@@ -1,0 +1,6 @@
+[package]
+name = "join_per_sample_vcfs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
