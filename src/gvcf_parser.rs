@@ -1,15 +1,18 @@
 use crate::errors::VcfParseError;
 use crate::utils_magic::file_is_gzipped;
 use flate2::read::MultiGzDecoder;
+use lru::LruCache;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 pub type VcfResult<T> = std::result::Result<T, VcfParseError>;
 
 const NON_REF: &str = "<NON_REF>";
 const DEF_N_VARIANTS_IN_BUFFER: usize = 100;
+const GT_FORMAT_LRU_CACHE_SIZE: usize = 5;
 
 #[derive(Debug)]
 pub struct GVcfRecord {
@@ -41,7 +44,7 @@ fn parse_format_field(format: &str) -> VcfResult<(usize, Option<usize>)> {
 impl GVcfRecord {
     fn from_line(
         line: &str,
-        format_cache: &mut Box<Option<(String, usize, Option<usize>)>>,
+        format_cache: &mut LruCache<String, (usize, Option<usize>)>,
     ) -> VcfResult<Self> {
         let mut fields = line.splitn(10, '\t');
         let chrom = fields
@@ -91,22 +94,14 @@ impl GVcfRecord {
             .map(str::to_string)
             .collect();
 
-        // Check cache first
-        let (gt_index, pl_index) = if let Some((cached_format, cached_gt_index, cached_pl_index)) =
-            format_cache.as_ref()
-        {
-            if format_str == cached_format.as_str() {
-                (*cached_gt_index, *cached_pl_index)
-            } else {
-                // Format changed, parse and update cache
-                let (gt_idx, pl_idx) = parse_format_field(format_str)?;
-                **format_cache = Some((format_str.to_string(), gt_idx, pl_idx));
-                (gt_idx, pl_idx)
-            }
+        // Check LRU cache first
+        let (gt_index, pl_index) = if let Some((gt_idx, pl_idx)) = format_cache.get(format_str) {
+            // Cache hit: return cached indices
+            (*gt_idx, *pl_idx)
         } else {
-            // First time, parse and cache
+            // Cache miss: parse and insert into cache
             let (gt_idx, pl_idx) = parse_format_field(format_str)?;
-            **format_cache = Some((format_str.to_string(), gt_idx, pl_idx));
+            format_cache.put(format_str.to_string(), (gt_idx, pl_idx));
             (gt_idx, pl_idx)
         };
 
@@ -156,9 +151,9 @@ pub struct GVcfRecordIterator<B: BufRead> {
     line: String,
     section: VcfSection,
     buffer: VecDeque<GVcfRecord>,
-    /// Cache for FORMAT field: (format_string, gt_index, pl_index)
-    /// Boxed to allow mutation from from_line
-    format_cache: Box<Option<(String, usize, Option<usize>)>>,
+    /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, pl_index)
+    /// Cache size of 5 is typically sufficient for VCF files with multiple alternating formats
+    format_cache: LruCache<String, (usize, Option<usize>)>,
 }
 
 impl<B: BufRead> GVcfRecordIterator<B> {
@@ -168,7 +163,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
             line: String::new(),
             section: VcfSection::Header,
             buffer: VecDeque::new(),
-            format_cache: Box::new(None),
+            format_cache: LruCache::new(NonZeroUsize::new(GT_FORMAT_LRU_CACHE_SIZE).unwrap()),
         }
     }
     fn process_header_and_first_variant(&mut self) -> Option<VcfResult<GVcfRecord>> {
