@@ -4,27 +4,35 @@ use std::path::PathBuf;
 
 use tempfile::NamedTempFile;
 
-use join_per_sample_vcfs::utils_magic::{are_gzipped_magic_bytes, file_is_gzipped};
+use join_per_sample_vcfs::utils_magic::{MagicByteError, are_gzipped_magic_bytes, file_is_gzipped};
 
 #[test]
-fn are_gzipped_magic_bytes_detects_gzip_header() {
+fn are_gzipped_magic_bytes_detects_gzip_header() -> Result<(), MagicByteError> {
     let bytes = [0x1f, 0x8b, 0x00, 0x00];
-    assert!(are_gzipped_magic_bytes(&bytes));
+    assert!(are_gzipped_magic_bytes(&bytes)?);
+    Ok(())
 }
 
 #[test]
-fn are_gzipped_magic_bytes_detects_non_gzip_header() {
+fn are_gzipped_magic_bytes_detects_non_gzip_header() -> Result<(), MagicByteError> {
     let bytes = [0x00, 0x01, 0x02, 0x03];
-    assert!(!are_gzipped_magic_bytes(&bytes));
+    assert!(!are_gzipped_magic_bytes(&bytes)?);
+    Ok(())
 }
 
 #[test]
-fn are_gzipped_magic_bytes_returns_false_for_insufficient_bytes() {
+fn are_gzipped_magic_bytes_returns_error_for_insufficient_bytes() {
     let empty: [u8; 0] = [];
     let one_byte = [0x1f];
 
-    assert!(!are_gzipped_magic_bytes(&empty));
-    assert!(!are_gzipped_magic_bytes(&one_byte));
+    assert!(matches!(
+        are_gzipped_magic_bytes(&empty),
+        Err(MagicByteError::InsufficientBytes { got: 0, need: 2 })
+    ));
+    assert!(matches!(
+        are_gzipped_magic_bytes(&one_byte),
+        Err(MagicByteError::InsufficientBytes { got: 1, need: 2 })
+    ));
 }
 
 #[test]
@@ -35,7 +43,7 @@ fn file_is_gzipped_returns_true_for_file_with_gzip_magic_bytes() {
     tmp.flush().unwrap();
 
     let path = tmp.path();
-    let result = file_is_gzipped(path).unwrap();
+    let result = file_is_gzipped(&path).unwrap();
 
     assert!(result);
 }
@@ -48,13 +56,13 @@ fn file_is_gzipped_returns_false_for_plain_file() {
     tmp.flush().unwrap();
 
     let path = tmp.path();
-    let result = file_is_gzipped(path).unwrap();
+    let result = file_is_gzipped(&path).unwrap();
 
     assert!(!result);
 }
 
 #[test]
-fn file_is_gzipped_returns_false_for_short_file() {
+fn file_is_gzipped_returns_error_for_short_file() {
     let mut tmp = NamedTempFile::new().unwrap();
 
     // Only 1 byte; too short to match gzip magic.
@@ -62,9 +70,10 @@ fn file_is_gzipped_returns_false_for_short_file() {
     tmp.flush().unwrap();
 
     let path = tmp.path();
-    let result = file_is_gzipped(path).unwrap();
-
-    assert!(!result);
+    assert!(matches!(
+        file_is_gzipped(&path),
+        Err(MagicByteError::InsufficientBytes { got: 1, need: 2 })
+    ));
 }
 
 #[test]
@@ -74,8 +83,10 @@ fn file_is_gzipped_propagates_io_error_for_missing_file() {
     let path: PathBuf = tmp.path().to_path_buf();
     drop(tmp);
 
-    let err = file_is_gzipped(&path).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(matches!(
+        file_is_gzipped(&path),
+        Err(MagicByteError::ProblemOpeningFile { .. })
+    ));
 }
 
 #[test]
