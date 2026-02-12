@@ -18,11 +18,32 @@ pub struct GVcfRecord {
     pub alleles: Vec<String>,
     pub ref_allele_len: u8,
     pub qual: f32,
+    gt_index: usize,
+    pl_index: Option<usize>,
+}
+
+/// Parses the FORMAT field and returns (gt_index, pl_index).
+/// Returns an error if GT is not found. PL is optional.
+fn parse_format_field(format: &str) -> VcfResult<(usize, Option<usize>)> {
+    let fields: Vec<&str> = format.split(':').collect();
+
+    let gt_index = fields.iter().position(|&field| field == "GT").ok_or(
+        VcfParseError::MissingGtFieldInFormat {
+            line: format.to_string(),
+        },
+    )?;
+
+    let pl_index = fields.iter().position(|&field| field == "PL");
+
+    Ok((gt_index, pl_index))
 }
 
 impl GVcfRecord {
-    fn from_line(line: &str) -> VcfResult<Self> {
-        let mut fields = line.splitn(7, '\t');
+    fn from_line(
+        line: &str,
+        format_cache: &mut Box<Option<(String, usize, Option<usize>)>>,
+    ) -> VcfResult<Self> {
+        let mut fields = line.splitn(10, '\t');
         let chrom = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
@@ -38,6 +59,11 @@ impl GVcfRecord {
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
         let qual_str = fields
+            .next()
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+        fields.next(); // FILTER
+        fields.next(); // INFO
+        let format_str = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
 
@@ -65,14 +91,46 @@ impl GVcfRecord {
             .map(str::to_string)
             .collect();
 
+        // Check cache first
+        let (gt_index, pl_index) = if let Some((cached_format, cached_gt_index, cached_pl_index)) =
+            format_cache.as_ref()
+        {
+            if format_str == cached_format.as_str() {
+                (*cached_gt_index, *cached_pl_index)
+            } else {
+                // Format changed, parse and update cache
+                let (gt_idx, pl_idx) = parse_format_field(format_str)?;
+                **format_cache = Some((format_str.to_string(), gt_idx, pl_idx));
+                (gt_idx, pl_idx)
+            }
+        } else {
+            // First time, parse and cache
+            let (gt_idx, pl_idx) = parse_format_field(format_str)?;
+            **format_cache = Some((format_str.to_string(), gt_idx, pl_idx));
+            (gt_idx, pl_idx)
+        };
+
         Ok(GVcfRecord {
             chrom: chrom.to_string(),
             pos: pos,
             alleles: alleles,
             ref_allele_len: ref_allele_len,
             qual: qual,
+            gt_index: gt_index,
+            pl_index: pl_index,
         })
     }
+
+    /// Returns the index of GT in the FORMAT field (for internal use and testing)
+    pub fn gt_index(&self) -> usize {
+        self.gt_index
+    }
+
+    /// Returns the index of PL in the FORMAT field if present (for internal use and testing)
+    pub fn pl_index(&self) -> Option<usize> {
+        self.pl_index
+    }
+
     pub fn get_span(self: &GVcfRecord) -> VcfResult<(u32, u32)> {
         let max_allele_len = self.alleles.iter().map(|allele| allele.len()).max().ok_or(
             VcfParseError::RuntimeError {
@@ -98,6 +156,9 @@ pub struct GVcfRecordIterator<B: BufRead> {
     line: String,
     section: VcfSection,
     buffer: VecDeque<GVcfRecord>,
+    /// Cache for FORMAT field: (format_string, gt_index, pl_index)
+    /// Boxed to allow mutation from from_line
+    format_cache: Box<Option<(String, usize, Option<usize>)>>,
 }
 
 impl<B: BufRead> GVcfRecordIterator<B> {
@@ -107,6 +168,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
             line: String::new(),
             section: VcfSection::Header,
             buffer: VecDeque::new(),
+            format_cache: Box::new(None),
         }
     }
     fn process_header_and_first_variant(&mut self) -> Option<VcfResult<GVcfRecord>> {
@@ -129,7 +191,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
             Ok(0) => None, // EOF
             Ok(_) => {
                 self.section = VcfSection::Body;
-                Some(GVcfRecord::from_line(&self.line))
+                Some(GVcfRecord::from_line(&self.line, &mut self.format_cache))
             }
             Err(error) => return Some(Err(VcfParseError::from(error))),
         }
@@ -148,7 +210,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
                             n_items_added += 1;
                         }
                     } else {
-                        match GVcfRecord::from_line(&self.line) {
+                        match GVcfRecord::from_line(&self.line, &mut self.format_cache) {
                             Ok(record) => {
                                 self.buffer.push_back(record);
                                 n_items_added += 1;

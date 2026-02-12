@@ -142,36 +142,27 @@ fn test_performance() {
 
 #[test]
 fn test_g_vcf_record() {
-    let pos: u32 = 10;
-    let alleles = vec!["A".to_string(), "C".to_string()];
-    let snp = GVcfRecord {
-        chrom: "chr1".to_string(),
-        pos: pos,
-        alleles: alleles,
-        ref_allele_len: 1,
-        qual: 30.0,
-    };
-    assert!(matches!(snp.get_span(), Ok((10, 10))));
+    // Test get_span with parsed records from actual VCF data
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t10\t.\tA\tC\t30\tPASS\t.\tGT\t0/1
+chr1\t10\t.\tAT\tA\t30\tPASS\t.\tGT\t0/1
+chr1\t10\t.\tA\tATT\t30\tPASS\t.\tGT\t0/1";
 
-    let alleles = vec!["AT".to_string(), "A".to_string()];
-    let snp = GVcfRecord {
-        chrom: "chr1".to_string(),
-        pos: pos,
-        alleles: alleles,
-        ref_allele_len: 2,
-        qual: 30.0,
-    };
-    assert!(matches!(snp.get_span(), Ok((10, 11))));
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader);
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
-    let alleles = vec!["A".to_string(), "ATT".to_string()];
-    let snp = GVcfRecord {
-        chrom: "chr1".to_string(),
-        pos: pos,
-        alleles: alleles,
-        ref_allele_len: 1,
-        qual: 30.0,
-    };
-    assert!(matches!(snp.get_span(), Ok((10, 12))));
+    assert_eq!(variants.len(), 3);
+
+    // SNP: should span a single position
+    assert!(matches!(variants[0].get_span(), Ok((10, 10))));
+
+    // Deletion: AT -> A, should span 2 positions
+    assert!(matches!(variants[1].get_span(), Ok((10, 11))));
+
+    // Insertion: A -> ATT, should span 3 positions
+    assert!(matches!(variants[2].get_span(), Ok((10, 12))));
 }
 
 #[test]
