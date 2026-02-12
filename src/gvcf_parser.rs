@@ -17,11 +17,12 @@ pub struct GVcfRecord {
     pub pos: u32,
     pub alleles: Vec<String>,
     pub ref_allele_len: u8,
+    pub qual: f32,
 }
 
 impl GVcfRecord {
     fn from_line(line: &str) -> VcfResult<Self> {
-        let mut fields = line.splitn(6, '\t');
+        let mut fields = line.splitn(7, '\t');
         let chrom = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
@@ -29,11 +30,14 @@ impl GVcfRecord {
         let pos = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
-        fields.next();
+        fields.next(); // ID
         let ref_allele = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
         let alt_alleles = fields
+            .next()
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+        let qual_str = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
 
@@ -47,6 +51,14 @@ impl GVcfRecord {
 
         let ref_allele_len = ref_allele.len() as u8;
 
+        let qual = if qual_str == "." {
+            f32::NAN
+        } else {
+            qual_str
+                .parse::<f32>()
+                .map_err(|_| VcfParseError::GVCFLineNotEnoughFields)?
+        };
+
         let alleles: Vec<String> = std::iter::once(ref_allele)
             .chain(alt_alleles.split(','))
             .filter(|allele| allele != &NON_REF)
@@ -58,6 +70,7 @@ impl GVcfRecord {
             pos: pos,
             alleles: alleles,
             ref_allele_len: ref_allele_len,
+            qual: qual,
         })
     }
     pub fn get_span(self: &GVcfRecord) -> VcfResult<(u32, u32)> {
