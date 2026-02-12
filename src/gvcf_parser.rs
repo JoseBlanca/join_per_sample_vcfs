@@ -16,6 +16,7 @@ pub struct GVcfRecord {
     pub chrom: String,
     pub pos: u32,
     pub alleles: Vec<String>,
+    pub ref_allele_len: u8,
 }
 
 impl GVcfRecord {
@@ -44,6 +45,8 @@ impl GVcfRecord {
             .parse::<u32>()
             .map_err(|_| VcfParseError::GVCFLineNotEnoughFields)?;
 
+        let ref_allele_len = ref_allele.len() as u8;
+
         let alleles: Vec<String> = std::iter::once(ref_allele)
             .chain(alt_alleles.split(','))
             .filter(|allele| allele != &NON_REF)
@@ -54,6 +57,7 @@ impl GVcfRecord {
             chrom: chrom.to_string(),
             pos: pos,
             alleles: alleles,
+            ref_allele_len: ref_allele_len,
         })
     }
     pub fn get_span(self: &GVcfRecord) -> VcfResult<(u32, u32)> {

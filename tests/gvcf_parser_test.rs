@@ -112,6 +112,7 @@ fn test_gzip_path() {
     assert_eq!(n_variants, 0);
 }
 
+#[ignore = "slow to run"]
 #[test]
 fn test_performance() {
     let path = "/home/jose/analyses/g2psol/source_data/TS.vcf.gz";
@@ -147,6 +148,7 @@ fn test_g_vcf_record() {
         chrom: "chr1".to_string(),
         pos: pos,
         alleles: alleles,
+        ref_allele_len: 1,
     };
     assert!(matches!(snp.get_span(), Ok((10, 10))));
 
@@ -155,6 +157,7 @@ fn test_g_vcf_record() {
         chrom: "chr1".to_string(),
         pos: pos,
         alleles: alleles,
+        ref_allele_len: 2,
     };
     assert!(matches!(snp.get_span(), Ok((10, 11))));
 
@@ -163,6 +166,31 @@ fn test_g_vcf_record() {
         chrom: "chr1".to_string(),
         pos: pos,
         alleles: alleles,
+        ref_allele_len: 1,
     };
     assert!(matches!(snp.get_span(), Ok((10, 12))));
+}
+
+#[test]
+fn test_ref_allele_len() {
+    let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader);
+
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    // First variant: 20\t17330\t.\tT\tA,<NON_REF>
+    assert_eq!(variants[0].ref_allele_len, 1);
+    assert_eq!(variants[0].alleles[0], "T");
+
+    // Second variant: 20\t17331\t.\tA\tG,T,<NON_REF>
+    assert_eq!(variants[1].ref_allele_len, 1);
+    assert_eq!(variants[1].alleles[0], "A");
+
+    // Third variant: 20\t17333\t.\tGTC\tG,GTCT,<NON_REF>
+    assert_eq!(variants[2].ref_allele_len, 3);
+    assert_eq!(variants[2].alleles[0], "GTC");
+
+    // Fourth variant: 20\t17334\t.\tGTC\tG,GTCT,<NON_REF>
+    assert_eq!(variants[3].ref_allele_len, 3);
+    assert_eq!(variants[3].alleles[0], "GTC");
 }
