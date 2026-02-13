@@ -140,57 +140,90 @@ impl GVcfRecord {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum VcfSection {
-    Header,
-    Body,
-}
-
 pub struct GVcfRecordIterator<B: BufRead> {
     reader: B,
     line: String,
-    section: VcfSection,
     buffer: VecDeque<GVcfRecord>,
     /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, pl_index)
     /// Cache size of 5 is typically sufficient for VCF files with multiple alternating formats
     format_cache: LruCache<String, (usize, Option<usize>)>,
+    /// Sample names extracted from the #CHROM header line
+    samples: Vec<String>,
 }
 
 impl<B: BufRead> GVcfRecordIterator<B> {
-    fn new(reader: B) -> Self {
-        GVcfRecordIterator {
-            reader: reader,
-            line: String::new(),
-            section: VcfSection::Header,
+    fn new(mut reader: B) -> VcfResult<Self> {
+        let mut line = String::new();
+
+        // Read the first line to start header processing
+        reader.read_line(&mut line).map_err(VcfParseError::from)?;
+
+        let mut iterator = GVcfRecordIterator {
+            reader,
+            line,
             buffer: VecDeque::new(),
             format_cache: LruCache::new(NonZeroUsize::new(GT_FORMAT_LRU_CACHE_SIZE).unwrap()),
-        }
+            samples: Vec::new(),
+        };
+
+        // Process the header and populate samples
+        iterator.process_header()?;
+
+        Ok(iterator)
     }
-    fn process_header_and_first_variant(&mut self) -> Option<VcfResult<GVcfRecord>> {
+
+    /// Parses sample names from the #CHROM header line.
+    /// The #CHROM line has 9 standard columns followed by sample names:
+    /// #CHROM POS ID REF ALT QUAL FILTER INFO FORMAT [sample1] [sample2] ...
+    fn parse_samples_from_header(&self) -> VcfResult<Vec<String>> {
+        // Verify this is the #CHROM line
+        if !self.line.starts_with("#CHROM") {
+            return Err(VcfParseError::BrokenHeader);
+        }
+
+        let fields: Vec<&str> = self.line.trim().split('\t').collect();
+
+        // VCF spec requires at least 9 columns, plus at least 1 sample
+        if fields.len() < 10 {
+            return Err(VcfParseError::BrokenHeader);
+        }
+
+        let samples: Vec<String> = fields
+            .iter()
+            .skip(9) // Skip the 9 standard VCF columns
+            .map(|s| s.to_string())
+            .collect();
+
+        Ok(samples)
+    }
+
+    /// Processes the VCF header, parsing sample names and preparing for variant reading.
+    /// This should be called during construction to initialize the iterator.
+    fn process_header(&mut self) -> VcfResult<()> {
+        // Read through ## header lines until we find the #CHROM line
         loop {
             if self.line.starts_with("##") {
                 self.line.clear();
                 match self.reader.read_line(&mut self.line) {
-                    Ok(0) => return Some(Err(VcfParseError::BrokenHeader)),
+                    Ok(0) => return Err(VcfParseError::BrokenHeader),
                     Ok(_) => {
                         if !self.line.starts_with("##") {
                             break;
                         }
                     }
-                    Err(error) => return Some(Err(VcfParseError::from(error))),
+                    Err(error) => return Err(VcfParseError::from(error)),
                 }
+            } else {
+                break;
             }
         }
-        self.line.clear();
-        match self.reader.read_line(&mut self.line) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                self.section = VcfSection::Body;
-                Some(GVcfRecord::from_line(&self.line, &mut self.format_cache))
-            }
-            Err(error) => return Some(Err(VcfParseError::from(error))),
-        }
+
+        // At this point, self.line contains the #CHROM line - parse samples
+        self.samples = self.parse_samples_from_header()?;
+
+        Ok(())
     }
+
     pub fn fill_buffer(&mut self, n_items: usize) -> VcfResult<usize> {
         let mut n_items_added: usize = 0;
         while self.buffer.len() < n_items {
@@ -198,21 +231,13 @@ impl<B: BufRead> GVcfRecordIterator<B> {
             match self.reader.read_line(&mut self.line) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
-                    if self.section == VcfSection::Header {
-                        let result = self.process_header_and_first_variant();
-                        if let Some(Ok(record)) = result {
+                    match GVcfRecord::from_line(&self.line, &mut self.format_cache) {
+                        Ok(record) => {
                             self.buffer.push_back(record);
                             n_items_added += 1;
                         }
-                    } else {
-                        match GVcfRecord::from_line(&self.line, &mut self.format_cache) {
-                            Ok(record) => {
-                                self.buffer.push_back(record);
-                                n_items_added += 1;
-                            }
-                            Err(VcfParseError::InvariantgVCFLine) => continue, // skip
-                            Err(err) => return Err(err),
-                        }
+                        Err(VcfParseError::InvariantgVCFLine) => continue, // skip
+                        Err(err) => return Err(err),
                     }
                 }
                 Err(err) => {
@@ -226,19 +251,26 @@ impl<B: BufRead> GVcfRecordIterator<B> {
     pub fn peek_items_in_buffer(&self) -> impl Iterator<Item = &GVcfRecord> {
         self.buffer.iter()
     }
+
+    /// Returns the sample names from the VCF header.
+    /// The samples are parsed from the #CHROM line during header processing.
+    /// Returns an empty slice if the header hasn't been processed yet.
+    pub fn samples(&self) -> &[String] {
+        &self.samples
+    }
 }
 
 impl<R: Read> GVcfRecordIterator<BufReader<R>> {
-    pub fn from_reader(reader: R) -> Self {
+    pub fn from_reader(reader: R) -> VcfResult<Self> {
         let buf_reader = BufReader::new(reader);
-        GVcfRecordIterator::new(buf_reader)
+        Ok(GVcfRecordIterator::new(buf_reader)?)
     }
 }
 impl<R: Read> GVcfRecordIterator<BufReader<MultiGzDecoder<R>>> {
-    pub fn from_gzip_reader(reader: R) -> Self {
+    pub fn from_gzip_reader(reader: R) -> VcfResult<Self> {
         let gz_decoder = MultiGzDecoder::new(reader);
         let buf_reader = BufReader::new(gz_decoder);
-        GVcfRecordIterator::new(buf_reader)
+        Ok(GVcfRecordIterator::new(buf_reader)?)
     }
 }
 impl GVcfRecordIterator<BufReader<MultiGzDecoder<File>>> {
@@ -249,7 +281,7 @@ impl GVcfRecordIterator<BufReader<MultiGzDecoder<File>>> {
         let file = File::open(&path)?;
         let gz_decoder = MultiGzDecoder::new(file);
         let buf_reader = BufReader::new(gz_decoder);
-        Ok(GVcfRecordIterator::new(buf_reader))
+        Ok(GVcfRecordIterator::new(buf_reader)?)
     }
 }
 

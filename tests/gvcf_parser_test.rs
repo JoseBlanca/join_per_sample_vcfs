@@ -16,7 +16,7 @@ const SAMPLE_GVCF: &str = "##
 #[test]
 fn test_gvcf_parsing() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader);
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     let mut n_variants: u32 = 0;
     for record in parser {
         match record {
@@ -35,7 +35,7 @@ fn test_gvcf_parsing() {
 #[test]
 fn test_buffer() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut var_iterator = GVcfRecordIterator::from_reader(reader);
+    let mut var_iterator = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     assert!(matches!(var_iterator.fill_buffer(3), Ok(3)));
     assert!(matches!(var_iterator.fill_buffer(1), Ok(0)));
     assert!(matches!(var_iterator.fill_buffer(4), Ok(1)));
@@ -51,7 +51,7 @@ fn test_buffer() {
 #[test]
 fn test_buffer2() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut var_iterator = GVcfRecordIterator::from_reader(reader);
+    let mut var_iterator = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     assert!(matches!(var_iterator.fill_buffer(2), Ok(2)));
     let variant = var_iterator.next().unwrap().unwrap();
     assert_eq!(variant.pos, 17330);
@@ -76,7 +76,7 @@ fn test_buffer2() {
 #[test]
 fn test_gzip_reader() {
     let file = File::open("tests/data/sample.g.vcf.gz").expect("Problem opening test file");
-    let records = GVcfRecordIterator::from_gzip_reader(file);
+    let records = GVcfRecordIterator::from_gzip_reader(file).expect("Failed to create parser");
 
     let mut n_variants: u32 = 0;
     for record in records {
@@ -150,7 +150,7 @@ chr1\t10\t.\tAT\tA\t30\tPASS\t.\tGT\t0/1
 chr1\t10\t.\tA\tATT\t30\tPASS\t.\tGT\t0/1";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader);
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 3);
@@ -168,7 +168,7 @@ chr1\t10\t.\tA\tATT\t30\tPASS\t.\tGT\t0/1";
 #[test]
 fn test_ref_allele_len() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader);
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
 
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
@@ -191,4 +191,48 @@ fn test_ref_allele_len() {
     assert_eq!(variants[3].ref_allele_len, 3);
     assert_eq!(variants[3].alleles[0], "GTC");
     assert_eq!(variants[3].qual, 50.0);
+}
+
+#[test]
+fn test_sample_parsing() {
+    let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+
+    // Samples should be available immediately after construction
+    let samples = parser.samples();
+    assert_eq!(samples.len(), 3);
+    assert_eq!(samples[0], "NA00001");
+    assert_eq!(samples[1], "NA00002");
+    assert_eq!(samples[2], "NA00003");
+}
+
+#[test]
+fn test_sample_parsing_with_buffer() {
+    let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
+    let mut parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+
+    // Samples should be available immediately after construction
+    let samples = parser.samples();
+    assert_eq!(samples.len(), 3);
+    assert_eq!(samples[0], "NA00001");
+    assert_eq!(samples[1], "NA00002");
+    assert_eq!(samples[2], "NA00003");
+
+    // Fill buffer should still work normally
+    parser.fill_buffer(2).unwrap();
+}
+
+#[test]
+fn test_sample_parsing_single_sample() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t10\t.\tA\tC\t30\tPASS\t.\tGT\t0/1";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+
+    // Samples should be available immediately after construction
+    let samples = parser.samples();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0], "Sample1");
 }
