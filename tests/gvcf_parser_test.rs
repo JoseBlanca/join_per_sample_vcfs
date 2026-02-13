@@ -236,3 +236,168 @@ chr1\t10\t.\tA\tC\t30\tPASS\t.\tGT\t0/1";
     assert_eq!(samples.len(), 1);
     assert_eq!(samples[0], "Sample1");
 }
+
+#[test]
+fn test_genotype_parsing_basic() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\tSample2\tSample3
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t0/0\t0/1\t1/1
+chr1\t200\t.\tG\tT\t40\tPASS\t.\tGT\t0|0\t0|1\t1|1";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 2);
+
+    // First variant: unphased genotypes
+    let v1 = &variants[0];
+    assert_eq!(v1.ploidy, 2);
+    assert_eq!(v1.n_samples(), 3);
+    assert_eq!(v1.sample_genotypes(0), &[0, 0]);
+    assert_eq!(v1.sample_genotypes(1), &[0, 1]);
+    assert_eq!(v1.sample_genotypes(2), &[1, 1]);
+    assert!(!v1.is_phased(0));
+    assert!(!v1.is_phased(1));
+    assert!(!v1.is_phased(2));
+
+    // Second variant: phased genotypes
+    let v2 = &variants[1];
+    assert_eq!(v2.sample_genotypes(0), &[0, 0]);
+    assert_eq!(v2.sample_genotypes(1), &[0, 1]);
+    assert_eq!(v2.sample_genotypes(2), &[1, 1]);
+    assert!(v2.is_phased(0));
+    assert!(v2.is_phased(1));
+    assert!(v2.is_phased(2));
+}
+
+#[test]
+fn test_genotype_parsing_missing() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\tSample2\tSample3
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t./.\t0/1\t.|.";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 1);
+    let v = &variants[0];
+
+    // Sample 0: missing unphased
+    assert_eq!(v.sample_genotypes(0), &[-1, -1]);
+    assert!(v.is_missing(0));
+    assert!(!v.is_phased(0));
+
+    // Sample 1: normal
+    assert_eq!(v.sample_genotypes(1), &[0, 1]);
+    assert!(!v.is_missing(1));
+
+    // Sample 2: missing phased
+    assert_eq!(v.sample_genotypes(2), &[-1, -1]);
+    assert!(v.is_missing(2));
+    assert!(v.is_phased(2));
+}
+
+#[test]
+fn test_genotype_parsing_multiallelic() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\tSample2
+chr1\t100\t.\tA\tC,G,T\t30\tPASS\t.\tGT\t0/1\t2/3";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 1);
+    let v = &variants[0];
+
+    assert_eq!(v.sample_genotypes(0), &[0, 1]);
+    assert_eq!(v.sample_genotypes(1), &[2, 3]);
+}
+
+#[test]
+fn test_genotype_api_methods() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t0/0\t0/1\t1/1\t./.";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    let v = &variants[0];
+
+    // is_hom_ref
+    assert!(v.is_hom_ref(0));
+    assert!(!v.is_hom_ref(1));
+    assert!(!v.is_hom_ref(2));
+    assert!(!v.is_hom_ref(3));
+
+    // is_homozygous
+    assert!(v.is_homozygous(0)); // 0/0
+    assert!(!v.is_homozygous(1)); // 0/1
+    assert!(v.is_homozygous(2)); // 1/1
+    assert!(v.is_homozygous(3)); // ./.
+
+    // is_missing
+    assert!(!v.is_missing(0));
+    assert!(!v.is_missing(1));
+    assert!(!v.is_missing(2));
+    assert!(v.is_missing(3));
+}
+
+#[test]
+fn test_genotype_with_format_fields() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\tSample2
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT:GQ:DP\t0/1:30:10\t1|1:40:15";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 1);
+    let v = &variants[0];
+
+    assert_eq!(v.sample_genotypes(0), &[0, 1]);
+    assert!(!v.is_phased(0));
+
+    assert_eq!(v.sample_genotypes(1), &[1, 1]);
+    assert!(v.is_phased(1));
+}
+
+#[test]
+fn test_genotype_performance_with_sample_gvcf() {
+    // Use the existing SAMPLE_GVCF data which has genotypes
+    let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
+    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 4);
+
+    // Check first variant: 20\t17330\t.\tT\tA,<NON_REF>\t.\tq10\tNS=3;DP=11;AF=0.017\tGT:GQ:DP:HQ\t.|0:49:3:58,50\t0|1:3:5:65,3\t0/0:41:3
+    let v1 = &variants[0];
+    assert_eq!(v1.n_samples(), 3);
+    assert_eq!(v1.ploidy, 2);
+
+    // Sample 0: .|0 (phased, missing first allele)
+    assert_eq!(v1.sample_genotypes(0), &[-1, 0]);
+    assert!(v1.is_phased(0));
+    assert!(v1.is_missing(0));
+
+    // Sample 1: 0|1 (phased heterozygous)
+    assert_eq!(v1.sample_genotypes(1), &[0, 1]);
+    assert!(v1.is_phased(1));
+    assert!(!v1.is_missing(1));
+
+    // Sample 2: 0/0 (unphased homozygous ref)
+    assert_eq!(v1.sample_genotypes(2), &[0, 0]);
+    assert!(!v1.is_phased(2));
+    assert!(v1.is_hom_ref(2));
+
+    // Check second variant has consistent ploidy
+    let v2 = &variants[1];
+    assert_eq!(v2.ploidy, 2);
+    assert_eq!(v2.n_samples(), 3);
+}
