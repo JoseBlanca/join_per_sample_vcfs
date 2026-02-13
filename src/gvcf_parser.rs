@@ -13,6 +13,7 @@ pub type VcfResult<T> = std::result::Result<T, VcfParseError>;
 const NON_REF: &str = "<NON_REF>";
 const DEF_N_VARIANTS_IN_BUFFER: usize = 100;
 const GT_FORMAT_LRU_CACHE_SIZE: usize = 5;
+const BUFREADER_CAPACITY: usize = 256 * 1024; // 256KB buffer for better I/O performance
 
 #[derive(Debug)]
 pub struct GVcfRecord {
@@ -36,17 +37,27 @@ pub struct GVcfRecord {
 /// Parses the FORMAT field and returns (gt_index, pl_index).
 /// Returns an error if GT is not found. PL is optional.
 fn parse_format_field(format: &str) -> VcfResult<(usize, Option<usize>)> {
-    let fields: Vec<&str> = format.split(':').collect();
+    let mut gt_index = None;
+    let mut pl_index = None;
 
-    let gt_index = fields.iter().position(|&field| field == "GT").ok_or(
-        VcfParseError::MissingGtFieldInFormat {
-            line: format.to_string(),
-        },
-    )?;
+    for (idx, field) in format.split(':').enumerate() {
+        if field == "GT" {
+            gt_index = Some(idx);
+        } else if field == "PL" {
+            pl_index = Some(idx);
+        }
 
-    let pl_index = fields.iter().position(|&field| field == "PL");
+        // Early exit if we found both
+        if gt_index.is_some() && pl_index.is_some() {
+            break;
+        }
+    }
 
-    Ok((gt_index, pl_index))
+    let gt_idx = gt_index.ok_or(VcfParseError::MissingGtFieldInFormat {
+        line: format.to_string(),
+    })?;
+
+    Ok((gt_idx, pl_index))
 }
 
 /// Fast genotype parser optimized for common cases.
@@ -131,39 +142,34 @@ fn parse_genotypes(
     genotypes_buffer: &mut Vec<i8>,
     phase_buffer: &mut Vec<bool>,
 ) -> VcfResult<(Vec<i8>, Vec<bool>, u8)> {
-    // Split sample fields
-    let samples: Vec<&str> = sample_fields.split('\t').collect();
-
-    if samples.len() != n_samples {
+    // Validate sample count and detect ploidy from first non-0/0 genotype
+    let sample_count = sample_fields.split('\t').count();
+    if sample_count != n_samples {
         return Err(VcfParseError::RuntimeError {
             message: format!(
                 "Expected {} samples, found {}",
                 n_samples,
-                samples.len()
+                sample_count
             ),
         });
     }
 
-    // Detect ploidy from first non-0/0 genotype or use last seen ploidy
     let mut detected_ploidy = last_ploidy;
-    for sample in samples.iter() {
-        let fields: Vec<&str> = sample.split(':').collect();
-        if gt_index >= fields.len() {
-            continue;
-        }
-        let gt_str = fields[gt_index];
+    for sample in sample_fields.split('\t') {
+        // Get GT field using nth() to avoid collecting into Vec
+        if let Some(gt_str) = sample.split(':').nth(gt_index) {
+            // Skip genotypes that don't help with ploidy detection:
+            // - 0/0 and 0|0 (common reference genotypes)
+            // - "." (missing with unknown ploidy)
+            if gt_str == "0/0" || gt_str == "0|0" || gt_str == "." {
+                continue;
+            }
 
-        // Skip genotypes that don't help with ploidy detection:
-        // - 0/0 and 0|0 (common reference genotypes)
-        // - "." (missing with unknown ploidy)
-        if gt_str == "0/0" || gt_str == "0|0" || gt_str == "." {
-            continue;
-        }
-
-        let (alleles, _) = parse_genotype_fast(gt_str, last_ploidy);
-        if !alleles.is_empty() {
-            detected_ploidy = alleles.len() as u8;
-            break;
+            let (alleles, _) = parse_genotype_fast(gt_str, last_ploidy);
+            if !alleles.is_empty() {
+                detected_ploidy = alleles.len() as u8;
+                break;
+            }
         }
     }
 
@@ -179,25 +185,23 @@ fn parse_genotypes(
     }
 
     // Zero-fill the genotypes buffer
-    for i in 0..total_alleles {
-        genotypes_buffer[i] = 0;
-    }
+    genotypes_buffer[0..total_alleles].fill(0);
 
     // Parse each sample
-    for (sample_idx, sample) in samples.iter().enumerate() {
-        let fields: Vec<&str> = sample.split(':').collect();
-
-        if gt_index >= fields.len() {
-            // Missing GT field - mark as missing
-            let start = sample_idx * ploidy as usize;
-            for i in 0..ploidy as usize {
-                genotypes_buffer[start + i] = -1;
+    for (sample_idx, sample) in sample_fields.split('\t').enumerate() {
+        // Get GT field using nth() to avoid collecting into Vec
+        let gt_str = match sample.split(':').nth(gt_index) {
+            Some(s) => s,
+            None => {
+                // Missing GT field - mark as missing
+                let start = sample_idx * ploidy as usize;
+                for i in 0..ploidy as usize {
+                    genotypes_buffer[start + i] = -1;
+                }
+                phase_buffer[sample_idx] = false;
+                continue;
             }
-            phase_buffer[sample_idx] = false;
-            continue;
-        }
-
-        let gt_str = fields[gt_index];
+        };
 
         // Fast path: check for common patterns
         if ploidy == 2 {
@@ -580,14 +584,14 @@ impl<B: BufRead> GVcfRecordIterator<B> {
 
 impl<R: Read> GVcfRecordIterator<BufReader<R>> {
     pub fn from_reader(reader: R) -> VcfResult<Self> {
-        let buf_reader = BufReader::new(reader);
+        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, reader);
         Ok(GVcfRecordIterator::new(buf_reader)?)
     }
 }
 impl<R: Read> GVcfRecordIterator<BufReader<MultiGzDecoder<R>>> {
     pub fn from_gzip_reader(reader: R) -> VcfResult<Self> {
         let gz_decoder = MultiGzDecoder::new(reader);
-        let buf_reader = BufReader::new(gz_decoder);
+        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
         Ok(GVcfRecordIterator::new(buf_reader)?)
     }
 }
@@ -598,7 +602,7 @@ impl GVcfRecordIterator<BufReader<MultiGzDecoder<File>>> {
         }
         let file = File::open(&path)?;
         let gz_decoder = MultiGzDecoder::new(file);
-        let buf_reader = BufReader::new(gz_decoder);
+        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
         Ok(GVcfRecordIterator::new(buf_reader)?)
     }
 }

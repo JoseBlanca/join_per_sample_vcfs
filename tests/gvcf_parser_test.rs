@@ -35,7 +35,8 @@ fn test_gvcf_parsing() {
 #[test]
 fn test_buffer() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut var_iterator = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let mut var_iterator =
+        GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     assert!(matches!(var_iterator.fill_buffer(3), Ok(3)));
     assert!(matches!(var_iterator.fill_buffer(1), Ok(0)));
     assert!(matches!(var_iterator.fill_buffer(4), Ok(1)));
@@ -51,7 +52,8 @@ fn test_buffer() {
 #[test]
 fn test_buffer2() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut var_iterator = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let mut var_iterator =
+        GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     assert!(matches!(var_iterator.fill_buffer(2), Ok(2)));
     let variant = var_iterator.next().unwrap().unwrap();
     assert_eq!(variant.pos, 17330);
@@ -112,7 +114,6 @@ fn test_gzip_path() {
     assert_eq!(n_variants, 0);
 }
 
-#[ignore = "slow to run"]
 #[test]
 fn test_performance() {
     let path = "/home/jose/analyses/g2psol/source_data/TS.vcf.gz";
