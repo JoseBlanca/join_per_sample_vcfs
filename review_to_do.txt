@@ -1,0 +1,46 @@
+peek_items_in_buffer -> peek_item_in_buffer return item or stopiteration
+
+should we return an error:
+
+        if alt_alleles == NON_REF {
+            return Err(VcfParseError::InvariantgVCFLine);
+        }
+        
+why should we detect_ploidy beforehand?
+
+We should not resize
+    // Resize buffers if needed
+    if genotypes_buffer.len() < total_alleles {
+        genotypes_buffer.resize(total_alleles, 0);
+    }
+    if phase_buffer.len() < n_samples {
+        phase_buffer.resize(n_samples, false);
+    }
+    
+    
+build depending on ploidy
+        // Fast path: check for common patterns
+        if ploidy == 2 {
+            match gt_str {
+                "0/0" => {
+                    phase_buffer[sample_idx] = false;
+                    // Already zero-filled, skip
+                    continue;
+                }
+                "0|0" => {
+                    phase_buffer[sample_idx] = true;
+                    // Already zero-filled, skip
+                    continue;
+                }
+                "./." => {
+                    genotypes_buffer[sample_idx * 2] = MISSING_ALLELE;
+                    genotypes_buffer[sample_idx * 2 + 1] = MISSING_ALLELE;
+                    phase_buffer[sample_idx] = false;
+                    continue;
+                }
+                ".|." => {
+                    genotypes_buffer[sample_idx * 2] = MISSING_ALLELE;
+                    genotypes_buffer[sample_idx * 2 + 1] = MISSING_ALLELE;
+                    phase_buffer[sample_idx] = true;
+                    continue;
+                }

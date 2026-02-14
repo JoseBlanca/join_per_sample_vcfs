@@ -1,5 +1,5 @@
 use join_per_sample_vcfs::errors::VcfParseError;
-use join_per_sample_vcfs::gvcf_parser::{GVcfRecord, GVcfRecordIterator};
+use join_per_sample_vcfs::gvcf_parser::GVcfRecordIterator;
 use std::fs::File;
 use std::io::BufReader;
 
@@ -33,46 +33,40 @@ fn test_gvcf_parsing() {
 }
 
 #[test]
-fn test_buffer() {
+fn test_peek_variant() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
     let mut var_iterator =
         GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
-    assert!(matches!(var_iterator.fill_buffer(3), Ok(3)));
-    assert!(matches!(var_iterator.fill_buffer(1), Ok(0)));
-    assert!(matches!(var_iterator.fill_buffer(4), Ok(1)));
-    assert!(matches!(var_iterator.fill_buffer(5), Ok(0)));
-    let variant = var_iterator.next().unwrap().unwrap();
-    assert_eq!(variant.pos, 17330);
-    let buffered_items = var_iterator.peek_items_in_buffer();
-    let poss = [17331, 17333, 17334];
-    for (expected_pos, variant) in poss.iter().zip(buffered_items) {
-        assert_eq!(&variant.pos, expected_pos);
-    }
+
+    // Peek should return the first variant without consuming it
+    let peeked = var_iterator.peek_variant().unwrap().unwrap();
+    assert_eq!(peeked.pos, 17330);
+
+    // Peeking again should return the same variant
+    let peeked_again = var_iterator.peek_variant().unwrap().unwrap();
+    assert_eq!(peeked_again.pos, 17330);
+
+    // Consuming via next should return the same variant
+    let consumed = var_iterator.next().unwrap().unwrap();
+    assert_eq!(consumed.pos, 17330);
+
+    // After consuming, peek should show the next variant
+    let next_peeked = var_iterator.peek_variant().unwrap().unwrap();
+    assert_eq!(next_peeked.pos, 17331);
 }
+
 #[test]
-fn test_buffer2() {
+fn test_peek_variant_exhausted() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
     let mut var_iterator =
         GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
-    assert!(matches!(var_iterator.fill_buffer(2), Ok(2)));
-    let variant = var_iterator.next().unwrap().unwrap();
-    assert_eq!(variant.pos, 17330);
-    let variant = var_iterator.next().unwrap().unwrap();
-    assert_eq!(variant.pos, 17331);
 
-    let buffered_items: Vec<&GVcfRecord> = var_iterator.peek_items_in_buffer().collect();
-    assert_eq!(buffered_items.len(), 0);
+    // Consume all variants
+    while var_iterator.next().is_some() {}
 
-    let variant = var_iterator.next().unwrap().unwrap();
-    assert_eq!(variant.pos, 17333);
-
-    assert!(matches!(var_iterator.fill_buffer(2), Ok(0)));
-
-    let buffered_items = var_iterator.peek_items_in_buffer();
-    let poss = [17334];
-    for (expected_pos, variant) in poss.iter().zip(buffered_items) {
-        assert_eq!(&variant.pos, expected_pos);
-    }
+    // Peek on exhausted iterator should return None
+    let peeked = var_iterator.peek_variant().unwrap();
+    assert!(peeked.is_none());
 }
 
 #[test]

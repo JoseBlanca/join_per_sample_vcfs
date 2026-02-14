@@ -738,13 +738,21 @@ impl<B: BufRead> GVcfRecordIterator<B> {
         Ok(n_items_added)
     }
 
-    pub fn peek_items_in_buffer(&self) -> impl Iterator<Item = &GVcfRecord> {
-        self.buffer.iter()
+    /// Returns a reference to the next variant without consuming it.
+    ///
+    /// If the buffer is empty, it will attempt to fill it first.
+    /// Returns `None` if the iterator is exhausted (no more variants).
+    pub fn peek_variant(&mut self) -> VcfResult<Option<&GVcfRecord>> {
+        if self.buffer.is_empty() {
+            self.fill_buffer(DEF_N_VARIANTS_IN_BUFFER)?;
+        }
+        Ok(self.buffer.front())
     }
 
     /// Returns the sample names from the VCF header.
-    /// The samples are parsed from the #CHROM line during header processing.
-    /// Returns an empty slice if the header hasn't been processed yet.
+    ///
+    /// Samples are parsed from the #CHROM line during construction and are
+    /// always available.
     pub fn samples(&self) -> &[String] {
         &self.samples
     }
