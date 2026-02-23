@@ -154,24 +154,24 @@ fn parse_format_field(format: &str) -> VcfResult<(usize, Option<usize>)> {
 /// Fast genotype parser optimized for common cases.
 /// Returns (alleles, is_phased) where alleles contains parsed allele indices (-1 for missing).
 #[inline]
-fn parse_genotype_fast(gt_str: &str, expected_ploidy: u8) -> (Vec<i8>, bool) {
+fn parse_genotype_fast(gt_str: &str, expected_ploidy: u8) -> VcfResult<(Vec<i8>, bool)> {
     let bytes = gt_str.as_bytes();
     let len = bytes.len();
 
     // Fast path: check for common diploid patterns first
     if expected_ploidy == 2 && len == 3 {
         match (bytes[0], bytes[1], bytes[2]) {
-            (b'0', b'/', b'0') => return (vec![0, 0], false),
-            (b'0', b'|', b'0') => return (vec![0, 0], true),
-            (b'.', b'/', b'.') => return (vec![MISSING_ALLELE, MISSING_ALLELE], false),
-            (b'.', b'|', b'.') => return (vec![MISSING_ALLELE, MISSING_ALLELE], true),
+            (b'0', b'/', b'0') => return Ok((vec![0, 0], false)),
+            (b'0', b'|', b'0') => return Ok((vec![0, 0], true)),
+            (b'.', b'/', b'.') => return Ok((vec![MISSING_ALLELE, MISSING_ALLELE], false)),
+            (b'.', b'|', b'.') => return Ok((vec![MISSING_ALLELE, MISSING_ALLELE], true)),
             _ => {}
         }
     }
 
     // Fast path: haploid reference
     if expected_ploidy == 1 && len == 1 && bytes[0] == b'0' {
-        return (vec![0], false);
+        return Ok((vec![0], false));
     }
 
     // General parser for other cases
@@ -184,7 +184,12 @@ fn parse_genotype_fast(gt_str: &str, expected_ploidy: u8) -> (Vec<i8>, bool) {
     for &byte in bytes {
         match byte {
             b'0'..=b'9' => {
-                current = current * 10 + (byte - b'0') as i8;
+                current = (current as u8)
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(byte - b'0'))
+                    .ok_or_else(|| VcfParseError::AlleleIndexOverflow {
+                        gt: gt_str.to_string(),
+                    })? as i8;
                 parsing_number = true;
                 seen_dot = false;
             }
@@ -220,7 +225,7 @@ fn parse_genotype_fast(gt_str: &str, expected_ploidy: u8) -> (Vec<i8>, bool) {
         alleles.push(current);
     }
 
-    (alleles, phased)
+    Ok((alleles, phased))
 }
 
 /// Validates that the number of sample fields matches the expected count.
@@ -249,9 +254,10 @@ fn detect_ploidy(sample_fields: &str, gt_index: usize, last_ploidy: u8) -> u8 {
                 continue;
             }
 
-            let (alleles, _) = parse_genotype_fast(gt_str, last_ploidy);
-            if !alleles.is_empty() {
-                return alleles.len() as u8;
+            if let Ok((alleles, _)) = parse_genotype_fast(gt_str, last_ploidy) {
+                if !alleles.is_empty() {
+                    return alleles.len() as u8;
+                }
             }
         }
     }
@@ -342,7 +348,7 @@ fn parse_genotypes(
         }
 
         // General path: parse genotype
-        let (alleles, phased) = parse_genotype_fast(gt_str, ploidy);
+        let (alleles, phased) = parse_genotype_fast(gt_str, ploidy)?;
 
         // Validate ploidy consistency
         if alleles.len() != ploidy as usize {
@@ -408,10 +414,6 @@ impl GVcfRecord {
         let sample_fields = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
-
-        if alt_alleles == NON_REF {
-            return Err(VcfParseError::InvariantgVCFLine);
-        }
 
         let pos = pos
             .parse::<u32>()
@@ -726,7 +728,6 @@ impl<B: BufRead> GVcfRecordIterator<B> {
                             self.buffer.push_back(record);
                             n_items_added += 1;
                         }
-                        Err(VcfParseError::InvariantgVCFLine) => continue, // skip
                         Err(err) => return Err(err),
                     }
                 }

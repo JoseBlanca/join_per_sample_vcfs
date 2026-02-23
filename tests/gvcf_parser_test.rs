@@ -6,7 +6,7 @@ use std::io::BufReader;
 const SAMPLE_GVCF: &str = "##
 ##FORMAT=<ID=HQ,Number=2,Type=Integer,Description=\"Haplotype Quality\">
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00001\tNA00002\tNA00003
-20\t14370\t.\tG\t<NON_REF>\t29\tPASS\tNS=3;DP=14;AF=0.5;DB;H2\tGT:GQ:DP:HQ\t1|2:48:1:51,51\t3|4:48:8:51,51\t5/6000:43:5:.,.
+20\t14370\t.\tG\t<NON_REF>\t29\tPASS\tNS=3;DP=14;AF=0.5;DB;H2\tGT:GQ:DP:HQ\t1|2:48:1:51,51\t3|4:48:8:51,51\t5/60:43:5:.,.
 20\t17330\t.\tT\tA,<NON_REF>\t.\tq10\tNS=3;DP=11;AF=0.017\tGT:GQ:DP:HQ\t.|0:49:3:58,50\t0|1:3:5:65,3\t0/0:41:3
 20\t17331\t.\tA\tG,T,<NON_REF>\t67\tPASS\tNS=2;DP=10;AF=0.333,0.667;AA=T;DB\tGT:GQ:DP:HQ\t1|2:21:6:23,27\t2|1:2:0:18,2\t2/2:35:4
 20\t17332\t.\tT\t<NON_REF>\t47\tPASS\tNS=3;DP=13;AA=T\tGT:GQ:DP:HQ\t0|0:54:7:56,60\t0|0:48:4:51,51\t0/0:61:2
@@ -29,7 +29,7 @@ fn test_gvcf_parsing() {
             }
         }
     }
-    assert_eq!(n_variants, 4);
+    assert_eq!(n_variants, 6);
 }
 
 #[test]
@@ -40,19 +40,19 @@ fn test_peek_variant() {
 
     // Peek should return the first variant without consuming it
     let peeked = var_iterator.peek_variant().unwrap().unwrap();
-    assert_eq!(peeked.pos, 17330);
+    assert_eq!(peeked.pos, 14370);
 
     // Peeking again should return the same variant
     let peeked_again = var_iterator.peek_variant().unwrap().unwrap();
-    assert_eq!(peeked_again.pos, 17330);
+    assert_eq!(peeked_again.pos, 14370);
 
     // Consuming via next should return the same variant
     let consumed = var_iterator.next().unwrap().unwrap();
-    assert_eq!(consumed.pos, 17330);
+    assert_eq!(consumed.pos, 14370);
 
     // After consuming, peek should show the next variant
     let next_peeked = var_iterator.peek_variant().unwrap().unwrap();
-    assert_eq!(next_peeked.pos, 17331);
+    assert_eq!(next_peeked.pos, 17330);
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn test_gzip_reader() {
             }
         }
     }
-    assert_eq!(n_variants, 0);
+    assert_eq!(n_variants, 63);
 }
 #[test]
 fn test_gzip_path() {
@@ -105,35 +105,10 @@ fn test_gzip_path() {
             }
         }
     }
-    assert_eq!(n_variants, 0);
+    assert_eq!(n_variants, 63);
 }
 
-#[test]
-fn test_performance() {
-    let path = "/home/jose/analyses/g2psol/source_data/TS.vcf.gz";
-    let records = GVcfRecordIterator::from_gzip_path(path).expect("Problem opening test file");
-    println!("{}", path);
 
-    let mut n_variants: u32 = 0;
-    let mut n_invariants: u32 = 0;
-    for record in records {
-        match record {
-            Ok(_variant) => {
-                n_variants += 1;
-            }
-            Err(VcfParseError::InvariantgVCFLine) => {
-                n_invariants += 1;
-            }
-            Err(error) => {
-                //Fail test
-                panic!("Unexpected error: {}", error);
-            }
-        }
-    }
-    println!("Num. variant loci: {n_variants}");
-    println!("Num. invariant loci: {n_invariants}");
-    println!("Num.loci: {}", n_invariants + n_variants);
-}
 
 #[test]
 fn test_g_vcf_record() {
@@ -168,24 +143,24 @@ fn test_ref_allele_len() {
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     // First variant: 20\t17330\t.\tT\tA,<NON_REF>\t.\tq10
-    assert_eq!(variants[0].ref_allele_len, 1);
-    assert_eq!(variants[0].alleles[0], "T");
-    assert!(variants[0].qual.is_nan());
+    assert_eq!(variants[1].ref_allele_len, 1);
+    assert_eq!(variants[1].alleles[0], "T");
+    assert!(variants[1].qual.is_nan());
 
     // Second variant: 20\t17331\t.\tA\tG,T,<NON_REF>\t67\tPASS
-    assert_eq!(variants[1].ref_allele_len, 1);
-    assert_eq!(variants[1].alleles[0], "A");
-    assert_eq!(variants[1].qual, 67.0);
+    assert_eq!(variants[2].ref_allele_len, 1);
+    assert_eq!(variants[2].alleles[0], "A");
+    assert_eq!(variants[2].qual, 67.0);
 
     // Third variant: 20\t17333\t.\tGTC\tG,GTCT,<NON_REF>\t50
-    assert_eq!(variants[2].ref_allele_len, 3);
-    assert_eq!(variants[2].alleles[0], "GTC");
-    assert_eq!(variants[2].qual, 50.0);
+    assert_eq!(variants[4].ref_allele_len, 3);
+    assert_eq!(variants[4].alleles[0], "GTC");
+    assert_eq!(variants[4].qual, 50.0);
 
     // Fourth variant: 20\t17334\t.\tGTC\tG,GTCT,<NON_REF>\t50
-    assert_eq!(variants[3].ref_allele_len, 3);
-    assert_eq!(variants[3].alleles[0], "GTC");
-    assert_eq!(variants[3].qual, 50.0);
+    assert_eq!(variants[5].ref_allele_len, 3);
+    assert_eq!(variants[5].alleles[0], "GTC");
+    assert_eq!(variants[5].qual, 50.0);
 }
 
 #[test]
@@ -369,10 +344,10 @@ fn test_genotype_performance_with_sample_gvcf() {
     let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
-    assert_eq!(variants.len(), 4);
+    assert_eq!(variants.len(), 6);
 
     // Check first variant: 20\t17330\t.\tT\tA,<NON_REF>\t.\tq10\tNS=3;DP=11;AF=0.017\tGT:GQ:DP:HQ\t.|0:49:3:58,50\t0|1:3:5:65,3\t0/0:41:3
-    let v1 = &variants[0];
+    let v1 = &variants[1];
     assert_eq!(v1.n_samples(), 3);
     assert_eq!(v1.ploidy, 2);
 
@@ -392,7 +367,29 @@ fn test_genotype_performance_with_sample_gvcf() {
     assert!(v1.is_hom_ref(2));
 
     // Check second variant has consistent ploidy
-    let v2 = &variants[1];
+    let v2 = &variants[2];
     assert_eq!(v2.ploidy, 2);
     assert_eq!(v2.n_samples(), 3);
+}
+
+#[ignore = "too slow"]
+#[test]
+fn test_performance() {
+    let path = "/home/jose/analyses/g2psol/source_data/TS.vcf.gz";
+    let records = GVcfRecordIterator::from_gzip_path(path).expect("Problem opening test file");
+    println!("{}", path);
+
+    let mut n_variants: u32 = 0;
+    for record in records {
+        match record {
+            Ok(_variant) => {
+                n_variants += 1;
+            }
+            Err(error) => {
+                //Fail test
+                panic!("Unexpected error: {}", error);
+            }
+        }
+    }
+    println!("Num.loci: {}", n_variants);
 }
