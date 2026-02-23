@@ -369,25 +369,3 @@ fn test_genotype_performance_with_sample_gvcf() {
     assert_eq!(v2.ploidy, 2);
     assert_eq!(v2.n_samples(), 3);
 }
-
-//#[ignore = "too slow"]
-#[test]
-fn test_performance() {
-    let path = "/home/jose/analyses/g2psol/source_data/TS.vcf.gz";
-    let records = GVcfRecordIterator::from_gzip_path(path).expect("Problem opening test file");
-    println!("{}", path);
-
-    let mut n_variants: u32 = 0;
-    for record in records {
-        match record {
-            Ok(_variant) => {
-                n_variants += 1;
-            }
-            Err(error) => {
-                //Fail test
-                panic!("Unexpected error: {}", error);
-            }
-        }
-    }
-    println!("Num.loci: {}", n_variants);
-}
