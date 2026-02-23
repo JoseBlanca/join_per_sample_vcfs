@@ -54,6 +54,7 @@
 
 use crate::errors::VcfParseError;
 use crate::utils_magic::file_is_gzipped;
+use ahash::RandomState; // fast hasher
 use flate2::read::MultiGzDecoder;
 use lru::LruCache;
 use std::collections::VecDeque;
@@ -380,7 +381,7 @@ fn parse_genotypes(
 impl GVcfRecord {
     fn from_line(
         line: &str,
-        format_cache: &mut LruCache<String, (usize, Option<usize>)>,
+        format_cache: &mut LruCache<String, (usize, Option<usize>), RandomState>,
         n_samples: usize,
         last_ploidy: u8,
         genotypes_buffer: &mut Vec<i8>,
@@ -617,7 +618,7 @@ pub struct GVcfRecordIterator<B: BufRead> {
     /// Internal buffer of parsed records
     vars_buffer: VecDeque<GVcfRecord>,
     /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, pl_index).
-    format_cache: LruCache<String, (usize, Option<usize>)>,
+    format_cache: LruCache<String, (usize, Option<usize>), RandomState>,
     /// Sample names extracted from the #CHROM header line
     samples: Vec<String>,
     /// Reusable buffer for genotypes to minimize allocations
@@ -639,7 +640,10 @@ impl<B: BufRead> GVcfRecordIterator<B> {
             reader,
             line,
             vars_buffer: VecDeque::new(),
-            format_cache: LruCache::new(NonZeroUsize::new(GT_FORMAT_LRU_CACHE_SIZE).unwrap()),
+            format_cache: LruCache::with_hasher(
+                NonZeroUsize::new(GT_FORMAT_LRU_CACHE_SIZE).unwrap(),
+                RandomState::new(),
+            ),
             samples: Vec::new(),
             genotypes_buffer: Vec::new(),
             phase_buffer: Vec::new(),

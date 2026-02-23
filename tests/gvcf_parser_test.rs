@@ -108,8 +108,6 @@ fn test_gzip_path() {
     assert_eq!(n_variants, 63);
 }
 
-
-
 #[test]
 fn test_g_vcf_record() {
     // Test get_span with parsed records from actual VCF data
@@ -372,7 +370,7 @@ fn test_genotype_performance_with_sample_gvcf() {
     assert_eq!(v2.n_samples(), 3);
 }
 
-#[ignore = "too slow"]
+//#[ignore = "too slow"]
 #[test]
 fn test_performance() {
     let path = "/home/jose/analyses/g2psol/source_data/TS.vcf.gz";
