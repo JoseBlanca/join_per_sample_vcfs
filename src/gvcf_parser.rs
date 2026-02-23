@@ -615,7 +615,7 @@ pub struct GVcfRecordIterator<B: BufRead> {
     /// Reusable line buffer
     line: String,
     /// Internal buffer of parsed records
-    buffer: VecDeque<GVcfRecord>,
+    vars_buffer: VecDeque<GVcfRecord>,
     /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, pl_index).
     format_cache: LruCache<String, (usize, Option<usize>)>,
     /// Sample names extracted from the #CHROM header line
@@ -638,7 +638,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
         let mut iterator = GVcfRecordIterator {
             reader,
             line,
-            buffer: VecDeque::new(),
+            vars_buffer: VecDeque::new(),
             format_cache: LruCache::new(NonZeroUsize::new(GT_FORMAT_LRU_CACHE_SIZE).unwrap()),
             samples: Vec::new(),
             genotypes_buffer: Vec::new(),
@@ -709,7 +709,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
         let mut n_items_added: usize = 0;
         let n_samples = self.samples.len();
 
-        while self.buffer.len() < n_items {
+        while self.vars_buffer.len() < n_items {
             self.line.clear();
             match self.reader.read_line(&mut self.line) {
                 Ok(0) => break, // EOF
@@ -725,7 +725,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
                         Ok(record) => {
                             // Update last seen ploidy for next record
                             self.last_seen_ploidy = record.ploidy;
-                            self.buffer.push_back(record);
+                            self.vars_buffer.push_back(record);
                             n_items_added += 1;
                         }
                         Err(err) => return Err(err),
@@ -744,10 +744,10 @@ impl<B: BufRead> GVcfRecordIterator<B> {
     /// If the buffer is empty, it will attempt to fill it first.
     /// Returns `None` if the iterator is exhausted (no more variants).
     pub fn peek_variant(&mut self) -> VcfResult<Option<&GVcfRecord>> {
-        if self.buffer.is_empty() {
+        if self.vars_buffer.is_empty() {
             self.fill_buffer(DEF_N_VARIANTS_IN_BUFFER)?;
         }
-        Ok(self.buffer.front())
+        Ok(self.vars_buffer.front())
     }
 
     /// Returns the sample names from the VCF header.
@@ -788,7 +788,7 @@ impl<R: BufRead> Iterator for GVcfRecordIterator<R> {
     type Item = VcfResult<GVcfRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.buffer.len() == 0 {
+        if self.vars_buffer.len() == 0 {
             match self.fill_buffer(DEF_N_VARIANTS_IN_BUFFER) {
                 Err(error) => return Some(Err(error)),
                 Ok(n_items_added) => match n_items_added {
@@ -798,7 +798,7 @@ impl<R: BufRead> Iterator for GVcfRecordIterator<R> {
             }
         }
 
-        if let Some(variant) = self.buffer.pop_front() {
+        if let Some(variant) = self.vars_buffer.pop_front() {
             return Some(Ok(variant));
         } else {
             return Some(Err(VcfParseError::RuntimeError {
