@@ -272,8 +272,6 @@ fn parse_genotypes(
     gt_index: usize,
     last_ploidy: u8,
 ) -> VcfResult<(Vec<i8>, Vec<bool>, u8)> {
-    validate_sample_count(sample_fields, n_samples)?;
-
     // Detect ploidy from first informative genotype
     let ploidy = detect_ploidy(sample_fields, gt_index, last_ploidy);
     let total_num_alleles = n_samples * ploidy as usize;
@@ -283,7 +281,17 @@ fn parse_genotypes(
     let mut phase: Vec<bool> = vec![false; total_num_alleles];
 
     // Parse each sample
+    let mut last_idx: usize = 0;
     for (sample_idx, sample_field) in sample_fields.split('\t').enumerate() {
+        last_idx = sample_idx;
+        if sample_idx >= n_samples {
+            return Err(VcfParseError::RuntimeError {
+                message: format!(
+                    "More than the expected number of samples {n_samples} found in line"
+                ),
+            });
+        }
+
         // Get GT field using nth() to avoid collecting into Vec
         let gt_str = match sample_field.split(':').nth(gt_index) {
             Some(s) => s,
@@ -360,6 +368,15 @@ fn parse_genotypes(
             genotypes[start + i] = allele;
         }
         phase[sample_idx] = phased;
+    }
+
+    let samples_seen = last_idx + 1;
+    if samples_seen > n_samples {
+        return Err(VcfParseError::RuntimeError {
+            message: format!(
+                "More samples than expected: expected {n_samples}, got {samples_seen}"
+            ),
+        });
     }
 
     Ok((genotypes, phase, ploidy))
