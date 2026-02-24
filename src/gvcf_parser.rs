@@ -36,17 +36,6 @@
 //!         record.chrom, record.pos,
 //!         record.alleles[0], &record.alleles[1..]);
 //!
-//!     // Access genotypes for each sample
-//!     for sample_idx in 0..record.n_samples() {
-//!         let genotypes = record.sample_genotypes(sample_idx);
-//!         let is_missing = record.is_missing(sample_idx);
-//!         let is_phased = record.is_phased(sample_idx);
-//!
-//!         if !is_missing {
-//!             println!("  Sample {}: {:?} (phased: {})",
-//!                 sample_idx, genotypes, is_phased);
-//!         }
-//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -122,8 +111,7 @@ pub struct GVcfRecord {
     pub genotypes: Vec<i8>,
     /// Phase information for each sample: `true` = phased (`|`), `false` = unphased (`/`)
     pub phase: Vec<bool>,
-    /// Ploidy of this variant (typically `2` for diploid organisms)
-    pub ploidy: u8,
+    pub n_samples: usize,
 }
 
 /// Parses the FORMAT field and returns (gt_index, pl_index).
@@ -155,27 +143,9 @@ fn parse_format_field(format: &str) -> VcfResult<(usize, Option<usize>)> {
 /// Fast genotype parser optimized for common cases.
 /// Returns (alleles, is_phased) where alleles contains parsed allele indices (-1 for missing).
 #[inline]
-fn parse_genotype_fast(gt_str: &str, expected_ploidy: u8) -> VcfResult<(Vec<i8>, bool)> {
+fn parse_genotype(gt_str: &str, expected_ploidy: u8) -> VcfResult<(Vec<i8>, bool)> {
     let bytes = gt_str.as_bytes();
-    let len = bytes.len();
 
-    // Fast path: check for common diploid patterns first
-    if expected_ploidy == 2 && len == 3 {
-        match (bytes[0], bytes[1], bytes[2]) {
-            (b'0', b'/', b'0') => return Ok((vec![0, 0], false)),
-            (b'0', b'|', b'0') => return Ok((vec![0, 0], true)),
-            (b'.', b'/', b'.') => return Ok((vec![MISSING_ALLELE, MISSING_ALLELE], false)),
-            (b'.', b'|', b'.') => return Ok((vec![MISSING_ALLELE, MISSING_ALLELE], true)),
-            _ => {}
-        }
-    }
-
-    // Fast path: haploid reference
-    if expected_ploidy == 1 && len == 1 && bytes[0] == b'0' {
-        return Ok((vec![0], false));
-    }
-
-    // General parser for other cases
     let mut alleles = Vec::with_capacity(expected_ploidy as usize);
     let mut phased = false;
     let mut current: i8 = 0;
@@ -229,51 +199,13 @@ fn parse_genotype_fast(gt_str: &str, expected_ploidy: u8) -> VcfResult<(Vec<i8>,
     Ok((alleles, phased))
 }
 
-/// Validates that the number of sample fields matches the expected count.
-fn validate_sample_count(sample_fields: &str, expected: usize) -> VcfResult<()> {
-    let actual = sample_fields.split('\t').count();
-    if actual != expected {
-        return Err(VcfParseError::RuntimeError {
-            message: format!("Expected {} samples, found {}", expected, actual),
-        });
-    }
-    Ok(())
-}
-
-/// Detects the ploidy of a variant from sample genotypes.
-///
-/// Scans through samples to find the first informative genotype (not 0/0, 0|0, or .)
-/// and uses its allele count to determine ploidy. Falls back to `last_ploidy` if
-/// no informative genotypes are found.
-fn detect_ploidy(sample_fields: &str, gt_index: usize, last_ploidy: u8) -> u8 {
-    for sample in sample_fields.split('\t') {
-        if let Some(gt_str) = sample.split(':').nth(gt_index) {
-            // Skip genotypes that don't help with ploidy detection:
-            // - 0/0 and 0|0 (common reference genotypes)
-            // - "." (missing with unknown ploidy)
-            if matches!(gt_str, "0/0" | "0|0" | ".") {
-                continue;
-            }
-
-            if let Ok((alleles, _)) = parse_genotype_fast(gt_str, last_ploidy) {
-                if !alleles.is_empty() {
-                    return alleles.len() as u8;
-                }
-            }
-        }
-    }
-    last_ploidy
-}
-
 /// Parses genotypes for all samples in a VCF line.
 fn parse_genotypes(
     sample_fields: &str,
     n_samples: usize,
     gt_index: usize,
-    last_ploidy: u8,
-) -> VcfResult<(Vec<i8>, Vec<bool>, u8)> {
-    // Detect ploidy from first informative genotype
-    let ploidy = detect_ploidy(sample_fields, gt_index, last_ploidy);
+    ploidy: u8,
+) -> VcfResult<(Vec<i8>, Vec<bool>)> {
     let total_num_alleles = n_samples * ploidy as usize;
 
     // Zero-fill the genotypes buffer, most alleles are reference alleles
@@ -310,7 +242,6 @@ fn parse_genotypes(
         if ploidy == 2 {
             match gt_str {
                 "0/0" => {
-                    phase[sample_idx] = false;
                     // Already zero-filled, skip
                     continue;
                 }
@@ -319,7 +250,7 @@ fn parse_genotypes(
                     // Already zero-filled, skip
                     continue;
                 }
-                "./." => {
+                "." | "./." => {
                     genotypes[sample_idx * 2] = MISSING_ALLELE;
                     genotypes[sample_idx * 2 + 1] = MISSING_ALLELE;
                     phase[sample_idx] = false;
@@ -331,24 +262,12 @@ fn parse_genotypes(
                     phase[sample_idx] = true;
                     continue;
                 }
-                "." => {
-                    // Single "." means missing with unknown ploidy - treat as diploid missing
-                    genotypes[sample_idx * 2] = MISSING_ALLELE;
-                    genotypes[sample_idx * 2 + 1] = MISSING_ALLELE;
-                    phase[sample_idx] = false;
-                    continue;
-                }
                 _ => {}
             }
-        } else if ploidy == 1 && gt_str == "." {
-            // Haploid missing
-            genotypes[sample_idx] = MISSING_ALLELE;
-            phase[sample_idx] = false;
-            continue;
         }
 
         // General path: parse genotype
-        let (alleles, phased) = parse_genotype_fast(gt_str, ploidy)?;
+        let (alleles, phased) = parse_genotype(gt_str, ploidy)?;
 
         // Validate ploidy consistency
         if alleles.len() != ploidy as usize {
@@ -379,7 +298,7 @@ fn parse_genotypes(
         });
     }
 
-    Ok((genotypes, phase, ploidy))
+    Ok((genotypes, phase))
 }
 
 impl GVcfRecord {
@@ -387,7 +306,7 @@ impl GVcfRecord {
         line: &str,
         format_cache: &mut LruCache<String, (usize, Option<usize>), RandomState>,
         n_samples: usize,
-        last_ploidy: u8,
+        ploidy: u8,
     ) -> VcfResult<Self> {
         let mut fields = line.splitn(10, '\t');
         let chrom = fields
@@ -450,8 +369,7 @@ impl GVcfRecord {
         };
 
         // Parse genotypes for all samples
-        let (genotypes, phase, ploidy) =
-            parse_genotypes(sample_fields, n_samples, gt_index, last_ploidy)?;
+        let (genotypes, phase) = parse_genotypes(sample_fields, n_samples, gt_index, ploidy)?;
 
         Ok(GVcfRecord {
             chrom: chrom.to_string(),
@@ -463,7 +381,7 @@ impl GVcfRecord {
             pl_index,
             genotypes,
             phase,
-            ploidy,
+            n_samples,
         })
     }
 
@@ -496,76 +414,13 @@ impl GVcfRecord {
     }
 
     // ============================================================================
-    // Genotype Accessors
-    // ============================================================================
-
-    /// Returns the genotypes for a specific sample as a slice.
-    ///
-    /// For a diploid sample, this returns a slice of length 2 containing the two allele indices.
-    /// Missing genotypes are represented as `-1`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `sample_idx >= self.n_samples()`.
-    #[inline]
-    pub fn sample_genotypes(&self, sample_idx: usize) -> &[i8] {
-        let start = sample_idx * self.ploidy as usize;
-        let end = start + self.ploidy as usize;
-        &self.genotypes[start..end]
-    }
-
-    /// Returns whether the specified sample is phased.
-    ///
-    /// Phased genotypes use `'|'` separator, unphased use `'/'`.
-    #[inline]
-    pub fn is_phased(&self, sample_idx: usize) -> bool {
-        self.phase[sample_idx]
-    }
-
-    /// Returns whether the specified sample has a missing genotype.
-    ///
-    /// A genotype is missing if any allele is `-1` (represented as `'.'` in VCF).
-    #[inline]
-    #[must_use]
-    pub fn is_missing(&self, sample_idx: usize) -> bool {
-        self.sample_genotypes(sample_idx)
-            .iter()
-            .any(|&a| a == MISSING_ALLELE)
-    }
-
-    /// Returns whether the specified sample is homozygous reference (all alleles are 0).
-    #[inline]
-    #[must_use]
-    pub fn is_hom_ref(&self, sample_idx: usize) -> bool {
-        self.sample_genotypes(sample_idx).iter().all(|&a| a == 0)
-    }
-
-    /// Returns whether the specified sample is homozygous (all alleles are the same).
-    #[inline]
-    #[must_use]
-    pub fn is_homozygous(&self, sample_idx: usize) -> bool {
-        let gts = self.sample_genotypes(sample_idx);
-        if gts.is_empty() {
-            return false;
-        }
-        let first = gts[0];
-        gts.iter().all(|&a| a == first)
-    }
-
-    // ============================================================================
     // Metadata
     // ============================================================================
 
     /// Returns the number of samples in this record.
     #[inline]
     pub fn n_samples(&self) -> usize {
-        self.phase.len() / (self.ploidy as usize)
-    }
-
-    /// Returns the ploidy of this variant.
-    #[inline]
-    pub fn ploidy(&self) -> u8 {
-        self.ploidy
+        self.n_samples
     }
 
     // ============================================================================
@@ -617,8 +472,7 @@ pub struct GVcfRecordIterator<B: BufRead> {
     format_cache: LruCache<String, (usize, Option<usize>), RandomState>,
     /// Sample names extracted from the #CHROM header line
     samples: Vec<String>,
-    /// Last seen ploidy to optimize buffer allocation
-    last_seen_ploidy: u8,
+    ploidy: u8,
 }
 
 impl<B: BufRead> GVcfRecordIterator<B> {
@@ -637,7 +491,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
                 RandomState::new(),
             ),
             samples: Vec::new(),
-            last_seen_ploidy: DEFAULT_PLOIDY,
+            ploidy: DEFAULT_PLOIDY,
         };
 
         // Process the header and populate samples
@@ -712,11 +566,9 @@ impl<B: BufRead> GVcfRecordIterator<B> {
                         &self.line,
                         &mut self.format_cache,
                         n_samples,
-                        self.last_seen_ploidy,
+                        self.ploidy,
                     ) {
                         Ok(record) => {
-                            // Update last seen ploidy for next record
-                            self.last_seen_ploidy = record.ploidy;
                             self.vars_buffer.push_back(record);
                             n_items_added += 1;
                         }
