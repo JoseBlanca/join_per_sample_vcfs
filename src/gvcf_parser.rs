@@ -266,26 +266,49 @@ fn parse_genotypes(
             }
         };
 
-        // Fast path: check for common patterns
-        if gt_str == patterns.ref_unphased {
-            // Already zero-filled, skip
-            continue;
-        } else if gt_str == patterns.ref_phased {
-            phase[sample_idx] = true;
-            continue;
-        } else if gt_str == "." || gt_str == patterns.missing_unphased {
+        // Fast path: hardcoded diploid reference (most common case)
+        if ploidy == 2 {
+            if gt_str == "0/0" {
+                continue;
+            } else if gt_str == "0|0" {
+                phase[sample_idx] = true;
+                continue;
+            } else if gt_str == "./." {
+                let start = sample_idx * ploidy as usize;
+                genotypes[start] = MISSING_ALLELE;
+                genotypes[start + 1] = MISSING_ALLELE;
+                continue;
+            }
+        } else {
+            // Fast path: check for common patterns (any ploidy)
+            if gt_str == patterns.ref_unphased {
+                continue;
+            } else if gt_str == patterns.ref_phased {
+                phase[sample_idx] = true;
+                continue;
+            } else if gt_str == patterns.missing_unphased {
+                let start = sample_idx * ploidy as usize;
+                for i in 0..ploidy as usize {
+                    genotypes[start + i] = MISSING_ALLELE;
+                }
+                phase[sample_idx] = false;
+                continue;
+            } else if gt_str == patterns.missing_phased {
+                let start = sample_idx * ploidy as usize;
+                for i in 0..ploidy as usize {
+                    genotypes[start + i] = MISSING_ALLELE;
+                }
+                phase[sample_idx] = true;
+                continue;
+            }
+        }
+
+        if gt_str == "." {
             let start = sample_idx * ploidy as usize;
             for i in 0..ploidy as usize {
                 genotypes[start + i] = MISSING_ALLELE;
             }
             phase[sample_idx] = false;
-            continue;
-        } else if gt_str == patterns.missing_phased {
-            let start = sample_idx * ploidy as usize;
-            for i in 0..ploidy as usize {
-                genotypes[start + i] = MISSING_ALLELE;
-            }
-            phase[sample_idx] = true;
             continue;
         }
 
