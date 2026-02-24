@@ -79,6 +79,33 @@ const DEFAULT_PLOIDY: u8 = 2;
 /// Marker value for missing alleles in genotype data.
 const MISSING_ALLELE: i8 = -1;
 
+/// Pre-computed string patterns for common genotypes at a given ploidy.
+///
+/// These patterns are generated once and reused to enable fast-path matching
+/// in `parse_genotypes` without hardcoding ploidy-specific strings.
+struct CommonGenotypePatterns {
+    ref_unphased: String,
+    ref_phased: String,
+    missing_unphased: String,
+    missing_phased: String,
+}
+
+impl CommonGenotypePatterns {
+    fn new(ploidy: u8) -> Self {
+        let n = ploidy as usize;
+        let ref_unphased = (0..n).map(|_| "0").collect::<Vec<_>>().join("/");
+        let ref_phased = (0..n).map(|_| "0").collect::<Vec<_>>().join("|");
+        let missing_unphased = (0..n).map(|_| ".").collect::<Vec<_>>().join("/");
+        let missing_phased = (0..n).map(|_| ".").collect::<Vec<_>>().join("|");
+        Self {
+            ref_unphased,
+            ref_phased,
+            missing_unphased,
+            missing_phased,
+        }
+    }
+}
+
 /// A single variant record from a GVCF file.
 ///
 /// # Genotype Storage
@@ -205,6 +232,7 @@ fn parse_genotypes(
     n_samples: usize,
     gt_index: usize,
     ploidy: u8,
+    patterns: &CommonGenotypePatterns,
 ) -> VcfResult<(Vec<i8>, Vec<bool>)> {
     let total_num_alleles = n_samples * ploidy as usize;
 
@@ -239,31 +267,26 @@ fn parse_genotypes(
         };
 
         // Fast path: check for common patterns
-        if ploidy == 2 {
-            match gt_str {
-                "0/0" => {
-                    // Already zero-filled, skip
-                    continue;
-                }
-                "0|0" => {
-                    phase[sample_idx] = true;
-                    // Already zero-filled, skip
-                    continue;
-                }
-                "." | "./." => {
-                    genotypes[sample_idx * 2] = MISSING_ALLELE;
-                    genotypes[sample_idx * 2 + 1] = MISSING_ALLELE;
-                    phase[sample_idx] = false;
-                    continue;
-                }
-                ".|." => {
-                    genotypes[sample_idx * 2] = MISSING_ALLELE;
-                    genotypes[sample_idx * 2 + 1] = MISSING_ALLELE;
-                    phase[sample_idx] = true;
-                    continue;
-                }
-                _ => {}
+        if gt_str == patterns.ref_unphased {
+            // Already zero-filled, skip
+            continue;
+        } else if gt_str == patterns.ref_phased {
+            phase[sample_idx] = true;
+            continue;
+        } else if gt_str == "." || gt_str == patterns.missing_unphased {
+            let start = sample_idx * ploidy as usize;
+            for i in 0..ploidy as usize {
+                genotypes[start + i] = MISSING_ALLELE;
             }
+            phase[sample_idx] = false;
+            continue;
+        } else if gt_str == patterns.missing_phased {
+            let start = sample_idx * ploidy as usize;
+            for i in 0..ploidy as usize {
+                genotypes[start + i] = MISSING_ALLELE;
+            }
+            phase[sample_idx] = true;
+            continue;
         }
 
         // General path: parse genotype
@@ -307,6 +330,7 @@ impl GVcfRecord {
         format_cache: &mut LruCache<String, (usize, Option<usize>), RandomState>,
         n_samples: usize,
         ploidy: u8,
+        patterns: &CommonGenotypePatterns,
     ) -> VcfResult<Self> {
         let mut fields = line.splitn(10, '\t');
         let chrom = fields
@@ -369,7 +393,8 @@ impl GVcfRecord {
         };
 
         // Parse genotypes for all samples
-        let (genotypes, phase) = parse_genotypes(sample_fields, n_samples, gt_index, ploidy)?;
+        let (genotypes, phase) =
+            parse_genotypes(sample_fields, n_samples, gt_index, ploidy, patterns)?;
 
         Ok(GVcfRecord {
             chrom: chrom.to_string(),
@@ -473,6 +498,8 @@ pub struct GVcfRecordIterator<B: BufRead> {
     /// Sample names extracted from the #CHROM header line
     samples: Vec<String>,
     ploidy: u8,
+    /// Pre-computed patterns for fast-path genotype matching
+    common_gt_patterns: CommonGenotypePatterns,
 }
 
 impl<B: BufRead> GVcfRecordIterator<B> {
@@ -492,6 +519,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
             ),
             samples: Vec::new(),
             ploidy: DEFAULT_PLOIDY,
+            common_gt_patterns: CommonGenotypePatterns::new(DEFAULT_PLOIDY),
         };
 
         // Process the header and populate samples
@@ -567,6 +595,7 @@ impl<B: BufRead> GVcfRecordIterator<B> {
                         &mut self.format_cache,
                         n_samples,
                         self.ploidy,
+                        &self.common_gt_patterns,
                     ) {
                         Ok(record) => {
                             self.vars_buffer.push_back(record);
