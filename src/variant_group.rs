@@ -9,7 +9,7 @@ use crate::gvcf_parser::{GVcfRecord, GVcfRecordIterator, VcfResult};
 /// The bin covers a contiguous genomic region where all contained variants
 /// have reference-allele spans that overlap with the bin's span.
 #[derive(Debug)]
-pub struct VariantBin {
+pub struct OverlappingVariantGroup {
     pub chrom: String,
     /// Start position of the bin (1-based, inclusive).
     pub start: u32,
@@ -19,7 +19,7 @@ pub struct VariantBin {
     pub records: Vec<GVcfRecord>,
 }
 
-impl VariantBin {
+impl OverlappingVariantGroup {
     pub fn span(&self) -> (&str, u32, u32) {
         (&self.chrom, self.start, self.end)
     }
@@ -43,7 +43,6 @@ pub struct VariantGroupIterator<B: BufRead> {
     current_chrom_idx: usize,
     chroms_seen: HashSet<String>,
     last_bin_start: Option<u32>,
-    all_samples: Vec<String>,
     done: bool,
 }
 
@@ -53,26 +52,18 @@ impl<B: BufRead> VariantGroupIterator<B> {
     /// # Arguments
     /// * `vcf_iters` - Per-sample VCF iterators to merge.
     /// * `sorted_chromosomes` - The expected chromosome processing order.
-    ///
-    /// # Errors
-    /// Returns an error if any sample name appears in more than one VCF.
     pub fn new(
         vcf_iters: Vec<GVcfRecordIterator<B>>,
         sorted_chromosomes: Vec<String>,
     ) -> VcfResult<Self> {
-        let mut all_samples = Vec::new();
-        let mut seen_samples: HashSet<String> = HashSet::new();
+        let mut seen_samples = HashSet::new();
         for iter in &vcf_iters {
             for sample in iter.samples() {
-                if !seen_samples.insert(sample.clone()) {
+                if !seen_samples.insert(sample) {
                     return Err(VcfParseError::RuntimeError {
-                        message: format!(
-                            "Sample '{}' appears in multiple VCF files",
-                            sample
-                        ),
+                        message: format!("Sample '{}' appears in multiple VCF files", sample),
                     });
                 }
-                all_samples.push(sample.clone());
             }
         }
 
@@ -82,22 +73,16 @@ impl<B: BufRead> VariantGroupIterator<B> {
             current_chrom_idx: 0,
             chroms_seen: HashSet::new(),
             last_bin_start: None,
-            all_samples,
             done: false,
         })
     }
 
-    /// Returns all sample names across all input VCFs.
-    pub fn samples(&self) -> &[String] {
-        &self.all_samples
-    }
-
-    fn fail(&mut self, error: VcfParseError) -> Option<VcfResult<VariantBin>> {
+    fn fail(&mut self, error: VcfParseError) -> Option<VcfResult<OverlappingVariantGroup>> {
         self.done = true;
         Some(Err(error))
     }
 
-    fn next_bin(&mut self) -> Option<VcfResult<VariantBin>> {
+    fn get_next_variant_group(&mut self) -> Option<VcfResult<OverlappingVariantGroup>> {
         if self.done {
             return None;
         }
@@ -267,7 +252,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
             self.last_bin_start = None;
         }
 
-        Some(Ok(VariantBin {
+        Some(Ok(OverlappingVariantGroup {
             chrom: current_chrom,
             start: bin_start,
             end: bin_end,
@@ -277,9 +262,9 @@ impl<B: BufRead> VariantGroupIterator<B> {
 }
 
 impl<B: BufRead> Iterator for VariantGroupIterator<B> {
-    type Item = VcfResult<VariantBin>;
+    type Item = VcfResult<OverlappingVariantGroup>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.next_bin()
+        self.get_next_variant_group()
     }
 }
