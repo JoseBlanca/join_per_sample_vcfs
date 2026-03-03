@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
 
-use join_per_sample_vcfs::gvcf_parser::GVcfRecordIterator;
+use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 
 fn bench_parse_gz_end_to_end(c: &mut Criterion) {
     let path = Path::new("/home/jose/analyses/g2psol/source_data/TS.vcf.gz");
@@ -11,8 +11,7 @@ fn bench_parse_gz_end_to_end(c: &mut Criterion) {
 
     c.bench_function("gvcf parse TS.vcf.gz (end-to-end)", |b| {
         b.iter(|| {
-            let records =
-                GVcfRecordIterator::from_gzip_path(path).expect("Problem opening test file");
+            let records = VariantIterator::from_gzip_path(path).expect("Problem opening test file");
 
             let mut n_variants: u32 = 0;
             for record in records {

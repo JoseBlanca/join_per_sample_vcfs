@@ -1,4 +1,4 @@
-use join_per_sample_vcfs::gvcf_parser::GVcfRecordIterator;
+use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 use std::fs::File;
 use std::io::BufReader;
 
@@ -15,7 +15,7 @@ const SAMPLE_GVCF: &str = "##
 #[test]
 fn test_gvcf_parsing() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let mut n_variants: u32 = 0;
     for record in parser {
         match record {
@@ -35,7 +35,7 @@ fn test_gvcf_parsing() {
 fn test_peek_variant() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
     let mut var_iterator =
-        GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+        VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Peek should return the first variant without consuming it
     let peeked = var_iterator.peek_variant().unwrap().unwrap();
@@ -58,7 +58,7 @@ fn test_peek_variant() {
 fn test_peek_variant_exhausted() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
     let mut var_iterator =
-        GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+        VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Consume all variants
     while var_iterator.next().is_some() {}
@@ -71,7 +71,7 @@ fn test_peek_variant_exhausted() {
 #[test]
 fn test_gzip_reader() {
     let file = File::open("tests/data/sample.g.vcf.gz").expect("Problem opening test file");
-    let records = GVcfRecordIterator::from_gzip_reader(file).expect("Failed to create parser");
+    let records = VariantIterator::from_gzip_reader(file).expect("Failed to create parser");
 
     let mut n_variants: u32 = 0;
     for record in records {
@@ -90,7 +90,7 @@ fn test_gzip_reader() {
 #[test]
 fn test_gzip_path() {
     let path = "tests/data/sample.g.vcf.gz";
-    let records = GVcfRecordIterator::from_gzip_path(path).expect("Problem opening test file");
+    let records = VariantIterator::from_gzip_path(path).expect("Problem opening test file");
 
     let mut n_variants: u32 = 0;
     for record in records {
@@ -117,7 +117,7 @@ chr1\t10\t.\tAT\tA\t30\tPASS\t.\tGT\t0/1
 chr1\t10\t.\tA\tATT\t30\tPASS\t.\tGT\t0/1";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 3);
@@ -135,7 +135,7 @@ chr1\t10\t.\tA\tATT\t30\tPASS\t.\tGT\t0/1";
 #[test]
 fn test_ref_allele_len() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
@@ -163,7 +163,7 @@ fn test_ref_allele_len() {
 #[test]
 fn test_sample_parsing() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Samples should be available immediately after construction
     let samples = parser.samples();
@@ -176,7 +176,7 @@ fn test_sample_parsing() {
 #[test]
 fn test_sample_parsing_with_buffer() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let mut parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Samples should be available immediately after construction
     let samples = parser.samples();
@@ -196,7 +196,7 @@ fn test_sample_parsing_single_sample() {
 chr1\t10\t.\tA\tC\t30\tPASS\t.\tGT\t0/1";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Samples should be available immediately after construction
     let samples = parser.samples();
@@ -212,7 +212,7 @@ chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t0/0\t0/1\t1/1
 chr1\t200\t.\tG\tT\t40\tPASS\t.\tGT\t0|0\t0|1\t1|1";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 2);
@@ -225,7 +225,7 @@ fn test_genotype_parsing_missing() {
 chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t./.\t0/1\t.|.";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 1);
@@ -238,7 +238,7 @@ fn test_genotype_parsing_multiallelic() {
 chr1\t100\t.\tA\tC,G,T\t30\tPASS\t.\tGT\t0/1\t2/3";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 1);
@@ -251,7 +251,7 @@ fn test_genotype_with_format_fields() {
 chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT:GQ:DP\t0/1:30:10\t1|1:40:15";
 
     let reader = BufReader::new(vcf_data.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 1);
@@ -261,7 +261,7 @@ chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT:GQ:DP\t0/1:30:10\t1|1:40:15";
 fn test_genotype_performance_with_sample_gvcf() {
     // Use the existing SAMPLE_GVCF data which has genotypes
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let parser = GVcfRecordIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 6);

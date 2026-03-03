@@ -1,17 +1,14 @@
 use std::io::BufReader;
 
-use join_per_sample_vcfs::gvcf_parser::GVcfRecordIterator;
+use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 use join_per_sample_vcfs::variant_group::VariantGroupIterator;
 
-fn make_iter(vcf_data: &str) -> GVcfRecordIterator<BufReader<BufReader<&[u8]>>> {
+fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
-    GVcfRecordIterator::from_reader(reader).expect("Failed to create parser")
+    VariantIterator::from_reader(reader).expect("Failed to create parser")
 }
 
-fn collect_spans(
-    vcf_data: &[&str],
-    sorted_chromosomes: Vec<String>,
-) -> Vec<(String, u32, u32)> {
+fn collect_spans(vcf_data: &[&str], sorted_chromosomes: Vec<String>) -> Vec<(String, u32, u32)> {
     let iters: Vec<_> = vcf_data.iter().map(|d| make_iter(d)).collect();
     let grouper =
         VariantGroupIterator::new(iters, sorted_chromosomes).expect("Failed to create grouper");
@@ -150,8 +147,7 @@ fn test_binning_with_deletion_spanning_several_snps() {
 #[test]
 fn test_wrong_chrom_order() {
     let iter = make_iter(VCF_WITH_WRONG_CHROMOSOME_ORDER);
-    let grouper =
-        VariantGroupIterator::new(vec![iter], vec!["1".into(), "2".into()]).unwrap();
+    let grouper = VariantGroupIterator::new(vec![iter], vec!["1".into(), "2".into()]).unwrap();
     let results: Vec<_> = grouper.collect();
     assert!(
         results.iter().any(|r| r.is_err()),
