@@ -215,6 +215,32 @@ fn test_wrong_order() {
 }
 
 #[test]
+fn test_source_iter_samples() {
+    // VCF1 has sample NA00001, VCF3 has sample NA00003
+    // All variants merge into one bin: ("20", 1, 6)
+    // First 6 variants come from VCF1 (iter 0), last from VCF3 (iter 1)
+    let iters = vec![make_iter(VCF1), make_iter(VCF3)];
+    let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
+    let iter_info = grouper.iter_info().to_vec();
+    let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
+
+    assert_eq!(iter_info.len(), 2);
+    assert_eq!(iter_info[0].samples, vec!["NA00001"]);
+    assert_eq!(iter_info[1].samples, vec!["NA00003"]);
+
+    let group = &groups[0];
+    assert_eq!(group.variants.len(), 7);
+    assert_eq!(group.source_var_iter_idxs.len(), 7);
+
+    // First 6 variants from VCF1 (iter 0), last from VCF3 (iter 1)
+    assert_eq!(group.source_var_iter_idxs, vec![0, 0, 0, 0, 0, 0, 1]);
+
+    // Verify we can look up sample names for each variant via iter_info
+    let sample_for_last_variant = &iter_info[group.source_var_iter_idxs[6]].samples;
+    assert_eq!(sample_for_last_variant, &vec!["NA00003".to_string()]);
+}
+
+#[test]
 fn test_duplicate_samples() {
     let iter1 = make_iter(VCF1);
     let iter2 = make_iter(VCF1); // same sample name NA00001

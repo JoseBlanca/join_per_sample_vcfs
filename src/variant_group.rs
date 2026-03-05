@@ -4,6 +4,12 @@ use std::io::BufRead;
 use crate::errors::VcfParseError;
 use crate::gvcf_parser::{Variant, VariantIterator, VcfResult};
 
+/// Metadata about a `VariantIterator`
+#[derive(Debug, Clone)]
+pub struct VariantIteratorInfo {
+    pub samples: Vec<String>,
+}
+
 /// A bin of overlapping variants collected from multiple per-sample VCFs.
 ///
 /// The bin covers a contiguous genomic region where all contained variants
@@ -17,6 +23,9 @@ pub struct OverlappingVariantGroup {
     pub end: u32,
     /// All variant records in this bin, in consumption order.
     pub variants: Vec<Variant>,
+    /// Index into `VariantGroupIterator::iter_info` for each variant,
+    /// parallel to `variants`.
+    pub source_var_iter_idxs: Vec<usize>,
 }
 
 impl OverlappingVariantGroup {
@@ -39,6 +48,7 @@ fn ref_span_end(record: &Variant) -> u32 {
 /// falls within the other's reference-allele span.
 pub struct VariantGroupIterator<B: BufRead> {
     vcf_iters: Vec<VariantIterator<B>>,
+    iter_info: Vec<VariantIteratorInfo>,
     sorted_chromosomes: Vec<String>,
     current_chrom_idx: usize,
     chroms_seen: HashSet<String>,
@@ -57,6 +67,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
         sorted_chromosomes: Vec<String>,
     ) -> VcfResult<Self> {
         let mut seen_samples = HashSet::new();
+        let mut iter_info = Vec::with_capacity(vcf_iters.len());
         for iter in &vcf_iters {
             for sample in iter.samples() {
                 if !seen_samples.insert(sample) {
@@ -65,16 +76,24 @@ impl<B: BufRead> VariantGroupIterator<B> {
                     });
                 }
             }
+            iter_info.push(VariantIteratorInfo {
+                samples: iter.samples().to_vec(),
+            });
         }
 
         Ok(Self {
             vcf_iters,
+            iter_info,
             sorted_chromosomes,
             current_chrom_idx: 0,
             chroms_seen: HashSet::new(),
             last_group_start: None,
             done: false,
         })
+    }
+
+    pub fn iter_info(&self) -> &[VariantIteratorInfo] {
+        &self.iter_info
     }
 
     fn fail(&mut self, error: VcfParseError) -> Option<VcfResult<OverlappingVariantGroup>> {
@@ -165,8 +184,9 @@ impl<B: BufRead> VariantGroupIterator<B> {
         &mut self,
         current_chrom: &str,
         mut group_end: u32,
-    ) -> VcfResult<(Vec<Variant>, u32)> {
+    ) -> VcfResult<(Vec<Variant>, Vec<usize>, u32)> {
         let mut records: Vec<Variant> = Vec::new();
+        let mut source_indices: Vec<usize> = Vec::new();
 
         loop {
             let mut added_any = false;
@@ -200,6 +220,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
                     }
 
                     records.push(record);
+                    source_indices.push(i);
                     added_any = true;
                 }
             }
@@ -209,7 +230,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
             }
         }
 
-        Ok((records, group_end))
+        Ok((records, source_indices, group_end))
     }
 
     fn chromosome_has_remaining_variants(&mut self, current_chrom: &str) -> VcfResult<bool> {
@@ -233,7 +254,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
             Err(e) => return self.fail(e),
         };
 
-        let (overlapping_vars, group_end) =
+        let (overlapping_vars, source_indices, group_end) =
             match self.group_overlapping_vars(&current_chrom, group_end) {
                 Ok(v) => v,
                 Err(e) => return self.fail(e),
@@ -257,6 +278,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
             start: group_start,
             end: group_end,
             variants: overlapping_vars,
+            source_var_iter_idxs: source_indices,
         }))
     }
 }
