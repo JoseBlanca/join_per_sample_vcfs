@@ -88,6 +88,13 @@ const VCF_WITH_WRONG_ORDER: &str = "##\n\
 #[test]
 fn test_simple_binning() {
     // VCF1 + VCF2: same SNP positions → one bin per position
+    //    GTATGG
+    // 20 123456
+    // VCF1
+    //    AAG AA
+    // VCF2
+    //    AAG AA
+
     let spans = collect_spans(&[VCF1, VCF2], vec!["1".into(), "20".into()]);
     assert_eq!(
         spans,

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::BufRead;
 
 use crate::errors::VcfParseError;
-use crate::gvcf_parser::{GVcfRecord, VariantIterator, VcfResult};
+use crate::gvcf_parser::{Variant, VariantIterator, VcfResult};
 
 /// A bin of overlapping variants collected from multiple per-sample VCFs.
 ///
@@ -16,7 +16,7 @@ pub struct OverlappingVariantGroup {
     /// End position of the bin (1-based, inclusive).
     pub end: u32,
     /// All variant records in this bin, in consumption order.
-    pub records: Vec<GVcfRecord>,
+    pub variants: Vec<Variant>,
 }
 
 impl OverlappingVariantGroup {
@@ -27,7 +27,7 @@ impl OverlappingVariantGroup {
 
 /// Computes the reference-allele span end for a variant (1-based, inclusive).
 #[inline]
-fn ref_span_end(record: &GVcfRecord) -> u32 {
+fn ref_span_end(record: &Variant) -> u32 {
     record.pos + record.ref_allele_len as u32 - 1
 }
 
@@ -165,8 +165,8 @@ impl<B: BufRead> VariantGroupIterator<B> {
         &mut self,
         current_chrom: &str,
         mut group_end: u32,
-    ) -> VcfResult<(Vec<GVcfRecord>, u32)> {
-        let mut records: Vec<GVcfRecord> = Vec::new();
+    ) -> VcfResult<(Vec<Variant>, u32)> {
+        let mut records: Vec<Variant> = Vec::new();
 
         loop {
             let mut added_any = false;
@@ -256,7 +256,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
             chrom: current_chrom,
             start: group_start,
             end: group_end,
-            records: overlapping_vars,
+            variants: overlapping_vars,
         }))
     }
 }

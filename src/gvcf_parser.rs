@@ -117,7 +117,7 @@ impl CommonGenotypePatterns {
 /// - For diploid (p=2): `genotypes[i*2]` and `genotypes[i*2+1]` are the two alleles
 ///
 #[derive(Debug)]
-pub struct GVcfRecord {
+pub struct Variant {
     /// Chromosome/contig name
     pub chrom: String,
     /// Genomic position (1-based)
@@ -347,7 +347,7 @@ fn parse_genotypes(
     Ok((genotypes, phase))
 }
 
-impl GVcfRecord {
+impl Variant {
     fn from_line(
         line: &str,
         format_cache: &mut LruCache<String, (usize, Option<usize>), RandomState>,
@@ -419,7 +419,7 @@ impl GVcfRecord {
         let (genotypes, phase) =
             parse_genotypes(sample_fields, n_samples, gt_index, ploidy, patterns)?;
 
-        Ok(GVcfRecord {
+        Ok(Variant {
             chrom: chrom.to_string(),
             pos,
             alleles,
@@ -515,7 +515,7 @@ pub struct VariantIterator<B: BufRead> {
     /// Reusable line buffer
     line: String,
     /// Internal buffer of parsed records
-    vars_buffer: VecDeque<GVcfRecord>,
+    vars_buffer: VecDeque<Variant>,
     /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, pl_index).
     format_cache: LruCache<String, (usize, Option<usize>), RandomState>,
     /// Sample names extracted from the #CHROM header line
@@ -613,7 +613,7 @@ impl<B: BufRead> VariantIterator<B> {
             match self.reader.read_line(&mut self.line) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
-                    match GVcfRecord::from_line(
+                    match Variant::from_line(
                         &self.line,
                         &mut self.format_cache,
                         n_samples,
@@ -639,7 +639,7 @@ impl<B: BufRead> VariantIterator<B> {
     ///
     /// If the buffer is empty, it will attempt to fill it first.
     /// Returns `None` if the iterator is exhausted (no more variants).
-    pub fn peek_variant(&mut self) -> VcfResult<Option<&GVcfRecord>> {
+    pub fn peek_variant(&mut self) -> VcfResult<Option<&Variant>> {
         if self.vars_buffer.is_empty() {
             self.fill_buffer(DEF_N_VARIANTS_IN_BUFFER)?;
         }
@@ -681,7 +681,7 @@ impl VariantIterator<BufReader<MultiGzDecoder<File>>> {
 }
 
 impl<R: BufRead> Iterator for VariantIterator<R> {
-    type Item = VcfResult<GVcfRecord>;
+    type Item = VcfResult<Variant>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.vars_buffer.len() == 0 {
