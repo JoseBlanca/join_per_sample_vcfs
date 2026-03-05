@@ -331,6 +331,7 @@ dependencies = [
  "criterion",
  "flate2",
  "lru",
+ "rayon",
  "tempfile",
  "thiserror",
 ]

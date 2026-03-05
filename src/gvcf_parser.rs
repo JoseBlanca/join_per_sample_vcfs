@@ -129,9 +129,9 @@ pub struct Variant {
     /// Variant quality score (QUAL field). `NaN` if missing.
     pub qual: f32,
     /// Index of GT field in FORMAT (cached for internal use)
-    gt_index: usize,
+    pub(crate) gt_index: usize,
     /// Index of PL field in FORMAT if present (cached for internal use)
-    pl_index: Option<usize>,
+    pub(crate) pl_index: Option<usize>,
     /// Genotypes for all samples, stored as a flat vector.
     /// For sample `i` with ploidy `p`: `genotypes[i*p..(i+1)*p]`
     /// Missing genotypes are represented as `-1`
