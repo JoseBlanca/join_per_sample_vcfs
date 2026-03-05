@@ -157,6 +157,42 @@ fn test_binning_with_deletion_spanning_several_snps() {
 }
 
 #[test]
+fn test_bin_contains_expected_variants() {
+    // VCF1 (6 SNPs at 1-6) + VCF3 (deletion GTATGG→G at pos 1, spanning 1-6)
+    //         GTATGG
+    //      20 123456
+    // VCF1    AAG.AA
+    // VCF3    .-----
+    // All variants merge into one bin: ("20", 1, 6)
+    let iters = vec![make_iter(VCF1), make_iter(VCF3)];
+    let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
+    let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
+
+    assert_eq!(groups.len(), 1);
+    let group = &groups[0];
+    assert_eq!(group.span(), ("20", 1, 6));
+
+    // 6 SNPs from VCF1 + 1 deletion from VCF3 = 7 variants
+    assert_eq!(group.variants.len(), 7);
+
+    let positions: Vec<u32> = group.variants.iter().map(|v| v.pos).collect();
+    assert_eq!(positions, vec![1, 2, 3, 4, 5, 6, 1]);
+
+    let ref_alleles: Vec<&str> = group
+        .variants
+        .iter()
+        .map(|v| v.alleles[0].as_str())
+        .collect();
+    assert_eq!(ref_alleles, vec!["G", "T", "A", "T", "G", "G", "GTATGG"]);
+
+    // The deletion is the last variant (from VCF3, consumed after VCF1's variants)
+    let deletion = &group.variants[6];
+    assert_eq!(deletion.alleles[0], "GTATGG");
+    assert_eq!(deletion.alleles[1], "G");
+    assert_eq!(deletion.ref_allele_len, 6);
+}
+
+#[test]
 fn test_wrong_chrom_order() {
     let iter = make_iter(VCF_WITH_WRONG_CHROMOSOME_ORDER);
     let grouper = VariantGroupIterator::new(vec![iter], vec!["1".into(), "2".into()]).unwrap();
