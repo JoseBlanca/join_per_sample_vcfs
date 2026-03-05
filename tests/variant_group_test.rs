@@ -52,7 +52,7 @@ const VCF2: &str = "##\n\
 //     ------
 const VCF3: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00003\n\
-    20\t1\t.\tGATCGAT\tG\t20\tPASS\t.\tGT\t0|0";
+    20\t1\t.\tGTATGG\tG\t20\tPASS\t.\tGT\t0|0";
 
 // VCF4 — deletions on three different chromosomes
 //       CGATGAT
@@ -61,15 +61,15 @@ const VCF3: &str = "##\n\
 const VCF4: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00004\n\
     1\t4\t.\tGATCGAT\tG\t20\tPASS\t.\tGT\t0|0\n\
-    20\t4\t.\tCGATGAT\tC\t20\tPASS\t.\tGT\t0|0\n\
+    20\t4\t.\tTGGAGCAT\tT\t20\tPASS\t.\tGT\t0|0\n\
     21\t4\t.\tGATCGAT\tG\t20\tPASS\t.\tGT\t0|0";
 
-// VCF5 — SNPs at positions 3, 8, and 20
+// VCF5 — SNPs at positions 3, 8, and 12
 const VCF5: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00005\n\
-    20\t3\t.\tT\tA\t20\tPASS\t.\tGT\t0|0\n\
+    20\t3\t.\tA\tT\t20\tPASS\t.\tGT\t0|0\n\
     20\t8\t.\tG\tA\t20\tPASS\t.\tGT\t0|0\n\
-    20\t20\t.\tG\tA\t20\tPASS\t.\tGT\t0|0";
+    20\t12\t.\tG\tA\t20\tPASS\t.\tGT\t0|0";
 
 const VCF_WITH_WRONG_CHROMOSOME_ORDER: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00005\n\
@@ -125,17 +125,22 @@ fn test_simple_binning() {
 
 #[test]
 fn test_binning_with_deletion_spanning_several_snps() {
-    // VCF1 (6 SNPs at 1-6) + VCF3 (deletion at 1 spanning 1-7)
+    //         GTATGG
+    //      20 123456
+    // VCF1    AAG.AA
+    // VCF3    .-----
     // → all merge into one bin
     let spans = collect_spans(&[VCF1, VCF3], vec!["1".into(), "20".into()]);
-    assert_eq!(spans, vec![("20".into(), 1, 7)]);
+    assert_eq!(spans, vec![("20".into(), 1, 6)]);
 
     // VCF1 + VCF3 + VCF4 + VCF5
-    // chr 1: VCF4 has deletion at 4-10 → bin (1, 4, 10)
-    // chr 20: VCF1 SNPs 1-6, VCF3 deletion 1-7, VCF4 deletion 4-10, VCF5 SNPs 3,8
-    //   all overlap transitively → bin (20, 1, 10)
-    //   VCF5 SNP at 20 is separate → bin (20, 20, 20)
-    // chr 21: VCF4 has deletion at 4-10 → bin (21, 4, 10)
+    //            GATCGAT     GTATGGAGCATG     CTAGATCGAT
+    //       1 1234567890  20 123456789012  21 1234567890
+    // VCF1    ..........     AAG.AA......     ..........
+    // VCF3    ..........     .-----......     ..........
+    // VCF4    ....------     ....-------.     ....------
+    // VCF5    ..........     ..T....A...A     ..........
+
     let spans = collect_spans(
         &[VCF1, VCF3, VCF4, VCF5],
         vec!["1".into(), "20".into(), "21".into()],
@@ -144,8 +149,8 @@ fn test_binning_with_deletion_spanning_several_snps() {
         spans,
         vec![
             ("1".into(), 4, 10),
-            ("20".into(), 1, 10),
-            ("20".into(), 20, 20),
+            ("20".into(), 1, 11),
+            ("20".into(), 12, 12),
             ("21".into(), 4, 10),
         ]
     );
