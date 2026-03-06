@@ -1,4 +1,4 @@
-from variant_group import (
+from variant_group_analyzer import (
     VariantGroupIterable,
     VariantIteratorInfo,
     variant_from_dict,
@@ -34,7 +34,9 @@ def test():
     var_group_iter = create_variant_group_iterator(
         [variant_sample1, variant_sample2], ["sample1", "sample2"]
     )
-    print(list(var_group_iter))
+    var_group = list(var_group_iter)[0]
+    assert var_group.start == 10
+    assert var_group.end == 10
 
 
 def main():
