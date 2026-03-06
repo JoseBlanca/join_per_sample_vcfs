@@ -1,1 +1,3 @@
 /target
+__pycache__/
+python_draft/__pycache__/
