@@ -5,8 +5,11 @@ from variant_group_analyzer import (
     merge_variant_group,
     Variant,
     var_end,
+    Ok,
+    Err,
 )
 from typing import Iterator
+import pytest
 
 
 class VariantGroupIterator:
@@ -97,6 +100,26 @@ def create_variant_group_iterator(
     return VariantGroupIterable(variant_iterators=vars_iters, var_iter_infos=iter_infos)
 
 
+def check_expected_result(result, expected):
+    if isinstance(result, Ok):
+        variants, sample_ids = result.value
+        variant = variants[0]
+    else:
+        pytest.fail("Got error, but Ok expected")
+
+    assert expected["chrom"] == variant.chrom
+    assert expected["pos"] == variant.pos
+    assert expected["ref_allele"] == variant.alleles[0]
+    assert expected["alt_alleles"] == set(variant.alleles[1:])
+
+    alleles = dict(enumerate(variant.alleles))
+    for var_sample_gts, exp_sample_gts in zip(variant.genotypes, expected["genotypes"]):
+        var_sample_gts = [alleles[allele] for allele in var_sample_gts]
+        assert var_sample_gts == exp_sample_gts
+
+    assert variant.phases == expected["phases"]
+
+
 def test_simple_merge():
     var1_sample1 = {
         "chrom": 1,
@@ -109,7 +132,7 @@ def test_simple_merge():
         "chrom": 1,
         "pos": 11,
         "alleles": ["G", "C"],
-        "genotypes": [[0, 0]],
+        "genotypes": [[1, 1]],
         "phases": [False],
     }
     vars_in_vfc1 = [var1_sample1, var2_sample1]
@@ -124,7 +147,7 @@ def test_simple_merge():
     var2_sample2 = {
         "chrom": 1,
         "pos": 11,
-        "alleles": ["A", "C"],
+        "alleles": ["G", "T"],
         "genotypes": [[1, 1]],
         "phases": [False],
     }
@@ -136,8 +159,19 @@ def test_simple_merge():
         samples_in_vcfs=[samples_in_vcf1, samples_in_vcf2],
     )
     var_group: OverlappingVariantGroup = list(var_group_iter)[0]
-    merge_variant_group(
+    result = merge_variant_group(
         var_group,
         samples_have_one_var_per_position=True,
         var_iter_infos=var_group_iter.var_iter_infos,
     )
+
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "AG",
+        "alt_alleles": {"TC", "AT", "TT"},
+        "genotypes": [["TC", "TC"], ["AT", "TT"]],
+        "samples": ["sample1", "sample2"],
+        "phases": [False, False],
+    }
+    check_expected_result(result, expected)

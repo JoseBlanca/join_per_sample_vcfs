@@ -71,9 +71,18 @@ def create_variant_for_region(
     var_group: OverlappingVariantGroup,
     region: tuple[int, int],
     var_iter_infos: list[VariantIteratorInfo],
-) -> Variant:
+) -> tuple[Variant, list[tuple[int, int]]]:
 
+    # create the alleles for each sample by adding the alleles for each var
+    # alleles_for_samples dict
+    # key: sample_id
+    #   sample_id, tuple with two items:
+    #       - VariantIterator in which the variant is located (int index)
+    #       - int index of that sample in that VariantIterator
+    # value is a list of alleles for the corresponding sample, one per haploid chromosome.
+    # each item in the list is a list of str alleles, one per variant
     alleles_for_samples = {}
+
     for variant, var_iter_of_origin in zip(
         var_group.variants, var_group.var_iter_of_origin
     ):
@@ -84,20 +93,84 @@ def create_variant_for_region(
             sample_id = (var_iter_of_origin, sample_idx_in_var_iter)
             if sample_id not in alleles_for_samples:
                 alleles_for_samples[sample_id] = [[] for _ in range(len(sample_gt))]
-            print(sample_id, sample_gt, sample_phase)
             for haplo_chrom_idx, sample_allele_haplo_int in enumerate(sample_gt):
                 sample_allele_haplo = alleles[sample_allele_haplo_int]
                 alleles_for_samples[sample_id][haplo_chrom_idx].append(
                     sample_allele_haplo
                 )
-    print(alleles_for_samples)
+    print(f"{alleles_for_samples=}")
+
+    # create reference alleles
+    # allele_ids dict:
+    #   - value
+    ref_allele_per_var_iter = []
+    for _ in var_iter_infos:
+        ref_allele_per_var_iter.append([])
+
+    for variant, var_iter_of_origin in zip(
+        var_group.variants, var_group.var_iter_of_origin
+    ):
+        var_ref_allele = variant.alleles[0]
+        ref_allele_per_var_iter[var_iter_of_origin].append(var_ref_allele)
+    ref_allele = "".join(ref_allele_per_var_iter[0])
+    for other_ref_per_var_iter in ref_allele_per_var_iter[1:]:
+        assert ref_allele == "".join(other_ref_per_var_iter)
+
+    allele_ids = {ref_allele: 0}
+    # create str alleles and modify alleles_for_samples to hold strs instead of lists
+    for sample_id, alleles_for_sample in alleles_for_samples.items():
+        alleles_for_sample_str = []
+        for allele_list in alleles_for_sample:
+            allele = "".join(allele_list)
+
+            if allele in allele_ids:
+                allele_id = allele_ids[allele]
+            else:
+                allele_id = len(allele_ids)
+                allele_ids[allele] = allele_id
+
+            alleles_for_sample_str.append(allele)
+        alleles_for_samples[sample_id] = alleles_for_sample_str
+
+    # create sample and genotypes for each sample
+    sample_ids = []
+    genotypes = []
+    for var_iter_idx, var_iter_info in enumerate(var_iter_infos):
+        for sample_idx, sample in enumerate(var_iter_info.samples):
+            sample_id = (var_iter_idx, sample_idx)
+            sample_ids.append(sample_id)
+            alleles_for_sample = alleles_for_samples[sample_id]
+            sample_gts = tuple(allele_ids[allele] for allele in alleles_for_sample)
+            genotypes.append(sample_gts)
+
+    for sample_id, alleles_for_sample in alleles_for_samples.items():
+        print(f"{sample_id=}")
+        var_iter_of_origin, sample_idx_in_var_iter = sample_id
+        sample = var_iter_infos[var_iter_of_origin].samples[sample_idx_in_var_iter]
+        print(f"{sample=}")
+        print(f"{alleles_for_sample=}")
+
+    alleles = list(allele_ids.keys())
+    alleles = sorted(alleles, key=lambda x: allele_ids[x])
+
+    print(f"{genotypes=}")
+    print(f"{alleles=}")
+    phases = [False] * len(sample_ids)
+    variant = Variant(
+        chrom=var_group.chrom,
+        pos=var_group.start,
+        alleles=alleles,
+        genotypes=genotypes,
+        phases=phases,
+    )
+    return variant, sample_ids
 
 
 def merge_variant_group(
     variant_group: OverlappingVariantGroup,
     var_iter_infos: list[VariantIteratorInfo],
     samples_have_one_var_per_position: bool,
-) -> Result[list[Variant], str]:
+) -> Result[tuple[list[Variant], list[tuple[int, int]]], str]:
 
     if not samples_have_one_var_per_position:
         return Err(
@@ -114,9 +187,9 @@ def merge_variant_group(
 
     variants: list[Variant] = []
     for region in variant_regions:
-        variant = create_variant_for_region(
+        variant, sample_ids = create_variant_for_region(
             variant_group, region, var_iter_infos=var_iter_infos
         )
         variants.append(variant)
 
-    return Ok(variants)
+    return Ok((variants, sample_ids))
