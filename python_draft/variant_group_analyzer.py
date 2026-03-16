@@ -41,6 +41,14 @@ def variant_new(
     )
 
 
+def var_len(variant: Variant):
+    return len(variant.alleles[0])
+
+
+def var_end(variant: Variant):
+    return var_len(variant) + variant.pos - 1
+
+
 def variant_from_dict(variant: dict) -> Variant:
     return variant_new(**variant)
 
@@ -57,65 +65,6 @@ class OverlappingVariantGroup:
 
     def __str__(self):
         return f"{self.chrom}:{self.start}-{self.end} ({len(self.variants)})"
-
-
-class VariantGroupIterator:
-    def __init__(
-        self,
-        variant_iterators: list[Iterator[Variant]],
-        iter_infos: list[VariantIteratorInfo],
-    ):
-        self.variant_iterators = variant_iterators
-        self.var_iter_infos = iter_infos
-
-    def __next__(self) -> OverlappingVariantGroup:
-        vars_in_group: list[Variant] = []
-        var_iter_of_origin: list[int] = []
-        for var_iter_idx, var_iter in enumerate(self.variant_iterators):
-            for var in var_iter:
-                vars_in_group.append(var)
-                var_iter_of_origin.append(var_iter_idx)
-
-        if not vars_in_group:
-            raise StopIteration
-
-        start = 10
-        end = start
-        var_group = OverlappingVariantGroup(
-            variants=vars_in_group,
-            chrom=1,
-            start=start,
-            end=end,
-            var_iter_of_origin=var_iter_of_origin,
-        )
-        return var_group
-
-    def __iter__(self):
-        return self
-
-
-class VariantGroupIterable:
-    def __init__(
-        self,
-        variant_iterators: list[Iterator[Variant]],
-        var_iter_infos: list[VariantIteratorInfo],
-    ):
-        assert len(variant_iterators) == len(var_iter_infos)
-
-        samples_seen = set()
-        for iter_info in var_iter_infos:
-            for sample in iter_info.samples:
-                if sample in samples_seen:
-                    raise RuntimeError(
-                        f"One sample should not be found in more than one VariantIterator: {sample}"
-                    )
-                samples_seen.add(sample)
-
-        self.variant_iterators = variant_iterators
-        self.var_iter_infos = var_iter_infos
-
-    def __iter__(self) -> VariantGroupIterator:
-        return VariantGroupIterator(self.variant_iterators, self.var_iter_infos)
 
 
 def create_variant_for_region(
