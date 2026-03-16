@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Iterator, Iterable
 from typing import Generic, TypeVar, Union
 
 T = TypeVar("T")
@@ -82,7 +81,7 @@ def create_variant_for_region(
     # value is a list of alleles for the corresponding sample, one per haploid chromosome.
     # each item in the list is a list of str alleles, one per variant
     alleles_for_samples = {}
-
+    positions_left_in_del = {}
     for variant, var_iter_of_origin in zip(
         var_group.variants, var_group.var_iter_of_origin
     ):
@@ -93,11 +92,33 @@ def create_variant_for_region(
             sample_id = (var_iter_of_origin, sample_idx_in_var_iter)
             if sample_id not in alleles_for_samples:
                 alleles_for_samples[sample_id] = [[] for _ in range(len(sample_gt))]
+                positions_left_in_del[sample_id] = 0
+
+            ref_allele = variant.alleles[0]
+            if len(ref_allele) > 1:
+                print("deletion created:", ref_allele)
+                deletion_created = True
+                positions_left_in_del[sample_id] = len(ref_allele)
+            else:
+                deletion_created = False
+
             for haplo_chrom_idx, sample_allele_haplo_int in enumerate(sample_gt):
                 sample_allele_haplo = alleles[sample_allele_haplo_int]
+
+                # the allele could have more than 1 nucleotides when is the first in a deletion
+                # but we should only add the first nucleotide, the one corresponding to this position
+                sample_allele_haplo = sample_allele_haplo[0]
+
+                if positions_left_in_del[sample_id] > 0 and not deletion_created:
+                    sample_allele_haplo = ""
+
                 alleles_for_samples[sample_id][haplo_chrom_idx].append(
                     sample_allele_haplo
                 )
+                print(f"{sample_allele_haplo=}")
+            if positions_left_in_del[sample_id] > 0:
+                positions_left_in_del[sample_id] -= 1
+
     print(f"{alleles_for_samples=}")
 
     # create reference alleles
@@ -111,8 +132,9 @@ def create_variant_for_region(
         var_group.variants, var_group.var_iter_of_origin
     ):
         var_ref_allele = variant.alleles[0]
-        ref_allele_per_var_iter[var_iter_of_origin].append(var_ref_allele)
+        ref_allele_per_var_iter[var_iter_of_origin].append(var_ref_allele[0])
     ref_allele = "".join(ref_allele_per_var_iter[0])
+    print(f"{ref_allele_per_var_iter=}")
     for other_ref_per_var_iter in ref_allele_per_var_iter[1:]:
         assert ref_allele == "".join(other_ref_per_var_iter)
 

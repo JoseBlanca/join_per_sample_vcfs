@@ -175,3 +175,60 @@ def test_simple_merge():
         "phases": [False, False],
     }
     check_expected_result(result, expected)
+
+
+def test_simple_deletion():
+    var1_sample1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["AT", "A"],
+        "genotypes": [[1, 1]],
+        "phases": [False],
+    }
+    var2_sample1 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["T"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    vars_in_vfc1 = [var1_sample1, var2_sample1]
+    samples_in_vcf1 = ["sample1"]
+    var1_sample2 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["A", "T"],
+        "genotypes": [[0, 1]],
+        "phases": [False],
+    }
+    var2_sample2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["T"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    vars_in_vfc2 = [var1_sample2, var2_sample2]
+    samples_in_vcf2 = ["sample2"]
+
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[vars_in_vfc1, vars_in_vfc2],
+        samples_in_vcfs=[samples_in_vcf1, samples_in_vcf2],
+    )
+    var_group: OverlappingVariantGroup = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "AT",
+        "alt_alleles": {"A", "TT"},
+        "genotypes": [["A", "A"], ["AT", "TT"]],
+        "samples": ["sample1", "sample2"],
+        "phases": [False, False],
+    }
+    check_expected_result(result, expected)
