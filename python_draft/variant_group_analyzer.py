@@ -90,14 +90,25 @@ def create_variant_for_region(
             zip(variant.genotypes, variant.phases)
         ):
             sample_id = (var_iter_of_origin, sample_idx_in_var_iter)
+
+            ploidy = len(sample_gt)
+
             if sample_id not in alleles_for_samples:
                 alleles_for_samples[sample_id] = [[] for _ in range(len(sample_gt))]
-                positions_left_in_del[sample_id] = 0
+                positions_left_in_del[sample_id] = [0] * ploidy
 
             ref_allele = variant.alleles[0]
             if len(ref_allele) > 1:
                 deletion_created = True
-                positions_left_in_del[sample_id] = len(ref_allele)
+                del_len = len(ref_allele) - 1
+                positions_left_in_del_for_sample = []
+                for sample_allele_haplo_int in sample_gt:
+                    if sample_allele_haplo_int != 0:
+                        positions_left_in_del_for_sample.append(del_len)
+                    else:
+                        positions_left_in_del_for_sample.append(0)
+                positions_left_in_del[sample_id] = positions_left_in_del_for_sample
+                print(f"{positions_left_in_del=}")
             else:
                 deletion_created = False
 
@@ -108,14 +119,16 @@ def create_variant_for_region(
                 # but we should only add the first nucleotide, the one corresponding to this position
                 sample_allele_haplo = sample_allele_haplo[0]
 
-                if positions_left_in_del[sample_id] > 0 and not deletion_created:
+                if (
+                    positions_left_in_del[sample_id][haplo_chrom_idx] > 0
+                    and not deletion_created
+                ):
                     sample_allele_haplo = ""
+                    positions_left_in_del[sample_id][haplo_chrom_idx] -= 1
 
                 alleles_for_samples[sample_id][haplo_chrom_idx].append(
                     sample_allele_haplo
                 )
-            if positions_left_in_del[sample_id] > 0:
-                positions_left_in_del[sample_id] -= 1
 
     print(f"{alleles_for_samples=}")
 
