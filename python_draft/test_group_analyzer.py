@@ -232,3 +232,74 @@ def test_simple_deletion():
         "phases": [False, False],
     }
     check_expected_result(result, expected)
+
+
+def test_deletion_len_2():
+    var1_sample1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["ATT", "A"],
+        "genotypes": [[1, 1]],
+        "phases": [False],
+    }
+    var2_sample1 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["T"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    var3_sample1 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["T"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    vars_in_vfc1 = [var1_sample1, var2_sample1, var3_sample1]
+    samples_in_vcf1 = ["sample1"]
+    var1_sample2 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["A", "T"],
+        "genotypes": [[0, 1]],
+        "phases": [False],
+    }
+    var2_sample2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["T"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    var3_sample2 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["T", "A"],
+        "genotypes": [[1, 1]],
+        "phases": [False],
+    }
+    vars_in_vfc2 = [var1_sample2, var2_sample2, var3_sample2]
+    samples_in_vcf2 = ["sample2"]
+
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[vars_in_vfc1, vars_in_vfc2],
+        samples_in_vcfs=[samples_in_vcf1, samples_in_vcf2],
+    )
+    var_group: OverlappingVariantGroup = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "ATT",
+        "alt_alleles": {"A", "TTA", "ATA"},
+        "genotypes": [["A", "A"], ["ATA", "TTA"]],
+        "samples": ["sample1", "sample2"],
+        "phases": [False, False],
+    }
+    check_expected_result(result, expected)

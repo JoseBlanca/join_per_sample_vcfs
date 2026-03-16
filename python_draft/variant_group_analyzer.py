@@ -96,7 +96,6 @@ def create_variant_for_region(
 
             ref_allele = variant.alleles[0]
             if len(ref_allele) > 1:
-                print("deletion created:", ref_allele)
                 deletion_created = True
                 positions_left_in_del[sample_id] = len(ref_allele)
             else:
@@ -115,7 +114,6 @@ def create_variant_for_region(
                 alleles_for_samples[sample_id][haplo_chrom_idx].append(
                     sample_allele_haplo
                 )
-                print(f"{sample_allele_haplo=}")
             if positions_left_in_del[sample_id] > 0:
                 positions_left_in_del[sample_id] -= 1
 
