@@ -161,9 +161,11 @@ def create_variant_for_region(
             for haplo_chrom_idx, sample_allele_haplo_int in enumerate(sample_gt):
                 sample_allele_haplo = alleles[sample_allele_haplo_int]
 
-                # the allele could have more than 1 nucleotides when is the first in a deletion
-                # but we should only add the first nucleotide, the one corresponding to this position
-                sample_allele_haplo = sample_allele_haplo[0]
+                # When the ref allele spans multiple positions (deletion), the allele may have
+                # extra characters for subsequent positions. We only keep the first nucleotide.
+                # But for insertions (allele longer than ref with single-base ref), keep the full allele.
+                if len(ref_allele) > 1:
+                    sample_allele_haplo = sample_allele_haplo[0]
 
                 if positions_left_in_del[sample_idx][haplo_chrom_idx] > 0 and (
                     not deletion_created
