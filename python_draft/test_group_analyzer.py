@@ -574,3 +574,282 @@ def test_two_overlapping_deletions_in_same_sample():
         "phases": [False, False],
     }
     check_expected_result(result, expected)
+
+
+def test_phase_single_het_no_phase_needed():
+    """Single heterozygote - phase not needed, no problem."""
+    var1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [False],
+    }
+    var2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["A"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[[var1, var2]],
+        samples_in_vcfs=[["sample1"]],
+    )
+    var_group = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "TA",
+        "alt_alleles": {"AA"},
+        "genotypes": [["TA", "AA"]],
+        "samples": ["sample1"],
+        "phases": [False],
+    }
+    check_expected_result(result, expected)
+
+
+def test_phase_kept_between_hets():
+    """Phase kept true between two heterozygotes - solvable."""
+    var1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["A"],
+        "genotypes": [[0, 0]],
+        "phases": [True],
+    }
+    var3 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["G", "C"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[[var1, var2, var3]],
+        samples_in_vcfs=[["sample1"]],
+    )
+    var_group = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "TAG",
+        "alt_alleles": {"AAC"},
+        "genotypes": [["TAG", "AAC"]],
+        "samples": ["sample1"],
+        "phases": [False],
+    }
+    check_expected_result(result, expected)
+
+
+def test_phase_false_on_first_position_still_solvable():
+    """Phase false on first position but true after - solvable.
+
+    Phase refers to the phase with the previous position, so the first
+    position's phase value doesn't matter.
+    """
+    var1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [False],
+    }
+    var2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["A"],
+        "genotypes": [[0, 0]],
+        "phases": [True],
+    }
+    var3 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["G", "C"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[[var1, var2, var3]],
+        samples_in_vcfs=[["sample1"]],
+    )
+    var_group = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "TAG",
+        "alt_alleles": {"AAC"},
+        "genotypes": [["TAG", "AAC"]],
+        "samples": ["sample1"],
+        "phases": [False],
+    }
+    check_expected_result(result, expected)
+
+
+def test_phase_first_het_not_at_first_position():
+    """First heterozygote is not at the first position - solvable."""
+    var1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["A"],
+        "genotypes": [[0, 0]],
+        "phases": [False],
+    }
+    var2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [False],
+    }
+    var3 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["A"],
+        "genotypes": [[0, 0]],
+        "phases": [True],
+    }
+    var4 = {
+        "chrom": 1,
+        "pos": 13,
+        "alleles": ["G", "C"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[[var1, var2, var3, var4]],
+        samples_in_vcfs=[["sample1"]],
+    )
+    var_group = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "ATAG",
+        "alt_alleles": {"AAAC"},
+        "genotypes": [["ATAG", "AAAC"]],
+        "samples": ["sample1"],
+        "phases": [False],
+    }
+    check_expected_result(result, expected)
+
+
+def test_phase_broken_between_hets_missing_genotype():
+    """Phase broken between two heterozygotes - genotype must be missing."""
+    var1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["G"],
+        "genotypes": [[0, 0]],
+        "phases": [False],  # phase broken here!
+    }
+    var3 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["A"],
+        "genotypes": [[0, 0]],
+        "phases": [True],
+    }
+    var4 = {
+        "chrom": 1,
+        "pos": 13,
+        "alleles": ["G", "C"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[[var1, var2, var3, var4]],
+        samples_in_vcfs=[["sample1"]],
+    )
+    var_group = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+    assert isinstance(result, Ok)
+    variants, sample_ids = result.value
+    variant = variants[0]
+    # genotype should be missing (-1) for this sample
+    assert variant.genotypes[0] == (-1, -1)
+
+
+def test_phase_broken_in_one_sample():
+    var1_sample1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var2_sample1 = {
+        "chrom": 1,
+        "pos": 13,
+        "alleles": ["G", "C"],
+        "genotypes": [[0, 1]],
+        "phases": [False],
+    }
+    var1_sample2 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["T", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var2_sample2 = {
+        "chrom": 1,
+        "pos": 13,
+        "alleles": ["G", "C"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    vars_in_vcf1 = [var1_sample1, var2_sample1]
+    vars_in_vcf2 = [var1_sample2, var2_sample2]
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[vars_in_vcf1, vars_in_vcf2],
+        samples_in_vcfs=[["sample1"], ["sample2"]],
+    )
+    var_group = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+    assert isinstance(result, Ok)
+    variants, sample_ids = result.value
+    variant = variants[0]
+    # genotype should be missing (-1) for this sample
+    assert variant.genotypes == [(-1, -1), (0, 1)]

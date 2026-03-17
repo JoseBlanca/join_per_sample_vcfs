@@ -92,6 +92,10 @@ def create_variant_for_region(
     # each item in the list is a list of str alleles, one per variant
     alleles_for_samples = [None] * total_samples
     positions_left_in_del = [None] * total_samples
+    # Phase tracking: detect when haplotype can't be built due to broken phase
+    first_het_seen = [False] * total_samples
+    phase_broken_since_het = [False] * total_samples
+    missing_samples = set()
     # Let's go through every variant of every variant iterator (VCF)
     # There should be one variant per genomic position and all genomic
     # positions should be covered by one variant
@@ -107,13 +111,14 @@ def create_variant_for_region(
         for sample_idx_in_var_iter, (sample_gt, sample_phase) in enumerate(
             zip(variant.genotypes, variant.phases)
         ):
-            sample_idx = (
+            sample_idx: int = (
                 sum(n_samples_per_var_iter[:var_iter_of_origin_idx])
                 + sample_idx_in_var_iter
             )
             print(f"{var_iter_of_origin_idx=} {sample_idx_in_var_iter=} {sample_idx=}")
 
             ploidy = len(sample_gt)
+            is_first_variant_for_sample = alleles_for_samples[sample_idx] is None
 
             if alleles_for_samples[sample_idx] is None:
                 # we create the data structure to store the alleles that we are going to be building
@@ -140,6 +145,17 @@ def create_variant_for_region(
                 print(f"{positions_left_in_del=}")
             else:
                 deletion_created = False
+
+            # Phase tracking: check if haplotype can be built for this sample
+            is_het = len(set(sample_gt)) > 1
+            if not is_first_variant_for_sample and first_het_seen[sample_idx]:
+                if not sample_phase:
+                    phase_broken_since_het[sample_idx] = True
+            if is_het:
+                if first_het_seen[sample_idx] and phase_broken_since_het[sample_idx]:
+                    missing_samples.add(sample_idx)
+                first_het_seen[sample_idx] = True
+                phase_broken_since_het[sample_idx] = False
 
             # Now we add the corresponding nucleotide to each the alelle of each haplotype
             for haplo_chrom_idx, sample_allele_haplo_int in enumerate(sample_gt):
@@ -181,6 +197,8 @@ def create_variant_for_region(
     allele_ids = {ref_allele: 0}
     # create str alleles and modify alleles_for_samples to hold strs instead of lists
     for sample_idx, alleles_for_sample in enumerate(alleles_for_samples):
+        if sample_idx in missing_samples:
+            continue
         alleles_for_sample_str = []
         for allele_list in alleles_for_sample:
             allele = "".join(allele_list)
@@ -200,13 +218,16 @@ def create_variant_for_region(
     for var_iter_idx, var_iter_info in enumerate(var_iter_infos):
         for sample_idx_in_var_iter, sample in enumerate(var_iter_info.samples):
             sample_idx = (
-                sum(n_samples_per_var_iter[:var_iter_idx])
-                + sample_idx_in_var_iter
+                sum(n_samples_per_var_iter[:var_iter_idx]) + sample_idx_in_var_iter
             )
             sample_ids.append(sample_idx)
-            alleles_for_sample = alleles_for_samples[sample_idx]
-            sample_gts = tuple(allele_ids[allele] for allele in alleles_for_sample)
-            genotypes.append(sample_gts)
+            if sample_idx in missing_samples:
+                ploidy = len(alleles_for_samples[sample_idx])
+                genotypes.append(tuple(-1 for _ in range(ploidy)))
+            else:
+                alleles_for_sample = alleles_for_samples[sample_idx]
+                sample_gts = tuple(allele_ids[allele] for allele in alleles_for_sample)
+                genotypes.append(sample_gts)
 
     for sample_idx, alleles_for_sample in enumerate(alleles_for_samples):
         print(f"{sample_idx=}")
