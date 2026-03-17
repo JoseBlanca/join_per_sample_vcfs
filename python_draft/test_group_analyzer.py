@@ -549,6 +549,7 @@ def test_two_overlapping_deletions_in_same_sample():
         "genotypes": [[0, 0]],
         "phases": [True],
     }
+
     vars_in_vfc2 = [var1_sample2, var2_sample2, var3_sample2]
     samples_in_vcf2 = ["sample2"]
 
@@ -568,7 +569,7 @@ def test_two_overlapping_deletions_in_same_sample():
         "pos": 10,
         "ref_allele": "ATG",
         "alt_alleles": {"AG", "AT", "GTG", "GT"},
-        "genotypes": [["AG", "AT"], ["GTG", "GT"]],
+        "genotypes": [["AT", "AG"], ["GTG", "GT"]],
         "samples": ["sample1", "sample2"],
         "phases": [False, False],
     }

@@ -98,6 +98,7 @@ def create_variant_for_region(
                 positions_left_in_del[sample_id] = [0] * ploidy
 
             ref_allele = variant.alleles[0]
+            prev_positions_left_in_del = list(positions_left_in_del[sample_id])
             if len(ref_allele) > 1:
                 deletion_created = True
                 positions_left_in_del_for_sample = []
@@ -120,9 +121,9 @@ def create_variant_for_region(
                 # but we should only add the first nucleotide, the one corresponding to this position
                 sample_allele_haplo = sample_allele_haplo[0]
 
-                if (
-                    positions_left_in_del[sample_id][haplo_chrom_idx] > 0
-                    and not deletion_created
+                if positions_left_in_del[sample_id][haplo_chrom_idx] > 0 and (
+                    not deletion_created
+                    or prev_positions_left_in_del[haplo_chrom_idx] > 0
                 ):
                     sample_allele_haplo = ""
                     positions_left_in_del[sample_id][haplo_chrom_idx] -= 1
