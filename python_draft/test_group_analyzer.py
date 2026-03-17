@@ -502,3 +502,74 @@ def test_two_deletions_in_same_sample():
         "phases": [False, False],
     }
     check_expected_result(result, expected)
+
+
+def test_two_overlapping_deletions_in_same_sample():
+    var1_sample1 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["AT", "A"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var2_sample1 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["TG", "T"],
+        "genotypes": [[1, 0]],
+        "phases": [True],
+    }
+    var3_sample1 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["G"],
+        "genotypes": [[0, 0]],
+        "phases": [True],
+    }
+    vars_in_vfc1 = [var1_sample1, var2_sample1, var3_sample1]
+    samples_in_vcf1 = ["sample1"]
+    var1_sample2 = {
+        "chrom": 1,
+        "pos": 10,
+        "alleles": ["A", "G"],
+        "genotypes": [[1, 1]],
+        "phases": [True],
+    }
+    var2_sample2 = {
+        "chrom": 1,
+        "pos": 11,
+        "alleles": ["TG", "T"],
+        "genotypes": [[0, 1]],
+        "phases": [True],
+    }
+    var3_sample2 = {
+        "chrom": 1,
+        "pos": 12,
+        "alleles": ["G"],
+        "genotypes": [[0, 0]],
+        "phases": [True],
+    }
+    vars_in_vfc2 = [var1_sample2, var2_sample2, var3_sample2]
+    samples_in_vcf2 = ["sample2"]
+
+    var_group_iter = create_variant_group_iterator(
+        vars_in_vcfs=[vars_in_vfc1, vars_in_vfc2],
+        samples_in_vcfs=[samples_in_vcf1, samples_in_vcf2],
+    )
+    var_group: OverlappingVariantGroup = list(var_group_iter)[0]
+    result = merge_variant_group(
+        var_group,
+        samples_have_one_var_per_position=True,
+        var_iter_infos=var_group_iter.var_iter_infos,
+    )
+
+    expected = {
+        "chrom": 1,
+        "pos": 10,
+        "ref_allele": "ATG",
+        "alt_alleles": {"AG", "AT", "GTG", "GT"},
+        "genotypes": [["AG", "AT"], ["GTG", "GT"]],
+        "samples": ["sample1", "sample2"],
+        "phases": [False, False],
+    }
+    check_expected_result(result, expected)

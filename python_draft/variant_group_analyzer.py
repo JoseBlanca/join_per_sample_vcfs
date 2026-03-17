@@ -101,11 +101,13 @@ def create_variant_for_region(
             if len(ref_allele) > 1:
                 deletion_created = True
                 positions_left_in_del_for_sample = []
-                for sample_allele_haplo_int in sample_gt:
+                for sample_allele_haplo_int, left_in_del in zip(
+                    sample_gt, positions_left_in_del[sample_id]
+                ):
                     sample_allele = variant.alleles[sample_allele_haplo_int]
                     print(f"{sample_allele=}")
                     del_len = len(ref_allele) - len(sample_allele)
-                    positions_left_in_del_for_sample.append(del_len)
+                    positions_left_in_del_for_sample.append(del_len + left_in_del)
                 positions_left_in_del[sample_id] = positions_left_in_del_for_sample
                 print(f"{positions_left_in_del=}")
             else:
