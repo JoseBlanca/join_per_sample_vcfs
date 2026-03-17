@@ -348,6 +348,31 @@ fn parse_genotypes(
 }
 
 impl Variant {
+    /// Creates a new Variant with the given fields.
+    /// Sets internal parser fields (gt_index, pl_index) to defaults.
+    pub fn new(
+        chrom: String,
+        pos: u32,
+        alleles: Vec<String>,
+        genotypes: Vec<i8>,
+        phase: Vec<bool>,
+        n_samples: usize,
+    ) -> Self {
+        let ref_allele_len = alleles.first().map_or(0, |a| a.len()) as u8;
+        Variant {
+            chrom,
+            pos,
+            alleles,
+            ref_allele_len,
+            qual: f32::NAN,
+            gt_index: 0,
+            pl_index: None,
+            genotypes,
+            phase,
+            n_samples,
+        }
+    }
+
     fn from_line(
         line: &str,
         format_cache: &mut LruCache<String, (usize, Option<usize>), RandomState>,
