@@ -8,11 +8,11 @@ pub enum MagicByteError {
     #[error("Insufficient bytes: got {got}, need at least {need}")]
     InsufficientBytes { got: usize, need: usize },
 
-    #[error("There was a problem opening the file: {path}")]
-    ProblemOpeningFile { path: String },
+    #[error("There was a problem opening the file '{path}': {reason}")]
+    ProblemOpeningFile { path: String, reason: String },
 
-    #[error("There was a problem opening reading the buffer for the file: {path}")]
-    ProblemFillingBuffer { path: String },
+    #[error("There was a problem reading the buffer for the file '{path}': {reason}")]
+    ProblemFillingBuffer { path: String, reason: String },
 }
 
 pub fn are_gzipped_magic_bytes(first_bytes: &[u8]) -> Result<bool, MagicByteError> {
@@ -26,15 +26,17 @@ pub fn are_gzipped_magic_bytes(first_bytes: &[u8]) -> Result<bool, MagicByteErro
 }
 
 fn read_first_bytes<P: AsRef<Path>>(path: &P, num_bytes: usize) -> Result<Vec<u8>, MagicByteError> {
-    let file = File::open(path).map_err(|_| MagicByteError::ProblemOpeningFile {
+    let file = File::open(path).map_err(|e| MagicByteError::ProblemOpeningFile {
         path: path.as_ref().to_string_lossy().to_string(),
+        reason: e.to_string(),
     })?;
     let mut buf_reader = BufReader::new(file);
 
     let buffer = buf_reader
         .fill_buf()
-        .map_err(|_| MagicByteError::ProblemFillingBuffer {
+        .map_err(|e| MagicByteError::ProblemFillingBuffer {
             path: path.as_ref().to_string_lossy().to_string(),
+            reason: e.to_string(),
         })?;
     Ok(buffer[..num_bytes.min(buffer.len())].to_vec())
 }
