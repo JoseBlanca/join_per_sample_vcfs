@@ -140,11 +140,19 @@ impl<B: BufRead> VariantGroupIterator<B> {
             let mut earliest_pos: Option<u32> = None;
             let mut earliest_end: u32 = 0;
 
+            let mut all_vars_in_same_pos_and_not_variable = true;
+
             for i in 0..self.vcf_iters.len() {
-                let (peek_chrom, peek_pos, p_end) = match self.vcf_iters[i].peek_variant()? {
-                    Some(r) => (r.chrom.clone(), r.pos, ref_span_end(r)),
-                    None => continue,
-                };
+                let (peek_chrom, peek_pos, p_end, is_variable) =
+                    match self.vcf_iters[i].peek_variant()? {
+                        Some(r) => (
+                            r.chrom.clone(),
+                            r.pos,
+                            ref_span_end(r),
+                            r.alleles.len() > 1,
+                        ),
+                        None => continue,
+                    };
 
                 self.validate_ordering(&peek_chrom, peek_pos, &chrom)?;
 
@@ -156,20 +164,45 @@ impl<B: BufRead> VariantGroupIterator<B> {
                     None => {
                         earliest_pos = Some(peek_pos);
                         earliest_end = p_end;
+                        if is_variable {
+                            all_vars_in_same_pos_and_not_variable = false;
+                        }
                     }
                     Some(ep) if peek_pos < ep => {
                         earliest_pos = Some(peek_pos);
                         earliest_end = p_end;
+                        all_vars_in_same_pos_and_not_variable = !is_variable;
                     }
-                    Some(ep) if peek_pos == ep && p_end > earliest_end => {
-                        earliest_end = p_end;
+                    Some(ep) if peek_pos == ep => {
+                        if p_end > earliest_end {
+                            earliest_end = p_end;
+                        }
+                        if is_variable {
+                            all_vars_in_same_pos_and_not_variable = false;
+                        }
                     }
-                    _ => {}
+                    _ => {
+                        all_vars_in_same_pos_and_not_variable = false;
+                    }
                 }
             }
 
             match earliest_pos {
-                Some(pos) => return Ok(Some((chrom, pos, earliest_end))),
+                Some(pos) => {
+                    if all_vars_in_same_pos_and_not_variable {
+                        for iter in self.vcf_iters.iter_mut() {
+                            match iter.peek_variant()? {
+                                Some(r) if r.chrom == chrom => {
+                                    iter.next();
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.last_group_start = Some(pos);
+                        continue;
+                    }
+                    return Ok(Some((chrom, pos, earliest_end)));
+                }
                 None => {
                     self.chroms_seen.insert(chrom);
                     self.current_chrom_idx += 1;
