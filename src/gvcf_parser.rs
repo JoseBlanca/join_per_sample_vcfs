@@ -42,6 +42,7 @@
 //! ```
 
 use crate::errors::VcfParseError;
+use crate::threaded_reader::ThreadedReader;
 use crate::utils_magic::file_is_gzipped;
 use ahash::RandomState; // fast hasher
 use flate2::read::MultiGzDecoder;
@@ -701,6 +702,18 @@ impl VariantIterator<BufReader<MultiGzDecoder<File>>> {
         let file = File::open(&path)?;
         let gz_decoder = MultiGzDecoder::new(file);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
+        Ok(VariantIterator::new(buf_reader)?)
+    }
+}
+impl VariantIterator<BufReader<ThreadedReader>> {
+    pub fn from_gzip_path_threaded<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
+        if !file_is_gzipped(&path).map_err(|_| VcfParseError::MagicByteError)? {
+            return Err(VcfParseError::VCFFileShouldBeGzipped);
+        }
+        let file = File::open(&path)?;
+        let gz_decoder = MultiGzDecoder::new(file);
+        let threaded = ThreadedReader::new(gz_decoder);
+        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, threaded);
         Ok(VariantIterator::new(buf_reader)?)
     }
 }

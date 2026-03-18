@@ -90,7 +90,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parse each gVCF file
     let mut vcf_iters = Vec::with_capacity(vcf_paths.len());
     for path in &vcf_paths {
-        let iter = VariantIterator::from_gzip_path(path)?;
+        let iter = VariantIterator::from_gzip_path_threaded(path)?;
         vcf_iters.push(iter);
     }
 
