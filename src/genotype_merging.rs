@@ -7,7 +7,7 @@ use crate::gvcf_parser::{Variant, VcfResult};
 use crate::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
 
 /// Default number of groups to process in each parallel batch.
-const DEFAULT_BATCH_SIZE: usize = 10_000;
+const DEFAULT_BATCH_SIZE: usize = 1000;
 
 /// Creates a merged variant for the region covered by a variant group.
 ///
