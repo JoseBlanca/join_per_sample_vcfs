@@ -101,32 +101,6 @@ impl<B: BufRead> VariantGroupIterator<B> {
         Some(Err(error))
     }
 
-    fn validate_ordering(&self, p_chrom: &str, p_pos: u32, expected_chrom: &str) -> VcfResult<()> {
-        if self.chroms_seen.contains(p_chrom) {
-            return Err(VcfParseError::RuntimeError {
-                message: format!(
-                    "Out-of-order chromosome '{}' at position {}: chromosome already processed",
-                    p_chrom, p_pos
-                ),
-            });
-        }
-
-        if p_chrom == expected_chrom {
-            if let Some(lbs) = self.last_group_start {
-                if p_pos < lbs {
-                    return Err(VcfParseError::RuntimeError {
-                        message: format!(
-                            "Out-of-order position on '{}': {} < last bin start {}",
-                            p_chrom, p_pos, lbs
-                        ),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Phase A: find the next chromosome span seed:
     /// (chromosome, earliest start, current end).
     fn compute_next_span_seed(&mut self) -> VcfResult<Option<(String, u32, u32)>> {
@@ -136,29 +110,42 @@ impl<B: BufRead> VariantGroupIterator<B> {
                 return Ok(None);
             }
 
-            let chrom = self.sorted_chromosomes[self.current_chrom_idx].clone();
+            let chrom = &self.sorted_chromosomes[self.current_chrom_idx];
             let mut earliest_pos: Option<u32> = None;
             let mut earliest_end: u32 = 0;
-
             let mut all_vars_in_same_pos_and_not_variable = true;
 
             for i in 0..self.vcf_iters.len() {
-                let (peek_chrom, peek_pos, p_end, is_variable) =
-                    match self.vcf_iters[i].peek_variant()? {
-                        Some(r) => (
-                            r.chrom.clone(),
-                            r.pos,
-                            ref_span_end(r),
-                            r.alleles.len() > 1,
-                        ),
-                        None => continue,
+                let (peek_pos, p_end, is_variable) = {
+                    let Some(r) = self.vcf_iters[i].peek_variant()? else {
+                        continue;
                     };
 
-                self.validate_ordering(&peek_chrom, peek_pos, &chrom)?;
+                    if r.chrom.as_str() != chrom.as_str() {
+                        if self.chroms_seen.contains(&r.chrom) {
+                            return Err(VcfParseError::RuntimeError {
+                                message: format!(
+                                    "Out-of-order chromosome '{}' at position {}: chromosome already processed",
+                                    r.chrom, r.pos
+                                ),
+                            });
+                        }
+                        continue;
+                    }
 
-                if peek_chrom != chrom {
-                    continue;
-                }
+                    if let Some(lbs) = self.last_group_start {
+                        if r.pos < lbs {
+                            return Err(VcfParseError::RuntimeError {
+                                message: format!(
+                                    "Out-of-order position on '{}': {} < last bin start {}",
+                                    chrom, r.pos, lbs
+                                ),
+                            });
+                        }
+                    }
+
+                    (r.pos, ref_span_end(r), r.alleles.len() > 1)
+                };
 
                 match earliest_pos {
                     None => {
@@ -192,7 +179,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
                     if all_vars_in_same_pos_and_not_variable {
                         for iter in self.vcf_iters.iter_mut() {
                             match iter.peek_variant()? {
-                                Some(r) if r.chrom == chrom => {
+                                Some(r) if r.chrom.as_str() == chrom.as_str() => {
                                     iter.next();
                                 }
                                 _ => {}
@@ -201,10 +188,10 @@ impl<B: BufRead> VariantGroupIterator<B> {
                         self.last_group_start = Some(pos);
                         continue;
                     }
-                    return Ok(Some((chrom, pos, earliest_end)));
+                    return Ok(Some((chrom.clone(), pos, earliest_end)));
                 }
                 None => {
-                    self.chroms_seen.insert(chrom);
+                    self.chroms_seen.insert(chrom.clone());
                     self.current_chrom_idx += 1;
                     self.last_group_start = None;
                 }
@@ -226,15 +213,38 @@ impl<B: BufRead> VariantGroupIterator<B> {
 
             for i in 0..self.vcf_iters.len() {
                 loop {
-                    let (peek_chrom, peek_pos) = match self.vcf_iters[i].peek_variant()? {
-                        Some(r) => (r.chrom.clone(), r.pos),
-                        None => break,
+                    let peek_pos = {
+                        let Some(r) = self.vcf_iters[i].peek_variant()? else {
+                            break;
+                        };
+
+                        if r.chrom.as_str() != current_chrom {
+                            if self.chroms_seen.contains(&r.chrom) {
+                                return Err(VcfParseError::RuntimeError {
+                                    message: format!(
+                                        "Out-of-order chromosome '{}' at position {}: chromosome already processed",
+                                        r.chrom, r.pos
+                                    ),
+                                });
+                            }
+                            break;
+                        }
+
+                        if let Some(lbs) = self.last_group_start {
+                            if r.pos < lbs {
+                                return Err(VcfParseError::RuntimeError {
+                                    message: format!(
+                                        "Out-of-order position on '{}': {} < last bin start {}",
+                                        current_chrom, r.pos, lbs
+                                    ),
+                                });
+                            }
+                        }
+
+                        r.pos
                     };
 
-                    self.validate_ordering(&peek_chrom, peek_pos, current_chrom)?;
-
-                    // overlap rule: same chromosome and start <= group_end
-                    if peek_chrom != current_chrom || peek_pos > group_end {
+                    if peek_pos > group_end {
                         break;
                     }
 
