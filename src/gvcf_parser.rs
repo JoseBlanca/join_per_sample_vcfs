@@ -696,8 +696,13 @@ impl<R: Read> VariantIterator<BufReader<MultiGzDecoder<R>>> {
 }
 impl VariantIterator<BufReader<MultiGzDecoder<File>>> {
     pub fn from_gzip_path<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
-        if !file_is_gzipped(&path).map_err(|_| VcfParseError::MagicByteError)? {
-            return Err(VcfParseError::VCFFileShouldBeGzipped);
+        if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
+            path: path.as_ref().to_string_lossy().to_string(),
+            reason: e.to_string(),
+        })? {
+            return Err(VcfParseError::VCFFileShouldBeGzipped {
+                path: path.as_ref().to_string_lossy().to_string(),
+            });
         }
         let file = File::open(&path)?;
         let gz_decoder = MultiGzDecoder::new(file);
@@ -707,8 +712,13 @@ impl VariantIterator<BufReader<MultiGzDecoder<File>>> {
 }
 impl VariantIterator<BufReader<ThreadedReader>> {
     pub fn from_gzip_path_threaded<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
-        if !file_is_gzipped(&path).map_err(|_| VcfParseError::MagicByteError)? {
-            return Err(VcfParseError::VCFFileShouldBeGzipped);
+        if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
+            path: path.as_ref().to_string_lossy().to_string(),
+            reason: e.to_string(),
+        })? {
+            return Err(VcfParseError::VCFFileShouldBeGzipped {
+                path: path.as_ref().to_string_lossy().to_string(),
+            });
         }
         let file = File::open(&path)?;
         let gz_decoder = MultiGzDecoder::new(file);

@@ -51,14 +51,14 @@ pub enum VcfParseError {
     #[error("I/O error opening path: '{path}'")]
     PathError { path: String },
 
-    #[error("Magic byte error")]
-    MagicByteError,
+    #[error("Magic byte error for file '{path}': {reason}")]
+    MagicByteError { path: String, reason: String },
 
     #[error("Gzip in stdin is not supported")]
     GzipInStdinNotSupported,
 
-    #[error("VCF file should be gzipped")]
-    VCFFileShouldBeGzipped,
+    #[error("VCF file should be gzipped: '{path}'")]
+    VCFFileShouldBeGzipped { path: String },
 
     #[error("VCF file should be bgzipped")]
     VCFFileShouldBeBGzipped,
