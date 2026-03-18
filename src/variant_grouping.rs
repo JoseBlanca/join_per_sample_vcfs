@@ -1,8 +1,26 @@
 use std::collections::HashSet;
 use std::io::BufRead;
 
+use rayon::prelude::*;
+
 use crate::errors::VcfParseError;
 use crate::gvcf_parser::{Variant, VariantIterator, VcfResult};
+
+/// Result of peeking a single iterator during the parallel scan.
+enum PeekResult {
+    /// Iterator is exhausted.
+    Exhausted,
+    /// Variant is on a different chromosome (not the current one).
+    DifferentChrom,
+    /// Variant is on the current chromosome.
+    OnCurrentChrom {
+        pos: u32,
+        span_end: u32,
+        is_variable: bool,
+    },
+    /// Ordering violation detected.
+    Error(VcfParseError),
+}
 
 /// Metadata about a `VariantIterator`
 #[derive(Debug, Clone)]
@@ -56,7 +74,7 @@ pub struct VariantGroupIterator<B: BufRead> {
     done: bool,
 }
 
-impl<B: BufRead> VariantGroupIterator<B> {
+impl<B: BufRead + Send> VariantGroupIterator<B> {
     /// Creates a new `VariantGroupIterator`.
     ///
     /// # Arguments
@@ -103,6 +121,9 @@ impl<B: BufRead> VariantGroupIterator<B> {
 
     /// Phase A: find the next chromosome span seed:
     /// (chromosome, earliest start, current end).
+    ///
+    /// The parallel scan peeks all iterators concurrently using rayon,
+    /// then reduces the results on the main thread.
     fn compute_next_span_seed(&mut self) -> VcfResult<Option<(String, u32, u32)>> {
         loop {
             if self.current_chrom_idx >= self.sorted_chromosomes.len() {
@@ -111,31 +132,35 @@ impl<B: BufRead> VariantGroupIterator<B> {
             }
 
             let chrom = &self.sorted_chromosomes[self.current_chrom_idx];
-            let mut earliest_pos: Option<u32> = None;
-            let mut earliest_end: u32 = 0;
-            let mut all_vars_in_same_pos_and_not_variable = true;
+            let chroms_seen = &self.chroms_seen;
+            let last_group_start = self.last_group_start;
 
-            for i in 0..self.vcf_iters.len() {
-                let (peek_pos, p_end, is_variable) = {
-                    let Some(r) = self.vcf_iters[i].peek_variant()? else {
-                        continue;
+            // Parallel peek: each iterator is peeked on a rayon thread.
+            let peek_results: Vec<PeekResult> = self
+                .vcf_iters
+                .par_iter_mut()
+                .map(|iter| {
+                    let r = match iter.peek_variant() {
+                        Ok(Some(r)) => r,
+                        Ok(None) => return PeekResult::Exhausted,
+                        Err(e) => return PeekResult::Error(e),
                     };
 
                     if r.chrom.as_str() != chrom.as_str() {
-                        if self.chroms_seen.contains(&r.chrom) {
-                            return Err(VcfParseError::RuntimeError {
+                        if chroms_seen.contains(&r.chrom) {
+                            return PeekResult::Error(VcfParseError::RuntimeError {
                                 message: format!(
                                     "Out-of-order chromosome '{}' at position {}: chromosome already processed",
                                     r.chrom, r.pos
                                 ),
                             });
                         }
-                        continue;
+                        return PeekResult::DifferentChrom;
                     }
 
-                    if let Some(lbs) = self.last_group_start {
+                    if let Some(lbs) = last_group_start {
                         if r.pos < lbs {
-                            return Err(VcfParseError::RuntimeError {
+                            return PeekResult::Error(VcfParseError::RuntimeError {
                                 message: format!(
                                     "Out-of-order position on '{}': {} < last bin start {}",
                                     chrom, r.pos, lbs
@@ -144,32 +169,65 @@ impl<B: BufRead> VariantGroupIterator<B> {
                         }
                     }
 
-                    (r.pos, ref_span_end(r), r.alleles.len() > 1)
-                };
+                    PeekResult::OnCurrentChrom {
+                        pos: r.pos,
+                        span_end: ref_span_end(r),
+                        is_variable: r.alleles.len() > 1,
+                    }
+                })
+                .collect();
 
-                match earliest_pos {
-                    None => {
-                        earliest_pos = Some(peek_pos);
-                        earliest_end = p_end;
-                        if is_variable {
-                            all_vars_in_same_pos_and_not_variable = false;
+            // Reduce: find earliest position and check all_non_variable.
+            let mut earliest_pos: Option<u32> = None;
+            let mut earliest_end: u32 = 0;
+            let mut all_vars_in_same_pos_and_not_variable = true;
+
+            for result in &peek_results {
+                match result {
+                    PeekResult::Error(_) => {
+                        // Extract the error by consuming the vec.
+                        // Find the first error and return it.
+                        for result in peek_results {
+                            if let PeekResult::Error(e) = result {
+                                return Err(e);
+                            }
                         }
+                        unreachable!();
                     }
-                    Some(ep) if peek_pos < ep => {
-                        earliest_pos = Some(peek_pos);
-                        earliest_end = p_end;
-                        all_vars_in_same_pos_and_not_variable = !is_variable;
-                    }
-                    Some(ep) if peek_pos == ep => {
-                        if p_end > earliest_end {
-                            earliest_end = p_end;
+                    PeekResult::Exhausted | PeekResult::DifferentChrom => continue,
+                    &PeekResult::OnCurrentChrom {
+                        pos,
+                        span_end,
+                        is_variable,
+                    } => {
+                        let peek_pos = pos;
+                        let p_end = span_end;
+
+                        match earliest_pos {
+                            None => {
+                                earliest_pos = Some(peek_pos);
+                                earliest_end = p_end;
+                                if is_variable {
+                                    all_vars_in_same_pos_and_not_variable = false;
+                                }
+                            }
+                            Some(ep) if peek_pos < ep => {
+                                earliest_pos = Some(peek_pos);
+                                earliest_end = p_end;
+                                all_vars_in_same_pos_and_not_variable = !is_variable;
+                            }
+                            Some(ep) if peek_pos == ep => {
+                                if p_end > earliest_end {
+                                    earliest_end = p_end;
+                                }
+                                if is_variable {
+                                    all_vars_in_same_pos_and_not_variable = false;
+                                }
+                            }
+                            _ => {
+                                all_vars_in_same_pos_and_not_variable = false;
+                            }
                         }
-                        if is_variable {
-                            all_vars_in_same_pos_and_not_variable = false;
-                        }
-                    }
-                    _ => {
-                        all_vars_in_same_pos_and_not_variable = false;
                     }
                 }
             }
@@ -177,14 +235,14 @@ impl<B: BufRead> VariantGroupIterator<B> {
             match earliest_pos {
                 Some(pos) => {
                     if all_vars_in_same_pos_and_not_variable {
-                        for iter in self.vcf_iters.iter_mut() {
-                            match iter.peek_variant()? {
-                                Some(r) if r.chrom.as_str() == chrom.as_str() => {
+                        // Skip: consume non-variable variants in parallel.
+                        self.vcf_iters.par_iter_mut().for_each(|iter| {
+                            if let Ok(Some(r)) = iter.peek_variant() {
+                                if r.chrom.as_str() == chrom.as_str() {
                                     iter.next();
                                 }
-                                _ => {}
                             }
-                        }
+                        });
                         self.last_group_start = Some(pos);
                         continue;
                     }
@@ -326,7 +384,7 @@ impl<B: BufRead> VariantGroupIterator<B> {
     }
 }
 
-impl<B: BufRead> Iterator for VariantGroupIterator<B> {
+impl<B: BufRead + Send> Iterator for VariantGroupIterator<B> {
     type Item = VcfResult<OverlappingVariantGroup>;
 
     fn next(&mut self) -> Option<Self::Item> {
