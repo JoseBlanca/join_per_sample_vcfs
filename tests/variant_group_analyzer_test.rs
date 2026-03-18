@@ -57,7 +57,9 @@ fn test_analyze_produces_one_variant_per_group() {
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
     let n_groups = groups.len();
 
-    let variants = analyze_groups(groups, &iter_info).unwrap();
+    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(variants.len(), n_groups);
 }
@@ -78,7 +80,9 @@ fn test_analyze_preserves_genomic_order() {
         .map(|g| (g.chrom.clone(), g.start))
         .collect();
 
-    let variants = analyze_groups(groups, &iter_info).unwrap();
+    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     let variant_positions: Vec<(String, u32)> = variants
         .iter()
@@ -99,7 +103,9 @@ fn test_analyze_single_group_from_merged_bin() {
 
     assert_eq!(groups.len(), 1);
 
-    let variants = analyze_groups(groups, &iter_info).unwrap();
+    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     assert_eq!(variants.len(), 1);
     assert_eq!(variants[0].chrom, "20");

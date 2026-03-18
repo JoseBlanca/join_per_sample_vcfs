@@ -6,6 +6,9 @@ use crate::errors::VcfParseError;
 use crate::gvcf_parser::{Variant, VcfResult};
 use crate::variant_group::{OverlappingVariantGroup, VariantIteratorInfo};
 
+/// Default number of groups to process in each parallel batch.
+const DEFAULT_BATCH_SIZE: usize = 10_000;
+
 /// Creates a merged variant for the region covered by a variant group.
 ///
 /// This is the core merging algorithm: it takes all overlapping variants from
@@ -211,23 +214,77 @@ pub fn merge_variant_group(
     Ok(vec![variant])
 }
 
-/// Processes all `OverlappingVariantGroup`s in parallel, returning an ordered
-/// sequence of merged variants.
+/// Iterator that pulls groups in batches, processes each batch in parallel
+/// with rayon, and yields merged variants one at a time.
 ///
-/// Groups are analyzed in parallel using rayon's thread pool, and results
-/// are collected in the original group order.
-pub fn analyze_groups(
-    groups: Vec<OverlappingVariantGroup>,
-    iter_info: &[VariantIteratorInfo],
-) -> VcfResult<Vec<Variant>> {
-    let results: Vec<VcfResult<Vec<Variant>>> = groups
-        .par_iter()
-        .map(|group| merge_variant_group(group, iter_info))
-        .collect();
+/// This gives both streaming output (bounded memory) and multi-core throughput.
+struct BatchedParallelIter<'a, I> {
+    groups: I,
+    iter_info: &'a [VariantIteratorInfo],
+    batch_size: usize,
+    buffer: std::vec::IntoIter<VcfResult<Variant>>,
+}
 
-    let mut variants = Vec::new();
-    for result in results {
-        variants.extend(result?);
+impl<'a, I> Iterator for BatchedParallelIter<'a, I>
+where
+    I: Iterator<Item = VcfResult<OverlappingVariantGroup>>,
+{
+    type Item = VcfResult<Variant>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Drain the current batch buffer first
+        if let Some(item) = self.buffer.next() {
+            return Some(item);
+        }
+
+        // Pull the next batch from the source iterator
+        let mut batch = Vec::with_capacity(self.batch_size);
+        for group_result in self.groups.by_ref() {
+            batch.push(group_result);
+            if batch.len() >= self.batch_size {
+                break;
+            }
+        }
+
+        if batch.is_empty() {
+            return None;
+        }
+
+        // Process the batch in parallel (rayon preserves input order)
+        let iter_info = self.iter_info;
+        let results: Vec<VcfResult<Variant>> = batch
+            .into_par_iter()
+            .flat_map(|group_result| match group_result {
+                Ok(group) => match merge_variant_group(&group, iter_info) {
+                    Ok(variants) => variants.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
+                },
+                Err(e) => vec![Err(e)],
+            })
+            .collect();
+
+        self.buffer = results.into_iter();
+        self.buffer.next()
     }
-    Ok(variants)
+}
+
+/// Processes `OverlappingVariantGroup`s from an iterator, returning a streaming
+/// iterator of merged variants.
+///
+/// Groups are pulled in batches and processed in parallel with rayon, then
+/// yielded one at a time. This bounds memory to one batch while using all
+/// available cores for the merge computation.
+pub fn analyze_groups<'a, I>(
+    groups: I,
+    iter_info: &'a [VariantIteratorInfo],
+) -> impl Iterator<Item = VcfResult<Variant>> + 'a
+where
+    I: Iterator<Item = VcfResult<OverlappingVariantGroup>> + 'a,
+{
+    BatchedParallelIter {
+        groups,
+        iter_info,
+        batch_size: DEFAULT_BATCH_SIZE,
+        buffer: Vec::new().into_iter(),
+    }
 }

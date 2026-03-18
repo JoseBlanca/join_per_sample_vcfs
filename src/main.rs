@@ -101,17 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let grouper = VariantGroupIterator::new(vcf_iters, sorted_chromosomes)?;
     let iter_info = grouper.iter_info().to_vec();
 
-    // Collect all groups
-    let mut groups = Vec::new();
-    for result in grouper {
-        groups.push(result?);
-    }
-
-    // Merge all groups
-    let variants = analyze_groups(groups, &iter_info)?;
-
-    // Output VCF
-    // Header
+    // Output VCF header
     println!("##fileformat=VCFv4.2");
     print!("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT");
     for sample in &all_samples {
@@ -119,9 +109,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Variant records
+    // Stream: group -> merge -> write (one variant at a time, no bulk collection)
     let ploidy = 2; // diploid assumption
-    for variant in &variants {
+    for result in analyze_groups(grouper, &iter_info) {
+        let variant = result?;
+
         let ref_allele = &variant.alleles[0];
         let alt_alleles = if variant.alleles.len() > 1 {
             variant.alleles[1..].join(",")
