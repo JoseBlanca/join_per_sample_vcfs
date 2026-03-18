@@ -77,4 +77,7 @@ pub enum VcfParseError {
 
     #[error("RuntimeError: {message}")]
     RuntimeError { message: String },
+
+    #[error("Variant group has no alternative alleles after merging")]
+    NotVariable,
 }

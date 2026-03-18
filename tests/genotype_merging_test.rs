@@ -49,8 +49,16 @@ const VCF5: &str = "##\n\
     20\t8\t.\tG\tA\t20\tPASS\t.\tGT\t1|1\n\
     20\t12\t.\tG\tA\t20\tPASS\t.\tGT\t1|1";
 
+const VCF6: &str = "##\n\
+    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00001\n\
+    20\t1\t.\tG\tA,<NON_REF>\t20\tPASS\t.\tGT\t0|0";
+
+const VCF7: &str = "##\n\
+    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00002\n\
+    20\t1\t.\tG\tA,<NON_REF>\t20\tPASS\t.\tGT\t0|0";
+
 #[test]
-fn test_analyze_produces_one_variant_per_group() {
+fn test_analyze_produces_one_variant_per_variable_group() {
     let iters = vec![make_iter(VCF1), make_iter(VCF2)];
     let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
     let iter_info = grouper.iter_info().to_vec();
@@ -61,7 +69,9 @@ fn test_analyze_produces_one_variant_per_group() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    assert_eq!(variants.len(), n_groups);
+    // Non-variable groups (e.g. <NON_REF>-only, missing-only) are filtered out
+    assert!(variants.len() <= n_groups);
+    assert!(variants.len() > 0);
 }
 
 #[test]
@@ -87,8 +97,12 @@ fn test_analyze_preserves_genomic_order() {
     let variant_positions: Vec<(String, u32)> =
         variants.iter().map(|v| (v.chrom.clone(), v.pos)).collect();
 
-    // Output variants must match the order of the input groups
-    assert_eq!(variant_positions, group_positions);
+    // Output variants must be a subset of input groups, in the same order
+    let variable_group_positions: Vec<(String, u32)> = group_positions
+        .into_iter()
+        .filter(|gp| variant_positions.contains(gp))
+        .collect();
+    assert_eq!(variant_positions, variable_group_positions);
 }
 
 #[test]
@@ -573,6 +587,26 @@ fn test_phase_broken_between_hets_missing_genotype() {
     let ploidy = variant.genotypes.len() / variant.n_samples;
     let gt = &variant.genotypes[0..ploidy];
     assert_eq!(gt, &[-1, -1]);
+}
+
+#[test]
+fn test_allele_merge_with_non_ref_filtered() {
+    // VCF6 and VCF7 both have ALT=A,<NON_REF> at chr20:1 with GT=0|0.
+    // <NON_REF> is stripped during parsing, so alleles should be ["G", "A"].
+    let iters = vec![make_iter(VCF6), make_iter(VCF7)];
+    let grouper = VariantGroupIterator::new(iters, vec!["20".into()]).unwrap();
+    let iter_info = grouper.iter_info().to_vec();
+    let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
+
+    assert_eq!(groups.len(), 1);
+
+    // Both samples are hom-ref, so no alt alleles survive the merge.
+    // Non-variable groups are filtered out by analyze_groups.
+    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(variants.len(), 0);
 }
 
 #[test]
