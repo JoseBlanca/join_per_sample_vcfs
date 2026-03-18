@@ -4,7 +4,7 @@ use rayon::prelude::*;
 
 use crate::errors::VcfParseError;
 use crate::gvcf_parser::{Variant, VcfResult};
-use crate::variant_group::{OverlappingVariantGroup, VariantIteratorInfo};
+use crate::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
 
 /// Default number of groups to process in each parallel batch.
 const DEFAULT_BATCH_SIZE: usize = 10_000;
@@ -68,7 +68,11 @@ fn create_variant_for_region(
                 let pos_left = &mut positions_left_in_del[sample_idx];
                 for (h, &allele_int) in sample_gt.iter().enumerate() {
                     // Missing alleles (-1) are treated as ref for deletion tracking
-                    let allele_idx = if allele_int < 0 { 0usize } else { allele_int as usize };
+                    let allele_idx = if allele_int < 0 {
+                        0usize
+                    } else {
+                        allele_int as usize
+                    };
                     let sample_allele = &variant.alleles[allele_idx];
                     let del_len = ref_allele.len() as i32 - sample_allele.len() as i32;
                     pos_left[h] = del_len + prev_pos_left[h];
@@ -97,7 +101,11 @@ fn create_variant_for_region(
 
             for (h, &allele_int) in sample_gt.iter().enumerate() {
                 // Missing alleles (-1) are treated as ref for allele building
-                let allele_idx = if allele_int < 0 { 0usize } else { allele_int as usize };
+                let allele_idx = if allele_int < 0 {
+                    0usize
+                } else {
+                    allele_int as usize
+                };
                 let full_allele = &variant.alleles[allele_idx];
 
                 // For multi-base ref (deletion context), keep only first character

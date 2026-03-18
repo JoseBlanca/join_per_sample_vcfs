@@ -1,12 +1,15 @@
 use std::env;
 use std::process;
 
+use join_per_sample_vcfs::genotype_merging::analyze_groups;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
-use join_per_sample_vcfs::variant_group::VariantGroupIterator;
-use join_per_sample_vcfs::variant_group_analyzer::analyze_groups;
+use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
 
 fn print_usage(program: &str) {
-    eprintln!("Usage: {} --chroms <chrom1,chrom2,...> <vcf1.gz> <vcf2.gz> ...", program);
+    eprintln!(
+        "Usage: {} --chroms <chrom1,chrom2,...> <vcf1.gz> <vcf2.gz> ...",
+        program
+    );
     eprintln!();
     eprintln!("Merges per-sample gVCF files into a single multi-sample VCF.");
     eprintln!();

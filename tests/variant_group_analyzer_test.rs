@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::io::BufReader;
 
+use join_per_sample_vcfs::genotype_merging::{analyze_groups, merge_variant_group};
 use join_per_sample_vcfs::gvcf_parser::{Variant, VariantIterator};
-use join_per_sample_vcfs::variant_group::{OverlappingVariantGroup, VariantIteratorInfo};
-use join_per_sample_vcfs::variant_group::VariantGroupIterator;
-use join_per_sample_vcfs::variant_group_analyzer::{analyze_groups, merge_variant_group};
+use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
+use join_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
 
 // ============================================================================
 // Existing tests (VCF-based integration tests)
@@ -66,28 +66,26 @@ fn test_analyze_produces_one_variant_per_group() {
 
 #[test]
 fn test_analyze_preserves_genomic_order() {
-    let iters = vec![make_iter(VCF1), make_iter(VCF3), make_iter(VCF4), make_iter(VCF5)];
-    let grouper = VariantGroupIterator::new(
-        iters,
-        vec!["1".into(), "20".into(), "21".into()],
-    )
-    .unwrap();
+    let iters = vec![
+        make_iter(VCF1),
+        make_iter(VCF3),
+        make_iter(VCF4),
+        make_iter(VCF5),
+    ];
+    let grouper =
+        VariantGroupIterator::new(iters, vec!["1".into(), "20".into(), "21".into()]).unwrap();
     let iter_info = grouper.iter_info().to_vec();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
-    let group_positions: Vec<(String, u32)> = groups
-        .iter()
-        .map(|g| (g.chrom.clone(), g.start))
-        .collect();
+    let group_positions: Vec<(String, u32)> =
+        groups.iter().map(|g| (g.chrom.clone(), g.start)).collect();
 
     let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    let variant_positions: Vec<(String, u32)> = variants
-        .iter()
-        .map(|v| (v.chrom.clone(), v.pos))
-        .collect();
+    let variant_positions: Vec<(String, u32)> =
+        variants.iter().map(|v| (v.chrom.clone(), v.pos)).collect();
 
     // Output variants must match the order of the input groups
     assert_eq!(variant_positions, group_positions);
@@ -199,13 +197,14 @@ fn test_simple_merge() {
     let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
     let var2_s2 = make_variant("1", 11, &["G", "T"], &[&[1, 1]], &[false]);
 
-    let group = make_group(
-        vec![var1_s1, var2_s1, var1_s2, var2_s2],
-        vec![0, 0, 1, 1],
-    );
+    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -213,7 +212,8 @@ fn test_simple_merge() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "AG",
         &["TC", "AT", "TT"],
         &[&["TC", "TC"], &["AT", "TT"]],
@@ -228,13 +228,14 @@ fn test_simple_insertion() {
     let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
     let var2_s2 = make_variant("1", 11, &["G", "T"], &[&[1, 1]], &[false]);
 
-    let group = make_group(
-        vec![var1_s1, var2_s1, var1_s2, var2_s2],
-        vec![0, 0, 1, 1],
-    );
+    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -242,7 +243,8 @@ fn test_simple_insertion() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "AG",
         &["AC", "ATTC", "TT", "AT"],
         &[&["AC", "ATTC"], &["AT", "TT"]],
@@ -257,13 +259,14 @@ fn test_simple_deletion() {
     let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
     let var2_s2 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
 
-    let group = make_group(
-        vec![var1_s1, var2_s1, var1_s2, var2_s2],
-        vec![0, 0, 1, 1],
-    );
+    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -271,7 +274,8 @@ fn test_simple_deletion() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "AT",
         &["A", "TT"],
         &[&["A", "A"], &["AT", "TT"]],
@@ -293,8 +297,12 @@ fn test_deletion_len_2() {
         vec![0, 0, 0, 1, 1, 1],
     );
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -302,7 +310,8 @@ fn test_deletion_len_2() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "ATT",
         &["A", "TTA", "ATA"],
         &[&["A", "A"], &["ATA", "TTA"]],
@@ -324,8 +333,12 @@ fn test_overlapping_deletions() {
         vec![0, 0, 0, 1, 1, 1],
     );
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -333,7 +346,8 @@ fn test_overlapping_deletions() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "ATT",
         &["AT", "AC", "GT"],
         &[&["AT", "AC"], &["GT", "GT"]],
@@ -348,13 +362,14 @@ fn test_het_deletion() {
     let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
     let var2_s2 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
 
-    let group = make_group(
-        vec![var1_s1, var2_s1, var1_s2, var2_s2],
-        vec![0, 0, 1, 1],
-    );
+    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -362,7 +377,8 @@ fn test_het_deletion() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "AT",
         &["A", "TT"],
         &[&["AT", "A"], &["AT", "TT"]],
@@ -384,8 +400,12 @@ fn test_two_deletions_in_same_sample() {
         vec![0, 0, 0, 1, 1, 1],
     );
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -393,7 +413,8 @@ fn test_two_deletions_in_same_sample() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "ATG",
         &["A", "AG", "GTG", "GT"],
         &[&["A", "AG"], &["GTG", "GT"]],
@@ -415,8 +436,12 @@ fn test_two_overlapping_deletions_in_same_sample() {
         vec![0, 0, 0, 1, 1, 1],
     );
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
@@ -424,7 +449,8 @@ fn test_two_overlapping_deletions_in_same_sample() {
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "ATG",
         &["AG", "AT", "GTG", "GT"],
         &[&["AT", "AG"], &["GTG", "GT"]],
@@ -442,21 +468,14 @@ fn test_phase_single_het_no_phase_needed() {
     let var2 = make_variant("1", 11, &["A"], &[&[0, 0]], &[false]);
 
     let group = make_group(vec![var1, var2], vec![0, 0]);
-    let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-    ];
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
 
-    check_result(
-        variant,
-        "1", 10,
-        "TA",
-        &["AA"],
-        &[&["TA", "AA"]],
-        &[false],
-    );
+    check_result(variant, "1", 10, "TA", &["AA"], &[&["TA", "AA"]], &[false]);
 }
 
 #[test]
@@ -466,16 +485,17 @@ fn test_phase_kept_between_hets() {
     let var3 = make_variant("1", 12, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3], vec![0, 0, 0]);
-    let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-    ];
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "TAG",
         &["AAC"],
         &[&["TAG", "AAC"]],
@@ -490,16 +510,17 @@ fn test_phase_false_on_first_position_still_solvable() {
     let var3 = make_variant("1", 12, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3], vec![0, 0, 0]);
-    let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-    ];
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "TAG",
         &["AAC"],
         &[&["TAG", "AAC"]],
@@ -515,16 +536,17 @@ fn test_phase_first_het_not_at_first_position() {
     let var4 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3, var4], vec![0, 0, 0, 0]);
-    let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-    ];
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
 
     check_result(
         variant,
-        "1", 10,
+        "1",
+        10,
         "ATAG",
         &["AAAC"],
         &[&["ATAG", "AAAC"]],
@@ -540,9 +562,9 @@ fn test_phase_broken_between_hets_missing_genotype() {
     let var4 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3, var4], vec![0, 0, 0, 0]);
-    let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-    ];
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
@@ -562,13 +584,14 @@ fn test_phase_broken_in_one_sample() {
     let var1_s2 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[true]);
     let var2_s2 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[true]);
 
-    let group = make_group(
-        vec![var1_s1, var2_s1, var1_s2, var2_s2],
-        vec![0, 0, 1, 1],
-    );
+    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
-        VariantIteratorInfo { samples: vec!["sample1".into()] },
-        VariantIteratorInfo { samples: vec!["sample2".into()] },
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
     ];
 
     let result = merge_variant_group(&group, &iter_infos).unwrap();
