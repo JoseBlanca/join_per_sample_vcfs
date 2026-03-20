@@ -1,14 +1,10 @@
 use std::collections::HashSet;
 use std::io::BufReader;
 
-use join_per_sample_vcfs::genotype_merging::{analyze_groups, merge_variant_group};
+use join_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in_groups};
 use join_per_sample_vcfs::gvcf_parser::{Variant, VariantIterator};
 use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
 use join_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
-
-// ============================================================================
-// Existing tests (VCF-based integration tests)
-// ============================================================================
 
 fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
@@ -58,20 +54,21 @@ const VCF7: &str = "##\n\
     20\t1\t.\tG\tA,<NON_REF>\t20\tPASS\t.\tGT\t0|0";
 
 #[test]
-fn test_analyze_produces_one_variant_per_variable_group() {
+fn test_group_merging_creates_correct_number_of_vars() {
     let iters = vec![make_iter(VCF1), make_iter(VCF2)];
     let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
     let iter_info = grouper.iter_info().to_vec();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
     let n_groups = groups.len();
+    println!("n_groups: {n_groups}");
 
-    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+    let vars: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    // Non-variable groups (e.g. <NON_REF>-only, missing-only) are filtered out
-    assert!(variants.len() <= n_groups);
-    assert!(variants.len() > 0);
+    // Non-variable vars are filtered out
+    assert!(vars.len() <= n_groups);
+    assert!(vars.len() > 0);
 }
 
 #[test]
@@ -90,7 +87,7 @@ fn test_analyze_preserves_genomic_order() {
     let group_positions: Vec<(String, u32)> =
         groups.iter().map(|g| (g.chrom.clone(), g.start)).collect();
 
-    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+    let variants: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
@@ -115,7 +112,7 @@ fn test_analyze_single_group_from_merged_bin() {
 
     assert_eq!(groups.len(), 1);
 
-    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+    let variants: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
@@ -602,7 +599,7 @@ fn test_allele_merge_with_non_ref_filtered() {
 
     // Both samples are hom-ref, so no alt alleles survive the merge.
     // Non-variable groups are filtered out by analyze_groups.
-    let variants: Vec<_> = analyze_groups(groups.into_iter().map(Ok), &iter_info)
+    let variants: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
@@ -641,3 +638,15 @@ fn test_phase_broken_in_one_sample() {
     let gt_s2 = &variant.genotypes[ploidy..2 * ploidy];
     assert_eq!(gt_s2, &[0, 1]);
 }
+
+// TODO
+// check that when one sample has a missing allele in one SNP the merged haplotype allele is completely missing
+//           12
+// ref       TC
+// sample1-1  A
+// sample1-2  .
+// sample2-1  -
+// sample2-2  -
+// vcf sample1 chrom1 2 C A 1/.
+// vcf sample2 chrom1 1 TC T 1/1
+// merged vcf chrom1 1 TC TA,C 1/. 2/2

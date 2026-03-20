@@ -287,7 +287,7 @@ where
 /// Groups are pulled in batches and processed in parallel with rayon, then
 /// yielded one at a time. This bounds memory to one batch while using all
 /// available cores for the merge computation.
-pub fn analyze_groups<'a, I>(
+pub fn merge_vars_in_groups<'a, I>(
     groups: I,
     iter_info: &'a [VariantIteratorInfo],
 ) -> impl Iterator<Item = VcfResult<Variant>> + 'a

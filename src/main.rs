@@ -1,7 +1,7 @@
 use std::env;
 use std::process;
 
-use join_per_sample_vcfs::genotype_merging::analyze_groups;
+use join_per_sample_vcfs::genotype_merging::merge_vars_in_groups;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
 
@@ -114,7 +114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stream: group -> merge -> write (one variant at a time, no bulk collection)
     let ploidy = 2; // diploid assumption
-    for result in analyze_groups(grouper, &iter_info) {
+    for result in merge_vars_in_groups(grouper, &iter_info) {
         let variant = result?;
 
         let ref_allele = &variant.alleles[0];
