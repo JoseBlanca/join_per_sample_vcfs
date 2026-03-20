@@ -53,22 +53,45 @@ const VCF7: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00002\n\
     20\t1\t.\tG\tA,<NON_REF>\t20\tPASS\t.\tGT\t0|0";
 
+const VCF8: &str = "##\n\
+    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00001\n\
+    20\t1\t.\tT\tA\t20\tPASS\t.\tGT\t0|.\n\
+    20\t2\t.\tT\tA\t20\tPASS\t.\tGT\t0|0\n";
+
+const VCF9: &str = "##\n\
+    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00002\n\
+    20\t1\t.\tT\tA\t20\tPASS\t.\tGT\t0|.\n\
+    20\t2\t.\tT\tA\t20\tPASS\t.\tGT\t0|0\n";
+
 #[test]
 fn test_group_merging_creates_correct_number_of_vars() {
     let iters = vec![make_iter(VCF1), make_iter(VCF2)];
     let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
     let iter_info = grouper.iter_info().to_vec();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
-    let n_groups = groups.len();
-    println!("n_groups: {n_groups}");
 
     let vars: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
     // Non-variable vars are filtered out
-    assert!(vars.len() <= n_groups);
-    assert!(vars.len() > 0);
+    assert!(vars.len() == 3);
+}
+
+#[test]
+fn test_non_variant_vars_are_removed() {
+    let iters = vec![make_iter(VCF8), make_iter(VCF9)];
+    let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
+    let iter_info = grouper.iter_info().to_vec();
+    let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
+    assert!(groups.len() == 2);
+
+    let vars: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    // Non-variable vars are filtered out
+    assert!(vars.len() == 0);
 }
 
 #[test]

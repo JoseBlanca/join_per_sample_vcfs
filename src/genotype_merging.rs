@@ -219,6 +219,7 @@ pub fn merge_variant_group(
     iter_info: &[VariantIteratorInfo],
 ) -> VcfResult<Vec<Variant>> {
     let variant = create_variant_for_region(group, iter_info)?;
+
     let has_missing = variant.genotypes.iter().any(|&g| g < 0);
     if variant.alleles.len() <= 1 && !has_missing {
         return Err(VcfParseError::NotVariable);
