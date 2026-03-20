@@ -18,7 +18,12 @@ const VCF1: &str = "##\n\
     20\t3\t.\tA\tG\t20\tPASS\t.\tGT\t.|0\n\
     20\t4\t.\tT\t<NON_REF>\t20\tPASS\t.\tGT\t0|0\n\
     20\t5\t.\tG\tA\t20\tPASS\t.\tGT\t0/1\n\
-    20\t6\t.\tG\tA\t20\tPASS\t.\tGT\t0/1";
+    20\t6\t.\tG\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t7\t.\tA\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t8\t.\tG\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t9\t.\tC\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t10\t.\tA\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t11\t.\tT\t.\t20\tPASS\t.\tGT\t0/0";
 
 const VCF2: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00002\n\
@@ -27,11 +32,21 @@ const VCF2: &str = "##\n\
     20\t3\t.\tA\tG\t20\tPASS\t.\tGT\t.|0\n\
     20\t4\t.\tT\t<NON_REF>\t20\tPASS\t.\tGT\t0|0\n\
     20\t5\t.\tG\tA\t20\tPASS\t.\tGT\t0/1\n\
-    20\t6\t.\tG\tA\t20\tPASS\t.\tGT\t0/1";
+    20\t6\t.\tG\tA\t20\tPASS\t.\tGT\t0/1\n\
+    20\t7\t.\tA\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t8\t.\tG\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t9\t.\tC\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t10\t.\tA\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t11\t.\tT\t.\t20\tPASS\t.\tGT\t0/0";
 
 const VCF3: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00003\n\
-    20\t1\t.\tGTATGG\tG\t20\tPASS\t.\tGT\t1|1";
+    20\t1\t.\tGTATGG\tG\t20\tPASS\t.\tGT\t1|1\n\
+    20\t7\t.\tA\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t8\t.\tG\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t9\t.\tC\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t10\t.\tA\t.\t20\tPASS\t.\tGT\t0/0\n\
+    20\t11\t.\tT\t.\t20\tPASS\t.\tGT\t0/0";
 
 const VCF4: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00004\n\
@@ -95,7 +110,20 @@ fn test_non_variant_vars_are_removed() {
 }
 
 #[test]
-fn test_analyze_preserves_genomic_order() {
+fn test_grouper_preserves_genomic_order() {
+    //            chrom 1   chrom 20     chrom 21
+    //            4567890   123456789012  4567890
+    // REF        GATCGAT   GTATGGAGCATG  GATCGAT
+    // VCF1
+    // NA00001-1            ATATGGAGCAT
+    // NA00001-2            A..TAAAGCAT
+    // NA00003-1            G-----AGCAT
+    // NA00003-2            G-----AGCAT
+    // NA00004-1  G------   GTAT-------   G------
+    // NA00004-2  G------   GTAT-------   G------
+    // NA00005-1              T     A  A
+    // NA00005-1              T     A  A
+
     let iters = vec![
         make_iter(VCF1),
         make_iter(VCF3),
@@ -104,25 +132,19 @@ fn test_analyze_preserves_genomic_order() {
     ];
     let grouper =
         VariantGroupIterator::new(iters, vec!["1".into(), "20".into(), "21".into()]).unwrap();
-    let iter_info = grouper.iter_info().to_vec();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
     let group_positions: Vec<(String, u32)> =
         groups.iter().map(|g| (g.chrom.clone(), g.start)).collect();
-
-    let variants: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-
-    let variant_positions: Vec<(String, u32)> =
-        variants.iter().map(|v| (v.chrom.clone(), v.pos)).collect();
-
-    // Output variants must be a subset of input groups, in the same order
-    let variable_group_positions: Vec<(String, u32)> = group_positions
-        .into_iter()
-        .filter(|gp| variant_positions.contains(gp))
-        .collect();
-    assert_eq!(variant_positions, variable_group_positions);
+    assert_eq!(
+        group_positions,
+        vec![
+            ("1".to_string(), 4),
+            ("20".to_string(), 1),
+            ("20".to_string(), 12),
+            ("21".to_string(), 4),
+        ]
+    );
 }
 
 #[test]
@@ -730,3 +752,6 @@ fn test_missing_allele_in_merged_haplotype() {
         "Sample 2 should be homozygous deletion"
     );
 }
+
+// TODO If you don't get data for one position in the merger it should return an error
+// TODO if the reference allele is different in one sample it should fail
