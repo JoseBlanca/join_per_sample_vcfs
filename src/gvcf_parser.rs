@@ -426,7 +426,7 @@ impl Variant {
 
         let alleles: Vec<String> = std::iter::once(ref_allele)
             .chain(alt_alleles.split(','))
-            .filter(|allele| allele != &NON_REF)
+            .filter(|allele| allele != &NON_REF && *allele != ".")
             .map(str::to_string)
             .collect();
 
