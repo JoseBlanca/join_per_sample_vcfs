@@ -161,6 +161,46 @@ fn test_ref_allele_len() {
 }
 
 #[test]
+fn test_non_ref_not_included_in_alleles() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tG\t<NON_REF>\t30\tPASS\t.\tGT\t0/0
+chr1\t200\t.\tT\tA,<NON_REF>\t40\tPASS\t.\tGT\t0/1";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 2);
+
+    // ALT=<NON_REF> only: alleles should contain just the ref allele
+    assert_eq!(variants[0].alleles, vec!["G"]);
+
+    // ALT=A,<NON_REF>: alleles should contain ref + A, but not <NON_REF>
+    assert_eq!(variants[1].alleles, vec!["T", "A"]);
+}
+
+#[test]
+fn test_dot_alt_not_included_in_alleles() {
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tG\t.\t30\tPASS\t.\tGT\t0/0
+chr1\t200\t.\tT\tA,.\t40\tPASS\t.\tGT\t0/1";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+
+    assert_eq!(variants.len(), 2);
+
+    // ALT=. only: alleles should contain just the ref allele
+    assert_eq!(variants[0].alleles, vec!["G"]);
+
+    // ALT=A,.: alleles should contain ref + A, but not "."
+    assert_eq!(variants[1].alleles, vec!["T", "A"]);
+}
+
+#[test]
 fn test_sample_parsing() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
     let parser = VariantIterator::from_reader(reader).expect("Failed to create parser");
