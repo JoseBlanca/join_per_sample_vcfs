@@ -662,14 +662,71 @@ fn test_phase_broken_in_one_sample() {
     assert_eq!(gt_s2, &[0, 1]);
 }
 
-// TODO
-// check that when one sample has a missing allele in one SNP the merged haplotype allele is completely missing
-//           12
-// ref       TC
-// sample1-1  A
-// sample1-2  .
-// sample2-1  -
-// sample2-2  -
-// vcf sample1 chrom1 2 C A 1/.
-// vcf sample2 chrom1 1 TC T 1/1
-// merged vcf chrom1 1 TC TA,C 1/. 2/2
+#[test]
+fn test_missing_allele_in_merged_haplotype() {
+    //           12
+    // ref       TC
+    // sample1-1  A
+    // sample1-2  .
+    // sample2-1  -
+    // sample2-2  -
+    // vcf sample1 chrom1 2 C A 1/.
+    // vcf sample2 chrom1 1 TC T 1/1
+    // merged vcf chrom1 1 TC TA,T 1/. 2/2
+
+    // sample1: ref T at pos 1, SNP C>A with one missing allele at pos 2
+    let var1_s1 = make_variant("chrom1", 1, &["T"], &[&[0, 0]], &[false]);
+    let var2_s1 = make_variant("chrom1", 2, &["C", "A"], &[&[1, -1]], &[false]);
+    // sample2: deletion TC>T at pos 1, ref C at pos 2
+    let var1_s2 = make_variant("chrom1", 1, &["TC", "T"], &[&[1, 1]], &[false]);
+    let var2_s2 = make_variant("chrom1", 2, &["C"], &[&[0, 0]], &[false]);
+
+    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
+    let iter_infos = vec![
+        VariantIteratorInfo {
+            samples: vec!["sample1".into()],
+        },
+        VariantIteratorInfo {
+            samples: vec!["sample2".into()],
+        },
+    ];
+
+    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let variant = &result[0];
+
+    assert_eq!(variant.chrom, "chrom1");
+    assert_eq!(variant.pos, 1);
+    assert_eq!(&variant.alleles[0], "TC");
+
+    let actual_alts: HashSet<&str> = variant.alleles[1..].iter().map(|s| s.as_str()).collect();
+    let expected_alts: HashSet<&str> = ["TA", "T"].iter().copied().collect();
+    assert_eq!(actual_alts, expected_alts, "Alt alleles mismatch");
+
+    let ploidy = variant.genotypes.len() / variant.n_samples;
+
+    // Sample 1: one allele should be "TA" and the other missing (-1)
+    let gt_s1 = &variant.genotypes[0..ploidy];
+    assert!(gt_s1.contains(&-1), "Sample 1 should have a missing allele");
+    let non_missing_alleles: Vec<&str> = gt_s1
+        .iter()
+        .filter(|&&g| g != -1)
+        .map(|&g| variant.alleles[g as usize].as_str())
+        .collect();
+    assert_eq!(
+        non_missing_alleles,
+        vec!["TA"],
+        "Sample 1 non-missing allele should be TA"
+    );
+
+    // Sample 2: both alleles should be "T" (the deletion)
+    let gt_s2 = &variant.genotypes[ploidy..2 * ploidy];
+    let gt_s2_alleles: Vec<&str> = gt_s2
+        .iter()
+        .map(|&g| variant.alleles[g as usize].as_str())
+        .collect();
+    assert_eq!(
+        gt_s2_alleles,
+        vec!["T", "T"],
+        "Sample 2 should be homozygous deletion"
+    );
+}

@@ -40,6 +40,8 @@ fn create_variant_for_region(
     let mut first_het_seen = vec![false; total_samples];
     let mut phase_broken_since_het = vec![false; total_samples];
     let mut missing_samples: HashSet<usize> = HashSet::new();
+    // Track per-sample, per-haplotype missing status
+    let mut missing_haplotypes: Vec<Vec<bool>> = vec![Vec::new(); total_samples];
 
     // Process each variant in the group
     for (variant, &var_iter_idx) in var_group
@@ -60,6 +62,7 @@ fn create_variant_for_region(
             if is_first {
                 alleles_for_samples[sample_idx] = Some(vec![Vec::new(); ploidy]);
                 positions_left_in_del[sample_idx] = vec![0i32; ploidy];
+                missing_haplotypes[sample_idx] = vec![false; ploidy];
             }
 
             // Save previous deletion state before potential update
@@ -100,8 +103,10 @@ fn create_variant_for_region(
             let pos_left = &mut positions_left_in_del[sample_idx];
 
             for (h, &allele_int) in sample_gt.iter().enumerate() {
-                // Missing alleles (-1) are treated as ref for allele building
+                // Missing alleles (-1) are treated as ref for allele building,
+                // but the haplotype is flagged as missing for the final genotype
                 let allele_idx = if allele_int < 0 {
+                    missing_haplotypes[sample_idx][h] = true;
                     0usize
                 } else {
                     allele_int as usize
@@ -191,8 +196,12 @@ fn create_variant_for_region(
         if missing_samples.contains(&sample_idx) {
             genotypes.extend(std::iter::repeat(-1i8).take(ploidy));
         } else {
-            for allele in &alleles_str_per_sample[sample_idx] {
-                genotypes.push(*allele_id_map.get(allele).unwrap() as i8);
+            for (h, allele) in alleles_str_per_sample[sample_idx].iter().enumerate() {
+                if missing_haplotypes[sample_idx][h] {
+                    genotypes.push(-1i8);
+                } else {
+                    genotypes.push(*allele_id_map.get(allele).unwrap() as i8);
+                }
             }
         }
     }
@@ -220,8 +229,14 @@ pub fn merge_variant_group(
 ) -> VcfResult<Vec<Variant>> {
     let variant = create_variant_for_region(group, iter_info)?;
 
-    let has_missing = variant.genotypes.iter().any(|&g| g < 0);
-    if variant.alleles.len() <= 1 && !has_missing {
+    // A variant is non-variable if it has no alt alleles and no input variants
+    // had alt alleles (i.e. missing genotypes from broken phase don't count,
+    // but missing from ref-only inputs should be filtered).
+    let any_input_has_alt = group
+        .variants
+        .iter()
+        .any(|v| v.alleles.len() > 1 && v.genotypes.iter().any(|&g| g > 0));
+    if variant.alleles.len() <= 1 && !any_input_has_alt {
         return Err(VcfParseError::NotVariable);
     }
     Ok(vec![variant])
