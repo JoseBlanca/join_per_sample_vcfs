@@ -248,7 +248,16 @@ fn check_result(
 
 #[test]
 fn test_simple_merge() {
-    let var1_s1 = make_variant("1", 10, &["A", "T"], &[&[1, 1]], &[false]);
+    // ref     AG
+    // chrom 1 01
+    // s1-1    TC
+    // s1-2    AC
+    // s2-1    AT
+    // s2-2    TT
+    // merged
+    //               s1  s2
+    // chrom 1 0 A T T/T T/A
+    let var1_s1 = make_variant("1", 10, &["A", "T"], &[&[1, 0]], &[false]);
     let var2_s1 = make_variant("1", 11, &["G", "C"], &[&[1, 1]], &[false]);
     let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
     let var2_s2 = make_variant("1", 11, &["G", "T"], &[&[1, 1]], &[false]);
@@ -271,8 +280,8 @@ fn test_simple_merge() {
         "1",
         10,
         "AG",
-        &["TC", "AT", "TT"],
-        &[&["TC", "TC"], &["AT", "TT"]],
+        &["TC", "AC", "AT", "TT"],
+        &[&["TC", "AC"], &["AT", "TT"]],
         &[false, false],
     );
 }
