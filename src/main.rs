@@ -4,6 +4,7 @@ use std::process;
 use join_per_sample_vcfs::genotype_merging::merge_vars_in_groups;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
+use join_per_sample_vcfs::vcf_writer::VcfWriter;
 
 fn print_usage(program: &str) {
     eprintln!(
@@ -104,49 +105,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let grouper = VariantGroupIterator::new(vcf_iters, sorted_chromosomes)?;
     let iter_info = grouper.iter_info().to_vec();
 
-    // Output VCF header
-    println!("##fileformat=VCFv4.2");
-    print!("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT");
-    for sample in &all_samples {
-        print!("\t{}", sample);
-    }
-    println!();
-
     // Stream: group -> merge -> write (one variant at a time, no bulk collection)
-    let ploidy = 2; // diploid assumption
-    for result in merge_vars_in_groups(grouper, &iter_info) {
-        let variant = result?;
-
-        let ref_allele = &variant.alleles[0];
-        let alt_alleles = if variant.alleles.len() > 1 {
-            variant.alleles[1..].join(",")
-        } else {
-            ".".to_string()
-        };
-
-        print!(
-            "{}\t{}\t.\t{}\t{}\t.\t.\t.\tGT",
-            variant.chrom, variant.pos, ref_allele, alt_alleles
-        );
-
-        for sample_idx in 0..variant.n_samples {
-            let gt_start = sample_idx * ploidy;
-            let gt = &variant.genotypes[gt_start..gt_start + ploidy];
-            let gt_str: Vec<String> = gt
-                .iter()
-                .map(|&a| {
-                    if a < 0 {
-                        ".".to_string()
-                    } else {
-                        a.to_string()
-                    }
-                })
-                .collect();
-            let phase_sep = if variant.phase[sample_idx] { "|" } else { "/" };
-            print!("\t{}", gt_str.join(phase_sep));
-        }
-        println!();
-    }
+    let mut writer = VcfWriter::from_stdout(&all_samples)?;
+    writer.write_variants(merge_vars_in_groups(grouper, &iter_info))?;
+    writer.flush()?;
 
     Ok(())
 }
