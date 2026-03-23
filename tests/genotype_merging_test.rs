@@ -288,12 +288,20 @@ fn test_simple_merge() {
 
 #[test]
 fn test_simple_insertion() {
-    let var1_s1 = make_variant("1", 10, &["A", "ATT"], &[&[0, 1]], &[false]);
-    let var2_s1 = make_variant("1", 11, &["G", "C"], &[&[1, 1]], &[false]);
-    let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
-    let var2_s2 = make_variant("1", 11, &["G", "T"], &[&[1, 1]], &[false]);
+    // ref    A--G
+    // s1-1   A--C
+    // s1-2   ATTC
+    // s2-1   A--T
+    // s2-2   T--T
+    let var10_s1 = make_variant("1", 10, &["A", "ATT"], &[&[0, 1]], &[false]);
+    let var11_s1 = make_variant("1", 11, &["G", "C"], &[&[1, 1]], &[false]);
+    let var10_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
+    let var11_s2 = make_variant("1", 11, &["G", "T"], &[&[1, 1]], &[false]);
 
-    let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
+    let group = make_group(
+        vec![var10_s1, var11_s1, var10_s2, var11_s2],
+        vec![0, 0, 1, 1],
+    );
     let iter_infos = vec![
         VariantIteratorInfo {
             samples: vec!["sample1".into()],
@@ -319,10 +327,15 @@ fn test_simple_insertion() {
 
 #[test]
 fn test_simple_deletion() {
-    let var1_s1 = make_variant("1", 10, &["AT", "A"], &[&[1, 1]], &[false]);
-    let var2_s1 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
-    let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
-    let var2_s2 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
+    // ref  AT
+    // s1-1 A-
+    // s1-2 A-
+    // s2-1 AT
+    // s2-2 TT
+    let var1_s1 = make_variant("1", 1, &["AT", "A"], &[&[1, 1]], &[false]);
+    let var2_s1 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
+    let var1_s2 = make_variant("1", 1, &["A", "T"], &[&[0, 1]], &[false]);
+    let var2_s2 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
 
     let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
@@ -340,7 +353,7 @@ fn test_simple_deletion() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "AT",
         &["A", "TT"],
         &[&["A", "A"], &["AT", "TT"]],
@@ -350,12 +363,17 @@ fn test_simple_deletion() {
 
 #[test]
 fn test_deletion_len_2() {
-    let var1_s1 = make_variant("1", 10, &["ATT", "A"], &[&[1, 1]], &[false]);
-    let var2_s1 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
-    let var3_s1 = make_variant("1", 12, &["T"], &[&[0, 0]], &[false]);
-    let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
-    let var2_s2 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
-    let var3_s2 = make_variant("1", 12, &["T", "A"], &[&[1, 1]], &[false]);
+    // ref  ATT
+    // s1-1 A--
+    // s1-2 A--
+    // s2-1 ATA
+    // s2-2 TTA
+    let var1_s1 = make_variant("1", 1, &["ATT", "A"], &[&[1, 1]], &[false]);
+    let var2_s1 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
+    let var3_s1 = make_variant("1", 3, &["T"], &[&[0, 0]], &[false]);
+    let var1_s2 = make_variant("1", 1, &["A", "T"], &[&[0, 1]], &[false]);
+    let var2_s2 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
+    let var3_s2 = make_variant("1", 3, &["T", "A"], &[&[1, 1]], &[false]);
 
     let group = make_group(
         vec![var1_s1, var2_s1, var3_s1, var1_s2, var2_s2, var3_s2],
@@ -376,9 +394,9 @@ fn test_deletion_len_2() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "ATT",
-        &["A", "TTA", "ATA"],
+        &["A", "ATA", "TTA"],
         &[&["A", "A"], &["ATA", "TTA"]],
         &[false, false],
     );
@@ -386,12 +404,17 @@ fn test_deletion_len_2() {
 
 #[test]
 fn test_overlapping_deletions() {
-    let var1_s1 = make_variant("1", 10, &["AT", "A"], &[&[1, 1]], &[false]);
-    let var2_s1 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
-    let var3_s1 = make_variant("1", 12, &["T", "C"], &[&[0, 1]], &[false]);
-    let var1_s2 = make_variant("1", 10, &["A", "G"], &[&[1, 1]], &[false]);
-    let var2_s2 = make_variant("1", 11, &["TT", "T"], &[&[1, 1]], &[false]);
-    let var3_s2 = make_variant("1", 12, &["T"], &[&[0, 0]], &[false]);
+    // ref  ATT
+    // s1-1 A-T
+    // s1-2 A-C
+    // s2-1 GT-
+    // s2-2 GT-
+    let var1_s1 = make_variant("1", 1, &["AT", "A"], &[&[1, 1]], &[false]);
+    let var2_s1 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
+    let var3_s1 = make_variant("1", 3, &["T", "C"], &[&[0, 1]], &[false]);
+    let var1_s2 = make_variant("1", 1, &["A", "G"], &[&[1, 1]], &[false]);
+    let var2_s2 = make_variant("1", 2, &["TT", "T"], &[&[1, 1]], &[false]);
+    let var3_s2 = make_variant("1", 3, &["T"], &[&[0, 0]], &[false]);
 
     let group = make_group(
         vec![var1_s1, var2_s1, var3_s1, var1_s2, var2_s2, var3_s2],
@@ -412,7 +435,7 @@ fn test_overlapping_deletions() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "ATT",
         &["AT", "AC", "GT"],
         &[&["AT", "AC"], &["GT", "GT"]],
@@ -422,10 +445,15 @@ fn test_overlapping_deletions() {
 
 #[test]
 fn test_het_deletion() {
-    let var1_s1 = make_variant("1", 10, &["AT", "A"], &[&[0, 1]], &[false]);
-    let var2_s1 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
-    let var1_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
-    let var2_s2 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
+    // ref  AT
+    // s1-1 AT
+    // s1-2 A-
+    // s2-1 AT
+    // s2-2 TT
+    let var1_s1 = make_variant("1", 1, &["AT", "A"], &[&[0, 1]], &[false]);
+    let var2_s1 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
+    let var1_s2 = make_variant("1", 1, &["A", "T"], &[&[0, 1]], &[false]);
+    let var2_s2 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
 
     let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
@@ -443,7 +471,7 @@ fn test_het_deletion() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "AT",
         &["A", "TT"],
         &[&["AT", "A"], &["AT", "TT"]],
@@ -453,12 +481,17 @@ fn test_het_deletion() {
 
 #[test]
 fn test_two_deletions_in_same_sample() {
-    let var1_s1 = make_variant("1", 10, &["ATG", "A", "AG"], &[&[1, 2]], &[false]);
-    let var2_s1 = make_variant("1", 11, &["T"], &[&[0, 0]], &[false]);
-    let var3_s1 = make_variant("1", 12, &["G"], &[&[0, 0]], &[false]);
-    let var1_s2 = make_variant("1", 10, &["A", "G"], &[&[1, 1]], &[false]);
-    let var2_s2 = make_variant("1", 11, &["TG", "T"], &[&[0, 1]], &[false]);
-    let var3_s2 = make_variant("1", 12, &["G"], &[&[0, 0]], &[false]);
+    // ref  ATG
+    // s1-1 A--
+    // s1-2 A-G
+    // s2-1 GTG
+    // s2-2 GT-
+    let var1_s1 = make_variant("1", 1, &["ATG", "A", "AG"], &[&[1, 2]], &[false]);
+    let var2_s1 = make_variant("1", 2, &["T"], &[&[0, 0]], &[false]);
+    let var3_s1 = make_variant("1", 3, &["G"], &[&[0, 0]], &[false]);
+    let var1_s2 = make_variant("1", 1, &["A", "G"], &[&[1, 1]], &[false]);
+    let var2_s2 = make_variant("1", 2, &["TG", "T"], &[&[0, 1]], &[false]);
+    let var3_s2 = make_variant("1", 3, &["G"], &[&[0, 0]], &[false]);
 
     let group = make_group(
         vec![var1_s1, var2_s1, var3_s1, var1_s2, var2_s2, var3_s2],
@@ -479,7 +512,7 @@ fn test_two_deletions_in_same_sample() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "ATG",
         &["A", "AG", "GTG", "GT"],
         &[&["A", "AG"], &["GTG", "GT"]],
@@ -489,12 +522,17 @@ fn test_two_deletions_in_same_sample() {
 
 #[test]
 fn test_two_overlapping_deletions_in_same_sample() {
-    let var1_s1 = make_variant("1", 10, &["AT", "A"], &[&[0, 1]], &[true]);
-    let var2_s1 = make_variant("1", 11, &["TG", "T"], &[&[1, 0]], &[true]);
-    let var3_s1 = make_variant("1", 12, &["G"], &[&[0, 0]], &[true]);
-    let var1_s2 = make_variant("1", 10, &["A", "G"], &[&[1, 1]], &[true]);
-    let var2_s2 = make_variant("1", 11, &["TG", "T"], &[&[0, 1]], &[true]);
-    let var3_s2 = make_variant("1", 12, &["G"], &[&[0, 0]], &[true]);
+    // ref  ATG
+    // s1-1 AT-
+    // s1-2 A-G
+    // s2-1 GTG
+    // s2-2 GT-
+    let var1_s1 = make_variant("1", 1, &["AT", "A"], &[&[0, 1]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["TG", "T"], &[&[1, 0]], &[true]);
+    let var3_s1 = make_variant("1", 3, &["G"], &[&[0, 0]], &[true]);
+    let var1_s2 = make_variant("1", 1, &["A", "G"], &[&[1, 1]], &[true]);
+    let var2_s2 = make_variant("1", 2, &["TG", "T"], &[&[0, 1]], &[true]);
+    let var3_s2 = make_variant("1", 3, &["G"], &[&[0, 0]], &[true]);
 
     let group = make_group(
         vec![var1_s1, var2_s1, var3_s1, var1_s2, var2_s2, var3_s2],
@@ -515,9 +553,9 @@ fn test_two_overlapping_deletions_in_same_sample() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "ATG",
-        &["AG", "AT", "GTG", "GT"],
+        &["AT", "AG", "GTG", "GT"],
         &[&["AT", "AG"], &["GTG", "GT"]],
         &[false, false],
     );
@@ -529,8 +567,11 @@ fn test_two_overlapping_deletions_in_same_sample() {
 
 #[test]
 fn test_phase_single_het_no_phase_needed() {
-    let var1 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[false]);
-    let var2 = make_variant("1", 11, &["A"], &[&[0, 0]], &[false]);
+    // ref  TA
+    // s1-1 TA
+    // s1-2 AA
+    let var1 = make_variant("1", 1, &["T", "A"], &[&[0, 1]], &[false]);
+    let var2 = make_variant("1", 2, &["A"], &[&[0, 0]], &[false]);
 
     let group = make_group(vec![var1, var2], vec![0, 0]);
     let iter_infos = vec![VariantIteratorInfo {
@@ -540,14 +581,17 @@ fn test_phase_single_het_no_phase_needed() {
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
 
-    check_result(variant, "1", 10, "TA", &["AA"], &[&["TA", "AA"]], &[false]);
+    check_result(variant, "1", 1, "TA", &["AA"], &[&["TA", "AA"]], &[false]);
 }
 
 #[test]
 fn test_phase_kept_between_hets() {
-    let var1 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[true]);
-    let var2 = make_variant("1", 11, &["A"], &[&[0, 0]], &[true]);
-    let var3 = make_variant("1", 12, &["G", "C"], &[&[0, 1]], &[true]);
+    // ref  TAG
+    // s1-1 TAG
+    // s1-2 AAC
+    let var1 = make_variant("1", 1, &["T", "A"], &[&[0, 1]], &[true]);
+    let var2 = make_variant("1", 2, &["A"], &[&[0, 0]], &[true]);
+    let var3 = make_variant("1", 3, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3], vec![0, 0, 0]);
     let iter_infos = vec![VariantIteratorInfo {
@@ -560,7 +604,7 @@ fn test_phase_kept_between_hets() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "TAG",
         &["AAC"],
         &[&["TAG", "AAC"]],
@@ -570,9 +614,12 @@ fn test_phase_kept_between_hets() {
 
 #[test]
 fn test_phase_false_on_first_position_still_solvable() {
-    let var1 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[false]);
-    let var2 = make_variant("1", 11, &["A"], &[&[0, 0]], &[true]);
-    let var3 = make_variant("1", 12, &["G", "C"], &[&[0, 1]], &[true]);
+    // ref  TAG
+    // s1-1 TAG
+    // s1-2 AAC
+    let var1 = make_variant("1", 1, &["T", "A"], &[&[0, 1]], &[false]);
+    let var2 = make_variant("1", 2, &["A"], &[&[0, 0]], &[true]);
+    let var3 = make_variant("1", 3, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3], vec![0, 0, 0]);
     let iter_infos = vec![VariantIteratorInfo {
@@ -585,7 +632,7 @@ fn test_phase_false_on_first_position_still_solvable() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "TAG",
         &["AAC"],
         &[&["TAG", "AAC"]],
@@ -595,10 +642,13 @@ fn test_phase_false_on_first_position_still_solvable() {
 
 #[test]
 fn test_phase_first_het_not_at_first_position() {
-    let var1 = make_variant("1", 10, &["A"], &[&[0, 0]], &[false]);
-    let var2 = make_variant("1", 11, &["T", "A"], &[&[0, 1]], &[false]);
-    let var3 = make_variant("1", 12, &["A"], &[&[0, 0]], &[true]);
-    let var4 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[true]);
+    // ref  ATAG
+    // s1-1 ATAG
+    // s1-2 AAAC
+    let var1 = make_variant("1", 1, &["A"], &[&[0, 0]], &[false]);
+    let var2 = make_variant("1", 2, &["T", "A"], &[&[0, 1]], &[false]);
+    let var3 = make_variant("1", 3, &["A"], &[&[0, 0]], &[true]);
+    let var4 = make_variant("1", 4, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3, var4], vec![0, 0, 0, 0]);
     let iter_infos = vec![VariantIteratorInfo {
@@ -611,7 +661,7 @@ fn test_phase_first_het_not_at_first_position() {
     check_result(
         variant,
         "1",
-        10,
+        1,
         "ATAG",
         &["AAAC"],
         &[&["ATAG", "AAAC"]],
@@ -621,10 +671,13 @@ fn test_phase_first_het_not_at_first_position() {
 
 #[test]
 fn test_phase_broken_between_hets_missing_genotype() {
-    let var1 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[true]);
-    let var2 = make_variant("1", 11, &["G"], &[&[0, 0]], &[false]); // phase broken!
-    let var3 = make_variant("1", 12, &["A"], &[&[0, 0]], &[true]);
-    let var4 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[true]);
+    // ref  TGAG
+    // s1-1 TGAG -> missing because of phasing
+    // s1-2 AGAC -> missing because of phasing
+    let var1 = make_variant("1", 1, &["T", "A"], &[&[0, 1]], &[true]);
+    let var2 = make_variant("1", 2, &["G"], &[&[0, 0]], &[false]); // phase broken!
+    let var3 = make_variant("1", 3, &["A"], &[&[0, 0]], &[true]);
+    let var4 = make_variant("1", 4, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1, var2, var3, var4], vec![0, 0, 0, 0]);
     let iter_infos = vec![VariantIteratorInfo {
@@ -662,12 +715,17 @@ fn test_allele_merge_with_non_ref_filtered() {
 
 #[test]
 fn test_phase_broken_in_one_sample() {
+    // ref  TG
+    // s1-1 TA -> missing
+    // s1-2 GC
+    // s2-1 TG
+    // s2-2 AC
     // Sample 1: phase broken between two hets
-    let var1_s1 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[true]);
-    let var2_s1 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[false]);
+    let var1_s1 = make_variant("1", 1, &["T", "A"], &[&[0, 1]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["G", "C"], &[&[0, 1]], &[false]);
     // Sample 2: phase maintained
-    let var1_s2 = make_variant("1", 10, &["T", "A"], &[&[0, 1]], &[true]);
-    let var2_s2 = make_variant("1", 13, &["G", "C"], &[&[0, 1]], &[true]);
+    let var1_s2 = make_variant("1", 1, &["T", "A"], &[&[0, 1]], &[true]);
+    let var2_s2 = make_variant("1", 2, &["G", "C"], &[&[0, 1]], &[true]);
 
     let group = make_group(vec![var1_s1, var2_s1, var1_s2, var2_s2], vec![0, 0, 1, 1]);
     let iter_infos = vec![
