@@ -42,6 +42,8 @@ fn create_variant_for_region(
     let mut missing_samples: HashSet<usize> = HashSet::new();
     // Track per-sample, per-haplotype missing status
     let mut missing_haplotypes: Vec<Vec<bool>> = vec![Vec::new(); total_samples];
+    // Phase output: true unless first variant is unphased, any het is unphased, or sample is missing
+    let mut sample_phase = vec![true; total_samples];
 
     // Process each variant in the group
     for (variant, &var_iter_idx) in var_group
@@ -56,7 +58,7 @@ fn create_variant_for_region(
             let sample_idx = sample_offsets[var_iter_idx] + sample_idx_in_var_iter;
             let gt_start = sample_idx_in_var_iter * ploidy;
             let sample_gt = &variant.genotypes[gt_start..gt_start + ploidy];
-            let sample_phase = variant.phase[sample_idx_in_var_iter];
+            let sample_phase_input = variant.phase[sample_idx_in_var_iter];
 
             let is_first = alleles_for_samples[sample_idx].is_none();
             if is_first {
@@ -85,9 +87,11 @@ fn create_variant_for_region(
                 false
             };
 
-            // Phase tracking: detect when haplotype can't be built due to broken phase
+            // Phase tracking: detect when haplotype can't be built due to broken phase.
+            // If phase is false after the first het was seen, we can't determine
+            // haplotype assignment for the next het.
             let is_het = sample_gt.iter().any(|&a| a != sample_gt[0]);
-            if !is_first && first_het_seen[sample_idx] && !sample_phase {
+            if !is_first && first_het_seen[sample_idx] && !sample_phase_input {
                 phase_broken_since_het[sample_idx] = true;
             }
             if is_het {
@@ -96,6 +100,14 @@ fn create_variant_for_region(
                 }
                 first_het_seen[sample_idx] = true;
                 phase_broken_since_het[sample_idx] = false;
+            }
+
+            // Output phase: false if first variant unphased or any het unphased
+            if is_first && !sample_phase_input {
+                sample_phase[sample_idx] = false;
+            }
+            if is_het && !sample_phase_input {
+                sample_phase[sample_idx] = false;
             }
 
             // Build alleles per haplotype
@@ -206,7 +218,11 @@ fn create_variant_for_region(
         }
     }
 
-    let phases = vec![false; total_samples];
+    // Missing samples get phase=false
+    for &si in &missing_samples {
+        sample_phase[si] = false;
+    }
+    let phases = sample_phase;
 
     Ok(Variant {
         chrom: var_group.chrom.clone(),

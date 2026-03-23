@@ -695,8 +695,7 @@ fn test_phase_broken_between_hets_missing_genotype() {
     let ploidy = variant.genotypes.len() / variant.n_samples;
     let gt = &variant.genotypes[0..ploidy];
     assert_eq!(gt, &[-1, -1]);
-    let phases = &variant.phase[0..ploidy];
-    assert_eq!(phases, &[false]);
+    assert_eq!(variant.phase, &[false]);
 }
 
 #[test]
@@ -755,6 +754,7 @@ fn test_phase_broken_in_one_sample() {
     // Sample 2: valid genotype (0/1 with ref="TG" and alt containing "AC")
     let gt_s2 = &variant.genotypes[ploidy..2 * ploidy];
     assert_eq!(gt_s2, &[0, 1]);
+
     let phases = &variant.phase[0..2];
     assert_eq!(phases, &[false, true]);
 }
@@ -880,9 +880,9 @@ fn test_phase_lost_in_het_and_not_recovered() {
 #[test]
 fn test_phase_lost_in_het2() {
     // ref   TAA
-    // s1-1  TAA
-    // s1-2  TTT
-    // phase 110 -> phase result false
+    // s1-1  TAA -> missing because of phasing
+    // s1-2  TTT -> missing because of phasing
+    // phase 110 -> two hets without phase between them -> missing genotype
     let var1_s1 = make_variant("1", 1, &["T"], &[&[0, 0]], &[true]);
     let var2_s1 = make_variant("1", 2, &["A", "T"], &[&[0, 1]], &[true]);
     let var3_s1 = make_variant("1", 3, &["A", "T"], &[&[0, 1]], &[false]);
@@ -895,15 +895,11 @@ fn test_phase_lost_in_het2() {
     let result = merge_variant_group(&group, &iter_infos).unwrap();
     let variant = &result[0];
 
-    check_result(
-        variant,
-        "1",
-        1,
-        "TAA",
-        &["TTT"],
-        &[&["TAA", "TTT"]],
-        &[false],
-    );
+    // Genotype should be missing (-1) for this sample due to broken phase
+    let ploidy = variant.genotypes.len() / variant.n_samples;
+    let gt = &variant.genotypes[0..ploidy];
+    assert_eq!(gt, &[-1, -1]);
+    assert_eq!(variant.phase, &[false]);
 }
 
 #[test]
