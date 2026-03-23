@@ -252,8 +252,10 @@ fn test_simple_merge() {
     // chrom 1 01
     // s1-1    TC
     // s1-2    AC
+    // phase   00
     // s2-1    AT
     // s2-2    TT
+    // phase   00
     // merged
     //               s1  s2
     // chrom 1 0 A T T/T T/A
@@ -291,8 +293,10 @@ fn test_simple_insertion() {
     // ref    A--G
     // s1-1   A--C
     // s1-2   ATTC
+    // phase  0  0
     // s2-1   A--T
     // s2-2   T--T
+    // phase  0  0
     let var10_s1 = make_variant("1", 10, &["A", "ATT"], &[&[0, 1]], &[false]);
     let var11_s1 = make_variant("1", 11, &["G", "C"], &[&[1, 1]], &[false]);
     let var10_s2 = make_variant("1", 10, &["A", "T"], &[&[0, 1]], &[false]);
@@ -557,7 +561,7 @@ fn test_two_overlapping_deletions_in_same_sample() {
         "ATG",
         &["AT", "AG", "GTG", "GT"],
         &[&["AT", "AG"], &["GTG", "GT"]],
-        &[false, false],
+        &[true, true],
     );
 }
 
@@ -608,7 +612,7 @@ fn test_phase_kept_between_hets() {
         "TAG",
         &["AAC"],
         &[&["TAG", "AAC"]],
-        &[false],
+        &[true],
     );
 }
 
@@ -691,6 +695,8 @@ fn test_phase_broken_between_hets_missing_genotype() {
     let ploidy = variant.genotypes.len() / variant.n_samples;
     let gt = &variant.genotypes[0..ploidy];
     assert_eq!(gt, &[-1, -1]);
+    let phases = &variant.phase[0..ploidy];
+    assert_eq!(phases, &[false]);
 }
 
 #[test]
@@ -749,6 +755,8 @@ fn test_phase_broken_in_one_sample() {
     // Sample 2: valid genotype (0/1 with ref="TG" and alt containing "AC")
     let gt_s2 = &variant.genotypes[ploidy..2 * ploidy];
     assert_eq!(gt_s2, &[0, 1]);
+    let phases = &variant.phase[0..2];
+    assert_eq!(phases, &[false, true]);
 }
 
 #[test]
@@ -818,6 +826,133 @@ fn test_missing_allele_in_merged_haplotype() {
         vec!["T", "T"],
         "Sample 2 should be homozygous deletion"
     );
+}
+
+#[test]
+fn test_phase_lost_in_het() {
+    // ref   TA
+    // s1-1  TA
+    // s1-2  TT
+    // phase 10 -> phase result false
+    let var1_s1 = make_variant("1", 1, &["T"], &[&[0, 0]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["A", "T"], &[&[0, 1]], &[false]);
+
+    let group = make_group(vec![var1_s1, var2_s1], vec![0, 0]);
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
+
+    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let variant = &result[0];
+
+    check_result(variant, "1", 1, "TA", &["TT"], &[&["TA", "TT"]], &[false]);
+}
+
+#[test]
+fn test_phase_lost_in_het_and_not_recovered() {
+    // ref   TAA
+    // s1-1  TAA
+    // s1-2  TTT
+    // phase 101 -> phase result false
+    let var1_s1 = make_variant("1", 1, &["T"], &[&[0, 0]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["A", "T"], &[&[0, 1]], &[false]);
+    let var3_s1 = make_variant("1", 3, &["A", "T"], &[&[0, 1]], &[true]);
+
+    let group = make_group(vec![var1_s1, var2_s1, var3_s1], vec![0, 0, 0]);
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
+
+    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let variant = &result[0];
+
+    check_result(
+        variant,
+        "1",
+        1,
+        "TAA",
+        &["TTT"],
+        &[&["TAA", "TTT"]],
+        &[false],
+    );
+}
+
+#[test]
+fn test_phase_lost_in_het2() {
+    // ref   TAA
+    // s1-1  TAA
+    // s1-2  TTT
+    // phase 110 -> phase result false
+    let var1_s1 = make_variant("1", 1, &["T"], &[&[0, 0]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["A", "T"], &[&[0, 1]], &[true]);
+    let var3_s1 = make_variant("1", 3, &["A", "T"], &[&[0, 1]], &[false]);
+
+    let group = make_group(vec![var1_s1, var2_s1, var3_s1], vec![0, 0, 0]);
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
+
+    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let variant = &result[0];
+
+    check_result(
+        variant,
+        "1",
+        1,
+        "TAA",
+        &["TTT"],
+        &[&["TAA", "TTT"]],
+        &[false],
+    );
+}
+
+#[test]
+fn test_phase_maintained_despited_not_phased_in_hom_position() {
+    // ref   TAA
+    // s1-1  TAA
+    // s1-2  TAT
+    // phase 101 -> phase result true
+    let var1_s1 = make_variant("1", 1, &["T"], &[&[0, 0]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["A"], &[&[0, 0]], &[false]);
+    let var3_s1 = make_variant("1", 3, &["A", "T"], &[&[0, 1]], &[true]);
+
+    let group = make_group(vec![var1_s1, var2_s1, var3_s1], vec![0, 0, 0]);
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
+
+    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let variant = &result[0];
+
+    check_result(
+        variant,
+        "1",
+        1,
+        "TAA",
+        &["TAT"],
+        &[&["TAA", "TAT"]],
+        &[true],
+    );
+}
+
+#[test]
+fn test_phase_conserved_in_het() {
+    // ref   TA
+    // s1-1  TA
+    // s1-2  TT
+    // phase 11 -> phase result true
+    let var1_s1 = make_variant("1", 1, &["T"], &[&[0, 0]], &[true]);
+    let var2_s1 = make_variant("1", 2, &["A", "T"], &[&[0, 1]], &[true]);
+
+    let group = make_group(vec![var1_s1, var2_s1], vec![0, 0]);
+    let iter_infos = vec![VariantIteratorInfo {
+        samples: vec!["sample1".into()],
+    }];
+
+    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let variant = &result[0];
+
+    check_result(variant, "1", 1, "TA", &["TT"], &[&["TA", "TT"]], &[true]);
 }
 
 // TODO If you don't get data for one position in the merger it should return an error
