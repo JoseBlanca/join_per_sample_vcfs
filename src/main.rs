@@ -1,10 +1,8 @@
 use std::env;
 use std::process;
 
-use join_per_sample_vcfs::genotype_merging::merge_vars_in_groups;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
-use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
-use join_per_sample_vcfs::vcf_writer::VcfWriter;
+use join_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
 fn print_usage(program: &str) {
     eprintln!(
@@ -95,20 +93,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         vcf_iters.push(iter);
     }
 
-    // Collect all sample names for the header
-    let all_samples: Vec<String> = vcf_iters
-        .iter()
-        .flat_map(|iter| iter.samples().iter().cloned())
-        .collect();
-
-    // Create the variant group iterator
-    let grouper = VariantGroupIterator::new(vcf_iters, sorted_chromosomes)?;
-    let iter_info = grouper.iter_info().to_vec();
-
-    // Stream: group -> merge -> write (one variant at a time, no bulk collection)
-    let mut writer = VcfWriter::from_stdout(&all_samples)?;
-    writer.write_variants(merge_vars_in_groups(grouper, &iter_info))?;
-    writer.flush()?;
+    let stdout = Box::new(std::io::stdout().lock());
+    merge_alleles_and_genotypes(vcf_iters, sorted_chromosomes, stdout)?;
 
     Ok(())
 }

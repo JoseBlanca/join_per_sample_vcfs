@@ -1,56 +1,34 @@
-use std::io::{self, BufReader, Write};
-use std::sync::{Arc, Mutex};
+use std::io::BufReader;
 
-use join_per_sample_vcfs::genotype_merging::merge_vars_in_groups;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
-use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
-use join_per_sample_vcfs::vcf_writer::VcfWriter;
+use join_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
 fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
     VariantIterator::from_reader(reader).expect("Failed to create parser")
 }
 
-/// Writer that captures output in a shared buffer.
-struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Run the full pipeline: parse gVCFs -> group -> merge -> write VCF.
 /// Returns the output VCF as a string.
 fn run_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>) -> String {
-    let mut iters = Vec::new();
-    for input in gvcf_inputs {
-        iters.push(make_iter(input));
+    let iters: Vec<_> = gvcf_inputs.iter().map(|input| make_iter(input)).collect();
+
+    let shared_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shared_clone = shared_buf.clone();
+
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
-    let all_samples: Vec<String> = iters
-        .iter()
-        .flat_map(|iter| iter.samples().iter().cloned())
-        .collect();
-
-    let grouper =
-        VariantGroupIterator::new(iters, chromosomes).expect("Failed to create grouper");
-    let iter_info = grouper.iter_info().to_vec();
-
-    let shared_buf = Arc::new(Mutex::new(Vec::new()));
-    let mut writer =
-        VcfWriter::from_writer(Box::new(SharedWriter(shared_buf.clone())), &all_samples)
-            .expect("Failed to create writer");
-
-    writer
-        .write_variants(merge_vars_in_groups(grouper, &iter_info))
-        .expect("Failed to write variants");
-    writer.flush().expect("Failed to flush");
-    drop(writer);
+    merge_alleles_and_genotypes(iters, chromosomes, Box::new(SharedWriter(shared_clone)))
+        .expect("Pipeline failed");
 
     let buf = shared_buf.lock().unwrap();
     String::from_utf8(buf.clone()).unwrap()
