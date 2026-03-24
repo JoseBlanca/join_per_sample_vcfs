@@ -1,6 +1,8 @@
 use std::env;
 use std::process;
+use std::thread;
 
+use join_per_sample_vcfs::decompression_pool::DecompressionPool;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 use join_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
@@ -86,10 +88,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to set thread count: {}", e))?;
     }
 
-    // Parse each gVCF file
+    // Create decompression pool (defaults to number of CPUs)
+    let decompression_threads = n_threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
+    let pool = DecompressionPool::new(decompression_threads);
+
+    // Parse each gVCF file using the shared pool
     let mut vcf_iters = Vec::with_capacity(vcf_paths.len());
     for path in &vcf_paths {
-        let iter = VariantIterator::from_gzip_path_threaded(path)?;
+        let iter = VariantIterator::from_gzip_path_pooled(path, &pool)?;
         vcf_iters.push(iter);
     }
 

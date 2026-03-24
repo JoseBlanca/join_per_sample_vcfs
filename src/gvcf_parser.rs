@@ -41,6 +41,7 @@
 //! # }
 //! ```
 
+use crate::decompression_pool::{DecompressionPool, PooledReader};
 use crate::errors::VcfParseError;
 use crate::threaded_reader::ThreadedReader;
 use crate::utils_magic::file_is_gzipped;
@@ -724,6 +725,28 @@ impl VariantIterator<BufReader<ThreadedReader>> {
         let gz_decoder = MultiGzDecoder::new(file);
         let threaded = ThreadedReader::new(gz_decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, threaded);
+        Ok(VariantIterator::new(buf_reader)?)
+    }
+}
+impl VariantIterator<BufReader<PooledReader>> {
+    /// Create a `VariantIterator` that uses a shared `DecompressionPool` for
+    /// gzip decompression, instead of spawning a dedicated thread per file.
+    pub fn from_gzip_path_pooled<P: AsRef<Path>>(
+        path: P,
+        pool: &DecompressionPool,
+    ) -> VcfResult<Self> {
+        if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
+            path: path.as_ref().to_string_lossy().to_string(),
+            reason: e.to_string(),
+        })? {
+            return Err(VcfParseError::VCFFileShouldBeGzipped {
+                path: path.as_ref().to_string_lossy().to_string(),
+            });
+        }
+        let file = File::open(&path)?;
+        let gz_decoder = MultiGzDecoder::new(file);
+        let pooled = pool.register(gz_decoder);
+        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, pooled);
         Ok(VariantIterator::new(buf_reader)?)
     }
 }
