@@ -12,6 +12,7 @@ use crate::gvcf_parser::{VcfResult, Variant};
 pub struct VcfWriter {
     writer: Box<dyn Write>,
     ploidy: usize,
+    broken_pipe: bool,
 }
 
 impl VcfWriter {
@@ -27,7 +28,7 @@ impl VcfWriter {
             Box::new(BufWriter::new(file))
         };
 
-        let mut vcf_writer = VcfWriter { writer, ploidy: 2 };
+        let mut vcf_writer = VcfWriter { writer, ploidy: 2, broken_pipe: false };
         vcf_writer.write_header(samples)?;
         Ok(vcf_writer)
     }
@@ -35,30 +36,48 @@ impl VcfWriter {
     /// Create a VCF writer that writes to stdout.
     pub fn from_stdout(samples: &[String]) -> io::Result<Self> {
         let writer: Box<dyn Write> = Box::new(BufWriter::new(io::stdout().lock()));
-        let mut vcf_writer = VcfWriter { writer, ploidy: 2 };
+        let mut vcf_writer = VcfWriter { writer, ploidy: 2, broken_pipe: false };
         vcf_writer.write_header(samples)?;
         Ok(vcf_writer)
     }
 
     /// Create a VCF writer from any `Write` implementor (useful for testing).
     pub fn from_writer(writer: Box<dyn Write>, samples: &[String]) -> io::Result<Self> {
-        let mut vcf_writer = VcfWriter { writer, ploidy: 2 };
+        let mut vcf_writer = VcfWriter { writer, ploidy: 2, broken_pipe: false };
         vcf_writer.write_header(samples)?;
         Ok(vcf_writer)
     }
 
-    fn write_header(&mut self, samples: &[String]) -> io::Result<()> {
-        write!(self.writer, "##fileformat=VCFv4.2\n")?;
-        write!(self.writer, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-        for sample in samples {
-            write!(self.writer, "\t{}", sample)?;
+    /// Write to the underlying writer, silently stopping on broken pipe.
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if self.broken_pipe {
+            return Ok(());
         }
-        write!(self.writer, "\n")?;
+        match self.writer.write_all(buf) {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                self.broken_pipe = true;
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    fn write_header(&mut self, samples: &[String]) -> io::Result<()> {
+        self.write_all(b"##fileformat=VCFv4.2\n")?;
+        self.write_all(b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+        for sample in samples {
+            self.write_all(format!("\t{}", sample).as_bytes())?;
+        }
+        self.write_all(b"\n")?;
         Ok(())
     }
 
     /// Write a single variant record.
     pub fn write_variant(&mut self, variant: &Variant) -> io::Result<()> {
+        if self.broken_pipe {
+            return Ok(());
+        }
+
         let ref_allele = &variant.alleles[0];
         let alt_alleles = if variant.alleles.len() > 1 {
             variant.alleles[1..].join(",")
@@ -66,10 +85,12 @@ impl VcfWriter {
             ".".to_string()
         };
 
-        write!(
-            self.writer,
-            "{}\t{}\t.\t{}\t{}\t.\t.\t.\tGT",
-            variant.chrom, variant.pos, ref_allele, alt_alleles
+        self.write_all(
+            format!(
+                "{}\t{}\t.\t{}\t{}\t.\t.\t.\tGT",
+                variant.chrom, variant.pos, ref_allele, alt_alleles
+            )
+            .as_bytes(),
         )?;
 
         for sample_idx in 0..variant.n_samples {
@@ -77,19 +98,19 @@ impl VcfWriter {
             let gt = &variant.genotypes[gt_start..gt_start + self.ploidy];
             let phase_sep = if variant.phase[sample_idx] { "|" } else { "/" };
 
-            write!(self.writer, "\t")?;
+            self.write_all(b"\t")?;
             for (i, &a) in gt.iter().enumerate() {
                 if i > 0 {
-                    write!(self.writer, "{}", phase_sep)?;
+                    self.write_all(phase_sep.as_bytes())?;
                 }
                 if a < 0 {
-                    write!(self.writer, ".")?;
+                    self.write_all(b".")?;
                 } else {
-                    write!(self.writer, "{}", a)?;
+                    self.write_all(format!("{}", a).as_bytes())?;
                 }
             }
         }
-        write!(self.writer, "\n")?;
+        self.write_all(b"\n")?;
         Ok(())
     }
 
@@ -99,15 +120,27 @@ impl VcfWriter {
         I: Iterator<Item = VcfResult<Variant>>,
     {
         for result in variants {
+            if self.broken_pipe {
+                return Ok(());
+            }
             let variant = result?;
             self.write_variant(&variant).map_err(crate::errors::VcfParseError::from)?;
         }
         Ok(())
     }
 
-    /// Flush the underlying writer.
+    /// Flush the underlying writer. Silently ignores broken pipe.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        if self.broken_pipe {
+            return Ok(());
+        }
+        match self.writer.flush() {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                self.broken_pipe = true;
+                Ok(())
+            }
+            other => other,
+        }
     }
 }
 
@@ -171,6 +204,7 @@ mod tests {
         let mut writer = VcfWriter {
             writer: Box::new(cursor),
             ploidy: 2,
+            broken_pipe: false,
         };
         writer.write_header(&samples).unwrap();
 
@@ -429,5 +463,109 @@ mod tests {
         let output = write_to_string(&samples, &[variant]);
         let data_line = output.lines().nth(2).unwrap();
         assert_eq!(data_line, "chr1\t10\t.\tA\tT\t.\t.\t.\tGT\t0/.");
+    }
+
+    /// A writer that returns BrokenPipe after a configured number of bytes.
+    struct BrokenPipeWriter {
+        bytes_until_break: usize,
+        bytes_written: usize,
+    }
+
+    impl BrokenPipeWriter {
+        fn new(bytes_until_break: usize) -> Self {
+            Self {
+                bytes_until_break,
+                bytes_written: 0,
+            }
+        }
+    }
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.bytes_written >= self.bytes_until_break {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"));
+            }
+            let allowed = (self.bytes_until_break - self.bytes_written).min(buf.len());
+            self.bytes_written += allowed;
+            Ok(allowed)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.bytes_written >= self.bytes_until_break {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_broken_pipe_on_write_variant_does_not_error() {
+        let samples = vec!["S1".to_string()];
+        // Allow enough bytes for the header, then break on the first variant
+        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer = VcfWriter::from_writer(
+            Box::new(BrokenPipeWriter::new(header.len())),
+            &samples,
+        )
+        .unwrap();
+
+        let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
+        let v2 = make_variant("chr1", 20, &["G", "C"], vec![1, 1], vec![false], 1);
+
+        // First write triggers the broken pipe — should return Ok
+        assert!(writer.write_variant(&v1).is_ok());
+        // Subsequent writes are silent no-ops
+        assert!(writer.write_variant(&v2).is_ok());
+        // Flush is also a no-op
+        assert!(writer.flush().is_ok());
+    }
+
+    #[test]
+    fn test_broken_pipe_on_write_variants_stops_silently() {
+        let samples = vec!["S1".to_string()];
+        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer = VcfWriter::from_writer(
+            Box::new(BrokenPipeWriter::new(header.len())),
+            &samples,
+        )
+        .unwrap();
+
+        let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
+        let v2 = make_variant("chr1", 20, &["G", "C"], vec![1, 1], vec![false], 1);
+        let v3 = make_variant("chr1", 30, &["C", "A"], vec![0, 0], vec![false], 1);
+
+        let iter = vec![Ok(v1), Ok(v2), Ok(v3)].into_iter();
+        // The whole iterator should complete without error
+        assert!(writer.write_variants(iter).is_ok());
+        assert!(writer.flush().is_ok());
+    }
+
+    #[test]
+    fn test_broken_pipe_mid_variant_stops_silently() {
+        let samples = vec!["S1".to_string()];
+        // Break after header + a few bytes into the first variant
+        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer = VcfWriter::from_writer(
+            Box::new(BrokenPipeWriter::new(header.len() + 5)),
+            &samples,
+        )
+        .unwrap();
+
+        let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
+        // Pipe breaks mid-write — should still return Ok
+        assert!(writer.write_variant(&v1).is_ok());
+    }
+
+    #[test]
+    fn test_broken_pipe_immediately_on_flush() {
+        let samples = vec!["S1".to_string()];
+        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer = VcfWriter::from_writer(
+            Box::new(BrokenPipeWriter::new(header.len())),
+            &samples,
+        )
+        .unwrap();
+
+        // No variants written, but flush hits broken pipe — should be Ok
+        assert!(writer.flush().is_ok());
     }
 }
