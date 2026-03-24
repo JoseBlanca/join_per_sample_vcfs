@@ -11,6 +11,21 @@ fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     VariantIterator::from_reader(reader).expect("Failed to create parser")
 }
 
+/// Collect merged variants from groups into a Vec (test helper).
+fn collect_merged_variants<I>(groups: I, iter_info: &[VariantIteratorInfo]) -> Vec<Variant>
+where
+    I: Iterator<Item = join_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVariantGroup>>
+        + Send,
+{
+    let mut vars = Vec::new();
+    merge_vars_in_groups(groups, iter_info, |result| {
+        vars.push(result?);
+        Ok(())
+    })
+    .unwrap();
+    vars
+}
+
 const VCF1: &str = "##\n\
     #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00001\n\
     20\t1\t.\tG\tA\t20\tPASS\t.\tGT\t1|1\n\
@@ -85,9 +100,7 @@ fn test_group_merging_creates_correct_number_of_vars() {
     let iter_info = grouper.iter_info().to_vec();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
-    let vars: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let vars = collect_merged_variants(groups.into_iter().map(Ok), &iter_info);
 
     // Non-variable vars are filtered out
     assert!(vars.len() == 3);
@@ -101,9 +114,7 @@ fn test_non_variant_vars_are_removed() {
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
     assert!(groups.len() == 2);
 
-    let vars: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let vars = collect_merged_variants(groups.into_iter().map(Ok), &iter_info);
 
     // Non-variable vars are filtered out
     assert!(vars.len() == 0);
@@ -157,9 +168,7 @@ fn test_analyze_single_group_from_merged_bin() {
 
     assert_eq!(groups.len(), 1);
 
-    let variants: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let variants = collect_merged_variants(groups.into_iter().map(Ok), &iter_info);
 
     assert_eq!(variants.len(), 1);
     assert_eq!(variants[0].chrom, "20");
@@ -711,9 +720,7 @@ fn test_allele_merge_with_non_ref_filtered() {
 
     // Both samples are hom-ref, so no alt alleles survive the merge.
     // Non-variable groups are filtered out by analyze_groups.
-    let variants: Vec<_> = merge_vars_in_groups(groups.into_iter().map(Ok), &iter_info)
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let variants = collect_merged_variants(groups.into_iter().map(Ok), &iter_info);
 
     assert_eq!(variants.len(), 0);
 }

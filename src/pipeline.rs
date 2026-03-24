@@ -23,7 +23,14 @@ pub fn merge_alleles_and_genotypes<B: BufRead + Send>(
 
     let mut vcf_writer =
         VcfWriter::from_writer(writer, &all_samples).map_err(crate::errors::VcfParseError::from)?;
-    vcf_writer.write_variants(merge_vars_in_groups(grouper, &iter_info))?;
+
+    merge_vars_in_groups(grouper, &iter_info, |result| {
+        let variant = result?;
+        vcf_writer
+            .write_variant(&variant)
+            .map_err(crate::errors::VcfParseError::from)
+    })?;
+
     vcf_writer
         .flush()
         .map_err(crate::errors::VcfParseError::from)?;
