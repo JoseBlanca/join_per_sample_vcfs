@@ -337,3 +337,48 @@ fn test_template_two_samples_non_ref_snps() {
         EXPECTED_SIMPLE_SNP_NON_REF,
     );
 }
+
+// Deletion in sample 1 and snp in sample 2
+const GVCF3_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+chr1    1    .   AA   A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   A    <NON_REF>     .     .       .     GT      0|0
+";
+const GVCF3_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+chr1    1    .   A    C,<NON_REF>   .     .       .     GT      1/1
+chr1    2    .   A    <NON_REF>     25    .       .     GT      0/0
+";
+const EXPECTED3: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample1  Sample2
+chr1    1    .   AA   A,CA  .     .       .     GT      0|1      2/2
+";
+
+#[test]
+fn test_del1() {
+    assert_pipeline(&[GVCF3_S1, GVCF3_S2], vec!["chr1".to_string()], EXPECTED3);
+}
+
+// Deletion in sample 1 and snp in sample 2
+const GVCF4_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+chr1    1    .   AA   A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   A    <NON_REF>     .     .       .     GT      0|0
+chr1    3    .   A    <NON_REF>     .     .       .     GT      0|0
+";
+const GVCF4_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+chr1    1    .   A    C,<NON_REF>   .     .       .     GT      1/1
+chr1    2    .   A    T,<NON_REF>   .     .       .     GT      1/1
+chr1    3    .   A    G,<NON_REF>   .     .       .     GT      1|0
+";
+const EXPECTED4: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample1  Sample2
+chr1    1    .   AA   A,CT  .     .       .     GT      0|1      2/2
+chr1    3    .   A    G     .     .       .     GT      0|0      1|0
+";
+
+#[test]
+fn test_del2() {
+    assert_pipeline(&[GVCF4_S1, GVCF4_S2], vec!["chr1".to_string()], EXPECTED4);
+}
