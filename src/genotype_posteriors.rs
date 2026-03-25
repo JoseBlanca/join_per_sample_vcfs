@@ -82,6 +82,88 @@ pub struct SitePosteriors {
     pub qual: f64,
 }
 
+/// Generates synthetic PL values from GT calls when the VCF has no PL field.
+///
+/// For each sample, we assign PL=0 to the genotype matching the GT call
+/// (meaning "most likely") and spread the remaining probability evenly across
+/// the other genotypes.  With the default confidence of 0.99:
+///
+///   - Called genotype:  PL = 0    (probability = 0.99)
+///   - Other genotypes:  PL = ~20  (probability = 0.01 / (num_genotypes - 1))
+///
+/// This avoids hard zeros that would prevent the EM from ever reconsidering
+/// a sample's genotype based on cohort-level evidence.
+///
+/// # Arguments
+/// * `genotypes` - The GT calls, flat: genotypes[sample * ploidy .. (sample+1) * ploidy]
+/// * `num_samples` - Number of samples
+/// * `num_alleles` - Number of alleles at this site
+/// * `ploidy` - Ploidy of the organism
+/// * `confidence` - Probability assigned to the called genotype (e.g., 0.99)
+///
+/// # Returns
+/// A flat vector of PL values: pls[sample * num_gt + g] for each genotype g.
+pub fn synthetic_pls_from_gt(
+    genotypes: &[i8],
+    num_samples: usize,
+    num_alleles: usize,
+    ploidy: usize,
+    confidence: f64,
+) -> Vec<f64> {
+    let all_genotypes = enumerate_genotypes(num_alleles, ploidy);
+    let num_genotypes = all_genotypes.len();
+
+    let pl_for_called = 0.0;
+    // PL = -10 * log10(probability)
+    // probability of each non-called genotype = (1 - confidence) / (num_genotypes - 1)
+    let prob_per_other = if num_genotypes > 1 {
+        (1.0 - confidence) / (num_genotypes - 1) as f64
+    } else {
+        1.0
+    };
+    let pl_for_other = -10.0 * prob_per_other.log10();
+
+    let mut pls = vec![pl_for_other; num_samples * num_genotypes];
+
+    for sample in 0..num_samples {
+        let gt_offset = sample * ploidy;
+        let pl_offset = sample * num_genotypes;
+
+        // Build allele counts from the GT call for this sample
+        let mut called_allele_counts = vec![0usize; num_alleles];
+        let mut has_missing = false;
+        for i in 0..ploidy {
+            let allele = genotypes[gt_offset + i];
+            if allele < 0 {
+                has_missing = true;
+                break;
+            }
+            let allele = allele as usize;
+            if allele < num_alleles {
+                called_allele_counts[allele] += 1;
+            }
+        }
+
+        if has_missing {
+            // Missing genotype: all PLs equal (no information)
+            for g in 0..num_genotypes {
+                pls[pl_offset + g] = 0.0;
+            }
+            continue;
+        }
+
+        // Find which genotype in the enumeration matches this GT call
+        for (g, genotype) in all_genotypes.iter().enumerate() {
+            if genotype.allele_counts == called_allele_counts {
+                pls[pl_offset + g] = pl_for_called;
+                break;
+            }
+        }
+    }
+
+    pls
+}
+
 /// Runs the full EM algorithm for one variant site.
 ///
 /// # Arguments
@@ -713,5 +795,87 @@ mod tests {
             het_selfing,
             het_outcrossing
         );
+    }
+
+    // --- Synthetic PL tests ---
+
+    #[test]
+    fn test_synthetic_pls_diploid_het() {
+        // Diploid, 2 alleles, 1 sample with GT = 0/1
+        // Genotype order: 0/0 (idx 0), 0/1 (idx 1), 1/1 (idx 2)
+        let genotypes: Vec<i8> = vec![0, 1];
+        let pls = synthetic_pls_from_gt(&genotypes, 1, 2, 2, 0.99);
+
+        assert_eq!(pls.len(), 3);
+        // Called genotype (0/1 = index 1) should have PL = 0
+        assert!((pls[1] - 0.0).abs() < 1e-9, "called GT should have PL=0");
+        // Others should have PL > 0
+        assert!(pls[0] > 15.0, "non-called PL={} should be > 15", pls[0]);
+        assert!(pls[2] > 15.0, "non-called PL={} should be > 15", pls[2]);
+        // The two non-called PLs should be equal
+        assert!((pls[0] - pls[2]).abs() < 1e-9, "non-called PLs should be equal");
+    }
+
+    #[test]
+    fn test_synthetic_pls_diploid_hom_ref() {
+        // GT = 0/0
+        let genotypes: Vec<i8> = vec![0, 0];
+        let pls = synthetic_pls_from_gt(&genotypes, 1, 2, 2, 0.99);
+
+        // 0/0 is index 0
+        assert!((pls[0] - 0.0).abs() < 1e-9);
+        assert!(pls[1] > 0.0);
+        assert!(pls[2] > 0.0);
+    }
+
+    #[test]
+    fn test_synthetic_pls_missing_genotype() {
+        // GT = ./. (missing)
+        let genotypes: Vec<i8> = vec![-1, -1];
+        let pls = synthetic_pls_from_gt(&genotypes, 1, 2, 2, 0.99);
+
+        // All PLs should be 0 (no information)
+        for pl in &pls {
+            assert!((pl - 0.0).abs() < 1e-9, "missing GT should give PL=0");
+        }
+    }
+
+    #[test]
+    fn test_synthetic_pls_tetraploid() {
+        // Tetraploid, 2 alleles, GT = 0/0/1/1
+        // Genotypes: 0000(0), 0001(1), 0011(2), 0111(3), 1111(4)
+        let genotypes: Vec<i8> = vec![0, 0, 1, 1];
+        let pls = synthetic_pls_from_gt(&genotypes, 1, 2, 4, 0.99);
+
+        assert_eq!(pls.len(), 5);
+        // 0/0/1/1 is index 2
+        assert!((pls[2] - 0.0).abs() < 1e-9, "called GT should have PL=0");
+        // Others should be > 0
+        assert!(pls[0] > 0.0);
+        assert!(pls[1] > 0.0);
+        assert!(pls[3] > 0.0);
+        assert!(pls[4] > 0.0);
+    }
+
+    #[test]
+    fn test_synthetic_pls_feed_into_em() {
+        // Two samples: GT = 0/1 and GT = 0/0, feed synthetic PLs into EM
+        let genotypes: Vec<i8> = vec![0, 1, 0, 0];
+        let pls = synthetic_pls_from_gt(&genotypes, 2, 2, 2, 0.99);
+
+        let result = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
+
+        // Sample 0 (0/1) should have het as most likely
+        let s0_het = result.genotype_posteriors[1];
+        let s0_hom_ref = result.genotype_posteriors[0];
+        assert!(
+            s0_het > s0_hom_ref,
+            "sample 0 het ({}) should be > hom-ref ({})",
+            s0_het,
+            s0_hom_ref
+        );
+
+        // Site should be called as variable
+        assert!(result.qual > 5.0, "QUAL={} should be > 5", result.qual);
     }
 }
