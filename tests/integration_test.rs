@@ -457,3 +457,137 @@ fn test_del_ins() {
         EXPECTED7,
     );
 }
+const GVCF6_S5: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample5
+chr1    1    .   A    T,<NON_REF>   .     .       .     GT      1/0
+chr1    2    .   T    A,<NON_REF>   .     .       .     GT      1/0
+chr1    3    .   C    T,<NON_REF>     .     .       .     GT    1|0
+";
+const EXPECTED8: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT             QUAL  FILTER  INFO  FORMAT  Sample1  Sample2  Sample3  Sample4  Sample5
+chr1    1    .   ATC  AC,CT,A,TTAC    .     .       .     GT      0|1      0|2      0|3      4|0      ./.
+";
+#[test]
+fn test_del_ins_missing_phase() {
+    assert_pipeline(
+        &[GVCF6_S1, GVCF6_S2, GVCF6_S3, GVCF6_S4, GVCF6_S5],
+        vec!["chr1".to_string()],
+        EXPECTED8,
+    );
+}
+
+// Phase problems
+const GVCF9_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+chr1    1    .   A    T,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    A,<NON_REF>     .     .       .   GT      0/1
+chr1    3    .   C    G,<NON_REF>   .     .       .     GT      0|1
+";
+const GVCF9_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+chr1    1    .   A    C,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    C,<NON_REF>   .     .       .     GT      0|1
+chr1    3    .   C    A,<NON_REF>   .     .       .     GT      0/1
+";
+const EXPECTED9: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample1  Sample2
+chr1    1    .   A    T,C  .     .       .     GT      0|1      0|2
+chr1    2    .   T    A,C  .     .       .     GT      0/1      0|2
+chr1    3    .   C    G,A  .     .       .     GT      0|1      0/2
+";
+#[test]
+fn test_snps_some_phases() {
+    assert_pipeline(&[GVCF9_S1, GVCF9_S2], vec!["chr1".to_string()], EXPECTED9);
+}
+
+const GVCF9_S3: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample3
+chr1    1    .   AT   A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    C,<NON_REF>   .     .       .     GT      1|0
+chr1    3    .   C    A,<NON_REF>   .     .       .     GT      0/1
+";
+const EXPECTED10: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT      QUAL  FILTER  INFO  FORMAT  Sample1  Sample2  Sample3
+chr1    1    .   AT   CC,AC,A  .     .       .     GT      ./.      0|1      2|3
+chr1    3    .   C    G,A      .     .       .     GT      0|1      0/2      0/2
+";
+#[test]
+fn test_missing_phase1() {
+    assert_pipeline(
+        &[GVCF9_S1, GVCF9_S2, GVCF9_S3],
+        vec!["chr1".to_string()],
+        EXPECTED10,
+    );
+}
+
+const GVCF9_S4: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample4
+chr1    1    .   ATC  A,<NON_REF>   .     .       .     GT      0/1
+chr1    2    .   T    <NON_REF>   .     .       .     GT        0|0
+chr1    3    .   C    <NON_REF>   .     .       .     GT        0|0
+";
+const GVCF9_S5: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample5
+chr1    1    .   ATC  A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>   .     .       .     GT        0|0
+chr1    3    .   C    <NON_REF>   .     .       .     GT        0|0
+";
+const GVCF9_S6: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample6
+chr1    1    .   A    T,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    TG,<NON_REF>  .     .       .     GT      0|1
+chr1    3    .   C    A,<NON_REF>   .     .       .     GT      0|1
+";
+const EXPECTED11: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT     QUAL  FILTER  INFO  FORMAT  Sample1  Sample2  Sample3  Sample4  Sample5  Sample6
+chr1    1    .   ATC  A,TTGA  .     .       .     GT      ./.      ./.      ./.      0/1      0|1      0|2
+";
+#[test]
+fn test_missing_phase2() {
+    assert_pipeline(
+        &[GVCF9_S1, GVCF9_S2, GVCF9_S3, GVCF9_S4, GVCF9_S5, GVCF9_S6],
+        vec!["chr1".to_string()],
+        EXPECTED11,
+    );
+}
+
+const GVCF10_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF   ALT           QUAL  FILTER  INFO  FORMAT  sample1
+chr1    1    .   ATCG  A,<NON_REF>   .     .       .     GT      0/1
+chr1    2    .   T     <NON_REF>   .     .       .     GT        0|0
+chr1    3    .   C     <NON_REF>   .     .       .     GT        0|0
+chr1    4    .   G     <NON_REF>   .     .       .     GT        0|0
+";
+const GVCF10_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT          QUAL  FILTER  INFO  FORMAT  sample2
+chr1    1    .   A    T,<NON_REF>  .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>    .     .       .     GT      0|0
+chr1    3    .   C    <NON_REF>    .     .       .     GT      0|0
+chr1    4    .   G    A,<NON_REF>  .     .       .     GT      0/1
+";
+const GVCF10_S3: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT          QUAL  FILTER  INFO  FORMAT  sample3
+chr1    1    .   A    T,<NON_REF>  .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>    .     .       .     GT      0/0
+chr1    3    .   C    <NON_REF>    .     .       .     GT      0|0
+chr1    4    .   G    A,<NON_REF>  .     .       .     GT      0|1
+";
+const GVCF10_S4: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT          QUAL  FILTER  INFO  FORMAT  sample4
+chr1    1    .   A    T,<NON_REF>  .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>    .     .       .     GT      0|0
+chr1    3    .   C    <NON_REF>    .     .       .     GT      0|0
+chr1    4    .   G    A,<NON_REF>  .     .       .     GT      0|1
+";
+const EXPECTED12: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF   ALT     QUAL  FILTER  INFO  FORMAT  sample1  sample2  sample3  sample4
+chr1    1    .   ATCG  A,TTCA  .     .       .     GT      0/1      ./.      ./.      0|2
+";
+#[test]
+fn test_missing_phase3() {
+    assert_pipeline(
+        &[GVCF10_S1, GVCF10_S2, GVCF10_S3, GVCF10_S4],
+        vec!["chr1".to_string()],
+        EXPECTED12,
+    );
+}
