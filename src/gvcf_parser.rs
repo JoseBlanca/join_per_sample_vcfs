@@ -140,6 +140,12 @@ pub struct Variant {
     pub genotypes: Vec<i8>,
     /// Phase information for each sample: `true` = phased (`|`), `false` = unphased (`/`)
     pub phase: Vec<bool>,
+    /// Phred-scaled genotype likelihoods (PL field) for all samples, stored as
+    /// a flat vector.  For diploid with `n` alleles there are `n*(n+1)/2`
+    /// values per sample.  Empty when PL is not present in the FORMAT field.
+    pub pls: Vec<f64>,
+    /// Number of PL values per sample (0 when PLs are absent).
+    pub pls_per_sample: usize,
     pub n_samples: usize,
 }
 
@@ -349,6 +355,35 @@ fn parse_genotypes(
     Ok((genotypes, phase))
 }
 
+/// Parses PL (phred-scaled genotype likelihood) values for all samples.
+///
+/// PL values are comma-separated integers inside the sample field at the given
+/// FORMAT index.  Returns a flat vector of f64 values and the count per sample.
+/// Missing PLs (`.`) are stored as 0.0.
+fn parse_pls(sample_fields: &str, n_samples: usize, pl_index: usize) -> (Vec<f64>, usize) {
+    let mut all_pls: Vec<f64> = Vec::new();
+    let mut pls_per_sample: Option<usize> = None;
+
+    for sample_field in sample_fields.split('\t').take(n_samples) {
+        if let Some(pl_str) = sample_field.split(':').nth(pl_index) {
+            let sample_pls: Vec<f64> = pl_str
+                .split(',')
+                .map(|v| v.parse::<f64>().unwrap_or(0.0))
+                .collect();
+            if pls_per_sample.is_none() {
+                pls_per_sample = Some(sample_pls.len());
+            }
+            all_pls.extend(sample_pls);
+        } else {
+            // No PL field for this sample — fill with zeros
+            let count = pls_per_sample.unwrap_or(0);
+            all_pls.extend(std::iter::repeat(0.0).take(count));
+        }
+    }
+
+    (all_pls, pls_per_sample.unwrap_or(0))
+}
+
 impl Variant {
     /// Creates a new Variant with the given fields.
     /// Sets internal parser fields (gt_index, pl_index) to defaults.
@@ -371,6 +406,8 @@ impl Variant {
             pl_index: None,
             genotypes,
             phase,
+            pls: Vec::new(),
+            pls_per_sample: 0,
             n_samples,
         }
     }
@@ -446,6 +483,13 @@ impl Variant {
         let (genotypes, phase) =
             parse_genotypes(sample_fields, n_samples, gt_index, ploidy, patterns)?;
 
+        // Parse PL values if the FORMAT field includes PL
+        let (pls, pls_per_sample) = if let Some(pl_idx) = pl_index {
+            parse_pls(sample_fields, n_samples, pl_idx)
+        } else {
+            (Vec::new(), 0)
+        };
+
         Ok(Variant {
             chrom: chrom.to_string(),
             pos,
@@ -456,6 +500,8 @@ impl Variant {
             pl_index,
             genotypes,
             phase,
+            pls,
+            pls_per_sample,
             n_samples,
         })
     }

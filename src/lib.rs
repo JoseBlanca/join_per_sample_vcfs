@@ -7,3 +7,4 @@ pub mod threaded_reader;
 pub mod utils_magic;
 pub mod variant_grouping;
 pub mod vcf_writer;
+pub mod genotype_posteriors;

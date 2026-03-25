@@ -170,6 +170,8 @@ mod tests {
             pl_index: None,
             genotypes,
             phase,
+            pls: Vec::new(),
+            pls_per_sample: 0,
             n_samples,
         }
     }

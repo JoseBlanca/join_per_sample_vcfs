@@ -236,6 +236,8 @@ fn create_variant_for_region(
         pl_index: None,
         genotypes,
         phase: phases,
+        pls: Vec::new(),
+        pls_per_sample: 0,
         n_samples: total_samples,
     })
 }
