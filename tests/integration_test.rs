@@ -382,3 +382,78 @@ chr1    3    .   A    G     .     .       .     GT      0|0      1|0
 fn test_del2() {
     assert_pipeline(&[GVCF4_S1, GVCF4_S2], vec!["chr1".to_string()], EXPECTED4);
 }
+
+// overlapping deletion
+const GVCF5_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+chr1    1    .   AT   A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>     .     .       .     GT      0|0
+chr1    3    .   C    T,<NON_REF>   .     .       .     GT      1|1
+";
+const GVCF5_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+chr1    1    .   A    C,<NON_REF>   .     .       .     GT      1|1
+chr1    2    .   TC   T,<NON_REF>   .     .       .     GT      1|1
+chr1    3    .   C    <NON_REF>     .     .       .     GT      0|0
+";
+const EXPECTED5: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT        QUAL  FILTER  INFO  FORMAT  Sample1  Sample2
+chr1    1    .   ATC  ATT,AT,CT  .     .       .     GT      1|2      3|3
+";
+
+#[test]
+fn test_del3() {
+    assert_pipeline(&[GVCF5_S1, GVCF5_S2], vec!["chr1".to_string()], EXPECTED5);
+}
+
+// overlapping deletion
+const GVCF6_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+chr1    1    .   AT   A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>     .     .       .     GT      0|0
+chr1    3    .   C    T,<NON_REF>   .     .       .     GT      0|0
+";
+const GVCF6_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+chr1    1    .   A    C,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   TC   T,<NON_REF>   .     .       .     GT      0|1
+chr1    3    .   C    <NON_REF>     .     .       .     GT      0|0
+";
+const GVCF6_S3: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample3
+chr1    1    .   ATC  A,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   T    <NON_REF>     .     .       .     GT      0|0
+chr1    3    .   C    <NON_REF>     .     .       .     GT      0|0
+";
+const EXPECTED6: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT        QUAL  FILTER  INFO  FORMAT  Sample1  Sample2  Sample3
+chr1    1    .   ATC  AC,CT,A    .     .       .     GT      0|1      0|2      0|3
+";
+
+#[test]
+fn test_del4() {
+    assert_pipeline(
+        &[GVCF6_S1, GVCF6_S2, GVCF6_S3],
+        vec!["chr1".to_string()],
+        EXPECTED6,
+    );
+}
+
+const GVCF6_S4: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample4
+chr1    1    .   A    T,<NON_REF>   .     .       .     GT      1|0
+chr1    2    .   T    TA,<NON_REF>   .     .       .     GT      1|0
+chr1    3    .   C    <NON_REF>     .     .       .     GT      0|0
+";
+const EXPECTED7: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT             QUAL  FILTER  INFO  FORMAT  Sample1  Sample2  Sample3  Sample4
+chr1    1    .   ATC  AC,CT,A,TTAC    .     .       .     GT      0|1      0|2      0|3      4|0
+";
+#[test]
+fn test_del_ins() {
+    assert_pipeline(
+        &[GVCF6_S1, GVCF6_S2, GVCF6_S3, GVCF6_S4],
+        vec!["chr1".to_string()],
+        EXPECTED7,
+    );
+}
