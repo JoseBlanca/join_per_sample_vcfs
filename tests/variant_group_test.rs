@@ -1,7 +1,7 @@
 use std::io::BufReader;
 
-use join_per_sample_vcfs::gvcf_parser::VariantIterator;
-use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
+use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::variant_grouping::VariantGroupIterator;
 
 fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());

@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::io::BufReader;
 
-use join_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in_groups};
-use join_per_sample_vcfs::gvcf_parser::{Variant, VariantIterator};
-use join_per_sample_vcfs::variant_grouping::VariantGroupIterator;
-use join_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
+use merge_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in_groups};
+use merge_per_sample_vcfs::gvcf_parser::{Variant, VariantIterator};
+use merge_per_sample_vcfs::variant_grouping::VariantGroupIterator;
+use merge_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
 
 fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
@@ -14,7 +14,7 @@ fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
 /// Collect merged variants from groups into a Vec (test helper).
 fn collect_merged_variants<I>(groups: I, iter_info: &[VariantIteratorInfo]) -> Vec<Variant>
 where
-    I: Iterator<Item = join_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVariantGroup>>
+    I: Iterator<Item = merge_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVariantGroup>>
         + Send,
 {
     let mut vars = Vec::new();

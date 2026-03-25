@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use join_per_sample_vcfs::gvcf_parser::VariantIterator;
+//! use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Parse a gzipped GVCF file

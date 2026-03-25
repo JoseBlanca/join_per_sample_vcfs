@@ -2,9 +2,9 @@ use std::env;
 use std::process;
 use std::thread;
 
-use join_per_sample_vcfs::decompression_pool::DecompressionPool;
-use join_per_sample_vcfs::gvcf_parser::VariantIterator;
-use join_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
+use merge_per_sample_vcfs::decompression_pool::DecompressionPool;
+use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
 fn print_usage(program: &str) {
     eprintln!(

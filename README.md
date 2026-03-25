@@ -1,11 +1,11 @@
-# join_per_sample_vcfs
+# merge_per_sample_vcfs
 
 A high-performance tool for merging per-sample gVCF files into a multi-sample VCF. Designed for thousands of input files with streaming I/O, without creating an intermediate variant database, and parallel processing.
 
 ## Usage
 
 ```
-$ join_per_sample_vcfs --chroms <chrom1,chrom2,...> [--threads <N>] <vcf1.gz> <vcf2.gz> ...
+$ merge_per_sample_vcfs --chroms <chrom1,chrom2,...> [--threads <N>] <vcf1.gz> <vcf2.gz> ...
 ```
 
 ### Options

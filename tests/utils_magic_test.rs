@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use tempfile::NamedTempFile;
 
-use join_per_sample_vcfs::utils_magic::{MagicByteError, are_gzipped_magic_bytes, file_is_gzipped};
+use merge_per_sample_vcfs::utils_magic::{
+    MagicByteError, are_gzipped_magic_bytes, file_is_gzipped,
+};
 
 #[test]
 fn are_gzipped_magic_bytes_detects_gzip_header() -> Result<(), MagicByteError> {

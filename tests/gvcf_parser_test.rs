@@ -1,4 +1,4 @@
-use join_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
 use std::fs::File;
 use std::io::BufReader;
 
@@ -34,8 +34,7 @@ fn test_gvcf_parsing() {
 #[test]
 fn test_peek_variant() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut var_iterator =
-        VariantIterator::from_reader(reader).expect("Failed to create parser");
+    let mut var_iterator = VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Peek should return the first variant without consuming it
     let peeked = var_iterator.peek_variant().unwrap().unwrap();
@@ -57,8 +56,7 @@ fn test_peek_variant() {
 #[test]
 fn test_peek_variant_exhausted() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut var_iterator =
-        VariantIterator::from_reader(reader).expect("Failed to create parser");
+    let mut var_iterator = VariantIterator::from_reader(reader).expect("Failed to create parser");
 
     // Consume all variants
     while var_iterator.next().is_some() {}

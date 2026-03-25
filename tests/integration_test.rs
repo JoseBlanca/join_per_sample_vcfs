@@ -1,7 +1,7 @@
 use std::io::BufReader;
 
-use join_per_sample_vcfs::gvcf_parser::VariantIterator;
-use join_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
+use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
 /// Convert a human-readable VCF string (spaces between fields) into proper
 /// tab-delimited VCF.  For each line: trim leading/trailing whitespace, then
