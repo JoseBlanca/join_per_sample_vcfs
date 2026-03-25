@@ -14,6 +14,20 @@ pub struct PriorConfig {
     pub indel_heterozygosity: f64,
     /// Uncertainty in our heterozygosity estimate (default: 0.01)
     pub heterozygosity_std_dev: f64,
+    /// Wright's fixation index (inbreeding coefficient).
+    ///
+    /// Controls the expected level of homozygosity in the population:
+    ///   F = 0.0 — Hardy-Weinberg equilibrium (outcrossing species, animals)
+    ///   F = 0.5 — partial selfing (e.g., some legumes, tomato)
+    ///   F = 1.0 — complete selfing (all individuals are homozygous)
+    ///
+    /// Technically, F is the probability that the two alleles in a diploid
+    /// individual are identical by descent.  Higher F means more homozygotes
+    /// and fewer heterozygotes than HW expectation.
+    ///
+    /// For polyploids, F is applied as the probability that all allele copies
+    /// in an individual are identical by descent.
+    pub fixation_index: f64,
 }
 
 impl Default for PriorConfig {
@@ -22,6 +36,7 @@ impl Default for PriorConfig {
             snp_heterozygosity: 0.001,
             indel_heterozygosity: 1.25e-4,
             heterozygosity_std_dev: 0.01,
+            fixation_index: 0.0,
         }
     }
 }
@@ -92,6 +107,8 @@ pub fn estimate_posteriors(
     let mut allele_frequencies = vec![1.0 / num_alleles as f64; num_alleles];
     let mut genotype_posteriors = vec![0.0; num_samples * num_genotypes];
 
+    let f = prior.fixation_index;
+
     for _iteration in 0..50 {
         // E-step: compute each sample's genotype posteriors given current frequencies
         compute_genotype_posteriors(
@@ -99,6 +116,8 @@ pub fn estimate_posteriors(
             &genotypes,
             sample_pls,
             num_samples,
+            f,
+            ploidy,
             &mut genotype_posteriors,
         );
 
@@ -131,6 +150,8 @@ pub fn estimate_posteriors(
         &genotypes,
         sample_pls,
         num_samples,
+        f,
+        ploidy,
         &mut genotype_posteriors,
     );
 
@@ -261,7 +282,7 @@ fn compute_prior_pseudocounts(num_alleles: usize, prior: &PriorConfig) -> Vec<f6
 ///
 /// For each genotype, the posterior combines three things:
 /// 1. The sequencing evidence (from the PL field)
-/// 2. The Hardy-Weinberg expectation given current allele frequencies
+/// 2. The genotype prior given current allele frequencies and fixation index
 /// 3. A combinatorial factor (how many distinguishable allele arrangements)
 ///
 /// The results are normalized so that each sample's posteriors sum to 1.
@@ -270,6 +291,8 @@ fn compute_genotype_posteriors(
     genotypes: &[Genotype],
     sample_pls: &[f64],
     num_samples: usize,
+    fixation_index: f64,
+    ploidy: usize,
     out_posteriors: &mut [f64],
 ) {
     let num_genotypes = genotypes.len();
@@ -285,7 +308,7 @@ fn compute_genotype_posteriors(
             let log10_likelihood = -sample_pls[pl_offset + g] / 10.0;
 
             let log10_hw_prior =
-                hardy_weinberg_log10_prior(genotype, allele_frequencies);
+                genotype_log10_prior(genotype, allele_frequencies, fixation_index, ploidy);
 
             let log10_posterior = log10_likelihood + log10_hw_prior;
             out_posteriors[post_offset + g] = log10_posterior;
@@ -309,28 +332,59 @@ fn compute_genotype_posteriors(
     }
 }
 
-/// Computes the Hardy-Weinberg log10 prior probability for a genotype of any
-/// ploidy, given allele frequencies.
+/// Computes the log10 genotype prior probability, incorporating the fixation
+/// index F (Wright's inbreeding coefficient).
 ///
-/// The general formula is:
-///   P(genotype | frequencies) = multinomial_coeff * product(freq[a] ^ count[a])
+/// The prior is a mixture of two components:
 ///
-/// For diploid AA: 1 * freq(A)^2
-/// For diploid AT: 2 * freq(A) * freq(T)
-/// For tetraploid AAAT: 4 * freq(A)^3 * freq(T)
-fn hardy_weinberg_log10_prior(
+/// 1. **Hardy-Weinberg component** (weight = 1 - F):
+///    The standard random-mating expectation.
+///    P_hw = multinomial_coeff * product(freq[a] ^ count[a])
+///
+/// 2. **Inbred component** (weight = F):
+///    All allele copies in the individual are identical by descent.
+///    Only fully homozygous genotypes (all copies the same allele) have
+///    nonzero probability under this component: P_inbred(all_A) = freq(A).
+///
+/// The combined prior is:
+///   P = (1 - F) * P_hw  +  F * P_inbred
+///
+/// When F = 0 this reduces to pure Hardy-Weinberg (outcrossing/animals).
+/// When F = 1 only homozygous genotypes have nonzero prior (complete selfing).
+fn genotype_log10_prior(
     genotype: &Genotype,
     allele_frequencies: &[f64],
+    fixation_index: f64,
+    ploidy: usize,
 ) -> f64 {
-    let mut log10_prior = genotype.log10_multinomial_coefficient;
-
+    // Hardy-Weinberg component
+    let mut log10_hw = genotype.log10_multinomial_coefficient;
     for (allele, &count) in genotype.allele_counts.iter().enumerate() {
         if count > 0 {
-            log10_prior += count as f64 * allele_frequencies[allele].log10();
+            log10_hw += count as f64 * allele_frequencies[allele].log10();
         }
     }
+    let prob_hw = f64::powf(10.0, log10_hw);
 
-    log10_prior
+    // Inbred component: nonzero only for fully homozygous genotypes
+    // (one allele has count == ploidy, all others are 0)
+    let prob_inbred = genotype
+        .allele_counts
+        .iter()
+        .enumerate()
+        .find(|(_, count)| **count == ploidy)
+        .map(|(allele, _)| allele_frequencies[allele])
+        .unwrap_or(0.0);
+
+    // Mix the two components
+    let combined = (1.0 - fixation_index) * prob_hw + fixation_index * prob_inbred;
+
+    // Guard against log10(0)
+    if combined <= 0.0 {
+        -1e10
+    } else {
+        combined.log10()
+    }
 }
 
 /// M-step: update allele frequencies from genotype posteriors.
@@ -571,5 +625,93 @@ mod tests {
                 sum
             );
         }
+    }
+
+    // --- Fixation index (F) tests ---
+
+    fn prior_with_f(f: f64) -> PriorConfig {
+        PriorConfig {
+            fixation_index: f,
+            ..PriorConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_high_f_favors_homozygotes() {
+        // Ambiguous data: PL equally supports het and hom-alt
+        let pls = vec![
+            30.0, 0.0, 0.0, // sample: het and hom-alt equally likely from reads
+        ];
+
+        let result_outcrossing = estimate_posteriors(2, 2, 1, &pls, &prior_with_f(0.0));
+        let result_selfing = estimate_posteriors(2, 2, 1, &pls, &prior_with_f(0.95));
+
+        // With high F, the hom-alt posterior should be higher than het
+        let het_idx = 1;
+        let hom_alt_idx = 2;
+
+        let het_post_outcrossing = result_outcrossing.genotype_posteriors[het_idx];
+        let het_post_selfing = result_selfing.genotype_posteriors[het_idx];
+
+        let hom_alt_post_outcrossing = result_outcrossing.genotype_posteriors[hom_alt_idx];
+        let hom_alt_post_selfing = result_selfing.genotype_posteriors[hom_alt_idx];
+
+        // Selfing should reduce het probability relative to outcrossing
+        assert!(
+            het_post_selfing < het_post_outcrossing,
+            "het posterior with F=0.95 ({}) should be less than F=0.0 ({})",
+            het_post_selfing,
+            het_post_outcrossing
+        );
+
+        // Selfing should increase hom-alt probability relative to outcrossing
+        assert!(
+            hom_alt_post_selfing > hom_alt_post_outcrossing,
+            "hom-alt posterior with F=0.95 ({}) should be greater than F=0.0 ({})",
+            hom_alt_post_selfing,
+            hom_alt_post_outcrossing
+        );
+    }
+
+    #[test]
+    fn test_f_zero_equals_hardy_weinberg() {
+        // F=0 should give the same result as the default (which is F=0)
+        let pls = vec![
+            10.0, 0.0, 30.0,
+            0.0, 15.0, 40.0,
+        ];
+        let result_default = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
+        let result_f0 = estimate_posteriors(2, 2, 2, &pls, &prior_with_f(0.0));
+
+        for (a, b) in result_default
+            .genotype_posteriors
+            .iter()
+            .zip(result_f0.genotype_posteriors.iter())
+        {
+            assert!((a - b).abs() < 1e-12, "F=0 should equal default HW");
+        }
+    }
+
+    #[test]
+    fn test_f_one_gives_zero_het_prior() {
+        // With F=1 (complete selfing) and clear het data, the prior fights
+        // against het, so the het posterior should be much lower than with F=0
+        let pls = vec![
+            99.0, 0.0, 99.0, // sample: clearly het from reads
+        ];
+
+        let result_outcrossing = estimate_posteriors(2, 2, 1, &pls, &prior_with_f(0.0));
+        let result_full_selfing = estimate_posteriors(2, 2, 1, &pls, &prior_with_f(1.0));
+
+        let het_idx = 1;
+        let het_outcrossing = result_outcrossing.genotype_posteriors[het_idx];
+        let het_selfing = result_full_selfing.genotype_posteriors[het_idx];
+
+        assert!(
+            het_selfing < het_outcrossing,
+            "het posterior with F=1.0 ({}) should be < F=0.0 ({})",
+            het_selfing,
+            het_outcrossing
+        );
     }
 }
