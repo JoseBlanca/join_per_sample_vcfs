@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Duration;
 
-use join_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
 
 fn bench_parse_gz_end_to_end(c: &mut Criterion) {
     let path = Path::new("/home/jose/analyses/g2psol/source_data/TS.vcf.gz");
