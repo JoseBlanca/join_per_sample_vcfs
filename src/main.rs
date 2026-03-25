@@ -3,6 +3,7 @@ use std::process;
 use std::thread;
 
 use merge_per_sample_vcfs::decompression_pool::DecompressionPool;
+use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
 use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
 use merge_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
@@ -104,7 +105,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stdout = Box::new(std::io::stdout().lock());
-    merge_alleles_and_genotypes(vcf_iters, sorted_chromosomes, stdout)?;
+    let prior = PriorConfig::default();
+    merge_alleles_and_genotypes(vcf_iters, sorted_chromosomes, stdout, &prior)?;
 
     Ok(())
 }

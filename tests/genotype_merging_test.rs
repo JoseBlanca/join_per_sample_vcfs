@@ -2,9 +2,14 @@ use std::collections::HashSet;
 use std::io::BufReader;
 
 use merge_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in_groups};
+use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
 use merge_per_sample_vcfs::gvcf_parser::{Variant, VariantIterator};
 use merge_per_sample_vcfs::variant_grouping::VariantGroupIterator;
 use merge_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
+
+fn default_prior() -> PriorConfig {
+    PriorConfig::default()
+}
 
 fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
@@ -18,7 +23,7 @@ where
         + Send,
 {
     let mut vars = Vec::new();
-    merge_vars_in_groups(groups, iter_info, |result| {
+    merge_vars_in_groups(groups, iter_info, &default_prior(), |result| {
         vars.push(result?);
         Ok(())
     })
@@ -283,7 +288,7 @@ fn test_simple_merge() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -324,7 +329,7 @@ fn test_simple_insertion() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -360,7 +365,7 @@ fn test_simple_deletion() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -401,7 +406,7 @@ fn test_deletion_len_2() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -442,7 +447,7 @@ fn test_overlapping_deletions() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -478,7 +483,7 @@ fn test_het_deletion() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -519,7 +524,7 @@ fn test_two_deletions_in_same_sample() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -560,7 +565,7 @@ fn test_two_overlapping_deletions_in_same_sample() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -591,7 +596,7 @@ fn test_phase_single_het_no_phase_needed() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(variant, "1", 1, "TA", &["AA"], &[&["TA", "AA"]], &[false]);
@@ -611,7 +616,7 @@ fn test_phase_kept_between_hets() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -639,7 +644,7 @@ fn test_phase_false_on_first_position_still_solvable() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -668,7 +673,7 @@ fn test_phase_first_het_not_at_first_position() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -697,7 +702,7 @@ fn test_phase_broken_between_hets_missing_genotype() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     // Genotype should be missing (-1) for this sample due to broken phase
@@ -749,7 +754,7 @@ fn test_phase_broken_in_one_sample() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     let ploidy = variant.genotypes.len() / variant.n_samples;
@@ -795,7 +800,7 @@ fn test_missing_allele_in_merged_haplotype() {
         },
     ];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     assert_eq!(variant.chrom, "chrom1");
@@ -849,7 +854,7 @@ fn test_phase_lost_in_het() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(variant, "1", 1, "TA", &["TT"], &[&["TA", "TT"]], &[false]);
@@ -870,7 +875,7 @@ fn test_phase_lost_in_het_and_not_recovered() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -899,7 +904,7 @@ fn test_phase_lost_in_het2() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     // Genotype should be missing (-1) for this sample due to broken phase
@@ -924,7 +929,7 @@ fn test_phase_maintained_despited_not_phased_in_hom_position() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(
@@ -952,7 +957,7 @@ fn test_phase_conserved_in_het() {
         samples: vec!["sample1".into()],
     }];
 
-    let result = merge_variant_group(&group, &iter_infos).unwrap();
+    let result = merge_variant_group(&group, &iter_infos, &default_prior()).unwrap();
     let variant = &result[0];
 
     check_result(variant, "1", 1, "TA", &["TT"], &[&["TA", "TT"]], &[true]);

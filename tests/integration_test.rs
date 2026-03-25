@@ -1,5 +1,6 @@
 use std::io::BufReader;
 
+use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
 use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
 use merge_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
@@ -93,7 +94,8 @@ fn run_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>) -> String {
         }
     }
 
-    merge_alleles_and_genotypes(iters, chromosomes, Box::new(SharedWriter(shared_clone)))
+    let prior = PriorConfig::default();
+    merge_alleles_and_genotypes(iters, chromosomes, Box::new(SharedWriter(shared_clone)), &prior)
         .expect("Pipeline failed");
 
     let buf = shared_buf.lock().unwrap();

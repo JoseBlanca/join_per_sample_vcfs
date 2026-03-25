@@ -265,7 +265,7 @@ pub fn estimate_posteriors(
 ///
 /// We generate non-decreasing allele sequences and sort them by the reversed
 /// sequence (highest position first) to match this convention.
-fn enumerate_genotypes(num_alleles: usize, ploidy: usize) -> Vec<Genotype> {
+pub fn enumerate_genotypes(num_alleles: usize, ploidy: usize) -> Vec<Genotype> {
     let mut allele_sequences: Vec<Vec<usize>> = Vec::new();
     let mut current = vec![0usize; ploidy];
 

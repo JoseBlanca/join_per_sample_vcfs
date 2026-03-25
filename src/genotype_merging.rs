@@ -5,6 +5,7 @@ use std::thread;
 use rayon::prelude::*;
 
 use crate::errors::VcfParseError;
+use crate::genotype_posteriors::{self, PriorConfig};
 use crate::gvcf_parser::{Variant, VcfResult};
 use crate::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
 
@@ -243,11 +244,17 @@ fn create_variant_for_region(
 }
 
 /// Merges a single `OverlappingVariantGroup` into one or more output variants.
+///
+/// After merging alleles and genotypes, computes genotype posterior
+/// probabilities using the EM algorithm.  If the input variants have PL data
+/// it is used directly; otherwise synthetic PLs are generated from the GT
+/// calls (99% confidence on the called genotype).
 pub fn merge_variant_group(
     group: &OverlappingVariantGroup,
     iter_info: &[VariantIteratorInfo],
+    prior: &PriorConfig,
 ) -> VcfResult<Vec<Variant>> {
-    let variant = create_variant_for_region(group, iter_info)?;
+    let mut variant = create_variant_for_region(group, iter_info)?;
 
     // A variant is non-variable if it has no alt alleles and no input variants
     // had alt alleles (i.e. missing genotypes from broken phase don't count,
@@ -259,7 +266,107 @@ pub fn merge_variant_group(
     if variant.alleles.len() <= 1 && !any_input_has_alt {
         return Err(VcfParseError::NotVariable);
     }
+
+    compute_posteriors_for_variant(&mut variant, prior);
+
     Ok(vec![variant])
+}
+
+/// Computes genotype posteriors for a merged variant and updates its QUAL and
+/// GT fields.
+fn compute_posteriors_for_variant(variant: &mut Variant, prior: &PriorConfig) {
+    let num_alleles = variant.alleles.len();
+    let num_samples = variant.n_samples;
+    if num_alleles == 0 || num_samples == 0 {
+        return;
+    }
+
+    // Determine ploidy from the genotypes vector
+    let ploidy = variant.genotypes.len() / num_samples;
+    if ploidy == 0 {
+        return;
+    }
+
+    // Use existing PLs if available, otherwise generate synthetic PLs from GT
+    let sample_pls = if !variant.pls.is_empty() {
+        variant.pls.clone()
+    } else {
+        genotype_posteriors::synthetic_pls_from_gt(
+            &variant.genotypes,
+            num_samples,
+            num_alleles,
+            ploidy,
+            0.99,
+        )
+    };
+
+    let posteriors = genotype_posteriors::estimate_posteriors(
+        num_alleles,
+        ploidy,
+        num_samples,
+        &sample_pls,
+        prior,
+    );
+
+    // Update QUAL score
+    variant.qual = posteriors.qual as f32;
+
+    // Update genotypes: assign each sample the genotype with the highest
+    // posterior probability
+    let genotypes_list = genotype_posteriors::enumerate_genotypes(num_alleles, ploidy);
+    let num_genotypes = genotypes_list.len();
+
+    for sample in 0..num_samples {
+        let gt_offset = sample * ploidy;
+
+        // Skip samples with any missing allele — the EM cannot reliably
+        // reassign partial genotypes, so we preserve the original call.
+        let has_missing = (0..ploidy).any(|i| variant.genotypes[gt_offset + i] < 0);
+        if has_missing {
+            continue;
+        }
+
+        let post_offset = sample * num_genotypes;
+
+        // Find the genotype with the highest posterior
+        let mut best_gt_index = 0;
+        let mut best_posterior = posteriors.genotype_posteriors[post_offset];
+        for g in 1..num_genotypes {
+            let p = posteriors.genotype_posteriors[post_offset + g];
+            if p > best_posterior {
+                best_posterior = p;
+                best_gt_index = g;
+            }
+        }
+
+        // Check if the EM changed the genotype.  If the allele counts match
+        // the original GT, keep the original ordering (preserves phase like
+        // 1|0 vs 0|1).  Only overwrite when the EM picked a different genotype.
+        let best_genotype = &genotypes_list[best_gt_index];
+        let mut original_counts = vec![0usize; num_alleles];
+        for i in 0..ploidy {
+            let a = variant.genotypes[gt_offset + i];
+            if a >= 0 {
+                original_counts[a as usize] += 1;
+            }
+        }
+
+        if original_counts != best_genotype.allele_counts {
+            // The EM changed the call — write the new genotype in sorted order
+            let mut pos = 0;
+            for (allele, &count) in best_genotype.allele_counts.iter().enumerate() {
+                for _ in 0..count {
+                    variant.genotypes[gt_offset + pos] = allele as i8;
+                    pos += 1;
+                }
+            }
+        }
+        // Otherwise: keep the original GT (preserving allele order / phase)
+    }
+
+    // Store the PLs used (for downstream tools that might need them)
+    variant.pls = sample_pls;
+    variant.pls_per_sample = num_genotypes;
 }
 
 /// Collect up to `batch_size` groups from the source iterator.
@@ -281,11 +388,12 @@ where
 fn process_batch(
     batch: Vec<VcfResult<OverlappingVariantGroup>>,
     iter_info: &[VariantIteratorInfo],
+    prior: &PriorConfig,
 ) -> Vec<VcfResult<Variant>> {
     batch
         .into_par_iter()
         .flat_map(|group_result| match group_result {
-            Ok(group) => match merge_variant_group(&group, iter_info) {
+            Ok(group) => match merge_variant_group(&group, iter_info, prior) {
                 Ok(variants) => variants.into_iter().map(Ok).collect(),
                 Err(VcfParseError::NotVariable) => vec![],
                 Err(e) => vec![Err(e)],
@@ -308,6 +416,7 @@ fn process_batch(
 pub fn merge_vars_in_groups<I, F>(
     groups: I,
     iter_info: &[VariantIteratorInfo],
+    prior: &PriorConfig,
     mut on_variant: F,
 ) -> VcfResult<()>
 where
@@ -342,7 +451,7 @@ where
             if batch.is_empty() {
                 break;
             }
-            let results = process_batch(batch, iter_info);
+            let results = process_batch(batch, iter_info, prior);
             for result in results {
                 on_variant(result)?;
             }
