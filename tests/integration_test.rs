@@ -3,15 +3,81 @@ use std::io::BufReader;
 use join_per_sample_vcfs::gvcf_parser::VariantIterator;
 use join_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
+/// Convert a human-readable VCF string (spaces between fields) into proper
+/// tab-delimited VCF.  For each line: trim leading/trailing whitespace, then
+/// replace every run of 2+ spaces with a single tab.  Empty lines are dropped.
+fn spaces_to_tabs(vcf: &str) -> String {
+    vcf.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            let mut result = String::new();
+            let mut space_count = 0usize;
+            for ch in trimmed.chars() {
+                if ch == ' ' {
+                    space_count += 1;
+                } else {
+                    if space_count >= 2 {
+                        result.push('\t');
+                    } else if space_count == 1 {
+                        result.push(' ');
+                    }
+                    space_count = 0;
+                    result.push(ch);
+                }
+            }
+            result
+        })
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
     VariantIterator::from_reader(reader).expect("Failed to create parser")
 }
 
+/// Run the full pipeline and assert the output matches the expected VCF exactly.
+///
+/// Both the expected VCF and the actual output are normalized (trimmed, tabs)
+/// before comparison, so constants can use spaces for readability.
+fn assert_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>, expected_vcf: &str) {
+    let output = run_pipeline(gvcf_inputs, chromosomes);
+    let got: Vec<&str> = output.lines().map(|l| l.trim()).collect();
+
+    let normalized_expected = spaces_to_tabs(expected_vcf);
+    let want: Vec<&str> = normalized_expected.lines().collect();
+
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "Line count mismatch: got {} lines, expected {}\n--- got ---\n{}\n--- expected ---\n{}",
+        got.len(),
+        want.len(),
+        got.join("\n"),
+        want.join("\n"),
+    );
+
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(
+            g,
+            w,
+            "Line {} differs:\n  got:      {}\n  expected: {}",
+            i + 1,
+            g,
+            w
+        );
+    }
+}
+
 /// Run the full pipeline: parse gVCFs -> group -> merge -> write VCF.
 /// Returns the output VCF as a string.
 fn run_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>) -> String {
-    let iters: Vec<_> = gvcf_inputs.iter().map(|input| make_iter(input)).collect();
+    let inputs: Vec<String> = gvcf_inputs.iter().map(|s| spaces_to_tabs(s)).collect();
+    let iters: Vec<_> = inputs.iter().map(|s| make_iter(s)).collect();
 
     let shared_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let shared_clone = shared_buf.clone();
@@ -34,274 +100,215 @@ fn run_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>) -> String {
     String::from_utf8(buf.clone()).unwrap()
 }
 
+// ============================================================================
+// Test data
+// ============================================================================
+
 // GATK-style gVCF for Sample1 covering chr1:1-5
-// - Position 1: ref (hom-ref with <NON_REF>)
-// - Position 2: ref (hom-ref with <NON_REF>)
-// - Position 3: het SNP A->T (with <NON_REF>)
-// - Position 4: ref (hom-ref with <NON_REF>)
-// - Position 5: ref (hom-ref with <NON_REF>)
-const GVCF_SAMPLE1: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\n\
-    chr1\t1\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t2\t.\tC\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t3\t.\tG\tT,<NON_REF>\t30\tPASS\t.\tGT\t0|1\n\
-    chr1\t4\t.\tT\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t5\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+// - Position 1: hom-ref
+// - Position 2: hom-ref
+// - Position 3: het SNP G->T
+// - Position 4: hom-ref
+// - Position 5: hom-ref
+const GVCF_SAMPLE1: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+    chr1    1    .   A    <NON_REF>     .     .       .     GT      0|0
+    chr1    2    .   C    <NON_REF>     .     .       .     GT      0|0
+    chr1    3    .   G    T,<NON_REF>   30    PASS    .     GT      0|1
+    chr1    4    .   T    <NON_REF>     .     .       .     GT      0|0
+    chr1    5    .   A    <NON_REF>     .     .       .     GT      0|0
+";
 
 // GATK-style gVCF for Sample2 covering chr1:1-5
-// - Position 1: ref (hom-ref with <NON_REF>)
-// - Position 2: het SNP C->A (with <NON_REF>)
-// - Position 3: hom-alt SNP G->C (with <NON_REF>)
-// - Position 4: ref (hom-ref with <NON_REF>)
-// - Position 5: het SNP A->G (with <NON_REF>)
-const GVCF_SAMPLE2: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample2\n\
-    chr1\t1\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t2\t.\tC\tA,<NON_REF>\t25\tPASS\t.\tGT\t0/1\n\
-    chr1\t3\t.\tG\tC,<NON_REF>\t40\tPASS\t.\tGT\t1|1\n\
-    chr1\t4\t.\tT\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t5\t.\tA\tG,<NON_REF>\t35\tPASS\t.\tGT\t0/1";
+// - Position 1: hom-ref
+// - Position 2: het SNP C->A
+// - Position 3: hom-alt SNP G->C (different allele than Sample1)
+// - Position 4: hom-ref
+// - Position 5: het SNP A->G
+const GVCF_SAMPLE2: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+    chr1    1    .   A    <NON_REF>     .     .       .     GT      0|0
+    chr1    2    .   C    A,<NON_REF>   25    PASS    .     GT      0/1
+    chr1    3    .   G    C,<NON_REF>   40    PASS    .     GT      1|1
+    chr1    4    .   T    <NON_REF>     .     .       .     GT      0|0
+    chr1    5    .   A    G,<NON_REF>   35    PASS    .     GT      0/1
+";
+
+const EXPECTED_SAMPLE1_SAMPLE2: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample1  Sample2
+    chr1    2    .   C    A    .     .       .     GT      0|0      0/1
+    chr1    3    .   G    T,C  .     .       .     GT      0|1      2|2
+    chr1    5    .   A    G    .     .       .     GT      0|0      0/1
+";
 
 #[test]
 fn test_full_pipeline_two_samples() {
-    let output = run_pipeline(
+    assert_pipeline(
         &[GVCF_SAMPLE1, GVCF_SAMPLE2],
         vec!["chr1".to_string()],
+        EXPECTED_SAMPLE1_SAMPLE2,
     );
-
-    let lines: Vec<&str> = output.lines().collect();
-
-    // Header
-    assert_eq!(lines[0], "##fileformat=VCFv4.2");
-    assert_eq!(
-        lines[1],
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1\tSample2"
-    );
-
-    // Only variable positions should be emitted (positions 2, 3, 5).
-    // Position 1 and 4 are hom-ref in both samples => filtered as non-variable.
-
-    // Position 2: Sample1=0|0 (ref), Sample2=0/1 (het C->A)
-    assert_eq!(
-        lines[2],
-        "chr1\t2\t.\tC\tA\t.\t.\t.\tGT\t0|0\t0/1"
-    );
-
-    // Position 3: Sample1=0|1 (het G->T), Sample2=1|1 (hom-alt G->C)
-    // Both have different ALT alleles, so merged alleles: G (ref), T, C
-    assert_eq!(
-        lines[3],
-        "chr1\t3\t.\tG\tT,C\t.\t.\t.\tGT\t0|1\t2|2"
-    );
-
-    // Position 5: Sample1=0|0 (ref), Sample2=0/1 (het A->G)
-    assert_eq!(
-        lines[4],
-        "chr1\t5\t.\tA\tG\t.\t.\t.\tGT\t0|0\t0/1"
-    );
-
-    // Exactly 5 lines total: 2 header + 3 data
-    assert_eq!(lines.len(), 5);
 }
 
-// GATK-style gVCF for Sample3 covering chr1:1-5
-// All positions are hom-ref
-const GVCF_ALL_REF: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample3\n\
-    chr1\t1\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t2\t.\tC\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t3\t.\tG\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t4\t.\tT\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t5\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+// All positions hom-ref
+const GVCF_ALL_REF: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT        QUAL  FILTER  INFO  FORMAT  Sample3
+    chr1    1    .   A    <NON_REF>  .     .       .     GT      0|0
+    chr1    2    .   C    <NON_REF>  .     .       .     GT      0|0
+    chr1    3    .   G    <NON_REF>  .     .       .     GT      0|0
+    chr1    4    .   T    <NON_REF>  .     .       .     GT      0|0
+    chr1    5    .   A    <NON_REF>  .     .       .     GT      0|0
+";
+
+const EXPECTED_ALL_REF: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample3
+";
 
 #[test]
 fn test_all_ref_samples_produce_no_variants() {
-    let output = run_pipeline(
-        &[GVCF_ALL_REF],
-        vec!["chr1".to_string()],
-    );
-
-    let lines: Vec<&str> = output.lines().collect();
-    // Only header lines, no data lines (everything is non-variable)
-    assert_eq!(lines.len(), 2);
-    assert_eq!(lines[0], "##fileformat=VCFv4.2");
+    assert_pipeline(&[GVCF_ALL_REF], vec!["chr1".to_string()], EXPECTED_ALL_REF);
 }
 
-// gVCF with a deletion spanning positions 2-4
-const GVCF_WITH_DELETION: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample4\n\
-    chr1\t1\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t2\t.\tCGT\tC,<NON_REF>\t30\tPASS\t.\tGT\t0|1\n\
-    chr1\t5\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+// Deletion spanning positions 2-4
+const GVCF_WITH_DELETION: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample4
+    chr1    1    .   A    <NON_REF>     .     .       .     GT      0|0
+    chr1    2    .   CGT  C,<NON_REF>   30    PASS    .     GT      0|1
+    chr1    5    .   A    <NON_REF>     .     .       .     GT      0|0
+";
 
-// gVCF covering the same region with SNPs at each position
-const GVCF_WITH_SNPS: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample5\n\
-    chr1\t1\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t2\t.\tC\tA,<NON_REF>\t20\tPASS\t.\tGT\t0|1\n\
-    chr1\t3\t.\tG\tT,<NON_REF>\t20\tPASS\t.\tGT\t1|0\n\
-    chr1\t4\t.\tT\tC,<NON_REF>\t20\tPASS\t.\tGT\t0|1\n\
-    chr1\t5\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+// SNPs at each position overlapping with the deletion
+const GVCF_WITH_SNPS: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample5
+    chr1    1    .   A    <NON_REF>     .     .       .     GT      0|0
+    chr1    2    .   C    A,<NON_REF>   20    PASS    .     GT      0|1
+    chr1    3    .   G    T,<NON_REF>   20    PASS    .     GT      1|0
+    chr1    4    .   T    C,<NON_REF>   20    PASS    .     GT      0|1
+    chr1    5    .   A    <NON_REF>     .     .       .     GT      0|0
+";
+
+// Deletion at pos 2 (CGT->C) overlaps with SNPs at pos 2, 3, 4 in Sample5
+// Merged ref = CGT (3 bases from deletion context)
+// Sample4: both haplotypes produce "C" (ref first-char = "C", alt = "C")
+// Sample5: hap1=C+T+T=CTT, hap2=A+G+C=AGC
+const EXPECTED_DELETION_SNPS: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT        QUAL  FILTER  INFO  FORMAT  Sample4  Sample5
+    chr1    2    .   CGT  C,CTT,AGC  .     .       .     GT      1|1      2|3
+";
 
 #[test]
 fn test_deletion_overlapping_with_snps() {
-    let output = run_pipeline(
+    assert_pipeline(
         &[GVCF_WITH_DELETION, GVCF_WITH_SNPS],
         vec!["chr1".to_string()],
+        EXPECTED_DELETION_SNPS,
     );
-
-    let lines: Vec<&str> = output.lines().collect();
-    assert_eq!(lines[0], "##fileformat=VCFv4.2");
-    assert_eq!(
-        lines[1],
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample4\tSample5"
-    );
-
-    // The deletion at pos 2 (CGT->C) overlaps with SNPs at pos 2, 3, 4 in Sample5
-    // This creates a merged group spanning positions 2-4.
-    // Ref allele is CGT (3 bases from the deletion context).
-    // Sample4 haplotypes: 0|1 for CGT->C, so alleles: CGT (ref) and C (del)
-    // Sample5 haplotypes at 2,3,4: (C,T,C) and (A,G,T) per haplotype
-    //   hap1: 0|1, 1|0, 0|1 => C+G+T = CGT (ref), A+T+C = ATC
-    //   wait — let me think through this more carefully.
-    // Actually, Sample5 at pos2: 0|1 means hap1=C(ref), hap2=A
-    //   at pos3: 1|0 means hap1=T, hap2=G(ref)
-    //   at pos4: 0|1 means hap1=T(ref), hap2=C
-    // So Sample5 hap1 = C+T+T = CTT, hap2 = A+G+C = AGC
-    // Merged alleles: CGT(ref=0), C(del=1), CTT(=2), AGC(=3)
-    // Sample4: 0|1 => CGT|C
-    // Sample5: 2|3 => CTT|AGC
-
-    // There should be data lines for the merged group
-    assert!(lines.len() > 2, "Expected variant output lines");
-
-    // Verify the merged variant at pos 2
-    let fields: Vec<&str> = lines[2].split('\t').collect();
-    assert_eq!(fields[0], "chr1"); // CHROM
-    assert_eq!(fields[1], "2"); // POS
-    assert_eq!(fields[3], "CGT"); // REF (3 bases from deletion context)
-    // ALT should include the deletion allele and the SNP-derived haplotype alleles
-    assert!(fields[4].contains("C"), "ALT should contain deletion allele 'C'");
 }
 
-// Two samples, one with a missing genotype
-const GVCF_WITH_MISSING: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample6\n\
-    chr1\t1\t.\tA\tT,<NON_REF>\t30\tPASS\t.\tGT\t0|.\n\
-    chr1\t2\t.\tC\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t3\t.\tG\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+// One sample with a missing genotype allele
+const GVCF_WITH_MISSING: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample6
+    chr1    1    .   A    T,<NON_REF>   30    PASS    .     GT      0|.
+    chr1    2    .   C    <NON_REF>     .     .       .     GT      0|0
+    chr1    3    .   G    <NON_REF>     .     .       .     GT      0|0
+";
 
-const GVCF_SIMPLE_VARIANT: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample7\n\
-    chr1\t1\t.\tA\tG,<NON_REF>\t40\tPASS\t.\tGT\t1|1\n\
-    chr1\t2\t.\tC\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t3\t.\tG\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+const GVCF_SIMPLE_VARIANT: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample7
+    chr1    1    .   A    G,<NON_REF>   40    PASS    .     GT      1|1
+    chr1    2    .   C    <NON_REF>     .     .       .     GT      0|0
+    chr1    3    .   G    <NON_REF>     .     .       .     GT      0|0
+";
+
+// Sample6 has 0|. (missing haplotype), so T is not contributed as an alt allele.
+// Only Sample7's G survives as alt. Sample7: 1|1 -> G|G.
+const EXPECTED_MISSING: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample6  Sample7
+    chr1    1    .   A    G    .     .       .     GT      0|.      1|1
+";
 
 #[test]
 fn test_missing_genotype_propagation() {
-    let output = run_pipeline(
+    assert_pipeline(
         &[GVCF_WITH_MISSING, GVCF_SIMPLE_VARIANT],
         vec!["chr1".to_string()],
-    );
-
-    let lines: Vec<&str> = output.lines().collect();
-
-    // Position 1 has variants in both samples
-    let fields: Vec<&str> = lines[2].split('\t').collect();
-    assert_eq!(fields[0], "chr1");
-    assert_eq!(fields[1], "1");
-    assert_eq!(fields[3], "A"); // REF
-
-    // Sample6 has a missing allele (0|.), Sample7 is 1|1
-    // The missing allele should be preserved as '.'
-    let sample6_gt = fields[9];
-    assert!(
-        sample6_gt.contains('.'),
-        "Sample6 genotype should contain missing allele '.', got: {}",
-        sample6_gt
-    );
-    let sample7_gt = fields[10];
-    assert!(
-        !sample7_gt.contains('.'),
-        "Sample7 genotype should not have missing alleles, got: {}",
-        sample7_gt
+        EXPECTED_MISSING,
     );
 }
 
-// Three samples across two chromosomes
-const GVCF_MULTI_CHROM_S1: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample8\n\
-    chr1\t1\t.\tA\tT,<NON_REF>\t30\tPASS\t.\tGT\t0|1\n\
-    chr1\t2\t.\tC\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr2\t1\t.\tG\tA,<NON_REF>\t25\tPASS\t.\tGT\t1|0\n\
-    chr2\t2\t.\tT\t<NON_REF>\t.\t.\t.\tGT\t0|0";
+// Two samples across two chromosomes
+const GVCF_MULTI_CHROM_S1: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample8
+    chr1    1    .   A    T,<NON_REF>   30    PASS    .     GT      0|1
+    chr1    2    .   C    <NON_REF>     .     .       .     GT      0|0
+    chr2    1    .   G    A,<NON_REF>   25    PASS    .     GT      1|0
+    chr2    2    .   T    <NON_REF>     .     .       .     GT      0|0
+";
 
-const GVCF_MULTI_CHROM_S2: &str = "##fileformat=VCFv4.2\n\
-    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample9\n\
-    chr1\t1\t.\tA\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr1\t2\t.\tC\tG,<NON_REF>\t20\tPASS\t.\tGT\t1|0\n\
-    chr2\t1\t.\tG\t<NON_REF>\t.\t.\t.\tGT\t0|0\n\
-    chr2\t2\t.\tT\tC,<NON_REF>\t35\tPASS\t.\tGT\t0|1";
+const GVCF_MULTI_CHROM_S2: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample9
+    chr1    1    .   A    <NON_REF>     .     .       .     GT      0|0
+    chr1    2    .   C    G,<NON_REF>   20    PASS    .     GT      1|0
+    chr2    1    .   G    <NON_REF>     .     .       .     GT      0|0
+    chr2    2    .   T    C,<NON_REF>   35    PASS    .     GT      0|1
+";
+
+const EXPECTED_MULTI_CHROM: &str = "
+    ##fileformat=VCFv4.2
+    #CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample8  Sample9
+    chr1    1    .   A    T    .     .       .     GT      0|1      0|0
+    chr1    2    .   C    G    .     .       .     GT      0|0      1|0
+    chr2    1    .   G    A    .     .       .     GT      1|0      0|0
+    chr2    2    .   T    C    .     .       .     GT      0|0      0|1
+";
 
 #[test]
 fn test_multi_chromosome_pipeline() {
-    let output = run_pipeline(
+    assert_pipeline(
         &[GVCF_MULTI_CHROM_S1, GVCF_MULTI_CHROM_S2],
         vec!["chr1".to_string(), "chr2".to_string()],
+        EXPECTED_MULTI_CHROM,
     );
+}
 
-    let lines: Vec<&str> = output.lines().collect();
-    assert_eq!(
-        lines[1],
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample8\tSample9"
+// Sample1: het SNP at pos 1, hom-ref at pos 2
+const GVCF_SIMPLE_SNPS_S1: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample1
+chr1    1    .   A    T,<NON_REF>   .     .       .     GT      0|1
+chr1    2    .   A    <NON_REF>     .     .       .     GT      0|0
+";
+
+// Sample2: hom-alt SNP at pos 1 (different allele), hom-ref at pos 2
+const GVCF_SIMPLE_SNPS_S2: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT           QUAL  FILTER  INFO  FORMAT  Sample2
+chr1    1    .   A    C,<NON_REF>   .     .       .     GT      1/1
+chr1    2    .   A    <NON_REF>     25    .       .     GT      0/0
+";
+
+// Expected: pos 1 merges T and C as alt alleles; pos 2 filtered (both hom-ref)
+const EXPECTED_SIMPLE_SNPS: &str = "##fileformat=VCFv4.2
+#CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  Sample1  Sample2
+chr1    1    .   A    T,C  .     .       .     GT      0|1      2/2
+";
+
+#[test]
+fn test_template_two_samples_snps() {
+    assert_pipeline(
+        &[GVCF_SIMPLE_SNPS_S1, GVCF_SIMPLE_SNPS_S2],
+        vec!["chr1".to_string()],
+        EXPECTED_SIMPLE_SNPS,
     );
-
-    // Data lines: chr1:1, chr1:2, chr2:1, chr2:2 (all have at least one non-ref sample)
-    // Collect (chrom, pos) from data lines
-    let data_positions: Vec<(&str, &str)> = lines[2..]
-        .iter()
-        .map(|line| {
-            let f: Vec<&str> = line.split('\t').collect();
-            (f[0], f[1])
-        })
-        .collect();
-
-    // Chromosomes should appear in order: chr1 first, then chr2
-    for (chrom, _) in &data_positions {
-        assert!(
-            *chrom == "chr1" || *chrom == "chr2",
-            "Unexpected chromosome: {}",
-            chrom
-        );
-    }
-    let chr1_count = data_positions.iter().filter(|(c, _)| *c == "chr1").count();
-    let chr2_count = data_positions.iter().filter(|(c, _)| *c == "chr2").count();
-    assert!(chr1_count > 0, "Should have chr1 variants");
-    assert!(chr2_count > 0, "Should have chr2 variants");
-
-    // chr1 variants should come before chr2 variants
-    let first_chr2_idx = data_positions
-        .iter()
-        .position(|(c, _)| *c == "chr2")
-        .unwrap();
-    let last_chr1_idx = data_positions
-        .iter()
-        .rposition(|(c, _)| *c == "chr1")
-        .unwrap();
-    assert!(last_chr1_idx < first_chr2_idx, "chr1 variants should precede chr2");
-
-    // Check specific genotypes
-    // chr1:1 — Sample8=0|1 (het A->T), Sample9=0|0 (ref)
-    assert_eq!(lines[2], "chr1\t1\t.\tA\tT\t.\t.\t.\tGT\t0|1\t0|0");
-
-    // chr1:2 — Sample8=0|0 (ref), Sample9=1|0 (het C->G)
-    assert_eq!(lines[3], "chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t0|0\t1|0");
-
-    // chr2:1 — Sample8=1|0 (het G->A), Sample9=0|0 (ref)
-    assert_eq!(lines[4], "chr2\t1\t.\tG\tA\t.\t.\t.\tGT\t1|0\t0|0");
-
-    // chr2:2 — Sample8=0|0 (ref), Sample9=0|1 (het T->C)
-    assert_eq!(lines[5], "chr2\t2\t.\tT\tC\t.\t.\t.\tGT\t0|0\t0|1");
-
-    assert_eq!(lines.len(), 6); // 2 header + 4 data
 }
