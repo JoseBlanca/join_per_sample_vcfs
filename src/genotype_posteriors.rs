@@ -26,16 +26,31 @@ impl Default for PriorConfig {
     }
 }
 
-/// One possible diploid genotype at a site.
-/// For example, with alleles [A, T, C]:
-///   - genotype 0/0 (AA) has allele_indices = [0, 0]
-///   - genotype 0/1 (AT) has allele_indices = [0, 1]
-///   - genotype 1/2 (TC) has allele_indices = [1, 2]
-pub struct DiploidGenotype {
-    /// The two allele indices (e.g., [0, 1] for a het 0/1).
-    pub allele_indices: [usize; 2],
+/// One possible genotype at a site, for any ploidy.
+///
+/// For diploid with alleles [A, T, C]:
+///   - genotype 0/0 (AA) has allele_counts = [2, 0, 0]
+///   - genotype 0/1 (AT) has allele_counts = [1, 1, 0]
+///   - genotype 1/2 (TC) has allele_counts = [0, 1, 1]
+///
+/// For tetraploid with alleles [A, T]:
+///   - genotype 0/0/0/0 has allele_counts = [4, 0]
+///   - genotype 0/0/0/1 has allele_counts = [3, 1]
+///   - genotype 0/0/1/1 has allele_counts = [2, 2]
+///   - genotype 0/1/1/1 has allele_counts = [1, 3]
+///   - genotype 1/1/1/1 has allele_counts = [0, 4]
+pub struct Genotype {
+    /// How many copies of each allele this genotype has.
+    /// Length equals the number of alleles at the site.
+    /// The values sum to the ploidy.
+    pub allele_counts: Vec<usize>,
     /// Position of this genotype in the PL array (VCF ordering).
     pub pl_index: usize,
+    /// Precomputed log10 of the multinomial coefficient for this genotype.
+    /// This accounts for how many distinguishable arrangements exist.
+    /// For diploid: het=log10(2), hom=log10(1)=0.
+    /// For tetraploid AAAT: log10(4!/(3!*1!)) = log10(4).
+    pub log10_multinomial_coefficient: f64,
 }
 
 /// Result of the EM algorithm for one site across all samples.
@@ -63,11 +78,12 @@ pub struct SitePosteriors {
 /// The estimated allele frequencies, per-sample genotype posteriors, and QUAL.
 pub fn estimate_posteriors(
     num_alleles: usize,
+    ploidy: usize,
     num_samples: usize,
     sample_pls: &[f64],
     prior: &PriorConfig,
 ) -> SitePosteriors {
-    let genotypes = enumerate_diploid_genotypes(num_alleles);
+    let genotypes = enumerate_genotypes(num_alleles, ploidy);
     let num_genotypes = genotypes.len();
 
     let prior_pseudocounts = compute_prior_pseudocounts(num_alleles, prior);
@@ -130,27 +146,94 @@ pub fn estimate_posteriors(
 
 // === Helper functions (filled in below) ===
 
-/// Lists all possible diploid genotypes for the given number of alleles.
+/// Lists all possible genotypes for the given number of alleles and ploidy.
 ///
-/// For 2 alleles (ref=0, alt=1) this returns: 0/0, 0/1, 1/1
-/// For 3 alleles (ref=0, alt1=1, alt2=2): 0/0, 0/1, 1/1, 0/2, 1/2, 2/2
+/// Diploid, 2 alleles: 0/0, 0/1, 1/1  (3 genotypes)
+/// Diploid, 3 alleles: 0/0, 0/1, 1/1, 0/2, 1/2, 2/2  (6 genotypes)
+/// Tetraploid, 2 alleles: 0/0/0/0, 0/0/0/1, 0/0/1/1, 0/1/1/1, 1/1/1/1  (5 genotypes)
 ///
-/// The ordering matches the VCF PL field convention.
-fn enumerate_diploid_genotypes(num_alleles: usize) -> Vec<DiploidGenotype> {
-    let mut genotypes = Vec::new();
-    let mut pl_index = 0;
+/// The ordering matches the VCF PL field convention (sorted combinations with
+/// replacement).
+/// Enumerates genotypes in VCF PL order.
+///
+/// The VCF spec orders genotypes so that the highest allele index changes
+/// slowest.  For diploid with 3 alleles:
+///   0/0, 0/1, 1/1, 0/2, 1/2, 2/2
+///
+/// We generate non-decreasing allele sequences and sort them by the reversed
+/// sequence (highest position first) to match this convention.
+fn enumerate_genotypes(num_alleles: usize, ploidy: usize) -> Vec<Genotype> {
+    let mut allele_sequences: Vec<Vec<usize>> = Vec::new();
+    let mut current = vec![0usize; ploidy];
 
-    for second_allele in 0..num_alleles {
-        for first_allele in 0..=second_allele {
-            genotypes.push(DiploidGenotype {
-                allele_indices: [first_allele, second_allele],
-                pl_index,
-            });
-            pl_index += 1;
+    collect_sorted_combinations(&mut current, 0, 0, num_alleles, ploidy, &mut allele_sequences);
+
+    // Sort by VCF convention: compare reversed sequences lexicographically.
+    // This makes the highest allele index the slowest-changing.
+    allele_sequences.sort_by(|a, b| {
+        for i in (0..ploidy).rev() {
+            match a[i].cmp(&b[i]) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
         }
-    }
+        std::cmp::Ordering::Equal
+    });
 
-    genotypes
+    allele_sequences
+        .into_iter()
+        .enumerate()
+        .map(|(pl_index, seq)| {
+            let mut allele_counts = vec![0usize; num_alleles];
+            for &a in &seq {
+                allele_counts[a] += 1;
+            }
+            let log10_coeff = log10_multinomial_coefficient(ploidy, &allele_counts);
+            Genotype {
+                allele_counts,
+                pl_index,
+                log10_multinomial_coefficient: log10_coeff,
+            }
+        })
+        .collect()
+}
+
+/// Collects all non-decreasing sequences of length `ploidy` from alleles 0..num_alleles.
+fn collect_sorted_combinations(
+    current: &mut [usize],
+    pos: usize,
+    min_allele: usize,
+    num_alleles: usize,
+    ploidy: usize,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if pos == ploidy {
+        out.push(current.to_vec());
+        return;
+    }
+    for allele in min_allele..num_alleles {
+        current[pos] = allele;
+        collect_sorted_combinations(current, pos + 1, allele, num_alleles, ploidy, out);
+    }
+}
+
+/// Computes log10(ploidy! / (count_1! * count_2! * ...)).
+///
+/// This is the number of distinguishable arrangements of alleles in a genotype.
+/// For diploid: hom (e.g., AA) = 1, het (e.g., AT) = 2.
+/// For tetraploid AABT: 4!/(2!*1!*1!) = 12.
+fn log10_multinomial_coefficient(ploidy: usize, allele_counts: &[usize]) -> f64 {
+    let mut log10_result = log10_factorial(ploidy);
+    for &count in allele_counts {
+        log10_result -= log10_factorial(count);
+    }
+    log10_result
+}
+
+/// Computes log10(n!) using the simple sum log10(1) + log10(2) + ... + log10(n).
+/// For the small values of ploidy we deal with, this is fast enough.
+fn log10_factorial(n: usize) -> f64 {
+    (1..=n).map(|i| (i as f64).log10()).sum()
 }
 
 /// Computes the Dirichlet prior pseudocounts for each allele.
@@ -179,12 +262,12 @@ fn compute_prior_pseudocounts(num_alleles: usize, prior: &PriorConfig) -> Vec<f6
 /// For each genotype, the posterior combines three things:
 /// 1. The sequencing evidence (from the PL field)
 /// 2. The Hardy-Weinberg expectation given current allele frequencies
-/// 3. A combinatorial factor for heterozygotes (het has 2 arrangements, hom has 1)
+/// 3. A combinatorial factor (how many distinguishable allele arrangements)
 ///
 /// The results are normalized so that each sample's posteriors sum to 1.
 fn compute_genotype_posteriors(
     allele_frequencies: &[f64],
-    genotypes: &[DiploidGenotype],
+    genotypes: &[Genotype],
     sample_pls: &[f64],
     num_samples: usize,
     out_posteriors: &mut [f64],
@@ -226,25 +309,28 @@ fn compute_genotype_posteriors(
     }
 }
 
-/// Computes the Hardy-Weinberg log10 prior probability for a diploid genotype
-/// given allele frequencies.
+/// Computes the Hardy-Weinberg log10 prior probability for a genotype of any
+/// ploidy, given allele frequencies.
 ///
-/// For a homozygous genotype (e.g., A/A): P = freq(A)^2
-/// For a heterozygous genotype (e.g., A/T): P = 2 * freq(A) * freq(T)
-///   (the factor of 2 accounts for the two possible arrangements: A|T and T|A)
+/// The general formula is:
+///   P(genotype | frequencies) = multinomial_coeff * product(freq[a] ^ count[a])
+///
+/// For diploid AA: 1 * freq(A)^2
+/// For diploid AT: 2 * freq(A) * freq(T)
+/// For tetraploid AAAT: 4 * freq(A)^3 * freq(T)
 fn hardy_weinberg_log10_prior(
-    genotype: &DiploidGenotype,
+    genotype: &Genotype,
     allele_frequencies: &[f64],
 ) -> f64 {
-    let allele_a = genotype.allele_indices[0];
-    let allele_b = genotype.allele_indices[1];
-    let freq_a = allele_frequencies[allele_a];
-    let freq_b = allele_frequencies[allele_b];
+    let mut log10_prior = genotype.log10_multinomial_coefficient;
 
-    let is_het = allele_a != allele_b;
-    let combinatorial_factor = if is_het { 2.0 } else { 1.0 };
+    for (allele, &count) in genotype.allele_counts.iter().enumerate() {
+        if count > 0 {
+            log10_prior += count as f64 * allele_frequencies[allele].log10();
+        }
+    }
 
-    f64::log10(combinatorial_factor * freq_a * freq_b)
+    log10_prior
 }
 
 /// M-step: update allele frequencies from genotype posteriors.
@@ -254,7 +340,7 @@ fn hardy_weinberg_log10_prior(
 /// and normalizes to get new frequency estimates.
 fn update_allele_frequencies(
     genotype_posteriors: &[f64],
-    genotypes: &[DiploidGenotype],
+    genotypes: &[Genotype],
     num_samples: usize,
     _num_alleles: usize,
     prior_pseudocounts: &[f64],
@@ -264,21 +350,21 @@ fn update_allele_frequencies(
     // Start with prior pseudocounts (our baseline expectation)
     let mut allele_counts: Vec<f64> = prior_pseudocounts.to_vec();
 
-    // Add the expected allele counts from each sample
+    // Add the expected allele counts from each sample.
+    // Each genotype contributes `ploidy` allele copies, distributed
+    // according to its allele_counts (e.g., tetraploid AAAT contributes
+    // 3 copies of A and 1 copy of T).
     for sample in 0..num_samples {
         let post_offset = sample * num_genotypes;
 
         for (g, genotype) in genotypes.iter().enumerate() {
             let posterior = genotype_posteriors[post_offset + g];
 
-            // Each diploid genotype contributes 2 allele copies.
-            // For hom 0/0: both copies go to allele 0.
-            // For het 0/1: one copy to allele 0, one to allele 1.
-            let allele_a = genotype.allele_indices[0];
-            let allele_b = genotype.allele_indices[1];
-
-            allele_counts[allele_a] += posterior;
-            allele_counts[allele_b] += posterior;
+            for (allele, &count) in genotype.allele_counts.iter().enumerate() {
+                if count > 0 {
+                    allele_counts[allele] += posterior * count as f64;
+                }
+            }
         }
     }
 
@@ -319,22 +405,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_enumerate_genotypes_biallelic() {
-        // 2 alleles -> 3 genotypes: 0/0, 0/1, 1/1
-        let gts = enumerate_diploid_genotypes(2);
+    fn test_enumerate_genotypes_diploid_biallelic() {
+        // Diploid, 2 alleles -> 3 genotypes: 0/0, 0/1, 1/1
+        let gts = enumerate_genotypes(2, 2);
         assert_eq!(gts.len(), 3);
-        assert_eq!(gts[0].allele_indices, [0, 0]); // 0/0
-        assert_eq!(gts[1].allele_indices, [0, 1]); // 0/1
-        assert_eq!(gts[2].allele_indices, [1, 1]); // 1/1
+        assert_eq!(gts[0].allele_counts, [2, 0]); // 0/0
+        assert_eq!(gts[1].allele_counts, [1, 1]); // 0/1
+        assert_eq!(gts[2].allele_counts, [0, 2]); // 1/1
     }
 
     #[test]
-    fn test_enumerate_genotypes_triallelic() {
-        // 3 alleles -> 6 genotypes: 0/0, 0/1, 1/1, 0/2, 1/2, 2/2
-        let gts = enumerate_diploid_genotypes(3);
+    fn test_enumerate_genotypes_diploid_triallelic() {
+        // Diploid, 3 alleles -> 6 genotypes
+        let gts = enumerate_genotypes(3, 2);
         assert_eq!(gts.len(), 6);
-        assert_eq!(gts[3].allele_indices, [0, 2]); // 0/2
-        assert_eq!(gts[4].allele_indices, [1, 2]); // 1/2
+        assert_eq!(gts[3].allele_counts, [1, 0, 1]); // 0/2
+        assert_eq!(gts[4].allele_counts, [0, 1, 1]); // 1/2
+    }
+
+    #[test]
+    fn test_enumerate_genotypes_tetraploid_biallelic() {
+        // Tetraploid, 2 alleles -> 5 genotypes:
+        //   0/0/0/0, 0/0/0/1, 0/0/1/1, 0/1/1/1, 1/1/1/1
+        let gts = enumerate_genotypes(2, 4);
+        assert_eq!(gts.len(), 5);
+        assert_eq!(gts[0].allele_counts, [4, 0]); // 0/0/0/0
+        assert_eq!(gts[1].allele_counts, [3, 1]); // 0/0/0/1
+        assert_eq!(gts[2].allele_counts, [2, 2]); // 0/0/1/1
+        assert_eq!(gts[3].allele_counts, [1, 3]); // 0/1/1/1
+        assert_eq!(gts[4].allele_counts, [0, 4]); // 1/1/1/1
+    }
+
+    #[test]
+    fn test_multinomial_coefficients() {
+        // Diploid het: 2!/(1!*1!) = 2
+        let gts = enumerate_genotypes(2, 2);
+        assert!((gts[1].log10_multinomial_coefficient - 2.0_f64.log10()).abs() < 1e-9);
+        // Diploid hom: 2!/(2!*0!) = 1
+        assert!((gts[0].log10_multinomial_coefficient - 0.0).abs() < 1e-9);
+
+        // Tetraploid 0/0/0/1: 4!/(3!*1!) = 4
+        let gts4 = enumerate_genotypes(2, 4);
+        assert!((gts4[1].log10_multinomial_coefficient - 4.0_f64.log10()).abs() < 1e-9);
+        // Tetraploid 0/0/1/1: 4!/(2!*2!) = 6
+        assert!((gts4[2].log10_multinomial_coefficient - 6.0_f64.log10()).abs() < 1e-9);
     }
 
     #[test]
@@ -353,7 +467,7 @@ mod tests {
             99.0, 0.0, 99.0, // sample 1: clearly 0/1
             99.0, 0.0, 99.0, // sample 2: clearly 0/1
         ];
-        let result = estimate_posteriors(2, 2, &pls, &PriorConfig::default());
+        let result = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
 
         // Both samples are clearly het, so QUAL should be high
         assert!(result.qual > 30.0, "QUAL={} should be > 30", result.qual);
@@ -373,7 +487,7 @@ mod tests {
             0.0, 99.0, 99.0, // sample 1: clearly 0/0
             0.0, 99.0, 99.0, // sample 2: clearly 0/0
         ];
-        let result = estimate_posteriors(2, 2, &pls, &PriorConfig::default());
+        let result = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
 
         // Both samples are hom-ref, so QUAL should be very low (no variant)
         assert!(result.qual < 1.0, "QUAL={} should be < 1", result.qual);
@@ -386,7 +500,7 @@ mod tests {
             99.0, 0.0, 99.0, // sample 1: clearly 0/1
             0.0, 99.0, 99.0, // sample 2: clearly 0/0
         ];
-        let result = estimate_posteriors(2, 2, &pls, &PriorConfig::default());
+        let result = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
 
         // One het out of two -> site is variable
         assert!(result.qual > 10.0, "QUAL={} should be > 10", result.qual);
@@ -404,7 +518,7 @@ mod tests {
             10.0, 0.0, 30.0, // sample 1: probably het
             0.0, 15.0, 40.0, // sample 2: probably hom-ref
         ];
-        let result = estimate_posteriors(2, 2, &pls, &PriorConfig::default());
+        let result = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
 
         for sample in 0..2 {
             let offset = sample * result.num_genotypes;
@@ -415,6 +529,44 @@ mod tests {
             assert!(
                 (sum - 1.0).abs() < 1e-9,
                 "sample {} posteriors sum to {} instead of 1.0",
+                sample,
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_tetraploid_clear_variant() {
+        // Tetraploid, biallelic: 5 genotypes (0/0/0/0 .. 1/1/1/1)
+        // Sample 1: clearly 0/0/1/1 (PL index 2)
+        // Sample 2: clearly 0/0/0/0 (PL index 0)
+        let pls = vec![
+            99.0, 99.0, 0.0, 99.0, 99.0, // sample 1: 0/0/1/1
+            0.0, 99.0, 99.0, 99.0, 99.0,  // sample 2: 0/0/0/0
+        ];
+        let result = estimate_posteriors(2, 4, 2, &pls, &PriorConfig::default());
+
+        assert_eq!(result.num_genotypes, 5);
+        assert!(result.qual > 10.0, "QUAL={} should be > 10", result.qual);
+    }
+
+    #[test]
+    fn test_tetraploid_posteriors_sum_to_one() {
+        let pls = vec![
+            10.0, 5.0, 0.0, 20.0, 40.0, // sample 1
+            0.0, 10.0, 20.0, 30.0, 40.0, // sample 2
+        ];
+        let result = estimate_posteriors(2, 4, 2, &pls, &PriorConfig::default());
+
+        for sample in 0..2 {
+            let offset = sample * result.num_genotypes;
+            let sum: f64 = result.genotype_posteriors
+                [offset..offset + result.num_genotypes]
+                .iter()
+                .sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-9,
+                "tetraploid sample {} posteriors sum to {} instead of 1.0",
                 sample,
                 sum
             );
