@@ -1,3 +1,4 @@
 /target
 __pycache__/
 python_draft/__pycache__/
+.tally-config.toml
