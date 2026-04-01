@@ -11,11 +11,16 @@ The gVCF files would be something like:
 gVCF s1
 pos ref  alt           gt  pl
 1   AG   A,<NON_REF>   1/1 200,30,0,200,30,200
-2   G    <NON_REF>     0/0 0,30,200
+2   G    <NON_REF>     0/0 0,0,0
 
 gVCF s2
 1 A    <NON_REF>     0/0 0,30,200
 2 G    C,<NON_REF>   1/1 200,30,0,200,30,200
+
+# allele, vallele, gallele
+
+vallele: one of the possible alleles found in a Variant
+gallele: one of the alleles found in a genotype for a sample, so the allele found in one of the chromosomes
 
 # PL meaning
 
@@ -27,7 +32,7 @@ Keep in mind, if you are not familiar with the statistical lingo, that when we s
 
 The basic formula for calculating PL is:
 
-$$ PL = -10 * \log{P(Genotype | Data)} $$
+PL = -10 * \log{P(Genotype | Data)}
 
 where P(Genotype | Data) is the conditional probability of the Genotype given the sequence Data that we have observed. 
 
@@ -41,6 +46,7 @@ https://gatk.broadinstitute.org/hc/en-us/articles/360035890451-Calculation-of-PL
 I've seen an example of a real gVCF file an when there's a deletion all PLs are set to zero.
 SL4.0ch00       592829  .       CG      C,<NON_REF>     107.78  .       .     GT:AD:DP:GQ:PGT:PID:PL:PS:SB    1|1:0,3,0:3:9:0|1:592829_CG_C:121,9,0,121,9,121:592829:0,0,3,0
 SL4.0ch00       592830  .       G       <NON_REF>       .       .       .       GT:AD:DP:GQ:PL  0/0:0,3:3:0:0,0,0
+
 
 # Genotype quality (GQ)
 
@@ -81,6 +87,10 @@ gVCF s1
 pos ref  alt           gt  pl
 1   AG   A,<NON_REF>   1/1 pl1_s1_00,pl1_s1_01,pl1_s1_11,pl1_s1_0nr,pl1_s1_1nr,pl1_s1_nrnr
 2   G    <NON_REF>     0/0 pl2_s1_00,pl2_s1_0nr,pl2_s1_nrnr
+s1_11,pl1_s1_0nr = 0
+pl2_s1_00=0
+pl2_s1_0nr=0
+pl2_s1_nrnr=0
 
 var_s1_1.pls is a vector with the values:pl1_s1_00,pl1_s1_01,pl1_s1_11,pl1_s1_0nr,pl1_s1_1nr,pl1_s1_nrnr
 
@@ -88,20 +98,53 @@ gVCF s2
 pos ref  alt           gt  pl
 1   A    <NON_REF>     0/0 pl1_s2_00,pl1_s2_0nr,pl1_s2_nrnr
 2   G    C,<NON_REF>   1/1 pl2_s2_00,pl2_s2_01,pl2_s2_11,pl2_s2_0nr,pl2_s2_1nr,pl2_s2_nrnr
+pl1_s2_00=0
+pl2_s2_11=0
 
 When we are building the merged genotypes out of the original per gVCF genotypes we have to store the PLs that accompanied every original genotype for each sample.
 
-In this case the merged alleles for s1 is only one (in an heterozygote there would be two).
-merged_gt_s1 (A/A) = merged_gt_s1_haplo1 (A) / merged_gt_s1_haplo2 (A)
+## Building the galleles
 
+Recipe to create the galleles and genotypes
+merged_gallele_s1_c1 = gallele_s1_pos1_c1 + gallele_s1_pos2_c2
+merged_gallele_s1_c2 = gallele_s1_pos1_c1 + gallele_s1_pos2_c2
+Meaning of the nomenclature: ga_s1_pos1_c1: gallele, sample1, pos 1, chrom 1
+If there is a deletion the galleles covering the deletion will be "", meaning that those galleles per sample won't be used to create the merged galleles.
 
-pls_to_consider_for_s1_haplo1 = []
+We are assuming known phase or not more than one heterozygotic position, otherwise we won't solve those valleles, they will be missing (. or -1).
 
+The valleles will be the ordered set of the reference vallele and then the galleles for all samples.
+galleles = [merged_gallele_ref, merged_gallele_s1_c1, merged_gallele_s1_c2, merged_gallele_s2_c1, merged_gallele_s2_c2]
+The merged valleles should be obtained from the vector of galleles removing the repeated ones
+valleles = non_repeated(galleles)
+vallele_idx = position of vallele in valleles
+There's a mapping from gallele to vallele in which several galleles could correspond to the same vallele -> vallele_idx_for_gallele
 
-nosotros
-s1 1,2 AG,G -> AG  pl s1 pos 1 0/0
-s1 1,2 A,G  -> A   pl s1 pos 1 1/1
-s2 1,2 A,G  -> AG  pl s2 min(pos 1 0/0, pos2 0/0)
-s2 1,2 A,C  -> AC  pl s2 min(pos 1 0/0, pos2 1/1)
+The sample genotypes for sample x to this point are coded as: merged_gallele_sx_c1/merged_gallele_sx_c2
+To get the final merged numeric genotype we have to recode as: vallele_idx_for_gallele[merged_gallele_sx_c1]/vallele_idx_for_gallele[merged_gallele_sx_c12]
 
-qué hace el freebayes    
+A PL should be calculated for each possible combination of valleles in each sample.
+
+1 -> 1:0/0 1:0/1 1:1/1
+2 -> 2:0/0 2:0/1 2:1/1
+
+PLs for all possible merged genotypes:
+PL1:0/0 + PL2:0/0
+PL1:0/0 + PL2:0/1
+PL1:0/0 + PL2:1/1
+PL1:0/1 + PL2:0/0
+PL1:0/1 + PL2:0/1
+PL1:0/1 + PL2:1/1
+PL1:1/1 + PL2:0/0
+PL1:1/1 + PL2:0/1
+PL1:1/1 + PL2:1/1
+nomenclature: PL1:0/0 means PL for position 0 for genotype 0/0
+The genotype qual is calculated from the difference between the minimum merged PL and the second one.
+After that we remove all combinations with non-ref.
+Next we normalize the values.
+
+#
+
+In each position (i) there is only one genotype.
+how much we trust genotype in position i = 1 - prob of any of the all other genotypes
+This value is related to GQ
