@@ -159,3 +159,7 @@ source_var_iter_idxs: Vec<usize>  // which iterator each variant came from
 - `genotype_joining_specification.md`: joining algorithm spec with examples, nomenclature, and the EM-based re-genotyping steps
 - `information_about_the_problem_to_solve.md`: background on gVCF format, PL meaning, GQ, GATK joint VCF, * allele
 - `posterior_gt_probs.md`: detailed description of GATK's EM algorithm for genotype posteriors, including call flow, math, intuitive explanation
+
+## GATK repository
+
+As a reference you have the GATK repository cloned in the directory ~/devel/gatk/
