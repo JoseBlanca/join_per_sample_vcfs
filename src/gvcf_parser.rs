@@ -118,6 +118,9 @@ impl CommonGenotypePatterns {
 /// - Missing alleles are represented as `-1`
 /// - For diploid (p=2): `genotypes[i*2]` and `genotypes[i*2+1]` are the two alleles
 ///
+/// Other FORMAT fields (PL, DP, GQ, etc.) are accessible lazily via
+/// [`gt_field_index`](Variant::gt_field_index) and
+/// [`get_gt_field_by_index`](Variant::get_gt_field_by_index).
 #[derive(Debug)]
 pub struct Variant {
     /// Chromosome/contig name
@@ -130,49 +133,33 @@ pub struct Variant {
     pub ref_allele_len: u8,
     /// Variant quality score (QUAL field). `NaN` if missing.
     pub qual: f32,
-    /// Index of GT field in FORMAT (cached for internal use)
-    pub(crate) gt_index: usize,
-    /// Index of PL field in FORMAT if present (cached for internal use)
-    pub(crate) pl_index: Option<usize>,
     /// Genotypes for all samples, stored as a flat vector.
     /// For sample `i` with ploidy `p`: `genotypes[i*p..(i+1)*p]`
     /// Missing genotypes are represented as `-1`
     pub genotypes: Vec<i8>,
     /// Phase information for each sample: `true` = phased (`|`), `false` = unphased (`/`)
     pub phase: Vec<bool>,
-    /// Phred-scaled genotype likelihoods (PL field) for all samples, stored as
-    /// a flat vector.  For diploid with `n` alleles there are `n*(n+1)/2`
-    /// values per sample.  Empty when PL is not present in the FORMAT field.
-    pub pls: Vec<f64>,
-    /// Number of PL values per sample (0 when PLs are absent).
-    pub pls_per_sample: usize,
+    /// FORMAT field names from the VCF line (e.g., `["GT", "PL", "DP", "GQ"]`).
+    /// Empty for programmatically constructed variants.
+    pub gt_format_fields: Vec<String>,
+    /// Raw sample genotype field strings, one per sample.
+    /// Each string contains colon-separated values matching `gt_format_fields`.
+    /// Empty for programmatically constructed variants.
+    pub sample_gt_fields: Vec<String>,
     pub n_samples: usize,
 }
 
-/// Parses the FORMAT field and returns (gt_index, pl_index).
-/// Returns an error if GT is not found. PL is optional.
-fn parse_format_field(format: &str) -> VcfResult<(usize, Option<usize>)> {
-    let mut gt_index = None;
-    let mut pl_index = None;
-
-    for (idx, field) in format.split(':').enumerate() {
-        if field == "GT" {
-            gt_index = Some(idx);
-        } else if field == "PL" {
-            pl_index = Some(idx);
-        }
-
-        // Early exit if we found both
-        if gt_index.is_some() && pl_index.is_some() {
-            break;
-        }
-    }
-
-    let gt_idx = gt_index.ok_or(VcfParseError::MissingGtFieldInFormat {
-        line: format.to_string(),
-    })?;
-
-    Ok((gt_idx, pl_index))
+/// Parses the FORMAT field and returns (gt_index, field_names).
+/// Returns an error if GT is not found.
+fn parse_format_field(format: &str) -> VcfResult<(usize, Vec<String>)> {
+    let fields: Vec<String> = format.split(':').map(String::from).collect();
+    let gt_index = fields
+        .iter()
+        .position(|f| f == "GT")
+        .ok_or_else(|| VcfParseError::MissingGtFieldInFormat {
+            line: format.to_string(),
+        })?;
+    Ok((gt_index, fields))
 }
 
 /// Fast genotype parser optimized for common cases.
@@ -355,38 +342,9 @@ fn parse_genotypes(
     Ok((genotypes, phase))
 }
 
-/// Parses PL (phred-scaled genotype likelihood) values for all samples.
-///
-/// PL values are comma-separated integers inside the sample field at the given
-/// FORMAT index.  Returns a flat vector of f64 values and the count per sample.
-/// Missing PLs (`.`) are stored as 0.0.
-fn parse_pls(sample_fields: &str, n_samples: usize, pl_index: usize) -> (Vec<f64>, usize) {
-    let mut all_pls: Vec<f64> = Vec::new();
-    let mut pls_per_sample: Option<usize> = None;
-
-    for sample_field in sample_fields.split('\t').take(n_samples) {
-        if let Some(pl_str) = sample_field.split(':').nth(pl_index) {
-            let sample_pls: Vec<f64> = pl_str
-                .split(',')
-                .map(|v| v.parse::<f64>().unwrap_or(0.0))
-                .collect();
-            if pls_per_sample.is_none() {
-                pls_per_sample = Some(sample_pls.len());
-            }
-            all_pls.extend(sample_pls);
-        } else {
-            // No PL field for this sample — fill with zeros
-            let count = pls_per_sample.unwrap_or(0);
-            all_pls.extend(std::iter::repeat(0.0).take(count));
-        }
-    }
-
-    (all_pls, pls_per_sample.unwrap_or(0))
-}
-
 impl Variant {
     /// Creates a new Variant with the given fields.
-    /// Sets internal parser fields (gt_index, pl_index) to defaults.
+    /// Sets gt_format_fields and sample_gt_fields to empty (no lazy field access).
     pub fn new(
         chrom: String,
         pos: u32,
@@ -402,19 +360,17 @@ impl Variant {
             alleles,
             ref_allele_len,
             qual: f32::NAN,
-            gt_index: 0,
-            pl_index: None,
             genotypes,
             phase,
-            pls: Vec::new(),
-            pls_per_sample: 0,
+            gt_format_fields: Vec::new(),
+            sample_gt_fields: Vec::new(),
             n_samples,
         }
     }
 
     fn from_line(
         line: &str,
-        format_cache: &mut LruCache<String, (usize, Option<usize>), RandomState>,
+        format_cache: &mut LruCache<String, (usize, Vec<String>), RandomState>,
         n_samples: usize,
         ploidy: u8,
         patterns: &CommonGenotypePatterns,
@@ -469,26 +425,25 @@ impl Variant {
             .collect();
 
         // Check LRU cache first
-        let (gt_index, pl_index) = if let Some((gt_idx, pl_idx)) = format_cache.get(format_str) {
-            // Cache hit: return cached indices
-            (*gt_idx, *pl_idx)
-        } else {
-            // Cache miss: parse and insert into cache
-            let (gt_idx, pl_idx) = parse_format_field(format_str)?;
-            format_cache.put(format_str.to_string(), (gt_idx, pl_idx));
-            (gt_idx, pl_idx)
-        };
+        let (gt_index, gt_format_fields) =
+            if let Some((gt_idx, fields)) = format_cache.get(format_str) {
+                (*gt_idx, fields.clone())
+            } else {
+                let (gt_idx, fields) = parse_format_field(format_str)?;
+                format_cache.put(format_str.to_string(), (gt_idx, fields.clone()));
+                (gt_idx, fields)
+            };
 
         // Parse genotypes for all samples
         let (genotypes, phase) =
             parse_genotypes(sample_fields, n_samples, gt_index, ploidy, patterns)?;
 
-        // Parse PL values if the FORMAT field includes PL
-        let (pls, pls_per_sample) = if let Some(pl_idx) = pl_index {
-            parse_pls(sample_fields, n_samples, pl_idx)
-        } else {
-            (Vec::new(), 0)
-        };
+        // Store raw sample fields for lazy access to other FORMAT fields
+        let sample_gt_fields: Vec<String> = sample_fields
+            .split('\t')
+            .take(n_samples)
+            .map(String::from)
+            .collect();
 
         Ok(Variant {
             chrom: chrom.to_string(),
@@ -496,12 +451,10 @@ impl Variant {
             alleles,
             ref_allele_len,
             qual,
-            gt_index,
-            pl_index,
             genotypes,
             phase,
-            pls,
-            pls_per_sample,
+            gt_format_fields,
+            sample_gt_fields,
             n_samples,
         })
     }
@@ -565,19 +518,25 @@ impl Variant {
     }
 
     // ============================================================================
-    // Internal/Testing Methods
+    // FORMAT Field Access
     // ============================================================================
 
-    /// Returns the index of GT in the FORMAT field (for internal use and testing).
-    #[doc(hidden)]
-    pub fn gt_index(&self) -> usize {
-        self.gt_index
+    /// Returns the index of a FORMAT field by name, or `None` if not present.
+    ///
+    /// The returned index can be passed to [`get_gt_field_by_index`](Variant::get_gt_field_by_index)
+    /// for efficient repeated access across variants with the same FORMAT layout.
+    pub fn gt_field_index(&self, field: &str) -> Option<usize> {
+        self.gt_format_fields.iter().position(|f| f == field)
     }
 
-    /// Returns the index of PL in the FORMAT field if present (for internal use and testing).
-    #[doc(hidden)]
-    pub fn pl_index(&self) -> Option<usize> {
-        self.pl_index
+    /// Returns the raw string value for a FORMAT field (by index) for each sample.
+    ///
+    /// Returns `"."` for samples where the field is missing.
+    pub fn get_gt_field_by_index(&self, idx: usize) -> Vec<&str> {
+        self.sample_gt_fields
+            .iter()
+            .map(|s| s.split(':').nth(idx).unwrap_or("."))
+            .collect()
     }
 }
 
@@ -589,8 +548,8 @@ pub struct VariantIterator<B: BufRead> {
     line: String,
     /// Internal buffer of parsed records
     vars_buffer: VecDeque<Variant>,
-    /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, pl_index).
-    format_cache: LruCache<String, (usize, Option<usize>), RandomState>,
+    /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, field_names).
+    format_cache: LruCache<String, (usize, Vec<String>), RandomState>,
     /// Sample names extracted from the #CHROM header line
     samples: Vec<String>,
     ploidy: u8,

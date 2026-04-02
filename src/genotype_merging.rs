@@ -233,12 +233,10 @@ fn create_variant_for_region(
         alleles: alleles_vec,
         ref_allele_len: ref_allele.len() as u8,
         qual: f32::NAN,
-        gt_index: 0,
-        pl_index: None,
         genotypes,
         phase: phases,
-        pls: Vec::new(),
-        pls_per_sample: 0,
+        gt_format_fields: Vec::new(),
+        sample_gt_fields: Vec::new(),
         n_samples: total_samples,
     })
 }
@@ -287,18 +285,14 @@ fn compute_posteriors_for_variant(variant: &mut Variant, prior: &PriorConfig) {
         return;
     }
 
-    // Use existing PLs if available, otherwise generate synthetic PLs from GT
-    let sample_pls = if !variant.pls.is_empty() {
-        variant.pls.clone()
-    } else {
-        genotype_posteriors::synthetic_pls_from_gt(
-            &variant.genotypes,
-            num_samples,
-            num_alleles,
-            ploidy,
-            0.99,
-        )
-    };
+    // Generate synthetic PLs from GT calls (99% confidence on the called genotype)
+    let sample_pls = genotype_posteriors::synthetic_pls_from_gt(
+        &variant.genotypes,
+        num_samples,
+        num_alleles,
+        ploidy,
+        0.99,
+    );
 
     let posteriors = genotype_posteriors::estimate_posteriors(
         num_alleles,
@@ -364,9 +358,6 @@ fn compute_posteriors_for_variant(variant: &mut Variant, prior: &PriorConfig) {
         // Otherwise: keep the original GT (preserving allele order / phase)
     }
 
-    // Store the PLs used (for downstream tools that might need them)
-    variant.pls = sample_pls;
-    variant.pls_per_sample = num_genotypes;
 }
 
 /// Collect up to `batch_size` groups from the source iterator.

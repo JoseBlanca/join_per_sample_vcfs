@@ -166,12 +166,10 @@ mod tests {
             alleles: alleles.iter().map(|s| s.to_string()).collect(),
             ref_allele_len: alleles[0].len() as u8,
             qual: f32::NAN,
-            gt_index: 0,
-            pl_index: None,
             genotypes,
             phase,
-            pls: Vec::new(),
-            pls_per_sample: 0,
+            gt_format_fields: Vec::new(),
+            sample_gt_fields: Vec::new(),
             n_samples,
         }
     }
