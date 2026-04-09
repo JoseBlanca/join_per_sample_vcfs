@@ -66,8 +66,8 @@ pub enum VcfParseError {
     #[error("gVCF line has not enough fields to be a variant")]
     GVCFLineNotEnoughFields,
 
-    #[error("VCF file ended before reading the whole header")]
-    BrokenHeader,
+    #[error("Broken VCF header at line: '{line}'")]
+    BrokenHeader { line: String },
 
     #[error("Malformed header fields and sample definition line")]
     MalformedHeader,

@@ -590,14 +590,18 @@ impl<B: BufRead> VariantIterator<B> {
     fn parse_samples_from_header(&self) -> VcfResult<Vec<String>> {
         // Verify this is the #CHROM line
         if !self.line.starts_with("#CHROM") {
-            return Err(VcfParseError::BrokenHeader);
+            return Err(VcfParseError::BrokenHeader {
+                line: self.line.trim().to_string(),
+            });
         }
 
         let fields: Vec<&str> = self.line.trim().split('\t').collect();
 
         // VCF spec requires standard columns plus at least 1 sample
         if fields.len() < VCF_STANDARD_COLUMNS + 1 {
-            return Err(VcfParseError::BrokenHeader);
+            return Err(VcfParseError::BrokenHeader {
+                line: self.line.trim().to_string(),
+            });
         }
 
         let samples: Vec<String> = fields
@@ -617,7 +621,11 @@ impl<B: BufRead> VariantIterator<B> {
             if self.line.starts_with("##") {
                 self.line.clear();
                 match self.reader.read_line(&mut self.line) {
-                    Ok(0) => return Err(VcfParseError::BrokenHeader),
+                    Ok(0) => {
+                        return Err(VcfParseError::BrokenHeader {
+                            line: self.line.clone(),
+                        })
+                    }
                     Ok(_) => {
                         if !self.line.starts_with("##") {
                             break;
