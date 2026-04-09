@@ -548,7 +548,7 @@ pub struct VarIterator<B: BufRead> {
     /// Internal buffer of parsed records
     vars_buffer: VecDeque<Variant>,
     /// LRU cache for FORMAT field parsing: maps format_string -> (gt_index, field_names).
-    format_cache: LruCache<String, (usize, Vec<String>), RandomState>,
+    gt_format_cache: LruCache<String, (usize, Vec<String>), RandomState>,
     /// Sample names extracted from the #CHROM header line
     samples: Vec<String>,
     ploidy: u8,
@@ -567,7 +567,7 @@ impl<B: BufRead> VarIterator<B> {
             reader,
             line,
             vars_buffer: VecDeque::new(),
-            format_cache: LruCache::with_hasher(
+            gt_format_cache: LruCache::with_hasher(
                 NonZeroUsize::new(GT_FORMAT_LRU_CACHE_SIZE).unwrap(),
                 RandomState::new(),
             ),
@@ -654,7 +654,7 @@ impl<B: BufRead> VarIterator<B> {
                 Ok(_) => {
                     match Variant::from_line(
                         &self.line,
-                        &mut self.format_cache,
+                        &mut self.gt_format_cache,
                         n_samples,
                         self.ploidy,
                         &self.common_gt_patterns,
