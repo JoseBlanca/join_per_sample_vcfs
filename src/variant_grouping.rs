@@ -4,7 +4,7 @@ use std::io::BufRead;
 use rayon::prelude::*;
 
 use crate::errors::VcfParseError;
-use crate::gvcf_parser::{Variant, VariantIterator, VcfResult};
+use crate::gvcf_parser::{Variant, VarIterator, VcfResult};
 
 /// Result of peeking a single iterator during the parallel scan.
 enum PeekResult {
@@ -65,7 +65,7 @@ fn ref_span_end(record: &Variant) -> u32 {
 /// overlap when they are on the same chromosome and one's start position
 /// falls within the other's reference-allele span.
 pub struct VariantGroupIterator<B: BufRead> {
-    vcf_iters: Vec<VariantIterator<B>>,
+    vcf_iters: Vec<VarIterator<B>>,
     iter_info: Vec<VariantIteratorInfo>,
     sorted_chromosomes: Vec<String>,
     current_chrom_idx: usize,
@@ -81,7 +81,7 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
     /// * `vcf_iters` - Per-sample VCF iterators to merge.
     /// * `sorted_chromosomes` - The expected chromosome processing order.
     pub fn new(
-        vcf_iters: Vec<VariantIterator<B>>,
+        vcf_iters: Vec<VarIterator<B>>,
         sorted_chromosomes: Vec<String>,
     ) -> VcfResult<Self> {
         let mut seen_samples = HashSet::new();

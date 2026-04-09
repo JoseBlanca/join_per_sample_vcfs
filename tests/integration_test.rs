@@ -1,7 +1,7 @@
 use std::io::BufReader;
 
 use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
-use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::gvcf_parser::VarIterator;
 use merge_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
 /// Convert a human-readable VCF string (spaces between fields) into proper
@@ -36,9 +36,9 @@ fn spaces_to_tabs(vcf: &str) -> String {
         .join("\n")
 }
 
-fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
+fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
-    VariantIterator::from_reader(reader).expect("Failed to create parser")
+    VarIterator::from_reader(reader).expect("Failed to create parser")
 }
 
 /// Run the full pipeline and assert the output matches the expected VCF exactly.

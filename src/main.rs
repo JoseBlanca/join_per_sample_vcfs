@@ -4,7 +4,7 @@ use std::thread;
 
 use merge_per_sample_vcfs::decompression_pool::DecompressionPool;
 use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
-use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
+use merge_per_sample_vcfs::gvcf_parser::VarIterator;
 use merge_per_sample_vcfs::pipeline::merge_alleles_and_genotypes;
 
 fn print_usage(program: &str) {
@@ -100,7 +100,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parse each gVCF file using the shared pool
     let mut vcf_iters = Vec::with_capacity(vcf_paths.len());
     for path in &vcf_paths {
-        let iter = VariantIterator::from_gzip_path_pooled(path, &pool)?;
+        let iter = VarIterator::from_gzip_path_pooled(path, &pool)?;
         vcf_iters.push(iter);
     }
 

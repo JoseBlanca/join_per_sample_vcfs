@@ -2,7 +2,7 @@ use std::io::{BufRead, Write};
 
 use crate::genotype_merging::merge_vars_in_groups;
 use crate::genotype_posteriors::PriorConfig;
-use crate::gvcf_parser::{VariantIterator, VcfResult};
+use crate::gvcf_parser::{VarIterator, VcfResult};
 use crate::variant_grouping::VariantGroupIterator;
 use crate::vcf_writer::VcfWriter;
 
@@ -10,7 +10,7 @@ use crate::vcf_writer::VcfWriter;
 /// samples, merges their alleles and genotypes, and writes the result as a
 /// multi-sample VCF.
 pub fn merge_alleles_and_genotypes<B: BufRead + Send>(
-    var_iters: Vec<VariantIterator<B>>,
+    var_iters: Vec<VarIterator<B>>,
     sorted_chromosomes: Vec<String>,
     writer: Box<dyn Write>,
     prior: &PriorConfig,

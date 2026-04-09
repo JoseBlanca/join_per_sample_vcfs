@@ -3,7 +3,7 @@ use std::io::BufReader;
 
 use merge_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in_groups};
 use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
-use merge_per_sample_vcfs::gvcf_parser::{Variant, VariantIterator};
+use merge_per_sample_vcfs::gvcf_parser::{Variant, VarIterator};
 use merge_per_sample_vcfs::variant_grouping::VariantGroupIterator;
 use merge_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
 
@@ -11,9 +11,9 @@ fn default_prior() -> PriorConfig {
     PriorConfig::default()
 }
 
-fn make_iter(vcf_data: &str) -> VariantIterator<BufReader<BufReader<&[u8]>>> {
+fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
-    VariantIterator::from_reader(reader).expect("Failed to create parser")
+    VarIterator::from_reader(reader).expect("Failed to create parser")
 }
 
 /// Collect merged variants from groups into a Vec (test helper).

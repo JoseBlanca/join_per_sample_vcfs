@@ -17,11 +17,11 @@
 //! # Example
 //!
 //! ```no_run
-//! use merge_per_sample_vcfs::gvcf_parser::VariantIterator;
+//! use merge_per_sample_vcfs::gvcf_parser::VarIterator;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Parse a gzipped GVCF file
-//! let parser = VariantIterator::from_gzip_path("sample.g.vcf.gz")?;
+//! let parser = VarIterator::from_gzip_path("sample.g.vcf.gz")?;
 //!
 //! // Access sample names
 //! let samples = parser.samples();
@@ -153,12 +153,11 @@ pub struct Variant {
 /// Returns an error if GT is not found.
 fn parse_format_field(format: &str) -> VcfResult<(usize, Vec<String>)> {
     let fields: Vec<String> = format.split(':').map(String::from).collect();
-    let gt_index = fields
-        .iter()
-        .position(|f| f == "GT")
-        .ok_or_else(|| VcfParseError::MissingGtFieldInFormat {
+    let gt_index = fields.iter().position(|f| f == "GT").ok_or_else(|| {
+        VcfParseError::MissingGtFieldInFormat {
             line: format.to_string(),
-        })?;
+        }
+    })?;
     Ok((gt_index, fields))
 }
 
@@ -541,7 +540,7 @@ impl Variant {
 }
 
 /// Streaming iterator for parsing GVCF files.
-pub struct VariantIterator<B: BufRead> {
+pub struct VarIterator<B: BufRead> {
     /// Underlying buffered reader
     reader: B,
     /// Reusable line buffer
@@ -557,14 +556,14 @@ pub struct VariantIterator<B: BufRead> {
     common_gt_patterns: CommonGenotypePatterns,
 }
 
-impl<B: BufRead> VariantIterator<B> {
+impl<B: BufRead> VarIterator<B> {
     fn new(mut reader: B) -> VcfResult<Self> {
         let mut line = String::new();
 
         // Read the first line to start header processing
         reader.read_line(&mut line).map_err(VcfParseError::from)?;
 
-        let mut iterator = VariantIterator {
+        let mut iterator = VarIterator {
             reader,
             line,
             vars_buffer: VecDeque::new(),
@@ -624,7 +623,7 @@ impl<B: BufRead> VariantIterator<B> {
                     Ok(0) => {
                         return Err(VcfParseError::BrokenHeader {
                             line: self.line.clone(),
-                        })
+                        });
                     }
                     Ok(_) => {
                         if !self.line.starts_with("##") {
@@ -695,20 +694,20 @@ impl<B: BufRead> VariantIterator<B> {
     }
 }
 
-impl<R: Read> VariantIterator<BufReader<R>> {
+impl<R: Read> VarIterator<BufReader<R>> {
     pub fn from_reader(reader: R) -> VcfResult<Self> {
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, reader);
-        Ok(VariantIterator::new(buf_reader)?)
+        Ok(VarIterator::new(buf_reader)?)
     }
 }
-impl<R: Read> VariantIterator<BufReader<MultiGzDecoder<R>>> {
+impl<R: Read> VarIterator<BufReader<MultiGzDecoder<R>>> {
     pub fn from_gzip_reader(reader: R) -> VcfResult<Self> {
         let gz_decoder = MultiGzDecoder::new(reader);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
-        Ok(VariantIterator::new(buf_reader)?)
+        Ok(VarIterator::new(buf_reader)?)
     }
 }
-impl VariantIterator<BufReader<MultiGzDecoder<File>>> {
+impl VarIterator<BufReader<MultiGzDecoder<File>>> {
     pub fn from_gzip_path<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
         if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
             path: path.as_ref().to_string_lossy().to_string(),
@@ -721,10 +720,10 @@ impl VariantIterator<BufReader<MultiGzDecoder<File>>> {
         let file = File::open(&path)?;
         let gz_decoder = MultiGzDecoder::new(file);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
-        Ok(VariantIterator::new(buf_reader)?)
+        Ok(VarIterator::new(buf_reader)?)
     }
 }
-impl VariantIterator<BufReader<ThreadedReader>> {
+impl VarIterator<BufReader<ThreadedReader>> {
     pub fn from_gzip_path_threaded<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
         if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
             path: path.as_ref().to_string_lossy().to_string(),
@@ -738,10 +737,10 @@ impl VariantIterator<BufReader<ThreadedReader>> {
         let gz_decoder = MultiGzDecoder::new(file);
         let threaded = ThreadedReader::new(gz_decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, threaded);
-        Ok(VariantIterator::new(buf_reader)?)
+        Ok(VarIterator::new(buf_reader)?)
     }
 }
-impl VariantIterator<BufReader<PooledReader>> {
+impl VarIterator<BufReader<PooledReader>> {
     /// Create a `VariantIterator` that uses a shared `DecompressionPool` for
     /// gzip decompression, instead of spawning a dedicated thread per file.
     pub fn from_gzip_path_pooled<P: AsRef<Path>>(
@@ -760,11 +759,11 @@ impl VariantIterator<BufReader<PooledReader>> {
         let gz_decoder = MultiGzDecoder::new(file);
         let pooled = pool.register(gz_decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, pooled);
-        Ok(VariantIterator::new(buf_reader)?)
+        Ok(VarIterator::new(buf_reader)?)
     }
 }
 
-impl<R: BufRead> Iterator for VariantIterator<R> {
+impl<R: BufRead> Iterator for VarIterator<R> {
     type Item = VcfResult<Variant>;
 
     fn next(&mut self) -> Option<Self::Item> {
