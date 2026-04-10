@@ -347,13 +347,10 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                         break;
                     }
 
-                    let record = self.vcf_iters[var_iter_idx].next().ok_or_else(|| {
-                        VcfParseError::RuntimeError {
-                            message:
-                                "Iterator ended unexpectedly while consuming overlapping record"
-                                    .to_string(),
-                        }
-                    })??;
+                    let record = match self.vcf_iters[var_iter_idx].next() {
+                        Some(result) => result?,
+                        None => unreachable!("peek succeeded, so next must return Some"),
+                    };
 
                     let new_end = record.get_var_end()?;
                     if new_end > group_end {
