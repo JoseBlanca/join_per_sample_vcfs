@@ -29,24 +29,24 @@ struct ChromSpan {
     end: u32,
 }
 
-/// Metadata about a `VariantIterator`
+/// Metadata about a `VarIterator`
 #[derive(Debug, Clone)]
 pub struct VarIteratorInfo {
     pub samples: Vec<String>,
 }
 
-/// A bin of overlapping variants collected from multiple per-sample VCFs.
+/// A group of overlapping variants collected from multiple per-sample VCFs.
 ///
-/// The bin covers a contiguous genomic region where all contained variants
-/// have reference-allele spans that overlap with the bin's span.
+/// The group covers a contiguous genomic region where all contained variants
+/// have reference-allele spans that overlap with the group's span.
 #[derive(Debug)]
 pub struct OverlappingVarGroup {
     pub chrom: String,
-    /// Start position of the bin (1-based, inclusive).
+    /// Start position of the group (1-based, inclusive).
     pub start: u32,
-    /// End position of the bin (1-based, inclusive).
+    /// End position of the group (1-based, inclusive).
     pub end: u32,
-    /// All variant records in this bin, in consumption order.
+    /// All variant records in this group, in consumption order.
     pub variants: Vec<Variant>,
     /// Index into `VarGroupIterator::iter_info` for each variant,
     /// parallel to `variants`.
@@ -301,7 +301,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         }
     }
 
-    /// Phase B: consume all records overlapping the current bin span
+    /// Phase B: consume all records overlapping the current group span
     /// and return the completed group.
     fn group_overlapping_vars(
         &mut self,
