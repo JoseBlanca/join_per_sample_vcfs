@@ -306,9 +306,9 @@ fn test_genotype_performance_with_sample_gvcf() {
 
     // Check first variant: 20\t17330\t.\tT\tA,<NON_REF>\t.\tq10\tNS=3;DP=11;AF=0.017\tGT:GQ:DP:HQ\t.|0:49:3:58,50\t0|1:3:5:65,3\t0/0:41:3
     let v1 = &variants[1];
-    assert_eq!(v1.n_samples(), 3);
+    assert_eq!(v1.n_samples, 3);
 
     // Check second variant has consistent ploidy
     let v2 = &variants[2];
-    assert_eq!(v2.n_samples(), 3);
+    assert_eq!(v2.n_samples, 3);
 }

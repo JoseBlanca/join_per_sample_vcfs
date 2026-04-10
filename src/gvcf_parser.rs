@@ -462,48 +462,6 @@ impl Variant {
         })
     }
 
-    // ============================================================================
-    // Core Accessors
-    // ============================================================================
-
-    /// Returns the chromosome/contig name.
-    #[inline]
-    pub fn chrom(&self) -> &str {
-        &self.chrom
-    }
-
-    /// Returns the genomic position (1-based).
-    #[inline]
-    pub fn position(&self) -> u32 {
-        self.pos
-    }
-
-    /// Returns all alleles (reference first, then alternates).
-    #[inline]
-    pub fn alleles(&self) -> &[String] {
-        &self.alleles
-    }
-
-    /// Returns the variant quality score. May be `NaN` if not available.
-    #[inline]
-    pub fn quality(&self) -> f32 {
-        self.qual
-    }
-
-    // ============================================================================
-    // Metadata
-    // ============================================================================
-
-    /// Returns the number of samples in this record.
-    #[inline]
-    pub fn n_samples(&self) -> usize {
-        self.n_samples
-    }
-
-    // ============================================================================
-    // Utility Methods
-    // ============================================================================
-
     /// Returns the genomic span covered by this variant as (start, end) inclusive.
     ///
     /// For SNPs, start == end. For indels, the span covers the maximum allele length.
