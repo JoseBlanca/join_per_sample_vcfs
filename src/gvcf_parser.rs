@@ -232,7 +232,7 @@ fn parse_genotypes(
 
     // Zero-fill the genotypes buffer, most alleles are reference alleles
     let mut genotypes: Vec<i8> = vec![0; total_num_alleles];
-    let mut phase: Vec<bool> = vec![false; total_num_alleles];
+    let mut phase: Vec<bool> = vec![false; n_samples];
 
     // Parse each sample
     let mut last_idx: usize = 0;
