@@ -23,7 +23,7 @@ enum PeekResult {
 }
 
 /// Seed for a new variant group: chromosome, start position, and initial end.
-struct SpanSeed {
+struct ChromSpan {
     chrom: String,
     start: u32,
     end: u32,
@@ -182,7 +182,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
     /// This method only peeks iterators — it does not consume the seed
     /// records. The caller must pass the seed to `group_overlapping_vars`,
     /// which consumes them as part of its overlap loop.
-    fn compute_next_span_seed(&mut self) -> VcfResult<Option<SpanSeed>> {
+    fn compute_next_span_seed(&mut self) -> VcfResult<Option<ChromSpan>> {
         loop {
             if self.current_chrom_idx >= self.sorted_chromosomes.len() {
                 self.done = true;
@@ -296,7 +296,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                         self.last_group_start = Some(pos);
                         continue;
                     }
-                    return Ok(Some(SpanSeed {
+                    return Ok(Some(ChromSpan {
                         chrom: chrom.clone(),
                         start: pos,
                         end: earliest_end,
