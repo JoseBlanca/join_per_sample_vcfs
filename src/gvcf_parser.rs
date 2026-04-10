@@ -379,7 +379,7 @@ impl Variant {
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
         fields.next(); // FILTER
         fields.next(); // INFO
-        let format_str = fields
+        let gt_format_str = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
 
@@ -388,10 +388,12 @@ impl Variant {
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
 
-        let pos = pos.parse::<u32>().map_err(|_| VcfParseError::InvalidPosition {
-            value: pos.to_string(),
-            line: line.to_string(),
-        })?;
+        let pos = pos
+            .parse::<u32>()
+            .map_err(|_| VcfParseError::InvalidPosition {
+                value: pos.to_string(),
+                line: line.to_string(),
+            })?;
 
         let qual = if qual_str == "." {
             f32::NAN
@@ -412,11 +414,11 @@ impl Variant {
 
         // Check LRU cache first
         let (gt_index, gt_format_fields) =
-            if let Some((gt_idx, fields)) = format_cache.get(format_str) {
+            if let Some((gt_idx, fields)) = format_cache.get(gt_format_str) {
                 (*gt_idx, fields.clone())
             } else {
-                let (gt_idx, fields) = parse_format_field(format_str)?;
-                format_cache.put(format_str.to_string(), (gt_idx, fields.clone()));
+                let (gt_idx, fields) = parse_format_field(gt_format_str)?;
+                format_cache.put(gt_format_str.to_string(), (gt_idx, fields.clone()));
                 (gt_idx, fields)
             };
 
