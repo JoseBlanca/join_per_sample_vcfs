@@ -220,12 +220,12 @@ fn parse_genotype(gt_str: &str, expected_ploidy: u8) -> VcfResult<(Vec<i8>, bool
 
 /// Parses genotypes for all samples in a VCF line.
 fn parse_genotypes(
-    sample_fields: &str,
-    n_samples: usize,
+    sample_gt_fields: &[String],
     gt_index: usize,
     ploidy: u8,
     patterns: &CommonGenotypePatterns,
 ) -> VcfResult<(Vec<i8>, Vec<bool>)> {
+    let n_samples = sample_gt_fields.len();
     let total_num_alleles = n_samples * ploidy as usize;
 
     // Zero-fill the genotypes buffer, most alleles are reference alleles
@@ -233,15 +233,7 @@ fn parse_genotypes(
     let mut phases: Vec<bool> = vec![false; n_samples];
 
     // Parse each sample
-    for (sample_idx, sample_field) in sample_fields.split('\t').enumerate() {
-        if sample_idx >= n_samples {
-            return Err(VcfParseError::RuntimeError {
-                message: format!(
-                    "More than the expected number of samples {n_samples} found in line"
-                ),
-            });
-        }
-
+    for (sample_idx, sample_field) in sample_gt_fields.iter().enumerate() {
         // Get GT field using nth() to avoid collecting into Vec
         let gt_str = match sample_field.split(':').nth(gt_index) {
             Some(s) => s,
@@ -420,16 +412,23 @@ impl Variant {
                 (gt_idx, fields)
             };
 
+        // Split sample fields once, reused for both GT parsing and lazy field access
+        let sample_gt_fields: Vec<String> =
+            sample_fields.split('\t').map(String::from).collect();
+        if sample_gt_fields.len() != n_samples {
+            return Err(VcfParseError::MalformedLine {
+                reason: format!(
+                    "expected {} samples, found {}",
+                    n_samples,
+                    sample_gt_fields.len()
+                ),
+                line: line.to_string(),
+            });
+        }
+
         // Parse genotypes for all samples
         let (genotypes, phases) =
-            parse_genotypes(sample_fields, n_samples, gt_index, ploidy, patterns)?;
-
-        // Store raw sample fields for lazy access to other FORMAT fields
-        let sample_gt_fields: Vec<String> = sample_fields
-            .split('\t')
-            .take(n_samples)
-            .map(String::from)
-            .collect();
+            parse_genotypes(&sample_gt_fields, gt_index, ploidy, patterns)?;
 
         Ok(Variant {
             chrom: chrom.to_string(),
