@@ -235,12 +235,14 @@ fn parse_genotypes(
     // Parse each sample
     for (sample_idx, sample_field) in sample_gt_fields.iter().enumerate() {
         // Get GT field using nth() to avoid collecting into Vec
-        let gt_str = sample_field.split(':').nth(gt_index).ok_or_else(|| {
-            VcfParseError::MissingGtField {
-                sample: sample_idx.to_string(),
-                line: sample_field.to_string(),
-            }
-        })?;
+        let gt_str =
+            sample_field
+                .split(':')
+                .nth(gt_index)
+                .ok_or_else(|| VcfParseError::MissingGtField {
+                    sample: sample_idx.to_string(),
+                    line: sample_field.to_string(),
+                })?;
 
         // Fast path: hardcoded diploid reference (most common case)
         if ploidy == 2 {
@@ -303,7 +305,7 @@ fn parse_genotypes(
             });
         }
 
-        // Copy alleles to buffer
+        // Copy alleles to genotypes vector
         let start = sample_idx * ploidy as usize;
         for (i, &allele) in alleles.iter().enumerate() {
             genotypes[start + i] = allele;
@@ -407,8 +409,7 @@ impl Variant {
             };
 
         // Split sample fields once, reused for both GT parsing and lazy field access
-        let sample_gt_fields: Vec<String> =
-            sample_fields.split('\t').map(String::from).collect();
+        let sample_gt_fields: Vec<String> = sample_fields.split('\t').map(String::from).collect();
         if sample_gt_fields.len() != n_samples {
             return Err(VcfParseError::MalformedLine {
                 reason: format!(
@@ -421,8 +422,7 @@ impl Variant {
         }
 
         // Parse genotypes for all samples
-        let (genotypes, phases) =
-            parse_genotypes(&sample_gt_fields, gt_index, ploidy, patterns)?;
+        let (genotypes, phases) = parse_genotypes(&sample_gt_fields, gt_index, ploidy, patterns)?;
 
         Ok(Variant {
             chrom: chrom.to_string(),
