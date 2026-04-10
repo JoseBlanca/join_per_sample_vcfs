@@ -691,7 +691,7 @@ impl<R: BufRead> Iterator for VarIterator<R> {
     type Item = VcfResult<Variant>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.vars_buffer.len() == 0 {
+        if self.vars_buffer.is_empty() {
             match self.fill_buffer(DEF_N_VARIANTS_IN_BUFFER) {
                 Err(error) => return Some(Err(error)),
                 Ok(n_items_added) => match n_items_added {
