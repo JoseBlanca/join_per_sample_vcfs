@@ -393,11 +393,11 @@ impl Variant {
             line: line.to_string(),
         })?;
 
-        let qual = if qual_str == "." {
+        let qual: f32 = if qual_str == "." {
             f32::NAN
         } else {
             qual_str
-                .parse::<f32>()
+                .parse()
                 .map_err(|_| VcfParseError::InvalidQuality {
                     value: qual_str.to_string(),
                     line: line.to_string(),
