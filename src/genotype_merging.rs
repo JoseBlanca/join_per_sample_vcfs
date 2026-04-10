@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::errors::VcfParseError;
 use crate::genotype_posteriors::{self, PriorConfig};
 use crate::gvcf_parser::{Variant, VcfResult};
-use crate::variant_grouping::{OverlappingVariantGroup, VariantIteratorInfo};
+use crate::variant_grouping::{OverlappingVarGroup, VarIteratorInfo};
 
 /// Default number of groups to process in each parallel batch.
 const DEFAULT_BATCH_SIZE: usize = 1000;
@@ -18,8 +18,8 @@ const DEFAULT_BATCH_SIZE: usize = 1000;
 /// multiple samples and produces a single merged variant with unified alleles
 /// and genotypes across all samples.
 fn create_variant_for_region(
-    var_group: &OverlappingVariantGroup,
-    var_iter_infos: &[VariantIteratorInfo],
+    var_group: &OverlappingVarGroup,
+    var_iter_infos: &[VarIteratorInfo],
 ) -> VcfResult<Variant> {
     // Compute sample offsets: sample_idx = sample_offsets[var_iter_idx] + sample_idx_in_var_iter
     let n_samples_per_var_iter: Vec<usize> = var_iter_infos
@@ -240,15 +240,15 @@ fn create_variant_for_region(
     })
 }
 
-/// Merges a single `OverlappingVariantGroup` into one or more output variants.
+/// Merges a single `OverlappingVarGroup` into one or more output variants.
 ///
 /// After merging alleles and genotypes, computes genotype posterior
 /// probabilities using the EM algorithm.  If the input variants have PL data
 /// it is used directly; otherwise synthetic PLs are generated from the GT
 /// calls (99% confidence on the called genotype).
 pub fn merge_variant_group(
-    group: &OverlappingVariantGroup,
-    iter_info: &[VariantIteratorInfo],
+    group: &OverlappingVarGroup,
+    iter_info: &[VarIteratorInfo],
     prior: &PriorConfig,
 ) -> VcfResult<Vec<Variant>> {
     let mut variant = create_variant_for_region(group, iter_info)?;
@@ -360,9 +360,9 @@ fn compute_posteriors_for_variant(variant: &mut Variant, prior: &PriorConfig) {
 }
 
 /// Collect up to `batch_size` groups from the source iterator.
-fn collect_batch<I>(groups: &mut I, batch_size: usize) -> Vec<VcfResult<OverlappingVariantGroup>>
+fn collect_batch<I>(groups: &mut I, batch_size: usize) -> Vec<VcfResult<OverlappingVarGroup>>
 where
-    I: Iterator<Item = VcfResult<OverlappingVariantGroup>>,
+    I: Iterator<Item = VcfResult<OverlappingVarGroup>>,
 {
     let mut batch = Vec::with_capacity(batch_size);
     for group_result in groups.by_ref() {
@@ -376,8 +376,8 @@ where
 
 /// Process a batch of groups in parallel with rayon.
 fn process_batch(
-    batch: Vec<VcfResult<OverlappingVariantGroup>>,
-    iter_info: &[VariantIteratorInfo],
+    batch: Vec<VcfResult<OverlappingVarGroup>>,
+    iter_info: &[VarIteratorInfo],
     prior: &PriorConfig,
 ) -> Vec<VcfResult<Variant>> {
     batch
@@ -393,7 +393,7 @@ fn process_batch(
         .collect()
 }
 
-/// Processes `OverlappingVariantGroup`s from an iterator and writes merged
+/// Processes `OverlappingVarGroup`s from an iterator and writes merged
 /// variants to a callback, one batch at a time.
 ///
 /// A background thread continuously collects groups into batches while the main
@@ -405,12 +405,12 @@ fn process_batch(
 /// without requiring `'static`.
 pub fn merge_vars_in_groups<I, F>(
     groups: I,
-    iter_info: &[VariantIteratorInfo],
+    iter_info: &[VarIteratorInfo],
     prior: &PriorConfig,
     mut on_variant: F,
 ) -> VcfResult<()>
 where
-    I: Iterator<Item = VcfResult<OverlappingVariantGroup>> + Send,
+    I: Iterator<Item = VcfResult<OverlappingVarGroup>> + Send,
     F: FnMut(VcfResult<Variant>) -> VcfResult<()>,
 {
     let batch_size = DEFAULT_BATCH_SIZE;
@@ -419,7 +419,7 @@ where
         // Bounded channel with capacity 1: the collector can be at most one
         // batch ahead, bounding memory to ~2 batches.
         let (batch_sender, batch_receiver) =
-            mpsc::sync_channel::<Vec<VcfResult<OverlappingVariantGroup>>>(1);
+            mpsc::sync_channel::<Vec<VcfResult<OverlappingVarGroup>>>(1);
 
         // Background collector: pulls groups into batches.
         scope.spawn(move || {

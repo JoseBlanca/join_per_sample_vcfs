@@ -1,7 +1,7 @@
 use std::io::BufReader;
 
 use merge_per_sample_vcfs::gvcf_parser::VarIterator;
-use merge_per_sample_vcfs::variant_grouping::VariantGroupIterator;
+use merge_per_sample_vcfs::variant_grouping::VarGroupIterator;
 
 fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
@@ -11,7 +11,7 @@ fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
 fn collect_spans(vcf_data: &[&str], sorted_chromosomes: Vec<String>) -> Vec<(String, u32, u32)> {
     let iters: Vec<_> = vcf_data.iter().map(|d| make_iter(d)).collect();
     let grouper =
-        VariantGroupIterator::new(iters, sorted_chromosomes).expect("Failed to create grouper");
+        VarGroupIterator::new(iters, sorted_chromosomes).expect("Failed to create grouper");
     grouper
         .map(|r| {
             let bin = r.expect("Unexpected error");
@@ -163,7 +163,7 @@ fn test_bin_contains_expected_variants() {
     // VCF3    .-----
     // All variants merge into one bin: ("20", 1, 6)
     let iters = vec![make_iter(VCF1), make_iter(VCF3)];
-    let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
+    let grouper = VarGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
     assert_eq!(groups.len(), 1);
@@ -193,7 +193,7 @@ fn test_bin_contains_expected_variants() {
 #[test]
 fn test_wrong_chrom_order() {
     let iter = make_iter(VCF_WITH_WRONG_CHROMOSOME_ORDER);
-    let grouper = VariantGroupIterator::new(vec![iter], vec!["1".into(), "2".into()]).unwrap();
+    let grouper = VarGroupIterator::new(vec![iter], vec!["1".into(), "2".into()]).unwrap();
     let results: Vec<_> = grouper.collect();
     assert!(
         results.iter().any(|r| r.is_err()),
@@ -204,7 +204,7 @@ fn test_wrong_chrom_order() {
 #[test]
 fn test_wrong_order() {
     let iter = make_iter(VCF_WITH_WRONG_ORDER);
-    let grouper = VariantGroupIterator::new(vec![iter], vec!["1".into()]).unwrap();
+    let grouper = VarGroupIterator::new(vec![iter], vec!["1".into()]).unwrap();
     let results: Vec<_> = grouper.collect();
     assert!(
         results.iter().any(|r| r.is_err()),
@@ -218,7 +218,7 @@ fn test_source_iter_samples() {
     // All variants merge into one bin: ("20", 1, 6)
     // First 6 variants come from VCF1 (iter 0), last from VCF3 (iter 1)
     let iters = vec![make_iter(VCF1), make_iter(VCF3)];
-    let grouper = VariantGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
+    let grouper = VarGroupIterator::new(iters, vec!["1".into(), "20".into()]).unwrap();
     let iter_info = grouper.iter_info().to_vec();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
@@ -242,14 +242,14 @@ fn test_source_iter_samples() {
 fn test_duplicate_samples() {
     let iter1 = make_iter(VCF1);
     let iter2 = make_iter(VCF1); // same sample name NA00001
-    let result = VariantGroupIterator::new(vec![iter1, iter2], vec!["20".into()]);
+    let result = VarGroupIterator::new(vec![iter1, iter2], vec!["20".into()]);
     assert!(result.is_err(), "Expected error for duplicate sample names");
 }
 
 #[test]
 fn test_empty_input() {
-    let grouper: VariantGroupIterator<BufReader<BufReader<&[u8]>>> =
-        VariantGroupIterator::new(vec![], vec!["1".into(), "20".into()]).unwrap();
+    let grouper: VarGroupIterator<BufReader<BufReader<&[u8]>>> =
+        VarGroupIterator::new(vec![], vec!["1".into(), "20".into()]).unwrap();
     let groups: Vec<_> = grouper.collect();
     assert!(groups.is_empty());
 }
@@ -268,7 +268,7 @@ fn test_single_variant_group() {
         #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1\n\
         1\t100\t.\tA\tT\t30\tPASS\t.\tGT\t0/1";
     let iters = vec![make_iter(vcf)];
-    let grouper = VariantGroupIterator::new(iters, vec!["1".into()]).unwrap();
+    let grouper = VarGroupIterator::new(iters, vec!["1".into()]).unwrap();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
     assert_eq!(groups.len(), 1);

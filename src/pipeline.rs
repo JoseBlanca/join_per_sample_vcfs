@@ -3,7 +3,7 @@ use std::io::{BufRead, Write};
 use crate::genotype_merging::merge_vars_in_groups;
 use crate::genotype_posteriors::PriorConfig;
 use crate::gvcf_parser::{VarIterator, VcfResult};
-use crate::variant_grouping::VariantGroupIterator;
+use crate::variant_grouping::VarGroupIterator;
 use crate::vcf_writer::VcfWriter;
 
 /// Runs the full gVCF merging pipeline: groups overlapping variants across
@@ -20,7 +20,7 @@ pub fn merge_alleles_and_genotypes<B: BufRead + Send>(
         .flat_map(|iter| iter.samples().iter().cloned())
         .collect();
 
-    let grouper = VariantGroupIterator::new(var_iters, sorted_chromosomes)?;
+    let grouper = VarGroupIterator::new(var_iters, sorted_chromosomes)?;
     let iter_info = grouper.iter_info().to_vec();
 
     let mut vcf_writer =
