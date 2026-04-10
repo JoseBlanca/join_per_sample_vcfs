@@ -245,3 +245,74 @@ fn test_duplicate_samples() {
     let result = VariantGroupIterator::new(vec![iter1, iter2], vec!["20".into()]);
     assert!(result.is_err(), "Expected error for duplicate sample names");
 }
+
+#[test]
+fn test_empty_input() {
+    let grouper: VariantGroupIterator<BufReader<BufReader<&[u8]>>> =
+        VariantGroupIterator::new(vec![], vec!["1".into(), "20".into()]).unwrap();
+    let groups: Vec<_> = grouper.collect();
+    assert!(groups.is_empty());
+}
+
+#[test]
+fn test_no_matching_chromosomes() {
+    // All iterators have variants, but none on chromosomes in sorted_chromosomes
+    let spans = collect_spans(&[VCF1, VCF2], vec!["X".into(), "Y".into()]);
+    assert!(spans.is_empty());
+}
+
+#[test]
+fn test_single_variant_group() {
+    // A single SNP from a single iterator produces a single-variant group
+    let vcf = "##\n\
+        #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1\n\
+        1\t100\t.\tA\tT\t30\tPASS\t.\tGT\t0/1";
+    let iters = vec![make_iter(vcf)];
+    let grouper = VariantGroupIterator::new(iters, vec!["1".into()]).unwrap();
+    let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].span(), ("1", 100, 100));
+    assert_eq!(groups[0].variants.len(), 1);
+    assert_eq!(groups[0].source_var_iter_idxs, vec![0]);
+}
+
+// VCF with only non-variable records (all hom-ref with single allele after <NON_REF> stripping)
+const VCF_ALL_HOMREF: &str = "##\n\
+    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00010\n\
+    1\t1\t.\tA\t<NON_REF>\t20\tPASS\t.\tGT\t0|0\n\
+    1\t2\t.\tC\t<NON_REF>\t20\tPASS\t.\tGT\t0|0\n\
+    1\t3\t.\tG\t<NON_REF>\t20\tPASS\t.\tGT\t0|0";
+
+const VCF_ALL_HOMREF2: &str = "##\n\
+    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tNA00011\n\
+    1\t1\t.\tA\t<NON_REF>\t20\tPASS\t.\tGT\t0|0\n\
+    1\t2\t.\tC\t<NON_REF>\t20\tPASS\t.\tGT\t0|0\n\
+    1\t3\t.\tG\t<NON_REF>\t20\tPASS\t.\tGT\t0|0";
+
+#[test]
+fn test_non_variable_groups_are_skipped() {
+    // When all iterators have non-variable records at the same position,
+    // the skip path should consume them and produce no groups.
+    let spans = collect_spans(&[VCF_ALL_HOMREF, VCF_ALL_HOMREF2], vec!["1".into()]);
+    assert!(
+        spans.is_empty(),
+        "Expected no groups when all variants are non-variable, got: {:?}",
+        spans
+    );
+}
+
+#[test]
+fn test_skip_path_produces_fewer_groups() {
+    // VCF_ALL_HOMREF has 3 non-variable positions; VCF1 has 5 variable positions on chr 20.
+    // Without skipping, positions from VCF_ALL_HOMREF would create groups on chr 1.
+    // With skipping, only chr 20 groups appear.
+    let spans = collect_spans(&[VCF_ALL_HOMREF, VCF1], vec!["1".into(), "20".into()]);
+    // chr 1 positions should be skipped (all non-variable), only chr 20 groups remain
+    assert!(
+        spans.iter().all(|(chrom, _, _)| chrom == "20"),
+        "Expected only chr 20 groups, got: {:?}",
+        spans
+    );
+    assert_eq!(spans.len(), 5); // 5 variable positions from VCF1
+}
