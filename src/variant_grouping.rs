@@ -395,20 +395,21 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             return None;
         }
 
-        let seed = match self.compute_next_span_seed() {
-            Ok(Some(v)) => v,
+        let group_span_seed = match self.compute_next_span_seed() {
+            Ok(Some(g_span_seed)) => g_span_seed,
             Ok(None) => return None,
             Err(e) => return self.fail(e),
         };
 
-        let overlaps = match self.group_overlapping_vars(&seed.chrom, seed.end) {
-            Ok(v) => v,
-            Err(e) => return self.fail(e),
-        };
+        let overlaps =
+            match self.group_overlapping_vars(&group_span_seed.chrom, group_span_seed.end) {
+                Ok(v) => v,
+                Err(e) => return self.fail(e),
+            };
 
-        self.last_group_start = Some(seed.start);
+        self.last_group_start = Some(group_span_seed.start);
 
-        let any_remaining = match self.chromosome_has_remaining_variants(&seed.chrom) {
+        let any_remaining = match self.chromosome_has_remaining_variants(&group_span_seed.chrom) {
             Ok(v) => v,
             Err(e) => return self.fail(e),
         };
@@ -418,8 +419,8 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         }
 
         Some(Ok(OverlappingVarGroup {
-            chrom: seed.chrom,
-            start: seed.start,
+            chrom: group_span_seed.chrom,
+            start: group_span_seed.start,
             end: overlaps.group_end,
             variants: overlaps.variants,
             source_var_iter_idxs: overlaps.source_indices,
