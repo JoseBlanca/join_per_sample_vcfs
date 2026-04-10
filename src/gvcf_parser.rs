@@ -546,7 +546,8 @@ impl<B: BufRead> VarIterator<B> {
                 match self.reader.read_line(&mut self.line) {
                     Ok(0) => {
                         return Err(VcfParseError::BrokenHeader {
-                            line: self.line.clone(),
+                            line: "EOF reached before #CHROM header line was found"
+                                .to_string(),
                         });
                     }
                     Ok(_) => {
