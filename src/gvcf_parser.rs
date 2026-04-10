@@ -1,18 +1,5 @@
-//! High-performance parser for GVCF (Genomic VCF) files.
-//!
 //! This module provides an efficient streaming iterator for parsing GVCF files with
 //! optimizations for common genomic data patterns.
-//!
-//! # Features
-//!
-//! - **Zero-allocation fast paths**: Common genotypes like `0/0` and `0|0` are handled
-//!   without allocations
-//! - **Reusable buffers**: Genotype and phase buffers are reused across variants to
-//!   minimize allocations
-//! - **Large I/O buffers**: 256KB buffer size for better throughput on large files
-//! - **LRU caching**: FORMAT field indices are cached to avoid repeated parsing
-//! - **Header processing**: Samples are extracted and available immediately after
-//!   iterator construction
 //!
 //! # Example
 //!
