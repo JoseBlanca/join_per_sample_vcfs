@@ -235,9 +235,7 @@ fn parse_genotypes(
     let mut phase: Vec<bool> = vec![false; n_samples];
 
     // Parse each sample
-    let mut last_idx: usize = 0;
     for (sample_idx, sample_field) in sample_fields.split('\t').enumerate() {
-        last_idx = sample_idx;
         if sample_idx >= n_samples {
             return Err(VcfParseError::RuntimeError {
                 message: format!(
@@ -327,15 +325,6 @@ fn parse_genotypes(
             genotypes[start + i] = allele;
         }
         phase[sample_idx] = phased;
-    }
-
-    let samples_seen = last_idx + 1;
-    if samples_seen > n_samples {
-        return Err(VcfParseError::RuntimeError {
-            message: format!(
-                "More samples than expected: expected {n_samples}, got {samples_seen}"
-            ),
-        });
     }
 
     Ok((genotypes, phase))
