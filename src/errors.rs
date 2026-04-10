@@ -63,8 +63,8 @@ pub enum VcfParseError {
     #[error("VCF file should be bgzipped")]
     VCFFileShouldBeBGzipped,
 
-    #[error("gVCF line has not enough fields to be a variant")]
-    GVCFLineNotEnoughFields,
+    #[error("gVCF line has not enough fields to be a variant: '{line}'")]
+    GVCFLineNotEnoughFields { line: String },
 
     #[error("Malformed VCF line: {reason}. Line: '{line}'")]
     MalformedLine { reason: String, line: String },

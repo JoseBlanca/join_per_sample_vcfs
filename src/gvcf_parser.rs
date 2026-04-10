@@ -337,31 +337,31 @@ impl Variant {
         let mut fields = line.splitn(10, '\t');
         let chrom = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
 
         let pos = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
         fields.next(); // ID
         let ref_allele = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
         let alt_alleles = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
         let qual_str = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
         fields.next(); // FILTER
         fields.next(); // INFO
         let gt_format_str = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
 
         // Get sample fields (the 10th field from splitn contains all remaining sample data)
         let sample_fields = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
 
         let pos: u32 = pos.parse().map_err(|_| VcfParseError::InvalidPosition {
             value: pos.to_string(),
