@@ -68,7 +68,7 @@ impl OverlappingVarGroup {
 
 /// Computes the reference-allele span end for a variant (1-based, inclusive).
 #[inline]
-fn ref_span_end(record: &Variant) -> u32 {
+fn get_var_end(record: &Variant) -> u32 {
     record.pos + record.alleles[0].len() as u32 - 1
 }
 
@@ -76,34 +76,34 @@ fn ref_span_end(record: &Variant) -> u32 {
 ///
 /// A chromosome is considered "already processed" if it appears in
 /// `sorted_chromosomes` at an index before `current_chrom_idx`.
-fn validate_record_order(
-    record: &Variant,
+fn validate_var_order(
+    var: &Variant,
     current_chrom: &str,
     sorted_chromosomes: &[String],
     current_chrom_idx: usize,
     last_group_start: Option<u32>,
 ) -> Result<(), VcfParseError> {
-    if record.chrom != current_chrom {
+    if var.chrom != current_chrom {
         let already_processed = sorted_chromosomes[..current_chrom_idx]
             .iter()
-            .any(|c| c == &record.chrom);
+            .any(|c| c == &var.chrom);
         if already_processed {
             return Err(VcfParseError::RuntimeError {
                 message: format!(
                     "Out-of-order chromosome '{}' at position {}: chromosome already processed",
-                    record.chrom, record.pos
+                    var.chrom, var.pos
                 ),
             });
         }
         return Ok(());
     }
 
-    if let Some(lbs) = last_group_start {
-        if record.pos < lbs {
+    if let Some(last_group_start) = last_group_start {
+        if var.pos < last_group_start {
             return Err(VcfParseError::RuntimeError {
                 message: format!(
-                    "Out-of-order position on '{}': {} < last bin start {}",
-                    current_chrom, record.pos, lbs
+                    "Out-of-order position on '{}': {} < last var group start {}",
+                    current_chrom, var.pos, last_group_start
                 ),
             });
         }
@@ -198,15 +198,15 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             let peek_results: Vec<PeekResult> = self
                 .vcf_iters
                 .par_iter_mut()
-                .map(|iter| {
-                    let r = match iter.peek_variant() {
-                        Ok(Some(r)) => r,
+                .map(|var_iter| {
+                    let var = match var_iter.peek_variant() {
+                        Ok(Some(var)) => var,
                         Ok(None) => return PeekResult::Exhausted,
                         Err(e) => return PeekResult::Error(e),
                     };
 
-                    if let Err(e) = validate_record_order(
-                        r,
+                    if let Err(e) = validate_var_order(
+                        var,
                         chrom,
                         sorted_chromosomes,
                         current_chrom_idx,
@@ -215,14 +215,14 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                         return PeekResult::Error(e);
                     }
 
-                    if r.chrom != *chrom {
+                    if var.chrom != *chrom {
                         return PeekResult::DifferentChrom;
                     }
 
                     PeekResult::OnCurrentChrom {
-                        pos: r.pos,
-                        span_end: ref_span_end(r),
-                        is_variable: r.alleles.len() > 1,
+                        pos: var.pos,
+                        span_end: get_var_end(var),
+                        is_variable: var.alleles.len() > 1,
                     }
                 })
                 .collect();
@@ -328,7 +328,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                             break;
                         };
 
-                        validate_record_order(
+                        validate_var_order(
                             r,
                             current_chrom,
                             &self.sorted_chromosomes,
@@ -356,7 +356,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                                         .to_string(),
                             })??;
 
-                    let new_end = ref_span_end(&record);
+                    let new_end = get_var_end(&record);
                     if new_end > group_end {
                         group_end = new_end;
                     }
