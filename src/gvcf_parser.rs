@@ -388,12 +388,10 @@ impl Variant {
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
 
-        let pos = pos
-            .parse::<u32>()
-            .map_err(|_| VcfParseError::InvalidPosition {
-                value: pos.to_string(),
-                line: line.to_string(),
-            })?;
+        let pos: u32 = pos.parse().map_err(|_| VcfParseError::InvalidPosition {
+            value: pos.to_string(),
+            line: line.to_string(),
+        })?;
 
         let qual = if qual_str == "." {
             f32::NAN
