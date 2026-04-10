@@ -587,7 +587,7 @@ impl<B: BufRead> VarIterator<B> {
         Ok(())
     }
 
-    pub fn fill_buffer(&mut self, n_items: usize) -> VcfResult<usize> {
+    fn fill_buffer(&mut self, n_items: usize) -> VcfResult<usize> {
         let mut n_items_added: usize = 0;
         let n_samples = self.samples.len();
 

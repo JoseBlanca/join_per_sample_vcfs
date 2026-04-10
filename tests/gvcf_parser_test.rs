@@ -223,8 +223,9 @@ fn test_sample_parsing_with_buffer() {
     assert_eq!(samples[1], "NA00002");
     assert_eq!(samples[2], "NA00003");
 
-    // Fill buffer should still work normally
-    parser.fill_buffer(2).unwrap();
+    // Iteration should still work normally after header parsing
+    let variants: Vec<_> = parser.filter_map(Result::ok).collect();
+    assert!(!variants.is_empty());
 }
 
 #[test]
