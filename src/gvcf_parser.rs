@@ -235,18 +235,12 @@ fn parse_genotypes(
     // Parse each sample
     for (sample_idx, sample_field) in sample_gt_fields.iter().enumerate() {
         // Get GT field using nth() to avoid collecting into Vec
-        let gt_str = match sample_field.split(':').nth(gt_index) {
-            Some(s) => s,
-            None => {
-                // Missing GT field - mark as missing
-                let start = sample_idx * ploidy as usize;
-                for i in 0..ploidy as usize {
-                    genotypes[start + i] = MISSING_ALLELE;
-                }
-                phases[sample_idx] = false;
-                continue;
+        let gt_str = sample_field.split(':').nth(gt_index).ok_or_else(|| {
+            VcfParseError::MissingGtField {
+                sample: sample_idx.to_string(),
+                line: sample_field.to_string(),
             }
-        };
+        })?;
 
         // Fast path: hardcoded diploid reference (most common case)
         if ploidy == 2 {
