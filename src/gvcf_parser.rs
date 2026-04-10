@@ -577,19 +577,15 @@ impl<B: BufRead> VarIterator<B> {
             match self.reader.read_line(&mut self.line) {
                 Ok(0) => break, // EOF
                 Ok(_) => {
-                    match Variant::from_line(
+                    let record = Variant::from_line(
                         &self.line,
                         &mut self.gt_format_cache,
                         n_samples,
                         self.ploidy,
                         &self.common_gt_patterns,
-                    ) {
-                        Ok(record) => {
-                            self.vars_buffer.push_back(record);
-                            n_items_added += 1;
-                        }
-                        Err(err) => return Err(err),
-                    }
+                    )?;
+                    self.vars_buffer.push_back(record);
+                    n_items_added += 1;
                 }
                 Err(err) => {
                     return Err(VcfParseError::from(err));
