@@ -315,15 +315,16 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         mut group_end: u32,
     ) -> VcfResult<CollectedOverlaps> {
         let mut variants: Vec<Variant> = Vec::new();
-        let mut source_indices: Vec<usize> = Vec::new();
+        let mut var_iter_source_idxs: Vec<usize> = Vec::new();
 
         loop {
             let mut added_any = false;
 
-            for i in 0..self.vcf_iters.len() {
+            for var_iter_idx in 0..self.vcf_iters.len() {
+                // now add all variants for this var_iter that overlap with with current group span
                 loop {
                     let peek_pos = {
-                        let Some(r) = self.vcf_iters[i].peek_variant()? else {
+                        let Some(r) = self.vcf_iters[var_iter_idx].peek_variant()? else {
                             break;
                         };
 
@@ -346,14 +347,13 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                         break;
                     }
 
-                    let record =
-                        self.vcf_iters[i]
-                            .next()
-                            .ok_or_else(|| VcfParseError::RuntimeError {
-                                message:
-                                    "Iterator ended unexpectedly while consuming overlapping record"
-                                        .to_string(),
-                            })??;
+                    let record = self.vcf_iters[var_iter_idx].next().ok_or_else(|| {
+                        VcfParseError::RuntimeError {
+                            message:
+                                "Iterator ended unexpectedly while consuming overlapping record"
+                                    .to_string(),
+                        }
+                    })??;
 
                     let new_end = record.get_var_end()?;
                     if new_end > group_end {
@@ -361,7 +361,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                     }
 
                     variants.push(record);
-                    source_indices.push(i);
+                    var_iter_source_idxs.push(var_iter_idx);
                     added_any = true;
                 }
             }
@@ -373,7 +373,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
 
         Ok(CollectedOverlaps {
             variants,
-            source_indices,
+            source_indices: var_iter_source_idxs,
             group_end,
         })
     }
