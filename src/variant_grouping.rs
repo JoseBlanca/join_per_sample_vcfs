@@ -22,6 +22,20 @@ enum PeekResult {
     Error(VcfParseError),
 }
 
+/// Seed for a new variant group: chromosome, start position, and initial end.
+struct SpanSeed {
+    chrom: String,
+    start: u32,
+    end: u32,
+}
+
+/// Collected overlapping variants for a group being built.
+struct CollectedOverlaps {
+    variants: Vec<Variant>,
+    source_indices: Vec<usize>,
+    group_end: u32,
+}
+
 /// Metadata about a `VariantIterator`
 #[derive(Debug, Clone)]
 pub struct VariantIteratorInfo {
@@ -59,14 +73,21 @@ fn ref_span_end(record: &Variant) -> u32 {
 }
 
 /// Validates that a record respects chromosome and position ordering constraints.
+///
+/// A chromosome is considered "already processed" if it appears in
+/// `sorted_chromosomes` at an index before `current_chrom_idx`.
 fn validate_record_order(
     record: &Variant,
     current_chrom: &str,
-    chroms_seen: &HashSet<String>,
+    sorted_chromosomes: &[String],
+    current_chrom_idx: usize,
     last_group_start: Option<u32>,
 ) -> Result<(), VcfParseError> {
     if record.chrom != current_chrom {
-        if chroms_seen.contains(&record.chrom) {
+        let already_processed = sorted_chromosomes[..current_chrom_idx]
+            .iter()
+            .any(|c| c == &record.chrom);
+        if already_processed {
             return Err(VcfParseError::RuntimeError {
                 message: format!(
                     "Out-of-order chromosome '{}' at position {}: chromosome already processed",
@@ -102,7 +123,6 @@ pub struct VariantGroupIterator<B: BufRead> {
     iter_info: Vec<VariantIteratorInfo>,
     sorted_chromosomes: Vec<String>,
     current_chrom_idx: usize,
-    chroms_seen: HashSet<String>,
     last_group_start: Option<u32>,
     done: bool,
 }
@@ -137,7 +157,6 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
             iter_info,
             sorted_chromosomes,
             current_chrom_idx: 0,
-            chroms_seen: HashSet::new(),
             last_group_start: None,
             done: false,
         })
@@ -152,12 +171,21 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
         Some(Err(error))
     }
 
-    /// Phase A: find the next chromosome span seed:
-    /// (chromosome, earliest start, current end).
+    /// Advances to the next chromosome, resetting position tracking.
+    fn advance_chromosome(&mut self) {
+        self.current_chrom_idx += 1;
+        self.last_group_start = None;
+    }
+
+    /// Phase A: find the next chromosome span seed.
     ///
     /// The parallel scan peeks all iterators concurrently using rayon,
     /// then reduces the results on the main thread.
-    fn compute_next_span_seed(&mut self) -> VcfResult<Option<(String, u32, u32)>> {
+    ///
+    /// This method only peeks iterators — it does not consume the seed
+    /// records. The caller must pass the seed to `group_overlapping_vars`,
+    /// which consumes them as part of its overlap loop.
+    fn compute_next_span_seed(&mut self) -> VcfResult<Option<SpanSeed>> {
         loop {
             if self.current_chrom_idx >= self.sorted_chromosomes.len() {
                 self.done = true;
@@ -165,7 +193,8 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
             }
 
             let chrom = &self.sorted_chromosomes[self.current_chrom_idx];
-            let chroms_seen = &self.chroms_seen;
+            let sorted_chromosomes = &self.sorted_chromosomes;
+            let current_chrom_idx = self.current_chrom_idx;
             let last_group_start = self.last_group_start;
 
             // Parallel peek: each iterator is peeked on a rayon thread.
@@ -179,8 +208,13 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
                         Err(e) => return PeekResult::Error(e),
                     };
 
-                    if let Err(e) = validate_record_order(r, chrom, chroms_seen, last_group_start)
-                    {
+                    if let Err(e) = validate_record_order(
+                        r,
+                        chrom,
+                        sorted_chromosomes,
+                        current_chrom_idx,
+                        last_group_start,
+                    ) {
                         return PeekResult::Error(e);
                     }
 
@@ -265,12 +299,14 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
                         self.last_group_start = Some(pos);
                         continue;
                     }
-                    return Ok(Some((chrom.clone(), pos, earliest_end)));
+                    return Ok(Some(SpanSeed {
+                        chrom: chrom.clone(),
+                        start: pos,
+                        end: earliest_end,
+                    }));
                 }
                 None => {
-                    self.chroms_seen.insert(chrom.clone());
-                    self.current_chrom_idx += 1;
-                    self.last_group_start = None;
+                    self.advance_chromosome();
                 }
             }
         }
@@ -281,8 +317,8 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
         &mut self,
         current_chrom: &str,
         mut group_end: u32,
-    ) -> VcfResult<(Vec<Variant>, Vec<usize>, u32)> {
-        let mut records: Vec<Variant> = Vec::new();
+    ) -> VcfResult<CollectedOverlaps> {
+        let mut variants: Vec<Variant> = Vec::new();
         let mut source_indices: Vec<usize> = Vec::new();
 
         loop {
@@ -298,7 +334,8 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
                         validate_record_order(
                             r,
                             current_chrom,
-                            &self.chroms_seen,
+                            &self.sorted_chromosomes,
+                            self.current_chrom_idx,
                             self.last_group_start,
                         )?;
 
@@ -327,7 +364,7 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
                         group_end = new_end;
                     }
 
-                    records.push(record);
+                    variants.push(record);
                     source_indices.push(i);
                     added_any = true;
                 }
@@ -338,14 +375,19 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
             }
         }
 
-        Ok((records, source_indices, group_end))
+        Ok(CollectedOverlaps {
+            variants,
+            source_indices,
+            group_end,
+        })
     }
 
     fn chromosome_has_remaining_variants(&mut self, current_chrom: &str) -> VcfResult<bool> {
-        for i in 0..self.vcf_iters.len() {
-            match self.vcf_iters[i].peek_variant()? {
-                Some(r) if r.chrom == current_chrom => return Ok(true),
-                _ => {}
+        for iter in &mut self.vcf_iters {
+            if let Some(r) = iter.peek_variant()? {
+                if r.chrom == current_chrom {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -356,37 +398,34 @@ impl<B: BufRead + Send> VariantGroupIterator<B> {
             return None;
         }
 
-        let (current_chrom, group_start, group_end) = match self.compute_next_span_seed() {
+        let seed = match self.compute_next_span_seed() {
             Ok(Some(v)) => v,
             Ok(None) => return None,
             Err(e) => return self.fail(e),
         };
 
-        let (overlapping_vars, source_indices, group_end) =
-            match self.group_overlapping_vars(&current_chrom, group_end) {
-                Ok(v) => v,
-                Err(e) => return self.fail(e),
-            };
+        let overlaps = match self.group_overlapping_vars(&seed.chrom, seed.end) {
+            Ok(v) => v,
+            Err(e) => return self.fail(e),
+        };
 
-        self.last_group_start = Some(group_start);
+        self.last_group_start = Some(seed.start);
 
-        let any_remaining = match self.chromosome_has_remaining_variants(&current_chrom) {
+        let any_remaining = match self.chromosome_has_remaining_variants(&seed.chrom) {
             Ok(v) => v,
             Err(e) => return self.fail(e),
         };
 
         if !any_remaining {
-            self.chroms_seen.insert(current_chrom.clone());
-            self.current_chrom_idx += 1;
-            self.last_group_start = None;
+            self.advance_chromosome();
         }
 
         Some(Ok(OverlappingVariantGroup {
-            chrom: current_chrom,
-            start: group_start,
-            end: group_end,
-            variants: overlapping_vars,
-            source_var_iter_idxs: source_indices,
+            chrom: seed.chrom,
+            start: seed.start,
+            end: overlaps.group_end,
+            variants: overlaps.variants,
+            source_var_iter_idxs: overlaps.source_indices,
         }))
     }
 }
