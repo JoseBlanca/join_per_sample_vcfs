@@ -304,6 +304,38 @@ fn parse_genotypes(
 }
 
 impl Variant {
+    /// Returns the end position of the variant's span (1-based, inclusive).
+    pub fn get_var_end(&self) -> VcfResult<u32> {
+        let ref_allele = self.alleles.first().ok_or_else(|| VcfParseError::RuntimeError {
+            message: format!(
+                "Variant at {}:{} has no alleles",
+                self.chrom, self.pos
+            ),
+        })?;
+        let ref_len: u32 = ref_allele.len().try_into().map_err(|_| VcfParseError::RuntimeError {
+            message: format!(
+                "Reference allele length overflow at {}:{}",
+                self.chrom, self.pos
+            ),
+        })?;
+        if ref_len == 0 {
+            return Err(VcfParseError::RuntimeError {
+                message: format!(
+                    "Empty reference allele at {}:{}",
+                    self.chrom, self.pos
+                ),
+            });
+        }
+        self.pos
+            .checked_add(ref_len - 1)
+            .ok_or_else(|| VcfParseError::RuntimeError {
+                message: format!(
+                    "Position overflow computing variant end at {}:{}",
+                    self.chrom, self.pos
+                ),
+            })
+    }
+
     /// Creates a new Variant with the given fields.
     /// Sets gt_format_fields and sample_gt_fields to empty (no lazy field access).
     pub fn new(

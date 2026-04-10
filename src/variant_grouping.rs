@@ -66,12 +66,6 @@ impl OverlappingVarGroup {
     }
 }
 
-/// Computes the reference-allele span end for a variant (1-based, inclusive).
-#[inline]
-fn get_var_end(record: &Variant) -> u32 {
-    record.pos + record.alleles[0].len() as u32 - 1
-}
-
 /// Validates that a record respects chromosome and position ordering constraints.
 ///
 /// A chromosome is considered "already processed" if it appears in
@@ -219,10 +213,13 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                         return PeekResult::DifferentChrom;
                     }
 
-                    PeekResult::OnCurrentChrom {
-                        pos: var.pos,
-                        span_end: get_var_end(var),
-                        is_variable: var.alleles.len() > 1,
+                    match var.get_var_end() {
+                        Ok(span_end) => PeekResult::OnCurrentChrom {
+                            pos: var.pos,
+                            span_end,
+                            is_variable: var.alleles.len() > 1,
+                        },
+                        Err(e) => PeekResult::Error(e),
                     }
                 })
                 .collect();
@@ -356,7 +353,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                                         .to_string(),
                             })??;
 
-                    let new_end = get_var_end(&record);
+                    let new_end = record.get_var_end()?;
                     if new_end > group_end {
                         group_end = new_end;
                     }
