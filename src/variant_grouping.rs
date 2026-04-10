@@ -29,13 +29,6 @@ struct ChromSpan {
     end: u32,
 }
 
-/// Collected overlapping variants for a group being built.
-struct CollectedOverlaps {
-    variants: Vec<Variant>,
-    source_indices: Vec<usize>,
-    group_end: u32,
-}
-
 /// Metadata about a `VariantIterator`
 #[derive(Debug, Clone)]
 pub struct VarIteratorInfo {
@@ -308,14 +301,16 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         }
     }
 
-    /// Phase B: consume all records overlapping the current bin span.
+    /// Phase B: consume all records overlapping the current bin span
+    /// and return the completed group.
     fn group_overlapping_vars(
         &mut self,
-        current_chrom: &str,
+        chrom: String,
+        start: u32,
         mut group_end: u32,
-    ) -> VcfResult<CollectedOverlaps> {
+    ) -> VcfResult<OverlappingVarGroup> {
         let mut variants: Vec<Variant> = Vec::new();
-        let mut var_iter_source_idxs: Vec<usize> = Vec::new();
+        let mut source_var_iter_idxs: Vec<usize> = Vec::new();
 
         loop {
             let mut added_any = false;
@@ -330,13 +325,13 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
 
                         validate_var_order(
                             r,
-                            current_chrom,
+                            &chrom,
                             &self.sorted_chromosomes,
                             self.current_chrom_idx,
                             self.last_group_start,
                         )?;
 
-                        if r.chrom != current_chrom {
+                        if r.chrom != chrom {
                             break;
                         }
 
@@ -358,7 +353,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                     }
 
                     variants.push(record);
-                    var_iter_source_idxs.push(var_iter_idx);
+                    source_var_iter_idxs.push(var_iter_idx);
                     added_any = true;
                 }
             }
@@ -368,10 +363,12 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             }
         }
 
-        Ok(CollectedOverlaps {
+        Ok(OverlappingVarGroup {
+            chrom,
+            start,
+            end: group_end,
             variants,
-            source_indices: var_iter_source_idxs,
-            group_end,
+            source_var_iter_idxs,
         })
     }
 
@@ -397,15 +394,18 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             Err(e) => return self.fail(e),
         };
 
-        let overlaps =
-            match self.group_overlapping_vars(&group_span_seed.chrom, group_span_seed.end) {
-                Ok(v) => v,
-                Err(e) => return self.fail(e),
-            };
+        let group = match self.group_overlapping_vars(
+            group_span_seed.chrom,
+            group_span_seed.start,
+            group_span_seed.end,
+        ) {
+            Ok(v) => v,
+            Err(e) => return self.fail(e),
+        };
 
-        self.last_group_start = Some(group_span_seed.start);
+        self.last_group_start = Some(group.start);
 
-        let any_remaining = match self.chromosome_has_remaining_variants(&group_span_seed.chrom) {
+        let any_remaining = match self.chromosome_has_remaining_variants(&group.chrom) {
             Ok(v) => v,
             Err(e) => return self.fail(e),
         };
@@ -414,13 +414,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             self.advance_chromosome();
         }
 
-        Some(Ok(OverlappingVarGroup {
-            chrom: group_span_seed.chrom,
-            start: group_span_seed.start,
-            end: overlaps.group_end,
-            variants: overlaps.variants,
-            source_var_iter_idxs: overlaps.source_indices,
-        }))
+        Some(Ok(group))
     }
 }
 
