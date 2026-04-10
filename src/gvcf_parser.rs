@@ -354,7 +354,7 @@ impl Variant {
 
     fn from_line(
         line: &str,
-        format_cache: &mut LruCache<String, (usize, Vec<String>), RandomState>,
+        gt_format_cache: &mut LruCache<String, (usize, Vec<String>), RandomState>,
         n_samples: usize,
         ploidy: u8,
         patterns: &CommonGenotypePatterns,
@@ -412,11 +412,11 @@ impl Variant {
 
         // Check LRU cache first
         let (gt_index, gt_format_fields) =
-            if let Some((gt_idx, fields)) = format_cache.get(gt_format_str) {
+            if let Some((gt_idx, fields)) = gt_format_cache.get(gt_format_str) {
                 (*gt_idx, fields.clone())
             } else {
                 let (gt_idx, fields) = parse_format_field(gt_format_str)?;
-                format_cache.put(gt_format_str.to_string(), (gt_idx, fields.clone()));
+                gt_format_cache.put(gt_format_str.to_string(), (gt_idx, fields.clone()));
                 (gt_idx, fields)
             };
 
