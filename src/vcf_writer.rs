@@ -96,7 +96,7 @@ impl VcfWriter {
         for sample_idx in 0..variant.n_samples {
             let gt_start = sample_idx * self.ploidy;
             let gt = &variant.genotypes[gt_start..gt_start + self.ploidy];
-            let phase_sep = if variant.phase[sample_idx] { "|" } else { "/" };
+            let phase_sep = if variant.phases[sample_idx] { "|" } else { "/" };
 
             self.write_all(b"\t")?;
             for (i, &a) in gt.iter().enumerate() {
@@ -157,7 +157,7 @@ mod tests {
         pos: u32,
         alleles: &[&str],
         genotypes: Vec<i8>,
-        phase: Vec<bool>,
+        phases: Vec<bool>,
         n_samples: usize,
     ) -> Variant {
         Variant {
@@ -166,7 +166,7 @@ mod tests {
             alleles: alleles.iter().map(|s| s.to_string()).collect(),
             qual: f32::NAN,
             genotypes,
-            phase,
+            phases,
             gt_format_fields: Vec::new(),
             sample_gt_fields: Vec::new(),
             n_samples,

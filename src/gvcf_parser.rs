@@ -136,7 +136,7 @@ pub struct Variant {
     /// Missing genotypes are represented as `-1`
     pub genotypes: Vec<i8>,
     /// Phase information for each sample: `true` = phased (`|`), `false` = unphased (`/`)
-    pub phase: Vec<bool>,
+    pub phases: Vec<bool>,
     /// FORMAT field names from the VCF line (e.g., `["GT", "PL", "DP", "GQ"]`).
     /// Empty for programmatically constructed variants.
     pub gt_format_fields: Vec<String>,
@@ -230,7 +230,7 @@ fn parse_genotypes(
 
     // Zero-fill the genotypes buffer, most alleles are reference alleles
     let mut genotypes: Vec<i8> = vec![0; total_num_alleles];
-    let mut phase: Vec<bool> = vec![false; n_samples];
+    let mut phases: Vec<bool> = vec![false; n_samples];
 
     // Parse each sample
     for (sample_idx, sample_field) in sample_fields.split('\t').enumerate() {
@@ -251,7 +251,7 @@ fn parse_genotypes(
                 for i in 0..ploidy as usize {
                     genotypes[start + i] = MISSING_ALLELE;
                 }
-                phase[sample_idx] = false;
+                phases[sample_idx] = false;
                 continue;
             }
         };
@@ -261,7 +261,7 @@ fn parse_genotypes(
             if gt_str == "0/0" {
                 continue;
             } else if gt_str == "0|0" {
-                phase[sample_idx] = true;
+                phases[sample_idx] = true;
                 continue;
             } else if gt_str == "./." {
                 let start = sample_idx * ploidy as usize;
@@ -274,21 +274,21 @@ fn parse_genotypes(
             if gt_str == patterns.ref_unphased {
                 continue;
             } else if gt_str == patterns.ref_phased {
-                phase[sample_idx] = true;
+                phases[sample_idx] = true;
                 continue;
             } else if gt_str == patterns.missing_unphased {
                 let start = sample_idx * ploidy as usize;
                 for i in 0..ploidy as usize {
                     genotypes[start + i] = MISSING_ALLELE;
                 }
-                phase[sample_idx] = false;
+                phases[sample_idx] = false;
                 continue;
             } else if gt_str == patterns.missing_phased {
                 let start = sample_idx * ploidy as usize;
                 for i in 0..ploidy as usize {
                     genotypes[start + i] = MISSING_ALLELE;
                 }
-                phase[sample_idx] = true;
+                phases[sample_idx] = true;
                 continue;
             }
         }
@@ -298,7 +298,7 @@ fn parse_genotypes(
             for i in 0..ploidy as usize {
                 genotypes[start + i] = MISSING_ALLELE;
             }
-            phase[sample_idx] = false;
+            phases[sample_idx] = false;
             continue;
         }
 
@@ -322,10 +322,10 @@ fn parse_genotypes(
         for (i, &allele) in alleles.iter().enumerate() {
             genotypes[start + i] = allele;
         }
-        phase[sample_idx] = phased;
+        phases[sample_idx] = phased;
     }
 
-    Ok((genotypes, phase))
+    Ok((genotypes, phases))
 }
 
 impl Variant {
@@ -336,7 +336,7 @@ impl Variant {
         pos: u32,
         alleles: Vec<String>,
         genotypes: Vec<i8>,
-        phase: Vec<bool>,
+        phases: Vec<bool>,
         n_samples: usize,
     ) -> Self {
         Variant {
@@ -345,7 +345,7 @@ impl Variant {
             alleles,
             qual: f32::NAN,
             genotypes,
-            phase,
+            phases,
             gt_format_fields: Vec::new(),
             sample_gt_fields: Vec::new(),
             n_samples,
@@ -421,7 +421,7 @@ impl Variant {
             };
 
         // Parse genotypes for all samples
-        let (genotypes, phase) =
+        let (genotypes, phases) =
             parse_genotypes(sample_fields, n_samples, gt_index, ploidy, patterns)?;
 
         // Store raw sample fields for lazy access to other FORMAT fields
@@ -437,7 +437,7 @@ impl Variant {
             alleles,
             qual,
             genotypes,
-            phase,
+            phases,
             gt_format_fields,
             sample_gt_fields,
             n_samples,

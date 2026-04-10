@@ -61,7 +61,7 @@ fn create_variant_for_region(
             let sample_idx = sample_offsets[var_iter_idx] + sample_idx_in_var_iter;
             let gt_start = sample_idx_in_var_iter * ploidy;
             let sample_gt = &variant.genotypes[gt_start..gt_start + ploidy];
-            let sample_phase_input = variant.phase[sample_idx_in_var_iter];
+            let sample_phase_input = variant.phases[sample_idx_in_var_iter];
 
             let is_first = alleles_for_samples[sample_idx].is_none();
             if is_first {
@@ -233,7 +233,7 @@ fn create_variant_for_region(
         alleles: alleles_vec,
         qual: f32::NAN,
         genotypes,
-        phase: phases,
+        phases,
         gt_format_fields: Vec::new(),
         sample_gt_fields: Vec::new(),
         n_samples: total_samples,

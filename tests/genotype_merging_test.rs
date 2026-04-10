@@ -253,7 +253,7 @@ fn check_result(
         assert_eq!(actual, *exp_gt, "Sample {} genotype mismatch", si);
     }
 
-    assert_eq!(variant.phase, expected_phases);
+    assert_eq!(variant.phases, expected_phases);
 }
 
 // ============================================================================
@@ -709,7 +709,7 @@ fn test_phase_broken_between_hets_missing_genotype() {
     let ploidy = variant.genotypes.len() / variant.n_samples;
     let gt = &variant.genotypes[0..ploidy];
     assert_eq!(gt, &[-1, -1]);
-    assert_eq!(variant.phase, &[false]);
+    assert_eq!(variant.phases, &[false]);
 }
 
 #[test]
@@ -767,7 +767,7 @@ fn test_phase_broken_in_one_sample() {
     let gt_s2 = &variant.genotypes[ploidy..2 * ploidy];
     assert_eq!(gt_s2, &[0, 1]);
 
-    let phases = &variant.phase[0..2];
+    let phases = &variant.phases[0..2];
     assert_eq!(phases, &[false, true]);
 }
 
@@ -911,7 +911,7 @@ fn test_phase_lost_in_het2() {
     let ploidy = variant.genotypes.len() / variant.n_samples;
     let gt = &variant.genotypes[0..ploidy];
     assert_eq!(gt, &[-1, -1]);
-    assert_eq!(variant.phase, &[false]);
+    assert_eq!(variant.phases, &[false]);
 }
 
 #[test]
