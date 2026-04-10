@@ -187,7 +187,7 @@ fn test_bin_contains_expected_variants() {
     let deletion = &group.variants[6];
     assert_eq!(deletion.alleles[0], "GTATGG");
     assert_eq!(deletion.alleles[1], "G");
-    assert_eq!(deletion.ref_allele_len, 6);
+    assert_eq!(deletion.alleles[0].len(), 6);
 }
 
 #[test]

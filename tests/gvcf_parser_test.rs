@@ -138,22 +138,22 @@ fn test_ref_allele_len() {
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     // First variant: 20\t17330\t.\tT\tA,<NON_REF>\t.\tq10
-    assert_eq!(variants[1].ref_allele_len, 1);
+    assert_eq!(variants[1].alleles[0].len(), 1);
     assert_eq!(variants[1].alleles[0], "T");
     assert!(variants[1].qual.is_nan());
 
     // Second variant: 20\t17331\t.\tA\tG,T,<NON_REF>\t67\tPASS
-    assert_eq!(variants[2].ref_allele_len, 1);
+    assert_eq!(variants[2].alleles[0].len(), 1);
     assert_eq!(variants[2].alleles[0], "A");
     assert_eq!(variants[2].qual, 67.0);
 
     // Third variant: 20\t17333\t.\tGTC\tG,GTCT,<NON_REF>\t50
-    assert_eq!(variants[4].ref_allele_len, 3);
+    assert_eq!(variants[4].alleles[0].len(), 3);
     assert_eq!(variants[4].alleles[0], "GTC");
     assert_eq!(variants[4].qual, 50.0);
 
     // Fourth variant: 20\t17334\t.\tGTC\tG,GTCT,<NON_REF>\t50
-    assert_eq!(variants[5].ref_allele_len, 3);
+    assert_eq!(variants[5].alleles[0].len(), 3);
     assert_eq!(variants[5].alleles[0], "GTC");
     assert_eq!(variants[5].qual, 50.0);
 }

@@ -164,7 +164,6 @@ mod tests {
             chrom: chrom.to_string(),
             pos,
             alleles: alleles.iter().map(|s| s.to_string()).collect(),
-            ref_allele_len: alleles[0].len() as u8,
             qual: f32::NAN,
             genotypes,
             phase,

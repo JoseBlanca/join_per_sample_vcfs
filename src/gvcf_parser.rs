@@ -129,8 +129,6 @@ pub struct Variant {
     pub pos: u32,
     /// Alleles: first is reference, rest are alternate alleles
     pub alleles: Vec<String>,
-    /// Length of the reference allele in base pairs
-    pub ref_allele_len: u8,
     /// Variant quality score (QUAL field). `NaN` if missing.
     pub qual: f32,
     /// Genotypes for all samples, stored as a flat vector.
@@ -341,12 +339,10 @@ impl Variant {
         phase: Vec<bool>,
         n_samples: usize,
     ) -> Self {
-        let ref_allele_len = alleles.first().map_or(0, |a| a.len()) as u8;
         Variant {
             chrom,
             pos,
             alleles,
-            ref_allele_len,
             qual: f32::NAN,
             genotypes,
             phase,
@@ -397,8 +393,6 @@ impl Variant {
             line: line.to_string(),
         })?;
 
-        let ref_allele_len = ref_allele.len() as u8;
-
         let qual = if qual_str == "." {
             f32::NAN
         } else {
@@ -441,7 +435,6 @@ impl Variant {
             chrom: chrom.to_string(),
             pos,
             alleles,
-            ref_allele_len,
             qual,
             genotypes,
             phase,

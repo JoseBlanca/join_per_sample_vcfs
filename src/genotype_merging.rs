@@ -231,7 +231,6 @@ fn create_variant_for_region(
         chrom: var_group.chrom.clone(),
         pos: var_group.start,
         alleles: alleles_vec,
-        ref_allele_len: ref_allele.len() as u8,
         qual: f32::NAN,
         genotypes,
         phase: phases,

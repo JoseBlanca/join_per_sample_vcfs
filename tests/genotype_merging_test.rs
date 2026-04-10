@@ -212,7 +212,7 @@ fn make_group(variants: Vec<Variant>, source_idxs: Vec<usize>) -> OverlappingVar
     let start = variants.iter().map(|v| v.pos).min().unwrap();
     let end = variants
         .iter()
-        .map(|v| v.pos + v.ref_allele_len as u32 - 1)
+        .map(|v| v.pos + v.alleles[0].len() as u32 - 1)
         .max()
         .unwrap();
     OverlappingVariantGroup {

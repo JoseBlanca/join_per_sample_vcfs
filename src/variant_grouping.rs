@@ -55,7 +55,7 @@ impl OverlappingVariantGroup {
 /// Computes the reference-allele span end for a variant (1-based, inclusive).
 #[inline]
 fn ref_span_end(record: &Variant) -> u32 {
-    record.pos + record.ref_allele_len as u32 - 1
+    record.pos + record.alleles[0].len() as u32 - 1
 }
 
 /// Iterator that merges multiple per-sample VCF streams, grouping
