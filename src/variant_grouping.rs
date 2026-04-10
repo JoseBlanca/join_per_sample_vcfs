@@ -4,7 +4,7 @@ use std::io::BufRead;
 use rayon::prelude::*;
 
 use crate::errors::VcfParseError;
-use crate::gvcf_parser::{Variant, VarIterator, VcfResult};
+use crate::gvcf_parser::{VarIterator, Variant, VcfResult};
 
 /// Result of peeking a single iterator during the parallel scan.
 enum PeekResult {
@@ -133,10 +133,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
     /// # Arguments
     /// * `vcf_iters` - Per-sample VCF iterators to merge.
     /// * `sorted_chromosomes` - The expected chromosome processing order.
-    pub fn new(
-        vcf_iters: Vec<VarIterator<B>>,
-        sorted_chromosomes: Vec<String>,
-    ) -> VcfResult<Self> {
+    pub fn new(vcf_iters: Vec<VarIterator<B>>, sorted_chromosomes: Vec<String>) -> VcfResult<Self> {
         let mut seen_samples = HashSet::new();
         let mut iter_info = Vec::with_capacity(vcf_iters.len());
         for iter in &vcf_iters {
@@ -393,7 +390,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         Ok(false)
     }
 
-    fn get_next_variant_group(&mut self) -> Option<VcfResult<OverlappingVarGroup>> {
+    fn get_next_var_group(&mut self) -> Option<VcfResult<OverlappingVarGroup>> {
         if self.done {
             return None;
         }
@@ -434,7 +431,7 @@ impl<B: BufRead + Send> Iterator for VarGroupIterator<B> {
     type Item = VcfResult<OverlappingVarGroup>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.get_next_variant_group()
+        self.get_next_var_group()
     }
 }
 
