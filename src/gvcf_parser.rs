@@ -403,9 +403,10 @@ impl Variant {
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields)?;
 
-        let pos = pos
-            .parse::<u32>()
-            .map_err(|_| VcfParseError::GVCFLineNotEnoughFields)?;
+        let pos = pos.parse::<u32>().map_err(|_| VcfParseError::InvalidPosition {
+            value: pos.to_string(),
+            line: line.to_string(),
+        })?;
 
         let ref_allele_len = ref_allele.len() as u8;
 
@@ -414,7 +415,10 @@ impl Variant {
         } else {
             qual_str
                 .parse::<f32>()
-                .map_err(|_| VcfParseError::GVCFLineNotEnoughFields)?
+                .map_err(|_| VcfParseError::InvalidQuality {
+                    value: qual_str.to_string(),
+                    line: line.to_string(),
+                })?
         };
 
         let alleles: Vec<String> = std::iter::once(ref_allele)
