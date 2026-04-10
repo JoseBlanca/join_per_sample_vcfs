@@ -634,14 +634,14 @@ impl<B: BufRead> VarIterator<B> {
 impl<R: Read> VarIterator<BufReader<R>> {
     pub fn from_reader(reader: R) -> VcfResult<Self> {
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, reader);
-        Ok(VarIterator::new(buf_reader)?)
+        VarIterator::new(buf_reader)
     }
 }
 impl<R: Read> VarIterator<BufReader<MultiGzDecoder<R>>> {
     pub fn from_gzip_reader(reader: R) -> VcfResult<Self> {
         let gz_decoder = MultiGzDecoder::new(reader);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
-        Ok(VarIterator::new(buf_reader)?)
+        VarIterator::new(buf_reader)
     }
 }
 /// Validates that a file is gzipped and returns a `MultiGzDecoder` for it.
