@@ -702,11 +702,9 @@ impl<R: BufRead> Iterator for VarIterator<R> {
         }
 
         if let Some(variant) = self.vars_buffer.pop_front() {
-            return Some(Ok(variant));
+            Some(Ok(variant))
         } else {
-            return Some(Err(VcfParseError::RuntimeError {
-                message: "The buffer should contain something".to_string(),
-            }));
+            unreachable!("Buffer was just filled or the no more variants branch was dealt with")
         }
     }
 }
