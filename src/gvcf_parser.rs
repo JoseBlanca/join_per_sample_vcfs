@@ -342,7 +342,9 @@ impl Variant {
         let pos = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
-        fields.next(); // ID
+        let _id = fields
+            .next()
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
         let ref_allele = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
@@ -352,8 +354,12 @@ impl Variant {
         let qual_str = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
-        fields.next(); // FILTER
-        fields.next(); // INFO
+        let _filter = fields
+            .next()
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+        let _info = fields
+            .next()
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
         let gt_format_str = fields
             .next()
             .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
