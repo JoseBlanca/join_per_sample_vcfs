@@ -176,7 +176,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
     /// This method only peeks iterators — it does not consume the seed
     /// records. The caller must pass the seed to `group_overlapping_vars`,
     /// which consumes them as part of its overlap loop.
-    fn compute_next_span_seed(&mut self) -> VcfResult<Option<ChromSpan>> {
+    fn compute_next_span_seed_and_skip_non_variable(&mut self) -> VcfResult<Option<ChromSpan>> {
         loop {
             if self.current_chrom_idx >= self.sorted_chromosomes.len() {
                 self.done = true;
@@ -238,6 +238,8 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
 
             let mut earliest_pos: Option<u32> = None;
             let mut earliest_end: u32 = 0;
+            // we are skipping groups that are completely not variable in order to avoid further processing them
+            // this is an optimization for performance. In most cases most genomic position won't be variable
             let mut skip_group = true;
 
             for result in &peek_results {
@@ -392,7 +394,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             return None;
         }
 
-        let group_span_seed = match self.compute_next_span_seed() {
+        let group_span_seed = match self.compute_next_span_seed_and_skip_non_variable() {
             Ok(Some(g_span_seed)) => g_span_seed,
             Ok(None) => return None,
             Err(e) => return self.fail(e),
