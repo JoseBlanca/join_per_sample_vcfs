@@ -651,59 +651,46 @@ impl<R: Read> VarIterator<BufReader<MultiGzDecoder<R>>> {
         Ok(VarIterator::new(buf_reader)?)
     }
 }
+/// Validates that a file is gzipped and returns a `MultiGzDecoder` for it.
+fn open_gzip_file<P: AsRef<Path>>(path: P) -> VcfResult<MultiGzDecoder<File>> {
+    if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
+        path: path.as_ref().to_string_lossy().to_string(),
+        reason: e.to_string(),
+    })? {
+        return Err(VcfParseError::VCFFileShouldBeGzipped {
+            path: path.as_ref().to_string_lossy().to_string(),
+        });
+    }
+    let file = File::open(&path)?;
+    Ok(MultiGzDecoder::new(file))
+}
+
 impl VarIterator<BufReader<MultiGzDecoder<File>>> {
     pub fn from_gzip_path<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
-        if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
-            path: path.as_ref().to_string_lossy().to_string(),
-            reason: e.to_string(),
-        })? {
-            return Err(VcfParseError::VCFFileShouldBeGzipped {
-                path: path.as_ref().to_string_lossy().to_string(),
-            });
-        }
-        let file = File::open(&path)?;
-        let gz_decoder = MultiGzDecoder::new(file);
-        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
-        Ok(VarIterator::new(buf_reader)?)
+        let decoder = open_gzip_file(path)?;
+        let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, decoder);
+        VarIterator::new(buf_reader)
     }
 }
 impl VarIterator<BufReader<ThreadedReader>> {
     pub fn from_gzip_path_threaded<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
-        if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
-            path: path.as_ref().to_string_lossy().to_string(),
-            reason: e.to_string(),
-        })? {
-            return Err(VcfParseError::VCFFileShouldBeGzipped {
-                path: path.as_ref().to_string_lossy().to_string(),
-            });
-        }
-        let file = File::open(&path)?;
-        let gz_decoder = MultiGzDecoder::new(file);
-        let threaded = ThreadedReader::new(gz_decoder);
+        let decoder = open_gzip_file(path)?;
+        let threaded = ThreadedReader::new(decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, threaded);
-        Ok(VarIterator::new(buf_reader)?)
+        VarIterator::new(buf_reader)
     }
 }
 impl VarIterator<BufReader<PooledReader>> {
-    /// Create a `VariantIterator` that uses a shared `DecompressionPool` for
+    /// Create a `VarIterator` that uses a shared `DecompressionPool` for
     /// gzip decompression, instead of spawning a dedicated thread per file.
     pub fn from_gzip_path_pooled<P: AsRef<Path>>(
         path: P,
         pool: &DecompressionPool,
     ) -> VcfResult<Self> {
-        if !file_is_gzipped(&path).map_err(|e| VcfParseError::MagicByteError {
-            path: path.as_ref().to_string_lossy().to_string(),
-            reason: e.to_string(),
-        })? {
-            return Err(VcfParseError::VCFFileShouldBeGzipped {
-                path: path.as_ref().to_string_lossy().to_string(),
-            });
-        }
-        let file = File::open(&path)?;
-        let gz_decoder = MultiGzDecoder::new(file);
-        let pooled = pool.register(gz_decoder);
+        let decoder = open_gzip_file(path)?;
+        let pooled = pool.register(decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, pooled);
-        Ok(VarIterator::new(buf_reader)?)
+        VarIterator::new(buf_reader)
     }
 }
 
