@@ -316,7 +316,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             let mut added_any = false;
 
             for var_iter_idx in 0..self.vcf_iters.len() {
-                // now add all variants for this var_iter that overlap with with current group span
+                // now add all variants for this var_iter that overlap with the current group span
                 loop {
                     let peek_pos = {
                         let Some(r) = self.vcf_iters[var_iter_idx].peek_variant()? else {
