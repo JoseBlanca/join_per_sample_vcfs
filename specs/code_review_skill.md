@@ -243,3 +243,126 @@ Use this to invoke the skill consistently. Fill in the Context block; the rest d
 > 4. Names are precise, domain-relevant, verb-based for functions.
 > 5. Defaults are visible at the call site, in docs, and at runtime.
 > 6. Code smells get concrete refactors, not vague complaints.
+
+---
+
+## Saving Code Review Reports
+
+### Directory Structure
+
+All code review reports are saved to the `reviews/` directory at the crate root:
+```
+project-root/
+├── src/
+├── tests/
+├── reviews/
+│   ├── gvcf_parser_2026-04-13.md
+│   ├── genotype_merging_2026-04-13.md
+│   └── ...
+├── Cargo.toml
+└── ...
+```
+
+### File Naming Convention
+
+Save each review report as:
+```
+reviews/<module_or_filename>_<YYYY-MM-DD>.md
+```
+
+Examples:
+- `reviews/gvcf_parser_2026-04-13.md` — review of `src/gvcf_parser.rs` and its test file
+- `reviews/genotype_merging_2026-04-13.md` — review of `src/genotype_merging.rs`
+- `reviews/lib_changes_2026-04-13.md` — review of multiple files or a PR diff
+
+If multiple reviews are created on the same date, append a version suffix:
+- `reviews/gvcf_parser_2026-04-13_v1.md`
+- `reviews/gvcf_parser_2026-04-13_v2.md`
+
+### Report Format
+
+Each review report is a Markdown file structured exactly as follows (use section headings verbatim):
+
+#### 1. **Document Header**
+```markdown
+# Code Review: <module-or-file-name>
+**Date:** <YYYY-MM-DD>  
+**Reviewer:** <name or "GitHub Copilot">  
+**Module:** <module-name>  
+**Status:** <Approve / Approve-with-changes / Request-changes>
+
+---
+```
+
+#### 2. **Sections (in order, use headings verbatim)**
+1. **Scope** — describe what was reviewed
+2. **Verdict** — one-line summary of approval status
+3. **Execution Status** — table of commands run and results
+4. **Open Questions & Assumptions** — numbered list (or "none")
+5. **Top 3 Priorities** — list of highest-impact fixes
+6. **Findings** — grouped by severity (Blocker → Major → Minor → Nits)
+7. **Out of Scope Observations** — pre-existing issues not in scope
+8. **Missing Tests to Add Now** — test code or specs
+9. **What's Good** — transferable patterns worth keeping
+10. **Commands to Re-verify** — instructions for follow-up verification
+11. **Author Response Template** (optional) — response format for the author
+
+#### 3. **Findings Template (for each finding)**
+
+Each finding uses this format:
+
+```markdown
+#### <SEVERITY_CODE>: [file.rs](../path/file.rs#L123–L456) — Short title
+
+- **Confidence:** High / Medium / Low
+- **Assumptions:** None. / Listed here.
+- **Problem:**  
+  [2–4 sentences describing the defect, with code snippets if needed.]
+
+- **Why it matters:**  
+  [1–2 sentences explaining impact: data loss, performance, correctness, maintainability.]
+
+- **Suggested fix:**  
+  [Concrete code diff, full replacement function, or numbered refactor steps.]
+  
+  ```rust
+  // example code
+  ```
+```
+
+#### 4. **Severity Codes**
+Use prefixes in findings:
+- `B` for Blocker (e.g., B1, B2, B3)
+- `M` for Major (e.g., M1, M2)
+- `Mi` for Minor (e.g., Mi1, Mi2)
+- Group Nits under a single "Nits" section without enumeration
+
+#### 5. **File Links**
+All file references use relative Markdown links with line numbers:
+- Link to line: `[file.rs](../path/file.rs#L123)`
+- Link to range: `[file.rs](../path/file.rs#L123–L456)`
+- Display text should be the path or a brief description, but not backticks
+
+### Commands Before Saving
+
+Before writing the review report, the reviewer must run (where applicable):
+
+1. `cargo fmt --check` — format check
+2. `cargo clippy --all-targets --all-features -- -D warnings` — lint check
+3. `cargo test --all-targets --all-features` — test execution
+4. `cargo doc --no-deps` — documentation build (optional for libs)
+5. `cargo audit` — security audit (optional)
+
+Quote output **verbatim**. If a command cannot be run, list it under **Execution Status** as "not run" with reason.
+
+### Review Checklist Before Saving
+
+- [ ] All findings reference specific line numbers with `file.rs#Lxxx` links
+- [ ] Each Blocker finding has High confidence
+- [ ] Each Major/Minor finding has a concrete fix (code, test, or specific question)
+- [ ] Test recommendations include test names matching `test_behavior_on_condition` pattern
+- [ ] "What's Good" section has 3–5 specific, transferable patterns (not vague praise)
+- [ ] File paths are relative to project root (e.g., `src/file.rs`, not `/home/...`)
+- [ ] Severity codes (B1, M1, etc.) are used consistently
+- [ ] Open questions are numbered and linked from findings
+- [ ] Author response template provided (if review blocks merge)
