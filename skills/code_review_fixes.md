@@ -11,7 +11,7 @@ This skill is downstream of the code-review workflow. Its job is not to perform 
 
 A review report is evidence and guidance, not an executable patch.
 
-### What this skill does
+## What this skill does
 
 - reads a completed review report
 - extracts and tracks every finding in that report
@@ -79,8 +79,7 @@ Every run of this skill must produce the following outputs:
 
 1. **Modified source files**, if one or more findings are applied.
 2. **Modified or added tests**, when needed to reproduce, verify, or guard the fix.
-3. **A fix-application report**, written in the designated `reviews/` directory.
-4. **A user-facing summary** stating what was applied, what required clarification, what was deferred or disputed, what failed validation, and what commands were run.
+3. **A fix-application report**, written in the designated `reviews/` directory. This report, and in particular its Executive Summary section, is the authoritative output to the user. At the end of the run, tell the user where the report was written and list any unresolved high-priority findings that require attention.
 
 ### Mandatory reporting rule
 
@@ -119,7 +118,7 @@ The purpose of preflight is to determine whether the review can be acted on safe
 5. Identify every finding ID and extract its metadata.
 6. Locate the referenced files and inspect the cited code or its current equivalent.
 7. Check whether the current code still matches the report closely enough to proceed.
-8. Build the initial finding ledger before editing any code.
+8. Complete the initial findings table in the report before editing any code.
 
 Do not modify source files before this preflight is complete.
 
@@ -168,7 +167,7 @@ In that case, still produce the fix-application report and record why the run co
 
 ### Preflight output
 
-The output of preflight is an initial ledger containing every finding from the review, each with:
+The output of preflight is the initial state of the report's findings table, with every finding from the review recorded and each assigned:
 
 - extracted metadata
 - current context status
@@ -179,7 +178,7 @@ The output of preflight is an initial ledger containing every finding from the r
   - `Dispute`
   - `Already fixed`
 
-This ledger must exist before any code edits begin.
+This initial state must be written to the report before any code edits begin.
 
 ## Decision model: Apply / Ask / Defer / Dispute / Already fixed
 
@@ -261,6 +260,42 @@ This still requires verification. Do not mark a finding already fixed just becau
 - A lower-severity finding may be applied if it is necessary to complete a higher-severity fix correctly.
 - Do not leave findings unclassified.
 
+### Terminal statuses
+
+Once a finding is implemented or otherwise resolved, assign one of these terminal statuses:
+
+#### Applied
+The finding was implemented materially as intended and validated successfully.
+
+#### Applied with adaptation
+The finding was implemented successfully, but the final implementation differed materially from the review's suggested fix.
+
+Use this when:
+- the review proposed a broader change than necessary
+- the suggested patch did not fit the current code structure
+- an existing crate pattern or type was used instead of the exact proposed mechanism
+- the test strategy or normalization point was changed for good reason
+
+This status must explain the adaptation.
+
+#### Already fixed
+The underlying defect is no longer present in the current code.
+
+#### Deferred
+The finding remains open but was not implemented in this run.
+
+#### Disputed
+Verification contradicts the review finding.
+
+#### Failed validation
+Implementation was attempted, then reverted because validation failed.
+
+#### Blocked by context mismatch
+The current code cannot be safely mapped to the report finding.
+
+#### Superseded
+Another implemented finding fully absorbed this one and no separate handling remains necessary. Must reference the absorbing finding.
+
 ## Interactive clarification policy
 
 Interactive clarification is permitted, but only in a narrow and controlled way.
@@ -303,7 +338,7 @@ Good question:
 
 Keep the number of questions tightly bounded.
 
-- Prefer at most **one question per finding**.
+- Prefer at most **two questions per finding**.
 - Prefer batching related questions into a short numbered list.
 - If safe progress would require more than **2–3 user decisions** before any meaningful implementation can start, stop and report that the fix set is not implementation-ready.
 
@@ -312,7 +347,7 @@ Keep the number of questions tightly bounded.
 When the user answers:
 
 - record the answer in the fix-application report
-- update the finding ledger
+- update the finding's status in the report
 - move the finding from `Ask` to one of:
   - `Apply`
   - `Defer`
@@ -320,113 +355,9 @@ When the user answers:
 
 Do not continue as if an answer had been given when it has not.
 
-## Finding ledger and status accounting
-
-The finding ledger is the control mechanism for the entire fix workflow.
-
-Before any edits are made, create a ledger containing **every finding ID** in the review. From that point onward, every finding must remain visible in the ledger until the run ends.
-
-### Accounting rule
-
-No finding disappears.
-
-Every finding from the source review must appear exactly once in the ledger at all times, with:
-
-- an initial decision state during planning:
-  - `Apply`
-  - `Ask`
-  - `Defer`
-  - `Dispute`
-  - `Already fixed`
-
-and later, with either:
-
-- a terminal status:
-  - `Applied`
-  - `Applied with adaptation`
-  - `Already fixed`
-  - `Deferred`
-  - `Disputed`
-  - `Failed validation`
-  - `Blocked by context mismatch`
-  - `Superseded`
-
-or:
-
-- an active non-terminal state:
-  - `Ask`, only while awaiting user clarification
-
-Do not use vague labels such as:
-- skipped
-- not handled
-- partially addressed
-- probably fixed
-
-### Meaning of terminal statuses
-
-#### Applied
-Use `Applied` when the finding was implemented materially as intended and validated successfully.
-
-#### Applied with adaptation
-Use `Applied with adaptation` when the finding was implemented successfully, but the final implementation materially differed from the review’s suggested fix.
-
-Use this when:
-- the review proposed a broader change than necessary
-- the suggested patch did not fit the current code structure
-- an existing crate pattern or type was used instead of the exact proposed mechanism
-- the test strategy or normalization point was changed for good reason
-
-This status must explain the adaptation.
-
-#### Already fixed
-Use `Already fixed` when the underlying defect is no longer present in the current code.
-
-#### Deferred
-Use `Deferred` when the finding remains open but was not implemented in this run.
-
-#### Disputed
-Use `Disputed` when verification contradicts the review finding.
-
-#### Failed validation
-Use `Failed validation` when implementation was attempted, then reverted because validation failed.
-
-#### Blocked by context mismatch
-Use this when the current code cannot be safely mapped to the report finding.
-
-#### Superseded
-Use `Superseded` only when another implemented finding fully absorbed this one and no separate handling remains necessary.
-
-A superseded finding must reference the finding that absorbed it.
-
-### Minimum ledger fields
-
-The ledger must track, at minimum:
-
-- finding ID
-- severity
-- title
-- initial decision
-- current or final status
-- rationale
-- whether user input was needed
-- affected files
-- whether code was changed
-- validation outcome
-- follow-up required or not
-
-### Completion requirement
-
-The run is not complete until:
-
-- every finding from the review appears in the ledger
-- no finding has more than one final status
-- every applied finding has validation attached
-- every non-applied finding has a reason
-- any unresolved high-severity findings are clearly visible for carry-forward
-
 ## Implementation workflow
 
-Once preflight is complete and the finding ledger exists, implement fixes in a controlled order.
+Once preflight is complete and the initial findings table is written to the report, implement fixes in a controlled order.
 
 The workflow is designed to prevent speculative edits, hidden scope creep, and untraceable partial work.
 
@@ -450,7 +381,7 @@ Default rule:
 - one finding
 - one scoped patch
 - one validation pass
-- one ledger update
+- one report update
 
 Bundling multiple findings into one edit is allowed only when:
 - they affect the same narrow code path
@@ -512,11 +443,11 @@ Acceptable reasons to adapt include:
 
 Whenever this happens, the final status should usually be `Applied with adaptation`, and the report must describe the difference.
 
-### Update the ledger immediately
+### Update the report immediately
 
 After each finding is handled:
 
-- update its ledger entry
+- update its entry in the report's findings table
 - record files changed
 - record tests added or modified
 - record validation commands run
@@ -538,9 +469,8 @@ If a finding is implemented and then fails validation:
 
 Before closing the run:
 
-- ensure every finding still appears exactly once in the ledger
+- ensure every finding from the review appears exactly once in the report
 - ensure every finding has either a terminal status or an active `Ask` state awaiting user input
-- ensure the fix-application report matches the final ledger
 - ensure unresolved high-severity findings are clearly carried forward
 
 
@@ -666,14 +596,14 @@ If unrelated pre-existing failures prevent clean full-project validation:
 - record that fact explicitly
 - still run the strongest relevant validation possible
 - distinguish clearly between:
-- failures introduced by the attempted fix
-- failures already present before the fix
+  - failures introduced by the attempted fix
+  - failures already present before the fix
 
 Do not let pre-existing project noise become an excuse for weak local verification.
 
-### Validation and the final ledger
+### Validation and the report
 
-A finding must not be given final status Applied or Applied with adaptation unless the validation required for that finding has been recorded in the ledger and the fix-application report.
+A finding must not be given final status Applied or Applied with adaptation unless the validation required for that finding has been recorded in the fix-application report.
 
 At minimum, each applied finding must record:
 
@@ -830,11 +760,11 @@ The fix-application report exists to provide:
 - **auditability** — later readers can reconstruct what was changed, what was not changed, and why
 - **verification** — validation commands and outcomes are recorded
 - **handoff** — unresolved findings are carried forward explicitly
-- **control** — the ledger and the report together prevent silent omissions
+- **control** — the report prevents silent omissions
 
 ### Accounting rule
 
-Before editing code, create a ledger containing every finding ID from the source review.
+Before editing code, complete the findings table in the report with every finding ID from the source review.
 
 At the end of the run, every finding must appear in the report with either:
 
@@ -892,9 +822,7 @@ If any of these checks fail, the report is incomplete.
 
 ### The report is the control artifact
 
-The fix-application report is not a cosmetic summary written after the real work. It is one of the main control artifacts of the workflow.
-
-The report must be kept consistent with the finding ledger throughout the run. If the ledger and the report disagree, the run is not complete.
+The fix-application report is not a cosmetic summary written after the real work. It is one of the main control artifacts of the workflow. Fill it in incrementally as you work — do not reconstruct it from memory at the end of the run.
 
 ### Report required even for blocked runs
 
@@ -964,7 +892,7 @@ Use the following structure exactly for the fix-application report.
 - <finding ID> — <short reason>
 - <finding ID> — <short reason>
 
-## 2. Finding ledger
+## 2. Findings table
 
 | ID | Severity | Title | Initial decision | Final status | User input | Files changed | Validation | Follow-up |
 |---|---|---|---|---|---|---|---|---|
@@ -1065,7 +993,7 @@ If none, write:
 
 ### Template rules
 
-- Every finding from the source review must appear exactly once in the finding ledger and exactly once in the per-finding log.
+- Every finding from the source review must appear exactly once in the findings table and exactly once in the per-finding log.
 - Use explicit status names only:
   - `Applied`
   - `Applied with adaptation`
