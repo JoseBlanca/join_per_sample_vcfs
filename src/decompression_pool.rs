@@ -434,9 +434,9 @@ mod tests {
 
     #[test]
     fn test_gzip_decompression() {
-        use flate2::write::GzEncoder;
-        use flate2::read::MultiGzDecoder;
         use flate2::Compression;
+        use flate2::read::MultiGzDecoder;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Compress some data.

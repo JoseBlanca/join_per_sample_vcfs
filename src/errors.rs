@@ -75,7 +75,9 @@ pub enum VcfParseError {
     #[error("Malformed header fields and sample definition line")]
     MalformedHeader,
 
-    #[error("Allele index overflow in genotype '{gt}': allele number exceeds maximum allowed (127)")]
+    #[error(
+        "Allele index overflow in genotype '{gt}': allele number exceeds maximum allowed (127)"
+    )]
     AlleleIndexOverflow { gt: String },
 
     #[error("RuntimeError: {message}")]

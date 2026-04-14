@@ -269,7 +269,14 @@ pub fn enumerate_genotypes(num_alleles: usize, ploidy: usize) -> Vec<Genotype> {
     let mut allele_sequences: Vec<Vec<usize>> = Vec::new();
     let mut current = vec![0usize; ploidy];
 
-    collect_sorted_combinations(&mut current, 0, 0, num_alleles, ploidy, &mut allele_sequences);
+    collect_sorted_combinations(
+        &mut current,
+        0,
+        0,
+        num_alleles,
+        ploidy,
+        &mut allele_sequences,
+    );
 
     // Sort by VCF convention: compare reversed sequences lexicographically.
     // This makes the highest allele index the slowest-changing.
@@ -517,11 +524,7 @@ fn update_allele_frequencies(
 /// of that probability: QUAL = -10 * log10(P(all samples are hom-ref)).
 ///
 /// High QUAL means we are confident there is a real variant.
-fn compute_qual(
-    genotype_posteriors: &[f64],
-    num_samples: usize,
-    num_genotypes: usize,
-) -> f64 {
+fn compute_qual(genotype_posteriors: &[f64], num_samples: usize, num_genotypes: usize) -> f64 {
     // The hom-ref genotype (0/0) is always the first one (pl_index = 0).
     let hom_ref_index = 0;
 
@@ -658,8 +661,7 @@ mod tests {
 
         for sample in 0..2 {
             let offset = sample * result.num_genotypes;
-            let sum: f64 = result.genotype_posteriors
-                [offset..offset + result.num_genotypes]
+            let sum: f64 = result.genotype_posteriors[offset..offset + result.num_genotypes]
                 .iter()
                 .sum();
             assert!(
@@ -678,7 +680,7 @@ mod tests {
         // Sample 2: clearly 0/0/0/0 (PL index 0)
         let pls = vec![
             99.0, 99.0, 0.0, 99.0, 99.0, // sample 1: 0/0/1/1
-            0.0, 99.0, 99.0, 99.0, 99.0,  // sample 2: 0/0/0/0
+            0.0, 99.0, 99.0, 99.0, 99.0, // sample 2: 0/0/0/0
         ];
         let result = estimate_posteriors(2, 4, 2, &pls, &PriorConfig::default());
 
@@ -696,8 +698,7 @@ mod tests {
 
         for sample in 0..2 {
             let offset = sample * result.num_genotypes;
-            let sum: f64 = result.genotype_posteriors
-                [offset..offset + result.num_genotypes]
+            let sum: f64 = result.genotype_posteriors[offset..offset + result.num_genotypes]
                 .iter()
                 .sum();
             assert!(
@@ -758,10 +759,7 @@ mod tests {
     #[test]
     fn test_f_zero_equals_hardy_weinberg() {
         // F=0 should give the same result as the default (which is F=0)
-        let pls = vec![
-            10.0, 0.0, 30.0,
-            0.0, 15.0, 40.0,
-        ];
+        let pls = vec![10.0, 0.0, 30.0, 0.0, 15.0, 40.0];
         let result_default = estimate_posteriors(2, 2, 2, &pls, &PriorConfig::default());
         let result_f0 = estimate_posteriors(2, 2, 2, &pls, &prior_with_f(0.0));
 
@@ -813,7 +811,10 @@ mod tests {
         assert!(pls[0] > 15.0, "non-called PL={} should be > 15", pls[0]);
         assert!(pls[2] > 15.0, "non-called PL={} should be > 15", pls[2]);
         // The two non-called PLs should be equal
-        assert!((pls[0] - pls[2]).abs() < 1e-9, "non-called PLs should be equal");
+        assert!(
+            (pls[0] - pls[2]).abs() < 1e-9,
+            "non-called PLs should be equal"
+        );
     }
 
     #[test]

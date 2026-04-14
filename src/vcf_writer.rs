@@ -1,10 +1,10 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 
-use crate::gvcf_parser::{VcfResult, Variant};
+use crate::gvcf_parser::{Variant, VcfResult};
 
 /// A writer that outputs merged variants in VCF format.
 ///
@@ -28,7 +28,11 @@ impl VcfWriter {
             Box::new(BufWriter::new(file))
         };
 
-        let mut vcf_writer = VcfWriter { writer, ploidy: 2, broken_pipe: false };
+        let mut vcf_writer = VcfWriter {
+            writer,
+            ploidy: 2,
+            broken_pipe: false,
+        };
         vcf_writer.write_header(samples)?;
         Ok(vcf_writer)
     }
@@ -36,14 +40,22 @@ impl VcfWriter {
     /// Create a VCF writer that writes to stdout.
     pub fn from_stdout(samples: &[String]) -> io::Result<Self> {
         let writer: Box<dyn Write> = Box::new(BufWriter::new(io::stdout().lock()));
-        let mut vcf_writer = VcfWriter { writer, ploidy: 2, broken_pipe: false };
+        let mut vcf_writer = VcfWriter {
+            writer,
+            ploidy: 2,
+            broken_pipe: false,
+        };
         vcf_writer.write_header(samples)?;
         Ok(vcf_writer)
     }
 
     /// Create a VCF writer from any `Write` implementor (useful for testing).
     pub fn from_writer(writer: Box<dyn Write>, samples: &[String]) -> io::Result<Self> {
-        let mut vcf_writer = VcfWriter { writer, ploidy: 2, broken_pipe: false };
+        let mut vcf_writer = VcfWriter {
+            writer,
+            ploidy: 2,
+            broken_pipe: false,
+        };
         vcf_writer.write_header(samples)?;
         Ok(vcf_writer)
     }
@@ -124,7 +136,8 @@ impl VcfWriter {
                 return Ok(());
             }
             let variant = result?;
-            self.write_variant(&variant).map_err(crate::errors::VcfParseError::from)?;
+            self.write_variant(&variant)
+                .map_err(crate::errors::VcfParseError::from)?;
         }
         Ok(())
     }
@@ -177,8 +190,7 @@ mod tests {
     fn test_write_single_variant() {
         let samples = vec!["SAMPLE1".to_string(), "SAMPLE2".to_string()];
         let buf: Vec<u8> = Vec::new();
-        let mut writer =
-            VcfWriter::from_writer(Box::new(buf), &samples).unwrap();
+        let mut writer = VcfWriter::from_writer(Box::new(buf), &samples).unwrap();
 
         let variant = make_variant(
             "chr1",
@@ -387,8 +399,7 @@ mod tests {
         let samples = vec!["S1".to_string()];
         {
             let mut writer = VcfWriter::from_path(&path, &samples).unwrap();
-            let variant =
-                make_variant("chr1", 100, &["A", "T"], vec![0, 1], vec![false], 1);
+            let variant = make_variant("chr1", 100, &["A", "T"], vec![0, 1], vec![false], 1);
             writer.write_variant(&variant).unwrap();
             writer.flush().unwrap();
         }
@@ -396,7 +407,10 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines[0], "##fileformat=VCFv4.2");
-        assert_eq!(lines[1], "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1");
+        assert_eq!(
+            lines[1],
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"
+        );
         assert_eq!(lines[2], "chr1\t100\t.\tA\tT\t.\t.\t.\tGT\t0/1");
 
         std::fs::remove_file(&path).ok();
@@ -411,8 +425,7 @@ mod tests {
         let samples = vec!["S1".to_string()];
         {
             let mut writer = VcfWriter::from_path(&path, &samples).unwrap();
-            let variant =
-                make_variant("chr1", 200, &["G", "A"], vec![1, 1], vec![true], 1);
+            let variant = make_variant("chr1", 200, &["G", "A"], vec![1, 1], vec![true], 1);
             writer.write_variant(&variant).unwrap();
             writer.flush().unwrap();
         }
@@ -425,7 +438,10 @@ mod tests {
 
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines[0], "##fileformat=VCFv4.2");
-        assert_eq!(lines[1], "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1");
+        assert_eq!(
+            lines[1],
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"
+        );
         assert_eq!(lines[2], "chr1\t200\t.\tG\tA\t.\t.\t.\tGT\t1|1");
 
         std::fs::remove_file(&path).ok();
@@ -500,12 +516,11 @@ mod tests {
     fn test_broken_pipe_on_write_variant_does_not_error() {
         let samples = vec!["S1".to_string()];
         // Allow enough bytes for the header, then break on the first variant
-        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
-        let mut writer = VcfWriter::from_writer(
-            Box::new(BrokenPipeWriter::new(header.len())),
-            &samples,
-        )
-        .unwrap();
+        let header =
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer =
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples)
+                .unwrap();
 
         let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
         let v2 = make_variant("chr1", 20, &["G", "C"], vec![1, 1], vec![false], 1);
@@ -521,12 +536,11 @@ mod tests {
     #[test]
     fn test_broken_pipe_on_write_variants_stops_silently() {
         let samples = vec!["S1".to_string()];
-        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
-        let mut writer = VcfWriter::from_writer(
-            Box::new(BrokenPipeWriter::new(header.len())),
-            &samples,
-        )
-        .unwrap();
+        let header =
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer =
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples)
+                .unwrap();
 
         let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
         let v2 = make_variant("chr1", 20, &["G", "C"], vec![1, 1], vec![false], 1);
@@ -542,12 +556,11 @@ mod tests {
     fn test_broken_pipe_mid_variant_stops_silently() {
         let samples = vec!["S1".to_string()];
         // Break after header + a few bytes into the first variant
-        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
-        let mut writer = VcfWriter::from_writer(
-            Box::new(BrokenPipeWriter::new(header.len() + 5)),
-            &samples,
-        )
-        .unwrap();
+        let header =
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer =
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len() + 5)), &samples)
+                .unwrap();
 
         let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
         // Pipe breaks mid-write — should still return Ok
@@ -557,12 +570,11 @@ mod tests {
     #[test]
     fn test_broken_pipe_immediately_on_flush() {
         let samples = vec!["S1".to_string()];
-        let header = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
-        let mut writer = VcfWriter::from_writer(
-            Box::new(BrokenPipeWriter::new(header.len())),
-            &samples,
-        )
-        .unwrap();
+        let header =
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        let mut writer =
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples)
+                .unwrap();
 
         // No variants written, but flush hits broken pipe — should be Ok
         assert!(writer.flush().is_ok());

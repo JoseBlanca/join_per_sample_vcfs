@@ -1,10 +1,10 @@
 pub mod decompression_pool;
 pub mod errors;
 pub mod genotype_merging;
+pub mod genotype_posteriors;
 pub mod gvcf_parser;
 pub mod pipeline;
 pub mod threaded_reader;
 pub mod utils_magic;
 pub mod variant_grouping;
 pub mod vcf_writer;
-pub mod genotype_posteriors;

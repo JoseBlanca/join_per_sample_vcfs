@@ -356,7 +356,6 @@ fn compute_posteriors_for_variant(variant: &mut Variant, prior: &PriorConfig) {
         }
         // Otherwise: keep the original GT (preserving allele order / phase)
     }
-
 }
 
 /// Collect up to `batch_size` groups from the source iterator.

@@ -95,8 +95,13 @@ fn run_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>) -> String {
     }
 
     let prior = PriorConfig::default();
-    merge_alleles_and_genotypes(iters, chromosomes, Box::new(SharedWriter(shared_clone)), &prior)
-        .expect("Pipeline failed");
+    merge_alleles_and_genotypes(
+        iters,
+        chromosomes,
+        Box::new(SharedWriter(shared_clone)),
+        &prior,
+    )
+    .expect("Pipeline failed");
 
     let buf = shared_buf.lock().unwrap();
     String::from_utf8(buf.clone()).unwrap()

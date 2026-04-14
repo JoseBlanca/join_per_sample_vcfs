@@ -3,7 +3,7 @@ use std::io::BufReader;
 
 use merge_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in_groups};
 use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
-use merge_per_sample_vcfs::gvcf_parser::{Variant, VarIterator};
+use merge_per_sample_vcfs::gvcf_parser::{VarIterator, Variant};
 use merge_per_sample_vcfs::variant_grouping::VarGroupIterator;
 use merge_per_sample_vcfs::variant_grouping::{OverlappingVarGroup, VarIteratorInfo};
 
@@ -19,8 +19,7 @@ fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
 /// Collect merged variants from groups into a Vec (test helper).
 fn collect_merged_variants<I>(groups: I, iter_info: &[VarIteratorInfo]) -> Vec<Variant>
 where
-    I: Iterator<Item = merge_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVarGroup>>
-        + Send,
+    I: Iterator<Item = merge_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVarGroup>> + Send,
 {
     let mut vars = Vec::new();
     merge_vars_in_groups(groups, iter_info, &default_prior(), |result| {
@@ -146,8 +145,7 @@ fn test_grouper_preserves_genomic_order() {
         make_iter(VCF4),
         make_iter(VCF5),
     ];
-    let grouper =
-        VarGroupIterator::new(iters, vec!["1".into(), "20".into(), "21".into()]).unwrap();
+    let grouper = VarGroupIterator::new(iters, vec!["1".into(), "20".into(), "21".into()]).unwrap();
     let groups: Vec<_> = grouper.map(|r| r.unwrap()).collect();
 
     let group_positions: Vec<(String, u32)> =
