@@ -151,55 +151,81 @@ fn parse_format_field(format: &str) -> VcfResult<(usize, Vec<String>)> {
 #[inline]
 fn parse_genotype(gt_str: &str, expected_ploidy: u8) -> VcfResult<(Vec<i8>, bool)> {
     let bytes = gt_str.as_bytes();
+    let n = bytes.len();
+
+    if n == 0 {
+        return Err(VcfParseError::RuntimeError {
+            message: "Empty GT string".to_string(),
+        });
+    }
 
     let mut alleles = Vec::with_capacity(expected_ploidy as usize);
     let mut phased = false;
-    let mut current: i8 = 0;
-    let mut parsing_number = false;
-    let mut seen_dot = false;
+    let mut i = 0;
 
-    for &byte in bytes {
-        match byte {
-            b'0'..=b'9' => {
-                current = (current as u8)
-                    .checked_mul(10)
-                    .and_then(|v| v.checked_add(byte - b'0'))
-                    .ok_or_else(|| VcfParseError::AlleleIndexOverflow {
-                        gt: gt_str.to_string(),
-                    })? as i8;
-                parsing_number = true;
-                seen_dot = false;
-            }
+    // GT grammar: <allele> ( ('/' | '|') <allele> )*
+    // where <allele> = one or more digits | exactly '.'
+    loop {
+        // Expect an allele
+        if i >= n {
+            return Err(VcfParseError::RuntimeError {
+                message: format!("Invalid GT: expected allele at end of '{}'", gt_str),
+            });
+        }
+        match bytes[i] {
             b'.' => {
                 alleles.push(MISSING_ALLELE);
-                seen_dot = true;
-                parsing_number = false;
+                i += 1;
+            }
+            b'0'..=b'9' => {
+                let mut val: u8 = 0;
+                while i < n && bytes[i].is_ascii_digit() {
+                    val = val
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add(bytes[i] - b'0'))
+                        .ok_or_else(|| VcfParseError::AlleleIndexOverflow {
+                            gt: gt_str.to_string(),
+                        })?;
+                    if val > 127 {
+                        return Err(VcfParseError::AlleleIndexOverflow {
+                            gt: gt_str.to_string(),
+                        });
+                    }
+                    i += 1;
+                }
+                alleles.push(val as i8);
+            }
+            _ => {
+                return Err(VcfParseError::RuntimeError {
+                    message: format!(
+                        "Invalid GT: unexpected character '{}' in '{}'",
+                        bytes[i] as char, gt_str
+                    ),
+                });
+            }
+        }
+
+        // After allele: expect separator or end of string
+        if i >= n {
+            break;
+        }
+        match bytes[i] {
+            b'/' => {
+                i += 1;
             }
             b'|' => {
-                if parsing_number {
-                    alleles.push(current);
-                    current = 0;
-                    parsing_number = false;
-                }
                 phased = true;
+                i += 1;
             }
-            b'/' => {
-                if parsing_number {
-                    alleles.push(current);
-                    current = 0;
-                    parsing_number = false;
-                } else if seen_dot {
-                    // Handle cases like "./." or ".|."
-                    seen_dot = false;
-                }
+            _ => {
+                return Err(VcfParseError::RuntimeError {
+                    message: format!(
+                        "Invalid GT: unexpected character '{}' in '{}'",
+                        bytes[i] as char, gt_str
+                    ),
+                });
             }
-            _ => {}
         }
-    }
-
-    // Push the last allele if we were parsing a number
-    if parsing_number {
-        alleles.push(current);
     }
 
     Ok((alleles, phased))
@@ -306,24 +332,25 @@ fn parse_genotypes(
 impl Variant {
     /// Returns the end position of the variant's span (1-based, inclusive).
     pub fn get_var_end(&self) -> VcfResult<u32> {
-        let ref_allele = self.alleles.first().ok_or_else(|| VcfParseError::RuntimeError {
-            message: format!(
-                "Variant at {}:{} has no alleles",
-                self.chrom, self.pos
-            ),
-        })?;
-        let ref_len: u32 = ref_allele.len().try_into().map_err(|_| VcfParseError::RuntimeError {
-            message: format!(
-                "Reference allele length overflow at {}:{}",
-                self.chrom, self.pos
-            ),
-        })?;
+        let ref_allele = self
+            .alleles
+            .first()
+            .ok_or_else(|| VcfParseError::RuntimeError {
+                message: format!("Variant at {}:{} has no alleles", self.chrom, self.pos),
+            })?;
+        let ref_len: u32 =
+            ref_allele
+                .len()
+                .try_into()
+                .map_err(|_| VcfParseError::RuntimeError {
+                    message: format!(
+                        "Reference allele length overflow at {}:{}",
+                        self.chrom, self.pos
+                    ),
+                })?;
         if ref_len == 0 {
             return Err(VcfParseError::RuntimeError {
-                message: format!(
-                    "Empty reference allele at {}:{}",
-                    self.chrom, self.pos
-                ),
+                message: format!("Empty reference allele at {}:{}", self.chrom, self.pos),
             });
         }
         self.pos
@@ -366,40 +393,62 @@ impl Variant {
         ploidy: u8,
         patterns: &CommonGenotypePatterns,
     ) -> VcfResult<Self> {
-        let mut fields = line.splitn(10, '\t');
+        let mut fields = line.trim_end().splitn(10, '\t');
         let chrom = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
 
         let pos = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
         let _id = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
         let ref_allele = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
         let alt_alleles = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
         let qual_str = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
         let _filter = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
         let _info = fields
             .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
-        let gt_format_str = fields
-            .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                line: line.to_string(),
+            })?;
+        let gt_format_str =
+            fields
+                .next()
+                .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                    line: line.to_string(),
+                })?;
 
         // Get sample fields (the 10th field from splitn contains all remaining sample data)
-        let sample_fields = fields
-            .next()
-            .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields { line: line.to_string() })?;
+        let sample_fields =
+            fields
+                .next()
+                .ok_or_else(|| VcfParseError::GVCFLineNotEnoughFields {
+                    line: line.to_string(),
+                })?;
 
         let pos: u32 = pos.parse().map_err(|_| VcfParseError::InvalidPosition {
             value: pos.to_string(),
@@ -471,10 +520,19 @@ impl Variant {
                 message: "There should be at least one allele".to_string(),
             },
         )?;
-        if max_allele_len == 1 {
+        if max_allele_len <= 1 {
             Ok((self.pos, self.pos))
         } else {
-            Ok((self.pos, self.pos + max_allele_len as u32 - 1))
+            let end = self
+                .pos
+                .checked_add(max_allele_len as u32 - 1)
+                .ok_or_else(|| VcfParseError::RuntimeError {
+                    message: format!(
+                        "Position overflow computing span at {}:{}",
+                        self.chrom, self.pos
+                    ),
+                })?;
+            Ok((self.pos, end))
         }
     }
 
@@ -584,8 +642,7 @@ impl<B: BufRead> VarIterator<B> {
                 match self.reader.read_line(&mut self.line) {
                     Ok(0) => {
                         return Err(VcfParseError::BrokenHeader {
-                            line: "EOF reached before #CHROM header line was found"
-                                .to_string(),
+                            line: "EOF reached before #CHROM header line was found".to_string(),
                         });
                     }
                     Ok(_) => {
@@ -716,10 +773,8 @@ impl<R: BufRead> Iterator for VarIterator<R> {
         if self.vars_buffer.is_empty() {
             match self.fill_buffer(DEF_N_VARIANTS_IN_BUFFER) {
                 Err(error) => return Some(Err(error)),
-                Ok(n_items_added) => match n_items_added {
-                    0 => return None,
-                    _ => (),
-                },
+                Ok(0) => return None,
+                Ok(_) => {}
             }
         }
 
