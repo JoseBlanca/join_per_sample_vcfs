@@ -1,4 +1,4 @@
-use merge_per_sample_vcfs::gvcf_parser::VarIterator;
+use merge_per_sample_vcfs::gvcf_parser::{VarIterator, Variant};
 use std::fs::File;
 use std::io::BufReader;
 
@@ -214,7 +214,7 @@ fn test_sample_parsing() {
 #[test]
 fn test_sample_parsing_with_buffer() {
     let reader = BufReader::new(SAMPLE_GVCF.as_bytes());
-    let mut parser = VarIterator::from_reader(reader).expect("Failed to create parser");
+    let parser = VarIterator::from_reader(reader).expect("Failed to create parser");
 
     // Samples should be available immediately after construction
     let samples = parser.samples();
@@ -255,6 +255,39 @@ chr1\t200\t.\tG\tT\t40\tPASS\t.\tGT\t0|0\t0|1\t1|1";
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 2);
+
+    // Variant 1: chr1:100, unphased
+    let v1 = &variants[0];
+    assert_eq!(v1.pos, 100);
+    assert_eq!(v1.genotypes.len(), 6); // 3 samples * ploidy 2
+    // Sample 1: 0/0
+    assert_eq!(v1.genotypes[0], 0);
+    assert_eq!(v1.genotypes[1], 0);
+    assert!(!v1.phases[0]);
+    // Sample 2: 0/1
+    assert_eq!(v1.genotypes[2], 0);
+    assert_eq!(v1.genotypes[3], 1);
+    assert!(!v1.phases[1]);
+    // Sample 3: 1/1
+    assert_eq!(v1.genotypes[4], 1);
+    assert_eq!(v1.genotypes[5], 1);
+    assert!(!v1.phases[2]);
+
+    // Variant 2: chr1:200, phased
+    let v2 = &variants[1];
+    assert_eq!(v2.pos, 200);
+    // Sample 1: 0|0
+    assert_eq!(v2.genotypes[0], 0);
+    assert_eq!(v2.genotypes[1], 0);
+    assert!(v2.phases[0]);
+    // Sample 2: 0|1
+    assert_eq!(v2.genotypes[2], 0);
+    assert_eq!(v2.genotypes[3], 1);
+    assert!(v2.phases[1]);
+    // Sample 3: 1|1
+    assert_eq!(v2.genotypes[4], 1);
+    assert_eq!(v2.genotypes[5], 1);
+    assert!(v2.phases[2]);
 }
 
 #[test]
@@ -268,6 +301,19 @@ chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t./.\t0/1\t.|.";
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 1);
+    let v = &variants[0];
+    // Sample 1: ./.  → missing, unphased
+    assert_eq!(v.genotypes[0], -1);
+    assert_eq!(v.genotypes[1], -1);
+    assert!(!v.phases[0]);
+    // Sample 2: 0/1 → het, unphased
+    assert_eq!(v.genotypes[2], 0);
+    assert_eq!(v.genotypes[3], 1);
+    assert!(!v.phases[1]);
+    // Sample 3: .|. → missing, phased
+    assert_eq!(v.genotypes[4], -1);
+    assert_eq!(v.genotypes[5], -1);
+    assert!(v.phases[2]);
 }
 
 #[test]
@@ -281,6 +327,15 @@ chr1\t100\t.\tA\tC,G,T\t30\tPASS\t.\tGT\t0/1\t2/3";
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 1);
+    let v = &variants[0];
+    // Sample 1: 0/1
+    assert_eq!(v.genotypes[0], 0);
+    assert_eq!(v.genotypes[1], 1);
+    assert!(!v.phases[0]);
+    // Sample 2: 2/3
+    assert_eq!(v.genotypes[2], 2);
+    assert_eq!(v.genotypes[3], 3);
+    assert!(!v.phases[1]);
 }
 
 #[test]
@@ -294,6 +349,27 @@ chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT:GQ:DP\t0/1:30:10\t1|1:40:15";
     let variants: Vec<_> = parser.filter_map(Result::ok).collect();
 
     assert_eq!(variants.len(), 1);
+    let v = &variants[0];
+    // Sample 1: 0/1, unphased
+    assert_eq!(v.genotypes[0], 0);
+    assert_eq!(v.genotypes[1], 1);
+    assert!(!v.phases[0]);
+    // Sample 2: 1|1, phased
+    assert_eq!(v.genotypes[2], 1);
+    assert_eq!(v.genotypes[3], 1);
+    assert!(v.phases[1]);
+
+    // Verify FORMAT field access
+    let gq_idx = v.gt_field_index("GQ").expect("GQ field should exist");
+    let gq_values = v.get_gt_field_by_index(gq_idx);
+    assert_eq!(gq_values[0], "30");
+    assert_eq!(gq_values[1], "40");
+
+    let dp_idx = v.gt_field_index("DP").expect("DP field should exist");
+    let dp_values = v.get_gt_field_by_index(dp_idx);
+    assert_eq!(dp_values[0], "10");
+    // Last sample's DP must be exactly "15", not "15\n" (M1 regression)
+    assert_eq!(dp_values[1], "15");
 }
 
 #[test]
@@ -312,4 +388,96 @@ fn test_genotype_performance_with_sample_gvcf() {
     // Check second variant has consistent ploidy
     let v2 = &variants[2];
     assert_eq!(v2.n_samples, 3);
+}
+
+#[test]
+fn test_parse_rejects_allele_index_out_of_range() {
+    // Allele index 128 exceeds i8::MAX (127) and must be rejected, not silently wrapped
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t128/0";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VarIterator::from_reader(reader).expect("Failed to create parser");
+    let results: Vec<_> = parser.collect();
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].is_err(),
+        "Allele index 128 should produce an error, not wrap to -128"
+    );
+}
+
+#[test]
+fn test_parse_rejects_invalid_characters() {
+    // "0/a" contains a non-digit, non-separator, non-dot character
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t0/a";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VarIterator::from_reader(reader).expect("Failed to create parser");
+    let results: Vec<_> = parser.collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err(), "GT '0/a' should be rejected");
+}
+
+#[test]
+fn test_parse_rejects_consecutive_separators() {
+    // "0//1" has consecutive separators with no allele between them
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t0//1";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VarIterator::from_reader(reader).expect("Failed to create parser");
+    let results: Vec<_> = parser.collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err(), "GT '0//1' should be rejected");
+}
+
+#[test]
+fn test_parse_rejects_trailing_junk() {
+    // "0/1x" has a trailing non-digit character
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t0/1x";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VarIterator::from_reader(reader).expect("Failed to create parser");
+    let results: Vec<_> = parser.collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err(), "GT '0/1x' should be rejected");
+}
+
+#[test]
+fn test_parse_rejects_leading_separator() {
+    // "/0/1" starts with a separator
+    let vcf_data = "##fileformat=VCFv4.2
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSample1
+chr1\t100\t.\tA\tC\t30\tPASS\t.\tGT\t/0/1";
+
+    let reader = BufReader::new(vcf_data.as_bytes());
+    let parser = VarIterator::from_reader(reader).expect("Failed to create parser");
+    let results: Vec<_> = parser.collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_err(), "GT '/0/1' should be rejected");
+}
+
+#[test]
+fn test_get_span_returns_error_on_position_overflow() {
+    // Position near u32::MAX with an allele long enough to overflow
+    let variant = Variant::new(
+        "chr1".to_string(),
+        u32::MAX - 5,
+        vec!["AAAAAAAAAAAA".to_string()], // 12 bases, pos + 11 overflows
+        vec![0, 0],
+        vec![false],
+        1,
+    );
+    let result = variant.get_span();
+    assert!(
+        result.is_err(),
+        "get_span should return error on position overflow, not wrap"
+    );
 }
