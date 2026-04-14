@@ -11,7 +11,7 @@ fn bench_parse_gz_end_to_end(c: &mut Criterion) {
 
     c.bench_function("gvcf parse TS.vcf.gz (end-to-end)", |b| {
         b.iter(|| {
-            let records = VarIterator::from_gzip_path(path).expect("Problem opening test file");
+            let records = VarIterator::from_gzip_path(path, 2).expect("Problem opening test file");
 
             let mut n_variants: u32 = 0;
             for record in records {

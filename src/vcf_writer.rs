@@ -19,7 +19,7 @@ impl VcfWriter {
     /// Create a VCF writer that writes to the given file path.
     ///
     /// If the path ends with `.gz`, the output will be gzip-compressed.
-    pub fn from_path(path: &str, samples: &[String]) -> io::Result<Self> {
+    pub fn from_path(path: &str, samples: &[String], ploidy: usize) -> io::Result<Self> {
         let writer: Box<dyn Write> = if path.ends_with(".gz") {
             let file = File::create(path)?;
             Box::new(BufWriter::new(GzEncoder::new(file, Compression::default())))
@@ -30,7 +30,7 @@ impl VcfWriter {
 
         let mut vcf_writer = VcfWriter {
             writer,
-            ploidy: 2,
+            ploidy,
             broken_pipe: false,
         };
         vcf_writer.write_header(samples)?;
@@ -38,11 +38,11 @@ impl VcfWriter {
     }
 
     /// Create a VCF writer that writes to stdout.
-    pub fn from_stdout(samples: &[String]) -> io::Result<Self> {
+    pub fn from_stdout(samples: &[String], ploidy: usize) -> io::Result<Self> {
         let writer: Box<dyn Write> = Box::new(BufWriter::new(io::stdout().lock()));
         let mut vcf_writer = VcfWriter {
             writer,
-            ploidy: 2,
+            ploidy,
             broken_pipe: false,
         };
         vcf_writer.write_header(samples)?;
@@ -50,10 +50,14 @@ impl VcfWriter {
     }
 
     /// Create a VCF writer from any `Write` implementor (useful for testing).
-    pub fn from_writer(writer: Box<dyn Write>, samples: &[String]) -> io::Result<Self> {
+    pub fn from_writer(
+        writer: Box<dyn Write>,
+        samples: &[String],
+        ploidy: usize,
+    ) -> io::Result<Self> {
         let mut vcf_writer = VcfWriter {
             writer,
-            ploidy: 2,
+            ploidy,
             broken_pipe: false,
         };
         vcf_writer.write_header(samples)?;
@@ -190,7 +194,7 @@ mod tests {
     fn test_write_single_variant() {
         let samples = vec!["SAMPLE1".to_string(), "SAMPLE2".to_string()];
         let buf: Vec<u8> = Vec::new();
-        let mut writer = VcfWriter::from_writer(Box::new(buf), &samples).unwrap();
+        let mut writer = VcfWriter::from_writer(Box::new(buf), &samples, 2).unwrap();
 
         let variant = make_variant(
             "chr1",
@@ -250,7 +254,7 @@ mod tests {
         }
 
         let mut writer =
-            VcfWriter::from_writer(Box::new(SharedWriter(shared_clone)), samples).unwrap();
+            VcfWriter::from_writer(Box::new(SharedWriter(shared_clone)), samples, 2).unwrap();
         for v in variants {
             writer.write_variant(v).unwrap();
         }
@@ -377,7 +381,8 @@ mod tests {
 
         let shared_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut writer =
-            VcfWriter::from_writer(Box::new(SharedWriter(shared_buf.clone())), &samples).unwrap();
+            VcfWriter::from_writer(Box::new(SharedWriter(shared_buf.clone())), &samples, 2)
+                .unwrap();
 
         let iter = vec![Ok(v1), Ok(v2)].into_iter();
         writer.write_variants(iter).unwrap();
@@ -398,7 +403,7 @@ mod tests {
 
         let samples = vec!["S1".to_string()];
         {
-            let mut writer = VcfWriter::from_path(&path, &samples).unwrap();
+            let mut writer = VcfWriter::from_path(&path, &samples, 2).unwrap();
             let variant = make_variant("chr1", 100, &["A", "T"], vec![0, 1], vec![false], 1);
             writer.write_variant(&variant).unwrap();
             writer.flush().unwrap();
@@ -424,7 +429,7 @@ mod tests {
 
         let samples = vec!["S1".to_string()];
         {
-            let mut writer = VcfWriter::from_path(&path, &samples).unwrap();
+            let mut writer = VcfWriter::from_path(&path, &samples, 2).unwrap();
             let variant = make_variant("chr1", 200, &["G", "A"], vec![1, 1], vec![true], 1);
             writer.write_variant(&variant).unwrap();
             writer.flush().unwrap();
@@ -464,7 +469,8 @@ mod tests {
 
         let shared_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut writer =
-            VcfWriter::from_writer(Box::new(SharedWriter(shared_buf.clone())), &samples).unwrap();
+            VcfWriter::from_writer(Box::new(SharedWriter(shared_buf.clone())), &samples, 2)
+                .unwrap();
 
         let iter = vec![Err(crate::errors::VcfParseError::NotVariable)].into_iter();
         let result = writer.write_variants(iter);
@@ -519,7 +525,7 @@ mod tests {
         let header =
             "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
         let mut writer =
-            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples)
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples, 2)
                 .unwrap();
 
         let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
@@ -539,7 +545,7 @@ mod tests {
         let header =
             "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
         let mut writer =
-            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples)
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples, 2)
                 .unwrap();
 
         let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
@@ -558,9 +564,12 @@ mod tests {
         // Break after header + a few bytes into the first variant
         let header =
             "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
-        let mut writer =
-            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len() + 5)), &samples)
-                .unwrap();
+        let mut writer = VcfWriter::from_writer(
+            Box::new(BrokenPipeWriter::new(header.len() + 5)),
+            &samples,
+            2,
+        )
+        .unwrap();
 
         let v1 = make_variant("chr1", 10, &["A", "T"], vec![0, 1], vec![false], 1);
         // Pipe breaks mid-write — should still return Ok
@@ -573,7 +582,7 @@ mod tests {
         let header =
             "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
         let mut writer =
-            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples)
+            VcfWriter::from_writer(Box::new(BrokenPipeWriter::new(header.len())), &samples, 2)
                 .unwrap();
 
         // No variants written, but flush hits broken pipe — should be Ok

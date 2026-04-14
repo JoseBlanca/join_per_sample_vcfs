@@ -13,7 +13,7 @@ fn default_prior() -> PriorConfig {
 
 fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
-    VarIterator::from_reader(reader).expect("Failed to create parser")
+    VarIterator::from_reader(reader, 2).expect("Failed to create parser")
 }
 
 /// Collect merged variants from groups into a Vec (test helper).

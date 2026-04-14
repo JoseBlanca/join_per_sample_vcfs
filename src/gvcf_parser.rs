@@ -62,8 +62,8 @@ const BUFREADER_CAPACITY: usize = 256 * 1024;
 /// Standard columns: CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT.
 const VCF_STANDARD_COLUMNS: usize = 9;
 
-/// Default ploidy assumption for variants (diploid).
-const DEFAULT_PLOIDY: u8 = 2;
+/// Default ploidy for diploid organisms.
+pub const DEFAULT_PLOIDY: u8 = 2;
 
 /// Marker value for missing alleles in genotype data.
 const MISSING_ALLELE: i8 = -1;
@@ -577,7 +577,7 @@ pub struct VarIterator<B: BufRead> {
 }
 
 impl<B: BufRead> VarIterator<B> {
-    fn new(mut reader: B) -> VcfResult<Self> {
+    fn new(mut reader: B, ploidy: u8) -> VcfResult<Self> {
         let mut line = String::new();
 
         // Read the first line to start header processing
@@ -592,8 +592,8 @@ impl<B: BufRead> VarIterator<B> {
                 RandomState::new(),
             ),
             samples: Vec::new(),
-            ploidy: DEFAULT_PLOIDY,
-            common_gt_patterns: CommonGenotypePatterns::new(DEFAULT_PLOIDY),
+            ploidy,
+            common_gt_patterns: CommonGenotypePatterns::new(ploidy),
         };
 
         // Process the header and populate samples
@@ -711,16 +711,16 @@ impl<B: BufRead> VarIterator<B> {
 }
 
 impl<R: Read> VarIterator<BufReader<R>> {
-    pub fn from_reader(reader: R) -> VcfResult<Self> {
+    pub fn from_reader(reader: R, ploidy: u8) -> VcfResult<Self> {
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, reader);
-        VarIterator::new(buf_reader)
+        VarIterator::new(buf_reader, ploidy)
     }
 }
 impl<R: Read> VarIterator<BufReader<MultiGzDecoder<R>>> {
-    pub fn from_gzip_reader(reader: R) -> VcfResult<Self> {
+    pub fn from_gzip_reader(reader: R, ploidy: u8) -> VcfResult<Self> {
         let gz_decoder = MultiGzDecoder::new(reader);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, gz_decoder);
-        VarIterator::new(buf_reader)
+        VarIterator::new(buf_reader, ploidy)
     }
 }
 /// Validates that a file is gzipped and returns a `MultiGzDecoder` for it.
@@ -738,18 +738,18 @@ fn open_gzip_file<P: AsRef<Path>>(path: P) -> VcfResult<MultiGzDecoder<File>> {
 }
 
 impl VarIterator<BufReader<MultiGzDecoder<File>>> {
-    pub fn from_gzip_path<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
+    pub fn from_gzip_path<P: AsRef<Path>>(path: P, ploidy: u8) -> VcfResult<Self> {
         let decoder = open_gzip_file(path)?;
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, decoder);
-        VarIterator::new(buf_reader)
+        VarIterator::new(buf_reader, ploidy)
     }
 }
 impl VarIterator<BufReader<ThreadedReader>> {
-    pub fn from_gzip_path_threaded<P: AsRef<Path>>(path: P) -> VcfResult<Self> {
+    pub fn from_gzip_path_threaded<P: AsRef<Path>>(path: P, ploidy: u8) -> VcfResult<Self> {
         let decoder = open_gzip_file(path)?;
         let threaded = ThreadedReader::new(decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, threaded);
-        VarIterator::new(buf_reader)
+        VarIterator::new(buf_reader, ploidy)
     }
 }
 impl VarIterator<BufReader<PooledReader>> {
@@ -758,11 +758,12 @@ impl VarIterator<BufReader<PooledReader>> {
     pub fn from_gzip_path_pooled<P: AsRef<Path>>(
         path: P,
         pool: &DecompressionPool,
+        ploidy: u8,
     ) -> VcfResult<Self> {
         let decoder = open_gzip_file(path)?;
         let pooled = pool.register(decoder);
         let buf_reader = BufReader::with_capacity(BUFREADER_CAPACITY, pooled);
-        VarIterator::new(buf_reader)
+        VarIterator::new(buf_reader, ploidy)
     }
 }
 

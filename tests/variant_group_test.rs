@@ -5,7 +5,7 @@ use merge_per_sample_vcfs::variant_grouping::VarGroupIterator;
 
 fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
-    VarIterator::from_reader(reader).expect("Failed to create parser")
+    VarIterator::from_reader(reader, 2).expect("Failed to create parser")
 }
 
 fn collect_spans(vcf_data: &[&str], sorted_chromosomes: Vec<String>) -> Vec<(String, u32, u32)> {

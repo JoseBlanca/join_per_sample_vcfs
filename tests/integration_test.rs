@@ -38,7 +38,7 @@ fn spaces_to_tabs(vcf: &str) -> String {
 
 fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
     let reader = BufReader::new(vcf_data.as_bytes());
-    VarIterator::from_reader(reader).expect("Failed to create parser")
+    VarIterator::from_reader(reader, 2).expect("Failed to create parser")
 }
 
 /// Run the full pipeline and assert the output matches the expected VCF exactly.
@@ -100,6 +100,7 @@ fn run_pipeline(gvcf_inputs: &[&str], chromosomes: Vec<String>) -> String {
         chromosomes,
         Box::new(SharedWriter(shared_clone)),
         &prior,
+        2,
     )
     .expect("Pipeline failed");
 

@@ -14,6 +14,7 @@ pub fn merge_alleles_and_genotypes<B: BufRead + Send>(
     sorted_chromosomes: Vec<String>,
     writer: Box<dyn Write>,
     prior: &PriorConfig,
+    ploidy: usize,
 ) -> VcfResult<()> {
     let all_samples: Vec<String> = var_iters
         .iter()
@@ -23,8 +24,8 @@ pub fn merge_alleles_and_genotypes<B: BufRead + Send>(
     let grouper = VarGroupIterator::new(var_iters, sorted_chromosomes)?;
     let iter_info = grouper.iter_info().to_vec();
 
-    let mut vcf_writer =
-        VcfWriter::from_writer(writer, &all_samples).map_err(crate::errors::VcfParseError::from)?;
+    let mut vcf_writer = VcfWriter::from_writer(writer, &all_samples, ploidy)
+        .map_err(crate::errors::VcfParseError::from)?;
 
     merge_vars_in_groups(grouper, &iter_info, prior, |result| {
         let variant = result?;
