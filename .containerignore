@@ -1,0 +1,9 @@
+target/
+target-container/
+.git/
+gatk/
+freebayes/
+python_draft/
+__pycache__/
+*.pyc
+.claude/

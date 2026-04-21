@@ -17,6 +17,35 @@ $ merge_per_sample_vcfs --chroms <chrom1,chrom2,...> [--threads <N>] <vcf1.gz> <
 
 - `<vcf.gz>` — One or more gzipped gVCF files (one per sample)
 
+## Development Container
+
+A [Containerfile](Containerfile) is provided for reproducible development with [podman](https://podman.io/). The image pins Rust (currently `1.95-bookworm`) and includes `bcftools`/`tabix` for inspecting VCF output, plus the [Claude Code](https://claude.com/claude-code) CLI for in-container agent sessions.
+
+### Getting started
+
+```
+./scripts/dev.sh                 # interactive shell inside the container
+./scripts/dev.sh cargo test      # run a one-off command
+./scripts/dev.sh cargo build --release
+```
+
+The first invocation builds the image (~4 min). Subsequent runs reuse the cached image.
+
+### Running Claude Code in the container
+
+```
+./scripts/claude.sh              # new Claude Code session
+./scripts/claude.sh --continue   # resume last session
+```
+
+The container acts as the sandbox: Claude can freely read/write/execute inside the mounted project directory but cannot touch anything else on the host, so `--dangerously-skip-permissions` is passed by default. Host `~/.claude.json` and `~/.claude/` are mounted so login and per-project auto-memory persist.
+
+### Design notes
+
+- The project directory is bind-mounted at the **same absolute path** inside and outside the container. This keeps paths consistent for tools that embed `cwd` into state (notably Claude auto-memory).
+- Container builds write to `target-container/` instead of `target/` so host and container don't invalidate each other's incremental compilation state.
+- Rootless podman maps container UID 0 to the host user, so files created inside the container appear with the correct ownership on the host.
+
 ## Architecture
 
 The pipeline flows through 5 stages:
