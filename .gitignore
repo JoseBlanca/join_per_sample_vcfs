@@ -2,3 +2,5 @@
 __pycache__/
 python_draft/__pycache__/
 .tally-config.toml
+gatk/
+freebayes/
