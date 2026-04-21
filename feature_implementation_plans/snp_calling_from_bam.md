@@ -215,6 +215,8 @@ When sample A has a deletion covering positions 1-3 and sample B has a SNP at po
 
 **[QUESTION]** How do we handle reads that only partially span the merged region (e.g., reads that cover position 1 of a 3bp deletion but end before position 3)? These can support the deletion allele (if they show the deletion at pos 1) but don't give evidence for ref across the whole region. Options: (a) count them as supporting their observed allele fragment, (b) discard them for this site.
 
+We have to detect the microsatellite regions and either remove them from the analysis or process them in an special way.
+
 ## Stage 5 — Genotype likelihoods from read evidence
 
 **Purpose:** Per sample, per possible genotype at the merged site, compute P(reads | genotype). These replace the PL values we currently read from gVCFs.

@@ -39,18 +39,6 @@ impl DeletionState {
 }
 ```
 
-### PositionGroup
-
-All input variants sharing the same start position within a group, with their source iterator indices.
-
-```rust
-struct PositionGroup<'a> {
-    pos: u32,
-    variants: Vec<&'a Variant>,
-    source_iter_idxs: Vec<usize>,
-}
-```
-
 ### UnifiedAlleles
 
 The merged allele list for one position, plus the mapping from each sample's original allele indices to unified indices.
@@ -89,51 +77,30 @@ Each step is one implementation unit: write the test(s) first, then implement.
 
 ---
 
-### Step 1: `group_variants_by_position`
+### Step 1: `detect_complex_variant`
 
 ```rust
-fn group_variants_by_position<'a>(
-    group: &'a OverlappingVarGroup,
-) -> Vec<PositionGroup<'a>>
+fn detect_complex_variant(
+    group: &OverlappingVarGroup,
+    first_pos: u32,
+) -> bool
 ```
+
+Scans all variants in the group. Returns `true` if the group covers more than one position AND any variant at a non-first position has a real ALT allele (not `*`, not `.`, not `<NON_REF>`).
 
 **Pseudocode:**
 ```
-fn group_variants_by_position(group):
-    pos_map: BTreeMap<u32, PositionGroup> = empty
-
-    for (variant, source_idx) in zip(group.variants, group.source_var_iter_idxs):
-        entry = pos_map.entry(variant.pos).or_insert(PositionGroup { pos: variant.pos, variants: [], source_iter_idxs: [] })
-        entry.variants.push(&variant)
-        entry.source_iter_idxs.push(source_idx)
-
-    return pos_map.into_values().collect()   // already sorted because BTreeMap
-```
-
-**Tests:**
-- Single-position group -> one `PositionGroup`
-- Multi-position group (deletion + SNPs) -> multiple `PositionGroup`s sorted by pos
-- Variants from different iterators at same position are grouped together
-
----
-
-### Step 2: `detect_complex_variant`
-
-```rust
-fn detect_complex_variant(position_groups: &[PositionGroup]) -> bool
-```
-
-**Pseudocode:**
-```
-fn detect_complex_variant(position_groups):
-    if position_groups.len() <= 1:
+fn detect_complex_variant(group, first_pos):
+    has_multiple_positions = group.variants.iter().any(|v| v.pos != first_pos)
+    if not has_multiple_positions:
         return false
 
-    for pos_group in position_groups[1..]:
-        for variant in pos_group.variants:
-            for allele in variant.alleles[1..]:     // skip ref
-                if allele != "*" and allele != "." and allele != "<NON_REF>":
-                    return true
+    for variant in &group.variants:
+        if variant.pos == first_pos:
+            continue
+        for allele in &variant.alleles[1..]:    // skip ref
+            if allele != "*" and allele != "." and allele != "<NON_REF>":
+                return true
     return false
 ```
 
@@ -145,31 +112,27 @@ fn detect_complex_variant(position_groups):
 
 ---
 
-### Step 3: `build_unified_alleles`
+### Step 2: `build_unified_alleles`
 
 ```rust
 fn build_unified_alleles(
-    pos_group: &PositionGroup,
+    pos: u32,
+    group: &OverlappingVarGroup,
     iter_infos: &[VarIteratorInfo],
     deletion_state: &DeletionState,
     is_first_position: bool,
-    max_ref_len: usize,       // longest ref at first position, for extending
     total_samples: usize,
-    sample_offsets: &[usize],  // sample_offsets[iter_idx] = first global sample index
+    sample_offsets: &[usize],
 ) -> UnifiedAlleles
 ```
 
+Filters `group.variants` to those starting at `pos` and builds the unified allele list.
+
 **Pseudocode:**
 ```
-fn build_unified_alleles(...):
-    // Determine the reference allele
-    // At first position of multi-position group: use longest ref
-    // At other positions: use the ref from any variant (they should all agree on ref)
-    ref_allele = longest ref allele among variants in pos_group
-    if is_first_position and max_ref_len > ref_allele.len():
-        // Shouldn't happen since max_ref_len comes from this position's variants
-        // But handle anyway
-        pass
+fn build_unified_alleles(pos, group, ...):
+    // Determine the reference allele from variants at this position
+    ref_allele = longest ref allele among variants where variant.pos == pos
 
     // Initialize unified allele list with ref
     alleles = [ref_allele.clone()]
@@ -179,17 +142,13 @@ fn build_unified_alleles(...):
     per_sample_maps = vec![vec![]; total_samples]
     per_sample_non_ref_idx = vec![None; total_samples]
 
-    // Track which samples have data at this position
-    samples_with_data: HashSet<usize> = empty
-
-    // Process each variant in the position group
-    for (variant, &iter_idx) in zip(pos_group.variants, pos_group.source_iter_idxs):
+    // Process each variant at this position
+    for (variant, &iter_idx) in group variants where variant.pos == pos:
         sample_offset = sample_offsets[iter_idx]
         n_samples_in_iter = iter_infos[iter_idx].samples.len()
 
         for local_sample in 0..n_samples_in_iter:
             global_sample = sample_offset + local_sample
-            samples_with_data.insert(global_sample)
 
             // Build the allele mapping for this sample
             sample_map = vec![0; variant.alleles.len()]
@@ -197,24 +156,18 @@ fn build_unified_alleles(...):
             for (orig_idx, allele) in variant.alleles.iter().enumerate():
                 if allele == "<NON_REF>":
                     per_sample_non_ref_idx[global_sample] = Some(orig_idx)
-                    // <NON_REF> is NOT added to unified list
-                    // Map it to a sentinel; we'll handle it in remap_pls
-                    sample_map[orig_idx] = usize::MAX  // sentinel for <NON_REF>
+                    sample_map[orig_idx] = usize::MAX  // sentinel
                     continue
 
                 // At first position, extend short alleles to match ref length
                 actual_allele = allele
                 if is_first_position and orig_idx > 0 and allele.len() < ref_allele.len():
-                    // Extend with trailing ref bases
-                    // e.g., REF=AC, ALT=C (SNP), ref_allele=AC -> ALT becomes CC
                     trailing = ref_allele[allele.len()..]
                     actual_allele = allele + trailing
 
                 if orig_idx == 0:
-                    // Ref allele: always maps to 0
                     sample_map[orig_idx] = 0
                 else:
-                    // Alt allele: add to unified set if not already present
                     unified_idx = allele_to_idx.get(actual_allele)
                     if unified_idx is None:
                         unified_idx = alleles.len()
@@ -225,16 +178,12 @@ fn build_unified_alleles(...):
             per_sample_maps[global_sample] = sample_map
 
     // Handle samples inside active deletions: their allele is *
-    // Add * to unified alleles if any sample is in a deletion
     for global_sample in 0..total_samples:
         if deletion_state.any_haplotype_in_deletion(global_sample):
             if "*" not in allele_to_idx:
                 star_idx = alleles.len()
                 alleles.push("*")
                 allele_to_idx.insert("*", star_idx)
-
-    // Samples not present at this position get a ref-only mapping (identity: [0])
-    // (handled downstream in build_position_pls; per_sample_maps stays empty for them)
 
     return UnifiedAlleles { alleles, per_sample_maps, per_sample_non_ref_idx }
 ```
@@ -249,7 +198,7 @@ fn build_unified_alleles(...):
 
 ---
 
-### Step 4: `remap_pls`
+### Step 3: `remap_pls`
 
 ```rust
 fn remap_pls(
@@ -330,11 +279,12 @@ fn remap_pls(...):
 
 ---
 
-### Step 5: `build_position_pls`
+### Step 4: `build_position_pls`
 
 ```rust
 fn build_position_pls(
-    pos_group: &PositionGroup,
+    pos: u32,
+    group: &OverlappingVarGroup,
     unified: &UnifiedAlleles,
     iter_infos: &[VarIteratorInfo],
     deletion_state: &DeletionState,
@@ -344,38 +294,36 @@ fn build_position_pls(
 ) -> Vec<f64>
 ```
 
-Builds the full PL matrix for all samples at one position.
+Builds the full PL matrix for all samples at one position. Filters `group.variants` to those at `pos`.
 
 **Pseudocode:**
 ```
-fn build_position_pls(...):
+fn build_position_pls(pos, group, ...):
     unified_num_alleles = unified.alleles.len()
     num_unified_gts = num_genotypes(unified_num_alleles, ploidy)
 
     all_pls = vec![0.0; total_samples * num_unified_gts]
 
     // Build set of which global samples have a variant at this position
-    sample_to_variant: HashMap<usize, &Variant> = {}
-    for (variant, &iter_idx) in zip(pos_group.variants, pos_group.source_iter_idxs):
+    sample_to_variant: HashMap<usize, (&Variant, usize)> = {}  // -> (variant, iter_idx)
+    for (variant, &iter_idx) in group variants where variant.pos == pos:
         offset = sample_offsets[iter_idx]
         for local in 0..iter_infos[iter_idx].samples.len():
-            sample_to_variant[offset + local] = variant
+            sample_to_variant[offset + local] = (variant, iter_idx)
 
     for global_sample in 0..total_samples:
         pl_offset = global_sample * num_unified_gts
 
         if deletion_state.any_haplotype_in_deletion(global_sample):
             // Sample is inside a deletion: synthetic hom-* PLs
-            // Find index of * in unified alleles
             star_idx = unified.alleles.iter().position(|a| a == "*")
             if star_idx is Some:
-                // Generate synthetic PLs: hom-* is the called genotype
                 synthetic_gt = vec![star_idx as i8; ploidy]
                 synthetic = synthetic_pls_from_gt(&synthetic_gt, 1, unified_num_alleles, ploidy, 0.99)
                 all_pls[pl_offset..pl_offset+num_unified_gts].copy_from_slice(&synthetic)
             continue
 
-        variant = sample_to_variant.get(global_sample)
+        (variant, iter_idx) = sample_to_variant.get(global_sample)
         if variant is None:
             // Sample not present: synthetic hom-ref PLs
             synthetic_gt = vec![0i8; ploidy]
@@ -386,47 +334,31 @@ fn build_position_pls(...):
         // Sample has a variant at this position
         allele_mapping = &unified.per_sample_maps[global_sample]
         non_ref_idx = unified.per_sample_non_ref_idx[global_sample]
+        local_sample_idx = global_sample - sample_offsets[iter_idx]
 
         // Try to get real PL values from the variant
         pl_field_idx = variant.gt_field_index("PL")
         if pl_field_idx is Some(idx):
-            // Parse PL values for this sample
             raw_pl_strings = variant.get_gt_field_by_index(idx)
-            // Find which local sample index this global sample corresponds to
-            // (determined by iter_idx and sample_offset)
-            local_sample_idx = global_sample - sample_offsets[iter_idx_for_this_sample]
             pl_str = raw_pl_strings[local_sample_idx]
             sample_pls = parse pl_str as Vec<f64> (comma-separated)
 
-            // Remap to unified space
             remapped = remap_pls(
-                &sample_pls,
-                variant.alleles.len(),
-                unified_num_alleles,
-                allele_mapping,
-                non_ref_idx,
-                ploidy,
+                &sample_pls, variant.alleles.len(), unified_num_alleles,
+                allele_mapping, non_ref_idx, ploidy,
             )
             all_pls[pl_offset..pl_offset+num_unified_gts].copy_from_slice(&remapped)
         else:
             // No PL field: generate synthetic PLs from GT, then remap
-            // Extract this sample's GT from the variant
-            local_sample_idx = ...
             gt_start = local_sample_idx * ploidy
             sample_gt = variant.genotypes[gt_start..gt_start+ploidy]
 
-            // Generate synthetic PLs in sample's local space
             sample_num_alleles = variant.alleles.len()
             synthetic = synthetic_pls_from_gt(&sample_gt, 1, sample_num_alleles, ploidy, 0.99)
 
-            // Remap to unified space
             remapped = remap_pls(
-                &synthetic,
-                sample_num_alleles,
-                unified_num_alleles,
-                allele_mapping,
-                non_ref_idx,
-                ploidy,
+                &synthetic, sample_num_alleles, unified_num_alleles,
+                allele_mapping, non_ref_idx, ploidy,
             )
             all_pls[pl_offset..pl_offset+num_unified_gts].copy_from_slice(&remapped)
 
@@ -441,7 +373,7 @@ fn build_position_pls(...):
 
 ---
 
-### Step 6: `posteriors_to_calls`
+### Step 5: `posteriors_to_calls`
 
 ```rust
 fn posteriors_to_calls(
@@ -508,7 +440,7 @@ fn posteriors_to_calls(posteriors, num_samples, ploidy, num_alleles):
 
 ---
 
-### Step 7: `prune_unused_alleles`
+### Step 6: `prune_unused_alleles`
 
 ```rust
 fn prune_unused_alleles(
@@ -584,7 +516,7 @@ fn prune_unused_alleles(alleles, genotypes, pls, ploidy, num_samples):
 
 ---
 
-### Step 8: `update_deletion_state`
+### Step 7: `update_deletion_state`
 
 ```rust
 fn update_deletion_state(
@@ -629,11 +561,12 @@ No dedicated tests (tested via orchestrator integration tests).
 
 ---
 
-### Step 9: `assign_tentative_genotypes`
+### Step 8: `assign_tentative_genotypes`
 
 ```rust
 fn assign_tentative_genotypes(
-    pos_group: &PositionGroup,
+    pos: u32,
+    group: &OverlappingVarGroup,
     unified: &UnifiedAlleles,
     deletion_state: &DeletionState,
     iter_infos: &[VarIteratorInfo],
@@ -643,16 +576,16 @@ fn assign_tentative_genotypes(
 ) -> (Vec<i8>, Vec<bool>)  // (genotypes, phases)
 ```
 
-Maps each sample's original GT to the unified allele indices. Also determines phase.
+Maps each sample's original GT to the unified allele indices. Also determines phase. Filters `group.variants` to those at `pos`.
 
 **Pseudocode:**
 ```
-fn assign_tentative_genotypes(...):
+fn assign_tentative_genotypes(pos, group, ...):
     genotypes = vec![-1i8; total_samples * ploidy]
     phases = vec![true; total_samples]
 
     // Samples with a variant at this position
-    for (variant, &iter_idx) in zip(pos_group.variants, pos_group.source_iter_idxs):
+    for (variant, &iter_idx) in group variants where variant.pos == pos:
         offset = sample_offsets[iter_idx]
         n_local = iter_infos[iter_idx].samples.len()
 
@@ -678,7 +611,6 @@ fn assign_tentative_genotypes(...):
     // Samples inside a deletion (not present at this position via a variant)
     for global in 0..total_samples:
         if genotypes[global * ploidy] == -1 and deletion_state.any_haplotype_in_deletion(global):
-            // Find * index in unified alleles
             star_idx = unified.alleles.iter().position(|a| a == "*")
             if star_idx is Some(si):
                 for h in 0..ploidy:
@@ -701,7 +633,7 @@ No dedicated tests (tested via orchestrator).
 
 ---
 
-### Step 10: `join_genotypes` (orchestrator)
+### Step 9: `join_genotypes` (orchestrator)
 
 ```rust
 pub fn join_genotypes(
@@ -713,6 +645,8 @@ pub fn join_genotypes(
 ) -> VcfResult<Vec<Variant>>
 ```
 
+The orchestrator iterates over sorted distinct positions directly, filtering `group.variants` at each position inline. No intermediate grouping struct needed — groups typically span at most ~10 positions (short deletions).
+
 **Pseudocode:**
 ```
 fn join_genotypes(group, iter_infos, prior, ploidy, remove_complex):
@@ -720,48 +654,46 @@ fn join_genotypes(group, iter_infos, prior, ploidy, remove_complex):
     sample_offsets = compute_sample_offsets(iter_infos)
     total_samples = sum of all iter_infos[i].samples.len()
 
-    // Step 1: group by position
-    position_groups = group_variants_by_position(group)
+    // Collect sorted distinct positions from the group's variants
+    positions: BTreeSet<u32> = group.variants.iter().map(|v| v.pos).collect()
+    let first_pos = *positions.first()
 
-    // Step 2: detect complex variants
-    if remove_complex and detect_complex_variant(&position_groups):
+    // Detect complex variants
+    if remove_complex and detect_complex_variant(group, first_pos):
         return Err(VcfParseError::ComplexVariantRemoved)
 
     // Initialize deletion state
     deletion_state = DeletionState::new(total_samples, ploidy)
 
-    // Determine max ref length at first position (for allele extension)
-    max_ref_len = max(v.alleles[0].len() for v in position_groups[0].variants)
-
     output_variants = []
 
-    for (i, pos_group) in position_groups.iter().enumerate():
+    for (i, &pos) in positions.iter().enumerate():
         is_first = (i == 0)
 
-        // Step 3a: build unified alleles
+        // Build unified alleles (filters group.variants to those at pos)
         unified = build_unified_alleles(
-            pos_group, iter_infos, &deletion_state,
-            is_first, max_ref_len, total_samples, &sample_offsets,
+            pos, group, iter_infos, &deletion_state,
+            is_first, total_samples, &sample_offsets,
         )
 
-        // Step 3b: build PLs for all samples
+        // Build PLs for all samples (filters group.variants to those at pos)
         position_pls = build_position_pls(
-            pos_group, &unified, iter_infos, &deletion_state,
+            pos, group, &unified, iter_infos, &deletion_state,
             &sample_offsets, total_samples, ploidy,
         )
 
-        // Step 3c: assign tentative genotypes (for phase preservation)
+        // Assign tentative genotypes for phase preservation
         (tentative_gts, phases) = assign_tentative_genotypes(
-            pos_group, &unified, &deletion_state,
+            pos, group, &unified, &deletion_state,
             iter_infos, &sample_offsets, total_samples, ploidy,
         )
 
         num_alleles = unified.alleles.len()
 
-        // Step 3d: run EM
+        // Run EM
         posteriors = estimate_posteriors(num_alleles, ploidy, total_samples, &position_pls, prior)
 
-        // Step 3e: derive GT, GQ, QUAL from posteriors
+        // Derive GT, GQ, QUAL from posteriors
         (em_genotypes, gqs, qual) = posteriors_to_calls(&posteriors, total_samples, ploidy, num_alleles)
 
         // Prefer tentative GTs when EM agrees (preserves phase)
@@ -770,42 +702,30 @@ fn join_genotypes(group, iter_infos, prior, ploidy, remove_complex):
             tentative_counts = count_alleles(tentative_gts, sample, ploidy, num_alleles)
             em_counts = count_alleles(em_genotypes, sample, ploidy, num_alleles)
             if tentative_counts == em_counts:
-                // EM agrees: keep tentative (preserves phase/order)
                 copy tentative_gts[sample*ploidy..(sample+1)*ploidy] -> final_genotypes
             else:
-                // EM changed the call: use EM genotype
                 copy em_genotypes[sample*ploidy..(sample+1)*ploidy] -> final_genotypes
-                phases[sample] = false  // phase no longer reliable
+                phases[sample] = false
 
-        // Step 3f: prune unused alleles
+        // Prune unused alleles
         (pruned_alleles, pruned_gts, pruned_pls) = prune_unused_alleles(
             &unified.alleles, &final_genotypes, &position_pls, ploidy, total_samples,
         )
 
-        // Step 3g: skip invariant
+        // Update deletion state (always, even if we skip the position)
+        deletion_state.decrement_all()
+        update_deletion_state(&final_genotypes, &unified.alleles, &mut deletion_state, total_samples, ploidy)
+
+        // Skip invariant positions
         if pruned_alleles.len() <= 1:
-            // Update deletion state before skipping
-            // (need to decrement counters even if we don't emit)
-            deletion_state.decrement_all()
-            update_deletion_state(&final_genotypes, &unified.alleles, &mut deletion_state, total_samples, ploidy)
             continue
 
-        // Step 3h: update deletion state
-        deletion_state.decrement_all()
-        update_deletion_state(&pruned_gts, &pruned_alleles, &mut deletion_state, total_samples, ploidy)
-
-        // Step 3i: build output Variant
+        // Build output Variant
         variant = Variant::new(
-            group.chrom.clone(),
-            pos_group.pos,
-            pruned_alleles,
-            pruned_gts,
-            phases,
-            total_samples,
+            group.chrom.clone(), pos, pruned_alleles, pruned_gts, phases, total_samples,
         )
         variant.qual = qual as f32
         // TODO: store GQ, PL in variant (requires extending Variant or output format)
-        // For now, we could store them in sample_gt_fields or add new fields
 
         output_variants.push(variant)
 
@@ -837,17 +757,16 @@ ComplexVariantRemoved { chrom: String, pos: u32 },
 
 | Order | Function                      | Dedicated tests? | Depends on     |
 |-------|-------------------------------|-------------------|----------------|
-| 1     | `DeletionState`               | Yes               | -              |
-| 2     | `group_variants_by_position`  | Yes               | -              |
-| 3     | `detect_complex_variant`      | Yes               | Step 2         |
-| 4     | `build_unified_alleles`       | Yes               | Step 1         |
-| 5     | `remap_pls`                   | Yes               | -              |
-| 6     | `build_position_pls`          | Yes               | Steps 4, 5    |
-| 7     | `posteriors_to_calls`         | Yes               | -              |
-| 8     | `prune_unused_alleles`        | Yes               | -              |
-| 9     | `update_deletion_state`       | No (via Step 11)  | Step 1         |
-| 10    | `assign_tentative_genotypes`  | No (via Step 11)  | Step 4         |
-| 11    | `join_genotypes`              | Yes (integration) | Steps 1-10     |
+| 0     | `DeletionState`               | Yes               | -              |
+| 1     | `detect_complex_variant`      | Yes               | -              |
+| 2     | `build_unified_alleles`       | Yes               | Step 0         |
+| 3     | `remap_pls`                   | Yes               | -              |
+| 4     | `build_position_pls`          | Yes               | Steps 2, 3    |
+| 5     | `posteriors_to_calls`         | Yes               | -              |
+| 6     | `prune_unused_alleles`        | Yes               | -              |
+| 7     | `update_deletion_state`       | No (via Step 9)   | Step 0         |
+| 8     | `assign_tentative_genotypes`  | No (via Step 9)   | Step 2         |
+| 9     | `join_genotypes`              | Yes (integration) | Steps 0-8      |
 
 ## Deferred work (not part of this plan)
 
