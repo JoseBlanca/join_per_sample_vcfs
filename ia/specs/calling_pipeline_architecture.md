@@ -119,6 +119,18 @@ One BAM → one `.psf`. Encodes everything downstream stages might need to
 compute a likelihood for this sample against any allele that may later be
 introduced into the merged variant set by other samples.
 
+Stage 1 is built in-tool rather than wrapped around an existing
+per-sample caller (freebayes, bcftools mpileup). The output format
+is the custom `.psf` (see Stage 2), which no existing caller
+emits; the quality adjustment we want is BAQ applied inline and
+parallelised across reads (see §"Why BAQ in-process" below), which
+`samtools calmd` cannot do in-process; and the per-read likelihood
+model we need is the simple freebayes-shaped one (Option B in
+§"Per-read likelihood quality" below) rather than HaplotypeCaller's
+PairHMM. Wrapping an existing caller would force us to write the
+same BAM-walking + scalar-accumulation code anyway, and would add
+an external dependency and an IO round-trip for no saved work.
+
 ### What it does, conceptually
 
 1. Streams the BAM, position by position, accumulating per-sample per-read
@@ -248,9 +260,12 @@ rejects per-read storage in favour of per-allele scalar summaries —
 sufficient to reproduce freebayes' posterior calculation exactly (see
 [freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md),
 section "The data freebayes actually consumes") at constant size in
-depth. PSP v1 needs to be revised accordingly; the BAQ-adjusted BQ
-values should also be reflected in whatever quality summary the
-revised format records.
+depth. Per-read storage would buy flexibility for alternative
+per-read likelihood models (PairHMM-style, novel error models) that
+this pipeline does not plan to support, at a cost linear in coverage
+— a trade we explicitly decline. PSP v1 needs to be revised
+accordingly; the BAQ-adjusted BQ values should also be reflected in
+whatever quality summary the revised format records.
 
 ## Stage 2 — per-sample file contract (`.psf`)
 
@@ -269,6 +284,21 @@ The contents of a per-position record:
 | `n_alleles` | number of distinct alleles observed at this position. `1` when all reads at this position agree on REF; `≥2` as soon as any read disagrees — even a single read supporting an alt. Stage 1 does not make variant / non-variant decisions; it just records what the reads show. |
 | per observed allele: allele sequence + the **five scalars** below | the single source of truth for per-sample evidence at this position |
 | per observed allele: phase chain identifier | links alleles across positions that co-occur on the same haplotype in this sample; lets the merger reason about compound haplotypes without needing any extra sequence context |
+
+**No explicit haplotype-context field.** A natural-looking
+alternative is to store a "local consensus sequence" on each allele
+— the surrounding bases the read carries around the variant — so
+the merger can reconstruct compound haplotypes by sequence
+alignment. The record above deliberately does not carry one,
+because every piece of information such a field would provide is
+already in the record or reachable from it: the reference sequence
+is in the FASTA, the sample's alt alleles sit in the per-position
+records themselves, and the linkage between alleles at different
+positions (which is the only cross-position fact the merger
+actually needs) comes from matching phase chain ids. Adding a
+consensus-sequence field would duplicate data already present
+elsewhere without enabling any reasoning the phase chain ids do
+not already support.
 
 ### The five per-allele scalars
 
@@ -412,6 +442,46 @@ Note: lossless RLE is *not* a gVCF block. A gVCF block merges adjacent
 positions with *similar* data into a single summary; lossless RLE
 merges adjacent positions with *identical* records and preserves the
 full data on decompression.
+
+### Why custom binary rather than BCF
+
+The `.psf` is an internal pipeline artefact consumed only by
+Stages 3–6 of this tool; no external consumer reads it. That
+removes the main reason to adopt BCF (tool interop), and the data
+shape — per-position pileup records with per-allele scalars and
+phase chain ids — does not map naturally onto BCF's per-variant
+FORMAT model. Scalars would have to be shoehorned into
+non-standard FORMAT fields that other BCF consumers could not
+interpret correctly anyway, so the nominal interop advantage
+would be lost in practice.
+
+Custom binary gives, in exchange for giving up bcftools interop:
+
+- **native fit to the per-position record shape** — scalars and
+  phase chain ids live as first-class fields rather than
+  overloaded FORMAT columns;
+- the full compression stack described above (`delta_pos`
+  implicit position, columnar per-block layout, zstd, optional
+  lossless RLE for identical runs) — realistic ~2–3× smaller
+  than an equivalent BCF;
+- **streaming write and streaming read** with no back-patched
+  headers and no CSI index needed (Stages 3–6 scan entire files
+  in order);
+- **one file per sample as the natural granularity** — which is
+  what cheap cohort recall requires, and which BCF tooling is
+  not built around (BCF's natural granularity is multi-sample
+  cohort files).
+
+The costs are real but bounded: no bcftools interop, a small
+`psf dump` / `psf head` utility for debugging (~a few hundred
+lines), and explicit version management via a magic number +
+version word at the file head. Readers reject unknown versions
+rather than silently guessing.
+
+A `psf → BCF`/VCF exporter is not planned now. It is a
+straightforward data-shape transformation that can be added as
+its own module if and when an external consumer requires it; no
+design decision here commits us either way.
 
 ### Why PLs are *not* stored
 
@@ -706,6 +776,490 @@ genome, with no phasing evidence in this sample) fall back to the
 standard formula and are flagged in the merged record so Stage 6
 knows the likelihood is approximate.
 
+### The statistics, explained
+
+This subsection expands the likelihood formula in step 2 above into
+the full statistical story, written for geneticists not specialised
+in statistics. Every formula is given an intuitive gloss. For
+source-level detail on the same quantities, see
+[freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md),
+which walks through freebayes' original C++ implementation, and
+[gatk_vs_freebayes_comparison.md](gatk_vs_freebayes_comparison.md)
+for the same terms in GATK.
+
+#### The question being asked
+
+For each sample `s` at each site, we want the posterior:
+
+```
+P(G_s | reads from every sample in the cohort)
+```
+
+"given everything every sample's reads say, what is the probability
+that sample `s`'s genotype is `G`?". Bayes' theorem decomposes this
+into two pieces:
+
+```
+P(G_s | reads)  ∝   P(reads_s | G_s)    ×   P(G_s | cohort-level information)
+                    └── likelihood ──┘      └─────────── prior ───────────┘
+```
+
+Stage 5 computes the **likelihood** — `P(reads_s | G)` — for every
+merged candidate genotype `G` and every sample `s`. Stage 6 combines
+that likelihood with the prior and iterates to a final posterior.
+
+#### What the likelihood actually measures
+
+`P(reads_s | G)` asks: "if sample `s` really had genotype `G`, how
+likely are the reads we observed?". Two conditions have to hold for
+the reads to be likely under `G`:
+
+1. Any read supporting an allele **not in** `G` has to be explained
+   as something other than sample `s`'s germline genotype —
+   principally a sequencing error or a mismapping, though at low
+   levels contaminating DNA from another source can also account for
+   such reads (see the contamination caveat below). The BQ/MQ-covered
+   part of that cost is what appears in the error-cost term.
+2. Among reads supporting alleles **in** `G`, the split across alleles
+   must look like what `G` predicts. A heterozygous `A/T` is expected
+   to produce roughly 50/50 A:T reads; a 20/0 split is unlikely under
+   `A/T`. A homozygous `A/A` is expected to produce ≈100% A reads; a
+   10/10 split is unlikely under `A/A`.
+
+These two checks are exactly the two terms in the formula:
+
+```
+L(G)  =   Σ over alleles a ∉ G of S_a              ←  "error-cost" term
+        + multinomial(allele_probs(G), obs_counts_in_G)   ←  "allele-balance" term
+```
+
+Reads supporting alleles not in `G` flow *only* through the
+error-cost term. They are taken out of the multinomial so that the
+multinomial is not multiplied by a zero expected probability.
+
+#### The error-cost term: `Σ_{a ∉ G} S_a`
+
+`S_a` is the per-allele quality scalar stored in the `.psf` for
+sample `s`:
+
+```
+S_a  =  Σ over reads supporting a of  max( ln(BQ_error), ln(MQ_error) )
+```
+
+where `BQ_error = 10^(-Q/10)` is the per-base sequencing-error
+probability implied by the Phred base quality and `MQ_error =
+10^(-MQ/10)` the per-read mismapping probability from MAPQ. Per read
+the **larger** error dominates — the read is only as trustworthy as
+its weakest link — so the maximum of the two log-error-probs is
+taken before summing.
+
+Under the hypothesis that sample `s` has genotype `G`, every read
+supporting an allele `a ∉ G` has to be explained as a sequencing
+error (BQ) or a mismapping (MQ). The total log-probability "all
+these reads are BQ/MQ-explained" is exactly `Σ_{a ∉ G} S_a`. A
+third mechanism — contamination — is not captured by
+`max(ln_BQ, ln_MQ)`; see the subsection below.
+
+**Geneticist intuition.** Twenty A-reads at Q=30 accumulate into
+`S_A ≈ 20 × -6.9 = -138`. If we evaluate `G = T/T`, the full `-138`
+is applied — effectively zero likelihood. This is how the error-cost
+term crushes genotypes that are grossly contradicted by the reads.
+
+#### When a read "not in G" isn't actually an error: contamination
+
+The error-cost term above models out-of-`G` reads as BQ/MQ errors
+only. In reality such reads can also arise from:
+
+- **Cross-sample contamination.** A fraction of reads may derive
+  from another individual's DNA — library-prep carry-over, index
+  hopping on the sequencer, or an outright sample swap. These reads
+  are real DNA, not sequencing artefacts, so their BQ and MQ are
+  fine; they simply do not belong to sample `s`.
+- **Somatic mosaicism.** Reads carrying a truly present but
+  non-germline variant in a small subset of cells.
+
+The `max(ln_BQ, ln_MQ)` scalar models neither case explicitly, so
+the base error-cost formula overpenalises genotypes in samples
+with real contamination. In well-prepared libraries contamination
+is typically <1 % and the mis-modelling is noise-level, but at
+higher levels — FFPE tumour material, environmental samples,
+deliberately pooled libraries — it biases the pipeline toward
+calling contaminating alt reads as real low-frequency variants.
+Because low-level contamination is common enough in practice to
+matter, **the pipeline models it explicitly**, as follows.
+
+**The mixture model.** Each read in sample `s` is treated as
+coming from a two-component mixture:
+
+- with probability `1 − c_s`, the read is from `s`'s own DNA (the
+  standard per-read model — consistent with `G_s` at expected
+  allele fractions, modulated by BQ/MQ errors);
+- with probability `c_s`, the read is from a random cohort member,
+  whose allele at this site is distributed as the population
+  allele frequency `p` (one read = one chromosome drawn under HWE).
+
+Per-read probability of supporting allele `a`:
+
+```
+P(read → a | G_s, c_s, p)
+   =  (1 − c_s) · P_own(a | G_s, BQ, MQ)     ← existing own-DNA term
+   +  c_s       · p_a                         ← contamination term
+```
+
+The genetics insight behind this form is that contaminating reads
+do not support random alleles — they support alleles that exist
+in *other samples*. A hom-A sample whose "odd reads" at a site
+with population AFs `(p_A = 0.3, p_B = 0.7)` preferentially
+support `B` rather than `C` or `G` is showing the fingerprint of
+contamination, not random sequencing error (which would be
+roughly unbiased across the three non-`A` bases). The mixture
+term `c_s · p_a` captures this formally.
+
+**Estimating `c_s`.** `c_s` is one more parameter estimated by
+the Stage 6 EM loop, jointly with the population allele
+frequencies `p`:
+
+- **E-step** — per-sample genotype posteriors given the current
+  `(p, c_s)`.
+- **M-step on `p`** — as before (posterior-weighted allele
+  counts + Dirichlet pseudocounts).
+- **M-step on `c_s`** — a 1D maximisation per sample: choose the
+  `c_s` that best explains the sample's odd-read pattern given
+  `p`.
+
+Most of the information about `c_s` comes from sites where the
+sample is confidently non-heterozygous and yet carries odd reads
+matching population-common alt alleles. No external estimate or
+reference panel is required. A user-supplied seed value (as in
+freebayes' `--contamination-estimates` or the output of
+VerifyBamID2 / GATK `CalculateContamination`) is still accepted
+and overrides the EM estimate when present.
+
+**Scalar-storage approximation.** The mixture log does not
+factor cleanly over the stored scalars:
+
+```
+log L_a = Σ over reads of log[ (1 − c_s) · P_err(read) + c_s · p_a ]
+```
+
+The `log` wraps a sum *inside* the per-read product, so each
+read needs its individual quality — a per-read value that `S_a`
+threw away when Stage 1 pre-summed. The pipeline therefore uses
+the **homogeneous-quality approximation**: all reads supporting
+allele `a` are treated as sharing the mean quality
+`S_a / count_a`, so the mixture is evaluated once per
+(sample, allele) and multiplied by `count_a`. No extra scalar is
+added to the `.psf`.
+
+The approximation is exact when all reads supporting `a` happen
+to have identical quality, and degrades as per-read qualities
+spread. At the 1–10 % contamination regime this matters for, the
+contamination term in the mixture tends to dominate each
+per-read log and the approximation stays tight. A follow-up
+option — adding one more per-allele scalar that makes the
+mixture reconstruction exact — is deferred until we see
+approximation error in practice.
+
+Relationship to freebayes: freebayes' own optional correction
+([DataLikelihood.cpp:116-130](../../freebayes/src/DataLikelihood.cpp#L116-L130),
+[freebayes_posterior_gt_probs.md §2d](freebayes_posterior_gt_probs.md#2d-contamination-and-reference-bias))
+takes a different shape — rescaling the reference-allele
+sampling probability rather than the per-read mixture — because
+freebayes operates on reads in memory and does not face the
+scalar-reconstruction constraint. It also requires the user to
+supply a contamination fraction externally; this pipeline infers
+`c_s` from the cohort as a side effect of the EM.
+
+#### The allele-balance term
+
+`obs_counts_in_G` are the observation counts for the alleles in `G`
+and `allele_probs(G)` is the vector of expected allele fractions
+under `G` — ploidy-aware:
+
+- `A/A` diploid: `(A, T) → (1, 0)`
+- `A/T` diploid: `(A, T) → (0.5, 0.5)`
+- `A/A/T` triploid: `(A, T) → (2/3, 1/3)`
+
+The multinomial PMF of the observed counts given those expected
+fractions is one standard probability calculation. Its role is to
+**penalise genotypes whose predicted balance does not match the
+observed counts**.
+
+**Geneticist intuition.** The discriminating power of this term
+grows with depth. At 20× coverage:
+
+- 20 A + 0 T under `A/A`: multinomial = 1 (log 0). Under `A/T`:
+  multinomial = `0.5²⁰ ≈ 10⁻⁶` — roughly a Phred-60 penalty. So the
+  multinomial alone can strongly rule out `A/T` from a clean
+  homozygous pileup.
+- 10 A + 10 T under `A/T`: multinomial peaks at the 50/50
+  expectation. Under `A/A` the T-reads leave the multinomial and
+  contribute to the error-cost term instead (~`10 × -6.9 = -69`),
+  which is how `A/A` is penalised in this case.
+
+At 5× the same comparison is much gentler (`0.5⁵ ≈ 0.03`, ~Phred
+15). Low-depth samples therefore rely more heavily on the
+error-cost term and on the cohort-level prior to tell genotypes
+apart — one of the main reasons joint calling across many samples
+adds value over per-sample calling.
+
+#### Why the five `.psf` scalars are enough
+
+| Scalar | Role |
+|---|---|
+| observation count | `obs_counts` in the multinomial (likelihood) |
+| `S_a = Σ max(ln_BQ, ln_MQ)` | `S_a` in the error-cost term (likelihood) |
+| forward-strand count | strand-bias prior (Stage 6) |
+| placed-left count | read-placement bias prior (Stage 6) |
+| placed-start count | fragment-position bias prior (Stage 6) |
+
+Both likelihood terms are written purely in terms of `obs_counts`
+and `S_a`, so the Stage 5 reconstruction is **exact** — bit-for-bit
+identical to what freebayes would compute with the full BAM in
+memory. The three remaining scalars feed observation-bias priors in
+Stage 6.
+
+A natural question is whether `sum(BQ)` and `sum(MQ)` separately
+could replace `S_a`. They cannot: the `max` in log space is
+nonlinear and has to be applied **per read** before summing. See
+[freebayes_posterior_gt_probs.md §Compactness implications](freebayes_posterior_gt_probs.md#compactness-implications--important-subtlety-about-bq-and-mq).
+
+#### Alleles the sample never locally observed
+
+A sample's `.psf` lists only alleles its own reads support. At the
+cohort level, the merged genotype `G` for sample `s` may include an
+allele `x` that `s` never observed — e.g. another sample
+contributed a novel ALT. The formula handles this automatically:
+
+- `obs_count(x) = 0` and `S_x = 0` for sample `s`, so `x`
+  contributes nothing in either term.
+- The sample's **own** locally observed alleles `a` that are not in
+  `G` still contribute their full `S_a` to the error-cost term —
+  those reads have to be errors under `G`.
+
+This reproduces freebayes' `<NON_REF>`-like behaviour for free. No
+separate `<NON_REF>` PL is stored, and the same mechanism
+generalises to compound haplotype alleles that `<NON_REF>` alone
+cannot represent (see §"Why a stored `<NON_REF>` / `<OTHER>` PL is
+also not needed" above).
+
+#### Compound haplotype alleles: the phase-chain check
+
+For most genotypes `G` the formula above is exact. The one case
+that needs extra machinery is a **compound haplotype allele** — an
+allele that is itself a combination of per-position variants
+co-occurring on the same haplotype (e.g. "SNP at 101 + deletion
+spanning 102–105" on one chromosome).
+
+A per-position `.psf` record stores evidence for each variant
+separately, but a compound is only "present" in sample `s` if `s`'s
+reads carry the pieces *together*, on the same read or read pair.
+Stage 1 therefore records a **phase chain identifier** on each
+allele whose support is linked to another position's allele by a
+shared read. At Stage 5:
+
+- If the compound's constituents share a phase chain id in sample
+  `s`, the sample's reads do carry the compound → evaluate the
+  likelihood normally, using the compound's joint observation count
+  and joint quality scalar.
+- Otherwise, the sample's reads carry only the constituents
+  separately. Under the hypothesis that `s` has the compound, those
+  reads have to be explained away. Stage 5 falls back to the
+  standard formula and flags the record as "compound-approximate"
+  so Stage 6 can interpret the resulting GQ conservatively.
+
+For every non-compound site — and for compound sites where the
+evidence is clean in every sample — the reconstruction is exact.
+For the fraction of compound sites where some samples have only
+partial phasing, the likelihood is approximate and explicitly
+labelled.
+
+**VCF encoding of the flag.** The approximation is surfaced in
+the final multi-sample VCF as a single boolean per-sample FORMAT
+field, `CA` (compound-approximate): `1` on records where this
+sample's likelihood was reconstructed under the phase-broken
+fallback, `0` otherwise. The field is absent entirely on
+non-compound records, to keep simple-SNP records uncluttered.
+No tiered scheme and no per-genotype granularity: the flag
+addresses a small minority of sites (compound haplotype +
+partial phase in some sample) and does not need a richer
+taxonomy to be useful. Downstream consumers that care about
+likelihood provenance filter on `CA`; everyone else ignores it.
+
+#### From likelihood to posterior (Stage 6, in one picture)
+
+Stage 5 outputs a per-sample, per-genotype likelihood table. Stage
+6 combines it with two pieces of population-genetic prior
+information:
+
+1. **Allele frequency in the cohort — Dirichlet prior with tiny
+   alt pseudocounts.** Rare alleles are *a priori* less common
+   than common ones; a single-sample homozygous-alt call out of
+   a thousand samples is implausible unless the likelihood is
+   very strong. Stage 6 estimates `p` at each site by EM,
+   iteratively tightening a point estimate from soft per-sample
+   posteriors. Full derivation in
+   [posterior_gt_probs.md](posterior_gt_probs.md).
+
+   The prior on `p` is a **Dirichlet distribution** with
+   GATK-style pseudocounts: `α_ref = 10`, `α_alt = 0.01` for
+   SNPs, `α_alt = 0.00125` for indels. User-overridable via
+   `--ref-pseudocount`, `--snp-alt-pseudocount`, and
+   `--indel-alt-pseudocount`. The M-step posterior mean is
+   closed-form:
+
+   ```
+   p̂_k  ∝  α_k  +  E[n_k]
+   ```
+
+   where `E[n_k]` is the posterior-weighted expected count of
+   allele `k` across the cohort. The pseudocounts act as a
+   pre-observation belief (≈99.9 % ref, ≈0.1 % any given alt):
+   at small cohorts they shrink weak alt evidence toward zero;
+   at large cohorts real alt signal overwhelms them and `p̂`
+   tracks the data. This is the same prior shape used by GATK's
+   `GenotypeGVCFs`.
+
+   **Why Dirichlet rather than Ewens' sampling formula.**
+   freebayes' equivalent prior is Ewens' sampling formula
+   ([freebayes_posterior_gt_probs.md §Component 2](freebayes_posterior_gt_probs.md#component-2--pallele-frequency-ewens-sampling-formula)),
+   parameterised by a population mutation rate `θ`. Both priors
+   encode the same genetics — rare alleles are *a priori* more
+   plausible than common ones, 50/50 splits are unusual — but
+   they differ in mathematical shape and, crucially, in whether
+   they fit EM. We pick Dirichlet for three reasons, recorded
+   here so a future redesign knows what has to be re-argued
+   before switching:
+
+   - **Conjugacy with the M-step.** Dirichlet-multinomial is
+     the conjugate pair for allele-frequency updates. The
+     M-step reduces to a closed-form sum — one addition per
+     allele per iteration. Ewens has no conjugacy with anything
+     in this pipeline; mixing it into the EM loop would require
+     a numerical maximisation every round, giving up the main
+     reason EM is the right algorithm at this scale. This is
+     the same reason GATK uses Dirichlet, and we follow.
+   - **Fits the pipeline's data structures.** Ewens scores the
+     *joint partition* of allele counts across samples (e.g. a
+     "one major + one rare" partition is scored differently
+     from a "two equal" partition). This partition is the
+     natural object in freebayes' combo search, where each
+     combo has one concrete partition. Our pipeline never
+     builds partitions of this form — it tracks per-sample
+     genotype posteriors and a single `p` vector. The object
+     Ewens scores is simply not represented in our data flow.
+   - **At our target scale, the choice is invisible.** At
+     thousands of samples the data dominates either prior and
+     `p̂` converges to the same value regardless. The
+     theoretical gap between Ewens and Dirichlet matters only
+     at small cohorts with marginal variants — which is exactly
+     the regime where the EM point estimate of `p` is itself
+     suspect (see §"Why EM rather than freebayes' combo search"
+     below). So there is no scenario in which Dirichlet loses
+     meaningfully to Ewens at target scale; at small scale the
+     entire EM-vs-combo-search decision reopens, and the
+     prior-shape choice rides along with it rather than
+     standing alone.
+
+   **Consequence for a future redesign.** Swapping Dirichlet
+   for Ewens in isolation is not a well-posed change: Ewens
+   only pays off in combination with combo-search
+   marginalisation (freebayes' full approach), and combo search
+   does not scale to thousands of samples. A future pipeline
+   that wants Ewens-level calibration at small cohorts should
+   revisit the EM-vs-combo-search decision first; the prior
+   choice follows from that, not the other way around.
+2. **Hardy–Weinberg proportions given `p`, adjusted by an
+   inbreeding coefficient `F`.** Under pure HWE (`F = 0`) the
+   expected genotype frequencies in the cohort are `(1 − p)²`,
+   `2 p (1 − p)`, `p²` (diploid biallelic). With `F > 0`:
+
+   ```
+   P(AA) = (1 − p)²  +  F · p (1 − p)
+   P(AB) = 2 p (1 − p) · (1 − F)
+   P(BB) = p²        +  F · p (1 − p)
+   ```
+
+   — homozygotes are enriched and heterozygotes depleted by a
+   factor of `F`. `F = 0` recovers pure HWE; `F = 1` means fully
+   homozygous lines (e.g. doubled haploids or long-inbred
+   material); negative `F` is allowed and encodes excess
+   heterozygosity (e.g. heterotic F1 populations).
+
+   `F` is exposed as the `--inbreeding` CLI parameter — a single
+   cohort-wide scalar, **default `0`**. The project targets
+   plant populations, where self-pollination, clonal
+   propagation, and inbred-line breeding make `F > 0` the norm
+   rather than the exception, and where assuming strict HWE
+   would systematically overcall heterozygotes. Typical values:
+   ≈0.98 for pure inbred lines or doubled haploids, ≈0.5 for a
+   few generations of selfing from an outcrossing ancestor, 0
+   for open-pollinated species or wild panels.
+
+   Internally, `F` is stored as a **per-sample vector `F_s`**,
+   initialised from the single user-supplied scalar (all samples
+   get the same value). The HWE prior then reads `F_s` rather
+   than a scalar `F` throughout. Keeping the internal
+   representation per-sample from day one costs essentially
+   nothing (one extra vector allocation) but leaves the upgrade
+   path open: adding per-sample `F` later (via a user-supplied
+   per-sample file) becomes a user-interface change, not an
+   algorithmic change. The user-facing interface stays simple —
+   one scalar — until there is a real case that needs more.
+   Beyond a user-supplied per-sample file, data-driven inference
+   of `F_s` from excess homozygosity in the sample's own calls
+   is a further possible extension, deferred for the same
+   reason: no concrete need today.
+
+Putting it together:
+
+```
+P(G_s | reads_cohort)  ∝   L_s(G_s)  ×  HWE(G_s | p̂)  ×  bias_priors
+```
+
+normalised so each sample's per-genotype posterior sums to 1. From
+there:
+
+- **GT** = argmax genotype.
+- **GQ** = Phred of `1 − P(best_genotype_s)`.
+- **QUAL** (site-level) = Phred of `Π_s P(hom-ref)_s`, i.e. the
+  posterior probability that the site is actually variant in at
+  least one sample.
+
+The observation-bias priors use the three bias scalars from the
+`.psf`. Conceptually: a candidate whose alt-supporting reads are
+all on one strand, or bunched at one end of the fragment, is more
+likely to be a systematic artefact than a real variant, so its
+posterior is down-weighted. Structural form as in
+[freebayes_posterior_gt_probs.md §Component 4](freebayes_posterior_gt_probs.md#component-4--observation-level-bias-priors-optional);
+unlike GATK, which handles these as post-hoc annotations (SOR, FS),
+this pipeline keeps them inside the posterior as freebayes does.
+
+#### Why EM rather than freebayes' combo search
+
+freebayes does not estimate a single `p̂`; it enumerates (searches)
+joint genotype *combos* across all samples and marginalises back to
+per-sample posteriors. The full three-way comparison (freebayes
+combo search, GATK EM, full MCMC) is in
+[freebayes_posterior_gt_probs.md §Three ways to solve the same problem](freebayes_posterior_gt_probs.md#three-ways-to-solve-the-same-problem-freebayes-gatk-mcmc)
+and [gatk_vs_freebayes_comparison.md §Breaking the chicken-and-egg](gatk_vs_freebayes_comparison.md#breaking-the-chicken-and-egg).
+Short version:
+
+- **Small cohorts (tens to a few hundred samples):** combo search
+  is better calibrated because it implicitly integrates over
+  uncertainty in `p`. EM collapses `p` to a point estimate and can
+  be slightly overconfident at rare variants.
+- **Target scale of this pipeline (thousands of samples):** the
+  posterior on `p` is so tight that `p̂` effectively equals the
+  integral. EM and combo search converge to the same numbers, and
+  EM wins on scaling (linear in sample count; combo search grows
+  much faster and runs out of budget past a few hundred samples).
+
+So EM here is a cheap approximation at small N and *the* correct
+answer at large N. See §"Stage 6 — posterior engine §Why EM, not
+combo-search marginalisation" below for the corresponding
+discussion at the Stage-6 level.
+
 ### Parallelism
 
 Groups are independent of each other: each one contains everything it
@@ -720,6 +1274,38 @@ This is the headline parallelism of the cohort side of the pipeline.
 Stage 1 parallelises across samples; Stage 5 parallelises across
 groups. Stage 4 (grouping) and Stage 6 (posterior EM) remain
 sequential but are cheap relative to Stage 5's per-group work.
+
+### No in-tool chunking
+
+The pipeline does not tile the genome into chunks for internal
+parallelism. The iterator chain already bounds memory at every
+stage: per-sample `.psf` readers hold one decompressed block each;
+the multi-way merger holds one next-record slot per sample
+(O(N_samples) × ~50 B); Stage 4 holds the currently-open group
+(a few hundred bp × cohort-wide records); Stage 5 holds only the
+groups currently being processed by rayon workers. None of those
+grow with `N_samples × genome_length`, so a single machine handles
+thousands of samples end-to-end without chunking.
+
+Two scenarios that *would* motivate chunking are explicitly not
+current requirements:
+
+- **Distribution across a cluster.** Achievable externally by
+  invoking the tool per chromosomal region — every node needs
+  only the same `.psf` files and reference, which are already
+  distributable.
+- **Region-selective re-processing** after adding samples. Same
+  external-invocation story.
+
+Both scenarios additionally require random-access seek into each
+`.psf` (a sidecar index with file offsets per chromosomal chunk),
+which contradicts the streaming-only posture of the `.psf` format
+(see Stage 2 §"Why custom binary rather than BCF"). If a real
+in-tool need later emerges — e.g. a cluster-native deployment
+that wants a single invocation across many nodes — the index
+plus tile-boundary handling (for compound variants that straddle
+tile edges) can be added against that concrete requirement
+rather than speculatively now.
 
 ### Relationship to the existing code
 
@@ -738,18 +1324,34 @@ generalised to:
 
 ### Algorithm
 
-EM over allele frequency, exactly as described in
-[posterior_gt_probs.md](posterior_gt_probs.md):
+EM over allele frequency, extended with a per-sample contamination
+parameter. The baseline algorithm is described in
+[posterior_gt_probs.md](posterior_gt_probs.md); the contamination
+extension is in Stage 5 §"When a read 'not in G' isn't actually an
+error: contamination".
 
-1. Initialise flat allele frequencies.
-2. **E-step**: for each sample, compute per-genotype posteriors using the
-   likelihood assigned above + HWE prior (with optional inbreeding
-   coefficient `F`).
-3. **M-step**: update allele frequencies from posterior-weighted allele
-   counts + Dirichlet pseudocounts.
-4. Iterate until convergence. Typically 3–5 rounds.
-5. QUAL = Phred of `Π_s P(hom-ref)_s`.
-6. Assign GT = argmax genotype. GQ = Phred of `1 − P(best_genotype)`.
+1. Initialise flat allele frequencies `p` and `c_s = 0` for every
+   sample.
+2. **E-step**: for each sample, compute per-genotype posteriors
+   using the mixture likelihood (current `p` and `c_s`) + the
+   HWE-with-`F` prior (see Stage 5 §"From likelihood to
+   posterior"). `F` is cohort-wide, user-supplied via
+   `--inbreeding`, default `0`.
+3. **M-step on `p`**: update allele frequencies from
+   posterior-weighted allele counts + Dirichlet pseudocounts
+   (`α_ref = 10`, `α_alt = 0.01` SNP, `α_alt = 0.00125` indel;
+   overridable via `--ref-pseudocount` /
+   `--snp-alt-pseudocount` / `--indel-alt-pseudocount`). Rationale
+   for Dirichlet over freebayes' Ewens prior is in Stage 5
+   §"From likelihood to posterior".
+4. **M-step on `c_s`**: 1D per-sample update that maximises the
+   sample's likelihood at its soft-assigned genotypes, using the
+   pattern of odd reads at confidently-non-heterozygous sites as
+   the main signal. Skipped when the user has supplied a fixed
+   `c_s` externally.
+5. Iterate until convergence. Typically 3–5 rounds.
+6. QUAL = Phred of `Π_s P(hom-ref)_s`.
+7. Assign GT = argmax genotype. GQ = Phred of `1 − P(best_genotype)`.
 
 ### Why EM, not combo-search marginalisation
 
@@ -787,71 +1389,6 @@ and merges where the samples carrying the compound alleles are the ones
 with direct per-sample evidence — the tiered rule gives exact or
 near-exact likelihoods.
 
-## Open decisions
-
-1. **Per-read records vs. per-allele summaries in `.psf`.** — **Resolved: per-allele summaries.**
-   The five scalars listed in Stage 2 are sufficient to reproduce
-   freebayes' likelihood and priors exactly. Per-read storage (the PSP v1
-   approach) buys flexibility for future alternative likelihood models we
-   have no plans for, at a linear cost in coverage. PSP v1 needs to be
-   revised to match.
-
-2. **Haplotype context representation.** — **Resolved: not stored;
-   phase chain identifiers are sufficient.** The per-position allele
-   records + phase chain ids linking alleles across positions provide
-   everything the merger needs to reason about compound haplotypes.
-   A separate "local consensus sequence" field on each allele was
-   considered and rejected as redundant: the reference comes from the
-   FASTA, the sample's alt alleles are already in the per-position
-   records, and the "which reads carry which combination" linkage
-   comes from matching phase chain ids across positions.
-
-3. **Serialisation: BCF vs. custom binary.**
-   - BCF gives tool interop, existing indexing, and a well-understood
-     FORMAT extension mechanism.
-   - Custom binary (PSP v1 route) is ~2–3× smaller and avoids BCF overhead
-     for fields we use in a non-standard way.
-   - The two can coexist: start custom, add a BCF exporter later.
-
-4. **Build Stage 1 or leverage existing callers.** — **Resolved: build
-   Stage 1 ourselves**, with BAQ computed inline in the per-sample
-   caller. Rationale: the per-read likelihood model we need is
-   freebayes-shaped and simple (Option B in the Stage 1 discussion),
-   but `samtools calmd` is single-threaded and has been a real-world
-   performance bottleneck. Implementing BAQ directly lets us
-   parallelise it with rayon and pipeline it with BAM decoding. See
-   Stage 1 §"Per-read likelihood quality" and §"Why BAQ in-process"
-   for the full argument, including why Option C (PairHMM + local
-   reassembly) is rejected at target coverage and left as a possible
-   future project.
-
-5. **Reference-confidence blocks: format and density.** — **Resolved:
-   no blocks; per-position records instead.** The `.psf` stores one
-   record per covered reference position with the full five-scalar
-   summary for every observed allele, down to single-read support.
-   Uncovered positions produce no record; gaps are implicit via
-   `delta_pos`. Compression is achieved by columnar storage + zstd,
-   plus optional lossless RLE for runs of identical adjacent records
-   — but not by the lossy summarisation that gVCF blocks rely on,
-   because at the target-coverage regime (2–10×) single-read
-   observations can be the only per-sample trace of real cohort-level
-   signal and must not be discarded at Stage 1. See Stage 2
-   §"Per-position record layout and compression" for the full
-   rationale.
-
-6. **Chunking strategy for Stages 4 + 5.**
-   - Cohort-wide merging at thousands of samples will be memory-heavy if
-     done in one pass. Chunking by genomic region (e.g. 1 Mb tiles) and
-     merging tiles independently, writing in parallel, is the natural
-     path. Needs a careful story for tile boundaries that fall inside a
-     compound variant.
-
-7. **Approximation flagging.**
-   - Which merged-record FORMAT field records "this sample's likelihood
-     for this genotype was approximated via tier 3 / tier 4 fallback"?
-   - Downstream consumers (GQ interpretation, filtering) should be able to
-     distinguish exact from approximate per-sample likelihoods.
-
 ## Relationship to existing specs in this directory
 
 - [general_project_specification.md](general_project_specification.md)
@@ -860,10 +1397,11 @@ near-exact likelihoods.
   retired once this design is firm.
 - [per_sample_pileup_format.md](per_sample_pileup_format.md) is the PSP v1
   binary format draft. Its per-read record layout is superseded by the
-  per-allele scalar summary decided here (Open decision 1). PSP v1 needs
-  to be revised: the per-read 3-byte record is replaced by five per-allele
-  scalars (observation count, `Σ max(ln_BQ, ln_MQ)`, forward-strand count,
-  placed-left count, placed-start count).
+  per-allele scalar summary decided here (see Stage 1 §"Related
+  existing draft" and Stage 2 §"The five per-allele scalars"). PSP
+  v1 needs to be revised: the per-read 3-byte record is replaced by
+  five per-allele scalars (observation count, `Σ max(ln_BQ, ln_MQ)`,
+  forward-strand count, placed-left count, placed-start count).
 - [genotype_joining_specification.md](genotype_joining_specification.md)
   documents the current allele-joining algorithm. The merge step in this
   architecture generalises that algorithm to operate on `.psf` instead of
