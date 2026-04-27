@@ -1,3 +1,4 @@
+pub mod buffered_peekable;
 pub mod decompression_pool;
 pub mod errors;
 pub mod genotype_merging;
