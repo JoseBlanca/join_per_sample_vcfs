@@ -1367,6 +1367,89 @@ needed, is to swap the point estimate of `p` for a Dirichlet posterior on
 `p` (variational Bayes). This stays linear in sample count and requires
 only local changes to the posterior engine.
 
+### Future extension: cohort haplotype-frequency priors for compound alleles
+
+The current Stage 6 estimates per-position allele frequencies `p` and
+uses them as priors on per-sample genotypes. A natural and load-bearing
+extension is to **also estimate per-compound haplotype frequencies** and
+feed them as priors on compound genotypes for samples where the
+phase-chain check returns no information — the phase-broken fallback
+path that Stage 5 currently flags as `CA = 1`.
+
+The motivation is that thousands of samples carry strong cohort-level
+signal about which compound haplotypes actually exist in the
+population. Homozygous-for-the-compound individuals pin the haplotype
+down unambiguously; heterozygotes' calls then have a meaningful prior
+to lean on when read-level evidence (the phase chain) is insufficient.
+This is structurally what classical population-phasing tools
+(fastPHASE, BEAGLE, IMPUTE, SHAPEIT) do for whole-genome haplotype
+reconstruction; here we'd apply the same idea narrowly inside an
+`OverlappingVariantGroup`, leveraging the cohort to strengthen
+specifically the cases where the chain is silent.
+
+**Where it goes in the inference.** Strictly at the *prior* layer, on
+top of the chain-based likelihood — it does **not** substitute for the
+chain in `P(reads | genotype)` (see
+[phase_chain.md §"Why not lean on cohort haplotype frequencies instead?"](phase_chain.md)
+for why a substitution would be statistically unsound). Concretely:
+
+- **E-step extension.** For each compound allele `C` in a group, the
+  current E-step computes a per-sample posterior over per-position
+  genotypes; extend it to compute a per-sample posterior over the
+  *compound* genotypes too, using whatever per-sample likelihood is
+  available (chain-based when the chain has evidence, phase-broken
+  fallback otherwise).
+- **M-step on `f_C`.** Add a new M-step that updates the cohort
+  frequency `f_C` of each compound haplotype as the posterior-weighted
+  count, with Dirichlet pseudocounts (small alt pseudocount, e.g.
+  `α_compound = 0.001`, tighter than per-position alt because compound
+  haplotypes are conditionally rarer).
+- **Feedback into samples with empty chain intersection.** For
+  samples that fell into the phase-broken fallback at Stage 5,
+  replace the independent-constituents prior with the cohort-derived
+  `f_C`. Samples with chain evidence keep using the chain-based
+  likelihood unchanged — `f_C` is just an updated prior for them too.
+- **HWE with `F`.** The same Wright's-`F` extension already used at
+  the per-position level applies directly to compound haplotype
+  pairs, so inbreeding / selfing populations remain handled.
+
+**What the extension buys.**
+
+- **Long-range compounds.** Compounds whose constituents lie beyond
+  read/pair span (chains can't reach) get cohort-anchored calls
+  whenever the cohort contains enough homozygotes.
+- **Mate-missing and low-coverage cases.** Per-sample fallbacks
+  currently flagged `CA = 1` get a much stronger prior, so their
+  GQ becomes informative rather than conservatively-down-weighted.
+- **Common compounds at scale.** With N in the thousands and
+  compound frequency above ~5%, the cohort prior is tight enough
+  to dominate noise in any single sample's fallback likelihood,
+  recovering most of the calibration the chain would have given.
+
+**What it does not buy.**
+
+- **Rare compounds (`q < ~0.01`).** Hom-alt frequency under HWE is
+  `q²`; below this threshold even N = 1000 produces ~0 homozygotes,
+  and the extension has no anchor. Chain evidence remains the only
+  way to call these — exactly the regime where the chain mechanism
+  is load-bearing.
+- **Replacement for the chain.** This is a prior, not a likelihood.
+  Samples with chain evidence still need the chain-based per-read
+  likelihood; cohort frequencies cannot be substituted there
+  without breaking Bayesian soundness.
+
+**Implementation cost.** Local to the posterior engine: one extra
+inner loop in the E-step (per-compound posterior), one extra
+M-step (per-compound frequency), and a small change to the
+fallback path so it consults `f_C` instead of constituent-product
+priors. Memory grows by O(#compounds_per_group), bounded by the
+group's allele structure. The chain machinery is unaffected.
+
+This extension is **not implemented in the v1 pipeline**. It is
+recorded here so a future implementer has a complete picture of
+how the cohort signal can strengthen the existing chain-based
+inference without compromising the per-sample likelihood path.
+
 ## Properties of this design vs. the alternatives
 
 | Property | freebayes joint | GATK GenotypeGVCFs | This design |
