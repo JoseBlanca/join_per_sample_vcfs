@@ -21,10 +21,11 @@ What this slice produces:
   headers against each other and against a reference FASTA, applies
   the per-read filter cascade from spec §"Read filters", and yields
   surviving reads in coordinate order.
-- A `CramReaderConfig` struct with `Default` providing the spec's
-  defaults (`min_mapq = 20`, all flag-based drops on, `min_read_length
-  = 1`).
-- Enough of `MergedRead` to carry every field downstream stages need
+- A `CramMergedReaderConfig` struct with `Default` providing the spec's
+  defaults (`min_mapq = Some(20)`, all flag-based drops on,
+  `min_read_length = Some(30)`). Both thresholds are `Option`s so
+  `None` cleanly expresses "no minimum".
+- Enough of `MappedRead` to carry every field downstream stages need
   (CIGAR, SEQ, BQ, MAPQ, flags, mate position, source-file index).
 - Hard errors for every failure mode listed in
   [per_sample_caller.md §Errors](../specs/per_sample_caller.md).
@@ -115,15 +116,21 @@ pub const DEFAULT_MIN_READ_LENGTH: u32 = 30;
 If a future filter needs a tunable, add it here and reference it from
 `Default`.
 
-### `CramReaderConfig`
+### `CramMergedReaderConfig`
+
+`min_mapq` and `min_read_length` are `Option`s: `None` is the explicit
+"no minimum" state. Using `0` as a disable sentinel would make
+`Some(0)` and `None` redundant representations of the same behaviour;
+`Option` makes the absent state structurally distinct from any
+specific threshold.
 
 ```rust
-pub struct CramReaderConfig {
-    /// Reads with MAPQ strictly below this are dropped. 0 disables.
-    pub min_mapq: u8,
-    /// Reads whose decoded SEQ length is strictly below this are dropped.
-    /// 0 disables.
-    pub min_read_length: u32,
+pub struct CramMergedReaderConfig {
+    /// `None` = no minimum; `Some(n)` = drop reads with MAPQ < n.
+    pub min_mapq: Option<u8>,
+    /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
+    /// length < n.
+    pub min_read_length: Option<u32>,
     pub drop_unmapped: bool,        // flag & 0x4
     pub drop_secondary: bool,       // flag & 0x100
     pub drop_supplementary: bool,   // flag & 0x800
@@ -131,11 +138,11 @@ pub struct CramReaderConfig {
     pub drop_duplicate: bool,       // flag & 0x400
 }
 
-impl Default for CramReaderConfig {
+impl Default for CramMergedReaderConfig {
     fn default() -> Self {
         Self {
-            min_mapq: DEFAULT_MIN_MAPQ,
-            min_read_length: DEFAULT_MIN_READ_LENGTH,
+            min_mapq: Some(DEFAULT_MIN_MAPQ),
+            min_read_length: Some(DEFAULT_MIN_READ_LENGTH),
             drop_unmapped: true,
             drop_secondary: true,
             drop_supplementary: true,
@@ -150,16 +157,29 @@ Call-site ergonomics via struct update syntax:
 
 ```rust
 // All defaults
-CramMergedReader::new(&crams, fa, CramReaderConfig::default())?;
+CramMergedReader::new(&crams, fa, CramMergedReaderConfig::default())?;
 
-// Override one field
-CramMergedReader::new(&crams, fa, CramReaderConfig {
-    min_mapq: 30,
+// Override one field — raise the threshold
+CramMergedReader::new(&crams, fa, CramMergedReaderConfig {
+    min_mapq: Some(30),
+    ..Default::default()
+})?;
+
+// Disable the MAPQ filter entirely
+CramMergedReader::new(&crams, fa, CramMergedReaderConfig {
+    min_mapq: None,
     ..Default::default()
 })?;
 ```
 
 ### `CramMergedReader`
+
+Two constructors. The public `new` is the convenience that opens
+files; the crate-internal `from_open_crams` is the testable core
+that takes pre-built per-CRAM record streams. The split pushes I/O
+to the program edge: production callers use `new`, tests inject
+canned record streams through `from_open_crams` and skip the
+synthetic-CRAM dance for everything except the I/O-glue tests.
 
 ```rust
 pub struct CramMergedReader {
@@ -168,13 +188,26 @@ pub struct CramMergedReader {
 }
 
 impl CramMergedReader {
-    /// Open every CRAM, validate headers against each other and the
-    /// FASTA, apply the per-read filter cascade per `config`, and
-    /// prepare a merged coordinate-sorted stream of surviving reads.
+    /// Public, convenient. Opens every CRAM, validates headers against
+    /// each other and the FASTA, sets up the noodles fasta repository,
+    /// and delegates the merge/filter logic to `from_open_crams`.
     pub fn new(
         crams: &[PathBuf],
         fasta: &Path,
-        config: CramReaderConfig,
+        config: CramMergedReaderConfig,
+    ) -> Result<Self, CramInputError>;
+
+    /// Crate-internal core. Takes pre-built per-CRAM record streams
+    /// plus the canonical contig list and sample name (the caller is
+    /// responsible for cross-file header validation — `new` does this
+    /// before calling here). All I/O for opening lives outside this
+    /// function, which is why it is the single point of entry tests
+    /// drive against.
+    pub(crate) fn from_open_crams(
+        open_crams: Vec<OpenCram>,
+        contigs: ContigList,
+        sample_name: String,
+        config: CramMergedReaderConfig,
     ) -> Result<Self, CramInputError>;
 
     pub fn sample_name(&self) -> &str;
@@ -183,6 +216,20 @@ impl CramMergedReader {
     /// Counts of reads dropped by each filter. Logged to stderr by the
     /// orchestrator at end-of-run per spec §"Errors" / Warnings.
     pub fn filter_counts(&self) -> &FilterCounts;
+}
+
+/// One CRAM's worth of already-decoded records, plus the path string
+/// used for error messages. The `records` iterator is consumed lazily
+/// by the merge — it is *not* drained eagerly. `Box<dyn Iterator>`
+/// keeps the signature concrete so `Vec<OpenCram>` is a plain owned
+/// type with no generic parameters or lifetimes.
+pub(crate) struct OpenCram {
+    /// Used in error messages naming the source of an offending read.
+    pub path_for_errors: PathBuf,
+    /// Lazy stream of decoded records. In production this wraps a
+    /// `noodles_cram::io::Reader::records()`; in tests it wraps a
+    /// `Vec<RecordBuf>::into_iter().map(Ok)`.
+    pub records: Box<dyn Iterator<Item = io::Result<noodles_sam::alignment::RecordBuf>> + Send>,
 }
 
 pub struct FilterCounts {
@@ -196,32 +243,47 @@ pub struct FilterCounts {
 }
 
 impl Iterator for CramMergedReader {
-    type Item = Result<MergedRead, CramInputError>;
+    type Item = Result<MappedRead, CramInputError>;
     fn next(&mut self) -> Option<Self::Item> { ... }
 }
 ```
+
+`OpenCram` exists at `pub(crate)` visibility — it carries
+`noodles::sam::alignment::RecordBuf`, and exposing that publicly
+would re-couple our public API to noodles. Tests live in the same
+crate, so `pub(crate)` is enough.
 
 Header-level errors surface from `new()`. Per-record errors (malformed
 record, out-of-order within a file, duplicate read across files) surface
 during iteration.
 
-Filter precedence at each pulled record (cheapest checks first to
-short-circuit decode work):
+Filter precedence at each pulled record. Per-check cost is roughly
+uniform across the flag-bit and MAPQ filters (one mask+compare or
+one byte compare, all on already-decoded record metadata), so the
+optimization is on *hit rate*: filters that drop more reads run
+first, so subsequent filters skip the most work. Approximate hit
+rates in a typical short-read CRAM are noted in parentheses; they
+shift with sample and aligner but the relative ordering is stable.
 
-1. Flag-bit drops in this order: unmapped, secondary, supplementary,
-   qc_fail, duplicate. Each enabled by its config bool.
-2. MAPQ < `min_mapq`.
-3. Decoded SEQ length < `min_read_length`.
+1. Duplicate (~10–30%).
+2. Low MAPQ — `min_mapq.is_some_and(|m| read.mapq < m)` (~5–15%).
+3. Supplementary (~1–5%).
+4. Secondary (~1–5%).
+5. Unmapped (~0–5%, often already filtered upstream).
+6. QC fail (<1%).
+7. Decoded SEQ length < `min_read_length` — structurally last
+   because it requires SEQ decoding.
 
-A dropped read increments its bucket in `FilterCounts` and is not
-yielded; the iterator pulls again.
+Each flag-bit step is gated by its `drop_*` config bool. A dropped
+read increments its bucket in `FilterCounts` and is not yielded; the
+iterator pulls again.
 
-### `MergedRead`
+### `MappedRead`
 
 Owned, decoupled from noodles. All fields public.
 
 ```rust
-pub struct MergedRead {
+pub struct MappedRead {
     pub qname: Vec<u8>,
     pub flag: u16,
     pub ref_id: usize,         // index into ContigList
@@ -310,6 +372,73 @@ and adds `.with_context(|| ...)` around calls into this module.
 5. Build the canonical `ContigList` and the canonical `sample_name`.
    Store on `CramMergedReader`.
 
+### Decoding via noodles
+
+CRAM is a complex container format (slice-based, reference-driven,
+multiple codec versions). We do not decode it ourselves; this slice
+sits on top of `noodles_cram`. The integration is small and lives
+entirely inside `cram_input.rs` — none of it leaks into the public
+API.
+
+**One reference repository, shared by all decoders.** A
+`noodles_fasta::Repository` is built once from the indexed FASTA and
+passed by reference to every CRAM reader. CRAM blocks decoded
+against the same reference share the cache; opening N CRAMs does not
+load the FASTA N times.
+
+```rust
+let fasta_repository = noodles_fasta::repository::Builder::default()
+    .add_adapter(noodles_fasta::indexed_reader::Builder::default()
+        .build_from_path(fasta_path)?)
+    .build();
+```
+
+**One reader per input CRAM.** Each input path is opened via the
+noodles builder, configured to use the shared repository:
+
+```rust
+let cram_reader = noodles_cram::io::reader::Builder::default()
+    .set_reference_sequence_repository(fasta_repository.clone())
+    .build_from_path(cram_path)?;
+let _header = cram_reader.read_header()?;   // also used for validation
+let records_iter = cram_reader.records();   // Iterator<Item = io::Result<RecordBuf>>
+```
+
+`RecordBuf` is the *owned* form of a SAM/CRAM record — it does not
+borrow from the decoder's internal buffers. That matters for the
+merge: peekers can hold heads across multiple `peek()` calls and the
+records we hand downstream do not pin any decoder lifetime. Using
+the borrowed `Record` form would force lifetime parameters all the
+way through the iterator API.
+
+The records iterator is what gets wrapped in `BufferedPeekable` for
+the merge loop (see Streaming merge below).
+
+**Per-record conversion** from `RecordBuf` into our owned
+`MappedRead` is a one-shot copy in a private helper
+`record_buf_to_mapped_read(buf, source_file_index) -> MappedRead`:
+
+| `MappedRead` field   | Source on `RecordBuf`                                   |
+|----------------------|---------------------------------------------------------|
+| `qname`              | `buf.name()` → bytes, cloned                            |
+| `flag`               | `buf.flags().bits()`                                    |
+| `ref_id`             | `buf.reference_sequence_id()` (already filtered for unmapped) |
+| `pos`                | `buf.alignment_start().unwrap().get() as u32`           |
+| `mapq`               | `buf.mapping_quality().map(u8::from).unwrap_or(0)`      |
+| `cigar`              | walk `buf.cigar().as_ref()`, convert each op (see below)|
+| `seq`                | `buf.sequence().as_ref().to_vec()` (uppercased to ACGTN)|
+| `qual`               | `buf.quality_scores().as_ref().to_vec()`                |
+| `mate_ref_id`        | `buf.mate_reference_sequence_id()`                      |
+| `mate_pos`           | `buf.mate_alignment_start().map(\|p\| p.get() as u32)`    |
+| `source_file_index`  | passed in by the merge loop                             |
+
+After conversion, the `MappedRead` is fully owned and disconnected
+from the decoder; downstream stages can move it freely.
+
+The exact `RecordBuf` accessor names follow the pinned noodles
+release; this table is the contract, the method names are
+implementation detail and may change with a noodles upgrade.
+
 ### Streaming merge
 
 State on `CramMergedReader`:
@@ -319,20 +448,22 @@ State on `CramMergedReader`:
 - `paths: Vec<PathBuf>` (parallel to `peekers`, for error messages).
 - `prev_per_file: Vec<Option<(ref_id, pos)>>` for per-file order
   validation.
-- `current_start_window: Vec<MergedReadKey>` — `(qname, flag, ref_id,
+- `current_start_window: Vec<MappedReadKey>` — `(qname, flag, ref_id,
   pos)` of every read accepted at the current `(ref_id, pos)`. Cleared
   whenever the next pulled read advances past it.
-- `config: CramReaderConfig`.
+- `config: CramMergedReaderConfig`.
 - `filter_counts: FilterCounts`.
 
 Per `next()`:
 
-1. Refill peekers' heads. For each peeker, peek; apply the filter
-   cascade against the head record (flag bits, then MAPQ — both are
-   in the alignment record's fixed-position header, so no SEQ/CIGAR
-   decode work is paid for a dropped read). If the head fails any
-   filter, increment the matching `FilterCounts` bucket, consume the
-   head, and re-peek. If the head is `Err`, surface it (mapped to
+1. Refill peekers' heads. For each peeker, peek; apply the pre-decode
+   filter cascade against the head record in hit-rate order
+   (duplicate → low MAPQ → supplementary → secondary → unmapped →
+   qc_fail). All checks read only fields already available in the
+   alignment record's fixed-position header, so no SEQ/CIGAR decode
+   work is paid for a dropped read. If the head fails any filter,
+   increment the matching `FilterCounts` bucket, consume the head,
+   and re-peek. If the head is `Err`, surface it (mapped to
    `CramInputError`).
 2. Choose the smallest surviving head by `(ref_id, pos, file_index)`.
    `file_index` is the deterministic tiebreaker.
@@ -343,13 +474,14 @@ Per `next()`:
    chosen read's `(qname, flag, ref_id, pos)` matches anything still
    in the window, return `DuplicateReadAcrossFiles`.
 5. Consume the chosen peeker's head. Convert the noodles record into a
-   `MergedRead` (clone bytes, decode CIGAR into our enum).
-6. Apply the post-decode filter: if `merged.seq.len() <
-   config.min_read_length`, increment `filter_counts.too_short`,
-   skip, pull next. (Done after decode because SEQ length isn't
-   reliably available pre-decode in CRAM.)
+   `MappedRead` (clone bytes, decode CIGAR into our enum).
+6. Apply the post-decode filter: if
+   `config.min_read_length.is_some_and(|min| merged.seq.len() < min as usize)`,
+   increment `filter_counts.too_short`, skip, pull next. (Done after
+   decode because SEQ length isn't reliably available pre-decode in
+   CRAM.)
 7. Push the read's key into the window. Update `prev_per_file`.
-8. Return `Ok(MergedRead)`.
+8. Return `Ok(MappedRead)`.
 
 When all peekers are exhausted, return `None`.
 
@@ -363,150 +495,218 @@ allocations beyond the `Vec` itself; CIGARs are short (typically
 
 `SEQ` decoded by noodles into a byte buffer of ACGTN. Quality scores
 likewise — both as raw bytes (Phred 0–93). We clone both into the
-`MergedRead`. If `SEQ` is `*` (no sequence), `seq` and `qual` are
+`MappedRead`. If `SEQ` is `*` (no sequence), `seq` and `qual` are
 empty `Vec`s; the post-decode `min_read_length` filter rejects them.
 
 ## TDD order
 
-Each numbered step is one implementation unit: write the failing test
-first, then make it pass.
+Tests split into three groups:
 
-### Step 1 — `ContigList` + equality
-- New type with derived `PartialEq` (modulo MD5 absence: `None == Some`
-  on either side is treated as a match per spec, the full match check
-  is only when both sides have `Some`).
-- Test: two equal lists compare equal; mismatched name / length / both
-  have `Some(md5)` but differ → not equal.
+- **Pure-type tests.** Touch neither constructor, just exercise types
+  in isolation.
+- **Group A — logic tests via `from_open_crams`.** Inject `Vec<RecordBuf>`
+  as the per-CRAM record stream. No filesystem, no noodles writer, no
+  FASTA on disk. Covers every non-I/O concern: merge order, tiebreaker,
+  out-of-order detection, dedup window, the entire filter cascade.
+  This is where most of the test mass lives.
+- **Group B — I/O-glue tests via `new`.** Real synthetic CRAMs and a
+  real FASTA on disk. Each test exercises one rule of header
+  validation, plus a single end-to-end smoke. Smaller set; covers
+  the noodles wiring and `new`'s file-opening / header-parsing logic.
 
-### Step 2 — Header parsing on a known-good CRAM
-- Build a tiny CRAM in-memory using noodles (one contig, two reads),
-  read its header through our `read_header_metadata` helper.
-- Test: returns expected contig list, sort order, sample name.
+Each numbered step within a group is one implementation unit: write
+the failing test first, then make it pass.
 
-### Step 3 — CRAM 4.x rejection
-- Synthesise a fake header byte string with major version 4 (we don't
-  need a fully valid file; the version check happens before record
-  decode).
-- Test: `UnsupportedCramVersion` returned with the right major.
+### Pure-type tests
 
-### Step 4 — Sort-order rejection
-- Build a CRAM with `@HD SO:queryname`.
-- Test: `NotCoordinateSorted`.
+#### P1 — `ContigList` + equality
+- Derived `PartialEq` with a small twist: when one side's `md5` is
+  `None`, it acts as a wildcard against the other's `Some`.
+- Test: two equal lists compare equal; mismatched name / length /
+  both have `Some(md5)` but differ → not equal; one `None` MD5 vs
+  one `Some` MD5 → equal.
 
-### Step 5 — Sample-tag handling
-- Build a CRAM with one `@RG` and `SM:foo`, expect `Ok("foo")`.
-- Build a CRAM with one `@RG` missing SM, expect `MissingSampleTag`.
-- Build two CRAMs with `SM:foo` and `SM:bar`, run `new()`, expect
-  `MultipleSampleNames`.
+### Group A — via `from_open_crams`
 
-### Step 6 — Contig-list mismatch
-- Two CRAMs with different `@SQ` orders → `ContigListMismatch{detail:
-  "name"}`.
-- Two CRAMs differing on length → `ContigListMismatch{detail: "length"}`.
-- Two CRAMs with conflicting MD5s where both have one →
-  `ContigListMismatch{detail: "md5"}`.
+These tests build `Vec<OpenCram>` directly. A test helper
+`open_cram_from_records(path_for_errors, records: Vec<RecordBuf>)`
+wraps a `Vec` in the `Box<dyn Iterator<...>>`. No file is touched.
 
-### Step 7 — FASTA agreement
-- CRAM with contig `chr1:1000`; FASTA `.fai` listing `chr1\t1000`. OK.
+#### A1 — Single-stream pass-through
+- One `OpenCram` with three records at positions 100, 200, 300.
+  Iterate; expect three `MappedRead`s in order, fields preserved
+  (CIGAR / SEQ / flag / MAPQ / mate fields).
+
+#### A2 — Multi-stream merge order
+- Two `OpenCram`s: A with records at 100, 300, 500; B with records at
+  150, 200, 400. Iterate; expect 100, 150, 200, 300, 400, 500 with
+  `source_file_index` alternating correctly.
+
+#### A3 — Tiebreaker on equal coordinates
+- A at (chr1, 100, qname=R1); B at (chr1, 100, qname=R2). Expect A
+  first (lower file_index), B second.
+
+#### A4 — Out-of-order within a single stream
+- A's records: position 200, then position 100. Iterate; first pull
+  yields pos=200; second pull returns `OutOfOrderRead` naming the
+  source path.
+
+#### A5 — Duplicate read across streams
+- A and B both contain `(qname=R1, flag=0x0, ref_id=0, pos=100)`.
+  Iterate; first pull yields the read; second pull returns
+  `DuplicateReadAcrossFiles` naming both source paths.
+
+#### A6 — Duplicate-window clears on advance
+- A: `(R1, pos=100)`, `(R1, pos=200)`. The second R1 is at a
+  different position so it's not a duplicate. Iterate; both yield
+  `Ok` (window cleared between positions).
+
+#### A7 — `min_mapq` filter
+- A: three records with MAPQ values straddling `DEFAULT_MIN_MAPQ`
+  (one well below, one just below, one above). Construct with
+  `CramMergedReaderConfig::default()`. Iterate; expect only the
+  above-threshold record yielded. `filter_counts().low_mapq == 2`.
+- A separate sanity test asserts `DEFAULT_MIN_MAPQ == 20` so a
+  future edit to the constant is caught loudly.
+
+#### A8 — `min_mapq = None` disables the MAPQ filter
+- Same input as A7, `min_mapq: None`. Iterate; expect all three
+  records. `filter_counts().low_mapq == 0`.
+
+#### A9 — Flag-bit drops, one filter at a time
+- One stream containing records tagged respectively unmapped
+  (0x4), secondary (0x100), supplementary (0x800), qc_fail (0x200),
+  duplicate (0x400), plus one clean record.
+- For each filter `F`: construct with all defaults except every
+  other drop bool set to `false` so only `F` is active. Iterate;
+  expect exactly the record tagged with `F` to be missing, and the
+  matching `FilterCounts` field == 1.
+- Then with full defaults: expect only the clean record yielded;
+  every drop bucket == 1.
+
+#### A10 — All flag drops disabled passes everything
+- Same input as A9, all `drop_*` bools `false`, `min_mapq: None`,
+  `min_read_length: None`. Iterate; expect all six records.
+
+#### A11 — `min_read_length` drops short and empty-SEQ records
+- A: long record of length `DEFAULT_MIN_READ_LENGTH + 20`, short
+  record of length `DEFAULT_MIN_READ_LENGTH - 5`, record with
+  `SEQ = *`. Defaults. Iterate; expect only the long record.
+  `filter_counts().too_short == 2`.
+- Sanity test asserts `DEFAULT_MIN_READ_LENGTH == 30`.
+- A second test with `min_read_length: None` yields all three.
+
+#### A12 — Filter precedence is hit-rate-ordered
+- A record flag-marked duplicate *and* unmapped *and* MAPQ 0. With
+  all drops on and `min_mapq = Some(20)`, only `duplicate` should
+  increment (the highest-hit-rate filter runs first; subsequent
+  ones are short-circuited).
+- A record unmapped *and* MAPQ 0, but not duplicate: `low_mapq`
+  increments (next in order), not `unmapped`.
+- A record unmapped only: `unmapped` increments. Together these pin
+  the cascade order at duplicate → MAPQ → unmapped without
+  enumerating every link.
+
+#### A13 — Empty stream
+- One `OpenCram` with an empty record vector. Iterate; expect
+  immediate `None`.
+
+#### A14 — Mixed empty + non-empty streams
+- A empty, B with two records. Iterate; expect B's two records in
+  order.
+
+### Group B — via `new`
+
+These tests build real synthetic CRAMs on disk via
+`test_fixtures::build_cram`, plus a real FASTA + `.fai`.
+
+#### B1 — Header parsing on a known-good CRAM
+- One CRAM with one contig, one `@RG SM:s1`, two records. Open via
+  `new`; assert `sample_name() == "s1"` and `contigs()` matches the
+  expected single-contig list.
+
+#### B2 — CRAM 4.x rejection
+- Synthesise a header byte string with major version 4 (full file
+  not needed — the version check happens before record decode).
+- Open via `new`; expect `UnsupportedCramVersion { major: 4, .. }`.
+
+#### B3 — Sort-order rejection
+- CRAM with `@HD SO:queryname`. Open via `new`; expect
+  `NotCoordinateSorted`.
+
+#### B4 — Sample-tag handling
+- One CRAM, one `@RG SM:foo` → `sample_name() == "foo"`.
+- One CRAM, one `@RG` with no `SM` → `MissingSampleTag`.
+- Two CRAMs with `SM:foo` and `SM:bar` → `MultipleSampleNames`.
+
+#### B5 — Contig-list mismatch across CRAMs
+- Two CRAMs differing in `@SQ` order → `ContigListMismatch{detail: "name"}`.
+- Differing in length → `ContigListMismatch{detail: "length"}`.
+- Conflicting MD5s where both have one → `ContigListMismatch{detail: "md5"}`.
+
+#### B6 — FASTA agreement
+- CRAM with contig `chr1:1000`; FASTA `.fai` listing `chr1\t1000` → OK.
 - FASTA missing `.fai` → `MissingFastaIndex`.
 - FASTA listing a different length → `FastaContigMismatch`.
 
-### Step 8 — Single-CRAM streaming
-- One CRAM with three reads at positions 100, 200, 300. Iterate;
-  expect three `MergedRead`s in order, with the right CIGAR / SEQ /
-  flag / mate fields.
-
-### Step 9 — Multi-CRAM merge order
-- Two CRAMs: file A with reads at 100, 300, 500; file B with reads
-  at 150, 200, 400.
-- Iterate; expect 100, 150, 200, 300, 400, 500 with `source_file_index`
-  alternating correctly.
-
-### Step 10 — Tiebreaker on equal coordinates
-- File A read at (chr1, 100) qname=R1; file B read at (chr1, 100)
-  qname=R2. Expect file A first (lower file_index), file B second.
-
-### Step 11 — Out-of-order within a single file
-- Build a CRAM that violates coordinate sort (read at 200 before read
-  at 100; we have to construct this manually since noodles' writer
-  may sort for us). Iterate; expect `OutOfOrderRead` on the second
-  pull.
-
-### Step 12 — Duplicate read across files
-- File A and file B both contain the same `(qname=R1, flag=0x0,
-  ref_id=0, pos=100)`. Iterate; first pull yields the read, second
-  pull returns `DuplicateReadAcrossFiles` naming both files.
-
-### Step 13 — Duplicate-window clears on advance
-- File A: `(R1, pos=100)`, `(R1, pos=200)`. The second R1 is at a
-  different position so it's not a duplicate. Iterate; both should
-  yield `Ok` (the window cleared between positions).
-
-### Step 14 — `min_mapq` filter
-- File A: three reads with MAPQ values straddling
-  `DEFAULT_MIN_MAPQ` (one well below, one just below, one above).
-  Construct with `CramReaderConfig::default()`. Iterate; expect only
-  the above-threshold read yielded. `filter_counts().low_mapq == 2`.
-- A separate sanity test asserts `DEFAULT_MIN_MAPQ == 20` so a future
-  edit to the constant is caught loudly.
-
-### Step 15 — `min_mapq = 0` disables the MAPQ filter
-- Same input as Step 14, `min_mapq: 0`. Iterate; expect all three
-  reads. `filter_counts().low_mapq == 0`.
-
-### Step 16 — Flag-bit drops, one filter at a time
-- One file containing reads tagged respectively unmapped (0x4),
-  secondary (0x100), supplementary (0x800), qc_fail (0x200),
-  duplicate (0x400), plus one clean read.
-- For each filter `F`: construct with all defaults except every other
-  drop bool set to `false` so only `F` is active. Iterate; expect
-  exactly the read tagged with `F` to be missing, and the matching
-  `FilterCounts` field to be 1.
-- Then with full defaults: expect only the clean read yielded; counts
-  reflect each drop bucket = 1.
-
-### Step 17 — All flag drops disabled passes everything
-- Same input as Step 16, all `drop_*` bools `false`, `min_mapq: 0`,
-  `min_read_length: 0`. Iterate; expect all six reads.
-
-### Step 18 — `min_read_length` drops short and empty-SEQ reads
-- File A: a long read of length `DEFAULT_MIN_READ_LENGTH + 20`, a
-  short read of length `DEFAULT_MIN_READ_LENGTH - 5`, and a read
-  with `SEQ = *` (no sequence). Construct with
-  `CramReaderConfig::default()`. Iterate; expect only the long read.
-  `filter_counts().too_short == 2`.
-- A sanity test asserts `DEFAULT_MIN_READ_LENGTH == 30`.
-- A second test with `min_read_length: 0` yields all three reads.
-
-### Step 19 — Filter precedence is cheap-first
-- A single read is unmapped *and* has MAPQ 0 *and* is also flag-marked
-  duplicate. With all drops on, only `unmapped` should increment
-  (confirms short-circuit ordering, not just final outcome).
-
-### Step 20 — Empty CRAM
-- A CRAM with a header but no records. Iterate; expect immediate `None`.
-
-### Step 21 — Mixed empty + non-empty
-- File A empty, file B with two reads. Iterate; expect file B's two
-  reads in order.
+#### B7 — End-to-end smoke
+- One CRAM with three records (positions 100, 200, 300), valid
+  reference and `.fai`. Open via `new`, iterate, assert three
+  `MappedRead`s with the expected fields. This is the only test
+  whose purpose is to confirm the noodles wiring and the
+  `new → from_open_crams` plumbing produce the same answer the
+  Group A tests get from injected streams.
 
 ## Test-fixture helpers
 
-Tests need synthetic CRAMs. Build a small helper module
-`src/per_sample_caller/test_fixtures.rs` (gated `#[cfg(test)]`):
+Two helper modules under `src/per_sample_caller/`, both gated
+`#[cfg(test)]`. The split mirrors the Group A / Group B test split:
+most tests use `record_specs` and never touch the disk; only Group B
+needs `cram_files`.
+
+### `record_specs.rs` — for Group A (no I/O)
+
+- `record_spec(name, flag, ref_id, pos, mapq, cigar, seq, qual,
+  mate_ref_id, mate_pos) -> RecordBuf` — concise builder for one
+  noodles `RecordBuf`. Defaults for fields not relevant to the test.
+- `open_cram_from_records(path_for_errors: &str, records:
+  Vec<RecordBuf>) -> OpenCram` — wraps a `Vec` in the
+  `Box<dyn Iterator<...>> + Send` shape `OpenCram::records` expects.
+- `default_contigs() -> ContigList` — a single-contig
+  (`chr1`, length 100_000) list for tests that don't care about the
+  contig list.
+
+These primitives let a Group A test fit in 5–10 lines:
+
+```rust
+let cram_a = open_cram_from_records("a.cram", vec![
+    record_spec("R1", 0, 0, 100, 60, "50M", "A".repeat(50), ...),
+    record_spec("R2", 0, 0, 300, 60, "50M", ...),
+]);
+let cram_b = open_cram_from_records("b.cram", vec![
+    record_spec("R3", 0, 0, 150, 60, "50M", ...),
+]);
+let reader = CramMergedReader::from_open_crams(
+    vec![cram_a, cram_b],
+    default_contigs(),
+    "sample".into(),
+    CramMergedReaderConfig::default(),
+)?;
+```
+
+### `cram_files.rs` — for Group B (real I/O)
 
 - `build_fasta(contigs: &[(name, sequence)]) -> (TempDir, PathBuf)` —
-  writes a FASTA + `.fai` to a tempdir, returns the path. Keeps the
-  TempDir alive for the test.
-- `build_cram(fasta_path, header_overrides, reads) -> (TempDir,
-  PathBuf)` — uses `noodles_cram::io::Writer` to build a coordinate-
-  sorted CRAM with the given header tweaks (sort order, RG/SM, SQ
-  list overrides) and reads. Returns the path.
-- `read_spec(name, flag, ref_id, pos, mapq, cigar, seq, qual,
-  mate_ref_id, mate_pos)` — concise constructor for record specs.
+  writes a FASTA + `.fai` to a tempdir, returns the path. Keeps
+  the `TempDir` alive for the test.
+- `build_cram(fasta_path, header_overrides, records: &[RecordBuf]) ->
+  (TempDir, PathBuf)` — uses `noodles_cram::io::Writer` to build a
+  coordinate-sorted CRAM with the given header tweaks (sort order,
+  `@RG SM`, `@SQ` overrides) and records. Returns the CRAM path.
 
-These helpers are also useful for the later slices (filter, BAQ,
-pileup walker), so they go in a shared location now.
+Both helpers stay in `src/per_sample_caller/` so later slices (BAQ,
+pileup walker) can reuse them. `record_spec` in particular is
+expected to be the workhorse for Group A in every later slice.
 
 ## Validation
 
@@ -523,7 +723,7 @@ Run after each step and at the end:
   CRAM. Deferred: the `Iterator` API stays stable when we later move
   decoding off-thread. Add behind the scenes when profiling shows
   decode-bound runs.
-- **Per-record allocations.** Each `MergedRead` clones `qname`, `seq`,
+- **Per-record allocations.** Each `MappedRead` clones `qname`, `seq`,
   `qual`, and the CIGAR vector. At 30× coverage this is billions of
   allocations across a human genome. If profiling later shows this is
   hot, we can switch to an arena or an `Arc<[u8]>` shared with the
@@ -544,6 +744,17 @@ Run after each step and at the end:
   as a post-decode pass; the CIGAR-shape rule moves to the pileup
   walker, where it semantically belongs (it suppresses an *allele*,
   not a read).
+- **Two-constructor split (`new` + `from_open_crams`).** Pushes I/O
+  to the program edge per ports-and-adapters reasoning. Public
+  callers pay no cost — they call `new(paths, ...)` as before. The
+  `pub(crate) from_open_crams` exists so the merge / order / dedup /
+  filter logic can be tested with injected `Vec<RecordBuf>` streams,
+  without round-tripping through the noodles writer and a tempdir.
+  `OpenCram` carries `noodles::sam::alignment::RecordBuf` and is
+  `pub(crate)` to avoid leaking noodles into the public API. Going
+  further (e.g. abstracting filesystem I/O behind a trait) was
+  considered and rejected — single-implementor abstractions add
+  generic noise without proportional benefit in Rust.
 - **`--region` / `.crai`-driven seeking.** Out of scope. When added,
   `CramMergedReader::with_region(...)` will be a sibling constructor;
   the iterator API stays the same.
