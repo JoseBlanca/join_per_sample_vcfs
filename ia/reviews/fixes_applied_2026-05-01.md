@@ -47,7 +47,7 @@
 | M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
-| Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | TBD | No | TBD | TBD | TBD |
+| Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | TBD | No | TBD | TBD | TBD |
 | Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | TBD | No | TBD | TBD | TBD |
 | Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### Mi2 — defensive `.unwrap_or_default()` on `canonical_path` masks an invariant
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** `canonical_path` is `Some` whenever `canonical_contigs` or `canonical_sample` is `Some`, by construction. The two error paths previously substituted `PathBuf::new()` if the invariant ever broke, hiding a real bug. The existing call sites at the end of the function already use `.expect`.
+- **Implementation summary:** Replaced both `.unwrap_or_default()` calls with `.expect("canonical_path is set when canonical_contigs is Some")` / `.expect("canonical_path is set when canonical_sample is Some")`.
+- **Review suggestion used verbatim?:** Yes (chose the minimal `.expect` route, not the larger refactor).
+- **Adaptation:** None.
+- **Verification performed:** All 26 tests still pass; the `.expect` strings document the invariant in code.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** None — the change is a defensive assertion on an existing invariant that none of the current tests exercise.
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 26 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None

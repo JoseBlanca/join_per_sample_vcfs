@@ -628,7 +628,9 @@ impl CramMergedReader {
                 Some(existing) => {
                     if let Err(detail) = existing.first_disagreement(&cram_header.contigs) {
                         return Err(CramInputError::ContigListMismatch {
-                            reference_path: canonical_path.clone().unwrap_or_default(),
+                            reference_path: canonical_path
+                                .clone()
+                                .expect("canonical_path is set when canonical_contigs is Some"),
                             other_path: cram_path.clone(),
                             detail,
                         });
@@ -639,7 +641,9 @@ impl CramMergedReader {
                 None => canonical_sample = Some(cram_header.sample_name.clone()),
                 Some(existing) if existing != &cram_header.sample_name => {
                     return Err(CramInputError::MultipleSampleNames {
-                        path_a: canonical_path.clone().unwrap_or_default(),
+                        path_a: canonical_path
+                            .clone()
+                            .expect("canonical_path is set when canonical_sample is Some"),
                         sm_a: existing.clone(),
                         path_b: cram_path.clone(),
                         sm_b: cram_header.sample_name,
