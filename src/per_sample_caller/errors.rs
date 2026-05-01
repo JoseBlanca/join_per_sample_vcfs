@@ -58,6 +58,17 @@ pub enum CramInputError {
     },
 
     #[error(
+        "multiple sample names within '{path}': @RG '{rg_a}' has SM:'{sm_a}', @RG '{rg_b}' has SM:'{sm_b}'"
+    )]
+    MultipleSampleNamesInFile {
+        path: PathBuf,
+        rg_a: String,
+        sm_a: String,
+        rg_b: String,
+        sm_b: String,
+    },
+
+    #[error(
         "out-of-order read in '{path}': QNAME '{qname}' at {this_pos} regresses from {prev_pos}"
     )]
     OutOfOrderRead {

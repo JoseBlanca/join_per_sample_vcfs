@@ -385,34 +385,38 @@ fn extract_single_sample_name(
     sam_header: &sam::Header,
 ) -> Result<String, CramInputError> {
     use noodles_sam::header::record::value::map::read_group::tag::SAMPLE;
-    let mut current: Option<String> = None;
+    let mut current: Option<(String, String)> = None;
     for (rg_id_bstr, rg_map) in sam_header.read_groups() {
+        let rg_id = String::from_utf8_lossy(rg_id_bstr.as_ref()).into_owned();
         let sm_raw =
             rg_map
                 .other_fields()
                 .get(&SAMPLE)
                 .ok_or_else(|| CramInputError::MissingSampleTag {
                     path: path.to_path_buf(),
-                    read_group_id: String::from_utf8_lossy(rg_id_bstr.as_ref()).into_owned(),
+                    read_group_id: rg_id.clone(),
                 })?;
         let sm = String::from_utf8_lossy(sm_raw.as_ref()).into_owned();
         match &current {
-            None => current = Some(sm),
-            Some(existing) if existing != &sm => {
-                return Err(CramInputError::MultipleSampleNames {
-                    path_a: path.to_path_buf(),
-                    sm_a: existing.clone(),
-                    path_b: path.to_path_buf(),
+            None => current = Some((rg_id, sm)),
+            Some((existing_rg, existing_sm)) if existing_sm != &sm => {
+                return Err(CramInputError::MultipleSampleNamesInFile {
+                    path: path.to_path_buf(),
+                    rg_a: existing_rg.clone(),
+                    sm_a: existing_sm.clone(),
+                    rg_b: rg_id,
                     sm_b: sm,
                 });
             }
             Some(_) => {}
         }
     }
-    current.ok_or_else(|| CramInputError::MissingSampleTag {
-        path: path.to_path_buf(),
-        read_group_id: "<no @RG entries>".into(),
-    })
+    current
+        .map(|(_, sm)| sm)
+        .ok_or_else(|| CramInputError::MissingSampleTag {
+            path: path.to_path_buf(),
+            read_group_id: "<no @RG entries>".into(),
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -1919,6 +1923,38 @@ mod tests {
             "got {:?}",
             err
         );
+
+        // 4) Single CRAM with two @RG entries that disagree on SM →
+        //    MultipleSampleNamesInFile, NOT MultipleSampleNames.
+        let (_fa4_dir, fa4) = build_fasta(&contigs).expect("fasta");
+        let (_c4_dir, c4) = build_cram(
+            &fa4,
+            &contigs,
+            &HeaderOverrides {
+                read_groups: vec![
+                    ("rg_foo".into(), Some("foo".into())),
+                    ("rg_bar".into(), Some("bar".into())),
+                ],
+                ..Default::default()
+            },
+            &records,
+        )
+        .expect("build within-file");
+        let err = err_or_panic(
+            CramMergedReader::new(&[c4], &fa4, CramMergedReaderConfig::default()),
+            "expected MultipleSampleNamesInFile",
+        );
+        match err {
+            CramInputError::MultipleSampleNamesInFile {
+                rg_a, sm_a, rg_b, sm_b, ..
+            } => {
+                assert_eq!(rg_a, "rg_foo");
+                assert_eq!(sm_a, "foo");
+                assert_eq!(rg_b, "rg_bar");
+                assert_eq!(sm_b, "bar");
+            }
+            other => panic!("expected MultipleSampleNamesInFile, got {:?}", other),
+        }
     }
 
     #[test]

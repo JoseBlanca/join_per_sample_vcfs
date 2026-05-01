@@ -42,7 +42,7 @@
 | ID | Severity | Title | Initial decision | Final status | User input | Files changed | Validation | Follow-up |
 |---|---|---|---|---|---|---|---|---|
 | M1 | Major | silent `as u32` truncation on position and length values | Apply | Applied | No | `cram_input.rs`, `errors.rs`, `record_specs.rs`, `cram_files.rs` | Pass | No |
-| M2 | Major | `MultipleSampleNames` reused for within-file SM disagreement | Apply | TBD | No | TBD | TBD | TBD |
+| M2 | Major | `MultipleSampleNames` reused for within-file SM disagreement | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | M3 | Major | `decode_md5_hex` silently tolerates malformed `M5` | Apply | TBD | No | TBD | TBD | TBD |
 | M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | TBD | No | TBD | TBD | TBD |
 | M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### M2 — `MultipleSampleNames` reused for within-file SM disagreement
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** Bug confirmed at the call site: when a single CRAM has two `@RG`s with different `SM` values, the variant `MultipleSampleNames` was emitted with `path_a == path_b`, producing a self-referential error message and conflating two distinct failure modes.
+- **Implementation summary:** Added `CramInputError::MultipleSampleNamesInFile { path, rg_a, sm_a, rg_b, sm_b }` and rewrote `extract_single_sample_name` to track the *(rg_id, sm)* pair as it iterates and emit the new variant on first disagreement. Cross-file `MultipleSampleNames` is unchanged and still raised by the cross-file checks in `CramMergedReader::new`.
+- **Review suggestion used verbatim?:** Yes (variant shape + emission point match the review).
+- **Adaptation:** None.
+- **Verification performed:** Added `b4_sample_tag_handling` sub-case (4) that builds a single CRAM with two disagreeing `@RG`s and asserts the new variant + the two `(rg_id, sm)` pairs match the expected order.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`, `src/per_sample_caller/errors.rs`
+- **Tests added or modified:** `b4_sample_tag_handling` (new sub-case asserting `MultipleSampleNamesInFile`)
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 23 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None
