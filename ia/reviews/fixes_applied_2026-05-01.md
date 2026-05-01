@@ -51,7 +51,7 @@
 | Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | Applied | No | `cram_input.rs` | Pass | No |
-| Mi6 | Minor | MAPQ-missing collapses to 0 — needs doc and regression test | Apply | TBD | No | TBD | TBD | TBD |
+| Mi6 | Minor | MAPQ-missing collapses to 0 — needs doc and regression test | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | N1 | Nit | `OpenCram::path_for_errors` rename | Apply | TBD | No | TBD | TBD | TBD |
 | N2 | Nit | `window: VecDeque` → `Vec` | Apply | TBD | No | TBD | TBD | TBD |
 | N3 | Nit | WindowKey clone | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### Mi6 — MAPQ-missing collapses to 0 — needs doc and regression test
+- **Severity:** Minor
+- **Initial decision:** Apply (decision: missing MAPQ → MAPQ 0 → reject under any non-zero minimum)
+- **Final status:** Applied
+- **Reasoning:** The behaviour is correct — `unwrap_or(0)` matches the project's coverage-target rationale — but it was undocumented and not pinned. A future refactor swapping `unwrap_or(0)` for `unwrap_or(u8::MAX)` would silently let unknown-MAPQ reads through.
+- **Implementation summary:** Extended the doc comment on `DEFAULT_MIN_MAPQ` with the missing-MAPQ rule and rationale (low coverage targets, bcftools/freebayes convention). Added `a7b_missing_mapq_is_treated_as_zero_and_filtered_by_default` exercising the `mapping_quality()==None` path: builds a record with `spec.mapq=0` (the `record_spec` guard maps this to no `MappingQuality` set) and asserts it lands in the `low_mapq` bucket under default config.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** New test exercises the `None` mapping-quality path; existing `a7_min_mapq_filter` continues to pass.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** `a7b_missing_mapq_is_treated_as_zero_and_filtered_by_default`
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 29 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None

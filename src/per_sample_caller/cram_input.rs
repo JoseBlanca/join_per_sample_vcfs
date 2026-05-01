@@ -23,6 +23,14 @@ use crate::per_sample_caller::errors::CramInputError;
 /// Reads with MAPQ strictly below this are dropped. Matches bcftools'
 /// default and the spec recommendation in
 /// `ia/specs/per_sample_caller.md` §"Read filters".
+///
+/// Reads with MAPQ unavailable (SAM 0xFF / noodles `mapping_quality()`
+/// returning `None`) are treated as MAPQ 0 and therefore rejected
+/// under any non-zero minimum. Decision recorded 2026-04-29: at the
+/// project's 2-10× coverage targets an "unknown" placement is not
+/// trustworthy enough to admit; matches the bcftools/freebayes
+/// convention. See `ia/reviews/per_sample_caller_cram_input_2026-04-29.md`
+/// (Mi6) for the full rationale.
 pub const DEFAULT_MIN_MAPQ: u8 = 20;
 
 /// Decoded SEQ length below this is dropped. Reads shorter than this
@@ -1480,6 +1488,29 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].qname, b"R_high");
         assert_eq!(counts.low_mapq, 2);
+    }
+
+    #[test]
+    fn a7b_missing_mapq_is_treated_as_zero_and_filtered_by_default() {
+        // record_spec maps mapq=0 to "no MappingQuality set" because of
+        // the `if spec.mapq > 0` guard, so this exercises the
+        // mapping_quality()==None path. Pins the decision recorded in
+        // the doc-comment on `DEFAULT_MIN_MAPQ`: a missing MAPQ is
+        // treated as 0 and dropped under any non-zero minimum.
+        let mut rec = pass_record("R", 0, 100);
+        rec.mapq = 0;
+        let cram = open_cram_from_records("a.cram", vec![record_spec(rec)]);
+        let reader = CramMergedReader::from_open_crams(
+            vec![cram],
+            default_contigs(),
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+        )
+        .expect("reader");
+        let (out, counts, err) = run_to_completion(reader);
+        assert!(err.is_none());
+        assert!(out.is_empty(), "MAPQ-missing read should be dropped");
+        assert_eq!(counts.low_mapq, 1);
     }
 
     #[test]
