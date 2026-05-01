@@ -75,7 +75,7 @@ pub enum CramInputError {
         path_a: PathBuf,
         path_b: PathBuf,
         ref_id: usize,
-        pos: u32,
+        pos: u64,
     },
 
     #[error("malformed record in '{path}' (qname='{qname}'): {source}")]

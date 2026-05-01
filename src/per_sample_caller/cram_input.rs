@@ -70,7 +70,7 @@ pub struct MappedRead {
     /// Index into the merged reader's `ContigList`.
     pub ref_id: usize,
     /// 1-based leftmost mapped position.
-    pub pos: u32,
+    pub pos: u64,
     pub mapq: u8,
     pub cigar: Vec<CigarOp>,
     /// Uppercase ACGTN.
@@ -78,7 +78,7 @@ pub struct MappedRead {
     /// Phred 0-93, raw BQ before BAQ capping.
     pub qual: Vec<u8>,
     pub mate_ref_id: Option<usize>,
-    pub mate_pos: Option<u32>,
+    pub mate_pos: Option<u64>,
     pub source_file_index: usize,
 }
 
@@ -90,7 +90,7 @@ pub struct MappedRead {
 #[derive(Debug, Clone)]
 pub struct ContigEntry {
     pub name: String,
-    pub length: u32,
+    pub length: u64,
     pub md5: Option<[u8; 16]>,
 }
 
@@ -326,7 +326,7 @@ fn extract_header(path: &Path, sam_header: &sam::Header) -> Result<CramHeader, C
     let mut entries: Vec<ContigEntry> = Vec::new();
     for (name_bstr, ref_seq_map) in sam_header.reference_sequences() {
         let name = String::from_utf8_lossy(name_bstr.as_ref()).into_owned();
-        let length: u32 = usize::from(ref_seq_map.length()) as u32;
+        let length: u64 = usize::from(ref_seq_map.length()) as u64;
         let md5 = md5_from_reference_sequence(ref_seq_map);
         entries.push(ContigEntry { name, length, md5 });
     }
@@ -467,7 +467,7 @@ fn validate_fasta_agreement(
                 ),
             });
         }
-        let fai_length = fai_record.length() as u32;
+        let fai_length: u64 = fai_record.length();
         if fai_length != contig.length {
             return Err(CramInputError::FastaContigMismatch {
                 fasta_path: fasta_path.to_path_buf(),
@@ -494,7 +494,7 @@ fn with_fai_extension(fasta_path: &Path) -> PathBuf {
 
 /// Per-file order tracker: previous `(ref_id, pos)` accepted for that
 /// file, used to detect within-file regressions.
-type PerFileOrder = Option<(usize, u32)>;
+type PerFileOrder = Option<(usize, u64)>;
 
 /// Key used by the duplicate-detection window: `(qname, flag, ref_id,
 /// pos)` per `ia/specs/per_sample_caller.md` §"Duplicate-read detection
@@ -504,7 +504,7 @@ struct WindowKey {
     qname: Vec<u8>,
     flag: u16,
     ref_id: usize,
-    pos: u32,
+    pos: u64,
 }
 
 /// Per-window entry: the key plus the source file index, so the
@@ -530,7 +530,7 @@ pub struct CramMergedReader {
     window: VecDeque<WindowEntry>,
     /// Anchor for the current window: `None` while empty, `Some` at
     /// the position of the entries currently in `window`.
-    window_anchor: Option<(usize, u32)>,
+    window_anchor: Option<(usize, u64)>,
     filter_counts: FilterCounts,
 }
 
@@ -824,7 +824,7 @@ impl Iterator for CramMergedReader {
 }
 
 impl CramMergedReader {
-    fn advance_window_if_needed(&mut self, ref_id: usize, pos: u32) {
+    fn advance_window_if_needed(&mut self, ref_id: usize, pos: u64) {
         match self.window_anchor {
             Some(anchor) if anchor != (ref_id, pos) => {
                 self.window.clear();
@@ -903,7 +903,7 @@ impl CramMergedReader {
     }
 
     fn argmin_head(&mut self) -> Option<usize> {
-        let mut best: Option<(usize, (usize, u32))> = None;
+        let mut best: Option<(usize, (usize, u64))> = None;
         for idx in 0..self.peekers.len() {
             let Ok(Some(rb)) = self.peekers[idx].peek() else {
                 continue;
@@ -979,12 +979,12 @@ struct HeadKey {
     qname: Vec<u8>,
     flag: u16,
     ref_id: usize,
-    pos: u32,
+    pos: u64,
 }
 
 fn head_key(rb: &sam::alignment::RecordBuf) -> Option<HeadKey> {
     let ref_id = rb.reference_sequence_id()?;
-    let pos = rb.alignment_start()?.get() as u32;
+    let pos = rb.alignment_start()?.get() as u64;
     let flag = rb.flags().bits();
     let qname = rb
         .name()
@@ -998,10 +998,10 @@ fn head_key(rb: &sam::alignment::RecordBuf) -> Option<HeadKey> {
     })
 }
 
-fn encode_order_key(ref_id: usize, pos: u32) -> u64 {
+fn encode_order_key(ref_id: usize, pos: u64) -> u64 {
     // Pack (ref_id, pos) into a single u64 for the OutOfOrderRead error
     // message. `ref_id` lives in the high 32 bits.
-    ((ref_id as u64) << 32) | (pos as u64)
+    ((ref_id as u64) << 32) | (pos & 0xFFFF_FFFF)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1042,7 +1042,7 @@ fn record_buf_to_mapped_read(
     let pos = rb
         .alignment_start()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record has no alignment_start"))?
-        .get() as u32;
+        .get() as u64;
     let mapq = rb.mapping_quality().map(u8::from).unwrap_or(0);
     let cigar = cigar_to_ops(rb.cigar());
     let seq: Vec<u8> = rb
@@ -1053,7 +1053,7 @@ fn record_buf_to_mapped_read(
         .collect();
     let qual = rb.quality_scores().as_ref().to_vec();
     let mate_ref_id = rb.mate_reference_sequence_id();
-    let mate_pos = rb.mate_alignment_start().map(|p| p.get() as u32);
+    let mate_pos = rb.mate_alignment_start().map(|p| p.get() as u64);
     Ok(MappedRead {
         qname,
         flag,
@@ -1169,7 +1169,7 @@ mod tests {
         (out, *reader.filter_counts(), err)
     }
 
-    fn pass_record(qname: &str, ref_id: usize, pos: u32) -> RecordSpec {
+    fn pass_record(qname: &str, ref_id: usize, pos: u64) -> RecordSpec {
         // MAPQ above DEFAULT_MIN_MAPQ; clean flags; SEQ length above
         // DEFAULT_MIN_READ_LENGTH.
         let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
@@ -1243,7 +1243,7 @@ mod tests {
         .expect("reader");
         let (out, _, err) = run_to_completion(reader);
         assert!(err.is_none(), "unexpected error: {:?}", err);
-        let positions: Vec<u32> = out.iter().map(|r| r.pos).collect();
+        let positions: Vec<u64> = out.iter().map(|r| r.pos).collect();
         assert_eq!(positions, vec![100, 150, 200, 300, 400, 500]);
         let sources: Vec<usize> = out.iter().map(|r| r.source_file_index).collect();
         assert_eq!(sources, vec![0, 1, 1, 0, 1, 0]);
@@ -1703,6 +1703,25 @@ mod tests {
         assert_eq!(out[1].qname, b"R2");
     }
 
+    #[test]
+    fn a15_position_above_u32_max_round_trips_through_mapped_read() {
+        let big_pos: u64 = (u32::MAX as u64) + 100;
+        let rec = pass_record("R", 0, big_pos);
+        let cram_a = open_cram_from_records("a.cram", vec![record_spec(rec)]);
+        let mut contigs = default_contigs();
+        contigs.entries[0].length = big_pos + 1_000;
+        let mut reader = CramMergedReader::from_open_crams(
+            vec![cram_a],
+            contigs,
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+        )
+        .expect("reader");
+        let read = reader.next().expect("ok").expect("ok");
+        assert_eq!(read.pos, big_pos);
+        assert!(reader.next().is_none());
+    }
+
     // --- Group B: via new (real CRAM + FASTA) ------------------------
 
     use crate::per_sample_caller::cram_files::{
@@ -1730,7 +1749,7 @@ mod tests {
         }]
     }
 
-    fn pass_record_for_b(qname: &str, ref_id: usize, pos: u32) -> RecordBufForB {
+    fn pass_record_for_b(qname: &str, ref_id: usize, pos: u64) -> RecordBufForB {
         let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
         record_spec(RecordSpec {
             qname: qname.into(),

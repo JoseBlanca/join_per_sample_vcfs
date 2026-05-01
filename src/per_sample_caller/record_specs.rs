@@ -29,13 +29,13 @@ pub(crate) struct RecordSpec {
     pub qname: String,
     pub flag: u16,
     pub ref_id: usize,
-    pub pos: u32,
+    pub pos: u64,
     pub mapq: u8,
     pub cigar_ops: Vec<CigarOp>,
     pub seq: Vec<u8>,
     pub qual: Vec<u8>,
     pub mate_ref_id: Option<usize>,
-    pub mate_pos: Option<u32>,
+    pub mate_pos: Option<u64>,
 }
 
 pub(crate) fn record_spec(spec: RecordSpec) -> RecordBuf {
@@ -44,7 +44,9 @@ pub(crate) fn record_spec(spec: RecordSpec) -> RecordBuf {
     *rb.flags_mut() = Flags::from(spec.flag);
     *rb.reference_sequence_id_mut() = Some(spec.ref_id);
     if spec.pos > 0 {
-        *rb.alignment_start_mut() = noodles_core::Position::new(spec.pos as usize);
+        *rb.alignment_start_mut() = usize::try_from(spec.pos)
+            .ok()
+            .and_then(noodles_core::Position::new);
     }
     if spec.mapq > 0 {
         *rb.mapping_quality_mut() = MappingQuality::new(spec.mapq);
@@ -70,7 +72,8 @@ pub(crate) fn record_spec(spec: RecordSpec) -> RecordBuf {
     *rb.mate_reference_sequence_id_mut() = spec.mate_ref_id;
     *rb.mate_alignment_start_mut() = spec
         .mate_pos
-        .and_then(|p| noodles_core::Position::new(p as usize));
+        .and_then(|p| usize::try_from(p).ok())
+        .and_then(noodles_core::Position::new);
     rb
 }
 

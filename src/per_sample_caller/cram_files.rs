@@ -25,7 +25,7 @@ use tempfile::TempDir;
 #[derive(Debug, Clone)]
 pub(crate) struct ContigSpec {
     pub name: String,
-    pub length: u32,
+    pub length: u64,
 }
 
 /// Knobs that test-driven CRAM writes need to override on the
@@ -47,7 +47,7 @@ pub(crate) struct HeaderOverrides {
     pub name_overrides: Vec<(String, String)>,
     /// Per-contig length override (same idea, for length mismatch
     /// tests).
-    pub length_overrides: Vec<(String, u32)>,
+    pub length_overrides: Vec<(String, u64)>,
 }
 
 /// Build a FASTA + `.fai` in a freshly allocated tempdir. Returns the
@@ -67,11 +67,17 @@ pub(crate) fn build_fasta(contigs: &[ContigSpec]) -> io::Result<(TempDir, PathBu
         fa.write_all(header.as_bytes())?;
         offset += header.len() as u64;
         // Sequence line: 'A' * length + '\n'
-        let seq = vec![b'A'; contig.length as usize];
+        let seq_len = usize::try_from(contig.length).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "contig length does not fit in usize on this target",
+            )
+        })?;
+        let seq = vec![b'A'; seq_len];
         fa.write_all(&seq)?;
         fa.write_all(b"\n")?;
         // .fai entry: name\tlength\toffset\tline_bases\tline_width
-        let line_bases = contig.length as u64;
+        let line_bases = contig.length;
         let line_width = line_bases + 1;
         writeln!(
             fai,
@@ -136,7 +142,9 @@ fn build_sam_header(contigs: &[ContigSpec], overrides: &HeaderOverrides) -> sam:
     for contig in contigs {
         let name = name_for(contig, overrides);
         let length = length_for(contig, overrides);
-        let length_nz = NonZero::new(length as usize).expect("contig length must be non-zero");
+        let length_usize =
+            usize::try_from(length).expect("contig length must fit in usize on this target");
+        let length_nz = NonZero::new(length_usize).expect("contig length must be non-zero");
         let mut ref_seq_map = Map::<ReferenceSequence>::new(length_nz);
         if let Some((_, md5)) = overrides
             .md5_overrides
@@ -179,7 +187,7 @@ fn name_for(contig: &ContigSpec, overrides: &HeaderOverrides) -> String {
         .unwrap_or_else(|| contig.name.clone())
 }
 
-fn length_for(contig: &ContigSpec, overrides: &HeaderOverrides) -> u32 {
+fn length_for(contig: &ContigSpec, overrides: &HeaderOverrides) -> u64 {
     overrides
         .length_overrides
         .iter()
