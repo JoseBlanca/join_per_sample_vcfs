@@ -49,7 +49,7 @@
 | Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | Applied | No | `cram_input.rs` | Pass | No |
-| Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | TBD | No | TBD | TBD | TBD |
+| Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | TBD | No | TBD | TBD | TBD |
 | Mi6 | Minor | MAPQ-missing collapses to 0 — needs doc and regression test | Apply | TBD | No | TBD | TBD | TBD |
 | N1 | Nit | `OpenCram::path_for_errors` rename | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### Mi4 — `MalformedRecord` errors with empty `qname` context
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** When the qname is unknown (peek failed before the record could be inspected), the variant emitted `qname=''` which doesn't help localise the failure.
+- **Implementation summary:** Changed `MalformedRecord.qname` from `String` to `Option<String>`. Updated the `#[error]` format string to omit the `(qname='…')` clause when `None` via a small `match` expression in the format args. Updated all five call sites: the two consumed-on-`fail` paths in `Iterator::next` use `Some(qname)` from the head; the three call sites where the record cannot be inspected (`refill_heads` peek error, `peek_head_keys` peek error, and the defensive `head_key()==None` arm) pass `None` (or `Some(name)` when the record name is recoverable).
+- **Review suggestion used verbatim?:** Yes — picked the `Option<String>` shape.
+- **Adaptation:** None; format string interpolation uses thiserror's expression-form to render the qname clause conditionally.
+- **Verification performed:** Added `p2_malformed_record_message_omits_empty_qname`, asserting the rendered message contains `qname='R1'` when set and contains no `qname` substring when the field is `None`.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`, `src/per_sample_caller/errors.rs`
+- **Tests added or modified:** `p2_malformed_record_message_omits_empty_qname`
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 28 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None

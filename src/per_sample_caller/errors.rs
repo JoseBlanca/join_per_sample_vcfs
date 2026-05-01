@@ -103,10 +103,16 @@ pub enum CramInputError {
         detail: String,
     },
 
-    #[error("malformed record in '{path}' (qname='{qname}'): {source}")]
+    #[error(
+        "malformed record in '{path}'{}: {source}",
+        match qname {
+            Some(q) => format!(" (qname='{q}')"),
+            None => String::new(),
+        }
+    )]
     MalformedRecord {
         path: PathBuf,
-        qname: String,
+        qname: Option<String>,
         #[source]
         source: std::io::Error,
     },

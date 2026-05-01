@@ -818,7 +818,7 @@ impl Iterator for CramMergedReader {
                 Some(Err(e)) => {
                     return self.fail(CramInputError::MalformedRecord {
                         path: self.paths[chosen_idx].clone(),
-                        qname: String::from_utf8_lossy(&head.qname).into_owned(),
+                        qname: Some(String::from_utf8_lossy(&head.qname).into_owned()),
                         source: e,
                     });
                 }
@@ -831,7 +831,7 @@ impl Iterator for CramMergedReader {
                 Err(e) => {
                     return self.fail(CramInputError::MalformedRecord {
                         path: self.paths[chosen_idx].clone(),
-                        qname: String::from_utf8_lossy(&head.qname).into_owned(),
+                        qname: Some(String::from_utf8_lossy(&head.qname).into_owned()),
                         source: e,
                     });
                 }
@@ -888,7 +888,7 @@ impl CramMergedReader {
                     Err(e) => {
                         return Err(CramInputError::MalformedRecord {
                             path: self.paths[idx].clone(),
-                            qname: String::new(),
+                            qname: None,
                             source: e,
                         });
                     }
@@ -928,8 +928,7 @@ impl CramMergedReader {
                     // than a silent drop.
                     let qname = rb
                         .name()
-                        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-                        .unwrap_or_default();
+                        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned());
                     Err(CramInputError::MalformedRecord {
                         path: self.paths[idx].clone(),
                         qname,
@@ -943,7 +942,7 @@ impl CramMergedReader {
             Ok(None) => Ok(None),
             Err(e) => Err(CramInputError::MalformedRecord {
                 path: self.paths[idx].clone(),
-                qname: String::new(),
+                qname: None,
                 source: e,
             }),
         }
@@ -1154,6 +1153,30 @@ mod tests {
     }
 
     // --- Pure-type tests ---------------------------------------------
+
+    #[test]
+    fn p2_malformed_record_message_omits_empty_qname() {
+        let with_qname = CramInputError::MalformedRecord {
+            path: PathBuf::from("/foo.cram"),
+            qname: Some("R1".into()),
+            source: io::Error::new(io::ErrorKind::InvalidData, "bad"),
+        };
+        assert!(
+            with_qname.to_string().contains("qname='R1'"),
+            "got {}",
+            with_qname
+        );
+        let no_qname = CramInputError::MalformedRecord {
+            path: PathBuf::from("/foo.cram"),
+            qname: None,
+            source: io::Error::new(io::ErrorKind::InvalidData, "bad"),
+        };
+        assert!(
+            !no_qname.to_string().contains("qname"),
+            "qname clause leaked: {}",
+            no_qname
+        );
+    }
 
     #[test]
     fn p1_contig_list_md5_wildcard_equality() {
