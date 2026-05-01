@@ -767,8 +767,10 @@ impl Iterator for CramMergedReader {
                 return Some(Err(CramInputError::OutOfOrderRead {
                     path: self.paths[chosen_idx].clone(),
                     qname: String::from_utf8_lossy(&head.qname).into_owned(),
-                    prev_pos: encode_order_key(prev_ref, prev_pos),
-                    this_pos: encode_order_key(head.ref_id, head.pos),
+                    prev_ref_id: prev_ref,
+                    prev_pos,
+                    this_ref_id: head.ref_id,
+                    this_pos: head.pos,
                 }));
             }
 
@@ -1020,12 +1022,6 @@ fn head_key(rb: &sam::alignment::RecordBuf) -> Option<HeadKey> {
         ref_id,
         pos,
     })
-}
-
-fn encode_order_key(ref_id: usize, pos: u64) -> u64 {
-    // Pack (ref_id, pos) into a single u64 for the OutOfOrderRead error
-    // message. `ref_id` lives in the high 32 bits.
-    ((ref_id as u64) << 32) | (pos & 0xFFFF_FFFF)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1315,8 +1311,19 @@ mod tests {
         assert_eq!(first.pos, 200);
         let err = reader.next().expect("err item").expect_err("expected err");
         match err {
-            CramInputError::OutOfOrderRead { qname, .. } => {
+            CramInputError::OutOfOrderRead {
+                qname,
+                prev_ref_id,
+                prev_pos,
+                this_ref_id,
+                this_pos,
+                ..
+            } => {
                 assert_eq!(qname, "R2");
+                assert_eq!(prev_ref_id, 0);
+                assert_eq!(prev_pos, 200);
+                assert_eq!(this_ref_id, 0);
+                assert_eq!(this_pos, 100);
             }
             other => panic!("unexpected error: {:?}", other),
         }

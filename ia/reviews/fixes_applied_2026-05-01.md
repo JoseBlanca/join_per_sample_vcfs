@@ -45,7 +45,7 @@
 | M2 | Major | `MultipleSampleNames` reused for within-file SM disagreement | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | M3 | Major | `decode_md5_hex` silently tolerates malformed `M5` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | Applied | No | `cram_input.rs` | Pass | No |
-| M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | TBD | No | TBD | TBD | TBD |
+| M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | TBD | No | TBD | TBD | TBD |
 | Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | TBD | No | TBD | TBD | TBD |
 | Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | TBD | No | TBD | TBD | TBD |
@@ -55,7 +55,7 @@
 | N1 | Nit | `OpenCram::path_for_errors` rename | Apply | TBD | No | TBD | TBD | TBD |
 | N2 | Nit | `window: VecDeque` → `Vec` | Apply | TBD | No | TBD | TBD | TBD |
 | N3 | Nit | WindowKey clone | Apply | TBD | No | TBD | TBD | TBD |
-| N4 | Nit | `encode_order_key` removal | Apply (subsumed by M5) | TBD | No | TBD | TBD | TBD |
+| N4 | Nit | `encode_order_key` removal | Apply (subsumed by M5) | Superseded | No | `cram_input.rs` | (covered by M5) | No |
 | N5 | Nit | Implementation file size — won't fix | Won't fix (per review) | Deferred | No | None | N/A | No |
 | N6 | Nit | `Container::default()` aesthetics | No concrete change | Deferred | No | None | N/A | No |
 
@@ -81,6 +81,39 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### M5 — `OutOfOrderRead` carries packed `(ref_id, pos)` keys
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** Bug confirmed: `OutOfOrderRead.prev_pos` and `this_pos` carried `(ref_id << 32) | pos` packed values, producing user-facing positions like `4294967396` and silently colliding when the cross-chromosome offset was `< 2^32`.
+- **Implementation summary:** Replaced packed fields with structured `prev_ref_id`, `prev_pos`, `this_ref_id`, `this_pos`. The `#[error]` format string now renders `(ref_id=…, pos=…)` for both prev and this. The packing helper `encode_order_key` is gone (this also resolves Nit "encode_order_key removal" — N4).
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Updated `a4_out_of_order_within_a_single_stream` to assert on each of the four structured fields. The previous assertion only checked the qname.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`, `src/per_sample_caller/errors.rs`
+- **Tests added or modified:** `a4_out_of_order_within_a_single_stream` (now asserts the four structured fields)
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 25 passed
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### N4 — `encode_order_key` removal
+- **Severity:** Nit
+- **Initial decision:** Apply (subsumed by M5)
+- **Final status:** Superseded (by M5)
+- **Reasoning:** `encode_order_key` was the helper that built the packed-u64 OutOfOrderRead key; with M5 restructuring the variant, the function has no remaining callers.
+- **Implementation summary:** Removed alongside the M5 fix.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Tests still green; no remaining references in tree.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** None.
+- **Validation:** Covered by M5's run.
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None

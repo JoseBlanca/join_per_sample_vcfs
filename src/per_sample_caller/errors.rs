@@ -69,12 +69,16 @@ pub enum CramInputError {
     },
 
     #[error(
-        "out-of-order read in '{path}': QNAME '{qname}' at {this_pos} regresses from {prev_pos}"
+        "out-of-order read in '{path}': QNAME '{qname}' at \
+         (ref_id={this_ref_id}, pos={this_pos}) regresses from \
+         (ref_id={prev_ref_id}, pos={prev_pos})"
     )]
     OutOfOrderRead {
         path: PathBuf,
         qname: String,
+        prev_ref_id: usize,
         prev_pos: u64,
+        this_ref_id: usize,
         this_pos: u64,
     },
 
