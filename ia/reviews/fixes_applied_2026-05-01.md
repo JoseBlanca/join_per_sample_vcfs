@@ -43,7 +43,7 @@
 |---|---|---|---|---|---|---|---|---|
 | M1 | Major | silent `as u32` truncation on position and length values | Apply | Applied | No | `cram_input.rs`, `errors.rs`, `record_specs.rs`, `cram_files.rs` | Pass | No |
 | M2 | Major | `MultipleSampleNames` reused for within-file SM disagreement | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
-| M3 | Major | `decode_md5_hex` silently tolerates malformed `M5` | Apply | TBD | No | TBD | TBD | TBD |
+| M3 | Major | `decode_md5_hex` silently tolerates malformed `M5` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | TBD | No | TBD | TBD | TBD |
 | M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | TBD | No | TBD | TBD | TBD |
 | Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### M3 — `decode_md5_hex` silently tolerates malformed `M5`
+- **Severity:** Major
+- **Initial decision:** Apply (decision: hard error on malformed M5)
+- **Final status:** Applied
+- **Reasoning:** Bug confirmed: `md5_from_reference_sequence` collapsed every malformed `M5` to `None`, which the wildcard `ContigEntry::eq` rule then accepted as "absent". A subtly wrong CRAM (truncated, non-hex character, lowercase typo) was silently treated as MD5-clean, contradicting the "errors must not pass silently" design principle.
+- **Implementation summary:** Promoted `md5_from_reference_sequence` to fallible (`Result<Option<[u8;16]>, CramInputError>`). Threaded the contig name and CRAM path so the new error variant `CramInputError::MalformedMd5 { path, contig, detail }` can be emitted with usable diagnostics. `extract_header` now propagates the error via `?`. A present-but-malformed `M5` is therefore a hard error; an absent `M5` still returns `Ok(None)` and acts as the documented wildcard.
+- **Review suggestion used verbatim?:** No
+- **Adaptation:** Detail string distinguishes "wrong length" from "non-hex character" rather than always reporting the byte count, since both inputs are real-world failure modes; the test exercises both branches.
+- **Verification performed:** Added `b4b_malformed_md5_rejected` covering three sub-cases: a non-hex 7-byte M5, a 30-char hex M5, and a 32-char string with a non-hex character — all three produce `MalformedMd5`. Existing CRAM-with-good-MD5 tests still pass.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`, `src/per_sample_caller/errors.rs`
+- **Tests added or modified:** `b4b_malformed_md5_rejected`
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 24 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None

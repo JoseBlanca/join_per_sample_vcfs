@@ -89,6 +89,13 @@ pub enum CramInputError {
         pos: u64,
     },
 
+    #[error("malformed @SQ M5 in '{path}' for contig '{contig}': {detail}")]
+    MalformedMd5 {
+        path: PathBuf,
+        contig: String,
+        detail: String,
+    },
+
     #[error("malformed record in '{path}' (qname='{qname}'): {source}")]
     MalformedRecord {
         path: PathBuf,

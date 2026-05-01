@@ -327,7 +327,7 @@ fn extract_header(path: &Path, sam_header: &sam::Header) -> Result<CramHeader, C
     for (name_bstr, ref_seq_map) in sam_header.reference_sequences() {
         let name = String::from_utf8_lossy(name_bstr.as_ref()).into_owned();
         let length: u64 = usize::from(ref_seq_map.length()) as u64;
-        let md5 = md5_from_reference_sequence(ref_seq_map);
+        let md5 = md5_from_reference_sequence(path, &name, ref_seq_map)?;
         entries.push(ContigEntry { name, length, md5 });
     }
     let contigs = ContigList { entries };
@@ -349,13 +349,28 @@ fn sort_order_string(sam_header: &sam::Header) -> Option<String> {
 }
 
 fn md5_from_reference_sequence(
+    path: &Path,
+    contig_name: &str,
     ref_seq_map: &sam::header::record::value::Map<
         sam::header::record::value::map::ReferenceSequence,
     >,
-) -> Option<[u8; 16]> {
+) -> Result<Option<[u8; 16]>, CramInputError> {
     use noodles_sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
-    let raw = ref_seq_map.other_fields().get(&MD5_CHECKSUM)?;
-    decode_md5_hex(raw.as_ref())
+    let Some(raw) = ref_seq_map.other_fields().get(&MD5_CHECKSUM) else {
+        return Ok(None);
+    };
+    let bytes = raw.as_ref();
+    decode_md5_hex(bytes).map(Some).ok_or_else(|| {
+        CramInputError::MalformedMd5 {
+            path: path.to_path_buf(),
+            contig: contig_name.to_string(),
+            detail: if bytes.len() != 32 {
+                format!("expected 32 hex chars, got {} bytes", bytes.len())
+            } else {
+                "non-hex character in M5 value".into()
+            },
+        }
+    })
 }
 
 fn decode_md5_hex(hex: &[u8]) -> Option<[u8; 16]> {
@@ -1954,6 +1969,87 @@ mod tests {
                 assert_eq!(sm_b, "bar");
             }
             other => panic!("expected MultipleSampleNamesInFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn b4b_malformed_md5_rejected() {
+        let contigs = one_contig_chr1();
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+
+        // 1) M5 with the wrong length (7 chars).
+        let (_fa1_dir, fa1) = build_fasta(&contigs).expect("fasta");
+        let (_c1_dir, c1) = build_cram(
+            &fa1,
+            &contigs,
+            &HeaderOverrides {
+                md5_overrides: vec![("chr1".into(), "not_hex".into())],
+                ..Default::default()
+            },
+            &records,
+        )
+        .expect("build short md5");
+        let err = err_or_panic(
+            CramMergedReader::new(&[c1], &fa1, CramMergedReaderConfig::default()),
+            "expected MalformedMd5",
+        );
+        match err {
+            CramInputError::MalformedMd5 { contig, detail, .. } => {
+                assert_eq!(contig, "chr1");
+                assert!(
+                    detail.contains("expected 32 hex chars"),
+                    "detail = {}",
+                    detail
+                );
+            }
+            other => panic!("expected MalformedMd5, got {:?}", other),
+        }
+
+        // 2) M5 with 30 hex chars (still wrong length, just barely).
+        let (_fa2_dir, fa2) = build_fasta(&contigs).expect("fasta");
+        let (_c2_dir, c2) = build_cram(
+            &fa2,
+            &contigs,
+            &HeaderOverrides {
+                md5_overrides: vec![("chr1".into(), "0".repeat(30))],
+                ..Default::default()
+            },
+            &records,
+        )
+        .expect("build short md5 30");
+        let err = err_or_panic(
+            CramMergedReader::new(&[c2], &fa2, CramMergedReaderConfig::default()),
+            "expected MalformedMd5 short",
+        );
+        assert!(
+            matches!(err, CramInputError::MalformedMd5 { .. }),
+            "got {:?}",
+            err
+        );
+
+        // 3) M5 with 32 chars but a non-hex character.
+        let (_fa3_dir, fa3) = build_fasta(&contigs).expect("fasta");
+        let mut bad = "0".repeat(31);
+        bad.push('Z');
+        let (_c3_dir, c3) = build_cram(
+            &fa3,
+            &contigs,
+            &HeaderOverrides {
+                md5_overrides: vec![("chr1".into(), bad)],
+                ..Default::default()
+            },
+            &records,
+        )
+        .expect("build non-hex md5");
+        let err = err_or_panic(
+            CramMergedReader::new(&[c3], &fa3, CramMergedReaderConfig::default()),
+            "expected MalformedMd5 non-hex",
+        );
+        match err {
+            CramInputError::MalformedMd5 { detail, .. } => {
+                assert!(detail.contains("non-hex"), "detail = {}", detail);
+            }
+            other => panic!("expected MalformedMd5, got {:?}", other),
         }
     }
 
