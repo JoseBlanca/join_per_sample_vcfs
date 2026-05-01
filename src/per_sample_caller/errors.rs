@@ -9,6 +9,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CramInputError {
+    #[error("at least one CRAM input is required")]
+    NoInputs,
+
     #[error("failed to open CRAM '{path}': {source}")]
     OpenFailed {
         path: PathBuf,

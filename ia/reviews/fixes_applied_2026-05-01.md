@@ -46,7 +46,7 @@
 | M3 | Major | `decode_md5_hex` silently tolerates malformed `M5` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
-| Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | TBD | No | TBD | TBD | TBD |
+| Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | TBD | No | TBD | TBD | TBD |
 | Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | TBD | No | TBD | TBD | TBD |
 | Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### Mi1 — empty-input check returns `CramInputError::Io`
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** A programming error (empty inputs) was being squeezed through the `Io` variant with a synthesized `io::Error`, which (a) emitted "I/O error on '': …" and (b) was indistinguishable from a real I/O failure for callers that match on the variant.
+- **Implementation summary:** Added `CramInputError::NoInputs`. The empty-input guard in `CramMergedReader::new` now returns it directly.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Added `a16_empty_inputs_returns_no_inputs`, which calls `new(&[], …)` and asserts the variant via a `match`.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`, `src/per_sample_caller/errors.rs`
+- **Tests added or modified:** `a16_empty_inputs_returns_no_inputs`
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 26 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None

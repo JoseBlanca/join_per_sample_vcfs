@@ -557,13 +557,7 @@ impl CramMergedReader {
         config: CramMergedReaderConfig,
     ) -> Result<Self, CramInputError> {
         if crams.is_empty() {
-            return Err(CramInputError::Io {
-                path: PathBuf::new(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "at least one CRAM input is required",
-                ),
-            });
+            return Err(CramInputError::NoInputs);
         }
 
         // FASTA repository — built once and shared across decoders.
@@ -1777,6 +1771,25 @@ mod tests {
         let read = reader.next().expect("ok").expect("ok");
         assert_eq!(read.pos, big_pos);
         assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn a16_empty_inputs_returns_no_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta_path = dir.path().join("ref.fa");
+        // The .fai is checked after the empty-input guard; touching a
+        // file isn't required because we expect to fail before the
+        // FASTA is even opened.
+        let result = CramMergedReader::new(
+            &[],
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        );
+        match result {
+            Ok(_) => panic!("expected NoInputs, got Ok"),
+            Err(CramInputError::NoInputs) => {}
+            Err(other) => panic!("expected NoInputs, got {:?}", other),
+        }
     }
 
     // --- Group B: via new (real CRAM + FASTA) ------------------------
