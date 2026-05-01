@@ -4,7 +4,7 @@
 **Source review:** `ia/reviews/per_sample_caller_cram_input_2026-04-29.md`
 **Source state reviewed against:** commit b2729fe (branch main)
 **Execution mode:** interactive
-**Overall status:** In progress
+**Overall status:** Completed
 
 ---
 
@@ -17,25 +17,26 @@
 - Nits: 6
 
 ### Outcome totals
-- Applied: 0
+- Applied: 12
 - Applied with adaptation: 0
 - Already fixed: 0
-- Deferred: 0
+- Deferred: 3 (N3, N5, N6 — N5/N6 per review's instruction)
 - Disputed: 0
 - Failed validation: 0
 - Blocked by context mismatch: 0
-- Superseded: 0
+- Superseded: 1 (N4 — subsumed by M5)
 - Awaiting user answer: 0
 
 ### Validation summary
-- `cargo fmt --check` → not run
-- `cargo clippy --all-targets --all-features -- -D warnings` → not run
-- `cargo test --all-targets --all-features` → not run
-- `cargo doc --no-deps` → not run
-- `cargo audit` → not run
+- `cargo fmt --check` → 0, clean (host)
+- `cargo clippy --all-targets --all-features -- -D warnings` → not gated; per_sample_caller is clean (host clippy reports the same pre-existing warnings/errors in `decompression_pool.rs`, `genotype_merging.rs`, `vcf_writer.rs` documented in the review's §3 "Execution Status" — out of scope for this fix run)
+- `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 29 passed (was 22 at review time)
+- `./scripts/dev.sh cargo test --lib` → 0, 90 passed (was 83 at review time)
+- `cargo doc --no-deps` → not run (review did not run it either)
+- `cargo audit` → not run (not installed in container; review skipped)
 
 ### Unresolved high-priority findings
-- (to be filled in)
+- None. All Major findings (M1-M5) have terminal status `Applied`.
 
 ## 2. Findings table
 
@@ -52,9 +53,9 @@
 | Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi6 | Minor | MAPQ-missing collapses to 0 — needs doc and regression test | Apply | Applied | No | `cram_input.rs` | Pass | No |
-| N1 | Nit | `OpenCram::path_for_errors` rename | Apply | TBD | No | TBD | TBD | TBD |
-| N2 | Nit | `window: VecDeque` → `Vec` | Apply | TBD | No | TBD | TBD | TBD |
-| N3 | Nit | WindowKey clone | Apply | TBD | No | TBD | TBD | TBD |
+| N1 | Nit | `OpenCram::path_for_errors` rename | Apply | Applied | No | `cram_input.rs`, `record_specs.rs` | Pass | No |
+| N2 | Nit | `window: VecDeque` → `Vec` | Apply | Applied | No | `cram_input.rs` | Pass | No |
+| N3 | Nit | WindowKey clone | Apply | Deferred | No | None | N/A | Yes |
 | N4 | Nit | `encode_order_key` removal | Apply (subsumed by M5) | Superseded | No | `cram_input.rs` | (covered by M5) | No |
 | N5 | Nit | Implementation file size — won't fix | Won't fix (per review) | Deferred | No | None | N/A | No |
 | N6 | Nit | `Container::default()` aesthetics | No concrete change | Deferred | No | None | N/A | No |
@@ -84,6 +85,88 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None
+
+### N1 — `OpenCram::path_for_errors` rename
+- **Severity:** Nit
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** `path_for_errors` is verbose; in context (a struct that owns the path used both for reporting and as the merged reader's identity), `path` is unambiguous.
+- **Implementation summary:** Renamed the field on `OpenCram` and the parameter on `open_cram_from_records`.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Full lib test suite still passes.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`, `src/per_sample_caller/record_specs.rs`
+- **Tests added or modified:** None.
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib` → 0, 90 passed
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### N2 — `window: VecDeque` → `Vec`
+- **Severity:** Nit
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** Only `push_back`, linear `iter().find`, and `clear()` are used. `Vec` has the same complexity for those operations and is one fewer concept.
+- **Implementation summary:** Replaced `VecDeque<WindowEntry>` with `Vec<WindowEntry>`. `push_back` → `push`. Dropped the `use std::collections::VecDeque;` import.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Full lib test suite still passes; the duplicate-detection tests (`a5`, `a6`) cover the window operations.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** None.
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib` → 0, 90 passed
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### N3 — WindowKey clone
+- **Severity:** Nit
+- **Initial decision:** Apply (review: agent's discretion either way)
+- **Final status:** Deferred
+- **Reasoning:** The clone is `head.qname.clone()`, called once per accepted record. To eliminate it we would need to restructure how `head` is held alive across the order-check / dup-check / consume-the-head sequence, since `head.qname` is also used to populate the error message if the consume step fails. The cost is small (qnames are short), the gain is zero on the hot path (one `Vec<u8>` allocation per accepted record), and the restructure would expand the diff for a marginal benefit. Per the review's "fixing agent's discretion" wording, leaving the clone in place is acceptable.
+- **Implementation summary:** None.
+- **Review suggestion used verbatim?:** N/A.
+- **Adaptation:** None.
+- **Verification performed:** N/A.
+- **Files changed:** None.
+- **Tests added or modified:** None.
+- **Validation:** N/A.
+- **User input:** None.
+- **Follow-up:** Re-evaluate when the BAQ / pileup-walker slices land — they may want to mutate the head's `qname` storage in a way that makes the clone obviously avoidable.
+- **Residual risk:** None.
+
+### N5 — Implementation file size
+- **Severity:** Nit
+- **Initial decision:** Won't fix (per review)
+- **Final status:** Deferred
+- **Reasoning:** Review states "fixing agent must NOT split this file as part of the review fixes."
+- **Implementation summary:** None.
+- **Review suggestion used verbatim?:** N/A.
+- **Adaptation:** None.
+- **Verification performed:** N/A.
+- **Files changed:** None.
+- **Tests added or modified:** None.
+- **Validation:** N/A.
+- **User input:** None.
+- **Follow-up:** Re-evaluate when later slices (BAQ, pileup walker) reveal which functions actually want to be reused.
+- **Residual risk:** None.
+
+### N6 — `Container::default()` aesthetics
+- **Severity:** Nit
+- **Initial decision:** No concrete change
+- **Final status:** Deferred
+- **Reasoning:** Per review: "Pure aesthetics. Approved (no concrete change required; revisit on noodles upgrade)."
+- **Implementation summary:** None.
+- **Review suggestion used verbatim?:** N/A.
+- **Adaptation:** None.
+- **Verification performed:** N/A.
+- **Files changed:** None.
+- **Tests added or modified:** None.
+- **Validation:** N/A.
+- **User input:** None.
+- **Follow-up:** Revisit on noodles upgrade.
+- **Residual risk:** None.
 
 ### Mi6 — MAPQ-missing collapses to 0 — needs doc and regression test
 - **Severity:** Minor
@@ -273,23 +356,36 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
 
 
 ## 5. Deferred findings to carry forward
-(to be filled in)
+- N3 — `WindowKey` qname clone: cost is small (one `Vec<u8>` per accepted record); restructuring `head`'s lifetime to avoid the clone expands the diff for marginal gain. Re-evaluate when later slices land. Review says agent's discretion either way.
+- N5 — file split (cram_input.rs ~2200 lines): explicitly out of scope per review ("fixing agent must NOT split this file as part of the review fixes"). Re-evaluate when later slices reveal reuse.
+- N6 — `Container::default()` aesthetics: revisit on noodles upgrade.
 
 ## 6. Disputed findings to return to reviewer
-(to be filled in)
+None.
 
 ## 7. Failed-validation findings
-(to be filled in)
+None.
 
 ## 8. Blocked-by-context-mismatch findings
-(to be filled in)
+None.
 
 ## 9. Commands run
-(to be filled in)
+- `./scripts/dev.sh cargo test --lib per_sample_caller`
+- `./scripts/dev.sh cargo test --lib`
+- `./scripts/dev.sh cargo build --lib`
+- `./scripts/dev.sh cargo build --lib --tests`
+- `cargo fmt --check`
+- `cargo fmt`
+- `cargo clippy --all-targets --all-features` (host)
 
 ## 10. Command results
-(to be filled in)
+- `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 29 passed (final state)
+- `./scripts/dev.sh cargo test --lib` → 0, 90 passed (final state)
+- `cargo fmt --check` → 0 after applying `cargo fmt`
+- `cargo clippy --all-targets --all-features` (host) → pre-existing warnings/errors in `decompression_pool.rs`, `genotype_merging.rs`, `vcf_writer.rs` only; no new warnings in `per_sample_caller`
 
 ## 11. Notes
-- Baseline before fixes: `./scripts/dev.sh cargo test --lib per_sample_caller` → 22 passed.
-- Each finding is implemented as a separate commit so the per-finding diff is reviewable in isolation.
+- Baseline before fixes: `./scripts/dev.sh cargo test --lib per_sample_caller` → 22 passed; final 29 passed.
+- Each finding is implemented as a separate commit so the per-finding diff is reviewable in isolation: M1, M2, M3, M4, M5, Mi1, Mi2, Mi3, Mi4, Mi5, Mi6, plus a closing Nits commit.
+- The review's Open Questions 1-4 were resolved at review time by Jose; no additional user input was required during this run.
+- Container clippy/rustfmt are not installed in the dev container, so format and clippy checks were run on the host. The host's clippy is configured against a slightly different toolchain version, which is why `clippy::collapsible_if` and `clippy::io_other_error` show in `decompression_pool.rs` etc. — those are pre-existing and explicitly out of scope.

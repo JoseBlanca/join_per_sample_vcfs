@@ -77,10 +77,10 @@ pub(crate) fn record_spec(spec: RecordSpec) -> RecordBuf {
     rb
 }
 
-pub(crate) fn open_cram_from_records(path_for_errors: &str, records: Vec<RecordBuf>) -> OpenCram {
+pub(crate) fn open_cram_from_records(path: &str, records: Vec<RecordBuf>) -> OpenCram {
     let iter = records.into_iter().map(Ok::<_, io::Error>);
     OpenCram {
-        path_for_errors: PathBuf::from(path_for_errors),
+        path: PathBuf::from(path),
         records: Box::new(iter),
     }
 }

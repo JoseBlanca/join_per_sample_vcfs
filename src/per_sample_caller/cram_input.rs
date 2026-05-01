@@ -4,7 +4,6 @@
 //! See `ia/feature_implementation_plans/per_sample_caller_cram_input.md`
 //! for the design rationale.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -236,7 +235,7 @@ impl Default for CramMergedReaderConfig {
 /// exposing it on a public type would re-couple our public API to
 /// noodles. Tests live in the same crate, so `pub(crate)` is enough.
 pub(crate) struct OpenCram {
-    pub path_for_errors: PathBuf,
+    pub path: PathBuf,
     pub records: Box<dyn Iterator<Item = io::Result<sam::alignment::RecordBuf>> + Send>,
 }
 
@@ -365,8 +364,9 @@ fn md5_from_reference_sequence(
         return Ok(None);
     };
     let bytes = raw.as_ref();
-    decode_md5_hex(bytes).map(Some).ok_or_else(|| {
-        CramInputError::MalformedMd5 {
+    decode_md5_hex(bytes)
+        .map(Some)
+        .ok_or_else(|| CramInputError::MalformedMd5 {
             path: path.to_path_buf(),
             contig: contig_name.to_string(),
             detail: if bytes.len() != 32 {
@@ -374,8 +374,7 @@ fn md5_from_reference_sequence(
             } else {
                 "non-hex character in M5 value".into()
             },
-        }
-    })
+        })
 }
 
 fn decode_md5_hex(hex: &[u8]) -> Option<[u8; 16]> {
@@ -551,7 +550,7 @@ pub struct CramMergedReader {
     prev_per_file: Vec<PerFileOrder>,
     /// Reads accepted at the current `(ref_id, pos)` — cleared on
     /// advance.
-    window: VecDeque<WindowEntry>,
+    window: Vec<WindowEntry>,
     /// Anchor for the current window: `None` while empty, `Some` at
     /// the position of the entries currently in `window`.
     window_anchor: Option<(usize, u64)>,
@@ -677,7 +676,7 @@ impl CramMergedReader {
                 pending: Vec::new().into_iter(),
             });
             open_crams.push(OpenCram {
-                path_for_errors: cram_path.clone(),
+                path: cram_path.clone(),
                 records: owned,
             });
         }
@@ -714,7 +713,7 @@ impl CramMergedReader {
         let mut peekers = Vec::with_capacity(n);
         let mut paths = Vec::with_capacity(n);
         for open in open_crams {
-            paths.push(open.path_for_errors);
+            paths.push(open.path);
             peekers.push(BufferedPeekable::with_buffer_size(
                 open.records,
                 PER_PEEKER_BUFFER_SIZE,
@@ -727,7 +726,7 @@ impl CramMergedReader {
             sample_name,
             config,
             prev_per_file: vec![None; n],
-            window: VecDeque::new(),
+            window: Vec::new(),
             window_anchor: None,
             filter_counts: FilterCounts::default(),
             fused: false,
@@ -859,7 +858,7 @@ impl Iterator for CramMergedReader {
             };
 
             // Accept: update window, prev_per_file.
-            self.window.push_back(WindowEntry {
+            self.window.push(WindowEntry {
                 key: new_key,
                 source_file_index: chosen_idx,
             });
@@ -1890,11 +1889,7 @@ mod tests {
         // The .fai is checked after the empty-input guard; touching a
         // file isn't required because we expect to fail before the
         // FASTA is even opened.
-        let result = CramMergedReader::new(
-            &[],
-            &fasta_path,
-            CramMergedReaderConfig::default(),
-        );
+        let result = CramMergedReader::new(&[], &fasta_path, CramMergedReaderConfig::default());
         match result {
             Ok(_) => panic!("expected NoInputs, got Ok"),
             Err(CramInputError::NoInputs) => {}
@@ -2122,7 +2117,11 @@ mod tests {
         );
         match err {
             CramInputError::MultipleSampleNamesInFile {
-                rg_a, sm_a, rg_b, sm_b, ..
+                rg_a,
+                sm_a,
+                rg_b,
+                sm_b,
+                ..
             } => {
                 assert_eq!(rg_a, "rg_foo");
                 assert_eq!(sm_a, "foo");
