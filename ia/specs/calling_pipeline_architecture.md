@@ -143,6 +143,15 @@ an external dependency and an IO round-trip for no saved work.
    are separated by a `delta_pos` field (distance from the previous
    record), so gaps are represented implicitly and the absence of a
    record unambiguously means "no data."
+8. **Stage 1 is a windowed walker.** Stage 1 cannot finalise a
+   record at position `Q` the moment the walker reaches `Q + 1`,
+   because later reads may still anchor at `Q` and extend its REF
+   span (Stage 2 §"Overlapping events extend the anchor REF"). It
+   holds a bounded buffer of open anchor records and transient
+   per-read state for positions inside the anchor window; the
+   window width `W`, the closure rule, and the handling of
+   out-of-window reads are specified in §"Anchor window and
+   closure" below.
 
 ### Per-read likelihood quality: BAQ vs. PairHMM vs. trust-the-aligner
 
@@ -218,21 +227,107 @@ This is a modest implementation win (BAQ is ~a few hundred lines
 following Heng Li's 2011 paper) that removes a real-world performance
 bottleneck users have hit with `calmd` in the past.
 
+### Anchor window and closure
+
+Stage 1 cannot emit each per-position record immediately. An anchor
+at position `Q` may still be extended by later-arriving reads that
+anchor at `Q` (Stage 2 §"Overlapping events extend the anchor
+REF"), and chain ids linking allele observations across positions
+need to track which reads support which alleles in a bounded
+neighbourhood of the walker. Stage 1 is therefore a windowed
+walker.
+
+**Window width `W`.** A fixed cap, configured by
+`--max-anchor-window` (default `5000` bp). Stage 1 holds open
+anchor records and transient per-read state for positions in
+`[walker − W, walker]`.
+
+**Closure rule.** As the walker advances past position `walker`,
+every open anchor at position `Q` with `Q + W ≤ walker` is
+finalised and emitted to the `.psf` writer. No further read can
+reach back to `Q`, so the anchor is safe to close.
+
+**Reads exceeding the window.** A read whose reference span (CIGAR
+walk length, plus mate gap for paired reads) exceeds `W` is
+**logged and skipped** — counted in the per-sample run summary
+alongside the existing skip categories (low MAPQ, unmapped,
+first-or-last-CIGAR indel, BAQ-rejected). For typical short-read
+data this counter stays at zero; for long-read data with the
+default cap, a non-zero counter signals that
+`--max-anchor-window` should be raised. Skipping rather than
+hard-erroring matches Stage 1's existing posture on unusable
+reads: many other categories of reads are dropped silently
+already, and one more bounded category does not change the
+contract — what matters is that the skip is reported in the
+summary so users can spot it.
+
+**Memory bound.** `O(W × max_alleles_per_position ×
+per_allele_record_size + per-read state for in-window reads)` —
+typically a few MB at the default `W = 5000`. Independent of
+cohort size and genome length.
+
+**Anchor extension vs. long single alleles.** Both close at the
+same `walker > Q + W` boundary, but they differ in memory
+profile:
+
+- **Anchor extension** — a compound observation in some read grows
+  an anchor's REF span (e.g. a SNP at 101 on the same read as a
+  deletion spanning 102–105). The compound is by construction
+  spannable by a single read or pair, so it fits inside `W`.
+- **Long single allele** — a long deletion supported by long reads
+  produces a record whose REF length equals the deletion length,
+  with no cross-read state beyond the reads that support that one
+  allele. Memory is `O(longest_allele_in_record)`, independent of
+  cross-read combinatorics.
+
+**Chain id reach.** A chain id links allele observations only
+inside the window of the chain's first allele. Once the anchor at
+the chain's first position closes, no further allele can be
+attached to the chain. This pins the cross-position reach of any
+single chain to ≤ `W` bp of reference and gives Stage 5 a
+deterministic upper bound when reasoning about compound spans
+across samples. A read or pair carrying linkage that would extend
+beyond `W` is split into multiple chains by the producer, each
+spanning ≤ `W` — but in practice any read or pair that fits the
+window cap by definition fits within one chain.
+
+**Per-read state is transient.** Stage 1 keeps a per-read window
+— which reads support which alleles at which positions — to
+compute anchor extensions and chain ids correctly. This state is
+released as soon as the relevant anchor records close. Per-read
+data does **not** propagate to the `.psf`; the on-disk format
+stores only per-allele scalars and chain ids (Stage 2 §"The five
+per-allele scalars"). The format-level "per-position summary, not
+per-read" property describes the on-disk artefact; Stage 1's
+runtime keeps the minimal per-read window required to produce
+the summaries.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--max-anchor-window N` | `5000` | Hard cap on the anchor window in bp. Reads with reference span exceeding `N` are logged and skipped, and counted in the per-sample run summary. |
+
 ### Related existing draft
 
-The binary layout for the per-sample artefact is sketched in
-[per_sample_pileup_format.md](per_sample_pileup_format.md) (PSP v1).
-That draft stores per-read records (3 bytes each). This architecture
-rejects per-read storage in favour of per-allele scalar summaries —
-sufficient to reproduce freebayes' posterior calculation exactly (see
-[freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md),
+The on-disk byte layout for the per-sample artefact lives in
+[per_sample_pileup_format.md](per_sample_pileup_format.md) (PSP v1),
+which this architecture promotes to the authoritative byte-layout
+specification (see §"Relationship to existing specs in this
+directory" at the end of this document). The current PSP v1 draft
+stores per-read records (3 bytes each); this architecture rejects
+per-read storage in favour of per-allele scalar summaries —
+sufficient to reproduce freebayes' posterior calculation exactly
+(see [freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md),
 section "The data freebayes actually consumes") at constant size in
 depth. Per-read storage would buy flexibility for alternative
 per-read likelihood models (PairHMM-style, novel error models) that
 this pipeline does not plan to support, at a cost linear in coverage
-— a trade we explicitly decline. PSP v1 needs to be revised
-accordingly; the BAQ-adjusted BQ values should also be reflected in
-whatever quality summary the revised format records.
+— a trade we explicitly decline. PSP v1 needs to be revised on
+three axes — the per-allele scalar set, BAQ-adjusted BQ feeding
+the quality scalar, and the per-block column manifest plus
+`(major, minor)` versioning policy from Stage 2 §"Schema evolution:
+per-block column manifest". The five v1 scalars become required
+column tags in that registry; future additions land as optional
+tags.
 
 ## Stage 2 — per-sample file contract (`.psf`)
 
@@ -353,7 +448,10 @@ reads), Stage 1 extends the record's REF sequence to cover the widest
 event and expresses all observed alts against that extended span —
 freebayes' haplotype-allele convention. The invariant that Stage 2
 records must maintain is: **every allele in a record spans the same
-reference stretch.**
+reference stretch.** The runtime mechanics — when Stage 1 finalises
+an anchor record, what bounds its growth, and how reads exceeding
+the bound are handled — are specified in Stage 1 §"Anchor window
+and closure".
 
 **Alt ordering within a record is Stage-1-internal** and carries no
 cohort-level meaning. The merger re-indexes at join time.
@@ -372,7 +470,7 @@ read, exact depth, exact quality sums, and strand / placement detail.
 Stage 1 applies no thresholding; every observed allele is kept
 regardless of how many reads support it.
 
-Three design decisions shape the format:
+Four design decisions shape the format:
 
 1. **All observed alleles are kept**, down to single-read support.
    Stage 1 has no "minimum reads per allele" or similar filter —
@@ -390,6 +488,13 @@ Three design decisions shape the format:
    where the record header is comparable in size to the data itself.
    A coarser format for ultra-low-depth regions is a possible future
    optimisation but not needed now.
+4. **Self-describing blocks via a per-block column manifest.** Each
+   compressed block declares which columns it carries. This is what
+   makes the format forward-compatible for future per-allele scalars
+   (e.g. an exact-mixture quality scalar to replace the
+   homogeneous-quality approximation in §"When a read 'not in G'
+   isn't actually an error") without a hard format break. See
+   §"Schema evolution: per-block column manifest" below.
 
 Compression, stacked:
 
@@ -397,8 +502,12 @@ Compression, stacked:
   covered positions).
 - **Columnar storage** within a block of records — each scalar lives
   in its own column so that adjacent-position similarity compresses
-  well.
-- **zstd** applied per block.
+  well. Columns are listed in the per-block manifest (see below);
+  the manifest entries identify each column by a stable tag from
+  the format's column-tag registry.
+- **zstd** applied per column inside a block (rather than across
+  the block as a whole) so that readers can skip-decompress columns
+  carrying tags they do not understand without parsing them.
 - Optionally, **lossless run-length encoding** for runs of positions
   whose entire record (alleles + scalars) is bit-identical. These
   runs are common in uniformly-covered non-variant regions and
@@ -409,6 +518,111 @@ Note: lossless RLE is *not* a gVCF block. A gVCF block merges adjacent
 positions with *similar* data into a single summary; lossless RLE
 merges adjacent positions with *identical* records and preserves the
 full data on decompression.
+
+### Schema evolution: per-block column manifest
+
+The `.psf` is the durable per-sample artefact behind the project's
+"cohort re-callable without re-doing per-sample work" property
+(constraint 5 at the top of this document). That property fails as
+soon as a schema change forces every existing `.psf` to be
+regenerated. The format therefore commits to a **forward-compatible
+columnar layout** so that minor schema additions (the most common
+kind anticipated — new per-allele scalars, new optional file-header
+fields) cost no per-sample re-runs. Hard breaks are reserved for
+genuine layout changes.
+
+**Major / minor versioning.** The file header carries a `(major,
+minor)` version pair, not a single version word. Semantic rule:
+
+- A **major bump** is a breaking layout change (block framing,
+  magic, fundamental encoding). Old readers reject; users run a
+  migration tool. Reserved for changes that genuinely cannot be
+  expressed as additions.
+- A **minor bump** is a forward-compatible addition. Old readers
+  consume new files by ignoring the unknown content; new readers
+  consume old files by substituting documented default values for
+  fields the old file does not carry.
+
+The vast majority of anticipated changes (new optional per-allele
+scalars, new header fields, new bias counters) are minor bumps and
+require no migration of existing `.psf` files.
+
+**Per-block column manifest.** Each compressed block opens with a
+small manifest listing its columns:
+
+```
+block_header:
+  n_records:    varint
+  n_columns:    varint
+  per column:
+    column_tag:    varint        // stable id from the format's tag registry
+    flags:         u8            // bit 0 = required (reader must understand)
+    byte_length:   varint        // length of this column's compressed payload
+  // columns then concatenated in manifest order, each
+  // independently zstd-compressed (so unknown columns can be
+  // skipped by byte_length without parsing).
+```
+
+Reader rule:
+
+- For each column with `required = 1`: the reader **must**
+  understand the tag, or it fails the file with a clear error.
+  The five v1 per-allele scalars are required tags.
+- For each column with `required = 0`: the reader consumes it if
+  it knows the tag, otherwise skips it by `byte_length`.
+- For each tag the reader expects but the file does not carry:
+  the reader substitutes the documented default for that tag (e.g.
+  for the future exact-mixture quality scalar, the documented
+  default is "fall back to the homogeneous-quality approximation
+  from §'When a read \"not in G\" isn't actually an error'").
+
+A single **column-tag registry** in the byte-layout spec
+([per_sample_pileup_format.md](per_sample_pileup_format.md))
+enumerates every known tag with its type, default value, and
+required/optional flag. This architecture document does not list
+the tags themselves; the registry lives next to the byte layout it
+describes.
+
+**File-header capability list.** The header carries a parallel,
+file-scoped manifest covering optional file-level content
+(future per-sample contamination-estimate seeds, future ploidy
+declarations, etc.). Same tag-and-skip semantics. Required from
+v1 — adding it after the fact would itself be a one-off
+compatibility shim that justifies a major bump. Better to have it
+from day one.
+
+**Migration story for the contamination-exact scalar.** Worked
+example for the one schema addition the spec already anticipates
+(§"When a read 'not in G' isn't actually an error: contamination",
+"a follow-up option — adding one more per-allele scalar that makes
+the mixture reconstruction exact"):
+
+- The byte-layout spec defines a new optional column tag for the
+  exact-mixture scalar. Default = "use the homogeneous-quality
+  approximation."
+- The on-disk format goes to `(major, minor) = (1, 1)` for files
+  carrying the new column. v1.0 files do not carry it.
+- v1.1 readers consume both v1.0 and v1.1 files. On v1.0 files
+  (or on v1.1 files without the optional tag) they use the
+  approximation; on v1.1 files carrying the tag they use the
+  exact computation.
+- v1.0 readers cannot consume v1.1 files because they predate the
+  manifest dispatcher entirely. This is the one-time legacy shim
+  paid when manifest-driven dispatch is introduced; subsequent
+  additions are free for forward compat.
+
+No `.psf` regeneration is required at any step in this story —
+which is the property the format-evolution policy exists to
+guarantee.
+
+**Cost.** Per-block manifest overhead is ~6–12 bytes per column
+tag (varint + byte_length + flags) plus a small constant per
+block, for sub-0.1% wire overhead at default block sizes.
+Reader complexity is one dispatch table keyed by tag plus a
+skip-unknown loop; writer complexity is committing to a column
+set at block-write time and emitting the manifest. The trade is
+overwhelmingly in favour of the durable artefact property, which
+is what justifies the custom format in the first place.
 
 ### Why custom binary rather than BCF
 
@@ -442,8 +656,20 @@ Custom binary gives, in exchange for giving up bcftools interop:
 The costs are real but bounded: no bcftools interop, a small
 `psf dump` / `psf head` utility for debugging (~a few hundred
 lines), and explicit version management via a magic number +
-version word at the file head. Readers reject unknown versions
-rather than silently guessing.
+`(major, minor)` version pair at the file head. The version
+policy is set out in §"Schema evolution: per-block column
+manifest" above: minor bumps are forward-compatible (old readers
+ignore unknown content; new readers default-fill missing
+content), major bumps require a migration tool, and all schema
+changes are mediated through the per-block column manifest and
+the file-header capability list rather than through silent
+positional reinterpretation.
+
+The `psf head` and `psf dump` utilities are part of this
+contract: both must surface the manifest contents in
+human-readable form, so that "what columns does this `.psf`
+actually carry, at what version, with what optional features?"
+is answerable without rebuilding the reader.
 
 A `psf → BCF`/VCF exporter is not planned now. It is a
 straightforward data-shape transformation that can be added as
@@ -707,10 +933,24 @@ haplotype alleles where needed.
 ### What it does, per group
 
 1. **Allele unification.** Across all samples in the group, build the
-   union of observed alleles. Handle compound haplotype alleles
-   spanning multiple original per-sample variant records (e.g.
-   deletion + nearby SNP co-occurring on the same haplotype in some
-   samples).
+   union of observed alleles. Compound haplotype alleles spanning
+   multiple original per-sample variant records (e.g. deletion +
+   nearby SNP co-occurring on the same haplotype in some samples)
+   enter the union **only if at least one sample in the group has
+   phase chain evidence linking all of the compound's constituents
+   on the same haplotype**. A compound with no chain anchor
+   anywhere in the cohort is not proposed; its constituents are
+   emitted as independent per-position alleles instead.
+
+   Rationale: without read-level evidence anywhere in the cohort,
+   the only signal for a compound's existence is co-occurrence
+   statistics — i.e. cohort haplotype frequency, which
+   [phase_chain.md §"Why not lean on cohort haplotype frequencies instead?"](phase_chain.md)
+   rules out from the per-sample likelihood. Calling such compounds
+   in v1 would systematically miscall their carriers (see §"Compound
+   haplotype alleles: the phase-chain check" below for the failure
+   mode the chain-anchor rule prevents). Calling them as cohort-prior
+   compounds is the v2 extension scoped at the end of Stage 6.
 2. **Per-sample likelihood reconstruction.** For each sample, for
    each genotype `G` in the merged allele set, compute the likelihood
    directly from the stored scalars using freebayes' standard
@@ -727,21 +967,41 @@ haplotype alleles where needed.
    sample's reads supporting its own local alleles contribute to
    `prodQout` for any genotype that doesn't include those alleles.
    The generalised `<NON_REF>`-equivalent behaviour is automatic.
-3. **Compound haplotype consistency.** For a merged genotype `G`
-   containing a compound haplotype allele, use the phase chain ids
-   across the group's `.psf` records to decide whether the sample's
-   own reads carry any support for the full compound haplotype. If
-   the constituent alleles of the compound share a phase chain id in
-   this sample, the compound has support in this sample; otherwise
-   the reads supporting any constituent are treated as disagreeing
-   with `G` (standard `prodQout` contribution).
+3. **Compound haplotype consistency.** A compound `C` is in the
+   merged allele set only because some sample (call it the
+   *anchor*) has chain evidence for it. For each sample, decide
+   how `C` is evaluated:
+
+   - **Chain-evident sample** (constituents share a phase chain id
+     in this sample): the sample's reads carry the compound
+     directly. Evaluate the likelihood normally, using the
+     compound's joint observation count and joint quality scalar.
+   - **Chain-broken sample** (sample has no phase chain id linking
+     the constituents — typically because no read or read pair
+     spans them): the per-read likelihood for `C` is **not**
+     computed via the standard formula (which would force every
+     constituent-supporting read into `prodQout` and bias the
+     sample away from `C` proportionally to depth, as flagged in
+     the review). Instead, the sample's per-read likelihood at
+     the constituent positions is computed under the
+     "constituents independent" model — the maximum-entropy
+     assumption when no read-level coupling evidence is
+     available — and combined at the *prior* layer with the
+     cohort-derived compound frequency `f_C` estimated by Stage 6
+     (see Stage 6 §"M-step on `f_C`"). This keeps the likelihood
+     unbiased and lets the cohort-level signal carry the burden
+     of distinguishing compound from constituent-pair haplotypes
+     for this sample. The record is flagged `CA = 1` for this
+     sample so downstream consumers can identify
+     cohort-prior-anchored calls.
 4. **Emit a merged variant record** ready for Stage 6.
 
-Sites where compound-allele reasoning cannot be evaluated cleanly
-(e.g. a compound haplotype spanning more than one read's worth of
-genome, with no phasing evidence in this sample) fall back to the
-standard formula and are flagged in the merged record so Stage 6
-knows the likelihood is approximate.
+Sites where every sample lacks chain evidence for a candidate
+compound are not affected by the fallback path: by Step 1 the
+compound is never proposed in the first place, and the constituents
+appear as independent per-position alleles. The fallback path
+applies only to chain-anchored compounds (some sample has chain
+evidence) where *other* samples in the same group are chain-broken.
 
 ### The statistics, explained
 
@@ -861,52 +1121,111 @@ coming from a two-component mixture:
 - with probability `1 − c_s`, the read is from `s`'s own DNA (the
   standard per-read model — consistent with `G_s` at expected
   allele fractions, modulated by BQ/MQ errors);
-- with probability `c_s`, the read is from a random cohort member,
-  whose allele at this site is distributed as the population
-  allele frequency `p` (one read = one chromosome drawn under HWE).
+- with probability `c_s`, the read is from another sample in the
+  same **contamination batch** as `s`, whose allele at this site
+  is distributed as the batch-wide allele frequency `q_{b, a}`
+  (one read = one chromosome drawn under HWE from within the
+  batch).
 
 Per-read probability of supporting allele `a`:
 
 ```
-P(read → a | G_s, c_s, p)
+P(read → a | G_s, c_s, q_{b})
    =  (1 − c_s) · P_own(a | G_s, BQ, MQ)     ← existing own-DNA term
-   +  c_s       · p_a                         ← contamination term
+   +  c_s       · q_{batch(s), a}             ← contamination term
 ```
 
 The genetics insight behind this form is that contaminating reads
 do not support random alleles — they support alleles that exist
-in *other samples*. A hom-A sample whose "odd reads" at a site
-with population AFs `(p_A = 0.3, p_B = 0.7)` preferentially
-support `B` rather than `C` or `G` is showing the fingerprint of
-contamination, not random sequencing error (which would be
-roughly unbiased across the three non-`A` bases). The mixture
-term `c_s · p_a` captures this formally.
+in **other samples that could physically have leaked in**.
+Contamination pathways (library-prep carry-over, index hopping,
+flowcell cross-talk) are bounded to a sequencing batch; reads
+from a sample run in a different study, lab, or year cannot
+contaminate this one. The contamination-source distribution
+therefore has to be batch-restricted — *not* cohort-wide — to
+match the physical contamination process. A cohort-wide source
+would correctly fingerprint diffuse low-level contamination on
+average across many small events, but would mis-model the
+common case where contamination is bounded to a specific
+sequencing batch.
 
-**Estimating `c_s`.** `c_s` is one more parameter estimated by
-the Stage 6 EM loop, jointly with the population allele
-frequencies `p`:
+**Why batch-specific `q_b` does not weaken the call quality.**
+The genotype prior `p_a` (Stage 6 §"From likelihood to
+posterior") stays cohort-wide and continues to drive
+calling-time HWE. Only the contamination-source distribution
+is batch-restricted. So small batches do not lose call quality
+on non-contaminated reads; they only get a less precise
+contamination-source distribution, which is exactly the right
+size for "what could have leaked in here."
+
+**The strict default: contamination correction is off unless
+batch info is supplied.** The pipeline does not attempt to infer
+contamination without an explicit declaration of which samples
+share a batch with which. A `--contamination-batches` TSV input
+(`sample_id → batch_id`) is the only way to enable the mixture
+term. With no batch file:
+
+- `c_s = 0` for every sample, mixture term disappears, the
+  per-read likelihood is the own-DNA term alone — i.e. the same
+  formula as if this subsection didn't exist.
+- The `q_b` parameter is not allocated; the EM has no
+  contamination-related M-step.
+
+This is intentionally harsh. A cohort-wide fallback (the prior
+draft of this spec used one) gives the wrong answer in exactly
+the cases users care about — sample swaps and same-batch index
+hopping — and silently. Forcing the user to supply batch
+information makes the model's scope explicit: the pipeline
+addresses contamination only when the user can characterise the
+contamination pool.
+
+**Estimating `c_s` and `q_b`.** When `--contamination-batches`
+is supplied, both parameters are estimated by the Stage 6 EM
+loop, jointly with the population allele frequencies `p`:
 
 - **E-step** — per-sample genotype posteriors given the current
-  `(p, c_s)`.
-- **M-step on `p`** — as before (posterior-weighted allele
-  counts + Dirichlet pseudocounts).
-- **M-step on `c_s`** — a 1D maximisation per sample: choose the
+  `(p, q_b, c_s)`.
+- **M-step on `p`** — cohort-wide, as before (posterior-weighted
+  allele counts + Dirichlet pseudocounts).
+- **M-step on `q_b`** — per-batch, posterior-weighted allele
+  counts across samples in batch `b` only, plus a small Dirichlet
+  pseudocount (`α_q`, default matches `--snp-alt-pseudocount` /
+  `--indel-alt-pseudocount`, separately overridable via
+  `--contamination-source-pseudocount`).
+- **M-step on `c_s`** — 1D maximisation per sample: choose the
   `c_s` that best explains the sample's odd-read pattern given
-  `p`.
+  `q_{batch(s)}`.
 
 Most of the information about `c_s` comes from sites where the
 sample is confidently non-heterozygous and yet carries odd reads
-matching population-common alt alleles. No external estimate or
-reference panel is required. A user-supplied seed value (as in
-freebayes' `--contamination-estimates` or the output of
-VerifyBamID2 / GATK `CalculateContamination`) is still accepted
-and overrides the EM estimate when present.
+matching alleles common in its **batch** (not the wider cohort —
+the batch restriction is what makes the signal a fingerprint of
+contamination rather than of population-typical odd reads). A
+user-supplied seed value (analogous to freebayes'
+`--contamination-estimates` and accepting the same shape) is
+still accepted via `--contamination-estimates FILE` and overrides
+the EM estimate per sample when present.
+
+**Singleton batches: contamination correction disabled per
+sample.** When sample `s` is the only member of its batch, `q_b`
+collapses to `s`'s own genotype distribution, the mixture term
+becomes indistinguishable from the own-DNA term, and `c_s` is
+unidentifiable. The pipeline detects singleton batches at
+startup and forces `c_s = 0` for those samples, regardless of
+the EM. The samples are reported in the per-cohort run summary
+so the user knows their contamination correction was disabled.
+
+**Tiny batches: configurable floor.** Below a configurable batch
+size `--min-batch-size-for-contamination` (default `5`), `c_s`
+is held at `0` unless a fixed `c_s` is supplied externally for
+the sample. `q_b` is still estimated for batches above the floor.
+Samples below the floor get a one-line note in the run summary.
 
 **Scalar-storage approximation.** The mixture log does not
 factor cleanly over the stored scalars:
 
 ```
-log L_a = Σ over reads of log[ (1 − c_s) · P_err(read) + c_s · p_a ]
+log L_a = Σ over reads of log[ (1 − c_s) · P_err(read) + c_s · q_{b, a} ]
 ```
 
 The `log` wraps a sum *inside* the per-read product, so each
@@ -925,7 +1244,47 @@ contamination term in the mixture tends to dominate each
 per-read log and the approximation stays tight. A follow-up
 option — adding one more per-allele scalar that makes the
 mixture reconstruction exact — is deferred until we see
-approximation error in practice.
+approximation error in practice; the format's
+forward-compatibility hatch (Stage 2 §"Schema evolution:
+per-block column manifest") makes this a minor schema bump
+rather than a hard break.
+
+**Scope and complementary tools.** The mixture model addresses
+**low-level (~1–10 %) cross-contamination within a declared
+batch** — the regime where the signature is a small fraction of
+reads supporting alleles that are common among the sample's
+batch-mates. Three failure modes lie outside this scope and
+require complementary tooling:
+
+- **Contamination *fraction* estimation as a separate QC step.**
+  VerifyBamID2 / GATK `CalculateContamination` give a per-sample
+  contamination fraction estimate from sequence alone (against a
+  population reference panel). Their estimates plug directly
+  into this pipeline via `--contamination-estimates`, overriding
+  the EM's `c_s` estimate per sample. This is the supported
+  integration path when an external estimate is available.
+- **Within-cohort duplicates and pedigree-violation swaps.**
+  somalier (or any kinship-based identity QC tool) detects
+  unexpected duplicates and pedigree inconsistencies from
+  sequence alone, given the user's pedigree expectations. This
+  pipeline does not subsume it; run it as cohort QC before or
+  after calling.
+- **Clean swaps between unrelated, never-genotyped samples.**
+  Out of scope for *any* sequence-only tool, not just this
+  pipeline. Without prior genotypes, a pedigree, or expected
+  technical replicates, a 100 %-swapped sample looks like a
+  normal sample of *some* donor; no tool can detect this from
+  sequence data alone. The pipeline's behaviour for a swapped
+  sample is honest — per-position likelihoods go flat under the
+  high-`c_s` regime and GQ collapses to ~0 — but not corrective.
+  Sample-tracking metadata is load-bearing here.
+
+**Practical guidance for the user.** If prior genotypes,
+pedigree, or expected replicates are available, run a
+sample-identity QC tool (VerifyBamID2 with a reference VCF, or
+somalier with a pedigree, etc.) against that anchor *before*
+this pipeline. If they aren't, full swaps are undetectable from
+data alone.
 
 Relationship to freebayes: freebayes' own optional correction
 ([DataLikelihood.cpp:116-130](../../freebayes/src/DataLikelihood.cpp#L116-L130),
@@ -935,7 +1294,18 @@ sampling probability rather than the per-read mixture — because
 freebayes operates on reads in memory and does not face the
 scalar-reconstruction constraint. It also requires the user to
 supply a contamination fraction externally; this pipeline infers
-`c_s` from the cohort as a side effect of the EM.
+`c_s` from the batch as a side effect of the EM (when batch
+info is supplied) and otherwise leaves contamination
+uncorrected.
+
+**CLI surface added by this subsection.**
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--contamination-batches FILE` | unset | TSV mapping `sample_id → batch_id`. Required to enable the contamination mixture; without it `c_s = 0` for every sample. |
+| `--min-batch-size-for-contamination N` | `5` | Floor on batch size for `c_s` inference. Samples in batches below the floor get `c_s = 0` unless a fixed value is supplied. |
+| `--contamination-estimates FILE` | unset | TSV mapping `sample_id → fixed c_s`. Overrides the EM estimate per sample. Compatible with VerifyBamID2 / GATK `CalculateContamination` output shapes. |
+| `--contamination-source-pseudocount X` | matches `--snp-alt-pseudocount` / `--indel-alt-pseudocount` | Dirichlet pseudocount on `q_b`. |
 
 #### The allele-balance term
 
@@ -1023,35 +1393,63 @@ separately, but a compound is only "present" in sample `s` if `s`'s
 reads carry the pieces *together*, on the same read or read pair.
 Stage 1 therefore records a **phase chain identifier** on each
 allele whose support is linked to another position's allele by a
-shared read. At Stage 5:
+shared read. A compound enters the merged allele set only if at
+least one sample in the cohort has chain evidence for it (Stage 5
+step 1); below, "the compound" always refers to such a
+chain-anchored compound. At Stage 5:
 
-- If the compound's constituents share a phase chain id in sample
-  `s`, the sample's reads do carry the compound → evaluate the
-  likelihood normally, using the compound's joint observation count
-  and joint quality scalar.
-- Otherwise, the sample's reads carry only the constituents
-  separately. Under the hypothesis that `s` has the compound, those
-  reads have to be explained away. Stage 5 falls back to the
-  standard formula and flags the record as "compound-approximate"
-  so Stage 6 can interpret the resulting GQ conservatively.
+- **Chain-evident sample.** If the compound's constituents share a
+  phase chain id in sample `s`, the sample's reads do carry the
+  compound. Evaluate the likelihood normally, using the compound's
+  joint observation count and joint quality scalar. Reconstruction
+  is exact.
+- **Chain-broken sample.** The sample's reads carry the
+  constituents separately. The naive option — apply the standard
+  formula treating every constituent-supporting read as an error
+  under the compound hypothesis — is the wrong model: under
+  heterozygous-compound truth those reads are *expected*, not
+  errors, and the formula imposes a per-read Phred-≈-6.9 penalty
+  on the compound proportional to depth, biasing chain-broken
+  samples away from carrying the compound. Stage 5 therefore
+  computes the per-read likelihood for the constituent positions
+  under the maximum-entropy "constituents independent" model, and
+  defers the compound-vs-constituent-pair distinction to the
+  *prior* layer in Stage 6: the cohort-derived compound
+  frequency `f_C` (estimated from chain-evident samples in the
+  same EM loop, see Stage 6 §"M-step on `f_C`") supplies the
+  expected genotype frequencies for `s`. The record is flagged
+  `CA = 1` for `s` to mark that the call leans on the cohort
+  prior rather than per-read evidence.
 
-For every non-compound site — and for compound sites where the
-evidence is clean in every sample — the reconstruction is exact.
-For the fraction of compound sites where some samples have only
-partial phasing, the likelihood is approximate and explicitly
-labelled.
+The chain-anchor rule and the cohort-prior fallback together
+eliminate the failure mode where a compound proposed by one sample
+silently miscalls every chain-broken carrier. Compounds with no
+chain anchor anywhere in the cohort are not proposed in v1 at all
+(see Stage 5 step 1) — those would require the full v2 cohort-only
+inference, which is documented at the end of Stage 6 and remains
+deferred. For every non-compound site, and for chain-anchored
+compounds where every carrier is chain-evident, the reconstruction
+is exact. For chain-anchored compounds with chain-broken carriers,
+the per-read likelihood is unbiased (no error-cost mis-assignment)
+and the `CA = 1` flag identifies the cohort-prior-anchored cases.
 
-**VCF encoding of the flag.** The approximation is surfaced in
-the final multi-sample VCF as a single boolean per-sample FORMAT
-field, `CA` (compound-approximate): `1` on records where this
-sample's likelihood was reconstructed under the phase-broken
-fallback, `0` otherwise. The field is absent entirely on
-non-compound records, to keep simple-SNP records uncluttered.
-No tiered scheme and no per-genotype granularity: the flag
-addresses a small minority of sites (compound haplotype +
-partial phase in some sample) and does not need a richer
-taxonomy to be useful. Downstream consumers that care about
-likelihood provenance filter on `CA`; everyone else ignores it.
+**VCF encoding of the flag.** The cohort-prior path is surfaced
+in the final multi-sample VCF as a single boolean per-sample
+FORMAT field, `CA` (cohort-anchored): `1` on records where this
+sample's compound call leans on the cohort frequency `f_C`
+rather than on per-sample read-level chain evidence; `0`
+otherwise. The field is absent entirely on non-compound
+records, to keep simple-SNP records uncluttered. No tiered
+scheme and no per-genotype granularity: the flag addresses a
+single distinction (chain-evident vs cohort-prior-anchored
+within a chain-anchored compound site) and does not need a
+richer taxonomy to be useful. Downstream consumers that care
+about call provenance filter on `CA`; everyone else ignores
+it. Note: the field's meaning shifted from earlier drafts of
+this spec — it no longer flags a known-bad approximation, it
+flags a deliberate use of the cohort prior in place of
+per-sample read-level evidence. The likelihood path itself is
+unbiased on both `CA = 0` and `CA = 1` records.
 
 #### From likelihood to posterior (Stage 6, in one picture)
 
@@ -1291,34 +1689,82 @@ generalised to:
 
 ### Algorithm
 
-EM over allele frequency, extended with a per-sample contamination
-parameter. The baseline algorithm is described in
+EM over allele frequency, extended with per-batch
+contamination-source distributions, per-sample contamination
+fractions, and per-compound cohort-frequency parameters. The
+baseline algorithm is described in
 [posterior_gt_probs.md](posterior_gt_probs.md); the contamination
 extension is in Stage 5 §"When a read 'not in G' isn't actually an
-error: contamination".
+error: contamination"; the compound-frequency parameter is the
+prior-side support for the chain-broken-sample path in Stage 5
+§"Compound haplotype consistency".
 
-1. Initialise flat allele frequencies `p` and `c_s = 0` for every
-   sample.
+The contamination machinery (`q_b`, `c_s`, and their associated
+M-steps) is gated on the user supplying
+`--contamination-batches`. Without that input `c_s = 0` for every
+sample, `q_b` is not allocated, and steps 4 and 6 below collapse
+to no-ops. With it, batches below
+`--min-batch-size-for-contamination` (default 5) participate in
+the cohort `p` M-step normally but get `c_s = 0` regardless of the
+EM, and singleton batches are treated as size-below-floor.
+
+1. Initialise flat allele frequencies `p`; `f_C` from its
+   Dirichlet pseudocount for every chain-anchored compound `C`.
+   When `--contamination-batches` is supplied, also initialise
+   flat `q_b` per batch and `c_s = 0` for every sample.
 2. **E-step**: for each sample, compute per-genotype posteriors
-   using the mixture likelihood (current `p` and `c_s`) + the
-   HWE-with-`F` prior (see Stage 5 §"From likelihood to
-   posterior"). `F` is cohort-wide, user-supplied via
-   `--inbreeding`, default `0`.
-3. **M-step on `p`**: update allele frequencies from
-   posterior-weighted allele counts + Dirichlet pseudocounts
-   (`α_ref = 10`, `α_alt = 0.01` SNP, `α_alt = 0.00125` indel;
-   overridable via `--ref-pseudocount` /
+   using the mixture likelihood (current `p`, `q_{batch(s)}` and
+   `c_s` if contamination is enabled; otherwise the own-DNA
+   likelihood alone) + the HWE-with-`F` prior (see Stage 5 §"From
+   likelihood to posterior"). `F` is cohort-wide, user-supplied
+   via `--inbreeding`, default `0`. For chain-anchored compound
+   alleles `C`:
+   - chain-evident samples use the chain-based likelihood and
+     read `f_C` from the current iterate as their compound prior;
+   - chain-broken samples use the constituent-product likelihood
+     (constituents-independent model) and `f_C` from the current
+     iterate as their compound prior — this is the path Stage 5
+     marks `CA = 1`.
+3. **M-step on `p`** (cohort-wide): update allele frequencies from
+   posterior-weighted allele counts across the whole cohort +
+   Dirichlet pseudocounts (`α_ref = 10`, `α_alt = 0.01` SNP,
+   `α_alt = 0.00125` indel; overridable via `--ref-pseudocount` /
    `--snp-alt-pseudocount` / `--indel-alt-pseudocount`). Rationale
    for Dirichlet over freebayes' Ewens prior is in Stage 5
    §"From likelihood to posterior".
-4. **M-step on `c_s`**: 1D per-sample update that maximises the
-   sample's likelihood at its soft-assigned genotypes, using the
-   pattern of odd reads at confidently-non-heterozygous sites as
-   the main signal. Skipped when the user has supplied a fixed
-   `c_s` externally.
-5. Iterate until convergence. Typically 3–5 rounds.
-6. QUAL = Phred of `Π_s P(hom-ref)_s`.
-7. Assign GT = argmax genotype. GQ = Phred of `1 − P(best_genotype)`.
+4. **M-step on `q_b`** (per batch, contamination-enabled only):
+   update each batch's contamination-source distribution from
+   posterior-weighted allele counts across **samples in batch `b`
+   only**, plus a Dirichlet pseudocount (`α_q`, default matches
+   the per-position alt pseudocount, overridable via
+   `--contamination-source-pseudocount`). Skipped entirely when
+   `--contamination-batches` is unset. For singleton batches the
+   step still runs but its output is unused (the affected sample's
+   `c_s` is forced to 0 — see step 6).
+5. **M-step on `f_C`** (one update per chain-anchored compound `C`
+   in the cohort): update the compound's frequency from the
+   posterior-weighted count of `C`-bearing chromosomes across all
+   samples in the group containing `C`, plus a Dirichlet
+   pseudocount (`α_compound = 0.001`, overridable via
+   `--compound-alt-pseudocount`; tighter than per-position alt
+   because compound haplotypes are conditionally rarer). Both
+   chain-evident and chain-broken samples contribute to the count,
+   each weighted by its current per-genotype posterior — so
+   chain-evident samples (with sharper per-read likelihoods)
+   dominate when present and chain-broken samples lean on the
+   cohort estimate they helped produce only weakly.
+6. **M-step on `c_s`** (per sample, contamination-enabled only):
+   1D maximisation per sample of the mixture likelihood against
+   `q_{batch(s)}` and the sample's soft-assigned genotypes,
+   driven mainly by odd reads at confidently-non-heterozygous
+   sites. Held at `c_s = 0` (M-step skipped) for samples in
+   singleton batches and for samples in batches below
+   `--min-batch-size-for-contamination`. Also skipped when the
+   user has supplied a fixed `c_s` for the sample via
+   `--contamination-estimates`.
+7. Iterate until convergence. Typically 3–5 rounds.
+8. QUAL = Phred of `Π_s P(hom-ref)_s`.
+9. Assign GT = argmax genotype. GQ = Phred of `1 − P(best_genotype)`.
 
 ### Why EM, not combo-search marginalisation
 
@@ -1334,88 +1780,96 @@ needed, is to swap the point estimate of `p` for a Dirichlet posterior on
 `p` (variational Bayes). This stays linear in sample count and requires
 only local changes to the posterior engine.
 
-### Future extension: cohort haplotype-frequency priors for compound alleles
+### Future extension: cohort-only inference of compound alleles with no chain anchor anywhere
 
-The current Stage 6 estimates per-position allele frequencies `p` and
-uses them as priors on per-sample genotypes. A natural and load-bearing
-extension is to **also estimate per-compound haplotype frequencies** and
-feed them as priors on compound genotypes for samples where the
-phase-chain check returns no information — the phase-broken fallback
-path that Stage 5 currently flags as `CA = 1`.
+v1's chain-anchor rule (Stage 5 step 1) means a compound enters the
+merged allele set only if some sample in the cohort has direct
+read-level chain evidence for it. The prior-side `f_C` machinery
+above (Stage 6 step 4) then carries chain-broken samples within the
+*same* group. What v1 deliberately does not handle is the case where
+**no sample anywhere in the cohort has chain evidence** for a
+candidate compound — typically a compound whose constituents lie far
+enough apart that no read or read pair in any sample spans them. In
+v1 such compounds are not proposed; their constituents are emitted
+as independent per-position alleles and any compound-vs-pair
+distinction is lost.
 
-The motivation is that thousands of samples carry strong cohort-level
-signal about which compound haplotypes actually exist in the
-population. Homozygous-for-the-compound individuals pin the haplotype
-down unambiguously; heterozygotes' calls then have a meaningful prior
-to lean on when read-level evidence (the phase chain) is insufficient.
-This is structurally what classical population-phasing tools
-(fastPHASE, BEAGLE, IMPUTE, SHAPEIT) do for whole-genome haplotype
-reconstruction; here we'd apply the same idea narrowly inside an
-`OverlappingVariantGroup`, leveraging the cohort to strengthen
-specifically the cases where the chain is silent.
+A natural extension is to recover these long-range compounds purely
+from cohort-level co-occurrence statistics. The motivation is that
+thousands of samples carry strong cohort-level signal about which
+compound haplotypes actually exist in the population: homozygotes
+pin the haplotype down unambiguously even when no read spans the
+constituents, and heterozygotes' calls then have a meaningful prior
+to lean on. This is structurally what classical population-phasing
+tools (fastPHASE, BEAGLE, IMPUTE, SHAPEIT) do for whole-genome
+haplotype reconstruction; here we would apply the same idea
+narrowly inside an `OverlappingVariantGroup`.
 
-**Where it goes in the inference.** Strictly at the *prior* layer, on
-top of the chain-based likelihood — it does **not** substitute for the
-chain in `P(reads | genotype)` (see
+**Where it goes in the inference.** Strictly at the *prior* layer
+(same as the v1 `f_C` mechanism for chain-anchored compounds) — it
+does **not** substitute for the chain in `P(reads | genotype)` (see
 [phase_chain.md §"Why not lean on cohort haplotype frequencies instead?"](phase_chain.md)
-for why a substitution would be statistically unsound). Concretely:
+for why a substitution would be statistically unsound). The
+algorithmic shape is the same as the v1 `f_C` M-step (Stage 6
+step 4), with two extensions:
 
-- **E-step extension.** For each compound allele `C` in a group, the
-  current E-step computes a per-sample posterior over per-position
-  genotypes; extend it to compute a per-sample posterior over the
-  *compound* genotypes too, using whatever per-sample likelihood is
-  available (chain-based when the chain has evidence, phase-broken
-  fallback otherwise).
-- **M-step on `f_C`.** Add a new M-step that updates the cohort
-  frequency `f_C` of each compound haplotype as the posterior-weighted
-  count, with Dirichlet pseudocounts (small alt pseudocount, e.g.
-  `α_compound = 0.001`, tighter than per-position alt because compound
-  haplotypes are conditionally rarer).
-- **Feedback into samples with empty chain intersection.** For
-  samples that fell into the phase-broken fallback at Stage 5,
-  replace the independent-constituents prior with the cohort-derived
-  `f_C`. Samples with chain evidence keep using the chain-based
-  likelihood unchanged — `f_C` is just an updated prior for them too.
-- **HWE with `F`.** The same Wright's-`F` extension already used at
-  the per-position level applies directly to compound haplotype
-  pairs, so inbreeding / selfing populations remain handled.
+- **Allele unification widened.** Stage 5 step 1 currently rejects
+  compounds with no chain anchor anywhere. The extension would
+  *propose* them as candidate compounds anyway — driven by
+  co-occurrence patterns at the constituents — and let the
+  cohort-only `f_C` estimate decide whether the candidate survives.
+- **`f_C` estimated entirely from constituent-product
+  likelihoods.** Without any chain-evident samples, every
+  contribution to the M-step on `f_C` comes from the
+  constituents-independent likelihood path. The estimate is
+  consequently weaker and depends on co-occurrence above what
+  per-position allele frequencies alone would predict — i.e. on
+  cohort-level linkage disequilibrium between the constituents.
 
-**What the extension buys.**
+**What the extension buys beyond v1.**
 
-- **Long-range compounds.** Compounds whose constituents lie beyond
-  read/pair span (chains can't reach) get cohort-anchored calls
-  whenever the cohort contains enough homozygotes.
-- **Mate-missing and low-coverage cases.** Per-sample fallbacks
-  currently flagged `CA = 1` get a much stronger prior, so their
-  GQ becomes informative rather than conservatively-down-weighted.
-- **Common compounds at scale.** With N in the thousands and
-  compound frequency above ~5%, the cohort prior is tight enough
-  to dominate noise in any single sample's fallback likelihood,
-  recovering most of the calibration the chain would have given.
+- **Long-range compounds with cohort homozygotes.** Compounds whose
+  constituents lie beyond any read/pair span in the cohort get
+  cohort-anchored calls whenever the cohort contains enough
+  homozygous-for-the-compound carriers.
+- **Common long-range compounds at scale.** With N in the thousands
+  and compound frequency above ~5%, the cohort prior is tight
+  enough to dominate noise in the constituents-independent
+  likelihood, recovering most of the calibration the chain would
+  have given.
 
 **What it does not buy.**
 
-- **Rare compounds (`q < ~0.01`).** Hom-alt frequency under HWE is
-  `q²`; below this threshold even N = 1000 produces ~0 homozygotes,
-  and the extension has no anchor. Chain evidence remains the only
-  way to call these — exactly the regime where the chain mechanism
-  is load-bearing.
+- **Rare long-range compounds (`q < ~0.01`).** Hom-compound
+  frequency under HWE is `q²`; below this threshold even N = 1000
+  produces ~0 homozygotes, and the extension has no anchor. Chain
+  evidence remains the only way to call these — exactly the
+  regime where the chain mechanism is load-bearing. v1's chain-anchor
+  rule already covers this case correctly: the compound is just not
+  called.
 - **Replacement for the chain.** This is a prior, not a likelihood.
   Samples with chain evidence still need the chain-based per-read
   likelihood; cohort frequencies cannot be substituted there
   without breaking Bayesian soundness.
+- **Robustness against HWE violations.** Cohort-only inference
+  bootstraps from per-sample posteriors that depend on HWE; under
+  inbreeding, admixture, or selection at the locus the
+  bootstrapping path is fragile (see [phase_chain.md §"Three
+  practical consequences"](phase_chain.md#why-not-lean-on-cohort-haplotype-frequencies-instead)).
+  Chain-anchored compounds in v1 do not depend on this path and so
+  are not affected.
 
-**Implementation cost.** Local to the posterior engine: one extra
-inner loop in the E-step (per-compound posterior), one extra
-M-step (per-compound frequency), and a small change to the
-fallback path so it consults `f_C` instead of constituent-product
-priors. Memory grows by O(#compounds_per_group), bounded by the
-group's allele structure. The chain machinery is unaffected.
+**Implementation cost.** Local to Stage 5 step 1 (loosen the
+chain-anchor rule for cohort-only candidates) plus minor tweaks to
+the existing v1 `f_C` M-step (Stage 6 step 4). The core machinery —
+per-compound posterior in the E-step, per-compound frequency in the
+M-step, cohort-prior path on chain-broken samples — is already
+present in v1.
 
 This extension is **not implemented in the v1 pipeline**. It is
 recorded here so a future implementer has a complete picture of
-how the cohort signal can strengthen the existing chain-based
-inference without compromising the per-sample likelihood path.
+how the cohort signal can strengthen calls beyond the chain-anchor
+boundary without compromising the per-sample likelihood path.
 
 ## Properties of this design vs. the alternatives
 
@@ -1425,19 +1879,32 @@ inference without compromising the per-sample likelihood path.
 | BAMs needed at joint-calling time | ✓ | ✗ | ✗ |
 | Per-sample artefacts reusable across cohorts | ✗ | ✓ | ✓ |
 | Correct joining of simple alleles | ✓ | ✓ | ✓ |
-| Correct **merging** of compound haplotype alleles | ✓ | ✗ | approximate, principled |
+| Correct **merging** of compound haplotype alleles | ✓ | ✗ | chain-anchored: yes; chain-less: deferred to v2 |
 | Read-level observation-bias priors | ✓ | partial | partial (via observation summary) |
 | Full Bayesian posterior on allele frequency | ✓ | no (point estimate) | no (EM point estimate) |
 
-The approximation row deserves a note: for haplotype-compound merges,
-neither the observation summary nor the reconstructed likelihood can
-perfectly match what freebayes computes with the reads in memory. In the
-small fraction of sites where this matters, Stage 5 flags the affected
-records so downstream consumers know the likelihood was approximated.
-For the overwhelming majority of sites — simple SNPs, simple indels,
-and merges where the samples carrying the compound alleles are the ones
-with direct per-sample evidence — the tiered rule gives exact or
-near-exact likelihoods.
+The compound-merging row deserves a note. v1 calls a compound only
+when at least one sample in the cohort has direct read-level chain
+evidence linking its constituents on the same haplotype. For those
+chain-anchored compounds:
+
+- chain-evident samples get an exact likelihood (joint observation
+  count + joint quality scalar);
+- chain-broken samples in the same group use the maximum-entropy
+  constituents-independent likelihood combined with a cohort
+  compound-frequency prior `f_C` estimated jointly with the
+  per-position allele frequencies, and are flagged `CA = 1` so
+  downstream consumers can identify cohort-prior-anchored calls.
+
+Compounds with no chain anchor anywhere in the cohort — typically
+long-range compounds whose constituents lie beyond any read or pair
+span in any sample — are *not* called as unified compound alleles in
+v1. Their constituents are emitted independently. Calling these
+compounds purely from cohort co-occurrence requires the v2
+extension (Stage 6 §"Future extension: cohort-only inference of
+compound alleles with no chain anchor anywhere"); v1 trades that
+capability away in exchange for an unbiased likelihood path on
+every record it does emit.
 
 ## Relationship to existing specs in this directory
 
@@ -1445,13 +1912,27 @@ near-exact likelihoods.
   describes the current gVCF-in / VCF-out tool. This architecture is the
   intended replacement; the current spec will need to be rewritten or
   retired once this design is firm.
-- [per_sample_pileup_format.md](per_sample_pileup_format.md) is the PSP v1
-  binary format draft. Its per-read record layout is superseded by the
-  per-allele scalar summary decided here (see Stage 1 §"Related
-  existing draft" and Stage 2 §"The five per-allele scalars"). PSP
-  v1 needs to be revised: the per-read 3-byte record is replaced by
-  five per-allele scalars (observation count, `Σ max(ln_BQ, ln_MQ)`,
-  forward-strand count, placed-left count, placed-start count).
+- [per_sample_pileup_format.md](per_sample_pileup_format.md) is the
+  PSP v1 binary format draft. This architecture promotes it to the
+  **authoritative byte-layout specification** for the `.psf`: the
+  architecture document above describes the format's *contract*
+  (record contents, allele conventions, compression strategy,
+  schema-evolution policy) but defers the on-disk byte layout —
+  including the column-tag registry referenced in §"Schema
+  evolution: per-block column manifest" — to PSP v1. PSP v1 needs to
+  be revised on three axes:
+  - per-read 3-byte records are replaced by per-allele scalar
+    summaries (observation count, `Σ max(ln_BQ, ln_MQ)`,
+    forward-strand count, placed-left count, placed-start count);
+  - the BAQ-adjusted base qualities (Stage 1 §"Per-read likelihood
+    quality") are the BQ values that feed `Σ max(ln_BQ, ln_MQ)`;
+  - the layout adopts the per-block column manifest, the
+    `(major, minor)` version pair, the file-header capability
+    list, and the column-tag registry described in §"Schema
+    evolution: per-block column manifest" above. Each of the five
+    per-allele scalars becomes a required column tag; future
+    additions (e.g. an exact-mixture quality scalar) become
+    optional column tags with a documented default.
 - [genotype_joining_specification.md](genotype_joining_specification.md)
   documents the current allele-joining algorithm. The merge step in this
   architecture generalises that algorithm to operate on `.psf` instead of
