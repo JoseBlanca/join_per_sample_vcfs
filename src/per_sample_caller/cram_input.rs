@@ -548,6 +548,12 @@ pub struct CramMergedReader {
     /// the position of the entries currently in `window`.
     window_anchor: Option<(usize, u64)>,
     filter_counts: FilterCounts,
+    /// Set the first time `next()` returns `Some(Err(_))`. After that,
+    /// every subsequent call returns `None`. Implements the fuse-on-
+    /// error semantics required by the spec's "halts Stage 1"
+    /// language so callers can use `for`, `collect`, or `try_fold`
+    /// without separate stop-on-first-error bookkeeping.
+    fused: bool,
 }
 
 impl CramMergedReader {
@@ -716,6 +722,7 @@ impl CramMergedReader {
             window: VecDeque::new(),
             window_anchor: None,
             filter_counts: FilterCounts::default(),
+            fused: false,
         })
     }
 
@@ -736,16 +743,27 @@ impl CramMergedReader {
 // Iterator + merge logic
 // ---------------------------------------------------------------------
 
+/// Iterates over surviving reads in coordinate order.
+///
+/// **Fuse-on-error semantics.** Once `next()` returns `Some(Err(_))`,
+/// every subsequent call returns `None`. This matches the spec's
+/// "halts Stage 1" requirement (`ia/specs/per_sample_caller.md`
+/// §"Errors") and lets callers use the iterator with any consumer
+/// (`for`, `collect`, `try_fold`) without separate "stop on first
+/// error" bookkeeping.
 impl Iterator for CramMergedReader {
     type Item = Result<MappedRead, CramInputError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None;
+        }
         loop {
             // Refill peekers' heads, dropping any head that fails the
             // pre-decode filter cascade. Each dropped head increments
             // its `FilterCounts` bucket.
             if let Err(e) = self.refill_heads() {
-                return Some(Err(e));
+                return self.fail(e);
             }
 
             // Pick the smallest surviving head; `None` means every
@@ -757,19 +775,19 @@ impl Iterator for CramMergedReader {
             let head = match self.peek_head_keys(chosen_idx) {
                 Ok(Some(keys)) => keys,
                 Ok(None) => continue,
-                Err(e) => return Some(Err(e)),
+                Err(e) => return self.fail(e),
             };
             if let Some((prev_ref, prev_pos)) = self.prev_per_file[chosen_idx]
                 && (head.ref_id, head.pos) < (prev_ref, prev_pos)
             {
-                return Some(Err(CramInputError::OutOfOrderRead {
+                return self.fail(CramInputError::OutOfOrderRead {
                     path: self.paths[chosen_idx].clone(),
                     qname: String::from_utf8_lossy(&head.qname).into_owned(),
                     prev_ref_id: prev_ref,
                     prev_pos,
                     this_ref_id: head.ref_id,
                     this_pos: head.pos,
-                }));
+                });
             }
 
             // Maintain the duplicate-detection window: clear if we
@@ -785,24 +803,24 @@ impl Iterator for CramMergedReader {
             };
             if let Some(other) = self.window.iter().find(|entry| entry.key == new_key) {
                 let other_path = self.paths[other.source_file_index].clone();
-                return Some(Err(CramInputError::DuplicateReadAcrossFiles {
+                return self.fail(CramInputError::DuplicateReadAcrossFiles {
                     qname: String::from_utf8_lossy(&new_key.qname).into_owned(),
                     path_a: other_path,
                     path_b: self.paths[chosen_idx].clone(),
                     ref_id: new_key.ref_id,
                     pos: new_key.pos,
-                }));
+                });
             }
 
             // Consume the chosen peeker's head.
             let record = match self.peekers[chosen_idx].next() {
                 Some(Ok(rb)) => rb,
                 Some(Err(e)) => {
-                    return Some(Err(CramInputError::MalformedRecord {
+                    return self.fail(CramInputError::MalformedRecord {
                         path: self.paths[chosen_idx].clone(),
                         qname: String::from_utf8_lossy(&head.qname).into_owned(),
                         source: e,
-                    }));
+                    });
                 }
                 None => continue,
             };
@@ -811,11 +829,11 @@ impl Iterator for CramMergedReader {
             let mapped = match record_buf_to_mapped_read(&record, chosen_idx) {
                 Ok(m) => m,
                 Err(e) => {
-                    return Some(Err(CramInputError::MalformedRecord {
+                    return self.fail(CramInputError::MalformedRecord {
                         path: self.paths[chosen_idx].clone(),
                         qname: String::from_utf8_lossy(&head.qname).into_owned(),
                         source: e,
-                    }));
+                    });
                 }
             };
 
@@ -839,7 +857,14 @@ impl Iterator for CramMergedReader {
     }
 }
 
+impl std::iter::FusedIterator for CramMergedReader {}
+
 impl CramMergedReader {
+    fn fail(&mut self, e: CramInputError) -> Option<<Self as Iterator>::Item> {
+        self.fused = true;
+        Some(Err(e))
+    }
+
     fn advance_window_if_needed(&mut self, ref_id: usize, pos: u64) {
         match self.window_anchor {
             Some(anchor) if anchor != (ref_id, pos) => {
@@ -1325,6 +1350,29 @@ mod tests {
             }
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    #[test]
+    fn a4b_iterator_returns_none_after_first_error() {
+        // Same shape as a4: out-of-order within a single stream.
+        let cram_a = open_cram_from_records(
+            "a.cram",
+            vec![
+                record_spec(pass_record("R1", 0, 200)),
+                record_spec(pass_record("R2", 0, 100)),
+            ],
+        );
+        let mut reader = CramMergedReader::from_open_crams(
+            vec![cram_a],
+            default_contigs(),
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+        )
+        .expect("reader");
+        assert!(reader.next().expect("ok item").is_ok()); // pos=200
+        assert!(reader.next().expect("err item").is_err()); // OutOfOrderRead
+        assert!(reader.next().is_none(), "iterator must fuse after Err");
+        assert!(reader.next().is_none(), "fuse is sticky");
     }
 
     #[test]

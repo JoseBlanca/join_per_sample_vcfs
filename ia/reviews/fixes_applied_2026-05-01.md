@@ -48,7 +48,7 @@
 | M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | Applied | No | `cram_input.rs` | Pass | No |
-| Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | TBD | No | TBD | TBD | TBD |
+| Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | TBD | No | TBD | TBD | TBD |
 | Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | TBD | No | TBD | TBD | TBD |
 | Mi6 | Minor | MAPQ-missing collapses to 0 — needs doc and regression test | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### Mi3 — iterator behaviour after `Some(Err)` is unspecified
+- **Severity:** Minor
+- **Initial decision:** Apply (decision: fuse on first error)
+- **Final status:** Applied
+- **Reasoning:** When `OutOfOrderRead` or `DuplicateReadAcrossFiles` was returned the offending head was not consumed; a caller using `for r in reader { … }` without breaking on error would loop the same error.
+- **Implementation summary:** Added a `fused: bool` field; the constructors initialise it to `false`. Added a private `fail(self, e)` helper that flips `fused` to `true` and returns `Some(Err(e))`. Every `return Some(Err(...))` site in `Iterator::next` now returns `self.fail(...)`. `next()` early-returns `None` once `fused`. Implemented `std::iter::FusedIterator` for combinator correctness. Added a doc comment on the `impl Iterator` block.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Added `a4b_iterator_returns_none_after_first_error`, mirroring `a4`'s fixture: drains the first ok record, then asserts the error variant, then asserts every subsequent `next()` returns `None`.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** `a4b_iterator_returns_none_after_first_error`
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 27 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None
