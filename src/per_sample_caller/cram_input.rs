@@ -186,8 +186,6 @@ pub struct CramMergedReaderConfig {
     /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
     /// length < n.
     pub min_read_length: Option<u32>,
-    /// Drop reads with `flag & 0x4` set.
-    pub drop_unmapped: bool,
     /// Drop reads with `flag & 0x100` set.
     pub drop_secondary: bool,
     /// Drop reads with `flag & 0x800` set.
@@ -211,7 +209,6 @@ impl Default for CramMergedReaderConfig {
         Self {
             min_mapq: Some(DEFAULT_MIN_MAPQ),
             min_read_length: Some(DEFAULT_MIN_READ_LENGTH),
-            drop_unmapped: true,
             drop_secondary: true,
             drop_supplementary: true,
             drop_qc_fail: true,
@@ -895,9 +892,15 @@ impl CramMergedReader {
             Ok(Some(rb)) => match head_key(rb) {
                 Some(key) => Ok(Some(key)),
                 None => {
-                    // Unmapped or malformed head leaked through; treat
-                    // it as a malformed record so the user sees a
-                    // pointed error instead of a silent drop.
+                    // Defence in depth: unmapped reads are now always
+                    // filtered upstream by `classify_pre_decode`, so a
+                    // record reaching `peek_head_keys` should always
+                    // carry a `reference_sequence_id` and an
+                    // `alignment_start`. If `head_key` returns `None`
+                    // here, the input is genuinely malformed (the CRAM
+                    // claims the read is mapped but omits both fields)
+                    // and the user is better served by a typed error
+                    // than a silent drop.
                     let qname = rb
                         .name()
                         .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
@@ -981,8 +984,10 @@ fn classify_pre_decode(
     if config.drop_secondary && (flag & FLAG_SECONDARY) != 0 {
         return PreDecodeOutcome::Drop(FilterBucket::Secondary);
     }
-    // 5. Unmapped (~0-5%).
-    if config.drop_unmapped && (flag & FLAG_UNMAPPED) != 0 {
+    // 5. Unmapped (~0-5%) — always dropped. An unmapped read contributes
+    // no allele evidence and would otherwise trip the head-key invariant
+    // (no `reference_sequence_id`, no `alignment_start`).
+    if (flag & FLAG_UNMAPPED) != 0 {
         return PreDecodeOutcome::Drop(FilterBucket::Unmapped);
     }
     // 6. QC fail (<1%).
@@ -1464,17 +1469,6 @@ mod tests {
         let cases: &[FlagCase] = &[
             (
                 |c| {
-                    c.drop_secondary = false;
-                    c.drop_supplementary = false;
-                    c.drop_qc_fail = false;
-                    c.drop_duplicate = false;
-                },
-                "unmapped",
-                |c| c.unmapped,
-            ),
-            (
-                |c| {
-                    c.drop_unmapped = false;
                     c.drop_supplementary = false;
                     c.drop_qc_fail = false;
                     c.drop_duplicate = false;
@@ -1484,7 +1478,6 @@ mod tests {
             ),
             (
                 |c| {
-                    c.drop_unmapped = false;
                     c.drop_secondary = false;
                     c.drop_qc_fail = false;
                     c.drop_duplicate = false;
@@ -1494,7 +1487,6 @@ mod tests {
             ),
             (
                 |c| {
-                    c.drop_unmapped = false;
                     c.drop_secondary = false;
                     c.drop_supplementary = false;
                     c.drop_duplicate = false;
@@ -1504,7 +1496,6 @@ mod tests {
             ),
             (
                 |c| {
-                    c.drop_unmapped = false;
                     c.drop_secondary = false;
                     c.drop_supplementary = false;
                     c.drop_qc_fail = false;
@@ -1559,13 +1550,12 @@ mod tests {
     }
 
     #[test]
-    fn a10_all_flag_drops_disabled_passes_everything() {
+    fn a10_all_optional_flag_drops_disabled_keeps_everything_except_unmapped() {
         let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
         let cram_a = open_cram_from_records("a.cram", recs);
         let cfg = CramMergedReaderConfig {
             min_mapq: None,
             min_read_length: None,
-            drop_unmapped: false,
             drop_secondary: false,
             drop_supplementary: false,
             drop_qc_fail: false,
@@ -1580,8 +1570,13 @@ mod tests {
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
         assert!(err.is_none());
-        assert_eq!(out.len(), 6);
-        assert_eq!(counts, FilterCounts::default());
+        // Unmapped is now always dropped — five of six records survive.
+        assert_eq!(out.len(), 5);
+        let expected = FilterCounts {
+            unmapped: 1,
+            ..FilterCounts::default()
+        };
+        assert_eq!(counts, expected);
     }
 
     #[test]
@@ -1720,6 +1715,42 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].qname, b"R1");
         assert_eq!(out[1].qname, b"R2");
+    }
+
+    #[test]
+    fn a14b_truly_unmapped_record_is_filtered_not_errored() {
+        // Build a record whose unmapped flag is set and whose pos is 0
+        // (the record_spec `if spec.pos > 0` guard means no
+        // alignment_start is set on the underlying RecordBuf — i.e. the
+        // shape of a real-CRAM unmapped record).
+        // `mapq` is set above `DEFAULT_MIN_MAPQ` so the low-MAPQ filter
+        // (which sits earlier in the cascade) doesn't pre-empt the
+        // unmapped bucket; the point of this test is the unmapped path.
+        let unmapped = RecordSpec {
+            qname: "U".into(),
+            flag: FLAG_UNMAPPED,
+            ref_id: 0,
+            pos: 0,
+            mapq: 60,
+            cigar_ops: vec![],
+            seq: vec![],
+            qual: vec![],
+            mate_ref_id: None,
+            mate_pos: None,
+        };
+        let cram = open_cram_from_records("a.cram", vec![record_spec(unmapped)]);
+        let mut reader = CramMergedReader::from_open_crams(
+            vec![cram],
+            default_contigs(),
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+        )
+        .expect("reader");
+        assert!(
+            reader.next().is_none(),
+            "unmapped record must be silently dropped"
+        );
+        assert_eq!(reader.filter_counts().unmapped, 1);
     }
 
     #[test]

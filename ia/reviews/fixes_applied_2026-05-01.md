@@ -44,7 +44,7 @@
 | M1 | Major | silent `as u32` truncation on position and length values | Apply | Applied | No | `cram_input.rs`, `errors.rs`, `record_specs.rs`, `cram_files.rs` | Pass | No |
 | M2 | Major | `MultipleSampleNames` reused for within-file SM disagreement | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
 | M3 | Major | `decode_md5_hex` silently tolerates malformed `M5` | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
-| M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | TBD | No | TBD | TBD | TBD |
+| M4 | Major | `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | M5 | Major | `OutOfOrderRead` carries packed `(ref_id, pos)` keys | Apply | TBD | No | TBD | TBD | TBD |
 | Mi1 | Minor | empty-input check returns `CramInputError::Io` | Apply | TBD | No | TBD | TBD | TBD |
 | Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### M4 — `peek_head_keys` reports `MalformedRecord` for legitimate kept-unmapped reads
+- **Severity:** Major
+- **Initial decision:** Apply (decision: drop unmapped unconditionally)
+- **Final status:** Applied
+- **Reasoning:** With `drop_unmapped=false`, an unmapped record (`reference_sequence_id` = `None`, `alignment_start` = `None`) survives `refill_heads`, then trips `peek_head_keys` and is reported as `MalformedRecord`. Removing the toggle eliminates the path: unmapped reads are always dropped at `classify_pre_decode` and never reach `peek_head_keys`.
+- **Implementation summary:** Removed `CramMergedReaderConfig::drop_unmapped`. `classify_pre_decode` now drops `FLAG_UNMAPPED` unconditionally at the same hit-rate-ordered position. `peek_head_keys`'s defensive `head_key()==None` arm is kept and re-commented as defence in depth against malformed CRAM bytes (input that claims a read is mapped but omits both fields).
+- **Review suggestion used verbatim?:** Yes for the config and `classify_pre_decode` change; chose review's option (a) for the defensive arm in `peek_head_keys`.
+- **Adaptation:** None.
+- **Verification performed:** Updated `a9_each_flag_drop_one_at_a_time` to drop the `unmapped` row from the cases table (no toggle to flip). Renamed and rewrote `a10_all_optional_flag_drops_disabled_keeps_everything_except_unmapped` so its expectation matches the new contract (5 records, `unmapped == 1`). Added `a14b_truly_unmapped_record_is_filtered_not_errored` to pin the new behaviour.
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** `a9_each_flag_drop_one_at_a_time` (cases table updated), `a10_all_optional_flag_drops_disabled_keeps_everything_except_unmapped` (renamed + new expectation), `a14b_truly_unmapped_record_is_filtered_not_errored` (new)
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 25 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None
