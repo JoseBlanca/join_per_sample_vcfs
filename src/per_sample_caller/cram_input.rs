@@ -825,6 +825,19 @@ impl Iterator for CramMergedReader {
                 None => continue,
             };
 
+            // Min-read-length filter — applied *before* the
+            // RecordBuf → MappedRead allocation so short reads do not
+            // pay for the qname / cigar / seq / qual clones we are
+            // about to throw away. The order/dup checks above have
+            // already run, so the duplicate-detection window stays
+            // consistent.
+            if let Some(min) = self.config.min_read_length
+                && (record.sequence().as_ref().len() as u32) < min
+            {
+                self.filter_counts.too_short += 1;
+                continue;
+            }
+
             // Convert RecordBuf -> MappedRead.
             let mapped = match record_buf_to_mapped_read(&record, chosen_idx) {
                 Ok(m) => m,
@@ -836,15 +849,6 @@ impl Iterator for CramMergedReader {
                     });
                 }
             };
-
-            // Post-decode filter: minimum read length (depends on
-            // SEQ length, only available after decode).
-            if let Some(min) = self.config.min_read_length
-                && (mapped.seq.len() as u32) < min
-            {
-                self.filter_counts.too_short += 1;
-                continue;
-            }
 
             // Accept: update window, prev_per_file.
             self.window.push_back(WindowEntry {

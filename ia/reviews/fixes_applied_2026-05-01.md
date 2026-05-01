@@ -50,7 +50,7 @@
 | Mi2 | Minor | defensive `.unwrap_or_default()` on `canonical_path` masks an invariant | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi3 | Minor | iterator behaviour after `Some(Err)` is unspecified | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi4 | Minor | `MalformedRecord` errors with empty `qname` context | Apply | Applied | No | `cram_input.rs`, `errors.rs` | Pass | No |
-| Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | TBD | No | TBD | TBD | TBD |
+| Mi5 | Minor | `min_read_length` filter pays for full record decode before rejecting | Apply | Applied | No | `cram_input.rs` | Pass | No |
 | Mi6 | Minor | MAPQ-missing collapses to 0 — needs doc and regression test | Apply | TBD | No | TBD | TBD | TBD |
 | N1 | Nit | `OpenCram::path_for_errors` rename | Apply | TBD | No | TBD | TBD | TBD |
 | N2 | Nit | `window: VecDeque` → `Vec` | Apply | TBD | No | TBD | TBD | TBD |
@@ -81,6 +81,23 @@ None. The review's Open Questions 1-4 were resolved at review time by Jose; all 
   - `./scripts/dev.sh cargo test --lib` → 0, 84 passed
   - `cargo fmt --check` → 0, clean (after `cargo fmt`)
   - `cargo clippy --all-targets --all-features` → no new warnings in `per_sample_caller` (pre-existing warnings in out-of-scope `decompression_pool.rs` etc. unchanged)
+- **User input:** None
+- **Follow-up:** None
+- **Residual risk:** None
+
+### Mi5 — `min_read_length` filter pays for full record decode before rejecting
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** `record_buf_to_mapped_read` clones qname, walks the CIGAR vector, uppercases SEQ, and copies QUAL — all work that is thrown away when the post-decode min-read-length check rejects the record. SEQ length is available on the `RecordBuf` directly, so the check can run earlier.
+- **Implementation summary:** Moved the `min_read_length` check from after `record_buf_to_mapped_read` to immediately after the order/dup checks consume the head. Reads `record.sequence().as_ref().len()` directly. Bucket increment and `continue` semantics unchanged.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** `a11_min_read_length_drops_short_and_empty` continues to pass — same input set (long, short, empty), same expected counts (`too_short == 2`).
+- **Files changed:** `src/per_sample_caller/cram_input.rs`
+- **Tests added or modified:** None — `a11` already exercises the filter and the bucket count.
+- **Validation:**
+  - `./scripts/dev.sh cargo test --lib per_sample_caller` → 0, 28 passed
 - **User input:** None
 - **Follow-up:** None
 - **Residual risk:** None
