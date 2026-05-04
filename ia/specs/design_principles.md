@@ -29,6 +29,20 @@ ambiguous.
      rule, not a numerology rule: the question to ask is "would a
      reader meeting this literal know what it means?", not "is this
      a number?".
+   - *Readability over name length — especially for private items.*
+     When the choice is between a short name that needs the type,
+     the doc comment, or surrounding code to be understood, and a
+     longer name that says what the thing is directly, take the
+     longer name. Public API names earn a small abbreviation budget
+     because they appear at many call sites and stretch into
+     headers; private names earn essentially none — a few extra
+     characters per use site cost nothing, and never having to
+     wonder "what is this?" pays off on every review. Concretely:
+     `ReadFingerprintWithSourceFile` over `WindowEntry`,
+     `per_file_prev_locus` over `prev_per_file`,
+     `record_streams` over `peekers`. The test is "would a reader
+     hitting this identifier cold know what it is, without looking
+     elsewhere?", not "is this name long?".
 
 2. **No guessing at user intent — every default and decision is
    explicit.** Every parameter default, every fallback behaviour, every

@@ -78,7 +78,7 @@ Do not force strict functional programming. Using structs/enums plus `impl` bloc
 - Types should be domain nouns (`VariantGroup`, `GenotypePosterior`).
 - Types name *shapes*; bindings (variables, fields, arguments) name *roles*. Prefer `type Locus = (usize, u64)` with `prev_per_file: Vec<Option<Locus>>` over a role-named alias like `type PerFileOrder = Option<(usize, u64)>` — the binding carries the role, the type stays reusable across other roles. Newtype wrappers (`struct UserId(u64)`) are exempt; their job is precisely to mint type-level role distinctions.
 - Avoid vague names: `item`, `data`, `value`, `thing`, `obj`, `tmp`, `helper`.
-- Keep names explicit enough to be unambiguous in context.
+- Prefer self-explaining names over short cryptic ones, especially for private items where length costs nothing: `ReadFingerprintWithSourceFile` over `WindowEntry`, `per_file_prev_locus` over `prev_per_file`. The test is "would a reader hitting this identifier cold know what it is, without looking elsewhere?", not "is this name long?".
 - Prefer straightforward control flow with early returns over deep nesting.
 - Add comments only for non-obvious invariants, algorithms, or performance tradeoffs.
 
