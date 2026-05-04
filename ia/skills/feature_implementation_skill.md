@@ -76,11 +76,14 @@ Do not force strict functional programming. Using structs/enums plus `impl` bloc
 
 - Functions should be verbs or verb phrases (`parse_header`, `merge_genotypes`).
 - Types should be domain nouns (`VariantGroup`, `GenotypePosterior`).
-- Types name *shapes*; bindings (variables, fields, arguments) name *roles*. Prefer `type Locus = (usize, u64)` with `prev_per_file: Vec<Option<Locus>>` over a role-named alias like `type PerFileOrder = Option<(usize, u64)>` — the binding carries the role, the type stays reusable across other roles. Newtype wrappers (`struct UserId(u64)`) are exempt; their job is precisely to mint type-level role distinctions.
+- Types name *shapes*; bindings (variables, fields, arguments) name *roles*. Prefer `type Locus = (usize, u64)` with `per_file_prev_locus: Vec<Option<Locus>>` over a role-named alias like `type PerFileOrder = Option<(usize, u64)>` — the binding carries the role, the type stays reusable across other roles. Newtype wrappers (`struct UserId(u64)`) are exempt; their job is precisely to mint type-level role distinctions.
 - Avoid vague names: `item`, `data`, `value`, `thing`, `obj`, `tmp`, `helper`.
 - Prefer self-explaining names over short cryptic ones, especially for private items where length costs nothing: `ReadFingerprintWithSourceFile` over `WindowEntry`, `per_file_prev_locus` over `prev_per_file`. The test is "would a reader hitting this identifier cold know what it is, without looking elsewhere?", not "is this name long?".
+- At internal layer transitions, prefix raw dependency-type bindings with the library name (`noodles_cram_reader` rather than `cram_reader`) when the value is about to be wrapped by project code. Once wrapped, the project-named wrapper carries the layer. Private-code convention only — public APIs still don't expose dependency types.
 - Prefer straightforward control flow with early returns over deep nesting.
 - Add comments only for non-obvious invariants, algorithms, or performance tradeoffs.
+- Type and field doc comments lead with what the value *is* (shape, parts, invariants), then add *why* (role, lifecycle, rationale) only when it would surprise a reader who understood the shape. Inline comments still follow the *why* not *what* rule — the difference is that doc comments on type-level declarations have no surrounding code to read the *what* off.
+- In design-explaining doc comments, prefer plain English to Rust jargon ("borrowing would force every consumer to copy the bytes itself" rather than "we avoid hidden clones"). The jargon gestures; the plain version names. Mechanical code annotations can still use jargon where it's load-bearing.
 
 ## Testing policy (mandatory)
 

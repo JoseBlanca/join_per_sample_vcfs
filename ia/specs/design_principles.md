@@ -43,6 +43,33 @@ ambiguous.
      `record_streams` over `peekers`. The test is "would a reader
      hitting this identifier cold know what it is, without looking
      elsewhere?", not "is this name long?".
+   - *Type and field doc comments lead with shape, then add why.*
+     The first sentence on a type alias, struct, or field
+     describes what the value *is* — its shape, what its parts
+     mean, what equality means, what invariants hold. The why
+     (algorithmic role, design rationale, lifecycle) follows in
+     subsequent sentences, only when it would surprise a reader
+     who already understood the shape. This parallels principle 7:
+     just as the type *name* describes shape, so does its doc
+     comment. The inline-comment rule above — *why* not *what* —
+     is unchanged: it's about `//` annotations next to executable
+     lines, where the surrounding code already shows what's
+     happening. Doc comments on type-level declarations are the
+     opposite case: there is no surrounding code to read the
+     *what* off, so the comment supplies it.
+   - *In design-explaining doc comments, prefer plain English to
+     Rust jargon.* When a comment explains a tradeoff — why
+     owned rather than borrowed, why heap-allocated, why this
+     iterator shape — terms like "move-only," "hidden clones,"
+     "fat pointer," or "vtable" short-circuit understanding for
+     any reader who isn't already fluent in Rust internals. Plain
+     English forces you to articulate the *actual* tradeoff: not
+     "we avoid hidden clones" but "borrowing would force every
+     consumer to copy the bytes itself, so we own them once and
+     move them along." The jargon often gestures at a thing
+     without naming it; the plain version names it. Mechanical
+     code annotations can still use jargon where it's
+     load-bearing — this is about design-explaining prose.
 
 2. **No guessing at user intent — every default and decision is
    explicit.** Every parameter default, every fallback behaviour, every
@@ -103,6 +130,19 @@ ambiguous.
      another CRAM library — or noodles changes its record type
      across a major release — only the conversion helper changes;
      downstream stages and external callers do not.
+   - *At internal layer transitions, prefix raw dependency-type
+     bindings with the library name.* When private code holds a
+     third-party value about to be wrapped by project code, the
+     prefix (`noodles_cram_reader` rather than `cram_reader`)
+     makes the layer transition visible: "this is the raw object,
+     about to enter our own layer." Once wrapped, the project-
+     named wrapper carries the layer identity. Concrete instance:
+     in `CramMergedReader::new`, both `noodles_cram_reader` and
+     `noodles_sam_header` are noodles types about to be moved
+     into `OwnedCramRecords`; the prefix announces "not yet
+     inside project ownership." This is a private-code convention
+     only — public APIs still don't expose dependency types per
+     the rule above.
    - *Not an absolute rule either.* For types that are genuinely
      standard across the ecosystem (`std::path::Path`,
      `std::io::Read`, integer types) the wrapping is pointless. The
@@ -157,16 +197,17 @@ ambiguous.
    use site appears.
    - *Example:* the CRAM merge's `type Locus = (usize, u64)` —
      contig-list index plus 1-based position — appears in three
-     different roles: `prev_per_file: Vec<Option<Locus>>` (per-file
-     order tracker), `window_anchor: Option<Locus>` (duplicate-
-     window anchor), and as the inner half of `argmin_head`'s
-     scratch `Option<(usize, Locus)>` (best stream index plus its
-     locus). The same shape gets a single name; each role is named
-     where the value is bound, and the surrounding `Option` /
-     `Vec` make storage semantics explicit. An earlier iteration
-     used `type PerFileOrder = Option<(usize, u64)>`, which baked
-     the role into the type name — and as a result the same shape
-     went unnamed in `window_anchor` and `argmin_head`, where the
+     different roles: `per_file_prev_locus: Vec<Option<Locus>>`
+     (per-file order tracker), `current_locus: Option<Locus>`
+     (the locus the merge is currently processing), and as the
+     inner half of `argmin_head`'s scratch
+     `Option<(usize, Locus)>` (best stream index plus its locus).
+     The same shape gets a single name; each role is named where
+     the value is bound, and the surrounding `Option` / `Vec`
+     make storage semantics explicit. An earlier iteration used
+     `type PerFileOrder = Option<(usize, u64)>`, which baked the
+     role into the type name — and as a result the same shape
+     went unnamed in `current_locus` and `argmin_head`, where the
      role was different.
    - *Newtype wrappers are a different tool.* `struct UserId(u64)`
      exists precisely to *create* a type-level role distinction
