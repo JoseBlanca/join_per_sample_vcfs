@@ -130,3 +130,40 @@ ambiguous.
      with one variant is overkill — `io::Error` directly is fine.
      The split is a guideline for places where both layers genuinely
      exist.
+
+7. **Type names describe data shapes; variable and field names
+   might describe roles.** A type alias or struct should name *what the
+   value is*, not what it's used for. Roles could live on the binding
+   (variable, field, argument), where surrounding context already
+   constrains their meaning. The same data shape often plays
+   different roles in different parts of the code; a shape-named
+   type composes naturally with `Option` / `Vec` / `HashMap` to
+   express presence, multiplicity, or keying at the storage site,
+   while a role-named type stops being usable the moment a second
+   use site appears.
+   - *Example:* the CRAM merge's `type Locus = (usize, u64)` —
+     contig-list index plus 1-based position — appears in three
+     different roles: `prev_per_file: Vec<Option<Locus>>` (per-file
+     order tracker), `window_anchor: Option<Locus>` (duplicate-
+     window anchor), and as the inner half of `argmin_head`'s
+     scratch `Option<(usize, Locus)>` (best stream index plus its
+     locus). The same shape gets a single name; each role is named
+     where the value is bound, and the surrounding `Option` /
+     `Vec` make storage semantics explicit. An earlier iteration
+     used `type PerFileOrder = Option<(usize, u64)>`, which baked
+     the role into the type name — and as a result the same shape
+     went unnamed in `window_anchor` and `argmin_head`, where the
+     role was different.
+   - *Newtype wrappers are a different tool.* `struct UserId(u64)`
+     exists precisely to *create* a type-level role distinction
+     between values that share a shape, and that is the whole point
+     of reaching for one. The principle here is about type
+     *aliases* and *owned domain types*; for those, naming the
+     shape keeps the door open for reuse where naming the role
+     closes it.
+   - *Not an absolute rule.* When a data shape has exactly one
+     plausible role across the whole module and you can't picture
+     it appearing elsewhere, a role-named alias is fine — there is
+     no reuse cost to pay. The test is "would this shape have an
+     independent meaning if it appeared somewhere else?", not "is
+     this a tuple?".

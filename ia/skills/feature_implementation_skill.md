@@ -76,6 +76,7 @@ Do not force strict functional programming. Using structs/enums plus `impl` bloc
 
 - Functions should be verbs or verb phrases (`parse_header`, `merge_genotypes`).
 - Types should be domain nouns (`VariantGroup`, `GenotypePosterior`).
+- Types name *shapes*; bindings (variables, fields, arguments) name *roles*. Prefer `type Locus = (usize, u64)` with `prev_per_file: Vec<Option<Locus>>` over a role-named alias like `type PerFileOrder = Option<(usize, u64)>` — the binding carries the role, the type stays reusable across other roles. Newtype wrappers (`struct UserId(u64)`) are exempt; their job is precisely to mint type-level role distinctions.
 - Avoid vague names: `item`, `data`, `value`, `thing`, `obj`, `tmp`, `helper`.
 - Keep names explicit enough to be unambiguous in context.
 - Prefer straightforward control flow with early returns over deep nesting.
