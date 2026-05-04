@@ -20,16 +20,12 @@ use crate::per_sample_caller::errors::CramInputError;
 // ---------------------------------------------------------------------
 
 /// Reads with MAPQ strictly below this are dropped. Matches bcftools'
-/// default and the spec recommendation in
-/// `ia/specs/per_sample_caller.md` §"Read filters".
+/// default
 ///
 /// Reads with MAPQ unavailable (SAM 0xFF / noodles `mapping_quality()`
 /// returning `None`) are treated as MAPQ 0 and therefore rejected
-/// under any non-zero minimum. Decision recorded 2026-04-29: at the
-/// project's 2-10× coverage targets an "unknown" placement is not
-/// trustworthy enough to admit; matches the bcftools/freebayes
-/// convention. See `ia/reviews/per_sample_caller_cram_input_2026-04-29.md`
-/// (Mi6) for the full rationale.
+/// under any non-zero minimum. Matches the bcftools/freebayes
+/// convention.
 pub const DEFAULT_MIN_MAPQ: u8 = 20;
 
 /// Decoded SEQ length below this is dropped. Reads shorter than this
@@ -40,7 +36,6 @@ pub const DEFAULT_MIN_READ_LENGTH: u32 = 30;
 /// `BufferedPeekable` look-ahead used per CRAM in the merge. The CRAM
 /// decoder underneath already does its own slice-level batching; an
 /// extra outer buffer would just delay records without saving work.
-/// See `ia/specs/buffered_peekable.md` §"Why it exists in the project".
 const PER_PEEKER_BUFFER_SIZE: usize = 1;
 
 // ---------------------------------------------------------------------
@@ -64,12 +59,19 @@ pub enum CigarOp {
 // MappedRead
 // ---------------------------------------------------------------------
 
-/// A read decoded out of a CRAM, owned and decoupled from noodles.
+/// A read decoded out of a CRAM. Every byte (qname, sequence,
+/// qualities, CIGAR) is owned by the `MappedRead` itself rather than
+/// borrowed from the noodles record it was decoded from. That lets
+/// downstream stages hold onto reads without being tied to the CRAM
+/// reader's lifetime.
 ///
 /// Every field is public — downstream stages (BAQ, the pileup walker)
-/// need to read them directly. The struct is move-only on the hot
-/// path; we avoid hidden clones by handing the decoded bytes through
-/// the iterator rather than referencing them.
+/// need to read them directly.
+///
+/// A borrowing design would save one allocation per read at decode
+/// time, but each downstream stage would then have to copy the bytes
+/// for itself before using them, which costs more in total than
+/// allocating once upfront and handing the read along.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedRead {
     pub qname: Vec<u8>,
@@ -515,26 +517,30 @@ fn with_fai_extension(fasta_path: &Path) -> PathBuf {
 // CramMergedReader
 // ---------------------------------------------------------------------
 
-/// Per-file order tracker: previous `(ref_id, pos)` accepted for that
-/// file, used to detect within-file regressions.
-type PerFileOrder = Option<(usize, u64)>;
+/// A genome location: index into the merged `ContigList` and 1-based
+/// position on that contig.
+type Locus = (usize, u64);
 
-/// Key used by the duplicate-detection window: `(qname, flag, ref_id,
-/// pos)` per `ia/specs/per_sample_caller.md` §"Duplicate-read detection
-/// across CRAMs".
+/// Identifying fingerprint of a mapped read: the four fields whose
+/// equality defines "same read" for duplicate detection — qname,
+/// SAM flags, contig-list index, and 1-based position. See
+/// `ia/specs/per_sample_caller.md` §"Duplicate-read detection across
+/// CRAMs" for the rationale behind these specific fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WindowKey {
+struct ReadFingerprint {
     qname: Vec<u8>,
     flag: u16,
     ref_id: usize,
     pos: u64,
 }
 
-/// Per-window entry: the key plus the source file index, so the
-/// duplicate error can name both files.
+/// A `ReadFingerprint` paired with the index of the input file it
+/// came from. Stored once per accepted read at the current locus so
+/// a duplicate error can name *both* source files (the previous
+/// acceptance and the colliding one).
 #[derive(Debug, Clone)]
-struct WindowEntry {
-    key: WindowKey,
+struct ReadFingerprintWithSourceFile {
+    key: ReadFingerprint,
     source_file_index: usize,
 }
 
@@ -542,18 +548,29 @@ type CramRecordsIter = Box<dyn Iterator<Item = io::Result<sam::alignment::Record
 type CramPeekable = BufferedPeekable<CramRecordsIter, sam::alignment::RecordBuf, io::Error>;
 
 pub struct CramMergedReader {
-    peekers: Vec<CramPeekable>,
+    record_streams: Vec<CramPeekable>,
     paths: Vec<PathBuf>,
     contigs: ContigList,
     sample_name: String,
     config: CramMergedReaderConfig,
-    prev_per_file: Vec<PerFileOrder>,
-    /// Reads accepted at the current `(ref_id, pos)` — cleared on
-    /// advance.
-    window: Vec<WindowEntry>,
-    /// Anchor for the current window: `None` while empty, `Some` at
-    /// the position of the entries currently in `window`.
-    window_anchor: Option<(usize, u64)>,
+    /// Previous `Locus` accepted from each input, parallel to
+    /// `record_streams` and `paths`. `None` until the first record
+    /// from that input is accepted. Used to detect within-file
+    /// regressions in coordinate order.
+    per_file_prev_locus: Vec<Option<Locus>>,
+    /// Cross-file duplicate-detection buffer for the current locus:
+    /// the `ReadFingerprintWithSourceFile` of every read already
+    /// accepted at `current_locus`. A new candidate whose fingerprint
+    /// matches any entry here is rejected as a cross-file duplicate.
+    /// Cleared whenever the merge advances to a new locus, since
+    /// duplicates only matter between records at the same
+    /// `(ref_id, pos)`.
+    current_locus_read_fingerprints: Vec<ReadFingerprintWithSourceFile>,
+    /// The locus the merge is currently processing. `None` before the
+    /// first record is examined; otherwise the locus of every entry
+    /// in `current_locus_read_fingerprints` (which may be empty if no
+    /// record has been accepted at this locus yet).
+    current_locus: Option<Locus>,
     filter_counts: FilterCounts,
     /// Set the first time `next()` returns `Some(Err(_))`. After that,
     /// every subsequent call returns `None`. Implements the fuse-on-
@@ -580,13 +597,13 @@ impl CramMergedReader {
                 fasta_path: fasta.to_path_buf(),
             });
         }
-        let indexed_reader = noodles_fasta::io::indexed_reader::Builder::default()
+        let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
             .build_from_path(fasta)
             .map_err(|source| CramInputError::Io {
                 path: fasta.to_path_buf(),
                 source,
             })?;
-        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_reader);
+        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
         let repository = fasta::Repository::new(adapter);
 
         // Open every CRAM, validate per-file invariants, and collect
@@ -594,10 +611,10 @@ impl CramMergedReader {
         let mut open_crams: Vec<OpenCram> = Vec::with_capacity(crams.len());
         let mut canonical_contigs: Option<ContigList> = None;
         let mut canonical_sample: Option<String> = None;
-        let mut canonical_path: Option<PathBuf> = None;
+        let mut reference_cram_path: Option<PathBuf> = None;
 
         for cram_path in crams {
-            let mut cram_reader = cram::io::reader::Builder::default()
+            let mut noodles_cram_reader = cram::io::reader::Builder::default()
                 .set_reference_sequence_repository(repository.clone())
                 .build_from_path(cram_path)
                 .map_err(|source| CramInputError::OpenFailed {
@@ -607,7 +624,7 @@ impl CramMergedReader {
 
             // Read file definition first to gate on CRAM major version
             // before any container is decoded.
-            let file_definition = cram_reader.read_file_definition().map_err(|source| {
+            let file_definition = noodles_cram_reader.read_file_definition().map_err(|source| {
                 CramInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
@@ -622,28 +639,28 @@ impl CramMergedReader {
                 });
             }
 
-            let sam_header =
-                cram_reader
+            let noodles_sam_header =
+                noodles_cram_reader
                     .read_file_header()
                     .map_err(|source| CramInputError::OpenFailed {
                         path: cram_path.clone(),
                         source,
                     })?;
-            let cram_header = extract_header(cram_path, &sam_header)?;
+            let cram_header = extract_header(cram_path, &noodles_sam_header)?;
 
             // Cross-file checks: contigs and sample name must be
             // identical across every file in the input.
             match &canonical_contigs {
                 None => {
                     canonical_contigs = Some(cram_header.contigs.clone());
-                    canonical_path = Some(cram_path.clone());
+                    reference_cram_path = Some(cram_path.clone());
                 }
                 Some(existing) => {
                     if let Err(detail) = existing.first_disagreement(&cram_header.contigs) {
                         return Err(CramInputError::ContigListMismatch {
-                            reference_path: canonical_path
+                            reference_path: reference_cram_path
                                 .clone()
-                                .expect("canonical_path is set when canonical_contigs is Some"),
+                                .expect("reference_cram_path is set when canonical_contigs is Some"),
                             other_path: cram_path.clone(),
                             detail,
                         });
@@ -654,9 +671,9 @@ impl CramMergedReader {
                 None => canonical_sample = Some(cram_header.sample_name.clone()),
                 Some(existing) if existing != &cram_header.sample_name => {
                     return Err(CramInputError::MultipleSampleNames {
-                        path_a: canonical_path
+                        path_a: reference_cram_path
                             .clone()
-                            .expect("canonical_path is set when canonical_sample is Some"),
+                            .expect("reference_cram_path is set when canonical_sample is Some"),
                         sm_a: existing.clone(),
                         path_b: cram_path.clone(),
                         sm_b: cram_header.sample_name,
@@ -668,16 +685,16 @@ impl CramMergedReader {
             // Build the owned record iterator and pack it into an
             // `OpenCram`. The reader and header are moved into the
             // owned iterator — neither escapes from this scope.
-            let owned: CramRecordsIter = Box::new(OwnedCramRecords {
-                reader: cram_reader,
-                header: sam_header,
+            let owned_records: CramRecordsIter = Box::new(OwnedCramRecords {
+                reader: noodles_cram_reader,
+                header: noodles_sam_header,
                 repository: repository.clone(),
                 container: cram::io::reader::Container::default(),
                 pending: Vec::new().into_iter(),
             });
             open_crams.push(OpenCram {
                 path: cram_path.clone(),
-                records: owned,
+                records: owned_records,
             });
         }
 
@@ -691,7 +708,7 @@ impl CramMergedReader {
         validate_fasta_agreement(
             fasta,
             &canonical_contigs,
-            canonical_path.as_deref().unwrap_or(fasta),
+            reference_cram_path.as_deref().unwrap_or(fasta),
         )?;
 
         Self::from_open_crams(open_crams, canonical_contigs, canonical_sample, config)
@@ -710,24 +727,24 @@ impl CramMergedReader {
         config: CramMergedReaderConfig,
     ) -> Result<Self, CramInputError> {
         let n = open_crams.len();
-        let mut peekers = Vec::with_capacity(n);
+        let mut record_streams = Vec::with_capacity(n);
         let mut paths = Vec::with_capacity(n);
         for open in open_crams {
             paths.push(open.path);
-            peekers.push(BufferedPeekable::with_buffer_size(
+            record_streams.push(BufferedPeekable::with_buffer_size(
                 open.records,
                 PER_PEEKER_BUFFER_SIZE,
             ));
         }
         Ok(Self {
-            peekers,
+            record_streams,
             paths,
             contigs,
             sample_name,
             config,
-            prev_per_file: vec![None; n],
-            window: Vec::new(),
-            window_anchor: None,
+            per_file_prev_locus: vec![None; n],
+            current_locus_read_fingerprints: Vec::new(),
+            current_locus: None,
             filter_counts: FilterCounts::default(),
             fused: false,
         })
@@ -766,7 +783,7 @@ impl Iterator for CramMergedReader {
             return None;
         }
         loop {
-            // Refill peekers' heads, dropping any head that fails the
+            // Refill record streams' heads, dropping any head that fails the
             // pre-decode filter cascade. Each dropped head increments
             // its `FilterCounts` bucket.
             if let Err(e) = self.refill_heads() {
@@ -774,7 +791,7 @@ impl Iterator for CramMergedReader {
             }
 
             // Pick the smallest surviving head; `None` means every
-            // peeker is exhausted and we are done.
+            // record stream is exhausted and we are done.
             let chosen_idx = self.argmin_head()?;
 
             // Validate per-file order against this file's previous
@@ -784,7 +801,7 @@ impl Iterator for CramMergedReader {
                 Ok(None) => continue,
                 Err(e) => return self.fail(e),
             };
-            if let Some((prev_ref, prev_pos)) = self.prev_per_file[chosen_idx]
+            if let Some((prev_ref, prev_pos)) = self.per_file_prev_locus[chosen_idx]
                 && (head.ref_id, head.pos) < (prev_ref, prev_pos)
             {
                 return self.fail(CramInputError::OutOfOrderRead {
@@ -797,18 +814,19 @@ impl Iterator for CramMergedReader {
                 });
             }
 
-            // Maintain the duplicate-detection window: clear if we
-            // advanced past the current anchor.
-            self.advance_window_if_needed(head.ref_id, head.pos);
+            // Move `current_locus` to the head's locus, clearing the
+            // accepted-fingerprints buffer if we've advanced past the
+            // previous one.
+            self.advance_current_locus_if_needed(head.ref_id, head.pos);
 
-            // Detect duplicates against the current window.
-            let new_key = WindowKey {
+            // Check for cross-file duplicates at the current locus.
+            let new_key = ReadFingerprint {
                 qname: head.qname.clone(),
                 flag: head.flag,
                 ref_id: head.ref_id,
                 pos: head.pos,
             };
-            if let Some(other) = self.window.iter().find(|entry| entry.key == new_key) {
+            if let Some(other) = self.current_locus_read_fingerprints.iter().find(|entry| entry.key == new_key) {
                 let other_path = self.paths[other.source_file_index].clone();
                 return self.fail(CramInputError::DuplicateReadAcrossFiles {
                     qname: String::from_utf8_lossy(&new_key.qname).into_owned(),
@@ -819,8 +837,8 @@ impl Iterator for CramMergedReader {
                 });
             }
 
-            // Consume the chosen peeker's head.
-            let record = match self.peekers[chosen_idx].next() {
+            // Consume the chosen record stream's head.
+            let record = match self.record_streams[chosen_idx].next() {
                 Some(Ok(rb)) => rb,
                 Some(Err(e)) => {
                     return self.fail(CramInputError::MalformedRecord {
@@ -836,8 +854,8 @@ impl Iterator for CramMergedReader {
             // RecordBuf → MappedRead allocation so short reads do not
             // pay for the qname / cigar / seq / qual clones we are
             // about to throw away. The order/dup checks above have
-            // already run, so the duplicate-detection window stays
-            // consistent.
+            // already run, so the dedup buffer at the current locus
+            // stays consistent.
             if let Some(min) = self.config.min_read_length
                 && (record.sequence().as_ref().len() as u32) < min
             {
@@ -857,12 +875,13 @@ impl Iterator for CramMergedReader {
                 }
             };
 
-            // Accept: update window, prev_per_file.
-            self.window.push(WindowEntry {
+            // Accept: record the fingerprint and bump the per-file
+            // previous-locus tracker.
+            self.current_locus_read_fingerprints.push(ReadFingerprintWithSourceFile {
                 key: new_key,
                 source_file_index: chosen_idx,
             });
-            self.prev_per_file[chosen_idx] = Some((mapped.ref_id, mapped.pos));
+            self.per_file_prev_locus[chosen_idx] = Some((mapped.ref_id, mapped.pos));
             return Some(Ok(mapped));
         }
     }
@@ -876,14 +895,14 @@ impl CramMergedReader {
         Some(Err(e))
     }
 
-    fn advance_window_if_needed(&mut self, ref_id: usize, pos: u64) {
-        match self.window_anchor {
-            Some(anchor) if anchor != (ref_id, pos) => {
-                self.window.clear();
-                self.window_anchor = Some((ref_id, pos));
+    fn advance_current_locus_if_needed(&mut self, ref_id: usize, pos: u64) {
+        match self.current_locus {
+            Some(existing) if existing != (ref_id, pos) => {
+                self.current_locus_read_fingerprints.clear();
+                self.current_locus = Some((ref_id, pos));
             }
             None => {
-                self.window_anchor = Some((ref_id, pos));
+                self.current_locus = Some((ref_id, pos));
             }
             _ => {}
         }
@@ -891,9 +910,9 @@ impl CramMergedReader {
 
     fn refill_heads(&mut self) -> Result<(), CramInputError> {
         let config = self.config;
-        for idx in 0..self.peekers.len() {
+        for idx in 0..self.record_streams.len() {
             loop {
-                let drop_outcome = match self.peekers[idx].peek() {
+                let drop_outcome = match self.record_streams[idx].peek() {
                     Ok(Some(rb)) => classify_pre_decode(&config, rb),
                     Ok(None) => break,
                     Err(e) => {
@@ -909,7 +928,7 @@ impl CramMergedReader {
                     PreDecodeOutcome::Drop(bucket) => {
                         self.bump_filter_count(bucket);
                         // Consume the dropped head and re-peek.
-                        let _ = self.peekers[idx].next();
+                        let _ = self.record_streams[idx].next();
                     }
                 }
             }
@@ -920,11 +939,11 @@ impl CramMergedReader {
     /// Inspect a peekable head without consuming it. Returns the
     /// merge-order key plus the few fields we need to perform the
     /// out-of-order and duplicate checks. `Ok(None)` means the
-    /// peeker is exhausted (peek is None at this point — should not
+    /// record stream is exhausted (peek is None at this point — should not
     /// happen between `refill_heads` and `argmin_head`, but treat
     /// defensively).
     fn peek_head_keys(&mut self, idx: usize) -> Result<Option<HeadKey>, CramInputError> {
-        match self.peekers[idx].peek() {
+        match self.record_streams[idx].peek() {
             Ok(Some(rb)) => match head_key(rb) {
                 Some(key) => Ok(Some(key)),
                 None => {
@@ -960,9 +979,9 @@ impl CramMergedReader {
     }
 
     fn argmin_head(&mut self) -> Option<usize> {
-        let mut best: Option<(usize, (usize, u64))> = None;
-        for idx in 0..self.peekers.len() {
-            let Ok(Some(rb)) = self.peekers[idx].peek() else {
+        let mut best: Option<(usize, Locus)> = None;
+        for idx in 0..self.record_streams.len() {
+            let Ok(Some(rb)) = self.record_streams[idx].peek() else {
                 continue;
             };
             let Some(head) = head_key(rb) else {
@@ -1437,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn a6_duplicate_window_clears_on_advance() {
+    fn a6_dedup_buffer_clears_on_locus_advance() {
         let cram_a = open_cram_from_records(
             "a.cram",
             vec![

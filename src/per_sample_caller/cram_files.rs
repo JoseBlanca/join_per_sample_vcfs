@@ -117,9 +117,9 @@ pub(crate) fn build_cram(
 }
 
 fn repository_for(fasta_path: &std::path::Path) -> io::Result<fasta::Repository> {
-    let indexed_reader =
+    let indexed_fasta_reader =
         fasta::io::indexed_reader::Builder::default().build_from_path(fasta_path)?;
-    let adapter = fasta::repository::adapters::IndexedReader::new(indexed_reader);
+    let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
     Ok(fasta::Repository::new(adapter))
 }
 
