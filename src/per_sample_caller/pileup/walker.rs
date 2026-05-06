@@ -419,44 +419,61 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
         if indices.len() < 2 {
             continue;
         }
-        for window in indices.windows(2) {
-            let (a, b) = (window[0], window[1]);
-            let bq_a = contributors[a].bq_baq_at_walker_pos;
-            let bq_b = contributors[b].bq_baq_at_walker_pos;
-            let loser_idx = match bq_a.cmp(&bq_b) {
-                std::cmp::Ordering::Less => a,
-                std::cmp::Ordering::Greater => b,
-                // Tie: prefer the read flagged as first mate.
-                // If both or neither carry is_first_mate, fall
-                // back to alignment_start (deterministic across
-                // input reorderings since paired mates always
-                // share a slot in pairs of two).
-                std::cmp::Ordering::Equal => {
-                    let a_first = contributors[a].is_first_mate;
-                    let b_first = contributors[b].is_first_mate;
-                    match (a_first, b_first) {
-                        (true, false) => b,
-                        (false, true) => a,
-                        _ => {
-                            if contributors[a].alignment_start <= contributors[b].alignment_start {
-                                b
-                            } else {
-                                a
+        // Spec invariant: only mate pairs share a slot, so at most
+        // two contributors per slot. Assert here so a future
+        // change that admits a third reader of the same slot
+        // (e.g. supplementary alignments slipping past upstream
+        // filters) surfaces in tests instead of in production.
+        debug_assert!(
+            indices.len() <= 2,
+            "more than two contributors share chain_slot_id {:?}",
+            indices,
+        );
+        // All-pairs comparison so a future relaxation of the
+        // invariant doesn't silently miss the (i, j>i+1) cases
+        // that `indices.windows(2)` skips.
+        for i in 0..indices.len() {
+            for j in (i + 1)..indices.len() {
+                let (a, b) = (indices[i], indices[j]);
+                let bq_a = contributors[a].bq_baq_at_walker_pos;
+                let bq_b = contributors[b].bq_baq_at_walker_pos;
+                let loser_idx = match bq_a.cmp(&bq_b) {
+                    std::cmp::Ordering::Less => a,
+                    std::cmp::Ordering::Greater => b,
+                    // Tie: prefer the read flagged as first mate.
+                    // If both or neither carry is_first_mate, fall
+                    // back to alignment_start (deterministic
+                    // across input reorderings since paired mates
+                    // always share a slot in pairs of two).
+                    std::cmp::Ordering::Equal => {
+                        let a_first = contributors[a].is_first_mate;
+                        let b_first = contributors[b].is_first_mate;
+                        match (a_first, b_first) {
+                            (true, false) => b,
+                            (false, true) => a,
+                            _ => {
+                                if contributors[a].alignment_start
+                                    <= contributors[b].alignment_start
+                                {
+                                    b
+                                } else {
+                                    a
+                                }
                             }
                         }
                     }
+                };
+                summary.mate_overlap_positions += 1;
+                // Indel involvement on either side at this
+                // walker_pos → collapse to a single observation by
+                // removing the loser entirely. Otherwise just zero
+                // the loser's BQ on its (Match-only) events.
+                let any_indel_here = pair_has_indel(&contributors[a], &contributors[b]);
+                if any_indel_here {
+                    to_remove.push(loser_idx);
+                } else {
+                    to_zero.push(loser_idx);
                 }
-            };
-            summary.mate_overlap_positions += 1;
-            // Indel involvement on either side at this walker_pos
-            // → collapse to a single observation by removing the
-            // loser entirely. Otherwise just zero the loser's BQ
-            // on its (Match-only) events.
-            let any_indel_here = pair_has_indel(&contributors[a], &contributors[b]);
-            if any_indel_here {
-                to_remove.push(loser_idx);
-            } else {
-                to_zero.push(loser_idx);
             }
         }
     }

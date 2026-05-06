@@ -47,7 +47,7 @@
 | M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | M3 | Major | `record_widen_events` counter conflates open and widen | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | M4 | Major | Lifecycle marks attach only to first drained record | Ask | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
-| M5 | Major | `windows(2)` only inspects adjacent contributor pairs | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| M5 | Major | `windows(2)` only inspects adjacent contributor pairs | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
 | Mi1 | Minor | `checked_sub.unwrap_or(0)` masks precondition violation | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | Mi2 | Minor | `walker_pos == 0` guard is dead code | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | Mi3 | Minor | `flush_chromosome` accepts unused `_fasta` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
@@ -144,6 +144,25 @@
 - **Tests added or modified:** Added `mate_overlap_bq_tie_prefers_first_mate_not_earlier_position`.
 - **Validation:**
   - `cargo test --lib pileup` → exit 0, 53 passed
+- **User input:** None.
+- **Follow-up:** None.
+- **Residual risk:** None.
+
+### M5 — `windows(2)` only inspects adjacent contributor pairs
+
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The spec invariant ("only mate pairs share a slot") makes the `len > 2` branch unreachable today, but the `windows(2)` shape silently miscompares the moment a future change relaxes the invariant. The fix replaces it with explicit all-pairs iteration plus a `debug_assert!` so any future violation surfaces in tests.
+- **Implementation summary:** Replaced `for window in indices.windows(2)` with two nested loops (`for i in 0..n / for j in (i+1)..n`) and added `debug_assert!(indices.len() <= 2)` to make the implicit invariant visible.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** Existing pileup suite (54 tests) still passes — no contributor sharing >2 slots in tests, but the `debug_assert!` would fire if one ever did. No new test added because constructing a contrived three-way slot-sharing scenario would need fixture reads that violate spec invariants the upstream filter is supposed to enforce; the value of the change is structural (no silent miscompare), not behavioral.
+- **Files changed:**
+  - `src/per_sample_caller/pileup/walker.rs`
+- **Tests added or modified:** None.
+- **Validation:**
+  - `cargo test --lib pileup` → exit 0, 54 passed
 - **User input:** None.
 - **Follow-up:** None.
 - **Residual risk:** None.
