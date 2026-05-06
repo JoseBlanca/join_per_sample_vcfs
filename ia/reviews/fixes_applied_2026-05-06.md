@@ -48,10 +48,10 @@
 | M3 | Major | `record_widen_events` counter conflates open and widen | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | M4 | Major | Lifecycle marks attach only to first drained record | Ask | Applied with adaptation | Yes | `src/per_sample_caller/pileup/slot_allocator.rs`, `ia/specs/pileup_walker.md` | Pass | No |
 | M5 | Major | `windows(2)` only inspects adjacent contributor pairs | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
-| Mi1 | Minor | `checked_sub.unwrap_or(0)` masks precondition violation | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
-| Mi2 | Minor | `walker_pos == 0` guard is dead code | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
-| Mi3 | Minor | `flush_chromosome` accepts unused `_fasta` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
-| Mi4 | Minor | `from_slot_counters` awkward shape | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| Mi1 | Minor | `checked_sub.unwrap_or(0)` masks precondition violation | Apply | Applied | No | `src/per_sample_caller/pileup/open_record.rs` | Pass | No |
+| Mi2 | Minor | `walker_pos == 0` guard is dead code | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
+| Mi3 | Minor | `flush_chromosome` accepts unused `_fasta` | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
+| Mi4 | Minor | `from_slot_counters` awkward shape | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
 | Mi5 | Minor | `FiveScalars::zero` duplicates `Default::default` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | Mi6 | Minor | `widen` always appends `extra_bases` to every allele | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | Nits | Nit | Clippy errors + small style items | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
@@ -148,6 +148,43 @@
 - **User input:** None.
 - **Follow-up:** None.
 - **Residual risk:** None.
+
+### Mi1 — `checked_sub.unwrap_or(0)` masks precondition violation
+
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The function documents "Events are assumed to be inside the record's footprint." The previous shape silently fabricated `offset = 0` if that precondition was violated; a `debug_assert!` + `saturating_sub` makes the contract loud in tests while behaving identically in release.
+- **Files changed:** `src/per_sample_caller/pileup/open_record.rs`.
+- **Tests:** Existing pileup suite (55 + others) passes.
+- **Validation:** `cargo test --lib` → 145 passed.
+
+### Mi2 — `walker_pos == 0` dead-code guard
+
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** `walker_pos` initialises to 1 and resets to 1 on chromosome change; nothing sets it to 0. Replaced the live early-return guard with a `debug_assert!` so a future regression that violates the invariant trips in tests.
+- **Files changed:** `src/per_sample_caller/pileup/walker.rs`.
+- **Validation:** `cargo test --lib` → 145 passed.
+
+### Mi3 — `flush_chromosome` accepts unused `_fasta`
+
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The `_fasta: &F` parameter was never read; dropped it and its generic, simplifying the signature.
+- **Files changed:** `src/per_sample_caller/pileup/walker.rs` (definition + two call sites).
+- **Validation:** `cargo test --lib` → 145 passed.
+
+### Mi4 — `from_slot_counters` awkward shape
+
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The function ignored most fields of its `Self` parameter, used a workaround `self_` name, and reconstructed the struct by hand. Replaced with a method `merge_slot_counters(self) -> Self` that mutates only the slot-derived fields.
+- **Files changed:** `src/per_sample_caller/pileup/walker.rs`.
+- **Validation:** `cargo test --lib` → 145 passed.
 
 ### M4 — Lifecycle marks attach only to first drained record
 

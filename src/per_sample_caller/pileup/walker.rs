@@ -45,7 +45,7 @@ where
             && state.last_admitted_chrom_id.is_some()
             && state.last_admitted_chrom_id != Some(peek.chrom_id)
         {
-            state.flush_chromosome(fasta, tx)?;
+            state.flush_chromosome(tx)?;
         }
         if let Some(peek) = iter.peek() {
             state.set_chrom_if_needed(peek.chrom_id);
@@ -89,7 +89,7 @@ where
 
     // End of input: flush whatever remains, on whichever
     // chromosome we were on.
-    state.flush_chromosome(fasta, tx)?;
+    state.flush_chromosome(tx)?;
 
     Ok(state.summary())
 }
@@ -108,16 +108,14 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    fn from_slot_counters(self_: Self, slot: SlotAllocatorCounters) -> Self {
-        Self {
-            reads_admitted: self_.reads_admitted,
-            records_emitted: self_.records_emitted,
-            record_widen_events: self_.record_widen_events,
-            mate_overlap_positions: self_.mate_overlap_positions,
-            slot_allocations: slot.slot_allocations,
-            slot_high_water: slot.slot_high_water,
-            mate_lookup_evictions: slot.mate_lookup_evictions,
-        }
+    /// Fold the slot allocator's counters into this summary at
+    /// run-end. The walker tracks reads/records/widens/overlap
+    /// itself; the allocator owns slot bookkeeping.
+    fn merge_slot_counters(mut self, slot: SlotAllocatorCounters) -> Self {
+        self.slot_allocations = slot.slot_allocations;
+        self.slot_high_water = slot.slot_high_water;
+        self.mate_lookup_evictions = slot.mate_lookup_evictions;
+        self
     }
 }
 
@@ -288,9 +286,10 @@ impl WalkerState {
         // contribute. Their last event (if any) was processed at
         // their alignment_end position; once walker advances past
         // that they're done.
-        if self.walker_pos == 0 {
-            return Ok(());
-        }
+        debug_assert!(
+            self.walker_pos > 0,
+            "walker_pos starts at 1 and never decreases below 1",
+        );
         self.active.expire_passed(self.walker_pos, &mut self.slots)
     }
 
@@ -341,11 +340,7 @@ impl WalkerState {
         Ok(())
     }
 
-    fn flush_chromosome<F: RefBaseFetcher>(
-        &mut self,
-        _fasta: &F,
-        tx: &SyncSender<PileupRecord>,
-    ) -> Result<(), WalkerError> {
+    fn flush_chromosome(&mut self, tx: &SyncSender<PileupRecord>) -> Result<(), WalkerError> {
         // Drain remaining open records (anything that was still
         // open at end-of-chromosome is by definition ready to
         // close — there are no future reads on this chromosome).
@@ -376,7 +371,7 @@ impl WalkerState {
     }
 
     fn summary(&self) -> RunSummary {
-        RunSummary::from_slot_counters(self.summary, self.slots.counters())
+        self.summary.merge_slot_counters(self.slots.counters())
     }
 }
 

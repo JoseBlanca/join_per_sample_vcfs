@@ -332,7 +332,13 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[&ReadEvent
     let mut ref_cursor: u32 = 0;
 
     for ev in sorted {
-        let offset = ev.anchor_pos().checked_sub(record_pos).unwrap_or(0);
+        debug_assert!(
+            ev.anchor_pos() >= record_pos,
+            "apply_events_to_ref: event anchor {} below record_pos {}",
+            ev.anchor_pos(),
+            record_pos,
+        );
+        let offset = ev.anchor_pos().saturating_sub(record_pos);
 
         // Emit any REF bases between ref_cursor and the event's
         // offset that haven't been consumed by a previous event.
