@@ -373,6 +373,56 @@ fn mate_overlap_zeroes_lower_bq_contribution() {
 }
 
 #[test]
+fn paired_mate_indel_overlap_yields_single_observation() {
+    // Both mates of a pair report the same insertion at the same
+    // anchor. Per spec §"Mate overlap on indels": treat as one
+    // observation, not two — assign the higher-BQ-proxy event to
+    // the bucket and drop the other. The previous walker zeroed
+    // the loser's BQ but still folded it as a separate
+    // observation.
+    //
+    // Reference AAAACGT (length 7). Both mates' CIGAR is 1M2I5M
+    // → anchor Match at 1, Insertion of 2 bp ("XX") at anchor 1,
+    // five Matches over positions 2..6.
+    let fa = MockFasta::new("AAAACGT");
+    let cigar = vec![CigarOp::Match(1), CigarOp::Insertion(2), CigarOp::Match(5)];
+    let mate_a = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 6,
+        cigar: cigar.clone(),
+        seq: b"AXXAAACG".to_vec(),
+        bq_baq: vec![30; 8],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("p"),
+        is_first_mate: true,
+        has_mate: true,
+    };
+    let mut mate_b = mate_a.clone();
+    mate_b.is_first_mate = false;
+    mate_b.bq_baq = vec![20; 8]; // lower BQ → loser
+
+    let records = drive_walker(vec![mate_a, mate_b], fa);
+    let anchor = records
+        .iter()
+        .find(|r| r.pos == 1)
+        .expect("anchor record at pos 1");
+    let ins = anchor
+        .alleles
+        .iter()
+        .find(|a| a.seq.len() > anchor.ref_span() as usize)
+        .expect("INS allele present");
+    assert_eq!(
+        ins.scalars.num_obs, 1,
+        "indel-overlap collapses to one observation; got {}",
+        ins.scalars.num_obs
+    );
+    // Forward-strand count should also reflect a single observation.
+    assert_eq!(ins.scalars.fwd, 1);
+}
+
+#[test]
 fn record_emits_in_coordinate_order_across_reads() {
     // 100 reads at increasing starts. We just want to verify the
     // emitted record stream is monotonically ordered by pos.

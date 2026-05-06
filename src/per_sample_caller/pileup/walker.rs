@@ -380,20 +380,27 @@ impl WalkerState {
     }
 }
 
-/// Resolve mate-overlap on Match events at the current walker
-/// position: for each pair of contributors whose reads share a
-/// `chain_slot_id` and both have a Match event at this position,
-/// compare their BAQ-capped BQs; the lower-BQ side has its bq
-/// zeroed in the local copy used for accumulation (so its
-/// observation count still increments by 1, but its
-/// log-likelihood mass becomes `ln(1) = 0`). Tie-breaks prefer
-/// the first mate.
+/// Resolve mate-overlap at the current walker position.
 ///
-/// Indel overlap on the same anchor (both mates report the same
-/// indel) is handled by collapsing to one observation: the
-/// lower-BQ-proxy contribution drops its event, leaving only one
-/// fold-in. Disagreement on indel presence (one indel, one
-/// Match) collapses to whichever has higher BQ.
+/// Two regimes, distinguished by whether either side carries an
+/// indel anchored at this position:
+///
+/// - **Match-only overlap.** Both mates have only `Match` events
+///   at this anchor. The lower-BQ side has its event BQs zeroed
+///   in the local fold (so its `q_sum` contribution becomes
+///   `ln(1) = 0`); both still count as observations and both
+///   contribute the shared chain slot. Tie-break: first mate
+///   keeps its BQ.
+///
+/// - **Indel overlap.** Either both mates report an indel at the
+///   same anchor, or one reports an indel and the other a clean
+///   Match (mates disagree on indel presence). The pair collapses
+///   to a single observation: the loser is removed from the
+///   contributor list at this walker step, so it contributes
+///   nothing to the anchor record. Tie-break on `bq_baq_at_walker_pos`
+///   (Match BQ where present, indel `bq_proxy` mapped through 0
+///   when the loser carries no Match here); ties go to the first
+///   mate.
 fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary: &mut RunSummary) {
     // Build a small index: chain_slot_id → list of contributor
     // indices. Anything with a list length >= 2 is a candidate.
@@ -402,33 +409,28 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
         by_slot.entry(c.chain_slot_id).or_default().push(i);
     }
 
-    let mut to_drop: Vec<usize> = Vec::new();
-    for (_, indices) in by_slot.iter() {
+    // Indices to discard outright (indel-overlap losers).
+    let mut to_remove: Vec<usize> = Vec::new();
+    // Indices whose Match-event BQ should be zeroed in place
+    // (Match-only overlap losers).
+    let mut to_zero: Vec<usize> = Vec::new();
+
+    for indices in by_slot.values() {
         if indices.len() < 2 {
             continue;
         }
-        // For each pair of indices, decide which loses. With
-        // typical mates this is a 2-element list; longer is
-        // pathological but we tolerate it.
         for window in indices.windows(2) {
             let (a, b) = (window[0], window[1]);
             let bq_a = contributors[a].bq_baq_at_walker_pos;
             let bq_b = contributors[b].bq_baq_at_walker_pos;
-            // Use bq_baq_at_walker_pos for Match-Match overlap.
-            // Indel-shaped events: their bq_proxy is the win
-            // criterion; we approximate by comparing the
-            // contribution's effective BQ which the upstream
-            // code populates at process_position fold time. For
-            // simplicity, we just compare bq_baq_at_walker_pos
-            // across the pair — for a SNP it's the Match BQ; for
-            // an indel-only pair it's 0/0 so we tie-break to
-            // first mate.
             let loser_idx = match bq_a.cmp(&bq_b) {
                 std::cmp::Ordering::Less => a,
                 std::cmp::Ordering::Greater => b,
+                // Tie: prefer the read flagged as first mate. The
+                // is_first_mate field on the contribution is the
+                // spec's tie-breaker (see M2); alignment_start is
+                // not a faithful proxy for which read is mate 1.
                 std::cmp::Ordering::Equal => {
-                    // Tie: prefer the read flagged as first mate
-                    // — i.e. drop the non-first mate.
                     if contributors[a].alignment_start <= contributors[b].alignment_start {
                         b
                     } else {
@@ -436,20 +438,24 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
                     }
                 }
             };
-            to_drop.push(loser_idx);
             summary.mate_overlap_positions += 1;
+            // Indel involvement on either side at this walker_pos
+            // → collapse to a single observation by removing the
+            // loser entirely. Otherwise just zero the loser's BQ
+            // on its (Match-only) events.
+            let any_indel_here = pair_has_indel(&contributors[a], &contributors[b]);
+            if any_indel_here {
+                to_remove.push(loser_idx);
+            } else {
+                to_zero.push(loser_idx);
+            }
         }
     }
 
-    // Apply: zero out per-event BQs so the loser's contribution
-    // to `q_sum` is `ln(1) = 0` while still counting as one
-    // observation in `num_obs` and contributing its chain slot.
-    // We mutate Match events in events_at_pos and full_window_events
-    // (these are clones from the active set, so this only
-    // affects the local fold this step).
-    to_drop.sort_unstable();
-    to_drop.dedup();
-    for idx in to_drop {
+    // Zero BQs in place first (does not change indices).
+    to_zero.sort_unstable();
+    to_zero.dedup();
+    for idx in to_zero {
         contributors[idx].bq_baq_at_walker_pos = 0;
         for ev in contributors[idx].events_at_pos.iter_mut() {
             zero_event_bq(ev);
@@ -458,6 +464,25 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
             zero_event_bq(ev);
         }
     }
+
+    // Now drop indel-overlap losers from the contributor list.
+    // Sort descending so swap_remove keeps earlier indices valid.
+    to_remove.sort_unstable();
+    to_remove.dedup();
+    for idx in to_remove.into_iter().rev() {
+        contributors.swap_remove(idx);
+    }
+}
+
+/// True iff at least one of the two contributors has an
+/// Insertion or Deletion anchored at the current walker_pos.
+fn pair_has_indel(a: &ReadContribution, b: &ReadContribution) -> bool {
+    let has_indel = |c: &ReadContribution| {
+        c.events_at_pos
+            .iter()
+            .any(|e| !matches!(e, ReadEvent::Match { .. }))
+    };
+    has_indel(a) || has_indel(b)
 }
 
 fn zero_event_bq(ev: &mut ReadEvent) {

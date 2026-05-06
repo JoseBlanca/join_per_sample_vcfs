@@ -42,7 +42,7 @@
 | ID | Severity | Title | Initial decision | Final status | User input | Files changed | Validation | Follow-up |
 |---|---|---|---|---|---|---|---|---|
 | B1 | Blocker | REF re-folded once per walker step inside open record | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
-| B2 | Blocker | Indel mate-overlap doesn't collapse to one observation | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| B2 | Blocker | Indel mate-overlap doesn't collapse to one observation | Apply | Applied | No | `src/per_sample_caller/pileup/{walker,tests}.rs` | Pass | No |
 | M1 | Major | `find_overlapping` early break unsound across heterogeneous spans | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | M3 | Major | `record_widen_events` counter conflates open and widen | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
@@ -87,6 +87,26 @@
 - **User input:** None.
 - **Follow-up:** Phantom-slot residual on a read that switches buckets across compound-event widens (a slot may persist on the bucket the read left, since other reads sharing the slot might still be there). Tests do not currently exercise this; flagged in §11.
 - **Residual risk:** Low for the SNP / single-deletion / pure-REF mixes the existing tests cover. Compound events on a single read crossing walker steps are not exercised; a future test should verify the bucket-switch path.
+
+### B2 — Indel mate-overlap doesn't collapse to one observation
+
+- **Severity:** Blocker
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** Per spec §"Mate overlap on indels" both regimes (same-indel pair, and indel-vs-Match disagreement) collapse to a single observation. Match-only overlap keeps its existing behaviour (loser's BQ zeroed; both still count as observations).
+- **Implementation summary:** `resolve_mate_overlap_at_pos` now classifies each pair's resolution: if either side has an Insertion/Deletion event anchored at this walker_pos (`pair_has_indel`), the loser is removed from the contributor list with `swap_remove` (descending-index pass keeps earlier indices stable); otherwise the loser's BQ is zeroed in place as before.
+- **Review suggestion used verbatim?:** No.
+- **Adaptation:** The review proposed splitting "drop event from loser" vs "zero match BQ"; this fix removes the loser entirely on indel-overlap (matching the stronger spec reading "treat as one observation, not two"). Kept the existing zero-BQ path for Match-only overlap. Tie-breaker change is deferred to M2 (still uses `alignment_start` here pending that fix).
+- **Verification performed:** Added regression test `paired_mate_indel_overlap_yields_single_observation`; failed before fix (INS.num_obs = 2), passed after (INS.num_obs = 1, fwd = 1). All 51 pileup tests pass.
+- **Files changed:**
+  - `src/per_sample_caller/pileup/walker.rs`
+  - `src/per_sample_caller/pileup/tests.rs`
+- **Tests added or modified:** Added `paired_mate_indel_overlap_yields_single_observation`.
+- **Validation:**
+  - `cargo test --lib pileup` → exit 0, 51 passed
+- **User input:** None.
+- **Follow-up:** None for this finding. Tie-breaker still uses `alignment_start` (M2 will fix).
+- **Residual risk:** Low. Match-only overlap path unchanged.
 
 ## 5. Deferred findings to carry forward
 
