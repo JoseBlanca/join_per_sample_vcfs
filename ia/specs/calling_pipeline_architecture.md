@@ -143,15 +143,18 @@ an external dependency and an IO round-trip for no saved work.
    are separated by a `delta_pos` field (distance from the previous
    record), so gaps are represented implicitly and the absence of a
    record unambiguously means "no data."
-8. **Stage 1 is a windowed walker.** Stage 1 cannot finalise a
-   record at position `Q` the moment the walker reaches `Q + 1`,
-   because later reads may still anchor at `Q` and extend its REF
-   span (Stage 2 §"Overlapping events extend the anchor REF"). It
-   holds a bounded buffer of open anchor records and transient
-   per-read state for positions inside the anchor window; the
-   window width `W`, the closure rule, and the handling of
-   out-of-window reads are specified in §"Anchor window and
-   closure" below.
+8. **Stage 1 is a sequential walker with eager closure.** Stage
+   1 holds open per-position records as it walks, because a
+   record at position `Q` may still be widened by later events
+   whose reference footprint reaches back into `Q`'s span
+   (Stage 2 §"Overlapping events extend the anchor REF"). A
+   record is finalised and emitted as soon as the walker has
+   advanced past its full reference footprint — there is no
+   fixed look-back window. Memory is bounded instead via a
+   read-span filter `MAX_RECORD_SPAN` that drops oversize reads
+   upstream; the closure rule, the filter, and the handling of
+   out-of-bound reads are specified in §"Open-record closure
+   and the read-span filter" below.
 
 ### Per-read likelihood quality: BAQ vs. PairHMM vs. trust-the-aligner
 
@@ -227,84 +230,106 @@ This is a modest implementation win (BAQ is ~a few hundred lines
 following Heng Li's 2011 paper) that removes a real-world performance
 bottleneck users have hit with `calmd` in the past.
 
-### Anchor window and closure
+### Open-record closure and the read-span filter
 
-Stage 1 cannot emit each per-position record immediately. An anchor
-at position `Q` may still be extended by later-arriving reads that
-anchor at `Q` (Stage 2 §"Overlapping events extend the anchor
-REF"), and chain ids linking allele observations across positions
-need to track which reads support which alleles in a bounded
-neighbourhood of the walker. Stage 1 is therefore a windowed
-walker.
+Stage 1 cannot emit each per-position record immediately. A
+record at position `Q` with current REF span `s` may still be
+widened by a later-arriving event whose footprint reaches back
+into `[Q, Q + s)` (Stage 2 §"Overlapping events extend the
+anchor REF"), and chain ids linking allele observations across
+positions need to track which reads support which alleles in a
+bounded neighbourhood of the walker. Stage 1 therefore holds a
+small set of open records, finalising each one as soon as the
+walker can prove no future event will touch it.
 
-**Window width `W`.** A fixed cap, configured by
-`--max-anchor-window` (default `5000` bp). Stage 1 holds open
-anchor records and transient per-read state for positions in
-`[walker − W, walker]`.
+**Closure rule.** As the walker advances past position
+`walker`, every open record at position `Q` with current REF
+span `s` and `Q + s ≤ walker` is finalised and emitted to the
+`.psf` writer. The proof of safety: reads arrive
+coordinate-sorted, so any future read has `alignment_start ≥
+walker + 1`; every event's anchor sits at an `M` position of
+its read, so future event anchors are also `≥ walker + 1`; an
+event with anchor `S ≥ walker + 1` can merge into the record
+at `Q` only if its footprint overlaps `[Q, Q + s)`, which
+requires `S < Q + s`; combined with `S ≥ walker + 1`, this
+forces `Q + s > walker`. Once `Q + s ≤ walker`, no future
+event can reach back, and the record is safe to close.
 
-**Closure rule.** As the walker advances past position `walker`,
-every open anchor at position `Q` with `Q + W ≤ walker` is
-finalised and emitted to the `.psf` writer. No further read can
-reach back to `Q`, so the anchor is safe to close.
+In practice this means SNP records (REF span = 1) close one
+walker step after they open; longer compounds and long
+deletions stay open for as many positions as their footprint
+demands; the walker never holds a record open beyond its own
+footprint.
 
-**Reads exceeding the window.** A read whose reference span (CIGAR
-walk length, plus mate gap for paired reads) exceeds `W` is
-**logged and skipped** — counted in the per-sample run summary
-alongside the existing skip categories (low MAPQ, unmapped,
-first-or-last-CIGAR indel, BAQ-rejected). For typical short-read
-data this counter stays at zero; for long-read data with the
-default cap, a non-zero counter signals that
-`--max-anchor-window` should be raised. Skipping rather than
-hard-erroring matches Stage 1's existing posture on unusable
-reads: many other categories of reads are dropped silently
-already, and one more bounded category does not change the
-contract — what matters is that the skip is reported in the
-summary so users can spot it.
+**Read-span filter `MAX_RECORD_SPAN`.** A fixed cap, configured
+by `--max-record-span` (default `5000` bp). A read whose
+reference span (CIGAR walk length, plus mate gap for paired
+reads) exceeds `MAX_RECORD_SPAN` is **logged and skipped** —
+counted in the per-sample run summary alongside the existing
+skip categories (low MAPQ, unmapped, first-or-last-CIGAR
+indel, BAQ-rejected). The filter is what bounds memory: every
+event's footprint extends at most `MAX_RECORD_SPAN` bases past
+its anchor, so no single open record can grow to a span
+larger than `MAX_RECORD_SPAN` from a single read's
+contribution, and walker memory is bounded by
+`O(MAX_RECORD_SPAN × max_concurrent_open_records)`. For
+typical short-read data the filter rarely fires; for
+long-read data with the default cap, a non-zero counter
+signals that `--max-record-span` should be raised. Skipping
+rather than hard-erroring matches Stage 1's existing posture
+on unusable reads: many other categories of reads are dropped
+silently already, and one more bounded category does not
+change the contract — what matters is that the skip is
+reported in the summary so users can spot it.
 
-**Memory bound.** `O(W × max_alleles_per_position ×
-per_allele_record_size + per-read state for in-window reads)` —
-typically a few MB at the default `W = 5000`. Independent of
-cohort size and genome length.
+**Memory bound.** `O(MAX_RECORD_SPAN × max_alleles_per_position
+× per_allele_record_size + per-read state for in-flight
+reads)` — typically a few MB at the default `MAX_RECORD_SPAN
+= 5000`. Independent of cohort size and genome length.
 
-**Anchor extension vs. long single alleles.** Both close at the
-same `walker > Q + W` boundary, but they differ in memory
-profile:
+**Compound extensions vs. long single alleles.** Both close
+under the same per-record footprint rule above, but differ in
+memory profile:
 
-- **Anchor extension** — a compound observation in some read grows
-  an anchor's REF span (e.g. a SNP at 101 on the same read as a
-  deletion spanning 102–105). The compound is by construction
-  spannable by a single read or pair, so it fits inside `W`.
-- **Long single allele** — a long deletion supported by long reads
-  produces a record whose REF length equals the deletion length,
-  with no cross-read state beyond the reads that support that one
-  allele. Memory is `O(longest_allele_in_record)`, independent of
-  cross-read combinatorics.
+- **Compound extension** — a compound observation in some read
+  grows a record's REF span (e.g. a SNP at 101 on the same
+  read as a deletion spanning 102–105). The compound is by
+  construction spannable by a single read or pair, so its
+  footprint fits inside `MAX_RECORD_SPAN`.
+- **Long single allele** — a long deletion supported by long
+  reads produces a record whose REF length equals the
+  deletion length, with no cross-read state beyond the reads
+  that support that one allele. Memory is
+  `O(longest_allele_in_record)`, independent of cross-read
+  combinatorics.
 
 **Chain id reach.** A chain id links allele observations only
-inside the window of the chain's first allele. Once the anchor at
-the chain's first position closes, no further allele can be
-attached to the chain. This pins the cross-position reach of any
-single chain to ≤ `W` bp of reference and gives Stage 5 a
+inside the footprint reach of the chain's first allele. Once
+the record at the chain's first position closes, no further
+allele can be attached to the chain. This pins the
+cross-position reach of any single chain to ≤
+`MAX_RECORD_SPAN` bp of reference and gives Stage 5 a
 deterministic upper bound when reasoning about compound spans
-across samples. A read or pair carrying linkage that would extend
-beyond `W` is split into multiple chains by the producer, each
-spanning ≤ `W` — but in practice any read or pair that fits the
-window cap by definition fits within one chain.
+across samples. A read or pair carrying linkage that would
+extend beyond `MAX_RECORD_SPAN` is split into multiple chains
+by the producer, each spanning ≤ `MAX_RECORD_SPAN` — but in
+practice any read or pair that survives the read-span filter
+by definition fits within one chain.
 
-**Per-read state is transient.** Stage 1 keeps a per-read window
-— which reads support which alleles at which positions — to
-compute anchor extensions and chain ids correctly. This state is
-released as soon as the relevant anchor records close. Per-read
-data does **not** propagate to the `.psf`; the on-disk format
-stores only per-allele scalars and chain ids (Stage 2 §"The five
-per-allele scalars"). The format-level "per-position summary, not
-per-read" property describes the on-disk artefact; Stage 1's
-runtime keeps the minimal per-read window required to produce
-the summaries.
+**Per-read state is transient.** Stage 1 keeps an in-flight
+per-read set — which reads support which alleles at which
+positions — to compute compound extensions and chain ids
+correctly. This state is released as soon as the relevant
+records close. Per-read data does **not** propagate to the
+`.psf`; the on-disk format stores only per-allele scalars and
+chain ids (Stage 2 §"The five per-allele scalars"). The
+format-level "per-position summary, not per-read" property
+describes the on-disk artefact; Stage 1's runtime keeps the
+minimal per-read state required to produce the summaries.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--max-anchor-window N` | `5000` | Hard cap on the anchor window in bp. Reads with reference span exceeding `N` are logged and skipped, and counted in the per-sample run summary. |
+| `--max-record-span N` | `5000` | Hard cap on per-record reference span in bp, enforced via an upstream read-span filter. Reads with reference span exceeding `N` are logged and skipped, and counted in the per-sample run summary. |
 
 ### Related existing draft
 
@@ -449,9 +474,9 @@ event and expresses all observed alts against that extended span —
 freebayes' haplotype-allele convention. The invariant that Stage 2
 records must maintain is: **every allele in a record spans the same
 reference stretch.** The runtime mechanics — when Stage 1 finalises
-an anchor record, what bounds its growth, and how reads exceeding
-the bound are handled — are specified in Stage 1 §"Anchor window
-and closure".
+an open record, what bounds its growth, and how reads exceeding
+the bound are handled — are specified in Stage 1 §"Open-record
+closure and the read-span filter".
 
 **Alt ordering within a record is Stage-1-internal** and carries no
 cohort-level meaning. The merger re-indexes at join time.
