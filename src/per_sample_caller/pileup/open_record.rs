@@ -11,6 +11,8 @@
 
 use std::collections::BTreeMap;
 
+use ahash::AHashMap;
+
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::slot_allocator::SlotId;
@@ -45,6 +47,27 @@ pub struct OpenPileupRecord {
     pub pos: u32,
     pub ref_seq: Vec<u8>,
     pub alleles: Vec<OpenAllele>,
+    /// Per-read fold state — the contribution this record currently
+    /// holds for each read that has folded into it. Used to enforce
+    /// "fold each (record, read) pair exactly once" across walker
+    /// steps: at re-fold time the previous contribution is
+    /// subtracted from its old bucket before the new contribution is
+    /// added to the new bucket. Without this state, a read with
+    /// Match events at every position inside an open record's
+    /// footprint would be re-folded once per walker step inside
+    /// that footprint, multiplying every five-scalar value by
+    /// `ref_span` (B1 in `ia/reviews/pileup_2026-05-06.md`).
+    folded_reads: AHashMap<u32, FoldedReadState>,
+}
+
+/// What a single read currently contributes to one bucket of one
+/// open record. Carries enough state to subtract the contribution
+/// cleanly when the read re-folds (e.g. on widening that grows the
+/// haplotype seq under the record).
+#[derive(Debug, Clone, Copy)]
+struct FoldedReadState {
+    allele_index: usize,
+    contribution: FiveScalars,
 }
 
 impl OpenPileupRecord {
@@ -59,6 +82,7 @@ impl OpenPileupRecord {
             pos,
             ref_seq,
             alleles: vec![ref_allele],
+            folded_reads: AHashMap::new(),
         }
     }
 
@@ -360,17 +384,17 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[&ReadEvent
 }
 
 /// Find or create the allele bucket inside a record matching `seq`.
-/// Returns a mutable reference to the bucket. Linear scan is fine —
-/// records typically have ≤ a few alleles.
-pub fn find_or_create_allele<'a>(
-    rec: &'a mut OpenPileupRecord,
-    seq: Vec<u8>,
-) -> &'a mut OpenAllele {
+/// Returns the bucket index. Linear scan is fine — records
+/// typically carry ≤ a few alleles. Returning the index rather
+/// than `&mut OpenAllele` keeps the `rec` borrow short, so callers
+/// can index into `alleles` and update sibling state (e.g.
+/// `folded_reads`) in the same scope.
+pub fn find_or_create_allele_index(rec: &mut OpenPileupRecord, seq: Vec<u8>) -> usize {
     if let Some(idx) = rec.alleles.iter().position(|a| a.seq == seq) {
-        &mut rec.alleles[idx]
+        idx
     } else {
         rec.alleles.push(OpenAllele::new(seq));
-        rec.alleles.last_mut().expect("just pushed")
+        rec.alleles.len() - 1
     }
 }
 
@@ -434,7 +458,9 @@ pub fn process_position(
     // Step 4-6: for each affected record (in coordinate order),
     // fold each contributor that has events overlapping the
     // record's footprint. Each (record, contributor) pair folds
-    // exactly once.
+    // exactly once across the record's lifetime: re-folds at
+    // later walker steps subtract the prior contribution from
+    // the old bucket before adding the new one.
     affected.sort_unstable();
     for key in affected {
         let (rec_pos, rec_ref_seq) = {
@@ -466,24 +492,63 @@ pub fn process_position(
             let allele_seq = apply_events_to_ref(rec_pos, &rec_ref_seq, &window_events);
             let bq = ln_bq_for_read(&window_events, contrib.bq_baq_at_walker_pos);
             let ln_q = bq.max(contrib.mq_log_err);
+            let new_contribution = FiveScalars {
+                num_obs: 1,
+                q_sum: ln_q,
+                fwd: u32::from(!contrib.is_reverse_strand),
+                placed_left: u32::from(contrib.alignment_start < rec_pos),
+                placed_start: u32::from(contrib.alignment_start == rec_pos),
+            };
 
             let rec = open.records.get_mut(&key).expect("affected key must exist");
-            let allele = find_or_create_allele(rec, allele_seq);
-            allele.scalars.num_obs += 1;
-            allele.scalars.q_sum += ln_q;
-            if !contrib.is_reverse_strand {
-                allele.scalars.fwd += 1;
+            // Subtract any prior contribution this read had to
+            // this record. Re-folds happen when a record widens
+            // and the read's haplotype under the wider span
+            // either changes bucket or stays in the same bucket
+            // with a possibly-different ln_q.
+            if let Some(prev) = rec.folded_reads.remove(&contrib.read_id) {
+                subtract_contribution(
+                    &mut rec.alleles[prev.allele_index].scalars,
+                    &prev.contribution,
+                );
             }
-            if contrib.alignment_start < rec_pos {
-                allele.scalars.placed_left += 1;
-            } else if contrib.alignment_start == rec_pos {
-                allele.scalars.placed_start += 1;
-            }
-            insert_sorted_unique(&mut allele.chain_slots, contrib.chain_slot_id);
+            let new_index = find_or_create_allele_index(rec, allele_seq);
+            add_contribution(&mut rec.alleles[new_index].scalars, &new_contribution);
+            insert_sorted_unique(
+                &mut rec.alleles[new_index].chain_slots,
+                contrib.chain_slot_id,
+            );
+            rec.folded_reads.insert(
+                contrib.read_id,
+                FoldedReadState {
+                    allele_index: new_index,
+                    contribution: new_contribution,
+                },
+            );
         }
     }
 
     Ok(())
+}
+
+fn add_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
+    scalars.num_obs += c.num_obs;
+    scalars.q_sum += c.q_sum;
+    scalars.fwd += c.fwd;
+    scalars.placed_left += c.placed_left;
+    scalars.placed_start += c.placed_start;
+}
+
+fn subtract_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
+    // Saturating-style: an internal-bookkeeping bug that produced
+    // a negative would otherwise wrap silently. Saturate to zero
+    // and rely on the upper invariant (num_obs over the record
+    // total still adds up) to surface mistakes through tests.
+    scalars.num_obs = scalars.num_obs.saturating_sub(c.num_obs);
+    scalars.q_sum -= c.q_sum;
+    scalars.fwd = scalars.fwd.saturating_sub(c.fwd);
+    scalars.placed_left = scalars.placed_left.saturating_sub(c.placed_left);
+    scalars.placed_start = scalars.placed_start.saturating_sub(c.placed_start);
 }
 
 /// Per-read BQ for an allele's quality contribution: min over
@@ -528,6 +593,11 @@ fn insert_sorted_unique(v: &mut Vec<SlotId>, slot: SlotId) {
 /// `process_position`.
 #[derive(Debug, Clone)]
 pub struct ReadContribution {
+    /// Active-set local id of the contributing read. Keys the
+    /// per-record `folded_reads` map so re-folding a read into the
+    /// same record at a later walker step subtracts its prior
+    /// contribution before adding the new one.
+    pub read_id: u32,
     pub chain_slot_id: SlotId,
     /// Events whose anchor *is* this walker_pos (used by step 3
     /// to identify candidate records).
@@ -679,10 +749,11 @@ mod tests {
     #[test]
     fn find_or_create_allele_returns_same_bucket_on_match() {
         let mut rec = OpenPileupRecord::new(0, 100, b"ACG".to_vec());
-        let bucket1 = find_or_create_allele(&mut rec, b"ACT".to_vec());
-        bucket1.scalars.num_obs = 1;
-        let bucket2 = find_or_create_allele(&mut rec, b"ACT".to_vec());
-        assert_eq!(bucket2.scalars.num_obs, 1);
+        let idx1 = find_or_create_allele_index(&mut rec, b"ACT".to_vec());
+        rec.alleles[idx1].scalars.num_obs = 1;
+        let idx2 = find_or_create_allele_index(&mut rec, b"ACT".to_vec());
+        assert_eq!(idx1, idx2);
+        assert_eq!(rec.alleles[idx2].scalars.num_obs, 1);
         // REF + ACT = 2 buckets total.
         assert_eq!(rec.alleles.len(), 2);
     }

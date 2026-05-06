@@ -194,6 +194,67 @@ fn deletion_record_has_extended_ref_span() {
 }
 
 #[test]
+fn deletion_record_does_not_double_count_ref_reads() {
+    // Reference: ACGTAC (positions 1..6).
+    // r1: pure-Match across 1..5 (5M). All REF.
+    // r2: 1M3D1M starting at 2 → Match at 2, Deletion of 3 anchored
+    //     at 2, Match at 6.
+    //
+    // The deletion record at pos=2 widens to span 4 (footprint
+    // [2, 6)). r1 spans the whole record's footprint with REF
+    // bases, so REF.num_obs should be 1 (one ref-spanning read);
+    // before the fix it was 4 because r1 was re-folded once per
+    // walker step inside the open record's footprint, multiplying
+    // every five-scalar value by ref_span.
+    let fa = MockFasta::new("ACGTAC");
+    let r1 = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 5,
+        cigar: vec![CigarOp::Match(5)],
+        seq: b"ACGTA".to_vec(),
+        bq_baq: vec![30; 5],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r1"),
+        is_first_mate: true,
+        has_mate: false,
+    };
+    let r2 = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 2,
+        alignment_end: 6,
+        cigar: vec![CigarOp::Match(1), CigarOp::Deletion(3), CigarOp::Match(1)],
+        seq: b"CC".to_vec(),
+        bq_baq: vec![30; 2],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r2"),
+        is_first_mate: true,
+        has_mate: false,
+    };
+    let records = drive_walker(vec![r1, r2], fa);
+    let anchor = records
+        .iter()
+        .find(|r| r.pos == 2)
+        .expect("anchor at deletion's preceding base");
+    assert_eq!(anchor.ref_span(), 4, "anchor + 3 deleted = 4");
+    let ref_allele = &anchor.alleles[0];
+    assert_eq!(
+        ref_allele.scalars.num_obs, 1,
+        "REF: 1 obs from r1 only; got {}",
+        ref_allele.scalars.num_obs
+    );
+    assert_eq!(ref_allele.scalars.fwd, 1, "REF: forward strand count = 1");
+    let del = anchor
+        .alleles
+        .iter()
+        .find(|a| a.seq.as_slice() == b"C")
+        .expect("DEL allele = anchor base only");
+    assert_eq!(del.scalars.num_obs, 1, "DEL: 1 obs from r2");
+}
+
+#[test]
 fn insertion_record_has_alt_longer_than_ref() {
     // Reference AAAACGT. Read 1M2I5M = 1 M at pos 1 ("A"), 2-base
     // insertion ("XX"), 5 M from pos 2.

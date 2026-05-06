@@ -228,6 +228,7 @@ impl WalkerState {
                 .unwrap_or(0);
 
             contributors.push(ReadContribution {
+                read_id: active.read_id,
                 chain_slot_id: active.chain_slot_id,
                 events_at_pos: events_at_pos.clone(),
                 full_window_events: active.events.clone(),
