@@ -186,21 +186,20 @@ impl OpenPileupRecordTable {
         // Candidates are records whose anchor `Q ≤ event_start`
         // (any record opened to the right of the event's start
         // would have its footprint start ≥ event_end > event_start
-        // — they can't overlap). Scan from the largest Q ≤
-        // event_start downward and return the first whose footprint
-        // reaches into the event.
-        for (&q, rec) in self.records.range(..=event_start).rev() {
+        // — they can't overlap). The search range is bounded by
+        // `MAX_RECORD_SPAN`: a record's footprint can extend at
+        // most `MAX_RECORD_SPAN` past its anchor, so any record
+        // anchored before `event_start - MAX_RECORD_SPAN` cannot
+        // reach `event_start`. Heterogeneous spans coexist (a
+        // wide deletion record may stay open while shorter records
+        // open and close around it), so an early break at the
+        // first record whose footprint ends at or before
+        // `event_start` would miss a wide earlier record sitting
+        // behind a narrow intermediate one.
+        let lo = event_start.saturating_sub(MAX_RECORD_SPAN);
+        for (&q, rec) in self.records.range(lo..=event_start).rev() {
             if rec.footprint_end_exclusive() > event_start && q < event_end {
                 return Some(q);
-            }
-            // If this record's footprint ends at or before
-            // event_start, no earlier record's footprint can reach
-            // event_start either (footprints are bounded by
-            // MAX_RECORD_SPAN; in practice we'd still need to walk
-            // a couple back to be safe, but for correctness we
-            // just terminate the search).
-            if rec.footprint_end_exclusive() <= event_start {
-                break;
             }
         }
         None
@@ -699,6 +698,25 @@ mod tests {
         // Event at pos 6 with span 1 — does NOT overlap (touching, not overlapping).
         let key = t.find_overlapping(6, 7);
         assert_eq!(key, None);
+    }
+
+    #[test]
+    fn find_overlapping_walks_past_intermediate_narrow_record_to_wide_one() {
+        // Two open records:
+        //   - wide deletion at pos 5, span 50 → footprint [5, 55)
+        //   - narrow SNP at pos 40, span 1 → footprint [40, 41)
+        // Query for an event at pos 41 with span 1: the wide
+        // record's footprint reaches into 41, so the answer must
+        // be Some(5). The previous early-break terminated at the
+        // narrow record because its footprint ends at 41 (≤ 41),
+        // missing the wide record entirely.
+        let mut t = OpenPileupRecordTable::new();
+        let chrom = "A".repeat(60);
+        let f = fa(&chrom);
+        t.open_new(0, 5, 50, &f).unwrap();
+        t.open_new(0, 40, 1, &f).unwrap();
+        let key = t.find_overlapping(41, 42);
+        assert_eq!(key, Some(5), "wide record at 5 must be found");
     }
 
     #[test]

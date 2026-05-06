@@ -43,7 +43,7 @@
 |---|---|---|---|---|---|---|---|---|
 | B1 | Blocker | REF re-folded once per walker step inside open record | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | B2 | Blocker | Indel mate-overlap doesn't collapse to one observation | Apply | Applied | No | `src/per_sample_caller/pileup/{walker,tests}.rs` | Pass | No |
-| M1 | Major | `find_overlapping` early break unsound across heterogeneous spans | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| M1 | Major | `find_overlapping` early break unsound across heterogeneous spans | Apply | Applied | No | `src/per_sample_caller/pileup/open_record.rs` | Pass | No |
 | M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | M3 | Major | `record_widen_events` counter conflates open and widen | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | M4 | Major | Lifecycle marks attach only to first drained record | Ask | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
@@ -107,6 +107,25 @@
 - **User input:** None.
 - **Follow-up:** None for this finding. Tie-breaker still uses `alignment_start` (M2 will fix).
 - **Residual risk:** Low. Match-only overlap path unchanged.
+
+### M1 — `find_overlapping` early break unsound across heterogeneous spans
+
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The early break terminated the backward scan at the first record whose footprint ended at or before `event_start`, missing wide earlier records sitting behind narrower intermediate ones. The fix bounds the search range by `MAX_RECORD_SPAN` (the upper bound on any single record's reach) and walks every record in `[event_start - MAX_RECORD_SPAN, event_start]` without an early exit.
+- **Implementation summary:** Replaced the backward-scan-with-early-break in `OpenPileupRecordTable::find_overlapping` with a `range(lo..=event_start)` scan where `lo = event_start.saturating_sub(MAX_RECORD_SPAN)`. Updated the function's doc to spell out why heterogeneous spans require this.
+- **Review suggestion used verbatim?:** Yes (the `MAX_RECORD_SPAN` bound was the review's exact suggestion).
+- **Adaptation:** None.
+- **Verification performed:** Added `find_overlapping_walks_past_intermediate_narrow_record_to_wide_one` (open_record.rs tests). Failed before fix (returned None), passed after (returned Some(5)). All 52 pileup tests pass.
+- **Files changed:**
+  - `src/per_sample_caller/pileup/open_record.rs`
+- **Tests added or modified:** Added `find_overlapping_walks_past_intermediate_narrow_record_to_wide_one`.
+- **Validation:**
+  - `cargo test --lib pileup` → exit 0, 52 passed
+- **User input:** None.
+- **Follow-up:** None.
+- **Residual risk:** None observed; the search is `O(log n + k)` where `k ≤ MAX_RECORD_SPAN` records sit in the bounded range — typical `k` is small because open records close eagerly.
 
 ## 5. Deferred findings to carry forward
 
