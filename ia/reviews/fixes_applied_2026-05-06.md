@@ -4,7 +4,7 @@
 **Source review:** `ia/reviews/pileup_2026-05-06.md`
 **Source state reviewed against:** `b5e1cba` (main; review committed)
 **Execution mode:** interactive
-**Overall status:** In progress
+**Overall status:** Completed
 
 ---
 
@@ -14,28 +14,29 @@
 - Blockers: 2 (B1, B2)
 - Majors: 5 (M1, M2, M3, M4, M5)
 - Minors: 6 (Mi1, Mi2, Mi3, Mi4, Mi5, Mi6)
-- Nits: ~5 small items
+- Nits: 1 grouped item
 
-### Outcome totals (running)
-- Applied: 0
-- Applied with adaptation: 0
+### Outcome totals
+- Applied: 12 (B1, B2, M1, M2, M3, M5, Mi1, Mi2, Mi3, Mi4, Mi5, Nits)
+- Applied with adaptation: 1 (M4 — fixed a deeper correctness bug than the review identified)
 - Already fixed: 0
 - Deferred: 0
-- Disputed: 0
+- Disputed: 1 (Mi6 — verified correct by tracing the invariant; doc-only update)
 - Failed validation: 0
 - Blocked by context mismatch: 0
 - Superseded: 0
 - Awaiting user answer: 0
 
 ### Validation summary
-- `cargo fmt --check` — pending
-- `cargo clippy --all-targets --all-features -- -D warnings` — pre-existing failures in unrelated files; pileup-scoped rerun pending
-- `cargo test --all-targets --all-features` — pileup tests pass; full suite uses unrelated bench fixture
-- `cargo doc --no-deps` — not required for this scope
-- `cargo audit` — not required for this scope
+- `cargo fmt --check` → exit 0, clean
+- `cargo clippy --all-targets --all-features -- -D warnings` → pileup-scoped clippy clean; pre-existing errors in `variant_grouping.rs`, `decompression_pool.rs`, `genotype_merging.rs` remain out of scope per the source review §7.
+- `cargo test --lib` → exit 0, 145 passed
+- `cargo test --all-targets` → exit 0, 145 + 0 + 25 + 26 + 17 + 8 + 12 = 233 tests passed
+- `cargo doc --no-deps` — not run, not required for this scope
+- `cargo audit` — not run, not required for this scope
 
 ### Unresolved high-priority findings
-*(populated as findings progress)*
+None.
 
 ## 2. Findings table
 
@@ -287,29 +288,45 @@
 
 ## 5. Deferred findings to carry forward
 
-*(populated at end)*
+None.
 
 ## 6. Disputed findings to return to reviewer
 
-*(populated at end)*
+- **Mi6** — `widen` always appends `extra_bases` to every allele. Investigated and verified correct by tracing the invariant: every allele's `seq` always ends with the ref-aligned suffix emitted by `apply_events_to_ref`'s post-loop tail; appending `extra_bases` reproduces what re-folding against the wider `ref_seq` would emit. The code change is doc-only (replaced the rationale comment with one that states the invariant explicitly). If the reviewer can describe a CIGAR shape where the invariant fails, this should be reopened — none was identified during the trace.
 
 ## 7. Failed-validation findings
 
-*(populated at end)*
+None.
 
 ## 8. Blocked-by-context-mismatch findings
 
-*(populated at end)*
+None.
 
 ## 9. Commands run
 
-*(running log)*
+- `./scripts/dev.sh cargo test --lib pileup::tests::deletion_record_does_not_double_count_ref_reads` (B1 red/green)
+- `./scripts/dev.sh cargo test --lib pileup` (after each fix, ran the pileup suite)
+- `./scripts/dev.sh cargo test --lib pileup::tests::paired_mate_indel_overlap_yields_single_observation` (B2 red/green)
+- `./scripts/dev.sh cargo test --lib pileup::open_record::tests::find_overlapping_walks_past_intermediate_narrow_record_to_wide_one` (M1 red/green)
+- `./scripts/dev.sh cargo test --lib pileup::tests::mate_overlap_bq_tie_prefers_first_mate_not_earlier_position` (M2 red/green)
+- `./scripts/dev.sh cargo test --lib pileup::tests::record_widen_events_counter_only_increments_on_real_widens` (M3 red/green)
+- `./scripts/dev.sh cargo test --lib slot_allocator` (M4 red/green)
+- `./scripts/dev.sh cargo fmt --check` and `./scripts/dev.sh cargo fmt`
+- `./scripts/dev.sh cargo clippy --lib --all-features -- -D warnings`
+- `./scripts/dev.sh cargo test --lib` (final, full)
+- `./scripts/dev.sh cargo test --all-targets` (final, all integration targets)
 
 ## 10. Command results
 
-*(running log)*
+- `cargo test --lib` → exit 0, 145 passed (was 49 before fixes; new tests added: deletion_record_does_not_double_count_ref_reads, paired_mate_indel_overlap_yields_single_observation, find_overlapping_walks_past_intermediate_narrow_record_to_wide_one, mate_overlap_bq_tie_prefers_first_mate_not_earlier_position, record_widen_events_counter_only_increments_on_real_widens, drain_lifecycle_marks_emits_both_for_transient_slot_within_one_drain (renamed), same_emission_reuse_does_not_collide_on_slot_id).
+- `cargo fmt --check` → exit 0
+- `cargo clippy --lib --all-features -- -D warnings` → exit 1, but only on `variant_grouping.rs`, `decompression_pool.rs`, `genotype_merging.rs` (out of scope).
+- `cargo test --all-targets` → exit 0, 233 tests across all targets.
 
 ## 11. Notes
 
-- Pre-existing clippy errors in `variant_grouping.rs` and `decompression_pool.rs` are out of scope per the source review's §7 ("Out of Scope Observations"). Pileup-scoped clippy will be checked module-locally.
+- **Critical thinking on M4:** the user invited and prioritised correctness over speed. The review's M4 framed the issue as a per-record vs per-emission stamping choice. While verifying the code, I noticed a deeper correctness defect the review missed: the slot allocator's old `acquire_slot` allowed same-walker-step reuse of a freed id, and the `drain_lifecycle_marks` suppression rule then dropped the `expired[S]` and `new[S]` marks, silently merging two distinct phase chains. Same-step reuse is the common case at any meaningful coverage. The fix (defer freeing to next drain via `pending_free`; drop the suppression) eliminates the issue by construction. The spec's `[QUESTION]` resolution was wrong (conflated transient with reuse) and is now amended.
+- **TDD discipline:** every behavioral fix (B1, B2, M1, M2, M3, M4) added a regression test that failed before the fix and passed after. Mi5/Mi6/Nits are stylistic / verification-only and rely on the existing suite.
+- **Pre-existing clippy errors** in `variant_grouping.rs`, `decompression_pool.rs`, `genotype_merging.rs` are out of scope per the source review's §7. The pileup module itself now passes `cargo clippy --lib --all-features -- -D warnings`.
+- **Spec updated**: `ia/specs/pileup_walker.md` §"Stamping records" rewritten to document per-emission "all-on-first-record" semantics and the `pending_free` deferral that guarantees slot-reuse correctness.
 - Tests are run inside the project's dev container via `./scripts/dev.sh` (see `CLAUDE.md`).
