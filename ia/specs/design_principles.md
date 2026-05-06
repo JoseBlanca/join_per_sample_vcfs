@@ -4,6 +4,8 @@ A few commitments shape both this specification and the code that will
 implement it. They take precedence when a concrete design decision is
 ambiguous.
 
+### General principles
+
 1. **Clarity and readability are paramount.** They apply equally to
    this specification and to the code that implements it — not one more
    than the other. A reader new to the project should be able to
@@ -29,34 +31,21 @@ ambiguous.
      rule, not a numerology rule: the question to ask is "would a
      reader meeting this literal know what it means?", not "is this
      a number?".
-   - *Readability over name length — especially for private items.*
-     When the choice is between a short name that needs the type,
-     the doc comment, or surrounding code to be understood, and a
-     longer name that says what the thing is directly, take the
-     longer name. Public API names earn a small abbreviation budget
-     because they appear at many call sites and stretch into
-     headers; private names earn essentially none — a few extra
-     characters per use site cost nothing, and never having to
-     wonder "what is this?" pays off on every review. Concretely:
-     `ReadFingerprintWithSourceFile` over `WindowEntry`,
-     `per_file_prev_locus` over `prev_per_file`,
-     `record_streams` over `peekers`. The test is "would a reader
-     hitting this identifier cold know what it is, without looking
-     elsewhere?", not "is this name long?".
    - *Type and field doc comments lead with shape, then add why.*
      The first sentence on a type alias, struct, or field
      describes what the value *is* — its shape, what its parts
      mean, what equality means, what invariants hold. The why
      (algorithmic role, design rationale, lifecycle) follows in
      subsequent sentences, only when it would surprise a reader
-     who already understood the shape. This parallels principle 7:
-     just as the type *name* describes shape, so does its doc
-     comment. The inline-comment rule above — *why* not *what* —
-     is unchanged: it's about `//` annotations next to executable
-     lines, where the surrounding code already shows what's
-     happening. Doc comments on type-level declarations are the
-     opposite case: there is no surrounding code to read the
-     *what* off, so the comment supplies it.
+     who already understood the shape. This parallels the naming
+     rule that *type names* describe shape (see Naming
+     conventions): just as the type name describes shape, so does
+     its doc comment. The inline-comment rule above — *why* not
+     *what* — is unchanged: it's about `//` annotations next to
+     executable lines, where the surrounding code already shows
+     what's happening. Doc comments on type-level declarations
+     are the opposite case: there is no surrounding code to read
+     the *what* off, so the comment supplies it.
    - *In design-explaining doc comments, prefer plain English to
      Rust jargon.* When a comment explains a tradeoff — why
      owned rather than borrowed, why heap-allocated, why this
@@ -130,25 +119,16 @@ ambiguous.
      another CRAM library — or noodles changes its record type
      across a major release — only the conversion helper changes;
      downstream stages and external callers do not.
-   - *At internal layer transitions, prefix raw dependency-type
-     bindings with the library name.* When private code holds a
-     third-party value about to be wrapped by project code, the
-     prefix (`noodles_cram_reader` rather than `cram_reader`)
-     makes the layer transition visible: "this is the raw object,
-     about to enter our own layer." Once wrapped, the project-
-     named wrapper carries the layer identity. Concrete instance:
-     in `CramMergedReader::new`, both `noodles_cram_reader` and
-     `noodles_sam_header` are noodles types about to be moved
-     into `OwnedCramRecords`; the prefix announces "not yet
-     inside project ownership." This is a private-code convention
-     only — public APIs still don't expose dependency types per
-     the rule above.
    - *Not an absolute rule either.* For types that are genuinely
      standard across the ecosystem (`std::path::Path`,
      `std::io::Read`, integer types) the wrapping is pointless. The
      test is "is this type effectively part of the dependency's
      identity, or is it a vocabulary term shared by everyone in the
      domain?". Wrap the former; pass the latter through.
+
+   The naming convention for the boundary itself — prefixing raw
+   dependency-typed bindings with the library name at the layer
+   transition — is in the Naming conventions section.
 
 6. **Typed errors at module boundaries; anyhow context at the program
    edge.** Principle 3 says errors must not pass silently. This one is
@@ -185,16 +165,24 @@ ambiguous.
      The split is a guideline for places where both layers genuinely
      exist.
 
-7. **Type names describe data shapes; variable and field names
-   might describe roles.** A type alias or struct should name *what the
-   value is*, not what it's used for. Roles could live on the binding
-   (variable, field, argument), where surrounding context already
-   constrains their meaning. The same data shape often plays
-   different roles in different parts of the code; a shape-named
-   type composes naturally with `Option` / `Vec` / `HashMap` to
-   express presence, multiplicity, or keying at the storage site,
-   while a role-named type stops being usable the moment a second
-   use site appears.
+### Naming conventions
+
+These are concrete naming practices that put the general principles
+above into action — especially principle 1 (clarity) and principle 5
+(don't leak dependency shapes). They live in their own section
+because they recur across many concrete decisions and are easier to
+find here than scattered through the principles.
+
+1. **Type names describe data shapes; variable and field names
+   might describe roles.** A type alias or struct should name *what
+   the value is*, not what it's used for. Roles could live on the
+   binding (variable, field, argument), where surrounding context
+   already constrains their meaning. The same data shape often
+   plays different roles in different parts of the code; a
+   shape-named type composes naturally with `Option` / `Vec` /
+   `HashMap` to express presence, multiplicity, or keying at the
+   storage site, while a role-named type stops being usable the
+   moment a second use site appears.
    - *Example:* the CRAM merge's `type Locus = (usize, u64)` —
      contig-list index plus 1-based position — appears in three
      different roles: `per_file_prev_locus: Vec<Option<Locus>>`
@@ -222,3 +210,41 @@ ambiguous.
      no reuse cost to pay. The test is "would this shape have an
      independent meaning if it appeared somewhere else?", not "is
      this a tuple?".
+
+2. **Readability over name length — especially for private items.**
+   When the choice is between a short name that needs the type, the
+   doc comment, or surrounding code to be understood, and a longer
+   name that says what the thing is directly, take the longer name.
+   Public API names earn a small abbreviation budget because they
+   appear at many call sites and stretch into headers; private names
+   earn essentially none — a few extra characters per use site cost
+   nothing, and never having to wonder "what is this?" pays off on
+   every review. Concretely: `ReadFingerprintWithSourceFile` over
+   `WindowEntry`, `per_file_prev_locus` over `prev_per_file`,
+   `record_streams` over `peekers`. The test is "would a reader
+   hitting this identifier cold know what it is, without looking
+   elsewhere?", not "is this name long?".
+
+3. **At internal layer transitions, prefix raw dependency-type
+   bindings with the library name.** When private code holds a
+   third-party value about to be wrapped by project code, the prefix
+   (`noodles_cram_reader` rather than `cram_reader`) makes the layer
+   transition visible: "this is the raw object, about to enter our
+   own layer." Once wrapped, the project-named wrapper carries the
+   layer identity. Concrete instance: in `CramMergedReader::new`,
+   both `noodles_cram_reader` and `noodles_sam_header` are noodles
+   types about to be moved into `OwnedCramRecords`; the prefix
+   announces "not yet inside project ownership." This is a private-
+   code convention only — public APIs still don't expose dependency
+   types per principle 5.
+
+4. **Type and field doc comments lead with shape, then add why.**
+   The first sentence on a type alias, struct, or field describes
+   what the value *is* — its shape, what its parts mean, what
+   equality means, what invariants hold. The why follows only when
+   it would surprise a reader who already understood the shape.
+   This is the natural parallel to item 1 above: just as the type
+   *name* describes shape, so does its doc comment. (The full
+   version of this rule, including how it interacts with the
+   inline-comment "why not what" rule, lives under principle 1 in
+   General principles.)
