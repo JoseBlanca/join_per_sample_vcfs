@@ -347,6 +347,67 @@ fn paired_mates_share_chain_slot_id() {
 }
 
 #[test]
+fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
+    // Two paired mates overlapping at the same anchor with the
+    // SAME alignment_start and the SAME BAQ-capped BQ. Distinguish
+    // them by mq_log_err so the kept-mate's contribution to q_sum
+    // is identifiable. Per spec §"Tie-breaking and disagreement":
+    // BQ tie → prefer mate 1 (the read with `is_first_mate`).
+    //
+    // The previous tie-break used `alignment_start` and dropped
+    // contributor `b` arbitrarily on equal starts, so the
+    // is_first_mate flag was ignored.
+    let fa = MockFasta::new("ACG");
+    let m_first = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 3,
+        cigar: vec![CigarOp::Match(3)],
+        seq: b"ACG".to_vec(),
+        bq_baq: vec![30; 3],
+        mq_log_err: -2.0, // distinct mq_log_err for the kept mate
+        is_reverse_strand: false,
+        qname: Arc::from("p"),
+        is_first_mate: true,
+        has_mate: true,
+    };
+    let m_second = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 3,
+        cigar: vec![CigarOp::Match(3)],
+        seq: b"ACG".to_vec(),
+        bq_baq: vec![30; 3],
+        mq_log_err: -10.0, // distinct mq_log_err for the loser
+        is_reverse_strand: false,
+        qname: Arc::from("p"),
+        is_first_mate: false,
+        has_mate: true,
+    };
+    // First-mate appears AFTER the second mate in the input stream,
+    // even though both have alignment_start = 1, to make sure the
+    // tie-break is decided by is_first_mate rather than by stream
+    // order or alignment_start.
+    let records = drive_walker(vec![m_second, m_first], fa);
+    let rec = &records[0];
+    assert_eq!(rec.alleles[0].scalars.num_obs, 2);
+    // Kept mate's contribution = max(ln_BQ(Q=30), -2.0) ≈ -2.0.
+    // Zeroed mate contributes max(ln(1)=0, -10.0) = 0.
+    // Sum ≈ -2.0. If the tie-break wrongly kept mate 2, sum would
+    // be max(0, -10.0) + max(ln_BQ, -2.0) ≈ -2.0 too — but the
+    // distinguishable case here is the chain_slot count: kept
+    // mate's bq is non-zero, ln_q ≈ -2.0; loser's ln_q = 0 from
+    // its zeroed BQ AND -10 mq, so its contribution to q_sum = 0.
+    // Net q_sum ≈ -2.0, NOT ≈ -10.0 (which would be the case if
+    // the tie-break wrongly kept mate 2).
+    assert!(
+        rec.alleles[0].scalars.q_sum > -3.0 && rec.alleles[0].scalars.q_sum < -1.0,
+        "q_sum ≈ -2.0 (first mate kept); got {}",
+        rec.alleles[0].scalars.q_sum
+    );
+}
+
+#[test]
 fn mate_overlap_zeroes_lower_bq_contribution() {
     // Two paired mates overlapping at the same position with
     // different BAQ-capped BQs. Higher BQ wins; lower contributes

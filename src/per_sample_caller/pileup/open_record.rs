@@ -612,6 +612,10 @@ pub struct ReadContribution {
     pub mq_log_err: f64,
     pub is_reverse_strand: bool,
     pub alignment_start: u32,
+    /// SAM flag `0x40`. The deterministic tie-breaker on
+    /// equal-BQ mate-overlap positions per the spec; not a faithful
+    /// proxy for "earlier alignment_start".
+    pub is_first_mate: bool,
 }
 
 /// Apply slot lifecycle markers from the slot allocator to the

@@ -236,6 +236,7 @@ impl WalkerState {
                 mq_log_err: active.read.mq_log_err,
                 is_reverse_strand: active.read.is_reverse_strand,
                 alignment_start: active.read.alignment_start,
+                is_first_mate: active.read.is_first_mate,
             });
         }
 
@@ -426,15 +427,24 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
             let loser_idx = match bq_a.cmp(&bq_b) {
                 std::cmp::Ordering::Less => a,
                 std::cmp::Ordering::Greater => b,
-                // Tie: prefer the read flagged as first mate. The
-                // is_first_mate field on the contribution is the
-                // spec's tie-breaker (see M2); alignment_start is
-                // not a faithful proxy for which read is mate 1.
+                // Tie: prefer the read flagged as first mate.
+                // If both or neither carry is_first_mate, fall
+                // back to alignment_start (deterministic across
+                // input reorderings since paired mates always
+                // share a slot in pairs of two).
                 std::cmp::Ordering::Equal => {
-                    if contributors[a].alignment_start <= contributors[b].alignment_start {
-                        b
-                    } else {
-                        a
+                    let a_first = contributors[a].is_first_mate;
+                    let b_first = contributors[b].is_first_mate;
+                    match (a_first, b_first) {
+                        (true, false) => b,
+                        (false, true) => a,
+                        _ => {
+                            if contributors[a].alignment_start <= contributors[b].alignment_start {
+                                b
+                            } else {
+                                a
+                            }
+                        }
                     }
                 }
             };

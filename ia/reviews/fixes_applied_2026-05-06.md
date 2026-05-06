@@ -44,7 +44,7 @@
 | B1 | Blocker | REF re-folded once per walker step inside open record | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | B2 | Blocker | Indel mate-overlap doesn't collapse to one observation | Apply | Applied | No | `src/per_sample_caller/pileup/{walker,tests}.rs` | Pass | No |
 | M1 | Major | `find_overlapping` early break unsound across heterogeneous spans | Apply | Applied | No | `src/per_sample_caller/pileup/open_record.rs` | Pass | No |
-| M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | M3 | Major | `record_widen_events` counter conflates open and widen | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | M4 | Major | Lifecycle marks attach only to first drained record | Ask | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
 | M5 | Major | `windows(2)` only inspects adjacent contributor pairs | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
@@ -126,6 +126,27 @@
 - **User input:** None.
 - **Follow-up:** None.
 - **Residual risk:** None observed; the search is `O(log n + k)` where `k ≤ MAX_RECORD_SPAN` records sit in the bounded range — typical `k` is small because open records close eagerly.
+
+### M2 — Mate-overlap tie-break uses `alignment_start`, not `is_first_mate`
+
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The spec says "BQ tie: prefer mate 1 (flag `0x40`, `is_first_mate` set)". The contribution didn't carry `is_first_mate` so the walker substituted `alignment_start` and broke ties on position. Adding the field and using it directly is a one-field plumbing change.
+- **Implementation summary:** Added `is_first_mate: bool` to `ReadContribution`; populated from `active.read.is_first_mate` in `walker.rs::process_position`; the tie branch in `resolve_mate_overlap_at_pos` now keeps the contributor with `is_first_mate == true`. Falls back to `alignment_start` only when both or neither carry the flag (defensive — paired mates by SAM convention have exactly one mate-1).
+- **Review suggestion used verbatim?:** Yes (the field-plumbing shape).
+- **Adaptation:** Kept the `alignment_start` path as a defensive fallback for the impossible-but-let's-not-panic "both or neither is_first_mate" case.
+- **Verification performed:** Added `mate_overlap_bq_tie_prefers_first_mate_not_earlier_position` (tests.rs). With first-mate appearing AFTER second-mate in the input stream and identical `alignment_start`, the previous code dropped first-mate's contribution and `q_sum ≈ -6.9`; after the fix, first-mate is kept and `q_sum ≈ -2.0`. All 53 pileup tests pass.
+- **Files changed:**
+  - `src/per_sample_caller/pileup/open_record.rs`
+  - `src/per_sample_caller/pileup/walker.rs`
+  - `src/per_sample_caller/pileup/tests.rs`
+- **Tests added or modified:** Added `mate_overlap_bq_tie_prefers_first_mate_not_earlier_position`.
+- **Validation:**
+  - `cargo test --lib pileup` → exit 0, 53 passed
+- **User input:** None.
+- **Follow-up:** None.
+- **Residual risk:** None.
 
 ## 5. Deferred findings to carry forward
 
