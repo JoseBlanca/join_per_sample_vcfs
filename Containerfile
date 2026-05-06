@@ -26,6 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Rust components not included in the base image's minimal profile.
+RUN rustup component add rustfmt clippy
+
 # Claude Code CLI, used when the container hosts an agent session.
 RUN npm install -g @anthropic-ai/claude-code
 
@@ -44,4 +47,6 @@ RUN mkdir -p src benches \
     && rm -rf src benches
 
 WORKDIR /work
+COPY scripts/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/container-entrypoint.sh"]
 CMD ["bash"]
