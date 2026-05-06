@@ -249,19 +249,18 @@ impl WalkerState {
         resolve_mate_overlap_at_pos(&mut contributors, &mut self.summary);
 
         // Step 3–6: fold contributors into the records affected at
-        // this walker_pos.
-        let span_before: u32 = self.open.iter().map(|(_, r)| r.ref_span()).sum();
-        process_position(
+        // this walker_pos. The returned outcome counts only the
+        // records that *widened* during this call — fresh opens
+        // and re-finds against an already-large-enough footprint
+        // do not count.
+        let outcome = process_position(
             &mut self.open,
             walker_pos,
             self.chrom_id,
             &contributors,
             fasta,
         )?;
-        let span_after: u32 = self.open.iter().map(|(_, r)| r.ref_span()).sum();
-        if span_after > span_before {
-            self.summary.record_widen_events += 1;
-        }
+        self.summary.record_widen_events += outcome.widen_count;
 
         Ok(())
     }

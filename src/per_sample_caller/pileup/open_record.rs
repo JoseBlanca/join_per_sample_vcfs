@@ -213,19 +213,24 @@ impl OpenPileupRecordTable {
     /// keep their existing length, expressing "more bases deleted
     /// relative to the wider REF" — see
     /// `ia/specs/pileup_walker.md` §"Step 4.2".
+    ///
+    /// Returns `true` when the record actually widened; `false`
+    /// when `new_end_exclusive` was already covered (no-op).
+    /// Callers use the bool to count real widen events without
+    /// conflating them with fresh `open_new` calls.
     fn widen(
         &mut self,
         key: u32,
         new_end_exclusive: u32,
         fasta: &dyn RefBaseFetcher,
-    ) -> Result<(), WalkerError> {
+    ) -> Result<bool, WalkerError> {
         let rec = self
             .records
             .get_mut(&key)
             .expect("widen called on absent record");
         let old_end = rec.footprint_end_exclusive();
         if new_end_exclusive <= old_end {
-            return Ok(());
+            return Ok(false);
         }
         let extra_len = new_end_exclusive - old_end;
         if (new_end_exclusive - rec.pos) > MAX_RECORD_SPAN {
@@ -272,7 +277,7 @@ impl OpenPileupRecordTable {
             // those bases as modified).
             allele.seq.extend_from_slice(&extra_bases);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Open a fresh record at `pos` with REF span `span`, fetching
@@ -424,8 +429,9 @@ pub fn process_position(
     chrom_id: u32,
     contributors: &[ReadContribution],
     fasta: &dyn RefBaseFetcher,
-) -> Result<(), WalkerError> {
+) -> Result<ProcessOutcome, WalkerError> {
     let mut affected: Vec<u32> = Vec::new();
+    let mut widen_count: u64 = 0;
 
     // Step 3: each event either lands in an existing record (and
     // possibly widens it) or opens a fresh one.
@@ -440,8 +446,8 @@ pub fn process_position(
                     .get(&k)
                     .expect("just located")
                     .footprint_end_exclusive();
-                if event_end > cur_end {
-                    open.widen(k, event_end, fasta)?;
+                if event_end > cur_end && open.widen(k, event_end, fasta)? {
+                    widen_count += 1;
                 }
                 k
             } else {
@@ -527,7 +533,18 @@ pub fn process_position(
         }
     }
 
-    Ok(())
+    Ok(ProcessOutcome { widen_count })
+}
+
+/// Side-effect counters returned by `process_position` so the
+/// walker can update its run-summary fields without having to
+/// inspect open-record-table state externally.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProcessOutcome {
+    /// Number of records that actually widened during this call.
+    /// Excludes fresh `open_new` calls and re-finds where the
+    /// event already fits inside the record's footprint.
+    pub widen_count: u64,
 }
 
 fn add_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {

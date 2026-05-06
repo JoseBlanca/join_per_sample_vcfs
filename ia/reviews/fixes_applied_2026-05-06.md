@@ -45,7 +45,7 @@
 | B2 | Blocker | Indel mate-overlap doesn't collapse to one observation | Apply | Applied | No | `src/per_sample_caller/pileup/{walker,tests}.rs` | Pass | No |
 | M1 | Major | `find_overlapping` early break unsound across heterogeneous spans | Apply | Applied | No | `src/per_sample_caller/pileup/open_record.rs` | Pass | No |
 | M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
-| M3 | Major | `record_widen_events` counter conflates open and widen | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| M3 | Major | `record_widen_events` counter conflates open and widen | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | M4 | Major | Lifecycle marks attach only to first drained record | Ask | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
 | M5 | Major | `windows(2)` only inspects adjacent contributor pairs | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | Mi1 | Minor | `checked_sub.unwrap_or(0)` masks precondition violation | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
@@ -146,6 +146,30 @@
   - `cargo test --lib pileup` → exit 0, 53 passed
 - **User input:** None.
 - **Follow-up:** None.
+- **Residual risk:** None.
+
+### M3 — `record_widen_events` counter conflates open and widen
+
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The previous heuristic (sum of all open-record spans before vs after) incremented on every fresh `open_new` because the after-sum included the new record's span. The right signal lives inside `widen` itself.
+- **Implementation summary:**
+  - `OpenPileupRecordTable::widen` now returns `Result<bool, _>` (true on actual widening, false on no-op).
+  - `process_position` now returns `ProcessOutcome { widen_count: u64 }`, counted as the sum of `widen` calls returning `true`.
+  - The walker increments `summary.record_widen_events` by `outcome.widen_count` after each `process_position`, replacing the span-sum delta.
+- **Review suggestion used verbatim?:** Yes (return-bool / explicit-counter shape).
+- **Adaptation:** Returned the count via a small `ProcessOutcome` struct rather than a `&mut u64` parameter, leaving room for additional per-step counters without growing the call signature.
+- **Verification performed:** Added `record_widen_events_counter_only_increments_on_real_widens` (tests.rs, exercises three pure-Match reads at non-overlapping positions; expects counter == 0). Failed before fix (got 9), passed after (got 0). All 54 pileup tests pass.
+- **Files changed:**
+  - `src/per_sample_caller/pileup/open_record.rs`
+  - `src/per_sample_caller/pileup/walker.rs`
+  - `src/per_sample_caller/pileup/tests.rs`
+- **Tests added or modified:** Added `record_widen_events_counter_only_increments_on_real_widens`; added `drive_walker_with_summary` helper for tests that need to assert on the run summary.
+- **Validation:**
+  - `cargo test --lib pileup` → exit 0, 54 passed
+- **User input:** None.
+- **Follow-up:** None. Considered adding a separate `record_open_events` counter; the spec only commits to `record_widen_events`, so leaving opens uncounted matches the spec.
 - **Residual risk:** None.
 
 ## 5. Deferred findings to carry forward

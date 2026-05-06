@@ -105,6 +105,15 @@ pub fn paired_snp_reads(
 /// Stage 2 runs on a separate thread per spec; we mirror that
 /// shape here to exercise the channel emission path properly.
 pub fn drive_walker(reads: Vec<PreparedRead>, fasta: MockFasta) -> Vec<super::PileupRecord> {
+    drive_walker_with_summary(reads, fasta).0
+}
+
+/// Same as `drive_walker` but also returns the run's
+/// `RunSummary`. Useful for tests that assert on counters.
+pub fn drive_walker_with_summary(
+    reads: Vec<PreparedRead>,
+    fasta: MockFasta,
+) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
     let (tx, rx) = mpsc::sync_channel::<super::PileupRecord>(64);
     let collector = thread::spawn(move || {
         let mut out = Vec::new();
@@ -115,8 +124,8 @@ pub fn drive_walker(reads: Vec<PreparedRead>, fasta: MockFasta) -> Vec<super::Pi
     });
     let summary = run(reads, &fasta, &tx).expect("walker run failed");
     drop(tx);
-    let _ = summary;
-    collector.join().expect("collector thread panicked")
+    let records = collector.join().expect("collector thread panicked");
+    (records, summary)
 }
 
 // ---------------------------------------------------------------------
@@ -430,6 +439,28 @@ fn mate_overlap_zeroes_lower_bq_contribution() {
         rec.alleles[0].scalars.q_sum > -4.0 && rec.alleles[0].scalars.q_sum < -2.0,
         "expected q_sum ≈ -3, got {}",
         rec.alleles[0].scalars.q_sum
+    );
+}
+
+#[test]
+fn record_widen_events_counter_only_increments_on_real_widens() {
+    // Three pure-Match reads at consecutive positions on a 10-bp
+    // reference. Every record opens fresh at span 1 and never
+    // widens; the run's `record_widen_events` counter should
+    // therefore stay at 0. The previous implementation summed
+    // ref_span across all open records before/after each
+    // process_position step and incremented when the after-sum
+    // grew — but a freshly-opened record also grows the sum, so
+    // the counter conflated opens with widens.
+    let fa = MockFasta::new("ACGTACGTAC");
+    let r1 = snp_read("r1", 1, b"ACG", &[30; 3]);
+    let r2 = snp_read("r2", 4, b"TAC", &[30; 3]);
+    let r3 = snp_read("r3", 7, b"GTA", &[30; 3]);
+    let (_records, summary) = drive_walker_with_summary(vec![r1, r2, r3], fa);
+    assert_eq!(
+        summary.record_widen_events, 0,
+        "no widening occurred; counter should be 0, got {}",
+        summary.record_widen_events
     );
 }
 
