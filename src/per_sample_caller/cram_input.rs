@@ -445,9 +445,8 @@ fn extract_single_sample_name(
 // ---------------------------------------------------------------------
 
 /// Validate that the indexed FASTA's contigs match `contigs`
-/// (name + length, in the same order). The CRAM `@SQ M5` is trusted
-/// per `ia/specs/per_sample_caller.md` §"Pre-flight validation"; we do
-/// not recompute it from the FASTA.
+/// (name + length, in the same order). The CRAM `@SQ M5` is trusted;
+/// we do not recompute it from the FASTA.
 fn validate_fasta_agreement(
     fasta_path: &Path,
     canonical_contigs: &ContigList,
@@ -624,12 +623,12 @@ impl CramMergedReader {
 
             // Read file definition first to gate on CRAM major version
             // before any container is decoded.
-            let file_definition = noodles_cram_reader.read_file_definition().map_err(|source| {
-                CramInputError::OpenFailed {
+            let file_definition = noodles_cram_reader
+                .read_file_definition()
+                .map_err(|source| CramInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
-                }
-            })?;
+                })?;
             let version = file_definition.version();
             if version.major() != 3 {
                 return Err(CramInputError::UnsupportedCramVersion {
@@ -639,13 +638,12 @@ impl CramMergedReader {
                 });
             }
 
-            let noodles_sam_header =
-                noodles_cram_reader
-                    .read_file_header()
-                    .map_err(|source| CramInputError::OpenFailed {
-                        path: cram_path.clone(),
-                        source,
-                    })?;
+            let noodles_sam_header = noodles_cram_reader.read_file_header().map_err(|source| {
+                CramInputError::OpenFailed {
+                    path: cram_path.clone(),
+                    source,
+                }
+            })?;
             let cram_header = extract_header(cram_path, &noodles_sam_header)?;
 
             // Cross-file checks: contigs and sample name must be
@@ -658,9 +656,9 @@ impl CramMergedReader {
                 Some(existing) => {
                     if let Err(detail) = existing.first_disagreement(&cram_header.contigs) {
                         return Err(CramInputError::ContigListMismatch {
-                            reference_path: reference_cram_path
-                                .clone()
-                                .expect("reference_cram_path is set when canonical_contigs is Some"),
+                            reference_path: reference_cram_path.clone().expect(
+                                "reference_cram_path is set when canonical_contigs is Some",
+                            ),
                             other_path: cram_path.clone(),
                             detail,
                         });
@@ -826,7 +824,11 @@ impl Iterator for CramMergedReader {
                 ref_id: head.ref_id,
                 pos: head.pos,
             };
-            if let Some(other) = self.current_locus_read_fingerprints.iter().find(|entry| entry.key == new_key) {
+            if let Some(other) = self
+                .current_locus_read_fingerprints
+                .iter()
+                .find(|entry| entry.key == new_key)
+            {
                 let other_path = self.paths[other.source_file_index].clone();
                 return self.fail(CramInputError::DuplicateReadAcrossFiles {
                     qname: String::from_utf8_lossy(&new_key.qname).into_owned(),
@@ -877,10 +879,11 @@ impl Iterator for CramMergedReader {
 
             // Accept: record the fingerprint and bump the per-file
             // previous-locus tracker.
-            self.current_locus_read_fingerprints.push(ReadFingerprintWithSourceFile {
-                key: new_key,
-                source_file_index: chosen_idx,
-            });
+            self.current_locus_read_fingerprints
+                .push(ReadFingerprintWithSourceFile {
+                    key: new_key,
+                    source_file_index: chosen_idx,
+                });
             self.per_file_prev_locus[chosen_idx] = Some((mapped.ref_id, mapped.pos));
             return Some(Ok(mapped));
         }
