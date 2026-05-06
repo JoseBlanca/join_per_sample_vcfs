@@ -13,6 +13,7 @@
 
 pub mod cram_input;
 pub mod errors;
+pub mod pileup;
 
 #[cfg(test)]
 pub(crate) mod cram_files;
