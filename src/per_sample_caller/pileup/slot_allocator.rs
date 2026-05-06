@@ -42,6 +42,14 @@ pub struct SlotAllocator {
     /// the smallest free id. The "lowest free id" rule keeps slot
     /// numbers compact in the typical case.
     free: Vec<SlotId>,
+    /// Slots released since the most recent `drain_lifecycle_marks`
+    /// call. They cannot be reused yet — moving them straight to
+    /// `free` would let a new admission hand them out within the
+    /// same emission window, putting `expired[S]` and `new[S]` in
+    /// one record's marks and silently merging two distinct phase
+    /// chains. `drain_lifecycle_marks` migrates this list to
+    /// `free` after emitting the marks for the just-closed window.
+    pending_free: Vec<SlotId>,
     /// Next never-used-before slot id; advances when `free` is empty.
     next_fresh: u32,
     /// Per-slot reference count: 1 for solo reads, 2 once both mates
@@ -72,6 +80,7 @@ impl SlotAllocator {
     pub fn new() -> Self {
         Self {
             free: Vec::new(),
+            pending_free: Vec::new(),
             next_fresh: 0,
             slot_refcount: vec![0u8; MAX_ACTIVE_SLOTS as usize],
             pending_mates: AHashMap::new(),
@@ -86,6 +95,7 @@ impl SlotAllocator {
     /// `ia/specs/pileup_walker.md` §"Chromosome boundaries").
     pub fn reset(&mut self) {
         self.free.clear();
+        self.pending_free.clear();
         self.next_fresh = 0;
         for slot in &mut self.slot_refcount {
             *slot = 0;
@@ -168,7 +178,12 @@ impl SlotAllocator {
     }
 
     /// Decrement a slot's refcount on read exit. When it reaches
-    /// zero the slot is recycled and stamped into `expired_marks`.
+    /// zero the slot is parked in `pending_free` (not `free`) and
+    /// its id is stamped into `expired_marks`. The slot only
+    /// becomes available for reuse at the next
+    /// `drain_lifecycle_marks` call, guaranteeing that any
+    /// `expired[S]` mark surfaces before any subsequent
+    /// `new[S]` for the same id.
     pub fn release_slot(&mut self, slot: SlotId) -> Result<(), WalkerError> {
         let idx = slot as usize;
         if idx >= self.slot_refcount.len() || self.slot_refcount[idx] == 0 {
@@ -181,54 +196,40 @@ impl SlotAllocator {
         }
         self.slot_refcount[idx] -= 1;
         if self.slot_refcount[idx] == 0 {
-            // Sorted-descending insert so `pop()` yields the
-            // smallest free id.
-            let pos = self
-                .free
-                .binary_search_by(|s| slot.cmp(s))
-                .unwrap_or_else(|p| p);
-            self.free.insert(pos, slot);
+            self.pending_free.push(slot);
             self.expired_marks.push(slot);
         }
         Ok(())
     }
 
     /// Drain the pending lifecycle markers into a `(new, expired)`
-    /// pair, deduplicating slots that appear in both lists (a chain
-    /// allocated and released between two emissions never became
-    /// observable, so we suppress it from both).
+    /// pair. Both lists are sorted-deduplicated; slots present in
+    /// *both* lists at the same drain are emitted in *both* (they
+    /// can only be genuinely-transient slots — allocated and
+    /// released within one emission window with no allele tagged —
+    /// because real reuse is forced into a different drain by the
+    /// `pending_free` deferral). The consumer applies `new_chains`
+    /// before processing and `expired_chains` after, so a transient
+    /// slot has no observable effect on the alive set.
+    ///
+    /// At end-of-drain, slots parked in `pending_free` are
+    /// migrated into `free` and become available for reuse.
     pub fn drain_lifecycle_marks(&mut self) -> (Vec<SlotId>, Vec<SlotId>) {
-        // Find the intersection (slots in both lists) and remove
-        // them from both. Sort + unique on each side first so the
-        // emitted lists are deterministic.
         sort_dedup(&mut self.new_marks);
         sort_dedup(&mut self.expired_marks);
+        let new_out = std::mem::take(&mut self.new_marks);
+        let exp_out = std::mem::take(&mut self.expired_marks);
 
-        let mut new_out = Vec::new();
-        let mut exp_out = Vec::new();
-        let mut i = 0;
-        let mut j = 0;
-        while i < self.new_marks.len() && j < self.expired_marks.len() {
-            match self.new_marks[i].cmp(&self.expired_marks[j]) {
-                std::cmp::Ordering::Less => {
-                    new_out.push(self.new_marks[i]);
-                    i += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    exp_out.push(self.expired_marks[j]);
-                    j += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    // present in both — suppress
-                    i += 1;
-                    j += 1;
-                }
-            }
+        // Migrate pending_free → free. `free` is kept sorted
+        // descending so `pop()` yields the smallest available id.
+        while let Some(slot) = self.pending_free.pop() {
+            let pos = self
+                .free
+                .binary_search_by(|s| slot.cmp(s))
+                .unwrap_or_else(|p| p);
+            self.free.insert(pos, slot);
         }
-        new_out.extend(self.new_marks.drain(i..));
-        exp_out.extend(self.expired_marks.drain(j..));
-        self.new_marks.clear();
-        self.expired_marks.clear();
+
         (new_out, exp_out)
     }
 
@@ -384,16 +385,59 @@ mod tests {
     }
 
     #[test]
-    fn drain_lifecycle_marks_suppresses_slots_present_in_both() {
+    fn drain_lifecycle_marks_emits_both_for_transient_slot_within_one_drain() {
+        // A slot allocated and released between two consecutive
+        // drains surfaces in *both* lists of the next drain. The
+        // previous "suppress same-id-in-both" rule was wrong: it
+        // also masked same-emission reuse (slot 0 released for
+        // r1 then reacquired for r2), silently merging two
+        // distinct phase chains. With the slot-deferral fix
+        // (release goes to `pending_free`, not `free`), reuse
+        // can't collide on the same drain — so any same-id-both
+        // case is genuinely transient and harmless to surface
+        // (the consumer applies new before expired and ends up
+        // with no net alive change).
         let mut a = SlotAllocator::new();
         let r = make_read("transient", false, 100);
         let (slot, _) = a.allocate_for_read(&r).unwrap();
         a.release_slot(slot).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
-        // The slot existed only between two emissions and was never
-        // visible: don't surface it.
-        assert!(new.is_empty(), "got {:?}", new);
-        assert!(expired.is_empty(), "got {:?}", expired);
+        assert_eq!(new, vec![slot]);
+        assert_eq!(expired, vec![slot]);
+    }
+
+    #[test]
+    fn same_emission_reuse_does_not_collide_on_slot_id() {
+        // r1 acquires slot, releases. Before any drain, r2
+        // acquires a slot. The walker MUST NOT hand out r1's old
+        // id to r2 within the same emission window — doing so
+        // would put the same id in both `new_marks` and
+        // `expired_marks` of the next drain, and a downstream
+        // consumer could not tell the resulting "chain ends and
+        // new chain starts" apart from a transient slot, silently
+        // merging the two reads' alleles into a single chain.
+        //
+        // The slot-deferral fix moves released slots to
+        // `pending_free`; only `drain_lifecycle_marks` migrates
+        // them to `free`. So r2 here gets a fresh id.
+        let mut a = SlotAllocator::new();
+        let r1 = make_read("r1", false, 100);
+        let (s1, _) = a.allocate_for_read(&r1).unwrap();
+        a.release_slot(s1).unwrap();
+        let r2 = make_read("r2", false, 100);
+        let (s2, _) = a.allocate_for_read(&r2).unwrap();
+        assert_ne!(
+            s1, s2,
+            "same-emission reuse must not collide; got s1={s1}, s2={s2}"
+        );
+
+        // After a drain, the freed slot becomes available again.
+        let _ = a.drain_lifecycle_marks();
+        a.release_slot(s2).unwrap();
+        let _ = a.drain_lifecycle_marks();
+        let r3 = make_read("r3", false, 100);
+        let (s3, _) = a.allocate_for_read(&r3).unwrap();
+        assert!(s3 == s1 || s3 == s2, "post-drain reuse may take any freed slot; got s3={s3}");
     }
 
     #[test]

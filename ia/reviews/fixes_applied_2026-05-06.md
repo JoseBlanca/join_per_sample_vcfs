@@ -46,7 +46,7 @@
 | M1 | Major | `find_overlapping` early break unsound across heterogeneous spans | Apply | Applied | No | `src/per_sample_caller/pileup/open_record.rs` | Pass | No |
 | M2 | Major | Mate-overlap tie-break uses `alignment_start`, not `is_first_mate` | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
 | M3 | Major | `record_widen_events` counter conflates open and widen | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker,tests}.rs` | Pass | No |
-| M4 | Major | Lifecycle marks attach only to first drained record | Ask | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| M4 | Major | Lifecycle marks attach only to first drained record | Ask | Applied with adaptation | Yes | `src/per_sample_caller/pileup/slot_allocator.rs`, `ia/specs/pileup_walker.md` | Pass | No |
 | M5 | Major | `windows(2)` only inspects adjacent contributor pairs | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
 | Mi1 | Minor | `checked_sub.unwrap_or(0)` masks precondition violation | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
 | Mi2 | Minor | `walker_pos == 0` guard is dead code | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
@@ -58,7 +58,8 @@
 
 ## 3. Questions asked and answers
 
-*(populated as Asks are issued)*
+1. **M4** — Should lifecycle marks attach per-emission (all on first record of an emission batch, current implementation) or per-record (each record carries marks since the previous record)?
+   - **Answer:** "Honestly, I don't know what would be best for M4. What do you think? I value correctness over implementation time, so don't worry if you have to redo something. Also, think critically about the spec, do not assume that it is correct just because it is written in a particular way." — Resolved by the fixer's critical analysis: per-emission stamping is kept, but the deeper correctness issue uncovered (slot-id reuse silently merging phase chains) is the actual fix delivered.
 
 ## 4. Per-finding log
 
@@ -147,6 +148,32 @@
 - **User input:** None.
 - **Follow-up:** None.
 - **Residual risk:** None.
+
+### M4 — Lifecycle marks attach only to first drained record
+
+- **Severity:** Major
+- **Initial decision:** Ask
+- **Final status:** Applied with adaptation
+- **Reasoning:** The review framed M4 as a per-record vs per-emission stamping choice. While reading the slot-allocator code I noticed a deeper correctness defect the review missed: **same-walker-step slot reuse silently merges phase chains.** When `r1` expires and `r2` admits in the same step, the allocator's old `acquire_slot` immediately popped the freed id from `free`. The drain produced `new=[S]` and `expired=[S]` simultaneously; the existing `drain_lifecycle_marks_suppresses_slots_present_in_both` rule dropped both, leaving the consumer no way to tell "r1's chain ended, r2's chain began with the same id" apart from a transient. Same-step reuse is the **common** case at any meaningful coverage (back-to-back reads at adjacent positions), so phase chains were routinely corrupted. Per-record vs per-emission stamping doesn't fix this — both options still allow the suppression to mask reuse.
+- **Implementation summary:**
+  - Added `pending_free: Vec<SlotId>` to `SlotAllocator`. `release_slot` now parks freed slots there instead of pushing directly to `free`.
+  - `drain_lifecycle_marks` migrates `pending_free` → `free` *after* draining the marks, so reuse of a freed id is forced into a strictly later emission than the one carrying its `expired` mark.
+  - Dropped the suppression in `drain_lifecycle_marks` — it's now unnecessary for reuse (impossible by construction) and harmless for genuinely-transient slots (consumer applies `new_chains` before processing and `expired_chains` after; transient slots produce no observable alive-set delta).
+  - Spec updated: removed the `[QUESTION]` resolution that recommended suppression; added a §"Slot reuse and the `pending_free` deferral" subsection making the design rule explicit.
+  - Per-emission "all-on-first-record" stamping is kept and now documented in the spec without ambiguity.
+- **Review suggestion used verbatim?:** No.
+- **Adaptation:** The review's two options (per-emission with explicit drain-on-empty, vs per-record marks) didn't cover the actual bug. The user explicitly invited critical thinking and prioritized correctness over speed. The implemented fix addresses the root cause (slot-id reuse correctness) and keeps per-emission stamping as documented behaviour.
+- **Verification performed:** Added `same_emission_reuse_does_not_collide_on_slot_id` (asserts `s1 != s2` when r1 releases and r2 admits before any drain; was `s1 == s2 == 0` before). Renamed and flipped `drain_lifecycle_marks_suppresses_slots_present_in_both` → `drain_lifecycle_marks_emits_both_for_transient_slot_within_one_drain` (transient slots now surface; consumer handles them). All 55 pileup tests pass; full lib suite at 145 tests passes.
+- **Files changed:**
+  - `src/per_sample_caller/pileup/slot_allocator.rs`
+  - `ia/specs/pileup_walker.md`
+- **Tests added or modified:** Added `same_emission_reuse_does_not_collide_on_slot_id`; replaced `drain_lifecycle_marks_suppresses_slots_present_in_both` with `drain_lifecycle_marks_emits_both_for_transient_slot_within_one_drain`.
+- **Validation:**
+  - `cargo test --lib pileup` → exit 0, 55 passed
+  - `cargo test --lib` → exit 0, 145 passed
+- **User input:** Yes — invited critical thinking; the user did not commit to either review-proposed option.
+- **Follow-up:** None required for the slot-reuse correctness bug. If Stage 5 ever needs per-record marks (rather than per-emission), that's an additive change — split `stamp_lifecycle_marks` to track marks per record. Not needed today.
+- **Residual risk:** Low. `pending_free` adds one more list to the allocator; the migration is `O(n)` per drain where `n ≤ active reads released this emission window` (typically ≤ a handful). Memory: one extra `Vec<u16>` per allocator.
 
 ### M5 — `windows(2)` only inspects adjacent contributor pairs
 

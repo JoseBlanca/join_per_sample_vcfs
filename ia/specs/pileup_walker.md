@@ -1024,21 +1024,59 @@ mate is admitted). Refcount goes down by 1 on each read expiry.
 
 ### Stamping records
 
-When the walker closes a record at `pos`, it drains the
-allocator's `new_marks` and `expired_marks` since the last
-emitted record into `PileupRecord.new_chains` and
-`expired_chains` respectively. The drain is per-emission (the
-walker emits in coordinate order; new/expired marks accumulate
-between emissions and reset at each emission).
+When the walker closes one or more records in a single
+`close_aged_records` call, it drains the allocator's `new_marks`
+and `expired_marks` accumulated since the previous drain into
+`PileupRecord.new_chains` and `expired_chains` respectively.
+Marks attach to **the first record of the emission batch**;
+subsequent records in the same batch carry empty
+`new_chains` / `expired_chains`. The consumer is expected to
+read records in coordinate order and treat each emission's first
+record's marks as describing transitions that became visible at
+some point during the walker's progression to that record's
+position.
 
-**[QUESTION]** what if a slot is allocated and released between
-two consecutive emitted records (a very short single-read pile
-with no surviving open record)? The slot appears in both `new_chains`
-and `expired_chains` of the same record. Stage 5's consumer
-needs to apply expired *after* new (or just suppress this case
-at emit time). Suppress here: if a slot id is present in both
-`new_marks` and `expired_marks`, drop it from both — the chain
-existed only between records and was never visible.
+If no record ages out at this walker step, drain is deferred
+until the next emission — the marks are not lost. At
+chromosome boundaries and end-of-input, `flush_chromosome`
+drains everything; if no records are pending closure but there
+are leftover marks, the marks are dropped (no record to attach
+them to, and Stage 5 has no further records to apply them
+against — the loss is consumer-invisible).
+
+#### Slot reuse and the `pending_free` deferral
+
+A subtle correctness issue: if a released slot was put back into
+`free` immediately, a same-walker-step admission could reuse
+the slot id, putting `expired[S]` and `new[S]` into the same
+record's marks. Since slot ids are reused across the whole
+stream, a downstream consumer would have no way to tell "r1's
+chain ended and r2's chain began with the same id" apart from a
+spurious single-chain transient — silently merging two distinct
+phase chains.
+
+The allocator therefore parks released slots in `pending_free`
+rather than `free` directly. `drain_lifecycle_marks` migrates
+`pending_free` → `free` only after emitting that drain's marks.
+Any reuse of a freed id is forced into a strictly later emission
+than the one carrying its `expired` mark. As a consequence:
+
+- `expired[S]` and `new[S]` for the **same `S`** in the same
+  drain can only describe a *transient* slot (allocated and
+  released within one emission window with no allele tagged).
+  The consumer applies `new_chains` before processing the
+  record and `expired_chains` after, so a transient slot has
+  no observable effect on the alive set.
+- `expired[S]` (from a real chain ending) and `new[S]` (from
+  reuse for a new chain) are guaranteed to be in **different
+  records'** marks, separated by at least one emission. The
+  consumer thus sees a clean chain transition and links r1's
+  alleles only to r1's chain, r2's alleles only to r2's chain.
+
+The previous draft's "suppress same-id-in-both" rule has been
+removed: it conflated transient slots (harmless) with reuse
+(corrupting). The deferral approach handles both cases by
+construction.
 
 ### Defensive bounds
 
