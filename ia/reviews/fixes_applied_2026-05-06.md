@@ -52,9 +52,9 @@
 | Mi2 | Minor | `walker_pos == 0` guard is dead code | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
 | Mi3 | Minor | `flush_chromosome` accepts unused `_fasta` | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
 | Mi4 | Minor | `from_slot_counters` awkward shape | Apply | Applied | No | `src/per_sample_caller/pileup/walker.rs` | Pass | No |
-| Mi5 | Minor | `FiveScalars::zero` duplicates `Default::default` | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
-| Mi6 | Minor | `widen` always appends `extra_bases` to every allele | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
-| Nits | Nit | Clippy errors + small style items | Apply | _pending_ | No | _pending_ | _pending_ | _pending_ |
+| Mi5 | Minor | `FiveScalars::zero` duplicates `Default::default` | Apply | Applied | No | `src/per_sample_caller/pileup/{mod,open_record}.rs` | Pass | No |
+| Mi6 | Minor | `widen` always appends `extra_bases` to every allele | Apply | Disputed | No | `src/per_sample_caller/pileup/open_record.rs` (doc only) | Pass | No |
+| Nits | Nit | Clippy errors + small style items | Apply | Applied | No | `src/per_sample_caller/pileup/{open_record,walker}.rs` | Pass | No |
 
 ## 3. Questions asked and answers
 
@@ -211,6 +211,36 @@
 - **User input:** Yes — invited critical thinking; the user did not commit to either review-proposed option.
 - **Follow-up:** None required for the slot-reuse correctness bug. If Stage 5 ever needs per-record marks (rather than per-emission), that's an additive change — split `stamp_lifecycle_marks` to track marks per record. Not needed today.
 - **Residual risk:** Low. `pending_free` adds one more list to the allocator; the migration is `O(n)` per drain where `n ≤ active reads released this emission window` (typically ≤ a handful). Memory: one extra `Vec<u16>` per allocator.
+
+### Mi5 — `FiveScalars::zero` duplicates `Default::default`
+
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The `zero()` method just delegated to `Self::default()` with no extra semantics. Removing it canonicalises construction at one name.
+- **Implementation summary:** Removed the `impl FiveScalars { fn zero }` block; updated the one call site (`OpenAllele::new`) to use `FiveScalars::default()`.
+- **Files changed:** `src/per_sample_caller/pileup/mod.rs`, `src/per_sample_caller/pileup/open_record.rs`.
+- **Validation:** `cargo test --lib` → 145 passed.
+
+### Mi6 — `widen` invariant on every allele kind
+
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Disputed
+- **Reasoning:** Investigated the reviewer's worry that "appending `extra_bases` to every allele's `seq`" might not produce the right haplotype for INS alleles whose insertion anchor sits mid-old-span. Tracing `apply_events_to_ref` shows that every allele's `seq` always *ends* with the ref-aligned suffix `ref_seq[ref_cursor..ref_seq.len()]` — the post-loop tail emits raw ref bases verbatim. Widening extends `ref_seq` with `extra_bases`; appending `extra_bases` to each allele's `seq` reproduces exactly what re-folding the read against the wider `ref_seq` would emit (modulo new events at the new positions, which haven't been folded yet — they fold at a later walker step into the right bucket via the B1 subtract-old/add-new path). The current code is correct for SNP/MNP, DEL, INS, and compound alleles by construction.
+- **Implementation summary:** No code-behaviour change. Replaced the inline rationale with a load-bearing comment that names the invariant ("every allele's seq ends with a ref-aligned suffix") and explains why simple append is correct for all allele kinds.
+- **Files changed:** `src/per_sample_caller/pileup/open_record.rs` (doc only).
+- **Validation:** `cargo test --lib` → 145 passed.
+- **Follow-up:** None. Recorded as Disputed because no code defect was confirmed; the documentation update tightens reasoning for future readers.
+
+### Nits — pileup-scoped clippy + small style
+
+- **Severity:** Nit
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The original review listed four pileup-scoped clippy errors (`manual_saturating_arithmetic`, `needless_lifetimes`, `unnecessary_filter_map`, `ptr_arg`). The first three are now resolved as side-effects of B1 (replaced `find_or_create_allele` lifetime-annotated wrapper with `find_or_create_allele_index`), Mi1 (replaced `checked_sub.unwrap_or(0)` with `saturating_sub`), and a follow-up `.filter_map → .map` rewrite in `ln_bq_for_read`. The fourth (`ptr_arg` on `resolve_mate_overlap_at_pos`) is a false positive — the function genuinely needs `&mut Vec<_>` for `swap_remove`; addressed via a localised `#[allow(clippy::ptr_arg)]` with a justifying comment.
+- **Files changed:** `src/per_sample_caller/pileup/open_record.rs` (filter_map → map; removed dead `OpenPileupRecordTable::iter` after M3 stopped using it), `src/per_sample_caller/pileup/walker.rs` (allow ptr_arg with comment).
+- **Validation:** `cargo clippy --lib --all-features -- -D warnings` → no errors in `src/per_sample_caller/pileup/`. Remaining clippy errors are in pre-existing out-of-scope files (variant_grouping.rs, decompression_pool.rs, genotype_merging.rs).
 
 ### M5 — `windows(2)` only inspects adjacent contributor pairs
 

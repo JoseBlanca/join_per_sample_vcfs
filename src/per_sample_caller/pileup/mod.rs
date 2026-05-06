@@ -124,12 +124,6 @@ pub struct FiveScalars {
     pub placed_start: u32,
 }
 
-impl FiveScalars {
-    pub fn zero() -> Self {
-        Self::default()
-    }
-}
-
 // ---------------------------------------------------------------------
 // AlleleObservation
 // ---------------------------------------------------------------------

@@ -437,7 +437,10 @@ mod tests {
         let _ = a.drain_lifecycle_marks();
         let r3 = make_read("r3", false, 100);
         let (s3, _) = a.allocate_for_read(&r3).unwrap();
-        assert!(s3 == s1 || s3 == s2, "post-drain reuse may take any freed slot; got s3={s3}");
+        assert!(
+            s3 == s1 || s3 == s2,
+            "post-drain reuse may take any freed slot; got s3={s3}"
+        );
     }
 
     #[test]

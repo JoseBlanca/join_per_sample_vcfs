@@ -31,7 +31,7 @@ impl OpenAllele {
     fn new(seq: Vec<u8>) -> Self {
         Self {
             seq,
-            scalars: FiveScalars::zero(),
+            scalars: FiveScalars::default(),
             chain_slots: Vec::new(),
         }
     }
@@ -133,10 +133,6 @@ pub struct OpenPileupRecordTable {
 impl OpenPileupRecordTable {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&u32, &OpenPileupRecord)> {
-        self.records.iter()
     }
 
     /// Drain every record whose footprint is fully behind the
@@ -251,30 +247,36 @@ impl OpenPileupRecordTable {
             })?;
         rec.ref_seq.extend_from_slice(&extra_bases);
 
-        // Rewrite each existing allele.
+        // Rewrite each existing allele by appending the new REF
+        // bases to its `seq`.
+        //
+        // **Invariant preserved by `apply_events_to_ref`:** every
+        // allele's `seq` ends with a ref-aligned suffix — concretely,
+        // the bytes `ref_seq[k..ref_seq.len()]` for some `k` ≥ the
+        // offset of the last event the read had inside this record.
+        // The function is by construction: after processing each
+        // event it advances `ref_cursor` past the event's footprint,
+        // and the post-event tail loop emits `ref_seq[ref_cursor..]`
+        // verbatim. So whatever modifications (SNP, INS, DEL) sit in
+        // the allele, the *trailing* bytes are always ref bases.
+        //
+        // Widening extends `ref_seq` with `extra_bases`. The
+        // ref-aligned tail of every allele then becomes
+        // `ref_seq_old[k..] ++ extra_bases`, which is still
+        // ref-aligned (now to the wider `ref_seq`). Appending
+        // `extra_bases` to each allele's `seq` therefore reproduces
+        // exactly what `apply_events_to_ref` would emit if we
+        // re-folded the read against the wider `ref_seq`, modulo
+        // the new bytes never being event-modified by this read
+        // (events at the new positions, if any, haven't been folded
+        // yet — they are processed at a later walker step which
+        // re-folds the read into the right bucket).
+        //
+        // So this loop is correct for all allele kinds: SNP/MNP
+        // (`seq.len() == old_ref_seq.len()`), DEL (shorter), INS
+        // (longer than old span by the inserted run). Each gets
+        // exactly the same `extra_bases` appended.
         for allele in &mut rec.alleles {
-            // If the allele was ref-aligned over the OLD span (i.e.
-            // its seq length equals the old ref span), append the
-            // new reference bases. Otherwise — the allele was a
-            // deletion (shorter than old span) or insertion
-            // (longer than old span by the inserted bases) — the
-            // rewrite rule preserves the event:
-            //
-            //  - DEL allele: keep its current length. The widened
-            //    REF now has more bases past the deletion's end,
-            //    but the deletion's seq stays "anchor only" or
-            //    "what remains after the deletion was applied to
-            //    the OLD REF span." We still need to append the
-            //    new ref bases, because the ref bases past the
-            //    deletion are present in the read (and therefore
-            //    in the haplotype).
-            //  - INS allele: same — append new ref bases past the
-            //    insertion's REF coverage.
-            //
-            // In all cases, append the new REF bases to the end
-            // of the allele's seq, because the new reference
-            // stretch is conserved (no event in this allele claims
-            // those bases as modified).
             allele.seq.extend_from_slice(&extra_bases);
         }
         Ok(true)
@@ -584,10 +586,10 @@ fn subtract_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
 fn ln_bq_for_read(window_events: &[&ReadEvent], fallback_bq: u8) -> f64 {
     let min_bq = window_events
         .iter()
-        .filter_map(|e| match e {
-            ReadEvent::Match { bq_baq, .. } => Some(*bq_baq),
-            ReadEvent::Insertion { bq_proxy, .. } => Some(*bq_proxy),
-            ReadEvent::Deletion { bq_proxy, .. } => Some(*bq_proxy),
+        .map(|e| match e {
+            ReadEvent::Match { bq_baq, .. } => *bq_baq,
+            ReadEvent::Insertion { bq_proxy, .. } => *bq_proxy,
+            ReadEvent::Deletion { bq_proxy, .. } => *bq_proxy,
         })
         .min()
         .unwrap_or(fallback_bq);

@@ -396,6 +396,10 @@ impl WalkerState {
 ///   (Match BQ where present, indel `bq_proxy` mapped through 0
 ///   when the loser carries no Match here); ties go to the first
 ///   mate.
+// `&mut Vec<_>` is intentional: the function `swap_remove`s
+// contributors on indel-overlap, which requires the owning `Vec`,
+// not a slice.
+#[allow(clippy::ptr_arg)]
 fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary: &mut RunSummary) {
     // Build a small index: chain_slot_id → list of contributor
     // indices. Anything with a list length >= 2 is a candidate.
