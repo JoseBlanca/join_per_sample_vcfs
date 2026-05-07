@@ -24,6 +24,14 @@ pub type SlotId = u16;
 /// Exceeding it is a hard error rather than silent slot reuse.
 pub const MAX_ACTIVE_SLOTS: u32 = 4096;
 
+/// Active-slot count at which the allocator emits a one-shot soft
+/// warning, well below `MAX_ACTIVE_SLOTS`. Lets the user spot a
+/// pathological-coverage region while the run is still alive instead
+/// of being greeted with `SlotExhausted` and no context. 75% of the
+/// hard cap leaves room for a steep climb to still be visible before
+/// the run fails.
+pub const HIGH_WATER_WARN_THRESHOLD: u32 = MAX_ACTIVE_SLOTS * 3 / 4;
+
 /// State the allocator holds for a first mate whose partner has not
 /// yet been admitted: which slot was issued, the first mate's
 /// `read_id` so the active-set admission code can link
@@ -67,6 +75,12 @@ pub struct SlotAllocator {
     expired_marks: Vec<SlotId>,
     /// Bookkeeping for the run summary.
     counters: SlotAllocatorCounters,
+    /// Set the first time the active-slot count reaches
+    /// `HIGH_WATER_WARN_THRESHOLD`. Idempotent within a run — and
+    /// because `reset` (called at chromosome boundaries) deliberately
+    /// preserves it, the warning fires at most once per run rather
+    /// than once per chromosome.
+    high_water_warned: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -87,6 +101,7 @@ impl SlotAllocator {
             new_marks: Vec::new(),
             expired_marks: Vec::new(),
             counters: SlotAllocatorCounters::default(),
+            high_water_warned: false,
         }
     }
 
@@ -103,7 +118,8 @@ impl SlotAllocator {
         self.pending_mates.clear();
         self.new_marks.clear();
         self.expired_marks.clear();
-        // counters are cumulative across the whole run, do not reset
+        // counters and high_water_warned are cumulative across the
+        // whole run, do not reset
     }
 
     /// Allocate a slot for an entering read.
@@ -150,6 +166,7 @@ impl SlotAllocator {
         // mate arrives), otherwise 1 for solo reads.
         let initial_refcount: u8 = if read.has_mate { 2 } else { 1 };
         self.set_refcount(slot, initial_refcount);
+        self.maybe_warn_high_water(read.chrom_id, read.alignment_start);
         self.counters.slot_allocations += 1;
         self.new_marks.push(slot);
 
@@ -243,6 +260,24 @@ impl SlotAllocator {
         let active = self.active_count();
         if active > self.counters.slot_high_water {
             self.counters.slot_high_water = active;
+        }
+    }
+
+    /// Emit a one-shot soft warning the first time the active-slot
+    /// count crosses `HIGH_WATER_WARN_THRESHOLD`. Surfaces a
+    /// pathological-coverage region while the run is still alive,
+    /// before it potentially trips `MAX_ACTIVE_SLOTS` and dies with
+    /// `WalkerError::SlotExhausted`.
+    fn maybe_warn_high_water(&mut self, chrom_id: u32, pos: u32) {
+        if !self.high_water_warned && self.counters.slot_high_water >= HIGH_WATER_WARN_THRESHOLD {
+            self.high_water_warned = true;
+            eprintln!(
+                "warning: pileup walker reached {}/{} active phase-chain slots at \
+                 chrom_id={} pos={}; if usage exceeds {} the run will fail with \
+                 SlotExhausted (consider raising --max-active-chain-slots or \
+                 pre-filtering this region)",
+                self.counters.slot_high_water, MAX_ACTIVE_SLOTS, chrom_id, pos, MAX_ACTIVE_SLOTS,
+            );
         }
     }
 
@@ -506,5 +541,54 @@ mod tests {
         assert!(a.pending_mates.is_empty());
         // Counters are cumulative across the whole run.
         assert_eq!(a.counters().slot_allocations, allocs_before);
+    }
+
+    #[test]
+    fn high_water_warning_fires_once_at_threshold_and_then_stays_set() {
+        // Allocate up to one slot below the threshold — the flag
+        // must still be clear, since the warning is supposed to
+        // fire exactly when the count reaches the threshold.
+        let mut a = SlotAllocator::new();
+        for i in 0..(HIGH_WATER_WARN_THRESHOLD - 1) {
+            let r = make_read(&format!("r{i}"), false, 100);
+            a.allocate_for_read(&r).expect("under threshold");
+        }
+        assert!(
+            !a.high_water_warned,
+            "must not fire before crossing the threshold"
+        );
+
+        // The next allocation lifts active_count to the threshold;
+        // the flag flips and the eprintln has fired (side effect
+        // not captured here — the flag is the test surface).
+        let r = make_read("threshold", false, 100);
+        a.allocate_for_read(&r).expect("at threshold");
+        assert!(a.high_water_warned, "must fire on reaching threshold");
+
+        // Subsequent allocations must not re-fire. The flag stays
+        // set; we'd otherwise spam stderr per allocation in deep
+        // regions.
+        let r = make_read("post-threshold", false, 100);
+        a.allocate_for_read(&r).expect("past threshold");
+        assert!(a.high_water_warned, "must remain set (one-shot)");
+    }
+
+    #[test]
+    fn reset_preserves_high_water_warning_flag() {
+        // The warning is one-shot per *run*, not per chromosome —
+        // `reset` is called at chromosome boundaries and must not
+        // re-arm the flag, otherwise a deep contig would re-warn on
+        // every following contig we visit.
+        let mut a = SlotAllocator::new();
+        for i in 0..HIGH_WATER_WARN_THRESHOLD {
+            let r = make_read(&format!("r{i}"), false, 100);
+            a.allocate_for_read(&r).unwrap();
+        }
+        assert!(a.high_water_warned);
+        a.reset();
+        assert!(
+            a.high_water_warned,
+            "reset must preserve the one-shot warning flag across chromosomes"
+        );
     }
 }
