@@ -392,3 +392,24 @@ a second attempt.
   benchmarks point at it.
 - Long-read CRAM input (decoder, BAQ tuning, `MAX_RECORD_SPAN`
   raise). Tracked separately if/when long-read support is decided.
+- **Binary-search the offset table.** The `CigarCursor.offsets`
+  vector is already sorted by `ref_pos`, so it doubles as an
+  index. `events_at(walker_pos)` could `partition_point` for the
+  op containing `walker_pos` and inspect at most two ops (the M
+  op containing `walker_pos`, and the op possibly anchoring an
+  indel at `walker_pos + 1`); `events_overlapping(lo, hi)` could
+  start from the first op with `ref_pos >= lo - max_deletion_len`
+  (a new field computed once at `new()` to bound left-side
+  lookback for deletions whose footprint extends rightward).
+  Yields O(log n) lookup vs. the current O(n) op walk. Skipped
+  for now because:
+  - For Illumina reads (1–5 CIGAR ops) the linear walk plus
+    early break already costs essentially nothing, and the
+    binary-search overhead would be a wash or slight regression.
+  - The benefit shows up at 50+ ops per read (PacBio HiFi and
+    longer), which we don't have a benchmark for yet.
+  - Adding `max_deletion_len` ships state we'd never measure
+    until that benchmark exists.
+
+  Revisit alongside the indel-heavy bench variant called out in
+  commit 3, or when long-read CRAM input lands.

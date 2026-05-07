@@ -111,6 +111,17 @@ impl CigarCursor {
         let n_ops = read.cigar.len();
         for (i, op) in read.cigar.iter().enumerate() {
             let off = self.offsets[i];
+            // Early break: ops are walked in non-decreasing
+            // ref_pos order. Once an op starts past `hi`, no later
+            // op can contribute — Match's emit range is empty,
+            // Insertion's anchor (`ref_pos - 1`) is at or past
+            // `hi`, and Deletion's footprint starts at the anchor
+            // so it cannot reach back into `[lo, hi)`. Saves a
+            // full-CIGAR scan per query for long reads with many
+            // ops.
+            if off.ref_pos > hi {
+                break;
+            }
             let is_first = i == 0;
             let is_last = i + 1 == n_ops;
             match *op {
@@ -194,8 +205,21 @@ impl CigarCursor {
     pub(super) fn events_at(&self, walker_pos: u32, read: &PreparedRead) -> Vec<ReadEvent> {
         let mut out = Vec::new();
         let n_ops = read.cigar.len();
+        // Anything that can anchor at `walker_pos` lives in an op
+        // whose start `ref_pos` is at most `walker_pos + 1` (the
+        // op containing `walker_pos` for a Match, or the op whose
+        // first ref position is one past `walker_pos` for an
+        // indel anchored at the previous op's end).
+        let break_threshold = walker_pos.saturating_add(1);
         for (i, op) in read.cigar.iter().enumerate() {
             let off = self.offsets[i];
+            // Early break: ops are walked in non-decreasing
+            // ref_pos order. Once an op starts past
+            // `break_threshold`, neither its M range nor any
+            // indel anchored at this op can land at `walker_pos`.
+            if off.ref_pos > break_threshold {
+                break;
+            }
             let is_first = i == 0;
             let is_last = i + 1 == n_ops;
             match *op {
