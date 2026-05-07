@@ -6,22 +6,19 @@
 use ahash::AHashMap;
 
 use super::PreparedRead;
-use super::decompose::{ReadEvent, decompose};
+use super::cigar_cursor::CigarCursor;
 use super::errors::WalkerError;
 use super::slot_allocator::{SlotAllocator, SlotId};
 
 /// One read currently in the walker's active set. The `read` field
-/// is the owned `PreparedRead`; `events` is the eager CIGAR
-/// decomposition computed once on admission.
+/// is the owned `PreparedRead`; `cursor` carries the per-op offset
+/// table the walker queries on demand for events at the current
+/// position or in an open record's footprint window.
 #[derive(Debug, Clone)]
 pub struct ActiveRead {
     pub read_id: u32,
     pub read: PreparedRead,
-    pub events: Vec<ReadEvent>,
-    /// Index into `events` of the next event the walker has not
-    /// yet folded in. Advances by `process_position` as the walker
-    /// passes each event's anchor position.
-    pub event_cursor: u32,
+    pub cursor: CigarCursor,
     pub chain_slot_id: SlotId,
     /// `Some(other.read_id)` when the partner mate has also been
     /// admitted. Filled by the active-set admission code on the
@@ -70,10 +67,6 @@ impl ActiveSet {
         self.reads.iter()
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ActiveRead> {
-        self.reads.iter_mut()
-    }
-
     /// Look up a read by `read_id` via the secondary index.
     /// Used by the active-set tests and by the mate-overlap fold
     /// path (the walker calls this on the partner mate's id).
@@ -109,13 +102,12 @@ impl ActiveSet {
         // qname isn't in `pending_mates` in those cases).
         slots.register_first_mate_read_id(&qname_for_register, read_id);
 
-        let events = decompose(&read);
+        let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
 
         let active = ActiveRead {
             read_id,
             read,
-            events,
-            event_cursor: 0,
+            cursor,
             chain_slot_id,
             mate_read_id: partner_read_id,
         };
@@ -149,20 +141,12 @@ impl ActiveSet {
         while i > 0 {
             i -= 1;
             if self.reads[i].read.alignment_end < walker_pos {
-                // Internal invariant: the read should have processed
-                // every event before its alignment ends.
-                if (self.reads[i].event_cursor as usize) < self.reads[i].events.len() {
-                    let qname = self.reads[i].read.qname.to_string();
-                    let chrom_id = self.reads[i].read.chrom_id;
-                    let pos = self.reads[i].read.alignment_start;
-                    let residual = self.reads[i].events.len() - self.reads[i].event_cursor as usize;
-                    return Err(WalkerError::Internal {
-                        detail: format!("read exited with {residual} unprocessed events"),
-                        qname,
-                        chrom_id,
-                        pos,
-                    });
-                }
+                // The eager `event_cursor` invariant the previous
+                // implementation checked here ("every event was
+                // popped") doesn't apply to the lazy cursor — it's
+                // stateless, so there's nothing to mark consumed.
+                // Single-fold-per-(record, read) is enforced by
+                // `OpenPileupRecord.folded_reads` instead.
                 let slot = self.reads[i].chain_slot_id;
                 slots.release_slot(slot)?;
                 self.swap_remove(i);
@@ -260,25 +244,12 @@ mod tests {
         assert_eq!(entry.read.qname.as_ref(), "b");
     }
 
-    /// Manually advance every active read's event_cursor to
-    /// `events.len()` so `expire_passed`'s internal-invariant
-    /// check (which fires when a read exits with unprocessed
-    /// events) doesn't trip in tests that exercise expiry in
-    /// isolation. In production the walker advances cursors as it
-    /// folds events at each walker_pos.
-    fn advance_all_cursors_to_end(s: &mut ActiveSet) {
-        for active in s.iter_mut() {
-            active.event_cursor = active.events.len() as u32;
-        }
-    }
-
     #[test]
     fn expire_passed_drops_only_reads_behind_walker() {
         let mut s = ActiveSet::new();
         let mut a = SlotAllocator::new();
         let _r0 = s.admit(solo_read("short", 0, 100, 10), &mut a).unwrap(); // ends 109
         let r1 = s.admit(solo_read("long", 0, 100, 200), &mut a).unwrap(); // ends 299
-        advance_all_cursors_to_end(&mut s);
         // Move walker to 150 — short is past, long still active.
         s.expire_passed(150, &mut a).unwrap();
         assert_eq!(s.len(), 1);
@@ -295,7 +266,6 @@ mod tests {
         let r0 = s.admit(solo_read("a", 0, 100, 1000), &mut a).unwrap(); // ends 1099
         let _r1 = s.admit(solo_read("b", 0, 100, 50), &mut a).unwrap(); // ends 149
         let r2 = s.admit(solo_read("c", 0, 100, 1000), &mut a).unwrap(); // ends 1099
-        advance_all_cursors_to_end(&mut s);
 
         s.expire_passed(200, &mut a).unwrap();
         assert_eq!(s.len(), 2, "middle read expired");

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use ahash::AHashMap;
 
+use super::active_set::ActiveSet;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::slot_allocator::SlotId;
@@ -317,7 +318,7 @@ impl OpenPileupRecordTable {
 /// sequence to compute the haplotype string this read presents
 /// under that record. Events are assumed to be inside the record's
 /// footprint and sorted by anchor.
-pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[&ReadEvent]) -> Vec<u8> {
+pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]) -> Vec<u8> {
     // Walk the ref_seq in offset order, applying events as we
     // pass their anchor positions. Each event is positioned by an
     // offset = (event.anchor_pos - record_pos).
@@ -325,7 +326,7 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[&ReadEvent
 
     // Sort events by anchor for safety (caller should have, but we
     // re-sort since the cost is tiny and the contract is clearer).
-    let mut sorted: Vec<&ReadEvent> = events.to_vec();
+    let mut sorted: Vec<&ReadEvent> = events.iter().collect();
     sorted.sort_by_key(|e| e.anchor_pos());
 
     // Skip indices already consumed by an event so we don't
@@ -436,6 +437,7 @@ pub fn process_position(
     walker_pos: u32,
     chrom_id: u32,
     contributors: &[ReadContribution],
+    active: &ActiveSet,
     fasta: &dyn RefBaseFetcher,
 ) -> Result<ProcessOutcome, WalkerError> {
     let mut affected: Vec<u32> = Vec::new();
@@ -484,15 +486,18 @@ pub fn process_position(
         let _ = walker_pos;
 
         for contrib in contributors {
-            let window_events: Vec<&ReadEvent> = contrib
-                .full_window_events
-                .iter()
-                .filter(|e| {
-                    let s = e.anchor_pos();
-                    let span = e.footprint_span();
-                    s < rec_end && (s + span) > rec_pos
-                })
-                .collect();
+            let active_read = active
+                .get_by_read_id(contrib.read_id)
+                .expect("contributor's read_id must still be in the active set");
+            let mut window_events =
+                active_read
+                    .cursor
+                    .events_overlapping(rec_pos, rec_end, &active_read.read);
+            if contrib.bq_zero_in_window {
+                for ev in &mut window_events {
+                    zero_event_bq(ev);
+                }
+            }
 
             // A contributor only folds into a record if it has
             // events overlapping the record's footprint. (No
@@ -555,6 +560,19 @@ pub struct ProcessOutcome {
     pub widen_count: u64,
 }
 
+/// Set the BQ field of a `ReadEvent` to zero in place. Used by
+/// the open-record fold when a contributor is flagged as the
+/// match-only mate-overlap loser — every window event pulled
+/// through its cursor gets the same BQ-zeroing the eager design
+/// applied to the cloned full-window vector.
+fn zero_event_bq(ev: &mut ReadEvent) {
+    match ev {
+        ReadEvent::Match { bq_baq, .. } => *bq_baq = 0,
+        ReadEvent::Insertion { bq_proxy, .. } => *bq_proxy = 0,
+        ReadEvent::Deletion { bq_proxy, .. } => *bq_proxy = 0,
+    }
+}
+
 fn add_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
     scalars.num_obs += c.num_obs;
     scalars.q_sum += c.q_sum;
@@ -583,7 +601,7 @@ fn subtract_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
 /// window (a clean REF read), we fall back to the read's BQ at
 /// the walker_pos, which is a `Match` event's `bq_baq` already
 /// stamped on the contribution.
-fn ln_bq_for_read(window_events: &[&ReadEvent], fallback_bq: u8) -> f64 {
+fn ln_bq_for_read(window_events: &[ReadEvent], fallback_bq: u8) -> f64 {
     let min_bq = window_events
         .iter()
         .map(|e| match e {
@@ -614,25 +632,23 @@ fn insert_sorted_unique(v: &mut Vec<SlotId>, slot: SlotId) {
 
 /// One read's contribution to the current walker position. The
 /// walker assembles these from its active set before calling
-/// `process_position`.
+/// `process_position`. The contribution carries no event window —
+/// the fold pulls window events lazily from the read's
+/// `CigarCursor` via `read_id` lookup against the `ActiveSet`.
 #[derive(Debug, Clone)]
 pub struct ReadContribution {
     /// Active-set local id of the contributing read. Keys the
-    /// per-record `folded_reads` map so re-folding a read into the
-    /// same record at a later walker step subtracts its prior
-    /// contribution before adding the new one.
+    /// per-record `folded_reads` map (so re-folds subtract the
+    /// prior contribution) and is also how the fold looks the
+    /// read up against the `ActiveSet` to query window events.
     pub read_id: u32,
     pub chain_slot_id: SlotId,
     /// Events whose anchor *is* this walker_pos (used by step 3
     /// to identify candidate records).
     pub events_at_pos: Vec<ReadEvent>,
-    /// All this read's events in a window around the walker_pos,
-    /// for the haplotype-string computation in step 5. In the
-    /// simple non-merged case this is identical to events_at_pos.
-    pub full_window_events: Vec<ReadEvent>,
     /// BAQ-capped BQ at this walker position (the Match-event's
-    /// quality, used as the fallback when window_events is empty
-    /// — a clean REF read).
+    /// quality, used as the fallback when the cursor's window
+    /// returns no events — a clean REF read).
     pub bq_baq_at_walker_pos: u8,
     pub mq_log_err: f64,
     pub is_reverse_strand: bool,
@@ -641,6 +657,12 @@ pub struct ReadContribution {
     /// equal-BQ mate-overlap positions per the spec; not a faithful
     /// proxy for "earlier alignment_start".
     pub is_first_mate: bool,
+    /// Set by `resolve_mate_overlap_at_pos` when this contributor
+    /// is the loser of a Match-only mate-overlap. The fold zeroes
+    /// the BQ on every event it pulls from this contributor's
+    /// cursor — equivalent to the eager design's in-place mutation
+    /// of the cloned full-window event list.
+    pub bq_zero_in_window: bool,
 }
 
 /// Apply slot lifecycle markers from the slot allocator to the
@@ -763,7 +785,7 @@ mod tests {
             base: b'X',
             bq_baq: 30,
         };
-        let out = apply_events_to_ref(100, ref_seq, &[&snp]);
+        let out = apply_events_to_ref(100, ref_seq, std::slice::from_ref(&snp));
         assert_eq!(out, b"ACXTA");
     }
 
@@ -775,7 +797,7 @@ mod tests {
             deleted_len: 2,
             bq_proxy: 30,
         };
-        let out = apply_events_to_ref(100, ref_seq, &[&del]);
+        let out = apply_events_to_ref(100, ref_seq, std::slice::from_ref(&del));
         // Anchor at 100 ("A"), then 2 bases deleted, then "TA".
         assert_eq!(out, b"ATA");
     }
@@ -788,7 +810,7 @@ mod tests {
             seq: b"XX".to_vec(),
             bq_proxy: 30,
         };
-        let out = apply_events_to_ref(100, ref_seq, &[&ins]);
+        let out = apply_events_to_ref(100, ref_seq, std::slice::from_ref(&ins));
         // Anchor "A", inserted "XX", then ref "CGTA".
         assert_eq!(out, b"AXXCGTA");
     }

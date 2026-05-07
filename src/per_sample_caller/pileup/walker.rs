@@ -191,29 +191,17 @@ impl WalkerState {
     }
 
     fn process_position<F: RefBaseFetcher>(&mut self, fasta: &F) -> Result<(), WalkerError> {
-        // Step 1: pop events whose anchor is at walker_pos out of
-        // every active read's pending list. Reads with no events
-        // here are silent at this position (deletion interior or
-        // N-skip), so they are *not* added as contributors at all.
+        // Step 1: query each active read's cursor for events
+        // anchored at walker_pos. Reads with no event here are
+        // silent (deletion interior or N-skip), so they are not
+        // added as contributors at all.
         let walker_pos = self.walker_pos;
         let mut contributors: Vec<ReadContribution> = Vec::new();
 
-        for active in self.active.iter_mut() {
-            let mut events_at_pos: Vec<ReadEvent> = Vec::new();
-            while let Some(ev) = active.events.get(active.event_cursor as usize) {
-                if ev.anchor_pos() != walker_pos {
-                    break;
-                }
-                events_at_pos.push(ev.clone());
-                active.event_cursor += 1;
-            }
+        for active in self.active.iter() {
+            let events_at_pos = active.cursor.events_at(walker_pos, &active.read);
 
             if events_at_pos.is_empty() {
-                // No event at this position from this read. The
-                // read is either inside one of its own deletion
-                // events (already folded at the deletion's anchor)
-                // or inside an N-skip. Either way, no contribution
-                // at walker_pos.
                 continue;
             }
 
@@ -228,34 +216,37 @@ impl WalkerState {
             contributors.push(ReadContribution {
                 read_id: active.read_id,
                 chain_slot_id: active.chain_slot_id,
-                events_at_pos: events_at_pos.clone(),
-                full_window_events: active.events.clone(),
+                events_at_pos,
                 bq_baq_at_walker_pos: bq_at_walker,
                 mq_log_err: active.read.mq_log_err,
                 is_reverse_strand: active.read.is_reverse_strand,
                 alignment_start: active.read.alignment_start,
                 is_first_mate: active.read.is_first_mate,
+                bq_zero_in_window: false,
             });
         }
 
         // Step 2: resolve mate overlap on events at this walker
         // position. For each pair of contributors whose reads
-        // share a chain_slot_id, compare BQ; lower-BQ side gets
-        // its bq_baq_at_walker_pos zeroed (still counts as one
-        // observation but contributes ln(1)=0 log-likelihood
-        // mass).
+        // share a chain_slot_id, compare BQ; the lower-BQ side
+        // has its `bq_baq_at_walker_pos` zeroed (still one
+        // observation, contributing ln(1)=0 log-likelihood mass)
+        // and is flagged so any window event the fold pulls from
+        // its cursor also gets BQ-zeroed.
         resolve_mate_overlap_at_pos(&mut contributors, &mut self.summary);
 
-        // Step 3–6: fold contributors into the records affected at
-        // this walker_pos. The returned outcome counts only the
-        // records that *widened* during this call — fresh opens
-        // and re-finds against an already-large-enough footprint
-        // do not count.
+        // Step 3–6: fold contributors into the records affected
+        // at this walker_pos. The fold queries each contributor's
+        // cursor through `&self.active`; the returned outcome
+        // counts only the records that *widened* during this
+        // call — fresh opens and re-finds against an
+        // already-large-enough footprint do not count.
         let outcome = process_position(
             &mut self.open,
             walker_pos,
             self.chrom_id,
             &contributors,
+            &self.active,
             fasta,
         )?;
         self.summary.record_widen_events += outcome.widen_count;
@@ -294,45 +285,17 @@ impl WalkerState {
     }
 
     fn advance(&mut self, next_pulled: Option<&PreparedRead>) -> Result<(), WalkerError> {
-        // Where do we want to be next? The earliest position where
-        // any active read still has an unprocessed event, OR the
-        // next pulled read's alignment_start, whichever is smaller.
-        let earliest_event_pos = self
-            .active
-            .iter()
-            .filter_map(|active| {
-                active
-                    .events
-                    .get(active.event_cursor as usize)
-                    .map(|ev| ev.anchor_pos())
-            })
-            .min();
-
-        let earliest_active_end = self
-            .active
-            .iter()
-            .map(|active| active.read.alignment_end)
-            .min();
-
-        // We never want to go backwards.
+        // Default: one position forward, so any active read's REF
+        // contribution gets folded at every position it sits on.
         let mut next_pos = self.walker_pos + 1;
 
-        if let Some(pos) = earliest_event_pos {
-            next_pos = next_pos.min(pos.max(self.walker_pos + 1));
-        }
-
-        // If there's an active read with no further events but
-        // still covering us, walk one position at a time so its
-        // REF contribution gets folded everywhere it sits.
-        if earliest_active_end.is_some() {
-            // Already covered by walker_pos + 1 above.
-        } else if let Some(p) = next_pulled
+        // If the active set is empty and the next pulled read
+        // starts past the walker, skip the uncovered span.
+        if self.active.is_empty()
+            && let Some(p) = next_pulled
             && p.chrom_id == self.chrom_id
             && p.alignment_start > self.walker_pos
         {
-            // Active set is empty and there are more reads to
-            // pull; jump to the next read's start (skips
-            // uncovered positions).
             next_pos = p.alignment_start;
         }
 
@@ -477,7 +440,11 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
         }
     }
 
-    // Zero BQs in place first (does not change indices).
+    // Zero BQs in place first (does not change indices). The
+    // `bq_zero_in_window` flag tells the open-record fold to
+    // apply the same zeroing to any window event it pulls
+    // through this contributor's cursor — equivalent to the
+    // eager design's mutation of the cloned `full_window_events`.
     to_zero.sort_unstable();
     to_zero.dedup();
     for idx in to_zero {
@@ -485,9 +452,7 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
         for ev in contributors[idx].events_at_pos.iter_mut() {
             zero_event_bq(ev);
         }
-        for ev in contributors[idx].full_window_events.iter_mut() {
-            zero_event_bq(ev);
-        }
+        contributors[idx].bq_zero_in_window = true;
     }
 
     // Now drop indel-overlap losers from the contributor list.

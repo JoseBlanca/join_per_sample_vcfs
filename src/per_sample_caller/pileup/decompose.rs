@@ -3,7 +3,9 @@
 //! contributions to the pileup. See `ia/specs/pileup_walker.md`
 //! §"Read decomposition" for the algorithm, edge cases, and rules.
 
+#[cfg(test)]
 use super::CigarOp;
+#[cfg(test)]
 use super::PreparedRead;
 
 /// One contribution from a read at a single reference position.
@@ -68,6 +70,12 @@ const INDEL_BQ_PROXY_PAD: usize = 1;
 
 /// Walk `read.cigar` once and emit the read's events in
 /// ref-position order.
+///
+/// Now used only as a parity oracle for `CigarCursor`'s tests
+/// (the lazy cursor produces the same events on demand). Kept
+/// behind `cfg(test)` rather than deleted so the cursor's tests
+/// retain a reference implementation to compare against.
+#[cfg(test)]
 pub fn decompose(read: &PreparedRead) -> Vec<ReadEvent> {
     let mut events: Vec<ReadEvent> = Vec::with_capacity(read.cigar.len());
     let mut ref_pos: u32 = read.alignment_start;

@@ -1,19 +1,30 @@
 //! Lazy CIGAR cursor — emits per-position events on demand from a
-//! `PreparedRead`'s CIGAR. Designed to replace the eager
-//! `Vec<ReadEvent>` per active read and the per-walker-step clones
-//! that drive the O(L²) hot path measured in
+//! `PreparedRead`'s CIGAR. Replaces the eager `Vec<ReadEvent>` per
+//! active read and the per-walker-step clones that drove the
+//! super-linear scaling measured in
 //! [`benches/pileup_walker_scaling.rs`](../../../benches/pileup_walker_scaling.rs).
 //!
-//! Commit 1 of the migration in
-//! `ia/feature_implementation_plans/pileup_lazy_cigar.md`: the
-//! cursor lands here behind the existing `decompose`, with parity
-//! tests asserting it reproduces `decompose`'s output. The walker
-//! still uses `decompose` until commit 2.
-//!
-//! The cursor itself holds only an offset table — one entry per
-//! CIGAR op. Every event-fetching call takes the read back as a
+//! The cursor holds only an offset table — one entry per CIGAR
+//! op. Every event-fetching call takes the read back as a
 //! parameter, so the cursor stays a small self-contained struct
 //! with no borrow on the read's buffers.
+//!
+//! Two query shapes:
+//!
+//! - `events_at(walker_pos, read)`: events whose **anchor** is
+//!   `walker_pos`. The walker uses this once per step to identify
+//!   contributing reads.
+//! - `events_overlapping(lo, hi, read)`: events whose **footprint**
+//!   intersects `[lo, hi)`. The open-record fold uses this to
+//!   compute the haplotype string a read presents under a given
+//!   record's footprint.
+//!
+//! The two are deliberately not equivalent — a deletion anchored
+//! before the window whose deleted run reaches into it overlaps
+//! the window but is not anchored at any position inside.
+//!
+//! Equivalence with the (now test-only) `decompose` reference is
+//! asserted by the parity oracle in this module's test submodule.
 
 use super::CigarOp;
 use super::PreparedRead;
@@ -68,14 +79,31 @@ impl CigarCursor {
         Self { offsets }
     }
 
-    /// Events whose anchor falls in the half-open ref-position
-    /// range `[lo, hi)`. Walks the cigar left-to-right and emits
-    /// in cigar order — same order `decompose` produces. Indels
-    /// are dropped under the same first/last-op rule as
+    /// Events whose **footprint** intersects the half-open
+    /// ref-position range `[lo, hi)`. A Match's footprint is the
+    /// single base at its anchor; an Insertion's is also one base
+    /// (the anchor base, with the inserted run sitting after it);
+    /// a Deletion's footprint covers the anchor plus the
+    /// `deleted_len` deleted bases — so a deletion anchored
+    /// before `lo` whose deleted run reaches into `[lo, hi)` is
+    /// returned.
+    ///
+    /// This matches the predicate the open-record fold uses
+    /// today (`open_record::process_position`'s `s < rec_end &&
+    /// s + span > rec_pos`) so the fold can replace the
+    /// in-memory `full_window_events` filter with one cursor
+    /// call.
+    ///
+    /// Indels are dropped under the same first/last-op rule as
     /// `decompose`: an indel anchored at position 0 (off the
     /// chromosome's start) or carried by the first/last cigar op
     /// (no flanking match to anchor against) is silently skipped.
-    pub(super) fn events_in_window(&self, lo: u32, hi: u32, read: &PreparedRead) -> Vec<ReadEvent> {
+    pub(super) fn events_overlapping(
+        &self,
+        lo: u32,
+        hi: u32,
+        read: &PreparedRead,
+    ) -> Vec<ReadEvent> {
         let mut out = Vec::new();
         if hi <= lo {
             return out;
@@ -109,7 +137,9 @@ impl CigarCursor {
                         continue;
                     }
                     let anchor = off.ref_pos - 1;
-                    if anchor < lo || anchor >= hi {
+                    // Insertion footprint is 1 base (the anchor),
+                    // identical to Match's overlap test.
+                    if anchor >= hi || anchor + 1 <= lo {
                         continue;
                     }
                     let read_off = off.read_pos as usize;
@@ -126,7 +156,10 @@ impl CigarCursor {
                         continue;
                     }
                     let anchor = off.ref_pos - 1;
-                    if anchor < lo || anchor >= hi {
+                    // Deletion footprint is `len + 1` bases:
+                    // anchor + the deleted run.
+                    let footprint_end = anchor + len + 1;
+                    if anchor >= hi || footprint_end <= lo {
                         continue;
                     }
                     let read_off = off.read_pos as usize;
@@ -146,13 +179,78 @@ impl CigarCursor {
         out
     }
 
-    /// Convenience: events anchored exactly at `walker_pos`.
-    /// Equivalent to `events_in_window(walker_pos, walker_pos + 1, read)`.
-    /// At most one Match plus one indel can sit at any single
-    /// anchor (e.g. last base of one M op = anchor of the I/D
-    /// that follows), so the returned vec carries at most 2.
+    /// Events whose **anchor** is exactly `walker_pos`. The
+    /// walker uses this at every step to identify the events the
+    /// active reads contribute at the current position. At most
+    /// one Match plus one indel can share an anchor (the last
+    /// base of one M op equals the anchor of the I/D that
+    /// follows), so the returned vec carries at most 2.
+    ///
+    /// Note this is **not** equivalent to
+    /// `events_overlapping(pos, pos + 1)`: the latter would
+    /// include a deletion anchored before `pos` whose footprint
+    /// reaches `pos`, which the walker has already processed at
+    /// an earlier step.
     pub(super) fn events_at(&self, walker_pos: u32, read: &PreparedRead) -> Vec<ReadEvent> {
-        self.events_in_window(walker_pos, walker_pos + 1, read)
+        let mut out = Vec::new();
+        let n_ops = read.cigar.len();
+        for (i, op) in read.cigar.iter().enumerate() {
+            let off = self.offsets[i];
+            let is_first = i == 0;
+            let is_last = i + 1 == n_ops;
+            match *op {
+                CigarOp::Match(len) | CigarOp::SeqMatch(len) | CigarOp::SeqMismatch(len) => {
+                    let op_lo = off.ref_pos;
+                    let op_hi = op_lo + len;
+                    if walker_pos >= op_lo && walker_pos < op_hi {
+                        let read_off = off.read_pos + (walker_pos - op_lo);
+                        out.push(ReadEvent::Match {
+                            ref_pos: walker_pos,
+                            base: read.seq[read_off as usize],
+                            bq_baq: read.bq_baq[read_off as usize],
+                        });
+                    }
+                }
+                CigarOp::Insertion(len) => {
+                    if is_first || is_last || off.ref_pos <= 1 {
+                        continue;
+                    }
+                    let anchor = off.ref_pos - 1;
+                    if anchor != walker_pos {
+                        continue;
+                    }
+                    let read_off = off.read_pos as usize;
+                    let seq = read.seq[read_off..read_off + len as usize].to_vec();
+                    let bq_proxy = indel_bq_proxy_insertion(&read.bq_baq, read_off, len);
+                    out.push(ReadEvent::Insertion {
+                        anchor_ref_pos: anchor,
+                        seq,
+                        bq_proxy,
+                    });
+                }
+                CigarOp::Deletion(len) => {
+                    if is_first || is_last || off.ref_pos <= 1 {
+                        continue;
+                    }
+                    let anchor = off.ref_pos - 1;
+                    if anchor != walker_pos {
+                        continue;
+                    }
+                    let read_off = off.read_pos as usize;
+                    let bq_proxy = indel_bq_proxy_deletion(&read.bq_baq, read_off, len);
+                    out.push(ReadEvent::Deletion {
+                        anchor_ref_pos: anchor,
+                        deleted_len: len,
+                        bq_proxy,
+                    });
+                }
+                CigarOp::Skip(_)
+                | CigarOp::SoftClip(_)
+                | CigarOp::HardClip(_)
+                | CigarOp::Padding(_) => {}
+            }
+        }
+        out
     }
 }
 
@@ -353,14 +451,16 @@ mod tests {
         ]
     }
 
-    /// Parity oracle: events_in_window covering the entire read
-    /// produces the same Vec<ReadEvent> as `decompose` for every
-    /// pattern in the corpus.
+    /// Parity oracle: `events_overlapping(0, MAX)` returns every
+    /// event `decompose` would emit, in the same order. Footprint
+    /// overlap with `[0, MAX)` is the universal case — every
+    /// event qualifies — so this is the cleanest single-shot
+    /// equivalence test.
     #[test]
     fn cursor_matches_decompose_on_pattern_corpus() {
         for (name, read) in pattern_corpus() {
             let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
-            let cursor_events = cursor.events_in_window(0, u32::MAX, &read);
+            let cursor_events = cursor.events_overlapping(0, u32::MAX, &read);
             let decompose_events = decompose(&read);
             assert_eq!(
                 cursor_events, decompose_events,
@@ -377,8 +477,6 @@ mod tests {
         for (name, read) in pattern_corpus() {
             let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
             let decompose_events = decompose(&read);
-            // Walk a generous range so we exercise both
-            // event-bearing and silent positions.
             for walker_pos in read.alignment_start..=read.alignment_end {
                 let want: Vec<ReadEvent> = decompose_events
                     .iter()
@@ -394,10 +492,12 @@ mod tests {
         }
     }
 
-    /// `events_in_window(lo, hi)` returns exactly the events whose
-    /// anchor falls in `[lo, hi)`.
+    /// `events_overlapping(lo, hi)` returns exactly the events
+    /// whose footprint intersects `[lo, hi)` — the same predicate
+    /// `open_record::process_position` applies to
+    /// `full_window_events` today.
     #[test]
-    fn events_in_window_subsets_correctly() {
+    fn events_overlapping_subsets_correctly() {
         for (name, read) in pattern_corpus() {
             let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
             let decompose_events = decompose(&read);
@@ -415,12 +515,17 @@ mod tests {
                 let want: Vec<ReadEvent> = decompose_events
                     .iter()
                     .filter(|e| {
-                        let a = e.anchor_pos();
-                        a >= lo && a < hi
+                        // Empty windows can never overlap.
+                        if lo >= hi {
+                            return false;
+                        }
+                        let s = e.anchor_pos();
+                        let span = e.footprint_span();
+                        s < hi && s + span > lo
                     })
                     .cloned()
                     .collect();
-                let got = cursor.events_in_window(lo, hi, &read);
+                let got = cursor.events_overlapping(lo, hi, &read);
                 assert_eq!(
                     got, want,
                     "pattern {name}, window [{lo}, {hi}): cursor disagrees with decompose",
@@ -429,17 +534,65 @@ mod tests {
         }
     }
 
+    /// Deletion anchored just before a window: footprint reaches
+    /// in, so `events_overlapping` includes it; `events_at`
+    /// (anchor-only) does not. Pinning the semantic split since
+    /// the open-record fold relies on it.
+    #[test]
+    fn deletion_anchored_before_window_overlaps_but_not_anchored() {
+        // 5M5D5M starting at 100. Deletion anchor at 104, footprint
+        // spans [104, 110) (anchor + 5 deleted bases). A window
+        // [105, 108) does not contain the anchor 104 but the
+        // deletion's footprint reaches in.
+        let read = make_read(
+            vec![CigarOp::Match(5), CigarOp::Deletion(5), CigarOp::Match(5)],
+            100,
+            b"ACGTAACGTA",
+            &[30; 10],
+        );
+        let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
+
+        let overlapping = cursor.events_overlapping(105, 108, &read);
+        assert!(
+            overlapping.iter().any(|e| matches!(
+                e,
+                ReadEvent::Deletion {
+                    anchor_ref_pos: 104,
+                    ..
+                }
+            )),
+            "deletion should be returned by events_overlapping when its footprint reaches the window",
+        );
+        let anchored = cursor.events_at(104, &read);
+        assert!(
+            anchored.iter().any(|e| matches!(
+                e,
+                ReadEvent::Deletion {
+                    anchor_ref_pos: 104,
+                    ..
+                }
+            )),
+            "deletion should be returned by events_at(104)",
+        );
+        let anchored_inside = cursor.events_at(105, &read);
+        assert!(
+            !anchored_inside
+                .iter()
+                .any(|e| matches!(e, ReadEvent::Deletion { .. })),
+            "deletion must NOT be returned by events_at(105) — that anchor is the deletion's interior, not its anchor",
+        );
+    }
+
     /// The cursor is stateless under repeated queries — calling
-    /// `events_in_window` or `events_at` twice with the same args
-    /// returns identical output, and order of mixed calls does
-    /// not matter.
+    /// the same method twice with the same args returns identical
+    /// output, and order of mixed calls does not matter.
     #[test]
     fn cursor_queries_are_stateless() {
         let (_, read) = pattern_corpus().into_iter().next().unwrap();
         let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
-        let a = cursor.events_in_window(0, u32::MAX, &read);
+        let a = cursor.events_overlapping(0, u32::MAX, &read);
         let b = cursor.events_at(read.alignment_start, &read);
-        let c = cursor.events_in_window(0, u32::MAX, &read);
+        let c = cursor.events_overlapping(0, u32::MAX, &read);
         let d = cursor.events_at(read.alignment_start, &read);
         assert_eq!(a, c);
         assert_eq!(b, d);

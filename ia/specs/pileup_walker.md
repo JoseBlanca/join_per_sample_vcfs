@@ -361,6 +361,22 @@ thread boundary cleanly.
 
 ## Read decomposition
 
+> **Implementation note (2026-05-07).** The walker no longer
+> stores the eager `events: Vec<ReadEvent>` per active read.
+> Instead, each `ActiveRead` carries a `CigarCursor` (in
+> `src/per_sample_caller/pileup/cigar_cursor.rs`) — a small
+> per-CIGAR-op offset table that emits events on demand via
+> `events_at(walker_pos, &read)` (anchor-at-pos) or
+> `events_overlapping(lo, hi, &read)` (footprint-overlap).
+> The semantics below are unchanged; the bullet "doing this
+> eagerly is simpler" is no longer true once read length grows
+> past a few kilobases — see
+> [`benches/pileup_walker_scaling.rs`](../../benches/pileup_walker_scaling.rs)
+> and the implementation plan
+> [`feature_implementation_plans/pileup_lazy_cigar.md`](../feature_implementation_plans/pileup_lazy_cigar.md).
+> Treat the prose below as the algorithmic spec; the cursor's
+> two query methods are the canonical realisation.
+
 When a read enters the active set, the walker walks its CIGAR
 once and produces `events: Vec<ReadEvent>` — the read's ordered
 list of per-reference-position contributions. Doing this eagerly
