@@ -4,7 +4,7 @@
 **Reviewer:** Claude (algorithm-comparison study)
 **Module reviewed:** `src/per_sample_caller/pileup`
 **Reference codebase:** `samtools/` (in-tree copy of samtools, not htslib)
-**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the backlog is mostly worked: `S1`, `S3`, `S4`, `S5`, and `S6` are closed (see each finding's Resolution); only `S2` (doc-only stage) remains open.
+**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the entire backlog is closed: `S1`, `S3`, `S4`, `S5`, `S6`, and `S7` were each acted on in this review's pass; `S2` was already addressed (lazy `CigarCursor` shipped in `7088bac` with follow-ups, plus a spec note in `ia/specs/pileup_walker.md`) — see each finding's Resolution.
 
 ---
 
@@ -133,7 +133,8 @@ file cover the threshold-crossing and reset-preservation properties.
 
 - **Priority:** Low today, becomes High if/when long-read support enters scope
 - **Effort:** Documentation now; substantial refactor later
-- **Status:** Open
+- **Status:** Closed — both stages already landed before this review's
+  backlog work began.
 
 **Observation.** `samtools/consensus_pileup.c` (`get_next_base`) walks
 CIGAR ops lazily via a single `(cigar_ind, cigar_op, cigar_len)` cursor
@@ -167,6 +168,30 @@ a silent footgun the next time we widen scope.
 
 **Risk.** Stage 1 (doc only) — none. Stage 2 — touches the hottest
 path; would need a dedicated benchmark and a careful diff.
+
+**Resolution.** Both stages already done by the time the
+backlog-work pass started, so no new commit was needed:
+
+- The "later" stage 2 (lazy CIGAR cursor) shipped in commit
+  `7088bac` ("Switch pileup walker to lazy CigarCursor"),
+  followed by perf-tuning passes in `401fe94` (early-break),
+  `5886d0c` (multi-op bench fixture), and `3a6dcc2` (auto-
+  selecting binary search). `ActiveRead` no longer carries
+  `events: Vec<ReadEvent>`; events are emitted on demand from
+  the [`CigarCursor`](../../src/per_sample_caller/pileup/cigar_cursor.rs).
+- The "now" stage 1 (doc note) is in
+  [ia/specs/pileup_walker.md:365–377](../specs/pileup_walker.md):
+  the spec explicitly records that the in-text "eager `Vec<ReadEvent>`"
+  description is the *algorithmic spec* but the in-tree code
+  uses the cursor, and points readers to
+  [`feature_implementation_plans/pileup_lazy_cigar.md`](../feature_implementation_plans/pileup_lazy_cigar.md)
+  for the rationale and benchmark numbers.
+
+The original observation in the review ("we eagerly emit
+`ReadEvent`s, which becomes the dominant memory cost on long
+reads") is now stale — the hot path is `O(reads)` not
+`O(reads × span)`, so the long-read memory blow-up the finding
+warned about no longer applies.
 
 ### `S3` — Defensive supplementary/secondary alignment guard at admission
 
@@ -619,7 +644,5 @@ small commit:
 3. ~~`S4` — investigate ref-fetch caching; add if needed.~~ **Closed without code change (2026-05-07) — `noodles_fasta::Repository` already caches; see S4's Resolution.**
 4. ~~`S6` — chrom-boundary eviction in the production `RefBaseFetcher`.~~ **Done in `453715b` (2026-05-07) — split out of S4 once `Repository::clear()` was confirmed public; see S6's Resolution.**
 5. ~~`S5` — per-column depth cap.~~ **Done in `8ba0bc0` (2026-05-07) — adopted samtools' caps as defaults rather than waiting for our own data; the per-allele framing in the original proposal was rejected as statistically biased; see S5's Resolution.**
-6. `S2` — long-read assumption note in the spec (doc-only stage).
-
-`S2` stage-2 (the lazy-CIGAR refactor) is parked until long-read
-support is decided.
+6. ~~`S2` — long-read assumption note in the spec, plus eventual lazy-CIGAR refactor.~~ **Already done before the backlog pass started: stage 2 in `7088bac` / `401fe94` / `5886d0c` / `3a6dcc2` (lazy `CigarCursor`); stage 1 note in [ia/specs/pileup_walker.md:365–377](../specs/pileup_walker.md). See S2's Resolution.**
+7. ~~`S7` — adopt samtools' BQ-combining math for match-only mate-overlap.~~ **Done in `b7b3807` (2026-05-07) — agree-case keeper takes summed BQ (cap 200), disagree-case winner gets `(bq * 0.8) as u8`; see S7's Resolution.**
