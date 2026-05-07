@@ -6,5 +6,6 @@ python_draft/__pycache__/
 gatk/
 freebayes/
 samtools/
+htslib/
 /CLAUDE.md
 /.claude/
