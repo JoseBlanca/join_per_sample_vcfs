@@ -124,6 +124,69 @@ If a future filter needs a tunable, add it here and reference it from
 `Option` makes the absent state structurally distinct from any
 specific threshold.
 
+> **Original design (historical, kept as reference).** The first
+> iteration of this plan exposed every flag-drop as a toggleable
+> bool — `drop_unmapped`, `drop_secondary`, `drop_supplementary`,
+> `drop_qc_fail`, `drop_duplicate` — all defaulting to `true`. The
+> assumption was that every flag was a user-tunable filter.
+>
+> ```rust
+> pub struct CramMergedReaderConfig {
+>     /// `None` = no minimum; `Some(n)` = drop reads with MAPQ < n.
+>     pub min_mapq: Option<u8>,
+>     /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
+>     /// length < n.
+>     pub min_read_length: Option<u32>,
+>     pub drop_unmapped: bool,        // flag & 0x4
+>     pub drop_secondary: bool,       // flag & 0x100
+>     pub drop_supplementary: bool,   // flag & 0x800
+>     pub drop_qc_fail: bool,         // flag & 0x200
+>     pub drop_duplicate: bool,       // flag & 0x400
+> }
+> ```
+
+**Revisions: three toggles removed.** `drop_unmapped`,
+`drop_secondary`, and `drop_supplementary` are no longer toggleable;
+those three classes are unconditionally dropped, and the
+configuration surface no longer lets a caller put them back in. The
+drops are still surfaced via `FilterCounts.{unmapped, secondary,
+supplementary}` so callers can audit how many records were removed.
+
+This happened in two steps:
+
+- **2026-05-01 (commit `08c2589`, "M4: always drop unmapped reads,
+  remove `drop_unmapped` toggle").** Unmapped reads have no
+  `reference_sequence_id` / `alignment_start`, so admitting them
+  trips the merge walker's head-key invariant. Allowing the toggle
+  to disable the unmapped drop was therefore a footgun with no
+  legitimate use.
+- **2026-05-07 (this revision).** The same logic was extended to
+  secondary and supplementary alignments, prompted by finding S3 in
+  the [pileup-vs-samtools review](../reviews/pileup_samtools_comparison_2026-05-07.md).
+  S3 originally proposed adding a defensive `debug_assert!` at the
+  walker's `ActiveSet::admit` boundary; on closer inspection,
+  removing the toggles upstream is strictly stronger because it
+  makes the misconfiguration *unrepresentable* rather than asserting
+  against it after the fact. The two flag classes are unsafe to
+  admit because:
+  - **Secondary** is a duplicated projection of a primary alignment;
+    admitting it double-counts the same molecule's bases.
+  - **Supplementary** is a chunk of a chimeric (long) read whose
+    other chunks are tracked separately; admitting it breaks the
+    one-slot-per-mate-pair invariant in the pileup walker.
+
+In each case the walker's per-record-closure semantics are simply
+not defined for the read, so there is no useful behaviour for the
+toggle to enable. The remaining toggles (`drop_qc_fail`,
+`drop_duplicate`) are kept because their flags genuinely do
+correspond to admissible reads under some legitimate workflows
+(re-evaluating QC-failed records from an over-aggressive upstream
+caller; keeping marked duplicates for certain QC pipelines).
+
+A future BAM (or other) input path should mirror this policy — or
+document a strong reason and a redesign of the walker contract
+before diverging.
+
 ```rust
 pub struct CramMergedReaderConfig {
     /// `None` = no minimum; `Some(n)` = drop reads with MAPQ < n.
@@ -131,11 +194,10 @@ pub struct CramMergedReaderConfig {
     /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
     /// length < n.
     pub min_read_length: Option<u32>,
-    pub drop_unmapped: bool,        // flag & 0x4
-    pub drop_secondary: bool,       // flag & 0x100
-    pub drop_supplementary: bool,   // flag & 0x800
-    pub drop_qc_fail: bool,         // flag & 0x200
-    pub drop_duplicate: bool,       // flag & 0x400
+    /// Drop reads with `flag & 0x200` set.
+    pub drop_qc_fail: bool,
+    /// Drop reads with `flag & 0x400` set.
+    pub drop_duplicate: bool,
 }
 
 impl Default for CramMergedReaderConfig {
@@ -143,9 +205,6 @@ impl Default for CramMergedReaderConfig {
         Self {
             min_mapq: Some(DEFAULT_MIN_MAPQ),
             min_read_length: Some(DEFAULT_MIN_READ_LENGTH),
-            drop_unmapped: true,
-            drop_secondary: true,
-            drop_supplementary: true,
             drop_qc_fail: true,
             drop_duplicate: true,
         }

@@ -188,6 +188,22 @@ pub struct FilterCounts {
 /// would make `Some(0)` and `None` redundant representations of the
 /// same behaviour; `Option` makes the absent state structurally
 /// distinct from any specific threshold.
+///
+/// **Why no `drop_secondary` / `drop_supplementary` toggles.** Both
+/// classes of non-primary alignment are unconditionally dropped — the
+/// pileup walker's per-record-closure semantics (`PileupRecord`,
+/// `AlleleObservation`, phase-chain slots) are defined only for
+/// primary alignments. A secondary alignment is a duplicated
+/// projection of a read already represented by its primary, and a
+/// supplementary alignment is a chunk of a chimeric read whose other
+/// chunks are tracked separately; admitting either would silently
+/// double-count alleles or break the one-slot-per-pair invariant.
+/// The drops are still surfaced via `FilterCounts.secondary` /
+/// `.supplementary` so users can audit how many records were
+/// removed, but there is no configuration that lets them through.
+/// A future BAM (or other) input path should mirror this policy, or
+/// document a strong reason and a redesign of the walker contract
+/// before diverging.
 #[derive(Debug, Clone, Copy)]
 pub struct CramMergedReaderConfig {
     /// `None` = no minimum; `Some(n)` = drop reads with MAPQ < n.
@@ -195,10 +211,6 @@ pub struct CramMergedReaderConfig {
     /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
     /// length < n.
     pub min_read_length: Option<u32>,
-    /// Drop reads with `flag & 0x100` set.
-    pub drop_secondary: bool,
-    /// Drop reads with `flag & 0x800` set.
-    pub drop_supplementary: bool,
     /// Drop reads with `flag & 0x200` set.
     pub drop_qc_fail: bool,
     /// Drop reads with `flag & 0x400` set.
@@ -218,8 +230,6 @@ impl Default for CramMergedReaderConfig {
         Self {
             min_mapq: Some(DEFAULT_MIN_MAPQ),
             min_read_length: Some(DEFAULT_MIN_READ_LENGTH),
-            drop_secondary: true,
-            drop_supplementary: true,
             drop_qc_fail: true,
             drop_duplicate: true,
         }
@@ -1033,12 +1043,15 @@ fn classify_pre_decode(
             return PreDecodeOutcome::Drop(FilterBucket::LowMapq);
         }
     }
-    // 3. Supplementary (~1-5%).
-    if config.drop_supplementary && (flag & FLAG_SUPPLEMENTARY) != 0 {
+    // 3. Supplementary (~1-5%) — unconditionally dropped; see the
+    //    "Why no drop_secondary / drop_supplementary toggles" note
+    //    on `CramMergedReaderConfig`.
+    if (flag & FLAG_SUPPLEMENTARY) != 0 {
         return PreDecodeOutcome::Drop(FilterBucket::Supplementary);
     }
-    // 4. Secondary (~1-5%).
-    if config.drop_secondary && (flag & FLAG_SECONDARY) != 0 {
+    // 4. Secondary (~1-5%) — unconditionally dropped; same rationale
+    //    as supplementary.
+    if (flag & FLAG_SECONDARY) != 0 {
         return PreDecodeOutcome::Drop(FilterBucket::Secondary);
     }
     // 5. Unmapped (~0-5%) — always dropped. An unmapped read contributes
@@ -1593,6 +1606,12 @@ mod tests {
 
     #[test]
     fn a9_each_flag_drop_one_at_a_time() {
+        // Only `drop_qc_fail` and `drop_duplicate` are toggleable;
+        // secondary/supplementary are unconditionally dropped (see
+        // the policy note on `CramMergedReaderConfig`) and so they
+        // can't be isolated by toggling. Their behaviour is
+        // covered by the all-defaults assertion at the bottom of
+        // the test, which still expects each bucket count to be 1.
         type FlagCase = (
             fn(&mut CramMergedReaderConfig),
             &'static str,
@@ -1601,26 +1620,6 @@ mod tests {
         let cases: &[FlagCase] = &[
             (
                 |c| {
-                    c.drop_supplementary = false;
-                    c.drop_qc_fail = false;
-                    c.drop_duplicate = false;
-                },
-                "secondary",
-                |c| c.secondary,
-            ),
-            (
-                |c| {
-                    c.drop_secondary = false;
-                    c.drop_qc_fail = false;
-                    c.drop_duplicate = false;
-                },
-                "supplementary",
-                |c| c.supplementary,
-            ),
-            (
-                |c| {
-                    c.drop_secondary = false;
-                    c.drop_supplementary = false;
                     c.drop_duplicate = false;
                 },
                 "qc_fail",
@@ -1628,8 +1627,6 @@ mod tests {
             ),
             (
                 |c| {
-                    c.drop_secondary = false;
-                    c.drop_supplementary = false;
                     c.drop_qc_fail = false;
                 },
                 "duplicate",
@@ -1682,14 +1679,17 @@ mod tests {
     }
 
     #[test]
-    fn a10_all_optional_flag_drops_disabled_keeps_everything_except_unmapped() {
+    fn a10_all_optional_flag_drops_disabled_keeps_only_unconditional_drops() {
+        // Disabling every toggleable flag drop (`drop_qc_fail`,
+        // `drop_duplicate`) leaves only the unconditional drops:
+        // unmapped, secondary, and supplementary. Three of six
+        // records survive (clean, qc_fail, duplicate); the other
+        // three each tick exactly one filter bucket.
         let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
         let cram_a = open_cram_from_records("a.cram", recs);
         let cfg = CramMergedReaderConfig {
             min_mapq: None,
             min_read_length: None,
-            drop_secondary: false,
-            drop_supplementary: false,
             drop_qc_fail: false,
             drop_duplicate: false,
         };
@@ -1702,10 +1702,11 @@ mod tests {
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
         assert!(err.is_none());
-        // Unmapped is now always dropped — five of six records survive.
-        assert_eq!(out.len(), 5);
+        assert_eq!(out.len(), 3);
         let expected = FilterCounts {
             unmapped: 1,
+            secondary: 1,
+            supplementary: 1,
             ..FilterCounts::default()
         };
         assert_eq!(counts, expected);
