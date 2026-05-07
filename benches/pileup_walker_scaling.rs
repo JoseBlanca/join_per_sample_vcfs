@@ -21,7 +21,7 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use merge_per_sample_vcfs::per_sample_caller::pileup::{
-    CigarOp, PileupRecord, PreparedRead, RefBaseFetcher, run,
+    CigarOp, PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig, run,
 };
 
 /// Constant-base reference. The walker only needs `RefBaseFetcher`,
@@ -188,7 +188,7 @@ fn run_walker(reads: Vec<PreparedRead>, fasta: &ConstFasta) -> u64 {
         }
         count
     });
-    run(reads, fasta, &tx).expect("walker run failed");
+    run(reads, fasta, &tx, &WalkerConfig::default()).expect("walker run failed");
     drop(tx);
     collector.join().expect("collector panicked")
 }
