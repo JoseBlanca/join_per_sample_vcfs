@@ -23,3 +23,7 @@ criterion = "0.8.2"
 [[bench]]
 name = "gvcf_perf"
 harness = false
+
+[[bench]]
+name = "pileup_walker_scaling"
+harness = false
