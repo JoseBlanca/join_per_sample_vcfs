@@ -12,7 +12,7 @@ use super::open_record::{
     OpenPileupRecordTable, ReadContribution, process_position, stamp_lifecycle_marks,
 };
 use super::slot_allocator::{SlotAllocator, SlotAllocatorCounters, SlotId};
-use super::{PileupRecord, PreparedRead, RefBaseFetcher};
+use super::{PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig};
 
 /// Run the walker over a coordinate-sorted stream of prepared
 /// reads, pushing each closed `PileupRecord` through `tx`.
@@ -25,12 +25,13 @@ pub fn run<I, F>(
     reads: I,
     fasta: &F,
     tx: &SyncSender<PileupRecord>,
+    config: &WalkerConfig,
 ) -> Result<RunSummary, WalkerError>
 where
     I: IntoIterator<Item = PreparedRead>,
     F: RefBaseFetcher,
 {
-    let mut state = WalkerState::new();
+    let mut state = WalkerState::new(*config);
     let mut iter = reads.into_iter().peekable();
 
     // Continue while there is work to do: more reads to pull,
@@ -105,6 +106,13 @@ pub struct RunSummary {
     pub slot_allocations: u64,
     pub slot_high_water: u32,
     pub mate_lookup_evictions: u64,
+    /// Number of columns where the contributor list was truncated
+    /// because depth exceeded the applicable per-column cap (see
+    /// `WalkerConfig::max_snp_column_depth` /
+    /// `max_indel_column_depth`). A non-zero value flags
+    /// pathologically deep regions; QC pipelines may want to look
+    /// at those samples / regions specifically.
+    pub column_depth_truncations: u64,
 }
 
 impl RunSummary {
@@ -134,10 +142,11 @@ struct WalkerState {
     slots: SlotAllocator,
     open: OpenPileupRecordTable,
     summary: RunSummary,
+    config: WalkerConfig,
 }
 
 impl WalkerState {
-    fn new() -> Self {
+    fn new(config: WalkerConfig) -> Self {
         Self {
             chrom_id: 0,
             walker_pos: 1,
@@ -147,6 +156,7 @@ impl WalkerState {
             slots: SlotAllocator::new(),
             open: OpenPileupRecordTable::new(),
             summary: RunSummary::default(),
+            config,
         }
     }
 
@@ -234,6 +244,23 @@ impl WalkerState {
         // and is flagged so any window event the fold pulls from
         // its cursor also gets BQ-zeroed.
         resolve_mate_overlap_at_pos(&mut contributors, &mut self.summary);
+
+        // Step 2b: per-column depth cap. Adopted from samtools'
+        // mpileup (see `WalkerConfig` doc-comment). Apply *after*
+        // mate-overlap so the cap counts genuine post-collapse
+        // observations, not per-mate. Detect "indel column" from
+        // the post-collapse contributor events — any Insertion or
+        // Deletion at this anchor flips the column to the tighter
+        // indel cap. Reads in the active set are not
+        // allele-correlated in iteration order, so a deterministic
+        // truncate-to-first-N is approximately unbiased and avoids
+        // the random-sample machinery a per-allele clip would
+        // require.
+        let cap = column_depth_cap(&contributors, &self.config);
+        if contributors.len() > cap {
+            contributors.truncate(cap);
+            self.summary.column_depth_truncations += 1;
+        }
 
         // Step 3–6: fold contributors into the records affected
         // at this walker_pos. The fold queries each contributor's
@@ -473,6 +500,22 @@ fn pair_has_indel(a: &ReadContribution, b: &ReadContribution) -> bool {
             .any(|e| !matches!(e, ReadEvent::Match { .. }))
     };
     has_indel(a) || has_indel(b)
+}
+
+/// Per-column depth cap. Returns the lower indel cap if any
+/// contributor reports an Insertion or Deletion at this anchor;
+/// otherwise the SNP/REF cap.
+fn column_depth_cap(contributors: &[ReadContribution], config: &WalkerConfig) -> usize {
+    let any_indel = contributors.iter().any(|c| {
+        c.events_at_pos
+            .iter()
+            .any(|e| !matches!(e, ReadEvent::Match { .. }))
+    });
+    if any_indel {
+        config.max_indel_column_depth as usize
+    } else {
+        config.max_snp_column_depth as usize
+    }
 }
 
 fn zero_event_bq(ev: &mut ReadEvent) {

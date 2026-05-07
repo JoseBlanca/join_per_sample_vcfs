@@ -54,6 +54,53 @@ pub const MATE_LOOKUP_WINDOW: u32 = 10_000;
 pub const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 
 // ---------------------------------------------------------------------
+// WalkerConfig
+// ---------------------------------------------------------------------
+
+/// Tunable thresholds the walker reads at run time. Mirrors the
+/// per-stage pattern of `CramMergedReaderConfig` (input stage):
+/// every value here is a parameter the future CLI binds to. New
+/// walker tunables go in this struct rather than as bare `pub
+/// const`s; existing consts are migrated opportunistically.
+///
+/// **Per-column depth caps** (`max_snp_column_depth`,
+/// `max_indel_column_depth`) defend against pathologically deep
+/// regions. Adopted from samtools' `MPLP_MAX_DEPTH` (8000) and
+/// `MPLP_MAX_INDEL_DEPTH` (250) — the indel cap is far tighter
+/// because homopolymer-context indels saturate beyond what the
+/// likelihood math needs. The cap is per-column, not per-allele:
+/// per-allele clipping would silently bias the allele-frequency
+/// estimate (a 99/1 column with cap=250 would report ~71/29).
+/// When the contributor count at a column exceeds the cap, we
+/// keep the first `cap` items and drop the rest; reads in the
+/// active set are not allele-correlated in their iteration order,
+/// so this is approximately unbiased without needing a full
+/// random-sample step.
+///
+/// With the current `MAX_ACTIVE_SLOTS = 4096`, only the indel cap
+/// can fire (column depth is already bounded below the SNP cap).
+/// The SNP cap is future-proofing for if/when the slot cap is
+/// raised.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkerConfig {
+    /// Maximum contributors to fold at a column whose alleles are
+    /// all SNP/REF (no indel events at this anchor).
+    pub max_snp_column_depth: u32,
+    /// Maximum contributors to fold at a column carrying any
+    /// indel observation at this anchor.
+    pub max_indel_column_depth: u32,
+}
+
+impl Default for WalkerConfig {
+    fn default() -> Self {
+        Self {
+            max_snp_column_depth: 8000,
+            max_indel_column_depth: 250,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // PreparedRead
 // ---------------------------------------------------------------------
 

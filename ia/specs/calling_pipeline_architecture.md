@@ -78,6 +78,49 @@ and on the `.psf` files alone, which is what makes cohort recall cheap
 and BAM-free. Only Stage 4 is inherently sequential; Stages 1 and 5
 parallelise cleanly (across samples and across groups respectively).
 
+## Configurable parameters
+
+Tunables live in **per-stage configuration structs**, one per
+pipeline stage that needs them. The future CLI binds to all of
+them, but each stage's config is independently constructible so
+tests, library users, and intermediate stages can use just what
+they need without depending on the whole pipeline's surface area.
+
+Existing config structs:
+
+- **`per_sample_caller::cram_input::CramMergedReaderConfig`** —
+  Stage 1 input filter knobs. Currently holds: `min_mapq`
+  (`Option<u8>`), `min_read_length` (`Option<u32>`),
+  `drop_qc_fail` (`bool`), `drop_duplicate` (`bool`). Other flag
+  classes (unmapped, secondary, supplementary) are unconditionally
+  dropped and are *not* exposed as toggles — see the doc-comment
+  on the struct for the rationale.
+- **`per_sample_caller::pileup::WalkerConfig`** — Stage 1 pileup
+  walker knobs. Currently holds the per-column depth caps
+  `max_snp_column_depth` (default 8000) and
+  `max_indel_column_depth` (default 250), adopted from samtools'
+  `MPLP_MAX_DEPTH` / `MPLP_MAX_INDEL_DEPTH` (the lower indel cap
+  exists because homopolymer-context indels saturate beyond what
+  the likelihood math needs).
+
+Rule of thumb for new tunables:
+
+1. **New tunable that the user might want to override** → add a
+   field to the relevant stage's config struct with a sensible
+   default. Avoid bare `pub const`s for anything a CLI flag might
+   want to bind.
+2. **Existing `pub const` that turns out to need tuning** →
+   migrate it to its stage's config struct opportunistically (when
+   there's a real reason, not speculatively).
+3. **Tunable that crosses stages** → put it in the *consumer*
+   stage's config and document the cross-stage relationship; do
+   not introduce a global config struct.
+
+Defaults should be borrowed from samtools / bcftools / freebayes
+where they have empirical grounding, with a comment naming the
+source so a future engineer revisiting on real data can see where
+the number came from.
+
 ## Stage 1 — per-sample caller
 
 ### Purpose

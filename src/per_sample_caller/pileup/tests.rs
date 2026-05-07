@@ -12,6 +12,7 @@ use std::thread;
 use super::CigarOp;
 use super::PreparedRead;
 use super::RefBaseFetcher;
+use super::WalkerConfig;
 use super::run;
 
 // ---------------------------------------------------------------------
@@ -114,6 +115,17 @@ pub fn drive_walker_with_summary(
     reads: Vec<PreparedRead>,
     fasta: MockFasta,
 ) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
+    drive_walker_with_config(reads, fasta, &WalkerConfig::default())
+}
+
+/// Drive `run` with an explicit `WalkerConfig`. Used by tests that
+/// need to override defaults (e.g., the per-column depth caps to
+/// trip the truncation path with a small synthetic input).
+pub fn drive_walker_with_config(
+    reads: Vec<PreparedRead>,
+    fasta: MockFasta,
+    config: &WalkerConfig,
+) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
     let (tx, rx) = mpsc::sync_channel::<super::PileupRecord>(64);
     let collector = thread::spawn(move || {
         let mut out = Vec::new();
@@ -122,7 +134,7 @@ pub fn drive_walker_with_summary(
         }
         out
     });
-    let summary = run(reads, &fasta, &tx).expect("walker run failed");
+    let summary = run(reads, &fasta, &tx, config).expect("walker run failed");
     drop(tx);
     let records = collector.join().expect("collector thread panicked");
     (records, summary)
@@ -541,7 +553,7 @@ fn out_of_order_input_is_a_hard_error() {
     let r1 = snp_read("r1", 5, b"ACG", &[30; 3]);
     let r2 = snp_read("r2", 1, b"ACG", &[30; 3]); // before r1 — invalid
     let (tx, _rx) = mpsc::sync_channel::<super::PileupRecord>(64);
-    let result = run(vec![r1, r2], &fa, &tx);
+    let result = run(vec![r1, r2], &fa, &tx, &WalkerConfig::default());
     assert!(result.is_err());
     let err = result.unwrap_err();
     let msg = err.to_string();
@@ -562,4 +574,98 @@ fn lifecycle_markers_appear_on_emitted_records() {
     let total_expired: usize = records.iter().map(|r| r.expired_chains.len()).sum();
     assert_eq!(total_new, 1, "exactly one chain start across all records");
     assert_eq!(total_expired, 1, "exactly one chain end across all records");
+}
+
+#[test]
+fn column_depth_cap_truncates_snp_only_column_when_over_cap() {
+    // Five SNP-only reads anchored at pos 1, each spanning 5
+    // bases. Every column has 5 contributors and only Match
+    // events, so the SNP cap applies. With max_snp_column_depth=3
+    // we expect every column to truncate to 3 contributors.
+    let fa = MockFasta::new("ACGTA");
+    let reads: Vec<_> = (0..5)
+        .map(|i| snp_read(&format!("r{i}"), 1, b"ACGTA", &[30; 5]))
+        .collect();
+    let cfg = WalkerConfig {
+        max_snp_column_depth: 3,
+        max_indel_column_depth: 99,
+    };
+    let (records, summary) = drive_walker_with_config(reads, fa, &cfg);
+
+    // 5 columns, all over-cap → 5 truncations.
+    assert_eq!(summary.column_depth_truncations, 5);
+    // No column should report num_obs > cap.
+    for rec in &records {
+        for allele in &rec.alleles {
+            assert!(
+                allele.scalars.num_obs <= 3,
+                "pos {}: num_obs {} should be capped at 3",
+                rec.pos,
+                allele.scalars.num_obs,
+            );
+        }
+    }
+}
+
+#[test]
+fn column_depth_cap_uses_indel_cap_when_any_indel_event_present() {
+    // Four SNP-only reads + one indel-bearing read, all anchored
+    // at pos 1. At column pos 1 the indel-bearing read contributes
+    // an Insertion event — the column flips to "indel column" and
+    // the tighter indel cap applies. At pos 2 onward only Match
+    // events remain, so the (much higher) SNP cap applies and
+    // does not fire.
+    let fa = MockFasta::new("AAAACGT");
+    let mut reads: Vec<PreparedRead> = (0..4)
+        .map(|i| snp_read(&format!("snp{i}"), 1, b"AAAACGT", &[30; 7]))
+        .collect();
+    // Indel read: 1M 2I 5M starting at pos 1; anchor of the
+    // insertion is pos 1.
+    let indel = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 6,
+        cigar: vec![CigarOp::Match(1), CigarOp::Insertion(2), CigarOp::Match(5)],
+        seq: b"AXXAAACG".to_vec(),
+        bq_baq: vec![30; 8],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("indel"),
+        is_first_mate: true,
+        has_mate: false,
+    };
+    reads.push(indel);
+
+    let cfg = WalkerConfig {
+        max_snp_column_depth: 99,  // far above 5; SNP-only cols don't fire
+        max_indel_column_depth: 2, // below 5; indel col at pos 1 fires
+    };
+    let (_records, summary) = drive_walker_with_config(reads, fa, &cfg);
+
+    // Exactly one column carried an indel event (pos 1), and that
+    // column had 5 contributors > indel cap of 2 → one truncation.
+    assert_eq!(
+        summary.column_depth_truncations, 1,
+        "indel cap should fire exactly once at the indel-anchor column",
+    );
+}
+
+#[test]
+fn column_depth_cap_does_not_fire_below_threshold() {
+    // Two SNP-only reads, default config (caps 8000 and 250).
+    // Far below either cap → no truncation, every contributor
+    // folds.
+    let fa = MockFasta::new("ACGTA");
+    let r1 = snp_read("r1", 1, b"ACGTA", &[30; 5]);
+    let r2 = snp_read("r2", 1, b"ACGTA", &[30; 5]);
+    let (records, summary) = drive_walker_with_summary(vec![r1, r2], fa);
+
+    assert_eq!(summary.column_depth_truncations, 0);
+    for rec in &records {
+        assert_eq!(
+            rec.alleles[0].scalars.num_obs, 2,
+            "pos {}: both reads should fold (no truncation under default cap)",
+            rec.pos,
+        );
+    }
 }
