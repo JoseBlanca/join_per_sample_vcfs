@@ -75,6 +75,38 @@ Plan targets:
 
 All clear by an order of magnitude or more.
 
+## Multi-op baseline (added later same day)
+
+Recorded after the early-break landed (commit `401fe94`), as a
+forward-looking guide for future cursor changes (the
+binary-search-on-offsets idea queued in the plan). Same span /
+coverage as the main bench; CIGAR is `[M(50), I(2)] × cycles +
+M(remainder)`, so each read carries many small ops scaling with
+`L`.
+
+| L | CIGAR ops | time | per-position |
+|---|---|---|---|
+|  150 |   5 | 436 ms |  8.7 µs |
+|  500 |  19 | 551 ms | 11.0 µs |
+| 1500 |  59 | 602 ms | 12.0 µs |
+| 5000 | 199 | 803 ms | 16.1 µs |
+
+For comparison, the single-op fixture reported 470 / 452 / 456 /
+400 ms on the same run — per-position cost stays ~9 µs across L
+because there's only one op to walk per query. The multi-op
+fixture climbs from 8.7 µs to 16.1 µs as ops grow 5 → 199, which
+is the cost the early-break already trims and the
+binary-search-on-offsets would trim further.
+
+The fixture uses **insertions** rather than deletions: an early
+draft with `[M(50), D(2)]` cycles tripped the walker's
+`MAX_RECORD_SPAN = 5000` cap because high-coverage overlapping
+deletions chain-widen the same open record. Insertions have
+footprint span 1 (just the anchor base), so they never widen
+records. The walker safety cap correctly fired on the first
+draft — the walker did the right thing; the fixture was the
+wrong workload.
+
 ## Trade-offs and follow-ups
 
 - **Public API unchanged.** `PreparedRead`, `PileupRecord`,
