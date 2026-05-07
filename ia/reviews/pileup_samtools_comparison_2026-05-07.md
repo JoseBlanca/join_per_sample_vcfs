@@ -4,7 +4,7 @@
 **Reviewer:** Claude (algorithm-comparison study)
 **Module reviewed:** `src/per_sample_caller/pileup`
 **Reference codebase:** `samtools/` (in-tree copy of samtools, not htslib)
-**Status:** Advisory — no defects; a small backlog of optional improvements
+**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the backlog is partially worked: `S1`, `S3`, and `S4` are closed (see each finding's Resolution); `S2` (doc-only stage) and `S5` (deferred) remain open.
 
 ---
 
@@ -100,7 +100,7 @@ Priority key:
 
 - **Priority:** Medium
 - **Effort:** Small (one log call, one threshold constant, one test)
-- **Status:** Open
+- **Status:** Closed in commit `5c90fbb` (2026-05-07).
 
 **Observation.** `bam_plcmd.c:1234` warns when `max_depth * nfn` is
 projected above 1M, before the depth cap is hit. Our slot allocator
@@ -119,6 +119,15 @@ investigate. Idempotent within a run.
 
 **Risk.** Effectively none — it's a soft signal that does not change
 behaviour on the happy path.
+
+**Resolution.** Implemented as proposed. Added
+`HIGH_WATER_WARN_THRESHOLD = MAX_ACTIVE_SLOTS * 3 / 4` and a one-shot
+`high_water_warned: bool` flag to `SlotAllocator` ([slot_allocator.rs](../../src/per_sample_caller/pileup/slot_allocator.rs)).
+The warning is `eprintln!` rather than `tracing::warn!` because the
+project has no logging crate yet — easy to swap later. The flag is
+deliberately preserved across `reset()` so the warning fires at most
+once per run, not once per chromosome. Two new tests in the same
+file cover the threshold-crossing and reset-preservation properties.
 
 ### `S2` — Document and (later) consider lazy CIGAR walking for long reads
 
@@ -164,7 +173,8 @@ path; would need a dedicated benchmark and a careful diff.
 - **Priority:** Low
 - **Effort:** Small (requires `is_supplementary`/`is_secondary` to
   flow into `PreparedRead`, plus a `debug_assert!` at admission)
-- **Status:** Open
+- **Status:** Closed in commit `7d875ac` (2026-05-07) — superseded
+  by upstream tightening rather than implemented as proposed.
 
 **Observation.** Both samtools and we rely on upstream filters to
 exclude supplementary and secondary alignments from the pileup input.
@@ -187,11 +197,33 @@ ground truth.
 constructor that hand-builds reads needs the new fields. That's the
 main cost; the guard itself is trivial.
 
+**Resolution.** A check of who actually consumes the toggles
+(`grep -rn 'drop_secondary\|drop_supplementary' src/`) showed the
+two booleans were referenced *only* inside `cram_input.rs` — no
+CLI flag, no library caller, no production code. They were public
+configuration with no documented use case, so the chosen fix was
+strictly stronger than the proposed `debug_assert!`: remove the
+toggles from `CramMergedReaderConfig` and unconditionally drop
+both flag classes in the cascade. That makes the misconfiguration
+*unrepresentable* upstream rather than asserting against it
+downstream at the walker boundary, and avoids the public-shape
+churn on `PreparedRead`. The drops still surface via
+`FilterCounts.secondary` / `.supplementary` so users can audit how
+many records were removed. Plan updated at
+[../feature_implementation_plans/per_sample_caller_cram_input.md](../feature_implementation_plans/per_sample_caller_cram_input.md)
+to keep the original 5-toggle design as a historical reference and
+explain the two-step revision (`drop_unmapped` removed in M4 on
+2026-05-01, `drop_secondary` / `drop_supplementary` in `7d875ac`).
+The producer-agnostic walker-boundary guard remains worth
+reconsidering only if a second producer of `PreparedRead` (e.g. a
+BAM input path) is added.
+
 ### `S4` — Verify (don't necessarily add) a reference-fetch LRU cache
 
 - **Priority:** Medium (depends on benchmark)
 - **Effort:** Small to investigate; small to add if needed
-- **Status:** Open — investigation first
+- **Status:** Closed (no commit) — no action needed; investigation
+  on 2026-05-07 confirmed the dependency already caches.
 
 **Observation.** `bam_plcmd.c:310–357` keeps a 3-slot LRU of contig
 sequences to amortise FASTA I/O across positions. Our walker calls
@@ -217,6 +249,50 @@ runtime win.
 
 **Risk.** None for the investigation. If a cache is added, scope it
 narrowly so we don't hide ref-fetch errors behind stale data.
+
+**Resolution.** No code change. Two findings from the
+investigation:
+
+1. **No production `RefBaseFetcher` exists yet.** A `grep -rn 'impl
+   RefBaseFetcher' src/` returns only `MockFasta`
+   ([tests.rs:39](../../src/per_sample_caller/pileup/tests.rs#L39)),
+   the in-memory test fetcher. `pileup::run` has no production
+   caller; the walker is exercised only from end-to-end tests. The
+   CRAM input layer does build a `noodles_fasta::Repository`
+   ([cram_files.rs:119–124](../../src/per_sample_caller/cram_files.rs#L119-L124),
+   [cram_input.rs:609–616](../../src/per_sample_caller/cram_input.rs#L609-L616)),
+   but it is consumed by noodles' CRAM block decoder, not exposed
+   to the walker.
+2. **`noodles_fasta::Repository` already caches whole contigs
+   unboundedly.** Source-grounded against the on-disk crate
+   (`~/.cargo/registry/.../noodles-fasta-0.60.0/src/repository.rs`):
+   `Repository` wraps `Arc<RwLock<AdapterCache>>` whose `cache`
+   field is `HashMap<Vec<u8>, Arc<Sequence>>`. `Repository::get`
+   first checks the cache under a read lock; on miss it takes the
+   write lock, calls the adapter (`IndexedReader::get` →
+   `Reader::query` → seek-and-read the contig from the FASTA via
+   the `.fai` index), and inserts the resulting `Arc<Sequence>`.
+   There is **no eviction policy** — once a contig is fetched it
+   stays in memory until the `Repository` is dropped.
+
+So a future production fetcher that does the obvious thing —
+`self.repo.get(name)?` then slice the returned `Arc<Sequence>` —
+pays one disk read per contig and then in-memory slicing for
+everything afterwards. samtools' 3-slot LRU was solving a problem
+we don't have: our walker is sequential single-pass per
+chromosome (per [ia/specs/pileup_walker.md](../specs/pileup_walker.md)
+§"Chromosome boundaries"), and noodles' "permanent cache per
+contig" is strictly stronger than a 3-slot LRU for that pattern.
+
+**Forward-looking caveat (not actionable today).** Repository's
+unbounded cache means whole-genome processing accumulates
+~3 GB of base data across 24 human chromosomes, with no eviction.
+If memory becomes a concern once a production driver is wired up,
+the right intervention is to *evict* (drop the previous contig's
+`Arc<Sequence>` at chromosome boundaries, where the walker
+already resets state) rather than to add more caching. Tracked
+here as a hint, not a finding — there is nothing to act on until
+a production driver exists and a memory budget is observed.
 
 ### `S5` — Per-allele observation cap (deferred)
 
@@ -260,9 +336,9 @@ For the record, so we don't relitigate them:
 If acted on in order, each finding is independent and can be its own
 small commit:
 
-1. `S1` — soft high-water warning (one-line user-visible win).
-2. `S3` — supplementary/secondary guard (cheap defence-in-depth).
-3. `S4` — investigate ref-fetch caching; add if needed.
+1. ~~`S1` — soft high-water warning (one-line user-visible win).~~ **Done in `5c90fbb` (2026-05-07).**
+2. ~~`S3` — supplementary/secondary guard (cheap defence-in-depth).~~ **Done in `7d875ac` (2026-05-07), via the stronger upstream-tightening route — see S3's Resolution.**
+3. ~~`S4` — investigate ref-fetch caching; add if needed.~~ **Closed without code change (2026-05-07) — `noodles_fasta::Repository` already caches; see S4's Resolution.**
 4. `S2` — long-read assumption note in the spec (doc-only stage).
 5. `S5` — leave open; revisit only if observed in production.
 
