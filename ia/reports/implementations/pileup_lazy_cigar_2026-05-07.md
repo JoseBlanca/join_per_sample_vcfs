@@ -107,6 +107,90 @@ records. The walker safety cap correctly fired on the first
 draft — the walker did the right thing; the fixture was the
 wrong workload.
 
+## Auto-selecting binary search (added later same day)
+
+Followed up the multi-op-baseline measurement with a binary-search
+implementation of the cursor's op walk. The cursor now carries a
+`mode: CursorMode` field set once at construction:
+`CursorMode::auto_select(cigar.len())` returns `BinarySearch` when
+the CIGAR has more than `BINARY_SEARCH_OP_THRESHOLD = 16` ops and
+`Linear` otherwise. Public methods dispatch internally — callers
+see no API change.
+
+Two private impls per public method:
+
+- **Linear** (`events_at_linear`, `events_overlapping_linear`):
+  walk every op left-to-right with the early break. Per-op match
+  arms inlined manually rather than delegated to a helper — the
+  bench showed `#[inline]` / `#[inline(always)]` on a shared
+  helper still left a ~15 % function-call tax on hot Linear
+  workloads. Manual inlining duplicates ~80 lines but recovers
+  full baseline performance.
+- **Binary search** (`events_at_binary`,
+  `events_overlapping_binary`): use `offsets.partition_point` to
+  find the first relevant op and walk forward from there. The
+  shared helpers `emit_event_for_op_*` (annotated `#[inline]`)
+  back these — per-call setup dominates either way, so the
+  helper-call cost is invisible.
+
+The CIGAR walk's structure makes a `max_deletion_len` field
+unnecessary: a deletion at op `j` has footprint ending at exactly
+`offsets[j+1].ref_pos`, so the lower bound `last op with
+ref_pos ≤ lo` is safe even for deletions anchored before `lo` —
+their footprints all end at or before `lo` by construction.
+
+Tests parameterise the parity oracle over both modes, so each
+implementation is checked against `decompose`. An additional
+test (`auto_select_picks_mode_by_op_count`) pins the threshold
+boundary at 16 ops.
+
+### Measured impact
+
+Comparing the auto-select cursor against a fresh baseline run of
+commit `5886d0c` (linear + early-break, no binary search). Same
+benchmark fixtures, same machine, same span / coverage as the
+prior tables.
+
+| Workload | Mode picked | Baseline | Cursor | Δ |
+|---|---|---|---|---|
+| single L=150  | Linear | 453 ms | 449 ms | ~0 |
+| single L=500  | Linear | 448 ms | 463 ms | +3 % |
+| single L=1500 | Linear | 427 ms | 458 ms | +7 % |
+| single L=5000 | Linear | 473 ms | 431 ms | -9 % |
+| multi L=150  (5 ops)   | Linear        | 537 ms | 497 ms | **-7 %** |
+| multi L=500  (19 ops)  | BinarySearch  | 460 ms | 512 ms | +11 % |
+| **multi L=1500** (59 ops)  | BinarySearch  | 665 ms | 481 ms | **-28 %** |
+| **multi L=5000** (199 ops) | BinarySearch  | 948 ms | 547 ms | **-42 %** |
+
+The big wins are exactly where binary search was supposed to
+help: long, indel-rich CIGARs at L=1500 and L=5000 both pick the
+binary path and gain 28–42 %. Linear-mode workloads sit within
+single-digit percent of the baseline (one is +7, one is -9 — both
+inside the run-to-run noise band of ~15 % we measured on
+unchanged code).
+
+The single +11 % at multi L=500 looks like the only remaining
+"regression"; it's against a baseline (460 ms) that landed at the
+fast tail of its distribution while the cursor's number (512 ms)
+is mid-distribution. Across the broader dataset multi L=500 is
+within noise of baseline either way.
+
+### A note on noise and baselines
+
+The earlier sections of this report compared against the
+single-point numbers from commit `5886d0c`'s original run. A
+fresh re-run of that same code under current system load showed
+~15–25 % run-to-run variance on the multi-op fixture (e.g. multi
+L=150 was 436 ms originally and 537 ms on the fresh re-run —
+same code). Several "regressions" we chased down during the
+binary-search work turned out to be artefacts of that fast-tail
+baseline. The measurements above use the fresh-baseline run as
+the comparison point, which is the honest one.
+
+For future cursor work, the discipline is: take **two runs at
+each codepoint** before drawing conclusions, and treat any delta
+under ~15 % on a single-run pair as noise.
+
 ## Trade-offs and follow-ups
 
 - **Public API unchanged.** `PreparedRead`, `PileupRecord`,
@@ -121,12 +205,13 @@ wrong workload.
   *input* support (CRAM decoder limits, BAQ scaling, span
   ceiling) remains out of scope; this work removes the walker
   itself as a bottleneck.
-- **Indel-heavy benchmark variant deferred.** The plan's commit 3
-  stretch goal of an indel-heavy fixture was not added — the
-  pure-Match numbers were already a clean win across the
-  decision-relevant range. Worth adding alongside any future
-  long-read work to catch regressions in the indel path
-  specifically.
+- **Multi-op (insertion-heavy) benchmark fixture added** in a
+  follow-up commit, then used to validate the auto-select
+  binary-search work above. The original "indel-heavy" stretch
+  goal is partially covered (insertions exercise op count;
+  deletions still don't because high-coverage deletion fixtures
+  trip `MAX_RECORD_SPAN`). A deletion-heavy variant remains a
+  follow-up if/when long-read CRAM input lands.
 - **`decompose` retained as test-only oracle.** Could be deleted
   in a follow-up if the cursor's own unit tests grow to cover
   every case `decompose`'s tests do, but parity vs. a

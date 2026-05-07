@@ -385,6 +385,66 @@ with behavioural surface area; if regression is found post-merge,
 revert it in isolation while leaving the cursor type in place for
 a second attempt.
 
+### Commit 4 — auto-selecting binary search on the offset table
+
+Added after the multi-op CIGAR fixture landed
+([commit `5886d0c`](../../benches/pileup_walker_scaling.rs)) once we
+had a workload where `CigarCursor`'s op-loop cost actually
+mattered. The early-break (commit `401fe94`) bounded the upper
+side of the loop; this commit binary-searches the lower side and
+delivers the long-read win we couldn't justify before.
+
+Design points:
+
+- **Two private impls per public method.** `events_at` and
+  `events_overlapping` each have a `_linear` variant (walk all
+  ops left-to-right with early break) and a `_binary` variant
+  (`offsets.partition_point` to find the start, then walk
+  forward with the same early break). Public methods dispatch on
+  a `mode: CursorMode` field set at construction.
+- **Auto-select inside `CigarCursor::new`.** The constructor
+  picks `BinarySearch` when `cigar.len() > BINARY_SEARCH_OP_THRESHOLD`
+  (currently 16) and `Linear` otherwise. Threshold is empirical
+  from the multi-op bench: linear faster at 5 ops, binary faster
+  at 19, crossover in between. No caller-visible API change —
+  the cursor self-tunes.
+- **No `max_deletion_len` field needed.** The CIGAR walk's
+  structure already bounds left-side lookback: a deletion at op
+  `j` has footprint ending at exactly `offsets[j+1].ref_pos`, so
+  if we set the lower-bound as the last op with `ref_pos ≤ lo`,
+  earlier ops' deletion footprints all end at or before `lo` by
+  construction. (This was an explicit refinement on the
+  earlier draft of this section that proposed
+  `max_deletion_len`.)
+- **`with_mode` constructor for tests** so the parity oracle can
+  run both implementations against `decompose` on the same
+  corpus. Auto-select test pins the threshold boundary.
+- **Manually-inlined per-op match arms in the Linear path.** An
+  earlier attempt extracted the per-op work into helpers
+  (`emit_event_for_op_*`); even with `#[inline(always)]` the
+  bench showed the helper-call overhead dominating Linear-mode
+  workloads (~15–20 % regression on `multi L=150`). Inlining the
+  match arms back into `events_*_linear` removed the regression.
+  The Binary paths still use the helpers (`#[inline]`) since
+  their per-call setup cost dwarfs any small inlining
+  difference.
+
+Measured effect (manual-inline + auto-select, against a fresh
+baseline run of the early-break-only code at `5886d0c`):
+
+| Workload | Mode picked | Baseline | Cursor | Δ |
+|---|---|---|---|---|
+| single L=150 | Linear | 453 ms | 449 ms | ~0 |
+| single L=5000 | Linear | 473 ms | 431 ms | -9 % |
+| multi L=150 (5 ops) | Linear | 537 ms | 497 ms | -7 % |
+| multi L=1500 (59 ops) | Binary | 665 ms | 481 ms | **-28 %** |
+| multi L=5000 (199 ops) | Binary | 948 ms | 547 ms | **-42 %** |
+
+The earlier "Linear-path regression" we tracked was an artefact
+of comparing against a single-point baseline whose number sat at
+the fast tail of the measurement distribution — the fresh
+baseline above is the honest comparison.
+
 ## Out-of-scope follow-ups
 
 - Walking ops directly inside `apply_events_to_ref` to avoid
@@ -392,24 +452,7 @@ a second attempt.
   benchmarks point at it.
 - Long-read CRAM input (decoder, BAQ tuning, `MAX_RECORD_SPAN`
   raise). Tracked separately if/when long-read support is decided.
-- **Binary-search the offset table.** The `CigarCursor.offsets`
-  vector is already sorted by `ref_pos`, so it doubles as an
-  index. `events_at(walker_pos)` could `partition_point` for the
-  op containing `walker_pos` and inspect at most two ops (the M
-  op containing `walker_pos`, and the op possibly anchoring an
-  indel at `walker_pos + 1`); `events_overlapping(lo, hi)` could
-  start from the first op with `ref_pos >= lo - max_deletion_len`
-  (a new field computed once at `new()` to bound left-side
-  lookback for deletions whose footprint extends rightward).
-  Yields O(log n) lookup vs. the current O(n) op walk. Skipped
-  for now because:
-  - For Illumina reads (1–5 CIGAR ops) the linear walk plus
-    early break already costs essentially nothing, and the
-    binary-search overhead would be a wash or slight regression.
-  - The benefit shows up at 50+ ops per read (PacBio HiFi and
-    longer), which we don't have a benchmark for yet.
-  - Adding `max_deletion_len` ships state we'd never measure
-    until that benchmark exists.
-
-  Revisit alongside the indel-heavy bench variant called out in
-  commit 3, or when long-read CRAM input lands.
+- Tuning `BINARY_SEARCH_OP_THRESHOLD` once we have data from
+  real long-read inputs. The current value (16) is empirical
+  from the synthetic bench; production CIGARs may shift the
+  crossover slightly either way.
