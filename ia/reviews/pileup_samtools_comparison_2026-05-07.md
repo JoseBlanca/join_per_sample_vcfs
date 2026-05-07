@@ -300,7 +300,7 @@ out as **S6** below.
 - **Priority:** Medium (latent memory blow-up on whole-genome runs)
 - **Effort:** Small (one new module, one `Cell<Option<u32>>`,
   one `Repository::clear()` call, a handful of tests)
-- **Status:** Closed in commit `_TBD_` (2026-05-07).
+- **Status:** Closed in commit `453715b` (2026-05-07).
 
 **Observation.** S4's investigation surfaced that
 `noodles_fasta::Repository`'s contig cache (`HashMap<Vec<u8>,
@@ -405,7 +405,7 @@ small commit:
 1. ~~`S1` — soft high-water warning (one-line user-visible win).~~ **Done in `5c90fbb` (2026-05-07).**
 2. ~~`S3` — supplementary/secondary guard (cheap defence-in-depth).~~ **Done in `7d875ac` (2026-05-07), via the stronger upstream-tightening route — see S3's Resolution.**
 3. ~~`S4` — investigate ref-fetch caching; add if needed.~~ **Closed without code change (2026-05-07) — `noodles_fasta::Repository` already caches; see S4's Resolution.**
-4. ~~`S6` — chrom-boundary eviction in the production `RefBaseFetcher`.~~ **Done (2026-05-07) — split out of S4 once `Repository::clear()` was confirmed public; see S6's Resolution.**
+4. ~~`S6` — chrom-boundary eviction in the production `RefBaseFetcher`.~~ **Done in `453715b` (2026-05-07) — split out of S4 once `Repository::clear()` was confirmed public; see S6's Resolution.**
 5. `S2` — long-read assumption note in the spec (doc-only stage).
 6. `S5` — leave open; revisit only if observed in production.
 
