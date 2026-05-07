@@ -35,16 +35,19 @@ RUN npm install -g @anthropic-ai/claude-code
 # Pre-warm the cargo registry cache with this project's dependencies so that
 # cold-start builds don't re-download every crate. Copy only the manifests
 # (not the source) so this layer is cached until a dep changes. cargo fetch
-# requires src/ to parse the manifest, so stub a dummy main.rs and bench
-# target, then discard them — only the populated registry under
-# $CARGO_HOME survives into the final image.
+# requires a parseable manifest plus src/main.rs, but it would also demand
+# a file for every [[bench]] target — so we strip the [[bench]] sections
+# from the manifest copy before fetching. Only the populated registry under
+# $CARGO_HOME survives into the final image; the stripped manifest, stub
+# src/, and /build itself are byproducts of this layer.
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src benches \
+RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
-    && echo 'fn main() {}' > benches/gvcf_perf.rs \
+    && awk 'BEGIN{skip=0} /^\[\[bench\]\]/{skip=1; next} /^\[/{skip=0} !skip' Cargo.toml > Cargo.toml.fetch \
+    && mv Cargo.toml.fetch Cargo.toml \
     && cargo fetch \
-    && rm -rf src benches
+    && rm -rf src
 
 WORKDIR /work
 COPY scripts/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
