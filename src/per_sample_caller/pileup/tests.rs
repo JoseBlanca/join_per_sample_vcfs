@@ -431,9 +431,9 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
 #[test]
 fn mate_overlap_zeroes_lower_bq_contribution() {
     // Two paired mates overlapping at the same position with
-    // different BAQ-capped BQs. Higher BQ wins; lower contributes
-    // to obs count but ln_bq becomes ln(1) = 0 — so q_sum gets
-    // only one meaningful contribution.
+    // different BAQ-capped BQs. Match-only agree case under S7:
+    // keeper carries the *summed* BQ (capped at 200), other is
+    // zeroed. Both mates still count as observations.
     //
     // Mate 1 at pos 1, BQ=30, length 3.
     // Mate 2 at pos 1, BQ=10, length 3 (overlapping).
@@ -443,14 +443,136 @@ fn mate_overlap_zeroes_lower_bq_contribution() {
     let records = drive_walker(vec![m1, m2], fa);
     let rec = &records[0];
     assert_eq!(rec.alleles[0].scalars.num_obs, 2, "both mates count");
-    // q_sum: max(ln_BQ, ln_MQ).
-    // Mate 1 (kept): max(ln(P_err Q=30), ln(P_err MQ ≈ -3)) ≈ -3
-    // Mate 2 (zeroed bq): max(ln(1)=0, ln(P_err MQ ≈ -3)) = 0
-    // Sum ≈ -3.
+    // q_sum at default mq_log_err = -3.0:
+    //   keeper: max(ln_perr(40), -3.0) = -3.0  (MQ dominates)
+    //   other:  max(ln(1)=0, -3.0)     = 0
+    //   sum ≈ -3.0
+    // (the BQ-summing change from S7 is invisible here because MQ
+    // dominates; tests at low MQ_log_err pin the BQ math directly).
     assert!(
         rec.alleles[0].scalars.q_sum > -4.0 && rec.alleles[0].scalars.q_sum < -2.0,
-        "expected q_sum ≈ -3, got {}",
+        "expected q_sum ≈ -3 (MQ-dominated), got {}",
         rec.alleles[0].scalars.q_sum
+    );
+}
+
+#[test]
+fn mate_overlap_agree_keeper_carries_summed_bq() {
+    // S7 agree case: when both mates' bases agree at walker_pos,
+    // the surviving observation carries the *sum* of BQs (not the
+    // higher mate's BQ as the original walker did). To make BQ
+    // dominate q_sum so the change is observable, set a strongly-
+    // negative mq_log_err so MQ never wins the max.
+    let fa = MockFasta::new("A");
+    let make = |is_first: bool, bq: u8| PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 1,
+        cigar: vec![CigarOp::Match(1)],
+        seq: b"A".to_vec(),
+        bq_baq: vec![bq],
+        mq_log_err: -100.0,
+        is_reverse_strand: false,
+        qname: Arc::from("p"),
+        is_first_mate: is_first,
+        has_mate: true,
+    };
+    let m1 = make(true, 20);
+    let m2 = make(false, 20);
+    let records = drive_walker(vec![m1, m2], fa);
+    assert_eq!(records.len(), 1);
+    let rec = &records[0];
+    assert_eq!(rec.alleles[0].scalars.num_obs, 2);
+    // Combined BQ = 40. ln_perr(40) = -40 * ln(10) / 10 ≈ -9.21.
+    // Keeper contribution: max(-9.21, -100) = -9.21.
+    // Other contribution: max(ln_perr(0)=0, -100) = 0.
+    // Total q_sum ≈ -9.21. Pre-S7 (Q=20 unsummed): ≈ -4.61.
+    let q = rec.alleles[0].scalars.q_sum;
+    assert!(
+        q < -8.5 && q > -10.0,
+        "q_sum should reflect summed BQ (≈ ln_perr(40) ≈ -9.21), got {q}",
+    );
+}
+
+#[test]
+fn mate_overlap_agree_combined_bq_caps_at_200() {
+    // S7 agree case: the combined BQ is clamped to samtools'
+    // MPLP cap of 200 (htslib/sam.c:5919-5921). 150 + 100 = 250
+    // → capped at 200.
+    let fa = MockFasta::new("A");
+    let make = |is_first: bool, bq: u8| PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 1,
+        cigar: vec![CigarOp::Match(1)],
+        seq: b"A".to_vec(),
+        bq_baq: vec![bq],
+        mq_log_err: -100.0,
+        is_reverse_strand: false,
+        qname: Arc::from("p"),
+        is_first_mate: is_first,
+        has_mate: true,
+    };
+    let m1 = make(true, 150);
+    let m2 = make(false, 100);
+    let records = drive_walker(vec![m1, m2], fa);
+    let q = records[0].alleles[0].scalars.q_sum;
+    // ln_perr(200) ≈ -46.05. Without the cap it would be
+    // ln_perr(250) ≈ -57.56.
+    assert!(
+        q < -45.0 && q > -47.0,
+        "q_sum should reflect cap-200 (≈ -46.05), got {q}",
+    );
+}
+
+#[test]
+fn mate_overlap_disagree_winner_bq_scaled_by_0_8() {
+    // S7 disagree case: when mate bases disagree, the higher-BQ
+    // mate keeps its BQ scaled by 0.8 (samtools' "we trust this
+    // less" haircut at htslib/sam.c:5927); the loser is zeroed.
+    let fa = MockFasta::new("A");
+    let make = |is_first: bool, base: u8, bq: u8| PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 1,
+        cigar: vec![CigarOp::Match(1)],
+        seq: vec![base],
+        bq_baq: vec![bq],
+        mq_log_err: -100.0,
+        is_reverse_strand: false,
+        qname: Arc::from("p"),
+        is_first_mate: is_first,
+        has_mate: true,
+    };
+    // Mate 1 has REF "A" with higher BQ → winner. Mate 2 has SNP
+    // "G" with lower BQ → loser, zeroed.
+    let m1 = make(true, b'A', 30);
+    let m2 = make(false, b'G', 20);
+    let records = drive_walker(vec![m1, m2], fa);
+    let rec = &records[0];
+    let ref_allele = rec
+        .alleles
+        .iter()
+        .find(|a| a.seq.as_slice() == b"A")
+        .expect("REF allele present");
+    let snp_allele = rec
+        .alleles
+        .iter()
+        .find(|a| a.seq.as_slice() == b"G")
+        .expect("SNP allele present");
+    assert_eq!(ref_allele.scalars.num_obs, 1);
+    assert_eq!(snp_allele.scalars.num_obs, 1);
+    // Winner BQ = (30 * 0.8) as u8 = 24. ln_perr(24) ≈ -5.53.
+    // Pre-S7 (Q=30 unscaled): ≈ -6.91.
+    let q_ref = ref_allele.scalars.q_sum;
+    assert!(
+        q_ref < -5.0 && q_ref > -6.0,
+        "REF allele q_sum should reflect scaled BQ=24 (≈ -5.53), got {q_ref}",
+    );
+    // Loser BQ zeroed → ln_perr(0) = 0 → max(0, -100) = 0.
+    assert_eq!(
+        snp_allele.scalars.q_sum, 0.0,
+        "SNP allele's BQ was zeroed; q_sum should be 0",
     );
 }
 

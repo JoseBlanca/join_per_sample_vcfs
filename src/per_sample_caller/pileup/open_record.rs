@@ -483,7 +483,6 @@ pub fn process_position(
             (rec.pos, rec.ref_seq.clone())
         };
         let rec_end = rec_pos + rec_ref_seq.len() as u32;
-        let _ = walker_pos;
 
         for contrib in contributors {
             let active_read = active
@@ -496,6 +495,21 @@ pub fn process_position(
             if contrib.bq_zero_in_window {
                 for ev in &mut window_events {
                     zero_event_bq(ev);
+                }
+            }
+            if let Some(override_bq) = contrib.bq_override_at_walker_pos {
+                // S7 mate-overlap math: the agree-case keeper's
+                // walker_pos event carries the summed BQ; the
+                // disagree-case winner's carries the 0.8-scaled
+                // BQ. Apply only at the walker_pos anchor —
+                // window events at other positions keep cursor-
+                // original BQ.
+                for ev in &mut window_events {
+                    if ev.anchor_pos() == walker_pos
+                        && let ReadEvent::Match { bq_baq, .. } = ev
+                    {
+                        *bq_baq = override_bq;
+                    }
                 }
             }
 
@@ -663,6 +677,17 @@ pub struct ReadContribution {
     /// cursor — equivalent to the eager design's in-place mutation
     /// of the cloned full-window event list.
     pub bq_zero_in_window: bool,
+    /// Set by `resolve_mate_overlap_at_pos` (S7) on the surviving
+    /// side of a Match-only mate-overlap pair: the agree-case
+    /// keeper carries the *summed* BQ (capped at 200), and the
+    /// disagree-case winner carries its BQ scaled by 0.8. The fold
+    /// rewrites the BQ on any window event whose anchor is
+    /// walker_pos to this value. Other window-event positions
+    /// keep their cursor-original BQ — the override is per-position,
+    /// matching our per-walker_pos resolution model rather than
+    /// samtools' admission-time mutation of the entire overlap
+    /// region.
+    pub bq_override_at_walker_pos: Option<u8>,
 }
 
 /// Apply slot lifecycle markers from the slot allocator to the

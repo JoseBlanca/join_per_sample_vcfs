@@ -233,6 +233,7 @@ impl WalkerState {
                 alignment_start: active.read.alignment_start,
                 is_first_mate: active.read.is_first_mate,
                 bq_zero_in_window: false,
+                bq_override_at_walker_pos: None,
             });
         }
 
@@ -400,9 +401,16 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
 
     // Indices to discard outright (indel-overlap losers).
     let mut to_remove: Vec<usize> = Vec::new();
-    // Indices whose Match-event BQ should be zeroed in place
-    // (Match-only overlap losers).
-    let mut to_zero: Vec<usize> = Vec::new();
+    // (idx, new_bq_at_walker_pos, zero_in_window) — applied to
+    // each contributor of a match-only overlap pair (S7). Agree-
+    // case keeper gets the summed BQ (capped at 200, zero_in_window
+    // = false); disagree-case winner gets `0.8 * bq` truncated
+    // (zero_in_window = false). Other / loser gets new_bq=0 with
+    // zero_in_window=true. The fold honours `bq_zero_in_window`
+    // (zeros every window event from this contributor's cursor)
+    // and `bq_override_at_walker_pos` (rewrites walker_pos events'
+    // BQ on top of the cursor pull).
+    let mut bq_updates: Vec<(usize, u8, bool /*zero_in_window*/)> = Vec::new();
 
     for indices in by_slot.values() {
         if indices.len() < 2 {
@@ -424,70 +432,171 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {
                 let (a, b) = (indices[i], indices[j]);
-                let bq_a = contributors[a].bq_baq_at_walker_pos;
-                let bq_b = contributors[b].bq_baq_at_walker_pos;
-                let loser_idx = match bq_a.cmp(&bq_b) {
-                    std::cmp::Ordering::Less => a,
-                    std::cmp::Ordering::Greater => b,
-                    // Tie: prefer the read flagged as first mate.
-                    // If both or neither carry is_first_mate, fall
-                    // back to alignment_start (deterministic
-                    // across input reorderings since paired mates
-                    // always share a slot in pairs of two).
-                    std::cmp::Ordering::Equal => {
-                        let a_first = contributors[a].is_first_mate;
-                        let b_first = contributors[b].is_first_mate;
-                        match (a_first, b_first) {
-                            (true, false) => b,
-                            (false, true) => a,
-                            _ => {
-                                if contributors[a].alignment_start
-                                    <= contributors[b].alignment_start
-                                {
-                                    b
-                                } else {
-                                    a
-                                }
-                            }
-                        }
-                    }
-                };
                 summary.mate_overlap_positions += 1;
-                // Indel involvement on either side at this
-                // walker_pos → collapse to a single observation by
-                // removing the loser entirely. Otherwise just zero
-                // the loser's BQ on its (Match-only) events.
                 let any_indel_here = pair_has_indel(&contributors[a], &contributors[b]);
                 if any_indel_here {
+                    // Indel on either side at this walker_pos:
+                    // collapse to a single observation by removing
+                    // the loser entirely. Tie-break: BQ first,
+                    // then is_first_mate, then alignment_start.
+                    let loser_idx = pick_overlap_loser(contributors, a, b);
                     to_remove.push(loser_idx);
                 } else {
-                    to_zero.push(loser_idx);
+                    // Match-only mate overlap (S7): apply
+                    // samtools-style BQ math.
+                    let base_a = match_base_at_pos(&contributors[a])
+                        .expect("match-only overlap: each side has a Match event at walker_pos");
+                    let base_b = match_base_at_pos(&contributors[b])
+                        .expect("match-only overlap: each side has a Match event at walker_pos");
+                    if base_a == base_b {
+                        // Agree case: sum BQs (cap 200), keeper
+                        // takes the sum, other is zeroed.
+                        let combined_bq = sum_bq_capped_at_200(
+                            contributors[a].bq_baq_at_walker_pos,
+                            contributors[b].bq_baq_at_walker_pos,
+                        );
+                        let keeper_idx = pick_agree_keeper(contributors, a, b);
+                        let other_idx = if keeper_idx == a { b } else { a };
+                        bq_updates.push((keeper_idx, combined_bq, false));
+                        bq_updates.push((other_idx, 0, true));
+                    } else {
+                        // Disagree case: higher-BQ side keeps its
+                        // BQ scaled by 0.8 (samtools' "we trust
+                        // this less" haircut); loser zeroed.
+                        let winner_idx = pick_disagree_winner(contributors, a, b);
+                        let loser_idx = if winner_idx == a { b } else { a };
+                        let scaled_bq =
+                            scale_bq_by_0_8(contributors[winner_idx].bq_baq_at_walker_pos);
+                        bq_updates.push((winner_idx, scaled_bq, false));
+                        bq_updates.push((loser_idx, 0, true));
+                    }
                 }
             }
         }
     }
 
-    // Zero BQs in place first (does not change indices). The
-    // `bq_zero_in_window` flag tells the open-record fold to
-    // apply the same zeroing to any window event it pulls
-    // through this contributor's cursor — equivalent to the
-    // eager design's mutation of the cloned `full_window_events`.
-    to_zero.sort_unstable();
-    to_zero.dedup();
-    for idx in to_zero {
-        contributors[idx].bq_baq_at_walker_pos = 0;
+    // Apply bq updates in place. The fold honours both
+    // `bq_zero_in_window` (zeroing every window event from this
+    // contributor's cursor) and `bq_override_at_walker_pos`
+    // (rewriting walker_pos events' BQ on top of the cursor
+    // pull). Update the local contribution's `bq_baq_at_walker_pos`
+    // and `events_at_pos` for consistency with the override.
+    for (idx, new_bq, zero_in_window) in bq_updates {
+        contributors[idx].bq_baq_at_walker_pos = new_bq;
         for ev in contributors[idx].events_at_pos.iter_mut() {
-            zero_event_bq(ev);
+            set_match_event_bq(ev, new_bq);
         }
-        contributors[idx].bq_zero_in_window = true;
+        if zero_in_window {
+            contributors[idx].bq_zero_in_window = true;
+        } else {
+            contributors[idx].bq_override_at_walker_pos = Some(new_bq);
+        }
     }
 
-    // Now drop indel-overlap losers from the contributor list.
+    // Drop indel-overlap losers from the contributor list.
     // Sort descending so swap_remove keeps earlier indices valid.
     to_remove.sort_unstable();
     to_remove.dedup();
     for idx in to_remove.into_iter().rev() {
         contributors.swap_remove(idx);
+    }
+}
+
+/// Loser-selection for the indel-overlap case. BQ first, then
+/// `is_first_mate`, then `alignment_start`. Matches the pre-S7
+/// semantics (which combined match-only and indel paths behind
+/// the same loser-selection).
+fn pick_overlap_loser(contributors: &[ReadContribution], a: usize, b: usize) -> usize {
+    let bq_a = contributors[a].bq_baq_at_walker_pos;
+    let bq_b = contributors[b].bq_baq_at_walker_pos;
+    match bq_a.cmp(&bq_b) {
+        std::cmp::Ordering::Less => a,
+        std::cmp::Ordering::Greater => b,
+        std::cmp::Ordering::Equal => {
+            let a_first = contributors[a].is_first_mate;
+            let b_first = contributors[b].is_first_mate;
+            match (a_first, b_first) {
+                (true, false) => b,
+                (false, true) => a,
+                _ => {
+                    if contributors[a].alignment_start <= contributors[b].alignment_start {
+                        b
+                    } else {
+                        a
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Keeper-selection for the agree case (S7). The choice is
+/// statistically irrelevant — the surviving side carries the
+/// summed BQ regardless — but must be deterministic. samtools
+/// uses a qname hash; we mirror our existing tie-break logic
+/// (`is_first_mate`, then `alignment_start`).
+fn pick_agree_keeper(contributors: &[ReadContribution], a: usize, b: usize) -> usize {
+    let a_first = contributors[a].is_first_mate;
+    let b_first = contributors[b].is_first_mate;
+    match (a_first, b_first) {
+        (true, false) => a,
+        (false, true) => b,
+        _ => {
+            if contributors[a].alignment_start <= contributors[b].alignment_start {
+                a
+            } else {
+                b
+            }
+        }
+    }
+}
+
+/// Winner-selection for the disagree case (S7): higher BQ wins;
+/// ties fall back to `is_first_mate`, then `alignment_start`
+/// (samtools uses a qname hash on ties).
+fn pick_disagree_winner(contributors: &[ReadContribution], a: usize, b: usize) -> usize {
+    let bq_a = contributors[a].bq_baq_at_walker_pos;
+    let bq_b = contributors[b].bq_baq_at_walker_pos;
+    match bq_a.cmp(&bq_b) {
+        std::cmp::Ordering::Greater => a,
+        std::cmp::Ordering::Less => b,
+        std::cmp::Ordering::Equal => pick_agree_keeper(contributors, a, b),
+    }
+}
+
+/// Extract the base from the `Match` event in `events_at_pos`.
+/// In a match-only mate-overlap (no indel anchored at walker_pos
+/// on either side), each contributor has exactly one Match event
+/// at walker_pos.
+fn match_base_at_pos(c: &ReadContribution) -> Option<u8> {
+    c.events_at_pos.iter().find_map(|e| match e {
+        ReadEvent::Match { base, .. } => Some(*base),
+        _ => None,
+    })
+}
+
+/// `min(a + b, 200)` in u8 space without overflow. Cap from
+/// samtools (`tweak_overlap_quality` in
+/// [`htslib/sam.c:5919-5921`](../../../htslib/sam.c#L5919-L5921)) —
+/// quality values above ~Q200 are effectively meaningless.
+fn sum_bq_capped_at_200(a: u8, b: u8) -> u8 {
+    let sum = (a as u16) + (b as u16);
+    sum.min(200) as u8
+}
+
+/// `(bq * 0.8)` truncated to u8, matching samtools' C `0.8 *
+/// uint8_t` cast at
+/// [`htslib/sam.c:5927`](../../../htslib/sam.c#L5927) (truncation,
+/// not rounding).
+fn scale_bq_by_0_8(bq: u8) -> u8 {
+    (bq as f64 * 0.8) as u8
+}
+
+/// In-place BQ rewrite on a `Match` event. No-op on indel
+/// events — the S7 BQ math only applies to match-only overlaps.
+fn set_match_event_bq(ev: &mut ReadEvent, bq: u8) {
+    if let ReadEvent::Match { bq_baq, .. } = ev {
+        *bq_baq = bq;
     }
 }
 
@@ -515,13 +624,5 @@ fn column_depth_cap(contributors: &[ReadContribution], config: &WalkerConfig) ->
         config.max_indel_column_depth as usize
     } else {
         config.max_snp_column_depth as usize
-    }
-}
-
-fn zero_event_bq(ev: &mut ReadEvent) {
-    match ev {
-        ReadEvent::Match { bq_baq, .. } => *bq_baq = 0,
-        ReadEvent::Insertion { bq_proxy, .. } => *bq_proxy = 0,
-        ReadEvent::Deletion { bq_proxy, .. } => *bq_proxy = 0,
     }
 }
