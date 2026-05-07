@@ -4,7 +4,7 @@
 **Reviewer:** Claude (algorithm-comparison study)
 **Module reviewed:** `src/per_sample_caller/pileup`
 **Reference codebase:** `samtools/` (in-tree copy of samtools, not htslib)
-**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the backlog is partially worked: `S1`, `S3`, and `S4` are closed (see each finding's Resolution); `S2` (doc-only stage) and `S5` (deferred) remain open.
+**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the backlog is partially worked: `S1`, `S3`, `S4`, and `S6` are closed (see each finding's Resolution); `S2` (doc-only stage) and `S5` (deferred) remain open.
 
 ---
 
@@ -284,15 +284,81 @@ chromosome (per [ia/specs/pileup_walker.md](../specs/pileup_walker.md)
 §"Chromosome boundaries"), and noodles' "permanent cache per
 contig" is strictly stronger than a 3-slot LRU for that pattern.
 
-**Forward-looking caveat (not actionable today).** Repository's
-unbounded cache means whole-genome processing accumulates
-~3 GB of base data across 24 human chromosomes, with no eviction.
-If memory becomes a concern once a production driver is wired up,
-the right intervention is to *evict* (drop the previous contig's
-`Arc<Sequence>` at chromosome boundaries, where the walker
-already resets state) rather than to add more caching. Tracked
-here as a hint, not a finding — there is nothing to act on until
-a production driver exists and a memory budget is observed.
+**Adjacent observation, promoted to its own finding.** Repository's
+unbounded cache means a future production fetcher would
+accumulate ~3 GB of base data across 24 human chromosomes if it
+just shared one `Repository` across the whole run. Initially
+captured here as a "wait until we see the memory bill" caveat,
+but on closer inspection (a) the design rule is so cheap that
+designing for it up front is strictly better, and (b)
+`noodles_fasta::Repository::clear()` is in fact public — missed on
+the first pass — so the eviction is a one-line operation. Split
+out as **S6** below.
+
+### `S6` — Chromosome-boundary eviction in the production `RefBaseFetcher`
+
+- **Priority:** Medium (latent memory blow-up on whole-genome runs)
+- **Effort:** Small (one new module, one `Cell<Option<u32>>`,
+  one `Repository::clear()` call, a handful of tests)
+- **Status:** Closed in commit `_TBD_` (2026-05-07).
+
+**Observation.** S4's investigation surfaced that
+`noodles_fasta::Repository`'s contig cache (`HashMap<Vec<u8>,
+Arc<Sequence>>`) is *unbounded* — once a contig is fetched it stays
+in memory until the `Repository` drops. The walker is sequential
+single-pass per chromosome (per
+[ia/specs/pileup_walker.md](../specs/pileup_walker.md)
+§"Chromosome boundaries") and never revisits a contig within a run,
+so a future production `RefBaseFetcher` that does the obvious
+"build one `Repository` at startup, share it across chromosomes"
+thing would accumulate ~3 GB of base data across the 24 human
+chromosomes for no functional benefit.
+
+**Proposal.** Bake the eviction into the production fetcher rather
+than waiting to discover the memory bill on real samples. Once one
+chromosome's records are done, the previous contig's
+`Arc<Sequence>` is no longer needed; drop it before loading the
+next. `noodles_fasta::Repository::clear()` is public (we missed it
+on the first pass of S4), so a single Repository can be reused for
+the whole run with its cache reset at chromosome boundaries.
+
+Concretely: a `ChromBoundaryRefFetcher` that holds a single
+`Repository` plus a `Cell<Option<u32>>` tracking the current
+`chrom_id`. On a `fetch` whose `chrom_id` differs from the cell,
+call `repository.clear()` and update the cell, then proceed to
+`repository.get(name)`. Steady-state cache size is exactly 1
+contig.
+
+**Rationale.** Cheap to do correctly the first time; expensive (in
+RSS, on whole-genome runs) to do wrong and then have to retrofit.
+The hook is natural: the chromosome change is detected by the
+fetcher itself from the `chrom_id` argument, so no extra plumbing
+into the walker is needed. Performance during a chromosome is
+unchanged — the cache holds the active contig in memory between
+fetches just as before; only the previous chromosome's bytes are
+freed.
+
+**Risk.** Effectively none. Cell-based interior mutability is fine
+because the walker is single-threaded per call (`run<I, F>` does
+not require `F: Send + Sync` and the walker state is itself not
+`Send`/`Sync`). If a future architecture parallelises across
+chromosomes within a single fetcher, the contract changes — but
+that would require a different design anyway because the
+single-Repository-with-clear approach assumes serial chromosome
+visits.
+
+**Resolution.** Implemented as proposed in
+[src/per_sample_caller/ref_fetcher.rs](../../src/per_sample_caller/ref_fetcher.rs):
+`ChromBoundaryRefFetcher` holds one `fasta::Repository` (built
+from an `IndexedReader` over the `.fa` + `.fai` files) plus a
+`Cell<Option<u32>>` for the current `chrom_id`. On a
+chromosome-changing fetch it calls `Repository::clear()` and
+updates the cell, then resolves the contig name via the project's
+`ContigList` and slices the returned `Arc<Sequence>`. Tests cover
+the eviction invariant by inspecting `Repository::len()` (exposed
+as `cached_contig_count`): the cache stays at one contig across
+chrom changes, regardless of how many chromosomes have been
+visited so far.
 
 ### `S5` — Per-allele observation cap (deferred)
 
@@ -339,8 +405,9 @@ small commit:
 1. ~~`S1` — soft high-water warning (one-line user-visible win).~~ **Done in `5c90fbb` (2026-05-07).**
 2. ~~`S3` — supplementary/secondary guard (cheap defence-in-depth).~~ **Done in `7d875ac` (2026-05-07), via the stronger upstream-tightening route — see S3's Resolution.**
 3. ~~`S4` — investigate ref-fetch caching; add if needed.~~ **Closed without code change (2026-05-07) — `noodles_fasta::Repository` already caches; see S4's Resolution.**
-4. `S2` — long-read assumption note in the spec (doc-only stage).
-5. `S5` — leave open; revisit only if observed in production.
+4. ~~`S6` — chrom-boundary eviction in the production `RefBaseFetcher`.~~ **Done (2026-05-07) — split out of S4 once `Repository::clear()` was confirmed public; see S6's Resolution.**
+5. `S2` — long-read assumption note in the spec (doc-only stage).
+6. `S5` — leave open; revisit only if observed in production.
 
 `S2` stage-2 (the lazy-CIGAR refactor) is parked until long-read
 support is decided.

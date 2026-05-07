@@ -14,6 +14,7 @@
 pub mod cram_input;
 pub mod errors;
 pub mod pileup;
+pub mod ref_fetcher;
 
 #[cfg(test)]
 pub(crate) mod cram_files;
