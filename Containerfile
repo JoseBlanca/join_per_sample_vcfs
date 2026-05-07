@@ -14,6 +14,11 @@ FROM docker.io/library/rust:1.95-bookworm
 #   - git / ca-certificates: needed by cargo for git-based deps and HTTPS.
 #   - bcftools / tabix: inspect and compare VCF output against reference tools.
 #   - curl: bootstraps the NodeSource apt repo for Node.js.
+#   - linux-perf: sampling profiler; backs cargo-flamegraph. In-container
+#     sampling typically needs the host's perf_event_paranoid relaxed or
+#     the container run with --cap-add=SYS_ADMIN.
+#   - hyperfine: statistical CLI benchmarking for reference comparisons.
+#   - valgrind: callgrind/cachegrind for instruction-level profiling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
@@ -22,12 +27,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         bcftools \
         tabix \
         curl \
+        linux-perf \
+        hyperfine \
+        valgrind \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust components not included in the base image's minimal profile.
 RUN rustup component add rustfmt clippy
+
+# cargo-flamegraph: wraps perf to render flamegraphs of release builds.
+# Installed as its own layer so it stays cached across Cargo.toml changes.
+RUN cargo install flamegraph --locked
 
 # Claude Code CLI, used when the container hosts an agent session.
 RUN npm install -g @anthropic-ai/claude-code
