@@ -9,6 +9,7 @@
 //! point `run`. Internal building blocks live in private submodules.
 
 mod active_set;
+mod cigar_cursor;
 mod decompose;
 mod errors;
 mod open_record;

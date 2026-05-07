@@ -149,7 +149,7 @@ pub fn decompose(read: &PreparedRead) -> Vec<ReadEvent> {
 /// Centring matches freebayes' insertion code path
 /// (window covers the inserted bases plus ±PAD flanking read
 /// bases — `freebayes/src/AlleleParser.cpp:1714`).
-fn indel_bq_proxy_insertion(bq_baq: &[u8], read_pos: usize, op_len: u32) -> u8 {
+pub(super) fn indel_bq_proxy_insertion(bq_baq: &[u8], read_pos: usize, op_len: u32) -> u8 {
     let lo = read_pos.saturating_sub(INDEL_BQ_PROXY_PAD);
     let hi = (read_pos + op_len as usize + INDEL_BQ_PROXY_PAD).min(bq_baq.len());
     bq_baq[lo..hi].iter().copied().min().unwrap_or(0)
@@ -160,7 +160,7 @@ fn indel_bq_proxy_insertion(bq_baq: &[u8], read_pos: usize, op_len: u32) -> u8 {
 /// read-position cursor (which sits at the base immediately after
 /// the deletion's preceding `M` end). Edge-clamped at read ends.
 /// Source: `freebayes/src/AlleleParser.cpp:1638-1659`.
-fn indel_bq_proxy_deletion(bq_baq: &[u8], read_pos: usize, deleted_len: u32) -> u8 {
+pub(super) fn indel_bq_proxy_deletion(bq_baq: &[u8], read_pos: usize, deleted_len: u32) -> u8 {
     // For a deletion of length `l`, freebayes uses `L = l + 2`
     // bases centred on the cursor `read_pos - L/2`. Edge-clamped.
     let l = deleted_len as usize + 2 * INDEL_BQ_PROXY_PAD;
