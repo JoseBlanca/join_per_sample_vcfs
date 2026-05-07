@@ -4,7 +4,7 @@
 **Reviewer:** Claude (algorithm-comparison study)
 **Module reviewed:** `src/per_sample_caller/pileup`
 **Reference codebase:** `samtools/` (in-tree copy of samtools, not htslib)
-**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the backlog is partially worked: `S1`, `S3`, `S4`, and `S6` are closed (see each finding's Resolution); `S2` (doc-only stage) and `S5` (deferred) remain open.
+**Status:** Advisory — no defects; a small backlog of optional improvements. As of 2026-05-07 the backlog is mostly worked: `S1`, `S3`, `S4`, `S5`, and `S6` are closed (see each finding's Resolution); only `S2` (doc-only stage) remains open.
 
 ---
 
@@ -360,11 +360,12 @@ as `cached_contig_count`): the cache stays at one contig across
 chrom changes, regardless of how many chromosomes have been
 visited so far.
 
-### `S5` — Per-allele observation cap (deferred)
+### `S5` — Per-column depth cap (originally framed as per-allele)
 
-- **Priority:** Low
+- **Priority:** Low (originally) → Medium (after the per-allele
+  vs. per-column nuance was worked out)
 - **Effort:** Medium
-- **Status:** Open — wait for evidence
+- **Status:** Closed in commit `8ba0bc0` (2026-05-07).
 
 **Observation.** samtools' mpileup uses a separate, lower cap for
 indel columns (`MPLP_MAX_INDEL_DEPTH = 250` vs `MPLP_MAX_DEPTH = 8000`)
@@ -372,15 +373,56 @@ because homopolymer-context indels are pathologically deep in real
 data. We have a uniform per-walker cap (active slot count) and no
 per-allele bound.
 
-**Proposal.** Hold off. Add the cap only if we see a Stage 2 failure
-or a runtime spike caused by a single allele's `num_obs` blowing up.
-Track this finding here so we don't forget the precedent exists.
+**Original proposal.** Hold off. Add the cap only if we see a
+Stage 2 failure or a runtime spike caused by a single allele's
+`num_obs` blowing up. Track this finding here so we don't forget
+the precedent exists.
 
-**Rationale.** Premature optimisation otherwise; Stage 2 should be
-robust to high allele depth in principle.
+**Original rationale.** Premature optimisation otherwise; Stage 2
+should be robust to high allele depth in principle.
 
-**Risk.** Adding it now would mean choosing a threshold without
-data, which is the worst time to choose one.
+**Original risk.** Adding it now would mean choosing a threshold
+without data, which is the worst time to choose one.
+
+**Resolution.** Adopted samtools' caps as defaults rather than
+waiting on our own evidence. Reasoning: samtools encodes 15+
+years of real-world calling experience; we're not "picking a
+threshold without data", we're inheriting a threshold that has
+data behind it (just not our data). When we have our own deep
+samples we can revisit the numbers; until then samtools' values
+are a defensible starting point and a hardcoded "no cap" is
+strictly worse than a borrowed-with-attribution cap.
+
+A first-pass design that would have applied the cap *per allele*
+was rejected after a more careful look: per-allele clipping
+silently biases the allele-frequency estimate at any column
+where the dominant allele exceeds the cap (a 99/1 column with
+cap=250 would report ~71/29 instead of ~99/1). Per-*column*
+truncation is what samtools does for the same reason — it
+preserves ratios in expectation. Implementation: truncate the
+contributor list to the first N items at fold time;
+deterministic-first-N is approximately unbiased because reads in
+our active set are not allele-correlated in iteration order, so
+no random-sample machinery is needed.
+
+Caps live on a new `WalkerConfig` struct
+([pileup/mod.rs](../../src/per_sample_caller/pileup/mod.rs),
+defaults `max_snp_column_depth = 8000`,
+`max_indel_column_depth = 250`). The cap detection (indel
+column? then use the tighter cap) runs at fold time in
+[walker.rs:column_depth_cap](../../src/per_sample_caller/pileup/walker.rs).
+A new `RunSummary.column_depth_truncations` counter tracks how
+many columns hit the cap so QC pipelines can flag pathologically
+deep regions. With the current `MAX_ACTIVE_SLOTS = 4096` only the
+indel cap can actually fire — the SNP cap is future-proofing for
+if/when the slot cap is raised.
+
+This finding also drove the introduction of the per-stage
+config-struct convention (mirrors `CramMergedReaderConfig`); the
+project's [calling_pipeline_architecture.md](../specs/calling_pipeline_architecture.md)
+gained a "Configurable parameters" section codifying the rule
+that new tunables go in stage configs rather than as bare `pub
+const`s.
 
 ## 5. Findings explicitly *rejected*
 
@@ -406,8 +448,8 @@ small commit:
 2. ~~`S3` — supplementary/secondary guard (cheap defence-in-depth).~~ **Done in `7d875ac` (2026-05-07), via the stronger upstream-tightening route — see S3's Resolution.**
 3. ~~`S4` — investigate ref-fetch caching; add if needed.~~ **Closed without code change (2026-05-07) — `noodles_fasta::Repository` already caches; see S4's Resolution.**
 4. ~~`S6` — chrom-boundary eviction in the production `RefBaseFetcher`.~~ **Done in `453715b` (2026-05-07) — split out of S4 once `Repository::clear()` was confirmed public; see S6's Resolution.**
-5. `S2` — long-read assumption note in the spec (doc-only stage).
-6. `S5` — leave open; revisit only if observed in production.
+5. ~~`S5` — per-column depth cap.~~ **Done in `8ba0bc0` (2026-05-07) — adopted samtools' caps as defaults rather than waiting for our own data; the per-allele framing in the original proposal was rejected as statistically biased; see S5's Resolution.**
+6. `S2` — long-read assumption note in the spec (doc-only stage).
 
 `S2` stage-2 (the lazy-CIGAR refactor) is parked until long-read
 support is decided.
