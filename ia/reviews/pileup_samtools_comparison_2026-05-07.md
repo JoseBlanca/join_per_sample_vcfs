@@ -430,7 +430,7 @@ const`s.
   code change)
 - **Effort:** Small (one struct field, a helper or two,
   per-position resolver update; no plumbing-shape changes)
-- **Status:** Closed in commit `_TBD_` (2026-05-07).
+- **Status:** Closed in commit `b7b3807` (2026-05-07).
 
 **Observation.** Reading [htslib/sam.c:5803-5942](../../htslib/sam.c#L5803-L5942)
 (`tweak_overlap_quality`) shows our walker does not match samtools
