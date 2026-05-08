@@ -275,6 +275,33 @@ This is a modest implementation win (BAQ is ~a few hundred lines
 following Heng Li's 2011 paper) that removes a real-world performance
 bottleneck users have hit with `calmd` in the past.
 
+**Reference implementations to port from when BAQ lands.** Two
+independent ports of Heng Li's HMM-Glocal BAQ algorithm exist
+that we can cross-check our implementation against:
+
+- **samtools** — the original C implementation
+  (`samtools/bam_md.c` and `bcftools/bam2bcf.c`), which is
+  what `calmd` runs.
+- **GATK's [`BAQ.java`](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/baq/BAQ.java)**
+  — a Java port explicitly synchronised against the samtools
+  source ([BAQ.java:174-175](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/baq/BAQ.java#L174-L175)).
+  Both ports converge on the same parameters
+  ([BAQ.java:76-78](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/baq/BAQ.java#L76-L78)
+  plus
+  [BAQ.java:88-142](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/baq/BAQ.java#L88-L142)):
+  `DEFAULT_GOP = 40` (gap-open penalty, Phred-scaled →
+  P(gap) = 1e-4), `DEFAULT_BANDWIDTH = 7` (DP band half-width),
+  `e = 0.1` (gap-extension probability), and `minBaseQual = 4`
+  (any base below Q4 is raised to Q4 before the HMM).
+
+Port from one and cross-check against the other rather than
+re-derive — the parameters are empirically calibrated and have
+been stable for ~15 years. Two independent reference
+implementations agreeing on a value is as close as we get to
+validation for an empirically-tuned HMM. See finding `G4` in
+[the GATK comparison review](../reviews/pileup_gatk_comparison_2026-05-08.md#g4--when-we-implement-baq-mirror-samtools--gatk-parameters)
+for the longer note.
+
 ### Why min indel quality, not freebayes' default summed-with-harmonic
 
 Item 5 above commits Stage 1 to the **minimum BQ in the `l + 2`
