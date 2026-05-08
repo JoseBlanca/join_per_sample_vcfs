@@ -1456,105 +1456,121 @@ fn read_exceeds_mismatch_fraction(
 ///   behaviour because the shift has revealed the read has no
 ///   left-flanking evidence for the event.
 fn left_align_indels(cigar: &mut Vec<CigarOp>, seq: &[u8], ref_seq: &[u8]) {
-    // First pass: collect each indel's index and pre-mutation
-    // (read_pos, ref_pos). We measure here, mutate later, so the
-    // shift computation always sees the original cursor positions
-    // (which are the true positions of bytes in `seq` and `ref_seq`,
-    // unaffected by CIGAR rearrangement).
-    #[derive(Clone, Copy)]
-    enum IndelKind {
-        Insertion,
-        Deletion,
-    }
-    struct Indel {
-        idx: usize,
-        kind: IndelKind,
-        len: u32,
-        read_pos: usize,
-        ref_pos: usize,
-    }
+    // Single forward pass. Each indel computes its shift using the
+    // *current* (read_pos, ref_pos) cursor and applies the shift in
+    // place — shrinking `cigar[i-1]` and growing `cigar[i+1]`.
+    //
+    // The cursor walks byte positions in `seq` and `ref_seq`, which
+    // are immutable. Mutating `cigar[i+1]` to be longer would
+    // ordinarily make the next iteration's cursor over-advance
+    // through that op (CIGAR length grew but the underlying byte
+    // count didn't). To keep the cursor honest, we carry the just-
+    // applied shift forward by exactly one op: the M op directly
+    // after a shifting indel advances the cursor by
+    // `current_len - prev_indel_shift`. After that op, the carry is
+    // discharged. Subsequent ops use their current lengths normally.
+    //
+    // The `apply` step only ever shrinks an M op we have already
+    // processed and grows the M op we are about to process, so the
+    // single-deep carry is sufficient — no other op can be affected
+    // by an in-loop mutation.
+    //
+    // CIGAR vector length is unchanged during the loop (we only
+    // resize op contents, never insert/remove); a final `retain`
+    // strips any `M`-class ops left at length 0.
 
-    let mut indels: Vec<Indel> = Vec::new();
     let mut read_pos: usize = 0;
     let mut ref_pos: usize = 0;
-    for (i, op) in cigar.iter().enumerate() {
-        match *op {
+    let mut prev_indel_shift: u32 = 0;
+
+    for i in 0..cigar.len() {
+        match cigar[i] {
             CigarOp::Match(n) | CigarOp::SeqMatch(n) | CigarOp::SeqMismatch(n) => {
-                read_pos += n as usize;
-                ref_pos += n as usize;
+                let advance = n - prev_indel_shift;
+                read_pos += advance as usize;
+                ref_pos += advance as usize;
+                prev_indel_shift = 0;
             }
             CigarOp::Insertion(n) => {
-                indels.push(Indel {
-                    idx: i,
-                    kind: IndelKind::Insertion,
-                    len: n,
-                    read_pos,
-                    ref_pos,
-                });
+                let shift = try_apply_indel_shift(
+                    cigar, i, seq, ref_seq, read_pos, ref_pos, n, /* is_insertion */ true,
+                );
                 read_pos += n as usize;
+                prev_indel_shift = shift;
             }
             CigarOp::Deletion(n) => {
-                indels.push(Indel {
-                    idx: i,
-                    kind: IndelKind::Deletion,
-                    len: n,
-                    read_pos,
-                    ref_pos,
-                });
+                let shift = try_apply_indel_shift(
+                    cigar, i, seq, ref_seq, read_pos, ref_pos, n, /* is_insertion */ false,
+                );
                 ref_pos += n as usize;
+                prev_indel_shift = shift;
             }
-            CigarOp::Skip(n) => ref_pos += n as usize,
-            CigarOp::SoftClip(n) => read_pos += n as usize,
-            CigarOp::HardClip(_) | CigarOp::Padding(_) => {}
+            CigarOp::Skip(n) => {
+                ref_pos += n as usize;
+                prev_indel_shift = 0;
+            }
+            CigarOp::SoftClip(n) => {
+                read_pos += n as usize;
+                prev_indel_shift = 0;
+            }
+            CigarOp::HardClip(_) | CigarOp::Padding(_) => {
+                prev_indel_shift = 0;
+            }
         }
     }
 
-    // Second pass: for each indel, shrink the preceding `M`-class
-    // op by `shift` and grow the following `M`-class op by the same
-    // amount. CIGAR length never changes during this pass (only op
-    // lengths do), so the indices collected above stay valid.
-    for indel in &indels {
-        if indel.idx == 0 {
-            continue;
-        }
-        let prev_idx = indel.idx - 1;
-        let next_idx = indel.idx + 1;
-        if next_idx >= cigar.len() {
-            continue;
-        }
-        let prev_len = match m_op_len(&cigar[prev_idx]) {
-            Some(n) => n as usize,
-            None => continue,
-        };
-        let next_len = match m_op_len(&cigar[next_idx]) {
-            Some(n) => n,
-            None => continue,
-        };
-        let n = indel.len as usize;
-        let max_shift = prev_len.min(indel.ref_pos);
-        let shift = match indel.kind {
-            IndelKind::Insertion => {
-                max_left_shift_insertion(seq, ref_seq, indel.read_pos, indel.ref_pos, n, max_shift)
-            }
-            IndelKind::Deletion => max_left_shift_deletion(ref_seq, indel.ref_pos, n, max_shift),
-        };
-        if shift > 0 {
-            set_m_op_len(&mut cigar[prev_idx], (prev_len - shift) as u32);
-            set_m_op_len(&mut cigar[next_idx], next_len + shift as u32);
-        }
-    }
-
-    // Strip any `M`-class ops that ended up at length 0 (created
-    // when an indel canonicalised all the way to its preceding M
-    // op's start). Keeps the CIGAR canonical and lets `decompose`'s
-    // first/last-CIGAR-op rule fire on indels now genuinely at the
-    // boundary.
+    // Strip any `M`-class ops left at length 0 (created when an
+    // indel canonicalised all the way to its preceding M op's
+    // start). Keeps the CIGAR canonical and lets `decompose`'s
+    // first/last-CIGAR-op rule fire on indels now genuinely at
+    // the boundary.
     cigar.retain(|op| {
         !matches!(
             *op,
             CigarOp::Match(0) | CigarOp::SeqMatch(0) | CigarOp::SeqMismatch(0)
         )
     });
+}
+
+/// Compute and apply the left-shift for an indel at `cigar[idx]`.
+/// Returns the shift that was applied (0 if no shift). Mutates
+/// `cigar[idx-1]` (shrinks) and `cigar[idx+1]` (grows) in place.
+/// Skips silently when neighbours aren't `M`-class or when the
+/// indel sits at a CIGAR boundary.
+#[allow(clippy::too_many_arguments)]
+fn try_apply_indel_shift(
+    cigar: &mut [CigarOp],
+    idx: usize,
+    seq: &[u8],
+    ref_seq: &[u8],
+    read_pos: usize,
+    ref_pos: usize,
+    indel_len: u32,
+    is_insertion: bool,
+) -> u32 {
+    if idx == 0 || idx + 1 >= cigar.len() {
+        return 0;
+    }
+    let Some(prev_len) = m_op_len(&cigar[idx - 1]) else {
+        return 0;
+    };
+    let Some(next_len) = m_op_len(&cigar[idx + 1]) else {
+        return 0;
+    };
+    let prev_len_usize = prev_len as usize;
+    let n = indel_len as usize;
+    let max_shift = prev_len_usize.min(ref_pos);
+    let shift = if is_insertion {
+        max_left_shift_insertion(seq, ref_seq, read_pos, ref_pos, n, max_shift)
+    } else {
+        max_left_shift_deletion(ref_seq, ref_pos, n, max_shift)
+    };
+    if shift == 0 {
+        return 0;
+    }
+    set_m_op_len(&mut cigar[idx - 1], prev_len - shift as u32);
+    set_m_op_len(&mut cigar[idx + 1], next_len + shift as u32);
+    shift as u32
 }
 
 /// Length of an `M`-class op (`Match` / `SeqMatch` / `SeqMismatch`),
@@ -1599,10 +1615,8 @@ fn max_left_shift_insertion(
     let ins = &seq[read_pos..read_pos + ins_len];
     let mut shift = 0;
     while shift < max_shift && ref_pos > shift {
-        let ref_byte = ref_seq[ref_pos - shift - 1].to_ascii_uppercase();
         let ins_idx = (ins_len - 1 - (shift % ins_len)) % ins_len;
-        let ins_byte = ins[ins_idx].to_ascii_uppercase();
-        if ref_byte != ins_byte {
+        if !ref_seq[ref_pos - shift - 1].eq_ignore_ascii_case(&ins[ins_idx]) {
             break;
         }
         shift += 1;
@@ -1628,7 +1642,7 @@ fn max_left_shift_deletion(
         if last_in_del >= ref_seq.len() {
             break;
         }
-        if ref_seq[before].to_ascii_uppercase() != ref_seq[last_in_del].to_ascii_uppercase() {
+        if !ref_seq[before].eq_ignore_ascii_case(&ref_seq[last_in_del]) {
             break;
         }
         shift += 1;
