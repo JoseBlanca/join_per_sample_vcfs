@@ -204,6 +204,11 @@ pub struct FilterCounts {
     /// finding `F1` in
     /// `ia/reviews/pileup_freebayes_comparison_2026-05-08.md`.
     pub high_mismatch_fraction: u64,
+    /// Reads dropped because their CIGAR contained an adjacent `I`/`D`
+    /// pair, or started/ended with a deletion (after stripping leading
+    /// soft/hard clips). See finding `G2` in
+    /// `ia/reviews/pileup_gatk_comparison_2026-05-08.md`.
+    pub bad_cigar: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -976,6 +981,22 @@ impl Iterator for CramMergedReader {
                 }
             };
 
+            // G2 — `GoodCigar`-style read rejection. Drops reads
+            // whose CIGAR contains an adjacent `I`/`D` pair (no
+            // biological event produces this) or whose first/last
+            // op (after stripping clips) is a deletion (no flanking
+            // evidence on the missing side). Default-on, no opt-out.
+            //
+            // Runs **before** F3 because F3 can deliberately shift
+            // an interior indel to a boundary as part of normal
+            // canonicalisation; checking after F3 would punish that.
+            // Pre-F3 boundary deletions are the case where the
+            // aligner itself produced the suspect alignment.
+            if cigar_is_bad(&mapped.cigar) {
+                self.filter_counts.bad_cigar += 1;
+                continue;
+            }
+
             // F3 + F1 both need the read's reference slice. Fetch
             // once and share. Repository is cheap to clone — its
             // internal state is `Arc<RwLock<...>>` — and cloning
@@ -1450,6 +1471,70 @@ fn cigar_ref_span(cigar: &[CigarOp]) -> u32 {
             _ => 0,
         })
         .sum()
+}
+
+/// Pure-logic implementation of finding `G2` (`GoodCigar`-style
+/// read-level rejection). Returns `true` when the CIGAR is
+/// "ill-formed" by either of two rules — both sentinel-grade:
+///
+/// 1. **Adjacent `I`/`D` pair, in either order.** No biological
+///    event produces an immediate insertion-then-deletion (or
+///    deletion-then-insertion) in a single read; when the aligner
+///    emits one, the alignment is genuinely confused and the read's
+///    other M-events near that region are also unreliable.
+/// 2. **Starts or ends with a deletion** (after stripping leading
+///    soft- or hard-clips). A deletion at a CIGAR boundary has no
+///    flanking evidence on the missing side; the aligner ran out of
+///    read bases at the wrong moment.
+///
+/// The boundary-deletion rule must be applied to the **original**
+/// CIGAR — i.e. before F3 left-alignment runs. F3 deliberately
+/// shifts indels through homopolymers/tandem repeats and can in
+/// principle land an indel at the read's edge as part of normal
+/// canonicalisation; rejecting that case would punish F3 for doing
+/// its job. Pre-F3 boundary deletions are the case where the
+/// aligner itself produced the suspect alignment.
+///
+/// Adjacent indels are invariant under F3 (F3 explicitly skips
+/// adjacent-indel triplets), so the consecutive-`I`/`D` rule is
+/// timing-independent — but for symmetry we run both checks at the
+/// same place in the cascade.
+fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
+    // Rule 1 — adjacent I/D in either order.
+    for window in cigar.windows(2) {
+        let (a, b) = (window[0], window[1]);
+        let a_is_indel = matches!(a, CigarOp::Insertion(_) | CigarOp::Deletion(_));
+        let b_is_indel = matches!(b, CigarOp::Insertion(_) | CigarOp::Deletion(_));
+        // Adjacent same-kind indels (II, DD) shouldn't occur in
+        // canonical CIGARs either, but they are not the GATK
+        // GoodCigar pattern — only mixed I/D pairs trigger this rule.
+        let a_is_ins = matches!(a, CigarOp::Insertion(_));
+        let b_is_ins = matches!(b, CigarOp::Insertion(_));
+        if a_is_indel && b_is_indel && a_is_ins != b_is_ins {
+            return true;
+        }
+    }
+
+    // Rule 2 — first or last op (after stripping clips) is a
+    // deletion. `iter().find` past the leading clips, and `iter()
+    // .rev().find` past the trailing clips, give us the first/last
+    // *non-clip* op. A read consisting entirely of clips has no
+    // such op and is not a boundary-deletion case.
+    let first_non_clip = cigar
+        .iter()
+        .find(|op| !matches!(op, CigarOp::SoftClip(_) | CigarOp::HardClip(_)));
+    if matches!(first_non_clip, Some(CigarOp::Deletion(_))) {
+        return true;
+    }
+    let last_non_clip = cigar
+        .iter()
+        .rev()
+        .find(|op| !matches!(op, CigarOp::SoftClip(_) | CigarOp::HardClip(_)));
+    if matches!(last_non_clip, Some(CigarOp::Deletion(_))) {
+        return true;
+    }
+
+    false
 }
 
 /// Pure-logic implementation of finding `F1` (per-read
@@ -2528,6 +2613,101 @@ mod tests {
     }
 
     #[test]
+    fn g2_consecutive_id_record_is_dropped_with_counter() {
+        // Build a record whose CIGAR has an adjacent I/D pair. The
+        // record is otherwise pristine (passes MAPQ, length, flag
+        // checks) so the only filter that can fire is G2.
+        let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
+        let mut spec = pass_record("R", 0, 100);
+        // Adjust seq/qual length to match the new CIGAR's read-consuming ops.
+        // M(20) + I(2) + D(1) + M(rest) → read consumes 20 + 2 + (len - 20) = len + 2.
+        let m_tail = (len - 20) as u32;
+        spec.cigar_ops = vec![
+            CigarOp::Match(20),
+            CigarOp::Insertion(2),
+            CigarOp::Deletion(1),
+            CigarOp::Match(m_tail),
+        ];
+        spec.seq = default_seq(len + 2);
+        spec.qual = default_qual(len + 2);
+        let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
+        let reader = CramMergedReader::from_open_crams(
+            vec![cram],
+            default_contigs(),
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+            None,
+        )
+        .expect("reader");
+        let (out, counts, err) = run_to_completion(reader);
+        assert!(err.is_none(), "G2 drop should not surface an error");
+        assert!(out.is_empty(), "G2 must drop the consecutive-I/D record");
+        assert_eq!(counts.bad_cigar, 1);
+    }
+
+    #[test]
+    fn g2_first_op_deletion_record_is_dropped_with_counter() {
+        // Boundary deletion: D as the first non-clip op. We add a
+        // leading soft-clip to verify the clip-stripping rule fires
+        // on the *post-clip* first op.
+        let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
+        let mut spec = pass_record("R", 0, 100);
+        let m_tail = (len - 5) as u32;
+        spec.cigar_ops = vec![
+            CigarOp::SoftClip(3),
+            CigarOp::Deletion(2),
+            CigarOp::Match(m_tail),
+        ];
+        // Read consumes 3 (SoftClip) + (len - 5) (Match) = len - 2.
+        spec.seq = default_seq(len - 2);
+        spec.qual = default_qual(len - 2);
+        let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
+        let reader = CramMergedReader::from_open_crams(
+            vec![cram],
+            default_contigs(),
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+            None,
+        )
+        .expect("reader");
+        let (out, counts, err) = run_to_completion(reader);
+        assert!(err.is_none());
+        assert!(out.is_empty());
+        assert_eq!(counts.bad_cigar, 1);
+    }
+
+    #[test]
+    fn g2_well_formed_record_passes_through() {
+        // Negative control: a clean CIGAR (single interior insertion)
+        // must NOT be filtered by G2. Also pins that we are not
+        // accidentally rejecting non-G2 patterns when wiring the
+        // cascade.
+        let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
+        let mut spec = pass_record("R", 0, 100);
+        let m_tail = (len - 20) as u32;
+        spec.cigar_ops = vec![
+            CigarOp::Match(20),
+            CigarOp::Insertion(2),
+            CigarOp::Match(m_tail),
+        ];
+        spec.seq = default_seq(len + 2);
+        spec.qual = default_qual(len + 2);
+        let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
+        let reader = CramMergedReader::from_open_crams(
+            vec![cram],
+            default_contigs(),
+            "sample".into(),
+            CramMergedReaderConfig::default(),
+            None,
+        )
+        .expect("reader");
+        let (out, counts, err) = run_to_completion(reader);
+        assert!(err.is_none());
+        assert_eq!(out.len(), 1);
+        assert_eq!(counts.bad_cigar, 0);
+    }
+
+    #[test]
     fn a16_empty_inputs_returns_no_inputs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fasta_path = dir.path().join("ref.fa");
@@ -3221,6 +3401,161 @@ mod tests {
             compute_adaptor_boundary(0, 0, 100, 150, None, None, 0),
             None
         );
+    }
+
+    // --- G2 cigar_is_bad helper: pure-logic tests --------------------
+    //
+    // These exercise `cigar_is_bad` directly. Integration with the
+    // cram_input filter cascade and the `FilterCounts.bad_cigar`
+    // counter is covered by the Group B tests below.
+
+    #[test]
+    fn g2_well_formed_cigar_is_not_bad() {
+        // Standard shapes that should pass: pure-match, single
+        // interior indel, soft-clipped ends, multi-indel CIGARs
+        // separated by M ops.
+        assert!(!cigar_is_bad(&[CigarOp::Match(100)]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::Match(50),
+            CigarOp::Insertion(2),
+            CigarOp::Match(50),
+        ]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::Match(50),
+            CigarOp::Deletion(3),
+            CigarOp::Match(50),
+        ]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::SoftClip(5),
+            CigarOp::Match(90),
+            CigarOp::SoftClip(5),
+        ]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::Match(20),
+            CigarOp::Insertion(2),
+            CigarOp::Match(40),
+            CigarOp::Deletion(1),
+            CigarOp::Match(20),
+        ]));
+    }
+
+    #[test]
+    fn g2_consecutive_id_is_bad() {
+        // I followed by D.
+        assert!(cigar_is_bad(&[
+            CigarOp::Match(20),
+            CigarOp::Insertion(2),
+            CigarOp::Deletion(1),
+            CigarOp::Match(20),
+        ]));
+        // D followed by I (the symmetric case).
+        assert!(cigar_is_bad(&[
+            CigarOp::Match(20),
+            CigarOp::Deletion(1),
+            CigarOp::Insertion(2),
+            CigarOp::Match(20),
+        ]));
+    }
+
+    #[test]
+    fn g2_consecutive_same_kind_indels_are_not_bad() {
+        // II or DD is non-canonical but not the GoodCigar pattern —
+        // those should be merged or normalised by the aligner; we
+        // don't reject on them here because the GATK rule is only
+        // about *mixed* I/D pairs.
+        assert!(!cigar_is_bad(&[
+            CigarOp::Match(20),
+            CigarOp::Insertion(2),
+            CigarOp::Insertion(1),
+            CigarOp::Match(20),
+        ]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::Match(20),
+            CigarOp::Deletion(2),
+            CigarOp::Deletion(1),
+            CigarOp::Match(20),
+        ]));
+    }
+
+    #[test]
+    fn g2_first_op_deletion_is_bad() {
+        assert!(cigar_is_bad(&[CigarOp::Deletion(2), CigarOp::Match(50),]));
+    }
+
+    #[test]
+    fn g2_last_op_deletion_is_bad() {
+        assert!(cigar_is_bad(&[CigarOp::Match(50), CigarOp::Deletion(2),]));
+    }
+
+    #[test]
+    fn g2_first_op_deletion_after_clip_is_bad() {
+        // GATK's rule explicitly says "with or without preceding
+        // clips": a deletion after only soft/hard clips is still a
+        // boundary deletion.
+        assert!(cigar_is_bad(&[
+            CigarOp::SoftClip(5),
+            CigarOp::Deletion(2),
+            CigarOp::Match(50),
+        ]));
+        assert!(cigar_is_bad(&[
+            CigarOp::HardClip(5),
+            CigarOp::SoftClip(3),
+            CigarOp::Deletion(2),
+            CigarOp::Match(50),
+        ]));
+    }
+
+    #[test]
+    fn g2_last_op_deletion_after_trailing_clip_is_bad() {
+        assert!(cigar_is_bad(&[
+            CigarOp::Match(50),
+            CigarOp::Deletion(2),
+            CigarOp::SoftClip(5),
+        ]));
+        assert!(cigar_is_bad(&[
+            CigarOp::Match(50),
+            CigarOp::Deletion(2),
+            CigarOp::SoftClip(3),
+            CigarOp::HardClip(2),
+        ]));
+    }
+
+    #[test]
+    fn g2_first_op_insertion_is_not_bad() {
+        // Boundary insertions are not the GoodCigar rule. The walker
+        // already drops first/last-op insertions as events (no
+        // flanking evidence), but the read itself stays in the active
+        // set and contributes Match events from the surrounding ops.
+        assert!(!cigar_is_bad(&[CigarOp::Insertion(2), CigarOp::Match(50),]));
+        assert!(!cigar_is_bad(&[CigarOp::Match(50), CigarOp::Insertion(2),]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::SoftClip(3),
+            CigarOp::Insertion(2),
+            CigarOp::Match(50),
+        ]));
+    }
+
+    #[test]
+    fn g2_only_clips_is_not_bad() {
+        // Pathological but not the GoodCigar pattern: a CIGAR of just
+        // clips has no first/last *non-clip* op, so the boundary-
+        // deletion check finds no candidate and returns false.
+        // Reads like this are dropped earlier by the min-read-length
+        // / unmapped-flag checks, so this is just a defensive case.
+        assert!(!cigar_is_bad(&[CigarOp::SoftClip(50)]));
+        assert!(!cigar_is_bad(&[
+            CigarOp::HardClip(10),
+            CigarOp::SoftClip(40),
+        ]));
+    }
+
+    #[test]
+    fn g2_empty_cigar_is_not_bad() {
+        // An empty CIGAR has no ops at all — `windows(2)` yields
+        // nothing, `find` returns None, neither rule fires. The
+        // upstream record decode would normally reject empty CIGARs
+        // before this point; this test pins the no-panic behaviour.
+        assert!(!cigar_is_bad(&[]));
     }
 
     // --- Group B: via new (real CRAM + FASTA) ------------------------
