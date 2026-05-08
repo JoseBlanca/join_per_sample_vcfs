@@ -50,6 +50,33 @@ use super::CigarOp;
 use super::PreparedRead;
 use super::decompose::{ReadEvent, indel_bq_proxy_deletion, indel_bq_proxy_insertion};
 
+/// Finding `G1` (adaptor-region per-base filter): is `ref_pos` past
+/// the read's mate-pair adaptor boundary?
+///
+/// On the **forward** strand the boundary is the first base past the
+/// 3′ end of the molecule, so any read base at `ref_pos >= boundary`
+/// is inside the adaptor. On the **reverse** strand the boundary is
+/// the last base before the molecule's 5′ end, so any read base at
+/// `ref_pos <= boundary` is inside the adaptor.
+///
+/// Returns `false` when no boundary is set on the read (single-end,
+/// mate unreliable, geometry inconsistent, or the molecule is at
+/// least as long as the read — in which case no readthrough is
+/// possible). See finding `G1` in
+/// `ia/reviews/pileup_gatk_comparison_2026-05-08.md` and
+/// `ia/specs/pileup_walker.md` §"Adaptor-region per-base filter".
+#[inline(always)]
+fn base_in_adaptor(ref_pos: u32, read: &PreparedRead) -> bool {
+    let Some(boundary) = read.adaptor_boundary else {
+        return false;
+    };
+    if read.is_reverse_strand {
+        ref_pos <= boundary
+    } else {
+        ref_pos >= boundary
+    }
+}
+
 /// CIGAR op-count threshold above which the cursor switches from
 /// linear-walk-with-early-break to binary-search-on-offsets. The
 /// value is chosen from the multi-op benchmark runs in
@@ -220,6 +247,12 @@ impl CigarCursor {
                             if base == b'N' {
                                 continue;
                             }
+                            // G1 — drop bases past the mate-pair adaptor
+                            // boundary. See `pileup_walker.md`
+                            // §"Adaptor-region per-base filter".
+                            if base_in_adaptor(ref_pos, read) {
+                                continue;
+                            }
                             out.push(ReadEvent::Match {
                                 ref_pos,
                                 base,
@@ -341,6 +374,12 @@ impl CigarCursor {
                         if base == b'N' {
                             continue;
                         }
+                        // G1 — drop bases past the mate-pair adaptor
+                        // boundary. See `pileup_walker.md`
+                        // §"Adaptor-region per-base filter".
+                        if base_in_adaptor(ref_pos, read) {
+                            continue;
+                        }
                         out.push(ReadEvent::Match {
                             ref_pos,
                             base,
@@ -446,7 +485,8 @@ impl CigarCursor {
                         let base = read.seq[read_off as usize];
                         // Read-N: skip per `pileup_walker.md`
                         // §"N-base handling".
-                        if base != b'N' {
+                        // G1 — drop bases past the adaptor boundary.
+                        if base != b'N' && !base_in_adaptor(walker_pos, read) {
                             out.push(ReadEvent::Match {
                                 ref_pos: walker_pos,
                                 base,
@@ -540,7 +580,8 @@ impl CigarCursor {
                     let base = read.seq[read_off as usize];
                     // Read-N: skip per `pileup_walker.md`
                     // §"N-base handling".
-                    if base != b'N' {
+                    // G1 — drop bases past the adaptor boundary.
+                    if base != b'N' && !base_in_adaptor(walker_pos, read) {
                         out.push(ReadEvent::Match {
                             ref_pos: walker_pos,
                             base,
@@ -648,6 +689,7 @@ mod tests {
             qname: Arc::from("r"),
             is_first_mate: true,
             has_mate: false,
+            adaptor_boundary: None,
         }
     }
 
@@ -1112,6 +1154,147 @@ mod tests {
                         "mode {mode:?}: a Match for read-N leaked through"
                     );
                 }
+            }
+        }
+    }
+
+    // --- G1: adaptor-region per-base filter -------------------------
+    //
+    // A read base placed past the mate-pair adaptor boundary was
+    // sequenced *through* the molecule into the far adaptor; it
+    // belongs to the library construct, not the genome. The cursor
+    // emits no Match event at those positions, in the same way
+    // read-N is skipped. See `ia/specs/pileup_walker.md`
+    // §"Adaptor-region per-base filter".
+
+    /// Build a `PreparedRead` exactly like `make_read` but with an
+    /// adaptor boundary and explicit strand. Used by the G1 tests.
+    fn make_read_with_adaptor(
+        cigar: Vec<CigarOp>,
+        alignment_start: u32,
+        seq: &[u8],
+        qual: &[u8],
+        is_reverse_strand: bool,
+        adaptor_boundary: Option<u32>,
+    ) -> PreparedRead {
+        let mut r = make_read(cigar, alignment_start, seq, qual);
+        r.is_reverse_strand = is_reverse_strand;
+        r.adaptor_boundary = adaptor_boundary;
+        r
+    }
+
+    #[test]
+    fn g1_forward_strand_drops_match_events_at_or_past_boundary() {
+        // 6bp read, M(6) at ref [100, 106). Boundary at 103: positions
+        // 103, 104, 105 are in adaptor → no Match events. 100, 101,
+        // 102 emit normally.
+        let read = make_read_with_adaptor(
+            vec![CigarOp::Match(6)],
+            100,
+            b"ACGTAC",
+            &[30; 6],
+            false,
+            Some(103),
+        );
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            for pos in 100u32..103 {
+                let evs = cursor.events_at(pos, &read);
+                assert_eq!(evs.len(), 1, "mode {mode:?}, pos {pos}: expected emit");
+            }
+            for pos in 103u32..106 {
+                assert!(
+                    cursor.events_at(pos, &read).is_empty(),
+                    "mode {mode:?}, pos {pos}: should be filtered as adaptor"
+                );
+            }
+            // events_overlapping over the whole read: 3 Match events
+            // for pre-boundary positions only.
+            let all = cursor.events_overlapping(0, u32::MAX, &read);
+            let positions: Vec<u32> = all.iter().map(|e| e.anchor_pos()).collect();
+            assert_eq!(positions, vec![100, 101, 102], "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn g1_reverse_strand_drops_match_events_at_or_before_boundary() {
+        // 6bp reverse-strand read, M(6) at ref [200, 206). Boundary at
+        // 202: positions 200, 201, 202 are in adaptor (≤ boundary).
+        // 203, 204, 205 emit normally.
+        let read = make_read_with_adaptor(
+            vec![CigarOp::Match(6)],
+            200,
+            b"ACGTAC",
+            &[30; 6],
+            true,
+            Some(202),
+        );
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            for pos in 200u32..=202 {
+                assert!(
+                    cursor.events_at(pos, &read).is_empty(),
+                    "mode {mode:?}, pos {pos}: should be filtered as adaptor (reverse)"
+                );
+            }
+            for pos in 203u32..206 {
+                let evs = cursor.events_at(pos, &read);
+                assert_eq!(
+                    evs.len(),
+                    1,
+                    "mode {mode:?}, pos {pos}: expected emit on reverse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn g1_no_boundary_means_no_filtering() {
+        // adaptor_boundary = None → behave exactly as if G1 didn't
+        // exist. Emit the standard 5 Match events.
+        let read = make_read_with_adaptor(
+            vec![CigarOp::Match(5)],
+            500,
+            b"ACGTA",
+            &[30; 5],
+            false,
+            None,
+        );
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            let all = cursor.events_overlapping(0, u32::MAX, &read);
+            assert_eq!(all.len(), 5, "mode {mode:?}: no boundary → no filter");
+        }
+    }
+
+    #[test]
+    fn g1_decompose_oracle_also_skips_adaptor_bases() {
+        // Parity check: the test-only `decompose` oracle skips adaptor
+        // bases too, so cursor-vs-oracle parity stays byte-clean on
+        // adaptor-bearing inputs. Without this the corpus parity test
+        // would fail any time a fixture set adaptor_boundary.
+        let read = make_read_with_adaptor(
+            vec![CigarOp::Match(8)],
+            10,
+            b"ACGTACGT",
+            &[30; 8],
+            false,
+            Some(14),
+        );
+        let oracle = decompose(&read);
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            let cursor_events = cursor.events_overlapping(0, u32::MAX, &read);
+            assert_eq!(
+                cursor_events, oracle,
+                "mode {mode:?}: cursor and decompose disagree on adaptor skipping"
+            );
+            // And no event sits at or past the boundary.
+            for ev in &cursor_events {
+                assert!(
+                    ev.anchor_pos() < 14,
+                    "mode {mode:?}: an event leaked through past boundary 14: {ev:?}"
+                );
             }
         }
     }

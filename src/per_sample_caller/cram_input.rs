@@ -102,6 +102,15 @@ pub struct MappedRead {
     pub qual: Vec<u8>,
     pub mate_ref_id: Option<usize>,
     pub mate_pos: Option<u64>,
+    /// Reference position of the first base on this read that lies
+    /// inside the mate-pair adaptor (1-based, inclusive on the read's
+    /// 3′ side; for reverse-strand reads, inclusive on the 5′ side).
+    /// `None` when the boundary cannot be reliably computed (single-end,
+    /// mate unmapped, mates on different contigs, TLEN=0, mates on the
+    /// same strand, geometry inconsistent, or the molecule is at least
+    /// as long as the read so no readthrough is possible). See finding
+    /// `G1` in `ia/reviews/pileup_gatk_comparison_2026-05-08.md`.
+    pub adaptor_boundary: Option<u32>,
     pub source_file_index: usize,
 }
 
@@ -267,7 +276,11 @@ pub struct CramMergedReaderConfig {
 
 // SAM/BAM flag bit constants — used both inside this module and by
 // tests building synthetic records.
+pub const FLAG_PAIRED: u16 = 0x1;
 pub const FLAG_UNMAPPED: u16 = 0x4;
+pub const FLAG_MATE_UNMAPPED: u16 = 0x8;
+pub const FLAG_REVERSE_STRAND: u16 = 0x10;
+pub const FLAG_MATE_REVERSE_STRAND: u16 = 0x20;
 pub const FLAG_SECONDARY: u16 = 0x100;
 pub const FLAG_QC_FAIL: u16 = 0x200;
 pub const FLAG_DUPLICATE: u16 = 0x400;
@@ -1311,6 +1324,16 @@ fn record_buf_to_mapped_read(
     let qual = rb.quality_scores().as_ref().to_vec();
     let mate_ref_id = rb.mate_reference_sequence_id();
     let mate_pos = rb.mate_alignment_start().map(|p| p.get() as u64);
+    let template_length = rb.template_length();
+    let adaptor_boundary = compute_adaptor_boundary(
+        flag,
+        ref_id,
+        pos,
+        seq.len() as u32,
+        mate_ref_id,
+        mate_pos,
+        template_length,
+    );
     Ok(MappedRead {
         qname,
         flag,
@@ -1322,8 +1345,93 @@ fn record_buf_to_mapped_read(
         qual,
         mate_ref_id,
         mate_pos,
+        adaptor_boundary,
         source_file_index,
     })
+}
+
+/// Finding `G1` (adaptor-region per-base filter) — pure-logic
+/// boundary computation. Returns the 1-based reference position of
+/// the first base that lies *inside* the mate-pair adaptor, or
+/// `None` when the read is single-end, the mate is unreliable, the
+/// fragment geometry is inconsistent, or the molecule is at least
+/// as long as the read (so no read base could have been sequenced
+/// past the molecule end).
+///
+/// Mirrors GATK's
+/// [`ReadUtils.getAdaptorBoundary`](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/read/ReadUtils.java#L527)
+/// with one principled deviation: instead of GATK's hardcoded
+/// `|tlen| > DEFAULT_ADAPTOR_SIZE = 100` cap (calibrated for 100bp
+/// reads), we gate on `|tlen| < seq_len`. The molecule has to be
+/// shorter than the *read's own* sequenced length for adaptor
+/// readthrough to be possible — that condition is read-aware and
+/// stays correct for ancient-DNA short fragments and for modern
+/// 150bp+ reads alike.
+///
+/// On the forward strand the boundary is `read.start + |tlen|`
+/// (first base past the molecule's 3′ end). On the reverse strand
+/// it is `mate.start - 1` (last base before the molecule's 5′ end);
+/// any read base at or before this position is inside the adaptor.
+/// The walker's emit sites apply the direction-aware test using
+/// `is_reverse_strand`.
+pub(crate) fn compute_adaptor_boundary(
+    flag: u16,
+    ref_id: usize,
+    pos: u64,
+    seq_len: u32,
+    mate_ref_id: Option<usize>,
+    mate_pos: Option<u64>,
+    template_length: i32,
+) -> Option<u32> {
+    // Required preconditions, in order of cheapness:
+    if flag & FLAG_PAIRED == 0 {
+        return None;
+    }
+    if flag & FLAG_UNMAPPED != 0 || flag & FLAG_MATE_UNMAPPED != 0 {
+        return None;
+    }
+    if template_length == 0 {
+        return None;
+    }
+    let is_reverse = flag & FLAG_REVERSE_STRAND != 0;
+    let mate_is_reverse = flag & FLAG_MATE_REVERSE_STRAND != 0;
+    // Same-strand pair → not a normal FR/RF pair, geometry is
+    // not the simple readthrough case.
+    if is_reverse == mate_is_reverse {
+        return None;
+    }
+    let mate_ref_id = mate_ref_id?;
+    if mate_ref_id != ref_id {
+        return None;
+    }
+    let mate_pos = mate_pos?;
+
+    let abs_tlen = template_length.unsigned_abs();
+    // Per-read gate: only check when the read could physically have
+    // run off the end of the molecule. If the molecule is at least
+    // as long as the read's sequence, no base sequenced from this
+    // read is in adaptor.
+    if abs_tlen >= seq_len {
+        return None;
+    }
+
+    if is_reverse {
+        // Reverse-strand read: molecule's 5′ end is at the mate's
+        // 1-based start; the first base inside adaptor (on the
+        // read's 5′ side, which is the *higher* read offset since
+        // the read is reversed) is the position immediately before
+        // the mate's start. Skip when ref_pos <= boundary.
+        if mate_pos == 0 {
+            // Defensive: 1-based positions are non-zero in valid
+            // SAM, but a corrupt record could place mate at 0.
+            return None;
+        }
+        Some(mate_pos as u32 - 1)
+    } else {
+        // Forward-strand read: molecule's 3′ end is at
+        // `read.start + |tlen|`. Skip when ref_pos >= boundary.
+        Some(pos as u32 + abs_tlen)
+    }
 }
 
 /// Reference-span sum of `M`-, `=`-, `X`-, `D`-, and `N`-op lengths
@@ -2962,6 +3070,157 @@ mod tests {
         let original = cigar.clone();
         left_align_indels(&mut cigar, seq, ref_seq);
         assert_eq!(cigar, original);
+    }
+
+    // --- G1 adaptor-boundary helper: pure-logic tests ----------------
+    //
+    // These exercise `compute_adaptor_boundary` directly, with synthetic
+    // SAM-flag/TLEN/mate-pos inputs. Integration into MappedRead
+    // construction is covered by the Group B tests via the `flag` /
+    // `mate_pos` knobs already available on `RecordSpec`.
+
+    /// Build the standard "properly paired, FR orientation" flag for a
+    /// forward-strand read whose mate is reverse-strand. Tests pass
+    /// this directly so the SAM bit fiddling is centralised.
+    const FLAG_FR_FWD: u16 = FLAG_PAIRED | FLAG_MATE_REVERSE_STRAND;
+    /// Same as `FLAG_FR_FWD` but for the reverse-strand mate.
+    const FLAG_FR_REV: u16 = FLAG_PAIRED | FLAG_REVERSE_STRAND;
+
+    #[test]
+    fn g1_single_end_returns_none() {
+        // No FLAG_PAIRED → boundary is undefined.
+        assert_eq!(
+            compute_adaptor_boundary(0, 0, 100, 150, Some(0), Some(200), 130),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_mate_unmapped_returns_none() {
+        let flag = FLAG_FR_FWD | FLAG_MATE_UNMAPPED;
+        assert_eq!(
+            compute_adaptor_boundary(flag, 0, 100, 150, Some(0), Some(200), 130),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_self_unmapped_returns_none() {
+        let flag = FLAG_FR_FWD | FLAG_UNMAPPED;
+        assert_eq!(
+            compute_adaptor_boundary(flag, 0, 100, 150, Some(0), Some(200), 130),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_zero_tlen_returns_none() {
+        // TLEN=0 means the aligner could not determine the insert size,
+        // typically because the mates are on different references or
+        // the placement is ambiguous. Don't filter.
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 100, 150, Some(0), Some(200), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_same_strand_pair_returns_none() {
+        // Same-strand FF or RR: improperly oriented, geometry is not
+        // the simple readthrough case.
+        let same_strand_flag = FLAG_PAIRED; // both forward (no FLAG_MATE_REVERSE_STRAND)
+        assert_eq!(
+            compute_adaptor_boundary(same_strand_flag, 0, 100, 150, Some(0), Some(200), 130),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_mate_on_different_contig_returns_none() {
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 100, 150, Some(1), Some(200), 130),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_molecule_at_least_as_long_as_read_returns_none() {
+        // 150bp read in a 200bp insert: fragment ≥ read, no readthrough.
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 100, 150, Some(0), Some(250), 200),
+            None
+        );
+        // Edge case: |tlen| == seq_len, also no readthrough.
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 100, 150, Some(0), Some(250), 150),
+            None
+        );
+    }
+
+    #[test]
+    fn g1_forward_strand_short_insert_boundary_is_start_plus_tlen() {
+        // 150bp read, insert 50bp: read overruns by 100bp into the
+        // 3′ adaptor. Boundary at read.start + |tlen| = 100 + 50 = 150.
+        // Any base at ref_pos >= 150 is in adaptor.
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 100, 150, Some(0), Some(149), 50),
+            Some(150)
+        );
+    }
+
+    #[test]
+    fn g1_reverse_strand_short_insert_boundary_is_mate_start_minus_one() {
+        // The reverse-strand read in an FR pair: mate's start is the
+        // forward-strand mate's leftmost ref pos (the molecule's 5′
+        // end on the forward strand). Boundary = mate.start - 1.
+        // ancient-DNA shape: 50bp molecule, mate starts at 100, our
+        // reverse read end placed beyond.
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_REV, 0, 200, 150, Some(0), Some(100), -50),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn g1_negative_tlen_takes_absolute_value() {
+        // Forward-strand mate that happens to be the second-in-pair
+        // (TLEN convention is reverse-mate TLEN, forward-mate -TLEN).
+        // |tlen| should be used so a negative sign does not break
+        // the calculation.
+        assert_eq!(
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 100, 150, Some(0), Some(149), -50),
+            Some(150)
+        );
+    }
+
+    #[test]
+    fn g1_ancient_dna_short_fragment_yields_boundary_inside_read_span() {
+        // 70bp ancient-DNA molecule sequenced with 100bp reads:
+        // mate starts at 1000, |tlen| = 70.
+        // Forward mate (start 1000): boundary at 1000 + 70 = 1070.
+        // Read covers ref [1000, 1100), so positions 1070..1100
+        // are filtered (30 of 100 bases).
+        let boundary_fwd =
+            compute_adaptor_boundary(FLAG_FR_FWD, 0, 1000, 100, Some(0), Some(1030), 70);
+        assert_eq!(boundary_fwd, Some(1070));
+        // Reverse mate (the same molecule's other end): boundary
+        // at mate.start - 1 = 1000 - 1 = 999. The reverse mate
+        // sits at ref [1030, 1130), but its leftward overrun is
+        // anywhere ≤ 999 — outside its own placement, which means
+        // its leftmost soft-clipped/`M` bases past 999 are flagged.
+        let boundary_rev =
+            compute_adaptor_boundary(FLAG_FR_REV, 0, 1030, 100, Some(0), Some(1000), -70);
+        assert_eq!(boundary_rev, Some(999));
+    }
+
+    #[test]
+    fn g1_default_record_has_no_boundary() {
+        // A record without any of the paired flags / TLEN must yield
+        // None — the no-op case the cursor relies on.
+        assert_eq!(
+            compute_adaptor_boundary(0, 0, 100, 150, None, None, 0),
+            None
+        );
     }
 
     // --- Group B: via new (real CRAM + FASTA) ------------------------

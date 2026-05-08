@@ -462,6 +462,67 @@ stays policy-free, consistent with the
 [architecture spec](calling_pipeline_architecture.md)'s "Stage
 1 records faithfully, downstream decides" principle.
 
+### Adaptor-region per-base filter
+
+When a sequenced library molecule is shorter than the read length
+(`|tlen| < seq_len`), each read sequences through the molecule
+and into the adaptor on the far end. The aligner usually
+soft-clips those adaptor bases, but not always — it can place
+them as `M`-op bases against spurious reference positions, where
+they look like real evidence. The walker therefore drops Match
+events whose reference position lies *past the molecule's end*,
+in the same way it drops events for read=`N`.
+
+The boundary is computed once per read at `cram_input` admission
+time (see
+[`compute_adaptor_boundary`](../../src/per_sample_caller/cram_input.rs))
+and stored on `MappedRead`/`PreparedRead` as
+`adaptor_boundary: Option<u32>`:
+
+- **Forward strand:** `boundary = read.start + |tlen|`. Any base
+  at `ref_pos >= boundary` is in adaptor.
+- **Reverse strand:** `boundary = mate.start - 1`. Any base at
+  `ref_pos <= boundary` is in adaptor.
+
+The boundary is `None` (filter is a no-op) when any of these
+hold: read is single-end, mate is unmapped, mate is on a
+different contig, TLEN=0, the pair is on the same strand, or
+`|tlen| >= seq_len`. The last condition — the molecule is at
+least as long as the read — means no read base could have been
+sequenced past the molecule's end; nothing to filter.
+
+The cursor's Match-emit sites (`events_at` and
+`events_overlapping` in
+[`cigar_cursor.rs`](../../src/per_sample_caller/pileup/cigar_cursor.rs))
+gate every emission on `!base_in_adaptor(ref_pos, read)`. The
+test-only [`decompose`](../../src/per_sample_caller/pileup/decompose.rs)
+oracle gates the same way so the parity tests stay byte-clean,
+mirroring the read-`N` skip pattern in §"N-base handling".
+
+This is finding `G1` from
+[the GATK comparison review](../reviews/pileup_gatk_comparison_2026-05-08.md#g1--adaptor-region-per-base-filter)
+and ports GATK's
+[`ReadUtils.isBaseInsideAdaptor`](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/read/ReadUtils.java#L1066)
+with one principled deviation: instead of GATK's hardcoded
+`|tlen| > 100` cap (calibrated for 100bp reads), we gate on
+`|tlen| < seq_len` per read. Read-aware gating is correct in
+both regimes — short fragments from ancient-DNA libraries (where
+the molecule is typically 30-70 bp, well below any plausible
+read length) and modern Illumina paired-end at 150 bp+ reads
+with sub-read-length inserts (where GATK's 100 cap would skip
+the boundary check and leak adaptor noise).
+
+This filter is orthogonal to mate-overlap resolution
+([§"Mate overlap"](#mate-overlap) below): mate overlap deals
+with bases sequenced *from* the molecule but observed twice;
+G1 deals with bases not sequenced from the molecule at all.
+
+The cursor performs the skip silently, in the same shape as the
+read-`N` skip — there is no per-position counter on `RunSummary`.
+If real-data analysis later needs to monitor how many bases are
+filtered as adaptor, a counter can be added without disturbing
+the filter's semantics.
+
 ### CIGAR walk algorithm
 
 ```

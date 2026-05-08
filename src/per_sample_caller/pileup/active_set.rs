@@ -209,6 +209,7 @@ mod tests {
             qname: Arc::from(qname),
             is_first_mate: true,
             has_mate: false,
+            adaptor_boundary: None,
         }
     }
 

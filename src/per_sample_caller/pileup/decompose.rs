@@ -95,8 +95,23 @@ pub fn decompose(read: &PreparedRead) -> Vec<ReadEvent> {
                     if base == b'N' {
                         continue;
                     }
+                    let pos = ref_pos + k;
+                    // G1 — drop bases past the mate-pair adaptor
+                    // boundary so the parity oracle stays byte-clean
+                    // against the lazy cursor. See
+                    // `ia/specs/pileup_walker.md`
+                    // §"Adaptor-region per-base filter".
+                    if let Some(boundary) = read.adaptor_boundary
+                        && (if read.is_reverse_strand {
+                            pos <= boundary
+                        } else {
+                            pos >= boundary
+                        })
+                    {
+                        continue;
+                    }
                     events.push(ReadEvent::Match {
-                        ref_pos: ref_pos + k,
+                        ref_pos: pos,
                         base,
                         bq_baq: read.bq_baq[read_pos + k as usize],
                     });
@@ -229,6 +244,7 @@ mod tests {
             qname: Arc::from("r"),
             is_first_mate: true,
             has_mate: false,
+            adaptor_boundary: None,
         }
     }
 

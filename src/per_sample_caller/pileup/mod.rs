@@ -143,6 +143,19 @@ pub struct PreparedRead {
     /// SAM flag `0x1`. When unset, the read is treated as solo and
     /// is not registered in `pending_mates`.
     pub has_mate: bool,
+    /// 1-based reference position of the first read base that lies
+    /// inside the mate-pair adaptor. `None` when the boundary cannot
+    /// be reliably computed (single-end, mate unmapped, geometry
+    /// inconsistent, or molecule longer than the read).
+    ///
+    /// On the **forward** strand any read base at `ref_pos >=
+    /// adaptor_boundary` was sequenced *through* the molecule's 3′
+    /// end into the far adaptor. On the **reverse** strand any read
+    /// base at `ref_pos <= adaptor_boundary` was sequenced through
+    /// the 5′ end into the near adaptor. The cursor's Match-emit
+    /// sites apply this test direction-aware. See finding `G1` in
+    /// `ia/reviews/pileup_gatk_comparison_2026-05-08.md`.
+    pub adaptor_boundary: Option<u32>,
 }
 
 // ---------------------------------------------------------------------

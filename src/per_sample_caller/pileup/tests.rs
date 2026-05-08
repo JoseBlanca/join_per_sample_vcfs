@@ -83,6 +83,7 @@ pub fn snp_read(qname: &str, alignment_start: u32, seq: &[u8], qual: &[u8]) -> P
         qname: Arc::from(qname),
         is_first_mate: true,
         has_mate: false,
+        adaptor_boundary: None,
     }
 }
 
@@ -198,6 +199,7 @@ fn deletion_record_has_extended_ref_span() {
         qname: Arc::from("r1"),
         is_first_mate: true,
         has_mate: false,
+        adaptor_boundary: None,
     };
     let records = drive_walker(vec![r], fa);
     let anchor = records
@@ -240,6 +242,7 @@ fn deletion_record_does_not_double_count_ref_reads() {
         qname: Arc::from("r1"),
         is_first_mate: true,
         has_mate: false,
+        adaptor_boundary: None,
     };
     let r2 = PreparedRead {
         chrom_id: 0,
@@ -253,6 +256,7 @@ fn deletion_record_does_not_double_count_ref_reads() {
         qname: Arc::from("r2"),
         is_first_mate: true,
         has_mate: false,
+        adaptor_boundary: None,
     };
     let records = drive_walker(vec![r1, r2], fa);
     let anchor = records
@@ -292,6 +296,7 @@ fn insertion_record_has_alt_longer_than_ref() {
         qname: Arc::from("r1"),
         is_first_mate: true,
         has_mate: false,
+        adaptor_boundary: None,
     };
     let records = drive_walker(vec![r], fa);
     let anchor = records.iter().find(|r| r.pos == 1).expect("anchor at 1");
@@ -391,6 +396,7 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
         qname: Arc::from("p"),
         is_first_mate: true,
         has_mate: true,
+        adaptor_boundary: None,
     };
     let m_second = PreparedRead {
         chrom_id: 0,
@@ -404,6 +410,7 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
         qname: Arc::from("p"),
         is_first_mate: false,
         has_mate: true,
+        adaptor_boundary: None,
     };
     // First-mate appears AFTER the second mate in the input stream,
     // even though both have alignment_start = 1, to make sure the
@@ -476,6 +483,7 @@ fn mate_overlap_agree_keeper_carries_summed_bq() {
         qname: Arc::from("p"),
         is_first_mate: is_first,
         has_mate: true,
+        adaptor_boundary: None,
     };
     let m1 = make(true, 20);
     let m2 = make(false, 20);
@@ -512,6 +520,7 @@ fn mate_overlap_agree_combined_bq_caps_at_200() {
         qname: Arc::from("p"),
         is_first_mate: is_first,
         has_mate: true,
+        adaptor_boundary: None,
     };
     let m1 = make(true, 150);
     let m2 = make(false, 100);
@@ -543,6 +552,7 @@ fn mate_overlap_disagree_winner_bq_scaled_by_0_8() {
         qname: Arc::from("p"),
         is_first_mate: is_first,
         has_mate: true,
+        adaptor_boundary: None,
     };
     // Mate 1 has REF "A" with higher BQ → winner. Mate 2 has SNP
     // "G" with lower BQ → loser, zeroed.
@@ -624,6 +634,7 @@ fn paired_mate_indel_overlap_yields_single_observation() {
         qname: Arc::from("p"),
         is_first_mate: true,
         has_mate: true,
+        adaptor_boundary: None,
     };
     let mut mate_b = mate_a.clone();
     mate_b.is_first_mate = false;
@@ -755,6 +766,7 @@ fn column_depth_cap_uses_indel_cap_when_any_indel_event_present() {
         qname: Arc::from("indel"),
         is_first_mate: true,
         has_mate: false,
+        adaptor_boundary: None,
     };
     reads.push(indel);
 
@@ -787,6 +799,52 @@ fn column_depth_cap_does_not_fire_below_threshold() {
         assert_eq!(
             rec.alleles[0].scalars.num_obs, 2,
             "pos {}: both reads should fold (no truncation under default cap)",
+            rec.pos,
+        );
+    }
+}
+
+// --- G1: adaptor-region per-base filter, walker integration ---------
+
+#[test]
+fn g1_walker_drops_match_observations_past_adaptor_boundary() {
+    // Reference: ACGTACGT (positions 1..9 1-based, 8 bases).
+    // Two reads on the same molecule, ancient-DNA shape:
+    //   - r_fwd: forward-strand, M(8) at pos 1, REF on every base.
+    //     Adaptor boundary at 5 (insert size = 4 < seq_len = 8) →
+    //     positions 1..4 emit, positions 5..8 are dropped as adaptor.
+    //   - r_rev: reverse-strand, M(8) at pos 1, REF on every base.
+    //     Adaptor boundary at 4 (mate.start - 1) → positions 1..4
+    //     are dropped, positions 5..8 emit.
+    //
+    // Net result at every position 1..8: exactly one read contributes
+    // (the one whose strand has that position outside its adaptor).
+    // Without G1, both reads would fold at every position and num_obs
+    // would be 2 — this is the regression the filter prevents.
+    let fa = MockFasta::new("ACGTACGT");
+    let mut r_fwd = snp_read("pair", 1, b"ACGTACGT", &[30; 8]);
+    r_fwd.is_reverse_strand = false;
+    r_fwd.has_mate = true;
+    r_fwd.is_first_mate = true;
+    r_fwd.adaptor_boundary = Some(5);
+    let mut r_rev = snp_read("pair", 1, b"ACGTACGT", &[30; 8]);
+    r_rev.is_reverse_strand = true;
+    r_rev.has_mate = true;
+    r_rev.is_first_mate = false;
+    r_rev.adaptor_boundary = Some(4);
+
+    let records = drive_walker(vec![r_fwd, r_rev], fa);
+    assert_eq!(records.len(), 8, "every covered position emits one record");
+    for rec in &records {
+        // Each position is covered by exactly one of the two mates
+        // after the adaptor filter applies. Without G1, mate-overlap
+        // resolution would still cap to 1 (sum-and-cap on agreement
+        // applies), but that path mutates BQ; here the filter cleanly
+        // removes the adaptor base from the contributor list before
+        // overlap resolution sees it.
+        assert_eq!(
+            rec.alleles[0].scalars.num_obs, 1,
+            "pos {}: exactly one mate is outside adaptor at this position",
             rec.pos,
         );
     }
