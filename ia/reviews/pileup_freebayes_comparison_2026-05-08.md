@@ -188,12 +188,14 @@ Priority key (same as the samtools review):
 - **Low** — only matters under conditions we don't currently
   target, or speculative.
 
-### `F1` — Per-read mismatch budget at filter time
+### `F1` — Per-read mismatch-fraction filter (default on, single knob)
 
 - **Priority:** Medium
-- **Effort:** Small (three counters in the BAM walk, four
-  thresholds in `CramMergedReaderConfig`, one
-  `FilterCounts` field per category)
+- **Effort:** Small (one config field, one constant, one
+  `FilterCounts` field, mismatch counter folded into the
+  existing per-read CIGAR walk)
+- **Status:** Designed and approved 2026-05-08; implementation
+  to follow. Subsumes the original `F2`.
 
 **Observation.** Freebayes drops an alignment **entirely** if
 any of four per-read mismatch budgets is exceeded
@@ -209,83 +211,127 @@ if (ra.alleles.empty()
 }
 ```
 
-The four knobs are `--read-mismatch-limit` (`RMU`, default
-unbounded), `--read-snp-limit` (default unbounded),
-`--read-indel-limit` (default unbounded), and
-`--read-max-mismatch-fraction` (default 1.0 — i.e. off). They
-are off by default, but the machinery is in place and is part of
-freebayes' standard "noise read" defence. The `mismatches`
-counter only increments for mismatches with `bq >= BQL2`
-(default 10, `Parameters.cpp`), so low-quality bases don't
-poison the budget — see `F2`.
+The `mismatches` counter only increments for mismatches with
+`bq >= BQL2` (default 10, `Parameters.cpp`), so low-quality
+bases don't poison the budget. All four knobs are off by
+default in freebayes — but the `--read-max-mismatch-fraction`
+formula is the most useful of the four because it captures the
+shape of the failure modes that pass MAPQ + BAQ:
+
+- **Adapter readthrough at the 3' end** — a mismatched tail
+  that BAQ can flatten BQ-wise but can't move into a soft clip.
+- **Wrong-reference / contamination** — bacterial / organelle
+  / PhiX reads aligning at low identity to "best available"
+  placement under a uniqueness-permissive aligner.
+- **Chimeric reads** where one end has a long mis-located tail.
 
 We have no equivalent in the
 [CramMergedReaderConfig](../../src/per_sample_caller/cram_input.rs)
-filter cascade. A read with 30 mismatches in 100 bp passes our
-filters today as long as MAPQ and length pass — every
+filter cascade today. A read with 30 mismatches in 100 bp
+passes our filters as long as MAPQ and length clear; every
 mismatch becomes a low-quality SNP allele in the per-position
-records, and at scale these noise reads inflate the
-`prodQout` term against true alts in low-coverage cohorts.
+records and inflates `prodQout` against true alts in
+low-coverage cohorts.
 
-**Proposal.**
+**Decision (2026-05-08).** Adopt a **default-on** filter with
+**two user-facing knobs** rather than freebayes' four-knob
+opt-in set:
 
-1. Add four optional thresholds to `CramMergedReaderConfig`:
-   `max_read_mismatch_fraction: Option<f32>`,
-   `max_read_mismatches: Option<u32>`,
-   `max_read_snp_count: Option<u32>`,
-   `max_read_indel_count: Option<u32>`. Default to `None`
-   (off), matching freebayes' default posture.
-2. Compute the counters during the existing per-read CIGAR
-   walk in `cram_input.rs` (so the walker doesn't see them).
-3. Surface drop counts via new `FilterCounts` fields, same
-   pattern as the existing `secondary` / `supplementary`
-   counters.
+- **Config:** two new fields on `CramMergedReaderConfig`:
+  - `max_read_mismatch_fraction: Option<f32>` — the threshold.
+    `None` = filter disabled; `Some(x)` = drop a read whose
+    mismatch fraction exceeds `x`. Default `Some(0.10)`.
+  - `mismatch_bq_floor: u8` — only mismatches whose base
+    quality clears this floor count toward the fraction. The
+    floor exists so the filter doesn't fire on genuinely
+    low-quality bases (which the per-base BQ already
+    de-emphasises in the likelihood). Default `10`, matching
+    freebayes' `BQL2`. `0` disables the floor (every mismatch
+    counts).
+- **Why two knobs.** The floor is exposed as a calibration
+  knob rather than buried as a private constant: it's
+  decision-relevant for users with unusually clean or
+  unusually noisy lanes, and a future-engineer reading the
+  config can see it sitting alongside the threshold. The two
+  knobs are semantically distinct (threshold = "how much is
+  too much"; floor = "what counts as a real mismatch") and
+  combining them into a single value would obscure both.
+  Subsumes the originally-proposed `F2`.
+- **Default rationale.** Real Illumina at MAPQ 20+ sits at
+  ~0.5-1% mismatch rate; 10% is comfortably outside that
+  distribution and inside the regime where adapter-runthrough,
+  contamination, and chimeric tails live. The BQ floor of 10
+  is freebayes' empirically-calibrated `BQL2`; below that
+  threshold the base call itself is too noisy to trust as
+  evidence of misalignment.
+- **Numerator:** count of `M`-op mismatches whose raw base
+  quality clears `mismatch_bq_floor`. Note: at the
+  `cram_input` stage we have raw BQ, not BAQ-adjusted BQ —
+  BAQ runs in a later stage. Filtering on raw BQ is the right
+  level for this filter: we're rejecting whole reads, not
+  per-base evidence, and we want to do so before paying the
+  BAQ cost.
+- **Denominator:** the count of `M`-op bases that are
+  ATGC-on-both-sides (skipping any position where either the
+  read or the reference has an `N`). This differs from
+  freebayes' `SEQLEN` denominator, which dilutes the fraction
+  with soft-clipped bases. Ours answers "what fraction of the
+  *confidently aligned* bases are mismatching?" and is more
+  aggressive on heavily-clipped reads — the right direction
+  for contamination defence.
+- **Where:** drop happens during per-read CIGAR analysis in
+  `cram_input` (alongside the existing flag / MAPQ / length
+  filters). The read never reaches the walker.
+- **Visibility:** new `FilterCounts.high_mismatch_fraction`
+  field, surfaced in the run summary alongside the existing
+  drop categories.
 
-**Rationale.** Cheap, opt-in, defends against adapter-runthrough
-or split-read noise in low-quality lanes that the BAQ stage
-cannot fix (BAQ adjusts per-base confidence within an alignment
-it accepts; it does not throw the alignment away). The defaults
-stay off, so behaviour is unchanged unless a user opts in.
+**Rationale for default-on.** Three reasons (per the design
+discussion behind this revision):
 
-**Risk.** None at the default-off settings. If turned on
-without thought, a user can throw away most of a low-quality
-sample's reads — same risk as today's MAPQ filter. Stage 1's
-existing run-summary reporting makes the loss visible.
+1. Filters that are off-by-default don't get used. The whole
+   reason `drop_qc_fail` and `drop_duplicate` are on-by-default
+   is that nobody would discover them otherwise.
+2. Reproducibility — defaults define "what the tool does." A
+   safety net that sits in the codebase but never fires is
+   worse than no safety net (it implies coverage it doesn't
+   deliver).
+3. Inverts the burden — instead of "opt-in to safety," it's
+   "opt-out for permissive mode." Right direction for a
+   defensive filter.
 
-### `F2` — BQ-floor `BQL2` for what counts as a "real" mismatch
+**Rationale for one knob, not four.** Freebayes' separate
+`readSnpLimit` / `readIndelLimit` / `RMU` thresholds duplicate
+the same signal at different angles; in practice
+`max_read_mismatch_fraction` alone catches the failure modes
+above. Fewer knobs is easier for users to understand and
+harder to misconfigure. If real data later shows a need for an
+indel-specific budget (e.g. PCR-stutter regions in homopolymer
+contexts), a follow-up adds it then with measured justification.
 
-- **Priority:** Low (only useful in conjunction with `F1`)
-- **Effort:** Small (one threshold constant, one branch in the
-  CIGAR walk)
+**Note on roles.** Strictly speaking, dropping high-mismatch
+reads is "the aligner's job" — a permissive aligner shouldn't
+emit them. But in practice BWA/minimap2/etc. emit alignments
+at a wide quality range and rely on downstream filtering;
+MAPQ alone doesn't catch high-mismatch but unique placements.
+This filter sits at the same `cram_input` BAM-input layer as
+the existing MAPQ / flag filters, on the same defence-in-depth
+grounds: the layer's job is to enforce a baseline of input
+quality the walker can rely on.
 
-**Observation.** When emitting per-base SNP alleles inside an
-`M` op, freebayes only increments the per-read mismatch budget
-counter (`ra.mismatches`) for mismatches whose base quality
-clears `parameters.BQL2` (default 10, `AlleleParser.cpp:1491-1494`):
+**Risk.** Default-on filters can quietly drop more than the
+user expects. Mitigations:
 
-```cpp
-if (qual >= parameters.BQL2) {
-    ++ra.mismatches;  // increment our mismatch counter if we're over BQL2
-    ++ra.snpCount;    // always increment snp counter
-}
-```
-
-The mismatch is still emitted as an allele — the BQ floor only
-gates whether it counts toward the `RMU` / `readMaxMismatchFraction`
-read-drop decision. (`snpCount` *also* gets the floor here,
-contrary to the comment, due to the conditional placement; that
-appears to be a freebayes bug, not a deliberate split.)
-
-**Proposal.** If `F1` is adopted, gate the `mismatches` counter
-on `bq_baq >= BQL2_DEFAULT = 10`. Don't re-implement the
-freebayes bug — gate `snpCount` independently from `mismatches`
-(or equivalently: gate only `mismatches`, not `snpCount`).
-
-**Rationale.** Otherwise the `F1` mismatch budget would be
-dominated by genuinely low-quality base calls, defeating the
-"noise read" intent.
-
-**Risk.** None.
+1. The threshold (10%) is conservative enough that
+   normal Illumina at MAPQ 20+ is essentially never affected.
+2. The drop counter is surfaced in the run summary so a
+   user looking at run stats can immediately see how many
+   reads it fired on. Consistently high counts indicate the
+   threshold needs revisiting; consistently zero counts mean
+   the filter is paying for itself only in worst-case
+   insurance.
+3. A user with a known-noisy lane can opt out via
+   `max_read_mismatch_fraction = None`.
 
 ### `F3` — Stage 1 indel left-alignment for placement canonicalisation
 
@@ -644,14 +690,12 @@ on the current sample backlog.
    with itself).
 2. `F5` — document `N`-base behaviour and add a pinning
    test (~30 minutes; clears an open question).
-3. `F2` — `BQL2`-floor for mismatch counting (only if `F1`
-   lands; trivial alongside it).
-4. `F1` — per-read mismatch budgets in
-   `CramMergedReaderConfig` (small, opt-in, surfaces in run
-   summary; defaults off so behaviour is unchanged on existing
-   pipelines).
-5. `F3` — Stage 1 indel left-alignment. The biggest of the
-   five and the only one that materially changes behaviour at
+3. `F1` — per-read mismatch-fraction filter in
+   `CramMergedReaderConfig` (single knob, default-on at 10%,
+   drop counter surfaced in run summary; subsumes the old
+   `F2` BQ-floor refinement).
+4. `F3` — Stage 1 indel left-alignment. The biggest of the
+   four and the only one that materially changes behaviour at
    defaults; justifies its own design pass before
    implementation, ideally tied to a homopolymer-context test
    sample so the win is measurable.
