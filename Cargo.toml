@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "pileup_walker_scaling"
 harness = false
+
+[[bench]]
+name = "freebayes_bookkeeping"
+harness = false

@@ -144,6 +144,23 @@ while acting on the findings below.
   `MAX_RECORD_SPAN` upstream filter that bounds it. Architectural
   divergence we want to keep — see §6.
 
+  *Empirical addendum (2026-05-08).* The Scope C microbenchmark
+  ([pileup_freebayes_bench_c_2026-05-08.md](../reports/implementations/pileup_freebayes_bench_c_2026-05-08.md))
+  measures the bookkeeping cost of the two data structures in
+  isolation (50 kb walker span, no fold work, no I/O, parity-checked
+  event stream). At an Illumina-shaped distribution (90% `span=1`,
+  10% `span ∈ [2, 10]`) our `BTreeMap<u32, OpenSlot>` with
+  merge-on-overlap is **2.05–2.20× faster** than a freebayes-shape
+  flat allele pool with linear-sweep ageing across the full
+  10–1000× coverage sweep. At a deletion-heavy stress
+  distribution (50% `span ∈ [10, 100]`) the gap reaches **17×**
+  because each long-footprint event keeps a pool entry alive for
+  10–100 walker steps, turning the linear retain into `O(N²)`,
+  while the merge-on-overlap rule keeps the BTreeMap small. The
+  architectural argument in §6 was correct on output-contract
+  grounds; the bench shows the design choice is also
+  performance-positive, not just performance-neutral.
+
 - **`A4` — Per-column depth handling preserves allele-frequency expectation.**
   Freebayes' `--limit-coverage` cap at `AlleleParser.cpp:2075-2092`
   is a **full-position purge**: when the per-position counter

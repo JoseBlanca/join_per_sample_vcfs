@@ -15,9 +15,16 @@ regardless of the outcome.
 
 ## Status
 
-- **Scope C (open-record bookkeeping microbenchmark):** open. Run first.
-- **Scope A (degraded-output walker):** conditional on C.
-- **Scope B (full-output walker):** conditional on A.
+- **Scope C (open-record bookkeeping microbenchmark):** **closed
+  2026-05-08** — `OursStyle` wins by 1.4-2.2× on the Illumina-shape
+  cells and 10-17× on deletion-heavy. Per the plan's exit criteria
+  this is the "do not proceed; strongest defence of design"
+  outcome. Report:
+  [pileup_freebayes_bench_c_2026-05-08.md](../reports/implementations/pileup_freebayes_bench_c_2026-05-08.md).
+- **Scope A (degraded-output walker):** **not pursued** — Scope C
+  closed the question.
+- **Scope B (full-output walker):** **not pursued** — conditional
+  on A, which was not pursued.
 
 ## Motivation
 
