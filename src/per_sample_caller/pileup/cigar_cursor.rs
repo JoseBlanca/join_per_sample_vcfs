@@ -210,9 +210,19 @@ impl CigarCursor {
                         for k in 0..span {
                             let ref_pos = emit_lo + k;
                             let read_off = off.read_pos + (ref_pos - op_lo);
+                            let base = read.seq[read_off as usize];
+                            // Skip read-N: an `N` base carries no
+                            // allele information, so emitting a Match
+                            // event for it would inflate scalars at
+                            // some allele bucket without justifying
+                            // evidence. See `pileup_walker.md`
+                            // §"N-base handling".
+                            if base == b'N' {
+                                continue;
+                            }
                             out.push(ReadEvent::Match {
                                 ref_pos,
-                                base: read.seq[read_off as usize],
+                                base,
                                 bq_baq: read.bq_baq[read_off as usize],
                             });
                         }
@@ -325,9 +335,15 @@ impl CigarCursor {
                     for k in 0..span {
                         let ref_pos = emit_lo + k;
                         let read_off = off.read_pos + (ref_pos - op_lo);
+                        let base = read.seq[read_off as usize];
+                        // Read-N: skip per `pileup_walker.md`
+                        // §"N-base handling".
+                        if base == b'N' {
+                            continue;
+                        }
                         out.push(ReadEvent::Match {
                             ref_pos,
-                            base: read.seq[read_off as usize],
+                            base,
                             bq_baq: read.bq_baq[read_off as usize],
                         });
                     }
@@ -427,11 +443,16 @@ impl CigarCursor {
                     let op_hi = op_lo + len;
                     if walker_pos >= op_lo && walker_pos < op_hi {
                         let read_off = off.read_pos + (walker_pos - op_lo);
-                        out.push(ReadEvent::Match {
-                            ref_pos: walker_pos,
-                            base: read.seq[read_off as usize],
-                            bq_baq: read.bq_baq[read_off as usize],
-                        });
+                        let base = read.seq[read_off as usize];
+                        // Read-N: skip per `pileup_walker.md`
+                        // §"N-base handling".
+                        if base != b'N' {
+                            out.push(ReadEvent::Match {
+                                ref_pos: walker_pos,
+                                base,
+                                bq_baq: read.bq_baq[read_off as usize],
+                            });
+                        }
                     }
                 }
                 CigarOp::Insertion(len) => {
@@ -516,11 +537,16 @@ impl CigarCursor {
                 let op_hi = op_lo + len;
                 if walker_pos >= op_lo && walker_pos < op_hi {
                     let read_off = off.read_pos + (walker_pos - op_lo);
-                    out.push(ReadEvent::Match {
-                        ref_pos: walker_pos,
-                        base: read.seq[read_off as usize],
-                        bq_baq: read.bq_baq[read_off as usize],
-                    });
+                    let base = read.seq[read_off as usize];
+                    // Read-N: skip per `pileup_walker.md`
+                    // §"N-base handling".
+                    if base != b'N' {
+                        out.push(ReadEvent::Match {
+                            ref_pos: walker_pos,
+                            base,
+                            bq_baq: read.bq_baq[read_off as usize],
+                        });
+                    }
                 }
             }
         }
@@ -955,5 +981,138 @@ mod tests {
         let d = cursor.events_at(read.alignment_start, &read);
         assert_eq!(a, c);
         assert_eq!(b, d);
+    }
+
+    // --- F5: read-N is no evidence ----------------------------------
+    //
+    // Read bases of `N` carry no allele information, so the cursor
+    // emits no Match event for them — neither into a `seq=b"N"`
+    // bucket (which would record "the read showed N" as a fake
+    // allele) nor into the REF bucket at ref-N positions (which
+    // would record "the read agrees with the unknown reference",
+    // also nonsense). See `ia/specs/pileup_walker.md`
+    // §"N-base handling".
+
+    #[test]
+    fn f5_read_n_emits_no_match_event_at_atgc_ref() {
+        // Single read base = N at a normal A/C/G/T reference. Expect:
+        // events_at returns no Match for that position, and the rest
+        // of the read's positions are emitted normally.
+        let read = make_read(
+            vec![CigarOp::Match(5)],
+            100,
+            b"ACNTG",
+            &[30, 30, 30, 30, 30],
+        );
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            // walker_pos 102 is the N — should yield empty.
+            assert!(
+                cursor.events_at(102, &read).is_empty(),
+                "mode {mode:?}: read-N at walker_pos 102 should not emit a Match"
+            );
+            // The other four positions should each yield exactly one
+            // Match with the right base.
+            for (offset, expected_base) in [(0u32, b'A'), (1, b'C'), (3, b'T'), (4, b'G')] {
+                let evs = cursor.events_at(100 + offset, &read);
+                assert_eq!(
+                    evs.len(),
+                    1,
+                    "mode {mode:?}: walker_pos {} should yield exactly one Match",
+                    100 + offset
+                );
+                if let ReadEvent::Match { base, .. } = evs[0] {
+                    assert_eq!(base, expected_base, "mode {mode:?}");
+                } else {
+                    panic!("mode {mode:?}: expected Match");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f5_read_n_emits_no_match_event_at_n_ref() {
+        // ref-N + read-N: also skipped (read-N is no evidence
+        // regardless of the reference byte).
+        // The cursor doesn't see ref bytes — it only emits read-side
+        // events — so this test exercises the same code path as the
+        // ATGC-ref case. The pin is that read-N is unconditionally
+        // skipped, no matter what the walker would later compare it
+        // against.
+        let read = make_read(vec![CigarOp::Match(3)], 200, b"NNN", &[30, 30, 30]);
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            // None of the three positions should yield a Match.
+            for walker_pos in 200u32..203 {
+                assert!(
+                    cursor.events_at(walker_pos, &read).is_empty(),
+                    "mode {mode:?}, walker_pos {walker_pos}: all-N read should emit no Match events"
+                );
+            }
+            // events_overlapping over the whole read range: also empty.
+            assert!(
+                cursor.events_overlapping(0, u32::MAX, &read).is_empty(),
+                "mode {mode:?}: all-N read should produce zero events under events_overlapping"
+            );
+        }
+    }
+
+    #[test]
+    fn f5_read_n_skip_is_per_position_not_per_read() {
+        // A read with a mix of ATGC and N bases: only the N
+        // positions are skipped; the others emit normally.
+        let read = make_read(vec![CigarOp::Match(6)], 300, b"ANCNNG", &[30; 6]);
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            let all = cursor.events_overlapping(0, u32::MAX, &read);
+            // Expect 3 Match events at positions 300, 302, 305 with
+            // bases A, C, G respectively.
+            assert_eq!(
+                all.len(),
+                3,
+                "mode {mode:?}: expected 3 Match events from ANCNNG, got {all:?}"
+            );
+            let positions: Vec<u32> = all.iter().map(|e| e.anchor_pos()).collect();
+            assert_eq!(positions, vec![300, 302, 305], "mode {mode:?}");
+            for ev in &all {
+                if let ReadEvent::Match { base, .. } = ev {
+                    assert!(
+                        matches!(*base, b'A' | b'C' | b'G'),
+                        "mode {mode:?}: emitted base should not be N"
+                    );
+                } else {
+                    panic!("mode {mode:?}: expected Match");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f5_decompose_oracle_also_skips_read_n() {
+        // Parity check: the test-only `decompose` oracle skips
+        // read-N too, so the cursor and the oracle remain
+        // byte-identical on N-bearing inputs. The
+        // `cursor_matches_decompose_on_pattern_corpus` test enforces
+        // this for the standard corpus; this test extends it to a
+        // dedicated N-bearing input that the corpus doesn't cover.
+        let read = make_read(vec![CigarOp::Match(5)], 400, b"ANGNT", &[30; 5]);
+        let oracle = decompose(&read);
+        for mode in [CursorMode::Linear, CursorMode::BinarySearch] {
+            let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
+            let cursor_events = cursor.events_overlapping(0, u32::MAX, &read);
+            assert_eq!(
+                cursor_events, oracle,
+                "mode {mode:?}: cursor and decompose disagree on read-N skipping"
+            );
+            // And no event has base = N.
+            for ev in &cursor_events {
+                if let ReadEvent::Match { base, .. } = ev {
+                    assert_ne!(
+                        *base, b'N',
+                        "mode {mode:?}: a Match for read-N leaked through"
+                    );
+                }
+            }
+        }
     }
 }

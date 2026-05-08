@@ -553,6 +553,8 @@ lands on the rationale.
 - **Priority:** Low (rare in practice but the rule should be explicit)
 - **Effort:** Small (one branch in `CigarCursor::Match` event
   emission; one test)
+- **Status:** Closed 2026-05-08. Adopted "skip read-`N` at
+  emit; pass ref-`N` through verbatim". See "Resolution" below.
 
 **Observation.** Freebayes treats `N` in the reference as a
 forced mismatch (`AlleleParser.cpp:1465`):
@@ -608,6 +610,54 @@ a draft assembly with `N` patches in the reference.
 observable depth at `N` positions — but those positions are
 already low-confidence by definition, and Stage 3's DUST
 filter drops most of them anyway.
+
+**Resolution.** Adopted both options 1 and 2 of the proposal:
+
+1. **Read-`N` is dropped at emit time** (option 2 of the
+   proposal). All four Match-emission sites in
+   [`cigar_cursor.rs`](../../src/per_sample_caller/pileup/cigar_cursor.rs)
+   (`events_overlapping_linear`, `events_overlapping_binary`,
+   `events_at_linear`, `events_at_binary`) and the test-only
+   [`decompose`](../../src/per_sample_caller/pileup/decompose.rs)
+   oracle now gate on `base != b'N'`. A read base of `N` carries
+   no allele information by definition, so emitting it would
+   inflate scalars at some allele bucket without justifying
+   evidence. This matches freebayes' practical behaviour
+   (freebayes emits `ALLELE_NULL` for read-`N` and filters
+   downstream — operationally identical to skipping at emit, with
+   one less allocation).
+
+2. **Ref-`N` passes through verbatim** (current behaviour, now
+   pinned). The walker does no special-case detection;
+   `alleles[0].seq[0] == b'N'` at ref-`N` positions, with alts
+   from non-`N` reads appearing as additional allele entries.
+   Records at ref-`N` positions are unusual VCF (`REF=N`) but
+   valid; Stage 3's DUST filter drops the bulk of ref-`N`
+   regions, and what slips through is left for Stage 5/6 to
+   apply policy on.
+
+3. **The combination resolves the ref-`N` + read-`N` oddity**
+   that motivated the original concern. Under the old behaviour,
+   the byte-identity allele equality treated ref-`N` + read-`N`
+   as a REF observation — recording the read as "agreeing with
+   the unknown reference," which was bookkeeping nonsense.
+   Skipping read-`N` at emit means no event ever gets folded for
+   that case; the position records no observation from that
+   read. Correct.
+
+**Documentation.**
+[`pileup_walker.md` §"N-base handling"](../specs/pileup_walker.md)
+now spells out the behaviour explicitly with the (ref byte ×
+read byte) → fold-result table that pins all six cases. Future
+engineers see the rule and the rationale together.
+
+**Tests.** Four new pinning tests in
+[`cigar_cursor.rs` tests](../../src/per_sample_caller/pileup/cigar_cursor.rs)
+prefixed `f5_`: read-`N` at ATGC ref produces no event,
+all-`N` read produces no events at any position, mixed `N`/ATGC
+read skips only the N positions, and the
+`decompose`-oracle-skips-read-`N` parity check. Each runs under
+both `Linear` and `BinarySearch` cursor modes.
 
 ## 5. Findings explicitly *rejected*
 
@@ -759,8 +809,11 @@ on the current sample backlog.
    **Done 2026-05-08** — see F4's Resolution above. New
    subsection in `calling_pipeline_architecture.md` plus a
    forward reference from the Stage 1 enumeration.
-2. `F5` — document `N`-base behaviour and add a pinning
-   test (~30 minutes; clears an open question).
+2. ~~`F5` — document `N`-base behaviour and add a pinning
+   test.~~ **Done 2026-05-08** — adopted "skip read-`N` at emit,
+   pass ref-`N` through verbatim". Resolves the ref-`N` +
+   read-`N` oddity by construction (no event is ever folded for
+   read-`N`). See F5's Resolution above.
 3. ~~`F1` — per-read mismatch-fraction filter in
    `CramMergedReaderConfig`.~~ **Done 2026-05-08** — single
    knob (with a BQ-floor companion knob), default-on at 10%,

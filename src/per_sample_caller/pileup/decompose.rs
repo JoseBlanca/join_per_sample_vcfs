@@ -89,9 +89,15 @@ pub fn decompose(read: &PreparedRead) -> Vec<ReadEvent> {
         match *op {
             CigarOp::Match(len) | CigarOp::SeqMatch(len) | CigarOp::SeqMismatch(len) => {
                 for k in 0..len {
+                    let base = read.seq[read_pos + k as usize];
+                    // Read-N: no Match event emitted. See
+                    // `ia/specs/pileup_walker.md` §"N-base handling".
+                    if base == b'N' {
+                        continue;
+                    }
                     events.push(ReadEvent::Match {
                         ref_pos: ref_pos + k,
-                        base: read.seq[read_pos + k as usize],
+                        base,
                         bq_baq: read.bq_baq[read_pos + k as usize],
                     });
                 }

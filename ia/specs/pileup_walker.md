@@ -405,6 +405,63 @@ makes this work correctly.
 
 `P` (padding) ops produce no events.
 
+### N-base handling
+
+**Read base of `N`.** A read base of `N` carries no allele
+information by definition — the position's call is unknown.
+Match events are emitted *only* when the read base is in
+`{A, C, G, T}`; a read base of `N` produces no event, and the
+walker folds nothing into any allele's scalars at that
+reference position. This applies uniformly regardless of what
+the reference says: read=`N` at ref=`A` is silent, read=`N` at
+ref=`N` is silent, read=`N` at ref=`G` is silent. The cursor's
+emit sites in
+[`cigar_cursor.rs`](../../src/per_sample_caller/pileup/cigar_cursor.rs)
+all gate on `base != b'N'`; the test-only
+[`decompose`](../../src/per_sample_caller/pileup/decompose.rs)
+oracle gates the same way so the parity tests stay byte-clean.
+
+This matches freebayes' practical behaviour: freebayes emits
+`ALLELE_NULL` for read=`N`
+([AlleleParser.cpp:1532-1547](../../freebayes/src/AlleleParser.cpp#L1532-L1547)),
+which is filtered out by every downstream consumer. Skipping at
+emit time is operationally identical and saves the `ALLELE_NULL`
+allocation.
+
+The depth at a position is implicitly the count over all alleles'
+`num_obs` at that position. A read with a `N` base does not
+contribute to depth at that position — correct, because the read
+has no information there. There is no separate "total reads
+covering this position" scalar that would need adjusting.
+
+**Reference base of `N`.** The walker passes reference bytes
+through verbatim into `alleles[0].seq`. Ref=`N` becomes
+`alleles[0].seq[0] == b'N'`; alts (from reads showing
+`A`/`C`/`G`/`T` at that position) appear as additional allele
+entries with `seq` matching the read base. There is no
+special-case detection in the walker — ref=`N` is just another
+byte from its perspective.
+
+The combined behaviour:
+
+| ref byte | read byte | event | walker fold result |
+|---|---|---|---|
+| `A` | `A` | Match | REF observation |
+| `A` | `C` | Match | ALT bucket `seq=b"C"` |
+| `A` | `N` | (none) | no contribution |
+| `N` | `A` | Match | ALT bucket `seq=b"A"` |
+| `N` | `N` | (none) | no contribution |
+| `N` | `C` | Match | ALT bucket `seq=b"C"` |
+
+Records at ref-`N` positions therefore have `REF=b"N"` on disk
+— unusual VCF but valid. Stage 3's DUST filter drops the bulk
+of ref-`N` regions (centromeres, telomeres, gaps), and what
+slips through is left for Stage 5/6 to apply policy on (e.g.,
+detect `REF[0] not in ATGC` and downgrade to no-call). Stage 1
+stays policy-free, consistent with the
+[architecture spec](calling_pipeline_architecture.md)'s "Stage
+1 records faithfully, downstream decides" principle.
+
 ### CIGAR walk algorithm
 
 ```
