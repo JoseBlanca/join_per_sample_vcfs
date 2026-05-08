@@ -173,10 +173,12 @@ an external dependency and an IO round-trip for no saved work.
    [AlleleParser.cpp:1626](../../freebayes/src/AlleleParser.cpp#L1626))
    and use the **minimum** BQ in that window as the per-read
    contribution to the indel allele's `Σ max(ln_BQ, ln_MQ)` scalar.
-   This matches freebayes' `--useMinIndelQuality` mode. Reads reporting
-   an indel as their first or last CIGAR operation are rejected — the
-   lack of flanking evidence on both sides makes the placement
-   untrustworthy (same rule as freebayes).
+   This matches freebayes' `--useMinIndelQuality` mode (which is
+   *not* freebayes' default — see §"Why min indel quality, not
+   freebayes' default summed-with-harmonic" below for the rationale).
+   Reads reporting an indel as their first or last CIGAR operation
+   are rejected — the lack of flanking evidence on both sides makes
+   the placement untrustworthy (same rule as freebayes).
 6. **Sub-threshold observations are kept.** A single read supporting an
    alt at an otherwise-REF position is recorded as a second allele
    entry for that position, not filtered out. At low coverage the
@@ -272,6 +274,74 @@ inside our per-sample caller lets us:
 This is a modest implementation win (BAQ is ~a few hundred lines
 following Heng Li's 2011 paper) that removes a real-world performance
 bottleneck users have hit with `calmd` in the past.
+
+### Why min indel quality, not freebayes' default summed-with-harmonic
+
+Item 5 above commits Stage 1 to the **minimum BQ in the `l + 2`
+window** as the per-read indel quality contribution. This matches
+freebayes' `--useMinIndelQuality` mode, which is *not* freebayes'
+default. Freebayes' default branch
+([AlleleParser.cpp:1659–1673](../../freebayes/src/AlleleParser.cpp#L1659-L1673)
+for deletions, [1735–1749](../../freebayes/src/AlleleParser.cpp#L1735-L1749)
+for insertions) computes:
+
+```c
+qual  = sumQuality(qualstr);
+qual += ln2phred(log((long double) L / (long double) l));
+qual /= harmonicSum(l);
+```
+
+— summed in-window BQ, scaled by `log(L/l)` and divided by
+`harmonicSum(l)` to penalise long indels (`harmonicSum(1) = 1`,
+`harmonicSum(5) ≈ 2.28`). The min branch fires only when
+`--use-min-indel-quality` is passed
+([Parameters.cpp:644](../../freebayes/src/Parameters.cpp#L644)).
+
+We deliberately pick min for three independent reasons:
+
+1. **Composability with the per-allele scalar.** Stage 2's
+   per-allele quality scalar is `Σ max(ln_BQ, ln_MQ)` summed
+   over supporting reads (§"The five per-allele scalars" below).
+   A min-aggregation slots into that sum directly: the read's
+   contribution is `max(ln(min_BQ_in_window), ln_MQ)`, computed
+   once per supporting read and accumulated. Freebayes'
+   summed-with-harmonic computes a non-linear, length-dependent
+   per-read scalar that does not slot into a sum without
+   carrying the harmonic denominator and the `log(L/l)`
+   correction as additional per-allele fields, to undo at
+   merge time. That would inflate the durable `.psf` artefact
+   with two extra per-allele scalars whose only role is to make
+   the freebayes math reconstructible — a real cost for a
+   non-default formula.
+
+2. **Calibration parity with bcftools.** bcftools mpileup /
+   bcftools call use a min-based indel quality treatment by
+   default — the same calibration target our BAQ-based pipeline
+   inherits (§"Per-read likelihood quality"). Picking min keeps
+   Stage 1 calibrated against a well-studied reference rather
+   than against freebayes' less-used default branch, and pairs
+   naturally with the BAQ stage we already share with bcftools.
+
+3. **Reversibility if we're wrong.** The choice is committed in
+   the *scalar set*, not in immutable byte layout. If a future
+   calibration study against truth sets shows freebayes'
+   harmonic correction is doing real work, the change is
+   adding two new per-allele scalars (a `harmonicSum(l)`
+   denominator and a `log(L/l)` adjustment) under the per-block
+   column manifest (§"Schema evolution: per-block column
+   manifest"). That is a minor-version bump — old `.psf`
+   files keep working with the min-based interpretation, new
+   files carry the additional scalars for the harmonic
+   reconstruction. No regeneration required.
+
+What we explicitly do *not* claim is that min is statistically
+superior to summed-with-harmonic on freebayes' calibration set.
+Freebayes' default exists because it gave better results on
+their evaluation set; switching defaults at our scale would
+need its own evaluation. We pick min on the three grounds
+above (composability, calibration parity, reversibility), and
+flag the choice here so a future engineer revisiting on real
+data sees the trade we made — not just the rule we encoded.
 
 ### Open-record closure and the read-span filter
 

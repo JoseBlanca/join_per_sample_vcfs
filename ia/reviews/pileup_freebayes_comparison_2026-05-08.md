@@ -470,6 +470,12 @@ and a follow-up if real data demands it.
 - **Priority:** Low (documentation only)
 - **Effort:** Tiny (a paragraph in
   [calling_pipeline_architecture.md §"Indel BQ proxy"](../specs/calling_pipeline_architecture.md))
+- **Status:** Closed 2026-05-08 — added a dedicated rationale
+  subsection
+  ([calling_pipeline_architecture.md §"Why min indel quality, not
+  freebayes' default summed-with-harmonic"](../specs/calling_pipeline_architecture.md))
+  and a forward-reference from item 5 of the Stage 1 enumeration.
+  See "Resolution" below.
 
 **Observation.** Our spec says:
 
@@ -525,6 +531,22 @@ spelling out:
 **Rationale.** Cheap insurance against future re-litigation.
 
 **Risk.** None — documentation only.
+
+**Resolution.** Implemented as a dedicated rationale subsection
+rather than the originally-proposed inline paragraph, to match
+the existing Stage 1 pattern (`§"Why BAQ in-process"` is a
+sibling subsection, not an aside). The new subsection covers all
+four points of the original proposal — freebayes' default is
+summed-with-harmonic, our composability argument, the bcftools
+calibration parity, and the reversibility-via-minor-version-bump
+story — plus an explicit "what we don't claim" paragraph
+flagging that we have not evaluated min vs. summed-with-harmonic
+on truth sets. That last paragraph is the future-proofing piece:
+a future engineer revisiting on real data sees both the trade we
+made and the unmade evaluation, not just the rule we encoded.
+Item 5 of the Stage 1 enumeration now points at the new
+subsection so a reader following the §"Indel BQ proxy" cross-reference
+lands on the rationale.
 
 ### `F5` — Define behaviour when reference base is `N`
 
@@ -733,17 +755,18 @@ Each finding is independent and can be its own small commit.
 None of them block each other; pick whichever is most useful
 on the current sample backlog.
 
-1. `F4` — document the `--useMinIndelQuality` choice
-   (paragraph-only, ~15 minutes; gets the spec consistent
-   with itself).
+1. ~~`F4` — document the `--useMinIndelQuality` choice.~~
+   **Done 2026-05-08** — see F4's Resolution above. New
+   subsection in `calling_pipeline_architecture.md` plus a
+   forward reference from the Stage 1 enumeration.
 2. `F5` — document `N`-base behaviour and add a pinning
    test (~30 minutes; clears an open question).
-3. `F1` — per-read mismatch-fraction filter in
-   `CramMergedReaderConfig` (single knob, default-on at 10%,
-   drop counter surfaced in run summary; subsumes the old
-   `F2` BQ-floor refinement).
-4. `F3` — Stage 1 indel left-alignment. The biggest of the
-   four and the only one that materially changes behaviour at
-   defaults; justifies its own design pass before
-   implementation, ideally tied to a homopolymer-context test
-   sample so the win is measurable.
+3. ~~`F1` — per-read mismatch-fraction filter in
+   `CramMergedReaderConfig`.~~ **Done 2026-05-08** — single
+   knob (with a BQ-floor companion knob), default-on at 10%,
+   drop counter surfaced in run summary. See F1's "Decision"
+   section above and commit `f102a0d`.
+4. ~~`F3` — Stage 1 indel left-alignment.~~ **Done 2026-05-08**
+   — always-on, no opt-out; runs in `cram_input` immediately
+   after decode and before F1. See F3's "Decision" section
+   above and commits `3b9e579`, `6921731`.
