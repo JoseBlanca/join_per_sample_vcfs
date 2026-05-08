@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pileup walker — interactive</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <h1>Pileup walker — interactive code-walk</h1>
+  <p class="subtitle">
+    Stage 1 of the per-sample caller, animated. Step through three scenarios
+    to see how reads, the CIGAR cursor, the active set, the open-record table
+    and the slot allocator cooperate.
+    Companion to <a href="architecture.md">architecture.md</a>.
+  </p>
+</header>
+
+<div id="controls">
+  <label>
+    Scenario:
+    <select id="scenario-picker"></select>
+  </label>
+  <button id="reset" title="Jump to step 0">⏮</button>
+  <button id="prev" title="Previous step">◀</button>
+  <button id="play" title="Auto-play">▶</button>
+  <button id="next" title="Next step">▶</button>
+  <button id="end" title="Jump to last step">⏭</button>
+  <span id="step-counter">0 / 0</span>
+  <label class="speed">
+    Speed:
+    <input type="range" id="speed" min="100" max="2000" value="700" step="100">
+    <span id="speed-display">700ms</span>
+  </label>
+</div>
+
+<main>
+  <section id="vis">
+    <h2 class="section-label">Reference</h2>
+    <div id="ref-axis" class="track"></div>
+
+    <h2 class="section-label">Reads <span class="hint">(all scenario reads; active reads are full-colour, pending and expired are dimmed)</span></h2>
+    <div id="reads" class="track"></div>
+
+    <h2 class="section-label">Open records <span class="hint">(table keyed by anchor; closes when <code>pos + ref_span ≤ walker_pos</code>)</span></h2>
+    <div id="open-records" class="track"></div>
+
+    <h2 class="section-label">Emitted records <span class="hint">(closed and pushed to the channel)</span></h2>
+    <div id="closed-records" class="closed-list"></div>
+  </section>
+
+  <aside id="info">
+    <div id="phase-card">
+      <div class="phase-row">
+        <span class="phase-label">Phase</span>
+        <span id="phase-name">—</span>
+      </div>
+      <div class="phase-row">
+        <span class="phase-label">Walker pos</span>
+        <span id="walker-display">—</span>
+      </div>
+      <div class="phase-row">
+        <span class="phase-label">Code</span>
+        <span id="code-ref">—</span>
+      </div>
+    </div>
+
+    <div id="description">
+      <p>Pick a scenario and press <kbd>▶</kbd>.</p>
+    </div>
+
+    <div id="code-walk">
+      <h3>Submodule map</h3>
+      <ul class="modules">
+        <li data-module="walker"><code>walker.rs</code> <span class="role">main loop</span></li>
+        <li data-module="active_set"><code>active_set.rs</code> <span class="role">active reads</span></li>
+        <li data-module="cigar_cursor"><code>cigar_cursor.rs</code> <span class="role">CIGAR walker</span></li>
+        <li data-module="slot_allocator"><code>slot_allocator.rs</code> <span class="role">phase-chain slots</span></li>
+        <li data-module="open_record"><code>open_record.rs</code> <span class="role">open records + fold</span></li>
+        <li data-module="decompose"><code>decompose.rs</code> <span class="role">test oracle</span></li>
+      </ul>
+    </div>
+
+    <div id="scenario-info">
+      <h3>About this scenario</h3>
+      <p id="scenario-description">—</p>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <p>
+    Source:
+    <a href="../../../src/per_sample_caller/pileup/">src/per_sample_caller/pileup/</a> &middot;
+    Spec: <a href="../../specs/pileup_walker.md">pileup_walker.md</a> &middot;
+    Architecture: <a href="../../specs/calling_pipeline_architecture.md">calling_pipeline_architecture.md</a>
+  </p>
+</footer>
+
+<script src="scenarios.js"></script>
+<script src="simulator.js"></script>
+<script src="viewer.js"></script>
+
+</body>
+</html>
