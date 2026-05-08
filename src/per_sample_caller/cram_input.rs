@@ -28,6 +28,20 @@ use crate::per_sample_caller::errors::CramInputError;
 /// convention.
 pub const DEFAULT_MIN_MAPQ: u8 = 20;
 
+/// Default for `CramMergedReaderConfig::max_read_mismatch_fraction`.
+/// 10% — comfortably outside the ~0.5-1% mismatch rate of normal
+/// Illumina at MAPQ 20+, inside the regime where adapter-runthrough,
+/// contamination, and chimeric tails live. See finding `F1` in
+/// `ia/reviews/pileup_freebayes_comparison_2026-05-08.md`.
+pub const DEFAULT_MAX_READ_MISMATCH_FRACTION: f32 = 0.10;
+
+/// Default for `CramMergedReaderConfig::mismatch_bq_floor`. Matches
+/// freebayes' `BQL2`. Mismatches whose raw base quality is below this
+/// floor do not count toward the mismatch fraction — keeps the filter
+/// from firing on genuinely low-quality bases (which the downstream
+/// likelihood already de-emphasises). `0` disables the floor entirely.
+pub const DEFAULT_MISMATCH_BQ_FLOOR: u8 = 10;
+
 /// Decoded SEQ length below this is dropped. Reads shorter than this
 /// rarely contribute reliable alignments at the project's coverage
 /// targets.
@@ -176,6 +190,11 @@ pub struct FilterCounts {
     pub duplicate: u64,
     pub low_mapq: u64,
     pub too_short: u64,
+    /// Reads dropped because their `M`-op mismatch fraction exceeded
+    /// `CramMergedReaderConfig::max_read_mismatch_fraction`. See
+    /// finding `F1` in
+    /// `ia/reviews/pileup_freebayes_comparison_2026-05-08.md`.
+    pub high_mismatch_fraction: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -215,6 +234,35 @@ pub struct CramMergedReaderConfig {
     pub drop_qc_fail: bool,
     /// Drop reads with `flag & 0x400` set.
     pub drop_duplicate: bool,
+    /// Default-on defence against contamination, adapter readthrough,
+    /// and other "the aligner placed it but it doesn't really belong
+    /// here" failure modes. `None` = filter disabled; `Some(x)` = drop
+    /// a read whose `M`-op mismatch fraction exceeds `x`.
+    ///
+    /// Mismatch fraction = `mismatches_with_bq_above_floor / m_op_bases_atgc`,
+    /// counting only positions where both the read base and the
+    /// reference base are in `{A, C, G, T}` (positions with `N` in
+    /// either are skipped from both numerator and denominator).
+    /// `mismatch_bq_floor` controls which mismatches count.
+    ///
+    /// Default `Some(0.10)` (`DEFAULT_MAX_READ_MISMATCH_FRACTION`).
+    /// Real BAQ-adjusted Illumina at MAPQ 20+ sits at ~0.5-1% mismatch
+    /// rate; 10% is comfortably outside that distribution. See finding
+    /// `F1` in
+    /// `ia/reviews/pileup_freebayes_comparison_2026-05-08.md`.
+    pub max_read_mismatch_fraction: Option<f32>,
+    /// BQ floor below which a mismatch does not count toward
+    /// `max_read_mismatch_fraction`. Default `10` (`DEFAULT_MISMATCH_BQ_FLOOR`),
+    /// matching freebayes' `BQL2`. `0` disables the floor (every
+    /// mismatch counts). Only meaningful when
+    /// `max_read_mismatch_fraction` is `Some`.
+    ///
+    /// At the `cram_input` stage the BQ is the raw value from the
+    /// CRAM, *not* BAQ-adjusted (BAQ runs in a later stage). Filtering
+    /// on raw BQ is the correct level for this filter — we are
+    /// rejecting whole reads, not per-base evidence, and want to do
+    /// so before paying the BAQ cost.
+    pub mismatch_bq_floor: u8,
 }
 
 // SAM/BAM flag bit constants — used both inside this module and by
@@ -232,6 +280,8 @@ impl Default for CramMergedReaderConfig {
             min_read_length: Some(DEFAULT_MIN_READ_LENGTH),
             drop_qc_fail: true,
             drop_duplicate: true,
+            max_read_mismatch_fraction: Some(DEFAULT_MAX_READ_MISMATCH_FRACTION),
+            mismatch_bq_floor: DEFAULT_MISMATCH_BQ_FLOOR,
         }
     }
 }
@@ -562,6 +612,18 @@ pub struct CramMergedReader {
     contigs: ContigList,
     sample_name: String,
     config: CramMergedReaderConfig,
+    /// FASTA repository for the F1 mismatch-fraction filter. `None`
+    /// disables that filter regardless of `config.max_read_mismatch_fraction`
+    /// — only relevant for in-memory test fixtures that do not have a
+    /// reference. The production `new()` always passes `Some`.
+    repository: Option<fasta::Repository>,
+    /// Cache of the most-recently-fetched contig sequence, indexed by
+    /// `ref_id`. Avoids one `Repository::get` (and its `RwLock`
+    /// acquisition) per accepted read on the steady-state path of a
+    /// chromosome. Cleared and refilled when the read's `ref_id`
+    /// changes. Held as `Arc<fasta::record::Sequence>` because that's
+    /// what `Repository::get` returns and cloning the `Arc` is free.
+    cached_contig: Option<(usize, std::sync::Arc<fasta::record::Sequence>)>,
     /// Previous `Locus` accepted from each input, parallel to
     /// `record_streams` and `paths`. `None` until the first record
     /// from that input is accepted. Used to detect within-file
@@ -719,7 +781,13 @@ impl CramMergedReader {
             reference_cram_path.as_deref().unwrap_or(fasta),
         )?;
 
-        Self::from_open_crams(open_crams, canonical_contigs, canonical_sample, config)
+        Self::from_open_crams(
+            open_crams,
+            canonical_contigs,
+            canonical_sample,
+            config,
+            Some(repository),
+        )
     }
 
     /// Crate-internal core. Takes pre-built per-CRAM record streams
@@ -728,11 +796,17 @@ impl CramMergedReader {
     /// before calling here). All I/O for opening lives outside this
     /// function, which is why it is the single point of entry tests
     /// drive against.
+    ///
+    /// `repository` is the FASTA reference for the F1 mismatch-fraction
+    /// filter. `None` disables that filter (intended for tests that
+    /// build CRAM records in memory and have no reference). The
+    /// production `new()` always passes `Some`.
     pub(crate) fn from_open_crams(
         open_crams: Vec<OpenCram>,
         contigs: ContigList,
         sample_name: String,
         config: CramMergedReaderConfig,
+        repository: Option<fasta::Repository>,
     ) -> Result<Self, CramInputError> {
         let n = open_crams.len();
         let mut record_streams = Vec::with_capacity(n);
@@ -750,6 +824,8 @@ impl CramMergedReader {
             contigs,
             sample_name,
             config,
+            repository,
+            cached_contig: None,
             per_file_prev_locus: vec![None; n],
             current_locus_read_fingerprints: Vec::new(),
             current_locus: None,
@@ -887,6 +963,35 @@ impl Iterator for CramMergedReader {
                 }
             };
 
+            // F1 — per-read mismatch-fraction filter. Drops reads
+            // whose `M`-op mismatch fraction exceeds the configured
+            // threshold; defends against contamination, adapter
+            // readthrough, and chimeric tails that pass MAPQ but
+            // wouldn't survive base-by-base scrutiny against the
+            // reference. Skipped when the threshold is `None` or
+            // when no `Repository` is plumbed (test fixtures).
+            //
+            // Repository is cheap to clone — its internal state is
+            // `Arc<RwLock<...>>` — and cloning here lets us release
+            // the immutable borrow on `self.repository` before
+            // `fetch_ref_for_read` takes `&mut self` for its cache
+            // update.
+            if let Some(threshold) = self.config.max_read_mismatch_fraction
+                && let Some(repository) = self.repository.clone()
+                && let Some(ref_seq) = self.fetch_ref_for_read(&repository, &mapped)
+                && read_exceeds_mismatch_fraction(
+                    &mapped.cigar,
+                    &mapped.seq,
+                    &mapped.qual,
+                    &ref_seq,
+                    self.config.mismatch_bq_floor,
+                    threshold,
+                )
+            {
+                self.filter_counts.high_mismatch_fraction += 1;
+                continue;
+            }
+
             // Accept: record the fingerprint and bump the per-file
             // previous-locus tracker.
             self.current_locus_read_fingerprints
@@ -906,6 +1011,55 @@ impl CramMergedReader {
     fn fail(&mut self, e: CramInputError) -> Option<<Self as Iterator>::Item> {
         self.fused = true;
         Some(Err(e))
+    }
+
+    /// Fetch the reference slice covering `[mapped.pos, mapped.pos +
+    /// cigar_ref_span)` for the F1 mismatch-fraction filter. Returns
+    /// `None` if the reference is unavailable or the slice would
+    /// extend past the end of the contig — both treated as "no
+    /// signal", which causes the F1 caller to skip the read instead
+    /// of dropping it.
+    ///
+    /// Caches one chromosome's `Arc<Sequence>` between calls so
+    /// reads contiguous on the same chromosome avoid the
+    /// `Repository::get` `RwLock` acquisition per read. The
+    /// underlying `noodles_fasta::Repository` already caches whole
+    /// contigs unboundedly, so this on-top cache is only an
+    /// optimisation against the per-call dispatch cost.
+    fn fetch_ref_for_read(
+        &mut self,
+        repository: &fasta::Repository,
+        mapped: &MappedRead,
+    ) -> Option<Vec<u8>> {
+        let ref_span = cigar_ref_span(&mapped.cigar);
+        if ref_span == 0 {
+            return None;
+        }
+        let contig = self.contigs.entries.get(mapped.ref_id)?;
+
+        // Refresh the cache on chrom change.
+        let needs_refresh = match &self.cached_contig {
+            Some((id, _)) => *id != mapped.ref_id,
+            None => true,
+        };
+        if needs_refresh {
+            let seq = repository.get(contig.name.as_bytes())?.ok()?;
+            self.cached_contig = Some((mapped.ref_id, seq));
+        }
+        let seq = &self.cached_contig.as_ref().expect("just set").1;
+
+        // `pos` is 1-based in our `MappedRead`; we want the byte
+        // slice covering reference positions `[pos, pos+ref_span)`.
+        // `Sequence` implements `AsRef<[u8]>` so we slice the raw
+        // byte buffer directly — sidesteps `Position` construction
+        // on the hot path.
+        let raw: &[u8] = AsRef::<[u8]>::as_ref(seq.as_ref());
+        let start = (mapped.pos as usize).checked_sub(1)?;
+        let end = start.checked_add(ref_span as usize)?;
+        if end > raw.len() {
+            return None;
+        }
+        Some(raw[start..end].to_vec())
     }
 
     fn advance_current_locus_if_needed(&mut self, ref_id: usize, pos: u64) {
@@ -1157,6 +1311,101 @@ fn record_buf_to_mapped_read(
     })
 }
 
+/// Reference-span sum of `M`-, `=`-, `X`-, `D`-, and `N`-op lengths
+/// — i.e. the count of reference positions the read covers. Helper
+/// for the F1 mismatch-fraction filter, which needs the slice
+/// `[pos, pos + ref_span)` of the reference to compare against.
+fn cigar_ref_span(cigar: &[CigarOp]) -> u32 {
+    cigar
+        .iter()
+        .map(|op| match *op {
+            CigarOp::Match(n)
+            | CigarOp::SeqMatch(n)
+            | CigarOp::SeqMismatch(n)
+            | CigarOp::Deletion(n)
+            | CigarOp::Skip(n) => n,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Pure-logic implementation of finding `F1` (per-read
+/// mismatch-fraction filter). Returns `true` when the read should
+/// be dropped — i.e. its `M`-op mismatch fraction strictly exceeds
+/// `threshold`.
+///
+/// - **Numerator:** count of `M`-op (or `=`/`X`-op) positions where
+///   the read base differs from the reference base **and** the raw
+///   base quality clears `bq_floor`. Positions where either base is
+///   `N` (or non-ATGC) are skipped from both numerator and
+///   denominator — they carry no usable signal.
+/// - **Denominator:** count of `M`-op positions counted in the
+///   numerator's denominator (i.e. ATGC-on-both-sides).
+/// - If the denominator is `0` (e.g. a read consisting entirely of
+///   soft-clips, or all `M` positions hit `N` bases), the function
+///   returns `false` — there is no signal on which to base a drop
+///   decision, and the conservative choice is to keep the read and
+///   let downstream filters speak.
+///
+/// `seq`, `qual`, and `cigar` are the read's owned fields after
+/// decoding; `ref_seq` is the reference slice covering
+/// `[read.pos, read.pos + cigar_ref_span(cigar))`. Indexing into
+/// these slices uses the standard CIGAR semantics — see
+/// [`crate::per_sample_caller::pileup::decompose`] for the
+/// reference walk pattern this function mirrors.
+fn read_exceeds_mismatch_fraction(
+    cigar: &[CigarOp],
+    seq: &[u8],
+    qual: &[u8],
+    ref_seq: &[u8],
+    bq_floor: u8,
+    threshold: f32,
+) -> bool {
+    let mut read_pos: usize = 0;
+    let mut ref_pos: usize = 0;
+    let mut mismatches: u32 = 0;
+    let mut comparable_bases: u32 = 0;
+
+    for op in cigar {
+        match *op {
+            CigarOp::Match(n) | CigarOp::SeqMatch(n) | CigarOp::SeqMismatch(n) => {
+                let n = n as usize;
+                for k in 0..n {
+                    let r = seq.get(read_pos + k).copied().unwrap_or(b'N');
+                    let g = ref_seq.get(ref_pos + k).copied().unwrap_or(b'N');
+                    let q = qual.get(read_pos + k).copied().unwrap_or(0);
+                    let r_atgc = matches!(r, b'A' | b'C' | b'G' | b'T');
+                    let g_atgc = matches!(g, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
+                    if r_atgc && g_atgc {
+                        comparable_bases += 1;
+                        if r != g.to_ascii_uppercase() && q >= bq_floor {
+                            mismatches += 1;
+                        }
+                    }
+                }
+                read_pos += n;
+                ref_pos += n;
+            }
+            CigarOp::Insertion(n) => {
+                read_pos += n as usize;
+            }
+            CigarOp::Deletion(n) | CigarOp::Skip(n) => {
+                ref_pos += n as usize;
+            }
+            CigarOp::SoftClip(n) => {
+                read_pos += n as usize;
+            }
+            CigarOp::HardClip(_) | CigarOp::Padding(_) => {}
+        }
+    }
+
+    if comparable_bases == 0 {
+        return false;
+    }
+    let fraction = (mismatches as f32) / (comparable_bases as f32);
+    fraction > threshold
+}
+
 fn cigar_to_ops(cigar: &sam::alignment::record_buf::Cigar) -> Vec<CigarOp> {
     use sam::alignment::record::cigar::op::Kind;
     cigar
@@ -1314,6 +1563,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1351,6 +1601,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, _, err) = run_to_completion(reader);
@@ -1372,6 +1623,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, _, err) = run_to_completion(reader);
@@ -1397,6 +1649,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let first = reader.next().expect("first").expect("ok");
@@ -1436,6 +1689,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         assert!(reader.next().expect("ok item").is_ok()); // pos=200
@@ -1454,6 +1708,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let first = reader.next().expect("first").expect("ok");
@@ -1485,6 +1740,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, _, err) = run_to_completion(reader);
@@ -1515,6 +1771,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1539,6 +1796,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1571,6 +1829,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             cfg,
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1643,6 +1902,7 @@ mod tests {
                 default_contigs(),
                 "sample".into(),
                 cfg,
+                None,
             )
             .expect("reader");
             let (out, counts, err) = run_to_completion(reader);
@@ -1665,6 +1925,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1692,12 +1953,14 @@ mod tests {
             min_read_length: None,
             drop_qc_fail: false,
             drop_duplicate: false,
+            ..Default::default()
         };
         let reader = CramMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
             cfg,
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1735,6 +1998,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1767,6 +2031,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             cfg,
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1800,6 +2065,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, counts, err) = run_to_completion(reader);
@@ -1821,6 +2087,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         assert!(reader.next().is_none());
@@ -1841,6 +2108,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let (out, _, err) = run_to_completion(reader);
@@ -1877,6 +2145,7 @@ mod tests {
             default_contigs(),
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         assert!(
@@ -1898,6 +2167,7 @@ mod tests {
             contigs,
             "sample".into(),
             CramMergedReaderConfig::default(),
+            None,
         )
         .expect("reader");
         let read = reader.next().expect("ok").expect("ok");
@@ -1918,6 +2188,178 @@ mod tests {
             Err(CramInputError::NoInputs) => {}
             Err(other) => panic!("expected NoInputs, got {:?}", other),
         }
+    }
+
+    // --- F1 mismatch-fraction helper: pure-logic tests ---------------
+    //
+    // These exercise `read_exceeds_mismatch_fraction` directly, with
+    // synthetic inputs (no Repository, no CRAM). Integration of the
+    // filter into the cram_input pipeline is covered by the
+    // `default_config_*` tests below.
+
+    fn m_only(len: u32) -> Vec<CigarOp> {
+        vec![CigarOp::Match(len)]
+    }
+
+    #[test]
+    fn f1_zero_mismatches_passes() {
+        let cigar = m_only(10);
+        let seq = b"ACGTACGTAC";
+        let qual = vec![30u8; 10];
+        let ref_seq = b"ACGTACGTAC";
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_high_mismatch_drops() {
+        let cigar = m_only(10);
+        let seq = b"ACGTACGTAC";
+        let qual = vec![30u8; 10];
+        let ref_seq = b"AGGGAGGTAG"; // 4 mismatches in 10 → 40 %
+        assert!(read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_threshold_boundary_is_strict_greater_than() {
+        // Exactly at threshold: should NOT drop (filter is `>`, not `>=`).
+        // 1 mismatch in 10 = 0.10 fraction; threshold = 0.10 → keep.
+        let cigar = m_only(10);
+        let seq = b"ACGTACGTAC";
+        let qual = vec![30u8; 10];
+        let ref_seq = b"AGGTACGTAC"; // 1 mismatch at pos 1
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+        // Just above threshold: 2/10 = 0.20.
+        let ref_seq_2mm = b"AGGAACGTAC"; // 2 mismatches
+        assert!(read_exceeds_mismatch_fraction(
+            &cigar,
+            seq,
+            &qual,
+            ref_seq_2mm,
+            10,
+            0.10
+        ));
+    }
+
+    #[test]
+    fn f1_bq_floor_excludes_low_quality_mismatches() {
+        // 5 mismatches in 10 bases (= 50 %), but all with BQ=5 (< floor=10).
+        // Filter should ignore them all → keep.
+        let cigar = m_only(10);
+        let seq = b"ACGTACGTAC";
+        let qual = vec![5u8; 10];
+        let ref_seq = b"AGGGAGGGAC"; // 5 mismatches
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+        // Same input with BQ=20 → mismatches count → drop.
+        let qual_high = vec![20u8; 10];
+        assert!(read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual_high, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_bq_floor_zero_counts_every_mismatch() {
+        // floor=0 → every mismatch counts regardless of BQ.
+        let cigar = m_only(10);
+        let seq = b"ACGTACGTAC";
+        let qual = vec![0u8; 10];
+        let ref_seq = b"AGGGAGGGAC"; // 5 mismatches
+        assert!(read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 0, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_n_in_ref_skipped_from_both_numerator_and_denominator() {
+        // Read = ACGTACGTAC, Ref = NNNNNNNNNN. All M positions hit
+        // N-in-ref → comparable_bases = 0 → keep (no signal).
+        let cigar = m_only(10);
+        let seq = b"ACGTACGTAC";
+        let qual = vec![30u8; 10];
+        let ref_seq = b"NNNNNNNNNN";
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_n_in_read_skipped_from_both_numerator_and_denominator() {
+        // 5 read bases are N (skipped); the other 5 all match
+        // → 0 mismatches in 5 comparable → keep.
+        let cigar = m_only(10);
+        let seq = b"NNNNNACGTA";
+        let qual = vec![30u8; 10];
+        let ref_seq = b"AAAAAACGTA";
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_soft_clips_excluded_from_denominator() {
+        // 5S5M: only the 5 M-op bases count. Two of them mismatch
+        // → 2/5 = 40 % → drop. The freebayes formula (with seqlen
+        // denominator = 10) would give 2/10 = 20 % — still drop here
+        // but this test pins the M-op-only behaviour we documented.
+        let cigar = vec![CigarOp::SoftClip(5), CigarOp::Match(5)];
+        let seq = b"AAAAAACGTA"; // first 5 = soft clip
+        let qual = vec![30u8; 10];
+        let ref_seq = b"GGGTA"; // ref covers only the 5 M bases
+        assert!(read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_indels_advance_cursors_but_dont_count() {
+        // 4M 2I 4M with all matches in M-ops and an insertion of
+        // garbage in the middle. M-op bases = 8, mismatches = 0.
+        // Insertion does not contribute to either count → keep.
+        let cigar = vec![CigarOp::Match(4), CigarOp::Insertion(2), CigarOp::Match(4)];
+        let seq = b"ACGTNNACGT"; // last 4 align after the 2-base ins
+        let qual = vec![30u8; 10];
+        let ref_seq = b"ACGTACGT";
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_no_m_op_returns_false() {
+        // All-soft-clip read (shouldn't happen post-MAPQ-filter but
+        // could). comparable_bases = 0 → keep (conservative).
+        let cigar = vec![CigarOp::SoftClip(10)];
+        let seq = b"ACGTACGTAC";
+        let qual = vec![30u8; 10];
+        let ref_seq = b""; // ref_span = 0
+        assert!(!read_exceeds_mismatch_fraction(
+            &cigar, seq, &qual, ref_seq, 10, 0.10
+        ));
+    }
+
+    #[test]
+    fn f1_default_config_has_filter_enabled_at_ten_percent() {
+        // Pin the default config: filter on, threshold 0.10, floor 10.
+        let cfg = CramMergedReaderConfig::default();
+        assert_eq!(cfg.max_read_mismatch_fraction, Some(0.10));
+        assert_eq!(cfg.mismatch_bq_floor, 10);
+        assert_eq!(DEFAULT_MAX_READ_MISMATCH_FRACTION, 0.10);
+        assert_eq!(DEFAULT_MISMATCH_BQ_FLOOR, 10);
+    }
+
+    #[test]
+    fn f1_filter_counts_default_high_mismatch_fraction_is_zero() {
+        // The new field on FilterCounts must default to 0 — otherwise
+        // previously-default-comparing tests would silently break.
+        let counts = FilterCounts::default();
+        assert_eq!(counts.high_mismatch_fraction, 0);
     }
 
     // --- Group B: via new (real CRAM + FASTA) ------------------------
