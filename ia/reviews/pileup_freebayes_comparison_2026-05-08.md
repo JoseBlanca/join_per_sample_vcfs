@@ -379,18 +379,65 @@ cohort merger sees a 1-vs-1 frequency spread instead of 2-vs-0,
 and the variant looks weaker than it is. BAQ does not fix this —
 BAQ adjusts BQ, it does not move CIGAR ops.
 
-**Proposal.**
+**Decision (2026-05-08).** Adopt as **always-on, no
+configuration knob**:
 
-1. Port `stablyLeftAlign` from `freebayes/src/LeftAlign.cpp` to
-   a Rust `cram_input::left_align` module. It mutates the CIGAR
-   in place, leaving the read sequence and BQ array untouched
-   (since the sequence does not change — only its annotation).
-2. Run it during CRAM/BAM ingest, before the read crosses into
-   the walker as a `PreparedRead`. Behind a config knob
-   `CramMergedReaderConfig.left_align_indels: bool`, default
-   `true` (matching freebayes).
-3. Surface a counter in the run summary so the user can see
-   how many reads actually got their indel anchors moved.
+- Port the `stablyLeftAlign` algorithm to a private function in
+  `cram_input` that mutates the CIGAR in place, leaving the read
+  sequence and BQ array untouched (the bytes don't change — only
+  their CIGAR annotation does). Single function, no module
+  boundary.
+- Run it during the per-read decode in `cram_input`, immediately
+  after `record_buf_to_mapped_read`, **before** the F1
+  mismatch-fraction filter (so F1 sees post-canonicalisation
+  CIGARs).
+- **No CLI / API knob.** Unlike F1's defensive filter (which has
+  a real opt-out case for known-noisy lanes), left-alignment is
+  pure normalisation: it never throws away data, and the only
+  cost of "turning it off" is fragmented allele scalars at
+  homopolymer-context indels. The performance gain from skipping
+  it is minimal. Adding a knob would mean an API/CLI surface and
+  a documentation entry for a switch that no caller has a
+  legitimate reason to flip.
+
+**Orientation invariance.** BAM/CRAM stores `seq` and `qual` in
+forward-reference orientation (a reverse-mapped read has its
+sequence reverse-complemented before storage), and CIGAR is in
+the same forward-reference order. The left-alignment algorithm
+operates on these forward-reference inputs and never branches on
+`is_reverse_strand`. Two reads of the same biological indel on
+opposite strands therefore *converge* on the same canonical
+anchor, which is the point of the filter — accidentally
+mirroring the shift direction by strand would defeat it. Tests
+explicitly cover the forward-vs-reverse-strand convergence case.
+
+**Scope of the algorithm we implement.** Only single-indel
+left-alignment within the immediately preceding `M`-class op.
+Specifically:
+
+- For each indel in the CIGAR, walk leftward one base at a time
+  while the shift condition holds (insertion: rotated last
+  inserted base equals the base just before the current anchor;
+  deletion: base just before the deletion equals the last
+  deleted base) AND the preceding `M`-class op has length to
+  give. Each base of shift takes one base from the preceding
+  `M` op and gives it to the following `M`-class op.
+- Bounded by the read's reference span — an indel cannot shift
+  past the read's `alignment_start`. If the homopolymer extends
+  to the read's left edge, the shift terminates with the indel
+  at first-CIGAR-op position; the walker's existing
+  first/last-op-indel rejection rule
+  ([decompose.rs:106](../../src/per_sample_caller/pileup/decompose.rs#L106),
+  [decompose.rs:120](../../src/per_sample_caller/pileup/decompose.rs#L120))
+  drops it on the next stage. That's the right outcome —
+  flanking evidence on only one side is the same condition the
+  rule already protects against.
+- **Not implemented:** freebayes' "merge neighbouring indels"
+  pass after left-alignment. That handles the rare case of two
+  close indels canonicalising into adjacency. Real Illumina
+  data rarely produces those patterns at variant-call quality;
+  if they show up in real samples, we add the merging pass
+  then. Adjacent-indel CIGARs are left untouched.
 
 **Rationale.** Restores the convergence property our
 allele-equality rule needs to be lossless. Without it, the
@@ -411,11 +458,12 @@ applies to indel anchor choice. Picking BAQ for SNPs but
 then trusting the aligner's indel anchors is internally
 inconsistent.
 
-**Risk.** Medium implementation cost; the algorithm is small
-but has subtle edge cases (multi-base indels next to
-short repeats need the "merge neighbouring indels" sweep to
-match freebayes' behaviour). Test coverage needs to include
-the homopolymer-anchor-scatter case explicitly.
+**Risk.** Low. The algorithm is small (~80 lines), the inputs
+and outputs are well-defined (CIGAR-in, CIGAR-out, read bytes
+unchanged), and the tests pin both the homopolymer-anchor-scatter
+case and the forward-vs-reverse-strand convergence
+explicitly. The "merge neighbouring indels" gap is acknowledged
+and a follow-up if real data demands it.
 
 ### `F4` — Document the `--useMinIndelQuality` choice and contrast with freebayes' default
 
