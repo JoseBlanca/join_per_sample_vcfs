@@ -398,16 +398,19 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
 
 /// Find or create the allele bucket inside a record matching `seq`.
 /// Returns the bucket index. Linear scan is fine — records
-/// typically carry ≤ a few alleles. Returning the index rather
-/// than `&mut OpenAllele` keeps the `rec` borrow short, so callers
-/// can index into `alleles` and update sibling state (e.g.
-/// `folded_reads`) in the same scope.
-pub fn find_or_create_allele_index(rec: &mut OpenPileupRecord, seq: Vec<u8>) -> usize {
-    if let Some(idx) = rec.alleles.iter().position(|a| a.seq == seq) {
+/// typically carry ≤ a few alleles.
+///
+/// Takes `&mut Vec<OpenAllele>` rather than `&mut OpenPileupRecord`
+/// so the caller can hold an independent borrow on the record's
+/// `ref_seq` (e.g. for `apply_events_to_ref`) at the same time.
+/// This is what lets `process_position` avoid cloning `ref_seq` per
+/// affected record. Mi6 in `ia/reviews/pileup_2026-05-09.md`.
+pub fn find_or_create_allele_index(alleles: &mut Vec<OpenAllele>, seq: Vec<u8>) -> usize {
+    if let Some(idx) = alleles.iter().position(|a| a.seq == seq) {
         idx
     } else {
-        rec.alleles.push(OpenAllele::new(seq));
-        rec.alleles.len() - 1
+        alleles.push(OpenAllele::new(seq));
+        alleles.len() - 1
     }
 }
 
@@ -478,11 +481,22 @@ pub fn process_position(
     // the old bucket before adding the new one.
     affected.sort_unstable();
     for key in affected {
-        let (rec_pos, rec_ref_seq) = {
-            let rec = open.records.get(&key).expect("affected key must exist");
-            (rec.pos, rec.ref_seq.clone())
-        };
-        let rec_end = rec_pos + rec_ref_seq.len() as u32;
+        let rec = open.records.get_mut(&key).expect("affected key must exist");
+        let rec_pos = rec.pos;
+        // Destructure through `&mut` so `ref_seq`, `alleles`, and
+        // `folded_reads` are each independent mutable borrows of
+        // disjoint fields. This lets us pass `ref_seq` to
+        // `apply_events_to_ref` while simultaneously mutating
+        // `alleles` and `folded_reads` — without cloning `ref_seq`
+        // per affected record. Mi6 in
+        // `ia/reviews/pileup_2026-05-09.md`.
+        let OpenPileupRecord {
+            ref_seq,
+            alleles,
+            folded_reads,
+            ..
+        } = rec;
+        let rec_end = rec_pos + ref_seq.len() as u32;
 
         for contrib in contributors {
             let active_read = active
@@ -521,7 +535,7 @@ pub fn process_position(
                 continue;
             }
 
-            let allele_seq = apply_events_to_ref(rec_pos, &rec_ref_seq, &window_events);
+            let allele_seq = apply_events_to_ref(rec_pos, ref_seq, &window_events);
             let bq = ln_bq_for_read(&window_events, contrib.bq_baq_at_walker_pos);
             let ln_q = bq.max(contrib.mq_log_err);
             let new_contribution = FiveScalars {
@@ -532,25 +546,24 @@ pub fn process_position(
                 placed_start: u32::from(contrib.alignment_start == rec_pos),
             };
 
-            let rec = open.records.get_mut(&key).expect("affected key must exist");
             // Subtract any prior contribution this read had to
             // this record. Re-folds happen when a record widens
             // and the read's haplotype under the wider span
             // either changes bucket or stays in the same bucket
             // with a possibly-different ln_q.
-            if let Some(prev) = rec.folded_reads.remove(&contrib.read_id) {
+            if let Some(prev) = folded_reads.remove(&contrib.read_id) {
                 subtract_contribution(
-                    &mut rec.alleles[prev.allele_index].scalars,
+                    &mut alleles[prev.allele_index].scalars,
                     &prev.contribution,
                 );
             }
-            let new_index = find_or_create_allele_index(rec, allele_seq);
-            add_contribution(&mut rec.alleles[new_index].scalars, &new_contribution);
+            let new_index = find_or_create_allele_index(alleles, allele_seq);
+            add_contribution(&mut alleles[new_index].scalars, &new_contribution);
             insert_sorted_unique(
-                &mut rec.alleles[new_index].chain_slots,
+                &mut alleles[new_index].chain_slots,
                 contrib.chain_slot_id,
             );
-            rec.folded_reads.insert(
+            folded_reads.insert(
                 contrib.read_id,
                 FoldedReadState {
                     allele_index: new_index,
@@ -850,9 +863,9 @@ mod tests {
     #[test]
     fn find_or_create_allele_returns_same_bucket_on_match() {
         let mut rec = OpenPileupRecord::new(0, 100, b"ACG".to_vec());
-        let idx1 = find_or_create_allele_index(&mut rec, b"ACT".to_vec());
+        let idx1 = find_or_create_allele_index(&mut rec.alleles, b"ACT".to_vec());
         rec.alleles[idx1].scalars.num_obs = 1;
-        let idx2 = find_or_create_allele_index(&mut rec, b"ACT".to_vec());
+        let idx2 = find_or_create_allele_index(&mut rec.alleles, b"ACT".to_vec());
         assert_eq!(idx1, idx2);
         assert_eq!(rec.alleles[idx2].scalars.num_obs, 1);
         // REF + ACT = 2 buckets total.
