@@ -71,11 +71,23 @@ pub const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 /// likelihood math needs. The cap is per-column, not per-allele:
 /// per-allele clipping would silently bias the allele-frequency
 /// estimate (a 99/1 column with cap=250 would report ~71/29).
-/// When the contributor count at a column exceeds the cap, we
-/// keep the first `cap` items and drop the rest; reads in the
-/// active set are not allele-correlated in their iteration order,
-/// so this is approximately unbiased without needing a full
-/// random-sample step.
+///
+/// **Truncation contract.** When the contributor count at a column
+/// exceeds the cap, the walker keeps the first `cap` contributors
+/// in **admission order** (= the order `cram_input` delivered them,
+/// which under normal pipeline operation is coordinate-then-arrival
+/// order across the merged CRAMs) and drops the rest. This is *not*
+/// a uniform random sample. It is approximately unbiased under the
+/// typical assumption that reads at a given coordinate are not
+/// allele-correlated — random-fragment shotgun shouldn't cluster
+/// alleles by arrival order. Pipelines that batch coverage by
+/// source (lane-stratified, region-restricted CRAMs concatenated
+/// rather than merged) can show batch-direction bias at over-cap
+/// columns; the fix in that case is upstream interleaving, not a
+/// random sampler here — the cap exists as a defensive truncation,
+/// not a statistical sampler. Pinned by
+/// `column_depth_cap_keeps_first_n_of_admission_order`. Mi5 in
+/// `ia/reviews/pileup_2026-05-09.md`.
 ///
 /// With the current `MAX_ACTIVE_SLOTS = 4096`, only the indel cap
 /// can fire (column depth is already bounded below the SNP cap).

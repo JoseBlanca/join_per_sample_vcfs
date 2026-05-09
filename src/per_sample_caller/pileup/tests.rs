@@ -826,6 +826,69 @@ fn column_depth_cap_truncates_snp_only_column_when_over_cap() {
 }
 
 #[test]
+fn column_depth_cap_keeps_first_n_of_admission_order() {
+    // The cap is a defensive truncation, not a uniform sampler.
+    // Pin the contract so an operator can reason about what
+    // survives: the first `cap` contributors in admission order
+    // (= upstream coordinate-then-arrival order from `cram_input`)
+    // fold into the record; the rest are dropped. Mi5 in
+    // `ia/reviews/pileup_2026-05-09.md`.
+    //
+    // Five SNP reads at pos 1, each with a distinct read base so
+    // we can identify which contributors survived. Cap = 2 → only
+    // r0 (C) and r1 (G) fold; r2 (T), r3 (A=REF), and r4 (C) are
+    // dropped.
+    let fa = MockFasta::new("A");
+    let r0 = snp_read("r0", 1, b"C", &[30]);
+    let r1 = snp_read("r1", 1, b"G", &[30]);
+    let r2 = snp_read("r2", 1, b"T", &[30]);
+    let r3 = snp_read("r3", 1, b"A", &[30]); // matches REF
+    let r4 = snp_read("r4", 1, b"C", &[30]);
+    let cfg = WalkerConfig {
+        max_snp_column_depth: 2,
+        max_indel_column_depth: 99,
+    };
+    let (records, summary) =
+        drive_walker_with_config(vec![r0, r1, r2, r3, r4], fa, &cfg);
+
+    assert_eq!(records.len(), 1, "single column emitted");
+    assert_eq!(summary.column_depth_truncations, 1);
+    let rec = &records[0];
+
+    // REF "A" survives as the alleles[0] entry but with zero
+    // observations, because r3 (the only REF-matching read) was
+    // past the cap.
+    assert_eq!(rec.alleles[0].seq, b"A", "alleles[0] is REF");
+    assert_eq!(
+        rec.alleles[0].scalars.num_obs, 0,
+        "no surviving read matched REF",
+    );
+
+    // r0's "C" and r1's "G" must be present with one observation each.
+    let c = rec
+        .alleles
+        .iter()
+        .find(|a| a.seq.as_slice() == b"C")
+        .expect("r0's allele 'C' must survive");
+    assert_eq!(c.scalars.num_obs, 1);
+    let g = rec
+        .alleles
+        .iter()
+        .find(|a| a.seq.as_slice() == b"G")
+        .expect("r1's allele 'G' must survive");
+    assert_eq!(g.scalars.num_obs, 1);
+
+    // r2's "T" must be absent — past the cap.
+    assert!(
+        rec.alleles.iter().all(|a| a.seq.as_slice() != b"T"),
+        "r2 was past the cap and must not have folded",
+    );
+
+    // Total buckets: REF + r0 + r1.
+    assert_eq!(rec.alleles.len(), 3, "REF + 2 surviving SNP buckets");
+}
+
+#[test]
 fn column_depth_cap_uses_indel_cap_when_any_indel_event_present() {
     // Four SNP-only reads + one indel-bearing read, all anchored
     // at pos 1. At column pos 1 the indel-bearing read contributes
