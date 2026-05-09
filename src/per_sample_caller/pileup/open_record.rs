@@ -574,16 +574,23 @@ pub struct ProcessOutcome {
     pub widen_count: u64,
 }
 
-/// Set the BQ field of a `ReadEvent` to zero in place. Used by
-/// the open-record fold when a contributor is flagged as the
-/// match-only mate-overlap loser — every window event pulled
-/// through its cursor gets the same BQ-zeroing the eager design
-/// applied to the cloned full-window vector.
+/// Zero a `Match` event's `bq_baq` in place; leave indel
+/// `bq_proxy` untouched. Used by the open-record fold when a
+/// contributor is flagged as the match-only mate-overlap loser:
+/// the rule (`pileup_walker.md` §"Mate overlap") zeros the
+/// Match at the overlap *position*, not all events in the
+/// loser's haplotype window. Indels in the same window sit at
+/// different anchors and carry independent evidence.
+///
+/// In today's pipeline the narrowing is invisible — the
+/// haplotype-level `min` in `ln_bq_for_read` collapses to 0 via
+/// the zeroed Match regardless. The narrow version is correct
+/// against a wider class of future reductions (median, weighted)
+/// and matches the spec wording. Mi3 in
+/// `ia/reviews/pileup_2026-05-09.md`.
 fn zero_event_bq(ev: &mut ReadEvent) {
-    match ev {
-        ReadEvent::Match { bq_baq, .. } => *bq_baq = 0,
-        ReadEvent::Insertion { bq_proxy, .. } => *bq_proxy = 0,
-        ReadEvent::Deletion { bq_proxy, .. } => *bq_proxy = 0,
+    if let ReadEvent::Match { bq_baq, .. } = ev {
+        *bq_baq = 0;
     }
 }
 
@@ -850,5 +857,64 @@ mod tests {
         assert_eq!(rec.alleles[idx2].scalars.num_obs, 1);
         // REF + ACT = 2 buckets total.
         assert_eq!(rec.alleles.len(), 2);
+    }
+
+    #[test]
+    fn zero_event_bq_zeros_match_only_preserving_indel_proxies() {
+        // Mate-overlap loser's BQ is zeroed across its haplotype
+        // window. Per `pileup_walker.md` §"Mate overlap", the rule
+        // applies to the Match event at the overlap position — the
+        // loser's *indel* events (which can sit at other positions
+        // in the window) carry independent evidence and must keep
+        // their `bq_proxy`. Today the haplotype-level `min`
+        // collapses to 0 via the zeroed Match regardless, so this is
+        // invisible at output level. Pin the helper's contract here
+        // so a future change to `ln_bq_for_read`'s reduction (e.g.
+        // median or weighted) cannot silently corrupt indel BQ
+        // proxies. Mi3 in `ia/reviews/pileup_2026-05-09.md`.
+        let mut m = ReadEvent::Match {
+            ref_pos: 100,
+            base: b'A',
+            bq_baq: 25,
+        };
+        zero_event_bq(&mut m);
+        match m {
+            ReadEvent::Match { bq_baq, .. } => {
+                assert_eq!(bq_baq, 0, "Match BQ must be zeroed on the overlap loser");
+            }
+            _ => panic!("Match shape must survive zeroing"),
+        }
+
+        let mut ins = ReadEvent::Insertion {
+            anchor_ref_pos: 130,
+            seq: vec![b'A', b'C'],
+            bq_proxy: 25,
+        };
+        zero_event_bq(&mut ins);
+        match ins {
+            ReadEvent::Insertion { bq_proxy, .. } => {
+                assert_eq!(
+                    bq_proxy, 25,
+                    "Insertion bq_proxy must survive — the indel sits at a different anchor than the overlap",
+                );
+            }
+            _ => panic!("Insertion shape must survive zeroing"),
+        }
+
+        let mut del = ReadEvent::Deletion {
+            anchor_ref_pos: 130,
+            deleted_len: 3,
+            bq_proxy: 25,
+        };
+        zero_event_bq(&mut del);
+        match del {
+            ReadEvent::Deletion { bq_proxy, .. } => {
+                assert_eq!(
+                    bq_proxy, 25,
+                    "Deletion bq_proxy must survive — the indel sits at a different anchor than the overlap",
+                );
+            }
+            _ => panic!("Deletion shape must survive zeroing"),
+        }
     }
 }
