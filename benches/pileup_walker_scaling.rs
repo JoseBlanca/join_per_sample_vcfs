@@ -72,6 +72,7 @@ fn build_reads(read_len: u32, span: u32, coverage: u32) -> Vec<PreparedRead> {
             qname: Arc::from(format!("r{i}").as_str()),
             is_first_mate: true,
             has_mate: false,
+            adaptor_boundary: None,
         });
     }
     // Walker requires non-decreasing alignment_start.
@@ -173,6 +174,7 @@ fn build_multi_op_reads(read_len: u32, span: u32, coverage: u32) -> Vec<Prepared
             qname: Arc::from(format!("r{i}").as_str()),
             is_first_mate: true,
             has_mate: false,
+            adaptor_boundary: None,
         });
     }
     reads.sort_by_key(|r| r.alignment_start);
@@ -195,8 +197,8 @@ fn run_walker(reads: Vec<PreparedRead>, fasta: &ConstFasta) -> u64 {
 
 fn bench_walker_read_length(c: &mut Criterion) {
     let mut group = c.benchmark_group("pileup_walker_read_length");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(10));
 
     // Hold (span, coverage) constant so total work is dominated by
     // per-active-read clone cost, not by the size of the input
@@ -239,8 +241,8 @@ fn bench_walker_read_length(c: &mut Criterion) {
 /// distinguish these because its loops run exactly once per query.
 fn bench_walker_multi_op(c: &mut Criterion) {
     let mut group = c.benchmark_group("pileup_walker_multi_op");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(10));
 
     let span: u32 = 50_000;
     let coverage: u32 = 30;
