@@ -67,10 +67,10 @@ impl ActiveSet {
         self.reads.iter()
     }
 
-    /// Look up a read by `read_id` via the secondary index.
-    /// Used by the active-set tests and by the mate-overlap fold
-    /// path (the walker calls this on the partner mate's id).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Look up a read by `read_id` via the secondary index. Used
+    /// by `open_record::process_position` to query each
+    /// contributor's `CigarCursor` for window events at the open
+    /// record's footprint, and by the active-set tests.
     pub fn get_by_read_id(&self, read_id: u32) -> Option<&ActiveRead> {
         let idx = *self.by_read_id.get(&read_id)?;
         Some(&self.reads[idx])
