@@ -179,7 +179,15 @@ impl OpenPileupRecordTable {
     /// here is non-empty interval intersection — touching
     /// intervals are not overlapping. Returns the anchor position
     /// of the matched record.
+    ///
+    /// Precondition: `event_start < event_end`. Empty events
+    /// (`event_start == event_end`) are not produced by any caller —
+    /// every `ReadEvent::footprint_span()` returns ≥ 1.
     pub fn find_overlapping(&self, event_start: u32, event_end: u32) -> Option<u32> {
+        debug_assert!(
+            event_start < event_end,
+            "find_overlapping called with empty event [{event_start}, {event_end})",
+        );
         // Candidates are records whose anchor `Q ≤ event_start`
         // (any record opened to the right of the event's start
         // would have its footprint start ≥ event_end > event_start
@@ -193,9 +201,14 @@ impl OpenPileupRecordTable {
         // first record whose footprint ends at or before
         // `event_start` would miss a wide earlier record sitting
         // behind a narrow intermediate one.
+        //
+        // The range bound `lo..=event_start` already guarantees
+        // `q ≤ event_start`, and the precondition gives
+        // `event_start < event_end`, so `q < event_end` is
+        // implied. Mi8 in `ia/reviews/pileup_2026-05-09.md`.
         let lo = event_start.saturating_sub(MAX_RECORD_SPAN);
         for (&q, rec) in self.records.range(lo..=event_start).rev() {
-            if rec.footprint_end_exclusive() > event_start && q < event_end {
+            if rec.footprint_end_exclusive() > event_start {
                 return Some(q);
             }
         }
