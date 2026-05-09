@@ -360,7 +360,7 @@ impl WalkerState {
         let (new, expired) = self.slots.drain_lifecycle_marks();
         // Append: there may be reads in the active set that need
         // their slots released as part of the flush.
-        self.active.flush_all(&mut self.slots)?;
+        self.active.flush_all(&mut self.slots, self.walker_pos)?;
         let (new2, expired2) = self.slots.drain_lifecycle_marks();
         let mut new_all = new;
         new_all.extend(new2);

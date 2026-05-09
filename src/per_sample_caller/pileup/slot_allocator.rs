@@ -201,14 +201,25 @@ impl SlotAllocator {
     /// `drain_lifecycle_marks` call, guaranteeing that any
     /// `expired[S]` mark surfaces before any subsequent
     /// `new[S]` for the same id.
-    pub fn release_slot(&mut self, slot: SlotId) -> Result<(), WalkerError> {
+    ///
+    /// `chrom_id` and `pos` describe the walker's current locus and
+    /// are only consulted on the error path: they populate
+    /// `WalkerError::Internal`'s context fields so an operator can
+    /// identify *where* an internal-invariant violation occurred.
+    /// On the happy path they are unused.
+    pub fn release_slot(
+        &mut self,
+        slot: SlotId,
+        chrom_id: u32,
+        pos: u32,
+    ) -> Result<(), WalkerError> {
         let idx = slot as usize;
         if idx >= self.slot_refcount.len() || self.slot_refcount[idx] == 0 {
             return Err(WalkerError::Internal {
                 detail: format!("release_slot on non-active slot {slot}"),
                 qname: String::new(),
-                chrom_id: 0,
-                pos: 0,
+                chrom_id,
+                pos,
             });
         }
         self.slot_refcount[idx] -= 1;
@@ -240,13 +251,18 @@ impl SlotAllocator {
     /// treat the give-up the same as a windowed eviction.
     ///
     /// Regression for finding M1 in `ia/reviews/pileup_2026-05-09.md`.
+    ///
+    /// `chrom_id` and `pos` are forwarded to `release_slot`'s error
+    /// path, just like for the direct release.
     pub fn release_pending_partner_ref_if_present(
         &mut self,
         qname: &Arc<str>,
+        chrom_id: u32,
+        pos: u32,
     ) -> Result<(), WalkerError> {
         if let Some(entry) = self.pending_mates.remove(qname) {
             self.counters.mate_lookup_evictions += 1;
-            self.release_slot(entry.chain_slot_id)?;
+            self.release_slot(entry.chain_slot_id, chrom_id, pos)?;
         }
         Ok(())
     }
@@ -423,12 +439,12 @@ mod tests {
         let m2 = make_read("p", true, 200);
         a.allocate_for_read(&m2).unwrap();
 
-        a.release_slot(slot).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
         assert!(expired.is_empty(), "slot still held by other mate");
 
-        a.release_slot(slot).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
         assert!(new.is_empty());
         assert_eq!(expired, vec![slot]);
@@ -446,7 +462,7 @@ mod tests {
         let (new, expired) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
         assert!(expired.is_empty());
-        a.release_slot(slot).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
         assert!(new.is_empty());
         assert_eq!(expired, vec![slot]);
@@ -468,7 +484,7 @@ mod tests {
         let mut a = SlotAllocator::new();
         let r = make_read("transient", false, 100);
         let (slot, _) = a.allocate_for_read(&r).unwrap();
-        a.release_slot(slot).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
         assert_eq!(expired, vec![slot]);
@@ -491,7 +507,7 @@ mod tests {
         let mut a = SlotAllocator::new();
         let r1 = make_read("r1", false, 100);
         let (s1, _) = a.allocate_for_read(&r1).unwrap();
-        a.release_slot(s1).unwrap();
+        a.release_slot(s1, 0, 100).unwrap();
         let r2 = make_read("r2", false, 100);
         let (s2, _) = a.allocate_for_read(&r2).unwrap();
         assert_ne!(
@@ -501,7 +517,7 @@ mod tests {
 
         // After a drain, the freed slot becomes available again.
         let _ = a.drain_lifecycle_marks();
-        a.release_slot(s2).unwrap();
+        a.release_slot(s2, 0, 100).unwrap();
         let _ = a.drain_lifecycle_marks();
         let r3 = make_read("r3", false, 100);
         let (s3, _) = a.allocate_for_read(&r3).unwrap();
@@ -521,7 +537,7 @@ mod tests {
         let (s1, _) = a.allocate_for_read(&r1).unwrap();
         let (s2, _) = a.allocate_for_read(&r2).unwrap();
         assert_eq!((s0, s1, s2), (0, 1, 2));
-        a.release_slot(s1).unwrap();
+        a.release_slot(s1, 0, 100).unwrap();
         let _ = a.drain_lifecycle_marks();
         // releasing slot 1 puts it in the free pool; the next
         // allocation should reuse it (smallest free id).
@@ -626,6 +642,40 @@ mod tests {
     }
 
     #[test]
+    fn release_slot_error_carries_walker_context() {
+        // When release_slot is called on a non-active slot — an
+        // internal-invariant violation — the resulting Internal error
+        // must carry the walker's current (chrom_id, pos) so an
+        // operator can identify *where* the bad call happened. The
+        // previous `chrom_id=0 pos=0` placeholders pointed at no real
+        // input, defeating the design-principle commitment that
+        // errors carry enough context to identify the offending input
+        // from the message alone. Mi2 in
+        // `ia/reviews/pileup_2026-05-09.md`.
+        let mut a = SlotAllocator::new();
+        // Slot 5 was never allocated; refcount is 0.
+        let err = a
+            .release_slot(5, /* chrom_id */ 7, /* pos */ 12345)
+            .expect_err("release_slot on non-active slot must error");
+        match err {
+            WalkerError::Internal {
+                detail,
+                chrom_id,
+                pos,
+                ..
+            } => {
+                assert_eq!(chrom_id, 7, "chrom_id must reflect caller context");
+                assert_eq!(pos, 12345, "pos must reflect caller context");
+                assert!(
+                    detail.contains("slot 5"),
+                    "detail must name the offending slot id; got: {detail}",
+                );
+            }
+            other => panic!("expected WalkerError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn release_pending_partner_paired_with_release_slot_emits_expired_for_orphan() {
         // The exact call sequence the active set's `expire_passed`
         // makes for a paired read exit: partner-ref release first,
@@ -638,8 +688,8 @@ mod tests {
         let (new, _) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
 
-        a.release_pending_partner_ref_if_present(&m1.qname).unwrap();
-        a.release_slot(slot).unwrap();
+        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
 
         let (_, expired) = a.drain_lifecycle_marks();
         assert_eq!(
@@ -663,8 +713,8 @@ mod tests {
         let solo = make_read("solo", false, 100);
         let (slot, _) = a.allocate_for_read(&solo).unwrap();
 
-        a.release_pending_partner_ref_if_present(&solo.qname).unwrap();
-        a.release_slot(slot).unwrap();
+        a.release_pending_partner_ref_if_present(&solo.qname, 0, 100).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
 
         let (_, expired) = a.drain_lifecycle_marks();
         assert_eq!(expired, vec![slot]);
@@ -692,14 +742,14 @@ mod tests {
         );
 
         // First-to-exit: partner-release is a no-op; release_slot 2→1.
-        a.release_pending_partner_ref_if_present(&m1.qname).unwrap();
-        a.release_slot(slot).unwrap();
+        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
         let (_, expired_mid) = a.drain_lifecycle_marks();
         assert!(expired_mid.is_empty());
 
         // Second-to-exit: same shape; release_slot 1→0, expired fires.
-        a.release_pending_partner_ref_if_present(&m2.qname).unwrap();
-        a.release_slot(slot).unwrap();
+        a.release_pending_partner_ref_if_present(&m2.qname, 0, 100).unwrap();
+        a.release_slot(slot, 0, 100).unwrap();
         let (_, expired_final) = a.drain_lifecycle_marks();
         assert_eq!(expired_final, vec![slot]);
         assert_eq!(

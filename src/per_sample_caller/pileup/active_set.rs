@@ -159,8 +159,9 @@ impl ActiveSet {
                 // `ia/reviews/pileup_2026-05-09.md`.
                 let slot = self.reads[i].chain_slot_id;
                 let qname = self.reads[i].read.qname.clone();
-                slots.release_pending_partner_ref_if_present(&qname)?;
-                slots.release_slot(slot)?;
+                let chrom_id = self.reads[i].read.chrom_id;
+                slots.release_pending_partner_ref_if_present(&qname, chrom_id, walker_pos)?;
+                slots.release_slot(slot, chrom_id, walker_pos)?;
                 self.swap_remove(i);
             }
         }
@@ -168,16 +169,28 @@ impl ActiveSet {
     }
 
     /// Drop every read unconditionally — used at chromosome
-    /// boundaries and end-of-input. Releases each slot.
-    pub fn flush_all(&mut self, slots: &mut SlotAllocator) -> Result<(), WalkerError> {
+    /// boundaries and end-of-input. Releases each slot. `walker_pos`
+    /// is the walker's current locus, used only to populate
+    /// `WalkerError::Internal`'s context fields if a release ever
+    /// hits the panic-free path (Mi2).
+    pub fn flush_all(
+        &mut self,
+        slots: &mut SlotAllocator,
+        walker_pos: u32,
+    ) -> Result<(), WalkerError> {
         while let Some(active) = self.reads.pop() {
             // The secondary index is rebuilt fresh after a flush.
             // Same partner-release order as `expire_passed` — handles
             // the orphan-first-mate case at mid-stream chromosome
             // flush, where the orphan is still in the active set when
             // the chromosome changes (M1).
-            slots.release_pending_partner_ref_if_present(&active.read.qname)?;
-            slots.release_slot(active.chain_slot_id)?;
+            let chrom_id = active.read.chrom_id;
+            slots.release_pending_partner_ref_if_present(
+                &active.read.qname,
+                chrom_id,
+                walker_pos,
+            )?;
+            slots.release_slot(active.chain_slot_id, chrom_id, walker_pos)?;
         }
         self.by_read_id.clear();
         Ok(())
@@ -325,7 +338,7 @@ mod tests {
         assert_eq!(new1.len(), 5);
 
         assert_eq!(s.len(), 5);
-        s.flush_all(&mut a).unwrap();
+        s.flush_all(&mut a, 200).unwrap();
         assert!(s.is_empty());
 
         let (_new, expired) = a.drain_lifecycle_marks();
