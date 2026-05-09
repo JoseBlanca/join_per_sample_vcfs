@@ -219,6 +219,38 @@ impl SlotAllocator {
         Ok(())
     }
 
+    /// If `qname` still has a `pending_mates` entry — meaning this
+    /// read was admitted as a first mate and its partner never
+    /// arrived — release the partner-pre-bumped refcount on the
+    /// slot. Called by the active set when a paired read exits, so
+    /// the orphan's slot reaches refcount 0 in the same step as the
+    /// read's own `release_slot` call (rather than getting stuck at
+    /// refcount 1 and never emitting `expired_marks[S]`).
+    ///
+    /// The call is paired with — and ordered before — the read's own
+    /// `release_slot`, so an orphan's two refs collapse to zero
+    /// inside a single `expire_passed` step. The expired mark
+    /// therefore fires while records are still being drained at this
+    /// walker_pos and gets stamped onto the next aged record, just
+    /// like a normal slot expiry.
+    ///
+    /// No-op when `qname` is solo (never registered) or partnered
+    /// (the second-mate path consumed the entry on partner arrival).
+    /// Counted as a `mate_lookup_eviction` so summary diagnostics
+    /// treat the give-up the same as a windowed eviction.
+    ///
+    /// Regression for finding M1 in `ia/reviews/pileup_2026-05-09.md`.
+    pub fn release_pending_partner_ref_if_present(
+        &mut self,
+        qname: &Arc<str>,
+    ) -> Result<(), WalkerError> {
+        if let Some(entry) = self.pending_mates.remove(qname) {
+            self.counters.mate_lookup_evictions += 1;
+            self.release_slot(entry.chain_slot_id)?;
+        }
+        Ok(())
+    }
+
     /// Drain the pending lifecycle markers into a `(new, expired)`
     /// pair. Both lists are sorted-deduplicated; slots present in
     /// *both* lists at the same drain are emitted in *both* (they
@@ -590,6 +622,90 @@ mod tests {
         assert!(
             a.high_water_warned,
             "reset must preserve the one-shot warning flag across chromosomes"
+        );
+    }
+
+    #[test]
+    fn release_pending_partner_paired_with_release_slot_emits_expired_for_orphan() {
+        // The exact call sequence the active set's `expire_passed`
+        // makes for a paired read exit: partner-ref release first,
+        // then the read's own slot release. For an orphan, refcount
+        // collapses 2 → 1 → 0 in this single sequence and the
+        // expired mark fires on the second call.
+        let mut a = SlotAllocator::new();
+        let m1 = make_read("orphan", true, 100);
+        let (slot, _) = a.allocate_for_read(&m1).unwrap();
+        let (new, _) = a.drain_lifecycle_marks();
+        assert_eq!(new, vec![slot]);
+
+        a.release_pending_partner_ref_if_present(&m1.qname).unwrap();
+        a.release_slot(slot).unwrap();
+
+        let (_, expired) = a.drain_lifecycle_marks();
+        assert_eq!(
+            expired,
+            vec![slot],
+            "orphan: 2→1 from partner release, 1→0 from own release, expired emitted",
+        );
+        assert_eq!(
+            a.counters().mate_lookup_evictions,
+            1,
+            "the abandoned partner counts as one eviction",
+        );
+    }
+
+    #[test]
+    fn release_pending_partner_is_noop_for_solo_read() {
+        // Solo reads never enter pending_mates, so the partner-release
+        // step is a no-op and the read's own release alone emits
+        // expired (refcount 1 → 0).
+        let mut a = SlotAllocator::new();
+        let solo = make_read("solo", false, 100);
+        let (slot, _) = a.allocate_for_read(&solo).unwrap();
+
+        a.release_pending_partner_ref_if_present(&solo.qname).unwrap();
+        a.release_slot(slot).unwrap();
+
+        let (_, expired) = a.drain_lifecycle_marks();
+        assert_eq!(expired, vec![slot]);
+        assert_eq!(
+            a.counters().mate_lookup_evictions,
+            0,
+            "solo path must not be counted as an eviction",
+        );
+    }
+
+    #[test]
+    fn release_pending_partner_is_noop_for_partnered_pair() {
+        // Once the second mate arrives, pending_mates is consumed.
+        // Either mate's exit calls release_pending_partner_ref_if_present
+        // and finds nothing to do — both mates' release_slot calls then
+        // collapse the slot 2 → 1 → 0 normally.
+        let mut a = SlotAllocator::new();
+        let m1 = make_read("p", true, 100);
+        let m2 = make_read("p", true, 200);
+        let (slot, _) = a.allocate_for_read(&m1).unwrap();
+        let _ = a.allocate_for_read(&m2).unwrap();
+        assert!(
+            a.pending_mates.is_empty(),
+            "second-mate path consumed the pending entry",
+        );
+
+        // First-to-exit: partner-release is a no-op; release_slot 2→1.
+        a.release_pending_partner_ref_if_present(&m1.qname).unwrap();
+        a.release_slot(slot).unwrap();
+        let (_, expired_mid) = a.drain_lifecycle_marks();
+        assert!(expired_mid.is_empty());
+
+        // Second-to-exit: same shape; release_slot 1→0, expired fires.
+        a.release_pending_partner_ref_if_present(&m2.qname).unwrap();
+        a.release_slot(slot).unwrap();
+        let (_, expired_final) = a.drain_lifecycle_marks();
+        assert_eq!(expired_final, vec![slot]);
+        assert_eq!(
+            a.counters().mate_lookup_evictions,
+            0,
+            "partnered pair must not be counted as an eviction",
         );
     }
 }

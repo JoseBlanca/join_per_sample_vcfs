@@ -710,6 +710,31 @@ fn lifecycle_markers_appear_on_emitted_records() {
 }
 
 #[test]
+fn orphan_first_mate_emits_balanced_lifecycle_marks() {
+    // A paired read whose mate never arrives (the second mate is filtered out
+    // upstream, lost, or simply absent for this molecule). The first mate is
+    // admitted with `has_mate=true`, so the slot allocator pre-bumps its
+    // refcount to 2 anticipating the partner. When the chromosome flushes,
+    // the partner ref must be released too — otherwise the orphan's slot
+    // surfaces in `new_chains` but never in `expired_chains`, leaving the
+    // downstream consumer with a dangling chain id.
+    //
+    // Regression for finding M1 in `ia/reviews/pileup_2026-05-09.md`.
+    let fa = MockFasta::new("ACG");
+    let mut r = snp_read("orphan", 1, b"ACG", &[30; 3]);
+    r.has_mate = true;
+    r.is_first_mate = true;
+    let records = drive_walker(vec![r], fa);
+    let total_new: usize = records.iter().map(|r| r.new_chains.len()).sum();
+    let total_expired: usize = records.iter().map(|r| r.expired_chains.len()).sum();
+    assert_eq!(total_new, 1, "orphan first mate produces one chain start");
+    assert_eq!(
+        total_expired, 1,
+        "orphan first mate must produce a matching chain end at chromosome flush",
+    );
+}
+
+#[test]
 fn column_depth_cap_truncates_snp_only_column_when_over_cap() {
     // Five SNP-only reads anchored at pos 1, each spanning 5
     // bases. Every column has 5 contributors and only Match

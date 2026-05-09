@@ -147,7 +147,19 @@ impl ActiveSet {
                 // stateless, so there's nothing to mark consumed.
                 // Single-fold-per-(record, read) is enforced by
                 // `OpenPileupRecord.folded_reads` instead.
+                //
+                // Order matters: give up the still-pending partner ref
+                // (if any) **before** releasing the read's own slot. An
+                // orphan first mate's slot has refcount 2; the two
+                // calls together collapse it 2→1→0 in this single
+                // step, so the expired mark fires now and lands on the
+                // next aged record. Without the partner-release the
+                // orphan's slot stays stuck at refcount 1 and never
+                // emits `expired_chains[S]`. See finding M1 in
+                // `ia/reviews/pileup_2026-05-09.md`.
                 let slot = self.reads[i].chain_slot_id;
+                let qname = self.reads[i].read.qname.clone();
+                slots.release_pending_partner_ref_if_present(&qname)?;
                 slots.release_slot(slot)?;
                 self.swap_remove(i);
             }
@@ -160,6 +172,11 @@ impl ActiveSet {
     pub fn flush_all(&mut self, slots: &mut SlotAllocator) -> Result<(), WalkerError> {
         while let Some(active) = self.reads.pop() {
             // The secondary index is rebuilt fresh after a flush.
+            // Same partner-release order as `expire_passed` — handles
+            // the orphan-first-mate case at mid-stream chromosome
+            // flush, where the orphan is still in the active set when
+            // the chromosome changes (M1).
+            slots.release_pending_partner_ref_if_present(&active.read.qname)?;
             slots.release_slot(active.chain_slot_id)?;
         }
         self.by_read_id.clear();
