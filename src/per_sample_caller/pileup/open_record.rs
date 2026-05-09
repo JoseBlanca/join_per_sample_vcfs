@@ -38,15 +38,16 @@ impl OpenAllele {
     }
 }
 
-/// One in-flight per-position record. Its REF span is `ref_seq.len()`;
-/// no separate `ref_span` field is stored. `alleles[0]` is always
-/// REF (`seq == ref_seq`).
+/// One in-flight per-position record. Its REF span is
+/// `alleles[0].seq.len()`; no separate `ref_span` field is stored.
+/// `alleles[0]` is always REF — its `seq` field is the canonical
+/// reference sequence under the record's footprint and is the only
+/// place those bytes are stored.
 #[derive(Debug, Clone)]
 pub struct OpenPileupRecord {
     pub chrom_id: u32,
     /// 1-based anchor position.
     pub pos: u32,
-    pub ref_seq: Vec<u8>,
     pub alleles: Vec<OpenAllele>,
     /// Per-read fold state — the contribution this record currently
     /// holds for each read that has folded into it. Used to enforce
@@ -75,20 +76,19 @@ impl OpenPileupRecord {
     /// Open a fresh record at `pos` with the given initial REF
     /// sequence. The REF allele bucket is created up front (with
     /// zero observations) so the `alleles[0] == REF` invariant
-    /// holds from the very start.
+    /// holds from the very start. The REF bytes are moved into the
+    /// REF bucket — there is no separate copy on the record.
     fn new(chrom_id: u32, pos: u32, ref_seq: Vec<u8>) -> Self {
-        let ref_allele = OpenAllele::new(ref_seq.clone());
         Self {
             chrom_id,
             pos,
-            ref_seq,
-            alleles: vec![ref_allele],
+            alleles: vec![OpenAllele::new(ref_seq)],
             folded_reads: AHashMap::new(),
         }
     }
 
     pub fn ref_span(&self) -> u32 {
-        self.ref_seq.len() as u32
+        self.alleles[0].seq.len() as u32
     }
 
     /// Footprint end (exclusive), in 1-based coordinates: the
@@ -265,10 +265,10 @@ impl OpenPileupRecordTable {
                 start_plus_len: new_end_exclusive,
                 source,
             })?;
-        rec.ref_seq.extend_from_slice(&extra_bases);
 
         // Rewrite each existing allele by appending the new REF
-        // bases to its `seq`.
+        // bases to its `seq`. `alleles[0]` is REF, so this loop is
+        // also where the canonical REF sequence widens.
         //
         // **Invariant preserved by `apply_events_to_ref`:** every
         // allele's `seq` ends with a ref-aligned suffix — concretely,
@@ -548,20 +548,21 @@ pub fn process_position(
         // removes records.
         let rec = open.records.get_mut(&key).expect("affected key must exist");
         let rec_pos = rec.pos;
-        // Destructure through `&mut` so `ref_seq`, `alleles`, and
-        // `folded_reads` are each independent mutable borrows of
-        // disjoint fields. This lets us pass `ref_seq` to
-        // `apply_events_to_ref` while simultaneously mutating
-        // `alleles` and `folded_reads` — without cloning `ref_seq`
-        // per affected record. Mi6 in
-        // `ia/reviews/pileup_2026-05-09.md`.
+        // Destructure through `&mut` so `alleles` and `folded_reads`
+        // are independent mutable borrows of disjoint fields. The
+        // REF sequence is read from `alleles[0].seq` — that borrow
+        // ends inside each `apply_events_to_ref` call (which returns
+        // an owned `Vec<u8>`), leaving the rest of the inner loop
+        // free to mutate `alleles[other_idx]`. This is the same
+        // disjoint-borrow shape Mi6 (`pileup_2026-05-09.md`)
+        // introduced, with `ref_seq` collapsed onto `alleles[0]` —
+        // the bytes are no longer duplicated on the record.
         let OpenPileupRecord {
-            ref_seq,
             alleles,
             folded_reads,
             ..
         } = rec;
-        let rec_end = rec_pos + ref_seq.len() as u32;
+        let rec_end = rec_pos + alleles[0].seq.len() as u32;
 
         for contrib in contributors {
             // PANIC-FREE: every `ReadContribution` is built from
@@ -605,7 +606,7 @@ pub fn process_position(
                 continue;
             }
 
-            let allele_seq = apply_events_to_ref(rec_pos, ref_seq, &window_events);
+            let allele_seq = apply_events_to_ref(rec_pos, &alleles[0].seq, &window_events);
             let bq = ln_bq_for_read(&window_events, contrib.bq_baq_at_walker_pos);
             let ln_q = bq.max(contrib.mq_log_err);
             let new_contribution = FiveScalars {
@@ -817,7 +818,6 @@ mod tests {
         let f = fa("ACGTAC");
         let rec = t.open_new(0, 1, 1, &f).unwrap();
         assert_eq!(rec.pos, 1);
-        assert_eq!(rec.ref_seq, b"A");
         assert_eq!(rec.alleles.len(), 1);
         assert_eq!(rec.alleles[0].seq, b"A");
         assert_eq!(rec.alleles[0].scalars.num_obs, 0);
@@ -832,7 +832,6 @@ mod tests {
         // Now widen to span 3 ("ACG").
         t.widen(1, 4, &f).unwrap();
         let rec = t.records.get(&1).unwrap();
-        assert_eq!(rec.ref_seq, b"ACG");
         assert_eq!(rec.alleles[0].seq, b"ACG");
     }
 
