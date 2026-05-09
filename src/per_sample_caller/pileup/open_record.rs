@@ -329,25 +329,49 @@ impl OpenPileupRecordTable {
 
 /// Apply a list of events from one read to the open record's REF
 /// sequence to compute the haplotype string this read presents
-/// under that record. Events are assumed to be inside the record's
-/// footprint and sorted by anchor.
+/// under that record.
+///
+/// **Preconditions on `events`** (every caller in this module
+/// satisfies them; new callers must too):
+/// 1. Every event's anchor lies inside the record's footprint
+///    (`event.anchor_pos() >= record_pos`).
+/// 2. Events are sorted by anchor position, non-decreasing.
+/// 3. At a tied anchor, events appear in the order
+///    `Match → Insertion → Deletion`. The Match must come first
+///    so its read base is emitted at the anchor offset before the
+///    Insertion/Deletion's `consumed_until` guard suppresses the
+///    REF base. The cursor's CIGAR walk satisfies this by
+///    construction (the M op preceding an I/D op emits its last
+///    Match before the I/D's anchored event).
+///
+/// Mi9 in `ia/reviews/pileup_2026-05-09.md`: the previous
+/// implementation collected and stable-sorted by anchor on every
+/// call, which masked tied-anchor ordering as a "we sort it for
+/// you" guarantee but didn't actually canonicalise the kind
+/// order. The cursor was already producing the right shape, so
+/// the sort was wasted work and the contract was unclear. The
+/// preconditions above are now explicit and asserted in debug.
 pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]) -> Vec<u8> {
     // Walk the ref_seq in offset order, applying events as we
     // pass their anchor positions. Each event is positioned by an
     // offset = (event.anchor_pos - record_pos).
     let mut out: Vec<u8> = Vec::with_capacity(ref_seq.len() + 8);
 
-    // Sort events by anchor for safety (caller should have, but we
-    // re-sort since the cost is tiny and the contract is clearer).
-    let mut sorted: Vec<&ReadEvent> = events.iter().collect();
-    sorted.sort_by_key(|e| e.anchor_pos());
+    debug_assert!(
+        events.windows(2).all(|w| {
+            let a = (w[0].anchor_pos(), event_kind_rank(&w[0]));
+            let b = (w[1].anchor_pos(), event_kind_rank(&w[1]));
+            a <= b
+        }),
+        "apply_events_to_ref: events must be sorted by (anchor, Match<Insertion<Deletion); got {events:?}",
+    );
 
     // Skip indices already consumed by an event so we don't
     // double-emit reference bases that an event has overridden.
     let mut consumed_until: u32 = 0; // ref offset (exclusive) consumed by the last event
     let mut ref_cursor: u32 = 0;
 
-    for ev in sorted {
+    for ev in events {
         debug_assert!(
             ev.anchor_pos() >= record_pos,
             "apply_events_to_ref: event anchor {} below record_pos {}",
@@ -407,6 +431,19 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
     }
 
     out
+}
+
+/// Order rank for the tied-anchor precondition on
+/// `apply_events_to_ref`: at the same anchor, Match must come
+/// before Insertion which must come before Deletion. The cursor's
+/// CIGAR walk produces this order naturally; the rank is just a
+/// total order for the debug-assert.
+fn event_kind_rank(ev: &ReadEvent) -> u8 {
+    match ev {
+        ReadEvent::Match { .. } => 0,
+        ReadEvent::Insertion { .. } => 1,
+        ReadEvent::Deletion { .. } => 2,
+    }
 }
 
 /// Find or create the allele bucket inside a record matching `seq`.
@@ -858,6 +895,33 @@ mod tests {
         let out = apply_events_to_ref(100, ref_seq, std::slice::from_ref(&del));
         // Anchor at 100 ("A"), then 2 bases deleted, then "TA".
         assert_eq!(out, b"ATA");
+    }
+
+    #[test]
+    fn apply_events_match_before_insertion_at_same_anchor_emits_read_base_then_inserted() {
+        // Tied-anchor case: Match and Insertion both anchored at
+        // record_pos. The Match must come first (per the function's
+        // precondition) so its read base is emitted; the Insertion
+        // then appends its inserted run, with `consumed_until`
+        // suppressing the would-be REF anchor push. The cursor's
+        // CIGAR walk satisfies this order by construction (M op
+        // before I op at the same anchor). Mi9 in
+        // `ia/reviews/pileup_2026-05-09.md`.
+        let ref_seq = b"ACGTA";
+        let m = ReadEvent::Match {
+            ref_pos: 100,
+            base: b'X',
+            bq_baq: 30,
+        };
+        let i = ReadEvent::Insertion {
+            anchor_ref_pos: 100,
+            seq: b"YY".to_vec(),
+            bq_proxy: 30,
+        };
+        let out = apply_events_to_ref(100, ref_seq, &[m, i]);
+        // Anchor: read base 'X' (not REF 'A'), then inserted "YY",
+        // then the rest of the REF tail.
+        assert_eq!(out, b"XYYCGTA");
     }
 
     #[test]
