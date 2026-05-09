@@ -5,6 +5,8 @@
 
 use std::sync::mpsc::{SendError, SyncSender};
 
+use ahash::AHashMap;
+
 use super::active_set::ActiveSet;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
@@ -414,7 +416,11 @@ impl WalkerState {
 fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary: &mut RunSummary) {
     // Build a small index: chain_slot_id → list of contributor
     // indices. Anything with a list length >= 2 is a candidate.
-    let mut by_slot: std::collections::HashMap<SlotId, Vec<usize>> = Default::default();
+    // ahash::AHashMap matches the rest of the module — std HashMap's
+    // RandomState would make iteration non-deterministic between runs
+    // and is also slower for this hot path. Mi4 in
+    // `ia/reviews/pileup_2026-05-09.md`.
+    let mut by_slot: AHashMap<SlotId, Vec<usize>> = AHashMap::new();
     for (i, c) in contributors.iter().enumerate() {
         by_slot.entry(c.chain_slot_id).or_default().push(i);
     }
