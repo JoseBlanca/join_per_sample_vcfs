@@ -40,12 +40,32 @@ where
     // positions sit ahead of the walker but inside the active
     // set's coverage.
     while iter.peek().is_some() || !state.active.is_empty() {
-        // Chromosome boundary: flush everything from the current
-        // chromosome before continuing.
+        // Chromosome boundary: validate the change is forward,
+        // then flush everything from the current chromosome
+        // before continuing.
+        //
+        // The regression check has to live *before* the flush —
+        // `flush_chromosome` resets `last_admitted_locus = None`,
+        // which would mask a regression at the per-read order
+        // check inside `admit_read`. See finding M2 in
+        // `ia/reviews/pileup_2026-05-09.md`.
         if let Some(peek) = iter.peek()
-            && state.last_admitted_chrom_id.is_some()
-            && state.last_admitted_chrom_id != Some(peek.chrom_id)
+            && let Some(prev_chrom_id) = state.last_admitted_chrom_id
+            && prev_chrom_id != peek.chrom_id
         {
+            if peek.chrom_id < prev_chrom_id {
+                let prev_pos = state
+                    .last_admitted_locus
+                    .map(|(_, pos)| pos)
+                    .unwrap_or(state.walker_pos);
+                return Err(WalkerError::OutOfOrder {
+                    qname: peek.qname.to_string(),
+                    prev_chrom_id,
+                    prev_pos,
+                    chrom_id: peek.chrom_id,
+                    pos: peek.alignment_start,
+                });
+            }
             state.flush_chromosome(tx)?;
         }
         if let Some(peek) = iter.peek() {

@@ -35,6 +35,15 @@ impl MockFasta {
             chromosomes: vec![chr0.as_bytes().to_vec()],
         }
     }
+
+    /// Multi-chromosome variant: each entry is the literal bases of
+    /// chromosome `i` (`chrom_id == i`). Used by tests that exercise
+    /// chromosome-boundary behaviour.
+    pub fn with_chromosomes(chroms: &[&str]) -> Self {
+        Self {
+            chromosomes: chroms.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        }
+    }
 }
 
 impl RefBaseFetcher for MockFasta {
@@ -691,6 +700,57 @@ fn out_of_order_input_is_a_hard_error() {
     let err = result.unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("out-of-order"), "got: {msg}");
+}
+
+#[test]
+fn chromosome_id_regression_is_a_hard_error() {
+    // Spec invariant: `(chrom_id, alignment_start)` must be
+    // monotonically non-decreasing across the input stream. The
+    // within-chromosome regression case is already pinned by
+    // `out_of_order_input_is_a_hard_error`; this test pins the
+    // *cross-chromosome* case, which used to be silently accepted
+    // because `flush_chromosome` reset `last_admitted_locus = None`
+    // and the regressing read then admitted as a fresh start on
+    // the smaller chrom_id. See finding M2 in
+    // `ia/reviews/pileup_2026-05-09.md`.
+    let fa = MockFasta::with_chromosomes(&["ACGTA", "ACGTA"]);
+    let mut r1 = snp_read("a", 1, b"AC", &[30; 2]);
+    r1.chrom_id = 1;
+    let mut r2 = snp_read("b", 1, b"AC", &[30; 2]);
+    r2.chrom_id = 0;
+    let (tx, _rx) = mpsc::sync_channel::<super::PileupRecord>(64);
+    let result = run(vec![r1, r2], &fa, &tx, &WalkerConfig::default());
+    assert!(result.is_err(), "chrom_id 1 → 0 must fail as out-of-order");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("out-of-order"),
+        "error message should reference out-of-order semantics; got: {msg}",
+    );
+}
+
+#[test]
+fn forward_chromosome_change_is_accepted() {
+    // Pin the legitimate forward case so the M2 fix doesn't
+    // accidentally reject monotonic chrom_id transitions.
+    let fa = MockFasta::with_chromosomes(&["ACG", "TTT"]);
+    let mut r1 = snp_read("a", 1, b"AC", &[30; 2]);
+    r1.chrom_id = 0;
+    let mut r2 = snp_read("b", 1, b"TT", &[30; 2]);
+    r2.chrom_id = 1;
+    let records = drive_walker(vec![r1, r2], fa);
+    assert!(
+        records.iter().any(|r| r.chrom_id == 0),
+        "chrom 0 records must be emitted",
+    );
+    assert!(
+        records.iter().any(|r| r.chrom_id == 1),
+        "chrom 1 records must be emitted",
+    );
+    // And they must come in chrom order.
+    let chrom_ids: Vec<u32> = records.iter().map(|r| r.chrom_id).collect();
+    let mut sorted = chrom_ids.clone();
+    sorted.sort();
+    assert_eq!(chrom_ids, sorted, "records must emit in chrom_id order");
 }
 
 #[test]
