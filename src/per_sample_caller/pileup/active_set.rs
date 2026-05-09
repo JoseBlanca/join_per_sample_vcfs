@@ -92,7 +92,20 @@ impl ActiveSet {
         slots: &mut SlotAllocator,
     ) -> Result<u32, WalkerError> {
         let read_id = self.next_read_id;
-        self.next_read_id += 1;
+        // `checked_add` guards against the 4-billion-read case
+        // where `next_read_id` would otherwise wrap silently in
+        // release mode and collide with an active-set entry via
+        // the `by_read_id` index. Implausible at routine
+        // workloads but cheap to defend against.
+        self.next_read_id =
+            self.next_read_id
+                .checked_add(1)
+                .ok_or_else(|| WalkerError::Internal {
+                    detail: format!("active-set next_read_id overflowed u32 at {read_id}"),
+                    qname: read.qname.to_string(),
+                    chrom_id: read.chrom_id,
+                    pos: read.alignment_start,
+                })?;
 
         let qname_for_register = read.qname.clone();
         let (chain_slot_id, partner_read_id) = slots.allocate_for_read(&read)?;

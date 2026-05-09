@@ -112,9 +112,7 @@ impl SlotAllocator {
         self.free.clear();
         self.pending_free.clear();
         self.next_fresh = 0;
-        for slot in &mut self.slot_refcount {
-            *slot = 0;
-        }
+        self.slot_refcount.fill(0);
         self.pending_mates.clear();
         self.new_marks.clear();
         self.expired_marks.clear();

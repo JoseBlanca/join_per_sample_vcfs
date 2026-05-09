@@ -234,6 +234,12 @@ impl OpenPileupRecordTable {
         new_end_exclusive: u32,
         fasta: &dyn RefBaseFetcher,
     ) -> Result<bool, WalkerError> {
+        // PANIC-FREE: `widen` is only called from
+        // `process_position` immediately after `find_overlapping`
+        // returned `Some(key)` for this key, and we hold an
+        // exclusive borrow on `self.records` from that call site
+        // through here. No path between the find and this lookup
+        // removes the entry.
         let rec = self
             .records
             .get_mut(&key)
@@ -323,6 +329,8 @@ impl OpenPileupRecordTable {
             })?;
         let rec = OpenPileupRecord::new(chrom_id, pos, ref_seq);
         self.records.insert(pos, rec);
+        // PANIC-FREE: the entry was just inserted on the previous
+        // line; no concurrent mutation is possible because `&mut self`.
         Ok(self.records.get_mut(&pos).expect("just inserted"))
     }
 }
@@ -504,6 +512,9 @@ pub fn process_position(
             let event_end = event_start + ev.footprint_span();
 
             let key = if let Some(k) = open.find_overlapping(event_start, event_end) {
+                // PANIC-FREE: `find_overlapping` returned `Some(k)`
+                // on the previous line; no mutation between then
+                // and this lookup.
                 let cur_end = open
                     .records
                     .get(&k)
@@ -531,6 +542,10 @@ pub fn process_position(
     // the old bucket before adding the new one.
     affected.sort_unstable();
     for key in affected {
+        // PANIC-FREE: every key in `affected` was either inserted
+        // by `open_new` or returned by `find_overlapping` in the
+        // step-3 loop above; no path between that loop and here
+        // removes records.
         let rec = open.records.get_mut(&key).expect("affected key must exist");
         let rec_pos = rec.pos;
         // Destructure through `&mut` so `ref_seq`, `alleles`, and
@@ -549,6 +564,11 @@ pub fn process_position(
         let rec_end = rec_pos + ref_seq.len() as u32;
 
         for contrib in contributors {
+            // PANIC-FREE: every `ReadContribution` is built from
+            // an entry in the active set in `walker::process_position`
+            // (the same step that produces `contributors`), and
+            // `process_position` runs before `expire_passed_reads`,
+            // so the read_id is still in the active set here.
             let active_read = active
                 .get_by_read_id(contrib.read_id)
                 .expect("contributor's read_id must still be in the active set");

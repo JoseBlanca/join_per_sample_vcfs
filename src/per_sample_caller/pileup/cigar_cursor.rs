@@ -266,7 +266,7 @@ impl CigarCursor {
                         continue;
                     }
                     let anchor = off.ref_pos - 1;
-                    if anchor >= hi || anchor + 1 <= lo {
+                    if anchor >= hi || anchor < lo {
                         continue;
                     }
                     let read_off = off.read_pos as usize;
@@ -395,7 +395,7 @@ impl CigarCursor {
                 let anchor = off.ref_pos - 1;
                 // Insertion footprint is 1 base (the anchor),
                 // identical to Match's overlap test.
-                if anchor >= hi || anchor + 1 <= lo {
+                if anchor >= hi || anchor < lo {
                     return;
                 }
                 let read_off = off.read_pos as usize;

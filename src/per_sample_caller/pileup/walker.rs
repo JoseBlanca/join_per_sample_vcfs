@@ -217,7 +217,7 @@ impl WalkerState {
             });
         }
         self.last_admitted_locus = Some(here);
-        let _ = self.active.admit(read, &mut self.slots)?;
+        self.active.admit(read, &mut self.slots)?;
         self.summary.reads_admitted += 1;
         Ok(())
     }
@@ -337,7 +337,19 @@ impl WalkerState {
     fn advance(&mut self, next_pulled: Option<&PreparedRead>) -> Result<(), WalkerError> {
         // Default: one position forward, so any active read's REF
         // contribution gets folded at every position it sits on.
-        let mut next_pos = self.walker_pos + 1;
+        // `checked_add` guards against the (extreme) case of a
+        // chromosome longer than `u32::MAX` bp — silent wrap to 0
+        // would corrupt all subsequent record positions. Realistic
+        // mammal/plant genomes don't approach this, but a few
+        // salamander/lungfish genomes do (≥ 4 Gbp).
+        let mut next_pos = self.walker_pos.checked_add(1).ok_or_else(|| {
+            WalkerError::Internal {
+                detail: format!("walker_pos overflowed u32 at {}", self.walker_pos),
+                qname: String::new(),
+                chrom_id: self.chrom_id,
+                pos: self.walker_pos,
+            }
+        })?;
 
         // If the active set is empty and the next pulled read
         // starts past the walker, skip the uncovered span.
@@ -359,16 +371,13 @@ impl WalkerState {
         // close — there are no future reads on this chromosome).
         let remaining = self.open.drain_all();
         let mut records: Vec<PileupRecord> = remaining.into_iter().map(|r| r.finalise()).collect();
-        let (new, expired) = self.slots.drain_lifecycle_marks();
-        // Append: there may be reads in the active set that need
-        // their slots released as part of the flush.
+        // Release any active-set reads first, then drain marks
+        // once. flush_all only emits `expired_marks` (release_slot
+        // never touches `new_marks`), so we don't need to merge
+        // a pre-flush drain with a post-flush drain.
         self.active.flush_all(&mut self.slots, self.walker_pos)?;
-        let (new2, expired2) = self.slots.drain_lifecycle_marks();
-        let mut new_all = new;
-        new_all.extend(new2);
-        let mut expired_all = expired;
-        expired_all.extend(expired2);
-        stamp_lifecycle_marks(&mut records, new_all, expired_all);
+        let (new, expired) = self.slots.drain_lifecycle_marks();
+        stamp_lifecycle_marks(&mut records, new, expired);
         for record in records {
             tx.send(record)
                 .map_err(|SendError(_)| WalkerError::ChannelClosed {
