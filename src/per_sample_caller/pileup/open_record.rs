@@ -83,7 +83,16 @@ impl OpenPileupRecord {
             chrom_id,
             pos,
             alleles: vec![OpenAllele::new(ref_seq)],
-            folded_reads: AHashMap::new(),
+            // Sized for typical WGS coverage so the per-record
+            // fold doesn't pay 4-5 grow reallocations as it
+            // accumulates contributors. Workloads with much higher
+            // coverage will still grow from this base; workloads
+            // far below pay ~1 KB of dead headroom per open record.
+            // dhat 2026-05-10: previously this was the largest
+            // remaining alloc site by bytes (228 MB on
+            // pileup_walker_multi_op/L=5000) — top finding after
+            // L6 in `ia/reviews/perf_pileup_2026-05-10.md`.
+            folded_reads: AHashMap::with_capacity(32),
         }
     }
 
