@@ -1,0 +1,238 @@
+---
+name: rust-performance-review
+description: Use this skill whenever the user asks for a performance review, hot-path audit, profiling guidance, or to "find places to make this faster" in Rust code. Trigger on phrases like "look for performance improvements", "is this on the hot path", "where is this allocating", "review for cache locality", "is there lock contention here", or when the user shares a flamegraph / criterion result and asks for next steps.
+---
+
+# Rust Performance Review
+
+You are scanning Rust code for performance-improvement candidates. You are **not** rewriting the code, and you are **not** asserting wins; you are surfacing places where a measurable gain is plausible and proposing the experiment that would confirm or refute it.
+
+This work has a hostile prior: most "obvious" optimizations either do not matter (cold code), do not help (the compiler already handles it), or trade real complexity for an imagined win. Be skeptical. Each candidate must answer: where on the call graph does this run? what would we measure? how much complexity does the fix add?
+
+The review is split across focused per-category checklists in `ia/skills/performance_review/`. **You are the orchestrator**: you triage which categories apply to the scope, dispatch one sub-agent per category in parallel, then synthesize their findings into a single report. Per-category rules are not duplicated in this file — read each category file when dispatching the corresponding sub-agent.
+
+## Review principles (must always hold)
+
+- **Profile first; pattern-match second.** A finding without a profile, benchmark, or strong call-graph evidence that the code is on a hot path is filed at low priority and paired with the measurement that would promote it. Do not propose a rewrite of code you cannot show is hot.
+- **Every candidate has a measurement plan.** State the experiment: which benchmark, which profiler, which metric (wall time / allocations / cache misses / lock-wait time / syscalls), and what threshold makes the fix worth merging. "It will be faster" is not a finding.
+- **Complexity is a cost.** Every fix names the complexity it introduces (extra type, lifetime gymnastics, `unsafe`, build-config knob, dependency) and weighs it against the expected gain. A fix that doubles maintenance for a 2% wall-time win is a bad trade in critical lab code.
+- **Hot-path discipline.** Optimizations in code that runs once at startup, in a CLI flag handler, or in error-handling paths are noise. Be explicit about the call-frequency assumption and downgrade severity when call frequency is unverified.
+- **Correctness first.** Never recommend an optimization that weakens invariants, introduces `unsafe`, or relaxes atomic ordering without a separate, justified safety review. Performance findings that touch correctness boundaries are flagged as such and held to the evidence bar of a correctness review.
+- **One change per measurement.** Bundling allocator switch + LTO + a code refactor in the same PR produces an unreadable result. Each PR names the single hypothesis being tested.
+
+The severity rubric and per-finding format are defined in `ia/skills/performance_review/_finding_format.md`. Read it once at the start of every review — both you (for synthesis) and every sub-agent you dispatch will follow it.
+
+## Review procedure
+
+You run each numbered step once per review. Only step 5 fans out into parallel sub-agents.
+
+### 1. Establish scope and call frequency
+
+Determine whether the review covers a full crate, a module, a PR diff, or a single function under benchmark. State the scope. For each in-scope file, identify which functions are believed to be on the hot path and on what evidence: a profile, a benchmark, a call-graph argument, or "no evidence yet". Code with no hot-path evidence is reviewed at lower priority — flag this as a constraint passed into every sub-agent prompt.
+
+### 2. Inventory existing measurement
+
+List every existing benchmark (`benches/`), profile artifact (`flamegraph.svg`, `*.profraw`, `dhat-*.json`, `samply.json.gz`), and any quoted measurement the user has provided. Note what is missing — which functions have no benchmark, no profile, or only synthetic timings. **If no measurement exists for the in-scope code, the first deliverable is a measurement plan, not code rewrites** — say so explicitly in the verdict.
+
+If real benchmark or profile output is available, quote it verbatim. The verbatim output is passed into each sub-agent's prompt at step 5 so they do not re-run.
+
+### 3. Determine intent and targets
+
+Before judging whether the code is fast enough, establish what it is meant to do — its purpose, its expected input sizes, its latency or throughput target, its target hardware. Performance review is meaningless without these numbers. If the targets are not stated, ask before continuing or file the gap as a Note finding.
+
+Write a one-paragraph "performance intent" summary; it is passed into each sub-agent's prompt.
+
+### 4. Triage categories
+
+Decide which per-category checklists apply. Each lives at `ia/skills/performance_review/<category>.md`.
+
+| Category | Apply when |
+|---|---|
+| `methodology` | Always. Establishes that profiling, benchmarking, and `Cargo.toml` are sound before any code-level finding is acted on. |
+| `allocations` | Code on the hot path constructs `Vec` / `String` / `Box` / `Arc` / map types, clones owned data, calls `format!` / `to_owned` / `to_string`, or has unbounded buffer growth. |
+| `data_layout` | Hot path iterates over collections of structs, holds shared atomic state across threads, defines a `pub struct` with several fields, or there is suspicion of cache-miss pressure or false sharing. |
+| `concurrency` | Code uses `Arc`, `Mutex`, `RwLock`, atomics, channels, `rayon`, `tokio`, `async fn`, or `spawn`. Skip otherwise. |
+| `hot_loops` | Hot path contains tight numeric or byte-processing loops, slice indexing, iterator chains, generic dispatch, `format!`, or anywhere autovectorization or branch layout could plausibly matter. |
+| `io_and_syscalls` | Code performs file or socket I/O, reads/writes large data, or makes per-record syscalls. |
+
+When in doubt, dispatch — a sub-agent that finds nothing applicable writes `No findings.` and is cheap.
+
+### 5. Dispatch sub-agents in parallel
+
+Create the scratch directory: `tmp/perf_review_<YYYY-MM-DD>_<scope-slug>/` (append `_v<N>` if it already exists). The slug is a short kebab-case identifier of the reviewed module or PR (e.g. `gvcf_parser`, `pr-142`).
+
+Project rule: scratch space is project-local `tmp/`, never `/tmp`. Add `tmp/` to `.gitignore` if it is not already covered by the existing target ignores.
+
+For each selected category, dispatch a `general-purpose` sub-agent **in parallel** — issue a single message with multiple Agent tool calls. Each sub-agent prompt:
+
+> Run the **<category>** checklist on the following Rust performance-review scope.
+>
+> **Scope:** <full crate / PR diff / module / single function>
+> **Performance intent and targets:** <one paragraph from step 3, including throughput/latency targets and target hardware>
+> **In-scope files (full paths):** <list>
+> **Hot-path evidence:** <verbatim profile output / benchmark numbers / "none — pattern-match only">
+> **Out of scope:** <list, with reasons>
+>
+> **Instructions:**
+> 1. Read `ia/skills/performance_review/<category>.md` for the rules to apply.
+> 2. Read `ia/skills/performance_review/_finding_format.md` for the severity rubric and finding format.
+> 3. Read each in-scope file.
+> 4. Apply each rule and produce findings in the specified format. For every candidate, propose the **measurement plan** (benchmark or profile that confirms the gain) and the **complexity cost** of the fix. Findings without a measurement plan are downgraded.
+> 5. Write findings to `tmp/perf_review_<date>_<slug>/<category>.md`. If no findings apply, write only the line `No findings.`
+> 6. Do not invent profile output, benchmark numbers, or call frequencies. Cite only what was provided in the prompt or what you read in the source.
+> 7. Stay within the category. Issues that belong elsewhere go under a `## Cross-category observations` heading at the bottom of your file.
+
+Substitute `<category>` and the scope fields for each dispatch. Do **not** assign severity codes (H1, L1, …) inside sub-agents — that happens at synthesis.
+
+### 6. Collect findings
+
+When all sub-agents complete, read each `tmp/perf_review_<date>_<slug>/<category>.md`. Tally findings, note any cross-category observations, and decide whether each cross-category note becomes its own finding or merely informs synthesis.
+
+Promote findings whose measurement plans converge (multiple categories agree the same site is hot). Demote findings that turn out to be cold-path on closer inspection. If a sub-agent appears to have skipped its scope or produced unverifiable findings, redispatch that one category with an explicit instruction to fix the gap.
+
+### 7. Synthesize the unified report
+
+Compose the report using the *Output format* below. Verdict, measurement plan, and "What's already good" need the full picture and are produced by you. Assign severity codes during synthesis: `H1, H2, …` for Hot-path; `L1, L2, …` for Likely; `S1, S2, …` for Speculative; Notes stay grouped without numbering. Save to `reviews/perf_<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
+
+## Output format
+
+Produce the synthesized report in the following order. Use the section headings verbatim so the format is machine-readable.
+
+### 1. Scope and constraints
+- What was reviewed: full crate / module / PR diff / single function.
+- Reviewed against: commit hash, branch, or "as-provided".
+- Throughput / latency targets, expected input sizes, target hardware.
+- Hot-path evidence available (profile, benchmark, or "none — pattern-match only").
+- In-scope files (list).
+- Deliberately out of scope (list, with reason).
+- Categories dispatched (list, each with a one-line reason).
+
+### 2. Verdict
+One of:
+- **Profile first** — there is not enough hot-path evidence to recommend code changes. Section 3 lists the measurements to take.
+- **Run experiments** — candidates exist; their priority and order are listed in section 5.
+- **Apply the listed wins** — at least one candidate is well-evidenced (matching profile, plausible mechanism, contained complexity); apply with the proposed measurements as gates.
+
+### 3. Measurement plan
+The benchmarks and profiles to add or run, in the order they unblock other findings. Each entry: command, expected output, what threshold answers what question. If the verdict is *Profile first*, this is the primary deliverable.
+
+### 4. Build / toolchain configuration
+LTO, codegen-units, panic, opt-level, debug, allocator, target-cpu — anything in `Cargo.toml` or `.cargo/config.toml` that should change before code-level work. Driven by the `methodology` sub-agent's findings.
+
+### 5. Code-level findings
+Grouped by severity (**Hot-path** → **Likely** → **Speculative** → **Note**). Within each severity, ordered by confidence (High → Low), then by file. Each finding follows the format defined in `ia/skills/performance_review/_finding_format.md`, with the severity code (H1, L1, …) prepended to the title — e.g. `H1: src/parser.rs:42 — Title`.
+
+### 6. Out-of-scope observations
+Performance smells in untouched code, surfaced but not blocking. Each: file, brief description, suggested follow-up (separate PR or issue).
+
+### 7. What's already good
+Up to 3 specific, transferable patterns the code is already getting right (e.g., "uses `with_capacity` everywhere it knows the size", "shards by sample to avoid `Mutex` contention"). One sentence each, with file references. No general praise. Skip the section entirely if nothing specific qualifies.
+
+### Author response convention
+Address each finding by its identifier (e.g., "H1", "L2") with one of: `applied in <commit>` / `experiment shows no gain — closing` / `disputed because …` / `deferred to <issue>` / `won't fix because …`. The "experiment shows no gain" path is expected and welcome — that is what the measurement plan is for.
+
+---
+
+Be direct. If something is plausibly hot, say so plainly and propose the experiment. Vague "could be faster" and vague "looks fine" are equally useless.
+
+## Saving the report
+
+### Directory and filename
+
+Save to the project's `reviews/` directory at the crate root:
+
+```
+reviews/perf_<module-slug>_<YYYY-MM-DD>.md
+```
+
+Examples:
+
+- `reviews/perf_gvcf_parser_2026-05-10.md`
+- `reviews/perf_pipeline_2026-05-10.md`
+- `reviews/perf_pr-142_2026-05-10.md`
+
+If a review for the same scope and date already exists, append `_v<N>`:
+
+- `reviews/perf_gvcf_parser_2026-05-10_v2.md`
+
+### Document header
+
+```markdown
+# Performance Review: <module-slug>
+**Date:** <YYYY-MM-DD>
+**Reviewer:** rust-performance-review skill (orchestrator)
+**Scope:** <one-line description>
+**Verdict:** <Profile first / Run experiments / Apply the listed wins>
+**Hot-path evidence:** <profile / benchmark / pattern-match only>
+
+---
+```
+
+The body is sections 1–7 of *Output format* above, in order, with verbatim headings.
+
+### File links inside findings
+
+References to source files use relative Markdown links from the `reviews/` directory:
+
+- Single line: `[file.rs](../path/file.rs#L123)`
+- Range: `[file.rs](../path/file.rs#L123-L456)`
+
+Display text is the path (no backticks).
+
+### Pre-save checklist
+
+- [ ] Every Hot-path finding has High confidence and quotes the profile / benchmark output that names the site.
+- [ ] Every Likely finding has a measurement plan that would confirm or refute the gain.
+- [ ] Every finding has a complexity cost named honestly.
+- [ ] Every cited file:line was actually read (no invented locations).
+- [ ] No fabricated percentages or speedup multipliers anywhere in the report.
+- [ ] Cold-path findings are downgraded to Note unless the orchestrator marked them in scope.
+- [ ] Severity codes (H1, L1, S1) are consistent and dense (no gaps).
+- [ ] Per-category files in `tmp/perf_review_<date>_<slug>/` are left in place as an audit trail.
+- [ ] Build configuration findings (section 4) are separated from code-level findings (section 5).
+
+## Reusable prompt template
+
+Use this to invoke the skill consistently. Fill in the Context block; the rest defers to the skill body.
+
+> Perform a Rust performance review per the **rust-performance-review** skill. Follow its principles, procedure, severity rubric, and output format in full — do not abbreviate or skip sections.
+>
+> **Context**
+> - **Scope:** <files / module / PR diff / branch>
+> - **Performance intent and targets:** <what the code does, on what input sizes, with what latency / throughput target, on what hardware>
+> - **Hot-path evidence:** <flamegraph path / criterion bench output / DHAT report / "none — pattern-match only">
+> - **Constraints:** <MSRV, `no_std`, target platforms, deadline pressure>
+> - **Out of scope:** <legacy modules being deleted, vendored deps>
+> - **Prior review history:** <previously reviewed? known tracked issues?>
+>
+> **Anti-hallucination contract.** Quote tool output verbatim. If a benchmark or profile was not run / read, say so under "Hot-path evidence" and downgrade findings accordingly. Never invent measurements, percentages, file paths, or line numbers.
+>
+> **Reminders of the most-violated rules** (not a substitute for the per-category checklists):
+> 1. Profile first; pattern-match second.
+> 2. Every finding has a measurement plan and a complexity cost.
+> 3. Cold code is not the hot path; downgrade findings filed against it.
+> 4. Correctness wins over speed. Route correctness-adjacent findings through a separate review.
+> 5. One change per measurement — do not bundle allocator + LTO + refactor.
+
+---
+
+## Sources
+
+The two articles that motivated this skill:
+
+- *Inside Rust's std and parking_lot Mutexes: Who Wins?* — https://blog.cuongle.dev/p/inside-rusts-std-and-parking-lot-mutexes-who-win
+- *About memory pressure, lock contention and data-oriented design* — https://mnt.io/articles/about-memory-pressure-lock-contention-and-data-oriented-design/
+
+Background reading the per-category rules draw on:
+
+- *The Rust Performance Book* (Nicholas Nethercote) — https://nnethercote.github.io/perf-book/
+- *How to avoid bounds checks in Rust (without unsafe!)* — https://shnatsel.medium.com/how-to-avoid-bounds-checks-in-rust-without-unsafe-f65e618b4c1e
+- *Why my Rust benchmarks were wrong* (Guillaume Endignoux on `black_box`) — https://gendignoux.com/blog/2022/01/31/rust-benchmarks.html
+- *Optimization adventures: making a parallel Rust workload faster with (or without) Rayon* — https://gendignoux.com/blog/2024/11/18/rust-rayon-optimized.html
+- `crossbeam_utils::CachePadded` docs — https://docs.rs/crossbeam-utils/latest/crossbeam_utils/struct.CachePadded.html
+- `bumpalo` — https://github.com/fitzgen/bumpalo
+- `dashmap` — https://github.com/xacrimon/dashmap
+- `rustc-hash` (FxHash) — https://github.com/rust-lang/rustc-hash
+- `mimalloc` — https://github.com/microsoft/mimalloc
+- `flamegraph-rs` — https://github.com/flamegraph-rs/flamegraph
+- `criterion.rs` — https://github.com/bheisler/criterion.rs
