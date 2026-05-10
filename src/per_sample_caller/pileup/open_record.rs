@@ -749,8 +749,10 @@ pub struct ReadContribution {
     pub read_id: u32,
     pub chain_slot_id: SlotId,
     /// Events whose anchor *is* this walker_pos (used by step 3
-    /// to identify candidate records).
-    pub events_at_pos: Vec<ReadEvent>,
+    /// to identify candidate records). At most 2 events anchor at
+    /// any walker_pos (one Match plus at most one indel), so the
+    /// SmallVec keeps this list off the heap on every step.
+    pub events_at_pos: super::cigar_cursor::EventsAt,
     /// BAQ-capped BQ at this walker position (the Match-event's
     /// quality, used as the fallback when the cursor's window
     /// returns no events — a clean REF read).

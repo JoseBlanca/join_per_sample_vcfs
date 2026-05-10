@@ -46,9 +46,25 @@
 //! asserted by the parity oracle in this module's test submodule
 //! — both modes are exercised against the same corpus.
 
+use smallvec::SmallVec;
+
 use super::CigarOp;
 use super::PreparedRead;
 use super::decompose::{ReadEvent, indel_bq_proxy_deletion, indel_bq_proxy_insertion};
+
+/// `events_at` returns at most two events (one Match plus at most
+/// one indel anchored at the same position). Inline storage keeps
+/// the per-step query off the heap on the typical path; only the
+/// rare zero-emit case stays on the stack regardless. Covers the
+/// `SmallVec<[ReadEvent; 2]>` commitment in the lazy-CIGAR plan.
+pub(super) type EventsAt = SmallVec<[ReadEvent; 2]>;
+
+/// `events_overlapping` returns one entry per event whose footprint
+/// intersects the queried record window. Typical SNP records query
+/// a 1-base window and get 0–1 events; widened deletion records
+/// can return a small handful. Inline cap of 4 covers the common
+/// path; over-cap workloads spill to heap with no semantic change.
+pub(super) type EventsOverlapping = SmallVec<[ReadEvent; 4]>;
 
 /// Finding `G1` (adaptor-region per-base filter): is `ref_pos` past
 /// the read's mate-pair adaptor boundary?
@@ -192,7 +208,7 @@ impl CigarCursor {
         lo: u32,
         hi: u32,
         read: &PreparedRead,
-    ) -> Vec<ReadEvent> {
+    ) -> EventsOverlapping {
         match self.mode {
             CursorMode::Linear => self.events_overlapping_linear(lo, hi, read),
             CursorMode::BinarySearch => self.events_overlapping_binary(lo, hi, read),
@@ -213,8 +229,8 @@ impl CigarCursor {
     /// doesn't fully fuse the helper into this hot path. The
     /// duplication with `emit_event_for_op_overlapping` is
     /// deliberate.
-    fn events_overlapping_linear(&self, lo: u32, hi: u32, read: &PreparedRead) -> Vec<ReadEvent> {
-        let mut out = Vec::new();
+    fn events_overlapping_linear(&self, lo: u32, hi: u32, read: &PreparedRead) -> EventsOverlapping {
+        let mut out = EventsOverlapping::new();
         if hi <= lo {
             return out;
         }
@@ -309,8 +325,8 @@ impl CigarCursor {
     /// then walk forward with the same upper-bound break. Used
     /// when the CIGAR has many ops; the fixed setup cost
     /// amortises over the saved op visits.
-    fn events_overlapping_binary(&self, lo: u32, hi: u32, read: &PreparedRead) -> Vec<ReadEvent> {
-        let mut out = Vec::new();
+    fn events_overlapping_binary(&self, lo: u32, hi: u32, read: &PreparedRead) -> EventsOverlapping {
+        let mut out = EventsOverlapping::new();
         if hi <= lo {
             return out;
         }
@@ -350,7 +366,7 @@ impl CigarCursor {
         i: usize,
         lo: u32,
         hi: u32,
-        out: &mut Vec<ReadEvent>,
+        out: &mut EventsOverlapping,
         read: &PreparedRead,
     ) {
         let off = self.offsets[i];
@@ -445,7 +461,7 @@ impl CigarCursor {
     /// include a deletion anchored before `pos` whose footprint
     /// reaches `pos`, which the walker has already processed at
     /// an earlier step.
-    pub(super) fn events_at(&self, walker_pos: u32, read: &PreparedRead) -> Vec<ReadEvent> {
+    pub(super) fn events_at(&self, walker_pos: u32, read: &PreparedRead) -> EventsAt {
         match self.mode {
             CursorMode::Linear => self.events_at_linear(walker_pos, read),
             CursorMode::BinarySearch => self.events_at_binary(walker_pos, read),
@@ -460,8 +476,8 @@ impl CigarCursor {
     ///
     /// Per-op match arms are inlined manually — see the same
     /// note on `events_overlapping_linear`.
-    fn events_at_linear(&self, walker_pos: u32, read: &PreparedRead) -> Vec<ReadEvent> {
-        let mut out = Vec::new();
+    fn events_at_linear(&self, walker_pos: u32, read: &PreparedRead) -> EventsAt {
+        let mut out = EventsAt::new();
         let n_ops = read.cigar.len();
         // Anything that can anchor at `walker_pos` lives in an op
         // whose start `ref_pos` is at most `walker_pos + 1` (the
@@ -543,8 +559,8 @@ impl CigarCursor {
     /// indel ops whose anchor lands at `walker_pos`. Selected
     /// when the CIGAR has many ops so skipping the prefix is
     /// worth the per-call setup.
-    fn events_at_binary(&self, walker_pos: u32, read: &PreparedRead) -> Vec<ReadEvent> {
-        let mut out = Vec::new();
+    fn events_at_binary(&self, walker_pos: u32, read: &PreparedRead) -> EventsAt {
+        let mut out = EventsAt::new();
         let n_ops = read.cigar.len();
         if n_ops == 0 {
             return out;
@@ -855,7 +871,8 @@ mod tests {
                 let cursor_events = cursor.events_overlapping(0, u32::MAX, &read);
                 let decompose_events = decompose(&read);
                 assert_eq!(
-                    cursor_events, decompose_events,
+                    cursor_events.as_slice(),
+                    decompose_events.as_slice(),
                     "mode {mode:?}, pattern {name}: cursor and decompose disagree",
                 );
             }
@@ -879,7 +896,8 @@ mod tests {
                         .collect();
                     let got = cursor.events_at(walker_pos, &read);
                     assert_eq!(
-                        got, want,
+                        got.as_slice(),
+                        want.as_slice(),
                         "mode {mode:?}, pattern {name}, walker_pos {walker_pos}: cursor disagrees with decompose",
                     );
                 }
@@ -923,7 +941,8 @@ mod tests {
                         .collect();
                     let got = cursor.events_overlapping(lo, hi, &read);
                     assert_eq!(
-                        got, want,
+                        got.as_slice(),
+                        want.as_slice(),
                         "mode {mode:?}, pattern {name}, window [{lo}, {hi}): cursor disagrees with decompose",
                     );
                 }
@@ -1143,7 +1162,8 @@ mod tests {
             let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
             let cursor_events = cursor.events_overlapping(0, u32::MAX, &read);
             assert_eq!(
-                cursor_events, oracle,
+                cursor_events.as_slice(),
+                oracle.as_slice(),
                 "mode {mode:?}: cursor and decompose disagree on read-N skipping"
             );
             // And no event has base = N.
@@ -1286,7 +1306,8 @@ mod tests {
             let cursor = CigarCursor::with_mode(&read.cigar, read.alignment_start, mode);
             let cursor_events = cursor.events_overlapping(0, u32::MAX, &read);
             assert_eq!(
-                cursor_events, oracle,
+                cursor_events.as_slice(),
+                oracle.as_slice(),
                 "mode {mode:?}: cursor and decompose disagree on adaptor skipping"
             );
             // And no event sits at or past the boundary.

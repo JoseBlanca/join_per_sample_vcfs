@@ -23,6 +23,7 @@ noodles-cram = "0.92.0"
 noodles-fasta = "0.60.0"
 noodles-sam = "0.84.0"
 rayon = "1.10"
+smallvec = "1.13"
 tempfile = "3"
 thiserror = "2.0.18"
 

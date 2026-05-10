@@ -634,6 +634,7 @@ dependencies = [
  "noodles-fasta",
  "noodles-sam",
  "rayon",
+ "smallvec",
  "tempfile",
  "thiserror",
 ]
