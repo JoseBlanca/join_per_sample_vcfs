@@ -29,6 +29,7 @@ Before making any code change, perform a preflight pass:
 3. For each finding, extract: ID, title, severity, confidence, assumptions, affected files, problem summary, suggested fix summary, whether it affects public API, whether it's testable, whether the current code still exhibits the issue.
 4. Verify findings against current code using semantic context (line numbers may have drifted). A finding is **context-matched** only if the relevant code still exists and the reported behavior is still present.
 5. Write the initial findings table to the report — every finding recorded with metadata and an initial decision — before editing any code.
+6. If any planned `Apply` touches perf-sensitive code (see `## Performance check`), save a criterion baseline **now**, before editing anything. The end-of-run comparison depends on having a clean pre-fix baseline.
 
 **Stop early** if: the review can't be interpreted reliably, source files are unavailable, or the codebase has drifted so far that most findings no longer map safely. Still produce the report explaining why.
 
@@ -141,6 +142,44 @@ Validate in layers after each fix:
 
 A finding cannot receive status `Applied` or `Applied with adaptation` unless the report records: commands run, exit codes, and concise results.
 
+## Performance check
+
+If any `Apply` changed code on a hot path covered by `benches/`, run a single end-of-run perf comparison. Skip otherwise (doc-only, test-only, or out-of-bench changes). One comparison per run, not per finding — perf regressions from code-review fixes are usually small and rare, and a single check at the end is the right granularity. If a regression shows up, bisecting it (revert and re-apply finding by finding) is a follow-up, not part of this run.
+
+**"Hot path covered by `benches/`"** means the changed file is reachable from any bench harness in `benches/`. When unsure, run the check.
+
+### Capturing the baseline
+
+Save a criterion baseline **before any fix is applied** (this is preflight step 6):
+
+```
+./scripts/dev.sh cargo bench -- --save-baseline pre-fixes
+```
+
+Saving the baseline is a prerequisite for the comparison. If editing started before a baseline was captured, record that fact in the report and skip the comparison rather than fabricating one — do not stash/revert/un-edit just to back-fill a baseline.
+
+### Comparing after all fixes
+
+Once every `Apply` finding is implemented and the rest of validation has passed, run the same benches against the saved baseline:
+
+```
+./scripts/dev.sh cargo bench -- --baseline pre-fixes
+```
+
+Run all benches in `benches/`, not just the ones whose code paths the fixes obviously touched — cross-module regressions are exactly what this check exists to catch.
+
+### Threshold and reporting
+
+A perf regression is flagged when criterion reports a **`regressed`** verdict on any bench group. Criterion's CI machinery is the threshold; don't layer a hand-picked percent on top of it.
+
+On regression:
+
+1. **Do not auto-revert.** The user decides whether to revert and bisect, ship as-is, or follow up separately.
+2. Record the regressed group(s), the criterion verdict, and the relevant bench output in the report's perf section.
+3. List the regression among the run's unresolved high-priority items so the user sees it at the end of the run.
+
+If criterion reports `no change` or `improved` on every group, a one-line note in the report is enough.
+
 ## Fix-application report
 
 **Every run must produce a report** in `reviews/`, even if no code changed, all findings were deferred, or the run was blocked. A run without a report is incomplete.
@@ -191,6 +230,7 @@ At the end of the run, tell the user where the report was written and list any u
 - `cargo test --all-targets --all-features` → <exit code / not run>, <result>
 - `cargo doc --no-deps` → <exit code / not run>, <result>
 - `cargo audit` → <exit code / not run>, <result>
+- Performance check (`cargo bench -- --baseline pre-fixes`) → <not applicable / not run / passed / regressed in <groups>>
 
 ### Unresolved high-priority findings
 - <finding ID> — <short reason>
@@ -250,14 +290,26 @@ If none: "None."
 
 If none: "None."
 
-## 9. Commands run
+## 9. Performance check
+
+- **Triggered:** <yes / no — reason>
+- **Baseline saved:** <yes, before any fix / no — explain>
+- **Benches run:** <list, or "all benches in benches/">
+- **Verdicts:**
+  - `<bench_group>` → <improved / no change / regressed>
+- **Outcome:** <pass / regression flagged / skipped>
+- **Notes:** <commands run, any caveats>
+
+If skipped: "Skipped — no Apply touched perf-sensitive code." (or other reason).
+
+## 10. Commands run
 - `<command>`
 - `<command>`
 
-## 10. Command results
+## 11. Command results
 - `<command>` → <exit code>, <one-line result>
 
-## 11. Notes
+## 12. Notes
 - <important assumption, adaptation, or follow-up>
 
 If none: "None."
