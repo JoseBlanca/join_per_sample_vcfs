@@ -423,6 +423,25 @@ impl WalkerState {
 // not a slice.
 #[allow(clippy::ptr_arg)]
 fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary: &mut RunSummary) {
+    // Fast path: mate overlap requires two contributors at this
+    // walker_pos sharing a chain_slot_id. Solo-read inputs never
+    // hit it; in paired-end inputs the geometry of insert sizes
+    // means most positions also don't. Detecting the no-pair case
+    // up front lets us skip the AHashMap allocation that would
+    // otherwise fire on every walker step (1.5 M allocations on
+    // the `pileup_walker_multi_op/L=5000` fixture, dhat 2026-05-10).
+    // O(n²) early-break duplicate check; at typical n ≤ ~30
+    // contributors per column it beats AHashMap construction +
+    // n probes, and short-circuits as soon as any pair is found.
+    let n = contributors.len();
+    let any_shared = (0..n).any(|i| {
+        let s = contributors[i].chain_slot_id;
+        ((i + 1)..n).any(|j| contributors[j].chain_slot_id == s)
+    });
+    if !any_shared {
+        return;
+    }
+
     // Build a small index: chain_slot_id → list of contributor
     // indices. Anything with a list length >= 2 is a candidate.
     // ahash::AHashMap matches the rest of the module — std HashMap's
