@@ -41,6 +41,16 @@ RUN rustup component add rustfmt clippy
 # Installed as its own layer so it stays cached across Cargo.toml changes.
 RUN cargo install flamegraph --locked
 
+# samply: sampling profiler that does not require perf permissions. Produces
+# a profile viewable in the Firefox profiler UI; complementary to flamegraph
+# for cases where the host's perf_event_paranoid is locked down.
+RUN cargo install samply --locked
+
+# cargo-show-asm: emit annotated assembly for a single function. Used to
+# verify codegen-level claims (bounds-check elision, autovectorization)
+# without disassembling the whole binary.
+RUN cargo install cargo-show-asm --locked
+
 # Claude Code CLI, used when the container hosts an agent session.
 RUN npm install -g @anthropic-ai/claude-code
 

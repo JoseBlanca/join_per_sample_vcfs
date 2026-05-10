@@ -1,6 +1,10 @@
 /target
 /target-container
 /tmp/
+/dhat-heap.json
+/flamegraph.svg
+/perf.data
+/perf.data.old
 __pycache__/
 python_draft/__pycache__/
 .tally-config.toml

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ahash = "0.8.12"
 anyhow = "1.0.102"
+dhat = { version = "0.3", optional = true }
 flate2 = "1.1.9"
 lru = "0.16.3"
 noodles-core = "0.19.0"
@@ -15,6 +16,12 @@ noodles-sam = "0.84.0"
 rayon = "1.10"
 tempfile = "3"
 thiserror = "2.0.18"
+
+[features]
+# Enable in `cargo run --example dhat_pileup --features dhat-heap` to swap
+# the global allocator for `dhat::Alloc` and produce `dhat-heap.json`.
+# Off by default so production builds carry no dhat code.
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 bstr = "1"
