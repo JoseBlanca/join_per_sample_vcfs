@@ -165,6 +165,11 @@ struct WalkerState {
     open: OpenPileupRecordTable,
     summary: RunSummary,
     config: WalkerConfig,
+    /// Reusable per-step buffer for the contributors list. Hoisted
+    /// here so the per-walker-step `Vec<ReadContribution>` is
+    /// allocated once and reused via `clear()` between steps. L6
+    /// in `ia/reviews/perf_pileup_2026-05-10.md`.
+    contributors_buf: Vec<ReadContribution>,
 }
 
 impl WalkerState {
@@ -179,6 +184,7 @@ impl WalkerState {
             open: OpenPileupRecordTable::new(),
             summary: RunSummary::default(),
             config,
+            contributors_buf: Vec::new(),
         }
     }
 
@@ -228,7 +234,9 @@ impl WalkerState {
         // silent (deletion interior or N-skip), so they are not
         // added as contributors at all.
         let walker_pos = self.walker_pos;
-        let mut contributors: Vec<ReadContribution> = Vec::new();
+        // Hoisted buffer; cleared per step. L6.
+        self.contributors_buf.clear();
+        let contributors = &mut self.contributors_buf;
 
         for active in self.active.iter() {
             let events_at_pos = active.cursor.events_at(walker_pos, &active.read);
@@ -266,7 +274,7 @@ impl WalkerState {
         // observation, contributing ln(1)=0 log-likelihood mass)
         // and is flagged so any window event the fold pulls from
         // its cursor also gets BQ-zeroed.
-        resolve_mate_overlap_at_pos(&mut contributors, &mut self.summary);
+        resolve_mate_overlap_at_pos(contributors, &mut self.summary);
 
         // Step 2b: per-column depth cap. Adopted from samtools'
         // mpileup (see `WalkerConfig` doc-comment). Apply *after*

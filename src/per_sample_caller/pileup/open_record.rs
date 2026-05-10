@@ -414,7 +414,9 @@ pub fn apply_events_to_ref_into(
             if start < end {
                 out.extend_from_slice(&ref_seq[start as usize..end as usize]);
             }
-            ref_cursor = offset;
+            // ref_cursor is unconditionally overwritten by the
+            // match arm below (every event variant sets it), so
+            // we don't bother updating it here.
         }
 
         match ev {
@@ -494,6 +496,7 @@ fn event_kind_rank(ev: &ReadEvent) -> u8 {
 /// `ref_seq` (e.g. for `apply_events_to_ref`) at the same time.
 /// This is what lets `process_position` avoid cloning `ref_seq` per
 /// affected record. Mi6 in `ia/reviews/pileup_2026-05-09.md`.
+#[cfg(test)]
 pub fn find_or_create_allele_index(alleles: &mut Vec<OpenAllele>, seq: Vec<u8>) -> usize {
     if let Some(idx) = alleles.iter().position(|a| a.seq == seq) {
         idx
