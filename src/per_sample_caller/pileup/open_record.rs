@@ -33,7 +33,15 @@ impl OpenAllele {
         Self {
             seq,
             scalars: FiveScalars::default(),
-            chain_slots: Vec::new(),
+            // Sized for typical WGS coverage so per-allele
+            // insert_sorted_unique calls don't trip the 0->4->8->16->32
+            // grow ladder. The chain_slots Vec is moved into the
+            // public AlleleObservation by `finalise()`, so this
+            // capacity hint also benefits downstream consumers
+            // (no realloc-to-shrink). dhat 2026-05-10 named the
+            // grows as the next-biggest alloc count site after
+            // the FoldedReadState pre-allocation.
+            chain_slots: Vec::with_capacity(32),
         }
     }
 }
