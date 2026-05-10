@@ -129,6 +129,13 @@ impl OpenPileupRecord {
 pub struct OpenPileupRecordTable {
     /// 1-based anchor position → record.
     records: BTreeMap<u32, OpenPileupRecord>,
+    /// Reusable scratch buffer for the per-(record, contributor)
+    /// haplotype string built by `apply_events_to_ref_into`. Hoisted
+    /// here so the inner-fold's allele-equality check can run
+    /// against a borrowed `&[u8]` and only `clone()` when adding a
+    /// genuinely new allele. See L10/L11 in
+    /// `ia/reviews/perf_pileup_2026-05-10.md`.
+    allele_seq_buf: Vec<u8>,
 }
 
 impl OpenPileupRecordTable {
@@ -359,11 +366,17 @@ impl OpenPileupRecordTable {
 /// order. The cursor was already producing the right shape, so
 /// the sort was wasted work and the contract was unclear. The
 /// preconditions above are now explicit and asserted in debug.
-pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]) -> Vec<u8> {
+pub fn apply_events_to_ref_into(
+    out: &mut Vec<u8>,
+    record_pos: u32,
+    ref_seq: &[u8],
+    events: &[ReadEvent],
+) {
     // Walk the ref_seq in offset order, applying events as we
     // pass their anchor positions. Each event is positioned by an
     // offset = (event.anchor_pos - record_pos).
-    let mut out: Vec<u8> = Vec::with_capacity(ref_seq.len() + 8);
+    out.clear();
+    out.reserve(ref_seq.len() + 8);
 
     debug_assert!(
         events.windows(2).all(|w| {
@@ -371,18 +384,19 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
             let b = (w[1].anchor_pos(), event_kind_rank(&w[1]));
             a <= b
         }),
-        "apply_events_to_ref: events must be sorted by (anchor, Match<Insertion<Deletion); got {events:?}",
+        "apply_events_to_ref_into: events must be sorted by (anchor, Match<Insertion<Deletion); got {events:?}",
     );
 
     // Skip indices already consumed by an event so we don't
     // double-emit reference bases that an event has overridden.
     let mut consumed_until: u32 = 0; // ref offset (exclusive) consumed by the last event
     let mut ref_cursor: u32 = 0;
+    let ref_len = ref_seq.len() as u32;
 
     for ev in events {
         debug_assert!(
             ev.anchor_pos() >= record_pos,
-            "apply_events_to_ref: event anchor {} below record_pos {}",
+            "apply_events_to_ref_into: event anchor {} below record_pos {}",
             ev.anchor_pos(),
             record_pos,
         );
@@ -390,16 +404,22 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
 
         // Emit any REF bases between ref_cursor and the event's
         // offset that haven't been consumed by a previous event.
-        while ref_cursor < offset {
-            if ref_cursor >= consumed_until && (ref_cursor as usize) < ref_seq.len() {
-                out.push(ref_seq[ref_cursor as usize]);
+        // Once `ref_cursor >= consumed_until` the predicate is
+        // monotonically true for the rest of the gap, so the gap
+        // collapses to a single memcpy of the un-consumed slice.
+        // L11 in the perf review.
+        if ref_cursor < offset {
+            let start = ref_cursor.max(consumed_until);
+            let end = offset.min(ref_len);
+            if start < end {
+                out.extend_from_slice(&ref_seq[start as usize..end as usize]);
             }
-            ref_cursor += 1;
+            ref_cursor = offset;
         }
 
         match ev {
             ReadEvent::Match { base, .. } => {
-                if (offset as usize) < ref_seq.len() {
+                if offset < ref_len {
                     out.push(*base);
                 }
                 ref_cursor = offset + 1;
@@ -410,7 +430,7 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
                 // base itself is unchanged (in the ref-matching
                 // sense). Emit the anchor base if not already
                 // emitted, then append the inserted bases.
-                if (offset as usize) < ref_seq.len() && offset >= consumed_until {
+                if offset < ref_len && offset >= consumed_until {
                     out.push(ref_seq[offset as usize]);
                 }
                 out.extend_from_slice(seq);
@@ -420,7 +440,7 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
             ReadEvent::Deletion { deleted_len, .. } => {
                 // DEL: keep the anchor base, drop the next
                 // `deleted_len` reference bases.
-                if (offset as usize) < ref_seq.len() && offset >= consumed_until {
+                if offset < ref_len && offset >= consumed_until {
                     out.push(ref_seq[offset as usize]);
                 }
                 let skip_until = offset + 1 + *deleted_len;
@@ -430,14 +450,25 @@ pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]
         }
     }
 
-    // Tail: emit remaining REF bases.
-    while (ref_cursor as usize) < ref_seq.len() {
-        if ref_cursor >= consumed_until {
-            out.push(ref_seq[ref_cursor as usize]);
+    // Tail: emit remaining REF bases past the last event. Same
+    // memcpy collapse as the gap above.
+    if ref_cursor < ref_len {
+        let start = ref_cursor.max(consumed_until);
+        if start < ref_len {
+            out.extend_from_slice(&ref_seq[start as usize..ref_len as usize]);
         }
-        ref_cursor += 1;
     }
+}
 
+/// Owning wrapper around `apply_events_to_ref_into`. Kept so unit
+/// tests (and any caller that isn't on the hot path) don't have to
+/// hoist a buffer manually. The hot-path call in `process_position`
+/// goes through the `_into` variant against a buffer on
+/// `OpenPileupRecordTable`.
+#[cfg(test)]
+pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]) -> Vec<u8> {
+    let mut out = Vec::new();
+    apply_events_to_ref_into(&mut out, record_pos, ref_seq, events);
     out
 }
 
@@ -470,6 +501,15 @@ pub fn find_or_create_allele_index(alleles: &mut Vec<OpenAllele>, seq: Vec<u8>) 
         alleles.push(OpenAllele::new(seq));
         alleles.len() - 1
     }
+}
+
+/// Borrowed lookup variant: matches `seq` against existing alleles
+/// without taking ownership. Used by the hot-path fold so the
+/// caller can run an equality check against a reusable buffer and
+/// only `clone()` the bytes when a genuinely new allele is added.
+/// L10 in `ia/reviews/perf_pileup_2026-05-10.md`.
+pub fn find_allele_index(alleles: &[OpenAllele], seq: &[u8]) -> Option<usize> {
+    alleles.iter().position(|a| a.seq.as_slice() == seq)
 }
 
 /// Process all events at `walker_pos` from the given list of
@@ -541,12 +581,21 @@ pub fn process_position(
     // later walker steps subtract the prior contribution from
     // the old bucket before adding the new one.
     affected.sort_unstable();
+    // Split-borrow the table fields so the inner fold can hold a
+    // mutable borrow on `allele_seq_buf` simultaneously with a
+    // mutable borrow on a record inside `records`. Equivalent to
+    // the `OpenPileupRecord { alleles, folded_reads, .. }` split
+    // below, just one level up.
+    let OpenPileupRecordTable {
+        records,
+        allele_seq_buf,
+    } = open;
     for key in affected {
         // PANIC-FREE: every key in `affected` was either inserted
         // by `open_new` or returned by `find_overlapping` in the
         // step-3 loop above; no path between that loop and here
         // removes records.
-        let rec = open.records.get_mut(&key).expect("affected key must exist");
+        let rec = records.get_mut(&key).expect("affected key must exist");
         let rec_pos = rec.pos;
         // Destructure through `&mut` so `alleles` and `folded_reads`
         // are independent mutable borrows of disjoint fields. The
@@ -606,7 +655,7 @@ pub fn process_position(
                 continue;
             }
 
-            let allele_seq = apply_events_to_ref(rec_pos, &alleles[0].seq, &window_events);
+            apply_events_to_ref_into(allele_seq_buf, rec_pos, &alleles[0].seq, &window_events);
             let bq = ln_bq_for_read(&window_events, contrib.bq_baq_at_walker_pos);
             let ln_q = bq.max(contrib.mq_log_err);
             let new_contribution = FiveScalars {
@@ -628,7 +677,17 @@ pub fn process_position(
                     &prev.contribution,
                 );
             }
-            let new_index = find_or_create_allele_index(alleles, allele_seq);
+            // Borrowed lookup; only `clone()` the bytes when adding
+            // a genuinely new allele. In SNP/REF steady state every
+            // contributor lands in the same existing bucket, so
+            // the clone path never fires.
+            let new_index = match find_allele_index(alleles, allele_seq_buf) {
+                Some(idx) => idx,
+                None => {
+                    alleles.push(OpenAllele::new(allele_seq_buf.clone()));
+                    alleles.len() - 1
+                }
+            };
             add_contribution(&mut alleles[new_index].scalars, &new_contribution);
             insert_sorted_unique(
                 &mut alleles[new_index].chain_slots,
