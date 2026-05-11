@@ -69,8 +69,8 @@ pub struct SlotAllocator {
     /// are admitted. The slot is released when this hits 0 again.
     slot_refcount: Vec<u8>,
     /// First mates whose partner has not yet arrived. Sized for
-    /// genuinely-pending pairs only — solo reads (no `has_mate`)
-    /// never enter this map.
+    /// genuinely-pending pairs only — solo reads
+    /// (`MateRole::Solo`) never enter this map.
     pending_mates: AHashMap<Arc<str>, PendingMate>,
     /// Slots that started since the previous emitted record.
     /// Drained on each emission.
@@ -148,16 +148,16 @@ impl SlotAllocator {
 
     /// Allocate a slot for an entering read.
     ///
-    /// - First mate of a pair (`has_mate` set, qname not in
-    ///   `pending_mates`): allocate a fresh or recycled slot and
-    ///   register the qname. Refcount is pre-set to 2,
+    /// - First mate of a pair (`mate_role.is_paired()` true, qname
+    ///   not in `pending_mates`): allocate a fresh or recycled slot
+    ///   and register the qname. Refcount is pre-set to 2,
     ///   anticipating the future second mate; this guarantees the
     ///   slot stays held even if the first mate exits the active
     ///   set before the second arrives.
     /// - Second mate (qname found in `pending_mates`): reuse the
     ///   first mate's slot (same chain). Refcount is unchanged
     ///   (already at 2 from the first-mate pre-allocation).
-    /// - Solo read (`has_mate` unset): allocate a slot with
+    /// - Solo read (`MateRole::Solo`): allocate a slot with
     ///   refcount 1.
     ///
     /// Returns `(slot_id, first_mate_read_id_if_pairing)` — the
@@ -174,7 +174,7 @@ impl SlotAllocator {
         // hard error.
         self.evict_stale_pending(read.alignment_start);
 
-        if read.has_mate
+        if read.mate_role.is_paired()
             && let Some(pending) = self.pending_mates.remove(&read.qname)
         {
             // Second mate of a known pair — reuse the slot. Refcount
@@ -188,13 +188,13 @@ impl SlotAllocator {
         // Pre-bump to 2 if a partner is expected (so the slot
         // stays held if the first mate exits before the second
         // mate arrives), otherwise 1 for solo reads.
-        let initial_refcount: u8 = if read.has_mate { 2 } else { 1 };
+        let initial_refcount: u8 = if read.mate_role.is_paired() { 2 } else { 1 };
         self.set_refcount(slot, initial_refcount);
         self.maybe_warn_high_water(read.chrom_id, read.alignment_start);
         self.counters.slot_allocations += 1;
         self.new_marks.push(slot);
 
-        if read.has_mate {
+        if read.mate_role.is_paired() {
             self.pending_mates.insert(
                 read.qname.clone(),
                 PendingMate {
@@ -418,9 +418,10 @@ fn sort_dedup(v: &mut Vec<SlotId>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MateRole;
     use super::*;
 
-    fn make_read(qname: &str, has_mate: bool, alignment_start: u32) -> PreparedRead {
+    fn make_read(qname: &str, mate_role: MateRole, alignment_start: u32) -> PreparedRead {
         PreparedRead {
             chrom_id: 0,
             alignment_start,
@@ -431,8 +432,7 @@ mod tests {
             mq_log_err: -3.0,
             is_reverse_strand: false,
             qname: Arc::from(qname),
-            is_first_mate: true,
-            has_mate,
+            mate_role,
             adaptor_boundary: None,
         }
     }
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn solo_read_allocates_slot_and_does_not_register_qname() {
         let mut a = SlotAllocator::new();
-        let read = make_read("solo", false, 100);
+        let read = make_read("solo", MateRole::Solo, 100);
         let (slot, mate_id) = a.allocate_for_read(&read).expect("solo allocates");
         assert_eq!(slot, 0);
         assert_eq!(mate_id, None);
@@ -450,11 +450,11 @@ mod tests {
     #[test]
     fn first_mate_registers_then_second_mate_reuses_slot() {
         let mut a = SlotAllocator::new();
-        let m1 = make_read("pair1", true, 100);
+        let m1 = make_read("pair1", MateRole::FirstOfPair, 100);
         let (slot1, mate_id1) = a.allocate_for_read(&m1).expect("first mate");
         a.register_first_mate_read_id(&m1.qname, 42);
 
-        let m2 = make_read("pair1", true, 200);
+        let m2 = make_read("pair1", MateRole::FirstOfPair, 200);
         let (slot2, mate_id2) = a.allocate_for_read(&m2).expect("second mate");
         assert_eq!(slot1, slot2, "mates must share a slot");
         assert_eq!(mate_id1, None, "first mate has no partner registered yet");
@@ -468,9 +468,9 @@ mod tests {
     #[test]
     fn slot_releases_only_after_both_mates_exit() {
         let mut a = SlotAllocator::new();
-        let m1 = make_read("p", true, 100);
+        let m1 = make_read("p", MateRole::FirstOfPair, 100);
         let (slot, _) = a.allocate_for_read(&m1).unwrap();
-        let m2 = make_read("p", true, 200);
+        let m2 = make_read("p", MateRole::FirstOfPair, 200);
         a.allocate_for_read(&m2).unwrap();
 
         a.release_slot(slot, 0, 100).unwrap();
@@ -491,7 +491,7 @@ mod tests {
         // release, drain again — only then do we see the expired
         // mark unsuppressed.
         let mut a = SlotAllocator::new();
-        let read = make_read("solo", false, 100);
+        let read = make_read("solo", MateRole::Solo, 100);
         let (slot, _) = a.allocate_for_read(&read).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
@@ -516,7 +516,7 @@ mod tests {
         // (the consumer applies new before expired and ends up
         // with no net alive change).
         let mut a = SlotAllocator::new();
-        let r = make_read("transient", false, 100);
+        let r = make_read("transient", MateRole::Solo, 100);
         let (slot, _) = a.allocate_for_read(&r).unwrap();
         a.release_slot(slot, 0, 100).unwrap();
         let (new, expired) = a.drain_lifecycle_marks();
@@ -539,10 +539,10 @@ mod tests {
         // `pending_free`; only `drain_lifecycle_marks` migrates
         // them to `free`. So r2 here gets a fresh id.
         let mut a = SlotAllocator::new();
-        let r1 = make_read("r1", false, 100);
+        let r1 = make_read("r1", MateRole::Solo, 100);
         let (s1, _) = a.allocate_for_read(&r1).unwrap();
         a.release_slot(s1, 0, 100).unwrap();
-        let r2 = make_read("r2", false, 100);
+        let r2 = make_read("r2", MateRole::Solo, 100);
         let (s2, _) = a.allocate_for_read(&r2).unwrap();
         assert_ne!(
             s1, s2,
@@ -553,7 +553,7 @@ mod tests {
         let _ = a.drain_lifecycle_marks();
         a.release_slot(s2, 0, 100).unwrap();
         let _ = a.drain_lifecycle_marks();
-        let r3 = make_read("r3", false, 100);
+        let r3 = make_read("r3", MateRole::Solo, 100);
         let (s3, _) = a.allocate_for_read(&r3).unwrap();
         assert!(
             s3 == s1 || s3 == s2,
@@ -564,9 +564,9 @@ mod tests {
     #[test]
     fn lowest_free_slot_is_reused_first() {
         let mut a = SlotAllocator::new();
-        let r0 = make_read("a", false, 100);
-        let r1 = make_read("b", false, 100);
-        let r2 = make_read("c", false, 100);
+        let r0 = make_read("a", MateRole::Solo, 100);
+        let r1 = make_read("b", MateRole::Solo, 100);
+        let r2 = make_read("c", MateRole::Solo, 100);
         let (s0, _) = a.allocate_for_read(&r0).unwrap();
         let (s1, _) = a.allocate_for_read(&r1).unwrap();
         let (s2, _) = a.allocate_for_read(&r2).unwrap();
@@ -575,7 +575,7 @@ mod tests {
         let _ = a.drain_lifecycle_marks();
         // releasing slot 1 puts it in the free pool; the next
         // allocation should reuse it (smallest free id).
-        let r3 = make_read("d", false, 100);
+        let r3 = make_read("d", MateRole::Solo, 100);
         let (s3, _) = a.allocate_for_read(&r3).unwrap();
         assert_eq!(s3, 1);
     }
@@ -585,10 +585,10 @@ mod tests {
         let mut a = SlotAllocator::new();
         // Fill all slots; we don't release anything.
         for i in 0..DEFAULT_MAX_ACTIVE_SLOTS {
-            let r = make_read(&format!("r{i}"), false, 100);
+            let r = make_read(&format!("r{i}"), MateRole::Solo, 100);
             a.allocate_for_read(&r).expect("under cap");
         }
-        let r = make_read("overflow", false, 100);
+        let r = make_read("overflow", MateRole::Solo, 100);
         let err = a.allocate_for_read(&r).expect_err("must hit cap");
         assert!(
             matches!(err, WalkerError::SlotExhausted { .. }),
@@ -599,14 +599,14 @@ mod tests {
     #[test]
     fn stale_pending_mates_are_evicted_after_window() {
         let mut a = SlotAllocator::new();
-        let m1 = make_read("orphan", true, 100);
+        let m1 = make_read("orphan", MateRole::FirstOfPair, 100);
         let _ = a.allocate_for_read(&m1).unwrap();
         assert_eq!(a.pending_mates.len(), 1);
 
         // Bring the walker far past the lookup window.
         let r2 = make_read(
             "later",
-            false,
+            MateRole::Solo,
             100 + super::super::DEFAULT_MATE_LOOKUP_WINDOW + 1,
         );
         a.allocate_for_read(&r2).unwrap();
@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn reset_clears_state_but_preserves_counters() {
         let mut a = SlotAllocator::new();
-        let r = make_read("x", false, 100);
+        let r = make_read("x", MateRole::Solo, 100);
         a.allocate_for_read(&r).unwrap();
         let allocs_before = a.counters().slot_allocations;
         a.reset();
@@ -638,7 +638,7 @@ mod tests {
         let mut a = SlotAllocator::new();
         let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_SLOTS);
         for i in 0..(threshold - 1) {
-            let r = make_read(&format!("r{i}"), false, 100);
+            let r = make_read(&format!("r{i}"), MateRole::Solo, 100);
             a.allocate_for_read(&r).expect("under threshold");
         }
         assert!(
@@ -649,14 +649,14 @@ mod tests {
         // The next allocation lifts active_count to the threshold;
         // the flag flips and the eprintln has fired (side effect
         // not captured here — the flag is the test surface).
-        let r = make_read("threshold", false, 100);
+        let r = make_read("threshold", MateRole::Solo, 100);
         a.allocate_for_read(&r).expect("at threshold");
         assert!(a.high_water_warned, "must fire on reaching threshold");
 
         // Subsequent allocations must not re-fire. The flag stays
         // set; we'd otherwise spam stderr per allocation in deep
         // regions.
-        let r = make_read("post-threshold", false, 100);
+        let r = make_read("post-threshold", MateRole::Solo, 100);
         a.allocate_for_read(&r).expect("past threshold");
         assert!(a.high_water_warned, "must remain set (one-shot)");
     }
@@ -670,7 +670,7 @@ mod tests {
         let mut a = SlotAllocator::new();
         let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_SLOTS);
         for i in 0..threshold {
-            let r = make_read(&format!("r{i}"), false, 100);
+            let r = make_read(&format!("r{i}"), MateRole::Solo, 100);
             a.allocate_for_read(&r).unwrap();
         }
         assert!(a.high_water_warned);
@@ -723,7 +723,7 @@ mod tests {
         // collapses 2 → 1 → 0 in this single sequence and the
         // expired mark fires on the second call.
         let mut a = SlotAllocator::new();
-        let m1 = make_read("orphan", true, 100);
+        let m1 = make_read("orphan", MateRole::FirstOfPair, 100);
         let (slot, _) = a.allocate_for_read(&m1).unwrap();
         let (new, _) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
@@ -751,7 +751,7 @@ mod tests {
         // step is a no-op and the read's own release alone emits
         // expired (refcount 1 → 0).
         let mut a = SlotAllocator::new();
-        let solo = make_read("solo", false, 100);
+        let solo = make_read("solo", MateRole::Solo, 100);
         let (slot, _) = a.allocate_for_read(&solo).unwrap();
 
         a.release_pending_partner_ref_if_present(&solo.qname, 0, 100)
@@ -774,8 +774,8 @@ mod tests {
         // and finds nothing to do — both mates' release_slot calls then
         // collapse the slot 2 → 1 → 0 normally.
         let mut a = SlotAllocator::new();
-        let m1 = make_read("p", true, 100);
-        let m2 = make_read("p", true, 200);
+        let m1 = make_read("p", MateRole::FirstOfPair, 100);
+        let m2 = make_read("p", MateRole::FirstOfPair, 200);
         let (slot, _) = a.allocate_for_read(&m1).unwrap();
         let _ = a.allocate_for_read(&m2).unwrap();
         assert!(

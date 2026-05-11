@@ -721,8 +721,7 @@ mod tests {
             mq_log_err: -3.0,
             is_reverse_strand: false,
             qname: Arc::from("r"),
-            is_first_mate: true,
-            has_mate: false,
+            mate_role: super::super::MateRole::Solo,
             adaptor_boundary: None,
         }
     }

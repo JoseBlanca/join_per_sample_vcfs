@@ -250,8 +250,7 @@ mod tests {
             mq_log_err: -3.0,
             is_reverse_strand: false,
             qname: Arc::from(qname),
-            is_first_mate: true,
-            has_mate: false,
+            mate_role: super::super::MateRole::Solo,
             adaptor_boundary: None,
         }
     }
@@ -263,8 +262,11 @@ mod tests {
         span: u32,
     ) -> PreparedRead {
         let mut r = solo_read(qname, 0, alignment_start, span);
-        r.has_mate = true;
-        r.is_first_mate = is_first_mate;
+        r.mate_role = if is_first_mate {
+            super::super::MateRole::FirstOfPair
+        } else {
+            super::super::MateRole::SecondOfPair
+        };
         r
     }
 

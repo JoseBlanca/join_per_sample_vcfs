@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use merge_per_sample_vcfs::per_sample_caller::pileup::{
-    CigarOp, PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig, run,
+    CigarOp, MateRole, PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig, run,
 };
 
 struct ConstFasta {
@@ -94,8 +94,7 @@ fn build_reads(read_len: u32, span: u32, coverage: u32) -> Vec<PreparedRead> {
             mq_log_err: -3.0,
             is_reverse_strand: false,
             qname: Arc::from(format!("r{i}").as_str()),
-            is_first_mate: true,
-            has_mate: false,
+            mate_role: MateRole::Solo,
             adaptor_boundary: None,
         });
     }

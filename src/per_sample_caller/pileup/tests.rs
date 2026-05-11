@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use super::CigarOp;
+use super::MateRole;
 use super::PreparedRead;
 use super::RefBaseFetcher;
 use super::WalkerConfig;
@@ -90,8 +91,7 @@ pub fn snp_read(qname: &str, alignment_start: u32, seq: &[u8], qual: &[u8]) -> P
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from(qname),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     }
 }
@@ -104,11 +104,9 @@ pub fn paired_snp_reads(
     qual: &[u8],
 ) -> (PreparedRead, PreparedRead) {
     let mut a = snp_read(qname, alignment_start_a, seq, qual);
-    a.has_mate = true;
-    a.is_first_mate = true;
+    a.mate_role = MateRole::FirstOfPair;
     let mut b = snp_read(qname, alignment_start_b, seq, qual);
-    b.has_mate = true;
-    b.is_first_mate = false;
+    b.mate_role = MateRole::SecondOfPair;
     (a, b)
 }
 
@@ -212,8 +210,7 @@ fn deletion_record_has_extended_ref_span() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("r1"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let records = drive_walker(vec![r], fa);
@@ -255,8 +252,7 @@ fn deletion_record_does_not_double_count_ref_reads() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("r1"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let r2 = PreparedRead {
@@ -269,8 +265,7 @@ fn deletion_record_does_not_double_count_ref_reads() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("r2"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let records = drive_walker(vec![r1, r2], fa);
@@ -309,8 +304,7 @@ fn insertion_record_has_alt_longer_than_ref() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("r1"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let records = drive_walker(vec![r], fa);
@@ -393,11 +387,12 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
     // SAME alignment_start and the SAME BAQ-capped BQ. Distinguish
     // them by mq_log_err so the kept-mate's contribution to q_sum
     // is identifiable. Per spec §"Tie-breaking and disagreement":
-    // BQ tie → prefer mate 1 (the read with `is_first_mate`).
+    // BQ tie → prefer mate 1 (the read whose `mate_role` is
+    // `FirstOfPair`).
     //
     // The previous tie-break used `alignment_start` and dropped
     // contributor `b` arbitrarily on equal starts, so the
-    // is_first_mate flag was ignored.
+    // first-of-pair distinction was ignored.
     let fa = MockFasta::new("ACG");
     let m_first = PreparedRead {
         chrom_id: 0,
@@ -409,8 +404,7 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
         mq_log_err: -2.0, // distinct mq_log_err for the kept mate
         is_reverse_strand: false,
         qname: Arc::from("p"),
-        is_first_mate: true,
-        has_mate: true,
+        mate_role: MateRole::FirstOfPair,
         adaptor_boundary: None,
     };
     let m_second = PreparedRead {
@@ -423,14 +417,13 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
         mq_log_err: -10.0, // distinct mq_log_err for the loser
         is_reverse_strand: false,
         qname: Arc::from("p"),
-        is_first_mate: false,
-        has_mate: true,
+        mate_role: MateRole::SecondOfPair,
         adaptor_boundary: None,
     };
     // First-mate appears AFTER the second mate in the input stream,
     // even though both have alignment_start = 1, to make sure the
-    // tie-break is decided by is_first_mate rather than by stream
-    // order or alignment_start.
+    // tie-break is decided by `MateRole::FirstOfPair` rather than
+    // by stream order or alignment_start.
     let records = drive_walker(vec![m_second, m_first], fa);
     let rec = &records[0];
     assert_eq!(rec.alleles[0].scalars.num_obs, 2);
@@ -496,8 +489,11 @@ fn mate_overlap_agree_keeper_carries_summed_bq() {
         mq_log_err: -100.0,
         is_reverse_strand: false,
         qname: Arc::from("p"),
-        is_first_mate: is_first,
-        has_mate: true,
+        mate_role: if is_first {
+            MateRole::FirstOfPair
+        } else {
+            MateRole::SecondOfPair
+        },
         adaptor_boundary: None,
     };
     let m1 = make(true, 20);
@@ -533,8 +529,11 @@ fn mate_overlap_agree_combined_bq_caps_at_200() {
         mq_log_err: -100.0,
         is_reverse_strand: false,
         qname: Arc::from("p"),
-        is_first_mate: is_first,
-        has_mate: true,
+        mate_role: if is_first {
+            MateRole::FirstOfPair
+        } else {
+            MateRole::SecondOfPair
+        },
         adaptor_boundary: None,
     };
     let m1 = make(true, 150);
@@ -565,8 +564,11 @@ fn mate_overlap_disagree_winner_bq_scaled_by_0_8() {
         mq_log_err: -100.0,
         is_reverse_strand: false,
         qname: Arc::from("p"),
-        is_first_mate: is_first,
-        has_mate: true,
+        mate_role: if is_first {
+            MateRole::FirstOfPair
+        } else {
+            MateRole::SecondOfPair
+        },
         adaptor_boundary: None,
     };
     // Mate 1 has REF "A" with higher BQ → winner. Mate 2 has SNP
@@ -647,12 +649,11 @@ fn paired_mate_indel_overlap_yields_single_observation() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("p"),
-        is_first_mate: true,
-        has_mate: true,
+        mate_role: MateRole::FirstOfPair,
         adaptor_boundary: None,
     };
     let mut mate_b = mate_a.clone();
-    mate_b.is_first_mate = false;
+    mate_b.mate_role = MateRole::SecondOfPair;
     mate_b.bq_baq = vec![20; 8]; // lower BQ → loser
 
     let records = drive_walker(vec![mate_a, mate_b], fa);
@@ -779,7 +780,7 @@ fn lifecycle_markers_appear_on_emitted_records() {
 fn orphan_first_mate_emits_balanced_lifecycle_marks() {
     // A paired read whose mate never arrives (the second mate is filtered out
     // upstream, lost, or simply absent for this molecule). The first mate is
-    // admitted with `has_mate=true`, so the slot allocator pre-bumps its
+    // admitted with a paired `mate_role`, so the slot allocator pre-bumps its
     // refcount to 2 anticipating the partner. When the chromosome flushes,
     // the partner ref must be released too — otherwise the orphan's slot
     // surfaces in `new_chains` but never in `expired_chains`, leaving the
@@ -788,8 +789,7 @@ fn orphan_first_mate_emits_balanced_lifecycle_marks() {
     // Regression for finding M1 in `ia/reviews/pileup_2026-05-09.md`.
     let fa = MockFasta::new("ACG");
     let mut r = snp_read("orphan", 1, b"ACG", &[30; 3]);
-    r.has_mate = true;
-    r.is_first_mate = true;
+    r.mate_role = MateRole::FirstOfPair;
     let records = drive_walker(vec![r], fa);
     let total_new: usize = records.iter().map(|r| r.new_chains.len()).sum();
     let total_expired: usize = records.iter().map(|r| r.expired_chains.len()).sum();
@@ -919,8 +919,7 @@ fn column_depth_cap_uses_indel_cap_when_any_indel_event_present() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("indel"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     reads.push(indel);
@@ -980,13 +979,11 @@ fn g1_walker_drops_match_observations_past_adaptor_boundary() {
     let fa = MockFasta::new("ACGTACGT");
     let mut r_fwd = snp_read("pair", 1, b"ACGTACGT", &[30; 8]);
     r_fwd.is_reverse_strand = false;
-    r_fwd.has_mate = true;
-    r_fwd.is_first_mate = true;
+    r_fwd.mate_role = MateRole::FirstOfPair;
     r_fwd.adaptor_boundary = Some(5);
     let mut r_rev = snp_read("pair", 1, b"ACGTACGT", &[30; 8]);
     r_rev.is_reverse_strand = true;
-    r_rev.has_mate = true;
-    r_rev.is_first_mate = false;
+    r_rev.mate_role = MateRole::SecondOfPair;
     r_rev.adaptor_boundary = Some(4);
 
     let records = drive_walker(vec![r_fwd, r_rev], fa);
@@ -1047,8 +1044,7 @@ fn zero_ref_span_input_is_a_hard_error() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("zero"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let (tx, _rx) = mpsc::sync_channel(64);
@@ -1079,8 +1075,7 @@ fn open_record_widening_past_max_record_span_errors() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("wide"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let (tx, rx) = mpsc::sync_channel(64);
@@ -1117,8 +1112,7 @@ fn admit_rejects_seq_shorter_than_cigar_consumes() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("short"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let (tx, _rx) = mpsc::sync_channel(64);
@@ -1148,8 +1142,7 @@ fn admit_rejects_seq_bq_length_mismatch() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("bq_short"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let (tx, _rx) = mpsc::sync_channel(64);
@@ -1182,8 +1175,7 @@ fn admit_rejects_cigar_consuming_more_read_bases_than_seq_provides() {
         mq_log_err: -3.0,
         is_reverse_strand: false,
         qname: Arc::from("cigar_long"),
-        is_first_mate: true,
-        has_mate: false,
+        mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
     let (tx, _rx) = mpsc::sync_channel(64);

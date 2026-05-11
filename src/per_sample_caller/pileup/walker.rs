@@ -326,7 +326,7 @@ impl WalkerState {
                 mq_log_err: active.read.mq_log_err,
                 is_reverse_strand: active.read.is_reverse_strand,
                 alignment_start: active.read.alignment_start,
-                is_first_mate: active.read.is_first_mate,
+                mate_role: active.read.mate_role,
                 bq_zero_in_window: false,
                 bq_override_at_walker_pos: None,
             });
@@ -568,7 +568,7 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
                     // Indel on either side at this walker_pos:
                     // collapse to a single observation by removing
                     // the loser entirely. Tie-break: BQ first,
-                    // then is_first_mate, then alignment_start.
+                    // then first-of-pair, then alignment_start.
                     let loser_idx = pick_overlap_loser(contributors, a, b);
                     to_remove.push(loser_idx);
                 } else {
@@ -638,7 +638,7 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
 }
 
 /// Loser-selection for the indel-overlap case. BQ first, then
-/// `is_first_mate`, then `alignment_start`. Matches the pre-S7
+/// first-of-pair, then `alignment_start`. Matches the pre-S7
 /// semantics (which combined match-only and indel paths behind
 /// the same loser-selection).
 fn pick_overlap_loser(contributors: &[ReadContribution], a: usize, b: usize) -> usize {
@@ -648,8 +648,8 @@ fn pick_overlap_loser(contributors: &[ReadContribution], a: usize, b: usize) -> 
         std::cmp::Ordering::Less => a,
         std::cmp::Ordering::Greater => b,
         std::cmp::Ordering::Equal => {
-            let a_first = contributors[a].is_first_mate;
-            let b_first = contributors[b].is_first_mate;
+            let a_first = contributors[a].mate_role.is_first_of_pair();
+            let b_first = contributors[b].mate_role.is_first_of_pair();
             match (a_first, b_first) {
                 (true, false) => b,
                 (false, true) => a,
@@ -669,10 +669,10 @@ fn pick_overlap_loser(contributors: &[ReadContribution], a: usize, b: usize) -> 
 /// statistically irrelevant — the surviving side carries the
 /// summed BQ regardless — but must be deterministic. samtools
 /// uses a qname hash; we mirror our existing tie-break logic
-/// (`is_first_mate`, then `alignment_start`).
+/// (first-of-pair, then `alignment_start`).
 fn pick_agree_keeper(contributors: &[ReadContribution], a: usize, b: usize) -> usize {
-    let a_first = contributors[a].is_first_mate;
-    let b_first = contributors[b].is_first_mate;
+    let a_first = contributors[a].mate_role.is_first_of_pair();
+    let b_first = contributors[b].mate_role.is_first_of_pair();
     match (a_first, b_first) {
         (true, false) => a,
         (false, true) => b,
@@ -687,7 +687,7 @@ fn pick_agree_keeper(contributors: &[ReadContribution], a: usize, b: usize) -> u
 }
 
 /// Winner-selection for the disagree case (S7): higher BQ wins;
-/// ties fall back to `is_first_mate`, then `alignment_start`
+/// ties fall back to first-of-pair, then `alignment_start`
 /// (samtools uses a qname hash on ties).
 fn pick_disagree_winner(contributors: &[ReadContribution], a: usize, b: usize) -> usize {
     let bq_a = contributors[a].bq_baq_at_walker_pos;
@@ -785,7 +785,11 @@ mod tests {
             mq_log_err: -3.0,
             is_reverse_strand: false,
             alignment_start,
-            is_first_mate,
+            mate_role: if is_first_mate {
+                super::super::MateRole::FirstOfPair
+            } else {
+                super::super::MateRole::SecondOfPair
+            },
             bq_zero_in_window: false,
             bq_override_at_walker_pos: None,
         }
@@ -819,10 +823,10 @@ mod tests {
     // --- M19: pick_* tertiary tie-break tests --------------------
     //
     // All three pick functions fall through to comparing
-    // `alignment_start` when both `is_first_mate` are equal. A
-    // flipped comparison here would silently change tie-break
-    // determinism — exactly the kind of bug that surfaces as
-    // "different VCF on the same input".
+    // `alignment_start` when both contributors' first-of-pair bits
+    // agree. A flipped comparison here would silently change
+    // tie-break determinism — exactly the kind of bug that surfaces
+    // as "different VCF on the same input".
 
     #[test]
     fn pick_agree_keeper_breaks_remaining_tie_by_earlier_alignment_start() {

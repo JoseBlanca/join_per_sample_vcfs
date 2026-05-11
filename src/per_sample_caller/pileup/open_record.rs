@@ -913,10 +913,13 @@ pub(super) struct ReadContribution {
     pub mq_log_err: f64,
     pub is_reverse_strand: bool,
     pub alignment_start: u32,
-    /// SAM flag `0x40`. The deterministic tie-breaker on
-    /// equal-BQ mate-overlap positions per the spec; not a faithful
-    /// proxy for "earlier alignment_start".
-    pub is_first_mate: bool,
+    /// SAM-flag-derived mate role. Carries through from
+    /// [`PreparedRead::mate_role`]; only
+    /// [`MateRole::is_first_of_pair`] is read by the tie-break
+    /// helpers (a deterministic tertiary key on equal-BQ
+    /// mate-overlap positions per the spec — not a faithful proxy
+    /// for "earlier alignment_start").
+    pub mate_role: super::MateRole,
     /// Set by `resolve_mate_overlap_at_pos` when this contributor
     /// is the loser of a Match-only mate-overlap. The fold zeroes
     /// the BQ on every event it pulls from this contributor's

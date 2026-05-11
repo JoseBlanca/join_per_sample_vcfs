@@ -151,6 +151,47 @@ impl Default for WalkerConfig {
 }
 
 // ---------------------------------------------------------------------
+// MateRole
+// ---------------------------------------------------------------------
+
+/// SAM-flag-derived mate role for a [`PreparedRead`]. Collapses the
+/// SAM `0x1` (paired) and `0x40` (first segment) bits into a single
+/// field so combinations the walker never wants to see — notably
+/// "solo + first-of-pair" — cannot be constructed.
+///
+/// "First" / "Second" here is the SAM-flag sense (which segment of
+/// the template the read came from), not the walker arrival-order
+/// sense — under coordinate-sorted input the second-of-pair can be
+/// the first to reach the walker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MateRole {
+    /// SAM flag `0x1` unset. Treated as solo by the walker and never
+    /// registered in `pending_mates`.
+    Solo,
+    /// SAM flag `0x1` set, flag `0x40` set — first segment in the
+    /// template.
+    FirstOfPair,
+    /// SAM flag `0x1` set, flag `0x40` unset — last segment in the
+    /// template.
+    SecondOfPair,
+}
+
+impl MateRole {
+    /// True for both `FirstOfPair` and `SecondOfPair` — i.e. SAM
+    /// flag `0x1` is set.
+    pub fn is_paired(self) -> bool {
+        !matches!(self, MateRole::Solo)
+    }
+
+    /// True only for `FirstOfPair`. Used by mate-overlap tie-breaks
+    /// on equal-BQ positions; on `Solo` and `SecondOfPair` it is
+    /// false.
+    pub fn is_first_of_pair(self) -> bool {
+        matches!(self, MateRole::FirstOfPair)
+    }
+}
+
+// ---------------------------------------------------------------------
 // PreparedRead
 // ---------------------------------------------------------------------
 
@@ -194,12 +235,15 @@ pub struct PreparedRead {
     pub mq_log_err: f64,
     pub is_reverse_strand: bool,
     pub qname: Arc<str>,
-    /// SAM flag `0x40`. Used as the deterministic tie-breaker on
-    /// equal-BQ mate-overlap positions.
-    pub is_first_mate: bool,
-    /// SAM flag `0x1`. When unset, the read is treated as solo and
-    /// is not registered in `pending_mates`.
-    pub has_mate: bool,
+    /// SAM-flag-derived mate role. Collapses the SAM `0x1` (paired)
+    /// and `0x40` (first segment) bits into one field so the
+    /// previously-unrepresentable "solo + first-of-pair" combination
+    /// is gone at the type level. The walker consults
+    /// [`MateRole::is_paired`] to decide whether to register the
+    /// qname for second-mate lookup and [`MateRole::is_first_of_pair`]
+    /// as the deterministic tie-breaker on equal-BQ mate-overlap
+    /// positions.
+    pub mate_role: MateRole,
     /// 1-based reference position of the first read base that lies
     /// inside the mate-pair adaptor. `None` when the boundary cannot
     /// be reliably computed (single-end, mate unmapped, geometry
