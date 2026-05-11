@@ -113,8 +113,8 @@ The shape of `PileupRecord`:
 |---|---|---|
 | `chrom_id` | `u32` | |
 | `pos` | `u32` | Anchor position, 1-based. Stage 2 deltas these into `delta_pos`. |
-| `new_chains` | `SmallVec<[SlotId; 4]>` | Slot ids that started since the previous emitted position (in any order; Stage 2 may reorder). |
-| `expired_chains` | `SmallVec<[SlotId; 4]>` | Slot ids that ended since the previous emitted position. |
+| `new_chains` | `SmallVec<[SlotId; 4]>` | Slot ids that started since the previous **closure step** (not the previous record). When a closure step emits multiple records, the marks attach to the first record of that batch; the trailing records carry empty `new_chains`. See §"Stamping records". Any order; Stage 2 may reorder. |
+| `expired_chains` | `SmallVec<[SlotId; 4]>` | Slot ids that ended since the previous closure step. Same first-record-of-batch attachment as `new_chains`. |
 | `alleles` | `Vec<AlleleObservation>` | At least one entry; `alleles[0]` is always REF. |
 
 Each `AlleleObservation`:
@@ -294,7 +294,11 @@ anchor position. The shape of `OpenPileupRecord`:
 | `pos` | `u32` | Anchor position. Redundant with the map key, kept for ergonomics. |
 | `ref_seq` | `SmallVec<[u8; 8]>` | The reference bases over `[pos, pos + ref_seq.len())`, taken from the FASTA on first open and re-fetched / re-checked when the span widens. The current REF-span is `ref_seq.len()` — no separate `ref_span` field is stored. |
 | `alleles` | `SmallVec<[OpenAllele; 4]>` | One entry per distinct allele. `alleles[0]` is always REF (`seq == ref_seq`). |
-| `new_chain_emit` | `SmallVec<[SlotId; 4]>` | Slots that started since the previous emitted record (filled by the slot allocator, drained on emission). |
+
+(Lifecycle marks are not stored on the open record. They live on
+the slot allocator's `new_marks` / `expired_marks` buffers and are
+drained per closure step into the emitted `PileupRecord`. See
+§"Stamping records".)
 
 `OpenAllele`:
 
@@ -743,8 +747,10 @@ A few subtleties:
   sufficient (and why `MAX_RECORD_SPAN` is not the closure
   trigger). The conversion is mechanical: open alleles become
   `AlleleObservation`s; `chain_slots` are sorted and deduped;
-  `new_chain_emit` and the slot allocator's `expired_chain_emit`
-  populate the record's `new_chains` / `expired_chains`. Each
+  the slot allocator's accumulated `new_marks` / `expired_marks`
+  are drained once for the whole closure batch and stamped onto
+  the **first record of the batch** (trailing records carry empty
+  lifecycle lists). Each
   `tx.send` may block if Stage 2 has fallen behind and the
   channel buffer is full — that's the intended backpressure.
 

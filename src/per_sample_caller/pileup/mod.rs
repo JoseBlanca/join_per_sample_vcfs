@@ -329,10 +329,27 @@ pub struct AlleleObservation {
 /// REF — the walker invariant — so `ref_span` is derivable as
 /// `alleles[0].seq.len()` and is not stored separately.
 ///
-/// `new_chains` and `expired_chains` carry the lifecycle markers
-/// for phase-chain slots: ids that started or ended since the
-/// previous emitted record. Both lists are deduplicated and may be
-/// emitted in any order; Stage 2 may reorder them.
+/// # Lifecycle markers (`new_chains`, `expired_chains`)
+///
+/// Carry the phase-chain slot ids that started or ended since the
+/// previous **closure step** (not the previous record). A closure
+/// step is one walker tick during which records whose footprint is
+/// fully behind the walker are drained and emitted; it may emit 0,
+/// 1, or many records. When a step emits more than one — common
+/// when a wide deletion at an earlier anchor unblocks several
+/// narrower records that were waiting behind it — the whole batch
+/// of marks is attached to the **first emitted record of that
+/// step**, and the trailing records carry empty `new_chains` and
+/// `expired_chains`. This is sufficient because Stage 2 applies
+/// the marks before reading each record's allele observations:
+/// processing records in order with the running rule
+/// `current ∪= rec.new_chains; current -= rec.expired_chains`
+/// gives the right `current` set at every record, whether the
+/// marks landed on this record or on an earlier one in the same
+/// batch.
+///
+/// Both lists are deduplicated and may appear in any order; Stage
+/// 2 may reorder them.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PileupRecord {
