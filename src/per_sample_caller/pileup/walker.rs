@@ -58,7 +58,7 @@ where
             if peek.chrom_id < prev_chrom_id {
                 let prev_pos = state
                     .last_admitted_locus
-                    .map(|(_, pos)| pos)
+                    .map(|l| l.pos)
                     .unwrap_or(state.walker_pos);
                 return Err(WalkerError::OutOfOrder {
                     qname: peek.qname.to_string(),
@@ -153,6 +153,17 @@ impl RunSummary {
     }
 }
 
+/// A genomic locus: a position on a specific chromosome. The
+/// `Ord` derive gives lexicographic ordering — chromosomes
+/// compared first, position within a chromosome second — which is
+/// exactly the walker's coordinate-sort invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Locus {
+    chrom_id: u32,
+    /// 1-based reference position.
+    pos: u32,
+}
+
 struct WalkerState {
     chrom_id: u32,
     walker_pos: u32,
@@ -161,9 +172,8 @@ struct WalkerState {
     /// flush-on-chromosome-change logic knows whether to flush
     /// before re-anchoring.
     last_admitted_chrom_id: Option<u32>,
-    /// Last admitted (chrom_id, alignment_start) for the order
-    /// invariant.
-    last_admitted_locus: Option<(u32, u32)>,
+    /// Last admitted locus for the coordinate-order invariant.
+    last_admitted_locus: Option<Locus>,
     active_reads: ActiveReads,
     slots: SlotAllocator,
     open: OpenPileupRecordTable,
@@ -215,16 +225,19 @@ impl WalkerState {
 
     fn admit_read(&mut self, read: PreparedRead) -> Result<(), WalkerError> {
         // Order-invariant check.
-        let here = (read.chrom_id, read.alignment_start);
+        let here = Locus {
+            chrom_id: read.chrom_id,
+            pos: read.alignment_start,
+        };
         if let Some(prev) = self.last_admitted_locus
             && here < prev
         {
             return Err(WalkerError::OutOfOrder {
                 qname: read.qname.to_string(),
-                prev_chrom_id: prev.0,
-                prev_pos: prev.1,
-                chrom_id: here.0,
-                pos: here.1,
+                prev_chrom_id: prev.chrom_id,
+                prev_pos: prev.pos,
+                chrom_id: here.chrom_id,
+                pos: here.pos,
             });
         }
         // Zero-ref-span check.
