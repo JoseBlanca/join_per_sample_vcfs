@@ -25,6 +25,14 @@
   - `wildcard_enum_match_arm = "deny"` — pairs with exhaustive matching.
   - `fn_params_excessive_bools = "deny"` — pairs with the boolean-parameters smell.
   - `must_use_candidate = "warn"` — surfaces missing `#[must_use]` annotations.
+  - `needless_bool = "warn"` — flags `if x { true } else { false }` and similar; near-zero false positives.
+  - `match_same_arms = "warn"` — pairs with the *duplicated logic* smell; surfaces match arms with identical bodies that should be merged.
 
   Per-call-site suppression with `#[allow(...)]` requires the justification comment already mandated under code smells.
+
+- **Escalating beyond the curated baseline (optional).** Clippy organizes lints into groups; the curated set above is *additive* over clippy's defaults (which `-D warnings` already enforces). Two further escalation paths exist, each with trade-offs:
+  - `clippy::pedantic` and `clippy::nursery` as `warn` (never `deny`) — surfaces additional style and emerging-pattern lints. Useful on libraries and critical-path code, noisy elsewhere. Expect a non-trivial number of per-site `#[allow(...)]` (with the usual justification comment) on first adoption.
+  - `clippy::restriction` is *not* a group to enable wholesale — its lints are mutually contradictory and project-specific. Pick individual lints from it (e.g. the `unwrap_used` / `expect_used` / `panic` already in the curated set) rather than enabling the group.
+
+  Each lint added to the curated set is a maintenance commitment: clippy renames and deprecates lints across versions. Prefer a short, principle-aligned list over a long inventory.
 - **Publishable metadata.** Crates intended for publication declare `license`, `repository`, `description`, `categories`, `keywords`. `cargo deny check licenses` enforces the allowed-license list across transitive deps.
