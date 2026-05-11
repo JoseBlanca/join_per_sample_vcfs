@@ -18,7 +18,7 @@ use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::slot_allocator::SlotId;
 use super::{
-    AlleleObservation, DEFAULT_MAX_RECORD_SPAN, FiveScalars, PileupRecord, RefBaseFetcher,
+    AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, PileupRecord, RefBaseFetcher,
 };
 
 /// Pre-allocated capacity for `OpenAllele::chain_slots` — sized
@@ -40,7 +40,7 @@ const RECORD_FOLDED_READS_INITIAL_CAPACITY: usize = 32;
 #[derive(Debug, Clone)]
 pub(super) struct OpenAllele {
     pub seq: Vec<u8>,
-    pub scalars: FiveScalars,
+    pub support: AlleleSupportStats,
     /// Sorted, deduplicated.
     pub chain_slots: Vec<SlotId>,
 }
@@ -49,7 +49,7 @@ impl OpenAllele {
     fn new(seq: Vec<u8>) -> Self {
         Self {
             seq,
-            scalars: FiveScalars::default(),
+            support: AlleleSupportStats::default(),
             chain_slots: Vec::with_capacity(ALLELE_CHAIN_SLOTS_INITIAL_CAPACITY),
         }
     }
@@ -86,7 +86,7 @@ pub(super) struct OpenPileupRecord {
 #[derive(Debug, Clone, Copy)]
 struct FoldedReadState {
     allele_index: usize,
-    contribution: FiveScalars,
+    contribution: AlleleSupportStats,
 }
 
 impl OpenPileupRecord {
@@ -128,7 +128,7 @@ impl OpenPileupRecord {
             .into_iter()
             .map(|a| AlleleObservation {
                 seq: a.seq,
-                scalars: a.scalars,
+                support: a.support,
                 chain_slots: a.chain_slots,
             })
             .collect();
@@ -727,7 +727,7 @@ pub(super) fn process_position(
             apply_events_to_ref_into(allele_seq_buf, rec_pos, &alleles[0].seq, &window_events);
             let bq = ln_bq_for_read(&window_events, contrib.bq_baq_at_walker_pos);
             let ln_q = bq.max(contrib.mq_log_err);
-            let new_contribution = FiveScalars {
+            let new_contribution = AlleleSupportStats {
                 num_obs: 1,
                 q_sum: ln_q,
                 fwd: u32::from(!contrib.is_reverse_strand),
@@ -741,7 +741,7 @@ pub(super) fn process_position(
             // either changes bucket or stays in the same bucket
             // with a possibly-different ln_q.
             if let Some(prev) = folded_reads.remove(&contrib.read_id) {
-                subtract_contribution(&mut alleles[prev.allele_index].scalars, &prev.contribution);
+                subtract_contribution(&mut alleles[prev.allele_index].support, &prev.contribution);
             }
             // Borrowed lookup; only `clone()` the bytes when adding
             // a genuinely new allele. In SNP/REF steady state every
@@ -754,7 +754,7 @@ pub(super) fn process_position(
                     alleles.len() - 1
                 }
             };
-            add_contribution(&mut alleles[new_index].scalars, &new_contribution);
+            add_contribution(&mut alleles[new_index].support, &new_contribution);
             insert_sorted_unique(&mut alleles[new_index].chain_slots, contrib.chain_slot_id);
             folded_reads.insert(
                 contrib.read_id,
@@ -800,15 +800,15 @@ fn zero_event_bq(ev: &mut ReadEvent) {
     }
 }
 
-fn add_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
-    scalars.num_obs += c.num_obs;
-    scalars.q_sum += c.q_sum;
-    scalars.fwd += c.fwd;
-    scalars.placed_left += c.placed_left;
-    scalars.placed_start += c.placed_start;
+fn add_contribution(support: &mut AlleleSupportStats, c: &AlleleSupportStats) {
+    support.num_obs += c.num_obs;
+    support.q_sum += c.q_sum;
+    support.fwd += c.fwd;
+    support.placed_left += c.placed_left;
+    support.placed_start += c.placed_start;
 }
 
-fn subtract_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
+fn subtract_contribution(support: &mut AlleleSupportStats, c: &AlleleSupportStats) {
     // Saturating-style: an internal-bookkeeping bug that produced
     // a negative would otherwise wrap silently. Saturate to zero
     // in release builds and rely on the upper invariant (num_obs
@@ -821,34 +821,34 @@ fn subtract_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
     // it saturate silently. `q_sum` is signed `f64` and is left
     // as a raw subtract — negatives are legal there by design.
     debug_assert!(
-        scalars.num_obs >= c.num_obs,
+        support.num_obs >= c.num_obs,
         "subtract_contribution underflow on num_obs: {} -= {}",
-        scalars.num_obs,
+        support.num_obs,
         c.num_obs,
     );
     debug_assert!(
-        scalars.fwd >= c.fwd,
+        support.fwd >= c.fwd,
         "subtract_contribution underflow on fwd: {} -= {}",
-        scalars.fwd,
+        support.fwd,
         c.fwd,
     );
     debug_assert!(
-        scalars.placed_left >= c.placed_left,
+        support.placed_left >= c.placed_left,
         "subtract_contribution underflow on placed_left: {} -= {}",
-        scalars.placed_left,
+        support.placed_left,
         c.placed_left,
     );
     debug_assert!(
-        scalars.placed_start >= c.placed_start,
+        support.placed_start >= c.placed_start,
         "subtract_contribution underflow on placed_start: {} -= {}",
-        scalars.placed_start,
+        support.placed_start,
         c.placed_start,
     );
-    scalars.num_obs = scalars.num_obs.saturating_sub(c.num_obs);
-    scalars.q_sum -= c.q_sum;
-    scalars.fwd = scalars.fwd.saturating_sub(c.fwd);
-    scalars.placed_left = scalars.placed_left.saturating_sub(c.placed_left);
-    scalars.placed_start = scalars.placed_start.saturating_sub(c.placed_start);
+    support.num_obs = support.num_obs.saturating_sub(c.num_obs);
+    support.q_sum -= c.q_sum;
+    support.fwd = support.fwd.saturating_sub(c.fwd);
+    support.placed_left = support.placed_left.saturating_sub(c.placed_left);
+    support.placed_start = support.placed_start.saturating_sub(c.placed_start);
 }
 
 /// Per-read BQ for an allele's quality contribution: min over
@@ -978,7 +978,7 @@ mod tests {
         assert_eq!(rec.pos, 1);
         assert_eq!(rec.alleles.len(), 1);
         assert_eq!(rec.alleles[0].seq, b"A");
-        assert_eq!(rec.alleles[0].scalars.num_obs, 0);
+        assert_eq!(rec.alleles[0].support.num_obs, 0);
     }
 
     #[test]
@@ -1144,10 +1144,10 @@ mod tests {
     fn find_or_create_allele_returns_same_bucket_on_match() {
         let mut rec = OpenPileupRecord::new(0, 100, b"ACG".to_vec());
         let idx1 = find_or_create_allele_index(&mut rec.alleles, b"ACT".to_vec());
-        rec.alleles[idx1].scalars.num_obs = 1;
+        rec.alleles[idx1].support.num_obs = 1;
         let idx2 = find_or_create_allele_index(&mut rec.alleles, b"ACT".to_vec());
         assert_eq!(idx1, idx2);
-        assert_eq!(rec.alleles[idx2].scalars.num_obs, 1);
+        assert_eq!(rec.alleles[idx2].support.num_obs, 1);
         // REF + ACT = 2 buckets total.
         assert_eq!(rec.alleles.len(), 2);
     }
@@ -1225,14 +1225,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "subtract_contribution underflow")]
     fn subtract_contribution_panics_on_underflow_in_debug() {
-        let mut s = FiveScalars {
+        let mut s = AlleleSupportStats {
             num_obs: 1,
             q_sum: 0.0,
             fwd: 1,
             placed_left: 0,
             placed_start: 0,
         };
-        let c = FiveScalars {
+        let c = AlleleSupportStats {
             num_obs: 5,
             q_sum: 0.0,
             fwd: 0,
@@ -1245,14 +1245,14 @@ mod tests {
     #[cfg(not(debug_assertions))]
     #[test]
     fn subtract_contribution_saturates_u32_fields_to_zero_in_release() {
-        let mut s = FiveScalars {
+        let mut s = AlleleSupportStats {
             num_obs: 1,
             q_sum: -1.0,
             fwd: 1,
             placed_left: 0,
             placed_start: 1,
         };
-        let c = FiveScalars {
+        let c = AlleleSupportStats {
             num_obs: 5,
             q_sum: -1.0,
             fwd: 5,
@@ -1274,14 +1274,14 @@ mod tests {
         // The widen path subtracts the prior contribution and adds
         // the new one. When old == new, the bucket must end up
         // unchanged.
-        let mut bucket = FiveScalars {
+        let mut bucket = AlleleSupportStats {
             num_obs: 7,
             q_sum: -3.0,
             fwd: 4,
             placed_left: 2,
             placed_start: 1,
         };
-        let c = FiveScalars {
+        let c = AlleleSupportStats {
             num_obs: 1,
             q_sum: -2.0,
             fwd: 1,

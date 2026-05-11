@@ -301,7 +301,7 @@ anchor position. The shape of `OpenPileupRecord`:
 | Field | Type | Purpose |
 |---|---|---|
 | `seq` | `SmallVec<[u8; 8]>` | Length = `ref_seq.len()` for SNP/MNP/DEL alleles; longer for INS-bearing alleles. |
-| `scalars` | `FiveScalars` | The five running per-allele scalars. |
+| `support` | `AlleleSupportStats` | The five running per-allele support stats. |
 | `chain_slots` | `SmallVec<[SlotId; 4]>` | Sorted, deduplicated. |
 
 `BTreeMap` over `HashMap` because the walker frequently needs to
@@ -962,10 +962,10 @@ If `A` is the chosen open record and `e` is the event:
 
 4. **Locate or create the allele bucket.** Linear scan of
    `A.alleles` for a bucket with matching `seq`; create one if
-   none exists. New allele buckets get `scalars =
-   FiveScalars::zero()` and an empty `chain_slots`.
+   none exists. New allele buckets get `support =
+   AlleleSupportStats::default()` and an empty `chain_slots`.
 
-5. **Update the allele bucket's scalars.** For the
+5. **Update the allele bucket's support stats.** For the
    contributing read `r`:
    ```
    allele.scalars.num_obs       += 1
@@ -1426,7 +1426,7 @@ src/per_sample_caller/
     active_set.rs        — ActiveReads, admission/exit, mate linking
     decompose.rs         — CIGAR → ReadEvent
     anchor.rs            — OpenPileupRecord, OpenAllele, open-record merging + widening
-    five_scalars.rs      — FiveScalars + accumulation
+    allele_support.rs    — AlleleSupportStats + accumulation
     slot_allocator.rs    — SlotAllocator, lifecycle marks
     mate_overlap.rs      — fold-time BQ comparison
     errors.rs            — WalkerError

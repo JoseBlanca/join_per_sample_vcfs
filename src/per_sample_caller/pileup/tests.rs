@@ -170,7 +170,7 @@ fn pure_ref_pileup_emits_one_record_per_position_with_only_ref_allele() {
     for (i, rec) in records.iter().enumerate() {
         assert_eq!(rec.pos, (i + 1) as u32);
         assert_eq!(rec.alleles.len(), 1, "REF only at clean position");
-        assert_eq!(rec.alleles[0].scalars.num_obs, 2);
+        assert_eq!(rec.alleles[0].support.num_obs, 2);
     }
 }
 
@@ -187,10 +187,10 @@ fn snp_at_one_position_emits_record_with_two_alleles() {
     assert_eq!(rec_pos3.alleles.len(), 2, "REF + SNP");
     // First is REF (G), supported by 1 read.
     assert_eq!(rec_pos3.alleles[0].seq, b"G");
-    assert_eq!(rec_pos3.alleles[0].scalars.num_obs, 1);
+    assert_eq!(rec_pos3.alleles[0].support.num_obs, 1);
     // Second is SNP (T), supported by 1 read.
     assert_eq!(rec_pos3.alleles[1].seq, b"T");
-    assert_eq!(rec_pos3.alleles[1].scalars.num_obs, 1);
+    assert_eq!(rec_pos3.alleles[1].support.num_obs, 1);
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn deletion_record_has_extended_ref_span() {
         .iter()
         .find(|a| a.seq.as_slice() == b"A")
         .expect("DEL allele = anchor only");
-    assert_eq!(del.scalars.num_obs, 1);
+    assert_eq!(del.support.num_obs, 1);
 }
 
 #[test]
@@ -276,17 +276,17 @@ fn deletion_record_does_not_double_count_ref_reads() {
     assert_eq!(anchor.ref_span(), 4, "anchor + 3 deleted = 4");
     let ref_allele = &anchor.alleles[0];
     assert_eq!(
-        ref_allele.scalars.num_obs, 1,
+        ref_allele.support.num_obs, 1,
         "REF: 1 obs from r1 only; got {}",
-        ref_allele.scalars.num_obs
+        ref_allele.support.num_obs
     );
-    assert_eq!(ref_allele.scalars.fwd, 1, "REF: forward strand count = 1");
+    assert_eq!(ref_allele.support.fwd, 1, "REF: forward strand count = 1");
     let del = anchor
         .alleles
         .iter()
         .find(|a| a.seq.as_slice() == b"C")
         .expect("DEL allele = anchor base only");
-    assert_eq!(del.scalars.num_obs, 1, "DEL: 1 obs from r2");
+    assert_eq!(del.support.num_obs, 1, "DEL: 1 obs from r2");
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn insertion_record_has_alt_longer_than_ref() {
     assert!(ins.is_some(), "INS allele should be longer than REF");
     let ins = ins.unwrap();
     assert_eq!(ins.seq, b"AXX", "anchor + 2 inserted bases");
-    assert_eq!(ins.scalars.num_obs, 1);
+    assert_eq!(ins.support.num_obs, 1);
 }
 
 #[test]
@@ -329,8 +329,8 @@ fn forward_strand_count_recorded_correctly() {
     r2.is_reverse_strand = true;
     let records = drive_walker(vec![r1, r2], fa);
     let rec = &records[0];
-    assert_eq!(rec.alleles[0].scalars.num_obs, 2);
-    assert_eq!(rec.alleles[0].scalars.fwd, 1);
+    assert_eq!(rec.alleles[0].support.num_obs, 2);
+    assert_eq!(rec.alleles[0].support.fwd, 1);
 }
 
 #[test]
@@ -346,9 +346,9 @@ fn placed_left_and_placed_start_are_per_record() {
     let r2 = snp_read("r2", 3, b"GTA", &[30; 3]);
     let records = drive_walker(vec![r1, r2], fa);
     let rec3 = records.iter().find(|r| r.pos == 3).unwrap();
-    assert_eq!(rec3.alleles[0].scalars.num_obs, 2);
-    assert_eq!(rec3.alleles[0].scalars.placed_left, 1);
-    assert_eq!(rec3.alleles[0].scalars.placed_start, 1);
+    assert_eq!(rec3.alleles[0].support.num_obs, 2);
+    assert_eq!(rec3.alleles[0].support.placed_left, 1);
+    assert_eq!(rec3.alleles[0].support.placed_start, 1);
 }
 
 #[test]
@@ -426,7 +426,7 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
     // by stream order or alignment_start.
     let records = drive_walker(vec![m_second, m_first], fa);
     let rec = &records[0];
-    assert_eq!(rec.alleles[0].scalars.num_obs, 2);
+    assert_eq!(rec.alleles[0].support.num_obs, 2);
     // Kept mate's contribution = max(ln_BQ(Q=30), -2.0) ≈ -2.0.
     // Zeroed mate contributes max(ln(1)=0, -10.0) = 0.
     // Sum ≈ -2.0. If the tie-break wrongly kept mate 2, sum would
@@ -437,9 +437,9 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
     // Net q_sum ≈ -2.0, NOT ≈ -10.0 (which would be the case if
     // the tie-break wrongly kept mate 2).
     assert!(
-        rec.alleles[0].scalars.q_sum > -3.0 && rec.alleles[0].scalars.q_sum < -1.0,
+        rec.alleles[0].support.q_sum > -3.0 && rec.alleles[0].support.q_sum < -1.0,
         "q_sum ≈ -2.0 (first mate kept); got {}",
-        rec.alleles[0].scalars.q_sum
+        rec.alleles[0].support.q_sum
     );
 }
 
@@ -457,7 +457,7 @@ fn mate_overlap_zeroes_lower_bq_contribution() {
     m2.bq_baq = vec![10; 3];
     let records = drive_walker(vec![m1, m2], fa);
     let rec = &records[0];
-    assert_eq!(rec.alleles[0].scalars.num_obs, 2, "both mates count");
+    assert_eq!(rec.alleles[0].support.num_obs, 2, "both mates count");
     // q_sum at default mq_log_err = -3.0:
     //   keeper: max(ln_perr(40), -3.0) = -3.0  (MQ dominates)
     //   other:  max(ln(1)=0, -3.0)     = 0
@@ -465,9 +465,9 @@ fn mate_overlap_zeroes_lower_bq_contribution() {
     // (the BQ-summing change from S7 is invisible here because MQ
     // dominates; tests at low MQ_log_err pin the BQ math directly).
     assert!(
-        rec.alleles[0].scalars.q_sum > -4.0 && rec.alleles[0].scalars.q_sum < -2.0,
+        rec.alleles[0].support.q_sum > -4.0 && rec.alleles[0].support.q_sum < -2.0,
         "expected q_sum ≈ -3 (MQ-dominated), got {}",
-        rec.alleles[0].scalars.q_sum
+        rec.alleles[0].support.q_sum
     );
 }
 
@@ -501,12 +501,12 @@ fn mate_overlap_agree_keeper_carries_summed_bq() {
     let records = drive_walker(vec![m1, m2], fa);
     assert_eq!(records.len(), 1);
     let rec = &records[0];
-    assert_eq!(rec.alleles[0].scalars.num_obs, 2);
+    assert_eq!(rec.alleles[0].support.num_obs, 2);
     // Combined BQ = 40. ln_perr(40) = -40 * ln(10) / 10 ≈ -9.21.
     // Keeper contribution: max(-9.21, -100) = -9.21.
     // Other contribution: max(ln_perr(0)=0, -100) = 0.
     // Total q_sum ≈ -9.21. Pre-S7 (Q=20 unsummed): ≈ -4.61.
-    let q = rec.alleles[0].scalars.q_sum;
+    let q = rec.alleles[0].support.q_sum;
     assert!(
         q < -8.5 && q > -10.0,
         "q_sum should reflect summed BQ (≈ ln_perr(40) ≈ -9.21), got {q}",
@@ -539,7 +539,7 @@ fn mate_overlap_agree_combined_bq_caps_at_200() {
     let m1 = make(true, 150);
     let m2 = make(false, 100);
     let records = drive_walker(vec![m1, m2], fa);
-    let q = records[0].alleles[0].scalars.q_sum;
+    let q = records[0].alleles[0].support.q_sum;
     // ln_perr(200) ≈ -46.05. Without the cap it would be
     // ln_perr(250) ≈ -57.56.
     assert!(
@@ -587,18 +587,18 @@ fn mate_overlap_disagree_winner_bq_scaled_by_0_8() {
         .iter()
         .find(|a| a.seq.as_slice() == b"G")
         .expect("SNP allele present");
-    assert_eq!(ref_allele.scalars.num_obs, 1);
-    assert_eq!(snp_allele.scalars.num_obs, 1);
+    assert_eq!(ref_allele.support.num_obs, 1);
+    assert_eq!(snp_allele.support.num_obs, 1);
     // Winner BQ = (30 * 0.8) as u8 = 24. ln_perr(24) ≈ -5.53.
     // Pre-S7 (Q=30 unscaled): ≈ -6.91.
-    let q_ref = ref_allele.scalars.q_sum;
+    let q_ref = ref_allele.support.q_sum;
     assert!(
         q_ref < -5.0 && q_ref > -6.0,
         "REF allele q_sum should reflect scaled BQ=24 (≈ -5.53), got {q_ref}",
     );
     // Loser BQ zeroed → ln_perr(0) = 0 → max(0, -100) = 0.
     assert_eq!(
-        snp_allele.scalars.q_sum, 0.0,
+        snp_allele.support.q_sum, 0.0,
         "SNP allele's BQ was zeroed; q_sum should be 0",
     );
 }
@@ -667,12 +667,12 @@ fn paired_mate_indel_overlap_yields_single_observation() {
         .find(|a| a.seq.len() > anchor.ref_span() as usize)
         .expect("INS allele present");
     assert_eq!(
-        ins.scalars.num_obs, 1,
+        ins.support.num_obs, 1,
         "indel-overlap collapses to one observation; got {}",
-        ins.scalars.num_obs
+        ins.support.num_obs
     );
     // Forward-strand count should also reflect a single observation.
-    assert_eq!(ins.scalars.fwd, 1);
+    assert_eq!(ins.support.fwd, 1);
 }
 
 #[test]
@@ -823,10 +823,10 @@ fn column_depth_cap_truncates_snp_only_column_when_over_cap() {
     for rec in &records {
         for allele in &rec.alleles {
             assert!(
-                allele.scalars.num_obs <= 3,
+                allele.support.num_obs <= 3,
                 "pos {}: num_obs {} should be capped at 3",
                 rec.pos,
-                allele.scalars.num_obs,
+                allele.support.num_obs,
             );
         }
     }
@@ -867,7 +867,7 @@ fn column_depth_cap_keeps_first_n_of_admission_order() {
     // past the cap.
     assert_eq!(rec.alleles[0].seq, b"A", "alleles[0] is REF");
     assert_eq!(
-        rec.alleles[0].scalars.num_obs, 0,
+        rec.alleles[0].support.num_obs, 0,
         "no surviving read matched REF",
     );
 
@@ -877,13 +877,13 @@ fn column_depth_cap_keeps_first_n_of_admission_order() {
         .iter()
         .find(|a| a.seq.as_slice() == b"C")
         .expect("r0's allele 'C' must survive");
-    assert_eq!(c.scalars.num_obs, 1);
+    assert_eq!(c.support.num_obs, 1);
     let g = rec
         .alleles
         .iter()
         .find(|a| a.seq.as_slice() == b"G")
         .expect("r1's allele 'G' must survive");
-    assert_eq!(g.scalars.num_obs, 1);
+    assert_eq!(g.support.num_obs, 1);
 
     // r2's "T" must be absent — past the cap.
     assert!(
@@ -952,7 +952,7 @@ fn column_depth_cap_does_not_fire_below_threshold() {
     assert_eq!(summary.column_depth_truncations, 0);
     for rec in &records {
         assert_eq!(
-            rec.alleles[0].scalars.num_obs, 2,
+            rec.alleles[0].support.num_obs, 2,
             "pos {}: both reads should fold (no truncation under default cap)",
             rec.pos,
         );
@@ -996,7 +996,7 @@ fn g1_walker_drops_match_observations_past_adaptor_boundary() {
         // removes the adaptor base from the contributor list before
         // overlap resolution sees it.
         assert_eq!(
-            rec.alleles[0].scalars.num_obs, 1,
+            rec.alleles[0].support.num_obs, 1,
             "pos {}: exactly one mate is outside adaptor at this position",
             rec.pos,
         );

@@ -748,7 +748,7 @@ src/
     read_filter.rs      — per-read filters (flags, MAPQ, ...)
     baq.rs              — BAQ HMM (port of samtools' implementation)
     pileup_walker.rs    — active-set, CIGAR consumption, allele extraction
-    five_scalars.rs     — per-allele scalar accumulation
+    allele_support.rs   — per-allele AlleleSupportStats accumulation
     phase_chain.rs      — slot allocator/recycler + per-read tagging
                           + new/expired marker emission
     psf_writer.rs       — Stage 2 encoder (separate spec)

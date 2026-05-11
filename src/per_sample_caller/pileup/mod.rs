@@ -4,7 +4,7 @@
 //!
 //! See `ia/specs/pileup_walker.md` for the implementation-ready
 //! specification. This module ships the public types
-//! (`PreparedRead`, `PileupRecord`, `AlleleObservation`, `FiveScalars`,
+//! (`PreparedRead`, `PileupRecord`, `AlleleObservation`, `AlleleSupportStats`,
 //! `SlotId`, `RefBaseFetcher`, `WalkerError`) and the public entry
 //! point `run`. Internal building blocks live in private submodules.
 
@@ -269,17 +269,18 @@ pub struct PreparedRead {
 }
 
 // ---------------------------------------------------------------------
-// FiveScalars
+// AlleleSupportStats
 // ---------------------------------------------------------------------
 
-/// The fixed set of per-allele scalars sufficient to reproduce
-/// freebayes' likelihood and observation-bias priors exactly. See
-/// `ia/specs/calling_pipeline_architecture.md` §"The five per-allele
-/// scalars" for the field-by-field justification. Stored compact
-/// because every record carries one of these per allele.
+/// The fixed set of per-allele support statistics sufficient to
+/// reproduce freebayes' likelihood and observation-bias priors
+/// exactly. See `ia/specs/calling_pipeline_architecture.md` §"The
+/// five per-allele scalars" for the field-by-field justification.
+/// Stored compact because every record carries one of these per
+/// allele.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[non_exhaustive]
-pub struct FiveScalars {
+pub struct AlleleSupportStats {
     /// Number of supporting reads for this allele in this record.
     pub num_obs: u32,
     /// `Σ max(ln(P_err_BQ_BAQ), ln(P_err_MQ))` over supporting reads.
@@ -314,7 +315,7 @@ pub struct FiveScalars {
 #[non_exhaustive]
 pub struct AlleleObservation {
     pub seq: Vec<u8>,
-    pub scalars: FiveScalars,
+    pub support: AlleleSupportStats,
     /// Distinct phase-chain slot ids that contributed to this
     /// allele, sorted ascending and deduplicated.
     pub chain_slots: Vec<SlotId>,
