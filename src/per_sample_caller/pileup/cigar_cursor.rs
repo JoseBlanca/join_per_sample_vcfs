@@ -229,12 +229,21 @@ impl CigarCursor {
     /// doesn't fully fuse the helper into this hot path. The
     /// duplication with `emit_event_for_op_overlapping` is
     /// deliberate.
-    fn events_overlapping_linear(&self, lo: u32, hi: u32, read: &PreparedRead) -> EventsOverlapping {
+    fn events_overlapping_linear(
+        &self,
+        lo: u32,
+        hi: u32,
+        read: &PreparedRead,
+    ) -> EventsOverlapping {
         let mut out = EventsOverlapping::new();
         if hi <= lo {
             return out;
         }
         let n_ops = read.cigar.len();
+        // Index loop (not iterator) for codegen parity with the
+        // inlined per-op match arms — see the bench note at the
+        // top of the file. Mi21 in
+        // `ia/reviews/pileup_2026-05-11.md`.
         for i in 0..n_ops {
             let off = self.offsets[i];
             if off.ref_pos > hi {
@@ -325,7 +334,12 @@ impl CigarCursor {
     /// then walk forward with the same upper-bound break. Used
     /// when the CIGAR has many ops; the fixed setup cost
     /// amortises over the saved op visits.
-    fn events_overlapping_binary(&self, lo: u32, hi: u32, read: &PreparedRead) -> EventsOverlapping {
+    fn events_overlapping_binary(
+        &self,
+        lo: u32,
+        hi: u32,
+        read: &PreparedRead,
+    ) -> EventsOverlapping {
         let mut out = EventsOverlapping::new();
         if hi <= lo {
             return out;
@@ -485,6 +499,10 @@ impl CigarCursor {
         // first ref position is one past `walker_pos` for an
         // indel anchored at the previous op's end).
         let break_threshold = walker_pos.saturating_add(1);
+        // Index loop (not iterator) for codegen parity with the
+        // inlined per-op match arms — see the bench note at the
+        // top of the file. Mi21 in
+        // `ia/reviews/pileup_2026-05-11.md`.
         for i in 0..n_ops {
             let off = self.offsets[i];
             if off.ref_pos > break_threshold {

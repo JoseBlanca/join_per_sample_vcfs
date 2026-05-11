@@ -11,26 +11,31 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 
+use super::PreparedRead;
 use super::errors::WalkerError;
-use super::{MATE_LOOKUP_WINDOW, PreparedRead};
 
 /// Phase-chain slot identifier. `u16` gives ~16× headroom over the
-/// default `MAX_ACTIVE_SLOTS` cap (4096); `u8`'s 256-slot ceiling
-/// would risk silent overflow at higher coverages. The cap, not the
-/// type, is the binding constraint.
+/// default cap (4096); `u8`'s 256-slot ceiling would risk silent
+/// overflow at higher coverages. The cap, not the type, is the
+/// binding constraint.
 pub type SlotId = u16;
 
-/// Hard cap on the number of concurrently-active phase-chain slots.
-/// Exceeding it is a hard error rather than silent slot reuse.
-pub const MAX_ACTIVE_SLOTS: u32 = 4096;
+/// Default value for [`WalkerConfig::max_active_slots`]:
+/// hard cap on the number of concurrently-active phase-chain
+/// slots. Exceeding it is a hard error rather than silent slot
+/// reuse.
+///
+/// [`WalkerConfig::max_active_slots`]: super::WalkerConfig::max_active_slots
+pub const DEFAULT_MAX_ACTIVE_SLOTS: u32 = 4096;
 
-/// Active-slot count at which the allocator emits a one-shot soft
-/// warning, well below `MAX_ACTIVE_SLOTS`. Lets the user spot a
-/// pathological-coverage region while the run is still alive instead
-/// of being greeted with `SlotExhausted` and no context. 75% of the
-/// hard cap leaves room for a steep climb to still be visible before
-/// the run fails.
-pub const HIGH_WATER_WARN_THRESHOLD: u32 = MAX_ACTIVE_SLOTS * 3 / 4;
+/// Fraction of the active-slot cap at which the allocator emits a
+/// one-shot soft warning. Lets the user spot a pathological-coverage
+/// region while the run is still alive instead of being greeted
+/// with `SlotExhausted` and no context. 75% leaves room for a steep
+/// climb to still be visible before the run fails.
+fn high_water_warn_threshold(cap: u32) -> u32 {
+    cap.saturating_mul(3) / 4
+}
 
 /// State the allocator holds for a first mate whose partner has not
 /// yet been admitted: which slot was issued, the first mate's
@@ -59,7 +64,7 @@ pub struct SlotAllocator {
     /// `free` after emitting the marks for the just-closed window.
     pending_free: Vec<SlotId>,
     /// Next never-used-before slot id; advances when `free` is empty.
-    next_fresh: u32,
+    next_fresh_slot_id: u32,
     /// Per-slot reference count: 1 for solo reads, 2 once both mates
     /// are admitted. The slot is released when this hits 0 again.
     slot_refcount: Vec<u8>,
@@ -76,11 +81,18 @@ pub struct SlotAllocator {
     /// Bookkeeping for the run summary.
     counters: SlotAllocatorCounters,
     /// Set the first time the active-slot count reaches
-    /// `HIGH_WATER_WARN_THRESHOLD`. Idempotent within a run — and
-    /// because `reset` (called at chromosome boundaries) deliberately
-    /// preserves it, the warning fires at most once per run rather
-    /// than once per chromosome.
+    /// `high_water_warn_threshold(max_active_slots)`. Idempotent
+    /// within a run — and because `reset` (called at chromosome
+    /// boundaries) deliberately preserves it, the warning fires
+    /// at most once per run rather than once per chromosome.
     high_water_warned: bool,
+    /// Hard cap on concurrent active slots. Per-instance because
+    /// `WalkerConfig` now exposes it as a tunable. M11 in
+    /// `ia/reviews/pileup_2026-05-11.md`.
+    max_active_slots: u32,
+    /// Per-instance pending-mate lookup window, mirrors
+    /// `WalkerConfig::mate_lookup_window`.
+    mate_lookup_window: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -91,17 +103,30 @@ pub struct SlotAllocatorCounters {
 }
 
 impl SlotAllocator {
+    /// Construct with the default cap and lookup window. Used by
+    /// tests; production code calls [`SlotAllocator::with_caps`]
+    /// from `walker::run`.
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_caps(DEFAULT_MAX_ACTIVE_SLOTS, super::DEFAULT_MATE_LOOKUP_WINDOW)
+    }
+
+    /// Construct with explicit caps. `max_active_slots` is the
+    /// hard cap on concurrent slots; `mate_lookup_window` is the
+    /// pending-mate eviction distance.
+    pub fn with_caps(max_active_slots: u32, mate_lookup_window: u32) -> Self {
         Self {
             free: Vec::new(),
             pending_free: Vec::new(),
-            next_fresh: 0,
-            slot_refcount: vec![0u8; MAX_ACTIVE_SLOTS as usize],
+            next_fresh_slot_id: 0,
+            slot_refcount: vec![0u8; max_active_slots as usize],
             pending_mates: AHashMap::new(),
             new_marks: Vec::new(),
             expired_marks: Vec::new(),
             counters: SlotAllocatorCounters::default(),
             high_water_warned: false,
+            max_active_slots,
+            mate_lookup_window,
         }
     }
 
@@ -111,13 +136,14 @@ impl SlotAllocator {
     pub fn reset(&mut self) {
         self.free.clear();
         self.pending_free.clear();
-        self.next_fresh = 0;
+        self.next_fresh_slot_id = 0;
         self.slot_refcount.fill(0);
         self.pending_mates.clear();
         self.new_marks.clear();
         self.expired_marks.clear();
-        // counters and high_water_warned are cumulative across the
-        // whole run, do not reset
+        // counters, high_water_warned, max_active_slots,
+        // and mate_lookup_window are cumulative / immutable
+        // across the run — do not reset.
     }
 
     /// Allocate a slot for an entering read.
@@ -310,19 +336,24 @@ impl SlotAllocator {
     }
 
     /// Emit a one-shot soft warning the first time the active-slot
-    /// count crosses `HIGH_WATER_WARN_THRESHOLD`. Surfaces a
+    /// count crosses 75 % of the configured cap. Surfaces a
     /// pathological-coverage region while the run is still alive,
-    /// before it potentially trips `MAX_ACTIVE_SLOTS` and dies with
+    /// before it potentially trips the cap and dies with
     /// `WalkerError::SlotExhausted`.
     fn maybe_warn_high_water(&mut self, chrom_id: u32, pos: u32) {
-        if !self.high_water_warned && self.counters.slot_high_water >= HIGH_WATER_WARN_THRESHOLD {
+        let threshold = high_water_warn_threshold(self.max_active_slots);
+        if !self.high_water_warned && self.counters.slot_high_water >= threshold {
             self.high_water_warned = true;
             eprintln!(
                 "warning: pileup walker reached {}/{} active phase-chain slots at \
                  chrom_id={} pos={}; if usage exceeds {} the run will fail with \
-                 SlotExhausted (consider raising --max-active-chain-slots or \
-                 pre-filtering this region)",
-                self.counters.slot_high_water, MAX_ACTIVE_SLOTS, chrom_id, pos, MAX_ACTIVE_SLOTS,
+                 SlotExhausted (raise WalkerConfig::max_active_slots or pre-filter \
+                 this region)",
+                self.counters.slot_high_water,
+                self.max_active_slots,
+                chrom_id,
+                pos,
+                self.max_active_slots,
             );
         }
     }
@@ -331,15 +362,15 @@ impl SlotAllocator {
         if let Some(slot) = self.free.pop() {
             return Ok(slot);
         }
-        if self.next_fresh >= MAX_ACTIVE_SLOTS {
+        if self.next_fresh_slot_id >= self.max_active_slots {
             return Err(WalkerError::SlotExhausted {
-                cap: MAX_ACTIVE_SLOTS,
+                cap: self.max_active_slots,
                 chrom_id: read.chrom_id,
                 pos: read.alignment_start,
             });
         }
-        let slot = self.next_fresh as SlotId;
-        self.next_fresh += 1;
+        let slot = self.next_fresh_slot_id as SlotId;
+        self.next_fresh_slot_id += 1;
         Ok(slot)
     }
 
@@ -348,26 +379,31 @@ impl SlotAllocator {
     }
 
     fn evict_stale_pending(&mut self, walker_pos: u32) {
-        // Collect first; remove after, so we don't iterate while
-        // mutating.
-        let mut stale: Vec<(Arc<str>, SlotId)> = Vec::new();
-        for (qname, entry) in &self.pending_mates {
-            if entry.seen_at + MATE_LOOKUP_WINDOW < walker_pos {
-                stale.push((qname.clone(), entry.chain_slot_id));
+        // `AHashMap::retain` lets us mutate the map in a single pass
+        // and avoid a per-stale-entry `Arc::clone`. The slot_refcount
+        // and counters borrows are split out of the closure body so
+        // the borrow checker sees them as disjoint from the map.
+        // Mi13 in `ia/reviews/pileup_2026-05-11.md`.
+        let slot_refcount = &mut self.slot_refcount;
+        let counters = &mut self.counters;
+        let mate_lookup_window = self.mate_lookup_window;
+        self.pending_mates.retain(|_qname, entry| {
+            // `saturating_add` per Mi8: guards `seen_at` near
+            // `u32::MAX` on multi-Gbp chromosomes.
+            if walker_pos > entry.seen_at.saturating_add(mate_lookup_window) {
+                counters.mate_lookup_evictions += 1;
+                // The first mate's slot was pre-bumped to refcount 2
+                // anticipating the partner. Drop to refcount 1 so
+                // the slot releases when the surviving mate exits.
+                let idx = entry.chain_slot_id as usize;
+                if idx < slot_refcount.len() && slot_refcount[idx] >= 2 {
+                    slot_refcount[idx] -= 1;
+                }
+                false // drop
+            } else {
+                true // keep
             }
-        }
-        for (qname, slot) in stale {
-            self.pending_mates.remove(&qname);
-            self.counters.mate_lookup_evictions += 1;
-            // The first mate's slot was pre-bumped to refcount 2
-            // anticipating the partner. Now that we've given up on
-            // the partner, decrement to refcount 1 so the slot
-            // releases when the surviving first mate exits.
-            let idx = slot as usize;
-            if idx < self.slot_refcount.len() && self.slot_refcount[idx] >= 2 {
-                self.slot_refcount[idx] -= 1;
-            }
-        }
+        });
     }
 }
 
@@ -548,7 +584,7 @@ mod tests {
     fn slot_exhausted_returns_hard_error() {
         let mut a = SlotAllocator::new();
         // Fill all slots; we don't release anything.
-        for i in 0..MAX_ACTIVE_SLOTS {
+        for i in 0..DEFAULT_MAX_ACTIVE_SLOTS {
             let r = make_read(&format!("r{i}"), false, 100);
             a.allocate_for_read(&r).expect("under cap");
         }
@@ -568,7 +604,11 @@ mod tests {
         assert_eq!(a.pending_mates.len(), 1);
 
         // Bring the walker far past the lookup window.
-        let r2 = make_read("later", false, 100 + MATE_LOOKUP_WINDOW + 1);
+        let r2 = make_read(
+            "later",
+            false,
+            100 + super::super::DEFAULT_MATE_LOOKUP_WINDOW + 1,
+        );
         a.allocate_for_read(&r2).unwrap();
         assert!(
             a.pending_mates.is_empty(),
@@ -584,7 +624,7 @@ mod tests {
         a.allocate_for_read(&r).unwrap();
         let allocs_before = a.counters().slot_allocations;
         a.reset();
-        assert_eq!(a.next_fresh, 0);
+        assert_eq!(a.next_fresh_slot_id, 0);
         assert!(a.pending_mates.is_empty());
         // Counters are cumulative across the whole run.
         assert_eq!(a.counters().slot_allocations, allocs_before);
@@ -596,7 +636,8 @@ mod tests {
         // must still be clear, since the warning is supposed to
         // fire exactly when the count reaches the threshold.
         let mut a = SlotAllocator::new();
-        for i in 0..(HIGH_WATER_WARN_THRESHOLD - 1) {
+        let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_SLOTS);
+        for i in 0..(threshold - 1) {
             let r = make_read(&format!("r{i}"), false, 100);
             a.allocate_for_read(&r).expect("under threshold");
         }
@@ -627,7 +668,8 @@ mod tests {
         // re-arm the flag, otherwise a deep contig would re-warn on
         // every following contig we visit.
         let mut a = SlotAllocator::new();
-        for i in 0..HIGH_WATER_WARN_THRESHOLD {
+        let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_SLOTS);
+        for i in 0..threshold {
             let r = make_read(&format!("r{i}"), false, 100);
             a.allocate_for_read(&r).unwrap();
         }
@@ -686,7 +728,8 @@ mod tests {
         let (new, _) = a.drain_lifecycle_marks();
         assert_eq!(new, vec![slot]);
 
-        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100).unwrap();
+        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100)
+            .unwrap();
         a.release_slot(slot, 0, 100).unwrap();
 
         let (_, expired) = a.drain_lifecycle_marks();
@@ -711,7 +754,8 @@ mod tests {
         let solo = make_read("solo", false, 100);
         let (slot, _) = a.allocate_for_read(&solo).unwrap();
 
-        a.release_pending_partner_ref_if_present(&solo.qname, 0, 100).unwrap();
+        a.release_pending_partner_ref_if_present(&solo.qname, 0, 100)
+            .unwrap();
         a.release_slot(slot, 0, 100).unwrap();
 
         let (_, expired) = a.drain_lifecycle_marks();
@@ -740,13 +784,15 @@ mod tests {
         );
 
         // First-to-exit: partner-release is a no-op; release_slot 2→1.
-        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100).unwrap();
+        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100)
+            .unwrap();
         a.release_slot(slot, 0, 100).unwrap();
         let (_, expired_mid) = a.drain_lifecycle_marks();
         assert!(expired_mid.is_empty());
 
         // Second-to-exit: same shape; release_slot 1→0, expired fires.
-        a.release_pending_partner_ref_if_present(&m2.qname, 0, 100).unwrap();
+        a.release_pending_partner_ref_if_present(&m2.qname, 0, 100)
+            .unwrap();
         a.release_slot(slot, 0, 100).unwrap();
         let (_, expired_final) = a.drain_lifecycle_marks();
         assert_eq!(expired_final, vec![slot]);

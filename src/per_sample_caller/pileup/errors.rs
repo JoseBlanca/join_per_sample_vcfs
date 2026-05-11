@@ -6,6 +6,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum WalkerError {
     #[error(
         "out-of-order read: qname='{qname}' at (chrom_id={chrom_id}, pos={pos}) regresses from \
@@ -67,4 +68,12 @@ pub enum WalkerError {
 
     #[error("walker output channel closed before all records were drained: {context}")]
     ChannelClosed { context: String },
+
+    #[error("malformed PreparedRead at qname='{qname}' (chrom_id={chrom_id}, pos={pos}): {reason}")]
+    MalformedRead {
+        reason: String,
+        qname: String,
+        chrom_id: u32,
+        pos: u32,
+    },
 }

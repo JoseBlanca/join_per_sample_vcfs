@@ -84,6 +84,9 @@ where
             if p.alignment_start > state.walker_pos {
                 break;
             }
+            // PANIC-FREE: `iter.peek()` returned Some on the loop
+            // condition above, and `iter` has not been advanced
+            // between then and here.
             let r = iter.next().expect("peek matched");
             state.admit_read(r)?;
         }
@@ -120,6 +123,7 @@ where
 /// Cumulative counters reported back by `run` so callers can log a
 /// per-sample summary.
 #[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
 pub struct RunSummary {
     pub reads_admitted: u64,
     pub records_emitted: u64,
@@ -180,8 +184,8 @@ impl WalkerState {
             last_admitted_chrom_id: None,
             last_admitted_locus: None,
             active: ActiveSet::new(),
-            slots: SlotAllocator::new(),
-            open: OpenPileupRecordTable::new(),
+            slots: SlotAllocator::with_caps(config.max_active_slots, config.mate_lookup_window),
+            open: OpenPileupRecordTable::with_cap(config.max_record_span),
             summary: RunSummary::default(),
             config,
             contributors_buf: Vec::new(),
@@ -196,7 +200,16 @@ impl WalkerState {
             // restarts from 1.
             self.walker_pos = 1;
             self.last_admitted_chrom_id = Some(chrom_id);
-            self.last_admitted_locus = None;
+            // `last_admitted_locus` is deliberately preserved
+            // across chromosome boundaries (Mi14 in
+            // `ia/reviews/pileup_2026-05-11.md`): the per-read
+            // tuple comparison in `admit_read` correctly admits a
+            // forward chrom change (`(new_chrom, _) > (old_chrom,
+            // _)` holds whenever `new_chrom > old_chrom`), and
+            // keeping the locus sticky lets the outer chrom
+            // regression's error message report the *actual*
+            // last admitted (chrom, pos) instead of falling back
+            // to a misleading `walker_pos`.
         }
     }
 
@@ -217,6 +230,53 @@ impl WalkerState {
         // Zero-ref-span check.
         if read.alignment_end < read.alignment_start {
             return Err(WalkerError::ZeroRefSpan {
+                qname: read.qname.to_string(),
+                chrom_id: read.chrom_id,
+                pos: read.alignment_start,
+            });
+        }
+        // M21: length invariants the cursor relies on. `PreparedRead`
+        // documents `seq.len() == bq_baq.len()` and that the CIGAR
+        // consumes exactly `seq.len()` read bases. The cursor and
+        // `decompose` both index `seq[..]`/`bq_baq[..]` using offsets
+        // derived from the CIGAR; a mismatch panics with `slice index
+        // out of bounds` and kills the run on the offending read.
+        // Validate here so a malformed `PreparedRead` surfaces as a
+        // typed `MalformedRead` error with full locus context.
+        if read.seq.len() != read.bq_baq.len() {
+            return Err(WalkerError::MalformedRead {
+                reason: format!(
+                    "seq.len ({}) != bq_baq.len ({})",
+                    read.seq.len(),
+                    read.bq_baq.len(),
+                ),
+                qname: read.qname.to_string(),
+                chrom_id: read.chrom_id,
+                pos: read.alignment_start,
+            });
+        }
+        let cigar_read_consumed: u64 = read
+            .cigar
+            .iter()
+            .map(|op| match *op {
+                super::CigarOp::Match(n)
+                | super::CigarOp::SeqMatch(n)
+                | super::CigarOp::SeqMismatch(n)
+                | super::CigarOp::Insertion(n)
+                | super::CigarOp::SoftClip(n) => n as u64,
+                super::CigarOp::Deletion(_)
+                | super::CigarOp::Skip(_)
+                | super::CigarOp::HardClip(_)
+                | super::CigarOp::Padding(_) => 0,
+            })
+            .sum();
+        if cigar_read_consumed != read.seq.len() as u64 {
+            return Err(WalkerError::MalformedRead {
+                reason: format!(
+                    "CIGAR consumes {} read bases but seq.len = {}",
+                    cigar_read_consumed,
+                    read.seq.len(),
+                ),
                 qname: read.qname.to_string(),
                 chrom_id: read.chrom_id,
                 pos: read.alignment_start,
@@ -245,11 +305,16 @@ impl WalkerState {
                 continue;
             }
 
+            // Fallback to BQ=0 when this contributor has only indel events at
+            // walker_pos (no Match). BQ=0 → ln(P_err)=0 in `phred_to_ln_perr`,
+            // so the contributor's Match-side q_sum contribution is zero; the
+            // indel BQ itself flows through events_at_pos and is folded
+            // separately. Not a recovered error — there is no Match BQ here.
             let bq_at_walker = events_at_pos
                 .iter()
                 .find_map(|e| match e {
                     ReadEvent::Match { bq_baq, .. } => Some(*bq_baq),
-                    _ => None,
+                    ReadEvent::Insertion { .. } | ReadEvent::Deletion { .. } => None,
                 })
                 .unwrap_or(0);
 
@@ -287,7 +352,7 @@ impl WalkerState {
         // truncate-to-first-N is approximately unbiased and avoids
         // the random-sample machinery a per-allele clip would
         // require.
-        let cap = column_depth_cap(&contributors, &self.config);
+        let cap = column_depth_cap(contributors, &self.config);
         if contributors.len() > cap {
             contributors.truncate(cap);
             self.summary.column_depth_truncations += 1;
@@ -303,7 +368,7 @@ impl WalkerState {
             &mut self.open,
             walker_pos,
             self.chrom_id,
-            &contributors,
+            contributors,
             &self.active,
             fasta,
         )?;
@@ -350,14 +415,15 @@ impl WalkerState {
         // would corrupt all subsequent record positions. Realistic
         // mammal/plant genomes don't approach this, but a few
         // salamander/lungfish genomes do (≥ 4 Gbp).
-        let mut next_pos = self.walker_pos.checked_add(1).ok_or_else(|| {
-            WalkerError::Internal {
+        let mut next_pos = self
+            .walker_pos
+            .checked_add(1)
+            .ok_or_else(|| WalkerError::Internal {
                 detail: format!("walker_pos overflowed u32 at {}", self.walker_pos),
                 qname: String::new(),
                 chrom_id: self.chrom_id,
                 pos: self.walker_pos,
-            }
-        })?;
+            })?;
 
         // If the active set is empty and the next pulled read
         // starts past the walker, skip the uncovered span.
@@ -393,10 +459,12 @@ impl WalkerState {
                 })?;
             self.summary.records_emitted += 1;
         }
-        // Reset chromosome-scoped state.
+        // Reset chromosome-scoped state. `self.open.reset()` keeps
+        // the perf-hoisted `allele_seq_buf` capacity across the
+        // chromosome boundary (Mi11).
         self.slots.reset();
         self.active.reset();
-        self.open = OpenPileupRecordTable::new();
+        self.open.reset();
         Ok(())
     }
 
@@ -506,6 +574,11 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
                 } else {
                     // Match-only mate overlap (S7): apply
                     // samtools-style BQ math.
+                    //
+                    // PANIC-FREE: inside the !any_indel_here branch, every
+                    // event at walker_pos on either side is a Match by
+                    // definition of `pair_has_indel`, so `match_base_at_pos`
+                    // returns Some.
                     let base_a = match_base_at_pos(&contributors[a])
                         .expect("match-only overlap: each side has a Match event at walker_pos");
                     let base_b = match_base_at_pos(&contributors[b])
@@ -633,7 +706,7 @@ fn pick_disagree_winner(contributors: &[ReadContribution], a: usize, b: usize) -
 fn match_base_at_pos(c: &ReadContribution) -> Option<u8> {
     c.events_at_pos.iter().find_map(|e| match e {
         ReadEvent::Match { base, .. } => Some(*base),
-        _ => None,
+        ReadEvent::Insertion { .. } | ReadEvent::Deletion { .. } => None,
     })
 }
 
@@ -668,7 +741,7 @@ fn pair_has_indel(a: &ReadContribution, b: &ReadContribution) -> bool {
     let has_indel = |c: &ReadContribution| {
         c.events_at_pos
             .iter()
-            .any(|e| !matches!(e, ReadEvent::Match { .. }))
+            .any(|e| matches!(e, ReadEvent::Insertion { .. } | ReadEvent::Deletion { .. },))
     };
     has_indel(a) || has_indel(b)
 }
@@ -680,11 +753,155 @@ fn column_depth_cap(contributors: &[ReadContribution], config: &WalkerConfig) ->
     let any_indel = contributors.iter().any(|c| {
         c.events_at_pos
             .iter()
-            .any(|e| !matches!(e, ReadEvent::Match { .. }))
+            .any(|e| matches!(e, ReadEvent::Insertion { .. } | ReadEvent::Deletion { .. },))
     });
     if any_indel {
         config.max_indel_column_depth as usize
     } else {
         config.max_snp_column_depth as usize
+    }
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::super::cigar_cursor::EventsAt;
+    use super::*;
+
+    fn contribution(
+        bq: u8,
+        is_first_mate: bool,
+        alignment_start: u32,
+        events: EventsAt,
+    ) -> ReadContribution {
+        ReadContribution {
+            read_id: 0,
+            chain_slot_id: 0,
+            events_at_pos: events,
+            bq_baq_at_walker_pos: bq,
+            mq_log_err: -3.0,
+            is_reverse_strand: false,
+            alignment_start,
+            is_first_mate,
+            bq_zero_in_window: false,
+            bq_override_at_walker_pos: None,
+        }
+    }
+
+    fn match_evs(pos: u32, base: u8, bq: u8) -> EventsAt {
+        let mut v = EventsAt::new();
+        v.push(ReadEvent::Match {
+            ref_pos: pos,
+            base,
+            bq_baq: bq,
+        });
+        v
+    }
+
+    fn indel_ins_evs(anchor: u32, bq: u8) -> EventsAt {
+        let mut v = EventsAt::new();
+        v.push(ReadEvent::Match {
+            ref_pos: anchor,
+            base: b'A',
+            bq_baq: bq,
+        });
+        v.push(ReadEvent::Insertion {
+            anchor_ref_pos: anchor,
+            seq: b"A".to_vec(),
+            bq_proxy: bq,
+        });
+        v
+    }
+
+    // --- M19: pick_* tertiary tie-break tests --------------------
+    //
+    // All three pick functions fall through to comparing
+    // `alignment_start` when both `is_first_mate` are equal. A
+    // flipped comparison here would silently change tie-break
+    // determinism — exactly the kind of bug that surfaces as
+    // "different VCF on the same input".
+
+    #[test]
+    fn pick_agree_keeper_breaks_remaining_tie_by_earlier_alignment_start() {
+        // Both first-mate, BQ tie (no BQ check in this function).
+        // Earlier alignment_start (50) wins over later (100).
+        let c = vec![
+            contribution(30, true, 100, match_evs(1, b'A', 30)),
+            contribution(30, true, 50, match_evs(1, b'A', 30)),
+        ];
+        assert_eq!(pick_agree_keeper(&c, 0, 1), 1);
+        // Swap order: now index 0 has the earlier alignment_start.
+        let c = vec![
+            contribution(30, true, 50, match_evs(1, b'A', 30)),
+            contribution(30, true, 100, match_evs(1, b'A', 30)),
+        ];
+        assert_eq!(pick_agree_keeper(&c, 0, 1), 0);
+    }
+
+    #[test]
+    fn pick_overlap_loser_breaks_bq_and_first_mate_tie_by_alignment_start() {
+        // BQ tie + first-mate tie → the loser is the one with the
+        // larger alignment_start.
+        let c = vec![
+            contribution(30, true, 100, match_evs(1, b'A', 30)),
+            contribution(30, true, 50, match_evs(1, b'A', 30)),
+        ];
+        // a=0 (start 100), b=1 (start 50) → loser is a (later start).
+        assert_eq!(pick_overlap_loser(&c, 0, 1), 0);
+    }
+
+    #[test]
+    fn pick_disagree_winner_on_bq_tie_delegates_to_pick_agree_keeper() {
+        // BQ tie + first-mate tie → falls back to alignment_start.
+        // The winner under the agree-keeper rule is the earlier
+        // alignment_start.
+        let c = vec![
+            contribution(30, true, 100, match_evs(1, b'A', 30)),
+            contribution(30, true, 50, match_evs(1, b'A', 30)),
+        ];
+        assert_eq!(pick_disagree_winner(&c, 0, 1), 1);
+    }
+
+    // --- Boundary tests for the samtools-C parity helpers --------
+
+    #[test]
+    fn sum_bq_capped_at_200_caps_exactly_at_200() {
+        assert_eq!(sum_bq_capped_at_200(0, 0), 0);
+        assert_eq!(sum_bq_capped_at_200(100, 100), 200);
+        assert_eq!(sum_bq_capped_at_200(150, 100), 200);
+        assert_eq!(sum_bq_capped_at_200(255, 255), 200);
+        assert_eq!(sum_bq_capped_at_200(99, 100), 199);
+    }
+
+    #[test]
+    fn scale_bq_by_0_8_truncates_not_rounds() {
+        assert_eq!(scale_bq_by_0_8(0), 0);
+        assert_eq!(scale_bq_by_0_8(5), 4); // 4.0 exact
+        assert_eq!(scale_bq_by_0_8(7), 5); // 5.6 → trunc 5 (round would give 6)
+        assert_eq!(scale_bq_by_0_8(30), 24); // 24.0
+    }
+
+    // --- column_depth_cap: any-indel rule ------------------------
+
+    #[test]
+    fn column_depth_cap_returns_indel_cap_when_only_some_contributors_have_indel() {
+        // Mixed SNP + one indel contributor at the same anchor.
+        // The "any" rule must flip the column to the indel cap.
+        let cfg = WalkerConfig {
+            max_snp_column_depth: 8000,
+            max_indel_column_depth: 2,
+            ..WalkerConfig::default()
+        };
+        let v = vec![
+            contribution(30, true, 1, match_evs(1, b'A', 30)),
+            contribution(30, true, 1, indel_ins_evs(1, 30)),
+            contribution(30, true, 1, match_evs(1, b'A', 30)),
+            contribution(30, true, 1, match_evs(1, b'A', 30)),
+            contribution(30, true, 1, match_evs(1, b'A', 30)),
+        ];
+        assert_eq!(column_depth_cap(&v, &cfg), 2);
     }
 }

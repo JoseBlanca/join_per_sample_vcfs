@@ -17,11 +17,28 @@ use super::active_set::ActiveSet;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::slot_allocator::SlotId;
-use super::{AlleleObservation, FiveScalars, MAX_RECORD_SPAN, PileupRecord, RefBaseFetcher};
+use super::{
+    AlleleObservation, DEFAULT_MAX_RECORD_SPAN, FiveScalars, PileupRecord, RefBaseFetcher,
+};
+
+/// Pre-allocated capacity for `OpenAllele::chain_slots` — sized
+/// for typical WGS coverage so `insert_sorted_unique` calls don't
+/// trip the 0→4→8→16→32 grow ladder. The vec is moved into
+/// `AlleleObservation` by `finalise()`, so downstream consumers
+/// also benefit. dhat 2026-05-10.
+const ALLELE_CHAIN_SLOTS_INITIAL_CAPACITY: usize = 32;
+
+/// Pre-allocated capacity for `OpenPileupRecord::folded_reads` —
+/// sized for typical WGS coverage so the per-record fold doesn't
+/// pay 4–5 grow reallocations as contributors accumulate.
+/// Previously the largest remaining alloc site by bytes (228 MB
+/// on `pileup_walker_multi_op/L=5000`); see L6 in
+/// `ia/reviews/perf_pileup_2026-05-10.md`.
+const RECORD_FOLDED_READS_INITIAL_CAPACITY: usize = 32;
 
 /// One in-flight allele bucket inside an `OpenPileupRecord`.
 #[derive(Debug, Clone)]
-pub struct OpenAllele {
+pub(super) struct OpenAllele {
     pub seq: Vec<u8>,
     pub scalars: FiveScalars,
     /// Sorted, deduplicated.
@@ -33,15 +50,7 @@ impl OpenAllele {
         Self {
             seq,
             scalars: FiveScalars::default(),
-            // Sized for typical WGS coverage so per-allele
-            // insert_sorted_unique calls don't trip the 0->4->8->16->32
-            // grow ladder. The chain_slots Vec is moved into the
-            // public AlleleObservation by `finalise()`, so this
-            // capacity hint also benefits downstream consumers
-            // (no realloc-to-shrink). dhat 2026-05-10 named the
-            // grows as the next-biggest alloc count site after
-            // the FoldedReadState pre-allocation.
-            chain_slots: Vec::with_capacity(32),
+            chain_slots: Vec::with_capacity(ALLELE_CHAIN_SLOTS_INITIAL_CAPACITY),
         }
     }
 }
@@ -52,7 +61,7 @@ impl OpenAllele {
 /// reference sequence under the record's footprint and is the only
 /// place those bytes are stored.
 #[derive(Debug, Clone)]
-pub struct OpenPileupRecord {
+pub(super) struct OpenPileupRecord {
     pub chrom_id: u32,
     /// 1-based anchor position.
     pub pos: u32,
@@ -91,16 +100,7 @@ impl OpenPileupRecord {
             chrom_id,
             pos,
             alleles: vec![OpenAllele::new(ref_seq)],
-            // Sized for typical WGS coverage so the per-record
-            // fold doesn't pay 4-5 grow reallocations as it
-            // accumulates contributors. Workloads with much higher
-            // coverage will still grow from this base; workloads
-            // far below pay ~1 KB of dead headroom per open record.
-            // dhat 2026-05-10: previously this was the largest
-            // remaining alloc site by bytes (228 MB on
-            // pileup_walker_multi_op/L=5000) — top finding after
-            // L6 in `ia/reviews/perf_pileup_2026-05-10.md`.
-            folded_reads: AHashMap::with_capacity(32),
+            folded_reads: AHashMap::with_capacity(RECORD_FOLDED_READS_INITIAL_CAPACITY),
         }
     }
 
@@ -110,9 +110,12 @@ impl OpenPileupRecord {
 
     /// Footprint end (exclusive), in 1-based coordinates: the
     /// position one past the last reference base this record
-    /// covers.
+    /// covers. `saturating_add` defends against `pos` near
+    /// `u32::MAX` on multi-Gbp chromosomes — without it the
+    /// returned end wraps and `drain_aged` misreads it. Mi8 in
+    /// `ia/reviews/pileup_2026-05-11.md`.
     pub fn footprint_end_exclusive(&self) -> u32 {
-        self.pos + self.ref_span()
+        self.pos.saturating_add(self.ref_span())
     }
 
     /// Convert into a finalised `PileupRecord`. The slot lifecycle
@@ -142,8 +145,8 @@ impl OpenPileupRecord {
 /// The set of currently-open records, keyed by anchor position.
 /// Range queries (find records overlapping a given event span)
 /// use the BTreeMap's ordered structure.
-#[derive(Debug, Default)]
-pub struct OpenPileupRecordTable {
+#[derive(Debug)]
+pub(super) struct OpenPileupRecordTable {
     /// 1-based anchor position → record.
     records: BTreeMap<u32, OpenPileupRecord>,
     /// Reusable scratch buffer for the per-(record, contributor)
@@ -153,27 +156,70 @@ pub struct OpenPileupRecordTable {
     /// genuinely new allele. See L10/L11 in
     /// `ia/reviews/perf_pileup_2026-05-10.md`.
     allele_seq_buf: Vec<u8>,
+    /// Per-instance cap on per-record reference span, mirrors
+    /// `WalkerConfig::max_record_span`. M11 in
+    /// `ia/reviews/pileup_2026-05-11.md`.
+    max_record_span: u32,
+}
+
+impl Default for OpenPileupRecordTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OpenPileupRecordTable {
+    /// Construct with the default `max_record_span`. Used by
+    /// tests; production code calls
+    /// [`OpenPileupRecordTable::with_cap`] from `walker::run`.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_cap(DEFAULT_MAX_RECORD_SPAN)
+    }
+
+    /// Construct with an explicit per-record reference span cap.
+    pub fn with_cap(max_record_span: u32) -> Self {
+        Self {
+            records: BTreeMap::new(),
+            allele_seq_buf: Vec::new(),
+            max_record_span,
+        }
+    }
+
+    /// Reset chromosome-scoped state in place. Used at chromosome
+    /// boundaries instead of replacing `self` with a fresh
+    /// `OpenPileupRecordTable::new()`, which would discard the
+    /// perf-hoisted `allele_seq_buf`. The caller is expected to
+    /// have drained `records` already (via `drain_all`); the
+    /// debug-assert pins that contract. Mi11 in
+    /// `ia/reviews/pileup_2026-05-11.md`.
+    pub fn reset(&mut self) {
+        debug_assert!(
+            self.records.is_empty(),
+            "OpenPileupRecordTable::reset called with {} records still open",
+            self.records.len(),
+        );
+        self.records.clear();
+        self.allele_seq_buf.clear();
     }
 
     /// Drain every record whose footprint is fully behind the
     /// walker (`pos + ref_span ≤ walker_pos`), in coordinate
     /// order. Used by the walker's `close_aged_records` step.
+    ///
+    /// **No early break on first not-yet-aged key.** A record at
+    /// key `q < walker_pos` whose footprint extends past
+    /// `walker_pos` (a wide deletion still in flight) does *not*
+    /// imply later keys are also not-aged: a narrower record
+    /// opened after it may have closed already. See finding Mi6
+    /// in `ia/reviews/pileup_2026-05-11.md`. Iteration is bounded
+    /// to keys strictly less than `walker_pos` — a record at
+    /// `pos ≥ walker_pos` has `footprint_end_exclusive ≥ pos + 1
+    /// > walker_pos`, so it cannot be aged this step.
     pub fn drain_aged(&mut self, walker_pos: u32) -> Vec<OpenPileupRecord> {
         let mut closing_keys: Vec<u32> = Vec::new();
-        for (&pos, rec) in self.records.iter() {
+        for (&pos, rec) in self.records.range(..walker_pos) {
             if rec.footprint_end_exclusive() <= walker_pos {
                 closing_keys.push(pos);
-            } else {
-                // BTreeMap iteration is sorted; once we see a
-                // record whose footprint is still ahead of the
-                // walker, no later key can be aged either, since
-                // their `pos` is even larger.
-                break;
             }
         }
         let mut out = Vec::with_capacity(closing_keys.len());
@@ -186,16 +232,10 @@ impl OpenPileupRecordTable {
     }
 
     /// Drain everything unconditionally (chromosome boundary or
-    /// end-of-input). Records come out in coordinate order.
+    /// end-of-input). Records come out in coordinate order
+    /// because `BTreeMap::into_values` iterates by key order.
     pub fn drain_all(&mut self) -> Vec<OpenPileupRecord> {
-        let mut out = Vec::with_capacity(self.records.len());
-        let keys: Vec<u32> = self.records.keys().copied().collect();
-        for k in keys {
-            if let Some(r) = self.records.remove(&k) {
-                out.push(r);
-            }
-        }
-        out
+        std::mem::take(&mut self.records).into_values().collect()
     }
 
     /// Find the open record (if any) whose footprint overlaps the
@@ -216,9 +256,9 @@ impl OpenPileupRecordTable {
         // (any record opened to the right of the event's start
         // would have its footprint start ≥ event_end > event_start
         // — they can't overlap). The search range is bounded by
-        // `MAX_RECORD_SPAN`: a record's footprint can extend at
-        // most `MAX_RECORD_SPAN` past its anchor, so any record
-        // anchored before `event_start - MAX_RECORD_SPAN` cannot
+        // `max_record_span`: a record's footprint can extend at
+        // most `max_record_span` past its anchor, so any record
+        // anchored before `event_start - max_record_span` cannot
         // reach `event_start`. Heterogeneous spans coexist (a
         // wide deletion record may stay open while shorter records
         // open and close around it), so an early break at the
@@ -230,7 +270,7 @@ impl OpenPileupRecordTable {
         // `q ≤ event_start`, and the precondition gives
         // `event_start < event_end`, so `q < event_end` is
         // implied. Mi8 in `ia/reviews/pileup_2026-05-09.md`.
-        let lo = event_start.saturating_sub(MAX_RECORD_SPAN);
+        let lo = event_start.saturating_sub(self.max_record_span);
         for (&q, rec) in self.records.range(lo..=event_start).rev() {
             if rec.footprint_end_exclusive() > event_start {
                 return Some(q);
@@ -273,12 +313,12 @@ impl OpenPileupRecordTable {
             return Ok(false);
         }
         let extra_len = new_end_exclusive - old_end;
-        if (new_end_exclusive - rec.pos) > MAX_RECORD_SPAN {
+        if (new_end_exclusive - rec.pos) > self.max_record_span {
             return Err(WalkerError::RecordTooWide {
                 chrom_id: rec.chrom_id,
                 pos: rec.pos,
                 span: new_end_exclusive - rec.pos,
-                cap: MAX_RECORD_SPAN,
+                cap: self.max_record_span,
             });
         }
         let extra_bases = fasta
@@ -335,12 +375,12 @@ impl OpenPileupRecordTable {
         span: u32,
         fasta: &dyn RefBaseFetcher,
     ) -> Result<&mut OpenPileupRecord, WalkerError> {
-        if span > MAX_RECORD_SPAN {
+        if span > self.max_record_span {
             return Err(WalkerError::RecordTooWide {
                 chrom_id,
                 pos,
                 span,
-                cap: MAX_RECORD_SPAN,
+                cap: self.max_record_span,
             });
         }
         let ref_seq = fasta
@@ -383,7 +423,7 @@ impl OpenPileupRecordTable {
 /// order. The cursor was already producing the right shape, so
 /// the sort was wasted work and the contract was unclear. The
 /// preconditions above are now explicit and asserted in debug.
-pub fn apply_events_to_ref_into(
+pub(super) fn apply_events_to_ref_into(
     out: &mut Vec<u8>,
     record_pos: u32,
     ref_seq: &[u8],
@@ -485,7 +525,11 @@ pub fn apply_events_to_ref_into(
 /// goes through the `_into` variant against a buffer on
 /// `OpenPileupRecordTable`.
 #[cfg(test)]
-pub fn apply_events_to_ref(record_pos: u32, ref_seq: &[u8], events: &[ReadEvent]) -> Vec<u8> {
+pub(super) fn apply_events_to_ref(
+    record_pos: u32,
+    ref_seq: &[u8],
+    events: &[ReadEvent],
+) -> Vec<u8> {
     let mut out = Vec::new();
     apply_events_to_ref_into(&mut out, record_pos, ref_seq, events);
     out
@@ -514,7 +558,7 @@ fn event_kind_rank(ev: &ReadEvent) -> u8 {
 /// This is what lets `process_position` avoid cloning `ref_seq` per
 /// affected record. Mi6 in `ia/reviews/pileup_2026-05-09.md`.
 #[cfg(test)]
-pub fn find_or_create_allele_index(alleles: &mut Vec<OpenAllele>, seq: Vec<u8>) -> usize {
+pub(super) fn find_or_create_allele_index(alleles: &mut Vec<OpenAllele>, seq: Vec<u8>) -> usize {
     if let Some(idx) = alleles.iter().position(|a| a.seq == seq) {
         idx
     } else {
@@ -528,7 +572,7 @@ pub fn find_or_create_allele_index(alleles: &mut Vec<OpenAllele>, seq: Vec<u8>) 
 /// caller can run an equality check against a reusable buffer and
 /// only `clone()` the bytes when a genuinely new allele is added.
 /// L10 in `ia/reviews/perf_pileup_2026-05-10.md`.
-pub fn find_allele_index(alleles: &[OpenAllele], seq: &[u8]) -> Option<usize> {
+pub(super) fn find_allele_index(alleles: &[OpenAllele], seq: &[u8]) -> Option<usize> {
     alleles.iter().position(|a| a.seq.as_slice() == seq)
 }
 
@@ -553,7 +597,7 @@ pub fn find_allele_index(alleles: &[OpenAllele], seq: &[u8]) -> Option<usize> {
 /// affected at this step are not re-folded — those reads were
 /// folded at the walker step where the record was created or
 /// widened, and folding again here would double-count.
-pub fn process_position(
+pub(super) fn process_position(
     open: &mut OpenPileupRecordTable,
     walker_pos: u32,
     chrom_id: u32,
@@ -569,7 +613,11 @@ pub fn process_position(
     for contrib in contributors {
         for ev in &contrib.events_at_pos {
             let event_start = ev.anchor_pos();
-            let event_end = event_start + ev.footprint_span();
+            // `saturating_add` for `event_end` per Mi8: on
+            // multi-Gbp chromosomes a raw `+` would wrap and the
+            // `find_overlapping` range lookup would search the
+            // wrong region.
+            let event_end = event_start.saturating_add(ev.footprint_span());
 
             let key = if let Some(k) = open.find_overlapping(event_start, event_end) {
                 // PANIC-FREE: `find_overlapping` returned `Some(k)`
@@ -609,6 +657,7 @@ pub fn process_position(
     let OpenPileupRecordTable {
         records,
         allele_seq_buf,
+        max_record_span: _,
     } = open;
     for key in affected {
         // PANIC-FREE: every key in `affected` was either inserted
@@ -692,10 +741,7 @@ pub fn process_position(
             // either changes bucket or stays in the same bucket
             // with a possibly-different ln_q.
             if let Some(prev) = folded_reads.remove(&contrib.read_id) {
-                subtract_contribution(
-                    &mut alleles[prev.allele_index].scalars,
-                    &prev.contribution,
-                );
+                subtract_contribution(&mut alleles[prev.allele_index].scalars, &prev.contribution);
             }
             // Borrowed lookup; only `clone()` the bytes when adding
             // a genuinely new allele. In SNP/REF steady state every
@@ -709,10 +755,7 @@ pub fn process_position(
                 }
             };
             add_contribution(&mut alleles[new_index].scalars, &new_contribution);
-            insert_sorted_unique(
-                &mut alleles[new_index].chain_slots,
-                contrib.chain_slot_id,
-            );
+            insert_sorted_unique(&mut alleles[new_index].chain_slots, contrib.chain_slot_id);
             folded_reads.insert(
                 contrib.read_id,
                 FoldedReadState {
@@ -730,7 +773,7 @@ pub fn process_position(
 /// walker can update its run-summary fields without having to
 /// inspect open-record-table state externally.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessOutcome {
+pub(super) struct ProcessOutcome {
     /// Number of records that actually widened during this call.
     /// Excludes fresh `open_new` calls and re-finds where the
     /// event already fits inside the record's footprint.
@@ -768,8 +811,39 @@ fn add_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
 fn subtract_contribution(scalars: &mut FiveScalars, c: &FiveScalars) {
     // Saturating-style: an internal-bookkeeping bug that produced
     // a negative would otherwise wrap silently. Saturate to zero
-    // and rely on the upper invariant (num_obs over the record
-    // total still adds up) to surface mistakes through tests.
+    // in release builds and rely on the upper invariant (num_obs
+    // over the record total still adds up) to surface mistakes
+    // through tests.
+    //
+    // `debug_assert!` peer per Mi7 in
+    // `ia/reviews/pileup_2026-05-11.md`: in debug builds (and
+    // tests) we trip loudly on an underflow rather than letting
+    // it saturate silently. `q_sum` is signed `f64` and is left
+    // as a raw subtract — negatives are legal there by design.
+    debug_assert!(
+        scalars.num_obs >= c.num_obs,
+        "subtract_contribution underflow on num_obs: {} -= {}",
+        scalars.num_obs,
+        c.num_obs,
+    );
+    debug_assert!(
+        scalars.fwd >= c.fwd,
+        "subtract_contribution underflow on fwd: {} -= {}",
+        scalars.fwd,
+        c.fwd,
+    );
+    debug_assert!(
+        scalars.placed_left >= c.placed_left,
+        "subtract_contribution underflow on placed_left: {} -= {}",
+        scalars.placed_left,
+        c.placed_left,
+    );
+    debug_assert!(
+        scalars.placed_start >= c.placed_start,
+        "subtract_contribution underflow on placed_start: {} -= {}",
+        scalars.placed_start,
+        c.placed_start,
+    );
     scalars.num_obs = scalars.num_obs.saturating_sub(c.num_obs);
     scalars.q_sum -= c.q_sum;
     scalars.fwd = scalars.fwd.saturating_sub(c.fwd);
@@ -820,7 +894,7 @@ fn insert_sorted_unique(v: &mut Vec<SlotId>, slot: SlotId) {
 /// the fold pulls window events lazily from the read's
 /// `CigarCursor` via `read_id` lookup against the `ActiveSet`.
 #[derive(Debug, Clone)]
-pub struct ReadContribution {
+pub(super) struct ReadContribution {
     /// Active-set local id of the contributing read. Keys the
     /// per-record `folded_reads` map (so re-folds subtract the
     /// prior contribution) and is also how the fold looks the
@@ -865,7 +939,7 @@ pub struct ReadContribution {
 /// Apply slot lifecycle markers from the slot allocator to the
 /// most-recently-emitted record. Used by the walker's
 /// close_aged_records step.
-pub fn stamp_lifecycle_marks(
+pub(super) fn stamp_lifecycle_marks(
     records: &mut [PileupRecord],
     new_chains: Vec<SlotId>,
     expired_chains: Vec<SlotId>,
@@ -929,6 +1003,32 @@ mod tests {
         assert_eq!(drained[0].pos, 1);
         assert_eq!(drained[1].pos, 5);
         assert_eq!(t.records.len(), 1);
+    }
+
+    #[test]
+    fn drain_aged_does_not_break_early_when_a_wide_record_blocks_a_narrow_one() {
+        // Heterogeneous spans: a wide deletion record sits at an
+        // earlier key than a narrow record. At a walker position
+        // where the narrow record is past closure but the wide one
+        // is not, `drain_aged` must still return the narrow record.
+        // An early break at the first "not yet aged" key would
+        // miss it.
+        let mut t = OpenPileupRecordTable::new();
+        let f = fa(&"A".repeat(60));
+        // Wide record at pos 5, span 50 → footprint [5, 55).
+        t.open_new(0, 5, 50, &f).unwrap();
+        // Narrow record at pos 10, span 1 → footprint [10, 11).
+        t.open_new(0, 10, 1, &f).unwrap();
+        // Walker at 11: narrow record should be aged out (11 >= 11);
+        // wide record is still open (55 > 11).
+        let drained = t.drain_aged(11);
+        assert_eq!(
+            drained.len(),
+            1,
+            "narrow record must drain even though the earlier wide one is still open",
+        );
+        assert_eq!(drained[0].pos, 10);
+        assert_eq!(t.records.len(), 1, "wide record stays open");
     }
 
     #[test]
@@ -1106,5 +1206,92 @@ mod tests {
             }
             _ => panic!("Deletion shape must survive zeroing"),
         }
+    }
+
+    // --- M18: subtract_contribution direct unit tests -----------
+    //
+    // The function is the most subtle correctness primitive in the
+    // module: every record widen re-folds via subtract-then-add.
+    // Pin the saturate-to-zero contract on the four `u32` fields
+    // and the straight `f64` subtract on `q_sum`.
+
+    // Mi7: in debug builds an underflow trips the `debug_assert!`
+    // peer; in release builds the `saturating_sub` zeroes the
+    // field. We pin both ends of the contract.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "subtract_contribution underflow")]
+    fn subtract_contribution_panics_on_underflow_in_debug() {
+        let mut s = FiveScalars {
+            num_obs: 1,
+            q_sum: 0.0,
+            fwd: 1,
+            placed_left: 0,
+            placed_start: 0,
+        };
+        let c = FiveScalars {
+            num_obs: 5,
+            q_sum: 0.0,
+            fwd: 0,
+            placed_left: 0,
+            placed_start: 0,
+        };
+        subtract_contribution(&mut s, &c);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn subtract_contribution_saturates_u32_fields_to_zero_in_release() {
+        let mut s = FiveScalars {
+            num_obs: 1,
+            q_sum: -1.0,
+            fwd: 1,
+            placed_left: 0,
+            placed_start: 1,
+        };
+        let c = FiveScalars {
+            num_obs: 5,
+            q_sum: -1.0,
+            fwd: 5,
+            placed_left: 5,
+            placed_start: 5,
+        };
+        subtract_contribution(&mut s, &c);
+        assert_eq!(s.num_obs, 0);
+        assert_eq!(s.fwd, 0);
+        assert_eq!(s.placed_left, 0);
+        assert_eq!(s.placed_start, 0);
+        // q_sum is straight f64 subtract by design (signed):
+        // (-1.0) - (-1.0) = 0.0.
+        assert!((s.q_sum - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn add_then_subtract_contribution_round_trips_for_u32_fields() {
+        // The widen path subtracts the prior contribution and adds
+        // the new one. When old == new, the bucket must end up
+        // unchanged.
+        let mut bucket = FiveScalars {
+            num_obs: 7,
+            q_sum: -3.0,
+            fwd: 4,
+            placed_left: 2,
+            placed_start: 1,
+        };
+        let c = FiveScalars {
+            num_obs: 1,
+            q_sum: -2.0,
+            fwd: 1,
+            placed_left: 0,
+            placed_start: 0,
+        };
+        let snapshot = bucket;
+        add_contribution(&mut bucket, &c);
+        subtract_contribution(&mut bucket, &c);
+        assert_eq!(bucket.num_obs, snapshot.num_obs);
+        assert_eq!(bucket.fwd, snapshot.fwd);
+        assert_eq!(bucket.placed_left, snapshot.placed_left);
+        assert_eq!(bucket.placed_start, snapshot.placed_start);
+        assert!((bucket.q_sum - snapshot.q_sum).abs() < 1e-12);
     }
 }

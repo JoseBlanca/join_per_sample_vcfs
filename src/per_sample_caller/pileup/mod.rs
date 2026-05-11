@@ -23,35 +23,50 @@ use std::sync::Arc;
 
 pub use crate::per_sample_caller::cram_input::CigarOp;
 pub use errors::WalkerError;
-pub use slot_allocator::{MAX_ACTIVE_SLOTS, SlotId};
-pub use walker::run;
+pub use slot_allocator::{DEFAULT_MAX_ACTIVE_SLOTS, SlotId};
+pub use walker::{RunSummary, run};
 
 // ---------------------------------------------------------------------
 // Defaults / tunables
 // ---------------------------------------------------------------------
 
-/// Hard cap on per-record reference span, enforced upstream as a
-/// read-span filter: a read whose CIGAR walk plus mate gap consumes
-/// more than `MAX_RECORD_SPAN` reference bases is dropped before
-/// reaching the walker. Bounds memory rather than serving as a
+/// Default for [`WalkerConfig::max_record_span`]. Bounds per-record
+/// memory by capping any open record's `ref_span`. Enforced both
+/// upstream (the filter stage drops reads whose CIGAR walk plus
+/// mate gap consumes more than this) and inside the walker
+/// (`widen` / `open_new` error with [`WalkerError::RecordTooWide`]
+/// if the cap is reached). Bounds memory rather than serving as a
 /// closure trigger; closure is per-record (see
 /// `ia/specs/pileup_walker.md` §"Closure rule").
-pub const MAX_RECORD_SPAN: u32 = 5_000;
+pub const DEFAULT_MAX_RECORD_SPAN: u32 = 5_000;
 
-/// Defensive bound on how far past the first mate's
-/// `alignment_start` the walker will keep an entry in
-/// `pending_mates` before evicting it and treating the first mate
-/// as solo. Sized for typical Illumina paired-end fragments
-/// (200–500 bp insert; outer-mate distance under a few kb on
-/// jumping libraries) with comfortable headroom. Long-read paired
-/// protocols with mate gaps beyond this would need it raised.
-pub const MATE_LOOKUP_WINDOW: u32 = 10_000;
+/// Default for [`WalkerConfig::mate_lookup_window`]. Defensive
+/// bound on how far past the first mate's `alignment_start` the
+/// walker will keep an entry in `pending_mates` before evicting
+/// it and treating the first mate as solo. Sized for typical
+/// Illumina paired-end fragments (200–500 bp insert; outer-mate
+/// distance under a few kb on jumping libraries) with comfortable
+/// headroom. Long-read paired protocols with mate gaps beyond
+/// this would need it raised.
+pub const DEFAULT_MATE_LOOKUP_WINDOW: u32 = 10_000;
 
 /// Default channel buffer between the walker thread and the Stage 2
 /// encoder thread. Sized for the worst-case burst of simultaneous
 /// closures plus enough headroom for a few subsequent steps to
 /// proceed before backpressure kicks in.
 pub const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 64;
+
+/// Default SNP/REF-column contributor cap, adopted from samtools'
+/// `MPLP_MAX_DEPTH`. Pathologically deep regions truncate at this
+/// many post-overlap contributors (admission order). See
+/// [`WalkerConfig`] for the truncation contract and bias caveats.
+pub const DEFAULT_MAX_SNP_COLUMN_DEPTH: u32 = 8_000;
+
+/// Default indel-column contributor cap, adopted from samtools'
+/// `MPLP_MAX_INDEL_DEPTH`. Tighter than the SNP cap because
+/// homopolymer-context indels saturate beyond what the likelihood
+/// math needs.
+pub const DEFAULT_MAX_INDEL_COLUMN_DEPTH: u32 = 250;
 
 // ---------------------------------------------------------------------
 // WalkerConfig
@@ -94,20 +109,43 @@ pub const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 /// The SNP cap is future-proofing for if/when the slot cap is
 /// raised.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct WalkerConfig {
     /// Maximum contributors to fold at a column whose alleles are
-    /// all SNP/REF (no indel events at this anchor).
+    /// all SNP/REF (no indel events at this anchor). Defaults to
+    /// [`DEFAULT_MAX_SNP_COLUMN_DEPTH`].
     pub max_snp_column_depth: u32,
     /// Maximum contributors to fold at a column carrying any
-    /// indel observation at this anchor.
+    /// indel observation at this anchor. Defaults to
+    /// [`DEFAULT_MAX_INDEL_COLUMN_DEPTH`].
     pub max_indel_column_depth: u32,
+    /// Hard cap on per-record reference span, enforced inside the
+    /// walker as a defensive bound (`widen` / `open_new` error
+    /// with [`WalkerError::RecordTooWide`]). Defaults to
+    /// [`DEFAULT_MAX_RECORD_SPAN`]. Upstream filtering drops reads
+    /// whose CIGAR walk plus mate gap consumes more than this, so
+    /// in normal operation the walker-side cap is never reached.
+    pub max_record_span: u32,
+    /// Defensive bound on how far past the first mate's
+    /// `alignment_start` the walker will keep a `pending_mates`
+    /// entry before evicting it and treating the first mate as
+    /// solo. Defaults to [`DEFAULT_MATE_LOOKUP_WINDOW`].
+    pub mate_lookup_window: u32,
+    /// Hard cap on the number of concurrently-active phase-chain
+    /// slots. Exceeding it is a hard error
+    /// ([`WalkerError::SlotExhausted`]) rather than silent slot
+    /// reuse. Defaults to [`DEFAULT_MAX_ACTIVE_SLOTS`].
+    pub max_active_slots: u32,
 }
 
 impl Default for WalkerConfig {
     fn default() -> Self {
         Self {
-            max_snp_column_depth: 8000,
-            max_indel_column_depth: 250,
+            max_snp_column_depth: DEFAULT_MAX_SNP_COLUMN_DEPTH,
+            max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+            max_record_span: DEFAULT_MAX_RECORD_SPAN,
+            mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
+            max_active_slots: DEFAULT_MAX_ACTIVE_SLOTS,
         }
     }
 }
@@ -125,6 +163,13 @@ impl Default for WalkerConfig {
 /// 0–93 (`bq_baq`). `qname` is shared as `Arc<str>` so cheap clones
 /// can sit in the `pending_mates` map alongside the `ActiveRead`
 /// without the bytes being duplicated.
+// `#[non_exhaustive]` is deliberately NOT applied to `PreparedRead`.
+// PreparedRead is the input contract: callers must populate it with
+// concrete bytes per the field-level docs, and adding a new field
+// should force every caller (test, bench, production constructor)
+// to update its literal explicitly. `#[non_exhaustive]` would push
+// callers toward `..Default::default()`, which is exactly the
+// silent-absorb hazard the refactor-safety rule guards against.
 #[derive(Debug, Clone)]
 pub struct PreparedRead {
     /// Index into the merged `ContigList`.
@@ -167,6 +212,15 @@ pub struct PreparedRead {
     /// the 5′ end into the near adaptor. The cursor's Match-emit
     /// sites apply this test direction-aware. See finding `G1` in
     /// `ia/reviews/pileup_gatk_comparison_2026-05-08.md`.
+    ///
+    /// # Default
+    /// `None` *disables the G1 adaptor filter* for this read: no
+    /// read base is treated as past the boundary. This is the
+    /// safe choice when the upstream cannot trust its mate
+    /// geometry — a false-positive filter would drop real
+    /// evidence. Callers that need strict filtering must compute
+    /// and set a boundary themselves. Mi17 in
+    /// `ia/reviews/pileup_2026-05-11.md`.
     pub adaptor_boundary: Option<u32>,
 }
 
@@ -180,6 +234,7 @@ pub struct PreparedRead {
 /// scalars" for the field-by-field justification. Stored compact
 /// because every record carries one of these per allele.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct FiveScalars {
     /// Number of supporting reads for this allele in this record.
     pub num_obs: u32,
@@ -212,6 +267,7 @@ pub struct FiveScalars {
 /// buckets for non-REF alleles are created lazily on first event,
 /// so they always have `num_obs ≥ 1`).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AlleleObservation {
     pub seq: Vec<u8>,
     pub scalars: FiveScalars,
@@ -233,6 +289,7 @@ pub struct AlleleObservation {
 /// previous emitted record. Both lists are deduplicated and may be
 /// emitted in any order; Stage 2 may reorder them.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PileupRecord {
     pub chrom_id: u32,
     /// 1-based anchor position.

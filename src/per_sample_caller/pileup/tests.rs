@@ -144,9 +144,15 @@ pub fn drive_walker_with_config(
         }
         out
     });
-    let summary = run(reads, &fasta, &tx, config).expect("walker run failed");
+    // Mi15: drop `tx` before joining the collector and before
+    // unwrapping the walker result. This guarantees the receiver
+    // wakes (channel closed) regardless of whether `run` returned
+    // Ok or Err, so the collector join is panic-resilient even
+    // under `panic=abort`.
+    let result = run(reads, &fasta, &tx, config);
     drop(tx);
     let records = collector.join().expect("collector thread panicked");
+    let summary = result.expect("walker run failed");
     (records, summary)
 }
 
@@ -807,6 +813,7 @@ fn column_depth_cap_truncates_snp_only_column_when_over_cap() {
     let cfg = WalkerConfig {
         max_snp_column_depth: 3,
         max_indel_column_depth: 99,
+        ..WalkerConfig::default()
     };
     let (records, summary) = drive_walker_with_config(reads, fa, &cfg);
 
@@ -847,9 +854,9 @@ fn column_depth_cap_keeps_first_n_of_admission_order() {
     let cfg = WalkerConfig {
         max_snp_column_depth: 2,
         max_indel_column_depth: 99,
+        ..WalkerConfig::default()
     };
-    let (records, summary) =
-        drive_walker_with_config(vec![r0, r1, r2, r3, r4], fa, &cfg);
+    let (records, summary) = drive_walker_with_config(vec![r0, r1, r2, r3, r4], fa, &cfg);
 
     assert_eq!(records.len(), 1, "single column emitted");
     assert_eq!(summary.column_depth_truncations, 1);
@@ -921,6 +928,7 @@ fn column_depth_cap_uses_indel_cap_when_any_indel_event_present() {
     let cfg = WalkerConfig {
         max_snp_column_depth: 99,  // far above 5; SNP-only cols don't fire
         max_indel_column_depth: 2, // below 5; indel col at pos 1 fires
+        ..WalkerConfig::default()
     };
     let (_records, summary) = drive_walker_with_config(reads, fa, &cfg);
 
@@ -995,5 +1003,224 @@ fn g1_walker_drops_match_observations_past_adaptor_boundary() {
             "pos {}: exactly one mate is outside adaptor at this position",
             rec.pos,
         );
+    }
+}
+
+// --- Error-variant coverage --------------------------------------
+//
+// M14–M17 of `ia/reviews/pileup_2026-05-11.md`: every `WalkerError`
+// variant must have a regression test pinning the exact variant
+// returned. Without these, a swallowed or mis-mapped error could
+// silently degrade to `Ok(())` (data loss) or to the wrong variant
+// (operator triage misled).
+
+#[test]
+fn run_returns_channel_closed_when_receiver_dropped_mid_stream() {
+    // M14. Drop the receiver before the walker runs — every send
+    // fails with SendError, which the walker maps to ChannelClosed.
+    let fa = MockFasta::new("ACGTACGT");
+    let reads: Vec<_> = (0..4u32)
+        .map(|i| snp_read(&format!("r{i}"), 1, b"ACGTACGT", &[30; 8]))
+        .collect();
+    let (tx, rx) = mpsc::sync_channel::<super::PileupRecord>(1);
+    drop(rx);
+    let err = super::run(reads, &fa, &tx, &WalkerConfig::default())
+        .expect_err("must propagate channel closure");
+    assert!(
+        matches!(err, super::WalkerError::ChannelClosed { .. }),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn zero_ref_span_input_is_a_hard_error() {
+    // M15. A malformed PreparedRead with alignment_end <
+    // alignment_start must hard-error on admission.
+    let fa = MockFasta::new("ACGT");
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 3,
+        alignment_end: 2,
+        cigar: vec![CigarOp::Match(0)],
+        seq: vec![],
+        bq_baq: vec![],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("zero"),
+        is_first_mate: true,
+        has_mate: false,
+        adaptor_boundary: None,
+    };
+    let (tx, _rx) = mpsc::sync_channel(64);
+    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default()).expect_err("must error");
+    assert!(
+        matches!(err, super::WalkerError::ZeroRefSpan { .. }),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn open_record_widening_past_max_record_span_errors() {
+    // M16 widen path. A single read with a deletion that pushes the
+    // open record's footprint past MAX_RECORD_SPAN must error.
+    let ref_len = (super::DEFAULT_MAX_RECORD_SPAN as usize) + 50;
+    let fa = MockFasta::new(&"A".repeat(ref_len));
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: ref_len as u32,
+        cigar: vec![
+            CigarOp::Match(1),
+            CigarOp::Deletion(super::DEFAULT_MAX_RECORD_SPAN + 1),
+            CigarOp::Match(1),
+        ],
+        seq: b"AA".to_vec(),
+        bq_baq: vec![30, 30],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("wide"),
+        is_first_mate: true,
+        has_mate: false,
+        adaptor_boundary: None,
+    };
+    let (tx, rx) = mpsc::sync_channel(64);
+    // Spawn a draining collector so the bounded channel doesn't
+    // block the walker before the error path fires.
+    let drain = thread::spawn(move || while rx.recv().is_ok() {});
+    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
+        .expect_err("must trip MAX_RECORD_SPAN");
+    drop(tx);
+    drain.join().unwrap();
+    match err {
+        super::WalkerError::RecordTooWide { cap, .. } => {
+            assert_eq!(cap, super::DEFAULT_MAX_RECORD_SPAN);
+        }
+        other => panic!("expected RecordTooWide, got {other:?}"),
+    }
+}
+
+// M21: malformed-PreparedRead validation. The walker must reject
+// the upstream contract violation as a typed error, not panic on
+// out-of-bounds indexing.
+
+#[test]
+fn admit_rejects_seq_shorter_than_cigar_consumes() {
+    // CIGAR consumes 5 read bases (5M), but seq has only 3.
+    let fa = MockFasta::new("ACGTA");
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 5,
+        cigar: vec![CigarOp::Match(5)],
+        seq: b"ACG".to_vec(),
+        bq_baq: vec![30; 3],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("short"),
+        is_first_mate: true,
+        has_mate: false,
+        adaptor_boundary: None,
+    };
+    let (tx, _rx) = mpsc::sync_channel(64);
+    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
+        .expect_err("must reject malformed read");
+    match err {
+        super::WalkerError::MalformedRead { reason, .. } => {
+            assert!(
+                reason.contains("CIGAR consumes 5 read bases but seq.len = 3"),
+                "got reason: {reason}",
+            );
+        }
+        other => panic!("expected MalformedRead, got {other:?}"),
+    }
+}
+
+#[test]
+fn admit_rejects_seq_bq_length_mismatch() {
+    let fa = MockFasta::new("ACGTA");
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 5,
+        cigar: vec![CigarOp::Match(5)],
+        seq: b"ACGTA".to_vec(),
+        bq_baq: vec![30, 30, 30], // 3 instead of 5
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("bq_short"),
+        is_first_mate: true,
+        has_mate: false,
+        adaptor_boundary: None,
+    };
+    let (tx, _rx) = mpsc::sync_channel(64);
+    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
+        .expect_err("must reject seq/bq mismatch");
+    match err {
+        super::WalkerError::MalformedRead { reason, .. } => {
+            assert!(
+                reason.contains("seq.len (5) != bq_baq.len (3)"),
+                "got reason: {reason}",
+            );
+        }
+        other => panic!("expected MalformedRead, got {other:?}"),
+    }
+}
+
+#[test]
+fn admit_rejects_cigar_consuming_more_read_bases_than_seq_provides() {
+    // CIGAR = 2M + 4I + 2M. Consumes 8 read bases; seq has 5.
+    // The cursor would index seq[2..6] for the Insertion, which
+    // is OOB. Admit-time check must catch it first.
+    let fa = MockFasta::new("ACGTA");
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 4,
+        cigar: vec![CigarOp::Match(2), CigarOp::Insertion(4), CigarOp::Match(2)],
+        seq: b"ACGTA".to_vec(),
+        bq_baq: vec![30; 5],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("cigar_long"),
+        is_first_mate: true,
+        has_mate: false,
+        adaptor_boundary: None,
+    };
+    let (tx, _rx) = mpsc::sync_channel(64);
+    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
+        .expect_err("must reject CIGAR/seq mismatch");
+    match err {
+        super::WalkerError::MalformedRead { reason, .. } => {
+            assert!(
+                reason.contains("CIGAR consumes 8 read bases but seq.len = 5"),
+                "got reason: {reason}",
+            );
+        }
+        other => panic!("expected MalformedRead, got {other:?}"),
+    }
+}
+
+#[test]
+fn fasta_fetch_failure_propagates_as_walker_error_fasta() {
+    // M17. Reference shorter than the read — MockFasta::fetch
+    // returns UnexpectedEof when the open_new fetch runs off the
+    // chromosome's end. Must surface as WalkerError::Fasta with
+    // the correct locus.
+    let fa = MockFasta::new("AC");
+    let r = snp_read("r", 1, b"ACGT", &[30; 4]);
+    let (tx, _rx) = mpsc::sync_channel(64);
+    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
+        .expect_err("must surface fasta error");
+    match err {
+        super::WalkerError::Fasta {
+            chrom_id,
+            start,
+            start_plus_len,
+            ..
+        } => {
+            assert_eq!(chrom_id, 0);
+            assert!(start_plus_len > start);
+        }
+        other => panic!("expected Fasta, got {other:?}"),
     }
 }
