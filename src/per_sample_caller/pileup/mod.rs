@@ -5,7 +5,7 @@
 //! See `ia/specs/pileup_walker.md` for the implementation-ready
 //! specification. This module ships the public types
 //! (`PreparedRead`, `PileupRecord`, `AlleleObservation`, `AlleleSupportStats`,
-//! `SlotId`, `RefBaseFetcher`, `WalkerError`) and the public entry
+//! `SlotId`, `RefSeqFetcher`, `WalkerError`) and the public entry
 //! point `run`. Internal building blocks live in private submodules.
 
 mod active_read_set;
@@ -371,7 +371,7 @@ impl PileupRecord {
 }
 
 // ---------------------------------------------------------------------
-// RefBaseFetcher
+// RefSeqFetcher
 // ---------------------------------------------------------------------
 
 /// What the walker needs from the reference: a way to fetch the
@@ -379,7 +379,7 @@ impl PileupRecord {
 /// chromosome, 1-based start. Implemented by the production wrapper
 /// over `noodles_fasta::Repository`; tests can plug in a mock that
 /// reads from an in-memory string.
-pub trait RefBaseFetcher {
+pub trait RefSeqFetcher {
     /// Fetch `length` reference bases starting at the 1-based
     /// position `start` on chromosome `chrom_id`. Bases are
     /// uppercase ASCII over `{A,C,G,T,N}`. Returns `Err` if the

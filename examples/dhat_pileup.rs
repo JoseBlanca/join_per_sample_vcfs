@@ -26,14 +26,14 @@ use std::sync::mpsc;
 use std::thread;
 
 use merge_per_sample_vcfs::per_sample_caller::pileup::{
-    CigarOp, MateRole, PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig, run,
+    CigarOp, MateRole, PileupRecord, PreparedRead, RefSeqFetcher, WalkerConfig, run,
 };
 
 struct ConstFasta {
     len: usize,
 }
 
-impl RefBaseFetcher for ConstFasta {
+impl RefSeqFetcher for ConstFasta {
     fn fetch(&self, _chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
         let lo = (start_1based - 1) as usize;
         let hi = lo + length as usize;
@@ -109,7 +109,7 @@ fn main() {
     let span: u32 = 50_000;
     let coverage: u32 = 30;
     let read_len: u32 = 5_000;
-    let fasta = ConstFasta {
+    let ref_fetcher = ConstFasta {
         len: span as usize + 100,
     };
 
@@ -123,7 +123,7 @@ fn main() {
         }
         count
     });
-    run(reads, &fasta, &tx, &WalkerConfig::default()).expect("walker run failed");
+    run(reads, &ref_fetcher, &tx, &WalkerConfig::default()).expect("walker run failed");
     drop(tx);
     let count = collector.join().expect("collector panicked");
     eprintln!("pileup records emitted: {count}");

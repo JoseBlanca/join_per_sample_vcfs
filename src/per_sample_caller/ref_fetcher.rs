@@ -1,4 +1,4 @@
-//! Production `RefBaseFetcher` impl that bounds memory by evicting
+//! Production `RefSeqFetcher` impl that bounds memory by evicting
 //! the previous chromosome's bases when the walker advances to a
 //! new one.
 //!
@@ -21,9 +21,9 @@ use std::path::Path;
 use noodles_fasta as fasta;
 
 use super::cram_input::ContigList;
-use super::pileup::RefBaseFetcher;
+use super::pileup::RefSeqFetcher;
 
-/// `RefBaseFetcher` that holds a single `noodles_fasta::Repository`
+/// `RefSeqFetcher` that holds a single `noodles_fasta::Repository`
 /// for the whole run and clears its cache whenever the walker moves
 /// to a new chromosome. Steady-state cache size is exactly one
 /// contig regardless of how many chromosomes have been visited.
@@ -62,7 +62,7 @@ impl ChromBoundaryRefFetcher {
     }
 }
 
-impl RefBaseFetcher for ChromBoundaryRefFetcher {
+impl RefSeqFetcher for ChromBoundaryRefFetcher {
     fn fetch(&self, chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
         if self.current_chrom.get() != Some(chrom_id) {
             // Walker moved to a new chromosome (or this is the

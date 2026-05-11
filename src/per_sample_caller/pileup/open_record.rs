@@ -18,7 +18,7 @@ use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::slot_allocator::SlotId;
 use super::{
-    AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, PileupRecord, RefBaseFetcher,
+    AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, PileupRecord, RefSeqFetcher,
 };
 
 /// Pre-allocated capacity for `OpenAllele::chain_slots` — sized
@@ -296,7 +296,7 @@ impl OpenPileupRecordTable {
         &mut self,
         key: u32,
         new_end_exclusive: u32,
-        fasta: &dyn RefBaseFetcher,
+        ref_fetcher: &dyn RefSeqFetcher,
     ) -> Result<bool, WalkerError> {
         // PANIC-FREE: `widen` is only called from
         // `process_position` immediately after `find_overlapping`
@@ -321,7 +321,7 @@ impl OpenPileupRecordTable {
                 cap: self.max_record_span,
             });
         }
-        let extra_bases = fasta
+        let extra_bases = ref_fetcher
             .fetch(rec.chrom_id, old_end, extra_len)
             .map_err(|source| WalkerError::Fasta {
                 chrom_id: rec.chrom_id,
@@ -367,13 +367,13 @@ impl OpenPileupRecordTable {
     }
 
     /// Open a fresh record at `pos` with REF span `span`, fetching
-    /// the reference bases from `fasta`.
+    /// the reference bases from `ref_fetcher`.
     fn open_new(
         &mut self,
         chrom_id: u32,
         pos: u32,
         span: u32,
-        fasta: &dyn RefBaseFetcher,
+        ref_fetcher: &dyn RefSeqFetcher,
     ) -> Result<&mut OpenPileupRecord, WalkerError> {
         if span > self.max_record_span {
             return Err(WalkerError::RecordTooWide {
@@ -383,14 +383,15 @@ impl OpenPileupRecordTable {
                 cap: self.max_record_span,
             });
         }
-        let ref_seq = fasta
-            .fetch(chrom_id, pos, span)
-            .map_err(|source| WalkerError::Fasta {
-                chrom_id,
-                start: pos,
-                start_plus_len: pos + span,
-                source,
-            })?;
+        let ref_seq =
+            ref_fetcher
+                .fetch(chrom_id, pos, span)
+                .map_err(|source| WalkerError::Fasta {
+                    chrom_id,
+                    start: pos,
+                    start_plus_len: pos + span,
+                    source,
+                })?;
         let rec = OpenPileupRecord::new(chrom_id, pos, ref_seq);
         self.records.insert(pos, rec);
         // PANIC-FREE: the entry was just inserted on the previous
@@ -603,7 +604,7 @@ pub(super) fn process_position(
     chrom_id: u32,
     contributors: &[ReadContribution],
     active_reads: &ActiveReads,
-    fasta: &dyn RefBaseFetcher,
+    ref_fetcher: &dyn RefSeqFetcher,
 ) -> Result<ProcessOutcome, WalkerError> {
     let mut affected: Vec<u32> = Vec::new();
     let mut widen_count: u64 = 0;
@@ -628,12 +629,12 @@ pub(super) fn process_position(
                     .get(&k)
                     .expect("just located")
                     .footprint_end_exclusive();
-                if event_end > cur_end && open.widen(k, event_end, fasta)? {
+                if event_end > cur_end && open.widen(k, event_end, ref_fetcher)? {
                     widen_count += 1;
                 }
                 k
             } else {
-                let new = open.open_new(chrom_id, event_start, ev.footprint_span(), fasta)?;
+                let new = open.open_new(chrom_id, event_start, ev.footprint_span(), ref_fetcher)?;
                 new.pos
             };
             if !affected.contains(&key) {

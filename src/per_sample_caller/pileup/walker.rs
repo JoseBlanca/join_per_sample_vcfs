@@ -14,7 +14,7 @@ use super::open_record::{
     OpenPileupRecordTable, ReadContribution, process_position, stamp_lifecycle_marks,
 };
 use super::slot_allocator::{SlotAllocator, SlotAllocatorCounters, SlotId};
-use super::{PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig};
+use super::{PileupRecord, PreparedRead, RefSeqFetcher, WalkerConfig};
 
 /// Run the walker over a coordinate-sorted stream of prepared
 /// reads, pushing each closed `PileupRecord` through `tx`.
@@ -25,13 +25,13 @@ use super::{PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig};
 /// malformed input shouldn't pass silently.
 pub fn run<I, F>(
     reads: I,
-    fasta: &F,
+    ref_fetcher: &F,
     tx: &SyncSender<PileupRecord>,
     config: &WalkerConfig,
 ) -> Result<RunSummary, WalkerError>
 where
     I: IntoIterator<Item = PreparedRead>,
-    F: RefBaseFetcher,
+    F: RefSeqFetcher,
 {
     let mut state = WalkerState::new(*config);
     let mut iter = reads.into_iter().peekable();
@@ -94,7 +94,7 @@ where
         // Process events at walker_pos and fold them into open
         // records. Mate-overlap is resolved fold-time inside this
         // step (see §"Mate overlap" handling below).
-        state.process_position(fasta)?;
+        state.process_position(ref_fetcher)?;
 
         // Expire reads whose alignment_end < walker_pos. Order
         // matters: expire BEFORE close so any slot lifecycle
@@ -288,7 +288,7 @@ impl WalkerState {
         Ok(())
     }
 
-    fn process_position<F: RefBaseFetcher>(&mut self, fasta: &F) -> Result<(), WalkerError> {
+    fn process_position<F: RefSeqFetcher>(&mut self, ref_fetcher: &F) -> Result<(), WalkerError> {
         // Step 1: query each active read's cursor for events
         // anchored at walker_pos. Reads with no event here are
         // silent (deletion interior or N-skip), so they are not
@@ -370,7 +370,7 @@ impl WalkerState {
             self.chrom_id,
             contributors,
             &self.active_reads,
-            fasta,
+            ref_fetcher,
         )?;
         self.summary.record_widen_events += outcome.widen_count;
 

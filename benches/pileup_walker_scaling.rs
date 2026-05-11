@@ -21,16 +21,16 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use merge_per_sample_vcfs::per_sample_caller::pileup::{
-    CigarOp, PileupRecord, PreparedRead, RefBaseFetcher, WalkerConfig, run,
+    CigarOp, MateRole, PileupRecord, PreparedRead, RefSeqFetcher, WalkerConfig, run,
 };
 
-/// Constant-base reference. The walker only needs `RefBaseFetcher`,
+/// Constant-base reference. The walker only needs `RefSeqFetcher`,
 /// so we avoid the FASTA toolchain entirely.
 struct ConstFasta {
     len: usize,
 }
 
-impl RefBaseFetcher for ConstFasta {
+impl RefSeqFetcher for ConstFasta {
     fn fetch(&self, _chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
         let lo = (start_1based - 1) as usize;
         let hi = lo + length as usize;
@@ -70,8 +70,7 @@ fn build_reads(read_len: u32, span: u32, coverage: u32) -> Vec<PreparedRead> {
             mq_log_err: -3.0,
             is_reverse_strand: false,
             qname: Arc::from(format!("r{i}").as_str()),
-            is_first_mate: true,
-            has_mate: false,
+            mate_role: MateRole::Solo,
             adaptor_boundary: None,
         });
     }
@@ -172,8 +171,7 @@ fn build_multi_op_reads(read_len: u32, span: u32, coverage: u32) -> Vec<Prepared
             mq_log_err: -3.0,
             is_reverse_strand: false,
             qname: Arc::from(format!("r{i}").as_str()),
-            is_first_mate: true,
-            has_mate: false,
+            mate_role: MateRole::Solo,
             adaptor_boundary: None,
         });
     }
@@ -181,7 +179,7 @@ fn build_multi_op_reads(read_len: u32, span: u32, coverage: u32) -> Vec<Prepared
     reads
 }
 
-fn run_walker(reads: Vec<PreparedRead>, fasta: &ConstFasta) -> u64 {
+fn run_walker(reads: Vec<PreparedRead>, ref_fetcher: &ConstFasta) -> u64 {
     let (tx, rx) = mpsc::sync_channel::<PileupRecord>(64);
     let collector = thread::spawn(move || {
         let mut count = 0u64;
@@ -190,7 +188,7 @@ fn run_walker(reads: Vec<PreparedRead>, fasta: &ConstFasta) -> u64 {
         }
         count
     });
-    run(reads, fasta, &tx, &WalkerConfig::default()).expect("walker run failed");
+    run(reads, ref_fetcher, &tx, &WalkerConfig::default()).expect("walker run failed");
     drop(tx);
     collector.join().expect("collector panicked")
 }
@@ -207,7 +205,7 @@ fn bench_walker_read_length(c: &mut Criterion) {
     // event vector at each walker step.
     let span: u32 = 50_000;
     let coverage: u32 = 30;
-    let fasta = ConstFasta {
+    let ref_fetcher = ConstFasta {
         len: span as usize + 100,
     };
 
@@ -222,7 +220,7 @@ fn bench_walker_read_length(c: &mut Criterion) {
             |b, &read_len| {
                 b.iter_batched(
                     || build_reads(read_len, span, coverage),
-                    |reads| black_box(run_walker(reads, &fasta)),
+                    |reads| black_box(run_walker(reads, &ref_fetcher)),
                     BatchSize::LargeInput,
                 );
             },
@@ -246,7 +244,7 @@ fn bench_walker_multi_op(c: &mut Criterion) {
 
     let span: u32 = 50_000;
     let coverage: u32 = 30;
-    let fasta = ConstFasta {
+    let ref_fetcher = ConstFasta {
         len: span as usize + 100,
     };
 
@@ -257,7 +255,7 @@ fn bench_walker_multi_op(c: &mut Criterion) {
             |b, &read_len| {
                 b.iter_batched(
                     || build_multi_op_reads(read_len, span, coverage),
-                    |reads| black_box(run_walker(reads, &fasta)),
+                    |reads| black_box(run_walker(reads, &ref_fetcher)),
                     BatchSize::LargeInput,
                 );
             },

@@ -12,7 +12,7 @@ use std::thread;
 use super::CigarOp;
 use super::MateRole;
 use super::PreparedRead;
-use super::RefBaseFetcher;
+use super::RefSeqFetcher;
 use super::WalkerConfig;
 use super::run;
 
@@ -20,7 +20,7 @@ use super::run;
 // MockFasta
 // ---------------------------------------------------------------------
 
-/// In-memory `RefBaseFetcher` implementation backed by a single
+/// In-memory `RefSeqFetcher` implementation backed by a single
 /// chromosome string. Tests inject their reference here directly
 /// instead of building a real FASTA file.
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ impl MockFasta {
     }
 }
 
-impl RefBaseFetcher for MockFasta {
+impl RefSeqFetcher for MockFasta {
     fn fetch(
         &self,
         chrom_id: u32,
@@ -113,17 +113,17 @@ pub fn paired_snp_reads(
 /// Drive `run` on a fixed input list, collecting emitted records.
 /// Stage 2 runs on a separate thread per spec; we mirror that
 /// shape here to exercise the channel emission path properly.
-pub fn drive_walker(reads: Vec<PreparedRead>, fasta: MockFasta) -> Vec<super::PileupRecord> {
-    drive_walker_with_summary(reads, fasta).0
+pub fn drive_walker(reads: Vec<PreparedRead>, ref_fetcher: MockFasta) -> Vec<super::PileupRecord> {
+    drive_walker_with_summary(reads, ref_fetcher).0
 }
 
 /// Same as `drive_walker` but also returns the run's
 /// `RunSummary`. Useful for tests that assert on counters.
 pub fn drive_walker_with_summary(
     reads: Vec<PreparedRead>,
-    fasta: MockFasta,
+    ref_fetcher: MockFasta,
 ) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
-    drive_walker_with_config(reads, fasta, &WalkerConfig::default())
+    drive_walker_with_config(reads, ref_fetcher, &WalkerConfig::default())
 }
 
 /// Drive `run` with an explicit `WalkerConfig`. Used by tests that
@@ -131,7 +131,7 @@ pub fn drive_walker_with_summary(
 /// trip the truncation path with a small synthetic input).
 pub fn drive_walker_with_config(
     reads: Vec<PreparedRead>,
-    fasta: MockFasta,
+    ref_fetcher: MockFasta,
     config: &WalkerConfig,
 ) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
     let (tx, rx) = mpsc::sync_channel::<super::PileupRecord>(64);
@@ -147,7 +147,7 @@ pub fn drive_walker_with_config(
     // wakes (channel closed) regardless of whether `run` returned
     // Ok or Err, so the collector join is panic-resilient even
     // under `panic=abort`.
-    let result = run(reads, &fasta, &tx, config);
+    let result = run(reads, &ref_fetcher, &tx, config);
     drop(tx);
     let records = collector.join().expect("collector thread panicked");
     let summary = result.expect("walker run failed");
