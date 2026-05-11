@@ -241,7 +241,7 @@ The two structures are kept in sync through encapsulation:
 admission inserts into both, expiry uses `Vec::swap_remove` on
 `active_reads` and updates `active_by_read_id` for both the
 removed entry and the entry that took its place. The pattern
-is standard and contained in `active_set.rs`; tests assert
+is standard and contained in `active_read_set.rs`; tests assert
 `active_by_read_id[r] == active_reads.iter().position(|x|
 x.read_id == r)` after each admission and expiry.
 
@@ -1429,7 +1429,7 @@ src/per_sample_caller/
   pileup/
     mod.rs               — public entry: `run(reads, fasta, tx)`
     walker_state.rs      — WalkerState, the loop driver
-    active_set.rs        — ActiveReads, admission/exit, mate linking
+    active_read_set.rs   — ActiveReads, admission/exit, mate linking
     decompose.rs         — CIGAR → ReadEvent
     anchor.rs            — OpenPileupRecord, OpenAllele, open-record merging + widening
     allele_support.rs    — AlleleSupportStats + accumulation

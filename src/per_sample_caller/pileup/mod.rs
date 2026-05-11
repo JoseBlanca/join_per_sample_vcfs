@@ -8,7 +8,7 @@
 //! `SlotId`, `RefBaseFetcher`, `WalkerError`) and the public entry
 //! point `run`. Internal building blocks live in private submodules.
 
-mod active_set;
+mod active_read_set;
 mod cigar_cursor;
 mod decompose;
 mod errors;

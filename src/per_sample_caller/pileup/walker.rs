@@ -7,7 +7,7 @@ use std::sync::mpsc::{SendError, SyncSender};
 
 use ahash::AHashMap;
 
-use super::active_set::ActiveSet;
+use super::active_read_set::ActiveReads;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::open_record::{
@@ -41,7 +41,7 @@ where
     // "iter empty" alone would leak open records whose anchor
     // positions sit ahead of the walker but inside the active
     // set's coverage.
-    while iter.peek().is_some() || !state.active.is_empty() {
+    while iter.peek().is_some() || !state.active_reads.is_empty() {
         // Chromosome boundary: validate the change is forward,
         // then flush everything from the current chromosome
         // before continuing.
@@ -164,7 +164,7 @@ struct WalkerState {
     /// Last admitted (chrom_id, alignment_start) for the order
     /// invariant.
     last_admitted_locus: Option<(u32, u32)>,
-    active: ActiveSet,
+    active_reads: ActiveReads,
     slots: SlotAllocator,
     open: OpenPileupRecordTable,
     summary: RunSummary,
@@ -183,7 +183,7 @@ impl WalkerState {
             walker_pos: 1,
             last_admitted_chrom_id: None,
             last_admitted_locus: None,
-            active: ActiveSet::new(),
+            active_reads: ActiveReads::new(),
             slots: SlotAllocator::with_caps(config.max_active_slots, config.mate_lookup_window),
             open: OpenPileupRecordTable::with_cap(config.max_record_span),
             summary: RunSummary::default(),
@@ -283,7 +283,7 @@ impl WalkerState {
             });
         }
         self.last_admitted_locus = Some(here);
-        self.active.admit(read, &mut self.slots)?;
+        self.active_reads.admit(read, &mut self.slots)?;
         self.summary.reads_admitted += 1;
         Ok(())
     }
@@ -298,7 +298,7 @@ impl WalkerState {
         self.contributors_buf.clear();
         let contributors = &mut self.contributors_buf;
 
-        for active in self.active.iter() {
+        for active in self.active_reads.iter() {
             let events_at_pos = active.cursor.events_at(walker_pos, &active.read);
 
             if events_at_pos.is_empty() {
@@ -369,7 +369,7 @@ impl WalkerState {
             walker_pos,
             self.chrom_id,
             contributors,
-            &self.active,
+            &self.active_reads,
             fasta,
         )?;
         self.summary.record_widen_events += outcome.widen_count;
@@ -404,7 +404,8 @@ impl WalkerState {
             self.walker_pos > 0,
             "walker_pos starts at 1 and never decreases below 1",
         );
-        self.active.expire_passed(self.walker_pos, &mut self.slots)
+        self.active_reads
+            .expire_passed(self.walker_pos, &mut self.slots)
     }
 
     fn advance(&mut self, next_pulled: Option<&PreparedRead>) -> Result<(), WalkerError> {
@@ -427,7 +428,7 @@ impl WalkerState {
 
         // If the active set is empty and the next pulled read
         // starts past the walker, skip the uncovered span.
-        if self.active.is_empty()
+        if self.active_reads.is_empty()
             && let Some(p) = next_pulled
             && p.chrom_id == self.chrom_id
             && p.alignment_start > self.walker_pos
@@ -449,7 +450,8 @@ impl WalkerState {
         // once. flush_all only emits `expired_marks` (release_slot
         // never touches `new_marks`), so we don't need to merge
         // a pre-flush drain with a post-flush drain.
-        self.active.flush_all(&mut self.slots, self.walker_pos)?;
+        self.active_reads
+            .flush_all(&mut self.slots, self.walker_pos)?;
         let (new, expired) = self.slots.drain_lifecycle_marks();
         stamp_lifecycle_marks(&mut records, new, expired);
         for record in records {
@@ -463,7 +465,7 @@ impl WalkerState {
         // the perf-hoisted `allele_seq_buf` capacity across the
         // chromosome boundary (Mi11).
         self.slots.reset();
-        self.active.reset();
+        self.active_reads.reset();
         self.open.reset();
         Ok(())
     }

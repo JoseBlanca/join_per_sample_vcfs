@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use ahash::AHashMap;
 
-use super::active_set::ActiveSet;
+use super::active_read_set::ActiveReads;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::slot_allocator::SlotId;
@@ -602,7 +602,7 @@ pub(super) fn process_position(
     walker_pos: u32,
     chrom_id: u32,
     contributors: &[ReadContribution],
-    active: &ActiveSet,
+    active_reads: &ActiveReads,
     fasta: &dyn RefBaseFetcher,
 ) -> Result<ProcessOutcome, WalkerError> {
     let mut affected: Vec<u32> = Vec::new();
@@ -688,7 +688,7 @@ pub(super) fn process_position(
             // (the same step that produces `contributors`), and
             // `process_position` runs before `expire_passed_reads`,
             // so the read_id is still in the active set here.
-            let active_read = active
+            let active_read = active_reads
                 .get_by_read_id(contrib.read_id)
                 .expect("contributor's read_id must still be in the active set");
             let mut window_events =
@@ -892,13 +892,13 @@ fn insert_sorted_unique(v: &mut Vec<SlotId>, slot: SlotId) {
 /// walker assembles these from its active set before calling
 /// `process_position`. The contribution carries no event window —
 /// the fold pulls window events lazily from the read's
-/// `CigarCursor` via `read_id` lookup against the `ActiveSet`.
+/// `CigarCursor` via `read_id` lookup against the `ActiveReads`.
 #[derive(Debug, Clone)]
 pub(super) struct ReadContribution {
     /// Active-set local id of the contributing read. Keys the
     /// per-record `folded_reads` map (so re-folds subtract the
     /// prior contribution) and is also how the fold looks the
-    /// read up against the `ActiveSet` to query window events.
+    /// read up against the `ActiveReads` to query window events.
     pub read_id: u32,
     pub chain_slot_id: SlotId,
     /// Events whose anchor *is* this walker_pos (used by step 3

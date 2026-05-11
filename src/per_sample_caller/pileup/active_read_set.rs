@@ -27,7 +27,7 @@ pub struct ActiveRead {
 }
 
 #[derive(Debug)]
-pub struct ActiveSet {
+pub struct ActiveReads {
     /// Primary container. Iteration order is admission order; we
     /// rely on this for deterministic record-formation tiebreaks
     /// (smaller `read_id` first).
@@ -41,7 +41,7 @@ pub struct ActiveSet {
     next_read_id: u32,
 }
 
-impl ActiveSet {
+impl ActiveReads {
     pub fn new() -> Self {
         Self {
             reads: Vec::new(),
@@ -222,7 +222,7 @@ impl ActiveSet {
     }
 }
 
-impl Default for ActiveSet {
+impl Default for ActiveReads {
     fn default() -> Self {
         Self::new()
     }
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn admit_assigns_increasing_read_ids() {
-        let mut s = ActiveSet::new();
+        let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         let r0 = s.admit(solo_read("a", 0, 100, 50), &mut a).unwrap();
         let r1 = s.admit(solo_read("b", 0, 110, 50), &mut a).unwrap();
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn secondary_index_maps_read_id_to_correct_entry() {
-        let mut s = ActiveSet::new();
+        let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         s.admit(solo_read("a", 0, 100, 50), &mut a).unwrap();
         let r1 = s.admit(solo_read("b", 0, 110, 50), &mut a).unwrap();
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn expire_passed_drops_only_reads_behind_walker() {
-        let mut s = ActiveSet::new();
+        let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         let _r0 = s.admit(solo_read("short", 0, 100, 10), &mut a).unwrap(); // ends 109
         let r1 = s.admit(solo_read("long", 0, 100, 200), &mut a).unwrap(); // ends 299
@@ -307,7 +307,7 @@ mod tests {
         // Admit three reads. Expire the middle one (walker between
         // the second's end and the third's end). Verify the index
         // still resolves the remaining two correctly.
-        let mut s = ActiveSet::new();
+        let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         let r0 = s.admit(solo_read("a", 0, 100, 1000), &mut a).unwrap(); // ends 1099
         let _r1 = s.admit(solo_read("b", 0, 100, 50), &mut a).unwrap(); // ends 149
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn paired_reads_get_mate_read_id_cross_links() {
-        let mut s = ActiveSet::new();
+        let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         let m1 = s.admit(paired_read("p", true, 100, 50), &mut a).unwrap();
         let m2 = s.admit(paired_read("p", false, 130, 50), &mut a).unwrap();
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn flush_all_releases_every_slot() {
-        let mut s = ActiveSet::new();
+        let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         for i in 0..5 {
             s.admit(solo_read(&format!("r{i}"), 0, 100, 50), &mut a)
