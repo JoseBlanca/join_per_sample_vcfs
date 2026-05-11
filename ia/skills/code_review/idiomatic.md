@@ -2,7 +2,7 @@
 
 **Purpose.** Code reads as Rust the language and ecosystem expect — iterators, exhaustive matches, type-level invariants, minimal lifetimes, no needless allocation.
 
-**Triggers.** Read every match expression, every function signature, every struct/enum definition, every use of `clone()` / `to_string()`, every `Box`/`Vec`/`String` parameter, every `impl Copy`, every visibility modifier.
+**Triggers.** Read every match expression, every function signature, every struct/enum definition, every use of `clone()` / `to_string()`, every `Box`/`Vec`/`String` parameter, every `impl Copy`, every visibility modifier. When a struct or parameter list contains two or more `bool` fields, write out the truth table (2ⁿ combinations) before continuing — if any row is "can't happen" or "doesn't apply", that is a rule-13 finding.
 
 **Skip when.** Never skipped.
 
@@ -15,7 +15,31 @@
   - (b) two `bool` parameters at the same call site (use an enum);
   - (c) a struct's fields are only valid in certain combinations (split into an enum);
   - (d) a return type allows an "empty" value where empty is invalid (use `NonEmpty<T>` or a constructor-validated newtype);
-  - (e) a numeric field has a documented range (use a newtype with a fallible constructor).
+  - (e) a numeric field has a documented range (use a newtype with a fallible constructor);
+  - (f) **co-dependent bools** — two `bool` fields (on a struct, in a parameter list, or carried together through the code) where the validity or meaning of one depends on the value of the other. The truth table has fewer meaningful rows than 2ⁿ. Replace with an enum whose variants are exactly the meaningful rows; expose the original bits via predicate methods so call sites don't change shape. This is the most common manifestation of (b) and (c) and is mechanically recognizable from field docs that reference adjacent fields, or that name bits from the same flag set / spec.
+
+  Worked example. Two SAM-flag-derived bools on the same struct:
+
+  ```rust
+  pub struct PreparedRead {
+      pub is_first_mate: bool, // SAM flag 0x40
+      pub has_mate:      bool, // SAM flag 0x1
+      // ...
+  }
+  ```
+
+  `has_mate = false, is_first_mate = true` is nonsense ("solo but first of pair"). Collapse to a 3-variant enum:
+
+  ```rust
+  pub enum MateRole { Solo, FirstOfPair, SecondOfPair }
+
+  impl MateRole {
+      pub fn is_paired(self)        -> bool { !matches!(self, Self::Solo) }
+      pub fn is_first_of_pair(self) -> bool {  matches!(self, Self::FirstOfPair) }
+  }
+  ```
+
+  Same byte footprint, same branch shape at call sites, one fewer representable bug.
 - **Control construction at the type level.** When a type's invariants are established by a constructor, prevent construction by other paths rather than relying on convention:
   - **Private unit field** (`_private: ()`) on a struct with otherwise-`pub` fields blocks struct-literal construction outside the defining module while keeping field reads public. Use when a `pub` struct must be constructed only via a validating constructor.
   - **Sealed traits** for `pub trait`s that must not be implementable downstream: nest a private supertrait in a `mod private { pub trait Sealed {} }` and require it as a bound. Use when adding a method must remain non-breaking, or when correctness depends on knowing every implementor.
