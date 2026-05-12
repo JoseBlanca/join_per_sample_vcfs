@@ -42,15 +42,18 @@ where
     // anchor positions sit ahead of the walker but inside the
     // active set's coverage.
     while reads_iter.peek().is_some() || !state.active_reads.is_empty() {
-        // Chromosome boundary: validate the change is forward,
-        // then flush everything from the current chromosome
-        // before continuing.
+        // Chromosome boundary: the next peeked read sits on a new
+        // chromosome, so finalise everything still in flight from
+        // the previous one — any still-open `PileupRecord`s are
+        // drained and emitted, active reads are released (their
+        // expiry markers are stamped onto the emitted records),
+        // and the per-chromosome state is reset. No data is lost;
+        // "flush" here means "finalise & emit", not "discard".
         //
-        // The regression check has to live *before* the flush —
-        // `flush_chromosome` resets `last_admitted_locus = None`,
-        // which would mask a regression at the per-read order
-        // check inside `admit_read`. See finding M2 in
-        // `ia/reviews/pileup_2026-05-09.md`.
+        // The forward-direction check has to run *before* the
+        // flush so a backward chromosome change errors out
+        // without first emitting the previous chromosome's
+        // records into the channel.
         if let Some(peeked_read) = reads_iter.peek()
             && let Some(prev_chrom_id) = state.last_admitted_chrom_id
             && prev_chrom_id != peeked_read.chrom_id
