@@ -13,7 +13,7 @@ use crate::per_sample_caller::pileup::{MateRole, PreparedRead, RefSeqFetcher};
 
 use super::BaqConfig;
 use super::probaln::probaln_glocal;
-use super::scratch::Scratch;
+use super::scratch::ProbalnScratch;
 
 /// Per-read result of [`BaqEngine::process`]: either a fully-built
 /// `PreparedRead` with `bq_baq = min(BQ, BAQ)`, or a structured skip
@@ -45,7 +45,7 @@ pub enum BaqSkipReason {
     /// splice gaps are out of scope; reject defensively. Mirrors
     /// realn.c:190.
     ContainsRefSkip,
-    /// `probaln_glocal` returned [`BaqOverflow`](super::errors::BaqOverflow)
+    /// `probaln_glocal` returned [`ProbalnError`](super::errors::ProbalnError)
     /// — practically only triggered by pathological read lengths.
     HmmOverflow,
     /// Reference window extension reached past the chromosome end and
@@ -54,36 +54,45 @@ pub enum BaqSkipReason {
     /// run the HMM on a truncated window with no clear interpretation
     /// of the trailing query bases.
     RefWindowPastChromEnd,
+    /// `MappedRead.pos` exceeds `i32::MAX` (positions on chromosomes
+    /// longer than 2 Gbp). The HMM uses `i32` for ref-axis arithmetic;
+    /// narrowing would corrupt the alignment.
+    PosOutOfRange,
+    /// `MappedRead.seq.len()` exceeds `i32::MAX`. Same i32-axis reason.
+    ReadTooLong,
+    /// `MappedRead.ref_id` exceeds `u32::MAX`. The fetcher API uses
+    /// `u32` for chromosome ids.
+    ChromIdOutOfRange,
 }
 
 /// Per-read BAQ driver. Owns reusable scratch buffers so a batched
 /// per-thread pass over reads does not allocate.
 ///
-/// `bq_buf` is the in-flight `bq_baq` working buffer that gets handed
-/// off to `PreparedRead` via `mem::take` on the success path; the
-/// engine starts every new read with a fresh empty `Vec` whose
+/// `bq_baq_buf` is the in-flight `bq_baq` working buffer that gets
+/// handed off to `PreparedRead` via `mem::take` on the success path;
+/// the engine starts every new read with a fresh empty `Vec` whose
 /// capacity is paid for once (on the first capping that allocates and
 /// every time the next read is longer than any prior).
 pub struct BaqEngine {
     cfg: BaqConfig,
-    scratch: Scratch,
-    state: Vec<i32>,
-    q: Vec<u8>,
-    tref: Vec<u8>,
-    tquery: Vec<u8>,
-    bq_buf: Vec<u8>,
+    scratch: ProbalnScratch,
+    encoded_ref: Vec<u8>,
+    encoded_query: Vec<u8>,
+    bq_baq_buf: Vec<u8>,
 }
 
 impl BaqEngine {
+    /// Construct a per-thread BAQ engine. Cheap — allocates only the
+    /// empty scratch `Vec`s; DP buffers grow lazily on the first
+    /// `process` call. Use one engine per worker thread (`BaqStream`
+    /// already does this via `map_init`); the engine is not `Sync`.
     pub fn new(cfg: BaqConfig) -> Self {
         Self {
             cfg,
-            scratch: Scratch::new(),
-            state: Vec::new(),
-            q: Vec::new(),
-            tref: Vec::new(),
-            tquery: Vec::new(),
-            bq_buf: Vec::new(),
+            scratch: ProbalnScratch::new(),
+            encoded_ref: Vec::new(),
+            encoded_query: Vec::new(),
+            bq_baq_buf: Vec::new(),
         }
     }
 
@@ -106,47 +115,75 @@ impl BaqEngine {
             return BaqOutcome::Skipped(BaqSkipReason::QualAbsent);
         }
 
-        let pos_0 = read.pos as i32 - 1;
-        let (xb0, xe0, yb, ye, bw) = match locate_alignment_span(&read.cigar, pos_0, self.cfg.bw) {
-            Ok(span) => span,
-            Err(reason) => return BaqOutcome::Skipped(reason),
+        // Checked narrowing — `MappedRead` is decoded from external
+        // CRAM/SAM and is not type-bounded to the narrower types the
+        // BAQ pipeline uses. Plain `as` casts wrap silently in release.
+        let pos_0 = match i32::try_from(read.pos).ok().and_then(|p| p.checked_sub(1)) {
+            Some(v) => v,
+            None => return BaqOutcome::Skipped(BaqSkipReason::PosOutOfRange),
         };
-        let l_qseq = read.seq.len() as i32;
+        let l_qseq = match i32::try_from(read.seq.len()) {
+            Ok(v) => v,
+            Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ReadTooLong),
+        };
+        let chrom_id = match u32::try_from(read.ref_id) {
+            Ok(v) => v,
+            Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ChromIdOutOfRange),
+        };
+
+        // (xb..xe): ref span; (yb..ye): query span. Both 0-based,
+        // half-open. `bw` may be wider than `cfg.band_half_width` if a
+        // single indel forces it.
+        let (xb0, xe0, yb, ye, bw) =
+            match locate_alignment_span(&read.cigar, pos_0, self.cfg.band_half_width) {
+                Ok(span) => span,
+                Err(reason) => return BaqOutcome::Skipped(reason),
+            };
         let (xb, xe) = extend_ref_window(xb0, xe0, yb, ye, l_qseq, bw);
-        let length = (xe - xb) as u32;
-        if length == 0 {
+        if xe <= xb {
             return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd);
         }
+        let length = (xe - xb) as u32;
 
-        let ref_bytes = match ref_fetcher.fetch(read.ref_id as u32, (xb + 1) as u32, length) {
+        let ref_bytes = match ref_fetcher.fetch(chrom_id, (xb + 1) as u32, length) {
             Ok(bytes) if !bytes.is_empty() => bytes,
-            _ => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
+            Ok(_empty) => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
+            Err(e) => {
+                // Surface genuine I/O failures distinct from past-chrom-end.
+                // The pileup-walker side has no way to tell from skip
+                // telemetry alone whether a transient fetch failure
+                // occurred, so log it here and still drop the read.
+                eprintln!(
+                    "warning: BAQ ref fetch failed (ref_id={}, xb={}, length={}): {}; \
+                     skipping read",
+                    read.ref_id, xb, length, e,
+                );
+                return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd);
+            }
         };
 
-        self.tref.clear();
-        self.tref.extend(ref_bytes.iter().map(|&b| encode_base(b)));
-        self.tquery.clear();
-        self.tquery.extend(read.seq.iter().map(|&b| encode_base(b)));
+        self.encoded_ref.clear();
+        self.encoded_ref
+            .extend(ref_bytes.iter().map(|&b| encode_base(b)));
+        self.encoded_query.clear();
+        self.encoded_query
+            .extend(read.seq.iter().map(|&b| encode_base(b)));
 
-        let hmm_cfg = BaqConfig { bw, ..self.cfg };
-
-        // resize without a prior clear(): only the growth above the
-        // current length pays a zero-fill (matters for variable-length
-        // workloads; uniform L=150 pays the fill exactly once on the
-        // first read). The HMM's MAP-decode loop writes every entry
-        // of `state` and `q` before they leave the engine, so the
-        // residual values from the previous read are harmless.
-        self.state.resize(read.seq.len(), 0);
-        self.q.resize(read.seq.len(), 0);
+        // Spell every BaqConfig field — adding a new field becomes a
+        // compile error at this site rather than silently inheriting
+        // from `self.cfg` (refactor-safety: parity drift hazard).
+        let hmm_cfg = BaqConfig {
+            gap_open_prob: self.cfg.gap_open_prob,
+            gap_extend_prob: self.cfg.gap_extend_prob,
+            band_half_width: bw,
+        };
 
         if probaln_glocal(
             &mut self.scratch,
-            &self.tref,
-            &self.tquery,
+            &self.encoded_ref,
+            &self.encoded_query,
             &read.qual,
             &hmm_cfg,
-            &mut self.state,
-            &mut self.q,
         )
         .is_err()
         {
@@ -154,23 +191,23 @@ impl BaqEngine {
         }
 
         apply_baq_cap_into(
-            &mut self.bq_buf,
+            &mut self.bq_baq_buf,
             &read.cigar,
             &read.qual,
-            &self.state,
-            &self.q,
+            &self.scratch.state,
+            &self.scratch.q,
             pos_0,
             xb,
         );
-        let bq_baq = std::mem::take(&mut self.bq_buf);
+        let bq_baq = std::mem::take(&mut self.bq_baq_buf);
 
-        BaqOutcome::Capped(mapped_to_prepared(read, bq_baq))
+        BaqOutcome::Capped(mapped_to_prepared(read, chrom_id, bq_baq))
     }
 }
 
 // ---------------------------------------------------------------------
-// CIGAR / base helpers — shared between `BaqEngine::process` and the
-// parity-test driver via `pub(super)` visibility.
+// CIGAR / base helpers — `pub(super)` so the test module can call them
+// directly rather than maintaining a duplicate copy.
 // ---------------------------------------------------------------------
 
 /// Lookup table for [`encode_base`]: A/C/G/T → 0/1/2/3 (case-insensitive),
@@ -190,9 +227,14 @@ static ENCODE_BASE: [u8; 256] = {
     t
 };
 
-/// Encode an ASCII base byte (case-insensitive A/C/G/T) into the 0..=3
-/// values `probaln_glocal` consumes; anything else (including `N`)
-/// becomes 4 (ambiguous). Mirrors htslib's `seq_nt16_int[seq_nt16_table[ch]]`.
+/// Encode an ASCII base byte into the 0..=3 values `probaln_glocal`
+/// consumes: A/a → 0, C/c → 1, G/g → 2, T/t → 3. Anything else
+/// (including `N` and every IUPAC ambiguity code) becomes 4
+/// ("ambiguous"). htslib's `seq_nt16_int[seq_nt16_table[ch]]` maps the
+/// IUPAC ambiguity bases to specific 0..=3 slots; we collapse them
+/// all to 4 because the BAQ parity fixtures contain no ambiguity
+/// codes and the BAQ caller's downstream consumer cannot use the
+/// finer distinction.
 #[inline]
 pub(super) fn encode_base(b: u8) -> u8 {
     ENCODE_BASE[b as usize]
@@ -200,7 +242,7 @@ pub(super) fn encode_base(b: u8) -> u8 {
 
 /// First CIGAR walk — find the match span `(xb..xe ref, yb..ye query)`
 /// and an indel-widened bandwidth. Mirrors realn.c:178-198.
-fn locate_alignment_span(
+pub(super) fn locate_alignment_span(
     cigar: &[CigarOp],
     pos_0: i32,
     cfg_bw: i32,
@@ -246,7 +288,12 @@ fn locate_alignment_span(
 /// Realn.c:200-203 ref-window extension and rebalance. The asymmetric
 /// rebalance preserves htslib's comma-operator order-of-eval (the
 /// second delta uses the already-updated `xb`).
-fn extend_ref_window(
+///
+/// Note: this function does **not** clamp `xe` to the actual reference
+/// length. The caller relies on [`RefSeqFetcher::fetch`] to reject
+/// over-end windows; the test driver's separate copy used to clamp
+/// against a known `ref_len` for unit-test convenience.
+pub(super) fn extend_ref_window(
     mut xb: i32,
     mut xe: i32,
     yb: i32,
@@ -272,7 +319,7 @@ fn extend_ref_window(
 /// writing into `out`. Mirrors the `!extend_baq` branch at
 /// realn.c:244-265. `out` is cleared first; the engine reuses one
 /// buffer across reads via `mem::take` on success.
-fn apply_baq_cap_into(
+pub(super) fn apply_baq_cap_into(
     out: &mut Vec<u8>,
     cigar: &[CigarOp],
     qual: &[u8],
@@ -308,7 +355,11 @@ fn apply_baq_cap_into(
             CigarOp::Deletion(_) => {
                 x += l as i32;
             }
-            _ => {}
+            // Refactor-safety: spell out the no-op variants so a new
+            // `CigarOp` variant is a compile error here, not a silent
+            // misaligned-cursor bug. `Skip` is rejected upstream by
+            // `locate_alignment_span` but spelled out anyway.
+            CigarOp::HardClip(_) | CigarOp::Padding(_) | CigarOp::Skip(_) => {}
         }
     }
 }
@@ -327,7 +378,7 @@ fn op_len(op: CigarOp) -> usize {
     }
 }
 
-fn mapped_to_prepared(read: MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
+fn mapped_to_prepared(read: MappedRead, chrom_id: u32, bq_baq: Vec<u8>) -> PreparedRead {
     let alignment_start = read.pos as u32;
     let alignment_end = compute_alignment_end(alignment_start, &read.cigar);
     let qname = qname_to_arc(&read.qname);
@@ -335,7 +386,7 @@ fn mapped_to_prepared(read: MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
     let is_reverse_strand = read.flag & FLAG_REVERSE_STRAND != 0;
     let mq_log_err = phred_to_ln_perr(read.mapq);
     PreparedRead {
-        chrom_id: read.ref_id as u32,
+        chrom_id,
         alignment_start,
         alignment_end,
         cigar: read.cigar,
@@ -350,17 +401,17 @@ fn mapped_to_prepared(read: MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
 }
 
 /// SAM-spec qnames are printable ASCII, so the happy path is one
-/// `Arc::<str>::from(&str)` allocation. The fallback round-trips
-/// through `from_utf8_lossy` only for the rare bad-byte case — without
-/// the fast path that's an extra `String` allocation on every read.
+/// `Arc::<str>::from(&str)` allocation. The fallback consumes the
+/// `Cow<str>` from `from_utf8_lossy` via `Arc<str>: From<Cow<'_, str>>`,
+/// which steals the `Owned` arm's allocation rather than copying.
 fn qname_to_arc(qname: &[u8]) -> Arc<str> {
     match std::str::from_utf8(qname) {
         Ok(s) => Arc::<str>::from(s),
-        Err(_) => Arc::<str>::from(String::from_utf8_lossy(qname).as_ref()),
+        Err(_) => Arc::<str>::from(String::from_utf8_lossy(qname)),
     }
 }
 
-fn compute_alignment_end(start_1: u32, cigar: &[CigarOp]) -> u32 {
+pub(super) fn compute_alignment_end(start_1: u32, cigar: &[CigarOp]) -> u32 {
     let mut ref_span: u32 = 0;
     for op in cigar {
         match *op {
@@ -369,12 +420,30 @@ fn compute_alignment_end(start_1: u32, cigar: &[CigarOp]) -> u32 {
             | CigarOp::SeqMismatch(l)
             | CigarOp::Deletion(l)
             | CigarOp::Skip(l) => ref_span = ref_span.saturating_add(l),
-            _ => {}
+            // Refactor-safety: explicit no-op variants so a new
+            // `CigarOp` variant cannot silently produce a wrong
+            // `alignment_end` for the pileup walker.
+            CigarOp::Insertion(_)
+            | CigarOp::SoftClip(_)
+            | CigarOp::HardClip(_)
+            | CigarOp::Padding(_) => {}
         }
     }
     start_1.saturating_add(ref_span).saturating_sub(1)
 }
 
+/// Derive [`MateRole`] from SAM flags.
+///
+/// # Defaults / fallbacks
+///
+/// - `FLAG_PAIRED` unset → `Solo`.
+/// - `FLAG_PAIRED` set & `FLAG_FIRST_OF_PAIR` set → `FirstOfPair`.
+/// - `FLAG_PAIRED` set & `FLAG_FIRST_OF_PAIR` unset → `SecondOfPair`.
+///   This treats `FLAG_SECOND_OF_PAIR` (0x80) as redundant — any
+///   paired read that does not declare itself first-of-pair is taken
+///   to be second-of-pair. Malformed records (both bits unset, or
+///   both set) fall into this branch silently; upstream CRAM
+///   validation is expected to reject them.
 fn derive_mate_role(flag: u16) -> MateRole {
     if flag & FLAG_PAIRED == 0 {
         MateRole::Solo
@@ -388,7 +457,8 @@ fn derive_mate_role(flag: u16) -> MateRole {
 /// `Q -> ln(P_err)` where `P_err = 10^(-Q/10)`. Mirrors the private
 /// `phred_to_ln_perr` helper in the pileup walker's `open_record.rs`;
 /// kept local here so the BAQ stage does not depend on that module's
-/// internal visibility.
+/// internal visibility. Candidate for promotion to a shared
+/// `per_sample_caller/phred.rs` module.
 fn phred_to_ln_perr(q: u8) -> f64 {
     if q == 0 {
         return 0.0;

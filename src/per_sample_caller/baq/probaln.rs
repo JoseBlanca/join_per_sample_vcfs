@@ -11,18 +11,38 @@
 //! expression. The other forward and the backward expressions are
 //! bit-identical between the two branches. Floating-point types match
 //! htslib byte-for-byte: `f64` for the DP tables, `f32` for the per-Q
-//! lookup and `BaqConfig.d`/`.e`.
+//! lookup and `BaqConfig::gap_open_prob` / `::gap_extend_prob`.
 
 use super::BaqConfig;
-use super::errors::BaqOverflow;
-use super::scratch::{Q2P, Scratch};
+use super::errors::ProbalnError;
+use super::scratch::{ProbalnScratch, Q2P};
 
 const EI: f64 = 0.25;
-// htslib uses the decimal literal `.33333333333` (11 digits), not 1/3.
-// The two f64 representations differ by ~3.3e-12, which is large
-// enough to change the HMM's posterior at mismatch positions enough
-// to flip a Phred rounding. Match the literal exactly for parity.
-const EM: f64 = 0.33333333333;
+// PARITY: htslib uses the decimal literal `.33333333333` (11 digits), not
+// 1/3. The two f64 representations differ by ~3.3e-12, which is large
+// enough to change the HMM's posterior at mismatch positions enough to
+// flip a Phred rounding. Match the literal exactly for parity — do not
+// promote to `1.0 / 3.0` or `f64::consts::FRAC_1_3`.
+#[allow(clippy::approx_constant)]
+pub(super) const EM: f64 = 0.33333333333;
+
+// PARITY: 10/ln(10), 4-digit truncation. Mirrors htslib's literal in
+// `probaln.c:285, 388, 421` — keep the truncation; do **not** promote
+// to `10.0 / f64::ln(10.0)` or `f64::consts::LOG10_E.recip()`. The
+// rounding boundary on `q[i]` depends on this exact value.
+pub(super) const PHRED_PER_NAT: f64 = 4.343;
+
+// Rounding bias for `as i32` truncation: `(x + ROUND_HALF_BIAS) as i32`
+// rounds half-up for positive `x`. Mirrors htslib.
+const ROUND_HALF_BIAS: f64 = 0.499;
+
+// Forward/backward rescale threshold (probaln.c:283). Below this the
+// running product `p` is too small to keep in f64; the loop renormalises.
+const RESCALE_THRESHOLD: f64 = 1e-100;
+
+// Posterior-Q overflow probe. htslib's `if (qv > 100) qv = 99`.
+const PHRED_CAP_OVERFLOW: i32 = 100;
+const PHRED_CAP: u8 = 99;
 
 /// Offset of HMM cell `(i, k)` inside its banded row, in 3-cell strides
 /// (one stride per HMM cell, holding M/I/D state probabilities). Direct
@@ -37,7 +57,7 @@ const EM: f64 = 0.33333333333;
 /// `>= i_dim` half. In-band callers (the main forward / backward loop
 /// over `k in beg..=end`) are guaranteed non-negative by construction.
 #[inline(always)]
-fn set_u(bw: i32, i: i32, k: i32) -> usize {
+pub(super) fn set_u(bw: i32, i: i32, k: i32) -> usize {
     let x = (i - bw).max(0);
     ((k - x + 1) * 3) as usize
 }
@@ -47,77 +67,103 @@ fn set_u(bw: i32, i: i32, k: i32) -> usize {
 ///
 /// `ref_seq` and `query` are encoded as 0/1/2/3/4 (A/C/G/T/N). `iqual`
 /// is the Phred 0-93 per-base quality of `query`, one byte per query
-/// base. On success, fills `state` and `q` and returns the
-/// Phred-scaled alignment likelihood (the value htslib's `int` return
-/// carries).
+/// base. On success, fills `scratch.state` and `scratch.q` and returns
+/// the Phred-scaled alignment likelihood (the value htslib's `int`
+/// return carries).
 ///
-/// `state[i]` encodes the alignment of query base `i`:
+/// `scratch.state[i]` encodes the alignment of query base `i`:
 /// - `state[i] >> 2` — 0-based reference position the base was aligned
 ///   to (relative to the start of `ref_seq`).
 /// - `state[i] & 3` — 0 if match, 1 if insertion.
 ///
-/// `q[i]` is the Phred-scaled posterior probability that `state[i]` is
-/// wrong, capped at 99 (htslib's same cap at
+/// `scratch.q[i]` is the Phred-scaled posterior probability that
+/// `state[i]` is wrong, capped at 99 (htslib's same cap at
 /// [probaln.c:418](../../../htslib/probaln.c#L418)).
 pub(super) fn probaln_glocal(
-    scratch: &mut Scratch,
+    scratch: &mut ProbalnScratch,
     ref_seq: &[u8],
     query: &[u8],
     iqual: &[u8],
     cfg: &BaqConfig,
-    state: &mut [i32],
-    q: &mut [u8],
-) -> Result<i32, BaqOverflow> {
-    if iqual.len() != query.len() || state.len() != query.len() || q.len() != query.len() {
-        return Err(BaqOverflow::InvalidInput);
+) -> Result<i32, ProbalnError> {
+    if iqual.len() != query.len() {
+        return Err(ProbalnError::SliceLengthMismatch);
     }
-    let l_ref = i32::try_from(ref_seq.len()).map_err(|_| BaqOverflow::InvalidInput)?;
-    let l_query = i32::try_from(query.len()).map_err(|_| BaqOverflow::InvalidInput)?;
+    let l_ref = i32::try_from(ref_seq.len()).map_err(|_| ProbalnError::SequenceTooLong)?;
+    let l_query = i32::try_from(query.len()).map_err(|_| ProbalnError::SequenceTooLong)?;
     if l_query >= i32::MAX - 2 {
-        return Err(BaqOverflow::InvalidInput);
+        return Err(ProbalnError::SequenceTooLong);
+    }
+    if cfg.band_half_width < 0 {
+        return Err(ProbalnError::InvalidBandwidth);
     }
     if l_ref == 0 || l_query == 0 {
+        // Resize state/q to the (possibly zero) query length so callers
+        // that read `scratch.state` / `scratch.q` after a zero-length
+        // call see consistent slice lengths.
+        scratch.state.clear();
+        scratch.q.clear();
         return Ok(0);
     }
 
     // Bandwidth selection (probaln.c:93-97).
     let mut bw = l_ref.max(l_query);
-    if bw > cfg.bw {
-        bw = cfg.bw;
+    if bw > cfg.band_half_width {
+        bw = cfg.band_half_width;
     }
     let len_diff = (l_ref - l_query).abs();
     if bw < len_diff {
         bw = len_diff;
     }
-    let bw2 = bw * 2 + 1;
-    let i_dim = (if bw2 < l_ref {
-        bw2 * 3 + 6
+    // PARITY/SAFETY: `bw * 2 + 1` and `bw2 * 3 + 6` in plain i32 can
+    // wrap for pathological bandwidths. Surface as AllocationOverflow
+    // rather than silently corrupt the matrix shape.
+    let bw2 = bw
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(1))
+        .ok_or(ProbalnError::AllocationOverflow)?;
+    let i_dim_i32 = if bw2 < l_ref {
+        bw2.checked_mul(3)
+            .and_then(|v| v.checked_add(6))
+            .ok_or(ProbalnError::AllocationOverflow)?
     } else {
-        l_ref * 3 + 6
-    }) as usize;
+        l_ref
+            .checked_mul(3)
+            .and_then(|v| v.checked_add(6))
+            .ok_or(ProbalnError::AllocationOverflow)?
+    };
+    let i_dim = i_dim_i32 as usize;
     let l_q = l_query as usize;
 
     // Allocation-size guard (probaln.c:104-107). Done before
     // `resize_for` so an overflow returns `Err` instead of panicking
     // inside Vec.
-    let rows = l_q.checked_add(1).ok_or(BaqOverflow::AllocationOverflow)?;
+    let rows = l_q.checked_add(1).ok_or(ProbalnError::AllocationOverflow)?;
     let cells = rows
         .checked_mul(i_dim)
-        .ok_or(BaqOverflow::AllocationOverflow)?;
+        .ok_or(ProbalnError::AllocationOverflow)?;
     let bytes = cells
         .checked_mul(std::mem::size_of::<f64>())
-        .ok_or(BaqOverflow::AllocationOverflow)?;
+        .ok_or(ProbalnError::AllocationOverflow)?;
     if bytes > isize::MAX as usize {
-        return Err(BaqOverflow::AllocationOverflow);
+        return Err(ProbalnError::AllocationOverflow);
     }
 
     scratch.resize_for(l_q, i_dim);
     // Borrow-split the disjoint scratch fields so the HMM body can
-    // index them by short names without re-walking `scratch.`.
+    // index them by short names without re-walking `scratch.`:
+    //   f     — forward DP table, banded, 3 cells per (i, k) for M/I/D.
+    //   b     — backward DP table, same shape as `f`.
+    //   s     — per-row scale factor s[i], used to renormalise each row.
+    //   qual  — per-query-base P_err, populated from `iqual` via Q2P.
+    //   state — HMM output: alignment state per query base (out-param).
+    //   q     — HMM output: Phred-scaled posterior error (out-param).
     let f = &mut scratch.f;
     let b = &mut scratch.b;
     let s = &mut scratch.s;
     let qual = &mut scratch.qual;
+    let state = &mut scratch.state;
+    let q = &mut scratch.q;
     // Process-wide shared lookup — see `scratch::Q2P`.
     let q2p: &[f32; 256] = &Q2P;
 
@@ -129,10 +175,13 @@ pub(super) fn probaln_glocal(
     // Transition probabilities (probaln.c:130-141).
     let sm = 1.0 / (2.0 * l_query as f64 + 2.0);
     let si = sm;
-    let d = cfg.d as f64;
-    let e = cfg.e as f64;
-    // m[from*3 + to] for state 0=M, 1=I, 2=D.
-    let m = [
+    let d = cfg.gap_open_prob as f64;
+    let e = cfg.gap_extend_prob as f64;
+    // PARITY: trans[from*3 + to] for state 0=M, 1=I, 2=D. Rows in
+    // declaration order: M→M, M→I, M→D, I→M, I→I, I→D, D→M, D→I, D→D.
+    // Renamed from htslib's `m` to disambiguate from `m_scale` and the
+    // M-state index encoding.
+    let trans = [
         (1.0 - d - d) * (1.0 - sm), // M→M
         d * (1.0 - sm),             // M→I
         d * (1.0 - sm),             // M→D
@@ -179,11 +228,12 @@ pub(super) fn probaln_glocal(
     }
     // f[2..=l_query] — main forward recursion.
     //
-    // The xi[1] (I-state) update is written in htslib's OPTIMIZED-branch
-    // form, not the PROBALN_ORIG form, because the htslib production
-    // build uses OPTIMIZED. The two are mathematically equal but differ
-    // by float-associativity rounding (ORIG: `EI * (a + b)`; OPT:
-    // `xm3*y3 + xm4*y4` with `xm3 = EI*M*m[1]` precomputed). The xi[0]
+    // PARITY: the xi[1] (I-state) update is written in htslib's
+    // OPTIMIZED-branch form, not the PROBALN_ORIG form, because the
+    // htslib production build uses OPTIMIZED. The two are mathematically
+    // equal but differ by float-associativity rounding (ORIG:
+    // `EI * (a + b)`; OPT: `xm3*y3 + xm4*y4` with `xm3 = EI*M*trans[1]`
+    // precomputed). Do **not** reassociate these expressions. The xi[0]
     // and xi[2] updates are bit-identical between the two branches.
     for i in 2..=l_query {
         let i_us = i as usize;
@@ -195,8 +245,8 @@ pub(super) fn probaln_glocal(
         let e_table = [qli * EM, 1.0 - qli, 1.0, 1.0];
         let m_scale = 1.0 / s[i_us - 1];
         // Precomputed xm[3..=4] from htslib's OPT branch.
-        let xm3 = EI * m_scale * m[1];
-        let xm4 = EI * m_scale * m[4];
+        let xm3 = EI * m_scale * trans[1];
+        let xm4 = EI * m_scale * trans[4];
         let mut sum = 0.0;
         let base_i = i_us * i_dim;
         let base_i1 = (i_us - 1) * i_dim;
@@ -205,10 +255,9 @@ pub(super) fn probaln_glocal(
         // `set_u(bw, i-1, k) = (k - x_im1 + 1) * 3`, etc.
         let x_i = (i - bw).max(0);
         let x_im1 = ((i - 1) - bw).max(0);
-        // L6: bounds-check elision proof. Every in-band `u, v01, v10, v11`
-        // is `< i_dim - 2` by construction (band width `bw2*3+6 ≤ i_dim`).
-        // Adding `+ 2` to a base offset stays under `base + i_dim`, so a
-        // single assert per base hoists all per-cell bounds checks.
+        // UNREACHABLE: i_dim >= bw2*3+6 and every in-band cell offset
+        // (k - x_i + 1) * 3 + 2 <= bw2*3 + 2 < i_dim by construction.
+        // A single per-row assert hoists all per-cell bounds checks.
         assert!(base_i + i_dim <= f.len());
         assert!(base_i1 + i_dim <= f.len());
         for k in beg..=end {
@@ -220,11 +269,11 @@ pub(super) fn probaln_glocal(
             let v10 = ((k - x_im1 + 1) * 3) as usize;
             let v01 = ((k - 1 - x_i + 1) * 3) as usize;
             f[base_i + u] = e_val
-                * (m[0] * m_scale * f[base_i1 + v11]
-                    + m[3] * m_scale * f[base_i1 + v11 + 1]
-                    + m[6] * m_scale * f[base_i1 + v11 + 2]);
+                * (trans[0] * m_scale * f[base_i1 + v11]
+                    + trans[3] * m_scale * f[base_i1 + v11 + 1]
+                    + trans[6] * m_scale * f[base_i1 + v11 + 2]);
             f[base_i + u + 1] = xm3 * f[base_i1 + v10] + xm4 * f[base_i1 + v10 + 1];
-            f[base_i + u + 2] = m[2] * f[base_i + v01] + m[8] * f[base_i + v01 + 2];
+            f[base_i + u + 2] = trans[2] * f[base_i + v01] + trans[8] * f[base_i + v01 + 2];
             sum += f[base_i + u] + f[base_i + u + 1] + f[base_i + u + 2];
         }
         s[i_us] = sum;
@@ -251,15 +300,18 @@ pub(super) fn probaln_glocal(
     {
         let mut p = 1.0;
         let mut pr1 = 0.0;
-        for i in 0..=(l_q + 1) {
-            p *= s[i];
-            if p < 1e-100 {
-                pr1 += -4.343 * p.ln();
+        for &scale in &s[..=(l_q + 1)] {
+            p *= scale;
+            if p < RESCALE_THRESHOLD {
+                pr1 += -PHRED_PER_NAT * p.ln();
                 p = 1.0;
             }
         }
-        pr1 += -4.343 * (p * l_ref as f64 * l_query as f64).ln();
-        pr_score = (pr1 + 0.499) as i32;
+        pr1 += -PHRED_PER_NAT * (p * l_ref as f64 * l_query as f64).ln();
+        // PARITY: `f64 → i32 as` saturates in Rust (post-1.45); NaN
+        // becomes 0. htslib has the same behaviour on x86-64 builds.
+        debug_assert!(pr1.is_finite(), "pr_score input must be finite");
+        pr_score = (pr1 + ROUND_HALF_BIAS) as i32;
     }
 
     // === Backward ===
@@ -290,7 +342,8 @@ pub(super) fn probaln_glocal(
         // diagonal predecessor rather than i-1 as forward does).
         let x_i = (i - bw).max(0);
         let x_ip1 = ((i + 1) - bw).max(0);
-        // L6: bounds-check elision proof for both rows (`base_i1 > base_i`).
+        // UNREACHABLE: same band-width invariant as the forward loop;
+        // `base_i1 > base_i` so one assert covers both rows.
         assert!(base_i1 + i_dim <= b.len());
         for k in (beg..=end).rev() {
             let u = ((k - x_i + 1) * 3) as usize;
@@ -304,10 +357,11 @@ pub(super) fn probaln_glocal(
                 let cond = ((r > 3 || qyi1 > 3) as usize) * 2 + ((r == qyi1) as usize);
                 e_table[cond] * b[base_i1 + v11]
             };
-            b[base_i + u] =
-                e_val * m[0] + EI * m[1] * b[base_i1 + v10 + 1] + m[2] * b[base_i + v01 + 2];
-            b[base_i + u + 1] = e_val * m[3] + EI * m[4] * b[base_i1 + v10 + 1];
-            b[base_i + u + 2] = (e_val * m[6] + m[8] * b[base_i + v01 + 2]) * y_d;
+            b[base_i + u] = e_val * trans[0]
+                + EI * trans[1] * b[base_i1 + v10 + 1]
+                + trans[2] * b[base_i + v01 + 2];
+            b[base_i + u + 1] = e_val * trans[3] + EI * trans[4] * b[base_i1 + v10 + 1];
+            b[base_i + u + 2] = (e_val * trans[6] + trans[8] * b[base_i + v01 + 2]) * y_d;
         }
         // Rescale this row (probaln.c:327-330).
         let scale = 1.0 / s[i_us];
@@ -359,7 +413,7 @@ pub(super) fn probaln_glocal(
         let base = i_us * i_dim;
         // L8: hoist the row-invariant `(i - bw).max(0)` from `set_u`.
         let x_i = (i - bw).max(0);
-        // L6: bounds-check elision proof.
+        // UNREACHABLE: band-width invariant (see forward loop).
         assert!(base + i_dim <= f.len());
         assert!(base + i_dim <= b.len());
         for k in beg..=end {
@@ -379,8 +433,17 @@ pub(super) fn probaln_glocal(
         }
         max_val /= sum;
         state[i_us - 1] = max_k;
-        let qv = (-4.343 * (1.0 - max_val).ln() + 0.499) as i32;
-        q[i_us - 1] = if qv > 100 { 99 } else { qv.max(0) as u8 };
+        // PARITY: htslib's `(int)(-4.343 * log(1.0 - max_val) + 0.499)`.
+        // NaN-on-input is impossible here by construction (max_val is
+        // a probability in [0, 1]); debug-assert as a regression guard.
+        let nat = -PHRED_PER_NAT * (1.0 - max_val).ln();
+        debug_assert!(nat.is_finite() || max_val >= 1.0, "qv input non-finite");
+        let qv = (nat + ROUND_HALF_BIAS) as i32;
+        q[i_us - 1] = if qv > PHRED_CAP_OVERFLOW {
+            PHRED_CAP
+        } else {
+            qv.max(0) as u8
+        };
     }
 
     Ok(pr_score)

@@ -6,6 +6,8 @@
 //! non-decreasing-coordinate invariant is preserved by rayon's
 //! order-preserving `par_iter` plus our serial chunk-by-chunk drain.
 
+use std::collections::VecDeque;
+
 use rayon::prelude::*;
 
 use crate::per_sample_caller::cram_input::MappedRead;
@@ -15,10 +17,14 @@ use crate::per_sample_caller::pileup::{PreparedRead, RefSeqFetcher};
 use super::BaqConfig;
 use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 
-/// Default chunk size — reads per rayon batch. 1024 is the plan's
-/// starting point
-/// ([baq.md commit 3](../../../ia/feature_implementation_plans/baq.md));
-/// the benchmark in commit 4 will tune this.
+/// Default chunk size — reads per rayon batch. Picked at 1024 from the
+/// `baq_stream_chunk_size` criterion bench
+/// ([benches/baq_perf.rs](../../../benches/baq_perf.rs)): on the
+/// reference workstation (Intel i7-1260P, 16 logical CPUs) `/1024`
+/// runs at ~88 ms vs `/4096` at ~85 ms — under 5 % wall-time gap for
+/// 4× the memory footprint per chunk, so 1024 is the better default
+/// for typical per-sample workloads. See
+/// `ia/reviews/perf_baq_2026-05-12.md` for the saved baseline.
 pub const DEFAULT_BAQ_CHUNK_SIZE: usize = 1024;
 
 /// Per-reason BAQ skip counters. `total` is what the pipeline rolls
@@ -35,10 +41,13 @@ pub struct BaqSkipCounts {
     pub contains_ref_skip: u64,
     pub hmm_overflow: u64,
     pub ref_window_past_chrom_end: u64,
+    pub pos_out_of_range: u64,
+    pub read_too_long: u64,
+    pub chrom_id_out_of_range: u64,
 }
 
 impl BaqSkipCounts {
-    fn bump(&mut self, reason: BaqSkipReason) {
+    pub(super) fn bump(&mut self, reason: BaqSkipReason) {
         self.total += 1;
         match reason {
             BaqSkipReason::Unmapped => self.unmapped += 1,
@@ -48,6 +57,9 @@ impl BaqSkipCounts {
             BaqSkipReason::ContainsRefSkip => self.contains_ref_skip += 1,
             BaqSkipReason::HmmOverflow => self.hmm_overflow += 1,
             BaqSkipReason::RefWindowPastChromEnd => self.ref_window_past_chrom_end += 1,
+            BaqSkipReason::PosOutOfRange => self.pos_out_of_range += 1,
+            BaqSkipReason::ReadTooLong => self.read_too_long += 1,
+            BaqSkipReason::ChromIdOutOfRange => self.chrom_id_out_of_range += 1,
         }
     }
 }
@@ -61,6 +73,10 @@ impl BaqSkipCounts {
 /// first and the error becomes the final iterator item. The iterator
 /// is fused: once exhausted (either by upstream returning `None` or
 /// after returning an upstream `Err`), it returns `None` forever.
+///
+/// Implements `Send` when `R: Send` and `F: Sync`. Not `Sync` —
+/// `BaqStream` is single-consumer (interior mutation through
+/// `&mut self`).
 pub struct BaqStream<'a, R, F>
 where
     F: RefSeqFetcher + Sync,
@@ -76,9 +92,9 @@ where
     /// refills it in place.
     outcomes_buf: Vec<BaqOutcome>,
     /// Surviving `PreparedRead`s for the current chunk, drained
-    /// front-to-back via `current_idx`. Lives on the stream so the
+    /// front-to-back via `pop_front`. Lives on the stream so the
     /// backing buffer survives across refills.
-    current_batch: Vec<PreparedRead>,
+    current_batch: VecDeque<PreparedRead>,
     pending_error: Option<CramInputError>,
     upstream_done: bool,
     skip_counts: BaqSkipCounts,
@@ -89,15 +105,19 @@ where
     R: Iterator<Item = Result<MappedRead, CramInputError>>,
     F: RefSeqFetcher + Sync,
 {
+    /// Construct a `BaqStream`. Panics if `chunk_size == 0` — a
+    /// programmer error in every call site (silently coercing to 1
+    /// would mask a misconfigured CLI flag as a perf bug).
     pub fn new(reads: R, cfg: BaqConfig, ref_fetcher: &'a F, chunk_size: usize) -> Self {
+        assert!(chunk_size > 0, "BaqStream chunk_size must be > 0");
         Self {
             reads,
             cfg,
             ref_fetcher,
-            chunk_size: chunk_size.max(1),
+            chunk_size,
             chunk_buf: Vec::new(),
             outcomes_buf: Vec::new(),
-            current_batch: Vec::new(),
+            current_batch: VecDeque::new(),
             pending_error: None,
             upstream_done: false,
             skip_counts: BaqSkipCounts::default(),
@@ -149,13 +169,10 @@ where
         self.current_batch.clear();
         for outcome in self.outcomes_buf.drain(..) {
             match outcome {
-                BaqOutcome::Capped(p) => self.current_batch.push(p),
+                BaqOutcome::Capped(p) => self.current_batch.push_back(p),
                 BaqOutcome::Skipped(reason) => self.skip_counts.bump(reason),
             }
         }
-        // Reverse so `next()` can `pop()` from the back and still yield
-        // in the original (coordinate-sorted) order.
-        self.current_batch.reverse();
     }
 }
 
@@ -167,7 +184,7 @@ where
     type Item = Result<PreparedRead, CramInputError>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(p) = self.current_batch.pop() {
+            if let Some(p) = self.current_batch.pop_front() {
                 return Some(Ok(p));
             }
             if let Some(e) = self.pending_error.take() {
