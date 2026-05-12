@@ -74,7 +74,7 @@ fn build_mapped_reads(read_len: u32, span: u32, coverage: u32) -> Vec<MappedRead
     reads
 }
 
-fn process_all(engine: &mut BaqEngine, reads: &[MappedRead], fetcher: &ConstRefFetcher) -> u64 {
+fn process_all(engine: &mut BaqEngine, reads: Vec<MappedRead>, fetcher: &ConstRefFetcher) -> u64 {
     let mut capped: u64 = 0;
     for r in reads {
         if let BaqOutcome::Capped(_) = engine.process(r, fetcher) {
@@ -96,11 +96,21 @@ fn bench_engine_read_length(c: &mut Criterion) {
     };
 
     for &read_len in &[150u32, 500, 1500, 5000] {
-        let reads = build_mapped_reads(read_len, span, coverage);
         group.bench_with_input(BenchmarkId::from_parameter(read_len), &read_len, |b, _| {
+            // The setup builds a fresh `Vec<MappedRead>` for each
+            // criterion batch and the bench body moves it into
+            // `process_all`, matching how `BaqStream::refill_batch`
+            // consumes its chunk in production (par_drain). Avoids
+            // the per-read `cigar.clone()` / `seq.clone()` cost that
+            // a borrow-based bench would re-introduce on top of L3.
             b.iter_batched(
-                || BaqEngine::new(BaqConfig::default()),
-                |mut engine| black_box(process_all(&mut engine, &reads, &fetcher)),
+                || {
+                    (
+                        BaqEngine::new(BaqConfig::default()),
+                        build_mapped_reads(read_len, span, coverage),
+                    )
+                },
+                |(mut engine, reads)| black_box(process_all(&mut engine, reads, &fetcher)),
                 BatchSize::SmallInput,
             );
         });

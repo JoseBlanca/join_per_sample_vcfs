@@ -81,10 +81,11 @@ fn main() {
 
     let mut engine = BaqEngine::new(BaqConfig::default());
     let mut capped: u64 = 0;
-    for r in &reads {
+    let n = reads.len();
+    for r in reads {
         if let BaqOutcome::Capped(_) = engine.process(r, &fetcher) {
             capped += 1;
         }
     }
-    eprintln!("reads processed: {} (capped: {capped})", reads.len());
+    eprintln!("reads processed: {n} (capped: {capped})");
 }

@@ -89,7 +89,13 @@ impl BaqEngine {
 
     /// Run BAQ on one read. See the [`BaqOutcome`] / [`BaqSkipReason`]
     /// docs for the success and skip shapes.
-    pub fn process(&mut self, read: &MappedRead, ref_fetcher: &dyn RefSeqFetcher) -> BaqOutcome {
+    ///
+    /// Takes `MappedRead` by value so the success path can **move**
+    /// `cigar`, `seq`, and `qname` straight into the resulting
+    /// `PreparedRead` instead of cloning them. The skip paths drop
+    /// the `MappedRead` immediately, same as the previous borrowing
+    /// API.
+    pub fn process(&mut self, read: MappedRead, ref_fetcher: &dyn RefSeqFetcher) -> BaqOutcome {
         if read.flag & FLAG_UNMAPPED != 0 {
             return BaqOutcome::Skipped(BaqSkipReason::Unmapped);
         }
@@ -124,9 +130,13 @@ impl BaqEngine {
 
         let hmm_cfg = BaqConfig { bw, ..self.cfg };
 
-        self.state.clear();
+        // resize without a prior clear(): only the growth above the
+        // current length pays a zero-fill (matters for variable-length
+        // workloads; uniform L=150 pays the fill exactly once on the
+        // first read). The HMM's MAP-decode loop writes every entry
+        // of `state` and `q` before they leave the engine, so the
+        // residual values from the previous read are harmless.
         self.state.resize(read.seq.len(), 0);
-        self.q.clear();
         self.q.resize(read.seq.len(), 0);
 
         if probaln_glocal(
@@ -317,7 +327,7 @@ fn op_len(op: CigarOp) -> usize {
     }
 }
 
-fn mapped_to_prepared(read: &MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
+fn mapped_to_prepared(read: MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
     let alignment_start = read.pos as u32;
     let alignment_end = compute_alignment_end(alignment_start, &read.cigar);
     let qname = qname_to_arc(&read.qname);
@@ -328,8 +338,8 @@ fn mapped_to_prepared(read: &MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
         chrom_id: read.ref_id as u32,
         alignment_start,
         alignment_end,
-        cigar: read.cigar.clone(),
-        seq: read.seq.clone(),
+        cigar: read.cigar,
+        seq: read.seq,
         bq_baq,
         mq_log_err,
         is_reverse_strand,

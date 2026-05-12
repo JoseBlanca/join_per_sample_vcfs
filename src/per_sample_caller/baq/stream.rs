@@ -135,10 +135,12 @@ where
         }
         let cfg = self.cfg;
         let fetcher = self.ref_fetcher;
-        // collect_into_vec clears the destination first and reuses its
-        // backing buffer — no per-chunk allocation of `outcomes`.
+        // par_drain consumes the chunk by-value (so `engine.process`
+        // can move the read's cigar/seq/qname straight into the
+        // resulting PreparedRead) while preserving both input order
+        // and the chunk_buf's backing capacity.
         self.chunk_buf
-            .par_iter()
+            .par_drain(..)
             .map_init(
                 || BaqEngine::new(cfg),
                 |engine, read| engine.process(read, fetcher),

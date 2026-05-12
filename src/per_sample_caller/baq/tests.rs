@@ -364,13 +364,15 @@ fn engine_happy_path_match_only() {
         b"ACGTACGT".to_vec(),
         vec![40; 8],
     );
+    let expected_seq = read.seq.clone();
+    let expected_cigar = read.cigar.clone();
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(&read, &fetcher) {
+    match engine.process(read, &fetcher) {
         BaqOutcome::Capped(prepared) => {
             assert_eq!(prepared.alignment_start, 1);
             assert_eq!(prepared.alignment_end, 8);
-            assert_eq!(prepared.seq, read.seq);
-            assert_eq!(prepared.cigar, read.cigar);
+            assert_eq!(prepared.seq, expected_seq);
+            assert_eq!(prepared.cigar, expected_cigar);
             assert_eq!(prepared.bq_baq.len(), 8);
             for (i, &q) in prepared.bq_baq.iter().enumerate() {
                 assert!(q <= 40, "pos {i}: bq_baq {q} exceeds raw qual 40");
@@ -396,7 +398,7 @@ fn engine_mate_role_first_of_pair() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(&read, &fetcher) {
+    match engine.process(read, &fetcher) {
         BaqOutcome::Capped(prepared) => assert_eq!(prepared.mate_role, MateRole::FirstOfPair),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -416,7 +418,7 @@ fn engine_reverse_strand_propagates() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(&read, &fetcher) {
+    match engine.process(read, &fetcher) {
         BaqOutcome::Capped(prepared) => assert!(prepared.is_reverse_strand),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -437,7 +439,7 @@ fn engine_skip_unmapped() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(&read, &fetcher)),
+        skip_reason(engine.process(read, &fetcher)),
         Some(BaqSkipReason::Unmapped),
     );
 }
@@ -450,7 +452,7 @@ fn engine_skip_empty_query() {
     let read = synthetic_read(0, 1, 60, vec![], vec![], vec![]);
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(&read, &fetcher)),
+        skip_reason(engine.process(read, &fetcher)),
         Some(BaqSkipReason::EmptyQuery),
     );
 }
@@ -470,7 +472,7 @@ fn engine_skip_qual_absent() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(&read, &fetcher)),
+        skip_reason(engine.process(read, &fetcher)),
         Some(BaqSkipReason::QualAbsent),
     );
 }
@@ -491,7 +493,7 @@ fn engine_skip_no_match_in_cigar() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(&read, &fetcher)),
+        skip_reason(engine.process(read, &fetcher)),
         Some(BaqSkipReason::NoMatchInCigar),
     );
 }
@@ -511,7 +513,7 @@ fn engine_skip_contains_ref_skip() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(&read, &fetcher)),
+        skip_reason(engine.process(read, &fetcher)),
         Some(BaqSkipReason::ContainsRefSkip),
     );
 }
@@ -534,7 +536,7 @@ fn engine_skip_ref_window_past_chrom_end() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(&read, &fetcher)),
+        skip_reason(engine.process(read, &fetcher)),
         Some(BaqSkipReason::RefWindowPastChromEnd),
     );
 }
