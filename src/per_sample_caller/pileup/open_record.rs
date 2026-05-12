@@ -168,6 +168,12 @@ pub(super) struct OpenPileupRecordTable {
     /// genuinely new allele. See L10/L11 in
     /// `ia/reviews/perf_pileup_2026-05-10.md`.
     allele_seq_buf: Vec<u8>,
+    /// Reusable scratch buffer for `drain_aged_into`'s "keys to
+    /// remove" list. Sized to ~1 entry per call at steady state;
+    /// cleared between calls so a per-call `Vec` allocation is not
+    /// paid each walker step. H2 in
+    /// `ia/reviews/perf_pileup_2026-05-12.md`.
+    closing_keys_buf: Vec<u32>,
     /// Per-instance cap on per-record reference span, mirrors
     /// `WalkerConfig::max_record_span`. M11 in
     /// `ia/reviews/pileup_2026-05-11.md`.
@@ -193,6 +199,7 @@ impl OpenPileupRecordTable {
         Self {
             records: BTreeMap::new(),
             allele_seq_buf: Vec::new(),
+            closing_keys_buf: Vec::new(),
             max_record_span,
         }
     }
@@ -212,6 +219,7 @@ impl OpenPileupRecordTable {
         );
         self.records.clear();
         self.allele_seq_buf.clear();
+        self.closing_keys_buf.clear();
     }
 
     /// Drain every record whose footprint is fully behind the
@@ -227,20 +235,20 @@ impl OpenPileupRecordTable {
     /// to keys strictly less than `walker_pos` — a record at
     /// `pos ≥ walker_pos` has `footprint_end_exclusive ≥ pos + 1
     /// > walker_pos`, so it cannot be aged this step.
-    pub fn drain_aged(&mut self, walker_pos: u32) -> Vec<OpenPileupRecord> {
-        let mut closing_keys: Vec<u32> = Vec::new();
+    pub fn drain_aged_into(&mut self, walker_pos: u32, out: &mut Vec<OpenPileupRecord>) {
+        out.clear();
+        self.closing_keys_buf.clear();
         for (&pos, rec) in self.records.range(..walker_pos) {
             if rec.footprint_end_exclusive() <= walker_pos {
-                closing_keys.push(pos);
+                self.closing_keys_buf.push(pos);
             }
         }
-        let mut out = Vec::with_capacity(closing_keys.len());
-        for pos in closing_keys {
+        out.reserve(self.closing_keys_buf.len());
+        for pos in self.closing_keys_buf.drain(..) {
             if let Some(rec) = self.records.remove(&pos) {
                 out.push(rec);
             }
         }
-        out
     }
 
     /// Drain everything unconditionally (chromosome boundary or
@@ -670,6 +678,7 @@ pub(super) fn process_position(
     let OpenPileupRecordTable {
         records,
         allele_seq_buf,
+        closing_keys_buf: _,
         max_record_span: _,
     } = open;
     for key in affected {
@@ -1031,7 +1040,8 @@ mod tests {
         t.open_new(0, 5, 1, &f).unwrap();
         t.open_new(0, 8, 1, &f).unwrap();
         // Walker at pos 6 — record at 1 (ends 2) and at 5 (ends 6) are aged out.
-        let drained = t.drain_aged(6);
+        let mut drained = Vec::new();
+        t.drain_aged_into(6, &mut drained);
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].pos, 1);
         assert_eq!(drained[1].pos, 5);
@@ -1054,7 +1064,8 @@ mod tests {
         t.open_new(0, 10, 1, &f).unwrap();
         // Walker at 11: narrow record should be aged out (11 >= 11);
         // wide record is still open (55 > 11).
-        let drained = t.drain_aged(11);
+        let mut drained = Vec::new();
+        t.drain_aged_into(11, &mut drained);
         assert_eq!(
             drained.len(),
             1,

@@ -11,7 +11,8 @@ use super::active_read_set::ActiveReads;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::open_record::{
-    OpenPileupRecordTable, ReadContribution, process_position, stamp_lifecycle_marks,
+    OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
+    stamp_lifecycle_marks,
 };
 use super::slot_allocator::{SlotAllocator, SlotAllocatorCounters, SlotId};
 use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerConfig};
@@ -195,6 +196,12 @@ struct WalkerState {
     /// allocated once and reused via `clear()` between steps. L6
     /// in `ia/reviews/perf_pileup_2026-05-10.md`.
     contributors_buf: Vec<ReadContribution>,
+    /// Reusable per-step buffer for `close_aged_records`'s drained
+    /// records. Paired with `OpenPileupRecordTable::closing_keys_buf`;
+    /// together they remove the two per-walker-step `Vec` allocations
+    /// `drain_aged` paid in round-1. H2 in
+    /// `ia/reviews/perf_pileup_2026-05-12.md`.
+    drained_buf: Vec<OpenPileupRecord>,
 }
 
 impl WalkerState {
@@ -210,6 +217,7 @@ impl WalkerState {
             summary: RunSummary::default(),
             config,
             contributors_buf: Vec::new(),
+            drained_buf: Vec::new(),
         }
     }
 
@@ -361,11 +369,16 @@ impl WalkerState {
     }
 
     fn close_aged_records(&mut self, tx: &SyncSender<PileupRecord>) -> Result<(), WalkerError> {
-        let aged = self.open_records.drain_aged(self.walker_pos);
-        if aged.is_empty() {
+        self.open_records
+            .drain_aged_into(self.walker_pos, &mut self.drained_buf);
+        if self.drained_buf.is_empty() {
             return Ok(());
         }
-        let mut records: Vec<PileupRecord> = aged.into_iter().map(|r| r.finalise()).collect();
+        // `finalise()` consumes each `OpenPileupRecord` by value, so we
+        // drain the hoisted buffer rather than `into_iter()`ing it; the
+        // backing `Vec` stays allocated and reusable for the next step.
+        let mut records: Vec<PileupRecord> =
+            self.drained_buf.drain(..).map(|r| r.finalise()).collect();
         let (new, expired) = self.slots.drain_lifecycle_marks();
         stamp_lifecycle_marks(&mut records, new, expired);
         for record in records {
