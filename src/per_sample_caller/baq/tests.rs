@@ -19,6 +19,7 @@ use noodles_sam::{
 
 use super::BaqConfig;
 use super::probaln::probaln_glocal;
+use super::scratch::Scratch;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -199,6 +200,7 @@ fn check_parity(stem: &str) {
     );
 
     let cfg = BaqConfig::default();
+    let mut scratch = Scratch::new();
 
     for (idx, (in_rec, exp_rec)) in in_records.iter().zip(exp_records.iter()).enumerate() {
         let bq_bytes: Vec<u8> = match exp_rec.data().get(&Tag::BASE_ALIGNMENT_QUALITY_OFFSETS) {
@@ -235,8 +237,16 @@ fn check_parity(stem: &str) {
 
         let mut state = vec![0i32; seq_ascii.len()];
         let mut q = vec![0u8; seq_ascii.len()];
-        probaln_glocal(&tref, &tseq, &qual, &bw_cfg, &mut state, &mut q)
-            .expect("probaln_glocal should not fail on fixture inputs");
+        probaln_glocal(
+            &mut scratch,
+            &tref,
+            &tseq,
+            &qual,
+            &bw_cfg,
+            &mut state,
+            &mut q,
+        )
+        .expect("probaln_glocal should not fail on fixture inputs");
 
         let capped = apply_baq_cap(cigar, &qual, &state, &q, pos_0, xb);
 
@@ -277,3 +287,261 @@ fn parity_realn02() {
 // is out of scope for this plan. The realn03 data files remain in
 // `tests/data/baq/` so the corpus is easy to extend if/when extended
 // BAQ lands. See `tests/data/baq/README.md`.
+
+// ---------------------------------------------------------------------
+// BaqEngine driver tests — synthetic MappedReads, no SAM parsing.
+// ---------------------------------------------------------------------
+
+use crate::per_sample_caller::cram_input::{
+    CigarOp, FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
+};
+use crate::per_sample_caller::pileup::{MateRole, RefSeqFetcher};
+
+use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
+
+/// Single-chrom in-memory fetcher: serves byte windows from `chrom`,
+/// errors on any request that runs past the end. Mirrors what
+/// `ChromBoundaryRefFetcher` does, just without FASTA IO.
+struct MockRefFetcher {
+    chrom: Vec<u8>,
+}
+
+impl RefSeqFetcher for MockRefFetcher {
+    fn fetch(
+        &self,
+        _chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        let start = (start_1based as usize)
+            .checked_sub(1)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "0 start"))?;
+        let end = start + length as usize;
+        if end > self.chrom.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "past chrom end",
+            ));
+        }
+        Ok(self.chrom[start..end].to_vec())
+    }
+}
+
+fn synthetic_read(
+    flag: u16,
+    pos: u64,
+    mapq: u8,
+    cigar: Vec<CigarOp>,
+    seq: Vec<u8>,
+    qual: Vec<u8>,
+) -> MappedRead {
+    MappedRead {
+        qname: b"r1".to_vec(),
+        flag,
+        ref_id: 0,
+        pos,
+        mapq,
+        cigar,
+        seq,
+        qual,
+        mate_ref_id: None,
+        mate_pos: None,
+        adaptor_boundary: None,
+        source_file_index: 0,
+    }
+}
+
+#[test]
+fn engine_happy_path_match_only() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::Match(8)],
+        b"ACGTACGT".to_vec(),
+        vec![40; 8],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    match engine.process(&read, &fetcher) {
+        BaqOutcome::Capped(prepared) => {
+            assert_eq!(prepared.alignment_start, 1);
+            assert_eq!(prepared.alignment_end, 8);
+            assert_eq!(prepared.seq, read.seq);
+            assert_eq!(prepared.cigar, read.cigar);
+            assert_eq!(prepared.bq_baq.len(), 8);
+            for (i, &q) in prepared.bq_baq.iter().enumerate() {
+                assert!(q <= 40, "pos {i}: bq_baq {q} exceeds raw qual 40");
+            }
+            assert_eq!(prepared.mate_role, MateRole::Solo);
+            assert!(!prepared.is_reverse_strand);
+        }
+        BaqOutcome::Skipped(reason) => panic!("expected Capped, got Skipped({reason:?})"),
+    }
+}
+
+#[test]
+fn engine_mate_role_first_of_pair() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(
+        FLAG_PAIRED | FLAG_FIRST_OF_PAIR,
+        1,
+        60,
+        vec![CigarOp::Match(5)],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    match engine.process(&read, &fetcher) {
+        BaqOutcome::Capped(prepared) => assert_eq!(prepared.mate_role, MateRole::FirstOfPair),
+        other => panic!("expected Capped, got {other:?}"),
+    }
+}
+
+#[test]
+fn engine_reverse_strand_propagates() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(
+        FLAG_REVERSE_STRAND,
+        1,
+        60,
+        vec![CigarOp::Match(5)],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    match engine.process(&read, &fetcher) {
+        BaqOutcome::Capped(prepared) => assert!(prepared.is_reverse_strand),
+        other => panic!("expected Capped, got {other:?}"),
+    }
+}
+
+#[test]
+fn engine_skip_unmapped() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(
+        FLAG_UNMAPPED,
+        1,
+        0,
+        vec![CigarOp::Match(5)],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    assert_eq!(
+        skip_reason(engine.process(&read, &fetcher)),
+        Some(BaqSkipReason::Unmapped),
+    );
+}
+
+#[test]
+fn engine_skip_empty_query() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(0, 1, 60, vec![], vec![], vec![]);
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    assert_eq!(
+        skip_reason(engine.process(&read, &fetcher)),
+        Some(BaqSkipReason::EmptyQuery),
+    );
+}
+
+#[test]
+fn engine_skip_qual_absent() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::Match(5)],
+        b"ACGTA".to_vec(),
+        vec![], // no quals
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    assert_eq!(
+        skip_reason(engine.process(&read, &fetcher)),
+        Some(BaqSkipReason::QualAbsent),
+    );
+}
+
+#[test]
+fn engine_skip_no_match_in_cigar() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGT".to_vec(),
+    };
+    // All soft-clip — no M/=/X. Matches realn.c:192 (`xb == -1`).
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::SoftClip(5)],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    assert_eq!(
+        skip_reason(engine.process(&read, &fetcher)),
+        Some(BaqSkipReason::NoMatchInCigar),
+    );
+}
+
+#[test]
+fn engine_skip_contains_ref_skip() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGTACGT".to_vec(),
+    };
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::Match(3), CigarOp::Skip(5), CigarOp::Match(3)],
+        b"ACGACG".to_vec(),
+        vec![40; 6],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    assert_eq!(
+        skip_reason(engine.process(&read, &fetcher)),
+        Some(BaqSkipReason::ContainsRefSkip),
+    );
+}
+
+#[test]
+fn engine_skip_ref_window_past_chrom_end() {
+    // 5 bp chrom, read at pos=4 with CIGAR=5M — match span [3..8) on a
+    // ref that only has [0..5). The fetcher errs, and the engine
+    // converts that to RefWindowPastChromEnd.
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTA".to_vec(),
+    };
+    let read = synthetic_read(
+        0,
+        4,
+        60,
+        vec![CigarOp::Match(5)],
+        b"TACGT".to_vec(),
+        vec![40; 5],
+    );
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    assert_eq!(
+        skip_reason(engine.process(&read, &fetcher)),
+        Some(BaqSkipReason::RefWindowPastChromEnd),
+    );
+}
+
+fn skip_reason(outcome: BaqOutcome) -> Option<BaqSkipReason> {
+    match outcome {
+        BaqOutcome::Skipped(r) => Some(r),
+        BaqOutcome::Capped(_) => None,
+    }
+}

@@ -209,6 +209,13 @@ pub struct FilterCounts {
     /// soft/hard clips). See finding `G2` in
     /// `ia/reviews/pileup_gatk_comparison_2026-05-08.md`.
     pub bad_cigar: u64,
+    /// Reads dropped because the BAQ stage refused to produce a usable
+    /// per-base posterior (HMM overflow, ref window past chrom end,
+    /// CIGAR with `N`/no-match, etc.). One bucket per
+    /// [`BaqSkipReason`](super::baq::BaqSkipReason) currently does not
+    /// exist — every BAQ skip reason rolls up into this counter. Split
+    /// later if a deployment cares which reason dominates.
+    pub baq_rejected: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -286,6 +293,7 @@ pub const FLAG_UNMAPPED: u16 = 0x4;
 pub const FLAG_MATE_UNMAPPED: u16 = 0x8;
 pub const FLAG_REVERSE_STRAND: u16 = 0x10;
 pub const FLAG_MATE_REVERSE_STRAND: u16 = 0x20;
+pub const FLAG_FIRST_OF_PAIR: u16 = 0x40;
 pub const FLAG_SECONDARY: u16 = 0x100;
 pub const FLAG_QC_FAIL: u16 = 0x200;
 pub const FLAG_DUPLICATE: u16 = 0x400;
@@ -1221,6 +1229,7 @@ impl CramMergedReader {
             FilterBucket::QcFail => self.filter_counts.qc_fail += 1,
             FilterBucket::Duplicate => self.filter_counts.duplicate += 1,
             FilterBucket::LowMapq => self.filter_counts.low_mapq += 1,
+            FilterBucket::BaqRejected => self.filter_counts.baq_rejected += 1,
         }
     }
 }
@@ -1302,13 +1311,18 @@ enum PreDecodeOutcome {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum FilterBucket {
+pub(super) enum FilterBucket {
     Unmapped,
     Secondary,
     Supplementary,
     QcFail,
     Duplicate,
     LowMapq,
+    /// Bucket for reads the BAQ stage refused — incremented by the
+    /// pipeline integration in a later commit; no call site in
+    /// `cram_input` itself today.
+    #[allow(dead_code)]
+    BaqRejected,
 }
 
 // ---------------------------------------------------------------------

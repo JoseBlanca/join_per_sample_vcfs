@@ -15,6 +15,7 @@
 
 use super::BaqConfig;
 use super::errors::BaqOverflow;
+use super::scratch::Scratch;
 
 const EI: f64 = 0.25;
 // htslib uses the decimal literal `.33333333333` (11 digits), not 1/3.
@@ -59,6 +60,7 @@ fn set_u(bw: i32, i: i32, k: i32) -> usize {
 /// wrong, capped at 99 (htslib's same cap at
 /// [probaln.c:418](../../../htslib/probaln.c#L418)).
 pub(super) fn probaln_glocal(
+    scratch: &mut Scratch,
     ref_seq: &[u8],
     query: &[u8],
     iqual: &[u8],
@@ -95,7 +97,9 @@ pub(super) fn probaln_glocal(
     }) as usize;
     let l_q = l_query as usize;
 
-    // Allocation-size guard (probaln.c:104-107).
+    // Allocation-size guard (probaln.c:104-107). Done before
+    // `resize_for` so an overflow returns `Err` instead of panicking
+    // inside Vec.
     let rows = l_q.checked_add(1).ok_or(BaqOverflow::AllocationOverflow)?;
     let cells = rows
         .checked_mul(i_dim)
@@ -107,16 +111,17 @@ pub(super) fn probaln_glocal(
         return Err(BaqOverflow::AllocationOverflow);
     }
 
-    let mut f: Vec<f64> = vec![0.0; cells];
-    let mut b: Vec<f64> = vec![0.0; cells];
-    let mut s: Vec<f64> = vec![0.0; l_q + 2];
+    scratch.resize_for(l_q, i_dim);
+    // Borrow-split the disjoint scratch fields so the HMM body can
+    // index them by short names without re-walking `scratch.`.
+    let f = &mut scratch.f;
+    let b = &mut scratch.b;
+    let s = &mut scratch.s;
+    let qual = &mut scratch.qual;
+    let q2p = &scratch.q2p;
 
-    // Per-base error prob lookup (probaln.c:46, 122-127).
-    let mut q2p = [0f32; 256];
-    for (i, slot) in q2p.iter_mut().enumerate() {
-        *slot = 10f32.powf(-(i as f32) / 10.0);
-    }
-    let mut qual: Vec<f32> = vec![0.0; l_q];
+    // Populate qual from iqual using the engine-owned Phred → P_err
+    // lookup.
     for i in 0..l_q {
         qual[i] = q2p[iqual[i] as usize];
     }

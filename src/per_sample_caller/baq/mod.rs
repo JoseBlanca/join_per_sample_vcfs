@@ -15,12 +15,15 @@
 //! Layer 2 (`BaqEngine`, per-read driver) and the pipeline integration
 //! land in later commits per the plan.
 
+mod engine;
 pub mod errors;
 mod probaln;
+mod scratch;
 
 #[cfg(test)]
 mod tests;
 
+pub use engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 pub use errors::BaqOverflow;
 
 /// Parameters for `probaln_glocal`. Mirrors htslib's `probaln_par_t`
