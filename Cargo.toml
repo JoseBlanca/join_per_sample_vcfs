@@ -48,3 +48,7 @@ harness = false
 [[bench]]
 name = "freebayes_bookkeeping"
 harness = false
+
+[[bench]]
+name = "baq_perf"
+harness = false
