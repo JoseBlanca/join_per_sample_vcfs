@@ -281,8 +281,8 @@ impl WalkerState {
         self.contributors_buf.clear();
         let contributors = &mut self.contributors_buf;
 
-        for active in self.active_reads.iter() {
-            let events_at_pos = active.cursor.events_at(walker_pos, &active.read);
+        for active_read in self.active_reads.iter() {
+            let events_at_pos = active_read.cursor.events_at(walker_pos, &active_read.read);
 
             if events_at_pos.is_empty() {
                 continue;
@@ -302,14 +302,14 @@ impl WalkerState {
                 .unwrap_or(0);
 
             contributors.push(ReadContribution {
-                read_id: active.read_id,
-                chain_slot_id: active.chain_slot_id,
+                read_id: active_read.read_id,
+                chain_slot_id: active_read.chain_slot_id,
                 events_at_pos,
                 bq_baq_at_walker_pos: bq_at_walker,
-                mq_log_err: active.read.mq_log_err,
-                is_reverse_strand: active.read.is_reverse_strand,
-                alignment_start: active.read.alignment_start,
-                mate_role: active.read.mate_role,
+                mq_log_err: active_read.read.mq_log_err,
+                is_reverse_strand: active_read.read.is_reverse_strand,
+                alignment_start: active_read.read.alignment_start,
+                mate_role: active_read.read.mate_role,
                 bq_zero_in_window: false,
                 bq_override_at_walker_pos: None,
             });
