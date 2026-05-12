@@ -19,12 +19,14 @@ mod engine;
 pub mod errors;
 mod probaln;
 mod scratch;
+mod stream;
 
 #[cfg(test)]
 mod tests;
 
 pub use engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 pub use errors::BaqOverflow;
+pub use stream::{BaqSkipCounts, BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
 
 /// Parameters for `probaln_glocal`. Mirrors htslib's `probaln_par_t`
 /// ([htslib/htslib/hts.h:1435](../../../htslib/htslib/hts.h#L1435)).

@@ -545,3 +545,158 @@ fn skip_reason(outcome: BaqOutcome) -> Option<BaqSkipReason> {
         BaqOutcome::Capped(_) => None,
     }
 }
+
+// ---------------------------------------------------------------------
+// BaqStream — rayon-parallel adapter tests.
+// ---------------------------------------------------------------------
+
+use crate::per_sample_caller::errors::CramInputError;
+use crate::per_sample_caller::pileup::PreparedRead;
+
+use super::stream::BaqStream;
+
+#[test]
+fn stream_yields_prepared_reads_in_order_within_chunk() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGTACGT".to_vec(),
+    };
+    let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=4)
+        .map(|pos| {
+            Ok(synthetic_read(
+                0,
+                pos as u64,
+                60,
+                vec![CigarOp::Match(5)],
+                b"ACGTA".to_vec(),
+                vec![40; 5],
+            ))
+        })
+        .collect();
+    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+    let outputs: Vec<Result<PreparedRead, _>> = stream.collect();
+    assert_eq!(outputs.len(), 4);
+    let starts: Vec<u32> = outputs
+        .iter()
+        .map(|r| r.as_ref().unwrap().alignment_start)
+        .collect();
+    assert_eq!(starts, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn stream_preserves_order_across_chunks() {
+    // Chunk size 2 with 5 inputs → three batches. Output order must
+    // still match input order.
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGTACGT".to_vec(),
+    };
+    let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=5)
+        .map(|pos| {
+            Ok(synthetic_read(
+                0,
+                pos as u64,
+                60,
+                vec![CigarOp::Match(5)],
+                b"ACGTA".to_vec(),
+                vec![40; 5],
+            ))
+        })
+        .collect();
+    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 2);
+    let starts: Vec<u32> = stream.map(|r| r.unwrap().alignment_start).collect();
+    assert_eq!(starts, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn stream_increments_skip_counts_per_reason() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGTACGTACGT".to_vec(),
+    };
+    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
+        // Capped — happy path.
+        Ok(synthetic_read(
+            0,
+            1,
+            60,
+            vec![CigarOp::Match(5)],
+            b"ACGTA".to_vec(),
+            vec![40; 5],
+        )),
+        // Unmapped — Skipped(Unmapped).
+        Ok(synthetic_read(
+            FLAG_UNMAPPED,
+            1,
+            0,
+            vec![CigarOp::Match(5)],
+            b"ACGTA".to_vec(),
+            vec![40; 5],
+        )),
+        // All soft-clip — Skipped(NoMatchInCigar).
+        Ok(synthetic_read(
+            0,
+            1,
+            60,
+            vec![CigarOp::SoftClip(5)],
+            b"ACGTA".to_vec(),
+            vec![40; 5],
+        )),
+        // Another capped — confirms skips don't break the surviving stream.
+        Ok(synthetic_read(
+            0,
+            2,
+            60,
+            vec![CigarOp::Match(5)],
+            b"CGTAC".to_vec(),
+            vec![40; 5],
+        )),
+    ];
+    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+    let outputs: Vec<_> = (&mut stream).collect();
+    assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 2);
+    let counts = *stream.skip_counts();
+    assert_eq!(counts.total, 2);
+    assert_eq!(counts.unmapped, 1);
+    assert_eq!(counts.no_match_in_cigar, 1);
+}
+
+#[test]
+fn stream_propagates_upstream_error_after_batched_reads() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGT".to_vec(),
+    };
+    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
+        Ok(synthetic_read(
+            0,
+            1,
+            60,
+            vec![CigarOp::Match(5)],
+            b"ACGTA".to_vec(),
+            vec![40; 5],
+        )),
+        Err(CramInputError::NoInputs),
+    ];
+    let outputs: Vec<_> =
+        BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16).collect();
+    assert_eq!(outputs.len(), 2);
+    assert!(outputs[0].is_ok());
+    assert!(matches!(outputs[1], Err(CramInputError::NoInputs)));
+}
+
+#[test]
+fn stream_is_fused_after_exhaustion() {
+    let fetcher = MockRefFetcher {
+        chrom: b"ACGTACGT".to_vec(),
+    };
+    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![Ok(synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::Match(5)],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    ))];
+    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+    assert!(stream.next().is_some());
+    assert!(stream.next().is_none());
+    // Confirmed fused: re-poll yields None.
+    assert!(stream.next().is_none());
+}
