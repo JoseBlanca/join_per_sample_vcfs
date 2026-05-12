@@ -36,6 +36,16 @@ where
     let mut state = WalkerState::new(*config);
     let mut reads_iter = reads.into_iter().peekable();
 
+    // Initial chromosome anchor: the first peeked read sets
+    // `chrom_id`, `walker_pos = 1`, and `last_admitted_chrom_id`.
+    // Subsequent re-anchors happen inside the chromosome-boundary
+    // block below, right after `flush_chromosome`. Hoisting this
+    // out of the per-iteration path keeps the hot loop free of a
+    // call that is a no-op on every iteration except the first.
+    if let Some(first) = reads_iter.peek() {
+        state.enter_chrom(first.chrom_id);
+    }
+
     // Continue while there is work to do: more reads to pull,
     // or active reads still covering the walker. Stopping at
     // "reads_iter empty" alone would leak open records whose
@@ -72,9 +82,7 @@ where
                 });
             }
             state.flush_chromosome(tx)?;
-        }
-        if let Some(peeked_read) = reads_iter.peek() {
-            state.set_chrom_if_needed(peeked_read.chrom_id);
+            state.enter_chrom(peeked_read.chrom_id);
         }
 
         // Pull every read with alignment_start ≤ walker_pos
@@ -205,25 +213,27 @@ impl WalkerState {
         }
     }
 
-    fn set_chrom_if_needed(&mut self, chrom_id: u32) {
-        if self.last_admitted_chrom_id != Some(chrom_id) {
-            self.chrom_id = chrom_id;
-            // Walker_pos resets per chromosome. Walker only
-            // emits within a chromosome, so position numbering
-            // restarts from 1.
-            self.walker_pos = 1;
-            self.last_admitted_chrom_id = Some(chrom_id);
-            // `last_admitted_locus` is deliberately preserved
-            // across chromosome boundaries (Mi14 in
-            // `ia/reviews/pileup_2026-05-11.md`): the per-read
-            // tuple comparison in `admit_read` correctly admits a
-            // forward chrom change (`(new_chrom, _) > (old_chrom,
-            // _)` holds whenever `new_chrom > old_chrom`), and
-            // keeping the locus sticky lets the outer chrom
-            // regression's error message report the *actual*
-            // last admitted (chrom, pos) instead of falling back
-            // to a misleading `walker_pos`.
-        }
+    /// Anchor the walker to a chromosome. Called twice in the
+    /// run lifecycle: once before the loop with the first peeked
+    /// read's chrom, and again inside the boundary block right
+    /// after `flush_chromosome` when the next peeked read sits on
+    /// a new chrom. Walker_pos resets per chromosome — the walker
+    /// only emits within a chromosome, so position numbering
+    /// restarts from 1.
+    ///
+    /// `last_admitted_locus` is deliberately preserved across
+    /// chromosome boundaries (Mi14 in
+    /// `ia/reviews/pileup_2026-05-11.md`): the per-read tuple
+    /// comparison in `admit_read` correctly admits a forward
+    /// chrom change (`(new_chrom, _) > (old_chrom, _)` holds
+    /// whenever `new_chrom > old_chrom`), and keeping the locus
+    /// sticky lets the outer chrom regression's error message
+    /// report the *actual* last admitted (chrom, pos) instead of
+    /// falling back to a misleading `walker_pos`.
+    fn enter_chrom(&mut self, chrom_id: u32) {
+        self.chrom_id = chrom_id;
+        self.walker_pos = 1;
+        self.last_admitted_chrom_id = Some(chrom_id);
     }
 
     fn admit_read(&mut self, read: PreparedRead) -> Result<(), WalkerError> {
