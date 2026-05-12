@@ -34,14 +34,14 @@ where
     F: RefSeqFetcher,
 {
     let mut state = WalkerState::new(*config);
-    let mut iter = reads.into_iter().peekable();
+    let mut reads_iter = reads.into_iter().peekable();
 
     // Continue while there is work to do: more reads to pull,
     // or active reads still covering the walker. Stopping at
-    // "iter empty" alone would leak open records whose anchor
-    // positions sit ahead of the walker but inside the active
-    // set's coverage.
-    while iter.peek().is_some() || !state.active_reads.is_empty() {
+    // "reads_iter empty" alone would leak open records whose
+    // anchor positions sit ahead of the walker but inside the
+    // active set's coverage.
+    while reads_iter.peek().is_some() || !state.active_reads.is_empty() {
         // Chromosome boundary: validate the change is forward,
         // then flush everything from the current chromosome
         // before continuing.
@@ -51,7 +51,7 @@ where
         // which would mask a regression at the per-read order
         // check inside `admit_read`. See finding M2 in
         // `ia/reviews/pileup_2026-05-09.md`.
-        if let Some(peek) = iter.peek()
+        if let Some(peek) = reads_iter.peek()
             && let Some(prev_chrom_id) = state.last_admitted_chrom_id
             && prev_chrom_id != peek.chrom_id
         {
@@ -70,24 +70,24 @@ where
             }
             state.flush_chromosome(tx)?;
         }
-        if let Some(peek) = iter.peek() {
+        if let Some(peek) = reads_iter.peek() {
             state.set_chrom_if_needed(peek.chrom_id);
         }
 
         // Pull every read with alignment_start ≤ walker_pos
         // (only on the current chromosome; reads on later
         // chromosomes wait for the chromosome flush above).
-        while let Some(p) = iter.peek() {
+        while let Some(p) = reads_iter.peek() {
             if p.chrom_id != state.chrom_id {
                 break;
             }
             if p.alignment_start > state.walker_pos {
                 break;
             }
-            // PANIC-FREE: `iter.peek()` returned Some on the loop
-            // condition above, and `iter` has not been advanced
+            // PANIC-FREE: `reads_iter.peek()` returned Some on the loop
+            // condition above, and `reads_iter` has not been advanced
             // between then and here.
-            let r = iter.next().expect("peek matched");
+            let r = reads_iter.next().expect("peek matched");
             state.admit_read(r)?;
         }
 
@@ -110,7 +110,7 @@ where
         // walker_pos+1 if any active read still has events at or
         // beyond it, otherwise jump to the next read's
         // alignment_start (skip uncovered span).
-        state.advance(iter.peek())?;
+        state.advance(reads_iter.peek())?;
     }
 
     // End of input: flush whatever remains, on whichever
