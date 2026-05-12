@@ -38,11 +38,27 @@ If real benchmark or profile output is available, quote it verbatim. The verbati
 
 **If a sampling profile is impossible to collect in the user's environment, raise the alarm before moving on.** This is not a "we'll work around it with other tools" situation — sampling profile access is a load-bearing input to a useful review, and proceeding without it significantly degrades the review's actionable output.
 
-Common blockers:
+Common blockers (diagnose precisely — the fix depends on the OS):
+
+**Linux** — `perf_event_open` is the kernel ABI all the major sampling tools use (`perf record`, `cargo flamegraph`, `samply`).
 
 - `kernel.perf_event_paranoid >= 3` (Debian's default) blocks `perf_event_open` for unprivileged users. Fix: `sudo sysctl kernel.perf_event_paranoid=2` (persist via `/etc/sysctl.d/99-perf.conf`).
 - Rootless container without `CAP_PERFMON`. Adding `--cap-add=PERFMON` on the container invocation only helps in *rootful* podman/docker — in rootless mode the kernel's `capable(CAP_PERFMON)` check runs against the host UID's caps, which the user namespace cannot grant. Lower the host paranoid instead, or run perf against the release binary from the host directly (`target/.../bench_binary --bench ... --profile-time 30`).
 - Restricted CI / sandboxed runners. May require running benches on a privileged worker, or accepting that any code-level findings will be marked Speculative.
+
+**macOS (incl. Apple Silicon M-series)** — There is no `perf_event_paranoid` knob; `perf` is Linux-specific. Profiling your own Rust process generally *just works* without elevated permissions. The native toolchain:
+
+- `samply record cargo bench --bench <name> -- <filter> --profile-time 30` — same crate as Linux, cross-platform; outputs to a self-contained viewer (https://profiler.firefox.com). Easiest first try.
+- `cargo flamegraph --bench <name> -- <filter> --profile-time 30` — on macOS this auto-switches to a `dtrace` backend.
+- **Instruments.app** (ships with Xcode Command Line Tools, free) — the canonical GUI profiler; CPU Profiler template uses M-series hardware counters natively. CLI variant: `xcrun xctrace record --template 'Time Profiler' --launch -- <binary>`.
+- `sample <pid>` — the simple, always-available CLI sampler that ships with the OS.
+
+macOS blockers that *do* exist (less common, mention only if hit):
+
+- System Integrity Protection (SIP) restricts some kernel-level DTrace probes; user-space sampling against your own process is unaffected. If `dtrace` complains about probe registration, disabling specific SIP features requires a Recovery-mode `csrutil` change — flag to user, don't recommend casually.
+- Profiling a signed third-party binary (cross-process attach) needs the binary's entitlements to allow it. Not relevant for our own `cargo bench` output.
+
+**Other OSes / WSL** — Treat as the closest match (WSL2 ≈ Linux; FreeBSD has `dtrace`). If you cannot match it, file the gap and ask the user.
 
 **Other profilers are not substitutes.** Each of them answers one narrow question:
 
@@ -239,7 +255,7 @@ Use this to invoke the skill consistently. Fill in the Context block; the rest d
 > 3. Cold code is not the hot path; downgrade findings filed against it.
 > 4. Correctness wins over speed. Route correctness-adjacent findings through a separate review.
 > 5. One change per measurement — do not bundle allocator + LTO + refactor.
-> 6. **If the environment blocks sampling profilers (`perf record` / `cargo flamegraph` / `samply`), halt and tell the user before continuing.** This is not a "we'll use DHAT instead" situation — DHAT, `cargo asm`, valgrind, and wall-clock criterion each answer one narrow question and **none** of them tells you which line owns the CPU. Without a sampling profile, most pattern-matched Likely findings will show no measurable gain when applied. Common fix: `sudo sysctl kernel.perf_event_paranoid=2`. See step 2 for the full handling.
+> 6. **If the environment blocks sampling profilers (`perf record` / `cargo flamegraph` / `samply` / Instruments / `dtrace`), halt and tell the user before continuing.** This is not a "we'll use DHAT instead" situation — DHAT, `cargo asm`, valgrind, and wall-clock criterion each answer one narrow question and **none** of them tells you which line owns the CPU. Without a sampling profile, most pattern-matched Likely findings will show no measurable gain when applied. The fix depends on OS (Linux: `sudo sysctl kernel.perf_event_paranoid=2`; macOS: usually no fix needed — `samply` / Instruments work without elevated perms); see step 2 for the full per-OS handling.
 
 ---
 
