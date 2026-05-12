@@ -1,0 +1,22 @@
+# Per-target compiler flags. Each entry lifts the CPU floor to a
+# microarchitecture the corresponding deployment is known to run on,
+# unlocking ISA features (AVX2/FMA on x86_64; Apple-Silicon extensions
+# on aarch64-macos) that the HMM inner loops in
+# `src/per_sample_caller/baq/probaln.rs` care about.
+#
+# Trade-off: the produced binary refuses to launch on hardware older
+# than the named microarchitecture. If a deployment is older than these
+# floors, override on the command line:
+#
+#   RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
+
+# Workstation / HPC Linux x86_64 — Haswell-or-newer (AVX2 + FMA + BMI2).
+# Covers every x86_64 server / workstation made since 2013.
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# macOS Apple Silicon dev box — `apple-m1` is the Apple-Silicon floor;
+# M2/M3/M4 are ISA-compatible (Armv8.6-A + Apple extensions). LLVM
+# auto-detects newer-core extensions at codegen time when this is set.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))']
+rustflags = ["-C", "target-cpu=apple-m1"]
