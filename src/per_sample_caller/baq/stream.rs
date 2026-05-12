@@ -69,7 +69,16 @@ where
     cfg: BaqConfig,
     ref_fetcher: &'a F,
     chunk_size: usize,
-    current_batch: std::vec::IntoIter<PreparedRead>,
+    /// Reusable input-chunk buffer drained from upstream each refill.
+    /// Its capacity sticks at `chunk_size` after the first refill.
+    chunk_buf: Vec<MappedRead>,
+    /// Reusable parallel-output buffer; `collect_into_vec` clears and
+    /// refills it in place.
+    outcomes_buf: Vec<BaqOutcome>,
+    /// Surviving `PreparedRead`s for the current chunk, drained
+    /// front-to-back via `current_idx`. Lives on the stream so the
+    /// backing buffer survives across refills.
+    current_batch: Vec<PreparedRead>,
     pending_error: Option<CramInputError>,
     upstream_done: bool,
     skip_counts: BaqSkipCounts,
@@ -86,7 +95,9 @@ where
             cfg,
             ref_fetcher,
             chunk_size: chunk_size.max(1),
-            current_batch: Vec::new().into_iter(),
+            chunk_buf: Vec::new(),
+            outcomes_buf: Vec::new(),
+            current_batch: Vec::new(),
             pending_error: None,
             upstream_done: false,
             skip_counts: BaqSkipCounts::default(),
@@ -104,10 +115,10 @@ where
         if self.upstream_done {
             return;
         }
-        let mut chunk: Vec<MappedRead> = Vec::with_capacity(self.chunk_size);
-        while chunk.len() < self.chunk_size {
+        self.chunk_buf.clear();
+        while self.chunk_buf.len() < self.chunk_size {
             match self.reads.next() {
-                Some(Ok(r)) => chunk.push(r),
+                Some(Ok(r)) => self.chunk_buf.push(r),
                 Some(Err(e)) => {
                     self.pending_error = Some(e);
                     self.upstream_done = true;
@@ -119,26 +130,30 @@ where
                 }
             }
         }
-        if chunk.is_empty() {
+        if self.chunk_buf.is_empty() {
             return;
         }
         let cfg = self.cfg;
         let fetcher = self.ref_fetcher;
-        let outcomes: Vec<BaqOutcome> = chunk
+        // collect_into_vec clears the destination first and reuses its
+        // backing buffer — no per-chunk allocation of `outcomes`.
+        self.chunk_buf
             .par_iter()
             .map_init(
                 || BaqEngine::new(cfg),
                 |engine, read| engine.process(read, fetcher),
             )
-            .collect();
-        let mut prepared = Vec::with_capacity(outcomes.len());
-        for outcome in outcomes {
+            .collect_into_vec(&mut self.outcomes_buf);
+        self.current_batch.clear();
+        for outcome in self.outcomes_buf.drain(..) {
             match outcome {
-                BaqOutcome::Capped(p) => prepared.push(p),
+                BaqOutcome::Capped(p) => self.current_batch.push(p),
                 BaqOutcome::Skipped(reason) => self.skip_counts.bump(reason),
             }
         }
-        self.current_batch = prepared.into_iter();
+        // Reverse so `next()` can `pop()` from the back and still yield
+        // in the original (coordinate-sorted) order.
+        self.current_batch.reverse();
     }
 }
 
@@ -150,7 +165,7 @@ where
     type Item = Result<PreparedRead, CramInputError>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(p) = self.current_batch.next() {
+            if let Some(p) = self.current_batch.pop() {
                 return Some(Ok(p));
             }
             if let Some(e) = self.pending_error.take() {

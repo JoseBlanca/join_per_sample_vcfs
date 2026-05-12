@@ -1,11 +1,25 @@
 //! Reusable buffers for `probaln_glocal`. `BaqEngine` owns one
 //! `Scratch` and threads it through the HMM on every read so a per-read
-//! call does not allocate.
+//! call does not allocate. The Phred→P_err lookup `Q2P` is process-wide
+//! shared via `LazyLock` so each rayon worker reads from one copy
+//! rather than carrying its own.
+
+use std::sync::LazyLock;
+
+/// Phred → P_err lookup. Initialised once per process from
+/// `10^(-q/10)` for `q in 0..=255`. Mirrors htslib's `g_qual2prob`
+/// (`htslib/probaln.c:46, 122-127`).
+pub(super) static Q2P: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    let mut t = [0f32; 256];
+    for (i, slot) in t.iter_mut().enumerate() {
+        *slot = 10f32.powf(-(i as f32) / 10.0);
+    }
+    t
+});
 
 /// Per-call working storage for `probaln_glocal`: the forward (`f`) and
 /// backward (`b`) banded DP tables, the per-row scale factors (`s`),
-/// the per-base error-probability working vector (`qual`), and the
-/// shared Phred → P_err lookup (`q2p`).
+/// and the per-base error-probability working vector (`qual`).
 ///
 /// Sized lazily by `resize_for`. The buffers grow to the largest
 /// problem seen so far and stay at that capacity, so a long read
@@ -15,21 +29,15 @@ pub(super) struct Scratch {
     pub(super) b: Vec<f64>,
     pub(super) s: Vec<f64>,
     pub(super) qual: Vec<f32>,
-    pub(super) q2p: [f32; 256],
 }
 
 impl Scratch {
     pub(super) fn new() -> Self {
-        let mut q2p = [0f32; 256];
-        for (i, slot) in q2p.iter_mut().enumerate() {
-            *slot = 10f32.powf(-(i as f32) / 10.0);
-        }
         Self {
             f: Vec::new(),
             b: Vec::new(),
             s: Vec::new(),
             qual: Vec::new(),
-            q2p,
         }
     }
 

@@ -15,7 +15,7 @@
 
 use super::BaqConfig;
 use super::errors::BaqOverflow;
-use super::scratch::Scratch;
+use super::scratch::{Q2P, Scratch};
 
 const EI: f64 = 0.25;
 // htslib uses the decimal literal `.33333333333` (11 digits), not 1/3.
@@ -118,10 +118,10 @@ pub(super) fn probaln_glocal(
     let b = &mut scratch.b;
     let s = &mut scratch.s;
     let qual = &mut scratch.qual;
-    let q2p = &scratch.q2p;
+    // Process-wide shared lookup — see `scratch::Q2P`.
+    let q2p: &[f32; 256] = &Q2P;
 
-    // Populate qual from iqual using the engine-owned Phred → P_err
-    // lookup.
+    // Populate qual from iqual using the shared Phred → P_err lookup.
     for i in 0..l_q {
         qual[i] = q2p[iqual[i] as usize];
     }
@@ -200,14 +200,25 @@ pub(super) fn probaln_glocal(
         let mut sum = 0.0;
         let base_i = i_us * i_dim;
         let base_i1 = (i_us - 1) * i_dim;
+        // L8: row-invariant `set_u` terms hoisted out of the inner k-loop.
+        // `set_u(bw, i, k) = (k - x_i + 1) * 3`,
+        // `set_u(bw, i-1, k) = (k - x_im1 + 1) * 3`, etc.
+        let x_i = (i - bw).max(0);
+        let x_im1 = ((i - 1) - bw).max(0);
+        // L6: bounds-check elision proof. Every in-band `u, v01, v10, v11`
+        // is `< i_dim - 2` by construction (band width `bw2*3+6 ≤ i_dim`).
+        // Adding `+ 2` to a base offset stays under `base + i_dim`, so a
+        // single assert per base hoists all per-cell bounds checks.
+        assert!(base_i + i_dim <= f.len());
+        assert!(base_i1 + i_dim <= f.len());
         for k in beg..=end {
             let r = ref_seq[(k - 1) as usize];
             let cond = ((r > 3 || qyi > 3) as usize) * 2 + ((r == qyi) as usize);
             let e_val = e_table[cond];
-            let u = set_u(bw, i, k);
-            let v11 = set_u(bw, i - 1, k - 1);
-            let v10 = set_u(bw, i - 1, k);
-            let v01 = set_u(bw, i, k - 1);
+            let u = ((k - x_i + 1) * 3) as usize;
+            let v11 = ((k - 1 - x_im1 + 1) * 3) as usize;
+            let v10 = ((k - x_im1 + 1) * 3) as usize;
+            let v01 = ((k - 1 - x_i + 1) * 3) as usize;
             f[base_i + u] = e_val
                 * (m[0] * m_scale * f[base_i1 + v11]
                     + m[3] * m_scale * f[base_i1 + v11 + 1]
@@ -275,11 +286,17 @@ pub(super) fn probaln_glocal(
         let e_table = [qli1 * EM, 1.0 - qli1, 1.0, 1.0];
         let base_i = i_us * i_dim;
         let base_i1 = (i_us + 1) * i_dim;
+        // L8: row-invariant set_u terms hoisted (uses i+1 for the backward
+        // diagonal predecessor rather than i-1 as forward does).
+        let x_i = (i - bw).max(0);
+        let x_ip1 = ((i + 1) - bw).max(0);
+        // L6: bounds-check elision proof for both rows (`base_i1 > base_i`).
+        assert!(base_i1 + i_dim <= b.len());
         for k in (beg..=end).rev() {
-            let u = set_u(bw, i, k);
-            let v11 = set_u(bw, i + 1, k + 1);
-            let v10 = set_u(bw, i + 1, k);
-            let v01 = set_u(bw, i, k + 1);
+            let u = ((k - x_i + 1) * 3) as usize;
+            let v11 = ((k + 1 - x_ip1 + 1) * 3) as usize;
+            let v10 = ((k - x_ip1 + 1) * 3) as usize;
+            let v01 = ((k + 1 - x_i + 1) * 3) as usize;
             let e_val = if k >= l_ref {
                 0.0
             } else {
@@ -294,8 +311,8 @@ pub(super) fn probaln_glocal(
         }
         // Rescale this row (probaln.c:327-330).
         let scale = 1.0 / s[i_us];
-        let beg_off = set_u(bw, i, beg);
-        let end_off = set_u(bw, i, end) + 2;
+        let beg_off = ((beg - x_i + 1) * 3) as usize;
+        let end_off = ((end - x_i + 1) * 3) as usize + 2;
         for k_off in beg_off..=end_off {
             b[base_i + k_off] *= scale;
         }
@@ -328,6 +345,9 @@ pub(super) fn probaln_glocal(
     }
 
     // === MAP / posterior decoding (probaln.c:380-425) ===
+    // PARITY: the strict `>` tie-break controls which `k` is selected
+    // when two cells share the maximum probability. Do not rewrite as
+    // branchless argmax — the parity tests pin the chosen `state[i]`.
     for i in 1..=l_query {
         let i_us = i as usize;
         let beg = 1.max(i - bw);
@@ -337,8 +357,13 @@ pub(super) fn probaln_glocal(
         let mut max_k: i32 = -1;
         let mut sum = 0.0;
         let base = i_us * i_dim;
+        // L8: hoist the row-invariant `(i - bw).max(0)` from `set_u`.
+        let x_i = (i - bw).max(0);
+        // L6: bounds-check elision proof.
+        assert!(base + i_dim <= f.len());
+        assert!(base + i_dim <= b.len());
         for k in beg..=end {
-            let u = set_u(bw, i, k);
+            let u = ((k - x_i + 1) * 3) as usize;
             let z_m = m_scale * f[base + u] * b[base + u];
             if z_m > max_val {
                 max_val = z_m;

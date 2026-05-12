@@ -58,6 +58,12 @@ pub enum BaqSkipReason {
 
 /// Per-read BAQ driver. Owns reusable scratch buffers so a batched
 /// per-thread pass over reads does not allocate.
+///
+/// `bq_buf` is the in-flight `bq_baq` working buffer that gets handed
+/// off to `PreparedRead` via `mem::take` on the success path; the
+/// engine starts every new read with a fresh empty `Vec` whose
+/// capacity is paid for once (on the first capping that allocates and
+/// every time the next read is longer than any prior).
 pub struct BaqEngine {
     cfg: BaqConfig,
     scratch: Scratch,
@@ -65,6 +71,7 @@ pub struct BaqEngine {
     q: Vec<u8>,
     tref: Vec<u8>,
     tquery: Vec<u8>,
+    bq_buf: Vec<u8>,
 }
 
 impl BaqEngine {
@@ -76,6 +83,7 @@ impl BaqEngine {
             q: Vec::new(),
             tref: Vec::new(),
             tquery: Vec::new(),
+            bq_buf: Vec::new(),
         }
     }
 
@@ -135,7 +143,16 @@ impl BaqEngine {
             return BaqOutcome::Skipped(BaqSkipReason::HmmOverflow);
         }
 
-        let bq_baq = apply_baq_cap(&read.cigar, &read.qual, &self.state, &self.q, pos_0, xb);
+        apply_baq_cap_into(
+            &mut self.bq_buf,
+            &read.cigar,
+            &read.qual,
+            &self.state,
+            &self.q,
+            pos_0,
+            xb,
+        );
+        let bq_baq = std::mem::take(&mut self.bq_buf);
 
         BaqOutcome::Capped(mapped_to_prepared(read, bq_baq))
     }
@@ -146,17 +163,29 @@ impl BaqEngine {
 // parity-test driver via `pub(super)` visibility.
 // ---------------------------------------------------------------------
 
+/// Lookup table for [`encode_base`]: A/C/G/T → 0/1/2/3 (case-insensitive),
+/// anything else → 4. Replacing the previous 5-way match with a
+/// straight-line gather lets `Vec::extend(iter.map(encode_base))`
+/// vectorize on AVX2 / NEON.
+static ENCODE_BASE: [u8; 256] = {
+    let mut t = [4u8; 256];
+    t[b'A' as usize] = 0;
+    t[b'a' as usize] = 0;
+    t[b'C' as usize] = 1;
+    t[b'c' as usize] = 1;
+    t[b'G' as usize] = 2;
+    t[b'g' as usize] = 2;
+    t[b'T' as usize] = 3;
+    t[b't' as usize] = 3;
+    t
+};
+
 /// Encode an ASCII base byte (case-insensitive A/C/G/T) into the 0..=3
 /// values `probaln_glocal` consumes; anything else (including `N`)
 /// becomes 4 (ambiguous). Mirrors htslib's `seq_nt16_int[seq_nt16_table[ch]]`.
+#[inline]
 pub(super) fn encode_base(b: u8) -> u8 {
-    match b {
-        b'A' | b'a' => 0,
-        b'C' | b'c' => 1,
-        b'G' | b'g' => 2,
-        b'T' | b't' => 3,
-        _ => 4,
-    }
+    ENCODE_BASE[b as usize]
 }
 
 /// First CIGAR walk — find the match span `(xb..xe ref, yb..ye query)`
@@ -229,17 +258,21 @@ fn extend_ref_window(
     (xb, xe)
 }
 
-/// Second CIGAR walk: cap match-position qualities by the HMM's `q`.
-/// Mirrors the `!extend_baq` branch at realn.c:244-265.
-fn apply_baq_cap(
+/// Second CIGAR walk: cap match-position qualities by the HMM's `q`,
+/// writing into `out`. Mirrors the `!extend_baq` branch at
+/// realn.c:244-265. `out` is cleared first; the engine reuses one
+/// buffer across reads via `mem::take` on success.
+fn apply_baq_cap_into(
+    out: &mut Vec<u8>,
     cigar: &[CigarOp],
     qual: &[u8],
     state: &[i32],
     q: &[u8],
     pos_0: i32,
     xb: i32,
-) -> Vec<u8> {
-    let mut capped = qual.to_vec();
+) {
+    out.clear();
+    out.extend_from_slice(qual);
     let mut x = pos_0;
     let mut y: usize = 0;
     let l_qseq = qual.len();
@@ -254,7 +287,7 @@ fn apply_baq_cap(
                 for i in y..(y + l_clamped) {
                     let expected_k = (x - xb) + (i as i32 - y as i32);
                     let agree = state[i] & 3 == 0 && state[i] >> 2 == expected_k;
-                    capped[i] = if agree { qual[i].min(q[i]) } else { 0 };
+                    out[i] = if agree { qual[i].min(q[i]) } else { 0 };
                 }
                 x += l as i32;
                 y += l_clamped;
@@ -268,7 +301,6 @@ fn apply_baq_cap(
             _ => {}
         }
     }
-    capped
 }
 
 fn op_len(op: CigarOp) -> usize {
@@ -288,7 +320,7 @@ fn op_len(op: CigarOp) -> usize {
 fn mapped_to_prepared(read: &MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
     let alignment_start = read.pos as u32;
     let alignment_end = compute_alignment_end(alignment_start, &read.cigar);
-    let qname = Arc::<str>::from(String::from_utf8_lossy(&read.qname).as_ref());
+    let qname = qname_to_arc(&read.qname);
     let mate_role = derive_mate_role(read.flag);
     let is_reverse_strand = read.flag & FLAG_REVERSE_STRAND != 0;
     let mq_log_err = phred_to_ln_perr(read.mapq);
@@ -304,6 +336,17 @@ fn mapped_to_prepared(read: &MappedRead, bq_baq: Vec<u8>) -> PreparedRead {
         qname,
         mate_role,
         adaptor_boundary: read.adaptor_boundary,
+    }
+}
+
+/// SAM-spec qnames are printable ASCII, so the happy path is one
+/// `Arc::<str>::from(&str)` allocation. The fallback round-trips
+/// through `from_utf8_lossy` only for the rare bad-byte case — without
+/// the fast path that's an extra `String` allocation on every read.
+fn qname_to_arc(qname: &[u8]) -> Arc<str> {
+    match std::str::from_utf8(qname) {
+        Ok(s) => Arc::<str>::from(s),
+        Err(_) => Arc::<str>::from(String::from_utf8_lossy(qname).as_ref()),
     }
 }
 
