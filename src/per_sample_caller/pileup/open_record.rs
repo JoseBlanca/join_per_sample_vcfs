@@ -34,6 +34,17 @@ const ALLELE_CHAIN_SLOTS_INITIAL_CAPACITY: usize = 32;
 /// Previously the largest remaining alloc site by bytes (228 MB
 /// on `pileup_walker_multi_op/L=5000`); see L6 in
 /// `ia/reviews/perf_pileup_2026-05-10.md`.
+///
+/// H1 in `ia/reviews/perf_pileup_2026-05-12.md` tried swapping
+/// the `AHashMap` for a sorted `Vec<(u32, FoldedReadState)>` —
+/// the cumulative bench regressed 1.3 % on the mean with four of
+/// eight fixtures regressing 3–12 % (worst on `multi_op/5000`,
+/// +11.8 %). The `Vec` doubled-on-grow past cap 32 inflated bytes
+/// (131 MB AHashMap → 166 MB Vec) and the `Vec::remove` shift on
+/// re-fold was more expensive than the AHashMap probe. Reverted;
+/// keep the `AHashMap` shape until a smaller-than-AHashMap
+/// container (e.g. an arena-pooled map or a perfect hash on
+/// dense `read_id` ranges) can be evaluated.
 const RECORD_FOLDED_READS_INITIAL_CAPACITY: usize = 32;
 
 /// One in-flight allele bucket inside an `OpenPileupRecord`.
@@ -76,6 +87,7 @@ pub(super) struct OpenPileupRecord {
     /// footprint would be re-folded once per walker step inside
     /// that footprint, multiplying every five-scalar value by
     /// `ref_span` (B1 in `ia/reviews/pileup_2026-05-06.md`).
+    ///
     folded_reads: AHashMap<u32, FoldedReadState>,
 }
 
@@ -874,12 +886,29 @@ fn ln_bq_for_read(window_events: &[ReadEvent], fallback_bq: u8) -> f64 {
 }
 
 /// `Q -> ln(P_err)` where `P_err = 10^(-Q/10)`.
-/// For Q = 0 the error probability is 1, so `ln(1) = 0`.
+///
+/// `q` is a Phred score constrained to `0..=93` by the
+/// [`PreparedRead`] spec, but the table is sized at 256 so the
+/// `q as usize` index covers `u8`'s full domain — bounds-check
+/// elision is unconditional. Built at compile time; the 2 KB
+/// table sits in L1 and the function compiles to one load.
+/// `q == 0` is pinned to `+0.0` to match the prior branch's
+/// `return 0.0;` exactly.
+///
+/// H3 in `ia/reviews/perf_pileup_2026-05-12.md`. Replaces the
+/// per-call FP multiply that round-2 perf attributed at 2.94 %
+/// of walker self-time on `pileup_walker_multi_op/5000`.
 fn phred_to_ln_perr(q: u8) -> f64 {
-    if q == 0 {
-        return 0.0;
-    }
-    -(q as f64) * std::f64::consts::LN_10 / 10.0
+    static LN_PERR_TABLE: [f64; 256] = {
+        let mut t = [0.0_f64; 256];
+        let mut q = 1usize;
+        while q < 256 {
+            t[q] = -(q as f64) * std::f64::consts::LN_10 / 10.0;
+            q += 1;
+        }
+        t
+    };
+    LN_PERR_TABLE[q as usize]
 }
 
 fn insert_sorted_unique(v: &mut Vec<SlotId>, slot: SlotId) {
