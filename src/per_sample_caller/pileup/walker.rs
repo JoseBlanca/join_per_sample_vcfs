@@ -51,37 +51,37 @@ where
         // which would mask a regression at the per-read order
         // check inside `admit_read`. See finding M2 in
         // `ia/reviews/pileup_2026-05-09.md`.
-        if let Some(peek) = reads_iter.peek()
+        if let Some(peeked_read) = reads_iter.peek()
             && let Some(prev_chrom_id) = state.last_admitted_chrom_id
-            && prev_chrom_id != peek.chrom_id
+            && prev_chrom_id != peeked_read.chrom_id
         {
-            if peek.chrom_id < prev_chrom_id {
+            if peeked_read.chrom_id < prev_chrom_id {
                 let prev_pos = state
                     .last_admitted_locus
                     .map(|l| l.pos)
                     .unwrap_or(state.walker_pos);
                 return Err(WalkerError::OutOfOrder {
-                    qname: peek.qname.to_string(),
+                    qname: peeked_read.qname.to_string(),
                     prev_chrom_id,
                     prev_pos,
-                    chrom_id: peek.chrom_id,
-                    pos: peek.alignment_start,
+                    chrom_id: peeked_read.chrom_id,
+                    pos: peeked_read.alignment_start,
                 });
             }
             state.flush_chromosome(tx)?;
         }
-        if let Some(peek) = reads_iter.peek() {
-            state.set_chrom_if_needed(peek.chrom_id);
+        if let Some(peeked_read) = reads_iter.peek() {
+            state.set_chrom_if_needed(peeked_read.chrom_id);
         }
 
         // Pull every read with alignment_start ≤ walker_pos
         // (only on the current chromosome; reads on later
         // chromosomes wait for the chromosome flush above).
-        while let Some(p) = reads_iter.peek() {
-            if p.chrom_id != state.chrom_id {
+        while let Some(peeked_read) = reads_iter.peek() {
+            if peeked_read.chrom_id != state.chrom_id {
                 break;
             }
-            if p.alignment_start > state.walker_pos {
+            if peeked_read.alignment_start > state.walker_pos {
                 break;
             }
             // PANIC-FREE: `reads_iter.peek()` returned Some on the loop
@@ -442,11 +442,11 @@ impl WalkerState {
         // If the active set is empty and the next pulled read
         // starts past the walker, skip the uncovered span.
         if self.active_reads.is_empty()
-            && let Some(p) = next_pulled
-            && p.chrom_id == self.chrom_id
-            && p.alignment_start > self.walker_pos
+            && let Some(peeked_read) = next_pulled
+            && peeked_read.chrom_id == self.chrom_id
+            && peeked_read.alignment_start > self.walker_pos
         {
-            next_pos = p.alignment_start;
+            next_pos = peeked_read.alignment_start;
         }
 
         self.walker_pos = next_pos;
