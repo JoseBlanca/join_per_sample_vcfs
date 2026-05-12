@@ -425,7 +425,7 @@ impl OpenPileupRecordTable {
 /// the sort was wasted work and the contract was unclear. The
 /// preconditions above are now explicit and asserted in debug.
 pub(super) fn apply_events_to_ref_into(
-    out: &mut Vec<u8>,
+    allele_seq: &mut Vec<u8>,
     record_pos: u32,
     ref_seq: &[u8],
     events: &[ReadEvent],
@@ -433,8 +433,8 @@ pub(super) fn apply_events_to_ref_into(
     // Walk the ref_seq in offset order, applying events as we
     // pass their anchor positions. Each event is positioned by an
     // offset = (event.anchor_pos - record_pos).
-    out.clear();
-    out.reserve(ref_seq.len() + 8);
+    allele_seq.clear();
+    allele_seq.reserve(ref_seq.len() + 8);
 
     debug_assert!(
         events.windows(2).all(|w| {
@@ -470,7 +470,7 @@ pub(super) fn apply_events_to_ref_into(
             let start = ref_cursor.max(consumed_until);
             let end = offset.min(ref_len);
             if start < end {
-                out.extend_from_slice(&ref_seq[start as usize..end as usize]);
+                allele_seq.extend_from_slice(&ref_seq[start as usize..end as usize]);
             }
             // ref_cursor is unconditionally overwritten by the
             // match arm below (every event variant sets it), so
@@ -480,7 +480,7 @@ pub(super) fn apply_events_to_ref_into(
         match ev {
             ReadEvent::Match { base, .. } => {
                 if offset < ref_len {
-                    out.push(*base);
+                    allele_seq.push(*base);
                 }
                 ref_cursor = offset + 1;
                 consumed_until = consumed_until.max(offset + 1);
@@ -491,9 +491,9 @@ pub(super) fn apply_events_to_ref_into(
                 // sense). Emit the anchor base if not already
                 // emitted, then append the inserted bases.
                 if offset < ref_len && offset >= consumed_until {
-                    out.push(ref_seq[offset as usize]);
+                    allele_seq.push(ref_seq[offset as usize]);
                 }
-                out.extend_from_slice(seq);
+                allele_seq.extend_from_slice(seq);
                 ref_cursor = offset + 1;
                 consumed_until = consumed_until.max(offset + 1);
             }
@@ -501,7 +501,7 @@ pub(super) fn apply_events_to_ref_into(
                 // DEL: keep the anchor base, drop the next
                 // `deleted_len` reference bases.
                 if offset < ref_len && offset >= consumed_until {
-                    out.push(ref_seq[offset as usize]);
+                    allele_seq.push(ref_seq[offset as usize]);
                 }
                 let skip_until = offset + 1 + *deleted_len;
                 ref_cursor = skip_until;
@@ -515,7 +515,7 @@ pub(super) fn apply_events_to_ref_into(
     if ref_cursor < ref_len {
         let start = ref_cursor.max(consumed_until);
         if start < ref_len {
-            out.extend_from_slice(&ref_seq[start as usize..ref_len as usize]);
+            allele_seq.extend_from_slice(&ref_seq[start as usize..ref_len as usize]);
         }
     }
 }
