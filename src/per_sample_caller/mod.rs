@@ -11,6 +11,7 @@
 //! chains, `.psf` writing) are separate slices and live in sibling
 //! modules.
 
+pub mod baq;
 pub mod cram_input;
 pub mod errors;
 pub mod pileup;

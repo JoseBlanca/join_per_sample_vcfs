@@ -244,11 +244,12 @@ shape:
   [`probaln.c:96-104`](../../htslib/probaln.c#L96-L104) become a
   `BaqOverflow` error variant. htslib returns `INT_MIN`; we return
   a structured error so the driver can count it.
-- Floating-point: htslib uses `float`. We use `f32` (not `f64`) to
-  preserve byte-identical output. The HMM is not numerically
-  sensitive enough at our quality range to require `f64`, and
-  matching `float` is what makes parity testing cheap (see test
-  plan).
+- Floating-point: htslib uses `double` for the DP tables (`f`,
+  `b`, `s`, `m`) and `float` for the per-base quality lookup
+  (`qual[]`, `g_qual2prob[]`) and the input parameters
+  (`probaln_par_t.d`, `.e`). The port mirrors that exactly — `f64`
+  for DP, `f32` for the lookup and config — to keep the byte-for-byte
+  parity test cheap.
 
 ### Layer 2 — per-read driver (`baq::BaqEngine::process`)
 
