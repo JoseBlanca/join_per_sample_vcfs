@@ -36,6 +36,32 @@ List every existing benchmark (`benches/`), profile artifact (`flamegraph.svg`, 
 
 If real benchmark or profile output is available, quote it verbatim. The verbatim output is passed into each sub-agent's prompt at step 5 so they do not re-run.
 
+**If a sampling profile is impossible to collect in the user's environment, raise the alarm before moving on.** This is not a "we'll work around it with other tools" situation — sampling profile access is a load-bearing input to a useful review, and proceeding without it significantly degrades the review's actionable output.
+
+Common blockers:
+
+- `kernel.perf_event_paranoid >= 3` (Debian's default) blocks `perf_event_open` for unprivileged users. Fix: `sudo sysctl kernel.perf_event_paranoid=2` (persist via `/etc/sysctl.d/99-perf.conf`).
+- Rootless container without `CAP_PERFMON`. Adding `--cap-add=PERFMON` on the container invocation only helps in *rootful* podman/docker — in rootless mode the kernel's `capable(CAP_PERFMON)` check runs against the host UID's caps, which the user namespace cannot grant. Lower the host paranoid instead, or run perf against the release binary from the host directly (`target/.../bench_binary --bench ... --profile-time 30`).
+- Restricted CI / sandboxed runners. May require running benches on a privileged worker, or accepting that any code-level findings will be marked Speculative.
+
+**Other profilers are not substitutes.** Each of them answers one narrow question:
+
+- DHAT — allocations only. A function can be 30 % of CPU and 0 % of allocations.
+- `cargo asm` — codegen inspection. Tells you whether bounds checks elided or autovec happened, but not whether the affected line matters.
+- valgrind / callgrind — deterministic instruction counts. Useful for ranking changes against each other but ~10–50× slower than native; the instruction count is *not* the same as the CPU-cycle cost (cache misses, branch mispredicts, FMA throughput all invisible).
+- Criterion wall-clock — cross-run variance is typically 5–10 %, larger than the effect size of individual changes. Within-run confidence intervals look impressive but are tighter than reality.
+
+None of these tells you which line of code holds 30 % of the CPU. Only a sampling profile does. A review without one will produce a long list of pattern-matched candidates of which most will show **no measurable gain when applied**, because the underlying site was not in the top 20 % of self-time. This failure mode is documented end-to-end in `ia/reviews/perf_baq_2026-05-12.md` (round one applied seven Likely findings against pattern-match alone; the criterion bench could not detect a net change; round two used a real profile and got measurable wins on the same code base).
+
+When sampling is blocked, **tell the user explicitly**, in this order:
+
+1. Name what is blocked and why (kernel paranoid setting, missing capabilities, sandboxed runner — diagnose precisely).
+2. Name the concrete fix to apply (the `sysctl` line, the container flag, "run on bare metal", etc.).
+3. State the cost of *not* fixing it: the review's actionable output is significantly degraded; the candidate list will not be rankable by hot-path evidence and many candidates that look promising will fall through.
+4. Ask whether they want to fix the access issue first, or proceed at lower-quality output.
+
+Do not silently route around this with "we'll use DHAT instead" or "we'll use cargo asm and infer." If the user accepts proceeding without sampling, downgrade every code-level finding's severity to **Likely** (no **Hot-path** is reachable without profile evidence per the rubric) and call out the constraint at the top of the report.
+
 ### 3. Determine intent and targets
 
 Before judging whether the code is fast enough, establish what it is meant to do — its purpose, its expected input sizes, its latency or throughput target, its target hardware. Performance review is meaningless without these numbers. If the targets are not stated, ask before continuing or file the gap as a Note finding.
@@ -213,6 +239,7 @@ Use this to invoke the skill consistently. Fill in the Context block; the rest d
 > 3. Cold code is not the hot path; downgrade findings filed against it.
 > 4. Correctness wins over speed. Route correctness-adjacent findings through a separate review.
 > 5. One change per measurement — do not bundle allocator + LTO + refactor.
+> 6. **If the environment blocks sampling profilers (`perf record` / `cargo flamegraph` / `samply`), halt and tell the user before continuing.** This is not a "we'll use DHAT instead" situation — DHAT, `cargo asm`, valgrind, and wall-clock criterion each answer one narrow question and **none** of them tells you which line owns the CPU. Without a sampling profile, most pattern-matched Likely findings will show no measurable gain when applied. Common fix: `sudo sysctl kernel.perf_event_paranoid=2`. See step 2 for the full handling.
 
 ---
 
