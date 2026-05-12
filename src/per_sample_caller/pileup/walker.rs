@@ -238,19 +238,19 @@ impl WalkerState {
 
     fn admit_read(&mut self, read: PreparedRead) -> Result<(), WalkerError> {
         // Order-invariant check.
-        let here = Locus {
+        let read_locus = Locus {
             chrom_id: read.chrom_id,
             pos: read.alignment_start,
         };
         if let Some(prev) = self.last_admitted_locus
-            && here < prev
+            && read_locus < prev
         {
             return Err(WalkerError::OutOfOrder {
                 qname: read.qname.to_string(),
                 prev_chrom_id: prev.chrom_id,
                 prev_pos: prev.pos,
-                chrom_id: here.chrom_id,
-                pos: here.pos,
+                chrom_id: read_locus.chrom_id,
+                pos: read_locus.pos,
             });
         }
         // Zero-ref-span check.
@@ -308,7 +308,7 @@ impl WalkerState {
                 pos: read.alignment_start,
             });
         }
-        self.last_admitted_locus = Some(here);
+        self.last_admitted_locus = Some(read_locus);
         self.active_reads.admit(read, &mut self.slots)?;
         self.summary.reads_admitted += 1;
         Ok(())
