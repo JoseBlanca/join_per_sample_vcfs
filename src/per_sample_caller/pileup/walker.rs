@@ -14,7 +14,7 @@ use super::open_record::{
     OpenPileupRecordTable, ReadContribution, process_position, stamp_lifecycle_marks,
 };
 use super::slot_allocator::{SlotAllocator, SlotAllocatorCounters, SlotId};
-use super::{PileupRecord, PreparedRead, RefSeqFetcher, WalkerConfig};
+use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerConfig};
 
 /// Run the walker over a coordinate-sorted stream of prepared
 /// reads, pushing each closed `PileupRecord` through `tx`.
@@ -261,53 +261,10 @@ impl WalkerState {
                 pos: read.alignment_start,
             });
         }
-        // M21: length invariants the cursor relies on. `PreparedRead`
-        // documents `seq.len() == bq_baq.len()` and that the CIGAR
-        // consumes exactly `seq.len()` read bases. The cursor and
-        // `decompose` both index `seq[..]`/`bq_baq[..]` using offsets
-        // derived from the CIGAR; a mismatch panics with `slice index
-        // out of bounds` and kills the run on the offending read.
-        // Validate here so a malformed `PreparedRead` surfaces as a
-        // typed `MalformedRead` error with full locus context.
-        if read.seq.len() != read.bq_baq.len() {
-            return Err(WalkerError::MalformedRead {
-                reason: format!(
-                    "seq.len ({}) != bq_baq.len ({})",
-                    read.seq.len(),
-                    read.bq_baq.len(),
-                ),
-                qname: read.qname.to_string(),
-                chrom_id: read.chrom_id,
-                pos: read.alignment_start,
-            });
-        }
-        let cigar_read_consumed: u64 = read
-            .cigar
-            .iter()
-            .map(|op| match *op {
-                super::CigarOp::Match(n)
-                | super::CigarOp::SeqMatch(n)
-                | super::CigarOp::SeqMismatch(n)
-                | super::CigarOp::Insertion(n)
-                | super::CigarOp::SoftClip(n) => n as u64,
-                super::CigarOp::Deletion(_)
-                | super::CigarOp::Skip(_)
-                | super::CigarOp::HardClip(_)
-                | super::CigarOp::Padding(_) => 0,
-            })
-            .sum();
-        if cigar_read_consumed != read.seq.len() as u64 {
-            return Err(WalkerError::MalformedRead {
-                reason: format!(
-                    "CIGAR consumes {} read bases but seq.len = {}",
-                    cigar_read_consumed,
-                    read.seq.len(),
-                ),
-                qname: read.qname.to_string(),
-                chrom_id: read.chrom_id,
-                pos: read.alignment_start,
-            });
-        }
+        // Length invariants the cursor relies on. See
+        // `PreparedRead::length` for the rationale.
+        read.length()
+            .map_err(|e| malformed_read_from_length_err(e, &read))?;
         self.last_admitted_locus = Some(read_locus);
         self.active_reads.admit(read, &mut self.slots)?;
         self.summary.reads_admitted += 1;
@@ -498,6 +455,28 @@ impl WalkerState {
 
     fn summary(&self) -> RunSummary {
         self.summary.merge_slot_counters(self.slots.counters())
+    }
+}
+
+/// Wrap a [`ReadLengthError`] (which carries only raw lengths) into
+/// a [`WalkerError::MalformedRead`] with the offending read's locus
+/// context attached.
+fn malformed_read_from_length_err(err: ReadLengthError, read: &PreparedRead) -> WalkerError {
+    let reason = match err {
+        ReadLengthError::SeqBqMismatch {
+            seq_len,
+            bq_baq_len,
+        } => format!("seq.len ({seq_len}) != bq_baq.len ({bq_baq_len})"),
+        ReadLengthError::CigarSeqMismatch {
+            cigar_consumed,
+            seq_len,
+        } => format!("CIGAR consumes {cigar_consumed} read bases but seq.len = {seq_len}"),
+    };
+    WalkerError::MalformedRead {
+        reason,
+        qname: read.qname.to_string(),
+        chrom_id: read.chrom_id,
+        pos: read.alignment_start,
     }
 }
 

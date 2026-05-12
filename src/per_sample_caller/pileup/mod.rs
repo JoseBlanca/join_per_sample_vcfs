@@ -269,6 +269,74 @@ pub struct PreparedRead {
 }
 
 // ---------------------------------------------------------------------
+// ReadLengthError
+// ---------------------------------------------------------------------
+
+/// Failure modes for [`PreparedRead::length`]. Carries the raw
+/// lengths only — locus context (qname, chrom_id, pos) is added by
+/// whichever caller maps this into its own error type (the walker
+/// wraps it in [`WalkerError::MalformedRead`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadLengthError {
+    /// `seq.len()` and `bq_baq.len()` disagree.
+    SeqBqMismatch { seq_len: usize, bq_baq_len: usize },
+    /// The CIGAR's read-consuming ops sum to `cigar_consumed` but
+    /// the `seq` field has length `seq_len`.
+    CigarSeqMismatch { cigar_consumed: u64, seq_len: usize },
+}
+
+impl PreparedRead {
+    /// The read's length (in `u64`, matching the cigar-sum width),
+    /// verified against the three internal representations that
+    /// must agree on it:
+    ///
+    /// 1. `seq.len() == bq_baq.len()`.
+    /// 2. The CIGAR's read-consuming ops (M/=/X/I/S) sum to
+    ///    `seq.len()`.
+    ///
+    /// On success the three lengths agree and the common value is
+    /// returned. On failure a typed [`ReadLengthError`] reports
+    /// which invariant broke.
+    ///
+    /// M21 in `ia/reviews/pileup_2026-05-09.md`. The cigar cursor
+    /// and `decompose` both index `seq[..]` / `bq_baq[..]` using
+    /// offsets derived from the CIGAR; a mismatch would otherwise
+    /// panic with `slice index out of bounds` and kill the run on
+    /// the offending read. The accessor surfaces a typed error
+    /// instead so callers can attach locus context and continue.
+    pub fn length(&self) -> Result<u64, ReadLengthError> {
+        if self.seq.len() != self.bq_baq.len() {
+            return Err(ReadLengthError::SeqBqMismatch {
+                seq_len: self.seq.len(),
+                bq_baq_len: self.bq_baq.len(),
+            });
+        }
+        let cigar_consumed: u64 = self
+            .cigar
+            .iter()
+            .map(|op| match *op {
+                CigarOp::Match(n)
+                | CigarOp::SeqMatch(n)
+                | CigarOp::SeqMismatch(n)
+                | CigarOp::Insertion(n)
+                | CigarOp::SoftClip(n) => n as u64,
+                CigarOp::Deletion(_)
+                | CigarOp::Skip(_)
+                | CigarOp::HardClip(_)
+                | CigarOp::Padding(_) => 0,
+            })
+            .sum();
+        if cigar_consumed != self.seq.len() as u64 {
+            return Err(ReadLengthError::CigarSeqMismatch {
+                cigar_consumed,
+                seq_len: self.seq.len(),
+            });
+        }
+        Ok(cigar_consumed)
+    }
+}
+
+// ---------------------------------------------------------------------
 // AlleleSupportStats
 // ---------------------------------------------------------------------
 

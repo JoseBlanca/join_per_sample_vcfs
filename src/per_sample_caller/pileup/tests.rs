@@ -1216,3 +1216,115 @@ fn fasta_fetch_failure_propagates_as_walker_error_fasta() {
         other => panic!("expected Fasta, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// PreparedRead::length — internal length-invariant checks
+// ---------------------------------------------------------------------
+
+#[test]
+fn prepared_read_length_returns_validated_length_on_well_formed_read() {
+    // 4-bp Match: seq.len = bq_baq.len = cigar-consumed = 4.
+    let r = snp_read("r", 1, b"ACGT", &[30; 4]);
+    assert_eq!(r.length(), Ok(4));
+}
+
+#[test]
+fn prepared_read_length_with_insertion_includes_inserted_bases() {
+    // CIGAR 2M1I2M consumes 5 read bases. seq and bq_baq must
+    // match. Confirms the helper sums the I op (read-consuming)
+    // and not just the M ops.
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 4,
+        cigar: vec![CigarOp::Match(2), CigarOp::Insertion(1), CigarOp::Match(2)],
+        seq: b"ACXGT".to_vec(),
+        bq_baq: vec![30; 5],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    assert_eq!(r.length(), Ok(5));
+}
+
+#[test]
+fn prepared_read_length_with_deletion_excludes_deleted_bases() {
+    // CIGAR 2M2D2M consumes 4 read bases (D op is reference-only).
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 6,
+        cigar: vec![CigarOp::Match(2), CigarOp::Deletion(2), CigarOp::Match(2)],
+        seq: b"ACGT".to_vec(),
+        bq_baq: vec![30; 4],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    assert_eq!(r.length(), Ok(4));
+}
+
+#[test]
+fn prepared_read_length_seq_bq_mismatch_returns_typed_error() {
+    let mut r = snp_read("r", 1, b"ACGT", &[30; 4]);
+    r.bq_baq.pop(); // bq_baq now length 3, seq length 4.
+    assert_eq!(
+        r.length(),
+        Err(super::ReadLengthError::SeqBqMismatch {
+            seq_len: 4,
+            bq_baq_len: 3,
+        })
+    );
+}
+
+#[test]
+fn prepared_read_length_cigar_seq_mismatch_returns_typed_error() {
+    // seq.len = bq_baq.len = 4 but cigar consumes 3 read bases.
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 3,
+        cigar: vec![CigarOp::Match(3)],
+        seq: b"ACGT".to_vec(),
+        bq_baq: vec![30; 4],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    assert_eq!(
+        r.length(),
+        Err(super::ReadLengthError::CigarSeqMismatch {
+            cigar_consumed: 3,
+            seq_len: 4,
+        })
+    );
+}
+
+#[test]
+fn prepared_read_length_checks_seq_bq_before_cigar() {
+    // Both invariants violated; the seq/bq check runs first so
+    // SeqBqMismatch wins. Locks in the deterministic ordering.
+    let r = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 3,
+        cigar: vec![CigarOp::Match(3)],
+        seq: b"ACGT".to_vec(), // length 4
+        bq_baq: vec![30; 3],   // length 3 ≠ seq.len → SeqBqMismatch
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    assert!(matches!(
+        r.length(),
+        Err(super::ReadLengthError::SeqBqMismatch { .. })
+    ));
+}
