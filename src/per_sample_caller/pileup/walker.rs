@@ -176,7 +176,7 @@ struct WalkerState {
     last_admitted_locus: Option<Locus>,
     active_reads: ActiveReads,
     slots: SlotAllocator,
-    open: OpenPileupRecordTable,
+    open_records: OpenPileupRecordTable,
     summary: RunSummary,
     config: WalkerConfig,
     /// Reusable per-step buffer for the contributors list. Hoisted
@@ -195,7 +195,7 @@ impl WalkerState {
             last_admitted_locus: None,
             active_reads: ActiveReads::new(),
             slots: SlotAllocator::with_caps(config.max_active_slots, config.mate_lookup_window),
-            open: OpenPileupRecordTable::with_cap(config.max_record_span),
+            open_records: OpenPileupRecordTable::with_cap(config.max_record_span),
             summary: RunSummary::default(),
             config,
             contributors_buf: Vec::new(),
@@ -378,7 +378,7 @@ impl WalkerState {
         // call — fresh opens and re-finds against an
         // already-large-enough footprint do not count.
         let outcome = process_position(
-            &mut self.open,
+            &mut self.open_records,
             walker_pos,
             self.chrom_id,
             contributors,
@@ -391,7 +391,7 @@ impl WalkerState {
     }
 
     fn close_aged_records(&mut self, tx: &SyncSender<PileupRecord>) -> Result<(), WalkerError> {
-        let aged = self.open.drain_aged(self.walker_pos);
+        let aged = self.open_records.drain_aged(self.walker_pos);
         if aged.is_empty() {
             return Ok(());
         }
@@ -457,7 +457,7 @@ impl WalkerState {
         // Drain remaining open records (anything that was still
         // open at end-of-chromosome is by definition ready to
         // close — there are no future reads on this chromosome).
-        let remaining = self.open.drain_all();
+        let remaining = self.open_records.drain_all();
         let mut records: Vec<PileupRecord> = remaining.into_iter().map(|r| r.finalise()).collect();
         // Release any active-set reads first, then drain marks
         // once. flush_all only emits `expired_marks` (release_slot
@@ -474,12 +474,12 @@ impl WalkerState {
                 })?;
             self.summary.records_emitted += 1;
         }
-        // Reset chromosome-scoped state. `self.open.reset()` keeps
-        // the perf-hoisted `allele_seq_buf` capacity across the
+        // Reset chromosome-scoped state. `self.open_records.reset()`
+        // keeps the perf-hoisted `allele_seq_buf` capacity across the
         // chromosome boundary (Mi11).
         self.slots.reset();
         self.active_reads.reset();
-        self.open.reset();
+        self.open_records.reset();
         Ok(())
     }
 
