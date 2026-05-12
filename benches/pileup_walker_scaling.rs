@@ -15,7 +15,9 @@ use std::hint::black_box;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::mpsc::SyncSender;
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -179,7 +181,21 @@ fn build_multi_op_reads(read_len: u32, span: u32, coverage: u32) -> Vec<Prepared
     reads
 }
 
-fn run_walker(reads: Vec<PreparedRead>, ref_fetcher: &ConstFasta) -> u64 {
+/// Per-iteration setup: pre-allocate the channel and spawn the
+/// collector thread alongside the read stream. Returns the tuple
+/// the timed body consumes.
+///
+/// Round-2 L2 in `ia/reviews/perf_pileup_2026-05-12.md`: with
+/// `mpsc::sync_channel` allocation + `thread::spawn` left inside
+/// the timed closure, the bench's own setup cost dominated
+/// short-walker runs and run-to-run variance reached ±10–20 % on
+/// the `multi_op` fixtures. Hoisting both into `iter_batched`'s
+/// setup closure leaves the timed routine measuring only walker
+/// work plus the unavoidable `drop(tx)` + `collector.join()`
+/// teardown (the collector drains its remaining buffer and
+/// exits; this is real walker-side cost because the walker holds
+/// `tx` until `run` returns).
+fn setup_walker(reads: Vec<PreparedRead>) -> (Vec<PreparedRead>, SyncSender<PileupRecord>, JoinHandle<u64>) {
     let (tx, rx) = mpsc::sync_channel::<PileupRecord>(64);
     let collector = thread::spawn(move || {
         let mut count = 0u64;
@@ -188,6 +204,19 @@ fn run_walker(reads: Vec<PreparedRead>, ref_fetcher: &ConstFasta) -> u64 {
         }
         count
     });
+    (reads, tx, collector)
+}
+
+/// Per-iteration timed body: run the walker, signal end-of-stream,
+/// join the collector. The walker call is the dominant cost; the
+/// drop + join are the only post-walker bookkeeping (and are part
+/// of the work the walker creates by emitting records, so they
+/// belong inside the timed region).
+fn drive_walker(
+    setup: (Vec<PreparedRead>, SyncSender<PileupRecord>, JoinHandle<u64>),
+    ref_fetcher: &ConstFasta,
+) -> u64 {
+    let (reads, tx, collector) = setup;
     run(reads, ref_fetcher, &tx, &WalkerConfig::default()).expect("walker run failed");
     drop(tx);
     collector.join().expect("collector panicked")
@@ -219,9 +248,9 @@ fn bench_walker_read_length(c: &mut Criterion) {
             &read_len,
             |b, &read_len| {
                 b.iter_batched(
-                    || build_reads(read_len, span, coverage),
-                    |reads| black_box(run_walker(reads, &ref_fetcher)),
-                    BatchSize::LargeInput,
+                    || setup_walker(build_reads(read_len, span, coverage)),
+                    |setup| black_box(drive_walker(setup, &ref_fetcher)),
+                    BatchSize::PerIteration,
                 );
             },
         );
@@ -254,9 +283,9 @@ fn bench_walker_multi_op(c: &mut Criterion) {
             &read_len,
             |b, &read_len| {
                 b.iter_batched(
-                    || build_multi_op_reads(read_len, span, coverage),
-                    |reads| black_box(run_walker(reads, &ref_fetcher)),
-                    BatchSize::LargeInput,
+                    || setup_walker(build_multi_op_reads(read_len, span, coverage)),
+                    |setup| black_box(drive_walker(setup, &ref_fetcher)),
+                    BatchSize::PerIteration,
                 );
             },
         );
