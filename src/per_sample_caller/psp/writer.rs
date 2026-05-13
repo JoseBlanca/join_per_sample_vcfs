@@ -25,8 +25,9 @@ use std::collections::BTreeSet;
 use std::io::Write;
 
 use super::block::{
-    BlockHeader, ColumnManifestEntry, encode_block_header, encode_bytes_concat, encode_list_column,
-    encode_scalar_column, encode_varint_column, new_column_compressor, zstd_compress_into,
+    BlockHeader, ColumnManifestEntry, encode_block_header, encode_bytes_concat,
+    encode_list_column_csr, encode_scalar_column, encode_varint_column, new_column_compressor,
+    zstd_compress_into,
 };
 use super::errors::PspWriteError;
 use super::header::{WriterHeader, build_header_bytes};
@@ -578,6 +579,31 @@ impl<W: Write> PspWriter<W> {
 // BlockAccumulator
 // ---------------------------------------------------------------------
 
+/// Flat CSR storage for a per-record or per-allele list column.
+/// `offsets[i]..offsets[i+1]` is row `i`'s slice into `data`;
+/// `offsets[0]` is always `0`. H2 in
+/// `ia/reviews/perf_psp_writer_2026-05-13.md`.
+struct ListColumn {
+    data: Vec<SlotId>,
+    offsets: Vec<u32>,
+}
+
+impl ListColumn {
+    fn with_capacity(n_rows_hint: usize, n_slots_hint: usize) -> Self {
+        let mut offsets = Vec::with_capacity(n_rows_hint + 1);
+        offsets.push(0);
+        Self {
+            data: Vec::with_capacity(n_slots_hint),
+            offsets,
+        }
+    }
+    #[inline]
+    fn push_row(&mut self, row: &[SlotId]) {
+        self.data.extend_from_slice(row);
+        self.offsets.push(self.data.len() as u32);
+    }
+}
+
 struct BlockAccumulator {
     chrom_id: u32,
     first_pos: u32,
@@ -588,8 +614,8 @@ struct BlockAccumulator {
     // Per-record columns.
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
-    new_chain_slots: Vec<Vec<SlotId>>,
-    expired_chain_slots: Vec<Vec<SlotId>>,
+    new_chain_slots: ListColumn,
+    expired_chain_slots: ListColumn,
     // Per-allele columns.
     allele_seq_len: Vec<u64>,
     allele_seq_bytes: Vec<u8>,
@@ -598,7 +624,7 @@ struct BlockAccumulator {
     allele_fwd_count: Vec<u32>,
     allele_placed_left_count: Vec<u32>,
     allele_placed_start_count: Vec<u32>,
-    allele_chain_slots: Vec<Vec<SlotId>>,
+    allele_chain_slots: ListColumn,
     /// Rough projection of the uncompressed byte total. Used to
     /// decide when to auto-flush.
     projected_bytes: usize,
@@ -613,8 +639,11 @@ impl BlockAccumulator {
             snapshot_active_slots,
             delta_pos: Vec::with_capacity(INITIAL_RECORDS_HINT),
             n_alleles: Vec::with_capacity(INITIAL_RECORDS_HINT),
-            new_chain_slots: Vec::with_capacity(INITIAL_RECORDS_HINT),
-            expired_chain_slots: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            // Per-record list columns. Most records have an empty
+            // chain-slots list, so the data buffer's hint is much
+            // smaller than the offsets hint.
+            new_chain_slots: ListColumn::with_capacity(INITIAL_RECORDS_HINT, 4096),
+            expired_chain_slots: ListColumn::with_capacity(INITIAL_RECORDS_HINT, 4096),
             allele_seq_len: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_seq_bytes: Vec::with_capacity(INITIAL_ALLELE_SEQ_BYTES_HINT),
             allele_obs_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
@@ -622,7 +651,7 @@ impl BlockAccumulator {
             allele_fwd_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_left_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_start_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
-            allele_chain_slots: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_chain_slots: ListColumn::with_capacity(INITIAL_ALLELES_HINT, 4096),
             projected_bytes: 0,
         }
     }
@@ -636,8 +665,11 @@ impl BlockAccumulator {
         };
         self.delta_pos.push(delta);
         self.n_alleles.push(record.alleles.len() as u64);
-        self.new_chain_slots.push(record.new_chains.clone());
-        self.expired_chain_slots.push(record.expired_chains.clone());
+        // H2: extend_from_slice into the flat data buffer, no
+        // per-record Vec allocation. The outer `Vec<Vec<SlotId>>`
+        // anti-pattern is gone — only one offsets push per row.
+        self.new_chain_slots.push_row(&record.new_chains);
+        self.expired_chain_slots.push_row(&record.expired_chains);
 
         for allele in &record.alleles {
             self.allele_seq_len.push(allele.seq.len() as u64);
@@ -649,7 +681,7 @@ impl BlockAccumulator {
                 .push(allele.support.placed_left);
             self.allele_placed_start_count
                 .push(allele.support.placed_start);
-            self.allele_chain_slots.push(allele.chain_slots.clone());
+            self.allele_chain_slots.push_row(&allele.chain_slots);
         }
 
         self.last_pos = record.pos;
@@ -711,27 +743,21 @@ fn encode_column_into(
         0x12 => encode_scalar_column(&block.allele_fwd_count, out),
         0x13 => encode_scalar_column(&block.allele_placed_left_count, out),
         0x14 => encode_scalar_column(&block.allele_placed_start_count, out),
-        0x20 => {
-            let slices: Vec<&[u16]> =
-                block.new_chain_slots.iter().map(|v| v.as_slice()).collect();
-            encode_list_column(&slices, out);
-        }
-        0x21 => {
-            let slices: Vec<&[u16]> = block
-                .expired_chain_slots
-                .iter()
-                .map(|v| v.as_slice())
-                .collect();
-            encode_list_column(&slices, out);
-        }
-        0x22 => {
-            let slices: Vec<&[u16]> = block
-                .allele_chain_slots
-                .iter()
-                .map(|v| v.as_slice())
-                .collect();
-            encode_list_column(&slices, out);
-        }
+        0x20 => encode_list_column_csr(
+            &block.new_chain_slots.data,
+            &block.new_chain_slots.offsets,
+            out,
+        ),
+        0x21 => encode_list_column_csr(
+            &block.expired_chain_slots.data,
+            &block.expired_chain_slots.offsets,
+            out,
+        ),
+        0x22 => encode_list_column_csr(
+            &block.allele_chain_slots.data,
+            &block.allele_chain_slots.offsets,
+            out,
+        ),
         unknown => {
             // V1_0_COLUMNS is the source of truth; if
             // encode_column_into is called with a tag not in this

@@ -389,18 +389,18 @@ fn bench_writer_phases(c: &mut Criterion) {
                 let mut w = PspWriter::new(io::sink(), phase_header.clone())
                     .expect("writer new");
                 let mut idx = 0usize;
+                // Prime up to and including the record that pushes
+                // projected_bytes >= TARGET. After the loop, the
+                // writer's open block has projected_bytes >= TARGET,
+                // so the body's first write_record will trigger
+                // exactly one auto-flush (the pre-check at
+                // writer.rs:113 fires before append).
                 while idx < phase_records.len() {
-                    let projected =
-                        w.current_block_projected_bytes().unwrap_or(0);
-                    // Leave a few hundred bytes of slack so the next
-                    // record's per_record + per_allele projection
-                    // pushes us past TARGET, guaranteeing an
-                    // auto-flush on the body's write.
-                    if projected + 256 >= TARGET_BYTES {
-                        break;
-                    }
                     w.write_record(&phase_records[idx]).expect("prime");
                     idx += 1;
+                    if w.current_block_projected_bytes().unwrap_or(0) >= TARGET_BYTES {
+                        break;
+                    }
                 }
                 (w, idx)
             },

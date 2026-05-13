@@ -254,6 +254,31 @@ pub fn encode_list_column<T: WireScalar>(lists: &[&[T]], out: &mut Vec<u8>) {
     }
 }
 
+/// Encode a list column directly from a flat CSR (compressed sparse
+/// row) layout: `data` is the concatenated payload, `offsets` is
+/// `n_rows + 1` long with `offsets[0] = 0` and `offsets[n_rows] =
+/// data.len()`. Row `i`'s slice is `data[offsets[i]..offsets[i+1]]`.
+///
+/// Equivalent on the wire to `encode_list_column(&rows, out)` but
+/// skips the `Vec<&[T]>` materialisation step the caller would
+/// otherwise need. H2 in
+/// `ia/reviews/perf_psp_writer_2026-05-13.md`.
+pub fn encode_list_column_csr<T: WireScalar>(
+    data: &[T],
+    offsets: &[u32],
+    out: &mut Vec<u8>,
+) {
+    for w in offsets.windows(2) {
+        let a = w[0] as usize;
+        let b = w[1] as usize;
+        let row = &data[a..b];
+        encode_u64_leb128(row.len() as u64, out);
+        for &v in row.iter() {
+            v.encode_le(out);
+        }
+    }
+}
+
 /// Decode a list column. `expected_count` is the cardinality-derived
 /// per-entry count.
 pub fn decode_list_column<T: WireScalar>(
