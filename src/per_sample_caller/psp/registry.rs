@@ -13,6 +13,11 @@
 /// `PerRecord` columns have one entry per per-position record
 /// (count = `n_records`); `PerAllele` columns have one entry per
 /// allele across all records (count = `n_total_alleles`).
+///
+/// **Not `#[non_exhaustive]` by design.** Every match on this enum
+/// must be exhaustive so adding a new cardinality in v1.x or v2.0
+/// is a compile error at every dispatch site (writer encoders,
+/// `as_str` / `parse_token`, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cardinality {
     PerRecord,
@@ -45,6 +50,9 @@ impl Cardinality {
 ///   `element-type` values.
 /// - `Bytes`: a flat byte stream chunked by a paired length column
 ///   (whose name lives in [`ColumnDef::length_column`]).
+///
+/// **Not `#[non_exhaustive]` by design** — same reason as
+/// [`Cardinality`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     Scalar,
@@ -73,6 +81,11 @@ impl Shape {
 
 /// Per-element type inside a scalar or list column. Absent on
 /// `Bytes`-shaped columns.
+///
+/// **Not `#[non_exhaustive]` by design.** Adding a new variant must
+/// be a compile error at every dispatch site
+/// ([`Self::fixed_byte_width`], [`Self::as_str`], the writer's
+/// `predict_uncompressed_len`, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementType {
     U8,
@@ -143,8 +156,16 @@ impl ElementType {
 /// Hard cap on the bytes of a single allele's sequence (the
 /// `allele_seq_len` row of the registry). Spec §"Required columns
 /// in v1.0" → 0x03 says: real biological alleles are far shorter,
-/// and a value over this cap is a producer bug. Enforced at write
-/// time and at read time.
+/// and a value over this cap is a producer bug.
+///
+/// **Enforcement.** The writer rejects oversized alleles in
+/// [`PspWriter::write_record`](crate::per_sample_caller::psp::writer::PspWriter::write_record).
+/// On the read side this cap is honoured by
+/// [`decode_bytes_split`](super::block::decode_bytes_split) when
+/// the caller passes `Some(MAX_ALLELE_SEQ_LEN)` as its
+/// `max_entry_len` argument — the eventual `PspReader` is required
+/// to do so for the `allele-seq` column so the registry's
+/// single-source-of-truth cap is enforced symmetrically.
 pub const MAX_ALLELE_SEQ_LEN: u64 = 10_000;
 
 /// One row of the column-tag registry. Identical information appears

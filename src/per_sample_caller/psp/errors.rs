@@ -12,15 +12,23 @@
 //! match on the variant; tests assert on the exact variant rather
 //! than stringly-comparing messages.
 //!
-//! New variants land as later modules need them; this file currently
-//! covers what the registry / varint / wire-primitive slice requires.
+//! Variants are organised by spec section: header framing
+//! ([`PspReadError::BadHeadMagic`], [`PspReadError::SentinelMismatch`], …),
+//! block-header invariants ([`PspReadError::BlockHeaderField`],
+//! [`PspReadError::BlockHeaderInvariant`]), column payloads
+//! ([`PspReadError::ColumnTruncated`], …), and trailer/index
+//! integrity ([`PspReadError::BadTrailerMagic`],
+//! [`PspReadError::IndexChecksum`], …). Both top-level enums carry
+//! `#[non_exhaustive]` so future variants can land as additive
+//! changes.
 
 use thiserror::Error;
 
 /// Failures intrinsic to LEB128 / zig-zag-LEB128 decoding. Always
-/// wrapped by [`PspReadError::Varint`] (the read side is the only
-/// side that decodes — the writer constructs varints by construction
-/// and cannot fail mid-encode).
+/// wrapped by a more specific [`PspReadError`] variant
+/// (`IndexEntryDecode`, `BlockHeaderField`, `ColumnElementDecode`)
+/// that carries the file-region context.
+#[non_exhaustive]
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarintError {
     /// Buffer ran out mid-varint: a continuation bit was set on the
@@ -39,6 +47,7 @@ pub enum VarintError {
 /// Failures the `WireScalar` decoders can produce. Generalises
 /// [`VarintError`] with fixed-width-only failure modes
 /// (buffer-too-short, illegal bool byte).
+#[non_exhaustive]
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarDecodeError {
     #[error("buffer truncated mid-decode")]
@@ -62,24 +71,11 @@ impl From<VarintError> for ScalarDecodeError {
     }
 }
 
-/// Errors the `.psp` reader can emit. Variants land as the
-/// corresponding slice ships; the registry / varint slice
-/// contributes the [`Self::Varint`] case.
+/// Errors the `.psp` reader can emit. New variants are added per
+/// spec section as each slice lands.
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum PspReadError {
-    #[error("varint decode failed{}: {source}", match context {
-        Some(c) => format!(" while reading {c}"),
-        None => String::new(),
-    })]
-    Varint {
-        /// What was being decoded when the failure occurred — e.g.
-        /// `"block header n_records"`. Optional so callers can pass
-        /// the bare primitive error up where context is added higher.
-        context: Option<&'static str>,
-        #[source]
-        source: VarintError,
-    },
-
     #[error("I/O error reading {context}: {source}")]
     Io {
         context: &'static str,
@@ -302,6 +298,7 @@ pub enum PspReadError {
 
 /// Errors the `.psp` writer can emit. Variants land as the
 /// corresponding slice ships.
+#[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum PspWriteError {
     #[error("I/O error writing {context}: {source}")]
@@ -340,7 +337,8 @@ pub enum PspWriteError {
     InvalidRecord { record_index: u64, reason: String },
 
     /// A record's `chrom_id` is outside the writer's chromosome
-    /// table (declared via [`WriterHeader::chromosomes`] in `new`).
+    /// table (declared via
+    /// [`super::header::WriterHeader::chromosomes`] in `new`).
     #[error(
         "record at index {record_index} has chrom_id {chrom_id}; header declared only {n_chroms} chromosomes"
     )]
@@ -389,5 +387,17 @@ pub enum PspWriteError {
         block_index: u64,
         #[source]
         source: PspReadError,
+    },
+
+    /// A column the writer just encoded has a byte length that
+    /// disagrees with the schema-predicted length. M5: this
+    /// previously fired only via `debug_assert!`; it is now a real
+    /// runtime check so a writer bug surfaces at the producer, not
+    /// downstream at read time.
+    #[error("column {column:?} self-check failed: encoded {got} bytes, schema predicts {expected}")]
+    ColumnSizeSelfCheck {
+        column: &'static str,
+        got: usize,
+        expected: usize,
     },
 }

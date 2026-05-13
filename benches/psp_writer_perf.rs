@@ -237,7 +237,13 @@ fn build_multi_allele_records(n: usize) -> Vec<PileupRecord> {
             ],
             2 => vec![
                 AlleleObservation::new(
-                    vec![r, bases[(i + 1) & 3], bases[(i + 2) & 3], bases[(i + 3) & 3], r],
+                    vec![
+                        r,
+                        bases[(i + 1) & 3],
+                        bases[(i + 2) & 3],
+                        bases[(i + 3) & 3],
+                        r,
+                    ],
                     AlleleSupportStats::new(18, -30.0, 9, 2, 1),
                     Vec::new(),
                 ),
@@ -362,16 +368,14 @@ fn bench_writer_phases(c: &mut Criterion) {
     group.bench_function("write_record_steady_100k", |b| {
         b.iter_batched(
             || {
-                let mut w = PspWriter::new(io::sink(), phase_header.clone())
-                    .expect("writer new");
+                let mut w = PspWriter::new(io::sink(), phase_header.clone()).expect("writer new");
                 for r in &phase_records[..WARMUP_NO_FLUSH] {
                     w.write_record(r).expect("warmup write_record");
                 }
                 w
             },
             |mut w| {
-                for r in &phase_records[WARMUP_NO_FLUSH..WARMUP_NO_FLUSH + BODY_NO_FLUSH]
-                {
+                for r in &phase_records[WARMUP_NO_FLUSH..WARMUP_NO_FLUSH + BODY_NO_FLUSH] {
                     black_box(w.write_record(black_box(r)).expect("write_record"));
                 }
                 // do NOT finish — body must time per-record append
@@ -392,8 +396,7 @@ fn bench_writer_phases(c: &mut Criterion) {
     group.bench_function("flush_block_one", |b| {
         b.iter_batched(
             || {
-                let mut w = PspWriter::new(io::sink(), phase_header.clone())
-                    .expect("writer new");
+                let mut w = PspWriter::new(io::sink(), phase_header.clone()).expect("writer new");
                 let mut idx = 0usize;
                 // Prime up to and including the record that pushes
                 // projected_bytes >= TARGET. After the loop, the

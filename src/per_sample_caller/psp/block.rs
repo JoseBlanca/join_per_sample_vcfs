@@ -40,6 +40,23 @@ use super::varint::{decode_u64_leb128, encode_u64_leb128};
 // WireScalar trait — fixed-width per-entry codecs
 // ---------------------------------------------------------------------
 
+mod wire_scalar_sealed {
+    /// Sealing marker so external crates cannot add `impl WireScalar
+    /// for FooType`. The codec dispatch matches on the registered
+    /// `ElementType` set; an unreachable foreign impl would be a
+    /// SemVer hazard.
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+    impl Sealed for u32 {}
+    impl Sealed for u64 {}
+    impl Sealed for i32 {}
+    impl Sealed for i64 {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+    impl Sealed for bool {}
+}
+
 /// Encode and decode a single fixed-width scalar value to / from
 /// little-endian bytes. Implemented for `u8`, `u16`, `u32`, `u64`,
 /// `i32`, `i64`, `f32`, `f64`, `bool`. **Not** implemented for the
@@ -47,7 +64,9 @@ use super::varint::{decode_u64_leb128, encode_u64_leb128};
 /// the standalone codecs in [`crate::per_sample_caller::psp::varint`]
 /// plus the [`encode_varint_column`] / [`decode_varint_column`]
 /// wrappers here.
-pub trait WireScalar: Sized + Copy {
+///
+/// The trait is sealed: external impls are not permitted.
+pub trait WireScalar: Sized + Copy + wire_scalar_sealed::Sealed {
     /// Encode self appended to `out`. Always pushes exactly
     /// [`Self::FIXED_BYTE_WIDTH`] bytes.
     fn encode_le(self, out: &mut Vec<u8>);
@@ -316,6 +335,20 @@ pub fn decode_list_column<T: WireScalar>(
             })?;
         cursor += n_k;
         let k = k_u64 as usize;
+        // DoS guard: `k` is attacker-controlled (decoded from
+        // potentially-corrupt file bytes). Each element occupies at
+        // least `T::FIXED_BYTE_WIDTH` bytes on the wire, so if `k`
+        // exceeds the remaining buffer divided by that width the
+        // file is malformed — reject before any allocation.
+        let remaining = bytes.len() - cursor;
+        let max_possible = remaining / T::FIXED_BYTE_WIDTH.max(1);
+        if k > max_possible {
+            return Err(PspReadError::ColumnElementDecode {
+                column: column_name.to_string(),
+                entry,
+                source: ScalarDecodeError::Truncated,
+            });
+        }
         let mut list = Vec::with_capacity(k);
         for _ in 0..k {
             let (v, n_v) = T::decode_le(&bytes[cursor..]).map_err(|source| {
@@ -360,17 +393,53 @@ pub fn encode_bytes_concat(values: &[&[u8]], out: &mut Vec<u8>) {
 /// already-decoded `lengths` from the paired length column. Returns
 /// one `Vec<u8>` per entry.
 ///
+/// `max_entry_len` is the per-column hard cap on a single entry's
+/// byte length. The `allele-seq` column passes
+/// `Some(MAX_ALLELE_SEQ_LEN)`; callers reading other future bytes-
+/// shape columns supply their own column-specific cap, or `None` to
+/// skip per-entry capping (tests may use this for negative-shape
+/// fixtures).
+///
 /// Errors:
+/// - [`PspReadError::ColumnElementDecode`] (with
+///   [`ScalarDecodeError::Truncated`] as source) if any individual
+///   length exceeds `max_entry_len`.
+/// - [`PspReadError::ColumnTruncated`] if the sum of `lengths` is
+///   greater than `bytes.len()`, *or* if the sum overflows `u64`
+///   on attacker-controlled inputs.
 /// - [`PspReadError::ColumnTrailingBytes`] if the sum of `lengths`
 ///   is less than `bytes.len()`.
-/// - [`PspReadError::ColumnTruncated`] if the sum of `lengths` is
-///   greater than `bytes.len()`.
 pub fn decode_bytes_split(
     bytes: &[u8],
     lengths: &[u64],
     column_name: &str,
+    max_entry_len: Option<u64>,
 ) -> Result<Vec<Vec<u8>>, PspReadError> {
-    let total: u64 = lengths.iter().sum();
+    // Compute the total length with `checked_add` so a tampered
+    // length column cannot wrap `u64` and bypass the buffer-size
+    // comparisons below. Also enforce the per-entry hard cap
+    // (`MAX_ALLELE_SEQ_LEN` for `allele-seq`) so the registry's
+    // single-source-of-truth cap is honoured symmetrically with the
+    // writer.
+    let mut total: u64 = 0;
+    for (i, &len) in lengths.iter().enumerate() {
+        if let Some(cap) = max_entry_len
+            && len > cap
+        {
+            return Err(PspReadError::ColumnElementDecode {
+                column: column_name.to_string(),
+                entry: i,
+                source: ScalarDecodeError::Truncated,
+            });
+        }
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| PspReadError::ColumnTruncated {
+                column: column_name.to_string(),
+                decoded: i,
+                expected: lengths.len(),
+            })?;
+    }
     let buf_len = bytes.len() as u64;
     if total > buf_len {
         return Err(PspReadError::ColumnTruncated {
@@ -526,21 +595,34 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<(BlockHeader, usize), PspRead
     let n_total_alleles = decode_u32_field(bytes, &mut cursor, "n_total_alleles")?;
 
     let k = decode_u32_field(bytes, &mut cursor, "active_chain_slots_count")?;
-    let mut active_chain_slots = Vec::with_capacity(k as usize);
+    // DoS guard: `k` is attacker-controlled. Each active-slot entry
+    // is a fixed `u16` LE (`u16::FIXED_BYTE_WIDTH` bytes); reject
+    // any `k` above the remaining-buffer-derived bound before any
+    // `Vec::with_capacity` allocation.
+    const SLOT_WIDTH: usize = <u16 as WireScalar>::FIXED_BYTE_WIDTH;
+    let remaining = bytes.len().saturating_sub(cursor);
+    let cap = (k as usize).min(remaining / SLOT_WIDTH + 1);
+    let mut active_chain_slots = Vec::with_capacity(cap);
     for _ in 0..k {
-        if cursor + 2 > bytes.len() {
+        if cursor + SLOT_WIDTH > bytes.len() {
             return Err(PspReadError::BlockHeaderField {
                 field: "active_chain_slots",
                 source: VarintError::Truncated,
             });
         }
-        let arr: [u8; 2] = bytes[cursor..cursor + 2].try_into().unwrap();
+        let arr: [u8; SLOT_WIDTH] = bytes[cursor..cursor + SLOT_WIDTH].try_into().unwrap();
         active_chain_slots.push(u16::from_le_bytes(arr));
-        cursor += 2;
+        cursor += SLOT_WIDTH;
     }
 
     let n_columns = decode_u32_field(bytes, &mut cursor, "n_columns")?;
-    let mut manifest = Vec::with_capacity(n_columns as usize);
+    // DoS guard: same shape as `active_chain_slots` above. Each
+    // manifest entry is at minimum three single-byte varints
+    // (tag, compressed_len, uncompressed_len), so the cap below is
+    // a generous upper bound that scales with the buffer.
+    let remaining = bytes.len().saturating_sub(cursor);
+    let cap = (n_columns as usize).min(remaining / 3 + 1);
+    let mut manifest = Vec::with_capacity(cap);
     for _ in 0..n_columns {
         let tag = decode_u16_field(bytes, &mut cursor, "manifest.tag")?;
         let compressed_len = decode_u32_field(bytes, &mut cursor, "manifest.compressed_len")?;
@@ -706,7 +788,7 @@ mod tests {
 
     #[test]
     fn wire_scalar_round_trip_f32() {
-        for v in [0.0f32, 1.5, -3.14, f32::MIN, f32::MAX] {
+        for v in [0.0f32, 1.5, -3.5, f32::MIN, f32::MAX] {
             let mut buf = Vec::new();
             v.encode_le(&mut buf);
             let (decoded, _) = f32::decode_le(&buf).unwrap();
@@ -716,7 +798,7 @@ mod tests {
 
     #[test]
     fn wire_scalar_round_trip_f64() {
-        for v in [0.0f64, 1.5, -3.14, f64::MIN, f64::MAX] {
+        for v in [0.0f64, 1.5, -3.5, f64::MIN, f64::MAX] {
             let mut buf = Vec::new();
             v.encode_le(&mut buf);
             let (decoded, _) = f64::decode_le(&buf).unwrap();
@@ -743,6 +825,8 @@ mod tests {
     }
 
     /// Truncated buffer in every fixed-width type → `Truncated`.
+    /// (Mi28: now covers `i32`, `i64`, `f32`, `bool` in addition to
+    /// the originally-tested unsigned and `f64` types.)
     #[test]
     fn wire_scalar_truncated() {
         assert_eq!(
@@ -762,7 +846,23 @@ mod tests {
             ScalarDecodeError::Truncated
         );
         assert_eq!(
+            i32::decode_le(&[0u8; 3]).unwrap_err(),
+            ScalarDecodeError::Truncated
+        );
+        assert_eq!(
+            i64::decode_le(&[0u8; 7]).unwrap_err(),
+            ScalarDecodeError::Truncated
+        );
+        assert_eq!(
+            f32::decode_le(&[0u8; 3]).unwrap_err(),
+            ScalarDecodeError::Truncated
+        );
+        assert_eq!(
             f64::decode_le(&[0u8; 4]).unwrap_err(),
+            ScalarDecodeError::Truncated
+        );
+        assert_eq!(
+            bool::decode_le(&[]).unwrap_err(),
             ScalarDecodeError::Truncated
         );
     }
@@ -781,7 +881,7 @@ mod tests {
 
     #[test]
     fn scalar_column_round_trip_f64() {
-        let values = vec![0.0f64, -3.14, 1e308, -1e-308];
+        let values = vec![0.0f64, -3.5, 1e308, -1e-308];
         let mut buf = Vec::new();
         encode_scalar_column(&values, &mut buf);
         let decoded: Vec<f64> = decode_scalar_column(&buf, values.len(), "test").unwrap();
@@ -977,6 +1077,7 @@ mod tests {
 
     #[test]
     fn bytes_column_round_trip() {
+        use super::super::registry::MAX_ALLELE_SEQ_LEN;
         let v0: &[u8] = b"A";
         let v1: &[u8] = b"ACGT";
         let v2: &[u8] = b"N";
@@ -984,7 +1085,9 @@ mod tests {
         let lengths: Vec<u64> = values.iter().map(|v| v.len() as u64).collect();
         let mut bytes_buf = Vec::new();
         encode_bytes_concat(&values, &mut bytes_buf);
-        let decoded = decode_bytes_split(&bytes_buf, &lengths, "allele-seq").unwrap();
+        let decoded =
+            decode_bytes_split(&bytes_buf, &lengths, "allele-seq", Some(MAX_ALLELE_SEQ_LEN))
+                .unwrap();
         assert_eq!(decoded[0], b"A");
         assert_eq!(decoded[1], b"ACGT");
         assert_eq!(decoded[2], b"N");
@@ -994,7 +1097,7 @@ mod tests {
     fn bytes_column_too_short_for_lengths() {
         let bytes_buf = b"AB".to_vec();
         let lengths = vec![1u64, 2, 3]; // sum=6, buf=2
-        let err = decode_bytes_split(&bytes_buf, &lengths, "allele-seq").unwrap_err();
+        let err = decode_bytes_split(&bytes_buf, &lengths, "allele-seq", None).unwrap_err();
         assert!(matches!(err, PspReadError::ColumnTruncated { .. }));
     }
 
@@ -1002,10 +1105,41 @@ mod tests {
     fn bytes_column_too_long_for_lengths() {
         let bytes_buf = b"ABCD".to_vec();
         let lengths = vec![1u64, 1]; // sum=2, buf=4
-        let err = decode_bytes_split(&bytes_buf, &lengths, "allele-seq").unwrap_err();
+        let err = decode_bytes_split(&bytes_buf, &lengths, "allele-seq", None).unwrap_err();
         match err {
             PspReadError::ColumnTrailingBytes { trailing, .. } => assert_eq!(trailing, 2),
             other => panic!("expected ColumnTrailingBytes, got {other:?}"),
+        }
+    }
+
+    /// (B2 regression.) Sum of attacker-controlled `u64` lengths
+    /// can wrap silently in release builds. `checked_add` must
+    /// reject this before the buffer-size comparison fires.
+    #[test]
+    fn bytes_column_rejects_overflowing_length_sum() {
+        let bytes_buf = b"A".to_vec();
+        let lengths = vec![u64::MAX, 1];
+        let err = decode_bytes_split(&bytes_buf, &lengths, "allele-seq", None)
+            .expect_err("overflow must be flagged, not wrapped");
+        assert!(matches!(err, PspReadError::ColumnTruncated { .. }));
+    }
+
+    /// (B2 regression.) When the caller supplies a per-entry cap
+    /// (`MAX_ALLELE_SEQ_LEN` for `allele-seq`), an oversized entry
+    /// is rejected before any decoding happens.
+    #[test]
+    fn bytes_column_rejects_entry_exceeding_max_allele_seq_len() {
+        use super::super::registry::MAX_ALLELE_SEQ_LEN;
+        let bytes_buf = vec![b'A'; (MAX_ALLELE_SEQ_LEN + 1) as usize];
+        let lengths = vec![MAX_ALLELE_SEQ_LEN + 1];
+        let err = decode_bytes_split(&bytes_buf, &lengths, "allele-seq", Some(MAX_ALLELE_SEQ_LEN))
+            .expect_err("entry exceeding MAX_ALLELE_SEQ_LEN must be rejected");
+        match err {
+            PspReadError::ColumnElementDecode { column, entry, .. } => {
+                assert_eq!(column, "allele-seq");
+                assert_eq!(entry, 0);
+            }
+            other => panic!("expected ColumnElementDecode, got {other:?}"),
         }
     }
 
@@ -1154,5 +1288,136 @@ mod tests {
         let truncated = &buf[..5.min(buf.len())];
         let err = decode_block_header(truncated).unwrap_err();
         assert!(matches!(err, PspReadError::BlockHeaderField { .. }));
+    }
+
+    /// (B3 regression.) A hostile block header declaring a
+    /// `u32::MAX` slot count must not drive an unbounded
+    /// `Vec::with_capacity` — the decoder rejects via the
+    /// remaining-buffer-derived bound and surfaces a typed error.
+    #[test]
+    fn block_header_decode_rejects_giant_active_slots_count_without_oom() {
+        let mut bytes = Vec::new();
+        encode_u64_leb128(0, &mut bytes); // chrom_id
+        encode_u64_leb128(1, &mut bytes); // first_pos
+        encode_u64_leb128(1, &mut bytes); // n_records
+        encode_u64_leb128(1, &mut bytes); // n_total_alleles
+        encode_u64_leb128(u32::MAX as u64, &mut bytes); // huge slot count
+        // No body for the slots — should fail Truncated, not OOM.
+        let err = decode_block_header(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            PspReadError::BlockHeaderField {
+                field: "active_chain_slots",
+                ..
+            }
+        ));
+    }
+
+    /// (B3 regression.) Same shape as the previous test for the
+    /// manifest count: a `u32::MAX` `n_columns` must surface as a
+    /// typed error, not an allocator abort.
+    #[test]
+    fn block_header_decode_rejects_giant_n_columns_without_oom() {
+        let mut bytes = Vec::new();
+        encode_u64_leb128(0, &mut bytes); // chrom_id
+        encode_u64_leb128(1, &mut bytes); // first_pos
+        encode_u64_leb128(1, &mut bytes); // n_records
+        encode_u64_leb128(1, &mut bytes); // n_total_alleles
+        encode_u64_leb128(0, &mut bytes); // zero slots
+        encode_u64_leb128(u32::MAX as u64, &mut bytes); // huge n_columns
+        // No body for the manifest — should fail Truncated, not OOM.
+        let err = decode_block_header(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            PspReadError::BlockHeaderField {
+                field: "manifest.tag",
+                ..
+            }
+        ));
+    }
+
+    /// (M1.) Pins the exact byte sequence the writer produces for
+    /// a known block header. A field-reorder refactor in
+    /// `encode_block_header` (or in the `BlockHeader` struct's
+    /// declaration order, which the encoder follows) would reorder
+    /// these bytes and fail this test loudly.
+    #[test]
+    fn block_header_wire_layout_is_stable() {
+        let header = BlockHeader {
+            chrom_id: 5,
+            first_pos: 100,
+            n_records: 1,
+            n_total_alleles: 1,
+            active_chain_slots: vec![7],
+            manifest: vec![ColumnManifestEntry {
+                tag: 0x01,
+                compressed_len: 8,
+                uncompressed_len: 16,
+            }],
+        };
+        let mut buf = Vec::new();
+        encode_block_header(&header, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            [
+                0x05, // chrom_id varint
+                0x64, // first_pos = 100 varint
+                0x01, // n_records varint
+                0x01, // n_total_alleles varint
+                0x01, // active_chain_slots count varint
+                0x07, 0x00, // slot 7 as LE u16
+                0x01, // n_columns varint
+                0x01, // manifest[0].tag varint
+                0x08, // manifest[0].compressed_len varint
+                0x10, // manifest[0].uncompressed_len varint
+            ]
+        );
+    }
+
+    /// (M19.) Pins the byte layout of `encode_list_column_csr`'s
+    /// output and confirms the LE fast path produces the same wire
+    /// shape as `encode_list_column`. Catches an endian regression
+    /// in either arm of the `#[cfg(target_endian = ...)]` gate.
+    #[test]
+    fn list_column_csr_round_trip_u16() {
+        // Three rows: [], [7], [1, 2, 3, 4, 5].
+        let data: Vec<u16> = vec![7, 1, 2, 3, 4, 5];
+        let offsets: Vec<u32> = vec![0, 0, 1, 6];
+        let mut buf = Vec::new();
+        encode_list_column_csr::<u16>(&data, &offsets, &mut buf);
+
+        let mut expected = Vec::new();
+        // Row 0: count 0, no body.
+        expected.push(0u8);
+        // Row 1: count 1, then u16(7) LE.
+        expected.push(1u8);
+        expected.extend_from_slice(&7u16.to_le_bytes());
+        // Row 2: count 5, then u16(1..=5) LE.
+        expected.push(5u8);
+        for v in [1u16, 2, 3, 4, 5] {
+            expected.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(buf, expected);
+
+        let decoded: Vec<Vec<u16>> = decode_list_column(&buf, 3, "csr-test").unwrap();
+        assert_eq!(decoded, vec![vec![], vec![7], vec![1, 2, 3, 4, 5]]);
+    }
+
+    /// (B1 regression.) An inner list count varint of `u64::MAX`
+    /// must not drive a giant `Vec::with_capacity` in
+    /// `decode_list_column`; the remaining-buffer-derived bound
+    /// rejects it with a typed error.
+    #[test]
+    fn list_column_decode_rejects_giant_inner_count_without_oom() {
+        let mut bytes = Vec::new();
+        encode_u64_leb128(u64::MAX, &mut bytes);
+        let err = decode_list_column::<u16>(&bytes, 1, "chain-slots").unwrap_err();
+        match err {
+            PspReadError::ColumnElementDecode { entry, source, .. } => {
+                assert_eq!(entry, 0);
+                assert_eq!(source, ScalarDecodeError::Truncated);
+            }
+            other => panic!("expected ColumnElementDecode, got {other:?}"),
+        }
     }
 }

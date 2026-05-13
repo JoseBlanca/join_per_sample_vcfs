@@ -15,7 +15,10 @@
 //! Both decoders return `(value, bytes_consumed)` on success and a
 //! [`VarintError`] on a truncated or over-long encoding. The caller
 //! adds context (block index, column, record index) when wrapping
-//! the error into [`PspReadError::Varint`].
+//! the error into the relevant [`super::errors::PspReadError`]
+//! variant — `IndexEntryDecode`, `BlockHeaderField`, or
+//! `ColumnElementDecode`, depending on which file region was being
+//! decoded.
 
 use super::errors::VarintError;
 

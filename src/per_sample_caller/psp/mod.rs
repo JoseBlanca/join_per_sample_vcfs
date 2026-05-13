@@ -7,15 +7,20 @@
 //! `ia/specs/per_sample_pileup_format.md`; this module is its
 //! authoritative implementation.
 //!
-//! The first slice of this module covers the shared primitives:
-//! - [`registry`]: the v1.0 column-tag registry — the single source
-//!   of truth shared by writer, reader, and (later) `psp_spec_dump`.
-//! - [`varint`]: LEB128 / zig-zag-LEB128 encoders and decoders used
-//!   everywhere in the binary body.
-//! - [`errors`]: typed error enums.
+//! Module layout:
 //!
-//! Block layout, header build/parse, the index, the trailer, and the
-//! `PspWriter` / `PspReader` public API land in subsequent slices.
+//! - [`registry`]: the v1.0 column-tag registry — the single source
+//!   of truth shared by writer, reader, and `psp_spec_dump`.
+//! - [`varint`]: LEB128 / zig-zag-LEB128 codecs.
+//! - [`errors`]: typed error enums.
+//! - [`header`], [`block`], [`index`], [`trailer`]: per-section
+//!   wire codecs.
+//! - [`writer`]: streaming [`writer::PspWriter`] over any `Write` sink.
+//!
+//! The reader-side public API (`PspReader`) is planned but not yet
+//! implemented. The decoder primitives in `block`, `index`,
+//! `header`, and `trailer` are already in place and exercised by
+//! their respective `#[cfg(test)] mod tests` round-trip suites.
 
 pub mod block;
 pub mod errors;

@@ -35,6 +35,21 @@ pub struct BlockIndexEntry {
     pub block_offset: u64,
 }
 
+/// Minimum bytes a [`BlockIndexEntry`] can occupy on the wire: four
+/// single-byte varints (`chrom_id`, `first_pos`, `last_pos`,
+/// `n_records`, each ≥ 1 byte) plus the fixed 8-byte `block_offset`.
+/// Used to derive an upper bound on `expected_n_blocks` from
+/// `bytes.len()` at decode time so a tampered trailer cannot drive
+/// an unbounded `Vec::with_capacity`.
+const MIN_ENTRY_BYTES: u64 = 1 + 1 + 1 + 1 + 8;
+
+/// Worst-case bytes a [`BlockIndexEntry`] can occupy on the wire:
+/// four 5-byte LEB128 varints (the maximum width for any `u32`)
+/// plus the fixed 8-byte `block_offset`. Used as the per-entry
+/// reservation hint in [`encode_index`] so the worst-case file
+/// allocates exactly once.
+const MAX_ENTRY_BYTES_HINT: usize = 5 + 5 + 5 + 5 + 8;
+
 /// XXH3-64 over `bytes`, truncated to its low 32 bits. Matches the
 /// truncation zstd uses for its frame content checksum (RFC 8878
 /// §3.1.1), so the same hash backs both — there is only ever one
@@ -53,11 +68,11 @@ pub fn checksum_index(bytes: &[u8]) -> u32 {
 /// the writer always sets to genomic order (the order blocks were
 /// written).
 pub fn encode_index(entries: &[BlockIndexEntry]) -> Vec<u8> {
-    // Worst-case sizing: each entry is at most 5+5+5+5+8 = 28 bytes
-    // (varints up to 5 bytes for u32, plus the fixed u64). Tightly
-    // bounding the initial capacity keeps the index region small
-    // even before append-amortisation kicks in.
-    let mut out = Vec::with_capacity(entries.len() * 28);
+    // Worst-case sizing per [`MAX_ENTRY_BYTES_HINT`]: varints up to
+    // 5 bytes for each `u32` plus the fixed 8-byte `block_offset`.
+    // Tightly bounding the initial capacity keeps the index region
+    // small even before append-amortisation kicks in.
+    let mut out = Vec::with_capacity(entries.len() * MAX_ENTRY_BYTES_HINT);
     for e in entries {
         encode_u64_leb128(u64::from(e.chrom_id), &mut out);
         encode_u64_leb128(u64::from(e.first_pos), &mut out);
@@ -84,8 +99,16 @@ pub fn decode_index(
     bytes: &[u8],
     expected_n_blocks: u64,
 ) -> Result<Vec<BlockIndexEntry>, PspReadError> {
+    // DoS guard: `expected_n_blocks` is the trailer's `n_blocks`
+    // field, decoded from an attacker-influenced file tail. Cap the
+    // up-front `Vec::with_capacity` against the buffer-derived
+    // ceiling so a `u64::MAX` trailer cannot drive an unbounded
+    // allocation. Truncation / mismatch is then detected per-entry
+    // inside the loop as before.
+    let cap_bound = (bytes.len() as u64) / MIN_ENTRY_BYTES + 1;
+    let initial_cap = expected_n_blocks.min(cap_bound) as usize;
     let mut cursor = 0usize;
-    let mut entries = Vec::with_capacity(expected_n_blocks as usize);
+    let mut entries = Vec::with_capacity(initial_cap);
 
     for entry_idx in 0..expected_n_blocks {
         let entry = decode_one_entry(bytes, &mut cursor, entry_idx as usize)?;
@@ -400,6 +423,51 @@ mod tests {
                 assert_eq!(field, "chrom_id");
             }
             other => panic!("expected IndexEntryDecode at entry 1, got {other:?}"),
+        }
+    }
+
+    /// (M2.) Pins the byte layout of `encode_index` for a known
+    /// entry. A field-reorder refactor in `BlockIndexEntry` (or in
+    /// `encode_index`'s ordering of the varint writes) would shift
+    /// the asserted bytes and fail this test loudly.
+    #[test]
+    fn wire_layout_is_stable() {
+        let entries = vec![BlockIndexEntry {
+            chrom_id: 0x01,
+            first_pos: 0x80,     // 2-byte LEB128: 0x80 0x01
+            last_pos: 0x4000,    // 3-byte LEB128: 0x80 0x80 0x01
+            n_records: 0x200000, // 4-byte LEB128: 0x80 0x80 0x80 0x01
+            block_offset: 0x0102030405060708,
+        }];
+        let bytes = encode_index(&entries);
+        // chrom_id = 1 — 1-byte varint.
+        assert_eq!(bytes[0], 0x01);
+        // first_pos = 128 — 2-byte varint.
+        assert_eq!(&bytes[1..3], &[0x80, 0x01]);
+        // last_pos = 0x4000 — 3-byte varint.
+        assert_eq!(&bytes[3..6], &[0x80, 0x80, 0x01]);
+        // n_records = 0x200000 — 4-byte varint.
+        assert_eq!(&bytes[6..10], &[0x80, 0x80, 0x80, 0x01]);
+        // block_offset — 8 LE bytes.
+        assert_eq!(&bytes[10..18], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(bytes.len(), 18);
+    }
+
+    /// (B3 regression.) A hostile trailer claiming `n_blocks =
+    /// u64::MAX` against an empty buffer must not drive an
+    /// unbounded `Vec::with_capacity`; the up-front cap clamps the
+    /// reservation and the per-entry decode surfaces the truncation.
+    #[test]
+    fn decode_index_rejects_giant_expected_count_without_oom() {
+        let err = decode_index(&[], u64::MAX).unwrap_err();
+        // The first decode_field_u32 call hits an empty slice and
+        // returns Truncated, wrapped as IndexEntryDecode at entry 0.
+        match err {
+            PspReadError::IndexEntryDecode { entry, field, .. } => {
+                assert_eq!(entry, 0);
+                assert_eq!(field, "chrom_id");
+            }
+            other => panic!("expected IndexEntryDecode at entry 0, got {other:?}"),
         }
     }
 }

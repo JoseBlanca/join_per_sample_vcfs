@@ -44,22 +44,33 @@ pub const DEFAULT_TARGET_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 /// Initial `Vec::with_capacity` hint for per-record columns in a
 /// freshly-opened block (delta-pos, n-alleles, the per-record list
 /// columns). Sized at the records-per-block high-water mark for the
-/// SNP-typical bench workload (~31 uncompressed bytes per record);
-/// pre-allocating this much keeps the amortised-doubling Vec growth
-/// path off the hot path for the common case. Real workloads with
-/// more alleles per record fit comfortably under this hint; the worst
-/// case is an additional realloc on a few-allele block, which is one
-/// reallocation per column per block instead of ~17.
+/// SNP-typical bench workload (~31 uncompressed bytes per record),
+/// where the 16 MiB block target fills at ~530k records; the hint
+/// pre-allocates for the bulk so column `Vec`s do not realloc on
+/// the hot path.
+///
+/// **Indel-heavy / multi-allelic workloads** carry more bytes per
+/// record, so blocks flush at fewer records (5k–50k typical). In
+/// that regime this hint *over-allocates* by ~5–10×; the excess
+/// capacity is held for the block's lifetime and freed at flush.
+/// No reallocation occurs in either direction — the trade is
+/// "spend some peak RAM, save the hot-path doubling cost on SNP
+/// runs."
 const INITIAL_RECORDS_HINT: usize = 350_000;
 /// Initial hint for per-allele columns. Sized a touch above
 /// `INITIAL_RECORDS_HINT` to absorb the typical excess of alleles
-/// over records (occasional multi-allelic positions).
+/// over records (occasional multi-allelic positions). Same
+/// SNP-vs-indel trade as `INITIAL_RECORDS_HINT`.
 const INITIAL_ALLELES_HINT: usize = 360_000;
 /// Initial hint for the concatenated allele-sequence byte buffer.
 /// On the SNP-typical workload one byte per allele = ~360 KiB; on
 /// indel-heavier workloads alleles run to ~10 bytes each. The 1 MiB
 /// hint covers both without leaving much slack.
 const INITIAL_ALLELE_SEQ_BYTES_HINT: usize = 1_000_000;
+/// Initial slot-data capacity for the three list-shaped chain-slot
+/// columns (Mi4). Most records carry zero chain slots; the
+/// SNP-typical workload's high-water mark sits well under this hint.
+const INITIAL_CHAIN_SLOTS_HINT: usize = 4096;
 
 /// Byte mask of allele bytes the writer accepts. `ALLOWED[b]` is
 /// `true` iff `b` is one of `b'A' | b'C' | b'G' | b'T' | b'N'`. Walked
@@ -92,22 +103,21 @@ fn err_invalid_record(record_index: u64, reason: String) -> PspWriteError {
 
 #[cold]
 #[inline(never)]
-fn err_invalid_allele_byte(
-    record_index: u64,
-    allele_index: usize,
-    seq: &[u8],
-) -> PspWriteError {
+fn err_invalid_allele_byte(record_index: u64, allele_index: usize, seq: &[u8]) -> PspWriteError {
+    // PANIC-FREE: validate_record only calls this helper after the
+    // `seq.iter().all(|&b| ALLOWED_ALLELE_BYTE[b as usize])` check
+    // at writer.rs:399 has returned `false` — so at least one
+    // invalid byte exists in `seq`. find() returning None here
+    // would mean the two walks disagree, which is a codebase bug.
     let (j, b) = seq
         .iter()
         .enumerate()
         .find(|&(_, &b)| !ALLOWED_ALLELE_BYTE[b as usize])
         .map(|(j, &b)| (j, b))
-        .expect("err_invalid_allele_byte called with valid sequence");
+        .expect("invariant: caller observed an invalid byte but find() returned None");
     PspWriteError::InvalidRecord {
         record_index,
-        reason: format!(
-            "allele {allele_index} byte {j} = {b:#04x} (only A/C/G/T/N allowed)"
-        ),
+        reason: format!("allele {allele_index} byte {j} = {b:#04x} (only A/C/G/T/N allowed)"),
     }
 }
 
@@ -387,9 +397,7 @@ impl<W: Write> PspWriter<W> {
             if len == 0 || (len as u64) > MAX_ALLELE_SEQ_LEN {
                 return Err(err_invalid_record(
                     record_index,
-                    format!(
-                        "allele {i} sequence length {len} outside [1, {MAX_ALLELE_SEQ_LEN}]"
-                    ),
+                    format!("allele {i} sequence length {len} outside [1, {MAX_ALLELE_SEQ_LEN}]"),
                 ));
             }
             // H4: lookup-table walk lets the loop run to completion
@@ -490,6 +498,10 @@ impl<W: Write> PspWriter<W> {
         }
 
         // Push to block buffers.
+        // PANIC-FREE: write_record opens `self.block` at writer.rs:253
+        // on every path that reaches this call. The Option shape is
+        // an artefact of the flush/open cycle, not a real "may be
+        // absent" condition here.
         let block = self.block.as_mut().expect("block open by construction");
         block.append_record(record);
 
@@ -506,6 +518,11 @@ impl<W: Write> PspWriter<W> {
     /// `clear()`ed inside this method, keeping its prior capacity so
     /// subsequent flushes do not pay realloc cost.
     fn flush_block(&mut self) -> Result<(), PspWriteError> {
+        // PANIC-FREE: flush_block is called only from `write_record`
+        // (gated by `should_flush`, which requires `self.block` to
+        // already be `Some`) and from `finish` (gated by
+        // `if self.block.is_some()`). Both call sites ensure a block
+        // is open.
         let mut block = self
             .block
             .take()
@@ -659,8 +676,14 @@ impl BlockAccumulator {
             // Per-record list columns. Most records have an empty
             // chain-slots list, so the data buffer's hint is much
             // smaller than the offsets hint.
-            new_chain_slots: ListColumn::with_capacity(INITIAL_RECORDS_HINT, 4096),
-            expired_chain_slots: ListColumn::with_capacity(INITIAL_RECORDS_HINT, 4096),
+            new_chain_slots: ListColumn::with_capacity(
+                INITIAL_RECORDS_HINT,
+                INITIAL_CHAIN_SLOTS_HINT,
+            ),
+            expired_chain_slots: ListColumn::with_capacity(
+                INITIAL_RECORDS_HINT,
+                INITIAL_CHAIN_SLOTS_HINT,
+            ),
             allele_seq_len: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_seq_bytes: Vec::with_capacity(INITIAL_ALLELE_SEQ_BYTES_HINT),
             allele_obs_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
@@ -668,7 +691,10 @@ impl BlockAccumulator {
             allele_fwd_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_left_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_start_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
-            allele_chain_slots: ListColumn::with_capacity(INITIAL_ALLELES_HINT, 4096),
+            allele_chain_slots: ListColumn::with_capacity(
+                INITIAL_ALLELES_HINT,
+                INITIAL_CHAIN_SLOTS_HINT,
+            ),
             projected_bytes: 0,
         }
     }
@@ -788,33 +814,71 @@ fn encode_column_into(
             });
         }
     }
-    // Verify the encoded size matches the schema-predicted size for
-    // fixed-width scalars and the bytes column (with the length
-    // column also known). This is a writer-side self-check: a
-    // mis-match means a bug in the writer.
-    debug_assert!(verify_encoded_size(def, block, out));
+    // M5: promote the writer-side column-size self-check from a
+    // debug-only assertion to a real check. Catches a writer bug
+    // (encoded length disagrees with the schema-predicted length)
+    // at the producer, not weeks later when a consumer rejects the
+    // file. The cost is one length comparison per column per block
+    // flush — well below the noise floor of the block's
+    // compression cost.
+    let predicted = predict_uncompressed_len(def, block);
+    if let Some(expected) = predicted
+        && expected != out.len()
+    {
+        return Err(PspWriteError::ColumnSizeSelfCheck {
+            column: def.name,
+            got: out.len(),
+            expected,
+        });
+    }
     Ok(())
 }
 
-fn verify_encoded_size(def: &ColumnDef, block: &BlockAccumulator, encoded: &[u8]) -> bool {
+/// Predict the encoded byte length for a column whose shape gives
+/// us an a-priori bound. Returns `None` for columns whose encoded
+/// length is genuinely variable (varint scalars, list columns).
+///
+/// The exhaustive matches force a compile-time update when a new
+/// `Shape` or `ElementType` variant lands — replacing the prior
+/// `_ => true` catch-all that silently approved any future
+/// combination.
+fn predict_uncompressed_len(def: &ColumnDef, block: &BlockAccumulator) -> Option<usize> {
     let n_records = block.delta_pos.len();
     let n_total_alleles = block.allele_seq_len.len();
-    match (def.cardinality, def.shape, def.element_type) {
-        (Cardinality::PerRecord, Shape::Scalar, Some(ElementType::Varint)) => true, // variable
-        (Cardinality::PerAllele, Shape::Scalar, Some(ElementType::Varint)) => true, // variable
-        (Cardinality::PerRecord, Shape::Scalar, Some(e)) if e.fixed_byte_width().is_some() => {
-            encoded.len() == n_records * e.fixed_byte_width().unwrap()
+    match def.shape {
+        Shape::Bytes => {
+            // `MAX_ALLELE_SEQ_LEN = 10_000`; with `u32::MAX` alleles
+            // per block the sum still fits comfortably in `usize` on
+            // 64-bit targets, but be defensive.
+            let total: u64 = block.allele_seq_len.iter().sum();
+            usize::try_from(total).ok()
         }
-        (Cardinality::PerAllele, Shape::Scalar, Some(e)) if e.fixed_byte_width().is_some() => {
-            encoded.len() == n_total_alleles * e.fixed_byte_width().unwrap()
+        Shape::List => None,
+        Shape::Scalar => {
+            let et = def
+                .element_type
+                .expect("non-Bytes shape requires element-type per registry invariants");
+            let count = match def.cardinality {
+                Cardinality::PerRecord => n_records,
+                Cardinality::PerAllele => n_total_alleles,
+            };
+            match et {
+                ElementType::Varint | ElementType::Svarint => None,
+                ElementType::U8
+                | ElementType::U16
+                | ElementType::U32
+                | ElementType::U64
+                | ElementType::I32
+                | ElementType::I64
+                | ElementType::F32
+                | ElementType::F64
+                | ElementType::Bool => Some(
+                    count
+                        * et.fixed_byte_width()
+                            .expect("fixed-width path: et was checked above"),
+                ),
+            }
         }
-        (_, Shape::List, _) => true, // variable
-        (_, Shape::Bytes, _) => {
-            // For tag 0x04, encoded length equals the sum of
-            // allele_seq_len.
-            encoded.len() as u64 == block.allele_seq_len.iter().sum::<u64>()
-        }
-        _ => true,
     }
 }
 
@@ -1226,6 +1290,61 @@ mod tests {
         assert_eq!(
             trailer.n_blocks, 2,
             "chrom change should produce two blocks"
+        );
+    }
+
+    /// (Mi27.) Multi-block index entries match the input order and
+    /// coordinates — defends against a bug that reverses entries,
+    /// drops one, or computes a wrong `last_pos` / `block_offset`.
+    #[test]
+    fn index_entries_match_input_order_and_coordinates() {
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(2)).unwrap();
+        writer
+            .write_record(&record(
+                0,
+                100,
+                vec![allele(b"A", 1, -1.0, &[])],
+                vec![],
+                vec![],
+            ))
+            .unwrap();
+        writer
+            .write_record(&record(
+                0,
+                200,
+                vec![allele(b"C", 1, -1.0, &[])],
+                vec![],
+                vec![],
+            ))
+            .unwrap();
+        writer
+            .write_record(&record(
+                1,
+                1,
+                vec![allele(b"G", 1, -1.0, &[])],
+                vec![],
+                vec![],
+            ))
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let trailer: &[u8; TRAILER_BYTES] =
+            bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
+        let trailer = decode_trailer(trailer).unwrap();
+        let index_bytes = &bytes[trailer.index_offset as usize
+            ..(trailer.index_offset + trailer.index_byte_length) as usize];
+        let entries = decode_index(index_bytes, trailer.n_blocks).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].chrom_id, 0);
+        assert_eq!(entries[0].first_pos, 100);
+        assert_eq!(entries[0].last_pos, 200);
+        assert_eq!(entries[0].n_records, 2);
+        assert_eq!(entries[1].chrom_id, 1);
+        assert_eq!(entries[1].first_pos, 1);
+        assert_eq!(entries[1].last_pos, 1);
+        assert_eq!(entries[1].n_records, 1);
+        assert!(
+            entries[1].block_offset > entries[0].block_offset,
+            "second block's offset must come after first"
         );
     }
 

@@ -86,7 +86,9 @@ pub const READER_FORMAT_VERSION: (u16, u16) = (1, 0);
 /// registry ([`V1_0_COLUMNS`]) verbatim.
 #[derive(Debug, Clone)]
 pub struct WriterHeader {
-    /// `(major, minor)`. v1.0 writers pass `(1, 0)`.
+    /// `(major, minor)`. The writer accepts exactly
+    /// [`READER_FORMAT_VERSION`]; any other value is rejected by
+    /// [`build_header_bytes`] with a `PspWriteError::InvalidHeaderField`.
     pub format_version: (u16, u16),
     pub sample: String,
     pub reference: String,
@@ -396,9 +398,12 @@ pub fn parse_header_bytes(bytes: &[u8]) -> Result<(ParsedHeader, usize), PspRead
     // 4. Parse TOML.
     let body_bytes = &bytes[body_start..body_end];
     let body_str =
-        std::str::from_utf8(body_bytes).map_err(|_| PspReadError::InvalidHeaderField {
+        std::str::from_utf8(body_bytes).map_err(|e| PspReadError::InvalidHeaderField {
             key: "<toml body>".to_string(),
-            reason: "TOML body is not valid UTF-8".to_string(),
+            reason: format!(
+                "TOML body is not valid UTF-8 at byte offset {}",
+                e.valid_up_to()
+            ),
         })?;
     let wire: WireHeader =
         toml::from_str(body_str).map_err(|source| PspReadError::HeaderToml { source })?;
@@ -423,9 +428,12 @@ pub fn parse_header_bytes(bytes: &[u8]) -> Result<(ParsedHeader, usize), PspRead
 /// for unit tests that hand-craft a body without re-implementing the
 /// framing.
 pub fn parse_header_toml(body: &[u8]) -> Result<ParsedHeader, PspReadError> {
-    let body_str = std::str::from_utf8(body).map_err(|_| PspReadError::InvalidHeaderField {
+    let body_str = std::str::from_utf8(body).map_err(|e| PspReadError::InvalidHeaderField {
         key: "<toml body>".to_string(),
-        reason: "TOML body is not valid UTF-8".to_string(),
+        reason: format!(
+            "TOML body is not valid UTF-8 at byte offset {}",
+            e.valid_up_to()
+        ),
     })?;
     let wire: WireHeader =
         toml::from_str(body_str).map_err(|source| PspReadError::HeaderToml { source })?;
@@ -436,11 +444,21 @@ fn parsed_from_wire(wire: WireHeader) -> Result<ParsedHeader, PspReadError> {
     // Per-field rules first — every value validated before structural
     // checks fire, so the error message names the lowest-level rule
     // that failed.
-    validate_format_version_str(&wire.format_version)?;
+    let format_version = parse_format_version(&wire.format_version)?;
     validate_printable_ascii("sample", &wire.sample)?;
     validate_printable_ascii("reference", &wire.reference)?;
 
-    let format_version = parse_format_version(&wire.format_version)?;
+    // M6: reject any file whose major version exceeds the reader's.
+    // Higher-major files may rest on layout assumptions a v1.x
+    // reader cannot make — spec §"Versioning policy".
+    if format_version.0 > READER_FORMAT_VERSION.0 {
+        return Err(PspReadError::UnsupportedFormatVersion {
+            file_major: format_version.0,
+            file_minor: format_version.1,
+            reader_major: READER_FORMAT_VERSION.0,
+            reader_minor: READER_FORMAT_VERSION.1,
+        });
+    }
 
     if wire.chromosomes.is_empty() {
         return Err(PspReadError::InvalidHeaderField {
@@ -448,17 +466,21 @@ fn parsed_from_wire(wire: WireHeader) -> Result<ParsedHeader, PspReadError> {
             reason: "[[chromosome]] array must have at least one entry".to_string(),
         });
     }
-    let mut chromosomes = Vec::with_capacity(wire.chromosomes.len());
-    for (i, c) in wire.chromosomes.into_iter().enumerate() {
-        chromosomes.push(parse_chromosome(i, c)?);
-    }
+    let chromosomes: Vec<ParsedChromosome> = wire
+        .chromosomes
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| parse_chromosome(i, c))
+        .collect::<Result<_, _>>()?;
 
     let writer = parse_writer(wire.writer)?;
 
-    let mut columns = Vec::with_capacity(wire.columns.len());
-    for (i, c) in wire.columns.into_iter().enumerate() {
-        columns.push(parse_column(i, c)?);
-    }
+    let columns: Vec<ParsedColumn> = wire
+        .columns
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| parse_column(i, c))
+        .collect::<Result<_, _>>()?;
     // Tag uniqueness inside the file.
     {
         let mut seen = std::collections::HashSet::new();
@@ -710,10 +732,20 @@ fn validate_writer_header(header: &WriterHeader) -> Result<(), PspWriteError> {
         reason,
     };
 
-    if header.format_version.0 == 0 && header.format_version.1 == 0 {
+    // M6: the writer only emits files at the single
+    // `READER_FORMAT_VERSION` it understands. A caller passing any
+    // other value would produce a header that advertises a version
+    // the body does not actually conform to — refuse loudly.
+    if header.format_version != READER_FORMAT_VERSION {
         return Err(bad(
             "format-version",
-            "(0, 0) is not a valid format version".to_string(),
+            format!(
+                "writer only emits {}.{}; got {}.{}",
+                READER_FORMAT_VERSION.0,
+                READER_FORMAT_VERSION.1,
+                header.format_version.0,
+                header.format_version.1,
+            ),
         ));
     }
     if let Err(reason) = check_printable_ascii(&header.sample) {
@@ -779,36 +811,36 @@ fn validate_writer_header(header: &WriterHeader) -> Result<(), PspWriteError> {
 // Per-field validators (read-side wrappers + raw checks)
 // ---------------------------------------------------------------------
 
-fn validate_format_version_str(s: &str) -> Result<(), PspReadError> {
-    check_format_version_str(s).map_err(|reason| PspReadError::InvalidHeaderField {
+/// Parse and validate a `format-version` string in one pass —
+/// returns `(major, minor)` on success or a typed error on any of
+/// the rejection conditions (missing `.`, empty halves, non-digit
+/// bytes, half exceeds `u16::MAX`). M9 folded the prior
+/// separate `validate_format_version_str` step into this function
+/// so the call site no longer has a doc-only "caller has validated"
+/// invariant backing an `.unwrap()`.
+fn parse_format_version(s: &str) -> Result<(u16, u16), PspReadError> {
+    let bad = |reason: String| PspReadError::InvalidHeaderField {
         key: "format-version".to_string(),
         reason,
-    })
-}
-
-fn parse_format_version(s: &str) -> Result<(u16, u16), PspReadError> {
-    // Caller has already validated the surface syntax via
-    // validate_format_version_str.
-    let (a, b) = s.split_once('.').unwrap();
-    let major = a
-        .parse::<u32>()
-        .map_err(|_| PspReadError::InvalidHeaderField {
-            key: "format-version".to_string(),
-            reason: format!("major component {a:?} does not parse as integer"),
-        })?;
-    let minor = b
-        .parse::<u32>()
-        .map_err(|_| PspReadError::InvalidHeaderField {
-            key: "format-version".to_string(),
-            reason: format!("minor component {b:?} does not parse as integer"),
-        })?;
-    if major > u16::MAX as u32 || minor > u16::MAX as u32 {
-        return Err(PspReadError::InvalidHeaderField {
-            key: "format-version".to_string(),
-            reason: format!("{major}.{minor} exceeds u16 range on at least one half"),
-        });
+    };
+    let Some((a, b)) = s.split_once('.') else {
+        return Err(bad(format!("{s:?} does not match [0-9]+\\.[0-9]+")));
+    };
+    if a.is_empty() || b.is_empty() {
+        return Err(bad(format!("{s:?} does not match [0-9]+\\.[0-9]+")));
     }
-    Ok((major as u16, minor as u16))
+    for half in [a, b] {
+        if !half.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad(format!("{s:?} contains a non-digit")));
+        }
+    }
+    let major = a
+        .parse::<u16>()
+        .map_err(|_| bad(format!("major component {a:?} exceeds u16 range")))?;
+    let minor = b
+        .parse::<u16>()
+        .map_err(|_| bad(format!("minor component {b:?} exceeds u16 range")))?;
+    Ok((major, minor))
 }
 
 fn validate_printable_ascii(key: &str, s: &str) -> Result<(), PspReadError> {
@@ -864,21 +896,6 @@ fn validate_column_name(key: &str, s: &str) -> Result<(), PspReadError> {
 // Raw character-set checks. Each returns `Ok(())` or `Err(reason)`,
 // where `reason` is a single sentence explaining which rule failed.
 // ---------------------------------------------------------------------
-
-fn check_format_version_str(s: &str) -> Result<(), String> {
-    let Some((a, b)) = s.split_once('.') else {
-        return Err(format!("{s:?} does not match [0-9]+\\.[0-9]+"));
-    };
-    if a.is_empty() || b.is_empty() {
-        return Err(format!("{s:?} does not match [0-9]+\\.[0-9]+"));
-    }
-    for half in [a, b] {
-        if !half.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(format!("{s:?} contains a non-digit"));
-        }
-    }
-    Ok(())
-}
 
 /// ASCII printable: bytes in `[0x20, 0x7E]`. Empty strings are
 /// rejected — none of our fields are legitimately empty.
@@ -1059,7 +1076,7 @@ mod tests {
     /// of parameters, frame the bytes, parse them back, assert the
     /// round-trip preserves every field.
     #[test]
-    fn h1_round_trip_minimal_header() {
+    fn round_trip_minimal_header() {
         let header = minimal_writer_header();
         let bytes = build_header_bytes(&header).expect("build should succeed");
         // Magic + length + body + sentinel must be at least 30 bytes.
@@ -1086,13 +1103,54 @@ mod tests {
         assert_eq!(parsed.columns.last().unwrap().name, "allele-chain-slots");
     }
 
+    /// (M3.) Pin the literal kebab-case TOML wire keys produced by
+    /// the serde renames on `WireHeader`, `WireWriter`, `WireColumn`.
+    /// Dropping a `#[serde(rename = ...)]` annotation would cause
+    /// every test in this file to keep passing (because the reader
+    /// uses the same wire definition) but break file compatibility
+    /// with separately-built consumers. This test fails loudly in
+    /// that case.
+    #[test]
+    fn wire_keys_are_pinned() {
+        let header = minimal_writer_header();
+        let body = String::from_utf8(build_header_toml(&header).unwrap()).unwrap();
+        for key in [
+            "format-version =",
+            "[[chromosome]]",
+            "[writer]",
+            "input-crams =",
+            "input-fasta =",
+            "[[column]]",
+            "element-type =",
+            "length-column =",
+        ] {
+            assert!(body.contains(key), "wire key {key:?} absent from TOML body");
+        }
+        // Converse: the snake_case forms must not leak — catches a
+        // dropped rename annotation that would otherwise be invisible
+        // because both serializer and deserializer would agree on
+        // the wrong name.
+        for forbidden in [
+            "format_version",
+            "input_crams",
+            "input_fasta",
+            "element_type",
+            "length_column",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "snake_case wire key {forbidden:?} leaked into TOML body"
+            );
+        }
+    }
+
     /// (Plan group H — H1.) Output is roundtrip-stable: parse a
     /// header, write it back, parse again, get identical strong-typed
     /// values. The byte representation may or may not be
     /// byte-identical (TOML serializer cosmetics) but the data must
     /// be.
     #[test]
-    fn h1_round_trip_is_data_stable() {
+    fn round_trip_is_data_stable() {
         let header = minimal_writer_header();
         let bytes_1 = build_header_bytes(&header).unwrap();
         let (parsed_1, _) = parse_header_bytes(&bytes_1).unwrap();
@@ -1101,7 +1159,7 @@ mod tests {
             format_version: parsed_1.format_version,
             sample: parsed_1.sample.clone(),
             reference: parsed_1.reference.clone(),
-            created: parsed_1.created.clone(),
+            created: parsed_1.created,
             chromosomes: parsed_1
                 .chromosomes
                 .iter()
@@ -1149,7 +1207,7 @@ mod tests {
         parse_header_toml(body.as_bytes()).expect_err("should fail")
     }
 
-    fn h1_valid_wire() -> WireHeader {
+    fn valid_wire() -> WireHeader {
         WireHeader {
             format_version: "1.0".to_string(),
             sample: "NA12878".to_string(),
@@ -1174,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn h2_writer_rejects_non_ascii_sample() {
+    fn writer_rejects_non_ascii_sample() {
         let mut header = minimal_writer_header();
         header.sample = "NA12878\u{e9}".to_string();
         let err = build_header_bytes(&header).expect_err("non-ASCII byte must fail");
@@ -1184,9 +1242,152 @@ mod tests {
         }
     }
 
+    // ----- M12: writer-side per-field validator coverage ---------
+    //
+    // Each test mirrors an `h2_reader_rejects_*` sibling above.
+    // Writer-side validation is the only line of defence against a
+    // buggy producer emitting a malformed file; the build-side
+    // validator path was previously only exercised by the
+    // `non_ascii_sample` test above.
+
+    /// `writer.reference` must satisfy printable-ASCII.
     #[test]
-    fn h2_reader_rejects_non_ascii_sample() {
-        let mut wire = h1_valid_wire();
+    fn writer_rejects_non_ascii_reference() {
+        let mut header = minimal_writer_header();
+        header.reference = "ref\u{e9}.fa".to_string();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => assert_eq!(key, "reference"),
+            other => panic!("expected InvalidHeaderField{{reference}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_empty_chromosomes() {
+        let mut header = minimal_writer_header();
+        header.chromosomes.clear();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => assert_eq!(key, "chromosome"),
+            other => panic!("expected InvalidHeaderField{{chromosome}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_invalid_chrom_name() {
+        let mut header = minimal_writer_header();
+        header.chromosomes[0].name = "ch<".to_string();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "chromosome[0].name");
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_zero_chrom_length() {
+        let mut header = minimal_writer_header();
+        header.chromosomes[0].length = 0;
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "chromosome[0].length");
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_short_md5() {
+        let mut header = minimal_writer_header();
+        header.chromosomes[0].md5 = "deadbeef".to_string();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "chromosome[0].md5");
+            }
+            other => panic!("expected InvalidHeaderField{{md5}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_path_separator_in_input_crams() {
+        let mut header = minimal_writer_header();
+        header.writer.input_crams[0] = "subdir/a.cram".to_string();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "writer.input-crams[0]");
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_path_separator_in_input_fasta() {
+        let mut header = minimal_writer_header();
+        header.writer.input_fasta = "subdir/ref.fa".to_string();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "writer.input-fasta");
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_path_separator_in_tool() {
+        let mut header = minimal_writer_header();
+        header.writer.tool = "bin/tool".to_string();
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "writer.tool");
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_invalid_parameter_bare_key() {
+        let mut header = minimal_writer_header();
+        // Space is not in the TOML bare-key set [A-Za-z0-9_-].
+        header
+            .writer
+            .parameters
+            .insert("bad key".to_string(), ParameterValue::Integer(0));
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert!(key.starts_with("writer.parameters."));
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn writer_rejects_non_finite_parameter_float() {
+        let mut header = minimal_writer_header();
+        header
+            .writer
+            .parameters
+            .insert("frac".to_string(), ParameterValue::Float(f64::NAN));
+        let err = build_header_bytes(&header).expect_err("must fail");
+        match err {
+            PspWriteError::InvalidHeaderField { key, reason } => {
+                assert_eq!(key, "writer.parameters.frac");
+                assert!(reason.contains("non-finite"));
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_rejects_non_ascii_sample() {
+        let mut wire = valid_wire();
         wire.sample = "NA12878\u{e9}".to_string();
         let err = parse_from_wire(&wire);
         match err {
@@ -1196,8 +1397,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_invalid_chrom_name() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_invalid_chrom_name() {
+        let mut wire = valid_wire();
         // `<` is not in @SQ SN's allowed set.
         wire.chromosomes[0].name = "ch<".to_string();
         let err = parse_from_wire(&wire);
@@ -1211,8 +1412,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_short_md5() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_short_md5() {
+        let mut wire = valid_wire();
         wire.chromosomes[0].md5 = "deadbeef".to_string();
         let err = parse_from_wire(&wire);
         match err {
@@ -1224,8 +1425,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_zero_chrom_length() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_zero_chrom_length() {
+        let mut wire = valid_wire();
         wire.chromosomes[0].length = 0;
         let err = parse_from_wire(&wire);
         match err {
@@ -1237,8 +1438,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_path_separator_in_input_crams() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_path_separator_in_input_crams() {
+        let mut wire = valid_wire();
         wire.writer.input_crams[0] = "subdir/a.cram".to_string();
         let err = parse_from_wire(&wire);
         match err {
@@ -1250,8 +1451,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_invalid_column_element_type() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_invalid_column_element_type() {
+        let mut wire = valid_wire();
         // Find allele-obs-count and lie about its element-type.
         let c = wire
             .columns
@@ -1269,8 +1470,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_bytes_shape_without_length_column() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_bytes_shape_without_length_column() {
+        let mut wire = valid_wire();
         let c = wire
             .columns
             .iter_mut()
@@ -1287,8 +1488,8 @@ mod tests {
     }
 
     #[test]
-    fn h2_reader_rejects_scalar_shape_with_length_column() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_scalar_shape_with_length_column() {
+        let mut wire = valid_wire();
         let c = wire
             .columns
             .iter_mut()
@@ -1307,8 +1508,8 @@ mod tests {
     // ----- H3: schema-vs-registry disagreement --------------------
 
     #[test]
-    fn h3_reader_rejects_q_sum_log_as_f32() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_q_sum_log_as_f32() {
+        let mut wire = valid_wire();
         let c = wire
             .columns
             .iter_mut()
@@ -1333,8 +1534,8 @@ mod tests {
     }
 
     #[test]
-    fn h3_reader_rejects_chain_slots_per_allele_to_per_record() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_chain_slots_per_allele_to_per_record() {
+        let mut wire = valid_wire();
         let c = wire
             .columns
             .iter_mut()
@@ -1354,8 +1555,8 @@ mod tests {
     }
 
     #[test]
-    fn h3_reader_rejects_missing_required_column() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_missing_required_column() {
+        let mut wire = valid_wire();
         // Drop allele-seq.
         wire.columns.retain(|c| c.name != "allele-seq");
         let err = parse_from_wire(&wire);
@@ -1368,8 +1569,8 @@ mod tests {
     }
 
     #[test]
-    fn h3_reader_rejects_unknown_required_column() {
-        let mut wire = h1_valid_wire();
+    fn reader_rejects_unknown_required_column() {
+        let mut wire = valid_wire();
         wire.columns.push(WireColumn {
             tag: 0x77,
             name: "future-required".to_string(),
@@ -1391,8 +1592,8 @@ mod tests {
     }
 
     #[test]
-    fn h3_reader_tolerates_unknown_optional_column() {
-        let mut wire = h1_valid_wire();
+    fn reader_tolerates_unknown_optional_column() {
+        let mut wire = valid_wire();
         wire.columns.push(WireColumn {
             tag: 0x33,
             name: "future-optional".to_string(),
@@ -1412,8 +1613,8 @@ mod tests {
     // ----- H4: unknown top-level keys ------------------------------
 
     #[test]
-    fn h4_reader_tolerates_unknown_top_level_keys() {
-        let mut wire = h1_valid_wire();
+    fn reader_tolerates_unknown_top_level_keys() {
+        let mut wire = valid_wire();
         wire.extras.insert(
             "future-feature".to_string(),
             toml::Value::String("hi".into()),
@@ -1426,7 +1627,7 @@ mod tests {
     // ----- H5: length prefix and sentinel framing -----------------
 
     #[test]
-    fn h5_reader_rejects_zero_body_length() {
+    fn reader_rejects_zero_body_length() {
         // Construct: magic + length=0 + sentinel — no body at all.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&HEAD_MAGIC);
@@ -1440,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn h5_reader_rejects_huge_body_length() {
+    fn reader_rejects_huge_body_length() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&HEAD_MAGIC);
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
@@ -1454,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn h5_reader_rejects_mismatched_sentinel() {
+    fn reader_rejects_mismatched_sentinel() {
         let header = minimal_writer_header();
         let mut bytes = build_header_bytes(&header).unwrap();
         // Corrupt one byte of the trailing sentinel.
@@ -1470,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn h5_reader_rejects_bad_magic() {
+    fn reader_rejects_bad_magic() {
         let header = minimal_writer_header();
         let mut bytes = build_header_bytes(&header).unwrap();
         bytes[0] = b'X';
@@ -1482,12 +1683,63 @@ mod tests {
     }
 
     #[test]
-    fn h5_writer_emits_length_prefix_matching_body() {
+    fn writer_emits_length_prefix_matching_body() {
         let header = minimal_writer_header();
         let bytes = build_header_bytes(&header).unwrap();
         let claimed_len = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
         let actual_body_len = bytes.len() - 4 - 8 - HEAD_SENTINEL_LEN;
         assert_eq!(claimed_len as usize, actual_body_len);
+    }
+
+    // ----- M6: format-version refusal on both sides --------------
+
+    /// Writer rejects any `format_version` other than the single
+    /// version it actually produces (`READER_FORMAT_VERSION`).
+    #[test]
+    fn writer_rejects_non_v1_0_format_version() {
+        let mut header = minimal_writer_header();
+        header.format_version = (2, 0);
+        let err =
+            build_header_bytes(&header).expect_err("writer must reject non-v1.0 format version");
+        match err {
+            PspWriteError::InvalidHeaderField { key, .. } => {
+                assert_eq!(key, "format-version");
+            }
+            other => panic!("expected InvalidHeaderField, got {other:?}"),
+        }
+    }
+
+    /// Reader rejects any file declaring a higher major version
+    /// than it supports — guards against a future v2.0 writer's
+    /// output silently flowing through a v1.0 reader.
+    #[test]
+    fn reader_rejects_higher_major_format_version() {
+        let mut wire = valid_wire();
+        wire.format_version = "2.0".to_string();
+        let err = parse_from_wire(&wire);
+        match err {
+            PspReadError::UnsupportedFormatVersion {
+                file_major,
+                reader_major,
+                ..
+            } => {
+                assert_eq!(file_major, 2);
+                assert_eq!(reader_major, 1);
+            }
+            other => panic!("expected UnsupportedFormatVersion, got {other:?}"),
+        }
+    }
+
+    /// Reader still accepts higher *minor* versions of the same
+    /// major (forward-compat per spec §"Versioning policy").
+    #[test]
+    fn reader_accepts_higher_minor_format_version() {
+        let mut wire = valid_wire();
+        wire.format_version = "1.99".to_string();
+        let body = toml::to_string(&wire).unwrap();
+        let parsed = parse_header_toml(body.as_bytes())
+            .expect("higher minor must parse — minor bumps are forward-compatible");
+        assert_eq!(parsed.format_version, (1, 99));
     }
 
     // ----- Per-field check unit tests (table-driven) -------------
@@ -1535,13 +1787,18 @@ mod tests {
 
     #[test]
     fn format_version_checks() {
-        assert!(check_format_version_str("1.0").is_ok());
-        assert!(check_format_version_str("1.10").is_ok());
-        assert!(check_format_version_str("100.200").is_ok());
-        assert!(check_format_version_str("1").is_err());
-        assert!(check_format_version_str("1.0.0").is_err()); // matches split_once but the second half is "0.0" with a dot
-        assert!(check_format_version_str("v1.0").is_err());
-        assert!(check_format_version_str(".").is_err());
-        assert!(check_format_version_str("").is_err());
+        assert_eq!(parse_format_version("1.0").unwrap(), (1, 0));
+        assert_eq!(parse_format_version("1.10").unwrap(), (1, 10));
+        assert_eq!(parse_format_version("100.200").unwrap(), (100, 200));
+        assert!(parse_format_version("1").is_err());
+        // "1.0.0" splits on the first '.' into ("1", "0.0"); the
+        // second half contains a non-digit '.', so the digit check
+        // rejects it.
+        assert!(parse_format_version("1.0.0").is_err());
+        assert!(parse_format_version("v1.0").is_err());
+        assert!(parse_format_version(".").is_err());
+        assert!(parse_format_version("").is_err());
+        // Each half must fit in u16 (M9 regression).
+        assert!(parse_format_version("65536.0").is_err());
     }
 }
