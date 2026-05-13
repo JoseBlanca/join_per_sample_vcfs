@@ -263,7 +263,14 @@ pub fn encode_list_column<T: WireScalar>(lists: &[&[T]], out: &mut Vec<u8>) {
 /// skips the `Vec<&[T]>` materialisation step the caller would
 /// otherwise need. H2 in
 /// `ia/reviews/perf_psp_writer_2026-05-13.md`.
-pub fn encode_list_column_csr<T: WireScalar>(
+///
+/// On little-endian targets the per-row body is one
+/// `extend_from_slice` of `bytemuck::cast_slice::<T, u8>(row)` — one
+/// memcpy per row, no per-element `extend_from_slice(&to_le_bytes())`
+/// bookkeeping. The `T: Pod` bound excludes `bool` from this path,
+/// which is fine because the writer's list columns only ever hold
+/// `SlotId = u16` today. (L6.)
+pub fn encode_list_column_csr<T: WireScalar + bytemuck::Pod>(
     data: &[T],
     offsets: &[u32],
     out: &mut Vec<u8>,
@@ -273,6 +280,11 @@ pub fn encode_list_column_csr<T: WireScalar>(
         let b = w[1] as usize;
         let row = &data[a..b];
         encode_u64_leb128(row.len() as u64, out);
+        #[cfg(target_endian = "little")]
+        {
+            out.extend_from_slice(bytemuck::cast_slice::<T, u8>(row));
+        }
+        #[cfg(not(target_endian = "little"))]
         for &v in row.iter() {
             v.encode_le(out);
         }
