@@ -69,6 +69,15 @@ impl<W: Write> PspWriter<W> {
     /// Validate the header, frame it (magic + length prefix + TOML +
     /// sentinel), and write it to `sink`. After this returns, the
     /// writer is ready to accept records.
+    ///
+    /// **Buffering.** Each block flush issues one `write_all` for the
+    /// block header plus one per column payload, and `finish` adds
+    /// one for the index and one for the 32-byte trailer. Against a
+    /// real-file sink each `write_all` becomes one `write(2)`
+    /// syscall. Wrap a `File` in
+    /// `BufWriter::with_capacity(64 * 1024, file)` (or larger) before
+    /// passing it here. In-memory sinks (`io::sink()`,
+    /// `Cursor<Vec<u8>>`) need no wrapper.
     pub fn new(mut sink: W, header: WriterHeader) -> Result<Self, PspWriteError> {
         let header_bytes = build_header_bytes(&header)?;
         sink.write_all(&header_bytes)
@@ -149,6 +158,17 @@ impl<W: Write> PspWriter<W> {
     /// Flush any open block, write the block index, and write the
     /// trailer. Consumes the writer; the returned sink is positioned
     /// at the end of a complete `.psp` file.
+    ///
+    /// **End-of-stage discipline for `BufWriter`-wrapped file sinks.**
+    /// `BufWriter::drop` may swallow flush errors, which for a
+    /// billions-of-records file can silently truncate the trailer.
+    /// The production caller should do, in order:
+    /// ```ignore
+    /// let buf = writer.finish()?;       // PSP-level flush
+    /// let file = buf.into_inner()?;     // surface BufWriter errors
+    /// file.sync_all()?;                 // durability for downstream stages
+    /// ```
+    /// `sync_all` is end-of-stage only — never per-block.
     pub fn finish(mut self) -> Result<W, PspWriteError> {
         if self.block.is_some() {
             self.flush_block()?;
