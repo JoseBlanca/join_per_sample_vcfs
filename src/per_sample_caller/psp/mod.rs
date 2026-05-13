@@ -18,6 +18,7 @@
 //! `PspWriter` / `PspReader` public API land in subsequent slices.
 
 pub mod errors;
+pub mod header;
 pub mod index;
 pub mod registry;
 pub mod trailer;

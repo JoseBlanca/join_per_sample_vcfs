@@ -116,6 +116,86 @@ pub enum PspReadError {
     /// trailer's count is wrong.
     #[error("block index has {got} entries, trailer claims {expected}")]
     IndexEntryCountMismatch { got: usize, expected: u64 },
+
+    /// The first four bytes of the file are not `PSP\n` — either the
+    /// file is not a `.psp` or the head magic is corrupt.
+    #[error("file head magic mismatch: got {got:02x?}, expected {expected:02x?}")]
+    BadHeadMagic { got: [u8; 4], expected: [u8; 4] },
+
+    /// `toml_body_length` (the 8-byte u64 length prefix between the
+    /// magic and the TOML body) is outside the legal `[1, 1048547]`
+    /// range. Validated before any buffer is allocated so a malicious
+    /// or corrupt file cannot drive a large allocation off this
+    /// field.
+    #[error("toml_body_length {got} outside allowed range [{min}, {max}]")]
+    BadHeaderLength { got: u64, min: u64, max: u64 },
+
+    /// The TOML body parsed successfully as TOML but its content
+    /// violates a per-field rule (§"Per-field character set" or a
+    /// schema invariant). `key` names the offending TOML key; `reason`
+    /// is a human-readable explanation of which rule failed.
+    #[error("invalid header field {key:?}: {reason}")]
+    InvalidHeaderField { key: String, reason: String },
+
+    /// The TOML body failed to parse as TOML at all. Wraps the
+    /// underlying `toml::de::Error` so the line/column information
+    /// survives.
+    #[error("TOML header parse failed: {source}")]
+    HeaderToml {
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// The 17 bytes immediately after the TOML body do not equal the
+    /// `---END-HEADER---\n` sentinel. Either the writer is buggy
+    /// (`toml_body_length` and the actual TOML body do not match) or
+    /// the file is corrupt.
+    #[error(
+        "header sentinel mismatch at byte offset {offset}: length prefix and sentinel disagree"
+    )]
+    SentinelMismatch { offset: u64 },
+
+    /// A column declared in the file's `[[column]]` array has
+    /// `required = true` but the reader's column-tag registry does
+    /// not recognise its `name` (or `tag`). The file's contract is
+    /// "this required column must be honoured"; an unknown reader
+    /// must refuse rather than proceed without it.
+    #[error("required column {name:?} (tag {tag:#x}) is not recognised by this reader")]
+    UnknownRequiredColumn { name: String, tag: u16 },
+
+    /// A column the v1.0 registry requires is absent from the file's
+    /// `[[column]]` array.
+    #[error("required column {name:?} (tag {tag:#x}) is missing from the file's [[column]] array")]
+    MissingRequiredColumn { name: String, tag: u16 },
+
+    /// A column whose `name`/`tag` the reader knows disagrees with
+    /// the registry on a structural field (cardinality, shape,
+    /// element-type, length-column, or required). The file claims
+    /// something different from what the spec at its declared
+    /// `format-version` says.
+    #[error(
+        "in-file schema disagrees with v1.0 registry on column {name:?}: {field} = {got:?} (expected {expected:?})"
+    )]
+    SchemaMismatch {
+        name: String,
+        field: &'static str,
+        got: String,
+        expected: String,
+    },
+
+    /// `format-version` is syntactically `MAJOR.MINOR` but the
+    /// declared major version exceeds what this reader supports.
+    /// Hard error — a higher-major reader's content may rest on
+    /// layout assumptions this reader cannot make.
+    #[error(
+        "file was written by format-version {file_major}.{file_minor}; this reader supports up to {reader_major}.{reader_minor}"
+    )]
+    UnsupportedFormatVersion {
+        file_major: u16,
+        file_minor: u16,
+        reader_major: u16,
+        reader_minor: u16,
+    },
 }
 
 /// Errors the `.psp` writer can emit. Variants land as the
@@ -128,4 +208,25 @@ pub enum PspWriteError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A field the writer was about to emit violates one of the spec's
+    /// per-field rules (§"Per-field character set"). Writer-side
+    /// pre-emit validation catches the failure before any byte is
+    /// written.
+    #[error("invalid header field {key:?}: {reason}")]
+    InvalidHeaderField { key: String, reason: String },
+
+    /// The TOML serializer failed (typically because a field cannot be
+    /// represented in TOML at all — should not happen for our schema,
+    /// but the failure surface exists). Carries the underlying
+    /// message as a string because `toml::ser::Error`'s exact type is
+    /// not part of the `toml` crate's public surface.
+    #[error("TOML header serialisation failed: {message}")]
+    HeaderToml { message: String },
+
+    /// The serialised TOML body exceeded the 1 MiB-minus-framing cap
+    /// (or somehow came out empty). Spec §"File header / Layout"
+    /// pins the bounds.
+    #[error("header TOML body length {got} outside allowed range [{min}, {max}]")]
+    HeaderBodyTooLarge { got: u64, min: u64, max: u64 },
 }
