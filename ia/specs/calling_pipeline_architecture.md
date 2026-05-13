@@ -30,11 +30,11 @@ design draws on.
 ## Pipeline overview
 
 ```
-BAM_i  ──► Stage 1: per-sample caller ──► sample_i.psf (Stage 2 format) ┐
+BAM_i  ──► Stage 1: per-sample caller ──► sample_i.psp (Stage 2 format) ┐
                                                                           │
-BAM_j  ──► Stage 1: per-sample caller ──► sample_j.psf (Stage 2 format) ├─► multi-way per-position iterator
+BAM_j  ──► Stage 1: per-sample caller ──► sample_j.psp (Stage 2 format) ├─► multi-way per-position iterator
                                                                           │             │
-BAM_k  ──► Stage 1: per-sample caller ──► sample_k.psf (Stage 2 format) ┘             ▼
+BAM_k  ──► Stage 1: per-sample caller ──► sample_k.psp (Stage 2 format) ┘             ▼
                                                                            Stage 3: DUST filter ◄── reference FASTA
                                                                                         │
                                                                                         ▼
@@ -50,8 +50,8 @@ BAM_k  ──► Stage 1: per-sample caller ──► sample_k.psf (Stage 2 form
 Six stages total:
 
 - **Stage 1 — per-sample caller.** Runs once per sample, reads the BAM,
-  writes one `.psf` (per-sample file) artefact.
-- **Stage 2 — per-sample file contract.** Specifies the `.psf` format
+  writes one `.psp` (per-sample file) artefact.
+- **Stage 2 — per-sample file contract.** Specifies the `.psp` format
   that Stage 1 produces. Not a runtime step — it is the interface
   between the per-sample and cohort sides of the pipeline.
 - **Stage 3 — low-complexity filter.** A streaming per-position filter.
@@ -74,7 +74,7 @@ Six stages total:
   emits the final VCF.
 
 Only Stage 1 touches BAMs. Stages 3–6 operate on the reference FASTA
-and on the `.psf` files alone, which is what makes cohort recall cheap
+and on the `.psp` files alone, which is what makes cohort recall cheap
 and BAM-free. Only Stage 4 is inherently sequential; Stages 1 and 5
 parallelise cleanly (across samples and across groups respectively).
 
@@ -125,13 +125,13 @@ the number came from.
 
 ### Purpose
 
-One BAM → one `.psf`. Encodes everything downstream stages might need to
+One BAM → one `.psp`. Encodes everything downstream stages might need to
 compute a likelihood for this sample against any allele that may later be
 introduced into the merged variant set by other samples.
 
 Stage 1 is built in-tool rather than wrapped around an existing
 per-sample caller (freebayes, bcftools mpileup). The output format
-is the custom `.psf` (see Stage 2), which no existing caller
+is the custom `.psp` (see Stage 2), which no existing caller
 emits; the quality adjustment we want is BAQ applied inline and
 parallelised across reads (see §"Why BAQ in-process" below), which
 `samtools calmd` cannot do in-process; and the per-read likelihood
@@ -164,7 +164,7 @@ an external dependency and an IO round-trip for no saved work.
 4. **Indel alleles are anchored at the position one before the variable
    region** (VCF convention). A deletion is stored as one allele at the
    anchor position; interior positions of the deletion appear in the
-   `.psf` only if they are covered by non-deleting reads. See Stage 2
+   `.psp` only if they are covered by non-deleting reads. See Stage 2
    §"Indel anchoring" for the exact REF/ALT shape.
 5. **Indel BQ proxy.** A deleted base has no sequencing quality of its
    own, so for a supporting read we take the window of `l + 2`
@@ -184,7 +184,7 @@ an external dependency and an IO round-trip for no saved work.
    entry for that position, not filtered out. At low coverage the
    cohort-level signal often lives in these single-read observations.
 7. **Uncovered positions produce no record.** Positions where the
-   sample has zero reads are simply absent from the `.psf`. Records
+   sample has zero reads are simply absent from the `.psp`. Records
    are separated by a `delta_pos` field (distance from the previous
    record), so gaps are represented implicitly and the absence of a
    record unambiguously means "no data."
@@ -336,7 +336,7 @@ We deliberately pick min for three independent reasons:
    per-read scalar that does not slot into a sum without
    carrying the harmonic denominator and the `log(L/l)`
    correction as additional per-allele fields, to undo at
-   merge time. That would inflate the durable `.psf` artefact
+   merge time. That would inflate the durable `.psp` artefact
    with two extra per-allele scalars whose only role is to make
    the freebayes math reconstructible — a real cost for a
    non-default formula.
@@ -356,7 +356,7 @@ We deliberately pick min for three independent reasons:
    adding two new per-allele scalars (a `harmonicSum(l)`
    denominator and a `log(L/l)` adjustment) under the per-block
    column manifest (§"Schema evolution: per-block column
-   manifest"). That is a minor-version bump — old `.psf`
+   manifest"). That is a minor-version bump — old `.psp`
    files keep working with the min-based interpretation, new
    files carry the additional scalars for the harmonic
    reconstruction. No regeneration required.
@@ -385,7 +385,7 @@ walker can prove no future event will touch it.
 **Closure rule.** As the walker advances past position
 `walker`, every open record at position `Q` with current REF
 span `s` and `Q + s ≤ walker` is finalised and emitted to the
-`.psf` writer. The proof of safety: reads arrive
+`.psp` writer. The proof of safety: reads arrive
 coordinate-sorted, so any future read has `alignment_start ≥
 walker + 1`; every event's anchor sits at an `M` position of
 its read, so future event anchors are also `≥ walker + 1`; an
@@ -461,7 +461,7 @@ per-read set — which reads support which alleles at which
 positions — to compute compound extensions and chain ids
 correctly. This state is released as soon as the relevant
 records close. Per-read data does **not** propagate to the
-`.psf`; the on-disk format stores only per-allele scalars and
+`.psp`; the on-disk format stores only per-allele scalars and
 chain ids (Stage 2 §"The five per-allele scalars"). The
 format-level "per-position summary, not per-read" property
 describes the on-disk artefact; Stage 1's runtime keeps the
@@ -486,17 +486,16 @@ section "The data freebayes actually consumes") at constant size in
 depth. Per-read storage would buy flexibility for alternative
 per-read likelihood models (PairHMM-style, novel error models) that
 this pipeline does not plan to support, at a cost linear in coverage
-— a trade we explicitly decline. PSP v1 needs to be revised on
-three axes — the per-allele scalar set, BAQ-adjusted BQ feeding
-the quality scalar, and the per-block column manifest plus
-`(major, minor)` versioning policy from Stage 2 §"Schema evolution:
-per-block column manifest". The five v1 scalars become required
-column tags in that registry; future additions land as optional
-tags.
+— a trade we explicitly decline. PSP v1 carries the per-allele
+scalar set as required `[[column]]` entries in the file-level
+binary schema; future additions land as optional `[[column]]`
+entries under the minor-bump rule. See Stage 2 §"Schema evolution"
+and [per_sample_pileup_format.md](per_sample_pileup_format.md)
+§"File header — binary schema".
 
-## Stage 2 — per-sample file contract (`.psf`)
+## Stage 2 — per-sample file contract (`.psp`)
 
-The `.psf` is a stream of **per-position records**, pileup-style. There
+The `.psp` is a stream of **per-position records**, pileup-style. There
 are no separate record types for variant vs non-variant positions and no
 gVCF-style reference-confidence blocks — every covered position gets
 the same record structure. Uncovered positions produce no record; gaps
@@ -558,7 +557,7 @@ than the BAM's raw BQ. See Stage 1 §"Per-read likelihood quality".
 
 ### Allele and record conventions
 
-A few simple rules make every allele in a `.psf` record
+A few simple rules make every allele in a `.psp` record
 self-describing. Anyone reading the file can identify the type of each
 allele — SNP, deletion, insertion, MNP — from its REF and ALT strings
 alone, without needing any extra type tags or metadata.
@@ -627,7 +626,7 @@ from `len(alleles[0])`.
 
 ### Per-position record layout and compression
 
-The `.psf` is pileup-style: one record per covered reference position.
+The `.psp` is pileup-style: one record per covered reference position.
 This design accepts a larger file per sample than GATK-style gVCF
 blocks in exchange for strictly lossless preservation of per-position
 information — including alt observations supported by even a single
@@ -639,7 +638,7 @@ Four design decisions shape the format:
 
 1. **All observed alleles are kept**, down to single-read support.
    Stage 1 has no "minimum reads per allele" or similar filter —
-   anything the BAM shows, the `.psf` records. At the project's
+   anything the BAM shows, the `.psp` records. At the project's
    target coverage (2–10×) these single-read observations are often
    the only per-sample trace of real cohort-level signal, and the
    decision to accept or reject an allele is deferred entirely to
@@ -653,108 +652,71 @@ Four design decisions shape the format:
    where the record header is comparable in size to the data itself.
    A coarser format for ultra-low-depth regions is a possible future
    optimisation but not needed now.
-4. **Self-describing blocks via a per-block column manifest.** Each
-   compressed block declares which columns it carries. This is what
-   makes the format forward-compatible for future per-allele scalars
-   (e.g. an exact-mixture quality scalar to replace the
-   homogeneous-quality approximation in §"When a read 'not in G'
-   isn't actually an error") without a hard format break. See
-   §"Schema evolution: per-block column manifest" below.
+4. **Self-describing binary body via a file-level schema.** Every
+   `.psp` carries a VCF-style `[[column]]` array in its plain-text
+   TOML header that declares each column's tag, scope, type, and
+   purpose. The per-block manifest references columns by tag and
+   carries only per-block-varying data (compressed/uncompressed
+   sizes). The schema is the file's single source of truth for
+   column semantics, and what makes the format forward-compatible
+   for future per-allele scalars (e.g. an exact-mixture quality
+   scalar to replace the homogeneous-quality approximation in §"When
+   a read 'not in G' isn't actually an error") without a hard format
+   break. See [per_sample_pileup_format.md](per_sample_pileup_format.md)
+   §"File header — binary schema".
 
 Compression, stacked:
 
 - **Implicit position** via `delta_pos` (typically 1 for consecutive
   covered positions).
-- **Columnar storage** within a block of records — each scalar lives
-  in its own column so that adjacent-position similarity compresses
-  well. Columns are listed in the per-block manifest (see below);
-  the manifest entries identify each column by a stable tag from
-  the format's column-tag registry.
+- **Columnar storage** within a block — each scalar lives in its
+  own column so adjacent-position similarity compresses well.
 - **zstd** applied per column inside a block (rather than across
   the block as a whole) so that readers can skip-decompress columns
-  carrying tags they do not understand without parsing them.
-- Optionally, **lossless run-length encoding** for runs of positions
-  whose entire record (alleles + scalars) is bit-identical. These
-  runs are common in uniformly-covered non-variant regions and
-  compress extremely hard. The decompressor expands them back to
-  one record per position — no information is lost.
+  with unknown tags without parsing them.
 
-Note: lossless RLE is *not* a gVCF block. A gVCF block merges adjacent
-positions with *similar* data into a single summary; lossless RLE
-merges adjacent positions with *identical* records and preserves the
-full data on decompression.
+(An earlier draft considered an optional lossless run-length
+encoding for runs of bit-identical records. It is not in v1.0 —
+zstd handles the common case well enough and the extra encoder/
+decoder path is not justified. Revisit only if real-data
+benchmarking shows otherwise.)
 
-### Schema evolution: per-block column manifest
+### Schema evolution
 
-The `.psf` is the durable per-sample artefact behind the project's
+The `.psp` is the durable per-sample artefact behind the project's
 "cohort re-callable without re-doing per-sample work" property
 (constraint 5 at the top of this document). That property fails as
-soon as a schema change forces every existing `.psf` to be
-regenerated. The format therefore commits to a **forward-compatible
-columnar layout** so that minor schema additions (the most common
-kind anticipated — new per-allele scalars, new optional file-header
-fields) cost no per-sample re-runs. Hard breaks are reserved for
-genuine layout changes.
+soon as a schema change forces every existing `.psp` to be
+regenerated. The format therefore commits to a forward-compatible
+schema-evolution policy so that minor schema additions (the common
+case — new per-allele scalars, new header fields) cost no per-sample
+re-runs. Hard breaks are reserved for genuine layout changes.
 
-**Major / minor versioning.** The file header carries a `(major,
-minor)` version pair, not a single version word. Semantic rule:
+**Major / minor versioning.** The file header carries a
+`format-version = "MAJOR.MINOR"` string in TOML. Semantic rule:
 
 - A **major bump** is a breaking layout change (block framing,
   magic, fundamental encoding). Old readers reject; users run a
   migration tool. Reserved for changes that genuinely cannot be
   expressed as additions.
-- A **minor bump** is a forward-compatible addition. Old readers
-  consume new files by ignoring the unknown content; new readers
-  consume old files by substituting documented default values for
-  fields the old file does not carry.
+- A **minor bump** adds only **optional** content (new optional
+  `[[column]]` entries, new optional top-level TOML keys). Older
+  readers consume the file by skipping unknown columns and unknown
+  top-level keys. Promoting an optional column to required is a
+  major bump, not a minor one.
 
 The vast majority of anticipated changes (new optional per-allele
-scalars, new header fields, new bias counters) are minor bumps and
-require no migration of existing `.psf` files.
+scalars, new header keys, new bias counters) are minor bumps and
+require no migration of existing `.psp` files.
 
-**Per-block column manifest.** Each compressed block opens with a
-small manifest listing its columns:
-
-```
-block_header:
-  n_records:    varint
-  n_columns:    varint
-  per column:
-    column_tag:    varint        // stable id from the format's tag registry
-    flags:         u8            // bit 0 = required (reader must understand)
-    byte_length:   varint        // length of this column's compressed payload
-  // columns then concatenated in manifest order, each
-  // independently zstd-compressed (so unknown columns can be
-  // skipped by byte_length without parsing).
-```
-
-Reader rule:
-
-- For each column with `required = 1`: the reader **must**
-  understand the tag, or it fails the file with a clear error.
-  The five v1 per-allele scalars are required tags.
-- For each column with `required = 0`: the reader consumes it if
-  it knows the tag, otherwise skips it by `byte_length`.
-- For each tag the reader expects but the file does not carry:
-  the reader substitutes the documented default for that tag (e.g.
-  for the future exact-mixture quality scalar, the documented
-  default is "fall back to the homogeneous-quality approximation
-  from §'When a read \"not in G\" isn't actually an error'").
-
-A single **column-tag registry** in the byte-layout spec
-([per_sample_pileup_format.md](per_sample_pileup_format.md))
-enumerates every known tag with its type, default value, and
-required/optional flag. This architecture document does not list
-the tags themselves; the registry lives next to the byte layout it
-describes.
-
-**File-header capability list.** The header carries a parallel,
-file-scoped manifest covering optional file-level content
-(future per-sample contamination-estimate seeds, future ploidy
-declarations, etc.). Same tag-and-skip semantics. Required from
-v1 — adding it after the fact would itself be a one-off
-compatibility shim that justifies a major bump. Better to have it
-from day one.
+**The schema-evolution mechanism is in the byte-layout spec.** The
+mechanics — the `[[column]]` array, the column-tag registry, the
+per-block manifest, the "unknown top-level keys are skipped" rule,
+the strict header/binary consistency checks — are defined in
+[per_sample_pileup_format.md](per_sample_pileup_format.md) and not
+duplicated here. That document also carries the canonical column-
+tag registry, the v1.0 schema, and the reader-side validation
+checklist.
 
 **Migration story for the contamination-exact scalar.** Worked
 example for the one schema addition the spec already anticipates
@@ -762,36 +724,28 @@ example for the one schema addition the spec already anticipates
 "a follow-up option — adding one more per-allele scalar that makes
 the mixture reconstruction exact"):
 
-- The byte-layout spec defines a new optional column tag for the
+- The byte-layout spec adds a new optional column tag for the
   exact-mixture scalar. Default = "use the homogeneous-quality
   approximation."
-- The on-disk format goes to `(major, minor) = (1, 1)` for files
+- The on-disk format goes to `format-version = "1.1"` for files
   carrying the new column. v1.0 files do not carry it.
 - v1.1 readers consume both v1.0 and v1.1 files. On v1.0 files
   (or on v1.1 files without the optional tag) they use the
   approximation; on v1.1 files carrying the tag they use the
   exact computation.
-- v1.0 readers cannot consume v1.1 files because they predate the
-  manifest dispatcher entirely. This is the one-time legacy shim
-  paid when manifest-driven dispatch is introduced; subsequent
-  additions are free for forward compat.
+- v1.0 readers consume v1.1 files too: the new column appears in
+  the v1.1 file's `[[column]]` array marked `required = false`,
+  the v1.0 reader doesn't recognise it, and per the binary-schema
+  rule it skips the column. The minor-bump-adds-only-optional
+  rule is what makes this work without a one-time legacy shim.
 
-No `.psf` regeneration is required at any step in this story —
+No `.psp` regeneration is required at any step in this story —
 which is the property the format-evolution policy exists to
 guarantee.
 
-**Cost.** Per-block manifest overhead is ~6–12 bytes per column
-tag (varint + byte_length + flags) plus a small constant per
-block, for sub-0.1% wire overhead at default block sizes.
-Reader complexity is one dispatch table keyed by tag plus a
-skip-unknown loop; writer complexity is committing to a column
-set at block-write time and emitting the manifest. The trade is
-overwhelmingly in favour of the durable artefact property, which
-is what justifies the custom format in the first place.
-
 ### Why custom binary rather than BCF
 
-The `.psf` is an internal pipeline artefact consumed only by
+The `.psp` is an internal pipeline artefact consumed only by
 Stages 3–6 of this tool; no external consumer reads it. That
 removes the main reason to adopt BCF (tool interop), and the data
 shape — per-position pileup records with per-allele scalars and
@@ -807,36 +761,45 @@ Custom binary gives, in exchange for giving up bcftools interop:
   phase chain ids live as first-class fields rather than
   overloaded FORMAT columns;
 - the full compression stack described above (`delta_pos`
-  implicit position, columnar per-block layout, zstd, optional
-  lossless RLE for identical runs) — realistic ~2–3× smaller
-  than an equivalent BCF;
-- **streaming write and streaming read** with no back-patched
-  headers and no CSI index needed (Stages 3–6 scan entire files
-  in order);
+  implicit position, columnar per-block layout, per-column zstd)
+  — realistic ~2–3× smaller than an equivalent BCF;
+- **plain-text TOML header** so any tool with `head` / `cat` /
+  `grep` can read the file's metadata without our software
+  installed — see [per_sample_pileup_format.md](per_sample_pileup_format.md)
+  §"File header";
+- **streaming write and streaming read**: the writer is single-
+  pass (the block index accumulates in memory and is written at
+  the tail), and Stages 3–6 scan the file sequentially with no
+  index needed for the main pipeline;
+- **a coordinate-keyed tail index** for the side cases that *do*
+  want random access (`psp dump chr3:...`, `--region` queries,
+  shard-by-chromosome cohort calls) — atomic with content, no
+  sidecar to lose;
 - **one file per sample as the natural granularity** — which is
   what cheap cohort recall requires, and which BCF tooling is
   not built around (BCF's natural granularity is multi-sample
   cohort files).
 
 The costs are real but bounded: no bcftools interop, a small
-`psf dump` / `psf head` utility for debugging (~a few hundred
-lines), and explicit version management via a magic number +
-`(major, minor)` version pair at the file head. The version
-policy is set out in §"Schema evolution: per-block column
-manifest" above: minor bumps are forward-compatible (old readers
-ignore unknown content; new readers default-fill missing
-content), major bumps require a migration tool, and all schema
-changes are mediated through the per-block column manifest and
-the file-header capability list rather than through silent
-positional reinterpretation.
+`psp dump` / `psp head` utility for debugging (~a few hundred
+lines), and explicit version management via a magic number + a
+`format-version` string in the TOML header. The version policy
+is set out in §"Schema evolution" above: minor bumps are
+forward-compatible by construction (they add only optional
+content; old readers skip unknown columns and unknown header
+keys), and all schema changes are mediated through the file-
+level binary schema rather than through silent positional
+reinterpretation.
 
-The `psf head` and `psf dump` utilities are part of this
-contract: both must surface the manifest contents in
-human-readable form, so that "what columns does this `.psf`
-actually carry, at what version, with what optional features?"
-is answerable without rebuilding the reader.
+The `psp head` and `psp dump` utilities are part of this
+contract: both must surface the header and binary-schema
+contents in human-readable form, so that "what columns does
+this `.psp` actually carry, at what version, with what optional
+features?" is answerable without rebuilding the reader. `psp head`
+in particular is largely a no-op on top of `head file.psp`
+followed by a TOML parser.
 
-A `psf → BCF`/VCF exporter is not planned now. It is a
+A `psp → BCF`/VCF exporter is not planned now. It is a
 straightforward data-shape transformation that can be added as
 its own module if and when an external consumer requires it; no
 design decision here commits us either way.
@@ -869,10 +832,10 @@ in the easy case, where recomputation from scalars is trivially cheap.
 
 The reasons to store PLs that apply to GATK's gVCF do not apply here:
 
-| Possible reason to store PLs | Applies to `.psf`? |
+| Possible reason to store PLs | Applies to `.psp`? |
 |---|---|
 | Locks in calibration if the likelihood formula changes | no — we've committed to freebayes-style; a formula change would be a new file version |
-| BCF / gVCF interoperability | no — `.psf` is a custom format; BCF export is a separate concern |
+| BCF / gVCF interoperability | no — `.psp` is a custom format; BCF export is a separate concern |
 | Saves joint-stage computation | marginally — reconstruction is a sum plus one multinomial call |
 | Supports per-sample analysis standalone | no — a consumer can compute PLs from scalars just as easily |
 | Encodes a formula the scalars cannot | no — scalars are sufficient for freebayes' likelihood |
@@ -908,7 +871,7 @@ most effective simple filter against pipeline false positives.
 
 Stage 3 is **not** a separate pass that produces a mask artefact on
 disk. It is a streaming per-position filter that sits in the iterator
-chain, between the multi-way merge of `.psf` files and the grouping
+chain, between the multi-way merge of `.psp` files and the grouping
 in Stage 4. When the DUST scorer flags a reference position as
 low-complexity, the per-position records at that position are
 silently dropped from the stream — they never reach Stage 4, so no
@@ -918,9 +881,9 @@ record is emitted.
 Conceptually:
 
 ```
-.psf_i ─┐
-.psf_j ─┼─► multi-way per-position iterator ─► [Stage 3 DUST filter] ─► Stage 4 grouping ─► ...
-.psf_k ─┘                                              ▲
+.psp_i ─┐
+.psp_j ─┼─► multi-way per-position iterator ─► [Stage 3 DUST filter] ─► Stage 4 grouping ─► ...
+.psp_k ─┘                                              ▲
                                                        │
                                         reference FASTA ─► DUST scorer
 ```
@@ -943,18 +906,18 @@ these regions, and the cheapest reliable mitigation across the whole
 field is to drop the affected reference positions up front.
 
 Filtering at the iterator level (rather than at Stage 1) keeps the
-per-sample `.psf` files faithful to what the BAM actually showed: the
+per-sample `.psp` files faithful to what the BAM actually showed: the
 filter is a cohort-level policy, not a property of the raw
-observations. The same `.psf` files can be re-run later with a
+observations. The same `.psp` files can be re-run later with a
 different complexity setting — or none at all — without regeneration.
 
 The other reason for keeping the filter out of Stage 1 is that
 pushing it in would not actually save meaningful disk space.
 Low-complexity regions are typically short stretches (usually tens to
 a few hundred bp each) and account for a small fraction of the total
-reference. Dropping them at `.psf`-write time would shrink per-sample
+reference. Dropping them at `.psp`-write time would shrink per-sample
 files only marginally, and in exchange we would be committing every
-`.psf` to a single DUST threshold chosen at the time of writing.
+`.psp` to a single DUST threshold chosen at the time of writing.
 That trade — small space saving in exchange for locking in one
 complexity parameter forever — is clearly not worth it, so the
 filter lives at Stage 3 where the threshold can be revisited freely.
@@ -1010,7 +973,7 @@ user must have asked for it.
 
 ### What the filter does *not* do
 
-- It does not modify `.psf` files. Those remain faithful records of
+- It does not modify `.psp` files. Those remain faithful records of
   what the BAM showed.
 - It does not adjust per-read qualities. BAQ and the `max(ln_BQ,
   ln_MQ)` scalar remain responsible for per-base confidence.
@@ -1053,7 +1016,7 @@ one. Most of the genome falls in this category.
 An `OverlappingVarGroup` contains:
 
 - the group's chromosome and `[start, end]` range
-- every `.psf` per-position record from every sample that falls in
+- every `.psp` per-position record from every sample that falls in
   that range
 - the per-allele scalars and phase chain ids from those records,
   carried through verbatim
@@ -1083,7 +1046,7 @@ few hundred bp, rarely more). It does not buffer the whole cohort.
 The implementation is conceptually similar to the existing
 [`VariantGroupIterator`](../../src/variant_grouping.rs) —
 multi-way-merging the per-sample streams and accumulating records into
-a group until the group closes — now operating on `.psf` input and on
+a group until the group closes — now operating on `.psp` input and on
 the filtered per-position stream produced by Stage 3.
 
 ## Stage 5 — per-group processing
@@ -1231,7 +1194,7 @@ multinomial is not multiplied by a zero expected probability.
 
 #### The error-cost term: `Σ_{a ∉ G} S_a`
 
-`S_a` is the per-allele quality scalar stored in the `.psf` for
+`S_a` is the per-allele quality scalar stored in the `.psp` for
 sample `s`:
 
 ```
@@ -1400,7 +1363,7 @@ the **homogeneous-quality approximation**: all reads supporting
 allele `a` are treated as sharing the mean quality
 `S_a / count_a`, so the mixture is evaluated once per
 (sample, allele) and multiplied by `count_a`. No extra scalar is
-added to the `.psf`.
+added to the `.psp`.
 
 The approximation is exact when all reads supporting `a` happen
 to have identical quality, and degrades as per-read qualities
@@ -1410,9 +1373,8 @@ per-read log and the approximation stays tight. A follow-up
 option — adding one more per-allele scalar that makes the
 mixture reconstruction exact — is deferred until we see
 approximation error in practice; the format's
-forward-compatibility hatch (Stage 2 §"Schema evolution:
-per-block column manifest") makes this a minor schema bump
-rather than a hard break.
+forward-compatibility hatch (Stage 2 §"Schema evolution") makes
+this a minor schema bump rather than a hard break.
 
 **Scope and complementary tools.** The mixture model addresses
 **low-level (~1–10 %) cross-contamination within a declared
@@ -1505,7 +1467,7 @@ error-cost term and on the cohort-level prior to tell genotypes
 apart — one of the main reasons joint calling across many samples
 adds value over per-sample calling.
 
-#### Why the five `.psf` scalars are enough
+#### Why the five `.psp` scalars are enough
 
 | Scalar | Role |
 |---|---|
@@ -1528,7 +1490,7 @@ nonlinear and has to be applied **per read** before summing. See
 
 #### Alleles the sample never locally observed
 
-A sample's `.psf` lists only alleles its own reads support. At the
+A sample's `.psp` lists only alleles its own reads support. At the
 cohort level, the merged genotype `G` for sample `s` may include an
 allele `x` that `s` never observed — e.g. another sample
 contributed a novel ALT. The formula handles this automatically:
@@ -1553,7 +1515,7 @@ allele that is itself a combination of per-position variants
 co-occurring on the same haplotype (e.g. "SNP at 101 + deletion
 spanning 102–105" on one chromosome).
 
-A per-position `.psf` record stores evidence for each variant
+A per-position `.psp` record stores evidence for each variant
 separately, but a compound is only "present" in sample `s` if `s`'s
 reads carry the pieces *together*, on the same read or read pair.
 Stage 1 therefore records a **phase chain identifier** on each
@@ -1757,7 +1719,7 @@ there:
   least one sample.
 
 The observation-bias priors use the three bias scalars from the
-`.psf`. Conceptually: a candidate whose alt-supporting reads are
+`.psp`. Conceptually: a candidate whose alt-supporting reads are
 all on one strand, or bunched at one end of the fragment, is more
 likely to be a systematic artefact than a real variant, so its
 posterior is down-weighted. Structural form as in
@@ -1809,7 +1771,7 @@ sequential but are cheap relative to Stage 5's per-group work.
 
 The pipeline does not tile the genome into chunks for internal
 parallelism. The iterator chain already bounds memory at every
-stage: per-sample `.psf` readers hold one decompressed block each;
+stage: per-sample `.psp` readers hold one decompressed block each;
 the multi-way merger holds one next-record slot per sample
 (O(N_samples) × ~50 B); Stage 4 holds the currently-open group
 (a few hundred bp × cohort-wide records); Stage 5 holds only the
@@ -1822,14 +1784,14 @@ current requirements:
 
 - **Distribution across a cluster.** Achievable externally by
   invoking the tool per chromosomal region — every node needs
-  only the same `.psf` files and reference, which are already
+  only the same `.psp` files and reference, which are already
   distributable.
 - **Region-selective re-processing** after adding samples. Same
   external-invocation story.
 
 Both scenarios additionally require random-access seek into each
-`.psf` (a sidecar index with file offsets per chromosomal chunk),
-which contradicts the streaming-only posture of the `.psf` format
+`.psp` (a sidecar index with file offsets per chromosomal chunk),
+which contradicts the streaming-only posture of the `.psp` format
 (see Stage 2 §"Why custom binary rather than BCF"). If a real
 in-tool need later emerges — e.g. a cluster-native deployment
 that wants a single invocation across many nodes — the index
@@ -1843,7 +1805,7 @@ This is conceptually the same algorithm as
 [`create_variant_for_region`](../../src/genotype_merging.rs#L20),
 generalised to:
 
-- operate on `.psf` per-position records rather than parsed gVCF rows
+- operate on `.psp` per-position records rather than parsed gVCF rows
 - use the five per-allele scalars to reconstruct likelihoods, rather
   than relying on carried-over PLs
 - reason about compound haplotypes via phase chain ids
@@ -2078,29 +2040,25 @@ every record it does emit.
   intended replacement; the current spec will need to be rewritten or
   retired once this design is firm.
 - [per_sample_pileup_format.md](per_sample_pileup_format.md) is the
-  PSP v1 binary format draft. This architecture promotes it to the
-  **authoritative byte-layout specification** for the `.psf`: the
-  architecture document above describes the format's *contract*
-  (record contents, allele conventions, compression strategy,
-  schema-evolution policy) but defers the on-disk byte layout —
-  including the column-tag registry referenced in §"Schema
-  evolution: per-block column manifest" — to PSP v1. PSP v1 needs to
-  be revised on three axes:
-  - per-read 3-byte records are replaced by per-allele scalar
-    summaries (observation count, `Σ max(ln_BQ, ln_MQ)`,
-    forward-strand count, placed-left count, placed-start count);
+  **authoritative byte-layout specification** for the `.psp`: this
+  architecture document describes the format's *contract* (record
+  contents, allele conventions, compression strategy, schema-
+  evolution policy) and defers the on-disk byte layout — TOML
+  header framing, the column-tag registry, varint encoding, block
+  framing, the tail index, the trailer — to that spec. Concretely:
+  - per-allele scalars (observation count, `Σ max(ln_BQ, ln_MQ)`,
+    forward-strand count, placed-left count, placed-start count)
+    are required `[[column]]` entries in the file-level binary
+    schema; future additions (e.g. an exact-mixture quality scalar)
+    become optional `[[column]]` entries under the minor-bump rule;
   - the BAQ-adjusted base qualities (Stage 1 §"Per-read likelihood
     quality") are the BQ values that feed `Σ max(ln_BQ, ln_MQ)`;
-  - the layout adopts the per-block column manifest, the
-    `(major, minor)` version pair, the file-header capability
-    list, and the column-tag registry described in §"Schema
-    evolution: per-block column manifest" above. Each of the five
-    per-allele scalars becomes a required column tag; future
-    additions (e.g. an exact-mixture quality scalar) become
-    optional column tags with a documented default.
+  - the file header is plain-text TOML, versioned via a
+    `format-version = "MAJOR.MINOR"` string; minor bumps add only
+    optional content.
 - [genotype_joining_specification.md](genotype_joining_specification.md)
   documents the current allele-joining algorithm. The merge step in this
-  architecture generalises that algorithm to operate on `.psf` instead of
+  architecture generalises that algorithm to operate on `.psp` instead of
   gVCF; most of the algorithmic content carries over.
 - [posterior_gt_probs.md](posterior_gt_probs.md) and
   [freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md)

@@ -280,10 +280,10 @@ posterior.
 
 This is the structural reason freebayes has no need for something
 like a phase chain id in its output. Our pipeline, in contrast,
-splits the work into a per-sample artefact (the `.psf`) and a
+splits the work into a per-sample artefact (the `.psp`) and a
 later joint stage that can be re-run cheaply across many cohort
 calls. The per-read linkage that freebayes computes-and-throws-away
-has to survive in the `.psf` for Stage 5 to consult — which is the
+has to survive in the `.psp` for Stage 5 to consult — which is the
 job phase chain ids exist to do.
 
 ## 4. Why we adopt none of the obvious alternatives as-is
@@ -659,7 +659,7 @@ positions are in the same phase set.
 | Linkage source | "Variants on the same assembled haplotype" | "Alleles co-observed on the same read within the window" (per-read backpointer `readID` on each `Allele`) | "Observations from the same physical molecule" |
 | Requires direct read overlap | No (assembly can bridge gaps) | Yes (only what reads see in the window) | Yes (chain ends when the read ends) |
 | Tells you which chromosome (mat/pat) | Yes (`0\|1` vs `1\|0` via PGT) | No | No |
-| Persistence in output | Yes (PID/PGT/PS in the VCF) | No (used only during calling, then discarded) | Yes (slot ids + lifecycle markers in the `.psf`) |
+| Persistence in output | Yes (PID/PGT/PS in the VCF) | No (used only during calling, then discarded) | Yes (slot ids + lifecycle markers in the `.psp`) |
 | Cost per locus | Heavy: PairHMM × #reads × #haplotypes | Light-medium: enumeration + per-window likelihood | Light: small slot table, integer comparisons |
 | Behaviour at 2-10× coverage | Unreliable; assembly under-powered | Works | Works |
 | Implementation size | ~thousands of lines (de Bruijn + PairHMM) | ~hundreds of lines (the relevant linkage parts) | ~hundreds of lines (active set + slot allocator) |
@@ -679,7 +679,7 @@ trade profiles:
   joint stage.
 - **Our slot id** keeps freebayes' direct per-read approach but
   makes it *persistent* and read-scoped (not window-scoped) so the
-  linkage survives in the `.psf` for Stage 5 to consult, without
+  linkage survives in the `.psp` for Stage 5 to consult, without
   paying anything close to assembly cost.
 
 For the project's coverage target, scale, and split-stage

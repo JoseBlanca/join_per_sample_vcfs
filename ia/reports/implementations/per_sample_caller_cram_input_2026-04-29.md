@@ -12,7 +12,7 @@ First slice of Stage 1 of the multi-sample calling pipeline:
 turning N coordinate-sorted CRAMs + an indexed reference FASTA into a
 single coordinate-sorted stream of `MappedRead`s, with the cheap
 per-read filter cascade applied along the way. No BAQ, no pileup
-walker, no allele extraction, no `.psf` writing — those are later
+walker, no allele extraction, no `.psp` writing — those are later
 slices.
 
 The slice ships `CramMergedReader` with two constructors that match
@@ -198,7 +198,7 @@ and panics if absent — unchanged by this slice.
 - **Stage 1 orchestrator.** `per_sample_caller/mod.rs` is currently
   a pub-mod-only file. The CLI entry, anyhow-context-wrapped error
   flow, and downstream slice wiring (`baq.rs`, `pileup_walker.rs`,
-  `phase_chain.rs`, `psf_writer.rs`) are all separate slices.
+  `phase_chain.rs`, `psp_writer.rs`) are all separate slices.
 
 ## Files touched
 

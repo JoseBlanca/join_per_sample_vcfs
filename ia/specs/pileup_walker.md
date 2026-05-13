@@ -53,7 +53,7 @@ Outside this scope:
   ([per_sample_caller.md §"Read filters"](per_sample_caller.md)).
 - BAQ HMM — runs upstream alongside filtering. The walker only
   ever sees BAQ-capped base qualities. BAQ is its own spec.
-- Byte-level encoding to disk — Stage 2 (`psf_writer`).
+- Byte-level encoding to disk — Stage 2 (`psp_writer`).
 
 ## Input interface
 

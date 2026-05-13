@@ -8,7 +8,7 @@
 //! `ia/specs/per_sample_caller.md` §"Read filters".
 //!
 //! Downstream stages (BAQ, pileup walking, allele extraction, phase
-//! chains, `.psf` writing) are separate slices and live in sibling
+//! chains, `.psp` writing) are separate slices and live in sibling
 //! modules.
 
 pub mod baq;

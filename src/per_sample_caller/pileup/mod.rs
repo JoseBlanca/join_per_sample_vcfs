@@ -1,6 +1,6 @@
 //! Stage 1's sequential pileup walker — turns a coordinate-sorted
 //! stream of prepared (filtered + BAQ-adjusted) reads into the
-//! per-position records that Stage 2 encodes to the `.psf` file.
+//! per-position records that Stage 2 encodes to the `.psp` file.
 //!
 //! See `ia/specs/pileup_walker.md` for the implementation-ready
 //! specification. This module ships the public types

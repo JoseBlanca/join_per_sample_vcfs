@@ -10,7 +10,7 @@ This slice covers header validation, decoding, the peek-and-scan
 merge, and the per-read filter cascade from spec §"Read filters" —
 all the cheap rejection-based filters that decide which reads enter
 the pipeline. It does *not* include BAQ, the pileup walker, phase
-chains, or `.psf` writing — those are separate slices.
+chains, or `.psp` writing — those are separate slices.
 
 ## Scope
 
@@ -49,7 +49,7 @@ What it does **not** include:
 - BAQ.
 - Pileup walking, allele extraction, scalar accumulation.
 - Phase-chain slot allocation.
-- `.psf` writing.
+- `.psp` writing.
 - Parallel decoder threads (deferred per spec §Parallelism — start
   single-threaded, thread later behind the same iterator API).
 - `--region` / `.crai`-driven seeking (no-`--region` streaming path

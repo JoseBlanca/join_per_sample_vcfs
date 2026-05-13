@@ -382,7 +382,7 @@ The rationale is that under freebayes-style likelihood computation, the
 PL values are *exactly derivable* from the scalars — they are a
 pre-computed projection of the same information, not an independent
 quantity. GATK has to store PL because its gVCF is PL-centric: there
-is no other stored per-sample evidence. Our `.psf` stores the
+is no other stored per-sample evidence. Our `.psp` stores the
 observation summary directly, which is strictly more information (it
 can be used to compute a likelihood against *any* allele, not just the
 sample-local set or the `<NON_REF>` catch-all), so adding PLs on top
@@ -394,7 +394,7 @@ samples — and generalise it: the same scalars support compound
 haplotype allele merging, which `<NON_REF>` alone cannot.
 
 In short: **GATK's gVCF stores PL as the per-sample summary;
-freebayes' VCF emits GL as an output only; our `.psf` stores the
+freebayes' VCF emits GL as an output only; our `.psp` stores the
 observation scalars, from which any PL can be reconstructed on demand.**
 
 ## Scaling
@@ -448,8 +448,8 @@ detail:
 | Design aspect | Choice | Rationale |
 |---|---|---|
 | Pipeline topology | split per-sample / joint, like GATK | scales to thousands |
-| Per-sample artefact | custom `.psf` with the five per-allele scalars freebayes needs | enables freebayes-equivalent likelihoods at joint time without BAM re-read |
-| Allele representation in `.psf` | haplotype-level, with anchor positions (Open decision 2) | lets the merger reconstruct compound alleles across samples |
+| Per-sample artefact | custom `.psp` with the five per-allele scalars freebayes needs | enables freebayes-equivalent likelihoods at joint time without BAM re-read |
+| Allele representation in `.psp` | haplotype-level, with anchor positions (Open decision 2) | lets the merger reconstruct compound alleles across samples |
 | Merge vs. join | **merge** — compound haplotype alleles assembled across samples | addresses GATK's main limitation |
 | Per-sample likelihood model | freebayes-style (max(ln_BQ, ln_MQ) per read, pre-summed) | simpler than PairHMM; sufficient for our target data; flexible upgrade path |
 | Joint chicken-and-egg breaker | EM (GATK-style) | linear scaling beats combo-search at 1000+ samples |

@@ -19,14 +19,14 @@ One Stage 1 invocation processes **one sample** end to end:
 
 ```
 sample.cram ───┐
-sample.cram ───┼──► Stage 1 per-sample caller ──► sample.psf
+sample.cram ───┼──► Stage 1 per-sample caller ──► sample.psp
 sample.cram ───┘
                   reference.fasta (+ .fai)
 ```
 
 Inputs are one or more **coordinate-sorted CRAM files belonging to the
 same biological sample** plus the reference FASTA the CRAMs were
-aligned against. Output is a single `.psf` artefact (Stage 2 format)
+aligned against. Output is a single `.psp` artefact (Stage 2 format)
 that downstream stages can read as a stream of per-position records
 without ever touching CRAM again.
 
@@ -39,7 +39,7 @@ What Stage 1 does *not* do, by design:
   ratio, no thresholding of any kind beyond per-read filters listed
   below).
 - It does not consult any other sample's data.
-- It does not build a `.psf` index. Records are written in coordinate
+- It does not build a `.psp` index. Records are written in coordinate
   order and the file is consumed sequentially by Stage 3.
 
 ## Inputs
@@ -717,7 +717,7 @@ Sketch:
 ```
 caller per-sample \
     --reference ref.fa \
-    --output sample.psf \
+    --output sample.psp \
     [--threads N] \
     [--min-mapq 20] \
     [--max-depth INT] \
@@ -751,7 +751,7 @@ src/
     allele_support.rs   — per-allele AlleleSupportStats accumulation
     phase_chain.rs      — slot allocator/recycler + per-read tagging
                           + new/expired marker emission
-    psf_writer.rs       — Stage 2 encoder (separate spec)
+    psp_writer.rs       — Stage 2 encoder (separate spec)
 ```
 
-The `psf_writer.rs` module is sized by Stage 2's spec, not this one.
+The `psp_writer.rs` module is sized by Stage 2's spec, not this one.

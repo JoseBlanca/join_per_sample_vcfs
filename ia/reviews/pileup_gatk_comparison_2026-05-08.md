@@ -140,7 +140,7 @@ them while acting on the findings below.
   ([calling_pipeline_architecture.md §"The five per-allele
   scalars"](../specs/calling_pipeline_architecture.md)), so
   Stage 5 reconstructs likelihoods without re-iterating
-  per-read state. The right choice for the `.psf` artefact
+  per-read state. The right choice for the `.psp` artefact
   shape; don't regress to per-read storage.
 
 - **`A4` — Emit at every covered position natively.**
@@ -152,7 +152,7 @@ them while acting on the findings below.
   `PileupRecord` for every covered position unconditionally
   ([calling_pipeline_architecture.md §"Stage 1 — per-sample
   caller"](../specs/calling_pipeline_architecture.md)), which
-  is what the `.psf`'s `delta_pos` encoding expects.
+  is what the `.psp`'s `delta_pos` encoding expects.
   Native fit; don't regress.
 
 ## 4. Findings — backlog to act on
@@ -351,7 +351,7 @@ For the record, so we don't relitigate them:
   ([line 322-324](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/locusiterator/LocusIteratorByState.java#L322-L324))
   yields no `AlignmentContext` for empty positions; getting
   every covered position requires wrapping with
-  `IntervalAlignmentContextIterator`. Our `.psf` requires
+  `IntervalAlignmentContextIterator`. Our `.psp` requires
   every covered position natively (the `delta_pos` encoding
   in [Stage 2](../specs/calling_pipeline_architecture.md)
   represents gaps implicitly, but only by counting positions
@@ -450,7 +450,7 @@ active region instead. The pileup layer is therefore an
 ancillary tool's data structure, not the artefact the calling
 pipeline rests on.
 
-**Our pileup *is* the artefact.** The `.psf` is the durable
+**Our pileup *is* the artefact.** The `.psp` is the durable
 per-sample output, written to disk and consumed by every
 downstream stage without re-touching the BAM. Per-allele
 scalars are pre-aggregated because Stage 5 reconstructs
@@ -487,7 +487,7 @@ that serve a contract we don't share.
 
 The single place where GATK's design *would* be a better fit
 than ours is if we ever decided to emit only per-variant
-positions to disk (giving up the lossless `.psf`). That
+positions to disk (giving up the lossless `.psp`). That
 decision rests on the cohort-recall property the architecture
 spec commits to in
 [constraint 5](../specs/calling_pipeline_architecture.md), so

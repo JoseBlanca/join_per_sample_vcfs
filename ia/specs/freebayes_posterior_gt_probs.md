@@ -777,7 +777,7 @@ granularity, every piece of per-sample / per-allele / per-read quantity
 that freebayes reads out of the BAMs and flows into the posterior
 calculation. If you wanted to reproduce freebayes' answer without
 re-reading BAMs — for example, by caching a per-sample summary file like
-the `.psf` proposed in
+the `.psp` proposed in
 [calling_pipeline_architecture.md](calling_pipeline_architecture.md) — this
 is the list of quantities that summary must either store directly or be
 able to reconstruct.
@@ -841,7 +841,7 @@ maintains, per candidate allele in the combo:
 If you have per-sample, per-allele observation summaries with these
 counts, you can reconstruct the combo-level `AlleleCounter` fields by
 summing across samples — no BAM re-read required. This is exactly why
-the `.psf` contract proposes storing strand, placement, and start counts
+the `.psp` contract proposes storing strand, placement, and start counts
 per allele per sample.
 
 Derived combo-level quantities (computed from the above, not stored):
@@ -869,7 +869,7 @@ Derived combo-level quantities (computed from the above, not stored):
 
 ### What freebayes does *not* use
 
-Worth explicitly listing, because it prunes the `.psf` contract:
+Worth explicitly listing, because it prunes the `.psp` contract:
 
 - Read sequence outside the haplotype window — only the allele
   assignment + qualities matter.

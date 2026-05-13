@@ -460,9 +460,9 @@ Reasons for fixtures-not-FFI:
 - Run the full pileup test suite. The walker's tests are
   byte-identical because they construct `PreparedRead`s directly
   with explicit `bq_baq` values — they do not go through BAQ.
-- The end-to-end test (CRAM → `.psf`) will produce *different*
+- The end-to-end test (CRAM → `.psp`) will produce *different*
   output than today, because today's pipeline passes raw BQ
-  through. The committed `.psf` golden file for the existing
+  through. The committed `.psp` golden file for the existing
   end-to-end test needs to be regenerated; commit the new file
   in the same commit as the integration.
 
@@ -494,7 +494,7 @@ Reasons for fixtures-not-FFI:
   must pass unchanged. It does not exercise BAQ — it constructs
   `PreparedRead`s with explicit `bq_baq` — so any test breakage
   is a sign of a regression in the walker, not BAQ.
-- **End-to-end (commit 3).** Re-record the existing CRAM → `.psf`
+- **End-to-end (commit 3).** Re-record the existing CRAM → `.psp`
   golden output with BAQ on. Diff against the pre-BAQ output and
   spot-check: BAQ should drop BQ around indels and keep BQ
   elsewhere. Commit the new golden file.

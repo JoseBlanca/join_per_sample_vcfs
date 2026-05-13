@@ -1,222 +1,1135 @@
-# Per-Sample Pileup (PSP) — Binary Format Specification
+# `.psp` — Per-Sample Pileup: byte-layout specification
 
-**Status:** Draft derived from the 2026-04-21 design discussion.
-This draft should be completely reconsidered once we decide which data we need to calculate the genotype posterior probabilities.
+**Status:** Design closed, 2026-05-13. Ready for implementation; v1.0
+to be ratified by the first round-trip test. Replaces the 2026-04-21
+PSP draft.
 
-## Purpose
+This document specifies the **on-disk byte layout** of the `.psp`
+(per-sample pileup) artefact — the file Stage 1 of the calling pipeline
+writes per sample, and that Stages 3–6 read back without ever
+revisiting the CRAM. It is the byte-level companion to the architecture
+document's Stage 2 section. The artefact's high-level shape:
 
-Defines the on-disk format produced by Stage 1 of the SNP calling pipeline (see `snp_calling_from_bam.md`). One PSP file per sample caches the candidate sites and per-read evidence extracted from a single BAM so that cohort-level variant calling can be re-run without revisiting the BAM.
+- per-position records (no variant / non-variant distinction);
+- five per-allele scalars (observation count, `Σ max(ln_BQ, ln_MQ)`,
+  forward-strand count, placed-left count, placed-start count);
+- phase chain slot ids with `new_chains` / `expired_chains` lifecycle
+  markers per record;
+- columnar storage within zstd-compressed blocks;
+- a mandatory tail-mounted **block index**;
+- a plain-text **TOML file header** framed by a `PSP\n` magic and a
+  `---END-HEADER---\n` sentinel — any tool with `head` / `cat` /
+  `grep` or a TOML parser can inspect file metadata without our
+  software installed;
+- a **VCF-style binary schema** carried in the TOML header as a
+  `[[column]]` array — the binary body is self-describing;
+- `(major, minor)` versioning, with the rule that minor bumps add
+  only optional content.
 
-## Design goals
+What is fixed by other specs is referenced here, not re-derived. What
+this document fixes for the first time: exact byte widths, varint
+encoding, the column-tag registry, the per-record / per-allele wire
+shape inside a block, and the file trailer. The reasoning behind
+each major decision lives in the "Design decisions log" appendix at
+the end.
 
-- Compact on low-coverage data. Typical target: 2–10× per sample.
-- Streamable sequentially — the common cohort-call pattern walks the whole genome in chrom/pos order.
-- Seekable by genomic region for parallelism and `--chroms` filtering.
-- Schema-versioned so new fields can be added without silently breaking old files.
-- Written once per sample, read many times.
+## Cross-references
 
-## Scope
+- [calling_pipeline_architecture.md](calling_pipeline_architecture.md) §"Stage 2 — per-sample file contract" — high-level record shape, rationale for scalars and phase chains, schema-evolution policy.
+- [per_sample_caller.md](per_sample_caller.md) — Stage 1, the producer. Defines what the writer puts into every column.
+- [freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md) — semantics of the five scalars.
 
-In scope: site-level and per-read evidence needed for downstream genotype likelihoods, standard GATK-style rank-sum filters (MQRankSum, ReadPosRankSum, BaseQRankSum), strand bias filters, and cross-sample allele merging.
+## Encoding conventions
 
-Out of scope for v1: haplotype blocks, long-read phase, per-read linkage tags.
+The file has two regions with different encoding rules: a plain-text
+**header** that can be inspected with `head` / `cat` / `grep` / any
+TOML parser, followed by a **binary body** of zstd-compressed
+columnar blocks plus index plus trailer.
 
-## Data model
+### Header (plain-text TOML)
 
-Granularity is three nested levels: site → allele → read.
+| Convention | Choice |
+|---|---|
+| Format | [TOML v1.0.0](https://toml.io/en/v1.0.0). |
+| Character set | 7-bit US-ASCII for every value in v1.0. UTF-8 is reserved for description-type fields added in future minor bumps (mirroring SAM v1.6's "ASCII by default, UTF-8 only in specific named fields"). |
+| Line terminator | LF only (`\n`, `0x0A`). No CR, no CRLF. |
+| String quoting | Basic strings (`"..."`). Literal strings (`'...'`) are accepted on read but writers emit basic strings for consistency. |
+| Numbers | Decimal integers and TOML's offset date-time for timestamps. |
 
-The format stores only independent data — anything derivable from the per-read records (depth, strand counts, sum of MQ², RMS MQ, etc.) is computed on read, not stored. At the project's target coverage, iterating reads is cheap and downstream stages already iterate them for likelihood computation.
+#### Per-field character set
 
-### Site-level fields
+Per-field rules follow SAM v1.6 §1.2.1 wherever the field has a SAM
+analogue. SAM's global rule is "7-bit US-ASCII except in specific
+named fields"; we adopt the same posture.
 
-One record per candidate site.
+| TOML key | Allowed character set | SAM analogue |
+|---|---|---|
+| `format-version` | `[0-9.]+` matching `[0-9]+\.[0-9]+` | n/a |
+| `sample` | ASCII printable (`[ -~]+`) | `@RG SM` |
+| `reference` | ASCII printable (`[ -~]+`) | filenames are ASCII in our domain |
+| `reference-md5` | exactly 32 lowercase hex characters | `@SQ M5` (SAM §1.3.2) |
+| `created` | TOML offset date-time (all ASCII) | n/a |
+| `chromosome.name` | SAM `@SQ SN` regex: `[0-9A-Za-z!#$%&+./:;?@^_|~-][0-9A-Za-z!#$%&*+./:;=?@^_|~-]*` | `@SQ SN` |
+| `chromosome.length` | positive integer in `[1, 2^31 − 1]` | `@SQ LN` |
+| `writer.tool`, `writer.version`, `writer.subcommand` | ASCII printable (`[ -~]+`); no `/`, `\` | n/a (`@PG PN`/`VN` analogue) |
+| `writer.input-crams[*]`, `writer.input-fasta` | ASCII printable filename (`[ -~]+`), no `/` or `\` — recorded as **basename only** to avoid leaking host paths (see §"File header — provenance and path stripping") | n/a |
+| `writer.parameters.<key>` | TOML bare key for `<key>` (`[A-Za-z0-9_-]+`); value type and range defined per parameter in the producer's config struct | n/a |
+| `column.name` | lowercase kebab-case ASCII (`[a-z][a-z0-9-]*`) | n/a — matches the column-tag registry |
+| `column.cardinality` | enum: `per-record` \| `per-allele` | n/a |
+| `column.shape` | enum: `scalar` \| `list` \| `bytes` | n/a |
+| `column.element-type` | enum: `u8`, `u16`, `u32`, `u64`, `i32`, `i64`, `f32`, `f64`, `varint`, `svarint`, `bool` | n/a |
+| `column.length-column` | the `name` of another column (lowercase kebab-case ASCII) | n/a |
+| `column.required` | bool | n/a |
+| `column.description` | ASCII printable; canonical text reproduced verbatim from the spec for the matching `tag` | n/a |
+| (future) `description`, `notes` | UTF-8 allowed | `@SQ DS`, `@PG DS`, `@CO` |
 
-| Field      | Type      | Notes                                                                         |
-|------------|-----------|-------------------------------------------------------------------------------|
-| chrom_id   | u32       | Index into the file header's chromosome table.                                |
-| pos        | u32       | 1-based reference start of the site's ref allele.                             |
-| ref_allele | var-len   | 1-byte length prefix + sequence bytes. One base for SNPs, longer for indel-extended refs. |
-| n_alleles  | u8        | Number of per-allele records that follow.                                     |
+The producer validates every value against its rule before writing;
+the consumer validates on parse. Non-conforming values are a hard
+error (`design_principles.md` §"Errors must not pass silently").
 
-Pre-filter depth and filter-reason counters are deliberately not stored. Dropped reads (duplicates, low-MAPQ, secondary, etc.) are not recoverable from the file, but none of the calling stages use that information. If QC reporting later needs pre-filter counts, it can be added behind a feature flag without a breaking version bump.
+### Body (binary)
 
-### Per-allele fields
+Everything from the byte after the header sentinel through the last
+byte of the trailer is binary, with these conventions:
 
-One entry per observed allele at the site. The first entry is always the reference allele (including when no read supports a variant).
+| Convention | Choice |
+|---|---|
+| Endianness | Little-endian for every fixed-width integer and float. |
+| Integer widths | `u8`, `u16`, `u32`, `u64` denote unsigned 1/2/4/8-byte little-endian integers; same with `i…` for signed. |
+| Float widths | `f32` is IEEE-754 binary32 little-endian; `f64` is binary64. |
+| Variable-length unsigned ints (`varint`) | Unsigned LEB128: 7 data bits per byte, MSB set on continuation. Max width capped at 10 bytes (covers `u64`). |
+| Variable-length signed ints (`svarint`) | Zig-zag encoded into LEB128 (`(n << 1) ^ (n >> 63)` then unsigned LEB128). Only used where signed deltas appear. |
+| Allele sequence | ASCII bytes over `{A, C, G, T, N}`, uppercase. zstd absorbs the run-of-`A`/`C`/`G`/`T` redundancy; a packed encoding is not pursued. |
+| Boolean | Single `u8`: `0` for false, `1` for true; other values are an error. |
 
-| Field      | Type     | Notes                                                                      |
-|------------|----------|----------------------------------------------------------------------------|
-| allele_seq | var-len  | 1-byte length prefix + sequence bytes.                                     |
-| ref_span   | u8       | Reference bases consumed by this allele (≥ 1).                             |
-| n_reads    | u16      | Number of per-read records that follow.                                    |
+Files use the file extension `.psp` (per-sample pileup). The format is
+not gzip-wrapped at the outer level; zstd compression happens only
+within block column payloads (§Block layout).
 
-Strand counts (fwd/rev), allele depth, and other per-allele summaries are computed from the per-read records on read. Partial-span reads, if tracked separately, would be a format extension — see open decisions.
-
-### Per-read fields
-
-One 3-byte packed record per read supporting this allele:
-
-| Byte | Bits | Field         | Notes                                                 |
-|------|------|---------------|-------------------------------------------------------|
-| 0    | 8    | BQ            | Base quality at the site (Phred 0–93).                |
-| 1    | 8    | MQ            | Read mapping quality (Phred; usually 0–60).           |
-| 2    | 7    | pos_in_read   | Position-in-read, clamped or binned to 0–127.         |
-| 2    | 1    | strand        | 0 = forward, 1 = reverse.                             |
-
-Strand is duplicated with the per-allele fwd/rev counts. Keeping it in the per-read record makes records self-contained and simplifies downstream per-read iteration.
-
-### Size estimate at 5× coverage
-
-- Site header: ~11 B.
-- Per-allele header: ~6 B (SNP case).
-- Per-read record: 3 B.
-
-Typical site with 2 alleles and 5 total reads: `11 + 2·6 + 5·3 ≈ 38 B` pre-compression.
-
-### Indel handling
-
-**Deletions.** For a read supporting a deletion of length k starting at position p:
-- The read contributes a per-read record to the deletion allele at position p.
-- The read contributes no evidence at positions p+1 … p+k.
-- BQ for the deletion record: **[OPEN]** min or mean of the base qualities immediately flanking the deletion, vs a fixed indel-error proxy.
-
-**Insertions.** For a read supporting an insertion of bases XY after position p:
-- The read contributes a per-read record to the allele `ref_base + XY` at position p.
-- BQ: **[OPEN]** min or mean of the BQs across the inserted bases.
-
-## File structure
+## File-level structure
 
 ```
-+-------------------+
-| file header       |
-+-------------------+
-| block 0           |
-+-------------------+
-| block 1           |
-+-------------------+
-| ...               |
-+-------------------+
-| block N-1         |
-+-------------------+
-| block index       |
-+-------------------+
-| footer (20 B)     |
-+-------------------+
++-----------------+
+| file header     |   (uncompressed, prefix-decodable)
++-----------------+
+| block 0         |   ┐
++-----------------+   │ zero or more blocks,
+| block 1         |   │ written in genomic order
++-----------------+   │ (chrom_id non-decreasing,
+| ...             |   │ pos non-decreasing within chrom).
++-----------------+   │ A block never crosses a
+| block N-1       |   │ chromosome boundary.
++-----------------+   ┘
+| block index     |   one entry per block; coordinate-keyed
++-----------------+
+| file trailer    |   fixed 32 bytes; locates the index, detects
++-----------------+   truncation
 ```
 
-### File header
+- A `.psp` may legally contain zero blocks (sample with no covered
+  positions, e.g. an empty CRAM). In that case the file is
+  `header + empty index + trailer`; the index carries zero entries
+  and the trailer still locates it.
+- Blocks are written sequentially in genomic order. Their byte
+  offsets are recorded once, in the tail-mounted **block index**
+  (§"Block index"). A reader that needs region-keyed access reads
+  the trailer, then the index, then seeks to the relevant blocks.
+- The tail-index pattern is what modern columnar binary formats
+  use (Parquet, ORC, Arrow IPC, ZIP's end-of-central-directory).
+  It keeps the writer single-pass — blocks are written as they
+  finalise, the index accumulates in memory and is dumped before
+  the trailer — and the index is atomic with the file content
+  rather than a sidecar that can drift.
 
-| Field              | Type            | Notes                                                               |
-|--------------------|-----------------|---------------------------------------------------------------------|
-| magic              | 4 B             | `PSP\0`.                                                            |
-| format_version     | u16             | Starts at 1. Bumped on breaking schema change.                      |
-| flags              | u16             | Reserved; 0 in v1. Used for optional feature bits.                  |
-| sample_name        | var-len utf-8   | Length-prefixed.                                                    |
-| reference_name     | var-len utf-8   | Length-prefixed.                                                    |
-| reference_md5      | 16 B            | MD5 of the FASTA used, for mismatch detection at cohort-call time.  |
-| chrom_table        | var-len         | u32 count, then per chrom: u32 name length, name bytes, u32 length_bp. |
-| creation_timestamp | u64             | Unix seconds.                                                       |
-| writer_version     | var-len utf-8   | Tool version that wrote the file.                                   |
+## File header
 
-### Block layout
+The file header is plain-text TOML, framed by a small fixed-byte
+magic at the start and a fixed sentinel line at the end. Goal:
+every key piece of metadata about the file (sample, reference,
+contigs, writer version, creation time) is readable with
+standard Unix tools, with no `.psp`-specific software installed:
 
-Each block is a standalone zstd frame. Records never cross block boundaries, and blocks never cross chromosome boundaries.
+```
+$ head file.psp
+PSP
+# .psp v1.0 header
+format-version = "1.0"
+sample         = "NA12878"
+reference      = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
+...
+```
 
-| Field             | Type   | Notes                                              |
-|-------------------|--------|----------------------------------------------------|
-| compressed_size   | u32    | Bytes of zstd payload that follow.                 |
-| uncompressed_size | u32    | Expected size after decompression.                 |
-| zstd_payload      | bytes  | Zstd frame containing a concatenation of site records. |
+### Layout
 
-**Target uncompressed block size:** 4 MB as the starting default, configurable. Larger blocks are preferred when RAM is not scarce (the common case); they improve zstd ratio and have negligible seek cost for any realistic region query. Test 16 MB before freezing the default.
+```
++-------------------------+
+| PSP\n                   | 4 bytes — magic. Printable ASCII; the
++-------------------------+   trailing newline opens the first
+                              TOML line.
+| <TOML body>             | variable; valid TOML v1.0.0, restricted
+|                         |   per §"Per-field character set". Ends
+|                         |   with at least one `\n`.
++-------------------------+
+| ---END-HEADER---\n      | 17 bytes — sentinel line. The next byte
++-------------------------+   is the first byte of block 0.
+```
 
-**Compression level:** **[OPEN]** Default zstd 9 as a starting point. Files are written once per sample and read many times, so a slower-write / better-ratio tradeoff is justified. Benchmark 3 / 9 / 19 on representative samples.
+Constraints:
 
-**Dictionary:** not used in v1. Revisit only if small-block compression ratio turns out to be poor.
+- The magic is exactly the four bytes `'P'`, `'S'`, `'P'`, `'\n'`.
+- The TOML body ends with at least one `\n` so the sentinel starts
+  on its own line.
+- The byte sequence `\n---END-HEADER---\n` must not appear inside
+  any TOML value. The per-field rules (§"Per-field character set")
+  forbid `\n` in every v1.0 field, so this is automatic for
+  well-formed values; a producer that somehow tries to write a
+  multi-line value must reject the value at validation time.
+- Total header size (magic through sentinel inclusive) is bounded
+  by a soft limit of **1 MiB**. A header exceeding this is rejected.
 
-### Block index
+Why this framing:
 
-Written immediately after the last data block. Prefixed by `u64 n_blocks`.
+- **`PSP\n` as fixed magic** lets `file` / libmagic identify a
+  `.psp` from offset 0, and lets a binary reader bail out on
+  non-`.psp` input before invoking a TOML parser.
+- **Sentinel rather than embedded byte count** keeps the writer
+  single-pass: the producer never has to back-patch a self-
+  referential length. Both `head` users and binary readers locate
+  the body end the same way.
+- **TOML rather than a custom key-value grammar** so we inherit a
+  single canonical spec, mature Rust support (`toml` crate, used
+  by Cargo itself), native dates, comments, and existing query
+  tooling (`taplo`, `dasel`, `tomlq`) — at the cost of one small
+  runtime dependency.
 
-| Field             | Type | Notes                                           |
-|-------------------|------|-------------------------------------------------|
-| chrom_id          | u32  |                                                 |
-| first_pos         | u32  |                                                 |
-| last_pos          | u32  |                                                 |
-| file_offset       | u64  | Byte offset of this block's `compressed_size` field. |
-| compressed_size   | u32  |                                                 |
-| uncompressed_size | u32  |                                                 |
-| n_sites           | u32  |                                                 |
+### Reader protocol
 
-Followed by `u32 index_crc` (CRC32C over the index bytes) for corruption detection.
+1. `pread` the first 4 bytes; verify `PSP\n`. Non-match → not a
+   `.psp` file, abort with a clear error.
+2. Read forward (streaming or `mmap`) until the byte sequence
+   `\n---END-HEADER---\n` is found, bounded by the 1 MiB soft
+   limit. Not found within the limit → corruption error.
+3. The TOML body is bytes 4 through the first `\n` of the
+   sentinel pattern (inclusive). Parse with a TOML v1.0.0 parser.
+4. Validate every field against the per-field rules
+   (§"Per-field character set"). Any rule violation is a hard
+   error; the file is rejected.
+5. Block 0 starts at the byte after the second `\n` of the
+   sentinel pattern.
 
-### Footer
+### TOML schema (v1.0)
 
-Fixed 20 bytes at end of file:
+Required top-level keys:
 
-| Field        | Type | Notes                                            |
-|--------------|------|--------------------------------------------------|
-| index_offset | u64  | Byte offset of the block index start.            |
-| index_size   | u64  | Index length in bytes.                           |
-| magic        | 4 B  | `PSP\0` again, for tail-based format detection.  |
+| Key | TOML type | Notes |
+|---|---|---|
+| `format-version` | string | `"MAJOR.MINOR"`. v1.0 writers emit `"1.0"`. |
+| `sample` | string | Sample name from the input CRAMs' `@RG SM`, validated identical across all input CRAMs (Stage 1 §"Multi-CRAM ingestion"). |
+| `reference` | string | Free-form, typically the FASTA's basename. Diagnostic. |
+| `reference-md5` | string | 32-character lowercase hex MD5 of the FASTA bytes the producer was handed. Stage 3 compares this against the FASTA it is given and refuses to proceed on mismatch — never silently. |
+| `created` | offset date-time | When the file was finalised. RFC 3339 / ISO 8601, e.g. `2026-05-13T10:00:00Z`. |
 
-A reader pread's the last 20 bytes, validates magic, reads the index, then seeks to the blocks it needs.
+Required array-of-tables `[[chromosome]]`, in `@SQ` order. The
+zero-based index into this array is the `chrom_id` referenced by
+blocks (Stage 1 validates that this order is identical across all
+input CRAMs and identical to the FASTA).
 
-## Access patterns
+| Key | TOML type | Notes |
+|---|---|---|
+| `name` | string | Contig name, matching SAM `@SQ SN`. |
+| `length` | integer | Contig length in base pairs (≥ 1). |
 
-### Sequential read (full cohort call)
+Required table `[writer]` — provenance for what produced the file.
+See §"File header — provenance and path stripping" below for the
+full schema and the rationale for the design (no literal `argv`,
+basenames only, every effective parameter recorded).
 
-1. Open file, read header.
-2. Read blocks in order; decompress each and emit its site records.
-3. Stop at the start of the block index.
+Required array-of-tables `[[column]]` — the **binary schema**: a
+declaration of every column the file's binary body carries, with
+its tag, cardinality, shape, type, and a canonical one-line
+description. See §"File header — binary schema" below.
 
-The block index is not needed for sequential reads. This matches the common case.
+**Unknown top-level keys.** A reader on a v1.0 file MUST NOT reject
+the file because an unrecognised top-level key appears; it skips
+the key. This is the mechanism by which future minor bumps can
+add optional file-scope content (see §"File-scope extensions
+(deferred to v1.x)" and §"Versioning policy").
 
-### Random access (region query)
+### File header — provenance and path stripping
 
-1. Open file, read header and footer.
-2. Seek to `index_offset`, decode the block index.
-3. Binary-search for blocks overlapping the requested `(chrom, start, end)`.
-4. Decompress only those blocks; filter records inside.
+The `[writer]` table records exactly what produced the file, in a
+form that supports reproducibility on any host without leaking the
+producer's directory structure or username.
 
-### Parallel write
+Required keys directly under `[writer]`:
 
-Stage 1 naturally pipelines as:
+| Key | TOML type | Notes |
+|---|---|---|
+| `tool` | string | Executable name, e.g. `"join_per_sample_vcfs"`. No path component. |
+| `version` | string | Tool version, e.g. `"0.3.0"`. Format is `tool`-defined; conventionally `MAJOR.MINOR.PATCH`. |
+| `subcommand` | string | The CLI subcommand actually invoked, e.g. `"per-sample"`. Single token, no path component. |
+| `input-crams` | array of strings | The CRAM files Stage 1 ingested, recorded as **basenames only** (no directory component, no `/` or `\`). One entry per input CRAM, in the order passed on the CLI. |
+| `input-fasta` | string | The reference FASTA, recorded as **basename only**. |
 
-- BAM decode
-- Pileup producing site records into an in-memory block buffer
-- Compression pool running zstd on completed blocks
-- Writer appending compressed blocks sequentially
+Required sub-table `[writer.parameters]` — one key per CLI-exposed
+knob, value = the effective value the writer ran with. Defaults and
+user-overrides are recorded identically; a re-run that explicitly
+sets a default to its default is a no-op, so the distinction adds
+no value here. Examples (one row per knob the producer's config
+structs expose):
 
-Block independence means the compression pool has no ordering constraints beyond final write order.
+```toml
+[writer.parameters]
+min-mapq               = 30
+max-snp-column-depth   = 8000
+max-indel-column-depth = 250
+drop-qc-fail           = true
+drop-duplicate         = true
+min-read-length        = 30
+# ... etc.
+```
 
-## Design rationale
+The parameter set the writer emits matches its CLI surface
+exactly: every knob exposed on the CLI appears here, no more, no
+less. A new knob added in a v1.x writer becomes a new key in the
+parameters sub-table; readers that don't know it ignore it (per
+the unknown-key rule).
 
-- **Raw per-read records, not histograms.** At the project's target coverage (2–10×), per-site read counts are small. Raw records (~3 B/read) come out smaller than fixed-size histograms (~50+ B per allele) and preserve exact per-read correlations between BQ/MQ for rank-sum filters. Quantization error from binning is not a concern the project cares about; size at low coverage is.
-- **Normalized format — no derived fields.** Depth, strand counts, RMS MQ, and other summaries are recomputed from the per-read records on demand. This keeps the file smaller and removes a class of consistency bugs (summary vs raw disagreeing). Recomputation is cheap because downstream stages iterate the reads anyway to compute likelihoods.
-- **Blocked zstd, not BGZF or zstd seekable format.** Our queries are always genomic-coord queries. A custom coord-native index is simpler and smaller than layering (chrom,pos) → byte-offset on top of zstd seekable. zstd replaces gzip for roughly 2× better ratio on our data.
-- **Large blocks (≥ 4 MB).** Typical usage walks large ranges; RAM is abundant. Larger blocks give zstd more context and better ratio, with negligible decompression latency on modern CPUs.
-- **Chromosome boundaries enforced.** Simplifies region queries and avoids spurious cross-chrom decompression at chrom transitions.
-- **In-file tail index.** Atomic with content; no sidecar file to manage or lose. Reader locates it from the fixed footer.
+**Why no literal `command-line` / `argv`.** A literal `argv` array
+necessarily carries full filesystem paths, which leak host
+directory structure (`/home/jblanca/projects/cohort_2026/data/...`)
+and the running user's name. The structured form above carries
+strictly more *useful* information for re-running and strictly
+less *incidental* information about the producer's host. A
+reader that wants to re-run on its own host substitutes its own
+paths to the recorded basenames:
 
-## Open decisions
+```
+$ join_per_sample_vcfs per-sample \
+      --reference <your-path>/GRCh38.fa \
+      --min-mapq 30 \
+      --max-snp-column-depth 8000 \
+      ... \
+      <your-path>/sample_lane1.cram
+```
 
-To be resolved before format v1 is frozen:
+**Why basenames, not `~`-anonymised paths.** Replacing `$HOME`
+with `~` would still leak project structure
+(`~/projects/cohort_2026/...`). Basename-only forecloses both
+classes of leak with a single rule and is sufficient for
+re-running.
 
-- **[OPEN]** Indel BQ: flanking-base stat (min or mean) for deletions, inserted-base stat (min or mean) for insertions, or a fixed indel-error proxy per read.
-- **[OPEN]** Partial-span reads: record them as a distinct allele bucket, mark them with a flag in the per-read record, or drop them entirely.
-- **[OPEN]** Reference context caching at each site (flanking bases, for microsatellite detection), or re-read from FASTA at cohort-call time.
-- **[OPEN]** Default compression level (3 / 9 / 19), to be chosen by benchmarking.
-- **[OPEN]** Block-level checksum: rely on zstd's built-in frame checksum, or add a dedicated u32 per block.
-- **[OPEN]** Default block size (4 MB vs 16 MB), to be chosen by benchmarking.
-- **[OPEN]** mmap vs pread on the read path (implementation detail, not format).
+**What's not in `[writer]`.** No `cwd`, no environment variables,
+no hostname, no UID/GID. The format records what the writer *did*,
+not where it lived.
 
-## Versioning policy
+### File header — binary schema
 
-- Bump `format_version` on any breaking schema change.
-- Readers must refuse to open files with a major version they do not understand.
-- New optional fields can be gated behind bits in the header's `flags` u16 without bumping the major version, provided older readers ignoring the flag still decode correctly.
+The `[[column]]` array of tables in the header declares every column
+the binary body carries: its tag (which is what the per-block manifest
+references), its scope (per-record vs per-allele), its on-the-wire
+shape, its element type, whether it is required, and a one-line
+description. The intent is **VCF-style self-description**: a tool
+that has only this file and the closed type vocabulary below can
+decode the binary body without consulting the spec.
 
-## Relation to the broader pipeline
+The `[[column]]` array doubles as the file-level "columns used"
+manifest: it lists every column the file's binary body contains,
+in full schema detail rather than as a bare list of names.
 
-This format is consumed by Stage 3 (`variant_grouping`) and later stages. Stage 3 reads PSP files in genomic order, aligning sites across samples into `OverlappingVarGroup`s. Stage 4 consumes the per-allele and per-read evidence to perform cross-sample allele merging. Stage 5 computes per-sample genotype likelihoods from the per-read BQ/MQ records. The format is independent of the BAM library choice in Stage 1 (rust-htslib vs noodles) — both libraries can produce the same record stream.
+#### `[[column]]` entry schema
+
+Each `[[column]]` table carries the following keys:
+
+| Key | TOML type | Notes |
+|---|---|---|
+| `tag` | integer | The numeric column tag the per-block manifest references. Conventionally written in hex (`0x11`); decimal is also legal TOML. Must be unique within the file and fall in a range valid for the file's `format-version` (see §"Reserved column-tag ranges"). |
+| `name` | string | Lowercase kebab-case, e.g. `"allele-q-sum-log"`. Stable across versions. |
+| `cardinality` | string | Closed enum: `"per-record"` (one entry per record, count = `n_records`) or `"per-allele"` (one entry per allele, count = `n_total_alleles`). |
+| `shape` | string | Closed enum: `"scalar"`, `"list"`, or `"bytes"`. |
+| `element-type` | string | Closed enum: `"u8"`, `"u16"`, `"u32"`, `"u64"`, `"i32"`, `"i64"`, `"f32"`, `"f64"`, `"varint"`, `"svarint"`, `"bool"`. Required when `shape != "bytes"`; absent when `shape == "bytes"`. |
+| `length-column` | string | Only present (and required) when `shape == "bytes"`. Names another column with the same `cardinality` whose values give per-entry byte lengths. |
+| `required` | bool | If true, a reader that does not recognise this `name`/`tag` pair must reject the file. If false, the reader may skip the column. |
+| `description` | string | One-line human-readable text. Canonical for the column's `tag` at a given `format-version`; the writer reproduces the spec text verbatim. |
+
+The TOML allows any extra keys per entry; a reader must skip
+unknown keys (per the unknown-key rule). This is the hatch for
+v1.x columns that need additional metadata (e.g. a per-column
+checksum policy, a unit-of-measure annotation).
+
+#### Encoding rules per (`cardinality`, `shape`)
+
+The column's on-the-wire encoding is fully determined by its
+`cardinality` and `shape`:
+
+| (`cardinality`, `shape`) | Encoding inside the column's payload |
+|---|---|
+| `(per-record, scalar)` | `n_records` `element-type` values, packed end to end. |
+| `(per-allele, scalar)` | `n_total_alleles` `element-type` values, packed end to end. |
+| `(per-record, list)` | `n_records` entries, each: `varint` count `k`, then `k` `element-type` values. |
+| `(per-allele, list)` | `n_total_alleles` entries, each: `varint` count `k`, then `k` `element-type` values. |
+| `(per-record, bytes)` | flat byte stream; chunk by walking the `length-column` (which must be `(per-record, scalar)` with `element-type = "varint"`). |
+| `(per-allele, bytes)` | flat byte stream; chunk by walking the `length-column` (which must be `(per-allele, scalar)` with `element-type = "varint"`). |
+
+A reader that knows the closed type vocabulary and the closed
+`(cardinality, shape)` matrix can decode any column the header
+declares, even ones it has never seen before.
+
+#### v1.0 binary schema
+
+A v1.0 file carries one `[[column]]` entry per row of §"Required
+columns in v1.0", in the same order. The writer emits the
+description text verbatim from the spec. The v1.0 schema is
+reproduced inline in §"Example v1.0 header" below.
+
+#### Header-binary consistency: required reader checks
+
+> **Note to whoever implements the reader.**
+>
+> A `.psp` file is **only valid** when the header's binary schema and
+> the binary body's actual layout agree on every detail. If a reader
+> discovers a disagreement, it must **abort with a clear error**.
+> Never silently reconcile. Never fall back to "what the spec says
+> for this format-version". Never patch up the data. The whole
+> point of the in-file schema is to make the file self-describing;
+> a writer that contradicts itself has produced a corrupt or buggy
+> artefact, and continuing to read would silently corrupt downstream
+> analyses.
+>
+> This is the project's "errors must not pass silently" principle
+> (`design_principles.md` §General principle 3) applied at the
+> sharpest edge of the format.
+
+Concrete checks the reader must perform at file-open (and per-block
+where noted):
+
+1. **Header well-formedness.** TOML parses cleanly; every required
+   key/table is present; every value matches its per-field rule
+   (§"Per-field character set").
+2. **Schema completeness.** Every `[[column]]` entry has the keys
+   its `(cardinality, shape)` requires (`element-type` for non-`bytes`
+   shapes; `length-column` for `bytes` shapes; both are mutually
+   exclusive).
+3. **`length-column` references.** For every `shape = "bytes"`
+   column, its `length-column` names another column in the schema,
+   that column has the same `cardinality`, `shape = "scalar"`, and
+   `element-type = "varint"`. Otherwise reject.
+4. **Tag uniqueness and range.** Tags are unique within the file;
+   each tag falls in a range valid for the file's `format-version`
+   (no minor-bump tags in a v1.0 file, no major-bump tags in a
+   v1.x file, no `0x00` sentinel).
+5. **Required-column recognition.** Every `[[column]]` with
+   `required = true` has a `name`/`tag` the reader recognises.
+   Otherwise abort, naming the column.
+6. **Schema-vs-registry agreement.** For every recognised column,
+   the in-file schema's `cardinality`, `shape`, `element-type`,
+   `length-column`, and `required` flags match what the reader's
+   own column-tag registry says for that `name`/`tag` at the file's
+   `format-version`. Any disagreement → abort, naming the column
+   and the disagreeing field.
+7. **Per-block manifest agreement** (checked at each block):
+    - Every tag in the per-block manifest is declared by a
+      `[[column]]` entry in the header.
+    - `uncompressed_len` matches what the encoding rules predict
+      from the block's `n_records`, `n_total_alleles`, the column's
+      `(cardinality, shape, element-type)`, and (for `bytes` shapes)
+      the actual length-column payload.
+    - Decompressing the payload yields exactly `uncompressed_len`
+      bytes.
+8. **No surprises in skipped columns.** A reader skipping a
+   `required = false` column it does not understand may not
+   silently consume bytes beyond the per-block-manifest's
+   `compressed_len` for that column.
+9. **No non-finite floats.** Every IEEE 754 float column
+   (`element-type = "f32"` or `"f64"`) is checked entry-by-entry
+   after decompression: NaN, +∞, and −∞ are forbidden. A
+   non-finite value is a producer bug — the per-allele scalars are
+   finite sums by construction — and a reader that encountered one
+   and proceeded would silently corrupt downstream likelihoods.
+   The error names the column, the block, and the offending entry
+   index.
+
+Failing any of these is a hard error.
+
+### Example v1.0 header
+
+```
+PSP
+# .psp v1.0 header
+format-version = "1.0"
+sample         = "NA12878"
+reference      = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
+reference-md5  = "4f9d2c5be3a1deadbeefcafef00dba11"
+created        = 2026-05-13T10:00:00Z
+
+[[chromosome]]
+name   = "chr1"
+length = 248956422
+
+[[chromosome]]
+name   = "chr2"
+length = 242193529
+
+# ... more chromosomes ...
+
+[[chromosome]]
+name   = "chrM"
+length = 16569
+
+[writer]
+tool        = "join_per_sample_vcfs"
+version     = "0.3.0"
+subcommand  = "per-sample"
+input-crams = ["sample_lane1.cram", "sample_lane2.cram"]
+input-fasta = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
+
+[writer.parameters]
+min-mapq               = 30
+max-snp-column-depth   = 8000
+max-indel-column-depth = 250
+drop-qc-fail           = true
+drop-duplicate         = true
+min-read-length        = 30
+
+# ---- Binary schema: declarations of every column in the body ----
+
+[[column]]
+tag          = 0x01
+name         = "delta-pos"
+cardinality  = "per-record"
+shape        = "scalar"
+element-type = "varint"
+required     = true
+description  = "Distance to the previous record's position. First record in a block has value 0 and uses the block header's first-pos."
+
+[[column]]
+tag          = 0x02
+name         = "n-alleles"
+cardinality  = "per-record"
+shape        = "scalar"
+element-type = "varint"
+required     = true
+description  = "Number of alleles in this record (>= 1). Sum across records equals n_total_alleles."
+
+[[column]]
+tag          = 0x03
+name         = "allele-seq-len"
+cardinality  = "per-allele"
+shape        = "scalar"
+element-type = "varint"
+required     = true
+description  = "Byte length of each allele's sequence. Drives chunking of allele-seq."
+
+[[column]]
+tag           = 0x04
+name          = "allele-seq"
+cardinality   = "per-allele"
+shape         = "bytes"
+length-column = "allele-seq-len"
+required      = true
+description   = "Allele sequence bytes (uppercase ASCII over {A,C,G,T,N}). REF is the first allele in each record."
+
+[[column]]
+tag          = 0x10
+name         = "allele-obs-count"
+cardinality  = "per-allele"
+shape        = "scalar"
+element-type = "u32"
+required     = true
+description  = "Observation count: reads supporting this allele."
+
+[[column]]
+tag          = 0x11
+name         = "allele-q-sum-log"
+cardinality  = "per-allele"
+shape        = "scalar"
+element-type = "f64"
+required     = true
+description  = "Sum over supporting reads of max(ln_BQ_BAQ, ln_MQ). The freebayes per-read combination of base and mapping quality."
+
+[[column]]
+tag          = 0x12
+name         = "allele-fwd-count"
+cardinality  = "per-allele"
+shape        = "scalar"
+element-type = "u32"
+required     = true
+description  = "Forward-strand count: reads on the forward strand supporting this allele."
+
+[[column]]
+tag          = 0x13
+name         = "allele-placed-left-count"
+cardinality  = "per-allele"
+shape        = "scalar"
+element-type = "u32"
+required     = true
+description  = "Reads whose 5' end is to the left of the record's position (freebayes' placedLeft)."
+
+[[column]]
+tag          = 0x14
+name         = "allele-placed-start-count"
+cardinality  = "per-allele"
+shape        = "scalar"
+element-type = "u32"
+required     = true
+description  = "Reads whose 5' end is the record's position (freebayes' placedStart)."
+
+[[column]]
+tag          = 0x20
+name         = "new-chain-slots"
+cardinality  = "per-record"
+shape        = "list"
+element-type = "u16"
+required     = true
+description  = "Phase-chain slot ids that became active since the previous record. Ascending."
+
+[[column]]
+tag          = 0x21
+name         = "expired-chain-slots"
+cardinality  = "per-record"
+shape        = "list"
+element-type = "u16"
+required     = true
+description  = "Phase-chain slot ids that ended since the previous record. Ascending."
+
+[[column]]
+tag          = 0x22
+name         = "allele-chain-slots"
+cardinality  = "per-allele"
+shape        = "list"
+element-type = "u16"
+required     = true
+description  = "Phase-chain slot ids contributing to each allele observation. Ascending. References the active-slot set after applying new-chain-slots and expired-chain-slots."
+---END-HEADER---
+```
+
+Comments are TOML-legal and survive the header roundtrip; writers
+may emit them or not, readers ignore them.
+
+### Header size in practice
+
+The chromosome list is the dominant contributor. Per-contig TOML
+overhead is ~40–50 bytes:
+
+- ~200 contigs (typical clean reference) → ~10 KB.
+- ~500 contigs (with decoys / alts) → ~25 KB.
+- ~3000 contigs (some plant references with unplaced scaffolds)
+  → ~150 KB — still well under the 1 MiB cap.
+
+Trivial against multi-GB block bodies.
+
+## Block layout
+
+A block holds the records of a single contiguous run of positions on
+a single chromosome, encoded columnar and zstd-compressed.
+
+```
+block:
+  block_header:                       (uncompressed)
+    chrom_id:           varint
+    first_pos:          varint        // 1-based reference position of the
+                                       // first record in the block
+    n_records:          varint        // number of per-position records in
+                                       // the block
+    n_total_alleles:    varint        // sum of n_alleles over all records;
+                                       // lets readers size per-allele
+                                       // columns up front
+    n_columns:          varint        // number of column-manifest entries
+                                       // that follow. May be less than the
+                                       // header's [[column]] count if the
+                                       // block legitimately omits an
+                                       // optional column it has no data for.
+    per column (n_columns entries):
+      column_tag:       varint        // selects from the header's [[column]]
+                                       // array. Required-ness, cardinality,
+                                       // shape, and element-type are
+                                       // resolved against the header
+                                       // schema; the per-block manifest
+                                       // does not redeclare them.
+      compressed_len:   varint        // byte length of the column's
+                                       // zstd-compressed payload
+      uncompressed_len: varint        // expected size after decompression.
+                                       // A reader cross-checks this against
+                                       // the value the encoding rules
+                                       // predict from the header schema and
+                                       // the block's n_records /
+                                       // n_total_alleles. Mismatch is a
+                                       // hard error (§"Header-binary
+                                       // consistency").
+  column_payloads:                    (concatenated, each independently
+                                       zstd-compressed)
+    payload_0:          compressed_len[0] bytes
+    payload_1:          compressed_len[1] bytes
+    ...
+    payload_{n_columns-1}: compressed_len[n_columns-1] bytes
+```
+
+The per-block manifest carries no redundant schema fields. The
+header's `[[column]]` array is the single source of truth for what a
+tag means; the per-block manifest only adds what genuinely varies
+block-to-block: which columns this block actually wrote, and how
+big their payloads are.
+
+### Why per-column zstd, not whole-block zstd
+
+This is the form the architecture's §"Per-position record layout
+and compression" already commits to. Recording the consequence for
+the byte layout here: a reader that does not recognise a non-required
+column tag can skip its `compressed_len` bytes and continue, without
+having to decompress data it would only discard anyway. Per-column
+framing also lets readers parallelise decompression by column when
+the work-stealing tradeoff is favourable (rayon over columns,
+trivially independent).
+
+### Block sizing
+
+**Target uncompressed block size:** ~16 MiB (writer hardcoded; not
+exposed on the CLI in v1). The writer accumulates records until
+either:
+
+- the projected uncompressed column-payload total reaches the
+  target, **or**
+- a chromosome boundary is reached (blocks never cross chromosomes).
+
+The target is a writer-side knob, not part of the on-disk contract.
+A reader handles any block size from 1 record up to the varint
+maximum (`2^64 − 1` records, in practice limited by memory).
+
+**Block invariants (must hold for every block).** A reader rejects
+the file if any block in the body violates these:
+
+- `n_records ≥ 1` — empty blocks are forbidden. A writer that has
+  no records to emit (e.g. a chromosome with zero coverage) emits
+  no block for that chromosome, not a zero-record one.
+- `n_total_alleles ≥ n_records` — every record has at least one
+  allele (the REF allele, always present per architecture doc
+  §"Allele and record conventions").
+- All records in a block share the same `chrom_id` (the block
+  header's `chrom_id`), and their positions are strictly increasing
+  in genomic order.
+
+Rationale for 16 MiB rather than the smaller (~4 MiB) figure earlier
+drafts considered: the artefact is expected to be large — WGS at
+the project's target coverage already produces multi-GB files —
+so any single sample run cares far more about compression ratio
+than about per-block decompression latency. Larger blocks give
+zstd more context (better ratio) and have negligible decompression
+overhead on modern CPUs. A future benchmark on real data may
+change the default; that's a writer change, not a format change.
+
+### Compression
+
+zstd is mandatory for every column payload in v1. The compression
+level is a writer-internal choice; the on-disk format does not
+record it and a reader decompresses any level transparently.
+
+The v1 writer uses **zstd level 9**, hardcoded. It is not exposed
+on the CLI in v1: the artefact is written once per sample and read
+many times, the level-vs-ratio trade-off is well within zstd's
+useful range at 9, and exposing it as a knob is more configuration
+surface than a standard user benefits from. Should benchmarking
+on real data later justify a different default, that is a
+writer change (and the new tool version is recorded in
+`[writer]`), not a format change.
+
+**Dictionary:** not used in v1. Revisit only if observed compression
+ratio at small block sizes is poor.
+
+**Per-block checksum:** rely on zstd's built-in per-frame checksum.
+Each column payload is its own zstd frame and so carries its own
+checksum; corruption inside a payload fails the frame integrity
+check at decompression time. No separate block-level CRC is added.
+
+## Logical record content and column shapes
+
+Each block expresses a sequence of N per-position records, each with
+some number of alleles. The logical content of one record:
+
+- a position (encoded implicitly via `delta_pos` + the block's
+  `first_pos`);
+- `n_alleles`: at least 1;
+- per allele: a sequence (the literal allele) and five scalars;
+- phase chain lifecycle markers (`new_chains`, `expired_chains`);
+- per allele: the list of phase chain slot ids that contributed
+  this observation.
+
+Stored columnar: each of these items becomes one column entry per
+record (per-record items) or one column entry per allele
+(per-allele items). The block's `n_records` sizes the per-record
+columns; `n_total_alleles` sizes the per-allele columns; an
+`n_alleles` column maps records onto their allele runs.
+
+The column-tag registry below names each column, gives its
+per-entry type, and declares whether it's required in v1.
+
+### Required columns in v1.0
+
+Every v1.0 block carries exactly these required columns, in this
+order. Optional v1.0 columns are introduced under §"Optional columns
+defined in v1.0" — currently none.
+
+This table **is** the v1.0 column-tag registry. It is also what a
+v1.0 writer emits verbatim into the file header's `[[column]]` array
+(§"File header — binary schema"). The spec and the in-file schema are
+two views of the same data; readers verify they agree
+(§"Header-binary consistency: required reader checks").
+
+| Tag (hex) | Name | Per-record / per-allele | Type per entry | Notes |
+|---|---|---|---|---|
+| `0x01` | `delta_pos` | per-record (N entries) | `varint` | Distance to the previous record's position. For the first record in a block, the value is `0` and the position is `first_pos` (from the block header). |
+| `0x02` | `n_alleles` | per-record (N entries) | `varint` | At least `1` per record. The sum equals the block's `n_total_alleles`. |
+| `0x03` | `allele_seq_len` | per-allele (M entries, M = `n_total_alleles`) | `varint` | Length in bytes of each allele's sequence. **Minimum `1`** — no allele is zero-length (SNP = 1, deletion ALT = 1 anchor base, insertion ALT = 1+ bytes). A reader rejects a record carrying `allele_seq_len = 0`. Within a record, the first allele is REF (architecture doc §"Allele and record conventions"). |
+| `0x04` | `allele_seq` | per-allele bytes | concatenation | The allele sequences laid end to end, decoded by walking `allele_seq_len`. Bytes are uppercase ASCII over `{A, C, G, T, N}`. |
+| `0x10` | `allele_obs_count` | per-allele (M entries) | `u32` | Observation count scalar (reads supporting this allele). `u32` covers the architecture's per-column depth caps with headroom. |
+| `0x11` | `allele_q_sum_log` | per-allele (M entries) | `f64` | `Σ max(ln_BQ_BAQ, ln_MQ)` over supporting reads. Stored in ln-units. Matches the implementation's `AlleleSupportStats::q_sum: f64` ([pileup/mod.rs:357](../../src/per_sample_caller/pileup/mod.rs#L357)); chosen to preserve the precision the accumulator uses, with no truncation at the I/O boundary. |
+| `0x12` | `allele_fwd_count` | per-allele (M entries) | `u32` | Forward-strand count. |
+| `0x13` | `allele_placed_left_count` | per-allele (M entries) | `u32` | Reads whose 5′ end is to the left of the record's position (freebayes' `placedLeft`). |
+| `0x14` | `allele_placed_start_count` | per-allele (M entries) | `u32` | Reads whose 5′ end *is* the record's position (`placedStart`). |
+| `0x20` | `new_chain_slots` | per-record list | varint count + `u16` slot ids | Per record: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order. Matches the implementation's `SlotId = u16` ([pileup/slot_allocator.rs:21](../../src/per_sample_caller/pileup/slot_allocator.rs#L21)); `u16` was chosen there for ~16× headroom over the active-slot cap (`DEFAULT_MAX_ACTIVE_SLOTS = 4096`). |
+| `0x21` | `expired_chain_slots` | per-record list | varint count + `u16` slot ids | Same shape as `new_chain_slots`. Architecture doc §"Phase chain identifiers" specifies the lifecycle invariant. |
+| `0x22` | `allele_chain_slots` | per-allele list | varint count + `u16` slot ids | Per allele: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order. The slot ids reference the currently-active set (i.e. after applying the record's `expired_chains` and `new_chains`). |
+
+A reader walks the columns in tandem; the per-record columns give
+the position and allele-count structure, and the per-allele columns
+are sliced by `n_alleles` to attribute entries to records.
+
+### Optional columns defined in v1.0
+
+None. The optional-column hatch exists for additions that v1.x will
+introduce as minor bumps without breaking v1.0 readers; the
+architecture document anticipates one already (an exact-mixture
+quality scalar for contamination handling). When v1.1 ships such a
+column, this section lists it with a stable tag in the range
+reserved below.
+
+### Reserved column-tag ranges
+
+| Range | Use |
+|---|---|
+| `0x00` | Reserved sentinel; never a valid tag. |
+| `0x01` – `0x0F` | Per-record structural columns (position, allele structure). |
+| `0x10` – `0x1F` | Per-allele scalar columns. |
+| `0x20` – `0x2F` | Phase-chain columns. |
+| `0x30` – `0x7F` | Reserved for future per-position / per-allele columns introduced as minor bumps. |
+| `0x80` – `0xFE` | Reserved for future major-version-only columns. |
+| `0xFF` and `≥ 0x100` | Available; encoder/decoder must handle varint widths. |
+
+Tags inside reserved-for-future ranges that a v1.0 file carries are
+an error: a v1.0 writer never emits them, and a reader encountering
+one in a file claiming `version_major = 1` rejects the file.
+
+### Column ordering within a block
+
+**Strict requirement: per-block manifest entries are listed in
+ascending `column_tag` order, with no duplicates.** Writers sort
+at emit time; readers reject any block whose manifest is
+out-of-order or contains duplicates with a clear error.
+
+The writer-side cost is zero (sorting a small list of tags) and
+the wins are concrete:
+
+- byte-deterministic output across writers makes `psp dump` and
+  hex-level diffs reproducible;
+- the reader gets a cheap O(n) check that catches a class of
+  writer bugs (forgot to sort, accidentally emitted a column
+  twice) without parsing payloads;
+- file-format-level consistency stays in the same posture as the
+  header/binary consistency checks (§"Header-binary consistency").
+
+## File-scope extensions (deferred to v1.x)
+
+v1.0 defines no file-scope extension mechanism beyond the binary
+schema and the writer/provenance tables. The architecture
+document anticipates eventually adding file-scope extras (e.g. a
+per-sample contamination estimate, a notes field) but none exist
+yet, so the v1.0 spec carries no dedicated table for them.
+
+When the first such extension is needed, it is introduced in a
+v1.x minor bump as either:
+
+- a new top-level TOML key or table (e.g. `contamination-estimate = 0.012`
+  or `[notes]`), under the rule below, or
+- a new `[[column]]` if it is per-record/per-allele data that belongs
+  in the binary body.
+
+**Minor-bump rule (load-bearing).** Any content a v1.x minor bump
+adds to the header MUST be **optional** — a v1.0 reader, which
+applies the "unknown top-level keys are silently skipped" rule
+(§"TOML schema"), must remain able to consume the file. Required
+additions necessitate a major bump. The same rule applies to
+`[[column]]` entries: minor bumps add `required = false` columns
+only; promoting an optional column to required is a major bump.
+
+This rule is what keeps the cohort re-callable property
+(architecture doc constraint 5) without a one-time legacy shim: a
+v1.0 writer's `.psp` files are forever consumable by future minor-
+bump readers, and minor-bump writers' files remain consumable by
+v1.0 readers.
+
+## Block index
+
+A coordinate-keyed index of every block, written immediately after
+the last data block and before the trailer. The index is
+**mandatory** in v1: every v1 writer emits it and every v1 reader
+can rely on its presence.
+
+```
+block_index:
+  per block (n_blocks entries, in the order the blocks were
+             written — which is genomic order):
+    chrom_id:         varint
+    first_pos:        varint   // 1-based reference position of the
+                                // block's first record
+    last_pos:         varint   // 1-based reference position of the
+                                // block's last record (inclusive).
+                                // first_pos == last_pos for single-
+                                // record blocks.
+    n_records:        varint
+    block_offset:     u64      // absolute file offset of the block's
+                                // first byte (the block_header's first
+                                // byte, not the column payloads)
+```
+
+Notes:
+
+- Entries are listed in file order. A reader doing a region query
+  binary-searches by `(chrom_id, first_pos, last_pos)`.
+- `block_offset` is the **absolute** offset from the start of the
+  file. We do not encode it as a delta from the previous entry: at
+  ~16–24 bytes per entry and a few hundred KB of index even on a
+  ×5 WGS, the size win is not worth the encode/decode complexity.
+- `n_records` is redundant with reading the block header itself but
+  cheap to keep; it lets a reader budget memory before decompressing
+  and helps `psp head` summarise the file without scanning blocks.
+- The index is **uncompressed**. Compressing it would save ~50% on a
+  structure that is already a fraction of a percent of file size,
+  and would force a reader to instantiate zstd before answering "what
+  blocks cover chrN?". Not worth it.
+- A `.psp` with zero data blocks still has a zero-entry index; the
+  trailer's `index_offset` points to the byte immediately after the
+  header (where blocks would have started).
+
+### Why a tail index, not a head index or a sidecar
+
+- **Streaming writer.** A head index would force two-pass write or
+  back-patched offsets; tail-mounted means the writer accumulates
+  index entries in memory and dumps them once at the end. Memory
+  cost is bounded by the block count (a few thousand entries on a
+  WGS-scale file).
+- **Atomic with the file.** Sidecar indexes (`.bai`, `.crai`, `.tbi`)
+  can drift relative to the data file when one is regenerated and
+  the other isn't, or get lost in transit. A tail index travels
+  with the bytes it indexes.
+- **Standard pattern.** Parquet, ORC, Arrow IPC File, and ZIP all
+  mount their metadata at the file tail and locate it via a fixed
+  trailer. The shape below is the same.
+
+### Size estimate
+
+Roughly 16–24 bytes per entry (varints + one `u64`). At the writer's
+default target block size (16 MiB uncompressed):
+
+- 5× human exome (~100 MB compressed) → ~6 blocks → ~140 B index.
+- 5× human WGS (~50 GB compressed) → ~3 k blocks → ~60 KB index.
+
+Negligible against the data body.
+
+## File trailer
+
+A fixed 32-byte trailer at the very end of the file. Its job is
+twofold: (a) locate the block index, (b) detect truncation /
+incomplete writes that would otherwise read as a shorter but
+valid-looking file.
+
+| Offset (from trailer start) | Field | Type | Notes |
+|---|---|---|---|
+| 0 | `index_offset` | `u64` | Absolute file offset of the block index's first byte. |
+| 8 | `index_byte_length` | `u64` | Length of the block index in bytes. `index_offset + index_byte_length` must equal the trailer's own start offset. |
+| 16 | `n_blocks` | `u64` | Total number of blocks written. Must equal the number of entries the reader decoded from the index. |
+| 24 | `trailer_magic` | 4 B | ASCII bytes `'P'`, `'S'`, `'P'`, `'E'` (for "PSP End"). Different from the head magic so truncation that copies the head pattern would not pass the tail check. |
+| 28 | `trailer_padding` | 4 B | Reserved, all zero in v1. Lets future versions encode a tiny tail-side feature (e.g. file-scoped checksum) without bumping major. |
+
+A reader's tail-read protocol:
+
+1. `pread` the last 32 bytes; validate `trailer_magic`.
+2. Seek to `index_offset`; read `index_byte_length` bytes.
+3. Decode the index; assert the decoded entry count equals
+   `n_blocks`.
+4. Region queries binary-search the in-memory index by
+   `(chrom_id, first_pos, last_pos)`; sequential reads ignore the
+   index entirely and stream from block 0.
+
+A reader that reaches EOF without seeing the trailer, or whose
+trailer arithmetic disagrees with `n_blocks`, reports a hard
+truncation / corruption error. There is no auto-recovery.
+
+## Versioning policy (current draft)
+
+The version pair lives in the TOML header as
+`format-version = "MAJOR.MINOR"` (string). Reader behaviour:
+
+- **Same major, same or lower minor.** Reader fully understands the
+  file. Unknown header keys are skipped (TOML schema is open by
+  convention here); block-level column dispatch goes by tag; required
+  unknown tags are an error (forbidden in a properly-issued minor
+  bump), optional unknown tags are skipped.
+- **Same major, higher minor than the reader supports.** Reader
+  consumes the file by tag dispatch. Unknown header keys are
+  skipped. Required column tags the reader does not know abort
+  with a clear error — but minor bumps are not allowed to add
+  required content (§"File-scope extensions (deferred to v1.x)"),
+  so a properly-issued v1.x file is always consumable by a v1.0
+  reader. Optional unknowns are silently skipped.
+- **Higher major.** Reader aborts immediately with "this file was
+  written by a newer format major version; please update". No
+  attempt to parse.
+- **Lower major (downgrade).** Reader aborts immediately.
+
+A writer always emits the *lowest* `(major, minor)` that covers the
+content it wrote. A v1.1 writer that happens to emit no v1.1-only
+columns produces a v1.0 file. This keeps the producer side honest
+about which readers can consume the artefact.
+
+## Non-goals
+
+- **No partial-file recovery.** A truncated file is an error, not
+  a recoverable state.
+- **No BCF/VCF interoperability at the byte level.** Optional
+  exporters live in their own module and do not constrain the on-disk
+  format (architecture doc §"Why custom binary rather than BCF").
+- **No backward compatibility for the v0 PSP draft** that this
+  document supersedes; nothing was ever written in the PSP
+  layout, so there is no legacy to read.
+
+## Appendix — Design decisions log
+
+This appendix preserves the reasoning behind each major design
+decision so future readers can understand *why* the format looks
+the way it does, not just *what* it requires. Each entry was once
+an open question during the design discussion; the resolution is
+recorded here. Two groups: **forward-compatibility** (the shape of
+the versioning / extensibility story) and **parameters & layout
+details** (defaults and field widths).
+
+### Forward-compatibility
+
+**~~Q-IDX — should the format carry a random-access index?~~**
+*Resolved 2026-05-13: mandatory tail-mounted block index (option 2),
+specified in §"Block index".*
+
+**~~Q-HDR — should the file header be plain text rather than binary?~~**
+*Resolved 2026-05-13: yes — TOML body framed by `PSP\n` magic and
+`---END-HEADER---\n` sentinel, ASCII per SAM v1.6 §1.2.1 conventions
+for v1.0 values. Specified in §"File header" and §"Encoding
+conventions / Header (plain-text TOML)".*
+
+**~~Q-FC1 — versioning granularity: file-level only, or also
+per-column?~~**
+*Resolved 2026-05-13: file-level only. The `format-version` in
+the TOML header is the single version axis. Per-column versioning
+adds machinery for a problem that can be addressed more simply by
+minting a new column tag when a column's semantics change (the
+Q-FC3 "Option 2" path). Knock-on: drop option 3 from Q-FC3.*
+
+**~~Q-FC2 — should the file header carry a "columns used" manifest
+in addition to per-block manifests?~~**
+*Resolved 2026-05-13: yes, and the manifest carries the full schema
+(VCF-style), not just a list of names. Specified in §"File header
+— binary schema". The header's `[[column]]` array is the file's
+single source of truth for column semantics; the per-block manifest
+references it by tag and carries only the per-block-varying fields
+(tag, compressed_len, uncompressed_len).*
+
+**~~Q-FC3 — how is a "semantic change to an existing column" expressed?~~**
+*Deferred 2026-05-13: no v1.0 commitment. The case ("we changed the
+meaning of an existing column's bytes without changing their type")
+is hypothetical and may never arise. When/if it does, the policy
+will be decided then; the choice is between a major bump and
+minting a new column tag (the option 3 "per-column version flag"
+path is closed by the Q-FC1 resolution).*
+
+**~~Q-FC4 — should minor bumps be allowed to promote an
+optional tag to required?~~**
+*Resolved 2026-05-13 (alongside the capability-list YAGNI cleanup):
+no. Minor bumps add only optional content; promoting optional to
+required is a major bump. Stated as the load-bearing "minor-bump
+rule" in §"File-scope extensions (deferred to v1.x)".*
+
+**~~Q-FC5 — should a higher-minor reader be required to roundtrip a
+lower-minor file losslessly?~~**
+*Deferred 2026-05-13: no v1.0 commitment. No repacking / relocation
+tool exists or is planned; when one does, the requirement is easy
+to retrofit (it's a property of the tool, not the format).*
+
+**~~Q-FC6 — capability list: dependencies between capabilities?~~**
+*Moot 2026-05-13: v1.0 has no capability list (YAGNI; see §"File-
+scope extensions (deferred to v1.x)"). If a future minor bump
+introduces inter-extension dependencies, the question reopens then.*
+
+**~~Q-FC7 — what reserves do we keep for "we ran out of room"?~~**
+*YAGNI 2026-05-13. The column-tag-range reserves already in §"Reserved
+column-tag ranges" are kept; no new reserved-flag bits are pre-baked.
+The per-block manifest's `flags` byte was dropped entirely when the
+binary schema moved to the header (Q-FC2 resolution), so the question
+about reserving bits in it is moot. Varint widths grow indefinitely
+as needed. We'll add reserves when a concrete need appears.*
+
+### Parameters & layout details
+
+**~~Q-PL1 — default zstd compression level.~~**
+*Resolved 2026-05-13: writer hardcodes zstd level 9. Not CLI-
+exposed in v1 (too much detail for the standard user). The format
+does not record the level; readers decompress any level. A future
+benchmark on real data may change the writer's default — that is a
+writer change, not a format change. See §"Compression".*
+
+**~~Q-PL2 — default target uncompressed block size.~~**
+*Resolved 2026-05-13: writer hardcodes 16 MiB. Files are expected
+to be large, so ratio matters more than per-block latency; bigger
+blocks compress better. Not CLI-exposed in v1; not recorded in the
+format. A future benchmark on real data may revise the default —
+that is a writer change, not a format change. See §"Block sizing".*
+
+**~~Q-PL3 — `f32` vs `f64` for `allele_q_sum_log`.~~**
+*Resolved 2026-05-13: `f64`, matching the implementation
+([pileup/mod.rs:357](../../src/per_sample_caller/pileup/mod.rs#L357),
+`AlleleSupportStats::q_sum: f64`). Storing at the accumulator's
+native precision avoids a truncation step at the I/O boundary; the
+extra 4 B per allele is negligible against the rest of the per-
+allele payload.*
+
+**~~Q-PL4 — `u8` vs `u16` for phase-chain slot ids.~~**
+*Resolved 2026-05-13: `u16`, matching the implementation
+([pileup/slot_allocator.rs:21](../../src/per_sample_caller/pileup/slot_allocator.rs#L21),
+`pub type SlotId = u16`). Chosen there for ~16× headroom over the
+active-slot cap (`DEFAULT_MAX_ACTIVE_SLOTS = 4096`); `u8`'s 256-slot
+ceiling would risk silent overflow at higher coverages.*
+
+**~~Q-PL5 — reserve a v1.x optional column for 2-bit packed allele
+sequences?~~**
+*Resolved 2026-05-13: no. Trust zstd. The size win over uppercase-
+ASCII bytes is expected to be minimal once zstd has absorbed the
+A/C/G/T redundancy across adjacent records, and a packed encoding
+would add a parallel writer/reader path for negligible gain.*
+
+**~~Q-PL6 — writer constraint on column ordering within a block.~~**
+*Resolved 2026-05-13: strict requirement. Per-block manifest entries
+are tag-ascending with no duplicates; writers sort at emit time,
+readers reject violations. See §"Column ordering within a block".*
+
+**~~Q-PL7 — trailer shape.~~**
+*Resolved alongside Q-IDX: trailer is now 32 B carrying
+`index_offset`, `index_byte_length`, `n_blocks`, magic, padding.
+See §"File trailer".*
+
+**~~Q-PL8 — per-block checksum.~~**
+*Resolved 2026-05-13: zstd's built-in per-frame checksum is
+sufficient; no extra block-level CRC. See §"Compression".*
+
+**~~Q-PL9 — float byte-layout details: NaN handling.~~**
+*Resolved 2026-05-13: hard error. NaN (or ±∞) in any float column
+is a producer bug; readers reject the file with a clear message
+naming the column, the block, and the offending entry. Applies to
+every IEEE 754 float column the format ever carries, not just
+`allele-q-sum-log`. Consistent with `design_principles.md`
+§"Errors must not pass silently".*

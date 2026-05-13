@@ -57,7 +57,7 @@ Out of scope:
 - The freebayes Bayesian model layer (`Genotype.cpp`,
   `DataLikelihood.cpp`, `Marginals.cpp`, `Result*.cpp`,
   `Bias.cpp`, `Dirichlet.cpp`, `Ewens.cpp`, `Multinomial.cpp`,
-  `Contamination.cpp`). The `.psf` scalar set was already
+  `Contamination.cpp`). The `.psp` scalar set was already
   derived from this layer in
   [freebayes_posterior_gt_probs.md](../specs/freebayes_posterior_gt_probs.md);
   no new evidence is sought here.
@@ -67,7 +67,7 @@ Out of scope:
   `getPartialObservationsOfHaplotype`). That is freebayes'
   *evaluation*-time machinery; we have no analogue and don't
   need one (Stage 4's grouping plus Stage 5's per-group
-  reconstruction does the same job from `.psf` data).
+  reconstruction does the same job from `.psp` data).
 
 ## 2. Summary verdict
 
@@ -719,7 +719,7 @@ For the record, so we don't relitigate them:
   argument applies here: our scalar set + phase chain id
   lets Stage 5 reconstruct the same compound-haplotype
   evidence at merge time, without committing to a single
-  `maxComplexGap` window during `.psf` writing. Stage 5
+  `maxComplexGap` window during `.psp` writing. Stage 5
   has the cohort context to decide which
   near-but-not-overlapping events deserve to be co-called;
   Stage 1 does not. Pulling the freebayes pattern forward
@@ -781,7 +781,7 @@ position-shaped output cannot represent — applies
 verbatim against freebayes too. Even though freebayes builds
 haplotype alleles internally via `buildHaplotypeAlleles`, that
 machinery runs at *evaluation* time on a window of registered
-alleles, not at *write* time on a stream. Our `.psf` is the
+alleles, not at *write* time on a stream. Our `.psp` is the
 write-time artefact, and the explicit close boundary is what
 lets us stream it without back-patching while preserving
 phase-chain reach.
