@@ -26,6 +26,12 @@
 //! appends, so those allocations are still measured exactly as
 //! production would produce them.
 
+// Opt-in mimalloc global allocator (cargo bench --features alloc-mimalloc ...).
+// Off by default so the bench runs against the system allocator.
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::hint::black_box;
 use std::io::{self, BufWriter, Write};
 use std::time::Duration;

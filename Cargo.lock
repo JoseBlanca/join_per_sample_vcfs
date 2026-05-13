@@ -588,6 +588,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37c93d8daa9d8a012fd8ab92f088405fb202ea0b6ab73ee2482ae66af4f42091"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -648,6 +657,7 @@ dependencies = [
  "dhat",
  "flate2",
  "lru",
+ "mimalloc",
  "noodles-core",
  "noodles-cram",
  "noodles-fasta",
@@ -660,6 +670,15 @@ dependencies = [
  "toml",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]

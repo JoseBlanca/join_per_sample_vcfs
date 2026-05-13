@@ -18,6 +18,7 @@ ahash = "0.8.12"
 anyhow = "1.0.102"
 bytemuck = "1"
 dhat = { version = "0.3", optional = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 flate2 = "1.1.9"
 lru = "0.16.3"
 noodles-core = "0.19.0"
@@ -38,6 +39,13 @@ zstd = "0.13"
 # the global allocator for `dhat::Alloc` and produce `dhat-heap.json`.
 # Off by default so production builds carry no dhat code.
 dhat-heap = ["dep:dhat"]
+# Enable in `cargo bench --features alloc-mimalloc --bench psp_writer_perf`
+# (or any other bench / example) to swap the global allocator for
+# `mimalloc`. Off by default so production binaries pick the system
+# allocator. The mutex exclusion with `dhat-heap` is enforced at the
+# `#[global_allocator]` declaration in each bench / example shim —
+# enabling both at once is a compile error there.
+alloc-mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 bstr = "1"
