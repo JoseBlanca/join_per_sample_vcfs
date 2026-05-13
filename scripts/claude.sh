@@ -32,6 +32,7 @@ exec podman run --rm -it \
     -w "$PROJECT_DIR" \
     "${CLAUDE_MOUNTS[@]}" \
     -e ANTHROPIC_API_KEY \
+    -e IS_SANDBOX=1 \
     -e CARGO_TARGET_DIR="$PROJECT_DIR/target-container" \
     "$IMAGE" \
     claude --dangerously-skip-permissions "$@"
