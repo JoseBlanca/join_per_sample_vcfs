@@ -208,6 +208,63 @@ pub fn decode_scalar_column<T: WireScalar>(
     Ok(values)
 }
 
+/// Slab-decode a fixed-width scalar column for `T: Pod` on
+/// little-endian targets. Symmetric with the writer's
+/// [`encode_list_column_csr`] LE fast path (L6 in
+/// `ia/reviews/perf_psp_reader_2026-05-13.md`).
+///
+/// On `target_endian = "little"` the entire payload is a single
+/// `bytemuck::cast_slice::<u8, T>(bytes).to_vec()` — one length
+/// check, one allocation, one memcpy, no per-element loop. Replaces
+/// the per-element `try_into().unwrap()` + `from_le_bytes` +
+/// `Vec::push` chain in [`decode_scalar_column`].
+///
+/// Falls back to the per-element [`decode_scalar_column`] path on
+/// big-endian targets.
+///
+/// `T: Pod` covers every v1.0 fixed-width scalar except `bool`
+/// (which keeps the per-element path because `0/1`-validation is
+/// not a memcpy).
+///
+/// Errors:
+/// - [`PspReadError::ColumnTruncated`] if the buffer is shorter
+///   than `expected_count * T::FIXED_BYTE_WIDTH` bytes.
+/// - [`PspReadError::ColumnTrailingBytes`] if it is longer.
+pub fn decode_scalar_column_pod<T: WireScalar + bytemuck::Pod>(
+    bytes: &[u8],
+    expected_count: usize,
+    column_name: &str,
+) -> Result<Vec<T>, PspReadError> {
+    #[cfg(target_endian = "little")]
+    {
+        let need = expected_count
+            .checked_mul(T::FIXED_BYTE_WIDTH)
+            .ok_or_else(|| PspReadError::ColumnTruncated {
+                column: column_name.to_string(),
+                decoded: 0,
+                expected: expected_count,
+            })?;
+        if bytes.len() < need {
+            return Err(PspReadError::ColumnTruncated {
+                column: column_name.to_string(),
+                decoded: bytes.len() / T::FIXED_BYTE_WIDTH,
+                expected: expected_count,
+            });
+        }
+        if bytes.len() > need {
+            return Err(PspReadError::ColumnTrailingBytes {
+                column: column_name.to_string(),
+                trailing: bytes.len() - need,
+            });
+        }
+        Ok(bytemuck::cast_slice::<u8, T>(&bytes[..need]).to_vec())
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        decode_scalar_column::<T>(bytes, expected_count, column_name)
+    }
+}
+
 // ---------------------------------------------------------------------
 // Varint scalar column codecs — variable-width
 // ---------------------------------------------------------------------

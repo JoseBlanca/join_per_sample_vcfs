@@ -29,7 +29,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::block::{
     BlockHeader, ColumnManifestEntry, decode_block_header, decode_bytes_split, decode_list_column,
-    decode_scalar_column, decode_varint_column, zstd_decompress,
+    decode_scalar_column_pod, decode_varint_column, zstd_decompress,
 };
 use super::errors::{
     BlockHeaderInvariantKind, MAX_SNAPSHOT_SLOTS_IN_ERROR, PhaseChainConsistencyKind, PspReadError,
@@ -104,6 +104,18 @@ impl<R: Read + Seek> PspReader<R> {
     /// `BlockIndexPosOutOfRange` on a block-index entry that
     /// disagrees with the parsed header.
     ///
+    /// # Buffering
+    ///
+    /// `PspReader::new` issues five `seek` + four `read_exact` calls
+    /// just to open, and each block then triggers ~12 small
+    /// `read_exact` calls (one per column). Wrap a real-file source
+    /// in `BufReader::with_capacity(64 * 1024, file)` (or larger) —
+    /// the default 8 KiB `BufReader::new` is too small to absorb the
+    /// per-column reads in a single kernel `read(2)`. For multi-GB
+    /// files consider 1 MiB or larger. `Cursor<Vec<u8>>` and other
+    /// in-memory sources don't need wrapping. L8 in
+    /// `ia/reviews/perf_psp_reader_2026-05-13.md`.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -112,7 +124,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// use merge_per_sample_vcfs::per_sample_caller::psp::PspReader;
     ///
     /// let f = File::open("sample.psp")?;
-    /// let mut reader = PspReader::new(BufReader::new(f))?;
+    /// let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, f))?;
     /// println!("sample = {}", reader.header().sample);
     /// for r in reader.records() {
     ///     let _ = r?;
@@ -346,7 +358,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// use merge_per_sample_vcfs::per_sample_caller::psp::PspReader;
     ///
     /// let f = File::open("sample.psp")?;
-    /// let mut reader = PspReader::new(BufReader::new(f))?;
+    /// let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, f))?;
     /// let n: usize = reader
     ///     .region_records(0, 1_000_000, 1_500_000)
     ///     .filter_map(|r| r.ok())
@@ -1235,26 +1247,26 @@ fn decode_one_column<R: Read>(
                 Some(MAX_ALLELE_SEQ_LEN),
             )?)
         }
-        ColumnKey::AlleleObsCount => DecodedColumn::AlleleObsCount(decode_scalar_column::<u32>(
+        ColumnKey::AlleleObsCount => DecodedColumn::AlleleObsCount(decode_scalar_column_pod::<u32>(
             &bytes,
             n_total_alleles,
             column_name,
         )?),
-        ColumnKey::AlleleQSumLog => DecodedColumn::AlleleQSumLog(decode_scalar_column::<f64>(
+        ColumnKey::AlleleQSumLog => DecodedColumn::AlleleQSumLog(decode_scalar_column_pod::<f64>(
             &bytes,
             n_total_alleles,
             column_name,
         )?),
-        ColumnKey::AlleleFwdCount => DecodedColumn::AlleleFwdCount(decode_scalar_column::<u32>(
+        ColumnKey::AlleleFwdCount => DecodedColumn::AlleleFwdCount(decode_scalar_column_pod::<u32>(
             &bytes,
             n_total_alleles,
             column_name,
         )?),
         ColumnKey::AllelePlacedLeftCount => DecodedColumn::AllelePlacedLeftCount(
-            decode_scalar_column::<u32>(&bytes, n_total_alleles, column_name)?,
+            decode_scalar_column_pod::<u32>(&bytes, n_total_alleles, column_name)?,
         ),
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
-            decode_scalar_column::<u32>(&bytes, n_total_alleles, column_name)?,
+            decode_scalar_column_pod::<u32>(&bytes, n_total_alleles, column_name)?,
         ),
         ColumnKey::NewChainSlots => DecodedColumn::NewChainSlots(decode_list_column::<SlotId>(
             &bytes,
