@@ -331,4 +331,63 @@ pub enum PspWriteError {
     /// pins the bounds.
     #[error("header TOML body length {got} outside allowed range [{min}, {max}]")]
     HeaderBodyTooLarge { got: u64, min: u64, max: u64 },
+
+    /// A record handed to `write_record` violates a spec invariant.
+    /// `reason` names which rule failed; `record_index` is the
+    /// zero-based position in the writer's input stream so the
+    /// error message can point at the offending input.
+    #[error("invalid record at index {record_index}: {reason}")]
+    InvalidRecord { record_index: u64, reason: String },
+
+    /// A record's `chrom_id` is outside the writer's chromosome
+    /// table (declared via [`WriterHeader::chromosomes`] in `new`).
+    #[error(
+        "record at index {record_index} has chrom_id {chrom_id}; header declared only {n_chroms} chromosomes"
+    )]
+    UnknownChromId {
+        record_index: u64,
+        chrom_id: u32,
+        n_chroms: u32,
+    },
+
+    /// A record's `pos` is `0` (1-based) or exceeds the contig's
+    /// declared length.
+    #[error(
+        "record at index {record_index}: pos {pos} out of [1, {chrom_length}] for chrom_id {chrom_id}"
+    )]
+    PosOutOfRange {
+        record_index: u64,
+        chrom_id: u32,
+        pos: u32,
+        chrom_length: u32,
+    },
+
+    /// Two consecutive records on the same chromosome have
+    /// non-strictly-increasing positions, or `chrom_id` decreased
+    /// from the previous record.
+    #[error(
+        "record at index {record_index} regresses: ({this_chrom}, {this_pos}) follows ({prev_chrom}, {prev_pos})"
+    )]
+    OutOfOrderRecord {
+        record_index: u64,
+        prev_chrom: u32,
+        prev_pos: u32,
+        this_chrom: u32,
+        this_pos: u32,
+    },
+
+    /// A phase-chain marker is inconsistent with the running
+    /// active-slot set: `new_chains` references a slot already
+    /// active, or `expired_chains` references a slot not active.
+    #[error("record at index {record_index}: phase-chain marker inconsistency: {reason}")]
+    PhaseChainMarkerInconsistency { record_index: u64, reason: String },
+
+    /// `finish` has been called but the writer-side encoded block
+    /// header rejected our own data — bug in the writer.
+    #[error("block emission failed at index {block_index}: {source}")]
+    BlockEmission {
+        block_index: u64,
+        #[source]
+        source: PspReadError,
+    },
 }

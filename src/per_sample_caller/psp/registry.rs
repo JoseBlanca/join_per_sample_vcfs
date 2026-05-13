@@ -140,6 +140,13 @@ impl ElementType {
     }
 }
 
+/// Hard cap on the bytes of a single allele's sequence (the
+/// `allele_seq_len` row of the registry). Spec §"Required columns
+/// in v1.0" → 0x03 says: real biological alleles are far shorter,
+/// and a value over this cap is a producer bug. Enforced at write
+/// time and at read time.
+pub const MAX_ALLELE_SEQ_LEN: u64 = 10_000;
+
 /// One row of the column-tag registry. Identical information appears
 /// in the spec's §"Required columns in v1.0" table and in every
 /// v1.0 file's TOML `[[column]]` array; this struct is the canonical

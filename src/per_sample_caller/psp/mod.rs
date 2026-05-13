@@ -24,5 +24,6 @@ pub mod index;
 pub mod registry;
 pub mod trailer;
 pub mod varint;
+pub mod writer;
 
 pub use errors::{PspReadError, PspWriteError};
