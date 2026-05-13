@@ -21,7 +21,6 @@
 //! these — that is by design, because the file may be read on a
 //! machine that did not write it.
 
-use std::collections::BTreeSet;
 use std::io::Write;
 
 use super::block::{
@@ -124,10 +123,17 @@ pub struct PspWriter<W: Write> {
     /// Open block — `None` when the writer is between blocks (just
     /// after `new` or just after a flush).
     block: Option<BlockAccumulator>,
-    /// Running active phase-chain slot set. Updated as records'
-    /// `new_chains` / `expired_chains` markers are applied;
-    /// snapshotted at block start.
-    active_slots: BTreeSet<SlotId>,
+    /// Running active phase-chain slot set, kept sorted ascending.
+    /// Updated as records' `new_chains` / `expired_chains` markers
+    /// are applied; snapshotted at block start.
+    ///
+    /// Sorted `Vec<SlotId>` (with `binary_search` membership) wins
+    /// over `BTreeSet<u16>` for the small active counts typical of
+    /// phasing (~8 active per locus): one contiguous allocation, one
+    /// cache line of data for small `n`, and the block-start snapshot
+    /// is a single memcpy via `.clone()` instead of a tree walk
+    /// (S1+S2 in `ia/reviews/perf_psp_writer_2026-05-13.md`).
+    active_slots: Vec<SlotId>,
     /// Last admitted record's `(chrom_id, pos)`, for monotonicity
     /// enforcement across `write_record` calls.
     last_locus: Option<(u32, u32)>,
@@ -182,7 +188,7 @@ impl<W: Write> PspWriter<W> {
             sink_offset,
             index_entries: Vec::new(),
             block: None,
-            active_slots: BTreeSet::new(),
+            active_slots: Vec::new(),
             last_locus: None,
             records_seen: 0,
             compressor,
@@ -239,7 +245,10 @@ impl<W: Write> PspWriter<W> {
                 }
                 Vec::new()
             } else {
-                self.active_slots.iter().copied().collect()
+                // `active_slots` is kept sorted ascending, which is
+                // the BlockHeader's contract for `active_chain_slots`.
+                // `.clone()` is one allocation + memcpy — S2.
+                self.active_slots.clone()
             };
             self.block = Some(BlockAccumulator::new(record.chrom_id, record.pos, snapshot));
         }
@@ -434,9 +443,10 @@ impl<W: Write> PspWriter<W> {
         record: &PileupRecord,
     ) -> Result<(), PspWriteError> {
         // Phase-chain marker consistency: expired must be currently
-        // active; new must not be currently active.
+        // active; new must not be currently active. Sorted-Vec
+        // membership is `binary_search`.
         for &slot in &record.expired_chains {
-            if !self.active_slots.contains(&slot) {
+            if self.active_slots.binary_search(&slot).is_err() {
                 return Err(PspWriteError::PhaseChainMarkerInconsistency {
                     record_index,
                     reason: format!("expired chain slot {slot} not currently active"),
@@ -444,24 +454,31 @@ impl<W: Write> PspWriter<W> {
             }
         }
         for &slot in &record.new_chains {
-            if self.active_slots.contains(&slot) {
+            if self.active_slots.binary_search(&slot).is_ok() {
                 return Err(PspWriteError::PhaseChainMarkerInconsistency {
                     record_index,
                     reason: format!("new chain slot {slot} already active"),
                 });
             }
         }
-        // Apply markers to running set.
+        // Apply markers to running set. Expired first, then new
+        // (matches the BTreeSet-era semantics).
         for &slot in &record.expired_chains {
-            self.active_slots.remove(&slot);
+            if let Ok(idx) = self.active_slots.binary_search(&slot) {
+                self.active_slots.remove(idx);
+            }
         }
         for &slot in &record.new_chains {
-            self.active_slots.insert(slot);
+            // `slot` was just checked not in active_slots, so this
+            // returns Err with the sorted insertion index.
+            if let Err(idx) = self.active_slots.binary_search(&slot) {
+                self.active_slots.insert(idx, slot);
+            }
         }
         // Now per-allele chain_slots must all be in the running set.
         for (i, allele) in record.alleles.iter().enumerate() {
             for &slot in &allele.chain_slots {
-                if !self.active_slots.contains(&slot) {
+                if self.active_slots.binary_search(&slot).is_err() {
                     return Err(PspWriteError::PhaseChainMarkerInconsistency {
                         record_index,
                         reason: format!(
