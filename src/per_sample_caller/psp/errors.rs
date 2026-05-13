@@ -105,6 +105,21 @@ pub enum BlockHeaderInvariantKind {
 
     #[error("{field}: value {value} exceeds u16 range")]
     FieldExceedsU16 { field: &'static str, value: u64 },
+
+    /// In **sequential** read mode, a block's
+    /// `active_chain_slots_at_block_start` snapshot disagreed with
+    /// the active set the reader carried forward from the previous
+    /// block (spec check #11). Random-access region reads do not
+    /// perform this check — they trust the snapshot.
+    #[error(
+        "active-chain-slots snapshot mismatch entering block {block}: \
+         snapshot has {snapshot_len} slots, carried-in set has {expected_len}"
+    )]
+    SnapshotMismatch {
+        block: usize,
+        snapshot_len: usize,
+        expected_len: usize,
+    },
 }
 
 /// Rules a record handed to `write_record` can violate. Carried as
@@ -157,6 +172,30 @@ pub enum PhaseChainMarkerInconsistencyKind {
     #[error("new chain slot {slot} already active")]
     NewAlreadyActive { slot: u16 },
 
+    #[error("allele {allele_index} references chain slot {slot} not in active set")]
+    AlleleReferencesUnknownSlot { allele_index: usize, slot: u16 },
+}
+
+/// Reasons a phase-chain consistency rule can fail at read time.
+/// Mirrors [`PhaseChainMarkerInconsistencyKind`] on the writer
+/// side but is reader-shaped: errors fire while materialising
+/// records or crossing block boundaries.
+#[non_exhaustive]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum PhaseChainConsistencyKind {
+    /// `expired_chain_slots` references a slot that was not in the
+    /// active set carried into the record.
+    #[error("expired chain slot {slot} not currently active")]
+    ExpiredNotActive { slot: u16 },
+
+    /// `new_chain_slots` references a slot already in the active
+    /// set when the record was reached.
+    #[error("new chain slot {slot} already active")]
+    NewAlreadyActive { slot: u16 },
+
+    /// An allele's `chain_slots` references a slot that is not in
+    /// the active set after applying this record's expired + new
+    /// markers.
     #[error("allele {allele_index} references chain slot {slot} not in active set")]
     AlleleReferencesUnknownSlot { allele_index: usize, slot: u16 },
 }
@@ -408,6 +447,70 @@ pub enum PspReadError {
     BlockHeaderInvariant {
         #[source]
         kind: BlockHeaderInvariantKind,
+    },
+
+    /// A `block_offset` in the decoded block index is out of order
+    /// or out of range. `PspReader` rejects this before any block
+    /// is read so a tampered index cannot redirect block reads to
+    /// arbitrary file offsets.
+    #[error(
+        "block index entry {block}: block_offset {offset} \
+         outside expected range [{min}, {max})"
+    )]
+    BlockIndexOffsetInvalid {
+        block: usize,
+        offset: u64,
+        min: u64,
+        max: u64,
+    },
+
+    /// A block-index entry's `chrom_id` is outside the file's
+    /// declared chromosome table. The header parse must succeed
+    /// before this check runs.
+    #[error(
+        "block index entry {block}: chrom_id {chrom_id} \
+         outside the file's chromosome table (n_chroms = {n_chroms})"
+    )]
+    BlockIndexChromOutOfRange {
+        block: usize,
+        chrom_id: u32,
+        n_chroms: u32,
+    },
+
+    /// A block-index entry's `first_pos` or `last_pos` lies outside
+    /// `[1, chromosomes[chrom_id].length]`, or `first_pos >
+    /// last_pos`.
+    #[error(
+        "block index entry {block}: pos {pos} outside [1, {chromosome_length}] \
+         for chrom_id {chrom_id}"
+    )]
+    BlockIndexPosOutOfRange {
+        block: usize,
+        chrom_id: u32,
+        pos: u32,
+        chromosome_length: u32,
+    },
+
+    /// An `f32` or `f64` column carried a non-finite value (NaN or
+    /// ±∞). The writer enforces finite-only on its side; this
+    /// fires if a hand-crafted or torn file slips a non-finite
+    /// past the zstd frame check. Spec check #9.
+    #[error("column {column:?} entry {entry}: non-finite float {value}")]
+    NonFiniteFloat {
+        column: String,
+        entry: usize,
+        value: f64,
+    },
+
+    /// A phase-chain marker or per-allele chain reference at
+    /// record `record_in_block` of block `block` is inconsistent
+    /// with the running active-slot set. Spec check #10.
+    #[error("phase-chain consistency violation at block {block} record {record_in_block}")]
+    PhaseChainConsistency {
+        block: usize,
+        record_in_block: u32,
+        #[source]
+        kind: PhaseChainConsistencyKind,
     },
 }
 

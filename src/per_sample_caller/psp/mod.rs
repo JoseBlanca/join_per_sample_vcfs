@@ -8,8 +8,8 @@
 //! authoritative implementation.
 //!
 //! Module layout (most sub-modules are `pub(crate)` — accessed
-//! through the [`writer::PspWriter`] entry point and the public
-//! [`header`] type surface):
+//! through the [`writer::PspWriter`] / [`reader::PspReader`] entry
+//! points and the public [`header`] type surface):
 //!
 //! - `registry`: the v1.0 column-tag registry — the single source
 //!   of truth shared by writer, reader, and `psp_spec_dump`.
@@ -17,11 +17,9 @@
 //! - `errors`: typed error enums (re-exported below).
 //! - [`header`], `block`, `index`, `trailer`: per-section wire codecs.
 //! - [`writer`]: streaming [`writer::PspWriter`] over any `Write` sink.
-//!
-//! The reader-side public API (`PspReader`) is planned but not yet
-//! implemented. The decoder primitives are already in place and
-//! exercised by their respective `#[cfg(test)] mod tests` round-trip
-//! suites.
+//! - [`reader`]: streaming [`reader::PspReader`] over any `Read +
+//!   Seek` source — sequential iteration over every record, plus
+//!   coordinate-keyed `region_records` queries via the block index.
 
 // Mi5: most submodules are crate-internal scaffolding for the
 // writer/reader implementations. The bench imports `header::*` and
@@ -31,6 +29,7 @@ pub(crate) mod block;
 pub(crate) mod errors;
 pub mod header;
 pub(crate) mod index;
+pub mod reader;
 pub(crate) mod registry;
 pub(crate) mod trailer;
 pub(crate) mod varint;
@@ -44,6 +43,8 @@ mod test_fixtures;
 // submodule. The `*Kind` sub-enums must be re-exported too because
 // the top-level error variants carry them as `#[source]`.
 pub use errors::{
-    BlockHeaderInvariantKind, InvalidRecordKind, PhaseChainMarkerInconsistencyKind, PspReadError,
-    PspWriteError, ScalarDecodeError, TomlSerError, VarintError,
+    BlockHeaderInvariantKind, InvalidRecordKind, PhaseChainConsistencyKind,
+    PhaseChainMarkerInconsistencyKind, PspReadError, PspWriteError, ScalarDecodeError,
+    TomlSerError, VarintError,
 };
+pub use reader::{PspReader, RecordsIter};
