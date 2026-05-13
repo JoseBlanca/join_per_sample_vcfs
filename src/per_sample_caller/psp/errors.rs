@@ -60,6 +60,62 @@ pub enum PspReadError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Trailer's magic bytes did not equal `PSPE`. Either the file is
+    /// not a `.psp`, has been truncated past the trailer's start, or
+    /// is corrupted at the tail.
+    #[error("trailer magic mismatch: got {got:02x?}, expected {expected:02x?}")]
+    BadTrailerMagic { got: [u8; 4], expected: [u8; 4] },
+
+    /// The XXH3-64 hash (low 32 bits) computed over the index bytes
+    /// does not match the value stored in the trailer. Spec
+    /// §"Header-binary consistency" rule 11 / spec §"File trailer".
+    /// Hard error — the index region is the one file region not
+    /// covered by a zstd frame checksum, and silently trusting a
+    /// corrupt index would redirect every subsequent block read to
+    /// wrong bytes.
+    #[error("block index checksum mismatch: stored {stored:#010x}, computed {computed:#010x}")]
+    IndexChecksum { stored: u32, computed: u32 },
+
+    /// Failed to decode a varint inside a block-index entry.
+    #[error("block index entry {entry} field {field}: {source}")]
+    IndexEntryDecode {
+        entry: usize,
+        field: &'static str,
+        #[source]
+        source: VarintError,
+    },
+
+    /// A block-index varint decoded successfully but exceeds the
+    /// representable range of the field's owning type (`u32` for the
+    /// genomic-coordinate-ish fields).
+    #[error("block index entry {entry} field {field}: value {value} exceeds the field's u32 range")]
+    IndexFieldOverflow {
+        entry: usize,
+        field: &'static str,
+        value: u64,
+    },
+
+    /// The block-index buffer ran out before a fixed-width field
+    /// (currently only `block_offset: u64`) could be read.
+    #[error("block index ran out of bytes while reading entry {entry} field {field}")]
+    IndexTruncated { entry: usize, field: &'static str },
+
+    /// The block-index buffer carried extra bytes past the last
+    /// entry. Either the trailer's `index_byte_length` is wrong, the
+    /// writer over-counted, or there is corruption between the index
+    /// and the trailer.
+    #[error(
+        "block index has {trailing_bytes} trailing bytes after the last entry; index_byte_length and the writer disagree"
+    )]
+    IndexTrailingBytes { trailing_bytes: usize },
+
+    /// The decoded entry count disagrees with the trailer's
+    /// `n_blocks` field. Either the index is short of entries (and a
+    /// varint truncation should have been caught earlier) or the
+    /// trailer's count is wrong.
+    #[error("block index has {got} entries, trailer claims {expected}")]
+    IndexEntryCountMismatch { got: usize, expected: u64 },
 }
 
 /// Errors the `.psp` writer can emit. Variants land as the

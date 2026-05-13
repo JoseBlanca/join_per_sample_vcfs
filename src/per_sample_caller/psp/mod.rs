@@ -18,7 +18,9 @@
 //! `PspWriter` / `PspReader` public API land in subsequent slices.
 
 pub mod errors;
+pub mod index;
 pub mod registry;
+pub mod trailer;
 pub mod varint;
 
 pub use errors::{PspReadError, PspWriteError};
