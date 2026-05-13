@@ -17,9 +17,10 @@ document's Stage 2 section. The artefact's high-level shape:
   markers per record;
 - columnar storage within zstd-compressed blocks;
 - a mandatory tail-mounted **block index**;
-- a plain-text **TOML file header** framed by a `PSP\n` magic and a
-  `---END-HEADER---\n` sentinel — any tool with `head` / `cat` /
-  `grep` or a TOML parser can inspect file metadata without our
+- a plain-text **TOML file header** framed by a `PSP\n` magic, an
+  8-byte little-endian length prefix, and a `---END-HEADER---\n`
+  sentinel — any tool with `head` / `cat` / `grep` or a TOML parser
+  can inspect file metadata without our
   software installed;
 - a **VCF-style binary schema** carried in the TOML header as a
   `[[column]]` array — the binary body is self-describing;
@@ -67,10 +68,10 @@ named fields"; we adopt the same posture.
 | `format-version` | `[0-9.]+` matching `[0-9]+\.[0-9]+` | n/a |
 | `sample` | ASCII printable (`[ -~]+`) | `@RG SM` |
 | `reference` | ASCII printable (`[ -~]+`) | filenames are ASCII in our domain |
-| `reference-md5` | exactly 32 lowercase hex characters | `@SQ M5` (SAM §1.3.2) |
 | `created` | TOML offset date-time (all ASCII) | n/a |
 | `chromosome.name` | SAM `@SQ SN` regex: `[0-9A-Za-z!#$%&+./:;?@^_|~-][0-9A-Za-z!#$%&*+./:;=?@^_|~-]*` | `@SQ SN` |
 | `chromosome.length` | positive integer in `[1, 2^31 − 1]` | `@SQ LN` |
+| `chromosome.md5` | exactly 32 lowercase hex characters | `@SQ M5` (SAM §1.3.2) |
 | `writer.tool`, `writer.version`, `writer.subcommand` | ASCII printable (`[ -~]+`); no `/`, `\` | n/a (`@PG PN`/`VN` analogue) |
 | `writer.input-crams[*]`, `writer.input-fasta` | ASCII printable filename (`[ -~]+`), no `/` or `\` — recorded as **basename only** to avoid leaking host paths (see §"File header — provenance and path stripping") | n/a |
 | `writer.parameters.<key>` | TOML bare key for `<key>` (`[A-Za-z0-9_-]+`); value type and range defined per parameter in the producer's config struct | n/a |
@@ -144,10 +145,14 @@ within block column payloads (§Block layout).
 ## File header
 
 The file header is plain-text TOML, framed by a small fixed-byte
-magic at the start and a fixed sentinel line at the end. Goal:
-every key piece of metadata about the file (sample, reference,
-contigs, writer version, creation time) is readable with
-standard Unix tools, with no `.psp`-specific software installed:
+magic at the start, an 8-byte little-endian `u64` length prefix
+giving the exact byte count of the TOML body, and a fixed sentinel
+line at the end. The length prefix is authoritative for locating
+the body boundary; the sentinel is kept as a structural cross-check
+and so that `head file.psp` ends cleanly on a recognisable line.
+Goal: every key piece of metadata about the file (sample, reference,
+contigs, writer version, creation time) is readable with standard
+Unix tools, with no `.psp`-specific software installed:
 
 ```
 $ head file.psp
@@ -163,59 +168,110 @@ reference      = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
 
 ```
 +-------------------------+
-| PSP\n                   | 4 bytes — magic. Printable ASCII; the
-+-------------------------+   trailing newline opens the first
-                              TOML line.
-| <TOML body>             | variable; valid TOML v1.0.0, restricted
-|                         |   per §"Per-field character set". Ends
-|                         |   with at least one `\n`.
+| PSP\n                   | 4 bytes — magic. Printable ASCII; lets
++-------------------------+   `file` / libmagic identify a `.psp`
+                              from offset 0.
+| toml_body_length        | 8 bytes — u64 little-endian. Authoritative
++-------------------------+   byte count of the TOML body that follows.
+                              Decoded directly from the bytes; no TOML
+                              parser is invoked to find the body's
+                              extent.
+| <TOML body>             | exactly `toml_body_length` bytes of valid
+|                         |   TOML v1.0.0, restricted per §"Per-field
+|                         |   character set". A writer SHOULD make the
+|                         |   last byte a `\n` so the sentinel that
+|                         |   follows starts on its own line for clean
+|                         |   `head` output, but the byte boundary is
+|                         |   set by `toml_body_length`, not by
+|                         |   scanning for a newline.
 +-------------------------+
-| ---END-HEADER---\n      | 17 bytes — sentinel line. The next byte
-+-------------------------+   is the first byte of block 0.
+| ---END-HEADER---\n      | 17 bytes — sentinel line. Redundant with
++-------------------------+   the length prefix for locating the body
+                              boundary, but verified by the reader as
+                              a structural cross-check (see "Why this
+                              framing" below). The next byte is the
+                              first byte of block 0.
 ```
 
 Constraints:
 
 - The magic is exactly the four bytes `'P'`, `'S'`, `'P'`, `'\n'`.
-- The TOML body ends with at least one `\n` so the sentinel starts
-  on its own line.
-- The byte sequence `\n---END-HEADER---\n` must not appear inside
-  any TOML value. The per-field rules (§"Per-field character set")
-  forbid `\n` in every v1.0 field, so this is automatic for
-  well-formed values; a producer that somehow tries to write a
-  multi-line value must reject the value at validation time.
-- Total header size (magic through sentinel inclusive) is bounded
-  by a soft limit of **1 MiB**. A header exceeding this is rejected.
+- `toml_body_length` is in the range `[1, 1048547]` — i.e. at least
+  one byte of TOML, and at most 1 MiB minus the framing overhead
+  (4 magic + 8 length + 17 sentinel = 29). A reader rejects any
+  value outside this range before allocating buffers.
+- Total header size (magic through sentinel inclusive) is therefore
+  bounded by a hard limit of **1 MiB**.
+- The 17 bytes immediately after the TOML body must equal the exact
+  byte sequence `---END-HEADER---\n`. Mismatch is a hard error
+  ("length prefix and sentinel disagree; writer is buggy or file
+  is corrupt").
+- Per-field rules (§"Per-field character set") forbid `\n` in
+  every v1.0 field, so a well-formed TOML body never accidentally
+  contains the sentinel pattern. This is a writer-side invariant;
+  the reader does not need to enforce it (the length prefix is
+  authoritative).
 
 Why this framing:
 
 - **`PSP\n` as fixed magic** lets `file` / libmagic identify a
   `.psp` from offset 0, and lets a binary reader bail out on
   non-`.psp` input before invoking a TOML parser.
-- **Sentinel rather than embedded byte count** keeps the writer
-  single-pass: the producer never has to back-patch a self-
-  referential length. Both `head` users and binary readers locate
-  the body end the same way.
+- **Length prefix as the authoritative body boundary.** A
+  sentinel-only framing (an earlier draft of this spec) finds the
+  body end by scanning for `\n---END-HEADER---\n`. That works only
+  if the sentinel byte sequence does not appear inside any TOML
+  value — which the per-field rules guarantee for well-formed v1.0
+  files but cannot guarantee against producer bugs (TOML v1.0.0
+  multi-line basic / literal strings `"""..."""` / `'''...'''`
+  legally contain `\n`, and a writer that fails to validate would
+  silently produce a file where the scan ends in the wrong place).
+  The length prefix moves the body boundary from "wherever the
+  reader finds the pattern" to "wherever the writer says the body
+  ends," which is what the format actually means. A bug in the
+  writer surfaces as a sentinel-mismatch hard error, not as a
+  successfully-parsed file with a truncated header.
+- **Sentinel kept as a structural cross-check.** Two reasons not
+  to delete it: (a) `head file.psp` still ends on a clearly
+  recognisable line, preserving the "any tool with head / cat /
+  grep can inspect" property the format wants; (b) a length
+  prefix that gets corrupted to a smaller value would otherwise
+  silently truncate the body — keeping the sentinel turns that
+  into a hard mismatch.
 - **TOML rather than a custom key-value grammar** so we inherit a
   single canonical spec, mature Rust support (`toml` crate, used
   by Cargo itself), native dates, comments, and existing query
   tooling (`taplo`, `dasel`, `tomlq`) — at the cost of one small
   runtime dependency.
+- **Writer cost: none beyond what was already paid.** The writer
+  must validate every TOML field before emitting the file
+  (§"Per-field character set"); that validation runs on an
+  in-memory string. Once validated, that string's byte length is
+  known and goes into the length prefix. No back-patching, no
+  two-pass write.
 
 ### Reader protocol
 
-1. `pread` the first 4 bytes; verify `PSP\n`. Non-match → not a
-   `.psp` file, abort with a clear error.
-2. Read forward (streaming or `mmap`) until the byte sequence
-   `\n---END-HEADER---\n` is found, bounded by the 1 MiB soft
-   limit. Not found within the limit → corruption error.
-3. The TOML body is bytes 4 through the first `\n` of the
-   sentinel pattern (inclusive). Parse with a TOML v1.0.0 parser.
-4. Validate every field against the per-field rules
+1. `pread` the first 4 bytes; verify they are `PSP\n`. Non-match →
+   not a `.psp` file, abort with a clear error.
+2. `pread` the next 8 bytes; decode as a little-endian `u64` →
+   `toml_body_length`. Verify the value falls in
+   `[1, 1048547]`. Out of range → hard error before any allocation
+   (`toml_body_length` is attacker-controllable if a malicious file
+   is ever fed to a reader, so the bound is checked first to keep
+   the next `pread` from allocating an arbitrary buffer).
+3. `pread` `toml_body_length` bytes starting at file offset 12.
+   Parse them with a TOML v1.0.0 parser. Any parse failure → hard
+   error.
+4. Validate every TOML field against the per-field rules
    (§"Per-field character set"). Any rule violation is a hard
    error; the file is rejected.
-5. Block 0 starts at the byte after the second `\n` of the
-   sentinel pattern.
+5. `pread` the next 17 bytes (at file offset `12 + toml_body_length`)
+   and verify they exactly equal `---END-HEADER---\n`. Mismatch is
+   a hard error ("length prefix and sentinel disagree"); never a
+   warning, never a recovery.
+6. Block 0 starts at file offset `12 + toml_body_length + 17`
+   (i.e. the byte after the sentinel's trailing `\n`).
 
 ### TOML schema (v1.0)
 
@@ -226,18 +282,26 @@ Required top-level keys:
 | `format-version` | string | `"MAJOR.MINOR"`. v1.0 writers emit `"1.0"`. |
 | `sample` | string | Sample name from the input CRAMs' `@RG SM`, validated identical across all input CRAMs (Stage 1 §"Multi-CRAM ingestion"). |
 | `reference` | string | Free-form, typically the FASTA's basename. Diagnostic. |
-| `reference-md5` | string | 32-character lowercase hex MD5 of the FASTA bytes the producer was handed. Stage 3 compares this against the FASTA it is given and refuses to proceed on mismatch — never silently. |
 | `created` | offset date-time | When the file was finalised. RFC 3339 / ISO 8601, e.g. `2026-05-13T10:00:00Z`. |
 
-Required array-of-tables `[[chromosome]]`, in `@SQ` order. The
-zero-based index into this array is the `chrom_id` referenced by
-blocks (Stage 1 validates that this order is identical across all
-input CRAMs and identical to the FASTA).
+Required array-of-tables `[[chromosome]]`, in `@SQ` order, **with at
+least one entry**. The zero-based index into this array is the
+`chrom_id` referenced by blocks (Stage 1 validates that this order
+is identical across all input CRAMs and identical to the FASTA). A
+file whose `[[chromosome]]` array is empty (zero entries) is rejected
+at header parse — there is no such thing as a `.psp` over a reference
+with no contigs; the merged CRAM input must always carry an `@SQ`
+header, and a producer that somehow tries to write a zero-contig
+file has a bug. (This is distinct from the zero-*block* case at
+§"File-level structure", which is legal and represents a sample
+with no covered positions: a non-empty `[[chromosome]]` list plus
+zero data blocks.)
 
 | Key | TOML type | Notes |
 |---|---|---|
 | `name` | string | Contig name, matching SAM `@SQ SN`. |
 | `length` | integer | Contig length in base pairs (≥ 1). |
+| `md5` | string | 32-character lowercase hex MD5 of the uppercase reference sequence for this contig (i.e. the contig's bases, uppercased, with no whitespace or non-base characters — exactly the SAM `@SQ M5` semantics). Stage 3 compares this against the FASTA it is given **per contig** and refuses to proceed on any mismatch — never silently. Per-contig (rather than whole-file) MD5 means re-wrapping a FASTA, regenerating its `.fai` sidecar, or re-downloading from a different mirror does **not** cause spurious rejections, but any actual change in a contig's sequence does, with a clear per-contig error. |
 
 Required table `[writer]` — provenance for what produced the file.
 See §"File header — provenance and path stripping" below for the
@@ -430,12 +494,76 @@ where noted):
 7. **Per-block manifest agreement** (checked at each block):
     - Every tag in the per-block manifest is declared by a
       `[[column]]` entry in the header.
-    - `uncompressed_len` matches what the encoding rules predict
-      from the block's `n_records`, `n_total_alleles`, the column's
-      `(cardinality, shape, element-type)`, and (for `bytes` shapes)
-      the actual length-column payload.
-    - Decompressing the payload yields exactly `uncompressed_len`
-      bytes.
+    - The manifest's column ordering satisfies §"Column ordering
+      within a block" (strictly ascending tags, no duplicates).
+    - **`uncompressed_len` a-priori prediction, where the schema
+      allows it.** The reader cross-checks `uncompressed_len`
+      *before* decompression for columns whose byte size is
+      determined by the block-level counts and the column's
+      schema alone — i.e. independent of the column's actual
+      values. Two cases:
+        1. **Fixed-width scalars.** `(per-record, scalar)` and
+           `(per-allele, scalar)` columns whose `element-type` is
+           one of `u8`, `u16`, `u32`, `u64`, `i32`, `i64`, `f32`,
+           `f64`, `bool`. Predicted size:
+           `n × sizeof(element-type)`, where `n` is `n_records` for
+           per-record columns and `n_total_alleles` for per-allele
+           columns.
+        2. **`bytes` columns, once their `length-column` has been
+           decompressed.** `(per-record, bytes)` and `(per-allele,
+           bytes)` columns. Predicted size: the sum of the
+           `length-column`'s varint entries. (Because this needs
+           the `length-column` payload, it is checked *after* the
+           length-column has been decompressed; the column ordering
+           rule guarantees the length-column appears first since
+           every `bytes` column's `length-column` has a numerically
+           lower tag in the v1.0 registry, but a reader implementing
+           this rule generically should treat it as a deferred
+           check rather than relying on that ordering coincidence.)
+      A mismatch in any of these is a hard error: the manifest and
+      the schema disagree about a column whose size is knowable in
+      advance.
+    - **`uncompressed_len` is not a-priori predictable for the
+      remaining shapes.** Variable-width and list shapes carry data
+      whose byte size depends on the values themselves and cannot
+      be predicted from the manifest alone. The reader does not
+      attempt a prediction check for them. Concretely:
+        - `(per-record, scalar)` and `(per-allele, scalar)` with
+          `element-type = "varint"` or `"svarint"`;
+        - every `(per-record, list)` and `(per-allele, list)`
+          column, regardless of `element-type`, because the
+          per-entry leading varint count makes the per-entry
+          size value-dependent.
+      For these columns, the manifest's `uncompressed_len` is what
+      the writer wrote; the only pre-decompression check is that
+      it is non-zero whenever there is at least one entry of the
+      appropriate cardinality. Structural correctness is checked
+      during decode (see below).
+    - **Decompressed size matches the manifest, always.** After
+      zstd decompression of any column payload, the produced byte
+      count must equal the manifest's `uncompressed_len`. This
+      applies uniformly to every column shape and catches torn or
+      truncated zstd frames whose internal checksum happens to
+      pass.
+    - **Structural correctness during decode** (for shapes where
+      it can fire):
+        - **List columns.** Walking the decompressed payload, each
+          per-entry varint count `k` must be followed by `k`
+          element-type values that fit within the remaining
+          buffer; after processing `n_records` (per-record list)
+          or `n_total_alleles` (per-allele list) entries, the
+          cursor must land exactly on the buffer's end.
+        - **Varint / svarint scalar columns.** After `n_records`
+          (per-record) or `n_total_alleles` (per-allele) varint
+          decodings, the cursor must land exactly on the buffer's
+          end. No partial varint at the tail.
+        - **`bytes` columns.** Already covered above: the sum of
+          the length-column entries must equal the decompressed
+          size; concatenating the sliced byte ranges must consume
+          the buffer fully.
+      Any over- or under-run is a hard error, naming the column,
+      the block, and the entry index at which the mismatch was
+      detected.
 8. **No surprises in skipped columns.** A reader skipping a
    `required = false` column it does not understand may not
    silently consume bytes beyond the per-block-manifest's
@@ -448,10 +576,37 @@ where noted):
    and proceeded would silently corrupt downstream likelihoods.
    The error names the column, the block, and the offending entry
    index.
+10. **Phase-chain active-set consistency** (checked at each block):
+    - The block header's `active_chain_slots_at_block_start` snapshot
+      is strictly ascending with no duplicates.
+    - The snapshot is empty whenever the block is the first block of
+      its chromosome (block 0 of the file, or any block whose
+      `chrom_id` differs from the previous block's).
+    - Walking the block's records in order, every slot id in
+      `allele_chain_slots` is a member of the running active set at
+      that record (snapshot ± preceding records' markers ± this
+      record's markers). `expired_chain_slots` only removes slots
+      that are currently active; `new_chain_slots` only adds slots
+      that are not. Any violation aborts, naming the block, the
+      record index, and the offending slot id.
+11. **Inter-block phase-chain continuity** (sequential reads only).
+    When a reader processes block N+1 immediately after block N on
+    the same chromosome, the active set carried forward from block
+    N's final record must equal block N+1's
+    `active_chain_slots_at_block_start`. A mismatch is a hard
+    error. Readers doing random access via the tail index cannot
+    perform this check; they trust the snapshot, which is why the
+    snapshot exists.
 
 Failing any of these is a hard error.
 
 ### Example v1.0 header
+
+The 8-byte `toml_body_length` prefix that sits between `PSP\n` and
+the TOML body is binary and is omitted from this rendering for
+readability; on disk, those eight bytes are a little-endian `u64`
+giving the exact byte count of the TOML between the prefix and the
+sentinel.
 
 ```
 PSP
@@ -459,22 +614,24 @@ PSP
 format-version = "1.0"
 sample         = "NA12878"
 reference      = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
-reference-md5  = "4f9d2c5be3a1deadbeefcafef00dba11"
 created        = 2026-05-13T10:00:00Z
 
 [[chromosome]]
 name   = "chr1"
 length = 248956422
+md5    = "6aef897c3d6ff0c78aff06ac189178dd"
 
 [[chromosome]]
 name   = "chr2"
 length = 242193529
+md5    = "f98db672eb0993dcfdabafe2a882905c"
 
 # ... more chromosomes ...
 
 [[chromosome]]
 name   = "chrM"
 length = 16569
+md5    = "c68f52674c9fb33aef52dcf399755519"
 
 [writer]
 tool        = "join_per_sample_vcfs"
@@ -581,7 +738,7 @@ cardinality  = "per-record"
 shape        = "list"
 element-type = "u16"
 required     = true
-description  = "Phase-chain slot ids that became active since the previous record. Ascending."
+description  = "Phase-chain slot ids that became active since the previous record. Ascending. On record 0 of a block, 'the previous record' is the block header's active-chain-slots-at-block-start snapshot."
 
 [[column]]
 tag          = 0x21
@@ -590,7 +747,7 @@ cardinality  = "per-record"
 shape        = "list"
 element-type = "u16"
 required     = true
-description  = "Phase-chain slot ids that ended since the previous record. Ascending."
+description  = "Phase-chain slot ids that ended since the previous record. Ascending. On record 0 of a block, 'the previous record' is the block header's active-chain-slots-at-block-start snapshot."
 
 [[column]]
 tag          = 0x22
@@ -599,7 +756,7 @@ cardinality  = "per-allele"
 shape        = "list"
 element-type = "u16"
 required     = true
-description  = "Phase-chain slot ids contributing to each allele observation. Ascending. References the active-slot set after applying new-chain-slots and expired-chain-slots."
+description  = "Phase-chain slot ids contributing to each allele observation. Ascending. References the active-slot set after applying this record's expired-chain-slots and new-chain-slots to the active set carried in from the previous record (or, for record 0 of a block, to the block header's active-chain-slots-at-block-start snapshot)."
 ---END-HEADER---
 ```
 
@@ -609,12 +766,12 @@ may emit them or not, readers ignore them.
 ### Header size in practice
 
 The chromosome list is the dominant contributor. Per-contig TOML
-overhead is ~40–50 bytes:
+overhead is ~90–100 bytes (name + length + 32-char `md5`):
 
-- ~200 contigs (typical clean reference) → ~10 KB.
-- ~500 contigs (with decoys / alts) → ~25 KB.
+- ~200 contigs (typical clean reference) → ~20 KB.
+- ~500 contigs (with decoys / alts) → ~50 KB.
 - ~3000 contigs (some plant references with unplaced scaffolds)
-  → ~150 KB — still well under the 1 MiB cap.
+  → ~300 KB — still well under the 1 MiB cap.
 
 Trivial against multi-GB block bodies.
 
@@ -634,6 +791,20 @@ block:
     n_total_alleles:    varint        // sum of n_alleles over all records;
                                        // lets readers size per-allele
                                        // columns up front
+    active_chain_slots_at_block_start:
+      varint count k                  // phase-chain slot ids that are
+      k × u16, ascending              //   already active when this block
+                                       //   begins, inherited from the
+                                       //   immediately preceding block on
+                                       //   the same chromosome. Empty (k=0)
+                                       //   for the first block on a
+                                       //   chromosome, since chains never
+                                       //   cross chromosome boundaries
+                                       //   (reads do not). See §"Phase-chain
+                                       //   state across blocks" for the
+                                       //   full invariant. Encoded with the
+                                       //   same shape as a per-record list
+                                       //   column.
     n_columns:          varint        // number of column-manifest entries
                                        // that follow. May be less than the
                                        // header's [[column]] count if the
@@ -649,13 +820,23 @@ block:
       compressed_len:   varint        // byte length of the column's
                                        // zstd-compressed payload
       uncompressed_len: varint        // expected size after decompression.
-                                       // A reader cross-checks this against
-                                       // the value the encoding rules
-                                       // predict from the header schema and
-                                       // the block's n_records /
-                                       // n_total_alleles. Mismatch is a
-                                       // hard error (§"Header-binary
-                                       // consistency").
+                                       // The reader always checks that the
+                                       // actual decompressed payload is
+                                       // exactly this many bytes (torn-frame
+                                       // catcher). For column shapes whose
+                                       // size is determined by the schema
+                                       // and the block counts alone
+                                       // (fixed-width scalars; bytes columns
+                                       // once their length-column is known)
+                                       // the reader additionally cross-checks
+                                       // this value against the schema-
+                                       // predicted size, before decompression.
+                                       // For variable-width / list shapes
+                                       // no a-priori prediction is possible
+                                       // and the structural correctness of
+                                       // the payload is checked during
+                                       // decode instead. Full rules in
+                                       // §"Header-binary consistency".
   column_payloads:                    (concatenated, each independently
                                        zstd-compressed)
     payload_0:          compressed_len[0] bytes
@@ -669,6 +850,51 @@ header's `[[column]]` array is the single source of truth for what a
 tag means; the per-block manifest only adds what genuinely varies
 block-to-block: which columns this block actually wrote, and how
 big their payloads are.
+
+### Phase-chain state across blocks
+
+Phase chains may straddle block boundaries: a chain that begins in
+block N and is still active when the writer cuts the block continues
+into block N+1. The block header's
+`active_chain_slots_at_block_start` snapshots which slots block N+1
+inherits, so a reader landing on block N+1 via the tail index can
+reconstruct the active set without scanning earlier blocks. This is
+what makes the tail-index pattern (§"Block index") usable for
+mid-chromosome random access in the presence of phase chains.
+
+Three invariants follow:
+
+1. **First block on a chromosome.** The snapshot is empty (`k = 0`).
+   Reads never cross chromosomes (Stage 1's CRAM merge never produces
+   a chain that spans a contig boundary), so every chain has expired
+   by the chromosome boundary. A reader checks this on every block
+   whose `chrom_id` differs from the immediately preceding block's
+   (or which is block 0 of the file).
+2. **Continuity across blocks on the same chromosome.** For blocks
+   N and N+1 sharing a `chrom_id`, block N+1's
+   `active_chain_slots_at_block_start` equals the active set at the
+   end of block N — that is, block N's
+   `active_chain_slots_at_block_start`, with every `new_chain_slots`
+   entry across block N's records added and every `expired_chain_slots`
+   entry across block N's records removed, all in record order. A
+   reader processing the file sequentially cross-checks this; a reader
+   doing random access trusts the snapshot (no preceding block in
+   memory to compare against).
+3. **First record's lifecycle markers are no longer special-cased.**
+   `new_chain_slots` and `expired_chain_slots` on record 0 mean
+   exactly what they mean on every other record: "slots that
+   started / ended since the previous record." For record 0, the
+   "previous record" is the snapshot, so the markers describe the
+   delta between the snapshot and record 0's currently-active set.
+   `allele_chain_slots` on record 0 references the active set after
+   applying record 0's markers to the snapshot.
+
+The snapshot is one `varint` plus a few `u16`s — bounded by per-position
+depth (the project's 2–10× target gives 5–15 active chains; at 30× a
+few tens). Cost against a 16 MiB block target is negligible. In
+exchange, every block is independently decodable given only its
+header and payloads, which is the same posture the rest of the
+format takes.
 
 ### Why per-column zstd, not whole-block zstd
 
@@ -707,6 +933,27 @@ the file if any block in the body violates these:
 - All records in a block share the same `chrom_id` (the block
   header's `chrom_id`), and their positions are strictly increasing
   in genomic order.
+- **Per-record `delta_pos` invariant.** The first record in a block
+  has `delta_pos = 0` (and its position is the block header's
+  `first_pos`); every subsequent record has `delta_pos ≥ 1`. A
+  `delta_pos = 0` on any record other than the first, or a
+  `delta_pos` value that would push the position past the contig's
+  declared `length`, is a hard error. This makes the "strictly
+  increasing positions" rule above checkable column-locally,
+  without having to materialise positions first.
+- `active_chain_slots_at_block_start` is empty (`k = 0`) whenever the
+  block is the first block of its chromosome (block 0 of the file,
+  or any block whose `chrom_id` differs from the previous block's).
+- The slot ids in `active_chain_slots_at_block_start` are strictly
+  ascending and pairwise distinct.
+- For every record, every slot id appearing in `allele_chain_slots`
+  is a member of the running active set at that record (computed
+  from `active_chain_slots_at_block_start` plus / minus the
+  preceding records' lifecycle markers and this record's
+  `new_chain_slots` / `expired_chain_slots`). A slot id appearing
+  in `expired_chain_slots` must be in the active set at the moment
+  of expiration; a slot id appearing in `new_chain_slots` must
+  *not* already be in it.
 
 Rationale for 16 MiB rather than the smaller (~4 MiB) figure earlier
 drafts considered: the artefact is expected to be large — WGS at
@@ -778,16 +1025,16 @@ two views of the same data; readers verify they agree
 |---|---|---|---|---|
 | `0x01` | `delta_pos` | per-record (N entries) | `varint` | Distance to the previous record's position. For the first record in a block, the value is `0` and the position is `first_pos` (from the block header). |
 | `0x02` | `n_alleles` | per-record (N entries) | `varint` | At least `1` per record. The sum equals the block's `n_total_alleles`. |
-| `0x03` | `allele_seq_len` | per-allele (M entries, M = `n_total_alleles`) | `varint` | Length in bytes of each allele's sequence. **Minimum `1`** — no allele is zero-length (SNP = 1, deletion ALT = 1 anchor base, insertion ALT = 1+ bytes). A reader rejects a record carrying `allele_seq_len = 0`. Within a record, the first allele is REF (architecture doc §"Allele and record conventions"). |
+| `0x03` | `allele_seq_len` | per-allele (M entries, M = `n_total_alleles`) | `varint` | Length in bytes of each allele's sequence. **Minimum `1`** — no allele is zero-length (SNP = 1, deletion ALT = 1 anchor base, insertion ALT = 1+ bytes). **Maximum `10_000`** — a hard sanity bound on a single allele's sequence length. Real biological alleles are far shorter (the longest realistic insertion in the project's domain is well under 1 kb); a value over the cap is a producer bug, and a reader that proceeded would either OOM on a 4 GiB varint or silently consume the rest of the block as allele bytes. A reader rejects any record carrying `allele_seq_len < 1` or `allele_seq_len > 10_000`, naming the block, the record, and the allele index. Within a record, the first allele is REF (architecture doc §"Allele and record conventions"). |
 | `0x04` | `allele_seq` | per-allele bytes | concatenation | The allele sequences laid end to end, decoded by walking `allele_seq_len`. Bytes are uppercase ASCII over `{A, C, G, T, N}`. |
 | `0x10` | `allele_obs_count` | per-allele (M entries) | `u32` | Observation count scalar (reads supporting this allele). `u32` covers the architecture's per-column depth caps with headroom. |
 | `0x11` | `allele_q_sum_log` | per-allele (M entries) | `f64` | `Σ max(ln_BQ_BAQ, ln_MQ)` over supporting reads. Stored in ln-units. Matches the implementation's `AlleleSupportStats::q_sum: f64` ([pileup/mod.rs:357](../../src/per_sample_caller/pileup/mod.rs#L357)); chosen to preserve the precision the accumulator uses, with no truncation at the I/O boundary. |
 | `0x12` | `allele_fwd_count` | per-allele (M entries) | `u32` | Forward-strand count. |
 | `0x13` | `allele_placed_left_count` | per-allele (M entries) | `u32` | Reads whose 5′ end is to the left of the record's position (freebayes' `placedLeft`). |
 | `0x14` | `allele_placed_start_count` | per-allele (M entries) | `u32` | Reads whose 5′ end *is* the record's position (`placedStart`). |
-| `0x20` | `new_chain_slots` | per-record list | varint count + `u16` slot ids | Per record: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order. Matches the implementation's `SlotId = u16` ([pileup/slot_allocator.rs:21](../../src/per_sample_caller/pileup/slot_allocator.rs#L21)); `u16` was chosen there for ~16× headroom over the active-slot cap (`DEFAULT_MAX_ACTIVE_SLOTS = 4096`). |
-| `0x21` | `expired_chain_slots` | per-record list | varint count + `u16` slot ids | Same shape as `new_chain_slots`. Architecture doc §"Phase chain identifiers" specifies the lifecycle invariant. |
-| `0x22` | `allele_chain_slots` | per-allele list | varint count + `u16` slot ids | Per allele: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order. The slot ids reference the currently-active set (i.e. after applying the record's `expired_chains` and `new_chains`). |
+| `0x20` | `new_chain_slots` | per-record list | varint count + `u16` slot ids | Per record: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order — slots that became active since the previous record. For record 0 of a block, "the previous record" is the block header's `active_chain_slots_at_block_start` snapshot (§"Phase-chain state across blocks"); the lifecycle semantics are otherwise identical on every record. Matches the implementation's `SlotId = u16` ([pileup/slot_allocator.rs:21](../../src/per_sample_caller/pileup/slot_allocator.rs#L21)); `u16` was chosen there for ~16× headroom over the active-slot cap (`DEFAULT_MAX_ACTIVE_SLOTS = 4096`). |
+| `0x21` | `expired_chain_slots` | per-record list | varint count + `u16` slot ids | Same shape and same record-0-relative-to-snapshot rule as `new_chain_slots`. Architecture doc §"Phase chain identifiers" specifies the lifecycle invariant. |
+| `0x22` | `allele_chain_slots` | per-allele list | varint count + `u16` slot ids | Per allele: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order. The slot ids reference the currently-active set (i.e. after applying the record's `expired_chain_slots` and `new_chain_slots` to the active set carried in from the previous record — or, on record 0, to the block header's `active_chain_slots_at_block_start`). |
 
 A reader walks the columns in tandem; the per-record columns give
 the position and allele-count structure, and the per-allele columns
@@ -937,36 +1184,59 @@ Negligible against the data body.
 ## File trailer
 
 A fixed 32-byte trailer at the very end of the file. Its job is
-twofold: (a) locate the block index, (b) detect truncation /
+threefold: (a) locate the block index, (b) detect truncation /
 incomplete writes that would otherwise read as a shorter but
-valid-looking file.
+valid-looking file, (c) detect silent corruption of the index
+region itself (the one region whose payload is not already covered
+by a zstd frame checksum).
 
 | Offset (from trailer start) | Field | Type | Notes |
 |---|---|---|---|
 | 0 | `index_offset` | `u64` | Absolute file offset of the block index's first byte. |
 | 8 | `index_byte_length` | `u64` | Length of the block index in bytes. `index_offset + index_byte_length` must equal the trailer's own start offset. |
 | 16 | `n_blocks` | `u64` | Total number of blocks written. Must equal the number of entries the reader decoded from the index. |
-| 24 | `trailer_magic` | 4 B | ASCII bytes `'P'`, `'S'`, `'P'`, `'E'` (for "PSP End"). Different from the head magic so truncation that copies the head pattern would not pass the tail check. |
-| 28 | `trailer_padding` | 4 B | Reserved, all zero in v1. Lets future versions encode a tiny tail-side feature (e.g. file-scoped checksum) without bumping major. |
+| 24 | `index_checksum` | `u32` | XXH3-64 hash of the `index_byte_length` index bytes, truncated to its low 32 bits and stored little-endian. Same hash and same truncation that zstd uses for its frame content checksum (RFC 8878 §3.1.1), so the same XXH3 implementation already pulled in by the zstd dependency computes both. Covers the index region — the only region in the file that is not already covered by a zstd frame's built-in checksum. For an empty index (zero blocks) the value is the XXH3-64 hash of the empty byte sequence, truncated. |
+| 28 | `trailer_magic` | 4 B | ASCII bytes `'P'`, `'S'`, `'P'`, `'E'` (for "PSP End"). Different from the head magic so truncation that copies the head pattern would not pass the tail check. Placed last so the EOF-aligned `pread` of the last four bytes is enough to reject a non-`.psp` or truncated file. |
 
 A reader's tail-read protocol:
 
 1. `pread` the last 32 bytes; validate `trailer_magic`.
 2. Seek to `index_offset`; read `index_byte_length` bytes.
-3. Decode the index; assert the decoded entry count equals
+3. Recompute the XXH3-64 of the read bytes, truncate to its low 32
+   bits, and compare to `index_checksum`. Mismatch is a hard
+   corruption error — no fall-back, no partial reads. The
+   architecture's principle is that errors do not pass silently
+   (`design_principles.md` §3); the index is the one file region
+   whose silent corruption could redirect every subsequent block
+   read to wrong bytes, so it is checked before any block offset
+   from it is trusted.
+4. Decode the index; assert the decoded entry count equals
    `n_blocks`.
-4. Region queries binary-search the in-memory index by
+5. Region queries binary-search the in-memory index by
    `(chrom_id, first_pos, last_pos)`; sequential reads ignore the
    index entirely and stream from block 0.
 
-A reader that reaches EOF without seeing the trailer, or whose
-trailer arithmetic disagrees with `n_blocks`, reports a hard
+A reader that reaches EOF without seeing the trailer, whose trailer
+arithmetic disagrees with `n_blocks`, or whose recomputed
+`index_checksum` disagrees with the stored value, reports a hard
 truncation / corruption error. There is no auto-recovery.
 
 ## Versioning policy (current draft)
 
 The version pair lives in the TOML header as
-`format-version = "MAJOR.MINOR"` (string). Reader behaviour:
+`format-version = "MAJOR.MINOR"` (string).
+
+**Ordering is numeric, not lexical.** A reader parses the string by
+splitting on the single `.`, converting each half to a non-negative
+integer with no leading-zero allowed (except for the literal `0`),
+and comparing those integers as numbers. So `"1.10"` is greater than
+`"1.9"`, even though lexically it would sort the other way. Each
+integer half fits in a `u16`; values outside `[0, 65535]` are a hard
+error. The per-field rule at §"Per-field character set" already
+restricts the surface syntax (`[0-9]+\.[0-9]+`); this paragraph is
+what gives those characters their order.
+
+Reader behaviour:
 
 - **Same major, same or lower minor.** Reader fully understands the
   file. Unknown header keys are skipped (TOML schema is open by
@@ -1021,7 +1291,52 @@ specified in §"Block index".*
 *Resolved 2026-05-13: yes — TOML body framed by `PSP\n` magic and
 `---END-HEADER---\n` sentinel, ASCII per SAM v1.6 §1.2.1 conventions
 for v1.0 values. Specified in §"File header" and §"Encoding
-conventions / Header (plain-text TOML)".*
+conventions / Header (plain-text TOML)". The framing was later
+revised in Q-HDR2 to add an authoritative byte-count length prefix
+between the magic and the TOML body.*
+
+**~~Q-HDR2 — how is the end of the TOML body located: by sentinel
+scan, by length prefix, or both?~~**
+*Resolved 2026-05-13: an 8-byte little-endian `u64` length prefix
+between `PSP\n` and the TOML body is authoritative for the body
+boundary; the `---END-HEADER---\n` sentinel is kept as a structural
+cross-check that the reader verifies immediately after consuming
+the body. Specified in §"File header" / "Layout" and "Reader
+protocol".*
+
+*The earlier sentinel-only framing (Q-HDR original resolution)
+relies on the byte sequence `\n---END-HEADER---\n` not appearing
+inside any TOML value. The per-field rules forbid `\n` in every
+v1.0 field, so well-formed files are safe — but TOML v1.0.0
+multi-line basic strings (`"""..."""`) and literal strings
+(`'''...'''`) legally contain `\n`, and a producer that fails the
+field-rule validation could silently emit a file whose sentinel
+scan ends in the wrong place. The "errors must not pass silently"
+posture (`design_principles.md` §3) doesn't tolerate a framing
+that depends on the writer being bug-free to find the writer's
+bug; the length prefix moves the body boundary from "wherever the
+reader finds the pattern" to "wherever the writer says the body
+ends," and a mismatch with the sentinel becomes a hard error
+rather than a silent prefix-eat.*
+
+*Alternatives considered: (a) drop the sentinel entirely once the
+length prefix is in place — rejected because `head file.psp` would
+no longer end on a recognisable line and a corrupted length prefix
+could silently truncate the body without any cross-check firing;
+(b) use an ASCII-decimal length prefix on its own line for
+`head`-cleanliness — rejected because it puts framing data
+syntactically inside the TOML region (a TOML parser would parse
+the framing line as a key), and the binary u64 form is shorter,
+unambiguous about leading zeros, signedness, and base, and trivial
+to read with a single fixed-offset `pread`. The 8 bytes of binary
+between `PSP\n` and the TOML body are mostly null (the body length
+fits in 3 bytes for any realistic header) and terminals handle the
+nulls cleanly; `psp head` is the user-facing inspection tool, raw
+`head` is the fallback. Writer cost is zero beyond what was
+already paid: the writer assembles the TOML body in memory to
+validate it (§"Per-field character set"), and the validated
+buffer's length is the prefix value — no back-patching, no
+two-pass write.*
 
 **~~Q-FC1 — versioning granularity: file-level only, or also
 per-column?~~**
@@ -1074,6 +1389,30 @@ binary schema moved to the header (Q-FC2 resolution), so the question
 about reserving bits in it is moot. Varint widths grow indefinitely
 as needed. We'll add reserves when a concrete need appears.*
 
+**~~Q-FC8 — how is phase-chain state preserved across block boundaries
+for random access?~~**
+*Resolved 2026-05-13: each block header carries an
+`active_chain_slots_at_block_start` snapshot (varint count + ascending
+`u16` slot ids) listing the slots inherited from the immediately
+preceding block on the same chromosome. Specified in §"Phase-chain
+state across blocks". The problem: phase chains are bounded by read
+or paired-fragment span (~150 bp – ~1 kb per
+[phase_chain.md](phase_chain.md) §"Chain length in practice") and the
+writer cuts blocks by uncompressed-byte target (~16 MiB), so chains
+plausibly straddle block boundaries. Without a snapshot, a reader
+that uses the tail index to seek to a mid-chromosome block cannot
+know which slot ids are active at the block's first record — it
+would have to scan every preceding block on the chromosome, defeating
+the tail-index pattern. Alternatives considered: (a) restricting
+block cuts to "no chain active" points (rejected: in regions of high
+read density the writer may never reach such a cut before the size
+target; block sizing would become unpredictable); (b) never recycling
+slot ids across a file (rejected: blows out the `u16` namespace on
+any non-trivial genome); (c) requiring sequential read for random
+access (rejected: defeats the whole point of the tail index). The
+snapshot costs `varint` + a few `u16`s per block — at the project's
+target coverage, single-digit bytes against a 16 MiB block payload.*
+
 ### Parameters & layout details
 
 **~~Q-PL1 — default zstd compression level.~~**
@@ -1119,7 +1458,9 @@ readers reject violations. See §"Column ordering within a block".*
 
 **~~Q-PL7 — trailer shape.~~**
 *Resolved alongside Q-IDX: trailer is now 32 B carrying
-`index_offset`, `index_byte_length`, `n_blocks`, magic, padding.
+`index_offset`, `index_byte_length`, `n_blocks`, `index_checksum`,
+and `trailer_magic`. (The original draft had a 4 B reserved padding
+slot in place of `index_checksum`; that slot was used up by Q-PL11.)
 See §"File trailer".*
 
 **~~Q-PL8 — per-block checksum.~~**
@@ -1133,3 +1474,50 @@ naming the column, the block, and the offending entry. Applies to
 every IEEE 754 float column the format ever carries, not just
 `allele-q-sum-log`. Consistent with `design_principles.md`
 §"Errors must not pass silently".*
+
+**~~Q-PL11 — integrity coverage for the block-index region.~~**
+*Resolved 2026-05-13: the trailer carries a 32-bit `index_checksum`
+(XXH3-64 of the index bytes, truncated to its low 32 bits — the
+same hash and truncation zstd uses for its frame content checksum).
+Reason: zstd frame checksums cover every column payload (§"Compression"),
+the trailer's `trailer_magic` + `n_blocks` arithmetic covers EOF
+truncation, and the file header is plain TOML whose corruption
+surfaces as a parse failure. The block index was the one file region
+left uncovered — bytes that are uncompressed varints plus absolute
+`u64` block offsets, sitting between the data and the trailer. A
+single flipped bit in an offset would silently redirect a region
+query to the wrong block, where decompression succeeds (the wrong
+column payloads still pass their own zstd checksums) and the reader
+returns wrong genotypes downstream. That is precisely the
+"errors-must-not-pass-silently" failure the project bans
+(`design_principles.md` §3), so the gap has to be closed.
+Alternatives considered: (a) CRC32C — equivalent error-detection
+strength but a second hash family to bring into the codebase
+(rejected: zstd already ships XXH3); (b) full 64-bit checksum
+(rejected: 32-bit is the ecosystem convention — zstd, BGZF,
+Parquet, ZIP all use 32 bits for region-scale checksums, the
+collision probability against accidental corruption is 1 in 2³²,
+and the saved 4 bytes are not the relevant cost). The 4 bytes
+this checksum occupies came from the trailer's previous
+`trailer_padding` field — exactly what that field's documented
+forward-compat purpose was reserved for ("a tiny tail-side feature,
+e.g. file-scoped checksum"), used up now rather than later. Future
+tail-side features past v1.0 will need their own room.*
+
+**~~Q-PL10 — reference identity: per-file or per-contig hash?~~**
+*Resolved 2026-05-13: per-contig `md5` on each `[[chromosome]]`
+entry, with SAM `@SQ M5` semantics (MD5 of the uppercase reference
+sequence for that contig). An earlier draft used a top-level
+`reference-md5` of the literal FASTA file bytes; that turned out
+to reject the same reference re-wrapped, regenerated, or
+re-downloaded from a different mirror — i.e. it fired on FASTA-file
+identity rather than reference-sequence identity, which is the
+opposite of what the consistency check is meant to enforce. The
+per-contig `@SQ M5` form has been the GA4GH / refget / samtools
+canonical reference hash since long before this project existed and
+is what every other tool in the pipeline (CRAM in particular)
+already keys reference identity on. Adopting it makes Stage 3's
+mismatch error specific (the offending contig, by name) rather
+than whole-file, and aligns this format with the broader
+ecosystem at no extra cost beyond ~50 bytes per contig in the
+TOML header. See §"File header" / `[[chromosome]]` `md5` key.*
