@@ -1,0 +1,13 @@
+# Pin the compiler version so criterion baselines saved across
+# review cycles remain comparable. Bumps are intentional, not
+# accidental — autovectorisation decisions in encode_u64_leb128,
+# encode_list_column_csr, validate_record, and the zstd inlining
+# boundary can shift between rustc versions without warning.
+#
+# Container builds (via ./scripts/dev.sh) inherit this pin through
+# the bind-mounted project directory; the container's preinstalled
+# toolchain is overridden if it does not match.
+[toolchain]
+channel = "1.95"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
