@@ -61,6 +61,56 @@ const INITIAL_ALLELES_HINT: usize = 360_000;
 /// hint covers both without leaving much slack.
 const INITIAL_ALLELE_SEQ_BYTES_HINT: usize = 1_000_000;
 
+/// Byte mask of allele bytes the writer accepts. `ALLOWED[b]` is
+/// `true` iff `b` is one of `b'A' | b'C' | b'G' | b'T' | b'N'`. Walked
+/// via `slice.iter().all(|&b| ALLOWED[b as usize])` so the hot-path
+/// loop is one indexed load + one branch per byte and runs to
+/// completion (no per-element early-exit via `?`) — autovectorisable
+/// on `target-cpu = x86-64-v3` (H4).
+const ALLOWED_ALLELE_BYTE: [bool; 256] = {
+    let mut t = [false; 256];
+    t[b'A' as usize] = true;
+    t[b'C' as usize] = true;
+    t[b'G' as usize] = true;
+    t[b'T' as usize] = true;
+    t[b'N' as usize] = true;
+    t
+};
+
+/// `#[cold]` constructors for `PspWriteError::InvalidRecord` (L5).
+/// Keeping the `format!` and `String` allocation out-of-line shrinks
+/// the hot-path body of `validate_record` (which the samply profile
+/// puts at 10 % self).
+#[cold]
+#[inline(never)]
+fn err_invalid_record(record_index: u64, reason: String) -> PspWriteError {
+    PspWriteError::InvalidRecord {
+        record_index,
+        reason,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_invalid_allele_byte(
+    record_index: u64,
+    allele_index: usize,
+    seq: &[u8],
+) -> PspWriteError {
+    let (j, b) = seq
+        .iter()
+        .enumerate()
+        .find(|&(_, &b)| !ALLOWED_ALLELE_BYTE[b as usize])
+        .map(|(j, &b)| (j, b))
+        .expect("err_invalid_allele_byte called with valid sequence");
+    PspWriteError::InvalidRecord {
+        record_index,
+        reason: format!(
+            "allele {allele_index} byte {j} = {b:#04x} (only A/C/G/T/N allowed)"
+        ),
+    }
+}
+
 /// Streaming `.psp` writer over any `Write` sink.
 pub struct PspWriter<W: Write> {
     sink: W,
@@ -315,44 +365,43 @@ impl<W: Write> PspWriter<W> {
 
         // At least one allele.
         if record.alleles.is_empty() {
-            return Err(PspWriteError::InvalidRecord {
+            return Err(err_invalid_record(
                 record_index,
-                reason: "record has zero alleles (REF always present)".to_string(),
-            });
+                "record has zero alleles (REF always present)".to_string(),
+            ));
         }
 
         // Per-allele rules.
         for (i, allele) in record.alleles.iter().enumerate() {
             let len = allele.seq.len();
             if len == 0 || (len as u64) > MAX_ALLELE_SEQ_LEN {
-                return Err(PspWriteError::InvalidRecord {
+                return Err(err_invalid_record(
                     record_index,
-                    reason: format!(
+                    format!(
                         "allele {i} sequence length {len} outside [1, {MAX_ALLELE_SEQ_LEN}]"
                     ),
-                });
+                ));
             }
-            for (j, &b) in allele.seq.iter().enumerate() {
-                if !matches!(b, b'A' | b'C' | b'G' | b'T' | b'N') {
-                    return Err(PspWriteError::InvalidRecord {
-                        record_index,
-                        reason: format!("allele {i} byte {j} = {b:#04x} (only A/C/G/T/N allowed)"),
-                    });
-                }
+            // H4: lookup-table walk lets the loop run to completion
+            // (no per-element early-exit) so LLVM can autovectorise
+            // on long alleles. The cold path scans again to locate
+            // the offending byte for the error message.
+            if !allele.seq.iter().all(|&b| ALLOWED_ALLELE_BYTE[b as usize]) {
+                return Err(err_invalid_allele_byte(record_index, i, &allele.seq));
             }
             if !allele.support.q_sum.is_finite() {
-                return Err(PspWriteError::InvalidRecord {
+                return Err(err_invalid_record(
                     record_index,
-                    reason: format!("allele {i} q_sum is non-finite ({})", allele.support.q_sum),
-                });
+                    format!("allele {i} q_sum is non-finite ({})", allele.support.q_sum),
+                ));
             }
             // chain_slots ascending + distinct (defensive).
             for w in allele.chain_slots.windows(2) {
                 if w[0] >= w[1] {
-                    return Err(PspWriteError::InvalidRecord {
+                    return Err(err_invalid_record(
                         record_index,
-                        reason: format!("allele {i} chain_slots not strictly ascending"),
-                    });
+                        format!("allele {i} chain_slots not strictly ascending"),
+                    ));
                 }
             }
         }
@@ -364,10 +413,10 @@ impl<W: Write> PspWriter<W> {
         ] {
             for w in slots.windows(2) {
                 if w[0] >= w[1] {
-                    return Err(PspWriteError::InvalidRecord {
+                    return Err(err_invalid_record(
                         record_index,
-                        reason: format!("{name} not strictly ascending"),
-                    });
+                        format!("{name} not strictly ascending"),
+                    ));
                 }
             }
         }
