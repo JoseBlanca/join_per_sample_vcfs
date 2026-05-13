@@ -65,12 +65,32 @@ fn encode_u64_leb128_cold(mut value: u64, out: &mut Vec<u8>) {
 ///
 /// Returns the decoded value and the number of bytes consumed.
 ///
+/// Split into an inlined fast path (`bytes[0] < 0x80`, one load + one
+/// compare) and a `#[cold] #[inline(never)]` multi-byte path, mirror
+/// of [`encode_u64_leb128`]'s L4 split. On the SNP-typical reader
+/// workload almost every per-record varint is single-byte
+/// (`delta_pos == 1`, `n_alleles == 1`, list-counts == 0), so the
+/// fast path covers the dominant case and LLVM keeps the cold body
+/// out of the call site's icache footprint. L5 in
+/// `ia/reviews/perf_psp_reader_2026-05-13.md`.
+///
 /// Errors:
 /// - [`VarintError::Truncated`] if the buffer ends before a byte
 ///   without the continuation bit is found.
 /// - [`VarintError::Overflow`] if more than [`MAX_VARINT_BYTES`]
 ///   continuation bytes are consumed.
+#[inline]
 pub fn decode_u64_leb128(bytes: &[u8]) -> Result<(u64, usize), VarintError> {
+    match bytes.first() {
+        Some(&b) if b < 0x80 => Ok((b as u64, 1)),
+        Some(_) => decode_u64_leb128_cold(bytes),
+        None => Err(VarintError::Truncated),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn decode_u64_leb128_cold(bytes: &[u8]) -> Result<(u64, usize), VarintError> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
     for (i, &b) in bytes.iter().enumerate().take(MAX_VARINT_BYTES) {
