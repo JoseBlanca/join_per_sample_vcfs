@@ -366,21 +366,52 @@ pub fn decode_bytes_split(
 /// Spec §"Compression" pins this at level 9. Not on the CLI.
 pub const ZSTD_COMPRESSION_LEVEL: i32 = 9;
 
-/// Compress a column payload with zstd. The output is one zstd
-/// frame with its **content checksum enabled** — the XXH64-truncated
-/// per-frame CRC the spec relies on for block-level integrity
-/// (§"Compression" / Q-PL8). zstd's high-level `encode_all` does not
-/// set the checksum flag by default, so we configure the encoder
-/// explicitly.
+/// Construct a `zstd::bulk::Compressor` configured for `.psp` column
+/// payloads: spec level 9 with frame content checksum enabled. Each
+/// writer keeps one of these alive for its lifetime so the CCtx
+/// workspace and tables are allocated once instead of per-column —
+/// the per-call setup of a fresh encoder is the dominant driver of
+/// the `__brk` / `__glibc_morecore` / `systrim` cluster the H3
+/// finding identified in the samply profile.
+pub fn new_column_compressor() -> io::Result<zstd::bulk::Compressor<'static>> {
+    let mut c = zstd::bulk::Compressor::new(ZSTD_COMPRESSION_LEVEL)?;
+    c.include_checksum(true)?;
+    Ok(c)
+}
+
+/// Compress `input` with the persistent `compressor`, writing the
+/// resulting zstd frame bytes into `out` (which is cleared first so
+/// the same `Vec<u8>` can be reused across many calls without
+/// reallocation). Output is one complete zstd frame with content
+/// checksum enabled — the XXH64-truncated per-frame CRC the spec
+/// relies on for block-level integrity (§"Compression" / Q-PL8).
+pub fn zstd_compress_into(
+    compressor: &mut zstd::bulk::Compressor<'static>,
+    input: &[u8],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    // `Compressor::compress_to_buffer` writes into the destination's
+    // `spare_capacity_mut`, so the buffer must have enough free
+    // capacity. Reserve the worst-case bound (`compress_bound(N)` is
+    // ~N + N/255 + 16 bytes for level 9). For a 16 MiB block payload
+    // that is ~16 MiB + ~65 KiB; the reserved capacity is reused on
+    // the next call (zstd_compress_into only `clear`s, never
+    // shrinks).
+    out.clear();
+    let bound = zstd::zstd_safe::compress_bound(input.len());
+    out.reserve(bound);
+    compressor.compress_to_buffer(input, out)?;
+    Ok(())
+}
+
+/// Compress a column payload with zstd. Single-shot variant for
+/// tests and other callers that do not have a persistent compressor.
+/// Uses the same frame settings as [`zstd_compress_into`] so the
+/// produced bytes decompress under the same reader path.
 pub fn zstd_compress(input: &[u8]) -> io::Result<Vec<u8>> {
-    use std::io::Write;
+    let mut compressor = new_column_compressor()?;
     let mut buf = Vec::new();
-    {
-        let mut encoder = zstd::Encoder::new(&mut buf, ZSTD_COMPRESSION_LEVEL)?;
-        encoder.include_checksum(true)?;
-        encoder.write_all(input)?;
-        encoder.finish()?;
-    }
+    zstd_compress_into(&mut compressor, input, &mut buf)?;
     Ok(buf)
 }
 

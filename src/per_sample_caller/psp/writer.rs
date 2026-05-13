@@ -26,7 +26,7 @@ use std::io::Write;
 
 use super::block::{
     BlockHeader, ColumnManifestEntry, encode_block_header, encode_bytes_concat, encode_list_column,
-    encode_scalar_column, encode_varint_column, zstd_compress,
+    encode_scalar_column, encode_varint_column, new_column_compressor, zstd_compress_into,
 };
 use super::errors::PspWriteError;
 use super::header::{WriterHeader, build_header_bytes};
@@ -83,6 +83,20 @@ pub struct PspWriter<W: Write> {
     /// Running count of records the caller has handed us. Used in
     /// error messages so the offending input is identifiable.
     records_seen: u64,
+    /// Persistent zstd compressor reused across every column of every
+    /// block. Each `compress_to_buffer` call resets the internal
+    /// frame state but keeps the CCtx workspace and tables alive.
+    compressor: zstd::bulk::Compressor<'static>,
+    /// Reused per-column uncompressed-payload scratch.
+    uncompressed_scratch: Vec<u8>,
+    /// Reused per-column compressed-frame buffers, indexed by
+    /// `V1_0_COLUMNS` position. Each `flush_block` call `clear`s the
+    /// inner Vecs (preserving their capacity) before refilling.
+    compressed_scratch: Vec<Vec<u8>>,
+    /// Reused per-flush manifest buffer (12 entries).
+    manifest_scratch: Vec<ColumnManifestEntry>,
+    /// Reused block-header serialisation buffer.
+    header_bytes_scratch: Vec<u8>,
 }
 
 impl<W: Write> PspWriter<W> {
@@ -106,6 +120,11 @@ impl<W: Write> PspWriter<W> {
                 source: e,
             })?;
         let sink_offset = header_bytes.len() as u64;
+        let compressor = new_column_compressor().map_err(|e| PspWriteError::Io {
+            context: "zstd compressor init",
+            source: e,
+        })?;
+        let compressed_scratch = (0..V1_0_COLUMNS.len()).map(|_| Vec::new()).collect();
         Ok(Self {
             sink,
             header,
@@ -115,6 +134,11 @@ impl<W: Write> PspWriter<W> {
             active_slots: BTreeSet::new(),
             last_locus: None,
             records_seen: 0,
+            compressor,
+            uncompressed_scratch: Vec::new(),
+            compressed_scratch,
+            manifest_scratch: Vec::with_capacity(V1_0_COLUMNS.len()),
+            header_bytes_scratch: Vec::new(),
         })
     }
 
@@ -408,60 +432,78 @@ impl<W: Write> PspWriter<W> {
     /// Encode the current block to wire bytes, compress its columns,
     /// emit header + payloads to the sink, and append an index
     /// entry.
+    ///
+    /// Per-flush scratch state (uncompressed payload buffer, the 12
+    /// compressed-frame buffers, the manifest scratch, and the
+    /// block-header bytes buffer) is reused across flushes — each is
+    /// `clear()`ed inside this method, keeping its prior capacity so
+    /// subsequent flushes do not pay realloc cost.
     fn flush_block(&mut self) -> Result<(), PspWriteError> {
-        let block = self
+        let mut block = self
             .block
             .take()
             .expect("flush_block called with no open block");
         let block_offset = self.sink_offset;
         let n_records = block.delta_pos.len() as u32;
         let n_total_alleles = block.allele_seq_len.len() as u32;
+        let block_index = self.index_entries.len() as u64;
 
-        // Encode every column, compress each, build the manifest.
-        let mut payloads: Vec<(u16, Vec<u8>, u32)> = Vec::with_capacity(V1_0_COLUMNS.len());
-        for column_def in V1_0_COLUMNS {
-            let payload = encode_column(column_def, &block)?;
-            let uncompressed_len = payload.len() as u32;
-            let compressed = zstd_compress(&payload).map_err(|e| PspWriteError::Io {
+        // Single pass over the column registry: encode -> compress ->
+        // record manifest entry. The intermediate `payloads` Vec the
+        // pre-refactor code carried (writer.rs:445 in the pre-L2
+        // tree) is gone; compressed-frame bytes live in
+        // `self.compressed_scratch[i]` until written to the sink
+        // below.
+        self.manifest_scratch.clear();
+        for (i, column_def) in V1_0_COLUMNS.iter().enumerate() {
+            self.uncompressed_scratch.clear();
+            encode_column_into(column_def, &block, &mut self.uncompressed_scratch)?;
+            let uncompressed_len = self.uncompressed_scratch.len() as u32;
+            zstd_compress_into(
+                &mut self.compressor,
+                &self.uncompressed_scratch,
+                &mut self.compressed_scratch[i],
+            )
+            .map_err(|e| PspWriteError::Io {
                 context: "zstd compression of column payload",
                 source: e,
             })?;
-            payloads.push((column_def.tag, compressed, uncompressed_len));
+            self.manifest_scratch.push(ColumnManifestEntry {
+                tag: column_def.tag,
+                compressed_len: self.compressed_scratch[i].len() as u32,
+                uncompressed_len,
+            });
         }
-        let manifest: Vec<ColumnManifestEntry> = payloads
-            .iter()
-            .map(|(tag, compressed, uncompressed_len)| ColumnManifestEntry {
-                tag: *tag,
-                compressed_len: compressed.len() as u32,
-                uncompressed_len: *uncompressed_len,
-            })
-            .collect();
 
-        let block_index = self.index_entries.len() as u64;
+        // Move the active-slot snapshot rather than cloning it —
+        // `block` is owned and dropped at end of scope (L3).
         let header = BlockHeader {
             chrom_id: block.chrom_id,
             first_pos: block.first_pos,
             n_records,
             n_total_alleles,
-            active_chain_slots: block.snapshot_active_slots.clone(),
-            manifest,
+            active_chain_slots: std::mem::take(&mut block.snapshot_active_slots),
+            manifest: std::mem::take(&mut self.manifest_scratch),
         };
-        let mut header_bytes = Vec::new();
-        encode_block_header(&header, &mut header_bytes).map_err(|source| {
+        self.header_bytes_scratch.clear();
+        encode_block_header(&header, &mut self.header_bytes_scratch).map_err(|source| {
             PspWriteError::BlockEmission {
                 block_index,
                 source,
             }
         })?;
+        // The manifest moved into `header`; recover it for the next
+        // flush so capacity is preserved.
+        self.manifest_scratch = header.manifest;
 
         self.sink
-            .write_all(&header_bytes)
+            .write_all(&self.header_bytes_scratch)
             .map_err(|e| PspWriteError::Io {
                 context: "block header",
                 source: e,
             })?;
-        let mut written = header_bytes.len() as u64;
-        for (_, compressed, _) in &payloads {
+        let mut written = self.header_bytes_scratch.len() as u64;
+        for compressed in &self.compressed_scratch {
             self.sink
                 .write_all(compressed)
                 .map_err(|e| PspWriteError::Io {
@@ -589,14 +631,20 @@ impl BlockAccumulator {
 // ---------------------------------------------------------------------
 
 /// Encode one column from the block accumulator into its
-/// uncompressed wire form. Dispatches by tag — each tag corresponds
-/// to a specific accumulator field with a specific element type.
-fn encode_column(def: &ColumnDef, block: &BlockAccumulator) -> Result<Vec<u8>, PspWriteError> {
-    let mut out = Vec::new();
+/// uncompressed wire form, appending into the caller-provided `out`
+/// buffer. Dispatches by tag — each tag corresponds to a specific
+/// accumulator field with a specific element type. The caller is
+/// responsible for `clear()`-ing `out` before calling so the buffer
+/// can be reused across columns without reallocation (L1).
+fn encode_column_into(
+    def: &ColumnDef,
+    block: &BlockAccumulator,
+    out: &mut Vec<u8>,
+) -> Result<(), PspWriteError> {
     match def.tag {
-        0x01 => encode_varint_column(&block.delta_pos, &mut out),
-        0x02 => encode_varint_column(&block.n_alleles, &mut out),
-        0x03 => encode_varint_column(&block.allele_seq_len, &mut out),
+        0x01 => encode_varint_column(&block.delta_pos, out),
+        0x02 => encode_varint_column(&block.n_alleles, out),
+        0x03 => encode_varint_column(&block.allele_seq_len, out),
         0x04 => encode_bytes_concat(
             &[&block.allele_seq_bytes[..]],
             // The bytes-column payload is the concatenation of every
@@ -604,19 +652,20 @@ fn encode_column(def: &ColumnDef, block: &BlockAccumulator) -> Result<Vec<u8>, P
             // in the 0x03 length column. We've kept the bytes
             // concatenated as we appended records, so the payload
             // is just `allele_seq_bytes` as-is.
-            &mut out,
+            out,
         ),
-        0x10 => encode_scalar_column(&block.allele_obs_count, &mut out),
+        0x10 => encode_scalar_column(&block.allele_obs_count, out),
         0x11 => {
             // q_sum was finite-validated at write_record time.
-            encode_scalar_column(&block.allele_q_sum_log, &mut out)
+            encode_scalar_column(&block.allele_q_sum_log, out)
         }
-        0x12 => encode_scalar_column(&block.allele_fwd_count, &mut out),
-        0x13 => encode_scalar_column(&block.allele_placed_left_count, &mut out),
-        0x14 => encode_scalar_column(&block.allele_placed_start_count, &mut out),
+        0x12 => encode_scalar_column(&block.allele_fwd_count, out),
+        0x13 => encode_scalar_column(&block.allele_placed_left_count, out),
+        0x14 => encode_scalar_column(&block.allele_placed_start_count, out),
         0x20 => {
-            let slices: Vec<&[u16]> = block.new_chain_slots.iter().map(|v| v.as_slice()).collect();
-            encode_list_column(&slices, &mut out);
+            let slices: Vec<&[u16]> =
+                block.new_chain_slots.iter().map(|v| v.as_slice()).collect();
+            encode_list_column(&slices, out);
         }
         0x21 => {
             let slices: Vec<&[u16]> = block
@@ -624,7 +673,7 @@ fn encode_column(def: &ColumnDef, block: &BlockAccumulator) -> Result<Vec<u8>, P
                 .iter()
                 .map(|v| v.as_slice())
                 .collect();
-            encode_list_column(&slices, &mut out);
+            encode_list_column(&slices, out);
         }
         0x22 => {
             let slices: Vec<&[u16]> = block
@@ -632,16 +681,18 @@ fn encode_column(def: &ColumnDef, block: &BlockAccumulator) -> Result<Vec<u8>, P
                 .iter()
                 .map(|v| v.as_slice())
                 .collect();
-            encode_list_column(&slices, &mut out);
+            encode_list_column(&slices, out);
         }
         unknown => {
-            // V1_0_COLUMNS is the source of truth; if encode_column
-            // is called with a tag not in this match, the registry
-            // has been extended without updating the dispatch — a
-            // programmer error.
+            // V1_0_COLUMNS is the source of truth; if
+            // encode_column_into is called with a tag not in this
+            // match, the registry has been extended without updating
+            // the dispatch — a programmer error.
             return Err(PspWriteError::InvalidRecord {
                 record_index: 0,
-                reason: format!("internal: encode_column has no dispatch for tag {unknown:#x}"),
+                reason: format!(
+                    "internal: encode_column_into has no dispatch for tag {unknown:#x}"
+                ),
             });
         }
     }
@@ -649,8 +700,8 @@ fn encode_column(def: &ColumnDef, block: &BlockAccumulator) -> Result<Vec<u8>, P
     // fixed-width scalars and the bytes column (with the length
     // column also known). This is a writer-side self-check: a
     // mis-match means a bug in the writer.
-    debug_assert!(verify_encoded_size(def, block, &out));
-    Ok(out)
+    debug_assert!(verify_encoded_size(def, block, out));
+    Ok(())
 }
 
 fn verify_encoded_size(def: &ColumnDef, block: &BlockAccumulator, encoded: &[u8]) -> bool {
