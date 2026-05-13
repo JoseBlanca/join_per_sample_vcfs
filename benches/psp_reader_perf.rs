@@ -293,7 +293,10 @@ fn bench_reader(c: &mut Criterion) {
     let phase_header = writer_header(NUM_RECORDS_PHASE, "phase");
     let phase_bytes = serialise(&phase_records, phase_header);
     drop(phase_records);
-    eprintln!("phase_chain_heavy_1M: {} bytes serialised", phase_bytes.len());
+    eprintln!(
+        "phase_chain_heavy_1M: {} bytes serialised",
+        phase_bytes.len()
+    );
     group.throughput(Throughput::Elements(NUM_RECORDS_PHASE as u64));
     group.bench_function("phase_chain_heavy_1M", |b| {
         b.iter(|| black_box(read_all_count(black_box(&phase_bytes))));

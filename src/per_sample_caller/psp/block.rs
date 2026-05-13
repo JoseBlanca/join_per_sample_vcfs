@@ -583,10 +583,51 @@ pub fn zstd_compress(input: &[u8]) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Decompress a zstd-compressed column payload. Failures wrap to
+/// Decompress a zstd-compressed column payload. Single-shot variant
+/// for tests and other callers that do not have a persistent
+/// decompressor; allocates a fresh `DCtx` workspace per call.
+/// Production reader path uses [`new_column_decompressor`] +
+/// [`zstd_decompress_into`] — see L1 in
+/// `ia/reviews/perf_psp_reader_2026-05-13.md`. Failures wrap to
 /// [`PspReadError::Zstd`] at the call site.
 pub fn zstd_decompress(input: &[u8]) -> io::Result<Vec<u8>> {
     zstd::stream::decode_all(input)
+}
+
+/// Construct a `zstd::bulk::Decompressor` for `.psp` column payloads.
+/// Each reader keeps one alive for its lifetime so the DCtx workspace
+/// is allocated once instead of per-column — the per-call setup of a
+/// fresh decoder context drives the same `__brk` / `__glibc_morecore`
+/// / `systrim` cluster the writer's H3 finding identified, mirrored
+/// here as L1 in `ia/reviews/perf_psp_reader_2026-05-13.md`.
+pub fn new_column_decompressor() -> io::Result<zstd::bulk::Decompressor<'static>> {
+    zstd::bulk::Decompressor::new()
+}
+
+/// Decompress `input` with the persistent `decompressor`, writing the
+/// resulting bytes into `out` (which is cleared first so the same
+/// `Vec<u8>` can be reused across many calls without reallocation).
+/// `uncompressed_len_hint` is the manifest's `uncompressed_len` for
+/// this column — the buffer is sized exactly so
+/// `decompress_to_buffer` has the spare capacity it needs in one
+/// `reserve` call.
+///
+/// Returns the number of bytes actually decompressed (which equals
+/// `uncompressed_len_hint` on a well-formed frame; the caller
+/// validates this against the manifest).
+pub fn zstd_decompress_into(
+    decompressor: &mut zstd::bulk::Decompressor<'static>,
+    input: &[u8],
+    uncompressed_len_hint: usize,
+    out: &mut Vec<u8>,
+) -> io::Result<usize> {
+    // `Decompressor::decompress_to_buffer` writes into the
+    // destination's `spare_capacity_mut`, so the buffer must have
+    // enough free capacity. The manifest entry's
+    // `uncompressed_len` is the exact size; reserve it.
+    out.clear();
+    out.reserve(uncompressed_len_hint);
+    decompressor.decompress_to_buffer(input, out)
 }
 
 // ---------------------------------------------------------------------

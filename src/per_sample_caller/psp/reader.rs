@@ -29,7 +29,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use super::block::{
     BlockHeader, ColumnManifestEntry, decode_block_header, decode_bytes_split, decode_list_column,
-    decode_scalar_column_pod, decode_varint_column, zstd_decompress,
+    decode_scalar_column_pod, decode_varint_column, new_column_decompressor, zstd_decompress_into,
 };
 use super::errors::{
     BlockHeaderInvariantKind, MAX_SNAPSHOT_SLOTS_IN_ERROR, PhaseChainConsistencyKind, PspReadError,
@@ -546,10 +546,38 @@ pub struct RecordsIter<'r, R: Read + Seek> {
     /// calls return `None`. Required for `Iterator` correctness
     /// when the source state after an error is unknown.
     poisoned: bool,
+    /// L1: persistent zstd decompressor reused across every column
+    /// of every block. The DCtx workspace is allocated once
+    /// (~hundreds of KiB at level 9) instead of per-column. Mirror
+    /// of writer-side H3 (commit 969de6c).
+    decompressor: zstd::bulk::Decompressor<'static>,
+    /// L2: per-iter scratch for the compressed column bytes. Cleared
+    /// then resized to `entry.compressed_len` per column; capacity
+    /// converges to the largest compressed column the iterator has
+    /// seen.
+    compressed_scratch: Vec<u8>,
+    /// L2: per-iter scratch for the decompressed column bytes,
+    /// written into by `zstd_decompress_into`. The per-column
+    /// decoders take `&[u8]` and return owned `Vec<...>`, so this
+    /// buffer is safe to reuse across columns within a block.
+    decompressed_scratch: Vec<u8>,
+    /// L2: per-iter scratch for the block-header grow-on-incomplete
+    /// loop. One Vec per `RecordsIter` instead of one per
+    /// `read_block_header` call.
+    block_header_buf: Vec<u8>,
 }
 
 impl<'r, R: Read + Seek> RecordsIter<'r, R> {
     fn new(reader: &'r mut PspReader<R>, clamp: RangeClamp) -> Self {
+        // L1: persistent decompressor. `Decompressor::new()` only
+        // fails in OOM scenarios and at that point we have bigger
+        // problems; the initial DCtx allocation is small. Mirror of
+        // the writer's `new_column_compressor()?` in `PspWriter::new`
+        // (which propagates the io::Error up; we cannot here because
+        // `records()` / `region_records()` return `RecordsIter`, not
+        // `Result<RecordsIter, _>`).
+        let decompressor = new_column_decompressor()
+            .expect("zstd::bulk::Decompressor::new is infallible on supported platforms");
         Self {
             reader,
             cur_block_idx: 0,
@@ -561,6 +589,10 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             clamp,
             record_index: 0,
             poisoned: false,
+            decompressor,
+            compressed_scratch: Vec::new(),
+            decompressed_scratch: Vec::new(),
+            block_header_buf: Vec::with_capacity(BLOCK_HEADER_INITIAL_CHUNK),
         }
     }
 
@@ -589,7 +621,8 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             .source
             .seek(SeekFrom::Start(entry.block_offset))
             .map_err(io_err("block start seek"))?;
-        let (block_header, _consumed) = read_block_header(&mut self.reader.source)?;
+        let (block_header, _consumed) =
+            read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
 
         // M7: first-block-of-chromosome → snapshot must be empty.
         // "First block of chromosome" = block 0, or any block
@@ -641,6 +674,9 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             &mut self.reader.source,
             &block_header,
             block_byte_budget(&self.reader.index, &self.reader.trailer, self.cur_block_idx),
+            &mut self.decompressor,
+            &mut self.compressed_scratch,
+            &mut self.decompressed_scratch,
         )?;
         self.cur_block = Some(decoded);
         self.next_record_in_block = 0;
@@ -879,11 +915,19 @@ impl<R: Read + Seek> Iterator for RecordsIter<'_, R> {
 /// `BlockHeaderField { source: VarintError::Truncated|Overflow }`
 /// for both, which conflated buffer-cap failures with single-varint
 /// decode failures.
-fn read_block_header<R: Read + Seek>(source: &mut R) -> Result<(BlockHeader, usize), PspReadError> {
+/// L2: takes a `&mut Vec<u8>` from the caller (the `RecordsIter`) so
+/// the buffer is reused across blocks. `clear()` keeps the capacity
+/// that converged after the first few blocks (typical block headers
+/// fit in `BLOCK_HEADER_INITIAL_CHUNK`).
+fn read_block_header<R: Read + Seek>(
+    source: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<(BlockHeader, usize), PspReadError> {
     let header_start = source
         .stream_position()
         .map_err(io_err("block header start position"))?;
-    let mut buf: Vec<u8> = Vec::with_capacity(BLOCK_HEADER_INITIAL_CHUNK);
+    buf.clear();
+    buf.reserve(BLOCK_HEADER_INITIAL_CHUNK);
     let mut chunk = BLOCK_HEADER_INITIAL_CHUNK;
     loop {
         let prev_len = buf.len();
@@ -899,7 +943,7 @@ fn read_block_header<R: Read + Seek>(source: &mut R) -> Result<(BlockHeader, usi
         }
         buf.truncate(prev_len + read);
 
-        match decode_block_header(&buf) {
+        match decode_block_header(buf) {
             Ok((header, consumed)) => {
                 // We over-read into `buf`; rewind the source so
                 // the caller's cursor lands at the start of the
@@ -941,10 +985,17 @@ fn read_block_header<R: Read + Seek>(source: &mut R) -> Result<(BlockHeader, usi
 /// block (or the index region for the last block). Used by
 /// `decode_one_column` to reject `compressed_len` values that would
 /// drive an allocation past the block's geographic extent — B2.
+///
+/// `decompressor`, `compressed_scratch`, `decompressed_scratch` are
+/// `RecordsIter`-owned buffers reused across every column of every
+/// block. L1 / L2 in `ia/reviews/perf_psp_reader_2026-05-13.md`.
 fn decode_block_payload<R: Read>(
     source: &mut R,
     header: &BlockHeader,
     byte_budget: u64,
+    decompressor: &mut zstd::bulk::Decompressor<'static>,
+    compressed_scratch: &mut Vec<u8>,
+    decompressed_scratch: &mut Vec<u8>,
 ) -> Result<DecodedBlock, PspReadError> {
     // B1: coverage check. Every v1.0 required tag must appear in
     // the per-block manifest. Symmetric with the file-level TOML
@@ -991,6 +1042,9 @@ fn decode_block_payload<R: Read>(
             n_total_alleles,
             allele_seq_len.as_deref(),
             remaining_budget,
+            decompressor,
+            compressed_scratch,
+            decompressed_scratch,
         )?;
         remaining_budget = remaining_budget.saturating_sub(entry.compressed_len as u64);
         // M10: `decode_one_column` returns `None` for an unknown
@@ -1125,6 +1179,12 @@ enum DecodedColumn {
 /// payload). M10: no `Unknown` escape hatch — the absence of a
 /// catch-all variant means a new `ColumnKey` forces both a new
 /// arm here *and* a new `DecodedColumn` variant.
+// L1 + L2: nine arguments because the persistent decompressor and the
+// two scratch buffers thread through to the per-column read +
+// decompress site. Bundling them would add a `ReaderScratch` struct
+// that exists only for this call shape; the line-noise from the extra
+// indirection is worse than the warning.
+#[allow(clippy::too_many_arguments)]
 fn decode_one_column<R: Read>(
     source: &mut R,
     entry: &ColumnManifestEntry,
@@ -1132,6 +1192,9 @@ fn decode_one_column<R: Read>(
     n_total_alleles: usize,
     allele_seq_len: Option<&[u64]>,
     remaining_budget: u64,
+    decompressor: &mut zstd::bulk::Decompressor<'static>,
+    compressed_scratch: &mut Vec<u8>,
+    decompressed_scratch: &mut Vec<u8>,
 ) -> Result<Option<DecodedColumn>, PspReadError> {
     // B2: reject `compressed_len` exceeding the block's remaining
     // byte budget before allocating. Catches the
@@ -1147,14 +1210,18 @@ fn decode_one_column<R: Read>(
         });
     }
 
+    // L2: read into the reusable compressed scratch.
+    compressed_scratch.clear();
+    compressed_scratch.resize(entry.compressed_len as usize, 0);
+
     // Unknown tag = optional future column; read past it so the
-    // source cursor stays aligned, then return `None`.
+    // source cursor stays aligned, then return `None`. The scratch
+    // buffer doubles as the throwaway sink for unknown columns.
     let def = match lookup_by_tag(entry.tag) {
         Some(d) => d,
         None => {
-            let mut sink = vec![0u8; entry.compressed_len as usize];
             source
-                .read_exact(&mut sink)
+                .read_exact(compressed_scratch.as_mut_slice())
                 .map_err(io_err("unknown optional column payload"))?;
             return Ok(None);
         }
@@ -1188,15 +1255,23 @@ fn decode_one_column<R: Read>(
         }
     }
 
-    // Read + decompress + verify decompressed length.
-    let mut compressed = vec![0u8; entry.compressed_len as usize];
+    // L1 + L2: read into the reusable compressed scratch (already
+    // sized above), then decompress through the persistent
+    // decompressor into the reusable decompressed scratch.
     source
-        .read_exact(&mut compressed)
+        .read_exact(compressed_scratch.as_mut_slice())
         .map_err(io_err("block column payload"))?;
-    let bytes = zstd_decompress(&compressed).map_err(|source| PspReadError::Zstd {
+    zstd_decompress_into(
+        decompressor,
+        compressed_scratch,
+        entry.uncompressed_len as usize,
+        decompressed_scratch,
+    )
+    .map_err(|source| PspReadError::Zstd {
         context: format!("column {column_name:?}"),
         source,
     })?;
+    let bytes: &[u8] = decompressed_scratch;
     if bytes.len() as u64 != entry.uncompressed_len as u64 {
         return Err(PspReadError::UncompressedLenMismatch {
             column: column_name.to_string(),
@@ -1209,13 +1284,13 @@ fn decode_one_column<R: Read>(
     // addition forces a new arm here as a compile error.
     let decoded = match def.key {
         ColumnKey::DeltaPos => {
-            DecodedColumn::DeltaPos(decode_varint_column(&bytes, n_records, column_name)?)
+            DecodedColumn::DeltaPos(decode_varint_column(bytes, n_records, column_name)?)
         }
         ColumnKey::NAlleles => {
-            DecodedColumn::NAlleles(decode_varint_column(&bytes, n_records, column_name)?)
+            DecodedColumn::NAlleles(decode_varint_column(bytes, n_records, column_name)?)
         }
         ColumnKey::AlleleSeqLen => {
-            let lens = decode_varint_column(&bytes, n_total_alleles, column_name)?;
+            let lens = decode_varint_column(bytes, n_total_alleles, column_name)?;
             // Enforce per-entry cap symmetrically with the writer.
             for (i, &len) in lens.iter().enumerate() {
                 if len > MAX_ALLELE_SEQ_LEN {
@@ -1241,47 +1316,43 @@ fn decode_one_column<R: Read>(
                 "allele-seq-len decoded before allele-seq per manifest tag-ascending order",
             );
             DecodedColumn::AlleleSeq(decode_bytes_split(
-                &bytes,
+                bytes,
                 lens,
                 column_name,
                 Some(MAX_ALLELE_SEQ_LEN),
             )?)
         }
-        ColumnKey::AlleleObsCount => DecodedColumn::AlleleObsCount(decode_scalar_column_pod::<u32>(
-            &bytes,
-            n_total_alleles,
-            column_name,
-        )?),
+        ColumnKey::AlleleObsCount => DecodedColumn::AlleleObsCount(
+            decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
+        ),
         ColumnKey::AlleleQSumLog => DecodedColumn::AlleleQSumLog(decode_scalar_column_pod::<f64>(
-            &bytes,
+            bytes,
             n_total_alleles,
             column_name,
         )?),
-        ColumnKey::AlleleFwdCount => DecodedColumn::AlleleFwdCount(decode_scalar_column_pod::<u32>(
-            &bytes,
-            n_total_alleles,
-            column_name,
-        )?),
+        ColumnKey::AlleleFwdCount => DecodedColumn::AlleleFwdCount(
+            decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
+        ),
         ColumnKey::AllelePlacedLeftCount => DecodedColumn::AllelePlacedLeftCount(
-            decode_scalar_column_pod::<u32>(&bytes, n_total_alleles, column_name)?,
+            decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
-            decode_scalar_column_pod::<u32>(&bytes, n_total_alleles, column_name)?,
+            decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
         ColumnKey::NewChainSlots => DecodedColumn::NewChainSlots(decode_list_column::<SlotId>(
-            &bytes,
+            bytes,
             n_records,
             column_name,
         )?),
         ColumnKey::ExpiredChainSlots => {
             DecodedColumn::ExpiredChainSlots(decode_list_column::<SlotId>(
-                &bytes,
+                bytes,
                 n_records,
                 column_name,
             )?)
         }
         ColumnKey::AlleleChainSlots => DecodedColumn::AlleleChainSlots(
-            decode_list_column::<SlotId>(&bytes, n_total_alleles, column_name)?,
+            decode_list_column::<SlotId>(bytes, n_total_alleles, column_name)?,
         ),
     };
     Ok(Some(decoded))
@@ -2127,8 +2198,20 @@ mod tests {
         let mut buf = Vec::new();
         encode_block_header(&bad, &mut buf).unwrap();
         let mut src = Cursor::new(buf);
-        let (header, _) = read_block_header(&mut src).unwrap();
-        let err = decode_block_payload(&mut src, &header, u64::MAX).unwrap_err();
+        let mut header_buf = Vec::new();
+        let (header, _) = read_block_header(&mut src, &mut header_buf).unwrap();
+        let mut decompressor = new_column_decompressor().unwrap();
+        let mut compressed = Vec::new();
+        let mut decompressed = Vec::new();
+        let err = decode_block_payload(
+            &mut src,
+            &header,
+            u64::MAX,
+            &mut decompressor,
+            &mut compressed,
+            &mut decompressed,
+        )
+        .unwrap_err();
         match err {
             PspReadError::MissingRequiredColumnInManifest { name, tag } => {
                 // First missing column in registry-tag order is
@@ -2244,8 +2327,20 @@ mod tests {
             let mut buf = Vec::new();
             encode_block_header(&bad, &mut buf).unwrap();
             let mut src = Cursor::new(buf);
-            let (header, _) = read_block_header(&mut src).unwrap();
-            let err = decode_block_payload(&mut src, &header, u64::MAX).unwrap_err();
+            let mut header_buf = Vec::new();
+            let (header, _) = read_block_header(&mut src, &mut header_buf).unwrap();
+            let mut decompressor = new_column_decompressor().unwrap();
+            let mut compressed = Vec::new();
+            let mut decompressed = Vec::new();
+            let err = decode_block_payload(
+                &mut src,
+                &header,
+                u64::MAX,
+                &mut decompressor,
+                &mut compressed,
+                &mut decompressed,
+            )
+            .unwrap_err();
             match err {
                 PspReadError::MissingRequiredColumnInManifest { name, tag } => {
                     assert_eq!(
@@ -2279,10 +2374,19 @@ mod tests {
         // Empty source — the byte-budget check fires before any
         // read, so the source contents are irrelevant.
         let mut src = Cursor::new(Vec::<u8>::new());
+        let mut decompressor = new_column_decompressor().unwrap();
+        let mut compressed = Vec::new();
+        let mut decompressed = Vec::new();
         let err = decode_one_column(
-            &mut src, &entry, /* n_records   */ 1, /* n_total_alleles */ 1,
+            &mut src,
+            &entry,
+            /* n_records   */ 1,
+            /* n_total_alleles */ 1,
             /* allele_seq_len */ None,
             /* remaining_budget */ 100, // far less than u32::MAX
+            &mut decompressor,
+            &mut compressed,
+            &mut decompressed,
         )
         .unwrap_err();
         match err {
