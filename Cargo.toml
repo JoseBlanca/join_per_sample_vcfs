@@ -2,6 +2,34 @@
 name = "merge_per_sample_vcfs"
 version = "0.1.0"
 edition = "2024"
+# Mi22: edition 2024 requires ≥ 1.85; the `let-chains` features
+# (e.g. `if let ... && ...` in header.rs) are stable since 1.88, so
+# 1.88 is the practical floor. `rust-toolchain.toml` pins 1.95 for
+# benchmark reproducibility — see its comment.
+rust-version = "1.88"
+
+[lints.rust]
+# Mi23: pin the unsafe-free policy via the lint table so editor LSPs
+# and CI builds see the same stance. `src/lib.rs` also carries
+# `#![forbid(unsafe_code)]` for redundancy.
+unsafe_code = "forbid"
+
+[lints.rustdoc]
+# Doc warnings escalate to errors so a broken intra-doc link can't
+# silently land.
+broken_intra_doc_links = "deny"
+# Several `pub(crate)` types (e.g. `IngestState`, `WriterScratch`,
+# `ColumnPayload`) appear in doc comments on public items but are
+# not re-exported. Allow the lint — the crate is internal-only.
+private_intra_doc_links = "allow"
+
+[lints.clippy]
+# Mi23: keep the lints table small and additive. `wildcard_enum_match_arm`
+# and `match_same_arms` would surface many pre-existing non-PSP
+# sites that are out of scope for the 2026-05-13 review fixes.
+# Re-enable when those modules get their own clippy pass.
+fallible_impl_from = "warn"
+fn_params_excessive_bools = "warn"
 
 [profile.release]
 lto = "fat"
@@ -53,6 +81,7 @@ alloc-mimalloc = ["dep:mimalloc"]
 [dev-dependencies]
 bstr = "1"
 criterion = "0.8.2"
+proptest = "1"
 
 [[bench]]
 name = "gvcf_perf"

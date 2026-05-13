@@ -1,3 +1,7 @@
+// Mi5: this module is `pub(crate)`; its decoder primitives are
+// reader-side surface awaiting the not-yet-built `PspReader`.
+// They are exercised by tests but not reached from production code.
+#![allow(dead_code)]
 //! Per-block primitives: block header, per-shape column codecs, zstd
 //! compression.
 //!
@@ -33,7 +37,7 @@
 
 use std::io;
 
-use super::errors::{PspReadError, ScalarDecodeError, VarintError};
+use super::errors::{BlockHeaderInvariantKind, PspReadError, ScalarDecodeError, VarintError};
 use super::varint::{decode_u64_leb128, encode_u64_leb128};
 
 // ---------------------------------------------------------------------
@@ -564,8 +568,13 @@ pub struct ColumnManifestEntry {
 /// Encode a block header to its varint-stream wire form. Validates
 /// the in-memory invariants the decoder will also check, so a writer
 /// that hands us a malformed header gets a hard error before any
-/// byte is emitted.
-pub fn encode_block_header(header: &BlockHeader, out: &mut Vec<u8>) -> Result<(), PspReadError> {
+/// byte is emitted. Returns the structural invariant directly so
+/// each side (writer / reader) can wrap it in its own top-level
+/// error type — M8.
+pub fn encode_block_header(
+    header: &BlockHeader,
+    out: &mut Vec<u8>,
+) -> Result<(), BlockHeaderInvariantKind> {
     validate_block_header_invariants(header)?;
     encode_u64_leb128(u64::from(header.chrom_id), out);
     encode_u64_leb128(u64::from(header.first_pos), out);
@@ -642,7 +651,8 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<(BlockHeader, usize), PspRead
         active_chain_slots,
         manifest,
     };
-    validate_block_header_invariants(&header)?;
+    validate_block_header_invariants(&header)
+        .map_err(|kind| PspReadError::BlockHeaderInvariant { kind })?;
     Ok((header, cursor))
 }
 
@@ -655,7 +665,7 @@ fn decode_u32_field(
         .map_err(|source| PspReadError::BlockHeaderField { field, source })?;
     *cursor += n;
     u32::try_from(v).map_err(|_| PspReadError::BlockHeaderInvariant {
-        reason: format!("{field}: value {v} exceeds u32 range"),
+        kind: BlockHeaderInvariantKind::FieldExceedsU32 { field, value: v },
     })
 }
 
@@ -668,43 +678,35 @@ fn decode_u16_field(
         .map_err(|source| PspReadError::BlockHeaderField { field, source })?;
     *cursor += n;
     u16::try_from(v).map_err(|_| PspReadError::BlockHeaderInvariant {
-        reason: format!("{field}: value {v} exceeds u16 range"),
+        kind: BlockHeaderInvariantKind::FieldExceedsU16 { field, value: v },
     })
 }
 
-fn validate_block_header_invariants(header: &BlockHeader) -> Result<(), PspReadError> {
+fn validate_block_header_invariants(header: &BlockHeader) -> Result<(), BlockHeaderInvariantKind> {
     if header.n_records == 0 {
-        return Err(PspReadError::BlockHeaderInvariant {
-            reason: "n_records must be >= 1 (empty blocks are forbidden)".to_string(),
-        });
+        return Err(BlockHeaderInvariantKind::EmptyBlock);
     }
     if header.n_total_alleles < header.n_records {
-        return Err(PspReadError::BlockHeaderInvariant {
-            reason: format!(
-                "n_total_alleles {} < n_records {} (every record has at least one allele)",
-                header.n_total_alleles, header.n_records
-            ),
+        return Err(BlockHeaderInvariantKind::AllelesLessThanRecords {
+            n_records: header.n_records,
+            n_total_alleles: header.n_total_alleles,
         });
     }
     // Active chain slots strictly ascending, no duplicates.
     for w in header.active_chain_slots.windows(2) {
         if w[0] >= w[1] {
-            return Err(PspReadError::BlockHeaderInvariant {
-                reason: format!(
-                    "active_chain_slots not strictly ascending: {} then {}",
-                    w[0], w[1]
-                ),
+            return Err(BlockHeaderInvariantKind::ActiveSlotsNotAscending {
+                prev: w[0],
+                next: w[1],
             });
         }
     }
     // Manifest tags strictly ascending, no duplicates.
     for w in header.manifest.windows(2) {
         if w[0].tag >= w[1].tag {
-            return Err(PspReadError::BlockHeaderInvariant {
-                reason: format!(
-                    "manifest tags not strictly ascending: {:#x} then {:#x}",
-                    w[0].tag, w[1].tag
-                ),
+            return Err(BlockHeaderInvariantKind::ManifestTagsNotAscending {
+                prev: w[0].tag,
+                next: w[1].tag,
             });
         }
     }
@@ -1230,7 +1232,7 @@ mod tests {
         header.n_records = 0;
         let mut buf = Vec::new();
         let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(err, PspReadError::BlockHeaderInvariant { .. }));
+        assert!(matches!(err, BlockHeaderInvariantKind::EmptyBlock));
     }
 
     #[test]
@@ -1240,7 +1242,13 @@ mod tests {
         header.n_total_alleles = 99;
         let mut buf = Vec::new();
         let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(err, PspReadError::BlockHeaderInvariant { .. }));
+        assert!(matches!(
+            err,
+            BlockHeaderInvariantKind::AllelesLessThanRecords {
+                n_records: 100,
+                n_total_alleles: 99,
+            }
+        ));
     }
 
     #[test]
@@ -1249,7 +1257,10 @@ mod tests {
         header.active_chain_slots = vec![7, 3, 42];
         let mut buf = Vec::new();
         let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(err, PspReadError::BlockHeaderInvariant { .. }));
+        assert!(matches!(
+            err,
+            BlockHeaderInvariantKind::ActiveSlotsNotAscending { prev: 7, next: 3 }
+        ));
     }
 
     #[test]
@@ -1258,7 +1269,10 @@ mod tests {
         header.active_chain_slots = vec![3, 3, 7];
         let mut buf = Vec::new();
         let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(err, PspReadError::BlockHeaderInvariant { .. }));
+        assert!(matches!(
+            err,
+            BlockHeaderInvariantKind::ActiveSlotsNotAscending { prev: 3, next: 3 }
+        ));
     }
 
     #[test]
@@ -1267,7 +1281,10 @@ mod tests {
         header.manifest[1].tag = 0x00;
         let mut buf = Vec::new();
         let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(err, PspReadError::BlockHeaderInvariant { .. }));
+        assert!(matches!(
+            err,
+            BlockHeaderInvariantKind::ManifestTagsNotAscending { .. }
+        ));
     }
 
     #[test]
@@ -1276,7 +1293,10 @@ mod tests {
         header.manifest[1].tag = 0x01; // same as manifest[0]
         let mut buf = Vec::new();
         let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(err, PspReadError::BlockHeaderInvariant { .. }));
+        assert!(matches!(
+            err,
+            BlockHeaderInvariantKind::ManifestTagsNotAscending { prev: 1, next: 1 }
+        ));
     }
 
     #[test]
@@ -1418,6 +1438,93 @@ mod tests {
                 assert_eq!(source, ScalarDecodeError::Truncated);
             }
             other => panic!("expected ColumnElementDecode, got {other:?}"),
+        }
+    }
+
+    // ------------------- Property-based round-trips (M13) ----------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Round-trip property over arbitrary `u32` scalar columns.
+        #[test]
+        fn proptest_scalar_column_round_trip_u32(
+            values in prop::collection::vec(any::<u32>(), 0..256),
+        ) {
+            let mut buf = Vec::new();
+            encode_scalar_column(&values, &mut buf);
+            let decoded: Vec<u32> =
+                decode_scalar_column(&buf, values.len(), "test").unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        /// Round-trip property over arbitrary `u64` varint scalar
+        /// columns — exercises the variable-width path the example
+        /// tests cover with a handful of values.
+        #[test]
+        fn proptest_varint_column_round_trip(
+            values in prop::collection::vec(any::<u64>(), 0..256),
+        ) {
+            let mut buf = Vec::new();
+            encode_varint_column(&values, &mut buf);
+            let decoded = decode_varint_column(&buf, values.len(), "test").unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        /// Round-trip property over `u16` list columns (the only
+        /// list element type used in v1.0).
+        #[test]
+        fn proptest_list_column_round_trip_u16(
+            rows in prop::collection::vec(
+                prop::collection::vec(any::<u16>(), 0..16),
+                0..32,
+            ),
+        ) {
+            let slices: Vec<&[u16]> = rows.iter().map(|r| r.as_slice()).collect();
+            let mut buf = Vec::new();
+            encode_list_column(&slices, &mut buf);
+            let decoded: Vec<Vec<u16>> =
+                decode_list_column(&buf, rows.len(), "test").unwrap();
+            prop_assert_eq!(decoded, rows);
+        }
+
+        /// Round-trip property for `BlockHeader`, the load-bearing
+        /// fixed wire structure.
+        #[test]
+        fn proptest_block_header_round_trip(
+            chrom_id in any::<u32>(),
+            first_pos in any::<u32>(),
+            n_records in 1u32..=u32::MAX,
+            extra_alleles in 0u32..=u32::MAX / 2,
+            slot_seed in any::<u16>(),
+            n_slots in 0u32..16,
+        ) {
+            // Build a strictly-ascending slot list deterministically
+            // from the seed and the desired length.
+            let active_chain_slots: Vec<u16> = (0..n_slots as u16)
+                .map(|i| slot_seed.wrapping_add(i))
+                .collect();
+            let mut sorted = active_chain_slots.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let header = BlockHeader {
+                chrom_id,
+                first_pos,
+                n_records,
+                // n_total_alleles ≥ n_records, modulo overflow risk.
+                n_total_alleles: n_records.saturating_add(extra_alleles),
+                active_chain_slots: sorted,
+                manifest: vec![ColumnManifestEntry {
+                    tag: 0x01,
+                    compressed_len: 0,
+                    uncompressed_len: 0,
+                }],
+            };
+            let mut buf = Vec::new();
+            encode_block_header(&header, &mut buf).unwrap();
+            let (decoded, consumed) = decode_block_header(&buf).unwrap();
+            prop_assert_eq!(consumed, buf.len());
+            prop_assert_eq!(decoded, header);
         }
     }
 }

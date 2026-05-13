@@ -47,7 +47,7 @@ impl RefSeqFetcher for ConstFasta {
 fn build_multi_op_cigar(ref_span: u32, cycle_len: u32, ins_len: u32) -> Vec<CigarOp> {
     let mut ops = Vec::new();
     let mut consumed = 0u32;
-    while consumed + cycle_len + 1 <= ref_span {
+    while consumed + cycle_len < ref_span {
         ops.push(CigarOp::Match(cycle_len));
         ops.push(CigarOp::Insertion(ins_len));
         consumed += cycle_len;

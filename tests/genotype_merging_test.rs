@@ -121,7 +121,7 @@ fn test_non_variant_vars_are_removed() {
     let vars = collect_merged_variants(groups.into_iter().map(Ok), &iter_info);
 
     // Non-variable vars are filtered out
-    assert!(vars.len() == 0);
+    assert!(vars.is_empty());
 }
 
 #[test]

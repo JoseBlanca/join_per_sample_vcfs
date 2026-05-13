@@ -3,9 +3,11 @@
 //! Two top-level enums — `PspWriteError` for the writer side,
 //! `PspReadError` for the reader — match the producer / consumer
 //! split in the spec's §"Header-binary consistency: required reader
-//! checks" and §"Block invariants". Sub-enums (e.g. `VarintError`)
-//! describe failures intrinsic to a primitive and get wrapped into
-//! the top-level enums with context at the call site.
+//! checks" and §"Block invariants". Sub-enums describe failures
+//! intrinsic to a primitive (varint decoding, fixed-width scalar
+//! decoding) or to a cross-cut category (block-header invariants,
+//! record-validation rules, phase-chain marker rules), and get
+//! wrapped into the top-level enums with context at the call site.
 //!
 //! Each variant is one concrete failure mode. No `Other(String)`
 //! catch-alls — callers that need to react to a specific failure
@@ -68,6 +70,118 @@ impl From<VarintError> for ScalarDecodeError {
             VarintError::Truncated => Self::Truncated,
             VarintError::Overflow => Self::VarintOverflow,
         }
+    }
+}
+
+/// Reasons a block-header value can violate the structural
+/// invariants the spec pins. Shared between the writer (which
+/// checks before emission) and the reader (which checks on decode);
+/// each side wraps the same kind in its own top-level error variant
+/// (see [`PspReadError::BlockHeaderInvariant`] and
+/// [`PspWriteError::BlockEmission`]). M8.
+#[non_exhaustive]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum BlockHeaderInvariantKind {
+    #[error("n_records must be >= 1 (empty blocks are forbidden)")]
+    EmptyBlock,
+
+    #[error(
+        "n_total_alleles {n_total_alleles} < n_records {n_records} \
+         (every record has at least one allele)"
+    )]
+    AllelesLessThanRecords {
+        n_records: u32,
+        n_total_alleles: u32,
+    },
+
+    #[error("active_chain_slots not strictly ascending: {prev} then {next}")]
+    ActiveSlotsNotAscending { prev: u16, next: u16 },
+
+    #[error("manifest tags not strictly ascending: {prev:#x} then {next:#x}")]
+    ManifestTagsNotAscending { prev: u16, next: u16 },
+
+    #[error("{field}: value {value} exceeds u32 range")]
+    FieldExceedsU32 { field: &'static str, value: u64 },
+
+    #[error("{field}: value {value} exceeds u16 range")]
+    FieldExceedsU16 { field: &'static str, value: u64 },
+}
+
+/// Rules a record handed to `write_record` can violate. Carried as
+/// the `kind` of [`PspWriteError::InvalidRecord`]. Mi10.
+#[non_exhaustive]
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum InvalidRecordKind {
+    #[error("record has zero alleles (REF always present)")]
+    ZeroAlleles,
+
+    #[error("allele {allele_index} sequence length {length} outside [1, {max}]")]
+    AlleleSeqLen {
+        allele_index: usize,
+        length: usize,
+        max: u64,
+    },
+
+    #[error(
+        "allele {allele_index} byte {byte_offset} = {byte:#04x} \
+         (only A/C/G/T/N allowed)"
+    )]
+    InvalidAlleleByte {
+        allele_index: usize,
+        byte_offset: usize,
+        byte: u8,
+    },
+
+    #[error("allele {allele_index} q_sum is non-finite ({q_sum})")]
+    NonFiniteQSum { allele_index: usize, q_sum: f64 },
+
+    #[error("allele {allele_index} chain_slots not strictly ascending")]
+    AlleleChainSlotsNotAscending { allele_index: usize },
+
+    #[error("{marker_set} not strictly ascending")]
+    ChainMarkerNotAscending { marker_set: &'static str },
+}
+
+/// Reasons a phase-chain marker can be inconsistent with the
+/// running active-slot set. Carried as the `kind` of
+/// [`PspWriteError::PhaseChainMarkerInconsistency`]. Mi10.
+#[non_exhaustive]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum PhaseChainMarkerInconsistencyKind {
+    #[error("active_slots non-empty ({n_active}) at first record of chromosome {chrom_id}")]
+    ActiveAtChromBoundary { n_active: usize, chrom_id: u32 },
+
+    #[error("expired chain slot {slot} not currently active")]
+    ExpiredNotActive { slot: u16 },
+
+    #[error("new chain slot {slot} already active")]
+    NewAlreadyActive { slot: u16 },
+
+    #[error("allele {allele_index} references chain slot {slot} not in active set")]
+    AlleleReferencesUnknownSlot { allele_index: usize, slot: u16 },
+}
+
+/// Wrapper around `toml::ser::Error` so the writer's error chain
+/// keeps the `#[source]` link without leaking the foreign type's
+/// shape into our public API. Mi12.
+#[derive(Debug)]
+pub struct TomlSerError(toml::ser::Error);
+
+impl TomlSerError {
+    pub(crate) fn new(e: toml::ser::Error) -> Self {
+        Self(e)
+    }
+}
+
+impl std::fmt::Display for TomlSerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for TomlSerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
     }
 }
 
@@ -287,13 +401,14 @@ pub enum PspReadError {
         source: ScalarDecodeError,
     },
 
-    /// A block-header structural invariant was violated. The
-    /// `reason` text names the invariant; the writer caught one of
-    /// the per-block invariants from spec §"Block sizing / Block
-    /// invariants" before emitting, or the reader caught a
-    /// corrupted block on the way in.
-    #[error("block header invariant violation: {reason}")]
-    BlockHeaderInvariant { reason: String },
+    /// A block-header structural invariant was violated; the reader
+    /// caught a corrupted block on the way in. The cause carries the
+    /// specific invariant; see [`BlockHeaderInvariantKind`].
+    #[error("block header invariant violation")]
+    BlockHeaderInvariant {
+        #[source]
+        kind: BlockHeaderInvariantKind,
+    },
 }
 
 /// Errors the `.psp` writer can emit. Variants land as the
@@ -301,9 +416,19 @@ pub enum PspReadError {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum PspWriteError {
-    #[error("I/O error writing {context}: {source}")]
+    /// I/O error during a write. Optional `block_index` and
+    /// `column_tag` fields identify the file region that was being
+    /// written when the failure occurred — populated for per-block
+    /// and per-column writes, `None` for file-level writes (header,
+    /// trailer, final flush). Mi9.
+    #[error(
+        "I/O error writing {context}{}: {source}",
+        format_block_column(*block_index, *column_tag),
+    )]
     Io {
         context: &'static str,
+        block_index: Option<u64>,
+        column_tag: Option<u16>,
         #[source]
         source: std::io::Error,
     },
@@ -315,13 +440,15 @@ pub enum PspWriteError {
     #[error("invalid header field {key:?}: {reason}")]
     InvalidHeaderField { key: String, reason: String },
 
-    /// The TOML serializer failed (typically because a field cannot be
-    /// represented in TOML at all — should not happen for our schema,
-    /// but the failure surface exists). Carries the underlying
-    /// message as a string because `toml::ser::Error`'s exact type is
-    /// not part of the `toml` crate's public surface.
-    #[error("TOML header serialisation failed: {message}")]
-    HeaderToml { message: String },
+    /// The TOML serializer failed (typically because a field cannot
+    /// be represented in TOML at all — should not happen for our
+    /// schema, but the failure surface exists). The wrapper newtype
+    /// preserves the `Error::source()` chain.
+    #[error("TOML header serialisation failed")]
+    HeaderToml {
+        #[source]
+        source: TomlSerError,
+    },
 
     /// The serialised TOML body exceeded the 1 MiB-minus-framing cap
     /// (or somehow came out empty). Spec §"File header / Layout"
@@ -330,11 +457,15 @@ pub enum PspWriteError {
     HeaderBodyTooLarge { got: u64, min: u64, max: u64 },
 
     /// A record handed to `write_record` violates a spec invariant.
-    /// `reason` names which rule failed; `record_index` is the
-    /// zero-based position in the writer's input stream so the
-    /// error message can point at the offending input.
-    #[error("invalid record at index {record_index}: {reason}")]
-    InvalidRecord { record_index: u64, reason: String },
+    /// `record_index` is the zero-based position in the writer's
+    /// input stream so the error message can point at the offending
+    /// input; `kind` names which rule failed.
+    #[error("invalid record at index {record_index}")]
+    InvalidRecord {
+        record_index: u64,
+        #[source]
+        kind: InvalidRecordKind,
+    },
 
     /// A record's `chrom_id` is outside the writer's chromosome
     /// table (declared via
@@ -375,18 +506,22 @@ pub enum PspWriteError {
     },
 
     /// A phase-chain marker is inconsistent with the running
-    /// active-slot set: `new_chains` references a slot already
-    /// active, or `expired_chains` references a slot not active.
-    #[error("record at index {record_index}: phase-chain marker inconsistency: {reason}")]
-    PhaseChainMarkerInconsistency { record_index: u64, reason: String },
+    /// active-slot set. `kind` names the specific inconsistency.
+    #[error("record at index {record_index}: phase-chain marker inconsistency")]
+    PhaseChainMarkerInconsistency {
+        record_index: u64,
+        #[source]
+        kind: PhaseChainMarkerInconsistencyKind,
+    },
 
-    /// `finish` has been called but the writer-side encoded block
-    /// header rejected our own data — bug in the writer.
-    #[error("block emission failed at index {block_index}: {source}")]
+    /// `finish` has been called but the writer-side block-header
+    /// invariant check rejected our own data — bug in the writer.
+    /// `kind` carries the specific invariant violated; M8.
+    #[error("block emission failed at index {block_index}")]
     BlockEmission {
         block_index: u64,
         #[source]
-        source: PspReadError,
+        kind: BlockHeaderInvariantKind,
     },
 
     /// A column the writer just encoded has a byte length that
@@ -400,4 +535,15 @@ pub enum PspWriteError {
         got: usize,
         expected: usize,
     },
+}
+
+/// Helper for [`PspWriteError::Io`]'s `Display`: renders the
+/// optional `(block_index, column_tag)` context inline.
+fn format_block_column(block_index: Option<u64>, column_tag: Option<u16>) -> String {
+    match (block_index, column_tag) {
+        (Some(b), Some(t)) => format!(" (block {b}, column {t:#x})"),
+        (Some(b), None) => format!(" (block {b})"),
+        (None, Some(t)) => format!(" (column {t:#x})"),
+        (None, None) => String::new(),
+    }
 }

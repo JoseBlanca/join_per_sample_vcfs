@@ -1,3 +1,6 @@
+// Mi5: this module is `pub(crate)`; its decoder primitives are
+// reader-side surface awaiting the not-yet-built `PspReader`.
+#![allow(dead_code)]
 //! The tail-mounted block index plus its XXH3-64 integrity check.
 //!
 //! Each `.psp` carries one [`BlockIndexEntry`] per block, written
@@ -451,6 +454,36 @@ mod tests {
         // block_offset — 8 LE bytes.
         assert_eq!(&bytes[10..18], &0x0102030405060708u64.to_le_bytes());
         assert_eq!(bytes.len(), 18);
+    }
+
+    // ------------------- Property-based round-trip (M13) -----------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Round-trip property over arbitrary index-entry vectors:
+        /// `decode(encode(entries))` recovers every entry.
+        #[test]
+        fn proptest_index_round_trip(
+            entries in prop::collection::vec(
+                (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>(), any::<u64>())
+                    .prop_map(|(chrom_id, first_pos, last_pos, n_records, block_offset)| {
+                        BlockIndexEntry {
+                            chrom_id,
+                            first_pos,
+                            last_pos,
+                            n_records,
+                            block_offset,
+                        }
+                    }),
+                0..50,
+            ),
+        ) {
+            let bytes = encode_index(&entries);
+            let decoded = decode_index(&bytes, entries.len() as u64)
+                .expect("round-trip decode succeeds");
+            prop_assert_eq!(decoded, entries);
+        }
     }
 
     /// (B3 regression.) A hostile trailer claiming `n_blocks =

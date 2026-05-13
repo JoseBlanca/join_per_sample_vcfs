@@ -97,7 +97,7 @@ fn file_is_gzipped_works_with_paths_from_fs_module() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let file_path = tmp_dir.path().join("test.gz");
 
-    fs::write(&file_path, &[0x1f, 0x8b, 0x08, 0x00]).unwrap();
+    fs::write(&file_path, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
     let result = file_is_gzipped(&file_path).unwrap();
 
     assert!(result);

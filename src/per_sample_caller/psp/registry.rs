@@ -1,3 +1,6 @@
+// Mi5: this module is `pub(crate)`; `lookup_by_tag` is reader-side
+// surface awaiting the not-yet-built `PspReader`.
+#![allow(dead_code)]
 //! The v1.0 column-tag registry — the single source of truth shared
 //! by writer, reader, and (later) the `psp_spec_dump` helper.
 //!
@@ -168,6 +171,76 @@ impl ElementType {
 /// single-source-of-truth cap is enforced symmetrically.
 pub const MAX_ALLELE_SEQ_LEN: u64 = 10_000;
 
+/// Exhaustive enumeration of every v1.0 column the registry knows
+/// about, by static identity. Used by the writer to dispatch
+/// per-column encoders without the compile-time hole a `match` on
+/// `u16` tag literals leaves (M4). Adding a v1.x column means
+/// adding a variant here, which forces every dispatch match to be
+/// updated as a compile error.
+///
+/// **Not `#[non_exhaustive]` by design** — see the comment on
+/// [`Cardinality`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColumnKey {
+    DeltaPos,
+    NAlleles,
+    AlleleSeqLen,
+    AlleleSeq,
+    AlleleObsCount,
+    AlleleQSumLog,
+    AlleleFwdCount,
+    AllelePlacedLeftCount,
+    AllelePlacedStartCount,
+    NewChainSlots,
+    ExpiredChainSlots,
+    AlleleChainSlots,
+}
+
+/// Per-payload-shape data, pinning the valid combinations of
+/// `(shape, element_type, length_column)` that previously lived as
+/// three flat `ColumnDef` fields (M17). Only the three combinations
+/// reachable in v1.0 are representable.
+///
+/// **Not `#[non_exhaustive]` by design** — same rationale as the
+/// neighbouring enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPayload {
+    /// One `element_type` value per entry.
+    Scalar { element_type: ElementType },
+    /// Per entry: a `varint` count followed by that many
+    /// `element_type` values.
+    List { element_type: ElementType },
+    /// A flat byte stream chunked by the named length column.
+    Bytes { length_column: &'static str },
+}
+
+impl ColumnPayload {
+    /// Recover the legacy `Shape` token for the wire / TOML schema.
+    pub const fn shape(self) -> Shape {
+        match self {
+            Self::Scalar { .. } => Shape::Scalar,
+            Self::List { .. } => Shape::List,
+            Self::Bytes { .. } => Shape::Bytes,
+        }
+    }
+
+    /// `Some(element_type)` for `Scalar`/`List`; `None` for `Bytes`.
+    pub const fn element_type(self) -> Option<ElementType> {
+        match self {
+            Self::Scalar { element_type } | Self::List { element_type } => Some(element_type),
+            Self::Bytes { .. } => None,
+        }
+    }
+
+    /// `Some(name)` for `Bytes`; `None` otherwise.
+    pub const fn length_column(self) -> Option<&'static str> {
+        match self {
+            Self::Bytes { length_column } => Some(length_column),
+            Self::Scalar { .. } | Self::List { .. } => None,
+        }
+    }
+}
+
 /// One row of the column-tag registry. Identical information appears
 /// in the spec's §"Required columns in v1.0" table and in every
 /// v1.0 file's TOML `[[column]]` array; this struct is the canonical
@@ -179,29 +252,44 @@ pub struct ColumnDef {
     /// same integer.
     pub tag: u16,
 
+    /// Static identity used for compile-time-exhaustive dispatch
+    /// (writer encoders, decoders) without going through the numeric
+    /// `tag`. Adding a registry entry forces every dispatch match to
+    /// be updated.
+    pub key: ColumnKey,
+
     /// Lowercase kebab-case identifier, e.g. `"allele-q-sum-log"`.
     /// Stable across versions.
     pub name: &'static str,
 
     pub cardinality: Cardinality,
-    pub shape: Shape,
 
-    /// `Some` whenever `shape != Bytes`; `None` exactly when
-    /// `shape == Bytes`.
-    pub element_type: Option<ElementType>,
-
-    /// `Some(name_of_length_column)` exactly when `shape == Bytes`;
-    /// `None` otherwise. The named column must exist in the same
-    /// registry, share `cardinality`, have `shape = Scalar`, and
-    /// have `element_type = Some(Varint)` (reader consistency
-    /// check #3).
-    pub length_column: Option<&'static str>,
+    /// Per-payload-shape data — pins the valid `(shape, element_type,
+    /// length_column)` combinations at the type level (M17).
+    pub payload: ColumnPayload,
 
     pub required: bool,
 
     /// Canonical one-line description, reproduced verbatim by the
     /// writer into the in-file `[[column]]` array.
     pub description: &'static str,
+}
+
+impl ColumnDef {
+    /// Convenience accessor for the legacy `shape` field.
+    pub const fn shape(&self) -> Shape {
+        self.payload.shape()
+    }
+
+    /// Convenience accessor for the legacy `element_type` field.
+    pub const fn element_type(&self) -> Option<ElementType> {
+        self.payload.element_type()
+    }
+
+    /// Convenience accessor for the legacy `length_column` field.
+    pub const fn length_column(&self) -> Option<&'static str> {
+        self.payload.length_column()
+    }
 }
 
 /// The v1.0 column registry. Order matches the spec's §"Required
@@ -211,11 +299,12 @@ pub struct ColumnDef {
 pub const V1_0_COLUMNS: &[ColumnDef] = &[
     ColumnDef {
         tag: 0x01,
+        key: ColumnKey::DeltaPos,
         name: "delta-pos",
         cardinality: Cardinality::PerRecord,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::Varint),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::Varint,
+        },
         required: true,
         description: "Distance to the previous record's position. \
             First record in a block has value 0 and uses the block \
@@ -223,54 +312,59 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x02,
+        key: ColumnKey::NAlleles,
         name: "n-alleles",
         cardinality: Cardinality::PerRecord,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::Varint),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::Varint,
+        },
         required: true,
         description: "Number of alleles in this record (>= 1). Sum \
             across records equals n_total_alleles.",
     },
     ColumnDef {
         tag: 0x03,
+        key: ColumnKey::AlleleSeqLen,
         name: "allele-seq-len",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::Varint),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::Varint,
+        },
         required: true,
         description: "Byte length of each allele's sequence. Drives \
             chunking of allele-seq.",
     },
     ColumnDef {
         tag: 0x04,
+        key: ColumnKey::AlleleSeq,
         name: "allele-seq",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Bytes,
-        element_type: None,
-        length_column: Some("allele-seq-len"),
+        payload: ColumnPayload::Bytes {
+            length_column: "allele-seq-len",
+        },
         required: true,
         description: "Allele sequence bytes (uppercase ASCII over \
             {A,C,G,T,N}). REF is the first allele in each record.",
     },
     ColumnDef {
         tag: 0x10,
+        key: ColumnKey::AlleleObsCount,
         name: "allele-obs-count",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::U32),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
         required: true,
         description: "Observation count: reads supporting this allele.",
     },
     ColumnDef {
         tag: 0x11,
+        key: ColumnKey::AlleleQSumLog,
         name: "allele-q-sum-log",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::F64),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::F64,
+        },
         required: true,
         description: "Sum over supporting reads of max(ln_BQ_BAQ, \
             ln_MQ). The freebayes per-read combination of base and \
@@ -278,44 +372,48 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x12,
+        key: ColumnKey::AlleleFwdCount,
         name: "allele-fwd-count",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::U32),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
         required: true,
         description: "Forward-strand count: reads on the forward \
             strand supporting this allele.",
     },
     ColumnDef {
         tag: 0x13,
+        key: ColumnKey::AllelePlacedLeftCount,
         name: "allele-placed-left-count",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::U32),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
         required: true,
         description: "Reads whose 5' end is to the left of the \
             record's position (freebayes' placedLeft).",
     },
     ColumnDef {
         tag: 0x14,
+        key: ColumnKey::AllelePlacedStartCount,
         name: "allele-placed-start-count",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::Scalar,
-        element_type: Some(ElementType::U32),
-        length_column: None,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
         required: true,
         description: "Reads whose 5' end is the record's position \
             (freebayes' placedStart).",
     },
     ColumnDef {
         tag: 0x20,
+        key: ColumnKey::NewChainSlots,
         name: "new-chain-slots",
         cardinality: Cardinality::PerRecord,
-        shape: Shape::List,
-        element_type: Some(ElementType::U16),
-        length_column: None,
+        payload: ColumnPayload::List {
+            element_type: ElementType::U16,
+        },
         required: true,
         description: "Phase-chain slot ids that became active since \
             the previous record. Ascending. On record 0 of a block, \
@@ -324,11 +422,12 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x21,
+        key: ColumnKey::ExpiredChainSlots,
         name: "expired-chain-slots",
         cardinality: Cardinality::PerRecord,
-        shape: Shape::List,
-        element_type: Some(ElementType::U16),
-        length_column: None,
+        payload: ColumnPayload::List {
+            element_type: ElementType::U16,
+        },
         required: true,
         description: "Phase-chain slot ids that ended since the \
             previous record. Ascending. On record 0 of a block, \
@@ -337,11 +436,12 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x22,
+        key: ColumnKey::AlleleChainSlots,
         name: "allele-chain-slots",
         cardinality: Cardinality::PerAllele,
-        shape: Shape::List,
-        element_type: Some(ElementType::U16),
-        length_column: None,
+        payload: ColumnPayload::List {
+            element_type: ElementType::U16,
+        },
         required: true,
         description: "Phase-chain slot ids contributing to each \
             allele observation. Ascending. References the \
@@ -367,38 +467,18 @@ pub fn lookup_by_name(name: &str) -> Option<&'static ColumnDef> {
 mod tests {
     use super::*;
 
-    /// Every column's shape/element-type/length-column triple has to
-    /// satisfy the spec's consistency rules: `Bytes` ⇔ no element-
-    /// type ⇔ has length-column; non-`Bytes` ⇔ has element-type ⇔
-    /// no length-column.
+    /// (M17.) The `ColumnPayload` enum *is* the shape invariant —
+    /// only `Scalar`/`List` carry an element-type and only `Bytes`
+    /// carries a length-column. This test is now mostly redundant
+    /// with the type system, but kept as a smoke check.
     #[test]
     fn shape_invariants_per_entry() {
         for c in V1_0_COLUMNS {
-            match c.shape {
-                Shape::Bytes => {
-                    assert!(
-                        c.element_type.is_none(),
-                        "{}: Bytes column must not have element-type",
-                        c.name
-                    );
-                    assert!(
-                        c.length_column.is_some(),
-                        "{}: Bytes column must have length-column",
-                        c.name
-                    );
+            match c.payload {
+                ColumnPayload::Bytes { length_column } => {
+                    assert!(!length_column.is_empty(), "{}: empty length-column", c.name);
                 }
-                Shape::Scalar | Shape::List => {
-                    assert!(
-                        c.element_type.is_some(),
-                        "{}: non-Bytes column must have element-type",
-                        c.name
-                    );
-                    assert!(
-                        c.length_column.is_none(),
-                        "{}: non-Bytes column must not have length-column",
-                        c.name
-                    );
-                }
+                ColumnPayload::Scalar { .. } | ColumnPayload::List { .. } => {}
             }
         }
     }
@@ -409,7 +489,7 @@ mod tests {
     #[test]
     fn length_column_references_are_well_typed() {
         for c in V1_0_COLUMNS {
-            if let Some(len_name) = c.length_column {
+            if let Some(len_name) = c.length_column() {
                 let target = lookup_by_name(len_name).unwrap_or_else(|| {
                     panic!("{}: length-column '{}' not in registry", c.name, len_name)
                 });
@@ -419,13 +499,13 @@ mod tests {
                     c.name
                 );
                 assert_eq!(
-                    target.shape,
+                    target.shape(),
                     Shape::Scalar,
                     "{}: length-column must be Scalar",
                     c.name
                 );
                 assert_eq!(
-                    target.element_type,
+                    target.element_type(),
                     Some(ElementType::Varint),
                     "{}: length-column must be Varint",
                     c.name
@@ -539,16 +619,33 @@ mod tests {
     fn key_columns_have_expected_types() {
         let q = lookup_by_name("allele-q-sum-log").unwrap();
         assert_eq!(q.tag, 0x11);
-        assert_eq!(q.element_type, Some(ElementType::F64));
+        assert_eq!(q.element_type(), Some(ElementType::F64));
 
         let slots = lookup_by_name("allele-chain-slots").unwrap();
         assert_eq!(slots.tag, 0x22);
         assert_eq!(slots.cardinality, Cardinality::PerAllele);
-        assert_eq!(slots.shape, Shape::List);
-        assert_eq!(slots.element_type, Some(ElementType::U16));
+        assert_eq!(slots.shape(), Shape::List);
+        assert_eq!(slots.element_type(), Some(ElementType::U16));
 
         let seq = lookup_by_name("allele-seq").unwrap();
-        assert_eq!(seq.shape, Shape::Bytes);
-        assert_eq!(seq.length_column, Some("allele-seq-len"));
+        assert_eq!(seq.shape(), Shape::Bytes);
+        assert_eq!(seq.length_column(), Some("allele-seq-len"));
+    }
+
+    /// (M4.) `ColumnKey` is exhaustive over every registry entry.
+    /// Adding a `ColumnDef` row without giving it a `key` is a
+    /// compile error; reusing an existing key for a new row would
+    /// fail this uniqueness test.
+    #[test]
+    fn column_keys_are_unique_and_cover_v1_0() {
+        let mut seen = std::collections::HashSet::new();
+        for c in V1_0_COLUMNS {
+            assert!(
+                seen.insert(c.key),
+                "duplicate ColumnKey {:?} in V1_0_COLUMNS",
+                c.key
+            );
+        }
+        assert_eq!(seen.len(), V1_0_COLUMNS.len());
     }
 }

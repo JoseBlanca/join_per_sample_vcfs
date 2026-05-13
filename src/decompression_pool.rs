@@ -130,7 +130,7 @@ enum JobResult {
     Done,
 }
 
-fn process_one_chunk(job: &mut Job, buf: &mut Vec<u8>) -> JobResult {
+fn process_one_chunk(job: &mut Job, buf: &mut [u8]) -> JobResult {
     // Check if cancelled or buffer full before reading.
     {
         let inner = job.buffer.inner.lock().unwrap();
@@ -373,8 +373,9 @@ mod tests {
         {
             let mut reader = pool.register(Cursor::new(data));
             let mut buf = [0u8; 1024];
-            // Read just a bit, then drop.
-            reader.read(&mut buf).unwrap();
+            // Read just a bit, then drop. The exact count read is
+            // irrelevant; we just need to touch the reader.
+            let _ = reader.read(&mut buf).unwrap();
         }
         // Pool should not hang — the cancelled job is cleaned up.
 
@@ -400,7 +401,7 @@ mod tests {
         struct FailingReader;
         impl Read for FailingReader {
             fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::Other, "read failed"))
+                Err(io::Error::other("read failed"))
             }
         }
 
@@ -421,7 +422,7 @@ mod tests {
             let pool = DecompressionPool::new(2);
             reader = pool.register(Cursor::new(data));
             let mut buf = [0u8; 1024];
-            reader.read(&mut buf).unwrap();
+            let _ = reader.read(&mut buf).unwrap();
             // Pool drops here while reader is still alive.
         }
         // Reader should still be able to drain what was already buffered

@@ -1,0 +1,61 @@
+# M18: Continuous-integration gates for the PSP code-review fixes.
+# Runs on every push to `main` and on every PR. The job names match
+# the verification commands the rust-code-review skill expects.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt + clippy + test + doc + audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins the channel; `dtolnay/rust-toolchain`
+      # picks it up automatically.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (lib + integration, excluding criterion benches)
+        # `--all-targets` would attempt to run criterion benches which
+        # need fixture files not present in CI; `--lib --tests` covers
+        # the unit + integration suites.
+        run: cargo test --lib --tests --all-features
+
+      - name: Doc build (deny warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --lib --all-features
+
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  msrv:
+    name: MSRV build (rust-version from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Build at MSRV
+        run: cargo build --lib --all-features

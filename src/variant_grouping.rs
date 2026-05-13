@@ -85,15 +85,15 @@ fn validate_var_order(
         return Ok(());
     }
 
-    if let Some(last_group_start) = last_group_start {
-        if var.pos < last_group_start {
-            return Err(VcfParseError::RuntimeError {
-                message: format!(
-                    "Out-of-order position on '{}': {} < last var group start {}",
-                    current_chrom, var.pos, last_group_start
-                ),
-            });
-        }
+    if let Some(last_group_start) = last_group_start
+        && var.pos < last_group_start
+    {
+        return Err(VcfParseError::RuntimeError {
+            message: format!(
+                "Out-of-order position on '{}': {} < last var group start {}",
+                current_chrom, var.pos, last_group_start
+            ),
+        });
     }
 
     Ok(())
@@ -278,11 +278,11 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
                         // All peeked variants are at the same position and non-variable;
                         // consume them in parallel.
                         self.vcf_iters.par_iter_mut().for_each(|iter| {
-                            if let Ok(Some(r)) = iter.peek_variant() {
-                                if r.chrom == *chrom {
-                                    debug_assert_eq!(r.pos, pos);
-                                    iter.next();
-                                }
+                            if let Ok(Some(r)) = iter.peek_variant()
+                                && r.chrom == *chrom
+                            {
+                                debug_assert_eq!(r.pos, pos);
+                                iter.next();
                             }
                         });
                         self.last_group_start = Some(pos);
@@ -374,10 +374,10 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
 
     fn chromosome_has_remaining_variants(&mut self, current_chrom: &str) -> VcfResult<bool> {
         for iter in &mut self.vcf_iters {
-            if let Some(r) = iter.peek_variant()? {
-                if r.chrom == current_chrom {
-                    return Ok(true);
-                }
+            if let Some(r) = iter.peek_variant()?
+                && r.chrom == current_chrom
+            {
+                return Ok(true);
             }
         }
         Ok(false)

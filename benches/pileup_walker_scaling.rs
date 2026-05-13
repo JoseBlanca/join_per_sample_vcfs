@@ -108,7 +108,7 @@ fn build_multi_op_cigar(ref_span: u32, cycle_len: u32, ins_len: u32) -> Vec<Ciga
     let mut consumed = 0u32;
     // Leave at least one full M op after the last I so the cigar
     // ends in M, not I.
-    while consumed + cycle_len + 1 <= ref_span {
+    while consumed + cycle_len < ref_span {
         ops.push(CigarOp::Match(cycle_len));
         ops.push(CigarOp::Insertion(ins_len));
         // Insertions don't consume reference bases.

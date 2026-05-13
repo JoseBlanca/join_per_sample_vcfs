@@ -298,8 +298,10 @@ fn em_constant_matches_htslib_literal() {
     // PARITY: `EM = 0.33333333333` (11 digits) must not drift to
     // `1.0/3.0` (~0.3333333333333333). A unit-test pin catches the
     // drift before the parity fixture does.
-    assert!(super::probaln::EM > 0.333333333329);
-    assert!(super::probaln::EM < 0.333333333331);
+    const _: () = {
+        assert!(super::probaln::EM > 0.333333333329);
+        assert!(super::probaln::EM < 0.333333333331);
+    };
 }
 
 #[test]

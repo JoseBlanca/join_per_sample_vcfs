@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use toml::value::Datetime;
 
-use super::errors::{PspReadError, PspWriteError};
+use super::errors::{PspReadError, PspWriteError, TomlSerError};
 use super::registry::{self, Cardinality, ColumnDef, ElementType, Shape, V1_0_COLUMNS};
 
 // ---------------------------------------------------------------------
@@ -181,11 +181,45 @@ pub struct ParsedColumn {
     pub tag: u16,
     pub name: String,
     pub cardinality: Cardinality,
-    pub shape: Shape,
-    pub element_type: Option<ElementType>,
-    pub length_column: Option<String>,
+    /// Per-payload-shape data; mirrors [`ColumnDef::payload`] but
+    /// uses `String` for the length-column reference because parse
+    /// inputs are owned. M17.
+    pub payload: ParsedColumnPayload,
     pub required: bool,
     pub description: String,
+}
+
+/// Owned counterpart to [`super::registry::ColumnPayload`] —
+/// parse-side variant where `length_column` is a `String`. M17.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedColumnPayload {
+    Scalar { element_type: ElementType },
+    List { element_type: ElementType },
+    Bytes { length_column: String },
+}
+
+impl ParsedColumnPayload {
+    pub fn shape(&self) -> Shape {
+        match self {
+            Self::Scalar { .. } => Shape::Scalar,
+            Self::List { .. } => Shape::List,
+            Self::Bytes { .. } => Shape::Bytes,
+        }
+    }
+
+    pub fn element_type(&self) -> Option<ElementType> {
+        match self {
+            Self::Scalar { element_type } | Self::List { element_type } => Some(*element_type),
+            Self::Bytes { .. } => None,
+        }
+    }
+
+    pub fn length_column(&self) -> Option<&str> {
+        match self {
+            Self::Bytes { length_column } => Some(length_column.as_str()),
+            Self::Scalar { .. } | Self::List { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -268,7 +302,7 @@ pub fn build_header_toml(header: &WriterHeader) -> Result<Vec<u8>, PspWriteError
     validate_writer_header(header)?;
     let wire = wire_from_writer_header(header);
     let s = toml::to_string(&wire).map_err(|e| PspWriteError::HeaderToml {
-        message: e.to_string(),
+        source: TomlSerError::new(e),
     })?;
     Ok(s.into_bytes())
 }
@@ -331,9 +365,9 @@ fn wire_column_from_def(c: &ColumnDef) -> WireColumn {
         tag: c.tag,
         name: c.name.to_string(),
         cardinality: c.cardinality.as_str().to_string(),
-        shape: c.shape.as_str().to_string(),
-        element_type: c.element_type.map(|e| e.as_str().to_string()),
-        length_column: c.length_column.map(|s| s.to_string()),
+        shape: c.shape().as_str().to_string(),
+        element_type: c.element_type().map(|e| e.as_str().to_string()),
+        length_column: c.length_column().map(|s| s.to_string()),
         required: c.required,
         description: c.description.to_string(),
     }
@@ -567,57 +601,74 @@ fn parse_column(index: usize, c: WireColumn) -> Result<ParsedColumn, PspReadErro
         key: format!("{key_prefix}.shape"),
         reason: format!("{:?} is not a valid shape token", c.shape),
     })?;
-    let element_type =
-        match (shape, c.element_type.as_deref()) {
-            (Shape::Bytes, None) => None,
-            (Shape::Bytes, Some(_)) => {
-                return Err(PspReadError::InvalidHeaderField {
-                    key: format!("{key_prefix}.element-type"),
-                    reason: "bytes-shape columns must not carry element-type".to_string(),
-                });
-            }
-            (_, None) => {
-                return Err(PspReadError::InvalidHeaderField {
-                    key: format!("{key_prefix}.element-type"),
-                    reason: format!("non-bytes shape {:?} requires element-type", shape.as_str()),
-                });
-            }
-            (_, Some(s)) => Some(ElementType::parse_token(s).ok_or_else(|| {
-                PspReadError::InvalidHeaderField {
-                    key: format!("{key_prefix}.element-type"),
-                    reason: format!("{s:?} is not a valid element-type token"),
-                }
-            })?),
-        };
-    let length_column = match (shape, c.length_column.as_deref()) {
-        (Shape::Bytes, Some(s)) => Some(s.to_string()),
-        (Shape::Bytes, None) => {
-            return Err(PspReadError::InvalidHeaderField {
-                key: format!("{key_prefix}.length-column"),
-                reason: "bytes-shape columns require length-column".to_string(),
-            });
-        }
-        (_, Some(_)) => {
-            return Err(PspReadError::InvalidHeaderField {
-                key: format!("{key_prefix}.length-column"),
-                reason: format!(
-                    "non-bytes shape {:?} must not carry length-column",
-                    shape.as_str()
-                ),
-            });
-        }
-        (_, None) => None,
-    };
+    let payload =
+        cross_check_shape_consistency(&key_prefix, shape, c.element_type, c.length_column)?;
     Ok(ParsedColumn {
         tag: c.tag,
         name: c.name,
         cardinality,
-        shape,
-        element_type,
-        length_column,
+        payload,
         required: c.required,
         description: c.description,
     })
+}
+
+/// Cross-validate the `(shape, element_type, length_column)` triple
+/// — only three of the twelve combinations are legal. Extracted
+/// from `parse_column` per Mi29 to keep the cross-rule logic in one
+/// place. Constructs the typed [`ParsedColumnPayload`] on success.
+fn cross_check_shape_consistency(
+    key_prefix: &str,
+    shape: Shape,
+    element_type: Option<String>,
+    length_column: Option<String>,
+) -> Result<ParsedColumnPayload, PspReadError> {
+    let bad = |field: &str, reason: String| PspReadError::InvalidHeaderField {
+        key: format!("{key_prefix}.{field}"),
+        reason,
+    };
+    match (shape, element_type.as_deref(), length_column.as_deref()) {
+        (Shape::Bytes, None, Some(lc)) => Ok(ParsedColumnPayload::Bytes {
+            length_column: lc.to_string(),
+        }),
+        (Shape::Bytes, Some(_), _) => Err(bad(
+            "element-type",
+            "bytes-shape columns must not carry element-type".to_string(),
+        )),
+        (Shape::Bytes, None, None) => Err(bad(
+            "length-column",
+            "bytes-shape columns require length-column".to_string(),
+        )),
+        (Shape::Scalar | Shape::List, None, _) => Err(bad(
+            "element-type",
+            format!("non-bytes shape {:?} requires element-type", shape.as_str()),
+        )),
+        (Shape::Scalar | Shape::List, Some(_), Some(_)) => Err(bad(
+            "length-column",
+            format!(
+                "non-bytes shape {:?} must not carry length-column",
+                shape.as_str()
+            ),
+        )),
+        (Shape::Scalar, Some(et_str), None) => {
+            let element_type = ElementType::parse_token(et_str).ok_or_else(|| {
+                bad(
+                    "element-type",
+                    format!("{et_str:?} is not a valid element-type token"),
+                )
+            })?;
+            Ok(ParsedColumnPayload::Scalar { element_type })
+        }
+        (Shape::List, Some(et_str), None) => {
+            let element_type = ElementType::parse_token(et_str).ok_or_else(|| {
+                bad(
+                    "element-type",
+                    format!("{et_str:?} is not a valid element-type token"),
+                )
+            })?;
+            Ok(ParsedColumnPayload::List { element_type })
+        }
+    }
 }
 
 /// Cross-check every column in the file's `[[column]]` array against
@@ -674,38 +725,40 @@ fn check_match(file: &ParsedColumn, def: &ColumnDef) -> Result<(), PspReadError>
             expected: def.cardinality.as_str().to_string(),
         });
     }
-    if file.shape != def.shape {
+    if file.payload.shape() != def.shape() {
         return Err(PspReadError::SchemaMismatch {
             name: file.name.clone(),
             field: "shape",
-            got: file.shape.as_str().to_string(),
-            expected: def.shape.as_str().to_string(),
+            got: file.payload.shape().as_str().to_string(),
+            expected: def.shape().as_str().to_string(),
         });
     }
-    if file.element_type != def.element_type {
+    if file.payload.element_type() != def.element_type() {
         return Err(PspReadError::SchemaMismatch {
             name: file.name.clone(),
             field: "element-type",
             got: file
-                .element_type
+                .payload
+                .element_type()
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
             expected: def
-                .element_type
+                .element_type()
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
         });
     }
-    if file.length_column.as_deref() != def.length_column {
+    if file.payload.length_column() != def.length_column() {
         return Err(PspReadError::SchemaMismatch {
             name: file.name.clone(),
             field: "length-column",
             got: file
-                .length_column
-                .clone()
+                .payload
+                .length_column()
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
             expected: def
-                .length_column
+                .length_column()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
         });
@@ -722,23 +775,60 @@ fn check_match(file: &ParsedColumn, def: &ColumnDef) -> Result<(), PspReadError>
 }
 
 // ---------------------------------------------------------------------
-// Build-side validation
+// Header-field validators (M16: shared generic helper)
 // ---------------------------------------------------------------------
+//
+// Header-field validation rules are identical on the read and write
+// sides — only the outer error type differs. M16 collapses the
+// previously-duplicated `validate_*` wrappers, the raw `check_*`
+// layer, and the ad-hoc inline `validate_writer_header` block into
+// a single generic-over-`E` helper `wrap`, where `E` carries the
+// `invalid_field(key, reason)` constructor via the
+// [`HeaderFieldError`] trait. Adding a new field rule now means
+// adding one `check_*` raw function plus one `wrap(...)` call on
+// each side — never two parallel branches that can drift.
 
+/// Outer error types that carry an "invalid header field" variant
+/// with `{key, reason}` shape. Both [`PspReadError`] and
+/// [`PspWriteError`] implement this. M16.
+trait HeaderFieldError {
+    fn invalid_field(key: String, reason: String) -> Self;
+}
+
+impl HeaderFieldError for PspReadError {
+    fn invalid_field(key: String, reason: String) -> Self {
+        PspReadError::InvalidHeaderField { key, reason }
+    }
+}
+
+impl HeaderFieldError for PspWriteError {
+    fn invalid_field(key: String, reason: String) -> Self {
+        PspWriteError::InvalidHeaderField { key, reason }
+    }
+}
+
+/// Map a `Result<(), String>` from a raw `check_*` function into a
+/// typed outer error, tagging it with the TOML-key prefix.
+fn wrap<E: HeaderFieldError>(key: &str, r: Result<(), String>) -> Result<(), E> {
+    r.map_err(|reason| E::invalid_field(key.to_string(), reason))
+}
+
+/// Run every per-field rule on a [`WriterHeader`]. Used by the
+/// writer to refuse malformed callers before any byte is emitted.
 fn validate_writer_header(header: &WriterHeader) -> Result<(), PspWriteError> {
-    let key = |k: &str| k.to_string();
-    let bad = |k: &str, reason: String| PspWriteError::InvalidHeaderField {
-        key: key(k),
-        reason,
-    };
+    validate_header_fields::<PspWriteError>(header)
+}
 
+/// Generic per-field validation pass shared between the writer
+/// (`validate_writer_header`) and the reader (after the wire types
+/// have parsed back into a struct-shaped form). All rules go through
+/// [`wrap`] so the error type is uniform.
+fn validate_header_fields<E: HeaderFieldError>(header: &WriterHeader) -> Result<(), E> {
     // M6: the writer only emits files at the single
-    // `READER_FORMAT_VERSION` it understands. A caller passing any
-    // other value would produce a header that advertises a version
-    // the body does not actually conform to — refuse loudly.
+    // `READER_FORMAT_VERSION` it understands.
     if header.format_version != READER_FORMAT_VERSION {
-        return Err(bad(
-            "format-version",
+        return Err(E::invalid_field(
+            "format-version".to_string(),
             format!(
                 "writer only emits {}.{}; got {}.{}",
                 READER_FORMAT_VERSION.0,
@@ -748,58 +838,50 @@ fn validate_writer_header(header: &WriterHeader) -> Result<(), PspWriteError> {
             ),
         ));
     }
-    if let Err(reason) = check_printable_ascii(&header.sample) {
-        return Err(bad("sample", reason));
-    }
-    if let Err(reason) = check_printable_ascii(&header.reference) {
-        return Err(bad("reference", reason));
-    }
+    wrap::<E>("sample", check_printable_ascii(&header.sample))?;
+    wrap::<E>("reference", check_printable_ascii(&header.reference))?;
     if header.chromosomes.is_empty() {
-        return Err(bad(
-            "chromosome",
+        return Err(E::invalid_field(
+            "chromosome".to_string(),
             "[[chromosome]] array must have at least one entry".to_string(),
         ));
     }
     for (i, c) in header.chromosomes.iter().enumerate() {
-        if let Err(reason) = check_chrom_name(&c.name) {
-            return Err(bad(&format!("chromosome[{i}].name"), reason));
-        }
+        wrap::<E>(&format!("chromosome[{i}].name"), check_chrom_name(&c.name))?;
         if c.length == 0 || c.length > i32::MAX as u32 {
-            return Err(bad(
-                &format!("chromosome[{i}].length"),
+            return Err(E::invalid_field(
+                format!("chromosome[{i}].length"),
                 format!("{} is outside [1, 2^31 - 1]", c.length),
             ));
         }
-        if let Err(reason) = check_md5_hex(&c.md5) {
-            return Err(bad(&format!("chromosome[{i}].md5"), reason));
-        }
+        wrap::<E>(&format!("chromosome[{i}].md5"), check_md5_hex(&c.md5))?;
     }
-    if let Err(reason) = check_printable_ascii_no_path_sep(&header.writer.tool) {
-        return Err(bad("writer.tool", reason));
-    }
-    if let Err(reason) = check_printable_ascii_no_path_sep(&header.writer.version) {
-        return Err(bad("writer.version", reason));
-    }
-    if let Err(reason) = check_printable_ascii_no_path_sep(&header.writer.subcommand) {
-        return Err(bad("writer.subcommand", reason));
-    }
+    wrap::<E>(
+        "writer.tool",
+        check_printable_ascii_no_path_sep(&header.writer.tool),
+    )?;
+    wrap::<E>(
+        "writer.version",
+        check_printable_ascii_no_path_sep(&header.writer.version),
+    )?;
+    wrap::<E>(
+        "writer.subcommand",
+        check_printable_ascii_no_path_sep(&header.writer.subcommand),
+    )?;
     for (i, c) in header.writer.input_crams.iter().enumerate() {
-        if let Err(reason) = check_basename(c) {
-            return Err(bad(&format!("writer.input-crams[{i}]"), reason));
-        }
+        wrap::<E>(&format!("writer.input-crams[{i}]"), check_basename(c))?;
     }
-    if let Err(reason) = check_basename(&header.writer.input_fasta) {
-        return Err(bad("writer.input-fasta", reason));
-    }
+    wrap::<E>(
+        "writer.input-fasta",
+        check_basename(&header.writer.input_fasta),
+    )?;
     for (k, v) in header.writer.parameters.iter() {
-        if let Err(reason) = check_bare_key(k) {
-            return Err(bad(&format!("writer.parameters.{k}"), reason));
-        }
+        wrap::<E>(&format!("writer.parameters.{k}"), check_bare_key(k))?;
         if let ParameterValue::Float(f) = v
             && !f.is_finite()
         {
-            return Err(bad(
-                &format!("writer.parameters.{k}"),
+            return Err(E::invalid_field(
+                format!("writer.parameters.{k}"),
                 format!("non-finite float {f}"),
             ));
         }
@@ -808,7 +890,7 @@ fn validate_writer_header(header: &WriterHeader) -> Result<(), PspWriteError> {
 }
 
 // ---------------------------------------------------------------------
-// Per-field validators (read-side wrappers + raw checks)
+// Per-field validators (read-side wrappers around `wrap`)
 // ---------------------------------------------------------------------
 
 /// Parse and validate a `format-version` string in one pass —
@@ -843,53 +925,36 @@ fn parse_format_version(s: &str) -> Result<(u16, u16), PspReadError> {
     Ok((major, minor))
 }
 
+// Read-side validators are one-line wrappers over `wrap` + the raw
+// `check_*` functions, exactly mirroring the build side. M16
+// collapsed the prior per-rule wrappers into these calls.
+
 fn validate_printable_ascii(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_printable_ascii(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_printable_ascii(s))
 }
 
 fn validate_printable_ascii_no_path_sep(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_printable_ascii_no_path_sep(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_printable_ascii_no_path_sep(s))
 }
 
 fn validate_basename(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_basename(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_basename(s))
 }
 
 fn validate_md5_hex(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_md5_hex(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_md5_hex(s))
 }
 
 fn validate_chrom_name(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_chrom_name(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_chrom_name(s))
 }
 
 fn validate_bare_key(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_bare_key(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_bare_key(s))
 }
 
 fn validate_column_name(key: &str, s: &str) -> Result<(), PspReadError> {
-    check_column_name(s).map_err(|reason| PspReadError::InvalidHeaderField {
-        key: key.to_string(),
-        reason,
-    })
+    wrap(key, check_column_name(s))
 }
 
 // ---------------------------------------------------------------------
@@ -1047,30 +1112,10 @@ fn is_chrom_tail_byte(b: u8) -> bool {
 mod tests {
     use super::*;
 
-    fn minimal_writer_header() -> WriterHeader {
-        let mut params = BTreeMap::new();
-        params.insert("min-mapq".to_string(), ParameterValue::Integer(30));
-        params.insert("drop-duplicate".to_string(), ParameterValue::Boolean(true));
-        WriterHeader {
-            format_version: (1, 0),
-            sample: "NA12878".to_string(),
-            reference: "GRCh38.fa".to_string(),
-            created: "2026-05-13T10:00:00Z".parse().unwrap(),
-            chromosomes: vec![ChromosomeEntry {
-                name: "chr1".to_string(),
-                length: 248956422,
-                md5: "6aef897c3d6ff0c78aff06ac189178dd".to_string(),
-            }],
-            writer: WriterProvenance {
-                tool: "join_per_sample_vcfs".to_string(),
-                version: "0.3.0".to_string(),
-                subcommand: "per-sample".to_string(),
-                input_crams: vec!["sample.cram".to_string()],
-                input_fasta: "GRCh38.fa".to_string(),
-                parameters: params,
-            },
-        }
-    }
+    // Mi20: the realistic-header fixture moved to the shared
+    // `super::super::test_fixtures` module — see that file for the
+    // canonical builder.
+    use super::super::test_fixtures::realistic_writer_header as minimal_writer_header;
 
     /// (Plan group H — H1.) Build with one chromosome and a couple
     /// of parameters, frame the bytes, parse them back, assert the

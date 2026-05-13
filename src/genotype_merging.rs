@@ -17,6 +17,10 @@ const DEFAULT_BATCH_SIZE: usize = 1000;
 /// This is the core merging algorithm: it takes all overlapping variants from
 /// multiple samples and produces a single merged variant with unified alleles
 /// and genotypes across all samples.
+// The two loops over `0..total_samples` access multiple parallel
+// vectors plus mutate `missing_samples`, so enumerate-based loops
+// don't meaningfully simplify them. Allow the clippy lint locally.
+#[allow(clippy::needless_range_loop)]
 fn create_variant_for_region(
     var_group: &OverlappingVarGroup,
     var_iter_infos: &[VarIteratorInfo],
@@ -209,7 +213,7 @@ fn create_variant_for_region(
     let mut genotypes = Vec::with_capacity(total_samples * ploidy);
     for sample_idx in 0..total_samples {
         if missing_samples.contains(&sample_idx) {
-            genotypes.extend(std::iter::repeat(-1i8).take(ploidy));
+            genotypes.extend(std::iter::repeat_n(-1i8, ploidy));
         } else {
             for (h, allele) in alleles_str_per_sample[sample_idx].iter().enumerate() {
                 if missing_haplotypes[sample_idx][h] {

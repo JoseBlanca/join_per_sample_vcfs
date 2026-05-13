@@ -7,7 +7,7 @@
 //!   and prepares the in-memory state for accepting records.
 //! - [`PspWriter::write_record`] — validates one record and buffers
 //!   it into the open block; auto-flushes when the projected
-//!   uncompressed payload reaches [`DEFAULT_TARGET_BLOCK_BYTES`] or
+//!   uncompressed payload reaches [`TARGET_BLOCK_BYTES`] or
 //!   the next record crosses a chromosome boundary.
 //! - [`PspWriter::finish`] — flushes any open block, writes the
 //!   block index and the trailer (with its XXH3-64 index checksum),
@@ -28,18 +28,20 @@ use super::block::{
     encode_list_column_csr, encode_scalar_column, encode_varint_column, new_column_compressor,
     zstd_compress_into,
 };
-use super::errors::PspWriteError;
+use super::errors::{InvalidRecordKind, PhaseChainMarkerInconsistencyKind, PspWriteError};
 use super::header::{WriterHeader, build_header_bytes};
 use super::index::{BlockIndexEntry, checksum_index, encode_index};
 use super::registry::{
-    Cardinality, ColumnDef, ElementType, MAX_ALLELE_SEQ_LEN, Shape, V1_0_COLUMNS,
+    ColumnDef, ColumnKey, ColumnPayload, ElementType, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS,
 };
 use super::trailer::{Trailer, encode_trailer};
 use crate::per_sample_caller::pileup::{PileupRecord, SlotId};
 
-/// Target uncompressed bytes per block. Spec §"Block sizing". Not
-/// CLI-exposed; the writer flushes around this value.
-pub const DEFAULT_TARGET_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+/// Target uncompressed bytes per block. Spec §"Block sizing" pins
+/// this; it is not a tunable. The writer auto-flushes when an open
+/// block's projected payload reaches this value. Tests can override
+/// via [`PspWriter::new_with_block_target`] (Mi1, M14).
+pub const TARGET_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Initial `Vec::with_capacity` hint for per-record columns in a
 /// freshly-opened block (delta-pos, n-alleles, the per-record list
@@ -88,17 +90,13 @@ const ALLOWED_ALLELE_BYTE: [bool; 256] = {
     t
 };
 
-/// `#[cold]` constructors for `PspWriteError::InvalidRecord` (L5).
-/// Keeping the `format!` and `String` allocation out-of-line shrinks
-/// the hot-path body of `validate_record` (which the samply profile
-/// puts at 10 % self).
+/// `#[cold]` constructor for `PspWriteError::InvalidRecord` (L5).
+/// Keeping the construction out-of-line shrinks the hot-path body
+/// of `validate_record` (which the samply profile puts at 10 % self).
 #[cold]
 #[inline(never)]
-fn err_invalid_record(record_index: u64, reason: String) -> PspWriteError {
-    PspWriteError::InvalidRecord {
-        record_index,
-        reason,
-    }
+fn err_invalid_record(record_index: u64, kind: InvalidRecordKind) -> PspWriteError {
+    PspWriteError::InvalidRecord { record_index, kind }
 }
 
 #[cold]
@@ -109,7 +107,7 @@ fn err_invalid_allele_byte(record_index: u64, allele_index: usize, seq: &[u8]) -
     // at writer.rs:399 has returned `false` — so at least one
     // invalid byte exists in `seq`. find() returning None here
     // would mean the two walks disagree, which is a codebase bug.
-    let (j, b) = seq
+    let (byte_offset, byte) = seq
         .iter()
         .enumerate()
         .find(|&(_, &b)| !ALLOWED_ALLELE_BYTE[b as usize])
@@ -117,22 +115,19 @@ fn err_invalid_allele_byte(record_index: u64, allele_index: usize, seq: &[u8]) -
         .expect("invariant: caller observed an invalid byte but find() returned None");
     PspWriteError::InvalidRecord {
         record_index,
-        reason: format!("allele {allele_index} byte {j} = {b:#04x} (only A/C/G/T/N allowed)"),
+        kind: InvalidRecordKind::InvalidAlleleByte {
+            allele_index,
+            byte_offset,
+            byte,
+        },
     }
 }
 
-/// Streaming `.psp` writer over any `Write` sink.
-pub struct PspWriter<W: Write> {
-    sink: W,
-    header: WriterHeader,
-    /// Bytes written to `sink` so far. Updated after every flush so
-    /// the block index records absolute offsets.
-    sink_offset: u64,
-    /// One entry per emitted block.
-    index_entries: Vec<BlockIndexEntry>,
-    /// Open block — `None` when the writer is between blocks (just
-    /// after `new` or just after a flush).
-    block: Option<BlockAccumulator>,
+/// Running per-record state shared across `write_record` calls.
+/// M15 extracts this from [`PspWriter`] so the record-ingest path
+/// owns its own bookkeeping without touching scratch buffers or
+/// the sink.
+struct IngestState {
     /// Running active phase-chain slot set, kept sorted ascending.
     /// Updated as records' `new_chains` / `expired_chains` markers
     /// are applied; snapshotted at block start.
@@ -150,20 +145,81 @@ pub struct PspWriter<W: Write> {
     /// Running count of records the caller has handed us. Used in
     /// error messages so the offending input is identifiable.
     records_seen: u64,
-    /// Persistent zstd compressor reused across every column of every
-    /// block. Each `compress_to_buffer` call resets the internal
-    /// frame state but keeps the CCtx workspace and tables alive.
+}
+
+impl IngestState {
+    fn new() -> Self {
+        Self {
+            active_slots: Vec::new(),
+            last_locus: None,
+            records_seen: 0,
+        }
+    }
+}
+
+/// Reused per-flush scratch state. M15 hoists the zstd compressor
+/// and the four buffer-sized scratches out of [`PspWriter`] so the
+/// god-struct can shrink and the flush phases can be written as
+/// free functions taking `&mut WriterScratch`.
+struct WriterScratch {
+    /// Persistent zstd compressor reused across every column of
+    /// every block. Each `compress_to_buffer` call resets the
+    /// internal frame state but keeps the CCtx workspace and tables
+    /// alive.
     compressor: zstd::bulk::Compressor<'static>,
     /// Reused per-column uncompressed-payload scratch.
-    uncompressed_scratch: Vec<u8>,
+    uncompressed: Vec<u8>,
     /// Reused per-column compressed-frame buffers, indexed by
-    /// `V1_0_COLUMNS` position. Each `flush_block` call `clear`s the
-    /// inner Vecs (preserving their capacity) before refilling.
-    compressed_scratch: Vec<Vec<u8>>,
+    /// `V1_0_COLUMNS` position. Each flush `clear()`s the inner
+    /// Vecs (preserving their capacity) before refilling.
+    compressed: Vec<Vec<u8>>,
     /// Reused per-flush manifest buffer (12 entries).
-    manifest_scratch: Vec<ColumnManifestEntry>,
+    manifest: Vec<ColumnManifestEntry>,
     /// Reused block-header serialisation buffer.
-    header_bytes_scratch: Vec<u8>,
+    header_bytes: Vec<u8>,
+}
+
+impl WriterScratch {
+    fn new() -> Result<Self, PspWriteError> {
+        let compressor = new_column_compressor().map_err(|e| PspWriteError::Io {
+            context: "zstd compressor init",
+            block_index: None,
+            column_tag: None,
+            source: e,
+        })?;
+        Ok(Self {
+            compressor,
+            uncompressed: Vec::new(),
+            compressed: (0..V1_0_COLUMNS.len()).map(|_| Vec::new()).collect(),
+            manifest: Vec::with_capacity(V1_0_COLUMNS.len()),
+            header_bytes: Vec::new(),
+        })
+    }
+}
+
+/// Streaming `.psp` writer over any `Write` sink. M15: down from
+/// 14 fields to 7 by extracting [`IngestState`] and
+/// [`WriterScratch`].
+pub struct PspWriter<W: Write> {
+    sink: W,
+    header: WriterHeader,
+    /// Bytes written to `sink` so far. Updated after every flush so
+    /// the block index records absolute offsets.
+    sink_offset: u64,
+    /// One entry per emitted block.
+    index_entries: Vec<BlockIndexEntry>,
+    /// Open block — `None` when the writer is between blocks (just
+    /// after `new` or just after a flush).
+    block: Option<BlockAccumulator>,
+    /// Running per-record ingest state.
+    ingest: IngestState,
+    /// Reused per-flush scratch buffers + zstd compressor.
+    scratch: WriterScratch,
+    /// Auto-flush trigger: the writer flushes when an open block's
+    /// projected uncompressed bytes reach this value. Defaults to
+    /// [`TARGET_BLOCK_BYTES`]; tests override via
+    /// [`PspWriter::new_with_block_target`] (M14, Mi26).
+    target_block_bytes: usize,
 }
 
 impl<W: Write> PspWriter<W> {
@@ -179,33 +235,40 @@ impl<W: Write> PspWriter<W> {
     /// `BufWriter::with_capacity(64 * 1024, file)` (or larger) before
     /// passing it here. In-memory sinks (`io::sink()`,
     /// `Cursor<Vec<u8>>`) need no wrapper.
-    pub fn new(mut sink: W, header: WriterHeader) -> Result<Self, PspWriteError> {
+    pub fn new(sink: W, header: WriterHeader) -> Result<Self, PspWriteError> {
+        Self::new_with_block_target(sink, header, TARGET_BLOCK_BYTES)
+    }
+
+    /// Like [`Self::new`] but overrides the auto-flush projected-byte
+    /// threshold. Exposed (hidden from rustdoc) so tests can force
+    /// size-driven flushes with realistic record counts. Not for
+    /// production use — the spec pins the block target at
+    /// [`TARGET_BLOCK_BYTES`].
+    #[doc(hidden)]
+    pub fn new_with_block_target(
+        mut sink: W,
+        header: WriterHeader,
+        target_block_bytes: usize,
+    ) -> Result<Self, PspWriteError> {
         let header_bytes = build_header_bytes(&header)?;
         sink.write_all(&header_bytes)
             .map_err(|e| PspWriteError::Io {
                 context: "file header",
+                block_index: None,
+                column_tag: None,
                 source: e,
             })?;
         let sink_offset = header_bytes.len() as u64;
-        let compressor = new_column_compressor().map_err(|e| PspWriteError::Io {
-            context: "zstd compressor init",
-            source: e,
-        })?;
-        let compressed_scratch = (0..V1_0_COLUMNS.len()).map(|_| Vec::new()).collect();
+        let scratch = WriterScratch::new()?;
         Ok(Self {
             sink,
             header,
             sink_offset,
             index_entries: Vec::new(),
             block: None,
-            active_slots: Vec::new(),
-            last_locus: None,
-            records_seen: 0,
-            compressor,
-            uncompressed_scratch: Vec::new(),
-            compressed_scratch,
-            manifest_scratch: Vec::with_capacity(V1_0_COLUMNS.len()),
-            header_bytes_scratch: Vec::new(),
+            ingest: IngestState::new(),
+            scratch,
+            target_block_bytes,
         })
     }
 
@@ -213,8 +276,8 @@ impl<W: Write> PspWriter<W> {
     /// sink as a side effect of any auto-flush this call triggered
     /// (zero if no flush).
     pub fn write_record(&mut self, record: &PileupRecord) -> Result<u64, PspWriteError> {
-        let record_index = self.records_seen;
-        self.records_seen += 1;
+        let record_index = self.ingest.records_seen;
+        self.ingest.records_seen += 1;
         self.validate_record(record_index, record)?;
 
         // Should we flush before appending? Flush triggers:
@@ -224,7 +287,7 @@ impl<W: Write> PspWriter<W> {
         let should_flush = match &self.block {
             None => false,
             Some(b) => {
-                b.chrom_id != record.chrom_id || b.projected_bytes >= DEFAULT_TARGET_BLOCK_BYTES
+                b.chrom_id != record.chrom_id || b.projected_bytes >= self.target_block_bytes
             }
         };
         if should_flush {
@@ -243,14 +306,13 @@ impl<W: Write> PspWriter<W> {
             // the first block on a new chromosome, that's a writer
             // upstream bug.
             let snapshot = if self.is_first_block_on_chrom(record.chrom_id) {
-                if !self.active_slots.is_empty() {
+                if !self.ingest.active_slots.is_empty() {
                     return Err(PspWriteError::PhaseChainMarkerInconsistency {
                         record_index,
-                        reason: format!(
-                            "active_slots non-empty ({}) at first record of chromosome {}",
-                            self.active_slots.len(),
-                            record.chrom_id
-                        ),
+                        kind: PhaseChainMarkerInconsistencyKind::ActiveAtChromBoundary {
+                            n_active: self.ingest.active_slots.len(),
+                            chrom_id: record.chrom_id,
+                        },
                     });
                 }
                 Vec::new()
@@ -258,13 +320,13 @@ impl<W: Write> PspWriter<W> {
                 // `active_slots` is kept sorted ascending, which is
                 // the BlockHeader's contract for `active_chain_slots`.
                 // `.clone()` is one allocation + memcpy — S2.
-                self.active_slots.clone()
+                self.ingest.active_slots.clone()
             };
             self.block = Some(BlockAccumulator::new(record.chrom_id, record.pos, snapshot));
         }
 
         self.apply_record_to_block(record_index, record)?;
-        self.last_locus = Some((record.chrom_id, record.pos));
+        self.ingest.last_locus = Some((record.chrom_id, record.pos));
 
         Ok(flushed_bytes)
     }
@@ -295,6 +357,8 @@ impl<W: Write> PspWriter<W> {
             .write_all(&index_bytes)
             .map_err(|e| PspWriteError::Io {
                 context: "block index",
+                block_index: None,
+                column_tag: None,
                 source: e,
             })?;
         self.sink_offset += index_byte_length;
@@ -310,11 +374,15 @@ impl<W: Write> PspWriter<W> {
             .write_all(&trailer_bytes)
             .map_err(|e| PspWriteError::Io {
                 context: "file trailer",
+                block_index: None,
+                column_tag: None,
                 source: e,
             })?;
         self.sink_offset += trailer_bytes.len() as u64;
         self.sink.flush().map_err(|e| PspWriteError::Io {
             context: "final flush",
+            block_index: None,
+            column_tag: None,
             source: e,
         })?;
         Ok(self.sink)
@@ -369,7 +437,7 @@ impl<W: Write> PspWriter<W> {
         }
 
         // Monotonic locus.
-        if let Some((prev_chrom, prev_pos)) = self.last_locus {
+        if let Some((prev_chrom, prev_pos)) = self.ingest.last_locus {
             let regression = record.chrom_id < prev_chrom
                 || (record.chrom_id == prev_chrom && record.pos <= prev_pos);
             if regression {
@@ -387,7 +455,7 @@ impl<W: Write> PspWriter<W> {
         if record.alleles.is_empty() {
             return Err(err_invalid_record(
                 record_index,
-                "record has zero alleles (REF always present)".to_string(),
+                InvalidRecordKind::ZeroAlleles,
             ));
         }
 
@@ -397,7 +465,11 @@ impl<W: Write> PspWriter<W> {
             if len == 0 || (len as u64) > MAX_ALLELE_SEQ_LEN {
                 return Err(err_invalid_record(
                     record_index,
-                    format!("allele {i} sequence length {len} outside [1, {MAX_ALLELE_SEQ_LEN}]"),
+                    InvalidRecordKind::AlleleSeqLen {
+                        allele_index: i,
+                        length: len,
+                        max: MAX_ALLELE_SEQ_LEN,
+                    },
                 ));
             }
             // H4: lookup-table walk lets the loop run to completion
@@ -410,7 +482,10 @@ impl<W: Write> PspWriter<W> {
             if !allele.support.q_sum.is_finite() {
                 return Err(err_invalid_record(
                     record_index,
-                    format!("allele {i} q_sum is non-finite ({})", allele.support.q_sum),
+                    InvalidRecordKind::NonFiniteQSum {
+                        allele_index: i,
+                        q_sum: allele.support.q_sum,
+                    },
                 ));
             }
             // chain_slots ascending + distinct (defensive).
@@ -418,7 +493,7 @@ impl<W: Write> PspWriter<W> {
                 if w[0] >= w[1] {
                     return Err(err_invalid_record(
                         record_index,
-                        format!("allele {i} chain_slots not strictly ascending"),
+                        InvalidRecordKind::AlleleChainSlotsNotAscending { allele_index: i },
                     ));
                 }
             }
@@ -433,7 +508,7 @@ impl<W: Write> PspWriter<W> {
                 if w[0] >= w[1] {
                     return Err(err_invalid_record(
                         record_index,
-                        format!("{name} not strictly ascending"),
+                        InvalidRecordKind::ChainMarkerNotAscending { marker_set: name },
                     ));
                 }
             }
@@ -454,44 +529,45 @@ impl<W: Write> PspWriter<W> {
         // active; new must not be currently active. Sorted-Vec
         // membership is `binary_search`.
         for &slot in &record.expired_chains {
-            if self.active_slots.binary_search(&slot).is_err() {
+            if self.ingest.active_slots.binary_search(&slot).is_err() {
                 return Err(PspWriteError::PhaseChainMarkerInconsistency {
                     record_index,
-                    reason: format!("expired chain slot {slot} not currently active"),
+                    kind: PhaseChainMarkerInconsistencyKind::ExpiredNotActive { slot },
                 });
             }
         }
         for &slot in &record.new_chains {
-            if self.active_slots.binary_search(&slot).is_ok() {
+            if self.ingest.active_slots.binary_search(&slot).is_ok() {
                 return Err(PspWriteError::PhaseChainMarkerInconsistency {
                     record_index,
-                    reason: format!("new chain slot {slot} already active"),
+                    kind: PhaseChainMarkerInconsistencyKind::NewAlreadyActive { slot },
                 });
             }
         }
         // Apply markers to running set. Expired first, then new
         // (matches the BTreeSet-era semantics).
         for &slot in &record.expired_chains {
-            if let Ok(idx) = self.active_slots.binary_search(&slot) {
-                self.active_slots.remove(idx);
+            if let Ok(idx) = self.ingest.active_slots.binary_search(&slot) {
+                self.ingest.active_slots.remove(idx);
             }
         }
         for &slot in &record.new_chains {
             // `slot` was just checked not in active_slots, so this
             // returns Err with the sorted insertion index.
-            if let Err(idx) = self.active_slots.binary_search(&slot) {
-                self.active_slots.insert(idx, slot);
+            if let Err(idx) = self.ingest.active_slots.binary_search(&slot) {
+                self.ingest.active_slots.insert(idx, slot);
             }
         }
         // Now per-allele chain_slots must all be in the running set.
         for (i, allele) in record.alleles.iter().enumerate() {
             for &slot in &allele.chain_slots {
-                if self.active_slots.binary_search(&slot).is_err() {
+                if self.ingest.active_slots.binary_search(&slot).is_err() {
                     return Err(PspWriteError::PhaseChainMarkerInconsistency {
                         record_index,
-                        reason: format!(
-                            "allele {i} references chain slot {slot} not in active set"
-                        ),
+                        kind: PhaseChainMarkerInconsistencyKind::AlleleReferencesUnknownSlot {
+                            allele_index: i,
+                            slot,
+                        },
                     });
                 }
             }
@@ -532,70 +608,19 @@ impl<W: Write> PspWriter<W> {
         let n_total_alleles = block.allele_seq_len.len() as u32;
         let block_index = self.index_entries.len() as u64;
 
-        // Single pass over the column registry: encode -> compress ->
-        // record manifest entry. The intermediate `payloads` Vec the
-        // pre-refactor code carried (writer.rs:445 in the pre-L2
-        // tree) is gone; compressed-frame bytes live in
-        // `self.compressed_scratch[i]` until written to the sink
-        // below.
-        self.manifest_scratch.clear();
-        for (i, column_def) in V1_0_COLUMNS.iter().enumerate() {
-            self.uncompressed_scratch.clear();
-            encode_column_into(column_def, &block, &mut self.uncompressed_scratch)?;
-            let uncompressed_len = self.uncompressed_scratch.len() as u32;
-            zstd_compress_into(
-                &mut self.compressor,
-                &self.uncompressed_scratch,
-                &mut self.compressed_scratch[i],
-            )
-            .map_err(|e| PspWriteError::Io {
-                context: "zstd compression of column payload",
-                source: e,
-            })?;
-            self.manifest_scratch.push(ColumnManifestEntry {
-                tag: column_def.tag,
-                compressed_len: self.compressed_scratch[i].len() as u32,
-                uncompressed_len,
-            });
-        }
-
-        // Move the active-slot snapshot rather than cloning it —
-        // `block` is owned and dropped at end of scope (L3).
-        let header = BlockHeader {
-            chrom_id: block.chrom_id,
-            first_pos: block.first_pos,
+        // Mi30: split flush into three phases. Each is a free
+        // function taking `&mut WriterScratch` (and, where needed,
+        // the open block, the sink, and `block_index` for error
+        // context).
+        encode_and_compress_columns(&block, &mut self.scratch, block_index)?;
+        assemble_block_header(
+            &mut block,
+            &mut self.scratch,
+            block_index,
             n_records,
             n_total_alleles,
-            active_chain_slots: std::mem::take(&mut block.snapshot_active_slots),
-            manifest: std::mem::take(&mut self.manifest_scratch),
-        };
-        self.header_bytes_scratch.clear();
-        encode_block_header(&header, &mut self.header_bytes_scratch).map_err(|source| {
-            PspWriteError::BlockEmission {
-                block_index,
-                source,
-            }
-        })?;
-        // The manifest moved into `header`; recover it for the next
-        // flush so capacity is preserved.
-        self.manifest_scratch = header.manifest;
-
-        self.sink
-            .write_all(&self.header_bytes_scratch)
-            .map_err(|e| PspWriteError::Io {
-                context: "block header",
-                source: e,
-            })?;
-        let mut written = self.header_bytes_scratch.len() as u64;
-        for compressed in &self.compressed_scratch {
-            self.sink
-                .write_all(compressed)
-                .map_err(|e| PspWriteError::Io {
-                    context: "block column payload",
-                    source: e,
-                })?;
-            written += compressed.len() as u64;
-        }
+        )?;
+        let written = emit_block_to_sink(&mut self.sink, &self.scratch, block_index)?;
         self.sink_offset += written;
 
         self.index_entries.push(BlockIndexEntry {
@@ -607,6 +632,102 @@ impl<W: Write> PspWriter<W> {
         });
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------
+// Flush phases (Mi30)
+// ---------------------------------------------------------------------
+
+/// Phase 1: walk the column registry, encoding each column's
+/// uncompressed bytes, compressing them into `scratch.compressed[i]`,
+/// and recording a manifest entry. `block_index` is used only for
+/// error context.
+fn encode_and_compress_columns(
+    block: &BlockAccumulator,
+    scratch: &mut WriterScratch,
+    block_index: u64,
+) -> Result<(), PspWriteError> {
+    scratch.manifest.clear();
+    for (i, column_def) in V1_0_COLUMNS.iter().enumerate() {
+        scratch.uncompressed.clear();
+        encode_column_into(column_def, block, &mut scratch.uncompressed)?;
+        let uncompressed_len = scratch.uncompressed.len() as u32;
+        zstd_compress_into(
+            &mut scratch.compressor,
+            &scratch.uncompressed,
+            &mut scratch.compressed[i],
+        )
+        .map_err(|e| PspWriteError::Io {
+            context: "zstd compression of column payload",
+            block_index: Some(block_index),
+            column_tag: Some(column_def.tag),
+            source: e,
+        })?;
+        scratch.manifest.push(ColumnManifestEntry {
+            tag: column_def.tag,
+            compressed_len: scratch.compressed[i].len() as u32,
+            uncompressed_len,
+        });
+    }
+    Ok(())
+}
+
+/// Phase 2: build the [`BlockHeader`] struct (moving the manifest
+/// scratch into it) and serialise it into `scratch.header_bytes`.
+/// The manifest scratch is restored at the end so capacity carries
+/// over to the next flush.
+fn assemble_block_header(
+    block: &mut BlockAccumulator,
+    scratch: &mut WriterScratch,
+    block_index: u64,
+    n_records: u32,
+    n_total_alleles: u32,
+) -> Result<(), PspWriteError> {
+    let header = BlockHeader {
+        chrom_id: block.chrom_id,
+        first_pos: block.first_pos,
+        n_records,
+        n_total_alleles,
+        // Move the active-slot snapshot rather than cloning it —
+        // `block` is owned and dropped at end of caller's scope (L3).
+        active_chain_slots: std::mem::take(&mut block.snapshot_active_slots),
+        manifest: std::mem::take(&mut scratch.manifest),
+    };
+    scratch.header_bytes.clear();
+    encode_block_header(&header, &mut scratch.header_bytes)
+        .map_err(|kind| PspWriteError::BlockEmission { block_index, kind })?;
+    // Recover the manifest for the next flush so capacity is
+    // preserved.
+    scratch.manifest = header.manifest;
+    Ok(())
+}
+
+/// Phase 3: write the encoded block header followed by every
+/// compressed column payload to the sink. Returns the total number
+/// of bytes written so the caller can update `sink_offset`.
+fn emit_block_to_sink<W: Write>(
+    sink: &mut W,
+    scratch: &WriterScratch,
+    block_index: u64,
+) -> Result<u64, PspWriteError> {
+    sink.write_all(&scratch.header_bytes)
+        .map_err(|e| PspWriteError::Io {
+            context: "block header",
+            block_index: Some(block_index),
+            column_tag: None,
+            source: e,
+        })?;
+    let mut written = scratch.header_bytes.len() as u64;
+    for (i, compressed) in scratch.compressed.iter().enumerate() {
+        sink.write_all(compressed).map_err(|e| PspWriteError::Io {
+            context: "block column payload",
+            block_index: Some(block_index),
+            column_tag: Some(V1_0_COLUMNS[i].tag),
+            source: e,
+        })?;
+        written += compressed.len() as u64;
+    }
+    Ok(written)
 }
 
 // ---------------------------------------------------------------------
@@ -751,68 +872,61 @@ impl BlockAccumulator {
 }
 
 // ---------------------------------------------------------------------
-// Column encoders — dispatched by (cardinality, shape, element-type)
+// Column encoders — exhaustive dispatch on `ColumnKey` (M4)
 // ---------------------------------------------------------------------
 
 /// Encode one column from the block accumulator into its
 /// uncompressed wire form, appending into the caller-provided `out`
-/// buffer. Dispatches by tag — each tag corresponds to a specific
-/// accumulator field with a specific element type. The caller is
-/// responsible for `clear()`-ing `out` before calling so the buffer
-/// can be reused across columns without reallocation (L1).
+/// buffer. Dispatches exhaustively on `def.key`, so adding a
+/// `ColumnKey` variant forces an arm here as a compile error — no
+/// runtime fall-through. The caller is responsible for `clear()`-ing
+/// `out` before calling so the buffer can be reused across columns
+/// without reallocation (L1).
 fn encode_column_into(
     def: &ColumnDef,
     block: &BlockAccumulator,
     out: &mut Vec<u8>,
 ) -> Result<(), PspWriteError> {
-    match def.tag {
-        0x01 => encode_varint_column(&block.delta_pos, out),
-        0x02 => encode_varint_column(&block.n_alleles, out),
-        0x03 => encode_varint_column(&block.allele_seq_len, out),
-        0x04 => encode_bytes_concat(
-            &[&block.allele_seq_bytes[..]],
+    match def.key {
+        ColumnKey::DeltaPos => encode_varint_column(&block.delta_pos, out),
+        ColumnKey::NAlleles => encode_varint_column(&block.n_alleles, out),
+        ColumnKey::AlleleSeqLen => encode_varint_column(&block.allele_seq_len, out),
+        ColumnKey::AlleleSeq => encode_bytes_concat(
             // The bytes-column payload is the concatenation of every
             // allele's sequence bytes; the per-allele lengths live
-            // in the 0x03 length column. We've kept the bytes
+            // in the `allele-seq-len` column. We kept the bytes
             // concatenated as we appended records, so the payload
             // is just `allele_seq_bytes` as-is.
+            &[&block.allele_seq_bytes[..]],
             out,
         ),
-        0x10 => encode_scalar_column(&block.allele_obs_count, out),
-        0x11 => {
+        ColumnKey::AlleleObsCount => encode_scalar_column(&block.allele_obs_count, out),
+        ColumnKey::AlleleQSumLog => {
             // q_sum was finite-validated at write_record time.
             encode_scalar_column(&block.allele_q_sum_log, out)
         }
-        0x12 => encode_scalar_column(&block.allele_fwd_count, out),
-        0x13 => encode_scalar_column(&block.allele_placed_left_count, out),
-        0x14 => encode_scalar_column(&block.allele_placed_start_count, out),
-        0x20 => encode_list_column_csr(
+        ColumnKey::AlleleFwdCount => encode_scalar_column(&block.allele_fwd_count, out),
+        ColumnKey::AllelePlacedLeftCount => {
+            encode_scalar_column(&block.allele_placed_left_count, out)
+        }
+        ColumnKey::AllelePlacedStartCount => {
+            encode_scalar_column(&block.allele_placed_start_count, out)
+        }
+        ColumnKey::NewChainSlots => encode_list_column_csr(
             &block.new_chain_slots.data,
             &block.new_chain_slots.offsets,
             out,
         ),
-        0x21 => encode_list_column_csr(
+        ColumnKey::ExpiredChainSlots => encode_list_column_csr(
             &block.expired_chain_slots.data,
             &block.expired_chain_slots.offsets,
             out,
         ),
-        0x22 => encode_list_column_csr(
+        ColumnKey::AlleleChainSlots => encode_list_column_csr(
             &block.allele_chain_slots.data,
             &block.allele_chain_slots.offsets,
             out,
         ),
-        unknown => {
-            // V1_0_COLUMNS is the source of truth; if
-            // encode_column_into is called with a tag not in this
-            // match, the registry has been extended without updating
-            // the dispatch — a programmer error.
-            return Err(PspWriteError::InvalidRecord {
-                record_index: 0,
-                reason: format!(
-                    "internal: encode_column_into has no dispatch for tag {unknown:#x}"
-                ),
-            });
-        }
     }
     // M5: promote the writer-side column-size self-check from a
     // debug-only assertion to a real check. Catches a writer bug
@@ -838,26 +952,25 @@ fn encode_column_into(
 /// us an a-priori bound. Returns `None` for columns whose encoded
 /// length is genuinely variable (varint scalars, list columns).
 ///
-/// The exhaustive matches force a compile-time update when a new
-/// `Shape` or `ElementType` variant lands — replacing the prior
+/// The exhaustive match on `ColumnPayload` (and on the inner
+/// `ElementType` for fixed-width scalars) forces a compile-time
+/// update when a new variant lands — replacing the prior
 /// `_ => true` catch-all that silently approved any future
 /// combination.
 fn predict_uncompressed_len(def: &ColumnDef, block: &BlockAccumulator) -> Option<usize> {
+    use super::registry::Cardinality;
     let n_records = block.delta_pos.len();
     let n_total_alleles = block.allele_seq_len.len();
-    match def.shape {
-        Shape::Bytes => {
+    match def.payload {
+        ColumnPayload::Bytes { .. } => {
             // `MAX_ALLELE_SEQ_LEN = 10_000`; with `u32::MAX` alleles
             // per block the sum still fits comfortably in `usize` on
             // 64-bit targets, but be defensive.
             let total: u64 = block.allele_seq_len.iter().sum();
             usize::try_from(total).ok()
         }
-        Shape::List => None,
-        Shape::Scalar => {
-            let et = def
-                .element_type
-                .expect("non-Bytes shape requires element-type per registry invariants");
+        ColumnPayload::List { .. } => None,
+        ColumnPayload::Scalar { element_type: et } => {
             let count = match def.cardinality {
                 Cardinality::PerRecord => n_records,
                 Cardinality::PerAllele => n_total_alleles,
@@ -886,42 +999,17 @@ fn predict_uncompressed_len(def: &ColumnDef, block: &BlockAccumulator) -> Option
 mod tests {
     use super::*;
     use crate::per_sample_caller::pileup::{AlleleObservation, AlleleSupportStats};
-    use crate::per_sample_caller::psp::header::{
-        ChromosomeEntry, ParameterValue, ParsedHeader, WriterProvenance, parse_header_bytes,
-    };
+    use crate::per_sample_caller::psp::header::{ParsedHeader, parse_header_bytes};
     use crate::per_sample_caller::psp::index::decode_index;
     use crate::per_sample_caller::psp::trailer::{TRAILER_BYTES, decode_trailer};
-    use std::collections::BTreeMap;
     use std::io::Cursor;
 
     // ---------- Fixture builders ---------------------------------
-
-    fn writer_header(n_chroms: usize) -> WriterHeader {
-        let chromosomes = (0..n_chroms)
-            .map(|i| ChromosomeEntry {
-                name: format!("chr{}", i + 1),
-                length: 1_000_000,
-                md5: "0".repeat(32),
-            })
-            .collect();
-        let mut params = BTreeMap::new();
-        params.insert("min-mapq".to_string(), ParameterValue::Integer(30));
-        WriterHeader {
-            format_version: (1, 0),
-            sample: "sample".to_string(),
-            reference: "ref.fa".to_string(),
-            created: "2026-05-13T10:00:00Z".parse().unwrap(),
-            chromosomes,
-            writer: WriterProvenance {
-                tool: "test".to_string(),
-                version: "0.0.1".to_string(),
-                subcommand: "per-sample".to_string(),
-                input_crams: vec!["a.cram".to_string()],
-                input_fasta: "ref.fa".to_string(),
-                parameters: params,
-            },
-        }
-    }
+    //
+    // Mi20: the `writer_header` fixture lives in the shared
+    // `super::super::test_fixtures` module so a new mandatory
+    // `WriterHeader` field updates one place.
+    use super::super::test_fixtures::writer_header;
 
     fn support(num_obs: u32, q_sum: f64) -> AlleleSupportStats {
         AlleleSupportStats {
@@ -1291,6 +1379,87 @@ mod tests {
             trailer.n_blocks, 2,
             "chrom change should produce two blocks"
         );
+    }
+
+    /// (M14.) The size-driven auto-flush trigger fires when an open
+    /// block's projected bytes cross `target_block_bytes`. We use
+    /// the `#[cfg(test)]`-exposed knob to override the 16 MiB
+    /// default so a modestly-sized fixture exercises the branch.
+    #[test]
+    fn auto_flushes_on_projected_size_boundary() {
+        // Target ~8 KiB worth of projected bytes — each simple
+        // record contributes ~30 bytes, so ~270 records per block.
+        let target = 8 * 1024;
+        let mut writer =
+            PspWriter::new_with_block_target(Cursor::new(Vec::new()), writer_header(1), target)
+                .unwrap();
+        for i in 1u32..=2000 {
+            writer
+                .write_record(&record(
+                    0,
+                    i,
+                    vec![allele(b"A", 1, -1.0, &[])],
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let trailer: &[u8; TRAILER_BYTES] =
+            bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
+        let trailer = decode_trailer(trailer).unwrap();
+        assert!(
+            trailer.n_blocks >= 2,
+            "size-based auto-flush should produce multiple blocks, got {}",
+            trailer.n_blocks
+        );
+    }
+
+    /// (Mi26.) `write_record` returns the number of bytes pushed to
+    /// the sink as a side effect of any auto-flush it triggered.
+    /// Defending the contract against a future refactor of the
+    /// `pre_flush_bytes` accounting.
+    #[test]
+    fn write_record_returns_flushed_byte_count() {
+        // Tiny block target so the second batch of records forces a
+        // flush.
+        let target = 4 * 1024;
+        let mut writer =
+            PspWriter::new_with_block_target(Cursor::new(Vec::new()), writer_header(1), target)
+                .unwrap();
+        // Records up to ~the target are absorbed with no flush.
+        let mut saw_flush = false;
+        for i in 1u32..=2000 {
+            let pushed = writer
+                .write_record(&record(
+                    0,
+                    i,
+                    vec![allele(b"A", 1, -1.0, &[])],
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+            if pushed > 0 {
+                saw_flush = true;
+                break;
+            }
+        }
+        assert!(
+            saw_flush,
+            "expected at least one auto-flush before record 2000"
+        );
+        // The very next record after a flush is on a fresh block — it
+        // must report 0 bytes pushed.
+        let post_flush = writer
+            .write_record(&record(
+                0,
+                10_000,
+                vec![allele(b"A", 1, -1.0, &[])],
+                vec![],
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(post_flush, 0, "post-flush record must not push bytes");
     }
 
     /// (Mi27.) Multi-block index entries match the input order and

@@ -1,3 +1,6 @@
+// Mi5: this module is `pub(crate)`; `decode_trailer` is reader-side
+// surface awaiting the not-yet-built `PspReader`.
+#![allow(dead_code)]
 //! The fixed 32-byte file trailer.
 //!
 //! The trailer sits at the very end of every `.psp` file. It carries:
@@ -166,5 +169,33 @@ mod tests {
         let bytes = encode_trailer(&t);
         let decoded = decode_trailer(&bytes).unwrap();
         assert_eq!(decoded, t);
+    }
+
+    // ------------------- Property-based round-trip (M13) -----------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Encode-decode round-trip property over the full u64/u32
+        /// field surface. Pins the wire layout against silent shifts
+        /// or byte-order errors.
+        #[test]
+        fn proptest_trailer_round_trip(
+            index_offset in any::<u64>(),
+            index_byte_length in any::<u64>(),
+            n_blocks in any::<u64>(),
+            index_checksum in any::<u32>(),
+        ) {
+            let t = Trailer {
+                index_offset,
+                index_byte_length,
+                n_blocks,
+                index_checksum,
+            };
+            let bytes = encode_trailer(&t);
+            prop_assert_eq!(bytes.len(), TRAILER_BYTES);
+            let decoded = decode_trailer(&bytes).expect("decode succeeds");
+            prop_assert_eq!(decoded, t);
+        }
     }
 }

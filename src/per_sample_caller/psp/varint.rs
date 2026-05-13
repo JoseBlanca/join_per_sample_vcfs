@@ -1,3 +1,8 @@
+// Mi5: this module is `pub(crate)`; its decoder primitives plus
+// the signed-varint codecs are reader-side surface awaiting the
+// not-yet-built `PspReader`. They're exercised by tests but are
+// not yet reached from any production code path.
+#![allow(dead_code)]
 //! LEB128 / zig-zag-LEB128 encoders and decoders.
 //!
 //! The `.psp` body uses unsigned LEB128 for every variable-length
@@ -257,5 +262,33 @@ mod tests {
         let _ = zigzag_encode(i64::MAX);
         assert_eq!(zigzag_decode(zigzag_encode(i64::MIN)), i64::MIN);
         assert_eq!(zigzag_decode(zigzag_encode(i64::MAX)), i64::MAX);
+    }
+
+    // ------------------- Property-based round-trips (M13) ----------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Round-trip property: `decode(encode(v))` recovers every
+        /// `u64`, and the byte count consumed equals the byte count
+        /// produced. Catches off-by-one cursor / shift bugs that
+        /// example-based tests miss.
+        #[test]
+        fn proptest_u64_round_trip(v in any::<u64>()) {
+            let mut buf = Vec::new();
+            encode_u64_leb128(v, &mut buf);
+            let (decoded, consumed) = decode_u64_leb128(&buf).expect("decode succeeds");
+            prop_assert_eq!(decoded, v);
+            prop_assert_eq!(consumed, buf.len());
+        }
+
+        #[test]
+        fn proptest_i64_round_trip(v in any::<i64>()) {
+            let mut buf = Vec::new();
+            encode_i64_svarint(v, &mut buf);
+            let (decoded, consumed) = decode_i64_svarint(&buf).expect("decode succeeds");
+            prop_assert_eq!(decoded, v);
+            prop_assert_eq!(consumed, buf.len());
+        }
     }
 }
