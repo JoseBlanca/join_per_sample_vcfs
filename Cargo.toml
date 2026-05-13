@@ -26,6 +26,9 @@ rayon = "1.10"
 smallvec = "1.13"
 tempfile = "3"
 thiserror = "2.0.18"
+toml = "1.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
 
 [features]
 # Enable in `cargo run --example dhat_pileup --features dhat-heap` to swap
