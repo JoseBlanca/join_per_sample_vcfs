@@ -17,6 +17,7 @@
 //! Block layout, header build/parse, the index, the trailer, and the
 //! `PspWriter` / `PspReader` public API land in subsequent slices.
 
+pub mod block;
 pub mod errors;
 pub mod header;
 pub mod index;

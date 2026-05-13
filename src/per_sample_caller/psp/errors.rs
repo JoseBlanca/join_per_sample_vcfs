@@ -36,6 +36,32 @@ pub enum VarintError {
     Overflow,
 }
 
+/// Failures the `WireScalar` decoders can produce. Generalises
+/// [`VarintError`] with fixed-width-only failure modes
+/// (buffer-too-short, illegal bool byte).
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarDecodeError {
+    #[error("buffer truncated mid-decode")]
+    Truncated,
+
+    #[error("varint exceeded 10-byte cap")]
+    VarintOverflow,
+
+    /// `bool` columns use a single byte; only `0` (false) and `1`
+    /// (true) are legal.
+    #[error("invalid bool byte {0:#04x}; expected 0 or 1")]
+    InvalidBool(u8),
+}
+
+impl From<VarintError> for ScalarDecodeError {
+    fn from(e: VarintError) -> Self {
+        match e {
+            VarintError::Truncated => Self::Truncated,
+            VarintError::Overflow => Self::VarintOverflow,
+        }
+    }
+}
+
 /// Errors the `.psp` reader can emit. Variants land as the
 /// corresponding slice ships; the registry / varint slice
 /// contributes the [`Self::Varint`] case.
@@ -196,6 +222,82 @@ pub enum PspReadError {
         reader_major: u16,
         reader_minor: u16,
     },
+
+    /// A column payload ran out before the expected entry count was
+    /// decoded. `decoded` entries had been produced when the cursor
+    /// hit the end of the buffer; `expected` is the cardinality-
+    /// derived count.
+    #[error("column {column:?} payload truncated: decoded {decoded} entries, expected {expected}")]
+    ColumnTruncated {
+        column: String,
+        decoded: usize,
+        expected: usize,
+    },
+
+    /// A column payload carried bytes past the last expected entry —
+    /// the writer wrote more than the cardinality demands.
+    #[error("column {column:?} payload has {trailing} trailing bytes after the last entry")]
+    ColumnTrailingBytes { column: String, trailing: usize },
+
+    /// zstd decompression failed for a column payload. Almost always
+    /// means corruption inside the compressed bytes (a single-byte
+    /// flip catches here via zstd's built-in frame checksum).
+    #[error("zstd decompression failed for {context}: {source}")]
+    Zstd {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A column's decompressed payload size did not match the
+    /// per-block manifest's `uncompressed_len`. Catches torn frames
+    /// whose internal checksum happens to pass — should not happen
+    /// in practice but the check is cheap.
+    #[error("column {column:?} decompressed to {got} bytes, manifest claimed {expected}")]
+    UncompressedLenMismatch {
+        column: String,
+        got: u64,
+        expected: u64,
+    },
+
+    /// A column's manifest-claimed `uncompressed_len` disagrees with
+    /// what the schema predicts a-priori for fixed-width or
+    /// length-column-bounded shapes. Caught *before* decompression
+    /// (spec §"Header-binary consistency" check #7).
+    #[error("column {column:?}: uncompressed_len {got} disagrees with schema-predicted {expected}")]
+    UncompressedLenSchemaMismatch {
+        column: String,
+        got: u64,
+        expected: u64,
+    },
+
+    /// A block header field could not be decoded; usually a varint
+    /// truncation inside the header byte stream.
+    #[error("block header field {field}: {source}")]
+    BlockHeaderField {
+        field: &'static str,
+        #[source]
+        source: VarintError,
+    },
+
+    /// A single element inside a column payload failed to decode.
+    /// `entry` is the per-cardinality index (record index for
+    /// per-record columns, allele index for per-allele).
+    #[error("column {column:?} entry {entry}: {source}")]
+    ColumnElementDecode {
+        column: String,
+        entry: usize,
+        #[source]
+        source: ScalarDecodeError,
+    },
+
+    /// A block-header structural invariant was violated. The
+    /// `reason` text names the invariant; the writer caught one of
+    /// the per-block invariants from spec §"Block sizing / Block
+    /// invariants" before emitting, or the reader caught a
+    /// corrupted block on the way in.
+    #[error("block header invariant violation: {reason}")]
+    BlockHeaderInvariant { reason: String },
 }
 
 /// Errors the `.psp` writer can emit. Variants land as the
