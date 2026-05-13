@@ -326,6 +326,98 @@ fn bench_writer(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_writer_phases(c: &mut Criterion) {
+    // Two sub-benches that isolate the per-record append cost from
+    // the per-flush encode+compress cost. The bench-side
+    // `current_block_projected_bytes` peek (on `PspWriter`) is the
+    // only writer-state introspection used here — it is `#[doc(hidden)]`
+    // and exists only so benches can align with the auto-flush
+    // boundary deterministically.
+    const TARGET_BYTES: usize = 16 * 1024 * 1024;
+
+    let mut group = c.benchmark_group("psp_writer_phases");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    // Bench fixtures are the SNP workload — pre-built so the
+    // per-iter setup only writes records, not Vec<PileupRecord>
+    // construction.
+    let phase_records = build_snp_records(NUM_RECORDS_SNP);
+    let phase_header = writer_header(NUM_RECORDS_SNP, "phases");
+
+    // ---- write_record steady-state ----
+    // Setup: prime a writer with WARMUP records (all in the first
+    // block, no auto-flush). Body: write BODY more (still under
+    // TARGET, no auto-flush). Body is pure per-record append cost in
+    // a warm accumulator.
+    const WARMUP_NO_FLUSH: usize = 100_000;
+    const BODY_NO_FLUSH: usize = 100_000;
+    group.throughput(Throughput::Elements(BODY_NO_FLUSH as u64));
+    group.bench_function("write_record_steady_100k", |b| {
+        b.iter_batched(
+            || {
+                let mut w = PspWriter::new(io::sink(), phase_header.clone())
+                    .expect("writer new");
+                for r in &phase_records[..WARMUP_NO_FLUSH] {
+                    w.write_record(r).expect("warmup write_record");
+                }
+                w
+            },
+            |mut w| {
+                for r in &phase_records[WARMUP_NO_FLUSH..WARMUP_NO_FLUSH + BODY_NO_FLUSH]
+                {
+                    black_box(w.write_record(black_box(r)).expect("write_record"));
+                }
+                // do NOT finish — body must time per-record append
+                // only, never the trailing flush + index + trailer.
+                drop(w);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // ---- flush_block-only ----
+    // Setup: prime up to projected_bytes just under TARGET so the
+    // very next write triggers exactly one auto-flush. Body: write
+    // that one trigger record (flush + tiny append). Reports one
+    // measurement per flush — divide by element count to get
+    // ms-per-flush.
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("flush_block_one", |b| {
+        b.iter_batched(
+            || {
+                let mut w = PspWriter::new(io::sink(), phase_header.clone())
+                    .expect("writer new");
+                let mut idx = 0usize;
+                while idx < phase_records.len() {
+                    let projected =
+                        w.current_block_projected_bytes().unwrap_or(0);
+                    // Leave a few hundred bytes of slack so the next
+                    // record's per_record + per_allele projection
+                    // pushes us past TARGET, guaranteeing an
+                    // auto-flush on the body's write.
+                    if projected + 256 >= TARGET_BYTES {
+                        break;
+                    }
+                    w.write_record(&phase_records[idx]).expect("prime");
+                    idx += 1;
+                }
+                (w, idx)
+            },
+            |(mut w, idx)| {
+                black_box(
+                    w.write_record(black_box(&phase_records[idx]))
+                        .expect("trigger write_record"),
+                );
+                drop(w);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
 fn bench_writer_io(c: &mut Criterion) {
     let mut group = c.benchmark_group("psp_writer_io");
     group.sample_size(10);
@@ -361,7 +453,7 @@ fn bench_writer_io(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_writer, bench_writer_io
+    targets = bench_writer, bench_writer_phases, bench_writer_io
 }
 
 criterion_main!(benches);

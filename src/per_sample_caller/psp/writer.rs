@@ -206,6 +206,19 @@ impl<W: Write> PspWriter<W> {
         Ok(self.sink)
     }
 
+    /// Projected uncompressed bytes the currently-open block has
+    /// accumulated. `None` when no block is open (just after `new` or
+    /// just after a flush).
+    ///
+    /// Hidden from rustdoc — this peek into writer state exists only
+    /// to let benches align iteration boundaries with the writer's
+    /// auto-flush boundary (see L10 in
+    /// `ia/reviews/perf_psp_writer_2026-05-13.md`).
+    #[doc(hidden)]
+    pub fn current_block_projected_bytes(&self) -> Option<usize> {
+        self.block.as_ref().map(|b| b.projected_bytes)
+    }
+
     /// `true` if no block has been emitted yet OR the most recent
     /// emitted block was on a different chromosome.
     fn is_first_block_on_chrom(&self, chrom_id: u32) -> bool {
