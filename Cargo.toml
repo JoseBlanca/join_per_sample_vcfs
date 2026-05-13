@@ -102,3 +102,7 @@ harness = false
 [[bench]]
 name = "psp_writer_perf"
 harness = false
+
+[[bench]]
+name = "psp_reader_perf"
+harness = false
