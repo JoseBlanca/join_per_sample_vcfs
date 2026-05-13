@@ -270,6 +270,18 @@ pub struct ColumnDef {
 
     pub required: bool,
 
+    /// When `true`, the reader sweeps every decoded float entry of
+    /// this column and rejects NaN / ±∞ (spec check #9). Only
+    /// meaningful for `ColumnPayload::Scalar { element_type: F32 |
+    /// F64 }` (and future float-list payloads); silently `false`
+    /// otherwise.
+    ///
+    /// Lifted from a hard-coded reader-side `match` so the set of
+    /// finite-constrained columns is *registry-defined* — a future
+    /// F-typed column flips this flag instead of remembering to
+    /// teach the reader's `decode_block_payload` about it. M11.
+    pub finite_constraint: bool,
+
     /// Canonical one-line description, reproduced verbatim by the
     /// writer into the in-file `[[column]]` array.
     pub description: &'static str,
@@ -306,6 +318,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::Varint,
         },
         required: true,
+        finite_constraint: false,
         description: "Distance to the previous record's position. \
             First record in a block has value 0 and uses the block \
             header's first-pos.",
@@ -319,6 +332,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::Varint,
         },
         required: true,
+        finite_constraint: false,
         description: "Number of alleles in this record (>= 1). Sum \
             across records equals n_total_alleles.",
     },
@@ -331,6 +345,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::Varint,
         },
         required: true,
+        finite_constraint: false,
         description: "Byte length of each allele's sequence. Drives \
             chunking of allele-seq.",
     },
@@ -343,6 +358,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             length_column: "allele-seq-len",
         },
         required: true,
+        finite_constraint: false,
         description: "Allele sequence bytes (uppercase ASCII over \
             {A,C,G,T,N}). REF is the first allele in each record.",
     },
@@ -355,6 +371,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U32,
         },
         required: true,
+        finite_constraint: false,
         description: "Observation count: reads supporting this allele.",
     },
     ColumnDef {
@@ -366,6 +383,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::F64,
         },
         required: true,
+        finite_constraint: true,
         description: "Sum over supporting reads of max(ln_BQ_BAQ, \
             ln_MQ). The freebayes per-read combination of base and \
             mapping quality.",
@@ -379,6 +397,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U32,
         },
         required: true,
+        finite_constraint: false,
         description: "Forward-strand count: reads on the forward \
             strand supporting this allele.",
     },
@@ -391,6 +410,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U32,
         },
         required: true,
+        finite_constraint: false,
         description: "Reads whose 5' end is to the left of the \
             record's position (freebayes' placedLeft).",
     },
@@ -403,6 +423,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U32,
         },
         required: true,
+        finite_constraint: false,
         description: "Reads whose 5' end is the record's position \
             (freebayes' placedStart).",
     },
@@ -415,6 +436,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U16,
         },
         required: true,
+        finite_constraint: false,
         description: "Phase-chain slot ids that became active since \
             the previous record. Ascending. On record 0 of a block, \
             'the previous record' is the block header's \
@@ -429,6 +451,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U16,
         },
         required: true,
+        finite_constraint: false,
         description: "Phase-chain slot ids that ended since the \
             previous record. Ascending. On record 0 of a block, \
             'the previous record' is the block header's \
@@ -443,6 +466,7 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             element_type: ElementType::U16,
         },
         required: true,
+        finite_constraint: false,
         description: "Phase-chain slot ids contributing to each \
             allele observation. Ascending. References the \
             active-slot set after applying this record's \

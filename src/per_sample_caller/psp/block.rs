@@ -39,6 +39,7 @@ use std::io;
 
 use super::errors::{BlockHeaderInvariantKind, PspReadError, ScalarDecodeError, VarintError};
 use super::varint::{decode_u64_leb128, encode_u64_leb128};
+use crate::per_sample_caller::pileup::SlotId;
 
 // ---------------------------------------------------------------------
 // WireScalar trait — fixed-width per-entry codecs
@@ -551,7 +552,11 @@ pub struct BlockHeader {
     /// **Strictly ascending, no duplicates**, empty whenever this is
     /// the first block on its chromosome. Spec §"Phase-chain state
     /// across blocks".
-    pub active_chain_slots: Vec<u16>,
+    ///
+    /// Type is `Vec<SlotId>` (not `Vec<u16>`) so widening `SlotId`
+    /// past `u16` is a compile error here rather than a silent
+    /// wire-format break. M12.
+    pub active_chain_slots: Vec<SlotId>,
     /// Per-column manifest, **strictly ascending by `column_tag`,
     /// no duplicates** — the writer sorts at emit time, the reader
     /// rejects out-of-order manifests.
@@ -582,6 +587,9 @@ pub fn encode_block_header(
     encode_u64_leb128(u64::from(header.n_total_alleles), out);
     encode_u64_leb128(header.active_chain_slots.len() as u64, out);
     for &slot in &header.active_chain_slots {
+        // M12: width is `<SlotId as WireScalar>::FIXED_BYTE_WIDTH`,
+        // computed once below to keep the wire-format dependence on
+        // `SlotId`'s size in one place.
         out.extend_from_slice(&slot.to_le_bytes());
     }
     encode_u64_leb128(header.manifest.len() as u64, out);
@@ -605,10 +613,13 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<(BlockHeader, usize), PspRead
 
     let k = decode_u32_field(bytes, &mut cursor, "active_chain_slots_count")?;
     // DoS guard: `k` is attacker-controlled. Each active-slot entry
-    // is a fixed `u16` LE (`u16::FIXED_BYTE_WIDTH` bytes); reject
-    // any `k` above the remaining-buffer-derived bound before any
-    // `Vec::with_capacity` allocation.
-    const SLOT_WIDTH: usize = <u16 as WireScalar>::FIXED_BYTE_WIDTH;
+    // is a fixed `SlotId` LE (`<SlotId as WireScalar>::FIXED_BYTE_WIDTH`
+    // bytes); reject any `k` above the remaining-buffer-derived
+    // bound before any `Vec::with_capacity` allocation. The width
+    // tracks `SlotId`'s size — widening `SlotId` past `u16` (M12)
+    // adjusts the wire shape at one site and the encoder loop in
+    // `encode_block_header` correspondingly.
+    const SLOT_WIDTH: usize = <SlotId as WireScalar>::FIXED_BYTE_WIDTH;
     let remaining = bytes.len().saturating_sub(cursor);
     let cap = (k as usize).min(remaining / SLOT_WIDTH + 1);
     let mut active_chain_slots = Vec::with_capacity(cap);
@@ -620,7 +631,7 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<(BlockHeader, usize), PspRead
             });
         }
         let arr: [u8; SLOT_WIDTH] = bytes[cursor..cursor + SLOT_WIDTH].try_into().unwrap();
-        active_chain_slots.push(u16::from_le_bytes(arr));
+        active_chain_slots.push(SlotId::from_le_bytes(arr));
         cursor += SLOT_WIDTH;
     }
 

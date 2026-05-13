@@ -111,16 +111,53 @@ pub enum BlockHeaderInvariantKind {
     /// the active set the reader carried forward from the previous
     /// block (spec check #11). Random-access region reads do not
     /// perform this check — they trust the snapshot.
+    ///
+    /// The two sets are reported as truncated slot lists (up to
+    /// [`MAX_SNAPSHOT_SLOTS_IN_ERROR`]) so a divergence at the
+    /// content level is diagnosable, not only at the length level.
     #[error(
         "active-chain-slots snapshot mismatch entering block {block}: \
-         snapshot has {snapshot_len} slots, carried-in set has {expected_len}"
+         snapshot = {snapshot:?}, carried-in = {expected:?}"
     )]
     SnapshotMismatch {
         block: usize,
-        snapshot_len: usize,
-        expected_len: usize,
+        snapshot: Vec<u16>,
+        expected: Vec<u16>,
+    },
+
+    /// First-block-of-chromosome carries a non-empty snapshot. The
+    /// writer is required to flush its active-chain-slot set to
+    /// empty on every chromosome boundary (and at the start of the
+    /// file), so any non-empty snapshot at a chrom-change block is
+    /// a hard error. Checked in both sequential and random-access
+    /// modes; spec §"Header-binary consistency" check #10.
+    #[error(
+        "block {block} is the first block of its chromosome but \
+         its snapshot has {snapshot_len} slots (must be empty)"
+    )]
+    NonEmptySnapshotAtChromStart { block: usize, snapshot_len: usize },
+
+    /// The decoded `n-alleles` column sums to a value different
+    /// from the block header's `n_total_alleles`. Spec
+    /// §"Per-block manifest agreement": any over- or under-run is
+    /// a hard error. Without this check, an over-run drives an
+    /// index-out-of-bounds panic on per-allele indexing, and an
+    /// under-run silently truncates the trailing alleles.
+    #[error(
+        "n-alleles column sums to {sum_n_alleles}, block header \
+         declares n_total_alleles = {n_total_alleles}"
+    )]
+    NAllelesSumMismatch {
+        n_total_alleles: u32,
+        sum_n_alleles: u64,
     },
 }
+
+/// Cap on the number of slot ids embedded in
+/// [`BlockHeaderInvariantKind::SnapshotMismatch`]'s `Debug`-rendered
+/// output. Beyond this the reporter truncates with `…` to keep log
+/// lines bounded on pathological inputs.
+pub const MAX_SNAPSHOT_SLOTS_IN_ERROR: usize = 8;
 
 /// Rules a record handed to `write_record` can violate. Carried as
 /// the `kind` of [`PspWriteError::InvalidRecord`]. Mi10.
@@ -343,6 +380,18 @@ pub enum PspReadError {
     #[error("required column {name:?} (tag {tag:#x}) is missing from the file's [[column]] array")]
     MissingRequiredColumn { name: String, tag: u16 },
 
+    /// A column the v1.0 registry requires is absent from a
+    /// per-block manifest. Symmetric with
+    /// [`Self::MissingRequiredColumn`] but checked at block-decode
+    /// time (the TOML `[[column]]` array is validated at header
+    /// parse; the per-block manifest is an independent layer and
+    /// must be cross-checked separately — B1).
+    #[error(
+        "required column {name:?} (tag {tag:#x}) is missing from a \
+         per-block manifest"
+    )]
+    MissingRequiredColumnInManifest { name: String, tag: u16 },
+
     /// A column whose `name`/`tag` the reader knows disagrees with
     /// the registry on a structural field (cardinality, shape,
     /// element-type, length-column, or required). The file claims
@@ -429,6 +478,33 @@ pub enum PspReadError {
         source: VarintError,
     },
 
+    /// The block-header grow-on-incomplete read loop hit its size
+    /// cap (currently 64 KiB) without `decode_block_header`
+    /// succeeding. Either the header is genuinely larger than the
+    /// cap (writer bug or unsupported future format) or the file's
+    /// bytes never form a valid header. Distinct from
+    /// [`Self::BlockHeaderField`] with `VarintError::Overflow`,
+    /// which signals a single-varint overflow at the decoder layer.
+    /// M3.
+    #[error(
+        "block header exceeds {cap}-byte read cap (read {consumed} \
+         bytes without a successful decode)"
+    )]
+    BlockHeaderExceedsCap { cap: usize, consumed: usize },
+
+    /// EOF was hit mid-decode while reading more bytes into the
+    /// block-header buffer. Distinct from
+    /// [`Self::BlockHeaderField`]'s field-specific truncation —
+    /// here we ran out of source bytes before any decode attempt
+    /// could discover where in the header it failed. `offset` is
+    /// the start of this block on the source; `consumed` is the
+    /// number of bytes successfully pulled before EOF. M4.
+    #[error(
+        "block header truncated at offset {offset} after reading \
+         {consumed} bytes"
+    )]
+    BlockHeaderTruncated { offset: u64, consumed: usize },
+
     /// A single element inside a column payload failed to decode.
     /// `entry` is the per-cardinality index (record index for
     /// per-record columns, allele index for per-allele).
@@ -505,10 +581,19 @@ pub enum PspReadError {
     /// A phase-chain marker or per-allele chain reference at
     /// record `record_in_block` of block `block` is inconsistent
     /// with the running active-slot set. Spec check #10.
-    #[error("phase-chain consistency violation at block {block} record {record_in_block}")]
+    ///
+    /// `record_index` is the file-global record count (matches the
+    /// writer-side `PspWriteError::PhaseChainMarkerInconsistency`'s
+    /// `record_index`); `record_in_block` is the local index inside
+    /// the offending block. Mi2.
+    #[error(
+        "phase-chain consistency violation at block {block} record \
+         {record_in_block} (global record_index {record_index})"
+    )]
     PhaseChainConsistency {
         block: usize,
         record_in_block: u32,
+        record_index: u64,
         #[source]
         kind: PhaseChainConsistencyKind,
     },
