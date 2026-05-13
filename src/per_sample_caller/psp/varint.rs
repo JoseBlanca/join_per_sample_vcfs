@@ -27,7 +27,25 @@ pub const MAX_VARINT_BYTES: usize = 10;
 
 /// Encode `value` as unsigned LEB128 and append the bytes to `out`.
 /// Always produces between 1 and 10 bytes. Never fails.
-pub fn encode_u64_leb128(mut value: u64, out: &mut Vec<u8>) {
+///
+/// Split into an inlined fast path (`value < 0x80`, one
+/// `Vec::push`) and a `#[cold] #[inline(never)]` multi-byte path,
+/// per L4. On the SNP-typical writer workload the vast majority of
+/// values (`delta_pos == 1`, `n_alleles == 1`, `allele_seq_len == 1`,
+/// per-list-count `== 0`) take the fast path; LLVM can lay the cold
+/// body out-of-line so the inlined call site stays tight.
+#[inline]
+pub fn encode_u64_leb128(value: u64, out: &mut Vec<u8>) {
+    if value < 0x80 {
+        out.push(value as u8);
+    } else {
+        encode_u64_leb128_cold(value, out);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn encode_u64_leb128_cold(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);
         value >>= 7;
