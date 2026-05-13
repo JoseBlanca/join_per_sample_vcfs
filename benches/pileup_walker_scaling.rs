@@ -195,7 +195,9 @@ fn build_multi_op_reads(read_len: u32, span: u32, coverage: u32) -> Vec<Prepared
 /// teardown (the collector drains its remaining buffer and
 /// exits; this is real walker-side cost because the walker holds
 /// `tx` until `run` returns).
-fn setup_walker(reads: Vec<PreparedRead>) -> (Vec<PreparedRead>, SyncSender<PileupRecord>, JoinHandle<u64>) {
+fn setup_walker(
+    reads: Vec<PreparedRead>,
+) -> (Vec<PreparedRead>, SyncSender<PileupRecord>, JoinHandle<u64>) {
     let (tx, rx) = mpsc::sync_channel::<PileupRecord>(64);
     let collector = thread::spawn(move || {
         let mut count = 0u64;
