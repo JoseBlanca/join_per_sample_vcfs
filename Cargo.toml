@@ -7,6 +7,7 @@ edition = "2024"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+panic = "abort"
 
 [profile.bench]
 inherits = "release"
