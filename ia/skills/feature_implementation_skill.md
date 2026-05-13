@@ -42,6 +42,7 @@ This keeps the process collaborative without blocking execution.
 
 Before coding, ensure the following is known or explicitly assumed:
 
+- **Domain intent.** A one-paragraph statement of what the feature is *meant* to do — its purpose, the contract it offers callers, and the invariants it maintains. Correctness claims are meaningless without intent; write intent down before judging design choices against it.
 - Inputs and outputs (types, format, ordering, cardinality).
 - Edge cases and failure modes.
 - Performance constraints (latency/throughput/memory).
@@ -49,6 +50,8 @@ Before coding, ensure the following is known or explicitly assumed:
 - Concurrency expectations (single-threaded, rayon, async, lock behavior).
 
 If critical information is missing and changes the implementation direction, ask focused questions before coding.
+
+**No silent assumptions.** When the spec leaves something unspecified and you proceed anyway — picking a default, choosing an ordering, deciding what an empty input means, assuming a collection is sorted — write the assumption down in the plan and in the final report. Silent choices are where features end up technically working but contractually wrong; surfacing them gives the user a chance to redirect before the choice is buried in code.
 
 ## Rust design rules
 
@@ -125,7 +128,7 @@ Run and report real command results when environment allows:
 - `cargo test --all-targets --all-features`
 - `cargo test <targeted_test_name>` for newly added scenarios
 
-If a command cannot be run, state that explicitly and do not fabricate output.
+If a command cannot be run, state that explicitly and do not fabricate output. The same rule applies to file paths, line numbers, type signatures, and behavior claims: cite only what was read or verified. When something cannot be checked, label it "needs verification" rather than asserting it as fact.
 
 ## Definition of done
 
@@ -144,10 +147,21 @@ A feature is complete only when all of the following are true:
 When using this skill, structure the response in this order:
 
 1. **Plan**: short implementation plan.
-2. **Changes made**: files and behavior added/modified.
-3. **Tests added/updated**: what each new test validates.
-4. **Validation results**: commands run and outcomes.
-5. **Tradeoffs and follow-ups**: explicit non-goals, deferred improvements.
+2. **Assumptions**: silent choices made when the spec was incomplete — what was unspecified, what was chosen, and why. Omit only if the spec was fully concrete.
+3. **Changes made**: files and behavior added/modified.
+4. **Tests added/updated**: what each new test validates.
+5. **Validation results**: commands run and outcomes.
+6. **Tradeoffs and follow-ups**: explicit non-goals, deferred improvements.
+
+## Saving the implementation report
+
+For non-trivial features, save a report mirroring the *Response format* sections to:
+
+```
+ia/reports/implementations/<feature-slug>_<YYYY-MM-DD>.md
+```
+
+Append `_v<N>` if a report for the same slug and date already exists. File references inside the report use relative Markdown links from the report's directory (e.g. `[file.rs](../../../src/file.rs#L42)`). Skip the saved report only for changes small enough that the commit message carries the full context.
 
 ## Reusable prompt template
 
