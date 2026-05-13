@@ -41,6 +41,26 @@ use crate::per_sample_caller::pileup::{PileupRecord, SlotId};
 /// CLI-exposed; the writer flushes around this value.
 pub const DEFAULT_TARGET_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 
+/// Initial `Vec::with_capacity` hint for per-record columns in a
+/// freshly-opened block (delta-pos, n-alleles, the per-record list
+/// columns). Sized at the records-per-block high-water mark for the
+/// SNP-typical bench workload (~31 uncompressed bytes per record);
+/// pre-allocating this much keeps the amortised-doubling Vec growth
+/// path off the hot path for the common case. Real workloads with
+/// more alleles per record fit comfortably under this hint; the worst
+/// case is an additional realloc on a few-allele block, which is one
+/// reallocation per column per block instead of ~17.
+const INITIAL_RECORDS_HINT: usize = 350_000;
+/// Initial hint for per-allele columns. Sized a touch above
+/// `INITIAL_RECORDS_HINT` to absorb the typical excess of alleles
+/// over records (occasional multi-allelic positions).
+const INITIAL_ALLELES_HINT: usize = 360_000;
+/// Initial hint for the concatenated allele-sequence byte buffer.
+/// On the SNP-typical workload one byte per allele = ~360 KiB; on
+/// indel-heavier workloads alleles run to ~10 bytes each. The 1 MiB
+/// hint covers both without leaving much slack.
+const INITIAL_ALLELE_SEQ_BYTES_HINT: usize = 1_000_000;
+
 /// Streaming `.psp` writer over any `Write` sink.
 pub struct PspWriter<W: Write> {
     sink: W,
@@ -500,18 +520,18 @@ impl BlockAccumulator {
             first_pos,
             last_pos: first_pos,
             snapshot_active_slots,
-            delta_pos: Vec::new(),
-            n_alleles: Vec::new(),
-            new_chain_slots: Vec::new(),
-            expired_chain_slots: Vec::new(),
-            allele_seq_len: Vec::new(),
-            allele_seq_bytes: Vec::new(),
-            allele_obs_count: Vec::new(),
-            allele_q_sum_log: Vec::new(),
-            allele_fwd_count: Vec::new(),
-            allele_placed_left_count: Vec::new(),
-            allele_placed_start_count: Vec::new(),
-            allele_chain_slots: Vec::new(),
+            delta_pos: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            n_alleles: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            new_chain_slots: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            expired_chain_slots: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            allele_seq_len: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_seq_bytes: Vec::with_capacity(INITIAL_ALLELE_SEQ_BYTES_HINT),
+            allele_obs_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_q_sum_log: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_fwd_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_placed_left_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_placed_start_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_chain_slots: Vec::with_capacity(INITIAL_ALLELES_HINT),
             projected_bytes: 0,
         }
     }
