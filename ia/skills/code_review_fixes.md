@@ -174,8 +174,8 @@ A perf regression is flagged when criterion reports a **`regressed`** verdict on
 
 On regression:
 
-1. **Do not auto-revert.** The user decides whether to revert and bisect, ship as-is, or follow up separately.
-2. Record the regressed group(s), the criterion verdict, and the relevant bench output in the report's perf section.
+1. **Do not auto-revert.** Correctness wins over performance: fixes that resolve a security issue or a real/potential bug are kept even if they cause a perf regression — that is precisely the tradeoff this skill is designed to accept. Only for fixes that are *not* security or correctness fixes (e.g., stylistic or readability findings that happened to land in `Apply`) does the user decide whether to revert and bisect, ship as-is, or follow up separately.
+2. Record the regressed group(s), the criterion verdict, and the relevant bench output in the report's perf section. For each regression, note whether the responsible fix is a security/bug fix (kept by policy) or a non-defect fix (awaiting user decision).
 3. List the regression among the run's unresolved high-priority items so the user sees it at the end of the run.
 
 If criterion reports `no change` or `improved` on every group, a one-line note in the report is enough.
