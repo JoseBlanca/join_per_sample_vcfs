@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "baq_perf"
 harness = false
+
+[[bench]]
+name = "psp_writer_perf"
+harness = false

@@ -436,6 +436,52 @@ impl PileupRecord {
     pub fn ref_span(&self) -> u32 {
         self.alleles[0].seq.len() as u32
     }
+
+    /// Constructor for external code (benches, integration tests).
+    /// The walker builds records via struct-update syntax internally
+    /// because [`PileupRecord`] is `#[non_exhaustive]`; this `new` is
+    /// the supported entry point from outside the crate.
+    pub fn new(
+        chrom_id: u32,
+        pos: u32,
+        new_chains: Vec<SlotId>,
+        expired_chains: Vec<SlotId>,
+        alleles: Vec<AlleleObservation>,
+    ) -> Self {
+        Self {
+            chrom_id,
+            pos,
+            new_chains,
+            expired_chains,
+            alleles,
+        }
+    }
+}
+
+impl AlleleObservation {
+    /// Constructor for external code (benches, integration tests).
+    /// See [`PileupRecord::new`].
+    pub fn new(seq: Vec<u8>, support: AlleleSupportStats, chain_slots: Vec<SlotId>) -> Self {
+        Self {
+            seq,
+            support,
+            chain_slots,
+        }
+    }
+}
+
+impl AlleleSupportStats {
+    /// Constructor for external code (benches, integration tests).
+    /// See [`PileupRecord::new`].
+    pub fn new(num_obs: u32, q_sum: f64, fwd: u32, placed_left: u32, placed_start: u32) -> Self {
+        Self {
+            num_obs,
+            q_sum,
+            fwd,
+            placed_left,
+            placed_start,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
