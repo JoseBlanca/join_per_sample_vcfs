@@ -140,7 +140,7 @@ fn bench_writer(c: &mut Criterion) {
     group.throughput(Throughput::Elements(records.len() as u64));
 
     group.bench_function("snp_typical_3_3M", |b| {
-        b.iter(|| black_box(write_all(&records, header.clone())));
+        b.iter(|| black_box(write_all(black_box(&records), black_box(header.clone()))));
     });
 
     group.finish();
