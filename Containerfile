@@ -15,8 +15,10 @@ FROM docker.io/library/rust:1.95-bookworm
 #   - bcftools / tabix: inspect and compare VCF output against reference tools.
 #   - curl: bootstraps the NodeSource apt repo for Node.js.
 #   - linux-perf: sampling profiler; backs cargo-flamegraph. In-container
-#     sampling typically needs the host's perf_event_paranoid relaxed or
-#     the container run with --cap-add=SYS_ADMIN.
+#     sampling needs the host's kernel.perf_event_paranoid relaxed
+#     (typically to 1). In rootless podman, --cap-add=SYS_ADMIN/PERFMON
+#     does NOT help — the syscall still reaches the host kernel as the
+#     unprivileged invoking user, so the sysctl is the only knob.
 #   - hyperfine: statistical CLI benchmarking for reference comparisons.
 #   - valgrind: callgrind/cachegrind for instruction-level profiling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,9 +43,10 @@ RUN rustup component add rustfmt clippy
 # Installed as its own layer so it stays cached across Cargo.toml changes.
 RUN cargo install flamegraph --locked
 
-# samply: sampling profiler that does not require perf permissions. Produces
-# a profile viewable in the Firefox profiler UI; complementary to flamegraph
-# for cases where the host's perf_event_paranoid is locked down.
+# samply: sampling profiler that produces a profile viewable in the Firefox
+# profiler UI; complementary to flamegraph. On Linux it still uses
+# perf_event_open under the hood, so the same host-side
+# kernel.perf_event_paranoid constraint as cargo-flamegraph applies.
 RUN cargo install samply --locked
 
 # cargo-show-asm: emit annotated assembly for a single function. Used to
