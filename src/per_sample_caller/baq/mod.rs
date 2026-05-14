@@ -28,7 +28,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use engine::{BaqEngine, BaqOutcome, BaqSkipReason};
+pub use engine::{BaqEngine, BaqOutcome, BaqSkipReason, prepare_passthrough};
 pub use errors::ProbalnError;
 pub use stream::{BaqSkipCounts, BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
 

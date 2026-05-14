@@ -72,52 +72,127 @@ impl RefSeqFetcher for ChromBoundaryRefFetcher {
             self.current_chrom.set(Some(chrom_id));
         }
 
-        let entry = self.contigs.entries.get(chrom_id as usize).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "chrom_id {chrom_id} out of range (have {} contigs)",
-                    self.contigs.entries.len()
-                ),
-            )
-        })?;
-
-        let seq_arc = match self.repository.get(entry.name.as_bytes()) {
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("contig {} not in FASTA", entry.name),
-                ));
-            }
-            Some(Err(e)) => return Err(e),
-            Some(Ok(seq)) => seq,
-        };
-        let bytes = seq_arc.as_ref().as_ref();
-
-        if start_1based == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "start_1based must be >= 1",
-            ));
-        }
-        let start_idx = (start_1based - 1) as usize;
-        let end_idx = start_idx
-            .checked_add(length as usize)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow"))?;
-        if end_idx > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "fetch [{}, {}) past contig {} length {}",
-                    start_1based,
-                    start_1based + length,
-                    entry.name,
-                    bytes.len()
-                ),
-            ));
-        }
-        Ok(bytes[start_idx..end_idx].to_vec())
+        fetch_from_repository(
+            &self.repository,
+            &self.contigs,
+            chrom_id,
+            start_1based,
+            length,
+        )
     }
+}
+
+// ---------------------------------------------------------------------
+// SyncRefFetcher — Sync-safe, no eviction. For the BAQ stage.
+// ---------------------------------------------------------------------
+
+/// `RefSeqFetcher` variant for the rayon-parallel BAQ stage, which
+/// requires a `Sync` fetcher to share across worker threads.
+///
+/// Trades eviction for thread-safety: under the hood it is the same
+/// `noodles_fasta::Repository` (already `Sync` thanks to its
+/// internal `Arc<RwLock<...>>`) but without the per-fetch
+/// chromosome-boundary check that makes [`ChromBoundaryRefFetcher`]
+/// non-`Sync`. The pipeline uses both:
+///
+/// - BAQ stage → [`SyncRefFetcher`] (parallel; non-evicting cache).
+/// - Pileup walker → [`ChromBoundaryRefFetcher`] (sequential;
+///   one-chrom-resident cache).
+///
+/// Memory: this fetcher's cache grows to hold every chromosome the
+/// run visits (~3 GB on a 24-chrom human reference). For Stage 1's
+/// per-sample whole-CRAM scan that is the dominant memory user, but
+/// it is bounded and predictable. A future slice can introduce a
+/// thread-safe chrom-boundary fetcher if the doubled cache footprint
+/// becomes a problem; today the two-fetcher split is the simpler
+/// design.
+pub struct SyncRefFetcher {
+    repository: fasta::Repository,
+    contigs: ContigList,
+}
+
+impl SyncRefFetcher {
+    pub fn new(fasta_path: &Path, contigs: ContigList) -> io::Result<Self> {
+        let indexed_reader =
+            fasta::io::indexed_reader::Builder::default().build_from_path(fasta_path)?;
+        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_reader);
+        let repository = fasta::Repository::new(adapter);
+        Ok(Self {
+            repository,
+            contigs,
+        })
+    }
+}
+
+impl RefSeqFetcher for SyncRefFetcher {
+    fn fetch(&self, chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
+        fetch_from_repository(
+            &self.repository,
+            &self.contigs,
+            chrom_id,
+            start_1based,
+            length,
+        )
+    }
+}
+
+/// Shared body of both fetchers — read a window from a
+/// noodles `Repository` after validating `chrom_id` and 1-based
+/// coordinates. Promoted to a free function so the two fetchers
+/// agree on the error shapes (test invariants checked against
+/// `ChromBoundaryRefFetcher` cover `SyncRefFetcher` by reuse).
+fn fetch_from_repository(
+    repository: &fasta::Repository,
+    contigs: &ContigList,
+    chrom_id: u32,
+    start_1based: u32,
+    length: u32,
+) -> Result<Vec<u8>, io::Error> {
+    let entry = contigs.entries.get(chrom_id as usize).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "chrom_id {chrom_id} out of range (have {} contigs)",
+                contigs.entries.len()
+            ),
+        )
+    })?;
+
+    let seq_arc = match repository.get(entry.name.as_bytes()) {
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("contig {} not in FASTA", entry.name),
+            ));
+        }
+        Some(Err(e)) => return Err(e),
+        Some(Ok(seq)) => seq,
+    };
+    let bytes = seq_arc.as_ref().as_ref();
+
+    if start_1based == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "start_1based must be >= 1",
+        ));
+    }
+    let start_idx = (start_1based - 1) as usize;
+    let end_idx = start_idx
+        .checked_add(length as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow"))?;
+    if end_idx > bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "fetch [{}, {}) past contig {} length {}",
+                start_1based,
+                start_1based + length,
+                entry.name,
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes[start_idx..end_idx].to_vec())
 }
 
 // ---------------------------------------------------------------------

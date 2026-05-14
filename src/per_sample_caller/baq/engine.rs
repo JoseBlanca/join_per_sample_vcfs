@@ -378,6 +378,20 @@ fn op_len(op: CigarOp) -> usize {
     }
 }
 
+/// Build a [`PreparedRead`] from a [`MappedRead`] *without* running
+/// the BAQ HMM — `bq_baq` is a clone of the raw `qual` from the CRAM
+/// record. Used by `pop_var_caller pileup --no-baq` to bypass BAQ
+/// while keeping the rest of the pipeline unchanged.
+///
+/// Reuses the same field-wiring as the BAQ-on path
+/// ([`mapped_to_prepared`]) so the two branches stay in lockstep on
+/// alignment-end computation, mate-role derivation, and adaptor
+/// boundary propagation.
+pub fn prepare_passthrough(read: MappedRead, chrom_id: u32) -> PreparedRead {
+    let bq_baq = read.qual.clone();
+    mapped_to_prepared(read, chrom_id, bq_baq)
+}
+
 fn mapped_to_prepared(read: MappedRead, chrom_id: u32, bq_baq: Vec<u8>) -> PreparedRead {
     let alignment_start = read.pos as u32;
     let alignment_end = compute_alignment_end(alignment_start, &read.cigar);

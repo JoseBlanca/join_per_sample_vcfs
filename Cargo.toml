@@ -48,6 +48,7 @@ anyhow = "1.0.102"
 # fast path (per_sample_caller/psp/block.rs). Avoids user-side
 # `unsafe`; single dependent call site.
 bytemuck = "1"
+clap = { version = "4", features = ["derive"] }
 dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 flate2 = "1.1.9"
@@ -82,6 +83,10 @@ alloc-mimalloc = ["dep:mimalloc"]
 bstr = "1"
 criterion = "0.8.2"
 proptest = "1"
+
+[[bin]]
+name = "pop_var_caller"
+path = "src/main.rs"
 
 [[bench]]
 name = "gvcf_perf"

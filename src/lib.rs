@@ -23,6 +23,7 @@ pub mod genotype_posteriors;
 pub mod gvcf_parser;
 pub mod per_sample_caller;
 pub mod pipeline;
+pub mod pop_var_caller;
 pub mod threaded_reader;
 pub mod utils_magic;
 pub mod variant_grouping;
