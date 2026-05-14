@@ -165,9 +165,8 @@ impl ActiveReads {
                 // `evict_stale_pending` walks the map on every
                 // subsequent `allocate_for_read` and drops entries
                 // whose `seen_at` is past the window.
-                let slot = self.reads[i].chain_slot_id;
                 let chrom_id = self.reads[i].read.chrom_id;
-                slots.release_slot(slot, chrom_id, walker_pos)?;
+                slots.note_read_exit(chrom_id, walker_pos)?;
                 self.swap_remove(i);
             }
         }
@@ -191,7 +190,7 @@ impl ActiveReads {
             // makes right after this method); we don't touch it
             // here.
             let chrom_id = active.read.chrom_id;
-            slots.release_slot(active.chain_slot_id, chrom_id, walker_pos)?;
+            slots.note_read_exit(chrom_id, walker_pos)?;
         }
         self.by_read_id.clear();
         Ok(())

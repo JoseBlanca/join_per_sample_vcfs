@@ -85,7 +85,7 @@ pub struct SlotAllocator {
     /// [`WalkerError::ChainIdSpaceExhausted`].
     next_id: u64,
     /// Count of currently-active reads. Bumped on every successful
-    /// fresh allocation, decremented in [`Self::release_slot`].
+    /// fresh allocation, decremented in [`Self::note_read_exit`].
     /// Enforced against `max_active_reads` to surface
     /// `ActiveReadsExhausted` before pathological-depth regions
     /// blow up memory.
@@ -289,28 +289,19 @@ impl SlotAllocator {
         }
     }
 
-    /// Decrement the active-read count on read exit. With unique
-    /// chain ids the act of expiring a read no longer touches a
-    /// slot id namespace — the id stays unique for the file — so
-    /// this is just refcount-style bookkeeping for the active-read
-    /// cap.
+    /// Note that a read has exited the active set: decrement the
+    /// active-read count. With unique chain ids the act of expiring
+    /// a read no longer touches a slot id namespace — the id stays
+    /// unique for the file — so this is just refcount-style
+    /// bookkeeping for the active-read cap.
     ///
-    /// `_slot`, `chrom_id`, and `pos` are accepted for API
-    /// compatibility with the previous signature. `_slot` is
-    /// unused (the unique-id design doesn't need to know which id
-    /// is leaving the active set); `chrom_id` and `pos` are only
-    /// consulted on the error path: they populate
-    /// `WalkerError::Internal`'s context fields if the active-read
-    /// count is asked to go below zero.
-    pub fn release_slot(
-        &mut self,
-        _slot: SlotId,
-        chrom_id: u32,
-        pos: u32,
-    ) -> Result<(), WalkerError> {
+    /// `chrom_id` and `pos` are only consulted on the error path:
+    /// they populate `WalkerError::Internal`'s context fields if the
+    /// active-read count is asked to go below zero.
+    pub fn note_read_exit(&mut self, chrom_id: u32, pos: u32) -> Result<(), WalkerError> {
         if self.active_count == 0 {
             return Err(WalkerError::Internal {
-                detail: "release_slot called with active_count already zero".to_string(),
+                detail: "note_read_exit called with active_count already zero".to_string(),
                 qname: String::new(),
                 chrom_id,
                 pos,
@@ -459,7 +450,7 @@ mod tests {
         let mut a = SlotAllocator::new();
         let r1 = make_read("r1", MateRole::Solo, 100);
         let (s1, _) = a.allocate_for_read(&r1).unwrap();
-        a.release_slot(s1, 0, 100).unwrap();
+        a.note_read_exit(0, 100).unwrap();
         let r2 = make_read("r2", MateRole::Solo, 100);
         let (s2, _) = a.allocate_for_read(&r2).unwrap();
         assert_ne!(s1, s2, "released ids must never be recycled");
@@ -560,13 +551,11 @@ mod tests {
     }
 
     #[test]
-    fn release_slot_on_empty_active_set_errors_with_locus_context() {
+    fn note_read_exit_on_empty_active_set_errors_with_locus_context() {
         let mut a = SlotAllocator::new();
         let err = a
-            .release_slot(
-                /* slot */ 5, /* chrom_id */ 7, /* pos */ 12345,
-            )
-            .expect_err("release_slot with empty active set must error");
+            .note_read_exit(/* chrom_id */ 7, /* pos */ 12345)
+            .expect_err("note_read_exit with empty active set must error");
         match err {
             WalkerError::Internal {
                 detail,
@@ -596,7 +585,7 @@ mod tests {
         let m1 = make_read("pair", MateRole::FirstOfPair, 100);
         let (slot1, _) = a.allocate_for_read(&m1).unwrap();
         // First mate exits the active set.
-        a.release_slot(slot1, 0, 200).unwrap();
+        a.note_read_exit(0, 200).unwrap();
         assert_eq!(a.active_count, 0);
         assert_eq!(
             a.pending_mates.len(),
@@ -656,7 +645,7 @@ mod tests {
         let r2 = make_read("would-be-max", MateRole::Solo, 100);
         // Active_count is now 1; release first so the active-cap check
         // doesn't pre-empt the overflow check.
-        a.release_slot(slot, 0, 100).unwrap();
+        a.note_read_exit(0, 100).unwrap();
         let err = a.allocate_for_read(&r2).expect_err("must surface overflow");
         assert!(
             matches!(err, WalkerError::ChainIdSpaceExhausted { .. }),
