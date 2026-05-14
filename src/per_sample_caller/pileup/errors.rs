@@ -66,9 +66,6 @@ pub enum WalkerError {
         pos: u32,
     },
 
-    #[error("walker output channel closed before all records were drained: {context}")]
-    ChannelClosed { context: String },
-
     #[error("malformed PreparedRead at qname='{qname}' (chrom_id={chrom_id}, pos={pos}): {reason}")]
     MalformedRead {
         reason: String,

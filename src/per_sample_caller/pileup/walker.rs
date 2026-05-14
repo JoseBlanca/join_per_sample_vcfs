@@ -1,9 +1,19 @@
 //! The walker loop. Single-threaded; drives all the building
 //! blocks (active set, slot allocator, open-record table) through
-//! the closure rule and pushes finalised `PileupRecord`s through
-//! a bounded channel.
+//! the closure rule and yields finalised `PileupRecord`s through
+//! a pull-shaped `Iterator`.
+//!
+//! The walker is a state machine: each call to `Iterator::next()`
+//! advances it until at least one record is ready (or end-of-input
+//! is reached), then yields one record at a time. A single walker
+//! tick may emit 0, 1, or many records; the iterator buffers them
+//! in a small `VecDeque` and drains across successive `next()`
+//! calls. Tick-internal order is preserved so the lifecycle-mark
+//! attachment rule — marks stamped onto the first record of the
+//! tick's batch — survives the change.
 
-use std::sync::mpsc::{SendError, SyncSender};
+use std::collections::VecDeque;
+use std::iter::Peekable;
 
 use ahash::AHashMap;
 
@@ -12,124 +22,202 @@ use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
-    stamp_lifecycle_marks,
 };
 use super::slot_allocator::{SlotAllocator, SlotAllocatorCounters, SlotId};
 use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerConfig};
 
-/// Run the walker over a coordinate-sorted stream of prepared
-/// reads, pushing each closed `PileupRecord` through `tx`.
+/// Construct a [`PileupWalker`] over a coordinate-sorted stream of
+/// prepared reads. The walker is an `Iterator<Item = Result<PileupRecord,
+/// WalkerError>>`; callers drive it by repeatedly calling `next()`
+/// (or by collecting / for-looping). After iteration ends, the
+/// run's cumulative counters are available via
+/// [`PileupWalker::summary`].
 ///
 /// Coordinate-order invariant: every read pulled from `reads` must
 /// have `(chrom_id, alignment_start)` non-decreasing relative to
 /// the previous one. A regression is a hard error — stale or
 /// malformed input shouldn't pass silently.
-pub fn run<I, F>(
-    reads: I,
-    ref_fetcher: &F,
-    tx: &SyncSender<PileupRecord>,
-    config: &WalkerConfig,
-) -> Result<RunSummary, WalkerError>
+pub fn run<R, F>(reads: R, ref_fetcher: F, config: &WalkerConfig) -> PileupWalker<R::IntoIter, F>
 where
-    I: IntoIterator<Item = PreparedRead>,
+    R: IntoIterator<Item = PreparedRead>,
     F: RefSeqFetcher,
 {
-    let mut state = WalkerState::new(*config);
-    let mut reads_iter = reads.into_iter().peekable();
+    PileupWalker::new(reads.into_iter(), ref_fetcher, config)
+}
 
-    // Initial chromosome anchor: the first peeked read sets
-    // `chrom_id`, `walker_pos = 1`, and `last_admitted_chrom_id`.
-    // Subsequent re-anchors happen inside the chromosome-boundary
-    // block below, right after `flush_chromosome`. Hoisting this
-    // out of the per-iteration path keeps the hot loop free of a
-    // call that is a no-op on every iteration except the first.
-    if let Some(first) = reads_iter.peek() {
-        state.enter_chrom(first.chrom_id);
+/// Pull-shaped walker over a coordinate-sorted stream of prepared
+/// reads. See [`run`] for the convenience constructor.
+pub struct PileupWalker<I, F>
+where
+    I: Iterator<Item = PreparedRead>,
+    F: RefSeqFetcher,
+{
+    reads: Peekable<I>,
+    ref_fetcher: F,
+    state: WalkerState,
+    /// Records produced by walker ticks but not yet consumed by
+    /// `Iterator::next`. A single tick may emit 0–many records
+    /// (e.g. a wide deletion at an earlier anchor unblocks several
+    /// narrower records simultaneously); they're appended here in
+    /// emission order and drained via `pop_front`.
+    pending: VecDeque<PileupRecord>,
+    /// `true` once end-of-input has been flushed *or* a `next()`
+    /// call has returned an error. Both terminal states stop the
+    /// iterator from doing further work.
+    done: bool,
+}
+
+impl<I, F> PileupWalker<I, F>
+where
+    I: Iterator<Item = PreparedRead>,
+    F: RefSeqFetcher,
+{
+    pub fn new(reads: I, ref_fetcher: F, config: &WalkerConfig) -> Self {
+        let mut reads = reads.peekable();
+        let mut state = WalkerState::new(*config);
+        // Initial chromosome anchor: the first peeked read sets
+        // `chrom_id`, `walker_pos = 1`, and
+        // `last_admitted_chrom_id`. Subsequent re-anchors happen
+        // inside the chromosome-boundary block of `fill_pending`,
+        // right after `flush_chromosome_into`.
+        if let Some(first) = reads.peek() {
+            state.enter_chrom(first.chrom_id);
+        }
+        Self {
+            reads,
+            ref_fetcher,
+            state,
+            pending: VecDeque::new(),
+            done: false,
+        }
     }
 
-    // Continue while there is work to do: more reads to pull,
-    // or active reads still covering the walker. Stopping at
-    // "reads_iter empty" alone would leak open records whose
-    // anchor positions sit ahead of the walker but inside the
-    // active set's coverage.
-    while reads_iter.peek().is_some() || !state.active_reads.is_empty() {
-        // Chromosome boundary: the next peeked read sits on a new
-        // chromosome, so finalise everything still in flight from
-        // the previous one — any still-open `PileupRecord`s are
-        // drained and emitted, active reads are released (their
-        // expiry markers are stamped onto the emitted records),
-        // and the per-chromosome state is reset. No data is lost;
-        // "flush" here means "finalise & emit", not "discard".
-        //
-        // The forward-direction check has to run *before* the
-        // flush so a backward chromosome change errors out
-        // without first emitting the previous chromosome's
-        // records into the channel.
-        if let Some(peeked_read) = reads_iter.peek()
-            && let Some(prev_chrom_id) = state.last_admitted_chrom_id
-            && prev_chrom_id != peeked_read.chrom_id
-        {
-            if peeked_read.chrom_id < prev_chrom_id {
-                let prev_pos = state
-                    .last_admitted_locus
-                    .map(|l| l.pos)
-                    .unwrap_or(state.walker_pos);
-                return Err(WalkerError::OutOfOrder {
-                    qname: peeked_read.qname.to_string(),
-                    prev_chrom_id,
-                    prev_pos,
-                    chrom_id: peeked_read.chrom_id,
-                    pos: peeked_read.alignment_start,
-                });
-            }
-            state.flush_chromosome(tx)?;
-            state.enter_chrom(peeked_read.chrom_id);
-        }
-
-        // Pull every read with alignment_start ≤ walker_pos
-        // (only on the current chromosome; reads on later
-        // chromosomes wait for the chromosome flush above).
-        while let Some(peeked_read) = reads_iter.peek() {
-            if peeked_read.chrom_id != state.chrom_id {
-                break;
-            }
-            if peeked_read.alignment_start > state.walker_pos {
-                break;
-            }
-            // PANIC-FREE: `reads_iter.peek()` returned Some on the loop
-            // condition above, and `reads_iter` has not been advanced
-            // between then and here.
-            let r = reads_iter.next().expect("peek matched");
-            state.admit_read(r)?;
-        }
-
-        // Process events at walker_pos and fold them into open
-        // records. Mate-overlap is resolved fold-time inside this
-        // step (see §"Mate overlap" handling below).
-        state.process_position(ref_fetcher)?;
-
-        // Expire reads whose alignment_end < walker_pos. Order
-        // matters: expire BEFORE close so any slot lifecycle
-        // marks generated by expiry land on records emitted at
-        // this same walker step rather than getting deferred.
-        state.expire_passed_reads()?;
-
-        // Close records whose footprint is fully behind the
-        // walker, send each to the channel.
-        state.close_aged_records(tx)?;
-
-        // Advance walker_pos to the next interesting position:
-        // walker_pos+1 if any active read still has events at or
-        // beyond it, otherwise jump to the next read's
-        // alignment_start (skip uncovered span).
-        state.advance(reads_iter.peek())?;
+    /// Cumulative counters for the run so far. Safe to call
+    /// mid-stream; the final summary is the value observed after
+    /// `next()` has returned `None`.
+    pub fn summary(&self) -> RunSummary {
+        self.state.summary()
     }
 
-    // End of input: flush whatever remains, on whichever
-    // chromosome we were on.
-    state.flush_chromosome(tx)?;
+    /// Drive the walker until at least one record is ready in
+    /// `pending`, or until end-of-input. End-of-input also flushes
+    /// the remaining chromosome and sets `done = true`.
+    fn fill_pending(&mut self) -> Result<(), WalkerError> {
+        loop {
+            // Terminal condition: no more reads to pull and the
+            // active set is empty. Stopping at "reads empty" alone
+            // would leak open records whose anchors sit ahead of
+            // the walker but inside the active set's coverage.
+            if self.reads.peek().is_none() && self.state.active_reads.is_empty() {
+                self.state.flush_chromosome_into(&mut self.pending)?;
+                self.done = true;
+                return Ok(());
+            }
 
-    Ok(state.summary())
+            // Chromosome boundary: the next peeked read sits on a
+            // new chromosome. Finalise everything still in flight
+            // from the previous chromosome and re-anchor.
+            //
+            // The forward-direction check has to run *before* the
+            // flush so a backward chromosome change errors out
+            // without first emitting the previous chromosome's
+            // records into `pending`.
+            //
+            // We pull the chrom_id and qname out of the peek
+            // borrow into locals so the subsequent calls into
+            // `self.state` aren't blocked by the peek borrow.
+            let chrom_transition: Option<u32> = {
+                let peeked = self.reads.peek();
+                match (peeked, self.state.last_admitted_chrom_id) {
+                    (Some(p), Some(prev)) if prev != p.chrom_id => {
+                        if p.chrom_id < prev {
+                            let prev_pos = self
+                                .state
+                                .last_admitted_locus
+                                .map(|l| l.pos)
+                                .unwrap_or(self.state.walker_pos);
+                            return Err(WalkerError::OutOfOrder {
+                                qname: p.qname.to_string(),
+                                prev_chrom_id: prev,
+                                prev_pos,
+                                chrom_id: p.chrom_id,
+                                pos: p.alignment_start,
+                            });
+                        }
+                        Some(p.chrom_id)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(new_chrom) = chrom_transition {
+                self.state.flush_chromosome_into(&mut self.pending)?;
+                self.state.enter_chrom(new_chrom);
+            }
+
+            // Pull every read with alignment_start ≤ walker_pos
+            // (only on the current chromosome; reads on later
+            // chromosomes wait for the chromosome flush above).
+            while let Some(peeked_read) = self.reads.peek() {
+                if peeked_read.chrom_id != self.state.chrom_id {
+                    break;
+                }
+                if peeked_read.alignment_start > self.state.walker_pos {
+                    break;
+                }
+                // PANIC-FREE: `peek()` returned Some on the loop
+                // condition above, and `self.reads` has not been
+                // advanced between then and here.
+                let r = self.reads.next().expect("peek matched");
+                self.state.admit_read(r)?;
+            }
+
+            // Process events at walker_pos, expire passed reads,
+            // and close aged records. Order matters: expire BEFORE
+            // close so any slot lifecycle marks generated by expiry
+            // land on records emitted at this same walker step
+            // rather than getting deferred to the next one.
+            self.state.process_position(&self.ref_fetcher)?;
+            self.state.expire_passed_reads()?;
+            self.state.close_aged_records_into(&mut self.pending);
+
+            // Advance walker_pos to the next interesting position:
+            // walker_pos+1 if any active read still has events at
+            // or beyond it, otherwise jump to the next read's
+            // alignment_start (skip uncovered span).
+            self.state.advance(self.reads.peek())?;
+
+            if !self.pending.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<I, F> Iterator for PileupWalker<I, F>
+where
+    I: Iterator<Item = PreparedRead>,
+    F: RefSeqFetcher,
+{
+    type Item = Result<PileupRecord, WalkerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(record) = self.pending.pop_front() {
+            return Some(Ok(record));
+        }
+        if self.done {
+            return None;
+        }
+        match self.fill_pending() {
+            Ok(()) => self.pending.pop_front().map(Ok),
+            Err(e) => {
+                // Terminal-on-first-error: stop yielding after this.
+                // The previous push-based shape stopped emission as
+                // soon as `run` returned `Err`; preserve that.
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 /// Cumulative counters reported back by `run` so callers can log a
@@ -368,27 +456,35 @@ impl WalkerState {
         Ok(())
     }
 
-    fn close_aged_records(&mut self, tx: &SyncSender<PileupRecord>) -> Result<(), WalkerError> {
+    /// Finalise any open records whose footprint is fully behind
+    /// the walker, append them to `out` in emission order, and
+    /// stamp the slot-allocator's pending lifecycle marks onto the
+    /// first record of this tick's batch.
+    ///
+    /// "First of this tick's batch" is indexed via `out`'s pre-call
+    /// length: marks land on `out[batch_start]`, which is the same
+    /// position the previous push-based code stamped onto
+    /// (`records[0]` of the per-tick local `Vec`). Returns without
+    /// touching `out` if there are no aged records to drain.
+    fn close_aged_records_into(&mut self, out: &mut VecDeque<PileupRecord>) {
         self.open_records
             .drain_aged_into(self.walker_pos, &mut self.drained_buf);
         if self.drained_buf.is_empty() {
-            return Ok(());
+            return;
         }
-        // `finalise()` consumes each `OpenPileupRecord` by value, so we
-        // drain the hoisted buffer rather than `into_iter()`ing it; the
-        // backing `Vec` stays allocated and reusable for the next step.
-        let mut records: Vec<PileupRecord> =
-            self.drained_buf.drain(..).map(|r| r.finalise()).collect();
-        let (new, expired) = self.slots.drain_lifecycle_marks();
-        stamp_lifecycle_marks(&mut records, new, expired);
-        for record in records {
-            tx.send(record)
-                .map_err(|SendError(_)| WalkerError::ChannelClosed {
-                    context: "walker output channel closed mid-run".into(),
-                })?;
+        let batch_start = out.len();
+        // `finalise()` consumes each `OpenPileupRecord` by value, so
+        // we drain the hoisted buffer rather than `into_iter()`ing
+        // it; the backing `Vec` stays allocated and reusable.
+        for open in self.drained_buf.drain(..) {
+            out.push_back(open.finalise());
             self.summary.records_emitted += 1;
         }
-        Ok(())
+        let (new, expired) = self.slots.drain_lifecycle_marks();
+        if let Some(first) = out.get_mut(batch_start) {
+            first.new_chains = new;
+            first.expired_chains = expired;
+        }
     }
 
     fn expire_passed_reads(&mut self) -> Result<(), WalkerError> {
@@ -436,12 +532,22 @@ impl WalkerState {
         Ok(())
     }
 
-    fn flush_chromosome(&mut self, tx: &SyncSender<PileupRecord>) -> Result<(), WalkerError> {
+    /// Finalise everything still in flight at end-of-chromosome
+    /// (or end-of-input), appending the records to `out` in
+    /// emission order and stamping the slot-allocator's pending
+    /// lifecycle marks onto the first record of the batch.
+    fn flush_chromosome_into(
+        &mut self,
+        out: &mut VecDeque<PileupRecord>,
+    ) -> Result<(), WalkerError> {
         // Drain remaining open records (anything that was still
         // open at end-of-chromosome is by definition ready to
         // close — there are no future reads on this chromosome).
-        let remaining = self.open_records.drain_all();
-        let mut records: Vec<PileupRecord> = remaining.into_iter().map(|r| r.finalise()).collect();
+        let batch_start = out.len();
+        for open in self.open_records.drain_all() {
+            out.push_back(open.finalise());
+            self.summary.records_emitted += 1;
+        }
         // Release any active-set reads first, then drain marks
         // once. flush_all only emits `expired_marks` (release_slot
         // never touches `new_marks`), so we don't need to merge
@@ -449,13 +555,9 @@ impl WalkerState {
         self.active_reads
             .flush_all(&mut self.slots, self.walker_pos)?;
         let (new, expired) = self.slots.drain_lifecycle_marks();
-        stamp_lifecycle_marks(&mut records, new, expired);
-        for record in records {
-            tx.send(record)
-                .map_err(|SendError(_)| WalkerError::ChannelClosed {
-                    context: "walker output channel closed during flush".into(),
-                })?;
-            self.summary.records_emitted += 1;
+        if let Some(first) = out.get_mut(batch_start) {
+            first.new_chains = new;
+            first.expired_chains = expired;
         }
         // Reset chromosome-scoped state. `self.open_records.reset()`
         // keeps the perf-hoisted `allele_seq_buf` capacity across the

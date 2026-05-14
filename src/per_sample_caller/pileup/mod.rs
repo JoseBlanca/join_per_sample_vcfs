@@ -17,14 +17,14 @@ mod slot_allocator;
 mod walker;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::sync::Arc;
 
 pub use crate::per_sample_caller::cram_input::CigarOp;
 pub use errors::WalkerError;
 pub use slot_allocator::{DEFAULT_MAX_ACTIVE_SLOTS, SlotId};
-pub use walker::{RunSummary, run};
+pub use walker::{PileupWalker, RunSummary, run};
 
 // ---------------------------------------------------------------------
 // Defaults / tunables
@@ -49,12 +49,6 @@ pub const DEFAULT_MAX_RECORD_SPAN: u32 = 5_000;
 /// headroom. Long-read paired protocols with mate gaps beyond
 /// this would need it raised.
 pub const DEFAULT_MATE_LOOKUP_WINDOW: u32 = 10_000;
-
-/// Default channel buffer between the walker thread and the Stage 2
-/// encoder thread. Sized for the worst-case burst of simultaneous
-/// closures plus enough headroom for a few subsequent steps to
-/// proceed before backpressure kicks in.
-pub const DEFAULT_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 
 /// Default SNP/REF-column contributor cap, adopted from samtools'
 /// `MPLP_MAX_DEPTH`. Pathologically deep regions truncate at this
@@ -505,4 +499,18 @@ pub trait RefSeqFetcher {
         start_1based: u32,
         length: u32,
     ) -> Result<Vec<u8>, std::io::Error>;
+}
+
+/// Forwarding impl so callers may pass either an owned fetcher or a
+/// shared reference into [`PileupWalker::new`] / [`run`]. The walker
+/// only ever calls `&self` methods, so the borrow is sufficient.
+impl<T: RefSeqFetcher + ?Sized> RefSeqFetcher for &T {
+    fn fetch(
+        &self,
+        chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        (**self).fetch(chrom_id, start_1based, length)
+    }
 }

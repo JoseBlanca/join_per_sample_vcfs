@@ -15,6 +15,7 @@ pub mod baq;
 pub mod cram_input;
 pub mod errors;
 pub mod pileup;
+pub mod pileup_to_psp;
 pub mod psp;
 pub mod ref_fetcher;
 

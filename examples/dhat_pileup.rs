@@ -22,11 +22,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::io;
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
 
 use merge_per_sample_vcfs::per_sample_caller::pileup::{
-    CigarOp, MateRole, PileupRecord, PreparedRead, RefSeqFetcher, WalkerConfig, run,
+    CigarOp, MateRole, PreparedRead, RefSeqFetcher, WalkerConfig, run,
 };
 
 struct ConstFasta {
@@ -115,16 +113,10 @@ fn main() {
 
     let reads = build_reads(read_len, span, coverage);
 
-    let (tx, rx) = mpsc::sync_channel::<PileupRecord>(64);
-    let collector = thread::spawn(move || {
-        let mut count = 0u64;
-        while rx.recv().is_ok() {
-            count += 1;
-        }
-        count
-    });
-    run(reads, &ref_fetcher, &tx, &WalkerConfig::default()).expect("walker run failed");
-    drop(tx);
-    let count = collector.join().expect("collector panicked");
+    let mut count: u64 = 0;
+    for item in run(reads, &ref_fetcher, &WalkerConfig::default()) {
+        item.expect("walker yielded error");
+        count += 1;
+    }
     eprintln!("pileup records emitted: {count}");
 }

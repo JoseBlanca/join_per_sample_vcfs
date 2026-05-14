@@ -978,24 +978,6 @@ pub(super) struct ReadContribution {
     pub bq_override_at_walker_pos: Option<u8>,
 }
 
-/// Apply slot lifecycle markers from the slot allocator to the
-/// most-recently-emitted record. Used by the walker's
-/// close_aged_records step.
-pub(super) fn stamp_lifecycle_marks(
-    records: &mut [PileupRecord],
-    new_chains: Vec<SlotId>,
-    expired_chains: Vec<SlotId>,
-) {
-    if let Some(first) = records.first_mut() {
-        first.new_chains = new_chains;
-        first.expired_chains = expired_chains;
-    }
-    // If multiple records emit at once, only the first carries
-    // the lifecycle markers — Stage 5's recv loop applies them
-    // before reading allele observations, so attaching to the
-    // first record is enough.
-}
-
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------

@@ -36,7 +36,7 @@ pub(crate) mod varint;
 pub mod writer;
 
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 
 // Public re-exports keep the typed error API reachable for
 // downstream code without naming the (now-`pub(crate)`) `errors`

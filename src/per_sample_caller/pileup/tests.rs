@@ -6,8 +6,6 @@
 //! overlap, phase-chain lifecycle markers, eager closure, etc.
 
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread;
 
 use super::CigarOp;
 use super::MateRole;
@@ -111,8 +109,6 @@ pub fn paired_snp_reads(
 }
 
 /// Drive `run` on a fixed input list, collecting emitted records.
-/// Stage 2 runs on a separate thread per spec; we mirror that
-/// shape here to exercise the channel emission path properly.
 pub fn drive_walker(reads: Vec<PreparedRead>, ref_fetcher: MockFasta) -> Vec<super::PileupRecord> {
     drive_walker_with_summary(reads, ref_fetcher).0
 }
@@ -134,23 +130,11 @@ pub fn drive_walker_with_config(
     ref_fetcher: MockFasta,
     config: &WalkerConfig,
 ) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
-    let (tx, rx) = mpsc::sync_channel::<super::PileupRecord>(64);
-    let collector = thread::spawn(move || {
-        let mut out = Vec::new();
-        while let Ok(r) = rx.recv() {
-            out.push(r);
-        }
-        out
-    });
-    // Mi15: drop `tx` before joining the collector and before
-    // unwrapping the walker result. This guarantees the receiver
-    // wakes (channel closed) regardless of whether `run` returned
-    // Ok or Err, so the collector join is panic-resilient even
-    // under `panic=abort`.
-    let result = run(reads, &ref_fetcher, &tx, config);
-    drop(tx);
-    let records = collector.join().expect("collector thread panicked");
-    let summary = result.expect("walker run failed");
+    let mut walker = run(reads, &ref_fetcher, config);
+    let records: Vec<super::PileupRecord> = (&mut walker)
+        .map(|r| r.expect("walker yielded error"))
+        .collect();
+    let summary = walker.summary();
     (records, summary)
 }
 
@@ -701,10 +685,7 @@ fn out_of_order_input_is_a_hard_error() {
     let fa = MockFasta::new("ACGTACGTAC");
     let r1 = snp_read("r1", 5, b"ACG", &[30; 3]);
     let r2 = snp_read("r2", 1, b"ACG", &[30; 3]); // before r1 — invalid
-    let (tx, _rx) = mpsc::sync_channel::<super::PileupRecord>(64);
-    let result = run(vec![r1, r2], &fa, &tx, &WalkerConfig::default());
-    assert!(result.is_err());
-    let err = result.unwrap_err();
+    let err = first_walker_error(vec![r1, r2], fa);
     let msg = err.to_string();
     assert!(msg.contains("out-of-order"), "got: {msg}");
 }
@@ -725,10 +706,8 @@ fn chromosome_id_regression_is_a_hard_error() {
     r1.chrom_id = 1;
     let mut r2 = snp_read("b", 1, b"AC", &[30; 2]);
     r2.chrom_id = 0;
-    let (tx, _rx) = mpsc::sync_channel::<super::PileupRecord>(64);
-    let result = run(vec![r1, r2], &fa, &tx, &WalkerConfig::default());
-    assert!(result.is_err(), "chrom_id 1 → 0 must fail as out-of-order");
-    let msg = result.unwrap_err().to_string();
+    let err = first_walker_error(vec![r1, r2], fa);
+    let msg = err.to_string();
     assert!(
         msg.contains("out-of-order"),
         "error message should reference out-of-order semantics; got: {msg}",
@@ -1008,25 +987,20 @@ fn g1_walker_drops_match_observations_past_adaptor_boundary() {
 // M14–M17 of `ia/reviews/pileup_2026-05-11.md`: every `WalkerError`
 // variant must have a regression test pinning the exact variant
 // returned. Without these, a swallowed or mis-mapped error could
-// silently degrade to `Ok(())` (data loss) or to the wrong variant
-// (operator triage misled).
+// silently degrade to `None` / `Ok(())` (data loss) or to the wrong
+// variant (operator triage misled).
+//
+// (The pre-iterator `run_returns_channel_closed_when_receiver_dropped_mid_stream`
+// regression has been removed: the pull-shape walker no longer
+// owns or sends through a channel, and the `ChannelClosed` variant
+// is gone.)
 
-#[test]
-fn run_returns_channel_closed_when_receiver_dropped_mid_stream() {
-    // M14. Drop the receiver before the walker runs — every send
-    // fails with SendError, which the walker maps to ChannelClosed.
-    let fa = MockFasta::new("ACGTACGT");
-    let reads: Vec<_> = (0..4u32)
-        .map(|i| snp_read(&format!("r{i}"), 1, b"ACGTACGT", &[30; 8]))
-        .collect();
-    let (tx, rx) = mpsc::sync_channel::<super::PileupRecord>(1);
-    drop(rx);
-    let err = super::run(reads, &fa, &tx, &WalkerConfig::default())
-        .expect_err("must propagate channel closure");
-    assert!(
-        matches!(err, super::WalkerError::ChannelClosed { .. }),
-        "got {err:?}",
-    );
+/// Iterate the walker until it yields its first error and return
+/// it. Panics if the walker exhausts without erroring.
+fn first_walker_error(reads: Vec<PreparedRead>, fa: MockFasta) -> super::WalkerError {
+    run(reads, &fa, &WalkerConfig::default())
+        .find_map(|r| r.err())
+        .expect("walker did not surface any error")
 }
 
 #[test]
@@ -1047,8 +1021,7 @@ fn zero_ref_span_input_is_a_hard_error() {
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
-    let (tx, _rx) = mpsc::sync_channel(64);
-    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default()).expect_err("must error");
+    let err = first_walker_error(vec![r], fa);
     assert!(
         matches!(err, super::WalkerError::ZeroRefSpan { .. }),
         "got {err:?}",
@@ -1078,14 +1051,7 @@ fn open_record_widening_past_max_record_span_errors() {
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
-    let (tx, rx) = mpsc::sync_channel(64);
-    // Spawn a draining collector so the bounded channel doesn't
-    // block the walker before the error path fires.
-    let drain = thread::spawn(move || while rx.recv().is_ok() {});
-    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
-        .expect_err("must trip MAX_RECORD_SPAN");
-    drop(tx);
-    drain.join().unwrap();
+    let err = first_walker_error(vec![r], fa);
     match err {
         super::WalkerError::RecordTooWide { cap, .. } => {
             assert_eq!(cap, super::DEFAULT_MAX_RECORD_SPAN);
@@ -1115,9 +1081,7 @@ fn admit_rejects_seq_shorter_than_cigar_consumes() {
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
-    let (tx, _rx) = mpsc::sync_channel(64);
-    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
-        .expect_err("must reject malformed read");
+    let err = first_walker_error(vec![r], fa);
     match err {
         super::WalkerError::MalformedRead { reason, .. } => {
             assert!(
@@ -1145,9 +1109,7 @@ fn admit_rejects_seq_bq_length_mismatch() {
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
-    let (tx, _rx) = mpsc::sync_channel(64);
-    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
-        .expect_err("must reject seq/bq mismatch");
+    let err = first_walker_error(vec![r], fa);
     match err {
         super::WalkerError::MalformedRead { reason, .. } => {
             assert!(
@@ -1178,9 +1140,7 @@ fn admit_rejects_cigar_consuming_more_read_bases_than_seq_provides() {
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
     };
-    let (tx, _rx) = mpsc::sync_channel(64);
-    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
-        .expect_err("must reject CIGAR/seq mismatch");
+    let err = first_walker_error(vec![r], fa);
     match err {
         super::WalkerError::MalformedRead { reason, .. } => {
             assert!(
@@ -1200,9 +1160,7 @@ fn fasta_fetch_failure_propagates_as_walker_error_fasta() {
     // the correct locus.
     let fa = MockFasta::new("AC");
     let r = snp_read("r", 1, b"ACGT", &[30; 4]);
-    let (tx, _rx) = mpsc::sync_channel(64);
-    let err = super::run(vec![r], &fa, &tx, &WalkerConfig::default())
-        .expect_err("must surface fasta error");
+    let err = first_walker_error(vec![r], fa);
     match err {
         super::WalkerError::Fasta {
             chrom_id,
@@ -1215,6 +1173,32 @@ fn fasta_fetch_failure_propagates_as_walker_error_fasta() {
         }
         other => panic!("expected Fasta, got {other:?}"),
     }
+}
+
+#[test]
+fn walker_iterator_returns_none_after_yielding_error() {
+    // The iterator's terminal-on-first-error contract: once `next()`
+    // returns `Err`, every subsequent call returns `None`. Mirrors
+    // the previous push-shape behaviour, where `run` returned `Err`
+    // and stopped emitting at the same moment.
+    let fa = MockFasta::new("AC"); // too short to satisfy a 4-base read.
+    let r = snp_read("r", 1, b"ACGT", &[30; 4]);
+    let mut walker = run(vec![r], &fa, &WalkerConfig::default());
+    // The error may be preceded by zero or more successful records
+    // (depending on the order of fasta fetch vs. walker_pos). Drive
+    // until we see the first Err, then assert exhaustion.
+    let mut saw_error = false;
+    for item in &mut walker {
+        if item.is_err() {
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "expected the walker to surface a Fasta error");
+    assert!(
+        walker.next().is_none(),
+        "walker must return None after its first error",
+    );
 }
 
 // ---------------------------------------------------------------------
