@@ -158,17 +158,15 @@ impl ActiveReads {
                 // `OpenPileupRecord.folded_reads`, not by per-read
                 // state here — the lazy CIGAR cursor is stateless.
                 //
-                // Order matters: give up the still-pending partner
-                // reservation (if any) **before** releasing the
-                // read's own active-count slot. An orphan first
-                // mate bumped `active_count` twice (once for itself,
-                // once anticipating the partner); these two calls
-                // together collapse those bumps back to zero in this
-                // single step.
+                // The `pending_mates` entry (if any) stays alive
+                // here: pair tracking is governed by
+                // `mate_lookup_window`, not by active-set
+                // residence. The slot allocator's
+                // `evict_stale_pending` walks the map on every
+                // subsequent `allocate_for_read` and drops entries
+                // whose `seen_at` is past the window.
                 let slot = self.reads[i].chain_slot_id;
-                let qname = self.reads[i].read.qname.clone();
                 let chrom_id = self.reads[i].read.chrom_id;
-                slots.release_pending_partner_ref_if_present(&qname, chrom_id, walker_pos)?;
                 slots.release_slot(slot, chrom_id, walker_pos)?;
                 self.swap_remove(i);
             }
@@ -188,16 +186,11 @@ impl ActiveReads {
     ) -> Result<(), WalkerError> {
         while let Some(active) = self.reads.pop() {
             // The secondary index is rebuilt fresh after a flush.
-            // Same partner-release order as `expire_passed` — handles
-            // the orphan-first-mate case at mid-stream chromosome
-            // flush, where the orphan is still in the active set when
-            // the chromosome changes (M1).
+            // `pending_mates` is cleaned up by the slot allocator's
+            // `reset()` call (which `walker::flush_chromosome_into`
+            // makes right after this method); we don't touch it
+            // here.
             let chrom_id = active.read.chrom_id;
-            slots.release_pending_partner_ref_if_present(
-                &active.read.qname,
-                chrom_id,
-                walker_pos,
-            )?;
             slots.release_slot(active.chain_slot_id, chrom_id, walker_pos)?;
         }
         self.by_read_id.clear();

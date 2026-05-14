@@ -43,6 +43,15 @@ pub enum WalkerError {
     ChainIdSpaceExhausted { chrom_id: u32, pos: u32 },
 
     #[error(
+        "pending-mates map exceeded its defensive cap (cap={cap}) at \
+         chrom_id={chrom_id} pos={pos}; this usually means the input has \
+         a pathologically high orphan-first-mate rate (every paired read \
+         flagged FirstOfPair with no SecondOfPair ever arriving). Verify \
+         the BAM's pairing flags or pre-filter the affected region."
+    )]
+    PendingMatesExhausted { cap: usize, chrom_id: u32, pos: u32 },
+
+    #[error(
         "open record reference span exceeded MAX_RECORD_SPAN: anchor (chrom_id={chrom_id}, \
          pos={pos}) reached span {span} (cap={cap}); upstream filter should have rejected the \
          underlying read"

@@ -349,48 +349,69 @@ fn uncovered_positions_produce_no_records() {
 
 #[test]
 fn paired_mates_with_overlapping_positions_share_chain_id() {
-    // Mate pair tracking kicks in only while the first mate's
-    // `pending_mates` entry is still alive. The active-set
-    // expiry path clears the entry when the first mate exits;
-    // mates whose second-mate arrival happens *after* the first
-    // mate has expired therefore each get distinct chain ids.
-    //
-    // This test pins the in-flight case: both mates start at the
-    // same position, so the second mate admits before the first
-    // mate's `pending_mates` entry can be released, and both
-    // collapse onto the same chain id.
+    // Both mates start at the same position; the second admits
+    // while the first is still in the active set. They collapse
+    // onto the same chain id via the `pending_mates` hash lookup.
     let fa = MockFasta::new("AAAAA");
     let (m1, m2) = paired_snp_reads("pair", 1, 1, b"AAA", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
-    // Both mates land in the REF bucket at pos 1 with the same id.
     assert_eq!(rec1.alleles[0].chain_slots, vec![0u64]);
 }
 
 #[test]
-fn paired_mates_with_gap_past_first_mate_get_distinct_chain_ids() {
-    // Mate-pair sharing depends on `pending_mates` still holding
-    // the first mate's entry when the second mate arrives. With
-    // m1 at pos 1-3 and m2 at pos 10, m1 expires from the active
-    // set at walker_pos=4, which drops m1's `pending_mates` entry
-    // (today's behaviour — the entry is tied to active-set
-    // lifetime, not to `mate_lookup_window`). When m2 arrives at
-    // pos 10 it cannot find m1's entry and mints a fresh chain id.
+fn paired_mates_within_lookup_window_share_chain_id_across_active_set_exit() {
+    // The first mate exits the active set well before the second
+    // mate admits. Mate-pair tracking is governed by
+    // `mate_lookup_window`, not by active-set residence — the
+    // `pending_mates` entry stays alive across the first mate's
+    // exit, and the second mate's later arrival (still within the
+    // window) reuses the first mate's chain id.
     //
-    // This is a pre-existing wart in the mate-tracking lifetime
-    // rule, not a regression from the unique-id refactor — the
-    // old recycling design merely *hid* it by handing out slot 0
-    // again via the free-list after m1's release. With unique ids
-    // the truth is visible. See follow-up note in
-    // `ia/feature_implementation_plans/unique_chain_ids.md`
-    // §"Out-of-scope follow-ups".
+    // Fixture: m1 covers pos 1-3, m2 admits at pos 10. m1's exit
+    // at walker_pos=4 must *not* drop the pending entry; the
+    // 10 → 1 = 9 bp separation is well inside the default
+    // `mate_lookup_window` of 10 000 bp.
     let fa = MockFasta::new("AAAAAAAAAAAAAAAAAAAA");
     let (m1, m2) = paired_snp_reads("pair", 1, 10, b"AAA", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
     let rec10 = records.iter().find(|r| r.pos == 10).unwrap();
     assert_eq!(rec1.alleles[0].chain_slots, vec![0u64]);
-    assert_eq!(rec10.alleles[0].chain_slots, vec![1u64]);
+    assert_eq!(
+        rec10.alleles[0].chain_slots,
+        vec![0u64],
+        "the two mates of a single pair must share one chain id"
+    );
+}
+
+#[test]
+fn paired_mates_separated_beyond_lookup_window_get_distinct_chain_ids() {
+    // When the second mate arrives more than `mate_lookup_window`
+    // bp past the first mate's `alignment_start`, the slot
+    // allocator's `evict_stale_pending` walk has dropped the
+    // pending entry by then. The second mate cannot match, mints
+    // a fresh chain id, and is therefore treated as a separate
+    // molecule. This is correct: when the pair is that far apart,
+    // we have no read-level evidence that they're the same
+    // physical fragment within our trustworthy-pairing window.
+    //
+    // Fixture: m1 at pos 1, m2 at pos 12_001. With default
+    // `mate_lookup_window = 10_000`, m2 is past the eviction
+    // threshold (1 + 10_000 + 1 = 10 002 first hits it).
+    let n = 12_010_usize;
+    let fa = MockFasta::new(&"A".repeat(n));
+    let (m1, m2) = paired_snp_reads("pair", 1, 12_001, b"AAA", &[30; 3]);
+    let records = drive_walker(vec![m1, m2], fa);
+    let rec_a = records.iter().find(|r| r.pos == 1).unwrap();
+    let rec_b = records.iter().find(|r| r.pos == 12_001).unwrap();
+    assert_eq!(rec_a.alleles[0].chain_slots, vec![0u64]);
+    assert_eq!(
+        rec_b.alleles[0].chain_slots,
+        vec![1u64],
+        "beyond the lookup window the pair-tracking entry has been evicted; \
+         the second mate gets a fresh id"
+    );
 }
 
 #[test]

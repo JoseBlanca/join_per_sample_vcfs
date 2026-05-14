@@ -43,6 +43,21 @@ pub type SlotId = u64;
 /// [`WalkerConfig::max_active_slots`]: super::WalkerConfig::max_active_slots
 pub const DEFAULT_MAX_ACTIVE_SLOTS: u32 = 4096;
 
+/// Hard cap on the number of entries the `pending_mates` map will
+/// hold at any time. Exceeding it surfaces as
+/// [`WalkerError::PendingMatesExhausted`].
+///
+/// The map's natural bound under `evict_stale_pending` is
+/// `(orphans per bp) × mate_lookup_window`. At realistic 30× coverage
+/// with ~5 % orphan rate and a 10 kb window, peak is ~100 entries.
+/// Even on pessimistic 300× coverage with 50 % orphans the peak sits
+/// around 10 k. This cap (10 k) catches truly malformed inputs (e.g.
+/// a BAM where every paired read carries the FirstOfPair flag and no
+/// second mate ever arrives) without firing on real data. Bumping
+/// the constant if `mate_lookup_window` is configured much higher
+/// for long-insert libraries is a one-line change.
+pub const MAX_PENDING_MATES: usize = 10_000;
+
 /// Fraction of the active-read cap at which the allocator emits a
 /// one-shot soft warning. Lets the user spot a pathological-coverage
 /// region before the run trips the cap.
@@ -94,6 +109,11 @@ pub struct SlotAllocator {
     /// Per-instance pending-mate lookup window, mirrors
     /// `WalkerConfig::mate_lookup_window`.
     mate_lookup_window: u32,
+    /// Per-instance pending-mates cap. Initialised from
+    /// [`MAX_PENDING_MATES`]; tests can lower it via the
+    /// `#[cfg(test)]` constructor so the cap path is reachable
+    /// without inserting 10 000 qnames.
+    pending_mates_cap: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -129,6 +149,7 @@ impl SlotAllocator {
             high_water_warned: false,
             max_active_reads,
             mate_lookup_window,
+            pending_mates_cap: MAX_PENDING_MATES,
         }
     }
 
@@ -140,6 +161,17 @@ impl SlotAllocator {
     pub(crate) fn with_next_id_for_testing(start: u64) -> Self {
         Self {
             next_id: start,
+            ..Self::new()
+        }
+    }
+
+    /// Test-only constructor that lowers the pending-mates cap to
+    /// `cap` so the `PendingMatesExhausted` path is reachable
+    /// without inserting `MAX_PENDING_MATES` qnames.
+    #[cfg(test)]
+    pub(crate) fn with_pending_mates_cap_for_testing(cap: usize) -> Self {
+        Self {
+            pending_mates_cap: cap,
             ..Self::new()
         }
     }
@@ -219,6 +251,21 @@ impl SlotAllocator {
         self.maybe_warn_high_water(read.chrom_id, read.alignment_start);
 
         if read.mate_role.is_paired() {
+            // Defensive cap on the pending-mates map size. The
+            // `evict_stale_pending` call at the top of every
+            // `allocate_for_read` already bounds the map via the
+            // mate-lookup window, so under realistic workloads
+            // this check never fires. It catches truly malformed
+            // inputs (every paired read flagged FirstOfPair with
+            // no SecondOfPair ever arriving) before they consume
+            // meaningful memory.
+            if self.pending_mates.len() >= self.pending_mates_cap {
+                return Err(WalkerError::PendingMatesExhausted {
+                    cap: self.pending_mates_cap,
+                    chrom_id: read.chrom_id,
+                    pos: read.alignment_start,
+                });
+            }
             self.pending_mates.insert(
                 read.qname.clone(),
                 PendingMate {
@@ -270,35 +317,6 @@ impl SlotAllocator {
             });
         }
         self.active_count -= 1;
-        Ok(())
-    }
-
-    /// If `qname` still has a `pending_mates` entry — meaning this
-    /// read was admitted as a first mate and its partner never
-    /// arrived — drop the entry and count the orphan as a
-    /// `mate_lookup_eviction`.
-    ///
-    /// In the unique-`u64`-chain-id design `active_count` is bumped
-    /// once per actual admitted read (not once per anticipated
-    /// pair), so this helper only cleans up the lingering
-    /// `pending_mates` map entry. The first mate's own
-    /// `release_slot` will decrement `active_count`; no second
-    /// decrement is owed.
-    ///
-    /// No-op when `qname` is solo (never registered) or partnered
-    /// (the second-mate path consumed the entry on partner arrival).
-    ///
-    /// `chrom_id` and `pos` are accepted for API compatibility with
-    /// the previous signature but unused here.
-    pub fn release_pending_partner_ref_if_present(
-        &mut self,
-        qname: &Arc<str>,
-        _chrom_id: u32,
-        _pos: u32,
-    ) -> Result<(), WalkerError> {
-        if self.pending_mates.remove(qname).is_some() {
-            self.counters.mate_lookup_evictions += 1;
-        }
         Ok(())
     }
 
@@ -568,52 +586,33 @@ mod tests {
     }
 
     #[test]
-    fn release_pending_partner_releases_orphan_first_mate() {
+    fn pending_mate_entry_survives_first_mate_release_for_window_matching() {
+        // Pair-tracking is governed by `mate_lookup_window`, not by
+        // active-set residence. After the first mate exits the
+        // active set, its `pending_mates` entry must survive so a
+        // later second-mate arrival within the window can still
+        // match.
         let mut a = SlotAllocator::new();
-        let m1 = make_read("orphan", MateRole::FirstOfPair, 100);
-        let (slot, _) = a.allocate_for_read(&m1).unwrap();
-        // First-mate path bumped active_count once (anticipating the
-        // partner). After partner-release the reservation is gone.
-        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100)
-            .unwrap();
-        // The first mate itself then exits; this releases its own slot.
-        a.release_slot(slot, 0, 100).unwrap();
-        assert_eq!(a.active_count, 0, "orphan slot fully released");
-        assert_eq!(a.counters().mate_lookup_evictions, 1);
-    }
-
-    #[test]
-    fn release_pending_partner_is_noop_for_solo_read() {
-        let mut a = SlotAllocator::new();
-        let solo = make_read("solo", MateRole::Solo, 100);
-        let (slot, _) = a.allocate_for_read(&solo).unwrap();
-        a.release_pending_partner_ref_if_present(&solo.qname, 0, 100)
-            .unwrap();
-        a.release_slot(slot, 0, 100).unwrap();
+        let m1 = make_read("pair", MateRole::FirstOfPair, 100);
+        let (slot1, _) = a.allocate_for_read(&m1).unwrap();
+        // First mate exits the active set.
+        a.release_slot(slot1, 0, 200).unwrap();
         assert_eq!(a.active_count, 0);
-        assert_eq!(a.counters().mate_lookup_evictions, 0);
-    }
-
-    #[test]
-    fn release_pending_partner_is_noop_for_partnered_pair() {
-        let mut a = SlotAllocator::new();
-        let m1 = make_read("p", MateRole::FirstOfPair, 100);
-        let m2 = make_read("p", MateRole::FirstOfPair, 200);
-        let (slot, _) = a.allocate_for_read(&m1).unwrap();
-        let _ = a.allocate_for_read(&m2).unwrap();
+        assert_eq!(
+            a.pending_mates.len(),
+            1,
+            "pending entry must outlive the first mate's release"
+        );
+        // Second mate arrives later (within the window); reuses
+        // the first mate's chain id.
+        let m2 = make_read("pair", MateRole::SecondOfPair, 200);
+        let (slot2, partner) = a.allocate_for_read(&m2).unwrap();
+        assert_eq!(slot1, slot2, "mates share the same chain id");
+        assert_eq!(partner, Some(0), "second-mate path saw the first mate");
         assert!(
             a.pending_mates.is_empty(),
-            "second-mate path consumed the pending entry",
+            "second-mate consumption clears the pending entry"
         );
-
-        a.release_pending_partner_ref_if_present(&m1.qname, 0, 100)
-            .unwrap();
-        a.release_slot(slot, 0, 100).unwrap();
-        a.release_pending_partner_ref_if_present(&m2.qname, 0, 100)
-            .unwrap();
-        a.release_slot(slot, 0, 100).unwrap();
-        assert_eq!(a.active_count, 0);
-        assert_eq!(a.counters().mate_lookup_evictions, 0);
     }
 
     // --- Overflow guard ------------------------------------------------
@@ -663,5 +662,50 @@ mod tests {
             matches!(err, WalkerError::ChainIdSpaceExhausted { .. }),
             "got {err:?}"
         );
+    }
+
+    // --- Pending-mates cap --------------------------------------------
+
+    #[test]
+    fn allocator_errors_when_pending_mates_cap_exceeded() {
+        // Lower the pending-mates cap to a tiny number via the
+        // test-only constructor so the cap path is reachable without
+        // 10 000 qnames. With cap=2, the third orphan first-mate
+        // admission must fail with PendingMatesExhausted.
+        let mut a = SlotAllocator::with_pending_mates_cap_for_testing(2);
+        let r0 = make_read("a", MateRole::FirstOfPair, 100);
+        let r1 = make_read("b", MateRole::FirstOfPair, 101);
+        a.allocate_for_read(&r0).unwrap();
+        a.allocate_for_read(&r1).unwrap();
+        assert_eq!(a.pending_mates.len(), 2);
+        let r2 = make_read("c", MateRole::FirstOfPair, 102);
+        let err = a
+            .allocate_for_read(&r2)
+            .expect_err("must surface PendingMatesExhausted at the cap");
+        match err {
+            WalkerError::PendingMatesExhausted { cap, chrom_id, pos } => {
+                assert_eq!(cap, 2);
+                assert_eq!(chrom_id, 0);
+                assert_eq!(pos, 102);
+            }
+            other => panic!("expected PendingMatesExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_mates_cap_does_not_block_second_mate_arrival() {
+        // The cap check is on `pending_mates.insert`. A second-mate
+        // arrival takes the existing-entry path (consumes the entry,
+        // does not insert), so the cap does not fire there — even
+        // with `pending_mates.len() == cap`, a second mate can still
+        // resolve cleanly.
+        let mut a = SlotAllocator::with_pending_mates_cap_for_testing(1);
+        let r0 = make_read("pair", MateRole::FirstOfPair, 100);
+        a.allocate_for_read(&r0).unwrap();
+        assert_eq!(a.pending_mates.len(), 1);
+        let r1 = make_read("pair", MateRole::SecondOfPair, 200);
+        a.allocate_for_read(&r1)
+            .expect("second-mate path must not hit the cap");
+        assert!(a.pending_mates.is_empty());
     }
 }
