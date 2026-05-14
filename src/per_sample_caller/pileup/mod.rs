@@ -125,10 +125,14 @@ pub struct WalkerConfig {
     /// entry before evicting it and treating the first mate as
     /// solo. Defaults to [`DEFAULT_MATE_LOOKUP_WINDOW`].
     pub mate_lookup_window: u32,
-    /// Hard cap on the number of concurrently-active phase-chain
-    /// slots. Exceeding it is a hard error
-    /// ([`WalkerError::SlotExhausted`]) rather than silent slot
-    /// reuse. Defaults to [`DEFAULT_MAX_ACTIVE_SLOTS`].
+    /// Hard cap on the number of concurrently-active reads.
+    /// Exceeding it is a hard error
+    /// ([`WalkerError::ActiveReadsExhausted`]) rather than silent
+    /// memory blow-up on pathologically deep regions. Defaults to
+    /// [`DEFAULT_MAX_ACTIVE_SLOTS`]. The field name keeps the
+    /// `slots` history for backwards-compatible config callers;
+    /// under the unique-`u64`-chain-id design it bounds concurrent
+    /// active reads, not a slot id namespace.
     pub max_active_slots: u32,
 }
 
@@ -391,35 +395,18 @@ pub struct AlleleObservation {
 /// REF — the walker invariant — so `ref_span` is derivable as
 /// `alleles[0].seq.len()` and is not stored separately.
 ///
-/// # Lifecycle markers (`new_chains`, `expired_chains`)
-///
-/// Carry the phase-chain slot ids that started or ended since the
-/// previous **closure step** (not the previous record). A closure
-/// step is one walker tick during which records whose footprint is
-/// fully behind the walker are drained and emitted; it may emit 0,
-/// 1, or many records. When a step emits more than one — common
-/// when a wide deletion at an earlier anchor unblocks several
-/// narrower records that were waiting behind it — the whole batch
-/// of marks is attached to the **first emitted record of that
-/// step**, and the trailing records carry empty `new_chains` and
-/// `expired_chains`. This is sufficient because Stage 2 applies
-/// the marks before reading each record's allele observations:
-/// processing records in order with the running rule
-/// `current ∪= rec.new_chains; current -= rec.expired_chains`
-/// gives the right `current` set at every record, whether the
-/// marks landed on this record or on an earlier one in the same
-/// batch.
-///
-/// Both lists are deduplicated and may appear in any order; Stage
-/// 2 may reorder them.
+/// Each `AlleleObservation`'s `chain_slots` field references chain
+/// ids minted by the walker's slot allocator. Chain ids are
+/// unique-per-`.psp`-file `u64` values; there is no recycling, no
+/// active-set bookkeeping, and no per-record lifecycle markers.
+/// Two allele observations sharing a chain id came from the same
+/// read or read-pair in this sample.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PileupRecord {
     pub chrom_id: u32,
     /// 1-based anchor position.
     pub pos: u32,
-    pub new_chains: Vec<SlotId>,
-    pub expired_chains: Vec<SlotId>,
     /// At least one entry; `alleles[0]` is always REF.
     pub alleles: Vec<AlleleObservation>,
 }
@@ -435,18 +422,10 @@ impl PileupRecord {
     /// The walker builds records via struct-update syntax internally
     /// because [`PileupRecord`] is `#[non_exhaustive]`; this `new` is
     /// the supported entry point from outside the crate.
-    pub fn new(
-        chrom_id: u32,
-        pos: u32,
-        new_chains: Vec<SlotId>,
-        expired_chains: Vec<SlotId>,
-        alleles: Vec<AlleleObservation>,
-    ) -> Self {
+    pub fn new(chrom_id: u32, pos: u32, alleles: Vec<AlleleObservation>) -> Self {
         Self {
             chrom_id,
             pos,
-            new_chains,
-            expired_chains,
             alleles,
         }
     }

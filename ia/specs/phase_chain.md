@@ -505,32 +505,30 @@ is to say: roughly per-position depth itself. At 30×, that is ~30;
 at 2-10× (the project target), 5-15. This bound is what makes the
 slot encoding cheap, and is the subject of the next section.
 
-## 6. The slot encoding, with a worked example
+## 6. The chain-id encoding, with a worked example
 
-Stage 1 assigns each chain a **slot id** — a small integer (`u8`
-in practice; `u16` if we ever want to be defensive). Slots are
-recycled: when a chain ends and a new one starts, the new chain
-can occupy a freed slot. To prevent consumers from confusing the
-old chain with the new one in a recycled slot, every per-position
-record carries two **lifecycle markers**:
+> **Updated 2026-05-14:** earlier drafts of this section described a
+> recycled-`u8`-with-lifecycle-markers encoding. That design was
+> replaced with the simpler **unique-per-`.psp`-file `u64`**
+> design specified below. Rationale and migration notes:
+> [ia/feature_implementation_plans/unique_chain_ids.md](../feature_implementation_plans/unique_chain_ids.md).
 
-- `new_chains`: slot ids that started since the previous emitted
-  position (a chain begins when its read enters the active set).
-- `expired_chains`: slot ids that ended since the previous
-  emitted position (a chain ends when its read or pair has fully
-  left the active set).
-
-The conceptual model is the same as VCF's `|` / `/` phase markers:
-within an open phase block, the slot id is the linkage; the
-markers declare where blocks open and close.
+Stage 1 assigns each chain a **chain id** — a monotonically
+allocated `u64` that is never reused within the lifetime of a
+`.psp` file. Two allele observations sharing a chain id therefore
+came from the same read or read-pair *in this sample*; there is no
+ambiguity from recycling, no `new_chains` / `expired_chains`
+lifecycle markers, and no active-set bookkeeping the reader needs
+to maintain. Overflow at `u64::MAX + 1` is caught and surfaced as
+`WalkerError::ChainIdSpaceExhausted`; the ceiling is
+unreachable on any realistic workload (~10¹⁹ chains per file vs.
+~10⁹ reads per deep-cov human WGS).
 
 ### Per-record shape
 
 ```
 record at position p:
     delta_pos:        distance to previous record
-    new_chains:       [slot id, ...]
-    expired_chains:   [slot id, ...]
     alleles:
       [
         { sequence: "A",
@@ -544,9 +542,9 @@ record at position p:
       ]
 ```
 
-`chain_slots` per allele is the small list of slots that
+`chain_slots` per allele is the small list of chain ids that
 contributed observations of that allele at this position. It is
-compact in practice (typically 1-3 entries; bounded by depth).
+compact in practice (typically 1–3 entries; bounded by depth).
 
 ### A trace through the toy example
 
@@ -560,25 +558,21 @@ read R4:  starts at 101, ends at 103  (covers 101, 102, 103) — SNP+DEL on the 
 read R5:  starts at 102, ends at 103  (covers 102, 103) — REF
 ```
 
-Stage 1 walks the merge in coordinate order. Slot allocation:
+Stage 1 walks the merge in coordinate order. Chain-id allocation:
 
 ```
 position 100:
-  R1 enters active set → assigned slot 0
-  R2 enters active set → assigned slot 1
+  R1 enters active set → assigned chain id 0
+  R2 enters active set → assigned chain id 1
   emitted record:
-    new_chains:     [0, 1]
-    expired_chains: []
     alleles:
       { "A", num_obs=2, chain_slots=[0, 1] }      # both reads see REF "A"
 
 position 101:
-  R3 enters active set → assigned slot 2
-  R4 enters active set → assigned slot 3
+  R3 enters active set → assigned chain id 2
+  R4 enters active set → assigned chain id 3
   R1, R2 still active.
   emitted record:
-    new_chains:     [2, 3]
-    expired_chains: []
     alleles:
       { "G", num_obs=2, chain_slots=[0, 1] },     # R1 and R2 saw REF "G"
       { "T", num_obs=2, chain_slots=[2, 3] }      # R3 and R4 saw the SNP
@@ -589,37 +583,24 @@ position 101:
   (i.e. the SNP and DEL allele at 101 are *separate* alleles in
   the same record, both supported by chains 2 and 3.)
 
-  R1's last covered position is 101; R1 expires *after* this
-  record is emitted (the active set walker only knows R1 has
-  ended once it advances past 101).
-
 position 102:
-  R5 enters active set → assigned slot 4 (slot 0 is freed by R1's
-                                          expiration but we don't
-                                          reuse it within the same
-                                          tick for clarity; the
-                                          algorithm could also
-                                          recycle slot 0 here)
-  R1 leaves active set (already past its end).
+  R5 enters active set → assigned chain id 4 (id 0 is never
+                                              reused, no matter
+                                              how long ago R1
+                                              expired)
+  R1 leaves active set.
   R2, R3, R4 still active.
   emitted record:
-    new_chains:     [4]
-    expired_chains: [0]
     alleles:
       { "T", num_obs=2, chain_slots=[1, 4] }      # R2 and R5 saw REF "T"
-                                                  # R3, R4 do not contribute here:
-                                                  # the deletion already accounted for them
-                                                  # at the anchor position 101.
 
 position 103:
   R2 leaves active set after this record.
   R3, R4, R5 still active here.
   emitted record:
-    new_chains:     []
-    expired_chains: []                            # nothing has *just* expired yet
     alleles:
-      { "C", num_obs=3, chain_slots=[1, 4, ?] }
-      # R5 contributes; R3 and R4 do not (still inside their deletion span).
+      { "C", num_obs=2, chain_slots=[1, 4] }      # R2 and R5 contribute
+      # R3 and R4 do not contribute here — still inside their deletion span.
 ```
 
 The crucial observation is in the record at position 101:
@@ -633,22 +614,15 @@ this sample, the SNP and the DEL co-occur on chains 2 and 3,
 i.e., on two distinct physical molecules. Stage 5 reads this
 directly — it does not need to assemble haplotypes.
 
-### Why the markers are needed
+### Why there are no lifecycle markers
 
-Slot 0 is freed when R1 expires and could be reused later — say a
-new read R6 starts at position 200 and gets assigned slot 0.
-Without lifecycle markers, a downstream consumer scanning records
-might see "slot 0 at position 100" and "slot 0 at position 200"
-and incorrectly conclude they came from the same molecule. The
-`expired_chains: [0]` marker between them tells the consumer:
-"slot 0's previous chain has ended; any future appearance of
-slot 0 is a new chain." That cleanly separates the two
-incarnations of slot 0.
-
-This is exactly the role `|` plays in VCF: within a phase block,
-positions linked by `|` share the genotype-phase-set ID; the
-opening/closing of phase blocks demarcates which `|`-linked
-positions are in the same phase set.
+Recycled slot ids would need a `new_chains` / `expired_chains`
+marker pair on every record to keep distinct chain incarnations
+distinguishable in a recycled slot id namespace — the role `|` /
+`/` play in VCF. With unique `u64` ids the namespace is large
+enough to retire that complexity: chain id 0 never re-appears
+after R1 expires, so no marker is needed to disambiguate it from
+a future read.
 
 ## 7. GATK, freebayes, and our slot id, side by side
 
@@ -659,12 +633,12 @@ positions are in the same phase set.
 | Linkage source | "Variants on the same assembled haplotype" | "Alleles co-observed on the same read within the window" (per-read backpointer `readID` on each `Allele`) | "Observations from the same physical molecule" |
 | Requires direct read overlap | No (assembly can bridge gaps) | Yes (only what reads see in the window) | Yes (chain ends when the read ends) |
 | Tells you which chromosome (mat/pat) | Yes (`0\|1` vs `1\|0` via PGT) | No | No |
-| Persistence in output | Yes (PID/PGT/PS in the VCF) | No (used only during calling, then discarded) | Yes (slot ids + lifecycle markers in the `.psp`) |
-| Cost per locus | Heavy: PairHMM × #reads × #haplotypes | Light-medium: enumeration + per-window likelihood | Light: small slot table, integer comparisons |
+| Persistence in output | Yes (PID/PGT/PS in the VCF) | No (used only during calling, then discarded) | Yes (unique `u64` chain ids in the `.psp`) |
+| Cost per locus | Heavy: PairHMM × #reads × #haplotypes | Light-medium: enumeration + per-window likelihood | Light: monotonic counter, integer comparisons |
 | Behaviour at 2-10× coverage | Unreliable; assembly under-powered | Works | Works |
-| Implementation size | ~thousands of lines (de Bruijn + PairHMM) | ~hundreds of lines (the relevant linkage parts) | ~hundreds of lines (active set + slot allocator) |
-| Stored on disk per record | One PID + one PGT per phased genotype | — (linkage never reaches disk) | Two short slot lists (`new_chains`, `expired_chains`) plus a per-allele slot list |
-| Downstream consumer's work | Read PID/PGT directly per genotype | N/A — consumer never sees the linkage | Walk records; intersect slot sets between two records |
+| Implementation size | ~thousands of lines (de Bruijn + PairHMM) | ~hundreds of lines (the relevant linkage parts) | ~tens of lines (monotonic counter + pending-mates map) |
+| Stored on disk per record | One PID + one PGT per phased genotype | — (linkage never reaches disk) | A per-allele list of `u64` chain ids |
+| Downstream consumer's work | Read PID/PGT directly per genotype | N/A — consumer never sees the linkage | Walk records; intersect `chain_slots` between two records |
 
 The three approaches solve overlapping problems with very different
 trade profiles:
@@ -750,16 +724,11 @@ is the entire scope.
 
 ### How Stage 5 walks the records
 
-Sequentially, maintaining a tiny per-sample active-slot view:
+Sequentially. Under the unique-`u64`-id design there is no active
+view to maintain; each per-record `allele.chain_slots` list is
+read at face value.
 
-1. On each per-position record:
-   - Apply `expired_chains`: remove those slot ids from the
-     active view.
-   - Apply `new_chains`: add those slot ids to the active view.
-   - For each allele, read its `chain_slots` list to know which
-     active chains support that allele at this position.
-
-2. To answer "do alleles X at p₁ and Y at p₂ co-occur in sample s
+1. To answer "do alleles X at p₁ and Y at p₂ co-occur in sample s
    on the same molecule":
 
    - Walk to record at p₁; read `chain_slots` for allele X →
@@ -836,22 +805,18 @@ computes that linkage, uses it for one round of variant calling,
 and discards it. Our pipeline separates per-sample evidence
 collection from joint posterior computation, so Stage 1 has to
 keep the linkage in a form Stage 5 can consume later, possibly
-across many cohort recalls. The slot encoding does that without
-inventing a global chain-id namespace, without paying for assembly
-the way GATK does, and without any extra burden on Stage 2 beyond
-"write these small integers."
+across many cohort recalls. The unique-`u64`-id encoding does that
+without paying for assembly the way GATK does, and without any
+extra burden on Stage 2 beyond "write these integers."
 
-The on-disk encoding is small: per-record `new_chains` and
-`expired_chains` lifecycle markers plus a per-allele list of slot
+The on-disk encoding is small: a per-allele list of `u64` chain
 ids. Stage 2's job is to write the integers verbatim. Stage 5's
-job is to walk the records, maintain its own active-slot view,
-and intersect slot sets when it needs to evaluate a compound
-haplotype.
+job is to walk the records and intersect `chain_slots` between two
+records when it needs to evaluate a compound haplotype.
 
-The two design decisions that make the chain mechanism cheap and
-correct are spelled out in
+The one design decision that makes the chain mechanism cheap and
+correct is spelled out in
 [per_sample_caller.md §"Phase chain identifiers"](per_sample_caller.md):
-slot recycling bounded by lifecycle markers, and per-pair (rather
-than per-mate) chain assignment via a small in-flight QNAME map.
-This document explains the *why*; that one specifies the *what*
-in implementation terms.
+per-pair (rather than per-mate) chain assignment via a small
+in-flight QNAME map. This document explains the *why*; that one
+specifies the *what* in implementation terms.

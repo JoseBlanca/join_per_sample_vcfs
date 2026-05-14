@@ -30,10 +30,17 @@ pub enum WalkerError {
     },
 
     #[error(
-        "phase-chain slot pool exhausted (cap={cap}) at chrom_id={chrom_id} pos={pos}; \
-         consider raising --max-active-chain-slots"
+        "active-read cap exceeded (cap={cap}) at chrom_id={chrom_id} pos={pos}; \
+         consider raising --max-active-chain-slots or pre-filtering this region"
     )]
-    SlotExhausted { cap: u32, chrom_id: u32, pos: u32 },
+    ActiveReadsExhausted { cap: u32, chrom_id: u32, pos: u32 },
+
+    #[error(
+        "phase-chain id space exhausted at chrom_id={chrom_id} pos={pos}: \
+         this .psp file has reached 2^64 unique read identifiers, the per-file \
+         limit imposed by the u64 chain id encoding"
+    )]
+    ChainIdSpaceExhausted { chrom_id: u32, pos: u32 },
 
     #[error(
         "open record reference span exceeded MAX_RECORD_SPAN: anchor (chrom_id={chrom_id}, \

@@ -348,21 +348,49 @@ fn uncovered_positions_produce_no_records() {
 }
 
 #[test]
-fn paired_mates_share_chain_slot_id() {
-    // Two paired reads at non-overlapping positions, same QNAME.
-    // Both mates' contributions to their respective records should
-    // carry the same chain_slot_id. Use a reference of all 'A's
-    // and read sequences of all 'A' so every fold lands in the REF
-    // bucket — keeps the test focused on chain_slot wiring without
-    // entangling the allele-identification path.
+fn paired_mates_with_overlapping_positions_share_chain_id() {
+    // Mate pair tracking kicks in only while the first mate's
+    // `pending_mates` entry is still alive. The active-set
+    // expiry path clears the entry when the first mate exits;
+    // mates whose second-mate arrival happens *after* the first
+    // mate has expired therefore each get distinct chain ids.
+    //
+    // This test pins the in-flight case: both mates start at the
+    // same position, so the second mate admits before the first
+    // mate's `pending_mates` entry can be released, and both
+    // collapse onto the same chain id.
+    let fa = MockFasta::new("AAAAA");
+    let (m1, m2) = paired_snp_reads("pair", 1, 1, b"AAA", &[30; 3]);
+    let records = drive_walker(vec![m1, m2], fa);
+    let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
+    // Both mates land in the REF bucket at pos 1 with the same id.
+    assert_eq!(rec1.alleles[0].chain_slots, vec![0u64]);
+}
+
+#[test]
+fn paired_mates_with_gap_past_first_mate_get_distinct_chain_ids() {
+    // Mate-pair sharing depends on `pending_mates` still holding
+    // the first mate's entry when the second mate arrives. With
+    // m1 at pos 1-3 and m2 at pos 10, m1 expires from the active
+    // set at walker_pos=4, which drops m1's `pending_mates` entry
+    // (today's behaviour — the entry is tied to active-set
+    // lifetime, not to `mate_lookup_window`). When m2 arrives at
+    // pos 10 it cannot find m1's entry and mints a fresh chain id.
+    //
+    // This is a pre-existing wart in the mate-tracking lifetime
+    // rule, not a regression from the unique-id refactor — the
+    // old recycling design merely *hid* it by handing out slot 0
+    // again via the free-list after m1's release. With unique ids
+    // the truth is visible. See follow-up note in
+    // `ia/feature_implementation_plans/unique_chain_ids.md`
+    // §"Out-of-scope follow-ups".
     let fa = MockFasta::new("AAAAAAAAAAAAAAAAAAAA");
     let (m1, m2) = paired_snp_reads("pair", 1, 10, b"AAA", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
     let rec10 = records.iter().find(|r| r.pos == 10).unwrap();
-    // REF bucket on each side carries the same shared slot id.
-    assert_eq!(rec1.alleles[0].chain_slots, vec![0u16]);
-    assert_eq!(rec10.alleles[0].chain_slots, vec![0u16]);
+    assert_eq!(rec1.alleles[0].chain_slots, vec![0u64]);
+    assert_eq!(rec10.alleles[0].chain_slots, vec![1u64]);
 }
 
 #[test]
@@ -740,42 +768,76 @@ fn forward_chromosome_change_is_accepted() {
 }
 
 #[test]
-fn lifecycle_markers_appear_on_emitted_records() {
-    // Single read covering 1..3. The slot is allocated when r
-    // enters and released when r exits. Across the 3 emitted
-    // records we should see exactly one `new_chains` entry (on
-    // the first record) and exactly one `expired_chains` entry
-    // (on a later record after r has exited).
-    let fa = MockFasta::new("ACG");
-    let r = snp_read("r", 1, b"ACG", &[30; 3]);
-    let records = drive_walker(vec![r], fa);
-    let total_new: usize = records.iter().map(|r| r.new_chains.len()).sum();
-    let total_expired: usize = records.iter().map(|r| r.expired_chains.len()).sum();
-    assert_eq!(total_new, 1, "exactly one chain start across all records");
-    assert_eq!(total_expired, 1, "exactly one chain end across all records");
+fn chain_ids_are_unique_and_monotonically_allocated() {
+    // Three solo reads admit cleanly; every chain id observed across
+    // emitted records must be unique (no recycling) and the ids
+    // appear in non-decreasing order of first reference position.
+    let fa = MockFasta::new("ACGTACGTAC");
+    let reads = vec![
+        snp_read("a", 1, b"AC", &[30; 2]),
+        snp_read("b", 4, b"AC", &[30; 2]),
+        snp_read("c", 7, b"AC", &[30; 2]),
+    ];
+    let records = drive_walker(reads, fa);
+
+    // Collect every chain id from every allele observation.
+    let mut all_ids: Vec<u64> = records
+        .iter()
+        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_slots.iter().copied()))
+        .collect();
+    let n_total_observations = all_ids.len();
+    all_ids.sort_unstable();
+    all_ids.dedup();
+    assert_eq!(
+        all_ids.len(),
+        3,
+        "three reads must produce exactly three distinct chain ids \
+         (observed across {n_total_observations} allele observations)",
+    );
+    // Monotonic: starts at 0 and increases by 1.
+    assert_eq!(all_ids, vec![0, 1, 2]);
 }
 
 #[test]
-fn orphan_first_mate_emits_balanced_lifecycle_marks() {
-    // A paired read whose mate never arrives (the second mate is filtered out
-    // upstream, lost, or simply absent for this molecule). The first mate is
-    // admitted with a paired `mate_role`, so the slot allocator pre-bumps its
-    // refcount to 2 anticipating the partner. When the chromosome flushes,
-    // the partner ref must be released too — otherwise the orphan's slot
-    // surfaces in `new_chains` but never in `expired_chains`, leaving the
-    // downstream consumer with a dangling chain id.
-    //
-    // Regression for finding M1 in `ia/reviews/pileup_2026-05-09.md`.
+fn paired_mates_share_a_single_chain_id() {
+    // First and second mates of a pair must collapse to one chain id.
     let fa = MockFasta::new("ACG");
-    let mut r = snp_read("orphan", 1, b"ACG", &[30; 3]);
-    r.mate_role = MateRole::FirstOfPair;
-    let records = drive_walker(vec![r], fa);
-    let total_new: usize = records.iter().map(|r| r.new_chains.len()).sum();
-    let total_expired: usize = records.iter().map(|r| r.expired_chains.len()).sum();
-    assert_eq!(total_new, 1, "orphan first mate produces one chain start");
+    let (m1, m2) = paired_snp_reads("p", 1, 1, b"ACG", &[30; 3]);
+    let records = drive_walker(vec![m1, m2], fa);
+    let mut all_ids: Vec<u64> = records
+        .iter()
+        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_slots.iter().copied()))
+        .collect();
+    all_ids.sort_unstable();
+    all_ids.dedup();
     assert_eq!(
-        total_expired, 1,
-        "orphan first mate must produce a matching chain end at chromosome flush",
+        all_ids.len(),
+        1,
+        "a paired read produces exactly one chain id shared across both mates",
+    );
+}
+
+#[test]
+fn chain_ids_persist_across_chromosome_boundaries() {
+    // Chain ids are per-`.psp`-file unique, not per-chromosome. The
+    // walker's slot allocator must NOT reset `next_id` on
+    // chromosome change.
+    let fa = MockFasta::with_chromosomes(&["AC", "AC"]);
+    let mut r0 = snp_read("a", 1, b"AC", &[30; 2]);
+    r0.chrom_id = 0;
+    let mut r1 = snp_read("b", 1, b"AC", &[30; 2]);
+    r1.chrom_id = 1;
+    let records = drive_walker(vec![r0, r1], fa);
+    let mut all_ids: Vec<u64> = records
+        .iter()
+        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_slots.iter().copied()))
+        .collect();
+    all_ids.sort_unstable();
+    all_ids.dedup();
+    assert_eq!(
+        all_ids,
+        vec![0, 1],
+        "chain ids must remain unique across chromosomes",
     );
 }
 

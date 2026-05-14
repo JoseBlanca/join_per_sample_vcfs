@@ -13,8 +13,8 @@ document's Stage 2 section. The artefact's high-level shape:
 - per-position records (no variant / non-variant distinction);
 - five per-allele scalars (observation count, `Σ max(ln_BQ, ln_MQ)`,
   forward-strand count, placed-left count, placed-start count);
-- phase chain slot ids with `new_chains` / `expired_chains` lifecycle
-  markers per record;
+- per-allele phase chain identifiers — unique-per-file `u64`s, no
+  recycling, no lifecycle markers (see Q-FC8);
 - columnar storage within zstd-compressed blocks;
 - a mandatory tail-mounted **block index**;
 - a plain-text **TOML file header** framed by a `PSP\n` magic, an
@@ -576,29 +576,20 @@ where noted):
    and proceeded would silently corrupt downstream likelihoods.
    The error names the column, the block, and the offending entry
    index.
-10. **Phase-chain active-set consistency** (checked at each block):
-    - The block header's `active_chain_slots_at_block_start` snapshot
-      is strictly ascending with no duplicates.
-    - The snapshot is empty whenever the block is the first block of
-      its chromosome (block 0 of the file, or any block whose
-      `chrom_id` differs from the previous block's).
-    - Walking the block's records in order, every slot id in
-      `allele_chain_slots` is a member of the running active set at
-      that record (snapshot ± preceding records' markers ± this
-      record's markers). `expired_chain_slots` only removes slots
-      that are currently active; `new_chain_slots` only adds slots
-      that are not. Any violation aborts, naming the block, the
-      record index, and the offending slot id.
-11. **Inter-block phase-chain continuity** (sequential reads only).
-    When a reader processes block N+1 immediately after block N on
-    the same chromosome, the active set carried forward from block
-    N's final record must equal block N+1's
-    `active_chain_slots_at_block_start`. A mismatch is a hard
-    error. Readers doing random access via the tail index cannot
-    perform this check; they trust the snapshot, which is why the
-    snapshot exists.
+10. **Phase-chain identifier ordering** (per record). Every
+    `allele_chain_slots` list is strictly ascending with no
+    duplicates. The reader rejects any record that violates this
+    well-formedness check, naming the block, the record index, and
+    the allele index.
 
-Failing any of these is a hard error.
+(Checks #10–11 in earlier drafts of this document — the
+"phase-chain active-set consistency" and "inter-block phase-chain
+continuity" rules — are gone along with the recycled-slot-id
+design. The unique-per-file `u64` chain ids defined in
+`phase_chain.md` §6 make active-set bookkeeping unnecessary on
+both the writer and reader sides.)
+
+Failing #10 is a hard error.
 
 ### Example v1.0 header
 
@@ -732,31 +723,13 @@ required     = true
 description  = "Reads whose 5' end is the record's position (freebayes' placedStart)."
 
 [[column]]
-tag          = 0x20
-name         = "new-chain-slots"
-cardinality  = "per-record"
-shape        = "list"
-element-type = "u16"
-required     = true
-description  = "Phase-chain slot ids that became active since the previous record. Ascending. On record 0 of a block, 'the previous record' is the block header's active-chain-slots-at-block-start snapshot."
-
-[[column]]
-tag          = 0x21
-name         = "expired-chain-slots"
-cardinality  = "per-record"
-shape        = "list"
-element-type = "u16"
-required     = true
-description  = "Phase-chain slot ids that ended since the previous record. Ascending. On record 0 of a block, 'the previous record' is the block header's active-chain-slots-at-block-start snapshot."
-
-[[column]]
 tag          = 0x22
 name         = "allele-chain-slots"
 cardinality  = "per-allele"
 shape        = "list"
-element-type = "u16"
+element-type = "u64"
 required     = true
-description  = "Phase-chain slot ids contributing to each allele observation. Ascending. References the active-slot set after applying this record's expired-chain-slots and new-chain-slots to the active set carried in from the previous record (or, for record 0 of a block, to the block header's active-chain-slots-at-block-start snapshot)."
+description  = "Phase-chain identifiers contributing to each allele observation. Ascending fixed-width little-endian u64s. Identifiers are unique within the .psp file and never recycled; two observations sharing an identifier came from the same read or read-pair in this sample. Tags 0x20 and 0x21 (the old new-chain-slots / expired-chain-slots lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8."
 ---END-HEADER---
 ```
 
@@ -791,20 +764,6 @@ block:
     n_total_alleles:    varint        // sum of n_alleles over all records;
                                        // lets readers size per-allele
                                        // columns up front
-    active_chain_slots_at_block_start:
-      varint count k                  // phase-chain slot ids that are
-      k × u16, ascending              //   already active when this block
-                                       //   begins, inherited from the
-                                       //   immediately preceding block on
-                                       //   the same chromosome. Empty (k=0)
-                                       //   for the first block on a
-                                       //   chromosome, since chains never
-                                       //   cross chromosome boundaries
-                                       //   (reads do not). See §"Phase-chain
-                                       //   state across blocks" for the
-                                       //   full invariant. Encoded with the
-                                       //   same shape as a per-record list
-                                       //   column.
     n_columns:          varint        // number of column-manifest entries
                                        // that follow. May be less than the
                                        // header's [[column]] count if the
@@ -853,48 +812,20 @@ big their payloads are.
 
 ### Phase-chain state across blocks
 
-Phase chains may straddle block boundaries: a chain that begins in
-block N and is still active when the writer cuts the block continues
-into block N+1. The block header's
-`active_chain_slots_at_block_start` snapshots which slots block N+1
-inherits, so a reader landing on block N+1 via the tail index can
-reconstruct the active set without scanning earlier blocks. This is
-what makes the tail-index pattern (§"Block index") usable for
-mid-chromosome random access in the presence of phase chains.
+Phase chains routinely straddle block boundaries: a chain that
+begins in block N and is still active when the writer cuts the
+block continues into block N+1. Under the unique-`u64`-id design
+no special handling is required at the block boundary — chain ids
+are unique within the entire `.psp` file, so the same id can
+appear in any block and refer to the same molecule it referred to
+in any earlier block. The block header therefore carries no
+active-slot snapshot; a reader landing on block N+1 via the tail
+index needs no carried-in state to materialise records.
 
-Three invariants follow:
-
-1. **First block on a chromosome.** The snapshot is empty (`k = 0`).
-   Reads never cross chromosomes (Stage 1's CRAM merge never produces
-   a chain that spans a contig boundary), so every chain has expired
-   by the chromosome boundary. A reader checks this on every block
-   whose `chrom_id` differs from the immediately preceding block's
-   (or which is block 0 of the file).
-2. **Continuity across blocks on the same chromosome.** For blocks
-   N and N+1 sharing a `chrom_id`, block N+1's
-   `active_chain_slots_at_block_start` equals the active set at the
-   end of block N — that is, block N's
-   `active_chain_slots_at_block_start`, with every `new_chain_slots`
-   entry across block N's records added and every `expired_chain_slots`
-   entry across block N's records removed, all in record order. A
-   reader processing the file sequentially cross-checks this; a reader
-   doing random access trusts the snapshot (no preceding block in
-   memory to compare against).
-3. **First record's lifecycle markers are no longer special-cased.**
-   `new_chain_slots` and `expired_chain_slots` on record 0 mean
-   exactly what they mean on every other record: "slots that
-   started / ended since the previous record." For record 0, the
-   "previous record" is the snapshot, so the markers describe the
-   delta between the snapshot and record 0's currently-active set.
-   `allele_chain_slots` on record 0 references the active set after
-   applying record 0's markers to the snapshot.
-
-The snapshot is one `varint` plus a few `u16`s — bounded by per-position
-depth (the project's 2–10× target gives 5–15 active chains; at 30× a
-few tens). Cost against a 16 MiB block target is negligible. In
-exchange, every block is independently decodable given only its
-header and payloads, which is the same posture the rest of the
-format takes.
+(Earlier drafts of this document specified an
+`active_chain_slots_at_block_start` snapshot field plus inter-block
+continuity checks. Both have been retired along with the recycled-
+slot-id design; see Q-FC8.)
 
 ### Why per-column zstd, not whole-block zstd
 
@@ -941,19 +872,8 @@ the file if any block in the body violates these:
   declared `length`, is a hard error. This makes the "strictly
   increasing positions" rule above checkable column-locally,
   without having to materialise positions first.
-- `active_chain_slots_at_block_start` is empty (`k = 0`) whenever the
-  block is the first block of its chromosome (block 0 of the file,
-  or any block whose `chrom_id` differs from the previous block's).
-- The slot ids in `active_chain_slots_at_block_start` are strictly
-  ascending and pairwise distinct.
-- For every record, every slot id appearing in `allele_chain_slots`
-  is a member of the running active set at that record (computed
-  from `active_chain_slots_at_block_start` plus / minus the
-  preceding records' lifecycle markers and this record's
-  `new_chain_slots` / `expired_chain_slots`). A slot id appearing
-  in `expired_chain_slots` must be in the active set at the moment
-  of expiration; a slot id appearing in `new_chain_slots` must
-  *not* already be in it.
+- Every per-allele `allele_chain_slots` list is strictly ascending
+  and pairwise distinct.
 
 Rationale for 16 MiB rather than the smaller (~4 MiB) figure earlier
 drafts considered: the artefact is expected to be large — WGS at
@@ -1032,9 +952,7 @@ two views of the same data; readers verify they agree
 | `0x12` | `allele_fwd_count` | per-allele (M entries) | `u32` | Forward-strand count. |
 | `0x13` | `allele_placed_left_count` | per-allele (M entries) | `u32` | Reads whose 5′ end is to the left of the record's position (freebayes' `placedLeft`). |
 | `0x14` | `allele_placed_start_count` | per-allele (M entries) | `u32` | Reads whose 5′ end *is* the record's position (`placedStart`). |
-| `0x20` | `new_chain_slots` | per-record list | varint count + `u16` slot ids | Per record: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order — slots that became active since the previous record. For record 0 of a block, "the previous record" is the block header's `active_chain_slots_at_block_start` snapshot (§"Phase-chain state across blocks"); the lifecycle semantics are otherwise identical on every record. Matches the implementation's `SlotId = u16` ([pileup/slot_allocator.rs:21](../../src/per_sample_caller/pileup/slot_allocator.rs#L21)); `u16` was chosen there for ~16× headroom over the active-slot cap (`DEFAULT_MAX_ACTIVE_SLOTS = 4096`). |
-| `0x21` | `expired_chain_slots` | per-record list | varint count + `u16` slot ids | Same shape and same record-0-relative-to-snapshot rule as `new_chain_slots`. Architecture doc §"Phase chain identifiers" specifies the lifecycle invariant. |
-| `0x22` | `allele_chain_slots` | per-allele list | varint count + `u16` slot ids | Per allele: a `varint` count `k`, then `k` little-endian `u16` slot ids in ascending order. The slot ids reference the currently-active set (i.e. after applying the record's `expired_chain_slots` and `new_chain_slots` to the active set carried in from the previous record — or, on record 0, to the block header's `active_chain_slots_at_block_start`). |
+| `0x22` | `allele_chain_slots` | per-allele list | varint count + `u64` LE ids | Per allele: a `varint` count `k`, then `k` little-endian `u64` chain ids in ascending order. Ids are unique within the `.psp` file and never recycled; two observations sharing an id came from the same read or read-pair in this sample. Matches the implementation's `SlotId = u64` ([pileup/slot_allocator.rs](../../src/per_sample_caller/pileup/slot_allocator.rs)). Tags `0x20` and `0x21` (the old `new_chain_slots` / `expired_chain_slots` lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8. |
 
 A reader walks the columns in tandem; the per-record columns give
 the position and allele-count structure, and the per-allele columns
@@ -1391,27 +1309,17 @@ as needed. We'll add reserves when a concrete need appears.*
 
 **~~Q-FC8 — how is phase-chain state preserved across block boundaries
 for random access?~~**
-*Resolved 2026-05-13: each block header carries an
-`active_chain_slots_at_block_start` snapshot (varint count + ascending
-`u16` slot ids) listing the slots inherited from the immediately
-preceding block on the same chromosome. Specified in §"Phase-chain
-state across blocks". The problem: phase chains are bounded by read
-or paired-fragment span (~150 bp – ~1 kb per
-[phase_chain.md](phase_chain.md) §"Chain length in practice") and the
-writer cuts blocks by uncompressed-byte target (~16 MiB), so chains
-plausibly straddle block boundaries. Without a snapshot, a reader
-that uses the tail index to seek to a mid-chromosome block cannot
-know which slot ids are active at the block's first record — it
-would have to scan every preceding block on the chromosome, defeating
-the tail-index pattern. Alternatives considered: (a) restricting
-block cuts to "no chain active" points (rejected: in regions of high
-read density the writer may never reach such a cut before the size
-target; block sizing would become unpredictable); (b) never recycling
-slot ids across a file (rejected: blows out the `u16` namespace on
-any non-trivial genome); (c) requiring sequential read for random
-access (rejected: defeats the whole point of the tail index). The
-snapshot costs `varint` + a few `u16`s per block — at the project's
-target coverage, single-digit bytes against a 16 MiB block payload.*
+*Originally resolved 2026-05-13 with a per-block
+`active_chain_slots_at_block_start` snapshot, on the assumption that
+slot ids needed recycling to keep the namespace small. **Superseded
+2026-05-14**: switched to **unique-per-`.psp`-file `u64` chain ids**
+(alternative (b) above, originally rejected on `u16` namespace
+grounds; with `u64` the namespace concern is gone). Under the new
+design there is no active-set state to preserve across blocks —
+chain ids are unique throughout the file — so the snapshot field
+is gone from the block header and inter-block continuity checks
+have been retired. The full rationale and migration is in
+[ia/feature_implementation_plans/unique_chain_ids.md](../feature_implementation_plans/unique_chain_ids.md).*
 
 ### Parameters & layout details
 
@@ -1438,11 +1346,17 @@ extra 4 B per allele is negligible against the rest of the per-
 allele payload.*
 
 **~~Q-PL4 — `u8` vs `u16` for phase-chain slot ids.~~**
-*Resolved 2026-05-13: `u16`, matching the implementation
-([pileup/slot_allocator.rs:21](../../src/per_sample_caller/pileup/slot_allocator.rs#L21),
-`pub type SlotId = u16`). Chosen there for ~16× headroom over the
-active-slot cap (`DEFAULT_MAX_ACTIVE_SLOTS = 4096`); `u8`'s 256-slot
-ceiling would risk silent overflow at higher coverages.*
+*Originally resolved 2026-05-13: `u16` over `u8` for headroom under
+recycling. **Superseded 2026-05-14**: phase-chain ids are now
+**unique-per-`.psp`-file `u64`** (`pub type SlotId = u64` in
+[pileup/slot_allocator.rs](../../src/per_sample_caller/pileup/slot_allocator.rs)),
+with no recycling. The on-disk encoding is fixed-width LE `u64`
+under tag `0x22` (`allele-chain-slots`); zstd absorbs the leading
+zero bytes on small ids. Overflow at `u64::MAX + 1` surfaces as
+`WalkerError::ChainIdSpaceExhausted` rather than silent wrap; the
+ceiling (~1.8 × 10¹⁹ chains per file) is unreachable on any
+realistic workload. See
+[ia/feature_implementation_plans/unique_chain_ids.md](../feature_implementation_plans/unique_chain_ids.md).*
 
 **~~Q-PL5 — reserve a v1.x optional column for 2-bit packed allele
 sequences?~~**

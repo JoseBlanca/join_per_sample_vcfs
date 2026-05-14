@@ -1579,20 +1579,20 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_chain_slots_per_allele_to_per_record() {
+    fn reader_rejects_n_alleles_cardinality_flipped_to_per_allele() {
         let mut wire = valid_wire();
         let c = wire
             .columns
             .iter_mut()
-            .find(|c| c.name == "new-chain-slots")
+            .find(|c| c.name == "n-alleles")
             .unwrap();
-        // new-chain-slots is per-record; force it to per-allele to
+        // n-alleles is per-record; force it to per-allele to
         // trigger a SchemaMismatch.
         c.cardinality = "per-allele".to_string();
         let err = parse_from_wire(&wire);
         match err {
             PspReadError::SchemaMismatch { name, field, .. } => {
-                assert_eq!(name, "new-chain-slots");
+                assert_eq!(name, "n-alleles");
                 assert_eq!(field, "cardinality");
             }
             other => panic!("expected SchemaMismatch, got {other:?}"),

@@ -94,9 +94,6 @@ pub enum BlockHeaderInvariantKind {
         n_total_alleles: u32,
     },
 
-    #[error("active_chain_slots not strictly ascending: {prev} then {next}")]
-    ActiveSlotsNotAscending { prev: u16, next: u16 },
-
     #[error("manifest tags not strictly ascending: {prev:#x} then {next:#x}")]
     ManifestTagsNotAscending { prev: u16, next: u16 },
 
@@ -105,37 +102,6 @@ pub enum BlockHeaderInvariantKind {
 
     #[error("{field}: value {value} exceeds u16 range")]
     FieldExceedsU16 { field: &'static str, value: u64 },
-
-    /// In **sequential** read mode, a block's
-    /// `active_chain_slots_at_block_start` snapshot disagreed with
-    /// the active set the reader carried forward from the previous
-    /// block (spec check #11). Random-access region reads do not
-    /// perform this check — they trust the snapshot.
-    ///
-    /// The two sets are reported as truncated slot lists (up to
-    /// [`MAX_SNAPSHOT_SLOTS_IN_ERROR`]) so a divergence at the
-    /// content level is diagnosable, not only at the length level.
-    #[error(
-        "active-chain-slots snapshot mismatch entering block {block}: \
-         snapshot = {snapshot:?}, carried-in = {expected:?}"
-    )]
-    SnapshotMismatch {
-        block: usize,
-        snapshot: Vec<u16>,
-        expected: Vec<u16>,
-    },
-
-    /// First-block-of-chromosome carries a non-empty snapshot. The
-    /// writer is required to flush its active-chain-slot set to
-    /// empty on every chromosome boundary (and at the start of the
-    /// file), so any non-empty snapshot at a chrom-change block is
-    /// a hard error. Checked in both sequential and random-access
-    /// modes; spec §"Header-binary consistency" check #10.
-    #[error(
-        "block {block} is the first block of its chromosome but \
-         its snapshot has {snapshot_len} slots (must be empty)"
-    )]
-    NonEmptySnapshotAtChromStart { block: usize, snapshot_len: usize },
 
     /// The decoded `n-alleles` column sums to a value different
     /// from the block header's `n_total_alleles`. Spec
@@ -152,12 +118,6 @@ pub enum BlockHeaderInvariantKind {
         sum_n_alleles: u64,
     },
 }
-
-/// Cap on the number of slot ids embedded in
-/// [`BlockHeaderInvariantKind::SnapshotMismatch`]'s `Debug`-rendered
-/// output. Beyond this the reporter truncates with `…` to keep log
-/// lines bounded on pathological inputs.
-pub const MAX_SNAPSHOT_SLOTS_IN_ERROR: usize = 8;
 
 /// Rules a record handed to `write_record` can violate. Carried as
 /// the `kind` of [`PspWriteError::InvalidRecord`]. Mi10.
@@ -189,52 +149,6 @@ pub enum InvalidRecordKind {
 
     #[error("allele {allele_index} chain_slots not strictly ascending")]
     AlleleChainSlotsNotAscending { allele_index: usize },
-
-    #[error("{marker_set} not strictly ascending")]
-    ChainMarkerNotAscending { marker_set: &'static str },
-}
-
-/// Reasons a phase-chain marker can be inconsistent with the
-/// running active-slot set. Carried as the `kind` of
-/// [`PspWriteError::PhaseChainMarkerInconsistency`]. Mi10.
-#[non_exhaustive]
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum PhaseChainMarkerInconsistencyKind {
-    #[error("active_slots non-empty ({n_active}) at first record of chromosome {chrom_id}")]
-    ActiveAtChromBoundary { n_active: usize, chrom_id: u32 },
-
-    #[error("expired chain slot {slot} not currently active")]
-    ExpiredNotActive { slot: u16 },
-
-    #[error("new chain slot {slot} already active")]
-    NewAlreadyActive { slot: u16 },
-
-    #[error("allele {allele_index} references chain slot {slot} not in active set")]
-    AlleleReferencesUnknownSlot { allele_index: usize, slot: u16 },
-}
-
-/// Reasons a phase-chain consistency rule can fail at read time.
-/// Mirrors [`PhaseChainMarkerInconsistencyKind`] on the writer
-/// side but is reader-shaped: errors fire while materialising
-/// records or crossing block boundaries.
-#[non_exhaustive]
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum PhaseChainConsistencyKind {
-    /// `expired_chain_slots` references a slot that was not in the
-    /// active set carried into the record.
-    #[error("expired chain slot {slot} not currently active")]
-    ExpiredNotActive { slot: u16 },
-
-    /// `new_chain_slots` references a slot already in the active
-    /// set when the record was reached.
-    #[error("new chain slot {slot} already active")]
-    NewAlreadyActive { slot: u16 },
-
-    /// An allele's `chain_slots` references a slot that is not in
-    /// the active set after applying this record's expired + new
-    /// markers.
-    #[error("allele {allele_index} references chain slot {slot} not in active set")]
-    AlleleReferencesUnknownSlot { allele_index: usize, slot: u16 },
 }
 
 /// Wrapper around `toml::ser::Error` so the writer's error chain
@@ -577,26 +491,6 @@ pub enum PspReadError {
         entry: usize,
         value: f64,
     },
-
-    /// A phase-chain marker or per-allele chain reference at
-    /// record `record_in_block` of block `block` is inconsistent
-    /// with the running active-slot set. Spec check #10.
-    ///
-    /// `record_index` is the file-global record count (matches the
-    /// writer-side `PspWriteError::PhaseChainMarkerInconsistency`'s
-    /// `record_index`); `record_in_block` is the local index inside
-    /// the offending block. Mi2.
-    #[error(
-        "phase-chain consistency violation at block {block} record \
-         {record_in_block} (global record_index {record_index})"
-    )]
-    PhaseChainConsistency {
-        block: usize,
-        record_in_block: u32,
-        record_index: u64,
-        #[source]
-        kind: PhaseChainConsistencyKind,
-    },
 }
 
 /// Errors the `.psp` writer can emit. Variants land as the
@@ -691,15 +585,6 @@ pub enum PspWriteError {
         prev_pos: u32,
         this_chrom: u32,
         this_pos: u32,
-    },
-
-    /// A phase-chain marker is inconsistent with the running
-    /// active-slot set. `kind` names the specific inconsistency.
-    #[error("record at index {record_index}: phase-chain marker inconsistency")]
-    PhaseChainMarkerInconsistency {
-        record_index: u64,
-        #[source]
-        kind: PhaseChainMarkerInconsistencyKind,
     },
 
     /// `finish` has been called but the writer-side block-header

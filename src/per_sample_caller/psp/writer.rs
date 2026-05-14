@@ -28,7 +28,7 @@ use super::block::{
     encode_list_column_csr, encode_scalar_column, encode_varint_column, new_column_compressor,
     zstd_compress_into,
 };
-use super::errors::{InvalidRecordKind, PhaseChainMarkerInconsistencyKind, PspWriteError};
+use super::errors::{InvalidRecordKind, PspWriteError};
 use super::header::{WriterHeader, build_header_bytes};
 use super::index::{BlockIndexEntry, checksum_index, encode_index};
 use super::registry::{
@@ -128,17 +128,6 @@ fn err_invalid_allele_byte(record_index: u64, allele_index: usize, seq: &[u8]) -
 /// owns its own bookkeeping without touching scratch buffers or
 /// the sink.
 struct IngestState {
-    /// Running active phase-chain slot set, kept sorted ascending.
-    /// Updated as records' `new_chains` / `expired_chains` markers
-    /// are applied; snapshotted at block start.
-    ///
-    /// Sorted `Vec<SlotId>` (with `binary_search` membership) wins
-    /// over `BTreeSet<u16>` for the small active counts typical of
-    /// phasing (~8 active per locus): one contiguous allocation, one
-    /// cache line of data for small `n`, and the block-start snapshot
-    /// is a single memcpy via `.clone()` instead of a tree walk
-    /// (S1+S2 in `ia/reviews/perf_psp_writer_2026-05-13.md`).
-    active_slots: Vec<SlotId>,
     /// Last admitted record's `(chrom_id, pos)`, for monotonicity
     /// enforcement across `write_record` calls.
     last_locus: Option<(u32, u32)>,
@@ -150,7 +139,6 @@ struct IngestState {
 impl IngestState {
     fn new() -> Self {
         Self {
-            active_slots: Vec::new(),
             last_locus: None,
             records_seen: 0,
         }
@@ -295,34 +283,12 @@ impl<W: Write> PspWriter<W> {
         }
         let flushed_bytes = self.sink_offset - pre_flush_bytes;
 
-        // Start a new block if none is open.
+        // Start a new block if none is open. With unique-per-file
+        // chain ids there is no active-slot snapshot to copy; the
+        // block header only carries structural metadata
+        // (chrom_id, first_pos, n_records, n_total_alleles, manifest).
         if self.block.is_none() {
-            // The first block on a chromosome always has an empty
-            // active-slot snapshot — Stage 1 never produces a chain
-            // that spans a contig boundary (reads don't), so by the
-            // time we cross a boundary every slot has expired. The
-            // walker is expected to honour this and we double-check
-            // here: if active_slots is non-empty AND we're starting
-            // the first block on a new chromosome, that's a writer
-            // upstream bug.
-            let snapshot = if self.is_first_block_on_chrom(record.chrom_id) {
-                if !self.ingest.active_slots.is_empty() {
-                    return Err(PspWriteError::PhaseChainMarkerInconsistency {
-                        record_index,
-                        kind: PhaseChainMarkerInconsistencyKind::ActiveAtChromBoundary {
-                            n_active: self.ingest.active_slots.len(),
-                            chrom_id: record.chrom_id,
-                        },
-                    });
-                }
-                Vec::new()
-            } else {
-                // `active_slots` is kept sorted ascending, which is
-                // the BlockHeader's contract for `active_chain_slots`.
-                // `.clone()` is one allocation + memcpy — S2.
-                self.ingest.active_slots.clone()
-            };
-            self.block = Some(BlockAccumulator::new(record.chrom_id, record.pos, snapshot));
+            self.block = Some(BlockAccumulator::new(record.chrom_id, record.pos));
         }
 
         self.apply_record_to_block(record_index, record)?;
@@ -399,15 +365,6 @@ impl<W: Write> PspWriter<W> {
     #[doc(hidden)]
     pub fn current_block_projected_bytes(&self) -> Option<usize> {
         self.block.as_ref().map(|b| b.projected_bytes)
-    }
-
-    /// `true` if no block has been emitted yet OR the most recent
-    /// emitted block was on a different chromosome.
-    fn is_first_block_on_chrom(&self, chrom_id: u32) -> bool {
-        match self.index_entries.last() {
-            None => true,
-            Some(last) => last.chrom_id != chrom_id,
-        }
     }
 
     fn validate_record(
@@ -499,85 +456,29 @@ impl<W: Write> PspWriter<W> {
             }
         }
 
-        // new / expired chains ascending + distinct.
-        for (name, slots) in [
-            ("new_chains", &record.new_chains),
-            ("expired_chains", &record.expired_chains),
-        ] {
-            for w in slots.windows(2) {
-                if w[0] >= w[1] {
-                    return Err(err_invalid_record(
-                        record_index,
-                        InvalidRecordKind::ChainMarkerNotAscending { marker_set: name },
-                    ));
-                }
-            }
-        }
-
         Ok(())
     }
 
     /// Apply the record's content to the open block's per-column
-    /// buffers, update the running active-slot set, and validate
-    /// phase-chain marker consistency against that set.
+    /// buffers.
     fn apply_record_to_block(
         &mut self,
         record_index: u64,
         record: &PileupRecord,
     ) -> Result<(), PspWriteError> {
-        // Phase-chain marker consistency: expired must be currently
-        // active; new must not be currently active. Sorted-Vec
-        // membership is `binary_search`.
-        for &slot in &record.expired_chains {
-            if self.ingest.active_slots.binary_search(&slot).is_err() {
-                return Err(PspWriteError::PhaseChainMarkerInconsistency {
-                    record_index,
-                    kind: PhaseChainMarkerInconsistencyKind::ExpiredNotActive { slot },
-                });
-            }
-        }
-        for &slot in &record.new_chains {
-            if self.ingest.active_slots.binary_search(&slot).is_ok() {
-                return Err(PspWriteError::PhaseChainMarkerInconsistency {
-                    record_index,
-                    kind: PhaseChainMarkerInconsistencyKind::NewAlreadyActive { slot },
-                });
-            }
-        }
-        // Apply markers to running set. Expired first, then new
-        // (matches the BTreeSet-era semantics).
-        for &slot in &record.expired_chains {
-            if let Ok(idx) = self.ingest.active_slots.binary_search(&slot) {
-                self.ingest.active_slots.remove(idx);
-            }
-        }
-        for &slot in &record.new_chains {
-            // `slot` was just checked not in active_slots, so this
-            // returns Err with the sorted insertion index.
-            if let Err(idx) = self.ingest.active_slots.binary_search(&slot) {
-                self.ingest.active_slots.insert(idx, slot);
-            }
-        }
-        // Now per-allele chain_slots must all be in the running set.
-        for (i, allele) in record.alleles.iter().enumerate() {
-            for &slot in &allele.chain_slots {
-                if self.ingest.active_slots.binary_search(&slot).is_err() {
-                    return Err(PspWriteError::PhaseChainMarkerInconsistency {
-                        record_index,
-                        kind: PhaseChainMarkerInconsistencyKind::AlleleReferencesUnknownSlot {
-                            allele_index: i,
-                            slot,
-                        },
-                    });
-                }
-            }
-        }
-
-        // Push to block buffers.
-        // PANIC-FREE: write_record opens `self.block` at writer.rs:253
-        // on every path that reaches this call. The Option shape is
-        // an artefact of the flush/open cycle, not a real "may be
-        // absent" condition here.
+        // With unique-per-file chain ids there's no active-set
+        // bookkeeping or lifecycle-marker validation. Each
+        // `allele.chain_slots` is just a list of `u64`s that must
+        // be strictly ascending (per-record well-formedness — pinned
+        // in `validate_record`); identifier collisions are
+        // structurally impossible because the slot allocator
+        // monotonically mints distinct values per file.
+        //
+        // PANIC-FREE: write_record opens `self.block` on every path
+        // that reaches this call. The Option shape is an artefact
+        // of the flush/open cycle, not a real "may be absent"
+        // condition here.
+        let _ = record_index;
         let block = self.block.as_mut().expect("block open by construction");
         block.append_record(record);
 
@@ -599,7 +500,7 @@ impl<W: Write> PspWriter<W> {
         // already be `Some`) and from `finish` (gated by
         // `if self.block.is_some()`). Both call sites ensure a block
         // is open.
-        let mut block = self
+        let block = self
             .block
             .take()
             .expect("flush_block called with no open block");
@@ -614,7 +515,7 @@ impl<W: Write> PspWriter<W> {
         // context).
         encode_and_compress_columns(&block, &mut self.scratch, block_index)?;
         assemble_block_header(
-            &mut block,
+            &block,
             &mut self.scratch,
             block_index,
             n_records,
@@ -677,7 +578,7 @@ fn encode_and_compress_columns(
 /// The manifest scratch is restored at the end so capacity carries
 /// over to the next flush.
 fn assemble_block_header(
-    block: &mut BlockAccumulator,
+    block: &BlockAccumulator,
     scratch: &mut WriterScratch,
     block_index: u64,
     n_records: u32,
@@ -688,9 +589,6 @@ fn assemble_block_header(
         first_pos: block.first_pos,
         n_records,
         n_total_alleles,
-        // Move the active-slot snapshot rather than cloning it —
-        // `block` is owned and dropped at end of caller's scope (L3).
-        active_chain_slots: std::mem::take(&mut block.snapshot_active_slots),
         manifest: std::mem::take(&mut scratch.manifest),
     };
     scratch.header_bytes.clear();
@@ -763,14 +661,9 @@ struct BlockAccumulator {
     chrom_id: u32,
     first_pos: u32,
     last_pos: u32,
-    /// Snapshot of the active-slot set at the moment this block
-    /// opened. Sits verbatim in the block header.
-    snapshot_active_slots: Vec<SlotId>,
     // Per-record columns.
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
-    new_chain_slots: ListColumn,
-    expired_chain_slots: ListColumn,
     // Per-allele columns.
     allele_seq_len: Vec<u64>,
     allele_seq_bytes: Vec<u8>,
@@ -786,25 +679,13 @@ struct BlockAccumulator {
 }
 
 impl BlockAccumulator {
-    fn new(chrom_id: u32, first_pos: u32, snapshot_active_slots: Vec<SlotId>) -> Self {
+    fn new(chrom_id: u32, first_pos: u32) -> Self {
         Self {
             chrom_id,
             first_pos,
             last_pos: first_pos,
-            snapshot_active_slots,
             delta_pos: Vec::with_capacity(INITIAL_RECORDS_HINT),
             n_alleles: Vec::with_capacity(INITIAL_RECORDS_HINT),
-            // Per-record list columns. Most records have an empty
-            // chain-slots list, so the data buffer's hint is much
-            // smaller than the offsets hint.
-            new_chain_slots: ListColumn::with_capacity(
-                INITIAL_RECORDS_HINT,
-                INITIAL_CHAIN_SLOTS_HINT,
-            ),
-            expired_chain_slots: ListColumn::with_capacity(
-                INITIAL_RECORDS_HINT,
-                INITIAL_CHAIN_SLOTS_HINT,
-            ),
             allele_seq_len: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_seq_bytes: Vec::with_capacity(INITIAL_ALLELE_SEQ_BYTES_HINT),
             allele_obs_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
@@ -829,11 +710,6 @@ impl BlockAccumulator {
         };
         self.delta_pos.push(delta);
         self.n_alleles.push(record.alleles.len() as u64);
-        // H2: extend_from_slice into the flat data buffer, no
-        // per-record Vec allocation. The outer `Vec<Vec<SlotId>>`
-        // anti-pattern is gone — only one offsets push per row.
-        self.new_chain_slots.push_row(&record.new_chains);
-        self.expired_chain_slots.push_row(&record.expired_chains);
 
         for allele in &record.alleles {
             self.allele_seq_len.push(allele.seq.len() as u64);
@@ -852,11 +728,10 @@ impl BlockAccumulator {
 
         // Rough size projection — per record, plus per-allele +
         // per-byte. Doesn't need to be precise; the target is a soft
-        // cap.
+        // cap. Chain slots are now u64 little-endian (8 bytes/id);
+        // zstd compresses the high-order zero bytes effectively.
         let per_record = 1 // delta-pos varint typical
-            + 1 // n-alleles varint typical
-            + (1 + 2 * record.new_chains.len()) // new_chain marker
-            + (1 + 2 * record.expired_chains.len()); // expired_chain marker
+            + 1; // n-alleles varint typical
         let per_allele: usize = record
             .alleles
             .iter()
@@ -864,7 +739,7 @@ impl BlockAccumulator {
                 1                  // allele-seq-len varint typical
                 + a.seq.len()      // allele-seq bytes
                 + 4 + 8 + 4 + 4 + 4 // the five scalars
-                + (1 + 2 * a.chain_slots.len())
+                + (1 + 8 * a.chain_slots.len()) // varint count + u64 ids
             })
             .sum();
         self.projected_bytes += per_record + per_allele;
@@ -912,16 +787,6 @@ fn encode_column_into(
         ColumnKey::AllelePlacedStartCount => {
             encode_scalar_column(&block.allele_placed_start_count, out)
         }
-        ColumnKey::NewChainSlots => encode_list_column_csr(
-            &block.new_chain_slots.data,
-            &block.new_chain_slots.offsets,
-            out,
-        ),
-        ColumnKey::ExpiredChainSlots => encode_list_column_csr(
-            &block.expired_chain_slots.data,
-            &block.expired_chain_slots.offsets,
-            out,
-        ),
         ColumnKey::AlleleChainSlots => encode_list_column_csr(
             &block.allele_chain_slots.data,
             &block.allele_chain_slots.offsets,
@@ -1021,7 +886,7 @@ mod tests {
         }
     }
 
-    fn allele(seq: &[u8], num_obs: u32, q_sum: f64, chain_slots: &[u16]) -> AlleleObservation {
+    fn allele(seq: &[u8], num_obs: u32, q_sum: f64, chain_slots: &[u64]) -> AlleleObservation {
         AlleleObservation {
             seq: seq.to_vec(),
             support: support(num_obs, q_sum),
@@ -1029,18 +894,10 @@ mod tests {
         }
     }
 
-    fn record(
-        chrom_id: u32,
-        pos: u32,
-        alleles: Vec<AlleleObservation>,
-        new_chains: Vec<u16>,
-        expired_chains: Vec<u16>,
-    ) -> PileupRecord {
+    fn record(chrom_id: u32, pos: u32, alleles: Vec<AlleleObservation>) -> PileupRecord {
         PileupRecord {
             chrom_id,
             pos,
-            new_chains,
-            expired_chains,
             alleles,
         }
     }
@@ -1093,13 +950,7 @@ mod tests {
     fn rejects_unknown_chrom_id() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let err = writer
-            .write_record(&record(
-                5,
-                100,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(5, 100, vec![allele(b"A", 10, -1.0, &[])]))
             .expect_err("chrom_id 5 with 1 chromosome should fail");
         assert!(matches!(err, PspWriteError::UnknownChromId { .. }));
     }
@@ -1108,13 +959,7 @@ mod tests {
     fn rejects_pos_zero() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let err = writer
-            .write_record(&record(
-                0,
-                0,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 0, vec![allele(b"A", 10, -1.0, &[])]))
             .expect_err("pos 0 should fail");
         assert!(matches!(err, PspWriteError::PosOutOfRange { .. }));
     }
@@ -1123,13 +968,7 @@ mod tests {
     fn rejects_pos_beyond_contig_length() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let err = writer
-            .write_record(&record(
-                0,
-                10_000_000,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 10_000_000, vec![allele(b"A", 10, -1.0, &[])]))
             .expect_err("pos beyond contig length should fail");
         assert!(matches!(err, PspWriteError::PosOutOfRange { .. }));
     }
@@ -1138,22 +977,10 @@ mod tests {
     fn rejects_out_of_order_positions() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"A", 10, -1.0, &[])]))
             .unwrap();
         let err = writer
-            .write_record(&record(
-                0,
-                50,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 50, vec![allele(b"A", 10, -1.0, &[])]))
             .expect_err("going backwards should fail");
         assert!(matches!(err, PspWriteError::OutOfOrderRecord { .. }));
     }
@@ -1162,22 +989,10 @@ mod tests {
     fn rejects_chrom_regression() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(2)).unwrap();
         writer
-            .write_record(&record(
-                1,
-                100,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(1, 100, vec![allele(b"A", 10, -1.0, &[])]))
             .unwrap();
         let err = writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"A", 10, -1.0, &[])]))
             .expect_err("chrom regression should fail");
         assert!(matches!(err, PspWriteError::OutOfOrderRecord { .. }));
     }
@@ -1186,7 +1001,7 @@ mod tests {
     fn rejects_zero_alleles() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let err = writer
-            .write_record(&record(0, 100, vec![], vec![], vec![]))
+            .write_record(&record(0, 100, vec![]))
             .expect_err("zero alleles should fail");
         assert!(matches!(err, PspWriteError::InvalidRecord { .. }));
     }
@@ -1195,13 +1010,7 @@ mod tests {
     fn rejects_non_acgtn_allele_byte() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let err = writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"X", 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"X", 10, -1.0, &[])]))
             .expect_err("non-ACGTN should fail");
         assert!(matches!(err, PspWriteError::InvalidRecord { .. }));
     }
@@ -1211,13 +1020,7 @@ mod tests {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let seq = b"A".repeat((MAX_ALLELE_SEQ_LEN + 1) as usize);
         let err = writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(&seq, 10, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(&seq, 10, -1.0, &[])]))
             .expect_err("seq > cap should fail");
         assert!(matches!(err, PspWriteError::InvalidRecord { .. }));
     }
@@ -1226,79 +1029,18 @@ mod tests {
     fn rejects_nan_q_sum() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         let err = writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 10, f64::NAN, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"A", 10, f64::NAN, &[])]))
             .expect_err("NaN q_sum should fail");
         assert!(matches!(err, PspWriteError::InvalidRecord { .. }));
     }
 
-    #[test]
-    fn rejects_phase_chain_marker_inconsistency_expired_not_active() {
-        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
-        let err = writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[])],
-                vec![],
-                vec![5], // 5 is not in the active set yet
-            ))
-            .expect_err("expired-not-active should fail");
-        assert!(matches!(
-            err,
-            PspWriteError::PhaseChainMarkerInconsistency { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_phase_chain_marker_inconsistency_double_open() {
-        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
-        writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[3])],
-                vec![3],
-                vec![],
-            ))
-            .unwrap();
-        let err = writer
-            .write_record(&record(
-                0,
-                101,
-                vec![allele(b"A", 1, -1.0, &[3])],
-                vec![3], // 3 is already active
-                vec![],
-            ))
-            .expect_err("re-opening an active slot should fail");
-        assert!(matches!(
-            err,
-            PspWriteError::PhaseChainMarkerInconsistency { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_allele_chain_slot_not_in_active_set() {
-        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
-        let err = writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[99])], // 99 not opened
-                vec![],
-                vec![],
-            ))
-            .expect_err("allele references unknown slot");
-        assert!(matches!(
-            err,
-            PspWriteError::PhaseChainMarkerInconsistency { .. }
-        ));
-    }
+    // Phase-chain marker inconsistency tests removed: the writer no
+    // longer tracks an active-slot set, so the marker-vs-active
+    // validation it used to enforce is gone. Chain ids are unique
+    // per `.psp` file (u64), so the same family of violations is
+    // structurally impossible. The remaining per-record well-
+    // formedness check (chain_slots strictly ascending) is pinned
+    // by the iterator-style assertions inside the round-trip tests.
 
     // ---------- One block round-trip via writer alone ----------
 
@@ -1306,13 +1048,7 @@ mod tests {
     fn one_record_one_block_finishes_cleanly() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
         writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 10, -2.5, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"A", 10, -2.5, &[])]))
             .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
 
@@ -1343,33 +1079,15 @@ mod tests {
     fn chrom_change_triggers_flush() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(2)).unwrap();
         writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"A", 1, -1.0, &[])]))
             .unwrap();
         writer
-            .write_record(&record(
-                0,
-                200,
-                vec![allele(b"C", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 200, vec![allele(b"C", 1, -1.0, &[])]))
             .unwrap();
         // Switch chromosome — the writer should flush block 0 and
         // start block 1.
         writer
-            .write_record(&record(
-                1,
-                1,
-                vec![allele(b"G", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(1, 1, vec![allele(b"G", 1, -1.0, &[])]))
             .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let trailer: &[u8; TRAILER_BYTES] =
@@ -1395,13 +1113,7 @@ mod tests {
                 .unwrap();
         for i in 1u32..=2000 {
             writer
-                .write_record(&record(
-                    0,
-                    i,
-                    vec![allele(b"A", 1, -1.0, &[])],
-                    vec![],
-                    vec![],
-                ))
+                .write_record(&record(0, i, vec![allele(b"A", 1, -1.0, &[])]))
                 .unwrap();
         }
         let bytes = writer.finish().unwrap().into_inner();
@@ -1431,13 +1143,7 @@ mod tests {
         let mut saw_flush = false;
         for i in 1u32..=2000 {
             let pushed = writer
-                .write_record(&record(
-                    0,
-                    i,
-                    vec![allele(b"A", 1, -1.0, &[])],
-                    vec![],
-                    vec![],
-                ))
+                .write_record(&record(0, i, vec![allele(b"A", 1, -1.0, &[])]))
                 .unwrap();
             if pushed > 0 {
                 saw_flush = true;
@@ -1451,13 +1157,7 @@ mod tests {
         // The very next record after a flush is on a fresh block — it
         // must report 0 bytes pushed.
         let post_flush = writer
-            .write_record(&record(
-                0,
-                10_000,
-                vec![allele(b"A", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 10_000, vec![allele(b"A", 1, -1.0, &[])]))
             .unwrap();
         assert_eq!(post_flush, 0, "post-flush record must not push bytes");
     }
@@ -1469,31 +1169,13 @@ mod tests {
     fn index_entries_match_input_order_and_coordinates() {
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(2)).unwrap();
         writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 100, vec![allele(b"A", 1, -1.0, &[])]))
             .unwrap();
         writer
-            .write_record(&record(
-                0,
-                200,
-                vec![allele(b"C", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(0, 200, vec![allele(b"C", 1, -1.0, &[])]))
             .unwrap();
         writer
-            .write_record(&record(
-                1,
-                1,
-                vec![allele(b"G", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
+            .write_record(&record(1, 1, vec![allele(b"G", 1, -1.0, &[])]))
             .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let trailer: &[u8; TRAILER_BYTES] =
@@ -1517,81 +1199,12 @@ mod tests {
         );
     }
 
-    /// Active-slot snapshot on subsequent (same-chrom) blocks
-    /// matches the running set at flush time. Tested indirectly via
-    /// a write_record sequence that closes block 1's last open slot
-    /// just before block 2 opens.
-    #[test]
-    fn active_slot_snapshot_carries_across_blocks() {
-        // Build a writer with a small target so a single record
-        // doesn't flush; we'll force a flush by chromosome change.
-        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(2)).unwrap();
-        // chrom 0: open slot 7, no per-allele reference; expire it.
-        writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[7])],
-                vec![7],
-                vec![],
-            ))
-            .unwrap();
-        writer
-            .write_record(&record(
-                0,
-                101,
-                vec![allele(b"C", 1, -1.0, &[])],
-                vec![],
-                vec![7],
-            ))
-            .unwrap();
-        // Move to chrom 1; active set is empty at this point.
-        writer
-            .write_record(&record(
-                1,
-                1,
-                vec![allele(b"G", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
-            .unwrap();
-        let bytes = writer.finish().unwrap().into_inner();
-        // Smoke test: file is non-zero and ends with a valid trailer.
-        let trailer: &[u8; TRAILER_BYTES] =
-            bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
-        assert!(decode_trailer(trailer).is_ok());
-    }
-
-    /// Phase-chain still active when chromosome switches: writer
-    /// catches the upstream bug at first-record time on the new
-    /// chromosome.
-    #[test]
-    fn rejects_chain_active_at_chromosome_boundary() {
-        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(2)).unwrap();
-        // Open a slot on chrom 0 and never close it.
-        writer
-            .write_record(&record(
-                0,
-                100,
-                vec![allele(b"A", 1, -1.0, &[5])],
-                vec![5],
-                vec![],
-            ))
-            .unwrap();
-        // Try to start chrom 1 — writer notices the active set is
-        // non-empty and rejects.
-        let err = writer
-            .write_record(&record(
-                1,
-                1,
-                vec![allele(b"G", 1, -1.0, &[])],
-                vec![],
-                vec![],
-            ))
-            .expect_err("chain active across chrom boundary should fail");
-        assert!(matches!(
-            err,
-            PspWriteError::PhaseChainMarkerInconsistency { .. }
-        ));
-    }
+    // The `active_slot_snapshot_carries_across_blocks` and
+    // `rejects_chain_active_at_chromosome_boundary` tests are gone:
+    // block headers no longer carry an active-slot snapshot, and
+    // there's no active-set bookkeeping for the writer to validate
+    // against at a chromosome boundary. Chain ids are unique per
+    // file, so chains "still active across blocks" is just a normal
+    // sequence of ids referenced by alleles in both blocks — nothing
+    // special to check.
 }

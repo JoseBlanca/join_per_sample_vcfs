@@ -75,41 +75,44 @@ mod tests {
 
     use super::super::pileup::tests::{MockFasta, snp_read};
     use super::super::pileup::{WalkerConfig, run};
+    use super::super::psp::PspReader;
     use super::super::psp::test_fixtures::writer_header;
     use super::super::psp::writer::PspWriter;
     use super::*;
 
-    /// Drive a tiny pileup run *not* through the writer, just to
-    /// confirm the seam's value-passing path. We compare against
-    /// an independent walker run over the same inputs; if anything
-    /// in `drive_pileup_to_psp`'s wiring corrupts records on the
-    /// way to the writer, this would catch it.
+    /// Drive a tiny pileup → psp run through the seam, then read the
+    /// resulting bytes back through `PspReader` and confirm
+    /// per-record parity. This is the contract the seam exists to
+    /// preserve: whatever the walker emits, the writer encodes
+    /// losslessly, and the reader yields the same records.
     ///
-    /// The end-to-end roundtrip-through-`PspWriter` + `PspReader`
-    /// is *not* exercised here because it surfaces a pre-existing
-    /// walker/writer contract mismatch (the walker stamps a slot's
-    /// `expired_chains` on the same record that references the slot
-    /// in `allele.chain_slots`; the writer's `apply_record_to_block`
-    /// rejects with `PhaseChainMarkerInconsistency`).
-    /// See [`writer_rejects_walker_output_when_chain_expires_on_same_record_as_final_reference`]
-    /// for the regression that pins this finding.
+    /// Note: under the unique-chain-id design this test passes for
+    /// real now. The earlier shape of this test pinned the walker /
+    /// writer contract mismatch that was the proximate motivation
+    /// for switching to unique ids.
     #[test]
-    fn drive_pileup_to_psp_passes_records_through_unmodified() {
+    fn drive_pileup_to_psp_roundtrips_records_through_in_memory_sink() {
         let fa = MockFasta::new("ACGTA");
         let reads = vec![
             snp_read("r1", 1, b"ACGTA", &[30; 5]),
             snp_read("r2", 1, b"ACGTA", &[30; 5]),
         ];
 
-        // Build a no-op writer header that the seam never actually
-        // touches with a record (we shadow the records into a Vec
-        // by collecting from a parallel walker run).
-        //
-        // Concretely: drive through a `Vec` sink instead of a
-        // `PspWriter` by collecting from the iterator side directly,
-        // and compare to a reference walker run.
-        let collected: Vec<_> = run(reads, &fa, &WalkerConfig::default())
-            .map(|r| r.expect("walker yielded error"))
+        let walker = run(reads, &fa, &WalkerConfig::default());
+        let writer = PspWriter::new(Cursor::new(Vec::<u8>::new()), writer_header(1))
+            .expect("writer construction");
+
+        let (sink, summary) = drive_pileup_to_psp(walker, writer).expect("seam should run cleanly");
+        assert_eq!(summary.records_emitted, 5, "expect five emitted records");
+
+        // Re-open the in-memory `.psp` artefact and pull every record
+        // back. Parity is per-record equality against an independent
+        // walker run over the same inputs.
+        let bytes = sink.into_inner();
+        let mut reader = PspReader::new(Cursor::new(bytes)).expect("reader open");
+        let read_back: Vec<_> = reader
+            .records()
+            .map(|r| r.expect("reader yielded error"))
             .collect();
 
         let fa2 = MockFasta::new("ACGTA");
@@ -124,53 +127,9 @@ mod tests {
         .map(|r| r.expect("walker yielded error"))
         .collect();
 
-        assert_eq!(collected.len(), 5, "expect five emitted records");
         assert_eq!(
-            collected, expected,
-            "two walker runs over identical inputs must emit byte-for-byte identical records",
-        );
-    }
-
-    /// Regression pin: piping walker output directly through the
-    /// writer surfaces a pre-existing contract mismatch.
-    ///
-    /// **What the walker emits.** When the read covering a record's
-    /// anchor position is also the *last* read in the run, the
-    /// walker stamps that slot's `expired_chains` onto the same
-    /// record whose `allele.chain_slots` still references it.
-    /// This happens because (a) the read contributes at its
-    /// `alignment_end` (so REF.chain_slots picks up the slot at the
-    /// final position), and (b) the closure rule expires the slot
-    /// on the very next walker tick — the same tick that closes the
-    /// final record.
-    ///
-    /// **What the writer expects.** [`PspWriter::apply_record_to_block`]
-    /// applies `expired_chains` to its running active-slot set
-    /// *before* validating each `allele.chain_slots` reference. So a
-    /// record that simultaneously expires slot S and references S in
-    /// its alleles trips
-    /// [`PhaseChainMarkerInconsistencyKind::AlleleReferencesUnknownSlot`].
-    ///
-    /// Reconciling this is a walker-or-writer design call (see the
-    /// implementation report) — out of scope for the seam itself.
-    /// The seam is correct; this test pins the integration finding
-    /// so the resolution doesn't silently regress whichever side
-    /// gets touched first.
-    #[test]
-    fn writer_rejects_walker_output_when_chain_expires_on_same_record_as_final_reference() {
-        let fa = MockFasta::new("ACGTA");
-        let reads = vec![
-            snp_read("r1", 1, b"ACGTA", &[30; 5]),
-            snp_read("r2", 1, b"ACGTA", &[30; 5]),
-        ];
-        let walker = run(reads, &fa, &WalkerConfig::default());
-        let writer = PspWriter::new(Cursor::new(Vec::<u8>::new()), writer_header(1))
-            .expect("writer construction");
-        let err = drive_pileup_to_psp(walker, writer)
-            .expect_err("walker → writer must fault on the final-record slot conflict today");
-        assert!(
-            matches!(err, PileupToPspError::Psp(_)),
-            "expected the writer-side validation to fault first, got {err:?}",
+            read_back, expected,
+            "records read back must equal records the walker emitted",
         );
     }
 

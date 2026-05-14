@@ -15,12 +15,13 @@
 //!   every `first_pos` / `last_pos` falls in
 //!   `[1, chromosomes[chrom_id].length]`.
 //! - **Sequential iteration:** per-block decode + per-record
-//!   materialisation with running phase-chain bookkeeping and the
-//!   block-start snapshot continuity check (spec check #11).
+//!   materialisation. No cross-block bookkeeping under the
+//!   unique-`u64`-chain-id design — chain ids are unique
+//!   throughout the file, so the same id in any block always
+//!   refers to the same molecule.
 //! - **Region iteration:** binary-search the block index for the
-//!   first overlapping block; snapshot-init the active-slot set at
-//!   each block (no cross-block continuity check on random-access
-//!   reads); clamp records to the requested window.
+//!   first overlapping block; clamp records to the requested
+//!   window.
 //!
 //! See `ia/feature_implementation_plans/psp_reader.md` for the
 //! design rationale and the test plan (Groups B, F, and R).
@@ -31,10 +32,7 @@ use super::block::{
     BlockHeader, ColumnManifestEntry, decode_block_header, decode_bytes_split, decode_list_column,
     decode_scalar_column_pod, decode_varint_column, new_column_decompressor, zstd_decompress_into,
 };
-use super::errors::{
-    BlockHeaderInvariantKind, MAX_SNAPSHOT_SLOTS_IN_ERROR, PhaseChainConsistencyKind, PspReadError,
-    ScalarDecodeError,
-};
+use super::errors::{BlockHeaderInvariantKind, PspReadError, ScalarDecodeError};
 use super::header::{
     HEAD_SENTINEL_LEN, HEADER_FRAMING_BYTES, MAX_HEADER_BODY_BYTES, MIN_HEADER_BODY_BYTES,
     ParsedHeader, parse_header_bytes,
@@ -325,9 +323,8 @@ impl<R: Read + Seek> PspReader<R> {
     }
 
     /// Sequential iterator over every record in genomic order.
-    /// Cross-block phase-chain continuity is checked at every
-    /// block boundary (spec check #11); errors poison the iterator
-    /// — subsequent `next()` calls return `None`.
+    /// Errors poison the iterator — subsequent `next()` calls
+    /// return `None`.
     pub fn records(&mut self) -> RecordsIter<'_, R> {
         RecordsIter::new(self, RangeClamp::None)
     }
@@ -336,9 +333,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// both ends) on `chrom_id`.
     ///
     /// Positions the iterator at the first block whose range
-    /// overlaps the window, init the active-slot set from that
-    /// block's snapshot (random-access mode skips spec check #11,
-    /// per the plan), and lets `RecordsIter` clamp per-record:
+    /// overlaps the window and lets `RecordsIter` clamp per-record:
     /// records before `start` are skipped; the first record past
     /// `end` ends iteration.
     ///
@@ -433,8 +428,6 @@ struct DecodedBlock {
     // Per-record columns
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
-    new_chain_slots: Vec<Vec<SlotId>>,
-    expired_chain_slots: Vec<Vec<SlotId>>,
     // Per-allele columns
     allele_seqs: Vec<Vec<u8>>,
     allele_obs_count: Vec<u32>,
@@ -446,10 +439,8 @@ struct DecodedBlock {
 }
 
 /// Region-iteration window. `None` for sequential iteration
-/// (the whole file, with full cross-block continuity); `Window`
-/// for region iteration (snapshot-init the active set at each
-/// block, no continuity check, clamp records to `[start, end]`
-/// on `chrom_id`).
+/// (the whole file); `Window` for region iteration (clamp records
+/// to `[start, end]` on `chrom_id`).
 #[derive(Debug, Clone, Copy)]
 enum RangeClamp {
     None,
@@ -517,30 +508,11 @@ pub struct RecordsIter<'r, R: Read + Seek> {
     /// record. Reset to `cur_block.first_pos` on the first record
     /// of every block.
     last_pos: u32,
-    /// Running phase-chain active-slot set, maintained across
-    /// records and across blocks for sequential iteration.
-    /// Sequential mode cross-checks every block-start snapshot
-    /// against this set (spec check #11); region mode resets it
-    /// from the snapshot at every block.
-    ///
-    /// M8: sorted `Vec<SlotId>` rather than `BTreeSet`, matching
-    /// the writer's `IngestState::active_slots` (`writer.rs:130`).
-    /// The typical active count is ~8, so one contiguous
-    /// allocation beats a tree, the block-start snapshot is a
-    /// `Vec == Vec` memcmp, and re-init is a clear-then-extend.
-    /// See `writer.rs:130-141` ("S1+S2") for the original
-    /// rationale.
-    active_chain_slots: Vec<SlotId>,
     /// `RangeClamp::None` for sequential iteration; `Window` for
-    /// region iteration. Tells `load_next_block` whether to run
-    /// the cross-block continuity check (sequential) or to
-    /// snapshot-init from the block header (region).
+    /// region iteration.
     clamp: RangeClamp,
     /// File-global running record count, incremented after each
-    /// successful `materialise_next_record`. Mi2: surfaces in
-    /// `PspReadError::PhaseChainConsistency` alongside the
-    /// block-local `record_in_block` so the file-coordinate
-    /// matches the writer-side `PhaseChainMarkerInconsistency`.
+    /// successful `materialise_next_record`.
     record_index: u64,
     /// Sticky: once `next()` has yielded `Some(Err(_))`, future
     /// calls return `None`. Required for `Iterator` correctness
@@ -585,7 +557,6 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             next_record_in_block: 0,
             next_allele_in_block: 0,
             last_pos: 0,
-            active_chain_slots: Vec::new(),
             clamp,
             record_index: 0,
             poisoned: false,
@@ -600,18 +571,10 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
     /// `self.cur_block`. Returns `Ok(false)` when no more blocks
     /// remain.
     ///
-    /// In sequential mode runs spec check #11: the new block's
-    /// `active_chain_slots_at_block_start` snapshot must equal the
-    /// active set carried in from the previous block. On a
-    /// chromosome change the active set must have been emptied by
-    /// the writer's chain-closure invariant, so both sides drop
-    /// to empty.
-    ///
-    /// In both modes runs spec check #10's first-block-of-chrom
-    /// rule: any block whose `chrom_id` differs from the previous
-    /// block's (or `cur_block_idx == 0`) must carry an empty
-    /// snapshot. M7: in random-access mode this was previously
-    /// silently trusted; the check is now run in both arms.
+    /// With unique-per-file chain ids the block header no longer
+    /// carries an active-slot snapshot, so there is no
+    /// snapshot-mismatch or first-block-of-chrom-must-be-empty
+    /// check to run here — block boundaries are structural only.
     fn load_next_block(&mut self) -> Result<bool, PspReadError> {
         if self.cur_block_idx >= self.reader.index.len() {
             return Ok(false);
@@ -623,52 +586,6 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             .map_err(io_err("block start seek"))?;
         let (block_header, _consumed) =
             read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
-
-        // M7: first-block-of-chromosome → snapshot must be empty.
-        // "First block of chromosome" = block 0, or any block
-        // whose `chrom_id` differs from the previous block's.
-        // Computed from the block index alone so the check runs
-        // before any phase-chain bookkeeping.
-        let is_first_of_chrom = self.cur_block_idx == 0
-            || self.reader.index[self.cur_block_idx].chrom_id
-                != self.reader.index[self.cur_block_idx - 1].chrom_id;
-        if is_first_of_chrom && !block_header.active_chain_slots.is_empty() {
-            return Err(PspReadError::BlockHeaderInvariant {
-                kind: BlockHeaderInvariantKind::NonEmptySnapshotAtChromStart {
-                    block: self.cur_block_idx,
-                    snapshot_len: block_header.active_chain_slots.len(),
-                },
-            });
-        }
-
-        match self.clamp {
-            RangeClamp::None => {
-                // Spec check #11: snapshot must match the
-                // carried-in set (sequential mode only). M8: both
-                // sides are sorted `Vec<SlotId>` so equality is
-                // a direct `==`. Mi1: on mismatch the error
-                // payload carries the (capped) contents of both
-                // sides so the divergence is diagnosable.
-                if block_header.active_chain_slots != self.active_chain_slots {
-                    return Err(PspReadError::BlockHeaderInvariant {
-                        kind: BlockHeaderInvariantKind::SnapshotMismatch {
-                            block: self.cur_block_idx,
-                            snapshot: cap_slots_for_error(&block_header.active_chain_slots),
-                            expected: cap_slots_for_error(&self.active_chain_slots),
-                        },
-                    });
-                }
-            }
-            RangeClamp::Window { .. } => {
-                // Random-access mode trusts the carried-set —
-                // the spec defers check #11 to sequential reads.
-                // The running set is reinitialised from the
-                // snapshot at every block.
-                self.active_chain_slots.clear();
-                self.active_chain_slots
-                    .extend_from_slice(&block_header.active_chain_slots);
-            }
-        }
 
         let decoded = decode_block_payload(
             &mut self.reader.source,
@@ -691,18 +608,14 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
 
     /// Construct the next `PileupRecord` from the currently-loaded
     /// block. Caller must ensure a block is loaded and has records
-    /// left. Also runs spec check #10: phase-chain marker
-    /// consistency against the running active-slot set.
+    /// left.
     ///
     /// M13: ownership of every per-record / per-allele inner `Vec`
     /// is moved out of the block via `mem::take`. The block is
     /// consumed strictly forwards (the iterator never revisits a
     /// `(block, i, j)` triple) and is dropped wholesale once
     /// exhausted, so the columns are dead the moment the record
-    /// is emitted. Validation reads (`&block.expired_chain_slots[i]`
-    /// etc.) run before the `mem::take`s by virtue of the
-    /// function's structure — every read is in the validation
-    /// section, every write is in the emission section.
+    /// is emitted.
     fn materialise_next_record(&mut self) -> Result<PileupRecord, PspReadError> {
         // M1: lift the option-unwrap out of the function body —
         // the caller (`<Self as Iterator>::next`) gates this call
@@ -721,46 +634,6 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             }
         };
         let i = self.next_record_in_block as usize;
-        let cur_block_idx = self.cur_block_idx;
-        let next_record_in_block = self.next_record_in_block;
-        let record_index = self.record_index;
-
-        // Spec check #10, part 1: every expired slot must currently
-        // be in the active set; no new slot may already be active.
-        // M8: sorted-Vec membership via `binary_search`.
-        for &slot in &block.expired_chain_slots[i] {
-            if self.active_chain_slots.binary_search(&slot).is_err() {
-                return Err(PspReadError::PhaseChainConsistency {
-                    block: cur_block_idx,
-                    record_in_block: next_record_in_block,
-                    record_index,
-                    kind: PhaseChainConsistencyKind::ExpiredNotActive { slot },
-                });
-            }
-        }
-        for &slot in &block.new_chain_slots[i] {
-            if self.active_chain_slots.binary_search(&slot).is_ok() {
-                return Err(PspReadError::PhaseChainConsistency {
-                    block: cur_block_idx,
-                    record_in_block: next_record_in_block,
-                    record_index,
-                    kind: PhaseChainConsistencyKind::NewAlreadyActive { slot },
-                });
-            }
-        }
-        // Apply markers (expired then new) — matches the writer's
-        // semantics in `apply_record_to_block`.
-        for &slot in &block.expired_chain_slots[i] {
-            if let Ok(pos) = self.active_chain_slots.binary_search(&slot) {
-                self.active_chain_slots.remove(pos);
-            }
-        }
-        for &slot in &block.new_chain_slots[i] {
-            if let Err(pos) = self.active_chain_slots.binary_search(&slot) {
-                self.active_chain_slots.insert(pos, slot);
-            }
-        }
-
         // Mi5: `delta_pos[i]` decodes as `u64`. A varint with the
         // top 32 bits set silently truncates if we cast to `u32`,
         // and `saturating_add` then caps `pos` at `u32::MAX` —
@@ -782,26 +655,6 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
         let n_alleles_here = block.n_alleles[i] as usize;
         let allele_start = self.next_allele_in_block as usize;
         let allele_end = allele_start + n_alleles_here;
-
-        // Spec check #10, part 2: every slot referenced by an
-        // allele must be in the post-application active set.
-        // Validation reads happen here, *before* the `mem::take`
-        // loop below.
-        for j in allele_start..allele_end {
-            for &slot in &block.allele_chain_slots[j] {
-                if self.active_chain_slots.binary_search(&slot).is_err() {
-                    return Err(PspReadError::PhaseChainConsistency {
-                        block: cur_block_idx,
-                        record_in_block: next_record_in_block,
-                        record_index,
-                        kind: PhaseChainConsistencyKind::AlleleReferencesUnknownSlot {
-                            allele_index: j - allele_start,
-                            slot,
-                        },
-                    });
-                }
-            }
-        }
 
         // M13: emission. Move ownership of the inner Vecs out of
         // `block` rather than cloning each one. The block is dead
@@ -825,8 +678,6 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
         let record = PileupRecord {
             chrom_id: block.chrom_id,
             pos,
-            new_chains: std::mem::take(&mut block.new_chain_slots[i]),
-            expired_chains: std::mem::take(&mut block.expired_chain_slots[i]),
             alleles,
         };
 
@@ -1020,8 +871,6 @@ fn decode_block_payload<R: Read>(
     // Per-record slots.
     let mut delta_pos: Option<Vec<u64>> = None;
     let mut n_alleles: Option<Vec<u64>> = None;
-    let mut new_chain_slots: Option<Vec<Vec<SlotId>>> = None;
-    let mut expired_chain_slots: Option<Vec<Vec<SlotId>>> = None;
 
     // Per-allele slots.
     let mut allele_seq_len: Option<Vec<u64>> = None;
@@ -1088,8 +937,6 @@ fn decode_block_payload<R: Read>(
             DecodedColumn::AlleleFwdCount(v) => allele_fwd_count = Some(v),
             DecodedColumn::AllelePlacedLeftCount(v) => allele_placed_left_count = Some(v),
             DecodedColumn::AllelePlacedStartCount(v) => allele_placed_start_count = Some(v),
-            DecodedColumn::NewChainSlots(v) => new_chain_slots = Some(v),
-            DecodedColumn::ExpiredChainSlots(v) => expired_chain_slots = Some(v),
             DecodedColumn::AlleleChainSlots(v) => allele_chain_slots = Some(v),
         }
     }
@@ -1123,9 +970,6 @@ fn decode_block_payload<R: Read>(
         n_records: header.n_records,
         delta_pos: delta_pos.expect("delta-pos column required by v1.0 schema"),
         n_alleles,
-        new_chain_slots: new_chain_slots.expect("new-chain-slots column required by v1.0 schema"),
-        expired_chain_slots: expired_chain_slots
-            .expect("expired-chain-slots column required by v1.0 schema"),
         allele_seqs: allele_seqs.expect("allele-seq column required by v1.0 schema"),
         allele_obs_count: allele_obs_count
             .expect("allele-obs-count column required by v1.0 schema"),
@@ -1158,8 +1002,6 @@ enum DecodedColumn {
     AlleleFwdCount(Vec<u32>),
     AllelePlacedLeftCount(Vec<u32>),
     AllelePlacedStartCount(Vec<u32>),
-    NewChainSlots(Vec<Vec<SlotId>>),
-    ExpiredChainSlots(Vec<Vec<SlotId>>),
     AlleleChainSlots(Vec<Vec<SlotId>>),
 }
 
@@ -1339,18 +1181,6 @@ fn decode_one_column<R: Read>(
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
             decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
-        ColumnKey::NewChainSlots => DecodedColumn::NewChainSlots(decode_list_column::<SlotId>(
-            bytes,
-            n_records,
-            column_name,
-        )?),
-        ColumnKey::ExpiredChainSlots => {
-            DecodedColumn::ExpiredChainSlots(decode_list_column::<SlotId>(
-                bytes,
-                n_records,
-                column_name,
-            )?)
-        }
         ColumnKey::AlleleChainSlots => DecodedColumn::AlleleChainSlots(
             decode_list_column::<SlotId>(bytes, n_total_alleles, column_name)?,
         ),
@@ -1370,17 +1200,6 @@ fn block_byte_budget(index: &[BlockIndexEntry], trailer: &Trailer, block_idx: us
         .map(|e| e.block_offset)
         .unwrap_or(trailer.index_offset);
     next_offset.saturating_sub(this_offset)
-}
-
-/// Mi1: truncate a slot list for inclusion in a
-/// `BlockHeaderInvariantKind::SnapshotMismatch` error payload, so
-/// log lines stay bounded on pathological inputs.
-fn cap_slots_for_error(slots: &[SlotId]) -> Vec<u16> {
-    slots
-        .iter()
-        .take(MAX_SNAPSHOT_SLOTS_IN_ERROR)
-        .copied()
-        .collect()
 }
 
 /// Predict the column's uncompressed byte length from the schema
@@ -1435,8 +1254,6 @@ mod tests {
         PileupRecord {
             chrom_id,
             pos,
-            new_chains: Vec::new(),
-            expired_chains: Vec::new(),
             alleles: vec![AlleleObservation {
                 seq: seq.to_vec(),
                 support: AlleleSupportStats {
@@ -1600,8 +1417,6 @@ mod tests {
         let want = PileupRecord {
             chrom_id: 0,
             pos: 100,
-            new_chains: Vec::new(),
-            expired_chains: Vec::new(),
             alleles: vec![allele(b"A", 17, -42.5, 9, 3, 7, &[])],
         };
         let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
@@ -1617,8 +1432,6 @@ mod tests {
         let got = &got[0];
         assert_eq!(got.chrom_id, want.chrom_id);
         assert_eq!(got.pos, want.pos);
-        assert_eq!(got.new_chains, want.new_chains);
-        assert_eq!(got.expired_chains, want.expired_chains);
         assert_eq!(got.alleles.len(), want.alleles.len());
         let g = &got.alleles[0];
         let w = &want.alleles[0];
@@ -1639,8 +1452,6 @@ mod tests {
         let snp = PileupRecord {
             chrom_id: 0,
             pos: 100,
-            new_chains: Vec::new(),
-            expired_chains: Vec::new(),
             alleles: vec![
                 allele(b"A", 30, -50.0, 16, 0, 30, &[]),
                 allele(b"C", 8, -8.0, 4, 0, 8, &[]),
@@ -1649,8 +1460,6 @@ mod tests {
         let multi = PileupRecord {
             chrom_id: 0,
             pos: 200,
-            new_chains: Vec::new(),
-            expired_chains: Vec::new(),
             alleles: vec![
                 allele(b"ACGT", 25, -40.0, 13, 0, 25, &[]),
                 allele(b"A", 5, -5.0, 2, 0, 5, &[]), // deletion of CGT
@@ -1750,59 +1559,36 @@ mod tests {
     }
 
     /// Build a record that opens slot `slot_id` at this position.
-    fn record_open_slot(chrom_id: u32, pos: u32, slot_id: SlotId) -> PileupRecord {
+    /// Record referencing chain id `chain_id` in its REF allele.
+    fn record_with_chain_id(chrom_id: u32, pos: u32, chain_id: SlotId) -> PileupRecord {
         PileupRecord {
             chrom_id,
             pos,
-            new_chains: vec![slot_id],
-            expired_chains: Vec::new(),
-            alleles: vec![allele(b"A", 1, -1.0, 1, 0, 1, &[slot_id])],
+            alleles: vec![allele(b"A", 1, -1.0, 1, 0, 1, &[chain_id])],
         }
     }
 
-    /// Record that consumes slot `slot_id` (references it but does
-    /// not close it).
-    fn record_use_slot(chrom_id: u32, pos: u32, slot_id: SlotId) -> PileupRecord {
-        PileupRecord {
-            chrom_id,
-            pos,
-            new_chains: Vec::new(),
-            expired_chains: Vec::new(),
-            alleles: vec![allele(b"A", 1, -1.0, 1, 0, 1, &[slot_id])],
-        }
-    }
-
-    /// Record that closes slot `slot_id`.
-    fn record_close_slot(chrom_id: u32, pos: u32, slot_id: SlotId) -> PileupRecord {
-        PileupRecord {
-            chrom_id,
-            pos,
-            new_chains: Vec::new(),
-            expired_chains: vec![slot_id],
-            alleles: vec![allele(b"A", 1, -1.0, 1, 0, 1, &[])],
-        }
-    }
-
-    /// (B5 / R9) Slot 7 opens in block N's last record, gets
-    /// referenced (consumed) in block N+1's first record, and
-    /// closes later. The reader's cross-block snapshot check
-    /// passes, and slot 7 is present in the per-record
-    /// `chain_slots` on both sides of the boundary.
+    /// (B5 / R9) A chain id appears on records spanning a block
+    /// boundary. The reader must materialise the id on both sides
+    /// without any active-set bookkeeping (unique-per-file ids
+    /// don't need it).
     #[test]
-    fn phase_chain_across_block_boundary() {
+    fn chain_id_round_trips_across_block_boundary() {
         let header = writer_header(1);
-        // Tiny block target so a few records fill a block.
         let mut writer =
             PspWriter::new_with_block_target(Cursor::new(Vec::new()), header, 1024).unwrap();
 
-        // Block 0: 100 plain records, then one that opens slot 7.
+        // Block 0: 100 plain records, then one referencing chain id 7.
         for i in 1u32..=100 {
             writer.write_record(&one_allele_record(0, i, b"A")).unwrap();
         }
-        writer.write_record(&record_open_slot(0, 101, 7)).unwrap();
-        // Block 1: a record that uses slot 7, then one that closes it.
-        writer.write_record(&record_use_slot(0, 102, 7)).unwrap();
-        writer.write_record(&record_close_slot(0, 103, 7)).unwrap();
+        writer
+            .write_record(&record_with_chain_id(0, 101, 7))
+            .unwrap();
+        // Block 1: another record referencing chain id 7.
+        writer
+            .write_record(&record_with_chain_id(0, 102, 7))
+            .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
 
         let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
@@ -1814,79 +1600,13 @@ mod tests {
         let got: Vec<PileupRecord> = reader
             .records()
             .collect::<Result<_, _>>()
-            .expect("phase-chain continuity holds across block boundaries");
+            .expect("records iterate cleanly across the boundary");
 
-        // Slot 7 appears on the open record, the use record, and
-        // the close record's `expired_chains`.
-        let opener = got.iter().find(|r| r.pos == 101).unwrap();
-        let user = got.iter().find(|r| r.pos == 102).unwrap();
-        let closer = got.iter().find(|r| r.pos == 103).unwrap();
-        assert!(opener.new_chains.contains(&7));
-        assert!(opener.alleles[0].chain_slots.contains(&7));
-        assert!(user.alleles[0].chain_slots.contains(&7));
-        assert!(closer.expired_chains.contains(&7));
-    }
-
-    /// (R10) Tight 4-record fixture engineered so block 1's
-    /// `active_chain_slots_at_block_start` snapshot is `[7]`. The
-    /// test then mutates that snapshot byte (slot 7 → slot 9),
-    /// breaking the carried-in active set continuity, and asserts
-    /// the reader rejects the file at the snapshot check.
-    #[test]
-    fn snapshot_mismatch_at_block_boundary() {
-        let header = writer_header(1);
-        // Target = 64 B: each ~30-byte record fills a block fast,
-        // so the second flush boundary lands between the
-        // open-slot record (in block 0) and the use-slot record
-        // (in block 1). Block 1's snapshot is therefore `[7]`.
-        let mut writer =
-            PspWriter::new_with_block_target(Cursor::new(Vec::new()), header, 64).unwrap();
-        writer.write_record(&one_allele_record(0, 1, b"A")).unwrap();
-        writer.write_record(&record_open_slot(0, 2, 7)).unwrap();
-        writer.write_record(&record_use_slot(0, 3, 7)).unwrap();
-        writer.write_record(&record_close_slot(0, 4, 7)).unwrap();
-        let mut bytes = writer.finish().unwrap().into_inner();
-
-        // Block 1's header at this fixture: 5 single-byte varints
-        // (chrom_id=0, first_pos=3, n_records=2,
-        // n_total_alleles=2, slot_count=1), then the snapshot
-        // slot LE u16 starting at `block1_offset + 5`. Slot 7
-        // (0x07 0x00) → slot 9 (0x09 0x00) breaks the snapshot.
-        let (block1_offset, n_blocks) = {
-            let reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
-            (
-                reader.block_index()[1].block_offset as usize,
-                reader.block_index().len(),
-            )
-        };
-        assert!(
-            n_blocks >= 2,
-            "fixture must produce ≥2 blocks; got {n_blocks}"
-        );
-        let snapshot_slot_offset = block1_offset + 5;
-        assert_eq!(
-            bytes[snapshot_slot_offset], 0x07,
-            "fixture invariant: block 1's snapshot slot LE u16 starts with 0x07"
-        );
-        assert_eq!(bytes[snapshot_slot_offset + 1], 0x00);
-        bytes[snapshot_slot_offset] = 0x09;
-
-        let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
-        let err = reader
-            .records()
-            .find_map(|r| r.err())
-            .expect("snapshot mismatch must surface as an error");
-        match err {
-            PspReadError::BlockHeaderInvariant {
-                kind: BlockHeaderInvariantKind::SnapshotMismatch { .. },
-            } => {}
-            PspReadError::PhaseChainConsistency { .. } => {
-                // Acceptable: the mismatch may surface first as a
-                // per-record consistency violation if the snapshot
-                // happens to be the *right* size but wrong slot id.
-            }
-            other => panic!("expected SnapshotMismatch or PhaseChainConsistency, got {other:?}"),
-        }
+        // Chain id 7 appears on both records around the boundary.
+        let first = got.iter().find(|r| r.pos == 101).unwrap();
+        let second = got.iter().find(|r| r.pos == 102).unwrap();
+        assert!(first.alleles[0].chain_slots.contains(&7));
+        assert!(second.alleles[0].chain_slots.contains(&7));
     }
 
     /// Build a 3-block fixture: 3 blocks on chrom 0 each holding
@@ -2143,7 +1863,6 @@ mod tests {
             first_pos: 1,
             n_records: 1,
             n_total_alleles: 1,
-            active_chain_slots: vec![],
             manifest: vec![
                 ColumnManifestEntry {
                     tag: 0x02,
@@ -2188,7 +1907,6 @@ mod tests {
             first_pos: 1,
             n_records: 1,
             n_total_alleles: 1,
-            active_chain_slots: vec![],
             manifest: vec![ColumnManifestEntry {
                 tag: 0x10, // allele-obs-count, the only v1.0 column present
                 compressed_len: 0,
@@ -2223,64 +1941,11 @@ mod tests {
         }
     }
 
-    /// (F8) Forge block 0's snapshot to declare slot_count = 1
-    /// (originally 0). Sequential iteration with an empty
-    /// carried-in active set fires `NonEmptySnapshotAtChromStart`
-    /// (M7) — or, if the forging mangles the byte stream past the
-    /// snapshot count, some other block-header variant.
-    ///
-    /// Mi7: the test pins that *something* must error. The
-    /// previous shape silently returned when open failed and the
-    /// iteration loop happened not to run; with the contract
-    /// recorded explicitly here a regression that silently accepts
-    /// the forged file would fail the assertion below.
-    #[test]
-    fn first_block_non_empty_snapshot() {
-        let mut bytes = small_multi_block_fixture();
-        let block0_offset = {
-            let reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
-            reader.block_index()[0].block_offset as usize
-        };
-        // For this fixture every leading field encodes to one
-        // byte, so slot_count sits at `block0_offset + 4`.
-        let slot_count_offset = block0_offset + 4;
-        assert_eq!(
-            bytes[slot_count_offset], 0,
-            "fixture invariant: block 0 starts with empty snapshot"
-        );
-        bytes[slot_count_offset] = 1;
-        match PspReader::new(Cursor::new(bytes)) {
-            Ok(mut reader) => {
-                let err = reader
-                    .records()
-                    .find_map(|r| r.err())
-                    .expect("forged non-empty first-block snapshot must error during iteration");
-                assert!(matches!(
-                    err,
-                    PspReadError::BlockHeaderInvariant { .. }
-                        | PspReadError::BlockHeaderField { .. }
-                        | PspReadError::BlockHeaderTruncated { .. }
-                        | PspReadError::BlockHeaderExceedsCap { .. }
-                ));
-            }
-            Err(e) => {
-                // Open-time failure is acceptable — the forging may
-                // have mangled the file enough that one of the
-                // open-time integrity checks rejected it. Either way
-                // we asserted that *something* failed.
-                assert!(matches!(
-                    e,
-                    PspReadError::BlockHeaderInvariant { .. }
-                        | PspReadError::BlockHeaderField { .. }
-                        | PspReadError::BlockHeaderTruncated { .. }
-                        | PspReadError::BlockHeaderExceedsCap { .. }
-                        | PspReadError::IndexChecksum { .. }
-                        | PspReadError::IndexTrailingBytes { .. }
-                        | PspReadError::IndexEntryDecode { .. }
-                ));
-            }
-        }
-    }
+    // (F8) The "forge block 0's active-slot snapshot" test is gone
+    // along with the snapshot field; block headers no longer carry
+    // a per-block active-slot list, so there is no `slot_count`
+    // byte to mutate or `NonEmptySnapshotAtChromStart` invariant to
+    // assert on.
 
     // -----------------------------------------------------------------
     // Regression tests added by the 2026-05-13 reader code review
@@ -2321,7 +1986,6 @@ mod tests {
                 first_pos: 1,
                 n_records: 1,
                 n_total_alleles: 1,
-                active_chain_slots: vec![],
                 manifest,
             };
             let mut buf = Vec::new();
@@ -2458,60 +2122,10 @@ mod tests {
         ));
     }
 
-    /// (M7) Random-access region mode rejects a first-block-of-
-    /// chromosome whose snapshot is non-empty. Previously
-    /// silently trusted in `RangeClamp::Window`.
-    ///
-    /// Fixture: 4 records on chrom 0 with a small block target so
-    /// at least 2 blocks are emitted. Forge block 0 (which is by
-    /// construction the first block of chrom 0) to declare
-    /// `slot_count = 1` plus a single slot.
-    #[test]
-    fn region_mode_rejects_non_empty_snapshot_at_chrom_start() {
-        let mut bytes = small_multi_block_fixture();
-        let block0_offset = {
-            let reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
-            reader.block_index()[0].block_offset as usize
-        };
-        let slot_count_offset = block0_offset + 4;
-        assert_eq!(
-            bytes[slot_count_offset], 0,
-            "fixture invariant: block 0 starts with empty snapshot"
-        );
-        bytes[slot_count_offset] = 1;
-        bytes.splice(
-            slot_count_offset + 1..slot_count_offset + 1,
-            [0x07u8, 0x00u8],
-        );
-        // The trailer's index_offset arithmetic is now wrong; the
-        // splice shifted everything past it. PspReader::new may
-        // therefore reject the file at open. That's fine — the
-        // test pins that *something* fails rather than the
-        // forged snapshot being silently trusted.
-        match PspReader::new(Cursor::new(bytes)) {
-            Ok(mut reader) => {
-                let err = reader
-                    .region_records(0, 1, u32::MAX)
-                    .find_map(|r| r.err())
-                    .expect("region-mode reader must reject non-empty snapshot at chrom 0");
-                assert!(matches!(
-                    err,
-                    PspReadError::BlockHeaderInvariant {
-                        kind: BlockHeaderInvariantKind::NonEmptySnapshotAtChromStart { .. }
-                    } | PspReadError::BlockHeaderInvariant {
-                        kind: BlockHeaderInvariantKind::SnapshotMismatch { .. }
-                    } | PspReadError::BlockHeaderInvariant { .. }
-                        | PspReadError::BlockHeaderField { .. }
-                        | PspReadError::BlockHeaderTruncated { .. }
-                        | PspReadError::BlockHeaderExceedsCap { .. }
-                ));
-            }
-            Err(_) => {
-                // Open-time failure is also acceptable (the splice
-                // shifts the trailer's pointer math).
-            }
-        }
-    }
+    // (M7) The "region mode rejects non-empty snapshot at chrom
+    // start" test is gone along with the snapshot field. Block
+    // headers no longer carry per-block active-slot lists; the
+    // first-block-of-chrom rule it pinned no longer exists.
 
     /// (Mi5) The `delta_pos` cast from `u64` to `u32` previously
     /// truncated silently for varints with the top 32 bits set,

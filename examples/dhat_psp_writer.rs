@@ -93,7 +93,7 @@ fn build_records() -> Vec<PileupRecord> {
                 Vec::new(),
             ));
         }
-        records.push(PileupRecord::new(0, pos, Vec::new(), Vec::new(), alleles));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }

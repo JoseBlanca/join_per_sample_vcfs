@@ -154,22 +154,17 @@ impl ActiveReads {
         while i > 0 {
             i -= 1;
             if self.reads[i].read.alignment_end < walker_pos {
-                // The eager `event_cursor` invariant the previous
-                // implementation checked here ("every event was
-                // popped") doesn't apply to the lazy cursor — it's
-                // stateless, so there's nothing to mark consumed.
                 // Single-fold-per-(record, read) is enforced by
-                // `OpenPileupRecord.folded_reads` instead.
+                // `OpenPileupRecord.folded_reads`, not by per-read
+                // state here — the lazy CIGAR cursor is stateless.
                 //
-                // Order matters: give up the still-pending partner ref
-                // (if any) **before** releasing the read's own slot. An
-                // orphan first mate's slot has refcount 2; the two
-                // calls together collapse it 2→1→0 in this single
-                // step, so the expired mark fires now and lands on the
-                // next aged record. Without the partner-release the
-                // orphan's slot stays stuck at refcount 1 and never
-                // emits `expired_chains[S]`. See finding M1 in
-                // `ia/reviews/pileup_2026-05-09.md`.
+                // Order matters: give up the still-pending partner
+                // reservation (if any) **before** releasing the
+                // read's own active-count slot. An orphan first
+                // mate bumped `active_count` twice (once for itself,
+                // once anticipating the partner); these two calls
+                // together collapse those bumps back to zero in this
+                // single step.
                 let slot = self.reads[i].chain_slot_id;
                 let qname = self.reads[i].read.qname.clone();
                 let chrom_id = self.reads[i].read.chrom_id;
@@ -337,26 +332,15 @@ mod tests {
     }
 
     #[test]
-    fn flush_all_releases_every_slot() {
+    fn flush_all_drops_every_active_read() {
         let mut s = ActiveReads::new();
         let mut a = SlotAllocator::new();
         for i in 0..5 {
             s.admit(solo_read(&format!("r{i}"), 0, 100, 50), &mut a)
                 .unwrap();
         }
-        // Drain once to emit the new_marks (mimics the walker
-        // emitting at least one record between admit and flush).
-        // Without this drain the new+expired pairs would suppress
-        // each other and we'd see no marks on the post-flush
-        // drain.
-        let (new1, _expired1) = a.drain_lifecycle_marks();
-        assert_eq!(new1.len(), 5);
-
         assert_eq!(s.len(), 5);
         s.flush_all(&mut a, 200).unwrap();
         assert!(s.is_empty());
-
-        let (_new, expired) = a.drain_lifecycle_marks();
-        assert_eq!(expired.len(), 5);
     }
 }

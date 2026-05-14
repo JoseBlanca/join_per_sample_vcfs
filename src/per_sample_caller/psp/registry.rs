@@ -191,8 +191,6 @@ pub enum ColumnKey {
     AlleleFwdCount,
     AllelePlacedLeftCount,
     AllelePlacedStartCount,
-    NewChainSlots,
-    ExpiredChainSlots,
     AlleleChainSlots,
 }
 
@@ -428,52 +426,22 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
             (freebayes' placedStart).",
     },
     ColumnDef {
-        tag: 0x20,
-        key: ColumnKey::NewChainSlots,
-        name: "new-chain-slots",
-        cardinality: Cardinality::PerRecord,
-        payload: ColumnPayload::List {
-            element_type: ElementType::U16,
-        },
-        required: true,
-        finite_constraint: false,
-        description: "Phase-chain slot ids that became active since \
-            the previous record. Ascending. On record 0 of a block, \
-            'the previous record' is the block header's \
-            active-chain-slots-at-block-start snapshot.",
-    },
-    ColumnDef {
-        tag: 0x21,
-        key: ColumnKey::ExpiredChainSlots,
-        name: "expired-chain-slots",
-        cardinality: Cardinality::PerRecord,
-        payload: ColumnPayload::List {
-            element_type: ElementType::U16,
-        },
-        required: true,
-        finite_constraint: false,
-        description: "Phase-chain slot ids that ended since the \
-            previous record. Ascending. On record 0 of a block, \
-            'the previous record' is the block header's \
-            active-chain-slots-at-block-start snapshot.",
-    },
-    ColumnDef {
         tag: 0x22,
         key: ColumnKey::AlleleChainSlots,
         name: "allele-chain-slots",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::List {
-            element_type: ElementType::U16,
+            element_type: ElementType::U64,
         },
         required: true,
         finite_constraint: false,
-        description: "Phase-chain slot ids contributing to each \
-            allele observation. Ascending. References the \
-            active-slot set after applying this record's \
-            expired-chain-slots and new-chain-slots to the active \
-            set carried in from the previous record (or, for record \
-            0 of a block, to the block header's \
-            active-chain-slots-at-block-start snapshot).",
+        description: "Phase-chain identifiers contributing to each \
+            allele observation. Ascending fixed-width little-endian \
+            u64s (relying on zstd to compress the leading zero bytes \
+            on early ids). Identifiers are unique within the .psp \
+            file and never recycled, so two observations sharing an \
+            identifier came from the same read or read-pair in this \
+            sample.",
     },
 ];
 
@@ -649,7 +617,7 @@ mod tests {
         assert_eq!(slots.tag, 0x22);
         assert_eq!(slots.cardinality, Cardinality::PerAllele);
         assert_eq!(slots.shape(), Shape::List);
-        assert_eq!(slots.element_type(), Some(ElementType::U16));
+        assert_eq!(slots.element_type(), Some(ElementType::U64));
 
         let seq = lookup_by_name("allele-seq").unwrap();
         assert_eq!(seq.shape(), Shape::Bytes);

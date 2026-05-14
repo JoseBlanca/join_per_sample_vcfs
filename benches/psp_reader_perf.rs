@@ -106,7 +106,7 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
                 Vec::new(),
             ));
         }
-        records.push(PileupRecord::new(0, pos, Vec::new(), Vec::new(), alleles));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }
@@ -114,40 +114,25 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
 fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
     let mut records = Vec::with_capacity(n);
     let bases = [b'A', b'C', b'G', b'T'];
-    let mut active: Vec<u16> = Vec::new();
-
-    fn next_unused(active: &[u16], also_avoid: &[u16]) -> u16 {
-        for id in 0..=255u16 {
-            if active.binary_search(&id).is_err() && !also_avoid.contains(&id) {
-                return id;
-            }
-        }
-        panic!("active set exhausted slot pool");
-    }
+    let mut next_id: u64 = 0;
+    let mut active: Vec<u64> = Vec::new();
 
     for i in 0..n {
         let pos = (i as u32) + 1;
         let ref_base = bases[i & 3];
 
-        let mut new_chains: Vec<u16> = Vec::new();
-        let mut expired_chains: Vec<u16> = Vec::new();
-
         if i == 0 {
-            for &seed in &[0u16, 1, 2, 3] {
-                new_chains.push(seed);
-                let idx = active.partition_point(|&s| s < seed);
-                active.insert(idx, seed);
+            for _ in 0..4 {
+                active.push(next_id);
+                next_id += 1;
             }
         } else {
             if i % 13 == 0 && active.len() > 3 {
-                let slot = active.remove(0);
-                expired_chains.push(slot);
+                active.remove(0);
             }
             if i % 11 == 0 && active.len() < 12 {
-                let slot = next_unused(&active, &expired_chains);
-                new_chains.push(slot);
-                let idx = active.partition_point(|&s| s < slot);
-                active.insert(idx, slot);
+                active.push(next_id);
+                next_id += 1;
             }
         }
 
@@ -158,13 +143,7 @@ fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
             chain_slots,
         )];
 
-        records.push(PileupRecord::new(
-            0,
-            pos,
-            new_chains,
-            expired_chains,
-            alleles,
-        ));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }
@@ -241,7 +220,7 @@ fn build_multi_allele_records(n: usize) -> Vec<PileupRecord> {
                 ),
             ],
         };
-        records.push(PileupRecord::new(0, pos, Vec::new(), Vec::new(), alleles));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }

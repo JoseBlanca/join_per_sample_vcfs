@@ -43,8 +43,7 @@ pub(crate) mod test_fixtures;
 // submodule. The `*Kind` sub-enums must be re-exported too because
 // the top-level error variants carry them as `#[source]`.
 pub use errors::{
-    BlockHeaderInvariantKind, InvalidRecordKind, PhaseChainConsistencyKind,
-    PhaseChainMarkerInconsistencyKind, PspReadError, PspWriteError, ScalarDecodeError,
+    BlockHeaderInvariantKind, InvalidRecordKind, PspReadError, PspWriteError, ScalarDecodeError,
     TomlSerError, VarintError,
 };
 pub use reader::{PspReader, RecordsIter};

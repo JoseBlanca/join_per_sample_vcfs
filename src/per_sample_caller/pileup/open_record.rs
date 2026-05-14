@@ -130,10 +130,7 @@ impl OpenPileupRecord {
         self.pos.saturating_add(self.ref_span())
     }
 
-    /// Convert into a finalised `PileupRecord`. The slot lifecycle
-    /// markers (`new_chains` / `expired_chains`) are filled by the
-    /// caller from the `SlotAllocator`'s drain; this method only
-    /// converts the per-allele state.
+    /// Convert into a finalised `PileupRecord`.
     pub fn finalise(self) -> PileupRecord {
         let alleles = self
             .alleles
@@ -147,8 +144,6 @@ impl OpenPileupRecord {
         PileupRecord {
             chrom_id: self.chrom_id,
             pos: self.pos,
-            new_chains: Vec::new(),
-            expired_chains: Vec::new(),
             alleles,
         }
     }

@@ -21,7 +21,6 @@
 //!   buffers and decides when to flush.
 //! - The dispatch from `[[column]]` schema entries to the
 //!   type-specific codec calls here.
-//! - The cross-block phase-chain consistency checks.
 //!
 //! Each block on the wire:
 //!
@@ -37,9 +36,8 @@
 
 use std::io;
 
-use super::errors::{BlockHeaderInvariantKind, PspReadError, ScalarDecodeError, VarintError};
+use super::errors::{BlockHeaderInvariantKind, PspReadError, ScalarDecodeError};
 use super::varint::{decode_u64_leb128, encode_u64_leb128};
-use crate::per_sample_caller::pileup::SlotId;
 
 // ---------------------------------------------------------------------
 // WireScalar trait — fixed-width per-entry codecs
@@ -645,16 +643,6 @@ pub struct BlockHeader {
     pub first_pos: u32,
     pub n_records: u32,
     pub n_total_alleles: u32,
-    /// `active_chain_slots_at_block_start`: slot ids inherited from
-    /// the immediately preceding block on the same chromosome.
-    /// **Strictly ascending, no duplicates**, empty whenever this is
-    /// the first block on its chromosome. Spec §"Phase-chain state
-    /// across blocks".
-    ///
-    /// Type is `Vec<SlotId>` (not `Vec<u16>`) so widening `SlotId`
-    /// past `u16` is a compile error here rather than a silent
-    /// wire-format break. M12.
-    pub active_chain_slots: Vec<SlotId>,
     /// Per-column manifest, **strictly ascending by `column_tag`,
     /// no duplicates** — the writer sorts at emit time, the reader
     /// rejects out-of-order manifests.
@@ -683,13 +671,6 @@ pub fn encode_block_header(
     encode_u64_leb128(u64::from(header.first_pos), out);
     encode_u64_leb128(u64::from(header.n_records), out);
     encode_u64_leb128(u64::from(header.n_total_alleles), out);
-    encode_u64_leb128(header.active_chain_slots.len() as u64, out);
-    for &slot in &header.active_chain_slots {
-        // M12: width is `<SlotId as WireScalar>::FIXED_BYTE_WIDTH`,
-        // computed once below to keep the wire-format dependence on
-        // `SlotId`'s size in one place.
-        out.extend_from_slice(&slot.to_le_bytes());
-    }
     encode_u64_leb128(header.manifest.len() as u64, out);
     for entry in &header.manifest {
         encode_u64_leb128(u64::from(entry.tag), out);
@@ -709,35 +690,11 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<(BlockHeader, usize), PspRead
     let n_records = decode_u32_field(bytes, &mut cursor, "n_records")?;
     let n_total_alleles = decode_u32_field(bytes, &mut cursor, "n_total_alleles")?;
 
-    let k = decode_u32_field(bytes, &mut cursor, "active_chain_slots_count")?;
-    // DoS guard: `k` is attacker-controlled. Each active-slot entry
-    // is a fixed `SlotId` LE (`<SlotId as WireScalar>::FIXED_BYTE_WIDTH`
-    // bytes); reject any `k` above the remaining-buffer-derived
-    // bound before any `Vec::with_capacity` allocation. The width
-    // tracks `SlotId`'s size — widening `SlotId` past `u16` (M12)
-    // adjusts the wire shape at one site and the encoder loop in
-    // `encode_block_header` correspondingly.
-    const SLOT_WIDTH: usize = <SlotId as WireScalar>::FIXED_BYTE_WIDTH;
-    let remaining = bytes.len().saturating_sub(cursor);
-    let cap = (k as usize).min(remaining / SLOT_WIDTH + 1);
-    let mut active_chain_slots = Vec::with_capacity(cap);
-    for _ in 0..k {
-        if cursor + SLOT_WIDTH > bytes.len() {
-            return Err(PspReadError::BlockHeaderField {
-                field: "active_chain_slots",
-                source: VarintError::Truncated,
-            });
-        }
-        let arr: [u8; SLOT_WIDTH] = bytes[cursor..cursor + SLOT_WIDTH].try_into().unwrap();
-        active_chain_slots.push(SlotId::from_le_bytes(arr));
-        cursor += SLOT_WIDTH;
-    }
-
     let n_columns = decode_u32_field(bytes, &mut cursor, "n_columns")?;
-    // DoS guard: same shape as `active_chain_slots` above. Each
-    // manifest entry is at minimum three single-byte varints
-    // (tag, compressed_len, uncompressed_len), so the cap below is
-    // a generous upper bound that scales with the buffer.
+    // DoS guard: `n_columns` is attacker-controlled. Each manifest
+    // entry is at minimum three single-byte varints (tag,
+    // compressed_len, uncompressed_len), so the cap below is a
+    // generous upper bound that scales with the buffer.
     let remaining = bytes.len().saturating_sub(cursor);
     let cap = (n_columns as usize).min(remaining / 3 + 1);
     let mut manifest = Vec::with_capacity(cap);
@@ -757,7 +714,6 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<(BlockHeader, usize), PspRead
         first_pos,
         n_records,
         n_total_alleles,
-        active_chain_slots,
         manifest,
     };
     validate_block_header_invariants(&header)
@@ -800,15 +756,6 @@ fn validate_block_header_invariants(header: &BlockHeader) -> Result<(), BlockHea
             n_records: header.n_records,
             n_total_alleles: header.n_total_alleles,
         });
-    }
-    // Active chain slots strictly ascending, no duplicates.
-    for w in header.active_chain_slots.windows(2) {
-        if w[0] >= w[1] {
-            return Err(BlockHeaderInvariantKind::ActiveSlotsNotAscending {
-                prev: w[0],
-                next: w[1],
-            });
-        }
     }
     // Manifest tags strictly ascending, no duplicates.
     for w in header.manifest.windows(2) {
@@ -1294,7 +1241,6 @@ mod tests {
             first_pos: 1,
             n_records: 100,
             n_total_alleles: 130,
-            active_chain_slots: vec![3, 7, 42],
             manifest: vec![
                 ColumnManifestEntry {
                     tag: 0x01,
@@ -1326,16 +1272,6 @@ mod tests {
     }
 
     #[test]
-    fn block_header_round_trip_empty_active_slots() {
-        let mut header = sample_block_header();
-        header.active_chain_slots.clear();
-        let mut buf = Vec::new();
-        encode_block_header(&header, &mut buf).unwrap();
-        let (decoded, _) = decode_block_header(&buf).unwrap();
-        assert_eq!(decoded, header);
-    }
-
-    #[test]
     fn block_header_rejects_zero_records() {
         let mut header = sample_block_header();
         header.n_records = 0;
@@ -1357,30 +1293,6 @@ mod tests {
                 n_records: 100,
                 n_total_alleles: 99,
             }
-        ));
-    }
-
-    #[test]
-    fn block_header_rejects_unsorted_active_slots() {
-        let mut header = sample_block_header();
-        header.active_chain_slots = vec![7, 3, 42];
-        let mut buf = Vec::new();
-        let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(
-            err,
-            BlockHeaderInvariantKind::ActiveSlotsNotAscending { prev: 7, next: 3 }
-        ));
-    }
-
-    #[test]
-    fn block_header_rejects_duplicate_active_slots() {
-        let mut header = sample_block_header();
-        header.active_chain_slots = vec![3, 3, 7];
-        let mut buf = Vec::new();
-        let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(
-            err,
-            BlockHeaderInvariantKind::ActiveSlotsNotAscending { prev: 3, next: 3 }
         ));
     }
 
@@ -1419,31 +1331,7 @@ mod tests {
         assert!(matches!(err, PspReadError::BlockHeaderField { .. }));
     }
 
-    /// (B3 regression.) A hostile block header declaring a
-    /// `u32::MAX` slot count must not drive an unbounded
-    /// `Vec::with_capacity` — the decoder rejects via the
-    /// remaining-buffer-derived bound and surfaces a typed error.
-    #[test]
-    fn block_header_decode_rejects_giant_active_slots_count_without_oom() {
-        let mut bytes = Vec::new();
-        encode_u64_leb128(0, &mut bytes); // chrom_id
-        encode_u64_leb128(1, &mut bytes); // first_pos
-        encode_u64_leb128(1, &mut bytes); // n_records
-        encode_u64_leb128(1, &mut bytes); // n_total_alleles
-        encode_u64_leb128(u32::MAX as u64, &mut bytes); // huge slot count
-        // No body for the slots — should fail Truncated, not OOM.
-        let err = decode_block_header(&bytes).unwrap_err();
-        assert!(matches!(
-            err,
-            PspReadError::BlockHeaderField {
-                field: "active_chain_slots",
-                ..
-            }
-        ));
-    }
-
-    /// (B3 regression.) Same shape as the previous test for the
-    /// manifest count: a `u32::MAX` `n_columns` must surface as a
+    /// (B3 regression.) A `u32::MAX` `n_columns` must surface as a
     /// typed error, not an allocator abort.
     #[test]
     fn block_header_decode_rejects_giant_n_columns_without_oom() {
@@ -1452,7 +1340,6 @@ mod tests {
         encode_u64_leb128(1, &mut bytes); // first_pos
         encode_u64_leb128(1, &mut bytes); // n_records
         encode_u64_leb128(1, &mut bytes); // n_total_alleles
-        encode_u64_leb128(0, &mut bytes); // zero slots
         encode_u64_leb128(u32::MAX as u64, &mut bytes); // huge n_columns
         // No body for the manifest — should fail Truncated, not OOM.
         let err = decode_block_header(&bytes).unwrap_err();
@@ -1477,7 +1364,6 @@ mod tests {
             first_pos: 100,
             n_records: 1,
             n_total_alleles: 1,
-            active_chain_slots: vec![7],
             manifest: vec![ColumnManifestEntry {
                 tag: 0x01,
                 compressed_len: 8,
@@ -1493,8 +1379,6 @@ mod tests {
                 0x64, // first_pos = 100 varint
                 0x01, // n_records varint
                 0x01, // n_total_alleles varint
-                0x01, // active_chain_slots count varint
-                0x07, 0x00, // slot 7 as LE u16
                 0x01, // n_columns varint
                 0x01, // manifest[0].tag varint
                 0x08, // manifest[0].compressed_len varint
@@ -1605,24 +1489,13 @@ mod tests {
             first_pos in any::<u32>(),
             n_records in 1u32..=u32::MAX,
             extra_alleles in 0u32..=u32::MAX / 2,
-            slot_seed in any::<u16>(),
-            n_slots in 0u32..16,
         ) {
-            // Build a strictly-ascending slot list deterministically
-            // from the seed and the desired length.
-            let active_chain_slots: Vec<u16> = (0..n_slots as u16)
-                .map(|i| slot_seed.wrapping_add(i))
-                .collect();
-            let mut sorted = active_chain_slots.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
             let header = BlockHeader {
                 chrom_id,
                 first_pos,
                 n_records,
                 // n_total_alleles ≥ n_records, modulo overflow risk.
                 n_total_alleles: n_records.saturating_add(extra_alleles),
-                active_chain_slots: sorted,
                 manifest: vec![ColumnManifestEntry {
                     tag: 0x01,
                     compressed_len: 0,

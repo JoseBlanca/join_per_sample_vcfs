@@ -21,10 +21,9 @@
 //! All four workloads build their `Vec<PileupRecord>` once outside
 //! the timed region; the bench body borrows `records` and clones
 //! only the small header (or recreates the sink for the file
-//! variant). The `BlockAccumulator` clones the inner Vecs
-//! (`new_chains`, `expired_chains`, `allele.chain_slots`) as it
-//! appends, so those allocations are still measured exactly as
-//! production would produce them.
+//! variant). The `BlockAccumulator` clones each
+//! `allele.chain_slots` `Vec` as it appends, so those allocations
+//! are still measured exactly as production would produce them.
 
 // Opt-in mimalloc global allocator (cargo bench --features alloc-mimalloc ...).
 // Off by default so the bench runs against the system allocator.
@@ -114,73 +113,45 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
                 Vec::new(),
             ));
         }
-        records.push(PileupRecord::new(0, pos, Vec::new(), Vec::new(), alleles));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }
 
-/// Phase-chain-heavy: ~6 active phase chains on average. Every record's
-/// first allele carries the current active set as `chain_slots`.
-/// Markers open / close at offset cadences so `new_chains` /
-/// `expired_chains` are non-empty on the boundary records.
-///
-/// Slot IDs cycle inside `[0, 256)` (the slot pool needs to be wider
-/// than `active.len()` at all times). Active is kept sorted
-/// ascending so it can be cloned straight into the validators'
-/// expected order.
+/// Phase-chain-heavy: ~6 active phase chains on average. Every
+/// record's first allele carries a sliding window of chain ids as
+/// `chain_slots`. With unique-per-file ids and no recycling, the
+/// "active set" notion is just whichever ids appear on this record;
+/// the lifecycle-marker mechanism is gone.
 fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
     let mut records = Vec::with_capacity(n);
     let bases = [b'A', b'C', b'G', b'T'];
-    let mut active: Vec<u16> = Vec::new();
-
-    fn next_unused(active: &[u16], also_avoid: &[u16]) -> u16 {
-        for id in 0..=255u16 {
-            if active.binary_search(&id).is_err() && !also_avoid.contains(&id) {
-                return id;
-            }
-        }
-        panic!("active set exhausted slot pool");
-    }
+    let mut next_id: u64 = 0;
+    let mut active: Vec<u64> = Vec::new();
 
     for i in 0..n {
         let pos = (i as u32) + 1;
         let ref_base = bases[i & 3];
 
-        let mut new_chains: Vec<u16> = Vec::new();
-        let mut expired_chains: Vec<u16> = Vec::new();
-
-        // Bootstrap the first record by opening four slots so subsequent
-        // records have something to reference / expire.
         if i == 0 {
-            for &seed in &[0u16, 1, 2, 3] {
-                new_chains.push(seed);
-                let idx = active.partition_point(|&s| s < seed);
-                active.insert(idx, seed);
+            for _ in 0..4 {
+                active.push(next_id);
+                next_id += 1;
             }
         } else {
-            // Close one (oldest) every 13 records when there's enough
+            // Drop one (oldest) every 13 records when there's enough
             // running to keep ≥ 3 active.
             if i % 13 == 0 && active.len() > 3 {
-                let slot = active.remove(0);
-                expired_chains.push(slot);
+                active.remove(0);
             }
-            // Open one (smallest unused) every 11 records when we're
-            // under the soft cap. Must avoid both the current active
-            // set AND any slot we just closed in this record — the
-            // writer validates `new_chains` against the pre-apply
-            // active set, so reopening the just-closed slot is a
-            // collision.
+            // Open one new chain every 11 records when we're under
+            // the soft cap.
             if i % 11 == 0 && active.len() < 12 {
-                let slot = next_unused(&active, &expired_chains);
-                new_chains.push(slot);
-                let idx = active.partition_point(|&s| s < slot);
-                active.insert(idx, slot);
+                active.push(next_id);
+                next_id += 1;
             }
         }
 
-        // First allele carries the full active set as chain_slots.
-        // active is kept sorted ascending, which is what the writer
-        // requires (strictly ascending, no duplicates).
         let chain_slots = active.clone();
         let alleles = vec![AlleleObservation::new(
             vec![ref_base],
@@ -188,13 +159,7 @@ fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
             chain_slots,
         )];
 
-        records.push(PileupRecord::new(
-            0,
-            pos,
-            new_chains,
-            expired_chains,
-            alleles,
-        ));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }
@@ -276,7 +241,7 @@ fn build_multi_allele_records(n: usize) -> Vec<PileupRecord> {
                 ),
             ],
         };
-        records.push(PileupRecord::new(0, pos, Vec::new(), Vec::new(), alleles));
+        records.push(PileupRecord::new(0, pos, alleles));
     }
     records
 }
