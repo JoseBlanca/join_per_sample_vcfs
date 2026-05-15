@@ -192,7 +192,14 @@ fn fetch_from_repository(
             ),
         ));
     }
-    Ok(bytes[start_idx..end_idx].to_vec())
+    // Soft-masked FASTAs (Ensembl/Gencode default) encode repeat
+    // regions as lowercase `acgtn`. The mask carries no information
+    // used downstream, and the PSP writer rejects anything outside
+    // A/C/G/T/N; uppercase here so every consumer sees canonical bases.
+    Ok(bytes[start_idx..end_idx]
+        .iter()
+        .map(|b| b.to_ascii_uppercase())
+        .collect())
 }
 
 // ---------------------------------------------------------------------
@@ -234,6 +241,50 @@ mod tests {
         let bases = fetcher.fetch(0, 5, 4).expect("fetch");
         assert_eq!(bases, b"AAAA");
         assert_eq!(bases.len(), 4);
+    }
+
+    #[test]
+    fn fetch_uppercases_soft_masked_bases() {
+        // Soft-masked FASTAs (Ensembl/Gencode default) encode repeat
+        // regions as lowercase `acgtn`. The fetcher must canonicalise
+        // to uppercase so the PSP writer (which rejects lowercase
+        // bytes) never sees a soft-masked REF byte.
+        use std::fs::File;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta_path = dir.path().join("soft.fa");
+        let fai_path = dir.path().join("soft.fa.fai");
+
+        let header = b">chr0\n";
+        let seq = b"ACGTacgtNn";
+        {
+            let mut fa = File::create(&fasta_path).expect("fa");
+            fa.write_all(header).expect("hdr");
+            fa.write_all(seq).expect("seq");
+            fa.write_all(b"\n").expect("nl");
+        }
+        {
+            let mut fai = File::create(&fai_path).expect("fai");
+            writeln!(
+                fai,
+                "chr0\t{}\t{}\t{}\t{}",
+                seq.len(),
+                header.len(),
+                seq.len(),
+                seq.len() + 1
+            )
+            .expect("fai");
+        }
+
+        let fetcher = ChromBoundaryRefFetcher::new(
+            &fasta_path,
+            contig_list(&[("chr0", seq.len() as u64)]),
+        )
+        .expect("fetcher");
+
+        let bases = fetcher.fetch(0, 1, seq.len() as u32).expect("fetch");
+        assert_eq!(bases, b"ACGTACGTNN");
     }
 
     #[test]
