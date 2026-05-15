@@ -11,7 +11,7 @@ It sits between Stage 2 (the per-sample `.psp` reader) and Stage 3
 
 ```
 sample_A.psp ─► PspReader ─┐
-sample_B.psp ─► PspReader ─┼─► PerPositionMerger ─► (chrom_id, pos, per-sample bundle)
+sample_B.psp ─► PspReader ─┼─► PerPositionMerger ─► (chrom_id, pos, per-sample pileups)
 sample_C.psp ─► PspReader ─┘
 ```
 
@@ -40,7 +40,7 @@ simplifies everything that follows.
 
 For each output position the merger does an O(N) scan over peeked
 heads to find the min `(chrom_id, pos)`, pulls successors only from
-the readers that were tied at that min, and yields a bundle.
+the readers that were tied at that min, and yields a `PerPositionPileups`.
 
 **Why linear scan and not a heap.** The textbook "heap wins at large
 N" rule of thumb assumes each output position only advances a few
@@ -70,7 +70,7 @@ follow-ups" for the criteria that would trigger building the heap.
 ## Out of scope
 
 - The heap variant. Not built; revisit only on a data-shape change.
-- The DUST filter (Stage 3). The merger emits unfiltered bundles;
+- The DUST filter (Stage 3). The merger emits unfiltered items;
   DUST sits on top of the iterator as a separate adaptor.
 - Parallel per-reader prefetch / threaded readahead. The pull-iterator
   pattern already decided against per-sample threading
@@ -130,14 +130,14 @@ impl<I> Iterator for PerPositionMerger<I>
 where
     I: Iterator<Item = Result<PileupRecord, PspReadError>>,
 {
-    type Item = Result<PerPositionBundle, MergerError>;
+    type Item = Result<PerPositionPileups, MergerError>;
 }
 
 /// One emitted item: a single `(chrom_id, pos)` with a per-sample
 /// slot for every sample passed to `PerPositionMerger::new`.
 /// Samples without a record at this position carry `None`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PerPositionBundle {
+pub struct PerPositionPileups {
     pub chrom_id: u32,
     pub pos: u32,
     /// Indexed by sample order (same as `sample_names()`).
@@ -177,8 +177,8 @@ let chromosomes = check_chromosome_agreement(&readers)?; // see below
 let sample_names = readers.iter().map(|r| r.header().sample.clone()).collect();
 let iters: Vec<_> = readers.iter_mut().map(|r| r.records()).collect();
 let merger = PerPositionMerger::new(iters, sample_names, chromosomes)?;
-for bundle in merger {
-    let bundle = bundle?;
+for pileups in merger {
+    let pileups = pileups?;
     // hand to DUST / grouping / ...
 }
 ```
@@ -225,21 +225,21 @@ circuits construction with `MergerError::Reader`.
    per-reader monotonicity internally; this check defends against
    pathological mocks and against drift if a future `RecordsIter`
    variant relaxes that property.)
-4. Build a `PerPositionBundle` of length `n_samples()`. For each
+4. Build a `PerPositionPileups` of length `n_samples()`. For each
    reader index `i`:
    - If `heads[i]` matches the min `(chrom_id, pos)`, move it into
-     `bundle.per_sample[i]` (so the slot is `Some(record)`) and
+     `pileups.per_sample[i]` (so the slot is `Some(record)`) and
      refill `heads[i]` from `readers[i].next()`.
    - Otherwise leave the slot as `None`.
-5. Update `last_emitted` and return `Ok(bundle)`.
+5. Update `last_emitted` and return `Ok(pileups)`.
 
 A reader error during refill (step 4) surfaces as
 `MergerError::Reader { sample_idx, sample_name, source }`, with
 `done` latched so subsequent `next()` calls return `None`. This
 matches the walker's terminate-on-first-error contract.
 
-Memory: `O(N)` peeked records + one in-flight bundle. No buffering
-beyond a single record per reader.
+Memory: `O(N)` peeked records + one in-flight `PerPositionPileups`.
+No buffering beyond a single record per reader.
 
 ## Header validation
 
@@ -294,13 +294,14 @@ Required cases:
 - **Empty cohort.** `readers = vec![]` yields an immediately
   exhausted iterator. `n_samples() == 0`.
 - **Single reader.** Identity pass-through: each `PileupRecord`
-  becomes a bundle of length 1 with `per_sample[0] = Some(r)`.
-- **Two readers, fully overlapping positions.** Every bundle has
+  becomes a `PerPositionPileups` of length 1 with
+  `per_sample[0] = Some(r)`.
+- **Two readers, fully overlapping positions.** Every item has
   both slots `Some`.
-- **Two readers, disjoint positions.** Every bundle has exactly
+- **Two readers, disjoint positions.** Every item has exactly
   one slot `Some`; ordering follows the merged sequence of all
   positions.
-- **Two readers, partial overlap.** Mixed bundles. Covers the
+- **Two readers, partial overlap.** Mixed items. Covers the
   "WGS-like" expected shape.
 - **Multi-chromosome.** Two readers, both spanning two chromosomes.
   Confirms chrom_id is the major sort key and pos is the minor one.
@@ -316,7 +317,7 @@ Required cases:
 - **Out-of-order detection.** A synthetic iterator that yields
   a backwards `(chrom_id, pos)` is caught with
   `MergerError::OutOfOrder`.
-- **Bundle order across `next()`.** Bundles are yielded in strictly
+- **Emission order across `next()`.** Items are yielded in strictly
   increasing `(chrom_id, pos)`. (Pinned with an explicit assertion
   loop in one of the multi-reader tests.)
 
@@ -349,7 +350,7 @@ generator.
 
 ## Assumptions / silent choices
 
-- **`Vec<Option<PileupRecord>>` per bundle**, not a sparse
+- **`Vec<Option<PileupRecord>>` per emitted item**, not a sparse
   representation. WGS-style coverage means most slots are `Some` at
   most positions, so the `Option` discriminator overhead is small
   and downstream stages benefit from O(1) "what did sample j see?"
@@ -368,8 +369,8 @@ generator.
   to reject that — they have the context to do so.
 - **Per-reader monotonicity is re-checked at the merge layer**, even
   though `RecordsIter` already enforces it within one block. Cheap
-  (one tuple comparison per bundle) and defends against drift and
-  pathological mocks.
+  (one tuple comparison per emitted item) and defends against drift
+  and pathological mocks.
 - **Errors latch.** Once any reader fails or the iterator emits an
   error, all subsequent `next()` calls return `None`. Same shape as
   the walker's pull-iterator contract.
@@ -383,9 +384,9 @@ generator.
   practice — e.g. when the path-based helper lands and wants to
   return a single bundled value — revisit with a `self_cell` or
   manual `Pin` wrapper. Don't pre-build that abstraction.
-- **Bundle clone cost in tests.** `PerPositionBundle: Clone` is only
+- **Pileups clone cost in tests.** `PerPositionPileups: Clone` is only
   needed for `PartialEq`-driven assertions in tests; production
-  paths move the bundle out. Confirm production calls don't end up
+  paths move the value out. Confirm production calls don't end up
   cloning by accident.
 
 ## Out-of-scope follow-ups
@@ -406,7 +407,7 @@ generator.
   thread or async readahead. Only worth it if profiling shows the
   merger is IO-bound on `PspReader::next` rather than on
   downstream stages. Defer until profiles exist.
-- **Sparse bundle encoding.** `SmallVec<[(sample_idx, record); K]>`
+- **Sparse `PerPositionPileups` encoding.** `SmallVec<[(sample_idx, record); K]>`
   instead of `Vec<Option<…>>`. Paired with the heap merger if the
   cohort access pattern ever becomes sparse.
 
@@ -415,7 +416,7 @@ generator.
 - `src/cohort/mod.rs` — new module root, declares
   `pub mod per_position_merger;`.
 - `src/cohort/per_position_merger.rs` — new file: `PerPositionMerger`,
-  `PerPositionBundle`, `MergerError`, `check_chromosome_agreement`,
+  `PerPositionPileups`, `MergerError`, `check_chromosome_agreement`,
   full `#[cfg(test)]` module.
 - `src/lib.rs` — `pub mod cohort;` added alongside the existing
   module declarations.
