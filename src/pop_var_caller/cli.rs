@@ -55,6 +55,10 @@ pub struct Cli {
 pub enum PopVarCallerCommand {
     /// Stage 1: run BAQ + pileup over one sample's CRAMs, emit a .psp.
     Pileup(PileupArgs),
+
+    /// Stream a .psp as samtools-mpileup-style text plus a trailing
+    /// column with per-allele aggregates PSP carries.
+    PspToPileup(super::psp_to_pileup::PspToPileupArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the

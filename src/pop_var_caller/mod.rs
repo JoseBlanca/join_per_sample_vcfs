@@ -4,5 +4,7 @@
 //! glue that turns CLI arguments into a configured pipeline run.
 
 pub mod cli;
+pub mod psp_to_pileup;
 
 pub use cli::{Cli, PileupArgs, PileupCliError, PopVarCallerCommand, run_pileup};
+pub use psp_to_pileup::{PspToPileupArgs, PspToPileupError, run_psp_to_pileup};

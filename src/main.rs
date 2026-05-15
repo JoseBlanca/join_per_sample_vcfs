@@ -5,12 +5,17 @@
 use std::process;
 
 use clap::Parser;
-use merge_per_sample_vcfs::pop_var_caller::{Cli, PopVarCallerCommand, run_pileup};
+use merge_per_sample_vcfs::pop_var_caller::{
+    Cli, PopVarCallerCommand, run_pileup, run_psp_to_pileup,
+};
 
 fn main() {
     let cli = Cli::parse();
     let result = match cli.cmd {
         PopVarCallerCommand::Pileup(args) => run_pileup(&args).map_err(|e| format!("{e}")),
+        PopVarCallerCommand::PspToPileup(args) => {
+            run_psp_to_pileup(&args).map_err(|e| format!("{e}"))
+        }
     };
     if let Err(msg) = result {
         eprintln!("error: {msg}");
