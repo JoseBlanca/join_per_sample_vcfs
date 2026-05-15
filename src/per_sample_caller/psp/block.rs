@@ -348,7 +348,7 @@ pub fn encode_list_column<T: WireScalar>(lists: &[&[T]], out: &mut Vec<u8>) {
 /// memcpy per row, no per-element `extend_from_slice(&to_le_bytes())`
 /// bookkeeping. The `T: Pod` bound excludes `bool` from this path,
 /// which is fine because the writer's list columns only ever hold
-/// `SlotId = u16` today. (L6.)
+/// `ChainId = u64` today. (L6.)
 pub fn encode_list_column_csr<T: WireScalar + bytemuck::Pod>(
     data: &[T],
     offsets: &[u32],
@@ -1085,7 +1085,7 @@ mod tests {
         let lists: Vec<&[u16]> = vec![r0, r1, r2];
         let mut buf = Vec::new();
         encode_list_column(&lists, &mut buf);
-        let decoded: Vec<Vec<u16>> = decode_list_column(&buf, lists.len(), "chain-slots").unwrap();
+        let decoded: Vec<Vec<u16>> = decode_list_column(&buf, lists.len(), "chain-ids").unwrap();
         assert_eq!(decoded.len(), 3);
         assert!(decoded[0].is_empty());
         assert_eq!(decoded[1], vec![7]);
@@ -1099,7 +1099,7 @@ mod tests {
         encode_list_column(&lists, &mut buf);
         // Tell decoder there are two entries; the second's count
         // varint is missing.
-        let err = decode_list_column::<u16>(&buf, 2, "chain-slots").unwrap_err();
+        let err = decode_list_column::<u16>(&buf, 2, "chain-ids").unwrap_err();
         match err {
             PspReadError::ColumnTruncated {
                 decoded, expected, ..
@@ -1121,7 +1121,7 @@ mod tests {
         buf.extend_from_slice(&7u16.to_le_bytes());
         buf.extend_from_slice(&9u16.to_le_bytes());
         buf.push(0x11); // dangling half of u16
-        let err = decode_list_column::<u16>(&buf, 1, "chain-slots").unwrap_err();
+        let err = decode_list_column::<u16>(&buf, 1, "chain-ids").unwrap_err();
         match err {
             PspReadError::ColumnElementDecode { entry, source, .. } => {
                 assert_eq!(entry, 0);
@@ -1424,7 +1424,7 @@ mod tests {
     fn list_column_decode_rejects_giant_inner_count_without_oom() {
         let mut bytes = Vec::new();
         encode_u64_leb128(u64::MAX, &mut bytes);
-        let err = decode_list_column::<u16>(&bytes, 1, "chain-slots").unwrap_err();
+        let err = decode_list_column::<u16>(&bytes, 1, "chain-ids").unwrap_err();
         match err {
             PspReadError::ColumnElementDecode { entry, source, .. } => {
                 assert_eq!(entry, 0);

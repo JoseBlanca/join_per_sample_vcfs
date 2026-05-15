@@ -41,7 +41,7 @@ use super::index::{BlockIndexEntry, checksum_index, decode_index};
 use super::registry::{ColumnKey, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS, lookup_by_tag};
 use super::trailer::{TRAILER_BYTES, Trailer, decode_trailer};
 use crate::per_sample_caller::pileup::{
-    AlleleObservation, AlleleSupportStats, PileupRecord, SlotId,
+    AlleleObservation, AlleleSupportStats, ChainId, PileupRecord,
 };
 
 /// Cap on how many bytes the reader will pull off the source in
@@ -435,7 +435,7 @@ struct DecodedBlock {
     allele_fwd_count: Vec<u32>,
     allele_placed_left_count: Vec<u32>,
     allele_placed_start_count: Vec<u32>,
-    allele_chain_slots: Vec<Vec<SlotId>>,
+    allele_chain_ids: Vec<Vec<ChainId>>,
 }
 
 /// Region-iteration window. `None` for sequential iteration
@@ -671,7 +671,7 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
                     placed_left: block.allele_placed_left_count[j],
                     placed_start: block.allele_placed_start_count[j],
                 },
-                chain_slots: std::mem::take(&mut block.allele_chain_slots[j]),
+                chain_ids: std::mem::take(&mut block.allele_chain_ids[j]),
             });
         }
 
@@ -880,7 +880,7 @@ fn decode_block_payload<R: Read>(
     let mut allele_fwd_count: Option<Vec<u32>> = None;
     let mut allele_placed_left_count: Option<Vec<u32>> = None;
     let mut allele_placed_start_count: Option<Vec<u32>> = None;
-    let mut allele_chain_slots: Option<Vec<Vec<SlotId>>> = None;
+    let mut allele_chain_ids: Option<Vec<Vec<ChainId>>> = None;
 
     let mut remaining_budget = byte_budget;
     for entry in &header.manifest {
@@ -937,7 +937,7 @@ fn decode_block_payload<R: Read>(
             DecodedColumn::AlleleFwdCount(v) => allele_fwd_count = Some(v),
             DecodedColumn::AllelePlacedLeftCount(v) => allele_placed_left_count = Some(v),
             DecodedColumn::AllelePlacedStartCount(v) => allele_placed_start_count = Some(v),
-            DecodedColumn::AlleleChainSlots(v) => allele_chain_slots = Some(v),
+            DecodedColumn::AlleleChainIds(v) => allele_chain_ids = Some(v),
         }
     }
 
@@ -981,8 +981,8 @@ fn decode_block_payload<R: Read>(
             .expect("allele-placed-left-count column required by v1.0 schema"),
         allele_placed_start_count: allele_placed_start_count
             .expect("allele-placed-start-count column required by v1.0 schema"),
-        allele_chain_slots: allele_chain_slots
-            .expect("allele-chain-slots column required by v1.0 schema"),
+        allele_chain_ids: allele_chain_ids
+            .expect("allele-chain-ids column required by v1.0 schema"),
     })
 }
 
@@ -1002,7 +1002,7 @@ enum DecodedColumn {
     AlleleFwdCount(Vec<u32>),
     AllelePlacedLeftCount(Vec<u32>),
     AllelePlacedStartCount(Vec<u32>),
-    AlleleChainSlots(Vec<Vec<SlotId>>),
+    AlleleChainIds(Vec<Vec<ChainId>>),
 }
 
 /// Read + decompress + decode one column. `allele_seq_len` is
@@ -1181,8 +1181,8 @@ fn decode_one_column<R: Read>(
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
             decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
-        ColumnKey::AlleleChainSlots => DecodedColumn::AlleleChainSlots(
-            decode_list_column::<SlotId>(bytes, n_total_alleles, column_name)?,
+        ColumnKey::AlleleChainIds => DecodedColumn::AlleleChainIds(
+            decode_list_column::<ChainId>(bytes, n_total_alleles, column_name)?,
         ),
     };
     Ok(Some(decoded))
@@ -1263,7 +1263,7 @@ mod tests {
                     placed_left: 0,
                     placed_start: 1,
                 },
-                chain_slots: Vec::new(),
+                chain_ids: Vec::new(),
             }],
         }
     }
@@ -1395,7 +1395,7 @@ mod tests {
         fwd: u32,
         placed_left: u32,
         placed_start: u32,
-        chain_slots: &[SlotId],
+        chain_ids: &[ChainId],
     ) -> AlleleObservation {
         AlleleObservation {
             seq: seq.to_vec(),
@@ -1406,7 +1406,7 @@ mod tests {
                 placed_left,
                 placed_start,
             },
-            chain_slots: chain_slots.to_vec(),
+            chain_ids: chain_ids.to_vec(),
         }
     }
 
@@ -1441,7 +1441,7 @@ mod tests {
         assert_eq!(g.support.fwd, w.support.fwd);
         assert_eq!(g.support.placed_left, w.support.placed_left);
         assert_eq!(g.support.placed_start, w.support.placed_start);
-        assert_eq!(g.chain_slots, w.chain_slots);
+        assert_eq!(g.chain_ids, w.chain_ids);
     }
 
     /// (B2) Multi-allele records: a SNP at pos=100 and a
@@ -1560,7 +1560,7 @@ mod tests {
 
     /// Build a record that opens slot `slot_id` at this position.
     /// Record referencing chain id `chain_id` in its REF allele.
-    fn record_with_chain_id(chrom_id: u32, pos: u32, chain_id: SlotId) -> PileupRecord {
+    fn record_with_chain_id(chrom_id: u32, pos: u32, chain_id: ChainId) -> PileupRecord {
         PileupRecord {
             chrom_id,
             pos,
@@ -1605,8 +1605,8 @@ mod tests {
         // Chain id 7 appears on both records around the boundary.
         let first = got.iter().find(|r| r.pos == 101).unwrap();
         let second = got.iter().find(|r| r.pos == 102).unwrap();
-        assert!(first.alleles[0].chain_slots.contains(&7));
-        assert!(second.alleles[0].chain_slots.contains(&7));
+        assert!(first.alleles[0].chain_ids.contains(&7));
+        assert!(second.alleles[0].chain_ids.contains(&7));
     }
 
     /// Build a 3-block fixture: 3 blocks on chrom 0 each holding

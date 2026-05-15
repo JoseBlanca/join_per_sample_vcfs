@@ -1,7 +1,7 @@
 # Stage 1 — per-sample caller (CRAM → per-position records)
 
 **Status:** Draft, 2026-04-27. Detailed specification of Stage 1 of the
-multi-sample calling pipeline. Slots underneath
+multi-sample calling pipeline. Sits underneath
 [calling_pipeline_architecture.md](calling_pipeline_architecture.md),
 which already commits to BAQ-in-process, five scalars per allele,
 VCF-style indel anchoring, kept sub-threshold observations, no records
@@ -82,12 +82,10 @@ architecture doc:
   by Stage 2; Stage 1 just emits absolute positions and lets Stage 2
   delta-encode).
 - chromosome id (Stage 2 carries it on chromosome change).
-- Phase-chain lifecycle markers: `new_chains` (slot ids that started
-  since the previous emitted position) and `expired_chains` (slot ids
-  that ended). See §"Phase chain identifiers" for the slot model.
 - `n_alleles` and the per-allele payload: the literal allele sequence,
-  the five scalars below, and the list of chain slot ids that
-  contributed this observation.
+  the five scalars below, and the list of chain ids that
+  contributed this observation. See §"Phase chain identifiers" for
+  the chain model.
 
 **Per-allele scalars** (committed in the architecture doc, repeated
 here as the work product Stage 1 must produce per allele observed at
@@ -528,94 +526,89 @@ A's observation at p1 and B's observation at p2 belong to the same
 chain — which lets Stage 5 know that, in this sample, A and B
 co-occur on the same haplotype.
 
-### Per-record encoding: slot ids + lifecycle markers
+### Per-record encoding: chain ids
 
-Chains are short-lived: a read or pair contributes for at most ~1 kb
-(PE fragment length), so the number of *concurrently active* chains
-at any reference position is bounded by per-position depth —
-typically 5–15 at the project's 2–10× coverage target, rarely above
-~50 even at 30×. That makes a tiny slot-based encoding much cheaper
-than full chain identifiers.
+Each per-position record carries, for each allele, a `chain_ids`
+list: the phase-chain ids that contributed this observation, sorted
+ascending and pairwise distinct. Two allele observations sharing a
+chain id therefore came from the same read or read-pair in this
+sample.
 
-Each per-position record carries:
+Chain ids are unique-per-`.psp`-file `u64` values, monotonically
+allocated from zero by Stage 1's chain-id allocator and **never
+recycled**. There is no `new_chains` / `expired_chains` lifecycle
+marker pair on the record; with a unique-id namespace the marker
+mechanism that older drafts used to disambiguate successive
+occupants of the same recycled slot is unnecessary. (Earlier drafts
+specified a recycled-`u16` encoding with lifecycle markers; that
+design was retired in 2026-05-14, see
+[ia/feature_implementation_plans/unique_chain_ids.md](../feature_implementation_plans/unique_chain_ids.md).)
 
-- `new_chains`: list of slot ids that started since the previous
-  emitted position (a chain begins when its read enters the active
-  set).
-- `expired_chains`: list of slot ids that ended since the previous
-  emitted position (a chain ends when its read or pair has fully
-  left the active set).
-- For each allele: `chain_slots`, the small list of slot ids of the
-  chains that contributed this observation (encoded as a bitmap over
-  currently-active slots, or a short list, at Stage 2's
-  discretion — but the data Stage 2 sees is just slot ids).
+The on-disk encoding is a fixed-width little-endian `u64` list
+under tag `0x22` (`allele-chain-ids`); zstd absorbs the leading
+zero bytes effectively for typical id magnitudes.
 
-Slot ids are small integers (`u8` is enough for the project's
-coverage target; `u16` is the defensive choice and still cheap).
-They are *recycled* once a chain has fully expired: the next new
-chain can occupy a freed slot. The lifecycle markers ensure no
-consumer ever confuses two chains that successively occupied the
-same slot — see §"Slot identity invariant" below.
+### Chain id allocation
 
-This is intentionally analogous to VCF's `|` / `/` phase markers:
-within an open phase block the slot id is the linkage; the markers
-declare where blocks open and close. The invariant the format
-preserves is the same one Stage 5 needs: "two observations carrying
-the same active slot id come from the same physical molecule."
+Stage 1's chain-id allocator is a monotonically-increasing `u64`
+counter, scoped to the whole `.psp` file. There is no free pool, no
+release step, no lifecycle bookkeeping. When a new read enters the
+active set:
 
-### Slot allocation
+1. Mint the next id (`counter`, then `counter += 1`).
+2. Tag every allele observation that read contributes to with that
+   chain id.
 
-Stage 1 maintains an internal table of currently active chain slots.
-When a new read pair (or solo read) enters the active set:
+When a read pair fully leaves the active set, the allocator simply
+decrements its concurrent-active-reads counter (used for the
+defensive `max_active_reads` cap); the chain id itself is never
+"released" because nothing ever needs to claim it again.
 
-1. Allocate the lowest free slot id from the table.
-2. Tag every allele observation that read pair contributes to with
-   that slot id.
-3. Add the slot id to the next emitted record's `new_chains` list.
-
-When a read pair fully leaves the active set:
-
-1. Release its slot id (the slot becomes available for reuse).
-2. Add the slot id to the next emitted record's `expired_chains`
-   list.
+Overflow at `u64::MAX + 1` is caught and surfaces as
+`WalkerError::ChainIdSpaceExhausted`; the ceiling (~1.8 × 10¹⁹
+chains per file) is unreachable on any realistic workload.
 
 Within a single record, multiple alleles may reference the same
-slot only in the rare case of mate-overlap with disagreement. Across
-records, a slot id refers to the same chain for the duration of its
-active lifetime, which is bounded by read/pair span.
+chain id only in the rare case of mate-overlap with disagreement.
+Across records and across blocks within the same `.psp` file, a
+chain id always refers to the same physical molecule — chains do
+not cross chromosomes only because the active set is flushed at
+chromosome boundaries, but the counter itself is preserved across
+the boundary so each id remains unique throughout the file.
 
-Phase chain slots are not shared across samples. Stage 1 only emits
-within-sample chains; cross-sample reasoning is the joint stage's job.
+Phase chains are not shared across samples. Stage 1 only emits
+within-sample chains; cross-sample reasoning is the joint stage's
+job.
 
-### Read pairs share one slot
+### Read pairs share one chain id
 
-Both mates of a paired-end read share a single slot id. An allele
+Both mates of a paired-end read share a single chain id. An allele
 observed on mate 1 at position p1 and an allele observed on mate 2
 at position p2 come from the same physical DNA molecule, so they
 are evidence for the same compound haplotype in this sample.
-Issuing two distinct slots would force Stage 5 to reconstruct the
+Issuing two distinct chain ids would force Stage 5 to reconstruct the
 linkage from QNAMEs (or, more likely, miss it entirely); doing it
 once at Stage 1 keeps the linkage explicit at no extra cost.
 
-**Assignment mechanics.** Stage 1 maintains a small QNAME → slot id
+**Assignment mechanics.** Stage 1 maintains a small QNAME → chain id
 map of pairs whose first mate has been seen but whose second mate
 has not yet been processed. When a read arrives at the per-read
 stage:
 
 1. Look up its QNAME in the map.
-2. If found: reuse that slot id, then drop the entry — once both
-   mates have been tagged, the QNAME → slot binding is no longer
-   needed.
-3. If not found: allocate a fresh slot id, use it for this read,
-   and register `(QNAME → slot)` if the read flags say a mate
+2. If found: tag this read with the first mate's chain id (the pair
+   shares one id), then drop the entry — once both mates have been
+   tagged, the QNAME → chain id binding is no longer needed.
+3. If not found: mint a fresh chain id, use it for this read,
+   and register `(QNAME → chain id)` if the read flags say a mate
    exists.
 
 **Solo reads.** Single-end runs, mate-filtered-out cases, and
 malformed inputs where only one mate appears all converge to the
-same shape: the surviving mate keeps the slot id it was issued on
+same shape: the surviving mate keeps the chain id it was issued on
 first-seen. Stage 5 cannot tell a chain-of-one from a chain-of-two,
-and does not need to — the slot semantics are identical: "alleles
-tagged with this slot were observed on the same physical molecule."
+and does not need to — the chain semantics are identical: "alleles
+tagged with this chain id were observed on the same physical molecule."
 
 **Map size.** Bounded by reads whose mate has not yet been seen at
 the current merge position. With coordinate-sorted CRAMs and
@@ -627,34 +620,29 @@ malformed inputs cannot grow the map without limit; entries that
 exceed the window are released and their first mate is treated as
 solo. A whole-file QNAME hash table is therefore unnecessary.
 
-### Slot identity invariant
+### Chain identity invariant
 
-At any reference position, every slot id present in `chain_slots`
-of any allele refers to a *single, unique chain* — the chain that
-currently occupies that slot. Slot ids are reused across the file,
-but never within an active lifetime: a slot enters `expired_chains`
-in the record at which its chain ends, and only after that
-expiration can the same slot id reappear in `new_chains` of a later
-record. The lifecycle markers thus preserve the conceptual
-invariant "different chains are never confused" without ever
-materialising global chain identifiers.
+At any reference position, every chain id present in `chain_ids`
+of any allele refers to a *single, unique chain* in the file. Chain
+ids are unique-per-`.psp`-file `u64` values, never recycled — so two
+allele observations sharing a chain id came from the same read or
+read-pair in this sample.
 
 This is sufficient for everything Stage 5 needs. Walking records
-sequentially, Stage 5 maintains its own active-slot view (apply
-`expired_chains`, then apply `new_chains`, then read each allele's
-`chain_slots`); the compound-haplotype check between two records
-becomes a small intersection of slot-id sets. No hashes, no
-per-file index, and no delta-encoding decisions for Stage 2 — it
-just writes the integers Stage 1 hands it.
+sequentially, Stage 5 reads each allele's `chain_ids` directly; the
+compound-haplotype check between two records becomes a small
+intersection of chain-id sets. No hashes, no per-file index, and no
+delta-encoding decisions for Stage 2 — it just writes the integers
+Stage 1 hands it.
 
 ## Output emission
 
 Stage 1's output side is a thin layer that:
 
 1. Receives a per-position record from the pileup walker (held in
-   memory: `chrom_id`, `pos`, the `new_chains` and `expired_chains`
-   slot lifecycle markers, and the list of `allele_evidence`
-   entries with their five scalars and per-observation slot lists).
+   memory: `chrom_id`, `pos`, and the list of `allele_evidence`
+   entries with their five scalars and per-observation chain-id
+   lists).
 2. Hands it to the Stage 2 encoder (compression, framing,
    variable-length encoding — all Stage 2's responsibility).
 
@@ -749,7 +737,7 @@ src/
     baq.rs              — BAQ HMM (port of samtools' implementation)
     pileup_walker.rs    — active-set, CIGAR consumption, allele extraction
     allele_support.rs   — per-allele AlleleSupportStats accumulation
-    phase_chain.rs      — slot allocator/recycler + per-read tagging
+    phase_chain.rs      — chain-id allocator + per-read tagging
                           + new/expired marker emission
     psp_writer.rs       — Stage 2 encoder (separate spec)
 ```

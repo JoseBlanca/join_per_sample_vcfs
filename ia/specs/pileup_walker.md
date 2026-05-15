@@ -37,7 +37,7 @@ Inside this scope:
   model (see [calling_pipeline_architecture.md §"Overlapping
   events extend the anchor REF"](calling_pipeline_architecture.md)).
 - Five-scalar accumulation per (open record, allele) pair.
-- Phase-chain slot allocation, recycling, and lifecycle markers.
+- Phase-chain id allocation (monotonic `u64`, never recycled).
 - Mate-overlap resolution at per-position granularity.
 - Open-record closure (eager — as soon as the record's
   footprint is fully behind the walker) and emission to Stage 2
@@ -113,9 +113,13 @@ The shape of `PileupRecord`:
 |---|---|---|
 | `chrom_id` | `u32` | |
 | `pos` | `u32` | Anchor position, 1-based. Stage 2 deltas these into `delta_pos`. |
-| `new_chains` | `SmallVec<[SlotId; 4]>` | Slot ids that started since the previous **closure step** (not the previous record). When a closure step emits multiple records, the marks attach to the first record of that batch; the trailing records carry empty `new_chains`. See §"Stamping records". Any order; Stage 2 may reorder. |
-| `expired_chains` | `SmallVec<[SlotId; 4]>` | Slot ids that ended since the previous closure step. Same first-record-of-batch attachment as `new_chains`. |
 | `alleles` | `Vec<AlleleObservation>` | At least one entry; `alleles[0]` is always REF. |
+
+(No per-record lifecycle markers. Earlier drafts carried
+`new_chains` / `expired_chains` lists to disambiguate successive
+occupants of a recycled chain id; with unique-per-`.psp`-file
+`u64` chain ids those markers are unnecessary. See
+§"Phase chain id allocator".)
 
 Each `AlleleObservation`:
 
@@ -127,7 +131,7 @@ Each `AlleleObservation`:
 | `fwd` | `u32` | Forward-strand reads in `num_obs`. |
 | `placed_left` | `u32` | Reads whose mapped 5′ end is to the left of `pos`. |
 | `placed_start` | `u32` | Reads whose mapped 5′ end *is* `pos`. |
-| `chain_slots` | `SmallVec<[SlotId; 4]>` | Distinct slot ids that contributed to this allele. |
+| `chain_ids` | `Vec<ChainId>` | Distinct chain ids that contributed to this allele, sorted ascending. |
 
 The record's reference span is not a stored field — it is
 **derivable as `alleles[0].seq.len()`**, since `alleles[0]` is
@@ -201,17 +205,15 @@ particular inline-size choice. The shape:
 | `is_first_mate` | `bool` | Cached from `read` for fast access. |
 | `mate_read_id` | `Option<u32>` | When the read's mate is also active, points at it. Filled when the second mate enters. |
 
-`SlotId = u16`, with a hard cap on concurrently active chains
-of `MAX_ACTIVE_SLOTS = 4096` (12 of the 16 bits used). `u16`
-matches the defensive choice from
-[per_sample_caller.md §"Per-record encoding"](per_sample_caller.md)
-and gives ~16× headroom over the cap; the per-element memory
-cost over `u8` is one byte per slot id, negligible at the
-collection sizes involved (`SmallVec<[SlotId; 4]>` carries 8
-inline bytes vs 4). The cap is set high enough that typical
-30× coverage does not approach it; long-tail repeat regions
-that do hit it produce a hard error rather than silent slot
-reuse.
+`ChainId = u64`, allocated monotonically by the chain-id
+allocator and never recycled within the lifetime of a `.psp`
+file. The independent `MAX_ACTIVE_READS = 4096` cap bounds
+concurrent active reads as a defensive memory bound; it has no
+relation to the `u64` chain-id namespace, which has effectively
+unlimited headroom (~1.8 × 10¹⁹ ids per file). Pathological
+repeat regions exceeding the active-reads cap surface as
+`WalkerError::ActiveReadsExhausted` — silent collision is
+structurally impossible because ids are never reused.
 
 The active set is iterated in `read_id` order in a few places
 (deterministic record-formation tiebreaks, deterministic
@@ -295,10 +297,11 @@ anchor position. The shape of `OpenPileupRecord`:
 | `ref_seq` | `SmallVec<[u8; 8]>` | The reference bases over `[pos, pos + ref_seq.len())`, taken from the FASTA on first open and re-fetched / re-checked when the span widens. The current REF-span is `ref_seq.len()` — no separate `ref_span` field is stored. |
 | `alleles` | `SmallVec<[OpenAllele; 4]>` | One entry per distinct allele. `alleles[0]` is always REF (`seq == ref_seq`). |
 
-(Lifecycle marks are not stored on the open record. They live on
-the slot allocator's `new_marks` / `expired_marks` buffers and are
-drained per closure step into the emitted `PileupRecord`. See
-§"Stamping records".)
+(There are no lifecycle marks: with unique-per-`.psp`-file `u64`
+chain ids, the `new_chains` / `expired_chains` mark mechanism
+that earlier drafts described is unnecessary. Each
+`OpenAllele.chain_ids` list grows as contributors fold in and is
+moved into the finalised `PileupRecord` at closure.)
 
 `OpenAllele`:
 
@@ -306,7 +309,7 @@ drained per closure step into the emitted `PileupRecord`. See
 |---|---|---|
 | `seq` | `SmallVec<[u8; 8]>` | Length = `ref_seq.len()` for SNP/MNP/DEL alleles; longer for INS-bearing alleles. |
 | `support` | `AlleleSupportStats` | The five running per-allele support stats. |
-| `chain_slots` | `SmallVec<[SlotId; 4]>` | Sorted, deduplicated. |
+| `chain_ids` | `Vec<ChainId>` | Sorted ascending, pairwise distinct. |
 
 `BTreeMap` over `HashMap` because the walker frequently needs to
 **find open records whose REF span overlaps a given event
@@ -746,13 +749,12 @@ A few subtleties:
   §"Closure rule" below for why this per-record condition is
   sufficient (and why `MAX_RECORD_SPAN` is not the closure
   trigger). The conversion is mechanical: open alleles become
-  `AlleleObservation`s; `chain_slots` are sorted and deduped;
-  the slot allocator's accumulated `new_marks` / `expired_marks`
-  are drained once for the whole closure batch and stamped onto
-  the **first record of the batch** (trailing records carry empty
-  lifecycle lists). Each
-  `tx.send` may block if Stage 2 has fallen behind and the
-  channel buffer is full — that's the intended backpressure.
+  `AlleleObservation`s; `chain_ids` are sorted ascending and
+  deduplicated as the open-record fold accumulates contributors.
+  There are no lifecycle marks to stamp under the unique-id
+  design. Each `tx.send` may block if Stage 2 has fallen behind
+  and the channel buffer is full — that's the intended
+  backpressure.
 
 - **`flush_all`** is the same as `close_aged_records` but
   unconditional — every open record is closed and sent through
@@ -1089,148 +1091,117 @@ gets considered, including those whose `window_events` is
 empty: their `allele_seq` is `A.ref_seq` and they fold into the
 REF bucket via the same find-or-create path.
 
-## Phase chain slot allocator
+## Phase chain id allocator
 
-The slot allocator and the walker are mostly independent: the
+The chain-id allocator and the walker are mostly independent: the
 allocator doesn't know what an open record is, only that reads
-enter and leave the active set and that each entry/exit
-produces lifecycle marks the walker stamps on the next emitted
-record.
+enter and leave the active set, and it hands the walker a fresh
+`u64` for every new read (or read-pair). The implementation is
+[`chain_id_allocator.rs`](../../src/per_sample_caller/pileup/chain_id_allocator.rs);
+the rationale for unique-per-file `u64` ids over the earlier
+recycled `u16` design is in
+[`feature_implementation_plans/unique_chain_ids.md`](../feature_implementation_plans/unique_chain_ids.md).
 
 ### State
 
 ```
-struct SlotAllocator {
-    free:                Vec<SlotId>,         // pool of recycled slot ids, sorted descending so pop() yields the lowest
-    next_fresh:          SlotId,              // never-used-before slot id, monotonically increasing within the limit
-    pending_mates:  AHashMap<Arc<str>, PendingMate>,
-    new_marks:           SmallVec<[SlotId; 4]>,
-    expired_marks:       SmallVec<[SlotId; 4]>,
+struct ChainIdAllocator {
+    next_id:            u64,                            // monotonic counter, scoped to the whole .psp file
+    active_count:       u32,                            // concurrent active reads, bounded by max_active_reads
+    pending_mates:      AHashMap<Arc<str>, PendingMate>,
+    counters:           ChainIdAllocatorCounters,       // run-summary metrics
 }
 ```
 
-`free` stores recycled slot ids; popping yields the smallest
-free id (Vec sorted descending so `pop()` is `O(1)` for the
-smallest). `next_fresh` advances when `free` is empty.
+There is no `free` pool, no `next_fresh` separate from
+`next_id`, no `new_marks` / `expired_marks` buffer, and no
+per-id refcount. `next_id` increments on every fresh
+allocation and is **preserved across chromosome boundaries** so
+chain ids stay unique throughout the file.
 
 ### Allocation on read entry
 
 ```
-fn allocate_for_read(&mut self, read: &PreparedRead) -> SlotId {
-    if read.has_mate {
-        if let Some(pending) = self.pending_mates.remove(&read.qname) {
-            return pending.chain_slot_id;        // second-mate path: reuse the first mate's slot
-        }
+fn allocate_for_read(&mut self, read: &PreparedRead) -> Result<ChainId, WalkerError> {
+    if read.has_mate
+        && let Some(pending) = self.pending_mates.remove(&read.qname)
+    {
+        // Second-mate path: the pair shares the first mate's id.
+        self.bump_active_count(...)?;
+        return Ok(pending.chain_id);
     }
-    let slot = self.free.pop().unwrap_or_else(|| {
-        let s = self.next_fresh;
-        self.next_fresh += 1;
-        if self.next_fresh > MAX_ACTIVE_SLOTS {
-            return Err(WalkerError::SlotExhausted);  // hard error, see below
-        }
-        s
-    });
+    self.bump_active_count(...)?;                  // enforces max_active_reads
+    let chain_id = self.next_id;
+    self.next_id = self.next_id
+        .checked_add(1)
+        .ok_or(WalkerError::ChainIdSpaceExhausted { ... })?;
     if read.has_mate {
         self.pending_mates.insert(
             read.qname.clone(),
-            PendingMate { chain_slot_id: slot, first_mate_read_id: read.read_id, seen_at: read.alignment_start },
+            PendingMate { chain_id, first_mate_read_id: read.read_id, seen_at: read.alignment_start },
         );
     }
-    self.new_marks.push(slot);
-    slot
+    Ok(chain_id)
 }
 ```
+
+The `checked_add` defends against silent wrap at `u64::MAX + 1`
+(a wrap would silently merge two distinct molecules into one
+id); overflow surfaces as `WalkerError::ChainIdSpaceExhausted`.
+The ceiling (~1.8 × 10¹⁹ ids per file) is unreachable on any
+realistic workload.
 
 ### Release on read expiry
 
-A slot is released only when **both** mates (or the sole mate of
-a solo read) have exited the active set. The walker tracks
-per-slot reference counts via a small `slot_refcount: [u8;
-MAX_ACTIVE_SLOTS]` array (or a sparse map at higher caps).
+Read exit only touches the defensive `active_count` counter:
 
 ```
-fn release_slot(&mut self, slot: SlotId) {
-    self.slot_refcount[slot as usize] -= 1;
-    if self.slot_refcount[slot as usize] == 0 {
-        self.free.push_sorted_descending(slot);
-        self.expired_marks.push(slot);
-    }
+fn note_read_exit(&mut self, ...) -> Result<(), WalkerError> {
+    self.active_count -= 1;     // checked: zero on entry is an internal error
+    Ok(())
 }
 ```
 
-Refcount goes up by 1 on each `allocate_for_read` call (so a
-solo read has refcount 1; a pair has refcount 2 after the second
-mate is admitted). Refcount goes down by 1 on each read expiry.
+There is no per-id refcount and no free pool — chain ids are
+unique throughout the file, so an exited read's id simply never
+appears in any later record.
 
-### Stamping records
+### No lifecycle markers
 
-When the walker closes one or more records in a single
-`close_aged_records` call, it drains the allocator's `new_marks`
-and `expired_marks` accumulated since the previous drain into
-`PileupRecord.new_chains` and `expired_chains` respectively.
-Marks attach to **the first record of the emission batch**;
-subsequent records in the same batch carry empty
-`new_chains` / `expired_chains`. The consumer is expected to
-read records in coordinate order and treat each emission's first
-record's marks as describing transitions that became visible at
-some point during the walker's progression to that record's
-position.
-
-If no record ages out at this walker step, drain is deferred
-until the next emission — the marks are not lost. At
-chromosome boundaries and end-of-input, `flush_chromosome`
-drains everything; if no records are pending closure but there
-are leftover marks, the marks are dropped (no record to attach
-them to, and Stage 5 has no further records to apply them
-against — the loss is consumer-invisible).
-
-#### Slot reuse and the `pending_free` deferral
-
-A subtle correctness issue: if a released slot was put back into
-`free` immediately, a same-walker-step admission could reuse
-the slot id, putting `expired[S]` and `new[S]` into the same
-record's marks. Since slot ids are reused across the whole
-stream, a downstream consumer would have no way to tell "r1's
-chain ended and r2's chain began with the same id" apart from a
-spurious single-chain transient — silently merging two distinct
-phase chains.
-
-The allocator therefore parks released slots in `pending_free`
-rather than `free` directly. `drain_lifecycle_marks` migrates
-`pending_free` → `free` only after emitting that drain's marks.
-Any reuse of a freed id is forced into a strictly later emission
-than the one carrying its `expired` mark. As a consequence:
-
-- `expired[S]` and `new[S]` for the **same `S`** in the same
-  drain can only describe a *transient* slot (allocated and
-  released within one emission window with no allele tagged).
-  The consumer applies `new_chains` before processing the
-  record and `expired_chains` after, so a transient slot has
-  no observable effect on the alive set.
-- `expired[S]` (from a real chain ending) and `new[S]` (from
-  reuse for a new chain) are guaranteed to be in **different
-  records'** marks, separated by at least one emission. The
-  consumer thus sees a clean chain transition and links r1's
-  alleles only to r1's chain, r2's alleles only to r2's chain.
-
-The previous draft's "suppress same-id-in-both" rule has been
-removed: it conflated transient slots (harmless) with reuse
-(corrupting). The deferral approach handles both cases by
-construction.
+With a unique-id namespace there is nothing to disambiguate: id
+`k` always refers to the same molecule wherever it appears. The
+`new_chains` / `expired_chains` markers that earlier drafts of
+this spec described — and the `pending_free` deferral that those
+markers required to prevent same-emission ambiguity under
+recycling — are gone. Consumers read each allele's `chain_ids`
+list directly; the compound-haplotype check is a small
+intersection between two records' lists.
 
 ### Defensive bounds
 
-- `MAX_ACTIVE_SLOTS`: hard cap, default `4096`. Exceeding it is
-  a hard error: very high coverage at a repeat region implies
-  the run is likely processing pathological input. The cap is
-  user-tuneable via `--max-active-chain-slots`.
+- `MAX_ACTIVE_READS`: hard cap on concurrently-active reads,
+  default `4096`. Exceeding it is a hard error
+  (`WalkerError::ActiveReadsExhausted`): very high coverage at a
+  repeat region implies pathological input. The cap is
+  user-tuneable via `--max-active-reads`. The cap is unrelated
+  to the chain-id namespace — `u64` ids have effectively
+  unlimited headroom; this bound exists to protect against
+  pathological memory pressure in the active-set bookkeeping
+  alone.
 
 - `MATE_LOOKUP_WINDOW`: if a pending first-mate entry has
   `seen_at + MATE_LOOKUP_WINDOW < walker_pos`, the entry is
-  evicted: the first mate is finalised as solo
-  (`pending_mates` cleared, slot refcount stays at 1, the
-  slot will release when the first mate's `ActiveRead` exits).
-  An eviction counter is bumped in the run summary.
+  evicted: the first mate is finalised as solo (`pending_mates`
+  entry cleared; the first mate's chain id is now its own and
+  never gets a partner). An eviction counter is bumped in the
+  run summary.
+
+- `MAX_PENDING_MATES`: defensive cap on the `pending_mates` map
+  size (default 10 000). Exceeding it surfaces as
+  `WalkerError::PendingMatesExhausted` — catches truly
+  malformed inputs (every paired read flagged FirstOfPair with
+  no SecondOfPair ever arriving) before they consume meaningful
+  memory.
 
 ## Mate-overlap mechanics
 
@@ -1315,7 +1286,9 @@ every error halts:
 |---|---|---|
 | Out-of-order read input | `WalkerError::OutOfOrder` | qname, expected min position, actual position |
 | Read decoded zero ref bases | `WalkerError::ZeroRefSpan` | qname |
-| Slot pool exhausted (`> MAX_ACTIVE_SLOTS`) | `WalkerError::SlotExhausted` | walker_pos, current active read count |
+| Active-reads cap exceeded (`> MAX_ACTIVE_READS`) | `WalkerError::ActiveReadsExhausted` | walker_pos, current active read count |
+| Chain-id namespace exhausted (`u64::MAX` chain ids minted) | `WalkerError::ChainIdSpaceExhausted` | walker_pos, chrom_id |
+| Pending-mates map exceeded `MAX_PENDING_MATES` (malformed input — orphaned first-mates piling up) | `WalkerError::PendingMatesExhausted` | walker_pos, cap |
 | Open record REF span exceeded `MAX_RECORD_SPAN` (should not happen — upstream rejects oversize reads) | `WalkerError::RecordTooWide` | anchor pos, current span |
 | Internal invariant: event cursor not at end on read exit | `WalkerError::Internal` | qname, residual events |
 | FASTA fetch failure during open-record widening | `WalkerError::Fasta(io::Error)` | chrom, requested span |
@@ -1335,8 +1308,8 @@ Reported on stderr at end of run, per
 | `reads_seen` | reads pulled from upstream |
 | `reads_admitted` | reads that entered the active set |
 | `mate_lookup_evictions` | first-mate entries timed out at `MATE_LOOKUP_WINDOW` |
-| `slot_allocations` | total slot allocations (including reuses across pairs) |
-| `slot_high_water` | maximum concurrently-active slots observed |
+| `chain_allocations` | total fresh chain ids minted (second-mate allocations, which share the first mate's id, do not count) |
+| `active_reads_high_water` | maximum concurrently-active reads observed |
 | `records_emitted` | total `PileupRecord`s sent to Stage 2 |
 | `record_widen_events` | times an open record's REF span widened |
 | `mate_overlap_positions` | per-position BQ comparisons performed |
@@ -1379,14 +1352,16 @@ Resolved against freebayes (consultation 2026-05-06,
   observed/unobserved flag bit elides the scalar block for
   zero-obs entries. See §"Output interface" for the full
   argument.
-- **`SlotId` underlying type.** `u16` with `MAX_ACTIVE_SLOTS =
-  4096` (12 bits used, ~16× headroom over the cap). `u8` was
-  rejected: the per-element memory saving over `u16` is one
-  byte and the entire stored collection of slot ids is small,
-  while a 256-slot cap is uncomfortably close to realistic
-  pileup depths and would risk silent overflow in repeat
-  regions. The cap can still be raised if needed; the type
-  choice carries no further constraint.
+- **`ChainId` underlying type.** `u64`, monotonically allocated
+  and never recycled within a `.psp` file. Earlier drafts chose
+  `u16` (with recycling, lifecycle markers, and a `MAX_ACTIVE_SLOTS
+  = 4096` cap on the namespace) but that design was retired
+  2026-05-14 in favour of unique-per-file `u64` ids; see
+  [`feature_implementation_plans/unique_chain_ids.md`](../feature_implementation_plans/unique_chain_ids.md).
+  The `u64` ceiling (~1.8 × 10¹⁹ ids per file) is unreachable on
+  any realistic workload; the `MAX_ACTIVE_READS` cap that
+  survives bounds **concurrent active reads**, not the
+  chain-id namespace.
 - **Active-set mate-lookup index.** Maintained from day one as
   a secondary `AHashMap<u32, usize>` (`read_id → vec_index`)
   alongside the primary `Vec<ActiveRead>`. Mate-lookup cost

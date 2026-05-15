@@ -31,7 +31,7 @@ pub enum WalkerError {
 
     #[error(
         "active-read cap exceeded (cap={cap}) at chrom_id={chrom_id} pos={pos}; \
-         consider raising --max-active-chain-slots or pre-filtering this region"
+         consider raising --max-active-reads or pre-filtering this region"
     )]
     ActiveReadsExhausted { cap: u32, chrom_id: u32, pos: u32 },
 

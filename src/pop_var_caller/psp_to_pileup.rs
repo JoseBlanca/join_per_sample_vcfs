@@ -41,7 +41,7 @@ pub struct PspToPileupArgs {
     #[arg(long)]
     pub region: Option<String>,
 
-    /// Append the per-allele `chain_slots` list (semicolon-separated)
+    /// Append the per-allele `chain_ids` list (semicolon-separated)
     /// to each allele record in the trailing ALLELE_DETAILS column.
     #[arg(long)]
     pub show_chain_ids: bool,
@@ -427,12 +427,12 @@ fn emit_allele_detail(out: &mut String, allele: &AlleleObservation, show_chains:
     if show_chains {
         out.push(':');
         let mut first = true;
-        for slot in &allele.chain_slots {
+        for chain_id in &allele.chain_ids {
             if !first {
                 out.push(';');
             }
             first = false;
-            let _ = write!(out, "{}", slot);
+            let _ = write!(out, "{}", chain_id);
         }
     }
 }

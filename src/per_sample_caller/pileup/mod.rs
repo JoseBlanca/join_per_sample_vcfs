@@ -5,15 +5,15 @@
 //! See `ia/specs/pileup_walker.md` for the implementation-ready
 //! specification. This module ships the public types
 //! (`PreparedRead`, `PileupRecord`, `AlleleObservation`, `AlleleSupportStats`,
-//! `SlotId`, `RefSeqFetcher`, `WalkerError`) and the public entry
+//! `ChainId`, `RefSeqFetcher`, `WalkerError`) and the public entry
 //! point `run`. Internal building blocks live in private submodules.
 
 mod active_read_set;
+mod chain_id_allocator;
 mod cigar_cursor;
 mod decompose;
 mod errors;
 mod open_record;
-mod slot_allocator;
 mod walker;
 
 #[cfg(test)]
@@ -22,8 +22,8 @@ pub(crate) mod tests;
 use std::sync::Arc;
 
 pub use crate::per_sample_caller::cram_input::CigarOp;
+pub use chain_id_allocator::{ChainId, DEFAULT_MAX_ACTIVE_READS};
 pub use errors::WalkerError;
-pub use slot_allocator::{DEFAULT_MAX_ACTIVE_SLOTS, SlotId};
 pub use walker::{PileupWalker, RunSummary, run};
 
 // ---------------------------------------------------------------------
@@ -98,10 +98,10 @@ pub const DEFAULT_MAX_INDEL_COLUMN_DEPTH: u32 = 250;
 /// `column_depth_cap_keeps_first_n_of_admission_order`. Mi5 in
 /// `ia/reviews/pileup_2026-05-09.md`.
 ///
-/// With the current `MAX_ACTIVE_SLOTS = 4096`, only the indel cap
+/// With the current `MAX_ACTIVE_READS = 4096`, only the indel cap
 /// can fire (column depth is already bounded below the SNP cap).
-/// The SNP cap is future-proofing for if/when the slot cap is
-/// raised.
+/// The SNP cap is future-proofing for if/when the active-reads cap
+/// is raised.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct WalkerConfig {
@@ -129,11 +129,8 @@ pub struct WalkerConfig {
     /// Exceeding it is a hard error
     /// ([`WalkerError::ActiveReadsExhausted`]) rather than silent
     /// memory blow-up on pathologically deep regions. Defaults to
-    /// [`DEFAULT_MAX_ACTIVE_SLOTS`]. The field name keeps the
-    /// `slots` history for backwards-compatible config callers;
-    /// under the unique-`u64`-chain-id design it bounds concurrent
-    /// active reads, not a slot id namespace.
-    pub max_active_slots: u32,
+    /// [`DEFAULT_MAX_ACTIVE_READS`].
+    pub max_active_reads: u32,
 }
 
 impl Default for WalkerConfig {
@@ -143,7 +140,7 @@ impl Default for WalkerConfig {
             max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
             max_record_span: DEFAULT_MAX_RECORD_SPAN,
             mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
-            max_active_slots: DEFAULT_MAX_ACTIVE_SLOTS,
+            max_active_reads: DEFAULT_MAX_ACTIVE_READS,
         }
     }
 }
@@ -382,9 +379,9 @@ pub struct AlleleSupportStats {
 pub struct AlleleObservation {
     pub seq: Vec<u8>,
     pub support: AlleleSupportStats,
-    /// Distinct phase-chain slot ids that contributed to this
-    /// allele, sorted ascending and deduplicated.
-    pub chain_slots: Vec<SlotId>,
+    /// Distinct phase-chain ids that contributed to this allele,
+    /// sorted ascending and deduplicated.
+    pub chain_ids: Vec<ChainId>,
 }
 
 // ---------------------------------------------------------------------
@@ -395,8 +392,8 @@ pub struct AlleleObservation {
 /// REF — the walker invariant — so `ref_span` is derivable as
 /// `alleles[0].seq.len()` and is not stored separately.
 ///
-/// Each `AlleleObservation`'s `chain_slots` field references chain
-/// ids minted by the walker's slot allocator. Chain ids are
+/// Each `AlleleObservation`'s `chain_ids` field references chain
+/// ids minted by the walker's chain-id allocator. Chain ids are
 /// unique-per-`.psp`-file `u64` values; there is no recycling, no
 /// active-set bookkeeping, and no per-record lifecycle markers.
 /// Two allele observations sharing a chain id came from the same
@@ -434,11 +431,11 @@ impl PileupRecord {
 impl AlleleObservation {
     /// Constructor for external code (benches, integration tests).
     /// See [`PileupRecord::new`].
-    pub fn new(seq: Vec<u8>, support: AlleleSupportStats, chain_slots: Vec<SlotId>) -> Self {
+    pub fn new(seq: Vec<u8>, support: AlleleSupportStats, chain_ids: Vec<ChainId>) -> Self {
         Self {
             seq,
             support,
-            chain_slots,
+            chain_ids,
         }
     }
 }

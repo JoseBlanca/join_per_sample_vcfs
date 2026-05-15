@@ -9,15 +9,15 @@
 //! `ia/feature_implementation_plans/unique_chain_ids.md` §"Overflow
 //! guard".
 //!
-//! With unique ids there is no slot lifecycle to track downstream:
-//! the per-record `new_chains` / `expired_chains` markers and the
-//! writer-side active-set bookkeeping are gone. The allocator's
-//! remaining responsibilities are (a) minting the id, (b) collapsing
-//! a read pair onto one id via the `pending_mates` map, and
-//! (c) defending against pathological depth via the
-//! `max_active_reads` cap that lives on the walker side.
+//! With unique ids there is no chain lifecycle to track downstream:
+//! the per-record new/expired chain markers and the writer-side
+//! active-set bookkeeping are gone. The allocator's remaining
+//! responsibilities are (a) minting the id, (b) collapsing a read
+//! pair onto one id via the `pending_mates` map, and (c) defending
+//! against pathological depth via the `max_active_reads` cap that
+//! lives on the walker side.
 //!
-//! The cap on *concurrent active reads* (`WalkerConfig::max_active_slots`)
+//! The cap on *concurrent active reads* (`WalkerConfig::max_active_reads`)
 //! is enforced here as a defensive check: if the number of active reads
 //! ever exceeds the cap, [`WalkerError::ActiveReadsExhausted`] surfaces.
 //! The cap is independent of, and far smaller than, the `u64`
@@ -32,16 +32,16 @@ use super::errors::WalkerError;
 
 /// Phase-chain identifier. `u64` gives ~1.8 × 10¹⁹ values per file —
 /// well beyond any realistic read count. Overflow is still caught
-/// (see [`SlotAllocator::allocate_for_read`]).
-pub type SlotId = u64;
+/// (see [`ChainIdAllocator::allocate_for_read`]).
+pub type ChainId = u64;
 
-/// Default value for [`WalkerConfig::max_active_slots`]: hard cap on
-/// the number of concurrently-active reads. The name is kept for
-/// API compatibility; it now bounds *concurrent active reads*, not
-/// a slot id namespace (slot ids are unique `u64`s, never recycled).
+/// Default value for [`WalkerConfig::max_active_reads`]: hard cap on
+/// the number of concurrently-active reads. Bounds *concurrent active
+/// reads*, not the chain id namespace (chain ids are unique `u64`s,
+/// never recycled).
 ///
-/// [`WalkerConfig::max_active_slots`]: super::WalkerConfig::max_active_slots
-pub const DEFAULT_MAX_ACTIVE_SLOTS: u32 = 4096;
+/// [`WalkerConfig::max_active_reads`]: super::WalkerConfig::max_active_reads
+pub const DEFAULT_MAX_ACTIVE_READS: u32 = 4096;
 
 /// Hard cap on the number of entries the `pending_mates` map will
 /// hold at any time. Exceeding it surfaces as
@@ -72,13 +72,13 @@ fn high_water_warn_threshold(cap: u32) -> u32 {
 /// evict stale entries past the lookup window.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingMate {
-    pub chain_slot_id: SlotId,
+    pub chain_id: ChainId,
     pub first_mate_read_id: u32,
     pub seen_at: u32,
 }
 
 #[derive(Debug)]
-pub struct SlotAllocator {
+pub struct ChainIdAllocator {
     /// Next never-used chain id. Incremented on every fresh
     /// allocation via [`checked_add`](u64::checked_add) so silent
     /// wrap to zero is impossible — overflow surfaces as
@@ -95,16 +95,14 @@ pub struct SlotAllocator {
     /// (`MateRole::Solo`) never enter this map.
     pending_mates: AHashMap<Arc<str>, PendingMate>,
     /// Bookkeeping for the run summary.
-    counters: SlotAllocatorCounters,
+    counters: ChainIdAllocatorCounters,
     /// Set the first time the active-read count reaches
     /// `high_water_warn_threshold(max_active_reads)`. Idempotent
     /// within a run — and because `reset` (called at chromosome
     /// boundaries) deliberately preserves it, the warning fires
     /// at most once per run rather than once per chromosome.
     high_water_warned: bool,
-    /// Hard cap on concurrent active reads. The name "max_active_slots"
-    /// is preserved on the public config struct for backwards-
-    /// compatible callers; here we store the same value.
+    /// Hard cap on concurrent active reads.
     max_active_reads: u32,
     /// Per-instance pending-mate lookup window, mirrors
     /// `WalkerConfig::mate_lookup_window`.
@@ -117,24 +115,24 @@ pub struct SlotAllocator {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SlotAllocatorCounters {
+pub struct ChainIdAllocatorCounters {
     /// Number of fresh chain ids minted (i.e., `next_id`
     /// increments). Second-mate allocations do not count.
-    pub slot_allocations: u64,
+    pub chain_allocations: u64,
     /// Peak observed value of `active_count` during the run.
-    pub slot_high_water: u32,
+    pub active_reads_high_water: u32,
     /// Number of first mates whose partner never arrived within
     /// `mate_lookup_window` and were evicted from `pending_mates`.
     pub mate_lookup_evictions: u64,
 }
 
-impl SlotAllocator {
+impl ChainIdAllocator {
     /// Construct with the default cap and lookup window. Used by
-    /// tests; production code calls [`SlotAllocator::with_caps`]
+    /// tests; production code calls [`ChainIdAllocator::with_caps`]
     /// from `walker::run`.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_caps(DEFAULT_MAX_ACTIVE_SLOTS, super::DEFAULT_MATE_LOOKUP_WINDOW)
+        Self::with_caps(DEFAULT_MAX_ACTIVE_READS, super::DEFAULT_MATE_LOOKUP_WINDOW)
     }
 
     /// Construct with explicit caps. `max_active_reads` is the
@@ -145,7 +143,7 @@ impl SlotAllocator {
             next_id: 0,
             active_count: 0,
             pending_mates: AHashMap::new(),
-            counters: SlotAllocatorCounters::default(),
+            counters: ChainIdAllocatorCounters::default(),
             high_water_warned: false,
             max_active_reads,
             mate_lookup_window,
@@ -201,14 +199,14 @@ impl SlotAllocator {
     /// - Solo read (`MateRole::Solo`): mint a fresh id; `active_count`
     ///   is incremented once.
     ///
-    /// Returns `(slot_id, first_mate_read_id_if_pairing)` — the
+    /// Returns `(chain_id, first_mate_read_id_if_pairing)` — the
     /// second value is `Some` only on the second-mate path, so the
     /// caller can fill `mate_read_id` cross-references in the
     /// active set.
     pub fn allocate_for_read(
         &mut self,
         read: &PreparedRead,
-    ) -> Result<(SlotId, Option<u32>), WalkerError> {
+    ) -> Result<(ChainId, Option<u32>), WalkerError> {
         // Garbage-collect stale pending-mate entries before any
         // allocation; otherwise a long pileup of unmatched first
         // mates can grow the map until memory pressure forces a
@@ -225,14 +223,14 @@ impl SlotAllocator {
             // distinct chain ids.
             self.bump_active_count(read.chrom_id, read.alignment_start)?;
             self.maybe_warn_high_water(read.chrom_id, read.alignment_start);
-            return Ok((pending.chain_slot_id, Some(pending.first_mate_read_id)));
+            return Ok((pending.chain_id, Some(pending.first_mate_read_id)));
         }
 
         // Fresh allocation: bump active_count first (so the cap
         // surfaces before we mint a new id we'd then have to roll
         // back), then mint.
         self.bump_active_count(read.chrom_id, read.alignment_start)?;
-        let slot = self.next_id;
+        let chain_id = self.next_id;
         // Bump next_id with overflow check. `2^64` chain ids per
         // .psp file is astronomically beyond any realistic
         // workload, but silent wrap-around would silently merge
@@ -247,7 +245,7 @@ impl SlotAllocator {
                 chrom_id: read.chrom_id,
                 pos: read.alignment_start,
             })?;
-        self.counters.slot_allocations += 1;
+        self.counters.chain_allocations += 1;
         self.maybe_warn_high_water(read.chrom_id, read.alignment_start);
 
         if read.mate_role.is_paired() {
@@ -269,14 +267,14 @@ impl SlotAllocator {
             self.pending_mates.insert(
                 read.qname.clone(),
                 PendingMate {
-                    chain_slot_id: slot,
+                    chain_id,
                     first_mate_read_id: 0, // caller fills via `register_first_mate_read_id`
                     seen_at: read.alignment_start,
                 },
             );
         }
 
-        Ok((slot, None))
+        Ok((chain_id, None))
     }
 
     /// Update a freshly-registered first mate's `PendingMate` entry
@@ -291,7 +289,7 @@ impl SlotAllocator {
 
     /// Note that a read has exited the active set: decrement the
     /// active-read count. With unique chain ids the act of expiring
-    /// a read no longer touches a slot id namespace — the id stays
+    /// a read no longer touches a chain id namespace — the id stays
     /// unique for the file — so this is just refcount-style
     /// bookkeeping for the active-read cap.
     ///
@@ -311,7 +309,7 @@ impl SlotAllocator {
         Ok(())
     }
 
-    pub fn counters(&self) -> SlotAllocatorCounters {
+    pub fn counters(&self) -> ChainIdAllocatorCounters {
         self.counters
     }
 
@@ -327,8 +325,8 @@ impl SlotAllocator {
             });
         }
         self.active_count += 1;
-        if self.active_count > self.counters.slot_high_water {
-            self.counters.slot_high_water = self.active_count;
+        if self.active_count > self.counters.active_reads_high_water {
+            self.counters.active_reads_high_water = self.active_count;
         }
         Ok(())
     }
@@ -340,14 +338,14 @@ impl SlotAllocator {
     /// `WalkerError::ActiveReadsExhausted`.
     fn maybe_warn_high_water(&mut self, chrom_id: u32, pos: u32) {
         let threshold = high_water_warn_threshold(self.max_active_reads);
-        if !self.high_water_warned && self.counters.slot_high_water >= threshold {
+        if !self.high_water_warned && self.counters.active_reads_high_water >= threshold {
             self.high_water_warned = true;
             eprintln!(
                 "warning: pileup walker reached {}/{} active reads at \
                  chrom_id={} pos={}; if usage exceeds {} the run will fail with \
-                 ActiveReadsExhausted (raise WalkerConfig::max_active_slots or \
+                 ActiveReadsExhausted (raise WalkerConfig::max_active_reads or \
                  pre-filter this region)",
-                self.counters.slot_high_water,
+                self.counters.active_reads_high_water,
                 self.max_active_reads,
                 chrom_id,
                 pos,
@@ -404,17 +402,17 @@ mod tests {
 
     #[test]
     fn solo_read_allocates_a_fresh_id_starting_at_zero() {
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let read = make_read("solo", MateRole::Solo, 100);
-        let (slot, mate_id) = a.allocate_for_read(&read).expect("solo allocates");
-        assert_eq!(slot, 0);
+        let (chain_id, mate_id) = a.allocate_for_read(&read).expect("solo allocates");
+        assert_eq!(chain_id, 0);
         assert_eq!(mate_id, None);
         assert!(a.pending_mates.is_empty());
     }
 
     #[test]
     fn ids_are_unique_and_monotonically_increasing_across_solo_reads() {
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let r0 = make_read("a", MateRole::Solo, 100);
         let r1 = make_read("b", MateRole::Solo, 100);
         let r2 = make_read("c", MateRole::Solo, 100);
@@ -426,14 +424,14 @@ mod tests {
 
     #[test]
     fn first_mate_registers_then_second_mate_reuses_id() {
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let m1 = make_read("pair1", MateRole::FirstOfPair, 100);
-        let (slot1, mate_id1) = a.allocate_for_read(&m1).expect("first mate");
+        let (chain_id1, mate_id1) = a.allocate_for_read(&m1).expect("first mate");
         a.register_first_mate_read_id(&m1.qname, 42);
 
         let m2 = make_read("pair1", MateRole::FirstOfPair, 200);
-        let (slot2, mate_id2) = a.allocate_for_read(&m2).expect("second mate");
-        assert_eq!(slot1, slot2, "mates must share a chain id");
+        let (chain_id2, mate_id2) = a.allocate_for_read(&m2).expect("second mate");
+        assert_eq!(chain_id1, chain_id2, "mates must share a chain id");
         assert_eq!(mate_id1, None, "first mate has no partner registered yet");
         assert_eq!(mate_id2, Some(42), "second mate sees first mate's read_id");
         assert!(
@@ -446,8 +444,8 @@ mod tests {
     fn released_ids_are_not_recycled() {
         // Same-id reuse is the entire bug class this design exists to
         // remove: a freed chain id must *not* surface again, even
-        // after the slot allocator has been told the read exited.
-        let mut a = SlotAllocator::new();
+        // after the allocator has been told the read exited.
+        let mut a = ChainIdAllocator::new();
         let r1 = make_read("r1", MateRole::Solo, 100);
         let (s1, _) = a.allocate_for_read(&r1).unwrap();
         a.note_read_exit(0, 100).unwrap();
@@ -459,8 +457,8 @@ mod tests {
 
     #[test]
     fn active_reads_cap_returns_hard_error() {
-        let mut a = SlotAllocator::new();
-        for i in 0..DEFAULT_MAX_ACTIVE_SLOTS {
+        let mut a = ChainIdAllocator::new();
+        for i in 0..DEFAULT_MAX_ACTIVE_READS {
             let r = make_read(&format!("r{i}"), MateRole::Solo, 100);
             a.allocate_for_read(&r).expect("under cap");
         }
@@ -474,7 +472,7 @@ mod tests {
 
     #[test]
     fn stale_pending_mates_are_evicted_after_window() {
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let m1 = make_read("orphan", MateRole::FirstOfPair, 100);
         let _ = a.allocate_for_read(&m1).unwrap();
         assert_eq!(a.pending_mates.len(), 1);
@@ -497,10 +495,10 @@ mod tests {
         // `reset` is called at chromosome boundaries. With unique ids
         // the *id counter* must stay monotonic across the boundary —
         // otherwise the same id would surface on two chromosomes.
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let r = make_read("x", MateRole::Solo, 100);
         a.allocate_for_read(&r).unwrap();
-        let allocs_before = a.counters().slot_allocations;
+        let allocs_before = a.counters().chain_allocations;
         let next_id_before = a.next_id;
         a.reset();
         assert_eq!(a.active_count, 0);
@@ -509,13 +507,13 @@ mod tests {
             a.next_id, next_id_before,
             "next_id must persist across reset",
         );
-        assert_eq!(a.counters().slot_allocations, allocs_before);
+        assert_eq!(a.counters().chain_allocations, allocs_before);
     }
 
     #[test]
     fn high_water_warning_fires_once_at_threshold_and_then_stays_set() {
-        let mut a = SlotAllocator::new();
-        let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_SLOTS);
+        let mut a = ChainIdAllocator::new();
+        let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_READS);
         for i in 0..(threshold - 1) {
             let r = make_read(&format!("r{i}"), MateRole::Solo, 100);
             a.allocate_for_read(&r).expect("under threshold");
@@ -536,8 +534,8 @@ mod tests {
 
     #[test]
     fn reset_preserves_high_water_warning_flag() {
-        let mut a = SlotAllocator::new();
-        let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_SLOTS);
+        let mut a = ChainIdAllocator::new();
+        let threshold = high_water_warn_threshold(DEFAULT_MAX_ACTIVE_READS);
         for i in 0..threshold {
             let r = make_read(&format!("r{i}"), MateRole::Solo, 100);
             a.allocate_for_read(&r).unwrap();
@@ -552,7 +550,7 @@ mod tests {
 
     #[test]
     fn note_read_exit_on_empty_active_set_errors_with_locus_context() {
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let err = a
             .note_read_exit(/* chrom_id */ 7, /* pos */ 12345)
             .expect_err("note_read_exit with empty active set must error");
@@ -581,9 +579,9 @@ mod tests {
         // active set, its `pending_mates` entry must survive so a
         // later second-mate arrival within the window can still
         // match.
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let m1 = make_read("pair", MateRole::FirstOfPair, 100);
-        let (slot1, _) = a.allocate_for_read(&m1).unwrap();
+        let (chain_id1, _) = a.allocate_for_read(&m1).unwrap();
         // First mate exits the active set.
         a.note_read_exit(0, 200).unwrap();
         assert_eq!(a.active_count, 0);
@@ -595,8 +593,8 @@ mod tests {
         // Second mate arrives later (within the window); reuses
         // the first mate's chain id.
         let m2 = make_read("pair", MateRole::SecondOfPair, 200);
-        let (slot2, partner) = a.allocate_for_read(&m2).unwrap();
-        assert_eq!(slot1, slot2, "mates share the same chain id");
+        let (chain_id2, partner) = a.allocate_for_read(&m2).unwrap();
+        assert_eq!(chain_id1, chain_id2, "mates share the same chain id");
         assert_eq!(partner, Some(0), "second-mate path saw the first mate");
         assert!(
             a.pending_mates.is_empty(),
@@ -611,7 +609,7 @@ mod tests {
         // Seed `next_id` to `u64::MAX` via the test constructor. The
         // very next fresh allocation must error rather than wrap to
         // zero (which would silently produce colliding chain ids).
-        let mut a = SlotAllocator::with_next_id_for_testing(u64::MAX);
+        let mut a = ChainIdAllocator::with_next_id_for_testing(u64::MAX);
         let r = make_read("at-max", MateRole::Solo, 100);
         let err = a
             .allocate_for_read(&r)
@@ -633,12 +631,12 @@ mod tests {
         // allocation. Pins that the `checked_add` is at the right
         // place and the test couldn't accidentally relax to
         // `wrapping_add` without failing this test.
-        let mut a = SlotAllocator::with_next_id_for_testing(u64::MAX - 1);
+        let mut a = ChainIdAllocator::with_next_id_for_testing(u64::MAX - 1);
         let r = make_read("at-max-minus-one", MateRole::Solo, 100);
-        let (slot, _) = a
+        let (chain_id, _) = a
             .allocate_for_read(&r)
             .expect("must succeed at u64::MAX - 1");
-        assert_eq!(slot, u64::MAX - 1);
+        assert_eq!(chain_id, u64::MAX - 1);
 
         // The next fresh allocation would mint `u64::MAX` and try to
         // bump `next_id` to `u64::MAX + 1`, which overflows — error.
@@ -661,7 +659,7 @@ mod tests {
         // test-only constructor so the cap path is reachable without
         // 10 000 qnames. With cap=2, the third orphan first-mate
         // admission must fail with PendingMatesExhausted.
-        let mut a = SlotAllocator::with_pending_mates_cap_for_testing(2);
+        let mut a = ChainIdAllocator::with_pending_mates_cap_for_testing(2);
         let r0 = make_read("a", MateRole::FirstOfPair, 100);
         let r1 = make_read("b", MateRole::FirstOfPair, 101);
         a.allocate_for_read(&r0).unwrap();
@@ -688,7 +686,7 @@ mod tests {
         // does not insert), so the cap does not fire there — even
         // with `pending_mates.len() == cap`, a second mate can still
         // resolve cleanly.
-        let mut a = SlotAllocator::with_pending_mates_cap_for_testing(1);
+        let mut a = ChainIdAllocator::with_pending_mates_cap_for_testing(1);
         let r0 = make_read("pair", MateRole::FirstOfPair, 100);
         a.allocate_for_read(&r0).unwrap();
         assert_eq!(a.pending_mates.len(), 1);

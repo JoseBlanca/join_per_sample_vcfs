@@ -26,7 +26,7 @@ use crate::per_sample_caller::cram_input::{
 use crate::per_sample_caller::errors::CramInputError;
 use crate::per_sample_caller::pileup;
 use crate::per_sample_caller::pileup::{
-    DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_SLOTS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+    DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH, RunSummary, WalkerConfig,
 };
 use crate::per_sample_caller::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
@@ -223,7 +223,7 @@ pub struct PileupArgs {
     #[arg(
         long,
         hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ACTIVE_SLOTS,
+        default_value_t = DEFAULT_MAX_ACTIVE_READS,
         help_heading = "Advanced — Pileup walker",
     )]
     pub max_active_reads: u32,
@@ -434,7 +434,7 @@ fn walker_config_from_args(args: &PileupArgs) -> WalkerConfig {
         max_indel_column_depth: args.max_indel_column_depth,
         max_record_span: args.max_record_span,
         mate_lookup_window: args.mate_lookup_window,
-        max_active_slots: args.max_active_reads,
+        max_active_reads: args.max_active_reads,
     }
 }
 
@@ -637,13 +637,13 @@ fn print_run_summary(
     }
     eprintln!(
         "walker: reads_admitted={} records_emitted={} record_widen_events={} \
-         mate_overlap_positions={} slot_high_water={} mate_lookup_evictions={} \
+         mate_overlap_positions={} active_reads_high_water={} mate_lookup_evictions={} \
          column_depth_truncations={}",
         summary.reads_admitted,
         summary.records_emitted,
         summary.record_widen_events,
         summary.mate_overlap_positions,
-        summary.slot_high_water,
+        summary.active_reads_high_water,
         summary.mate_lookup_evictions,
         summary.column_depth_truncations,
     );
@@ -718,7 +718,7 @@ mod tests {
             max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
             max_record_span: DEFAULT_MAX_RECORD_SPAN,
             mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
-            max_active_reads: DEFAULT_MAX_ACTIVE_SLOTS,
+            max_active_reads: DEFAULT_MAX_ACTIVE_READS,
         }
     }
 

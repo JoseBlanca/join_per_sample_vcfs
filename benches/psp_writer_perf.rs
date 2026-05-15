@@ -6,9 +6,9 @@
 //!   0.1 % SNPs, no phase-chain markers. Dense common case.
 //! - `psp_writer/phase_chain_heavy_1M` — single chromosome, sustained
 //!   active phase-chain set (~6 active on average), each record's
-//!   first allele carries the full active set as `chain_slots`. Drives
-//!   the three `Vec<Vec<SlotId>>` list columns and the `active_slots`
-//!   set bookkeeping.
+//!   first allele carries the full active set as `chain_ids`. Drives
+//!   the `Vec<Vec<ChainId>>` list column and the active-chain
+//!   bookkeeping.
 //! - `psp_writer/multi_allele_500k` — single chromosome, 2–4 alleles
 //!   per record, indel-shaped allele lengths from 1 to 10 bytes.
 //!   Exercises the bytes column, per-allele scalars, and the per-byte
@@ -22,7 +22,7 @@
 //! the timed region; the bench body borrows `records` and clones
 //! only the small header (or recreates the sink for the file
 //! variant). The `BlockAccumulator` clones each
-//! `allele.chain_slots` `Vec` as it appends, so those allocations
+//! `allele.chain_ids` `Vec` as it appends, so those allocations
 //! are still measured exactly as production would produce them.
 
 // Opt-in mimalloc global allocator (cargo bench --features alloc-mimalloc ...).
@@ -120,7 +120,7 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
 
 /// Phase-chain-heavy: ~6 active phase chains on average. Every
 /// record's first allele carries a sliding window of chain ids as
-/// `chain_slots`. With unique-per-file ids and no recycling, the
+/// `chain_ids`. With unique-per-file ids and no recycling, the
 /// "active set" notion is just whichever ids appear on this record;
 /// the lifecycle-marker mechanism is gone.
 fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
@@ -152,11 +152,11 @@ fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
             }
         }
 
-        let chain_slots = active.clone();
+        let chain_ids = active.clone();
         let alleles = vec![AlleleObservation::new(
             vec![ref_base],
             AlleleSupportStats::new(20, -40.0, 10, 5, 2),
-            chain_slots,
+            chain_ids,
         )];
 
         records.push(PileupRecord::new(0, pos, alleles));

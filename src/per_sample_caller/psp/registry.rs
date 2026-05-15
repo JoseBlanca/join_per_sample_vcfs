@@ -191,7 +191,7 @@ pub enum ColumnKey {
     AlleleFwdCount,
     AllelePlacedLeftCount,
     AllelePlacedStartCount,
-    AlleleChainSlots,
+    AlleleChainIds,
 }
 
 /// Per-payload-shape data, pinning the valid combinations of
@@ -427,8 +427,8 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x22,
-        key: ColumnKey::AlleleChainSlots,
-        name: "allele-chain-slots",
+        key: ColumnKey::AlleleChainIds,
+        name: "allele-chain-ids",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::List {
             element_type: ElementType::U64,
@@ -613,11 +613,11 @@ mod tests {
         assert_eq!(q.tag, 0x11);
         assert_eq!(q.element_type(), Some(ElementType::F64));
 
-        let slots = lookup_by_name("allele-chain-slots").unwrap();
-        assert_eq!(slots.tag, 0x22);
-        assert_eq!(slots.cardinality, Cardinality::PerAllele);
-        assert_eq!(slots.shape(), Shape::List);
-        assert_eq!(slots.element_type(), Some(ElementType::U64));
+        let chain_ids = lookup_by_name("allele-chain-ids").unwrap();
+        assert_eq!(chain_ids.tag, 0x22);
+        assert_eq!(chain_ids.cardinality, Cardinality::PerAllele);
+        assert_eq!(chain_ids.shape(), Shape::List);
+        assert_eq!(chain_ids.element_type(), Some(ElementType::U64));
 
         let seq = lookup_by_name("allele-seq").unwrap();
         assert_eq!(seq.shape(), Shape::Bytes);

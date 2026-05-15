@@ -147,8 +147,8 @@ pub enum InvalidRecordKind {
     #[error("allele {allele_index} q_sum is non-finite ({q_sum})")]
     NonFiniteQSum { allele_index: usize, q_sum: f64 },
 
-    #[error("allele {allele_index} chain_slots not strictly ascending")]
-    AlleleChainSlotsNotAscending { allele_index: usize },
+    #[error("allele {allele_index} chain_ids not strictly ascending")]
+    AlleleChainIdsNotAscending { allele_index: usize },
 }
 
 /// Wrapper around `toml::ser::Error` so the writer's error chain

@@ -35,7 +35,7 @@ use super::registry::{
     ColumnDef, ColumnKey, ColumnPayload, ElementType, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS,
 };
 use super::trailer::{Trailer, encode_trailer};
-use crate::per_sample_caller::pileup::{PileupRecord, SlotId};
+use crate::per_sample_caller::pileup::{ChainId, PileupRecord};
 
 /// Target uncompressed bytes per block. Spec §"Block sizing" pins
 /// this; it is not a tunable. The writer auto-flushes when an open
@@ -69,10 +69,10 @@ const INITIAL_ALLELES_HINT: usize = 360_000;
 /// indel-heavier workloads alleles run to ~10 bytes each. The 1 MiB
 /// hint covers both without leaving much slack.
 const INITIAL_ALLELE_SEQ_BYTES_HINT: usize = 1_000_000;
-/// Initial slot-data capacity for the three list-shaped chain-slot
-/// columns (Mi4). Most records carry zero chain slots; the
+/// Initial chain-id-data capacity for the list-shaped chain-id
+/// column (Mi4). Most records carry zero chain ids; the
 /// SNP-typical workload's high-water mark sits well under this hint.
-const INITIAL_CHAIN_SLOTS_HINT: usize = 4096;
+const INITIAL_CHAIN_IDS_HINT: usize = 4096;
 
 /// Byte mask of allele bytes the writer accepts. `ALLOWED[b]` is
 /// `true` iff `b` is one of `b'A' | b'C' | b'G' | b'T' | b'N'`. Walked
@@ -445,12 +445,12 @@ impl<W: Write> PspWriter<W> {
                     },
                 ));
             }
-            // chain_slots ascending + distinct (defensive).
-            for w in allele.chain_slots.windows(2) {
+            // chain_ids ascending + distinct (defensive).
+            for w in allele.chain_ids.windows(2) {
                 if w[0] >= w[1] {
                     return Err(err_invalid_record(
                         record_index,
-                        InvalidRecordKind::AlleleChainSlotsNotAscending { allele_index: i },
+                        InvalidRecordKind::AlleleChainIdsNotAscending { allele_index: i },
                     ));
                 }
             }
@@ -468,10 +468,10 @@ impl<W: Write> PspWriter<W> {
     ) -> Result<(), PspWriteError> {
         // With unique-per-file chain ids there's no active-set
         // bookkeeping or lifecycle-marker validation. Each
-        // `allele.chain_slots` is just a list of `u64`s that must
+        // `allele.chain_ids` is just a list of `u64`s that must
         // be strictly ascending (per-record well-formedness — pinned
         // in `validate_record`); identifier collisions are
-        // structurally impossible because the slot allocator
+        // structurally impossible because the chain-id allocator
         // monotonically mints distinct values per file.
         //
         // PANIC-FREE: write_record opens `self.block` on every path
@@ -637,21 +637,21 @@ fn emit_block_to_sink<W: Write>(
 /// `offsets[0]` is always `0`. H2 in
 /// `ia/reviews/perf_psp_writer_2026-05-13.md`.
 struct ListColumn {
-    data: Vec<SlotId>,
+    data: Vec<ChainId>,
     offsets: Vec<u32>,
 }
 
 impl ListColumn {
-    fn with_capacity(n_rows_hint: usize, n_slots_hint: usize) -> Self {
+    fn with_capacity(n_rows_hint: usize, n_chain_ids_hint: usize) -> Self {
         let mut offsets = Vec::with_capacity(n_rows_hint + 1);
         offsets.push(0);
         Self {
-            data: Vec::with_capacity(n_slots_hint),
+            data: Vec::with_capacity(n_chain_ids_hint),
             offsets,
         }
     }
     #[inline]
-    fn push_row(&mut self, row: &[SlotId]) {
+    fn push_row(&mut self, row: &[ChainId]) {
         self.data.extend_from_slice(row);
         self.offsets.push(self.data.len() as u32);
     }
@@ -672,7 +672,7 @@ struct BlockAccumulator {
     allele_fwd_count: Vec<u32>,
     allele_placed_left_count: Vec<u32>,
     allele_placed_start_count: Vec<u32>,
-    allele_chain_slots: ListColumn,
+    allele_chain_ids: ListColumn,
     /// Rough projection of the uncompressed byte total. Used to
     /// decide when to auto-flush.
     projected_bytes: usize,
@@ -693,9 +693,9 @@ impl BlockAccumulator {
             allele_fwd_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_left_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_start_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
-            allele_chain_slots: ListColumn::with_capacity(
+            allele_chain_ids: ListColumn::with_capacity(
                 INITIAL_ALLELES_HINT,
-                INITIAL_CHAIN_SLOTS_HINT,
+                INITIAL_CHAIN_IDS_HINT,
             ),
             projected_bytes: 0,
         }
@@ -721,14 +721,14 @@ impl BlockAccumulator {
                 .push(allele.support.placed_left);
             self.allele_placed_start_count
                 .push(allele.support.placed_start);
-            self.allele_chain_slots.push_row(&allele.chain_slots);
+            self.allele_chain_ids.push_row(&allele.chain_ids);
         }
 
         self.last_pos = record.pos;
 
         // Rough size projection — per record, plus per-allele +
         // per-byte. Doesn't need to be precise; the target is a soft
-        // cap. Chain slots are now u64 little-endian (8 bytes/id);
+        // cap. Chain ids are u64 little-endian (8 bytes/id);
         // zstd compresses the high-order zero bytes effectively.
         let per_record = 1 // delta-pos varint typical
             + 1; // n-alleles varint typical
@@ -739,7 +739,7 @@ impl BlockAccumulator {
                 1                  // allele-seq-len varint typical
                 + a.seq.len()      // allele-seq bytes
                 + 4 + 8 + 4 + 4 + 4 // the five scalars
-                + (1 + 8 * a.chain_slots.len()) // varint count + u64 ids
+                + (1 + 8 * a.chain_ids.len()) // varint count + u64 ids
             })
             .sum();
         self.projected_bytes += per_record + per_allele;
@@ -787,9 +787,9 @@ fn encode_column_into(
         ColumnKey::AllelePlacedStartCount => {
             encode_scalar_column(&block.allele_placed_start_count, out)
         }
-        ColumnKey::AlleleChainSlots => encode_list_column_csr(
-            &block.allele_chain_slots.data,
-            &block.allele_chain_slots.offsets,
+        ColumnKey::AlleleChainIds => encode_list_column_csr(
+            &block.allele_chain_ids.data,
+            &block.allele_chain_ids.offsets,
             out,
         ),
     }
@@ -886,11 +886,11 @@ mod tests {
         }
     }
 
-    fn allele(seq: &[u8], num_obs: u32, q_sum: f64, chain_slots: &[u64]) -> AlleleObservation {
+    fn allele(seq: &[u8], num_obs: u32, q_sum: f64, chain_ids: &[u64]) -> AlleleObservation {
         AlleleObservation {
             seq: seq.to_vec(),
             support: support(num_obs, q_sum),
-            chain_slots: chain_slots.to_vec(),
+            chain_ids: chain_ids.to_vec(),
         }
     }
 
@@ -1035,11 +1035,11 @@ mod tests {
     }
 
     // Phase-chain marker inconsistency tests removed: the writer no
-    // longer tracks an active-slot set, so the marker-vs-active
+    // longer tracks an active-chain set, so the marker-vs-active
     // validation it used to enforce is gone. Chain ids are unique
     // per `.psp` file (u64), so the same family of violations is
     // structurally impossible. The remaining per-record well-
-    // formedness check (chain_slots strictly ascending) is pinned
+    // formedness check (chain_ids strictly ascending) is pinned
     // by the iterator-style assertions inside the round-trip tests.
 
     // ---------- One block round-trip via writer alone ----------

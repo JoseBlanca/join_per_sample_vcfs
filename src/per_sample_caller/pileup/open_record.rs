@@ -14,19 +14,19 @@ use std::collections::BTreeMap;
 use ahash::AHashMap;
 
 use super::active_read_set::ActiveReads;
+use super::chain_id_allocator::ChainId;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
-use super::slot_allocator::SlotId;
 use super::{
     AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, PileupRecord, RefSeqFetcher,
 };
 
-/// Pre-allocated capacity for `OpenAllele::chain_slots` — sized
+/// Pre-allocated capacity for `OpenAllele::chain_ids` — sized
 /// for typical WGS coverage so `insert_sorted_unique` calls don't
 /// trip the 0→4→8→16→32 grow ladder. The vec is moved into
 /// `AlleleObservation` by `finalise()`, so downstream consumers
 /// also benefit. dhat 2026-05-10.
-const ALLELE_CHAIN_SLOTS_INITIAL_CAPACITY: usize = 32;
+const ALLELE_CHAIN_IDS_INITIAL_CAPACITY: usize = 32;
 
 /// Pre-allocated capacity for `OpenPileupRecord::folded_reads` —
 /// sized for typical WGS coverage so the per-record fold doesn't
@@ -53,7 +53,7 @@ pub(super) struct OpenAllele {
     pub seq: Vec<u8>,
     pub support: AlleleSupportStats,
     /// Sorted, deduplicated.
-    pub chain_slots: Vec<SlotId>,
+    pub chain_ids: Vec<ChainId>,
 }
 
 impl OpenAllele {
@@ -61,7 +61,7 @@ impl OpenAllele {
         Self {
             seq,
             support: AlleleSupportStats::default(),
-            chain_slots: Vec::with_capacity(ALLELE_CHAIN_SLOTS_INITIAL_CAPACITY),
+            chain_ids: Vec::with_capacity(ALLELE_CHAIN_IDS_INITIAL_CAPACITY),
         }
     }
 }
@@ -138,7 +138,7 @@ impl OpenPileupRecord {
             .map(|a| AlleleObservation {
                 seq: a.seq,
                 support: a.support,
-                chain_slots: a.chain_slots,
+                chain_ids: a.chain_ids,
             })
             .collect();
         PileupRecord {
@@ -772,7 +772,7 @@ pub(super) fn process_position(
                 }
             };
             add_contribution(&mut alleles[new_index].support, &new_contribution);
-            insert_sorted_unique(&mut alleles[new_index].chain_slots, contrib.chain_slot_id);
+            insert_sorted_unique(&mut alleles[new_index].chain_ids, contrib.chain_id);
             folded_reads.insert(
                 contrib.read_id,
                 FoldedReadState {
@@ -915,10 +915,10 @@ fn phred_to_ln_perr(q: u8) -> f64 {
     LN_PERR_TABLE[q as usize]
 }
 
-fn insert_sorted_unique(v: &mut Vec<SlotId>, slot: SlotId) {
-    match v.binary_search(&slot) {
+fn insert_sorted_unique(v: &mut Vec<ChainId>, chain_id: ChainId) {
+    match v.binary_search(&chain_id) {
         Ok(_) => {} // already present
-        Err(pos) => v.insert(pos, slot),
+        Err(pos) => v.insert(pos, chain_id),
     }
 }
 
@@ -934,7 +934,7 @@ pub(super) struct ReadContribution {
     /// prior contribution) and is also how the fold looks the
     /// read up against the `ActiveReads` to query window events.
     pub read_id: u32,
-    pub chain_slot_id: SlotId,
+    pub chain_id: ChainId,
     /// Events whose anchor *is* this walker_pos (used by step 3
     /// to identify candidate records). At most 2 events anchor at
     /// any walker_pos (one Match plus at most one indel), so the

@@ -18,7 +18,7 @@ The order:
 3. How freebayes solves it (per-read linkage internally, no phase output).
 4. Why we adopt neither approach as-is.
 5. What our "phase chain" is, in precise terms.
-6. The slot encoding, with a worked example.
+6. The chain-id encoding, with a worked example.
 7. A side-by-side comparison.
 8. What downstream stages actually do with the chains.
 
@@ -479,7 +479,7 @@ the chain doesn't link them — there is no evidence either way.
   out the consensus sequence of the molecule a chain came from.
   The five per-allele scalars are aggregated on top of the chain
   membership; the chain itself is just an identifier.
-- **No "the read carries the variant" claim.** A chain at slot k
+- **No "the read carries the variant" claim.** A chain id k
   means a read contributed observations at every position the
   chain appears in; one of those observations might be the alt
   allele, another might be the ref. Stage 5 looks at the
@@ -503,7 +503,7 @@ number of chains "currently active" is bounded by per-position
 depth times a small factor (chain spans ÷ position spacing), which
 is to say: roughly per-position depth itself. At 30×, that is ~30;
 at 2-10× (the project target), 5-15. This bound is what makes the
-slot encoding cheap, and is the subject of the next section.
+chain-id encoding cheap, and is the subject of the next section.
 
 ## 6. The chain-id encoding, with a worked example
 
@@ -535,14 +535,14 @@ record at position p:
           num_obs: 5,
           q_sum: ...,
           fwd: 3, placed_left: 2, placed_start: 1,
-          chain_slots: [0, 2] },          // contributed by chains 0 and 2
+          chain_ids: [0, 2] },          // contributed by chains 0 and 2
         { sequence: "T",
           ...
-          chain_slots: [1] },
+          chain_ids: [1] },
       ]
 ```
 
-`chain_slots` per allele is the small list of chain ids that
+`chain_ids` per allele is the small list of chain ids that
 contributed observations of that allele at this position. It is
 compact in practice (typically 1–3 entries; bounded by depth).
 
@@ -566,7 +566,7 @@ position 100:
   R2 enters active set → assigned chain id 1
   emitted record:
     alleles:
-      { "A", num_obs=2, chain_slots=[0, 1] }      # both reads see REF "A"
+      { "A", num_obs=2, chain_ids=[0, 1] }      # both reads see REF "A"
 
 position 101:
   R3 enters active set → assigned chain id 2
@@ -574,12 +574,12 @@ position 101:
   R1, R2 still active.
   emitted record:
     alleles:
-      { "G", num_obs=2, chain_slots=[0, 1] },     # R1 and R2 saw REF "G"
-      { "T", num_obs=2, chain_slots=[2, 3] }      # R3 and R4 saw the SNP
+      { "G", num_obs=2, chain_ids=[0, 1] },     # R1 and R2 saw REF "G"
+      { "T", num_obs=2, chain_ids=[2, 3] }      # R3 and R4 saw the SNP
 
   Note: the deletion that R3 and R4 carry is anchored at 101 by
   VCF convention, so the same record gets a third allele:
-      { "TGT" → "T" (DEL), num_obs=2, chain_slots=[2, 3] }
+      { "TGT" → "T" (DEL), num_obs=2, chain_ids=[2, 3] }
   (i.e. the SNP and DEL allele at 101 are *separate* alleles in
   the same record, both supported by chains 2 and 3.)
 
@@ -592,21 +592,21 @@ position 102:
   R2, R3, R4 still active.
   emitted record:
     alleles:
-      { "T", num_obs=2, chain_slots=[1, 4] }      # R2 and R5 saw REF "T"
+      { "T", num_obs=2, chain_ids=[1, 4] }      # R2 and R5 saw REF "T"
 
 position 103:
   R2 leaves active set after this record.
   R3, R4, R5 still active here.
   emitted record:
     alleles:
-      { "C", num_obs=2, chain_slots=[1, 4] }      # R2 and R5 contribute
+      { "C", num_obs=2, chain_ids=[1, 4] }      # R2 and R5 contribute
       # R3 and R4 do not contribute here — still inside their deletion span.
 ```
 
 The crucial observation is in the record at position 101:
 
-- The SNP allele `T` carries `chain_slots = [2, 3]`.
-- The DEL allele `TGT → T` carries `chain_slots = [2, 3]`.
+- The SNP allele `T` carries `chain_ids = [2, 3]`.
+- The DEL allele `TGT → T` carries `chain_ids = [2, 3]`.
 - Both alleles share the same chains.
 
 That sharing is the answer to the per-position-pair question: for
@@ -616,17 +616,17 @@ directly — it does not need to assemble haplotypes.
 
 ### Why there are no lifecycle markers
 
-Recycled slot ids would need a `new_chains` / `expired_chains`
+Recycled chain ids would need a `new_chains` / `expired_chains`
 marker pair on every record to keep distinct chain incarnations
-distinguishable in a recycled slot id namespace — the role `|` /
+distinguishable in a recycled namespace — the role `|` /
 `/` play in VCF. With unique `u64` ids the namespace is large
 enough to retire that complexity: chain id 0 never re-appears
 after R1 expires, so no marker is needed to disambiguate it from
 a future read.
 
-## 7. GATK, freebayes, and our slot id, side by side
+## 7. GATK, freebayes, and our chain id, side by side
 
-| Axis | GATK PID/PGT | freebayes (internal only) | Our slot id |
+| Axis | GATK PID/PGT | freebayes (internal only) | Our chain id |
 |---|---|---|---|
 | Mechanism | Local re-assembly → haplotype EventMap → set comparison | Adaptive haplotype window + observed-allele enumeration; per-read linkage in `RegisteredAlignment` | Direct per-read tagging at scan time |
 | Range | Active region (typically 1-2 kb) | Per-locus haplotype window (typically a handful of bp; longer at indel-in-repeat sites) | Read or read-pair span (~150 bp – ~1 kb) |
@@ -638,7 +638,7 @@ a future read.
 | Behaviour at 2-10× coverage | Unreliable; assembly under-powered | Works | Works |
 | Implementation size | ~thousands of lines (de Bruijn + PairHMM) | ~hundreds of lines (the relevant linkage parts) | ~tens of lines (monotonic counter + pending-mates map) |
 | Stored on disk per record | One PID + one PGT per phased genotype | — (linkage never reaches disk) | A per-allele list of `u64` chain ids |
-| Downstream consumer's work | Read PID/PGT directly per genotype | N/A — consumer never sees the linkage | Walk records; intersect `chain_slots` between two records |
+| Downstream consumer's work | Read PID/PGT directly per genotype | N/A — consumer never sees the linkage | Walk records; intersect `chain_ids` between two records |
 
 The three approaches solve overlapping problems with very different
 trade profiles:
@@ -651,14 +651,14 @@ trade profiles:
   limitation is that the linkage is for internal use during a
   single calling pass and is never made available to a separate
   joint stage.
-- **Our slot id** keeps freebayes' direct per-read approach but
+- **Our chain id** keeps freebayes' direct per-read approach but
   makes it *persistent* and read-scoped (not window-scoped) so the
   linkage survives in the `.psp` for Stage 5 to consult, without
   paying anything close to assembly cost.
 
 For the project's coverage target, scale, and split-stage
-architecture, the slot mechanism takes the right pieces from both
-references.
+architecture, the chain-id mechanism takes the right pieces from
+both references.
 
 ## 8. What Stage 5 does with the chains
 
@@ -725,15 +725,15 @@ is the entire scope.
 ### How Stage 5 walks the records
 
 Sequentially. Under the unique-`u64`-id design there is no active
-view to maintain; each per-record `allele.chain_slots` list is
+view to maintain; each per-record `allele.chain_ids` list is
 read at face value.
 
 1. To answer "do alleles X at p₁ and Y at p₂ co-occur in sample s
    on the same molecule":
 
-   - Walk to record at p₁; read `chain_slots` for allele X →
+   - Walk to record at p₁; read `chain_ids` for allele X →
      get the set S₁.
-   - Walk to record at p₂; read `chain_slots` for allele Y →
+   - Walk to record at p₂; read `chain_ids` for allele Y →
      get the set S₂.
    - Compute |S₁ ∩ S₂|. That is the number of physical
      molecules in this sample that support both X and Y.
@@ -752,8 +752,8 @@ Recall: at position 101, chains 2 and 3 supported both the SNP
 allele `T` and the DEL allele. Suppose Stage 5 wants to know: does
 sample s have the compound allele "SNP at 101 + DEL spanning 102"?
 
-- Read at p=101 (SNP allele "T"): chain_slots = [2, 3].
-- Read at p=101 (DEL allele "TGT→T"): chain_slots = [2, 3].
+- Read at p=101 (SNP allele "T"): chain_ids = [2, 3].
+- Read at p=101 (DEL allele "TGT→T"): chain_ids = [2, 3].
   (Both events live at the same anchor record; the question is
   cross-allele within one record, but the same intersection
   applies.)
@@ -776,8 +776,8 @@ read R4': starts at 102, ends at 103 (DEL only, mate not seen)
 
 then in t:
 
-- At 101 SNP allele `T`: chain_slots = [slot for R3'].
-- At 101 DEL allele "TGT→T": chain_slots = [slot for R4'].
+- At 101 SNP allele `T`: chain_ids = [chain id for R3'].
+- At 101 DEL allele "TGT→T": chain_ids = [chain id for R4'].
 - Intersection is empty.
 
 Stage 5 sees that neither read supports both events together. It
@@ -811,7 +811,7 @@ extra burden on Stage 2 beyond "write these integers."
 
 The on-disk encoding is small: a per-allele list of `u64` chain
 ids. Stage 2's job is to write the integers verbatim. Stage 5's
-job is to walk the records and intersect `chain_slots` between two
+job is to walk the records and intersect `chain_ids` between two
 records when it needs to evaluate a compound haplotype.
 
 The one design decision that makes the chain mechanism cheap and

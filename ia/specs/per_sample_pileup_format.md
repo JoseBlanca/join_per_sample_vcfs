@@ -577,14 +577,14 @@ where noted):
    The error names the column, the block, and the offending entry
    index.
 10. **Phase-chain identifier ordering** (per record). Every
-    `allele_chain_slots` list is strictly ascending with no
+    `allele_chain_ids` list is strictly ascending with no
     duplicates. The reader rejects any record that violates this
     well-formedness check, naming the block, the record index, and
     the allele index.
 
 (Checks #10–11 in earlier drafts of this document — the
 "phase-chain active-set consistency" and "inter-block phase-chain
-continuity" rules — are gone along with the recycled-slot-id
+continuity" rules — are gone along with the recycled-chain-id
 design. The unique-per-file `u64` chain ids defined in
 `phase_chain.md` §6 make active-set bookkeeping unnecessary on
 both the writer and reader sides.)
@@ -724,12 +724,12 @@ description  = "Reads whose 5' end is the record's position (freebayes' placedSt
 
 [[column]]
 tag          = 0x22
-name         = "allele-chain-slots"
+name         = "allele-chain-ids"
 cardinality  = "per-allele"
 shape        = "list"
 element-type = "u64"
 required     = true
-description  = "Phase-chain identifiers contributing to each allele observation. Ascending fixed-width little-endian u64s. Identifiers are unique within the .psp file and never recycled; two observations sharing an identifier came from the same read or read-pair in this sample. Tags 0x20 and 0x21 (the old new-chain-slots / expired-chain-slots lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8."
+description  = "Phase-chain identifiers contributing to each allele observation. Ascending fixed-width little-endian u64s. Identifiers are unique within the .psp file and never recycled; two observations sharing an identifier came from the same read or read-pair in this sample. Tags 0x20 and 0x21 (the old new-chain-ids / expired-chain-ids lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8."
 ---END-HEADER---
 ```
 
@@ -819,13 +819,13 @@ no special handling is required at the block boundary — chain ids
 are unique within the entire `.psp` file, so the same id can
 appear in any block and refer to the same molecule it referred to
 in any earlier block. The block header therefore carries no
-active-slot snapshot; a reader landing on block N+1 via the tail
+active-chain snapshot; a reader landing on block N+1 via the tail
 index needs no carried-in state to materialise records.
 
 (Earlier drafts of this document specified an
-`active_chain_slots_at_block_start` snapshot field plus inter-block
+`active_chain_ids_at_block_start` snapshot field plus inter-block
 continuity checks. Both have been retired along with the recycled-
-slot-id design; see Q-FC8.)
+chain-id design; see Q-FC8.)
 
 ### Why per-column zstd, not whole-block zstd
 
@@ -872,7 +872,7 @@ the file if any block in the body violates these:
   declared `length`, is a hard error. This makes the "strictly
   increasing positions" rule above checkable column-locally,
   without having to materialise positions first.
-- Every per-allele `allele_chain_slots` list is strictly ascending
+- Every per-allele `allele_chain_ids` list is strictly ascending
   and pairwise distinct.
 
 Rationale for 16 MiB rather than the smaller (~4 MiB) figure earlier
@@ -917,7 +917,7 @@ some number of alleles. The logical content of one record:
 - `n_alleles`: at least 1;
 - per allele: a sequence (the literal allele) and five scalars;
 - phase chain lifecycle markers (`new_chains`, `expired_chains`);
-- per allele: the list of phase chain slot ids that contributed
+- per allele: the list of phase chain ids that contributed
   this observation.
 
 Stored columnar: each of these items becomes one column entry per
@@ -952,7 +952,7 @@ two views of the same data; readers verify they agree
 | `0x12` | `allele_fwd_count` | per-allele (M entries) | `u32` | Forward-strand count. |
 | `0x13` | `allele_placed_left_count` | per-allele (M entries) | `u32` | Reads whose 5′ end is to the left of the record's position (freebayes' `placedLeft`). |
 | `0x14` | `allele_placed_start_count` | per-allele (M entries) | `u32` | Reads whose 5′ end *is* the record's position (`placedStart`). |
-| `0x22` | `allele_chain_slots` | per-allele list | varint count + `u64` LE ids | Per allele: a `varint` count `k`, then `k` little-endian `u64` chain ids in ascending order. Ids are unique within the `.psp` file and never recycled; two observations sharing an id came from the same read or read-pair in this sample. Matches the implementation's `SlotId = u64` ([pileup/slot_allocator.rs](../../src/per_sample_caller/pileup/slot_allocator.rs)). Tags `0x20` and `0x21` (the old `new_chain_slots` / `expired_chain_slots` lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8. |
+| `0x22` | `allele_chain_ids` | per-allele list | varint count + `u64` LE ids | Per allele: a `varint` count `k`, then `k` little-endian `u64` chain ids in ascending order. Ids are unique within the `.psp` file and never recycled; two observations sharing an id came from the same read or read-pair in this sample. Matches the implementation's `ChainId = u64` ([pileup/chain_id_allocator.rs](../../src/per_sample_caller/pileup/chain_id_allocator.rs)). Tags `0x20` and `0x21` (the old `new_chain_ids` / `expired_chain_ids` lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8. |
 
 A reader walks the columns in tandem; the per-record columns give
 the position and allele-count structure, and the per-allele columns
@@ -1310,8 +1310,8 @@ as needed. We'll add reserves when a concrete need appears.*
 **~~Q-FC8 — how is phase-chain state preserved across block boundaries
 for random access?~~**
 *Originally resolved 2026-05-13 with a per-block
-`active_chain_slots_at_block_start` snapshot, on the assumption that
-slot ids needed recycling to keep the namespace small. **Superseded
+`active_chain_ids_at_block_start` snapshot, on the assumption that
+chain ids needed recycling to keep the namespace small. **Superseded
 2026-05-14**: switched to **unique-per-`.psp`-file `u64` chain ids**
 (alternative (b) above, originally rejected on `u16` namespace
 grounds; with `u64` the namespace concern is gone). Under the new
@@ -1345,13 +1345,13 @@ native precision avoids a truncation step at the I/O boundary; the
 extra 4 B per allele is negligible against the rest of the per-
 allele payload.*
 
-**~~Q-PL4 — `u8` vs `u16` for phase-chain slot ids.~~**
+**~~Q-PL4 — `u8` vs `u16` for phase-chain ids.~~**
 *Originally resolved 2026-05-13: `u16` over `u8` for headroom under
 recycling. **Superseded 2026-05-14**: phase-chain ids are now
-**unique-per-`.psp`-file `u64`** (`pub type SlotId = u64` in
-[pileup/slot_allocator.rs](../../src/per_sample_caller/pileup/slot_allocator.rs)),
+**unique-per-`.psp`-file `u64`** (`pub type ChainId = u64` in
+[pileup/chain_id_allocator.rs](../../src/per_sample_caller/pileup/chain_id_allocator.rs)),
 with no recycling. The on-disk encoding is fixed-width LE `u64`
-under tag `0x22` (`allele-chain-slots`); zstd absorbs the leading
+under tag `0x22` (`allele-chain-ids`); zstd absorbs the leading
 zero bytes on small ids. Overflow at `u64::MAX + 1` surfaces as
 `WalkerError::ChainIdSpaceExhausted` rather than silent wrap; the
 ceiling (~1.8 × 10¹⁹ chains per file) is unreachable on any

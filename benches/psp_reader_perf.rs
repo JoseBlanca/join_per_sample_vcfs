@@ -12,7 +12,7 @@
 //!   shape the writer's `snp_typical_3_3M` covers.
 //! - `psp_reader/phase_chain_heavy_1M` — sustained ~6-active phase set,
 //!   each record's first allele carries the active set as
-//!   `chain_slots`. Drives the three list columns through `decode_list_column`
+//!   `chain_ids`. Drives the list column through `decode_list_column`
 //!   and the `mem::take` materialisation in `materialise_next_record`.
 //! - `psp_reader/multi_allele_500k` — 2–4 alleles per record, indel-
 //!   shaped allele lengths from 1–10 bytes. Drives the bytes column
@@ -136,11 +136,11 @@ fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
             }
         }
 
-        let chain_slots = active.clone();
+        let chain_ids = active.clone();
         let alleles = vec![AlleleObservation::new(
             vec![ref_base],
             AlleleSupportStats::new(20, -40.0, 10, 5, 2),
-            chain_slots,
+            chain_ids,
         )];
 
         records.push(PileupRecord::new(0, pos, alleles));

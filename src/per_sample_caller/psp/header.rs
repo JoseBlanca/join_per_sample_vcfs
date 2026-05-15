@@ -1145,7 +1145,7 @@ mod tests {
         // All 12 v1.0 columns appear in the parsed header.
         assert_eq!(parsed.columns.len(), V1_0_COLUMNS.len());
         assert_eq!(parsed.columns[0].name, "delta-pos");
-        assert_eq!(parsed.columns.last().unwrap().name, "allele-chain-slots");
+        assert_eq!(parsed.columns.last().unwrap().name, "allele-chain-ids");
     }
 
     /// (M3.) Pin the literal kebab-case TOML wire keys produced by

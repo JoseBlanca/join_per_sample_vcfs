@@ -1,5 +1,5 @@
 //! The walker loop. Single-threaded; drives all the building
-//! blocks (active set, slot allocator, open-record table) through
+//! blocks (active set, chain-id allocator, open-record table) through
 //! the closure rule and yields finalised `PileupRecord`s through
 //! a pull-shaped `Iterator`.
 //!
@@ -21,7 +21,7 @@ use super::errors::WalkerError;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
 };
-use super::slot_allocator::{SlotAllocator, SlotAllocatorCounters, SlotId};
+use super::chain_id_allocator::{ChainId, ChainIdAllocator, ChainIdAllocatorCounters};
 use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerConfig};
 
 /// Construct a [`PileupWalker`] over a coordinate-sorted stream of
@@ -227,8 +227,8 @@ pub struct RunSummary {
     pub records_emitted: u64,
     pub record_widen_events: u64,
     pub mate_overlap_positions: u64,
-    pub slot_allocations: u64,
-    pub slot_high_water: u32,
+    pub chain_allocations: u64,
+    pub active_reads_high_water: u32,
     pub mate_lookup_evictions: u64,
     /// Number of columns where the contributor list was truncated
     /// because depth exceeded the applicable per-column cap (see
@@ -240,13 +240,13 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    /// Fold the slot allocator's counters into this summary at
+    /// Fold the chain-id allocator's counters into this summary at
     /// run-end. The walker tracks reads/records/widens/overlap
-    /// itself; the allocator owns slot bookkeeping.
-    fn merge_slot_counters(mut self, slot: SlotAllocatorCounters) -> Self {
-        self.slot_allocations = slot.slot_allocations;
-        self.slot_high_water = slot.slot_high_water;
-        self.mate_lookup_evictions = slot.mate_lookup_evictions;
+    /// itself; the allocator owns chain-id bookkeeping.
+    fn merge_chain_id_counters(mut self, counters: ChainIdAllocatorCounters) -> Self {
+        self.chain_allocations = counters.chain_allocations;
+        self.active_reads_high_water = counters.active_reads_high_water;
+        self.mate_lookup_evictions = counters.mate_lookup_evictions;
         self
     }
 }
@@ -273,7 +273,7 @@ struct WalkerState {
     /// Last admitted locus for the coordinate-order invariant.
     last_admitted_locus: Option<Locus>,
     active_reads: ActiveReads,
-    slots: SlotAllocator,
+    chain_ids: ChainIdAllocator,
     open_records: OpenPileupRecordTable,
     summary: RunSummary,
     config: WalkerConfig,
@@ -298,7 +298,7 @@ impl WalkerState {
             last_admitted_chrom_id: None,
             last_admitted_locus: None,
             active_reads: ActiveReads::new(),
-            slots: SlotAllocator::with_caps(config.max_active_slots, config.mate_lookup_window),
+            chain_ids: ChainIdAllocator::with_caps(config.max_active_reads, config.mate_lookup_window),
             open_records: OpenPileupRecordTable::with_cap(config.max_record_span),
             summary: RunSummary::default(),
             config,
@@ -360,7 +360,7 @@ impl WalkerState {
         read.length()
             .map_err(|e| malformed_read_from_length_err(e, &read))?;
         self.last_admitted_locus = Some(read_locus);
-        self.active_reads.admit(read, &mut self.slots)?;
+        self.active_reads.admit(read, &mut self.chain_ids)?;
         self.summary.reads_admitted += 1;
         Ok(())
     }
@@ -397,7 +397,7 @@ impl WalkerState {
 
             contributors.push(ReadContribution {
                 read_id: active_read.read_id,
-                chain_slot_id: active_read.chain_slot_id,
+                chain_id: active_read.chain_id,
                 events_at_pos,
                 bq_baq_at_walker_pos: bq_at_walker,
                 mq_log_err: active_read.read.mq_log_err,
@@ -411,7 +411,7 @@ impl WalkerState {
 
         // Step 2: resolve mate overlap on events at this walker
         // position. For each pair of contributors whose reads
-        // share a chain_slot_id, compare BQ; the lower-BQ side
+        // share a chain_id, compare BQ; the lower-BQ side
         // has its `bq_baq_at_walker_pos` zeroed (still one
         // observation, contributing ln(1)=0 log-likelihood mass)
         // and is flagged so any window event the fold pulls from
@@ -483,7 +483,7 @@ impl WalkerState {
             "walker_pos starts at 1 and never decreases below 1",
         );
         self.active_reads
-            .expire_passed(self.walker_pos, &mut self.slots)
+            .expire_passed(self.walker_pos, &mut self.chain_ids)
     }
 
     fn advance(&mut self, next_pulled: Option<&PreparedRead>) -> Result<(), WalkerError> {
@@ -539,21 +539,21 @@ impl WalkerState {
         // forward, and the next chromosome's first read mints a
         // fresh id that has never appeared in the file.
         self.active_reads
-            .flush_all(&mut self.slots, self.walker_pos)?;
+            .flush_all(&mut self.chain_ids, self.walker_pos)?;
         // Reset chromosome-scoped state. `self.open_records.reset()`
         // keeps the perf-hoisted `allele_seq_buf` capacity across
-        // the chromosome boundary (Mi11). `slots.reset()` clears
+        // the chromosome boundary (Mi11). `chain_ids.reset()` clears
         // the active-read count and pending-mates map but
         // preserves the file-scoped `next_id` counter so chain
         // ids stay unique across chromosomes.
-        self.slots.reset();
+        self.chain_ids.reset();
         self.active_reads.reset();
         self.open_records.reset();
         Ok(())
     }
 
     fn summary(&self) -> RunSummary {
-        self.summary.merge_slot_counters(self.slots.counters())
+        self.summary.merge_chain_id_counters(self.chain_ids.counters())
     }
 }
 
@@ -588,7 +588,7 @@ fn malformed_read_from_length_err(err: ReadLengthError, read: &PreparedRead) -> 
 ///   at this anchor. The lower-BQ side has its event BQs zeroed
 ///   in the local fold (so its `q_sum` contribution becomes
 ///   `ln(1) = 0`); both still count as observations and both
-///   contribute the shared chain slot. Tie-break: first mate
+///   contribute the shared chain id. Tie-break: first mate
 ///   keeps its BQ.
 ///
 /// - **Indel overlap.** Either both mates report an indel at the
@@ -606,7 +606,7 @@ fn malformed_read_from_length_err(err: ReadLengthError, read: &PreparedRead) -> 
 #[allow(clippy::ptr_arg)]
 fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary: &mut RunSummary) {
     // Fast path: mate overlap requires two contributors at this
-    // walker_pos sharing a chain_slot_id. Solo-read inputs never
+    // walker_pos sharing a chain_id. Solo-read inputs never
     // hit it; in paired-end inputs the geometry of insert sizes
     // means most positions also don't. Detecting the no-pair case
     // up front lets us skip the AHashMap allocation that would
@@ -617,22 +617,22 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
     // n probes, and short-circuits as soon as any pair is found.
     let n = contributors.len();
     let any_shared = (0..n).any(|i| {
-        let s = contributors[i].chain_slot_id;
-        ((i + 1)..n).any(|j| contributors[j].chain_slot_id == s)
+        let s = contributors[i].chain_id;
+        ((i + 1)..n).any(|j| contributors[j].chain_id == s)
     });
     if !any_shared {
         return;
     }
 
-    // Build a small index: chain_slot_id → list of contributor
+    // Build a small index: chain_id → list of contributor
     // indices. Anything with a list length >= 2 is a candidate.
     // ahash::AHashMap matches the rest of the module — std HashMap's
     // RandomState would make iteration non-deterministic between runs
     // and is also slower for this hot path. Mi4 in
     // `ia/reviews/pileup_2026-05-09.md`.
-    let mut by_slot: AHashMap<SlotId, Vec<usize>> = AHashMap::new();
+    let mut by_chain_id: AHashMap<ChainId, Vec<usize>> = AHashMap::new();
     for (i, c) in contributors.iter().enumerate() {
-        by_slot.entry(c.chain_slot_id).or_default().push(i);
+        by_chain_id.entry(c.chain_id).or_default().push(i);
     }
 
     // Indices to discard outright (indel-overlap losers).
@@ -648,18 +648,18 @@ fn resolve_mate_overlap_at_pos(contributors: &mut Vec<ReadContribution>, summary
     // BQ on top of the cursor pull).
     let mut bq_updates: Vec<(usize, u8, bool /*zero_in_window*/)> = Vec::new();
 
-    for indices in by_slot.values() {
+    for indices in by_chain_id.values() {
         if indices.len() < 2 {
             continue;
         }
-        // Spec invariant: only mate pairs share a slot, so at most
-        // two contributors per slot. Assert here so a future
-        // change that admits a third reader of the same slot
+        // Spec invariant: only mate pairs share a chain id, so at
+        // most two contributors per chain. Assert here so a future
+        // change that admits a third reader of the same chain
         // (e.g. supplementary alignments slipping past upstream
         // filters) surfaces in tests instead of in production.
         debug_assert!(
             indices.len() <= 2,
-            "more than two contributors share chain_slot_id {:?}",
+            "more than two contributors share chain_id {:?}",
             indices,
         );
         // All-pairs comparison so a future relaxation of the
@@ -885,7 +885,7 @@ mod tests {
     ) -> ReadContribution {
         ReadContribution {
             read_id: 0,
-            chain_slot_id: 0,
+            chain_id: 0,
             events_at_pos: events,
             bq_baq_at_walker_pos: bq,
             mq_log_err: -3.0,

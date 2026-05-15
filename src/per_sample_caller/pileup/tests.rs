@@ -356,7 +356,7 @@ fn paired_mates_with_overlapping_positions_share_chain_id() {
     let (m1, m2) = paired_snp_reads("pair", 1, 1, b"AAA", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
-    assert_eq!(rec1.alleles[0].chain_slots, vec![0u64]);
+    assert_eq!(rec1.alleles[0].chain_ids, vec![0u64]);
 }
 
 #[test]
@@ -377,9 +377,9 @@ fn paired_mates_within_lookup_window_share_chain_id_across_active_set_exit() {
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
     let rec10 = records.iter().find(|r| r.pos == 10).unwrap();
-    assert_eq!(rec1.alleles[0].chain_slots, vec![0u64]);
+    assert_eq!(rec1.alleles[0].chain_ids, vec![0u64]);
     assert_eq!(
-        rec10.alleles[0].chain_slots,
+        rec10.alleles[0].chain_ids,
         vec![0u64],
         "the two mates of a single pair must share one chain id"
     );
@@ -388,7 +388,7 @@ fn paired_mates_within_lookup_window_share_chain_id_across_active_set_exit() {
 #[test]
 fn paired_mates_separated_beyond_lookup_window_get_distinct_chain_ids() {
     // When the second mate arrives more than `mate_lookup_window`
-    // bp past the first mate's `alignment_start`, the slot
+    // bp past the first mate's `alignment_start`, the chain-id
     // allocator's `evict_stale_pending` walk has dropped the
     // pending entry by then. The second mate cannot match, mints
     // a fresh chain id, and is therefore treated as a separate
@@ -405,9 +405,9 @@ fn paired_mates_separated_beyond_lookup_window_get_distinct_chain_ids() {
     let records = drive_walker(vec![m1, m2], fa);
     let rec_a = records.iter().find(|r| r.pos == 1).unwrap();
     let rec_b = records.iter().find(|r| r.pos == 12_001).unwrap();
-    assert_eq!(rec_a.alleles[0].chain_slots, vec![0u64]);
+    assert_eq!(rec_a.alleles[0].chain_ids, vec![0u64]);
     assert_eq!(
-        rec_b.alleles[0].chain_slots,
+        rec_b.alleles[0].chain_ids,
         vec![1u64],
         "beyond the lookup window the pair-tracking entry has been evicted; \
          the second mate gets a fresh id"
@@ -464,7 +464,7 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
     // Zeroed mate contributes max(ln(1)=0, -10.0) = 0.
     // Sum ≈ -2.0. If the tie-break wrongly kept mate 2, sum would
     // be max(0, -10.0) + max(ln_BQ, -2.0) ≈ -2.0 too — but the
-    // distinguishable case here is the chain_slot count: kept
+    // distinguishable case here is the chain id count: kept
     // mate's bq is non-zero, ln_q ≈ -2.0; loser's ln_q = 0 from
     // its zeroed BQ AND -10 mq, so its contribution to q_sum = 0.
     // Net q_sum ≈ -2.0, NOT ≈ -10.0 (which would be the case if
@@ -804,7 +804,7 @@ fn chain_ids_are_unique_and_monotonically_allocated() {
     // Collect every chain id from every allele observation.
     let mut all_ids: Vec<u64> = records
         .iter()
-        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_slots.iter().copied()))
+        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_ids.iter().copied()))
         .collect();
     let n_total_observations = all_ids.len();
     all_ids.sort_unstable();
@@ -827,7 +827,7 @@ fn paired_mates_share_a_single_chain_id() {
     let records = drive_walker(vec![m1, m2], fa);
     let mut all_ids: Vec<u64> = records
         .iter()
-        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_slots.iter().copied()))
+        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_ids.iter().copied()))
         .collect();
     all_ids.sort_unstable();
     all_ids.dedup();
@@ -841,7 +841,7 @@ fn paired_mates_share_a_single_chain_id() {
 #[test]
 fn chain_ids_persist_across_chromosome_boundaries() {
     // Chain ids are per-`.psp`-file unique, not per-chromosome. The
-    // walker's slot allocator must NOT reset `next_id` on
+    // walker's chain-id allocator must NOT reset `next_id` on
     // chromosome change.
     let fa = MockFasta::with_chromosomes(&["AC", "AC"]);
     let mut r0 = snp_read("a", 1, b"AC", &[30; 2]);
@@ -851,7 +851,7 @@ fn chain_ids_persist_across_chromosome_boundaries() {
     let records = drive_walker(vec![r0, r1], fa);
     let mut all_ids: Vec<u64> = records
         .iter()
-        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_slots.iter().copied()))
+        .flat_map(|r| r.alleles.iter().flat_map(|a| a.chain_ids.iter().copied()))
         .collect();
     all_ids.sort_unstable();
     all_ids.dedup();

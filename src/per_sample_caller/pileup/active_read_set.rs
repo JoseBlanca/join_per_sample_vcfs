@@ -6,9 +6,9 @@
 use ahash::AHashMap;
 
 use super::PreparedRead;
+use super::chain_id_allocator::{ChainId, ChainIdAllocator};
 use super::cigar_cursor::CigarCursor;
 use super::errors::WalkerError;
-use super::slot_allocator::{SlotAllocator, SlotId};
 
 /// One read currently in the walker's active set. The `read` field
 /// is the owned `PreparedRead`; `cursor` carries the per-op offset
@@ -19,7 +19,7 @@ pub struct ActiveRead {
     pub read_id: u32,
     pub read: PreparedRead,
     pub cursor: CigarCursor,
-    pub chain_slot_id: SlotId,
+    pub chain_id: ChainId,
     /// `Some(other.read_id)` when the partner mate has also been
     /// admitted. Filled by the active-set admission code on the
     /// second-mate path.
@@ -83,13 +83,13 @@ impl ActiveReads {
     }
 
     /// Admit a read: assign a `read_id`, decompose its CIGAR,
-    /// allocate a phase-chain slot via `slots`, and (if this is
+    /// allocate a phase-chain id via `chain_ids`, and (if this is
     /// the second mate of a pair) cross-link `mate_read_id` with
     /// the first mate.
     pub fn admit(
         &mut self,
         read: PreparedRead,
-        slots: &mut SlotAllocator,
+        chain_ids: &mut ChainIdAllocator,
     ) -> Result<u32, WalkerError> {
         let read_id = self.next_read_id;
         // `checked_add` guards against the 4-billion-read case
@@ -108,12 +108,12 @@ impl ActiveReads {
                 })?;
 
         let qname_for_register = read.qname.clone();
-        let (chain_slot_id, partner_read_id) = slots.allocate_for_read(&read)?;
+        let (chain_id, partner_read_id) = chain_ids.allocate_for_read(&read)?;
 
-        // Tell the slot allocator this fresh first-mate's read_id
+        // Tell the chain-id allocator this fresh first-mate's read_id
         // (no-op when this is a second mate or solo read, since the
         // qname isn't in `pending_mates` in those cases).
-        slots.register_first_mate_read_id(&qname_for_register, read_id);
+        chain_ids.register_first_mate_read_id(&qname_for_register, read_id);
 
         let cursor = CigarCursor::new(&read.cigar, read.alignment_start);
 
@@ -121,7 +121,7 @@ impl ActiveReads {
             read_id,
             read,
             cursor,
-            chain_slot_id,
+            chain_id,
             mate_read_id: partner_read_id,
         };
 
@@ -142,12 +142,12 @@ impl ActiveReads {
     }
 
     /// Drop reads whose alignment ends before `walker_pos`. For
-    /// each dropped read, release its phase-chain slot and update
-    /// the secondary index.
+    /// each dropped read, release its phase-chain bookkeeping and
+    /// update the secondary index.
     pub fn expire_passed(
         &mut self,
         walker_pos: u32,
-        slots: &mut SlotAllocator,
+        chain_ids: &mut ChainIdAllocator,
     ) -> Result<(), WalkerError> {
         // Iterate from the end so swap_remove indices stay valid.
         let mut i = self.reads.len();
@@ -161,12 +161,12 @@ impl ActiveReads {
                 // The `pending_mates` entry (if any) stays alive
                 // here: pair tracking is governed by
                 // `mate_lookup_window`, not by active-set
-                // residence. The slot allocator's
+                // residence. The chain-id allocator's
                 // `evict_stale_pending` walks the map on every
                 // subsequent `allocate_for_read` and drops entries
                 // whose `seen_at` is past the window.
                 let chrom_id = self.reads[i].read.chrom_id;
-                slots.note_read_exit(chrom_id, walker_pos)?;
+                chain_ids.note_read_exit(chrom_id, walker_pos)?;
                 self.swap_remove(i);
             }
         }
@@ -174,23 +174,24 @@ impl ActiveReads {
     }
 
     /// Drop every read unconditionally — used at chromosome
-    /// boundaries and end-of-input. Releases each slot. `walker_pos`
-    /// is the walker's current locus, used only to populate
-    /// `WalkerError::Internal`'s context fields if a release ever
-    /// hits the panic-free path (Mi2).
+    /// boundaries and end-of-input. Releases each read's
+    /// active-count slot. `walker_pos` is the walker's current
+    /// locus, used only to populate `WalkerError::Internal`'s
+    /// context fields if a release ever hits the panic-free path
+    /// (Mi2).
     pub fn flush_all(
         &mut self,
-        slots: &mut SlotAllocator,
+        chain_ids: &mut ChainIdAllocator,
         walker_pos: u32,
     ) -> Result<(), WalkerError> {
         while let Some(active) = self.reads.pop() {
             // The secondary index is rebuilt fresh after a flush.
-            // `pending_mates` is cleaned up by the slot allocator's
+            // `pending_mates` is cleaned up by the chain-id allocator's
             // `reset()` call (which `walker::flush_chromosome_into`
             // makes right after this method); we don't touch it
             // here.
             let chrom_id = active.read.chrom_id;
-            slots.note_read_exit(chrom_id, walker_pos)?;
+            chain_ids.note_read_exit(chrom_id, walker_pos)?;
         }
         self.by_read_id.clear();
         Ok(())
@@ -260,7 +261,7 @@ mod tests {
     #[test]
     fn admit_assigns_increasing_read_ids() {
         let mut s = ActiveReads::new();
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let r0 = s.admit(solo_read("a", 0, 100, 50), &mut a).unwrap();
         let r1 = s.admit(solo_read("b", 0, 110, 50), &mut a).unwrap();
         let r2 = s.admit(solo_read("c", 0, 120, 50), &mut a).unwrap();
@@ -270,7 +271,7 @@ mod tests {
     #[test]
     fn secondary_index_maps_read_id_to_correct_entry() {
         let mut s = ActiveReads::new();
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         s.admit(solo_read("a", 0, 100, 50), &mut a).unwrap();
         let r1 = s.admit(solo_read("b", 0, 110, 50), &mut a).unwrap();
         let entry = s.get_by_read_id(r1).expect("must find by id");
@@ -280,7 +281,7 @@ mod tests {
     #[test]
     fn expire_passed_drops_only_reads_behind_walker() {
         let mut s = ActiveReads::new();
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let _r0 = s.admit(solo_read("short", 0, 100, 10), &mut a).unwrap(); // ends 109
         let r1 = s.admit(solo_read("long", 0, 100, 200), &mut a).unwrap(); // ends 299
         // Move walker to 150 — short is past, long still active.
@@ -295,7 +296,7 @@ mod tests {
         // the second's end and the third's end). Verify the index
         // still resolves the remaining two correctly.
         let mut s = ActiveReads::new();
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let r0 = s.admit(solo_read("a", 0, 100, 1000), &mut a).unwrap(); // ends 1099
         let _r1 = s.admit(solo_read("b", 0, 100, 50), &mut a).unwrap(); // ends 149
         let r2 = s.admit(solo_read("c", 0, 100, 1000), &mut a).unwrap(); // ends 1099
@@ -315,7 +316,7 @@ mod tests {
     #[test]
     fn paired_reads_get_mate_read_id_cross_links() {
         let mut s = ActiveReads::new();
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         let m1 = s.admit(paired_read("p", true, 100, 50), &mut a).unwrap();
         let m2 = s.admit(paired_read("p", false, 130, 50), &mut a).unwrap();
         // Both mates should now reference each other.
@@ -326,7 +327,7 @@ mod tests {
     #[test]
     fn flush_all_drops_every_active_read() {
         let mut s = ActiveReads::new();
-        let mut a = SlotAllocator::new();
+        let mut a = ChainIdAllocator::new();
         for i in 0..5 {
             s.admit(solo_read(&format!("r{i}"), 0, 100, 50), &mut a)
                 .unwrap();

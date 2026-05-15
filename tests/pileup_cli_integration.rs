@@ -20,7 +20,7 @@ use merge_per_sample_vcfs::per_sample_caller::cram_input::{
     DEFAULT_MISMATCH_BQ_FLOOR,
 };
 use merge_per_sample_vcfs::per_sample_caller::pileup::{
-    DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_SLOTS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+    DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
 };
 use merge_per_sample_vcfs::per_sample_caller::psp::PspReader;
@@ -168,7 +168,7 @@ fn default_args(reference: PathBuf, output: PathBuf, crams: Vec<PathBuf>) -> Pil
         max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
         max_record_span: DEFAULT_MAX_RECORD_SPAN,
         mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
-        max_active_reads: DEFAULT_MAX_ACTIVE_SLOTS,
+        max_active_reads: DEFAULT_MAX_ACTIVE_READS,
     }
 }
 
