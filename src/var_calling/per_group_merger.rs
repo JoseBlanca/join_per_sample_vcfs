@@ -167,6 +167,18 @@ pub enum DegeneracyKind {
     PositiveInfinity,
 }
 
+/// Identifies which compound-likelihood loop surfaced a
+/// [`PerGroupMergerError::ZeroObservationConstituent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundPhase {
+    /// The quality-gathering loop in `project_scalars` that builds
+    /// `min_mean_q` for a chain-anchored compound.
+    QualityGather,
+    /// The constituent-subtraction loop in `project_scalars` that
+    /// removes the compound's claim from each constituent's scalars.
+    ConstituentSubtraction,
+}
+
 /// Errors surfaced by the per-group merger.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -202,6 +214,63 @@ pub enum PerGroupMergerError {
         sample_idx: usize,
         genotype_idx: usize,
         kind: DegeneracyKind,
+    },
+
+    /// Compound projection asked for a `(record_idx, local_allele_idx)`
+    /// pair that no sample in the group carries. The walker invariant
+    /// says any admitted compound constituent has at least one
+    /// anchoring sample providing the byte sequence.
+    #[error(
+        "compound projection at chrom {chrom_id} {start}-{end}: no sample \
+         carries record_idx={record_idx} local_allele_idx={local_allele_idx}"
+    )]
+    MissingCompoundAlleleBytes {
+        chrom_id: u32,
+        start: u32,
+        end: u32,
+        record_idx: usize,
+        local_allele_idx: usize,
+    },
+
+    /// A non-REF allele bucket reported `num_obs = 0` while building
+    /// per-sample scalars for a chain-anchored compound. The walker
+    /// invariant guarantees non-REF buckets always carry at least one
+    /// observation; a zero would silently distort the homogeneous-
+    /// quality approximation (quality phase) or the subtraction step.
+    #[error(
+        "zero-observation constituent for chain-anchored compound at chrom \
+         {chrom_id} {start}-{end} (phase: {phase:?}): sample_idx={sample_idx} \
+         allele_idx={allele_idx} record_idx={record_idx} \
+         local_allele_idx={local_allele_idx}"
+    )]
+    ZeroObservationConstituent {
+        chrom_id: u32,
+        start: u32,
+        end: u32,
+        phase: CompoundPhase,
+        sample_idx: usize,
+        allele_idx: usize,
+        record_idx: usize,
+        local_allele_idx: usize,
+    },
+
+    /// A chain-anchored compound (`inter > 0`) produced no usable
+    /// quality from any of its constituent sources for this sample —
+    /// every source either lacked a record at that position or was
+    /// already filtered. Walker invariant says `inter > 0` for a
+    /// sample implies at least one usable constituent in that sample.
+    #[error(
+        "chain-anchored compound at chrom {chrom_id} {start}-{end} \
+         (sample_idx={sample_idx} allele_idx={allele_idx}) has \
+         chain-anchor count {inter} but no constituent yielded a quality"
+    )]
+    NoQualityForChainAnchoredCompound {
+        chrom_id: u32,
+        start: u32,
+        end: u32,
+        sample_idx: usize,
+        allele_idx: usize,
+        inter: u32,
     },
 }
 
@@ -487,7 +556,7 @@ fn process_group(
         "OverlappingVarGroup records disagree on per_sample width",
     );
 
-    let unified = unify_alleles(&group, &ref_seq, n_samples);
+    let unified = unify_alleles(&group, &ref_seq, n_samples)?;
     let unified = enforce_max_alleles(unified, config.max_alleles);
 
     // REF-only ⇒ no record. Compound rejection (no entry added) and
@@ -497,7 +566,7 @@ fn process_group(
         return Ok(None);
     }
 
-    let projection = project_scalars(&group, &unified, n_samples);
+    let projection = project_scalars(&group, &unified, n_samples)?;
     let ca_flags = build_ca_flags(&unified, n_samples);
     let log_likelihoods = compute_log_likelihoods(
         &unified,
@@ -599,7 +668,7 @@ fn unify_alleles(
     group: &OverlappingVarGroup,
     ref_seq: &[u8],
     n_samples: usize,
-) -> UnifiedAlleleSet {
+) -> Result<UnifiedAlleleSet, PerGroupMergerError> {
     // Index `byte_key → position in alleles`. REF is always at 0.
     let mut alleles: Vec<UnifiedAllele> = Vec::new();
     let mut byte_index: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
@@ -655,7 +724,7 @@ fn unify_alleles(
     let compounds = detect_compound_candidates(group, n_samples);
     for candidate in compounds {
         let projected =
-            project_compound_onto_group(ref_seq, group, &candidate.constituents_per_first_anchor);
+            project_compound_onto_group(ref_seq, group, &candidate.constituents_per_first_anchor)?;
         let target_idx = match byte_index.get(&projected) {
             Some(&idx) => {
                 // The compound's byte sequence already exists in the
@@ -698,10 +767,10 @@ fn unify_alleles(
         }
     }
 
-    UnifiedAlleleSet {
+    Ok(UnifiedAlleleSet {
         alleles,
         dropped_other: DroppedOther::default(),
-    }
+    })
 }
 
 /// Project a single record's local allele onto the group's reference
@@ -854,9 +923,9 @@ fn project_compound_onto_group(
     ref_seq: &[u8],
     group: &OverlappingVarGroup,
     constituents: &[CompoundConstituent],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, PerGroupMergerError> {
     if constituents.is_empty() {
-        return ref_seq.to_vec();
+        return Ok(ref_seq.to_vec());
     }
 
     // We process constituents in record-position order. Each
@@ -885,13 +954,22 @@ fn project_compound_onto_group(
         let local_offset = (pp.pos - group.start) as usize;
         // Find any sample that has this record's allele at
         // local_allele_idx; that sample's record gives us the bytes.
+        // The walker invariant guarantees at least one anchoring
+        // sample; missing it is a contract violation, not a data
+        // condition.
         let allele_bytes = pp
             .per_sample
             .iter()
             .filter_map(|slot| slot.as_ref())
             .find(|rec| c.local_allele_idx < rec.alleles.len())
             .map(|rec| rec.alleles[c.local_allele_idx].seq.clone())
-            .unwrap_or_default();
+            .ok_or(PerGroupMergerError::MissingCompoundAlleleBytes {
+                chrom_id: group.chrom_id,
+                start: group.start,
+                end: group.end,
+                record_idx: c.record_idx,
+                local_allele_idx: c.local_allele_idx,
+            })?;
         let local_span = pp
             .per_sample
             .iter()
@@ -920,7 +998,7 @@ fn project_compound_onto_group(
         result.extend_from_slice(&ref_seq[cursor_offset..]);
     }
 
-    result
+    Ok(result)
 }
 
 fn constituent_list(src: &[CompoundConstituent]) -> Vec<CompoundConstituent> {
@@ -997,7 +1075,7 @@ fn project_scalars(
     group: &OverlappingVarGroup,
     unified: &UnifiedAlleleSet,
     n_samples: usize,
-) -> ScalarProjection {
+) -> Result<ScalarProjection, PerGroupMergerError> {
     let n_kept = unified.alleles.len();
 
     let mut scalars: Vec<Vec<AlleleSupportStats>> = (0..n_samples)
@@ -1070,7 +1148,16 @@ fn project_scalars(
                 };
                 let stats = rec.alleles[local_allele_idx].support;
                 if stats.num_obs == 0 {
-                    continue;
+                    return Err(PerGroupMergerError::ZeroObservationConstituent {
+                        chrom_id: group.chrom_id,
+                        start: group.start,
+                        end: group.end,
+                        phase: CompoundPhase::QualityGather,
+                        sample_idx,
+                        allele_idx,
+                        record_idx,
+                        local_allele_idx,
+                    });
                 }
                 let mean_q = stats.q_sum / (stats.num_obs as f64);
                 min_mean_q = Some(match min_mean_q {
@@ -1083,7 +1170,16 @@ fn project_scalars(
                 bias_basis += stats.num_obs as u64;
             }
             let count = inter;
-            let q_sum = min_mean_q.unwrap_or(0.0) * (count as f64);
+            let mean_q =
+                min_mean_q.ok_or(PerGroupMergerError::NoQualityForChainAnchoredCompound {
+                    chrom_id: group.chrom_id,
+                    start: group.start,
+                    end: group.end,
+                    sample_idx,
+                    allele_idx,
+                    inter,
+                })?;
+            let q_sum = mean_q * (count as f64);
             let scale = if bias_basis == 0 {
                 0.0
             } else {
@@ -1106,7 +1202,7 @@ fn project_scalars(
     // kept_idx` index once so each lookup avoids the previous O(n)
     // scan over `unified.alleles`.
     let source_index = build_source_index(unified);
-    for allele in &unified.alleles {
+    for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if !allele.is_compound {
             continue;
         }
@@ -1126,7 +1222,16 @@ fn project_scalars(
                 };
                 let support = rec.alleles[local_allele_idx].support;
                 if support.num_obs == 0 {
-                    continue;
+                    return Err(PerGroupMergerError::ZeroObservationConstituent {
+                        chrom_id: group.chrom_id,
+                        start: group.start,
+                        end: group.end,
+                        phase: CompoundPhase::ConstituentSubtraction,
+                        sample_idx,
+                        allele_idx,
+                        record_idx,
+                        local_allele_idx,
+                    });
                 }
                 let scale = (inter as f64) / (support.num_obs as f64);
                 let mut to_subtract = AlleleSupportStats {
@@ -1150,10 +1255,10 @@ fn project_scalars(
         }
     }
 
-    ScalarProjection {
+    Ok(ScalarProjection {
         scalars,
         other_scalars,
-    }
+    })
 }
 
 /// Build a `(sample_idx, record_idx, local_allele_idx) → allele_idx`
@@ -2354,5 +2459,132 @@ mod tests {
         };
         let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
         assert!(merger.collect::<Result<Vec<_>, _>>().unwrap().is_empty());
+    }
+
+    // ---------- M4 contract-violation errors ----------
+
+    #[test]
+    fn project_compound_onto_group_errors_when_no_sample_carries_allele() {
+        // Walker invariant says every admitted compound constituent
+        // has at least one anchoring sample providing the bytes.
+        // Hand-build a constituent referencing a record where the
+        // requested local_allele_idx doesn't exist on any sample.
+        let rec_s0 = record(0, 100, vec![allele(b"A", stats(2, -0.5), &[])]);
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 7,
+            start: 100,
+            end: 100,
+            records: vec![pp],
+        };
+        let constituents = vec![CompoundConstituent {
+            record_idx: 0,
+            local_allele_idx: 5, // out of range — no sample carries it
+        }];
+        match project_compound_onto_group(b"A", &group, &constituents) {
+            Err(PerGroupMergerError::MissingCompoundAlleleBytes {
+                chrom_id,
+                record_idx,
+                local_allele_idx,
+                ..
+            }) => {
+                assert_eq!(chrom_id, 7);
+                assert_eq!(record_idx, 0);
+                assert_eq!(local_allele_idx, 5);
+            }
+            Ok(_) => panic!("expected MissingCompoundAlleleBytes, got Ok"),
+            Err(other) => panic!("expected MissingCompoundAlleleBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_group_errors_on_zero_obs_constituent_in_quality_gather() {
+        // Two chain-anchored SNPs in one sample — should admit a
+        // compound. The p=102 constituent has num_obs = 0 (walker
+        // invariant violation). project_scalars must surface the
+        // contradiction rather than fabricating an infinite-quality
+        // compound.
+        let rec_s0_p100 = record(
+            0,
+            100,
+            vec![
+                allele(b"A", stats(2, -0.5), &[]),
+                allele(b"T", stats(6, -2.0), &[42]),
+            ],
+        );
+        let rec_s0_p102 = record(
+            0,
+            102,
+            vec![
+                allele(b"G", stats(2, -0.5), &[]),
+                allele(b"C", stats(0, 0.0), &[42]), // zero obs — bogus
+            ],
+        );
+        let pp0 = pp_one(0, 100, 1, vec![(0, rec_s0_p100)]);
+        let pp1 = pp_one(0, 102, 1, vec![(0, rec_s0_p102)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 102,
+            records: vec![pp0, pp1],
+        };
+        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AAG", 100));
+        match merger.next() {
+            Some(Err(PerGroupMergerError::ZeroObservationConstituent {
+                phase: CompoundPhase::QualityGather,
+                ..
+            })) => {}
+            other => panic!("expected ZeroObservationConstituent(QualityGather), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_scalars_errors_when_chain_anchored_compound_has_no_usable_constituent() {
+        // inter > 0 for sample 0 but per_sample_sources[0] is empty
+        // ⇒ no constituent yields a quality, min_mean_q stays None,
+        // the post-loop fallback must surface NoQualityForChainAnchoredCompound.
+        let unified = UnifiedAlleleSet {
+            alleles: vec![
+                UnifiedAllele {
+                    seq: b"AAG".to_vec(),
+                    is_compound: false,
+                    constituents: Vec::new(),
+                    per_sample_sources: vec![Vec::new()],
+                    chain_anchor_counts: vec![0],
+                    cohort_count: 0,
+                    cap_protected: true,
+                },
+                UnifiedAllele {
+                    seq: b"TAC".to_vec(),
+                    is_compound: true,
+                    constituents: Vec::new(),
+                    per_sample_sources: vec![Vec::new()],
+                    chain_anchor_counts: vec![3], // claim 3 chain-anchor obs
+                    cohort_count: 3,
+                    cap_protected: true,
+                },
+            ],
+            dropped_other: DroppedOther::default(),
+        };
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 102,
+            records: vec![pp_one(0, 100, 1, vec![])],
+        };
+        match project_scalars(&group, &unified, 1) {
+            Err(PerGroupMergerError::NoQualityForChainAnchoredCompound {
+                sample_idx,
+                allele_idx,
+                inter,
+                ..
+            }) => {
+                assert_eq!(sample_idx, 0);
+                assert_eq!(allele_idx, 1);
+                assert_eq!(inter, 3);
+            }
+            Ok(_) => panic!("expected NoQualityForChainAnchoredCompound, got Ok"),
+            Err(other) => panic!("expected NoQualityForChainAnchoredCompound, got {other:?}"),
+        }
     }
 }
