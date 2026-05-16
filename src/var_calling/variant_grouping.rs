@@ -146,14 +146,10 @@ impl<I> VariantGrouper<I>
 where
     I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
 {
-    /// Construct a grouper with default tuning. Equivalent to
-    /// `with_config(upstream, GrouperConfig::default())`.
-    pub fn new(upstream: I) -> Self {
-        Self::with_config(upstream, GrouperConfig::default())
-    }
-
-    /// Construct a grouper with explicit tuning. Use this when
-    /// overriding [`GrouperConfig::max_var_group_span`].
+    /// Construct a grouper with explicit tuning. Pass
+    /// [`GrouperConfig::default()`] for the standard defaults; pass an
+    /// explicit value for [`GrouperConfig::max_var_group_span`] to
+    /// override.
     pub fn with_config(upstream: I, config: GrouperConfig) -> Self {
         Self {
             upstream,
@@ -423,7 +419,8 @@ mod tests {
 
     #[test]
     fn empty_upstream_yields_immediately() {
-        let mut grouper = VariantGrouper::new(iter_from(Vec::new()));
+        let mut grouper =
+            VariantGrouper::with_config(iter_from(Vec::new()), GrouperConfig::default());
         assert!(grouper.next().is_none());
         // latches:
         assert!(grouper.next().is_none());
@@ -431,7 +428,10 @@ mod tests {
 
     #[test]
     fn single_trivial_snp() {
-        let grouper = VariantGrouper::new(ok_iter(vec![snp_pp(0, 100, 1, 0)]));
+        let grouper = VariantGrouper::with_config(
+            ok_iter(vec![snp_pp(0, 100, 1, 0)]),
+            GrouperConfig::default(),
+        );
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].chrom_id, 0);
@@ -450,7 +450,7 @@ mod tests {
             ref_only_pp(0, 102, 1, 0),
             snp_pp(0, 103, 1, 0),
         ]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 103, 103));
@@ -465,7 +465,7 @@ mod tests {
         let mut pps: Vec<PerPositionPileups> =
             (100..1100).map(|p| ref_only_pp(0, p, 1, 0)).collect();
         pps.push(snp_pp(0, 1100, 1, 0));
-        let grouper = VariantGrouper::new(ok_iter(pps));
+        let grouper = VariantGrouper::with_config(ok_iter(pps), GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 1100, 1100));
@@ -483,7 +483,7 @@ mod tests {
             ref_only_pp(0, 102, 2, 1),
             snp_pp(0, 104, 2, 1),
         ]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 100, 104));
@@ -501,7 +501,7 @@ mod tests {
             ref_only_pp(0, 104, 1, 0),
             snp_pp(0, 105, 1, 0),
         ]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].span(), (0, 102, 102));
@@ -519,7 +519,7 @@ mod tests {
             ref_only_pp(0, 150, 1, 0),
             snp_pp(0, 200, 1, 0),
         ]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].span(), (0, 100, 100));
@@ -533,7 +533,7 @@ mod tests {
         // Sample 0 has a deletion at p=100 with ref_span=5 (covers
         // p=100..104). Sample 1 has a SNP at p=103.
         let upstream = ok_iter(vec![del_pp(0, 100, 2, 0, 5), snp_pp(0, 103, 2, 1)]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 100, 104));
@@ -561,7 +561,11 @@ mod tests {
             del_pp(0, 102, 1, 0, 4),
             snp_pp(0, 105, 1, 0),
         ]);
-        let groups = collect_groups(VariantGrouper::new(upstream)).unwrap();
+        let groups = collect_groups(VariantGrouper::with_config(
+            upstream,
+            GrouperConfig::default(),
+        ))
+        .unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 100, 105));
         assert_eq!(groups[0].records.len(), 4);
@@ -573,7 +577,7 @@ mod tests {
         // record at p=105 with ref_span=1 must not shrink end
         // back to 105.
         let upstream = ok_iter(vec![del_pp(0, 100, 1, 0, 10), snp_pp(0, 105, 1, 0)]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 100, 109));
@@ -583,7 +587,11 @@ mod tests {
     fn single_record_end_is_inclusive_one_based() {
         // ref_span = 3 at p=100 → end must be 102, not 103.
         let upstream = ok_iter(vec![del_pp(0, 100, 1, 0, 3)]);
-        let groups = collect_groups(VariantGrouper::new(upstream)).unwrap();
+        let groups = collect_groups(VariantGrouper::with_config(
+            upstream,
+            GrouperConfig::default(),
+        ))
+        .unwrap();
         assert_eq!(groups[0].span(), (0, 100, 102));
     }
 
@@ -595,7 +603,7 @@ mod tests {
         // pos=1 on chrom 1. Numerically pos=1 ≤ end=199 would
         // overlap, but the chrom change forces a close.
         let upstream = ok_iter(vec![del_pp(0, 100, 1, 0, 100), snp_pp(1, 1, 1, 0)]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].span(), (0, 100, 199));
@@ -610,7 +618,7 @@ mod tests {
             snp_pp(1, 50, 1, 0),
             snp_pp(1, 150, 1, 0),
         ]);
-        let grouper = VariantGrouper::new(upstream);
+        let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
         let groups = collect_groups(grouper).unwrap();
         assert_eq!(groups.len(), 4);
         assert_eq!(groups[0].span(), (0, 100, 100));
@@ -633,7 +641,7 @@ mod tests {
     #[test]
     fn upstream_error_before_any_group() {
         let items: Vec<Item> = vec![Err(fake_upstream_err(0))];
-        let mut grouper = VariantGrouper::new(iter_from(items));
+        let mut grouper = VariantGrouper::with_config(iter_from(items), GrouperConfig::default());
         match grouper.next() {
             Some(Err(GrouperError::Upstream(MergerError::OutOfOrder { .. }))) => {}
             other => panic!("expected upstream out-of-order, got {other:?}"),
@@ -653,7 +661,7 @@ mod tests {
             Ok(snp_pp(0, 101, 1, 0)),
             Err(fake_upstream_err(0)),
         ];
-        let mut grouper = VariantGrouper::new(iter_from(items));
+        let mut grouper = VariantGrouper::with_config(iter_from(items), GrouperConfig::default());
         match grouper.next() {
             Some(Err(GrouperError::Upstream(MergerError::OutOfOrder { .. }))) => {}
             other => panic!("expected upstream error, got {other:?}"),
@@ -747,7 +755,11 @@ mod tests {
         // max_ref_span falls back to 1, but we never reach that
         // path because has_variant_observation rejects first.
         let upstream = ok_iter(vec![empty_pp(0, 100, 2), snp_pp(0, 101, 2, 0)]);
-        let groups = collect_groups(VariantGrouper::new(upstream)).unwrap();
+        let groups = collect_groups(VariantGrouper::with_config(
+            upstream,
+            GrouperConfig::default(),
+        ))
+        .unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].span(), (0, 101, 101));
     }

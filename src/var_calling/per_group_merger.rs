@@ -29,8 +29,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::var_calling::variant_grouping::{GrouperError, OverlappingVarGroup};
 use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
+use crate::var_calling::variant_grouping::{GrouperError, OverlappingVarGroup};
 
 /// Maximum number of alleles retained in a single merged record
 /// before the cap drops the lowest-cohort-count alleles into the
@@ -373,10 +373,10 @@ impl<I> PerGroupMerger<I>
 where
     I: Iterator<Item = Result<OverlappingVarGroup, GrouperError>>,
 {
-    pub fn new(upstream: I, ref_fetcher: SharedRefFetcher) -> Self {
-        Self::with_config(upstream, ref_fetcher, PerGroupMergerConfig::default())
-    }
-
+    /// Construct a merger with explicit tuning. Pass
+    /// [`PerGroupMergerConfig::default()`] for the standard defaults
+    /// (`ploidy = 2`, `max_alleles = 6`, `batch_size = 32`); pass an
+    /// explicit value for any field to override.
     pub fn with_config(
         upstream: I,
         ref_fetcher: SharedRefFetcher,
@@ -1593,8 +1593,8 @@ fn ln_factorial(n: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::var_calling::per_position_merger::PerPositionPileups;
     use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::var_calling::per_position_merger::PerPositionPileups;
 
     // ---------- mock ref fetcher ----------
 
@@ -1698,7 +1698,11 @@ mod tests {
             end: 100,
             records: vec![pp],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         let out: Vec<_> = merger.collect();
         assert_eq!(out.len(), 1);
         let record = out.into_iter().next().unwrap().unwrap();
@@ -1730,7 +1734,11 @@ mod tests {
             end: 100,
             records: vec![pp],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         let out: Vec<_> = merger.collect();
         let record = out.into_iter().next().unwrap().unwrap();
         assert_eq!(record.alleles.len(), 2);
@@ -1758,7 +1766,11 @@ mod tests {
             end: 101,
             records: vec![pp],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AT", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"AT", 100),
+            PerGroupMergerConfig::default(),
+        );
         let record = merger
             .collect::<Vec<_>>()
             .into_iter()
@@ -1780,7 +1792,11 @@ mod tests {
             end: 100,
             records: vec![pp],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         assert!(merger.collect::<Vec<_>>().is_empty());
     }
 
@@ -1814,7 +1830,11 @@ mod tests {
             end: 101,
             records: vec![pp0, pp1],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AC", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"AC", 100),
+            PerGroupMergerConfig::default(),
+        );
         let record = merger
             .collect::<Vec<_>>()
             .into_iter()
@@ -1857,7 +1877,11 @@ mod tests {
             end: 102,
             records: vec![pp0, pp1],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AAG", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"AAG", 100),
+            PerGroupMergerConfig::default(),
+        );
         let record = merger
             .collect::<Vec<_>>()
             .into_iter()
@@ -1906,7 +1930,11 @@ mod tests {
             end: 102,
             records: vec![pp0, pp1],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AAG", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"AAG", 100),
+            PerGroupMergerConfig::default(),
+        );
         let record = merger
             .collect::<Vec<_>>()
             .into_iter()
@@ -1966,7 +1994,11 @@ mod tests {
             end: 102,
             records: vec![pp0, pp1],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AAG", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"AAG", 100),
+            PerGroupMergerConfig::default(),
+        );
         let record = merger
             .collect::<Vec<_>>()
             .into_iter()
@@ -2061,7 +2093,11 @@ mod tests {
             end: 100,
             records: vec![pp],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         assert!(merger.collect::<Vec<_>>().is_empty());
     }
 
@@ -2099,7 +2135,11 @@ mod tests {
             records: vec![pp],
         };
         // Empty fetcher seq → out-of-range error.
-        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"", 100));
+        let mut merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"", 100),
+            PerGroupMergerConfig::default(),
+        );
         match merger.next() {
             Some(Err(PerGroupMergerError::RefFetch { .. })) => {}
             other => panic!("expected RefFetch error, got {other:?}"),
@@ -2191,7 +2231,11 @@ mod tests {
             end: 100,
             records: vec![pp],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         let record = merger
             .collect::<Vec<_>>()
             .into_iter()
@@ -2245,12 +2289,13 @@ mod tests {
         let ref_seq: Vec<u8> = (100..=200)
             .map(|p| if p == 200 { b'C' } else { b'A' })
             .collect();
-        let merger = PerGroupMerger::new(
+        let merger = PerGroupMerger::with_config(
             ok_iter(vec![group_a, group_b]),
             Arc::new(MockRef {
                 seq: ref_seq,
                 base_offset: 100,
             }),
+            PerGroupMergerConfig::default(),
         );
         let records: Vec<_> = merger.collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 2);
@@ -2377,7 +2422,11 @@ mod tests {
             end: 100,
             records: vec![pp],
         };
-        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let mut merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         match merger.next() {
             Some(Err(PerGroupMergerError::RefFetch { .. })) => {}
             other => panic!("expected RefFetch error on inverted span, got {other:?}"),
@@ -2412,7 +2461,11 @@ mod tests {
             end: 101,
             records: vec![pp],
         };
-        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), Arc::new(ShortRef));
+        let mut merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            Arc::new(ShortRef),
+            PerGroupMergerConfig::default(),
+        );
         match merger.next() {
             Some(Err(PerGroupMergerError::RefFetch { .. })) => {}
             other => panic!("expected RefFetch error on short fetcher, got {other:?}"),
@@ -2457,7 +2510,11 @@ mod tests {
             end: 100,
             records: vec![],
         };
-        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        let merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"A", 100),
+            PerGroupMergerConfig::default(),
+        );
         assert!(merger.collect::<Result<Vec<_>, _>>().unwrap().is_empty());
     }
 
@@ -2528,7 +2585,11 @@ mod tests {
             end: 102,
             records: vec![pp0, pp1],
         };
-        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"AAG", 100));
+        let mut merger = PerGroupMerger::with_config(
+            ok_iter(vec![group]),
+            fetcher(b"AAG", 100),
+            PerGroupMergerConfig::default(),
+        );
         match merger.next() {
             Some(Err(PerGroupMergerError::ZeroObservationConstituent {
                 phase: CompoundPhase::QualityGather,

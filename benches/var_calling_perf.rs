@@ -27,17 +27,19 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
-use merge_per_sample_vcfs::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
-use merge_per_sample_vcfs::var_calling::per_position_merger::{
-    MergerError, PerPositionMerger, PerPositionPileups,
-};
-use merge_per_sample_vcfs::var_calling::variant_grouping::{
-    OverlappingVarGroup, VariantGrouper,
-};
 use merge_per_sample_vcfs::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, ChainId, PileupRecord, RefSeqFetcher,
 };
 use merge_per_sample_vcfs::per_sample_pileup::psp::PspReadError;
+use merge_per_sample_vcfs::var_calling::per_group_merger::{
+    PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
+};
+use merge_per_sample_vcfs::var_calling::per_position_merger::{
+    MergerError, PerPositionMerger, PerPositionPileups,
+};
+use merge_per_sample_vcfs::var_calling::variant_grouping::{
+    GrouperConfig, OverlappingVarGroup, VariantGrouper,
+};
 
 // ---------------------------------------------------------------------
 // Common helpers
@@ -142,41 +144,47 @@ fn bench_per_position_merger(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(N_POSITIONS as u64));
 
-    group.bench_function(format!("dense_{N_SAMPLES}_samples_{N_POSITIONS}_positions"), |b| {
-        b.iter_batched(
-            || build_dense_per_sample_streams(N_SAMPLES, N_POSITIONS),
-            |streams| {
-                let merger =
-                    PerPositionMerger::new(streams, names(N_SAMPLES), Vec::new()).unwrap();
-                let mut count: u64 = 0;
-                for item in merger {
-                    let pp = item.unwrap();
-                    black_box(&pp);
-                    count += 1;
-                }
-                black_box(count)
-            },
-            criterion::BatchSize::LargeInput,
-        );
-    });
+    group.bench_function(
+        format!("dense_{N_SAMPLES}_samples_{N_POSITIONS}_positions"),
+        |b| {
+            b.iter_batched(
+                || build_dense_per_sample_streams(N_SAMPLES, N_POSITIONS),
+                |streams| {
+                    let merger =
+                        PerPositionMerger::new(streams, names(N_SAMPLES), Vec::new()).unwrap();
+                    let mut count: u64 = 0;
+                    for item in merger {
+                        let pp = item.unwrap();
+                        black_box(&pp);
+                        count += 1;
+                    }
+                    black_box(count)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
 
-    group.bench_function(format!("sparse_{N_SAMPLES}_samples_{N_POSITIONS}_positions"), |b| {
-        b.iter_batched(
-            || build_sparse_per_sample_streams(N_SAMPLES, N_POSITIONS),
-            |streams| {
-                let merger =
-                    PerPositionMerger::new(streams, names(N_SAMPLES), Vec::new()).unwrap();
-                let mut count: u64 = 0;
-                for item in merger {
-                    let pp = item.unwrap();
-                    black_box(&pp);
-                    count += 1;
-                }
-                black_box(count)
-            },
-            criterion::BatchSize::LargeInput,
-        );
-    });
+    group.bench_function(
+        format!("sparse_{N_SAMPLES}_samples_{N_POSITIONS}_positions"),
+        |b| {
+            b.iter_batched(
+                || build_sparse_per_sample_streams(N_SAMPLES, N_POSITIONS),
+                |streams| {
+                    let merger =
+                        PerPositionMerger::new(streams, names(N_SAMPLES), Vec::new()).unwrap();
+                    let mut count: u64 = 0;
+                    for item in merger {
+                        let pp = item.unwrap();
+                        black_box(&pp);
+                        count += 1;
+                    }
+                    black_box(count)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
 
     group.finish();
 }
@@ -253,8 +261,7 @@ fn build_overlap_extension_pp_stream(
         }));
         // SNPs at base+1, base+2, base+3, base+4 in other samples.
         for offset in 1..=4_u32 {
-            let mut per_sample: Vec<Option<PileupRecord>> =
-                (0..n_samples).map(|_| None).collect();
+            let mut per_sample: Vec<Option<PileupRecord>> = (0..n_samples).map(|_| None).collect();
             let pos = base + offset;
             per_sample[1 % n_samples] = Some(PileupRecord::new(
                 0,
@@ -282,25 +289,28 @@ fn bench_variant_grouper(c: &mut Criterion) {
     // the pure-REF drop fast path.
     const N_POSITIONS_SNP: u32 = 200_000;
     group.throughput(Throughput::Elements(N_POSITIONS_SNP as u64));
-    group.bench_function(format!("snp_dense_{N_SAMPLES}_samples_{N_POSITIONS_SNP}_pos"), |b| {
-        b.iter_batched(
-            || {
-                let pp_stream = build_snp_dense_pp_stream(N_SAMPLES, N_POSITIONS_SNP, 200);
-                pp_stream.into_iter()
-            },
-            |upstream: GrouperUpstream| {
-                let grouper = VariantGrouper::new(upstream);
-                let mut count: u64 = 0;
-                for item in grouper {
-                    let g = item.unwrap();
-                    black_box(&g);
-                    count += 1;
-                }
-                black_box(count)
-            },
-            criterion::BatchSize::LargeInput,
-        );
-    });
+    group.bench_function(
+        format!("snp_dense_{N_SAMPLES}_samples_{N_POSITIONS_SNP}_pos"),
+        |b| {
+            b.iter_batched(
+                || {
+                    let pp_stream = build_snp_dense_pp_stream(N_SAMPLES, N_POSITIONS_SNP, 200);
+                    pp_stream.into_iter()
+                },
+                |upstream: GrouperUpstream| {
+                    let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
+                    let mut count: u64 = 0;
+                    for item in grouper {
+                        let g = item.unwrap();
+                        black_box(&g);
+                        count += 1;
+                    }
+                    black_box(count)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
 
     // Overlap-extension: 5 000 groups × 5 records each.
     const N_GROUPS_EXT: u32 = 5_000;
@@ -310,12 +320,11 @@ fn bench_variant_grouper(c: &mut Criterion) {
         |b| {
             b.iter_batched(
                 || {
-                    let pp_stream =
-                        build_overlap_extension_pp_stream(N_SAMPLES, N_GROUPS_EXT, 100);
+                    let pp_stream = build_overlap_extension_pp_stream(N_SAMPLES, N_GROUPS_EXT, 100);
                     pp_stream.into_iter()
                 },
                 |upstream: GrouperUpstream| {
-                    let grouper = VariantGrouper::new(upstream);
+                    let grouper = VariantGrouper::with_config(upstream, GrouperConfig::default());
                     let mut count: u64 = 0;
                     for item in grouper {
                         let g = item.unwrap();
@@ -347,9 +356,7 @@ fn build_biallelic_snp_groups(
     let mut groups = Vec::with_capacity(n_groups as usize);
     let last_pos = (n_groups - 1) * spacing + 100;
     let ref_len = (last_pos - 100 + 1) as usize;
-    let ref_seq: Vec<u8> = (0..ref_len)
-        .map(|i| BASES[i & 3])
-        .collect();
+    let ref_seq: Vec<u8> = (0..ref_len).map(|i| BASES[i & 3]).collect();
     for g in 0..n_groups {
         let pos = g * spacing + 100;
         let ref_base = ref_seq[(pos - 100) as usize];
@@ -363,7 +370,12 @@ fn build_biallelic_snp_groups(
                 pos,
                 vec![
                     ref_obs(ref_base, n_ref),
-                    alt_obs(alt_base, n_alt, -2.0 * n_alt as f64, vec![pos as u64 + s as u64]),
+                    alt_obs(
+                        alt_base,
+                        n_alt,
+                        -2.0 * n_alt as f64,
+                        vec![pos as u64 + s as u64],
+                    ),
                 ],
             ));
         }
@@ -405,10 +417,8 @@ fn build_compound_groups(
         let alt_p1 = BASES[((p1 - 100) as usize + 1) & 3];
         let alt_p2 = BASES[((p2 - 100) as usize + 1) & 3];
 
-        let mut per_sample_p1: Vec<Option<PileupRecord>> =
-            (0..n_samples).map(|_| None).collect();
-        let mut per_sample_p2: Vec<Option<PileupRecord>> =
-            (0..n_samples).map(|_| None).collect();
+        let mut per_sample_p1: Vec<Option<PileupRecord>> = (0..n_samples).map(|_| None).collect();
+        let mut per_sample_p2: Vec<Option<PileupRecord>> = (0..n_samples).map(|_| None).collect();
 
         let anchor_cut = (n_samples as f32 * chain_anchored_fraction) as usize;
         for s in 0..n_samples {
@@ -494,9 +504,10 @@ fn bench_per_group_merger(c: &mut Criterion) {
             b.iter_batched(
                 || groups_snp.clone(),
                 |groups| {
-                    let merger = PerGroupMerger::new(
+                    let merger = PerGroupMerger::with_config(
                         groups.into_iter().map(Ok),
                         Arc::clone(&fetcher_snp),
+                        PerGroupMergerConfig::default(),
                     );
                     let mut count: u64 = 0;
                     for item in merger {
@@ -521,9 +532,10 @@ fn bench_per_group_merger(c: &mut Criterion) {
             b.iter_batched(
                 || groups_compound_full.clone(),
                 |groups| {
-                    let merger = PerGroupMerger::new(
+                    let merger = PerGroupMerger::with_config(
                         groups.into_iter().map(Ok),
                         Arc::clone(&fetcher_compound),
+                        PerGroupMergerConfig::default(),
                     );
                     let mut count: u64 = 0;
                     for item in merger {
@@ -539,17 +551,17 @@ fn bench_per_group_merger(c: &mut Criterion) {
     );
 
     // --- compound mixed: half the samples chain-broken ⇒ fallback path ---
-    let (groups_compound_mixed, _) =
-        build_compound_groups(N_GROUPS, N_SAMPLES, SPACING, 0.5);
+    let (groups_compound_mixed, _) = build_compound_groups(N_GROUPS, N_SAMPLES, SPACING, 0.5);
     group.bench_function(
         format!("compound_half_chain_broken_{N_SAMPLES}_samples_{N_GROUPS}_groups"),
         |b| {
             b.iter_batched(
                 || groups_compound_mixed.clone(),
                 |groups| {
-                    let merger = PerGroupMerger::new(
+                    let merger = PerGroupMerger::with_config(
                         groups.into_iter().map(Ok),
                         Arc::clone(&fetcher_compound),
+                        PerGroupMergerConfig::default(),
                     );
                     let mut count: u64 = 0;
                     for item in merger {
@@ -571,9 +583,10 @@ fn bench_per_group_merger(c: &mut Criterion) {
         b.iter_batched(
             || groups_solo.clone(),
             |groups| {
-                let merger = PerGroupMerger::new(
+                let merger = PerGroupMerger::with_config(
                     groups.into_iter().map(Ok),
                     Arc::clone(&fetcher_solo),
+                    PerGroupMergerConfig::default(),
                 );
                 let mut count: u64 = 0;
                 for item in merger {
