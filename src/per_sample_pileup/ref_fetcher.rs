@@ -277,11 +277,9 @@ mod tests {
             .expect("fai");
         }
 
-        let fetcher = ChromBoundaryRefFetcher::new(
-            &fasta_path,
-            contig_list(&[("chr0", seq.len() as u64)]),
-        )
-        .expect("fetcher");
+        let fetcher =
+            ChromBoundaryRefFetcher::new(&fasta_path, contig_list(&[("chr0", seq.len() as u64)]))
+                .expect("fetcher");
 
         let bases = fetcher.fetch(0, 1, seq.len() as u32).expect("fetch");
         assert_eq!(bases, b"ACGTACGTNN");

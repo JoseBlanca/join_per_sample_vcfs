@@ -36,9 +36,7 @@ fn format_error_chain(err: &(dyn Error + 'static)) -> String {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.cmd {
-        PopVarCallerCommand::Pileup(args) => {
-            run_pileup(&args).map_err(|e| format_error_chain(&e))
-        }
+        PopVarCallerCommand::Pileup(args) => run_pileup(&args).map_err(|e| format_error_chain(&e)),
         PopVarCallerCommand::PspToPileup(args) => {
             run_psp_to_pileup(&args).map_err(|e| format_error_chain(&e))
         }

@@ -16,12 +16,12 @@ use std::iter::Peekable;
 use ahash::AHashMap;
 
 use super::active_read_set::ActiveReads;
+use super::chain_id_allocator::{ChainId, ChainIdAllocator, ChainIdAllocatorCounters};
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
 };
-use super::chain_id_allocator::{ChainId, ChainIdAllocator, ChainIdAllocatorCounters};
 use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerConfig};
 
 /// Construct a [`PileupWalker`] over a coordinate-sorted stream of
@@ -298,7 +298,10 @@ impl WalkerState {
             last_admitted_chrom_id: None,
             last_admitted_locus: None,
             active_reads: ActiveReads::new(),
-            chain_ids: ChainIdAllocator::with_caps(config.max_active_reads, config.mate_lookup_window),
+            chain_ids: ChainIdAllocator::with_caps(
+                config.max_active_reads,
+                config.mate_lookup_window,
+            ),
             open_records: OpenPileupRecordTable::with_cap(config.max_record_span),
             summary: RunSummary::default(),
             config,
@@ -553,7 +556,8 @@ impl WalkerState {
     }
 
     fn summary(&self) -> RunSummary {
-        self.summary.merge_chain_id_counters(self.chain_ids.counters())
+        self.summary
+            .merge_chain_id_counters(self.chain_ids.counters())
     }
 }
 

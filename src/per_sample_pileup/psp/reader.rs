@@ -1181,9 +1181,11 @@ fn decode_one_column<R: Read>(
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
             decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
-        ColumnKey::AlleleChainIds => DecodedColumn::AlleleChainIds(
-            decode_list_column::<ChainId>(bytes, n_total_alleles, column_name)?,
-        ),
+        ColumnKey::AlleleChainIds => DecodedColumn::AlleleChainIds(decode_list_column::<ChainId>(
+            bytes,
+            n_total_alleles,
+            column_name,
+        )?),
     };
     Ok(Some(decoded))
 }
