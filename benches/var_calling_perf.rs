@@ -35,7 +35,7 @@ use merge_per_sample_vcfs::var_calling::per_group_merger::{
     PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
 };
 use merge_per_sample_vcfs::var_calling::per_position_merger::{
-    MergerError, PerPositionMerger, PerPositionPileups,
+    PerPositionMerger, PerPositionMergerError, PerPositionPileups,
 };
 use merge_per_sample_vcfs::var_calling::variant_grouping::{
     GrouperConfig, OverlappingVarGroup, VariantGrouper,
@@ -193,7 +193,7 @@ fn bench_per_position_merger(c: &mut Criterion) {
 // variant_grouper benches
 // ---------------------------------------------------------------------
 
-type GrouperUpstream = std::vec::IntoIter<Result<PerPositionPileups, MergerError>>;
+type GrouperUpstream = std::vec::IntoIter<Result<PerPositionPileups, PerPositionMergerError>>;
 
 /// SNP-dense per-position stream: every position carries a record;
 /// every `snp_every_n`th position has a non-REF allele. Drives the
@@ -202,7 +202,7 @@ fn build_snp_dense_pp_stream(
     n_samples: usize,
     n_positions: u32,
     snp_every_n: u32,
-) -> Vec<Result<PerPositionPileups, MergerError>> {
+) -> Vec<Result<PerPositionPileups, PerPositionMergerError>> {
     let mut out = Vec::with_capacity(n_positions as usize);
     for p in 1..=n_positions {
         let mut per_sample: Vec<Option<PileupRecord>> = (0..n_samples).map(|_| None).collect();
@@ -240,7 +240,7 @@ fn build_overlap_extension_pp_stream(
     n_samples: usize,
     n_groups: u32,
     spacing: u32,
-) -> Vec<Result<PerPositionPileups, MergerError>> {
+) -> Vec<Result<PerPositionPileups, PerPositionMergerError>> {
     let mut out = Vec::with_capacity((n_groups * 6) as usize);
     for g in 0..n_groups {
         let base = g * spacing + 100;

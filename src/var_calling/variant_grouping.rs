@@ -1,7 +1,7 @@
 //! Stage 4 — variant grouping over the per-position pileup stream.
 //!
 //! Given an upstream iterator that yields `Result<PerPositionPileups,
-//! MergerError>` items in strictly increasing `(chrom_id, pos)` order
+//! PerPositionMergerError>` items in strictly increasing `(chrom_id, pos)` order
 //! (the contract `PerPositionMerger` provides), the [`VariantGrouper`]
 //! bundles positions whose REF spans overlap into a single
 //! [`OverlappingVarGroup`] and emits a stream of independent groups.
@@ -20,7 +20,7 @@
 
 use thiserror::Error;
 
-use crate::var_calling::per_position_merger::{MergerError, PerPositionPileups};
+use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 
 /// Default value for [`GrouperConfig::max_var_group_span`].
 ///
@@ -82,7 +82,7 @@ impl OverlappingVarGroup {
 #[derive(Error, Debug)]
 pub enum GrouperError {
     #[error("upstream: {0}")]
-    Upstream(#[from] MergerError),
+    Upstream(#[from] PerPositionMergerError),
 
     /// A group's reference span would exceed
     /// [`GrouperConfig::max_var_group_span`]. The locus is reported
@@ -105,7 +105,7 @@ pub enum GrouperError {
 /// of per-position pileups.
 pub struct VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
 {
     upstream: I,
     config: GrouperConfig,
@@ -119,7 +119,7 @@ where
 
 impl<I> std::fmt::Debug for VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Exhaustive destructure so a new field on `VariantGrouper`
@@ -144,7 +144,7 @@ where
 
 impl<I> VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
 {
     /// Construct a grouper with explicit tuning. Pass
     /// [`GrouperConfig::default()`] for the standard defaults; pass an
@@ -187,7 +187,7 @@ where
 
 impl<I> Iterator for VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
 {
     type Item = Result<OverlappingVarGroup, GrouperError>;
 
@@ -320,7 +320,7 @@ mod tests {
     use super::*;
     use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
 
-    type Item = Result<PerPositionPileups, MergerError>;
+    type Item = Result<PerPositionPileups, PerPositionMergerError>;
     type TestIter = std::vec::IntoIter<Item>;
 
     // ---------- fixture builders ----------
@@ -410,7 +410,7 @@ mod tests {
         grouper: VariantGrouper<I>,
     ) -> Result<Vec<OverlappingVarGroup>, GrouperError>
     where
-        I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
+        I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
     {
         grouper.collect()
     }
@@ -629,8 +629,8 @@ mod tests {
 
     // ---------- error propagation ----------
 
-    fn fake_upstream_err(sample_idx: usize) -> MergerError {
-        MergerError::OutOfOrder {
+    fn fake_upstream_err(sample_idx: usize) -> PerPositionMergerError {
+        PerPositionMergerError::OutOfOrder {
             sample_idx,
             sample_name: format!("S{sample_idx}"),
             chrom_id: 0,
@@ -643,7 +643,7 @@ mod tests {
         let items: Vec<Item> = vec![Err(fake_upstream_err(0))];
         let mut grouper = VariantGrouper::with_config(iter_from(items), GrouperConfig::default());
         match grouper.next() {
-            Some(Err(GrouperError::Upstream(MergerError::OutOfOrder { .. }))) => {}
+            Some(Err(GrouperError::Upstream(PerPositionMergerError::OutOfOrder { .. }))) => {}
             other => panic!("expected upstream out-of-order, got {other:?}"),
         }
         assert!(grouper.next().is_none());
@@ -663,7 +663,7 @@ mod tests {
         ];
         let mut grouper = VariantGrouper::with_config(iter_from(items), GrouperConfig::default());
         match grouper.next() {
-            Some(Err(GrouperError::Upstream(MergerError::OutOfOrder { .. }))) => {}
+            Some(Err(GrouperError::Upstream(PerPositionMergerError::OutOfOrder { .. }))) => {}
             other => panic!("expected upstream error, got {other:?}"),
         }
         assert!(grouper.next().is_none());

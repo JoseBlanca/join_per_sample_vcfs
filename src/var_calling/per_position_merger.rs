@@ -51,7 +51,7 @@ pub struct PerPositionPileups {
 /// a side table.
 #[non_exhaustive]
 #[derive(Error, Debug)]
-pub enum MergerError {
+pub enum PerPositionMergerError {
     /// `readers` and `sample_names` had different lengths. The
     /// caller must hand one name per reader, in the same order.
     /// Defensive check — the rest of the merger's API assumes the
@@ -69,11 +69,11 @@ pub enum MergerError {
     ///
     /// `source` is boxed because `PspReadError` is the largest enum
     /// variant in this crate; inlining it would bloat
-    /// `Result<_, MergerError>` past 128 bytes for every per-position
+    /// `Result<_, PerPositionMergerError>` past 128 bytes for every per-position
     /// emission, which the merger's hot path returns once per output
     /// item.
-    #[error("reader {sample_idx} ({sample_name}) failed: {source}")]
-    Reader {
+    #[error("per-sample reader {sample_idx} ({sample_name}) failed: {source}")]
+    PerSampleReader {
         sample_idx: usize,
         sample_name: String,
         #[source]
@@ -170,18 +170,18 @@ where
     /// `sample_names`; `chromosomes` is metadata only and is not
     /// length-checked against the readers.
     ///
-    /// Returns [`MergerError::SampleCountMismatch`] if
+    /// Returns [`PerPositionMergerError::SampleCountMismatch`] if
     /// `sample_names.len() != readers.len()`, or
-    /// [`MergerError::Reader`] if any reader fails on its first
+    /// [`PerPositionMergerError::PerSampleReader`] if any reader fails on its first
     /// `next()` (the initial prefetch). Empty `readers` is allowed
     /// and yields an immediately-exhausted iterator.
     pub fn new(
         mut readers: Vec<I>,
         sample_names: Vec<String>,
         chromosomes: Vec<ParsedChromosome>,
-    ) -> Result<Self, MergerError> {
+    ) -> Result<Self, PerPositionMergerError> {
         if readers.len() != sample_names.len() {
-            return Err(MergerError::SampleCountMismatch {
+            return Err(PerPositionMergerError::SampleCountMismatch {
                 n_readers: readers.len(),
                 n_sample_names: sample_names.len(),
             });
@@ -192,7 +192,7 @@ where
                 Some(Ok(record)) => heads.push(Some(record)),
                 None => heads.push(None),
                 Some(Err(source)) => {
-                    return Err(MergerError::Reader {
+                    return Err(PerPositionMergerError::PerSampleReader {
                         sample_idx,
                         sample_name: sample_names[sample_idx].clone(),
                         source: Box::new(source),
@@ -227,7 +227,7 @@ impl<I> Iterator for PerPositionMerger<I>
 where
     I: Iterator<Item = Result<PileupRecord, PspReadError>>,
 {
-    type Item = Result<PerPositionPileups, MergerError>;
+    type Item = Result<PerPositionPileups, PerPositionMergerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -260,7 +260,7 @@ where
                 .position(|h| h.as_ref().is_some_and(|r| (r.chrom_id, r.pos) == min_key))
                 .expect("min_key was derived from a non-None head");
             self.done = true;
-            return Some(Err(MergerError::OutOfOrder {
+            return Some(Err(PerPositionMergerError::OutOfOrder {
                 sample_idx: offender,
                 sample_name: self.sample_names[offender].clone(),
                 chrom_id: min_key.0,
@@ -292,7 +292,7 @@ where
                 }
                 Some(Err(source)) => {
                     self.done = true;
-                    return Some(Err(MergerError::Reader {
+                    return Some(Err(PerPositionMergerError::PerSampleReader {
                         sample_idx,
                         sample_name: self.sample_names[sample_idx].clone(),
                         source: Box::new(source),
@@ -315,14 +315,14 @@ where
 /// clone of the agreed-upon list. Empty `readers` yields an empty
 /// list.
 ///
-/// Returns [`MergerError::ChromosomeMismatch`] on the first
+/// Returns [`PerPositionMergerError::ChromosomeMismatch`] on the first
 /// divergence. The chromosome list is the operative contract for
 /// the merger's correctness; mismatched reference strings that
 /// happen to agree on every per-chromosome field are not fatal
 /// here.
 pub fn check_chromosome_agreement<R: Read + Seek>(
     readers: &[PspReader<R>],
-) -> Result<Vec<ParsedChromosome>, MergerError> {
+) -> Result<Vec<ParsedChromosome>, PerPositionMergerError> {
     let Some(baseline_reader) = readers.first() else {
         return Ok(Vec::new());
     };
@@ -331,7 +331,7 @@ pub fn check_chromosome_agreement<R: Read + Seek>(
         let other = &reader.header().chromosomes;
         let sample_name = reader.header().sample.clone();
         if other.len() != baseline.len() {
-            return Err(MergerError::ChromosomeMismatch {
+            return Err(PerPositionMergerError::ChromosomeMismatch {
                 sample_idx,
                 sample_name,
                 chrom_id: 0,
@@ -340,7 +340,7 @@ pub fn check_chromosome_agreement<R: Read + Seek>(
         }
         for (chrom_id, (base, this)) in baseline.iter().zip(other.iter()).enumerate() {
             if base.name != this.name {
-                return Err(MergerError::ChromosomeMismatch {
+                return Err(PerPositionMergerError::ChromosomeMismatch {
                     sample_idx,
                     sample_name,
                     chrom_id: chrom_id as u32,
@@ -348,7 +348,7 @@ pub fn check_chromosome_agreement<R: Read + Seek>(
                 });
             }
             if base.length != this.length {
-                return Err(MergerError::ChromosomeMismatch {
+                return Err(PerPositionMergerError::ChromosomeMismatch {
                     sample_idx,
                     sample_name,
                     chrom_id: chrom_id as u32,
@@ -356,7 +356,7 @@ pub fn check_chromosome_agreement<R: Read + Seek>(
                 });
             }
             if base.md5 != this.md5 {
-                return Err(MergerError::ChromosomeMismatch {
+                return Err(PerPositionMergerError::ChromosomeMismatch {
                     sample_idx,
                     sample_name,
                     chrom_id: chrom_id as u32,
@@ -561,13 +561,13 @@ mod tests {
             assert!(pileups.per_sample[1].is_none());
         }
         let err = merger.next().unwrap().unwrap_err();
-        let MergerError::Reader {
+        let PerPositionMergerError::PerSampleReader {
             sample_idx,
             sample_name,
             ..
         } = err
         else {
-            panic!("expected Reader error, got {err:?}");
+            panic!("expected PerSampleReader error, got {err:?}");
         };
         assert_eq!(sample_idx, 1);
         assert_eq!(sample_name, "S1");
@@ -582,13 +582,13 @@ mod tests {
         let a = iter_from(vec![Ok(rec(0, 1))]);
         let b = iter_from(vec![Err(fake_err())]);
         let err = PerPositionMerger::new(vec![a, b], names(2), Vec::new()).unwrap_err();
-        let MergerError::Reader {
+        let PerPositionMergerError::PerSampleReader {
             sample_idx,
             sample_name,
             ..
         } = err
         else {
-            panic!("expected Reader error, got {err:?}");
+            panic!("expected PerSampleReader error, got {err:?}");
         };
         assert_eq!(sample_idx, 1);
         assert_eq!(sample_name, "S1");
@@ -604,7 +604,7 @@ mod tests {
         let first = merger.next().unwrap().unwrap();
         assert_eq!((first.chrom_id, first.pos), (0, 5));
         let err = merger.next().unwrap().unwrap_err();
-        let MergerError::OutOfOrder {
+        let PerPositionMergerError::OutOfOrder {
             sample_idx,
             chrom_id,
             pos,
@@ -656,7 +656,7 @@ mod tests {
         let err = PerPositionMerger::new(vec![a, b], names(1), Vec::new()).unwrap_err();
         assert!(matches!(
             err,
-            MergerError::SampleCountMismatch {
+            PerPositionMergerError::SampleCountMismatch {
                 n_readers: 2,
                 n_sample_names: 1,
             }
@@ -690,7 +690,7 @@ mod tests {
         let r0 = psp_reader_with_header(h0);
         let r1 = psp_reader_with_header(h1);
         let err = check_chromosome_agreement(&[r0, r1]).unwrap_err();
-        let MergerError::ChromosomeMismatch {
+        let PerPositionMergerError::ChromosomeMismatch {
             sample_idx,
             chrom_id,
             detail,
@@ -714,7 +714,7 @@ mod tests {
         let err = check_chromosome_agreement(&[r0, r1]).unwrap_err();
         assert!(matches!(
             err,
-            MergerError::ChromosomeMismatch {
+            PerPositionMergerError::ChromosomeMismatch {
                 sample_idx: 1,
                 chrom_id: 0,
                 ..
@@ -730,7 +730,7 @@ mod tests {
         let r0 = psp_reader_with_header(h0);
         let r1 = psp_reader_with_header(h1);
         let err = check_chromosome_agreement(&[r0, r1]).unwrap_err();
-        let MergerError::ChromosomeMismatch { detail, .. } = err else {
+        let PerPositionMergerError::ChromosomeMismatch { detail, .. } = err else {
             panic!("expected ChromosomeMismatch");
         };
         assert!(detail.contains("name"), "detail = {detail:?}");
@@ -748,7 +748,7 @@ mod tests {
         let r0 = psp_reader_with_header(h0);
         let r1 = psp_reader_with_header(h1);
         let err = check_chromosome_agreement(&[r0, r1]).unwrap_err();
-        let MergerError::ChromosomeMismatch { detail, .. } = err else {
+        let PerPositionMergerError::ChromosomeMismatch { detail, .. } = err else {
             panic!("expected ChromosomeMismatch");
         };
         assert!(detail.contains("count"), "detail = {detail:?}");
