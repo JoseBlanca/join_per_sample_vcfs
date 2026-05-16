@@ -122,16 +122,22 @@ where
     I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure so a new field on `VariantGrouper`
+        // fails to compile here instead of silently being dropped
+        // from the debug rendering.
+        let Self {
+            upstream: _,
+            config,
+            pending_seed,
+            done,
+        } = self;
         f.debug_struct("VariantGrouper")
-            .field("config", &self.config)
+            .field("config", config)
             .field(
                 "pending_seed_at",
-                &self
-                    .pending_seed
-                    .as_ref()
-                    .map(|pp| (pp.chrom_id, pp.pos)),
+                &pending_seed.as_ref().map(|pp| (pp.chrom_id, pp.pos)),
             )
-            .field("done", &self.done)
+            .field("done", done)
             .finish()
     }
 }
@@ -210,7 +216,11 @@ where
         // Initialise the in-progress group.
         let chrom_id = seed.chrom_id;
         let start = seed.pos;
-        let seed_end = start + max_ref_span(&seed) - 1;
+        // `max_ref_span` falls back to `1` when every slot is `None`
+        // (in production the seed-time variant check screens that
+        // case out); `saturating_sub` guards a hypothetical future
+        // caller that exposes `ref_span = 0` from blowing up here.
+        let seed_end = start + max_ref_span(&seed).saturating_sub(1);
 
         // Seed-time cap check — guards against a single record's
         // ref_span alone exceeding the cap. Stage 1's MAX_RECORD_SPAN
@@ -289,16 +299,17 @@ where
 /// distinct allele (i.e. some sample observed a non-REF allele at
 /// this position). Walks slots until the first hit and short-circuits.
 fn has_variant_observation(pp: &PerPositionPileups) -> bool {
-    pp.per_sample
-        .iter()
-        .flatten()
-        .any(|r| r.alleles.len() > 1)
+    pp.per_sample.iter().flatten().any(|r| r.alleles.len() > 1)
 }
 
 /// Maximum `ref_span` across all `Some` slots of `pp`. Falls back to
-/// `1` if every slot is `None` — the merger does not emit such items
-/// in production, but a `0` would underflow the `pos + ref_span - 1`
-/// inclusive-end arithmetic.
+/// `1` if every slot is `None`.
+///
+/// PANIC-FREE: callers gate this behind `has_variant_observation`,
+/// which short-circuits in Phase A on any pp with no `Some` slots, so
+/// the fallback branch is unreachable in production. It is kept for
+/// future direct callers and to keep the `pos + ref_span - 1`
+/// inclusive-end arithmetic well-defined on a hypothetical empty pp.
 fn max_ref_span(pp: &PerPositionPileups) -> u32 {
     pp.per_sample
         .iter()
@@ -399,7 +410,9 @@ mod tests {
         iter_from(pps.into_iter().map(Ok).collect())
     }
 
-    fn collect_groups<I>(grouper: VariantGrouper<I>) -> Result<Vec<OverlappingVarGroup>, GrouperError>
+    fn collect_groups<I>(
+        grouper: VariantGrouper<I>,
+    ) -> Result<Vec<OverlappingVarGroup>, GrouperError>
     where
         I: Iterator<Item = Result<PerPositionPileups, MergerError>>,
     {
@@ -449,9 +462,8 @@ mod tests {
         // 1000 pure-REF positions, then one SNP. Smoke-test that the
         // seed-search loop does not accumulate per-dropped-position
         // state.
-        let mut pps: Vec<PerPositionPileups> = (100..1100)
-            .map(|p| ref_only_pp(0, p, 1, 0))
-            .collect();
+        let mut pps: Vec<PerPositionPileups> =
+            (100..1100).map(|p| ref_only_pp(0, p, 1, 0)).collect();
         pps.push(snp_pp(0, 1100, 1, 0));
         let grouper = VariantGrouper::new(ok_iter(pps));
         let groups = collect_groups(grouper).unwrap();

@@ -23,8 +23,7 @@
 //! pulled, processed in parallel via `rayon::par_iter`, and the
 //! resulting records are emitted one-by-one in input order.
 
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -162,6 +161,7 @@ impl MergedRecord {
 /// closed-form formula is finite for all valid inputs — a degeneracy
 /// signals an internal bug, not a data condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DegeneracyKind {
     NaN,
     PositiveInfinity,
@@ -171,6 +171,10 @@ pub enum DegeneracyKind {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum PerGroupMergerError {
+    // Single-origin: only one `?` in this module surfaces a
+    // `GrouperError`. If a second site is ever added, drop `#[from]`
+    // here and convert explicitly at each site so error provenance
+    // does not silently collapse into the same variant.
     #[error("upstream: {0}")]
     Upstream(#[from] GrouperError),
 
@@ -250,7 +254,10 @@ fn collect_non_decreasing(
 // ---------------------------------------------------------------------
 
 /// Type-erased reference fetcher handle shared across rayon workers.
-type SharedRefFetcher = Arc<dyn RefSeqFetcher + Send + Sync>;
+/// The `Send + Sync` bounds are mandatory because the merger fans
+/// `process_group` out via `rayon::par_iter`; the merger never asks
+/// for `&mut` access, so an immutable shared handle is sufficient.
+pub type SharedRefFetcher = Arc<dyn RefSeqFetcher + Send + Sync>;
 
 /// Streaming, internally-parallel per-group merger.
 pub struct PerGroupMerger<I>
@@ -262,8 +269,9 @@ where
     config: PerGroupMergerConfig,
     /// FIFO of merged records produced by the most recent parallel
     /// batch. The iterator drains this before pulling another batch.
-    /// `None` entries mean "the group merged down to REF only" — the
-    /// merger swallows them per the Stage 4 contract.
+    /// REF-only groups are filtered out inside `refill` before they
+    /// land here, so this queue only carries real records and
+    /// surfaced errors.
     pending: VecDeque<Result<MergedRecord, PerGroupMergerError>>,
     /// Latched after the first surfaced error or upstream exhaustion.
     done: bool,
@@ -274,10 +282,20 @@ where
     I: Iterator<Item = Result<OverlappingVarGroup, GrouperError>>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field on `PerGroupMerger`
+        // fails to compile here so the omission from Debug output is
+        // explicit rather than silent.
+        let Self {
+            upstream: _,
+            ref_fetcher: _,
+            config,
+            pending,
+            done,
+        } = self;
         f.debug_struct("PerGroupMerger")
-            .field("config", &self.config)
-            .field("pending_len", &self.pending.len())
-            .field("done", &self.done)
+            .field("config", config)
+            .field("pending_len", &pending.len())
+            .field("done", done)
             .finish()
     }
 }
@@ -334,6 +352,14 @@ where
 
         let config = self.config;
         let fetcher = Arc::clone(&self.ref_fetcher);
+        // `.collect()` here intentionally does not short-circuit on
+        // `Err`: rayon's truly short-circuiting combinators would
+        // discard the successful prefix, but we need every `Ok`
+        // record at an index lower than the first `Err` to be
+        // emitted in input order before the error latches. Cost:
+        // O(batch_size) wasted work on a systemic failure (e.g. a
+        // bad reference window) where every worker fails the same
+        // way. Acceptable trade-off for a deterministic emit order.
         let results: Vec<Result<Option<MergedRecord>, PerGroupMergerError>> = batch
             .into_par_iter()
             .map(|group| process_group(group, fetcher.as_ref(), &config))
@@ -391,6 +417,37 @@ fn process_group(
     let chrom_id = group.chrom_id;
     let start = group.start;
     let end = group.end;
+    // Defensive: a `ploidy = 0` config would make `genotype_order`
+    // return `[[]]` and force a divide-by-zero in the chain-broken
+    // fallback. Surface it as a typed error rather than producing a
+    // degenerate record.
+    if config.ploidy == 0 {
+        return Err(PerGroupMergerError::RefFetch {
+            chrom_id,
+            start,
+            end,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PerGroupMergerConfig::ploidy must be >= 1",
+            ),
+        });
+    }
+    if end < start {
+        // `OverlappingVarGroup` is a `pub` struct with no
+        // constructor invariant. The cohort's own grouper guarantees
+        // `start <= end`, but a hand-built fixture or alternative
+        // upstream could feed an inverted range; surface it as a
+        // typed error rather than wrapping `u32`.
+        return Err(PerGroupMergerError::RefFetch {
+            chrom_id,
+            start,
+            end,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("group end ({end}) precedes start ({start})"),
+            ),
+        });
+    }
     let span = end - start + 1;
 
     let ref_seq = ref_fetcher.fetch(chrom_id, start, span).map_err(|source| {
@@ -401,18 +458,41 @@ fn process_group(
             source,
         }
     })?;
+    if ref_seq.len() != span as usize {
+        // The trait contract requires exactly `length` bytes; an
+        // alternative fetcher implementation that returns fewer
+        // would otherwise blow up downstream in
+        // `project_local_allele`'s slice arithmetic.
+        return Err(PerGroupMergerError::RefFetch {
+            chrom_id,
+            start,
+            end,
+            source: std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("fetcher returned {} bytes for span {}", ref_seq.len(), span,),
+            ),
+        });
+    }
 
     let n_samples = group
         .records
         .first()
         .map(|pp| pp.per_sample.len())
         .unwrap_or(0);
+    debug_assert!(
+        group
+            .records
+            .iter()
+            .all(|pp| pp.per_sample.len() == n_samples),
+        "OverlappingVarGroup records disagree on per_sample width",
+    );
 
     let unified = unify_alleles(&group, &ref_seq, n_samples);
-    let unified = enforce_max_alleles(unified, n_samples, config.max_alleles);
+    let unified = enforce_max_alleles(unified, config.max_alleles);
 
-    // REF-only ⇒ no record. Compound rejection or cap drop may have
-    // collapsed the merged set to a single allele.
+    // REF-only ⇒ no record. Compound rejection (no entry added) and
+    // the cap path (drops into `dropped_other`) both leave `alleles`
+    // shorter; the OTHER pool never enters as a real allele.
     if unified.alleles.len() < 2 {
         return Ok(None);
     }
@@ -431,12 +511,10 @@ fn process_group(
             ploidy: config.ploidy,
         },
     )?;
-    let _ = n_samples;
 
     let alleles: Vec<MergedAllele> = unified
         .alleles
         .into_iter()
-        .filter(|a| !a.seq.is_empty() || a.is_compound)
         .map(|a| MergedAllele {
             seq: a.seq,
             is_compound: a.is_compound,
@@ -487,11 +565,34 @@ struct UnifiedAllele {
     cap_protected: bool,
 }
 
+/// `alleles[0]` is always REF over the group's reference span.
+/// Subsequent entries are ALTs in insertion order; cross-record
+/// chain-anchored compounds end the list.
 struct UnifiedAlleleSet {
     alleles: Vec<UnifiedAllele>,
-    /// Index of the REF allele in `alleles`; always 0.
-    #[allow(dead_code)]
-    ref_idx: usize,
+    /// Pooled per-sample `(record_idx, local_allele_idx)` sources of
+    /// alleles dropped by the `max_alleles` cap. Empty if the cap did
+    /// not drop anything. Drives the per-sample `other_scalars` in
+    /// the emitted record.
+    dropped_other: DroppedOther,
+}
+
+/// Per-sample pool of cap-dropped allele sources, plus the cohort-wide
+/// count those alleles contributed. Read by `project_scalars` to fold
+/// into `other_scalars`.
+#[derive(Default)]
+struct DroppedOther {
+    /// Indexed by `sample_idx`; each inner vector lists the
+    /// `(record_idx, local_allele_idx)` pairs whose scalars must sum
+    /// into the per-sample OTHER pool. Length is either `0` (cap
+    /// inactive) or `n_samples`.
+    per_sample_sources: Vec<Vec<(usize, usize)>>,
+}
+
+impl DroppedOther {
+    fn is_empty(&self) -> bool {
+        self.per_sample_sources.is_empty()
+    }
 }
 
 fn unify_alleles(
@@ -585,21 +686,21 @@ fn unify_alleles(
         };
         // Record per-sample chain-anchor counts and the per-sample
         // constituent sources (for the scalar-subtraction step).
-        for (sample_idx, sample_info) in candidate.per_sample.iter().enumerate() {
-            alleles[target_idx].chain_anchor_counts[sample_idx] = sample_info.intersection;
+        for (sample_idx, anchor_evidence) in candidate.per_sample.iter().enumerate() {
+            alleles[target_idx].chain_anchor_counts[sample_idx] = anchor_evidence.intersection;
             // The cohort count picks up |chain_id ∩| from each
             // anchoring sample (one observation per spanning read).
-            alleles[target_idx].cohort_count += sample_info.intersection as u64;
-            if sample_info.intersection > 0 {
+            alleles[target_idx].cohort_count += anchor_evidence.intersection as u64;
+            if anchor_evidence.intersection > 0 {
                 alleles[target_idx].per_sample_sources[sample_idx] =
-                    sample_info.constituent_sources.clone();
+                    anchor_evidence.constituent_sources.clone();
             }
         }
     }
 
     UnifiedAlleleSet {
         alleles,
-        ref_idx: 0,
+        dropped_other: DroppedOther::default(),
     }
 }
 
@@ -633,11 +734,11 @@ struct CompoundCandidate {
     /// by the same byte sequence).
     constituents_per_first_anchor: Vec<CompoundConstituent>,
     /// Per-sample info indexed by `sample_idx`.
-    per_sample: Vec<CompoundSampleInfo>,
+    per_sample: Vec<CompoundChainAnchorEvidence>,
 }
 
 #[derive(Default, Clone)]
-struct CompoundSampleInfo {
+struct CompoundChainAnchorEvidence {
     /// |chain-id intersection across the candidate's constituents in
     /// this sample|. Zero if the sample is chain-broken.
     intersection: u32,
@@ -648,53 +749,36 @@ struct CompoundSampleInfo {
 }
 
 /// Enumerate compound candidates by chain-id evidence. A candidate is
-/// keyed by the *projected byte sequence* of its constituent allele
-/// bytes. Per the implementation plan, we first walk each sample's
-/// chain ids to identify which (record_idx, local_allele_idx) sets
-/// co-occur on a single read, then group by the resulting byte
-/// sequence so that distinct samples' proposals over different local
-/// allele indices but identical bytes coalesce into one candidate.
+/// keyed by the canonical tuple of its constituent
+/// `(record_idx, local_allele_idx)` pairs (sorted by `record_idx`).
+/// Under the walker invariant each `(record_idx, local_allele_idx)`
+/// names a unique allele byte sequence inside its record, so this
+/// tuple is 1-1 with the projected compound byte sequence — keying by
+/// it side-steps the byte-collision hazard a `Vec<u8>` key would have
+/// for pathological inputs where two distinct local alleles share
+/// bytes.
 fn detect_compound_candidates(
     group: &OverlappingVarGroup,
     n_samples: usize,
 ) -> Vec<CompoundCandidate> {
-    // Map: byte-sequence-of-candidate → (constituents-from-first-anchor,
-    // per-sample info). Bytes-keying allows the same candidate to be
-    // anchored by multiple samples even if they use different local
-    // allele indices for "the same" allele.
-    let group_start = group.start;
-    let ref_span_total = (group.end - group.start + 1) as usize;
-    // ref_seq is reconstructed lazily inside this function only for
-    // candidate-byte-key derivation; the outer unify pass already has
-    // the FASTA-derived ref_seq, but we don't have it here so we use
-    // a sentinel byte vector of equal length filled with zero. The
-    // resulting byte key is unique per candidate because the
-    // *positions* and *bytes* of the substitutions encode it.
-    //
-    // We do NOT need this byte key to be canonical against the FASTA
-    // ref_seq; we only need two candidates with the same constituent
-    // bytes to map to the same key. Using zeros as the background
-    // makes the key independent of the FASTA, which is what we want.
-    let pseudo_ref = vec![0u8; ref_span_total];
+    let mut candidates: BTreeMap<Vec<(usize, usize)>, CompoundCandidate> = BTreeMap::new();
 
-    let mut candidates: BTreeMap<Vec<u8>, CompoundCandidate> = BTreeMap::new();
-
-    for (sample_idx, sample_info) in
-        (0..n_samples).map(|sample_idx| (sample_idx, sample_chain_proposals(group, sample_idx)))
-    {
-        for proposal in sample_info {
-            // Skip degenerate proposals — these are reads whose chain
-            // ids only touch one record (no compound).
+    for sample_idx in 0..n_samples {
+        for proposal in sample_chain_proposals(group, sample_idx) {
+            // Skip degenerate proposals — chain ids touching only one
+            // record do not propose a compound.
             if proposal.constituents.len() < 2 {
                 continue;
             }
-            // Byte-key derived from constituents' allele bytes
-            // substituted onto a zero-filled ref of the right length.
-            let key = project_compound_onto_group(&pseudo_ref, group, &proposal.constituents);
+            let key: Vec<(usize, usize)> = proposal
+                .constituents
+                .iter()
+                .map(|c| (c.record_idx, c.local_allele_idx))
+                .collect();
 
             let entry = candidates.entry(key).or_insert_with(|| CompoundCandidate {
                 constituents_per_first_anchor: proposal.constituents.clone(),
-                per_sample: vec![CompoundSampleInfo::default(); n_samples],
+                per_sample: vec![CompoundChainAnchorEvidence::default(); n_samples],
             });
             entry.per_sample[sample_idx].intersection += 1;
             if entry.per_sample[sample_idx].constituent_sources.is_empty() {
@@ -705,7 +789,6 @@ fn detect_compound_candidates(
                     .collect();
             }
         }
-        let _ = group_start;
     }
 
     candidates.into_values().collect()
@@ -786,10 +869,18 @@ fn project_compound_onto_group(
     let mut result: Vec<u8> = Vec::new();
     let mut cursor_offset: usize = 0; // index into ref_seq
 
-    let mut constituents_sorted = constituents.to_vec();
-    constituents_sorted.sort_by_key(|c| c.record_idx);
+    // Every caller currently passes a `Vec<CompoundConstituent>`
+    // sorted by `record_idx` (see `sample_chain_proposals`,
+    // `constituent_list`); the debug-assert keeps that contract
+    // visible.
+    debug_assert!(
+        constituents
+            .windows(2)
+            .all(|w| w[0].record_idx <= w[1].record_idx),
+        "project_compound_onto_group expects constituents sorted by record_idx",
+    );
 
-    for c in &constituents_sorted {
+    for c in constituents {
         let pp = &group.records[c.record_idx];
         let local_offset = (pp.pos - group.start) as usize;
         // Find any sample that has this record's allele at
@@ -842,11 +933,7 @@ fn constituent_list(src: &[CompoundConstituent]) -> Vec<CompoundConstituent> {
 // max_alleles cap
 // ---------------------------------------------------------------------
 
-fn enforce_max_alleles(
-    mut unified: UnifiedAlleleSet,
-    _n_samples: usize,
-    max_alleles: usize,
-) -> UnifiedAlleleSet {
+fn enforce_max_alleles(mut unified: UnifiedAlleleSet, max_alleles: usize) -> UnifiedAlleleSet {
     if unified.alleles.len() <= max_alleles {
         return unified;
     }
@@ -867,7 +954,8 @@ fn enforce_max_alleles(
         return unified;
     }
 
-    // Mark prunable indices beyond the budget for removal.
+    // Drop prunable indices beyond the budget. Iterate high-to-low so
+    // the surviving `remove` calls do not shift earlier indices.
     let mut to_remove: Vec<usize> = prunable_indices.split_off(budget_for_prunable);
     to_remove.sort_unstable();
     to_remove.reverse();
@@ -876,35 +964,19 @@ fn enforce_max_alleles(
         .map(|i| unified.alleles.remove(i))
         .collect();
 
-    // Fold removed alleles' per-sample sources into the "<OTHER>"
-    // pool (returned via `other_sources` on the set so the projector
-    // can sum scalars below).
-    unified.alleles[0].cap_protected = true; // keep REF protected
-    // Stash the dropped sources on the REF entry; the scalar
-    // projection step picks them up via a separate field. To avoid
-    // sneaking an extra field through everywhere, we encode the
-    // dropped sources as a synthetic "ghost" UnifiedAllele appended
-    // last; the projector treats it specially.
+    // Sum the dropped per-sample sources into the typed OTHER pool.
+    // No sentinel allele is pushed onto `alleles`; every downstream
+    // helper reads `dropped_other` directly.
     let n_samples = unified.alleles[0].per_sample_sources.len();
-    let mut ghost = UnifiedAllele {
-        seq: Vec::new(),
-        is_compound: false,
-        constituents: Vec::new(),
-        per_sample_sources: vec![Vec::new(); n_samples],
-        chain_anchor_counts: vec![0; n_samples],
-        cohort_count: 0,
-        cap_protected: false,
-    };
+    let mut pool: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_samples];
     for dropped in removed {
         for (s, sources) in dropped.per_sample_sources.into_iter().enumerate() {
-            ghost.per_sample_sources[s].extend(sources);
+            pool[s].extend(sources);
         }
-        ghost.cohort_count += dropped.cohort_count;
     }
-    // The ghost is identified by an empty `seq`. The projector
-    // recognises it and folds its scalars into `other_scalars` rather
-    // than treating it as a real allele.
-    unified.alleles.push(ghost);
+    unified.dropped_other = DroppedOther {
+        per_sample_sources: pool,
+    };
     unified
 }
 
@@ -926,44 +998,46 @@ fn project_scalars(
     unified: &UnifiedAlleleSet,
     n_samples: usize,
 ) -> ScalarProjection {
-    // Detect a trailing OTHER ghost entry (empty seq) introduced by
-    // the cap.
-    let has_ghost = unified
-        .alleles
-        .last()
-        .is_some_and(|a| a.seq.is_empty() && !a.is_compound);
-    let n_kept = if has_ghost {
-        unified.alleles.len() - 1
-    } else {
-        unified.alleles.len()
-    };
+    let n_kept = unified.alleles.len();
 
     let mut scalars: Vec<Vec<AlleleSupportStats>> = (0..n_samples)
         .map(|_| vec![AlleleSupportStats::default(); n_kept])
         .collect();
     let mut other_scalars: Vec<AlleleSupportStats> = vec![AlleleSupportStats::default(); n_samples];
 
-    // First: per-position scalars from each non-compound allele's
-    // sources.
+    // Per-position scalars: sum every non-compound allele's
+    // per-sample sources into `scalars[s][allele_idx]`.
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if allele.is_compound {
             continue;
         }
-        let is_other = has_ghost && allele_idx == n_kept;
         for (sample_idx, sources) in allele.per_sample_sources.iter().enumerate() {
             let mut bucket = AlleleSupportStats::default();
             for &(record_idx, local_allele_idx) in sources {
                 let pp = &group.records[record_idx];
-                let Some(rec) = pp.per_sample[sample_idx].as_ref() else {
+                let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
                     continue;
                 };
                 let support = rec.alleles[local_allele_idx].support;
                 add_stats(&mut bucket, &support);
             }
-            if is_other {
-                add_stats(&mut other_scalars[sample_idx], &bucket);
-            } else {
-                scalars[sample_idx][allele_idx] = bucket;
+            scalars[sample_idx][allele_idx] = bucket;
+        }
+    }
+
+    // OTHER pool: alleles dropped by the `max_alleles` cap. Their
+    // per-sample sources still contribute to the error-cost term in
+    // every genotype's likelihood, so they fold into `other_scalars`
+    // here rather than disappearing entirely.
+    if !unified.dropped_other.is_empty() {
+        for (sample_idx, sources) in unified.dropped_other.per_sample_sources.iter().enumerate() {
+            for &(record_idx, local_allele_idx) in sources {
+                let pp = &group.records[record_idx];
+                let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
+                    continue;
+                };
+                let support = rec.alleles[local_allele_idx].support;
+                add_stats(&mut other_scalars[sample_idx], &support);
             }
         }
     }
@@ -991,7 +1065,7 @@ fn project_scalars(
             let mut bias_basis: u64 = 0;
             for &(record_idx, local_allele_idx) in sources {
                 let pp = &group.records[record_idx];
-                let Some(rec) = pp.per_sample[sample_idx].as_ref() else {
+                let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
                     continue;
                 };
                 let stats = rec.alleles[local_allele_idx].support;
@@ -1028,8 +1102,10 @@ fn project_scalars(
     // Subtract compound contribution from constituents in
     // chain-anchored samples. A read that supports the compound
     // should be attributed to the compound, not double-counted on
-    // each constituent.
-    let n_kept_scalar_cols = scalars.first().map(|row| row.len()).unwrap_or(0);
+    // each constituent. Build an O(1) `(sample, record, local) →
+    // kept_idx` index once so each lookup avoids the previous O(n)
+    // scan over `unified.alleles`.
+    let source_index = build_source_index(unified);
     for allele in &unified.alleles {
         if !allele.is_compound {
             continue;
@@ -1040,37 +1116,36 @@ fn project_scalars(
             }
             for &(record_idx, local_allele_idx) in &allele.per_sample_sources[sample_idx] {
                 let pp = &group.records[record_idx];
-                let Some(rec) = pp.per_sample[sample_idx].as_ref() else {
+                let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
                     continue;
                 };
-                if let Some(constituent_idx) =
-                    find_per_position_allele_idx(unified, record_idx, local_allele_idx, sample_idx)
-                    && constituent_idx < n_kept_scalar_cols
-                {
-                    let support = rec.alleles[local_allele_idx].support;
-                    if support.num_obs == 0 {
-                        continue;
-                    }
-                    let scale = (inter as f64) / (support.num_obs as f64);
-                    let mut to_subtract = AlleleSupportStats {
-                        num_obs: inter.min(support.num_obs),
-                        q_sum: support.q_sum * scale.min(1.0),
-                        fwd: ((support.fwd as f64) * scale.min(1.0)).round() as u32,
-                        placed_left: ((support.placed_left as f64) * scale.min(1.0)).round() as u32,
-                        placed_start: ((support.placed_start as f64) * scale.min(1.0)).round()
-                            as u32,
-                    };
-                    to_subtract.fwd = to_subtract
-                        .fwd
-                        .min(scalars[sample_idx][constituent_idx].fwd);
-                    to_subtract.placed_left = to_subtract
-                        .placed_left
-                        .min(scalars[sample_idx][constituent_idx].placed_left);
-                    to_subtract.placed_start = to_subtract
-                        .placed_start
-                        .min(scalars[sample_idx][constituent_idx].placed_start);
-                    sub_stats(&mut scalars[sample_idx][constituent_idx], &to_subtract);
+                let Some(&constituent_idx) =
+                    source_index.get(&(sample_idx, record_idx, local_allele_idx))
+                else {
+                    continue;
+                };
+                let support = rec.alleles[local_allele_idx].support;
+                if support.num_obs == 0 {
+                    continue;
                 }
+                let scale = (inter as f64) / (support.num_obs as f64);
+                let mut to_subtract = AlleleSupportStats {
+                    num_obs: inter.min(support.num_obs),
+                    q_sum: support.q_sum * scale.min(1.0),
+                    fwd: ((support.fwd as f64) * scale.min(1.0)).round() as u32,
+                    placed_left: ((support.placed_left as f64) * scale.min(1.0)).round() as u32,
+                    placed_start: ((support.placed_start as f64) * scale.min(1.0)).round() as u32,
+                };
+                to_subtract.fwd = to_subtract
+                    .fwd
+                    .min(scalars[sample_idx][constituent_idx].fwd);
+                to_subtract.placed_left = to_subtract
+                    .placed_left
+                    .min(scalars[sample_idx][constituent_idx].placed_left);
+                to_subtract.placed_start = to_subtract
+                    .placed_start
+                    .min(scalars[sample_idx][constituent_idx].placed_start);
+                sub_stats(&mut scalars[sample_idx][constituent_idx], &to_subtract);
             }
         }
     }
@@ -1081,44 +1156,64 @@ fn project_scalars(
     }
 }
 
-/// Look up the index in `unified.alleles` whose sources list
-/// `(record_idx, local_allele_idx)` for `sample_idx`. Returns the
-/// first match; per-position projections per-sample-source point to a
-/// unique merged allele.
-fn find_per_position_allele_idx(
+/// Build a `(sample_idx, record_idx, local_allele_idx) → allele_idx`
+/// map for every non-compound entry of `unified.alleles`. Used by the
+/// compound-subtraction pass to find each constituent's kept per-position
+/// allele in O(1).
+fn build_source_index(
     unified: &UnifiedAlleleSet,
-    record_idx: usize,
-    local_allele_idx: usize,
-    sample_idx: usize,
-) -> Option<usize> {
-    for (idx, allele) in unified.alleles.iter().enumerate() {
+) -> std::collections::HashMap<(usize, usize, usize), usize> {
+    let mut idx: std::collections::HashMap<(usize, usize, usize), usize> =
+        std::collections::HashMap::new();
+    for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if allele.is_compound {
             continue;
         }
-        if allele.per_sample_sources[sample_idx]
-            .iter()
-            .any(|&(r, a)| r == record_idx && a == local_allele_idx)
-        {
-            return Some(idx);
+        for (sample_idx, sources) in allele.per_sample_sources.iter().enumerate() {
+            for &(record_idx, local_allele_idx) in sources {
+                idx.insert((sample_idx, record_idx, local_allele_idx), allele_idx);
+            }
         }
     }
-    None
+    idx
 }
 
 fn add_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
-    into.num_obs += src.num_obs;
-    into.q_sum += src.q_sum;
-    into.fwd += src.fwd;
-    into.placed_left += src.placed_left;
-    into.placed_start += src.placed_start;
+    // Exhaustive destructure so a new field on `AlleleSupportStats`
+    // fails to compile here instead of silently being left out of
+    // the merged total.
+    let AlleleSupportStats {
+        num_obs,
+        q_sum,
+        fwd,
+        placed_left,
+        placed_start,
+    } = *src;
+    into.num_obs = into.num_obs.saturating_add(num_obs);
+    into.q_sum += q_sum;
+    into.fwd = into.fwd.saturating_add(fwd);
+    into.placed_left = into.placed_left.saturating_add(placed_left);
+    into.placed_start = into.placed_start.saturating_add(placed_start);
 }
 
 fn sub_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
-    into.num_obs = into.num_obs.saturating_sub(src.num_obs);
-    into.q_sum = (into.q_sum - src.q_sum).max(0.0);
-    into.fwd = into.fwd.saturating_sub(src.fwd);
-    into.placed_left = into.placed_left.saturating_sub(src.placed_left);
-    into.placed_start = into.placed_start.saturating_sub(src.placed_start);
+    // `q_sum` is a sum of `ln(P_err) ≤ 0` (always non-positive); the
+    // residual after subtracting a less-negative `src.q_sum` must
+    // remain `≤ 0`. The clamp guards against over-subtraction taking
+    // the residual *positive*; it must not be `.max(0.0)`, which
+    // would erase a perfectly valid negative residual.
+    let AlleleSupportStats {
+        num_obs,
+        q_sum,
+        fwd,
+        placed_left,
+        placed_start,
+    } = *src;
+    into.num_obs = into.num_obs.saturating_sub(num_obs);
+    into.q_sum = (into.q_sum - q_sum).min(0.0);
+    into.fwd = into.fwd.saturating_sub(fwd);
+    into.placed_left = into.placed_left.saturating_sub(placed_left);
+    into.placed_start = into.placed_start.saturating_sub(placed_start);
 }
 
 // ---------------------------------------------------------------------
@@ -1128,18 +1223,9 @@ fn sub_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
 fn build_ca_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec<Vec<bool>> {
     // ca_flags[sample_idx][allele_idx] = true iff allele is a
     // compound and the sample is chain-broken at it.
-    let has_ghost = unified
-        .alleles
-        .last()
-        .is_some_and(|a| a.seq.is_empty() && !a.is_compound);
-    let n_kept = if has_ghost {
-        unified.alleles.len() - 1
-    } else {
-        unified.alleles.len()
-    };
-
-    let mut out: Vec<Vec<bool>> = (0..n_samples).map(|_| vec![false; n_kept]).collect();
-    for (allele_idx, allele) in unified.alleles.iter().take(n_kept).enumerate() {
+    let n_alleles = unified.alleles.len();
+    let mut out: Vec<Vec<bool>> = (0..n_samples).map(|_| vec![false; n_alleles]).collect();
+    for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if !allele.is_compound {
             continue;
         }
@@ -1179,17 +1265,8 @@ fn compute_log_likelihoods(
 ) -> Result<Vec<Vec<f64>>, PerGroupMergerError> {
     let n_samples = projection.scalars.len();
     let ploidy = ctx.ploidy;
-    let has_ghost = unified
-        .alleles
-        .last()
-        .is_some_and(|a| a.seq.is_empty() && !a.is_compound);
-    let n_kept = if has_ghost {
-        unified.alleles.len() - 1
-    } else {
-        unified.alleles.len()
-    };
-
-    let genotypes = genotype_order(ploidy, n_kept);
+    let n_alleles = unified.alleles.len();
+    let genotypes = genotype_order(ploidy, n_alleles);
     let mut out: Vec<Vec<f64>> = (0..n_samples).map(|_| vec![0.0; genotypes.len()]).collect();
 
     for (sample_idx, out_row) in out.iter_mut().enumerate() {
@@ -1216,7 +1293,7 @@ fn compute_log_likelihoods(
                     ploidy,
                 )
             } else {
-                standard_log_likelihood(scalars, other, genotype, n_kept, ploidy)
+                standard_log_likelihood(scalars, other, genotype, n_alleles, ploidy)
             };
 
             if value.is_nan() {
@@ -1251,7 +1328,7 @@ fn compute_log_likelihoods(
 /// chain-broken compound in the genotype.
 fn standard_log_likelihood(
     scalars: &[AlleleSupportStats],
-    other: &AlleleSupportStats,
+    other_scalars: &AlleleSupportStats,
     genotype: &[u8],
     n_alleles: usize,
     ploidy: u8,
@@ -1259,7 +1336,7 @@ fn standard_log_likelihood(
     let in_g: Vec<usize> = (0..n_alleles)
         .filter(|&a| genotype.contains(&(a as u8)))
         .collect();
-    let g_set: std::collections::BTreeSet<usize> = in_g.iter().copied().collect();
+    let g_set: BTreeSet<usize> = in_g.iter().copied().collect();
 
     // Error-cost: sum S_s(a) for a ∉ G plus the OTHER pool.
     let mut log_l = 0.0;
@@ -1268,11 +1345,11 @@ fn standard_log_likelihood(
             log_l += stats.q_sum;
         }
     }
-    log_l += other.q_sum;
+    log_l += other_scalars.q_sum;
 
     // Multinomial: log(N!) − Σ log(n_i!) + Σ n_i log(p_i), with the
     // `xlogy` convention: 0·log 0 = 0.
-    let mut p_counts: std::collections::BTreeMap<usize, u32> = std::collections::BTreeMap::new();
+    let mut p_counts: BTreeMap<usize, u32> = BTreeMap::new();
     for &a in genotype {
         *p_counts.entry(a as usize).or_insert(0) += 1;
     }
@@ -1284,6 +1361,12 @@ fn standard_log_likelihood(
         let n_i = scalars[a].num_obs as u64;
         n_total += n_i;
         sum_ln_n_fact += ln_factorial(n_i);
+        // PANIC-FREE: every `a` in `in_g` was filtered by
+        // `genotype.contains(&(a as u8))`, and `p_counts` is built
+        // from `genotype`, so the key is always present. The
+        // `unwrap_or(&0)` is defensive only — if it ever fired, the
+        // `xlogy` below would return `-inf` and the genotype would
+        // be ruled out.
         let p_i = (*p_counts.get(&a).unwrap_or(&0) as f64) / (ploidy as f64);
         sum_n_log_p += xlogy(n_i as f64, p_i);
     }
@@ -1318,7 +1401,7 @@ fn chain_broken_log_likelihood(
     let mut log_l = 0.0;
     for constituent in &compound.constituents {
         let pp = &group.records[constituent.record_idx];
-        let Some(rec) = pp.per_sample[sample_idx].as_ref() else {
+        let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
             // No record from this sample at this constituent position
             // ⇒ zero scalars; the per-position likelihood reduces to
             // the multinomial of an empty sample, which is 0.0 in log
@@ -1326,7 +1409,7 @@ fn chain_broken_log_likelihood(
             continue;
         };
         let n_local_alleles = rec.alleles.len();
-        let mut counts: Vec<u32> = (0..n_local_alleles)
+        let counts: Vec<u32> = (0..n_local_alleles)
             .map(|a| rec.alleles[a].support.num_obs)
             .collect();
         let q_sums: Vec<f64> = (0..n_local_alleles)
@@ -1352,9 +1435,9 @@ fn chain_broken_log_likelihood(
 
         // Error cost at this position: Σ q_sum over local alleles not
         // in per_pos_counts.
-        for a in 0..n_local_alleles {
+        for (a, &q_sum) in q_sums.iter().enumerate() {
             if per_pos_counts[a] == 0 {
-                log_l += q_sums[a];
+                log_l += q_sum;
             }
         }
 
@@ -1367,16 +1450,15 @@ fn chain_broken_log_likelihood(
             .sum();
         let mut sum_ln_n_fact = 0.0;
         let mut sum_n_log_p = 0.0;
-        for a in 0..n_local_alleles {
+        for (a, &count) in counts.iter().enumerate() {
             if per_pos_counts[a] == 0 {
                 continue;
             }
-            let n_i = counts[a] as u64;
+            let n_i = count as u64;
             sum_ln_n_fact += ln_factorial(n_i);
             let p_i = (per_pos_counts[a] as f64) / (n_slots as f64);
             sum_n_log_p += xlogy(n_i as f64, p_i);
         }
-        let _ = &mut counts;
         log_l += ln_factorial(n_total) - sum_ln_n_fact + sum_n_log_p;
     }
 
@@ -2069,5 +2151,208 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!((records[0].start, records[0].end), (100, 100));
         assert_eq!((records[1].start, records[1].end), (200, 200));
+    }
+
+    // ---------- scalar arithmetic helpers ----------
+
+    #[test]
+    fn sub_stats_subtraction_preserves_negative_q_sum_residual() {
+        // Regression: `sub_stats` previously clamped via `.max(0.0)`,
+        // which wiped a legitimate negative residual. `q_sum` is a
+        // sum of `ln(P_err) ≤ 0`; subtracting a less-negative `src`
+        // from a more-negative `into` must produce a more-negative
+        // residual, capped at 0 (over-subtraction).
+        let mut into = AlleleSupportStats::new(10, -50.0, 5, 2, 1);
+        let src = AlleleSupportStats::new(3, -15.0, 1, 0, 0);
+        sub_stats(&mut into, &src);
+        assert_eq!(into.num_obs, 7);
+        assert!(
+            (into.q_sum - (-35.0)).abs() < 1e-9,
+            "q_sum = {} (expected -35.0)",
+            into.q_sum,
+        );
+        assert_eq!(into.fwd, 4);
+        assert_eq!(into.placed_left, 2);
+        assert_eq!(into.placed_start, 1);
+    }
+
+    #[test]
+    fn sub_stats_over_subtraction_clamps_q_sum_to_zero() {
+        // If the scaled subtraction over-runs into.q_sum (a bug or a
+        // pathological scaler), the clamp must hold the residual at
+        // 0, not let it go positive.
+        let mut into = AlleleSupportStats::new(5, -10.0, 2, 1, 0);
+        let src = AlleleSupportStats::new(5, -25.0, 2, 1, 0);
+        sub_stats(&mut into, &src);
+        assert_eq!(into.num_obs, 0);
+        assert_eq!(into.q_sum, 0.0);
+    }
+
+    #[test]
+    fn cap_one_returns_none_no_record_emitted() {
+        // Regression: with `max_alleles = 1`, REF stays protected,
+        // every ALT folds into the ghost OTHER entry; the merged
+        // vector is `[REF, ghost]` (length 2) but the *real* allele
+        // count is 1. Must emit no record.
+        let rec_s0 = record(
+            0,
+            100,
+            vec![
+                allele(b"A", stats(10, -1.0), &[]),
+                allele(b"T", stats(5, -2.0), &[1]),
+                allele(b"G", stats(4, -2.0), &[2]),
+            ],
+        );
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+            records: vec![pp],
+        };
+        let config = PerGroupMergerConfig {
+            ploidy: DEFAULT_PLOIDY,
+            max_alleles: 1,
+            batch_size: DEFAULT_BATCH_SIZE,
+        };
+        let merger = PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
+        let out: Vec<_> = merger.collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(
+            out.is_empty(),
+            "max_alleles=1 must drop the group, got {} records",
+            out.len(),
+        );
+    }
+
+    #[test]
+    fn cap_zero_returns_none_no_record_emitted() {
+        let rec_s0 = record(
+            0,
+            100,
+            vec![
+                allele(b"A", stats(10, -1.0), &[]),
+                allele(b"T", stats(5, -2.0), &[1]),
+            ],
+        );
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+            records: vec![pp],
+        };
+        let config = PerGroupMergerConfig {
+            ploidy: DEFAULT_PLOIDY,
+            max_alleles: 0,
+            batch_size: DEFAULT_BATCH_SIZE,
+        };
+        let merger = PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
+        let out: Vec<_> = merger.collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn add_stats_saturates_on_overflow() {
+        let mut into = AlleleSupportStats::new(u32::MAX - 1, -1.0, 0, 0, 0);
+        let src = AlleleSupportStats::new(10, -2.0, 0, 0, 0);
+        add_stats(&mut into, &src);
+        assert_eq!(into.num_obs, u32::MAX, "saturating add expected");
+        assert!((into.q_sum - (-3.0)).abs() < 1e-9);
+    }
+
+    // ---------- defensive boundary tests ----------
+
+    #[test]
+    fn process_group_returns_error_on_inverted_start_end() {
+        let rec_s0 = record(0, 200, vec![allele(b"A", stats(1, 0.0), &[])]);
+        let pp = pp_one(0, 200, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 200,
+            end: 100,
+            records: vec![pp],
+        };
+        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        match merger.next() {
+            Some(Err(PerGroupMergerError::RefFetch { .. })) => {}
+            other => panic!("expected RefFetch error on inverted span, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_group_returns_error_on_short_fetcher_return() {
+        struct ShortRef;
+        impl RefSeqFetcher for ShortRef {
+            fn fetch(
+                &self,
+                _chrom_id: u32,
+                _start_1based: u32,
+                _length: u32,
+            ) -> Result<Vec<u8>, std::io::Error> {
+                Ok(vec![b'A'])
+            }
+        }
+        let rec_s0 = record(
+            0,
+            100,
+            vec![
+                allele(b"AT", stats(1, 0.0), &[]),
+                allele(b"A", stats(5, -1.0), &[1]),
+            ],
+        );
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 101,
+            records: vec![pp],
+        };
+        let mut merger = PerGroupMerger::new(ok_iter(vec![group]), Arc::new(ShortRef));
+        match merger.next() {
+            Some(Err(PerGroupMergerError::RefFetch { .. })) => {}
+            other => panic!("expected RefFetch error on short fetcher, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_group_returns_error_on_zero_ploidy() {
+        let rec_s0 = record(
+            0,
+            100,
+            vec![
+                allele(b"A", stats(1, 0.0), &[]),
+                allele(b"T", stats(5, -1.0), &[1]),
+            ],
+        );
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+            records: vec![pp],
+        };
+        let config = PerGroupMergerConfig {
+            ploidy: 0,
+            max_alleles: DEFAULT_MAX_ALLELES_PER_RECORD,
+            batch_size: DEFAULT_BATCH_SIZE,
+        };
+        let mut merger =
+            PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
+        match merger.next() {
+            Some(Err(PerGroupMergerError::RefFetch { .. })) => {}
+            other => panic!("expected error on ploidy=0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_records_group_drops() {
+        let group = OverlappingVarGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+            records: vec![],
+        };
+        let merger = PerGroupMerger::new(ok_iter(vec![group]), fetcher(b"A", 100));
+        assert!(merger.collect::<Result<Vec<_>, _>>().unwrap().is_empty());
     }
 }

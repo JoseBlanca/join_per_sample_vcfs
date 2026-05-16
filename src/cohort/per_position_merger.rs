@@ -139,11 +139,22 @@ where
     I: Iterator<Item = Result<PileupRecord, PspReadError>>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure so a new field on `PerPositionMerger`
+        // fails to compile here instead of silently being dropped from
+        // the debug rendering.
+        let Self {
+            readers: _,
+            heads: _,
+            sample_names,
+            chromosomes,
+            last_emitted,
+            done,
+        } = self;
         f.debug_struct("PerPositionMerger")
-            .field("sample_names", &self.sample_names)
-            .field("n_chromosomes", &self.chromosomes.len())
-            .field("last_emitted", &self.last_emitted)
-            .field("done", &self.done)
+            .field("sample_names", sample_names)
+            .field("n_chromosomes", &chromosomes.len())
+            .field("last_emitted", last_emitted)
+            .field("done", done)
             .finish()
     }
 }
