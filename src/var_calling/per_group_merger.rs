@@ -23,7 +23,7 @@
 //! pulled, processed in parallel via `rayon::par_iter`, and the
 //! resulting records are emitted one-by-one in input order.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -1465,15 +1465,31 @@ fn standard_log_likelihood(
     n_alleles: usize,
     ploidy: u8,
 ) -> f64 {
-    let in_g: Vec<usize> = (0..n_alleles)
-        .filter(|&a| genotype.contains(&(a as u8)))
-        .collect();
-    let g_set: BTreeSet<usize> = in_g.iter().copied().collect();
+    // Scratch is sized by `n_alleles ≤ 64`. The `max_alleles` cap
+    // defaults to 6 and would have to be raised an order of magnitude
+    // before the bitmask shape needs widening — pleasant to keep the
+    // allocation off the heap.
+    debug_assert!(
+        n_alleles <= MAX_BITMASK_ALLELES,
+        "standard_log_likelihood assumes n_alleles ≤ {MAX_BITMASK_ALLELES} (u64 bitmask + \
+         fixed-size scratch); got {n_alleles}",
+    );
+
+    // Bit `a` set iff allele `a` appears in `genotype`. Replaces the
+    // previous `BTreeSet<usize>` for the membership check.
+    let g_bits: u64 = genotype.iter().fold(0u64, |acc, &a| acc | (1u64 << a));
+
+    // Per-allele copy count in `genotype`. Replaces the previous
+    // `BTreeMap<usize, u32>`. Entries past `n_alleles - 1` stay zero.
+    let mut p_counts: [u32; MAX_BITMASK_ALLELES] = [0; MAX_BITMASK_ALLELES];
+    for &a in genotype {
+        p_counts[a as usize] += 1;
+    }
 
     // Error-cost: sum S_s(a) for a ∉ G plus the OTHER pool.
     let mut log_l = 0.0;
     for (a, stats) in scalars.iter().enumerate().take(n_alleles) {
-        if !g_set.contains(&a) {
+        if (g_bits >> a) & 1 == 0 {
             log_l += stats.q_sum;
         }
     }
@@ -1481,31 +1497,30 @@ fn standard_log_likelihood(
 
     // Multinomial: log(N!) − Σ log(n_i!) + Σ n_i log(p_i), with the
     // `xlogy` convention: 0·log 0 = 0.
-    let mut p_counts: BTreeMap<usize, u32> = BTreeMap::new();
-    for &a in genotype {
-        *p_counts.entry(a as usize).or_insert(0) += 1;
-    }
-
     let mut n_total: u64 = 0;
     let mut sum_ln_n_fact = 0.0;
     let mut sum_n_log_p = 0.0;
-    for &a in &in_g {
+    for a in 0..n_alleles {
+        if (g_bits >> a) & 1 == 0 {
+            continue;
+        }
         let n_i = scalars[a].num_obs as u64;
         n_total += n_i;
         sum_ln_n_fact += ln_factorial(n_i);
-        // PANIC-FREE: every `a` in `in_g` was filtered by
-        // `genotype.contains(&(a as u8))`, and `p_counts` is built
-        // from `genotype`, so the key is always present. The
-        // `unwrap_or(&0)` is defensive only — if it ever fired, the
-        // `xlogy` below would return `-inf` and the genotype would
-        // be ruled out.
-        let p_i = (*p_counts.get(&a).unwrap_or(&0) as f64) / (ploidy as f64);
+        // PANIC-FREE: `a` is filtered by `g_bits`, which is built from
+        // `genotype`; `p_counts[a]` is therefore non-zero by construction.
+        let p_i = (p_counts[a] as f64) / (ploidy as f64);
         sum_n_log_p += xlogy(n_i as f64, p_i);
     }
 
     log_l += ln_factorial(n_total) - sum_ln_n_fact + sum_n_log_p;
     log_l
 }
+
+/// Width of the per-allele bitmask used by [`standard_log_likelihood`]
+/// and its scratch tables. 64 leaves an order-of-magnitude headroom
+/// over the default `max_alleles` cap of 6.
+const MAX_BITMASK_ALLELES: usize = 64;
 
 /// Chain-broken-compound fallback: decompose to per-position
 /// likelihoods at the compound's constituent positions. Non-constituent
@@ -1601,11 +1616,43 @@ fn xlogy(n: f64, p: f64) -> f64 {
     if n == 0.0 { 0.0 } else { n * p.ln() }
 }
 
-/// `ln(n!)` via iterative summation. Fast enough for the depths Stage 5
-/// sees in practice; switch to `lgamma` if profiling shows this is hot.
-fn ln_factorial(n: u64) -> f64 {
+/// Size of the precomputed `ln(n!)` table. WGS per-allele observation
+/// counts at a single position are typically O(10)–O(100); 1024 leaves
+/// an order-of-magnitude headroom before the iterative fallback kicks
+/// in. Sized for the hot path, not for the absolute worst case.
+const LN_FACTORIAL_TABLE_SIZE: usize = 1024;
+
+/// Precomputed `ln(n!)` for `n ∈ [0, LN_FACTORIAL_TABLE_SIZE)`. Built
+/// once on first access via [`std::sync::LazyLock`]; subsequent calls
+/// to [`ln_factorial`] become an O(1) array load for any `n` in range.
+///
+/// Trade-off vs the previous iterative implementation: a one-time
+/// ~8 KB heap allocation + ~1024 `f64::ln` calls during the first
+/// `ln_factorial` invocation, in exchange for O(1) per-call cost on
+/// the per-sample × per-genotype × per-allele triple loop in
+/// `compute_log_likelihoods`. For depths exceeding the table size the
+/// iterative fallback keeps correctness.
+static LN_FACTORIAL_TABLE: std::sync::LazyLock<Vec<f64>> = std::sync::LazyLock::new(|| {
+    let mut table = Vec::with_capacity(LN_FACTORIAL_TABLE_SIZE);
+    table.push(0.0); // ln(0!) = 0
     let mut acc = 0.0;
-    for i in 2..=n {
+    for i in 1..LN_FACTORIAL_TABLE_SIZE {
+        acc += (i as f64).ln();
+        table.push(acc);
+    }
+    table
+});
+
+/// `ln(n!)` — O(1) for `n < LN_FACTORIAL_TABLE_SIZE` via lookup,
+/// O(n − table_size) for larger `n` via continued iterative summation
+/// from the last tabled value.
+fn ln_factorial(n: u64) -> f64 {
+    let n_usize = n as usize;
+    if n_usize < LN_FACTORIAL_TABLE_SIZE {
+        return LN_FACTORIAL_TABLE[n_usize];
+    }
+    let mut acc = LN_FACTORIAL_TABLE[LN_FACTORIAL_TABLE_SIZE - 1];
+    for i in LN_FACTORIAL_TABLE_SIZE..=n_usize {
         acc += (i as f64).ln();
     }
     acc
@@ -2367,6 +2414,28 @@ mod tests {
         subtract_support(&mut into, &src);
         assert_eq!(into.num_obs, 0);
         assert_eq!(into.q_sum, 0.0);
+    }
+
+    #[test]
+    fn ln_factorial_small_values_via_table() {
+        // ln(0!) = ln(1!) = 0; ln(2!) = ln 2; ln(5!) = ln 120.
+        assert_eq!(ln_factorial(0), 0.0);
+        assert_eq!(ln_factorial(1), 0.0);
+        assert!((ln_factorial(2) - 2.0_f64.ln()).abs() < 1e-12);
+        assert!((ln_factorial(5) - 120.0_f64.ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ln_factorial_iterative_fallback_matches_table_path_at_boundary() {
+        // Boundary check: ln_factorial(LN_FACTORIAL_TABLE_SIZE) must
+        // equal ln_factorial(LN_FACTORIAL_TABLE_SIZE - 1) + ln(N).
+        let table_last = ln_factorial((LN_FACTORIAL_TABLE_SIZE - 1) as u64);
+        let just_past = ln_factorial(LN_FACTORIAL_TABLE_SIZE as u64);
+        let expected = table_last + (LN_FACTORIAL_TABLE_SIZE as f64).ln();
+        assert!(
+            (just_past - expected).abs() < 1e-9,
+            "table/fallback boundary mismatch: {just_past} vs {expected}",
+        );
     }
 
     #[test]
