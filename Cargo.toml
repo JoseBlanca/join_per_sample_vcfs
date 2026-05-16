@@ -89,10 +89,6 @@ name = "pop_var_caller"
 path = "src/main.rs"
 
 [[bench]]
-name = "gvcf_perf"
-harness = false
-
-[[bench]]
 name = "pileup_walker_scaling"
 harness = false
 
