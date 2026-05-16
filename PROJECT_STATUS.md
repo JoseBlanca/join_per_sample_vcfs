@@ -49,7 +49,7 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Status:** shipped
 - **Plan:** [per_sample_caller_cram_input.md](doc/devel/implementation_plans/per_sample_caller_cram_input.md)
 - **Impl report:** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/implementations/per_sample_caller_cram_input_2026-04-29.md)
-- **Latest review / fixes:** [reviews/per_sample_caller_cram_input_2026-04-29.md](doc/devel/reviews/per_sample_caller_cram_input_2026-04-29.md), [fixes_applied_2026-05-01.md](doc/devel/reviews/fixes_applied_2026-05-01.md)
+- **Latest review / fixes:** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/reviews/per_sample_caller_cram_input_2026-04-29.md), [fixes_applied_2026-05-01.md](doc/devel/reports/implementations/fixes_applied_2026-05-01.md)
 - **Open:** none
 
 #### Pileup walker
@@ -61,15 +61,15 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - freebayes-style bench — [plan](doc/devel/implementation_plans/pileup_freebayes_style_benchmark.md), [impl](doc/devel/reports/implementations/pileup_freebayes_bench_c_2026-05-08.md)
   - pull-iterator walker — [plan](doc/devel/implementation_plans/pileup_pull_iterator.md), [impl](doc/devel/reports/implementations/pileup_pull_iterator_2026-05-14.md)
   - unique chain ids — [plan](doc/devel/implementation_plans/unique_chain_ids.md), [impl](doc/devel/reports/implementations/unique_chain_ids_2026-05-14.md)
-- **Latest reviews:** [pileup_2026-05-11.md](doc/devel/reviews/pileup_2026-05-11.md), [perf_pileup_2026-05-12.md](doc/devel/reviews/perf_pileup_2026-05-12.md)
-- **Latest fixes-applied:** [fixes_applied_2026-05-13.md](doc/devel/reviews/fixes_applied_2026-05-13.md)
+- **Latest reviews:** [pileup_2026-05-11.md](doc/devel/reports/reviews/pileup_2026-05-11.md), [perf_pileup_2026-05-12.md](doc/devel/reports/reviews/perf_pileup_2026-05-12.md)
+- **Latest fixes-applied:** [fixes_applied_2026-05-13.md](doc/devel/reports/implementations/fixes_applied_2026-05-13.md)
 - **Open:** none
 
 #### BAQ
 - **Status:** shipped
 - **Plan:** [baq.md](doc/devel/implementation_plans/baq.md)
 - **Impl report:** [baq_2026-05-12.md](doc/devel/reports/implementations/baq_2026-05-12.md)
-- **Latest review / perf review / fixes:** [baq_2026-05-12.md](doc/devel/reviews/baq_2026-05-12.md), [perf_baq_2026-05-12.md](doc/devel/reviews/perf_baq_2026-05-12.md), [fixes_applied_2026-05-12.md](doc/devel/reviews/fixes_applied_2026-05-12.md)
+- **Latest review / perf review / fixes:** [baq_2026-05-12.md](doc/devel/reports/reviews/baq_2026-05-12.md), [perf_baq_2026-05-12.md](doc/devel/reports/reviews/perf_baq_2026-05-12.md), [fixes_applied_2026-05-12.md](doc/devel/reports/implementations/fixes_applied_2026-05-12.md)
 - **Open:** none
 
 #### Pileup → psp seam
@@ -99,8 +99,8 @@ consume. Not a runtime step — an interface.
   - writer/reader bootstrap: [per_sample_pileup_writer_reader.md](doc/devel/implementation_plans/per_sample_pileup_writer_reader.md)
   - psp → pileup roundtrip: [psp_to_pileup.md](doc/devel/implementation_plans/psp_to_pileup.md)
 - **Impl reports:** [psp_reader_2026-05-13.md](doc/devel/reports/implementations/psp_reader_2026-05-13.md), [psp_to_pileup_2026-05-15.md](doc/devel/reports/implementations/psp_to_pileup_2026-05-15.md)
-- **Latest reviews:** [psp_2026-05-13.md](doc/devel/reviews/psp_2026-05-13.md), [psp_reader_2026-05-13.md](doc/devel/reviews/psp_reader_2026-05-13.md), [perf_psp_writer_2026-05-13.md](doc/devel/reviews/perf_psp_writer_2026-05-13.md), [perf_psp_reader_2026-05-13.md](doc/devel/reviews/perf_psp_reader_2026-05-13.md)
-- **Latest fixes-applied:** [fixes_applied_psp_reader_2026-05-13.md](doc/devel/reviews/fixes_applied_psp_reader_2026-05-13.md), [perf_psp_reader_2026-05-13_applied.md](doc/devel/reviews/perf_psp_reader_2026-05-13_applied.md), [perf_psp_writer_2026-05-13_applied.md](doc/devel/reviews/perf_psp_writer_2026-05-13_applied.md)
+- **Latest reviews:** [psp_2026-05-13.md](doc/devel/reports/reviews/psp_2026-05-13.md), [psp_reader_2026-05-13.md](doc/devel/reports/reviews/psp_reader_2026-05-13.md), [perf_psp_writer_2026-05-13.md](doc/devel/reports/reviews/perf_psp_writer_2026-05-13.md), [perf_psp_reader_2026-05-13.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-13.md)
+- **Latest fixes-applied:** [fixes_applied_psp_reader_2026-05-13.md](doc/devel/reports/implementations/fixes_applied_psp_reader_2026-05-13.md), [perf_psp_reader_2026-05-13_applied.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-13_applied.md), [perf_psp_writer_2026-05-13_applied.md](doc/devel/reports/reviews/perf_psp_writer_2026-05-13_applied.md)
 - **Open:** none
 
 ---
@@ -132,8 +132,8 @@ grouper.
 - **Impl report:** [multi_way_per_position_iterator_2026-05-15.md](doc/devel/reports/implementations/multi_way_per_position_iterator_2026-05-15.md)
 - **Code:** [src/var_calling/per_position_merger.rs](src/var_calling/per_position_merger.rs)
 - **Bench:** `var_calling_merger/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
-- **Latest review:** [reviews/per-position-merger_2026-05-15.md](reviews/per-position-merger_2026-05-15.md)
-- **Latest fixes-applied:** bundled into [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md) (cohort run).
+- **Latest review:** [per-position-merger_2026-05-15.md](doc/devel/reports/reviews/per-position-merger_2026-05-15.md)
+- **Latest fixes-applied:** bundled into [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) (cohort run).
 - **Open:** perf review deferred — sampling profile blocked by the
   Claude Code session sandbox (see baseline numbers in
   [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt)).
@@ -143,8 +143,8 @@ grouper.
 - **Plan:** [cohort_variant_grouping.md](doc/devel/implementation_plans/cohort_variant_grouping.md)
 - **Code:** [src/var_calling/variant_grouping.rs](src/var_calling/variant_grouping.rs)
 - **Bench:** `var_calling_grouper/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
-- **Latest review:** [reviews/cohort_2026-05-16.md](reviews/cohort_2026-05-16.md)
-- **Latest fixes-applied:** [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md)
+- **Latest review:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md)
+- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md)
 - **Open:** implementation report not yet written; perf review
   deferred (sampling profile blocked — see Stage 3 entry above).
 
@@ -164,8 +164,8 @@ via rayon.
   Slowest stage per element on the criterion baseline; the natural
   starting point for the deferred perf review.
 - **Impl report:** not yet saved.
-- **Latest review:** [reviews/cohort_2026-05-16.md](reviews/cohort_2026-05-16.md)
-- **Latest fixes-applied:** [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md)
+- **Latest review:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md)
+- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md)
 - **Open:**
   - Implementation report for the Stage 5 merger has not been saved; the
     next `rust-feature-implementation` run for this feature should produce

@@ -207,4 +207,4 @@ This skill does **not** save a standalone report by default, so it does not norm
 - [anthropics/skills — skill-creator SKILL.md](https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md) — pushy-description pattern, progressive disclosure.
 - [anthropics/claude-code — pr-review-toolkit/code-reviewer.md](https://github.com/anthropics/claude-code/blob/main/plugins/pr-review-toolkit/agents/code-reviewer.md) — confidence-threshold reporting rubric (adapted to the four-tier model here).
 - [`std::clone::Clone` documentation](https://doc.rust-lang.org/std/clone/trait.Clone.html) — the load-bearing line "always explicit and may or may not be expensive" justifies the measurement tier.
-- This project's pileup Mi6 fix in [`reviews/pileup_2026-05-09.md`](../reviews/pileup_2026-05-09.md) — worked example of the field-level destructure pattern (Tier B, ~5 KB clone per call dropped).
+- This project's pileup Mi6 fix in [`reviews/pileup_2026-05-09.md`](../../reports/reviews/pileup_2026-05-09.md) — worked example of the field-level destructure pattern (Tier B, ~5 KB clone per call dropped).

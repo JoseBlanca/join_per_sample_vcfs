@@ -507,7 +507,7 @@ oracle gates the same way so the parity tests stay byte-clean,
 mirroring the read-`N` skip pattern in §"N-base handling".
 
 This is finding `G1` from
-[the GATK comparison review](../reviews/pileup_gatk_comparison_2026-05-08.md#g1--adaptor-region-per-base-filter)
+[the GATK comparison review](../reports/reviews/pileup_gatk_comparison_2026-05-08.md#g1--adaptor-region-per-base-filter)
 and ports GATK's
 [`ReadUtils.isBaseInsideAdaptor`](../../gatk/src/main/java/org/broadinstitute/hellbender/utils/read/ReadUtils.java#L1066)
 with one principled deviation: instead of GATK's hardcoded

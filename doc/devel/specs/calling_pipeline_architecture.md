@@ -299,7 +299,7 @@ re-derive — the parameters are empirically calibrated and have
 been stable for ~15 years. Two independent reference
 implementations agreeing on a value is as close as we get to
 validation for an empirically-tuned HMM. See finding `G4` in
-[the GATK comparison review](../reviews/pileup_gatk_comparison_2026-05-08.md#g4--when-we-implement-baq-mirror-samtools--gatk-parameters)
+[the GATK comparison review](../reports/reviews/pileup_gatk_comparison_2026-05-08.md#g4--when-we-implement-baq-mirror-samtools--gatk-parameters)
 for the longer note.
 
 ### Why min indel quality, not freebayes' default summed-with-harmonic

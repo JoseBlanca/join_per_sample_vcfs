@@ -238,7 +238,7 @@ unmapped, geometry inconsistent). The cursor consults it inline
 ([`cigar_cursor.rs:69`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs#L69))
 rather than relying on the read having been pre-trimmed
 upstream. This was the G1 finding from
-[`ia/reviews/pileup_gatk_comparison_2026-05-08.md`](../../reviews/pileup_gatk_comparison_2026-05-08.md).
+[`ia/reviews/pileup_gatk_comparison_2026-05-08.md`](../../devel/reports/reviews/pileup_gatk_comparison_2026-05-08.md).
 
 ### Read-N handling
 
