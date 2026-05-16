@@ -1,9 +1,9 @@
 # `BufferedPeekable` — shared peekable adapter for fallible iterators
 
 **Status:** Draft, 2026-04-27. Specification of a small shared
-utility used by Stage 1 (per-sample caller) and Stage 4 (variant
+utility used by Stage 1 (per-sample pileup) and Stage 4 (variant
 grouping) of the calling pipeline. Lives in `src/` and is referenced
-from [per_sample_caller.md](per_sample_caller.md) and (eventually)
+from [per_sample_pileup.md](per_sample_pileup.md) and (eventually)
 the cohort-side spec.
 
 ## Purpose
@@ -29,9 +29,9 @@ errors trapped inside the buffer, and it never batch-pulls.
 
 Two concrete callers, today and tomorrow:
 
-- **Stage 1, per-sample caller.** Wraps each input CRAM's record
+- **Stage 1, per-sample pileup.** Wraps each input CRAM's record
   iterator in `BufferedPeekable` and merges them by `(ref_id, pos)`
-  with peek-and-scan ([per_sample_caller.md:153](per_sample_caller.md#L153)).
+  with peek-and-scan ([per_sample_pileup.md:153](per_sample_pileup.md#L153)).
   CRAM record iteration is already block-buffered inside noodles, so
   Stage 1 will use a small `buffer_size` (1 is sufficient — the
   buffer is there for peek semantics, not batching).

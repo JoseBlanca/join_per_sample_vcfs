@@ -25,7 +25,7 @@ use super::engine::{
 use super::errors::ProbalnError;
 use super::probaln::probaln_glocal;
 use super::scratch::{ProbalnScratch, Q2P};
-use crate::per_sample_caller::cram_input::CigarOp;
+use crate::per_sample_pileup::cram_input::CigarOp;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -343,10 +343,10 @@ fn set_u_wraps_out_of_band_to_huge_usize() {
 // BaqEngine driver tests — synthetic MappedReads, no SAM parsing.
 // ---------------------------------------------------------------------
 
-use crate::per_sample_caller::cram_input::{
+use crate::per_sample_pileup::cram_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
-use crate::per_sample_caller::pileup::{MateRole, RefSeqFetcher};
+use crate::per_sample_pileup::pileup::{MateRole, RefSeqFetcher};
 
 use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 
@@ -833,8 +833,8 @@ fn baq_skip_counts_bump_is_exhaustive_per_variant() {
 // BaqStream — rayon-parallel adapter tests.
 // ---------------------------------------------------------------------
 
-use crate::per_sample_caller::errors::CramInputError;
-use crate::per_sample_caller::pileup::PreparedRead;
+use crate::per_sample_pileup::errors::CramInputError;
+use crate::per_sample_pileup::pileup::PreparedRead;
 
 use super::stream::BaqStream;
 

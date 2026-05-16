@@ -1,11 +1,11 @@
-//! Stage 1 of the multi-sample calling pipeline: per-sample caller.
+//! Stage 1 of the multi-sample calling pipeline: per-sample pileup.
 //!
-//! This slice of the per-sample caller reads one or more
+//! This slice of the per-sample pileup reads one or more
 //! coordinate-sorted CRAM files belonging to a single sample, validates
 //! their headers against each other and against the reference FASTA,
 //! merges them into a single coordinate-sorted record stream, and
 //! applies the per-read filter cascade specified in
-//! `ia/specs/per_sample_caller.md` §"Read filters".
+//! `ia/specs/per_sample_pileup.md` §"Read filters".
 //!
 //! Downstream stages (BAQ, pileup walking, allele extraction, phase
 //! chains, `.psp` writing) are separate slices and live in sibling

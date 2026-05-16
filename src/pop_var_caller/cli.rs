@@ -15,26 +15,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
-use crate::per_sample_caller::baq::{
+use crate::per_sample_pileup::baq::{
     BaqConfig, BaqSkipCounts, BaqStream, DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
     SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB, SAMTOOLS_ILLUMINA_GAP_OPEN_PROB, prepare_passthrough,
 };
-use crate::per_sample_caller::cram_input::{
+use crate::per_sample_pileup::cram_input::{
     ContigList, CramMergedReader, CramMergedReaderConfig, DEFAULT_MAX_READ_MISMATCH_FRACTION,
     DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH, DEFAULT_MISMATCH_BQ_FLOOR, FilterCounts,
 };
-use crate::per_sample_caller::errors::CramInputError;
-use crate::per_sample_caller::pileup;
-use crate::per_sample_caller::pileup::{
+use crate::per_sample_pileup::errors::CramInputError;
+use crate::per_sample_pileup::pileup;
+use crate::per_sample_pileup::pileup::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH, RunSummary, WalkerConfig,
 };
-use crate::per_sample_caller::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
-use crate::per_sample_caller::psp::header::{
+use crate::per_sample_pileup::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
+use crate::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
-use crate::per_sample_caller::psp::writer::PspWriter;
-use crate::per_sample_caller::ref_fetcher::{ChromBoundaryRefFetcher, SyncRefFetcher};
+use crate::per_sample_pileup::psp::writer::PspWriter;
+use crate::per_sample_pileup::ref_fetcher::{ChromBoundaryRefFetcher, SyncRefFetcher};
 
 pub mod error_bridge;
 use error_bridge::ErrorSheddingAdapter;
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn build_writer_header_errors_on_missing_md5() {
-        use crate::per_sample_caller::cram_input::{ContigEntry, ContigList};
+        use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
         let contigs = ContigList {
             entries: vec![ContigEntry {
                 name: "chr1".into(),
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn build_writer_header_strips_paths_to_basenames() {
-        use crate::per_sample_caller::cram_input::{ContigEntry, ContigList};
+        use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
         let md5 = [0u8; 16];
         let contigs = ContigList {
             entries: vec![ContigEntry {

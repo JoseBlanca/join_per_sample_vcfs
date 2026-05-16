@@ -1,15 +1,15 @@
-//! Cohort-side end-to-end throughput.
+//! Variant-calling pipeline end-to-end throughput.
 //!
 //! Three iterator stages, three bench groups:
 //!
-//! - `cohort_merger/*` — `PerPositionMerger` (Stage 3) k-way merge over
-//!   per-sample synthetic iterators. Drives the inner linear-scan over
-//!   peeked heads.
-//! - `cohort_grouper/*` — `VariantGrouper` (Stage 4) overlap bundler on
-//!   top of the merger. Drives the pure-REF drop loop and the
-//!   transitive extension chain.
-//! - `cohort_per_group_merger/*` — `PerGroupMerger` (Stage 5) allele
-//!   unification + likelihood reconstruction. Drives compound
+//! - `var_calling_merger/*` — `PerPositionMerger` (Stage 3) k-way merge
+//!   over per-sample synthetic iterators. Drives the inner linear-scan
+//!   over peeked heads.
+//! - `var_calling_grouper/*` — `VariantGrouper` (Stage 4) overlap
+//!   bundler on top of the merger. Drives the pure-REF drop loop and
+//!   the transitive extension chain.
+//! - `var_calling_per_group_merger/*` — `PerGroupMerger` (Stage 5)
+//!   allele unification + likelihood reconstruction. Drives compound
 //!   detection, scalar projection, the closed-form likelihood, and the
 //!   rayon-parallel batch path.
 //!
@@ -27,17 +27,17 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
-use merge_per_sample_vcfs::cohort::per_group_merger::{PerGroupMerger, SharedRefFetcher};
-use merge_per_sample_vcfs::cohort::per_position_merger::{
+use merge_per_sample_vcfs::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
+use merge_per_sample_vcfs::var_calling::per_position_merger::{
     MergerError, PerPositionMerger, PerPositionPileups,
 };
-use merge_per_sample_vcfs::cohort::variant_grouping::{
+use merge_per_sample_vcfs::var_calling::variant_grouping::{
     OverlappingVarGroup, VariantGrouper,
 };
-use merge_per_sample_vcfs::per_sample_caller::pileup::{
+use merge_per_sample_vcfs::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, ChainId, PileupRecord, RefSeqFetcher,
 };
-use merge_per_sample_vcfs::per_sample_caller::psp::PspReadError;
+use merge_per_sample_vcfs::per_sample_pileup::psp::PspReadError;
 
 // ---------------------------------------------------------------------
 // Common helpers
@@ -133,7 +133,7 @@ fn names(n: usize) -> Vec<String> {
 }
 
 fn bench_per_position_merger(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cohort_merger");
+    let mut group = c.benchmark_group("var_calling_merger");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(10));
 
@@ -272,7 +272,7 @@ fn build_overlap_extension_pp_stream(
 }
 
 fn bench_variant_grouper(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cohort_grouper");
+    let mut group = c.benchmark_group("var_calling_grouper");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(10));
 
@@ -476,7 +476,7 @@ fn build_compound_groups(
 }
 
 fn bench_per_group_merger(c: &mut Criterion) {
-    let mut group = c.benchmark_group("cohort_per_group_merger");
+    let mut group = c.benchmark_group("var_calling_per_group_merger");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(15));
 

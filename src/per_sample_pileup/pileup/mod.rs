@@ -21,7 +21,7 @@ pub(crate) mod tests;
 
 use std::sync::Arc;
 
-pub use crate::per_sample_caller::cram_input::CigarOp;
+pub use crate::per_sample_pileup::cram_input::CigarOp;
 pub use chain_id_allocator::{ChainId, DEFAULT_MAX_ACTIVE_READS};
 pub use errors::WalkerError;
 pub use walker::{PileupWalker, RunSummary, run};

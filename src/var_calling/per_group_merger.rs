@@ -29,8 +29,8 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::cohort::variant_grouping::{GrouperError, OverlappingVarGroup};
-use crate::per_sample_caller::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
+use crate::var_calling::variant_grouping::{GrouperError, OverlappingVarGroup};
+use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
 
 /// Maximum number of alleles retained in a single merged record
 /// before the cap drops the lowest-cohort-count alleles into the
@@ -1488,8 +1488,8 @@ fn ln_factorial(n: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cohort::per_position_merger::PerPositionPileups;
-    use crate::per_sample_caller::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::var_calling::per_position_merger::PerPositionPileups;
+    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
 
     // ---------- mock ref fetcher ----------
 

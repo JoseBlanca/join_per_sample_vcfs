@@ -10,9 +10,9 @@ use std::collections::VecDeque;
 
 use rayon::prelude::*;
 
-use crate::per_sample_caller::cram_input::MappedRead;
-use crate::per_sample_caller::errors::CramInputError;
-use crate::per_sample_caller::pileup::{PreparedRead, RefSeqFetcher};
+use crate::per_sample_pileup::cram_input::MappedRead;
+use crate::per_sample_pileup::errors::CramInputError;
+use crate::per_sample_pileup::pileup::{PreparedRead, RefSeqFetcher};
 
 use super::BaqConfig;
 use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};

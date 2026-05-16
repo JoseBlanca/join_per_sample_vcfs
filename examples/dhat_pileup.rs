@@ -23,7 +23,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::io;
 use std::sync::Arc;
 
-use merge_per_sample_vcfs::per_sample_caller::pileup::{
+use merge_per_sample_vcfs::per_sample_pileup::pileup::{
     CigarOp, MateRole, PreparedRead, RefSeqFetcher, WalkerConfig, run,
 };
 

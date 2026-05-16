@@ -85,7 +85,7 @@ ambiguous.
    work" function from a "set up the inputs" function: the work
    function takes already-prepared streams or buffers; a thin
    convenience wrapper opens the files and calls into it.
-   - *Example:* the per-sample caller's CRAM reader exposes
+   - *Example:* the per-sample pileup's CRAM reader exposes
      `new(paths, fasta, config)` for the convenient case, and
      `pub(crate) from_open_crams(streams, contigs, sample, config)`
      for the testable core. The merge / order / dedup / filter logic

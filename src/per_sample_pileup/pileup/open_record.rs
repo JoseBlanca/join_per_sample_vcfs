@@ -980,7 +980,7 @@ pub(super) struct ReadContribution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_caller::pileup::tests::MockFasta;
+    use crate::per_sample_pileup::pileup::tests::MockFasta;
 
     fn fa(s: &str) -> MockFasta {
         MockFasta::new(s)

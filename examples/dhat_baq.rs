@@ -21,9 +21,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::io;
 
-use merge_per_sample_vcfs::per_sample_caller::baq::{BaqConfig, BaqEngine, BaqOutcome};
-use merge_per_sample_vcfs::per_sample_caller::cram_input::{CigarOp, MappedRead};
-use merge_per_sample_vcfs::per_sample_caller::pileup::RefSeqFetcher;
+use merge_per_sample_vcfs::per_sample_pileup::baq::{BaqConfig, BaqEngine, BaqOutcome};
+use merge_per_sample_vcfs::per_sample_pileup::cram_input::{CigarOp, MappedRead};
+use merge_per_sample_vcfs::per_sample_pileup::pileup::RefSeqFetcher;
 
 /// Constant-base reference; mirrors the bench's `ConstRefFetcher`.
 struct ConstRefFetcher {

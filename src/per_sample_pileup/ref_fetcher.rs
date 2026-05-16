@@ -210,8 +210,8 @@ fn fetch_from_repository(
 mod tests {
     use super::*;
 
-    use crate::per_sample_caller::cram_files::{ContigSpec, build_fasta};
-    use crate::per_sample_caller::cram_input::{ContigEntry, ContigList};
+    use crate::per_sample_pileup::cram_files::{ContigSpec, build_fasta};
+    use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
 
     fn contig_list(entries: &[(&str, u64)]) -> ContigList {
         ContigList {

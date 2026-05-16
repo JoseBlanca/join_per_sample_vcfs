@@ -1,7 +1,9 @@
-//! Cohort-side stages of the multi-sample SNP caller.
+//! Variant-calling stages (Stages 3–6).
 //!
-//! Sits between Stage 2 (the per-sample `.psp` reader) and Stages 3-6
-//! (DUST filter, grouping, per-group, posterior). See
+//! Sits between Stage 2 (the per-sample `.psp` reader) and the
+//! posterior engine: DUST filter, grouping, per-group merger,
+//! posterior. Used in cohort mode across many samples, but the same
+//! code path applies to a single sample. See
 //! `doc/devel/specs/calling_pipeline_architecture.md` for the full
 //! stage breakdown.
 //!

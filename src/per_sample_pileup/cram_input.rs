@@ -13,7 +13,7 @@ use noodles_fasta as fasta;
 use noodles_sam as sam;
 
 use crate::buffered_peekable::BufferedPeekable;
-use crate::per_sample_caller::errors::CramInputError;
+use crate::per_sample_pileup::errors::CramInputError;
 
 // ---------------------------------------------------------------------
 // Defaults
@@ -609,7 +609,7 @@ type Locus = (usize, u64);
 /// Identifying fingerprint of a mapped read: the four fields whose
 /// equality defines "same read" for duplicate detection — qname,
 /// SAM flags, contig-list index, and 1-based position. See
-/// `ia/specs/per_sample_caller.md` §"Duplicate-read detection across
+/// `ia/specs/per_sample_pileup.md` §"Duplicate-read detection across
 /// CRAMs" for the rationale behind these specific fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadFingerprint {
@@ -881,7 +881,7 @@ impl CramMergedReader {
 ///
 /// **Fuse-on-error semantics.** Once `next()` returns `Some(Err(_))`,
 /// every subsequent call returns `None`. This matches the spec's
-/// "halts Stage 1" requirement (`ia/specs/per_sample_caller.md`
+/// "halts Stage 1" requirement (`ia/specs/per_sample_pileup.md`
 /// §"Errors") and lets callers use the iterator with any consumer
 /// (`for`, `collect`, `try_fold`) without separate "stop on first
 /// error" bookkeeping.
@@ -1573,7 +1573,7 @@ fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
 /// decoding; `ref_seq` is the reference slice covering
 /// `[read.pos, read.pos + cigar_ref_span(cigar))`. Indexing into
 /// these slices uses the standard CIGAR semantics — see
-/// [`crate::per_sample_caller::pileup::decompose`] for the
+/// [`crate::per_sample_pileup::pileup::decompose`] for the
 /// reference walk pattern this function mirrors.
 fn read_exceeds_mismatch_fraction(
     cigar: &[CigarOp],
@@ -1886,7 +1886,7 @@ fn cigar_to_ops(cigar: &sam::alignment::record_buf::Cigar) -> Vec<CigarOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_caller::record_specs::{
+    use crate::per_sample_pileup::record_specs::{
         RecordSpec, default_contigs, open_cram_from_records, record_spec,
     };
 
@@ -3574,7 +3574,7 @@ mod tests {
 
     // --- Group B: via new (real CRAM + FASTA) ------------------------
 
-    use crate::per_sample_caller::cram_files::{
+    use crate::per_sample_pileup::cram_files::{
         ContigSpec, HeaderOverrides, build_cram, build_cram_with_major_version, build_fasta,
     };
 

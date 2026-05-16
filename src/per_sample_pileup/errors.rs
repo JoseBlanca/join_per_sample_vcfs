@@ -1,6 +1,6 @@
-//! Errors produced by the per-sample caller's CRAM input slice.
+//! Errors produced by the per-sample pileup's CRAM input slice.
 //!
-//! See `ia/specs/per_sample_caller.md` §"Errors" for the catalogue of
+//! See `ia/specs/per_sample_pileup.md` §"Errors" for the catalogue of
 //! failure modes this enum covers.
 
 use std::path::PathBuf;

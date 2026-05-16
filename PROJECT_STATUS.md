@@ -6,7 +6,7 @@ Skills and agents are instructed to leave it untouched.
 -->
 > **About this project.** Multi-sample SNP caller, mid-pivot from a
 > gVCF-merger to a six-stage Bayesian pipeline:
-> per-sample caller → `.psp` artefact → DUST filter → variant grouping →
+> per-sample pileup → `.psp` artefact → DUST filter → variant grouping →
 > per-group merger → posterior engine. The authoritative design document is
 > [doc/devel/specs/calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md);
 > read it before anything else. Companion design context is in
@@ -22,7 +22,8 @@ Skills and agents are instructed to leave it untouched.
 > project manager (next-task)._
 >
 > - **Last completed task:** Cohort criterion bench scaffold landed on
->   2026-05-16 ([benches/cohort_perf.rs](benches/cohort_perf.rs)); the
+>   2026-05-16 ([benches/var_calling_perf.rs](benches/var_calling_perf.rs),
+>   originally named `benches/cohort_perf.rs`); the
 >   perf review itself was *deferred* because the session's seccomp
 >   filter blocks `perf_event_open` and no sampling profile could be
 >   captured. Baseline criterion numbers saved at
@@ -40,7 +41,7 @@ Skills and agents are instructed to leave it untouched.
 
 Stage descriptions are one-line reminders; the spec is authoritative.
 
-### Stage 1 — per-sample caller (BAM → `.psp`)
+### Stage 1 — per-sample pileup (BAM → `.psp`)
 
 Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
@@ -53,7 +54,7 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
 #### Pileup walker
 - **Status:** shipped
-- **Code:** [src/per_sample_caller/pileup/](src/per_sample_caller/pileup/)
+- **Code:** [src/per_sample_pileup/pileup/](src/per_sample_pileup/pileup/)
 - **Subfeature plans & impl reports:**
   - lazy CIGAR — [plan](doc/devel/implementation_plans/pileup_lazy_cigar.md), [impl](doc/devel/reports/implementations/pileup_lazy_cigar_2026-05-07.md)
   - fold cache — [impl](doc/devel/reports/implementations/pileup_fold_cache_2026-05-07.md)
@@ -73,7 +74,7 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
 #### Pileup → psp seam
 - **Status:** shipped
-- **Code:** [src/per_sample_caller/pileup_to_psp.rs](src/per_sample_caller/pileup_to_psp.rs)
+- **Code:** [src/per_sample_pileup/pileup_to_psp.rs](src/per_sample_pileup/pileup_to_psp.rs)
 - **Impl report:** [pileup_to_psp_seam_2026-05-14.md](doc/devel/reports/implementations/pileup_to_psp_seam_2026-05-14.md)
 - **Open:** none
 
@@ -129,8 +130,8 @@ grouper.
 - **Status:** shipped
 - **Plan:** [multi_way_per_position_iterator.md](doc/devel/implementation_plans/multi_way_per_position_iterator.md)
 - **Impl report:** [multi_way_per_position_iterator_2026-05-15.md](doc/devel/reports/implementations/multi_way_per_position_iterator_2026-05-15.md)
-- **Code:** [src/cohort/per_position_merger.rs](src/cohort/per_position_merger.rs)
-- **Bench:** `cohort_merger/*` in [benches/cohort_perf.rs](benches/cohort_perf.rs)
+- **Code:** [src/var_calling/per_position_merger.rs](src/var_calling/per_position_merger.rs)
+- **Bench:** `var_calling_merger/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
 - **Latest review:** [reviews/per-position-merger_2026-05-15.md](reviews/per-position-merger_2026-05-15.md)
 - **Latest fixes-applied:** bundled into [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md) (cohort run).
 - **Open:** perf review deferred — sampling profile blocked by the
@@ -140,8 +141,8 @@ grouper.
 #### Variant grouper (Stage 4 bundler)
 - **Status:** fixes-applied (2026-05-16); no separate implementation report
 - **Plan:** [cohort_variant_grouping.md](doc/devel/implementation_plans/cohort_variant_grouping.md)
-- **Code:** [src/cohort/variant_grouping.rs](src/cohort/variant_grouping.rs)
-- **Bench:** `cohort_grouper/*` in [benches/cohort_perf.rs](benches/cohort_perf.rs)
+- **Code:** [src/var_calling/variant_grouping.rs](src/var_calling/variant_grouping.rs)
+- **Bench:** `var_calling_grouper/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
 - **Latest review:** [reviews/cohort_2026-05-16.md](reviews/cohort_2026-05-16.md)
 - **Latest fixes-applied:** [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md)
 - **Open:** implementation report not yet written; perf review
@@ -158,8 +159,8 @@ via rayon.
 #### Per-group merger (allele unification + likelihood)
 - **Status:** fixes-applied (2026-05-16)
 - **Plan:** [cohort_per_group_merger.md](doc/devel/implementation_plans/cohort_per_group_merger.md)
-- **Code:** [src/cohort/per_group_merger.rs](src/cohort/per_group_merger.rs)
-- **Bench:** `cohort_per_group_merger/*` in [benches/cohort_perf.rs](benches/cohort_perf.rs).
+- **Code:** [src/var_calling/per_group_merger.rs](src/var_calling/per_group_merger.rs)
+- **Bench:** `var_calling_per_group_merger/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs).
   Slowest stage per element on the criterion baseline; the natural
   starting point for the deferred perf review.
 - **Impl report:** not yet saved.

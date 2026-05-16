@@ -15,8 +15,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::per_sample_caller::errors::CramInputError;
-use crate::per_sample_caller::pileup::PreparedRead;
+use crate::per_sample_pileup::errors::CramInputError;
+use crate::per_sample_pileup::pileup::PreparedRead;
 
 /// Shared handle the orchestrator keeps so it can `take()` the
 /// stashed error once the walker exhausts. Cheap to clone (one
@@ -95,8 +95,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::per_sample_caller::cram_input::CigarOp;
-    use crate::per_sample_caller::pileup::MateRole;
+    use crate::per_sample_pileup::cram_input::CigarOp;
+    use crate::per_sample_pileup::pileup::MateRole;
 
     fn dummy_prepared(pos: u32) -> PreparedRead {
         PreparedRead {

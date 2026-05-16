@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
-use crate::per_sample_caller::cram_input::{
+use crate::per_sample_pileup::cram_input::{
     CigarOp, FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
-use crate::per_sample_caller::pileup::{MateRole, PreparedRead, RefSeqFetcher};
+use crate::per_sample_pileup::pileup::{MateRole, PreparedRead, RefSeqFetcher};
 
 use super::BaqConfig;
 use super::probaln::probaln_glocal;
@@ -472,7 +472,7 @@ fn derive_mate_role(flag: u16) -> MateRole {
 /// `phred_to_ln_perr` helper in the pileup walker's `open_record.rs`;
 /// kept local here so the BAQ stage does not depend on that module's
 /// internal visibility. Candidate for promotion to a shared
-/// `per_sample_caller/phred.rs` module.
+/// `per_sample_pileup/phred.rs` module.
 fn phred_to_ln_perr(q: u8) -> f64 {
     if q == 0 {
         return 0.0;

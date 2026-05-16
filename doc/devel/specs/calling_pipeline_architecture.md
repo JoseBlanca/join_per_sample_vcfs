@@ -30,11 +30,11 @@ design draws on.
 ## Pipeline overview
 
 ```
-BAM_i  ──► Stage 1: per-sample caller ──► sample_i.psp (Stage 2 format) ┐
+BAM_i  ──► Stage 1: per-sample pileup ──► sample_i.psp (Stage 2 format) ┐
                                                                           │
-BAM_j  ──► Stage 1: per-sample caller ──► sample_j.psp (Stage 2 format) ├─► multi-way per-position iterator
+BAM_j  ──► Stage 1: per-sample pileup ──► sample_j.psp (Stage 2 format) ├─► multi-way per-position iterator
                                                                           │             │
-BAM_k  ──► Stage 1: per-sample caller ──► sample_k.psp (Stage 2 format) ┘             ▼
+BAM_k  ──► Stage 1: per-sample pileup ──► sample_k.psp (Stage 2 format) ┘             ▼
                                                                            Stage 3: DUST filter ◄── reference FASTA
                                                                                         │
                                                                                         ▼
@@ -49,7 +49,7 @@ BAM_k  ──► Stage 1: per-sample caller ──► sample_k.psp (Stage 2 form
 
 Six stages total:
 
-- **Stage 1 — per-sample caller.** Runs once per sample, reads the BAM,
+- **Stage 1 — per-sample pileup.** Runs once per sample, reads the BAM,
   writes one `.psp` (per-sample file) artefact.
 - **Stage 2 — per-sample file contract.** Specifies the `.psp` format
   that Stage 1 produces. Not a runtime step — it is the interface
@@ -88,14 +88,14 @@ they need without depending on the whole pipeline's surface area.
 
 Existing config structs:
 
-- **`per_sample_caller::cram_input::CramMergedReaderConfig`** —
+- **`per_sample_pileup::cram_input::CramMergedReaderConfig`** —
   Stage 1 input filter knobs. Currently holds: `min_mapq`
   (`Option<u8>`), `min_read_length` (`Option<u32>`),
   `drop_qc_fail` (`bool`), `drop_duplicate` (`bool`). Other flag
   classes (unmapped, secondary, supplementary) are unconditionally
   dropped and are *not* exposed as toggles — see the doc-comment
   on the struct for the rationale.
-- **`per_sample_caller::pileup::WalkerConfig`** — Stage 1 pileup
+- **`per_sample_pileup::pileup::WalkerConfig`** — Stage 1 pileup
   walker knobs. Currently holds the per-column depth caps
   `max_snp_column_depth` (default 8000) and
   `max_indel_column_depth` (default 250), adopted from samtools'
@@ -121,7 +121,7 @@ where they have empirical grounding, with a comment naming the
 source so a future engineer revisiting on real data can see where
 the number came from.
 
-## Stage 1 — per-sample caller
+## Stage 1 — per-sample pileup
 
 ### Purpose
 
@@ -130,7 +130,7 @@ compute a likelihood for this sample against any allele that may later be
 introduced into the merged variant set by other samples.
 
 Stage 1 is built in-tool rather than wrapped around an existing
-per-sample caller (freebayes, bcftools mpileup). The output format
+per-sample pileup (freebayes, bcftools mpileup). The output format
 is the custom `.psp` (see Stage 2), which no existing caller
 emits; the quality adjustment we want is BAQ applied inline and
 parallelised across reads (see §"Why BAQ in-process" below), which
@@ -224,7 +224,7 @@ BAQ)`. Then compute per-read likelihoods in freebayes' style.
 - Fixes the indel-adjacent misplacement signal at modest cost.
 - Per-read and embarrassingly parallel — unlike `samtools calmd`,
   which is single-threaded and slow enough to be a pipeline bottleneck
-  in practice. Implementing BAQ directly inside our per-sample caller
+  in practice. Implementing BAQ directly inside our per-sample pileup
   lets us parallelise it across reads natively (rayon), amortise it
   with BAM decoding, and avoid the calmd roundtrip.
 - Keeps the per-read likelihood simple: BAQ-adjusted BQ flows into
@@ -262,7 +262,7 @@ reads. In practice it becomes a bottleneck at scale — a per-sample
 preprocessing cost that has to be paid serially before our tool can
 start. Since the BAQ algorithm itself is embarrassingly parallel (a
 local HMM per read, independent of every other read), implementing it
-inside our per-sample caller lets us:
+inside our per-sample pileup lets us:
 
 - parallelise across reads with rayon;
 - pipeline it with BAM decompression and CIGAR walking;

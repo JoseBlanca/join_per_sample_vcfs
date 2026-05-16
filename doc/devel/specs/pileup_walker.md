@@ -4,7 +4,7 @@
 the sequential walker that turns a coordinate-sorted stream of
 prepared (filtered + BAQ-adjusted) reads into the per-position
 records consumed by the Stage 2 encoder. Slots underneath
-[per_sample_caller.md](per_sample_caller.md), which already commits
+[per_sample_pileup.md](per_sample_pileup.md), which already commits
 to the high-level Stage 1 shape, the input/output contract, the
 five-scalar layout, the phase-chain semantics, the mate-overlap
 rule, and the per-read filter cascade. This document fills in the
@@ -21,7 +21,7 @@ or detail to confirm).
 ## Purpose and scope
 
 The pileup walker is the **single-threaded core** of Stage 1
-([per_sample_caller.md §"Parallelism"](per_sample_caller.md)).
+([per_sample_pileup.md §"Parallelism"](per_sample_pileup.md)).
 Its job is to walk the stream of prepared reads, accumulate
 per-allele evidence at every reference position covered by at
 least one read, and emit a sequence of per-position records to
@@ -47,10 +47,10 @@ Inside this scope:
 
 Outside this scope:
 - CRAM decoding and multi-file merge — handled in
-  [`cram_input`](../../src/per_sample_caller/cram_input.rs).
+  [`cram_input`](../../src/per_sample_pileup/cram_input.rs).
 - Per-read filtering (flags, MAPQ, etc.) — runs upstream of the
   walker as part of the parallel filter+BAQ stage
-  ([per_sample_caller.md §"Read filters"](per_sample_caller.md)).
+  ([per_sample_pileup.md §"Read filters"](per_sample_pileup.md)).
 - BAQ HMM — runs upstream alongside filtering. The walker only
   ever sees BAQ-capped base qualities. BAQ is its own spec.
 - Byte-level encoding to disk — Stage 2 (`psp_writer`).
@@ -358,7 +358,7 @@ kicks in. Small enough that excess memory pressure is
 negligible.
 
 **Cross-thread requirement.** Per
-[per_sample_caller.md §"Parallelism"](per_sample_caller.md),
+[per_sample_pileup.md §"Parallelism"](per_sample_pileup.md),
 the Stage 2 encoder runs on a separate thread from the walker
 so that zstd compression overlaps with walker work. The
 channel is the only synchronisation point between them; the
@@ -371,7 +371,7 @@ thread boundary cleanly.
 > **Implementation note (2026-05-07).** The walker no longer
 > stores the eager `events: Vec<ReadEvent>` per active read.
 > Instead, each `ActiveRead` carries a `CigarCursor` (in
-> `src/per_sample_caller/pileup/cigar_cursor.rs`) — a small
+> `src/per_sample_pileup/pileup/cigar_cursor.rs`) — a small
 > per-CIGAR-op offset table that emits events on demand via
 > `events_at(walker_pos, &read)` (anchor-at-pos) or
 > `events_overlapping(lo, hi, &read)` (footprint-overlap).
@@ -423,9 +423,9 @@ reference position. This applies uniformly regardless of what
 the reference says: read=`N` at ref=`A` is silent, read=`N` at
 ref=`N` is silent, read=`N` at ref=`G` is silent. The cursor's
 emit sites in
-[`cigar_cursor.rs`](../../src/per_sample_caller/pileup/cigar_cursor.rs)
+[`cigar_cursor.rs`](../../src/per_sample_pileup/pileup/cigar_cursor.rs)
 all gate on `base != b'N'`; the test-only
-[`decompose`](../../src/per_sample_caller/pileup/decompose.rs)
+[`decompose`](../../src/per_sample_pileup/pileup/decompose.rs)
 oracle gates the same way so the parity tests stay byte-clean.
 
 This matches freebayes' practical behaviour: freebayes emits
@@ -482,7 +482,7 @@ in the same way it drops events for read=`N`.
 
 The boundary is computed once per read at `cram_input` admission
 time (see
-[`compute_adaptor_boundary`](../../src/per_sample_caller/cram_input.rs))
+[`compute_adaptor_boundary`](../../src/per_sample_pileup/cram_input.rs))
 and stored on `MappedRead`/`PreparedRead` as
 `adaptor_boundary: Option<u32>`:
 
@@ -500,9 +500,9 @@ sequenced past the molecule's end; nothing to filter.
 
 The cursor's Match-emit sites (`events_at` and
 `events_overlapping` in
-[`cigar_cursor.rs`](../../src/per_sample_caller/pileup/cigar_cursor.rs))
+[`cigar_cursor.rs`](../../src/per_sample_pileup/pileup/cigar_cursor.rs))
 gate every emission on `!base_in_adaptor(ref_pos, read)`. The
-test-only [`decompose`](../../src/per_sample_caller/pileup/decompose.rs)
+test-only [`decompose`](../../src/per_sample_pileup/pileup/decompose.rs)
 oracle gates the same way so the parity tests stay byte-clean,
 mirroring the read-`N` skip pattern in §"N-base handling".
 
@@ -871,8 +871,8 @@ indels"):
 
 Disagreement (different bases) follows the same rule: higher
 BQ wins, no extra downgrade
-([per_sample_caller.md §"Disagreement at an
-overlap position"](per_sample_caller.md)).
+([per_sample_pileup.md §"Disagreement at an
+overlap position"](per_sample_pileup.md)).
 
 #### Mate overlap on indels
 
@@ -882,7 +882,7 @@ Two cases:
   as one observation, not two. Assign the higher-BQ-proxy event
   to the allele bucket; drop the other. The allele's
   `chain_slots` still gets the (single, shared) `chain_slot_id`
-  for the pair. The per-sample caller spec covers per-position
+  for the pair. The per-sample pileup spec covers per-position
   SNP overlap explicitly but is silent on indel overlap; treating
   the pair as one observation is the consistent extension of
   that rule.
@@ -1097,7 +1097,7 @@ The chain-id allocator and the walker are mostly independent: the
 allocator doesn't know what an open record is, only that reads
 enter and leave the active set, and it hands the walker a fresh
 `u64` for every new read (or read-pair). The implementation is
-[`chain_id_allocator.rs`](../../src/per_sample_caller/pileup/chain_id_allocator.rs);
+[`chain_id_allocator.rs`](../../src/per_sample_pileup/pileup/chain_id_allocator.rs);
 the rationale for unique-per-file `u64` ids over the earlier
 recycled `u16` design is in
 [`feature_implementation_plans/unique_chain_ids.md`](../feature_implementation_plans/unique_chain_ids.md).
@@ -1301,7 +1301,7 @@ sample name and chromosome.
 ## Run-summary counters
 
 Reported on stderr at end of run, per
-[per_sample_caller.md §"Errors"](per_sample_caller.md):
+[per_sample_pileup.md §"Errors"](per_sample_pileup.md):
 
 | Counter | Meaning |
 |---|---|
@@ -1388,7 +1388,7 @@ Resolved against freebayes (consultation 2026-05-06,
   has no explicit mate-overlap logic, so there's no upstream
   precedent — this is a deliberate project choice extending
   the per-position SNP overlap rule from
-  [per_sample_caller.md §"Mate-overlap handling"](per_sample_caller.md)
+  [per_sample_pileup.md §"Mate-overlap handling"](per_sample_pileup.md)
   to indels. See §"Mate overlap on indels" for the cases.
 
 No questions remain open before implementation.
@@ -1396,11 +1396,11 @@ No questions remain open before implementation.
 ## Module layout
 
 The pileup walker is one Rust module
-(`src/per_sample_caller/pileup_walker.rs`), but internally
+(`src/per_sample_pileup/pileup_walker.rs`), but internally
 splits into a few small files for readability:
 
 ```
-src/per_sample_caller/
+src/per_sample_pileup/
   pileup/
     mod.rs               — public entry: `run(reads, fasta, tx)`
     walker_state.rs      — WalkerState, the loop driver
@@ -1420,7 +1420,7 @@ principle 4](design_principles.md), the public entry takes
 already-prepared reads and a channel `Sender<PileupRecord>` —
 the file-on-disk dance and the cross-thread orchestration
 between the walker thread and the Stage 2 encoder thread live
-in `per_sample_caller/mod.rs`.
+in `per_sample_pileup/mod.rs`.
 
 ## Cross-references
 
@@ -1428,7 +1428,7 @@ in `per_sample_caller/mod.rs`.
   — Stage 1 architectural commitments: BAQ in-process, five
   scalars, `MAX_RECORD_SPAN` cap, indel BQ proxy, indel anchoring,
   overlapping-event REF extension.
-- [per_sample_caller.md](per_sample_caller.md) — Stage 1
+- [per_sample_pileup.md](per_sample_pileup.md) — Stage 1
   end-to-end shape: input/output, read filters, mate-overlap
   rule, phase-chain slot encoding, parallelism, CLI.
 - [phase_chain.md](phase_chain.md) — conceptual model for what

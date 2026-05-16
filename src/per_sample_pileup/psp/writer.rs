@@ -35,7 +35,7 @@ use super::registry::{
     ColumnDef, ColumnKey, ColumnPayload, ElementType, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS,
 };
 use super::trailer::{Trailer, encode_trailer};
-use crate::per_sample_caller::pileup::{ChainId, PileupRecord};
+use crate::per_sample_pileup::pileup::{ChainId, PileupRecord};
 
 /// Target uncompressed bytes per block. Spec §"Block sizing" pins
 /// this; it is not a tunable. The writer auto-flushes when an open
@@ -863,10 +863,10 @@ fn predict_uncompressed_len(def: &ColumnDef, block: &BlockAccumulator) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_caller::pileup::{AlleleObservation, AlleleSupportStats};
-    use crate::per_sample_caller::psp::header::{ParsedHeader, parse_header_bytes};
-    use crate::per_sample_caller::psp::index::decode_index;
-    use crate::per_sample_caller::psp::trailer::{TRAILER_BYTES, decode_trailer};
+    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats};
+    use crate::per_sample_pileup::psp::header::{ParsedHeader, parse_header_bytes};
+    use crate::per_sample_pileup::psp::index::decode_index;
+    use crate::per_sample_pileup::psp::trailer::{TRAILER_BYTES, decode_trailer};
     use std::io::Cursor;
 
     // ---------- Fixture builders ---------------------------------

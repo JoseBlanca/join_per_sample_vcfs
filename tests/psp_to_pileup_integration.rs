@@ -10,13 +10,13 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::Path;
 
-use merge_per_sample_vcfs::per_sample_caller::pileup::{
+use merge_per_sample_vcfs::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, PileupRecord,
 };
-use merge_per_sample_vcfs::per_sample_caller::psp::header::{
+use merge_per_sample_vcfs::per_sample_pileup::psp::header::{
     ChromosomeEntry, WriterHeader, WriterProvenance,
 };
-use merge_per_sample_vcfs::per_sample_caller::psp::writer::PspWriter;
+use merge_per_sample_vcfs::per_sample_pileup::psp::writer::PspWriter;
 use merge_per_sample_vcfs::pop_var_caller::{PspToPileupArgs, run_psp_to_pileup};
 use tempfile::TempDir;
 

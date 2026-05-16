@@ -1,4 +1,4 @@
-# Stage 1 — per-sample caller (CRAM → per-position records)
+# Stage 1 — per-sample pileup (CRAM → per-position records)
 
 **Status:** Draft, 2026-04-27. Detailed specification of Stage 1 of the
 multi-sample calling pipeline. Sits underneath
@@ -19,7 +19,7 @@ One Stage 1 invocation processes **one sample** end to end:
 
 ```
 sample.cram ───┐
-sample.cram ───┼──► Stage 1 per-sample caller ──► sample.psp
+sample.cram ───┼──► Stage 1 per-sample pileup ──► sample.psp
 sample.cram ───┘
                   reference.fasta (+ .fai)
 ```
@@ -730,7 +730,7 @@ implementation plan:
 
 ```
 src/
-  per_sample_caller/
+  per_sample_pileup/
     mod.rs              — CLI entry, orchestration
     cram_input.rs       — header validation, multi-file peek-and-scan merge
     read_filter.rs      — per-read filters (flags, MAPQ, ...)

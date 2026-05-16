@@ -1,7 +1,7 @@
 # Phase chains — what they are, what they answer, why we use them
 
 **Status:** Explanatory document, 2026-04-28. Companion to
-[per_sample_caller.md](per_sample_caller.md) and
+[per_sample_pileup.md](per_sample_pileup.md) and
 [calling_pipeline_architecture.md](calling_pipeline_architecture.md).
 This is not a design spec — those already commit to the phase-chain
 mechanism. This document exists to make the *concept* concrete:
@@ -816,7 +816,7 @@ records when it needs to evaluate a compound haplotype.
 
 The one design decision that makes the chain mechanism cheap and
 correct is spelled out in
-[per_sample_caller.md §"Phase chain identifiers"](per_sample_caller.md):
+[per_sample_pileup.md §"Phase chain identifiers"](per_sample_pileup.md):
 per-pair (rather than per-mate) chain assignment via a small
 in-flight QNAME map. This document explains the *why*; that one
 specifies the *what* in implementation terms.

@@ -20,7 +20,7 @@
 
 use thiserror::Error;
 
-use crate::cohort::per_position_merger::{MergerError, PerPositionPileups};
+use crate::var_calling::per_position_merger::{MergerError, PerPositionPileups};
 
 /// Default value for [`GrouperConfig::max_var_group_span`].
 ///
@@ -322,7 +322,7 @@ fn max_ref_span(pp: &PerPositionPileups) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_caller::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
 
     type Item = Result<PerPositionPileups, MergerError>;
     type TestIter = std::vec::IntoIter<Item>;

@@ -10,7 +10,7 @@ sense of the Rust code. Where Rust idioms matter (ownership,
 `BTreeMap`, `mpsc::SyncSender`), they are flagged inline.
 
 > **Where this fits in the bigger pipeline.** The pileup walker is
-> Stage 1 of the per-sample caller. It reads a coordinate-sorted
+> Stage 1 of the per-sample pileup. It reads a coordinate-sorted
 > stream of `PreparedRead` values (already filtered + BAQ-adjusted
 > upstream) and emits a stream of `PileupRecord` values — one per
 > covered reference position. The full pipeline is described in
@@ -41,20 +41,20 @@ that it flushes when they're done.
 
 ## The six submodules
 
-[`src/per_sample_caller/pileup/`](../../../src/per_sample_caller/pileup/)
+[`src/per_sample_pileup/pileup/`](../../../src/per_sample_pileup/pileup/)
 is split into six files plus a `mod.rs` that re-exports the public
 types. The split is deliberate — each file owns one concept and
 there is a clear handoff between them. Read in this order:
 
 | Module | Lines | Owns |
 |---|---|---|
-| [`mod.rs`](../../../src/per_sample_caller/pileup/mod.rs) | 263 | Public types: `PreparedRead`, `PileupRecord`, `AlleleObservation`, `FiveScalars`, `SlotId`, `RefBaseFetcher`, `WalkerConfig`. No logic. |
-| [`walker.rs`](../../../src/per_sample_caller/pileup/walker.rs) | 628 | The main loop. Owns `WalkerState` and the per-step phase choreography. |
-| [`active_set.rs`](../../../src/per_sample_caller/pileup/active_set.rs) | 317 | The set of reads currently in flight (admitted, not yet expired). One entry per read. |
-| [`cigar_cursor.rs`](../../../src/per_sample_caller/pileup/cigar_cursor.rs) | 1301 | Per-read state: where each CIGAR op starts on the reference and on the read. Lazily emits events at any queried position. |
-| [`open_record.rs`](../../../src/per_sample_caller/pileup/open_record.rs) | 854 | The records currently held open. Keyed by anchor position. Owns the fold logic that turns events into per-allele scalars. |
-| [`slot_allocator.rs`](../../../src/per_sample_caller/pileup/slot_allocator.rs) | 595 | Phase-chain slot ids. Pairs mates onto the same slot, recycles slots when reads expire. |
-| [`decompose.rs`](../../../src/per_sample_caller/pileup/decompose.rs) | 580 | **Test-only** since the lazy cursor landed. A reference oracle that decomposes a whole CIGAR up-front; used by parity tests against the cursor. |
+| [`mod.rs`](../../../src/per_sample_pileup/pileup/mod.rs) | 263 | Public types: `PreparedRead`, `PileupRecord`, `AlleleObservation`, `FiveScalars`, `SlotId`, `RefBaseFetcher`, `WalkerConfig`. No logic. |
+| [`walker.rs`](../../../src/per_sample_pileup/pileup/walker.rs) | 628 | The main loop. Owns `WalkerState` and the per-step phase choreography. |
+| [`active_set.rs`](../../../src/per_sample_pileup/pileup/active_set.rs) | 317 | The set of reads currently in flight (admitted, not yet expired). One entry per read. |
+| [`cigar_cursor.rs`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs) | 1301 | Per-read state: where each CIGAR op starts on the reference and on the read. Lazily emits events at any queried position. |
+| [`open_record.rs`](../../../src/per_sample_pileup/pileup/open_record.rs) | 854 | The records currently held open. Keyed by anchor position. Owns the fold logic that turns events into per-allele scalars. |
+| [`slot_allocator.rs`](../../../src/per_sample_pileup/pileup/slot_allocator.rs) | 595 | Phase-chain slot ids. Pairs mates onto the same slot, recycles slots when reads expire. |
+| [`decompose.rs`](../../../src/per_sample_pileup/pileup/decompose.rs) | 580 | **Test-only** since the lazy cursor landed. A reference oracle that decomposes a whole CIGAR up-front; used by parity tests against the cursor. |
 
 The "lazy cursor" point in the table is a real surprise worth
 calling out: the spec describes eager decomposition into a
@@ -64,7 +64,7 @@ events are computed on-demand at the position the walker queries.
 
 ## The walker loop, phase by phase
 
-[`walker.rs:24`](../../../src/per_sample_caller/pileup/walker.rs#L24)
+[`walker.rs:24`](../../../src/per_sample_pileup/pileup/walker.rs#L24)
 defines the entry point `run`. The interesting code is the
 `while` loop at lines 42–89:
 
@@ -93,11 +93,11 @@ For every pending read with `alignment_start ≤ walker_pos`:
 1. Allocate a fresh `read_id` (monotonic `u32`).
 2. Build a `CigarCursor` (precompute the `(ref_pos, read_pos)` pair
    at the start of every CIGAR op, plus a sentinel — see
-   [`cigar_cursor.rs`](../../../src/per_sample_caller/pileup/cigar_cursor.rs)).
+   [`cigar_cursor.rs`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs)).
 3. Allocate a `SlotId` from the slot allocator. If the read is the
    second mate of a pair already in flight, **reuse** the first
    mate's slot rather than allocating a new one
-   ([`slot_allocator.rs`](../../../src/per_sample_caller/pileup/slot_allocator.rs)).
+   ([`slot_allocator.rs`](../../../src/per_sample_pileup/pileup/slot_allocator.rs)).
 4. Push to the active set.
 
 Why mate-pair slot sharing matters: at fold time the open-record
@@ -189,7 +189,7 @@ out: the walker simply isn't there.
 
 ## CIGAR cursor
 
-[`cigar_cursor.rs`](../../../src/per_sample_caller/pileup/cigar_cursor.rs)
+[`cigar_cursor.rs`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs)
 is the biggest module by line count. It deserves a closer look.
 
 A `CigarCursor` holds:
@@ -235,7 +235,7 @@ silently dropped. The boundary is direction-aware:
 The boundary is supplied on `PreparedRead.adaptor_boundary` (or
 `None` if it can't be reliably computed — single-end, mate
 unmapped, geometry inconsistent). The cursor consults it inline
-([`cigar_cursor.rs:69`](../../../src/per_sample_caller/pileup/cigar_cursor.rs#L69))
+([`cigar_cursor.rs:69`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs#L69))
 rather than relying on the read having been pre-trimmed
 upstream. This was the G1 finding from
 [`ia/reviews/pileup_gatk_comparison_2026-05-08.md`](../../reviews/pileup_gatk_comparison_2026-05-08.md).
@@ -243,13 +243,13 @@ upstream. This was the G1 finding from
 ### Read-N handling
 
 A read base of `N` is silently skipped on the M emit path
-([`cigar_cursor.rs:247`](../../../src/per_sample_caller/pileup/cigar_cursor.rs#L247)).
+([`cigar_cursor.rs:247`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs#L247)).
 This is the F5 commit. Reference Ns flow through verbatim; only
 read Ns get filtered.
 
 ## Open-record store
 
-[`open_record.rs`](../../../src/per_sample_caller/pileup/open_record.rs)
+[`open_record.rs`](../../../src/per_sample_pileup/pileup/open_record.rs)
 is structured around a `BTreeMap<u32, OpenPileupRecord>` keyed by
 anchor position. The choice of `BTreeMap` (rather than `HashMap`)
 matters for two reasons:
@@ -273,7 +273,7 @@ Each `OpenPileupRecord` holds:
   widen.
 
 The widening protocol
-([`open_record.rs:281`](../../../src/per_sample_caller/pileup/open_record.rs#L281)):
+([`open_record.rs:281`](../../../src/per_sample_pileup/pileup/open_record.rs#L281)):
 
 1. Fetch the new REF bases from the FASTA.
 2. Append them to every allele's `seq` (REF gets the literal
@@ -293,7 +293,7 @@ that touches the record (which is bounded by `MAX_RECORD_SPAN
 
 ## Slot allocator
 
-[`slot_allocator.rs`](../../../src/per_sample_caller/pileup/slot_allocator.rs)
+[`slot_allocator.rs`](../../../src/per_sample_pileup/pileup/slot_allocator.rs)
 mints `SlotId` values (`u16`, 12 bits used, hard cap
 `MAX_ACTIVE_SLOTS = 4096`). The id is the durable handle for a
 "phase chain" — alleles sharing the same slot id across positions
@@ -318,14 +318,14 @@ The mate-pair refcount trick: when the first mate arrives, the
 slot is allocated with refcount **2** (anticipating the second
 mate). If the second mate never shows up within
 `MATE_LOOKUP_WINDOW = 10_000` bp, the pending entry is evicted
-([`slot_allocator.rs:309`](../../../src/per_sample_caller/pileup/slot_allocator.rs#L309))
+([`slot_allocator.rs:309`](../../../src/per_sample_pileup/pileup/slot_allocator.rs#L309))
 and the refcount drops back to 1, so the slot releases when the
 first mate exits.
 
 ## Mate-pair overlap
 
 The trickiest small piece of the walker.
-[`walker.rs:394`](../../../src/per_sample_caller/pileup/walker.rs#L394)
+[`walker.rs:394`](../../../src/per_sample_pileup/pileup/walker.rs#L394)
 (`resolve_mate_overlap_at_pos`).
 
 For each `(slot_id, contributors[])` group with ≥ 2 entries:
@@ -351,7 +351,7 @@ across positions is preserved.
 
 ## Five per-allele scalars (`FiveScalars`)
 
-[`mod.rs:170`](../../../src/per_sample_caller/pileup/mod.rs#L170).
+[`mod.rs:170`](../../../src/per_sample_pileup/pileup/mod.rs#L170).
 The fold maintains, per allele per record, exactly these:
 
 | Field | Updated by |
@@ -372,13 +372,13 @@ per-allele scalars"](../../specs/calling_pipeline_architecture.md)).
 
 Recommended reading order, given this map:
 
-1. [`mod.rs`](../../../src/per_sample_caller/pileup/mod.rs) — types only, ~10 minutes.
-2. [`walker.rs::run`](../../../src/per_sample_caller/pileup/walker.rs#L24) — the main loop body. Stop at `process_position` calls.
-3. [`active_set.rs`](../../../src/per_sample_caller/pileup/active_set.rs) — small file, easy admit/expire.
-4. [`slot_allocator.rs`](../../../src/per_sample_caller/pileup/slot_allocator.rs) — read in pieces; the freelist + pending_mates story is the interesting bit.
-5. [`cigar_cursor.rs`](../../../src/per_sample_caller/pileup/cigar_cursor.rs) — start with `events_at`, then `events_overlapping`. Skip `BinarySearch` mode on first read.
-6. [`open_record.rs::process_position`](../../../src/per_sample_caller/pileup/open_record.rs) — the fold. Read after you understand the cursor.
-7. [`walker.rs::resolve_mate_overlap_at_pos`](../../../src/per_sample_caller/pileup/walker.rs#L394) — apply once everything else is in place.
+1. [`mod.rs`](../../../src/per_sample_pileup/pileup/mod.rs) — types only, ~10 minutes.
+2. [`walker.rs::run`](../../../src/per_sample_pileup/pileup/walker.rs#L24) — the main loop body. Stop at `process_position` calls.
+3. [`active_set.rs`](../../../src/per_sample_pileup/pileup/active_set.rs) — small file, easy admit/expire.
+4. [`slot_allocator.rs`](../../../src/per_sample_pileup/pileup/slot_allocator.rs) — read in pieces; the freelist + pending_mates story is the interesting bit.
+5. [`cigar_cursor.rs`](../../../src/per_sample_pileup/pileup/cigar_cursor.rs) — start with `events_at`, then `events_overlapping`. Skip `BinarySearch` mode on first read.
+6. [`open_record.rs::process_position`](../../../src/per_sample_pileup/pileup/open_record.rs) — the fold. Read after you understand the cursor.
+7. [`walker.rs::resolve_mate_overlap_at_pos`](../../../src/per_sample_pileup/pileup/walker.rs#L394) — apply once everything else is in place.
 
 Open [`index.html`](index.html) alongside this and step through
 the three scenarios. The viewer names the function being

@@ -37,7 +37,7 @@ the end.
 ## Cross-references
 
 - [calling_pipeline_architecture.md](calling_pipeline_architecture.md) §"Stage 2 — per-sample file contract" — high-level record shape, rationale for scalars and phase chains, schema-evolution policy.
-- [per_sample_caller.md](per_sample_caller.md) — Stage 1, the producer. Defines what the writer puts into every column.
+- [per_sample_pileup.md](per_sample_pileup.md) — Stage 1, the producer. Defines what the writer puts into every column.
 - [freebayes_posterior_gt_probs.md](freebayes_posterior_gt_probs.md) — semantics of the five scalars.
 
 ## Encoding conventions
@@ -948,11 +948,11 @@ two views of the same data; readers verify they agree
 | `0x03` | `allele_seq_len` | per-allele (M entries, M = `n_total_alleles`) | `varint` | Length in bytes of each allele's sequence. **Minimum `1`** — no allele is zero-length (SNP = 1, deletion ALT = 1 anchor base, insertion ALT = 1+ bytes). **Maximum `10_000`** — a hard sanity bound on a single allele's sequence length. Real biological alleles are far shorter (the longest realistic insertion in the project's domain is well under 1 kb); a value over the cap is a producer bug, and a reader that proceeded would either OOM on a 4 GiB varint or silently consume the rest of the block as allele bytes. A reader rejects any record carrying `allele_seq_len < 1` or `allele_seq_len > 10_000`, naming the block, the record, and the allele index. Within a record, the first allele is REF (architecture doc §"Allele and record conventions"). |
 | `0x04` | `allele_seq` | per-allele bytes | concatenation | The allele sequences laid end to end, decoded by walking `allele_seq_len`. Bytes are uppercase ASCII over `{A, C, G, T, N}`. |
 | `0x10` | `allele_obs_count` | per-allele (M entries) | `u32` | Observation count scalar (reads supporting this allele). `u32` covers the architecture's per-column depth caps with headroom. |
-| `0x11` | `allele_q_sum_log` | per-allele (M entries) | `f64` | `Σ max(ln_BQ_BAQ, ln_MQ)` over supporting reads. Stored in ln-units. Matches the implementation's `AlleleSupportStats::q_sum: f64` ([pileup/mod.rs:357](../../src/per_sample_caller/pileup/mod.rs#L357)); chosen to preserve the precision the accumulator uses, with no truncation at the I/O boundary. |
+| `0x11` | `allele_q_sum_log` | per-allele (M entries) | `f64` | `Σ max(ln_BQ_BAQ, ln_MQ)` over supporting reads. Stored in ln-units. Matches the implementation's `AlleleSupportStats::q_sum: f64` ([pileup/mod.rs:357](../../src/per_sample_pileup/pileup/mod.rs#L357)); chosen to preserve the precision the accumulator uses, with no truncation at the I/O boundary. |
 | `0x12` | `allele_fwd_count` | per-allele (M entries) | `u32` | Forward-strand count. |
 | `0x13` | `allele_placed_left_count` | per-allele (M entries) | `u32` | Reads whose 5′ end is to the left of the record's position (freebayes' `placedLeft`). |
 | `0x14` | `allele_placed_start_count` | per-allele (M entries) | `u32` | Reads whose 5′ end *is* the record's position (`placedStart`). |
-| `0x22` | `allele_chain_ids` | per-allele list | varint count + `u64` LE ids | Per allele: a `varint` count `k`, then `k` little-endian `u64` chain ids in ascending order. Ids are unique within the `.psp` file and never recycled; two observations sharing an id came from the same read or read-pair in this sample. Matches the implementation's `ChainId = u64` ([pileup/chain_id_allocator.rs](../../src/per_sample_caller/pileup/chain_id_allocator.rs)). Tags `0x20` and `0x21` (the old `new_chain_ids` / `expired_chain_ids` lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8. |
+| `0x22` | `allele_chain_ids` | per-allele list | varint count + `u64` LE ids | Per allele: a `varint` count `k`, then `k` little-endian `u64` chain ids in ascending order. Ids are unique within the `.psp` file and never recycled; two observations sharing an id came from the same read or read-pair in this sample. Matches the implementation's `ChainId = u64` ([pileup/chain_id_allocator.rs](../../src/per_sample_pileup/pileup/chain_id_allocator.rs)). Tags `0x20` and `0x21` (the old `new_chain_ids` / `expired_chain_ids` lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8. |
 
 A reader walks the columns in tandem; the per-record columns give
 the position and allele-count structure, and the per-allele columns
@@ -1339,7 +1339,7 @@ that is a writer change, not a format change. See §"Block sizing".*
 
 **~~Q-PL3 — `f32` vs `f64` for `allele_q_sum_log`.~~**
 *Resolved 2026-05-13: `f64`, matching the implementation
-([pileup/mod.rs:357](../../src/per_sample_caller/pileup/mod.rs#L357),
+([pileup/mod.rs:357](../../src/per_sample_pileup/pileup/mod.rs#L357),
 `AlleleSupportStats::q_sum: f64`). Storing at the accumulator's
 native precision avoids a truncation step at the I/O boundary; the
 extra 4 B per allele is negligible against the rest of the per-
@@ -1349,7 +1349,7 @@ allele payload.*
 *Originally resolved 2026-05-13: `u16` over `u8` for headroom under
 recycling. **Superseded 2026-05-14**: phase-chain ids are now
 **unique-per-`.psp`-file `u64`** (`pub type ChainId = u64` in
-[pileup/chain_id_allocator.rs](../../src/per_sample_caller/pileup/chain_id_allocator.rs)),
+[pileup/chain_id_allocator.rs](../../src/per_sample_pileup/pileup/chain_id_allocator.rs)),
 with no recycling. The on-disk encoding is fixed-width LE `u64`
 under tag `0x22` (`allele-chain-ids`); zstd absorbs the leading
 zero bytes on small ids. Overflow at `u64::MAX + 1` surfaces as

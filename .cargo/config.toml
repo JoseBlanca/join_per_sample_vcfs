@@ -2,7 +2,7 @@
 # microarchitecture the corresponding deployment is known to run on,
 # unlocking ISA features (AVX2/FMA on x86_64; Apple-Silicon extensions
 # on aarch64-macos) that the HMM inner loops in
-# `src/per_sample_caller/baq/probaln.rs` care about.
+# `src/per_sample_pileup/baq/probaln.rs` care about.
 #
 # Trade-off: the produced binary refuses to launch on hardware older
 # than the named microarchitecture. If a deployment is older than these
