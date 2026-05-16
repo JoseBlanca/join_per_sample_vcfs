@@ -10,7 +10,7 @@
 //! First occupant: [`per_position_merger`], the linear-scan k-way
 //! merge over per-sample `.psp` record streams. Stage 4 lands in
 //! [`variant_grouping`], the streaming overlap bundler that turns
-//! the merger's output into `OverlappingVarGroup`s for Stage 5.
+//! the merger's output into `OverlappingVariantGroup`s for Stage 5.
 //! Later stages land in sibling modules as they are implemented.
 
 pub mod per_group_merger;

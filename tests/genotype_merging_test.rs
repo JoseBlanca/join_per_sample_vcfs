@@ -5,7 +5,7 @@ use merge_per_sample_vcfs::genotype_merging::{merge_variant_group, merge_vars_in
 use merge_per_sample_vcfs::genotype_posteriors::PriorConfig;
 use merge_per_sample_vcfs::gvcf_parser::{VarIterator, Variant};
 use merge_per_sample_vcfs::variant_grouping::VarGroupIterator;
-use merge_per_sample_vcfs::variant_grouping::{OverlappingVarGroup, VarIteratorInfo};
+use merge_per_sample_vcfs::variant_grouping::{OverlappingVariantGroup, VarIteratorInfo};
 
 fn default_prior() -> PriorConfig {
     PriorConfig::default()
@@ -19,7 +19,8 @@ fn make_iter(vcf_data: &str) -> VarIterator<BufReader<BufReader<&[u8]>>> {
 /// Collect merged variants from groups into a Vec (test helper).
 fn collect_merged_variants<I>(groups: I, iter_info: &[VarIteratorInfo]) -> Vec<Variant>
 where
-    I: Iterator<Item = merge_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVarGroup>> + Send,
+    I: Iterator<Item = merge_per_sample_vcfs::gvcf_parser::VcfResult<OverlappingVariantGroup>>
+        + Send,
 {
     let mut vars = Vec::new();
     merge_vars_in_groups(groups, iter_info, &default_prior(), |result| {
@@ -204,8 +205,8 @@ fn make_variant(
     )
 }
 
-/// Creates an OverlappingVarGroup from variants and their source iterator indices.
-fn make_group(variants: Vec<Variant>, source_idxs: Vec<usize>) -> OverlappingVarGroup {
+/// Creates an OverlappingVariantGroup from variants and their source iterator indices.
+fn make_group(variants: Vec<Variant>, source_idxs: Vec<usize>) -> OverlappingVariantGroup {
     let chrom = variants[0].chrom.clone();
     let start = variants.iter().map(|v| v.pos).min().unwrap();
     let end = variants
@@ -213,7 +214,7 @@ fn make_group(variants: Vec<Variant>, source_idxs: Vec<usize>) -> OverlappingVar
         .map(|v| v.pos + v.alleles[0].len() as u32 - 1)
         .max()
         .unwrap();
-    OverlappingVarGroup {
+    OverlappingVariantGroup {
         chrom,
         start,
         end,

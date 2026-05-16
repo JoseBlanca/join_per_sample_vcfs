@@ -38,7 +38,7 @@ use merge_per_sample_vcfs::var_calling::per_position_merger::{
     PerPositionMerger, PerPositionMergerError, PerPositionPileups,
 };
 use merge_per_sample_vcfs::var_calling::variant_grouping::{
-    GrouperConfig, OverlappingVarGroup, VariantGrouper,
+    GrouperConfig, OverlappingVariantGroup, VariantGrouper,
 };
 
 // ---------------------------------------------------------------------
@@ -352,7 +352,7 @@ fn build_biallelic_snp_groups(
     n_groups: u32,
     n_samples: usize,
     spacing: u32,
-) -> (Vec<OverlappingVarGroup>, Vec<u8>) {
+) -> (Vec<OverlappingVariantGroup>, Vec<u8>) {
     let mut groups = Vec::with_capacity(n_groups as usize);
     let last_pos = (n_groups - 1) * spacing + 100;
     let ref_len = (last_pos - 100 + 1) as usize;
@@ -379,7 +379,7 @@ fn build_biallelic_snp_groups(
                 ],
             ));
         }
-        groups.push(OverlappingVarGroup {
+        groups.push(OverlappingVariantGroup {
             chrom_id: 0,
             start: pos,
             end: pos,
@@ -403,7 +403,7 @@ fn build_compound_groups(
     n_samples: usize,
     spacing: u32,
     chain_anchored_fraction: f32,
-) -> (Vec<OverlappingVarGroup>, Vec<u8>) {
+) -> (Vec<OverlappingVariantGroup>, Vec<u8>) {
     let mut groups = Vec::with_capacity(n_groups as usize);
     let last_pos = (n_groups - 1) * spacing + 100 + 2;
     let ref_len = (last_pos - 100 + 1) as usize;
@@ -464,7 +464,7 @@ fn build_compound_groups(
             }
         }
 
-        groups.push(OverlappingVarGroup {
+        groups.push(OverlappingVariantGroup {
             chrom_id: 0,
             start: p1,
             end: p2,

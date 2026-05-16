@@ -1,6 +1,6 @@
 //! Stage 5 — per-group merger.
 //!
-//! Consumes `Result<OverlappingVarGroup, GrouperError>` items from
+//! Consumes `Result<OverlappingVariantGroup, GrouperError>` items from
 //! Stage 4 and emits one `MergedRecord` per group: a unified allele
 //! set plus the per-sample scalar table and per-sample, per-genotype
 //! log-likelihood vector under `c_s = 0` (no contamination
@@ -16,7 +16,7 @@
 //! closed-form likelihood from the five per-allele scalars carried in
 //! `AlleleSupportStats`. Chain-broken samples at chain-anchored
 //! compounds fall back to a constituents-independent per-position
-//! likelihood and surface that fact through `ca_flags` so Stage 6 can
+//! likelihood and surface that fact through `chain_anchor_flags` so Stage 6 can
 //! use a cohort-derived compound frequency as the prior signal there.
 //!
 //! Parallelism is internal to `next()`: a batch of upstream groups is
@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
-use crate::var_calling::variant_grouping::{GrouperError, OverlappingVarGroup};
+use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
 /// Maximum number of alleles retained in a single merged record
 /// before the cap drops the lowest-cohort-count alleles into the
@@ -40,12 +40,18 @@ pub const DEFAULT_MAX_ALLELES_PER_RECORD: usize = 6;
 
 /// Default cohort-wide ploidy. Diploid is the common case; the merger
 /// supports higher ploidies (triploid, tetraploid) through
-/// [`PerGroupMergerConfig::ploidy`].
+/// [`PerGroupMergerConfig::ploidy`]. See
+/// `doc/devel/specs/calling_pipeline_architecture.md` §"Stage 5 —
+/// per-group processing" for the ploidy contract.
 pub const DEFAULT_PLOIDY: u8 = 2;
 
 /// Default number of upstream groups pulled and processed in parallel
-/// per `next()` cycle. Tuned for cache-friendly batches; raise it on
-/// very wide cohorts where per-group work amortises better.
+/// per `next()` cycle. **Placeholder** — chosen as a reasonable
+/// starting point for cache-friendly batches; no comparative benchmark
+/// has selected this specific value yet. Raise it on very wide cohorts
+/// where per-group work amortises better, and re-evaluate when the
+/// `var_calling_per_group_merger/*` criterion bench gets a dedicated
+/// batch-size sweep.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 
 /// Tunable knobs for the per-group merger.
@@ -103,9 +109,16 @@ pub struct MergedAllele {
 }
 
 /// One constituent of a compound allele: position in the source
-/// `OverlappingVarGroup.records` plus the local allele index in that
+/// `OverlappingVariantGroup.records` plus the local allele index in that
 /// record (per the first chain-anchoring sample — see
 /// [`MergedAllele::constituents`]).
+///
+/// **The `local_allele_idx` is a representative, not a cohort-canonical
+/// identifier.** Different samples may carry the same compound through
+/// different `local_allele_idx` values because of per-sample allele
+/// packing within a record. To find a given sample's contribution to a
+/// compound, walk that sample's records by `record_idx` and match on
+/// allele byte sequence, not on `local_allele_idx` equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompoundConstituent {
     pub record_idx: usize,
@@ -113,7 +126,7 @@ pub struct CompoundConstituent {
 }
 
 /// One emitted item: a unified allele set for a single
-/// `OverlappingVarGroup`, the per-sample scalar table, the per-sample
+/// `OverlappingVariantGroup`, the per-sample scalar table, the per-sample
 /// chain-anchor flags, and the per-sample, per-genotype log-likelihood
 /// vector under `c_s = 0`.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,12 +150,12 @@ pub struct MergedRecord {
     /// error-cost term so the likelihoods preserve the pre-cap
     /// evidence balance.
     pub other_scalars: Vec<AlleleSupportStats>,
-    /// `ca_flags[sample_idx][allele_idx]` — `true` iff `allele_idx`
+    /// `chain_anchor_flags[sample_idx][allele_idx]` — `true` iff `allele_idx`
     /// is a compound and `sample_idx` is chain-broken at it (the
     /// fallback likelihood path was used). Stage 6 reads this to
     /// route the cohort-derived compound frequency `f_C` as the
     /// prior signal for chain-broken samples.
-    pub ca_flags: Vec<Vec<bool>>,
+    pub chain_anchor_flags: Vec<Vec<bool>>,
     /// `log_likelihoods[sample_idx][genotype_idx]` — natural-log
     /// likelihood under `c_s = 0`. Genotype order is canonical
     /// per [`genotype_order`].
@@ -285,10 +298,17 @@ pub enum PerGroupMergerError {
 /// CC`). All samples in a `MergedRecord` use the same order.
 pub fn genotype_order(ploidy: u8, n_alleles: usize) -> Vec<Vec<u8>> {
     let ploidy = ploidy as usize;
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut current: Vec<u8> = vec![0; ploidy];
-    collect_non_decreasing(&mut current, 0, 0, n_alleles, ploidy, &mut out);
-    out.sort_by(|a, b| {
+    let mut enumerated_genotypes: Vec<Vec<u8>> = Vec::new();
+    let mut partial_genotype: Vec<u8> = vec![0; ploidy];
+    collect_non_decreasing(
+        &mut partial_genotype,
+        0,
+        0,
+        n_alleles,
+        ploidy,
+        &mut enumerated_genotypes,
+    );
+    enumerated_genotypes.sort_by(|a, b| {
         for i in (0..ploidy).rev() {
             match a[i].cmp(&b[i]) {
                 std::cmp::Ordering::Equal => continue,
@@ -297,24 +317,31 @@ pub fn genotype_order(ploidy: u8, n_alleles: usize) -> Vec<Vec<u8>> {
         }
         std::cmp::Ordering::Equal
     });
-    out
+    enumerated_genotypes
 }
 
 fn collect_non_decreasing(
-    current: &mut [u8],
+    partial_genotype: &mut [u8],
     pos: usize,
     min_allele: u8,
     n_alleles: usize,
     ploidy: usize,
-    out: &mut Vec<Vec<u8>>,
+    enumerated_genotypes: &mut Vec<Vec<u8>>,
 ) {
     if pos == ploidy {
-        out.push(current.to_vec());
+        enumerated_genotypes.push(partial_genotype.to_vec());
         return;
     }
     for a in min_allele..(n_alleles as u8) {
-        current[pos] = a;
-        collect_non_decreasing(current, pos + 1, a, n_alleles, ploidy, out);
+        partial_genotype[pos] = a;
+        collect_non_decreasing(
+            partial_genotype,
+            pos + 1,
+            a,
+            n_alleles,
+            ploidy,
+            enumerated_genotypes,
+        );
     }
 }
 
@@ -331,7 +358,7 @@ pub type SharedRefFetcher = Arc<dyn RefSeqFetcher + Send + Sync>;
 /// Streaming, internally-parallel per-group merger.
 pub struct PerGroupMerger<I>
 where
-    I: Iterator<Item = Result<OverlappingVarGroup, GrouperError>>,
+    I: Iterator<Item = Result<OverlappingVariantGroup, GrouperError>>,
 {
     upstream: I,
     ref_fetcher: SharedRefFetcher,
@@ -348,7 +375,7 @@ where
 
 impl<I> std::fmt::Debug for PerGroupMerger<I>
 where
-    I: Iterator<Item = Result<OverlappingVarGroup, GrouperError>>,
+    I: Iterator<Item = Result<OverlappingVariantGroup, GrouperError>>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Exhaustive destructure: a new field on `PerGroupMerger`
@@ -371,7 +398,7 @@ where
 
 impl<I> PerGroupMerger<I>
 where
-    I: Iterator<Item = Result<OverlappingVarGroup, GrouperError>>,
+    I: Iterator<Item = Result<OverlappingVariantGroup, GrouperError>>,
 {
     /// Construct a merger with explicit tuning. Pass
     /// [`PerGroupMergerConfig::default()`] for the standard defaults
@@ -400,7 +427,7 @@ where
     /// `false` once upstream is fully drained and `pending` is empty.
     fn refill(&mut self) -> bool {
         let batch_size = self.config.batch_size.max(1);
-        let mut batch: Vec<OverlappingVarGroup> = Vec::with_capacity(batch_size);
+        let mut batch: Vec<OverlappingVariantGroup> = Vec::with_capacity(batch_size);
 
         while batch.len() < batch_size {
             match self.upstream.next() {
@@ -452,7 +479,7 @@ where
 
 impl<I> Iterator for PerGroupMerger<I>
 where
-    I: Iterator<Item = Result<OverlappingVarGroup, GrouperError>>,
+    I: Iterator<Item = Result<OverlappingVariantGroup, GrouperError>>,
 {
     type Item = Result<MergedRecord, PerGroupMergerError>;
 
@@ -476,10 +503,10 @@ where
 // Per-group worker (pure function so rayon can call it freely)
 // ---------------------------------------------------------------------
 
-/// Merge a single `OverlappingVarGroup` into a `MergedRecord` (or
+/// Merge a single `OverlappingVariantGroup` into a `MergedRecord` (or
 /// `None` if the group reduces to REF-only after unification).
 fn process_group(
-    group: OverlappingVarGroup,
+    group: OverlappingVariantGroup,
     ref_fetcher: &(dyn RefSeqFetcher + Send + Sync),
     config: &PerGroupMergerConfig,
 ) -> Result<Option<MergedRecord>, PerGroupMergerError> {
@@ -502,7 +529,7 @@ fn process_group(
         });
     }
     if end < start {
-        // `OverlappingVarGroup` is a `pub` struct with no
+        // `OverlappingVariantGroup` is a `pub` struct with no
         // constructor invariant. The cohort's own grouper guarantees
         // `start <= end`, but a hand-built fixture or alternative
         // upstream could feed an inverted range; surface it as a
@@ -553,7 +580,7 @@ fn process_group(
             .records
             .iter()
             .all(|pp| pp.per_sample.len() == n_samples),
-        "OverlappingVarGroup records disagree on per_sample width",
+        "OverlappingVariantGroup records disagree on per_sample width",
     );
 
     let unified = unify_alleles(&group, &ref_seq, n_samples)?;
@@ -567,13 +594,13 @@ fn process_group(
     }
 
     let projection = project_scalars(&group, &unified, n_samples)?;
-    let ca_flags = build_ca_flags(&unified, n_samples);
+    let chain_anchor_flags = build_chain_anchor_flags(&unified, n_samples);
     let log_likelihoods = compute_log_likelihoods(
         &unified,
         &projection,
-        &ca_flags,
+        &chain_anchor_flags,
         &group,
-        &LikelihoodCtx {
+        &LikelihoodContext {
             chrom_id,
             start,
             end,
@@ -599,7 +626,7 @@ fn process_group(
         ploidy: config.ploidy,
         scalars: projection.scalars,
         other_scalars: projection.other_scalars,
-        ca_flags,
+        chain_anchor_flags,
         log_likelihoods,
     }))
 }
@@ -665,7 +692,7 @@ impl DroppedOther {
 }
 
 fn unify_alleles(
-    group: &OverlappingVarGroup,
+    group: &OverlappingVariantGroup,
     ref_seq: &[u8],
     n_samples: usize,
 ) -> Result<UnifiedAlleleSet, PerGroupMergerError> {
@@ -734,7 +761,7 @@ fn unify_alleles(
                 if !alleles[idx].is_compound {
                     alleles[idx].is_compound = true;
                     alleles[idx].constituents =
-                        constituent_list(&candidate.constituents_per_first_anchor);
+                        sort_constituents(&candidate.constituents_per_first_anchor);
                 }
                 idx
             }
@@ -744,7 +771,7 @@ fn unify_alleles(
                 alleles.push(UnifiedAllele {
                     seq: projected,
                     is_compound: true,
-                    constituents: constituent_list(&candidate.constituents_per_first_anchor),
+                    constituents: sort_constituents(&candidate.constituents_per_first_anchor),
                     per_sample_sources: vec![Vec::new(); n_samples],
                     chain_anchor_counts: vec![0; n_samples],
                     cohort_count: 0,
@@ -827,13 +854,13 @@ struct CompoundChainAnchorEvidence {
 /// for pathological inputs where two distinct local alleles share
 /// bytes.
 fn detect_compound_candidates(
-    group: &OverlappingVarGroup,
+    group: &OverlappingVariantGroup,
     n_samples: usize,
 ) -> Vec<CompoundCandidate> {
     let mut candidates: BTreeMap<Vec<(usize, usize)>, CompoundCandidate> = BTreeMap::new();
 
     for sample_idx in 0..n_samples {
-        for proposal in sample_chain_proposals(group, sample_idx) {
+        for proposal in build_chain_proposals(group, sample_idx) {
             // Skip degenerate proposals — chain ids touching only one
             // record do not propose a compound.
             if proposal.constituents.len() < 2 {
@@ -872,7 +899,7 @@ struct ChainProposal {
 /// Walk the group's records and group chain ids by sample. Each chain
 /// id touching ≥ 2 distinct non-REF allele observations across
 /// records becomes one proposed compound.
-fn sample_chain_proposals(group: &OverlappingVarGroup, sample_idx: usize) -> Vec<ChainProposal> {
+fn build_chain_proposals(group: &OverlappingVariantGroup, sample_idx: usize) -> Vec<ChainProposal> {
     // chain_id → Vec<(record_idx, local_allele_idx)> for this sample.
     let mut by_chain: BTreeMap<ChainId, Vec<CompoundConstituent>> = BTreeMap::new();
 
@@ -921,7 +948,7 @@ fn sample_chain_proposals(group: &OverlappingVarGroup, sample_idx: usize) -> Vec
 /// anchoring read.
 fn project_compound_onto_group(
     ref_seq: &[u8],
-    group: &OverlappingVarGroup,
+    group: &OverlappingVariantGroup,
     constituents: &[CompoundConstituent],
 ) -> Result<Vec<u8>, PerGroupMergerError> {
     if constituents.is_empty() {
@@ -939,8 +966,8 @@ fn project_compound_onto_group(
     let mut cursor_offset: usize = 0; // index into ref_seq
 
     // Every caller currently passes a `Vec<CompoundConstituent>`
-    // sorted by `record_idx` (see `sample_chain_proposals`,
-    // `constituent_list`); the debug-assert keeps that contract
+    // sorted by `record_idx` (see `build_chain_proposals`,
+    // `sort_constituents`); the debug-assert keeps that contract
     // visible.
     debug_assert!(
         constituents
@@ -1001,7 +1028,7 @@ fn project_compound_onto_group(
     Ok(result)
 }
 
-fn constituent_list(src: &[CompoundConstituent]) -> Vec<CompoundConstituent> {
+fn sort_constituents(src: &[CompoundConstituent]) -> Vec<CompoundConstituent> {
     let mut out = src.to_vec();
     out.sort_by_key(|c| (c.record_idx, c.local_allele_idx));
     out
@@ -1072,7 +1099,7 @@ struct ScalarProjection {
 }
 
 fn project_scalars(
-    group: &OverlappingVarGroup,
+    group: &OverlappingVariantGroup,
     unified: &UnifiedAlleleSet,
     n_samples: usize,
 ) -> Result<ScalarProjection, PerGroupMergerError> {
@@ -1097,7 +1124,7 @@ fn project_scalars(
                     continue;
                 };
                 let support = rec.alleles[local_allele_idx].support;
-                add_stats(&mut bucket, &support);
+                add_support(&mut bucket, &support);
             }
             scalars[sample_idx][allele_idx] = bucket;
         }
@@ -1115,7 +1142,7 @@ fn project_scalars(
                     continue;
                 };
                 let support = rec.alleles[local_allele_idx].support;
-                add_stats(&mut other_scalars[sample_idx], &support);
+                add_support(&mut other_scalars[sample_idx], &support);
             }
         }
     }
@@ -1250,7 +1277,7 @@ fn project_scalars(
                 to_subtract.placed_start = to_subtract
                     .placed_start
                     .min(scalars[sample_idx][constituent_idx].placed_start);
-                sub_stats(&mut scalars[sample_idx][constituent_idx], &to_subtract);
+                subtract_support(&mut scalars[sample_idx][constituent_idx], &to_subtract);
             }
         }
     }
@@ -1283,7 +1310,7 @@ fn build_source_index(
     idx
 }
 
-fn add_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
+fn add_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
     // Exhaustive destructure so a new field on `AlleleSupportStats`
     // fails to compile here instead of silently being left out of
     // the merged total.
@@ -1301,7 +1328,7 @@ fn add_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
     into.placed_start = into.placed_start.saturating_add(placed_start);
 }
 
-fn sub_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
+fn subtract_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
     // `q_sum` is a sum of `ln(P_err) ≤ 0` (always non-positive); the
     // residual after subtracting a less-negative `src.q_sum` must
     // remain `≤ 0`. The clamp guards against over-subtraction taking
@@ -1325,8 +1352,8 @@ fn sub_stats(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
 // chain-anchor flag table (Step 4)
 // ---------------------------------------------------------------------
 
-fn build_ca_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec<Vec<bool>> {
-    // ca_flags[sample_idx][allele_idx] = true iff allele is a
+fn build_chain_anchor_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec<Vec<bool>> {
+    // chain_anchor_flags[sample_idx][allele_idx] = true iff allele is a
     // compound and the sample is chain-broken at it.
     let n_alleles = unified.alleles.len();
     let mut out: Vec<Vec<bool>> = (0..n_samples).map(|_| vec![false; n_alleles]).collect();
@@ -1354,7 +1381,7 @@ fn build_ca_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec<Vec<bool>
 
 /// Locus + ploidy context bundle threaded through likelihood
 /// computation so callers don't pass six positional `u32`/`u8`s.
-struct LikelihoodCtx {
+struct LikelihoodContext {
     chrom_id: u32,
     start: u32,
     end: u32,
@@ -1364,9 +1391,9 @@ struct LikelihoodCtx {
 fn compute_log_likelihoods(
     unified: &UnifiedAlleleSet,
     projection: &ScalarProjection,
-    ca_flags: &[Vec<bool>],
-    group: &OverlappingVarGroup,
-    ctx: &LikelihoodCtx,
+    chain_anchor_flags: &[Vec<bool>],
+    group: &OverlappingVariantGroup,
+    ctx: &LikelihoodContext,
 ) -> Result<Vec<Vec<f64>>, PerGroupMergerError> {
     let n_samples = projection.scalars.len();
     let ploidy = ctx.ploidy;
@@ -1381,7 +1408,7 @@ fn compute_log_likelihoods(
             // Chain-broken-compound fallback check.
             let chain_broken_compound = genotype.iter().find_map(|&a| {
                 let a = a as usize;
-                if unified.alleles[a].is_compound && ca_flags[sample_idx][a] {
+                if unified.alleles[a].is_compound && chain_anchor_flags[sample_idx][a] {
                     Some(a)
                 } else {
                     None
@@ -1487,7 +1514,7 @@ fn standard_log_likelihood(
 /// reconstructed per-position.
 fn chain_broken_log_likelihood(
     unified: &UnifiedAlleleSet,
-    group: &OverlappingVarGroup,
+    group: &OverlappingVariantGroup,
     sample_idx: usize,
     genotype: &[u8],
     compound_idx: usize,
@@ -1660,8 +1687,8 @@ mod tests {
     }
 
     fn ok_iter(
-        groups: Vec<OverlappingVarGroup>,
-    ) -> std::vec::IntoIter<Result<OverlappingVarGroup, GrouperError>> {
+        groups: Vec<OverlappingVariantGroup>,
+    ) -> std::vec::IntoIter<Result<OverlappingVariantGroup, GrouperError>> {
         groups
             .into_iter()
             .map(Ok::<_, GrouperError>)
@@ -1692,7 +1719,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 2, vec![(0, rec_s0), (1, rec_s1)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -1728,7 +1755,7 @@ mod tests {
         );
         let rec_s1 = record(0, 100, vec![allele(b"A", stats(8, -0.5), &[])]);
         let pp = pp_one(0, 100, 2, vec![(0, rec_s0), (1, rec_s1)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -1760,7 +1787,7 @@ mod tests {
         // Sample 1 covers p=100 only; ref_span=1, REF=A.
         let rec_s1 = record(0, 100, vec![allele(b"A", stats(10, -0.5), &[])]);
         let pp = pp_one(0, 100, 2, vec![(0, rec_s0), (1, rec_s1)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 101,
@@ -1786,7 +1813,7 @@ mod tests {
         // Every sample has only REF allele after unification.
         let rec_s0 = record(0, 100, vec![allele(b"A", stats(8, -1.0), &[])]);
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -1824,7 +1851,7 @@ mod tests {
             ],
         );
         let pp1 = pp_one(0, 101, 2, vec![(0, rec_s0_p101)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 101,
@@ -1871,7 +1898,7 @@ mod tests {
         );
         let pp0 = pp_one(0, 100, 1, vec![(0, rec_s0_p100)]);
         let pp1 = pp_one(0, 102, 1, vec![(0, rec_s0_p102)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 102,
@@ -1899,7 +1926,7 @@ mod tests {
         assert_eq!(record.alleles.iter().filter(|a| a.is_compound).count(), 1);
         // Sample is chain-evident at the compound ⇒ ca_flag false.
         let compound_idx = record.alleles.iter().position(|a| a.is_compound).unwrap();
-        assert!(!record.ca_flags[0][compound_idx]);
+        assert!(!record.chain_anchor_flags[0][compound_idx]);
     }
 
     #[test]
@@ -1924,7 +1951,7 @@ mod tests {
         );
         let pp0 = pp_one(0, 100, 1, vec![(0, rec_s0_p100)]);
         let pp1 = pp_one(0, 102, 1, vec![(0, rec_s0_p102)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 102,
@@ -1953,7 +1980,7 @@ mod tests {
         // p=102. Sample 0 has a single read linking them (chain id
         // 42). Sample 1 has them on independent reads. Compound is
         // chain-anchored by sample 0; sample 1 is chain-broken ⇒
-        // ca_flags[1][compound] = true.
+        // chain_anchor_flags[1][compound] = true.
         let rec_s0_p100 = record(
             0,
             100,
@@ -1988,7 +2015,7 @@ mod tests {
         );
         let pp0 = pp_one(0, 100, 2, vec![(0, rec_s0_p100), (1, rec_s1_p100)]);
         let pp1 = pp_one(0, 102, 2, vec![(0, rec_s0_p102), (1, rec_s1_p102)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 102,
@@ -2010,8 +2037,14 @@ mod tests {
             .iter()
             .position(|a| a.is_compound)
             .expect("compound is chain-anchored");
-        assert!(!record.ca_flags[0][compound_idx], "sample 0 anchors");
-        assert!(record.ca_flags[1][compound_idx], "sample 1 is chain-broken");
+        assert!(
+            !record.chain_anchor_flags[0][compound_idx],
+            "sample 0 anchors"
+        );
+        assert!(
+            record.chain_anchor_flags[1][compound_idx],
+            "sample 1 is chain-broken"
+        );
     }
 
     // ---------- genotype enumeration ----------
@@ -2055,7 +2088,7 @@ mod tests {
         ];
         let rec = record(0, 100, alleles);
         let pp = pp_one(0, 100, 1, vec![(0, rec)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2087,7 +2120,7 @@ mod tests {
         // Sample 0 has only REF allele at one position.
         let rec_s0 = record(0, 100, vec![allele(b"A", stats(8, 0.0), &[])]);
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2128,7 +2161,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2176,7 +2209,7 @@ mod tests {
         // a chain-anchored compound.
         let pp0 = pp_one(0, 100, 1, vec![(0, rec_s0_p100)]);
         let pp1 = pp_one(0, 102, 1, vec![(0, rec_s0_p102)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 102,
@@ -2225,7 +2258,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2272,13 +2305,13 @@ mod tests {
         );
         let pp_a = pp_one(0, 100, 1, vec![(0, rec_a)]);
         let pp_b = pp_one(0, 200, 1, vec![(0, rec_b)]);
-        let group_a = OverlappingVarGroup {
+        let group_a = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
             records: vec![pp_a],
         };
-        let group_b = OverlappingVarGroup {
+        let group_b = OverlappingVariantGroup {
             chrom_id: 0,
             start: 200,
             end: 200,
@@ -2307,14 +2340,14 @@ mod tests {
 
     #[test]
     fn sub_stats_subtraction_preserves_negative_q_sum_residual() {
-        // Regression: `sub_stats` previously clamped via `.max(0.0)`,
+        // Regression: `subtract_support` previously clamped via `.max(0.0)`,
         // which wiped a legitimate negative residual. `q_sum` is a
         // sum of `ln(P_err) ≤ 0`; subtracting a less-negative `src`
         // from a more-negative `into` must produce a more-negative
         // residual, capped at 0 (over-subtraction).
         let mut into = AlleleSupportStats::new(10, -50.0, 5, 2, 1);
         let src = AlleleSupportStats::new(3, -15.0, 1, 0, 0);
-        sub_stats(&mut into, &src);
+        subtract_support(&mut into, &src);
         assert_eq!(into.num_obs, 7);
         assert!(
             (into.q_sum - (-35.0)).abs() < 1e-9,
@@ -2333,7 +2366,7 @@ mod tests {
         // 0, not let it go positive.
         let mut into = AlleleSupportStats::new(5, -10.0, 2, 1, 0);
         let src = AlleleSupportStats::new(5, -25.0, 2, 1, 0);
-        sub_stats(&mut into, &src);
+        subtract_support(&mut into, &src);
         assert_eq!(into.num_obs, 0);
         assert_eq!(into.q_sum, 0.0);
     }
@@ -2354,7 +2387,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2385,7 +2418,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2405,7 +2438,7 @@ mod tests {
     fn add_stats_saturates_on_overflow() {
         let mut into = AlleleSupportStats::new(u32::MAX - 1, -1.0, 0, 0, 0);
         let src = AlleleSupportStats::new(10, -2.0, 0, 0, 0);
-        add_stats(&mut into, &src);
+        add_support(&mut into, &src);
         assert_eq!(into.num_obs, u32::MAX, "saturating add expected");
         assert!((into.q_sum - (-3.0)).abs() < 1e-9);
     }
@@ -2416,7 +2449,7 @@ mod tests {
     fn process_group_returns_error_on_inverted_start_end() {
         let rec_s0 = record(0, 200, vec![allele(b"A", stats(1, 0.0), &[])]);
         let pp = pp_one(0, 200, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 200,
             end: 100,
@@ -2455,7 +2488,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 101,
@@ -2483,7 +2516,7 @@ mod tests {
             ],
         );
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2504,7 +2537,7 @@ mod tests {
 
     #[test]
     fn empty_records_group_drops() {
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 100,
@@ -2528,7 +2561,7 @@ mod tests {
         // requested local_allele_idx doesn't exist on any sample.
         let rec_s0 = record(0, 100, vec![allele(b"A", stats(2, -0.5), &[])]);
         let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 7,
             start: 100,
             end: 100,
@@ -2579,7 +2612,7 @@ mod tests {
         );
         let pp0 = pp_one(0, 100, 1, vec![(0, rec_s0_p100)]);
         let pp1 = pp_one(0, 102, 1, vec![(0, rec_s0_p102)]);
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 102,
@@ -2627,7 +2660,7 @@ mod tests {
             ],
             dropped_other: DroppedOther::default(),
         };
-        let group = OverlappingVarGroup {
+        let group = OverlappingVariantGroup {
             chrom_id: 0,
             start: 100,
             end: 102,

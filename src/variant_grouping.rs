@@ -40,7 +40,7 @@ pub struct VarIteratorInfo {
 /// The group covers a contiguous genomic region where all contained variants
 /// have reference-allele spans that overlap with the group's span.
 #[derive(Debug)]
-pub struct OverlappingVarGroup {
+pub struct OverlappingVariantGroup {
     pub chrom: String,
     /// Start position of the group (1-based, inclusive).
     pub start: u32,
@@ -53,7 +53,7 @@ pub struct OverlappingVarGroup {
     pub source_var_iter_idxs: Vec<usize>,
 }
 
-impl OverlappingVarGroup {
+impl OverlappingVariantGroup {
     pub fn span(&self) -> (&str, u32, u32) {
         (&self.chrom, self.start, self.end)
     }
@@ -150,7 +150,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         &self.iter_info
     }
 
-    fn fail(&mut self, error: VcfParseError) -> Option<VcfResult<OverlappingVarGroup>> {
+    fn fail(&mut self, error: VcfParseError) -> Option<VcfResult<OverlappingVariantGroup>> {
         self.done = true;
         Some(Err(error))
     }
@@ -308,7 +308,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         chrom: String,
         start: u32,
         mut group_end: u32,
-    ) -> VcfResult<OverlappingVarGroup> {
+    ) -> VcfResult<OverlappingVariantGroup> {
         let mut variants: Vec<Variant> = Vec::new();
         let mut source_var_iter_idxs: Vec<usize> = Vec::new();
 
@@ -363,7 +363,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
             }
         }
 
-        Ok(OverlappingVarGroup {
+        Ok(OverlappingVariantGroup {
             chrom,
             start,
             end: group_end,
@@ -383,7 +383,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
         Ok(false)
     }
 
-    fn get_next_var_group(&mut self) -> Option<VcfResult<OverlappingVarGroup>> {
+    fn get_next_var_group(&mut self) -> Option<VcfResult<OverlappingVariantGroup>> {
         if self.done {
             return None;
         }
@@ -419,7 +419,7 @@ impl<B: BufRead + Send> VarGroupIterator<B> {
 }
 
 impl<B: BufRead + Send> Iterator for VarGroupIterator<B> {
-    type Item = VcfResult<OverlappingVarGroup>;
+    type Item = VcfResult<OverlappingVariantGroup>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.get_next_var_group()

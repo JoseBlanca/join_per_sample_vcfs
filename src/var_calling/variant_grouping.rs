@@ -4,15 +4,15 @@
 //! PerPositionMergerError>` items in strictly increasing `(chrom_id, pos)` order
 //! (the contract `PerPositionMerger` provides), the [`VariantGrouper`]
 //! bundles positions whose REF spans overlap into a single
-//! [`OverlappingVarGroup`] and emits a stream of independent groups.
+//! [`OverlappingVariantGroup`] and emits a stream of independent groups.
 //!
 //! Pure-REF positions across every sample with no group currently
 //! open are dropped at the iterator boundary without ever being
 //! folded into a group — see the "seed-time filter" rationale in
 //! `doc/devel/implementation_plans/cohort_variant_grouping.md`. The
-//! `max_var_group_span` cap in [`GrouperConfig`] hard-bounds the
+//! `max_variant_group_span` cap in [`GrouperConfig`] hard-bounds the
 //! reach of any emitted group; exceeding it is a
-//! [`GrouperError::VarGroupTooWide`] rather than a silent drop.
+//! [`GrouperError::VariantGroupTooWide`] rather than a silent drop.
 //!
 //! The grouper is generic on the upstream iterator type so synthetic
 //! `std::iter`-based fixtures can drive it in unit tests without
@@ -22,12 +22,12 @@ use thiserror::Error;
 
 use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 
-/// Default value for [`GrouperConfig::max_var_group_span`].
+/// Default value for [`GrouperConfig::max_variant_group_span`].
 ///
 /// 2× Stage 1's `MAX_RECORD_SPAN` (5000 bp). High enough that real
 /// cohorts have headroom for cross-sample transitive extension
 /// chains, low enough to bound memory on adversarial inputs.
-pub const DEFAULT_MAX_VAR_GROUP_SPAN: u32 = 10_000;
+pub const DEFAULT_MAX_VARIANT_GROUP_SPAN: u32 = 10_000;
 
 /// Tunable knobs for the grouper. Follows the per-stage config
 /// convention described in
@@ -37,23 +37,23 @@ pub const DEFAULT_MAX_VAR_GROUP_SPAN: u32 = 10_000;
 #[non_exhaustive]
 pub struct GrouperConfig {
     /// Hard cap on the reference span of any emitted
-    /// [`OverlappingVarGroup`]. A group whose `end - start + 1`
+    /// [`OverlappingVariantGroup`]. A group whose `end - start + 1`
     /// would exceed this value triggers
-    /// [`GrouperError::VarGroupTooWide`] and the iterator latches
-    /// `done`. Defaults to [`DEFAULT_MAX_VAR_GROUP_SPAN`].
+    /// [`GrouperError::VariantGroupTooWide`] and the iterator latches
+    /// `done`. Defaults to [`DEFAULT_MAX_VARIANT_GROUP_SPAN`].
     ///
     /// The bound is defensive — Stage 1's `MAX_RECORD_SPAN` already
     /// caps every single record's reach, so in normal operation
     /// the cap is never reached. Users hitting it on real data
     /// should raise it explicitly via the config rather than rely
     /// on the grouper to silently drop the group.
-    pub max_var_group_span: u32,
+    pub max_variant_group_span: u32,
 }
 
 impl Default for GrouperConfig {
     fn default() -> Self {
         Self {
-            max_var_group_span: DEFAULT_MAX_VAR_GROUP_SPAN,
+            max_variant_group_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
         }
     }
 }
@@ -62,14 +62,14 @@ impl Default for GrouperConfig {
 /// in strictly increasing `pos` order. `start` and `end` are 1-based
 /// inclusive and cover the union of every record's REF span.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OverlappingVarGroup {
+pub struct OverlappingVariantGroup {
     pub chrom_id: u32,
     pub start: u32,
     pub end: u32,
     pub records: Vec<PerPositionPileups>,
 }
 
-impl OverlappingVarGroup {
+impl OverlappingVariantGroup {
     pub fn span(&self) -> (u32, u32, u32) {
         (self.chrom_id, self.start, self.end)
     }
@@ -77,7 +77,7 @@ impl OverlappingVarGroup {
 
 /// Errors the grouper can emit. Upstream errors come through wrapped
 /// in [`GrouperError::Upstream`]; grouper-side failures (currently
-/// just [`GrouperError::VarGroupTooWide`]) are their own variants.
+/// just [`GrouperError::VariantGroupTooWide`]) are their own variants.
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum GrouperError {
@@ -85,14 +85,14 @@ pub enum GrouperError {
     Upstream(#[from] PerPositionMergerError),
 
     /// A group's reference span would exceed
-    /// [`GrouperConfig::max_var_group_span`]. The locus is reported
+    /// [`GrouperConfig::max_variant_group_span`]. The locus is reported
     /// so the user can either investigate it or raise the cap.
     #[error(
         "variant group at chrom {chrom_id} starting at {start} would span \
-         {attempted_span} bp (>{cap} bp cap); raise GrouperConfig::max_var_group_span \
+         {attempted_span} bp (>{cap} bp cap); raise GrouperConfig::max_variant_group_span \
          or investigate the locus"
     )]
-    VarGroupTooWide {
+    VariantGroupTooWide {
         chrom_id: u32,
         start: u32,
         attempted_end: u32,
@@ -148,7 +148,7 @@ where
 {
     /// Construct a grouper with explicit tuning. Pass
     /// [`GrouperConfig::default()`] for the standard defaults; pass an
-    /// explicit value for [`GrouperConfig::max_var_group_span`] to
+    /// explicit value for [`GrouperConfig::max_variant_group_span`] to
     /// override.
     pub fn with_config(upstream: I, config: GrouperConfig) -> Self {
         Self {
@@ -189,7 +189,7 @@ impl<I> Iterator for VariantGrouper<I>
 where
     I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
 {
-    type Item = Result<OverlappingVarGroup, GrouperError>;
+    type Item = Result<OverlappingVariantGroup, GrouperError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -222,14 +222,14 @@ where
         // ref_span alone exceeding the cap. Stage 1's MAX_RECORD_SPAN
         // should prevent this in normal operation, but the cap
         // should not rely on that invariant silently.
-        if seed_end - start + 1 > self.config.max_var_group_span {
+        if seed_end - start + 1 > self.config.max_variant_group_span {
             self.done = true;
-            return Some(Err(GrouperError::VarGroupTooWide {
+            return Some(Err(GrouperError::VariantGroupTooWide {
                 chrom_id,
                 start,
                 attempted_end: seed_end,
                 attempted_span: seed_end - start + 1,
-                cap: self.config.max_var_group_span,
+                cap: self.config.max_variant_group_span,
             }));
         }
 
@@ -242,7 +242,7 @@ where
             match self.upstream.next() {
                 None => {
                     self.done = true;
-                    return Some(Ok(OverlappingVarGroup {
+                    return Some(Ok(OverlappingVariantGroup {
                         chrom_id,
                         start,
                         end,
@@ -263,7 +263,7 @@ where
                         // call (possibly dropping it if it is itself
                         // pure-REF).
                         self.pending_seed = Some(pp);
-                        return Some(Ok(OverlappingVarGroup {
+                        return Some(Ok(OverlappingVariantGroup {
                             chrom_id,
                             start,
                             end,
@@ -273,14 +273,14 @@ where
 
                     let pp_ref_span = max_ref_span(&pp);
                     let attempted_end = end.max(pp.pos + pp_ref_span - 1);
-                    if attempted_end - start + 1 > self.config.max_var_group_span {
+                    if attempted_end - start + 1 > self.config.max_variant_group_span {
                         self.done = true;
-                        return Some(Err(GrouperError::VarGroupTooWide {
+                        return Some(Err(GrouperError::VariantGroupTooWide {
                             chrom_id,
                             start,
                             attempted_end,
                             attempted_span: attempted_end - start + 1,
-                            cap: self.config.max_var_group_span,
+                            cap: self.config.max_variant_group_span,
                         }));
                     }
                     end = attempted_end;
@@ -351,7 +351,7 @@ mod tests {
         slot: usize,
         record: PileupRecord,
     ) -> PerPositionPileups {
-        let mut per_sample: Vec<Option<PileupRecord>> = (0..n_samples).map(|_| None).collect();
+        let mut per_sample: Vec<Option<PileupRecord>> = vec![None; n_samples];
         per_sample[slot] = Some(record);
         PerPositionPileups {
             chrom_id,
@@ -394,7 +394,7 @@ mod tests {
         PerPositionPileups {
             chrom_id,
             pos,
-            per_sample: (0..n_samples).map(|_| None).collect(),
+            per_sample: vec![None; n_samples],
         }
     }
 
@@ -408,7 +408,7 @@ mod tests {
 
     fn collect_groups<I>(
         grouper: VariantGrouper<I>,
-    ) -> Result<Vec<OverlappingVarGroup>, GrouperError>
+    ) -> Result<Vec<OverlappingVariantGroup>, GrouperError>
     where
         I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
     {
@@ -669,7 +669,7 @@ mod tests {
         assert!(grouper.next().is_none());
     }
 
-    // ---------- max_var_group_span cap ----------
+    // ---------- max_variant_group_span cap ----------
 
     #[test]
     fn cap_triggered_by_extension() {
@@ -680,12 +680,12 @@ mod tests {
         // attempted_end = max(107, 107+5-1)=111, span=12 > 10.
         // The cap must trip; no group is emitted.
         let config = GrouperConfig {
-            max_var_group_span: 10,
+            max_variant_group_span: 10,
         };
         let upstream = ok_iter(vec![del_pp(0, 100, 1, 0, 8), del_pp(0, 107, 1, 0, 5)]);
         let mut grouper = VariantGrouper::with_config(upstream, config);
         match grouper.next() {
-            Some(Err(GrouperError::VarGroupTooWide {
+            Some(Err(GrouperError::VariantGroupTooWide {
                 chrom_id,
                 start,
                 attempted_end,
@@ -698,7 +698,7 @@ mod tests {
                 assert_eq!(attempted_span, 12);
                 assert_eq!(cap, 10);
             }
-            other => panic!("expected VarGroupTooWide, got {other:?}"),
+            other => panic!("expected VariantGroupTooWide, got {other:?}"),
         }
         assert!(grouper.next().is_none());
     }
@@ -709,12 +709,12 @@ mod tests {
         // Seed: deletion at p=100 with ref_span=5 → seed_end=104,
         // span=5 > 4 → error even before any extension.
         let config = GrouperConfig {
-            max_var_group_span: 4,
+            max_variant_group_span: 4,
         };
         let upstream = ok_iter(vec![del_pp(0, 100, 1, 0, 5)]);
         let mut grouper = VariantGrouper::with_config(upstream, config);
         match grouper.next() {
-            Some(Err(GrouperError::VarGroupTooWide {
+            Some(Err(GrouperError::VariantGroupTooWide {
                 chrom_id,
                 start,
                 attempted_end,
@@ -727,7 +727,7 @@ mod tests {
                 assert_eq!(attempted_span, 5);
                 assert_eq!(cap, 4);
             }
-            other => panic!("expected VarGroupTooWide, got {other:?}"),
+            other => panic!("expected VariantGroupTooWide, got {other:?}"),
         }
         assert!(grouper.next().is_none());
     }
@@ -738,7 +738,7 @@ mod tests {
         // Seed: deletion at p=100 with ref_span=5 → end=104,
         // span=5. Exactly at the cap, not over — must emit.
         let config = GrouperConfig {
-            max_var_group_span: 5,
+            max_variant_group_span: 5,
         };
         let upstream = ok_iter(vec![del_pp(0, 100, 1, 0, 5)]);
         let groups = collect_groups(VariantGrouper::with_config(upstream, config)).unwrap();
@@ -769,15 +769,15 @@ mod tests {
     #[test]
     fn default_config_has_documented_cap() {
         let cfg = GrouperConfig::default();
-        assert_eq!(cfg.max_var_group_span, DEFAULT_MAX_VAR_GROUP_SPAN);
+        assert_eq!(cfg.max_variant_group_span, DEFAULT_MAX_VARIANT_GROUP_SPAN);
     }
 
     #[test]
     fn config_accessor_returns_active_config() {
         let cfg = GrouperConfig {
-            max_var_group_span: 42,
+            max_variant_group_span: 42,
         };
         let grouper = VariantGrouper::with_config(iter_from(Vec::<Item>::new()), cfg);
-        assert_eq!(grouper.config().max_var_group_span, 42);
+        assert_eq!(grouper.config().max_variant_group_span, 42);
     }
 }

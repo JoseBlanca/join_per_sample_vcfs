@@ -273,8 +273,7 @@ where
         // raw `0..n` range — we still need parallel access to
         // `self.heads`, `self.readers`, and `self.sample_names` by
         // the same index.
-        let mut per_sample: Vec<Option<PileupRecord>> =
-            (0..self.n_samples()).map(|_| None).collect();
+        let mut per_sample: Vec<Option<PileupRecord>> = vec![None; self.n_samples()];
         for (sample_idx, slot) in per_sample.iter_mut().enumerate() {
             let head_at_min = self.heads[sample_idx]
                 .as_ref()
