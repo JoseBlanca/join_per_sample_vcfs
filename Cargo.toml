@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "psp_reader_perf"
 harness = false
+
+[[bench]]
+name = "cohort_perf"
+harness = false

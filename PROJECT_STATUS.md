@@ -21,13 +21,17 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Stage 5 per-group merger — code-review fixes
->   landed on 2026-05-16
->   ([reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md));
->   no implementation report saved yet.
-> - **Next task:** _set by human PM._ Standing candidates: write the Stage
->   5 implementation report; plan Stage 3 (DUST filter); plan Stage 6
->   (posterior engine); pick up the standing items below
+> - **Last completed task:** Cohort criterion bench scaffold landed on
+>   2026-05-16 ([benches/cohort_perf.rs](benches/cohort_perf.rs)); the
+>   perf review itself was *deferred* because the session's seccomp
+>   filter blocks `perf_event_open` and no sampling profile could be
+>   captured. Baseline criterion numbers saved at
+>   [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt).
+> - **Next task:** _set by human PM._ Standing candidates: re-run the
+>   perf review once a sampling profiler is available (run benches
+>   outside the sandbox; pair with samply / cargo flamegraph); write the
+>   Stage 5 implementation report; plan Stage 3 (DUST filter); plan
+>   Stage 6 (posterior engine); pick up the standing items below
 >   (BED-region skip, phase-chain integration tests).
 
 ---
@@ -126,17 +130,22 @@ grouper.
 - **Plan:** [multi_way_per_position_iterator.md](doc/devel/implementation_plans/multi_way_per_position_iterator.md)
 - **Impl report:** [multi_way_per_position_iterator_2026-05-15.md](doc/devel/reports/implementations/multi_way_per_position_iterator_2026-05-15.md)
 - **Code:** [src/cohort/per_position_merger.rs](src/cohort/per_position_merger.rs)
+- **Bench:** `cohort_merger/*` in [benches/cohort_perf.rs](benches/cohort_perf.rs)
 - **Latest review:** [reviews/per-position-merger_2026-05-15.md](reviews/per-position-merger_2026-05-15.md)
 - **Latest fixes-applied:** bundled into [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md) (cohort run).
-- **Open:** none
+- **Open:** perf review deferred — sampling profile blocked by the
+  Claude Code session sandbox (see baseline numbers in
+  [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt)).
 
 #### Variant grouper (Stage 4 bundler)
 - **Status:** fixes-applied (2026-05-16); no separate implementation report
 - **Plan:** [cohort_variant_grouping.md](doc/devel/implementation_plans/cohort_variant_grouping.md)
 - **Code:** [src/cohort/variant_grouping.rs](src/cohort/variant_grouping.rs)
+- **Bench:** `cohort_grouper/*` in [benches/cohort_perf.rs](benches/cohort_perf.rs)
 - **Latest review:** [reviews/cohort_2026-05-16.md](reviews/cohort_2026-05-16.md)
 - **Latest fixes-applied:** [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md)
-- **Open:** implementation report not yet written.
+- **Open:** implementation report not yet written; perf review
+  deferred (sampling profile blocked — see Stage 3 entry above).
 
 ---
 
@@ -150,6 +159,9 @@ via rayon.
 - **Status:** fixes-applied (2026-05-16)
 - **Plan:** [cohort_per_group_merger.md](doc/devel/implementation_plans/cohort_per_group_merger.md)
 - **Code:** [src/cohort/per_group_merger.rs](src/cohort/per_group_merger.rs)
+- **Bench:** `cohort_per_group_merger/*` in [benches/cohort_perf.rs](benches/cohort_perf.rs).
+  Slowest stage per element on the criterion baseline; the natural
+  starting point for the deferred perf review.
 - **Impl report:** not yet saved.
 - **Latest review:** [reviews/cohort_2026-05-16.md](reviews/cohort_2026-05-16.md)
 - **Latest fixes-applied:** [reviews/fixes_applied_2026-05-16.md](reviews/fixes_applied_2026-05-16.md)
@@ -159,6 +171,11 @@ via rayon.
     one and link it here.
   - Phase-chain integration tests for the likelihood calculation (see
     *Standing items* below).
+  - Perf review deferred — sampling profile blocked by the Claude Code
+    session sandbox. Baseline numbers + candidate sites recorded in
+    [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt).
+    Re-run the perf-review skill once a sampling profiler is available
+    (outside the sandbox, with `samply` / `cargo flamegraph`).
 
 ---
 
