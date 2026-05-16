@@ -696,7 +696,24 @@ fn unify_alleles(
     ref_seq: &[u8],
     n_samples: usize,
 ) -> Result<UnifiedAlleleSet, PerGroupMergerError> {
-    // Index `byte_key → position in alleles`. REF is always at 0.
+    let (mut alleles, mut byte_index) = project_per_position_alleles(group, ref_seq, n_samples);
+    admit_compound_candidates(&mut alleles, &mut byte_index, group, ref_seq, n_samples)?;
+    Ok(UnifiedAlleleSet {
+        alleles,
+        dropped_other: DroppedOther::default(),
+    })
+}
+
+/// Step 1 of unification: seed `alleles[0]` with REF over the group's
+/// reference span, then project every per-sample `(record, local
+/// allele)` onto the same span and dedupe by byte equality. Returns
+/// the in-progress allele vector and the `byte_key → allele_idx`
+/// lookup table that step 2 reuses when admitting compound candidates.
+fn project_per_position_alleles(
+    group: &OverlappingVariantGroup,
+    ref_seq: &[u8],
+    n_samples: usize,
+) -> (Vec<UnifiedAllele>, BTreeMap<Vec<u8>, usize>) {
     let mut alleles: Vec<UnifiedAllele> = Vec::new();
     let mut byte_index: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
 
@@ -711,8 +728,6 @@ fn unify_alleles(
     });
     byte_index.insert(ref_seq.to_vec(), 0);
 
-    // Project every (sample, record, allele) onto the group span and
-    // dedupe by byte equality.
     for (record_idx, pp) in group.records.iter().enumerate() {
         let local_offset = (pp.pos - group.start) as usize;
         for (sample_idx, slot) in pp.per_sample.iter().enumerate() {
@@ -744,10 +759,23 @@ fn unify_alleles(
             }
         }
     }
-    // REF is always protected.
-    alleles[0].cap_protected = true;
 
-    // ---- Compound-candidate detection + chain-anchor admission ----
+    (alleles, byte_index)
+}
+
+/// Step 2 of unification: detect cross-record compound candidates
+/// from chain-id evidence, project each onto the group span, and
+/// admit them into `alleles` (either extending an existing entry whose
+/// byte sequence already matches or appending a new entry). Populates
+/// per-sample chain-anchor counts and constituent-source lists used
+/// by the scalar-subtraction pass in [`project_scalars`].
+fn admit_compound_candidates(
+    alleles: &mut Vec<UnifiedAllele>,
+    byte_index: &mut BTreeMap<Vec<u8>, usize>,
+    group: &OverlappingVariantGroup,
+    ref_seq: &[u8],
+    n_samples: usize,
+) -> Result<(), PerGroupMergerError> {
     let compounds = detect_compound_candidates(group, n_samples);
     for candidate in compounds {
         let projected =
@@ -793,11 +821,7 @@ fn unify_alleles(
             }
         }
     }
-
-    Ok(UnifiedAlleleSet {
-        alleles,
-        dropped_other: DroppedOther::default(),
-    })
+    Ok(())
 }
 
 /// Project a single record's local allele onto the group's reference
@@ -1104,14 +1128,29 @@ fn project_scalars(
     n_samples: usize,
 ) -> Result<ScalarProjection, PerGroupMergerError> {
     let n_kept = unified.alleles.len();
-
     let mut scalars: Vec<Vec<AlleleSupportStats>> = (0..n_samples)
         .map(|_| vec![AlleleSupportStats::default(); n_kept])
         .collect();
-    let mut other_scalars: Vec<AlleleSupportStats> = vec![AlleleSupportStats::default(); n_samples];
 
-    // Per-position scalars: sum every non-compound allele's
-    // per-sample sources into `scalars[s][allele_idx]`.
+    sum_per_position_scalars(&mut scalars, group, unified);
+    let other_scalars = pool_dropped_other_scalars(group, &unified.dropped_other, n_samples);
+    project_compound_scalars(&mut scalars, group, unified)?;
+    subtract_compound_from_constituents(&mut scalars, group, unified)?;
+
+    Ok(ScalarProjection {
+        scalars,
+        other_scalars,
+    })
+}
+
+/// Step 1 of scalar projection: sum every non-compound allele's
+/// per-sample sources into `scalars[sample_idx][allele_idx]`. The
+/// compound entries are filled in by [`project_compound_scalars`].
+fn sum_per_position_scalars(
+    scalars: &mut [Vec<AlleleSupportStats>],
+    group: &OverlappingVariantGroup,
+    unified: &UnifiedAlleleSet,
+) {
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if allele.is_compound {
             continue;
@@ -1129,29 +1168,46 @@ fn project_scalars(
             scalars[sample_idx][allele_idx] = bucket;
         }
     }
+}
 
-    // OTHER pool: alleles dropped by the `max_alleles` cap. Their
-    // per-sample sources still contribute to the error-cost term in
-    // every genotype's likelihood, so they fold into `other_scalars`
-    // here rather than disappearing entirely.
-    if !unified.dropped_other.is_empty() {
-        for (sample_idx, sources) in unified.dropped_other.per_sample_sources.iter().enumerate() {
-            for &(record_idx, local_allele_idx) in sources {
-                let pp = &group.records[record_idx];
-                let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
-                    continue;
-                };
-                let support = rec.alleles[local_allele_idx].support;
-                add_support(&mut other_scalars[sample_idx], &support);
-            }
+/// Step 2 of scalar projection: pool the per-sample sources of every
+/// allele dropped by the `max_alleles` cap into the per-sample OTHER
+/// bucket. Those scalars still contribute to the error-cost term in
+/// every genotype's likelihood, so they fold into `other_scalars`
+/// here rather than disappearing entirely.
+fn pool_dropped_other_scalars(
+    group: &OverlappingVariantGroup,
+    dropped_other: &DroppedOther,
+    n_samples: usize,
+) -> Vec<AlleleSupportStats> {
+    let mut other_scalars: Vec<AlleleSupportStats> = vec![AlleleSupportStats::default(); n_samples];
+    if dropped_other.is_empty() {
+        return other_scalars;
+    }
+    for (sample_idx, sources) in dropped_other.per_sample_sources.iter().enumerate() {
+        for &(record_idx, local_allele_idx) in sources {
+            let pp = &group.records[record_idx];
+            let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
+                continue;
+            };
+            let support = rec.alleles[local_allele_idx].support;
+            add_support(&mut other_scalars[sample_idx], &support);
         }
     }
+    other_scalars
+}
 
-    // Compound entries: chain-evident samples get
-    // (count = |chain_id ∩|, S_s = |chain_id ∩| × min over
-    // constituents of (q_sum / num_obs)). Bias counts (fwd,
-    // placed_left, placed_start) are scaled from any constituent's
-    // bias by |chain_id ∩| / num_obs.
+/// Step 3 of scalar projection: build the per-sample compound scalar
+/// for every chain-anchored compound allele. Chain-evident samples
+/// get `(count = |chain_id ∩|, S_s = count × min over constituents of
+/// (q_sum / num_obs))`; bias counts (fwd, placed_left, placed_start)
+/// are scaled from any constituent's bias by `|chain_id ∩| / num_obs`.
+/// See the per-group merger plan §"Step 3" for the derivation.
+fn project_compound_scalars(
+    scalars: &mut [Vec<AlleleSupportStats>],
+    group: &OverlappingVariantGroup,
+    unified: &UnifiedAlleleSet,
+) -> Result<(), PerGroupMergerError> {
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if !allele.is_compound {
             continue;
@@ -1221,13 +1277,23 @@ fn project_scalars(
             };
         }
     }
+    Ok(())
+}
 
-    // Subtract compound contribution from constituents in
-    // chain-anchored samples. A read that supports the compound
-    // should be attributed to the compound, not double-counted on
-    // each constituent. Build an O(1) `(sample, record, local) →
-    // kept_idx` index once so each lookup avoids the previous O(n)
-    // scan over `unified.alleles`.
+/// Step 4 of scalar projection: in every chain-anchored sample,
+/// subtract the compound's claim from each constituent's per-position
+/// scalars. A read that supports the compound also appears under each
+/// constituent's local allele in the raw record; without this step the
+/// constituent would be double-counted against the compound at the
+/// group level. The subtraction is scaled by `|chain_id ∩| / num_obs`
+/// and clamped per-field to avoid negative bias counts. Uses
+/// [`build_source_index`] once for O(1) constituent lookups across
+/// the entire pass.
+fn subtract_compound_from_constituents(
+    scalars: &mut [Vec<AlleleSupportStats>],
+    group: &OverlappingVariantGroup,
+    unified: &UnifiedAlleleSet,
+) -> Result<(), PerGroupMergerError> {
     let source_index = build_source_index(unified);
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if !allele.is_compound {
@@ -1281,11 +1347,7 @@ fn project_scalars(
             }
         }
     }
-
-    Ok(ScalarProjection {
-        scalars,
-        other_scalars,
-    })
+    Ok(())
 }
 
 /// Build a `(sample_idx, record_idx, local_allele_idx) → allele_idx`
