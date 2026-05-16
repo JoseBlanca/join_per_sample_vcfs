@@ -1417,11 +1417,11 @@ fn compute_log_likelihoods(
 
             let value = if let Some(compound_idx) = chain_broken_compound {
                 chain_broken_log_likelihood(
-                    unified,
+                    &unified.alleles[compound_idx],
+                    compound_idx as u8,
                     group,
                     sample_idx,
                     genotype,
-                    compound_idx,
                     ploidy,
                 )
             } else {
@@ -1513,18 +1513,17 @@ fn standard_log_likelihood(
 /// set's whole-group scalars don't apply when the haplotype is being
 /// reconstructed per-position.
 fn chain_broken_log_likelihood(
-    unified: &UnifiedAlleleSet,
+    compound: &UnifiedAllele,
+    compound_slot: u8,
     group: &OverlappingVariantGroup,
     sample_idx: usize,
     genotype: &[u8],
-    compound_idx: usize,
     ploidy: u8,
 ) -> f64 {
     // Decompose the genotype at each constituent position: the
     // compound's slot in the haplotype takes the constituent's local
     // allele; non-compound slots in the haplotype keep their
     // per-position projection.
-    let compound = &unified.alleles[compound_idx];
     if compound.constituents.is_empty() {
         return 0.0;
     }
@@ -1549,15 +1548,14 @@ fn chain_broken_log_likelihood(
             .collect();
 
         // Decode the genotype at this position: each slot that is
-        // `compound_idx` takes the constituent's local allele; other
+        // `compound_slot` takes the constituent's local allele; other
         // slots take REF (slot index 0) as the sentinel for "not
         // observed in the chain-broken interpretation". This matches
         // the plan's "G_decomposed: C/REF ⇒ at p_i, (Y_i, REF_i)"
         // convention.
         let mut per_pos_counts: Vec<u32> = vec![0; n_local_alleles];
         for &slot in genotype {
-            let slot = slot as usize;
-            let local_idx = if slot == compound_idx {
+            let local_idx = if slot == compound_slot {
                 constituent.local_allele_idx
             } else {
                 0 // REF
