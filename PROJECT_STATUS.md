@@ -21,19 +21,29 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort criterion bench scaffold landed on
->   2026-05-16 ([benches/var_calling_perf.rs](benches/var_calling_perf.rs),
->   originally named `benches/cohort_perf.rs`); the
->   perf review itself was *deferred* because the session's seccomp
->   filter blocks `perf_event_open` and no sampling profile could be
->   captured. Baseline criterion numbers saved at
->   [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt).
-> - **Next task:** _set by human PM._ Standing candidates: re-run the
->   perf review once a sampling profiler is available (run benches
->   outside the sandbox; pair with samply / cargo flamegraph); write the
->   Stage 5 implementation report; plan Stage 3 (DUST filter); plan
->   Stage 6 (posterior engine); pick up the standing items below
->   (BED-region skip, phase-chain integration tests).
+> - **Last completed task:** Wave 1 of the var_calling perf review
+>   shipped on 2026-05-16 — fixes L2, H1, H4, H3, **H2** applied
+>   (`AHashMap` for both intra-group maps with pre-sizing,
+>   precomputed `genotype_order` cache on the merger, stack-array
+>   scratch in `chain_broken_log_likelihood`, `SmallVec` inner for
+>   `per_sample_sources`, and **flat row-major `Vec<T>` for
+>   `MergedRecord.scalars` / `chain_anchor_flags` /
+>   `log_likelihoods`** — public API change with accessor methods,
+>   no Stage 6 consumer yet). All 571 lib tests pass; bit-exact. H2
+>   phase 2b is the cleanest signal: two back-to-back runs show
+>   biallelic_64 −14 % (p = 0.00), compound paths −7 to −9 %, all
+>   significant. Detailed write-up:
+>   [perf_var_calling_2026-05-16_applied.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16_applied.md).
+>   Original perf review (still load-bearing for the remaining
+>   findings): [perf_var_calling_2026-05-16.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16.md).
+> - **Next task:** _set by human PM._ Standing candidates: re-bench
+>   the full Wave-1 set on a quieter host with a clean
+>   pre-perf-review checkout baseline; apply the remaining Hot-path
+>   findings from the perf review — H5 (`DEFAULT_BATCH_SIZE` sweep),
+>   H6 (Stage 4 bench fixture-rebuild fix), H7 (cohort-size sweep);
+>   write the Stage 5 implementation report; plan Stage 3 (DUST
+>   filter); plan Stage 6 (posterior engine); pick up the standing
+>   items below (BED-region skip, phase-chain integration tests).
 
 ---
 
@@ -132,21 +142,32 @@ grouper.
 - **Impl report:** [multi_way_per_position_iterator_2026-05-15.md](doc/devel/reports/implementations/multi_way_per_position_iterator_2026-05-15.md)
 - **Code:** [src/var_calling/per_position_merger.rs](src/var_calling/per_position_merger.rs)
 - **Bench:** `var_calling_merger/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
-- **Latest review:** [per-position-merger_2026-05-15.md](doc/devel/reports/reviews/per-position-merger_2026-05-15.md)
+- **Latest reviews:** [per-position-merger_2026-05-15.md](doc/devel/reports/reviews/per-position-merger_2026-05-15.md), [perf_var_calling_2026-05-16.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16.md)
 - **Latest fixes-applied:** bundled into [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) (cohort run) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (Mi14/Mi15 OutOfOrder+ChromosomeMismatch land here).
-- **Open:** perf review deferred — sampling profile blocked by the
-  Claude Code session sandbox (see baseline numbers in
-  [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt)).
+- **Open:**
+  - **H6** (perf review): the Stage 4 merger bench is fixture-dominated
+    (67 % inclusive in `iter_batched` setup vs 21 % in
+    `PerPositionMerger::next`); rebuild fixtures once outside `b.iter`
+    before any Stage 4 code-level change can be defended.
+  - **L8** (perf review, depends on H6): `vec![None; self.n_samples()]`
+    per emission at [per_position_merger.rs:306](src/var_calling/per_position_merger.rs#L306)
+    is the candidate Stage 4 allocation site to revisit once the bench
+    is unblocked.
 
 #### Variant grouper (Stage 4 bundler)
 - **Status:** fixes-applied (2026-05-16); no separate implementation report
 - **Plan:** [cohort_variant_grouping.md](doc/devel/implementation_plans/cohort_variant_grouping.md)
 - **Code:** [src/var_calling/variant_grouping.rs](src/var_calling/variant_grouping.rs)
 - **Bench:** `var_calling_grouper/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
-- **Latest review:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md)
+- **Latest reviews:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md), [perf_var_calling_2026-05-16.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16.md)
 - **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (v2 closes the entire v1 deferred list)
-- **Open:** implementation report not yet written; perf review
-  deferred (sampling profile blocked — see Stage 3 entry above).
+- **Open:**
+  - Implementation report not yet written.
+  - **H6** (perf review): the Stage 4 grouper bench is also
+    fixture-dominated (77 % inclusive in `iter_batched` setup vs 13 %
+    in `VariantGrouper::next`); rebuild fixtures once outside `b.iter`
+    before any Stage 4 code-level change can be defended. Shared
+    bench-shape fix with the merger above.
 
 ---
 
@@ -161,22 +182,35 @@ via rayon.
 - **Plan:** [cohort_per_group_merger.md](doc/devel/implementation_plans/cohort_per_group_merger.md)
 - **Code:** [src/var_calling/per_group_merger.rs](src/var_calling/per_group_merger.rs)
 - **Bench:** `var_calling_per_group_merger/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs).
-  Slowest stage per element on the criterion baseline; the natural
-  starting point for the deferred perf review.
+  Slowest stage per element on the criterion baseline (~22 K groups/s
+  biallelic, ~12 K groups/s compound) and the primary focus of the
+  2026-05-16 perf review.
 - **Impl report:** not yet saved.
-- **Latest review:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md)
-- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (v2 closes the entire v1 deferred list)
+- **Latest reviews:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md), [perf_var_calling_2026-05-16.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16.md)
+- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (v2 closes the v1 deferred list) + [perf_var_calling_2026-05-16_applied.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16_applied.md) (Wave 1 of the perf review: L2 + H1 + H4 + H3 + H2 applied — H2 phase 2b is the headline ~14 % biallelic win, p = 0.00, confirmed by two back-to-back runs; all 571 tests pass)
 - **Open:**
   - Implementation report for the Stage 5 merger has not been saved; the
     next `rust-feature-implementation` run for this feature should produce
     one and link it here.
   - Phase-chain integration tests for the likelihood calculation (see
     *Standing items* below).
-  - Perf review deferred — sampling profile blocked by the Claude Code
-    session sandbox. Baseline numbers + candidate sites recorded in
-    [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt).
-    Re-run the perf-review skill once a sampling profiler is available
-    (outside the sandbox, with `samply` / `cargo flamegraph`).
+  - Re-bench Wave 1 on a quieter host with a clean pre-perf-review
+    checkout baseline to put an absolute number on the cumulative
+    L2 + H1 + H4 + H3 + H2 effect. The in-session ~12–14 %
+    biallelic_64 figure is reliable for H2 (back-to-back confirms);
+    the absolute pre-vs-post number drifted with host load. See
+    [perf_var_calling_2026-05-16_applied.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16_applied.md).
+  - Remaining Hot-path findings to apply (see
+    [perf_var_calling_2026-05-16.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16.md)
+    §5):
+    - **H5** — sweep `DEFAULT_BATCH_SIZE` (currently a self-declared
+      placeholder at [per_group_merger.rs:55](src/var_calling/per_group_merger.rs#L55))
+      and reset to the measured optimum.
+    - **H6** — Stage 4 bench fixture-rebuild fix (the per_position_merger
+      / variant_grouper benches' iter_batched setup is fixture-dominated
+      per the original perf review). Unblocks Stage 4 code-level findings.
+    - **H7** — cohort-size sweep at N=10/64/256/1024 samples.
+  - Wave 2 / 3 / Likely / Speculative findings tracked in the report.
 
 ---
 

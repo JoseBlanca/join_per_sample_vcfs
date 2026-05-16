@@ -26,8 +26,19 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 use thiserror::Error;
+
+/// Per-sample list of `(record_idx, local_allele_idx)` pairs used by
+/// the unify-alleles bookkeeping. Inline-1 covers the dominant
+/// biallelic case (≤ 1 source per sample); chain-anchored compound
+/// constituents (2+) spill to the heap, matching the previous `Vec`
+/// behaviour for that case. Sized to keep the per-allele
+/// `Vec<SourceList>` table cheap to allocate and drop on the rayon
+/// worker — the dominant Stage 5 allocator cost per the perf review.
+type SourceList = SmallVec<[(usize, usize); 1]>;
 
 use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
 use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
@@ -129,6 +140,16 @@ pub struct CompoundConstituent {
 /// `OverlappingVariantGroup`, the per-sample scalar table, the per-sample
 /// chain-anchor flags, and the per-sample, per-genotype log-likelihood
 /// vector under `c_s = 0`.
+///
+/// **Storage layout.** The three per-(sample, allele) and
+/// per-(sample, genotype) matrices below are row-major flat `Vec`s
+/// (sample-major). Use the accessor methods [`Self::scalars_row`],
+/// [`Self::chain_anchor_flag`] / [`Self::chain_anchor_flags_row`],
+/// and [`Self::log_likelihoods_row`] to read them rather than indexing
+/// the buffers directly. The flattening collapses what was previously
+/// `n_samples + 1` small heap allocations per matrix per record into a
+/// single allocation — the per-group merger's emit path is on Stage 5's
+/// allocator-bound critical path per the 2026-05-16 perf review.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergedRecord {
     pub chrom_id: u32,
@@ -141,31 +162,66 @@ pub struct MergedRecord {
     /// Cohort-wide ploidy used for genotype enumeration. Copied from
     /// [`PerGroupMergerConfig::ploidy`].
     pub ploidy: u8,
-    /// `scalars[sample_idx][allele_idx]` — projected
-    /// [`AlleleSupportStats`] for that sample/allele. A sample with
-    /// no records in the group has every entry zeroed.
-    pub scalars: Vec<Vec<AlleleSupportStats>>,
+    /// Number of samples this record carries scalars / likelihoods for.
+    pub n_samples: usize,
+    /// Number of genotypes per sample in `log_likelihoods`. Equals
+    /// `genotype_order(ploidy, alleles.len()).len()`.
+    pub n_genotypes: usize,
+    /// Flat row-major scalars table — `scalars[sample_idx * alleles.len() + allele_idx]`
+    /// is the projected [`AlleleSupportStats`] for that sample/allele.
+    /// A sample with no records in the group has every entry zeroed.
+    /// Use [`Self::scalars_row`] for the per-sample slice.
+    pub scalars: Vec<AlleleSupportStats>,
     /// `other_scalars[sample_idx]` — pooled scalars for alleles that
     /// were dropped by the `max_alleles` cap. Always counts into the
     /// error-cost term so the likelihoods preserve the pre-cap
     /// evidence balance.
     pub other_scalars: Vec<AlleleSupportStats>,
-    /// `chain_anchor_flags[sample_idx][allele_idx]` — `true` iff `allele_idx`
-    /// is a compound and `sample_idx` is chain-broken at it (the
-    /// fallback likelihood path was used). Stage 6 reads this to
-    /// route the cohort-derived compound frequency `f_C` as the
-    /// prior signal for chain-broken samples.
-    pub chain_anchor_flags: Vec<Vec<bool>>,
-    /// `log_likelihoods[sample_idx][genotype_idx]` — natural-log
-    /// likelihood under `c_s = 0`. Genotype order is canonical
-    /// per [`genotype_order`].
-    pub log_likelihoods: Vec<Vec<f64>>,
+    /// Flat row-major flag table — `chain_anchor_flags[sample_idx * alleles.len() + allele_idx]`
+    /// is `true` iff `allele_idx` is a compound and `sample_idx` is
+    /// chain-broken at it (the fallback likelihood path was used).
+    /// Stage 6 reads this to route the cohort-derived compound
+    /// frequency `f_C` as the prior signal for chain-broken samples.
+    /// Use [`Self::chain_anchor_flag`] for individual lookups or
+    /// [`Self::chain_anchor_flags_row`] for the per-sample slice.
+    pub chain_anchor_flags: Vec<bool>,
+    /// Flat row-major log-likelihood table —
+    /// `log_likelihoods[sample_idx * n_genotypes + genotype_idx]` is
+    /// the natural-log likelihood under `c_s = 0`. Genotype order is
+    /// canonical per [`genotype_order`]. Use [`Self::log_likelihoods_row`]
+    /// for the per-sample slice.
+    pub log_likelihoods: Vec<f64>,
 }
 
 impl MergedRecord {
     /// Number of samples this record carries scalars/likelihoods for.
     pub fn n_samples(&self) -> usize {
-        self.scalars.len()
+        self.n_samples
+    }
+
+    /// Per-sample slice into the flat row-major `scalars` table.
+    pub fn scalars_row(&self, sample_idx: usize) -> &[AlleleSupportStats] {
+        let n_alleles = self.alleles.len();
+        let start = sample_idx * n_alleles;
+        &self.scalars[start..start + n_alleles]
+    }
+
+    /// Single chain-anchor flag at `(sample_idx, allele_idx)`.
+    pub fn chain_anchor_flag(&self, sample_idx: usize, allele_idx: usize) -> bool {
+        self.chain_anchor_flags[sample_idx * self.alleles.len() + allele_idx]
+    }
+
+    /// Per-sample slice into the flat row-major `chain_anchor_flags` table.
+    pub fn chain_anchor_flags_row(&self, sample_idx: usize) -> &[bool] {
+        let n_alleles = self.alleles.len();
+        let start = sample_idx * n_alleles;
+        &self.chain_anchor_flags[start..start + n_alleles]
+    }
+
+    /// Per-sample slice into the flat row-major `log_likelihoods` table.
+    pub fn log_likelihoods_row(&self, sample_idx: usize) -> &[f64] {
+        let start = sample_idx * self.n_genotypes;
+        &self.log_likelihoods[start..start + self.n_genotypes]
     }
 }
 
@@ -363,6 +419,14 @@ where
     upstream: I,
     ref_fetcher: SharedRefFetcher,
     config: PerGroupMergerConfig,
+    /// Precomputed `genotype_order(config.ploidy, n)` for `n` in
+    /// `0..=config.max_alleles`, indexed by `n_alleles`. Built once at
+    /// construction; shared with rayon workers via `Arc` so no
+    /// per-group rebuild fires on the worker thread (the prior shape
+    /// allocated `Vec<Vec<u8>>` per `process_group` call). Safe because
+    /// `enforce_max_alleles` caps `unified.alleles.len() <=
+    /// config.max_alleles` before `compute_log_likelihoods` runs.
+    genotype_tables: Arc<Vec<Vec<Vec<u8>>>>,
     /// FIFO of merged records produced by the most recent parallel
     /// batch. The iterator drains this before pulling another batch.
     /// REF-only groups are filtered out inside `refill` before they
@@ -371,6 +435,15 @@ where
     pending: VecDeque<Result<MergedRecord, PerGroupMergerError>>,
     /// Latched after the first surfaced error or upstream exhaustion.
     done: bool,
+}
+
+/// Build the per-(ploidy, n_alleles) genotype table cache used by
+/// `PerGroupMerger`. Tests that drive `process_group` directly call
+/// this with the test's own config so the cache slice matches.
+fn build_genotype_tables(config: &PerGroupMergerConfig) -> Vec<Vec<Vec<u8>>> {
+    (0..=config.max_alleles)
+        .map(|n_alleles| genotype_order(config.ploidy, n_alleles))
+        .collect()
 }
 
 impl<I> std::fmt::Debug for PerGroupMerger<I>
@@ -385,6 +458,7 @@ where
             upstream: _,
             ref_fetcher: _,
             config,
+            genotype_tables: _,
             pending,
             done,
         } = self;
@@ -409,10 +483,12 @@ where
         ref_fetcher: SharedRefFetcher,
         config: PerGroupMergerConfig,
     ) -> Self {
+        let genotype_tables = Arc::new(build_genotype_tables(&config));
         Self {
             upstream,
             ref_fetcher,
             config,
+            genotype_tables,
             pending: VecDeque::new(),
             done: false,
         }
@@ -448,6 +524,7 @@ where
 
         let config = self.config;
         let fetcher = Arc::clone(&self.ref_fetcher);
+        let genotype_tables = Arc::clone(&self.genotype_tables);
         // `.collect()` here intentionally does not short-circuit on
         // `Err`: rayon's truly short-circuiting combinators would
         // discard the successful prefix, but we need every `Ok`
@@ -458,7 +535,7 @@ where
         // way. Acceptable trade-off for a deterministic emit order.
         let results: Vec<Result<Option<MergedRecord>, PerGroupMergerError>> = batch
             .into_par_iter()
-            .map(|group| process_group(group, fetcher.as_ref(), &config))
+            .map(|group| process_group(group, fetcher.as_ref(), &config, &genotype_tables))
             .collect();
 
         for result in results {
@@ -509,6 +586,7 @@ fn process_group(
     group: OverlappingVariantGroup,
     ref_fetcher: &(dyn RefSeqFetcher + Send + Sync),
     config: &PerGroupMergerConfig,
+    genotype_tables: &[Vec<Vec<u8>>],
 ) -> Result<Option<MergedRecord>, PerGroupMergerError> {
     let chrom_id = group.chrom_id;
     let start = group.start;
@@ -595,7 +673,7 @@ fn process_group(
 
     let projection = project_scalars(&group, &unified, n_samples)?;
     let chain_anchor_flags = build_chain_anchor_flags(&unified, n_samples);
-    let log_likelihoods = compute_log_likelihoods(
+    let (log_likelihoods, n_genotypes) = compute_log_likelihoods(
         &unified,
         &projection,
         &chain_anchor_flags,
@@ -606,6 +684,7 @@ fn process_group(
             end,
             ploidy: config.ploidy,
         },
+        genotype_tables,
     )?;
 
     let alleles: Vec<MergedAllele> = unified
@@ -624,6 +703,8 @@ fn process_group(
         end,
         alleles,
         ploidy: config.ploidy,
+        n_samples,
+        n_genotypes,
         scalars: projection.scalars,
         other_scalars: projection.other_scalars,
         chain_anchor_flags,
@@ -647,7 +728,7 @@ struct UnifiedAllele {
     /// chain-anchoring samples (one entry per *constituent* —
     /// allowing the scalar-subtraction pass below to find every
     /// constituent contribution that the compound must claim).
-    per_sample_sources: Vec<Vec<(usize, usize)>>,
+    per_sample_sources: Vec<SourceList>,
     /// Per chain-anchoring sample: the number of chain ids in this
     /// sample whose proposal byte sequence equals this allele's
     /// `seq`. Zero for non-compound alleles and for samples that
@@ -678,11 +759,11 @@ struct UnifiedAlleleSet {
 /// into `other_scalars`.
 #[derive(Default)]
 struct DroppedOther {
-    /// Indexed by `sample_idx`; each inner vector lists the
+    /// Indexed by `sample_idx`; each inner list holds the
     /// `(record_idx, local_allele_idx)` pairs whose scalars must sum
     /// into the per-sample OTHER pool. Length is either `0` (cap
     /// inactive) or `n_samples`.
-    per_sample_sources: Vec<Vec<(usize, usize)>>,
+    per_sample_sources: Vec<SourceList>,
 }
 
 impl DroppedOther {
@@ -713,15 +794,30 @@ fn project_per_position_alleles(
     group: &OverlappingVariantGroup,
     ref_seq: &[u8],
     n_samples: usize,
-) -> (Vec<UnifiedAllele>, BTreeMap<Vec<u8>, usize>) {
-    let mut alleles: Vec<UnifiedAllele> = Vec::new();
-    let mut byte_index: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+) -> (Vec<UnifiedAllele>, AHashMap<Vec<u8>, usize>) {
+    // Cheap upper bound on distinct alleles in the group: REF + every
+    // per-sample (record, local allele) pair. Most workloads cluster
+    // around 2-3 unique alleles per group, so a small with_capacity
+    // here avoids the first-insert rehash.
+    let max_distinct: usize = 1 + group
+        .records
+        .iter()
+        .map(|pp| {
+            pp.per_sample
+                .iter()
+                .flatten()
+                .map(|r| r.alleles.len())
+                .sum::<usize>()
+        })
+        .sum::<usize>();
+    let mut alleles: Vec<UnifiedAllele> = Vec::with_capacity(max_distinct);
+    let mut byte_index: AHashMap<Vec<u8>, usize> = AHashMap::with_capacity(max_distinct);
 
     alleles.push(UnifiedAllele {
         seq: ref_seq.to_vec(),
         is_compound: false,
         constituents: Vec::new(),
-        per_sample_sources: vec![Vec::new(); n_samples],
+        per_sample_sources: vec![SourceList::new(); n_samples],
         chain_anchor_counts: vec![0; n_samples],
         cohort_count: 0,
         cap_protected: true,
@@ -745,7 +841,7 @@ fn project_per_position_alleles(
                             seq: projected,
                             is_compound: false,
                             constituents: Vec::new(),
-                            per_sample_sources: vec![Vec::new(); n_samples],
+                            per_sample_sources: vec![SourceList::new(); n_samples],
                             chain_anchor_counts: vec![0; n_samples],
                             cohort_count: 0,
                             cap_protected: false,
@@ -771,7 +867,7 @@ fn project_per_position_alleles(
 /// by the scalar-subtraction pass in [`project_scalars`].
 fn admit_compound_candidates(
     alleles: &mut Vec<UnifiedAllele>,
-    byte_index: &mut BTreeMap<Vec<u8>, usize>,
+    byte_index: &mut AHashMap<Vec<u8>, usize>,
     group: &OverlappingVariantGroup,
     ref_seq: &[u8],
     n_samples: usize,
@@ -800,7 +896,7 @@ fn admit_compound_candidates(
                     seq: projected,
                     is_compound: true,
                     constituents: sort_constituents(&candidate.constituents_per_first_anchor),
-                    per_sample_sources: vec![Vec::new(); n_samples],
+                    per_sample_sources: vec![SourceList::new(); n_samples],
                     chain_anchor_counts: vec![0; n_samples],
                     cohort_count: 0,
                     cap_protected: true,
@@ -865,7 +961,7 @@ struct CompoundChainAnchorEvidence {
     /// `(record_idx, local_allele_idx)` source pairs for this
     /// sample's constituent alleles in this compound. Only populated
     /// when `intersection > 0`. Used by the scalar-subtraction pass.
-    constituent_sources: Vec<(usize, usize)>,
+    constituent_sources: SourceList,
 }
 
 /// Enumerate compound candidates by chain-id evidence. A candidate is
@@ -1097,7 +1193,7 @@ fn enforce_max_alleles(mut unified: UnifiedAlleleSet, max_alleles: usize) -> Uni
     // No sentinel allele is pushed onto `alleles`; every downstream
     // helper reads `dropped_other` directly.
     let n_samples = unified.alleles[0].per_sample_sources.len();
-    let mut pool: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_samples];
+    let mut pool: Vec<SourceList> = vec![SourceList::new(); n_samples];
     for dropped in removed {
         for (s, sources) in dropped.per_sample_sources.into_iter().enumerate() {
             pool[s].extend(sources);
@@ -1114,9 +1210,15 @@ fn enforce_max_alleles(mut unified: UnifiedAlleleSet, max_alleles: usize) -> Uni
 // ---------------------------------------------------------------------
 
 struct ScalarProjection {
-    /// `scalars[sample_idx][allele_idx]` matches the *kept* alleles
-    /// (compound and per-position). Does not include the OTHER bucket.
-    scalars: Vec<Vec<AlleleSupportStats>>,
+    /// Flat row-major scalars buffer, length `n_samples * n_kept`.
+    /// Indexed as `scalars[sample_idx * n_kept + allele_idx]`. Covers
+    /// the *kept* alleles only (compound and per-position) — the OTHER
+    /// bucket lives in `other_scalars`.
+    scalars: Vec<AlleleSupportStats>,
+    /// Width of one sample row in `scalars`.
+    n_kept: usize,
+    /// Number of samples this projection covers.
+    n_samples: usize,
     /// `other_scalars[sample_idx]` — pooled scalars for cap-dropped
     /// alleles. Zero if the cap did not drop anything.
     other_scalars: Vec<AlleleSupportStats>,
@@ -1128,17 +1230,18 @@ fn project_scalars(
     n_samples: usize,
 ) -> Result<ScalarProjection, PerGroupMergerError> {
     let n_kept = unified.alleles.len();
-    let mut scalars: Vec<Vec<AlleleSupportStats>> = (0..n_samples)
-        .map(|_| vec![AlleleSupportStats::default(); n_kept])
-        .collect();
+    let mut scalars: Vec<AlleleSupportStats> =
+        vec![AlleleSupportStats::default(); n_samples * n_kept];
 
-    sum_per_position_scalars(&mut scalars, group, unified);
+    sum_per_position_scalars(&mut scalars, n_kept, group, unified);
     let other_scalars = pool_dropped_other_scalars(group, &unified.dropped_other, n_samples);
-    project_compound_scalars(&mut scalars, group, unified)?;
-    subtract_compound_from_constituents(&mut scalars, group, unified)?;
+    project_compound_scalars(&mut scalars, n_kept, group, unified)?;
+    subtract_compound_from_constituents(&mut scalars, n_kept, group, unified)?;
 
     Ok(ScalarProjection {
         scalars,
+        n_kept,
+        n_samples,
         other_scalars,
     })
 }
@@ -1147,7 +1250,8 @@ fn project_scalars(
 /// per-sample sources into `scalars[sample_idx][allele_idx]`. The
 /// compound entries are filled in by [`project_compound_scalars`].
 fn sum_per_position_scalars(
-    scalars: &mut [Vec<AlleleSupportStats>],
+    scalars: &mut [AlleleSupportStats],
+    n_kept: usize,
     group: &OverlappingVariantGroup,
     unified: &UnifiedAlleleSet,
 ) {
@@ -1165,7 +1269,7 @@ fn sum_per_position_scalars(
                 let support = rec.alleles[local_allele_idx].support;
                 add_support(&mut bucket, &support);
             }
-            scalars[sample_idx][allele_idx] = bucket;
+            scalars[sample_idx * n_kept + allele_idx] = bucket;
         }
     }
 }
@@ -1204,7 +1308,8 @@ fn pool_dropped_other_scalars(
 /// are scaled from any constituent's bias by `|chain_id ∩| / num_obs`.
 /// See the per-group merger plan §"Step 3" for the derivation.
 fn project_compound_scalars(
-    scalars: &mut [Vec<AlleleSupportStats>],
+    scalars: &mut [AlleleSupportStats],
+    n_kept: usize,
     group: &OverlappingVariantGroup,
     unified: &UnifiedAlleleSet,
 ) -> Result<(), PerGroupMergerError> {
@@ -1268,7 +1373,7 @@ fn project_compound_scalars(
             } else {
                 (count as f64) / (bias_basis as f64)
             };
-            scalars[sample_idx][allele_idx] = AlleleSupportStats {
+            scalars[sample_idx * n_kept + allele_idx] = AlleleSupportStats {
                 num_obs: count,
                 q_sum,
                 fwd: ((bias_fwd as f64) * scale).round() as u32,
@@ -1290,7 +1395,8 @@ fn project_compound_scalars(
 /// [`build_source_index`] once for O(1) constituent lookups across
 /// the entire pass.
 fn subtract_compound_from_constituents(
-    scalars: &mut [Vec<AlleleSupportStats>],
+    scalars: &mut [AlleleSupportStats],
+    n_kept: usize,
     group: &OverlappingVariantGroup,
     unified: &UnifiedAlleleSet,
 ) -> Result<(), PerGroupMergerError> {
@@ -1326,6 +1432,7 @@ fn subtract_compound_from_constituents(
                         local_allele_idx,
                     });
                 }
+                let dest_idx = sample_idx * n_kept + constituent_idx;
                 let scale = (inter as f64) / (support.num_obs as f64);
                 let mut to_subtract = AlleleSupportStats {
                     num_obs: inter.min(support.num_obs),
@@ -1334,16 +1441,12 @@ fn subtract_compound_from_constituents(
                     placed_left: ((support.placed_left as f64) * scale.min(1.0)).round() as u32,
                     placed_start: ((support.placed_start as f64) * scale.min(1.0)).round() as u32,
                 };
-                to_subtract.fwd = to_subtract
-                    .fwd
-                    .min(scalars[sample_idx][constituent_idx].fwd);
-                to_subtract.placed_left = to_subtract
-                    .placed_left
-                    .min(scalars[sample_idx][constituent_idx].placed_left);
+                to_subtract.fwd = to_subtract.fwd.min(scalars[dest_idx].fwd);
+                to_subtract.placed_left = to_subtract.placed_left.min(scalars[dest_idx].placed_left);
                 to_subtract.placed_start = to_subtract
                     .placed_start
-                    .min(scalars[sample_idx][constituent_idx].placed_start);
-                subtract_support(&mut scalars[sample_idx][constituent_idx], &to_subtract);
+                    .min(scalars[dest_idx].placed_start);
+                subtract_support(&mut scalars[dest_idx], &to_subtract);
             }
         }
     }
@@ -1356,9 +1459,14 @@ fn subtract_compound_from_constituents(
 /// allele in O(1).
 fn build_source_index(
     unified: &UnifiedAlleleSet,
-) -> std::collections::HashMap<(usize, usize, usize), usize> {
-    let mut idx: std::collections::HashMap<(usize, usize, usize), usize> =
-        std::collections::HashMap::new();
+) -> AHashMap<(usize, usize, usize), usize> {
+    let expected: usize = unified
+        .alleles
+        .iter()
+        .filter(|a| !a.is_compound)
+        .map(|a| a.per_sample_sources.iter().map(SmallVec::len).sum::<usize>())
+        .sum();
+    let mut idx: AHashMap<(usize, usize, usize), usize> = AHashMap::with_capacity(expected);
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if allele.is_compound {
             continue;
@@ -1414,23 +1522,24 @@ fn subtract_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
 // chain-anchor flag table (Step 4)
 // ---------------------------------------------------------------------
 
-fn build_chain_anchor_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec<Vec<bool>> {
-    // chain_anchor_flags[sample_idx][allele_idx] = true iff allele is a
-    // compound and the sample is chain-broken at it.
+/// Build the flat `chain_anchor_flags` table — `out[sample_idx * n_alleles + allele_idx]`
+/// is `true` iff the allele is a compound and the sample is chain-broken
+/// at it. Single heap allocation instead of `n_samples + 1`.
+fn build_chain_anchor_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec<bool> {
     let n_alleles = unified.alleles.len();
-    let mut out: Vec<Vec<bool>> = (0..n_samples).map(|_| vec![false; n_alleles]).collect();
+    let mut out: Vec<bool> = vec![false; n_samples * n_alleles];
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
         if !allele.is_compound {
             continue;
         }
-        for (sample_idx, row) in out.iter_mut().enumerate() {
+        for sample_idx in 0..n_samples {
             if allele.chain_anchor_counts[sample_idx] == 0 {
                 // Chain-broken at this compound for this sample.
                 // (A sample with no record at any constituent position
                 // is treated as chain-broken — the fallback path
                 // still works because the per-position likelihood
                 // degenerates to zero scalars.)
-                row[allele_idx] = true;
+                out[sample_idx * n_alleles + allele_idx] = true;
             }
         }
     }
@@ -1450,27 +1559,48 @@ struct LikelihoodContext {
     ploidy: u8,
 }
 
+/// Compute the flat row-major log-likelihood table. Returns
+/// `(out, n_genotypes)` where `out` has length `n_samples * n_genotypes`
+/// and `out[sample_idx * n_genotypes + genotype_idx]` is the natural
+/// log-likelihood for that sample/genotype under `c_s = 0`.
 fn compute_log_likelihoods(
     unified: &UnifiedAlleleSet,
     projection: &ScalarProjection,
-    chain_anchor_flags: &[Vec<bool>],
+    chain_anchor_flags: &[bool],
     group: &OverlappingVariantGroup,
     ctx: &LikelihoodContext,
-) -> Result<Vec<Vec<f64>>, PerGroupMergerError> {
-    let n_samples = projection.scalars.len();
+    genotype_tables: &[Vec<Vec<u8>>],
+) -> Result<(Vec<f64>, usize), PerGroupMergerError> {
+    let n_samples = projection.n_samples;
+    let n_kept = projection.n_kept;
     let ploidy = ctx.ploidy;
     let n_alleles = unified.alleles.len();
-    let genotypes = genotype_order(ploidy, n_alleles);
-    let mut out: Vec<Vec<f64>> = (0..n_samples).map(|_| vec![0.0; genotypes.len()]).collect();
+    // `enforce_max_alleles` caps `n_alleles <= config.max_alleles`, and
+    // the merger precomputed `genotype_tables` over that range, so the
+    // lookup is bounds-safe. Fallback to `genotype_order` keeps direct
+    // callers honest if they pass a cache that doesn't cover the input.
+    let fallback;
+    let genotypes: &[Vec<u8>] = if n_alleles < genotype_tables.len() {
+        &genotype_tables[n_alleles]
+    } else {
+        fallback = genotype_order(ploidy, n_alleles);
+        &fallback
+    };
+    let n_genotypes = genotypes.len();
+    let mut out: Vec<f64> = vec![0.0; n_samples * n_genotypes];
 
-    for (sample_idx, out_row) in out.iter_mut().enumerate() {
-        let scalars = &projection.scalars[sample_idx];
+    for sample_idx in 0..n_samples {
+        let scalars_row =
+            &projection.scalars[sample_idx * n_kept..sample_idx * n_kept + n_kept];
+        let flags_row =
+            &chain_anchor_flags[sample_idx * n_alleles..sample_idx * n_alleles + n_alleles];
         let other = &projection.other_scalars[sample_idx];
+        let out_row_start = sample_idx * n_genotypes;
         for (g_idx, genotype) in genotypes.iter().enumerate() {
             // Chain-broken-compound fallback check.
             let chain_broken_compound = genotype.iter().find_map(|&a| {
                 let a = a as usize;
-                if unified.alleles[a].is_compound && chain_anchor_flags[sample_idx][a] {
+                if unified.alleles[a].is_compound && flags_row[a] {
                     Some(a)
                 } else {
                     None
@@ -1487,7 +1617,7 @@ fn compute_log_likelihoods(
                     ploidy,
                 )
             } else {
-                standard_log_likelihood(scalars, other, genotype, n_alleles, ploidy)
+                standard_log_likelihood(scalars_row, other, genotype, n_alleles, ploidy)
             };
 
             if value.is_nan() {
@@ -1511,11 +1641,11 @@ fn compute_log_likelihoods(
                 });
             }
 
-            out_row[g_idx] = value;
+            out[out_row_start + g_idx] = value;
         }
     }
 
-    Ok(out)
+    Ok((out, n_genotypes))
 }
 
 /// Freebayes' closed-form likelihood for `(sample, genotype)` with no
@@ -1617,12 +1747,18 @@ fn chain_broken_log_likelihood(
             continue;
         };
         let n_local_alleles = rec.alleles.len();
-        let counts: Vec<u32> = (0..n_local_alleles)
-            .map(|a| rec.alleles[a].support.num_obs)
-            .collect();
-        let q_sums: Vec<f64> = (0..n_local_alleles)
-            .map(|a| rec.alleles[a].support.q_sum)
-            .collect();
+        // Stack-resident scratch for the per-position multinomial. The
+        // previous shape allocated `Vec<u32>` / `Vec<f64>` / `Vec<u32>`
+        // per (sample × genotype × constituent) call, dropped on the
+        // rayon worker; for the chain-broken bench shape that was
+        // tens-of-millions of small heap allocations on the
+        // allocator-bound critical path. Matches the existing
+        // `[u32; MAX_BITMASK_ALLELES]` convention in `standard_log_likelihood`.
+        debug_assert!(
+            n_local_alleles <= MAX_BITMASK_ALLELES,
+            "chain_broken_log_likelihood assumes n_local_alleles ≤ {MAX_BITMASK_ALLELES}; got {n_local_alleles}",
+        );
+        let mut per_pos_counts: [u32; MAX_BITMASK_ALLELES] = [0; MAX_BITMASK_ALLELES];
 
         // Decode the genotype at this position: each slot that is
         // `compound_slot` takes the constituent's local allele; other
@@ -1630,7 +1766,6 @@ fn chain_broken_log_likelihood(
         // observed in the chain-broken interpretation". This matches
         // the plan's "G_decomposed: C/REF ⇒ at p_i, (Y_i, REF_i)"
         // convention.
-        let mut per_pos_counts: Vec<u32> = vec![0; n_local_alleles];
         for &slot in genotype {
             let local_idx = if slot == compound_slot {
                 constituent.local_allele_idx
@@ -1640,28 +1775,28 @@ fn chain_broken_log_likelihood(
             per_pos_counts[local_idx] += 1;
         }
 
+        // Read support stats inline from `rec.alleles[a].support` — no
+        // gather-into-scratch step is needed because the per-position
+        // loops touch each allele exactly once.
+
         // Error cost at this position: Σ q_sum over local alleles not
         // in per_pos_counts.
-        for (a, &q_sum) in q_sums.iter().enumerate() {
+        for a in 0..n_local_alleles {
             if per_pos_counts[a] == 0 {
-                log_l += q_sum;
+                log_l += rec.alleles[a].support.q_sum;
             }
         }
 
         // Multinomial at this position.
-        let n_total: u64 = counts
-            .iter()
-            .enumerate()
-            .filter(|(a, _)| per_pos_counts[*a] > 0)
-            .map(|(_, &c)| c as u64)
-            .sum();
+        let mut n_total: u64 = 0;
         let mut sum_ln_n_fact = 0.0;
         let mut sum_n_log_p = 0.0;
-        for (a, &count) in counts.iter().enumerate() {
+        for a in 0..n_local_alleles {
             if per_pos_counts[a] == 0 {
                 continue;
             }
-            let n_i = count as u64;
+            let n_i = rec.alleles[a].support.num_obs as u64;
+            n_total += n_i;
             sum_ln_n_fact += ln_factorial(n_i);
             let p_i = (per_pos_counts[a] as f64) / (n_slots as f64);
             sum_n_log_p += xlogy(n_i as f64, p_i);
@@ -1843,10 +1978,10 @@ mod tests {
         assert_eq!(record.alleles.len(), 2);
         assert_eq!(record.alleles[0].seq, b"A");
         assert_eq!(record.alleles[1].seq, b"T");
-        assert_eq!(record.scalars.len(), 2);
-        assert_eq!(record.scalars[0].len(), 2);
+        assert_eq!(record.n_samples, 2);
+        assert_eq!(record.scalars_row(0).len(), 2);
         // diploid biallelic ⇒ 3 genotypes
-        assert_eq!(record.log_likelihoods[0].len(), 3);
+        assert_eq!(record.log_likelihoods_row(0).len(), 3);
     }
 
     #[test]
@@ -1975,10 +2110,10 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        assert_eq!(record.scalars.len(), 2);
+        assert_eq!(record.n_samples, 2);
         // Sample 1 has no record at p=101 ⇒ its merged scalars for
         // anything that came from p=101 must be zeroed.
-        assert!(record.scalars[1].iter().all(|s| s.num_obs <= 8));
+        assert!(record.scalars_row(1).iter().all(|s| s.num_obs <= 8));
     }
 
     // ---------- chain-anchored compounds ----------
@@ -2033,7 +2168,7 @@ mod tests {
         assert_eq!(record.alleles.iter().filter(|a| a.is_compound).count(), 1);
         // Sample is chain-evident at the compound ⇒ ca_flag false.
         let compound_idx = record.alleles.iter().position(|a| a.is_compound).unwrap();
-        assert!(!record.chain_anchor_flags[0][compound_idx]);
+        assert!(!record.chain_anchor_flag(0, compound_idx));
     }
 
     #[test]
@@ -2145,11 +2280,11 @@ mod tests {
             .position(|a| a.is_compound)
             .expect("compound is chain-anchored");
         assert!(
-            !record.chain_anchor_flags[0][compound_idx],
+            !record.chain_anchor_flag(0, compound_idx),
             "sample 0 anchors"
         );
         assert!(
-            record.chain_anchor_flags[1][compound_idx],
+            record.chain_anchor_flag(1, compound_idx),
             "sample 1 is chain-broken"
         );
     }
@@ -2382,7 +2517,7 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        for ll in &record.log_likelihoods[0] {
+        for ll in record.log_likelihoods_row(0) {
             assert!(
                 !(ll.is_nan() || (ll.is_infinite() && *ll > 0.0)),
                 "likelihood is {ll}, expected finite or -inf",
@@ -2772,7 +2907,7 @@ mod tests {
                     seq: b"AAG".to_vec(),
                     is_compound: false,
                     constituents: Vec::new(),
-                    per_sample_sources: vec![Vec::new()],
+                    per_sample_sources: vec![SourceList::new()],
                     chain_anchor_counts: vec![0],
                     cohort_count: 0,
                     cap_protected: true,
@@ -2781,7 +2916,7 @@ mod tests {
                     seq: b"TAC".to_vec(),
                     is_compound: true,
                     constituents: Vec::new(),
-                    per_sample_sources: vec![Vec::new()],
+                    per_sample_sources: vec![SourceList::new()],
                     chain_anchor_counts: vec![3], // claim 3 chain-anchor obs
                     cohort_count: 3,
                     cap_protected: true,
