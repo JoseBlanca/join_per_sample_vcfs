@@ -393,23 +393,141 @@ subcommand for post-hoc.
 **Verdict.** Recorded as a real alternative; **full evaluation
 deferred** along with all other contamination-mode work (see
 §"Out of scope (v1)"). The contamination follow-up plan will
-revisit Algorithms 3 and 5 side by side with the benefit of
+revisit Algorithms 3, 5, and 6 side by side with the benefit of
 real cohort data — including the open question of whether
 flavour 5c's approximation is calibration-acceptable.
+
+### Algorithm 6 — informative-site subsample for contamination estimation (deferred — leading candidate for v2)
+
+**Shape.** Decouple contamination *estimation* from contamination
+*application* by deriving `c_s` and `q_b` from a small
+informative-site subsample (default ~10 000 records), then
+running the main pipeline with the frozen estimates applied to
+every record. Two passes over the `.psp` chain, **no scratch
+file**:
+
+1. **Estimation pass.** Run Stages 1→5 streaming. For each
+   incoming `MergedRecord`, cheaply check whether it qualifies as
+   an informative site using **raw observed allele counts** (no
+   per-record EM required — see §"Site selection" below). Skip
+   non-qualifying records. For the qualifying ~10 000 records,
+   run per-record EM to obtain soft posteriors and accumulate
+   into the same cross-record aggregators Algorithm 3 uses
+   (`q_b` posterior-weighted allele-class counts, `c_s` evidence
+   per sample). Do **not** emit posteriors; do **not**
+   materialise records to disk.
+2. **Cross-record M-steps.** Same closed-form/1D-opt machinery as
+   Algorithm 3: `q_b` from per-batch Dirichlet-normalised
+   allele-class counts; `c_s` from per-sample 1D maximisation
+   against `q_{batch(s)}` and soft-assigned genotypes.
+3. **Convergence / stability check on the subsample.** Compute
+   the `c_s` estimate at growing subsample sizes (e.g. on the
+   first ½ and the full ~10 000 records, or via k-block
+   jackknife). If the largest per-sample delta exceeds
+   `--contamination-stability-tolerance`, raise a typed error
+   carrying the observed deltas and a recommended next sample
+   size derived from the observed volatility (e.g. extrapolate
+   from the ½→full delta to an N that should land under
+   tolerance). This is a **finite-sample-stability** check, not
+   an EM-convergence check — the EM inside each per-record fit
+   converges on its own.
+4. **Main pass.** Re-stream Stages 1→6 from the `.psp` chain
+   with `c_s` and `q_b` frozen at their estimated values. Each
+   record's E-step uses the mixture likelihood
+   `(1 − c_s) · L_own + c_s · L_contam` (same recompute machinery
+   as Algorithm 3 Pass 2). Posteriors emitted here are the ones
+   that go to the VCF writer.
+
+**Site selection (cheap pre-filter, no EM required).** Qualify a
+`MergedRecord` if the cohort-wide **raw observed major-allele
+fraction** (summed across samples from `MergedRecord.scalars` /
+the per-sample allele observations) is below a configurable
+threshold (e.g. `--contamination-min-minor-allele-fraction`,
+default such that the major-allele fraction is roughly ≤ 0.7).
+Raw observed frequency is good enough for selection — the
+post-EM `p̂` is the same quantity up to pseudocount-driven
+shrinkage and contamination-driven bias, neither of which
+matters for "is this site informative enough to keep?" Reservoir
+sampling caps the kept set at `--contamination-sample-size`
+(default 10 000) so the aggregator stays bounded regardless of
+how many records pass the pre-filter.
+
+**Non-convergence behaviour.** On stability-check failure the
+engine returns
+`PosteriorEngineError::ContaminationEstimateDidNotConverge`
+carrying the per-sample observed deltas and a recommended next
+sample size. The user re-runs with a larger
+`--contamination-sample-size`. (No silent fallback to `c_s = 0`
+— that would produce a confident-looking VCF whose contamination
+correction is actually missing.)
+
+**Strengths.**
+
+- **No scratch file.** The single biggest win over Algorithm 3.
+  The 100–300 GB compressed scratch and the `MergedRecord`
+  serialisation format both disappear. Aggregators are
+  `O(cohort × n_batches × allele_classes)` plus the bounded
+  ~10 000-record sample — both in RAM, both small.
+- **Statistically sufficient.** `c_s` and `q_b` are a handful of
+  scalars per sample/batch. 10 000 well-chosen sites is plenty;
+  this matches what VerifyBamID / ContEst do in practice.
+- **Single-pass equivalent through Stage 5 internals on Pass 1.**
+  Pass 1 streams records but only runs per-record EM on the
+  ~10 000 that pass the pre-filter; the other ~10M records are
+  cheap to skip (allele-count check, drop). Stage 4/5 cost is
+  unavoidable on both passes regardless.
+- **Honest convergence signal.** The stability check tells the
+  user whether the sample size was sufficient, instead of
+  silently producing a possibly-undercooked estimate.
+- **Streaming-shaped.** Two streaming passes over the `.psp`
+  chain. No on-disk intermediate to manage, no cleanup, no
+  `--scratch-dir`, no `--keep-scratch`.
+
+**Weaknesses.**
+
+- **Two passes over the `.psp` chain.** Stages 1→5 run twice
+  (same cost profile as Algorithm 5b). The full Stage 4/5
+  recompute cost is the price of dropping the scratch file. On
+  most cohorts this is cheaper than the scratch write+read+delete
+  cycle, but it's an empirical question per workload.
+- **Small statistical-efficiency loss vs Algorithm 3** from using
+  ~10 000 sites instead of all sites. Expected to be negligible
+  given how few parameters are being estimated, but should be
+  measured against Algorithm 3 on at least one real cohort
+  before fixing the default sample size.
+- **Site-selection bias.** Sites with low major-allele frequency
+  are not a uniform sample of the genome — different read-depth
+  distributions, error-mode mix, etc. Fine under the standard
+  assumption that contamination is a constant fraction across
+  the genome; would miss site-class-specific contamination
+  behaviour (not a model this pipeline aims to support).
+
+**Open question — does the estimation pass need to materialise
+anything?** The aggregators are small. If `c_s` re-estimation
+ever wants to recombine with new evidence (e.g. an outer
+iteration), the cheapest path is another estimation pass over
+the `.psp` chain rather than carrying the subsample in RAM —
+the subsample is small enough that re-deriving it is faster
+than serialising it.
 
 ### Decision
 
 - **No-contamination mode (default):** Algorithm 1
   (per-record-independent EM, streaming). **Implemented in v1.**
 - **Contamination mode (`--contamination-batches` supplied):**
-  choice between Algorithm 3 (two-pass with scratch-file replay)
-  and Algorithm 5 (VCF-replay, possibly as a separate
-  subcommand) is **deferred** to the contamination follow-up
-  plan, alongside the unresolved `c_s` sufficient-statistic
-  question. Algorithm 3 is the current best candidate for the
-  in-engine path; Algorithm 5 is the candidate for a separate
-  post-hoc subcommand; the two are not mutually exclusive and
-  may both ship. **Not implemented in v1.**
+  choice between Algorithm 3 (two-pass with scratch-file replay),
+  Algorithm 5 (VCF-replay, possibly as a separate subcommand),
+  and Algorithm 6 (informative-site subsample, no scratch file)
+  is **deferred** to the contamination follow-up plan, alongside
+  the `c_s` sufficient-statistic question. **Algorithm 6 is the
+  current leading candidate for the in-engine path** — dropping
+  the scratch file is a larger win than the small statistical-
+  efficiency loss from subsampling. Algorithm 3 remains as the
+  fallback if real cohort data shows the subsample-based
+  estimator is unstable in regimes the stability check cannot
+  rescue. Algorithm 5 remains as the candidate for a separate
+  post-hoc subcommand; it is not mutually exclusive with either
+  6 or 3. **Not implemented in v1.**
 
 The split is invisible from the iterator's external shape — the
 v1 engine emits a `PosteriorRecord` per `MergedRecord` in genomic
