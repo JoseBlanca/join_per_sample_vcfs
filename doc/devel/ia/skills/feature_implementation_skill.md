@@ -19,6 +19,7 @@ This skill is for writing new code, not just patching existing defects. It empha
 
 ## Default workflow
 
+0. **Read `PROJECT_STATUS.md` at the project root.** Use the "About this project" paragraph for design context, "Current focus" to confirm the task matches the project's direction, and the in-scope feature's block (if any) to locate its spec, plan, and prior reports. See *Project status protocol* below.
 1. Clarify the feature contract.
 2. Design the shape of the solution (types, module boundaries, data flow, errors).
 3. Share a short implementation plan with the user and ask for comments when interactive mode is desired.
@@ -26,6 +27,7 @@ This skill is for writing new code, not just patching existing defects. It empha
 5. Implement the feature with minimal, focused changes.
 6. Validate with Rust tooling.
 7. Report what changed, why, and how it was validated.
+8. **Update `PROJECT_STATUS.md`** — append the new implementation report to the feature's block (create the block if first time touching this feature), update `Status:`, refresh `Last completed task`. See *Project status protocol* below.
 
 ## Interactive planning gate
 
@@ -141,6 +143,7 @@ A feature is complete only when all of the following are true:
 - Existing tests pass (or failures are explained and unrelated).
 - Formatting/linting expectations are met or explicitly documented.
 - Any tradeoffs (performance, API decisions, deferred work) are clearly documented.
+- The feature's block in `PROJECT_STATUS.md` reflects the new state (per *Project status protocol*).
 
 ## Response format for implementation tasks
 
@@ -162,6 +165,40 @@ ia/reports/implementations/<feature-slug>_<YYYY-MM-DD>.md
 ```
 
 Append `_v<N>` if a report for the same slug and date already exists. File references inside the report use relative Markdown links from the report's directory (e.g. `[file.rs](../../../src/file.rs#L42)`). Skip the saved report only for changes small enough that the commit message carries the full context.
+
+## Project status protocol
+
+The project tracks the lifecycle of every feature in `PROJECT_STATUS.md` at the project root. It is a navigation aid, not a source of truth — use it to find the relevant spec, plan, and prior reports for the in-scope feature, then verify against current code as usual.
+
+**At task start.** Read `PROJECT_STATUS.md`. The immutable "About this project" paragraph (delimited by `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` HTML comments) gives the design context and points at the authoritative spec; "Current focus" confirms the project's direction and last-completed work; the per-feature blocks point at the plan, prior impl reports, and reviews for the in-scope feature.
+
+**At task end** (after the implementation report has been saved): update only the in-scope feature's block in `PROJECT_STATUS.md`.
+
+- If the block already exists: append a link to the new implementation report under `Impl report:` (or `Impl reports:` if the feature has several), refresh `Status:`, close `Open:` items the run resolved, add any new `Open:` items the run surfaced.
+- If the block does not exist yet: create one in the matching pipeline-stage section, using the format of existing blocks (do not improvise a new format).
+- Refresh the **Current focus** paragraph: rewrite `Last completed task` to name this implementation and link the new report. Touch `Next task` only if the human PM has not already set one — otherwise leave it alone, optionally appending `(suggested follow-up: …)` after the existing text.
+
+**Status vocabulary** (one per block; use the closest match):
+
+| Status            | Meaning                                                   |
+|---|---|
+| `planned`         | Plan written, no code yet                                 |
+| `in-flight`       | Code being written; no implementation report yet          |
+| `implemented`     | Implementation report exists; no review yet               |
+| `reviewed`        | Review exists; fixes not yet applied                      |
+| `fixes-applied`   | Fix-application report exists for the latest review       |
+| `shipped`         | Reviewed, fixes applied, no open follow-ups               |
+| `superseded`      | Replaced by another feature (link the replacement)        |
+
+After a feature_implementation run, the typical new status is `implemented` (no review yet).
+
+**Hard rules.**
+
+- Do not edit the **About this project** paragraph or anything between the `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` comments.
+- Do not modify another feature's block.
+- Do not summarize report content inside the block — the block is a list of pointers.
+- Prefer in-place updates of an existing bullet over accumulating a long history (`git log` and `ls reviews/` carry chronology).
+- If `PROJECT_STATUS.md` and the current code disagree, trust the code; the status file is stale and should be updated, not relied on.
 
 ## Reusable prompt template
 

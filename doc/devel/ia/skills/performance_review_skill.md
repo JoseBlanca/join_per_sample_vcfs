@@ -26,6 +26,10 @@ The severity rubric and per-finding format are defined in `ia/skills/performance
 
 You run each numbered step once per review. Only step 5 fans out into parallel sub-agents.
 
+### 0. Read `PROJECT_STATUS.md`
+
+Read `PROJECT_STATUS.md` at the project root to orient on what the project is, the current focus, and the in-scope feature's prior artefacts (plan, implementation report, prior reviews, prior perf reviews, prior benches). See *Project status protocol* below for what to read and what to update at the end.
+
 ### 1. Establish scope and call frequency
 
 Determine whether the review covers a full crate, a module, a PR diff, or a single function under benchmark. State the scope. For each in-scope file, identify which functions are believed to be on the hot path and on what evidence: a profile, a benchmark, a call-graph argument, or "no evidence yet". Code with no hot-path evidence is reviewed at lower priority — flag this as a constraint passed into every sub-agent prompt.
@@ -136,6 +140,10 @@ Promote findings whose measurement plans converge (multiple categories agree the
 
 Compose the report using the *Output format* below. Verdict, measurement plan, and "What's already good" need the full picture and are produced by you. Assign severity codes during synthesis: `H1, H2, …` for Hot-path; `L1, L2, …` for Likely; `S1, S2, …` for Speculative; Notes stay grouped without numbering. Save to `reviews/perf_<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
 
+### 8. Update `PROJECT_STATUS.md`
+
+After the perf review report is saved, update the in-scope feature's block in `PROJECT_STATUS.md` to point at it. See *Project status protocol* below for the rules.
+
 ## Output format
 
 Produce the synthesized report in the following order. Use the section headings verbatim so the format is machine-readable.
@@ -232,6 +240,30 @@ Display text is the path (no backticks).
 - [ ] Severity codes (H1, L1, S1) are consistent and dense (no gaps).
 - [ ] Per-category files in `tmp/perf_review_<date>_<slug>/` are left in place as an audit trail.
 - [ ] Build configuration findings (section 4) are separated from code-level findings (section 5).
+- [ ] `PROJECT_STATUS.md` updated (per *Project status protocol*).
+
+## Project status protocol
+
+The project tracks the lifecycle of every feature in `PROJECT_STATUS.md` at the project root. It is a navigation aid, not a source of truth — use it to find the relevant spec, plan, and prior reports for the in-scope feature, then verify against current code as usual.
+
+**At task start.** Read `PROJECT_STATUS.md`. The immutable "About this project" paragraph (delimited by `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` HTML comments) gives the design context and points at the authoritative spec; "Current focus" confirms the project's direction and last-completed work; the per-feature blocks point at the plan, prior impl reports, and prior reviews (correctness and performance) for the in-scope feature.
+
+**At task end** (after the perf review report has been saved): update only the in-scope feature's block in `PROJECT_STATUS.md`.
+
+- Append a link to the new perf review under `Latest reviews:` (perf reviews live alongside correctness reviews in the same bullet group; the filename prefix `perf_` is enough to tell them apart). Prefer to replace the previous perf review link rather than accumulate a long list.
+- Leave `Status:` unchanged — perf reviews do not advance the correctness lifecycle. Exception: if the verdict is `Profile first` and that blocks further code-level work, add an `Open:` item naming the measurement to take.
+- Add `Open:` items for any Hot-path or Likely findings the run surfaced; do not close existing items.
+- Refresh **Current focus** — rewrite `Last completed task` to name this perf review and link the report. Touch `Next task` only if the human PM has not already set one; otherwise leave it alone, optionally appending `(suggested follow-up: …)` after the existing text.
+
+**Status vocabulary:** `planned` / `in-flight` / `implemented` / `reviewed` / `fixes-applied` / `shipped` / `superseded`. (Perf reviews do not have their own status — they annotate whichever status the feature is already in.)
+
+**Hard rules.**
+
+- Do not edit the **About this project** paragraph or anything between the `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` comments.
+- Do not modify another feature's block.
+- Do not summarize the perf findings inside the block — the block is a list of pointers; numbers and measurement plans live in the saved report.
+- If the in-scope feature has no block yet, create one using the format of existing blocks.
+- If `PROJECT_STATUS.md` and the current code disagree, trust the code; the status file is stale and should be updated, not relied on.
 
 ## Reusable prompt template
 

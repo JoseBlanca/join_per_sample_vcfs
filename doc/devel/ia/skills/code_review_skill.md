@@ -23,6 +23,10 @@ The severity rubric and per-finding format are defined in `ia/skills/code_review
 
 You run each numbered step once per review. Only step 6 fans out into parallel sub-agents.
 
+### 0. Read `PROJECT_STATUS.md`
+
+Read `PROJECT_STATUS.md` at the project root to orient on what the project is, the current focus, and the in-scope feature's prior artefacts (plan, implementation report, prior reviews, prior fix-applied reports). See *Project status protocol* below for what to read and what to update at the end.
+
 ### 1. Establish scope
 
 Determine whether the review covers a full crate, a diff/PR, or a snippet. State the scope. For diffs, identify changed files and the direct callers/callees of changed items; these define the in-scope surface.
@@ -120,6 +124,10 @@ Compose the report using the *Output format* below. Verdict, top 3, and "What's 
 Each finding is filed once. Issues that were merged in step 7 (raised by multiple categories) carry a `**Categories:** <a>, <b>` line citing every sub-agent that surfaced them — this is convergent evidence and should be visible to the author, not hidden behind deduplication.
 
 Save to `reviews/<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
+
+### 10. Update `PROJECT_STATUS.md`
+
+After the review report is saved, update the in-scope feature's block in `PROJECT_STATUS.md` to point at it. See *Project status protocol* below for the rules.
 
 ## Output format
 
@@ -223,6 +231,30 @@ Display text is the path (no backticks).
 - [ ] Severity codes (B1, M1, Mi1) are consistent and dense (no gaps).
 - [ ] Open questions are numbered and referenced from the findings they affect.
 - [ ] Per-category files in `tmp/review_<date>_<slug>/` are left in place as an audit trail.
+- [ ] `PROJECT_STATUS.md` updated (per *Project status protocol*).
+
+## Project status protocol
+
+The project tracks the lifecycle of every feature in `PROJECT_STATUS.md` at the project root. It is a navigation aid, not a source of truth — use it to find the relevant spec, plan, and prior reports for the in-scope feature, then verify against current code as usual.
+
+**At task start.** Read `PROJECT_STATUS.md`. The immutable "About this project" paragraph (delimited by `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` HTML comments) gives the design context and points at the authoritative spec; "Current focus" confirms the project's direction and last-completed work; the per-feature blocks point at the plan, prior impl reports, and reviews for the in-scope feature.
+
+**At task end** (after the review report has been saved): update only the in-scope feature's block in `PROJECT_STATUS.md`.
+
+- Append a link to the new review under `Latest review:` (or `Latest reviews:` if multiple). Prefer to replace the previous link rather than accumulate a long list — `git log` and `ls reviews/` carry chronology.
+- Update `Status:` to `reviewed` (or keep `fixes-applied` / `shipped` if the review found nothing material; explain in one trailing word: `shipped (re-reviewed 2026-MM-DD)`).
+- Add any new `Open:` items the review surfaced; do not close existing ones (a review surfaces, it does not resolve — that is the apply-fixes skill's job).
+- Refresh **Current focus** — rewrite `Last completed task` to name this review and link the report. Touch `Next task` only if the human PM has not already set one; otherwise leave it alone, optionally appending `(suggested follow-up: apply fixes)`.
+
+**Status vocabulary:** `planned` / `in-flight` / `implemented` / `reviewed` / `fixes-applied` / `shipped` / `superseded`. After a code-review run, the typical new status is `reviewed`.
+
+**Hard rules.**
+
+- Do not edit the **About this project** paragraph or anything between the `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` comments.
+- Do not modify another feature's block.
+- Do not summarize the review's findings inside the block — the block is a list of pointers; findings live in the saved report.
+- If the in-scope feature has no block yet, create one using the format of existing blocks.
+- If `PROJECT_STATUS.md` and the current code disagree, trust the code; the status file is stale and should be updated, not relied on.
 
 ## Reusable prompt template
 

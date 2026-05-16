@@ -180,6 +180,15 @@ If you encounter any of the following, **do not silently work around them** — 
 - A clone whose removal would require changing a `pub` API: surface the trade-off explicitly; do not silently rewrite the public surface.
 - More than ~10 clones in one function: the function likely needs a structural rethink, not a clone-by-clone audit. Recommend a separate refactor and stop the audit on this function.
 
+## Project status protocol
+
+`PROJECT_STATUS.md` at the project root tracks the lifecycle of every feature. Skim it at task start to identify the in-scope feature and its current state — useful for ranking clones (Tier A/B inside a `shipped` hot-path feature carries more weight than clones in `planned` or `in-flight` code that may still change shape).
+
+This skill does **not** save a standalone report by default, so it does not normally update `PROJECT_STATUS.md`. Two exceptions:
+
+- **Invoked from inside `rust-code-review`.** The parent code-review run owns the status update; do nothing extra here.
+- **Invoked standalone and the user asks for a saved report.** Follow the protocol used by the other skills (in particular `rust-code-review` and `rust-performance-review`): append a link to the new report under the in-scope feature's `Latest reviews:` bullet, leave `Status:` unchanged, add `Open:` items only for Tier A or B findings the user explicitly chooses to defer, and refresh `Last completed task` in **Current focus**. Do not touch the **About this project** paragraph or any other feature's block.
+
 ## What this skill is not
 
 - **Not a clippy replacement.** Run `cargo clippy --all-targets --all-features -- -W clippy::redundant_clone -W clippy::clone_on_copy -W clippy::needless_pass_by_value` first; clippy catches the obvious cases. The skill's value is in the cases clippy doesn't see and the cases clippy flags but the right answer is "leave it."

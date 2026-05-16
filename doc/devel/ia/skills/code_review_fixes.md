@@ -24,6 +24,7 @@ A review report is evidence and guidance, not an executable patch. Suggested cod
 
 Before making any code change, perform a preflight pass:
 
+0. Read `PROJECT_STATUS.md` at the project root — orient on the feature's lifecycle (plan, prior reviews, prior fix-applied reports, open items). See *Project status protocol* below.
 1. Read the review header, scope, open questions, and top priorities.
 2. Read all findings in full — not just summaries.
 3. For each finding, extract: ID, title, severity, confidence, assumptions, affected files, problem summary, suggested fix summary, whether it affects public API, whether it's testable, whether the current code still exhibits the issue.
@@ -188,7 +189,7 @@ If criterion reports `no change` or `improved` on every group, a one-line note i
 
 **Accounting rule:** every finding from the source review must appear exactly once in the findings table with a terminal status or an active `Ask` state. No finding may disappear.
 
-**Completion rule:** the run is not complete until: every finding is in the report, every applied finding records files changed and validation, every non-applied finding records a reason, and unresolved high-severity findings are listed explicitly.
+**Completion rule:** the run is not complete until: every finding is in the report, every applied finding records files changed and validation, every non-applied finding records a reason, unresolved high-severity findings are listed explicitly, and `PROJECT_STATUS.md` reflects the new state (per *Project status protocol*).
 
 At the end of the run, tell the user where the report was written and list any unresolved high-priority findings.
 
@@ -321,3 +322,25 @@ If none: "None."
 - Use only the explicit status names defined in this skill. No vague labels like `skipped` or `partially done`.
 - If no code changes were made, the report must explain why.
 - If blocked awaiting user input, keep affected findings in `Ask` state with the exact question recorded.
+
+## Project status protocol
+
+The project tracks the lifecycle of every feature in `PROJECT_STATUS.md` at the project root. It is a navigation aid, not a source of truth — use it to find the relevant spec, plan, and prior reports for the in-scope feature, then verify against current code as usual.
+
+**At task start.** Read `PROJECT_STATUS.md`. The immutable "About this project" paragraph (delimited by `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` HTML comments) gives the design context and points at the authoritative spec; "Current focus" confirms the project's direction and last-completed work; the per-feature blocks point at the plan, prior impl reports, prior reviews, and prior fix-applied reports for the in-scope feature.
+
+**At task end** (after the fix-application report has been saved): update only the in-scope feature's block in `PROJECT_STATUS.md`.
+
+- Append a link to the new fix-application report under `Latest fixes-applied:`. Prefer to replace the previous link rather than accumulate a long list — `git log` and `ls reviews/` carry chronology.
+- Update `Status:` to `fixes-applied` if any non-trivial findings remain open, or to `shipped` if every Blocker and Major was either `Applied` / `Already fixed` / `Disputed` with no open follow-ups.
+- Close `Open:` items the run resolved (`Applied` and `Already fixed`). Add new `Open:` items for `Deferred`, `Failed validation`, `Blocked by context mismatch`, or unresolved `Ask` findings — each linked to the relevant finding ID in the saved report.
+- Refresh **Current focus** — rewrite `Last completed task` to name this fix run and link the report. Touch `Next task` only if the human PM has not already set one; otherwise leave it alone.
+
+**Status vocabulary:** `planned` / `in-flight` / `implemented` / `reviewed` / `fixes-applied` / `shipped` / `superseded`.
+
+**Hard rules.**
+
+- Do not edit the **About this project** paragraph or anything between the `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` comments.
+- Do not modify another feature's block.
+- Do not summarize report content inside the block — the block is a list of pointers.
+- If `PROJECT_STATUS.md` and the current code disagree, trust the code; the status file is stale and should be updated, not relied on.
