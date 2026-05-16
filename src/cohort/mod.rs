@@ -11,5 +11,6 @@
 //! the merger's output into `OverlappingVarGroup`s for Stage 5.
 //! Later stages land in sibling modules as they are implemented.
 
+pub mod per_group_merger;
 pub mod per_position_merger;
 pub mod variant_grouping;
