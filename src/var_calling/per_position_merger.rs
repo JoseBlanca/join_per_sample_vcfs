@@ -85,20 +85,33 @@ pub enum PerPositionMergerError {
     /// enforces per-reader monotonicity internally, so in production
     /// this fires only on pathological mocks or on drift in a future
     /// reader variant that relaxes the per-reader guarantee.
-    #[error("reader {sample_idx} ({sample_name}) emitted out-of-order record: {chrom_id}:{pos}")]
+    ///
+    /// Both the regressing key and the boundary it violated are
+    /// carried so the error is interpretable on its own without
+    /// reproducing the merger state.
+    #[error(
+        "reader {sample_idx} ({sample_name}) emitted out-of-order record: \
+         {regressing_chrom_id}:{regressing_pos} ≤ last emitted \
+         {last_emitted_chrom_id}:{last_emitted_pos}"
+    )]
     OutOfOrder {
         sample_idx: usize,
         sample_name: String,
-        chrom_id: u32,
-        pos: u32,
+        regressing_chrom_id: u32,
+        regressing_pos: u32,
+        last_emitted_chrom_id: u32,
+        last_emitted_pos: u32,
     },
 
-    /// Two `.psp` files disagree on the chromosome id space —
-    /// chromosome count, name, length, or md5 differs. Emitted by
+    /// Two `.psp` files disagree on the per-chromosome metadata for a
+    /// specific chromosome — name, length, or md5 differs. Emitted by
     /// [`check_chromosome_agreement`]. `detail` is a human-readable
     /// description of the specific divergence; downstream code
-    /// matches on `ChromosomeMismatch { .. }` rather than parsing
-    /// it.
+    /// matches on `ChromosomeMismatch { .. }` rather than parsing it.
+    ///
+    /// See also [`PerPositionMergerError::ChromosomeCountMismatch`]
+    /// for the case where the two files disagree on the *count* of
+    /// chromosomes (no specific chrom_id is meaningful then).
     #[error(
         "sample {sample_idx} ({sample_name}) chromosome {chrom_id} disagrees with sample 0: {detail}"
     )]
@@ -107,6 +120,21 @@ pub enum PerPositionMergerError {
         sample_name: String,
         chrom_id: u32,
         detail: String,
+    },
+
+    /// Two `.psp` files disagree on the *number* of chromosomes in
+    /// their headers. Emitted by [`check_chromosome_agreement`]
+    /// before any per-chromosome comparison. Carries both counts so
+    /// the error is self-contained.
+    #[error(
+        "sample {sample_idx} ({sample_name}) declares {n_other} chromosomes; \
+         sample 0 declares {n_baseline}"
+    )]
+    ChromosomeCountMismatch {
+        sample_idx: usize,
+        sample_name: String,
+        n_baseline: usize,
+        n_other: usize,
     },
 }
 
@@ -263,8 +291,10 @@ where
             return Some(Err(PerPositionMergerError::OutOfOrder {
                 sample_idx: offender,
                 sample_name: self.sample_names[offender].clone(),
-                chrom_id: min_key.0,
-                pos: min_key.1,
+                regressing_chrom_id: min_key.0,
+                regressing_pos: min_key.1,
+                last_emitted_chrom_id: last.0,
+                last_emitted_pos: last.1,
             }));
         }
 
@@ -314,11 +344,13 @@ where
 /// clone of the agreed-upon list. Empty `readers` yields an empty
 /// list.
 ///
-/// Returns [`PerPositionMergerError::ChromosomeMismatch`] on the first
-/// divergence. The chromosome list is the operative contract for
-/// the merger's correctness; mismatched reference strings that
-/// happen to agree on every per-chromosome field are not fatal
-/// here.
+/// Returns [`PerPositionMergerError::ChromosomeCountMismatch`] if
+/// the headers declare a different number of chromosomes, or
+/// [`PerPositionMergerError::ChromosomeMismatch`] on the first
+/// per-chromosome divergence (name/length/md5). The chromosome list
+/// is the operative contract for the merger's correctness;
+/// mismatched reference strings that happen to agree on every
+/// per-chromosome field are not fatal here.
 pub fn check_chromosome_agreement<R: Read + Seek>(
     readers: &[PspReader<R>],
 ) -> Result<Vec<ParsedChromosome>, PerPositionMergerError> {
@@ -330,11 +362,11 @@ pub fn check_chromosome_agreement<R: Read + Seek>(
         let other = &reader.header().chromosomes;
         let sample_name = reader.header().sample.clone();
         if other.len() != baseline.len() {
-            return Err(PerPositionMergerError::ChromosomeMismatch {
+            return Err(PerPositionMergerError::ChromosomeCountMismatch {
                 sample_idx,
                 sample_name,
-                chrom_id: 0,
-                detail: format!("chromosome count: {} vs {}", other.len(), baseline.len()),
+                n_baseline: baseline.len(),
+                n_other: other.len(),
             });
         }
         for (chrom_id, (base, this)) in baseline.iter().zip(other.iter()).enumerate() {
@@ -605,15 +637,18 @@ mod tests {
         let err = merger.next().unwrap().unwrap_err();
         let PerPositionMergerError::OutOfOrder {
             sample_idx,
-            chrom_id,
-            pos,
+            regressing_chrom_id,
+            regressing_pos,
+            last_emitted_chrom_id,
+            last_emitted_pos,
             ..
         } = err
         else {
             panic!("expected OutOfOrder, got {err:?}");
         };
         assert_eq!(sample_idx, 0);
-        assert_eq!((chrom_id, pos), (0, 3));
+        assert_eq!((regressing_chrom_id, regressing_pos), (0, 3));
+        assert_eq!((last_emitted_chrom_id, last_emitted_pos), (0, 5));
         assert!(merger.next().is_none());
     }
 
@@ -747,9 +782,17 @@ mod tests {
         let r0 = psp_reader_with_header(h0);
         let r1 = psp_reader_with_header(h1);
         let err = check_chromosome_agreement(&[r0, r1]).unwrap_err();
-        let PerPositionMergerError::ChromosomeMismatch { detail, .. } = err else {
-            panic!("expected ChromosomeMismatch");
+        let PerPositionMergerError::ChromosomeCountMismatch {
+            sample_idx,
+            n_baseline,
+            n_other,
+            ..
+        } = err
+        else {
+            panic!("expected ChromosomeCountMismatch, got {err:?}");
         };
-        assert!(detail.contains("count"), "detail = {detail:?}");
+        assert_eq!(sample_idx, 1);
+        assert_eq!(n_baseline, 2);
+        assert_eq!(n_other, 3);
     }
 }

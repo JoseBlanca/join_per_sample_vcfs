@@ -633,8 +633,10 @@ mod tests {
         PerPositionMergerError::OutOfOrder {
             sample_idx,
             sample_name: format!("S{sample_idx}"),
-            chrom_id: 0,
-            pos: 0,
+            regressing_chrom_id: 0,
+            regressing_pos: 0,
+            last_emitted_chrom_id: 0,
+            last_emitted_pos: 0,
         }
     }
 
