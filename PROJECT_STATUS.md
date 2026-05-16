@@ -133,7 +133,7 @@ grouper.
 - **Code:** [src/var_calling/per_position_merger.rs](src/var_calling/per_position_merger.rs)
 - **Bench:** `var_calling_merger/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
 - **Latest review:** [per-position-merger_2026-05-15.md](doc/devel/reports/reviews/per-position-merger_2026-05-15.md)
-- **Latest fixes-applied:** bundled into [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) (cohort run).
+- **Latest fixes-applied:** bundled into [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) (cohort run) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (Mi14/Mi15 OutOfOrder+ChromosomeMismatch land here).
 - **Open:** perf review deferred — sampling profile blocked by the
   Claude Code session sandbox (see baseline numbers in
   [tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt](tmp/perf_review_2026-05-16_cohort/baseline_criterion.txt)).
@@ -144,7 +144,7 @@ grouper.
 - **Code:** [src/var_calling/variant_grouping.rs](src/var_calling/variant_grouping.rs)
 - **Bench:** `var_calling_grouper/*` in [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
 - **Latest review:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md)
-- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md)
+- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (v2 closes the entire v1 deferred list)
 - **Open:** implementation report not yet written; perf review
   deferred (sampling profile blocked — see Stage 3 entry above).
 
@@ -165,7 +165,7 @@ via rayon.
   starting point for the deferred perf review.
 - **Impl report:** not yet saved.
 - **Latest review:** [cohort_2026-05-16.md](doc/devel/reports/reviews/cohort_2026-05-16.md)
-- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md)
+- **Latest fixes-applied:** [fixes_applied_2026-05-16.md](doc/devel/reports/implementations/fixes_applied_2026-05-16.md) + [fixes_applied_2026-05-16_v2.md](doc/devel/reports/implementations/fixes_applied_2026-05-16_v2.md) (v2 closes the entire v1 deferred list)
 - **Open:**
   - Implementation report for the Stage 5 merger has not been saved; the
     next `rust-feature-implementation` run for this feature should produce
