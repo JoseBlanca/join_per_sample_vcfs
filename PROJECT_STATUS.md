@@ -22,25 +22,21 @@ Skills and agents are instructed to leave it untouched.
 > project manager (next-task)._
 >
 > - **Last completed task:** Stage 3 sdust low-complexity filter
->   implementation on 2026-05-17 —
->   [dust_filter_2026-05-17.md](doc/devel/reports/implementations/dust_filter_2026-05-17.md).
->   New module
->   [src/var_calling/dust_filter.rs](src/var_calling/dust_filter.rs)
->   ports `sdust_core` from the vendored `lh3/sdust` (gitignored at
->   `sdust/`) as a pure `sdust_mask` function, wrapped by a
->   per-chromosome-batch `DustFilter` iterator adaptor over the
->   `PerPositionMerger` stream. Two-layer API: `sdust_mask` is
->   testable in isolation; `DustFilter` is the upstream-wiring
->   wrapper. 25 new tests (12 algorithmic core including a
->   golden-vector test against committed `expected` values that
->   were generated once at implementation time by running
->   `lh3/sdust` on 6 hand-picked snippets — the C tool is not a
->   build- or test-time dependency; 5 config validation tests; 8
->   iterator-plumbing tests with a stub fetcher).
->   `DustFilterConfig::new` is fallible (validates `window ∈
->   3..=4096`); `DustFilter::new` is infallible. 693 lib + 109
->   integration tests pass; `cargo fmt --check`,
->   `cargo clippy --all-targets --all-features -- -D warnings` clean.
+>   code review on 2026-05-17 —
+>   [dust_filter_2026-05-17.md](doc/devel/reports/reviews/dust_filter_2026-05-17.md).
+>   Request-changes verdict: 0 Blockers, 8 Major, 24 Minor + 9
+>   Nits. Most-important fixes: M1 `pileups.pos - 1` silent
+>   underflow on `pos == 0` (typed-error variant needed); M2
+>   missing property test on `sdust_mask`; M3/M4 missing
+>   boundary and out-of-order regression tests on `DustFilter`;
+>   M5 `sdust_high_threshold_disables_masking` does not pin
+>   strict-`>`; M6 error-`Display` chain doubling; M7 missing
+>   `// PANIC-FREE:` comment; M8 unchecked counter subtractions.
+>   Algorithmic port from `lh3/sdust` verified byte-for-byte
+>   against the C source — no port-fidelity findings. Four open
+>   questions for the human PM: tracing policy (Mi6), `window`
+>   upper bound justification (Mi7), `sdust_mask` panic-vs-Result
+>   symmetry (Mi24), out-of-order policy (M4).
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -130,7 +126,7 @@ reference and silently drops low-complexity records. No intermediate
 mask file. Algorithm ported from `lh3/sdust` (vendored at `sdust/`,
 gitignored).
 
-- **Status:** implemented
+- **Status:** reviewed
 - **Spec section:** `## Stage 3 — low-complexity filter` in [calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md)
 - **Plan:** [dust_filter.md](doc/devel/implementation_plans/dust_filter.md)
 - **Code:** [src/var_calling/dust_filter.rs](src/var_calling/dust_filter.rs)
@@ -141,7 +137,9 @@ gitignored).
   by running `lh3/sdust` on each snippet — the C tool is not a
   build- or test-time dependency.
 - **Impl report:** [dust_filter_2026-05-17.md](doc/devel/reports/implementations/dust_filter_2026-05-17.md)
+- **Latest review:** [dust_filter_2026-05-17.md](doc/devel/reports/reviews/dust_filter_2026-05-17.md) — Request-changes: 0 Blockers, 8 Major, 24 Minor + 9 Nits. Headline items: M1 `pileups.pos - 1` underflow on `pos == 0` (silent wrong filtering in release); M2 missing property test on `sdust_mask`; M3 no half-open boundary test on `is_masked`; M4 no out-of-order regression test; M5 `sdust_high_threshold_disables_masking` does not actually pin the strict-`>` boundary; M6 error `Display` doubles the source chain; M7 `expect("deque non-empty at cap")` lacks `// PANIC-FREE:`; M8 unchecked counter subtractions rely on undocumented invariants.
 - **Open:**
+  - Apply review findings (see `Latest review`).
   - CLI parser bindings (`--complexity-window`,
     `--complexity-threshold`, `--no-complexity-filter`) land with
     the cohort subcommand.
