@@ -44,6 +44,7 @@
 //! [`PosteriorEngineError::ApproximateModeNotYetImplemented`].
 
 pub mod backends;
+mod interp;
 mod shape;
 
 use std::fmt;

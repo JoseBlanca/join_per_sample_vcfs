@@ -29,9 +29,10 @@ use merge_per_sample_vcfs::var_calling::per_group_merger::{
     MergedRecord, PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
 };
 use merge_per_sample_vcfs::var_calling::per_position_merger::PerPositionPileups;
-use merge_per_sample_vcfs::var_calling::posterior_engine::{
-    PosteriorEngine, PosteriorEngineConfig,
+use merge_per_sample_vcfs::var_calling::posterior_engine::backends::{
+    ExactMath, InterpUnivariateMath, MathBackend,
 };
+use merge_per_sample_vcfs::var_calling::posterior_engine::{PosteriorEngine, PosteriorEngineConfig};
 use merge_per_sample_vcfs::var_calling::variant_grouping::OverlappingVariantGroup;
 
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
@@ -141,32 +142,21 @@ fn representative_contamination(n_samples: usize) -> ContaminationEstimates {
     .expect("representative_contamination inputs are valid")
 }
 
-fn main() {
-    eprintln!("building fixture ({N_GROUPS} groups, {N_SAMPLES} samples)…");
-    let setup_start = Instant::now();
-
-    let (groups, ref_seq) = build_biallelic_snp_groups(N_GROUPS, N_SAMPLES, SPACING);
-    let fetcher: SharedRefFetcher = Arc::new(InMemRef {
-        seq: ref_seq,
-        base_offset: 100,
-    });
-    let merged = pre_merge(groups, fetcher);
-    let mut config = PosteriorEngineConfig::with_project_defaults();
-    config.contamination = Some(representative_contamination(N_SAMPLES));
-
-    eprintln!(
-        "fixture built in {:?} ({} merged records)",
-        setup_start.elapsed(),
-        merged.len()
-    );
-    eprintln!("draining engine {N_RUNS} times…");
-
+fn drain<M: MathBackend + Copy>(
+    merged: &[MergedRecord],
+    config: &PosteriorEngineConfig,
+    math: M,
+) -> std::time::Duration {
     let mut total_records: u64 = 0;
     let runs_start = Instant::now();
     for run in 0..N_RUNS {
         let run_start = Instant::now();
-        let records = merged.clone();
-        let engine = PosteriorEngine::with_config(records.into_iter().map(Ok), config.clone());
+        let records = merged.to_vec();
+        let engine = PosteriorEngine::with_math_backend(
+            records.into_iter().map(Ok),
+            config.clone(),
+            math,
+        );
         let mut n = 0_u64;
         for item in engine {
             let r = item.expect("engine produced an error");
@@ -186,4 +176,43 @@ fn main() {
         "total: {total_records} records across {N_RUNS} runs in {elapsed:?} ({:.2} us/record)",
         elapsed.as_secs_f64() * 1e6 / total_records as f64
     );
+    elapsed
+}
+
+fn main() {
+    eprintln!("building fixture ({N_GROUPS} groups, {N_SAMPLES} samples)…");
+    let setup_start = Instant::now();
+
+    let (groups, ref_seq) = build_biallelic_snp_groups(N_GROUPS, N_SAMPLES, SPACING);
+    let fetcher: SharedRefFetcher = Arc::new(InMemRef {
+        seq: ref_seq,
+        base_offset: 100,
+    });
+    let merged = pre_merge(groups, fetcher);
+    let mut config = PosteriorEngineConfig::with_project_defaults();
+    config.contamination = Some(representative_contamination(N_SAMPLES));
+
+    eprintln!(
+        "fixture built in {:?} ({} merged records)",
+        setup_start.elapsed(),
+        merged.len()
+    );
+
+    // `POSTERIOR_BACKEND` selects the math backend for this run.
+    // Defaults to ExactMath so existing scripts keep their meaning.
+    let backend = std::env::var("POSTERIOR_BACKEND").unwrap_or_else(|_| "exact".to_string());
+    match backend.as_str() {
+        "exact" => {
+            eprintln!("backend: ExactMath; draining engine {N_RUNS} times…");
+            drain(&merged, &config, ExactMath);
+        }
+        "interp" => {
+            eprintln!("backend: InterpUnivariateMath; draining engine {N_RUNS} times…");
+            drain(&merged, &config, InterpUnivariateMath);
+        }
+        other => {
+            eprintln!("unknown POSTERIOR_BACKEND={other:?} (use 'exact' or 'interp')");
+            std::process::exit(2);
+        }
+    }
 }

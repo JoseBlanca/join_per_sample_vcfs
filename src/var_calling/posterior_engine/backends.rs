@@ -11,14 +11,16 @@
 //! - [`ExactMath`] — calls `f64::ln` / `f64::exp` directly. Bit-identical
 //!   to the unoptimised engine and the default for
 //!   [`PosteriorEngine::new`] / [`PosteriorEngine::with_config`].
-//! - Future: `InterpUnivariateMath` — interpolated lookup tables over a
-//!   uniform grid in the IEEE 754 mantissa. Approximate but ~4× faster
-//!   per call. Lands in a later step of the interpolated-LUTs plan.
+//! - [`InterpUnivariateMath`] — IEEE-decomposition + 1D linear-interp
+//!   lookup tables. Approximate (~`1e-6` relative error per call) but
+//!   substantially faster than native `ln` / `exp`. Opt-in via
+//!   [`PosteriorEngine::with_math_backend`] until the accuracy harness
+//!   confirms the trade-off is acceptable for the default.
 //!
 //! The trait is `Sync` because backends are constructed once and shared
 //! across the EM loop's reads; no mutable state is required for either
-//! backend (`ExactMath` is zero-sized, `InterpUnivariateMath` will hold
-//! `'static` tables).
+//! backend (both are zero-sized — [`InterpUnivariateMath`] reads
+//! `'static`-lifetime tables defined in the sibling `interp` module).
 //!
 //! [`PosteriorEngine`]: super::PosteriorEngine
 //! [`PosteriorEngine::new`]: super::PosteriorEngine::new
@@ -69,6 +71,34 @@ impl MathBackend for ExactMath {
     #[inline]
     fn exp(&self, x: f64) -> f64 {
         x.exp()
+    }
+}
+
+/// Interpolated `ln` / `exp` via static lookup tables.
+///
+/// Per-call relative error on typical EM inputs is ~`1e-6` (set by
+/// the 1024-bin sub-table resolution in [`super::interp`]); see the
+/// module docs there for the IEEE-decomposition trick that linearises
+/// the inputs.
+///
+/// **API stability.** The internals (table layout, resolution, the
+/// precise sub-domain partition) may change without a major version
+/// bump as the accuracy harness drives the resolution tuning. For
+/// stable output across versions, construct the engine via
+/// [`super::PosteriorEngine::new`] / [`super::PosteriorEngine::with_config`]
+/// and don't name the backend explicitly.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InterpUnivariateMath;
+
+impl MathBackend for InterpUnivariateMath {
+    #[inline]
+    fn ln(&self, x: f64) -> f64 {
+        super::interp::ln_approx(x)
+    }
+
+    #[inline]
+    fn exp(&self, x: f64) -> f64 {
+        super::interp::exp_approx(x)
     }
 }
 
