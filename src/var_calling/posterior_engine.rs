@@ -44,12 +44,14 @@
 //! [`PosteriorEngineError::ApproximateModeNotYetImplemented`].
 
 pub mod backends;
+mod shape;
 
 use std::fmt;
 
 use thiserror::Error;
 
 use self::backends::{ExactMath, MathBackend};
+use self::shape::{GenotypeShape, shape_for};
 use crate::per_sample_pileup::pileup::AlleleSupportStats;
 use crate::var_calling::contamination_estimation::{
     AlleleClass as ContamAlleleClass, ContaminationEstimates, MAX_BASE_ERROR, MIN_BASE_ERROR,
@@ -717,8 +719,8 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
     math: &M,
 ) -> Result<Vec<f64>, PosteriorEngineError> {
     let n_alleles = alleles.len();
-    let genotypes = genotype_order(ploidy, n_alleles);
-    let n_genotypes = genotypes.len();
+    let shape = shape_for(ploidy, n_alleles);
+    let n_genotypes = shape.n_genotypes;
     let n_samples = scalars.len() / n_alleles;
 
     debug_assert_eq!(
@@ -738,17 +740,7 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
         .copied()
         .map(map_to_contam_class)
         .collect();
-
-    // Flat row-major n_genotypes × n_alleles allele-count table —
-    // matches the existing EmContext layout.
-    let mut genotype_allele_counts = vec![0_u32; n_genotypes * n_alleles];
-    for (g_idx, g) in genotypes.iter().enumerate() {
-        let genotype_copy_counts =
-            &mut genotype_allele_counts[g_idx * n_alleles..(g_idx + 1) * n_alleles];
-        for &a in g {
-            genotype_copy_counts[a as usize] += 1;
-        }
-    }
+    let genotype_allele_counts = &shape.genotype_allele_counts;
 
     let ploidy_f = f64::from(ploidy);
     // Denominator for spreading per-base error mass across alleles
@@ -846,11 +838,12 @@ struct EmContext<'a> {
     n_genotypes: usize,
     n_alleles: usize,
     ploidy: u8,
-    /// Flat row-major `n_genotypes × n_alleles` allele-count table —
-    /// `[g_idx * n_alleles + a]` is the number of copies of allele
-    /// `a` in genotype `g_idx`.
-    genotype_allele_counts: &'a [u32],
-    log_multinomial_coeffs: &'a [f64],
+    /// Precomputed genotype-shape artefacts:
+    /// `genotype_allele_counts`, `log_multinomial_coeffs`,
+    /// `nonzero_pairs` / `nonzero_pairs_offsets`, and
+    /// `homozygous_allele_for`. Shared across records of the same
+    /// `(ploidy, n_alleles)` via the thread-local cache.
+    shape: &'a GenotypeShape,
     compound_mask: &'a [bool],
     pseudocounts: &'a [f64],
     /// `safe_ln(f_s)` per sample, where `f_s` is the per-sample
@@ -1012,8 +1005,6 @@ fn run_em_for_record<M: MathBackend>(
         .map(|&f_s| safe_ln(math, 1.0 - f_s))
         .collect();
 
-    let genotypes = genotype_order(ploidy, n_alleles);
-
     let allele_classes = classify_alleles(&alleles);
     let pseudocounts: Vec<f64> = allele_classes
         .iter()
@@ -1021,21 +1012,12 @@ fn run_em_for_record<M: MathBackend>(
         .collect();
     let compound_mask: Vec<bool> = alleles.iter().map(|a| a.is_compound).collect();
 
-    // Precompute the per-genotype allele-count rows (counts[g][a]) and
-    // the multinomial log-coefficients ln C(ploidy; counts[g]) into
-    // flat row-major buffers. Both are functions of (ploidy, genotype)
-    // only and reused every EM iteration.
-    let mut genotype_allele_counts = vec![0_u32; n_genotypes * n_alleles];
-    for (g_idx, g) in genotypes.iter().enumerate() {
-        let row = &mut genotype_allele_counts[g_idx * n_alleles..(g_idx + 1) * n_alleles];
-        for &a in g {
-            row[a as usize] += 1;
-        }
-    }
-    let log_multinomial_coeffs: Vec<f64> = genotype_allele_counts
-        .chunks_exact(n_alleles)
-        .map(|counts| log_multinomial_coefficient(ploidy, counts))
-        .collect();
+    // Genotype-shape artefacts (allele-count table, multinomial
+    // coefficients, non-zero-pair and homozygous-allele lookups) come
+    // from a thread-local `(ploidy, n_alleles)`-keyed cache. Repeated
+    // shapes (the common case — every biallelic-diploid record shares
+    // `(2, 2)`) hit the cache instead of rebuilding.
+    let shape = shape_for(ploidy, n_alleles);
 
     let ctx = EmContext {
         locus,
@@ -1043,8 +1025,7 @@ fn run_em_for_record<M: MathBackend>(
         n_genotypes,
         n_alleles,
         ploidy,
-        genotype_allele_counts: &genotype_allele_counts,
-        log_multinomial_coeffs: &log_multinomial_coeffs,
+        shape: &shape,
         compound_mask: &compound_mask,
         pseudocounts: &pseudocounts,
         log_f_per_sample: &log_f_per_sample,
@@ -1266,34 +1247,31 @@ fn e_step<M: MathBackend>(
         let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
         let log_f = ctx.log_f_per_sample[sample_idx];
 
-        for (g_idx, gt_counts) in ctx
-            .genotype_allele_counts
-            .chunks_exact(ctx.n_alleles)
-            .enumerate()
-        {
-            let log_indep = ctx.log_multinomial_coeffs[g_idx]
-                + gt_counts
+        for (g_idx, &ll) in ll_row.iter().enumerate() {
+            // Inner sum walks only the non-zero (allele, count) pairs
+            // for this genotype — the `if k == 0` skip-branch and the
+            // per-cell `homozygous_allele` linear scan that the
+            // un-shape-cached path used are both gone. For diploid each
+            // pairs slice is 1 (homozygous) or 2 (heterozygous) entries.
+            let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
+            let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
+
+            let log_indep = ctx.shape.log_multinomial_coeffs[g_idx]
+                + pairs
                     .iter()
-                    .enumerate()
-                    .map(|(a, &k)| {
-                        if k == 0 {
-                            0.0
-                        } else {
-                            k as f64 * scratch.log_p_effective[a]
-                        }
-                    })
+                    .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
                     .sum::<f64>();
-            let log_prior = if let Some(homo_allele) = homozygous_allele(gt_counts) {
-                log_sum_exp_2(
+
+            let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
+                Some(homo_allele) => log_sum_exp_2(
                     math,
                     log_one_minus_f + log_indep,
-                    log_f + scratch.log_p_effective[homo_allele],
-                )
-            } else {
+                    log_f + scratch.log_p_effective[homo_allele as usize],
+                ),
                 // Heterozygous genotype: IBD component contributes 0.
-                log_one_minus_f + log_indep
+                None => log_one_minus_f + log_indep,
             };
-            scratch.log_post_unnorm[g_idx] = ll_row[g_idx] + log_prior;
+            scratch.log_post_unnorm[g_idx] = ll + log_prior;
         }
 
         let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
@@ -1336,6 +1314,7 @@ fn m_step_p_hat(ctx: &EmContext<'_>, posteriors: &[f64], scratch: &mut EmScratch
 
     for post_row in posteriors.chunks_exact(ctx.n_genotypes) {
         for (g_idx, gt_counts) in ctx
+            .shape
             .genotype_allele_counts
             .chunks_exact(ctx.n_alleles)
             .enumerate()
@@ -1531,42 +1510,6 @@ fn log_sum_exp_slice<M: MathBackend>(math: &M, values: &[f64]) -> f64 {
     }
     let sum: f64 = values.iter().map(|v| math.exp(*v - m)).sum();
     m + math.ln(sum)
-}
-
-fn log_multinomial_coefficient(ploidy: u8, counts: &[u32]) -> f64 {
-    let mut log_coef = log_factorial(ploidy as u32);
-    for &k in counts {
-        log_coef -= log_factorial(k);
-    }
-    log_coef
-}
-
-/// `lgamma(n + 1)` for small non-negative `n`. The EM only uses this
-/// for `n ≤ ploidy` (≤ 8 in practice), so a tiny iterative product is
-/// fastest and exact for all relevant inputs.
-fn log_factorial(n: u32) -> f64 {
-    let mut acc = 0.0_f64;
-    for i in 2..=n {
-        acc += (i as f64).ln();
-    }
-    acc
-}
-
-/// If every non-zero entry of `counts` is at the same allele index,
-/// returns that index. Used to detect genotypes that the
-/// HWE-with-`F` IBD partition contributes mass to.
-fn homozygous_allele(counts: &[u32]) -> Option<usize> {
-    let mut found: Option<usize> = None;
-    for (a, &k) in counts.iter().enumerate() {
-        if k == 0 {
-            continue;
-        }
-        match found {
-            None => found = Some(a),
-            Some(_) => return None,
-        }
-    }
-    found
 }
 
 fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
@@ -2722,36 +2665,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn log_factorial_returns_zero_for_zero_and_one() {
-        assert_eq!(log_factorial(0), 0.0);
-        assert_eq!(log_factorial(1), 0.0);
-        assert!(approx(log_factorial(5), (120.0_f64).ln(), 1e-12));
-    }
-
-    #[test]
-    fn log_multinomial_coefficient_matches_closed_form() {
-        assert!(approx(
-            log_multinomial_coefficient(2, &[1, 1]),
-            2.0_f64.ln(),
-            1e-12
-        ));
-        assert!(approx(log_multinomial_coefficient(2, &[2, 0]), 0.0, 1e-12));
-        assert!(approx(
-            log_multinomial_coefficient(4, &[2, 2]),
-            6.0_f64.ln(),
-            1e-12
-        ));
-    }
-
-    #[test]
-    fn homozygous_allele_returns_index_for_pure_genotypes() {
-        assert_eq!(homozygous_allele(&[2, 0, 0]), Some(0));
-        assert_eq!(homozygous_allele(&[0, 2, 0]), Some(1));
-        assert_eq!(homozygous_allele(&[0, 0, 2]), Some(2));
-        assert_eq!(homozygous_allele(&[1, 1, 0]), None);
-        assert_eq!(homozygous_allele(&[0, 0, 0]), None);
-    }
+    // `log_factorial`, `log_multinomial_coefficient`, and
+    // `homozygous_allele` were moved alongside the genotype-shape cache
+    // to `posterior_engine::shape`; their tests live in that module.
 
     #[test]
     fn classify_alleles_routes_pseudocounts_correctly() {
