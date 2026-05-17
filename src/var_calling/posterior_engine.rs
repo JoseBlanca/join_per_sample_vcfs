@@ -876,6 +876,11 @@ struct EmScratch {
     /// Per-genotype unnormalised log-posterior for the current
     /// sample. Length `n_genotypes`.
     log_post_unnorm: Vec<f64>,
+    /// SIMD-lane buffer: per-genotype `f64x4` of unnormalised
+    /// log-posteriors across a 4-sample batch. Used by the SIMD
+    /// `e_step` body when `M::HAS_LANE_4` is true. Length
+    /// `n_genotypes`. Non-SIMD callers leave this alone.
+    log_post_unnorm_lane: Vec<wide::f64x4>,
     /// Posterior-weighted allele counts E[n_a]. Length `n_alleles`.
     expected_counts: Vec<f64>,
 }
@@ -886,6 +891,7 @@ impl EmScratch {
             p_effective: vec![0.0; n_alleles],
             log_p_effective: vec![0.0; n_alleles],
             log_post_unnorm: vec![0.0; n_genotypes],
+            log_post_unnorm_lane: vec![wide::f64x4::ZERO; n_genotypes],
             expected_counts: vec![0.0; n_alleles],
         }
     }
@@ -1062,15 +1068,30 @@ fn run_em_for_record<M: MathBackend>(
     // posteriors reflect the *post-final-M-step* parameters rather
     // than the parameters that produced the last `posteriors` buffer
     // contents.
-    e_step(
-        &ctx,
-        math,
-        &log_likelihoods,
-        &p_hat,
-        &f_hat_compound,
-        &mut scratch,
-        &mut posteriors,
-    )?;
+    //
+    // `M::HAS_LANE_4` is a compile-time const so the unused branch is
+    // dead-code-eliminated after monomorphisation.
+    if M::HAS_LANE_4 {
+        e_step_simd(
+            &ctx,
+            math,
+            &log_likelihoods,
+            &p_hat,
+            &f_hat_compound,
+            &mut scratch,
+            &mut posteriors,
+        )?;
+    } else {
+        e_step(
+            &ctx,
+            math,
+            &log_likelihoods,
+            &p_hat,
+            &f_hat_compound,
+            &mut scratch,
+            &mut posteriors,
+        )?;
+    }
 
     let (best_genotype, gq_phred, qual_phred) =
         summarise_posteriors(n_samples, n_genotypes, &posteriors, config.max_gq_phred);
@@ -1166,15 +1187,27 @@ fn run_em_loop<M: MathBackend>(
     while iterations < max_iterations {
         iterations += 1;
 
-        e_step(
-            ctx,
-            math,
-            log_likelihoods,
-            p_hat,
-            f_hat_compound,
-            scratch,
-            posteriors,
-        )?;
+        if M::HAS_LANE_4 {
+            e_step_simd(
+                ctx,
+                math,
+                log_likelihoods,
+                p_hat,
+                f_hat_compound,
+                scratch,
+                posteriors,
+            )?;
+        } else {
+            e_step(
+                ctx,
+                math,
+                log_likelihoods,
+                p_hat,
+                f_hat_compound,
+                scratch,
+                posteriors,
+            )?;
+        }
 
         let new_p_hat = m_step_p_hat(ctx, posteriors, scratch);
         let new_f_hat_compound = m_step_f_hat_compound(ctx, scratch);
@@ -1299,6 +1332,191 @@ fn e_step<M: MathBackend>(
             });
         }
 
+        for (g_idx, post_slot) in post_row.iter_mut().enumerate() {
+            let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
+            if !posterior.is_finite() {
+                return Err(PosteriorEngineError::NonFinitePosterior {
+                    locus: ctx.locus,
+                    sample_idx,
+                    genotype_idx: Some(g_idx),
+                    kind: classify_nonfinite(posterior),
+                });
+            }
+            *post_slot = posterior;
+        }
+    }
+
+    Ok(())
+}
+
+/// SIMD-aware variant of [`e_step`]. Processes samples in batches of
+/// 4 lanes; falls back to the scalar `e_step` body for the tail when
+/// `n_samples` is not a multiple of 4.
+///
+/// The dispatch in [`run_em_loop`] / [`run_em_for_record`] selects
+/// this when the math backend's `HAS_LANE_4` const is `true`. For
+/// scalar backends the const is `false` and this function is
+/// dead-code-eliminated by monomorphisation.
+fn e_step_simd<M: MathBackend>(
+    ctx: &EmContext<'_>,
+    math: &M,
+    log_likelihoods: &[f64],
+    p_hat: &[f64],
+    f_hat_compound: &[f64],
+    scratch: &mut EmScratch,
+    posteriors: &mut [f64],
+) -> Result<(), PosteriorEngineError> {
+    // `log_p_effective` build is per-allele scalar work — identical
+    // to the scalar e_step.
+    for (a, (slot_p, slot_log)) in scratch
+        .p_effective
+        .iter_mut()
+        .zip(scratch.log_p_effective.iter_mut())
+        .enumerate()
+    {
+        let p = if ctx.compound_mask[a] {
+            f_hat_compound[a]
+        } else {
+            p_hat[a]
+        };
+        *slot_p = p;
+        *slot_log = safe_ln(math, p);
+    }
+
+    let n_genotypes = ctx.n_genotypes;
+    let n_samples = ctx.n_samples;
+    let n_full_batches = n_samples / 4;
+    let tail_start = n_full_batches * 4;
+
+    // Batch loop: 4 samples per iteration.
+    for batch_idx in 0..n_full_batches {
+        let s0 = batch_idx * 4;
+
+        // Lane-load the per-sample fixation-index logs for this
+        // batch's 4 samples.
+        let log_f_v = wide::f64x4::from([
+            ctx.log_f_per_sample[s0],
+            ctx.log_f_per_sample[s0 + 1],
+            ctx.log_f_per_sample[s0 + 2],
+            ctx.log_f_per_sample[s0 + 3],
+        ]);
+        let log_one_minus_f_v = wide::f64x4::from([
+            ctx.log_one_minus_f_per_sample[s0],
+            ctx.log_one_minus_f_per_sample[s0 + 1],
+            ctx.log_one_minus_f_per_sample[s0 + 2],
+            ctx.log_one_minus_f_per_sample[s0 + 3],
+        ]);
+
+        // Compute `log_post_unnorm[g]` as a `f64x4` across the 4
+        // samples for every genotype.
+        for g_idx in 0..n_genotypes {
+            // `log_indep` is identical across the 4 samples (depends
+            // only on the shape and `log_p_effective`).
+            let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
+            let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
+            let log_indep = ctx.shape.log_multinomial_coeffs[g_idx]
+                + pairs
+                    .iter()
+                    .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
+                    .sum::<f64>();
+            let log_indep_v = wide::f64x4::splat(log_indep);
+
+            let log_prior_v = match ctx.shape.homozygous_allele_for[g_idx] {
+                Some(homo_allele) => {
+                    let term1 = log_one_minus_f_v + log_indep_v;
+                    let term2 =
+                        log_f_v + wide::f64x4::splat(scratch.log_p_effective[homo_allele as usize]);
+                    log_sum_exp_2_x4(math, term1, term2)
+                }
+                None => log_one_minus_f_v + log_indep_v,
+            };
+
+            // Lane-load the per-sample likelihood for this genotype.
+            // `log_likelihoods` is `[s * n_genotypes + g]` row-major.
+            let ll_v = wide::f64x4::from([
+                log_likelihoods[s0 * n_genotypes + g_idx],
+                log_likelihoods[(s0 + 1) * n_genotypes + g_idx],
+                log_likelihoods[(s0 + 2) * n_genotypes + g_idx],
+                log_likelihoods[(s0 + 3) * n_genotypes + g_idx],
+            ]);
+
+            scratch.log_post_unnorm_lane[g_idx] = ll_v + log_prior_v;
+        }
+
+        // Per-lane `log_z` via SIMD log_sum_exp_slice.
+        let log_z_v = log_sum_exp_slice_x4(math, &scratch.log_post_unnorm_lane);
+        let log_z_arr = log_z_v.to_array();
+
+        // Surface non-finite `log_z` per lane.
+        for (lane, &z) in log_z_arr.iter().enumerate() {
+            if !z.is_finite() {
+                return Err(PosteriorEngineError::NonFinitePosterior {
+                    locus: ctx.locus,
+                    sample_idx: s0 + lane,
+                    genotype_idx: None,
+                    kind: classify_nonfinite(z),
+                });
+            }
+        }
+
+        // Normalise into `posteriors`. Layout stays sample-major, so
+        // we scatter each lane back to its `(sample, genotype)` slot.
+        for g_idx in 0..n_genotypes {
+            let post_v =
+                wide::f64x4::from(math.exp_x4((scratch.log_post_unnorm_lane[g_idx] - log_z_v).to_array()));
+            let post_arr = post_v.to_array();
+            for (lane, &p) in post_arr.iter().enumerate() {
+                if !p.is_finite() {
+                    return Err(PosteriorEngineError::NonFinitePosterior {
+                        locus: ctx.locus,
+                        sample_idx: s0 + lane,
+                        genotype_idx: Some(g_idx),
+                        kind: classify_nonfinite(p),
+                    });
+                }
+                posteriors[(s0 + lane) * n_genotypes + g_idx] = p;
+            }
+        }
+    }
+
+    // Tail: process any samples beyond the last full batch via the
+    // scalar inner loop. Repeats the per-genotype work for these few
+    // samples — typically 0..3 of them, negligible cost.
+    for sample_idx in tail_start..n_samples {
+        let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
+        let log_f = ctx.log_f_per_sample[sample_idx];
+        let ll_row = &log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
+
+        for (g_idx, &ll) in ll_row.iter().enumerate() {
+            let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
+            let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
+            let log_indep = ctx.shape.log_multinomial_coeffs[g_idx]
+                + pairs
+                    .iter()
+                    .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
+                    .sum::<f64>();
+            let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
+                Some(homo_allele) => log_sum_exp_2(
+                    math,
+                    log_one_minus_f + log_indep,
+                    log_f + scratch.log_p_effective[homo_allele as usize],
+                ),
+                None => log_one_minus_f + log_indep,
+            };
+            scratch.log_post_unnorm[g_idx] = ll + log_prior;
+        }
+
+        let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
+        if !log_z.is_finite() {
+            return Err(PosteriorEngineError::NonFinitePosterior {
+                locus: ctx.locus,
+                sample_idx,
+                genotype_idx: None,
+                kind: classify_nonfinite(log_z),
+            });
+        }
+        let post_row =
+            &mut posteriors[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
         for (g_idx, post_slot) in post_row.iter_mut().enumerate() {
             let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
             if !posterior.is_finite() {
@@ -1519,6 +1737,47 @@ fn log_sum_exp_slice<M: MathBackend>(math: &M, values: &[f64]) -> f64 {
     }
     let sum: f64 = values.iter().map(|v| math.exp(*v - m)).sum();
     m + math.ln(sum)
+}
+
+/// Lane-of-4 version of [`log_sum_exp_2`]. The both-`-INF` lane case
+/// (which the scalar guards via early returns) is left to produce
+/// `NaN` here — in the EM hot path, log-priors are sums of finite
+/// pseudocount-stabilised log-frequencies, so this case never arises
+/// on realistic inputs.
+#[inline]
+fn log_sum_exp_2_x4<M: MathBackend>(math: &M, a: wide::f64x4, b: wide::f64x4) -> wide::f64x4 {
+    let m = a.fast_max(b);
+    let ea = math.exp_x4((a - m).to_array());
+    let eb = math.exp_x4((b - m).to_array());
+    let sum = wide::f64x4::from(ea) + wide::f64x4::from(eb);
+    let ln_sum = wide::f64x4::from(math.ln_x4(sum.to_array()));
+    m + ln_sum
+}
+
+/// Lane-of-4 version of [`log_sum_exp_slice`]. Each lane independently
+/// computes `log_sum_exp` over the genotype dimension (the slice).
+///
+/// If any lane's max is `-∞`, that lane's result is forced to `-∞`
+/// (matching the scalar's all-`-∞` short circuit) rather than the
+/// `NaN` the raw computation would produce.
+#[inline]
+fn log_sum_exp_slice_x4<M: MathBackend>(math: &M, values: &[wide::f64x4]) -> wide::f64x4 {
+    use wide::CmpEq;
+    let mut m = wide::f64x4::splat(f64::NEG_INFINITY);
+    for &v in values {
+        m = m.fast_max(v);
+    }
+    let mut sum = wide::f64x4::splat(0.0);
+    for &v in values {
+        let exp_diff = math.exp_x4((v - m).to_array());
+        sum += wide::f64x4::from(exp_diff);
+    }
+    let ln_sum = wide::f64x4::from(math.ln_x4(sum.to_array()));
+    let candidate = m + ln_sum;
+    // Per-lane fallback: if a lane's `m == -∞`, force result to `-∞`.
+    let neg_inf = wide::f64x4::splat(f64::NEG_INFINITY);
+    let all_neg_mask = m.cmp_eq(neg_inf);
+    all_neg_mask.blend(neg_inf, candidate)
 }
 
 fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {

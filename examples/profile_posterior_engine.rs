@@ -30,7 +30,7 @@ use merge_per_sample_vcfs::var_calling::per_group_merger::{
 };
 use merge_per_sample_vcfs::var_calling::per_position_merger::PerPositionPileups;
 use merge_per_sample_vcfs::var_calling::posterior_engine::backends::{
-    ExactMath, InterpUnivariateMath, MathBackend,
+    ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend,
 };
 use merge_per_sample_vcfs::var_calling::posterior_engine::{PosteriorEngine, PosteriorEngineConfig};
 use merge_per_sample_vcfs::var_calling::variant_grouping::OverlappingVariantGroup;
@@ -210,8 +210,12 @@ fn main() {
             eprintln!("backend: InterpUnivariateMath; draining engine {N_RUNS} times…");
             drain(&merged, &config, InterpUnivariateMath);
         }
+        "simd" => {
+            eprintln!("backend: InterpUnivariateSimdMath; draining engine {N_RUNS} times…");
+            drain(&merged, &config, InterpUnivariateSimdMath);
+        }
         other => {
-            eprintln!("unknown POSTERIOR_BACKEND={other:?} (use 'exact' or 'interp')");
+            eprintln!("unknown POSTERIOR_BACKEND={other:?} (use 'exact' / 'interp' / 'simd')");
             std::process::exit(2);
         }
     }
