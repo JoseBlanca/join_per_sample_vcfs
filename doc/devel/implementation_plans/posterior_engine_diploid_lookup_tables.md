@@ -269,14 +269,34 @@ struct EmContext<'a> {
 
 Bit-identical to today's output. Trivial to validate.
 
-### E. `(ploidy, n_alleles)`-keyed genotype-shape cache
+### E. `(ploidy, n_alleles)`-keyed genotype-shape cache + e_step restructure
 
-`run_em_for_record` rebuilds three pure-function-of-`(ploidy,
+The step-0 flamegraph shows `e_step` itself at ~30 % of self-time
+on top of the ~40 % spent in `ln`/`exp`. Item A targets the
+math; this item targets the EM inner-loop arithmetic by
+**extending `GenotypeShape`** with two precomputed fields that
+let `e_step` skip three avoidable costs per cell:
+
+1. **The `if k == 0` skip-branch** in the per-allele sum.
+2. **The `homozygous_allele(gt_counts)` linear scan** done per
+   cell to pick the IBD prior branch.
+3. **The cast-and-multiply by `k as f64`** when `k = 1` (a
+   wasted multiply by 1.0).
+
+`run_em_for_record` today rebuilds three pure-function-of-`(ploidy,
 n_alleles)` artefacts on every record:
 
 - `genotype_order(ploidy, n_alleles)` ([per_group_merger.rs:355](../../src/var_calling/per_group_merger.rs#L355));
 - the flat `genotype_allele_counts` table;
 - `log_multinomial_coeffs`.
+
+We add two more, both also pure functions of `(ploidy, n_alleles)`:
+
+- `nonzero_pairs` — flat list of `(allele_idx, count)` pairs with
+  `count > 0`, concatenated per genotype; for diploid each
+  genotype has 1 or 2 entries.
+- `homozygous_allele_for[g]` — `Some(a)` if genotype `g` is
+  homozygous for allele `a`, `None` otherwise.
 
 Adjacent biallelic-SNP records share the same `(2, 2)` shape;
 caching is a free win. Implementation — a fixed-size slot array
@@ -287,6 +307,16 @@ struct GenotypeShape {
     n_genotypes: usize,
     genotype_allele_counts: Vec<u32>,
     log_multinomial_coeffs: Vec<f64>,
+    /// Flat list of `(allele_idx, count)` pairs with count > 0,
+    /// concatenated per genotype. For diploid: 1 entry (homozygous)
+    /// or 2 entries (heterozygous) per genotype.
+    nonzero_pairs: Vec<(u8, u32)>,
+    /// `(start, len)` into `nonzero_pairs`, per genotype.
+    nonzero_pairs_offsets: Vec<(u32, u8)>,
+    /// Per genotype: `Some(a)` if homozygous for allele `a`,
+    /// `None` otherwise. Replaces the per-cell
+    /// `homozygous_allele(gt_counts)` scan in `e_step`.
+    homozygous_allele_for: Vec<Option<u8>>,
 }
 
 const MAX_CACHED_PLOIDY: usize = 8;       // covers diploid through octoploid
@@ -330,6 +360,50 @@ itself (it won't — the lookup is once per record, dwarfed by
 the EM loop), revisit with a HashMap+LRU. The slot array is
 the simpler shape and matches the (heavily concentrated)
 real-world `(ploidy, n_alleles)` distribution.
+
+**The matching `e_step` rewrite.** With the cache populated, the
+hot inner loop is rewritten to consume `nonzero_pairs` and
+`homozygous_allele_for` directly:
+
+```rust
+for g in 0..shape.n_genotypes {
+    let (start, len) = shape.nonzero_pairs_offsets[g];
+    let pairs = &shape.nonzero_pairs[start as usize..start as usize + len as usize];
+
+    // log_indep — sum is at most `ploidy` terms (1 or 2 for diploid),
+    // and the `k == 0` branch is gone because zero entries aren't listed.
+    let log_indep = shape.log_multinomial_coeffs[g]
+        + pairs
+            .iter()
+            .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
+            .sum::<f64>();
+
+    // log_prior — the IBD/non-IBD branch reads from a precomputed
+    // flag instead of re-scanning the count row.
+    let log_prior = match shape.homozygous_allele_for[g] {
+        Some(a) => log_sum_exp_2(
+            log_one_minus_f + log_indep,
+            log_f + scratch.log_p_effective[a as usize],
+        ),
+        None => log_one_minus_f + log_indep,
+    };
+
+    scratch.log_post_unnorm[g] = ll_row[g] + log_prior;
+}
+```
+
+**Numerical parity.** Bit-identical to today's output. Skipping
+`k == 0` entries doesn't change float arithmetic
+(`0.0 * log_p + y == y` exactly under IEEE 754). The
+`homozygous_allele_for` lookup substitutes for the scan but
+returns the same value. No re-association of the inner sum.
+
+**Ploidy-agnostic.** Works at any ploidy — polyploid genotypes
+simply have longer `nonzero_pairs` entries. The deeper
+diploid-only specialisation (a `match` over a
+`DiploidGenotypeCounts` enum that hard-codes `k_a ∈ {0, 1, 2}`)
+remains available as a follow-up if profiling after this lands
+still points at `e_step`.
 
 ## Pluggable math backend
 
@@ -597,9 +671,21 @@ is still the dominant hot spot after `InterpUnivariateMath`
 lands (say, ≥ 40 % of `run_em_for_record` time in the
 biallelic-contam-on fixture — informed by the step-0 flamegraph
 breakdown), the 3D table becomes worth prototyping. Otherwise we
-leave it deferred. Pre-implementation guesses for calibration:
-**1.5–2.5× wall-time reduction** for `InterpUnivariateMath` on
-the biallelic-no-contam case; **2–3.5×** with contamination on.
+leave it deferred.
+
+**Pre-implementation speedup estimates, informed by the step-0
+flamegraph** (`ln`+`exp` ≈ 40 %, `e_step` arithmetic ≈ 30 % of
+self-time on the contam-on fixture):
+
+- **Item A alone (interp `ln`/`exp`)**: attacks ~40 %.
+  Conservative estimate ~1.4× on contam-on (math-heavy);
+  ~1.3× on no-contam (less math).
+- **Item E alone (shape cache + e_step restructure)**: attacks
+  the ~30 % `e_step` arithmetic via removed branches, removed
+  scans, and zero-skipping. Estimate ~1.15× on its own.
+- **A + E combined** (the v1 target): plausibly **~1.6-1.8× on
+  contam-on, ~1.4-1.6× on no-contam**. These are guesses; the
+  bench from step 6 is the source of truth.
 
 ## Implementation order
 
@@ -640,7 +726,11 @@ Step-by-step so each commit is reviewable on its own:
    ploidy-independent. Land independently. Re-run the bench —
    should be neutral-to-slightly-positive; catches accidental
    regression.
-3. **Genotype-shape cache** (item E). Bit-identical. Land
+3. **Genotype-shape cache + e_step restructure** (item E). The
+   cache adds `nonzero_pairs` and `homozygous_allele_for` to
+   `GenotypeShape`; the e_step inner loop is rewritten to
+   consume them (removed `k == 0` branch, removed
+   `homozygous_allele` scan). Bit-identical. Land
    independently. Re-run the bench — expect a small positive on
    wide-allele fixtures where setup cost matters.
 4. **`InterpUnivariateMath` impl** (item A) — the `ln_approx` /
@@ -878,6 +968,57 @@ These are the inline `**Open question**`s consolidated:
   `c_s` and `q_b` are constant within a batch. Collapses the
   deferred 3D lookup to 1D in `p_own`; potentially worth a
   specialised path if the 3D follow-up is triggered.
+- **Rayon over records — coarse-grained parallelism (the "hammer").**
+  `PosteriorEngine` is single-threaded today; each `next()` call
+  drives one record through `run_em_for_record`. Records are
+  independent (no cross-record state during the EM), so the
+  natural parallel shape is to buffer `K` upstream `MergedRecord`s
+  per `next()` refill and process them with `rayon::par_iter`.
+  Output order can be preserved by tagging records with the
+  upstream index and reassembling, the same pattern Stage 5
+  ([per_group_merger.rs:484](../../src/var_calling/per_group_merger.rs#L484))
+  already uses. Expected speedup: near-linear with core count up
+  to memory-bandwidth saturation on the `MergedRecord` clones
+  and the per-record `Vec` allocations. Likely the **biggest
+  single throughput improvement available** to Stage 6, and
+  also the easiest to land — most of the engine code is unchanged,
+  the surface change is in the iterator driver. **Cleanly
+  multiplicative with the interp tables + e_step restructure**:
+  the per-thread cost stays exactly what those optimisations
+  brought it down to, and rayon multiplies the total throughput
+  by core count. (Note: the cohort-level `p_hat` aggregation
+  across samples is *inside* one record's EM, so it doesn't
+  cross record boundaries — `p_hat` doesn't need synchronisation
+  in this design.)
+- **SIMD over samples within a record — fine-grained
+  parallelism (the "glove").** Inside one record, the E-step
+  does identical work for each of the `n_samples` samples. The
+  per-cell `exp` at the normalisation step, the per-sample
+  `log_sum_exp_slice`, and the elementwise `ll[s, g] +
+  log_prior[s, g]` all SIMD-vectorise across samples in lanes
+  of 4 (AVX2) or 8 (AVX-512). `log_indep[g]` is a scalar that
+  broadcasts perfectly to every lane. The per-sample data
+  (`log_f[s]`, `log_one_minus_f[s]`, `ll[s, g]`) needs to be
+  laid out genotype-major (contiguous in the sample dimension);
+  one per-record transpose of the engine buffers (a few KB,
+  L1-resident) sets that up. **Composes multiplicatively with
+  the interp tables**: a vectorised `exp_approx_x4` (single
+  vector gather + lane-parallel interpolation) is the natural
+  endgame for item A's interp `exp`. Expected on-thread
+  speedup ~2-3× on top of items A + E. Surface change is large
+  — buffer layout, `wide`/`std::simd` dependency, AVX2/NEON
+  multiversioning — but the math contract is unchanged.
+  **Composes with rayon-over-records as well**: rayon multiplies
+  throughput by core count; SIMD multiplies per-thread
+  throughput by lane count. They're orthogonal — the "hammer"
+  parallelises tasks, the "glove" tightens each task.
+- **Per-record allocator amortisation.** The engine allocates
+  `posteriors`, `p_hat`, `f_hat_compound`, and several `Vec`s
+  per `run_em_for_record` call. With rayon-over-records, a
+  per-thread scratch arena (or a `thread_local` `Vec` pool)
+  removes the malloc/free traffic the step-0 flamegraph showed
+  in the bench-loop allocator share. Independent of the math
+  story, but the natural pairing with the rayon follow-up.
 
 ## File touch list
 
