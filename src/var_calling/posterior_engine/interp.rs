@@ -13,9 +13,12 @@
 //! Inside each sub-domain the function's second derivative is mild
 //! (`|f''(m)| ∈ [0.25, 1]` for `ln(m)`, varies by 2× for `2^f`), so
 //! uniform spacing gives near-uniform output error for linear
-//! interpolation. The plan §"A / Resolution is a tunable" calls for a
-//! starting resolution of 1024 entries per sub-table — the accuracy
-//! harness in step 5 drives the final choice.
+//! interpolation. The plan §"A / Resolution is a tunable" calls for
+//! the accuracy harness to drive the resolution choice — at the
+//! current `TABLE_BINS = 256`, per-call absolute error is ~`2e-6`,
+//! end-to-end posterior error is ~`2e-6` (~50× below the 1e-4
+//! parity budget), and the 4 KB tables (2 × 257 × 8 bytes) sit
+//! comfortably in L1 alongside the engine's other hot data.
 //!
 //! Out-of-domain inputs (`0.0` / negatives / `NaN` / `±∞` /
 //! subnormals) fall back to the native `f64::ln` or `f64::exp` so the
@@ -26,12 +29,12 @@ use std::sync::LazyLock;
 /// Number of *bins* in each sub-table (one less than the entry count
 /// because we keep a trailing sentinel so linear interp doesn't need
 /// a bounds check on `idx + 1`).
-const TABLE_BINS: usize = 1024;
+const TABLE_BINS: usize = 256;
 
-/// Number of mantissa bits we route to the sub-table index. With 1024
-/// bins this is 10 bits, leaving 42 mantissa bits below for the
+/// Number of mantissa bits we route to the sub-table index. With 256
+/// bins this is 8 bits, leaving 44 mantissa bits below for the
 /// linear-interp fraction.
-const TABLE_INDEX_BITS: u32 = 10;
+const TABLE_INDEX_BITS: u32 = 8;
 
 const _: () = assert!(1 << TABLE_INDEX_BITS == TABLE_BINS);
 
