@@ -43,10 +43,13 @@
 //! implementation is deferred; setting the flag to `true` returns
 //! [`PosteriorEngineError::ApproximateModeNotYetImplemented`].
 
+pub mod backends;
+
 use std::fmt;
 
 use thiserror::Error;
 
+use self::backends::{ExactMath, MathBackend};
 use crate::per_sample_pileup::pileup::AlleleSupportStats;
 use crate::var_calling::contamination_estimation::{
     AlleleClass as ContamAlleleClass, ContaminationEstimates, MAX_BASE_ERROR, MIN_BASE_ERROR,
@@ -520,18 +523,21 @@ pub struct EmDiagnostics {
 ///     PosteriorEngine::new(upstream).collect()
 /// }
 /// ```
-pub struct PosteriorEngine<I>
+pub struct PosteriorEngine<I, M = ExactMath>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
+    M: MathBackend,
 {
     upstream: I,
     config: PosteriorEngineConfig,
+    math: M,
     is_latched: bool,
 }
 
-impl<I> fmt::Debug for PosteriorEngine<I>
+impl<I, M> fmt::Debug for PosteriorEngine<I, M>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
+    M: MathBackend,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Exhaustive destructure: a new field on `PosteriorEngine`
@@ -540,6 +546,7 @@ where
         let Self {
             upstream: _,
             config,
+            math: _,
             is_latched,
         } = self;
         f.debug_struct("PosteriorEngine")
@@ -549,22 +556,39 @@ where
     }
 }
 
-impl<I> PosteriorEngine<I>
+impl<I> PosteriorEngine<I, ExactMath>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
 {
-    /// Construct an engine with the [project defaults].
+    /// Construct an engine with the [project defaults] and the
+    /// bit-identical [`ExactMath`] backend.
     ///
     /// [project defaults]: PosteriorEngineConfig::with_project_defaults
     pub fn new(upstream: I) -> Self {
         Self::with_config(upstream, PosteriorEngineConfig::with_project_defaults())
     }
 
-    /// Construct an engine with explicit tuning.
+    /// Construct an engine with explicit tuning and the bit-identical
+    /// [`ExactMath`] backend.
     pub fn with_config(upstream: I, config: PosteriorEngineConfig) -> Self {
+        Self::with_math_backend(upstream, config, ExactMath)
+    }
+}
+
+impl<I, M> PosteriorEngine<I, M>
+where
+    I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
+    M: MathBackend,
+{
+    /// Construct an engine with explicit tuning and an explicit math
+    /// backend. Use this to opt into an approximate backend (e.g.
+    /// `InterpUnivariateMath`) or to opt back into [`ExactMath`] if a
+    /// future release flips the default.
+    pub fn with_math_backend(upstream: I, config: PosteriorEngineConfig, math: M) -> Self {
         Self {
             upstream,
             config,
+            math,
             is_latched: false,
         }
     }
@@ -579,13 +603,14 @@ where
         if self.config.approximate_posterior_calculation {
             return Err(PosteriorEngineError::ApproximateModeNotYetImplemented);
         }
-        run_em_for_record(record, &self.config)
+        run_em_for_record(record, &self.config, &self.math)
     }
 }
 
-impl<I> Iterator for PosteriorEngine<I>
+impl<I, M> Iterator for PosteriorEngine<I, M>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
+    M: MathBackend,
 {
     type Item = Result<PosteriorRecord, PosteriorEngineError>;
 
@@ -682,13 +707,14 @@ fn map_to_contam_class(class: AlleleClass) -> Option<ContamAlleleClass> {
 /// in-tree caller is [`run_em_for_record`], which validates the
 /// merged record's shape via [`validate_record_shape`] before calling
 /// here.
-fn compute_mixture_log_likelihoods(
+fn compute_mixture_log_likelihoods<M: MathBackend>(
     locus: RecordLocus,
     alleles: &[MergedAllele],
     ploidy: u8,
     scalars: &[AlleleSupportStats],
     estimates: &ContaminationEstimates,
     fallback_log_likelihoods: &[f64],
+    math: &M,
 ) -> Result<Vec<f64>, PosteriorEngineError> {
     let n_alleles = alleles.len();
     let genotypes = genotype_order(ploidy, n_alleles);
@@ -758,7 +784,7 @@ fn compute_mixture_log_likelihoods(
             n_obs[a] = support.num_obs;
             if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
-                mean_err[a] = per_read_log_err.exp().clamp(MIN_BASE_ERROR, MAX_BASE_ERROR);
+                mean_err[a] = math.exp(per_read_log_err).clamp(MIN_BASE_ERROR, MAX_BASE_ERROR);
             }
         }
 
@@ -793,7 +819,7 @@ fn compute_mixture_log_likelihoods(
                         kind: NonFiniteKind::NegativeInfinity,
                     });
                 }
-                ll += f64::from(n_a) * mix.ln();
+                ll += f64::from(n_a) * math.ln(mix);
             }
             mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
         }
@@ -857,9 +883,10 @@ impl EmScratch {
     }
 }
 
-fn run_em_for_record(
+fn run_em_for_record<M: MathBackend>(
     record: MergedRecord,
     config: &PosteriorEngineConfig,
+    math: &M,
 ) -> Result<PosteriorRecord, PosteriorEngineError> {
     let MergedRecord {
         chrom_id,
@@ -923,6 +950,7 @@ fn run_em_for_record(
                 &scalars,
                 estimates,
                 &log_likelihoods,
+                math,
             )?
         } else {
             log_likelihoods
@@ -1013,6 +1041,7 @@ fn run_em_for_record(
     let diagnostics = run_em_loop(
         &ctx,
         config,
+        math,
         &log_likelihoods,
         &mut p_hat,
         &mut f_hat_compound,
@@ -1026,6 +1055,7 @@ fn run_em_for_record(
     // contents.
     e_step(
         &ctx,
+        math,
         &log_likelihoods,
         &p_hat,
         &f_hat_compound,
@@ -1109,9 +1139,11 @@ fn validate_record_shape(
     Ok(())
 }
 
-fn run_em_loop(
+#[allow(clippy::too_many_arguments)]
+fn run_em_loop<M: MathBackend>(
     ctx: &EmContext<'_>,
     config: &PosteriorEngineConfig,
+    math: &M,
     log_likelihoods: &[f64],
     p_hat: &mut Vec<f64>,
     f_hat_compound: &mut Vec<f64>,
@@ -1127,6 +1159,7 @@ fn run_em_loop(
 
         e_step(
             ctx,
+            math,
             log_likelihoods,
             p_hat,
             f_hat_compound,
@@ -1175,8 +1208,9 @@ fn resolve_fixation_indices(
     Ok(overrides.to_vec())
 }
 
-fn e_step(
+fn e_step<M: MathBackend>(
     ctx: &EmContext<'_>,
+    math: &M,
     log_likelihoods: &[f64],
     p_hat: &[f64],
     f_hat_compound: &[f64],
@@ -1200,7 +1234,7 @@ fn e_step(
             p_hat[a]
         };
         *slot_p = p;
-        *slot_log = safe_ln(p);
+        *slot_log = safe_ln(math, p);
     }
 
     let ll_chunks = log_likelihoods.chunks_exact(ctx.n_genotypes);
@@ -1211,8 +1245,8 @@ fn e_step(
         .zip(ctx.fixation_indices.iter())
         .enumerate()
     {
-        let log_one_minus_f = safe_ln(1.0 - f_s);
-        let log_f = safe_ln(f_s);
+        let log_one_minus_f = safe_ln(math, 1.0 - f_s);
+        let log_f = safe_ln(math, f_s);
 
         for (g_idx, gt_counts) in ctx
             .genotype_allele_counts
@@ -1233,6 +1267,7 @@ fn e_step(
                     .sum::<f64>();
             let log_prior = if let Some(homo_allele) = homozygous_allele(gt_counts) {
                 log_sum_exp_2(
+                    math,
                     log_one_minus_f + log_indep,
                     log_f + scratch.log_p_effective[homo_allele],
                 )
@@ -1243,7 +1278,7 @@ fn e_step(
             scratch.log_post_unnorm[g_idx] = ll_row[g_idx] + log_prior;
         }
 
-        let log_z = log_sum_exp_slice(&scratch.log_post_unnorm);
+        let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
         // log_z is `-∞` iff every entry of `log_post_unnorm` is `-∞`,
         // which can only happen if the prior assigns zero mass to
         // every genotype the likelihood permits. Pseudocounts keep p̂
@@ -1260,7 +1295,7 @@ fn e_step(
         }
 
         for (g_idx, post_slot) in post_row.iter_mut().enumerate() {
-            let posterior = (scratch.log_post_unnorm[g_idx] - log_z).exp();
+            let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
             if !posterior.is_finite() {
                 return Err(PosteriorEngineError::NonFinitePosterior {
                     locus: ctx.locus,
@@ -1453,11 +1488,13 @@ fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> Posteri
 // Numeric helpers
 // ---------------------------------------------------------------------
 
-fn safe_ln(x: f64) -> f64 {
-    if x <= 0.0 { f64::NEG_INFINITY } else { x.ln() }
+#[inline]
+fn safe_ln<M: MathBackend>(math: &M, x: f64) -> f64 {
+    if x <= 0.0 { f64::NEG_INFINITY } else { math.ln(x) }
 }
 
-fn log_sum_exp_2(a: f64, b: f64) -> f64 {
+#[inline]
+fn log_sum_exp_2<M: MathBackend>(math: &M, a: f64, b: f64) -> f64 {
     if a == f64::NEG_INFINITY {
         return b;
     }
@@ -1465,16 +1502,17 @@ fn log_sum_exp_2(a: f64, b: f64) -> f64 {
         return a;
     }
     let m = a.max(b);
-    m + ((a - m).exp() + (b - m).exp()).ln()
+    m + math.ln(math.exp(a - m) + math.exp(b - m))
 }
 
-fn log_sum_exp_slice(values: &[f64]) -> f64 {
+#[inline]
+fn log_sum_exp_slice<M: MathBackend>(math: &M, values: &[f64]) -> f64 {
     let m = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if m == f64::NEG_INFINITY {
         return f64::NEG_INFINITY;
     }
-    let sum: f64 = values.iter().map(|v| (v - m).exp()).sum();
-    m + sum.ln()
+    let sum: f64 = values.iter().map(|v| math.exp(*v - m)).sum();
+    m + math.ln(sum)
 }
 
 fn log_multinomial_coefficient(ploidy: u8, counts: &[u32]) -> f64 {
@@ -2637,28 +2675,30 @@ mod tests {
 
     #[test]
     fn log_sum_exp_2_handles_neg_infinity_arguments() {
-        assert_eq!(log_sum_exp_2(f64::NEG_INFINITY, 3.0), 3.0);
-        assert_eq!(log_sum_exp_2(3.0, f64::NEG_INFINITY), 3.0);
-        assert!(approx(log_sum_exp_2(0.0, 0.0), 2.0_f64.ln(), 1e-12));
+        let m = ExactMath;
+        assert_eq!(log_sum_exp_2(&m, f64::NEG_INFINITY, 3.0), 3.0);
+        assert_eq!(log_sum_exp_2(&m, 3.0, f64::NEG_INFINITY), 3.0);
+        assert!(approx(log_sum_exp_2(&m, 0.0, 0.0), 2.0_f64.ln(), 1e-12));
     }
 
     #[test]
     fn log_sum_exp_slice_returns_neg_infinity_when_every_entry_is_neg_infinity() {
         let v = vec![f64::NEG_INFINITY; 5];
-        assert_eq!(log_sum_exp_slice(&v), f64::NEG_INFINITY);
+        assert_eq!(log_sum_exp_slice(&ExactMath, &v), f64::NEG_INFINITY);
     }
 
     #[test]
     fn log_sum_exp_slice_returns_neg_infinity_for_empty_slice() {
-        assert_eq!(log_sum_exp_slice(&[]), f64::NEG_INFINITY);
+        assert_eq!(log_sum_exp_slice(&ExactMath, &[]), f64::NEG_INFINITY);
     }
 
     #[test]
     fn log_sum_exp_slice_matches_log_sum_exp_2_on_two_element_inputs() {
+        let m = ExactMath;
         for &(a, b) in &[(0.0_f64, 1.0), (-3.0, 7.0), (-5.5, 5.5)] {
             assert!(approx(
-                log_sum_exp_slice(&[a, b]),
-                log_sum_exp_2(a, b),
+                log_sum_exp_slice(&m, &[a, b]),
+                log_sum_exp_2(&m, a, b),
                 1e-12
             ));
         }
@@ -2726,11 +2766,12 @@ mod tests {
 
     #[test]
     fn safe_ln_returns_neg_infinity_for_zero_and_negative_inputs() {
-        assert_eq!(safe_ln(0.0), f64::NEG_INFINITY);
-        assert_eq!(safe_ln(-0.0), f64::NEG_INFINITY);
-        assert_eq!(safe_ln(-1.0), f64::NEG_INFINITY);
-        assert!(approx(safe_ln(std::f64::consts::E), 1.0, 1e-12));
-        assert!(safe_ln(f64::NAN).is_nan());
+        let m = ExactMath;
+        assert_eq!(safe_ln(&m, 0.0), f64::NEG_INFINITY);
+        assert_eq!(safe_ln(&m, -0.0), f64::NEG_INFINITY);
+        assert_eq!(safe_ln(&m, -1.0), f64::NEG_INFINITY);
+        assert!(approx(safe_ln(&m, std::f64::consts::E), 1.0, 1e-12));
+        assert!(safe_ln(&m, f64::NAN).is_nan());
     }
 
     #[test]
