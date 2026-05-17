@@ -853,7 +853,13 @@ struct EmContext<'a> {
     log_multinomial_coeffs: &'a [f64],
     compound_mask: &'a [bool],
     pseudocounts: &'a [f64],
-    fixation_indices: &'a [f64],
+    /// `safe_ln(f_s)` per sample, where `f_s` is the per-sample
+    /// fixation index. Hoisted out of `e_step`'s per-iteration loop
+    /// because `fixation_indices` is record-static.
+    log_f_per_sample: &'a [f64],
+    /// `safe_ln(1.0 - f_s)` per sample. Same record-static rationale as
+    /// `log_f_per_sample`.
+    log_one_minus_f_per_sample: &'a [f64],
     compound_pseudocount: f64,
 }
 
@@ -994,6 +1000,18 @@ fn run_em_for_record<M: MathBackend>(
         config.fixation_index_default,
     )?;
 
+    // `safe_ln(f_s)` and `safe_ln(1 - f_s)` are functions of
+    // `fixation_indices` only, so they're record-static. Precompute
+    // once here instead of inside `e_step`'s per-iteration sample loop.
+    let log_f_per_sample: Vec<f64> = fixation_indices
+        .iter()
+        .map(|&f_s| safe_ln(math, f_s))
+        .collect();
+    let log_one_minus_f_per_sample: Vec<f64> = fixation_indices
+        .iter()
+        .map(|&f_s| safe_ln(math, 1.0 - f_s))
+        .collect();
+
     let genotypes = genotype_order(ploidy, n_alleles);
 
     let allele_classes = classify_alleles(&alleles);
@@ -1029,7 +1047,8 @@ fn run_em_for_record<M: MathBackend>(
         log_multinomial_coeffs: &log_multinomial_coeffs,
         compound_mask: &compound_mask,
         pseudocounts: &pseudocounts,
-        fixation_indices: &fixation_indices,
+        log_f_per_sample: &log_f_per_sample,
+        log_one_minus_f_per_sample: &log_one_minus_f_per_sample,
         compound_pseudocount: config.compound_alt_pseudocount,
     };
 
@@ -1240,13 +1259,12 @@ fn e_step<M: MathBackend>(
     let ll_chunks = log_likelihoods.chunks_exact(ctx.n_genotypes);
     let post_chunks = posteriors.chunks_exact_mut(ctx.n_genotypes);
 
-    for (sample_idx, ((ll_row, post_row), &f_s)) in ll_chunks
-        .zip(post_chunks)
-        .zip(ctx.fixation_indices.iter())
-        .enumerate()
-    {
-        let log_one_minus_f = safe_ln(math, 1.0 - f_s);
-        let log_f = safe_ln(math, f_s);
+    for (sample_idx, (ll_row, post_row)) in ll_chunks.zip(post_chunks).enumerate() {
+        // `log_f` and `log_one_minus_f` are precomputed in EmContext
+        // because `fixation_indices` is record-static; this loop only
+        // needs to read them indexed by `sample_idx`.
+        let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
+        let log_f = ctx.log_f_per_sample[sample_idx];
 
         for (g_idx, gt_counts) in ctx
             .genotype_allele_counts
