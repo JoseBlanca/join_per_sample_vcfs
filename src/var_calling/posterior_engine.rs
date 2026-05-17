@@ -2731,6 +2731,524 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Math-backend approximate-parity harness
+    //
+    // For every fixture in the battery we run both `ExactMath` (the
+    // bit-identical baseline) and `InterpUnivariateMath` (the approx
+    // backend), then compare outputs field-by-field. Per-cell errors
+    // are accumulated into distributions so the test asserts on max
+    // *and* p99 (catches a backend that meets the max but has a fat
+    // tail). `argmax_mismatch_above_margin` counts samples whose best
+    // genotype differs *and* whose top posterior margin is above the
+    // "borderline" threshold — i.e. cases where a near-tie is not the
+    // excuse. Tolerances follow §"Approximate parity" of the
+    // implementation plan.
+    // -----------------------------------------------------------------
+
+    use super::backends::{ExactMath, InterpUnivariateMath, MathBackend};
+
+    const POSTERIOR_MAX_TOL: f64 = 1e-4;
+    const POSTERIOR_P99_TOL: f64 = 5e-5;
+    const PHRED_MAX_TOL: f64 = 1.0;
+    const PHRED_P99_TOL: f64 = 0.5;
+    const ALLELE_FREQ_MAX_TOL: f64 = 1e-4;
+    const BORDERLINE_MARGIN: f64 = 0.05;
+
+    /// Per-metric error summary. Fields are read via the `Debug`
+    /// derive when the harness prints the report on assertion failure.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct ErrorReport {
+        label: &'static str,
+        n: usize,
+        max: f64,
+        p99: f64,
+        p95: f64,
+        p50: f64,
+        mean: f64,
+        argmax_fixture: &'static str,
+    }
+
+    impl ErrorReport {
+        fn from_samples(label: &'static str, mut samples: Vec<(f64, &'static str)>) -> Self {
+            samples.sort_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let n = samples.len();
+            let pick = |q: f64| -> (f64, &'static str) {
+                if n == 0 {
+                    (0.0, "")
+                } else {
+                    let idx = ((n as f64) * q).floor() as usize;
+                    samples[idx.min(n - 1)]
+                }
+            };
+            let (max, argmax_fixture) = samples.last().copied().unwrap_or((0.0, ""));
+            let (p99, _) = pick(0.99);
+            let (p95, _) = pick(0.95);
+            let (p50, _) = pick(0.50);
+            let mean = if n == 0 {
+                0.0
+            } else {
+                samples.iter().map(|s| s.0).sum::<f64>() / n as f64
+            };
+            ErrorReport {
+                label,
+                n,
+                max,
+                p99,
+                p95,
+                p50,
+                mean,
+                argmax_fixture,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct AccuracyAccumulator {
+        posterior_errors: Vec<(f64, &'static str)>,
+        phred_errors: Vec<(f64, &'static str)>,
+        allele_freq_errors: Vec<(f64, &'static str)>,
+        argmax_mismatch_above_margin: usize,
+        argmax_mismatch_borderline_skipped: usize,
+        fixtures_total: usize,
+    }
+
+    impl AccuracyAccumulator {
+        fn ingest(
+            &mut self,
+            fixture: &'static str,
+            exact: &PosteriorRecord,
+            approx: &PosteriorRecord,
+        ) {
+            self.fixtures_total += 1;
+            assert_eq!(exact.n_samples, approx.n_samples);
+            assert_eq!(exact.n_genotypes, approx.n_genotypes);
+            assert_eq!(exact.allele_frequencies.len(), approx.allele_frequencies.len());
+
+            for (e, a) in exact
+                .posteriors
+                .iter()
+                .zip(approx.posteriors.iter())
+            {
+                self.posterior_errors.push(((e - a).abs(), fixture));
+            }
+            for (e, a) in exact
+                .allele_frequencies
+                .iter()
+                .zip(approx.allele_frequencies.iter())
+            {
+                self.allele_freq_errors.push(((e - a).abs(), fixture));
+            }
+            for (e, a) in exact.gq_phred.iter().zip(approx.gq_phred.iter()) {
+                if e.is_finite() && a.is_finite() {
+                    self.phred_errors.push(((e - a).abs(), fixture));
+                }
+            }
+            if exact.qual_phred.is_finite() && approx.qual_phred.is_finite() {
+                self.phred_errors
+                    .push(((exact.qual_phred - approx.qual_phred).abs(), fixture));
+            }
+
+            // `best_genotype` is checked per sample only when the
+            // exact top posterior dominates by ≥ BORDERLINE_MARGIN.
+            // Closer races are tagged "borderline" and excluded — the
+            // approximate posterior may flip a near-tied argmax without
+            // implying a real divergence.
+            for sample_idx in 0..exact.n_samples {
+                let row = exact.posteriors_row(sample_idx);
+                let mut sorted = row.to_vec();
+                sorted.sort_by(|a, b| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let margin = if sorted.len() >= 2 {
+                    sorted[0] - sorted[1]
+                } else {
+                    1.0
+                };
+                if margin < BORDERLINE_MARGIN {
+                    self.argmax_mismatch_borderline_skipped += 1;
+                    continue;
+                }
+                if exact.best_genotype[sample_idx] != approx.best_genotype[sample_idx] {
+                    self.argmax_mismatch_above_margin += 1;
+                }
+            }
+        }
+
+        fn summarise(self) -> AccuracyReport {
+            AccuracyReport {
+                posterior_error: ErrorReport::from_samples("posterior", self.posterior_errors),
+                phred_error: ErrorReport::from_samples("phred", self.phred_errors),
+                allele_freq_error: ErrorReport::from_samples(
+                    "allele_freq",
+                    self.allele_freq_errors,
+                ),
+                argmax_mismatch_above_margin: self.argmax_mismatch_above_margin,
+                argmax_mismatch_borderline_skipped: self.argmax_mismatch_borderline_skipped,
+                fixtures_total: self.fixtures_total,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct AccuracyReport {
+        posterior_error: ErrorReport,
+        phred_error: ErrorReport,
+        allele_freq_error: ErrorReport,
+        argmax_mismatch_above_margin: usize,
+        argmax_mismatch_borderline_skipped: usize,
+        fixtures_total: usize,
+    }
+
+    /// Run a single fixture under both backends and ingest the per-cell
+    /// errors into `accum`.
+    fn drive_pair<M: MathBackend + Copy>(
+        accum: &mut AccuracyAccumulator,
+        fixture: &'static str,
+        record: MergedRecord,
+        approx_backend: M,
+        config: Option<PosteriorEngineConfig>,
+    ) {
+        let cfg = config.unwrap_or_else(PosteriorEngineConfig::with_project_defaults);
+        let exact_engine = PosteriorEngine::with_config(
+            std::iter::once(Ok::<_, PerGroupMergerError>(record.clone())),
+            cfg.clone(),
+        );
+        let approx_engine = PosteriorEngine::with_math_backend(
+            std::iter::once(Ok::<_, PerGroupMergerError>(record)),
+            cfg,
+            approx_backend,
+        );
+        let exact: Vec<_> = exact_engine
+            .collect::<Result<Vec<_>, _>>()
+            .expect("ExactMath fixture errored");
+        let approx: Vec<_> = approx_engine
+            .collect::<Result<Vec<_>, _>>()
+            .expect("approximate backend fixture errored");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(approx.len(), 1);
+        accum.ingest(fixture, &exact[0], &approx[0]);
+    }
+
+    fn cohort_likelihoods_biallelic_diploid(n_samples: usize) -> Vec<Vec<f64>> {
+        // Half ALT-leaning, half REF-leaning. Likelihoods chosen so
+        // every sample's argmax margin sits well above the borderline.
+        (0..n_samples)
+            .map(|s: usize| {
+                if s.is_multiple_of(2) {
+                    vec![-30.0, -10.0, -0.1]
+                } else {
+                    vec![-0.1, -10.0, -30.0]
+                }
+            })
+            .collect()
+    }
+
+    fn build_accuracy_battery<M: MathBackend + Copy>(approx: M) -> AccuracyReport {
+        let mut accum = AccuracyAccumulator::default();
+
+        // Biallelic, single sample, strong-REF.
+        drive_pair(
+            &mut accum,
+            "biallelic_single_sample_strong_ref",
+            merged_record_simple(1, 100, vec![b"A", b"C"], 2, vec![vec![-0.1, -10.0, -30.0]]),
+            approx,
+            None,
+        );
+
+        // Biallelic, single sample, strong-ALT.
+        drive_pair(
+            &mut accum,
+            "biallelic_single_sample_strong_alt",
+            merged_record_simple(1, 200, vec![b"A", b"C"], 2, vec![vec![-30.0, -10.0, -0.1]]),
+            approx,
+            None,
+        );
+
+        // Biallelic, 64 samples, mixed evidence.
+        drive_pair(
+            &mut accum,
+            "biallelic_64_samples_mixed",
+            merged_record_simple(
+                1,
+                300,
+                vec![b"A", b"C"],
+                2,
+                cohort_likelihoods_biallelic_diploid(64),
+            ),
+            approx,
+            None,
+        );
+
+        // Triallelic SNP, 8 samples.
+        let trial_likelihoods: Vec<Vec<f64>> = (0..8)
+            .map(|s| {
+                // 6 genotypes for n_alleles=3, ploidy=2: AA, AB, BB, AC, BC, CC
+                let mut row = vec![-20.0; 6];
+                let idx = s % 6;
+                row[idx] = -0.1;
+                row
+            })
+            .collect();
+        drive_pair(
+            &mut accum,
+            "triallelic_8_samples",
+            merged_record_simple(
+                1,
+                400,
+                vec![b"A", b"C", b"G"],
+                2,
+                trial_likelihoods,
+            ),
+            approx,
+            None,
+        );
+
+        // Compound allele, chain-anchored, 8 samples.
+        let compound_ll: Vec<Vec<f64>> = (0..8)
+            .map(|s: usize| {
+                if s.is_multiple_of(2) {
+                    vec![-0.1, -10.0, -30.0]
+                } else {
+                    vec![-30.0, -5.0, -0.1]
+                }
+            })
+            .collect();
+        drive_pair(
+            &mut accum,
+            "compound_chain_anchored",
+            merged_record_with_compound(
+                1,
+                500,
+                vec![b"A", b"CT"],
+                &[1],
+                vec![vec![false, true]; 8],
+                2,
+                compound_ll,
+            ),
+            approx,
+            None,
+        );
+
+        // Compound allele with a chain-broken sample.
+        let compound_broken_ll: Vec<Vec<f64>> = (0..6)
+            .map(|s: usize| {
+                if s == 0 {
+                    vec![-0.5, -2.0, -5.0]
+                } else if s.is_multiple_of(2) {
+                    vec![-0.1, -10.0, -30.0]
+                } else {
+                    vec![-30.0, -5.0, -0.1]
+                }
+            })
+            .collect();
+        let mut chain_flags = vec![vec![false, true]; 6];
+        chain_flags[0] = vec![false, false];
+        drive_pair(
+            &mut accum,
+            "compound_chain_broken_sample",
+            merged_record_with_compound(
+                1,
+                600,
+                vec![b"A", b"CT"],
+                &[1],
+                chain_flags,
+                2,
+                compound_broken_ll,
+            ),
+            approx,
+            None,
+        );
+
+        // Non-zero fixation index default.
+        let mut config = PosteriorEngineConfig::with_project_defaults();
+        config.fixation_index_default = 0.3;
+        drive_pair(
+            &mut accum,
+            "fixation_index_default_0_3",
+            merged_record_simple(
+                1,
+                700,
+                vec![b"A", b"C"],
+                2,
+                cohort_likelihoods_biallelic_diploid(32),
+            ),
+            approx,
+            Some(config),
+        );
+
+        // Per-sample fixation index overrides.
+        let mut config = PosteriorEngineConfig::with_project_defaults();
+        config.fixation_index_overrides =
+            Some((0..32).map(|s: usize| if s.is_multiple_of(2) { 0.0 } else { 0.4 }).collect());
+        drive_pair(
+            &mut accum,
+            "fixation_index_per_sample_overrides",
+            merged_record_simple(
+                1,
+                800,
+                vec![b"A", b"C"],
+                2,
+                cohort_likelihoods_biallelic_diploid(32),
+            ),
+            approx,
+            Some(config),
+        );
+
+        // Triploid (polyploid path).
+        let triploid_ll: Vec<Vec<f64>> = (0..16)
+            .map(|s| {
+                // 4 genotypes for ploidy=3, n_alleles=2: 0/0/0, 0/0/1, 0/1/1, 1/1/1
+                let mut row = vec![-20.0_f64; 4];
+                row[s % 4] = -0.1;
+                row
+            })
+            .collect();
+        drive_pair(
+            &mut accum,
+            "triploid_biallelic",
+            merged_record_simple(1, 900, vec![b"A", b"C"], 3, triploid_ll),
+            approx,
+            None,
+        );
+
+        // Contamination on, all samples c_s > 0.
+        let mut contam_cfg = PosteriorEngineConfig::with_project_defaults();
+        contam_cfg.contamination = Some(
+            crate::var_calling::contamination_estimation::ContaminationEstimates::from_user_supplied(
+                vec![Some(0.03_f64); 32],
+                vec![[0.6, 0.3, 0.1]],
+                vec![0; 32],
+            )
+            .expect("valid contamination fixture"),
+        );
+        drive_pair(
+            &mut accum,
+            "contam_on_all_samples",
+            merged_record_simple(
+                1,
+                1000,
+                vec![b"A", b"C"],
+                2,
+                cohort_likelihoods_biallelic_diploid(32),
+            ),
+            approx,
+            Some(contam_cfg),
+        );
+
+        // Contamination on, mixed c_s = None and c_s > 0.
+        let mut mixed_cfg = PosteriorEngineConfig::with_project_defaults();
+        let c_s_mixed: Vec<Option<f64>> = (0..32)
+            .map(|s: usize| if s.is_multiple_of(3) { None } else { Some(0.05_f64) })
+            .collect();
+        mixed_cfg.contamination = Some(
+            crate::var_calling::contamination_estimation::ContaminationEstimates::from_user_supplied(
+                c_s_mixed,
+                vec![[0.6, 0.3, 0.1]],
+                vec![0; 32],
+            )
+            .expect("valid mixed contamination"),
+        );
+        drive_pair(
+            &mut accum,
+            "contam_on_mixed_c_s",
+            merged_record_simple(
+                1,
+                1100,
+                vec![b"A", b"C"],
+                2,
+                cohort_likelihoods_biallelic_diploid(32),
+            ),
+            approx,
+            Some(mixed_cfg),
+        );
+
+        // Contamination on with triallelic site.
+        let mut tri_contam_cfg = PosteriorEngineConfig::with_project_defaults();
+        tri_contam_cfg.contamination = Some(
+            crate::var_calling::contamination_estimation::ContaminationEstimates::from_user_supplied(
+                vec![Some(0.03_f64); 8],
+                vec![[0.6, 0.3, 0.1]],
+                vec![0; 8],
+            )
+            .expect("valid triallelic contam fixture"),
+        );
+        let tri_contam_ll: Vec<Vec<f64>> = (0..8)
+            .map(|s| {
+                let mut row = vec![-20.0_f64; 6];
+                row[s % 6] = -0.1;
+                row
+            })
+            .collect();
+        drive_pair(
+            &mut accum,
+            "contam_on_triallelic",
+            merged_record_simple(1, 1200, vec![b"A", b"C", b"G"], 2, tri_contam_ll),
+            approx,
+            Some(tri_contam_cfg),
+        );
+
+        accum.summarise()
+    }
+
+    #[test]
+    fn interp_univariate_clears_approximate_parity_budget() {
+        let report = build_accuracy_battery(InterpUnivariateMath);
+        eprintln!("InterpUnivariateMath accuracy report:\n{report:#?}");
+
+        assert!(
+            report.posterior_error.max <= POSTERIOR_MAX_TOL,
+            "posterior_error.max = {} > {}",
+            report.posterior_error.max,
+            POSTERIOR_MAX_TOL,
+        );
+        assert!(
+            report.posterior_error.p99 <= POSTERIOR_P99_TOL,
+            "posterior_error.p99 = {} > {}",
+            report.posterior_error.p99,
+            POSTERIOR_P99_TOL,
+        );
+        assert!(
+            report.phred_error.max <= PHRED_MAX_TOL,
+            "phred_error.max = {} > {}",
+            report.phred_error.max,
+            PHRED_MAX_TOL,
+        );
+        assert!(
+            report.phred_error.p99 <= PHRED_P99_TOL,
+            "phred_error.p99 = {} > {}",
+            report.phred_error.p99,
+            PHRED_P99_TOL,
+        );
+        assert!(
+            report.allele_freq_error.max <= ALLELE_FREQ_MAX_TOL,
+            "allele_freq_error.max = {} > {}",
+            report.allele_freq_error.max,
+            ALLELE_FREQ_MAX_TOL,
+        );
+        assert_eq!(
+            report.argmax_mismatch_above_margin, 0,
+            "{} samples picked a different best genotype with margin >= {}",
+            report.argmax_mismatch_above_margin, BORDERLINE_MARGIN,
+        );
+    }
+
+    /// Sanity check: `ExactMath` against itself produces all-zero
+    /// errors. Guards the harness machinery — if this fails, the
+    /// comparison logic is broken, not the backends.
+    #[test]
+    fn exact_against_exact_yields_zero_errors() {
+        let report = build_accuracy_battery(ExactMath);
+        assert_eq!(report.posterior_error.max, 0.0);
+        assert_eq!(report.phred_error.max, 0.0);
+        assert_eq!(report.allele_freq_error.max, 0.0);
+        assert_eq!(report.argmax_mismatch_above_margin, 0);
+    }
+
+    // -----------------------------------------------------------------
     // Property tests (proptest)
     // -----------------------------------------------------------------
 
