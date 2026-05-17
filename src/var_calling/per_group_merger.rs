@@ -1783,8 +1783,8 @@ fn chain_broken_log_likelihood(
 
         // Error cost at this position: Σ q_sum over local alleles not
         // in per_pos_counts.
-        for a in 0..n_local_alleles {
-            if per_pos_counts[a] == 0 {
+        for (a, &count) in per_pos_counts.iter().enumerate().take(n_local_alleles) {
+            if count == 0 {
                 log_l += rec.alleles[a].support.q_sum;
             }
         }
@@ -1793,14 +1793,14 @@ fn chain_broken_log_likelihood(
         let mut n_total: u64 = 0;
         let mut sum_ln_n_fact = 0.0;
         let mut sum_n_log_p = 0.0;
-        for a in 0..n_local_alleles {
-            if per_pos_counts[a] == 0 {
+        for (a, &count) in per_pos_counts.iter().enumerate().take(n_local_alleles) {
+            if count == 0 {
                 continue;
             }
             let n_i = rec.alleles[a].support.num_obs as u64;
             n_total += n_i;
             sum_ln_n_fact += ln_factorial(n_i);
-            let p_i = (per_pos_counts[a] as f64) / (n_slots as f64);
+            let p_i = (count as f64) / (n_slots as f64);
             sum_n_log_p += xlogy(n_i as f64, p_i);
         }
         log_l += ln_factorial(n_total) - sum_ln_n_fact + sum_n_log_p;

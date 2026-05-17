@@ -21,28 +21,24 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Stage 6 posterior engine (no-contamination
->   v1) shipped through full implement → review → fixes-applied cycle
->   on 2026-05-16.
->   [src/var_calling/posterior_engine.rs](src/var_calling/posterior_engine.rs)
->   ships a streaming `PosteriorEngine<I>` iterator, `PosteriorRecord`
->   (forwards scalars / chain-anchor flags for the VCF writer),
->   per-record EM with HWE-with-`F` prior generalised to arbitrary
->   ploidy via the Wright–Fisher partition formula, closed-form
->   M-steps on `p̂` (Dirichlet) and `f̂_C` (Beta). After the review's
->   refactor pass: `RecordLocus` + `EmContext` extraction kills the
->   four `too_many_arguments` allows, scratch buffers (`EmScratch`)
->   are lifted across iterations, `genotype_allele_counts` flattens
->   to row-major, the `MalformedMergedRecord` typed error replaces
->   the `debug_assert!` on `n_genotypes` (now unconditional), and the
->   trivial-record row-sum bug is fixed. 622 lib tests + 7 integration
->   tests pass; clippy-clean on the in-scope files. M3 (config
->   knob-range validation), Mi5 (perf bench), Mi6 (golden tests), and
->   a handful of API-shape Minors are deferred as standalone
->   follow-ups. Reports:
->   [impl](doc/devel/reports/implementations/posterior_engine_2026-05-16.md),
->   [review](doc/devel/reports/reviews/posterior_engine_2026-05-16.md),
->   [fixes-applied](doc/devel/reports/reviews/posterior_engine_2026-05-16_applied.md).
+> - **Last completed task:** Contamination-estimation side-pass v1
+>   implemented on 2026-05-17 —
+>   [src/var_calling/contamination_estimation.rs](src/var_calling/contamination_estimation.rs)
+>   ships `estimate_contamination` running block-wise online EM on
+>   raw `.psp` data, type-level mutually-exclusive
+>   `StoppingMode::{Convergence, FixedSites}`, the
+>   `ContaminationEstimates` hand-off (consumed by Stage 6 as frozen
+>   inputs), and singleton/below-floor finalisation. Stage 6 wiring
+>   landed in the same commit: `PosteriorEngineConfig.contamination`
+>   is now `Option<ContaminationEstimates>`, with a
+>   mixture-likelihood E-step that recomputes per-(sample, genotype)
+>   log-likelihoods from `MergedRecord.scalars` when contamination is
+>   enabled. 645 lib + 4 new contamination-integration + all other
+>   integration tests pass; clippy-clean (with two pre-existing
+>   per_group_merger.rs and benches/var_calling_perf.rs warnings
+>   resolved as a side-effect of clearing the `-D warnings` gate);
+>   `cargo fmt --check` clean. Detailed write-up:
+>   [contamination_estimation_2026-05-17.md](doc/devel/reports/implementations/contamination_estimation_2026-05-17.md).
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -245,13 +241,35 @@ EM over merged records → final multi-sample VCF.
     [src/var_calling/per_group_merger.rs:1786 + 1796](src/var_calling/per_group_merger.rs#L1786)
     and in
     [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
-    surfaced during this work's validation; they predate the
-    posterior engine and want a small clippy-cleanup pass.
+    were resolved on 2026-05-17 as a side-effect of clearing the
+    contamination work's `-D warnings` gate; both
+    semantic-preserving iterator conversions.
 
-#### Posterior engine — contamination mode (Algorithm 3 or 5)
-- **Status:** not yet planned
-- **Plan:** none yet — follow-up to the v1 plan §"Out of scope (v1)"
-- **Open:** plan needs to be written before implementation can start.
+#### Contamination-estimation side-pass
+- **Status:** implemented
+- **Spec:** [contamination_estimation.md](doc/devel/specs/contamination_estimation.md)
+- **Plan:** [contamination_estimation.md](doc/devel/implementation_plans/contamination_estimation.md)
+- **Code:** [src/var_calling/contamination_estimation.rs](src/var_calling/contamination_estimation.rs);
+  Stage 6 consumer-side wiring in
+  [src/var_calling/posterior_engine.rs](src/var_calling/posterior_engine.rs)
+- **Tests:** unit + 3 proptests in the module +
+  [tests/contamination_estimation_integration.rs](tests/contamination_estimation_integration.rs)
+- **Impl report:** [contamination_estimation_2026-05-17.md](doc/devel/reports/implementations/contamination_estimation_2026-05-17.md)
+- **Open:**
+  - Code review not yet run.
+  - Partition-parallel scans across chromosomes (spec §"Cost and
+    parallelism") — add only if real cohort runs show wall time
+    matters.
+  - `--external-allele-frequencies` for substituting a reference-
+    panel `q_b` (v2 follow-up).
+  - `--contamination-estimates`-only short path that estimates
+    `q_b` while freezing user-supplied `c_s`
+    (`ContaminationEstimateSource::Mixed` slot exists but is unused
+    in v1).
+  - CLI parser bindings land with the cohort subcommand; the v1
+    library API is exercised programmatically in tests.
+  - Compound-allele `q_b = 0` choice (Assumption 2 in the impl
+    report) — calibration impact in real cohorts is open.
 
 #### Posterior engine — approximate-LUT inner loop
 - **Status:** not yet implemented (config flag wired only)

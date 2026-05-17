@@ -120,7 +120,7 @@ fn build_sparse_per_sample_streams(n_samples: usize, n_positions: u32) -> Vec<Me
             let mut records: Vec<Result<PileupRecord, PspReadError>> =
                 Vec::with_capacity((n_positions / 2) as usize);
             for p in 1..=n_positions {
-                if ((p as usize) + s) % 2 == 0 {
+                if ((p as usize) + s).is_multiple_of(2) {
                     let ref_base = BASES[(p as usize) & 3];
                     records.push(Ok(PileupRecord::new(0, p, vec![ref_obs(ref_base, 30)])));
                 }
@@ -362,10 +362,14 @@ fn build_biallelic_snp_groups(
         let ref_base = ref_seq[(pos - 100) as usize];
         let alt_base = BASES[((pos - 100) as usize + 1) & 3];
         let mut per_sample: Vec<Option<PileupRecord>> = (0..n_samples).map(|_| None).collect();
-        for s in 0..n_samples {
+        for (s, slot) in per_sample.iter_mut().enumerate().take(n_samples) {
             // Even samples ALT-leaning, odd samples REF-leaning.
-            let (n_ref, n_alt) = if s % 2 == 0 { (4, 26) } else { (24, 6) };
-            per_sample[s] = Some(PileupRecord::new(
+            let (n_ref, n_alt) = if s.is_multiple_of(2) {
+                (4, 26)
+            } else {
+                (24, 6)
+            };
+            *slot = Some(PileupRecord::new(
                 0,
                 pos,
                 vec![
