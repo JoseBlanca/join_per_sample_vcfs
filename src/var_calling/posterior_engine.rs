@@ -51,7 +51,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use self::backends::{ExactMath, MathBackend};
+use self::backends::{InterpUnivariateMath, MathBackend};
 use self::shape::{GenotypeShape, shape_for};
 use crate::per_sample_pileup::pileup::AlleleSupportStats;
 use crate::var_calling::contamination_estimation::{
@@ -526,7 +526,7 @@ pub struct EmDiagnostics {
 ///     PosteriorEngine::new(upstream).collect()
 /// }
 /// ```
-pub struct PosteriorEngine<I, M = ExactMath>
+pub struct PosteriorEngine<I, M = InterpUnivariateMath>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
     M: MathBackend,
@@ -559,22 +559,30 @@ where
     }
 }
 
-impl<I> PosteriorEngine<I, ExactMath>
+impl<I> PosteriorEngine<I, InterpUnivariateMath>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
 {
-    /// Construct an engine with the [project defaults] and the
-    /// bit-identical [`ExactMath`] backend.
+    /// Construct an engine with the [project defaults] and the default
+    /// math backend ([`InterpUnivariateMath`], ~10 % faster than
+    /// [`ExactMath`] on the contam-on bench with ~50× margin under the
+    /// approximate-parity budget — see the implementation plan's
+    /// step-7 decision).
+    ///
+    /// For bit-identical reproducibility against the unoptimised
+    /// engine, construct with
+    /// [`with_math_backend`](Self::with_math_backend) and pass
+    /// [`ExactMath`] explicitly.
     ///
     /// [project defaults]: PosteriorEngineConfig::with_project_defaults
     pub fn new(upstream: I) -> Self {
         Self::with_config(upstream, PosteriorEngineConfig::with_project_defaults())
     }
 
-    /// Construct an engine with explicit tuning and the bit-identical
-    /// [`ExactMath`] backend.
+    /// Construct an engine with explicit tuning and the default math
+    /// backend ([`InterpUnivariateMath`]).
     pub fn with_config(upstream: I, config: PosteriorEngineConfig) -> Self {
-        Self::with_math_backend(upstream, config, ExactMath)
+        Self::with_math_backend(upstream, config, InterpUnivariateMath)
     }
 }
 
@@ -1622,9 +1630,14 @@ mod tests {
         record
     }
 
+    // The semantic / numeric tests below assert tight tolerances
+    // (often 1e-12) against hand-computed expected values. They pin
+    // against `ExactMath` explicitly so the production default
+    // (`InterpUnivariateMath`) can move without breaking them; the
+    // backend-equivalence guarantee is enforced separately by
+    // `tests_math_backend_accuracy` (see the accuracy harness).
     fn engine_for(record: MergedRecord) -> Vec<Result<PosteriorRecord, PosteriorEngineError>> {
-        let upstream = std::iter::once(Ok::<_, PerGroupMergerError>(record));
-        PosteriorEngine::new(upstream).collect()
+        engine_for_with_config(record, PosteriorEngineConfig::with_project_defaults())
     }
 
     fn engine_for_with_config(
@@ -1632,7 +1645,7 @@ mod tests {
         config: PosteriorEngineConfig,
     ) -> Vec<Result<PosteriorRecord, PosteriorEngineError>> {
         let upstream = std::iter::once(Ok::<_, PerGroupMergerError>(record));
-        PosteriorEngine::with_config(upstream, config).collect()
+        PosteriorEngine::with_math_backend(upstream, config, super::backends::ExactMath).collect()
     }
 
     fn single_ok(record: MergedRecord) -> PosteriorRecord {
@@ -2913,9 +2926,13 @@ mod tests {
         config: Option<PosteriorEngineConfig>,
     ) {
         let cfg = config.unwrap_or_else(PosteriorEngineConfig::with_project_defaults);
-        let exact_engine = PosteriorEngine::with_config(
+        // The "exact" baseline is pinned to `ExactMath` regardless of
+        // the engine's default backend — the harness's contract is "is
+        // `approx_backend` close to the bit-identical reference?".
+        let exact_engine = PosteriorEngine::with_math_backend(
             std::iter::once(Ok::<_, PerGroupMergerError>(record.clone())),
             cfg.clone(),
+            ExactMath,
         );
         let approx_engine = PosteriorEngine::with_math_backend(
             std::iter::once(Ok::<_, PerGroupMergerError>(record)),
