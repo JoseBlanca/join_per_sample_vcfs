@@ -56,7 +56,7 @@ Six stages total:
   that Stage 1 produces. Not a runtime step — it is the interface
   between the per-sample and cohort sides of the pipeline.
 - **Stage 3 — low-complexity filter.** A streaming per-position filter.
-  Computes DUST scores from the reference on the fly and silently drops
+  Computes sdust scores from the reference on the fly and silently drops
   per-position records whose reference context is low-complexity. No
   intermediate mask file is written.
 - **Stage 4 — grouping.** Walks the filtered per-position stream in
@@ -936,38 +936,78 @@ That trade — small space saving in exchange for locking in one
 complexity parameter forever — is clearly not worth it, so the
 filter lives at Stage 3 where the threshold can be revisited freely.
 
-### Algorithm — BLAST DUST
+### Algorithm — symmetric DUST (sdust)
 
-The same algorithm used by NCBI BLAST's DUST filter (Tatusov and
-Lipman). For each sliding window of `w` reference bases:
+The algorithm originally introduced by Tatusov & Lipman (1993) for
+NCBI BLAST and refined to its symmetric, locality-precise form by
+Morgulis, Gertz, Schäffer & Agarwala (2006). The symmetric variant
+is what modern short-read aligners (BWA-MEM, minimap2, samtools)
+use exclusively; masking with sdust therefore drops exactly the
+regions where upstream alignment is most unreliable, which is the
+filter's motivation. Reference implementation: `lh3/sdust` (the
+~300-line standalone C port maintained by Heng Li).
 
-1. Count each triplet (`AAA`, `AAC`, ..., `TTT`) within the window.
-2. Score the window as `s = Σ over triplets t of f_t · (f_t − 1) / 2`,
-   where `f_t` is the count of triplet `t` in the window.
-3. If `s` exceeds the threshold `T`, every position in the window is
-   low-complexity.
+The core scoring function is unchanged from classical DUST: for any
+reference subinterval, count the occurrences of each ACGT triplet
+and compute `s = Σ_t f_t · (f_t − 1) / 2`, where `f_t` is the
+count of triplet `t`. What changes is *where* the score is
+applied:
 
-Defaults (matching the standard DUST parameters): `w = 64`, `T = 20`.
+1. Consider every reference subinterval `[i, j]` of length at most
+   `w` (the window parameter) and at least 3 (the minimum length
+   for one triplet).
+2. Normalise the score by triplet count: a subinterval is
+   low-complexity when its score density `s / (j − i − 1)`
+   exceeds a threshold tied to the parameter `T`. The exact
+   formula matches the `lh3/sdust` reference implementation;
+   downstream specs and the implementation plan transcribe it
+   verbatim from the canonical source rather than re-deriving it
+   here.
+3. Among all overlapping low-complexity subintervals, retain the
+   *maximal* ones — subintervals that cannot be extended in either
+   direction while staying above threshold. Every reference base
+   covered by any maximal subinterval is flagged low-complexity.
 
-Because DUST uses a sliding window, the filter only needs to maintain a
-small moving buffer of the reference (~`w` bp each side of the current
-position). It does not need a whole-genome mask in memory, and
-computation is incremental as the iterator advances.
+Defaults: `w = 64`, `T = 20`. These match the `lh3/sdust` /
+minimap2 defaults and are what every aligner in the surrounding
+ecosystem uses out of the box.
+
+The variant is called *symmetric* because the resulting mask is
+independent of scan direction — forward and reverse traversal of
+the reference produce identical masks. Classical DUST is
+asymmetric at window edges; this is one of the two reasons
+modern tools switched.
+
+Memory is bounded by the window: the scorer maintains O(w) state
+(triplet counts plus a candidate-maximal-subinterval list within
+the current window). It does not need a whole-genome mask in
+memory, and computation advances incrementally as the iterator
+moves.
+
+#### Historical note — classical BLAST DUST
+
+The classical (asymmetric, fixed-window) DUST of Tatusov & Lipman
+1993 is the algorithm implemented by NCBI BLAST's `dustmasker`.
+It uses the same triplet-count score on fixed-width windows and
+flags the entire window when the score exceeds threshold. The
+classical algorithm is referenced here for historical context only;
+the implementation targets sdust.
 
 ### How the filter behaves at the iterator
 
 At each position in the multi-way per-position stream:
 
-1. Advance the DUST scorer's window to cover the position in question.
-2. If the DUST score at that window flags the position as
-   low-complexity, the filter silently drops this position's records
-   and advances to the next.
-3. Otherwise, the records for that position are yielded downstream to
-   Stage 4's grouping iterator unchanged.
+1. Advance the sdust scorer past the position in question — i.e.
+   ensure the scanner has consumed enough reference to know whether
+   any maximal low-complexity subinterval covers this position.
+2. If sdust flags the position as low-complexity, the filter
+   silently drops this position's records and advances to the next.
+3. Otherwise, the records for that position are yielded downstream
+   to Stage 4's grouping iterator unchanged.
 
 The filter does not aggregate, reorder, or buffer records; it just
 decides "pass or skip" per incoming position. Order is preserved.
-Memory is constant (bounded by the DUST window size).
+Memory is constant (bounded by the window parameter).
 
 ### Parameters and opt-out
 
@@ -976,10 +1016,10 @@ explicit), all filter behaviour is user-visible:
 
 | Flag | Default | Effect |
 |---|---|---|
-| *(default — filter on)* | on | Apply DUST filter with `w = 64`, `T = 20`. |
+| *(default — filter on)* | on | Apply sdust filter with `w = 64`, `T = 20`. |
 | `--no-complexity-filter` | — | Disable the filter entirely. Every position from the upstream iterator is passed through. |
-| `--complexity-window N` | 64 | Override DUST window size. |
-| `--complexity-threshold T` | 20 | Override DUST score threshold. |
+| `--complexity-window N` | 64 | Override sdust window size (maximum subinterval length). |
+| `--complexity-threshold T` | 20 | Override sdust score-density threshold. |
 
 Opt-out is explicit (`--no-complexity-filter`), never silent — per
 Design principle 3, if the pipeline is running without the filter the

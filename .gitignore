@@ -12,5 +12,6 @@ gatk/
 freebayes/
 samtools/
 htslib/
+sdust/
 /CLAUDE.md
 /.claude/
