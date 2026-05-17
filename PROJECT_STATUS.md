@@ -21,21 +21,28 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Wave 1 of the var_calling perf review
->   shipped on 2026-05-16 — fixes L2, H1, H4, H3, **H2** applied
->   (`AHashMap` for both intra-group maps with pre-sizing,
->   precomputed `genotype_order` cache on the merger, stack-array
->   scratch in `chain_broken_log_likelihood`, `SmallVec` inner for
->   `per_sample_sources`, and **flat row-major `Vec<T>` for
->   `MergedRecord.scalars` / `chain_anchor_flags` /
->   `log_likelihoods`** — public API change with accessor methods,
->   no Stage 6 consumer yet). All 571 lib tests pass; bit-exact. H2
->   phase 2b is the cleanest signal: two back-to-back runs show
->   biallelic_64 −14 % (p = 0.00), compound paths −7 to −9 %, all
->   significant. Detailed write-up:
->   [perf_var_calling_2026-05-16_applied.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16_applied.md).
->   Original perf review (still load-bearing for the remaining
->   findings): [perf_var_calling_2026-05-16.md](doc/devel/reports/reviews/perf_var_calling_2026-05-16.md).
+> - **Last completed task:** Stage 6 posterior engine (no-contamination
+>   v1) shipped through full implement → review → fixes-applied cycle
+>   on 2026-05-16.
+>   [src/var_calling/posterior_engine.rs](src/var_calling/posterior_engine.rs)
+>   ships a streaming `PosteriorEngine<I>` iterator, `PosteriorRecord`
+>   (forwards scalars / chain-anchor flags for the VCF writer),
+>   per-record EM with HWE-with-`F` prior generalised to arbitrary
+>   ploidy via the Wright–Fisher partition formula, closed-form
+>   M-steps on `p̂` (Dirichlet) and `f̂_C` (Beta). After the review's
+>   refactor pass: `RecordLocus` + `EmContext` extraction kills the
+>   four `too_many_arguments` allows, scratch buffers (`EmScratch`)
+>   are lifted across iterations, `genotype_allele_counts` flattens
+>   to row-major, the `MalformedMergedRecord` typed error replaces
+>   the `debug_assert!` on `n_genotypes` (now unconditional), and the
+>   trivial-record row-sum bug is fixed. 622 lib tests + 7 integration
+>   tests pass; clippy-clean on the in-scope files. M3 (config
+>   knob-range validation), Mi5 (perf bench), Mi6 (golden tests), and
+>   a handful of API-shape Minors are deferred as standalone
+>   follow-ups. Reports:
+>   [impl](doc/devel/reports/implementations/posterior_engine_2026-05-16.md),
+>   [review](doc/devel/reports/reviews/posterior_engine_2026-05-16.md),
+>   [fixes-applied](doc/devel/reports/reviews/posterior_engine_2026-05-16_applied.md).
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -218,11 +225,40 @@ via rayon.
 
 EM over merged records → final multi-sample VCF.
 
-- **Status:** not yet planned
+#### Posterior engine (no-contamination v1)
+- **Status:** fixes-applied
 - **Spec sections:** `## Stage 6 — posterior engine` in [calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md); background in [freebayes_posterior_gt_probs.md](doc/devel/specs/freebayes_posterior_gt_probs.md) and [gatk_em_calculation.md](doc/devel/specs/gatk_em_calculation.md)
-- **Plan:** none yet
-- **Code:** none yet
+- **Plan:** [posterior_engine.md](doc/devel/implementation_plans/posterior_engine.md)
+- **Code:** [src/var_calling/posterior_engine.rs](src/var_calling/posterior_engine.rs)
+- **Tests:** unit tests in the module + [tests/posterior_engine_integration.rs](tests/posterior_engine_integration.rs)
+- **Impl report:** [posterior_engine_2026-05-16.md](doc/devel/reports/implementations/posterior_engine_2026-05-16.md)
+- **Latest review:** [posterior_engine_2026-05-16.md](doc/devel/reports/reviews/posterior_engine_2026-05-16.md) — Request-changes: 2 Blocker test-gap findings, 11 Major, 13 Minor.
+- **Latest fixes-applied:** [posterior_engine_2026-05-16_applied.md](doc/devel/reports/reviews/posterior_engine_2026-05-16_applied.md) — both Blockers fixed (B1 `NonFinitePosterior` test, B2 trivial-record row-sum bug + tests); 10 of 11 Majors applied (M3 config validation deferred — needs engine-vs-CLI boundary decision); 8 of 13 Minors applied (Mi5 perf bench, Mi6 golden test, Mi12 `with_config -> Result`, Mi13 fixture consolidation deferred as standalone follow-ups). 622 lib + 7 integration tests pass, clippy-clean on the in-scope files.
+- **Open:**
+  - **M3** — config validation (engine-side vs CLI-side knob-range checking for `F`, pseudocounts). Lands with the cohort CLI subcommand.
+  - **Mi5** — `benches/posterior_engine_perf.rs` regression-threshold criterion bench.
+  - **Mi6** — golden `tests/golden/posterior_engine/*` fixtures locking emitted `f64` values across the representative-record matrix.
+  - **Mi12 / Mi13** — `with_config -> Result<Self, _>` for fail-fast validation, and fixture consolidation across the unit / integration crate boundary.
+  - End-to-end PspReader→…→PosteriorEngine integration test lands
+    with the cohort CLI subcommand (needs a real ref-fasta fixture).
+  - Pre-existing clippy warnings in
+    [src/var_calling/per_group_merger.rs:1786 + 1796](src/var_calling/per_group_merger.rs#L1786)
+    and in
+    [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
+    surfaced during this work's validation; they predate the
+    posterior engine and want a small clippy-cleanup pass.
+
+#### Posterior engine — contamination mode (Algorithm 3 or 5)
+- **Status:** not yet planned
+- **Plan:** none yet — follow-up to the v1 plan §"Out of scope (v1)"
 - **Open:** plan needs to be written before implementation can start.
+
+#### Posterior engine — approximate-LUT inner loop
+- **Status:** not yet implemented (config flag wired only)
+- **Plan section:** [posterior_engine.md §"Approximation via precomputed lookup tables"](doc/devel/implementation_plans/posterior_engine.md)
+- **Open:** evaluation methodology pinned in the plan; needs the
+  exact-math engine bench numbers before deciding which candidates
+  to land.
 
 ---
 

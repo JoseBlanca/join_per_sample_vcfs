@@ -1442,10 +1442,10 @@ fn subtract_compound_from_constituents(
                     placed_start: ((support.placed_start as f64) * scale.min(1.0)).round() as u32,
                 };
                 to_subtract.fwd = to_subtract.fwd.min(scalars[dest_idx].fwd);
-                to_subtract.placed_left = to_subtract.placed_left.min(scalars[dest_idx].placed_left);
-                to_subtract.placed_start = to_subtract
-                    .placed_start
-                    .min(scalars[dest_idx].placed_start);
+                to_subtract.placed_left =
+                    to_subtract.placed_left.min(scalars[dest_idx].placed_left);
+                to_subtract.placed_start =
+                    to_subtract.placed_start.min(scalars[dest_idx].placed_start);
                 subtract_support(&mut scalars[dest_idx], &to_subtract);
             }
         }
@@ -1457,14 +1457,17 @@ fn subtract_compound_from_constituents(
 /// map for every non-compound entry of `unified.alleles`. Used by the
 /// compound-subtraction pass to find each constituent's kept per-position
 /// allele in O(1).
-fn build_source_index(
-    unified: &UnifiedAlleleSet,
-) -> AHashMap<(usize, usize, usize), usize> {
+fn build_source_index(unified: &UnifiedAlleleSet) -> AHashMap<(usize, usize, usize), usize> {
     let expected: usize = unified
         .alleles
         .iter()
         .filter(|a| !a.is_compound)
-        .map(|a| a.per_sample_sources.iter().map(SmallVec::len).sum::<usize>())
+        .map(|a| {
+            a.per_sample_sources
+                .iter()
+                .map(SmallVec::len)
+                .sum::<usize>()
+        })
         .sum();
     let mut idx: AHashMap<(usize, usize, usize), usize> = AHashMap::with_capacity(expected);
     for (allele_idx, allele) in unified.alleles.iter().enumerate() {
@@ -1590,8 +1593,7 @@ fn compute_log_likelihoods(
     let mut out: Vec<f64> = vec![0.0; n_samples * n_genotypes];
 
     for sample_idx in 0..n_samples {
-        let scalars_row =
-            &projection.scalars[sample_idx * n_kept..sample_idx * n_kept + n_kept];
+        let scalars_row = &projection.scalars[sample_idx * n_kept..sample_idx * n_kept + n_kept];
         let flags_row =
             &chain_anchor_flags[sample_idx * n_alleles..sample_idx * n_alleles + n_alleles];
         let other = &projection.other_scalars[sample_idx];
