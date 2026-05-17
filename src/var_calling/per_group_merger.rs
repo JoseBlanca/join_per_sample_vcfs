@@ -77,7 +77,7 @@ pub struct PerGroupMergerConfig {
     /// Hard cap on the number of alleles in a single merged record.
     /// Excess alleles (lowest cohort-wide count first; REF and any
     /// chain-anchored compound protected) drop into a per-sample
-    /// "<OTHER>" scalar pool that only contributes to the error-cost
+    /// `<OTHER>` scalar pool that only contributes to the error-cost
     /// term. Defaults to [`DEFAULT_MAX_ALLELES_PER_RECORD`].
     pub max_alleles: usize,
 

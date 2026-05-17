@@ -21,22 +21,36 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Stage 3 sdust low-complexity filter
->   code review on 2026-05-17 —
->   [dust_filter_2026-05-17.md](doc/devel/reports/reviews/dust_filter_2026-05-17.md).
->   Request-changes verdict: 0 Blockers, 8 Major, 24 Minor + 9
->   Nits. Most-important fixes: M1 `pileups.pos - 1` silent
->   underflow on `pos == 0` (typed-error variant needed); M2
->   missing property test on `sdust_mask`; M3/M4 missing
->   boundary and out-of-order regression tests on `DustFilter`;
->   M5 `sdust_high_threshold_disables_masking` does not pin
->   strict-`>`; M6 error-`Display` chain doubling; M7 missing
->   `// PANIC-FREE:` comment; M8 unchecked counter subtractions.
->   Algorithmic port from `lh3/sdust` verified byte-for-byte
->   against the C source — no port-fidelity findings. Four open
->   questions for the human PM: tracing policy (Mi6), `window`
->   upper bound justification (Mi7), `sdust_mask` panic-vs-Result
->   symmetry (Mi24), out-of-order policy (M4).
+> - **Last completed task:** Stage 3 sdust filter review-fixes on
+>   2026-05-17 —
+>   [dust_filter_2026-05-17_applied.md](doc/devel/reports/reviews/dust_filter_2026-05-17_applied.md).
+>   36 of 41 review findings Applied (7 of 8 Majors + 22 of 24
+>   Minors + 7 Nits); 1 Applied-with-adaptation (Mi21
+>   cargo-doc partially blocked on parallel `posterior_engine`
+>   WIP); 2 Won't-fix per project preference (M4 out-of-order =
+>   merger's responsibility; Mi6 informational tracing).
+>   Headline correctness fixes: M1 `InvalidPos` variant +
+>   `checked_sub` on the 1-based→0-based conversion; M6 dropped
+>   `{0}`/`{source}` interpolation from error `Display`; M7/M8
+>   `// PANIC-FREE:` / `// INVARIANT:` comments at every
+>   unchecked decrement plus a `debug_assert!` on the suffix-trim
+>   invariant. Test additions: 13 new tests, including a
+>   property/invariant sweep over ~40 K seeded-random inputs
+>   (`sdust_invariants_hold_on_random_seeded_inputs`) that pins
+>   the structural invariants `is_masked` relies on; the M5
+>   strict-`>` boundary test (6 A's must not mask, 7 A's must)
+>   verified against the cloned binary. Structural cleanups: M14
+>   `Option<LoadedChrom>` bundle for the three co-dependent
+>   fields, M17 `dust_density_exceeds` helper extracted from three
+>   open-coded sites, M13 `i64` reverse loop replaced with
+>   `(0..hi).rev()` over u32. `sdust_mask` and `SdustIntervals`
+>   made private (Q3): public surface is now `DustFilter`,
+>   `DustFilterConfig`, `DustFilterError`, the two `DEFAULT_*`
+>   constants. 38 dust_filter tests pass; `cargo fmt --check`,
+>   `cargo clippy --all-targets --all-features -- -D warnings`
+>   clean. `cargo doc` surfaced and fixed two pre-existing doc
+>   errors in untouched code; full doc-build awaits parallel
+>   posterior_engine refactor.
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -126,20 +140,21 @@ reference and silently drops low-complexity records. No intermediate
 mask file. Algorithm ported from `lh3/sdust` (vendored at `sdust/`,
 gitignored).
 
-- **Status:** reviewed
+- **Status:** fixes-applied
 - **Spec section:** `## Stage 3 — low-complexity filter` in [calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md)
 - **Plan:** [dust_filter.md](doc/devel/implementation_plans/dust_filter.md)
 - **Code:** [src/var_calling/dust_filter.rs](src/var_calling/dust_filter.rs)
-- **Tests:** 25 unit tests in the module (algorithmic core,
-  config validation, iterator plumbing) plus a golden-vector
-  test against a committed `GOLDEN_SNIPPETS` const whose
-  `expected` values were generated once at implementation time
-  by running `lh3/sdust` on each snippet — the C tool is not a
-  build- or test-time dependency.
+- **Tests:** 38 tests in the module (algorithmic core, config
+  validation, iterator plumbing, golden vector against committed
+  `lh3/sdust` outputs, seeded-random invariant sweep over ~40 K
+  input combinations, half-open boundary, threshold-strictness
+  boundary, `pos == 0` latch, exhaustion latch). `lh3/sdust` is
+  not a build- or test-time dependency.
 - **Impl report:** [dust_filter_2026-05-17.md](doc/devel/reports/implementations/dust_filter_2026-05-17.md)
-- **Latest review:** [dust_filter_2026-05-17.md](doc/devel/reports/reviews/dust_filter_2026-05-17.md) — Request-changes: 0 Blockers, 8 Major, 24 Minor + 9 Nits. Headline items: M1 `pileups.pos - 1` underflow on `pos == 0` (silent wrong filtering in release); M2 missing property test on `sdust_mask`; M3 no half-open boundary test on `is_masked`; M4 no out-of-order regression test; M5 `sdust_high_threshold_disables_masking` does not actually pin the strict-`>` boundary; M6 error `Display` doubles the source chain; M7 `expect("deque non-empty at cap")` lacks `// PANIC-FREE:`; M8 unchecked counter subtractions rely on undocumented invariants.
+- **Latest review:** [dust_filter_2026-05-17.md](doc/devel/reports/reviews/dust_filter_2026-05-17.md) — Request-changes: 0 Blockers, 8 Major, 24 Minor + 9 Nits.
+- **Latest fixes-applied:** [dust_filter_2026-05-17_applied.md](doc/devel/reports/reviews/dust_filter_2026-05-17_applied.md) — 36 of 41 findings Applied (7 of 8 Majors + 22 of 24 Minors + 7 Nits); 1 Applied-with-adaptation (Mi21 partially blocked on parallel `posterior_engine` WIP); 2 Won't-fix per project preference (M4 out-of-order check is the merger's responsibility; Mi6 informational tracing conflicts with the "no logs" project preference); 2 Nits won't-fix.
 - **Open:**
-  - Apply review findings (see `Latest review`).
+  - **Mi21** — full `cargo doc --no-deps --all-features` with `-D warnings` to be re-run once the parallel `posterior_engine` refactor compiles; intra-doc links in `dust_filter.rs` itself have been visually verified.
   - CLI parser bindings (`--complexity-window`,
     `--complexity-threshold`, `--no-complexity-filter`) land with
     the cohort subcommand.

@@ -11,7 +11,9 @@
 //! `doc/devel/implementation_plans/contamination_estimation.md`.
 //!
 //! Architecture: a side-pass, not a stage. It consumes
-//! [`PerPositionPileups`] from a [`PerPositionMerger`] (or any
+//! [`PerPositionPileups`] from a
+//! [`PerPositionMerger`](crate::var_calling::per_position_merger::PerPositionMerger)
+//! (or any
 //! iterator with that shape) but does **not** go through Stage 3
 //! (DUST filter), Stage 4 (grouping), or Stage 5 (per-group merger).
 //! Bypassing them is the point: contamination is a per-read mixture
