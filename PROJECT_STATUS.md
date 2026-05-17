@@ -21,39 +21,37 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Contamination-estimation side-pass v1
->   review-fixes run on 2026-05-17 —
->   [fixes_applied_2026-05-17.md](doc/devel/reports/reviews/fixes_applied_2026-05-17.md).
->   33 of 41 findings Applied (both Blockers, 14 of 16 Majors, 17 of
->   23 Minors); 2 Applied-with-adaptation; 1 Already-fixed; 6 Deferred
->   (M13 mechanical 14-site test-literal cleanup; M14 `OnlineEmState`
->   god-struct refactor; Mi9 test-fixture deduplication; Mi19
->   `DEFAULT_*` spec citations; Mi21/Mi22 paired with M14/M13). Both
->   Blockers fixed: B1 made `ContaminationEstimates::from_user_supplied`
->   fallible with 7 typed-error variants; B2 added value-witness tests
->   for `compute_mixture_log_likelihoods` + a fixed integration test
->   that contrasts the mixture branch against the c_s=0 baseline.
->   Major correctness fixes: M2 three silent clamps now have
->   `debug_assert!` invariants documenting structural unreachability;
->   M9 hard error on `min_batch_size_for_contamination < 2` at the
->   gate (no more silent `.max(2)` coercion); M12 dropped the `Default`
->   anti-pattern; M15 cohort_alleles dropped per-allele byte clones.
->   668 lib + 109 integration tests pass; `cargo fmt --check`,
->   `cargo clippy --all-targets --all-features -- -D warnings` all
->   clean. Two perf regressions surfaced (likely code-layout drift,
->   not directly attributable to fixed files) — kept per skill policy.
->   Implementation report:
->   [contamination_estimation_2026-05-17.md](doc/devel/reports/implementations/contamination_estimation_2026-05-17.md);
->   review:
->   [contamination_estimation_2026-05-17.md](doc/devel/reports/reviews/contamination_estimation_2026-05-17.md).
+> - **Last completed task:** Stage 3 sdust low-complexity filter
+>   implementation on 2026-05-17 —
+>   [dust_filter_2026-05-17.md](doc/devel/reports/implementations/dust_filter_2026-05-17.md).
+>   New module
+>   [src/var_calling/dust_filter.rs](src/var_calling/dust_filter.rs)
+>   ports `sdust_core` from the vendored `lh3/sdust` (gitignored at
+>   `sdust/`) as a pure `sdust_mask` function, wrapped by a
+>   per-chromosome-batch `DustFilter` iterator adaptor over the
+>   `PerPositionMerger` stream. Two-layer API: `sdust_mask` is
+>   testable in isolation; `DustFilter` is the upstream-wiring
+>   wrapper. 25 new tests (12 algorithmic core including a
+>   golden-vector test against committed `expected` values that
+>   were generated once at implementation time by running
+>   `lh3/sdust` on 6 hand-picked snippets — the C tool is not a
+>   build- or test-time dependency; 5 config validation tests; 8
+>   iterator-plumbing tests with a stub fetcher).
+>   `DustFilterConfig::new` is fallible (validates `window ∈
+>   3..=4096`); `DustFilter::new` is infallible. 693 lib + 109
+>   integration tests pass; `cargo fmt --check`,
+>   `cargo clippy --all-targets --all-features -- -D warnings` clean.
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
 >   findings from the perf review — H5 (`DEFAULT_BATCH_SIZE` sweep),
 >   H6 (Stage 4 bench fixture-rebuild fix), H7 (cohort-size sweep);
->   write the Stage 5 implementation report; plan Stage 3 (DUST
->   filter); plan Stage 6 (posterior engine); pick up the standing
->   items below (BED-region skip, phase-chain integration tests).
+>   write the Stage 5 implementation report; design + implement the
+>   cohort CLI subcommand (wires PspReader → multi-way merger →
+>   DustFilter → grouper → per-group merger → posterior engine →
+>   VCF writer; closes the open items on Stages 3/5/6 that wait for
+>   it); pick up the standing items below (BED-region skip,
+>   phase-chain integration tests).
 
 ---
 
@@ -125,16 +123,33 @@ consume. Not a runtime step — an interface.
 
 ---
 
-### Stage 3 — low-complexity (DUST) filter
+### Stage 3 — low-complexity (sdust) filter
 
-Streaming per-position filter that computes DUST from the reference and
-silently drops low-complexity records. No intermediate mask file.
+Streaming per-position filter that computes sdust scores from the
+reference and silently drops low-complexity records. No intermediate
+mask file. Algorithm ported from `lh3/sdust` (vendored at `sdust/`,
+gitignored).
 
-- **Status:** not yet planned
+- **Status:** implemented
 - **Spec section:** `## Stage 3 — low-complexity filter` in [calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md)
-- **Plan:** none yet
-- **Code:** none yet
-- **Open:** plan needs to be written before implementation can start.
+- **Plan:** [dust_filter.md](doc/devel/implementation_plans/dust_filter.md)
+- **Code:** [src/var_calling/dust_filter.rs](src/var_calling/dust_filter.rs)
+- **Tests:** 25 unit tests in the module (algorithmic core,
+  config validation, iterator plumbing) plus a golden-vector
+  test against a committed `GOLDEN_SNIPPETS` const whose
+  `expected` values were generated once at implementation time
+  by running `lh3/sdust` on each snippet — the C tool is not a
+  build- or test-time dependency.
+- **Impl report:** [dust_filter_2026-05-17.md](doc/devel/reports/implementations/dust_filter_2026-05-17.md)
+- **Open:**
+  - CLI parser bindings (`--complexity-window`,
+    `--complexity-threshold`, `--no-complexity-filter`) land with
+    the cohort subcommand.
+  - End-to-end PspReader → DustFilter integration test lands with
+    the cohort CLI subcommand (needs a real ref-fasta fixture).
+  - Criterion bench — deferred until the cohort CLI runs
+    end-to-end and we can measure DUST's share of real cohort
+    wall time.
 
 ---
 

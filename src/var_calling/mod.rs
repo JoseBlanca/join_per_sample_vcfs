@@ -14,6 +14,7 @@
 //! Later stages land in sibling modules as they are implemented.
 
 pub mod contamination_estimation;
+pub mod dust_filter;
 pub mod per_group_merger;
 pub mod per_position_merger;
 pub mod posterior_engine;
