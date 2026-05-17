@@ -108,61 +108,153 @@ mixture likelihood.
 
 ### Step 1 — informative-site filter (per (sample, site) pair)
 
-A `(sample s, position i)` pair enters the estimator when **all**
-of the following hold, computed from raw `.psp` aggregates with
-no per-record EM:
+The filter operates at **two levels** and a `(sample s, position
+i)` pair enters the estimator only when **both** sets of
+conditions hold. All conditions are evaluated from raw `.psp`
+aggregates with no per-record EM.
 
-- **Sample depth at the site** `n_{s,i} ≥ MIN_DEPTH` (default 10).
-  Low-depth pairs cannot confidently call the sample's genotype,
-  and contribute too little signal to be worth the bookkeeping.
-- **Sample's observed major-allele fraction**
-  `(max_a n_{s,i,a}) / n_{s,i} ≥ MIN_MAJOR_FRACTION` (default 0.95).
-  The sample is confidently homozygous-major at this site. Any
-  minor reads are candidate contamination (or base errors —
-  step 3 separates them).
-- **Cohort has minor-allele variation at the site.** Summed
-  across all samples, the second-most-common allele has count
-  `≥ MIN_COHORT_MINOR_COUNT` (default 2) and observed cohort
-  minor-allele fraction `≥ MIN_COHORT_MINOR_FRACTION` (default
-  0.005). Sites that are 100 %-major across the cohort carry no
-  information about `c_s` — any minor reads would be pure base
-  errors regardless of contamination.
+The two levels point in opposite directions on the
+major-allele-fraction axis, and that is deliberate — see below.
 
-The per-(sample, site) hom-major call uses raw observed
-fractions, not a per-record EM estimate. Raw fractions are good
-enough: the post-EM call is the same quantity up to pseudocount
-shrinkage and contamination-induced bias, neither of which
-matters for "is the sample confidently homozygous here?"
+#### 1a. Cohort-wide site filter (applied once per site)
 
-### Step 2 — reservoir-sample informative sites until convergence or cap
+The site qualifies if the **cohort-aggregated major-allele
+fraction is LOW enough** that the site is polymorphic. Concretely,
+summed across all samples in the cohort:
+
+- The second-most-common allele has count
+  `≥ MIN_COHORT_MINOR_COUNT` (default 2).
+- The observed cohort-minor-allele fraction is
+  `≥ MIN_COHORT_MINOR_FRACTION` (default 0.005) — equivalently,
+  the cohort major-allele fraction is `≤ 0.995`.
+
+Sites that fail (i.e. the cohort is essentially monomorphic at
+that position) carry no information about `c_s`: at a site where
+the whole cohort shows only allele A, contamination from another
+cohort sample also brings allele A reads, so contamination is
+undetectable. The few reads carrying a different allele at such
+sites are pure base errors regardless of contamination.
+
+This is the "low major-allele frequency" criterion in the
+broader Algorithm 6 discussion ([posterior_engine.md](../implementation_plans/posterior_engine.md)),
+phrased here as a positive lower bound on the cohort *minor*
+fraction.
+
+#### 1b. Per-sample filter (applied to each sample at a qualifying site)
+
+For each sample `s` at a site that already passed 1a, the
+sample's observation qualifies if the **sample's own
+major-allele fraction is HIGH enough** to call the sample
+confidently homozygous-major:
+
+- `n_{s,i} ≥ MIN_DEPTH` (default 10). Low-depth pairs cannot
+  confidently call the sample's genotype.
+- `(max_a n_{s,i,a}) / n_{s,i} ≥ MIN_MAJOR_FRACTION`
+  (default 0.95). At least 95 % of this sample's reads at this
+  site carry the same allele — the sample is unambiguously
+  homozygous-major.
+
+Samples that fail (low depth, or genuinely heterozygous, or
+ambiguous) are skipped for this site, but other samples at the
+same site may still contribute. The site itself is not
+discarded; only the (sample, site) tuples that don't meet
+1b are.
+
+#### Why the two filters point in opposite directions
+
+- The **cohort** filter wants polymorphism (low cohort major
+  fraction) so that contamination from another cohort sample is
+  likely to introduce a *different* allele than sample s's own
+  genotype — otherwise contamination is invisible.
+- The **per-sample** filter wants confidence in the sample's
+  genotype (high per-sample major fraction) so that minor reads
+  in this sample's pile are interpretable as "must be
+  contamination or base error." If the sample were genuinely
+  heterozygous, minor reads would just be the second allele and
+  carry no contamination signal.
+
+A useful (sample, site) tuple is therefore one where **the
+cohort is polymorphic but this particular sample happens to be
+homozygous-major** — exactly the regime VerifyBamID and ContEst
+exploit.
+
+#### Why raw fractions are enough
+
+The per-sample hom-major call uses raw observed fractions, not a
+per-record EM estimate. Raw fractions are good enough: the
+post-EM call is the same quantity up to pseudocount shrinkage
+and contamination-induced bias, neither of which matters for
+"is the sample confidently homozygous here?" at the 0.95 threshold.
+
+### Step 2 — stream informative sites; stop on convergence or fixed-N target
 
 The estimator processes `.psp` files in genomic order via the
 same multi-way per-position iterator Stage 3 uses (minus the
-DUST filter). At each position that passes the cohort-minor-
-variation check, it iterates samples and emits one (sample,
-site, allele_counts, BQ_aggregates) tuple per (sample, site) pair
-passing the per-sample filters.
+DUST filter). At each position that passes the cohort-wide
+filter (Step 1a), it iterates samples and feeds each (sample,
+site) pair passing the per-sample filter (Step 1b) through the
+online-EM update in Step 4.
 
-Tuples accumulate into in-RAM per-sample and per-batch
-aggregators. The estimator stops when either of:
+**No tuples are stored.** All per-(sample, site) contributions
+fold into a small set of running sufficient statistics whose
+size is `O(n_samples + n_batches × n_allele_classes)` — KB at
+realistic cohort sizes. See Step 4 for the precise state.
 
-- **Convergence**: at every `--contamination-block-size` tuples
-  (default 1000), re-estimate `c_s` from all data accumulated so
-  far. The largest per-sample delta `max_s |c_s_new − c_s_prev|`
-  must fall below `--contamination-stability-tolerance` (default
-  1e-3) for `--contamination-stability-blocks` (default 3)
-  consecutive blocks.
-- **Site cap**: total tuples processed reaches
-  `--contamination-max-sites` (default 10 000 sites, counted as
-  positions — not per-sample tuples).
+The estimator stops by exactly one of two stopping criteria,
+**selected at CLI parse time and mutually exclusive**:
 
-If the genome ends before convergence and before the site cap,
-that means there were not enough informative sites in the cohort
-to estimate contamination at the requested tolerance. The pass
-returns `ContaminationEstimateDidNotConverge` carrying the
-final-block per-sample deltas and a recommended next-run
-configuration (typically a wider tolerance or a lower
-MIN_MAJOR_FRACTION). See §"Non-convergence behaviour".
+#### Convergence mode (default)
+
+Active when `--contamination-stability-tolerance T` is set
+(default `1e-3`); silently active when neither stopping flag is
+passed.
+
+At every `--contamination-block-size` informative sites
+(default 1000), snapshot the current `c_s` vector derived from
+the running sufficient statistics. Convergence is declared when
+the largest per-sample delta `max_s |c_s_new − c_s_prev|` stays
+below `T` for `--contamination-stability-blocks` consecutive
+snapshots (default 3).
+
+If the `.psp` files are exhausted before convergence fires, the
+side-pass returns
+`ContaminationEstimateDidNotConverge` carrying the final-block
+per-sample deltas, the number of informative sites processed,
+and a recommended next-run configuration (typically a wider
+tolerance, a relaxed `MIN_MAJOR_FRACTION`, or a switch to
+fixed-N mode with `N` set to the observed count). See
+§"Non-convergence behaviour".
+
+#### Fixed-N mode
+
+Active when `--contamination-num-sites N` is set.
+
+The side-pass processes exactly `N` informative positions (i.e.
+positions passing Step 1a, regardless of how many samples
+contribute at each) and returns whatever estimate the running
+sufficient statistics yield at that boundary. **No convergence
+check, no stability tolerance.** The user has explicitly
+declared "use these N sites, give me the resulting estimate" —
+the mode is reproducible by construction, which makes it the
+right tool for regression tests and cross-version benchmarks.
+
+If the `.psp` files are exhausted before `N` informative sites
+are found, the side-pass returns `ContaminationInsufficientSites
+{ requested: N, found: M, recommendation: ... }`. See
+§"Non-convergence behaviour".
+
+#### Mutual exclusivity
+
+Setting both `--contamination-stability-tolerance` and
+`--contamination-num-sites` is a CLI parse-time error. The user
+picks one stopping discipline; the spec does not silently
+combine them. This is the only CLI shape that satisfies Design
+principle 3 (no silent defaults) — if both were allowed and
+both fired, the user would not know which one decided the run.
+
+Convergence mode is the default for users who have no informed
+opinion on `N`; fixed-N mode is the explicit opt-in for
+reproducibility.
 
 ### Step 3 — separate base errors from contamination signal
 
@@ -180,9 +272,15 @@ reads above this expectation are contamination signal; subtract
 the error contribution before passing to the mixture MLE so the
 estimator doesn't conflate the two.
 
-### Step 4 — joint MLE on `c_s` (per sample) and `q_b` (per batch)
+### Step 4 — block-wise online EM on `c_s` and `q_b`
 
-Notation:
+The maximum-likelihood estimator runs as **block-wise online
+EM** over the stream of reads produced by Steps 1 and 2. State
+is kept entirely in compact running sufficient statistics — **no
+tuples and no per-block read buffer are retained**.
+
+#### Notation
+
 - `n_{s,i,a}` = observed read count for sample `s` at site `i`
   carrying allele class `a ∈ {REF, SNP_alt, INDEL_alt}` (matching
   the existing `q_b` allele-class enum in
@@ -194,7 +292,7 @@ Notation:
 - `q_b ∈ Δ^{K−1}` (probability simplex, K = number of allele
   classes) = unknown.
 
-Per-read mixture likelihood:
+#### Per-read mixture likelihood
 
 ```
 P(read r with allele a | s, i, c_s, q_{b(s)})
@@ -207,38 +305,106 @@ The first term encodes "read came from sample s with genotype
 encodes "read came from a contaminant whose allele frequency is
 `q_b` for the batch s belongs to".
 
-Joint MLE: maximise `Π_{(s, i, r)} P(read r | ...)` over `{c_s}`
-and `{q_b}` simultaneously. Coordinate ascent converges in a few
-iterations because the parameter coupling is weak:
+#### Running sufficient statistics
 
-1. **Init**: `c_s = 0.02` for every sample (rough prior on
-   typical sequencing-batch contamination), `q_b` uniform over
-   allele classes.
-2. **Update `q_b`** (closed form, per batch):
+Per sample `s`:
+- `S_s = Σ over reads r for s of γ_r`
+- `N_s = Σ over reads for s of 1`
+
+Per batch `b`, per allele class `a`:
+- `S_b[a] = Σ over reads r in b of γ_r · 1[class(r) = a]`
+- `N_b = Σ over reads in b of 1`
+
+Where `γ_r = P(read r came from contamination | currently
+frozen c_s, q_b)`. Total state: `O(n_samples × 2 + n_batches ×
+(K + 1))` scalars — a few KB at typical cohort sizes.
+
+#### Init
+
+- `c_s_0 = 0.02` for every sample (rough prior on typical
+  sequencing-batch contamination).
+- `q_b_0` uniform across allele classes (renormalised through
+  the Dirichlet pseudocounts `α_a` from the per-position
+  pseudocounts: `--ref-pseudocount`, `--snp-alt-pseudocount`,
+  `--indel-alt-pseudocount`).
+- All running sufficient statistics zeroed.
+- The "frozen" parameters used to compute the first block's
+  `γ_r` values = the init values.
+
+#### Block update (fires every `--contamination-block-size` sites)
+
+The block is a **heartbeat**, not a buffer: reads are processed
+one at a time as they arrive, but the parameters used to compute
+`γ_r` stay frozen for the duration of the block, only refreshing
+at block boundaries.
+
+For each incoming `(sample s, site i, read r)`:
+
+1. **E-step (γ at frozen parameters):**
    ```
-   q_b[a] ∝ α_a + Σ over (s ∈ batch b, i, r) of c_s · 1[class(read r) = a]
+   γ_r = c_s_frozen · q_{b(s)_frozen}[class(r)]
+       / [(1 − c_s_frozen) · P(r | g_{s,i}, ε_{s,i,r})
+          + c_s_frozen · q_{b(s)_frozen}[class(r)]]
    ```
-   Dirichlet pseudocounts `α_a` match the Stage 6 per-position
-   pseudocounts (`--ref-pseudocount`, `--snp-alt-pseudocount`,
-   `--indel-alt-pseudocount`).
-3. **Update `c_s`** (1D maximisation per sample over [0, 1]):
-   maximise
+2. **Sufficient-statistic update:** add `γ_r` into the running
+   sums for `s` and for `b(s)`. Increment the matching `N`
+   counters.
+
+At end of every block (every `--contamination-block-size`
+informative sites):
+
+3. **Refresh parameter estimates** from the updated running
+   sufficient statistics:
    ```
-   L_s(c_s) = Σ over (i, r) for s of
-              ln[(1 − c_s) · P(r | g_{s,i}, ε_{s,i,r}) + c_s · q_{b(s)}[class(r)]]
+   c_s = S_s / N_s
+   q_b[a] = (α_a + S_b[a]) / (Σ_a α_a + Σ_a S_b[a])
    ```
-   via golden-section search or a fixed grid at 0.001-step
-   resolution. The objective is concave in `c_s` for fixed `q_b`
-   so either method works; the grid is preferred for its
-   reproducibility.
-4. **Iterate** until `max_s |c_s_new − c_s_prev| < 1e-5` (an
-   *inner* convergence threshold on the joint MLE, distinct from
-   the *outer* block-stability check in Step 2). Typically 5–10
-   iterations.
+   The Dirichlet pseudocounts `α_a` appear in the `q_b`
+   normalisation so `q_b` is well-defined even on cold-start
+   batches; `c_s` has no pseudocount (it is a fraction, not a
+   distribution).
+4. **Snapshot `c_s`** for the Step-2 stability check.
+5. **Re-freeze** `c_s_frozen ← c_s, q_b_frozen ← q_b` for the
+   next block's `γ` computations.
+
+No buffer is allocated, cleared, or grown between blocks. The
+running sufficient statistics are cumulative across the entire
+side-pass.
+
+#### Why block-wise (and not pure per-read online EM)
+
+A strict per-read variant would refresh the parameters after
+each read, so every `γ_r` is computed against parameters that
+have just shifted by one read's worth of evidence. That is the
+classical online-EM setting that requires a stepwise learning
+rate (Cappé & Moulines 2009, "Online EM") to converge cleanly.
+
+Block-wise refresh keeps `γ` values consistent with a single
+parameter snapshot per block, removes the need for any learning-
+rate schedule, and aligns naturally with the stability snapshots
+Step 2 needs anyway. The `--contamination-block-size` knob is
+the same heartbeat for both EM refresh and stability check.
+
+#### Why this converges to the offline MLE
+
+As the side-pass advances, the running sufficient statistics
+converge to their population expectations under the stationary
+input stream; the parameter estimates derived from them converge
+to the offline (batch) MLE; and the per-block stability shrinks
+below any chosen tolerance. The first block's `γ` values are
+biased (computed at init parameters), but for cohorts with
+`c_s ≤ 0.05` the asymptotic bias is `O(c̄² / N)` and falls well
+below the default `1e-3` stability tolerance after a few
+thousand sites. The same bound bounds the difference between
+this online estimator and the batch MLE that the previous
+version of the spec described.
 
 ### Step 5 — apply small-batch and explicit-override floors
 
-After Step 4 converges:
+Once the Step 2 stopping criterion fires (convergence in
+convergence mode; site target in fixed-N mode), the current
+parameter estimates are finalised with the following floors and
+overrides applied:
 
 - **Singleton batches**: any batch containing exactly one sample
   cannot have its `c_s` and `q_b` distinguished from each other
@@ -261,49 +427,83 @@ q_b_per_batch }` to Stage 6.
 
 ## Convergence and non-convergence behaviour
 
-### Convergence is a property of the subsample, not of the MLE
+### Convergence is a property of the running estimate, not of an inner MLE
 
-The Step 4 inner MLE always converges (concave 1D objectives,
-closed-form Dirichlet update). What can fail is the **outer**
-finite-sample-stability check (Step 2): the `c_s` estimates may
-keep drifting as more sites are added, indicating the subsample
-is too small relative to the cohort's signal-to-noise.
+The Step 4 online-EM update has no inner MLE — there is no
+inner loop to converge. What "convergence" means in this spec
+is the **outer block-stability** check from Step 2: the per-
+block snapshots of `c_s` derived from the running sufficient
+statistics stop moving more than the tolerance between
+consecutive blocks.
 
-A stable estimate after K = 3 blocks of M = 1000 sites each
-means: across the last 3 000 informative sites added, the
-largest per-sample `c_s` movement was below 1e-3. That is what
+A stable estimate after K = 3 blocks of M = 1000 sites means:
+across the last 3 000 informative sites added, the largest
+per-sample `c_s` movement was below the tolerance. That is what
 the user is buying when they take the `c_s` numbers at face
 value.
 
-### When stability fails — actionable error
+The block-wise online EM is guaranteed to converge to the
+offline (batch) MLE in the limit (see Step 4); what can fail is
+reaching the chosen tolerance before exhausting the cohort's
+informative sites. Noisy cohorts, very low contamination
+signal, or a very tight tolerance can leave the per-block
+deltas oscillating.
 
-`ContaminationEstimateDidNotConverge` carries:
+### `ContaminationEstimateDidNotConverge` — convergence mode only
+
+Raised when the `.psp` files are exhausted before convergence
+fires. Carries:
 
 - The final per-sample deltas across the last two blocks.
 - The total number of informative sites processed.
-- A recommended `--contamination-max-sites` for the next run,
-  computed by extrapolating the observed delta-vs-N curve to the
-  N at which the largest delta would fall under tolerance.
-  Formula: if the last-two-blocks delta scaled roughly as
-  N^(−1/2) (the expected MLE scaling), then
-  `N_recommended ≈ N_current · (delta_observed / tolerance)^2`.
-  Capped at 10× the current cap so the recommendation does not
-  spiral.
+- A recommended next-run configuration: extrapolating the
+  observed delta from the last two blocks under the expected
+  MLE scaling `delta ∝ N^(−1/2)`, the side-pass suggests
+  `N_recommended ≈ N_current · (delta_observed / tolerance)²`,
+  capped at 10× the current input size to avoid runaway
+  recommendations. The user can act on this by relaxing the
+  tolerance, by switching to fixed-N mode with
+  `--contamination-num-sites N_recommended`, or by relaxing
+  `MIN_MAJOR_FRACTION` (admits more sites per genome).
 
-The user re-runs with the recommended cap (or a wider
-tolerance, or a relaxed MIN_MAJOR_FRACTION to admit more
-sites). **No silent fallback to `c_s = 0`** — that would
-produce a confident-looking VCF whose contamination correction
-is missing. Per Design principle 3 (no silent defaults), the
-user explicitly opts in if they want contamination skipped.
+### `ContaminationInsufficientSites` — fixed-N mode only
 
-### Convergence diagnostics
+Raised when `.psp` files are exhausted before
+`--contamination-num-sites N` informative sites are found.
+Carries:
+
+- `requested: N` — the user-supplied target.
+- `found: M` — actual count of informative sites observed.
+- A recommended next-run configuration: typically "lower
+  `--contamination-num-sites` to ~M", or switch to convergence
+  mode with `--contamination-stability-tolerance`, or relax
+  filtering thresholds (e.g. lower `MIN_MAJOR_FRACTION`) to
+  admit more sites.
+
+### No silent fallback
+
+Neither error type silently falls back to `c_s = 0`. Per Design
+principle 3 (no silent defaults), the user must explicitly opt
+out of contamination correction — either by omitting
+`--contamination-batches` entirely, or by supplying
+`--contamination-estimates` with explicit zero values for the
+affected samples. A confident-looking VCF whose contamination
+correction is missing is a calibration trap the pipeline must
+not produce.
+
+### Convergence diagnostics (convergence mode only)
 
 When `--contamination-diagnostics-out FILE` is set, the side-
-pass writes a small TSV with one row per block:
-`block_idx`, `sites_processed_so_far`, `max_c_s_delta`,
-`mean_c_s_so_far`, `min_c_s_so_far`, `max_c_s_so_far`. Useful
-for tuning the tolerance against real cohort data.
+pass writes a small TSV with one row per block: `block_idx`,
+`sites_processed_so_far`, `max_c_s_delta`, `mean_c_s_so_far`,
+`min_c_s_so_far`, `max_c_s_so_far`. Useful for tuning the
+tolerance against real cohort data.
+
+Setting `--contamination-diagnostics-out` together with
+`--contamination-num-sites` is a CLI parse-time error: the
+per-block delta is meaningless in fixed-N mode (no stability
+check runs), and silently emitting an empty or
+delta-less file would hide that fact.
 
 ## What the side-pass consumes
 
@@ -343,17 +543,34 @@ for tuning the tolerance against real cohort data.
 
 ## Parameters and opt-out
 
+**Side-pass enable / replace**
+
 | Flag | Default | Effect |
 |---|---|---|
 | `--contamination-batches FILE` | — | **Enables the side-pass.** TSV mapping `sample_id → batch_id`. Without this flag, no side-pass runs; Stage 6 uses `c_s = 0`. |
 | `--contamination-estimates FILE` | — | Skip the side-pass entirely; use the user-supplied `c_s` values. Format: TSV `sample_id → c_s`. `q_b` is still estimated by a short side-pass restricted to `q_b`-only updates (Step 4 with `c_s` frozen) unless `--contamination-source-distributions FILE` is also supplied. |
 | `--contamination-source-distributions FILE` | — | Skip the side-pass entirely; use user-supplied `q_b` values. Requires `--contamination-estimates` to also be set. |
-| `--contamination-estimates-out FILE` | — | Write the side-pass output to disk for inspection / reuse. TSV with per-sample `c_s` and per-batch `q_b`. |
-| `--contamination-diagnostics-out FILE` | — | Write the per-block convergence trace (see §"Convergence diagnostics"). |
-| `--contamination-max-sites N` | 10 000 | Hard cap on positions processed. |
-| `--contamination-block-size N` | 1000 | Sites per stability-check block. |
-| `--contamination-stability-tolerance T` | 1e-3 | Max per-sample `c_s` delta between consecutive blocks for convergence. |
-| `--contamination-stability-blocks K` | 3 | Number of consecutive within-tolerance blocks required to declare convergence. |
+
+**Stopping criterion (mutually exclusive — passing both is a CLI parse-time error)**
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--contamination-stability-tolerance T` | `1e-3` (default mode when neither stopping flag is passed) | **Convergence mode.** Run until `max_s |c_s_new − c_s_prev| < T` for `--contamination-stability-blocks` consecutive snapshots. |
+| `--contamination-num-sites N` | — | **Fixed-N mode.** Process exactly `N` informative positions and return the resulting estimate. No convergence check. Reproducible by construction. |
+
+**Convergence-mode-only knobs**
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--contamination-stability-blocks K` | 3 | Consecutive within-tolerance snapshots required to declare convergence. |
+| `--contamination-diagnostics-out FILE` | — | Per-block convergence trace (see §"Convergence diagnostics"). **CLI error** when combined with `--contamination-num-sites`. |
+
+**Both modes**
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--contamination-block-size N` | 1000 | Sites per heartbeat — controls both the EM parameter refresh and (in convergence mode) the stability snapshot. |
+| `--contamination-estimates-out FILE` | — | Write side-pass output to disk for inspection / reuse. TSV with per-sample `c_s` and per-batch `q_b`. |
 | `--contamination-min-depth D` | 10 | Per-sample minimum read depth at a site to consider the (sample, site) pair. |
 | `--contamination-min-major-fraction F` | 0.95 | Per-sample minimum observed major-allele fraction to call hom-major. |
 | `--contamination-min-cohort-minor-count N` | 2 | Cohort-summed minimum minor-allele read count for a site to be informative. |
@@ -369,33 +586,37 @@ pseudocounts in Step 4).
 
 ## Cost and parallelism
 
-**Memory** is `O(cohort_size + n_batches × n_allele_classes +
-sites_processed × cohort_size × n_allele_classes_observed)`.
-At the default 10 000 sites and a 1000-sample cohort with ~3
-allele classes per kept tuple, that is ~30 MB of aggregator —
-trivial.
+**Memory** is `O(n_samples + n_batches × n_allele_classes)` —
+the running sufficient statistics from Step 4 and a handful of
+scalar parameters per sample. At a 1000-sample cohort with ~10
+batches and ~3 allele classes, that is on the order of **20–30
+KB** of state regardless of how many sites the side-pass
+processes. There is no per-tuple or per-block buffer to size.
 
 **CPU** is dominated by the multi-way per-position scan over
-`.psp` files (the same cost as Stage 3 minus DUST, except the
-side-pass also stops early once convergence fires — typically
-after a few thousand sites, well before whole-genome scan).
-Step 4's MLE iteration runs on the small accumulated tuples and
-is negligible.
+`.psp` files (the same cost as Stage 3 minus DUST). In
+convergence mode the side-pass stops early once stability fires
+— typically after a few thousand sites, well before whole-
+genome scan. In fixed-N mode it stops at exactly `N` sites. The
+online-EM per-read work (one closed-form `γ` plus four scalar
+adds) is negligible against the `.psp` read cost.
 
 **Parallelism**. The per-position scan parallelises across
 chromosome partitions the same way Stage 1 parallelises across
-samples. Each partition produces partial aggregator state; merge
-at the end. The block-stability check requires reasoning about
-global state, so it runs sequentially over the merged
-aggregator after each partition completes a full block. Cheap.
+samples. Each partition contributes incremental updates to the
+running sufficient statistics; the merge at partition boundaries
+is a scalar-wise sum. The block-stability check (convergence
+mode) runs sequentially over the merged statistics after each
+partition completes a block. Cheap.
 
-For early-stop to work cleanly with partitioned scans, partition
-work is dispatched in genomic-order chunks and the side-pass
-joins partitions in order; once early-stop fires, in-flight
-partitions are cancelled. This gives reproducible results at the
-cost of slightly less parallelism than full-genome processing
-would offer — fine, because the side-pass is cheap relative to
-the main pipeline regardless.
+For early-stop to work cleanly with partitioned scans (both the
+convergence-mode early-stop and the fixed-N-mode exact-stop),
+partition work is dispatched in genomic-order chunks and the
+side-pass joins partitions in order; once the stopping
+criterion fires, in-flight partitions are cancelled. This gives
+reproducible results at the cost of slightly less parallelism
+than full-genome processing would offer — fine, because the
+side-pass is cheap relative to the main pipeline regardless.
 
 ## Hand-off to Stage 6
 
@@ -489,12 +710,15 @@ The trade-off:
 
 1. **Single-sample, no contamination, all-REF cohort.** No
    informative sites (cohort minor-allele check fails everywhere).
-   Side-pass returns `c_s = 0` with provenance "no informative
-   sites".
+   In convergence mode the side-pass exhausts the input without
+   ever updating the running statistics and returns
+   `ContaminationEstimateDidNotConverge` (or, when the cohort
+   has no informative sites at all, a dedicated "no informative
+   sites" provenance variant).
 2. **Two-sample cohort, batch_A contains both, one sample seeded
    with synthetic 3 % contamination from the other.** Side-pass
    recovers `c_s ≈ 0.03` for the contaminated sample within
-   tolerance.
+   tolerance, in convergence mode at the default `1e-3` tolerance.
 3. **Singleton batch.** Sample in batch_solo gets `c_s = 0`
    regardless of input data.
 4. **Below-floor batch.** Two samples in batch_small (floor = 5)
@@ -503,30 +727,60 @@ The trade-off:
    the named samples; unnamed samples still get MLE values.**
 6. **Convergence diagnostics output format.** TSV header and row
    shape match the spec.
+7. **Fixed-N mode hits exactly N sites and returns.** Synthetic
+   cohort with abundant informative sites; pass
+   `--contamination-num-sites 2000`; side-pass processes exactly
+   2000 informative positions, runs no stability check, returns
+   the resulting estimate.
+8. **CLI mutual-exclusivity error.** Passing both
+   `--contamination-stability-tolerance` and
+   `--contamination-num-sites` fails at parse time before any
+   work happens.
+9. **CLI diagnostics-in-fixed-N error.** Passing
+   `--contamination-diagnostics-out` together with
+   `--contamination-num-sites` fails at parse time.
 
 ### Property tests (proptest)
 
 1. **`c_s ∈ [0, 1]` and `q_b` is a simplex** for every cohort
-   shape proptest generates.
+   shape proptest generates, in both modes.
 2. **Permuting samples within a batch does not change `q_b` for
    that batch.**
 3. **Adding more sites to a converged subsample does not move
    `c_s` beyond the tolerance** (i.e. the convergence criterion
-   is consistent with itself).
+   is consistent with itself) — convergence mode.
+4. **Online-EM block-size independence (within tolerance).**
+   Running the side-pass on the same input at two different
+   `--contamination-block-size` values produces `c_s` estimates
+   within `tolerance` of each other once both converge. Probes
+   the block-wise refresh design — the heartbeat rate should
+   change only how often stability is checked, not the estimator's
+   limit.
 
 ### Integration tests
 
-1. **End-to-end with `--contamination-batches` enabled.** A
-   synthetic cohort with known per-sample contamination
-   fractions; side-pass output matches ground truth within
-   tolerance; Stage 6 consumes the output and emits a VCF whose
-   genotype calls match the no-contamination ground-truth more
-   closely than a Stage 6 run with `c_s = 0` would.
-2. **Non-convergence on a deliberately underspecified cohort.**
-   A 4-sample cohort with 1 batch, low-coverage everywhere. The
-   side-pass returns `ContaminationEstimateDidNotConverge` with
-   a sensible recommended next-run cap.
-3. **Round-trip via `--contamination-estimates-out` and
+1. **End-to-end with `--contamination-batches` enabled,
+   convergence mode.** Synthetic cohort with known per-sample
+   contamination fractions; side-pass output matches ground
+   truth within tolerance; Stage 6 consumes the output and
+   emits a VCF whose genotype calls match the no-contamination
+   ground-truth more closely than a Stage 6 run with `c_s = 0`
+   would.
+2. **End-to-end, fixed-N mode.** Same cohort as test 1, with
+   `--contamination-num-sites 5000` instead of the default
+   tolerance. `c_s` estimates from the two modes agree within
+   tolerance.
+3. **Non-convergence on a deliberately underspecified cohort
+   (convergence mode).** A 4-sample cohort with 1 batch,
+   low-coverage everywhere. The side-pass returns
+   `ContaminationEstimateDidNotConverge` with a sensible
+   recommended next-run config.
+4. **Insufficient sites in fixed-N mode.** Same kind of
+   underspecified cohort, but invoked with
+   `--contamination-num-sites 50000`. The side-pass returns
+   `ContaminationInsufficientSites { requested, found,
+   recommendation }`.
+5. **Round-trip via `--contamination-estimates-out` and
    `--contamination-estimates` + `--contamination-source-
    distributions`.** Run 1 produces the artefact; Run 2 loads
    it and skips the side-pass; final VCFs match bit-for-bit.
