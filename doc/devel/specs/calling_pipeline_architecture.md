@@ -32,19 +32,20 @@ design draws on.
 ```
 BAM_i  ──► Stage 1: per-sample pileup ──► sample_i.psp (Stage 2 format) ┐
                                                                           │
-BAM_j  ──► Stage 1: per-sample pileup ──► sample_j.psp (Stage 2 format) ├─► multi-way per-position iterator
+BAM_j  ──► Stage 1: per-sample pileup ──► sample_j.psp (Stage 2 format) ├──► multi-way per-position iterator
                                                                           │             │
-BAM_k  ──► Stage 1: per-sample pileup ──► sample_k.psp (Stage 2 format) ┘             ▼
-                                                                           Stage 3: DUST filter ◄── reference FASTA
-                                                                                        │
-                                                                                        ▼
-                                                                           Stage 4: grouping ──► OverlappingVarGroup stream
-                                                                                                   │
-                                                                                                   ▼
-                                                                           Stage 5: per-group processing (rayon parallel)
-                                                                                                   │
-                                                                                                   ▼
-                                                                           Stage 6: posterior engine ──► multi-sample VCF
+BAM_k  ──► Stage 1: per-sample pileup ──► sample_k.psp (Stage 2 format) ┤             ▼
+                                                                          │  Stage 3: DUST filter ◄── reference FASTA
+                                                                          │             │
+                                                                          │             ▼
+                                                                          │  Stage 4: grouping ──► OverlappingVarGroup stream
+                                                                          │                          │
+                                                                          │                          ▼
+                                                                          │  Stage 5: per-group processing (rayon parallel)
+                                                                          │                          │
+                                                                          │                          ▼
+                                                                          └─► contamination side-pass ──► (c_s, q_b) ──► Stage 6: posterior engine ──► multi-sample VCF
+                                                                              (optional; gated on --contamination-batches)
 ```
 
 Six stages total:
@@ -70,13 +71,26 @@ Six stages total:
   scalars, compound-haplotype consistency via phase chain ids. Groups
   are independent of each other, so Stage 5 runs in parallel across
   groups via rayon.
+- **Contamination side-pass (optional, runs ahead of Stage 6).** When
+  `--contamination-batches` is supplied, a separate pass over the
+  `.psp` files estimates per-sample contamination fractions `c_s` and
+  per-batch contamination-source allele-class distributions `q_b` via
+  a read-level mixture MLE. Bypasses Stages 3–5 entirely. The output
+  is consumed by Stage 6 as frozen inputs. Skipped without
+  `--contamination-batches`; in that case Stage 6 uses `c_s = 0` for
+  every sample. See [contamination_estimation.md](contamination_estimation.md).
 - **Stage 6 — posterior engine.** Runs EM over the merged records and
-  emits the final VCF.
+  emits the final VCF. With contamination enabled, the engine consumes
+  the side-pass's frozen `c_s` and `q_b` in its mixture-likelihood
+  E-step (it does not re-estimate them).
 
-Only Stage 1 touches BAMs. Stages 3–6 operate on the reference FASTA
-and on the `.psp` files alone, which is what makes cohort recall cheap
-and BAM-free. Only Stage 4 is inherently sequential; Stages 1 and 5
-parallelise cleanly (across samples and across groups respectively).
+Only Stage 1 touches BAMs. Stages 3–6 and the optional contamination
+side-pass operate on the `.psp` files (and, for Stage 3 only, on the
+reference FASTA); none of them re-read the BAMs, which is what makes
+cohort recall cheap and BAM-free. Only Stage 4 is inherently
+sequential; Stages 1 and 5 parallelise cleanly (across samples and
+across groups respectively), and the side-pass parallelises across
+chromosome partitions.
 
 ## Configurable parameters
 
@@ -1812,40 +1826,94 @@ generalised to:
 - run under rayon across groups rather than the current
   double-buffered batch-of-1000 arrangement
 
+## Contamination estimation side-pass (optional)
+
+### Purpose
+
+Estimate per-sample contamination fractions `c_s` and per-batch
+contamination-source allele-class distributions `q_b` from raw
+`.psp` data, before Stage 6 runs. Stage 6 consumes both as
+**frozen inputs** to its mixture-likelihood E-step.
+
+### Shape
+
+A separate streaming pass over the `.psp` files (same files
+Stages 3–5 consume) that bypasses the DUST filter, grouping, and
+per-group merger. The pass identifies confidently-homozygous
+(sample, site) pairs from raw observed allele counts and runs a
+joint maximum-likelihood fit on `c_s` and `q_b` under a per-read
+mixture model (the same model VerifyBamID / ContEst use).
+
+The pass is gated on `--contamination-batches`. When unsupplied,
+the pass is skipped, `c_s = 0` for every sample, and Stage 6's
+E-step reduces to the own-DNA likelihood alone. When supplied,
+the output is handed to Stage 6 in memory; no on-disk artefact
+between the two stages by default.
+
+### Why outside Stage 6
+
+`c_s` and `q_b` are global parameters — properties of a sample's
+library and a sequencing batch respectively, not of any single
+record. Estimating them inside Stage 6's per-record EM either
+breaks the streaming shape (a single EM loop over all records),
+needs a multi-pass scratch file (hundreds of GB at cohort
+scale), or pays per-record EM and Stage 4/5 cost on an in-engine
+estimation pass — all heavier than a direct read-level MLE on
+raw `.psp` aggregates. See
+[contamination_estimation.md §"Why a side-pass rather than inside Stage 6"](contamination_estimation.md)
+for the full design comparison; see
+[posterior_engine.md §"Algorithmic alternatives considered"](../implementation_plans/posterior_engine.md)
+for the discarded alternatives.
+
+### Authoritative spec
+
+[contamination_estimation.md](contamination_estimation.md)
+carries the algorithm (informative-site filter, read-level
+mixture MLE, block-stability convergence criterion), the
+parameter list, the hand-off shape, the test strategy, and the
+design rationale. This section is the architecture-level
+overview only.
+
 ## Stage 6 — posterior engine
 
 ### Algorithm
 
-EM over allele frequency, extended with per-batch
-contamination-source distributions, per-sample contamination
-fractions, and per-compound cohort-frequency parameters. The
-baseline algorithm is described in
-[posterior_gt_probs.md](posterior_gt_probs.md); the contamination
-extension is in Stage 5 §"When a read 'not in G' isn't actually an
-error: contamination"; the compound-frequency parameter is the
-prior-side support for the chain-broken-sample path in Stage 5
-§"Compound haplotype consistency".
+EM over allele frequency and per-compound cohort-frequency
+parameters. The baseline algorithm is described in
+[posterior_gt_probs.md](posterior_gt_probs.md); the
+compound-frequency parameter is the prior-side support for the
+chain-broken-sample path in Stage 5 §"Compound haplotype
+consistency". The mixture-likelihood extension (when
+contamination correction is enabled) is in Stage 5 §"When a read
+'not in G' isn't actually an error: contamination".
 
-The contamination machinery (`q_b`, `c_s`, and their associated
-M-steps) is gated on the user supplying
-`--contamination-batches`. Without that input `c_s = 0` for every
-sample, `q_b` is not allocated, and steps 4 and 6 below collapse
-to no-ops. With it, batches below
-`--min-batch-size-for-contamination` (default 5) participate in
-the cohort `p` M-step normally but get `c_s = 0` regardless of the
-EM, and singleton batches are treated as size-below-floor.
+`c_s` (per-sample contamination fraction) and `q_b` (per-batch
+contamination-source allele-class distribution) are **not
+estimated inside this EM**. When `--contamination-batches` is
+supplied, the contamination side-pass produces both ahead of
+Stage 6 (see [contamination_estimation.md](contamination_estimation.md))
+and Stage 6 uses them as frozen inputs to its mixture-likelihood
+E-step. Without `--contamination-batches`, the side-pass is
+skipped, `c_s = 0` for every sample, and the E-step reduces to
+the own-DNA likelihood alone. The side-pass handles
+singleton-batch and below-floor-batch cases (forcing `c_s = 0`
+for the affected samples); Stage 6 just consumes whatever
+vector it is handed.
 
 1. Initialise flat allele frequencies `p`; `f_C` from its
    Dirichlet pseudocount for every chain-anchored compound `C`.
-   When `--contamination-batches` is supplied, also initialise
-   flat `q_b` per batch and `c_s = 0` for every sample.
+   Load frozen `c_s` and `q_b` from the side-pass output (or
+   from `--contamination-estimates` / `--contamination-source-distributions`
+   when the user supplies them directly). When contamination is
+   disabled, set `c_s = 0` for every sample and leave `q_b`
+   unallocated.
 2. **E-step**: for each sample, compute per-genotype posteriors
-   using the mixture likelihood (current `p`, `q_{batch(s)}` and
-   `c_s` if contamination is enabled; otherwise the own-DNA
-   likelihood alone) + the HWE-with-`F` prior (see Stage 5 §"From
-   likelihood to posterior"). `F` is cohort-wide, user-supplied
-   via `--inbreeding`, default `0`. For chain-anchored compound
-   alleles `C`:
+   using the mixture likelihood (current `p`, frozen
+   `q_{batch(s)}` and `c_s` when contamination is enabled;
+   otherwise the own-DNA likelihood alone) + the HWE-with-`F`
+   prior (see Stage 5 §"From likelihood to posterior"). `F` is
+   cohort-wide, user-supplied via `--inbreeding`, default `0`.
+   For chain-anchored compound alleles `C`:
    - chain-evident samples use the chain-based likelihood and
      read `f_C` from the current iterate as their compound prior;
    - chain-broken samples use the constituent-product likelihood
@@ -1859,16 +1927,7 @@ EM, and singleton batches are treated as size-below-floor.
    `--snp-alt-pseudocount` / `--indel-alt-pseudocount`). Rationale
    for Dirichlet over freebayes' Ewens prior is in Stage 5
    §"From likelihood to posterior".
-4. **M-step on `q_b`** (per batch, contamination-enabled only):
-   update each batch's contamination-source distribution from
-   posterior-weighted allele counts across **samples in batch `b`
-   only**, plus a Dirichlet pseudocount (`α_q`, default matches
-   the per-position alt pseudocount, overridable via
-   `--contamination-source-pseudocount`). Skipped entirely when
-   `--contamination-batches` is unset. For singleton batches the
-   step still runs but its output is unused (the affected sample's
-   `c_s` is forced to 0 — see step 6).
-5. **M-step on `f_C`** (one update per chain-anchored compound `C`
+4. **M-step on `f_C`** (one update per chain-anchored compound `C`
    in the cohort): update the compound's frequency from the
    posterior-weighted count of `C`-bearing chromosomes across all
    samples in the group containing `C`, plus a Dirichlet
@@ -1880,18 +1939,9 @@ EM, and singleton batches are treated as size-below-floor.
    chain-evident samples (with sharper per-read likelihoods)
    dominate when present and chain-broken samples lean on the
    cohort estimate they helped produce only weakly.
-6. **M-step on `c_s`** (per sample, contamination-enabled only):
-   1D maximisation per sample of the mixture likelihood against
-   `q_{batch(s)}` and the sample's soft-assigned genotypes,
-   driven mainly by odd reads at confidently-non-heterozygous
-   sites. Held at `c_s = 0` (M-step skipped) for samples in
-   singleton batches and for samples in batches below
-   `--min-batch-size-for-contamination`. Also skipped when the
-   user has supplied a fixed `c_s` for the sample via
-   `--contamination-estimates`.
-7. Iterate until convergence. Typically 3–5 rounds.
-8. QUAL = Phred of `Π_s P(hom-ref)_s`.
-9. Assign GT = argmax genotype. GQ = Phred of `1 − P(best_genotype)`.
+5. Iterate until convergence. Typically 3–5 rounds.
+6. QUAL = Phred of `Π_s P(hom-ref)_s`.
+7. Assign GT = argmax genotype. GQ = Phred of `1 − P(best_genotype)`.
 
 ### Why EM, not combo-search marginalisation
 
@@ -2065,6 +2115,12 @@ every record it does emit.
   describe the two statistical approaches to posterior calculation. This
   architecture adopts the GATK-style EM approach (described in the first)
   for scalability reasons argued in the second.
+- [contamination_estimation.md](contamination_estimation.md) is the
+  authoritative spec for the optional contamination side-pass that
+  estimates `c_s` and `q_b` from raw `.psp` data ahead of Stage 6. The
+  side-pass replaces what would otherwise have been in-engine M-steps
+  on those parameters; the Stage 6 section above describes the
+  consumer-side change.
 - [snp_calling_from_bam.md](../feature_implementation_plans/snp_calling_from_bam.md)
   is an earlier sketch of this same pipeline with different emphasis.
   Open questions raised there (quality assignment for indels, use of
