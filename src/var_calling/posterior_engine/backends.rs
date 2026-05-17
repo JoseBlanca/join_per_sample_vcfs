@@ -52,6 +52,33 @@ pub trait MathBackend: Sync {
 
     /// Exponential. Inputs propagate IEEE 754 semantics directly.
     fn exp(&self, x: f64) -> f64;
+
+    /// Lane-of-4 natural log. Default falls back to four scalar `ln`
+    /// calls; SIMD backends override with a lane-parallel
+    /// implementation. The engine routes its hottest log/exp calls
+    /// through `ln_x4` / `exp_x4` only on the
+    /// [`Self::HAS_LANE_4`]-true code path.
+    #[inline]
+    fn ln_x4(&self, x: [f64; 4]) -> [f64; 4] {
+        [self.ln(x[0]), self.ln(x[1]), self.ln(x[2]), self.ln(x[3])]
+    }
+
+    /// Lane-of-4 exponential. Default falls back to four scalar
+    /// calls; SIMD backends override.
+    #[inline]
+    fn exp_x4(&self, x: [f64; 4]) -> [f64; 4] {
+        [self.exp(x[0]), self.exp(x[1]), self.exp(x[2]), self.exp(x[3])]
+    }
+
+    /// Whether this backend's lane methods are SIMD-accelerated and
+    /// the engine should pick its lane-batched `e_step` body.
+    /// Defaults to `false`; only [`InterpUnivariateSimdMath`]
+    /// currently overrides.
+    ///
+    /// Resolved at monomorphisation time, so the engine's
+    /// `if M::HAS_LANE_4 { … } else { … }` dispatch compiles to a
+    /// dead-code-elimination of the unused branch.
+    const HAS_LANE_4: bool = false;
 }
 
 /// Bit-identical baseline. Delegates `ln` / `exp` to `f64::ln` /
@@ -100,6 +127,45 @@ impl MathBackend for InterpUnivariateMath {
     fn exp(&self, x: f64) -> f64 {
         super::interp::exp_approx(x)
     }
+}
+
+/// SIMD-accelerated interpolated math. Same approximation contract as
+/// [`InterpUnivariateMath`] for the scalar `ln` / `exp` methods, plus
+/// genuine lane-of-4 implementations for `ln_x4` / `exp_x4` that the
+/// engine uses on its hot path when this backend is selected.
+///
+/// On x86_64 this lowers to AVX2 (via `wide`'s `f64x4`); on aarch64
+/// it lowers to two NEON `float64x2_t` pairs. Both paths share the
+/// same source.
+///
+/// **API stability.** Same caveat as [`InterpUnivariateMath`] —
+/// internals (lane width, table layout) may change without a major
+/// version bump.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InterpUnivariateSimdMath;
+
+impl MathBackend for InterpUnivariateSimdMath {
+    #[inline]
+    fn ln(&self, x: f64) -> f64 {
+        super::interp::ln_approx(x)
+    }
+
+    #[inline]
+    fn exp(&self, x: f64) -> f64 {
+        super::interp::exp_approx(x)
+    }
+
+    #[inline]
+    fn ln_x4(&self, x: [f64; 4]) -> [f64; 4] {
+        super::interp::ln_approx_x4(wide::f64x4::from(x)).to_array()
+    }
+
+    #[inline]
+    fn exp_x4(&self, x: [f64; 4]) -> [f64; 4] {
+        super::interp::exp_approx_x4(wide::f64x4::from(x)).to_array()
+    }
+
+    const HAS_LANE_4: bool = true;
 }
 
 #[cfg(test)]

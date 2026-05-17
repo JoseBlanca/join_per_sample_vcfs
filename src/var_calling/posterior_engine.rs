@@ -2758,7 +2758,7 @@ mod tests {
     // implementation plan.
     // -----------------------------------------------------------------
 
-    use super::backends::{ExactMath, InterpUnivariateMath, MathBackend};
+    use super::backends::{ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend};
 
     const POSTERIOR_MAX_TOL: f64 = 1e-4;
     const POSTERIOR_P99_TOL: f64 = 5e-5;
@@ -3215,6 +3215,48 @@ mod tests {
     fn interp_univariate_clears_approximate_parity_budget() {
         let report = build_accuracy_battery(InterpUnivariateMath);
         eprintln!("InterpUnivariateMath accuracy report:\n{report:#?}");
+
+        assert!(
+            report.posterior_error.max <= POSTERIOR_MAX_TOL,
+            "posterior_error.max = {} > {}",
+            report.posterior_error.max,
+            POSTERIOR_MAX_TOL,
+        );
+        assert!(
+            report.posterior_error.p99 <= POSTERIOR_P99_TOL,
+            "posterior_error.p99 = {} > {}",
+            report.posterior_error.p99,
+            POSTERIOR_P99_TOL,
+        );
+        assert!(
+            report.phred_error.max <= PHRED_MAX_TOL,
+            "phred_error.max = {} > {}",
+            report.phred_error.max,
+            PHRED_MAX_TOL,
+        );
+        assert!(
+            report.phred_error.p99 <= PHRED_P99_TOL,
+            "phred_error.p99 = {} > {}",
+            report.phred_error.p99,
+            PHRED_P99_TOL,
+        );
+        assert!(
+            report.allele_freq_error.max <= ALLELE_FREQ_MAX_TOL,
+            "allele_freq_error.max = {} > {}",
+            report.allele_freq_error.max,
+            ALLELE_FREQ_MAX_TOL,
+        );
+        assert_eq!(
+            report.argmax_mismatch_above_margin, 0,
+            "{} samples picked a different best genotype with margin >= {}",
+            report.argmax_mismatch_above_margin, BORDERLINE_MARGIN,
+        );
+    }
+
+    #[test]
+    fn interp_univariate_simd_clears_approximate_parity_budget() {
+        let report = build_accuracy_battery(InterpUnivariateSimdMath);
+        eprintln!("InterpUnivariateSimdMath accuracy report:\n{report:#?}");
 
         assert!(
             report.posterior_error.max <= POSTERIOR_MAX_TOL,
