@@ -1,6 +1,6 @@
 //! Variant-calling pipeline end-to-end throughput.
 //!
-//! Three iterator stages, three bench groups:
+//! Four iterator stages, four bench groups:
 //!
 //! - `var_calling_merger/*` — `PerPositionMerger` (Stage 3) k-way merge
 //!   over per-sample synthetic iterators. Drives the inner linear-scan
@@ -12,6 +12,10 @@
 //!   allele unification + likelihood reconstruction. Drives compound
 //!   detection, scalar projection, the closed-form likelihood, and the
 //!   rayon-parallel batch path.
+//! - `var_calling_posterior_engine/*` — `PosteriorEngine` (Stage 6)
+//!   EM-with-HWE prior, optional contamination mixture pre-pass.
+//!   Inputs are pre-merged `MergedRecord` vectors built outside the
+//!   timed region so the bench measures the engine in isolation.
 //!
 //! Workloads are synthetic in-memory `Vec`s so each `cargo bench` run
 //! is reproducible. Inputs are built outside the timed regions.
@@ -31,11 +35,15 @@ use merge_per_sample_vcfs::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, ChainId, PileupRecord, RefSeqFetcher,
 };
 use merge_per_sample_vcfs::per_sample_pileup::psp::PspReadError;
+use merge_per_sample_vcfs::var_calling::contamination_estimation::ContaminationEstimates;
 use merge_per_sample_vcfs::var_calling::per_group_merger::{
-    PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
+    MergedRecord, PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
 };
 use merge_per_sample_vcfs::var_calling::per_position_merger::{
     PerPositionMerger, PerPositionMergerError, PerPositionPileups,
+};
+use merge_per_sample_vcfs::var_calling::posterior_engine::{
+    PosteriorEngine, PosteriorEngineConfig,
 };
 use merge_per_sample_vcfs::var_calling::variant_grouping::{
     GrouperConfig, OverlappingVariantGroup, VariantGrouper,
@@ -607,10 +615,147 @@ fn bench_per_group_merger(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------
+// posterior_engine benches (Stage 6)
+// ---------------------------------------------------------------------
+
+/// Drive `PerGroupMerger` to completion and return the collected
+/// `MergedRecord` stream. Done **once per fixture**, outside any timed
+/// region — Stage 6's per-record cost is what we want to measure, not
+/// the merger's.
+fn pre_merge(
+    groups: Vec<OverlappingVariantGroup>,
+    fetcher: SharedRefFetcher,
+    merger_config: PerGroupMergerConfig,
+) -> Vec<MergedRecord> {
+    PerGroupMerger::with_config(groups.into_iter().map(Ok), fetcher, merger_config)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("merger fixture produced an error")
+}
+
+/// Representative single-batch contamination estimates: every sample
+/// belongs to batch 0, `c_s = 3 %` for everyone, and the contaminant
+/// source distribution `q_b` is `[0.6 REF, 0.3 SnpAlt, 0.1 IndelAlt]`.
+/// Modest but visible — exercises the mixture pre-pass without
+/// driving every cell to the `mix <= 0` defensive branch.
+fn representative_contamination(n_samples: usize) -> ContaminationEstimates {
+    let c_s_per_sample = vec![Some(0.03_f64); n_samples];
+    let q_b_per_batch = vec![[0.6_f64, 0.3, 0.1]];
+    let sample_to_batch = vec![0_usize; n_samples];
+    ContaminationEstimates::from_user_supplied(c_s_per_sample, q_b_per_batch, sample_to_batch)
+        .expect("representative_contamination inputs are valid")
+}
+
+fn bench_posterior_engine(c: &mut Criterion) {
+    let mut group = c.benchmark_group("var_calling_posterior_engine");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    const N_SAMPLES: usize = 64;
+    const N_GROUPS: u32 = 10_000;
+    const SPACING: u32 = 10;
+
+    group.throughput(Throughput::Elements(N_GROUPS as u64));
+
+    // --- biallelic SNP, no contamination (dominant production case) ---
+    let (groups_snp, ref_seq_snp) = build_biallelic_snp_groups(N_GROUPS, N_SAMPLES, SPACING);
+    let fetcher_snp = shared_fetcher(ref_seq_snp.clone(), 100);
+    let merged_diploid = pre_merge(
+        groups_snp.clone(),
+        Arc::clone(&fetcher_snp),
+        PerGroupMergerConfig::default(),
+    );
+    let config_no_contam = PosteriorEngineConfig::with_project_defaults();
+    group.bench_function(
+        format!("biallelic_snp_no_contam_{N_SAMPLES}_samples_{N_GROUPS}_groups"),
+        |b| {
+            b.iter_batched(
+                || merged_diploid.clone(),
+                |records| {
+                    let engine = PosteriorEngine::with_config(
+                        records.into_iter().map(Ok),
+                        config_no_contam.clone(),
+                    );
+                    let mut count: u64 = 0;
+                    for item in engine {
+                        let r = item.expect("posterior fixture produced an error");
+                        black_box(&r);
+                        count += 1;
+                    }
+                    black_box(count)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
+
+    // --- biallelic SNP, contamination on (exercises mixture pre-pass) ---
+    let mut config_contam = PosteriorEngineConfig::with_project_defaults();
+    config_contam.contamination = Some(representative_contamination(N_SAMPLES));
+    group.bench_function(
+        format!("biallelic_snp_contam_on_{N_SAMPLES}_samples_{N_GROUPS}_groups"),
+        |b| {
+            b.iter_batched(
+                || merged_diploid.clone(),
+                |records| {
+                    let engine = PosteriorEngine::with_config(
+                        records.into_iter().map(Ok),
+                        config_contam.clone(),
+                    );
+                    let mut count: u64 = 0;
+                    for item in engine {
+                        let r = item.expect("posterior fixture produced an error");
+                        black_box(&r);
+                        count += 1;
+                    }
+                    black_box(count)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
+
+    // --- polyploid (ploidy = 3) biallelic SNP, no contamination ---
+    // Same upstream groups, merger configured for triploid. Exercises
+    // the polyploid path that the upcoming diploid optimisations
+    // explicitly leave unchanged.
+    let mut triploid_merger_config = PerGroupMergerConfig::default();
+    triploid_merger_config.ploidy = 3;
+    let merged_triploid = pre_merge(groups_snp, Arc::clone(&fetcher_snp), triploid_merger_config);
+    group.bench_function(
+        format!("biallelic_snp_ploidy_3_{N_SAMPLES}_samples_{N_GROUPS}_groups"),
+        |b| {
+            b.iter_batched(
+                || merged_triploid.clone(),
+                |records| {
+                    let engine = PosteriorEngine::with_config(
+                        records.into_iter().map(Ok),
+                        config_no_contam.clone(),
+                    );
+                    let mut count: u64 = 0;
+                    for item in engine {
+                        let r = item.expect("posterior fixture produced an error");
+                        black_box(&r);
+                        count += 1;
+                    }
+                    black_box(count)
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_per_position_merger, bench_variant_grouper, bench_per_group_merger
+    targets =
+        bench_per_position_merger,
+        bench_variant_grouper,
+        bench_per_group_merger,
+        bench_posterior_engine
 }
 
 criterion_main!(benches);
