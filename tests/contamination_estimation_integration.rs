@@ -121,7 +121,7 @@ fn merged_record(
 /// Build a side-pass config in fixed-N mode with the project defaults
 /// adjusted for the small synthetic cohorts the integration tests use
 /// (the production floor of 5 samples/batch would suppress every sample).
-fn fixed_n_config(num_sites: u32) -> ContaminationEstimationConfig {
+fn small_cohort_fixed_n_config(num_sites: u32) -> ContaminationEstimationConfig {
     let mut cfg = ContaminationEstimationConfig::with_project_defaults();
     cfg.stopping_mode = StoppingMode::FixedSites { num_sites };
     cfg.block_size = 500;
@@ -138,7 +138,7 @@ fn side_pass_recovers_three_percent_contamination_end_to_end() {
         3,
         vec![0, 0, 0],
         1,
-        fixed_n_config(3000),
+        small_cohort_fixed_n_config(3000),
     )
     .expect("side-pass should succeed");
 
@@ -154,7 +154,7 @@ fn side_pass_recovers_three_percent_contamination_end_to_end() {
         estimates.source
     );
 
-    let c_s_0 = estimates.c_s_per_sample[0].expect("not floored");
+    let c_s_0 = estimates.effective_c_s(0);
     assert!(
         (c_s_0 - 0.03).abs() < 0.02,
         "c_s for sample 0 = {}; expected ~0.03",
@@ -164,22 +164,19 @@ fn side_pass_recovers_three_percent_contamination_end_to_end() {
 
 #[test]
 fn side_pass_output_feeds_stage_6_without_error() {
-    // The end-to-end consumer test: run the side-pass, then plug the
-    // ContaminationEstimates into a PosteriorEngine and confirm
-    // emission succeeds. The mixture branch in the engine is
-    // exercised here for the first time outside the engine's own
-    // module tests.
+    // The original "no error" smoke test, kept as-is: run the side-
+    // pass, plug the ContaminationEstimates into a PosteriorEngine,
+    // confirm emission succeeds and the posteriors are well-shaped.
     let stream = synth_three_sample_stream(2000, 50, 0.02);
     let estimates = estimate_contamination(
         stream.into_iter(),
         3,
         vec![0, 0, 0],
         1,
-        fixed_n_config(1500),
+        small_cohort_fixed_n_config(1500),
     )
     .expect("side-pass should succeed");
 
-    // Build a synthetic 3-sample MergedRecord matching the cohort.
     let alleles_seqs = vec![&b"A"[..], &b"C"[..]];
     let scalars_per_sample = vec![
         vec![
@@ -188,12 +185,8 @@ fn side_pass_output_feeds_stage_6_without_error() {
         ];
         3
     ];
-    // Pre-baked log-likelihoods for the EM's fallback path; the
-    // mixture branch recomputes them from scalars regardless, so any
-    // shape-correct stub suffices.
     let n_genotypes = genotype_order(2, 2).len();
     let lls_per_sample = vec![vec![0.0_f64; n_genotypes]; 3];
-
     let record = merged_record(0, 100, alleles_seqs, 2, scalars_per_sample, lls_per_sample);
 
     let mut config = PosteriorEngineConfig::default();
@@ -202,7 +195,6 @@ fn side_pass_output_feeds_stage_6_without_error() {
     let outputs: Vec<_> = PosteriorEngine::with_config(upstream, config).collect();
     assert_eq!(outputs.len(), 1);
     let pr: &PosteriorRecord = outputs[0].as_ref().expect("engine should emit");
-    // Posteriors row sums to 1 for every sample.
     for s in 0..pr.n_samples {
         let row_sum: f64 = pr.posteriors_row(s).iter().sum();
         assert!(
@@ -215,6 +207,88 @@ fn side_pass_output_feeds_stage_6_without_error() {
 }
 
 #[test]
+fn mixture_branch_shifts_posteriors_relative_to_no_contamination_baseline() {
+    // B2 main assertion: feeding the engine a `ContaminationEstimates`
+    // with a non-trivial `c_s` produces *different* posteriors than
+    // the no-contamination path on the same record. A regression that
+    // silently bypassed `compute_mixture_log_likelihoods` (e.g. a
+    // wiring change making `effective_c_s` return 0) would make
+    // these byte-identical. Uses `from_user_supplied` directly to
+    // decouple the test from the side-pass's accuracy and pick a
+    // c_s large enough to make the EM shift unambiguous.
+    let estimates =
+        ContaminationEstimates::from_user_supplied(vec![Some(0.5)], vec![[0.5, 0.5, 0.0]], vec![0])
+            .expect("valid inputs");
+
+    // Sample with very ambiguous data: 5 REF + 5 ALT reads. Without
+    // contamination this looks like a clean heterozygote; with c_s=0.5
+    // (every read 50/50 own-vs-contam) the mixture posterior is
+    // visibly different. Small read count + lowered REF pseudocount
+    // ensures the prior doesn't drown out the likelihood shift.
+    let alleles_seqs = vec![&b"A"[..], &b"C"[..]];
+    let scalars_per_sample = vec![vec![
+        AlleleSupportStats::new(5, 0.001_f64.ln() * 5.0, 2, 2, 0),
+        AlleleSupportStats::new(5, 0.001_f64.ln() * 5.0, 2, 2, 0),
+    ]];
+    // Heterozygote-leaning baseline lls (only used in the `c_s=0`
+    // run; the mixture path recomputes from scalars).
+    let lls_per_sample = vec![vec![-3.0_f64, 0.0, -3.0]];
+
+    let record_contam = merged_record(
+        0,
+        100,
+        alleles_seqs.clone(),
+        2,
+        scalars_per_sample.clone(),
+        lls_per_sample.clone(),
+    );
+    let record_baseline =
+        merged_record(0, 100, alleles_seqs, 2, scalars_per_sample, lls_per_sample);
+
+    let mut config_contam = PosteriorEngineConfig::default();
+    config_contam.contamination = Some(estimates);
+    config_contam.ref_pseudocount = 0.1; // don't let pseudocount swamp 10-read signal
+    let pr_contam: PosteriorRecord = PosteriorEngine::with_config(
+        std::iter::once(Ok::<MergedRecord, PerGroupMergerError>(record_contam)),
+        config_contam,
+    )
+    .next()
+    .unwrap()
+    .expect("engine should emit (contam)");
+
+    let mut config_baseline = PosteriorEngineConfig::default();
+    config_baseline.ref_pseudocount = 0.1;
+    let pr_baseline: PosteriorRecord = PosteriorEngine::with_config(
+        std::iter::once(Ok::<MergedRecord, PerGroupMergerError>(record_baseline)),
+        config_baseline,
+    )
+    .next()
+    .unwrap()
+    .expect("engine should emit (baseline)");
+
+    let mut any_diff = false;
+    for s in 0..pr_contam.n_samples {
+        for (a, b) in pr_contam
+            .posteriors_row(s)
+            .iter()
+            .zip(pr_baseline.posteriors_row(s).iter())
+        {
+            if (a - b).abs() > 1e-6 {
+                any_diff = true;
+            }
+        }
+    }
+    assert!(
+        any_diff,
+        "mixture branch produced output identical to c_s=0 path — \
+         did `compute_mixture_log_likelihoods` get silently bypassed? \
+         contam = {:?}, baseline = {:?}",
+        pr_contam.posteriors_row(0),
+        pr_baseline.posteriors_row(0),
+    );
+}
+
+#[test]
 fn fixed_n_mode_returns_insufficient_sites_with_recommendation() {
     let stream = synth_three_sample_stream(100, 50, 0.02);
     let result = estimate_contamination(
@@ -222,7 +296,7 @@ fn fixed_n_mode_returns_insufficient_sites_with_recommendation() {
         3,
         vec![0, 0, 0],
         1,
-        fixed_n_config(10_000),
+        small_cohort_fixed_n_config(10_000),
     );
     match result {
         Err(ContaminationEstimationError::InsufficientSites {
@@ -275,7 +349,8 @@ fn user_supplied_estimates_round_trip_via_zero_constructor() {
     >(record_baseline)))
     .collect();
     let mut config = PosteriorEngineConfig::default();
-    config.contamination = Some(ContaminationEstimates::zero(2, vec![0, 0], 1));
+    config.contamination =
+        Some(ContaminationEstimates::zero(2, vec![0, 0], 1).expect("valid inputs"));
     let mirrored: Vec<_> = PosteriorEngine::with_config(
         std::iter::once(Ok::<MergedRecord, PerGroupMergerError>(record_zero)),
         config,

@@ -86,7 +86,13 @@ pub const DEFAULT_MIN_BATCH_SIZE_FOR_CONTAMINATION: u32 = 5;
 /// per the spec rather than 0 so the first block's `γ_r` values are
 /// computed against a plausible (rather than degenerate) parameter
 /// snapshot.
-pub const DEFAULT_CS_INIT: f64 = 0.02;
+pub const DEFAULT_C_S_INIT: f64 = 0.02;
+
+/// Initial per-batch `q_b` allele-class prior — uniform across the
+/// three classes. The first block's mixture denominator is
+/// well-defined for every class before any reads contribute; later
+/// blocks refresh from the running sufficient statistics.
+pub const DEFAULT_Q_B_INIT_PER_CLASS: f64 = 1.0 / N_ALLELE_CLASSES as f64;
 
 /// Default Dirichlet pseudocount on REF reads for the `q_b` update.
 /// Mirrors the posterior engine's REF pseudocount; the side-pass
@@ -209,13 +215,21 @@ pub struct ContaminationEstimationConfig {
     pub snp_alt_pseudocount: f64,
     /// Dirichlet pseudocount on indel-alt reads in the `q_b` update.
     pub indel_alt_pseudocount: f64,
+    /// Initial per-sample `c_s` seeded into the first block's frozen
+    /// snapshot before any reads contribute. The first block's `γ_r`
+    /// values are computed against this prior; later blocks refresh
+    /// from the running sufficient statistics. Defaults to
+    /// [`DEFAULT_C_S_INIT`].
+    pub c_s_init: f64,
+    /// Initial per-batch `q_b` allele-class prior (one shared value
+    /// per class) seeded into the first block's frozen snapshot.
+    /// Defaults to [`DEFAULT_Q_B_INIT_PER_CLASS`] (uniform).
+    pub q_b_init_per_class: f64,
 }
 
-impl Default for ContaminationEstimationConfig {
-    fn default() -> Self {
-        Self::with_project_defaults()
-    }
-}
+// M12: `Default` impl removed deliberately — every call site must
+// pick `with_project_defaults()` explicitly so behavior-affecting
+// defaults are visible at construction.
 
 impl ContaminationEstimationConfig {
     /// Construct the side-pass config with the project defaults
@@ -232,6 +246,8 @@ impl ContaminationEstimationConfig {
             ref_pseudocount: DEFAULT_REF_PSEUDOCOUNT,
             snp_alt_pseudocount: DEFAULT_SNP_ALT_PSEUDOCOUNT,
             indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
+            c_s_init: DEFAULT_C_S_INIT,
+            q_b_init_per_class: DEFAULT_Q_B_INIT_PER_CLASS,
         }
     }
 }
@@ -261,22 +277,29 @@ pub enum ContaminationEstimateSource {
 /// Output of the side-pass. Consumed by Stage 6 as a frozen input via
 /// [`PosteriorEngineConfig::contamination`].
 ///
+/// Fields are `pub(crate)` rather than `pub` to enforce the
+/// accessor-only contract: callers outside the crate must use
+/// [`Self::effective_c_s`] and [`Self::q_b_for_sample`] rather than
+/// indexing the raw vectors. The accessors collapse the
+/// floored-sample `None` to `0.0`; raw indexing would bypass that
+/// contract and could panic on a malformed `sample_to_batch`.
+///
 /// [`PosteriorEngineConfig::contamination`]: crate::var_calling::posterior_engine::PosteriorEngineConfig::contamination
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ContaminationEstimates {
     /// `c_s` per cohort-sample-idx. `None` for samples whose batch is
     /// singleton or below-floor — Stage 6 reads `None` as `c_s = 0`.
-    pub c_s_per_sample: Vec<Option<f64>>,
+    pub(crate) c_s_per_sample: Vec<Option<f64>>,
     /// `q_b` per batch-idx. Each entry is a probability vector over
     /// [`AlleleClass`] indices. Singleton / below-floor batches carry
     /// a zero vector (unused — the samples in those batches have
     /// `c_s = None`).
-    pub q_b_per_batch: Vec<[f64; N_ALLELE_CLASSES]>,
+    pub(crate) q_b_per_batch: Vec<[f64; N_ALLELE_CLASSES]>,
     /// Cohort-sample-idx → batch-idx mapping, as supplied at
     /// construction.
-    pub sample_to_batch: Vec<usize>,
-    /// Provenance.
+    pub(crate) sample_to_batch: Vec<usize>,
+    /// Provenance — readable from outside the crate for telemetry.
     pub source: ContaminationEstimateSource,
 }
 
@@ -285,34 +308,82 @@ impl ContaminationEstimates {
     /// to `c_s = 0`), every batch has a zero `q_b` vector. Used by
     /// Stage 6 callers that want to take the contamination-aware code
     /// path with a no-op estimate.
-    pub fn zero(n_samples: usize, sample_to_batch: Vec<usize>, n_batches: usize) -> Self {
-        debug_assert_eq!(sample_to_batch.len(), n_samples);
-        Self {
+    ///
+    /// Returns `Err(SampleToBatchLengthMismatch)` if `sample_to_batch.len()
+    /// != n_samples`, or `Err(BatchIndexOutOfRange)` if any
+    /// `sample_to_batch[s] >= n_batches`. The validation is at runtime
+    /// (not `debug_assert!`) because the constructor is on the public-API
+    /// CLI ingestion path and silent release-mode acceptance of
+    /// misaligned input would propagate to Stage 6's hot loop.
+    pub fn zero(
+        n_samples: usize,
+        sample_to_batch: Vec<usize>,
+        n_batches: usize,
+    ) -> Result<Self, ContaminationEstimationError> {
+        validate_sample_to_batch(&sample_to_batch, n_samples, n_batches)?;
+        Ok(Self {
             c_s_per_sample: vec![None; n_samples],
             q_b_per_batch: vec![[0.0; N_ALLELE_CLASSES]; n_batches],
             sample_to_batch,
             source: ContaminationEstimateSource::Disabled,
-        }
+        })
     }
 
     /// Build from user-supplied `c_s` values (one per sample) and
-    /// optional user-supplied `q_b` vectors. The provenance is
-    /// [`ContaminationEstimateSource::UserSupplied`].
+    /// user-supplied `q_b` vectors. Validates every input fully — see
+    /// the `Err` variants below for the exact contract.
     ///
     /// Used by the CLI path
     /// `--contamination-estimates`/`--contamination-source-distributions`
     /// to skip the side-pass entirely.
+    ///
+    /// Returns:
+    /// - [`ContaminationEstimationError::SampleToBatchLengthMismatch`]
+    ///   if `c_s_per_sample.len() != sample_to_batch.len()`.
+    /// - [`ContaminationEstimationError::BatchIndexOutOfRange`]
+    ///   if any `sample_to_batch[s] >= q_b_per_batch.len()`.
+    /// - [`ContaminationEstimationError::CsOutOfRange`]
+    ///   if any `Some(c)` is not finite or not in `[0, 1]`.
+    /// - [`ContaminationEstimationError::QbNotSimplex`]
+    ///   if any `q_b_per_batch[b]` does not sum to ~1 (and is not the
+    ///   explicit all-zero vector used to mark a floored batch).
+    /// - [`ContaminationEstimationError::QbEntryOutOfRange`]
+    ///   if any `q_b_per_batch[b][a]` is not finite or not in `[0, 1]`.
     pub fn from_user_supplied(
         c_s_per_sample: Vec<Option<f64>>,
         q_b_per_batch: Vec<[f64; N_ALLELE_CLASSES]>,
         sample_to_batch: Vec<usize>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ContaminationEstimationError> {
+        validate_sample_to_batch(&sample_to_batch, c_s_per_sample.len(), q_b_per_batch.len())?;
+        for (sample_idx, c_opt) in c_s_per_sample.iter().enumerate() {
+            if let Some(&value) = c_opt.as_ref()
+                && !(value.is_finite() && (0.0..=1.0).contains(&value))
+            {
+                return Err(ContaminationEstimationError::CsOutOfRange { sample_idx, value });
+            }
+        }
+        for (batch_idx, row) in q_b_per_batch.iter().enumerate() {
+            let all_zero = row.iter().all(|v| *v == 0.0);
+            let sum: f64 = row.iter().sum();
+            if !all_zero && (sum - 1.0).abs() > 1e-6 {
+                return Err(ContaminationEstimationError::QbNotSimplex { batch_idx, sum });
+            }
+            for (class_idx, &value) in row.iter().enumerate() {
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(ContaminationEstimationError::QbEntryOutOfRange {
+                        batch_idx,
+                        class_idx,
+                        value,
+                    });
+                }
+            }
+        }
+        Ok(Self {
             c_s_per_sample,
             q_b_per_batch,
             sample_to_batch,
             source: ContaminationEstimateSource::UserSupplied,
-        }
+        })
     }
 
     /// Effective `c_s` for a sample — `0.0` whenever
@@ -335,8 +406,17 @@ impl ContaminationEstimates {
 /// optional concrete `--contamination-num-sites` value the user can
 /// pass to recover.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NextRunRecommendation {
+    /// Pre-rendered, user-facing English summary suitable for direct
+    /// display. Reads e.g. `"Recommended next run: relax
+    /// --contamination-stability-tolerance, …"`.
     pub message: String,
+    /// Concrete suggested `--contamination-num-sites` value when the
+    /// side-pass can extrapolate one (typically: under the expected
+    /// MLE scaling `delta ∝ N^(−1/2)`, the N at which the observed
+    /// delta would drop to tolerance). `None` when no extrapolation
+    /// is possible (zero / non-finite delta).
     pub suggested_num_sites: Option<u32>,
 }
 
@@ -352,9 +432,16 @@ impl fmt::Display for NextRunRecommendation {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ContaminationEstimationError {
-    /// Upstream merger / reader error.
-    #[error("upstream merger: {0}")]
-    Upstream(#[from] PerPositionMergerError),
+    /// Upstream merger / reader error, with the side-pass's own
+    /// progress context (`sites_processed`) so the user can
+    /// distinguish a transient mid-stream failure from a fatal
+    /// header-mismatch on the first record.
+    #[error("upstream merger failed after {sites_processed} informative sites")]
+    Upstream {
+        sites_processed: u32,
+        #[source]
+        source: PerPositionMergerError,
+    },
 
     /// Convergence mode, upstream exhausted before convergence fired.
     #[error(
@@ -386,11 +473,92 @@ pub enum ContaminationEstimationError {
         recommendation: NextRunRecommendation,
     },
 
-    /// Caller-side input violates an invariant — e.g. `sample_to_batch`
-    /// length doesn't match the cohort size, or a `batch_idx` is out
-    /// of range.
-    #[error("bad input: {0}")]
-    BadInput(String),
+    /// `sample_to_batch.len()` does not match the cohort size declared
+    /// elsewhere on the call (e.g. `n_samples` argument to
+    /// [`estimate_contamination`], or `c_s_per_sample.len()` on
+    /// [`ContaminationEstimates::from_user_supplied`]).
+    #[error("sample_to_batch length {got} does not match expected cohort size {expected}")]
+    SampleToBatchLengthMismatch { expected: usize, got: usize },
+
+    /// `sample_to_batch[s]` references a `batch_idx` outside the
+    /// declared `n_batches` range (or the supplied
+    /// `q_b_per_batch.len()` on
+    /// [`ContaminationEstimates::from_user_supplied`]).
+    #[error("sample_to_batch contains batch_idx {batch_idx} >= n_batches {n_batches}")]
+    BatchIndexOutOfRange { batch_idx: usize, n_batches: usize },
+
+    /// Config knob `block_size` was set to 0; the side-pass needs a
+    /// strictly positive heartbeat to make progress.
+    #[error("contamination block_size must be > 0")]
+    ZeroBlockSize,
+
+    /// Config knob `min_batch_size_for_contamination` was set below
+    /// the inherent floor of 2. Singletons are always floored
+    /// (`c_s` and `q_b` are unidentifiable in a batch of one), so any
+    /// value below 2 is meaningless. The CLI translates the
+    /// user-supplied value into this error rather than silently
+    /// coercing.
+    #[error("min_batch_size_for_contamination = {got} below the inherent floor of 2")]
+    MinBatchSizeBelowFloor { got: u32 },
+
+    /// Config knob `min_depth` was set to 0; the per-sample hom-major
+    /// call divides by depth, so 0 admits empty records.
+    #[error("min_depth must be >= 1")]
+    ZeroMinDepth,
+
+    /// A user-supplied `c_s` value (via
+    /// [`ContaminationEstimates::from_user_supplied`]) is not a
+    /// finite number in `[0, 1]`.
+    #[error("c_s_per_sample[{sample_idx}] = {value} is not a finite value in [0, 1]")]
+    CsOutOfRange { sample_idx: usize, value: f64 },
+
+    /// A user-supplied `q_b` row is not a probability simplex (does
+    /// not sum to ~1 and is not the explicit floored-zero vector).
+    #[error(
+        "q_b_per_batch[{batch_idx}] sums to {sum}; expected 1.0 within 1e-6 \
+         (or all zeros for floored batches)"
+    )]
+    QbNotSimplex { batch_idx: usize, sum: f64 },
+
+    /// A user-supplied `q_b` entry is not a finite probability in
+    /// `[0, 1]`.
+    #[error("q_b_per_batch[{batch_idx}][{class_idx}] = {value} is not a finite value in [0, 1]")]
+    QbEntryOutOfRange {
+        batch_idx: usize,
+        class_idx: usize,
+        value: f64,
+    },
+}
+
+// ---------------------------------------------------------------------
+// Shared input validation
+// ---------------------------------------------------------------------
+
+/// Validate that `sample_to_batch` is length-aligned with the declared
+/// cohort size and that every entry is a valid batch index. Used by
+/// every public constructor and entry point that takes
+/// `(n_samples, sample_to_batch, n_batches)` as inputs, so the contract
+/// holds uniformly across the public API.
+fn validate_sample_to_batch(
+    sample_to_batch: &[usize],
+    expected_cohort_size: usize,
+    n_batches: usize,
+) -> Result<(), ContaminationEstimationError> {
+    if sample_to_batch.len() != expected_cohort_size {
+        return Err(ContaminationEstimationError::SampleToBatchLengthMismatch {
+            expected: expected_cohort_size,
+            got: sample_to_batch.len(),
+        });
+    }
+    if let Some(&max_batch) = sample_to_batch.iter().max()
+        && max_batch >= n_batches
+    {
+        return Err(ContaminationEstimationError::BatchIndexOutOfRange {
+            batch_idx: max_batch,
+            n_batches,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -417,25 +585,17 @@ pub fn estimate_contamination<I>(
 where
     I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
 {
-    if sample_to_batch.len() != n_samples {
-        return Err(ContaminationEstimationError::BadInput(format!(
-            "sample_to_batch length {} does not match n_samples {}",
-            sample_to_batch.len(),
-            n_samples
-        )));
-    }
-    if let Some(&max_batch) = sample_to_batch.iter().max()
-        && max_batch >= n_batches
-    {
-        return Err(ContaminationEstimationError::BadInput(format!(
-            "sample_to_batch contains batch_idx {} >= n_batches {}",
-            max_batch, n_batches
-        )));
-    }
+    validate_sample_to_batch(&sample_to_batch, n_samples, n_batches)?;
     if config.block_size == 0 {
-        return Err(ContaminationEstimationError::BadInput(
-            "block_size must be > 0".to_string(),
-        ));
+        return Err(ContaminationEstimationError::ZeroBlockSize);
+    }
+    if config.min_batch_size_for_contamination < 2 {
+        return Err(ContaminationEstimationError::MinBatchSizeBelowFloor {
+            got: config.min_batch_size_for_contamination,
+        });
+    }
+    if config.min_depth == 0 {
+        return Err(ContaminationEstimationError::ZeroMinDepth);
     }
 
     let mut state = OnlineEmState::new(n_samples, n_batches, &config);
@@ -443,8 +603,25 @@ where
     let mut at_block_boundary;
 
     for item in upstream {
-        let pileups = item?;
-        let observed_count = filter_and_update(&pileups, &sample_to_batch, &mut state, &config);
+        let pileups = item.map_err(|source| ContaminationEstimationError::Upstream {
+            sites_processed,
+            source,
+        })?;
+        // M15: per-position scratch with `&[u8]` keys — borrows die
+        // with `pileups` at end-of-iteration, so the buffer is
+        // re-allocated per position. The win over the original code
+        // is dropping the per-allele `Vec<u8>` clones (which are the
+        // expensive bit for indels); the outer `Vec::with_capacity(4)`
+        // allocation is one short-lived allocation per position
+        // and matches the original allocation count.
+        let mut cohort_alleles_scratch: Vec<(&[u8], u32)> = Vec::with_capacity(4);
+        let observed_count = filter_and_update(
+            &pileups,
+            &sample_to_batch,
+            &mut state,
+            &config,
+            &mut cohort_alleles_scratch,
+        );
         if observed_count == 0 {
             // Site passed Step 1a but no (sample, site) pair passed
             // Step 1b: it did not advance the estimate, so it does not
@@ -456,8 +633,7 @@ where
         at_block_boundary = sites_processed.is_multiple_of(config.block_size);
 
         if at_block_boundary {
-            let (max_delta, per_sample_deltas) =
-                refresh_parameters_and_snapshot(&mut state, &config);
+            let max_delta = refresh_parameters_and_snapshot(&mut state, &config);
 
             match config.stopping_mode {
                 StoppingMode::Convergence {
@@ -472,8 +648,8 @@ where
                     } else {
                         state.consecutive_within_tolerance = 0;
                     }
-                    state.last_block_deltas = per_sample_deltas;
-                    state.last_block_max_delta = max_delta;
+                    // `state.last_block_{deltas, max_delta}` were
+                    // already written by refresh_parameters_and_snapshot.
                 }
                 StoppingMode::FixedSites { num_sites } => {
                     if sites_processed >= num_sites {
@@ -494,7 +670,7 @@ where
             max_delta: state.last_block_max_delta,
             tolerance,
             per_sample_deltas: state.last_block_deltas,
-            recommendation: recommend_for_non_convergence(
+            recommendation: NextRunRecommendation::for_non_convergence(
                 sites_processed,
                 state.last_block_max_delta,
                 tolerance,
@@ -504,7 +680,10 @@ where
             Err(ContaminationEstimationError::InsufficientSites {
                 requested: num_sites,
                 found: sites_processed,
-                recommendation: recommend_for_insufficient_sites(sites_processed, num_sites),
+                recommendation: NextRunRecommendation::for_insufficient_sites(
+                    sites_processed,
+                    num_sites,
+                ),
             })
         }
     }
@@ -543,15 +722,16 @@ struct OnlineEmState {
 }
 
 impl OnlineEmState {
-    fn new(n_samples: usize, n_batches: usize, _config: &ContaminationEstimationConfig) -> Self {
+    fn new(n_samples: usize, n_batches: usize, config: &ContaminationEstimationConfig) -> Self {
+        let q_b_init = [config.q_b_init_per_class; N_ALLELE_CLASSES];
         Self {
             s_per_sample: vec![0.0; n_samples],
             n_per_sample: vec![0; n_samples],
             s_per_batch: vec![[0.0; N_ALLELE_CLASSES]; n_batches],
             n_per_batch: vec![0; n_batches],
-            c_s_frozen: vec![DEFAULT_CS_INIT; n_samples],
-            q_b_frozen: vec![[1.0 / N_ALLELE_CLASSES as f64; N_ALLELE_CLASSES]; n_batches],
-            c_s_last_snapshot: vec![DEFAULT_CS_INIT; n_samples],
+            c_s_frozen: vec![config.c_s_init; n_samples],
+            q_b_frozen: vec![q_b_init; n_batches],
+            c_s_last_snapshot: vec![config.c_s_init; n_samples],
             last_block_deltas: vec![0.0; n_samples],
             last_block_max_delta: f64::INFINITY,
             consecutive_within_tolerance: 0,
@@ -563,62 +743,71 @@ impl OnlineEmState {
 // Step 1 — informative-site filter
 // ---------------------------------------------------------------------
 
-/// Outcome of Step 1a (cohort-wide filter) at a single position.
-#[derive(Debug, Clone, Copy)]
-struct CohortFilterOutcome {
-    /// `true` iff the site passes Step 1a — i.e. is polymorphic in the
-    /// cohort at the configured thresholds.
-    qualifies: bool,
-}
-
 /// Sum allele counts across all samples present at a position, then
 /// apply Step 1a's cohort-wide thresholds.
-fn step_1a_cohort_filter(
-    pileups: &PerPositionPileups,
+///
+/// Returns `true` iff the site is polymorphic in the cohort at the
+/// configured thresholds.
+///
+/// `cohort_alleles_scratch` is a caller-owned buffer threaded through
+/// the per-position loop so the per-position allocation + per-allele
+/// byte clone disappears (M15). The caller `clear()`s it at the top
+/// of each position; the capacity persists across positions. Keys are
+/// `&[u8]` borrows into `pileups`, so the borrow lifetime fits inside
+/// one call.
+fn step_1a_cohort_filter<'a>(
+    pileups: &'a PerPositionPileups,
     config: &ContaminationEstimationConfig,
-) -> CohortFilterOutcome {
-    // The position is shared across all samples; the allele alphabet
-    // is per-sample. Aggregating across samples means summing
-    // num_obs across entries with matching `seq`. The expected
-    // alphabet size is small (typically 2–4), so a linear scan over a
-    // small Vec is the right shape.
-    let mut cohort_alleles: Vec<(Vec<u8>, u32)> = Vec::with_capacity(4);
+    cohort_alleles_scratch: &mut Vec<(&'a [u8], u32)>,
+) -> bool {
+    cohort_alleles_scratch.clear();
     for slot in &pileups.per_sample {
         let Some(rec) = slot else { continue };
         for obs in &rec.alleles {
-            if let Some(entry) = cohort_alleles.iter_mut().find(|(seq, _)| seq == &obs.seq) {
+            if let Some(entry) = cohort_alleles_scratch
+                .iter_mut()
+                .find(|(seq, _)| *seq == obs.seq.as_slice())
+            {
                 entry.1 = entry.1.saturating_add(obs.support.num_obs);
             } else {
-                cohort_alleles.push((obs.seq.clone(), obs.support.num_obs));
+                cohort_alleles_scratch.push((obs.seq.as_slice(), obs.support.num_obs));
             }
         }
     }
 
-    if cohort_alleles.len() < 2 {
+    if cohort_alleles_scratch.len() < 2 {
         // Only one allele type observed → monomorphic in the cohort.
-        return CohortFilterOutcome { qualifies: false };
+        return false;
     }
 
     // Sort descending by count to identify major and second-most-common.
-    cohort_alleles.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-    let total_reads: u64 = cohort_alleles.iter().map(|(_, n)| u64::from(*n)).sum();
+    cohort_alleles_scratch.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    let total_reads: u64 = cohort_alleles_scratch
+        .iter()
+        .map(|(_, n)| u64::from(*n))
+        .sum();
     if total_reads == 0 {
-        return CohortFilterOutcome { qualifies: false };
+        return false;
     }
-    let second_count = cohort_alleles[1].1;
+    let second_count = cohort_alleles_scratch[1].1;
     let cohort_minor_fraction = u64::from(second_count) as f64 / total_reads as f64;
 
-    let qualifies = second_count >= config.min_cohort_minor_count
-        && cohort_minor_fraction >= config.min_cohort_minor_fraction;
-    CohortFilterOutcome { qualifies }
+    second_count >= config.min_cohort_minor_count
+        && cohort_minor_fraction >= config.min_cohort_minor_fraction
 }
 
 /// Per-sample observation that passes Step 1b. Each retained
 /// `(sample, site)` pair produces one of these; the online-EM update
 /// folds it into the running sufficient statistics immediately.
+///
+/// `sample_idx` is **not** carried on the struct — `step_1b_sample_filter`
+/// does not know the sample index of the record it is filtering, so
+/// the caller passes the index into [`apply_observation`] alongside the
+/// observation. This avoids the "illegal intermediate state with
+/// placeholder `sample_idx: 0` patched by the caller" pattern that was
+/// review finding M1.
 #[derive(Debug, Clone, Copy)]
 struct InformativeObservation {
-    sample_idx: usize,
     /// Per-allele-class read counts at this (sample, site). Reads of
     /// allele classes the sample's observation didn't carry contribute
     /// 0; only the classes actually seen here are non-zero.
@@ -675,7 +864,6 @@ fn step_1b_sample_filter(
     }
 
     Some(InformativeObservation {
-        sample_idx: 0, // filled in by the caller (we don't have sample_idx here)
         counts_by_class,
         q_sum_by_class,
         g_major_class,
@@ -686,25 +874,24 @@ fn step_1b_sample_filter(
 /// each passing observation into the online-EM state, and return how
 /// many samples contributed (used to decide whether the site ticks
 /// the informative-site counter).
-fn filter_and_update(
-    pileups: &PerPositionPileups,
+fn filter_and_update<'a>(
+    pileups: &'a PerPositionPileups,
     sample_to_batch: &[usize],
     state: &mut OnlineEmState,
     config: &ContaminationEstimationConfig,
+    cohort_alleles_scratch: &mut Vec<(&'a [u8], u32)>,
 ) -> u32 {
-    let cohort = step_1a_cohort_filter(pileups, config);
-    if !cohort.qualifies {
+    if !step_1a_cohort_filter(pileups, config, cohort_alleles_scratch) {
         return 0;
     }
 
     let mut contributed: u32 = 0;
     for (sample_idx, slot) in pileups.per_sample.iter().enumerate() {
         let Some(record) = slot else { continue };
-        let Some(mut obs) = step_1b_sample_filter(record, config) else {
+        let Some(obs) = step_1b_sample_filter(record, config) else {
             continue;
         };
-        obs.sample_idx = sample_idx;
-        apply_observation(state, &obs, sample_to_batch);
+        apply_observation(state, sample_idx, &obs, sample_to_batch);
         contributed += 1;
     }
     contributed
@@ -720,15 +907,19 @@ fn filter_and_update(
 /// one pass — there is no per-block read buffer.
 fn apply_observation(
     state: &mut OnlineEmState,
+    sample_idx: usize,
     obs: &InformativeObservation,
     sample_to_batch: &[usize],
 ) {
-    let s = obs.sample_idx;
+    let s = sample_idx;
     let b = sample_to_batch[s];
     let c_s = state.c_s_frozen[s];
     let q_b = state.q_b_frozen[b];
 
-    let total_reads: u32 = obs.counts_by_class.iter().sum();
+    // M16: accumulate read counts in `u64` to match downstream
+    // sufficient-statistic widths and to be saturating-add-consistent
+    // with step_1a/step_1b.
+    let total_reads: u64 = obs.counts_by_class.iter().map(|&n| u64::from(n)).sum();
     if total_reads == 0 {
         return;
     }
@@ -736,14 +927,21 @@ fn apply_observation(
     // Depth-weighted mean per-base error for this sample at this site.
     // `q_sum` is in log-error space already (ln of per-read error
     // probability), so the per-read mean is exp(mean log error) =
-    // exp(sum / count).
+    // exp(sum / count). (Mi1: dead defensive `if total_reads > 0`
+    // dropped — the early return at line above already excludes 0.)
     let total_q_sum: f64 = obs.q_sum_by_class.iter().sum();
-    let mean_log_error = if total_reads > 0 {
-        total_q_sum / total_reads as f64
-    } else {
-        0.0
-    };
-    let mean_error = mean_log_error.exp().clamp(MIN_BASE_ERROR, MAX_BASE_ERROR);
+    let mean_log_error = total_q_sum / total_reads as f64;
+    let raw_mean_error = mean_log_error.exp();
+    // M2(a): debug-mode invariant — Step 1b's `min_major_fraction`
+    // filter is supposed to keep `mean_error` well clear of 1.0, and
+    // BQ-aggregate underflow to near zero is the spec's documented
+    // recovery point. Release builds clamp as a numerical safety net.
+    debug_assert!(
+        raw_mean_error > 0.0 && raw_mean_error.is_finite(),
+        "mean_error must be a positive finite number (got {raw_mean_error}); \
+         Step 1b should have rejected this (sample, site)"
+    );
+    let mean_error = raw_mean_error.clamp(MIN_BASE_ERROR, MAX_BASE_ERROR);
 
     for (class_idx, &n_reads_class) in obs.counts_by_class.iter().enumerate() {
         if n_reads_class == 0 {
@@ -760,15 +958,21 @@ fn apply_observation(
         };
         let p_contam = q_b[class_idx];
 
-        // Mixture denominator, floored to avoid numerical 0/0 in the
-        // degenerate case where both p_own and p_contam are tiny.
+        // M2(b): mixture denominator is structurally `> 0` under the
+        // clamped error model (p_own for the major class is at least
+        // `1 − MAX_BASE_ERROR = 0.5`; off-major classes have `p_own >=
+        // MIN_BASE_ERROR / (K − 1)`). Debug-only `debug_assert!`
+        // documents the invariant; release-mode floor at MIN_POSITIVE
+        // is a defensive numerical guard.
         let mix = (1.0 - c_s) * p_own + c_s * p_contam;
+        debug_assert!(
+            mix > 0.0 && mix.is_finite(),
+            "mixture denominator should be > 0 after clamp (got {mix}); \
+             c_s={c_s} p_own={p_own} p_contam={p_contam}"
+        );
         let gamma = if mix > f64::MIN_POSITIVE {
             (c_s * p_contam) / mix
         } else {
-            // Defensive: at p_own=p_contam=0 gamma is undefined; treat
-            // the contribution as zero so it does not perturb the
-            // running statistics.
             0.0
         };
 
@@ -787,17 +991,29 @@ fn apply_observation(
 fn refresh_parameters_and_snapshot(
     state: &mut OnlineEmState,
     config: &ContaminationEstimationConfig,
-) -> (f64, Vec<f64>) {
+) -> f64 {
     // M-step on c_s: simple ratio per sample, with the init value
     // retained for samples that never received any reads (so no
-    // division by zero and no spurious jump from init to a noisy ratio).
+    // division by zero and no spurious jump from init to a noisy
+    // ratio). The clone is the in-place initialiser — values that
+    // skip the `if n_val > 0` branch keep their previous-block
+    // frozen value.
     let mut c_s_new = state.c_s_frozen.clone();
     for (slot, (&s_val, &n_val)) in c_s_new
         .iter_mut()
         .zip(state.s_per_sample.iter().zip(state.n_per_sample.iter()))
     {
         if n_val > 0 {
-            *slot = (s_val / n_val as f64).clamp(0.0, 1.0);
+            let ratio = s_val / n_val as f64;
+            // M2(c): the ratio is bounded in [0, 1] by construction
+            // because every γ ∈ [0, 1] and `s_val = Σ γ · n_reads`,
+            // `n_val = Σ n_reads`. Debug-only assertion documents the
+            // invariant; release-mode clamp is a fp-noise safety net.
+            debug_assert!(
+                (0.0..=1.0).contains(&ratio) && ratio.is_finite(),
+                "c_s M-step ratio out of [0, 1]: {ratio} (s_val={s_val}, n_val={n_val})"
+            );
+            *slot = ratio.clamp(0.0, 1.0);
         }
     }
 
@@ -820,25 +1036,30 @@ fn refresh_parameters_and_snapshot(
         // else: keep the init uniform — no reads seen for this batch yet.
     }
 
-    // Compute per-sample deltas against the previous snapshot.
+    // Compute per-sample deltas against the previous snapshot and
+    // write them into the state's `last_block_*` fields directly —
+    // the caller reads them from state, so no return-and-reassign
+    // dance is needed (Mi20).
     let mut per_sample_deltas = vec![0.0_f64; c_s_new.len()];
     let mut max_delta = 0.0_f64;
-    for s in 0..c_s_new.len() {
+    for (s, slot) in per_sample_deltas.iter_mut().enumerate() {
         let delta = (c_s_new[s] - state.c_s_last_snapshot[s]).abs();
-        per_sample_deltas[s] = delta;
+        *slot = delta;
         if delta > max_delta {
             max_delta = delta;
         }
     }
 
     // Promote new params to frozen snapshots and record the snapshot.
+    // One clone of `c_s_new` (read by two state fields); the other
+    // assignments move.
     state.c_s_frozen = c_s_new.clone();
     state.q_b_frozen = q_b_new;
     state.c_s_last_snapshot = c_s_new;
     state.last_block_max_delta = max_delta;
-    state.last_block_deltas = per_sample_deltas.clone();
+    state.last_block_deltas = per_sample_deltas;
 
-    (max_delta, per_sample_deltas)
+    max_delta
 }
 
 // ---------------------------------------------------------------------
@@ -862,9 +1083,11 @@ fn finalise(
     for &b in &sample_to_batch {
         batch_sizes[b] = batch_sizes[b].saturating_add(1);
     }
+    // The entry-point gate enforces `min_batch_size_for_contamination >= 2`,
+    // so singletons are always below-floor here (no `.max(2)` needed).
     let batch_qualifies: Vec<bool> = batch_sizes
         .iter()
-        .map(|&n| n >= config.min_batch_size_for_contamination.max(2))
+        .map(|&n| n >= config.min_batch_size_for_contamination)
         .collect();
 
     let c_s_per_sample: Vec<Option<f64>> = (0..n_samples)
@@ -900,62 +1123,66 @@ fn finalise(
 }
 
 // ---------------------------------------------------------------------
-// Recommendation builders
+// NextRunRecommendation constructors
 // ---------------------------------------------------------------------
 
-fn recommend_for_non_convergence(
-    sites_processed: u32,
-    observed_delta: f64,
-    tolerance: f64,
-) -> NextRunRecommendation {
-    let suggested = if observed_delta.is_finite() && observed_delta > 0.0 && tolerance > 0.0 {
-        // Under the expected MLE scaling delta ∝ N^(−1/2), the N at
-        // which the delta drops to `tolerance` is
-        //   N_recommended ≈ N · (observed_delta / tolerance)^2.
-        // Cap at 10× to keep the recommendation actionable.
-        let ratio = observed_delta / tolerance;
-        let scaled = f64::from(sites_processed) * ratio * ratio;
-        let capped = scaled.min(f64::from(sites_processed) * 10.0);
-        if capped.is_finite() && capped > 0.0 {
-            Some(capped.round().min(u32::MAX as f64) as u32)
+impl NextRunRecommendation {
+    /// Recommendation for the convergence-mode non-convergence path.
+    /// Extrapolates a suggested `--contamination-num-sites` from the
+    /// observed last-block delta under the expected MLE scaling
+    /// `delta ∝ N^(−1/2)`, capped at 10× the current input size to
+    /// keep the recommendation actionable.
+    pub(crate) fn for_non_convergence(
+        sites_processed: u32,
+        observed_delta: f64,
+        tolerance: f64,
+    ) -> Self {
+        let suggested = if observed_delta.is_finite() && observed_delta > 0.0 && tolerance > 0.0 {
+            let ratio = observed_delta / tolerance;
+            let scaled = f64::from(sites_processed) * ratio * ratio;
+            let capped = scaled.min(f64::from(sites_processed) * 10.0);
+            if capped.is_finite() && capped > 0.0 {
+                Some(capped.round().min(u32::MAX as f64) as u32)
+            } else {
+                None
+            }
         } else {
             None
+        };
+        let suggested_clause = match suggested {
+            Some(n) => format!(
+                " — try `--contamination-num-sites {}` or relax `--contamination-stability-tolerance`",
+                n
+            ),
+            None => String::new(),
+        };
+        Self {
+            message: format!(
+                "Recommended next run: relax `--contamination-stability-tolerance`, \
+                 lower `--contamination-min-major-fraction`, or switch to fixed-N mode{}",
+                suggested_clause
+            ),
+            suggested_num_sites: suggested,
         }
-    } else {
-        None
-    };
-    let suggested_clause = match suggested {
-        Some(n) => format!(
-            " — try `--contamination-num-sites {}` or relax `--contamination-stability-tolerance`",
-            n
-        ),
-        None => String::new(),
-    };
-    NextRunRecommendation {
-        message: format!(
-            "Recommended next run: relax `--contamination-stability-tolerance`, \
-             lower `--contamination-min-major-fraction`, or switch to fixed-N mode{}",
-            suggested_clause
-        ),
-        suggested_num_sites: suggested,
     }
-}
 
-fn recommend_for_insufficient_sites(found: u32, requested: u32) -> NextRunRecommendation {
-    let suggested = if found > 0 { Some(found) } else { None };
-    let suggested_clause = match suggested {
-        Some(n) => format!(" — try `--contamination-num-sites {}`", n),
-        None => " — try a smaller `--contamination-num-sites`".to_string(),
-    };
-    NextRunRecommendation {
-        message: format!(
-            "Recommended next run: lower `--contamination-num-sites` from \
-             {} to ~{} (the observed count), switch to convergence mode \
-             with `--contamination-stability-tolerance`, or relax filtering \
-             thresholds (e.g. `--contamination-min-major-fraction`){}",
-            requested, found, suggested_clause
-        ),
-        suggested_num_sites: suggested,
+    /// Recommendation for the fixed-N-mode insufficient-sites path.
+    pub(crate) fn for_insufficient_sites(found: u32, requested: u32) -> Self {
+        let suggested = if found > 0 { Some(found) } else { None };
+        let suggested_clause = match suggested {
+            Some(n) => format!(" — try `--contamination-num-sites {}`", n),
+            None => " — try a smaller `--contamination-num-sites`".to_string(),
+        };
+        Self {
+            message: format!(
+                "Recommended next run: lower `--contamination-num-sites` from \
+                 {} to ~{} (the observed count), switch to convergence mode \
+                 with `--contamination-stability-tolerance`, or relax filtering \
+                 thresholds (e.g. `--contamination-min-major-fraction`){}",
+                requested, found, suggested_clause
+            ),
+            suggested_num_sites: suggested,
+        }
     }
 }
 
@@ -966,12 +1193,19 @@ fn recommend_for_insufficient_sites(found: u32, requested: u32) -> NextRunRecomm
 /// Floor on per-base error rate. Some BQ aggregates can underflow to
 /// near zero for very high-quality reads; clamping prevents the
 /// mixture denominator from collapsing.
-const MIN_BASE_ERROR: f64 = 1e-12;
+///
+/// Shared with the Stage 6 mixture-likelihood E-step at
+/// [`crate::var_calling::posterior_engine`] — the floor/ceiling are
+/// part of one model assumption and must move together.
+pub const MIN_BASE_ERROR: f64 = 1e-12;
 
 /// Ceiling on per-base error rate. The model assumes hom-major reads,
 /// so a sample with mean error near 1.0 would not have passed
 /// Step 1b's `min_major_fraction` filter; this is a safety net.
-const MAX_BASE_ERROR: f64 = 0.5;
+///
+/// Shared with the Stage 6 mixture-likelihood E-step at
+/// [`crate::var_calling::posterior_engine`].
+pub const MAX_BASE_ERROR: f64 = 0.5;
 
 // =====================================================================
 // Tests
@@ -1034,8 +1268,9 @@ mod tests {
             ],
         );
         let cfg = ContaminationEstimationConfig::with_project_defaults();
-        let outcome = step_1a_cohort_filter(&pileups, &cfg);
-        assert!(!outcome.qualifies);
+        let mut scratch = Vec::new();
+        let qualifies = step_1a_cohort_filter(&pileups, &cfg, &mut scratch);
+        assert!(!qualifies);
     }
 
     #[test]
@@ -1060,8 +1295,9 @@ mod tests {
             ],
         );
         let cfg = ContaminationEstimationConfig::with_project_defaults();
-        let outcome = step_1a_cohort_filter(&pileups, &cfg);
-        assert!(outcome.qualifies);
+        let mut scratch = Vec::new();
+        let qualifies = step_1a_cohort_filter(&pileups, &cfg, &mut scratch);
+        assert!(qualifies);
     }
 
     #[test]
@@ -1080,8 +1316,9 @@ mod tests {
             ],
         );
         let cfg = ContaminationEstimationConfig::with_project_defaults();
-        let outcome = step_1a_cohort_filter(&pileups, &cfg);
-        assert!(!outcome.qualifies);
+        let mut scratch = Vec::new();
+        let qualifies = step_1a_cohort_filter(&pileups, &cfg, &mut scratch);
+        assert!(!qualifies);
     }
 
     // ----- Step 1b: per-sample filter ------------------------------
@@ -1120,7 +1357,7 @@ mod tests {
     /// fraction are switched to the SNP alt allele (simulating
     /// contamination from another sample). All other samples are
     /// hom-REF with no contamination.
-    fn synth_two_sample_contam_stream(
+    fn synth_three_sample_contam_stream(
         n_sites: u32,
         n_reads: u32,
         c_true: f64,
@@ -1152,7 +1389,7 @@ mod tests {
     #[test]
     fn online_em_recovers_zero_contamination() {
         // Three samples in one batch, no contamination injected.
-        let stream = synth_two_sample_contam_stream(2000, 50, 0.0);
+        let stream = synth_three_sample_contam_stream(2000, 50, 0.0);
         let estimates = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1176,7 +1413,7 @@ mod tests {
     #[test]
     fn online_em_recovers_three_percent_contamination() {
         // Sample 0 contaminated at 3 %; should recover within tolerance.
-        let stream = synth_two_sample_contam_stream(4000, 50, 0.03);
+        let stream = synth_three_sample_contam_stream(4000, 50, 0.03);
         let estimates = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1203,7 +1440,7 @@ mod tests {
 
     #[test]
     fn fixed_n_mode_processes_exact_count() {
-        let stream = synth_two_sample_contam_stream(5000, 50, 0.02);
+        let stream = synth_three_sample_contam_stream(5000, 50, 0.02);
         let estimates = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1233,7 +1470,7 @@ mod tests {
     fn convergence_mode_returns_did_not_converge_on_short_stream() {
         // Very short stream — convergence cannot fire in 3 blocks of
         // 500 sites = 1500 sites, and we provide only 200 sites.
-        let stream = synth_two_sample_contam_stream(200, 50, 0.02);
+        let stream = synth_three_sample_contam_stream(200, 50, 0.02);
         let result = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1261,7 +1498,7 @@ mod tests {
 
     #[test]
     fn fixed_n_returns_insufficient_sites_on_short_stream() {
-        let stream = synth_two_sample_contam_stream(100, 50, 0.02);
+        let stream = synth_three_sample_contam_stream(100, 50, 0.02);
         let result = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1290,7 +1527,7 @@ mod tests {
     #[test]
     fn singleton_batch_gets_c_s_none() {
         // Two samples, each in its own batch → both singleton.
-        let stream = synth_two_sample_contam_stream(2000, 50, 0.03);
+        let stream = synth_three_sample_contam_stream(2000, 50, 0.03);
         let estimates = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1315,7 +1552,7 @@ mod tests {
     #[test]
     fn below_floor_batch_gets_c_s_none() {
         // All three samples in one batch with floor = 5 → below floor.
-        let stream = synth_two_sample_contam_stream(2000, 50, 0.03);
+        let stream = synth_three_sample_contam_stream(2000, 50, 0.03);
         let estimates = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1336,7 +1573,7 @@ mod tests {
 
     #[test]
     fn cs_in_unit_interval_and_qb_is_simplex() {
-        let stream = synth_two_sample_contam_stream(2000, 50, 0.04);
+        let stream = synth_three_sample_contam_stream(2000, 50, 0.04);
         let estimates = estimate_contamination(
             stream.into_iter(),
             3,
@@ -1369,7 +1606,7 @@ mod tests {
 
     #[test]
     fn estimates_zero_constructor_is_disabled_source() {
-        let est = ContaminationEstimates::zero(3, vec![0, 0, 0], 1);
+        let est = ContaminationEstimates::zero(3, vec![0, 0, 0], 1).expect("valid inputs");
         assert_eq!(est.source, ContaminationEstimateSource::Disabled);
         assert!(est.c_s_per_sample.iter().all(|c| c.is_none()));
         for s in 0..3 {
@@ -1378,21 +1615,145 @@ mod tests {
     }
 
     #[test]
+    fn estimates_zero_rejects_length_mismatch_in_release() {
+        // M5: was a `debug_assert!` only; now a runtime check.
+        let result = ContaminationEstimates::zero(3, vec![0, 0], 1);
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::SampleToBatchLengthMismatch {
+                expected: 3,
+                got: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn estimates_zero_rejects_batch_idx_out_of_range() {
+        // M5: zero() now validates `sample_to_batch[s] < n_batches`.
+        let result = ContaminationEstimates::zero(2, vec![0, 5], 2);
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::BatchIndexOutOfRange {
+                batch_idx: 5,
+                n_batches: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn from_user_supplied_is_user_source() {
         let est = ContaminationEstimates::from_user_supplied(
             vec![Some(0.03), None, Some(0.01)],
             vec![[0.9, 0.08, 0.02]],
             vec![0, 0, 0],
-        );
+        )
+        .expect("valid inputs");
         assert_eq!(est.source, ContaminationEstimateSource::UserSupplied);
         assert_eq!(est.effective_c_s(0), 0.03);
         assert_eq!(est.effective_c_s(1), 0.0);
     }
 
+    #[test]
+    fn from_user_supplied_rejects_length_mismatch() {
+        // B1 fix: was unvalidated; now returns a typed error.
+        let result = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.0); 3],
+            vec![[1.0, 0.0, 0.0]],
+            vec![0, 0], // wrong length
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::SampleToBatchLengthMismatch {
+                expected: 3,
+                got: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn from_user_supplied_rejects_c_s_out_of_range() {
+        let result = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.0), Some(1.5), None], // 1.5 > 1.0
+            vec![[1.0, 0.0, 0.0]],
+            vec![0, 0, 0],
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::CsOutOfRange { sample_idx: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn from_user_supplied_rejects_c_s_non_finite() {
+        let result = ContaminationEstimates::from_user_supplied(
+            vec![Some(f64::NAN)],
+            vec![[1.0, 0.0, 0.0]],
+            vec![0],
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::CsOutOfRange { sample_idx: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn from_user_supplied_rejects_q_b_not_simplex() {
+        let result = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.02)],
+            vec![[0.5, 0.3, 0.3]], // sums to 1.1
+            vec![0],
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::QbNotSimplex { batch_idx: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn from_user_supplied_accepts_all_zero_q_b_as_floored_batch() {
+        // The floored-batch convention: `q_b = [0, 0, 0]` is valid even
+        // though it doesn't sum to 1, because Stage 6 treats the
+        // affected samples as `c_s = 0` (none of the q_b entries are
+        // ever read).
+        let est =
+            ContaminationEstimates::from_user_supplied(vec![None], vec![[0.0, 0.0, 0.0]], vec![0])
+                .expect("all-zero q_b is the floored-batch convention");
+        assert_eq!(est.q_b_for_sample(0), &[0.0; N_ALLELE_CLASSES]);
+    }
+
+    #[test]
+    fn from_user_supplied_rejects_batch_idx_out_of_range() {
+        let result = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.0); 2],
+            vec![[1.0, 0.0, 0.0]; 2],
+            vec![0, 5], // batch_idx 5 with q_b_per_batch.len() = 2
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::BatchIndexOutOfRange {
+                batch_idx: 5,
+                n_batches: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn q_b_for_sample_returns_the_batch_distribution_for_the_sample() {
+        let est = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.01), Some(0.02), Some(0.03)],
+            vec![[1.0, 0.0, 0.0], [0.5, 0.4, 0.1]],
+            vec![1, 0, 1],
+        )
+        .expect("valid inputs");
+        assert_eq!(est.q_b_for_sample(0), &[0.5, 0.4, 0.1]);
+        assert_eq!(est.q_b_for_sample(1), &[1.0, 0.0, 0.0]);
+        assert_eq!(est.q_b_for_sample(2), &[0.5, 0.4, 0.1]);
+    }
+
     // ----- Bad-input contract --------------------------------------
 
     #[test]
-    fn bad_input_when_sample_to_batch_length_wrong() {
+    fn sample_to_batch_length_mismatch_surfaces_typed_error() {
         let stream: Vec<Result<PerPositionPileups, PerPositionMergerError>> = vec![];
         let result = estimate_contamination(
             stream.into_iter(),
@@ -1403,12 +1764,15 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ContaminationEstimationError::BadInput(_))
+            Err(ContaminationEstimationError::SampleToBatchLengthMismatch {
+                expected: 3,
+                got: 2,
+            })
         ));
     }
 
     #[test]
-    fn bad_input_when_batch_idx_out_of_range() {
+    fn batch_idx_out_of_range_surfaces_typed_error() {
         let stream: Vec<Result<PerPositionPileups, PerPositionMergerError>> = vec![];
         let result = estimate_contamination(
             stream.into_iter(),
@@ -1419,12 +1783,15 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ContaminationEstimationError::BadInput(_))
+            Err(ContaminationEstimationError::BatchIndexOutOfRange {
+                batch_idx: 5,
+                n_batches: 2,
+            })
         ));
     }
 
     #[test]
-    fn bad_input_when_block_size_zero() {
+    fn zero_block_size_surfaces_typed_error() {
         let stream: Vec<Result<PerPositionPileups, PerPositionMergerError>> = vec![];
         let result = estimate_contamination(
             stream.into_iter(),
@@ -1433,12 +1800,125 @@ mod tests {
             1,
             ContaminationEstimationConfig {
                 block_size: 0,
+                min_batch_size_for_contamination: 2,
                 ..ContaminationEstimationConfig::with_project_defaults()
             },
         );
         assert!(matches!(
             result,
-            Err(ContaminationEstimationError::BadInput(_))
+            Err(ContaminationEstimationError::ZeroBlockSize)
+        ));
+    }
+
+    #[test]
+    fn min_batch_size_below_floor_surfaces_typed_error() {
+        // M9 fix: the gate rejects `min_batch_size_for_contamination < 2`
+        // rather than silently coercing to 2 inside `finalise`.
+        let stream: Vec<Result<PerPositionPileups, PerPositionMergerError>> = vec![];
+        let result = estimate_contamination(
+            stream.into_iter(),
+            1,
+            vec![0],
+            1,
+            ContaminationEstimationConfig {
+                min_batch_size_for_contamination: 1,
+                ..ContaminationEstimationConfig::with_project_defaults()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::MinBatchSizeBelowFloor { got: 1 })
+        ));
+    }
+
+    // Mi11: NextRunRecommendation constructor coverage.
+    #[test]
+    fn next_run_recommendation_for_non_convergence_caps_at_10x_sites() {
+        // Raw scaling factor at observed_delta=1.0, tolerance=1e-3
+        // is 10^6, but the 10× cap clips it to 10·sites_processed = 1000.
+        let r = NextRunRecommendation::for_non_convergence(100, 1.0, 1e-3);
+        assert_eq!(r.suggested_num_sites, Some(1000));
+    }
+
+    #[test]
+    fn next_run_recommendation_for_non_convergence_returns_none_on_zero_delta() {
+        let r = NextRunRecommendation::for_non_convergence(100, 0.0, 1e-3);
+        assert_eq!(r.suggested_num_sites, None);
+    }
+
+    #[test]
+    fn next_run_recommendation_for_non_convergence_returns_none_on_infinite_delta() {
+        // The outer `observed_delta.is_finite()` guard short-circuits
+        // when delta is INF/NaN; the cap logic is never reached.
+        let r = NextRunRecommendation::for_non_convergence(100, f64::INFINITY, 1e-3);
+        assert_eq!(r.suggested_num_sites, None);
+    }
+
+    #[test]
+    fn next_run_recommendation_for_insufficient_sites_suggests_observed_count() {
+        let r = NextRunRecommendation::for_insufficient_sites(42, 10_000);
+        assert_eq!(r.suggested_num_sites, Some(42));
+    }
+
+    #[test]
+    fn next_run_recommendation_for_insufficient_sites_returns_none_when_found_zero() {
+        let r = NextRunRecommendation::for_insufficient_sites(0, 10_000);
+        assert_eq!(r.suggested_num_sites, None);
+    }
+
+    // Mi18: site counter does not tick when no sample passes Step 1b.
+    #[test]
+    fn site_counter_does_not_tick_when_step_1b_finds_no_samples() {
+        // Cohort polymorphic (Step 1a passes) but every sample has
+        // depth < min_depth (Step 1b fails) → sites_processed stays
+        // at 0; fixed-N mode reports InsufficientSites { found: 0 }.
+        let cfg = ContaminationEstimationConfig {
+            stopping_mode: StoppingMode::FixedSites { num_sites: 1 },
+            block_size: 500,
+            min_depth: 10,
+            min_batch_size_for_contamination: 2,
+            ..ContaminationEstimationConfig::with_project_defaults()
+        };
+        let mean_err = 0.001;
+        // Each sample has only 2 reads each (below min_depth=10)
+        // but the cohort sums to many reads of both alleles.
+        let stream: Vec<Result<PerPositionPileups, PerPositionMergerError>> = (0..50)
+            .map(|i| {
+                let mk_rec = |a, c| {
+                    pileup_record(i + 1, vec![obs(b"A", a, mean_err), obs(b"C", c, mean_err)])
+                };
+                Ok(position(
+                    i + 1,
+                    vec![Some(mk_rec(2, 0)), Some(mk_rec(1, 1)), Some(mk_rec(0, 2))],
+                ))
+            })
+            .collect();
+        let result = estimate_contamination(stream.into_iter(), 3, vec![0, 0, 0], 1, cfg);
+        match result {
+            Err(ContaminationEstimationError::InsufficientSites { found: 0, .. }) => {}
+            other => panic!("expected InsufficientSites {{ found: 0, .. }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_min_depth_surfaces_typed_error() {
+        // Mi10 fix: divide-by-depth in step_1b_sample_filter would
+        // produce NaN on a synthetic empty-observation record.
+        let stream: Vec<Result<PerPositionPileups, PerPositionMergerError>> = vec![];
+        let result = estimate_contamination(
+            stream.into_iter(),
+            1,
+            vec![0],
+            1,
+            ContaminationEstimationConfig {
+                min_depth: 0,
+                min_batch_size_for_contamination: 2,
+                ..ContaminationEstimationConfig::with_project_defaults()
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ContaminationEstimationError::ZeroMinDepth)
         ));
     }
 
@@ -1452,7 +1932,7 @@ mod tests {
             c_true in 0.0_f64..0.10,
             batch_size in 2usize..4,
         ) {
-            let stream = synth_two_sample_contam_stream(n_sites, n_reads, c_true);
+            let stream = synth_three_sample_contam_stream(n_sites, n_reads, c_true);
             let n_samples = 3;
             let effective_batch_size = batch_size.clamp(1, 3);
             let s_to_b: Vec<usize> = (0..n_samples).map(|i| i % effective_batch_size).collect();
@@ -1484,7 +1964,7 @@ mod tests {
             n_reads in 20u32..80,
             c_true in 0.0_f64..0.10,
         ) {
-            let stream = synth_two_sample_contam_stream(n_sites, n_reads, c_true);
+            let stream = synth_three_sample_contam_stream(n_sites, n_reads, c_true);
             let estimates = estimate_contamination(
                 stream.into_iter(),
                 3,
@@ -1524,8 +2004,8 @@ mod tests {
                 min_batch_size_for_contamination: 2,
                 ..ContaminationEstimationConfig::with_project_defaults()
             };
-            let stream_a = synth_two_sample_contam_stream(n_sites, n_reads, c_true);
-            let stream_b = synth_two_sample_contam_stream(n_sites, n_reads, c_true);
+            let stream_a = synth_three_sample_contam_stream(n_sites, n_reads, c_true);
+            let stream_b = synth_three_sample_contam_stream(n_sites, n_reads, c_true);
             let est_a = estimate_contamination(stream_a.into_iter(), 3, s_to_b.clone(), 1, common_cfg(500))
                 .expect("a converges");
             let est_b = estimate_contamination(stream_b.into_iter(), 3, s_to_b, 1, common_cfg(1000))

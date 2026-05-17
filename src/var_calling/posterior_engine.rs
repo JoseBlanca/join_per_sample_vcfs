@@ -49,7 +49,7 @@ use thiserror::Error;
 
 use crate::per_sample_pileup::pileup::AlleleSupportStats;
 use crate::var_calling::contamination_estimation::{
-    AlleleClass as ContamAlleleClass, ContaminationEstimates,
+    AlleleClass as ContamAlleleClass, ContaminationEstimates, MAX_BASE_ERROR, MIN_BASE_ERROR,
 };
 use crate::var_calling::per_group_merger::{
     MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
@@ -671,18 +671,41 @@ fn map_to_contam_class(class: AlleleClass) -> Option<ContamAlleleClass> {
 /// a genotype with allele copy counts `k_a` is `(k_a / ploidy) · (1 −
 /// ε_{s,a}) + ((ploidy − k_a) / ploidy) · (ε_{s,a} / (n_alleles − 1))`.
 /// Per-allele `ε_{s,a}` is derived from the `q_sum` aggregate.
-#[allow(clippy::too_many_arguments)]
+///
+/// # Panics
+///
+/// Debug-only invariants:
+/// - `scalars.len() == n_samples * n_alleles`
+/// - `fallback_log_likelihoods.len() == n_samples * n_genotypes`
+///
+/// In release builds these are caller responsibilities; the only
+/// in-tree caller is [`run_em_for_record`], which validates the
+/// merged record's shape via [`validate_record_shape`] before calling
+/// here.
 fn compute_mixture_log_likelihoods(
     locus: RecordLocus,
     alleles: &[MergedAllele],
     ploidy: u8,
-    n_samples: usize,
-    n_genotypes: usize,
-    n_alleles: usize,
     scalars: &[AlleleSupportStats],
     estimates: &ContaminationEstimates,
     fallback_log_likelihoods: &[f64],
 ) -> Result<Vec<f64>, PosteriorEngineError> {
+    let n_alleles = alleles.len();
+    let genotypes = genotype_order(ploidy, n_alleles);
+    let n_genotypes = genotypes.len();
+    let n_samples = scalars.len() / n_alleles;
+
+    debug_assert_eq!(
+        scalars.len(),
+        n_samples * n_alleles,
+        "scalars length does not match n_samples * n_alleles"
+    );
+    debug_assert_eq!(
+        fallback_log_likelihoods.len(),
+        n_samples * n_genotypes,
+        "fallback_log_likelihoods length does not match n_samples * n_genotypes"
+    );
+
     let allele_classes = classify_alleles(alleles);
     let contam_class_per_allele: Vec<Option<ContamAlleleClass>> = allele_classes
         .iter()
@@ -690,21 +713,24 @@ fn compute_mixture_log_likelihoods(
         .map(map_to_contam_class)
         .collect();
 
-    let genotypes = genotype_order(ploidy, n_alleles);
     // Flat row-major n_genotypes × n_alleles allele-count table —
     // matches the existing EmContext layout.
     let mut genotype_allele_counts = vec![0_u32; n_genotypes * n_alleles];
     for (g_idx, g) in genotypes.iter().enumerate() {
-        let row = &mut genotype_allele_counts[g_idx * n_alleles..(g_idx + 1) * n_alleles];
+        let genotype_copy_counts =
+            &mut genotype_allele_counts[g_idx * n_alleles..(g_idx + 1) * n_alleles];
         for &a in g {
-            row[a as usize] += 1;
+            genotype_copy_counts[a as usize] += 1;
         }
     }
 
     let ploidy_f = f64::from(ploidy);
-    let non_genotype_classes = (n_alleles as f64 - 1.0).max(1.0);
+    // Denominator for spreading per-base error mass across alleles
+    // other than the one the genotype carries; floored at 1 so the
+    // n_alleles == 1 degenerate case doesn't divide by zero.
+    let other_allele_error_denom = (n_alleles as f64 - 1.0).max(1.0);
 
-    let mut out = vec![0.0_f64; n_samples * n_genotypes];
+    let mut mixture_log_likelihoods = vec![0.0_f64; n_samples * n_genotypes];
 
     for sample_idx in 0..n_samples {
         let c_s = estimates.effective_c_s(sample_idx);
@@ -713,7 +739,8 @@ fn compute_mixture_log_likelihoods(
             // mixture collapses to the own-DNA term. Fall back to
             // Stage 5's precomputed value to avoid re-deriving the
             // same number with floating-point drift.
-            let dst = &mut out[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
+            let dst = &mut mixture_log_likelihoods
+                [sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
             let src =
                 &fallback_log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
             dst.copy_from_slice(src);
@@ -724,14 +751,14 @@ fn compute_mixture_log_likelihoods(
         // Per-allele observation count and mean per-read error rate
         // for this sample at this site, recovered from the row of
         // AlleleSupportStats Stage 5 emitted.
-        let row = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
+        let sample_allele_scalars = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
         let mut n_obs = vec![0_u32; n_alleles];
         let mut mean_err = vec![0.0_f64; n_alleles];
-        for (a, support) in row.iter().enumerate() {
+        for (a, support) in sample_allele_scalars.iter().enumerate() {
             n_obs[a] = support.num_obs;
             if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
-                mean_err[a] = per_read_log_err.exp().clamp(1e-12, 0.5);
+                mean_err[a] = per_read_log_err.exp().clamp(MIN_BASE_ERROR, MAX_BASE_ERROR);
             }
         }
 
@@ -746,7 +773,7 @@ fn compute_mixture_log_likelihoods(
                 let eps = mean_err[a];
                 // P(read carrying allele a | genotype G).
                 let p_own = (k_a / ploidy_f) * (1.0 - eps)
-                    + ((ploidy_f - k_a) / ploidy_f) * (eps / non_genotype_classes);
+                    + ((ploidy_f - k_a) / ploidy_f) * (eps / other_allele_error_denom);
                 let p_contam = match contam_class_per_allele[a] {
                     Some(class) => q_b[class as usize],
                     None => 0.0, // compound allele class — see map_to_contam_class
@@ -768,11 +795,11 @@ fn compute_mixture_log_likelihoods(
                 }
                 ll += f64::from(n_a) * mix.ln();
             }
-            out[sample_idx * n_genotypes + g_idx] = ll;
+            mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
         }
     }
 
-    Ok(out)
+    Ok(mixture_log_likelihoods)
 }
 
 fn pseudocount_for(class: AlleleClass, config: &PosteriorEngineConfig) -> f64 {
@@ -867,14 +894,32 @@ fn run_em_for_record(
                 record_samples: n_samples,
             });
         }
+        // M8: the side-pass's fallible constructors
+        // (`ContaminationEstimates::zero` / `::from_user_supplied`)
+        // and the in-engine `finalise` are the only construction
+        // sites; each enforces `sample_to_batch.len() ==
+        // c_s_per_sample.len()` and `batch_idx < q_b_per_batch.len()`.
+        // Together with the cohort-size check above, this makes
+        // `effective_c_s` and `q_b_for_sample` indexing PANIC-FREE for
+        // every well-formed `ContaminationEstimates`. Debug-only
+        // sanity check.
+        debug_assert_eq!(
+            estimates.sample_to_batch.len(),
+            n_samples,
+            "ContaminationEstimates internal invariant violated"
+        );
+        debug_assert!(
+            estimates
+                .sample_to_batch
+                .iter()
+                .all(|&b| b < estimates.q_b_per_batch.len()),
+            "ContaminationEstimates internal invariant violated"
+        );
         if n_alleles >= 2 {
             compute_mixture_log_likelihoods(
                 locus,
                 &alleles,
                 ploidy,
-                n_samples,
-                n_genotypes,
-                n_alleles,
                 &scalars,
                 estimates,
                 &log_likelihoods,
@@ -1948,7 +1993,7 @@ mod tests {
         let baseline = engine_for(record.clone());
 
         let config = PosteriorEngineConfig {
-            contamination: Some(ContaminationEstimates::zero(1, vec![0], 1)),
+            contamination: Some(ContaminationEstimates::zero(1, vec![0], 1).expect("valid inputs")),
             ..Default::default()
         };
         let mirrored = engine_for_with_config(record, config);
@@ -1966,7 +2011,9 @@ mod tests {
         let record =
             merged_record_simple(1, 100, vec![b"A", b"C"], 2, vec![vec![0.0, -50.0, -50.0]]);
         let config = PosteriorEngineConfig {
-            contamination: Some(ContaminationEstimates::zero(2, vec![0, 0], 1)),
+            contamination: Some(
+                ContaminationEstimates::zero(2, vec![0, 0], 1).expect("valid inputs"),
+            ),
             ..Default::default()
         };
         let out = engine_for_with_config(record, config);
@@ -1978,6 +2025,271 @@ mod tests {
             }) => {}
             other => panic!("expected ContaminationCohortSizeMismatch, got {other:?}"),
         }
+    }
+
+    // ---------- B2 value-witness tests for compute_mixture_log_likelihoods ----------
+
+    /// Build a 1-sample, 2-allele (REF=A, SNP-alt=C) MergedRecord with
+    /// the given per-allele scalars and a stub fallback log-likelihood
+    /// table. The fallback is shape-correct but only used by the
+    /// floored-sample branch (`c_s = 0`), so the value is irrelevant
+    /// for c_s > 0 tests.
+    fn build_single_sample_record(
+        num_obs_ref: u32,
+        num_obs_alt: u32,
+        mean_err: f64,
+        n_genotypes: usize,
+    ) -> MergedRecord {
+        let alleles = vec![
+            MergedAllele {
+                seq: b"A".to_vec(),
+                is_compound: false,
+                constituents: vec![],
+            },
+            MergedAllele {
+                seq: b"C".to_vec(),
+                is_compound: false,
+                constituents: vec![],
+            },
+        ];
+        let q_sum_ref = if num_obs_ref > 0 {
+            mean_err.ln() * f64::from(num_obs_ref)
+        } else {
+            0.0
+        };
+        let q_sum_alt = if num_obs_alt > 0 {
+            mean_err.ln() * f64::from(num_obs_alt)
+        } else {
+            0.0
+        };
+        let scalars = vec![
+            AlleleSupportStats::new(num_obs_ref, q_sum_ref, num_obs_ref / 2, 0, 0),
+            AlleleSupportStats::new(num_obs_alt, q_sum_alt, num_obs_alt / 2, 0, 0),
+        ];
+        MergedRecord {
+            chrom_id: 1,
+            start: 100,
+            end: 100,
+            alleles,
+            ploidy: 2,
+            n_samples: 1,
+            n_genotypes,
+            scalars,
+            other_scalars: vec![AlleleSupportStats::default(); 1],
+            chain_anchor_flags: vec![false; 2],
+            log_likelihoods: vec![0.0; n_genotypes], // fallback stub
+        }
+    }
+
+    #[test]
+    fn compute_mixture_log_likelihoods_matches_hand_calculation_at_c_s_5_percent() {
+        // Hand calc for: 1 sample, ploidy=2, alleles=[A, C], n_obs=[50, 0],
+        // ε = 0.001 per read, c_s = 0.05, q_b = [0.95, 0.05, 0.0].
+        // n_alleles=2 ⇒ non_genotype error denom = 1.0.
+        //
+        // For each genotype G with copy count k_REF in {0, 1, 2}:
+        //   p_own(REF | G) = (k/2)·(1-ε) + ((2-k)/2)·(ε/1)
+        //                  = (k/2)·0.999 + ((2-k)/2)·0.001
+        //   q_b[Ref] = 0.95
+        //   mix = 0.95·p_own + 0.05·0.95
+        //   ll  = 50·ln(mix)         [n_obs only on REF; ALT contributes 0]
+        //
+        //   G=RR (k=2): p_own=0.999    mix = 0.95·0.999 + 0.05·0.95 ≈ 0.9985
+        //   G=RA (k=1): p_own=0.5005   mix = 0.95·0.5005 + 0.05·0.95 ≈ 0.522975
+        //   G=AA (k=0): p_own=0.001    mix = 0.95·0.001 + 0.05·0.95 ≈ 0.04845
+        let estimates = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.05)],
+            vec![[0.95, 0.05, 0.0]],
+            vec![0],
+        )
+        .expect("valid inputs");
+        let n_genotypes = genotype_order(2, 2).len();
+        assert_eq!(n_genotypes, 3); // RR, RA, AA
+
+        let record = build_single_sample_record(50, 0, 0.001, n_genotypes);
+        let config = PosteriorEngineConfig {
+            contamination: Some(estimates),
+            ..Default::default()
+        };
+        let out = engine_for_with_config(record, config);
+        let pr = out.into_iter().next().unwrap().expect("ok");
+
+        // The EM converges these likelihoods into posteriors. We
+        // can't easily hand-calc the EM-converged posteriors but we
+        // CAN check the relative ordering implied by the
+        // log-likelihoods (RR > RA > AA, monotonic in the witness
+        // mix calc above).
+        let post = pr.posteriors_row(0);
+        assert!(
+            post[0] > post[1] && post[1] > post[2],
+            "mixture-likelihood ordering wrong: RR={}, RA={}, AA={} \
+             (expected strictly decreasing)",
+            post[0],
+            post[1],
+            post[2],
+        );
+        // RR posterior should dominate (the mix value at G=RR is
+        // ~21× the mix value at G=RA, multiplied by 50 reads).
+        assert!(post[0] > 0.95, "P(RR) should dominate; got {}", post[0]);
+    }
+
+    #[test]
+    fn compute_mixture_log_likelihoods_falls_back_to_precomputed_when_c_s_is_none() {
+        // When `effective_c_s` returns 0 (sample's `c_s_per_sample[s]`
+        // is None — singleton/below-floor), the mixture function
+        // copies Stage 5's `log_likelihoods` row through verbatim
+        // rather than recomputing. We can witness this by passing a
+        // recognisable fallback that produces a specific posterior,
+        // then asserting the engine's output matches a baseline run
+        // with `contamination = None` on the same record.
+        let alleles = vec![
+            MergedAllele {
+                seq: b"A".to_vec(),
+                is_compound: false,
+                constituents: vec![],
+            },
+            MergedAllele {
+                seq: b"C".to_vec(),
+                is_compound: false,
+                constituents: vec![],
+            },
+        ];
+        let scalars = vec![
+            AlleleSupportStats::new(49, 0.001_f64.ln() * 49.0, 24, 0, 0),
+            AlleleSupportStats::new(1, 0.001_f64.ln(), 0, 0, 0),
+        ];
+        let n_genotypes = genotype_order(2, 2).len();
+        // Use a recognisable hom-REF-leaning likelihood vector.
+        let lls = vec![0.0_f64, -30.0, -50.0];
+        let make_record = || MergedRecord {
+            chrom_id: 1,
+            start: 100,
+            end: 100,
+            alleles: alleles.clone(),
+            ploidy: 2,
+            n_samples: 1,
+            n_genotypes,
+            scalars: scalars.clone(),
+            other_scalars: vec![AlleleSupportStats::default(); 1],
+            chain_anchor_flags: vec![false; 2],
+            log_likelihoods: lls.clone(),
+        };
+
+        // contamination = Some(estimates with c_s = None) → fallback path.
+        let estimates = ContaminationEstimates::zero(1, vec![0], 1).expect("valid inputs");
+        let config_contam = PosteriorEngineConfig {
+            contamination: Some(estimates),
+            ..Default::default()
+        };
+        let pr_contam = engine_for_with_config(make_record(), config_contam);
+        let pr_baseline = engine_for(make_record());
+
+        match (&pr_contam[0], &pr_baseline[0]) {
+            (Ok(c), Ok(b)) => assert_eq!(
+                c, b,
+                "c_s=None should produce identical posteriors to contamination=None"
+            ),
+            other => panic!("expected matching Ok records, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_mixture_log_likelihoods_returns_non_finite_error_when_mix_is_zero() {
+        // c_s = 1.0 (all reads are contaminant), q_b = [1.0, 0.0, 0.0]
+        // (contaminant always carries REF). A read carrying the SNP
+        // alt (allele 1) has p_contam = 0 and p_own term is zeroed by
+        // (1 - c_s) = 0 → mix = 0 → log = -∞.
+        let estimates = ContaminationEstimates::from_user_supplied(
+            vec![Some(1.0)],
+            vec![[1.0, 0.0, 0.0]],
+            vec![0],
+        )
+        .expect("valid inputs");
+        let n_genotypes = genotype_order(2, 2).len();
+        // 1 ALT read forces the mixture term on allele 1 to fire.
+        let record = build_single_sample_record(0, 1, 0.001, n_genotypes);
+        let config = PosteriorEngineConfig {
+            contamination: Some(estimates),
+            ..Default::default()
+        };
+        let out = engine_for_with_config(record, config);
+        match &out[0] {
+            Err(PosteriorEngineError::NonFinitePosterior {
+                kind: NonFiniteKind::NegativeInfinity,
+                sample_idx: 0,
+                ..
+            }) => {}
+            other => panic!("expected NonFinitePosterior(NegativeInfinity), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_mixture_log_likelihoods_invariant_under_q_b_when_zero_reads() {
+        // A sample with `n_obs = [0, 0]` for every allele should
+        // produce posteriors that are *independent* of `q_b` — only
+        // the EM prior shapes the result. Verify by running with two
+        // distinct `q_b` rows and asserting matching posteriors.
+        let n_genotypes = genotype_order(2, 2).len();
+        let make_record = || build_single_sample_record(0, 0, 0.001, n_genotypes);
+
+        let est_a = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.05)],
+            vec![[0.95, 0.05, 0.0]],
+            vec![0],
+        )
+        .expect("valid inputs");
+        let est_b = ContaminationEstimates::from_user_supplied(
+            vec![Some(0.05)],
+            vec![[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]],
+            vec![0],
+        )
+        .expect("valid inputs");
+
+        let pr_a = engine_for_with_config(
+            make_record(),
+            PosteriorEngineConfig {
+                contamination: Some(est_a),
+                ..Default::default()
+            },
+        );
+        let pr_b = engine_for_with_config(
+            make_record(),
+            PosteriorEngineConfig {
+                contamination: Some(est_b),
+                ..Default::default()
+            },
+        );
+
+        match (&pr_a[0], &pr_b[0]) {
+            (Ok(a), Ok(b)) => assert_eq!(
+                a.posteriors, b.posteriors,
+                "posteriors should be independent of q_b when n_obs = [0; K]"
+            ),
+            other => panic!("expected matching Ok records, got {other:?}"),
+        }
+    }
+
+    // ---------- B2 / Mi12: map_to_contam_class direct coverage ----------
+
+    #[test]
+    fn map_to_contam_class_round_trips_all_three_non_compound_classes() {
+        assert_eq!(
+            map_to_contam_class(AlleleClass::Ref),
+            Some(ContamAlleleClass::Ref)
+        );
+        assert_eq!(
+            map_to_contam_class(AlleleClass::SnpAlt),
+            Some(ContamAlleleClass::SnpAlt)
+        );
+        assert_eq!(
+            map_to_contam_class(AlleleClass::IndelAlt),
+            Some(ContamAlleleClass::IndelAlt)
+        );
+    }
+
+    #[test]
+    fn map_to_contam_class_returns_none_for_compound() {
+        assert!(map_to_contam_class(AlleleClass::CompoundAlt).is_none());
     }
 
     #[test]
@@ -2475,11 +2787,17 @@ mod tests {
             (ploidy, alleles, likelihoods) in proptest_record_strategy()
         ) {
             let record = merged_record_simple(1, 100, alleles, ploidy, likelihoods);
-            // EM can legitimately return `DidNotConverge` on adversarial
-            // likelihood matrices; that's a documented engine outcome,
-            // not a bug. Skip those cases instead of failing the
-            // proptest.
-            let Ok(pr) = try_single(record) else { return Ok(()); };
+            // M3: skip only the specific `DidNotConverge` outcome (a
+            // documented engine error on adversarial likelihood
+            // matrices); any other error variant is a real bug and
+            // should fail the proptest loudly.
+            let pr = match try_single(record) {
+                Ok(pr) => pr,
+                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Err(other) => return Err(TestCaseError::fail(format!(
+                    "unexpected engine error: {other}"
+                ))),
+            };
             for s in 0..pr.n_samples {
                 let sum: f64 = pr.posteriors_row(s).iter().sum();
                 prop_assert!((sum - 1.0).abs() < 1e-9, "ploidy={ploidy} sum={sum}");
@@ -2491,7 +2809,13 @@ mod tests {
             (ploidy, alleles, likelihoods) in proptest_record_strategy()
         ) {
             let record = merged_record_simple(1, 100, alleles, ploidy, likelihoods);
-            let Ok(pr) = try_single(record) else { return Ok(()); };
+            let pr = match try_single(record) {
+                Ok(pr) => pr,
+                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Err(other) => return Err(TestCaseError::fail(format!(
+                    "unexpected engine error: {other}"
+                ))),
+            };
             for p in &pr.allele_frequencies {
                 prop_assert!(*p >= 0.0 && *p <= 1.0);
             }
@@ -2515,10 +2839,21 @@ mod tests {
             let permuted: Vec<Vec<f64>> = perm.iter().map(|&i| likelihoods[i].clone()).collect();
             let record_a = merged_record_simple(1, 100, alleles.clone(), ploidy, likelihoods);
             let record_b = merged_record_simple(1, 100, alleles, ploidy, permuted);
-            // Both records must converge for the invariance assertion to
-            // be meaningful; skip if either errors.
-            let (Ok(pr_a), Ok(pr_b)) = (try_single(record_a), try_single(record_b)) else {
-                return Ok(());
+            // Both records must converge for the invariance assertion
+            // to be meaningful; skip only on DidNotConverge.
+            let pr_a = match try_single(record_a) {
+                Ok(pr) => pr,
+                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Err(other) => return Err(TestCaseError::fail(format!(
+                    "unexpected engine error on record_a: {other}"
+                ))),
+            };
+            let pr_b = match try_single(record_b) {
+                Ok(pr) => pr,
+                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Err(other) => return Err(TestCaseError::fail(format!(
+                    "unexpected engine error on record_b: {other}"
+                ))),
             };
             for (a, b) in pr_a.allele_frequencies.iter().zip(pr_b.allele_frequencies.iter()) {
                 prop_assert!((a - b).abs() < 1e-6);

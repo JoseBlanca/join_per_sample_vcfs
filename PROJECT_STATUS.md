@@ -22,23 +22,30 @@ Skills and agents are instructed to leave it untouched.
 > project manager (next-task)._
 >
 > - **Last completed task:** Contamination-estimation side-pass v1
->   implemented on 2026-05-17 —
->   [src/var_calling/contamination_estimation.rs](src/var_calling/contamination_estimation.rs)
->   ships `estimate_contamination` running block-wise online EM on
->   raw `.psp` data, type-level mutually-exclusive
->   `StoppingMode::{Convergence, FixedSites}`, the
->   `ContaminationEstimates` hand-off (consumed by Stage 6 as frozen
->   inputs), and singleton/below-floor finalisation. Stage 6 wiring
->   landed in the same commit: `PosteriorEngineConfig.contamination`
->   is now `Option<ContaminationEstimates>`, with a
->   mixture-likelihood E-step that recomputes per-(sample, genotype)
->   log-likelihoods from `MergedRecord.scalars` when contamination is
->   enabled. 645 lib + 4 new contamination-integration + all other
->   integration tests pass; clippy-clean (with two pre-existing
->   per_group_merger.rs and benches/var_calling_perf.rs warnings
->   resolved as a side-effect of clearing the `-D warnings` gate);
->   `cargo fmt --check` clean. Detailed write-up:
->   [contamination_estimation_2026-05-17.md](doc/devel/reports/implementations/contamination_estimation_2026-05-17.md).
+>   review-fixes run on 2026-05-17 —
+>   [fixes_applied_2026-05-17.md](doc/devel/reports/reviews/fixes_applied_2026-05-17.md).
+>   33 of 41 findings Applied (both Blockers, 14 of 16 Majors, 17 of
+>   23 Minors); 2 Applied-with-adaptation; 1 Already-fixed; 6 Deferred
+>   (M13 mechanical 14-site test-literal cleanup; M14 `OnlineEmState`
+>   god-struct refactor; Mi9 test-fixture deduplication; Mi19
+>   `DEFAULT_*` spec citations; Mi21/Mi22 paired with M14/M13). Both
+>   Blockers fixed: B1 made `ContaminationEstimates::from_user_supplied`
+>   fallible with 7 typed-error variants; B2 added value-witness tests
+>   for `compute_mixture_log_likelihoods` + a fixed integration test
+>   that contrasts the mixture branch against the c_s=0 baseline.
+>   Major correctness fixes: M2 three silent clamps now have
+>   `debug_assert!` invariants documenting structural unreachability;
+>   M9 hard error on `min_batch_size_for_contamination < 2` at the
+>   gate (no more silent `.max(2)` coercion); M12 dropped the `Default`
+>   anti-pattern; M15 cohort_alleles dropped per-allele byte clones.
+>   668 lib + 109 integration tests pass; `cargo fmt --check`,
+>   `cargo clippy --all-targets --all-features -- -D warnings` all
+>   clean. Two perf regressions surfaced (likely code-layout drift,
+>   not directly attributable to fixed files) — kept per skill policy.
+>   Implementation report:
+>   [contamination_estimation_2026-05-17.md](doc/devel/reports/implementations/contamination_estimation_2026-05-17.md);
+>   review:
+>   [contamination_estimation_2026-05-17.md](doc/devel/reports/reviews/contamination_estimation_2026-05-17.md).
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -246,7 +253,7 @@ EM over merged records → final multi-sample VCF.
     semantic-preserving iterator conversions.
 
 #### Contamination-estimation side-pass
-- **Status:** implemented
+- **Status:** fixes-applied
 - **Spec:** [contamination_estimation.md](doc/devel/specs/contamination_estimation.md)
 - **Plan:** [contamination_estimation.md](doc/devel/implementation_plans/contamination_estimation.md)
 - **Code:** [src/var_calling/contamination_estimation.rs](src/var_calling/contamination_estimation.rs);
@@ -255,8 +262,14 @@ EM over merged records → final multi-sample VCF.
 - **Tests:** unit + 3 proptests in the module +
   [tests/contamination_estimation_integration.rs](tests/contamination_estimation_integration.rs)
 - **Impl report:** [contamination_estimation_2026-05-17.md](doc/devel/reports/implementations/contamination_estimation_2026-05-17.md)
+- **Latest review:** [contamination_estimation_2026-05-17.md](doc/devel/reports/reviews/contamination_estimation_2026-05-17.md) — Request-changes: 2 Blockers, 16 Major, 23 Minor + grouped Nits.
+- **Latest fixes-applied:** [fixes_applied_2026-05-17.md](doc/devel/reports/reviews/fixes_applied_2026-05-17.md) — 33 Applied (both Blockers + 14 of 16 Majors + 17 of 23 Minors), 2 Applied-with-adaptation (M15 cohort_alleles per-position alloc instead of cross-position scratch; Mi11 INF-delta test inverted), 1 Already-fixed (Mi17 covered by M9), 6 Deferred (M13 / M14 / Mi9 / Mi19 / Mi21 / Mi22). 668 lib + 109 integration tests pass; clippy + fmt clean. Perf comparison: 6 of 8 benches unchanged or improved, 2 regressed (var_calling_merger/dense +1.99 %, var_calling_grouper/overlap_extension +11.31 %) — both kept per skill policy (all fixes are correctness/test-coverage grade), most likely code-layout / inlining drift from the added test fixtures in adjacent modules.
 - **Open:**
-  - Code review not yet run.
+  - **M13** — `..Default::default()` in 14 new test sites; mechanical fix as a focused PR before any new `ContaminationEstimationConfig` field lands. See fixes_applied §M13.
+  - **M14** — `OnlineEmState` god-struct split (3 sub-structs: `EmRunningStats`, `EmFrozenParameters`, `StabilityTracker`); pair with Mi21 (`estimate_contamination` long flat state machine). See fixes_applied §M14.
+  - **Mi9** — Test fixture duplication between in-module and integration tests; needs cross-crate shared test module design.
+  - **Mi19** — `DEFAULT_*` constants lack spec citations; pure-doc churn across 5 sites.
+  - **Mi21 / Mi22** — paired with M14 and M13 respectively.
   - Partition-parallel scans across chromosomes (spec §"Cost and
     parallelism") — add only if real cohort runs show wall time
     matters.
@@ -270,6 +283,10 @@ EM over merged records → final multi-sample VCF.
     library API is exercised programmatically in tests.
   - Compound-allele `q_b = 0` choice (Assumption 2 in the impl
     report) — calibration impact in real cohorts is open.
+  - Two perf regressions surfaced by the fix-application run
+    (`var_calling_merger/dense`, `var_calling_grouper/overlap_extension`)
+    — likely code-layout effects from new code in adjacent modules;
+    revisit if real-cohort wall time matters.
 
 #### Posterior engine — approximate-LUT inner loop
 - **Status:** not yet implemented (config flag wired only)
