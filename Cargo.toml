@@ -63,6 +63,11 @@ smallvec = "1.13"
 tempfile = "3"
 thiserror = "2.0.18"
 toml = "1.1"
+# `wide`: portable SIMD primitives — AVX2 on x86_64 (production
+# server), NEON on aarch64 (Apple Silicon dev laptop). Single
+# source for both ISAs. Used by posterior_engine::simd for the
+# lane-parallel ln/exp tables.
+wide = "0.7"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.13"
 
