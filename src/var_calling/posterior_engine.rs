@@ -760,6 +760,13 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
 
     let mut mixture_log_likelihoods = vec![0.0_f64; n_samples * n_genotypes];
 
+    // Per-sample scratch reused across the sample loop. Hoisted out of
+    // the loop body so the EM hot path doesn't pay 2 mallocs per
+    // sample per record (samply 2026-05-18 showed ~20 % of contam-on
+    // self-time in libc malloc).
+    let mut n_obs = vec![0_u32; n_alleles];
+    let mut mean_err = vec![0.0_f64; n_alleles];
+
     for sample_idx in 0..n_samples {
         let c_s = estimates.effective_c_s(sample_idx);
         if c_s <= 0.0 {
@@ -778,16 +785,18 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
 
         // Per-allele observation count and mean per-read error rate
         // for this sample at this site, recovered from the row of
-        // AlleleSupportStats Stage 5 emitted.
+        // AlleleSupportStats Stage 5 emitted. Both buffers are reused
+        // across samples; the loop below fully rewrites every slot, so
+        // there's no need to clear them between iterations.
         let sample_allele_scalars = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
-        let mut n_obs = vec![0_u32; n_alleles];
-        let mut mean_err = vec![0.0_f64; n_alleles];
         for (a, support) in sample_allele_scalars.iter().enumerate() {
             n_obs[a] = support.num_obs;
-            if support.num_obs > 0 {
+            mean_err[a] = if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
-                mean_err[a] = math.exp(per_read_log_err).clamp(MIN_BASE_ERROR, MAX_BASE_ERROR);
-            }
+                math.exp(per_read_log_err).clamp(MIN_BASE_ERROR, MAX_BASE_ERROR)
+            } else {
+                0.0
+            };
         }
 
         for (g_idx, gt_counts) in genotype_allele_counts.chunks_exact(n_alleles).enumerate() {
