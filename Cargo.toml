@@ -53,10 +53,12 @@ dhat = { version = "0.3", optional = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 flate2 = "1.1.9"
 lru = "0.16.3"
-noodles-core = "0.19.0"
-noodles-cram = "0.92.0"
-noodles-fasta = "0.60.0"
-noodles-sam = "0.84.0"
+noodles-bgzf = "0.47.0"
+noodles-core = "0.20.0"
+noodles-cram = "0.93.0"
+noodles-fasta = "0.61.0"
+noodles-sam = "0.85.0"
+noodles-vcf = "0.88.0"
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1.13"

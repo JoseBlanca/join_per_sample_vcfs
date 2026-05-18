@@ -21,36 +21,23 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Stage 3 sdust filter review-fixes on
->   2026-05-17 —
->   [dust_filter_2026-05-17_applied.md](doc/devel/reports/reviews/dust_filter_2026-05-17_applied.md).
->   36 of 41 review findings Applied (7 of 8 Majors + 22 of 24
->   Minors + 7 Nits); 1 Applied-with-adaptation (Mi21
->   cargo-doc partially blocked on parallel `posterior_engine`
->   WIP); 2 Won't-fix per project preference (M4 out-of-order =
->   merger's responsibility; Mi6 informational tracing).
->   Headline correctness fixes: M1 `InvalidPos` variant +
->   `checked_sub` on the 1-based→0-based conversion; M6 dropped
->   `{0}`/`{source}` interpolation from error `Display`; M7/M8
->   `// PANIC-FREE:` / `// INVARIANT:` comments at every
->   unchecked decrement plus a `debug_assert!` on the suffix-trim
->   invariant. Test additions: 13 new tests, including a
->   property/invariant sweep over ~40 K seeded-random inputs
->   (`sdust_invariants_hold_on_random_seeded_inputs`) that pins
->   the structural invariants `is_masked` relies on; the M5
->   strict-`>` boundary test (6 A's must not mask, 7 A's must)
->   verified against the cloned binary. Structural cleanups: M14
->   `Option<LoadedChrom>` bundle for the three co-dependent
->   fields, M17 `dust_density_exceeds` helper extracted from three
->   open-coded sites, M13 `i64` reverse loop replaced with
->   `(0..hi).rev()` over u32. `sdust_mask` and `SdustIntervals`
->   made private (Q3): public surface is now `DustFilter`,
->   `DustFilterConfig`, `DustFilterError`, the two `DEFAULT_*`
->   constants. 38 dust_filter tests pass; `cargo fmt --check`,
->   `cargo clippy --all-targets --all-features -- -D warnings`
->   clean. `cargo doc` surfaced and fixed two pre-existing doc
->   errors in untouched code; full doc-build awaits parallel
->   posterior_engine refactor.
+> - **Last completed task:** Cohort VCF writer (Stage 6 sink) on
+>   2026-05-18 —
+>   [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/implementations/cohort_vcf_writer_2026-05-18.md).
+>   New `src/var_calling/vcf_writer/` module streaming
+>   `PosteriorRecord` items to `.vcf` (plain text) or `.vcf.gz`
+>   (bgzf, htslib-compatible EOF marker) via noodles-vcf 0.88;
+>   VCF 4.4 header with `AF`/`AC`/`AN`/`DP`/`CA` INFO and
+>   `GT:GQ:DP:AD` FORMAT (plus opt-in `GP` via
+>   `WriterConfig::emit_gp`, default off). `QUAL = ∞` caps at
+>   9999 (`QUAL_MAX` constant). Atomic `<output>.tmp` →
+>   `<output>` rename on `finish`. Whole noodles family bumped to
+>   the 0.20/0.47/0.61/0.85/0.88/0.93 release wave (user
+>   approved a full upgrade rather than carrying dual-version
+>   resolution). 27 new tests pass (23 in-crate + 4 integration);
+>   full lib suite still 756 passing; `cargo fmt --check`,
+>   `cargo clippy --lib --tests --all-features -- -D warnings`
+>   clean.
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -315,6 +302,26 @@ EM over merged records → final multi-sample VCF.
     (`var_calling_merger/dense`, `var_calling_grouper/overlap_extension`)
     — likely code-layout effects from new code in adjacent modules;
     revisit if real-cohort wall time matters.
+
+#### Cohort VCF writer (Stage 6 sink)
+- **Status:** implemented
+- **Plan:** [cohort_vcf_writer.md](doc/devel/implementation_plans/cohort_vcf_writer.md)
+- **Code:** [src/var_calling/vcf_writer/](src/var_calling/vcf_writer/)
+- **Tests:** 23 unit tests in the module + 4 integration tests in
+  [tests/cohort_vcf_writer_integration.rs](tests/cohort_vcf_writer_integration.rs).
+- **Impl report:** [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/implementations/cohort_vcf_writer_2026-05-18.md)
+- **Open:**
+  - End-to-end exercise through the cohort CLI (lands with the
+    `pop_var_caller cohort` subcommand slice — see *Standing
+    items*).
+  - `bcftools view` / `bcftools stats` manual smoke; deferred to
+    the cohort CLI slice where a real CLI invocation exists.
+  - Tabix `.tbi` index alongside `.vcf.gz` — out of v1 scope; add
+    when random-access matters.
+  - `PL` (phred-scaled likelihoods) FORMAT field — needs Stage 5 →
+    `PosteriorRecord` forwarding of `log_likelihoods`.
+  - Per-sample contamination fraction in INFO — wires in once the
+    cohort CLI threads `ContaminationEstimates` into the writer.
 
 #### Posterior engine — approximate-LUT inner loop
 - **Status:** not yet implemented (config flag wired only)
