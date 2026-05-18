@@ -13,5 +13,6 @@ freebayes/
 samtools/
 htslib/
 sdust/
+bcftools/
 /CLAUDE.md
 /.claude/
