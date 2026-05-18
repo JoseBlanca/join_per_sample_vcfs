@@ -21,41 +21,36 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Posterior-engine performance review
->   on 2026-05-18 —
->   [perf_posterior_engine_2026-05-18.md](doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md).
->   Four parallel per-category sub-agents (methodology,
->   allocations, data_layout, hot_loops) ran against
->   `src/var_calling/posterior_engine{.rs,/}` plus deep web
->   research + local-source ground-truthing against the
->   vendored `gatk/`, `freebayes/`, `bcftools/` trees. Verdict:
->   **Run experiments** — 4 Hot-path (H4 homogeneous-fixation
->   hoist subsumes H1 SIMD `log_sum_exp_2_x4` `-INF`
->   short-circuit; H2 `log_indep` cross-batch reuse; H3
->   GATK-style natural-log `softplus_neg` table for
->   `log_sum_exp_2_x4`), 11 Likely (per-engine `RecordScratch`
->   lift for 13 per-record `Vec` allocations,
->   `log_likelihoods` batch-of-4 transpose, autovec-blocking
->   branch in `accumulate_expected_counts`,
->   `#[inline(always)]`/`#[cold]` audits, in-bench
->   self-validation), 11 Speculative (SQUAREM, warm-start
->   across records, adaptive genotype pruning à la Octopus,
->   `f64x8` AVX-512 backend, PGO, `x86-64-v4` floor, …). Built
->   on the May 17/18 bench evidence (24.41 → 22.33 → 18.15
->   µs/record across `ExactMath` / `InterpUnivariateMath` /
->   `InterpUnivariateSimdMath`); no new samply / DHAT was
->   collected this round — measurement plan §3 names both as
->   the first things to acquire before applying L5+ /
->   promoting Likely findings. Cross-codebase finding: none of
->   the three reference callers vectorise ln/exp (GATK's
->   `JacobianLogTable` is the only precedent and it's natural-log-tabulating
->   in the same shape H3 proposes); our `wide::f64x4`-native
->   ln/exp already leads the field. Per-category audit trail
->   at `tmp/perf_review_2026-05-18_posterior_engine/`. The
->   prior task on this date (cohort VCF writer review fixes
->   applied on 2026-05-18 —
->   [cohort_vcf_writer_2026-05-18_applied.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18_applied.md))
->   sits alongside under the vcf_writer block.
+> - **Last completed task:** Posterior-engine perf review-application
+>   wave 2 on 2026-05-18 (afternoon) —
+>   [posterior_engine_perf_2026-05-18_v2.md](doc/devel/reports/implementations/posterior_engine_perf_2026-05-18_v2.md).
+>   Three commits on `main`: H2 + H4 hoist (`013b49f`), post-H4
+>   pinned profile (`666a432`), per-engine `RecordScratch` lift
+>   (`9594533`). H2+H4 measured **−14 % to −32 %** wall-clock on the
+>   contam-on 64×10 000 fixture (conservative bound −14 %). The
+>   RecordScratch lift dropped allocator cycles ~17.5 % → ~13.3 %
+>   (~−4 pp) while refunding ~0.7 pp to memmove for the 5 output
+>   clones — wall-time inconclusive on this dev laptop due to
+>   thermal-state noise. Cycle-distribution comparison is the
+>   trustworthy signal. **Hardware-counter analysis reshaped the
+>   priority list**: IPC = 2.97 (near-saturating superscalar),
+>   L1-dcache-miss = 0.34 %, branch-miss = 0.11 % — the engine is
+>   execution-bound, not memory-bound. This refutes L8/L9 (the
+>   `log_likelihoods` transpose) — cache layout has no room to help
+>   when L1 is hitting 99.66 %. The remaining levers all reduce
+>   *instruction count* or add parallelism: rayon-over-records
+>   (16–128× on a server), AVX-512 `f64x8` (~2×), or algorithmic
+>   shortcuts. Rayon-over-records is the clear next move; deferred
+>   to a separate session per the user's call.
+>   Review-finding status updates (full table in the wave-2
+>   report): H1 / H2 / H4 / L5–L7 applied; H3 demoted to
+>   Speculative; L4 dropped; L8 / L9 demoted to Note (data refutes
+>   them); S5 (`f64x8` backend) promoted to Likely.
+>   Prior tasks today (cohort VCF writer review fixes-applied
+>   [cohort_vcf_writer_2026-05-18_applied.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18_applied.md);
+>   posterior-engine perf review
+>   [perf_posterior_engine_2026-05-18.md](doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md))
+>   sit alongside under their respective feature blocks.
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -267,7 +262,7 @@ EM over merged records → final multi-sample VCF.
 - **Plan:** [posterior_engine.md](doc/devel/implementation_plans/posterior_engine.md)
 - **Code:** [src/var_calling/posterior_engine.rs](src/var_calling/posterior_engine.rs)
 - **Tests:** unit tests in the module + [tests/posterior_engine_integration.rs](tests/posterior_engine_integration.rs)
-- **Impl report:** [posterior_engine_2026-05-16.md](doc/devel/reports/implementations/posterior_engine_2026-05-16.md)
+- **Impl reports:** [posterior_engine_2026-05-16.md](doc/devel/reports/implementations/posterior_engine_2026-05-16.md); perf history: [perf 2026-05-17](doc/devel/reports/implementations/posterior_engine_perf_2026-05-17.md), [SIMD analysis 2026-05-18](doc/devel/reports/implementations/posterior_engine_simd_analysis_2026-05-18.md), [perf wave-1 2026-05-18](doc/devel/reports/implementations/posterior_engine_perf_2026-05-18.md), [post-H4 profile](doc/devel/reports/implementations/posterior_engine_post_h4_profile_2026-05-18.md), [perf wave-2 (H4 + RecordScratch) 2026-05-18](doc/devel/reports/implementations/posterior_engine_perf_2026-05-18_v2.md)
 - **Latest reviews:** [posterior_engine_2026-05-16.md](doc/devel/reports/reviews/posterior_engine_2026-05-16.md) — Request-changes: 2 Blocker test-gap findings, 11 Major, 13 Minor; [perf_posterior_engine_2026-05-18.md](doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md) — Run-experiments: 4 Hot-path (H4 homogeneous-fixation hoist subsumes H1 SIMD `log_sum_exp_2_x4 -INF` short-circuit; H2 `log_indep` cross-batch reuse; H3 GATK-style natural-log `softplus_neg` table for `log_sum_exp_2_x4`), 11 Likely (per-engine `RecordScratch` lift for 13 per-record allocs, `log_likelihoods` batch-of-4 transpose, autovec-blocking branch in `accumulate_expected_counts`, `#[inline(always)]` / `#[cold]` audits, in-bench self-validation), 11 Speculative (SQUAREM, warm-start across records, adaptive genotype pruning à la Octopus, cross-record tensor-style batching at same-shape, `f64x8` AVX-512 backend, PGO, `x86-64-v4` floor, …). Built on the May 17/18 bench evidence; the deep web + local-source (`gatk/`, `freebayes/`, `bcftools/`) research that fed it surfaced that none of the three reference callers vectorise ln/exp (GATK's `JacobianLogTable` is the closest precedent for H3) — `wide::f64x4`-native ln/exp already leads the field.
 - **Latest fixes-applied:** [posterior_engine_2026-05-16_applied.md](doc/devel/reports/reviews/posterior_engine_2026-05-16_applied.md) — both Blockers fixed (B1 `NonFinitePosterior` test, B2 trivial-record row-sum bug + tests); 10 of 11 Majors applied (M3 config validation deferred — needs engine-vs-CLI boundary decision); 8 of 13 Minors applied (Mi5 perf bench, Mi6 golden test, Mi12 `with_config -> Result`, Mi13 fixture consolidation deferred as standalone follow-ups). 622 lib + 7 integration tests pass, clippy-clean on the in-scope files.
 - **Open:**
@@ -275,21 +270,14 @@ EM over merged records → final multi-sample VCF.
   - **Mi5** — `benches/posterior_engine_perf.rs` regression-threshold criterion bench.
   - **Mi6** — golden `tests/golden/posterior_engine/*` fixtures locking emitted `f64` values across the representative-record matrix.
   - **Mi12 / Mi13** — `with_config -> Result<Self, _>` for fail-fast validation, and fixture consolidation across the unit / integration crate boundary.
-  - **Perf H4** — homogeneous-fixation hoist: precompute `log_prior[g]` once per EM iter when `f_s` is constant across samples; bit-identical when triggered. Subsumes H1 (SIMD `log_sum_exp_2_x4` `-INF` short-circuit). See [perf review §5 Hot-path](doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md#hot-path).
-  - **Perf H2** — hoist `log_indep` per-EM-iter (currently recomputed per (batch_idx, g_idx) in `e_step_simd`). Bit-identical.
-  - **Perf H3** — GATK-style natural-log `softplus_neg(x) = ln(1 + exp(-x))` table for `log_sum_exp_2_x4` (8 kB, 1024-bin linear interp over [0, 30]); replaces 3 transcendentals with 1 lookup. Order *after* H4: H4 may demote H3 to Speculative by removing most of the call sites.
-  - **Perf L5–L7** — per-engine `RecordScratch` to lift 13 per-record `Vec` allocations into a reusable buffer + lift the mixture pre-pass's owned `Vec` (the in-source comment at posterior_engine.rs:763 already records a prior similar hoist worth ~20 % of contam-on self-time). DHAT first to confirm site ranking.
-  - **Perf L8/L9** — transpose `log_likelihoods`/`posteriors` to batch-of-4-samples-major in `e_step_simd` so strided gather/scatter become contiguous `vmovupd`.
-  - **Perf measurement** — fresh post-SIMD samply profile (today's flamegraph evidence is pre-SIMD May-17) and one DHAT pass before applying L5+.
+  - **Perf — applied 2026-05-18 (closed):** H1 (subsumed by H4), H2 (`log_indep` cross-batch reuse), H4 (homogeneous-fixation hoist) — see commit `013b49f`. L5–L7 (per-engine `RecordScratch` lift) — see commit `9594533`. Full session report at [posterior_engine_perf_2026-05-18_v2.md](doc/devel/reports/implementations/posterior_engine_perf_2026-05-18_v2.md).
+  - **Perf — refuted by hardware-counter profile (demoted to Note):** L8/L9 (`log_likelihoods` / `posteriors` batch-of-4 transpose). Post-RecordScratch IPC = 2.97, L1 hit 99.66 %, branch-miss 0.11 % — the engine is execution-bound, not memory-bound. Cache layout has no remaining room to help.
+  - **Perf — demoted to Speculative:** H3 (GATK-style `softplus_neg` table). H4 removed most `log_sum_exp_2_x4` calls; `__ieee754_log_fma` is now only ~3 % of cycles.
+  - **Perf — promoted to Likely:** S5 (AVX-512 `f64x8` backend). With IPC=2.97 single-thread saturated, wider lanes are one of the few remaining single-thread levers (~2× on Skylake-X+/Zen 4-5 hosts).
+  - **Perf next big lever — rayon-over-records.** Order-of-magnitude lever (16–128× on a server). RecordScratch lift is structured for per-thread ownership: each worker gets its own scratch. Separate plan; deferred from the wave-2 session per user's call.
+  - **Perf remaining small-but-cheap:** L3 (`#[inline(always)]` on `log_sum_exp_*_x4`, gated by `cargo asm` check), L10 (in-bench `debug_assert!` on `diagnostics.iterations`).
   - End-to-end PspReader→…→PosteriorEngine integration test lands
     with the cohort CLI subcommand (needs a real ref-fasta fixture).
-  - Pre-existing clippy warnings in
-    [src/var_calling/per_group_merger.rs:1786 + 1796](src/var_calling/per_group_merger.rs#L1786)
-    and in
-    [benches/var_calling_perf.rs](benches/var_calling_perf.rs)
-    were resolved on 2026-05-17 as a side-effect of clearing the
-    contamination work's `-D warnings` gate; both
-    semantic-preserving iterator conversions.
 
 #### Contamination-estimation side-pass
 - **Status:** fixes-applied
