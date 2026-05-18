@@ -233,7 +233,11 @@ mod tests {
     #[test]
     fn diploid_biallelic_nonzero_pairs_have_lengths_one_two_one() {
         let s = shape_for(2, 2);
-        let offsets: Vec<_> = s.nonzero_pairs_offsets.iter().map(|&(_, len)| len).collect();
+        let offsets: Vec<_> = s
+            .nonzero_pairs_offsets
+            .iter()
+            .map(|&(_, len)| len)
+            .collect();
         assert_eq!(offsets, vec![1, 2, 1]);
     }
 

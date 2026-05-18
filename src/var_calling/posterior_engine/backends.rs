@@ -80,7 +80,12 @@ pub trait MathBackend: Sync {
     #[inline]
     fn exp_x4(&self, x: wide::f64x4) -> wide::f64x4 {
         let a = x.to_array();
-        wide::f64x4::from([self.exp(a[0]), self.exp(a[1]), self.exp(a[2]), self.exp(a[3])])
+        wide::f64x4::from([
+            self.exp(a[0]),
+            self.exp(a[1]),
+            self.exp(a[2]),
+            self.exp(a[3]),
+        ])
     }
 
     /// Whether this backend's lane methods are SIMD-accelerated and

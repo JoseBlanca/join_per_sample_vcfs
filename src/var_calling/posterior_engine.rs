@@ -793,7 +793,8 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
             n_obs[a] = support.num_obs;
             mean_err[a] = if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
-                math.exp(per_read_log_err).clamp(MIN_BASE_ERROR, MAX_BASE_ERROR)
+                math.exp(per_read_log_err)
+                    .clamp(MIN_BASE_ERROR, MAX_BASE_ERROR)
             } else {
                 0.0
             };
@@ -899,8 +900,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
     let mut mean_err_all = vec![0.0_f64; n_samples * n_alleles];
     for sample_idx in 0..n_samples {
         c_s_all[sample_idx] = estimates.effective_c_s(sample_idx);
-        let sample_allele_scalars =
-            &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
+        let sample_allele_scalars = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
         for (a, support) in sample_allele_scalars.iter().enumerate() {
             mean_err_all[sample_idx * n_alleles + a] = if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
@@ -1046,8 +1046,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
             continue; // fallback row already in place
         }
         let q_b = estimates.q_b_for_sample(sample_idx);
-        let sample_allele_scalars =
-            &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
+        let sample_allele_scalars = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
 
         for (g_idx, gt_counts) in genotype_allele_counts.chunks_exact(n_alleles).enumerate() {
             let mut ll: f64 = 0.0;
@@ -1115,6 +1114,17 @@ struct EmContext<'a> {
     /// `safe_ln(1.0 - f_s)` per sample. Same record-static rationale as
     /// `log_f_per_sample`.
     log_one_minus_f_per_sample: &'a [f64],
+    /// Every sample shares the same `f_s` value (e.g. the default
+    /// config sets `fixation_index_default = 0.0` and leaves
+    /// `fixation_index_overrides = None`). When `true`,
+    /// `log_f_per_sample[0]` and `log_one_minus_f_per_sample[0]` are
+    /// the cohort-wide values, and the entire per-genotype log-prior
+    /// (including the homozygous-IBD `log_sum_exp_2` term) is
+    /// sample-invariant within an EM iteration — `e_step` /
+    /// `e_step_simd` precompute it once into
+    /// `EmScratch::log_prior_per_g` and splat from there. See
+    /// H2 + H4 in `doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md`.
+    homogeneous_fixation: bool,
     compound_pseudocount: f64,
 }
 
@@ -1126,6 +1136,22 @@ struct EmScratch {
     p_effective: Vec<f64>,
     /// Natural log of `p_effective`. Length `n_alleles`.
     log_p_effective: Vec<f64>,
+    /// Per-genotype `log_indep` = `log_multinomial_coeffs[g] + Σ k *
+    /// log_p_effective[a]` over non-zero pairs. Sample-invariant
+    /// within one EM iteration; `e_step` / `e_step_simd` rebuild it
+    /// from the current `log_p_effective` at the top of each call
+    /// and reuse it across every sample/batch (eliminates the
+    /// cross-batch redundancy flagged as H2 in the perf review).
+    /// Length `n_genotypes`.
+    log_indep_per_g: Vec<f64>,
+    /// Per-genotype log-prior under the homogeneous-fixation hoist.
+    /// Filled by `e_step` / `e_step_simd` at the top of each call
+    /// when `ctx.homogeneous_fixation` is `true`; the inner sample /
+    /// batch loop then splats from here instead of recomputing
+    /// `log_sum_exp_2(log_one_minus_f + log_indep, log_f +
+    /// log_p_effective[homo])` per sample. Length `n_genotypes`.
+    /// Heterogeneous-fixation paths leave this alone.
+    log_prior_per_g: Vec<f64>,
     /// Per-genotype unnormalised log-posterior for the current
     /// sample. Length `n_genotypes`.
     log_post_unnorm: Vec<f64>,
@@ -1143,6 +1169,8 @@ impl EmScratch {
         Self {
             p_effective: vec![0.0; n_alleles],
             log_p_effective: vec![0.0; n_alleles],
+            log_indep_per_g: vec![0.0; n_genotypes],
+            log_prior_per_g: vec![0.0; n_genotypes],
             log_post_unnorm: vec![0.0; n_genotypes],
             log_post_unnorm_lane: vec![wide::f64x4::ZERO; n_genotypes],
             expected_counts: vec![0.0; n_alleles],
@@ -1287,6 +1315,19 @@ fn run_em_for_record<M: MathBackend>(
         .map(|&f_s| safe_ln(math, 1.0 - f_s))
         .collect();
 
+    // Detect the homogeneous-fixation case (every sample shares the
+    // same `f_s`). Default config — `fixation_index_default = 0.0`,
+    // `fixation_index_overrides = None` — hits this path; a CLI
+    // `--inbreeding` global override also hits it. The
+    // heterogeneous case (per-sample overrides differing) stays on
+    // the per-sample path. Comparing on `f_s` rather than on the
+    // logged value sidesteps `NaN != NaN` (and `-INF == -INF` is
+    // `true` for any IEEE-754 implementation, but the typed input
+    // here is always finite).
+    let homogeneous_fixation = fixation_indices
+        .first()
+        .is_some_and(|&first| fixation_indices.iter().all(|&f| f == first));
+
     let allele_classes = classify_alleles(&alleles);
     let pseudocounts: Vec<f64> = allele_classes
         .iter()
@@ -1312,6 +1353,7 @@ fn run_em_for_record<M: MathBackend>(
         pseudocounts: &pseudocounts,
         log_f_per_sample: &log_f_per_sample,
         log_one_minus_f_per_sample: &log_one_minus_f_per_sample,
+        homogeneous_fixation,
         compound_pseudocount: config.compound_alt_pseudocount,
     };
 
@@ -1546,41 +1588,53 @@ fn e_step<M: MathBackend>(
         *slot_log = safe_ln(math, p);
     }
 
+    // H2: `log_indep` depends only on `log_p_effective` and the
+    // genotype shape — sample-invariant within an EM iteration.
+    // Precompute once and read inside the sample loop instead of
+    // rebuilding per (sample, g_idx).
+    fill_log_indep_per_g(ctx, scratch);
+
+    // H4: when every sample shares the same `f_s`, the whole
+    // per-genotype log-prior is also sample-invariant; fold it into
+    // `scratch.log_prior_per_g` once and let the sample loop splat.
+    // Heterogeneous-fixation records take the per-sample path below.
+    if ctx.homogeneous_fixation {
+        fill_log_prior_per_g_homogeneous(ctx, math, scratch);
+    }
+
     let ll_chunks = log_likelihoods.chunks_exact(ctx.n_genotypes);
     let post_chunks = posteriors.chunks_exact_mut(ctx.n_genotypes);
 
     for (sample_idx, (ll_row, post_row)) in ll_chunks.zip(post_chunks).enumerate() {
-        // `log_f` and `log_one_minus_f` are precomputed in EmContext
-        // because `fixation_indices` is record-static; this loop only
-        // needs to read them indexed by `sample_idx`.
-        let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
-        let log_f = ctx.log_f_per_sample[sample_idx];
+        if ctx.homogeneous_fixation {
+            // log_prior_per_g[g] already carries the IBD term; just
+            // add the sample's likelihood per genotype.
+            for (g_idx, (&ll, post_slot)) in ll_row
+                .iter()
+                .zip(scratch.log_post_unnorm.iter_mut())
+                .enumerate()
+            {
+                *post_slot = ll + scratch.log_prior_per_g[g_idx];
+            }
+        } else {
+            // Heterogeneous: `log_f` / `log_one_minus_f` change per
+            // sample, so the IBD branch has to run per-cell.
+            let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
+            let log_f = ctx.log_f_per_sample[sample_idx];
 
-        for (g_idx, &ll) in ll_row.iter().enumerate() {
-            // Inner sum walks only the non-zero (allele, count) pairs
-            // for this genotype — the `if k == 0` skip-branch and the
-            // per-cell `homozygous_allele` linear scan that the
-            // un-shape-cached path used are both gone. For diploid each
-            // pairs slice is 1 (homozygous) or 2 (heterozygous) entries.
-            let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
-            let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
-
-            let log_indep = ctx.shape.log_multinomial_coeffs[g_idx]
-                + pairs
-                    .iter()
-                    .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
-                    .sum::<f64>();
-
-            let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
-                Some(homo_allele) => log_sum_exp_2(
-                    math,
-                    log_one_minus_f + log_indep,
-                    log_f + scratch.log_p_effective[homo_allele as usize],
-                ),
-                // Heterozygous genotype: IBD component contributes 0.
-                None => log_one_minus_f + log_indep,
-            };
-            scratch.log_post_unnorm[g_idx] = ll + log_prior;
+            for (g_idx, &ll) in ll_row.iter().enumerate() {
+                let log_indep = scratch.log_indep_per_g[g_idx];
+                let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
+                    Some(homo_allele) => log_sum_exp_2(
+                        math,
+                        log_one_minus_f + log_indep,
+                        log_f + scratch.log_p_effective[homo_allele as usize],
+                    ),
+                    // Heterozygous genotype: IBD component contributes 0.
+                    None => log_one_minus_f + log_indep,
+                };
+                scratch.log_post_unnorm[g_idx] = ll + log_prior;
+            }
         }
 
         let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
@@ -1650,6 +1704,20 @@ fn e_step_simd<M: MathBackend>(
         *slot_log = safe_ln(math, p);
     }
 
+    // H2: cache `log_indep[g]` once per iteration; the batch loop
+    // splats from it instead of recomputing per (batch, g_idx).
+    fill_log_indep_per_g(ctx, scratch);
+
+    // H4: when fixation is homogeneous (default config — `f_s = 0`
+    // for every sample), the whole per-genotype log-prior is
+    // sample-invariant. Fold it once into `scratch.log_prior_per_g`
+    // and let the batch loop splat from there instead of doing a
+    // 3-transcendental `log_sum_exp_2_x4` per (batch, homozygous g)
+    // whose `log_f_v = -∞` lane makes the work redundant anyway.
+    if ctx.homogeneous_fixation {
+        fill_log_prior_per_g_homogeneous(ctx, math, scratch);
+    }
+
     let n_genotypes = ctx.n_genotypes;
     let n_samples = ctx.n_samples;
     let n_full_batches = n_samples / 4;
@@ -1659,43 +1727,44 @@ fn e_step_simd<M: MathBackend>(
     for batch_idx in 0..n_full_batches {
         let s0 = batch_idx * 4;
 
-        // Lane-load the per-sample fixation-index logs for this
-        // batch's 4 samples.
-        let log_f_v = wide::f64x4::from([
-            ctx.log_f_per_sample[s0],
-            ctx.log_f_per_sample[s0 + 1],
-            ctx.log_f_per_sample[s0 + 2],
-            ctx.log_f_per_sample[s0 + 3],
-        ]);
-        let log_one_minus_f_v = wide::f64x4::from([
-            ctx.log_one_minus_f_per_sample[s0],
-            ctx.log_one_minus_f_per_sample[s0 + 1],
-            ctx.log_one_minus_f_per_sample[s0 + 2],
-            ctx.log_one_minus_f_per_sample[s0 + 3],
-        ]);
+        // `log_f_v` / `log_one_minus_f_v` only matter on the
+        // heterogeneous-fixation path; the homogeneous case reads
+        // its log-prior straight from `scratch.log_prior_per_g`.
+        let (log_f_v, log_one_minus_f_v) = if ctx.homogeneous_fixation {
+            (wide::f64x4::ZERO, wide::f64x4::ZERO)
+        } else {
+            (
+                wide::f64x4::from([
+                    ctx.log_f_per_sample[s0],
+                    ctx.log_f_per_sample[s0 + 1],
+                    ctx.log_f_per_sample[s0 + 2],
+                    ctx.log_f_per_sample[s0 + 3],
+                ]),
+                wide::f64x4::from([
+                    ctx.log_one_minus_f_per_sample[s0],
+                    ctx.log_one_minus_f_per_sample[s0 + 1],
+                    ctx.log_one_minus_f_per_sample[s0 + 2],
+                    ctx.log_one_minus_f_per_sample[s0 + 3],
+                ]),
+            )
+        };
 
         // Compute `log_post_unnorm[g]` as a `f64x4` across the 4
         // samples for every genotype.
         for g_idx in 0..n_genotypes {
-            // `log_indep` is identical across the 4 samples (depends
-            // only on the shape and `log_p_effective`).
-            let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
-            let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
-            let log_indep = ctx.shape.log_multinomial_coeffs[g_idx]
-                + pairs
-                    .iter()
-                    .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
-                    .sum::<f64>();
-            let log_indep_v = wide::f64x4::splat(log_indep);
-
-            let log_prior_v = match ctx.shape.homozygous_allele_for[g_idx] {
-                Some(homo_allele) => {
-                    let term1 = log_one_minus_f_v + log_indep_v;
-                    let term2 =
-                        log_f_v + wide::f64x4::splat(scratch.log_p_effective[homo_allele as usize]);
-                    log_sum_exp_2_x4(math, term1, term2)
+            let log_prior_v = if ctx.homogeneous_fixation {
+                wide::f64x4::splat(scratch.log_prior_per_g[g_idx])
+            } else {
+                let log_indep_v = wide::f64x4::splat(scratch.log_indep_per_g[g_idx]);
+                match ctx.shape.homozygous_allele_for[g_idx] {
+                    Some(homo_allele) => {
+                        let term1 = log_one_minus_f_v + log_indep_v;
+                        let term2 = log_f_v
+                            + wide::f64x4::splat(scratch.log_p_effective[homo_allele as usize]);
+                        log_sum_exp_2_x4(math, term1, term2)
+                    }
+                    None => log_one_minus_f_v + log_indep_v,
                 }
-                None => log_one_minus_f_v + log_indep_v,
             };
 
             // Lane-load the per-sample likelihood for this genotype.
@@ -1746,30 +1815,36 @@ fn e_step_simd<M: MathBackend>(
     }
 
     // Tail: process any samples beyond the last full batch via the
-    // scalar inner loop. Repeats the per-genotype work for these few
-    // samples — typically 0..3 of them, negligible cost.
+    // scalar inner loop. Reads from the same `log_indep_per_g` /
+    // `log_prior_per_g` scratch the batch loop populated above, so
+    // no per-tail-sample recomputation.
     for sample_idx in tail_start..n_samples {
-        let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
-        let log_f = ctx.log_f_per_sample[sample_idx];
         let ll_row = &log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
 
-        for (g_idx, &ll) in ll_row.iter().enumerate() {
-            let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
-            let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
-            let log_indep = ctx.shape.log_multinomial_coeffs[g_idx]
-                + pairs
-                    .iter()
-                    .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
-                    .sum::<f64>();
-            let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
-                Some(homo_allele) => log_sum_exp_2(
-                    math,
-                    log_one_minus_f + log_indep,
-                    log_f + scratch.log_p_effective[homo_allele as usize],
-                ),
-                None => log_one_minus_f + log_indep,
-            };
-            scratch.log_post_unnorm[g_idx] = ll + log_prior;
+        if ctx.homogeneous_fixation {
+            for (g_idx, (&ll, post_slot)) in ll_row
+                .iter()
+                .zip(scratch.log_post_unnorm.iter_mut())
+                .enumerate()
+            {
+                *post_slot = ll + scratch.log_prior_per_g[g_idx];
+            }
+        } else {
+            let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
+            let log_f = ctx.log_f_per_sample[sample_idx];
+
+            for (g_idx, &ll) in ll_row.iter().enumerate() {
+                let log_indep = scratch.log_indep_per_g[g_idx];
+                let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
+                    Some(homo_allele) => log_sum_exp_2(
+                        math,
+                        log_one_minus_f + log_indep,
+                        log_f + scratch.log_p_effective[homo_allele as usize],
+                    ),
+                    None => log_one_minus_f + log_indep,
+                };
+                scratch.log_post_unnorm[g_idx] = ll + log_prior;
+            }
         }
 
         let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
@@ -1781,8 +1856,7 @@ fn e_step_simd<M: MathBackend>(
                 kind: classify_nonfinite(log_z),
             });
         }
-        let post_row =
-            &mut posteriors[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
+        let post_row = &mut posteriors[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
         for (g_idx, post_slot) in post_row.iter_mut().enumerate() {
             let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
             if !posterior.is_finite() {
@@ -2014,12 +2088,77 @@ fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> Posteri
 }
 
 // ---------------------------------------------------------------------
+// E-step prelude helpers
+// ---------------------------------------------------------------------
+
+/// Fill `scratch.log_indep_per_g` from the current `log_p_effective`.
+///
+/// `log_indep[g] = log_multinomial_coeffs[g] + Σ k · log_p_effective[a]`
+/// over the genotype's non-zero `(allele, count)` pairs (1 entry for
+/// homozygous, 2 for heterozygous in the diploid case). Sample-
+/// invariant within an EM iteration; both `e_step` and `e_step_simd`
+/// call this once per iteration so the sample / batch loop can read
+/// from the cache instead of rebuilding (H2 in
+/// `perf_posterior_engine_2026-05-18.md`).
+#[inline]
+fn fill_log_indep_per_g(ctx: &EmContext<'_>, scratch: &mut EmScratch) {
+    for g_idx in 0..ctx.n_genotypes {
+        let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
+        let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
+        scratch.log_indep_per_g[g_idx] = ctx.shape.log_multinomial_coeffs[g_idx]
+            + pairs
+                .iter()
+                .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
+                .sum::<f64>();
+    }
+}
+
+/// Fill `scratch.log_prior_per_g` from the current `log_indep_per_g`
+/// under the homogeneous-fixation invariant (every sample has the
+/// same `f_s`). Caller must have just run [`fill_log_indep_per_g`].
+///
+/// Reads the cohort-wide `log_f` / `log_one_minus_f` from
+/// `ctx.log_f_per_sample[0]` / `[..._one_minus...][0]`. The scalar
+/// `log_sum_exp_2` short-circuits on `-∞` arguments (default config
+/// path: `f_s = 0.0` → `log_f = -∞`), so the homozygous branch
+/// usually folds to `log_one_minus_f + log_indep` without any
+/// transcendental call. H4 in the perf review.
+#[inline]
+fn fill_log_prior_per_g_homogeneous<M: MathBackend>(
+    ctx: &EmContext<'_>,
+    math: &M,
+    scratch: &mut EmScratch,
+) {
+    debug_assert!(
+        !ctx.log_f_per_sample.is_empty(),
+        "homogeneous_fixation set but log_f_per_sample is empty"
+    );
+    let log_f = ctx.log_f_per_sample[0];
+    let log_one_minus_f = ctx.log_one_minus_f_per_sample[0];
+    for g_idx in 0..ctx.n_genotypes {
+        let log_indep = scratch.log_indep_per_g[g_idx];
+        scratch.log_prior_per_g[g_idx] = match ctx.shape.homozygous_allele_for[g_idx] {
+            Some(homo_allele) => log_sum_exp_2(
+                math,
+                log_one_minus_f + log_indep,
+                log_f + scratch.log_p_effective[homo_allele as usize],
+            ),
+            None => log_one_minus_f + log_indep,
+        };
+    }
+}
+
+// ---------------------------------------------------------------------
 // Numeric helpers
 // ---------------------------------------------------------------------
 
 #[inline]
 fn safe_ln<M: MathBackend>(math: &M, x: f64) -> f64 {
-    if x <= 0.0 { f64::NEG_INFINITY } else { math.ln(x) }
+    if x <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        math.ln(x)
+    }
 }
 
 #[inline]
@@ -3346,9 +3485,7 @@ mod tests {
 
     impl ErrorReport {
         fn from_samples(label: &'static str, mut samples: Vec<(f64, &'static str)>) -> Self {
-            samples.sort_by(|a, b| {
-                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             let n = samples.len();
             let pick = |q: f64| -> (f64, &'static str) {
                 if n == 0 {
@@ -3400,13 +3537,12 @@ mod tests {
             self.fixtures_total += 1;
             assert_eq!(exact.n_samples, approx.n_samples);
             assert_eq!(exact.n_genotypes, approx.n_genotypes);
-            assert_eq!(exact.allele_frequencies.len(), approx.allele_frequencies.len());
+            assert_eq!(
+                exact.allele_frequencies.len(),
+                approx.allele_frequencies.len()
+            );
 
-            for (e, a) in exact
-                .posteriors
-                .iter()
-                .zip(approx.posteriors.iter())
-            {
+            for (e, a) in exact.posteriors.iter().zip(approx.posteriors.iter()) {
                 self.posterior_errors.push(((e - a).abs(), fixture));
             }
             for (e, a) in exact
@@ -3434,9 +3570,7 @@ mod tests {
             for sample_idx in 0..exact.n_samples {
                 let row = exact.posteriors_row(sample_idx);
                 let mut sorted = row.to_vec();
-                sorted.sort_by(|a, b| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 let margin = if sorted.len() >= 2 {
                     sorted[0] - sorted[1]
                 } else {
@@ -3575,13 +3709,7 @@ mod tests {
         drive_pair(
             &mut accum,
             "triallelic_8_samples",
-            merged_record_simple(
-                1,
-                400,
-                vec![b"A", b"C", b"G"],
-                2,
-                trial_likelihoods,
-            ),
+            merged_record_simple(1, 400, vec![b"A", b"C", b"G"], 2, trial_likelihoods),
             approx,
             None,
         );
@@ -3661,8 +3789,11 @@ mod tests {
 
         // Per-sample fixation index overrides.
         let mut config = PosteriorEngineConfig::with_project_defaults();
-        config.fixation_index_overrides =
-            Some((0..32).map(|s: usize| if s.is_multiple_of(2) { 0.0 } else { 0.4 }).collect());
+        config.fixation_index_overrides = Some(
+            (0..32)
+                .map(|s: usize| if s.is_multiple_of(2) { 0.0 } else { 0.4 })
+                .collect(),
+        );
         drive_pair(
             &mut accum,
             "fixation_index_per_sample_overrides",
@@ -3721,7 +3852,13 @@ mod tests {
         // Contamination on, mixed c_s = None and c_s > 0.
         let mut mixed_cfg = PosteriorEngineConfig::with_project_defaults();
         let c_s_mixed: Vec<Option<f64>> = (0..32)
-            .map(|s: usize| if s.is_multiple_of(3) { None } else { Some(0.05_f64) })
+            .map(|s: usize| {
+                if s.is_multiple_of(3) {
+                    None
+                } else {
+                    Some(0.05_f64)
+                }
+            })
             .collect();
         mixed_cfg.contamination = Some(
             crate::var_calling::contamination_estimation::ContaminationEstimates::from_user_supplied(

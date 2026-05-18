@@ -32,7 +32,9 @@ use merge_per_sample_vcfs::var_calling::per_position_merger::PerPositionPileups;
 use merge_per_sample_vcfs::var_calling::posterior_engine::backends::{
     ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend,
 };
-use merge_per_sample_vcfs::var_calling::posterior_engine::{PosteriorEngine, PosteriorEngineConfig};
+use merge_per_sample_vcfs::var_calling::posterior_engine::{
+    PosteriorEngine, PosteriorEngineConfig,
+};
 use merge_per_sample_vcfs::var_calling::variant_grouping::OverlappingVariantGroup;
 
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
@@ -152,11 +154,8 @@ fn drain<M: MathBackend + Copy>(
     for run in 0..N_RUNS {
         let run_start = Instant::now();
         let records = merged.to_vec();
-        let engine = PosteriorEngine::with_math_backend(
-            records.into_iter().map(Ok),
-            config.clone(),
-            math,
-        );
+        let engine =
+            PosteriorEngine::with_math_backend(records.into_iter().map(Ok), config.clone(), math);
         let mut n = 0_u64;
         for item in engine {
             let r = item.expect("engine produced an error");

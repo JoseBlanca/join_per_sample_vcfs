@@ -147,10 +147,7 @@ mod tests {
     fn assert_relative(a: f64, b: f64, tol: f64, label: &str) {
         let scale = b.abs().max(1.0);
         let err = (a - b).abs() / scale;
-        assert!(
-            err <= tol,
-            "{label}: |{a} - {b}| / {scale} = {err} > {tol}"
-        );
+        assert!(err <= tol, "{label}: |{a} - {b}| / {scale} = {err} > {tol}");
     }
 
     // ---- ln_approx ----
@@ -233,5 +230,4 @@ mod tests {
             );
         }
     }
-
 }

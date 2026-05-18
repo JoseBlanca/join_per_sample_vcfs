@@ -716,9 +716,7 @@ fn bench_posterior_engine(c: &mut Criterion) {
     );
     bench_posterior_drain(
         &mut group,
-        &format!(
-            "biallelic_snp_no_contam_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate"
-        ),
+        &format!("biallelic_snp_no_contam_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate"),
         &merged_diploid,
         &config_no_contam,
         InterpUnivariateMath,
@@ -743,9 +741,7 @@ fn bench_posterior_engine(c: &mut Criterion) {
     );
     bench_posterior_drain(
         &mut group,
-        &format!(
-            "biallelic_snp_contam_on_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate"
-        ),
+        &format!("biallelic_snp_contam_on_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate"),
         &merged_diploid,
         &config_contam,
         InterpUnivariateMath,
@@ -773,9 +769,7 @@ fn bench_posterior_engine(c: &mut Criterion) {
     );
     bench_posterior_drain(
         &mut group,
-        &format!(
-            "biallelic_snp_ploidy_3_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate"
-        ),
+        &format!("biallelic_snp_ploidy_3_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate"),
         &merged_triploid,
         &config_no_contam,
         InterpUnivariateMath,
@@ -792,7 +786,6 @@ fn bench_posterior_engine(c: &mut Criterion) {
 
     group.finish();
 }
-
 
 criterion_group! {
     name = benches;
