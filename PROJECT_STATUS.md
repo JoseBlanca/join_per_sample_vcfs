@@ -21,23 +21,31 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort VCF writer (Stage 6 sink) on
+> - **Last completed task:** Cohort VCF writer code review on
 >   2026-05-18 —
->   [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/implementations/cohort_vcf_writer_2026-05-18.md).
->   New `src/var_calling/vcf_writer/` module streaming
->   `PosteriorRecord` items to `.vcf` (plain text) or `.vcf.gz`
->   (bgzf, htslib-compatible EOF marker) via noodles-vcf 0.88;
->   VCF 4.4 header with `AF`/`AC`/`AN`/`DP`/`CA` INFO and
->   `GT:GQ:DP:AD` FORMAT (plus opt-in `GP` via
->   `WriterConfig::emit_gp`, default off). `QUAL = ∞` caps at
->   9999 (`QUAL_MAX` constant). Atomic `<output>.tmp` →
->   `<output>` rename on `finish`. Whole noodles family bumped to
->   the 0.20/0.47/0.61/0.85/0.88/0.93 release wave (user
->   approved a full upgrade rather than carrying dual-version
->   resolution). 27 new tests pass (23 in-crate + 4 integration);
->   full lib suite still 756 passing; `cargo fmt --check`,
->   `cargo clippy --lib --tests --all-features -- -D warnings`
->   clean.
+>   [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18.md).
+>   Eight parallel category sub-agents (reliability, errors,
+>   naming, defaults, idiomatic, refactor_safety, smells,
+>   extras) ran against `src/var_calling/vcf_writer/` on branch
+>   `review/vcf-writer` (off impl commit `cd1977a`). Verdict:
+>   **Request-changes** — 1 Blocker (silent allele-index drop
+>   in `tally_called_alleles` producing VCFs with `sum(AC) +
+>   REF != AN`), 15 Major (5 of them an `errors.rs` redesign
+>   cluster — opaque `Io` collapse, stringly `Encode`,
+>   missing `#[non_exhaustive]`, mechanism-prefixed `Display`,
+>   field-inverted `SampleCountMismatch`; 4 a malformed-input
+>   panic + DP-overflow cluster in `record_encode.rs`; plus
+>   parent-dir-fsync gap in `sink.rs`, `Default for
+>   WriterConfig` empty-path footgun, `<output>.tmp` leak on
+>   header-write failure, missing `#[must_use]`, no criterion
+>   bench), 19 Minor, grouped Nits. Verification commands run
+>   inside the container: `cargo fmt --check` clean for
+>   in-scope files (10 hunks failing only in parallel
+>   `posterior_engine/*` WIP), `cargo clippy --lib --tests
+>   --all-features -- -D warnings` clean, `cargo test --lib
+>   var_calling::vcf_writer` 23/0, integration test 4/0.
+>   Per-category audit trail at
+>   `tmp/review_2026-05-18_vcf_writer/`.
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -304,12 +312,13 @@ EM over merged records → final multi-sample VCF.
     revisit if real-cohort wall time matters.
 
 #### Cohort VCF writer (Stage 6 sink)
-- **Status:** implemented
+- **Status:** reviewed
 - **Plan:** [cohort_vcf_writer.md](doc/devel/implementation_plans/cohort_vcf_writer.md)
 - **Code:** [src/var_calling/vcf_writer/](src/var_calling/vcf_writer/)
 - **Tests:** 23 unit tests in the module + 4 integration tests in
   [tests/cohort_vcf_writer_integration.rs](tests/cohort_vcf_writer_integration.rs).
 - **Impl report:** [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/implementations/cohort_vcf_writer_2026-05-18.md)
+- **Latest review:** [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18.md) — Request-changes: 1 Blocker, 15 Major, 19 Minor + grouped Nits.
 - **Open:**
   - End-to-end exercise through the cohort CLI (lands with the
     `pop_var_caller cohort` subcommand slice — see *Standing
@@ -322,6 +331,10 @@ EM over merged records → final multi-sample VCF.
     `PosteriorRecord` forwarding of `log_likelihoods`.
   - Per-sample contamination fraction in INFO — wires in once the
     cohort CLI threads `ContaminationEstimates` into the writer.
+  - Review fixes pending; B1 (silent AC drop) + the `errors.rs`
+    redesign cluster (M1–M5) + the malformed-input panic +
+    DP-overflow cluster in `record_encode.rs` (M6–M9) are the
+    top-3 priorities per the review's §5.
 
 #### Posterior engine — approximate-LUT inner loop
 - **Status:** not yet implemented (config flag wired only)
