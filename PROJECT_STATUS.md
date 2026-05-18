@@ -21,23 +21,34 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort VCF writer (Stage 6 sink) on
->   2026-05-18 —
->   [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/implementations/cohort_vcf_writer_2026-05-18.md).
->   New `src/var_calling/vcf_writer/` module streaming
->   `PosteriorRecord` items to `.vcf` (plain text) or `.vcf.gz`
->   (bgzf, htslib-compatible EOF marker) via noodles-vcf 0.88;
->   VCF 4.4 header with `AF`/`AC`/`AN`/`DP`/`CA` INFO and
->   `GT:GQ:DP:AD` FORMAT (plus opt-in `GP` via
->   `WriterConfig::emit_gp`, default off). `QUAL = ∞` caps at
->   9999 (`QUAL_MAX` constant). Atomic `<output>.tmp` →
->   `<output>` rename on `finish`. Whole noodles family bumped to
->   the 0.20/0.47/0.61/0.85/0.88/0.93 release wave (user
->   approved a full upgrade rather than carrying dual-version
->   resolution). 27 new tests pass (23 in-crate + 4 integration);
->   full lib suite still 756 passing; `cargo fmt --check`,
->   `cargo clippy --lib --tests --all-features -- -D warnings`
->   clean.
+> - **Last completed task:** Cohort VCF writer review fixes
+>   applied on 2026-05-18 —
+>   [cohort_vcf_writer_2026-05-18_applied.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18_applied.md).
+>   Applied 1 Blocker + 14 of 15 Majors + 16 of 19 Minors +
+>   grouped Nits (31 findings Applied, 4 Deferred — M15
+>   criterion bench, Mi11/Mi12 public-API renames, Mi14
+>   shared-test-fixtures module — and 1 Applied-with-adaptation
+>   Mi16). Headline changes: typed `VcfWriteError`
+>   per-operation variants (`CreateTmp`/`WriteHeader`/`WriteRecord`/
+>   `FinishBgzf`/`FsyncFile`/`FsyncDir`/`Rename`) + boxed
+>   `Encode { operation, source }` + `#[non_exhaustive]`; new
+>   variants for B1 (`AlleleIndexOutOfBounds`), M6
+>   (`InconsistentRecord`), M7/M8 (`DepthOverflow`); structural
+>   validation up-front in `encode` replaces six unchecked
+>   slice indexes; `sink.rs::finish` now fsyncs the parent
+>   directory after rename; `Default for WriterConfig`
+>   dropped in favour of `WriterConfig::new` + named consts;
+>   `CohortVcfWriter` gains `#[must_use]`, a `config()`
+>   accessor, exhaustive-destructure `Debug`, `<output>.tmp`
+>   cleanup on header-write failure, and a
+>   `(ploidy, n_alleles)` keyed genotype-table cache. 22 new
+>   regression tests added (41 unit + 4 integration; up from 23 +
+>   4 in the impl commit). Validation inside the container:
+>   `cargo fmt --check` clean for in-scope files, `cargo clippy
+>   --lib --tests --all-features -- -D warnings` clean,
+>   `cargo test --all-targets` lib 778 / integration 113, zero
+>   failures. Branch: `review/vcf-writer` @ `cd1977a` →
+>   <new tip>.
 > - **Next task:** _set by human PM._ Standing candidates: re-bench
 >   the full Wave-1 set on a quieter host with a clean
 >   pre-perf-review checkout baseline; apply the remaining Hot-path
@@ -304,12 +315,14 @@ EM over merged records → final multi-sample VCF.
     revisit if real-cohort wall time matters.
 
 #### Cohort VCF writer (Stage 6 sink)
-- **Status:** implemented
+- **Status:** fixes-applied
 - **Plan:** [cohort_vcf_writer.md](doc/devel/implementation_plans/cohort_vcf_writer.md)
 - **Code:** [src/var_calling/vcf_writer/](src/var_calling/vcf_writer/)
-- **Tests:** 23 unit tests in the module + 4 integration tests in
+- **Tests:** 41 unit tests in the module + 4 integration tests in
   [tests/cohort_vcf_writer_integration.rs](tests/cohort_vcf_writer_integration.rs).
 - **Impl report:** [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/implementations/cohort_vcf_writer_2026-05-18.md)
+- **Latest review:** [cohort_vcf_writer_2026-05-18.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18.md)
+- **Latest fixes-applied:** [cohort_vcf_writer_2026-05-18_applied.md](doc/devel/reports/reviews/cohort_vcf_writer_2026-05-18_applied.md) — 31 Applied (1 Blocker + 14 of 15 Majors + 16 of 19 Minors + Nits) + 1 Applied-with-adaptation (Mi16) + 4 Deferred.
 - **Open:**
   - End-to-end exercise through the cohort CLI (lands with the
     `pop_var_caller cohort` subcommand slice — see *Standing
@@ -322,6 +335,21 @@ EM over merged records → final multi-sample VCF.
     `PosteriorRecord` forwarding of `log_likelihoods`.
   - Per-sample contamination fraction in INFO — wires in once the
     cohort CLI threads `ContaminationEstimates` into the writer.
+  - **M15** — `benches/vcf_writer_perf.rs` (criterion bench at
+    1000 samples × biallelic SNP / `emit_gp = true` /
+    encode-only); deferred from the review fix pass.
+  - **Mi11 + Mi12** — `WriterConfig` → `CohortVcfWriterConfig`
+    + `tool_string` → `source_label`/`tool_name` public-API
+    renames; pair into a coordinated naming pass before
+    publishing the crate.
+  - **Mi14** — three-way test-fixture deduplication via a
+    `pub(crate) test_fixtures` module + `test-support` feature
+    flag; deferred.
+  - **M13 follow-up** — fault-injection test for `new()` tmp
+    cleanup; lands when the sink-injection seam exists.
+  - **Mi16 follow-up** — full `BGZF_EOF` deduplication
+    (currently shared in-crate but the integration test keeps
+    its own copy).
 
 #### Posterior engine — approximate-LUT inner loop
 - **Status:** not yet implemented (config flag wired only)
