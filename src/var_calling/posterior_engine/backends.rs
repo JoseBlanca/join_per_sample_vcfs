@@ -155,14 +155,22 @@ impl MathBackend for InterpUnivariateSimdMath {
         super::interp::exp_approx(x)
     }
 
+    // Lane-of-4 routes through `wide`'s built-in polynomial `f64x4::ln`
+    // / `f64x4::exp`, NOT the sibling `interp::{ln_approx_x4,
+    // exp_approx_x4}` table-lookup helpers. The May 17 perf report
+    // assumed the table approach would dominate; in practice the
+    // table-lookup `_x4` helpers do per-lane scalar bit-decomposition
+    // and per-lane scalar table reads (the SIMD ops only wrap a scalar
+    // gather), which costs more than `wide`'s fully-SIMD polynomial.
+    // See doc/devel/reports/implementations/posterior_engine_simd_analysis_2026-05-18.md.
     #[inline]
     fn ln_x4(&self, x: [f64; 4]) -> [f64; 4] {
-        super::interp::ln_approx_x4(wide::f64x4::from(x)).to_array()
+        wide::f64x4::from(x).ln().to_array()
     }
 
     #[inline]
     fn exp_x4(&self, x: [f64; 4]) -> [f64; 4] {
-        super::interp::exp_approx_x4(wide::f64x4::from(x)).to_array()
+        wide::f64x4::from(x).exp().to_array()
     }
 
     const HAS_LANE_4: bool = true;
