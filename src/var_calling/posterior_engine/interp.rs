@@ -157,7 +157,13 @@ use wide::f64x4;
 
 /// Lane-parallel `ln_approx`. Same approximation contract as the
 /// scalar [`ln_approx`].
+///
+/// Unused since 2026-05-18: the SIMD backend now routes lane-of-4
+/// through `wide::f64x4::ln`, which outperforms this table-lookup
+/// helper (see the SIMD analysis report). Kept under `allow(dead_code)`
+/// pending a removal pass.
 #[inline]
+#[allow(dead_code)]
 pub(super) fn ln_approx_x4(x: f64x4) -> f64x4 {
     let arr = x.to_array();
     // If any lane is non-positive, non-finite, or subnormal, route
@@ -211,8 +217,9 @@ pub(super) fn ln_approx_x4(x: f64x4) -> f64x4 {
 }
 
 /// Lane-parallel `exp_approx`. Same approximation contract as the
-/// scalar [`exp_approx`].
+/// scalar [`exp_approx`]. Unused — see `ln_approx_x4` docs.
 #[inline]
+#[allow(dead_code)]
 pub(super) fn exp_approx_x4(y: f64x4) -> f64x4 {
     let arr = y.to_array();
     if arr.iter().any(|&v| !v.is_finite()) {

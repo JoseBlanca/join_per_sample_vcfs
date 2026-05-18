@@ -9,6 +9,7 @@ use merge_per_sample_vcfs::per_sample_pileup::pileup::AlleleSupportStats;
 use merge_per_sample_vcfs::var_calling::per_group_merger::{
     MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
 };
+use merge_per_sample_vcfs::var_calling::posterior_engine::backends::ExactMath;
 use merge_per_sample_vcfs::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
@@ -55,10 +56,19 @@ fn merged_record_simple(
 }
 
 fn collect_ok(records: Vec<MergedRecord>) -> Vec<PosteriorRecord> {
+    // Pin to `ExactMath` so the strict-tolerance assertions below
+    // (e.g. row-sum within `1e-9`) keep the bit-identical-baseline
+    // semantics they were written against. Backend equivalence under
+    // the looser approximate-parity budget is enforced separately by
+    // the `tests_math_backend_accuracy` harness in the engine module.
     let upstream = records.into_iter().map(Ok::<_, PerGroupMergerError>);
-    PosteriorEngine::new(upstream)
-        .collect::<Result<Vec<_>, PosteriorEngineError>>()
-        .expect("posterior engine emitted error")
+    PosteriorEngine::with_math_backend(
+        upstream,
+        PosteriorEngineConfig::with_project_defaults(),
+        ExactMath,
+    )
+    .collect::<Result<Vec<_>, PosteriorEngineError>>()
+    .expect("posterior engine emitted error")
 }
 
 #[test]

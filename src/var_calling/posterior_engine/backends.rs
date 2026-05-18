@@ -6,20 +6,27 @@
 //! one implementation for another via
 //! [`PosteriorEngine::with_math_backend`].
 //!
-//! Two backends ship today:
+//! Three backends ship today:
 //!
 //! - [`ExactMath`] — calls `f64::ln` / `f64::exp` directly. Bit-identical
-//!   to the unoptimised engine and the default for
-//!   [`PosteriorEngine::new`] / [`PosteriorEngine::with_config`].
+//!   to the unoptimised engine. Opt-in via
+//!   [`PosteriorEngine::with_math_backend`] when reproducibility against
+//!   the unoptimised engine matters.
 //! - [`InterpUnivariateMath`] — IEEE-decomposition + 1D linear-interp
-//!   lookup tables. Approximate (~`1e-6` relative error per call) but
-//!   substantially faster than native `ln` / `exp`. Opt-in via
-//!   [`PosteriorEngine::with_math_backend`] until the accuracy harness
-//!   confirms the trade-off is acceptable for the default.
+//!   lookup tables. Approximate (~`1e-6` relative error per call) and
+//!   ~10 % faster than [`ExactMath`] in pure scalar code. Opt-in; useful
+//!   when the SIMD backend isn't suitable (e.g. testing the scalar
+//!   approximation in isolation).
+//! - [`InterpUnivariateSimdMath`] — lane-of-4 `ln` / `exp` via `wide`'s
+//!   built-in polynomial approximation. The **default** for
+//!   [`PosteriorEngine::new`] / [`PosteriorEngine::with_config`]: same
+//!   parity-budget margin as [`InterpUnivariateMath`] and ~25 % faster
+//!   than [`ExactMath`] on the contam-on bench. See
+//!   `doc/devel/reports/implementations/posterior_engine_simd_analysis_2026-05-18.md`.
 //!
 //! The trait is `Sync` because backends are constructed once and shared
-//! across the EM loop's reads; no mutable state is required for either
-//! backend (both are zero-sized — [`InterpUnivariateMath`] reads
+//! across the EM loop's reads; no mutable state is required for any
+//! backend (all three are zero-sized — the interp backends read
 //! `'static`-lifetime tables defined in the sibling `interp` module).
 //!
 //! [`PosteriorEngine`]: super::PosteriorEngine

@@ -43,7 +43,7 @@ use merge_per_sample_vcfs::var_calling::per_position_merger::{
     PerPositionMerger, PerPositionMergerError, PerPositionPileups,
 };
 use merge_per_sample_vcfs::var_calling::posterior_engine::backends::{
-    ExactMath, InterpUnivariateMath, MathBackend,
+    ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend,
 };
 use merge_per_sample_vcfs::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig,
@@ -723,6 +723,15 @@ fn bench_posterior_engine(c: &mut Criterion) {
         &config_no_contam,
         InterpUnivariateMath,
     );
+    bench_posterior_drain(
+        &mut group,
+        &format!(
+            "biallelic_snp_no_contam_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate_simd"
+        ),
+        &merged_diploid,
+        &config_no_contam,
+        InterpUnivariateSimdMath,
+    );
 
     // --- biallelic SNP, contamination on (exercises mixture pre-pass) ---
     bench_posterior_drain(
@@ -740,6 +749,15 @@ fn bench_posterior_engine(c: &mut Criterion) {
         &merged_diploid,
         &config_contam,
         InterpUnivariateMath,
+    );
+    bench_posterior_drain(
+        &mut group,
+        &format!(
+            "biallelic_snp_contam_on_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate_simd"
+        ),
+        &merged_diploid,
+        &config_contam,
+        InterpUnivariateSimdMath,
     );
 
     // --- polyploid (ploidy = 3) biallelic SNP ---
@@ -761,6 +779,15 @@ fn bench_posterior_engine(c: &mut Criterion) {
         &merged_triploid,
         &config_no_contam,
         InterpUnivariateMath,
+    );
+    bench_posterior_drain(
+        &mut group,
+        &format!(
+            "biallelic_snp_ploidy_3_{N_SAMPLES}_samples_{N_GROUPS}_groups/interp_univariate_simd"
+        ),
+        &merged_triploid,
+        &config_no_contam,
+        InterpUnivariateSimdMath,
     );
 
     group.finish();

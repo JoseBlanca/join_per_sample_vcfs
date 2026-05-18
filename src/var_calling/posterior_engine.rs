@@ -51,7 +51,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use self::backends::{InterpUnivariateMath, MathBackend};
+use self::backends::{InterpUnivariateSimdMath, MathBackend};
 use self::shape::{GenotypeShape, shape_for};
 use crate::per_sample_pileup::pileup::AlleleSupportStats;
 use crate::var_calling::contamination_estimation::{
@@ -526,7 +526,7 @@ pub struct EmDiagnostics {
 ///     PosteriorEngine::new(upstream).collect()
 /// }
 /// ```
-pub struct PosteriorEngine<I, M = InterpUnivariateMath>
+pub struct PosteriorEngine<I, M = InterpUnivariateSimdMath>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
     M: MathBackend,
@@ -559,15 +559,15 @@ where
     }
 }
 
-impl<I> PosteriorEngine<I, InterpUnivariateMath>
+impl<I> PosteriorEngine<I, InterpUnivariateSimdMath>
 where
     I: Iterator<Item = Result<MergedRecord, PerGroupMergerError>>,
 {
     /// Construct an engine with the [project defaults] and the default
-    /// math backend ([`InterpUnivariateMath`], ~10 % faster than
+    /// math backend ([`InterpUnivariateSimdMath`], ~25 % faster than
     /// [`ExactMath`] on the contam-on bench with ~50× margin under the
-    /// approximate-parity budget — see the implementation plan's
-    /// step-7 decision).
+    /// approximate-parity budget — see the 2026-05-18 SIMD analysis
+    /// report).
     ///
     /// For bit-identical reproducibility against the unoptimised
     /// engine, construct with
@@ -580,9 +580,9 @@ where
     }
 
     /// Construct an engine with explicit tuning and the default math
-    /// backend ([`InterpUnivariateMath`]).
+    /// backend ([`InterpUnivariateSimdMath`]).
     pub fn with_config(upstream: I, config: PosteriorEngineConfig) -> Self {
-        Self::with_math_backend(upstream, config, InterpUnivariateMath)
+        Self::with_math_backend(upstream, config, InterpUnivariateSimdMath)
     }
 }
 
@@ -592,9 +592,10 @@ where
     M: MathBackend,
 {
     /// Construct an engine with explicit tuning and an explicit math
-    /// backend. Use this to opt into an approximate backend (e.g.
-    /// `InterpUnivariateMath`) or to opt back into [`ExactMath`] if a
-    /// future release flips the default.
+    /// backend. Use this to opt into a scalar-only approximate backend
+    /// (`InterpUnivariateMath`) or to opt back into [`ExactMath`] if
+    /// bit-identical reproducibility against the unoptimised engine
+    /// matters.
     pub fn with_math_backend(upstream: I, config: PosteriorEngineConfig, math: M) -> Self {
         Self {
             upstream,
@@ -1892,7 +1893,7 @@ mod tests {
     // The semantic / numeric tests below assert tight tolerances
     // (often 1e-12) against hand-computed expected values. They pin
     // against `ExactMath` explicitly so the production default
-    // (`InterpUnivariateMath`) can move without breaking them; the
+    // (`InterpUnivariateSimdMath`) can move without breaking them; the
     // backend-equivalence guarantee is enforced separately by
     // `tests_math_backend_accuracy` (see the accuracy harness).
     fn engine_for(record: MergedRecord) -> Vec<Result<PosteriorRecord, PosteriorEngineError>> {
