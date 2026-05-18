@@ -535,6 +535,12 @@ where
     config: PosteriorEngineConfig,
     math: M,
     is_latched: bool,
+    /// Reusable per-record scratch buffers. Allocated empty here and
+    /// resized once per record in `run_em_for_record`; steady-state
+    /// records of the same shape allocate nothing. See
+    /// [`RecordScratch`] for the layout and the post-H4 profile
+    /// motivation.
+    scratch: RecordScratch,
 }
 
 impl<I, M> fmt::Debug for PosteriorEngine<I, M>
@@ -551,6 +557,7 @@ where
             config,
             math: _,
             is_latched,
+            scratch: _,
         } = self;
         f.debug_struct("PosteriorEngine")
             .field("config", config)
@@ -602,6 +609,7 @@ where
             config,
             math,
             is_latched: false,
+            scratch: RecordScratch::empty(),
         }
     }
 
@@ -615,7 +623,7 @@ where
         if self.config.approximate_posterior_calculation {
             return Err(PosteriorEngineError::ApproximateModeNotYetImplemented);
         }
-        run_em_for_record(record, &self.config, &self.math)
+        run_em_for_record(record, &self.config, &self.math, &mut self.scratch)
     }
 }
 
@@ -663,22 +671,29 @@ enum AlleleClass {
     CompoundAlt,
 }
 
+/// Single-allele classifier. Shared between [`run_em_for_record`]
+/// (which writes the result into `scratch.allele_classes` per allele
+/// without a Vec allocation) and the test-only [`classify_alleles`]
+/// helper.
+fn classify_allele(allele: &MergedAllele, ref_len: usize, is_first: bool) -> AlleleClass {
+    if is_first {
+        AlleleClass::Ref
+    } else if allele.is_compound {
+        AlleleClass::CompoundAlt
+    } else if allele.seq.len() == ref_len {
+        AlleleClass::SnpAlt
+    } else {
+        AlleleClass::IndelAlt
+    }
+}
+
+#[cfg(test)]
 fn classify_alleles(alleles: &[MergedAllele]) -> Vec<AlleleClass> {
     let ref_len = alleles[0].seq.len();
     alleles
         .iter()
         .enumerate()
-        .map(|(idx, allele)| {
-            if idx == 0 {
-                AlleleClass::Ref
-            } else if allele.is_compound {
-                AlleleClass::CompoundAlt
-            } else if allele.seq.len() == ref_len {
-                AlleleClass::SnpAlt
-            } else {
-                AlleleClass::IndelAlt
-            }
-        })
+        .map(|(idx, allele)| classify_allele(allele, ref_len, idx == 0))
         .collect()
 }
 
@@ -719,20 +734,30 @@ fn map_to_contam_class(class: AlleleClass) -> Option<ContamAlleleClass> {
 /// in-tree caller is [`run_em_for_record`], which validates the
 /// merged record's shape via [`validate_record_shape`] before calling
 /// here.
+/// Fill `scratch.mixture_log_likelihoods` with the
+/// mixture-recomputed per-(sample, genotype) log-likelihood under
+/// the configured contamination estimates. Scalar fallback path;
+/// `compute_mixture_log_likelihoods_simd` is the AVX2 default.
+///
+/// Caller invariants: `scratch.mixture_contam_class_per_allele` has
+/// been filled, and `scratch.mixture_log_likelihoods` /
+/// `scratch.mixture_n_obs` / `scratch.mixture_mean_err` /
+/// `scratch.mixture_c_s_all` are resized to the current record's
+/// shape.
+#[allow(clippy::too_many_arguments)]
 fn compute_mixture_log_likelihoods<M: MathBackend>(
     locus: RecordLocus,
-    alleles: &[MergedAllele],
+    shape: &GenotypeShape,
+    n_alleles: usize,
+    n_genotypes: usize,
+    n_samples: usize,
     ploidy: u8,
     scalars: &[AlleleSupportStats],
     estimates: &ContaminationEstimates,
     fallback_log_likelihoods: &[f64],
     math: &M,
-) -> Result<Vec<f64>, PosteriorEngineError> {
-    let n_alleles = alleles.len();
-    let shape = shape_for(ploidy, n_alleles);
-    let n_genotypes = shape.n_genotypes;
-    let n_samples = scalars.len() / n_alleles;
-
+    scratch: &mut RecordScratch,
+) -> Result<(), PosteriorEngineError> {
     debug_assert_eq!(
         scalars.len(),
         n_samples * n_alleles,
@@ -744,12 +769,6 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
         "fallback_log_likelihoods length does not match n_samples * n_genotypes"
     );
 
-    let allele_classes = classify_alleles(alleles);
-    let contam_class_per_allele: Vec<Option<ContamAlleleClass>> = allele_classes
-        .iter()
-        .copied()
-        .map(map_to_contam_class)
-        .collect();
     let genotype_allele_counts = &shape.genotype_allele_counts;
 
     let ploidy_f = f64::from(ploidy);
@@ -758,15 +777,6 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
     // n_alleles == 1 degenerate case doesn't divide by zero.
     let other_allele_error_denom = (n_alleles as f64 - 1.0).max(1.0);
 
-    let mut mixture_log_likelihoods = vec![0.0_f64; n_samples * n_genotypes];
-
-    // Per-sample scratch reused across the sample loop. Hoisted out of
-    // the loop body so the EM hot path doesn't pay 2 mallocs per
-    // sample per record (samply 2026-05-18 showed ~20 % of contam-on
-    // self-time in libc malloc).
-    let mut n_obs = vec![0_u32; n_alleles];
-    let mut mean_err = vec![0.0_f64; n_alleles];
-
     for sample_idx in 0..n_samples {
         let c_s = estimates.effective_c_s(sample_idx);
         if c_s <= 0.0 {
@@ -774,7 +784,7 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
             // mixture collapses to the own-DNA term. Fall back to
             // Stage 5's precomputed value to avoid re-deriving the
             // same number with floating-point drift.
-            let dst = &mut mixture_log_likelihoods
+            let dst = &mut scratch.mixture_log_likelihoods
                 [sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
             let src =
                 &fallback_log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
@@ -785,13 +795,12 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
 
         // Per-allele observation count and mean per-read error rate
         // for this sample at this site, recovered from the row of
-        // AlleleSupportStats Stage 5 emitted. Both buffers are reused
-        // across samples; the loop below fully rewrites every slot, so
-        // there's no need to clear them between iterations.
+        // AlleleSupportStats Stage 5 emitted. Both scratch slots are
+        // fully rewritten below, so no per-iter clear needed.
         let sample_allele_scalars = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
         for (a, support) in sample_allele_scalars.iter().enumerate() {
-            n_obs[a] = support.num_obs;
-            mean_err[a] = if support.num_obs > 0 {
+            scratch.mixture_n_obs[a] = support.num_obs;
+            scratch.mixture_mean_err[a] = if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
                 math.exp(per_read_log_err)
                     .clamp(MIN_BASE_ERROR, MAX_BASE_ERROR)
@@ -802,17 +811,17 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
 
         for (g_idx, gt_counts) in genotype_allele_counts.chunks_exact(n_alleles).enumerate() {
             let mut ll: f64 = 0.0;
-            for a in 0..n_alleles {
-                let n_a = n_obs[a];
+            for (a, &k) in gt_counts.iter().enumerate() {
+                let n_a = scratch.mixture_n_obs[a];
                 if n_a == 0 {
                     continue;
                 }
-                let k_a = f64::from(gt_counts[a]);
-                let eps = mean_err[a];
+                let k_a = f64::from(k);
+                let eps = scratch.mixture_mean_err[a];
                 // P(read carrying allele a | genotype G).
                 let p_own = (k_a / ploidy_f) * (1.0 - eps)
                     + ((ploidy_f - k_a) / ploidy_f) * (eps / other_allele_error_denom);
-                let p_contam = match contam_class_per_allele[a] {
+                let p_contam = match scratch.mixture_contam_class_per_allele[a] {
                     Some(class) => q_b[class as usize],
                     None => 0.0, // compound allele class — see map_to_contam_class
                 };
@@ -833,11 +842,11 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
                 }
                 ll += f64::from(n_a) * math.ln(mix);
             }
-            mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
+            scratch.mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
         }
     }
 
-    Ok(mixture_log_likelihoods)
+    Ok(())
 }
 
 /// Lane-of-4 SIMD variant of [`compute_mixture_log_likelihoods`].
@@ -856,19 +865,18 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
 #[allow(clippy::too_many_arguments)]
 fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
     locus: RecordLocus,
-    alleles: &[MergedAllele],
+    shape: &GenotypeShape,
+    n_alleles: usize,
+    n_genotypes: usize,
+    n_samples: usize,
     ploidy: u8,
     scalars: &[AlleleSupportStats],
     estimates: &ContaminationEstimates,
     fallback_log_likelihoods: &[f64],
     math: &M,
-) -> Result<Vec<f64>, PosteriorEngineError> {
+    scratch: &mut RecordScratch,
+) -> Result<(), PosteriorEngineError> {
     use wide::{CmpGt, CmpLe, f64x4};
-
-    let n_alleles = alleles.len();
-    let shape = shape_for(ploidy, n_alleles);
-    let n_genotypes = shape.n_genotypes;
-    let n_samples = scalars.len() / n_alleles;
 
     debug_assert_eq!(
         scalars.len(),
@@ -881,12 +889,6 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
         "fallback_log_likelihoods length does not match n_samples * n_genotypes"
     );
 
-    let allele_classes = classify_alleles(alleles);
-    let contam_class_per_allele: Vec<Option<ContamAlleleClass>> = allele_classes
-        .iter()
-        .copied()
-        .map(map_to_contam_class)
-        .collect();
     let genotype_allele_counts = &shape.genotype_allele_counts;
 
     let ploidy_f = f64::from(ploidy);
@@ -896,13 +898,11 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
     // (sample, allele) cell so the SIMD batch loop can lane-load
     // them with simple gathers. n_obs reads directly from `scalars`
     // (its `num_obs: u32` field is already where we'd put it).
-    let mut c_s_all = vec![0.0_f64; n_samples];
-    let mut mean_err_all = vec![0.0_f64; n_samples * n_alleles];
     for sample_idx in 0..n_samples {
-        c_s_all[sample_idx] = estimates.effective_c_s(sample_idx);
+        scratch.mixture_c_s_all[sample_idx] = estimates.effective_c_s(sample_idx);
         let sample_allele_scalars = &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
         for (a, support) in sample_allele_scalars.iter().enumerate() {
-            mean_err_all[sample_idx * n_alleles + a] = if support.num_obs > 0 {
+            scratch.mixture_mean_err_all[sample_idx * n_alleles + a] = if support.num_obs > 0 {
                 let per_read_log_err = support.q_sum / f64::from(support.num_obs);
                 math.exp(per_read_log_err)
                     .clamp(MIN_BASE_ERROR, MAX_BASE_ERROR)
@@ -916,7 +916,9 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
     // values. Samples with `c_s <= 0` (inactive in the mixture model)
     // keep their fallback row through the SIMD loop; active lanes
     // overwrite their per-genotype cell on the way out.
-    let mut mixture_log_likelihoods = fallback_log_likelihoods.to_vec();
+    scratch
+        .mixture_log_likelihoods
+        .copy_from_slice(fallback_log_likelihoods);
 
     let n_full_batches = n_samples / 4;
     let tail_start = n_full_batches * 4;
@@ -925,10 +927,10 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
         let s0 = batch_idx * 4;
 
         let c_s_v = f64x4::from([
-            c_s_all[s0],
-            c_s_all[s0 + 1],
-            c_s_all[s0 + 2],
-            c_s_all[s0 + 3],
+            scratch.mixture_c_s_all[s0],
+            scratch.mixture_c_s_all[s0 + 1],
+            scratch.mixture_c_s_all[s0 + 2],
+            scratch.mixture_c_s_all[s0 + 3],
         ]);
         let one_minus_c_s_v = f64x4::splat(1.0) - c_s_v;
         let active_mask = c_s_v.cmp_gt(f64x4::splat(0.0));
@@ -955,10 +957,10 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
 
                 // `eps` per lane.
                 let eps_v = f64x4::from([
-                    mean_err_all[s0 * n_alleles + a],
-                    mean_err_all[(s0 + 1) * n_alleles + a],
-                    mean_err_all[(s0 + 2) * n_alleles + a],
-                    mean_err_all[(s0 + 3) * n_alleles + a],
+                    scratch.mixture_mean_err_all[s0 * n_alleles + a],
+                    scratch.mixture_mean_err_all[(s0 + 1) * n_alleles + a],
+                    scratch.mixture_mean_err_all[(s0 + 2) * n_alleles + a],
+                    scratch.mixture_mean_err_all[(s0 + 3) * n_alleles + a],
                 ]);
 
                 // p_own depends on (eps, k_a, ploidy_f). The
@@ -975,7 +977,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
                 // q_b value for the current allele's contamination
                 // class. Compound-allele class → `None` → 0.0 across
                 // all lanes.
-                let p_contam_v = match contam_class_per_allele[a] {
+                let p_contam_v = match scratch.mixture_contam_class_per_allele[a] {
                     Some(class) => {
                         let ci = class as usize;
                         f64x4::from([
@@ -1000,7 +1002,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
                 if bad_mask.any() {
                     let mix_arr = mix_v.to_array();
                     for lane in 0..4 {
-                        if c_s_all[s0 + lane] > 0.0
+                        if scratch.mixture_c_s_all[s0 + lane] > 0.0
                             && scalars[(s0 + lane) * n_alleles + a].num_obs > 0
                             && mix_arr[lane] <= 0.0
                         {
@@ -1027,21 +1029,21 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
 
             // Scatter back: each active lane writes its cell;
             // inactive lanes keep the fallback already copied into
-            // `mixture_log_likelihoods` at function entry.
+            // `scratch.mixture_log_likelihoods` at function entry.
             let ll_arr = ll_v.to_array();
-            for lane in 0..4 {
-                if c_s_all[s0 + lane] > 0.0 {
-                    mixture_log_likelihoods[(s0 + lane) * n_genotypes + g_idx] = ll_arr[lane];
+            for (lane, &ll_lane) in ll_arr.iter().enumerate() {
+                if scratch.mixture_c_s_all[s0 + lane] > 0.0 {
+                    scratch.mixture_log_likelihoods[(s0 + lane) * n_genotypes + g_idx] = ll_lane;
                 }
             }
         }
     }
 
     // Tail: process leftover samples (n_samples % 4) with scalar
-    // math. The pre-pass already populated `mean_err_all`, so the
-    // tail just reads from it.
+    // math. The pre-pass already populated `scratch.mixture_mean_err_all`,
+    // so the tail just reads from it.
     for sample_idx in tail_start..n_samples {
-        let c_s = c_s_all[sample_idx];
+        let c_s = scratch.mixture_c_s_all[sample_idx];
         if c_s <= 0.0 {
             continue; // fallback row already in place
         }
@@ -1056,10 +1058,10 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
                     continue;
                 }
                 let k_a = f64::from(gt_counts[a]);
-                let eps = mean_err_all[sample_idx * n_alleles + a];
+                let eps = scratch.mixture_mean_err_all[sample_idx * n_alleles + a];
                 let p_own = (k_a / ploidy_f) * (1.0 - eps)
                     + ((ploidy_f - k_a) / ploidy_f) * (eps / other_allele_error_denom);
-                let p_contam = match contam_class_per_allele[a] {
+                let p_contam = match scratch.mixture_contam_class_per_allele[a] {
                     Some(class) => q_b[class as usize],
                     None => 0.0,
                 };
@@ -1074,11 +1076,11 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
                 }
                 ll += f64::from(n_a) * math.ln(mix);
             }
-            mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
+            scratch.mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
         }
     }
 
-    Ok(mixture_log_likelihoods)
+    Ok(())
 }
 
 fn pseudocount_for(class: AlleleClass, config: &PosteriorEngineConfig) -> f64 {
@@ -1093,6 +1095,18 @@ fn pseudocount_for(class: AlleleClass, config: &PosteriorEngineConfig) -> f64 {
 /// Per-record EM inputs that don't change across iterations.
 /// Bundled into one struct so `e_step` / `m_step` don't take 10+
 /// parameters each.
+/// Per-record EM context: scalar parameters + a shared reference to
+/// the cached genotype shape.
+///
+/// **No slice fields.** The arrays that used to live here as borrowed
+/// slices (`compound_mask`, `pseudocounts`, `log_f_per_sample`,
+/// `log_one_minus_f_per_sample`) now live in [`RecordScratch`]; EM
+/// reads them through the same `&mut RecordScratch` it already
+/// receives, sidestepping the borrow-checker conflict between holding
+/// `&EmContext<'_>` (which would borrow scratch) and `&mut
+/// RecordScratch` simultaneously. `EmContext` is `Copy` so passing it
+/// by value to each EM helper is free.
+#[derive(Clone, Copy)]
 struct EmContext<'a> {
     locus: RecordLocus,
     n_samples: usize,
@@ -1103,34 +1117,50 @@ struct EmContext<'a> {
     /// `genotype_allele_counts`, `log_multinomial_coeffs`,
     /// `nonzero_pairs` / `nonzero_pairs_offsets`, and
     /// `homozygous_allele_for`. Shared across records of the same
-    /// `(ploidy, n_alleles)` via the thread-local cache.
+    /// `(ploidy, n_alleles)` via the thread-local cache. The borrow
+    /// is held for the duration of `run_em_for_record` against the
+    /// `Arc<GenotypeShape>` returned by `shape_for(...)`.
     shape: &'a GenotypeShape,
-    compound_mask: &'a [bool],
-    pseudocounts: &'a [f64],
-    /// `safe_ln(f_s)` per sample, where `f_s` is the per-sample
-    /// fixation index. Hoisted out of `e_step`'s per-iteration loop
-    /// because `fixation_indices` is record-static.
-    log_f_per_sample: &'a [f64],
-    /// `safe_ln(1.0 - f_s)` per sample. Same record-static rationale as
-    /// `log_f_per_sample`.
-    log_one_minus_f_per_sample: &'a [f64],
     /// Every sample shares the same `f_s` value (e.g. the default
     /// config sets `fixation_index_default = 0.0` and leaves
     /// `fixation_index_overrides = None`). When `true`,
-    /// `log_f_per_sample[0]` and `log_one_minus_f_per_sample[0]` are
-    /// the cohort-wide values, and the entire per-genotype log-prior
-    /// (including the homozygous-IBD `log_sum_exp_2` term) is
-    /// sample-invariant within an EM iteration — `e_step` /
-    /// `e_step_simd` precompute it once into
-    /// `EmScratch::log_prior_per_g` and splat from there. See
-    /// H2 + H4 in `doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md`.
+    /// `scratch.log_f_per_sample[0]` and
+    /// `scratch.log_one_minus_f_per_sample[0]` are the cohort-wide
+    /// values, and the entire per-genotype log-prior (including the
+    /// homozygous-IBD `log_sum_exp_2` term) is sample-invariant
+    /// within an EM iteration — `e_step` / `e_step_simd` precompute
+    /// it once into `RecordScratch::log_prior_per_g` and splat from
+    /// there. See H2 + H4 in
+    /// `doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md`.
     homogeneous_fixation: bool,
     compound_pseudocount: f64,
 }
 
-/// Per-record EM scratch buffers, allocated once per record and
-/// reused across iterations.
-struct EmScratch {
+/// Per-engine scratch buffers reused across every record.
+///
+/// `PosteriorEngine` owns one instance; [`run_em_for_record`] resizes
+/// each `Vec` to the current record's shape on entry, then the EM
+/// loop overwrites cells in place. Steady-state allocation count
+/// drops to ~zero for the intermediate buffers — `Vec::resize` keeps
+/// capacity when the new shape is ≤ the high-water mark and only
+/// reallocates when growing past it. The May-18 post-H4 sampling
+/// profile showed glibc allocator self-time at ~16 % of cycles
+/// before this lift; see
+/// `doc/devel/reports/implementations/posterior_engine_post_h4_profile_2026-05-18.md`.
+///
+/// Output buffers (`p_hat`, `f_hat_compound`, `posteriors`,
+/// `best_genotype`, `gq_phred`, `compound_frequencies`) are filled
+/// here and `.clone()`-d out into [`PosteriorRecord`] on the way
+/// back — trades one malloc-then-zero-init per record for one
+/// malloc-then-memcpy at the same size. Memcpy beats zero-init on
+/// the small Vecs and ties on the large `posteriors` buffer; on the
+/// small Vecs (`p_hat`, `f_hat_compound`, `compound_frequencies`)
+/// where malloc overhead dominates over the byte cost, lifting them
+/// into the scratch removes the alloc entirely from the EM
+/// iteration loop (`m_step_*_p_hat` no longer collects a fresh `Vec`
+/// every EM iter).
+struct RecordScratch {
+    // ===== EM working set (previously EmScratch). =====
     /// Effective per-allele frequency seen by the prior (compounds
     /// substituted with `f̂_C`). Length `n_alleles`.
     p_effective: Vec<f64>,
@@ -1140,41 +1170,157 @@ struct EmScratch {
     /// log_p_effective[a]` over non-zero pairs. Sample-invariant
     /// within one EM iteration; `e_step` / `e_step_simd` rebuild it
     /// from the current `log_p_effective` at the top of each call
-    /// and reuse it across every sample/batch (eliminates the
-    /// cross-batch redundancy flagged as H2 in the perf review).
-    /// Length `n_genotypes`.
+    /// (H2 in the perf review). Length `n_genotypes`.
     log_indep_per_g: Vec<f64>,
     /// Per-genotype log-prior under the homogeneous-fixation hoist.
-    /// Filled by `e_step` / `e_step_simd` at the top of each call
-    /// when `ctx.homogeneous_fixation` is `true`; the inner sample /
-    /// batch loop then splats from here instead of recomputing
-    /// `log_sum_exp_2(log_one_minus_f + log_indep, log_f +
-    /// log_p_effective[homo])` per sample. Length `n_genotypes`.
-    /// Heterogeneous-fixation paths leave this alone.
+    /// Filled at the top of each `e_step` call when
+    /// `ctx.homogeneous_fixation` (H4). Length `n_genotypes`.
     log_prior_per_g: Vec<f64>,
     /// Per-genotype unnormalised log-posterior for the current
     /// sample. Length `n_genotypes`.
     log_post_unnorm: Vec<f64>,
     /// SIMD-lane buffer: per-genotype `f64x4` of unnormalised
-    /// log-posteriors across a 4-sample batch. Used by the SIMD
-    /// `e_step` body when `M::HAS_LANE_4` is true. Length
-    /// `n_genotypes`. Non-SIMD callers leave this alone.
+    /// log-posteriors across a 4-sample batch. Length `n_genotypes`.
     log_post_unnorm_lane: Vec<wide::f64x4>,
     /// Posterior-weighted allele counts E[n_a]. Length `n_alleles`.
     expected_counts: Vec<f64>,
+
+    // ===== Record-static intermediates (no copy-out). =====
+    /// Per-sample fixation indices `f_s`. Length `n_samples`.
+    fixation_indices: Vec<f64>,
+    /// `safe_ln(f_s)` per sample; hoisted out of `e_step`'s
+    /// per-iteration sample loop. Length `n_samples`.
+    log_f_per_sample: Vec<f64>,
+    /// `safe_ln(1.0 - f_s)` per sample. Length `n_samples`.
+    log_one_minus_f_per_sample: Vec<f64>,
+    /// Per-allele [`AlleleClass`]. Length `n_alleles`.
+    allele_classes: Vec<AlleleClass>,
+    /// Per-allele Dirichlet pseudocount routed from
+    /// [`PosteriorEngineConfig`] by [`AlleleClass`]. Length
+    /// `n_alleles`.
+    pseudocounts: Vec<f64>,
+    /// Per-allele compound-allele flag. Length `n_alleles`.
+    compound_mask: Vec<bool>,
+    /// Per-allele contamination class — `None` for compound alleles
+    /// (the mixture's `p_contam` term collapses to 0). Length
+    /// `n_alleles`. Only populated when contamination is configured.
+    mixture_contam_class_per_allele: Vec<Option<ContamAlleleClass>>,
+
+    // ===== EM state (current + next for the convergence test). =====
+    /// Current allele-frequency estimate. Length `n_alleles`.
+    p_hat: Vec<f64>,
+    /// Next-iteration allele-frequency estimate. After the M-step
+    /// fills it, `max_abs_diff(p_hat, p_hat_next)` drives convergence
+    /// and `mem::swap` rotates the roles. Length `n_alleles`.
+    p_hat_next: Vec<f64>,
+    /// Current compound-frequency estimate. Length `n_alleles`.
+    f_hat_compound: Vec<f64>,
+    /// Per-`(sample, genotype)` posteriors, sample-major. Length
+    /// `n_samples * n_genotypes`.
+    posteriors: Vec<f64>,
+
+    // ===== Output buffers (cloned into PosteriorRecord at the end). =====
+    /// Per-sample argmax genotype index. Length `n_samples`.
+    best_genotype: Vec<usize>,
+    /// Per-sample GQ in phred units. Length `n_samples`.
+    gq_phred: Vec<f64>,
+    /// Per-allele `Option<f64>` of the compound-frequency estimate
+    /// (`None` for non-compound alleles). Length `n_alleles`.
+    compound_frequencies: Vec<Option<f64>>,
+
+    // ===== Mixture pre-pass buffers (only used when contam-on). =====
+    /// Mixture-recomputed log-likelihoods. Length
+    /// `n_samples * n_genotypes`. Filled by the mixture pre-pass when
+    /// contamination is configured; the EM loop reads from here
+    /// instead of the upstream `MergedRecord.log_likelihoods`.
+    mixture_log_likelihoods: Vec<f64>,
+    /// Per-allele observation count for the current sample in the
+    /// scalar mixture pre-pass. Length `n_alleles`.
+    mixture_n_obs: Vec<u32>,
+    /// Per-allele mean per-read error rate for the current sample
+    /// in the scalar mixture pre-pass. Length `n_alleles`.
+    mixture_mean_err: Vec<f64>,
+    /// Per-sample contamination fraction for the SIMD mixture
+    /// pre-pass. Length `n_samples`.
+    mixture_c_s_all: Vec<f64>,
+    /// Per-`(sample, allele)` mean per-read error rate for the SIMD
+    /// mixture pre-pass. Length `n_samples * n_alleles`.
+    mixture_mean_err_all: Vec<f64>,
 }
 
-impl EmScratch {
-    fn new(n_alleles: usize, n_genotypes: usize) -> Self {
+impl RecordScratch {
+    /// All Vecs empty; capacity grows on first `resize_to` call.
+    fn empty() -> Self {
         Self {
-            p_effective: vec![0.0; n_alleles],
-            log_p_effective: vec![0.0; n_alleles],
-            log_indep_per_g: vec![0.0; n_genotypes],
-            log_prior_per_g: vec![0.0; n_genotypes],
-            log_post_unnorm: vec![0.0; n_genotypes],
-            log_post_unnorm_lane: vec![wide::f64x4::ZERO; n_genotypes],
-            expected_counts: vec![0.0; n_alleles],
+            p_effective: Vec::new(),
+            log_p_effective: Vec::new(),
+            log_indep_per_g: Vec::new(),
+            log_prior_per_g: Vec::new(),
+            log_post_unnorm: Vec::new(),
+            log_post_unnorm_lane: Vec::new(),
+            expected_counts: Vec::new(),
+            fixation_indices: Vec::new(),
+            log_f_per_sample: Vec::new(),
+            log_one_minus_f_per_sample: Vec::new(),
+            allele_classes: Vec::new(),
+            pseudocounts: Vec::new(),
+            compound_mask: Vec::new(),
+            mixture_contam_class_per_allele: Vec::new(),
+            p_hat: Vec::new(),
+            p_hat_next: Vec::new(),
+            f_hat_compound: Vec::new(),
+            posteriors: Vec::new(),
+            best_genotype: Vec::new(),
+            gq_phred: Vec::new(),
+            compound_frequencies: Vec::new(),
+            mixture_log_likelihoods: Vec::new(),
+            mixture_n_obs: Vec::new(),
+            mixture_mean_err: Vec::new(),
+            mixture_c_s_all: Vec::new(),
+            mixture_mean_err_all: Vec::new(),
         }
+    }
+
+    /// Size every buffer to the current record's shape. `Vec::resize`
+    /// preserves capacity above the high-water mark, so steady-state
+    /// records of the same shape allocate nothing.
+    fn resize_to(&mut self, n_samples: usize, n_alleles: usize, n_genotypes: usize) {
+        self.p_effective.resize(n_alleles, 0.0);
+        self.log_p_effective.resize(n_alleles, 0.0);
+        self.log_indep_per_g.resize(n_genotypes, 0.0);
+        self.log_prior_per_g.resize(n_genotypes, 0.0);
+        self.log_post_unnorm.resize(n_genotypes, 0.0);
+        self.log_post_unnorm_lane
+            .resize(n_genotypes, wide::f64x4::ZERO);
+        self.expected_counts.resize(n_alleles, 0.0);
+
+        self.fixation_indices.resize(n_samples, 0.0);
+        self.log_f_per_sample.resize(n_samples, 0.0);
+        self.log_one_minus_f_per_sample.resize(n_samples, 0.0);
+        self.allele_classes.resize(n_alleles, AlleleClass::Ref);
+        self.pseudocounts.resize(n_alleles, 0.0);
+        self.compound_mask.resize(n_alleles, false);
+        self.mixture_contam_class_per_allele.resize(n_alleles, None);
+
+        self.p_hat.resize(n_alleles, 0.0);
+        self.p_hat_next.resize(n_alleles, 0.0);
+        self.f_hat_compound.resize(n_alleles, 0.0);
+        self.posteriors.resize(n_samples * n_genotypes, 0.0);
+
+        self.best_genotype.resize(n_samples, 0);
+        self.gq_phred.resize(n_samples, 0.0);
+        self.compound_frequencies.resize(n_alleles, None);
+
+        // Mixture buffers are only used when contam-on; resize
+        // unconditionally so the buffer is the right shape if a
+        // subsequent record toggles contam state. (`Vec::resize` is
+        // O(0) when length == capacity == requested.)
+        self.mixture_log_likelihoods
+            .resize(n_samples * n_genotypes, 0.0);
+        self.mixture_n_obs.resize(n_alleles, 0);
+        self.mixture_mean_err.resize(n_alleles, 0.0);
+        self.mixture_c_s_all.resize(n_samples, 0.0);
+        self.mixture_mean_err_all.resize(n_samples * n_alleles, 0.0);
     }
 }
 
@@ -1182,6 +1328,7 @@ fn run_em_for_record<M: MathBackend>(
     record: MergedRecord,
     config: &PosteriorEngineConfig,
     math: &M,
+    scratch: &mut RecordScratch,
 ) -> Result<PosteriorRecord, PosteriorEngineError> {
     let MergedRecord {
         chrom_id,
@@ -1204,11 +1351,103 @@ fn run_em_for_record<M: MathBackend>(
     };
     let n_alleles = alleles.len();
 
+    // Belt-and-braces: Stage 5 drops REF-only groups (alleles.len() <
+    // 2). If one slips through, emit a trivial posterior record per
+    // the plan §"Edge cases" — every sample is hom-REF with QUAL 0.
+    // (Checked before the mixture pre-pass and the scratch.resize_to
+    // call since the trivial path doesn't touch scratch.)
+    if n_alleles < 2 {
+        return Ok(trivial_posterior_record(
+            TrivialRecordInputs {
+                locus,
+                alleles,
+                ploidy,
+                n_samples,
+                scalars,
+                other_scalars,
+                chain_anchor_flags,
+            },
+            config.max_gq_phred,
+        ));
+    }
+
+    validate_record_shape(
+        locus,
+        ploidy,
+        n_alleles,
+        n_samples,
+        n_genotypes,
+        &log_likelihoods,
+        &chain_anchor_flags,
+    )?;
+
+    // Resize the per-engine scratch to the current record's shape
+    // before any further field accesses. Steady-state records of the
+    // same shape allocate nothing here.
+    scratch.resize_to(n_samples, n_alleles, n_genotypes);
+
+    // Fill the record-static scratch fields (no mallocs — overwrites
+    // pre-sized buffers).
+    resolve_fixation_indices(
+        locus,
+        n_samples,
+        config.fixation_index_overrides.as_deref(),
+        config.fixation_index_default,
+        &mut scratch.fixation_indices,
+    )?;
+
+    // `safe_ln(f_s)` and `safe_ln(1 - f_s)` are functions of
+    // `fixation_indices` only, so they're record-static. Precompute
+    // once here instead of inside `e_step`'s per-iteration sample loop.
+    for s in 0..n_samples {
+        let f_s = scratch.fixation_indices[s];
+        scratch.log_f_per_sample[s] = safe_ln(math, f_s);
+        scratch.log_one_minus_f_per_sample[s] = safe_ln(math, 1.0 - f_s);
+    }
+
+    // Detect the homogeneous-fixation case (every sample shares the
+    // same `f_s`). Default config — `fixation_index_default = 0.0`,
+    // `fixation_index_overrides = None` — hits this path; a CLI
+    // `--inbreeding` global override also hits it. The
+    // heterogeneous case (per-sample overrides differing) stays on
+    // the per-sample path. Comparing on `f_s` rather than on the
+    // logged value sidesteps `NaN != NaN` (and `-INF == -INF` is
+    // `true` for any IEEE-754 implementation, but the typed input
+    // here is always finite).
+    let homogeneous_fixation = scratch
+        .fixation_indices
+        .first()
+        .is_some_and(|&first| scratch.fixation_indices.iter().all(|&f| f == first));
+
+    // Per-allele classification, pseudocounts, compound mask, and
+    // contamination class — all record-static. Fill into scratch so
+    // the EM loop and the mixture pre-pass read them by slice rather
+    // than rebuilding per call.
+    let ref_len = alleles[0].seq.len();
+    for (a, allele) in alleles.iter().enumerate() {
+        let class = classify_allele(allele, ref_len, a == 0);
+        scratch.allele_classes[a] = class;
+        scratch.pseudocounts[a] = pseudocount_for(class, config);
+        scratch.compound_mask[a] = allele.is_compound;
+        scratch.mixture_contam_class_per_allele[a] = map_to_contam_class(class);
+    }
+
+    // Genotype-shape artefacts (allele-count table, multinomial
+    // coefficients, non-zero-pair and homozygous-allele lookups) come
+    // from a thread-local `(ploidy, n_alleles)`-keyed cache. Repeated
+    // shapes (the common case — every biallelic-diploid record shares
+    // `(2, 2)`) hit the cache instead of rebuilding.
+    let shape = shape_for(ploidy, n_alleles);
+
     // Mixture-likelihood branch: when contamination is configured,
-    // replace the Stage-5-supplied (c_s = 0) log-likelihood table with
-    // the mixture-recomputed version before the EM loop runs.
-    // Everything downstream is unchanged.
-    let log_likelihoods = if let Some(estimates) = config.contamination.as_ref() {
+    // replace the Stage-5-supplied (c_s = 0) log-likelihood table
+    // with the mixture-recomputed version before the EM loop runs.
+    // The mixture function fills `scratch.mixture_log_likelihoods`;
+    // we then `mem::swap` it into the local `log_likelihoods` owner
+    // so EM can read a slice through a borrow that doesn't tie up
+    // `scratch`.
+    let mut log_likelihoods = log_likelihoods;
+    let did_mixture = if let Some(estimates) = config.contamination.as_ref() {
         if estimates.c_s_per_sample.len() != n_samples {
             return Err(PosteriorEngineError::ContaminationCohortSizeMismatch {
                 locus,
@@ -1237,110 +1476,50 @@ fn run_em_for_record<M: MathBackend>(
                 .all(|&b| b < estimates.q_b_per_batch.len()),
             "ContaminationEstimates internal invariant violated"
         );
-        if n_alleles >= 2 {
-            // `M::HAS_LANE_4` is a compile-time const; the unused
-            // branch is dead-code-eliminated after monomorphisation.
-            if M::HAS_LANE_4 {
-                compute_mixture_log_likelihoods_simd(
-                    locus,
-                    &alleles,
-                    ploidy,
-                    &scalars,
-                    estimates,
-                    &log_likelihoods,
-                    math,
-                )?
-            } else {
-                compute_mixture_log_likelihoods(
-                    locus,
-                    &alleles,
-                    ploidy,
-                    &scalars,
-                    estimates,
-                    &log_likelihoods,
-                    math,
-                )?
-            }
-        } else {
-            log_likelihoods
-        }
-    } else {
-        log_likelihoods
-    };
-
-    // Belt-and-braces: Stage 5 drops REF-only groups (alleles.len() <
-    // 2). If one slips through, emit a trivial posterior record per
-    // the plan §"Edge cases" — every sample is hom-REF with QUAL 0.
-    if n_alleles < 2 {
-        return Ok(trivial_posterior_record(
-            TrivialRecordInputs {
+        // `M::HAS_LANE_4` is a compile-time const; the unused branch
+        // is dead-code-eliminated after monomorphisation.
+        if M::HAS_LANE_4 {
+            compute_mixture_log_likelihoods_simd(
                 locus,
-                alleles,
-                ploidy,
+                &shape,
+                n_alleles,
+                n_genotypes,
                 n_samples,
-                scalars,
-                other_scalars,
-                chain_anchor_flags,
-            },
-            config.max_gq_phred,
-        ));
+                ploidy,
+                &scalars,
+                estimates,
+                &log_likelihoods,
+                math,
+                scratch,
+            )?;
+        } else {
+            compute_mixture_log_likelihoods(
+                locus,
+                &shape,
+                n_alleles,
+                n_genotypes,
+                n_samples,
+                ploidy,
+                &scalars,
+                estimates,
+                &log_likelihoods,
+                math,
+                scratch,
+            )?;
+        }
+        true
+    } else {
+        false
+    };
+    if did_mixture {
+        // Swap the mixture-recomputed buffer into `log_likelihoods` so
+        // the EM loop reads it via a borrow that does NOT alias
+        // `scratch.mixture_log_likelihoods`. The buffer that used to
+        // be `log_likelihoods` is now sitting in
+        // `scratch.mixture_log_likelihoods`; the next record will
+        // overwrite it during its own `resize_to` + mixture pre-pass.
+        std::mem::swap(&mut log_likelihoods, &mut scratch.mixture_log_likelihoods);
     }
-
-    validate_record_shape(
-        locus,
-        ploidy,
-        n_alleles,
-        n_samples,
-        n_genotypes,
-        &log_likelihoods,
-        &chain_anchor_flags,
-    )?;
-
-    let fixation_indices = resolve_fixation_indices(
-        locus,
-        n_samples,
-        config.fixation_index_overrides.as_deref(),
-        config.fixation_index_default,
-    )?;
-
-    // `safe_ln(f_s)` and `safe_ln(1 - f_s)` are functions of
-    // `fixation_indices` only, so they're record-static. Precompute
-    // once here instead of inside `e_step`'s per-iteration sample loop.
-    let log_f_per_sample: Vec<f64> = fixation_indices
-        .iter()
-        .map(|&f_s| safe_ln(math, f_s))
-        .collect();
-    let log_one_minus_f_per_sample: Vec<f64> = fixation_indices
-        .iter()
-        .map(|&f_s| safe_ln(math, 1.0 - f_s))
-        .collect();
-
-    // Detect the homogeneous-fixation case (every sample shares the
-    // same `f_s`). Default config — `fixation_index_default = 0.0`,
-    // `fixation_index_overrides = None` — hits this path; a CLI
-    // `--inbreeding` global override also hits it. The
-    // heterogeneous case (per-sample overrides differing) stays on
-    // the per-sample path. Comparing on `f_s` rather than on the
-    // logged value sidesteps `NaN != NaN` (and `-INF == -INF` is
-    // `true` for any IEEE-754 implementation, but the typed input
-    // here is always finite).
-    let homogeneous_fixation = fixation_indices
-        .first()
-        .is_some_and(|&first| fixation_indices.iter().all(|&f| f == first));
-
-    let allele_classes = classify_alleles(&alleles);
-    let pseudocounts: Vec<f64> = allele_classes
-        .iter()
-        .map(|c| pseudocount_for(*c, config))
-        .collect();
-    let compound_mask: Vec<bool> = alleles.iter().map(|a| a.is_compound).collect();
-
-    // Genotype-shape artefacts (allele-count table, multinomial
-    // coefficients, non-zero-pair and homozygous-allele lookups) come
-    // from a thread-local `(ploidy, n_alleles)`-keyed cache. Repeated
-    // shapes (the common case — every biallelic-diploid record shares
-    // `(2, 2)`) hit the cache instead of rebuilding.
-    let shape = shape_for(ploidy, n_alleles);
 
     let ctx = EmContext {
         locus,
@@ -1349,29 +1528,21 @@ fn run_em_for_record<M: MathBackend>(
         n_alleles,
         ploidy,
         shape: &shape,
-        compound_mask: &compound_mask,
-        pseudocounts: &pseudocounts,
-        log_f_per_sample: &log_f_per_sample,
-        log_one_minus_f_per_sample: &log_one_minus_f_per_sample,
         homogeneous_fixation,
         compound_pseudocount: config.compound_alt_pseudocount,
     };
 
-    let mut scratch = EmScratch::new(n_alleles, n_genotypes);
-    let mut p_hat = vec![1.0 / n_alleles as f64; n_alleles];
-    let mut f_hat_compound = vec![1.0 / n_alleles as f64; n_alleles];
-    let mut posteriors = vec![0.0_f64; n_samples * n_genotypes];
+    // EM initial point: uniform allele frequencies and uniform
+    // compound frequencies. Overwrites scratch in place — no malloc.
+    let p_init = 1.0 / n_alleles as f64;
+    for slot in scratch.p_hat.iter_mut() {
+        *slot = p_init;
+    }
+    for slot in scratch.f_hat_compound.iter_mut() {
+        *slot = p_init;
+    }
 
-    let diagnostics = run_em_loop(
-        &ctx,
-        config,
-        math,
-        &log_likelihoods,
-        &mut p_hat,
-        &mut f_hat_compound,
-        &mut posteriors,
-        &mut scratch,
-    )?;
+    let diagnostics = run_em_loop(ctx, config, math, &log_likelihoods, scratch)?;
 
     // Final E-step under the converged (p̂, f̂_C) so the emitted
     // posteriors reflect the *post-final-M-step* parameters rather
@@ -1381,41 +1552,23 @@ fn run_em_for_record<M: MathBackend>(
     // `M::HAS_LANE_4` is a compile-time const so the unused branch is
     // dead-code-eliminated after monomorphisation.
     if M::HAS_LANE_4 {
-        e_step_simd(
-            &ctx,
-            math,
-            &log_likelihoods,
-            &p_hat,
-            &f_hat_compound,
-            &mut scratch,
-            &mut posteriors,
-        )?;
+        e_step_simd(ctx, math, &log_likelihoods, scratch)?;
     } else {
-        e_step(
-            &ctx,
-            math,
-            &log_likelihoods,
-            &p_hat,
-            &f_hat_compound,
-            &mut scratch,
-            &mut posteriors,
-        )?;
+        e_step(ctx, math, &log_likelihoods, scratch)?;
     }
 
-    let (best_genotype, gq_phred, qual_phred) =
-        summarise_posteriors(n_samples, n_genotypes, &posteriors, config.max_gq_phred);
+    let qual_phred = summarise_posteriors(n_samples, n_genotypes, scratch, config.max_gq_phred);
 
-    let compound_frequencies: Vec<Option<f64>> = compound_mask
-        .iter()
-        .enumerate()
-        .map(|(a, &is_compound)| {
-            if is_compound {
-                Some(f_hat_compound[a])
-            } else {
-                None
-            }
-        })
-        .collect();
+    // Fill `scratch.compound_frequencies` from the converged f̂_C and
+    // the compound mask, then clone-out below. Reuses the scratch
+    // slot instead of `.collect()`ing a fresh Vec.
+    for a in 0..n_alleles {
+        scratch.compound_frequencies[a] = if scratch.compound_mask[a] {
+            Some(scratch.f_hat_compound[a])
+        } else {
+            None
+        };
+    }
 
     Ok(PosteriorRecord {
         locus,
@@ -1423,11 +1576,15 @@ fn run_em_for_record<M: MathBackend>(
         ploidy,
         n_samples,
         n_genotypes,
-        allele_frequencies: p_hat,
-        compound_frequencies,
-        posteriors,
-        best_genotype,
-        gq_phred,
+        // Clone the converged outputs out of scratch. The clone is a
+        // single malloc-then-memcpy per Vec — cheaper than the
+        // pre-lift malloc-then-zero-init since memcpy avoids the
+        // zero-init pass for an already-initialised buffer.
+        allele_frequencies: scratch.p_hat.clone(),
+        compound_frequencies: scratch.compound_frequencies.clone(),
+        posteriors: scratch.posteriors.clone(),
+        best_genotype: scratch.best_genotype.clone(),
+        gq_phred: scratch.gq_phred.clone(),
         qual_phred,
         scalars,
         other_scalars,
@@ -1478,16 +1635,12 @@ fn validate_record_shape(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_em_loop<M: MathBackend>(
-    ctx: &EmContext<'_>,
+    ctx: EmContext<'_>,
     config: &PosteriorEngineConfig,
     math: &M,
     log_likelihoods: &[f64],
-    p_hat: &mut Vec<f64>,
-    f_hat_compound: &mut Vec<f64>,
-    posteriors: &mut [f64],
-    scratch: &mut EmScratch,
+    scratch: &mut RecordScratch,
 ) -> Result<EmDiagnostics, PosteriorEngineError> {
     let mut iterations: u32 = 0;
     let mut last_delta = f64::INFINITY;
@@ -1497,33 +1650,19 @@ fn run_em_loop<M: MathBackend>(
         iterations += 1;
 
         if M::HAS_LANE_4 {
-            e_step_simd(
-                ctx,
-                math,
-                log_likelihoods,
-                p_hat,
-                f_hat_compound,
-                scratch,
-                posteriors,
-            )?;
+            e_step_simd(ctx, math, log_likelihoods, scratch)?;
         } else {
-            e_step(
-                ctx,
-                math,
-                log_likelihoods,
-                p_hat,
-                f_hat_compound,
-                scratch,
-                posteriors,
-            )?;
+            e_step(ctx, math, log_likelihoods, scratch)?;
         }
 
-        let new_p_hat = m_step_p_hat(ctx, posteriors, scratch);
-        let new_f_hat_compound = m_step_f_hat_compound(ctx, scratch);
+        // M-step writes `p_hat_next` and overwrites `f_hat_compound`
+        // in place. `p_hat` is double-buffered against `p_hat_next`
+        // so the convergence test can read both before we advance.
+        m_step_p_hat(ctx, scratch);
+        m_step_f_hat_compound(ctx, scratch);
 
-        last_delta = max_abs_diff(p_hat, &new_p_hat);
-        *p_hat = new_p_hat;
-        *f_hat_compound = new_f_hat_compound;
+        last_delta = max_abs_diff(&scratch.p_hat, &scratch.p_hat_next);
+        std::mem::swap(&mut scratch.p_hat, &mut scratch.p_hat_next);
 
         if last_delta < config.convergence_threshold {
             return Ok(EmDiagnostics {
@@ -1540,52 +1679,57 @@ fn run_em_loop<M: MathBackend>(
     })
 }
 
+/// Fill `out` with the per-sample fixation indices `f_s`, either
+/// from the per-sample overrides (when configured) or by broadcasting
+/// the cohort-wide default. `out` is assumed pre-sized to `n_samples`
+/// by `RecordScratch::resize_to`.
 fn resolve_fixation_indices(
     locus: RecordLocus,
     n_samples: usize,
     overrides: Option<&[f64]>,
     default: f64,
-) -> Result<Vec<f64>, PosteriorEngineError> {
-    let Some(overrides) = overrides else {
-        return Ok(vec![default; n_samples]);
-    };
-    if overrides.len() != n_samples {
-        return Err(PosteriorEngineError::InbreedingOverrideLengthMismatch {
-            locus,
-            override_len: overrides.len(),
-            record_samples: n_samples,
-        });
+    out: &mut [f64],
+) -> Result<(), PosteriorEngineError> {
+    debug_assert_eq!(out.len(), n_samples);
+    match overrides {
+        Some(overrides) => {
+            if overrides.len() != n_samples {
+                return Err(PosteriorEngineError::InbreedingOverrideLengthMismatch {
+                    locus,
+                    override_len: overrides.len(),
+                    record_samples: n_samples,
+                });
+            }
+            out.copy_from_slice(overrides);
+        }
+        None => {
+            for slot in out.iter_mut() {
+                *slot = default;
+            }
+        }
     }
-    Ok(overrides.to_vec())
+    Ok(())
 }
 
 fn e_step<M: MathBackend>(
-    ctx: &EmContext<'_>,
+    ctx: EmContext<'_>,
     math: &M,
     log_likelihoods: &[f64],
-    p_hat: &[f64],
-    f_hat_compound: &[f64],
-    scratch: &mut EmScratch,
-    posteriors: &mut [f64],
+    scratch: &mut RecordScratch,
 ) -> Result<(), PosteriorEngineError> {
     // Effective per-allele frequency seen by the prior: `f̂_C`
     // substitutes for `p̂[compound]` in every compound slot, regardless
     // of any per-sample chain-broken flag (the chain-broken flag only
     // affects the likelihood, which Stage 5 has already baked into
     // `log_likelihoods`).
-    for (a, (slot_p, slot_log)) in scratch
-        .p_effective
-        .iter_mut()
-        .zip(scratch.log_p_effective.iter_mut())
-        .enumerate()
-    {
-        let p = if ctx.compound_mask[a] {
-            f_hat_compound[a]
+    for a in 0..ctx.n_alleles {
+        let p = if scratch.compound_mask[a] {
+            scratch.f_hat_compound[a]
         } else {
-            p_hat[a]
+            scratch.p_hat[a]
         };
-        *slot_p = p;
-        *slot_log = safe_ln(math, p);
+        scratch.p_effective[a] = p;
+        scratch.log_p_effective[a] = safe_ln(math, p);
     }
 
     // H2: `log_indep` depends only on `log_p_effective` and the
@@ -1602,25 +1746,21 @@ fn e_step<M: MathBackend>(
         fill_log_prior_per_g_homogeneous(ctx, math, scratch);
     }
 
-    let ll_chunks = log_likelihoods.chunks_exact(ctx.n_genotypes);
-    let post_chunks = posteriors.chunks_exact_mut(ctx.n_genotypes);
+    let n_genotypes = ctx.n_genotypes;
+    for sample_idx in 0..ctx.n_samples {
+        let ll_row = &log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
 
-    for (sample_idx, (ll_row, post_row)) in ll_chunks.zip(post_chunks).enumerate() {
         if ctx.homogeneous_fixation {
             // log_prior_per_g[g] already carries the IBD term; just
             // add the sample's likelihood per genotype.
-            for (g_idx, (&ll, post_slot)) in ll_row
-                .iter()
-                .zip(scratch.log_post_unnorm.iter_mut())
-                .enumerate()
-            {
-                *post_slot = ll + scratch.log_prior_per_g[g_idx];
+            for (g_idx, &ll) in ll_row.iter().enumerate() {
+                scratch.log_post_unnorm[g_idx] = ll + scratch.log_prior_per_g[g_idx];
             }
         } else {
             // Heterogeneous: `log_f` / `log_one_minus_f` change per
             // sample, so the IBD branch has to run per-cell.
-            let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
-            let log_f = ctx.log_f_per_sample[sample_idx];
+            let log_one_minus_f = scratch.log_one_minus_f_per_sample[sample_idx];
+            let log_f = scratch.log_f_per_sample[sample_idx];
 
             for (g_idx, &ll) in ll_row.iter().enumerate() {
                 let log_indep = scratch.log_indep_per_g[g_idx];
@@ -1653,7 +1793,8 @@ fn e_step<M: MathBackend>(
             });
         }
 
-        for (g_idx, post_slot) in post_row.iter_mut().enumerate() {
+        let post_base = sample_idx * n_genotypes;
+        for g_idx in 0..n_genotypes {
             let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
             if !posterior.is_finite() {
                 return Err(PosteriorEngineError::NonFinitePosterior {
@@ -1663,7 +1804,7 @@ fn e_step<M: MathBackend>(
                     kind: classify_nonfinite(posterior),
                 });
             }
-            *post_slot = posterior;
+            scratch.posteriors[post_base + g_idx] = posterior;
         }
     }
 
@@ -1679,29 +1820,21 @@ fn e_step<M: MathBackend>(
 /// scalar backends the const is `false` and this function is
 /// dead-code-eliminated by monomorphisation.
 fn e_step_simd<M: MathBackend>(
-    ctx: &EmContext<'_>,
+    ctx: EmContext<'_>,
     math: &M,
     log_likelihoods: &[f64],
-    p_hat: &[f64],
-    f_hat_compound: &[f64],
-    scratch: &mut EmScratch,
-    posteriors: &mut [f64],
+    scratch: &mut RecordScratch,
 ) -> Result<(), PosteriorEngineError> {
     // `log_p_effective` build is per-allele scalar work — identical
     // to the scalar e_step.
-    for (a, (slot_p, slot_log)) in scratch
-        .p_effective
-        .iter_mut()
-        .zip(scratch.log_p_effective.iter_mut())
-        .enumerate()
-    {
-        let p = if ctx.compound_mask[a] {
-            f_hat_compound[a]
+    for a in 0..ctx.n_alleles {
+        let p = if scratch.compound_mask[a] {
+            scratch.f_hat_compound[a]
         } else {
-            p_hat[a]
+            scratch.p_hat[a]
         };
-        *slot_p = p;
-        *slot_log = safe_ln(math, p);
+        scratch.p_effective[a] = p;
+        scratch.log_p_effective[a] = safe_ln(math, p);
     }
 
     // H2: cache `log_indep[g]` once per iteration; the batch loop
@@ -1735,16 +1868,16 @@ fn e_step_simd<M: MathBackend>(
         } else {
             (
                 wide::f64x4::from([
-                    ctx.log_f_per_sample[s0],
-                    ctx.log_f_per_sample[s0 + 1],
-                    ctx.log_f_per_sample[s0 + 2],
-                    ctx.log_f_per_sample[s0 + 3],
+                    scratch.log_f_per_sample[s0],
+                    scratch.log_f_per_sample[s0 + 1],
+                    scratch.log_f_per_sample[s0 + 2],
+                    scratch.log_f_per_sample[s0 + 3],
                 ]),
                 wide::f64x4::from([
-                    ctx.log_one_minus_f_per_sample[s0],
-                    ctx.log_one_minus_f_per_sample[s0 + 1],
-                    ctx.log_one_minus_f_per_sample[s0 + 2],
-                    ctx.log_one_minus_f_per_sample[s0 + 3],
+                    scratch.log_one_minus_f_per_sample[s0],
+                    scratch.log_one_minus_f_per_sample[s0 + 1],
+                    scratch.log_one_minus_f_per_sample[s0 + 2],
+                    scratch.log_one_minus_f_per_sample[s0 + 3],
                 ]),
             )
         };
@@ -1795,8 +1928,9 @@ fn e_step_simd<M: MathBackend>(
             }
         }
 
-        // Normalise into `posteriors`. Layout stays sample-major, so
-        // we scatter each lane back to its `(sample, genotype)` slot.
+        // Normalise into `scratch.posteriors`. Layout stays
+        // sample-major, so we scatter each lane back to its
+        // `(sample, genotype)` slot.
         for g_idx in 0..n_genotypes {
             let post_v = math.exp_x4(scratch.log_post_unnorm_lane[g_idx] - log_z_v);
             let post_arr = post_v.to_array();
@@ -1809,7 +1943,7 @@ fn e_step_simd<M: MathBackend>(
                         kind: classify_nonfinite(p),
                     });
                 }
-                posteriors[(s0 + lane) * n_genotypes + g_idx] = p;
+                scratch.posteriors[(s0 + lane) * n_genotypes + g_idx] = p;
             }
         }
     }
@@ -1822,16 +1956,12 @@ fn e_step_simd<M: MathBackend>(
         let ll_row = &log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
 
         if ctx.homogeneous_fixation {
-            for (g_idx, (&ll, post_slot)) in ll_row
-                .iter()
-                .zip(scratch.log_post_unnorm.iter_mut())
-                .enumerate()
-            {
-                *post_slot = ll + scratch.log_prior_per_g[g_idx];
+            for (g_idx, &ll) in ll_row.iter().enumerate() {
+                scratch.log_post_unnorm[g_idx] = ll + scratch.log_prior_per_g[g_idx];
             }
         } else {
-            let log_one_minus_f = ctx.log_one_minus_f_per_sample[sample_idx];
-            let log_f = ctx.log_f_per_sample[sample_idx];
+            let log_one_minus_f = scratch.log_one_minus_f_per_sample[sample_idx];
+            let log_f = scratch.log_f_per_sample[sample_idx];
 
             for (g_idx, &ll) in ll_row.iter().enumerate() {
                 let log_indep = scratch.log_indep_per_g[g_idx];
@@ -1856,8 +1986,8 @@ fn e_step_simd<M: MathBackend>(
                 kind: classify_nonfinite(log_z),
             });
         }
-        let post_row = &mut posteriors[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
-        for (g_idx, post_slot) in post_row.iter_mut().enumerate() {
+        let post_base = sample_idx * n_genotypes;
+        for g_idx in 0..n_genotypes {
             let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
             if !posterior.is_finite() {
                 return Err(PosteriorEngineError::NonFinitePosterior {
@@ -1867,29 +1997,31 @@ fn e_step_simd<M: MathBackend>(
                     kind: classify_nonfinite(posterior),
                 });
             }
-            *post_slot = posterior;
+            scratch.posteriors[post_base + g_idx] = posterior;
         }
     }
 
     Ok(())
 }
 
-fn m_step_p_hat(ctx: &EmContext<'_>, posteriors: &[f64], scratch: &mut EmScratch) -> Vec<f64> {
-    accumulate_expected_counts(ctx, posteriors, &mut scratch.expected_counts);
+/// M-step on p̂. Writes the new estimate into `scratch.p_hat_next`;
+/// the caller (`run_em_loop`) then computes `max_abs_diff(p_hat,
+/// p_hat_next)` and `mem::swap`s the two buffers to advance the
+/// iteration.
+fn m_step_p_hat(ctx: EmContext<'_>, scratch: &mut RecordScratch) {
+    accumulate_expected_counts(ctx, &scratch.posteriors, &mut scratch.expected_counts);
 
     // M-step on p̂ — Dirichlet posterior mean over the simplex.
     let dirichlet_denominator: f64 = scratch
         .expected_counts
         .iter()
-        .zip(ctx.pseudocounts.iter())
+        .zip(scratch.pseudocounts.iter())
         .map(|(e, a)| e + a)
         .sum();
-    scratch
-        .expected_counts
-        .iter()
-        .zip(ctx.pseudocounts.iter())
-        .map(|(e, a)| (e + a) / dirichlet_denominator)
-        .collect()
+    for a in 0..ctx.n_alleles {
+        scratch.p_hat_next[a] =
+            (scratch.expected_counts[a] + scratch.pseudocounts[a]) / dirichlet_denominator;
+    }
 }
 
 /// Sum `posterior[s, g] · gt_counts[g, a]` over (s, g) into
@@ -1897,11 +2029,7 @@ fn m_step_p_hat(ctx: &EmContext<'_>, posteriors: &[f64], scratch: &mut EmScratch
 /// [`m_step_p_hat`] so the biallelic-diploid fast path can specialise
 /// the inner triple loop without cluttering the surrounding Dirichlet
 /// arithmetic.
-fn accumulate_expected_counts(
-    ctx: &EmContext<'_>,
-    posteriors: &[f64],
-    expected_counts: &mut [f64],
-) {
+fn accumulate_expected_counts(ctx: EmContext<'_>, posteriors: &[f64], expected_counts: &mut [f64]) {
     // Biallelic-diploid is the dominant production case: every
     // standard SNP and small indel hits `(n_alleles, n_genotypes) ==
     // (2, 3)`. `genotype_allele_counts` is then statically
@@ -1949,49 +2077,57 @@ fn accumulate_expected_counts(
     }
 }
 
-fn m_step_f_hat_compound(ctx: &EmContext<'_>, scratch: &EmScratch) -> Vec<f64> {
+/// M-step on f̂_C. Writes the new estimate into
+/// `scratch.f_hat_compound`. Unlike `p_hat`, `f_hat_compound` is
+/// not part of the convergence test, so it can be overwritten in
+/// place without double-buffering.
+fn m_step_f_hat_compound(ctx: EmContext<'_>, scratch: &mut RecordScratch) {
     // M-step on f̂_C — Beta(α_compound, 1 − α_compound) posterior
     // mean. Each compound is independent of the others.
     let chromosomes_total = ctx.ploidy as f64 * ctx.n_samples as f64;
     let alpha_other = 1.0 - ctx.compound_pseudocount;
-    (0..ctx.n_alleles)
-        .map(|a| {
-            if ctx.compound_mask[a] {
-                let expected_compound_count = scratch.expected_counts[a];
-                (ctx.compound_pseudocount + expected_compound_count)
-                    / (ctx.compound_pseudocount + alpha_other + chromosomes_total)
-            } else {
-                0.0
-            }
-        })
-        .collect()
+    let denominator = ctx.compound_pseudocount + alpha_other + chromosomes_total;
+    for a in 0..ctx.n_alleles {
+        scratch.f_hat_compound[a] = if scratch.compound_mask[a] {
+            (ctx.compound_pseudocount + scratch.expected_counts[a]) / denominator
+        } else {
+            0.0
+        };
+    }
 }
 
+/// Compute per-sample best genotype, GQ phred, and site-level QUAL
+/// from the EM-converged posteriors.
+///
+/// Writes the per-sample outputs (`best_genotype`, `gq_phred`) into
+/// `scratch` so the caller can `.clone()` them into the output
+/// record without a fresh malloc-then-zero-init per record. Returns
+/// only the scalar `qual_phred`.
 fn summarise_posteriors(
     n_samples: usize,
     n_genotypes: usize,
-    posteriors: &[f64],
+    scratch: &mut RecordScratch,
     max_gq: f64,
-) -> (Vec<usize>, Vec<f64>, f64) {
-    let mut best_genotype = vec![0_usize; n_samples];
-    let mut gq_phred = vec![0.0_f64; n_samples];
+) -> f64 {
     let mut log10_p_hom_ref_sum = 0.0_f64;
 
-    for (sample_idx, post_row) in posteriors.chunks_exact(n_genotypes).enumerate() {
+    for sample_idx in 0..n_samples {
+        let post_row =
+            &scratch.posteriors[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
         let (best_idx, best_p) = post_row.iter().enumerate().fold(
             (0_usize, f64::NEG_INFINITY),
             |(best_i, best_v), (i, &v)| {
                 if v > best_v { (i, v) } else { (best_i, best_v) }
             },
         );
-        best_genotype[sample_idx] = best_idx;
+        scratch.best_genotype[sample_idx] = best_idx;
 
         // Clamp p_best below 1 by one ULP so the Phred calculation is
         // finite when EM produced an exact 1.0 (e.g. a singleton
         // genotype after softmax of `[finite, -∞, -∞]`).
         let p_best_clamped = best_p.min(1.0 - f64::EPSILON);
         let gq = PHRED_SCALE * (1.0 - p_best_clamped).log10();
-        gq_phred[sample_idx] = gq.clamp(0.0, max_gq);
+        scratch.gq_phred[sample_idx] = gq.clamp(0.0, max_gq);
 
         let p_hom_ref = post_row[HOM_REF_GENOTYPE_IDX];
         if p_hom_ref > 0.0 {
@@ -2005,13 +2141,11 @@ fn summarise_posteriors(
     // P(hom-ref) = 0 exactly, the product is 0 and QUAL = +∞ — a
     // legitimate "site is certainly variant" signal; the VCF writer
     // can cap it if it wants to.
-    let qual_phred = if log10_p_hom_ref_sum.is_finite() {
+    if log10_p_hom_ref_sum.is_finite() {
         PHRED_SCALE * log10_p_hom_ref_sum
     } else {
         f64::INFINITY
-    };
-
-    (best_genotype, gq_phred, qual_phred)
+    }
 }
 
 /// Inputs to [`trivial_posterior_record`]. Grouped into a struct
@@ -2101,7 +2235,7 @@ fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> Posteri
 /// from the cache instead of rebuilding (H2 in
 /// `perf_posterior_engine_2026-05-18.md`).
 #[inline]
-fn fill_log_indep_per_g(ctx: &EmContext<'_>, scratch: &mut EmScratch) {
+fn fill_log_indep_per_g(ctx: EmContext<'_>, scratch: &mut RecordScratch) {
     for g_idx in 0..ctx.n_genotypes {
         let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
         let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
@@ -2118,23 +2252,24 @@ fn fill_log_indep_per_g(ctx: &EmContext<'_>, scratch: &mut EmScratch) {
 /// same `f_s`). Caller must have just run [`fill_log_indep_per_g`].
 ///
 /// Reads the cohort-wide `log_f` / `log_one_minus_f` from
-/// `ctx.log_f_per_sample[0]` / `[..._one_minus...][0]`. The scalar
+/// `scratch.log_f_per_sample[0]` /
+/// `scratch.log_one_minus_f_per_sample[0]`. The scalar
 /// `log_sum_exp_2` short-circuits on `-∞` arguments (default config
 /// path: `f_s = 0.0` → `log_f = -∞`), so the homozygous branch
 /// usually folds to `log_one_minus_f + log_indep` without any
 /// transcendental call. H4 in the perf review.
 #[inline]
 fn fill_log_prior_per_g_homogeneous<M: MathBackend>(
-    ctx: &EmContext<'_>,
+    ctx: EmContext<'_>,
     math: &M,
-    scratch: &mut EmScratch,
+    scratch: &mut RecordScratch,
 ) {
     debug_assert!(
-        !ctx.log_f_per_sample.is_empty(),
-        "homogeneous_fixation set but log_f_per_sample is empty"
+        !scratch.log_f_per_sample.is_empty(),
+        "homogeneous_fixation set but scratch.log_f_per_sample is empty"
     );
-    let log_f = ctx.log_f_per_sample[0];
-    let log_one_minus_f = ctx.log_one_minus_f_per_sample[0];
+    let log_f = scratch.log_f_per_sample[0];
+    let log_one_minus_f = scratch.log_one_minus_f_per_sample[0];
     for g_idx in 0..ctx.n_genotypes {
         let log_indep = scratch.log_indep_per_g[g_idx];
         scratch.log_prior_per_g[g_idx] = match ctx.shape.homozygous_allele_for[g_idx] {

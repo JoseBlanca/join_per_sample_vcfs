@@ -40,6 +40,12 @@ const CACHE_SLOTS: usize = (MAX_CACHED_PLOIDY + 1) * (MAX_CACHED_N_ALLELES + 1);
 /// Per-`(ploidy, n_alleles)` artefacts the EM loop needs but doesn't
 /// change between records of the same shape.
 pub(crate) struct GenotypeShape {
+    /// Number of genotypes for the cached `(ploidy, n_alleles)`
+    /// shape. Read by the in-module tests as a sanity check; the
+    /// production engine threads `n_genotypes` through
+    /// `MergedRecord` and `EmContext` rather than re-reading it from
+    /// the shape cache.
+    #[allow(dead_code)]
     pub(crate) n_genotypes: usize,
     /// Flat row-major `n_genotypes × n_alleles` allele-count table.
     /// `[g_idx * n_alleles + a]` is the number of copies of allele `a`
