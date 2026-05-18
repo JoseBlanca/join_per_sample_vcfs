@@ -1801,25 +1801,7 @@ fn e_step_simd<M: MathBackend>(
 }
 
 fn m_step_p_hat(ctx: &EmContext<'_>, posteriors: &[f64], scratch: &mut EmScratch) -> Vec<f64> {
-    for slot in scratch.expected_counts.iter_mut() {
-        *slot = 0.0;
-    }
-
-    for post_row in posteriors.chunks_exact(ctx.n_genotypes) {
-        for (g_idx, gt_counts) in ctx
-            .shape
-            .genotype_allele_counts
-            .chunks_exact(ctx.n_alleles)
-            .enumerate()
-        {
-            let weight = post_row[g_idx];
-            for (a, &k) in gt_counts.iter().enumerate() {
-                if k != 0 {
-                    scratch.expected_counts[a] += weight * k as f64;
-                }
-            }
-        }
-    }
+    accumulate_expected_counts(ctx, posteriors, &mut scratch.expected_counts);
 
     // M-step on p̂ — Dirichlet posterior mean over the simplex.
     let dirichlet_denominator: f64 = scratch
@@ -1834,6 +1816,63 @@ fn m_step_p_hat(ctx: &EmContext<'_>, posteriors: &[f64], scratch: &mut EmScratch
         .zip(ctx.pseudocounts.iter())
         .map(|(e, a)| (e + a) / dirichlet_denominator)
         .collect()
+}
+
+/// Sum `posterior[s, g] · gt_counts[g, a]` over (s, g) into
+/// `expected_counts[a]`, clearing the output first. Split out from
+/// [`m_step_p_hat`] so the biallelic-diploid fast path can specialise
+/// the inner triple loop without cluttering the surrounding Dirichlet
+/// arithmetic.
+fn accumulate_expected_counts(
+    ctx: &EmContext<'_>,
+    posteriors: &[f64],
+    expected_counts: &mut [f64],
+) {
+    // Biallelic-diploid is the dominant production case: every
+    // standard SNP and small indel hits `(n_alleles, n_genotypes) ==
+    // (2, 3)`. `genotype_allele_counts` is then statically
+    // `[2, 0, 1, 1, 0, 2]` (RR, RA, AA), so the per-sample inner
+    // loop reduces to two FMAs with no data-dependent branch.
+    if ctx.n_alleles == 2 && ctx.n_genotypes == 3 {
+        let mut e_ref = 0.0_f64;
+        let mut e_alt = 0.0_f64;
+        for post_row in posteriors.chunks_exact(3) {
+            // `chunks_exact(3)` already proves `post_row.len() == 3`,
+            // so the indexed loads compile down to bounds-check-free
+            // movsd instructions.
+            let p_rr = post_row[0];
+            let p_ra = post_row[1];
+            let p_aa = post_row[2];
+            // RR=[2,0] → contributes 2·P_RR to REF, 0 to ALT
+            // RA=[1,1] → contributes   P_RA to REF,   P_RA to ALT
+            // AA=[0,2] → contributes 0 to REF,      2·P_AA to ALT
+            e_ref += 2.0 * p_rr + p_ra;
+            e_alt += p_ra + 2.0 * p_aa;
+        }
+        expected_counts[0] = e_ref;
+        expected_counts[1] = e_alt;
+        return;
+    }
+
+    // General path: any `(ploidy, n_alleles)` shape.
+    for slot in expected_counts.iter_mut() {
+        *slot = 0.0;
+    }
+    for post_row in posteriors.chunks_exact(ctx.n_genotypes) {
+        for (g_idx, gt_counts) in ctx
+            .shape
+            .genotype_allele_counts
+            .chunks_exact(ctx.n_alleles)
+            .enumerate()
+        {
+            let weight = post_row[g_idx];
+            for (a, &k) in gt_counts.iter().enumerate() {
+                if k != 0 {
+                    expected_counts[a] += weight * k as f64;
+                }
+            }
+        }
+    }
 }
 
 fn m_step_f_hat_compound(ctx: &EmContext<'_>, scratch: &EmScratch) -> Vec<f64> {
