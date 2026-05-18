@@ -1463,8 +1463,7 @@ fn e_step_simd<M: MathBackend>(
         // Normalise into `posteriors`. Layout stays sample-major, so
         // we scatter each lane back to its `(sample, genotype)` slot.
         for g_idx in 0..n_genotypes {
-            let post_v =
-                wide::f64x4::from(math.exp_x4((scratch.log_post_unnorm_lane[g_idx] - log_z_v).to_array()));
+            let post_v = math.exp_x4(scratch.log_post_unnorm_lane[g_idx] - log_z_v);
             let post_arr = post_v.to_array();
             for (lane, &p) in post_arr.iter().enumerate() {
                 if !p.is_finite() {
@@ -1748,10 +1747,9 @@ fn log_sum_exp_slice<M: MathBackend>(math: &M, values: &[f64]) -> f64 {
 #[inline]
 fn log_sum_exp_2_x4<M: MathBackend>(math: &M, a: wide::f64x4, b: wide::f64x4) -> wide::f64x4 {
     let m = a.fast_max(b);
-    let ea = math.exp_x4((a - m).to_array());
-    let eb = math.exp_x4((b - m).to_array());
-    let sum = wide::f64x4::from(ea) + wide::f64x4::from(eb);
-    let ln_sum = wide::f64x4::from(math.ln_x4(sum.to_array()));
+    let ea = math.exp_x4(a - m);
+    let eb = math.exp_x4(b - m);
+    let ln_sum = math.ln_x4(ea + eb);
     m + ln_sum
 }
 
@@ -1770,10 +1768,9 @@ fn log_sum_exp_slice_x4<M: MathBackend>(math: &M, values: &[wide::f64x4]) -> wid
     }
     let mut sum = wide::f64x4::splat(0.0);
     for &v in values {
-        let exp_diff = math.exp_x4((v - m).to_array());
-        sum += wide::f64x4::from(exp_diff);
+        sum += math.exp_x4(v - m);
     }
-    let ln_sum = wide::f64x4::from(math.ln_x4(sum.to_array()));
+    let ln_sum = math.ln_x4(sum);
     let candidate = m + ln_sum;
     // Per-lane fallback: if a lane's `m == -∞`, force result to `-∞`.
     let neg_inf = wide::f64x4::splat(f64::NEG_INFINITY);

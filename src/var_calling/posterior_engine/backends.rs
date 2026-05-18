@@ -65,16 +65,22 @@ pub trait MathBackend: Sync {
     /// implementation. The engine routes its hottest log/exp calls
     /// through `ln_x4` / `exp_x4` only on the
     /// [`Self::HAS_LANE_4`]-true code path.
+    ///
+    /// Takes and returns [`wide::f64x4`] directly so the SIMD call
+    /// sites in `e_step_simd` / `log_sum_exp_*_x4` don't pay an array
+    /// round-trip per call.
     #[inline]
-    fn ln_x4(&self, x: [f64; 4]) -> [f64; 4] {
-        [self.ln(x[0]), self.ln(x[1]), self.ln(x[2]), self.ln(x[3])]
+    fn ln_x4(&self, x: wide::f64x4) -> wide::f64x4 {
+        let a = x.to_array();
+        wide::f64x4::from([self.ln(a[0]), self.ln(a[1]), self.ln(a[2]), self.ln(a[3])])
     }
 
     /// Lane-of-4 exponential. Default falls back to four scalar
     /// calls; SIMD backends override.
     #[inline]
-    fn exp_x4(&self, x: [f64; 4]) -> [f64; 4] {
-        [self.exp(x[0]), self.exp(x[1]), self.exp(x[2]), self.exp(x[3])]
+    fn exp_x4(&self, x: wide::f64x4) -> wide::f64x4 {
+        let a = x.to_array();
+        wide::f64x4::from([self.exp(a[0]), self.exp(a[1]), self.exp(a[2]), self.exp(a[3])])
     }
 
     /// Whether this backend's lane methods are SIMD-accelerated and
@@ -163,21 +169,17 @@ impl MathBackend for InterpUnivariateSimdMath {
     }
 
     // Lane-of-4 routes through `wide`'s built-in polynomial `f64x4::ln`
-    // / `f64x4::exp`, NOT the sibling `interp::{ln_approx_x4,
-    // exp_approx_x4}` table-lookup helpers. The May 17 perf report
-    // assumed the table approach would dominate; in practice the
-    // table-lookup `_x4` helpers do per-lane scalar bit-decomposition
-    // and per-lane scalar table reads (the SIMD ops only wrap a scalar
-    // gather), which costs more than `wide`'s fully-SIMD polynomial.
-    // See doc/devel/reports/implementations/posterior_engine_simd_analysis_2026-05-18.md.
+    // / `f64x4::exp` — fully SIMD via safe_arch AVX2 intrinsics +
+    // bytemuck bit-cast. See
+    // doc/devel/reports/implementations/posterior_engine_simd_analysis_2026-05-18.md.
     #[inline]
-    fn ln_x4(&self, x: [f64; 4]) -> [f64; 4] {
-        wide::f64x4::from(x).ln().to_array()
+    fn ln_x4(&self, x: wide::f64x4) -> wide::f64x4 {
+        x.ln()
     }
 
     #[inline]
-    fn exp_x4(&self, x: [f64; 4]) -> [f64; 4] {
-        wide::f64x4::from(x).exp().to_array()
+    fn exp_x4(&self, x: wide::f64x4) -> wide::f64x4 {
+        x.exp()
     }
 
     const HAS_LANE_4: bool = true;
