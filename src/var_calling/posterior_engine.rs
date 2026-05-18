@@ -839,6 +839,249 @@ fn compute_mixture_log_likelihoods<M: MathBackend>(
     Ok(mixture_log_likelihoods)
 }
 
+/// Lane-of-4 SIMD variant of [`compute_mixture_log_likelihoods`].
+/// Process samples in batches of 4 using `f64x4` math; the per-sample
+/// outer loop, the per-(g, a) inner work, and the dominant
+/// `math.ln(mix)` call all go SIMD via [`MathBackend::ln_x4`].
+///
+/// The samply profile from 2026-05-18 showed ~12 % of contam-on
+/// self-time in the scalar mixture pre-pass (3.8 % on `math.ln(mix)`
+/// at line 824 of the scalar version, plus ~8 % in `interp::*_approx`
+/// driven from that call). The SIMD body replaces it.
+///
+/// Dispatched from [`run_em_for_record`] when `M::HAS_LANE_4` is
+/// true. Scalar backends fall through to
+/// [`compute_mixture_log_likelihoods`].
+#[allow(clippy::too_many_arguments)]
+fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
+    locus: RecordLocus,
+    alleles: &[MergedAllele],
+    ploidy: u8,
+    scalars: &[AlleleSupportStats],
+    estimates: &ContaminationEstimates,
+    fallback_log_likelihoods: &[f64],
+    math: &M,
+) -> Result<Vec<f64>, PosteriorEngineError> {
+    use wide::{CmpGt, CmpLe, f64x4};
+
+    let n_alleles = alleles.len();
+    let shape = shape_for(ploidy, n_alleles);
+    let n_genotypes = shape.n_genotypes;
+    let n_samples = scalars.len() / n_alleles;
+
+    debug_assert_eq!(
+        scalars.len(),
+        n_samples * n_alleles,
+        "scalars length does not match n_samples * n_alleles"
+    );
+    debug_assert_eq!(
+        fallback_log_likelihoods.len(),
+        n_samples * n_genotypes,
+        "fallback_log_likelihoods length does not match n_samples * n_genotypes"
+    );
+
+    let allele_classes = classify_alleles(alleles);
+    let contam_class_per_allele: Vec<Option<ContamAlleleClass>> = allele_classes
+        .iter()
+        .copied()
+        .map(map_to_contam_class)
+        .collect();
+    let genotype_allele_counts = &shape.genotype_allele_counts;
+
+    let ploidy_f = f64::from(ploidy);
+    let other_allele_error_denom = (n_alleles as f64 - 1.0).max(1.0);
+
+    // Per-sample pre-pass: collect c_s and mean_err for every
+    // (sample, allele) cell so the SIMD batch loop can lane-load
+    // them with simple gathers. n_obs reads directly from `scalars`
+    // (its `num_obs: u32` field is already where we'd put it).
+    let mut c_s_all = vec![0.0_f64; n_samples];
+    let mut mean_err_all = vec![0.0_f64; n_samples * n_alleles];
+    for sample_idx in 0..n_samples {
+        c_s_all[sample_idx] = estimates.effective_c_s(sample_idx);
+        let sample_allele_scalars =
+            &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
+        for (a, support) in sample_allele_scalars.iter().enumerate() {
+            mean_err_all[sample_idx * n_alleles + a] = if support.num_obs > 0 {
+                let per_read_log_err = support.q_sum / f64::from(support.num_obs);
+                math.exp(per_read_log_err)
+                    .clamp(MIN_BASE_ERROR, MAX_BASE_ERROR)
+            } else {
+                0.0
+            };
+        }
+    }
+
+    // Initialize output with the fallback (Stage-5 precomputed)
+    // values. Samples with `c_s <= 0` (inactive in the mixture model)
+    // keep their fallback row through the SIMD loop; active lanes
+    // overwrite their per-genotype cell on the way out.
+    let mut mixture_log_likelihoods = fallback_log_likelihoods.to_vec();
+
+    let n_full_batches = n_samples / 4;
+    let tail_start = n_full_batches * 4;
+
+    for batch_idx in 0..n_full_batches {
+        let s0 = batch_idx * 4;
+
+        let c_s_v = f64x4::from([
+            c_s_all[s0],
+            c_s_all[s0 + 1],
+            c_s_all[s0 + 2],
+            c_s_all[s0 + 3],
+        ]);
+        let one_minus_c_s_v = f64x4::splat(1.0) - c_s_v;
+        let active_mask = c_s_v.cmp_gt(f64x4::splat(0.0));
+
+        if !active_mask.any() {
+            // All 4 lanes inactive — fallback rows already in place,
+            // nothing more to do for this batch.
+            continue;
+        }
+
+        for g_idx in 0..n_genotypes {
+            let gt_offset = g_idx * n_alleles;
+            let mut ll_v = f64x4::splat(0.0);
+
+            for a in 0..n_alleles {
+                // `n_a` per lane (different samples at fixed allele).
+                let n_a_v = f64x4::from([
+                    f64::from(scalars[s0 * n_alleles + a].num_obs),
+                    f64::from(scalars[(s0 + 1) * n_alleles + a].num_obs),
+                    f64::from(scalars[(s0 + 2) * n_alleles + a].num_obs),
+                    f64::from(scalars[(s0 + 3) * n_alleles + a].num_obs),
+                ]);
+                let n_a_mask = n_a_v.cmp_gt(f64x4::splat(0.0));
+
+                // `eps` per lane.
+                let eps_v = f64x4::from([
+                    mean_err_all[s0 * n_alleles + a],
+                    mean_err_all[(s0 + 1) * n_alleles + a],
+                    mean_err_all[(s0 + 2) * n_alleles + a],
+                    mean_err_all[(s0 + 3) * n_alleles + a],
+                ]);
+
+                // p_own depends on (eps, k_a, ploidy_f). The
+                // coefficients are lane-uniform (depend on g, a, not
+                // sample), so we splat them and combine with the
+                // per-lane `eps`.
+                let k_a = f64::from(genotype_allele_counts[gt_offset + a]);
+                let coeff_own = k_a / ploidy_f;
+                let coeff_err = (ploidy_f - k_a) / (ploidy_f * other_allele_error_denom);
+                let p_own_v = f64x4::splat(coeff_own) * (f64x4::splat(1.0) - eps_v)
+                    + f64x4::splat(coeff_err) * eps_v;
+
+                // p_contam per lane: gather the per-sample-batch
+                // q_b value for the current allele's contamination
+                // class. Compound-allele class → `None` → 0.0 across
+                // all lanes.
+                let p_contam_v = match contam_class_per_allele[a] {
+                    Some(class) => {
+                        let ci = class as usize;
+                        f64x4::from([
+                            estimates.q_b_for_sample(s0)[ci],
+                            estimates.q_b_for_sample(s0 + 1)[ci],
+                            estimates.q_b_for_sample(s0 + 2)[ci],
+                            estimates.q_b_for_sample(s0 + 3)[ci],
+                        ])
+                    }
+                    None => f64x4::splat(0.0),
+                };
+
+                let mix_v = one_minus_c_s_v * p_own_v + c_s_v * p_contam_v;
+
+                // Defensive: every active lane with `n_a > 0` must
+                // produce `mix > 0`. If any such lane has `mix <= 0`,
+                // surface the first offending lane as a
+                // non-finite-posterior error (matches the scalar
+                // body's behaviour exactly).
+                let contributing_mask = active_mask & n_a_mask;
+                let bad_mask = mix_v.cmp_le(f64x4::splat(0.0)) & contributing_mask;
+                if bad_mask.any() {
+                    let mix_arr = mix_v.to_array();
+                    for lane in 0..4 {
+                        if c_s_all[s0 + lane] > 0.0
+                            && scalars[(s0 + lane) * n_alleles + a].num_obs > 0
+                            && mix_arr[lane] <= 0.0
+                        {
+                            return Err(PosteriorEngineError::NonFinitePosterior {
+                                locus,
+                                sample_idx: s0 + lane,
+                                genotype_idx: Some(g_idx),
+                                kind: NonFiniteKind::NegativeInfinity,
+                            });
+                        }
+                    }
+                }
+
+                // Replace `mix` with 1.0 in lanes that won't
+                // contribute, so `ln` doesn't see 0 / negative inputs
+                // (which would produce `-∞` / `NaN` and poison the
+                // sum via `0 * -∞ = NaN`).
+                let mix_safe = contributing_mask.blend(mix_v, f64x4::splat(1.0));
+                let log_mix_v = math.ln_x4(mix_safe);
+                let contrib_v = n_a_v * log_mix_v;
+                let contrib_masked = contributing_mask.blend(contrib_v, f64x4::splat(0.0));
+                ll_v += contrib_masked;
+            }
+
+            // Scatter back: each active lane writes its cell;
+            // inactive lanes keep the fallback already copied into
+            // `mixture_log_likelihoods` at function entry.
+            let ll_arr = ll_v.to_array();
+            for lane in 0..4 {
+                if c_s_all[s0 + lane] > 0.0 {
+                    mixture_log_likelihoods[(s0 + lane) * n_genotypes + g_idx] = ll_arr[lane];
+                }
+            }
+        }
+    }
+
+    // Tail: process leftover samples (n_samples % 4) with scalar
+    // math. The pre-pass already populated `mean_err_all`, so the
+    // tail just reads from it.
+    for sample_idx in tail_start..n_samples {
+        let c_s = c_s_all[sample_idx];
+        if c_s <= 0.0 {
+            continue; // fallback row already in place
+        }
+        let q_b = estimates.q_b_for_sample(sample_idx);
+        let sample_allele_scalars =
+            &scalars[sample_idx * n_alleles..(sample_idx + 1) * n_alleles];
+
+        for (g_idx, gt_counts) in genotype_allele_counts.chunks_exact(n_alleles).enumerate() {
+            let mut ll: f64 = 0.0;
+            for a in 0..n_alleles {
+                let n_a = sample_allele_scalars[a].num_obs;
+                if n_a == 0 {
+                    continue;
+                }
+                let k_a = f64::from(gt_counts[a]);
+                let eps = mean_err_all[sample_idx * n_alleles + a];
+                let p_own = (k_a / ploidy_f) * (1.0 - eps)
+                    + ((ploidy_f - k_a) / ploidy_f) * (eps / other_allele_error_denom);
+                let p_contam = match contam_class_per_allele[a] {
+                    Some(class) => q_b[class as usize],
+                    None => 0.0,
+                };
+                let mix = (1.0 - c_s) * p_own + c_s * p_contam;
+                if mix <= 0.0 {
+                    return Err(PosteriorEngineError::NonFinitePosterior {
+                        locus,
+                        sample_idx,
+                        genotype_idx: Some(g_idx),
+                        kind: NonFiniteKind::NegativeInfinity,
+                    });
+                }
+                ll += f64::from(n_a) * math.ln(mix);
+            }
+            mixture_log_likelihoods[sample_idx * n_genotypes + g_idx] = ll;
+        }
+    }
+
+    Ok(mixture_log_likelihoods)
+}
+
 fn pseudocount_for(class: AlleleClass, config: &PosteriorEngineConfig) -> f64 {
     match class {
         AlleleClass::Ref => config.ref_pseudocount,
@@ -967,15 +1210,29 @@ fn run_em_for_record<M: MathBackend>(
             "ContaminationEstimates internal invariant violated"
         );
         if n_alleles >= 2 {
-            compute_mixture_log_likelihoods(
-                locus,
-                &alleles,
-                ploidy,
-                &scalars,
-                estimates,
-                &log_likelihoods,
-                math,
-            )?
+            // `M::HAS_LANE_4` is a compile-time const; the unused
+            // branch is dead-code-eliminated after monomorphisation.
+            if M::HAS_LANE_4 {
+                compute_mixture_log_likelihoods_simd(
+                    locus,
+                    &alleles,
+                    ploidy,
+                    &scalars,
+                    estimates,
+                    &log_likelihoods,
+                    math,
+                )?
+            } else {
+                compute_mixture_log_likelihoods(
+                    locus,
+                    &alleles,
+                    ploidy,
+                    &scalars,
+                    estimates,
+                    &log_likelihoods,
+                    math,
+                )?
+            }
         } else {
             log_likelihoods
         }
