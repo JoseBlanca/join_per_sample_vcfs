@@ -11,8 +11,10 @@
 use std::collections::HashSet;
 
 use noodles_vcf::Header;
+use noodles_vcf::header::Builder as HeaderBuilder;
 use noodles_vcf::header::FileFormat;
 use noodles_vcf::header::record::Value as HeaderValue;
+use noodles_vcf::header::record::key::other::ParseError as OtherKeyParseError;
 use noodles_vcf::header::record::value::Map;
 use noodles_vcf::header::record::value::map::{
     Contig, Filter, Format, Info,
@@ -39,9 +41,13 @@ pub struct CohortMetadata {
     /// Contig table — name, length, md5. Sourced from the per-position
     /// merger's chromosome slice, which in turn was sourced from the
     /// `.psp` headers.
+    ///
+    /// An empty vector is accepted (the header will carry no
+    /// `##contig=` lines); operationally meaningless but structurally
+    /// valid.
     pub contigs: Vec<ParsedChromosome>,
     /// Goes into `##source=...`. Conventionally `"pop_var_caller
-    /// <version>"`.
+    /// <version>"`. An empty string skips the `##source` line.
     pub tool_string: String,
     /// Goes into `##commandline=...`. CLIs build this from
     /// `std::env::args()`; library users may pass an empty string to
@@ -57,44 +63,21 @@ pub(super) fn build_vcf_header(
 
     let mut builder = Header::builder().set_file_format(FileFormat::new(4, 4));
 
-    if !metadata.tool_string.is_empty() {
-        let key = "source".parse().map_err(
-            |e: noodles_vcf::header::record::key::other::ParseError| {
-                VcfWriteError::Encode(format!("##source key parse: {e}"))
-            },
-        )?;
-        builder = builder
-            .insert(key, HeaderValue::from(metadata.tool_string.as_str()))
-            .map_err(|e| VcfWriteError::Encode(format!("##source insert: {e}")))?;
-    }
-
-    if !metadata.command_line.is_empty() {
-        let key = "commandline".parse().map_err(
-            |e: noodles_vcf::header::record::key::other::ParseError| {
-                VcfWriteError::Encode(format!("##commandline key parse: {e}"))
-            },
-        )?;
-        builder = builder
-            .insert(key, HeaderValue::from(metadata.command_line.as_str()))
-            .map_err(|e| VcfWriteError::Encode(format!("##commandline insert: {e}")))?;
-    }
+    builder = insert_unstructured(builder, "source", &metadata.tool_string)?;
+    builder = insert_unstructured(builder, "commandline", &metadata.command_line)?;
 
     for entry in &metadata.contigs {
-        let length_usize =
-            usize::try_from(entry.length).map_err(|_| VcfWriteError::ContigLengthOverflow {
-                name: entry.name.clone(),
-                length: entry.length,
-            })?;
-        // VCF 4.4 specifies the contig length is an integer; htslib
-        // treats it as signed 32-bit. Reject anything wider than
-        // i32::MAX to avoid silent wrap on consumer parsers, even
-        // though i32::MAX > any real chromosome.
+        // Mi4: `usize::try_from(u32)` is infallible on 32-bit and
+        // 64-bit targets (the project deploys to x86_64 and aarch64).
+        // The only real cap is the VCF spec's `##contig=length=` field
+        // which htslib treats as signed 32-bit. One check suffices.
         if entry.length > i32::MAX as u32 {
             return Err(VcfWriteError::ContigLengthOverflow {
                 name: entry.name.clone(),
                 length: entry.length,
             });
         }
+        let length_usize = entry.length as usize;
         let mut contig = Map::<Contig>::new();
         *contig.length_mut() = Some(length_usize);
         *contig.md5_mut() = Some(entry.md5.clone());
@@ -195,6 +178,53 @@ pub(super) fn build_vcf_header(
     Ok(builder.build())
 }
 
+/// Mi6: insert one unstructured `##key=value` header record. Empty
+/// `value` is a no-op (callers contract on it to skip the line). Both
+/// the key-parse and the insert failure surface as
+/// `VcfWriteError::Encode` with the project-side operation tag —
+/// the noodles cause is boxed per the project's "no third-party types
+/// in our public error API" decision.
+fn insert_unstructured(
+    builder: HeaderBuilder,
+    key: &'static str,
+    value: &str,
+) -> Result<HeaderBuilder, VcfWriteError> {
+    if value.is_empty() {
+        return Ok(builder);
+    }
+    let parsed_key = key
+        .parse::<noodles_vcf::header::record::key::Other>()
+        .map_err(|e: OtherKeyParseError| VcfWriteError::Encode {
+            operation: header_op_for_key(key, KeyOp::Parse),
+            source: Box::new(e),
+        })?;
+    builder
+        .insert(parsed_key, HeaderValue::from(value))
+        .map_err(|e| VcfWriteError::Encode {
+            operation: header_op_for_key(key, KeyOp::Insert),
+            source: Box::new(e),
+        })
+}
+
+enum KeyOp {
+    Parse,
+    Insert,
+}
+
+/// Produces a `&'static str` operation tag for the `Encode` variant.
+/// The set of keys we ever insert is known at compile time, so a
+/// small `match` keeps `Encode { operation: &'static str }` honest.
+fn header_op_for_key(key: &'static str, op: KeyOp) -> &'static str {
+    match (key, op) {
+        ("source", KeyOp::Parse) => "##source key parse",
+        ("source", KeyOp::Insert) => "##source insert",
+        ("commandline", KeyOp::Parse) => "##commandline key parse",
+        ("commandline", KeyOp::Insert) => "##commandline insert",
+        (_, KeyOp::Parse) => "header key parse",
+        (_, KeyOp::Insert) => "header insert",
+    }
+}
+
 fn validate_metadata(metadata: &CohortMetadata) -> Result<(), VcfWriteError> {
     if metadata.sample_names.is_empty() {
         return Err(VcfWriteError::InvalidMetadata(
@@ -224,6 +254,8 @@ fn validate_metadata(metadata: &CohortMetadata) -> Result<(), VcfWriteError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// Serialise a header through the actual VCF writer so the test
@@ -256,15 +288,20 @@ mod tests {
         }
     }
 
+    fn cfg_emit_gp_off() -> WriterConfig {
+        WriterConfig::new(PathBuf::from("/dev/null"))
+    }
+
+    fn cfg_emit_gp_on() -> WriterConfig {
+        let mut c = WriterConfig::new(PathBuf::from("/dev/null"));
+        c.emit_gp = true;
+        c
+    }
+
     #[test]
     fn header_round_trips_without_gp_by_default() {
         let metadata = fixture_metadata();
-        let config = WriterConfig {
-            output: "/dev/null".into(),
-            default_filter_pass: true,
-            emit_gp: false,
-        };
-        let header = build_vcf_header(&metadata, &config).unwrap();
+        let header = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap();
         let text = header_to_string(&header);
         assert!(text.contains("##fileformat=VCFv4.4"));
         assert!(text.contains("##source=pop_var_caller 0.1.0"));
@@ -287,12 +324,7 @@ mod tests {
     #[test]
     fn header_includes_gp_when_enabled() {
         let metadata = fixture_metadata();
-        let config = WriterConfig {
-            output: "/dev/null".into(),
-            default_filter_pass: true,
-            emit_gp: true,
-        };
-        let header = build_vcf_header(&metadata, &config).unwrap();
+        let header = build_vcf_header(&metadata, &cfg_emit_gp_on()).unwrap();
         let text = header_to_string(&header);
         assert!(text.contains("##FORMAT=<ID=GP,Number=G,Type=Float"));
     }
@@ -301,8 +333,7 @@ mod tests {
     fn empty_sample_names_rejected() {
         let mut metadata = fixture_metadata();
         metadata.sample_names.clear();
-        let config = WriterConfig::default();
-        let err = build_vcf_header(&metadata, &config).unwrap_err();
+        let err = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap_err();
         assert!(matches!(err, VcfWriteError::InvalidMetadata(_)));
     }
 
@@ -310,8 +341,7 @@ mod tests {
     fn duplicate_sample_name_rejected() {
         let mut metadata = fixture_metadata();
         metadata.sample_names = vec!["S0".into(), "S0".into()];
-        let config = WriterConfig::default();
-        let err = build_vcf_header(&metadata, &config).unwrap_err();
+        let err = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap_err();
         match err {
             VcfWriteError::InvalidMetadata(msg) => {
                 assert!(msg.contains("duplicate sample name"), "got: {msg}");
@@ -324,13 +354,74 @@ mod tests {
     fn duplicate_contig_name_rejected() {
         let mut metadata = fixture_metadata();
         metadata.contigs[1].name = "chr1".into();
-        let config = WriterConfig::default();
-        let err = build_vcf_header(&metadata, &config).unwrap_err();
+        let err = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap_err();
         match err {
             VcfWriteError::InvalidMetadata(msg) => {
                 assert!(msg.contains("duplicate contig name"), "got: {msg}");
             }
             other => panic!("expected InvalidMetadata, got {other:?}"),
         }
+    }
+
+    /// Mi4: contig length over `i32::MAX` is rejected with the typed
+    /// variant. Previously had zero coverage.
+    #[test]
+    fn contig_length_above_i32_max_rejected() {
+        let mut metadata = fixture_metadata();
+        let bad_length = (i32::MAX as u32) + 1;
+        metadata.contigs[0].length = bad_length;
+        let err = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap_err();
+        match err {
+            VcfWriteError::ContigLengthOverflow { name, length } => {
+                assert_eq!(name, "chr1");
+                assert_eq!(length, bad_length);
+            }
+            other => panic!("expected ContigLengthOverflow, got {other:?}"),
+        }
+    }
+
+    /// Mi5: empty `tool_string` skips the `##source` line; doc on
+    /// `CohortMetadata::tool_string` contracts on this skip.
+    #[test]
+    fn header_omits_source_when_tool_string_empty() {
+        let mut metadata = fixture_metadata();
+        metadata.tool_string = String::new();
+        let header = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap();
+        let text = header_to_string(&header);
+        assert!(
+            !text.contains("##source="),
+            "##source should be absent with empty tool_string\n{text}"
+        );
+    }
+
+    /// Mi5: empty `command_line` skips the `##commandline` line.
+    #[test]
+    fn header_omits_commandline_when_command_line_empty() {
+        let mut metadata = fixture_metadata();
+        metadata.command_line = String::new();
+        let header = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap();
+        let text = header_to_string(&header);
+        assert!(
+            !text.contains("##commandline="),
+            "##commandline should be absent with empty command_line\n{text}"
+        );
+    }
+
+    /// Mi3: empty `contigs` is structurally valid; we accept it and
+    /// produce a header with no `##contig=` lines. (Documented in
+    /// `CohortMetadata::contigs`.)
+    #[test]
+    fn empty_contigs_accepted_produces_header_with_no_contig_lines() {
+        let mut metadata = fixture_metadata();
+        metadata.contigs.clear();
+        let header = build_vcf_header(&metadata, &cfg_emit_gp_off()).unwrap();
+        let text = header_to_string(&header);
+        assert!(
+            !text.contains("##contig="),
+            "no ##contig lines expected\n{text}"
+        );
+        // Sample names still flow through.
+        let chrom_line = text.lines().find(|l| l.starts_with("#CHROM")).unwrap();
+        assert!(chrom_line.ends_with("\tS0\tS1\tS2"));
     }
 }

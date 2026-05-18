@@ -30,6 +30,13 @@ fn ref_allele(seq: &[u8]) -> MergedAllele {
     }
 }
 
+/// Mi13: alias for `ref_allele` so call sites read REF/ALT intent
+/// without anyone having to stop and check whether the fixture is
+/// (re)building a REF position.
+fn alt_allele(seq: &[u8]) -> MergedAllele {
+    ref_allele(seq)
+}
+
 fn support(num_obs: u32) -> AlleleSupportStats {
     // `AlleleSupportStats` is `#[non_exhaustive]`; integration tests
     // outside the crate go through the `new` constructor.
@@ -58,7 +65,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
             start: 100,
             end: 100,
         },
-        alleles: vec![ref_allele(b"A"), ref_allele(b"T")],
+        alleles: vec![ref_allele(b"A"), alt_allele(b"T")],
         ploidy: 2,
         n_samples: 2,
         n_genotypes: 3,
@@ -86,7 +93,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
             start: 500,
             end: 500,
         },
-        alleles: vec![ref_allele(b"A"), ref_allele(b"T"), ref_allele(b"C")],
+        alleles: vec![ref_allele(b"A"), alt_allele(b"T"), alt_allele(b"C")],
         ploidy: 2,
         n_samples: 2,
         n_genotypes: 6,
@@ -124,7 +131,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
             start: 900,
             end: 900,
         },
-        alleles: vec![ref_allele(b"A"), ref_allele(b"ATT")],
+        alleles: vec![ref_allele(b"A"), alt_allele(b"ATT")],
         ploidy: 2,
         n_samples: 2,
         n_genotypes: 3,

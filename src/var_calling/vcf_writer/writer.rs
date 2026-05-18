@@ -5,10 +5,16 @@
 //! parks the encoder; `write_record` encodes one `PosteriorRecord`
 //! into a noodles `RecordBuf` and feeds it to the underlying VCF
 //! writer; `finish` flushes the sink (including the bgzf EOF block
-//! for gzipped paths), `fsync`s, and atomic-renames into place.
+//! for gzipped paths), `fsync`s the file and the parent directory,
+//! then atomic-renames into place.
 //!
 //! Forgetting `finish` leaves `<output>.tmp` on disk and no
-//! `<output>` — intended loud failure.
+//! `<output>` — intended loud failure. The `#[must_use]` attribute
+//! on [`CohortVcfWriter`] gives the compiler a chance to catch the
+//! forgotten-finish case at the construction site.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 use noodles_vcf::Header as VcfHeader;
 use noodles_vcf::variant::io::Write as _;
@@ -18,8 +24,9 @@ use super::WriterConfig;
 use super::errors::VcfWriteError;
 use super::header::{CohortMetadata, build_vcf_header};
 use super::record_encode::{build_format_keys, encode};
-use super::sink::SinkKind;
+use super::sink::{SinkKind, tmp_path_for};
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::var_calling::per_group_merger::genotype_order;
 use crate::var_calling::posterior_engine::PosteriorRecord;
 
 /// Streams `PosteriorRecord` items to a VCF file.
@@ -30,13 +37,21 @@ use crate::var_calling::posterior_engine::PosteriorRecord;
 /// [`super::record_encode::encode`]. The writer's
 /// non-decreasing-locus order check is the last line of defence
 /// against an upstream that surfaces records out of order.
+///
+/// **The writer must be finalised with [`CohortVcfWriter::finish`].**
+/// Otherwise the output is left at `<output>.tmp` and no `<output>`
+/// is produced; the `#[must_use]` attribute warns at the construction
+/// site if the value is dropped without `finish`.
+#[must_use = "CohortVcfWriter must be finalised by calling `.finish()`; \
+              otherwise the output is left at `<output>.tmp` and no \
+              `<output>` is produced"]
 pub struct CohortVcfWriter {
     /// noodles' line-oriented VCF writer wraps our sink directly. The
     /// sink (plain or bgzf) is owned by the writer and recovered on
     /// `finish`.
     inner: noodles_vcf::io::Writer<SinkKind>,
-    /// Re-encoded by the writer on every record write, but kept here
-    /// once because noodles takes `&Header` per call.
+    /// Built once at construction; passed to noodles per record because
+    /// `write_variant_record` takes `&Header`.
     header: VcfHeader,
     /// Cohort metadata frozen at construction. Only the `contigs`
     /// slice is read on the per-record path (to map `chrom_id` →
@@ -46,29 +61,92 @@ pub struct CohortVcfWriter {
     /// Cohort size, re-checked against every record's `n_samples`.
     expected_samples: usize,
     /// Final path; tmp is `<final_path>.tmp`. Held until `finish`.
-    final_path: std::path::PathBuf,
+    final_path: PathBuf,
     /// FORMAT keys list — built once from `config.emit_gp` and reused
     /// per record.
     format_keys: Keys,
-    /// Whole-run config — held by value for the per-record encoder.
+    /// Whole-run config — held by value for the per-record encoder and
+    /// surfaced via [`CohortVcfWriter::config`] for runtime inspection.
     config: WriterConfig,
     /// Latches the most recent `(chrom_id, start)` so the next
     /// record can be checked for non-decreasing order.
     last_locus: Option<(u32, u32)>,
+    /// Mi17: cache of `genotype_order(ploidy, n_alleles)` tables keyed
+    /// by the pair. Per-record encoding looks up here instead of
+    /// rebuilding the table; in steady state (cohort with constant
+    /// ploidy and a small range of `n_alleles`) every record beyond
+    /// the first hits the cache.
+    genotype_tables: HashMap<(u8, usize), Vec<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for CohortVcfWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field on the struct fails to
+        // compile here so the omission from Debug output is explicit
+        // rather than silent.
+        let Self {
+            inner: _,
+            header: _,
+            contigs,
+            expected_samples,
+            final_path,
+            format_keys,
+            config,
+            last_locus,
+            genotype_tables,
+        } = self;
+        f.debug_struct("CohortVcfWriter")
+            .field("config", config)
+            .field("expected_samples", expected_samples)
+            .field("contigs_len", &contigs.len())
+            .field("format_keys", format_keys)
+            .field("final_path", final_path)
+            .field("last_locus", last_locus)
+            .field("cached_genotype_tables", &genotype_tables.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CohortVcfWriter {
-    /// Open `<config.output>.tmp`, build the VCF header, and write it.
+    /// Open `<config.output>.tmp`, build the VCF header, and write
+    /// it. If the header write fails the tmp file is removed before
+    /// the error bubbles, so a constructor failure is not
+    /// indistinguishable from "user forgot to call finish".
+    ///
+    /// # Errors
+    ///
+    /// * [`VcfWriteError::InvalidMetadata`] — cohort metadata fails
+    ///   validation (empty sample names, duplicate sample/contig
+    ///   name).
+    /// * [`VcfWriteError::ContigLengthOverflow`] — a contig length
+    ///   exceeds `i32::MAX`.
+    /// * [`VcfWriteError::Encode`] — noodles refuses a header value
+    ///   (`##source` / `##commandline` parse or insert).
+    /// * [`VcfWriteError::CreateTmp`] — `File::create` on
+    ///   `<output>.tmp` failed.
+    /// * [`VcfWriteError::WriteHeader`] — writing the header bytes
+    ///   to the sink failed; the tmp file is removed on this path.
     pub fn new(metadata: CohortMetadata, config: WriterConfig) -> Result<Self, VcfWriteError> {
         let header = build_vcf_header(&metadata, &config)?;
         let format_keys = build_format_keys(&config);
-        let contigs = metadata.contigs.clone();
         let expected_samples = metadata.sample_names.len();
+        // Mi9: move the field out of `metadata` instead of cloning.
+        let contigs = metadata.contigs;
         let final_path = config.output.clone();
 
         let sink = SinkKind::open_tmp(&final_path)?;
         let mut inner = noodles_vcf::io::Writer::new(sink);
-        inner.write_header(&header)?;
+        // M13: a header-write failure must remove the tmp file so a
+        // constructor crash is not confused with "user forgot to
+        // call finish".
+        if let Err(write_err) = inner.write_header(&header) {
+            let tmp = tmp_path_for(&final_path);
+            let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+            return Err(VcfWriteError::WriteHeader {
+                tmp_path: tmp,
+                source: write_err,
+            });
+        }
         Ok(Self {
             inner,
             header,
@@ -78,14 +156,46 @@ impl CohortVcfWriter {
             format_keys,
             config,
             last_locus: None,
+            genotype_tables: HashMap::new(),
         })
     }
 
-    /// Encode and write one record. Latches the locus order; an
-    /// upstream regression surfaces as
+    /// The config this writer was constructed with (frozen at `new`).
+    /// Useful for runtime inspection ("is GP enabled?", "what path?")
+    /// when the caller no longer holds the original `WriterConfig`.
+    #[must_use]
+    pub fn config(&self) -> &WriterConfig {
+        &self.config
+    }
+
+    /// Encode and write one record.
+    ///
+    /// Latches the locus order; an upstream regression surfaces as
     /// [`VcfWriteError::RecordOutOfOrder`] and the writer keeps
     /// running (the next call gets a fresh order check against the
-    /// previous accepted record).
+    /// previous accepted record). `last_locus` is *not* updated on
+    /// any error path, so a rejected record does not corrupt the
+    /// order-check baseline.
+    ///
+    /// # Errors
+    ///
+    /// * [`VcfWriteError::RecordOutOfOrder`] — `record.locus` does
+    ///   not strictly exceed the previous accepted record's locus.
+    /// * [`VcfWriteError::SampleCountMismatch`] — `record.n_samples`
+    ///   differs from the cohort metadata's sample count.
+    /// * [`VcfWriteError::InconsistentRecord`] — a per-record
+    ///   vector length doesn't match the record's declared shape.
+    /// * [`VcfWriteError::UnknownChromId`] — `record.locus.chrom_id`
+    ///   is out of bounds for the contig table.
+    /// * [`VcfWriteError::GenotypeIndexOutOfBounds`] /
+    ///   [`VcfWriteError::AlleleIndexOutOfBounds`] — a decoded
+    ///   `best_genotype` cell references a non-existent slot.
+    /// * [`VcfWriteError::DepthOverflow`] — a depth (per-sample DP,
+    ///   per-allele AD, or cohort total) overflows `i32`.
+    /// * [`VcfWriteError::Encode`] — noodles refused a value
+    ///   (non-UTF-8 allele bytes, invalid `Position`, …).
+    /// * [`VcfWriteError::WriteRecord`] — the sink rejected the
+    ///   serialised bytes.
     pub fn write_record(&mut self, record: &PosteriorRecord) -> Result<(), VcfWriteError> {
         let locus = (record.locus.chrom_id, record.locus.start);
         if let Some(prev) = self.last_locus
@@ -99,20 +209,52 @@ impl CohortVcfWriter {
             });
         }
 
+        let table = self
+            .genotype_tables
+            .entry((record.ploidy, record.alleles.len()))
+            .or_insert_with(|| genotype_order(record.ploidy, record.alleles.len()))
+            .clone();
         let buf = encode(
             record,
             &self.contigs,
             &self.config,
             &self.format_keys,
             self.expected_samples,
+            &table,
         )?;
-        self.inner.write_variant_record(&self.header, &buf)?;
+        self.inner
+            .write_variant_record(&self.header, &buf)
+            .map_err(|source| VcfWriteError::WriteRecord {
+                chrom_id: locus.0,
+                pos: locus.1,
+                source,
+            })?;
         self.last_locus = Some(locus);
         Ok(())
     }
 
-    /// Flush, emit the bgzf EOF block when applicable, sync, and
-    /// atomic-rename `<output>.tmp` → `<output>`.
+    /// Flush, emit the bgzf EOF block when applicable, sync the file
+    /// and parent directory, then atomic-rename `<output>.tmp` →
+    /// `<output>`.
+    ///
+    /// Consumes `self`, so a forgotten call leaves `<output>.tmp` on
+    /// disk and no `<output>` — see the type-level `#[must_use]`
+    /// note.
+    ///
+    /// # Errors
+    ///
+    /// * [`VcfWriteError::FinishBgzf`] — the bgzf sink failed to
+    ///   emit its EOF block / flush its tail.
+    /// * [`VcfWriteError::WriteHeader`] — the `BufWriter` tail flush
+    ///   failed on the plain-text path (the operation is "writing
+    ///   the buffered tail").
+    /// * [`VcfWriteError::FsyncFile`] — `File::sync_all` on the tmp
+    ///   file failed.
+    /// * [`VcfWriteError::Rename`] — `fs::rename` from the tmp path
+    ///   to the final path failed.
+    /// * [`VcfWriteError::FsyncDir`] — opening or fsyncing the
+    ///   parent directory failed (without this fsync the rename is
+    ///   not durable across a crash).
     pub fn finish(self) -> Result<(), VcfWriteError> {
         let sink = self.inner.into_inner();
         sink.finish(&self.final_path)?;
@@ -187,18 +329,17 @@ mod tests {
         }
     }
 
+    fn cfg_for(out: PathBuf) -> WriterConfig {
+        WriterConfig::new(out)
+    }
+
     #[test]
     fn full_round_trip_plain_text() {
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
         let metadata = fixture_metadata();
-        let config = WriterConfig {
-            output: out.clone(),
-            default_filter_pass: true,
-            emit_gp: false,
-        };
 
-        let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
+        let mut writer = CohortVcfWriter::new(metadata, cfg_for(out.clone())).unwrap();
         writer.write_record(&mk_record(100)).unwrap();
         writer.write_record(&mk_record(200)).unwrap();
         writer.finish().unwrap();
@@ -209,7 +350,6 @@ mod tests {
         assert_eq!(data_lines.len(), 2);
         assert!(data_lines[0].starts_with("chr1\t100\t"));
         assert!(data_lines[1].starts_with("chr1\t200\t"));
-        // Tmp file is gone.
         assert!(!out.with_extension("vcf.tmp").exists());
     }
 
@@ -218,12 +358,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
         let metadata = fixture_metadata();
-        let config = WriterConfig {
-            output: out,
-            default_filter_pass: true,
-            emit_gp: false,
-        };
-        let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
+        let mut writer = CohortVcfWriter::new(metadata, cfg_for(out)).unwrap();
         writer.write_record(&mk_record(200)).unwrap();
         let err = writer.write_record(&mk_record(100)).unwrap_err();
         assert!(matches!(
@@ -242,14 +377,75 @@ mod tests {
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
         let metadata = fixture_metadata();
-        let config = WriterConfig {
-            output: out,
-            default_filter_pass: true,
-            emit_gp: false,
-        };
-        let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
+        let mut writer = CohortVcfWriter::new(metadata, cfg_for(out)).unwrap();
         writer.write_record(&mk_record(200)).unwrap();
         let err = writer.write_record(&mk_record(200)).unwrap_err();
         assert!(matches!(err, VcfWriteError::RecordOutOfOrder { .. }));
+    }
+
+    /// Mi1: an `RecordOutOfOrder` error does not advance
+    /// `last_locus`. A subsequent record at a position past the
+    /// *previous accepted* locus must still error against that
+    /// locus, not the rejected one.
+    #[test]
+    fn out_of_order_does_not_advance_last_locus() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let metadata = fixture_metadata();
+        let mut writer = CohortVcfWriter::new(metadata, cfg_for(out)).unwrap();
+        writer.write_record(&mk_record(200)).unwrap();
+        let _ = writer.write_record(&mk_record(100)).unwrap_err();
+        // Subsequent record at 150 should still error against last
+        // accepted (200), not against the rejected 100.
+        let err = writer.write_record(&mk_record(150)).unwrap_err();
+        assert!(matches!(
+            err,
+            VcfWriteError::RecordOutOfOrder {
+                prev_pos: 200,
+                pos: 150,
+                ..
+            }
+        ));
+        // And a record at 201 should succeed.
+        writer.write_record(&mk_record(201)).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// M12: `config()` accessor returns the frozen config; useful for
+    /// runtime inspection without having to keep the original
+    /// `WriterConfig` around.
+    #[test]
+    fn config_accessor_exposes_frozen_settings() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let metadata = fixture_metadata();
+        let writer = CohortVcfWriter::new(metadata, cfg_for(out.clone())).unwrap();
+        let cfg = writer.config();
+        assert_eq!(cfg.output, out);
+        assert!(cfg.default_filter_pass);
+        assert!(!cfg.emit_gp);
+        writer.finish().unwrap();
+    }
+
+    /// Mi17: the second record at the same `(ploidy, n_alleles)` is
+    /// served from the cache. Asserted indirectly by observing that
+    /// the cache grows from 0 → 1 across the first record and then
+    /// stays at 1 across the second (same shape).
+    #[test]
+    fn genotype_table_cache_is_keyed_by_ploidy_and_n_alleles() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let metadata = fixture_metadata();
+        let mut writer = CohortVcfWriter::new(metadata, cfg_for(out)).unwrap();
+        assert_eq!(writer.genotype_tables.len(), 0);
+        writer.write_record(&mk_record(100)).unwrap();
+        assert_eq!(writer.genotype_tables.len(), 1, "biallelic table cached");
+        writer.write_record(&mk_record(200)).unwrap();
+        assert_eq!(
+            writer.genotype_tables.len(),
+            1,
+            "second biallelic record reuses cache"
+        );
+        writer.finish().unwrap();
     }
 }
