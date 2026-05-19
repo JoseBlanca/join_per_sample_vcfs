@@ -64,6 +64,9 @@ pub enum PopVarCallerCommand {
     /// Estimate per-sample contamination from cohort `.psp` files and
     /// emit a TOML artefact consumed by `var-calling`.
     EstimateContamination(super::estimate_contamination::EstimateContaminationArgs),
+
+    /// Call SNPs across a cohort: `.psp` files → multi-sample VCF.
+    VarCalling(super::var_calling::VarCallingArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the

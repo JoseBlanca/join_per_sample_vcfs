@@ -20,6 +20,7 @@
 
 use thiserror::Error;
 
+use crate::var_calling::dust_filter::DustFilterError;
 use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 
 /// Default value for [`GrouperConfig::max_variant_group_span`].
@@ -115,8 +116,17 @@ impl OverlappingVariantGroup {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum GrouperError {
+    /// Upstream merger surfaced an error. The merger sits directly
+    /// before the grouper when the DUST filter is bypassed.
     #[error("upstream: {0}")]
     Upstream(#[from] PerPositionMergerError),
+
+    /// DUST filter surfaced an error. The filter sits between the
+    /// merger and the grouper whenever low-complexity filtering is on.
+    /// The chain-renderer in `main` walks `source()` to surface the
+    /// underlying merger / IO cause.
+    #[error("dust filter: {0}")]
+    DustFilter(#[from] DustFilterError),
 
     /// A group's reference span would exceed
     /// [`GrouperConfig::max_variant_group_span`]. The locus is reported
@@ -137,10 +147,15 @@ pub enum GrouperError {
 
 /// Streaming single-pass overlap bundler over an upstream iterator
 /// of per-position pileups.
-pub struct VariantGrouper<I>
-where
-    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
-{
+///
+/// The struct is generic over the upstream iterator type `I` only;
+/// the upstream's error type does not appear at the struct level so
+/// `VariantGrouper<I>` is the same shape whether `I` is a
+/// `PerPositionMerger` (yielding `PerPositionMergerError`) or a
+/// `DustFilter` (yielding `DustFilterError`). The impls below bound
+/// `I::Item` to `Result<PerPositionPileups, E>` for any `E` that
+/// lifts into [`GrouperError`].
+pub struct VariantGrouper<I> {
     upstream: I,
     config: GrouperConfig,
     /// First item of the next group, already pulled from upstream
@@ -151,9 +166,10 @@ where
     done: bool,
 }
 
-impl<I> std::fmt::Debug for VariantGrouper<I>
+impl<I, E> std::fmt::Debug for VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, E>>,
+    GrouperError: From<E>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Exhaustive destructure so a new field on `VariantGrouper`
@@ -176,14 +192,21 @@ where
     }
 }
 
-impl<I> VariantGrouper<I>
+impl<I, E> VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, E>>,
+    GrouperError: From<E>,
 {
     /// Construct a grouper with explicit tuning. Pass
     /// [`GrouperConfig::default()`] for the standard defaults; pass an
     /// explicit value for [`GrouperConfig::max_variant_group_span`] to
     /// override.
+    ///
+    /// `I` is generic over its upstream error type `E` so the same
+    /// grouper accepts both `PerPositionMerger` (yields
+    /// `PerPositionMergerError`) and `DustFilter` (yields
+    /// `DustFilterError`) without an adapter. Whatever the upstream's
+    /// error, it lifts into [`GrouperError`] via the `From` bound.
     pub fn with_config(upstream: I, config: GrouperConfig) -> Self {
         Self {
             upstream,
@@ -207,7 +230,7 @@ where
                 Some(pp) => pp,
                 None => match self.upstream.next() {
                     None => return Ok(None),
-                    Some(Err(e)) => return Err(GrouperError::Upstream(e)),
+                    Some(Err(e)) => return Err(e.into()),
                     Some(Ok(pp)) => pp,
                 },
             };
@@ -219,9 +242,10 @@ where
     }
 }
 
-impl<I> Iterator for VariantGrouper<I>
+impl<I, E> Iterator for VariantGrouper<I>
 where
-    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, E>>,
+    GrouperError: From<E>,
 {
     type Item = Result<OverlappingVariantGroup, GrouperError>;
 
@@ -288,7 +312,7 @@ where
                     // are never emitted because Stage 5 has no way
                     // to know the group was truncated.
                     self.done = true;
-                    return Some(Err(GrouperError::Upstream(e)));
+                    return Some(Err(e.into()));
                 }
                 Some(Ok(pp)) => {
                     if pp.chrom_id != chrom_id || pp.pos > end {

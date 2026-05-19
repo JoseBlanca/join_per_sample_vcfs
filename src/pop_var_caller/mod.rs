@@ -8,6 +8,7 @@ pub mod cli;
 pub mod contamination_artifact;
 pub mod estimate_contamination;
 pub mod psp_to_pileup;
+pub mod var_calling;
 
 pub use batch_assignment::{BatchAssignment, BatchAssignmentError, DEFAULT_BATCH_ID};
 pub use cli::{Cli, PileupArgs, PileupCliError, PopVarCallerCommand, run_pileup};
@@ -16,3 +17,4 @@ pub use estimate_contamination::{
     EstimateContaminationArgs, EstimateContaminationCliError, run_estimate_contamination,
 };
 pub use psp_to_pileup::{PspToPileupArgs, PspToPileupError, run_psp_to_pileup};
+pub use var_calling::{VarCallingArgs, VarCallingCliError, run_var_calling};
