@@ -21,23 +21,29 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI follow-up **Wave 1**
->   (Public-API hygiene) fixes-applied 2026-05-19 —
+> - **Last completed task:** Cohort CLI follow-up **Wave 2**
+>   (Config-construction discipline) fixes-applied 2026-05-19 —
+>   [cohort_cli_2026-05-19_applied_wave2.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md).
+>   All 4 Wave-2 findings Applied under Option C (hybrid):
+>   **M4** (`PosteriorEngineConfig::contamination` privatised +
+>   validating `with_contamination` setter), **Mi2**
+>   (`PosteriorEngineConfig::new(...)` 8 positional `f64` args
+>   replaced with zero-arg `new()` returning defaults + per-field
+>   `with_*` validating setters), **Mi14** (CLI flag, struct
+>   field, parser fn, and artefact parameter-map key all
+>   renamed to `min_batch_size_for_contamination` — only
+>   user-visible CLI break in the 5-wave follow-up), **Mi21**
+>   (struct-level doc on `ContaminationEstimationConfig`
+>   formalises the validate-after-build contract). 889 lib
+>   tests pass (was 887; +2 net from the rewritten builder
+>   validation block); fmt + clippy + full test suite clean.
+>   `cargo doc --no-deps` still exits 101 on the **same 5
+>   pre-existing errors as Wave 1** (2 in `pileup_to_psp.rs`,
+>   3 `ExactMath` in `posterior_engine.rs`); zero introduced
+>   by Wave 2. Carried forward: 8 Deferred (M10 / M11 / M13 +
+>   paired Minors + M5/M9 follow-ups) for Waves 3 – 5.
+>   Wave 1 (Public-API hygiene, commit `c7ee0c3`) report:
 >   [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md).
->   All 4 Wave-1 findings Applied: **M8** (`WriterConfig`
->   `#[non_exhaustive]` + `with_emit_gp` builder), **Mi5**
->   (`#[non_exhaustive]` on `ContaminationArtefact` + 4
->   sub-structs), **Mi6** (`SUPPORTED_VERSIONS` allow-list +
->   `UnsupportedVersion` error variant +
->   `read_rejects_artefact_with_unknown_version` test), **Mi13**
->   (file rename `contamination_artifact.rs` →
->   `contamination_artefact.rs`). 887 lib tests pass (was 886);
->   fmt + clippy + full test suite clean. `cargo doc --no-deps`
->   exits 101 but **every error is pre-existing** (2 in
->   `pileup_to_psp.rs`, 3 `ExactMath` in `posterior_engine.rs`;
->   tracked by Stage 6 Mi21); zero errors introduced by Wave 1.
->   Carried forward: 12 Deferred (M4 / M10 / M11 / M13 +
->   paired Minors + M5/M9 follow-ups) for Waves 2 – 5.
 >   The reviewed slice landed earlier on 2026-05-19 in commits
 >   `1523049` through `147e435` (impl report:
 >   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md);
@@ -121,14 +127,18 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
   Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
 - **Latest fixes-applied (cohort slice):**
-  Wave 1 of the deferred follow-up,
+  Wave 2 of the deferred follow-up,
+  [cohort_cli_2026-05-19_applied_wave2.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md) —
+  4 more Deferred items closed under Option C: **M4**
+  (`PosteriorEngineConfig.contamination` privatised + builder
+  setter), **Mi2** (`PosteriorEngineConfig::new` rebuilt as 0-arg
+  defaults + per-field `with_*` setters), **Mi14** (CLI flag
+  rename `--min-batch-size` → `--min-batch-size-for-contamination`,
+  same name everywhere — user-visible break), **Mi21** (validate-
+  after-build contract documented). 889 lib tests pass. Wave 1
+  pass (commit `c7ee0c3`):
   [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md) —
-  4 of 16 Deferred items closed: **M8** (`WriterConfig`
-  `#[non_exhaustive]` + builder), **Mi5** (`#[non_exhaustive]` on
-  `ContaminationArtefact` + sub-structs), **Mi6** (schema-version
-  allow-list), **Mi13** (file rename to British spelling).
-  887 lib tests pass; fmt + clippy + full test suite clean. Prior
-  pass (commit `db1ec2a`):
+  4 Applied (M8, Mi5, Mi6, Mi13). Original pass (commit `db1ec2a`):
   [cohort_cli_2026-05-19_applied.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md) —
   20 Applied + Mi7 Disputed-with-test.
 - **Code:** [src/pop_var_caller/](src/pop_var_caller/)
@@ -138,21 +148,18 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from cohort-slice review):**
-  - **Wave 2 (Config-construction discipline) — pending.** **M4**
-    + **Mi2** + **Mi21** + **Mi14** under Option C (hybrid:
-    builder for the sharp configs, validate-after-build for the
-    wide one). Decisions locked 2026-05-19 in
-    [pop_var_caller_cohort_cli_followup.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli_followup.md).
   - **Wave 3 (Shared-infrastructure refactor) — pending.** **Mi8**,
     **Mi19**, **M9 follow-up**, **M10**, **M11**, **Mi18**.
-    The largest wave; depends on Wave 2's config shape for the
-    driver signature.
+    The largest wave; now unblocked since Wave 2 settled the
+    config shape for the driver signature.
   - **Wave 4 (Rayon concurrency policy) — pending.** **M13** with
     silent-no-op second-call policy (locked 2026-05-19).
   - **Wave 5 (Test infrastructure + missing coverage) — pending.**
     **Mi20**, **Mi23**, M1/M2 walker-error CRAM test, **M5
     follow-up** (real FASTA → `.psp` MD5 enforcement; wired in
     this wave per the 2026-05-19 decision).
+  - **Closed in Wave 2 (2026-05-19):** **M4**, **Mi2**, **Mi14**,
+    **Mi21**.
   - **Closed in Wave 1 (2026-05-19):** **M8**, **Mi5**, **Mi6**,
     **Mi13**.
   - Selected deferred Nits — drop unused `#[from]` variants, vestigial
