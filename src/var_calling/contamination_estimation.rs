@@ -210,6 +210,47 @@ impl Default for StoppingMode {
 }
 
 /// Tunable knobs for [`estimate_contamination`].
+///
+/// # Construction contract — **validate-after-build**
+///
+/// Unlike the other Stage 3 – 6 configs (which expose a `new(...)`
+/// constructor or `with_*` builders that validate at construction
+/// time), this config is wide (14+ mostly-numeric fields with no
+/// cross-field invariants), so the project follows the
+/// **validate-after-build** pattern instead:
+///
+/// 1. Construct via [`Self::with_project_defaults`] (or struct
+///    literal anchored on
+///    `..ContaminationEstimationConfig::with_project_defaults()` to
+///    tweak only a subset of fields).
+/// 2. Mutate the public fields directly to set whatever knobs the
+///    caller cares about.
+/// 3. Call [`Self::validate`] **once** before passing the config
+///    into [`estimate_contamination`]. The CLI parser calls
+///    `validate()` immediately so range errors surface before any
+///    `.psp` is opened; library callers should do the same after
+///    constructing or modifying the config.
+///
+/// The pattern matches the cohort CLI plan's choice (Option C in
+/// the 2026-05-19 plan-review discussion): builder for the sharp
+/// configs ([`crate::var_calling::posterior_engine::PosteriorEngineConfig`],
+/// [`crate::var_calling::vcf_writer::WriterConfig`]),
+/// validate-after-build for this wide one. A 14-arg positional
+/// constructor would be hostile; a 14-step `.with_*` chain would be
+/// equally noisy.
+///
+/// # Example
+///
+/// ```ignore
+/// use merge_per_sample_vcfs::var_calling::contamination_estimation::{
+///     ContaminationEstimationConfig, estimate_contamination,
+/// };
+///
+/// let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+/// cfg.min_depth = 12;
+/// cfg.min_cohort_minor_count = 8;
+/// cfg.validate()?; // call this before estimate_contamination(...)
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ContaminationEstimationConfig {
