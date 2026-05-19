@@ -4,8 +4,7 @@
 ABOUT-PARAGRAPH-START — do not edit this paragraph.
 Skills and agents are instructed to leave it untouched.
 -->
-> **About this project.** Multi-sample SNP caller, mid-pivot from a
-> gVCF-merger to a six-stage Bayesian pipeline:
+> **About this project.** Multi-sample SNP caller:
 > per-sample pileup → `.psp` artefact → DUST filter → variant grouping →
 > per-group merger → posterior engine. The authoritative design document is
 > [doc/devel/specs/calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md);
@@ -458,15 +457,3 @@ list is clear.
   sizing) — micro-benches alone can't catch end-to-end scaling
   artefacts.
 
----
-
-## Legacy / superseded code
-
-Pre-pivot gVCF-merger components, kept until the new pipeline reaches
-feature parity and the old CLI paths are retired. **Not in scope** of new
-work unless explicitly requested.
-
-- [src/gvcf_parser.rs](src/gvcf_parser.rs)
-- [src/genotype_merging.rs](src/genotype_merging.rs)
-- [src/genotype_posteriors.rs](src/genotype_posteriors.rs)
-- [src/vcf_writer.rs](src/vcf_writer.rs)
