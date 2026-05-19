@@ -569,6 +569,22 @@ impl ContaminationEstimates {
     pub fn q_b_for_sample(&self, sample_idx: usize) -> &[f64; N_ALLELE_CLASSES] {
         &self.q_b_per_batch[self.sample_to_batch[sample_idx]]
     }
+
+    /// Per-batch contaminant background distributions, indexed by
+    /// dense batch index. Floored batches carry an all-zero row
+    /// (the engine's convention for "this batch was floored / `q_b`
+    /// unused"; mirrored by
+    /// [`crate::pop_var_caller::contamination_artefact::BatchEntry`]'s
+    /// all-zero acceptance rule).
+    ///
+    /// Mi18 from the 2026-05-19 cohort CLI review: exposed so
+    /// `pop_var_caller::estimate_contamination::build_artefact_from_estimates`
+    /// can index per-batch without the linear-scan
+    /// `sample_to_batch.iter().position(...)` workaround it
+    /// previously had.
+    pub fn q_b_per_batch(&self) -> &[[f64; N_ALLELE_CLASSES]] {
+        &self.q_b_per_batch
+    }
 }
 
 /// Recommendation surfaced alongside the two non-convergence error

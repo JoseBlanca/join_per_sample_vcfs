@@ -9,66 +9,44 @@
 //! [`with_stage1_pipeline`]; the closure receives the walker, wraps it
 //! as a k=1 input to [`PerPositionMerger`], and chains the rest of the
 //! cohort pipeline exactly as `var-calling` does. The walker's
-//! `WalkerError` is stashed by an inline `.scan()`-based error-shedding
-//! adapter (backed by `Rc<RefCell<Option<WalkerError>>>` — same shape
-//! as [`ErrorSheddingAdapter`](crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter)
-//! for CRAM-input errors) so the merger sees a clean
+//! `WalkerError` is stashed by an
+//! [`ErrorSheddingAdapter`](crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter)
+//! parameterised over `(PileupRecord, WalkerError)` — the same
+//! adapter used at the Stage 1 CRAM-input seam, just bound to
+//! different `T` and `E` — so the merger sees a clean
 //! `Result<_, PspReadError>` stream; any stashed walker error is
 //! surfaced after the pipeline drains.
 //!
 //! Plan: `doc/devel/implementation_plans/pop_var_caller_cohort_cli.md`
 //! §"Subcommand: var-calling-from-bam".
 
-use std::cell::RefCell;
-use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use clap::Args;
 use thiserror::Error;
 
-use crate::per_sample_pileup::baq::{
-    BaqConfig, DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-    SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB, SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
-};
-use crate::per_sample_pileup::cram_input::{
-    ContigList, CramMergedReaderConfig, DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ,
-    DEFAULT_MIN_READ_LENGTH, DEFAULT_MISMATCH_BQ_FLOOR,
-};
-use crate::per_sample_pileup::pileup::{
-    DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
-    DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH, PileupRecord, WalkerConfig, WalkerError,
-};
+use crate::per_sample_pileup::cram_input::ContigList;
+use crate::per_sample_pileup::pileup::{PileupRecord, WalkerError};
 use crate::per_sample_pileup::psp::PspReadError;
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::cli::PileupCliError;
-use crate::pop_var_caller::cli::parsers;
+use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
+use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
+use crate::pop_var_caller::common::{current_command_line, format_md5_hex};
 use crate::pop_var_caller::stage1_pipeline::{Stage1PipelineContext, with_stage1_pipeline};
-use crate::var_calling::dust_filter::{
-    DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW, DustFilter, DustFilterConfig, DustFilterError,
-};
+use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
-    DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY, PerGroupMerger,
-    PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
+    DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };
-use crate::var_calling::per_position_merger::{
-    PerPositionMerger, PerPositionMergerError, PerPositionPileups,
-};
+use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
 use crate::var_calling::posterior_engine::{
-    DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
-    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
-    DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, PosteriorEngine,
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
-use crate::var_calling::variant_grouping::{
-    DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig, GrouperConfigError, GrouperError, VariantGrouper,
-};
-use crate::var_calling::vcf_writer::{
-    CohortMetadata, CohortVcfWriter, DEFAULT_EMIT_GP, VcfWriteError, WriterConfig, tmp_path_for,
-};
+use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
+use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig};
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -78,12 +56,17 @@ use crate::var_calling::vcf_writer::{
 /// sample's CRAM(s) → VCF, no `.psp` on disk. No contamination knob
 /// (contamination correction requires the `.psp` route — see plan).
 ///
-/// The fields duplicate `PileupArgs` and `VarCallingArgs` (minus
-/// contamination); future cleanup may share them via
-/// `#[command(flatten)]` sub-structs.
+/// Flattens both [`Stage1Args`](crate::pop_var_caller::cli::shared_args::Stage1Args)
+/// (CRAM-input filters, BAQ HMM, pileup walker — shared with the
+/// `pileup` subcommand) and
+/// [`CohortPipelineArgs`](crate::pop_var_caller::cli::shared_args::CohortPipelineArgs)
+/// (DUST, grouper, per-group merger, posterior engine, ploidy, VCF
+/// writer — shared with `var-calling`). M10 from the 2026-05-19
+/// cohort CLI review unified the three previously-duplicated args
+/// surfaces.
 #[derive(Debug, Args, Clone)]
 pub struct VarCallingFromBamArgs {
-    // ===== Stage 1 — Common ===================================
+    // ===== Top-level (visible in `-h`) ========================
     /// Reference FASTA. A sibling `.fai` is required.
     #[arg(long)]
     pub reference: PathBuf,
@@ -101,261 +84,17 @@ pub struct VarCallingFromBamArgs {
     #[arg(required = true)]
     pub crams: Vec<PathBuf>,
 
-    /// Drop reads with MAPQ < N. `0` admits everything.
-    #[arg(long, default_value_t = DEFAULT_MIN_MAPQ)]
-    pub min_mapq: u8,
-
-    /// Skip the BAQ HMM. `bq_baq` becomes a copy of the raw CRAM QUAL.
-    #[arg(long)]
-    pub no_baq: bool,
-
     /// Skip the low-complexity (sdust) filter entirely.
     #[arg(long)]
     pub no_complexity_filter: bool,
 
-    /// Cohort-wide ploidy.
-    #[arg(long, default_value_t = DEFAULT_PLOIDY, value_parser = parsers::parse_ploidy)]
-    pub ploidy: u8,
+    // ===== Stage 1 (shared with pileup) =======================
+    #[command(flatten)]
+    pub stage1: crate::pop_var_caller::cli::shared_args::Stage1Args,
 
-    // ===== Advanced — CRAM input filters ======================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MIN_READ_LENGTH,
-        help_heading = "Advanced — CRAM input filters",
-    )]
-    pub min_read_length: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        help_heading = "Advanced — CRAM input filters"
-    )]
-    pub keep_qc_fail: bool,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        help_heading = "Advanced — CRAM input filters"
-    )]
-    pub keep_duplicates: bool,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_READ_MISMATCH_FRACTION,
-        value_parser = crate::pop_var_caller::cli::parse_mismatch_fraction,
-        help_heading = "Advanced — CRAM input filters",
-    )]
-    pub max_read_mismatch_fraction: f32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MISMATCH_BQ_FLOOR,
-        help_heading = "Advanced — CRAM input filters",
-    )]
-    pub mismatch_bq_floor: u8,
-
-    // ===== Advanced — BAQ HMM =================================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_gap_open_prob: f32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_gap_extend_prob: f32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_band_half_width: i32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_BAQ_CHUNK_SIZE,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_chunk_size: usize,
-
-    // ===== Advanced — Pileup walker ===========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_SNP_COLUMN_DEPTH,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_snp_column_depth: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_INDEL_COLUMN_DEPTH,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_indel_column_depth: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_RECORD_SPAN,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_record_span: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MATE_LOOKUP_WINDOW,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub mate_lookup_window: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ACTIVE_READS,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_active_reads: u32,
-
-    // ===== Advanced — DUST filter =============================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_DUST_WINDOW,
-        value_parser = parsers::parse_dust_window,
-        help_heading = "Advanced — DUST filter",
-    )]
-    pub complexity_window: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_DUST_THRESHOLD,
-        value_parser = parsers::parse_dust_threshold,
-        help_heading = "Advanced — DUST filter",
-    )]
-    pub complexity_threshold: u32,
-
-    // ===== Advanced — Variant grouping ========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_VARIANT_GROUP_SPAN,
-        value_parser = parsers::parse_var_group_max_span,
-        help_heading = "Advanced — Variant grouping",
-    )]
-    pub var_group_max_span: u32,
-
-    // ===== Advanced — Per-group merger ========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ALLELES_PER_RECORD,
-        value_parser = parsers::parse_max_alleles,
-        help_heading = "Advanced — Per-group merger",
-    )]
-    pub max_alleles_per_var: usize,
-
-    // ===== Advanced — Posterior engine ========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_INBREEDING_COEFFICIENT,
-        value_parser = parsers::parse_inbreeding_coefficient,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub inbreeding_coefficient: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_CONVERGENCE_THRESHOLD,
-        value_parser = parsers::parse_em_convergence_threshold,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub em_convergence_threshold: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ITERATIONS,
-        value_parser = parsers::parse_em_max_iterations,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub em_max_iterations: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_REF_PSEUDOCOUNT,
-        value_parser = parsers::parse_ref_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub ref_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_SNP_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_snp_alt_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub snp_alt_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_INDEL_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_indel_alt_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub indel_alt_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_compound_alt_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub compound_alt_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_GQ_PHRED,
-        value_parser = parsers::parse_max_gq_phred,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub max_gq_phred: f64,
-
-    // ===== Advanced — VCF writer ==============================
-    /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
-    /// default — `GP` is `Number=G`, so the per-sample cell grows as
-    /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at
-    /// ploidy=2, n_alleles=6). Opt in when posteriors are wanted on
-    /// disk.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_EMIT_GP,
-        help_heading = "Advanced — VCF writer",
-    )]
-    pub emit_gp: bool,
+    // ===== Cohort pipeline (shared with var-calling) ==========
+    #[command(flatten)]
+    pub cohort: crate::pop_var_caller::cli::shared_args::CohortPipelineArgs,
 }
 
 // ---------------------------------------------------------------------
@@ -433,6 +172,9 @@ pub enum VarCallingFromBamCliError {
 pub fn run_var_calling_from_bam(
     args: &VarCallingFromBamArgs,
 ) -> Result<(), VarCallingFromBamCliError> {
+    let stage1 = &args.stage1;
+    let cohort = &args.cohort;
+
     // 1. Rayon pool — same once-per-process policy as the other
     //    subcommands.
     if let Some(n) = args.threads {
@@ -442,17 +184,22 @@ pub fn run_var_calling_from_bam(
             .map_err(|_| VarCallingFromBamCliError::RayonAlreadyConfigured)?;
     }
 
-    // 2. Build the Stage 1 configs from args.
-    let cram_cfg = cram_config_from_args(args);
-    let baq_cfg = baq_config_from_args(args);
-    let walker_cfg = walker_config_from_args(args);
+    // 2. Build the Stage 1 configs from args. The helpers live in
+    //    `cli.rs` and take `&Stage1Args` directly — same code path
+    //    drives this subcommand and `pileup`, no duplication.
+    let cram_cfg = crate::pop_var_caller::cli::cram_config_from_args(stage1);
+    let baq_cfg = crate::pop_var_caller::cli::baq_config_from_args(stage1);
+    let walker_cfg = crate::pop_var_caller::cli::walker_config_from_args(stage1);
 
     // 3. Build per-stage configs (cohort side).
-    let dust_cfg = DustFilterConfig::new(args.complexity_window, args.complexity_threshold)
+    let dust_cfg = DustFilterConfig::new(cohort.complexity_window, cohort.complexity_threshold)
         .map_err(VarCallingFromBamCliError::Dust)?;
-    let grouper_cfg = GrouperConfig::new(args.var_group_max_span)?;
-    let per_group_cfg =
-        PerGroupMergerConfig::new(args.ploidy, args.max_alleles_per_var, DEFAULT_BATCH_SIZE)?;
+    let grouper_cfg = GrouperConfig::new(cohort.var_group_max_span)?;
+    let per_group_cfg = PerGroupMergerConfig::new(
+        cohort.ploidy,
+        cohort.max_alleles_per_var,
+        DEFAULT_BATCH_SIZE,
+    )?;
     // Build the posterior-engine config via the validating
     // builder chain. The `from-bam` subcommand has no
     // `--contamination-estimates` surface, so `contamination`
@@ -461,14 +208,14 @@ pub fn run_var_calling_from_bam(
     // future maintainers reading this flow alongside
     // `var_calling.rs`.
     let posterior_cfg = PosteriorEngineConfig::new()
-        .with_convergence_threshold(args.em_convergence_threshold)?
-        .with_max_iterations(args.em_max_iterations)?
-        .with_ref_pseudocount(args.ref_pseudocount)?
-        .with_snp_alt_pseudocount(args.snp_alt_pseudocount)?
-        .with_indel_alt_pseudocount(args.indel_alt_pseudocount)?
-        .with_compound_alt_pseudocount(args.compound_alt_pseudocount)?
-        .with_fixation_index_default(args.inbreeding_coefficient)?
-        .with_max_gq_phred(args.max_gq_phred)?
+        .with_convergence_threshold(cohort.em_convergence_threshold)?
+        .with_max_iterations(cohort.em_max_iterations)?
+        .with_ref_pseudocount(cohort.ref_pseudocount)?
+        .with_snp_alt_pseudocount(cohort.snp_alt_pseudocount)?
+        .with_indel_alt_pseudocount(cohort.indel_alt_pseudocount)?
+        .with_compound_alt_pseudocount(cohort.compound_alt_pseudocount)?
+        .with_fixation_index_default(cohort.inbreeding_coefficient)?
+        .with_max_gq_phred(cohort.max_gq_phred)?
         .with_contamination(None)?;
 
     // 4. Drive the Stage 1 chain via the shared helper. The named
@@ -477,7 +224,7 @@ pub fn run_var_calling_from_bam(
     //    signature names every captured value so the data flow is
     //    legible (previously: ~95-line closure capturing six values).
     let no_complexity_filter = args.no_complexity_filter;
-    let emit_gp = args.emit_gp;
+    let emit_gp = cohort.emit_gp;
     let reference = args.reference.clone();
     let output = args.output.clone();
     let command_line = current_command_line();
@@ -488,8 +235,8 @@ pub fn run_var_calling_from_bam(
         cram_cfg,
         baq_cfg,
         walker_cfg,
-        args.baq_chunk_size,
-        args.no_baq,
+        stage1.baq_chunk_size,
+        stage1.no_baq,
         |ctx| {
             run_cohort_pipeline_for_single_sample(
                 ctx,
@@ -560,7 +307,11 @@ pub fn run_var_calling_from_bam(
 ///
 /// On any driver-loop failure (write_record / posterior emission /
 /// finish), the writer's `<output>.tmp` is best-effort removed —
-/// matching `run_pileup`'s discipline (M6 parity).
+/// matching `run_pileup`'s discipline (M6 parity). The shared
+/// [`drive_cohort_pipeline`] handles the merger-onwards wiring and
+/// the cleanup loop; this wrapper sets up the walker-shim and
+/// metadata, then surfaces any stashed walker error after the
+/// driver returns.
 #[allow(clippy::too_many_arguments)]
 fn run_cohort_pipeline_for_single_sample(
     ctx: Stage1PipelineContext<'_>,
@@ -576,7 +327,8 @@ fn run_cohort_pipeline_for_single_sample(
 ) -> Result<(), VarCallingFromBamCliError> {
     // Convert ContigList → Vec<ParsedChromosome>. Single validated
     // source of truth for chromosomes; the merger consumes a clone
-    // and the DUST branch consumes the original.
+    // and the cohort driver takes the original through
+    // CohortPipelineParams.
     let chromosomes = contigs_to_parsed(ctx.contigs)?;
     let sample_name_owned = ctx.sample_name.to_string();
 
@@ -595,76 +347,55 @@ fn run_cohort_pipeline_for_single_sample(
     let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
 
     // Wrap the walker as a k=1 input for PerPositionMerger. The
-    // shim stashes walker errors and reports end-of-stream,
-    // mirroring `ErrorSheddingAdapter`'s pattern for CRAM input
-    // errors.
+    // adapter stashes walker errors and reports end-of-stream; the
+    // `.map(Ok)` lifts the bare `PileupRecord`s back into the
+    // `Result<_, PspReadError>` shape that `PerPositionMerger`
+    // wants (no walker error will ever flow through this Result —
+    // it is stashed in the handle instead).
     //
     // Invariant: the stash is touched only on the merger's main
     // thread. `PerGroupMerger::refill` collects upstream items into
     // a `Vec` before fanning rayon workers across it, so the walker
     // chain itself never crosses thread boundaries. If upstream of
-    // `PerGroupMerger` ever becomes multi-threaded, this needs to
-    // become `Arc<Mutex<...>>` (and the constraint should move to
-    // the bridge module).
-    let walker_error_stash: Rc<RefCell<Option<WalkerError>>> = Rc::new(RefCell::new(None));
-    let stash_clone = walker_error_stash.clone();
-    let walker_iter = ctx.walker.scan(stash_clone, |stash, r| match r {
-        Ok(rec) => Some(Ok::<PileupRecord, PspReadError>(rec)),
-        Err(e) => {
-            *stash.borrow_mut() = Some(e);
-            None
-        }
-    });
+    // `PerGroupMerger` ever becomes multi-threaded, the stash
+    // becomes `Arc<Mutex<...>>` (and the constraint should move to
+    // `error_bridge`).
+    let walker_adapter: ErrorSheddingAdapter<_, PileupRecord, WalkerError> =
+        ErrorSheddingAdapter::new(ctx.walker);
+    let walker_error_handle = walker_adapter.error_handle();
     let walker_iter: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>>> =
-        Box::new(walker_iter);
+        Box::new(walker_adapter.map(Ok));
 
-    // Build merger / DUST / grouper / per-group / posterior. The
-    // merger consumes a clone of `chromosomes`; the DUST branch
-    // consumes the original (both branches converge on a single
-    // boxed iterator yielding `Result<_, GrouperError>`).
+    // Build the merger from the walker-shim, then hand the rest of
+    // the pipeline to the shared cohort driver.
     let merger = PerPositionMerger::new(
         vec![walker_iter],
         vec![sample_name_owned.clone()],
         chromosomes.clone(),
     )?;
-    let upstream_for_grouper: Box<dyn Iterator<Item = Result<PerPositionPileups, GrouperError>>> =
-        if no_complexity_filter {
-            Box::new(merger.map(|r| r.map_err(GrouperError::from)))
-        } else {
-            let dust = DustFilter::new(merger, &*fetcher, chromosomes, dust_cfg);
-            Box::new(dust.map(|r| r.map_err(GrouperError::from)))
-        };
-    let grouper = VariantGrouper::with_config(upstream_for_grouper, grouper_cfg);
-    let per_group = PerGroupMerger::with_config(grouper, fetcher.clone(), per_group_cfg);
-    let posterior = PosteriorEngine::with_config(per_group, posterior_cfg);
+    let pipeline_params = CohortPipelineParams {
+        no_complexity_filter,
+        dust_cfg,
+        grouper_cfg,
+        per_group_cfg,
+        posterior_cfg,
+        fetcher,
+        chromosomes,
+    };
+    let records_written = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
+        merger,
+        pipeline_params,
+        output,
+        metadata,
+        writer_cfg,
+    )?;
 
-    // Open writer, stream records, finalise. On any failure inside
-    // the loop, best-effort remove `<output>.tmp` — `finish()`
-    // consumes `self`, so a `?` short-circuit leaves the tmp on
-    // disk otherwise. Matches `run_var_calling`'s M6 cleanup
-    // discipline.
-    let tmp_path = tmp_path_for(output);
-    let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
-    let mut records_written: u64 = 0;
-    let drive_result: Result<(), VarCallingFromBamCliError> = (|| {
-        for item in posterior {
-            let record = item?;
-            writer.write_record(&record)?;
-            records_written += 1;
-        }
-        writer.finish()?;
-        Ok(())
-    })();
-    if let Err(e) = drive_result {
-        let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
-        return Err(e);
-    }
-
-    // Surface walker errors stashed by the scan-adapter. The
-    // pipeline ran to completion, so `<output>` has been renamed
-    // from `<output>.tmp` — retract that publish (publish-then-
-    // retract semantics: we'd rather no file than a truncated one).
-    if let Some(e) = walker_error_stash.borrow_mut().take() {
+    // Surface walker errors stashed by the ErrorSheddingAdapter.
+    // The pipeline ran to completion, so `<output>` has been
+    // renamed from `<output>.tmp` — retract that publish
+    // (publish-then-retract semantics: we'd rather no file than a
+    // truncated one).
+    if let Some(e) = walker_error_handle.take() {
         // best-effort cleanup; the rename already happened
         let _ = std::fs::remove_file(output);
         return Err(VarCallingFromBamCliError::Walker(e));
@@ -675,47 +406,6 @@ fn run_cohort_pipeline_for_single_sample(
         sample_name_owned, records_written,
     );
     Ok(())
-}
-
-fn cram_config_from_args(args: &VarCallingFromBamArgs) -> CramMergedReaderConfig {
-    CramMergedReaderConfig {
-        min_mapq: if args.min_mapq == 0 {
-            None
-        } else {
-            Some(args.min_mapq)
-        },
-        min_read_length: if args.min_read_length == 0 {
-            None
-        } else {
-            Some(args.min_read_length)
-        },
-        drop_qc_fail: !args.keep_qc_fail,
-        drop_duplicate: !args.keep_duplicates,
-        max_read_mismatch_fraction: if args.max_read_mismatch_fraction == 0.0 {
-            None
-        } else {
-            Some(args.max_read_mismatch_fraction)
-        },
-        mismatch_bq_floor: args.mismatch_bq_floor,
-    }
-}
-
-fn baq_config_from_args(args: &VarCallingFromBamArgs) -> BaqConfig {
-    BaqConfig {
-        gap_open_prob: args.baq_gap_open_prob,
-        gap_extend_prob: args.baq_gap_extend_prob,
-        band_half_width: args.baq_band_half_width,
-    }
-}
-
-fn walker_config_from_args(args: &VarCallingFromBamArgs) -> WalkerConfig {
-    WalkerConfig {
-        max_snp_column_depth: args.max_snp_column_depth,
-        max_indel_column_depth: args.max_indel_column_depth,
-        max_record_span: args.max_record_span,
-        mate_lookup_window: args.mate_lookup_window,
-        max_active_reads: args.max_active_reads,
-    }
 }
 
 /// Convert the CRAM-side [`ContigList`] into the .psp-shaped
@@ -748,28 +438,6 @@ fn contigs_to_parsed(
             })
         })
         .collect()
-}
-
-/// Format a 16-byte MD5 as 32 lowercase hex characters. Mirrors the
-/// helper in `cli.rs`; duplicated rather than re-exported to keep the
-/// subcommand self-contained.
-fn format_md5_hex(bytes: [u8; 16]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(32);
-    for b in bytes {
-        // PANIC-FREE: `std::fmt::Write` on a `String` is infallible
-        // — the only failure mode is OOM, which the runtime turns
-        // into an abort, not an `Err`.
-        write!(&mut out, "{b:02x}").expect("writing to a String never fails");
-    }
-    out
-}
-
-fn current_command_line() -> String {
-    std::env::args_os()
-        .map(|a: OsString| a.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 // ---------------------------------------------------------------------

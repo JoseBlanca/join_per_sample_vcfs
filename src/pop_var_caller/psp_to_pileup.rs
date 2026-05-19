@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::per_sample_pileup::pileup::{AlleleObservation, PileupRecord};
 use crate::per_sample_pileup::psp::{PspReadError, PspReader, RecordsIter};
+use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 
 // ---------------------------------------------------------------------
 // Clap surface
@@ -141,7 +142,7 @@ fn parse_region(s: &str) -> Result<RegionSpec, PspToPileupError> {
 /// line.
 pub fn run_psp_to_pileup(args: &PspToPileupArgs) -> Result<(), PspToPileupError> {
     let file = File::open(&args.input)?;
-    let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, file))?;
+    let mut reader = PspReader::new(BufReader::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file))?;
 
     // Snapshot the chrom_id → name map up-front. The reader's parsed
     // header sits behind an immutable borrow, which would conflict
@@ -212,7 +213,10 @@ fn open_sink(path: &PathBuf) -> Result<Box<dyn Write>, io::Error> {
         Ok(Box::new(io::stdout().lock()))
     } else {
         let file = File::create(path)?;
-        Ok(Box::new(BufWriter::with_capacity(64 * 1024, file)))
+        Ok(Box::new(BufWriter::with_capacity(
+            DEFAULT_BUFFERED_IO_CAPACITY,
+            file,
+        )))
     }
 }
 

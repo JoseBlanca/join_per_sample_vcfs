@@ -25,6 +25,7 @@ use merge_per_sample_vcfs::per_sample_pileup::pileup::{
 };
 use merge_per_sample_vcfs::per_sample_pileup::psp::PspReader;
 use merge_per_sample_vcfs::per_sample_pileup::psp::header::ParameterValue;
+use merge_per_sample_vcfs::pop_var_caller::cli::shared_args::Stage1Args;
 use merge_per_sample_vcfs::pop_var_caller::{PileupArgs, run_pileup};
 use noodles_cram as cram;
 use noodles_fasta as fasta;
@@ -153,22 +154,24 @@ fn default_args(reference: PathBuf, output: PathBuf, crams: Vec<PathBuf>) -> Pil
         output,
         threads: None,
         crams,
-        min_mapq: DEFAULT_MIN_MAPQ,
-        no_baq: false,
-        min_read_length: 0, // admit any length
-        keep_qc_fail: false,
-        keep_duplicates: false,
-        max_read_mismatch_fraction: DEFAULT_MAX_READ_MISMATCH_FRACTION,
-        mismatch_bq_floor: DEFAULT_MISMATCH_BQ_FLOOR,
-        baq_gap_open_prob: SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
-        baq_gap_extend_prob: SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
-        baq_band_half_width: SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-        baq_chunk_size: DEFAULT_BAQ_CHUNK_SIZE,
-        max_snp_column_depth: DEFAULT_MAX_SNP_COLUMN_DEPTH,
-        max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
-        max_record_span: DEFAULT_MAX_RECORD_SPAN,
-        mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
-        max_active_reads: DEFAULT_MAX_ACTIVE_READS,
+        stage1: Stage1Args {
+            min_mapq: DEFAULT_MIN_MAPQ,
+            no_baq: false,
+            min_read_length: 0, // admit any length
+            keep_qc_fail: false,
+            keep_duplicates: false,
+            max_read_mismatch_fraction: DEFAULT_MAX_READ_MISMATCH_FRACTION,
+            mismatch_bq_floor: DEFAULT_MISMATCH_BQ_FLOOR,
+            baq_gap_open_prob: SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
+            baq_gap_extend_prob: SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
+            baq_band_half_width: SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
+            baq_chunk_size: DEFAULT_BAQ_CHUNK_SIZE,
+            max_snp_column_depth: DEFAULT_MAX_SNP_COLUMN_DEPTH,
+            max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+            max_record_span: DEFAULT_MAX_RECORD_SPAN,
+            mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
+            max_active_reads: DEFAULT_MAX_ACTIVE_READS,
+        },
     }
 }
 
@@ -271,7 +274,7 @@ fn no_baq_path_writes_valid_psp() {
     let cram = build_cram(dir.path(), &fasta, true, &records);
     let output = dir.path().join("out.psp");
     let mut args = default_args(fasta, output.clone(), vec![cram]);
-    args.no_baq = true;
+    args.stage1.no_baq = true;
 
     run_pileup(&args).expect("run_pileup OK");
 

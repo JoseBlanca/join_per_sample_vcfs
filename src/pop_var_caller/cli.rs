@@ -10,32 +10,27 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
-use crate::per_sample_pileup::baq::{
-    BaqConfig, BaqSkipCounts, DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-    SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB, SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
-};
-use crate::per_sample_pileup::cram_input::{
-    ContigList, CramMergedReaderConfig, DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ,
-    DEFAULT_MIN_READ_LENGTH, DEFAULT_MISMATCH_BQ_FLOOR, FilterCounts,
-};
+use crate::per_sample_pileup::baq::BaqConfig;
+use crate::per_sample_pileup::baq::BaqSkipCounts;
+use crate::per_sample_pileup::cram_input::{ContigList, CramMergedReaderConfig, FilterCounts};
 use crate::per_sample_pileup::errors::CramInputError;
-use crate::per_sample_pileup::pileup::{
-    DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
-    DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH, RunSummary, WalkerConfig,
-};
+use crate::per_sample_pileup::pileup::{RunSummary, WalkerConfig};
 use crate::per_sample_pileup::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
 use crate::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use crate::per_sample_pileup::psp::writer::PspWriter;
+use crate::pop_var_caller::common::{
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, format_md5_hex, rfc3339_now,
+};
 
 pub mod error_bridge;
 pub mod parsers;
+pub mod shared_args;
 
 // ---------------------------------------------------------------------
 // Clap surface
@@ -75,6 +70,11 @@ pub enum PopVarCallerCommand {
 /// authoritative knob list; the orchestrator translates it into module
 /// configs. Defaults are pulled from each module's `DEFAULT_*` consts
 /// so they stay in sync.
+///
+/// Stage 1 knobs (CRAM-input filters, BAQ HMM, pileup walker) live in
+/// the flattened [`Stage1Args`](shared_args::Stage1Args) sub-struct so
+/// the `var-calling-from-bam` subcommand reuses the same surface
+/// — M10 from the 2026-05-19 cohort CLI review.
 #[derive(Debug, Args, Clone)]
 pub struct PileupArgs {
     // ===== Common flags (visible in `-h`) =====================
@@ -96,147 +96,9 @@ pub struct PileupArgs {
     #[arg(required = true)]
     pub crams: Vec<PathBuf>,
 
-    /// Drop reads with MAPQ < N. `0` admits everything.
-    #[arg(long, default_value_t = DEFAULT_MIN_MAPQ)]
-    pub min_mapq: u8,
-
-    /// Skip the BAQ HMM. `bq_baq` becomes a copy of the raw CRAM
-    /// QUAL.
-    #[arg(long)]
-    pub no_baq: bool,
-
-    // ===== Advanced flags (hidden from `-h`, shown in `--help`) =====
-    /// Drop reads with decoded SEQ length < N. `0` admits any length.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MIN_READ_LENGTH,
-        help_heading = "Advanced — CRAM input filters",
-    )]
-    pub min_read_length: u32,
-
-    /// Keep reads with the QC-fail flag (0x200) set.
-    #[arg(
-        long,
-        hide_short_help = true,
-        help_heading = "Advanced — CRAM input filters"
-    )]
-    pub keep_qc_fail: bool,
-
-    /// Keep reads with the duplicate flag (0x400) set.
-    #[arg(
-        long,
-        hide_short_help = true,
-        help_heading = "Advanced — CRAM input filters"
-    )]
-    pub keep_duplicates: bool,
-
-    /// Drop reads whose M-op mismatch fraction exceeds X. Must be in
-    /// [0.0, 1.0]; pass 0.0 to disable the filter entirely. Values
-    /// outside the range are a hard error.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_READ_MISMATCH_FRACTION,
-        value_parser = parse_mismatch_fraction,
-        help_heading = "Advanced — CRAM input filters",
-    )]
-    pub max_read_mismatch_fraction: f32,
-
-    /// BQ floor below which a mismatch does not count toward
-    /// --max-read-mismatch-fraction. `0` makes every mismatch count.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MISMATCH_BQ_FLOOR,
-        help_heading = "Advanced — CRAM input filters",
-    )]
-    pub mismatch_bq_floor: u8,
-
-    /// BAQ gap-open probability. samtools/htslib default: 1e-3.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_gap_open_prob: f32,
-
-    /// BAQ gap-extension probability. samtools/htslib default: 0.1.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_gap_extend_prob: f32,
-
-    /// BAQ band half-width. samtools/htslib default: 7. The engine
-    /// auto-widens per-read on long indels.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_band_half_width: i32,
-
-    /// BAQ batch size — reads processed in parallel per rayon chunk.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_BAQ_CHUNK_SIZE,
-        help_heading = "Advanced — BAQ HMM",
-    )]
-    pub baq_chunk_size: usize,
-
-    /// Max contributors folded at a pure-SNP/REF column.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_SNP_COLUMN_DEPTH,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_snp_column_depth: u32,
-
-    /// Max contributors folded at a column carrying any indel
-    /// observation.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_INDEL_COLUMN_DEPTH,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_indel_column_depth: u32,
-
-    /// Hard cap on per-record reference span.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_RECORD_SPAN,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_record_span: u32,
-
-    /// How far past a first mate the walker keeps a pending-mates
-    /// entry before evicting and treating the first mate as solo.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MATE_LOOKUP_WINDOW,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub mate_lookup_window: u32,
-
-    /// Hard cap on concurrently-active reads (defensive bound;
-    /// exceeding it is a hard error).
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ACTIVE_READS,
-        help_heading = "Advanced — Pileup walker",
-    )]
-    pub max_active_reads: u32,
+    // ===== Stage 1 (shared with var-calling-from-bam) =========
+    #[command(flatten)]
+    pub stage1: shared_args::Stage1Args,
 }
 
 pub(crate) fn parse_mismatch_fraction(s: &str) -> Result<f32, String> {
@@ -290,10 +152,12 @@ pub enum PileupCliError {
 /// so the same code path drives both this subcommand and (Task 8)
 /// `var-calling-from-bam`.
 pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
+    let stage1 = &args.stage1;
+
     // 1. Translate CLI → module configs.
-    let cram_cfg = cram_config_from_args(args);
-    let baq_cfg = baq_config_from_args(args);
-    let walker_cfg = walker_config_from_args(args);
+    let cram_cfg = cram_config_from_args(stage1);
+    let baq_cfg = baq_config_from_args(stage1);
+    let walker_cfg = walker_config_from_args(stage1);
 
     // 2. Size rayon's global pool when --threads is given. If the
     //    pool is already configured (e.g. a prior call in the same
@@ -319,8 +183,8 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         cram_cfg,
         baq_cfg,
         walker_cfg,
-        args.baq_chunk_size,
-        args.no_baq,
+        stage1.baq_chunk_size,
+        stage1.no_baq,
         |ctx| {
             // Build the writer header from the reader's metadata (the
             // M5 hard-error fires here).
@@ -329,11 +193,11 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
                 &args.reference,
                 ctx.contigs,
                 &args.crams,
-                args,
+                stage1,
             )?;
             // Open the .tmp output, build the writer, drive the walker.
             let file = File::create(&tmp_path).map_err(PileupCliError::Io)?;
-            let buf = BufWriter::with_capacity(64 * 1024, file);
+            let buf = BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
             let psp_writer = PspWriter::new(buf, header).map_err(PileupToPspError::from)?;
             let (sink, run_summary) = drive_pileup_to_psp(ctx.walker, psp_writer)?;
             Ok((sink, run_summary))
@@ -370,7 +234,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
 // Helpers
 // ---------------------------------------------------------------------
 
-fn cram_config_from_args(args: &PileupArgs) -> CramMergedReaderConfig {
+pub(super) fn cram_config_from_args(args: &shared_args::Stage1Args) -> CramMergedReaderConfig {
     CramMergedReaderConfig {
         min_mapq: if args.min_mapq == 0 {
             None
@@ -393,7 +257,7 @@ fn cram_config_from_args(args: &PileupArgs) -> CramMergedReaderConfig {
     }
 }
 
-fn baq_config_from_args(args: &PileupArgs) -> BaqConfig {
+pub(super) fn baq_config_from_args(args: &shared_args::Stage1Args) -> BaqConfig {
     BaqConfig {
         gap_open_prob: args.baq_gap_open_prob,
         gap_extend_prob: args.baq_gap_extend_prob,
@@ -401,7 +265,7 @@ fn baq_config_from_args(args: &PileupArgs) -> BaqConfig {
     }
 }
 
-fn walker_config_from_args(args: &PileupArgs) -> WalkerConfig {
+pub(super) fn walker_config_from_args(args: &shared_args::Stage1Args) -> WalkerConfig {
     WalkerConfig {
         max_snp_column_depth: args.max_snp_column_depth,
         max_indel_column_depth: args.max_indel_column_depth,
@@ -444,7 +308,7 @@ fn build_writer_header(
     fasta_path: &Path,
     contigs: &ContigList,
     cram_paths: &[PathBuf],
-    args: &PileupArgs,
+    args: &shared_args::Stage1Args,
 ) -> Result<WriterHeader, PileupCliError> {
     let mut chromosomes = Vec::with_capacity(contigs.entries.len());
     for entry in &contigs.entries {
@@ -491,27 +355,10 @@ fn build_writer_header(
     })
 }
 
-fn basename(p: &Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned())
-}
-
-/// Format a 16-byte MD5 as 32 lowercase hex characters, matching
-/// SAM `@SQ M5` and the `.psp` `chromosome.md5` field.
-fn format_md5_hex(bytes: [u8; 16]) -> String {
-    let mut out = String::with_capacity(32);
-    for b in bytes {
-        use std::fmt::Write as _;
-        write!(&mut out, "{b:02x}").expect("writing to a String never fails");
-    }
-    out
-}
-
 /// Effective parameter map, written into `WriterProvenance.parameters`
 /// so the .psp self-describes the run. Every CLI knob — including the
 /// ones left at their defaults — is recorded.
-fn effective_parameters(args: &PileupArgs) -> BTreeMap<String, ParameterValue> {
+fn effective_parameters(args: &shared_args::Stage1Args) -> BTreeMap<String, ParameterValue> {
     let mut p = BTreeMap::new();
     // CRAM input filters
     p.insert(
@@ -623,52 +470,24 @@ fn print_run_summary(
 }
 
 // ---------------------------------------------------------------------
-// RFC3339 timestamp (no date-crate dep)
-// ---------------------------------------------------------------------
-
-/// Format the current UTC time as a TOML-compatible RFC3339 string
-/// (`YYYY-MM-DDTHH:MM:SSZ`). Done by hand so we don't pull in a date
-/// crate just for this one call. Uses Howard Hinnant's civil-date
-/// algorithm to turn days-since-epoch into (year, month, day).
-fn rfc3339_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let sod = secs % 86_400;
-    let (y, m, d) = civil_from_days(days);
-    let h = sod / 3600;
-    let min = (sod % 3600) / 60;
-    let s = sod % 60;
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days` — translate days-since-epoch
-/// (1970-01-01 = 0) into a proleptic Gregorian (year, month, day).
-/// Verified by external reference; see
-/// http://howardhinnant.github.io/date_algorithms.html
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::per_sample_pileup::baq::{
+        DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
+        SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB, SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
+    };
+    use crate::per_sample_pileup::cram_input::{
+        DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
+        DEFAULT_MISMATCH_BQ_FLOOR,
+    };
+    use crate::per_sample_pileup::pileup::{
+        DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+        DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
+    };
 
     fn default_args(reference: PathBuf, output: PathBuf, crams: Vec<PathBuf>) -> PileupArgs {
         PileupArgs {
@@ -676,22 +495,24 @@ mod tests {
             output,
             threads: None,
             crams,
-            min_mapq: DEFAULT_MIN_MAPQ,
-            no_baq: false,
-            min_read_length: DEFAULT_MIN_READ_LENGTH,
-            keep_qc_fail: false,
-            keep_duplicates: false,
-            max_read_mismatch_fraction: DEFAULT_MAX_READ_MISMATCH_FRACTION,
-            mismatch_bq_floor: DEFAULT_MISMATCH_BQ_FLOOR,
-            baq_gap_open_prob: SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
-            baq_gap_extend_prob: SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
-            baq_band_half_width: SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-            baq_chunk_size: DEFAULT_BAQ_CHUNK_SIZE,
-            max_snp_column_depth: DEFAULT_MAX_SNP_COLUMN_DEPTH,
-            max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
-            max_record_span: DEFAULT_MAX_RECORD_SPAN,
-            mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
-            max_active_reads: DEFAULT_MAX_ACTIVE_READS,
+            stage1: shared_args::Stage1Args {
+                min_mapq: DEFAULT_MIN_MAPQ,
+                no_baq: false,
+                min_read_length: DEFAULT_MIN_READ_LENGTH,
+                keep_qc_fail: false,
+                keep_duplicates: false,
+                max_read_mismatch_fraction: DEFAULT_MAX_READ_MISMATCH_FRACTION,
+                mismatch_bq_floor: DEFAULT_MISMATCH_BQ_FLOOR,
+                baq_gap_open_prob: SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
+                baq_gap_extend_prob: SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
+                baq_band_half_width: SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
+                baq_chunk_size: DEFAULT_BAQ_CHUNK_SIZE,
+                max_snp_column_depth: DEFAULT_MAX_SNP_COLUMN_DEPTH,
+                max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+                max_record_span: DEFAULT_MAX_RECORD_SPAN,
+                mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
+                max_active_reads: DEFAULT_MAX_ACTIVE_READS,
+            },
         }
     }
 
@@ -712,21 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn format_md5_hex_is_32_lowercase() {
-        let bytes = [
-            0x6a, 0xef, 0x89, 0x7c, 0x3d, 0x6f, 0xf0, 0xc7, 0x8a, 0xff, 0x06, 0xac, 0x18, 0x91,
-            0x78, 0xdd,
-        ];
-        assert_eq!(format_md5_hex(bytes), "6aef897c3d6ff0c78aff06ac189178dd");
-    }
-
-    #[test]
-    fn basename_strips_directory() {
-        assert_eq!(basename(Path::new("/tmp/a/b/sample.cram")), "sample.cram");
-        assert_eq!(basename(Path::new("ref.fa")), "ref.fa");
-    }
-
-    #[test]
     fn tmp_path_appends_suffix() {
         assert_eq!(
             tmp_path_for(Path::new("/tmp/x.psp")),
@@ -736,27 +542,9 @@ mod tests {
     }
 
     #[test]
-    fn civil_from_days_matches_known_dates() {
-        // Unix epoch
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 1970-12-31 (day 364, 1970 is not a leap year)
-        assert_eq!(civil_from_days(364), (1970, 12, 31));
-        // 2000-01-01 (day 10957 since epoch, common Y2K test)
-        assert_eq!(civil_from_days(10957), (2000, 1, 1));
-        // 2024-02-29 — leap day
-        assert_eq!(civil_from_days(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn rfc3339_now_parses_as_toml_datetime() {
-        let s = rfc3339_now();
-        let _: toml::value::Datetime = s.parse().expect("must parse as toml Datetime");
-    }
-
-    #[test]
     fn effective_parameters_records_every_knob() {
         let args = default_args(PathBuf::from("r.fa"), PathBuf::from("o.psp"), vec![]);
-        let p = effective_parameters(&args);
+        let p = effective_parameters(&args.stage1);
         // Sanity: every knob shows up.
         for key in &[
             "min_mapq",
@@ -795,7 +583,7 @@ mod tests {
             }],
         };
         let args = default_args(PathBuf::from("r.fa"), PathBuf::from("o.psp"), vec![]);
-        let err = build_writer_header("s", Path::new("r.fa"), &contigs, &[], &args)
+        let err = build_writer_header("s", Path::new("r.fa"), &contigs, &[], &args.stage1)
             .expect_err("must error");
         assert!(matches!(err, PileupCliError::MissingMd5 { ref contig } if contig == "chr1"));
     }
@@ -825,7 +613,7 @@ mod tests {
             Path::new("/data/ref/grch38.fa"),
             &contigs,
             &crams,
-            &args,
+            &args.stage1,
         )
         .expect("build_writer_header");
         assert_eq!(header.writer.input_fasta, "grch38.fa");

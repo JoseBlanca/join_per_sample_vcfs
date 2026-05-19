@@ -5,6 +5,8 @@
 
 pub mod batch_assignment;
 pub mod cli;
+pub(crate) mod cohort_driver;
+pub(crate) mod common;
 pub mod contamination_artefact;
 pub mod estimate_contamination;
 pub mod psp_to_pileup;

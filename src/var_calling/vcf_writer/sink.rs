@@ -26,6 +26,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::errors::VcfWriteError;
+use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 
 /// htslib-required empty-bgzf EOF marker.
 ///
@@ -54,9 +55,10 @@ impl SinkKind {
     /// Open `<final_path>.tmp` and wrap it in the sink kind chosen by
     /// `final_path`'s suffix.
     ///
-    /// The plain sink wraps the file in a 64 KiB `BufWriter` so the
-    /// per-record `write_all` calls coalesce into block-sized writes
-    /// before they hit the kernel. The bgzf sink does its own
+    /// The plain sink wraps the file in a
+    /// [`DEFAULT_BUFFERED_IO_CAPACITY`]-sized `BufWriter` (64 KiB)
+    /// so the per-record `write_all` calls coalesce into block-sized
+    /// writes before they hit the kernel. The bgzf sink does its own
     /// block-level buffering internally.
     pub(super) fn open_tmp(final_path: &Path) -> Result<Self, VcfWriteError> {
         let tmp_path = tmp_path_for(final_path);
@@ -67,7 +69,7 @@ impl SinkKind {
         Ok(if path_is_bgzf(final_path) {
             SinkKind::Bgzf(noodles_bgzf::io::Writer::new(file))
         } else {
-            SinkKind::Plain(BufWriter::with_capacity(64 * 1024, file))
+            SinkKind::Plain(BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file))
         })
     }
 

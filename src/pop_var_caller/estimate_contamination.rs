@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::Args;
 use thiserror::Error;
@@ -30,6 +30,7 @@ use toml::value::Datetime;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
+use crate::pop_var_caller::common::{DEFAULT_BUFFERED_IO_CAPACITY, basename, rfc3339_now};
 use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
@@ -329,7 +330,7 @@ pub fn run_estimate_contamination(
     let mut readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(args.psp_files.len());
     for path in &args.psp_files {
         let file = File::open(path).map_err(EstimateContaminationCliError::Io)?;
-        let buf = BufReader::with_capacity(64 * 1024, file);
+        let buf = BufReader::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
         let reader = PspReader::new(buf)?;
         readers.push(reader);
     }
@@ -473,25 +474,19 @@ fn build_artefact_from_estimates(
 
     let parameters = build_parameter_map(args, cfg);
 
-    let batches: Vec<BatchEntry> = (0..batch_id_for_idx.len())
-        .map(|batch_idx| {
-            // Internal access via the engine's `effective_c_s` /
-            // `q_b_for_sample` accessors needs a sample-side index;
-            // build `BatchEntry` directly from the engine's pub(crate)
-            // shape would mean exposing more. Instead pick any sample
-            // in this batch and read its q_b through the accessor.
-            // Falls back to all-zero (floored signal) if the engine
-            // returned an unused batch.
-            let representative_sample = estimates
-                .sample_to_batch
-                .iter()
-                .position(|b| *b == batch_idx);
-            let q_b: [f64; 3] = match representative_sample {
-                Some(s) => *estimates.q_b_for_sample(s),
-                None => [0.0; 3],
-            };
+    // Per-batch q_b rows come straight from the engine's
+    // dense-batch table via the Mi18 accessor — no per-batch
+    // linear-scan for a representative sample. `build_dense_batches`
+    // (called above) guarantees the two parallel vectors have the
+    // same length, so indexing by `batch_idx` is total.
+    let q_b_rows = estimates.q_b_per_batch();
+    let batches: Vec<BatchEntry> = batch_id_for_idx
+        .iter()
+        .enumerate()
+        .map(|(batch_idx, id)| {
+            let q_b = q_b_rows[batch_idx];
             BatchEntry {
-                id: batch_id_for_idx[batch_idx].clone(),
+                id: id.clone(),
                 contaminant_ref_prob: q_b[0],
                 contaminant_snp_alt_prob: q_b[1],
                 contaminant_indel_alt_prob: q_b[2],
@@ -630,47 +625,6 @@ fn print_run_summary(
     Ok(())
 }
 
-/// Format the current UTC time as a TOML-compatible RFC3339 string.
-/// Mirrors the helper in `pop_var_caller::cli` to avoid coupling the
-/// two subcommands' implementations.
-fn rfc3339_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let sod = secs % 86_400;
-    let (y, m, d) = civil_from_days(days);
-    let h = sod / 3600;
-    let min = (sod % 3600) / 60;
-    let s = sod % 60;
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
-}
-
-/// Howard Hinnant's `civil_from_days`. Identical to the helper in
-/// `pop_var_caller::cli`; duplicated rather than re-exported to keep
-/// the subcommands self-contained.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-fn basename(p: &Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned())
-}
-
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -736,25 +690,5 @@ mod tests {
             batch_id_for_idx,
             vec!["lane_3".to_string(), "all_samples".to_string()]
         );
-    }
-
-    #[test]
-    fn rfc3339_now_parses_as_toml_datetime() {
-        let s = rfc3339_now();
-        let _: Datetime = s.parse().expect("rfc3339_now must parse as toml Datetime");
-    }
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(364), (1970, 12, 31));
-        assert_eq!(civil_from_days(10957), (2000, 1, 1));
-        assert_eq!(civil_from_days(19782), (2024, 2, 29));
-    }
-
-    #[test]
-    fn basename_strips_directory() {
-        assert_eq!(basename(Path::new("/data/grch38.fa")), "grch38.fa");
-        assert_eq!(basename(Path::new("ref.fa")), "ref.fa");
     }
 }

@@ -2,13 +2,14 @@
 //!
 //! Wires Stages 3–6 of the pipeline:
 //!
-//!   PspReader(s) → PerPositionMerger → [DustFilter] → VariantGrouper
+//!   PspReader(s) → PerPositionMerger → DustFilter → VariantGrouper
 //!   → PerGroupMerger → PosteriorEngine → CohortVcfWriter
 //!
 //! The DUST filter is bypassed when `--no-complexity-filter` is set;
-//! both branches converge on the same downstream chain via a shared
-//! [`Box<dyn Iterator>`] adapter that lifts the upstream error into
-//! [`GrouperError`].
+//! both branches converge on the same downstream chain via a
+//! `Box<dyn Iterator>` adapter that lifts the upstream error into
+//! [`GrouperError`] — the wiring lives in
+//! [`crate::pop_var_caller::cohort_driver::drive_cohort_pipeline`].
 //!
 //! Contamination plumbing:
 //!
@@ -22,7 +23,6 @@
 //! Plan: `doc/devel/implementation_plans/pop_var_caller_cohort_cli.md`
 //! §"Subcommand: var-calling".
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
@@ -33,39 +33,36 @@ use thiserror::Error;
 
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
-use crate::pop_var_caller::cli::parsers;
+use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
+use crate::pop_var_caller::common::{DEFAULT_BUFFERED_IO_CAPACITY, basename, current_command_line};
 use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
-use crate::var_calling::dust_filter::{
-    DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW, DustFilter, DustFilterConfig, DustFilterError,
-};
+use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
-    DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY, PerGroupMerger,
-    PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
+    DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };
 use crate::var_calling::per_position_merger::{
-    PerPositionMerger, PerPositionMergerError, PerPositionPileups, check_chromosome_agreement,
+    PerPositionMerger, PerPositionMergerError, check_chromosome_agreement,
 };
 use crate::var_calling::posterior_engine::{
-    DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
-    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
-    DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, PosteriorEngine,
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
-use crate::var_calling::variant_grouping::{
-    DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig, GrouperConfigError, GrouperError, VariantGrouper,
-};
-use crate::var_calling::vcf_writer::{
-    CohortMetadata, CohortVcfWriter, DEFAULT_EMIT_GP, VcfWriteError, WriterConfig, tmp_path_for,
-};
+use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
+use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig};
 
 // ---------------------------------------------------------------------
 // CLI surface
 // ---------------------------------------------------------------------
 
 /// Arguments accepted by `pop_var_caller var-calling`.
+///
+/// Cohort-pipeline knobs (DUST, grouper, per-group merger,
+/// posterior engine, ploidy, VCF writer) live in the flattened
+/// [`CohortPipelineArgs`](crate::pop_var_caller::cli::shared_args::CohortPipelineArgs)
+/// sub-struct so the `var-calling-from-bam` subcommand reuses the
+/// same surface — M10 from the 2026-05-19 cohort CLI review.
 #[derive(Debug, Args, Clone)]
 pub struct VarCallingArgs {
     // ===== Common (visible in `-h`) ===========================
@@ -95,140 +92,13 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub no_complexity_filter: bool,
 
-    /// Cohort-wide ploidy.
-    #[arg(long, default_value_t = DEFAULT_PLOIDY, value_parser = parsers::parse_ploidy)]
-    pub ploidy: u8,
-
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
     pub psp_files: Vec<PathBuf>,
 
-    // ===== Advanced — DUST filter ==============================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_DUST_WINDOW,
-        value_parser = parsers::parse_dust_window,
-        help_heading = "Advanced — DUST filter",
-    )]
-    pub complexity_window: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_DUST_THRESHOLD,
-        value_parser = parsers::parse_dust_threshold,
-        help_heading = "Advanced — DUST filter",
-    )]
-    pub complexity_threshold: u32,
-
-    // ===== Advanced — Variant grouping =========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_VARIANT_GROUP_SPAN,
-        value_parser = parsers::parse_var_group_max_span,
-        help_heading = "Advanced — Variant grouping",
-    )]
-    pub var_group_max_span: u32,
-
-    // ===== Advanced — Per-group merger =========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ALLELES_PER_RECORD,
-        value_parser = parsers::parse_max_alleles,
-        help_heading = "Advanced — Per-group merger",
-    )]
-    pub max_alleles_per_var: usize,
-
-    // ===== Advanced — Posterior engine =========================
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_INBREEDING_COEFFICIENT,
-        value_parser = parsers::parse_inbreeding_coefficient,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub inbreeding_coefficient: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_CONVERGENCE_THRESHOLD,
-        value_parser = parsers::parse_em_convergence_threshold,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub em_convergence_threshold: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_ITERATIONS,
-        value_parser = parsers::parse_em_max_iterations,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub em_max_iterations: u32,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_REF_PSEUDOCOUNT,
-        value_parser = parsers::parse_ref_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub ref_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_SNP_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_snp_alt_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub snp_alt_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_INDEL_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_indel_alt_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub indel_alt_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_compound_alt_pseudocount,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub compound_alt_pseudocount: f64,
-
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_MAX_GQ_PHRED,
-        value_parser = parsers::parse_max_gq_phred,
-        help_heading = "Advanced — Posterior engine",
-    )]
-    pub max_gq_phred: f64,
-
-    // ===== Advanced — VCF writer ===============================
-    /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
-    /// default — `GP` is `Number=G`, so the per-sample cell grows as
-    /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at
-    /// ploidy=2, n_alleles=6). Opt in when posteriors are wanted on
-    /// disk; a 1000-sample × 100 K-variant cohort with `emit_gp` adds
-    /// ~8 GiB to the VCF.
-    #[arg(
-        long,
-        hide_short_help = true,
-        default_value_t = DEFAULT_EMIT_GP,
-        help_heading = "Advanced — VCF writer",
-    )]
-    pub emit_gp: bool,
+    // ===== Cohort pipeline (shared with var-calling-from-bam) ==
+    #[command(flatten)]
+    pub cohort: crate::pop_var_caller::cli::shared_args::CohortPipelineArgs,
 }
 
 // ---------------------------------------------------------------------
@@ -321,10 +191,13 @@ pub enum VarCallingCliError {
 /// 6. Build + validate every per-stage config from the CLI args.
 /// 7. Wire the pipeline (merger → optional DUST → grouper →
 ///    per-group merger → posterior engine).
-/// 8. Stream records into the [`CohortVcfWriter`]; finalise via
+/// 8. Stream records into the
+///    [`CohortVcfWriter`](crate::var_calling::vcf_writer::CohortVcfWriter); finalise via
 ///    atomic tmp+rename.
 /// 9. Print a one-shot stderr run-summary block.
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
+    let cohort = &args.cohort;
+
     // 1. Rayon pool.
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -337,7 +210,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     let mut readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(args.psp_files.len());
     for path in &args.psp_files {
         let file = File::open(path).map_err(VarCallingCliError::Io)?;
-        let buf = BufReader::with_capacity(64 * 1024, file);
+        let buf = BufReader::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
         let reader = PspReader::new(buf)?;
         readers.push(reader);
     }
@@ -361,10 +234,13 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     let chromosomes = check_chromosome_agreement(&readers)?;
 
     // 5. Build + validate every per-stage config.
-    let dust_cfg = DustFilterConfig::new(args.complexity_window, args.complexity_threshold)?;
-    let grouper_cfg = GrouperConfig::new(args.var_group_max_span)?;
-    let per_group_cfg =
-        PerGroupMergerConfig::new(args.ploidy, args.max_alleles_per_var, DEFAULT_BATCH_SIZE)?;
+    let dust_cfg = DustFilterConfig::new(cohort.complexity_window, cohort.complexity_threshold)?;
+    let grouper_cfg = GrouperConfig::new(cohort.var_group_max_span)?;
+    let per_group_cfg = PerGroupMergerConfig::new(
+        cohort.ploidy,
+        cohort.max_alleles_per_var,
+        DEFAULT_BATCH_SIZE,
+    )?;
     // 5. Build the posterior-engine config via the named-setter
     //    builder chain. Every setter validates and returns
     //    `Result<Self, _>` so a swap or out-of-range value surfaces
@@ -374,14 +250,14 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // 6. Load contamination if supplied; threaded into the engine
     //    config through the same `with_contamination` setter.
     let posterior_cfg = PosteriorEngineConfig::new()
-        .with_convergence_threshold(args.em_convergence_threshold)?
-        .with_max_iterations(args.em_max_iterations)?
-        .with_ref_pseudocount(args.ref_pseudocount)?
-        .with_snp_alt_pseudocount(args.snp_alt_pseudocount)?
-        .with_indel_alt_pseudocount(args.indel_alt_pseudocount)?
-        .with_compound_alt_pseudocount(args.compound_alt_pseudocount)?
-        .with_fixation_index_default(args.inbreeding_coefficient)?
-        .with_max_gq_phred(args.max_gq_phred)?
+        .with_convergence_threshold(cohort.em_convergence_threshold)?
+        .with_max_iterations(cohort.em_max_iterations)?
+        .with_ref_pseudocount(cohort.ref_pseudocount)?
+        .with_snp_alt_pseudocount(cohort.snp_alt_pseudocount)?
+        .with_indel_alt_pseudocount(cohort.indel_alt_pseudocount)?
+        .with_compound_alt_pseudocount(cohort.compound_alt_pseudocount)?
+        .with_fixation_index_default(cohort.inbreeding_coefficient)?
+        .with_max_gq_phred(cohort.max_gq_phred)?
         .with_contamination(load_contamination(
             args.contamination_estimates.as_deref(),
             &sample_names,
@@ -401,60 +277,34 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line: current_command_line(),
     };
-    let writer_cfg = WriterConfig::new(args.output.clone()).with_emit_gp(args.emit_gp);
+    let writer_cfg = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
 
     // 9. Wire the pipeline. The k-way merger sits on top of the
     //    record iterators borrowed from each reader.
     let record_iters: Vec<_> = readers.iter_mut().map(|r| r.records()).collect();
     let merger = PerPositionMerger::new(record_iters, sample_names.clone(), chromosomes.clone())?;
 
-    // DUST filter is optional; both branches converge on a
-    // `Box<dyn Iterator<Item = Result<_, GrouperError>>>` so the
-    // grouper sees a single type either way. The grouper is generic
-    // over upstream error via `GrouperError: From<E>` — see the
-    // commit that introduced the generalisation.
-    // DustFilter wants `F: RefSeqFetcher` by value. `Arc<dyn ...>`
-    // does not itself impl the trait (no blanket impl for Arc), but
-    // `&dyn RefSeqFetcher` does via the existing `impl<T: RefSeqFetcher
-    // + ?Sized> RefSeqFetcher for &T` blanket. Passing `&*fetcher`
-    // satisfies the bound and ties the filter's lifetime to `fetcher`,
-    // which lives for the whole pipeline scope.
-    let upstream_for_grouper: Box<
-        dyn Iterator<Item = Result<PerPositionPileups, GrouperError>> + '_,
-    > = if args.no_complexity_filter {
-        Box::new(merger.map(|r| r.map_err(GrouperError::from)))
-    } else {
-        let dust = DustFilter::new(merger, &*fetcher, chromosomes.clone(), dust_cfg);
-        Box::new(dust.map(|r| r.map_err(GrouperError::from)))
+    // 10. Drive the cohort pipeline (DUST → grouper → per-group
+    //     merger → posterior engine → VCF writer) via the shared
+    //     helper. M11 from the 2026-05-19 review — the wiring used
+    //     to be duplicated verbatim against `var_calling_from_bam`'s
+    //     `run_cohort_pipeline_for_single_sample` helper.
+    let pipeline_params = CohortPipelineParams {
+        no_complexity_filter: args.no_complexity_filter,
+        dust_cfg,
+        grouper_cfg,
+        per_group_cfg,
+        posterior_cfg,
+        fetcher,
+        chromosomes,
     };
-
-    let grouper = VariantGrouper::with_config(upstream_for_grouper, grouper_cfg);
-    let per_group = PerGroupMerger::with_config(grouper, fetcher.clone(), per_group_cfg);
-    let posterior = PosteriorEngine::with_config(per_group, posterior_cfg);
-
-    // 10. Stream records into the writer; tmp-then-rename on success.
-    //     On any driver-loop failure we best-effort remove the half-
-    //     written `<output>.tmp` so failed runs don't leave stale tmp
-    //     files behind — parity with `run_pileup` and
-    //     `run_var_calling_from_bam`. The writer's `finish()` consumes
-    //     `self`, so a `?` short-circuit in the loop never reaches the
-    //     rename and the tmp would otherwise linger.
-    let tmp_path = tmp_path_for(&args.output);
-    let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
-    let mut records_written: u64 = 0;
-    let drive_result: Result<(), VarCallingCliError> = (|| {
-        for item in posterior {
-            let record = item?;
-            writer.write_record(&record)?;
-            records_written += 1;
-        }
-        writer.finish()?;
-        Ok(())
-    })();
-    if let Err(e) = drive_result {
-        let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
-        return Err(e);
-    }
+    let records_written = drive_cohort_pipeline::<_, VarCallingCliError>(
+        merger,
+        pipeline_params,
+        &args.output,
+        metadata,
+        writer_cfg,
+    )?;
 
     // 11. Stderr summary.
     print_run_summary(&sample_names, records_written);
@@ -525,19 +375,6 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-fn basename(p: &Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned())
-}
-
-fn current_command_line() -> String {
-    std::env::args_os()
-        .map(|a: OsString| a.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn print_run_summary(sample_names: &[String], records_written: u64) {
     eprintln!(
         "var-calling: n_samples={} records_emitted={}",
@@ -578,12 +415,6 @@ mod tests {
         let mut bad = "6aef897c3d6ff0c78aff06ac189178d".to_string();
         bad.push('Z');
         assert_eq!(md5_hex_to_bytes(&bad), None);
-    }
-
-    #[test]
-    fn basename_strips_directory() {
-        assert_eq!(basename(Path::new("/data/grch38.fa")), "grch38.fa");
-        assert_eq!(basename(Path::new("ref.fa")), "ref.fa");
     }
 
     #[test]
