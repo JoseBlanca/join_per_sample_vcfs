@@ -792,4 +792,88 @@ contamination_fraction = 0.01
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }
+
+    #[test]
+    fn to_estimates_round_trips_floored_batch_with_zero_qb() {
+        // Mi23 coverage. The engine's convention for a floored
+        // batch (singleton, or below `min_batch_size_for_contamination`)
+        // is to write an all-zero `q_b` row in the artefact and
+        // `contamination_fraction = 0.0` for every sample in that
+        // batch. `to_estimates_for_samples` must round-trip the
+        // all-zero row verbatim — Stage 6's contamination math
+        // treats it as the "unused" sentinel rather than a real
+        // probability simplex.
+        let mut a = fixture();
+        a.batches[0].contaminant_ref_prob = 0.0;
+        a.batches[0].contaminant_snp_alt_prob = 0.0;
+        a.batches[0].contaminant_indel_alt_prob = 0.0;
+        a.samples[0].contamination_fraction = 0.0;
+        a.samples[1].contamination_fraction = 0.0;
+        a.validate().unwrap();
+
+        let cohort = ["NA12878", "NA12891"];
+        let est = a.to_estimates_for_samples(&cohort).unwrap();
+        // Both samples' effective c_s is 0.0 (floored).
+        assert_eq!(est.effective_c_s(0), 0.0);
+        assert_eq!(est.effective_c_s(1), 0.0);
+        // The q_b row each sample resolves to is the all-zero
+        // floored sentinel — round-tripped from the on-disk
+        // `[[batches]]` row verbatim.
+        assert_eq!(est.q_b_for_sample(0), &[0.0, 0.0, 0.0]);
+        assert_eq!(est.q_b_for_sample(1), &[0.0, 0.0, 0.0]);
+        // The Mi18 batch-side accessor sees the same row at the
+        // single dense-batch index.
+        assert_eq!(est.q_b_per_batch().len(), 1);
+        assert_eq!(est.q_b_per_batch()[0], [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn to_estimates_orders_dense_batches_by_cohort_first_seen() {
+        // Mi23 coverage. The artefact's `[[batches]]` array can be
+        // in any order on disk (TOML doesn't guarantee a meaningful
+        // ordering). `to_estimates_for_samples` reorders into the
+        // dense batch slice by *cohort first-seen*: the first
+        // sample's batch lands at index 0, the next never-before-
+        // seen batch lands at index 1, etc. This test pins the
+        // contract — a downstream consumer that indexes
+        // `q_b_per_batch()` must see batches in the same order it
+        // first encounters them in the cohort sample list.
+        let mut a = fixture();
+        // Reshape the fixture: artefact has two batches in "lane_z,
+        // lane_a" order on disk; samples assign NA12878 → lane_a,
+        // NA12891 → lane_z. Cohort order (NA12878, NA12891) should
+        // produce dense_batches[0] = lane_a, dense_batches[1] =
+        // lane_z (first-seen-by-cohort, not the disk order).
+        a.batches = vec![
+            BatchEntry {
+                id: "lane_z".into(),
+                contaminant_ref_prob: 0.7,
+                contaminant_snp_alt_prob: 0.2,
+                contaminant_indel_alt_prob: 0.1,
+            },
+            BatchEntry {
+                id: "lane_a".into(),
+                contaminant_ref_prob: 0.9,
+                contaminant_snp_alt_prob: 0.05,
+                contaminant_indel_alt_prob: 0.05,
+            },
+        ];
+        a.samples[0].batch = "lane_a".into();
+        a.samples[1].batch = "lane_z".into();
+        a.validate().unwrap();
+
+        let cohort = ["NA12878", "NA12891"];
+        let est = a.to_estimates_for_samples(&cohort).unwrap();
+
+        // dense_batches[0] = lane_a (first cohort sample's batch);
+        // dense_batches[1] = lane_z (next new batch encountered).
+        let q_b = est.q_b_per_batch();
+        assert_eq!(q_b.len(), 2);
+        assert_eq!(q_b[0], [0.9, 0.05, 0.05], "dense_batches[0] = lane_a");
+        assert_eq!(q_b[1], [0.7, 0.2, 0.1], "dense_batches[1] = lane_z");
+        // Sample-side accessors confirm both samples resolve to
+        // their correct dense rows.
+        assert_eq!(est.q_b_for_sample(0), &[0.9, 0.05, 0.05]);
+        assert_eq!(est.q_b_for_sample(1), &[0.7, 0.2, 0.1]);
+    }
 }

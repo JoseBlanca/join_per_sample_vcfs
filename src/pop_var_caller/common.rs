@@ -20,6 +20,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use md5::{Digest, Md5};
+
+use crate::per_sample_pileup::pileup::RefSeqFetcher;
+use crate::per_sample_pileup::psp::header::ParsedChromosome;
+
 /// Buffered-I/O capacity used by every `BufReader::with_capacity` /
 /// `BufWriter::with_capacity` in the cohort CLI's file I/O. 64 KiB
 /// matches the value the per-sample `.psp` reader/writer documents
@@ -123,6 +128,82 @@ pub(crate) fn configure_rayon_pool(n: Option<usize>) -> Result<(), rayon::Thread
     // line per process. Discard the result so a vanishingly-rare
     // double-set is silent.
     let _ = RAYON_POOL_CONFIGURED.set(());
+    Ok(())
+}
+
+/// Why [`verify_fasta_matches_psp_chromosomes`] rejected the
+/// supplied FASTA. **M5 follow-up** wraps two distinct failure
+/// modes — actual MD5 mismatch (FASTA had the contig but the
+/// bytes don't match) vs the fetcher failing on a contig
+/// (contig name missing from FASTA, or I/O failure). Both fail
+/// the cross-check but the user-facing remediation differs.
+#[derive(Debug)]
+pub(crate) enum FastaVerifyError {
+    /// Contig is present in the FASTA but its uppercase-bases MD5
+    /// does not match the value carried by the `.psp` header.
+    Md5Mismatch {
+        /// Contig name (shared between the `.psp` header and the
+        /// FASTA — the upstream basename check guarantees they
+        /// agree on naming).
+        contig: String,
+        /// Lowercase 32-hex MD5 of the contig's uppercase bases as
+        /// read from the supplied FASTA.
+        fasta_md5: String,
+        /// 32-hex MD5 the `.psp` header carries (originally sourced
+        /// from the producing CRAM's `@SQ M5`).
+        psp_md5: String,
+    },
+    /// The fetcher failed to read the contig from the FASTA (the
+    /// contig name is missing, or an I/O error occurred). Carries
+    /// the contig name + the inner `io::Error` for context.
+    FetchFailed {
+        contig: String,
+        source: std::io::Error,
+    },
+}
+
+/// Cross-check that each `.psp` header's per-contig MD5 matches the
+/// MD5 of the corresponding uppercase contig bases in the supplied
+/// FASTA. **M5 follow-up** from the 2026-05-19 cohort CLI review —
+/// the basename cross-check (`run_var_calling` /
+/// `run_estimate_contamination` step 3) is necessary but not
+/// sufficient; this helper closes the "right basename, wrong
+/// bytes" failure mode the project's "no silent intermediates"
+/// principle exists to prevent.
+///
+/// Costs: each call fetches every contig's full bytes from the
+/// supplied FASTA via `fetcher.fetch(chrom_id, 1, length)`. On
+/// `SyncRefFetcher` the fetch populates the per-contig in-memory
+/// cache, so the bytes survive for the rest of the pipeline — this
+/// helper effectively pre-warms the cache while doing the MD5
+/// comparison. On a 24-chrom human reference that means
+/// ~3 GiB of resident memory (already the dominant memory user) +
+/// a few seconds of I/O at process startup; on the tiny
+/// integration-test fixtures the overhead is negligible.
+pub(crate) fn verify_fasta_matches_psp_chromosomes(
+    fetcher: &impl RefSeqFetcher,
+    chromosomes: &[ParsedChromosome],
+) -> Result<(), FastaVerifyError> {
+    for (chrom_id, contig) in chromosomes.iter().enumerate() {
+        // `fetch` uppercases on the way out, so the MD5 is taken
+        // over the canonical SAM-spec form (`A`/`C`/`G`/`T`/`N`)
+        // regardless of how the FASTA is masked on disk.
+        let bytes = fetcher
+            .fetch(chrom_id as u32, 1, contig.length)
+            .map_err(|source| FastaVerifyError::FetchFailed {
+                contig: contig.name.clone(),
+                source,
+            })?;
+        let digest: [u8; 16] = Md5::digest(&bytes).into();
+        let fasta_md5 = format_md5_hex(digest);
+        if fasta_md5 != contig.md5 {
+            return Err(FastaVerifyError::Md5Mismatch {
+                contig: contig.name.clone(),
+                fasta_md5,
+                psp_md5: contig.md5.clone(),
+            });
+        }
+    }
     Ok(())
 }
 

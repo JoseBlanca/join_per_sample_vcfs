@@ -28,15 +28,18 @@ use thiserror::Error;
 use toml::value::Datetime;
 
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
+use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
 use crate::pop_var_caller::common::{
-    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, rfc3339_now,
+    DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool, rfc3339_now,
+    verify_fasta_matches_psp_chromosomes,
 };
 use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
 };
+use crate::pop_var_caller::var_calling::contigs_from_parsed;
 use crate::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, DEFAULT_BLOCK_SIZE, DEFAULT_C_S_INIT,
@@ -275,6 +278,32 @@ pub enum EstimateContaminationCliError {
     #[error("rayon thread pool already initialised — refusing to override")]
     RayonAlreadyConfigured,
 
+    /// FASTA contig bytes don't match the `.psp` header's
+    /// per-contig MD5. The basename cross-check (variant
+    /// `ReferenceMismatch`) is necessary but not sufficient — this
+    /// variant catches "right filename, wrong bytes" (e.g. the
+    /// user has a same-named FASTA pointing at a different genome
+    /// build). M5 follow-up from the 2026-05-19 cohort CLI review.
+    #[error(
+        "fasta `{contig}` bytes don't match the .psp header MD5 — \
+         fasta has `{fasta_md5}`, .psp has `{psp_md5}`"
+    )]
+    FastaContigMd5Mismatch {
+        contig: String,
+        fasta_md5: String,
+        psp_md5: String,
+    },
+
+    /// Failed to read a contig from the FASTA referenced by
+    /// `--reference` — the contig declared by the `.psp` is missing
+    /// (or unreadable) from the FASTA on disk.
+    #[error("fasta `{contig}`: failed to read for MD5 verification — {source}")]
+    FastaContigFetchFailed {
+        contig: String,
+        #[source]
+        source: io::Error,
+    },
+
     /// Internal: `SystemTime::now()` formatting failed. Realistically
     /// can only fire if the clock is set before the epoch.
     #[error("internal: failed to format current timestamp as RFC3339")]
@@ -335,10 +364,11 @@ pub fn run_estimate_contamination(
         readers.push(reader);
     }
 
-    // 3. Cross-check references. Basename comparison only — the FASTA
-    //    bytes on disk are not hashed against the .psp per-contig MD5s.
-    //    Mirrors `run_var_calling`'s v1 contract; MD5 enforcement
-    //    against `--reference` is a follow-up.
+    // 3. Cross-check references — first by basename, then by
+    //    per-contig MD5 against the FASTA bytes. M5 follow-up from
+    //    the 2026-05-19 cohort CLI review closed the
+    //    "right basename, wrong genome build" failure mode that
+    //    the basename-only v1 contract left open.
     let supplied_ref = basename(&args.reference);
     for (path, reader) in args.psp_files.iter().zip(readers.iter()) {
         if reader.header().reference != supplied_ref {
@@ -349,6 +379,33 @@ pub fn run_estimate_contamination(
             });
         }
     }
+    // The .psp readers' chromosome tables must agree across the
+    // cohort before we can MD5-verify them as a single batch.
+    let chromosomes = check_chromosome_agreement(&readers)?;
+    // The side-pass itself does not need the FASTA bytes; the
+    // SyncRefFetcher exists solely to drive the MD5 verification
+    // and is dropped immediately afterwards so the in-memory
+    // contig cache does not occupy the process for the side-pass.
+    let verify_fetcher = SyncRefFetcher::new(&args.reference, contigs_from_parsed(&chromosomes))
+        .map_err(EstimateContaminationCliError::Io)?;
+    match verify_fasta_matches_psp_chromosomes(&verify_fetcher, &chromosomes) {
+        Ok(()) => {}
+        Err(FastaVerifyError::Md5Mismatch {
+            contig,
+            fasta_md5,
+            psp_md5,
+        }) => {
+            return Err(EstimateContaminationCliError::FastaContigMd5Mismatch {
+                contig,
+                fasta_md5,
+                psp_md5,
+            });
+        }
+        Err(FastaVerifyError::FetchFailed { contig, source }) => {
+            return Err(EstimateContaminationCliError::FastaContigFetchFailed { contig, source });
+        }
+    }
+    drop(verify_fetcher);
 
     // 4. Batch assignment.
     let batches = match &args.batch_assignment {
@@ -385,8 +442,9 @@ pub fn run_estimate_contamination(
     };
     cfg.validate()?;
 
-    // 7. Cross-check chromosomes across readers, then build merger.
-    let chromosomes = check_chromosome_agreement(&readers)?;
+    // 7. Build the merger from the .psp readers. Chromosome
+    //    agreement + FASTA MD5 cross-check happened earlier
+    //    (step 3); the `chromosomes` table from there is reused.
     let record_iters: Vec<_> = readers.iter_mut().map(|r| r.records()).collect();
     let merger = PerPositionMerger::new(record_iters, sample_names.clone(), chromosomes)?;
 

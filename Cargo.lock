@@ -841,6 +841,7 @@ dependencies = [
  "dhat",
  "flate2",
  "lru",
+ "md-5",
  "mimalloc",
  "noodles-bgzf",
  "noodles-core",

@@ -35,7 +35,8 @@ use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
 use crate::pop_var_caller::common::{
-    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, current_command_line,
+    DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
+    current_command_line, verify_fasta_matches_psp_chromosomes,
 };
 use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
@@ -167,6 +168,35 @@ pub enum VarCallingCliError {
     /// process. The binary calls it at most once.
     #[error("rayon thread pool already initialised — refusing to override")]
     RayonAlreadyConfigured,
+
+    /// FASTA contig bytes don't match the `.psp` header's
+    /// per-contig MD5. The basename cross-check (variant
+    /// `ReferenceMismatch`) is necessary but not sufficient — this
+    /// variant catches "right filename, wrong bytes" (e.g. the user
+    /// has a same-named FASTA pointing at a different genome
+    /// build). M5 follow-up from the 2026-05-19 cohort CLI review.
+    #[error(
+        "fasta `{contig}` bytes don't match the .psp header MD5 — \
+         fasta has `{fasta_md5}`, .psp has `{psp_md5}`"
+    )]
+    FastaContigMd5Mismatch {
+        contig: String,
+        fasta_md5: String,
+        psp_md5: String,
+    },
+
+    /// Failed to read a contig from the FASTA referenced by
+    /// `--reference` — the contig declared by the `.psp` is missing
+    /// (or unreadable) from the FASTA on disk. Distinguished from
+    /// `FastaContigMd5Mismatch` because the user-facing remediation
+    /// differs: the FASTA either doesn't contain the contig at all
+    /// or the `.fai` index is stale.
+    #[error("fasta `{contig}`: failed to read for MD5 verification — {source}")]
+    FastaContigFetchFailed {
+        contig: String,
+        #[source]
+        source: io::Error,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -266,6 +296,32 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     //    merger). The .psp header's chrom table is the source of truth.
     let fetcher_concrete = SyncRefFetcher::new(&args.reference, contigs_from_parsed(&chromosomes))
         .map_err(VarCallingCliError::Io)?;
+
+    // 7a. Cross-check FASTA bytes against the .psp per-contig MD5s.
+    //     Catches "right basename, wrong genome build" — the
+    //     basename check at step 3 was necessary but not sufficient.
+    //     M5 follow-up from the 2026-05-19 cohort CLI review. This
+    //     fetches every contig, so the SyncRefFetcher's in-memory
+    //     cache is warm by the time DUST / per-group merger start
+    //     pulling from it.
+    match verify_fasta_matches_psp_chromosomes(&fetcher_concrete, &chromosomes) {
+        Ok(()) => {}
+        Err(FastaVerifyError::Md5Mismatch {
+            contig,
+            fasta_md5,
+            psp_md5,
+        }) => {
+            return Err(VarCallingCliError::FastaContigMd5Mismatch {
+                contig,
+                fasta_md5,
+                psp_md5,
+            });
+        }
+        Err(FastaVerifyError::FetchFailed { contig, source }) => {
+            return Err(VarCallingCliError::FastaContigFetchFailed { contig, source });
+        }
+    }
+
     let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
 
     // 8. Cohort metadata for the writer header. Sourced from the
@@ -333,7 +389,7 @@ fn load_contamination(
 /// [`SyncRefFetcher`] constructor expects. `ContigList` lives in the
 /// CRAM input module — we re-shape the .psp `ParsedChromosome` into
 /// it. Md5 round-trips through hex when present.
-fn contigs_from_parsed(
+pub(crate) fn contigs_from_parsed(
     chromosomes: &[crate::per_sample_pileup::psp::header::ParsedChromosome],
 ) -> crate::per_sample_pileup::cram_input::ContigList {
     use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
