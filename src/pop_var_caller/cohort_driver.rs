@@ -29,7 +29,8 @@ use crate::var_calling::vcf_writer::{
 /// Bundle of per-stage configs + shared resources consumed by
 /// [`drive_cohort_pipeline`]. Constructed by the caller; consumed
 /// (by-value) when the driver runs.
-pub(crate) struct CohortPipelineParams {
+#[doc(hidden)]
+pub struct CohortPipelineParams {
     /// Whether to skip the DUST filter (set per-CLI by
     /// `--no-complexity-filter`).
     pub no_complexity_filter: bool,
@@ -61,7 +62,8 @@ pub(crate) struct CohortPipelineParams {
 /// `VarCallingFromBamCliError`); both enums already carry the five
 /// required `From` impls so the bounds are satisfied without further
 /// work.
-pub(crate) fn drive_cohort_pipeline<M, E>(
+#[doc(hidden)]
+pub fn drive_cohort_pipeline<M, E>(
     merger: M,
     params: CohortPipelineParams,
     output: &Path,

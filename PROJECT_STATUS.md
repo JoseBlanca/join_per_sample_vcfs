@@ -455,4 +455,24 @@ list is clear.
   (rayon-over-records, `--per-group-batch-size`, per-group batch
   sizing) — micro-benches alone can't catch end-to-end scaling
   artefacts.
+  - **`.psp` → cohort VCF arm — shipped 2026-05-19:**
+    [benches/cohort_e2e_perf.rs](benches/cohort_e2e_perf.rs). Two
+    bench-group families: `cohort_e2e_core/*` times
+    [`drive_cohort_pipeline`](src/pop_var_caller/cohort_driver.rs) in
+    isolation (PSP open + FASTA verify outside the timed region) with
+    sub-groups `scaling_samples` (N ∈ {10, 64, 256}), `scaling_region`
+    (L ∈ {1 000, 5 000, 20 000}), and `scaling_threads` (T ∈ {1, 2,
+    4, max-cores} via per-bench local `rayon::ThreadPool` +
+    `pool.install(...)`); `cohort_e2e_full/*` times
+    [`run_var_calling`](src/pop_var_caller/var_calling.rs) end-to-end
+    over `scaling_samples` + `scaling_region`. The full group cannot
+    sweep thread count within one `cargo bench` invocation —
+    `configure_rayon_pool` / `ThreadPoolBuilder::build_global` is
+    once-per-process; run separate invocations under
+    `RAYON_NUM_THREADS=N`. Bench-surface lift:
+    [`drive_cohort_pipeline`](src/pop_var_caller/cohort_driver.rs) +
+    `CohortPipelineParams` promoted from `pub(crate)` to
+    `#[doc(hidden)] pub`. 15 bench variants pass `cargo bench --bench
+    cohort_e2e_perf -- --test`.
+  - **CRAM → `.psp` arm:** still pending.
 

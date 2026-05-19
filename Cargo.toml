@@ -121,3 +121,7 @@ harness = false
 [[bench]]
 name = "var_calling_perf"
 harness = false
+
+[[bench]]
+name = "cohort_e2e_perf"
+harness = false
