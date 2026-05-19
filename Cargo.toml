@@ -2,6 +2,7 @@
 name = "pop_var_caller"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # Mi22: edition 2024 requires ≥ 1.85; the `let-chains` features
 # (e.g. `if let ... && ...` in header.rs) are stable since 1.88, so
 # 1.88 is the practical floor. `rust-toolchain.toml` pins 1.95 for

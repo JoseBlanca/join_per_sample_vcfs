@@ -65,3 +65,8 @@ mounted so login and per-project auto-memory persist.
 - Rootless podman maps container UID 0 to the host user, so files
   created inside the container appear with the correct ownership on
   the host.
+
+## License
+
+Licensed under the MIT License — see [LICENSE](LICENSE) for the full
+text.
