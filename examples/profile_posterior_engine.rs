@@ -188,8 +188,9 @@ fn main() {
         base_offset: 100,
     });
     let merged = pre_merge(groups, fetcher);
-    let mut config = PosteriorEngineConfig::with_project_defaults();
-    config.contamination = Some(representative_contamination(N_SAMPLES));
+    let config = PosteriorEngineConfig::with_project_defaults()
+        .with_contamination(Some(representative_contamination(N_SAMPLES)))
+        .expect("with_contamination is infallible today");
 
     eprintln!(
         "fixture built in {:?} ({} merged records)",

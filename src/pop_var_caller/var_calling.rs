@@ -365,20 +365,27 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     let grouper_cfg = GrouperConfig::new(args.var_group_max_span)?;
     let per_group_cfg =
         PerGroupMergerConfig::new(args.ploidy, args.max_alleles_per_var, DEFAULT_BATCH_SIZE)?;
-    let mut posterior_cfg = PosteriorEngineConfig::new(
-        args.em_convergence_threshold,
-        args.em_max_iterations,
-        args.ref_pseudocount,
-        args.snp_alt_pseudocount,
-        args.indel_alt_pseudocount,
-        args.compound_alt_pseudocount,
-        args.inbreeding_coefficient,
-        args.max_gq_phred,
-    )?;
-
-    // 6. Load contamination if supplied.
-    posterior_cfg.contamination =
-        load_contamination(args.contamination_estimates.as_deref(), &sample_names)?;
+    // 5. Build the posterior-engine config via the named-setter
+    //    builder chain. Every setter validates and returns
+    //    `Result<Self, _>` so a swap or out-of-range value surfaces
+    //    a typed error at construction time; the `contamination`
+    //    field is private and reachable only via
+    //    `with_contamination(...)`.
+    // 6. Load contamination if supplied; threaded into the engine
+    //    config through the same `with_contamination` setter.
+    let posterior_cfg = PosteriorEngineConfig::new()
+        .with_convergence_threshold(args.em_convergence_threshold)?
+        .with_max_iterations(args.em_max_iterations)?
+        .with_ref_pseudocount(args.ref_pseudocount)?
+        .with_snp_alt_pseudocount(args.snp_alt_pseudocount)?
+        .with_indel_alt_pseudocount(args.indel_alt_pseudocount)?
+        .with_compound_alt_pseudocount(args.compound_alt_pseudocount)?
+        .with_fixation_index_default(args.inbreeding_coefficient)?
+        .with_max_gq_phred(args.max_gq_phred)?
+        .with_contamination(load_contamination(
+            args.contamination_estimates.as_deref(),
+            &sample_names,
+        )?)?;
 
     // 7. Build the reference fetcher (shared between DUST + per-group
     //    merger). The .psp header's chrom table is the source of truth.

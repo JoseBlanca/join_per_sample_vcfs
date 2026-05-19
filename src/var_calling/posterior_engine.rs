@@ -164,6 +164,26 @@ const PHRED_SCALE: f64 = -10.0;
 const HOM_REF_GENOTYPE_IDX: usize = 0;
 
 /// Tunable knobs for the posterior engine.
+///
+/// **Construction.** Build via [`PosteriorEngineConfig::new`] (or
+/// [`Default::default()`], or
+/// [`with_project_defaults`](Self::with_project_defaults) — all
+/// three yield the project defaults) then chain `with_*` setters
+/// to override individual knobs:
+///
+/// ```ignore
+/// let cfg = PosteriorEngineConfig::new()
+///     .with_max_iterations(80)?
+///     .with_max_gq_phred(60.0)?
+///     .with_contamination(Some(estimates))?;
+/// ```
+///
+/// Every `with_*` setter returns `Result<Self, PosteriorEngineConfigError>`
+/// and validates the field's invariants on the way in. The
+/// `contamination` field is **private** — it can only be set via
+/// [`with_contamination`](Self::with_contamination), so any future
+/// cross-field invariant added to that setter cannot be bypassed
+/// by direct field assignment from outside the module.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PosteriorEngineConfig {
@@ -215,8 +235,15 @@ pub struct PosteriorEngineConfig {
     /// activates the mixture-likelihood E-step using the carried
     /// `c_s` and `q_b` values.
     ///
+    /// **Private.** Set via
+    /// [`with_contamination`](Self::with_contamination); the setter
+    /// runs whatever cross-field validation lands in future revisions
+    /// of this engine. Direct mutation from outside the module would
+    /// bypass that gate (this is the M4 fix from the 2026-05-19
+    /// cohort CLI review).
+    ///
     /// [`estimate_contamination`]: crate::var_calling::contamination_estimation::estimate_contamination
-    pub contamination: Option<ContaminationEstimates>,
+    contamination: Option<ContaminationEstimates>,
 }
 
 impl Default for PosteriorEngineConfig {
@@ -259,38 +286,30 @@ impl PosteriorEngineConfig {
         }
     }
 
-    /// Validated constructor — closes Stage 6 review finding **Mi12**.
-    /// Range bounds match the cohort CLI plan's "Config validation"
-    /// table; the CLI side mirrors these in [`value_parser`] hooks.
+    /// Construct with the project defaults; equivalent to
+    /// [`with_project_defaults`](Self::with_project_defaults) and
+    /// [`Default::default()`]. Defaults are documented on
+    /// `with_project_defaults` and are guaranteed valid by
+    /// construction, so [`Self::new`] is infallible.
     ///
-    /// Sets `fixation_index_overrides` to `None`,
-    /// `approximate_posterior_calculation` to `false`, and
-    /// `contamination` to `None`. Library callers can tweak those fields
-    /// directly after construction.
+    /// Chain `with_*` setters to override individual knobs; each
+    /// setter validates and returns `Result<Self, _>`:
     ///
-    /// # Errors
-    ///
-    /// Each `PosteriorEngineConfigError` variant names the rejected
-    /// field and value. Validation rules in order of fields above:
-    ///
-    /// * `convergence_threshold`: finite, in `(0.0, 0.1]`.
-    /// * `max_iterations`: in `1..=500`.
-    /// * `ref_pseudocount`, `snp_alt_pseudocount`, `indel_alt_pseudocount`,
-    ///   `compound_alt_pseudocount`: each finite, in `(0.0, 1000.0]`.
-    /// * `fixation_index_default`: finite, in `[0.0, 1.0]`.
-    /// * `max_gq_phred`: finite, in `(10.0, 200.0]`.
-    ///
-    /// [`value_parser`]: https://docs.rs/clap/latest/clap/builder/struct.Arg.html#method.value_parser
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    /// ```ignore
+    /// let cfg = PosteriorEngineConfig::new()
+    ///     .with_max_iterations(80)?
+    ///     .with_max_gq_phred(60.0)?
+    ///     .with_contamination(Some(estimates))?;
+    /// ```
+    pub fn new() -> Self {
+        Self::with_project_defaults()
+    }
+
+    /// Validating setter for `convergence_threshold` — finite, in
+    /// `(0.0, CONVERGENCE_THRESHOLD_RANGE_MAX]` (i.e. `(0.0, 0.1]`).
+    pub fn with_convergence_threshold(
+        mut self,
         convergence_threshold: f64,
-        max_iterations: u32,
-        ref_pseudocount: f64,
-        snp_alt_pseudocount: f64,
-        indel_alt_pseudocount: f64,
-        compound_alt_pseudocount: f64,
-        fixation_index_default: f64,
-        max_gq_phred: f64,
     ) -> Result<Self, PosteriorEngineConfigError> {
         if !(convergence_threshold.is_finite()
             && 0.0 < convergence_threshold
@@ -300,49 +319,124 @@ impl PosteriorEngineConfig {
                 got: convergence_threshold,
             });
         }
+        self.convergence_threshold = convergence_threshold;
+        Ok(self)
+    }
+
+    /// Validating setter for `max_iterations` — in
+    /// `1..=MAX_ITERATIONS_RANGE_MAX` (i.e. `1..=500`).
+    pub fn with_max_iterations(
+        mut self,
+        max_iterations: u32,
+    ) -> Result<Self, PosteriorEngineConfigError> {
         if !(1..=MAX_ITERATIONS_RANGE_MAX).contains(&max_iterations) {
             return Err(PosteriorEngineConfigError::InvalidMaxIterations {
                 got: max_iterations,
             });
         }
-        for (name, value) in [
-            ("ref_pseudocount", ref_pseudocount),
-            ("snp_alt_pseudocount", snp_alt_pseudocount),
-            ("indel_alt_pseudocount", indel_alt_pseudocount),
-            ("compound_alt_pseudocount", compound_alt_pseudocount),
-        ] {
-            if !(value.is_finite() && 0.0 < value && value <= PSEUDOCOUNT_RANGE_MAX) {
-                return Err(PosteriorEngineConfigError::InvalidPseudocount {
-                    field: name,
-                    got: value,
-                });
-            }
-        }
+        self.max_iterations = max_iterations;
+        Ok(self)
+    }
+
+    /// Validating setter for `ref_pseudocount` — finite, in
+    /// `(0.0, PSEUDOCOUNT_RANGE_MAX]`.
+    pub fn with_ref_pseudocount(
+        mut self,
+        ref_pseudocount: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        validate_pseudocount("ref_pseudocount", ref_pseudocount)?;
+        self.ref_pseudocount = ref_pseudocount;
+        Ok(self)
+    }
+
+    /// Validating setter for `snp_alt_pseudocount` — finite, in
+    /// `(0.0, PSEUDOCOUNT_RANGE_MAX]`.
+    pub fn with_snp_alt_pseudocount(
+        mut self,
+        snp_alt_pseudocount: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        validate_pseudocount("snp_alt_pseudocount", snp_alt_pseudocount)?;
+        self.snp_alt_pseudocount = snp_alt_pseudocount;
+        Ok(self)
+    }
+
+    /// Validating setter for `indel_alt_pseudocount` — finite, in
+    /// `(0.0, PSEUDOCOUNT_RANGE_MAX]`.
+    pub fn with_indel_alt_pseudocount(
+        mut self,
+        indel_alt_pseudocount: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        validate_pseudocount("indel_alt_pseudocount", indel_alt_pseudocount)?;
+        self.indel_alt_pseudocount = indel_alt_pseudocount;
+        Ok(self)
+    }
+
+    /// Validating setter for `compound_alt_pseudocount` — finite, in
+    /// `(0.0, PSEUDOCOUNT_RANGE_MAX]`.
+    pub fn with_compound_alt_pseudocount(
+        mut self,
+        compound_alt_pseudocount: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        validate_pseudocount("compound_alt_pseudocount", compound_alt_pseudocount)?;
+        self.compound_alt_pseudocount = compound_alt_pseudocount;
+        Ok(self)
+    }
+
+    /// Validating setter for `fixation_index_default` — finite, in
+    /// `[0.0, 1.0]`.
+    pub fn with_fixation_index_default(
+        mut self,
+        fixation_index_default: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
         if !(fixation_index_default.is_finite() && (0.0..=1.0).contains(&fixation_index_default)) {
             return Err(PosteriorEngineConfigError::InvalidFixationIndex {
                 got: fixation_index_default,
             });
         }
+        self.fixation_index_default = fixation_index_default;
+        Ok(self)
+    }
+
+    /// Validating setter for `max_gq_phred` — finite, in
+    /// `(GQ_PHRED_RANGE_MIN_EXCLUSIVE, GQ_PHRED_RANGE_MAX]`
+    /// (i.e. `(10.0, 200.0]`).
+    pub fn with_max_gq_phred(
+        mut self,
+        max_gq_phred: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
         if !(max_gq_phred.is_finite()
             && GQ_PHRED_RANGE_MIN_EXCLUSIVE < max_gq_phred
             && max_gq_phred <= GQ_PHRED_RANGE_MAX)
         {
             return Err(PosteriorEngineConfigError::InvalidMaxGqPhred { got: max_gq_phred });
         }
-        Ok(Self {
-            convergence_threshold,
-            max_iterations,
-            ref_pseudocount,
-            snp_alt_pseudocount,
-            indel_alt_pseudocount,
-            compound_alt_pseudocount,
-            fixation_index_default,
-            fixation_index_overrides: None,
-            max_gq_phred,
-            approximate_posterior_calculation: false,
-            contamination: None,
-        })
+        self.max_gq_phred = max_gq_phred;
+        Ok(self)
     }
+
+    /// Validating setter for the private `contamination` field. The
+    /// only public path to set the contamination state; closes
+    /// **M4** from the 2026-05-19 cohort CLI review by forcing any
+    /// future cross-field invariant through this setter rather than
+    /// allowing it to be bypassed via direct field assignment.
+    /// Currently no cross-field invariants are checked; the setter
+    /// is the place to add them.
+    pub fn with_contamination(
+        mut self,
+        contamination: Option<ContaminationEstimates>,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        self.contamination = contamination;
+        Ok(self)
+    }
+}
+
+/// Shared validator for the four `*_pseudocount` setters. Keeps the
+/// "field name + value" error shape consistent across them.
+fn validate_pseudocount(field: &'static str, value: f64) -> Result<(), PosteriorEngineConfigError> {
+    if !(value.is_finite() && 0.0 < value && value <= PSEUDOCOUNT_RANGE_MAX) {
+        return Err(PosteriorEngineConfigError::InvalidPseudocount { field, got: value });
+    }
+    Ok(())
 }
 
 /// Config-construction errors for [`PosteriorEngineConfig::new`].
@@ -4421,36 +4515,32 @@ mod tests {
         }
     }
 
-    // ---------- PosteriorEngineConfig::new validation tests ----------
-
-    fn default_new_args() -> (f64, u32, f64, f64, f64, f64, f64, f64) {
-        (
-            DEFAULT_CONVERGENCE_THRESHOLD,
-            DEFAULT_MAX_ITERATIONS,
-            DEFAULT_REF_PSEUDOCOUNT,
-            DEFAULT_SNP_ALT_PSEUDOCOUNT,
-            DEFAULT_INDEL_ALT_PSEUDOCOUNT,
-            DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-            DEFAULT_INBREEDING_COEFFICIENT,
-            DEFAULT_MAX_GQ_PHRED,
-        )
-    }
+    // ---------- PosteriorEngineConfig builder validation tests -----
 
     #[test]
-    fn config_new_accepts_defaults() {
-        let (a, b, c, d, e, f, g, h) = default_new_args();
-        let cfg = PosteriorEngineConfig::new(a, b, c, d, e, f, g, h).unwrap();
+    fn config_new_returns_project_defaults() {
+        let cfg = PosteriorEngineConfig::new();
         assert_eq!(cfg.convergence_threshold, DEFAULT_CONVERGENCE_THRESHOLD);
         assert_eq!(cfg.max_iterations, DEFAULT_MAX_ITERATIONS);
+        assert_eq!(cfg.ref_pseudocount, DEFAULT_REF_PSEUDOCOUNT);
+        assert_eq!(cfg.snp_alt_pseudocount, DEFAULT_SNP_ALT_PSEUDOCOUNT);
+        assert_eq!(cfg.indel_alt_pseudocount, DEFAULT_INDEL_ALT_PSEUDOCOUNT);
+        assert_eq!(
+            cfg.compound_alt_pseudocount,
+            DEFAULT_COMPOUND_ALT_PSEUDOCOUNT
+        );
+        assert_eq!(cfg.fixation_index_default, DEFAULT_INBREEDING_COEFFICIENT);
         assert!(cfg.fixation_index_overrides.is_none());
+        assert_eq!(cfg.max_gq_phred, DEFAULT_MAX_GQ_PHRED);
         assert!(!cfg.approximate_posterior_calculation);
         assert!(cfg.contamination.is_none());
     }
 
     #[test]
-    fn config_new_rejects_nan_threshold() {
-        let (_, b, c, d, e, f, g, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(f64::NAN, b, c, d, e, f, g, h).unwrap_err();
+    fn with_convergence_threshold_rejects_nan() {
+        let err = PosteriorEngineConfig::new()
+            .with_convergence_threshold(f64::NAN)
+            .unwrap_err();
         assert!(matches!(
             err,
             PosteriorEngineConfigError::InvalidConvergenceThreshold { .. }
@@ -4458,9 +4548,10 @@ mod tests {
     }
 
     #[test]
-    fn config_new_rejects_zero_threshold() {
-        let (_, b, c, d, e, f, g, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(0.0, b, c, d, e, f, g, h).unwrap_err();
+    fn with_convergence_threshold_rejects_zero() {
+        let err = PosteriorEngineConfig::new()
+            .with_convergence_threshold(0.0)
+            .unwrap_err();
         assert!(matches!(
             err,
             PosteriorEngineConfigError::InvalidConvergenceThreshold { .. }
@@ -4468,11 +4559,10 @@ mod tests {
     }
 
     #[test]
-    fn config_new_rejects_threshold_just_above_max() {
-        let (_, b, c, d, e, f, g, h) = default_new_args();
-        let err =
-            PosteriorEngineConfig::new(CONVERGENCE_THRESHOLD_RANGE_MAX + 1e-9, b, c, d, e, f, g, h)
-                .unwrap_err();
+    fn with_convergence_threshold_rejects_just_above_max() {
+        let err = PosteriorEngineConfig::new()
+            .with_convergence_threshold(CONVERGENCE_THRESHOLD_RANGE_MAX + 1e-9)
+            .unwrap_err();
         assert!(matches!(
             err,
             PosteriorEngineConfigError::InvalidConvergenceThreshold { .. }
@@ -4480,15 +4570,17 @@ mod tests {
     }
 
     #[test]
-    fn config_new_accepts_threshold_at_max() {
-        let (_, b, c, d, e, f, g, h) = default_new_args();
-        PosteriorEngineConfig::new(CONVERGENCE_THRESHOLD_RANGE_MAX, b, c, d, e, f, g, h).unwrap();
+    fn with_convergence_threshold_accepts_max() {
+        PosteriorEngineConfig::new()
+            .with_convergence_threshold(CONVERGENCE_THRESHOLD_RANGE_MAX)
+            .unwrap();
     }
 
     #[test]
-    fn config_new_rejects_zero_iterations() {
-        let (a, _, c, d, e, f, g, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(a, 0, c, d, e, f, g, h).unwrap_err();
+    fn with_max_iterations_rejects_zero() {
+        let err = PosteriorEngineConfig::new()
+            .with_max_iterations(0)
+            .unwrap_err();
         assert_eq!(
             err,
             PosteriorEngineConfigError::InvalidMaxIterations { got: 0 }
@@ -4496,9 +4588,9 @@ mod tests {
     }
 
     #[test]
-    fn config_new_rejects_iterations_above_max() {
-        let (a, _, c, d, e, f, g, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(a, MAX_ITERATIONS_RANGE_MAX + 1, c, d, e, f, g, h)
+    fn with_max_iterations_rejects_above_max() {
+        let err = PosteriorEngineConfig::new()
+            .with_max_iterations(MAX_ITERATIONS_RANGE_MAX + 1)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -4507,22 +4599,9 @@ mod tests {
     }
 
     #[test]
-    fn config_new_rejects_zero_pseudocount() {
-        let (a, b, _, d, e, f, g, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(a, b, 0.0, d, e, f, g, h).unwrap_err();
-        assert!(matches!(
-            err,
-            PosteriorEngineConfigError::InvalidPseudocount {
-                field: "ref_pseudocount",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn config_new_rejects_pseudocount_above_max() {
-        let (a, b, _, d, e, f, g, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(a, b, PSEUDOCOUNT_RANGE_MAX + 1.0, d, e, f, g, h)
+    fn with_ref_pseudocount_rejects_zero() {
+        let err = PosteriorEngineConfig::new()
+            .with_ref_pseudocount(0.0)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -4534,9 +4613,42 @@ mod tests {
     }
 
     #[test]
-    fn config_new_rejects_inbreeding_above_one() {
-        let (a, b, c, d, e, f, _, h) = default_new_args();
-        let err = PosteriorEngineConfig::new(a, b, c, d, e, f, 1.5, h).unwrap_err();
+    fn with_ref_pseudocount_rejects_above_max() {
+        let err = PosteriorEngineConfig::new()
+            .with_ref_pseudocount(PSEUDOCOUNT_RANGE_MAX + 1.0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidPseudocount {
+                field: "ref_pseudocount",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn with_indel_alt_pseudocount_rejects_zero_names_its_own_field() {
+        // Mi2 swap-risk regression: every pseudocount setter must
+        // surface the field name in the error, so an
+        // out-of-range value in the chained call is unambiguous
+        // about which knob the caller meant.
+        let err = PosteriorEngineConfig::new()
+            .with_indel_alt_pseudocount(0.0)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidPseudocount {
+                field: "indel_alt_pseudocount",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn with_fixation_index_default_rejects_above_one() {
+        let err = PosteriorEngineConfig::new()
+            .with_fixation_index_default(1.5)
+            .unwrap_err();
         assert!(matches!(
             err,
             PosteriorEngineConfigError::InvalidFixationIndex { .. }
@@ -4544,16 +4656,19 @@ mod tests {
     }
 
     #[test]
-    fn config_new_accepts_inbreeding_boundaries() {
-        let (a, b, c, d, e, f, _, h) = default_new_args();
-        PosteriorEngineConfig::new(a, b, c, d, e, f, 0.0, h).unwrap();
-        PosteriorEngineConfig::new(a, b, c, d, e, f, 1.0, h).unwrap();
+    fn with_fixation_index_default_accepts_boundaries() {
+        PosteriorEngineConfig::new()
+            .with_fixation_index_default(0.0)
+            .unwrap();
+        PosteriorEngineConfig::new()
+            .with_fixation_index_default(1.0)
+            .unwrap();
     }
 
     #[test]
-    fn config_new_rejects_max_gq_below_min() {
-        let (a, b, c, d, e, f, g, _) = default_new_args();
-        let err = PosteriorEngineConfig::new(a, b, c, d, e, f, g, GQ_PHRED_RANGE_MIN_EXCLUSIVE)
+    fn with_max_gq_phred_rejects_at_min_exclusive() {
+        let err = PosteriorEngineConfig::new()
+            .with_max_gq_phred(GQ_PHRED_RANGE_MIN_EXCLUSIVE)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -4562,10 +4677,10 @@ mod tests {
     }
 
     #[test]
-    fn config_new_rejects_max_gq_above_max() {
-        let (a, b, c, d, e, f, g, _) = default_new_args();
-        let err =
-            PosteriorEngineConfig::new(a, b, c, d, e, f, g, GQ_PHRED_RANGE_MAX + 0.1).unwrap_err();
+    fn with_max_gq_phred_rejects_above_max() {
+        let err = PosteriorEngineConfig::new()
+            .with_max_gq_phred(GQ_PHRED_RANGE_MAX + 0.1)
+            .unwrap_err();
         assert!(matches!(
             err,
             PosteriorEngineConfigError::InvalidMaxGqPhred { .. }
@@ -4573,8 +4688,20 @@ mod tests {
     }
 
     #[test]
-    fn config_new_accepts_max_gq_at_max() {
-        let (a, b, c, d, e, f, g, _) = default_new_args();
-        PosteriorEngineConfig::new(a, b, c, d, e, f, g, GQ_PHRED_RANGE_MAX).unwrap();
+    fn with_max_gq_phred_accepts_max() {
+        PosteriorEngineConfig::new()
+            .with_max_gq_phred(GQ_PHRED_RANGE_MAX)
+            .unwrap();
+    }
+
+    #[test]
+    fn with_contamination_round_trips() {
+        // M4: the only public path to set `contamination` is the
+        // validating setter, which today is the identity but
+        // reserves the slot for future cross-field checks.
+        let cfg = PosteriorEngineConfig::new()
+            .with_contamination(None)
+            .unwrap();
+        assert!(cfg.contamination.is_none());
     }
 }

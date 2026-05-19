@@ -703,8 +703,9 @@ fn bench_posterior_engine(c: &mut Criterion) {
     );
 
     let config_no_contam = PosteriorEngineConfig::with_project_defaults();
-    let mut config_contam = PosteriorEngineConfig::with_project_defaults();
-    config_contam.contamination = Some(representative_contamination(N_SAMPLES));
+    let config_contam = PosteriorEngineConfig::with_project_defaults()
+        .with_contamination(Some(representative_contamination(N_SAMPLES)))
+        .expect("with_contamination is infallible today");
 
     // --- biallelic SNP, no contamination (dominant production case) ---
     bench_posterior_drain(

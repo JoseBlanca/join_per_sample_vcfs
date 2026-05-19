@@ -189,8 +189,9 @@ fn side_pass_output_feeds_stage_6_without_error() {
     let lls_per_sample = vec![vec![0.0_f64; n_genotypes]; 3];
     let record = merged_record(0, 100, alleles_seqs, 2, scalars_per_sample, lls_per_sample);
 
-    let mut config = PosteriorEngineConfig::default();
-    config.contamination = Some(estimates);
+    let config = PosteriorEngineConfig::new()
+        .with_contamination(Some(estimates))
+        .expect("with_contamination is infallible today");
     let upstream = std::iter::once(Ok::<MergedRecord, PerGroupMergerError>(record));
     let outputs: Vec<_> = PosteriorEngine::with_config(upstream, config).collect();
     assert_eq!(outputs.len(), 1);
@@ -245,9 +246,11 @@ fn mixture_branch_shifts_posteriors_relative_to_no_contamination_baseline() {
     let record_baseline =
         merged_record(0, 100, alleles_seqs, 2, scalars_per_sample, lls_per_sample);
 
-    let mut config_contam = PosteriorEngineConfig::default();
-    config_contam.contamination = Some(estimates);
-    config_contam.ref_pseudocount = 0.1; // don't let pseudocount swamp 10-read signal
+    let config_contam = PosteriorEngineConfig::new()
+        .with_contamination(Some(estimates))
+        .unwrap()
+        .with_ref_pseudocount(0.1) // don't let pseudocount swamp 10-read signal
+        .unwrap();
     let pr_contam: PosteriorRecord = PosteriorEngine::with_config(
         std::iter::once(Ok::<MergedRecord, PerGroupMergerError>(record_contam)),
         config_contam,
@@ -348,9 +351,11 @@ fn user_supplied_estimates_round_trip_via_zero_constructor() {
         PerGroupMergerError,
     >(record_baseline)))
     .collect();
-    let mut config = PosteriorEngineConfig::default();
-    config.contamination =
-        Some(ContaminationEstimates::zero(2, vec![0, 0], 1).expect("valid inputs"));
+    let config = PosteriorEngineConfig::new()
+        .with_contamination(Some(
+            ContaminationEstimates::zero(2, vec![0, 0], 1).expect("valid inputs"),
+        ))
+        .unwrap();
     let mirrored: Vec<_> = PosteriorEngine::with_config(
         std::iter::once(Ok::<MergedRecord, PerGroupMergerError>(record_zero)),
         config,

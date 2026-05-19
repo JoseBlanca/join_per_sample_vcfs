@@ -453,18 +453,23 @@ pub fn run_var_calling_from_bam(
     let grouper_cfg = GrouperConfig::new(args.var_group_max_span)?;
     let per_group_cfg =
         PerGroupMergerConfig::new(args.ploidy, args.max_alleles_per_var, DEFAULT_BATCH_SIZE)?;
-    let mut posterior_cfg = PosteriorEngineConfig::new(
-        args.em_convergence_threshold,
-        args.em_max_iterations,
-        args.ref_pseudocount,
-        args.snp_alt_pseudocount,
-        args.indel_alt_pseudocount,
-        args.compound_alt_pseudocount,
-        args.inbreeding_coefficient,
-        args.max_gq_phred,
-    )?;
-    // No contamination — explicit "none" sentinel.
-    posterior_cfg.contamination = None;
+    // Build the posterior-engine config via the validating
+    // builder chain. The `from-bam` subcommand has no
+    // `--contamination-estimates` surface, so `contamination`
+    // stays at the project default (`None`); the explicit setter
+    // call is kept as a "no contamination here" anchor for
+    // future maintainers reading this flow alongside
+    // `var_calling.rs`.
+    let posterior_cfg = PosteriorEngineConfig::new()
+        .with_convergence_threshold(args.em_convergence_threshold)?
+        .with_max_iterations(args.em_max_iterations)?
+        .with_ref_pseudocount(args.ref_pseudocount)?
+        .with_snp_alt_pseudocount(args.snp_alt_pseudocount)?
+        .with_indel_alt_pseudocount(args.indel_alt_pseudocount)?
+        .with_compound_alt_pseudocount(args.compound_alt_pseudocount)?
+        .with_fixation_index_default(args.inbreeding_coefficient)?
+        .with_max_gq_phred(args.max_gq_phred)?
+        .with_contamination(None)?;
 
     // 4. Drive the Stage 1 chain via the shared helper. The named
     //    helper `run_cohort_pipeline_for_single_sample` takes the
