@@ -21,23 +21,23 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI slice landed 2026-05-19 —
->   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md).
->   Ten sequential commits on `main` (`1523049` through `147e435`)
->   delivering three new subcommands: `var-calling`,
->   `estimate-contamination`, and `var-calling-from-bam`. The
->   pipeline now runs end-to-end from `.psp` files (cohort path) or
->   directly from CRAM (single-sample one-off path) to multi-sample
->   VCF. The `var-calling-from-bam` path is borrow-free — no temp
->   `.psp` is ever written, per the
->   `feedback_no_silent_intermediates` user preference. Stage 1's
->   `run_pileup` was refactored to share a new
->   `with_stage1_pipeline` helper with the from-bam path. Stage 6
->   review items M3 and Mi12 closed (engine-side
->   `Config::new -> Result` validators landed). 880 lib tests + new
->   `tests/cohort_cli_integration.rs` covering three end-to-end
->   paths (full chained workflow, from-bam, contamination-sample
->   reconciliation). Plan: [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md).
+> - **Last completed task:** Cohort CLI slice reviewed 2026-05-19 —
+>   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md).
+>   Request-changes: 0 Blockers, 14 Major, 23 Minor + grouped Nits
+>   across reliability / errors / naming / defaults / idiomatic /
+>   refactor_safety / unsafe_concurrency / smells / tooling / extras.
+>   Top 3 priorities are **M1** (stashed CRAM-input error silently
+>   dropped on closure-Err in `with_stage1_pipeline`), **M5**
+>   (reference cross-check is basename-only; plan claimed MD5
+>   enforcement against `--reference`), and **M14** (`cargo doc
+>   --no-deps` failing on 5 new broken intra-doc links). Six numbered
+>   open questions gate several findings.
+>   The reviewed slice landed earlier on 2026-05-19 in commits
+>   `1523049` through `147e435` (impl report:
+>   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)),
+>   delivering three new subcommands (`var-calling`,
+>   `estimate-contamination`, `var-calling-from-bam`). Plan:
+>   [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md).
 > - **Next task:** _set by human PM._ Standing candidates: the
 >   manual `bcftools view` / `bcftools stats` smoke against real
 >   cohort data (the synthetic fixture in the integration tests is
@@ -96,8 +96,9 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Open:** none
 
 #### `pop_var_caller` CLI
-- **Status:** shipped (subcommands `pileup`, `psp-to-pileup`,
-  `var-calling`, `estimate-contamination`, `var-calling-from-bam`)
+- **Status:** Stage 1 CLI shipped (subcommands `pileup`, `psp-to-pileup`);
+  cohort CLI reviewed (subcommands `var-calling`,
+  `estimate-contamination`, `var-calling-from-bam`)
 - **Plans:**
   - Stage 1 CLI (`pileup`, `psp-to-pileup`):
     [pop_var_caller_pileup_cli.md](doc/devel/implementation_plans/pop_var_caller_pileup_cli.md)
@@ -106,14 +107,67 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
     [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md)
 - **Impl report (cohort slice):**
   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
+- **Latest review (cohort slice):**
+  [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
+  Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped
+  Nits. Top 3: M1 stashed CRAM-input error dropped on closure-Err in
+  `with_stage1_pipeline`; M5 reference cross-check is basename-only
+  (plan claimed MD5 enforcement against `--reference`); M14 `cargo
+  doc --no-deps` fails on 5 new broken intra-doc links.
 - **Code:** [src/pop_var_caller/](src/pop_var_caller/)
 - **Integration tests:**
   [tests/pileup_cli_integration.rs](tests/pileup_cli_integration.rs)
   (Stage 1) and
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
-- **Open:** `bcftools view` / `bcftools stats` manual smoke against
-  real cohort data; shared `tests/common/` fixture helpers.
+- **Open (from cohort-slice review):**
+  - **M1** — `stage1_pipeline.rs:167` silently drops stashed CRAM
+    error when closure returns Err; prefer the stash over the closure
+    error.
+  - **M2** — walker-error stash path in `var_calling-from-bam` is end-
+    to-end untested.
+  - **M3** — silent `unwrap_or_default()` on missing MD5 + truncating
+    `as u32` cast in the DUST branch of `var_calling_from_bam.rs:525-540`.
+  - **M4** — post-construction mutation of `posterior_cfg.contamination`
+    bypasses future engine validation.
+  - **M5** — reference cross-check is basename-only (`var_calling.rs:335-348`,
+    mirror in `estimate_contamination.rs`); plan claimed FASTA-MD5
+    enforcement.
+  - **M6** — iterator error in `run_var_calling` leaves `<output>.tmp`
+    orphaned; no parity with `run_pileup` / `run_var_calling_from_bam`.
+  - **M7** — `Q_B_SIMPLEX_TOLERANCE = 1e-9` doc says "looser than 1e-6"
+    but value is stricter (open question 1).
+  - **M8** — `WriterConfig` lacks `#[non_exhaustive]`; the
+    `default_filter_pass` drop is an unannounced breaking change for
+    downstream consumers.
+  - **M9** — Inline `Iterator::scan` reinvents `ErrorSheddingAdapter`;
+    module-doc `WalkerErrorSheddingAdapter` references a phantom type.
+  - **M10** — `VarCallingFromBamArgs` duplicates ~30 fields of
+    `VarCallingArgs` + `PileupArgs` (3rd copy); extract via
+    `#[command(flatten)]` sub-structs.
+  - **M11** — Cohort pipeline wiring duplicated near-verbatim between
+    `var_calling.rs` and `var_calling_from_bam.rs`.
+  - **M12** — ~95-line closure in `run_var_calling_from_bam`; extract
+    to named helper.
+  - **M13** — Three `rayon::ThreadPoolBuilder::build_global()` sites
+    with no in-process coordination; second-call hazard for library
+    consumers (open question 2).
+  - **M14** — `cargo doc --no-deps` fails: 5 new broken intra-doc
+    links (`batch_assignment.rs:30` `Self::batch_for`,
+    `contamination_artifact.rs:56` `Self::to_estimates_for_samples`,
+    `contamination_artifact.rs:277` `ContaminationEstimateSource::UserSupplied`,
+    `stage1_pipeline.rs:15` `[feedback_no_silent_intermediates]`,
+    `var_calling_from_bam.rs:13` `WalkerErrorSheddingAdapter`) plus
+    `estimate_contamination.rs:296` redundant-link warning.
+  - **Mi1–Mi23** — see review report for details; biggest groups are
+    helper duplication across 3–4 modules (Mi8), missing integration
+    tests including the load-bearing `estimate-contamination →
+    var-calling` chain test (Mi23), and CRLF body-row handling in
+    `BatchAssignment` (Mi7 — "Needs verification": may promote to
+    Major if a CRLF fixture confirms the corrupt-label bug).
+  - `bcftools view` / `bcftools stats` manual smoke against real
+    cohort data (pre-existing).
+  - Shared `tests/common/` fixture helpers (Mi20, pre-existing).
 
 ---
 
@@ -382,6 +436,15 @@ list is clear.
 - **Phase-chain integration tests.** Add integration tests asserting that
   phase chains are correctly carried through the Stage 5 likelihood
   calculation. Source: [doc/devel/TODO.txt](doc/devel/TODO.txt).
+- **Parallel-optimization integration perf benches.** Build end-to-end
+  criterion (or equivalent) benches that measure wall time for the two
+  pipeline arms whose parallelism still needs tuning: CRAM → `.psp`
+  (Stage 1, `pileup` / `var-calling-from-bam`) and `.psp` → cohort VCF
+  (Stages 3–6, `var-calling`). These integration benches are the
+  ground truth for the deferred parallelisation-tuning pass
+  (rayon-over-records, `--per-group-batch-size`, per-group batch
+  sizing) — micro-benches alone can't catch end-to-end scaling
+  artefacts.
 
 ---
 
