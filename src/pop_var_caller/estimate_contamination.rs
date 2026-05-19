@@ -145,6 +145,7 @@ pub struct EstimateContaminationArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_MIN_COHORT_MINOR_COUNT,
+        value_parser = parsers::parse_min_cohort_minor_count,
         help_heading = "Advanced — Informative-site cuts",
     )]
     pub min_cohort_minor_count: u32,
@@ -177,7 +178,7 @@ pub struct EstimateContaminationArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_REF_PSEUDOCOUNT,
-        value_parser = parsers::parse_contam_pseudocount,
+        value_parser = parsers::parse_ref_pseudocount,
         help_heading = "Advanced — Priors",
     )]
     pub ref_pseudocount: f64,
@@ -187,7 +188,7 @@ pub struct EstimateContaminationArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_SNP_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_contam_pseudocount,
+        value_parser = parsers::parse_snp_alt_pseudocount,
         help_heading = "Advanced — Priors",
     )]
     pub snp_alt_pseudocount: f64,
@@ -197,7 +198,7 @@ pub struct EstimateContaminationArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_INDEL_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_contam_pseudocount,
+        value_parser = parsers::parse_indel_alt_pseudocount,
         help_heading = "Advanced — Priors",
     )]
     pub indel_alt_pseudocount: f64,
@@ -271,6 +272,18 @@ pub enum EstimateContaminationCliError {
     /// can only fire if the clock is set before the epoch.
     #[error("internal: failed to format current timestamp as RFC3339")]
     TimestampFormat,
+
+    /// The contamination engine returned a `ContaminationEstimateSource`
+    /// other than `SidePass` — meaning the engine's public API
+    /// reshaped while this orchestrator was not updated in lockstep.
+    /// Surfacing as a typed error rather than silently reporting
+    /// `sites_processed = 0` matches the project's "no logs — promote
+    /// to typed errors" rule.
+    #[error(
+        "internal: contamination engine returned an unexpected source variant ({got}); \
+         the orchestrator expects `SidePass`. Engine API drift?"
+    )]
+    UnexpectedEstimateSource { got: String },
 }
 
 // ---------------------------------------------------------------------
@@ -293,7 +306,7 @@ pub enum EstimateContaminationCliError {
 ///    over the cohort).
 /// 7. Run [`estimate_contamination`].
 /// 8. Convert the engine-side
-///    [`ContaminationEstimates`](crate::var_calling::contamination_estimation::ContaminationEstimates)
+///    [`ContaminationEstimates`]
 ///    into a [`ContaminationArtefact`] and write it via atomic
 ///    tmp+rename.
 /// 9. Print a one-shot stderr run-summary block.
@@ -317,7 +330,10 @@ pub fn run_estimate_contamination(
         readers.push(reader);
     }
 
-    // 3. Cross-check references.
+    // 3. Cross-check references. Basename comparison only — the FASTA
+    //    bytes on disk are not hashed against the .psp per-contig MD5s.
+    //    Mirrors `run_var_calling`'s v1 contract; MD5 enforcement
+    //    against `--reference` is a follow-up.
     let supplied_ref = basename(&args.reference);
     for (path, reader) in args.psp_files.iter().zip(readers.iter()) {
         if reader.header().reference != supplied_ref {
@@ -384,7 +400,7 @@ pub fn run_estimate_contamination(
     artefact.write(&args.output)?;
 
     // 10. Stderr summary.
-    print_run_summary(&estimates, &sample_names, &batch_id_for_idx);
+    print_run_summary(&estimates, &sample_names, &batch_id_for_idx)?;
 
     Ok(())
 }
@@ -571,15 +587,21 @@ fn print_run_summary(
     estimates: &ContaminationEstimates,
     sample_names: &[String],
     batch_id_for_idx: &[String],
-) {
+) -> Result<(), EstimateContaminationCliError> {
     let sites_processed = match &estimates.source {
         ContaminationEstimateSource::SidePass {
             sites_processed, ..
         } => *sites_processed,
-        // The contamination subcommand always runs the side-pass, so
-        // any other variant would mean the engine reshaped its API
-        // and the orchestrator wasn't updated.
-        _ => 0,
+        // The contamination subcommand always drives the side-pass.
+        // Any other variant means the engine reshaped its public API
+        // and this orchestrator was not updated in lockstep — surface
+        // as a typed error rather than silently reporting `sites_processed=0`.
+        // The project's "no logs — promote to typed errors" rule applies.
+        other => {
+            return Err(EstimateContaminationCliError::UnexpectedEstimateSource {
+                got: format!("{other:?}"),
+            });
+        }
     };
     let mut floored: usize = 0;
     let mut per_batch_size: HashMap<usize, usize> = HashMap::new();
@@ -601,6 +623,7 @@ fn print_run_summary(
     for (idx, size) in per_batch {
         eprintln!("  batch={} size={}", batch_id_for_idx[idx], size);
     }
+    Ok(())
 }
 
 /// Format the current UTC time as a TOML-compatible RFC3339 string.

@@ -323,6 +323,9 @@ impl ContaminationEstimationConfig {
         if self.min_depth == 0 {
             return Err(ContaminationEstimationError::ZeroMinDepth);
         }
+        if self.min_cohort_minor_count == 0 {
+            return Err(ContaminationEstimationError::ZeroMinCohortMinorCount);
+        }
         if self.min_batch_size_for_contamination < 2 {
             return Err(ContaminationEstimationError::MinBatchSizeBelowFloor {
                 got: self.min_batch_size_for_contamination,
@@ -631,6 +634,13 @@ pub enum ContaminationEstimationError {
     /// call divides by depth, so 0 admits empty records.
     #[error("min_depth must be >= 1")]
     ZeroMinDepth,
+
+    /// Config knob `min_cohort_minor_count` was set to 0; the
+    /// informative-site filter then degenerates to its fraction-axis
+    /// counterpart, admitting effectively every site on the count
+    /// axis.
+    #[error("min_cohort_minor_count must be >= 1")]
+    ZeroMinCohortMinorCount,
 
     /// A user-supplied `c_s` value (via
     /// [`ContaminationEstimates::from_user_supplied`]) is not a

@@ -9,8 +9,10 @@
 //! [`with_stage1_pipeline`]; the closure receives the walker, wraps it
 //! as a k=1 input to [`PerPositionMerger`], and chains the rest of the
 //! cohort pipeline exactly as `var-calling` does. The walker's
-//! `WalkerError` is stashed by a local error-shedding adapter
-//! ([`WalkerErrorSheddingAdapter`]) so the merger sees a clean
+//! `WalkerError` is stashed by an inline `.scan()`-based error-shedding
+//! adapter (backed by `Rc<RefCell<Option<WalkerError>>>` — same shape
+//! as [`ErrorSheddingAdapter`](crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter)
+//! for CRAM-input errors) so the merger sees a clean
 //! `Result<_, PspReadError>` stream; any stashed walker error is
 //! surfaced after the pipeline drains.
 //!
@@ -57,15 +59,15 @@ use crate::var_calling::per_position_merger::{
 };
 use crate::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
-    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_ITERATIONS,
-    DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, MAX_GQ_PHRED, PosteriorEngine,
+    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
+    DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, PosteriorEngine,
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{
     DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig, GrouperConfigError, GrouperError, VariantGrouper,
 };
 use crate::var_calling::vcf_writer::{
-    CohortMetadata, CohortVcfWriter, DEFAULT_EMIT_GP, VcfWriteError, WriterConfig,
+    CohortMetadata, CohortVcfWriter, DEFAULT_EMIT_GP, VcfWriteError, WriterConfig, tmp_path_for,
 };
 
 // ---------------------------------------------------------------------
@@ -300,7 +302,7 @@ pub struct VarCallingFromBamArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_REF_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_ref_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub ref_pseudocount: f64,
@@ -309,7 +311,7 @@ pub struct VarCallingFromBamArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_SNP_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_snp_alt_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub snp_alt_pseudocount: f64,
@@ -318,7 +320,7 @@ pub struct VarCallingFromBamArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_INDEL_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_indel_alt_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub indel_alt_pseudocount: f64,
@@ -327,7 +329,7 @@ pub struct VarCallingFromBamArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_compound_alt_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub compound_alt_pseudocount: f64,
@@ -335,13 +337,18 @@ pub struct VarCallingFromBamArgs {
     #[arg(
         long,
         hide_short_help = true,
-        default_value_t = MAX_GQ_PHRED,
+        default_value_t = DEFAULT_MAX_GQ_PHRED,
         value_parser = parsers::parse_max_gq_phred,
         help_heading = "Advanced — Posterior engine",
     )]
     pub max_gq_phred: f64,
 
     // ===== Advanced — VCF writer ==============================
+    /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
+    /// default — `GP` is `Number=G`, so the per-sample cell grows as
+    /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at
+    /// ploidy=2, n_alleles=6). Opt in when posteriors are wanted on
+    /// disk.
     #[arg(
         long,
         hide_short_help = true,
@@ -410,6 +417,11 @@ pub enum VarCallingFromBamCliError {
     /// pipeline's `ParsedChromosome`).
     #[error("contig '{name}' length {length} exceeds u32::MAX")]
     ContigLengthOverflow { name: String, length: u64 },
+
+    /// `rayon::ThreadPoolBuilder::build_global()` already ran in this
+    /// process. The binary calls it at most once.
+    #[error("rayon thread pool already initialised — refusing to override")]
+    RayonAlreadyConfigured,
 }
 
 // ---------------------------------------------------------------------
@@ -427,7 +439,7 @@ pub fn run_var_calling_from_bam(
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
-            .map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
+            .map_err(|_| VarCallingFromBamCliError::RayonAlreadyConfigured)?;
     }
 
     // 2. Build the Stage 1 configs from args.
@@ -454,9 +466,11 @@ pub fn run_var_calling_from_bam(
     // No contamination — explicit "none" sentinel.
     posterior_cfg.contamination = None;
 
-    // 4. Drive the Stage 1 chain via the shared helper. Inside the
-    //    closure: build the cohort pipeline at k=1, stream records
-    //    into the VCF writer, finish (atomic rename).
+    // 4. Drive the Stage 1 chain via the shared helper. The named
+    //    helper `run_cohort_pipeline_for_single_sample` takes the
+    //    walker over and runs the rest of the cohort pipeline; its
+    //    signature names every captured value so the data flow is
+    //    legible (previously: ~95-line closure capturing six values).
     let no_complexity_filter = args.no_complexity_filter;
     let emit_gp = args.emit_gp;
     let reference = args.reference.clone();
@@ -471,99 +485,19 @@ pub fn run_var_calling_from_bam(
         walker_cfg,
         args.baq_chunk_size,
         args.no_baq,
-        |ctx: Stage1PipelineContext<'_>| -> Result<(), VarCallingFromBamCliError> {
-            // 4a. Convert ContigList → Vec<ParsedChromosome>. The cohort
-            //     pipeline expects the .psp-shaped representation.
-            let chromosomes = contigs_to_parsed(ctx.contigs)?;
-            let sample_name_owned = ctx.sample_name.to_string();
-
-            // 4b. Cohort metadata for the VCF writer.
-            let metadata = CohortMetadata {
-                sample_names: vec![sample_name_owned.clone()],
-                contigs: chromosomes.clone(),
-                tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
+        |ctx| {
+            run_cohort_pipeline_for_single_sample(
+                ctx,
+                &reference,
+                &output,
                 command_line,
-            };
-            let writer_cfg = WriterConfig {
-                output: output.clone(),
+                no_complexity_filter,
                 emit_gp,
-            };
-
-            // 4c. Reference fetcher shared between DUST + PerGroupMerger.
-            let fetcher_concrete = SyncRefFetcher::new(&reference, ctx.contigs.clone())
-                .map_err(VarCallingFromBamCliError::Io)?;
-            let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
-
-            // 4d. Wrap the walker as a k=1 input for PerPositionMerger.
-            //     Walker yields `Result<PileupRecord, WalkerError>`;
-            //     merger wants `Result<PileupRecord, PspReadError>`.
-            //     The shim adapter stashes walker errors and reports
-            //     end-of-stream, mirroring `ErrorSheddingAdapter`'s
-            //     pattern for CRAM input errors.
-            let walker_error_stash: Rc<RefCell<Option<WalkerError>>> = Rc::new(RefCell::new(None));
-            let stash_clone = walker_error_stash.clone();
-            let walker_iter = ctx.walker.scan(stash_clone, |stash, r| match r {
-                Ok(rec) => Some(Ok::<PileupRecord, PspReadError>(rec)),
-                Err(e) => {
-                    *stash.borrow_mut() = Some(e);
-                    None
-                }
-            });
-            let walker_iter: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>>> =
-                Box::new(walker_iter);
-
-            // 4e. Build merger / DUST / grouper / per-group / posterior.
-            let merger = PerPositionMerger::new(
-                vec![walker_iter],
-                vec![sample_name_owned.clone()],
-                chromosomes,
-            )?;
-            let upstream_for_grouper: Box<
-                dyn Iterator<Item = Result<PerPositionPileups, GrouperError>>,
-            > = if no_complexity_filter {
-                Box::new(merger.map(|r| r.map_err(GrouperError::from)))
-            } else {
-                let dust = DustFilter::new(
-                    merger,
-                    &*fetcher,
-                    ctx.contigs
-                        .entries
-                        .iter()
-                        .map(|e| ParsedChromosome {
-                            name: e.name.clone(),
-                            length: e.length as u32,
-                            md5: e.md5.map(format_md5_hex).unwrap_or_default(),
-                        })
-                        .collect(),
-                    dust_cfg,
-                );
-                Box::new(dust.map(|r| r.map_err(GrouperError::from)))
-            };
-            let grouper = VariantGrouper::with_config(upstream_for_grouper, grouper_cfg);
-            let per_group = PerGroupMerger::with_config(grouper, fetcher.clone(), per_group_cfg);
-            let posterior = PosteriorEngine::with_config(per_group, posterior_cfg);
-
-            // 4f. Open writer, stream records, finalise.
-            let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
-            let mut records_written: u64 = 0;
-            for item in posterior {
-                let record = item?;
-                writer.write_record(&record)?;
-                records_written += 1;
-            }
-            writer.finish()?;
-
-            // 4g. Surface walker errors stashed by the scan-adapter.
-            if let Some(e) = walker_error_stash.borrow_mut().take() {
-                let _ = std::fs::remove_file(&output);
-                return Err(VarCallingFromBamCliError::Walker(e));
-            }
-
-            eprintln!(
-                "var-calling-from-bam: sample={} records_emitted={}",
-                sample_name_owned, records_written,
-            );
-            Ok(())
+                dust_cfg,
+                grouper_cfg,
+                per_group_cfg,
+                posterior_cfg,
+            )
         },
     )?;
 
@@ -604,6 +538,142 @@ pub fn run_var_calling_from_bam(
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
+
+/// Drive Stages 3–6 over a single sample's Stage 1 walker.
+///
+/// Pulled out of the inline closure that used to live inside
+/// [`run_var_calling_from_bam`] so the data flow is legible (every
+/// captured value becomes a named parameter) and so an eventual
+/// shared `drive_cohort_pipeline` (deferred review item M11) has a
+/// clear extraction surface. The closure's outer captures map 1:1
+/// onto the parameters here.
+///
+/// Walker errors are stashed via an inline `.scan()` adapter — the
+/// merger sees a clean `Result<_, PspReadError>` stream and never
+/// observes the walker's `Err` arm; the stash is read after the
+/// pipeline drains and converted into [`VarCallingFromBamCliError::Walker`].
+///
+/// On any driver-loop failure (write_record / posterior emission /
+/// finish), the writer's `<output>.tmp` is best-effort removed —
+/// matching `run_pileup`'s discipline (M6 parity).
+#[allow(clippy::too_many_arguments)]
+fn run_cohort_pipeline_for_single_sample(
+    ctx: Stage1PipelineContext<'_>,
+    reference: &std::path::Path,
+    output: &std::path::Path,
+    command_line: String,
+    no_complexity_filter: bool,
+    emit_gp: bool,
+    dust_cfg: DustFilterConfig,
+    grouper_cfg: GrouperConfig,
+    per_group_cfg: PerGroupMergerConfig,
+    posterior_cfg: PosteriorEngineConfig,
+) -> Result<(), VarCallingFromBamCliError> {
+    // Convert ContigList → Vec<ParsedChromosome>. Single validated
+    // source of truth for chromosomes; the merger consumes a clone
+    // and the DUST branch consumes the original.
+    let chromosomes = contigs_to_parsed(ctx.contigs)?;
+    let sample_name_owned = ctx.sample_name.to_string();
+
+    // Cohort metadata + writer config.
+    let metadata = CohortMetadata {
+        sample_names: vec![sample_name_owned.clone()],
+        contigs: chromosomes.clone(),
+        tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
+        command_line,
+    };
+    let writer_cfg = WriterConfig {
+        output: output.to_path_buf(),
+        emit_gp,
+    };
+
+    // Reference fetcher shared between DUST + PerGroupMerger.
+    let fetcher_concrete = SyncRefFetcher::new(reference, ctx.contigs.clone())
+        .map_err(VarCallingFromBamCliError::Io)?;
+    let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
+
+    // Wrap the walker as a k=1 input for PerPositionMerger. The
+    // shim stashes walker errors and reports end-of-stream,
+    // mirroring `ErrorSheddingAdapter`'s pattern for CRAM input
+    // errors.
+    //
+    // Invariant: the stash is touched only on the merger's main
+    // thread. `PerGroupMerger::refill` collects upstream items into
+    // a `Vec` before fanning rayon workers across it, so the walker
+    // chain itself never crosses thread boundaries. If upstream of
+    // `PerGroupMerger` ever becomes multi-threaded, this needs to
+    // become `Arc<Mutex<...>>` (and the constraint should move to
+    // the bridge module).
+    let walker_error_stash: Rc<RefCell<Option<WalkerError>>> = Rc::new(RefCell::new(None));
+    let stash_clone = walker_error_stash.clone();
+    let walker_iter = ctx.walker.scan(stash_clone, |stash, r| match r {
+        Ok(rec) => Some(Ok::<PileupRecord, PspReadError>(rec)),
+        Err(e) => {
+            *stash.borrow_mut() = Some(e);
+            None
+        }
+    });
+    let walker_iter: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>>> =
+        Box::new(walker_iter);
+
+    // Build merger / DUST / grouper / per-group / posterior. The
+    // merger consumes a clone of `chromosomes`; the DUST branch
+    // consumes the original (both branches converge on a single
+    // boxed iterator yielding `Result<_, GrouperError>`).
+    let merger = PerPositionMerger::new(
+        vec![walker_iter],
+        vec![sample_name_owned.clone()],
+        chromosomes.clone(),
+    )?;
+    let upstream_for_grouper: Box<dyn Iterator<Item = Result<PerPositionPileups, GrouperError>>> =
+        if no_complexity_filter {
+            Box::new(merger.map(|r| r.map_err(GrouperError::from)))
+        } else {
+            let dust = DustFilter::new(merger, &*fetcher, chromosomes, dust_cfg);
+            Box::new(dust.map(|r| r.map_err(GrouperError::from)))
+        };
+    let grouper = VariantGrouper::with_config(upstream_for_grouper, grouper_cfg);
+    let per_group = PerGroupMerger::with_config(grouper, fetcher.clone(), per_group_cfg);
+    let posterior = PosteriorEngine::with_config(per_group, posterior_cfg);
+
+    // Open writer, stream records, finalise. On any failure inside
+    // the loop, best-effort remove `<output>.tmp` — `finish()`
+    // consumes `self`, so a `?` short-circuit leaves the tmp on
+    // disk otherwise. Matches `run_var_calling`'s M6 cleanup
+    // discipline.
+    let tmp_path = tmp_path_for(output);
+    let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
+    let mut records_written: u64 = 0;
+    let drive_result: Result<(), VarCallingFromBamCliError> = (|| {
+        for item in posterior {
+            let record = item?;
+            writer.write_record(&record)?;
+            records_written += 1;
+        }
+        writer.finish()?;
+        Ok(())
+    })();
+    if let Err(e) = drive_result {
+        let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
+        return Err(e);
+    }
+
+    // Surface walker errors stashed by the scan-adapter. The
+    // pipeline ran to completion, so `<output>` has been renamed
+    // from `<output>.tmp` — retract that publish (publish-then-
+    // retract semantics: we'd rather no file than a truncated one).
+    if let Some(e) = walker_error_stash.borrow_mut().take() {
+        // best-effort cleanup; the rename already happened
+        let _ = std::fs::remove_file(output);
+        return Err(VarCallingFromBamCliError::Walker(e));
+    }
+
+    eprintln!(
+        "var-calling-from-bam: sample={} records_emitted={}",
+        sample_name_owned, records_written,
+    );
+    Ok(())
+}
 
 fn cram_config_from_args(args: &VarCallingFromBamArgs) -> CramMergedReaderConfig {
     CramMergedReaderConfig {
@@ -685,6 +755,9 @@ fn format_md5_hex(bytes: [u8; 16]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(32);
     for b in bytes {
+        // PANIC-FREE: `std::fmt::Write` on a `String` is infallible
+        // — the only failure mode is OOM, which the runtime turns
+        // into an abort, not an `Err`.
         write!(&mut out, "{b:02x}").expect("writing to a String never fails");
     }
     out

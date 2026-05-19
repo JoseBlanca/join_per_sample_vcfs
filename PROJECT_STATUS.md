@@ -21,20 +21,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI slice reviewed 2026-05-19 —
->   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md).
->   Request-changes: 0 Blockers, 14 Major, 23 Minor + grouped Nits
->   across reliability / errors / naming / defaults / idiomatic /
->   refactor_safety / unsafe_concurrency / smells / tooling / extras.
->   Top 3 priorities are **M1** (stashed CRAM-input error silently
->   dropped on closure-Err in `with_stage1_pipeline`), **M5**
->   (reference cross-check is basename-only; plan claimed MD5
->   enforcement against `--reference`), and **M14** (`cargo doc
->   --no-deps` failing on 5 new broken intra-doc links). Six numbered
->   open questions gate several findings.
+> - **Last completed task:** Cohort CLI slice fixes-applied 2026-05-19 —
+>   [cohort_cli_2026-05-19_applied.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md).
+>   20 of 37 findings Applied (9 of 14 Majors + 11 of 23 Minors +
+>   PANIC-FREE comment Nits) + Mi7 Disputed-with-test; 16 Deferred
+>   (5 Major design-calls — M4 / M8 / M10 / M11 / M13 — plus 11
+>   paired Minors). 886 lib tests + every integration target green;
+>   `cargo doc --no-deps` is now clean for everything this slice
+>   touched (only pre-existing `ExactMath` errors in
+>   `posterior_engine.rs` remain, tracked by Stage 6 Mi21).
 >   The reviewed slice landed earlier on 2026-05-19 in commits
 >   `1523049` through `147e435` (impl report:
->   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)),
+>   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md);
+>   review: [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md)),
 >   delivering three new subcommands (`var-calling`,
 >   `estimate-contamination`, `var-calling-from-bam`). Plan:
 >   [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md).
@@ -97,7 +96,7 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
 #### `pop_var_caller` CLI
 - **Status:** Stage 1 CLI shipped (subcommands `pileup`, `psp-to-pileup`);
-  cohort CLI reviewed (subcommands `var-calling`,
+  cohort CLI fixes-applied (subcommands `var-calling`,
   `estimate-contamination`, `var-calling-from-bam`)
 - **Plans:**
   - Stage 1 CLI (`pileup`, `psp-to-pileup`):
@@ -109,11 +108,13 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
 - **Latest review (cohort slice):**
   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
-  Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped
-  Nits. Top 3: M1 stashed CRAM-input error dropped on closure-Err in
-  `with_stage1_pipeline`; M5 reference cross-check is basename-only
-  (plan claimed MD5 enforcement against `--reference`); M14 `cargo
-  doc --no-deps` fails on 5 new broken intra-doc links.
+  Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
+- **Latest fixes-applied (cohort slice):**
+  [cohort_cli_2026-05-19_applied.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md) —
+  20 Applied (9 Majors: M1, M2, M3, M5-doc, M6, M7, M9-doc, M12, M14;
+  11 Minors: Mi1, Mi3, Mi4, Mi9, Mi10, Mi11, Mi12, Mi15, Mi16, Mi17,
+  Mi22; subset of Nits) + Mi7 Disputed-with-test. 16 Deferred (5
+  Major design-calls + 11 paired Minors). 886 lib tests pass.
 - **Code:** [src/pop_var_caller/](src/pop_var_caller/)
 - **Integration tests:**
   [tests/pileup_cli_integration.rs](tests/pileup_cli_integration.rs)
@@ -121,53 +122,49 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from cohort-slice review):**
-  - **M1** — `stage1_pipeline.rs:167` silently drops stashed CRAM
-    error when closure returns Err; prefer the stash over the closure
-    error.
-  - **M2** — walker-error stash path in `var_calling-from-bam` is end-
-    to-end untested.
-  - **M3** — silent `unwrap_or_default()` on missing MD5 + truncating
-    `as u32` cast in the DUST branch of `var_calling_from_bam.rs:525-540`.
   - **M4** — post-construction mutation of `posterior_cfg.contamination`
-    bypasses future engine validation.
-  - **M5** — reference cross-check is basename-only (`var_calling.rs:335-348`,
-    mirror in `estimate_contamination.rs`); plan claimed FASTA-MD5
-    enforcement.
-  - **M6** — iterator error in `run_var_calling` leaves `<output>.tmp`
-    orphaned; no parity with `run_pileup` / `run_var_calling_from_bam`.
-  - **M7** — `Q_B_SIMPLEX_TOLERANCE = 1e-9` doc says "looser than 1e-6"
-    but value is stricter (open question 1).
+    bypasses future engine validation. Deferred — design call (privatise
+    fields vs builder vs validated setter).
+  - **M5 follow-up** — FASTA→.psp MD5 enforcement (doc was tightened
+    this round; the wiring work is the long-term answer).
   - **M8** — `WriterConfig` lacks `#[non_exhaustive]`; the
-    `default_filter_pass` drop is an unannounced breaking change for
-    downstream consumers.
-  - **M9** — Inline `Iterator::scan` reinvents `ErrorSheddingAdapter`;
-    module-doc `WalkerErrorSheddingAdapter` references a phantom type.
+    `default_filter_pass` drop remains an unannounced breaking change
+    for downstream consumers. Deferred — public-API design call.
+  - **M9 follow-up** — Generalise `ErrorSheddingAdapter` to be
+    parametric over `<I, T, E>` so the from-bam walker shim can reuse
+    it instead of the open-coded `.scan()` (the doc was fixed this
+    round; the code dedup is the bigger refactor).
   - **M10** — `VarCallingFromBamArgs` duplicates ~30 fields of
-    `VarCallingArgs` + `PileupArgs` (3rd copy); extract via
+    `VarCallingArgs` + `PileupArgs`. Deferred — extract via
     `#[command(flatten)]` sub-structs.
   - **M11** — Cohort pipeline wiring duplicated near-verbatim between
-    `var_calling.rs` and `var_calling_from_bam.rs`.
-  - **M12** — ~95-line closure in `run_var_calling_from_bam`; extract
-    to named helper.
+    `var_calling.rs` and the new
+    `run_cohort_pipeline_for_single_sample` helper. Deferred —
+    extract a shared `drive_cohort_pipeline` driver.
   - **M13** — Three `rayon::ThreadPoolBuilder::build_global()` sites
-    with no in-process coordination; second-call hazard for library
-    consumers (open question 2).
-  - **M14** — `cargo doc --no-deps` fails: 5 new broken intra-doc
-    links (`batch_assignment.rs:30` `Self::batch_for`,
-    `contamination_artifact.rs:56` `Self::to_estimates_for_samples`,
-    `contamination_artifact.rs:277` `ContaminationEstimateSource::UserSupplied`,
-    `stage1_pipeline.rs:15` `[feedback_no_silent_intermediates]`,
-    `var_calling_from_bam.rs:13` `WalkerErrorSheddingAdapter`) plus
-    `estimate_contamination.rs:296` redundant-link warning.
-  - **Mi1–Mi23** — see review report for details; biggest groups are
-    helper duplication across 3–4 modules (Mi8), missing integration
-    tests including the load-bearing `estimate-contamination →
-    var-calling` chain test (Mi23), and CRLF body-row handling in
-    `BatchAssignment` (Mi7 — "Needs verification": may promote to
-    Major if a CRLF fixture confirms the corrupt-label bug).
+    with no in-process coordination. Deferred — policy choice (silent
+    `OnceLock` no-op vs typed error).
+  - **Mi2 / Mi21** — Pair with M4 (config-construction shape).
+  - **Mi5 / Mi6** — Pair with M8 (on-disk type `#[non_exhaustive]`
+    + schema versioning gate).
+  - **Mi8 / Mi19** — Pair with M10/M11 (`pop_var_caller::common`
+    helper extraction + `DEFAULT_BUFFERED_IO_CAPACITY` constant).
+  - **Mi13** — File `contamination_artifact.rs` (American) holds type
+    `ContaminationArtefact` (British); deferred mechanical rename.
+  - **Mi14** — CLI knob `min_batch_size` diverges from engine field
+    `min_batch_size_for_contamination`; deferred (touches engine).
+  - **Mi18** — `build_artefact_from_estimates` linear scan; needs
+    new `q_b_per_batch()` engine accessor first.
+  - **Mi20** — Shared `tests/common/` fixture helpers (also satisfies
+    a previously pre-existing standing item).
+  - **Mi23** — Load-bearing `estimate-contamination → var-calling`
+    chain integration test (plus an end-to-end CRAM-fixture test for
+    M1/M2's walker-error path).
+  - Selected deferred Nits — drop unused `#[from]` variants, vestigial
+    `let _ = cfg;`, `Stage1RunSummary` renames, `DEFAULT_BATCH_ID`
+    value-mismatch, etc.
   - `bcftools view` / `bcftools stats` manual smoke against real
     cohort data (pre-existing).
-  - Shared `tests/common/` fixture helpers (Mi20, pre-existing).
 
 ---
 

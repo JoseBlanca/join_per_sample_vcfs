@@ -121,12 +121,12 @@ pub const DEFAULT_COMPOUND_ALT_PSEUDOCOUNT: f64 = 0.001;
 /// target tends to want a non-zero override per the spec.
 pub const DEFAULT_INBREEDING_COEFFICIENT: f64 = 0.0;
 
-/// Phred cap on per-sample GQ. Matches the GATK and bcftools
+/// Default Phred cap on per-sample GQ. Matches the GATK and bcftools
 /// convention (`GQ` capped at 99) so downstream tooling sees a
 /// familiar range; the cap also prevents `+∞` GQ when EM yields
-/// `P(best) = 1` exactly. The CLI exposes this as `--max-gq-phred`
-/// once the cohort subcommand lands.
-pub const MAX_GQ_PHRED: f64 = 99.0;
+/// `P(best) = 1` exactly. The CLI exposes this as `--max-gq-phred`;
+/// the actual validator upper bound is [`GQ_PHRED_RANGE_MAX`] (200.0).
+pub const DEFAULT_MAX_GQ_PHRED: f64 = 99.0;
 
 /// Validation upper bound on `convergence_threshold` (cohort CLI plan).
 /// Loose-but-not-degenerate: a `1.0` threshold would always exit after
@@ -198,7 +198,7 @@ pub struct PosteriorEngineConfig {
     /// file is a follow-up that flips this from `None` to `Some(_)`
     /// without an engine-side refactor.
     pub fixation_index_overrides: Option<Vec<f64>>,
-    /// GQ Phred cap. Defaults to [`MAX_GQ_PHRED`].
+    /// GQ Phred cap. Defaults to [`DEFAULT_MAX_GQ_PHRED`].
     pub max_gq_phred: f64,
     /// Opt-in flag for the precomputed-LUT inner loop (multinomial
     /// coefficients, HWE-with-`F` quantised priors). **The LUT
@@ -240,7 +240,7 @@ impl PosteriorEngineConfig {
     /// | `compound_alt_pseudocount`         | [`DEFAULT_COMPOUND_ALT_PSEUDOCOUNT`]  | 0.001    |
     /// | `fixation_index_default`           | [`DEFAULT_INBREEDING_COEFFICIENT`]    | 0.0      |
     /// | `fixation_index_overrides`         | —                                     | `None`   |
-    /// | `max_gq_phred`                     | [`MAX_GQ_PHRED`]                      | 99.0     |
+    /// | `max_gq_phred`                     | [`DEFAULT_MAX_GQ_PHRED`]                      | 99.0     |
     /// | `approximate_posterior_calculation`| —                                     | `false`  |
     /// | `contamination`                    | —                                     | `None`   |
     pub fn with_project_defaults() -> Self {
@@ -253,7 +253,7 @@ impl PosteriorEngineConfig {
             compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
             fixation_index_default: DEFAULT_INBREEDING_COEFFICIENT,
             fixation_index_overrides: None,
-            max_gq_phred: MAX_GQ_PHRED,
+            max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             approximate_posterior_calculation: false,
             contamination: None,
         }
@@ -2932,7 +2932,8 @@ mod tests {
         let pr = single_ok(record);
         let p_best = pr.posteriors_row(0)[pr.best_genotype[0]];
         let p_best_clamped = p_best.min(1.0 - f64::EPSILON);
-        let expected_gq = ((-10.0_f64) * (1.0 - p_best_clamped).log10()).clamp(0.0, MAX_GQ_PHRED);
+        let expected_gq =
+            ((-10.0_f64) * (1.0 - p_best_clamped).log10()).clamp(0.0, DEFAULT_MAX_GQ_PHRED);
         assert!(
             approx(pr.gq_phred[0], expected_gq, 1e-9),
             "gq_phred={} expected={}",
@@ -2962,7 +2963,7 @@ mod tests {
         }
         // GQ clamps regardless of how extreme the posterior is.
         assert!(pr.gq_phred[0].is_finite());
-        assert!(pr.gq_phred[0] <= MAX_GQ_PHRED + 1e-9);
+        assert!(pr.gq_phred[0] <= DEFAULT_MAX_GQ_PHRED + 1e-9);
     }
 
     #[test]
@@ -4431,7 +4432,7 @@ mod tests {
             DEFAULT_INDEL_ALT_PSEUDOCOUNT,
             DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
             DEFAULT_INBREEDING_COEFFICIENT,
-            MAX_GQ_PHRED,
+            DEFAULT_MAX_GQ_PHRED,
         )
     }
 

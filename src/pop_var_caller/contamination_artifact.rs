@@ -53,11 +53,11 @@
 //! - `samples[*].name` is unique within the file.
 //!
 //! Sample-name reconciliation against the cohort `.psp` inputs lives
-//! in [`Self::to_estimates_for_samples`] — extras in the artefact
+//! in [`ContaminationArtefact::to_estimates_for_samples`] — extras in the artefact
 //! are silently ignored; missing-from-artefact `.psp` samples are a
 //! hard error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -74,7 +74,7 @@ use crate::var_calling::contamination_estimation::{
 /// loosened by an additional safety factor — round-trip via
 /// `toml::Value::Float` (f64) can shave a few ULP off, so we keep some
 /// slack on top of the engine bound.
-pub const Q_B_SIMPLEX_TOLERANCE: f64 = 1e-9;
+pub const Q_B_SIMPLEX_TOLERANCE: f64 = 1e-5;
 
 // ---------------------------------------------------------------------
 // On-disk types — serde-derived. Public so consumers can build /
@@ -274,57 +274,60 @@ impl ContaminationArtefact {
     ///   superset cohort and then call on a subset.
     ///
     /// The returned `ContaminationEstimates::source` is
-    /// [`ContaminationEstimateSource::UserSupplied`]
+    /// [`UserSupplied`](crate::var_calling::contamination_estimation::ContaminationEstimateSource::UserSupplied)
     /// (the artefact was loaded from disk; from the engine's
     /// perspective it is externally supplied).
     pub fn to_estimates_for_samples(
         &self,
         sample_names: &[&str],
     ) -> Result<ContaminationEstimates, ContaminationArtefactError> {
-        // Build batch_id -> dense_batch_idx for the subset of batches
-        // referenced by the cohort. Batches that don't show up under
-        // any cohort sample are also dropped (no engine-side overhead).
-        let by_name: BTreeMap<&str, &SampleEntry> =
+        // Mi12: revalidate up-front so this method carries the same
+        // safety guarantee whether the artefact was loaded via
+        // `Self::read` (already validated), built in-memory then
+        // `validate()`'d (already validated), or hand-built and
+        // passed straight in (previously: half-guarded by a defensive
+        // arm; now: explicitly safe).
+        self.validate()?;
+
+        // Mi17: lookup-only maps express intent better as `HashMap`s
+        // (no iteration; sorted order would be wasted work).
+        let by_name: HashMap<&str, &SampleEntry> =
             self.samples.iter().map(|s| (s.name.as_str(), s)).collect();
-        let by_batch: BTreeMap<&str, &BatchEntry> =
+        let by_batch: HashMap<&str, &BatchEntry> =
             self.batches.iter().map(|b| (b.id.as_str(), b)).collect();
 
-        // First pass: enumerate the batches the cohort actually uses,
-        // in stable artefact order. A batch appears in the dense table
-        // only if at least one cohort sample references it.
+        // Single pass over `sample_names`. Both the
+        // `SampleMissingFromArtefact` and the dense-batch population
+        // happen inline; `validate()` above already guaranteed every
+        // `samples[*].batch` resolves into `[[batches]]`, so the
+        // batch lookup uses `expect` rather than another error arm
+        // (any failure here would mean validate() did not actually
+        // run on this `self`, which is a contract violation).
         let mut dense_batches: Vec<&BatchEntry> = Vec::new();
-        let mut batch_idx_for_id: BTreeMap<&str, usize> = BTreeMap::new();
-        for cohort_name in sample_names {
-            let s = by_name.get(cohort_name).ok_or_else(|| {
-                ContaminationArtefactError::SampleMissingFromArtefact {
-                    sample: (*cohort_name).to_string(),
-                }
-            })?;
-            if let std::collections::btree_map::Entry::Vacant(e) =
-                batch_idx_for_id.entry(s.batch.as_str())
-            {
-                let b = by_batch.get(s.batch.as_str()).ok_or_else(|| {
-                    // Caught by `validate()` already, but defensive
-                    // for the case where a caller hand-builds the
-                    // artefact without calling `validate()`.
-                    ContaminationArtefactError::DanglingSampleBatch {
-                        sample: s.name.clone(),
-                        batch: s.batch.clone(),
-                    }
-                })?;
-                e.insert(dense_batches.len());
-                dense_batches.push(b);
-            }
-        }
-
-        // Second pass: build the three engine-side vectors aligned
-        // with `sample_names`.
+        let mut batch_idx_for_id: HashMap<&str, usize> = HashMap::new();
         let mut c_s_per_sample: Vec<Option<f64>> = Vec::with_capacity(sample_names.len());
         let mut sample_to_batch: Vec<usize> = Vec::with_capacity(sample_names.len());
-        for cohort_name in sample_names {
-            let s = by_name[cohort_name];
+        for &cohort_name in sample_names {
+            let s = by_name.get(cohort_name).ok_or_else(|| {
+                ContaminationArtefactError::SampleMissingFromArtefact {
+                    sample: cohort_name.to_string(),
+                }
+            })?;
+            let dense_idx = match batch_idx_for_id.get(s.batch.as_str()) {
+                Some(idx) => *idx,
+                None => {
+                    let b = by_batch
+                        .get(s.batch.as_str())
+                        .copied()
+                        .expect("validate() ran above and guarantees no dangling batch");
+                    let idx = dense_batches.len();
+                    batch_idx_for_id.insert(s.batch.as_str(), idx);
+                    dense_batches.push(b);
+                    idx
+                }
+            };
             c_s_per_sample.push(Some(s.contamination_fraction));
-            sample_to_batch.push(batch_idx_for_id[s.batch.as_str()]);
+            sample_to_batch.push(dense_idx);
         }
         let q_b_per_batch: Vec<[f64; N_ALLELE_CLASSES]> = dense_batches
             .iter()

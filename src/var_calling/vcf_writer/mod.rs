@@ -39,6 +39,7 @@ mod writer;
 
 pub use errors::VcfWriteError;
 pub use header::CohortMetadata;
+pub use sink::tmp_path_for;
 pub use writer::CohortVcfWriter;
 
 /// Default for [`WriterConfig::emit_gp`]. Off — `GP` is `Number=G`

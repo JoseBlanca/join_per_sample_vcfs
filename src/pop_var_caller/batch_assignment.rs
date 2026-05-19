@@ -27,7 +27,7 @@
 //!   files.
 //! - Sample names that aren't in the cohort being processed are
 //!   silently ignored downstream; missing-from-TSV samples fall back
-//!   to the default batch `"all_samples"` via [`Self::batch_for`].
+//!   to the default batch `"all_samples"` via [`BatchAssignment::batch_for`].
 //!
 //! The expected consumer is the contamination subcommand; sample-name
 //! reconciliation against the `.psp` inputs lives there, not here.
@@ -271,6 +271,28 @@ mod tests {
     fn header_with_trailing_newline_is_ok() {
         // File without trailing newline.
         let m = parse("sample\tbatch\nNA12878\tlane_3").unwrap();
+        assert_eq!(m.batch_for("NA12878"), "lane_3");
+    }
+
+    /// Mi7 verification: `&str::lines()` recognises `\r\n` as a single
+    /// line terminator and strips both characters, so a CRLF-authored
+    /// (Windows-style) TSV parses identically to LF-only. This test
+    /// locks the contract so a future change to a custom splitter
+    /// can't silently store `"NA12878\r"` / `"lane_3\r"` as keys.
+    #[test]
+    fn body_rows_with_trailing_carriage_return_preserve_sample_name() {
+        let m = parse("sample\tbatch\r\nNA12878\tlane_3\r\nNA12891\tlane_7\r\n").unwrap();
+        assert_eq!(m.batch_for("NA12878"), "lane_3");
+        assert_eq!(m.batch_for("NA12891"), "lane_7");
+        // And the `\r`-suffixed forms must not exist as keys.
+        assert_eq!(m.batch_for("NA12878\r"), DEFAULT_BATCH_ID);
+    }
+
+    #[test]
+    fn header_with_crlf_is_ok() {
+        // CRLF-terminated header — `trim_end()` strips the `\r` so
+        // header-equality still holds.
+        let m = parse("sample\tbatch\r\nNA12878\tlane_3\r\n").unwrap();
         assert_eq!(m.batch_for("NA12878"), "lane_3");
     }
 

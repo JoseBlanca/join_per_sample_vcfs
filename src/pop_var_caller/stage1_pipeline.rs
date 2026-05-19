@@ -11,8 +11,9 @@
 //! after the closure returns and the borrow chain unwinds.
 //!
 //! No temp `.psp` is ever written — the var-calling-from-bam path
-//! consumes the walker's record stream directly. See
-//! [feedback_no_silent_intermediates] in the user's memory.
+//! consumes the walker's record stream directly. (Rationale: the
+//! project's "no silent intermediates" principle — if a subcommand
+//! exists to skip an artefact, don't fall back to a hidden one.)
 
 use std::path::{Path, PathBuf};
 
@@ -112,18 +113,28 @@ where
     let walker_fetcher =
         ChromBoundaryRefFetcher::new(reference, contigs.clone()).map_err(PileupCliError::Io)?;
 
-    // 3. Build the boxed input iterator + handle for upstream errors.
-    //    Both branches converge on `Box<dyn Iterator<Item =
+    // 3. Build the boxed input iterator + handle for upstream errors,
+    //    drive the closure, then snapshot every branch-local counter
+    //    into a single tuple. Both arms must produce the same tuple
+    //    shape, so a future per-branch counter cannot land in only
+    //    one arm — adding a field forces both arms to update.
+    //    Both branches also converge on `Box<dyn Iterator<Item =
     //    PreparedRead>>` so the walker has the same concrete type
     //    either way (see `Stage1Walker`).
-    let result: Result<R, E>;
-    let stashed_upstream_error: Option<CramInputError>;
-    let baq_skip_counts: Option<BaqSkipCounts>;
-
-    if no_baq {
+    let (result, baq_skip_counts, stashed_upstream_error): (
+        Result<R, E>,
+        Option<BaqSkipCounts>,
+        Option<CramInputError>,
+    ) = if no_baq {
         // No-BAQ: passthrough map directly off the reader.
         let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
             r.map(|read| {
+                // PANIC-FREE: `ref_id` is the CRAM-side contig id;
+                // `CramMergedReader` only emits `PreparedRead`s with
+                // a non-negative `ref_id` (mapped reads pass the
+                // pre-walker filter, unmapped reads are dropped
+                // upstream). The cast to `u32` is therefore total
+                // for every value this iterator surfaces.
                 let chrom_id = u32::try_from(read.ref_id).expect("ref_id fits u32");
                 prepare_passthrough(read, chrom_id)
             })
@@ -136,12 +147,12 @@ where
             sample_name: &sample_name,
             contigs: &contigs,
         };
-        result = f(ctx);
+        let r = f(ctx);
         // Closure dropped ctx (and walker inside it) — `&mut adapter`
         // borrow released. Now drop adapter to release `&mut reader`.
         drop(adapter);
-        stashed_upstream_error = error_handle.take();
-        baq_skip_counts = None;
+        let stash = error_handle.take();
+        (r, None, stash)
     } else {
         // BAQ-on: reader → BaqStream → adapter → walker.
         let mut baq_stream = BaqStream::new(reader.by_ref(), baq_cfg, &baq_fetcher, baq_chunk_size);
@@ -154,17 +165,27 @@ where
             sample_name: &sample_name,
             contigs: &contigs,
         };
-        result = f(ctx);
+        let r = f(ctx);
         // Closure dropped walker → `&mut adapter` released. Now drop
         // adapter → `&mut baq_stream` released. Then snapshot.
         drop(adapter);
-        stashed_upstream_error = error_handle.take();
-        baq_skip_counts = Some(*baq_stream.skip_counts());
+        let stash = error_handle.take();
+        let skip = Some(*baq_stream.skip_counts());
         drop(baq_stream);
-    }
+        (r, skip, stash)
+    };
 
     let filter_counts = *reader.filter_counts();
-    let r = result?;
+
+    // Surface order: if the closure errored AND the source stream had
+    // already failed (the `ErrorSheddingAdapter` translated it to
+    // end-of-stream), prefer the **upstream** error — it is the root
+    // cause; the closure's failure is the downstream symptom of the
+    // truncated stream. Logic factored into `prefer_upstream_or_closure`
+    // so it can be unit-tested in isolation. On Ok the stash is
+    // returned alongside the result so the caller can surface it
+    // separately (and tear down any half-written output).
+    let (r, stashed_upstream_error) = prefer_upstream_or_closure(result, stashed_upstream_error)?;
 
     Ok(Stage1Outputs {
         result: r,
@@ -176,4 +197,79 @@ where
         },
         stashed_upstream_error,
     })
+}
+
+/// Surface-order rule used by [`with_stage1_pipeline`]: if both the
+/// closure failed *and* an upstream CRAM-input error was stashed by
+/// the `ErrorSheddingAdapter`, prefer the upstream error — it is the
+/// root cause. On Ok the stash is handed back to the caller for
+/// separate surfacing. Pure function so it is unit-testable in
+/// isolation.
+fn prefer_upstream_or_closure<R, E>(
+    result: Result<R, E>,
+    stashed: Option<CramInputError>,
+) -> Result<(R, Option<CramInputError>), E>
+where
+    E: From<PileupCliError>,
+{
+    match result {
+        Ok(v) => Ok((v, stashed)),
+        Err(closure_err) => match stashed {
+            Some(upstream) => Err(PileupCliError::CramInput(upstream).into()),
+            None => Err(closure_err),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::per_sample_pileup::errors::CramInputError;
+
+    /// On success, the closure result is preserved and the stash (if
+    /// any) is handed back to the caller.
+    #[test]
+    fn prefer_upstream_or_closure_returns_ok_with_stash_when_closure_succeeded() {
+        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+            prefer_upstream_or_closure(Ok(42), None);
+        assert!(matches!(r, Ok((42, None))));
+
+        let stashed = CramInputError::Io {
+            path: std::path::PathBuf::from("sample.cram"),
+            source: std::io::Error::other("cram truncated"),
+        };
+        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+            prefer_upstream_or_closure(Ok(7), Some(stashed));
+        let (v, stash) = r.expect("Ok branch must propagate");
+        assert_eq!(v, 7);
+        assert!(matches!(stash, Some(CramInputError::Io { .. })));
+    }
+
+    /// When the closure errors and the stash is empty, the closure
+    /// error propagates unchanged.
+    #[test]
+    fn prefer_upstream_or_closure_returns_closure_err_when_stash_is_none() {
+        let closure_err = PileupCliError::TimestampFormat;
+        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+            prefer_upstream_or_closure::<u8, _>(Err(closure_err), None);
+        assert!(matches!(r, Err(PileupCliError::TimestampFormat)));
+    }
+
+    /// When the closure errors AND the stash holds a CRAM-input error,
+    /// the upstream error wins — this is the M1 case (the stash was
+    /// silently dropped before the fix).
+    #[test]
+    fn prefer_upstream_or_closure_prefers_stash_when_both_present() {
+        let closure_err = PileupCliError::TimestampFormat;
+        let stashed = CramInputError::Io {
+            path: std::path::PathBuf::from("sample.cram"),
+            source: std::io::Error::other("cram truncated"),
+        };
+        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+            prefer_upstream_or_closure::<u8, _>(Err(closure_err), Some(stashed));
+        match r {
+            Err(PileupCliError::CramInput(CramInputError::Io { .. })) => (),
+            other => panic!("expected upstream CramInput::Io, got {other:?}"),
+        }
+    }
 }

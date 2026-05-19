@@ -45,8 +45,8 @@ use merge_per_sample_vcfs::var_calling::per_group_merger::{
 };
 use merge_per_sample_vcfs::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
-    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_ITERATIONS,
-    DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, MAX_GQ_PHRED,
+    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
+    DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
 use merge_per_sample_vcfs::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
 use noodles_cram as cram;
@@ -206,7 +206,7 @@ fn var_calling_args(
         snp_alt_pseudocount: DEFAULT_SNP_ALT_PSEUDOCOUNT,
         indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
         compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-        max_gq_phred: MAX_GQ_PHRED,
+        max_gq_phred: DEFAULT_MAX_GQ_PHRED,
         emit_gp: false,
     }
 }
@@ -325,7 +325,7 @@ fn var_calling_from_bam_happy_path() {
         snp_alt_pseudocount: DEFAULT_SNP_ALT_PSEUDOCOUNT,
         indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
         compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-        max_gq_phred: MAX_GQ_PHRED,
+        max_gq_phred: DEFAULT_MAX_GQ_PHRED,
         emit_gp: false,
     };
     run_var_calling_from_bam(&args).expect("run_var_calling_from_bam OK");

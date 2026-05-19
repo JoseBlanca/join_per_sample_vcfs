@@ -22,8 +22,7 @@
 
 use crate::var_calling::contamination_estimation::{
     C_S_INIT_RANGE_MAX, MIN_COHORT_MINOR_FRACTION_RANGE_MAX_EXCLUSIVE,
-    MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE, PSEUDOCOUNT_RANGE_MAX as CONTAM_PSEUDOCOUNT_RANGE_MAX,
-    STABILITY_TOLERANCE_RANGE_MAX,
+    MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE, STABILITY_TOLERANCE_RANGE_MAX,
 };
 use crate::var_calling::dust_filter::{MAX_DUST_WINDOW, SD_WLEN};
 use crate::var_calling::per_group_merger::{MAX_ALLELES_PER_VAR_CAP, MAX_PLOIDY};
@@ -68,6 +67,27 @@ fn parse_u32_in(s: &str, name: &str, lo: u32, hi: u32) -> Result<u32, String> {
     Ok(v)
 }
 
+/// Parse a `u32`, then check `v >= lo`. Use this when the only
+/// constraint is a lower bound; pairing `parse_u32_in` with `u32::MAX`
+/// as the upper bound advertises a policy that isn't there.
+fn parse_u32_min(s: &str, name: &str, lo: u32) -> Result<u32, String> {
+    let v: u32 = s
+        .parse()
+        .map_err(|e| format!("{name}: not a non-negative integer ({e})"))?;
+    if v < lo {
+        return Err(format!("{name} must be >= {lo}, got `{s}`"));
+    }
+    Ok(v)
+}
+
+/// Parse a `u32` with no range constraint — use sparingly, when every
+/// non-negative integer is genuinely admissible (e.g. DUST threshold,
+/// where large values just mean "don't mask anything").
+fn parse_u32_any(s: &str, name: &str) -> Result<u32, String> {
+    s.parse()
+        .map_err(|e| format!("{name}: not a non-negative integer ({e})"))
+}
+
 /// Parse a `u8`, then check `lo..=hi`.
 fn parse_u8_in(s: &str, name: &str, lo: u8, hi: u8) -> Result<u8, String> {
     let v: u8 = s
@@ -109,11 +129,11 @@ pub fn parse_max_alleles(s: &str) -> Result<usize, String> {
 
 // ---- Stage 4 (grouper) ------------------------------------------
 
-/// `--var-group-max-span`: `>= 1` (`u32`). No upper bound beyond
-/// `u32::MAX`; a value of `0` makes every non-empty group exceed the
-/// cap (degenerate).
+/// `--var-group-max-span`: `>= 1`. No engine-side upper bound; a
+/// value of `0` makes every non-empty group exceed the cap
+/// (degenerate).
 pub fn parse_var_group_max_span(s: &str) -> Result<u32, String> {
-    parse_u32_in(s, "var-group-max-span", 1, u32::MAX)
+    parse_u32_min(s, "var-group-max-span", 1)
 }
 
 // ---- Stage 3 (DUST filter) --------------------------------------
@@ -127,7 +147,7 @@ pub fn parse_dust_window(s: &str) -> Result<u32, String> {
 /// thresholds as "don't mask anything"; no engine-side upper bound
 /// applies.
 pub fn parse_dust_threshold(s: &str) -> Result<u32, String> {
-    parse_u32_in(s, "complexity-threshold", 0, u32::MAX)
+    parse_u32_any(s, "complexity-threshold")
 }
 
 // ---- Stage 6 (posterior engine) ---------------------------------
@@ -167,16 +187,37 @@ pub fn parse_max_gq_phred(s: &str) -> Result<f64, String> {
     )
 }
 
-/// Any Dirichlet pseudocount (`--ref-pseudocount`,
-/// `--snp-alt-pseudocount`, `--indel-alt-pseudocount`,
-/// `--compound-alt-pseudocount`): finite, `(0.0, 1000.0]`.
-pub fn parse_pseudocount(s: &str) -> Result<f64, String> {
+/// Shared body for every Dirichlet-pseudocount parser. Range is the
+/// same across the posterior engine and the contamination side-pass
+/// (`PSEUDOCOUNT_RANGE_MAX = 1000.0` in both modules); the only thing
+/// that varies between flags is the *name* embedded in the error.
+fn parse_pseudocount_with_name(s: &str, flag: &str) -> Result<f64, String> {
     parse_f64_with(
         s,
-        "pseudocount",
+        flag,
         |v| 0.0 < v && v <= PSEUDOCOUNT_RANGE_MAX,
         "(0.0, 1000.0]",
     )
+}
+
+/// `--ref-pseudocount`: finite, `(0.0, 1000.0]`.
+pub fn parse_ref_pseudocount(s: &str) -> Result<f64, String> {
+    parse_pseudocount_with_name(s, "ref-pseudocount")
+}
+
+/// `--snp-alt-pseudocount`: finite, `(0.0, 1000.0]`.
+pub fn parse_snp_alt_pseudocount(s: &str) -> Result<f64, String> {
+    parse_pseudocount_with_name(s, "snp-alt-pseudocount")
+}
+
+/// `--indel-alt-pseudocount`: finite, `(0.0, 1000.0]`.
+pub fn parse_indel_alt_pseudocount(s: &str) -> Result<f64, String> {
+    parse_pseudocount_with_name(s, "indel-alt-pseudocount")
+}
+
+/// `--compound-alt-pseudocount`: finite, `(0.0, 1000.0]`.
+pub fn parse_compound_alt_pseudocount(s: &str) -> Result<f64, String> {
+    parse_pseudocount_with_name(s, "compound-alt-pseudocount")
 }
 
 // ---- Side-pass (contamination estimator) ------------------------
@@ -231,39 +272,35 @@ pub fn parse_q_b_init_per_class(s: &str) -> Result<f64, String> {
     )
 }
 
-/// Contamination-estimation Dirichlet pseudocount: finite,
-/// `(0.0, 1000.0]`. The contamination side-pass mirrors the posterior
-/// engine's pseudocount range; this parser exists as a distinct entry
-/// point so the flag name in error messages is right.
-pub fn parse_contam_pseudocount(s: &str) -> Result<f64, String> {
-    parse_f64_with(
-        s,
-        "contam-pseudocount",
-        |v| 0.0 < v && v <= CONTAM_PSEUDOCOUNT_RANGE_MAX,
-        "(0.0, 1000.0]",
-    )
-}
-
-/// `--block-size`: `>= 1` (`u32`). The side-pass needs a positive
-/// heartbeat to make progress.
+/// `--block-size`: `>= 1`. The side-pass needs a positive heartbeat
+/// to make progress.
 pub fn parse_block_size(s: &str) -> Result<u32, String> {
-    parse_u32_in(s, "block-size", 1, u32::MAX)
+    parse_u32_min(s, "block-size", 1)
 }
 
-/// `--min-depth`: `>= 1` (`u32`).
+/// `--min-depth`: `>= 1`.
 pub fn parse_min_depth(s: &str) -> Result<u32, String> {
-    parse_u32_in(s, "min-depth", 1, u32::MAX)
+    parse_u32_min(s, "min-depth", 1)
 }
 
-/// `--min-batch-size`: `>= 2` (`u32`). Singletons are unidentifiable
+/// `--min-batch-size`: `>= 2`. Singletons are unidentifiable
 /// per [`crate::var_calling::contamination_estimation`].
 pub fn parse_min_batch_size(s: &str) -> Result<u32, String> {
-    parse_u32_in(s, "min-batch-size", 2, u32::MAX)
+    parse_u32_min(s, "min-batch-size", 2)
 }
 
-/// `--stability-blocks`: `>= 1` (`u32`).
+/// `--min-cohort-minor-count`: `>= 1`. A zero floor admits
+/// every site on the count axis and degenerates the informative-site
+/// filter to its fraction axis alone — defensible only if explicitly
+/// chosen, which we don't expose. Default is 2 per
+/// [`crate::var_calling::contamination_estimation::DEFAULT_MIN_COHORT_MINOR_COUNT`].
+pub fn parse_min_cohort_minor_count(s: &str) -> Result<u32, String> {
+    parse_u32_min(s, "min-cohort-minor-count", 1)
+}
+
+/// `--stability-blocks`: `>= 1`.
 pub fn parse_stability_blocks(s: &str) -> Result<u32, String> {
-    parse_u32_in(s, "stability-blocks", 1, u32::MAX)
+    parse_u32_min(s, "stability-blocks", 1)
 }
 
 // ---------------------------------------------------------------------
@@ -316,13 +353,29 @@ mod tests {
 
     #[test]
     fn pseudocount_boundaries() {
-        parse_pseudocount("0.01").unwrap();
-        parse_pseudocount("10.0").unwrap();
-        parse_pseudocount("1000.0").unwrap();
-        assert!(parse_pseudocount("0").is_err());
-        assert!(parse_pseudocount("-1").is_err());
-        assert!(parse_pseudocount("1000.1").is_err());
-        assert!(parse_pseudocount("inf").is_err());
+        // Every per-flag entry delegates to the same body, so the
+        // range check only needs one boundary sweep. We probe each
+        // entry once so a future regression that drops the wiring
+        // for any one of them still surfaces.
+        parse_ref_pseudocount("0.01").unwrap();
+        parse_snp_alt_pseudocount("10.0").unwrap();
+        parse_indel_alt_pseudocount("1000.0").unwrap();
+        parse_compound_alt_pseudocount("0.001").unwrap();
+        assert!(parse_ref_pseudocount("0").is_err());
+        assert!(parse_snp_alt_pseudocount("-1").is_err());
+        assert!(parse_indel_alt_pseudocount("1000.1").is_err());
+        assert!(parse_compound_alt_pseudocount("inf").is_err());
+    }
+
+    #[test]
+    fn pseudocount_error_carries_flag_name() {
+        // The whole point of the per-flag split (Mi1): the rendered
+        // error string identifies *which* knob took the bad value.
+        let err = parse_snp_alt_pseudocount("2000").unwrap_err();
+        assert!(
+            err.contains("snp-alt-pseudocount"),
+            "error should name the flag, got: {err}"
+        );
     }
 
     #[test]

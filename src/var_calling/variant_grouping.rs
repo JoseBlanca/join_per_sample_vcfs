@@ -166,11 +166,11 @@ pub struct VariantGrouper<I> {
     done: bool,
 }
 
-impl<I, E> std::fmt::Debug for VariantGrouper<I>
-where
-    I: Iterator<Item = Result<PerPositionPileups, E>>,
-    GrouperError: From<E>,
-{
+// `Debug` does not need to know the upstream error type — the body
+// never touches `E`. Keeping the bounds off this impl lets `Debug`
+// callers print a `VariantGrouper<I>` without proving `GrouperError:
+// From<E>`.
+impl<I> std::fmt::Debug for VariantGrouper<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Exhaustive destructure so a new field on `VariantGrouper`
         // fails to compile here instead of silently being dropped

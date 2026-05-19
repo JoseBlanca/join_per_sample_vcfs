@@ -50,15 +50,15 @@ use crate::var_calling::per_position_merger::{
 };
 use crate::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
-    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_ITERATIONS,
-    DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, MAX_GQ_PHRED, PosteriorEngine,
+    DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
+    DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT, PosteriorEngine,
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{
     DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig, GrouperConfigError, GrouperError, VariantGrouper,
 };
 use crate::var_calling::vcf_writer::{
-    CohortMetadata, CohortVcfWriter, DEFAULT_EMIT_GP, VcfWriteError, WriterConfig,
+    CohortMetadata, CohortVcfWriter, DEFAULT_EMIT_GP, VcfWriteError, WriterConfig, tmp_path_for,
 };
 
 // ---------------------------------------------------------------------
@@ -174,7 +174,7 @@ pub struct VarCallingArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_REF_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_ref_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub ref_pseudocount: f64,
@@ -183,7 +183,7 @@ pub struct VarCallingArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_SNP_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_snp_alt_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub snp_alt_pseudocount: f64,
@@ -192,7 +192,7 @@ pub struct VarCallingArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_INDEL_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_indel_alt_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub indel_alt_pseudocount: f64,
@@ -201,7 +201,7 @@ pub struct VarCallingArgs {
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
-        value_parser = parsers::parse_pseudocount,
+        value_parser = parsers::parse_compound_alt_pseudocount,
         help_heading = "Advanced — Posterior engine",
     )]
     pub compound_alt_pseudocount: f64,
@@ -209,13 +209,19 @@ pub struct VarCallingArgs {
     #[arg(
         long,
         hide_short_help = true,
-        default_value_t = MAX_GQ_PHRED,
+        default_value_t = DEFAULT_MAX_GQ_PHRED,
         value_parser = parsers::parse_max_gq_phred,
         help_heading = "Advanced — Posterior engine",
     )]
     pub max_gq_phred: f64,
 
     // ===== Advanced — VCF writer ===============================
+    /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
+    /// default — `GP` is `Number=G`, so the per-sample cell grows as
+    /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at
+    /// ploidy=2, n_alleles=6). Opt in when posteriors are wanted on
+    /// disk; a 1000-sample × 100 K-variant cohort with `emit_gp` adds
+    /// ~8 GiB to the VCF.
     #[arg(
         long,
         hide_short_help = true,
@@ -302,9 +308,14 @@ pub enum VarCallingCliError {
 /// 1. Size the global rayon pool when `--threads` is set.
 /// 2. Open every `.psp` with [`PspReader`].
 /// 3. Cross-check `header.reference` against the basename of
-///    `--reference`.
+///    `--reference`. **Basename-only — the FASTA on disk is not
+///    content-hashed against the `.psp` per-contig MD5s.** A future
+///    slice may wire that check; see the v1 contract note below.
 /// 4. Cross-check chromosomes across readers
-///    ([`check_chromosome_agreement`]).
+///    ([`check_chromosome_agreement`]). This compares per-contig MD5s
+///    *between readers* only, not against the FASTA — so two `.psp`s
+///    produced from the same reference agree on contents, but the
+///    supplied `--reference` is trusted to match by basename only.
 /// 5. Load `--contamination-estimates` if supplied and reconcile
 ///    sample names; absence → `c_s = 0` for every sample.
 /// 6. Build + validate every per-stage config from the CLI args.
@@ -331,7 +342,9 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         readers.push(reader);
     }
 
-    // 3. Cross-check references.
+    // 3. Cross-check references. Basename comparison only; the FASTA
+    //    bytes on disk are not hashed against the .psp per-contig MD5s.
+    //    See the function docstring's "v1 contract" note.
     let supplied_ref = basename(&args.reference);
     for (path, reader) in args.psp_files.iter().zip(readers.iter()) {
         if reader.header().reference != supplied_ref {
@@ -416,14 +429,28 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     let posterior = PosteriorEngine::with_config(per_group, posterior_cfg);
 
     // 10. Stream records into the writer; tmp-then-rename on success.
+    //     On any driver-loop failure we best-effort remove the half-
+    //     written `<output>.tmp` so failed runs don't leave stale tmp
+    //     files behind — parity with `run_pileup` and
+    //     `run_var_calling_from_bam`. The writer's `finish()` consumes
+    //     `self`, so a `?` short-circuit in the loop never reaches the
+    //     rename and the tmp would otherwise linger.
+    let tmp_path = tmp_path_for(&args.output);
     let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
     let mut records_written: u64 = 0;
-    for item in posterior {
-        let record = item?;
-        writer.write_record(&record)?;
-        records_written += 1;
+    let drive_result: Result<(), VarCallingCliError> = (|| {
+        for item in posterior {
+            let record = item?;
+            writer.write_record(&record)?;
+            records_written += 1;
+        }
+        writer.finish()?;
+        Ok(())
+    })();
+    if let Err(e) = drive_result {
+        let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
+        return Err(e);
     }
-    writer.finish()?;
 
     // 11. Stderr summary.
     print_run_summary(&sample_names, records_written);

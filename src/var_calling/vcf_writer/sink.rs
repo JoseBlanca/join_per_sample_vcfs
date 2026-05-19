@@ -145,7 +145,10 @@ impl Write for SinkKind {
 
 /// Path used while the file is being written. The atomic
 /// [`fs::rename`] at finish-time moves it to the final path.
-pub(super) fn tmp_path_for(final_path: &Path) -> PathBuf {
+/// Exposed `pub` so orchestrators can clean up the tmp file on
+/// driver-loop errors (the writer's `finish()` consumes `self`, so
+/// a forgotten / never-reached call leaves the tmp on disk).
+pub fn tmp_path_for(final_path: &Path) -> PathBuf {
     let mut tmp = final_path.as_os_str().to_owned();
     tmp.push(".tmp");
     PathBuf::from(tmp)
