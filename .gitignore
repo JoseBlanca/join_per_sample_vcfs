@@ -14,5 +14,6 @@ samtools/
 htslib/
 sdust/
 bcftools/
+gatk-protected/
 /CLAUDE.md
 /.claude/
