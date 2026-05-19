@@ -21,29 +21,38 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI follow-up **Wave 2**
->   (Config-construction discipline) fixes-applied 2026-05-19 —
+> - **Last completed task:** Cohort CLI follow-up **Wave 3**
+>   (Shared-infrastructure refactor) fixes-applied 2026-05-19 —
+>   [cohort_cli_2026-05-19_applied_wave3.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md).
+>   All 6 Wave-3 findings Applied (largest mechanical wave —
+>   ~1500 LOC): **Mi8** (`pop_var_caller::common` extracts five
+>   helpers — basename, format_md5_hex, current_command_line,
+>   rfc3339_now, civil_from_days — that were duplicated 2-4
+>   places each), **Mi19** (`DEFAULT_BUFFERED_IO_CAPACITY: usize
+>   = 64 * 1024` constant replaces 6 magic-number literals),
+>   **M9 follow-up** (`ErrorSheddingAdapter<I, T, E>`
+>   generalised so the from-bam walker shim reuses it instead
+>   of an open-coded `.scan()`), **Mi18** (`q_b_per_batch()`
+>   accessor on `ContaminationEstimates`; artefact builder no
+>   longer linear-scans for a representative sample), **M10**
+>   (`Stage1Args` + `CohortPipelineArgs` via clap's
+>   `#[command(flatten)]` — three args structs reduced from
+>   ~30 duplicated fields to thin wrappers; `cram/baq/walker_config_from_args`
+>   helpers unified to take `&Stage1Args`), **M11**
+>   (`drive_cohort_pipeline` shared driver — cohort pipeline
+>   wiring lives in one place now). 887 lib tests pass (−2
+>   from helper-test dedup into `common::tests`); fmt + clippy
+>   + full test suite clean. `cargo doc --no-deps` exits 101
+>   on the **same 5 pre-existing errors** as Waves 1/2
+>   (`pileup_to_psp.rs` + `ExactMath`); zero introduced by
+>   Wave 3. Carried forward: **5 Deferred** for Waves 4 – 5
+>   (M13 / Mi20 / Mi23 / M1+M2-followup / M5-followup).
+>   Earlier Wave 1 (Public-API hygiene, commit `c7ee0c3`)
+>   report:
+>   [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md);
+>   Wave 2 (Config-construction discipline, commit `f44c086`)
+>   report:
 >   [cohort_cli_2026-05-19_applied_wave2.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md).
->   All 4 Wave-2 findings Applied under Option C (hybrid):
->   **M4** (`PosteriorEngineConfig::contamination` privatised +
->   validating `with_contamination` setter), **Mi2**
->   (`PosteriorEngineConfig::new(...)` 8 positional `f64` args
->   replaced with zero-arg `new()` returning defaults + per-field
->   `with_*` validating setters), **Mi14** (CLI flag, struct
->   field, parser fn, and artefact parameter-map key all
->   renamed to `min_batch_size_for_contamination` — only
->   user-visible CLI break in the 5-wave follow-up), **Mi21**
->   (struct-level doc on `ContaminationEstimationConfig`
->   formalises the validate-after-build contract). 889 lib
->   tests pass (was 887; +2 net from the rewritten builder
->   validation block); fmt + clippy + full test suite clean.
->   `cargo doc --no-deps` still exits 101 on the **same 5
->   pre-existing errors as Wave 1** (2 in `pileup_to_psp.rs`,
->   3 `ExactMath` in `posterior_engine.rs`); zero introduced
->   by Wave 2. Carried forward: 8 Deferred (M10 / M11 / M13 +
->   paired Minors + M5/M9 follow-ups) for Waves 3 – 5.
->   Wave 1 (Public-API hygiene, commit `c7ee0c3`) report:
->   [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md).
 >   The reviewed slice landed earlier on 2026-05-19 in commits
 >   `1523049` through `147e435` (impl report:
 >   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md);
@@ -127,20 +136,22 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
   Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
 - **Latest fixes-applied (cohort slice):**
-  Wave 2 of the deferred follow-up,
-  [cohort_cli_2026-05-19_applied_wave2.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md) —
-  4 more Deferred items closed under Option C: **M4**
-  (`PosteriorEngineConfig.contamination` privatised + builder
-  setter), **Mi2** (`PosteriorEngineConfig::new` rebuilt as 0-arg
-  defaults + per-field `with_*` setters), **Mi14** (CLI flag
-  rename `--min-batch-size` → `--min-batch-size-for-contamination`,
-  same name everywhere — user-visible break), **Mi21** (validate-
-  after-build contract documented). 889 lib tests pass. Wave 1
-  pass (commit `c7ee0c3`):
-  [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md) —
-  4 Applied (M8, Mi5, Mi6, Mi13). Original pass (commit `db1ec2a`):
-  [cohort_cli_2026-05-19_applied.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md) —
-  20 Applied + Mi7 Disputed-with-test.
+  Wave 3 of the deferred follow-up,
+  [cohort_cli_2026-05-19_applied_wave3.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md) —
+  6 more Deferred items closed: **Mi8** (helper extraction
+  via `pop_var_caller::common`), **Mi19**
+  (`DEFAULT_BUFFERED_IO_CAPACITY` constant), **M9-followup**
+  (`ErrorSheddingAdapter<I, T, E>`), **Mi18**
+  (`q_b_per_batch()` accessor), **M10** (`Stage1Args` +
+  `CohortPipelineArgs` clap flatten), **M11**
+  (`drive_cohort_pipeline` shared driver). 887 lib tests
+  pass. Earlier passes:
+  [Wave 2](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md)
+  (M4 / Mi2 / Mi14 / Mi21);
+  [Wave 1](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md)
+  (M8 / Mi5 / Mi6 / Mi13);
+  [original pass](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md)
+  (20 Applied + Mi7 Disputed-with-test).
 - **Code:** [src/pop_var_caller/](src/pop_var_caller/)
 - **Integration tests:**
   [tests/pileup_cli_integration.rs](tests/pileup_cli_integration.rs)
@@ -148,16 +159,14 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from cohort-slice review):**
-  - **Wave 3 (Shared-infrastructure refactor) — pending.** **Mi8**,
-    **Mi19**, **M9 follow-up**, **M10**, **M11**, **Mi18**.
-    The largest wave; now unblocked since Wave 2 settled the
-    config shape for the driver signature.
   - **Wave 4 (Rayon concurrency policy) — pending.** **M13** with
     silent-no-op second-call policy (locked 2026-05-19).
   - **Wave 5 (Test infrastructure + missing coverage) — pending.**
     **Mi20**, **Mi23**, M1/M2 walker-error CRAM test, **M5
     follow-up** (real FASTA → `.psp` MD5 enforcement; wired in
     this wave per the 2026-05-19 decision).
+  - **Closed in Wave 3 (2026-05-19):** **Mi8**, **Mi19**,
+    **M9-followup**, **Mi18**, **M10**, **M11**.
   - **Closed in Wave 2 (2026-05-19):** **M4**, **Mi2**, **Mi14**,
     **Mi21**.
   - **Closed in Wave 1 (2026-05-19):** **M8**, **Mi5**, **Mi6**,
