@@ -163,14 +163,18 @@ pub struct EstimateContaminationArgs {
 
     /// Batches strictly smaller than this floor get `c_s = 0`
     /// regardless of the EM. Singleton batches are always floored.
+    ///
+    /// Flag, field, and artefact parameter-map key share the same
+    /// `min_batch_size_for_contamination` name — Mi14 from the
+    /// 2026-05-19 cohort CLI review unified the three.
     #[arg(
         long,
         hide_short_help = true,
         default_value_t = DEFAULT_MIN_BATCH_SIZE_FOR_CONTAMINATION,
-        value_parser = parsers::parse_min_batch_size,
+        value_parser = parsers::parse_min_batch_size_for_contamination,
         help_heading = "Advanced — Informative-site cuts",
     )]
-    pub min_batch_size: u32,
+    pub min_batch_size_for_contamination: u32,
 
     // ===== Advanced — Priors ===================================
     /// Dirichlet pseudocount on REF reads in the `q_b` update.
@@ -371,7 +375,7 @@ pub fn run_estimate_contamination(
         min_major_fraction: args.min_major_fraction,
         min_cohort_minor_count: args.min_cohort_minor_count,
         min_cohort_minor_fraction: args.min_cohort_minor_fraction,
-        min_batch_size_for_contamination: args.min_batch_size,
+        min_batch_size_for_contamination: args.min_batch_size_for_contamination,
         ref_pseudocount: args.ref_pseudocount,
         snp_alt_pseudocount: args.snp_alt_pseudocount,
         indel_alt_pseudocount: args.indel_alt_pseudocount,
@@ -552,8 +556,8 @@ fn build_parameter_map(
         toml::Value::Float(args.min_cohort_minor_fraction),
     );
     p.insert(
-        "min_batch_size".into(),
-        toml::Value::Integer(args.min_batch_size as i64),
+        "min_batch_size_for_contamination".into(),
+        toml::Value::Integer(args.min_batch_size_for_contamination as i64),
     );
     p.insert(
         "ref_pseudocount".into(),

@@ -47,7 +47,7 @@
 //! - For each batch the three `contaminant_*_prob` values sum to
 //!   `1.0` within `1e-9`, **or** every field is exactly `0.0` — the
 //!   explicit all-zero row is the engine's signal that the batch was
-//!   floored (singleton or below `min_batch_size`) and its `q_b` is
+//!   floored (singleton or below `min_batch_size_for_contamination`) and its `q_b` is
 //!   unused. Compound alleles are implicitly 0 (Assumption 2 of the
 //!   contamination impl report).
 //! - `samples[*].name` is unique within the file.

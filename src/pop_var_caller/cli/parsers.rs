@@ -283,10 +283,15 @@ pub fn parse_min_depth(s: &str) -> Result<u32, String> {
     parse_u32_min(s, "min-depth", 1)
 }
 
-/// `--min-batch-size`: `>= 2`. Singletons are unidentifiable
-/// per [`crate::var_calling::contamination_estimation`].
-pub fn parse_min_batch_size(s: &str) -> Result<u32, String> {
-    parse_u32_min(s, "min-batch-size", 2)
+/// `--min-batch-size-for-contamination`: `>= 2`. Singletons are
+/// unidentifiable per [`crate::var_calling::contamination_estimation`].
+///
+/// Flag name mirrors the engine-side field name
+/// [`crate::var_calling::contamination_estimation::ContaminationEstimationConfig::min_batch_size_for_contamination`]
+/// and the artefact parameter-map key — same concept, same name in
+/// all three places. Mi14 from the 2026-05-19 cohort CLI review.
+pub fn parse_min_batch_size_for_contamination(s: &str) -> Result<u32, String> {
+    parse_u32_min(s, "min-batch-size-for-contamination", 2)
 }
 
 /// `--min-cohort-minor-count`: `>= 1`. A zero floor admits
@@ -490,11 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn min_batch_size_rejects_below_two() {
-        parse_min_batch_size("2").unwrap();
-        parse_min_batch_size("5").unwrap();
-        assert!(parse_min_batch_size("0").is_err());
-        assert!(parse_min_batch_size("1").is_err());
+    fn min_batch_size_for_contamination_rejects_below_two() {
+        parse_min_batch_size_for_contamination("2").unwrap();
+        parse_min_batch_size_for_contamination("5").unwrap();
+        assert!(parse_min_batch_size_for_contamination("0").is_err());
+        assert!(parse_min_batch_size_for_contamination("1").is_err());
     }
 
     #[test]
