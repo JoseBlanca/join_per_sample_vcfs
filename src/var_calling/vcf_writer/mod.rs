@@ -73,7 +73,7 @@ pub const DEFAULT_EMIT_GP: bool = false;
 ///
 /// ```
 /// use std::path::PathBuf;
-/// use merge_per_sample_vcfs::var_calling::vcf_writer::WriterConfig;
+/// use pop_var_caller::var_calling::vcf_writer::WriterConfig;
 ///
 /// let cfg = WriterConfig::new(PathBuf::from("out.vcf")).with_emit_gp(true);
 /// assert_eq!(cfg.emit_gp, true);

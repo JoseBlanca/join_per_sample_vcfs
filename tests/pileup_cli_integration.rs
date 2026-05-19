@@ -13,22 +13,22 @@ use std::io::BufReader;
 use std::path::PathBuf;
 
 use common::{CONTIG_NAME, build_cram, build_fasta, fixture_md5, read_record};
-use merge_per_sample_vcfs::per_sample_pileup::baq::{
+use pop_var_caller::per_sample_pileup::baq::{
     DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
     SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
 };
-use merge_per_sample_vcfs::per_sample_pileup::cram_input::{
+use pop_var_caller::per_sample_pileup::cram_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
     DEFAULT_MISMATCH_BQ_FLOOR,
 };
-use merge_per_sample_vcfs::per_sample_pileup::pileup::{
+use pop_var_caller::per_sample_pileup::pileup::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
 };
-use merge_per_sample_vcfs::per_sample_pileup::psp::PspReader;
-use merge_per_sample_vcfs::per_sample_pileup::psp::header::ParameterValue;
-use merge_per_sample_vcfs::pop_var_caller::cli::shared_args::Stage1Args;
-use merge_per_sample_vcfs::pop_var_caller::{PileupArgs, run_pileup};
+use pop_var_caller::per_sample_pileup::psp::PspReader;
+use pop_var_caller::per_sample_pileup::psp::header::ParameterValue;
+use pop_var_caller::pop_var_caller::cli::shared_args::Stage1Args;
+use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
 use tempfile::TempDir;
 
 /// Default `PileupArgs` instance overridable by the test. We

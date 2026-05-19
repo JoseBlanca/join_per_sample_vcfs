@@ -1,4 +1,4 @@
-//! # `merge_per_sample_vcfs`
+//! # `pop_var_caller`
 //!
 //! Multi-sample variant caller — per-sample → cohort merge pipeline.
 //! See `ia/specs/calling_pipeline_architecture.md` for the stage

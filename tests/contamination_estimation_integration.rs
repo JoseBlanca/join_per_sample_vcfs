@@ -7,20 +7,20 @@
 //! directly rather than rounding through `.psp` on-disk artefacts —
 //! the on-disk path is exercised by `psp_to_pileup_integration.rs`.
 
-use merge_per_sample_vcfs::per_sample_pileup::pileup::{
+use pop_var_caller::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, PileupRecord,
 };
-use merge_per_sample_vcfs::var_calling::contamination_estimation::{
+use pop_var_caller::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, StoppingMode, estimate_contamination,
 };
-use merge_per_sample_vcfs::var_calling::per_group_merger::{
+use pop_var_caller::var_calling::per_group_merger::{
     MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
 };
-use merge_per_sample_vcfs::var_calling::per_position_merger::{
+use pop_var_caller::var_calling::per_position_merger::{
     PerPositionMergerError, PerPositionPileups,
 };
-use merge_per_sample_vcfs::var_calling::posterior_engine::{
+use pop_var_caller::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorRecord,
 };
 

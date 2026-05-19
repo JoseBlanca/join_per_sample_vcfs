@@ -829,40 +829,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "merge_per_sample_vcfs"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "anyhow",
- "bstr",
- "bytemuck",
- "clap",
- "criterion",
- "dhat",
- "flate2",
- "lru",
- "md-5",
- "mimalloc",
- "noodles-bgzf",
- "noodles-core",
- "noodles-cram",
- "noodles-fasta",
- "noodles-sam",
- "noodles-vcf",
- "proptest",
- "rayon",
- "serde",
- "serial_test",
- "smallvec",
- "tempfile",
- "thiserror",
- "toml",
- "wide",
- "xxhash-rust",
- "zstd",
-]
-
-[[package]]
 name = "mimalloc"
 version = "0.1.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1124,6 +1090,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
+]
+
+[[package]]
+name = "pop_var_caller"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "bstr",
+ "bytemuck",
+ "clap",
+ "criterion",
+ "dhat",
+ "flate2",
+ "lru",
+ "md-5",
+ "mimalloc",
+ "noodles-bgzf",
+ "noodles-core",
+ "noodles-cram",
+ "noodles-fasta",
+ "noodles-sam",
+ "noodles-vcf",
+ "proptest",
+ "rayon",
+ "serde",
+ "serial_test",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "wide",
+ "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

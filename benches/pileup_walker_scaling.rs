@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use merge_per_sample_vcfs::per_sample_pileup::pileup::{
+use pop_var_caller::per_sample_pileup::pileup::{
     CigarOp, MateRole, PreparedRead, RefSeqFetcher, WalkerConfig, run,
 };
 

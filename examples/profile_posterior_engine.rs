@@ -21,21 +21,21 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use merge_per_sample_vcfs::per_sample_pileup::pileup::{
+use pop_var_caller::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, ChainId, PileupRecord, RefSeqFetcher,
 };
-use merge_per_sample_vcfs::var_calling::contamination_estimation::ContaminationEstimates;
-use merge_per_sample_vcfs::var_calling::per_group_merger::{
+use pop_var_caller::var_calling::contamination_estimation::ContaminationEstimates;
+use pop_var_caller::var_calling::per_group_merger::{
     MergedRecord, PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
 };
-use merge_per_sample_vcfs::var_calling::per_position_merger::PerPositionPileups;
-use merge_per_sample_vcfs::var_calling::posterior_engine::backends::{
+use pop_var_caller::var_calling::per_position_merger::PerPositionPileups;
+use pop_var_caller::var_calling::posterior_engine::backends::{
     ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend,
 };
-use merge_per_sample_vcfs::var_calling::posterior_engine::{
+use pop_var_caller::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig,
 };
-use merge_per_sample_vcfs::var_calling::variant_grouping::OverlappingVariantGroup;
+use pop_var_caller::var_calling::variant_grouping::OverlappingVariantGroup;
 
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
 

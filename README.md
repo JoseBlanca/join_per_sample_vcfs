@@ -1,4 +1,4 @@
-# merge_per_sample_vcfs
+# Pop Var Caller
 
 Multi-sample SNP caller built around a six-stage pipeline:
 per-sample pileup → `.psp` artefact → DUST filter → variant grouping →

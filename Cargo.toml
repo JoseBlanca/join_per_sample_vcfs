@@ -1,5 +1,5 @@
 [package]
-name = "merge_per_sample_vcfs"
+name = "pop_var_caller"
 version = "0.1.0"
 edition = "2024"
 # Mi22: edition 2024 requires ≥ 1.85; the `let-chains` features

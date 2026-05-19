@@ -15,7 +15,7 @@
 # Any extra arguments are forwarded to `podman build`.
 set -euo pipefail
 
-IMAGE="${IMAGE:-merge_per_sample_vcfs-dev}"
+IMAGE="${IMAGE:-pop-var-caller-dev}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 exec podman build \

@@ -12,43 +12,43 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{WRONG_MD5, build_cram, build_fasta, fixture_md5, read_record};
-use merge_per_sample_vcfs::per_sample_pileup::baq::{
+use pop_var_caller::per_sample_pileup::baq::{
     DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
     SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
 };
-use merge_per_sample_vcfs::per_sample_pileup::cram_input::{
+use pop_var_caller::per_sample_pileup::cram_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MISMATCH_BQ_FLOOR,
 };
-use merge_per_sample_vcfs::per_sample_pileup::pileup::{
+use pop_var_caller::per_sample_pileup::pileup::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
 };
-use merge_per_sample_vcfs::pop_var_caller::cli::shared_args::{CohortPipelineArgs, Stage1Args};
-use merge_per_sample_vcfs::pop_var_caller::estimate_contamination::{
+use pop_var_caller::pop_var_caller::cli::shared_args::{CohortPipelineArgs, Stage1Args};
+use pop_var_caller::pop_var_caller::estimate_contamination::{
     EstimateContaminationArgs, EstimateContaminationCliError, run_estimate_contamination,
 };
-use merge_per_sample_vcfs::pop_var_caller::var_calling::{
+use pop_var_caller::pop_var_caller::var_calling::{
     VarCallingArgs, VarCallingCliError, run_var_calling,
 };
-use merge_per_sample_vcfs::pop_var_caller::var_calling_from_bam::{
+use pop_var_caller::pop_var_caller::var_calling_from_bam::{
     VarCallingFromBamArgs, VarCallingFromBamCliError, run_var_calling_from_bam,
 };
-use merge_per_sample_vcfs::pop_var_caller::{PileupArgs, run_pileup};
-use merge_per_sample_vcfs::var_calling::contamination_estimation::{
+use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
+use pop_var_caller::var_calling::contamination_estimation::{
     DEFAULT_C_S_INIT, DEFAULT_Q_B_INIT_PER_CLASS,
 };
-use merge_per_sample_vcfs::var_calling::dust_filter::{
+use pop_var_caller::var_calling::dust_filter::{
     DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW,
 };
-use merge_per_sample_vcfs::var_calling::per_group_merger::{
+use pop_var_caller::var_calling::per_group_merger::{
     DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
 };
-use merge_per_sample_vcfs::var_calling::posterior_engine::{
+use pop_var_caller::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
     DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
-use merge_per_sample_vcfs::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
+use pop_var_caller::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
 use noodles_sam::alignment::record_buf::RecordBuf;
 use tempfile::TempDir;
 
@@ -348,7 +348,7 @@ contamination_fraction = 0.01
 /// **M13 multi-invocation pattern.** Two consecutive `run_pileup`
 /// calls in the same process must both succeed — the cohort CLI's
 /// rayon-pool gate
-/// ([`configure_rayon_pool`](merge_per_sample_vcfs::pop_var_caller))
+/// ([`configure_rayon_pool`](pop_var_caller::pop_var_caller))
 /// is idempotent, so library consumers and a future
 /// multi-subcommand test runner can chain `run_*` helpers freely.
 ///
@@ -433,7 +433,7 @@ fn estimate_contamination_then_var_calling_chain() {
 /// whose header `chromosome.md5` is `WRONG_MD5` (forced via the
 /// CRAM `@SQ M5`), then run `run_var_calling` against the real
 /// FASTA. Verifies that
-/// [`verify_fasta_matches_psp_chromosomes`](merge_per_sample_vcfs::pop_var_caller)
+/// [`verify_fasta_matches_psp_chromosomes`](pop_var_caller::pop_var_caller)
 /// catches the "right basename, wrong genome build" failure mode
 /// the v1 basename-only check couldn't see, and surfaces a typed
 /// [`VarCallingCliError::FastaContigMd5Mismatch`] before the
@@ -552,7 +552,7 @@ fn var_calling_reports_reference_mismatch_for_psp_with_different_header_basename
 ///      [`VarCallingFromBamCliError::Walker`] variant (not silently
 ///      swallowed) — M1/M2 from the review locked the error path in
 ///      via the
-///      [`ErrorSheddingAdapter`](merge_per_sample_vcfs::pop_var_caller).
+///      [`ErrorSheddingAdapter`](pop_var_caller::pop_var_caller).
 ///   2. The output VCF does not exist on disk afterwards
 ///      (publish-then-retract: the orchestrator best-effort removes
 ///      `<output>` after the rename runs).

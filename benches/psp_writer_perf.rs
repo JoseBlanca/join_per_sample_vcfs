@@ -37,13 +37,13 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
-use merge_per_sample_vcfs::per_sample_pileup::pileup::{
+use pop_var_caller::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, PileupRecord,
 };
-use merge_per_sample_vcfs::per_sample_pileup::psp::header::{
+use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
-use merge_per_sample_vcfs::per_sample_pileup::psp::writer::PspWriter;
+use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
 use std::collections::BTreeMap;
 
 const NUM_RECORDS_SNP: usize = 3_300_000;

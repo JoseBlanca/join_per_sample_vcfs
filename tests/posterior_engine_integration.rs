@@ -5,12 +5,12 @@
 //! Stage 6's contract is independent of Stage 5's internal layout
 //! per the implementation plan.
 
-use merge_per_sample_vcfs::per_sample_pileup::pileup::AlleleSupportStats;
-use merge_per_sample_vcfs::var_calling::per_group_merger::{
+use pop_var_caller::per_sample_pileup::pileup::AlleleSupportStats;
+use pop_var_caller::var_calling::per_group_merger::{
     MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
 };
-use merge_per_sample_vcfs::var_calling::posterior_engine::backends::ExactMath;
-use merge_per_sample_vcfs::var_calling::posterior_engine::{
+use pop_var_caller::var_calling::posterior_engine::backends::ExactMath;
+use pop_var_caller::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
 

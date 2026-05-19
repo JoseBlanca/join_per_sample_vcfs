@@ -12,13 +12,13 @@ use std::io::Read as _;
 
 use tempfile::tempdir;
 
-use merge_per_sample_vcfs::per_sample_pileup::pileup::AlleleSupportStats;
-use merge_per_sample_vcfs::per_sample_pileup::psp::header::ParsedChromosome;
-use merge_per_sample_vcfs::var_calling::per_group_merger::MergedAllele;
-use merge_per_sample_vcfs::var_calling::posterior_engine::{
+use pop_var_caller::per_sample_pileup::pileup::AlleleSupportStats;
+use pop_var_caller::per_sample_pileup::psp::header::ParsedChromosome;
+use pop_var_caller::var_calling::per_group_merger::MergedAllele;
+use pop_var_caller::var_calling::posterior_engine::{
     EmDiagnostics, PosteriorRecord, RecordLocus,
 };
-use merge_per_sample_vcfs::var_calling::vcf_writer::{
+use pop_var_caller::var_calling::vcf_writer::{
     CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig,
 };
 

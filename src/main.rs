@@ -6,7 +6,7 @@ use std::error::Error;
 use std::process;
 
 use clap::Parser;
-use merge_per_sample_vcfs::pop_var_caller::{
+use pop_var_caller::pop_var_caller::{
     Cli, PopVarCallerCommand, run_estimate_contamination, run_pileup, run_psp_to_pileup,
     run_var_calling, run_var_calling_from_bam,
 };

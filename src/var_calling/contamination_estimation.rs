@@ -242,7 +242,7 @@ impl Default for StoppingMode {
 /// # Example
 ///
 /// ```ignore
-/// use merge_per_sample_vcfs::var_calling::contamination_estimation::{
+/// use pop_var_caller::var_calling::contamination_estimation::{
 ///     ContaminationEstimationConfig, estimate_contamination,
 /// };
 ///

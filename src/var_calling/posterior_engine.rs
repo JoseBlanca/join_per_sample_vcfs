@@ -756,10 +756,10 @@ pub struct EmDiagnostics {
 /// # Examples
 ///
 /// ```
-/// use merge_per_sample_vcfs::var_calling::per_group_merger::{
+/// use pop_var_caller::var_calling::per_group_merger::{
 ///     MergedRecord, PerGroupMergerError,
 /// };
-/// use merge_per_sample_vcfs::var_calling::posterior_engine::{
+/// use pop_var_caller::var_calling::posterior_engine::{
 ///     PosteriorEngine, PosteriorEngineError, PosteriorRecord,
 /// };
 ///

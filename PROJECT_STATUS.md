@@ -10,9 +10,8 @@ Skills and agents are instructed to leave it untouched.
 > [doc/devel/specs/calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md);
 > read it before anything else. Companion design context is in
 > [doc/devel/specs/design_principles.md](doc/devel/specs/design_principles.md).
-> All work below is graded against that spec, not against the older
-> gVCF-merger code still present in `src/` (see *Legacy* section at the
-> bottom). For the AI assistant's per-skill instructions on reading and
+> All work below is graded against that spec. For the AI assistant's
+> per-skill instructions on reading and
 > updating this file, see [doc/devel/ia/skills/](doc/devel/ia/skills/) —
 > every skill defines a "Project status protocol" section.
 <!-- ABOUT-PARAGRAPH-END -->

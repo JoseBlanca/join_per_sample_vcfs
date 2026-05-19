@@ -119,7 +119,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use merge_per_sample_vcfs::per_sample_pileup::psp::PspReader;
+    /// use pop_var_caller::per_sample_pileup::psp::PspReader;
     ///
     /// let f = File::open("sample.psp")?;
     /// let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, f))?;
@@ -350,7 +350,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use merge_per_sample_vcfs::per_sample_pileup::psp::PspReader;
+    /// use pop_var_caller::per_sample_pileup::psp::PspReader;
     ///
     /// let f = File::open("sample.psp")?;
     /// let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, f))?;

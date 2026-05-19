@@ -20,12 +20,12 @@ use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use merge_per_sample_vcfs::per_sample_pileup::baq::{
+use pop_var_caller::per_sample_pileup::baq::{
     BaqConfig, BaqEngine, BaqOutcome, BaqStream, DEFAULT_BAQ_CHUNK_SIZE,
 };
-use merge_per_sample_vcfs::per_sample_pileup::cram_input::{CigarOp, MappedRead};
-use merge_per_sample_vcfs::per_sample_pileup::errors::CramInputError;
-use merge_per_sample_vcfs::per_sample_pileup::pileup::RefSeqFetcher;
+use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, MappedRead};
+use pop_var_caller::per_sample_pileup::errors::CramInputError;
+use pop_var_caller::per_sample_pileup::pileup::RefSeqFetcher;
 
 /// Constant-base reference: every fetch returns `vec![b'A'; length]`.
 /// Same trick the pileup walker bench uses to avoid the FASTA

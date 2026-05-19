@@ -1,4 +1,4 @@
-# Development container for merge_per_sample_vcfs.
+# Development container for pop_var_caller.
 #
 # Serves two purposes:
 #   1. Reproducible build/dev environment for the team.
