@@ -79,7 +79,9 @@ pub const DEFAULT_DUST_THRESHOLD: u32 = 20;
 
 /// Triplet length, in bases. Fixed by the algorithm — every
 /// reference to "triplet" in this module means a 3-base word.
-const SD_WLEN: u32 = 3;
+/// Doubles as the minimum window the validator accepts — a window
+/// smaller than the triplet length leaves no room for an interval.
+pub const SD_WLEN: u32 = 3;
 
 /// Largest [`DustFilterConfig::window`] the validator accepts.
 /// Anchored at the value beyond which the `u32` running scores
@@ -89,7 +91,7 @@ const SD_WLEN: u32 = 3;
 /// clean number well below that boundary; any further use case
 /// needing a larger window must first switch the score fields to
 /// `u64`.
-const MAX_DUST_WINDOW: u32 = u16::MAX as u32;
+pub const MAX_DUST_WINDOW: u32 = u16::MAX as u32;
 
 /// Number of distinct ACGT triplets (`4³`). Sizes the per-triplet
 /// count arrays.

@@ -37,6 +37,7 @@ use crate::per_sample_pileup::psp::writer::PspWriter;
 use crate::per_sample_pileup::ref_fetcher::{ChromBoundaryRefFetcher, SyncRefFetcher};
 
 pub mod error_bridge;
+pub mod parsers;
 use error_bridge::ErrorSheddingAdapter;
 
 // ---------------------------------------------------------------------
