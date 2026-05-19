@@ -259,7 +259,7 @@ via rayon.
 
 EM over merged records → final multi-sample VCF.
 
-#### Posterior engine (no-contamination v1)
+#### Posterior engine
 - **Status:** fixes-applied
 - **Spec sections:** `## Stage 6 — posterior engine` in [calling_pipeline_architecture.md](doc/devel/specs/calling_pipeline_architecture.md); background in [freebayes_posterior_gt_probs.md](doc/devel/specs/freebayes_posterior_gt_probs.md) and [gatk_em_calculation.md](doc/devel/specs/gatk_em_calculation.md)
 - **Plan:** [posterior_engine.md](doc/devel/implementation_plans/posterior_engine.md)
