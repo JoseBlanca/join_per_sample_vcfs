@@ -21,38 +21,32 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI follow-up **Wave 3**
->   (Shared-infrastructure refactor) fixes-applied 2026-05-19 —
->   [cohort_cli_2026-05-19_applied_wave3.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md).
->   All 6 Wave-3 findings Applied (largest mechanical wave —
->   ~1500 LOC): **Mi8** (`pop_var_caller::common` extracts five
->   helpers — basename, format_md5_hex, current_command_line,
->   rfc3339_now, civil_from_days — that were duplicated 2-4
->   places each), **Mi19** (`DEFAULT_BUFFERED_IO_CAPACITY: usize
->   = 64 * 1024` constant replaces 6 magic-number literals),
->   **M9 follow-up** (`ErrorSheddingAdapter<I, T, E>`
->   generalised so the from-bam walker shim reuses it instead
->   of an open-coded `.scan()`), **Mi18** (`q_b_per_batch()`
->   accessor on `ContaminationEstimates`; artefact builder no
->   longer linear-scans for a representative sample), **M10**
->   (`Stage1Args` + `CohortPipelineArgs` via clap's
->   `#[command(flatten)]` — three args structs reduced from
->   ~30 duplicated fields to thin wrappers; `cram/baq/walker_config_from_args`
->   helpers unified to take `&Stage1Args`), **M11**
->   (`drive_cohort_pipeline` shared driver — cohort pipeline
->   wiring lives in one place now). 887 lib tests pass (−2
->   from helper-test dedup into `common::tests`); fmt + clippy
->   + full test suite clean. `cargo doc --no-deps` exits 101
->   on the **same 5 pre-existing errors** as Waves 1/2
->   (`pileup_to_psp.rs` + `ExactMath`); zero introduced by
->   Wave 3. Carried forward: **5 Deferred** for Waves 4 – 5
->   (M13 / Mi20 / Mi23 / M1+M2-followup / M5-followup).
->   Earlier Wave 1 (Public-API hygiene, commit `c7ee0c3`)
->   report:
->   [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md);
->   Wave 2 (Config-construction discipline, commit `f44c086`)
->   report:
->   [cohort_cli_2026-05-19_applied_wave2.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md).
+> - **Last completed task:** Cohort CLI follow-up **Wave 4**
+>   (Rayon concurrency policy) fixes-applied 2026-05-19 —
+>   [cohort_cli_2026-05-19_applied_wave4.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave4.md).
+>   Single-finding wave: **M13** Applied under the silent-no-op
+>   second-call policy (locked 2026-05-19). New
+>   `configure_rayon_pool(n)` helper in `pop_var_caller::common`
+>   gates a `static OnceLock<()>` ahead of
+>   `rayon::ThreadPoolBuilder::build_global()`; all 4 subcommand
+>   drivers (`run_pileup`, `run_var_calling`,
+>   `run_var_calling_from_bam`, `run_estimate_contamination`)
+>   migrated. New `serial_test` dev-dep + a `#[serial]`
+>   integration test (`run_pileup_can_be_called_back_to_back`)
+>   plus a `configure_rayon_pool_none_is_always_ok` unit test
+>   cover the multi-invocation pattern. 888 lib tests pass
+>   (+1 vs Wave 3); fmt + clippy + full test suite clean.
+>   `cargo doc --no-deps` exits 101 on the **same 5 pre-existing
+>   errors** (`pileup_to_psp.rs` + `ExactMath`); zero introduced.
+>   Carried forward: **4 Deferred** for Wave 5 (Mi20 / Mi23 /
+>   M1+M2-followup / M5-followup).
+>   Earlier wave reports:
+>   [Wave 1](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md)
+>   (commit `c7ee0c3`),
+>   [Wave 2](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md)
+>   (commit `f44c086`),
+>   [Wave 3](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md)
+>   (commit `248521a`).
 >   The reviewed slice landed earlier on 2026-05-19 in commits
 >   `1523049` through `147e435` (impl report:
 >   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md);
@@ -136,16 +130,12 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
   Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
 - **Latest fixes-applied (cohort slice):**
-  Wave 3 of the deferred follow-up,
-  [cohort_cli_2026-05-19_applied_wave3.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md) —
-  6 more Deferred items closed: **Mi8** (helper extraction
-  via `pop_var_caller::common`), **Mi19**
-  (`DEFAULT_BUFFERED_IO_CAPACITY` constant), **M9-followup**
-  (`ErrorSheddingAdapter<I, T, E>`), **Mi18**
-  (`q_b_per_batch()` accessor), **M10** (`Stage1Args` +
-  `CohortPipelineArgs` clap flatten), **M11**
-  (`drive_cohort_pipeline` shared driver). 887 lib tests
-  pass. Earlier passes:
+  Wave 4 of the deferred follow-up,
+  [cohort_cli_2026-05-19_applied_wave4.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave4.md) —
+  **M13** Applied (silent-no-op rayon-pool gate). 888 lib
+  tests pass. Earlier passes:
+  [Wave 3](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md)
+  (Mi8 / Mi19 / M9-followup / Mi18 / M10 / M11);
   [Wave 2](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md)
   (M4 / Mi2 / Mi14 / Mi21);
   [Wave 1](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md)
@@ -159,12 +149,11 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from cohort-slice review):**
-  - **Wave 4 (Rayon concurrency policy) — pending.** **M13** with
-    silent-no-op second-call policy (locked 2026-05-19).
   - **Wave 5 (Test infrastructure + missing coverage) — pending.**
     **Mi20**, **Mi23**, M1/M2 walker-error CRAM test, **M5
     follow-up** (real FASTA → `.psp` MD5 enforcement; wired in
     this wave per the 2026-05-19 decision).
+  - **Closed in Wave 4 (2026-05-19):** **M13**.
   - **Closed in Wave 3 (2026-05-19):** **Mi8**, **Mi19**,
     **M9-followup**, **Mi18**, **M10**, **M11**.
   - **Closed in Wave 2 (2026-05-19):** **M4**, **Mi2**, **Mi14**,
