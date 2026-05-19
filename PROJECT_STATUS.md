@@ -21,22 +21,33 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI slice fixes-applied 2026-05-19 —
->   [cohort_cli_2026-05-19_applied.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md).
->   20 of 37 findings Applied (9 of 14 Majors + 11 of 23 Minors +
->   PANIC-FREE comment Nits) + Mi7 Disputed-with-test; 16 Deferred
->   (5 Major design-calls — M4 / M8 / M10 / M11 / M13 — plus 11
->   paired Minors). 886 lib tests + every integration target green;
->   `cargo doc --no-deps` is now clean for everything this slice
->   touched (only pre-existing `ExactMath` errors in
->   `posterior_engine.rs` remain, tracked by Stage 6 Mi21).
+> - **Last completed task:** Cohort CLI follow-up **Wave 1**
+>   (Public-API hygiene) fixes-applied 2026-05-19 —
+>   [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md).
+>   All 4 Wave-1 findings Applied: **M8** (`WriterConfig`
+>   `#[non_exhaustive]` + `with_emit_gp` builder), **Mi5**
+>   (`#[non_exhaustive]` on `ContaminationArtefact` + 4
+>   sub-structs), **Mi6** (`SUPPORTED_VERSIONS` allow-list +
+>   `UnsupportedVersion` error variant +
+>   `read_rejects_artefact_with_unknown_version` test), **Mi13**
+>   (file rename `contamination_artifact.rs` →
+>   `contamination_artefact.rs`). 887 lib tests pass (was 886);
+>   fmt + clippy + full test suite clean. `cargo doc --no-deps`
+>   exits 101 but **every error is pre-existing** (2 in
+>   `pileup_to_psp.rs`, 3 `ExactMath` in `posterior_engine.rs`;
+>   tracked by Stage 6 Mi21); zero errors introduced by Wave 1.
+>   Carried forward: 12 Deferred (M4 / M10 / M11 / M13 +
+>   paired Minors + M5/M9 follow-ups) for Waves 2 – 5.
 >   The reviewed slice landed earlier on 2026-05-19 in commits
 >   `1523049` through `147e435` (impl report:
 >   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md);
 >   review: [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md)),
 >   delivering three new subcommands (`var-calling`,
->   `estimate-contamination`, `var-calling-from-bam`). Plan:
->   [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md).
+>   `estimate-contamination`, `var-calling-from-bam`). Plans:
+>   [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md)
+>   (original slice),
+>   [pop_var_caller_cohort_cli_followup.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli_followup.md)
+>   (five-wave deferred follow-up).
 > - **Next task:** _set by human PM._ Standing candidates: the
 >   manual `bcftools view` / `bcftools stats` smoke against real
 >   cohort data (the synthetic fixture in the integration tests is
@@ -110,11 +121,16 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
   Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
 - **Latest fixes-applied (cohort slice):**
+  Wave 1 of the deferred follow-up,
+  [cohort_cli_2026-05-19_applied_wave1.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md) —
+  4 of 16 Deferred items closed: **M8** (`WriterConfig`
+  `#[non_exhaustive]` + builder), **Mi5** (`#[non_exhaustive]` on
+  `ContaminationArtefact` + sub-structs), **Mi6** (schema-version
+  allow-list), **Mi13** (file rename to British spelling).
+  887 lib tests pass; fmt + clippy + full test suite clean. Prior
+  pass (commit `db1ec2a`):
   [cohort_cli_2026-05-19_applied.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md) —
-  20 Applied (9 Majors: M1, M2, M3, M5-doc, M6, M7, M9-doc, M12, M14;
-  11 Minors: Mi1, Mi3, Mi4, Mi9, Mi10, Mi11, Mi12, Mi15, Mi16, Mi17,
-  Mi22; subset of Nits) + Mi7 Disputed-with-test. 16 Deferred (5
-  Major design-calls + 11 paired Minors). 886 lib tests pass.
+  20 Applied + Mi7 Disputed-with-test.
 - **Code:** [src/pop_var_caller/](src/pop_var_caller/)
 - **Integration tests:**
   [tests/pileup_cli_integration.rs](tests/pileup_cli_integration.rs)
@@ -122,44 +138,23 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from cohort-slice review):**
-  - **M4** — post-construction mutation of `posterior_cfg.contamination`
-    bypasses future engine validation. Deferred — design call (privatise
-    fields vs builder vs validated setter).
-  - **M5 follow-up** — FASTA→.psp MD5 enforcement (doc was tightened
-    this round; the wiring work is the long-term answer).
-  - **M8** — `WriterConfig` lacks `#[non_exhaustive]`; the
-    `default_filter_pass` drop remains an unannounced breaking change
-    for downstream consumers. Deferred — public-API design call.
-  - **M9 follow-up** — Generalise `ErrorSheddingAdapter` to be
-    parametric over `<I, T, E>` so the from-bam walker shim can reuse
-    it instead of the open-coded `.scan()` (the doc was fixed this
-    round; the code dedup is the bigger refactor).
-  - **M10** — `VarCallingFromBamArgs` duplicates ~30 fields of
-    `VarCallingArgs` + `PileupArgs`. Deferred — extract via
-    `#[command(flatten)]` sub-structs.
-  - **M11** — Cohort pipeline wiring duplicated near-verbatim between
-    `var_calling.rs` and the new
-    `run_cohort_pipeline_for_single_sample` helper. Deferred —
-    extract a shared `drive_cohort_pipeline` driver.
-  - **M13** — Three `rayon::ThreadPoolBuilder::build_global()` sites
-    with no in-process coordination. Deferred — policy choice (silent
-    `OnceLock` no-op vs typed error).
-  - **Mi2 / Mi21** — Pair with M4 (config-construction shape).
-  - **Mi5 / Mi6** — Pair with M8 (on-disk type `#[non_exhaustive]`
-    + schema versioning gate).
-  - **Mi8 / Mi19** — Pair with M10/M11 (`pop_var_caller::common`
-    helper extraction + `DEFAULT_BUFFERED_IO_CAPACITY` constant).
-  - **Mi13** — File `contamination_artifact.rs` (American) holds type
-    `ContaminationArtefact` (British); deferred mechanical rename.
-  - **Mi14** — CLI knob `min_batch_size` diverges from engine field
-    `min_batch_size_for_contamination`; deferred (touches engine).
-  - **Mi18** — `build_artefact_from_estimates` linear scan; needs
-    new `q_b_per_batch()` engine accessor first.
-  - **Mi20** — Shared `tests/common/` fixture helpers (also satisfies
-    a previously pre-existing standing item).
-  - **Mi23** — Load-bearing `estimate-contamination → var-calling`
-    chain integration test (plus an end-to-end CRAM-fixture test for
-    M1/M2's walker-error path).
+  - **Wave 2 (Config-construction discipline) — pending.** **M4**
+    + **Mi2** + **Mi21** + **Mi14** under Option C (hybrid:
+    builder for the sharp configs, validate-after-build for the
+    wide one). Decisions locked 2026-05-19 in
+    [pop_var_caller_cohort_cli_followup.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli_followup.md).
+  - **Wave 3 (Shared-infrastructure refactor) — pending.** **Mi8**,
+    **Mi19**, **M9 follow-up**, **M10**, **M11**, **Mi18**.
+    The largest wave; depends on Wave 2's config shape for the
+    driver signature.
+  - **Wave 4 (Rayon concurrency policy) — pending.** **M13** with
+    silent-no-op second-call policy (locked 2026-05-19).
+  - **Wave 5 (Test infrastructure + missing coverage) — pending.**
+    **Mi20**, **Mi23**, M1/M2 walker-error CRAM test, **M5
+    follow-up** (real FASTA → `.psp` MD5 enforcement; wired in
+    this wave per the 2026-05-19 decision).
+  - **Closed in Wave 1 (2026-05-19):** **M8**, **Mi5**, **Mi6**,
+    **Mi13**.
   - Selected deferred Nits — drop unused `#[from]` variants, vestigial
     `let _ = cfg;`, `Stage1RunSummary` renames, `DEFAULT_BATCH_ID`
     value-mismatch, etc.
