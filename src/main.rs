@@ -7,7 +7,7 @@ use std::process;
 
 use clap::Parser;
 use merge_per_sample_vcfs::pop_var_caller::{
-    Cli, PopVarCallerCommand, run_pileup, run_psp_to_pileup,
+    Cli, PopVarCallerCommand, run_estimate_contamination, run_pileup, run_psp_to_pileup,
 };
 
 // Walk the `std::error::Error::source()` chain joining messages with
@@ -39,6 +39,9 @@ fn main() {
         PopVarCallerCommand::Pileup(args) => run_pileup(&args).map_err(|e| format_error_chain(&e)),
         PopVarCallerCommand::PspToPileup(args) => {
             run_psp_to_pileup(&args).map_err(|e| format_error_chain(&e))
+        }
+        PopVarCallerCommand::EstimateContamination(args) => {
+            run_estimate_contamination(&args).map_err(|e| format_error_chain(&e))
         }
     };
     if let Err(msg) = result {

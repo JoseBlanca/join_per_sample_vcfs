@@ -45,8 +45,11 @@
 //! - Every probability (`contamination_fraction`,
 //!   `contaminant_*_prob`) is finite and in `[0.0, 1.0]`.
 //! - For each batch the three `contaminant_*_prob` values sum to
-//!   `1.0` within `1e-9` — compound alleles are implicitly 0
-//!   (Assumption 2 of the contamination impl report).
+//!   `1.0` within `1e-9`, **or** every field is exactly `0.0` — the
+//!   explicit all-zero row is the engine's signal that the batch was
+//!   floored (singleton or below `min_batch_size`) and its `q_b` is
+//!   unused. Compound alleles are implicitly 0 (Assumption 2 of the
+//!   contamination impl report).
 //! - `samples[*].name` is unique within the file.
 //!
 //! Sample-name reconciliation against the cohort `.psp` inputs lives
@@ -209,9 +212,16 @@ impl ContaminationArtefact {
                     });
                 }
             }
+            // An explicit all-zero row signals "batch floored, q_b
+            // unused" — engine convention (mirrors
+            // ContaminationEstimates::from_user_supplied). Anything
+            // else must lie on the probability simplex.
+            let all_zero = b.contaminant_ref_prob == 0.0
+                && b.contaminant_snp_alt_prob == 0.0
+                && b.contaminant_indel_alt_prob == 0.0;
             let sum =
                 b.contaminant_ref_prob + b.contaminant_snp_alt_prob + b.contaminant_indel_alt_prob;
-            if (sum - 1.0).abs() > Q_B_SIMPLEX_TOLERANCE {
+            if !all_zero && (sum - 1.0).abs() > Q_B_SIMPLEX_TOLERANCE {
                 return Err(ContaminationArtefactError::BatchProbabilitiesDoNotSum {
                     batch_id: b.id.clone(),
                     sum,
@@ -565,6 +575,18 @@ mod tests {
             a.validate().unwrap_err(),
             ContaminationArtefactError::BatchProbabilitiesDoNotSum { .. }
         ));
+    }
+
+    #[test]
+    fn accepts_all_zero_qb_row_for_floored_batch() {
+        // Engine convention: floored batches carry an all-zero q_b
+        // vector. The validator must accept this even though it does
+        // not lie on the probability simplex.
+        let mut a = fixture();
+        a.batches[0].contaminant_ref_prob = 0.0;
+        a.batches[0].contaminant_snp_alt_prob = 0.0;
+        a.batches[0].contaminant_indel_alt_prob = 0.0;
+        a.validate().unwrap();
     }
 
     #[test]

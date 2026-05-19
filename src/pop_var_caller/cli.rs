@@ -60,6 +60,10 @@ pub enum PopVarCallerCommand {
     /// Stream a .psp as samtools-mpileup-style text plus a trailing
     /// column with per-allele aggregates PSP carries.
     PspToPileup(super::psp_to_pileup::PspToPileupArgs),
+
+    /// Estimate per-sample contamination from cohort `.psp` files and
+    /// emit a TOML artefact consumed by `var-calling`.
+    EstimateContamination(super::estimate_contamination::EstimateContaminationArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the
