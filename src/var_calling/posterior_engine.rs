@@ -128,6 +128,31 @@ pub const DEFAULT_INBREEDING_COEFFICIENT: f64 = 0.0;
 /// once the cohort subcommand lands.
 pub const MAX_GQ_PHRED: f64 = 99.0;
 
+/// Validation upper bound on `convergence_threshold` (cohort CLI plan).
+/// Loose-but-not-degenerate: a `1.0` threshold would always exit after
+/// one EM iteration (max possible per-allele change is `1.0`).
+pub const CONVERGENCE_THRESHOLD_RANGE_MAX: f64 = 0.1;
+
+/// Validation upper bound on `max_iterations` (cohort CLI plan). EM
+/// converges in 3–5 iterations on the GATK reference; `500` is 10× the
+/// default of `50`, generous headroom for debugging without entering
+/// runaway territory.
+pub const MAX_ITERATIONS_RANGE_MAX: u32 = 500;
+
+/// Validation upper bound on Dirichlet pseudocounts. Beyond `1000` the
+/// prior swamps any realistic cohort-level evidence (forces the prior
+/// unconditionally).
+pub const PSEUDOCOUNT_RANGE_MAX: f64 = 1000.0;
+
+/// Validation lower bound on `max_gq_phred` (exclusive). Phred values
+/// below `10` are absurdly low confidence caps.
+pub const GQ_PHRED_RANGE_MIN_EXCLUSIVE: f64 = 10.0;
+
+/// Validation upper bound on `max_gq_phred`. Phred `200` corresponds to
+/// `p = 1e-20` — already absurdly confident; anything higher has no
+/// physical meaning.
+pub const GQ_PHRED_RANGE_MAX: f64 = 200.0;
+
 /// Phred conversion factor — `Phred = -10 · log10(p)`. The literal
 /// `-10.0` appears in every Phred-conversion site; the named const
 /// keeps the meaning in one place.
@@ -233,6 +258,131 @@ impl PosteriorEngineConfig {
             contamination: None,
         }
     }
+
+    /// Validated constructor — closes Stage 6 review finding **Mi12**.
+    /// Range bounds match the cohort CLI plan's "Config validation"
+    /// table; the CLI side mirrors these in [`value_parser`] hooks.
+    ///
+    /// Sets `fixation_index_overrides` to `None`,
+    /// `approximate_posterior_calculation` to `false`, and
+    /// `contamination` to `None`. Library callers can tweak those fields
+    /// directly after construction.
+    ///
+    /// # Errors
+    ///
+    /// Each `PosteriorEngineConfigError` variant names the rejected
+    /// field and value. Validation rules in order of fields above:
+    ///
+    /// * `convergence_threshold`: finite, in `(0.0, 0.1]`.
+    /// * `max_iterations`: in `1..=500`.
+    /// * `ref_pseudocount`, `snp_alt_pseudocount`, `indel_alt_pseudocount`,
+    ///   `compound_alt_pseudocount`: each finite, in `(0.0, 1000.0]`.
+    /// * `fixation_index_default`: finite, in `[0.0, 1.0]`.
+    /// * `max_gq_phred`: finite, in `(10.0, 200.0]`.
+    ///
+    /// [`value_parser`]: https://docs.rs/clap/latest/clap/builder/struct.Arg.html#method.value_parser
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        convergence_threshold: f64,
+        max_iterations: u32,
+        ref_pseudocount: f64,
+        snp_alt_pseudocount: f64,
+        indel_alt_pseudocount: f64,
+        compound_alt_pseudocount: f64,
+        fixation_index_default: f64,
+        max_gq_phred: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        if !(convergence_threshold.is_finite()
+            && 0.0 < convergence_threshold
+            && convergence_threshold <= CONVERGENCE_THRESHOLD_RANGE_MAX)
+        {
+            return Err(PosteriorEngineConfigError::InvalidConvergenceThreshold {
+                got: convergence_threshold,
+            });
+        }
+        if !(1..=MAX_ITERATIONS_RANGE_MAX).contains(&max_iterations) {
+            return Err(PosteriorEngineConfigError::InvalidMaxIterations {
+                got: max_iterations,
+            });
+        }
+        for (name, value) in [
+            ("ref_pseudocount", ref_pseudocount),
+            ("snp_alt_pseudocount", snp_alt_pseudocount),
+            ("indel_alt_pseudocount", indel_alt_pseudocount),
+            ("compound_alt_pseudocount", compound_alt_pseudocount),
+        ] {
+            if !(value.is_finite() && 0.0 < value && value <= PSEUDOCOUNT_RANGE_MAX) {
+                return Err(PosteriorEngineConfigError::InvalidPseudocount {
+                    field: name,
+                    got: value,
+                });
+            }
+        }
+        if !(fixation_index_default.is_finite() && (0.0..=1.0).contains(&fixation_index_default)) {
+            return Err(PosteriorEngineConfigError::InvalidFixationIndex {
+                got: fixation_index_default,
+            });
+        }
+        if !(max_gq_phred.is_finite()
+            && GQ_PHRED_RANGE_MIN_EXCLUSIVE < max_gq_phred
+            && max_gq_phred <= GQ_PHRED_RANGE_MAX)
+        {
+            return Err(PosteriorEngineConfigError::InvalidMaxGqPhred { got: max_gq_phred });
+        }
+        Ok(Self {
+            convergence_threshold,
+            max_iterations,
+            ref_pseudocount,
+            snp_alt_pseudocount,
+            indel_alt_pseudocount,
+            compound_alt_pseudocount,
+            fixation_index_default,
+            fixation_index_overrides: None,
+            max_gq_phred,
+            approximate_posterior_calculation: false,
+            contamination: None,
+        })
+    }
+}
+
+/// Config-construction errors for [`PosteriorEngineConfig::new`].
+/// Distinct from [`PosteriorEngineError`] (runtime errors during
+/// iteration) — a `PosteriorEngineConfigError` is surfaced at
+/// construction time before any upstream records have been pulled.
+#[non_exhaustive]
+#[derive(Error, Debug, PartialEq)]
+pub enum PosteriorEngineConfigError {
+    /// `convergence_threshold` was non-finite or outside `(0.0, 0.1]`.
+    /// A threshold ≥ 1.0 would always exit after one EM iteration; the
+    /// 0.1 upper bound is a strict "10 % per-allele change is loose but
+    /// not absurd" line.
+    #[error(
+        "convergence_threshold must be finite and in (0.0, {CONVERGENCE_THRESHOLD_RANGE_MAX}], got {got}"
+    )]
+    InvalidConvergenceThreshold { got: f64 },
+
+    /// `max_iterations` was outside `1..=500`. The default is 50; 500
+    /// is 10× generous headroom.
+    #[error("max_iterations must be in 1..={MAX_ITERATIONS_RANGE_MAX}, got {got}")]
+    InvalidMaxIterations { got: u32 },
+
+    /// One of the Dirichlet pseudocounts was non-finite or outside
+    /// `(0.0, 1000.0]`. `field` names which one.
+    #[error("{field} must be finite and in (0.0, {PSEUDOCOUNT_RANGE_MAX}], got {got}")]
+    InvalidPseudocount { field: &'static str, got: f64 },
+
+    /// `fixation_index_default` was non-finite or outside `[0.0, 1.0]`.
+    /// `0.0` is outcrossing, `1.0` is full inbreeding.
+    #[error("fixation_index_default must be finite and in [0.0, 1.0], got {got}")]
+    InvalidFixationIndex { got: f64 },
+
+    /// `max_gq_phred` was non-finite or outside `(10.0, 200.0]`. Phred
+    /// 200 already corresponds to `p = 1e-20`; values below 10 are
+    /// absurdly low confidence caps.
+    #[error(
+        "max_gq_phred must be finite and in ({GQ_PHRED_RANGE_MIN_EXCLUSIVE}, {GQ_PHRED_RANGE_MAX}], got {got}"
+    )]
+    InvalidMaxGqPhred { got: f64 },
 }
 
 /// Why a posterior calculation hit an unrecoverable value. Surfaced
@@ -4268,5 +4418,162 @@ mod tests {
             let pr_b = out_b.into_iter().next().unwrap().expect("posterior");
             prop_assert!(pr_b.allele_frequencies[1] <= pr_a.allele_frequencies[1] + 1e-9);
         }
+    }
+
+    // ---------- PosteriorEngineConfig::new validation tests ----------
+
+    fn default_new_args() -> (f64, u32, f64, f64, f64, f64, f64, f64) {
+        (
+            DEFAULT_CONVERGENCE_THRESHOLD,
+            DEFAULT_MAX_ITERATIONS,
+            DEFAULT_REF_PSEUDOCOUNT,
+            DEFAULT_SNP_ALT_PSEUDOCOUNT,
+            DEFAULT_INDEL_ALT_PSEUDOCOUNT,
+            DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
+            DEFAULT_INBREEDING_COEFFICIENT,
+            MAX_GQ_PHRED,
+        )
+    }
+
+    #[test]
+    fn config_new_accepts_defaults() {
+        let (a, b, c, d, e, f, g, h) = default_new_args();
+        let cfg = PosteriorEngineConfig::new(a, b, c, d, e, f, g, h).unwrap();
+        assert_eq!(cfg.convergence_threshold, DEFAULT_CONVERGENCE_THRESHOLD);
+        assert_eq!(cfg.max_iterations, DEFAULT_MAX_ITERATIONS);
+        assert!(cfg.fixation_index_overrides.is_none());
+        assert!(!cfg.approximate_posterior_calculation);
+        assert!(cfg.contamination.is_none());
+    }
+
+    #[test]
+    fn config_new_rejects_nan_threshold() {
+        let (_, b, c, d, e, f, g, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(f64::NAN, b, c, d, e, f, g, h).unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidConvergenceThreshold { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_rejects_zero_threshold() {
+        let (_, b, c, d, e, f, g, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(0.0, b, c, d, e, f, g, h).unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidConvergenceThreshold { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_rejects_threshold_just_above_max() {
+        let (_, b, c, d, e, f, g, h) = default_new_args();
+        let err =
+            PosteriorEngineConfig::new(CONVERGENCE_THRESHOLD_RANGE_MAX + 1e-9, b, c, d, e, f, g, h)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidConvergenceThreshold { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_accepts_threshold_at_max() {
+        let (_, b, c, d, e, f, g, h) = default_new_args();
+        PosteriorEngineConfig::new(CONVERGENCE_THRESHOLD_RANGE_MAX, b, c, d, e, f, g, h).unwrap();
+    }
+
+    #[test]
+    fn config_new_rejects_zero_iterations() {
+        let (a, _, c, d, e, f, g, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(a, 0, c, d, e, f, g, h).unwrap_err();
+        assert_eq!(
+            err,
+            PosteriorEngineConfigError::InvalidMaxIterations { got: 0 }
+        );
+    }
+
+    #[test]
+    fn config_new_rejects_iterations_above_max() {
+        let (a, _, c, d, e, f, g, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(a, MAX_ITERATIONS_RANGE_MAX + 1, c, d, e, f, g, h)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidMaxIterations { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_rejects_zero_pseudocount() {
+        let (a, b, _, d, e, f, g, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(a, b, 0.0, d, e, f, g, h).unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidPseudocount {
+                field: "ref_pseudocount",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_new_rejects_pseudocount_above_max() {
+        let (a, b, _, d, e, f, g, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(a, b, PSEUDOCOUNT_RANGE_MAX + 1.0, d, e, f, g, h)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidPseudocount {
+                field: "ref_pseudocount",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_new_rejects_inbreeding_above_one() {
+        let (a, b, c, d, e, f, _, h) = default_new_args();
+        let err = PosteriorEngineConfig::new(a, b, c, d, e, f, 1.5, h).unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidFixationIndex { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_accepts_inbreeding_boundaries() {
+        let (a, b, c, d, e, f, _, h) = default_new_args();
+        PosteriorEngineConfig::new(a, b, c, d, e, f, 0.0, h).unwrap();
+        PosteriorEngineConfig::new(a, b, c, d, e, f, 1.0, h).unwrap();
+    }
+
+    #[test]
+    fn config_new_rejects_max_gq_below_min() {
+        let (a, b, c, d, e, f, g, _) = default_new_args();
+        let err = PosteriorEngineConfig::new(a, b, c, d, e, f, g, GQ_PHRED_RANGE_MIN_EXCLUSIVE)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidMaxGqPhred { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_rejects_max_gq_above_max() {
+        let (a, b, c, d, e, f, g, _) = default_new_args();
+        let err =
+            PosteriorEngineConfig::new(a, b, c, d, e, f, g, GQ_PHRED_RANGE_MAX + 0.1).unwrap_err();
+        assert!(matches!(
+            err,
+            PosteriorEngineConfigError::InvalidMaxGqPhred { .. }
+        ));
+    }
+
+    #[test]
+    fn config_new_accepts_max_gq_at_max() {
+        let (a, b, c, d, e, f, g, _) = default_new_args();
+        PosteriorEngineConfig::new(a, b, c, d, e, f, g, GQ_PHRED_RANGE_MAX).unwrap();
     }
 }

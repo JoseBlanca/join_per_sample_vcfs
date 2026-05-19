@@ -160,7 +160,6 @@ fn plain_text_path_writes_three_records_with_default_config() {
     let metadata = metadata_two_samples();
     let config = WriterConfig {
         output: out.clone(),
-        default_filter_pass: true,
         emit_gp: false,
     };
 
@@ -228,7 +227,6 @@ fn plain_text_path_with_emit_gp_adds_format_column() {
     let metadata = metadata_two_samples();
     let config = WriterConfig {
         output: out.clone(),
-        default_filter_pass: true,
         emit_gp: true,
     };
 
@@ -262,7 +260,6 @@ fn bgzf_path_writes_compressed_vcf_with_eof_marker() {
     let metadata = metadata_two_samples();
     let config = WriterConfig {
         output: out.clone(),
-        default_filter_pass: true,
         emit_gp: false,
     };
 
@@ -302,7 +299,6 @@ fn out_of_order_records_surface_a_clear_error() {
     let metadata = metadata_two_samples();
     let config = WriterConfig {
         output: out,
-        default_filter_pass: true,
         emit_gp: false,
     };
     let mut writer = CohortVcfWriter::new(metadata, config).unwrap();

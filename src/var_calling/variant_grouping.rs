@@ -58,6 +58,40 @@ impl Default for GrouperConfig {
     }
 }
 
+impl GrouperConfig {
+    /// Validated constructor. Returns
+    /// [`GrouperConfigError::InvalidMaxVariantGroupSpan`] if
+    /// `max_variant_group_span == 0` (a zero cap makes every non-empty
+    /// group trip [`GrouperError::VariantGroupTooWide`] — degenerate).
+    ///
+    /// Public fields stay accessible for tests and library use; this
+    /// constructor is the validated entry point that the CLI funnels
+    /// through.
+    pub fn new(max_variant_group_span: u32) -> Result<Self, GrouperConfigError> {
+        if max_variant_group_span == 0 {
+            return Err(GrouperConfigError::InvalidMaxVariantGroupSpan {
+                got: max_variant_group_span,
+            });
+        }
+        Ok(Self {
+            max_variant_group_span,
+        })
+    }
+}
+
+/// Config-construction errors for [`GrouperConfig::new`]. Distinct from
+/// [`GrouperError`] (runtime errors during iteration) — a
+/// `GrouperConfigError` is surfaced at construction time before any
+/// upstream records have been pulled.
+#[non_exhaustive]
+#[derive(Error, Debug, PartialEq)]
+pub enum GrouperConfigError {
+    /// `max_variant_group_span` was zero. A zero cap is degenerate (every
+    /// non-empty group exceeds it).
+    #[error("max_variant_group_span must be >= 1, got {got}")]
+    InvalidMaxVariantGroupSpan { got: u32 },
+}
+
 /// One emitted item: a single overlap-bundle of per-position pileups,
 /// in strictly increasing `pos` order. `start` and `end` are 1-based
 /// inclusive and cover the union of every record's REF span.
@@ -781,5 +815,26 @@ mod tests {
         };
         let grouper = VariantGrouper::with_config(iter_from(Vec::<Item>::new()), cfg);
         assert_eq!(grouper.config().max_variant_group_span, 42);
+    }
+
+    #[test]
+    fn config_new_accepts_one() {
+        let cfg = GrouperConfig::new(1).expect("1 is valid");
+        assert_eq!(cfg.max_variant_group_span, 1);
+    }
+
+    #[test]
+    fn config_new_accepts_default() {
+        let cfg = GrouperConfig::new(DEFAULT_MAX_VARIANT_GROUP_SPAN).unwrap();
+        assert_eq!(cfg.max_variant_group_span, DEFAULT_MAX_VARIANT_GROUP_SPAN);
+    }
+
+    #[test]
+    fn config_new_rejects_zero() {
+        let err = GrouperConfig::new(0).expect_err("0 is invalid");
+        assert_eq!(
+            err,
+            GrouperConfigError::InvalidMaxVariantGroupSpan { got: 0 }
+        );
     }
 }

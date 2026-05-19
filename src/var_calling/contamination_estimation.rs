@@ -112,6 +112,33 @@ pub const DEFAULT_SNP_ALT_PSEUDOCOUNT: f64 = 0.01;
 pub const DEFAULT_INDEL_ALT_PSEUDOCOUNT: f64 = 0.00125;
 
 // ---------------------------------------------------------------------
+// Validation range constants — match the cohort CLI plan's table.
+// ---------------------------------------------------------------------
+
+/// Validation upper bound on `stability_tolerance` (cohort CLI plan).
+/// A tolerance of `1.0` is meaningless (per-sample `c_s` lives in
+/// `[0, 1]` so any delta is below 1.0); `0.1` is already very loose.
+pub const STABILITY_TOLERANCE_RANGE_MAX: f64 = 0.1;
+
+/// Validation lower bound on `min_major_fraction` (exclusive). A
+/// "major"-allele fraction at or below `0.5` is contradictory.
+pub const MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE: f64 = 0.5;
+
+/// Validation upper bound on `min_cohort_minor_fraction` (exclusive).
+/// A "minor"-allele fraction at or above `0.5` is contradictory.
+pub const MIN_COHORT_MINOR_FRACTION_RANGE_MAX_EXCLUSIVE: f64 = 0.5;
+
+/// Validation upper bound on Dirichlet pseudocounts. Mirrors the
+/// posterior engine value (`PSEUDOCOUNT_RANGE_MAX`); kept module-local
+/// so the contamination side-pass stays self-contained.
+pub const PSEUDOCOUNT_RANGE_MAX: f64 = 1000.0;
+
+/// Validation upper bound on `c_s_init`. A contamination prior `> 0.5`
+/// flips the mixture model — the sample's real reads become the
+/// assumed contaminant.
+pub const C_S_INIT_RANGE_MAX: f64 = 0.5;
+
+// ---------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------
 
@@ -251,6 +278,103 @@ impl ContaminationEstimationConfig {
             c_s_init: DEFAULT_C_S_INIT,
             q_b_init_per_class: DEFAULT_Q_B_INIT_PER_CLASS,
         }
+    }
+
+    /// Validate the config against the cohort CLI plan's range table.
+    /// Returns the first violation found. The CLI calls this at parse
+    /// time so out-of-range values surface before any `.psp` is opened;
+    /// library callers can re-validate after tweaking
+    /// `with_project_defaults()` fields.
+    ///
+    /// Many-field config — the validate-after-build pattern is used
+    /// instead of a positional `new(...)` because 14+ numeric arguments
+    /// would be hostile at the call site.
+    pub fn validate(&self) -> Result<(), ContaminationEstimationError> {
+        // Stopping mode — numeric sub-fields need their own ranges.
+        match self.stopping_mode {
+            StoppingMode::Convergence {
+                tolerance,
+                stability_blocks,
+            } => {
+                if !(tolerance.is_finite()
+                    && 0.0 < tolerance
+                    && tolerance <= STABILITY_TOLERANCE_RANGE_MAX)
+                {
+                    return Err(ContaminationEstimationError::InvalidStabilityTolerance {
+                        got: tolerance,
+                    });
+                }
+                if stability_blocks == 0 {
+                    return Err(ContaminationEstimationError::ZeroStabilityBlocks);
+                }
+            }
+            StoppingMode::FixedSites { num_sites } => {
+                if num_sites == 0 {
+                    return Err(ContaminationEstimationError::ZeroFixedSites);
+                }
+            }
+        }
+
+        // Counts — re-check the inline pre-existing rules so the
+        // Config carries the full guarantee end-to-end.
+        if self.block_size == 0 {
+            return Err(ContaminationEstimationError::ZeroBlockSize);
+        }
+        if self.min_depth == 0 {
+            return Err(ContaminationEstimationError::ZeroMinDepth);
+        }
+        if self.min_batch_size_for_contamination < 2 {
+            return Err(ContaminationEstimationError::MinBatchSizeBelowFloor {
+                got: self.min_batch_size_for_contamination,
+            });
+        }
+
+        // Fractions.
+        if !(self.min_major_fraction.is_finite()
+            && MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE < self.min_major_fraction
+            && self.min_major_fraction <= 1.0)
+        {
+            return Err(ContaminationEstimationError::InvalidMinMajorFraction {
+                got: self.min_major_fraction,
+            });
+        }
+        if !(self.min_cohort_minor_fraction.is_finite()
+            && (0.0..MIN_COHORT_MINOR_FRACTION_RANGE_MAX_EXCLUSIVE)
+                .contains(&self.min_cohort_minor_fraction))
+        {
+            return Err(
+                ContaminationEstimationError::InvalidMinCohortMinorFraction {
+                    got: self.min_cohort_minor_fraction,
+                },
+            );
+        }
+
+        // Pseudocounts.
+        for (name, value) in [
+            ("ref_pseudocount", self.ref_pseudocount),
+            ("snp_alt_pseudocount", self.snp_alt_pseudocount),
+            ("indel_alt_pseudocount", self.indel_alt_pseudocount),
+        ] {
+            if !(value.is_finite() && 0.0 < value && value <= PSEUDOCOUNT_RANGE_MAX) {
+                return Err(ContaminationEstimationError::InvalidPseudocount {
+                    field: name,
+                    got: value,
+                });
+            }
+        }
+
+        // Priors / inits.
+        if !(self.c_s_init.is_finite() && (0.0..=C_S_INIT_RANGE_MAX).contains(&self.c_s_init)) {
+            return Err(ContaminationEstimationError::InvalidCsInit { got: self.c_s_init });
+        }
+        if !(self.q_b_init_per_class.is_finite() && (0.0..=1.0).contains(&self.q_b_init_per_class))
+        {
+            return Err(ContaminationEstimationError::InvalidQbInit {
+                got: self.q_b_init_per_class,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -530,6 +654,53 @@ pub enum ContaminationEstimationError {
         class_idx: usize,
         value: f64,
     },
+
+    /// `StoppingMode::Convergence.tolerance` was non-finite or outside
+    /// `(0.0, 0.1]`. Surfaced by [`ContaminationEstimationConfig::validate`].
+    #[error(
+        "stability_tolerance must be finite and in (0.0, {STABILITY_TOLERANCE_RANGE_MAX}], got {got}"
+    )]
+    InvalidStabilityTolerance { got: f64 },
+
+    /// `StoppingMode::Convergence.stability_blocks` was zero. At least
+    /// one snapshot is required to declare convergence.
+    #[error("stability_blocks must be >= 1")]
+    ZeroStabilityBlocks,
+
+    /// `StoppingMode::FixedSites.num_sites` was zero. The fixed-N mode
+    /// needs at least one site to make progress.
+    #[error("num_sites must be >= 1")]
+    ZeroFixedSites,
+
+    /// `min_major_fraction` was non-finite or outside `(0.5, 1.0]`. A
+    /// "major"-allele fraction at or below 0.5 is contradictory.
+    #[error(
+        "min_major_fraction must be finite and in ({MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE}, 1.0], got {got}"
+    )]
+    InvalidMinMajorFraction { got: f64 },
+
+    /// `min_cohort_minor_fraction` was non-finite or outside
+    /// `[0.0, 0.5)`. A "minor"-allele fraction at or above 0.5 is
+    /// contradictory.
+    #[error(
+        "min_cohort_minor_fraction must be finite and in [0.0, {MIN_COHORT_MINOR_FRACTION_RANGE_MAX_EXCLUSIVE}), got {got}"
+    )]
+    InvalidMinCohortMinorFraction { got: f64 },
+
+    /// One of the Dirichlet pseudocounts was non-finite or outside
+    /// `(0.0, 1000.0]`. `field` names which one.
+    #[error("{field} must be finite and in (0.0, {PSEUDOCOUNT_RANGE_MAX}], got {got}")]
+    InvalidPseudocount { field: &'static str, got: f64 },
+
+    /// `c_s_init` was non-finite or outside `[0.0, 0.5]`. A
+    /// contamination prior above 0.5 flips the mixture model — the
+    /// sample's real reads become the assumed contaminant.
+    #[error("c_s_init must be finite and in [0.0, {C_S_INIT_RANGE_MAX}], got {got}")]
+    InvalidCsInit { got: f64 },
+
+    /// `q_b_init_per_class` was non-finite or outside `[0.0, 1.0]`.
+    #[error("q_b_init_per_class must be finite and in [0.0, 1.0], got {got}")]
+    InvalidQbInit { got: f64 },
 }
 
 // ---------------------------------------------------------------------
@@ -2022,5 +2193,153 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------- ContaminationEstimationConfig::validate tests ----------
+
+    #[test]
+    fn config_validate_accepts_project_defaults() {
+        ContaminationEstimationConfig::with_project_defaults()
+            .validate()
+            .expect("project defaults are valid");
+    }
+
+    #[test]
+    fn config_validate_rejects_stability_tolerance_nan() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.stopping_mode = StoppingMode::Convergence {
+            tolerance: f64::NAN,
+            stability_blocks: DEFAULT_STABILITY_BLOCKS,
+        };
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidStabilityTolerance { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_stability_tolerance_above_max() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.stopping_mode = StoppingMode::Convergence {
+            tolerance: STABILITY_TOLERANCE_RANGE_MAX + 1e-9,
+            stability_blocks: DEFAULT_STABILITY_BLOCKS,
+        };
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidStabilityTolerance { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validate_accepts_stability_tolerance_at_max() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.stopping_mode = StoppingMode::Convergence {
+            tolerance: STABILITY_TOLERANCE_RANGE_MAX,
+            stability_blocks: DEFAULT_STABILITY_BLOCKS,
+        };
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_stability_blocks() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.stopping_mode = StoppingMode::Convergence {
+            tolerance: DEFAULT_STABILITY_TOLERANCE,
+            stability_blocks: 0,
+        };
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::ZeroStabilityBlocks
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_fixed_sites() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.stopping_mode = StoppingMode::FixedSites { num_sites: 0 };
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::ZeroFixedSites
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_min_major_at_boundary() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.min_major_fraction = MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidMinMajorFraction { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_min_cohort_minor_at_boundary() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.min_cohort_minor_fraction = MIN_COHORT_MINOR_FRACTION_RANGE_MAX_EXCLUSIVE;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidMinCohortMinorFraction { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_pseudocount() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.ref_pseudocount = 0.0;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidPseudocount {
+                field: "ref_pseudocount",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_c_s_init_above_max() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.c_s_init = C_S_INIT_RANGE_MAX + 1e-9;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidCsInit { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validate_accepts_c_s_init_at_boundary() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.c_s_init = C_S_INIT_RANGE_MAX;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn config_validate_rejects_q_b_init_above_one() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.q_b_init_per_class = 1.1;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::InvalidQbInit { .. }
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_zero_block_size() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.block_size = 0;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::ZeroBlockSize
+        ));
+    }
+
+    #[test]
+    fn config_validate_rejects_below_floor_batch_size() {
+        let mut cfg = ContaminationEstimationConfig::with_project_defaults();
+        cfg.min_batch_size_for_contamination = 1;
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ContaminationEstimationError::MinBatchSizeBelowFloor { got: 1 }
+        ));
     }
 }

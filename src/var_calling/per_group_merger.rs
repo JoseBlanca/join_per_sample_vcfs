@@ -96,6 +96,68 @@ impl Default for PerGroupMergerConfig {
     }
 }
 
+/// Inclusive upper bound on [`PerGroupMergerConfig::ploidy`]. Octoploid
+/// wheat is the realistic high-water mark for population cohorts; `u8`'s
+/// `255` is mathematically permitted but degenerate in practice. Matches
+/// the cohort CLI plan's validation table.
+pub const MAX_PLOIDY: u8 = 8;
+
+/// Inclusive upper bound on [`PerGroupMergerConfig::max_alleles`]. Wide
+/// enough for the most polyallelic real loci; `16` already exceeds the
+/// GATK default (`6`) almost 3×. Matches the cohort CLI plan.
+pub const MAX_ALLELES_PER_VAR_CAP: usize = 16;
+
+impl PerGroupMergerConfig {
+    /// Validated constructor. Range bounds — matching the cohort CLI
+    /// plan's "Config validation" table — are enforced here:
+    ///
+    /// * `ploidy` ∈ `1..=MAX_PLOIDY` (default `2`).
+    /// * `max_alleles` ∈ `2..=MAX_ALLELES_PER_VAR_CAP` (default `6`).
+    /// * `batch_size` ≥ `1` (a zero batch would never refill).
+    ///
+    /// Public fields stay accessible for tests and library use; this
+    /// constructor is the validated entry point that the CLI funnels
+    /// through.
+    pub fn new(
+        ploidy: u8,
+        max_alleles: usize,
+        batch_size: usize,
+    ) -> Result<Self, PerGroupMergerConfigError> {
+        if !(1..=MAX_PLOIDY).contains(&ploidy) {
+            return Err(PerGroupMergerConfigError::InvalidPloidy { got: ploidy });
+        }
+        if !(2..=MAX_ALLELES_PER_VAR_CAP).contains(&max_alleles) {
+            return Err(PerGroupMergerConfigError::InvalidMaxAlleles { got: max_alleles });
+        }
+        if batch_size == 0 {
+            return Err(PerGroupMergerConfigError::InvalidBatchSize { got: batch_size });
+        }
+        Ok(Self {
+            ploidy,
+            max_alleles,
+            batch_size,
+        })
+    }
+}
+
+/// Config-construction errors for [`PerGroupMergerConfig::new`].
+#[non_exhaustive]
+#[derive(Error, Debug, PartialEq)]
+pub enum PerGroupMergerConfigError {
+    /// `ploidy` was out of range `1..=MAX_PLOIDY`.
+    #[error("ploidy must be in 1..={MAX_PLOIDY}, got {got}")]
+    InvalidPloidy { got: u8 },
+
+    /// `max_alleles` was out of range `2..=MAX_ALLELES_PER_VAR_CAP`.
+    #[error("max_alleles must be in 2..={MAX_ALLELES_PER_VAR_CAP}, got {got}")]
+    InvalidMaxAlleles { got: usize },
+
+    /// `batch_size` was zero. A zero batch would never refill the
+    /// merger.
+    #[error("batch_size must be >= 1, got {got}")]
+    InvalidBatchSize { got: usize },
+}
+
 /// One allele in the merged set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergedAllele {
@@ -2946,5 +3008,79 @@ mod tests {
             Ok(_) => panic!("expected NoQualityForChainAnchoredCompound, got Ok"),
             Err(other) => panic!("expected NoQualityForChainAnchoredCompound, got {other:?}"),
         }
+    }
+
+    // ---------- config / API smoke tests ----------
+
+    #[test]
+    fn config_new_accepts_defaults() {
+        let cfg = PerGroupMergerConfig::new(
+            DEFAULT_PLOIDY,
+            DEFAULT_MAX_ALLELES_PER_RECORD,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap();
+        assert_eq!(cfg.ploidy, DEFAULT_PLOIDY);
+        assert_eq!(cfg.max_alleles, DEFAULT_MAX_ALLELES_PER_RECORD);
+        assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn config_new_accepts_range_boundaries() {
+        // Just inside both bounds.
+        PerGroupMergerConfig::new(1, 2, 1).unwrap();
+        PerGroupMergerConfig::new(MAX_PLOIDY, MAX_ALLELES_PER_VAR_CAP, 1024).unwrap();
+    }
+
+    #[test]
+    fn config_new_rejects_zero_ploidy() {
+        let err = PerGroupMergerConfig::new(0, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_BATCH_SIZE)
+            .unwrap_err();
+        assert_eq!(err, PerGroupMergerConfigError::InvalidPloidy { got: 0 });
+    }
+
+    #[test]
+    fn config_new_rejects_too_high_ploidy() {
+        let err = PerGroupMergerConfig::new(
+            MAX_PLOIDY + 1,
+            DEFAULT_MAX_ALLELES_PER_RECORD,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PerGroupMergerConfigError::InvalidPloidy {
+                got: MAX_PLOIDY + 1
+            }
+        );
+    }
+
+    #[test]
+    fn config_new_rejects_one_allele() {
+        let err = PerGroupMergerConfig::new(DEFAULT_PLOIDY, 1, DEFAULT_BATCH_SIZE).unwrap_err();
+        assert_eq!(err, PerGroupMergerConfigError::InvalidMaxAlleles { got: 1 });
+    }
+
+    #[test]
+    fn config_new_rejects_too_many_alleles() {
+        let err = PerGroupMergerConfig::new(
+            DEFAULT_PLOIDY,
+            MAX_ALLELES_PER_VAR_CAP + 1,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PerGroupMergerConfigError::InvalidMaxAlleles {
+                got: MAX_ALLELES_PER_VAR_CAP + 1
+            }
+        );
+    }
+
+    #[test]
+    fn config_new_rejects_zero_batch_size() {
+        let err = PerGroupMergerConfig::new(DEFAULT_PLOIDY, DEFAULT_MAX_ALLELES_PER_RECORD, 0)
+            .unwrap_err();
+        assert_eq!(err, PerGroupMergerConfigError::InvalidBatchSize { got: 0 });
     }
 }

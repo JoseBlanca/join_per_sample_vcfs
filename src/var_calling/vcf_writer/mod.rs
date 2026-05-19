@@ -41,11 +41,6 @@ pub use errors::VcfWriteError;
 pub use header::CohortMetadata;
 pub use writer::CohortVcfWriter;
 
-/// Default for [`WriterConfig::default_filter_pass`]. v1 always
-/// emits `PASS` in the FILTER column; reserved for a future filter
-/// slice.
-pub const DEFAULT_FILTER_PASS: bool = true;
-
 /// Default for [`WriterConfig::emit_gp`]. Off — `GP` is `Number=G`
 /// and most consumers don't read it (size grows as
 /// `(ploidy + n_alleles - 1) choose ploidy`; 21 floats per sample
@@ -63,6 +58,12 @@ pub const DEFAULT_EMIT_GP: bool = false;
 /// at rename time with a confusing `io::Error`. Forcing the caller
 /// to pass `output` explicitly makes the missing-field bug a compile
 /// error.
+///
+/// **v1 FILTER policy:** every emitted record carries `PASS`. The
+/// `default_filter_pass` knob that used to live on this struct has
+/// been dropped — a future filter slice will re-introduce filter
+/// expressions through a different surface (typed filter rules,
+/// not a binary flag).
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
     /// Output path. Suffix selects the sink kind (matched
@@ -70,11 +71,6 @@ pub struct WriterConfig {
     /// * `.vcf.gz` or `.vcf.bgz` → bgzf
     /// * anything else           → plain text
     pub output: PathBuf,
-
-    /// When true, always emit `PASS` in the FILTER column. Reserved
-    /// for a future filter slice; v1 has no filter expressions.
-    /// Defaults to [`DEFAULT_FILTER_PASS`].
-    pub default_filter_pass: bool,
 
     /// When true, declare `##FORMAT=<ID=GP,Number=G,Type=Float,…>`
     /// in the header and emit a `GP` cell per sample. Off by default
@@ -84,12 +80,10 @@ pub struct WriterConfig {
 }
 
 impl WriterConfig {
-    /// Build a config with [`DEFAULT_FILTER_PASS`] and
-    /// [`DEFAULT_EMIT_GP`].
+    /// Build a config with [`DEFAULT_EMIT_GP`].
     pub fn new(output: PathBuf) -> Self {
         Self {
             output,
-            default_filter_pass: DEFAULT_FILTER_PASS,
             emit_gp: DEFAULT_EMIT_GP,
         }
     }

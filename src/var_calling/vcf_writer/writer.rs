@@ -422,7 +422,6 @@ mod tests {
         let writer = CohortVcfWriter::new(metadata, cfg_for(out.clone())).unwrap();
         let cfg = writer.config();
         assert_eq!(cfg.output, out);
-        assert!(cfg.default_filter_pass);
         assert!(!cfg.emit_gp);
         writer.finish().unwrap();
     }

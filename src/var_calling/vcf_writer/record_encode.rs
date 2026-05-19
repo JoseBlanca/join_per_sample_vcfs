@@ -104,11 +104,11 @@ pub(super) fn encode(
 
     let qual = clamp_qual(record.qual_phred);
 
-    let filters = if config.default_filter_pass {
-        Filters::pass()
-    } else {
-        Filters::default()
-    };
+    // v1 policy: every record carries PASS. The
+    // `default_filter_pass` knob was dropped from `WriterConfig`; a
+    // future filter slice will re-introduce filter expressions
+    // through a typed-rule surface, not a binary flag.
+    let filters = Filters::pass();
 
     let n_alleles = record.alleles.len();
 
@@ -552,7 +552,6 @@ mod tests {
     fn cfg_emit_gp_on() -> WriterConfig {
         WriterConfig {
             output: PathBuf::from("/dev/null"),
-            default_filter_pass: true,
             emit_gp: true,
         }
     }
