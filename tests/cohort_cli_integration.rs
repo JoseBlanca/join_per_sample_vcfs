@@ -400,3 +400,41 @@ contamination_fraction = 0.01
         "error should mention the missing sample: {chain} / {nested}"
     );
 }
+
+/// **M13 multi-invocation pattern.** Two consecutive `run_pileup`
+/// calls in the same process must both succeed — the cohort CLI's
+/// rayon-pool gate
+/// ([`configure_rayon_pool`](merge_per_sample_vcfs::pop_var_caller))
+/// is idempotent, so library consumers and a future
+/// multi-subcommand test runner can chain `run_*` helpers freely.
+///
+/// `args.threads = None` so this exercises the multi-invocation
+/// *pattern* without depending on rayon's process-global state
+/// being uninitialised by an earlier test (which would be racy
+/// under cargo-test's shared-process model). The
+/// `configure_rayon_pool(None)` path returns `Ok(())` without
+/// touching `build_global()`, so both calls are trivially clean.
+///
+/// `#[serial]` keeps this test from interleaving with other tests
+/// in the same binary that might exercise rayon. The unit test
+/// `configure_rayon_pool_none_is_always_ok` in
+/// `pop_var_caller::common::tests` covers the helper's
+/// `None`-path contract directly.
+#[serial_test::serial]
+#[test]
+fn run_pileup_can_be_called_back_to_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![read_record("r1", 10, b"AAAAA")];
+    let cram_a = build_cram(dir.path(), &fasta, "A", &reads);
+    let cram_b = build_cram(dir.path(), &fasta, "B", &reads);
+
+    let args1 = pileup_args(fasta.clone(), dir.path().join("a.psp"), vec![cram_a]);
+    run_pileup(&args1).expect("first run_pileup OK");
+
+    let args2 = pileup_args(fasta, dir.path().join("b.psp"), vec![cram_b]);
+    run_pileup(&args2).expect("second run_pileup OK");
+
+    assert!(dir.path().join("a.psp").exists());
+    assert!(dir.path().join("b.psp").exists());
+}

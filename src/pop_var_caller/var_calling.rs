@@ -34,7 +34,9 @@ use thiserror::Error;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
-use crate::pop_var_caller::common::{DEFAULT_BUFFERED_IO_CAPACITY, basename, current_command_line};
+use crate::pop_var_caller::common::{
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, current_command_line,
+};
 use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
@@ -198,13 +200,10 @@ pub enum VarCallingCliError {
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
     let cohort = &args.cohort;
 
-    // 1. Rayon pool.
-    if let Some(n) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .map_err(|_| VarCallingCliError::RayonAlreadyConfigured)?;
-    }
+    // 1. Rayon pool — idempotent under the silent-no-op policy
+    //    (M13, locked 2026-05-19); first caller wins, subsequent
+    //    callers' --threads is silently ignored.
+    configure_rayon_pool(args.threads).map_err(|_| VarCallingCliError::RayonAlreadyConfigured)?;
 
     // 2. Open every .psp.
     let mut readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(args.psp_files.len());

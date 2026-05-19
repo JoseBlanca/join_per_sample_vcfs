@@ -30,7 +30,9 @@ use toml::value::Datetime;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
-use crate::pop_var_caller::common::{DEFAULT_BUFFERED_IO_CAPACITY, basename, rfc3339_now};
+use crate::pop_var_caller::common::{
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, rfc3339_now,
+};
 use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
@@ -318,13 +320,11 @@ pub enum EstimateContaminationCliError {
 pub fn run_estimate_contamination(
     args: &EstimateContaminationArgs,
 ) -> Result<(), EstimateContaminationCliError> {
-    // 1. Rayon pool.
-    if let Some(n) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .map_err(|_| EstimateContaminationCliError::RayonAlreadyConfigured)?;
-    }
+    // 1. Rayon pool — idempotent under the silent-no-op policy
+    //    (M13, locked 2026-05-19); first caller wins, subsequent
+    //    callers' --threads is silently ignored.
+    configure_rayon_pool(args.threads)
+        .map_err(|_| EstimateContaminationCliError::RayonAlreadyConfigured)?;
 
     // 2. Open readers + collect sample names.
     let mut readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(args.psp_files.len());

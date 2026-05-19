@@ -17,6 +17,7 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Buffered-I/O capacity used by every `BufReader::with_capacity` /
@@ -81,6 +82,48 @@ pub(crate) fn rfc3339_now() -> String {
     let min = (sod % 3600) / 60;
     let s = sod % 60;
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
+}
+
+/// Tracks whether [`configure_rayon_pool`] has already taken the
+/// process-global rayon pool. Set once per process; never cleared.
+static RAYON_POOL_CONFIGURED: OnceLock<()> = OnceLock::new();
+
+/// Size rayon's process-global thread pool to `n` worker threads,
+/// or leave rayon's default in place when `n` is `None`. Idempotent:
+/// only the first call with `Some(_)` in a given process actually
+/// touches the global pool; subsequent calls (with any value)
+/// return `Ok(())` without touching anything. M13 from the
+/// 2026-05-19 cohort CLI review — the policy is **silent no-op on
+/// second call**, locked in plan-review on the same date.
+///
+/// Rayon's `ThreadPoolBuilder::build_global()` is itself a once-per-
+/// process operation that errors on the second call. Centralising
+/// the gate here means library consumers, test runners, and any
+/// future multi-subcommand driver can call as many `run_*` helpers
+/// as they like back-to-back without managing the first-call /
+/// second-call discrimination themselves.
+///
+/// The first caller wins; subsequent callers' `n` is ignored. This
+/// is the cheapest correct semantics — callers that care about a
+/// specific thread count should set it via the binary entry-point
+/// before anything else runs.
+pub(crate) fn configure_rayon_pool(n: Option<usize>) -> Result<(), rayon::ThreadPoolBuildError> {
+    let Some(n) = n else { return Ok(()) };
+    if RAYON_POOL_CONFIGURED.get().is_some() {
+        // Already configured by an earlier call in this process —
+        // silent no-op rather than error.
+        return Ok(());
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()?;
+    // `set` can race with another thread that won the
+    // `build_global` race above, but our gate happened before
+    // `build_global` succeeded, so at most one thread reaches this
+    // line per process. Discard the result so a vanishingly-rare
+    // double-set is silent.
+    let _ = RAYON_POOL_CONFIGURED.set(());
+    Ok(())
 }
 
 /// Howard Hinnant's `civil_from_days` — translate days-since-epoch
@@ -148,5 +191,19 @@ mod tests {
     fn rfc3339_now_parses_as_toml_datetime() {
         let s = rfc3339_now();
         let _: toml::value::Datetime = s.parse().expect("must parse as toml Datetime");
+    }
+
+    #[test]
+    fn configure_rayon_pool_none_is_always_ok() {
+        // `None` is the always-safe path: never touches rayon's
+        // global pool and always returns `Ok(())`, regardless of
+        // process state. M13's idempotency contract is partially
+        // tested here (the `Some(_)` path is hard to exercise
+        // deterministically under cargo-test's shared-process
+        // model because other tests lazy-init rayon's pool; see
+        // the wave's notes).
+        configure_rayon_pool(None).unwrap();
+        configure_rayon_pool(None).unwrap();
+        configure_rayon_pool(None).unwrap();
     }
 }

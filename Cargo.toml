@@ -90,6 +90,7 @@ alloc-mimalloc = ["dep:mimalloc"]
 bstr = "1"
 criterion = "0.8.2"
 proptest = "1"
+serial_test = "3"
 
 [[bin]]
 name = "pop_var_caller"

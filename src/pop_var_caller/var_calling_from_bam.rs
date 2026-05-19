@@ -35,7 +35,7 @@ use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
 use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
-use crate::pop_var_caller::common::{current_command_line, format_md5_hex};
+use crate::pop_var_caller::common::{configure_rayon_pool, current_command_line, format_md5_hex};
 use crate::pop_var_caller::stage1_pipeline::{Stage1PipelineContext, with_stage1_pipeline};
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
@@ -175,14 +175,11 @@ pub fn run_var_calling_from_bam(
     let stage1 = &args.stage1;
     let cohort = &args.cohort;
 
-    // 1. Rayon pool — same once-per-process policy as the other
-    //    subcommands.
-    if let Some(n) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .map_err(|_| VarCallingFromBamCliError::RayonAlreadyConfigured)?;
-    }
+    // 1. Rayon pool — idempotent under the silent-no-op policy
+    //    (M13, locked 2026-05-19); first caller wins, subsequent
+    //    callers' --threads is silently ignored.
+    configure_rayon_pool(args.threads)
+        .map_err(|_| VarCallingFromBamCliError::RayonAlreadyConfigured)?;
 
     // 2. Build the Stage 1 configs from args. The helpers live in
     //    `cli.rs` and take `&Stage1Args` directly — same code path

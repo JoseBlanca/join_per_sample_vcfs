@@ -25,7 +25,7 @@ use crate::per_sample_pileup::psp::header::{
 };
 use crate::per_sample_pileup::psp::writer::PspWriter;
 use crate::pop_var_caller::common::{
-    DEFAULT_BUFFERED_IO_CAPACITY, basename, format_md5_hex, rfc3339_now,
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, format_md5_hex, rfc3339_now,
 };
 
 pub mod error_bridge;
@@ -159,15 +159,12 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let baq_cfg = baq_config_from_args(stage1);
     let walker_cfg = walker_config_from_args(stage1);
 
-    // 2. Size rayon's global pool when --threads is given. If the
-    //    pool is already configured (e.g. a prior call in the same
-    //    process), we report it; the binary only calls this once.
-    if let Some(n) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
-    }
+    // 2. Size rayon's global pool when --threads is given. The
+    //    helper is idempotent (silent no-op on second call) so
+    //    library consumers and test runners can invoke multiple
+    //    `run_*` helpers back-to-back; the first caller wins. M13
+    //    from the 2026-05-19 cohort CLI review.
+    configure_rayon_pool(args.threads).map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
 
     // 3. Tmp output path. The closure opens the file lazily so the
     //    .tmp file only appears once the Stage 1 chain is fully set
