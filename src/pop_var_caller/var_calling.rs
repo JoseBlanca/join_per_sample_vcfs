@@ -34,7 +34,7 @@ use thiserror::Error;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::cli::parsers;
-use crate::pop_var_caller::contamination_artifact::{
+use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
 use crate::var_calling::contamination_estimation::ContaminationEstimates;

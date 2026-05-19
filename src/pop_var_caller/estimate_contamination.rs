@@ -7,7 +7,7 @@
 //! The produced artefact is the input `var-calling` consumes via
 //! `--contamination-estimates`. The two subcommands share the
 //! artefact format defined in
-//! [`crate::pop_var_caller::contamination_artifact`].
+//! [`crate::pop_var_caller::contamination_artefact`].
 //!
 //! **Convergence-mode only in v1.** The engine's `StoppingMode` enum
 //! also supports `FixedSites { num_sites }`, but v1's CLI surface does
@@ -30,7 +30,7 @@ use toml::value::Datetime;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
-use crate::pop_var_caller::contamination_artifact::{
+use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
 };
