@@ -8,6 +8,7 @@ pub mod cli;
 pub mod contamination_artifact;
 pub mod estimate_contamination;
 pub mod psp_to_pileup;
+pub mod stage1_pipeline;
 pub mod var_calling;
 
 pub use batch_assignment::{BatchAssignment, BatchAssignmentError, DEFAULT_BATCH_ID};

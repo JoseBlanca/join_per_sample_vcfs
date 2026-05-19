@@ -16,15 +16,14 @@ use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
 use crate::per_sample_pileup::baq::{
-    BaqConfig, BaqSkipCounts, BaqStream, DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
-    SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB, SAMTOOLS_ILLUMINA_GAP_OPEN_PROB, prepare_passthrough,
+    BaqConfig, BaqSkipCounts, DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
+    SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB, SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
 };
 use crate::per_sample_pileup::cram_input::{
-    ContigList, CramMergedReader, CramMergedReaderConfig, DEFAULT_MAX_READ_MISMATCH_FRACTION,
-    DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH, DEFAULT_MISMATCH_BQ_FLOOR, FilterCounts,
+    ContigList, CramMergedReaderConfig, DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ,
+    DEFAULT_MIN_READ_LENGTH, DEFAULT_MISMATCH_BQ_FLOOR, FilterCounts,
 };
 use crate::per_sample_pileup::errors::CramInputError;
-use crate::per_sample_pileup::pileup;
 use crate::per_sample_pileup::pileup::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH, RunSummary, WalkerConfig,
@@ -34,11 +33,9 @@ use crate::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use crate::per_sample_pileup::psp::writer::PspWriter;
-use crate::per_sample_pileup::ref_fetcher::{ChromBoundaryRefFetcher, SyncRefFetcher};
 
 pub mod error_bridge;
 pub mod parsers;
-use error_bridge::ErrorSheddingAdapter;
 
 // ---------------------------------------------------------------------
 // Clap surface
@@ -281,6 +278,12 @@ pub enum PileupCliError {
 /// Records on success are written to `<output>.tmp` and atomically
 /// renamed to `<output>` on success. Stderr receives a one-shot
 /// run-summary block after the pipeline exhausts.
+///
+/// The Stage 1 borrow chain (`reader → BAQ → adapter → walker`) is
+/// extracted into
+/// [`with_stage1_pipeline`](super::stage1_pipeline::with_stage1_pipeline)
+/// so the same code path drives both this subcommand and (Task 8)
+/// `var-calling-from-bam`.
 pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     // 1. Translate CLI → module configs.
     let cram_cfg = cram_config_from_args(args);
@@ -297,102 +300,59 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             .map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
     }
 
-    // 3. Open the merged reader, capture metadata for the writer header.
-    let mut reader = CramMergedReader::new(&args.crams, &args.reference, cram_cfg)?;
-    let sample_name = reader.sample_name().to_string();
-    let contigs = reader.contigs().clone();
-
-    // 4. Build writer header (this is where missing @SQ M5 hard-errors).
-    let header = build_writer_header(&sample_name, &args.reference, &contigs, &args.crams, args)?;
-
-    // 5. Reference fetchers — two of them. BAQ runs in parallel and
-    //    needs a Sync fetcher; the walker is single-threaded and uses
-    //    the chrom-boundary-evicting one. See [`SyncRefFetcher`]
-    //    docs for the memory trade-off.
-    let baq_fetcher =
-        SyncRefFetcher::new(&args.reference, contigs.clone()).map_err(PileupCliError::Io)?;
-    let walker_fetcher = ChromBoundaryRefFetcher::new(&args.reference, contigs.clone())
-        .map_err(PileupCliError::Io)?;
-
-    // 6. Open the output sink at `<output>.tmp`. Atomic rename on
-    //    success — partial files never appear at `output`.
+    // 3. Tmp output path. The closure opens the file lazily so the
+    //    .tmp file only appears once the Stage 1 chain is fully set
+    //    up — failures before this point leave no garbage on disk.
     let tmp_path = tmp_path_for(&args.output);
-    let file = File::create(&tmp_path).map_err(PileupCliError::Io)?;
-    let buf = BufWriter::with_capacity(64 * 1024, file);
-    let psp_writer = PspWriter::new(buf, header).map_err(PileupToPspError::from)?;
 
-    // 7. Assemble the pipeline. `reader` and `baq_stream` (when on)
-    //    are kept by-ref through the chain so they survive until we
-    //    pull `FilterCounts` / `BaqSkipCounts` for the run-summary
-    //    block at the end. Borrow order is:
-    //
-    //        &mut reader → BaqStream<&mut reader> → &mut baq_stream
-    //                  → ErrorSheddingAdapter      → &mut adapter
-    //                  → PileupWalker              → drive_pileup_to_psp
-    //
-    //    Each adapter is dropped in reverse before the one below it
-    //    is touched again, so the borrow checker accepts the chain.
-    //    Both branches end with `buf_sink` ready for `finalise_output`,
-    //    plus the three counter snapshots and any stashed upstream error.
-    let summary: RunSummary;
-    let stashed_error: Option<CramInputError>;
-    let baq_skip_counts_for_summary: Option<BaqSkipCounts>;
-    let buf_sink: BufWriter<File>;
+    // 4. Drive the Stage 1 chain via the shared helper. The closure
+    //    runs while the chain is alive; counter snapshots happen
+    //    afterwards inside the helper.
+    let outputs = super::stage1_pipeline::with_stage1_pipeline::<_, PileupCliError, _>(
+        &args.crams,
+        &args.reference,
+        cram_cfg,
+        baq_cfg,
+        walker_cfg,
+        args.baq_chunk_size,
+        args.no_baq,
+        |ctx| {
+            // Build the writer header from the reader's metadata (the
+            // M5 hard-error fires here).
+            let header = build_writer_header(
+                ctx.sample_name,
+                &args.reference,
+                ctx.contigs,
+                &args.crams,
+                args,
+            )?;
+            // Open the .tmp output, build the writer, drive the walker.
+            let file = File::create(&tmp_path).map_err(PileupCliError::Io)?;
+            let buf = BufWriter::with_capacity(64 * 1024, file);
+            let psp_writer = PspWriter::new(buf, header).map_err(PileupToPspError::from)?;
+            let (sink, run_summary) = drive_pileup_to_psp(ctx.walker, psp_writer)?;
+            Ok((sink, run_summary))
+        },
+    )?;
 
-    if args.no_baq {
-        let prepared = reader.by_ref().map(|r| {
-            r.map(|read| {
-                let chrom_id = u32::try_from(read.ref_id).expect("ref_id fits u32");
-                prepare_passthrough(read, chrom_id)
-            })
-        });
-        let mut adapter = ErrorSheddingAdapter::new(prepared);
-        let handle = adapter.error_handle();
-        let walker = pileup::run(adapter.by_ref(), &walker_fetcher, &walker_cfg);
-        let (sink, run_summary) = drive_pileup_to_psp(walker, psp_writer)?;
-        summary = run_summary;
-        stashed_error = handle.take();
-        baq_skip_counts_for_summary = None;
-        buf_sink = sink;
-        // Drop adapter (and the map closure inside) so the &mut
-        // borrow of `reader` is released — `filter_counts()` next.
-        drop(adapter);
-    } else {
-        let mut baq_stream =
-            BaqStream::new(reader.by_ref(), baq_cfg, &baq_fetcher, args.baq_chunk_size);
-        let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
-        let handle = adapter.error_handle();
-        let walker = pileup::run(adapter.by_ref(), &walker_fetcher, &walker_cfg);
-        let (sink, run_summary) = drive_pileup_to_psp(walker, psp_writer)?;
-        summary = run_summary;
-        stashed_error = handle.take();
-        buf_sink = sink;
-        // Adapter borrows baq_stream; drop it first.
-        drop(adapter);
-        // Now baq_stream is accessible — snapshot skip counts before dropping.
-        baq_skip_counts_for_summary = Some(*baq_stream.skip_counts());
-        drop(baq_stream); // releases &mut reader for `filter_counts()` below
-    }
-
-    // Pull FilterCounts before the writer-tmp is renamed — the
-    // counts live in the reader and we want them in the summary even
-    // if the rename later fails.
-    let filter_counts_for_summary: FilterCounts = *reader.filter_counts();
+    let (buf_sink, summary) = outputs.result;
+    let filter_counts_for_summary = outputs.run_summary.filter_counts;
+    let baq_skip_counts_for_summary = outputs.run_summary.baq_skip_counts;
 
     finalise_output(buf_sink, &tmp_path, &args.output)?;
 
-    // 8. Surface a deferred upstream error if one was stashed by the
+    // 5. Surface a deferred upstream error if one was stashed by the
     //    bridge. This is the only place upstream errors are
     //    reported — the walker would have exited cleanly from its
     //    perspective.
-    if let Some(e) = stashed_error {
+    if let Some(e) = outputs.stashed_upstream_error {
         let _ = fs::remove_file(&args.output); // best-effort cleanup
         return Err(PileupCliError::CramInput(e));
     }
 
-    // 9. Format the stderr run-summary block.
+    // 6. Format the stderr run-summary block.
     print_run_summary(
-        &sample_name,
+        &outputs.sample_name,
         &filter_counts_for_summary,
         baq_skip_counts_for_summary.as_ref(),
         &summary,
