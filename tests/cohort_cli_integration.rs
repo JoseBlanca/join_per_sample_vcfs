@@ -9,7 +9,6 @@
 //! per_sample_pileup test-only helpers are `pub(crate)`. Future
 //! cleanup may share them via a `tests/common/` module.
 
-use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::num::NonZero;
@@ -26,9 +25,6 @@ use merge_per_sample_vcfs::per_sample_pileup::cram_input::{
 use merge_per_sample_vcfs::per_sample_pileup::pileup::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
-};
-use merge_per_sample_vcfs::pop_var_caller::contamination_artifact::{
-    BatchEntry, ContaminationArtefact, Provenance, ProvenanceInputs, SampleEntry,
 };
 use merge_per_sample_vcfs::pop_var_caller::var_calling::{
     VarCallingArgs, VarCallingCliError, run_var_calling,
@@ -350,34 +346,37 @@ fn var_calling_rejects_contamination_artefact_missing_sample() {
     let reads = vec![read_record("r1", 10, b"AAAAA")];
     let psp = make_psp_for_sample(dir.path(), &fasta, "NA00001", &reads);
 
-    // Hand-craft a contamination artefact missing NA00001.
-    let artefact = ContaminationArtefact {
-        provenance: Provenance {
-            tool: "pop_var_caller".into(),
-            version: "0.1.0".into(),
-            subcommand: "estimate-contamination".into(),
-            created: "2026-05-19T12:00:00Z".parse().unwrap(),
-            inputs: ProvenanceInputs {
-                reference: "ref.fa".into(),
-                input_psps: vec!["OTHER_SAMPLE.psp".into()],
-                batch_assignment: None,
-            },
-        },
-        parameters: BTreeMap::new(),
-        batches: vec![BatchEntry {
-            id: "lane_1".into(),
-            contaminant_ref_prob: 0.999,
-            contaminant_snp_alt_prob: 0.0008,
-            contaminant_indel_alt_prob: 0.0002,
-        }],
-        samples: vec![SampleEntry {
-            name: "OTHER_SAMPLE".into(),
-            batch: "lane_1".into(),
-            contamination_fraction: 0.01,
-        }],
-    };
+    // Hand-craft a contamination artefact missing NA00001. The
+    // on-disk TOML is the realistic input path here: `run_var_calling`
+    // always loads via `ContaminationArtefact::read`, and writing a
+    // literal mirrors what a user editing the file by hand would
+    // produce. Avoids depending on the (`#[non_exhaustive]`) artefact
+    // struct surface from outside the crate.
+    let artefact_toml = r#"[provenance]
+tool = "pop_var_caller"
+version = "0.1.0"
+subcommand = "estimate-contamination"
+created = 2026-05-19T12:00:00Z
+
+[provenance.inputs]
+reference = "ref.fa"
+input_psps = ["OTHER_SAMPLE.psp"]
+
+[parameters]
+
+[[batches]]
+id = "lane_1"
+contaminant_ref_prob = 0.999
+contaminant_snp_alt_prob = 0.0008
+contaminant_indel_alt_prob = 0.0002
+
+[[samples]]
+name = "OTHER_SAMPLE"
+batch = "lane_1"
+contamination_fraction = 0.01
+"#;
     let artefact_path = dir.path().join("estimates.toml");
-    artefact.write(&artefact_path).expect("write artefact");
+    fs::write(&artefact_path, artefact_toml).expect("write artefact");
 
     let vcf_out = dir.path().join("out.vcf");
     let args = var_calling_args(fasta, vcf_out, vec![psp], Some(artefact_path));

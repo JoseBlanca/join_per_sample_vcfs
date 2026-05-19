@@ -76,6 +76,15 @@ use crate::var_calling::contamination_estimation::{
 /// slack on top of the engine bound.
 pub const Q_B_SIMPLEX_TOLERANCE: f64 = 1e-5;
 
+/// Strict allow-list of artefact schema versions this build can
+/// read. A version not on this list is rejected at
+/// [`ContaminationArtefact::validate`] (and therefore
+/// [`ContaminationArtefact::read`]) time. Promote a new version only
+/// once the reader has been updated for the new shape — the gate's
+/// whole point is to prevent a v0.2.0 file from silently
+/// deserialising under v0.1.0 reader assumptions.
+pub const SUPPORTED_VERSIONS: &[&str] = &["0.1.0"];
+
 // ---------------------------------------------------------------------
 // On-disk types — serde-derived. Public so consumers can build /
 // inspect, but every load / write goes through the validator.
@@ -83,6 +92,13 @@ pub const Q_B_SIMPLEX_TOLERANCE: f64 = 1e-5;
 
 /// Top-level artefact. Construct with the public fields, then write
 /// with [`Self::write`]; load with [`Self::read`].
+///
+/// `#[non_exhaustive]` so callers outside this crate cannot
+/// struct-literal-construct it; a future field addition is then
+/// not a breaking change. Inside the crate (and in
+/// [`#[cfg(test)]`](`cfg`) test modules of the same crate)
+/// struct-literal construction continues to compile.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContaminationArtefact {
     /// Tool / version / timestamp / input identification.
@@ -100,6 +116,7 @@ pub struct ContaminationArtefact {
 
 /// Producer-tool provenance — mirrors the .psp `WriterProvenance`
 /// shape.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provenance {
     pub tool: String,
@@ -112,6 +129,7 @@ pub struct Provenance {
 
 /// Identifying paths from the producing run. Path values are
 /// **basenames only**, matching the `.psp` provenance convention.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceInputs {
     pub reference: String,
@@ -123,6 +141,7 @@ pub struct ProvenanceInputs {
 }
 
 /// One row of `[[batches]]`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchEntry {
     pub id: String,
@@ -132,6 +151,7 @@ pub struct BatchEntry {
 }
 
 /// One row of `[[samples]]`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SampleEntry {
     pub name: String,
@@ -193,6 +213,18 @@ impl ContaminationArtefact {
     /// public so callers that build an artefact in-memory can re-check
     /// after edits.
     pub fn validate(&self) -> Result<(), ContaminationArtefactError> {
+        // Schema version gate. The strict allow-list catches the
+        // exact failure mode the `provenance.version` field exists
+        // for: a future v0.2.0 producer writing reshaped fields
+        // would otherwise round-trip through this v0.1.0 reader
+        // with no error.
+        if !SUPPORTED_VERSIONS.contains(&self.provenance.version.as_str()) {
+            return Err(ContaminationArtefactError::UnsupportedVersion {
+                got: self.provenance.version.clone(),
+                supported: SUPPORTED_VERSIONS,
+            });
+        }
+
         // Per-batch checks: id uniqueness + probability range + simplex.
         let mut batch_ids: BTreeMap<&str, usize> = BTreeMap::new();
         for (idx, b) in self.batches.iter().enumerate() {
@@ -422,6 +454,21 @@ pub enum ContaminationArtefactError {
     /// artefact-level rule.
     #[error("contamination artefact: engine-side conversion failed — {0}")]
     EngineConversion(ContaminationEstimationError),
+
+    /// The artefact's `provenance.version` is not on the
+    /// [`SUPPORTED_VERSIONS`] allow-list. Either the file was
+    /// produced by a newer pop_var_caller build whose schema this
+    /// reader does not yet understand, or by a much older build
+    /// whose entry was removed. Promote the version only after the
+    /// reader handles the new shape.
+    #[error(
+        "contamination artefact: provenance.version `{got}` is not in the \
+         supported set {supported:?}"
+    )]
+    UnsupportedVersion {
+        got: String,
+        supported: &'static [&'static str],
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -698,5 +745,51 @@ mod tests {
         ));
         // And the file should not exist.
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_rejects_artefact_with_unknown_version() {
+        // A TOML that is structurally valid but carries a
+        // provenance.version outside SUPPORTED_VERSIONS must surface
+        // UnsupportedVersion. This is the entire point of the gate —
+        // a future v0.2.0 shape would otherwise deserialise against
+        // v0.1.0 reader assumptions.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("future.toml");
+        fs::write(
+            &path,
+            r#"[provenance]
+tool = "pop_var_caller"
+version = "99.0.0"
+subcommand = "estimate-contamination"
+created = 2026-05-19T12:00:00Z
+
+[provenance.inputs]
+reference = "ref.fa"
+input_psps = ["NA12878.psp"]
+
+[parameters]
+
+[[batches]]
+id = "lane_1"
+contaminant_ref_prob = 0.999
+contaminant_snp_alt_prob = 0.0008
+contaminant_indel_alt_prob = 0.0002
+
+[[samples]]
+name = "NA12878"
+batch = "lane_1"
+contamination_fraction = 0.01
+"#,
+        )
+        .unwrap();
+        let err = ContaminationArtefact::read(&path).unwrap_err();
+        match err {
+            ContaminationArtefactError::UnsupportedVersion { got, supported } => {
+                assert_eq!(got, "99.0.0");
+                assert_eq!(supported, SUPPORTED_VERSIONS);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
     }
 }
