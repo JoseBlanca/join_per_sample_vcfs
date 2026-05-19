@@ -21,32 +21,42 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI follow-up **Wave 4**
->   (Rayon concurrency policy) fixes-applied 2026-05-19 —
->   [cohort_cli_2026-05-19_applied_wave4.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave4.md).
->   Single-finding wave: **M13** Applied under the silent-no-op
->   second-call policy (locked 2026-05-19). New
->   `configure_rayon_pool(n)` helper in `pop_var_caller::common`
->   gates a `static OnceLock<()>` ahead of
->   `rayon::ThreadPoolBuilder::build_global()`; all 4 subcommand
->   drivers (`run_pileup`, `run_var_calling`,
->   `run_var_calling_from_bam`, `run_estimate_contamination`)
->   migrated. New `serial_test` dev-dep + a `#[serial]`
->   integration test (`run_pileup_can_be_called_back_to_back`)
->   plus a `configure_rayon_pool_none_is_always_ok` unit test
->   cover the multi-invocation pattern. 888 lib tests pass
->   (+1 vs Wave 3); fmt + clippy + full test suite clean.
->   `cargo doc --no-deps` exits 101 on the **same 5 pre-existing
->   errors** (`pileup_to_psp.rs` + `ExactMath`); zero introduced.
->   Carried forward: **4 Deferred** for Wave 5 (Mi20 / Mi23 /
->   M1+M2-followup / M5-followup).
->   Earlier wave reports:
+> - **Last completed task:** Cohort CLI follow-up **Wave 5**
+>   (Test infrastructure + missing coverage) fixes-applied
+>   2026-05-19 —
+>   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md).
+>   Final wave of the deferred follow-up; **all 4 Wave-5
+>   findings Applied**: **Mi20** (`tests/common/mod.rs`
+>   consolidates fixture helpers across the two integration-test
+>   binaries), **Mi23** (load-bearing
+>   `estimate_contamination → var_calling` chain integration
+>   test + 4 missing-coverage unit / integration tests),
+>   **M1/M2 follow-up** (end-to-end CRAM-fixture test for the
+>   walker-error path — `max_active_reads = 1` trips
+>   `Walker(_)`, output VCF cleaned up), and the
+>   only-behaviour-change finding **M5 follow-up** (real
+>   FASTA → `.psp` per-contig MD5 enforcement via
+>   `verify_fasta_matches_psp_chromosomes` + the typed
+>   `FastaContigMd5Mismatch` / `FastaContigFetchFailed` error
+>   variants on both subcommands; the v1 basename-only
+>   contract is now obsolete). 890 lib tests pass (+2 from
+>   the new `to_estimates_*` artefact-builder tests) + 9
+>   cohort CLI integration tests (+5 net from the new
+>   integration tests added this wave); fmt + clippy clean;
+>   `cargo doc --no-deps` exits 101 on the **same 5
+>   pre-existing errors** as every prior wave; zero introduced
+>   by Wave 5.
+>   **The 16 originally-Deferred findings from the 2026-05-19
+>   review are now closed in full.**
+>   Wave reports:
 >   [Wave 1](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave1.md)
 >   (commit `c7ee0c3`),
 >   [Wave 2](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md)
 >   (commit `f44c086`),
 >   [Wave 3](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md)
->   (commit `248521a`).
+>   (commit `248521a`),
+>   [Wave 4](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave4.md)
+>   (commit `d84ee8e`).
 >   The reviewed slice landed earlier on 2026-05-19 in commits
 >   `1523049` through `147e435` (impl report:
 >   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md);
@@ -116,8 +126,8 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
 #### `pop_var_caller` CLI
 - **Status:** Stage 1 CLI shipped (subcommands `pileup`, `psp-to-pileup`);
-  cohort CLI fixes-applied (subcommands `var-calling`,
-  `estimate-contamination`, `var-calling-from-bam`)
+  cohort CLI **shipped** — every Deferred finding from the
+  2026-05-19 review is Applied (Waves 1 – 5).
 - **Plans:**
   - Stage 1 CLI (`pileup`, `psp-to-pileup`):
     [pop_var_caller_pileup_cli.md](doc/devel/implementation_plans/pop_var_caller_pileup_cli.md)
@@ -130,10 +140,14 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
   Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
 - **Latest fixes-applied (cohort slice):**
-  Wave 4 of the deferred follow-up,
-  [cohort_cli_2026-05-19_applied_wave4.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave4.md) —
-  **M13** Applied (silent-no-op rayon-pool gate). 888 lib
+  Wave 5 of the deferred follow-up,
+  [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md) —
+  **Mi20**, **Mi23**, **M1/M2 follow-up**, **M5 follow-up**
+  (FASTA → `.psp` MD5 enforcement is the only behaviour change
+  across the 5-wave plan). 890 lib + 9 cohort integration
   tests pass. Earlier passes:
+  [Wave 4](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave4.md)
+  (M13);
   [Wave 3](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave3.md)
   (Mi8 / Mi19 / M9-followup / Mi18 / M10 / M11);
   [Wave 2](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave2.md)
@@ -142,6 +156,8 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   (M8 / Mi5 / Mi6 / Mi13);
   [original pass](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied.md)
   (20 Applied + Mi7 Disputed-with-test).
+  **Status: shipped** — every originally-Deferred finding is
+  Applied; the 5-wave follow-up plan is complete.
 - **Code:** [src/pop_var_caller/](src/pop_var_caller/)
 - **Integration tests:**
   [tests/pileup_cli_integration.rs](tests/pileup_cli_integration.rs)
@@ -149,10 +165,9 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from cohort-slice review):**
-  - **Wave 5 (Test infrastructure + missing coverage) — pending.**
-    **Mi20**, **Mi23**, M1/M2 walker-error CRAM test, **M5
-    follow-up** (real FASTA → `.psp` MD5 enforcement; wired in
-    this wave per the 2026-05-19 decision).
+  *None — the 16 originally-Deferred findings are all Applied.*
+  - **Closed in Wave 5 (2026-05-19):** **Mi20**, **Mi23**,
+    **M1+M2-followup**, **M5-followup**.
   - **Closed in Wave 4 (2026-05-19):** **M13**.
   - **Closed in Wave 3 (2026-05-19):** **Mi8**, **Mi19**,
     **M9-followup**, **Mi18**, **M10**, **M11**.
