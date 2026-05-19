@@ -5,8 +5,10 @@
 
 pub mod batch_assignment;
 pub mod cli;
+pub mod contamination_artifact;
 pub mod psp_to_pileup;
 
 pub use batch_assignment::{BatchAssignment, BatchAssignmentError, DEFAULT_BATCH_ID};
 pub use cli::{Cli, PileupArgs, PileupCliError, PopVarCallerCommand, run_pileup};
+pub use contamination_artifact::{ContaminationArtefact, ContaminationArtefactError};
 pub use psp_to_pileup::{PspToPileupArgs, PspToPileupError, run_psp_to_pileup};
