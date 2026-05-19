@@ -550,10 +550,7 @@ mod tests {
     }
 
     fn cfg_emit_gp_on() -> WriterConfig {
-        WriterConfig {
-            output: PathBuf::from("/dev/null"),
-            emit_gp: true,
-        }
+        WriterConfig::new(PathBuf::from("/dev/null")).with_emit_gp(true)
     }
 
     fn table_for(record: &PosteriorRecord) -> Vec<Vec<u8>> {

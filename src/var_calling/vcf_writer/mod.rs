@@ -53,18 +53,32 @@ pub const DEFAULT_EMIT_GP: bool = false;
 /// future flags slot in without changing the public constructor
 /// signature.
 ///
-/// Constructed via [`WriterConfig::new`]. There is no `Default` impl
-/// because `output` has no sensible default — an empty `PathBuf`
-/// would silently produce `.tmp` files in the process cwd and fail
-/// at rename time with a confusing `io::Error`. Forcing the caller
-/// to pass `output` explicitly makes the missing-field bug a compile
-/// error.
+/// Constructed via [`WriterConfig::new`] and refined with the
+/// `with_*` builder setters; the struct is `#[non_exhaustive]`, so
+/// callers outside this crate cannot construct it by struct literal
+/// and a future field addition is not a breaking change. There is
+/// no `Default` impl because `output` has no sensible default — an
+/// empty `PathBuf` would silently produce `.tmp` files in the
+/// process cwd and fail at rename time with a confusing
+/// `io::Error`. Forcing the caller to pass `output` explicitly
+/// makes the missing-field bug a compile error.
 ///
 /// **v1 FILTER policy:** every emitted record carries `PASS`. The
 /// `default_filter_pass` knob that used to live on this struct has
 /// been dropped — a future filter slice will re-introduce filter
 /// expressions through a different surface (typed filter rules,
-/// not a binary flag).
+/// not a binary flag). The `#[non_exhaustive]` annotation was
+/// added at the same time so the next such drop or addition is
+/// announced at the type level.
+///
+/// ```
+/// use std::path::PathBuf;
+/// use merge_per_sample_vcfs::var_calling::vcf_writer::WriterConfig;
+///
+/// let cfg = WriterConfig::new(PathBuf::from("out.vcf")).with_emit_gp(true);
+/// assert_eq!(cfg.emit_gp, true);
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
     /// Output path. Suffix selects the sink kind (matched
@@ -87,5 +101,13 @@ impl WriterConfig {
             output,
             emit_gp: DEFAULT_EMIT_GP,
         }
+    }
+
+    /// Override the `emit_gp` flag. Builder-style setter so callers
+    /// can chain knobs onto [`WriterConfig::new`] without touching
+    /// the (`#[non_exhaustive]`) struct fields directly.
+    pub fn with_emit_gp(mut self, emit_gp: bool) -> Self {
+        self.emit_gp = emit_gp;
+        self
     }
 }

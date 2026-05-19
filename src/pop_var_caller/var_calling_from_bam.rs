@@ -582,10 +582,7 @@ fn run_cohort_pipeline_for_single_sample(
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line,
     };
-    let writer_cfg = WriterConfig {
-        output: output.to_path_buf(),
-        emit_gp,
-    };
+    let writer_cfg = WriterConfig::new(output.to_path_buf()).with_emit_gp(emit_gp);
 
     // Reference fetcher shared between DUST + PerGroupMerger.
     let fetcher_concrete = SyncRefFetcher::new(reference, ctx.contigs.clone())

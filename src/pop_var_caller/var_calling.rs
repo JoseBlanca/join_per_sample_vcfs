@@ -394,10 +394,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line: current_command_line(),
     };
-    let writer_cfg = WriterConfig {
-        output: args.output.clone(),
-        emit_gp: args.emit_gp,
-    };
+    let writer_cfg = WriterConfig::new(args.output.clone()).with_emit_gp(args.emit_gp);
 
     // 9. Wire the pipeline. The k-way merger sits on top of the
     //    record iterators borrowed from each reader.

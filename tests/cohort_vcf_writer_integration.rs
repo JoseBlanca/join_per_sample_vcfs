@@ -158,10 +158,7 @@ fn plain_text_path_writes_three_records_with_default_config() {
     let dir = tempdir().unwrap();
     let out = dir.path().join("out.vcf");
     let metadata = metadata_two_samples();
-    let config = WriterConfig {
-        output: out.clone(),
-        emit_gp: false,
-    };
+    let config = WriterConfig::new(out.clone());
 
     let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
     for record in three_record_fixture() {
@@ -225,10 +222,7 @@ fn plain_text_path_with_emit_gp_adds_format_column() {
     let dir = tempdir().unwrap();
     let out = dir.path().join("out.vcf");
     let metadata = metadata_two_samples();
-    let config = WriterConfig {
-        output: out.clone(),
-        emit_gp: true,
-    };
+    let config = WriterConfig::new(out.clone()).with_emit_gp(true);
 
     let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
     for record in three_record_fixture() {
@@ -258,10 +252,7 @@ fn bgzf_path_writes_compressed_vcf_with_eof_marker() {
     let dir = tempdir().unwrap();
     let out = dir.path().join("out.vcf.gz");
     let metadata = metadata_two_samples();
-    let config = WriterConfig {
-        output: out.clone(),
-        emit_gp: false,
-    };
+    let config = WriterConfig::new(out.clone());
 
     let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
     for record in three_record_fixture() {
@@ -297,10 +288,7 @@ fn out_of_order_records_surface_a_clear_error() {
     let dir = tempdir().unwrap();
     let out = dir.path().join("out.vcf");
     let metadata = metadata_two_samples();
-    let config = WriterConfig {
-        output: out,
-        emit_gp: false,
-    };
+    let config = WriterConfig::new(out);
     let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
     let records = three_record_fixture();
     writer.write_record(&records[2]).unwrap(); // chr1:900

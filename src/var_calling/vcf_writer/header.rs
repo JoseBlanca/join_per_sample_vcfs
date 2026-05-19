@@ -293,9 +293,7 @@ mod tests {
     }
 
     fn cfg_emit_gp_on() -> WriterConfig {
-        let mut c = WriterConfig::new(PathBuf::from("/dev/null"));
-        c.emit_gp = true;
-        c
+        WriterConfig::new(PathBuf::from("/dev/null")).with_emit_gp(true)
     }
 
     #[test]
