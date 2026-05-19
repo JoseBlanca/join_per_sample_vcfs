@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>pop_var_caller — architecture (Mermaid)</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --line: #c8c8c8;
+    --accent: #2b6cb0;
+
+    --c-pileup-fill:   #fde8c4; --c-pileup-stroke:   #b25e09;
+    --c-psp-fill:      #fff2b8; --c-psp-stroke:      #8a6d00;
+    --c-contam-fill:   #f5d6ee; --c-contam-stroke:   #8a2a78;
+    --c-call-fill:     #cfe5f6; --c-call-stroke:     #1a5a8a;
+  }
+
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    line-height: 1.5;
+  }
+
+  body { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  h1 { margin: 0 0 4px 0; font-size: 1.6rem; }
+  h2 { margin-top: 32px; font-size: 1.15rem; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+
+  .subtitle { color: var(--muted); margin: 0 0 16px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; font-size: 0.92em; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px 16px;
+    margin: 8px 0 24px 0;
+    font-size: 0.88rem;
+  }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .legend-swatch {
+    width: 16px; height: 16px;
+    border-radius: 3px;
+    border: 1.5px solid #444;
+  }
+
+  .pill {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 9px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #fff;
+    background: #444;
+    vertical-align: middle;
+  }
+  .pill.parallel { background: #1f7a32; }
+  .pill.optional { background: #8a2a78; }
+
+  .diagram-wrap {
+    width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fafafa;
+    padding: 16px;
+  }
+  .mermaid { display: flex; justify-content: center; min-height: 200px; }
+
+  .crosslink {
+    background: #f4f4f4;
+    border-left: 4px solid var(--accent);
+    padding: 8px 12px;
+    border-radius: 0 4px 4px 0;
+    margin: 12px 0 20px 0;
+    font-size: 0.92rem;
+  }
+
+  .footnote { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+
+  table.modtable { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 0.92rem; }
+  table.modtable th, table.modtable td { border-bottom: 1px solid var(--line); padding: 6px 10px; vertical-align: top; text-align: left; }
+  table.modtable th { background: #f4f4f4; font-weight: 600; }
+  table.modtable td.role { white-space: nowrap; font-weight: 600; }
+  table.modtable td.path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
+
+  .step-section { margin-top: 28px; }
+  .step-section h3 {
+    margin: 0 0 4px 0;
+    padding: 4px 10px;
+    border-left: 6px solid var(--accent);
+    background: #f4f4f4;
+    border-radius: 0 4px 4px 0;
+  }
+  .step-section.pileup  h3 { border-left-color: var(--c-pileup-stroke);  background: var(--c-pileup-fill); }
+  .step-section.contam  h3 { border-left-color: var(--c-contam-stroke);  background: var(--c-contam-fill); }
+  .step-section.calling h3 { border-left-color: var(--c-call-stroke);    background: var(--c-call-fill); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>pop_var_caller — architecture (Mermaid version)</h1>
+  <p class="subtitle">
+    Same architecture as the main page, drawn with
+    <a href="https://mermaid.js.org/">Mermaid</a> instead of hand-written SVG.
+  </p>
+
+  <div class="crosslink">
+    Comparison: <a href="architecture.html">hand-written SVG version</a> ·
+    spec: <a href="../devel/specs/calling_pipeline_architecture.md">calling_pipeline_architecture.md</a> ·
+    status: <a href="../../PROJECT_STATUS.md">PROJECT_STATUS.md</a>.
+    <br>
+    <span class="footnote">
+      This page loads Mermaid from a CDN. Open it with internet access.
+    </span>
+  </div>
+
+  <div class="legend">
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-pileup-fill); border-color: var(--c-pileup-stroke);"></span>Step 1 — pileup</span>
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-contam-fill); border-color: var(--c-contam-stroke);"></span>Step 2 — contamination</span>
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-call-fill); border-color: var(--c-call-stroke);"></span>Step 3 — SNP calling</span>
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-psp-fill); border-color: var(--c-psp-stroke);"></span>Artefact</span>
+    <span class="legend-item"><span class="pill parallel">parallel</span></span>
+    <span class="legend-item"><span class="pill optional">optional</span></span>
+  </div>
+</header>
+
+<h2>Three steps at a glance</h2>
+
+<div class="diagram-wrap">
+<pre class="mermaid">
+flowchart TD
+  %% ---- inputs ----
+  BAM[("BAM / CRAM × N<br/>(one per sample)")]
+  REF[("Reference FASTA")]
+  TSV[("Batch assignment TSV<br/><i>optional</i>")]
+
+  %% ---- STEP 1 ----
+  subgraph S1 ["<b>STEP 1 — PILEUP</b> (parallel across samples)"]
+    direction LR
+    CRAM["<b>cram_input</b><br/>filter + ref fetch"]
+    WALK["<b>pileup walker</b><br/>CIGAR fold · slots"]
+    BAQ["<b>BAQ</b><br/>in-process, parallel"]
+    P2P["<b>pileup → psp</b><br/>encode + bgzf write"]
+    CRAM --> WALK --> BAQ --> P2P
+  end
+
+  %% ---- bridging artefact ----
+  PSP[(".psp files × N<br/>one per sample<br/>bgzf-framed · five per-allele scalars")]
+
+  %% ---- STEP 2 ----
+  subgraph S2 ["<b>STEP 2 — CONTAMINATION</b> (optional)"]
+    direction TB
+    BR["batch-assignment reader"]
+    MLE["read-level mixture MLE"]
+    CSQB[("(c_s, q_b) TOML")]
+    BR --> MLE --> CSQB
+  end
+
+  %% ---- STEP 3 ----
+  subgraph S3 ["<b>STEP 3 — SNP CALLING</b> (parallel across groups)"]
+    direction TB
+    JOIN["<b>per-sample pileup joiner</b><br/>merges N pileups → one record/position<br/>carrying every sample's evidence"]
+    DUST["<b>DUST low-complexity filter</b><br/>streaming sdust"]
+    GROUP["<b>variant grouper</b><br/>bundles overlapping / adjacent positions"]
+    PG["<b>per-group merger</b> (rayon)<br/>allele unification · likelihoods"]
+    BAY["<b>Bayesian genotype estimator (EM)</b><br/>per-sample GT · GQ · QUAL"]
+    VCF["<b>cohort VCF writer</b><br/>bgzf multi-sample VCF"]
+    JOIN --> DUST --> GROUP --> PG --> BAY --> VCF
+  end
+
+  %% ---- output ----
+  OUT[("cohort.vcf.gz")]
+
+  %% ---- top-level wiring ----
+  BAM --> CRAM
+  REF --> WALK
+  P2P --> PSP
+  PSP --> JOIN
+  PSP -. ".psp" .-> BR
+  TSV -. "sample → batch" .-> BR
+  REF -. "ref FASTA" .-> DUST
+  CSQB -. "(c_s, q_b)" .-> BAY
+  VCF --> OUT
+
+  %% ---- styling ----
+  classDef pileup    fill:#fde8c4,stroke:#b25e09,color:#000;
+  classDef contam    fill:#f5d6ee,stroke:#8a2a78,stroke-dasharray:5 4,color:#000;
+  classDef calling   fill:#cfe5f6,stroke:#1a5a8a,color:#000;
+  classDef artefact  fill:#fff2b8,stroke:#8a6d00,color:#000;
+  classDef input     fill:#f0f0f0,stroke:#5a5a5a,color:#000;
+
+  class CRAM,WALK,BAQ,P2P pileup;
+  class BR,MLE contam;
+  class CSQB artefact;
+  class JOIN,DUST,GROUP,PG,BAY,VCF calling;
+  class PSP,OUT artefact;
+  class BAM,REF,TSV input;
+
+  %% subgraph backgrounds
+  style S1 fill:#fef5e6,stroke:#b25e09,stroke-width:2px;
+  style S2 fill:#faecf5,stroke:#8a2a78,stroke-width:2px,stroke-dasharray:6 4;
+  style S3 fill:#e6f0fa,stroke:#1a5a8a,stroke-width:2px;
+</pre>
+</div>
+
+<p class="footnote">
+  Solid arrows are in-process data streams; dashed arrows (magenta and
+  the labelled FASTA edge) are auxiliary inputs and the optional Step 2
+  side-pass.
+</p>
+
+<h2>What's in each step</h2>
+
+<section class="step-section pileup">
+  <h3>Step 1 — Pileup <span class="pill parallel">parallel</span></h3>
+  <p>
+    One BAM/CRAM in, one <code>.psp</code> out. Streams the BAM exactly
+    once and writes the five freebayes-sufficient scalars per allele.
+  </p>
+  <table class="modtable">
+    <thead><tr><th>Role</th><th>Path</th></tr></thead>
+    <tbody>
+      <tr><td class="role">CRAM/BAM input</td><td class="path"><a href="../../src/per_sample_pileup/cram_input.rs">cram_input.rs</a></td></tr>
+      <tr><td class="role">pileup walker</td><td class="path"><a href="../../src/per_sample_pileup/pileup/">pileup/</a></td></tr>
+      <tr><td class="role">BAQ</td><td class="path"><a href="../../src/per_sample_pileup/baq/">baq/</a></td></tr>
+      <tr><td class="role">pileup → .psp</td><td class="path"><a href="../../src/per_sample_pileup/pileup_to_psp.rs">pileup_to_psp.rs</a> · <a href="../../src/per_sample_pileup/psp/">psp/</a></td></tr>
+      <tr><td class="role">CLI driver</td><td class="path"><code>pop_var_caller pileup</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="step-section contam">
+  <h3>Step 2 — Contamination estimates <span class="pill optional">optional</span></h3>
+  <p>
+    Reads <code>.psp</code> + a sample-to-batch TSV; emits per-sample
+    contamination fractions <code>c_s</code> and per-batch
+    <code>q_b</code> as a TOML artefact frozen for Step 3.
+  </p>
+  <table class="modtable">
+    <thead><tr><th>Role</th><th>Path</th></tr></thead>
+    <tbody>
+      <tr><td class="role">batch reader</td><td class="path"><a href="../../src/pop_var_caller/batch_assignment.rs">batch_assignment.rs</a></td></tr>
+      <tr><td class="role">mixture MLE</td><td class="path"><a href="../../src/var_calling/contamination_estimation.rs">contamination_estimation.rs</a></td></tr>
+      <tr><td class="role">TOML artefact</td><td class="path"><a href="../../src/pop_var_caller/contamination_artifact.rs">contamination_artifact.rs</a></td></tr>
+      <tr><td class="role">CLI driver</td><td class="path"><code>pop_var_caller estimate-contamination</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="step-section calling">
+  <h3>Step 3 — SNP calling <span class="pill parallel">parallel</span></h3>
+  <p>
+    Joins N <code>.psp</code> readers, filters low-complexity positions,
+    groups overlapping events, reconstructs per-sample likelihoods,
+    runs EM, and writes the multi-sample VCF.
+  </p>
+  <table class="modtable">
+    <thead><tr><th>Role</th><th>Path</th></tr></thead>
+    <tbody>
+      <tr><td class="role">per-sample pileup joiner</td><td class="path"><a href="../../src/var_calling/per_position_merger.rs">per_position_merger.rs</a></td></tr>
+      <tr><td class="role">DUST filter</td><td class="path"><a href="../../src/var_calling/dust_filter.rs">dust_filter.rs</a></td></tr>
+      <tr><td class="role">variant grouper</td><td class="path"><a href="../../src/var_calling/variant_grouping.rs">variant_grouping.rs</a></td></tr>
+      <tr><td class="role">per-group merger</td><td class="path"><a href="../../src/var_calling/per_group_merger.rs">per_group_merger.rs</a></td></tr>
+      <tr><td class="role">Bayesian genotype estimator</td><td class="path"><a href="../../src/var_calling/posterior_engine.rs">posterior_engine.rs</a></td></tr>
+      <tr><td class="role">cohort VCF writer</td><td class="path"><a href="../../src/var_calling/vcf_writer/">vcf_writer/</a></td></tr>
+      <tr><td class="role">CLI driver</td><td class="path"><code>pop_var_caller cohort</code> (planned)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<h2>Source — the Mermaid that produced the diagram</h2>
+
+<p>
+  The diagram above is rendered live from this fenced block. Copy-paste it
+  into the <a href="https://mermaid.live">Mermaid Live Editor</a> to tweak.
+</p>
+
+<pre style="background:#f4f4f4;padding:12px;border-radius:6px;overflow-x:auto;font-size:0.85rem;">flowchart TD
+  BAM[("BAM / CRAM × N")]
+  REF[("Reference FASTA")]
+  TSV[("Batch assignment TSV (optional)")]
+
+  subgraph S1 ["STEP 1 — PILEUP (parallel)"]
+    direction LR
+    CRAM["cram_input"] --&gt; WALK["pileup walker"] --&gt; BAQ["BAQ"] --&gt; P2P["pileup → psp"]
+  end
+
+  PSP[(".psp files × N")]
+
+  subgraph S2 ["STEP 2 — CONTAMINATION (optional)"]
+    direction TB
+    BR["batch-assignment reader"] --&gt; MLE["read-level mixture MLE"] --&gt; CSQB[("(c_s, q_b) TOML")]
+  end
+
+  subgraph S3 ["STEP 3 — SNP CALLING (parallel)"]
+    direction TB
+    JOIN["per-sample pileup joiner"] --&gt; DUST["DUST filter"] --&gt; GROUP["variant grouper"]
+    GROUP --&gt; PG["per-group merger"] --&gt; BAY["Bayesian genotype estimator (EM)"] --&gt; VCF["cohort VCF writer"]
+  end
+
+  OUT[("cohort.vcf.gz")]
+
+  BAM --&gt; CRAM
+  REF --&gt; WALK
+  P2P --&gt; PSP
+  PSP --&gt; JOIN
+  PSP -. ".psp" .-&gt; BR
+  TSV -. "sample → batch" .-&gt; BR
+  REF -. "ref FASTA" .-&gt; DUST
+  CSQB -. "(c_s, q_b)" .-&gt; BAY
+  VCF --&gt; OUT
+</pre>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: true },
+    securityLevel: 'loose'
+  });
+</script>
+
+</body>
+</html>

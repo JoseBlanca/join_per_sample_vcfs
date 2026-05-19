@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>pop_var_caller — architecture &amp; data flow</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5a5a5a;
+    --line: #c8c8c8;
+    --accent: #2b6cb0;
+
+    --c-input-fill:    #f0f0f0; --c-input-stroke:    #5a5a5a;
+    --c-pileup-fill:   #fde8c4; --c-pileup-stroke:   #b25e09;
+    --c-psp-fill:      #fff2b8; --c-psp-stroke:      #8a6d00;
+    --c-contam-fill:   #f5d6ee; --c-contam-stroke:   #8a2a78;
+    --c-call-fill:     #cfe5f6; --c-call-stroke:     #1a5a8a;
+    --c-sink-fill:     #e3e3e3; --c-sink-stroke:     #3a3a3a;
+  }
+
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    line-height: 1.5;
+  }
+
+  body { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  h1 { margin: 0 0 4px 0; font-size: 1.6rem; }
+  h2 { margin-top: 32px; font-size: 1.15rem; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  h3 { margin-top: 18px; font-size: 1rem; }
+
+  .subtitle { color: var(--muted); margin: 0 0 16px 0; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; font-size: 0.92em; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 8px 16px;
+    margin: 8px 0 24px 0;
+    font-size: 0.88rem;
+  }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .legend-swatch {
+    width: 16px; height: 16px;
+    border-radius: 3px;
+    border: 1.5px solid #444;
+  }
+
+  .diagram-wrap {
+    width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fafafa;
+    padding: 8px;
+  }
+  svg.diagram { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+
+  .diagram text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  .step-title { font-weight: 700; font-size: 16px; letter-spacing: 0.03em; }
+  .node-title { font-weight: 600; font-size: 13px; }
+  .node-sub   { font-size: 11px; fill: #333; }
+  .node-path  { font-size: 10.5px; fill: #444; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .flow-label { font-size: 11.5px; fill: #333; font-style: italic; }
+  .artefact-label { font-size: 12px; fill: #444; font-weight: 600; font-style: italic; }
+  .edge-arrow { fill: none; stroke: #333; stroke-width: 1.7; }
+  .edge-arrow.dashed { stroke-dasharray: 5 4; stroke: #8a2a78; }
+  .edge-arrow.ref-flow { stroke: #1f7a32; }
+
+  .pill {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 9px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #fff;
+    background: #444;
+    vertical-align: middle;
+  }
+  .pill.parallel { background: #1f7a32; }
+  .pill.seq      { background: #b25e09; }
+  .pill.optional { background: #8a2a78; }
+
+  .step-section { margin-top: 28px; }
+  .step-section h3 {
+    margin: 0 0 4px 0;
+    padding: 4px 10px;
+    border-left: 6px solid var(--accent);
+    background: #f4f4f4;
+    border-radius: 0 4px 4px 0;
+  }
+  .step-section.pileup  h3 { border-left-color: var(--c-pileup-stroke);  background: var(--c-pileup-fill); }
+  .step-section.contam  h3 { border-left-color: var(--c-contam-stroke);  background: var(--c-contam-fill); }
+  .step-section.calling h3 { border-left-color: var(--c-call-stroke);    background: var(--c-call-fill); }
+
+  table.modtable { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 0.92rem; }
+  table.modtable th, table.modtable td { border-bottom: 1px solid var(--line); padding: 6px 10px; vertical-align: top; text-align: left; }
+  table.modtable th { background: #f4f4f4; font-weight: 600; }
+  table.modtable td.role  { white-space: nowrap; font-weight: 600; }
+  table.modtable td.path  { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; }
+
+  .footnote { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>pop_var_caller — architecture &amp; data flow</h1>
+  <p class="subtitle">
+    Multi-sample SNP caller. The pipeline is run as three discrete steps,
+    each with its own CLI subcommand and on-disk artefact. The
+    authoritative design spec is at
+    <a href="../devel/specs/calling_pipeline_architecture.md">doc/devel/specs/calling_pipeline_architecture.md</a>;
+    status board at
+    <a href="../../PROJECT_STATUS.md">PROJECT_STATUS.md</a>.
+    Alternate rendering of the same diagram using Mermaid:
+    <a href="architecture-mermaid.html">architecture-mermaid.html</a>.
+  </p>
+
+  <div class="legend">
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-input-fill); border-color: var(--c-input-stroke);"></span>Input / artefact</span>
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-pileup-fill); border-color: var(--c-pileup-stroke);"></span>Step 1 — pileup</span>
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-contam-fill); border-color: var(--c-contam-stroke);"></span>Step 2 — contamination estimates</span>
+    <span class="legend-item"><span class="legend-swatch" style="background: var(--c-call-fill); border-color: var(--c-call-stroke);"></span>Step 3 — SNP calling</span>
+    <span class="legend-item"><span class="pill parallel">parallel</span> across samples or groups</span>
+    <span class="legend-item"><span class="pill optional">optional</span> gated on a CLI flag</span>
+  </div>
+</header>
+
+<h2>Three steps at a glance</h2>
+
+<div class="diagram-wrap">
+<svg class="diagram" viewBox="0 0 1180 980" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow-default" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+    </marker>
+    <marker id="arrow-contam" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a2a78"/>
+    </marker>
+    <marker id="arrow-ref" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f7a32"/>
+    </marker>
+
+    <g id="badge-parallel">
+      <rect x="0" y="0" width="62" height="16" rx="8" ry="8" fill="#1f7a32"/>
+      <text x="31" y="11.5" text-anchor="middle" font-size="9.5" font-weight="700" fill="#fff">PARALLEL</text>
+    </g>
+    <g id="badge-optional">
+      <rect x="0" y="0" width="62" height="16" rx="8" ry="8" fill="#8a2a78"/>
+      <text x="31" y="11.5" text-anchor="middle" font-size="9.5" font-weight="700" fill="#fff">OPTIONAL</text>
+    </g>
+  </defs>
+
+  <!-- ============================================================ -->
+  <!-- INPUTS ROW                                                    -->
+  <!-- ============================================================ -->
+  <g>
+    <!-- BAM stack -->
+    <rect x="100" y="44" width="220" height="50" rx="6" ry="6"
+          fill="var(--c-input-fill)" stroke="var(--c-input-stroke)" opacity="0.4"/>
+    <rect x="95" y="39" width="220" height="50" rx="6" ry="6"
+          fill="var(--c-input-fill)" stroke="var(--c-input-stroke)" opacity="0.65"/>
+    <rect x="90" y="34" width="220" height="50" rx="6" ry="6"
+          fill="var(--c-input-fill)" stroke="var(--c-input-stroke)"/>
+    <text x="200" y="56" text-anchor="middle" class="node-title">BAM / CRAM × N</text>
+    <text x="200" y="74" text-anchor="middle" class="node-sub">one per sample, coord-sorted</text>
+
+    <!-- Reference FASTA -->
+    <rect x="480" y="34" width="220" height="50" rx="6" ry="6"
+          fill="var(--c-input-fill)" stroke="var(--c-input-stroke)"/>
+    <text x="590" y="56" text-anchor="middle" class="node-title">Reference FASTA</text>
+    <text x="590" y="74" text-anchor="middle" class="node-sub">used by pileup &amp; calling</text>
+
+    <!-- batch TSV (optional) -->
+    <rect x="870" y="34" width="220" height="50" rx="6" ry="6"
+          fill="var(--c-input-fill)" stroke="var(--c-input-stroke)"
+          stroke-dasharray="4 3"/>
+    <text x="980" y="56" text-anchor="middle" class="node-title">Batch assignment TSV</text>
+    <text x="980" y="74" text-anchor="middle" class="node-sub">optional — sample → batch</text>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- STEP 1 — PILEUP                                                -->
+  <!-- ============================================================ -->
+  <g>
+    <rect x="60" y="124" width="720" height="166" rx="10" ry="10"
+          fill="var(--c-pileup-fill)" stroke="var(--c-pileup-stroke)" stroke-width="2"/>
+
+    <text x="80" y="150" class="step-title" fill="#7a3f04">STEP 1 — PILEUP</text>
+    <use href="#badge-parallel" x="690" y="138"/>
+    <text x="80" y="170" class="node-sub">One BAM → one <tspan font-family="ui-monospace,Menlo,monospace">.psp</tspan>. Reads each BAM exactly once. Parallel across samples at the driver.</text>
+
+    <!-- substages inside -->
+    <g>
+      <rect x="80"  y="192" width="150" height="64" rx="6" ry="6" fill="#fff" stroke="var(--c-pileup-stroke)"/>
+      <text x="155" y="212" text-anchor="middle" class="node-title">cram_input</text>
+      <text x="155" y="228" text-anchor="middle" class="node-sub">filter + ref fetch</text>
+      <text x="155" y="246" text-anchor="middle" class="node-path">cram_input.rs</text>
+
+      <rect x="246" y="192" width="150" height="64" rx="6" ry="6" fill="#fff" stroke="var(--c-pileup-stroke)"/>
+      <text x="321" y="212" text-anchor="middle" class="node-title">pileup walker</text>
+      <text x="321" y="228" text-anchor="middle" class="node-sub">CIGAR fold · slots</text>
+      <text x="321" y="246" text-anchor="middle" class="node-path">pileup/</text>
+
+      <rect x="412" y="192" width="150" height="64" rx="6" ry="6" fill="#fff" stroke="var(--c-pileup-stroke)"/>
+      <text x="487" y="212" text-anchor="middle" class="node-title">BAQ</text>
+      <text x="487" y="228" text-anchor="middle" class="node-sub">in-process, parallel</text>
+      <text x="487" y="246" text-anchor="middle" class="node-path">baq/</text>
+
+      <rect x="578" y="192" width="184" height="64" rx="6" ry="6" fill="#fff" stroke="var(--c-pileup-stroke)"/>
+      <text x="670" y="212" text-anchor="middle" class="node-title">pileup → psp</text>
+      <text x="670" y="228" text-anchor="middle" class="node-sub">encode + bgzf write</text>
+      <text x="670" y="246" text-anchor="middle" class="node-path">pileup_to_psp.rs</text>
+
+      <path d="M 230 224 L 246 224" class="edge-arrow" marker-end="url(#arrow-default)"/>
+      <path d="M 396 224 L 412 224" class="edge-arrow" marker-end="url(#arrow-default)"/>
+      <path d="M 562 224 L 578 224" class="edge-arrow" marker-end="url(#arrow-default)"/>
+    </g>
+
+    <text x="80" y="278" class="node-sub">CLI subcommand: <tspan font-family="ui-monospace,Menlo,monospace">pop_var_caller pileup</tspan></text>
+  </g>
+
+  <!-- BAM → Step 1 -->
+  <path d="M 200 84 L 200 124" class="edge-arrow" marker-end="url(#arrow-default)"/>
+  <!-- Ref FASTA → Step 1 -->
+  <path d="M 540 84 C 540 100, 460 100, 460 124" class="edge-arrow ref-flow" marker-end="url(#arrow-ref)"/>
+
+  <!-- ============================================================ -->
+  <!-- ARTEFACT — .psp files                                          -->
+  <!-- ============================================================ -->
+  <g>
+    <rect x="170" y="340" width="500" height="58" rx="6" ry="6"
+          fill="var(--c-psp-fill)" stroke="var(--c-psp-stroke)" opacity="0.55"/>
+    <rect x="165" y="335" width="500" height="58" rx="6" ry="6"
+          fill="var(--c-psp-fill)" stroke="var(--c-psp-stroke)" opacity="0.8"/>
+    <rect x="160" y="330" width="500" height="58" rx="6" ry="6"
+          fill="var(--c-psp-fill)" stroke="var(--c-psp-stroke)" stroke-width="1.5"/>
+
+    <text x="410" y="352" text-anchor="middle" class="node-title">.psp files × N (one per sample)</text>
+    <text x="410" y="370" text-anchor="middle" class="node-sub">bgzf-framed · per-record header · five per-allele scalars · phase-chain slot ids</text>
+    <text x="410" y="384" text-anchor="middle" class="node-path">src/per_sample_pileup/psp/</text>
+  </g>
+
+  <!-- Step 1 → .psp -->
+  <path d="M 420 290 L 420 330" class="edge-arrow" marker-end="url(#arrow-default)"/>
+  <text x="428" y="316" class="artefact-label">.psp</text>
+
+  <!-- ============================================================ -->
+  <!-- STEP 2 — CONTAMINATION (right side)                            -->
+  <!-- ============================================================ -->
+  <g>
+    <rect x="820" y="440" width="300" height="280" rx="10" ry="10"
+          fill="var(--c-contam-fill)" stroke="var(--c-contam-stroke)" stroke-width="2"
+          stroke-dasharray="6 4"/>
+
+    <text x="838" y="466" class="step-title" fill="#5a1a52">STEP 2 — CONTAMINATION</text>
+    <use href="#badge-optional" x="1050" y="454"/>
+    <text x="838" y="486" class="node-sub">Optional side-pass.</text>
+    <text x="838" y="502" class="node-sub">Bypasses Step 3's pipeline.</text>
+
+    <rect x="838" y="514" width="264" height="56" rx="6" ry="6" fill="#fff" stroke="var(--c-contam-stroke)"/>
+    <text x="970" y="534" text-anchor="middle" class="node-title">batch-assignment reader</text>
+    <text x="970" y="558" text-anchor="middle" class="node-path">pop_var_caller/batch_assignment.rs</text>
+
+    <rect x="838" y="582" width="264" height="56" rx="6" ry="6" fill="#fff" stroke="var(--c-contam-stroke)"/>
+    <text x="970" y="602" text-anchor="middle" class="node-title">read-level mixture MLE</text>
+    <text x="970" y="626" text-anchor="middle" class="node-path">var_calling/contamination_estimation.rs</text>
+
+    <rect x="838" y="650" width="264" height="56" rx="6" ry="6" fill="#fff" stroke="var(--c-contam-stroke)"/>
+    <text x="970" y="670" text-anchor="middle" class="node-title">(c_s, q_b) TOML artefact</text>
+    <text x="970" y="694" text-anchor="middle" class="node-path">pop_var_caller/contamination_artifact.rs</text>
+
+    <path d="M 970 570 L 970 582" class="edge-arrow dashed" marker-end="url(#arrow-contam)"/>
+    <path d="M 970 638 L 970 650" class="edge-arrow dashed" marker-end="url(#arrow-contam)"/>
+  </g>
+
+  <text x="820" y="740" class="node-sub">CLI subcommand: <tspan font-family="ui-monospace,Menlo,monospace">pop_var_caller estimate-contamination</tspan></text>
+
+  <!-- batch TSV → Step 2 -->
+  <path d="M 980 84 C 980 250, 980 380, 980 440" class="edge-arrow dashed" marker-end="url(#arrow-contam)"/>
+  <!-- .psp → Step 2 -->
+  <path d="M 660 358 C 760 358, 820 460, 838 520" class="edge-arrow dashed" marker-end="url(#arrow-contam)"/>
+
+  <!-- ============================================================ -->
+  <!-- STEP 3 — SNP CALLING (left/center)                             -->
+  <!-- ============================================================ -->
+  <g>
+    <rect x="60" y="440" width="720" height="436" rx="10" ry="10"
+          fill="var(--c-call-fill)" stroke="var(--c-call-stroke)" stroke-width="2"/>
+
+    <text x="80" y="466" class="step-title" fill="#0e3a5a">STEP 3 — SNP CALLING</text>
+    <use href="#badge-parallel" x="690" y="454"/>
+    <text x="80" y="486" class="node-sub">Joins N .psp readers → multi-sample VCF. Parallel across variant groups via rayon.</text>
+
+    <!-- internal vertical chain of substages -->
+    <g>
+      <!-- multi-way per-position merger -->
+      <rect x="80" y="502" width="680" height="50" rx="6" ry="6" fill="#fff" stroke="var(--c-call-stroke)"/>
+      <text x="98" y="522" class="node-title">per-sample pileup joiner</text>
+      <text x="98" y="540" class="node-sub">merges the N per-sample pileups into one record per position carrying every sample's evidence</text>
+      <text x="742" y="540" text-anchor="end" class="node-path">var_calling/per_position_merger.rs</text>
+
+      <!-- DUST filter -->
+      <rect x="80" y="562" width="680" height="50" rx="6" ry="6" fill="#fff" stroke="var(--c-call-stroke)"/>
+      <text x="98" y="582" class="node-title">DUST low-complexity filter</text>
+      <text x="98" y="600" class="node-sub">streaming sdust against ref FASTA · silently drops low-complexity contexts</text>
+      <text x="742" y="600" text-anchor="end" class="node-path">var_calling/dust_filter.rs</text>
+
+      <!-- variant grouper -->
+      <rect x="80" y="622" width="680" height="50" rx="6" ry="6" fill="#fff" stroke="var(--c-call-stroke)"/>
+      <text x="98" y="642" class="node-title">variant grouper</text>
+      <text x="98" y="660" class="node-sub">bundles overlapping / adjacent positions into OverlappingVarGroup values</text>
+      <text x="742" y="660" text-anchor="end" class="node-path">var_calling/variant_grouping.rs</text>
+
+      <!-- per-group merger -->
+      <rect x="80" y="682" width="680" height="50" rx="6" ry="6" fill="#fff" stroke="var(--c-call-stroke)"/>
+      <text x="98" y="702" class="node-title">per-group merger (rayon parallel)</text>
+      <text x="98" y="720" class="node-sub">allele unification · per-sample likelihood reconstruction · phase-chain consistency</text>
+      <text x="742" y="720" text-anchor="end" class="node-path">var_calling/per_group_merger.rs</text>
+
+      <!-- posterior engine -->
+      <rect x="80" y="742" width="680" height="50" rx="6" ry="6" fill="#fff" stroke="var(--c-call-stroke)"/>
+      <text x="98" y="762" class="node-title">Bayesian genotype estimator (EM)</text>
+      <text x="98" y="780" class="node-sub">final per-sample genotype + GQ + QUAL · optional contamination mixture using frozen (c_s, q_b)</text>
+      <text x="742" y="780" text-anchor="end" class="node-path">var_calling/posterior_engine.rs</text>
+
+      <!-- VCF writer -->
+      <rect x="80" y="802" width="680" height="50" rx="6" ry="6" fill="#fff" stroke="var(--c-call-stroke)"/>
+      <text x="98" y="822" class="node-title">cohort VCF writer</text>
+      <text x="98" y="840" class="node-sub">noodles-backed · bgzf multi-sample VCF</text>
+      <text x="742" y="840" text-anchor="end" class="node-path">var_calling/vcf_writer/</text>
+
+      <!-- inter-substage arrows -->
+      <path d="M 420 552 L 420 562" class="edge-arrow" marker-end="url(#arrow-default)"/>
+      <path d="M 420 612 L 420 622" class="edge-arrow" marker-end="url(#arrow-default)"/>
+      <path d="M 420 672 L 420 682" class="edge-arrow" marker-end="url(#arrow-default)"/>
+      <path d="M 420 732 L 420 742" class="edge-arrow" marker-end="url(#arrow-default)"/>
+      <path d="M 420 792 L 420 802" class="edge-arrow" marker-end="url(#arrow-default)"/>
+    </g>
+
+    <text x="80" y="862" class="node-sub">CLI subcommand: <tspan font-family="ui-monospace,Menlo,monospace">pop_var_caller cohort</tspan> (planned — end-to-end wiring)</text>
+  </g>
+
+  <!-- .psp → Step 3 -->
+  <path d="M 420 398 L 420 440" class="edge-arrow" marker-end="url(#arrow-default)"/>
+  <text x="428" y="424" class="artefact-label">.psp readers</text>
+
+  <!-- Ref FASTA → DUST (long green curve down right edge of Step 3) -->
+  <path d="M 700 56 C 800 56, 800 587, 760 587" class="edge-arrow ref-flow" marker-end="url(#arrow-ref)"/>
+  <text x="810" y="320" class="flow-label" fill="#1f7a32" transform="rotate(90 810 320)">reference FASTA (DUST)</text>
+
+  <!-- Step 2 output → posterior engine -->
+  <path d="M 838 678 C 800 678, 790 767, 760 767" class="edge-arrow dashed" marker-end="url(#arrow-contam)"/>
+  <text x="730" y="744" text-anchor="end" class="flow-label" fill="#8a2a78">(c_s, q_b)</text>
+
+  <!-- ============================================================ -->
+  <!-- OUTPUT                                                         -->
+  <!-- ============================================================ -->
+  <g>
+    <rect x="240" y="916" width="360" height="50" rx="6" ry="6"
+          fill="var(--c-sink-fill)" stroke="var(--c-sink-stroke)" stroke-width="1.5"/>
+    <text x="420" y="938" text-anchor="middle" class="node-title">cohort.vcf.gz</text>
+    <text x="420" y="954" text-anchor="middle" class="node-sub">final multi-sample VCF</text>
+  </g>
+  <path d="M 420 876 L 420 916" class="edge-arrow" marker-end="url(#arrow-default)"/>
+
+</svg>
+</div>
+
+<p class="footnote">
+  Solid black arrows show in-process streams; green is shared reference-FASTA
+  access; dashed magenta is the optional Step 2 side-pass and its
+  <code>(c_s, q_b)</code> hand-off into Step 3's posterior engine.
+</p>
+
+<h2>What's in each step</h2>
+
+<section class="step-section pileup">
+  <h3>Step 1 — Pileup <span class="pill parallel">parallel</span></h3>
+  <p>
+    One BAM/CRAM in, one <code>.psp</code> out. Streams the BAM exactly
+    once, accumulates per-sample evidence at every covered reference
+    position, applies BAQ in-process, and writes the five
+    freebayes-sufficient scalars per allele (<code>num_obs</code>,
+    <code>q_sum</code>, <code>fwd</code>, <code>placed_left</code>,
+    <code>placed_start</code>) plus phase-chain slot ids.
+  </p>
+  <table class="modtable">
+    <thead><tr><th>Role</th><th>Path</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="role">CRAM/BAM input</td>
+        <td class="path"><a href="../../src/per_sample_pileup/cram_input.rs">cram_input.rs</a> · <a href="../../src/per_sample_pileup/cram_files.rs">cram_files.rs</a> · <a href="../../src/per_sample_pileup/ref_fetcher.rs">ref_fetcher.rs</a></td>
+        <td>Min-MAPQ / min-length / flag filtering; reference fetcher.</td>
+      </tr>
+      <tr>
+        <td class="role">pileup walker</td>
+        <td class="path"><a href="../../src/per_sample_pileup/pileup/">pileup/</a> (walker · active_set · cigar_cursor · open_record · slot_allocator)</td>
+        <td>Per-position CIGAR fold with lazy cursor and phase-chain slot allocation. Step-by-step viewer in <a href="animations/index.html">animations/index.html</a>.</td>
+      </tr>
+      <tr>
+        <td class="role">BAQ</td>
+        <td class="path"><a href="../../src/per_sample_pileup/baq/">baq/</a></td>
+        <td>Base-Alignment-Quality realigner, in-process and parallel across reads.</td>
+      </tr>
+      <tr>
+        <td class="role">pileup → .psp</td>
+        <td class="path"><a href="../../src/per_sample_pileup/pileup_to_psp.rs">pileup_to_psp.rs</a> · <a href="../../src/per_sample_pileup/psp/">psp/</a></td>
+        <td>Encodes <code>PileupRecord</code>s into the bgzf-framed <code>.psp</code> artefact (<code>PspWriter</code>/<code>PspReader</code> pair).</td>
+      </tr>
+      <tr>
+        <td class="role">CLI driver</td>
+        <td class="path"><a href="../../src/pop_var_caller/">pop_var_caller/</a> — <code>pileup</code> subcommand</td>
+        <td>Shipped.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="step-section contam">
+  <h3>Step 2 — Contamination estimates <span class="pill optional">optional</span></h3>
+  <p>
+    Reads the <code>.psp</code> files + a sample-to-batch assignment TSV
+    and estimates per-sample contamination fraction <code>c_s</code> and
+    per-batch contamination-source allele-class distribution
+    <code>q_b</code> via a read-level mixture MLE. Output is a small TOML
+    artefact consumed by Step 3 as frozen inputs (the posterior engine
+    does <em>not</em> re-estimate them). Skipped entirely if
+    <code>--contamination-batches</code> is not supplied; Step 3 then
+    uses <code>c_s = 0</code> for every sample.
+  </p>
+  <table class="modtable">
+    <thead><tr><th>Role</th><th>Path</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="role">batch reader</td>
+        <td class="path"><a href="../../src/pop_var_caller/batch_assignment.rs">pop_var_caller/batch_assignment.rs</a></td>
+        <td>Parses the sample → batch TSV.</td>
+      </tr>
+      <tr>
+        <td class="role">mixture MLE</td>
+        <td class="path"><a href="../../src/var_calling/contamination_estimation.rs">var_calling/contamination_estimation.rs</a></td>
+        <td>Read-level EM. Bypasses Step 3's grouping/merger pipeline.</td>
+      </tr>
+      <tr>
+        <td class="role">artefact</td>
+        <td class="path"><a href="../../src/pop_var_caller/contamination_artifact.rs">pop_var_caller/contamination_artifact.rs</a></td>
+        <td>TOML <code>(c_s, q_b)</code> serialiser. Spec: <a href="../devel/specs/contamination_estimation.md">contamination_estimation.md</a>.</td>
+      </tr>
+      <tr>
+        <td class="role">CLI driver</td>
+        <td class="path"><a href="../../src/pop_var_caller/estimate_contamination.rs">pop_var_caller/estimate_contamination.rs</a> — <code>estimate-contamination</code> subcommand</td>
+        <td>Shipped.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="step-section calling">
+  <h3>Step 3 — SNP calling <span class="pill parallel">parallel</span></h3>
+  <p>
+    Joins N <code>.psp</code> readers, filters low-complexity positions,
+    groups overlapping events, reconstructs per-sample likelihoods,
+    runs EM, and writes the multi-sample VCF. Six substages stream
+    end-to-end; the per-group merger and the posterior engine
+    parallelise across independent variant groups via rayon. Only
+    Step 3 needs the reference FASTA (for DUST scoring); only Step 3
+    consumes the optional <code>(c_s, q_b)</code> from Step 2.
+  </p>
+  <table class="modtable">
+    <thead><tr><th>Role</th><th>Path</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="role">per-sample pileup joiner</td>
+        <td class="path"><a href="../../src/var_calling/per_position_merger.rs">var_calling/per_position_merger.rs</a></td>
+        <td>Merges the N per-sample <code>.psp</code> streams into a single per-position stream where each record carries every sample's evidence side-by-side.</td>
+      </tr>
+      <tr>
+        <td class="role">DUST filter</td>
+        <td class="path"><a href="../../src/var_calling/dust_filter.rs">var_calling/dust_filter.rs</a></td>
+        <td>Streaming sdust filter. No intermediate mask file; reference FASTA consulted on the fly.</td>
+      </tr>
+      <tr>
+        <td class="role">variant grouper</td>
+        <td class="path"><a href="../../src/var_calling/variant_grouping.rs">var_calling/variant_grouping.rs</a></td>
+        <td>Bundles overlapping / adjacent positions into <code>OverlappingVarGroup</code> values. Sequential, emits independent groups.</td>
+      </tr>
+      <tr>
+        <td class="role">per-group merger</td>
+        <td class="path"><a href="../../src/var_calling/per_group_merger.rs">var_calling/per_group_merger.rs</a></td>
+        <td>Allele unification + per-sample likelihood reconstruction from the five scalars + phase-chain consistency. Parallel across groups.</td>
+      </tr>
+      <tr>
+        <td class="role">Bayesian genotype estimator</td>
+        <td class="path"><a href="../../src/var_calling/posterior_engine.rs">var_calling/posterior_engine.rs</a> · <a href="../../src/var_calling/posterior_engine/">posterior_engine/</a></td>
+        <td>EM over the joined records → per-sample genotype + GQ + QUAL. Mixture E-step when contamination is enabled.</td>
+      </tr>
+      <tr>
+        <td class="role">cohort VCF writer</td>
+        <td class="path"><a href="../../src/var_calling/vcf_writer/">var_calling/vcf_writer/</a></td>
+        <td>Multi-sample bgzf VCF sink.</td>
+      </tr>
+      <tr>
+        <td class="role">CLI driver</td>
+        <td class="path"><a href="../../src/pop_var_caller/">pop_var_caller/</a> — <code>cohort</code> subcommand</td>
+        <td>Planned end-to-end wiring.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<h2>Further reading</h2>
+
+<ol>
+  <li>The spec — <a href="../devel/specs/calling_pipeline_architecture.md">calling_pipeline_architecture.md</a> — is authoritative.</li>
+  <li>Design constraints — <a href="../devel/specs/design_principles.md">design_principles.md</a>.</li>
+  <li>The <a href="animations/index.html">pileup-walker animation</a> is a step-by-step visualisation of Step 1's per-position fold.</li>
+  <li>Per-step status — what is shipped vs. open — <a href="../../PROJECT_STATUS.md">PROJECT_STATUS.md</a>.</li>
+</ol>
+
+</body>
+</html>
