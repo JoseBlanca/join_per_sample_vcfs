@@ -10,14 +10,20 @@
 //! subcommands (multi-vs-single, .psp-records-vs-walker), but
 //! everything *after* the merger is identical.
 
-use std::path::Path;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::per_sample_pileup::psp::{PspReadError, PspReader};
+use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::var_calling::dust_filter::{DustFilter, DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
     PerGroupMerger, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };
-use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
+use crate::var_calling::per_position_merger::{
+    PerPositionMerger, PerPositionMergerError, PerPositionPileups,
+};
 use crate::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError,
 };
@@ -29,7 +35,14 @@ use crate::var_calling::vcf_writer::{
 /// Bundle of per-stage configs + shared resources consumed by
 /// [`drive_cohort_pipeline`]. Constructed by the caller; consumed
 /// (by-value) when the driver runs.
+///
+/// `Clone` is derived because the per-chromosome parallel path in
+/// [`run_var_calling`](super::var_calling::run_var_calling) builds
+/// one parameter set per chromosome from a shared template. Every
+/// field is cheap-Clone — the configs are `Copy` or wrap a small
+/// `Vec`; `fetcher` is an `Arc`; `chromosomes` is a `Vec<ParsedChromosome>`.
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct CohortPipelineParams {
     /// Whether to skip the DUST filter (set per-CLI by
     /// `--no-complexity-filter`).
@@ -134,4 +147,89 @@ where
         return Err(e);
     }
     Ok(records_written)
+}
+
+/// Run the cohort var-calling chain (DUST → … → VCF writer) over a
+/// single chromosome's records and write a complete self-contained
+/// VCF fragment to `fragment_path`. Designed as the per-worker body
+/// of the per-chromosome parallel partition driven from
+/// [`run_var_calling`](super::var_calling::run_var_calling).
+///
+/// Each worker re-opens its own `PspReader` set against `psp_paths`
+/// — opens are cheap (one seek to the trailer + a small index read
+/// per file) and per-worker readers avoid cross-thread coordination
+/// on the read side. The whole-chromosome window is materialised via
+/// [`PspReader::region_records`](crate::per_sample_pileup::psp::PspReader::region_records)
+/// with `start = 1`, `end = chrom.length`; chromosomes with zero
+/// records on disk yield an empty iterator + a header-only fragment,
+/// which [`crate::var_calling::vcf_writer::concat::concat_fragments`]
+/// handles by stripping the header on non-first fragments.
+///
+/// Returns `(chrom_id, records_written)` on success. Errors are
+/// surfaced through the same typed enum the sequential
+/// [`drive_cohort_pipeline`] uses; the per-chrom orchestrator
+/// collects worker results and returns the first error after every
+/// worker has joined.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // shared template + per-worker inputs; bundling adds indirection without clarity gain
+pub fn process_one_chromosome<E>(
+    chrom_id: u32,
+    psp_paths: &[PathBuf],
+    sample_names: Vec<String>,
+    all_chromosomes: Vec<ParsedChromosome>,
+    fragment_path: PathBuf,
+    metadata: CohortMetadata,
+    writer_cfg_template: WriterConfig,
+    pipeline_params: CohortPipelineParams,
+) -> Result<(u32, u64), E>
+where
+    E: From<std::io::Error>
+        + From<PspReadError>
+        + From<PerPositionMergerError>
+        + From<DustFilterError>
+        + From<GrouperError>
+        + From<PerGroupMergerError>
+        + From<PosteriorEngineError>
+        + From<VcfWriteError>,
+{
+    let chrom_length = all_chromosomes
+        .get(chrom_id as usize)
+        .map(|c| c.length)
+        .expect("chrom_id past contig table — caller (run_var_calling) must validate the bound");
+
+    // Open one PspReader per sample. Per-worker ownership: no
+    // cross-thread coordination on the read side.
+    let mut readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(psp_paths.len());
+    for path in psp_paths {
+        let file = File::open(path)?;
+        let buf = BufReader::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
+        readers.push(PspReader::new(buf)?);
+    }
+
+    // Per-chrom record iterators. `region_records` seeks to the
+    // first overlapping block + clamps the iterator to records on
+    // this chrom inside [1, chrom_length].
+    let record_iters: Vec<_> = readers
+        .iter_mut()
+        .map(|r| r.region_records(chrom_id, 1, chrom_length))
+        .collect();
+
+    let merger = PerPositionMerger::new(record_iters, sample_names, all_chromosomes)?;
+
+    // Inherit `emit_gp` (and any future flags) from the template;
+    // override only the output path. Struct-update syntax keeps this
+    // robust against future `WriterConfig` field additions.
+    let writer_cfg = WriterConfig {
+        output: fragment_path.clone(),
+        ..writer_cfg_template
+    };
+
+    let records_written = drive_cohort_pipeline::<_, E>(
+        merger,
+        pipeline_params,
+        &fragment_path,
+        metadata,
+        writer_cfg,
+    )?;
+    Ok((chrom_id, records_written))
 }
