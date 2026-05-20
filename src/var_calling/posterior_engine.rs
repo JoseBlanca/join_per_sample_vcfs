@@ -1530,6 +1530,23 @@ struct RecordScratch {
     /// (`None` for non-compound alleles). Length `n_alleles`.
     compound_frequencies: Vec<Option<f64>>,
 
+    // ===== Site-QUAL exact-AF buffers (used after EM converges). =====
+    /// Per-sample log-likelihoods collapsed by total non-ref allele
+    /// count. Layout: row-major `[sample_idx * (ploidy + 1) +
+    /// non_ref_count]`. Filled by [`compute_qual_via_exact_af`] before
+    /// the convolution. Length `n_samples * (ploidy + 1)`.
+    per_sample_alt_log_lik: Vec<f64>,
+    /// Rolling per-cohort-AC log-probability buffer for the exact-AF
+    /// convolution. After processing the first `s` samples,
+    /// `log_p_ac_curr[k]` holds `log P(seen data | AC = k)` for
+    /// `k = 0..=s·ploidy`. After the prior step it holds the
+    /// unnormalised log-posterior over `K = 0..=ploidy·n_samples`.
+    /// Length `ploidy * n_samples + 1`.
+    log_p_ac_curr: Vec<f64>,
+    /// Swap target for [`Self::log_p_ac_curr`] during the convolution.
+    /// Same length.
+    log_p_ac_next: Vec<f64>,
+
     // ===== Mixture pre-pass buffers (only used when contam-on). =====
     /// Mixture-recomputed log-likelihoods. Length
     /// `n_samples * n_genotypes`. Filled by the mixture pre-pass when
@@ -1575,6 +1592,9 @@ impl RecordScratch {
             best_genotype: Vec::new(),
             gq_phred: Vec::new(),
             compound_frequencies: Vec::new(),
+            per_sample_alt_log_lik: Vec::new(),
+            log_p_ac_curr: Vec::new(),
+            log_p_ac_next: Vec::new(),
             mixture_log_likelihoods: Vec::new(),
             mixture_n_obs: Vec::new(),
             mixture_mean_err: Vec::new(),
@@ -1586,7 +1606,13 @@ impl RecordScratch {
     /// Size every buffer to the current record's shape. `Vec::resize`
     /// preserves capacity above the high-water mark, so steady-state
     /// records of the same shape allocate nothing.
-    fn resize_to(&mut self, n_samples: usize, n_alleles: usize, n_genotypes: usize) {
+    fn resize_to(
+        &mut self,
+        n_samples: usize,
+        n_alleles: usize,
+        n_genotypes: usize,
+        ploidy: u8,
+    ) {
         self.p_effective.resize(n_alleles, 0.0);
         self.log_p_effective.resize(n_alleles, 0.0);
         self.log_indep_per_g.resize(n_genotypes, 0.0);
@@ -1612,6 +1638,16 @@ impl RecordScratch {
         self.best_genotype.resize(n_samples, 0);
         self.gq_phred.resize(n_samples, 0.0);
         self.compound_frequencies.resize(n_alleles, None);
+
+        // Exact-AF QUAL buffers. `(ploidy + 1)` slots per sample for
+        // the collapsed-by-alt-count likelihoods; `ploidy * n_samples
+        // + 1` slots for the rolling AC log-probability vectors.
+        let p = ploidy as usize;
+        self.per_sample_alt_log_lik
+            .resize(n_samples * (p + 1), f64::NEG_INFINITY);
+        let ac_len = n_samples * p + 1;
+        self.log_p_ac_curr.resize(ac_len, f64::NEG_INFINITY);
+        self.log_p_ac_next.resize(ac_len, f64::NEG_INFINITY);
 
         // Mixture buffers are only used when contam-on; resize
         // unconditionally so the buffer is the right shape if a
@@ -1686,7 +1722,7 @@ fn run_em_for_record<M: MathBackend>(
     // Resize the per-engine scratch to the current record's shape
     // before any further field accesses. Steady-state records of the
     // same shape allocate nothing here.
-    scratch.resize_to(n_samples, n_alleles, n_genotypes);
+    scratch.resize_to(n_samples, n_alleles, n_genotypes, ploidy);
 
     // Fill the record-static scratch fields (no mallocs — overwrites
     // pre-sized buffers).
@@ -1859,7 +1895,25 @@ fn run_em_for_record<M: MathBackend>(
         e_step(ctx, math, &log_likelihoods, scratch)?;
     }
 
-    let qual_phred = summarise_posteriors(n_samples, n_genotypes, scratch, config.max_gq_phred);
+    summarise_posteriors(n_samples, n_genotypes, scratch, config.max_gq_phred);
+    // Beta(α_alt, α_ref) prior shape for the AC marginalisation —
+    // read off the per-allele pseudocounts the EM already routed
+    // through `pseudocount_for` into `scratch.pseudocounts`. Sum over
+    // ALTs (a ≥ 1) for the "any non-ref" collapse.
+    let alpha_ref = scratch.pseudocounts[0];
+    let alpha_alt: f64 = scratch.pseudocounts[1..n_alleles].iter().sum();
+    let qual_phred = compute_qual_via_exact_af(
+        math,
+        n_samples,
+        n_genotypes,
+        n_alleles,
+        ploidy,
+        &log_likelihoods,
+        &shape,
+        alpha_ref,
+        alpha_alt,
+        scratch,
+    );
 
     // Fill `scratch.compound_frequencies` from the converged f̂_C and
     // the compound mask, then clone-out below. Reuses the scratch
@@ -2412,14 +2466,15 @@ fn m_step_f_hat_compound(ctx: EmContext<'_>, scratch: &mut RecordScratch) {
 /// `scratch` so the caller can `.clone()` them into the output
 /// record without a fresh malloc-then-zero-init per record. Returns
 /// only the scalar `qual_phred`.
+/// Walk each sample's posterior row and fill the per-sample output
+/// buffers (`best_genotype` argmax and `gq_phred`). The site-level
+/// QUAL is no longer derived here — see [`compute_qual_via_exact_af`].
 fn summarise_posteriors(
     n_samples: usize,
     n_genotypes: usize,
     scratch: &mut RecordScratch,
     max_gq: f64,
-) -> f64 {
-    let mut log10_p_hom_ref_sum = 0.0_f64;
-
+) {
     for sample_idx in 0..n_samples {
         let post_row =
             &scratch.posteriors[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
@@ -2437,24 +2492,174 @@ fn summarise_posteriors(
         let p_best_clamped = best_p.min(1.0 - f64::EPSILON);
         let gq = PHRED_SCALE * (1.0 - p_best_clamped).log10();
         scratch.gq_phred[sample_idx] = gq.clamp(0.0, max_gq);
+    }
+}
 
-        let p_hom_ref = post_row[HOM_REF_GENOTYPE_IDX];
-        if p_hom_ref > 0.0 {
-            log10_p_hom_ref_sum += p_hom_ref.log10();
-        } else {
-            log10_p_hom_ref_sum = f64::NEG_INFINITY;
+/// Lanczos approximation to `ln Γ(x)` for `x > 0`. Used by
+/// [`compute_qual_via_exact_af`] to evaluate the Beta-Binomial AC
+/// prior — argument range is `≈ 0.001..few-thousand` (Dirichlet
+/// pseudocounts on one end, cohort factorials on the other), which
+/// the standard `g = 7, n = 9` form covers at ~15-digit accuracy.
+/// For `x < 0.5` the reflection formula `Γ(z)·Γ(1 − z) = π / sin(πz)`
+/// is applied; in our use the argument is always `> 0` (positive
+/// pseudocounts and factorial offsets), but the reflection branch is
+/// kept for robustness.
+fn ln_gamma(x: f64) -> f64 {
+    debug_assert!(x > 0.0, "ln_gamma called with non-positive x={x}");
+    const G: f64 = 7.0;
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_2,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().abs().ln()
+            - ln_gamma(1.0 - x);
+    }
+    let z = x - 1.0;
+    let mut a = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        a += c / (z + i as f64);
+    }
+    let t = z + G + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + a.ln() + (z + 0.5) * t.ln() - t
+}
+
+/// Site-level QUAL via "any non-ref carrier" exact AC enumeration.
+///
+/// Computes `−10·log10 P(K = 0 | data)` where `K = Σ_s c_s` is the
+/// total non-ref allele count across the cohort, `c_s ∈ {0..ploidy}`
+/// is sample `s`'s non-ref allele count, and the prior on `K` is the
+/// Beta-Binomial induced by a Dirichlet on (ref, any-non-ref) allele
+/// frequency with `α_ref = config.ref_pseudocount` and
+/// `α_alt = Σ_{a ≥ 1} pseudocount_for(allele_classes[a])`. The
+/// "any non-ref" collapse means multi-allelic sites use a single QUAL
+/// (one allele frequency over the union of ALTs); this matches the
+/// VCF intent of `−10·log10 P(no variant)`.
+///
+/// In contrast to the previous `Π_s P(GT_s = hom-ref)` formula, this
+/// is a properly normalised marginal posterior — adding hom-ref
+/// samples adds essentially zero log-evidence against `K > 0` under
+/// the sparse-het prior, so QUAL is bounded by what the few
+/// non-hom-ref samples actually justify rather than scaling with the
+/// cohort size. See the QUAL-semantics project memory for the
+/// alignment with GATK (`P(AC = 0 | data)`) and FreeBayes
+/// (`1 - P(K = 1 | reads)`).
+///
+/// Algorithm (log-domain throughout, `log_sum_exp_2` for stability):
+///   1. **Collapse** per-sample per-genotype log-likelihoods into
+///      per-sample-per-`c` (= non-ref-allele-count) cells:
+///      `l_s[c] = logsumexp_{g : non_ref(g) = c} log_likelihoods[s, g]`.
+///   2. **Convolution** sample-by-sample over the cohort AC axis:
+///      `log_p_ac[k] ← logsumexp_{c} (log_p_ac_prev[k − c] + l_s[c])`.
+///   3. **Apply log-prior** `log P(K = k)` from
+///      Beta-Binomial(`ploidy · n_samples`, `α_alt`, `α_ref`).
+///   4. **Normalise** with logsumexp over `K = 0..=ploidy·n_samples`
+///      and read off `P(K = 0 | data)`.
+#[allow(clippy::too_many_arguments)] // shape, math backend, scratch, and the four numeric record shape parameters are all distinct concerns — bundling adds indirection without clarity gain.
+fn compute_qual_via_exact_af<M: MathBackend>(
+    math: &M,
+    n_samples: usize,
+    n_genotypes: usize,
+    n_alleles: usize,
+    ploidy: u8,
+    log_likelihoods: &[f64],
+    shape: &GenotypeShape,
+    alpha_ref: f64,
+    alpha_alt: f64,
+    scratch: &mut RecordScratch,
+) -> f64 {
+    let p = ploidy as usize;
+    let max_k = n_samples * p;
+    let max_k_p1 = max_k + 1;
+
+    // Step 1: per-sample collapsed log-likelihoods.
+    for slot in scratch.per_sample_alt_log_lik.iter_mut() {
+        *slot = f64::NEG_INFINITY;
+    }
+    for s in 0..n_samples {
+        let ll_row = &log_likelihoods[s * n_genotypes..(s + 1) * n_genotypes];
+        let alt_row_base = s * (p + 1);
+        for (g, &ll) in ll_row.iter().enumerate() {
+            let counts = &shape.genotype_allele_counts[g * n_alleles..(g + 1) * n_alleles];
+            // c = ploidy − count of REF (allele 0) = total non-ref copies.
+            let c = (p as u32 - counts[0]) as usize;
+            let slot = &mut scratch.per_sample_alt_log_lik[alt_row_base + c];
+            *slot = log_sum_exp_2(math, *slot, ll);
         }
     }
 
-    // QUAL = -10 · log10(Π_s P(hom-ref)_s). If any sample has
-    // P(hom-ref) = 0 exactly, the product is 0 and QUAL = +∞ — a
-    // legitimate "site is certainly variant" signal; the VCF writer
-    // can cap it if it wants to.
-    if log10_p_hom_ref_sum.is_finite() {
-        PHRED_SCALE * log10_p_hom_ref_sum
-    } else {
-        f64::INFINITY
+    // Step 2: convolution. Initialise with the empty-prefix
+    // distribution (mass 1 on `K = 0`, zero elsewhere).
+    for slot in scratch.log_p_ac_curr[..max_k_p1].iter_mut() {
+        *slot = f64::NEG_INFINITY;
     }
+    scratch.log_p_ac_curr[0] = 0.0;
+
+    for s in 0..n_samples {
+        let l_s = &scratch.per_sample_alt_log_lik[s * (p + 1)..(s + 1) * (p + 1)];
+        let kmax_after = (s + 1) * p;
+        for slot in scratch.log_p_ac_next[..max_k_p1].iter_mut() {
+            *slot = f64::NEG_INFINITY;
+        }
+        for k in 0..=kmax_after {
+            let c_max = p.min(k);
+            let mut acc = f64::NEG_INFINITY;
+            for (c, &ll) in l_s.iter().enumerate().take(c_max + 1) {
+                let prev = scratch.log_p_ac_curr[k - c];
+                if prev > f64::NEG_INFINITY && ll > f64::NEG_INFINITY {
+                    acc = log_sum_exp_2(math, acc, prev + ll);
+                }
+            }
+            scratch.log_p_ac_next[k] = acc;
+        }
+        std::mem::swap(&mut scratch.log_p_ac_curr, &mut scratch.log_p_ac_next);
+    }
+
+    // Step 3: apply the Beta-Binomial log-prior on `K`.
+    //
+    // The (ref, any-non-ref) collapse on the allele-frequency simplex
+    // turns the per-allele Dirichlet pseudocounts into a Beta prior
+    // on `f_non_ref` with shape (`α_alt`, `α_ref`), which in turn
+    // induces Beta-Binomial(max_k, α_alt, α_ref) on `K`.
+    let log_beta_norm =
+        ln_gamma(alpha_alt) + ln_gamma(alpha_ref) - ln_gamma(alpha_alt + alpha_ref);
+    let max_k_f = max_k as f64;
+    let log_max_k_fact = ln_gamma(max_k_f + 1.0);
+    let log_denom = ln_gamma(alpha_alt + alpha_ref + max_k_f);
+
+    // Overwrite `log_p_ac_next` with the unnormalised log-posterior
+    // (likelihood + prior) so we can sweep it for the partition once.
+    for k in 0..max_k_p1 {
+        let k_f = k as f64;
+        let log_binom = log_max_k_fact - ln_gamma(k_f + 1.0) - ln_gamma(max_k_f - k_f + 1.0);
+        let log_beta_kk = ln_gamma(alpha_alt + k_f) + ln_gamma(alpha_ref + max_k_f - k_f);
+        let log_prior_k = log_binom + log_beta_kk - log_denom - log_beta_norm;
+        scratch.log_p_ac_next[k] = scratch.log_p_ac_curr[k] + log_prior_k;
+    }
+
+    // Step 4: normalise via logsumexp; derive QUAL from P(K = 0).
+    let log_z = log_sum_exp_slice(math, &scratch.log_p_ac_next[..max_k_p1]);
+    if log_z == f64::NEG_INFINITY {
+        // Pathological — every (K, data) combination has zero mass.
+        // Safer to surface as QUAL = 0 than to claim infinite
+        // confidence; this branch should not be reachable from real
+        // inputs.
+        return 0.0;
+    }
+    let log_p_k0_post = scratch.log_p_ac_next[0] - log_z;
+    if log_p_k0_post == f64::NEG_INFINITY {
+        return f64::INFINITY;
+    }
+    // QUAL = −10 · log10(P(K = 0 | data)).
+    PHRED_SCALE * (log_p_k0_post / std::f64::consts::LN_10)
 }
 
 /// Inputs to [`trivial_posterior_record`]. Grouped into a struct
@@ -3122,19 +3327,78 @@ mod tests {
     }
 
     #[test]
-    fn site_qual_matches_closed_form_on_weak_uniform_cohort() {
-        let likelihoods: Vec<Vec<f64>> = (0..5).map(|_| vec![0.0, -3.0, -3.0]).collect();
-        let record = merged_record_simple(1, 100, vec![b"A", b"C"], 2, likelihoods);
+    fn site_qual_matches_closed_form_for_single_sample() {
+        // Single diploid biallelic sample with arbitrary log-likelihoods
+        // — the AC convolution collapses to the per-sample row, so the
+        // expected QUAL is the Beta-Binomial(2, α_alt, α_ref) posterior
+        // on `K = 0` computed in closed form. Catches sign / base / prior
+        // mistakes in `compute_qual_via_exact_af` against the math.
+        let l = vec![-1.5_f64, -0.2, -2.0];
+        let record = merged_record_simple(1, 100, vec![b"A", b"C"], 2, vec![l.clone()]);
         let pr = single_ok(record);
-        let expected_qual: f64 = -10.0
-            * (0..pr.n_samples)
-                .map(|s| pr.posteriors_row(s)[0].log10())
-                .sum::<f64>();
+
+        let alpha_alt = DEFAULT_SNP_ALT_PSEUDOCOUNT;
+        let alpha_ref = DEFAULT_REF_PSEUDOCOUNT;
+        // log B(α_alt, α_ref).
+        let log_beta_norm =
+            ln_gamma(alpha_alt) + ln_gamma(alpha_ref) - ln_gamma(alpha_alt + alpha_ref);
+        // P(K = k | 2, α_alt, α_ref) for k = 0, 1, 2.
+        let log_prior = |k: u32| -> f64 {
+            let kf = k as f64;
+            let log_binom =
+                ln_gamma(3.0) - ln_gamma(kf + 1.0) - ln_gamma(2.0 - kf + 1.0);
+            let log_beta_kk = ln_gamma(alpha_alt + kf) + ln_gamma(alpha_ref + 2.0 - kf);
+            log_binom + log_beta_kk - ln_gamma(alpha_alt + alpha_ref + 2.0) - log_beta_norm
+        };
+        let log_post: [f64; 3] = [
+            l[0] + log_prior(0),
+            l[1] + log_prior(1),
+            l[2] + log_prior(2),
+        ];
+        let m = log_post.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let log_z = m + (log_post.iter().map(|x| (x - m).exp()).sum::<f64>()).ln();
+        let expected_qual = -10.0 * (log_post[0] - log_z) / std::f64::consts::LN_10;
+
         assert!(
-            approx(pr.qual_phred, expected_qual, 1e-9),
+            approx(pr.qual_phred, expected_qual, 1e-6),
             "qual_phred={} expected={}",
             pr.qual_phred,
-            expected_qual
+            expected_qual,
+        );
+    }
+
+    #[test]
+    fn site_qual_does_not_inflate_when_no_sample_has_strong_alt_evidence() {
+        // Pathology the new formula fixes: a cohort where every
+        // sample has weak ambiguous evidence (mild hint toward het)
+        // but no sample is a confident carrier. Under the old
+        // `Π_s P(GT_s = hom-ref)` formula every such sample
+        // contributed a few extra phred and QUAL grew linearly with
+        // N — that's how the synthetic-10-duplicate cohort hit
+        // QUAL ≈ 30 with no real signal. Under the cohort-AC
+        // posterior with a sparse-het prior, weak per-sample
+        // evidence translates to a weak posterior shift at the
+        // cohort-AC level, bounded by the prior; QUAL must stay
+        // small regardless of N.
+        let weak = vec![0.0_f64, -1.0, -3.0]; // mild ref preference per sample
+
+        let one = merged_record_simple(1, 100, vec![b"A", b"C"], 2, vec![weak.clone()]);
+        let qual_one = single_ok(one).qual_phred;
+
+        let many_likelihoods: Vec<Vec<f64>> = (0..20).map(|_| weak.clone()).collect();
+        let many = merged_record_simple(1, 100, vec![b"A", b"C"], 2, many_likelihoods);
+        let qual_many = single_ok(many).qual_phred;
+
+        // The defaults' sparse-het prior keeps QUAL ≲ 5 phred for any
+        // cohort under this evidence shape. Under the old formula
+        // QUAL would have grown by ~10 phred between N=1 and N=20.
+        assert!(
+            qual_one < 5.0,
+            "qual_one={qual_one} should be < 5 (weak evidence, no clear carrier)",
+        );
+        assert!(
+            qual_many < 5.0,
+            "qual_many={qual_many} should be < 5 (cohort growth must not inflate QUAL when no sample is a clear carrier)",
         );
     }
 
@@ -3156,9 +3420,14 @@ mod tests {
     }
 
     #[test]
-    fn summarise_posteriors_returns_infinite_qual_when_any_sample_has_zero_hom_ref_posterior() {
-        // log-likelihood ratio so extreme that softmax of the alts
-        // underflows P(RR) to exactly 0.
+    fn site_qual_is_large_but_finite_under_extreme_alt_evidence() {
+        // Under the new `−10·log10 P(K = 0 | data)` formula QUAL is
+        // bounded by the convolution arithmetic — it grows large but
+        // does not reach `f64::INFINITY` unless the entire numerator
+        // at `K = 0` underflows to `−∞` exactly. The VCF writer caps
+        // at `QUAL_MAX = 9999.0` anyway. This test pins the
+        // "large-finite, not ±∞ or NaN" contract for an extreme
+        // single-sample alt-favoured input.
         let record = merged_record_simple(
             1,
             100,
@@ -3167,14 +3436,11 @@ mod tests {
             vec![vec![-1000.0, -1000.0, 0.0]],
         );
         let pr = single_ok(record);
-        if pr.posteriors_row(0)[0] == 0.0 {
-            assert!(
-                pr.qual_phred.is_infinite() && pr.qual_phred > 0.0,
-                "qual_phred = {}",
-                pr.qual_phred
-            );
-        }
-        // GQ clamps regardless of how extreme the posterior is.
+        assert!(
+            pr.qual_phred.is_finite() && pr.qual_phred > 100.0,
+            "qual_phred = {} (expected large-finite)",
+            pr.qual_phred,
+        );
         assert!(pr.gq_phred[0].is_finite());
         assert!(pr.gq_phred[0] <= DEFAULT_MAX_GQ_PHRED + 1e-9);
     }
