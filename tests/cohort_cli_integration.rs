@@ -24,6 +24,7 @@ use pop_var_caller::per_sample_pileup::pileup::{
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
 };
 use pop_var_caller::pop_var_caller::cli::shared_args::{CohortPipelineArgs, Stage1Args};
+use pop_var_caller::pop_var_caller::cohort_driver::DEFAULT_MIN_QUAL_PHRED;
 use pop_var_caller::pop_var_caller::estimate_contamination::{
     EstimateContaminationArgs, EstimateContaminationCliError, run_estimate_contamination,
 };
@@ -113,6 +114,7 @@ fn var_calling_args(
             indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
             compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
+            min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             emit_gp: false,
         },
     }
@@ -332,6 +334,7 @@ fn var_calling_from_bam_happy_path() {
             indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
             compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
+            min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             emit_gp: false,
         },
     };
@@ -666,6 +669,7 @@ fn var_calling_from_bam_surfaces_walker_error_on_max_active_reads_trip() {
             indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
             compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
+            min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             emit_gp: false,
         },
     };

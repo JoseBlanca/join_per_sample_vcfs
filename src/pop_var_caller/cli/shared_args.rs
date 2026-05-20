@@ -41,6 +41,7 @@ use crate::per_sample_pileup::pileup::{
 };
 use crate::pop_var_caller::cli::parse_mismatch_fraction;
 use crate::pop_var_caller::cli::parsers;
+use crate::pop_var_caller::cohort_driver::DEFAULT_MIN_QUAL_PHRED;
 use crate::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use crate::var_calling::per_group_merger::{DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY};
 use crate::var_calling::posterior_engine::{
@@ -326,6 +327,21 @@ pub struct CohortPipelineArgs {
     pub max_gq_phred: f64,
 
     // ===== Advanced — VCF writer ===============================
+    /// Drop records with site-level `QUAL` strictly below this
+    /// (phred). `0` disables the filter. Default matches GATK
+    /// HaplotypeCaller's emission gate; caveat: our `QUAL` is a
+    /// product over per-sample hom-ref posteriors, which inflates
+    /// with cohort size, so the same threshold means different
+    /// things at different N.
+    #[arg(
+        long = "min-qual",
+        hide_short_help = true,
+        default_value_t = DEFAULT_MIN_QUAL_PHRED,
+        value_parser = parsers::parse_min_qual_phred,
+        help_heading = "Advanced — VCF writer",
+    )]
+    pub min_qual_phred: f64,
+
     /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
     /// default — `GP` is `Number=G`, so the per-sample cell grows as
     /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at

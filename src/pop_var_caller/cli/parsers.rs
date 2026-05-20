@@ -187,6 +187,11 @@ pub fn parse_max_gq_phred(s: &str) -> Result<f64, String> {
     )
 }
 
+/// `--min-qual`: finite, `[0.0, 1000.0]`. `0.0` disables the filter.
+pub fn parse_min_qual_phred(s: &str) -> Result<f64, String> {
+    parse_f64_with(s, "min-qual", |v| (0.0..=1000.0).contains(&v), "[0.0, 1000.0]")
+}
+
 /// Shared body for every Dirichlet-pseudocount parser. Range is the
 /// same across the posterior engine and the contamination side-pass
 /// (`PSEUDOCOUNT_RANGE_MAX = 1000.0` in both modules); the only thing
@@ -354,6 +359,17 @@ mod tests {
         assert!(parse_max_gq_phred("10").is_err());
         assert!(parse_max_gq_phred("200.001").is_err());
         assert!(parse_max_gq_phred("nan").is_err());
+    }
+
+    #[test]
+    fn min_qual_phred_boundaries() {
+        parse_min_qual_phred("0").unwrap();
+        parse_min_qual_phred("30").unwrap();
+        parse_min_qual_phred("1000").unwrap();
+        assert!(parse_min_qual_phred("-0.001").is_err());
+        assert!(parse_min_qual_phred("1000.001").is_err());
+        assert!(parse_min_qual_phred("nan").is_err());
+        assert!(parse_min_qual_phred("inf").is_err());
     }
 
     #[test]

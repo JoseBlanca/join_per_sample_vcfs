@@ -32,6 +32,23 @@ use crate::var_calling::vcf_writer::{
     CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig, tmp_path_for,
 };
 
+/// Default for [`CohortPipelineParams::min_qual_phred`]. Matches
+/// GATK HaplotypeCaller's `--standard-min-confidence-threshold-for-calling`
+/// (30.0) as a hygiene gate.
+///
+/// **Caveat.** Our site-level QUAL is currently
+/// `-10·log10(Π_s P(GT_s = hom-ref))` — a *product* over samples,
+/// not a marginalised cohort-AF posterior the way GATK
+/// (`P(AC = 0 | data)`, integrated over a shared AF) and FreeBayes
+/// (`1 - P(K = 1 | reads)`) compute it. Under our formula QUAL
+/// grows roughly linearly with cohort size even when nothing about
+/// the per-sample evidence changes, so a fixed threshold has
+/// different bite at different N. A fix to the QUAL semantics is
+/// tracked separately; until then `30.0` is a coarse low-end
+/// hygiene cutoff (drops the obvious tail) rather than a calibrated
+/// quality bar.
+pub const DEFAULT_MIN_QUAL_PHRED: f64 = 30.0;
+
 /// Counts the driver tracks as it streams records from the posterior
 /// engine to the VCF writer. Surfaced by [`drive_cohort_pipeline`]
 /// and [`process_one_chromosome`] so the orchestrator can build a
@@ -54,6 +71,11 @@ pub struct CohortDriveStats {
     /// genotypes — but emitting them produces non-variant records,
     /// which the VCF spec doesn't intend for sites VCFs.
     pub records_dropped_hom_ref: u64,
+    /// Posterior records dropped before reaching the writer because
+    /// `qual_phred` was strictly below
+    /// [`CohortPipelineParams::min_qual_phred`]. See the constant's
+    /// doc for the QUAL-semantics caveat.
+    pub records_dropped_low_qual: u64,
 }
 
 /// Bundle of per-stage configs + shared resources consumed by
@@ -83,6 +105,13 @@ pub struct CohortPipelineParams {
     /// Chromosomes table — consumed by DUST when the filter is on
     /// (no use otherwise).
     pub chromosomes: Vec<ParsedChromosome>,
+    /// Minimum site-level `QUAL` (phred) required to emit a record.
+    /// Records with `qual_phred < min_qual_phred` are dropped before
+    /// reaching the writer. `0.0` disables the filter. Default:
+    /// [`DEFAULT_MIN_QUAL_PHRED`] — see the constant's doc for the
+    /// caveat about how our cohort-product QUAL scales with sample
+    /// count.
+    pub min_qual_phred: f64,
 }
 
 /// Drive DUST → grouper → per-group merger → posterior engine →
@@ -124,6 +153,7 @@ where
         posterior_cfg,
         fetcher,
         chromosomes,
+        min_qual_phred,
     } = params;
 
     let tmp_path = tmp_path_for(output);
@@ -163,6 +193,10 @@ where
             let record = item?;
             if !record.is_variant_call() {
                 stats.records_dropped_hom_ref += 1;
+                continue;
+            }
+            if record.qual_phred < min_qual_phred {
+                stats.records_dropped_low_qual += 1;
                 continue;
             }
             if !record.diagnostics.converged {

@@ -89,7 +89,9 @@ use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
 use pop_var_caller::per_sample_pileup::psp::PspReadError;
 use pop_var_caller::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
-use pop_var_caller::pop_var_caller::cohort_driver::{drive_cohort_pipeline, CohortPipelineParams};
+use pop_var_caller::pop_var_caller::cohort_driver::{
+    drive_cohort_pipeline, CohortPipelineParams, DEFAULT_MIN_QUAL_PHRED,
+};
 use pop_var_caller::pop_var_caller::var_calling::{
     run_var_calling, VarCallingArgs, VarCallingCliError,
 };
@@ -267,6 +269,7 @@ impl CohortFixture {
             posterior_cfg: posterior_default_cfg(),
             fetcher: self.fetcher.clone(),
             chromosomes: self.chromosomes.clone(),
+            min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
         };
 
         let metadata = CohortMetadata {
@@ -309,6 +312,7 @@ impl CohortFixture {
                 indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
                 compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
                 max_gq_phred: DEFAULT_MAX_GQ_PHRED,
+                min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
                 emit_gp: false,
             },
         }

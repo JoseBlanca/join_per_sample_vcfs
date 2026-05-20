@@ -60,6 +60,7 @@ use pop_var_caller::per_sample_pileup::psp::header::{
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
 use pop_var_caller::per_sample_pileup::psp::PspReader;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
+use pop_var_caller::pop_var_caller::cohort_driver::DEFAULT_MIN_QUAL_PHRED;
 use pop_var_caller::pop_var_caller::var_calling::{run_var_calling, VarCallingArgs};
 use pop_var_caller::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use pop_var_caller::var_calling::per_group_merger::{
@@ -167,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
             compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
+            min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             emit_gp: false,
         },
     };

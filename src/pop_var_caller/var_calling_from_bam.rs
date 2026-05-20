@@ -222,6 +222,7 @@ pub fn run_var_calling_from_bam(
     //    legible (previously: ~95-line closure capturing six values).
     let no_complexity_filter = args.no_complexity_filter;
     let emit_gp = cohort.emit_gp;
+    let min_qual_phred = cohort.min_qual_phred;
     let reference = args.reference.clone();
     let output = args.output.clone();
     let command_line = current_command_line();
@@ -242,6 +243,7 @@ pub fn run_var_calling_from_bam(
                 command_line,
                 no_complexity_filter,
                 emit_gp,
+                min_qual_phred,
                 dust_cfg,
                 grouper_cfg,
                 per_group_cfg,
@@ -317,6 +319,7 @@ fn run_cohort_pipeline_for_single_sample(
     command_line: String,
     no_complexity_filter: bool,
     emit_gp: bool,
+    min_qual_phred: f64,
     dust_cfg: DustFilterConfig,
     grouper_cfg: GrouperConfig,
     per_group_cfg: PerGroupMergerConfig,
@@ -378,6 +381,7 @@ fn run_cohort_pipeline_for_single_sample(
         posterior_cfg,
         fetcher,
         chromosomes,
+        min_qual_phred,
     };
     let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
         merger,
