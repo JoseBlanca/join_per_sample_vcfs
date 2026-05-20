@@ -201,9 +201,17 @@ Likely list:
 8. **`profile_cohort_e2e --em-convergence-threshold`** — expose
    the existing CLI knob through the example so future bench runs
    don't need to fall back to the real binary.
-9. **Posterior engine `DidNotConverge` long-term fix** —
-   emit-with-flag instead of hard-erroring, per the perf review's
-   out-of-scope note.
+9. **~~Posterior engine `DidNotConverge` long-term fix~~ — closed
+   2026-05-20** (commit `aab9ac0`). Records that hit
+   `max_iterations` without satisfying `convergence_threshold` now
+   emit with `FILTER=EMNoConv` instead of hard-erroring; the run
+   summary surfaces the count via `records_emnoconv=N (...)`.
+   Validated on the multi-chrom fixture: 5 EMNoConv / 1,358,193
+   PASS records (~3.7 ppm) at the default 1e-3 threshold; the
+   previously-failing SL4.0ch00:434557 site now emits with the
+   flag. The bench above ran with `--em-convergence-threshold
+   5e-3` as a workaround; future bench re-runs can drop the
+   workaround.
 10. **Multi-chrom integration-test coverage** — the impl ships
     with a determinism test on the existing single-chrom fixture;
     a multi-contig fixture (FASTA + CRAM + .psp) would let

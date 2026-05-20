@@ -19,7 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **H1 (per-chromosome parallelism)** + **L1
+> - **Last completed task:** Posterior engine **emit-with-flag** for
+>   non-converging records (commit `aab9ac0`). Records that hit
+>   `max_iterations` without satisfying `convergence_threshold` are
+>   now emitted with `FILTER=EMNoConv` instead of hard-erroring the
+>   whole cohort run. Closes the perf review's out-of-scope
+>   `DidNotConverge` long-term fix. Validated on the multi-chrom
+>   tomato workload: previously-failing site `SL4.0ch00:434557`
+>   (`last_delta=0.00105` at iter 50, just over the 1e-3 threshold)
+>   now emits with the flag; 5 EMNoConv records / 1,358,193 PASS
+>   (~3.7 ppm of the cohort). Run summary surfaces the tally:
+>   `var-calling: ... records_emnoconv=5 (FILTER=EMNoConv; EM
+>   iteration cap)`. 850 lib tests + 39 integration tests pass.
+> - **Previous task:** **H1 (per-chromosome parallelism)** + **L1
 >   (per-group `par_iter` removal)** for cohort `var-calling` — impl
 >   report
 >   [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md);
@@ -45,7 +57,7 @@ Skills and agents are instructed to leave it untouched.
 >   `0b1e958` (run_var_calling reshape + determinism integration
 >   test) → the bench validation + this status update.
 >   848 lib + 39 integration tests pass; clippy clean.
-> - **Previous task:** End-to-end perf review of the `.psp` →
+> - **Previous-previous task:** End-to-end perf review of the `.psp` →
 >   cohort-VCF pipeline (Stages 3–6) on real tomato (SL4.0) data —
 >   [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md).
 >   Verdict: **Apply the listed wins.** Profile evidence: `perf record
@@ -64,7 +76,7 @@ Skills and agents are instructed to leave it untouched.
 >   release] debug = "line-tables-only"` → `debug = true`,
 >   SyncRefFetcher pre-warm, CSR decoder, SmallVec for AlleleObservation,
 >   per-group merger `par_iter` removal), 5 Speculative, 6 Notes.
-> - **Previous-previous task:** Cohort CLI follow-up **Wave 5**
+> - **Earlier task:** Cohort CLI follow-up **Wave 5**
 >   (Test infrastructure + missing coverage) fixes-applied
 >   2026-05-19 —
 >   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md).
