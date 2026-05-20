@@ -21,13 +21,6 @@ use super::{
     AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, PileupRecord, RefSeqFetcher,
 };
 
-/// Pre-allocated capacity for `OpenAllele::chain_ids` — sized
-/// for typical WGS coverage so `insert_sorted_unique` calls don't
-/// trip the 0→4→8→16→32 grow ladder. The vec is moved into
-/// `AlleleObservation` by `finalise()`, so downstream consumers
-/// also benefit. dhat 2026-05-10.
-const ALLELE_CHAIN_IDS_INITIAL_CAPACITY: usize = 32;
-
 /// Pre-allocated capacity for `OpenPileupRecord::folded_reads` —
 /// sized for typical WGS coverage so the per-record fold doesn't
 /// pay 4–5 grow reallocations as contributors accumulate.
@@ -48,12 +41,19 @@ const ALLELE_CHAIN_IDS_INITIAL_CAPACITY: usize = 32;
 const RECORD_FOLDED_READS_INITIAL_CAPACITY: usize = 32;
 
 /// One in-flight allele bucket inside an `OpenPileupRecord`.
+///
+/// The bucket's `chain_ids` are *not* tracked here — they are
+/// derived from `OpenPileupRecord::folded_reads` at `finalise()`
+/// time. Storing them on the bucket and the fold state in parallel
+/// invites the two to drift on re-fold (a read leaving a bucket
+/// needs both its scalar contribution and its chain id removed —
+/// historically only the scalars were subtracted, leaving stale
+/// chain ids behind on `num_obs == 0` buckets). Projection at
+/// emit time is impossible to drift by construction.
 #[derive(Debug, Clone)]
 pub(super) struct OpenAllele {
     pub seq: Vec<u8>,
     pub support: AlleleSupportStats,
-    /// Sorted, deduplicated.
-    pub chain_ids: Vec<ChainId>,
 }
 
 impl OpenAllele {
@@ -61,7 +61,6 @@ impl OpenAllele {
         Self {
             seq,
             support: AlleleSupportStats::default(),
-            chain_ids: Vec::with_capacity(ALLELE_CHAIN_IDS_INITIAL_CAPACITY),
         }
     }
 }
@@ -94,11 +93,14 @@ pub(super) struct OpenPileupRecord {
 /// What a single read currently contributes to one bucket of one
 /// open record. Carries enough state to subtract the contribution
 /// cleanly when the read re-folds (e.g. on widening that grows the
-/// haplotype seq under the record).
+/// haplotype seq under the record). `chain_id` is also stored here
+/// so the per-bucket chain id set can be projected at `finalise()`
+/// time straight from the current fold state — see [`OpenAllele`].
 #[derive(Debug, Clone, Copy)]
 struct FoldedReadState {
     allele_index: usize,
     contribution: AlleleSupportStats,
+    chain_id: ChainId,
 }
 
 impl OpenPileupRecord {
@@ -130,15 +132,33 @@ impl OpenPileupRecord {
         self.pos.saturating_add(self.ref_span())
     }
 
-    /// Convert into a finalised `PileupRecord`.
+    /// Convert into a finalised `PileupRecord`. Per-bucket
+    /// `chain_ids` are projected from `folded_reads` here rather
+    /// than carried on each `OpenAllele`: a re-fold subtracts the
+    /// read's scalar contribution from the old bucket and adds it
+    /// to the new one, but the old bucket would retain the read's
+    /// chain id unless the walker explicitly tracked it. Deriving
+    /// the chain id set from `folded_reads` at finalise removes
+    /// that drift surface entirely.
     pub fn finalise(self) -> PileupRecord {
+        let mut per_bucket: Vec<Vec<ChainId>> = (0..self.alleles.len())
+            .map(|_| Vec::new())
+            .collect();
+        for state in self.folded_reads.values() {
+            per_bucket[state.allele_index].push(state.chain_id);
+        }
+        for chain_ids in &mut per_bucket {
+            chain_ids.sort_unstable();
+            chain_ids.dedup();
+        }
         let alleles = self
             .alleles
             .into_iter()
-            .map(|a| AlleleObservation {
+            .zip(per_bucket)
+            .map(|(a, chain_ids)| AlleleObservation {
                 seq: a.seq,
                 support: a.support,
-                chain_ids: a.chain_ids,
+                chain_ids,
             })
             .collect();
         PileupRecord {
@@ -772,12 +792,12 @@ pub(super) fn process_position(
                 }
             };
             add_contribution(&mut alleles[new_index].support, &new_contribution);
-            insert_sorted_unique(&mut alleles[new_index].chain_ids, contrib.chain_id);
             folded_reads.insert(
                 contrib.read_id,
                 FoldedReadState {
                     allele_index: new_index,
                     contribution: new_contribution,
+                    chain_id: contrib.chain_id,
                 },
             );
         }
@@ -913,13 +933,6 @@ fn phred_to_ln_perr(q: u8) -> f64 {
         t
     };
     LN_PERR_TABLE[q as usize]
-}
-
-fn insert_sorted_unique(v: &mut Vec<ChainId>, chain_id: ChainId) {
-    match v.binary_search(&chain_id) {
-        Ok(_) => {} // already present
-        Err(pos) => v.insert(pos, chain_id),
-    }
 }
 
 /// One read's contribution to the current walker position. The

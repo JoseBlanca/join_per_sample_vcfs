@@ -369,18 +369,38 @@ pub struct AlleleSupportStats {
 /// equals the record's REF span (= `alleles[0].seq.len()`);
 /// INS-bearing alleles are longer.
 ///
-/// A `num_obs == 0` entry is valid and means "this allele exists in
-/// the record but no read in this sample observed it" — only the
-/// REF entry can be in this state under the current walker (allele
-/// buckets for non-REF alleles are created lazily on first event,
-/// so they always have `num_obs ≥ 1`).
+/// **Observation count.** A `num_obs == 0` entry means "this allele
+/// exists in the record but no read in this sample currently has it
+/// as its haplotype." Two paths produce this:
+/// 1. The REF entry at a position no read covers as REF.
+/// 2. A non-REF bucket that *was* observed under an earlier
+///    (narrower) footprint and lost its only observer when the
+///    record widened and that read re-folded into a different
+///    bucket. The empty bucket stays in the record because its
+///    seq is still a legal haplotype call across the widened
+///    footprint — downstream consumers should treat it as having
+///    no evidence in this sample.
+///
+/// **Chain ids invariant.** `chain_ids` lists exactly the chains of
+/// reads currently folded into this bucket — derived from the open-
+/// record's fold map at finalise time, not accumulated during
+/// folding. Consequences:
+/// - `chain_ids.len() <= num_obs as usize` in every bucket (each
+///   chain id is backed by at least one observation; paired mates
+///   may share a chain id, so the inequality can be strict).
+/// - `num_obs == 0 ⇒ chain_ids.is_empty()`.
+///
+/// Downstream callers that match constituents by chain-id
+/// intersection (e.g. the per-group merger building chain-anchored
+/// compounds) can rely on the contrapositive: any bucket reachable
+/// via a chain id intersection has `num_obs >= 1`.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct AlleleObservation {
     pub seq: Vec<u8>,
     pub support: AlleleSupportStats,
-    /// Distinct phase-chain ids that contributed to this allele,
-    /// sorted ascending and deduplicated.
+    /// Distinct phase-chain ids of reads currently folded into this
+    /// bucket, sorted ascending and deduplicated.
     pub chain_ids: Vec<ChainId>,
 }
 

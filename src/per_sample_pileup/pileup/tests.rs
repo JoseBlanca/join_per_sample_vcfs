@@ -274,6 +274,105 @@ fn deletion_record_does_not_double_count_ref_reads() {
 }
 
 #[test]
+fn refold_after_widen_clears_chain_id_from_old_bucket() {
+    // Reference ACGTAC (positions 1..6).
+    //
+    // R0 (1M2D1M @ pos 1): Match(A @ 1), Del(CG @ 2..3),
+    //     Match(T @ 4). seq "AT". Opens record at pos 1
+    //     directly at span 3 (footprint [1, 4)).
+    // R1 (5M @ pos 1) with a T→C SNP at pos 4: seq "ACGCA".
+    //     At walker_pos 1, R1 folds into the record at pos 1
+    //     with events overlapping [1, 4): three Matches at
+    //     pos 1..3, all REF — R1 lands in the REF bucket "ACG".
+    // R3 (1M1D1M @ pos 3): Match(G @ 3), Del(T @ 4),
+    //     Match(A @ 5). seq "GA". At walker_pos 3, R3's
+    //     deletion has footprint [3, 5), which overlaps the
+    //     existing record at pos 1 (footprint [1, 4)) and
+    //     extends past it — widens the record to span 4
+    //     (footprint [1, 5)).
+    //
+    // At walker_pos 3, R1 is a contributor (Match @ 3) and
+    // re-folds under the now-wider REF "ACGT": its event
+    // window now includes Match(4) = C (SNP), so the new
+    // allele seq is "ACGC" — a *different* bucket from REF
+    // "ACGT" (the REF bucket's seq was extended in-place by
+    // `widen()` from "ACG" to "ACGT").
+    //
+    // Walker invariant under test: after R1 re-folds out of
+    // the REF bucket into "ACGC", the REF bucket must not
+    // retain R1's chain id. With the open-record bug,
+    // `subtract_contribution` zeroes the scalars but never
+    // removes the read's chain id from the old
+    // `OpenAllele.chain_ids` vector — so REF ends up with
+    // num_obs = 0 and chain_ids = [1] (R1's stale id).
+    // Downstream, the merger sees a chain-anchored
+    // constituent with no observations and (rightly) refuses
+    // to compute a quality from it.
+    let fa = MockFasta::new("ACGTAC");
+    let r0 = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 4,
+        cigar: vec![CigarOp::Match(1), CigarOp::Deletion(2), CigarOp::Match(1)],
+        seq: b"AT".to_vec(),
+        bq_baq: vec![30; 2],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r0"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    let r1 = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 1,
+        alignment_end: 5,
+        cigar: vec![CigarOp::Match(5)],
+        seq: b"ACGCA".to_vec(),
+        bq_baq: vec![30; 5],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r1"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    let r3 = PreparedRead {
+        chrom_id: 0,
+        alignment_start: 3,
+        alignment_end: 5,
+        cigar: vec![CigarOp::Match(1), CigarOp::Deletion(1), CigarOp::Match(1)],
+        seq: b"GA".to_vec(),
+        bq_baq: vec![30; 2],
+        mq_log_err: -3.0,
+        is_reverse_strand: false,
+        qname: Arc::from("r3"),
+        mate_role: MateRole::Solo,
+        adaptor_boundary: None,
+    };
+    let records = drive_walker(vec![r0, r1, r3], fa);
+    let anchor = records
+        .iter()
+        .find(|r| r.pos == 1)
+        .expect("anchor record at pos 1");
+
+    // Universal invariant: in every emitted record, every
+    // allele bucket's `chain_ids.len()` must be `<= num_obs`.
+    // Each chain id represents at least one observation that
+    // landed in this bucket; a chain id with no backing
+    // observation is a leftover from a re-fold that the
+    // walker forgot to clean up.
+    for allele in &anchor.alleles {
+        assert!(
+            allele.chain_ids.len() <= allele.support.num_obs as usize,
+            "allele {:?} has chain_ids={:?} but num_obs={} — \
+             stale chain ids exceed observations",
+            std::str::from_utf8(&allele.seq).unwrap_or("<non-utf8>"),
+            allele.chain_ids,
+            allele.support.num_obs,
+        );
+    }
+}
+
+#[test]
 fn insertion_record_has_alt_longer_than_ref() {
     // Reference AAAACGT. Read 1M2I5M = 1 M at pos 1 ("A"), 2-base
     // insertion ("XX"), 5 M from pos 2.

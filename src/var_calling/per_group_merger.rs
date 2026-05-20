@@ -364,10 +364,17 @@ pub enum PerGroupMergerError {
     },
 
     /// A non-REF allele bucket reported `num_obs = 0` while building
-    /// per-sample scalars for a chain-anchored compound. The walker
-    /// invariant guarantees non-REF buckets always carry at least one
-    /// observation; a zero would silently distort the homogeneous-
-    /// quality approximation (quality phase) or the subtraction step.
+    /// per-sample scalars for a chain-anchored compound. Any bucket
+    /// reached here was selected via chain-id intersection, and the
+    /// walker's `chain_ids` invariant
+    /// (`src/per_sample_pileup/pileup/mod.rs` near `AlleleObservation`)
+    /// guarantees `chain_ids` lists only reads currently folded into
+    /// the bucket — so a non-empty `chain_ids` implies `num_obs >= 1`.
+    /// Hitting this error means that invariant has been violated
+    /// upstream (e.g. a buggy walker change, or a hand-crafted
+    /// `PileupRecord` in tests / fuzz input); silently continuing
+    /// would distort the homogeneous-quality approximation or panic
+    /// the subtraction step on `inter / 0`.
     #[error(
         "zero-observation constituent for chain-anchored compound at chrom \
          {chrom_id} {start}-{end} (phase: {phase:?}): sample_idx={sample_idx} \
