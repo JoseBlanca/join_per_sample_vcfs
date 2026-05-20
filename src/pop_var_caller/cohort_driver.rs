@@ -46,6 +46,14 @@ pub struct CohortDriveStats {
     /// emitted with `EmDiagnostics::converged = false` and routed by
     /// the writer to `FILTER=EMNoConv`.
     pub records_unconverged: u64,
+    /// Posterior records dropped before reaching the writer because
+    /// every sample's argmax genotype was hom-ref (so the cohort-level
+    /// `AC` would have been 0 across all ALTs). The EM allele
+    /// frequency `p̂` can still be non-zero at such sites — it's a
+    /// likelihood-weighted estimate from read counts, not from argmax
+    /// genotypes — but emitting them produces non-variant records,
+    /// which the VCF spec doesn't intend for sites VCFs.
+    pub records_dropped_hom_ref: u64,
 }
 
 /// Bundle of per-stage configs + shared resources consumed by
@@ -153,6 +161,10 @@ where
     let drive_result: Result<(), E> = (|| {
         for item in posterior {
             let record = item?;
+            if !record.is_variant_call() {
+                stats.records_dropped_hom_ref += 1;
+                continue;
+            }
             if !record.diagnostics.converged {
                 stats.records_unconverged += 1;
             }

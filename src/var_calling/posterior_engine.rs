@@ -746,6 +746,25 @@ impl PosteriorRecord {
         let start = sample_idx * n_alleles;
         &self.chain_anchor_flags[start..start + n_alleles]
     }
+
+    /// True iff at least one sample's argmax genotype carries a
+    /// non-reference allele.
+    ///
+    /// The canonical [`genotype_order`](crate::var_calling::per_group_merger::genotype_order)
+    /// table places the all-REF genotype at index 0 for every
+    /// `(ploidy, n_alleles)` (e.g. `0/0` for diploid biallelic,
+    /// `AAAA` for tetraploid biallelic), so the check is just
+    /// `best_genotype.iter().any(|&i| i != 0)`.
+    ///
+    /// Used by the cohort driver to drop records that the per-sample
+    /// genotype caller resolved to hom-ref everywhere — the EM
+    /// allele-frequency estimate `p̂` can still be non-zero at such
+    /// sites (it's a likelihood-weighted estimate from raw read
+    /// counts, not from argmax genotypes), and emitting them would
+    /// produce VCF rows with `AC=0` across all samples.
+    pub fn is_variant_call(&self) -> bool {
+        self.best_genotype.iter().any(|&i| i != 0)
+    }
 }
 
 /// EM bookkeeping for a single record. A `PosteriorRecord` is emitted
@@ -2824,6 +2843,44 @@ mod tests {
         assert_eq!(pr.best_genotype, vec![2]);
         assert!(pr.posteriors_row(0)[2] > 0.999);
         assert!(pr.qual_phred > 20.0, "qual_phred = {}", pr.qual_phred);
+    }
+
+    #[test]
+    fn is_variant_call_false_when_every_sample_is_hom_ref() {
+        // Two samples, both with strong-RR evidence — driver should
+        // skip this record before it reaches the VCF writer.
+        let record = merged_record_simple(
+            1,
+            100,
+            vec![b"A", b"C"],
+            2,
+            vec![
+                vec![0.0, -50.0, -50.0],
+                vec![0.0, -50.0, -50.0],
+            ],
+        );
+        let pr = single_ok(record);
+        assert_eq!(pr.best_genotype, vec![0, 0]);
+        assert!(!pr.is_variant_call());
+    }
+
+    #[test]
+    fn is_variant_call_true_when_any_sample_is_non_ref() {
+        // One sample RR, one sample AA — exactly the case that today
+        // emits AC>0 but historically motivated the filter on the
+        // other side: a single non-ref carrier is enough.
+        let record = merged_record_simple(
+            1,
+            100,
+            vec![b"A", b"C"],
+            2,
+            vec![
+                vec![0.0, -50.0, -50.0],
+                vec![-50.0, -50.0, 0.0],
+            ],
+        );
+        let pr = single_ok(record);
+        assert!(pr.is_variant_call());
     }
 
     #[test]
