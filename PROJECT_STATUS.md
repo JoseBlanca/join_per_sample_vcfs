@@ -19,7 +19,33 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** End-to-end perf review of the `.psp` →
+> - **Last completed task:** **H1 (per-chromosome parallelism)** + **L1
+>   (per-group `par_iter` removal)** for cohort `var-calling` — impl
+>   report
+>   [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md);
+>   plan
+>   [cohort_per_chromosome_parallel.md](doc/devel/implementation_plans/cohort_per_chromosome_parallel.md).
+>   `run_var_calling` now drives one DUST → … → VCF-writer chain per
+>   chromosome in parallel via `rayon::par_iter`, then concats the
+>   per-chrom fragments in contig-table order via a new pure-Rust
+>   bgzf-aware concat module (`src/var_calling/vcf_writer/concat.rs`).
+>   Realised speedup on the real multi-chrom tomato fixture
+>   (`SRR7279727.multichrom.psp` — 2 Mbp from each of 13 chroms,
+>   N=10 cohort, back-to-back T sweep):
+>   T=1 → 106.6 s; T=2 → 65.3 s (1.63×); T=4 → 44.4 s (2.40×);
+>   T=8 → 33.0 s (**3.23×**); T=13 → 27.7 s (**3.85× ceiling**);
+>   T=16 → 27.6 s (soft cap honored). Below the plan's 4× T=8
+>   acceptance threshold (the realistic limit is ch00 read-imbalance:
+>   ch00 carries 1.4 M reads vs ~85–125 K on every other chrom — the
+>   unplaced/decoy contig absorbs unmappable reads) but well above
+>   the 2× rethink threshold. L5 `SyncRefFetcher` RwLock contention
+>   is now the next ceiling. Five-commit PR:
+>   `309a5be` (L1) → `63abd6d` (concat.rs + 5 unit tests) →
+>   `8a829c6` (process_one_chromosome helper) →
+>   `0b1e958` (run_var_calling reshape + determinism integration
+>   test) → the bench validation + this status update.
+>   848 lib + 39 integration tests pass; clippy clean.
+> - **Previous task:** End-to-end perf review of the `.psp` →
 >   cohort-VCF pipeline (Stages 3–6) on real tomato (SL4.0) data —
 >   [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md).
 >   Verdict: **Apply the listed wins.** Profile evidence: `perf record
@@ -38,16 +64,7 @@ Skills and agents are instructed to leave it untouched.
 >   release] debug = "line-tables-only"` → `debug = true`,
 >   SyncRefFetcher pre-warm, CSR decoder, SmallVec for AlleleObservation,
 >   per-group merger `par_iter` removal), 5 Speculative, 6 Notes.
->   The review's diagnosis corrects the earlier baseline-sweep
->   prediction ("rayon-over-records is the lever"): on real data
->   per-group merger + posterior are <2 %, so rayon-over-records would
->   parallelise <2 % of the work — the right lever is per-chromosome.
->   Preparatory work that landed alongside the review: new
->   `examples/profile_cohort_e2e.rs` (commit `ee34420`); per-group
->   merger zero-obs-constituent correctness fix (commit `2d92dd2`);
->   posterior engine convergence threshold relaxed 1e-4 → 1e-3
->   (commit `d4252da`).
-> - **Previous task:** Cohort CLI follow-up **Wave 5**
+> - **Previous-previous task:** Cohort CLI follow-up **Wave 5**
 >   (Test infrastructure + missing coverage) fixes-applied
 >   2026-05-19 —
 >   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md).
@@ -198,10 +215,18 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
 - **Open (from 2026-05-20 perf review):**
-  - **H1** — per-chromosome parallelism (headline order-of-magnitude
-    lever): partition the DUST→…→writer chain at the chromosome
-    boundary, drive via `rayon::par_iter` over the 13 contigs, walk
-    per-chrom buffers in contig-table order at the writer.
+  - **H1 — closed 2026-05-20** (per-chromosome parallelism shipped).
+    Five-commit PR `309a5be` → `0b1e958`; impl report
+    [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md).
+    Realised **3.85× wall-time speedup at T=13** on the multi-chrom
+    real-data fixture (106.6 s → 27.7 s). Workload imbalance
+    (ch00 carries 1.4 M of 2.6 M total reads as the unplaced/decoy
+    contig) gates the ceiling below the plan's predicted 6–10×
+    range; L5 contention absorbs another ~23 %.
+  - **L1 — closed 2026-05-20** (per-group merger inner `par_iter`
+    removed, commit `309a5be`). Mandatory prep for H1 — nested
+    rayon under per-chrom outer is wasteful and would have
+    polluted the H1 measurement.
   - **H2 / H3** — DUST `find_perfect` inner-loop: replace
     `Vec::insert(j, …)` (O(n) memmove) and `VecDeque` indexing
     (per-element wrap + bounds check). Gated by **H7**.
@@ -217,13 +242,25 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
     paired with the same fix in `DustFilter`.
   - **H7** — add an isolated `var_calling_dust_filter` criterion bench
     (gates H2 / H3 / L1 / L2 / L12 measurements).
-  - **L1–L12** — see the full report; highlights: L1 drop per-group
-    `par_iter` (one-line, mandatory once H1 lands), L2 `AlleleObservation`
-    `Vec` → `SmallVec`, L3 PSP CSR decoder, L4 `fetch_from_repository`
-    `make_ascii_uppercase`, L5 `SyncRefFetcher` pre-warm (becomes hot
-    only under H1), L8 `[profile.release] debug = "line-tables-only"`
+  - **L2–L12** — see the full report; highlights: **L5 is now the
+    next ceiling under H1** (`SyncRefFetcher` `RwLock<HashMap>::read()`
+    on every fetch — pre-warm into `Vec<Arc<Vec<u8>>>` indexed by
+    `chrom_id`, drop the noodles `Repository` runtime dep);
+    L2 `AlleleObservation` `Vec` → `SmallVec`,
+    L3 PSP CSR decoder, L4 `fetch_from_repository`
+    `make_ascii_uppercase`, L8 `[profile.release] debug = "line-tables-only"`
     → `debug = true`, L9 `alloc-mimalloc` A/B against real-data
     workload, L10 missing drained-count assertions in benches.
+  - **Per-chrom parallel follow-ups** (from the impl report): streaming
+    concat (v2 — append finished fragments while slower chroms run);
+    block-level bgzf concat (v2 — skip decompress+re-encode);
+    sub-chromosome decomposition (push below
+    `max(per-chrom-time)` on imbalanced workloads like tomato's ch00);
+    `RLIMIT_NOFILE` bump (defaults to 1024; N=256 × n_chrom > 1024 fds);
+    `var-calling-from-bam` + `estimate-contamination` parallelisation;
+    `profile_cohort_e2e --em-convergence-threshold` knob; posterior
+    `DidNotConverge` emit-with-flag long-term fix; multi-chrom
+    integration-test fixture in `tests/common/mod.rs`.
 - **Open (from cohort-slice review):**
   *None — the 16 originally-Deferred findings are all Applied.*
   - **Closed in Wave 5 (2026-05-19):** **Mi20**, **Mi23**,
@@ -546,7 +583,19 @@ list is clear.
     (T=1=12.7s ≈ T=16=13.6s); DUST 33 %, allocations 21 %, PSP
     decode 15 %; per-group merger + posterior together <2 %. Seven
     Hot-path + 12 Likely findings; **H1 per-chromosome parallelism**
-    is the order-of-magnitude lever. Tracks all the Open items the
-    cohort CLI block now carries.
+    is the order-of-magnitude lever.
+  - **`.psp` → cohort VCF arm — H1 per-chromosome parallelism shipped
+    2026-05-20:**
+    [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md).
+    Realised **3.85× wall-time reduction at T=13** on the multi-chrom
+    real-data fixture
+    (`tmp/SRR7279727.multichrom.psp` — 2 Mbp from each of 13 SL4.0
+    chroms via `samtools view --regions`, N=10 cohort: 106.6 s →
+    27.7 s). Workload imbalance (ch00 unplaced/decoy reads at
+    13× the median per-chrom count) gates the ceiling below the
+    plan's predicted 6–10×; L5 contention is the next ceiling
+    (acknowledged for follow-up). Includes L1 (per-group inner
+    `par_iter` removed) and a new pure-Rust bgzf-aware concat
+    module (`src/var_calling/vcf_writer/concat.rs`).
   - **CRAM → `.psp` arm:** still pending.
 
