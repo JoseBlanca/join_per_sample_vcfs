@@ -298,18 +298,6 @@ pub enum DegeneracyKind {
     PositiveInfinity,
 }
 
-/// Identifies which compound-likelihood loop surfaced a
-/// [`PerGroupMergerError::ZeroObservationConstituent`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompoundPhase {
-    /// The quality-gathering loop in `project_scalars` that builds
-    /// `min_mean_q` for a chain-anchored compound.
-    QualityGather,
-    /// The constituent-subtraction loop in `project_scalars` that
-    /// removes the compound's claim from each constituent's scalars.
-    ConstituentSubtraction,
-}
-
 /// Errors surfaced by the per-group merger.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -359,28 +347,6 @@ pub enum PerGroupMergerError {
         chrom_id: u32,
         start: u32,
         end: u32,
-        record_idx: usize,
-        local_allele_idx: usize,
-    },
-
-    /// A non-REF allele bucket reported `num_obs = 0` while building
-    /// per-sample scalars for a chain-anchored compound. The walker
-    /// invariant guarantees non-REF buckets always carry at least one
-    /// observation; a zero would silently distort the homogeneous-
-    /// quality approximation (quality phase) or the subtraction step.
-    #[error(
-        "zero-observation constituent for chain-anchored compound at chrom \
-         {chrom_id} {start}-{end} (phase: {phase:?}): sample_idx={sample_idx} \
-         allele_idx={allele_idx} record_idx={record_idx} \
-         local_allele_idx={local_allele_idx}"
-    )]
-    ZeroObservationConstituent {
-        chrom_id: u32,
-        start: u32,
-        end: u32,
-        phase: CompoundPhase,
-        sample_idx: usize,
-        allele_idx: usize,
         record_idx: usize,
         local_allele_idx: usize,
     },
@@ -1397,17 +1363,16 @@ fn project_compound_scalars(
                     continue;
                 };
                 let stats = rec.alleles[local_allele_idx].support;
+                // A constituent with `num_obs == 0` carries chain-
+                // anchoring evidence (already counted in `inter`) but
+                // no direct observations — contributes nothing to the
+                // homogeneous-quality approximation. Skip it.
+                // Real-data shape that surfaced this: tomato (SL4.0)
+                // SRR7279725_small.psp SL4.0ch01:1628667, where an
+                // intermediate `AAA` deletion bucket has chain_ids set
+                // but `num_obs = 0`.
                 if stats.num_obs == 0 {
-                    return Err(PerGroupMergerError::ZeroObservationConstituent {
-                        chrom_id: group.chrom_id,
-                        start: group.start,
-                        end: group.end,
-                        phase: CompoundPhase::QualityGather,
-                        sample_idx,
-                        allele_idx,
-                        record_idx,
-                        local_allele_idx,
-                    });
+                    continue;
                 }
                 let mean_q = stats.q_sum / (stats.num_obs as f64);
                 min_mean_q = Some(match min_mean_q {
@@ -1463,7 +1428,7 @@ fn subtract_compound_from_constituents(
     unified: &UnifiedAlleleSet,
 ) -> Result<(), PerGroupMergerError> {
     let source_index = build_source_index(unified);
-    for (allele_idx, allele) in unified.alleles.iter().enumerate() {
+    for allele in &unified.alleles {
         if !allele.is_compound {
             continue;
         }
@@ -1482,17 +1447,11 @@ fn subtract_compound_from_constituents(
                     continue;
                 };
                 let support = rec.alleles[local_allele_idx].support;
+                // Same skip rule as the quality-gather path above: a
+                // zero-observation constituent has nothing for the
+                // compound to subtract (and `inter / 0` would panic).
                 if support.num_obs == 0 {
-                    return Err(PerGroupMergerError::ZeroObservationConstituent {
-                        chrom_id: group.chrom_id,
-                        start: group.start,
-                        end: group.end,
-                        phase: CompoundPhase::ConstituentSubtraction,
-                        sample_idx,
-                        allele_idx,
-                        record_idx,
-                        local_allele_idx,
-                    });
+                    continue;
                 }
                 let dest_idx = sample_idx * n_kept + constituent_idx;
                 let scale = (inter as f64) / (support.num_obs as f64);
@@ -1874,7 +1833,11 @@ fn chain_broken_log_likelihood(
 /// `0 · log 0 = 0`. Matches the convention used in
 /// `genotype_posteriors.rs` and the architecture spec.
 fn xlogy(n: f64, p: f64) -> f64 {
-    if n == 0.0 { 0.0 } else { n * p.ln() }
+    if n == 0.0 {
+        0.0
+    } else {
+        n * p.ln()
+    }
 }
 
 /// Size of the precomputed `ln(n!)` table. WGS per-allele observation
@@ -2223,12 +2186,10 @@ mod tests {
             .unwrap();
         // Merged set: REF=AAG, T at p=100 (TAG), C at p=102 (AAC),
         // compound (TAC). 4 alleles.
-        assert!(
-            record
-                .alleles
-                .iter()
-                .any(|a| a.seq == b"TAC" && a.is_compound)
-        );
+        assert!(record
+            .alleles
+            .iter()
+            .any(|a| a.seq == b"TAC" && a.is_compound));
         assert_eq!(record.alleles.iter().filter(|a| a.is_compound).count(), 1);
         // Sample is chain-evident at the compound ⇒ ca_flag false.
         let compound_idx = record.alleles.iter().position(|a| a.is_compound).unwrap();
@@ -2916,12 +2877,19 @@ mod tests {
     }
 
     #[test]
-    fn process_group_errors_on_zero_obs_constituent_in_quality_gather() {
+    fn process_group_skips_zero_obs_constituents_in_chain_anchored_compound() {
         // Two chain-anchored SNPs in one sample — should admit a
-        // compound. The p=102 constituent has num_obs = 0 (walker
-        // invariant violation). project_scalars must surface the
-        // contradiction rather than fabricating an infinite-quality
-        // compound.
+        // compound. The p=102 constituent's non-REF bucket carries the
+        // chain id but `num_obs = 0` — a shape the walker emits in
+        // real data for chain-anchored intermediates (first surfaced
+        // by tomato SRR7279725_small.psp at SL4.0ch01:1628667, where
+        // the `AAA` deletion bucket has chain_ids but no direct
+        // observations).
+        //
+        // Contract: project_scalars must silently skip the zero-obs
+        // constituent (no quality, no subtraction) rather than error.
+        // At least one other constituent (here p=100 with num_obs = 6)
+        // supplies the compound's quality basis.
         let rec_s0_p100 = record(
             0,
             100,
@@ -2935,7 +2903,7 @@ mod tests {
             102,
             vec![
                 allele(b"G", stats(2, -0.5), &[]),
-                allele(b"C", stats(0, 0.0), &[42]), // zero obs — bogus
+                allele(b"C", stats(0, 0.0), &[42]), // zero obs — skipped
             ],
         );
         let pp0 = pp_one(0, 100, 1, vec![(0, rec_s0_p100)]);
@@ -2952,11 +2920,8 @@ mod tests {
             PerGroupMergerConfig::default(),
         );
         match merger.next() {
-            Some(Err(PerGroupMergerError::ZeroObservationConstituent {
-                phase: CompoundPhase::QualityGather,
-                ..
-            })) => {}
-            other => panic!("expected ZeroObservationConstituent(QualityGather), got {other:?}"),
+            Some(Ok(_)) => {} // success: zero-obs constituent silently skipped
+            other => panic!("expected Ok(MergedRecord), got {other:?}"),
         }
     }
 
