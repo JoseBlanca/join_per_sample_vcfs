@@ -104,11 +104,23 @@ pub(super) fn encode(
 
     let qual = clamp_qual(record.qual_phred);
 
-    // v1 policy: every record carries PASS. The
-    // `default_filter_pass` knob was dropped from `WriterConfig`; a
-    // future filter slice will re-introduce filter expressions
-    // through a typed-rule surface, not a binary flag.
-    let filters = Filters::pass();
+    // FILTER policy:
+    //   * `PASS`     — EM converged within `max_iterations`.
+    //   * `EMNoConv` — EM hit the iteration cap; the record is still
+    //                  emitted with allele frequencies + posteriors
+    //                  from a final E-step under the un-converged
+    //                  p̂/f̂. Downstream consumers can prune via
+    //                  `bcftools view -f PASS`.
+    // A future filter slice will re-introduce filter *expressions*
+    // through a typed-rule surface; the per-record bit here is the
+    // engine's diagnostics signal, not the rule surface.
+    let filters = if record.diagnostics.converged {
+        Filters::pass()
+    } else {
+        [String::from(super::header::EM_NO_CONV_FILTER_ID)]
+            .into_iter()
+            .collect()
+    };
 
     let n_alleles = record.alleles.len();
 
@@ -533,6 +545,7 @@ mod tests {
             diagnostics: EmDiagnostics {
                 iterations: 5,
                 final_max_delta_p: 1e-6,
+                converged: true,
             },
         }
     }
@@ -608,6 +621,59 @@ mod tests {
         assert_eq!(fields[8], "GT:GQ:DP:AD");
         assert_eq!(fields[9], "0/0:60:20:20,0", "S0 cell: {}", fields[9]);
         assert_eq!(fields[10], "0/1:40:20:10,10", "S1 cell: {}", fields[10]);
+    }
+
+    #[test]
+    fn unconverged_record_renders_with_emnoconv_filter() {
+        let mut record = biallelic_two_samples();
+        record.diagnostics.converged = false;
+        let contigs = fixture_contigs();
+        let config = cfg_default();
+        let keys = build_format_keys(&config);
+        let header = fixture_header(&config);
+        let table = table_for(&record);
+
+        let buf = encode(&record, &contigs, &config, &keys, 2, &table).unwrap();
+        let line = record_to_line(&buf, &header);
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+
+        // Same record shape as the happy-path test — only FILTER changes.
+        assert_eq!(
+            fields[6], "EMNoConv",
+            "non-converging records must carry the EMNoConv FILTER, got {} (full line: {line})",
+            fields[6],
+        );
+
+        // And the header must declare the filter so a strict
+        // consumer accepts the file. `write_header` is an inherent
+        // method on `noodles_vcf::io::Writer` — no trait import.
+        let header_text = {
+            let mut writer = noodles_vcf::io::Writer::new(Vec::new());
+            writer.write_header(&header).unwrap();
+            String::from_utf8(writer.into_inner()).unwrap()
+        };
+        assert!(
+            header_text.contains("##FILTER=<ID=EMNoConv"),
+            "header missing ##FILTER=<ID=EMNoConv> declaration: {header_text}",
+        );
+    }
+
+    #[test]
+    fn converged_record_renders_with_pass_filter() {
+        // Lower-stakes regression check — the converged path must
+        // still emit PASS after the FILTER-policy change.
+        let mut record = biallelic_two_samples();
+        record.diagnostics.converged = true;
+        let contigs = fixture_contigs();
+        let config = cfg_default();
+        let keys = build_format_keys(&config);
+        let header = fixture_header(&config);
+        let table = table_for(&record);
+
+        let buf = encode(&record, &contigs, &config, &keys, 2, &table).unwrap();
+        let line = record_to_line(&buf, &header);
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[6], "PASS");
     }
 
     #[test]

@@ -32,6 +32,22 @@ use crate::var_calling::vcf_writer::{
     CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig, tmp_path_for,
 };
 
+/// Counts the driver tracks as it streams records from the posterior
+/// engine to the VCF writer. Surfaced by [`drive_cohort_pipeline`]
+/// and [`process_one_chromosome`] so the orchestrator can build a
+/// run summary without reading the emitted VCF back.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CohortDriveStats {
+    /// Total records written to the writer (or the per-chrom fragment).
+    pub records_written: u64,
+    /// Subset of `records_written` whose posterior EM hit the
+    /// iteration cap without satisfying the convergence threshold —
+    /// emitted with `EmDiagnostics::converged = false` and routed by
+    /// the writer to `FILTER=EMNoConv`.
+    pub records_unconverged: u64,
+}
+
 /// Bundle of per-stage configs + shared resources consumed by
 /// [`drive_cohort_pipeline`]. Constructed by the caller; consumed
 /// (by-value) when the driver runs.
@@ -65,9 +81,10 @@ pub struct CohortPipelineParams {
 /// VCF writer over `merger`, finalising the writer on success and
 /// best-effort removing the `<output>.tmp` on driver-loop failure.
 ///
-/// Returns the number of records written on success. Caller is
-/// responsible for any post-driver bookkeeping (e.g. surfacing a
-/// stashed walker error from the from-bam shim's
+/// Returns [`CohortDriveStats`] on success — total emitted records
+/// + the subset whose EM didn't converge. The caller is responsible
+/// for post-driver bookkeeping (e.g. surfacing a stashed walker
+/// error from the from-bam shim's
 /// [`ErrorSheddingAdapter`](crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter)).
 ///
 /// Generic over the error type `E` so each subcommand can keep its
@@ -82,7 +99,7 @@ pub fn drive_cohort_pipeline<M, E>(
     output: &Path,
     metadata: CohortMetadata,
     writer_cfg: WriterConfig,
-) -> Result<u64, E>
+) -> Result<CohortDriveStats, E>
 where
     M: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
     E: From<DustFilterError>
@@ -132,12 +149,15 @@ where
     // tmp on disk. Matches the per-subcommand M6 cleanup
     // discipline.
     let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
-    let mut records_written: u64 = 0;
+    let mut stats = CohortDriveStats::default();
     let drive_result: Result<(), E> = (|| {
         for item in posterior {
             let record = item?;
+            if !record.diagnostics.converged {
+                stats.records_unconverged += 1;
+            }
             writer.write_record(&record)?;
-            records_written += 1;
+            stats.records_written += 1;
         }
         writer.finish()?;
         Ok(())
@@ -146,7 +166,7 @@ where
         let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
         return Err(e);
     }
-    Ok(records_written)
+    Ok(stats)
 }
 
 /// Run the cohort var-calling chain (DUST → … → VCF writer) over a
@@ -165,7 +185,7 @@ where
 /// which [`crate::var_calling::vcf_writer::concat::concat_fragments`]
 /// handles by stripping the header on non-first fragments.
 ///
-/// Returns `(chrom_id, records_written)` on success. Errors are
+/// Returns `(chrom_id, CohortDriveStats)` on success. Errors are
 /// surfaced through the same typed enum the sequential
 /// [`drive_cohort_pipeline`] uses; the per-chrom orchestrator
 /// collects worker results and returns the first error after every
@@ -181,7 +201,7 @@ pub fn process_one_chromosome<E>(
     metadata: CohortMetadata,
     writer_cfg_template: WriterConfig,
     pipeline_params: CohortPipelineParams,
-) -> Result<(u32, u64), E>
+) -> Result<(u32, CohortDriveStats), E>
 where
     E: From<std::io::Error>
         + From<PspReadError>
@@ -224,12 +244,12 @@ where
         ..writer_cfg_template
     };
 
-    let records_written = drive_cohort_pipeline::<_, E>(
+    let stats = drive_cohort_pipeline::<_, E>(
         merger,
         pipeline_params,
         &fragment_path,
         metadata,
         writer_cfg,
     )?;
-    Ok((chrom_id, records_written))
+    Ok((chrom_id, stats))
 }

@@ -81,6 +81,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
         diagnostics: EmDiagnostics {
             iterations: 5,
             final_max_delta_p: 1e-6,
+            converged: true,
         },
     };
 
@@ -119,6 +120,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
         diagnostics: EmDiagnostics {
             iterations: 4,
             final_max_delta_p: 1e-6,
+            converged: true,
         },
     };
 
@@ -147,6 +149,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
         diagnostics: EmDiagnostics {
             iterations: 3,
             final_max_delta_p: 1e-6,
+            converged: true,
         },
     };
 

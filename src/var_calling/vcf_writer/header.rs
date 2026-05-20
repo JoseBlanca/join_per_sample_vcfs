@@ -26,6 +26,14 @@ use super::WriterConfig;
 use super::errors::VcfWriteError;
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 
+/// Canonical FILTER ID emitted on records whose posterior EM hit the
+/// iteration cap. Shared between the header-declaration site (this
+/// module) and the per-record FILTER-value site
+/// ([`record_encode`](super::record_encode)) so a future rename
+/// stays in one place. Following the GATK / bcftools convention of
+/// short no-underscore identifiers.
+pub(super) const EM_NO_CONV_FILTER_ID: &str = "EMNoConv";
+
 /// Inputs the writer needs at construction time. Built by the CLI
 /// from `merger.sample_names()`, `merger.chromosomes()`, and the
 /// invocation context.
@@ -84,9 +92,20 @@ pub(super) fn build_vcf_header(
         builder = builder.add_contig(entry.name.clone(), contig);
     }
 
-    // PASS filter — every record carries PASS by default; declaring
-    // it in the header makes bcftools / strict consumers happy.
+    // PASS filter — declared so bcftools / strict consumers see the
+    // canonical entry; emitted on records whose EM converged.
     builder = builder.add_filter("PASS", Map::<Filter>::pass());
+    // EMNoConv — emitted on records whose posterior EM hit the
+    // iteration cap without satisfying `convergence_threshold`. The
+    // record is still well-formed (allele frequencies + posteriors
+    // come from a final E-step under the un-converged p̂/f̂); the
+    // flag exists so downstream consumers can prune via
+    // `bcftools view -f PASS` without losing the cohort run on a
+    // single problematic site.
+    builder = builder.add_filter(
+        EM_NO_CONV_FILTER_ID,
+        Map::<Filter>::new("EM posterior did not converge within max iterations"),
+    );
 
     // INFO entries.
     builder = builder

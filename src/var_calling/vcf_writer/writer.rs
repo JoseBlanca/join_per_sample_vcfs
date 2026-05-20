@@ -325,6 +325,7 @@ mod tests {
             diagnostics: EmDiagnostics {
                 iterations: 5,
                 final_max_delta_p: 1e-6,
+                converged: true,
             },
         }
     }

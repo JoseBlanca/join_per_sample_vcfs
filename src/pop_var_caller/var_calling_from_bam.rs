@@ -379,7 +379,7 @@ fn run_cohort_pipeline_for_single_sample(
         fetcher,
         chromosomes,
     };
-    let records_written = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
+    let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
         merger,
         pipeline_params,
         output,
@@ -398,9 +398,17 @@ fn run_cohort_pipeline_for_single_sample(
         return Err(VarCallingFromBamCliError::Walker(e));
     }
 
+    let emnoconv_note = if stats.records_unconverged > 0 {
+        format!(
+            " records_emnoconv={} (FILTER=EMNoConv; EM iteration cap)",
+            stats.records_unconverged,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling-from-bam: sample={} records_emitted={}",
-        sample_name_owned, records_written,
+        "var-calling-from-bam: sample={} records_emitted={}{}",
+        sample_name_owned, stats.records_written, emnoconv_note,
     );
     Ok(())
 }

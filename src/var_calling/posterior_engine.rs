@@ -21,9 +21,15 @@
 //! 3. M-step on `p̂` from posterior-weighted allele counts plus
 //!    Dirichlet pseudocounts, and on `f̂_C` from posterior-weighted
 //!    compound counts plus a Beta(α_compound, 1 − α_compound) prior.
-//! 4. Convergence check on `max |Δp̂|`; hard cap at
-//!    `config.max_iterations` returns
-//!    [`PosteriorEngineError::DidNotConverge`].
+//! 4. Convergence check on `max |Δp̂|`. Records that satisfy the
+//!    threshold emit with `EmDiagnostics::converged = true`; records
+//!    that hit `config.max_iterations` without satisfying it emit
+//!    with `EmDiagnostics::converged = false` and are routed by the
+//!    VCF writer to `FILTER=EMNoConv`. The
+//!    [`PosteriorEngineError::DidNotConverge`] variant is reserved
+//!    for future engine variants but is no longer raised by the
+//!    exact-math EM loop — emit-with-flag preserves the record so a
+//!    single hard site doesn't kill the whole cohort run.
 //!
 //! Compound alleles get the cohort-derived `f̂_C` substituted for
 //! `p̂[compound]` everywhere the prior is evaluated, regardless of
@@ -79,10 +85,11 @@ use crate::var_calling::per_group_merger::{
 /// ones.
 pub const DEFAULT_CONVERGENCE_THRESHOLD: f64 = 1e-3;
 
-/// Default hard cap on per-record EM iterations. Exceeding it returns
-/// [`PosteriorEngineError::DidNotConverge`]. Empirically the
-/// closed-form M-steps converge in 3–5 rounds per the GATK reference;
-/// 50 is the belt-and-braces ceiling.
+/// Default hard cap on per-record EM iterations. Records that exceed
+/// it emit with `EmDiagnostics::converged = false` (routed by the VCF
+/// writer to `FILTER=EMNoConv`) rather than hard-failing the cohort
+/// run. Empirically the closed-form M-steps converge in 3–5 rounds
+/// per the GATK reference; 50 is the belt-and-braces ceiling.
 ///
 /// Source: implementation-plan `posterior_engine.md` §"Step 5 —
 /// convergence check".
@@ -586,8 +593,16 @@ pub enum PosteriorEngineError {
         kind: NonFiniteKind,
     },
 
-    /// EM did not converge within `max_iterations`. A hard cap exists
-    /// so that pathological records cannot stall the engine.
+    /// **Historical — no longer raised by the exact-math EM loop.**
+    /// Records that hit `max_iterations` without satisfying
+    /// `convergence_threshold` are now emitted with
+    /// `EmDiagnostics::converged = false` and routed by the VCF
+    /// writer to `FILTER=EMNoConv`. The variant is retained because
+    /// the engine's `#[non_exhaustive]` `Result` shape is part of
+    /// its public API and future engine variants (e.g. the deferred
+    /// approximate-LUT mode) may still need a hard non-convergence
+    /// surface; removing it would be a SemVer-breaking change for
+    /// callers exhaustively matching on the enum.
     #[error(
         "EM did not converge within {max_iterations} iterations at {locus} \
          (last delta: {last_delta})"
@@ -733,16 +748,30 @@ impl PosteriorRecord {
     }
 }
 
-/// EM bookkeeping for a single record. A `PosteriorRecord` is only
-/// emitted on convergence, so an emitted record's
-/// `iterations <= config.max_iterations` and
-/// `final_max_delta_p < config.convergence_threshold` always hold.
+/// EM bookkeeping for a single record. A `PosteriorRecord` is emitted
+/// regardless of EM convergence — `converged` carries that bit so the
+/// VCF writer can route non-converging records into a flagged
+/// `FILTER` value (`EMNoConv`) rather than hard-erroring the whole
+/// cohort run on a single problematic site. Hard-erroring on
+/// non-convergence was the v0 behaviour; the emit-with-flag policy
+/// matches GATK / bcftools convention and preserves
+/// downstream-filterable information that would otherwise be lost.
+///
+/// On `converged == true`: `final_max_delta_p < config.convergence_threshold`.
+/// On `converged == false`: the EM loop hit `config.max_iterations`
+/// without satisfying the threshold; the emitted record's
+/// `allele_frequencies` / `posteriors` are computed from the
+/// un-converged p̂/f̂ values via the same final E-step the
+/// converged path uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EmDiagnostics {
     /// Iterations actually run (≤ `config.max_iterations`).
     pub iterations: u32,
     /// `max_a |p̂_new[a] − p̂_old[a]|` at the last iteration.
     pub final_max_delta_p: f64,
+    /// `true` iff the EM loop exited via the convergence threshold
+    /// rather than the iteration cap.
+    pub converged: bool,
 }
 
 /// Streaming posterior engine. Wraps an upstream `MergedRecord`
@@ -1922,14 +1951,21 @@ fn run_em_loop<M: MathBackend>(
             return Ok(EmDiagnostics {
                 iterations,
                 final_max_delta_p: last_delta,
+                converged: true,
             });
         }
     }
 
-    Err(PosteriorEngineError::DidNotConverge {
-        locus: ctx.locus,
-        max_iterations,
-        last_delta,
+    // Iteration cap reached. Emit the record with `converged: false`
+    // so the caller (and ultimately the VCF writer) can flag it via
+    // `FILTER=EMNoConv` rather than hard-erroring the whole cohort
+    // run on a single problematic site. The un-converged p̂/f̂
+    // values flow through the same post-loop final E-step the
+    // converged path uses.
+    Ok(EmDiagnostics {
+        iterations: max_iterations,
+        final_max_delta_p: last_delta,
+        converged: false,
     })
 }
 
@@ -2471,6 +2507,9 @@ fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> Posteri
         diagnostics: EmDiagnostics {
             iterations: 0,
             final_max_delta_p: 0.0,
+            // Trivial record — the closed-form output IS the
+            // converged fixed point, no iteration needed.
+            converged: true,
         },
     }
 }
@@ -2745,9 +2784,12 @@ mod tests {
     }
 
     /// Proptest-friendly variant of [`single_ok`]: returns the engine's
-    /// `Result` so the caller can `prop_assume!` over pathological
-    /// inputs (e.g. `DidNotConverge`, which is a documented engine
-    /// error variant for adversarial likelihood matrices, not a bug).
+    /// `Result` so the caller can drop adversarial inputs whose EM
+    /// hit the iteration cap (`pr.diagnostics.converged == false` —
+    /// invariants like "permutation invariance" are only meaningful
+    /// when both runs reached the same fixed point). The engine no
+    /// longer surfaces non-convergence as `Err(DidNotConverge)`; it
+    /// emits the record with `converged: false` instead.
     fn try_single(record: MergedRecord) -> Result<PosteriorRecord, PosteriorEngineError> {
         let mut out = engine_for(record);
         assert_eq!(out.len(), 1);
@@ -2851,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_iteration_cap_returns_did_not_converge_error() {
+    fn hard_iteration_cap_emits_record_with_converged_false() {
         let record = merged_record_simple(1, 100, vec![b"A", b"C"], 2, vec![vec![0.0, -1.0, -2.0]]);
         let config = PosteriorEngineConfig {
             max_iterations: 1,
@@ -2859,23 +2901,33 @@ mod tests {
             ..Default::default()
         };
         let out = engine_for_with_config(record, config);
-        match &out[0] {
-            Err(PosteriorEngineError::DidNotConverge {
-                locus,
-                max_iterations,
-                last_delta,
-            }) => {
-                assert_eq!(locus.chrom_id, 1);
-                assert_eq!(locus.start, 100);
-                assert_eq!(locus.end, 100);
-                assert_eq!(*max_iterations, 1);
-                assert!(
-                    last_delta.is_finite() && *last_delta >= 0.0,
-                    "last_delta = {last_delta}"
-                );
-            }
-            other => panic!("expected DidNotConverge, got {other:?}"),
+        let pr = match out.into_iter().next() {
+            Some(Ok(pr)) => pr,
+            other => panic!("expected Ok(PosteriorRecord), got {other:?}"),
+        };
+        assert_eq!(pr.locus.chrom_id, 1);
+        assert_eq!(pr.locus.start, 100);
+        assert_eq!(pr.locus.end, 100);
+        assert!(
+            !pr.diagnostics.converged,
+            "iteration-cap exit must set converged=false"
+        );
+        assert_eq!(pr.diagnostics.iterations, 1);
+        assert!(
+            pr.diagnostics.final_max_delta_p.is_finite()
+                && pr.diagnostics.final_max_delta_p >= 0.0,
+            "final_max_delta_p = {}",
+            pr.diagnostics.final_max_delta_p,
+        );
+        // Even though EM didn't converge, the emitted record must
+        // still satisfy the basic invariants — the final E-step
+        // normalises posteriors regardless of convergence.
+        for s in 0..pr.n_samples {
+            let sum: f64 = pr.posteriors_row(s).iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "row sum = {sum}");
         }
+        let p_sum: f64 = pr.allele_frequencies.iter().sum();
+        assert!((p_sum - 1.0).abs() < 1e-9, "p̂ sum = {p_sum}");
     }
 
     #[test]
@@ -4429,13 +4481,16 @@ mod tests {
             (ploidy, alleles, likelihoods) in proptest_record_strategy()
         ) {
             let record = merged_record_simple(1, 100, alleles, ploidy, likelihoods);
-            // M3: skip only the specific `DidNotConverge` outcome (a
-            // documented engine error on adversarial likelihood
-            // matrices); any other error variant is a real bug and
-            // should fail the proptest loudly.
+            // Records that hit the iteration cap on adversarial
+            // likelihood matrices are emitted with `converged: false`
+            // (the engine no longer surfaces non-convergence as an
+            // `Err`). Skip those — the per-row sum invariant holds
+            // for them too, but separating the converged-only
+            // population keeps this proptest a clean check on the
+            // converged code path.
             let pr = match try_single(record) {
-                Ok(pr) => pr,
-                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Ok(pr) if pr.diagnostics.converged => pr,
+                Ok(_) => return Ok(()),
                 Err(other) => return Err(TestCaseError::fail(format!(
                     "unexpected engine error: {other}"
                 ))),
@@ -4452,8 +4507,8 @@ mod tests {
         ) {
             let record = merged_record_simple(1, 100, alleles, ploidy, likelihoods);
             let pr = match try_single(record) {
-                Ok(pr) => pr,
-                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Ok(pr) if pr.diagnostics.converged => pr,
+                Ok(_) => return Ok(()),
                 Err(other) => return Err(TestCaseError::fail(format!(
                     "unexpected engine error: {other}"
                 ))),
@@ -4482,17 +4537,20 @@ mod tests {
             let record_a = merged_record_simple(1, 100, alleles.clone(), ploidy, likelihoods);
             let record_b = merged_record_simple(1, 100, alleles, ploidy, permuted);
             // Both records must converge for the invariance assertion
-            // to be meaningful; skip only on DidNotConverge.
+            // to be meaningful — un-converged runs stop at the
+            // iteration cap with parameter values that depend on
+            // path-history. Skip when either run lands at
+            // `converged: false`.
             let pr_a = match try_single(record_a) {
-                Ok(pr) => pr,
-                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Ok(pr) if pr.diagnostics.converged => pr,
+                Ok(_) => return Ok(()),
                 Err(other) => return Err(TestCaseError::fail(format!(
                     "unexpected engine error on record_a: {other}"
                 ))),
             };
             let pr_b = match try_single(record_b) {
-                Ok(pr) => pr,
-                Err(PosteriorEngineError::DidNotConverge { .. }) => return Ok(()),
+                Ok(pr) if pr.diagnostics.converged => pr,
+                Ok(_) => return Ok(()),
                 Err(other) => return Err(TestCaseError::fail(format!(
                     "unexpected engine error on record_b: {other}"
                 ))),

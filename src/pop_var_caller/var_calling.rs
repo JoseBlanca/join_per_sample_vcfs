@@ -35,7 +35,9 @@ use thiserror::Error;
 
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
-use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, process_one_chromosome};
+use crate::pop_var_caller::cohort_driver::{
+    CohortDriveStats, CohortPipelineParams, process_one_chromosome,
+};
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
     current_command_line, verify_fasta_matches_psp_chromosomes,
@@ -379,7 +381,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         fetcher,
         chromosomes: chromosomes.clone(),
     };
-    let per_chrom_results: Vec<Result<(u32, u64), VarCallingCliError>> = chromosomes
+    let per_chrom_results: Vec<Result<(u32, CohortDriveStats), VarCallingCliError>> = chromosomes
         .par_iter()
         .enumerate()
         .map(|(cid, _chrom)| {
@@ -400,10 +402,11 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // discussion). All workers have already joined by the time
     // par_iter().collect() returns; this loop only surfaces the
     // first error.
-    let mut total_records: u64 = 0;
+    let mut total_stats = CohortDriveStats::default();
     for result in per_chrom_results {
-        let (_cid, n) = result?;
-        total_records += n;
+        let (_cid, stats) = result?;
+        total_stats.records_written += stats.records_written;
+        total_stats.records_unconverged += stats.records_unconverged;
     }
 
     // 10b. Concat fragments in contig-table order into the final
@@ -416,7 +419,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // 11. Stderr summary.
     print_run_summary(
         &sample_names,
-        total_records,
+        total_stats,
         args.threads,
         chromosomes.len(),
     );
@@ -496,9 +499,14 @@ fn hex_digit(c: u8) -> Option<u8> {
 /// `--threads R` with `R > n_chromosomes`). Matches the convention
 /// in samtools / bcftools where over-provisioning the thread pool
 /// is a warning-grade fact, not an error.
+///
+/// `records_emnoconv` is a tally of records whose posterior EM hit
+/// the iteration cap and were emitted with `FILTER=EMNoConv`. Only
+/// printed when at least one such record was produced; absence keeps
+/// the happy-path summary tight.
 fn print_run_summary(
     sample_names: &[String],
-    records_written: u64,
+    stats: CohortDriveStats,
     requested_threads: Option<usize>,
     n_chromosomes: usize,
 ) {
@@ -510,12 +518,21 @@ fn print_run_summary(
         }
         _ => String::new(),
     };
+    let emnoconv_note = if stats.records_unconverged > 0 {
+        format!(
+            " records_emnoconv={} (FILTER=EMNoConv; EM iteration cap)",
+            stats.records_unconverged,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}",
         sample_names.len(),
-        records_written,
+        stats.records_written,
         effective_threads,
         cap_note,
+        emnoconv_note,
     );
 }
 
