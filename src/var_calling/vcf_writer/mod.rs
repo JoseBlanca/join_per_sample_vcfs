@@ -40,6 +40,7 @@ mod writer;
 
 pub use errors::VcfWriteError;
 pub use header::CohortMetadata;
+pub(crate) use sink::path_is_bgzf;
 pub use sink::tmp_path_for;
 pub use writer::CohortVcfWriter;
 

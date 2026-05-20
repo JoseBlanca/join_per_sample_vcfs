@@ -183,7 +183,7 @@ fn sync_parent_dir(final_path: &Path) -> Result<(), VcfWriteError> {
 /// True when the path ends with `.vcf.gz` or `.vcf.bgz` (matched
 /// case-insensitively — `out.VCF.GZ` resolves the same as
 /// `out.vcf.gz`).
-pub(super) fn path_is_bgzf(path: &Path) -> bool {
+pub(crate) fn path_is_bgzf(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
         return false;
     };

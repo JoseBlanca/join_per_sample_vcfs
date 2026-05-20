@@ -220,6 +220,64 @@ fn var_calling_happy_path_three_samples() {
     );
 }
 
+/// **Determinism under the per-chromosome parallel path.** Run the
+/// same cohort input through `run_var_calling` twice (different
+/// output paths in the same process — the rayon pool is shared, so
+/// both runs use the same parallelism). The data body of the
+/// resulting VCFs must be byte-identical: per-chrom fragments are
+/// assembled in contig-table order regardless of worker finish
+/// order, so the final VCF is a deterministic function of the
+/// inputs. Plan §test plan #1 (morphed: post-merge the serial
+/// path no longer exists, so we assert run-vs-run determinism
+/// instead of parallel-vs-serial equivalence).
+#[test]
+fn var_calling_emits_deterministic_vcf_across_runs() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    let reads_a = vec![
+        read_record("r1", 10, b"AAAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let reads_b = vec![
+        read_record("r1", 10, b"ACAAA"), // SNP at pos 11
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let psp_a = make_psp_for_sample(dir.path(), &fasta, "NA00001", &reads_a);
+    let psp_b = make_psp_for_sample(dir.path(), &fasta, "NA00002", &reads_b);
+
+    let psps = vec![psp_a, psp_b];
+    let vcf1 = dir.path().join("cohort_run1.vcf");
+    let vcf2 = dir.path().join("cohort_run2.vcf");
+
+    let args1 = var_calling_args(fasta.clone(), vcf1.clone(), psps.clone(), None);
+    run_var_calling(&args1).expect("first run OK");
+
+    let args2 = var_calling_args(fasta, vcf2.clone(), psps, None);
+    run_var_calling(&args2).expect("second run OK");
+
+    // Bodies must match byte-for-byte once we strip header lines
+    // that legitimately differ between runs (##source / ##commandline
+    // — the latter includes argv, which would only differ if the
+    // tests passed different args, which they don't here, but we
+    // strip both to be robust against any future header drift).
+    let body1 = fs::read_to_string(&vcf1).expect("read vcf1");
+    let body2 = fs::read_to_string(&vcf2).expect("read vcf2");
+    let strip_volatile = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("##source=") && !l.starts_with("##commandline="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip_volatile(&body1),
+        strip_volatile(&body2),
+        "two runs over identical input must produce byte-identical VCF body \
+         (parallel path is deterministic; per-chrom fragments assemble in \
+         contig-table order regardless of worker finish order)"
+    );
+}
+
 /// **var-calling-from-bam happy path.** One CRAM directly → VCF.
 /// No `.psp` is written by the test (the helper internally writes
 /// the .psp for the cohort path, but `run_var_calling_from_bam`

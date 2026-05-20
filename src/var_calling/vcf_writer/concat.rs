@@ -1,9 +1,3 @@
-// Suppress `dead_code` until the per-chrom driver wires this module
-// in (next commit on the cohort_per_chromosome_parallel branch).
-// The unit tests in this module already exercise both the plain and
-// bgzf paths end-to-end.
-#![allow(dead_code)]
-
 //! Pure-Rust bgzf-aware concatenation of complete VCF fragments.
 //!
 //! The per-chromosome parallel path in

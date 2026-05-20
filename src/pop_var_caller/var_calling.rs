@@ -29,11 +29,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Args;
+use rayon::prelude::*;
+use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
-use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
+use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, process_one_chromosome};
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
     current_command_line, verify_fasta_matches_psp_chromosomes,
@@ -46,14 +48,13 @@ use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };
-use crate::var_calling::per_position_merger::{
-    PerPositionMerger, PerPositionMergerError, check_chromosome_agreement,
-};
+use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
-use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig};
+use crate::var_calling::vcf_writer::concat::concat_fragments;
+use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig, path_is_bgzf};
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -205,28 +206,36 @@ pub enum VarCallingCliError {
 
 /// Run the cohort var-calling pipeline and emit a multi-sample VCF.
 ///
-/// Pipeline (per the cohort CLI plan §"Subcommand: var-calling"):
+/// Pipeline (per the cohort CLI plan §"Subcommand: var-calling" +
+/// the 2026-05-20 per-chromosome-parallel implementation plan):
 ///
 /// 1. Size the global rayon pool when `--threads` is set.
-/// 2. Open every `.psp` with [`PspReader`].
+/// 2. Open every `.psp` with [`PspReader`] for header validation
+///    (the validated readers are then dropped — each per-chrom
+///    worker re-opens its own set).
 /// 3. Cross-check `header.reference` against the basename of
-///    `--reference`. **Basename-only — the FASTA on disk is not
-///    content-hashed against the `.psp` per-contig MD5s.** A future
-///    slice may wire that check; see the v1 contract note below.
+///    `--reference`. **Basename-only — the FASTA bytes are
+///    additionally MD5-verified at step 7a.**
 /// 4. Cross-check chromosomes across readers
-///    ([`check_chromosome_agreement`]). This compares per-contig MD5s
-///    *between readers* only, not against the FASTA — so two `.psp`s
-///    produced from the same reference agree on contents, but the
-///    supplied `--reference` is trusted to match by basename only.
+///    ([`check_chromosome_agreement`]). Compares per-contig MD5s
+///    *between readers* only.
 /// 5. Load `--contamination-estimates` if supplied and reconcile
 ///    sample names; absence → `c_s = 0` for every sample.
 /// 6. Build + validate every per-stage config from the CLI args.
-/// 7. Wire the pipeline (merger → optional DUST → grouper →
-///    per-group merger → posterior engine).
-/// 8. Stream records into the
-///    [`CohortVcfWriter`](crate::var_calling::vcf_writer::CohortVcfWriter); finalise via
-///    atomic tmp+rename.
-/// 9. Print a one-shot stderr run-summary block.
+/// 7. Build the [`SyncRefFetcher`] and verify its bytes against the
+///    `.psp` per-contig MD5s (warms the cache as a side-effect).
+/// 8. Cohort metadata + writer-config template.
+/// 9. Per-chromosome parallel partition: one worker per contig,
+///    each writes a complete VCF fragment to a scratch TempDir
+///    located next to the final output. Workers run via
+///    `rayon::par_iter`; results are collected and the first error
+///    (if any) is surfaced after every worker has joined.
+/// 10. [`concat_fragments`] assembles the per-chrom fragments in
+///     contig-table order into the final output via the writer's
+///     atomic-rename + parent-dir-fsync discipline.
+/// 11. Print a one-shot stderr run-summary block (includes
+///     `effective_threads` + the `requested … capped by N chromosomes`
+///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
     let cohort = &args.cohort;
 
@@ -235,7 +244,10 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     //    callers' --threads is silently ignored.
     configure_rayon_pool(args.threads).map_err(|_| VarCallingCliError::RayonAlreadyConfigured)?;
 
-    // 2. Open every .psp.
+    // 2. Open every .psp once for header validation. Per-chrom
+    //    workers re-open their own readers below; keeping the
+    //    parent's readers alive would multiply concurrent open
+    //    file descriptors by ~N_chromosomes for no read-side win.
     let mut readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(args.psp_files.len());
     for path in &args.psp_files {
         let file = File::open(path).map_err(VarCallingCliError::Io)?;
@@ -244,9 +256,8 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         readers.push(reader);
     }
 
-    // 3. Cross-check references. Basename comparison only; the FASTA
-    //    bytes on disk are not hashed against the .psp per-contig MD5s.
-    //    See the function docstring's "v1 contract" note.
+    // 3. Cross-check references. Basename comparison only — the
+    //    FASTA bytes get an MD5 cross-check at step 7a.
     let supplied_ref = basename(&args.reference);
     for (path, reader) in args.psp_files.iter().zip(readers.iter()) {
         if reader.header().reference != supplied_ref {
@@ -261,6 +272,11 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // 4. Sample names + chromosome agreement.
     let sample_names: Vec<String> = readers.iter().map(|r| r.header().sample.clone()).collect();
     let chromosomes = check_chromosome_agreement(&readers)?;
+    // Validation done; drop the parent readers so workers can own
+    // their own file handles without inflating the concurrent fd
+    // count. Plan §"RLIMIT_NOFILE bump" tracks the v1 ceiling at
+    // N_samples × N_chromosomes.
+    drop(readers);
 
     // 5. Build + validate every per-stage config.
     let dust_cfg = DustFilterConfig::new(cohort.complexity_window, cohort.complexity_threshold)?;
@@ -270,14 +286,9 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         cohort.max_alleles_per_var,
         DEFAULT_BATCH_SIZE,
     )?;
-    // 5. Build the posterior-engine config via the named-setter
-    //    builder chain. Every setter validates and returns
-    //    `Result<Self, _>` so a swap or out-of-range value surfaces
-    //    a typed error at construction time; the `contamination`
-    //    field is private and reachable only via
-    //    `with_contamination(...)`.
-    // 6. Load contamination if supplied; threaded into the engine
-    //    config through the same `with_contamination` setter.
+    // 5/6. Posterior config + contamination wired through the named-
+    //      setter builder chain so out-of-range values surface as
+    //      typed errors at construction time.
     let posterior_cfg = PosteriorEngineConfig::new()
         .with_convergence_threshold(cohort.em_convergence_threshold)?
         .with_max_iterations(cohort.em_max_iterations)?
@@ -298,12 +309,8 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         .map_err(VarCallingCliError::Io)?;
 
     // 7a. Cross-check FASTA bytes against the .psp per-contig MD5s.
-    //     Catches "right basename, wrong genome build" — the
-    //     basename check at step 3 was necessary but not sufficient.
-    //     M5 follow-up from the 2026-05-19 cohort CLI review. This
-    //     fetches every contig, so the SyncRefFetcher's in-memory
-    //     cache is warm by the time DUST / per-group merger start
-    //     pulling from it.
+    //     Catches "right basename, wrong genome build". Warms the
+    //     SyncRefFetcher's in-memory cache as a side-effect.
     match verify_fasta_matches_psp_chromosomes(&fetcher_concrete, &chromosomes) {
         Ok(()) => {}
         Err(FastaVerifyError::Md5Mismatch {
@@ -324,26 +331,45 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
 
     let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
 
-    // 8. Cohort metadata for the writer header. Sourced from the
-    //    merger's view of the cohort, not from the CLI argument order.
+    // 8. Cohort metadata for the writer header + the writer-config
+    //    template inherited by every per-chrom fragment writer.
     let metadata = CohortMetadata {
         sample_names: sample_names.clone(),
         contigs: chromosomes.clone(),
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line: current_command_line(),
     };
-    let writer_cfg = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
+    let writer_cfg_template =
+        WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
 
-    // 9. Wire the pipeline. The k-way merger sits on top of the
-    //    record iterators borrowed from each reader.
-    let record_iters: Vec<_> = readers.iter_mut().map(|r| r.records()).collect();
-    let merger = PerPositionMerger::new(record_iters, sample_names.clone(), chromosomes.clone())?;
+    // 9. Per-chromosome fragment paths under a TempDir placed
+    //    *next to* the final output (so the concat's atomic rename
+    //    stays on one filesystem, and the RAII drop cleans up
+    //    even on panic). Plan §"Tempdir + fragment paths".
+    let output_parent = args
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let frags_dir = TempDir::new_in(output_parent).map_err(VarCallingCliError::Io)?;
+    let frag_ext = if path_is_bgzf(&args.output) {
+        "vcf.gz"
+    } else {
+        "vcf"
+    };
+    let fragment_paths: Vec<PathBuf> = chromosomes
+        .iter()
+        .enumerate()
+        .map(|(cid, c)| {
+            frags_dir
+                .path()
+                .join(format!("chr_{cid:03}_{name}.{frag_ext}", name = c.name))
+        })
+        .collect();
 
-    // 10. Drive the cohort pipeline (DUST → grouper → per-group
-    //     merger → posterior engine → VCF writer) via the shared
-    //     helper. M11 from the 2026-05-19 review — the wiring used
-    //     to be duplicated verbatim against `var_calling_from_bam`'s
-    //     `run_cohort_pipeline_for_single_sample` helper.
+    // 10. Drive per-chrom workers in parallel. CohortPipelineParams
+    //     is Clone so each worker takes its own params instance; the
+    //     fetcher's Arc::clone inside is one atomic per worker.
     let pipeline_params = CohortPipelineParams {
         no_complexity_filter: args.no_complexity_filter,
         dust_cfg,
@@ -351,18 +377,49 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         per_group_cfg,
         posterior_cfg,
         fetcher,
-        chromosomes,
+        chromosomes: chromosomes.clone(),
     };
-    let records_written = drive_cohort_pipeline::<_, VarCallingCliError>(
-        merger,
-        pipeline_params,
-        &args.output,
-        metadata,
-        writer_cfg,
-    )?;
+    let per_chrom_results: Vec<Result<(u32, u64), VarCallingCliError>> = chromosomes
+        .par_iter()
+        .enumerate()
+        .map(|(cid, _chrom)| {
+            process_one_chromosome::<VarCallingCliError>(
+                cid as u32,
+                &args.psp_files,
+                sample_names.clone(),
+                chromosomes.clone(),
+                fragment_paths[cid].clone(),
+                metadata.clone(),
+                writer_cfg_template.clone(),
+                pipeline_params.clone(),
+            )
+        })
+        .collect();
+
+    // Fail-fast on the first error (option (a) from the design
+    // discussion). All workers have already joined by the time
+    // par_iter().collect() returns; this loop only surfaces the
+    // first error.
+    let mut total_records: u64 = 0;
+    for result in per_chrom_results {
+        let (_cid, n) = result?;
+        total_records += n;
+    }
+
+    // 10b. Concat fragments in contig-table order into the final
+    //      output. concat_fragments owns the atomic rename + parent
+    //      directory fsync (via SinkKind::finish), so by the time
+    //      it returns Ok the file is durable at args.output.
+    concat_fragments(&args.output, &fragment_paths)?;
+    // frags_dir RAII-drops the scratch TempDir + fragments here.
 
     // 11. Stderr summary.
-    print_run_summary(&sample_names, records_written);
+    print_run_summary(
+        &sample_names,
+        total_records,
+        args.threads,
+        chromosomes.len(),
+    );
     Ok(())
 }
 
@@ -430,11 +487,35 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-fn print_run_summary(sample_names: &[String], records_written: u64) {
+/// Print the one-shot stderr run summary.
+///
+/// `effective_threads` is the per-chrom parallelism actually
+/// realised — `min(rayon_pool_size, n_chromosomes)`. The
+/// parenthetical `(requested R; capped by N chromosomes)` is
+/// appended only when the cap actually bit (i.e. the user passed
+/// `--threads R` with `R > n_chromosomes`). Matches the convention
+/// in samtools / bcftools where over-provisioning the thread pool
+/// is a warning-grade fact, not an error.
+fn print_run_summary(
+    sample_names: &[String],
+    records_written: u64,
+    requested_threads: Option<usize>,
+    n_chromosomes: usize,
+) {
+    let pool_size = rayon::current_num_threads();
+    let effective_threads = pool_size.min(n_chromosomes.max(1));
+    let cap_note = match requested_threads {
+        Some(req) if req > n_chromosomes && n_chromosomes > 0 => {
+            format!(" (requested {req}; capped by {n_chromosomes} chromosomes)")
+        }
+        _ => String::new(),
+    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}",
         sample_names.len(),
         records_written,
+        effective_threads,
+        cap_note,
     );
 }
 
