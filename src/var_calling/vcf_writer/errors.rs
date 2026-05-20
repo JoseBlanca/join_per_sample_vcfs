@@ -204,4 +204,34 @@ pub enum VcfWriteError {
     /// `##contig=length=` cap.
     #[error("contig '{name}' length {length} exceeds i32::MAX (VCF contig length limit)")]
     ContigLengthOverflow { name: String, length: u32 },
+
+    // ---------- per-chromosome concat (Stage 6 sink, parallel path) ----------
+    /// [`concat_fragments`](super::concat::concat_fragments) was given
+    /// an empty fragment list. A downstream pipeline that produces
+    /// zero per-chrom fragments is a caller bug (the cohort's contig
+    /// table is non-empty by construction), not a quiet success.
+    #[error("concat_fragments called with an empty fragment list (output {final_path})")]
+    EmptyFragmentList { final_path: PathBuf },
+
+    /// Reading from one of the per-chrom VCF fragments failed — either
+    /// `File::open` could not open the fragment path, or a mid-stream
+    /// `read_line` failed on its bgzf / plain reader.
+    #[error("failed to read per-chrom fragment {fragment}")]
+    ReadFragment {
+        fragment: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Writing fragment bytes into the concatenated output sink
+    /// failed. `fragment` is the input fragment under append; the
+    /// underlying sink is the `<final_path>.tmp` opened by
+    /// [`concat_fragments`](super::concat::concat_fragments).
+    #[error("failed to write concat output (appending fragment {fragment} into {final_path})")]
+    WriteConcat {
+        final_path: PathBuf,
+        fragment: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }

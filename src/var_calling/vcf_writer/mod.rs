@@ -31,6 +31,7 @@
 
 use std::path::PathBuf;
 
+pub(crate) mod concat;
 mod errors;
 mod header;
 mod record_encode;
