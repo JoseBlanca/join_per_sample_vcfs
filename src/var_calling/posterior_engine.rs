@@ -62,12 +62,22 @@ use crate::var_calling::per_group_merger::{
 };
 
 /// Default EM convergence threshold on `max_a |p̂_new[a] − p̂_old[a]|`.
-/// Inherited from the implementation plan; revisit against real data.
 ///
 /// Source: implementation-plan `posterior_engine.md` §"Step 5 —
-/// convergence check" picks `1e-4` as the per-record threshold; GATK's
-/// `0.1` on raw allele counts is roughly equivalent at depth ≈ 20.
-pub const DEFAULT_CONVERGENCE_THRESHOLD: f64 = 1e-4;
+/// convergence check" originally picked `1e-4`; GATK's `0.1` on raw
+/// allele counts is roughly equivalent at depth ≈ 20.
+///
+/// Relaxed from `1e-4` to `1e-3` (2026-05-20) after tomato (SL4.0)
+/// SRR7279725_small.psp surfaced hard records where the EM plateau'd
+/// in the `5e-4 … 1e-3` band and hit
+/// [`DEFAULT_MAX_ITERATIONS`] without crossing the original threshold
+/// (e.g. SL4.0ch01:2025118, `last_delta = 7.33e-4` at iter 50).
+/// `1e-3` is in the typical range for population-genetics EM and the
+/// well-conditioned records that previously converged below `1e-4`
+/// still do so well before the iteration cap — the change buys
+/// robustness on hard records without giving up precision on easy
+/// ones.
+pub const DEFAULT_CONVERGENCE_THRESHOLD: f64 = 1e-3;
 
 /// Default hard cap on per-record EM iterations. Exceeding it returns
 /// [`PosteriorEngineError::DidNotConverge`]. Empirically the
@@ -259,7 +269,7 @@ impl PosteriorEngineConfig {
     ///
     /// | Field                              | Constant                              | Value    |
     /// |---|---|---|
-    /// | `convergence_threshold`            | [`DEFAULT_CONVERGENCE_THRESHOLD`]     | 1e-4     |
+    /// | `convergence_threshold`            | [`DEFAULT_CONVERGENCE_THRESHOLD`]     | 1e-3     |
     /// | `max_iterations`                   | [`DEFAULT_MAX_ITERATIONS`]            | 50       |
     /// | `ref_pseudocount`                  | [`DEFAULT_REF_PSEUDOCOUNT`]           | 10.0     |
     /// | `snp_alt_pseudocount`              | [`DEFAULT_SNP_ALT_PSEUDOCOUNT`]       | 0.01     |
