@@ -19,7 +19,35 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Cohort CLI follow-up **Wave 5**
+> - **Last completed task:** End-to-end perf review of the `.psp` →
+>   cohort-VCF pipeline (Stages 3–6) on real tomato (SL4.0) data —
+>   [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md).
+>   Verdict: **Apply the listed wins.** Profile evidence: `perf record
+>   --call-graph=dwarf` at T=1 on a real `SRR7279725.small.psp × N=10`
+>   cohort, 11.93 s wall, 14 K P-core samples. Headline findings:
+>   pipeline is essentially single-threaded (T=1/2/4/16 all run
+>   11.5–13.6 s — T=16 actually *slower* than T=1); DUST filter is
+>   33 % of self-time (sequential), allocations 21 %, PSP decode 15 %,
+>   FASTA MD5 startup 8.7 %; per-group merger + posterior engine
+>   together <2 %. Seven Hot-path findings (H1 per-chromosome
+>   parallelism — the order-of-magnitude lever; H2/H3 DUST inner-loop
+>   `Vec::insert` + `VecDeque` indexing; H4 PSP `SeekFrom::Start`
+>   defeats BufReader; H5 M5 verify whole-contig allocation; H6
+>   per-position merger `vec![None; n_samples]` per emit; H7 missing
+>   DUST criterion bench), 12 Likely (incl. allocator A/B, `[profile.
+>   release] debug = "line-tables-only"` → `debug = true`,
+>   SyncRefFetcher pre-warm, CSR decoder, SmallVec for AlleleObservation,
+>   per-group merger `par_iter` removal), 5 Speculative, 6 Notes.
+>   The review's diagnosis corrects the earlier baseline-sweep
+>   prediction ("rayon-over-records is the lever"): on real data
+>   per-group merger + posterior are <2 %, so rayon-over-records would
+>   parallelise <2 % of the work — the right lever is per-chromosome.
+>   Preparatory work that landed alongside the review: new
+>   `examples/profile_cohort_e2e.rs` (commit `ee34420`); per-group
+>   merger zero-obs-constituent correctness fix (commit `2d92dd2`);
+>   posterior engine convergence threshold relaxed 1e-4 → 1e-3
+>   (commit `d4252da`).
+> - **Previous task:** Cohort CLI follow-up **Wave 5**
 >   (Test infrastructure + missing coverage) fixes-applied
 >   2026-05-19 —
 >   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md).
@@ -134,9 +162,16 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
     [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md)
 - **Impl report (cohort slice):**
   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
-- **Latest review (cohort slice):**
-  [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md) —
-  Request-changes: 0 Blockers, 14 Major (M1–M14), 23 Minor + grouped Nits.
+- **Latest reviews (cohort slice):**
+  [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md)
+  (end-to-end perf review against real tomato data — verdict: *Apply
+  the listed wins*; 7 Hot-path findings, 12 Likely, 5 Speculative;
+  headline: pipeline is essentially single-threaded, DUST 33 %,
+  allocations 21 %; H1 per-chromosome parallelism is the
+  order-of-magnitude lever);
+  [cohort_cli_2026-05-19.md](doc/devel/reports/reviews/cohort_cli_2026-05-19.md)
+  (correctness — Request-changes: 0 Blockers, 14 Major (M1–M14), 23
+  Minor + grouped Nits).
 - **Latest fixes-applied (cohort slice):**
   Wave 5 of the deferred follow-up,
   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md) —
@@ -162,6 +197,33 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   (Stage 1) and
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
+- **Open (from 2026-05-20 perf review):**
+  - **H1** — per-chromosome parallelism (headline order-of-magnitude
+    lever): partition the DUST→…→writer chain at the chromosome
+    boundary, drive via `rayon::par_iter` over the 13 contigs, walk
+    per-chrom buffers in contig-table order at the writer.
+  - **H2 / H3** — DUST `find_perfect` inner-loop: replace
+    `Vec::insert(j, …)` (O(n) memmove) and `VecDeque` indexing
+    (per-element wrap + bounds check). Gated by **H7**.
+  - **H4** — PSP reader: replace per-block `SeekFrom::Start` (which
+    discards the 64 KiB BufReader) with `seek_relative` for the
+    post-header rewind and "skip if already at offset" for the
+    pre-block seek (or pull-style `fill_buf`/`consume`).
+  - **H5** — M5 verify: stream the FASTA in 64 KiB windows
+    feeding `Md5::update` instead of materialising whole contigs (up
+    to 91 MB) and uppercasing byte-by-byte.
+  - **H6** — `PerPositionMerger::next`'s `vec![None; n_samples]` per
+    emit (~19M allocations / run at N=10): lending-iterator pivot,
+    paired with the same fix in `DustFilter`.
+  - **H7** — add an isolated `var_calling_dust_filter` criterion bench
+    (gates H2 / H3 / L1 / L2 / L12 measurements).
+  - **L1–L12** — see the full report; highlights: L1 drop per-group
+    `par_iter` (one-line, mandatory once H1 lands), L2 `AlleleObservation`
+    `Vec` → `SmallVec`, L3 PSP CSR decoder, L4 `fetch_from_repository`
+    `make_ascii_uppercase`, L5 `SyncRefFetcher` pre-warm (becomes hot
+    only under H1), L8 `[profile.release] debug = "line-tables-only"`
+    → `debug = true`, L9 `alloc-mimalloc` A/B against real-data
+    workload, L10 missing drained-count assertions in benches.
 - **Open (from cohort-slice review):**
   *None — the 16 originally-Deferred findings are all Applied.*
   - **Closed in Wave 5 (2026-05-19):** **Mi20**, **Mi23**,
@@ -474,5 +536,17 @@ list is clear.
     `CohortPipelineParams` promoted from `pub(crate)` to
     `#[doc(hidden)] pub`. 15 bench variants pass `cargo bench --bench
     cohort_e2e_perf -- --test`.
+  - **`.psp` → cohort VCF arm — perf review against real data
+    2026-05-20:**
+    [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md).
+    Used the bench above + an `examples/profile_cohort_e2e.rs`
+    one-off + `perf record` on real tomato (SL4.0)
+    `SRR7279725.small.psp × N=10` to produce the headline
+    diagnosis: pipeline is essentially single-threaded
+    (T=1=12.7s ≈ T=16=13.6s); DUST 33 %, allocations 21 %, PSP
+    decode 15 %; per-group merger + posterior together <2 %. Seven
+    Hot-path + 12 Likely findings; **H1 per-chromosome parallelism**
+    is the order-of-magnitude lever. Tracks all the Open items the
+    cohort CLI block now carries.
   - **CRAM → `.psp` arm:** still pending.
 
