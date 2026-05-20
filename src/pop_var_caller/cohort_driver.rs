@@ -49,6 +49,25 @@ use crate::var_calling::vcf_writer::{
 /// quality bar.
 pub const DEFAULT_MIN_QUAL_PHRED: f64 = 30.0;
 
+/// Default for [`CohortPipelineParams::min_alt_obs_per_sample`].
+/// Records where no ALT allele has `max(num_obs across samples) >= 2`
+/// are dropped *before* reaching the EM. Empirically (multichrom
+/// 10-duplicate cohort, 2026-05-20) `2` cuts FPs vs GATK by 70%
+/// while losing < 1 pp recall; 89.9 % of pileup-level candidates
+/// are single-alt-read positions that come from base / alignment
+/// error rather than real variation.
+///
+/// `0` and `1` are both effective no-ops (every candidate has at
+/// least one supporting alt read by construction); they're allowed
+/// as escape hatches for tests / debugging.
+///
+/// Closest GATK analogue: `--min-pruning = 2` on the De Bruijn
+/// assembly, which prunes assembly paths supported by fewer than
+/// two reads in the cohort. Our filter is per-allele max across
+/// samples rather than per-path, but the effect on candidate-set
+/// size is comparable.
+pub const DEFAULT_MIN_ALT_OBS_PER_SAMPLE: u32 = 2;
+
 /// Counts the driver tracks as it streams records from the posterior
 /// engine to the VCF writer. Surfaced by [`drive_cohort_pipeline`]
 /// and [`process_one_chromosome`] so the orchestrator can build a
@@ -76,6 +95,14 @@ pub struct CohortDriveStats {
     /// [`CohortPipelineParams::min_qual_phred`]. See the constant's
     /// doc for the QUAL-semantics caveat.
     pub records_dropped_low_qual: u64,
+    /// Per-group records dropped *before* the EM because no ALT
+    /// allele had `max(num_obs across samples) >=
+    /// min_alt_obs_per_sample`. These records would otherwise have
+    /// reached the EM and emitted a 0/1 call from a single supporting
+    /// read; pruning them at the per-group → EM boundary saves the EM
+    /// CPU on top of the precision gain. See
+    /// [`DEFAULT_MIN_ALT_OBS_PER_SAMPLE`].
+    pub records_dropped_low_alt_obs: u64,
 }
 
 /// Bundle of per-stage configs + shared resources consumed by
@@ -112,6 +139,12 @@ pub struct CohortPipelineParams {
     /// caveat about how our cohort-product QUAL scales with sample
     /// count.
     pub min_qual_phred: f64,
+    /// Minimum per-allele alt-read support — at the per-group merger
+    /// → EM boundary, a record is dropped if no ALT allele has
+    /// `max(num_obs across samples) >= min_alt_obs_per_sample`. `0`
+    /// or `1` disables the filter (every candidate has ≥ 1 supporting
+    /// read by construction). Default: [`DEFAULT_MIN_ALT_OBS_PER_SAMPLE`].
+    pub min_alt_obs_per_sample: u32,
 }
 
 /// Drive DUST → grouper → per-group merger → posterior engine →
@@ -154,6 +187,7 @@ where
         fetcher,
         chromosomes,
         min_qual_phred,
+        min_alt_obs_per_sample,
     } = params;
 
     let tmp_path = tmp_path_for(output);
@@ -179,7 +213,42 @@ where
     // `fetcher.clone()` is cheap (`Arc::clone`); the per-group
     // merger needs its own owned handle.
     let per_group = PerGroupMerger::with_config(grouper, fetcher.clone(), per_group_cfg);
-    let posterior = PosteriorEngine::with_config(per_group, posterior_cfg);
+
+    // Min-alt-AD filter at the per-group merger → EM boundary. The
+    // filter closure cannot mutably borrow `stats` (that borrow is
+    // taken by the drive loop below), so we accumulate into a local
+    // `AtomicU64` and fold the result into `stats` once the iterator
+    // is fully drained. Single-threaded in practice, but `AtomicU64`
+    // sidesteps the lifetime gymnastics of `Cell<u64>` in a `move`
+    // closure here.
+    let alt_obs_dropped = std::sync::atomic::AtomicU64::new(0);
+    let alt_obs_dropped_ref = &alt_obs_dropped;
+    let per_group_filtered = per_group.filter_map(move |item| match item {
+        Err(e) => Some(Err(e)),
+        Ok(record) => {
+            if min_alt_obs_per_sample <= 1 || record.alleles.len() <= 1 {
+                return Some(Ok(record));
+            }
+            let n_alleles = record.alleles.len();
+            let any_alt_passes = (1..n_alleles).any(|allele_idx| {
+                let mut max_obs = 0u32;
+                for sample_idx in 0..record.n_samples {
+                    let obs = record.scalars[sample_idx * n_alleles + allele_idx].num_obs;
+                    if obs > max_obs {
+                        max_obs = obs;
+                    }
+                }
+                max_obs >= min_alt_obs_per_sample
+            });
+            if any_alt_passes {
+                Some(Ok(record))
+            } else {
+                alt_obs_dropped_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
+    });
+    let posterior = PosteriorEngine::with_config(per_group_filtered, posterior_cfg);
 
     // Open writer, stream records, finalise. On any failure inside
     // the loop, best-effort remove `<output>.tmp` — `finish()`
@@ -212,6 +281,8 @@ where
         let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
         return Err(e);
     }
+    stats.records_dropped_low_alt_obs +=
+        alt_obs_dropped.load(std::sync::atomic::Ordering::Relaxed);
     Ok(stats)
 }
 

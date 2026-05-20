@@ -192,6 +192,11 @@ pub fn parse_min_qual_phred(s: &str) -> Result<f64, String> {
     parse_f64_with(s, "min-qual", |v| (0.0..=1000.0).contains(&v), "[0.0, 1000.0]")
 }
 
+/// `--min-alt-obs-per-sample`: `0..=100`. `0` and `1` are no-ops.
+pub fn parse_min_alt_obs_per_sample(s: &str) -> Result<u32, String> {
+    parse_u32_in(s, "min-alt-obs-per-sample", 0, 100)
+}
+
 /// Shared body for every Dirichlet-pseudocount parser. Range is the
 /// same across the posterior engine and the contamination side-pass
 /// (`PSEUDOCOUNT_RANGE_MAX = 1000.0` in both modules); the only thing
@@ -370,6 +375,17 @@ mod tests {
         assert!(parse_min_qual_phred("1000.001").is_err());
         assert!(parse_min_qual_phred("nan").is_err());
         assert!(parse_min_qual_phred("inf").is_err());
+    }
+
+    #[test]
+    fn min_alt_obs_per_sample_boundaries() {
+        parse_min_alt_obs_per_sample("0").unwrap();
+        parse_min_alt_obs_per_sample("1").unwrap();
+        parse_min_alt_obs_per_sample("2").unwrap();
+        parse_min_alt_obs_per_sample("100").unwrap();
+        assert!(parse_min_alt_obs_per_sample("101").is_err());
+        assert!(parse_min_alt_obs_per_sample("-1").is_err());
+        assert!(parse_min_alt_obs_per_sample("abc").is_err());
     }
 
     #[test]

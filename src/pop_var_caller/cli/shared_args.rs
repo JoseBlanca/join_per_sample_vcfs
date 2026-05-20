@@ -41,7 +41,9 @@ use crate::per_sample_pileup::pileup::{
 };
 use crate::pop_var_caller::cli::parse_mismatch_fraction;
 use crate::pop_var_caller::cli::parsers;
-use crate::pop_var_caller::cohort_driver::DEFAULT_MIN_QUAL_PHRED;
+use crate::pop_var_caller::cohort_driver::{
+    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_QUAL_PHRED,
+};
 use crate::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use crate::var_calling::per_group_merger::{DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY};
 use crate::var_calling::posterior_engine::{
@@ -341,6 +343,23 @@ pub struct CohortPipelineArgs {
         help_heading = "Advanced — VCF writer",
     )]
     pub min_qual_phred: f64,
+
+    /// Drop records before the EM where no ALT allele has
+    /// `max(num_obs across samples) >= N`. `0` and `1` disable the
+    /// filter (every candidate has ≥ 1 supporting read by
+    /// construction). Default `2` empirically cuts false positives
+    /// against GATK by ~70% at < 1 pp recall cost — single-alt-read
+    /// candidates dominate the noise tail (89.9% on the multichrom
+    /// validation cohort). GATK's analogue is `--min-pruning = 2` on
+    /// the assembly graph.
+    #[arg(
+        long = "min-alt-obs-per-sample",
+        hide_short_help = true,
+        default_value_t = DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+        value_parser = parsers::parse_min_alt_obs_per_sample,
+        help_heading = "Advanced — Per-group merger",
+    )]
+    pub min_alt_obs_per_sample: u32,
 
     /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
     /// default — `GP` is `Number=G`, so the per-sample cell grows as

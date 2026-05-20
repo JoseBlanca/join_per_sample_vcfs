@@ -381,6 +381,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         fetcher,
         chromosomes: chromosomes.clone(),
         min_qual_phred: args.cohort.min_qual_phred,
+        min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
     };
     let per_chrom_results: Vec<Result<(u32, CohortDriveStats), VarCallingCliError>> = chromosomes
         .par_iter()
@@ -410,6 +411,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         total_stats.records_unconverged += stats.records_unconverged;
         total_stats.records_dropped_hom_ref += stats.records_dropped_hom_ref;
         total_stats.records_dropped_low_qual += stats.records_dropped_low_qual;
+        total_stats.records_dropped_low_alt_obs += stats.records_dropped_low_alt_obs;
     }
 
     // 10b. Concat fragments in contig-table order into the final
@@ -545,8 +547,16 @@ fn print_run_summary(
     } else {
         String::new()
     };
+    let dropped_low_alt_obs_note = if stats.records_dropped_low_alt_obs > 0 {
+        format!(
+            " records_dropped_low_alt_obs={} (no ALT max(num_obs) >= --min-alt-obs-per-sample)",
+            stats.records_dropped_low_alt_obs,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}",
         sample_names.len(),
         stats.records_written,
         effective_threads,
@@ -554,6 +564,7 @@ fn print_run_summary(
         emnoconv_note,
         dropped_hom_ref_note,
         dropped_low_qual_note,
+        dropped_low_alt_obs_note,
     );
 }
 
