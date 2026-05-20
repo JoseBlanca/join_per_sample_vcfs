@@ -19,15 +19,17 @@
 //! likelihood and surface that fact through `chain_anchor_flags` so Stage 6 can
 //! use a cohort-derived compound frequency as the prior signal there.
 //!
-//! Parallelism is internal to `next()`: a batch of upstream groups is
-//! pulled, processed in parallel via `rayon::par_iter`, and the
-//! resulting records are emitted one-by-one in input order.
+//! The merger pulls a batch of upstream groups, processes them
+//! serially, and emits the resulting records one-by-one in input
+//! order. Parallelism above the merger lives at the per-chromosome
+//! seam in [`crate::pop_var_caller::cohort_driver`]; running an inner
+//! `rayon::par_iter` here would only nest under that outer
+//! decomposition.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use rayon::prelude::*;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -36,8 +38,8 @@ use thiserror::Error;
 /// biallelic case (≤ 1 source per sample); chain-anchored compound
 /// constituents (2+) spill to the heap, matching the previous `Vec`
 /// behaviour for that case. Sized to keep the per-allele
-/// `Vec<SourceList>` table cheap to allocate and drop on the rayon
-/// worker — the dominant Stage 5 allocator cost per the perf review.
+/// `Vec<SourceList>` table cheap to allocate and drop per group —
+/// the dominant Stage 5 allocator cost per the perf review.
 type SourceList = SmallVec<[(usize, usize); 1]>;
 
 use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
@@ -474,10 +476,12 @@ fn collect_non_decreasing(
 // Public merger type
 // ---------------------------------------------------------------------
 
-/// Type-erased reference fetcher handle shared across rayon workers.
-/// The `Send + Sync` bounds are mandatory because the merger fans
-/// `process_group` out via `rayon::par_iter`; the merger never asks
-/// for `&mut` access, so an immutable shared handle is sufficient.
+/// Type-erased reference fetcher handle shared across per-chromosome
+/// workers. The `Send + Sync` bounds are mandatory because each
+/// per-chrom worker constructs its own `PerGroupMerger` and the
+/// shared fetcher `Arc` moves across the worker boundary; the merger
+/// itself only ever asks for `&` access, so an immutable shared
+/// handle is sufficient.
 pub type SharedRefFetcher = Arc<dyn RefSeqFetcher + Send + Sync>;
 
 /// Streaming, internally-parallel per-group merger.
@@ -490,14 +494,15 @@ where
     config: PerGroupMergerConfig,
     /// Precomputed `genotype_order(config.ploidy, n)` for `n` in
     /// `0..=config.max_alleles`, indexed by `n_alleles`. Built once at
-    /// construction; shared with rayon workers via `Arc` so no
-    /// per-group rebuild fires on the worker thread (the prior shape
-    /// allocated `Vec<Vec<u8>>` per `process_group` call). Safe because
-    /// `enforce_max_alleles` caps `unified.alleles.len() <=
+    /// construction; held behind `Arc` so the cohort driver's per-chrom
+    /// workers can each construct a `PerGroupMerger` that shares the
+    /// same table without rebuild on each worker boundary (the prior
+    /// shape allocated `Vec<Vec<u8>>` per `process_group` call). Safe
+    /// because `enforce_max_alleles` caps `unified.alleles.len() <=
     /// config.max_alleles` before `compute_log_likelihoods` runs.
     genotype_tables: Arc<Vec<Vec<Vec<u8>>>>,
-    /// FIFO of merged records produced by the most recent parallel
-    /// batch. The iterator drains this before pulling another batch.
+    /// FIFO of merged records produced by the most recent batch refill.
+    /// The iterator drains this before pulling another batch.
     /// REF-only groups are filtered out inside `refill` before they
     /// land here, so this queue only carries real records and
     /// surfaced errors.
@@ -591,20 +596,23 @@ where
             return false;
         }
 
-        let config = self.config;
-        let fetcher = Arc::clone(&self.ref_fetcher);
-        let genotype_tables = Arc::clone(&self.genotype_tables);
-        // `.collect()` here intentionally does not short-circuit on
-        // `Err`: rayon's truly short-circuiting combinators would
-        // discard the successful prefix, but we need every `Ok`
-        // record at an index lower than the first `Err` to be
-        // emitted in input order before the error latches. Cost:
-        // O(batch_size) wasted work on a systemic failure (e.g. a
-        // bad reference window) where every worker fails the same
-        // way. Acceptable trade-off for a deterministic emit order.
+        // Collect into a `Vec<Result<_>>` rather than processing
+        // inline so the successful prefix in `batch` is emitted in
+        // input order before the first error latches `done` below.
+        // A short-circuiting fold here would discard already-computed
+        // records below the error. Per-chrom outer parallelism lives
+        // in `cohort_driver`; this loop runs serially on a single
+        // worker thread.
         let results: Vec<Result<Option<MergedRecord>, PerGroupMergerError>> = batch
-            .into_par_iter()
-            .map(|group| process_group(group, fetcher.as_ref(), &config, &genotype_tables))
+            .into_iter()
+            .map(|group| {
+                process_group(
+                    group,
+                    self.ref_fetcher.as_ref(),
+                    &self.config,
+                    &self.genotype_tables,
+                )
+            })
             .collect();
 
         for result in results {
@@ -646,7 +654,7 @@ where
 }
 
 // ---------------------------------------------------------------------
-// Per-group worker (pure function so rayon can call it freely)
+// Per-group worker (pure function — borrows shared state by reference)
 // ---------------------------------------------------------------------
 
 /// Merge a single `OverlappingVariantGroup` into a `MergedRecord` (or
@@ -1820,11 +1828,11 @@ fn chain_broken_log_likelihood(
         let n_local_alleles = rec.alleles.len();
         // Stack-resident scratch for the per-position multinomial. The
         // previous shape allocated `Vec<u32>` / `Vec<f64>` / `Vec<u32>`
-        // per (sample × genotype × constituent) call, dropped on the
-        // rayon worker; for the chain-broken bench shape that was
-        // tens-of-millions of small heap allocations on the
-        // allocator-bound critical path. Matches the existing
-        // `[u32; MAX_BITMASK_ALLELES]` convention in `standard_log_likelihood`.
+        // per (sample × genotype × constituent) call; for the
+        // chain-broken bench shape that was tens-of-millions of small
+        // heap allocations on the allocator-bound critical path.
+        // Matches the existing `[u32; MAX_BITMASK_ALLELES]` convention
+        // in `standard_log_likelihood`.
         debug_assert!(
             n_local_alleles <= MAX_BITMASK_ALLELES,
             "chain_broken_log_likelihood assumes n_local_alleles ≤ {MAX_BITMASK_ALLELES}; got {n_local_alleles}",
