@@ -300,26 +300,34 @@ suspect records GATK *also* emits without filtering.
 
 ---
 
-## Implementation phases
+## Implementation phases — status (2026-05-22)
 
-**Phase A — storage + PSP plumbing (smallest reviewable unit):**
-add the two fields, thread `mapq` through `add_contribution`, add
-two column tags, version bump, tests 1 + 5 + 6. No VCF changes
-yet; the fields are silently populated.
+**Phase A — landed (commit `a87e9a6`):**
+`AlleleSupportStats.mapq_sum: u32` and `mapq_sum_sq: u64` flow from
+the BAM walker through `PreparedRead.mapq`, `ReadContribution.mapq`,
+`add_contribution`, the per-group-merger's compound-allele rebuilds,
+and the PSP I/O (two new columns 0x15, 0x16). New round-trip test
+`mapq_scalars_round_trip`.
 
-**Phase B — VCF INFO emission:** compute cohort means and Welch's
-t in `record_encode.rs`, declare the four INFO fields in the
-header, emit them. Tests 2 + 3.
+**Phase B — landed (commit `5903aa0`):**
+`INFO/MQRef` (Number=1), `INFO/MQAlt`/`MQDiff`/`MQDiffT` (Number=A)
+emitted on every record from cohort-pooled `mapq_sum` /
+`mapq_sum_sq`. New integration test
+`mapq_info_fields_reflect_cohort_pooled_stats` pins both the header
+declarations and an end-to-end expected `MQDiffT ≈ −5.66` on a
+hand-built suspect record.
 
-**Phase C — Drop filter + CLI knobs:** add `--no-mapq-diff-filter`
-and `--min-mapq-diff-t`, add the per-record drop alongside
-`min_alt_obs` / `min_qual`, add the new log counter. Test 4.
+**Phase C — landed (commit `e8f3e90`):**
+`--no-mapq-diff-filter` and `--min-mapq-diff-t` flags;
+`record_fails_mapq_diff_t` helper at the variant-emission stage;
+new `records_dropped_low_mapq_diff_t` counter on the
+`var-calling: …` summary line. Tests
+`mapq_diff_t_filter_decision_matches_thresholds` cover the drop /
+disable / undefined-stay branches.
 
-**Phase D — regenerate + measure:** rebuild
-`tmp/cohort_synth_multichrom/*.psp`, re-run var-calling, compare
-against GATK with the existing scripts. Document the actual
-INFO/MQDiffT distribution against today's analysis prediction and
-the drop counter against the ~3,650 + ~790 estimate.
-
-Each phase is a separate commit. A, B, C land together in one PR;
-D is a follow-up validation report, not code.
+**Phase D — in progress:** regenerate the synthetic 10-duplicate
+cohort PSPs (the new MAPQ columns are required by the reader),
+re-run cohort var-calling, compare against the GATK 10-sample
+reference, and validate that the actual `MQDiffT` distribution and
+drop counter match the analysis prediction
+(~3,650 FPs + ~790 TPs dropped at the default).

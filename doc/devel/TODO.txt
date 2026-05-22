@@ -2,3 +2,12 @@
 let's add regions to skip using a bed file. For instance to avoid pathological regions.
 
 Add an issue, create integration tests that check that the phase chains are correctely considered in the likelihood calculation.
+
+
+memoria, chroms streaming
+
+psp in parallel
+
+bam
+
+
