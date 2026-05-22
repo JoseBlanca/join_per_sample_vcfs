@@ -90,7 +90,7 @@ use pop_var_caller::per_sample_pileup::psp::PspReadError;
 use pop_var_caller::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{
-    drive_cohort_pipeline, CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+    drive_cohort_pipeline, CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
     DEFAULT_MIN_QUAL_PHRED,
 };
 use pop_var_caller::pop_var_caller::var_calling::{
@@ -272,6 +272,8 @@ impl CohortFixture {
             chromosomes: self.chromosomes.clone(),
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+            no_mapq_diff_filter: false,
+            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
         };
 
         let metadata = CohortMetadata {
@@ -316,6 +318,8 @@ impl CohortFixture {
                 max_gq_phred: DEFAULT_MAX_GQ_PHRED,
                 min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
                 min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+            no_mapq_diff_filter: false,
+            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
                 emit_gp: false,
             },
         }

@@ -382,6 +382,8 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         chromosomes: chromosomes.clone(),
         min_qual_phred: args.cohort.min_qual_phred,
         min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
+        no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
+        min_mapq_diff_t: args.cohort.min_mapq_diff_t,
     };
     let per_chrom_results: Vec<Result<(u32, CohortDriveStats), VarCallingCliError>> = chromosomes
         .par_iter()
@@ -412,6 +414,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         total_stats.records_dropped_hom_ref += stats.records_dropped_hom_ref;
         total_stats.records_dropped_low_qual += stats.records_dropped_low_qual;
         total_stats.records_dropped_low_alt_obs += stats.records_dropped_low_alt_obs;
+        total_stats.records_dropped_low_mapq_diff_t += stats.records_dropped_low_mapq_diff_t;
     }
 
     // 10b. Concat fragments in contig-table order into the final
@@ -555,8 +558,16 @@ fn print_run_summary(
     } else {
         String::new()
     };
+    let dropped_low_mapq_diff_t_note = if stats.records_dropped_low_mapq_diff_t > 0 {
+        format!(
+            " records_dropped_low_mapq_diff_t={} (any ALT Welch's t < --min-mapq-diff-t)",
+            stats.records_dropped_low_mapq_diff_t,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}",
         sample_names.len(),
         stats.records_written,
         effective_threads,
@@ -565,6 +576,7 @@ fn print_run_summary(
         dropped_hom_ref_note,
         dropped_low_qual_note,
         dropped_low_alt_obs_note,
+        dropped_low_mapq_diff_t_note,
     );
 }
 

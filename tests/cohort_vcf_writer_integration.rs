@@ -389,6 +389,75 @@ fn mapq_info_fields_reflect_cohort_pooled_stats() {
     );
 }
 
+/// Phase C: spot-check the cohort_driver's MAPQ-diff drop helper
+/// directly (the integration test for the actual driver runs through
+/// `cohort_cli_integration` end-to-end). Verifies the three contract
+/// branches:
+///
+///  - record with a clearly suspect ALT (Welch's t ≈ −5.7) gets the
+///    "drop" verdict;
+///  - same record but with `--no-mapq-diff-filter` semantics (i.e.
+///    threshold = `-inf`) does not trigger;
+///  - record where the read counts are below
+///    `MAPQ_FILTER_MIN_READS_PER_SIDE` (n_alt=2) stays even with the
+///    same suspect t.
+#[test]
+fn mapq_diff_t_filter_decision_matches_thresholds() {
+    use pop_var_caller::pop_var_caller::cohort_driver::{
+        record_fails_mapq_diff_t_for_test as record_fails, DEFAULT_MIN_MAPQ_DIFF_T,
+    };
+
+    // Same per-sample shape as the Phase B test: REF=20 reads MAPQ 60,
+    // ALT=4 reads MAPQ (0, 20, 30, 30) on sample S1.
+    let suspect = PosteriorRecord {
+        locus: RecordLocus {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+        },
+        alleles: vec![ref_allele(b"A"), alt_allele(b"T")],
+        ploidy: 2,
+        n_samples: 2,
+        n_genotypes: 3,
+        allele_frequencies: vec![0.8, 0.2],
+        compound_frequencies: vec![None, None],
+        posteriors: vec![0.98, 0.01, 0.01, 0.05, 0.90, 0.05],
+        best_genotype: vec![0, 1],
+        gq_phred: vec![60.0, 40.0],
+        qual_phred: 150.0,
+        scalars: vec![
+            support_with_mapq(10, 600, 36_000),
+            support_with_mapq(0, 0, 0),
+            support_with_mapq(10, 600, 36_000),
+            support_with_mapq(4, 80, 2_200),
+        ],
+        other_scalars: vec![],
+        chain_anchor_flags: vec![false; 4],
+        diagnostics: EmDiagnostics {
+            iterations: 5,
+            final_max_delta_p: 1e-6,
+            converged: true,
+        },
+    };
+    // Welch's t ≈ −5.66 — below default −3.0, so drop.
+    assert!(record_fails(&suspect, DEFAULT_MIN_MAPQ_DIFF_T));
+    // Threshold = -inf means "filter off" — must not drop.
+    assert!(!record_fails(&suspect, f32::NEG_INFINITY));
+
+    // Same shape but ALT only has 2 reads (below
+    // MAPQ_FILTER_MIN_READS_PER_SIDE): the test is undefined → stay.
+    let undefined = PosteriorRecord {
+        scalars: vec![
+            support_with_mapq(10, 600, 36_000),
+            support_with_mapq(0, 0, 0),
+            support_with_mapq(10, 600, 36_000),
+            support_with_mapq(2, 0, 0), // mean=0, both reads MAPQ 0
+        ],
+        ..suspect.clone()
+    };
+    assert!(!record_fails(&undefined, DEFAULT_MIN_MAPQ_DIFF_T));
+}
+
 #[test]
 fn out_of_order_records_surface_a_clear_error() {
     let dir = tempdir().unwrap();

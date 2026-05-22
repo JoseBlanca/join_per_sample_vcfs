@@ -42,8 +42,16 @@ use crate::per_sample_pileup::pileup::{
 use crate::pop_var_caller::cli::parse_mismatch_fraction;
 use crate::pop_var_caller::cli::parsers;
 use crate::pop_var_caller::cohort_driver::{
-    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_QUAL_PHRED,
+    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
+
+/// Tiny shim so `clap`'s `default_value_t` (which needs a `Display`
+/// expression evaluated at attribute time) can read
+/// [`DEFAULT_MIN_MAPQ_DIFF_T`] without dragging the path through
+/// every CLI helper that reads this constant.
+const fn pop_var_caller_default_min_mapq_diff_t() -> f32 {
+    DEFAULT_MIN_MAPQ_DIFF_T
+}
 use crate::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use crate::var_calling::per_group_merger::{DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY};
 use crate::var_calling::posterior_engine::{
@@ -360,6 +368,38 @@ pub struct CohortPipelineArgs {
         help_heading = "Advanced — Per-group merger",
     )]
     pub min_alt_obs_per_sample: u32,
+
+    /// Skip the Welch's-t MAPQ-difference drop entirely. The
+    /// `INFO/MQRef`, `MQAlt`, `MQDiff`, and `MQDiffT` annotations
+    /// still emit; setting this keeps records that would otherwise
+    /// be dropped for having alt-supporting reads at systematically
+    /// lower MAPQ than ref-supporting reads (the multi-mapper
+    /// fingerprint).
+    #[arg(
+        long = "no-mapq-diff-filter",
+        hide_short_help = true,
+        default_value_t = false,
+        help_heading = "Advanced — MAPQ filter",
+    )]
+    pub no_mapq_diff_filter: bool,
+
+    /// Threshold for the Welch's-t MAPQ-difference drop. Records
+    /// with at least one ALT whose cohort-pooled Welch's t (ALT vs
+    /// REF MAPQ) is below this value AND both sides have ≥ 3
+    /// supporting reads are dropped before reaching the writer.
+    /// Pass `-inf` to disable; pass `--no-mapq-diff-filter` for the
+    /// equivalent boolean. Default `-3.0` empirically catches 25 %
+    /// of GATK-extreme multi-mapper sites at a 2.0 % false-flag
+    /// rate on GATK-clean sites; see the per_allele_mapq_tracking
+    /// implementation plan for the cross-validation.
+    #[arg(
+        long = "min-mapq-diff-t",
+        hide_short_help = true,
+        default_value_t = pop_var_caller_default_min_mapq_diff_t(),
+        value_parser = parsers::parse_min_mapq_diff_t,
+        help_heading = "Advanced — MAPQ filter",
+    )]
+    pub min_mapq_diff_t: f32,
 
     /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
     /// default — `GP` is `Number=G`, so the per-sample cell grows as

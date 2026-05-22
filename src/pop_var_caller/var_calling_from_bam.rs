@@ -224,6 +224,8 @@ pub fn run_var_calling_from_bam(
     let emit_gp = cohort.emit_gp;
     let min_qual_phred = cohort.min_qual_phred;
     let min_alt_obs_per_sample = cohort.min_alt_obs_per_sample;
+    let no_mapq_diff_filter = cohort.no_mapq_diff_filter;
+    let min_mapq_diff_t = cohort.min_mapq_diff_t;
     let reference = args.reference.clone();
     let output = args.output.clone();
     let command_line = current_command_line();
@@ -246,6 +248,8 @@ pub fn run_var_calling_from_bam(
                 emit_gp,
                 min_qual_phred,
                 min_alt_obs_per_sample,
+                no_mapq_diff_filter,
+                min_mapq_diff_t,
                 dust_cfg,
                 grouper_cfg,
                 per_group_cfg,
@@ -323,6 +327,8 @@ fn run_cohort_pipeline_for_single_sample(
     emit_gp: bool,
     min_qual_phred: f64,
     min_alt_obs_per_sample: u32,
+    no_mapq_diff_filter: bool,
+    min_mapq_diff_t: f32,
     dust_cfg: DustFilterConfig,
     grouper_cfg: GrouperConfig,
     per_group_cfg: PerGroupMergerConfig,
@@ -386,6 +392,8 @@ fn run_cohort_pipeline_for_single_sample(
         chromosomes,
         min_qual_phred,
         min_alt_obs_per_sample,
+        no_mapq_diff_filter,
+        min_mapq_diff_t,
     };
     let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
         merger,

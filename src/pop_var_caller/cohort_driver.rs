@@ -103,6 +103,12 @@ pub struct CohortDriveStats {
     /// CPU on top of the precision gain. See
     /// [`DEFAULT_MIN_ALT_OBS_PER_SAMPLE`].
     pub records_dropped_low_alt_obs: u64,
+    /// Records dropped at variant emission because at least one ALT's
+    /// cohort-pooled Welch's t-statistic (ALT vs REF MAPQ) fell below
+    /// the `--min-mapq-diff-t` threshold and both sides had enough
+    /// supporting reads for the test to be defined. See
+    /// [`DEFAULT_MIN_MAPQ_DIFF_T`] and [`MAPQ_FILTER_MIN_READS_PER_SIDE`].
+    pub records_dropped_low_mapq_diff_t: u64,
 }
 
 /// Bundle of per-stage configs + shared resources consumed by
@@ -145,7 +151,34 @@ pub struct CohortPipelineParams {
     /// or `1` disables the filter (every candidate has ≥ 1 supporting
     /// read by construction). Default: [`DEFAULT_MIN_ALT_OBS_PER_SAMPLE`].
     pub min_alt_obs_per_sample: u32,
+    /// Skip the Welch's-t MAPQ-difference drop entirely. INFO fields
+    /// still emit; records with deeply suspect MAPQ asymmetry are
+    /// kept in the VCF. Default: `false` (filter active).
+    pub no_mapq_diff_filter: bool,
+    /// Drop records whose worst per-ALT Welch's t-statistic for the
+    /// MAPQ(alt) − MAPQ(ref) distribution falls below this threshold,
+    /// provided both sides have at least
+    /// [`MAPQ_FILTER_MIN_READS_PER_SIDE`] supporting reads in the
+    /// cohort. Negative values target the multi-mapper fingerprint.
+    /// Set to `f32::NEG_INFINITY` to disable while keeping
+    /// [`Self::no_mapq_diff_filter`] = false. Default:
+    /// [`DEFAULT_MIN_MAPQ_DIFF_T`].
+    pub min_mapq_diff_t: f32,
 }
+
+/// Default Welch's-t threshold for the multi-mapper MAPQ-difference
+/// filter. Empirically validated against GATK's cohort-level
+/// `MQRankSum` annotation on the 10-duplicate synthetic cohort:
+/// catches 25 % of GATK-extreme sites at a 2.0 % false-flag rate on
+/// GATK-clean sites. See the per_allele_mapq_tracking implementation
+/// plan for the cross-validation table.
+pub const DEFAULT_MIN_MAPQ_DIFF_T: f32 = -3.0;
+
+/// Minimum cohort-pooled read count on each of REF and ALT before
+/// the Welch's-t MAPQ filter applies. Below this count the variance
+/// estimate is dominated by a single value and the test is unstable;
+/// sites in that regime stay in the output regardless of MQDiffT.
+pub const MAPQ_FILTER_MIN_READS_PER_SIDE: u32 = 3;
 
 /// Drive DUST → grouper → per-group merger → posterior engine →
 /// VCF writer over `merger`, finalising the writer on success and
@@ -188,6 +221,8 @@ where
         chromosomes,
         min_qual_phred,
         min_alt_obs_per_sample,
+        no_mapq_diff_filter,
+        min_mapq_diff_t,
     } = params;
 
     let tmp_path = tmp_path_for(output);
@@ -268,6 +303,12 @@ where
                 stats.records_dropped_low_qual += 1;
                 continue;
             }
+            if !no_mapq_diff_filter
+                && record_fails_mapq_diff_t(&record, min_mapq_diff_t)
+            {
+                stats.records_dropped_low_mapq_diff_t += 1;
+                continue;
+            }
             if !record.diagnostics.converged {
                 stats.records_unconverged += 1;
             }
@@ -284,6 +325,83 @@ where
     stats.records_dropped_low_alt_obs +=
         alt_obs_dropped.load(std::sync::atomic::Ordering::Relaxed);
     Ok(stats)
+}
+
+/// Integration-test alias for [`record_fails_mapq_diff_t`]. The
+/// helper itself is private to the driver (single call site); the
+/// alias lets the cohort_vcf_writer_integration test exercise the
+/// decision without exposing the production helper as `pub`.
+#[doc(hidden)]
+pub fn record_fails_mapq_diff_t_for_test(
+    record: &crate::var_calling::posterior_engine::PosteriorRecord,
+    threshold: f32,
+) -> bool {
+    record_fails_mapq_diff_t(record, threshold)
+}
+
+/// Cohort-level pass/fail test for the Welch's-t MAPQ-difference
+/// drop. Returns `true` iff the record has at least one ALT whose
+/// cohort-pooled Welch's t (ALT MAPQ vs REF MAPQ) is finite, computable
+/// (both sides have ≥ [`MAPQ_FILTER_MIN_READS_PER_SIDE`] supporting
+/// reads), **and** below `threshold`. Records where the test is
+/// undefined on every ALT stay (the metric cannot speak to them).
+fn record_fails_mapq_diff_t(
+    record: &crate::var_calling::posterior_engine::PosteriorRecord,
+    threshold: f32,
+) -> bool {
+    if !threshold.is_finite() {
+        // f32::NEG_INFINITY (or any non-finite) means "filter off".
+        return false;
+    }
+    let n_alleles = record.alleles.len();
+    if n_alleles < 2 {
+        return false;
+    }
+    // Pool REF across samples once.
+    let (n_ref, sum_ref, ssq_ref) = pool_allele_mapq(record, 0);
+    if n_ref < MAPQ_FILTER_MIN_READS_PER_SIDE {
+        return false;
+    }
+    let mean_ref = sum_ref as f64 / n_ref as f64;
+    let var_ref = ((ssq_ref as f64 - (sum_ref as f64) * mean_ref).max(0.0))
+        / ((n_ref - 1) as f64);
+    for alt_idx in 1..n_alleles {
+        let (n_alt, sum_alt, ssq_alt) = pool_allele_mapq(record, alt_idx);
+        if n_alt < MAPQ_FILTER_MIN_READS_PER_SIDE {
+            continue;
+        }
+        let mean_alt = sum_alt as f64 / n_alt as f64;
+        let var_alt = ((ssq_alt as f64 - (sum_alt as f64) * mean_alt).max(0.0))
+            / ((n_alt - 1) as f64);
+        let se2 = var_alt / (n_alt as f64) + var_ref / (n_ref as f64);
+        if se2 <= 0.0 {
+            // Degenerate variance — let it pass.
+            continue;
+        }
+        let t = (mean_alt - mean_ref) / se2.sqrt();
+        if (t as f32) < threshold {
+            return true;
+        }
+    }
+    false
+}
+
+/// Helper for [`record_fails_mapq_diff_t`]: sum `(num_obs,
+/// mapq_sum, mapq_sum_sq)` across samples for one allele index.
+fn pool_allele_mapq(
+    record: &crate::var_calling::posterior_engine::PosteriorRecord,
+    allele_idx: usize,
+) -> (u32, u64, u128) {
+    let mut n: u64 = 0;
+    let mut sum: u64 = 0;
+    let mut ssq: u128 = 0;
+    for sample_idx in 0..record.n_samples {
+        let stats = &record.scalars_row(sample_idx)[allele_idx];
+        n += u64::from(stats.num_obs);
+        sum += u64::from(stats.mapq_sum);
+        ssq += stats.mapq_sum_sq as u128;
+    }
+    (u32::try_from(n).unwrap_or(u32::MAX), sum, ssq)
 }
 
 /// Run the cohort var-calling chain (DUST → … → VCF writer) over a

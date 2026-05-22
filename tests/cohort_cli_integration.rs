@@ -25,7 +25,7 @@ use pop_var_caller::per_sample_pileup::pileup::{
 };
 use pop_var_caller::pop_var_caller::cli::shared_args::{CohortPipelineArgs, Stage1Args};
 use pop_var_caller::pop_var_caller::cohort_driver::{
-    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_QUAL_PHRED,
+    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
 use pop_var_caller::pop_var_caller::estimate_contamination::{
     EstimateContaminationArgs, EstimateContaminationCliError, run_estimate_contamination,
@@ -118,6 +118,8 @@ fn var_calling_args(
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+            no_mapq_diff_filter: false,
+            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
             emit_gp: false,
         },
     }
@@ -339,6 +341,8 @@ fn var_calling_from_bam_happy_path() {
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+            no_mapq_diff_filter: false,
+            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
             emit_gp: false,
         },
     };
@@ -675,6 +679,8 @@ fn var_calling_from_bam_surfaces_walker_error_on_max_active_reads_trip() {
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+            no_mapq_diff_filter: false,
+            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
             emit_gp: false,
         },
     };
