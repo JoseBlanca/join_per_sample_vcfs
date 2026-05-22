@@ -148,6 +148,38 @@ pub(super) fn build_vcf_header(
                 InfoType::Flag,
                 "At least one sample is a chain-anchor-broken compound call",
             ),
+        )
+        .add_info(
+            "MQRef",
+            Map::<Info>::new(
+                InfoNumber::Count(1),
+                InfoType::Float,
+                "Cohort-pooled mean mapping quality of reads supporting REF",
+            ),
+        )
+        .add_info(
+            "MQAlt",
+            Map::<Info>::new(
+                InfoNumber::AlternateBases,
+                InfoType::Float,
+                "Cohort-pooled mean mapping quality of reads supporting each ALT",
+            ),
+        )
+        .add_info(
+            "MQDiff",
+            Map::<Info>::new(
+                InfoNumber::AlternateBases,
+                InfoType::Float,
+                "MQAlt - MQRef per ALT; negative => alt reads have lower MAPQ than ref reads (multi-mapper fingerprint)",
+            ),
+        )
+        .add_info(
+            "MQDiffT",
+            Map::<Info>::new(
+                InfoNumber::AlternateBases,
+                InfoType::Float,
+                "Welch's t-statistic comparing ALT vs REF MAPQ distributions across the cohort. Negative => alt reads cluster at lower MAPQ.",
+            ),
         );
 
     // FORMAT entries — always-on quartet, plus GP only when enabled.

@@ -286,6 +286,109 @@ fn bgzf_path_writes_compressed_vcf_with_eof_marker() {
     assert_eq!(data_lines.len(), 3);
 }
 
+/// Helper for the MAPQ-INFO test: builds an `AlleleSupportStats`
+/// that pins all five of `num_obs`, `mapq_sum`, `mapq_sum_sq` so
+/// the test can predict the cohort-pooled mean / Welch's t.
+fn support_with_mapq(num_obs: u32, mapq_sum: u32, mapq_sum_sq: u64) -> AlleleSupportStats {
+    AlleleSupportStats::new(num_obs, 0.0, 0, 0, 0, mapq_sum, mapq_sum_sq)
+}
+
+/// Phase B: a record where REF reads are clean (all MAPQ=60) and
+/// ALT reads are multi-mappers (MAPQ=20 mean, with spread). Verify
+/// the four new INFO fields land with the expected values.
+///
+/// REF: 20 reads × MAPQ=60   → sum=1200, sum_sq=72000  → mean 60.00
+/// ALT:  4 reads with MAPQs (0, 20, 30, 30) → sum=80, sum_sq=2200 → mean 20.00
+/// Variance (sample, ddof=1):
+///   var_ref = 0  (all reads MAPQ=60)
+///   var_alt = (2200 - 80²/4) / (4-1) = (2200 - 1600)/3 = 200
+/// Welch's t = (20 - 60) / sqrt(200/4 + 0/20)
+///           = -40 / sqrt(50)
+///           ≈ -5.657
+#[test]
+fn mapq_info_fields_reflect_cohort_pooled_stats() {
+    let dir = tempdir().unwrap();
+    let out = dir.path().join("out.vcf");
+    let metadata = metadata_two_samples();
+    let config = WriterConfig::new(out.clone());
+
+    let mut writer = CohortVcfWriter::new(metadata, config).unwrap();
+    let record = PosteriorRecord {
+        locus: RecordLocus {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+        },
+        alleles: vec![ref_allele(b"A"), alt_allele(b"T")],
+        ploidy: 2,
+        n_samples: 2,
+        n_genotypes: 3,
+        allele_frequencies: vec![0.8, 0.2],
+        compound_frequencies: vec![None, None],
+        posteriors: vec![0.98, 0.01, 0.01, 0.05, 0.90, 0.05],
+        best_genotype: vec![0, 1],
+        gq_phred: vec![60.0, 40.0],
+        qual_phred: 150.0,
+        // Layout is sample-major: scalars[s][a]. Pool across samples:
+        //   REF: S0 = 10 reads × MAPQ 60, S1 = 10 reads × MAPQ 60
+        //   ALT: S0 = 0 reads, S1 = 4 reads (mixed)
+        // S0 row: REF (n=10, sum=600, ssq=36000), ALT (n=0, 0, 0)
+        // S1 row: REF (n=10, sum=600, ssq=36000), ALT (n=4, 80, 2200)
+        scalars: vec![
+            support_with_mapq(10, 600, 36_000),
+            support_with_mapq(0, 0, 0),
+            support_with_mapq(10, 600, 36_000),
+            support_with_mapq(4, 80, 2_200),
+        ],
+        other_scalars: vec![],
+        chain_anchor_flags: vec![false; 4],
+        diagnostics: EmDiagnostics {
+            iterations: 5,
+            final_max_delta_p: 1e-6,
+            converged: true,
+        },
+    };
+    writer.write_record(&record).unwrap();
+    writer.finish().unwrap();
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    // Header declarations.
+    assert!(text.contains("##INFO=<ID=MQRef,Number=1,Type=Float"));
+    assert!(text.contains("##INFO=<ID=MQAlt,Number=A,Type=Float"));
+    assert!(text.contains("##INFO=<ID=MQDiff,Number=A,Type=Float"));
+    assert!(text.contains("##INFO=<ID=MQDiffT,Number=A,Type=Float"));
+
+    let data_lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(data_lines.len(), 1);
+    let info = data_lines[0].split('\t').nth(7).unwrap();
+
+    // Parse INFO into a map of key → value string.
+    let info_map: std::collections::HashMap<&str, &str> = info
+        .split(';')
+        .filter_map(|kv| kv.split_once('=').or(Some((kv, ""))))
+        .collect();
+
+    // MQRef: cohort mean MAPQ of REF reads = 60.0
+    let mq_ref: f32 = info_map["MQRef"].parse().unwrap();
+    assert!((mq_ref - 60.0).abs() < 0.01, "MQRef={mq_ref}");
+
+    // MQAlt: cohort mean MAPQ of ALT reads = 80 / 4 = 20.0
+    let mq_alt: f32 = info_map["MQAlt"].parse().unwrap();
+    assert!((mq_alt - 20.0).abs() < 0.01, "MQAlt={mq_alt}");
+
+    // MQDiff: 20.0 - 60.0 = -40.0
+    let mq_diff: f32 = info_map["MQDiff"].parse().unwrap();
+    assert!((mq_diff - (-40.0)).abs() < 0.01, "MQDiff={mq_diff}");
+
+    // MQDiffT: -40 / sqrt(200/4 + 0/20) = -40 / sqrt(50) ≈ -5.657
+    let mq_t: f32 = info_map["MQDiffT"].parse().unwrap();
+    let expected_t = -40.0_f32 / (50.0_f32).sqrt();
+    assert!(
+        (mq_t - expected_t).abs() < 0.05,
+        "MQDiffT={mq_t} expected ≈ {expected_t}"
+    );
+}
+
 #[test]
 fn out_of_order_records_surface_a_clear_error() {
     let dir = tempdir().unwrap();

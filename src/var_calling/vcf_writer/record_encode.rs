@@ -322,7 +322,137 @@ fn build_info(
         info.as_mut().insert("CA".into(), Some(InfoValue::Flag));
     }
 
+    // MQRef / MQAlt / MQDiff / MQDiffT — cohort-pooled MAPQ stats.
+    // Number=1 for MQRef (REF is single); Number=A for MQAlt /
+    // MQDiff / MQDiffT (one entry per ALT). All four emit `.` when
+    // the underlying counts are insufficient (variance undefined or
+    // no reads of the relevant class).
+    emit_mapq_info(record, n_alleles, &mut info);
+
     Ok(info)
+}
+
+/// Per-allele MAPQ summary across the cohort. For each allele, sum
+/// `num_obs`, `mapq_sum`, `mapq_sum_sq` across samples; from the
+/// totals derive mean and Welch's-t-statistic for ALT vs REF.
+///
+/// Storage shape: returned vector indexed by allele (0 = REF).
+struct CohortMapqStats {
+    n: u32,
+    mean: f64,
+    variance: f64,
+}
+impl CohortMapqStats {
+    fn from_pool(n: u32, sum: u64, sum_sq: u128) -> Option<Self> {
+        if n == 0 {
+            return None;
+        }
+        let n_f = n as f64;
+        let mean = (sum as f64) / n_f;
+        // Sample variance via the identity
+        //   var = (sum_sq − sum²/n) / (n − 1)
+        // Requires n ≥ 2; for n == 1 we report variance = 0 (single
+        // observation — Welch's t can't be computed regardless).
+        let variance = if n >= 2 {
+            let sum_sq_f = sum_sq as f64;
+            let bessel = ((sum_sq_f - (sum as f64) * mean) / ((n - 1) as f64)).max(0.0);
+            bessel
+        } else {
+            0.0
+        };
+        Some(Self {
+            n,
+            mean,
+            variance,
+        })
+    }
+}
+
+fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> Option<CohortMapqStats> {
+    let mut n: u64 = 0;
+    let mut sum: u64 = 0;
+    let mut sum_sq: u128 = 0;
+    for sample_idx in 0..record.n_samples {
+        let row = record.scalars_row(sample_idx);
+        let stats = &row[allele_idx];
+        n += u64::from(stats.num_obs);
+        sum += u64::from(stats.mapq_sum);
+        sum_sq += stats.mapq_sum_sq as u128;
+    }
+    // Cohort `num_obs` overflows u32 only at depths well beyond the
+    // pipeline's per-sample max — but the per-allele stat downstream
+    // only ever fits the per-sample-summed u64 sum into mean/var
+    // computations, so we keep n as u32 by saturating.
+    let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
+    CohortMapqStats::from_pool(n_u32, sum, sum_sq)
+}
+
+fn welch_t(alt: &CohortMapqStats, ref_: &CohortMapqStats) -> Option<f32> {
+    // Need ≥2 observations on each side to estimate variance.
+    if alt.n < 2 || ref_.n < 2 {
+        return None;
+    }
+    let se2 = alt.variance / (alt.n as f64) + ref_.variance / (ref_.n as f64);
+    if se2 <= 0.0 {
+        // Degenerate variance: if means are equal report t = 0;
+        // otherwise the statistic is undefined (a perfectly uniform
+        // group means the t-test can't speak; let the filter pass
+        // these — they aren't the multi-mapper pattern we target).
+        if (alt.mean - ref_.mean).abs() < f64::EPSILON {
+            return Some(0.0);
+        }
+        return None;
+    }
+    Some(((alt.mean - ref_.mean) / se2.sqrt()) as f32)
+}
+
+fn emit_mapq_info(record: &PosteriorRecord, n_alleles: usize, info: &mut Info) {
+    if n_alleles < 2 {
+        // REF-only sites never reach the VCF writer (cohort_driver
+        // drops them upstream), but guard defensively.
+        return;
+    }
+    let ref_stats = pool_allele_mapq(record, 0);
+    // MQRef — Number=1 Type=Float. Emit only when defined; omit
+    // entirely if no REF reads anywhere in the cohort.
+    if let Some(r) = ref_stats.as_ref() {
+        info.as_mut().insert(
+            "MQRef".into(),
+            Some(InfoValue::Float(r.mean as f32)),
+        );
+    }
+    // Per-ALT MQAlt, MQDiff, MQDiffT
+    let n_alts = n_alleles - 1;
+    let mut mq_alt_vec: Vec<Option<f32>> = Vec::with_capacity(n_alts);
+    let mut mq_diff_vec: Vec<Option<f32>> = Vec::with_capacity(n_alts);
+    let mut mq_diff_t_vec: Vec<Option<f32>> = Vec::with_capacity(n_alts);
+    for alt_idx in 1..n_alleles {
+        let alt_stats = pool_allele_mapq(record, alt_idx);
+        let alt_mean = alt_stats.as_ref().map(|s| s.mean as f32);
+        mq_alt_vec.push(alt_mean);
+        let diff = match (alt_stats.as_ref(), ref_stats.as_ref()) {
+            (Some(a), Some(r)) => Some((a.mean - r.mean) as f32),
+            _ => None,
+        };
+        mq_diff_vec.push(diff);
+        let t = match (alt_stats.as_ref(), ref_stats.as_ref()) {
+            (Some(a), Some(r)) => welch_t(a, r),
+            _ => None,
+        };
+        mq_diff_t_vec.push(t);
+    }
+    info.as_mut().insert(
+        "MQAlt".into(),
+        Some(InfoValue::Array(InfoArray::Float(mq_alt_vec))),
+    );
+    info.as_mut().insert(
+        "MQDiff".into(),
+        Some(InfoValue::Array(InfoArray::Float(mq_diff_vec))),
+    );
+    info.as_mut().insert(
+        "MQDiffT".into(),
+        Some(InfoValue::Array(InfoArray::Float(mq_diff_t_vec))),
+    );
 }
 
 /// Walk each sample's argmax genotype, decode it through the
