@@ -244,8 +244,9 @@ mod tests {
             qname: Arc::from("r"),
             mate_role: super::super::MateRole::Solo,
             adaptor_boundary: None,
-        }
+                        mapq: 60,
     }
+}
 
     #[test]
     fn pure_match_yields_one_match_event_per_position() {

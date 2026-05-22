@@ -40,7 +40,7 @@ fn alt_allele(seq: &[u8]) -> MergedAllele {
 fn support(num_obs: u32) -> AlleleSupportStats {
     // `AlleleSupportStats` is `#[non_exhaustive]`; integration tests
     // outside the crate go through the `new` constructor.
-    AlleleSupportStats::new(num_obs, 0.0, 0, 0, 0)
+    AlleleSupportStats::new(num_obs, 0.0, 0, 0, 0, 0, 0)
 }
 
 fn metadata_two_samples() -> CohortMetadata {

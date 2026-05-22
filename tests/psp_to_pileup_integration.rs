@@ -50,7 +50,7 @@ fn writer_header_for(chrom_names: &[&str]) -> WriterHeader {
 }
 
 fn supp(num_obs: u32, fwd: u32) -> AlleleSupportStats {
-    AlleleSupportStats::new(num_obs, -1.234, fwd, 0, 0)
+    AlleleSupportStats::new(num_obs, -1.234, fwd, 0, 0, 0, 0)
 }
 
 fn write_psp(path: &Path, chrom_names: &[&str], records: &[PileupRecord]) {

@@ -288,6 +288,9 @@ mod tests {
             fwd: 0,
             placed_left: 0,
             placed_start: 0,
+        
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         }
     }
     fn fixture_metadata() -> CohortMetadata {

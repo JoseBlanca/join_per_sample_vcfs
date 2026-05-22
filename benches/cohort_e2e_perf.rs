@@ -429,7 +429,9 @@ fn build_sample_records(n_positions: u32, ref_seq: &[u8], sample_idx: usize) -> 
                         HET_REF_DEPTH / 2,
                         HET_REF_DEPTH / 4,
                         HET_REF_DEPTH / 8,
-                    ),
+                                            0,
+                        0,
+),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
@@ -440,7 +442,9 @@ fn build_sample_records(n_positions: u32, ref_seq: &[u8], sample_idx: usize) -> 
                         HET_ALT_DEPTH / 2,
                         HET_ALT_DEPTH / 4,
                         HET_ALT_DEPTH / 8,
-                    ),
+                                            0,
+                        0,
+),
                     Vec::new(),
                 ),
             ]
@@ -453,7 +457,9 @@ fn build_sample_records(n_positions: u32, ref_seq: &[u8], sample_idx: usize) -> 
                     REF_DEPTH / 2,
                     REF_DEPTH / 4,
                     REF_DEPTH / 8,
-                ),
+                                    0,
+                    0,
+),
                 Vec::new(),
             )]
         };

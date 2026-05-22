@@ -32,7 +32,7 @@ fn obs(seq: &[u8], num_obs: u32, mean_bq_err: f64) -> AlleleObservation {
     } else {
         mean_bq_err.ln() * f64::from(num_obs)
     };
-    let support = AlleleSupportStats::new(num_obs, q_sum, num_obs / 2, num_obs / 2, 0);
+    let support = AlleleSupportStats::new(num_obs, q_sum, num_obs / 2, num_obs / 2, 0, 0, 0);
     AlleleObservation::new(seq.to_vec(), support, Vec::new())
 }
 
@@ -180,8 +180,8 @@ fn side_pass_output_feeds_stage_6_without_error() {
     let alleles_seqs = vec![&b"A"[..], &b"C"[..]];
     let scalars_per_sample = vec![
         vec![
-            AlleleSupportStats::new(49, 0.001_f64.ln() * 49.0, 24, 24, 0),
-            AlleleSupportStats::new(1, 0.001_f64.ln(), 0, 0, 0),
+            AlleleSupportStats::new(49, 0.001_f64.ln() * 49.0, 24, 24, 0, 0, 0),
+            AlleleSupportStats::new(1, 0.001_f64.ln(), 0, 0, 0, 0, 0),
         ];
         3
     ];
@@ -228,8 +228,8 @@ fn mixture_branch_shifts_posteriors_relative_to_no_contamination_baseline() {
     // ensures the prior doesn't drown out the likelihood shift.
     let alleles_seqs = vec![&b"A"[..], &b"C"[..]];
     let scalars_per_sample = vec![vec![
-        AlleleSupportStats::new(5, 0.001_f64.ln() * 5.0, 2, 2, 0),
-        AlleleSupportStats::new(5, 0.001_f64.ln() * 5.0, 2, 2, 0),
+        AlleleSupportStats::new(5, 0.001_f64.ln() * 5.0, 2, 2, 0, 0, 0),
+        AlleleSupportStats::new(5, 0.001_f64.ln() * 5.0, 2, 2, 0, 0, 0),
     ]];
     // Heterozygote-leaning baseline lls (only used in the `c_s=0`
     // run; the mixture path recomputes from scalars).
@@ -327,7 +327,7 @@ fn user_supplied_estimates_round_trip_via_zero_constructor() {
     let alleles_seqs = vec![&b"A"[..], &b"C"[..]];
     let scalars_per_sample = vec![
         vec![
-            AlleleSupportStats::new(50, 0.001_f64.ln() * 50.0, 25, 25, 0),
+            AlleleSupportStats::new(50, 0.001_f64.ln() * 50.0, 25, 25, 0, 0, 0),
             AlleleSupportStats::default(),
         ];
         2

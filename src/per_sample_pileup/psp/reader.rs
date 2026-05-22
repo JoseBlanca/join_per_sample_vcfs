@@ -435,6 +435,8 @@ struct DecodedBlock {
     allele_fwd_count: Vec<u32>,
     allele_placed_left_count: Vec<u32>,
     allele_placed_start_count: Vec<u32>,
+    allele_mapq_sum: Vec<u32>,
+    allele_mapq_sum_sq: Vec<u64>,
     allele_chain_ids: Vec<Vec<ChainId>>,
 }
 
@@ -670,6 +672,8 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
                     fwd: block.allele_fwd_count[j],
                     placed_left: block.allele_placed_left_count[j],
                     placed_start: block.allele_placed_start_count[j],
+                    mapq_sum: block.allele_mapq_sum[j],
+                    mapq_sum_sq: block.allele_mapq_sum_sq[j],
                 },
                 chain_ids: std::mem::take(&mut block.allele_chain_ids[j]),
             });
@@ -880,6 +884,8 @@ fn decode_block_payload<R: Read>(
     let mut allele_fwd_count: Option<Vec<u32>> = None;
     let mut allele_placed_left_count: Option<Vec<u32>> = None;
     let mut allele_placed_start_count: Option<Vec<u32>> = None;
+    let mut allele_mapq_sum: Option<Vec<u32>> = None;
+    let mut allele_mapq_sum_sq: Option<Vec<u64>> = None;
     let mut allele_chain_ids: Option<Vec<Vec<ChainId>>> = None;
 
     let mut remaining_budget = byte_budget;
@@ -937,6 +943,8 @@ fn decode_block_payload<R: Read>(
             DecodedColumn::AlleleFwdCount(v) => allele_fwd_count = Some(v),
             DecodedColumn::AllelePlacedLeftCount(v) => allele_placed_left_count = Some(v),
             DecodedColumn::AllelePlacedStartCount(v) => allele_placed_start_count = Some(v),
+            DecodedColumn::AlleleMapqSum(v) => allele_mapq_sum = Some(v),
+            DecodedColumn::AlleleMapqSumSq(v) => allele_mapq_sum_sq = Some(v),
             DecodedColumn::AlleleChainIds(v) => allele_chain_ids = Some(v),
         }
     }
@@ -981,6 +989,10 @@ fn decode_block_payload<R: Read>(
             .expect("allele-placed-left-count column required by v1.0 schema"),
         allele_placed_start_count: allele_placed_start_count
             .expect("allele-placed-start-count column required by v1.0 schema"),
+        allele_mapq_sum: allele_mapq_sum
+            .expect("allele-mapq-sum column required by v1.0 schema"),
+        allele_mapq_sum_sq: allele_mapq_sum_sq
+            .expect("allele-mapq-sum-sq column required by v1.0 schema"),
         allele_chain_ids: allele_chain_ids
             .expect("allele-chain-ids column required by v1.0 schema"),
     })
@@ -1002,6 +1014,8 @@ enum DecodedColumn {
     AlleleFwdCount(Vec<u32>),
     AllelePlacedLeftCount(Vec<u32>),
     AllelePlacedStartCount(Vec<u32>),
+    AlleleMapqSum(Vec<u32>),
+    AlleleMapqSumSq(Vec<u64>),
     AlleleChainIds(Vec<Vec<ChainId>>),
 }
 
@@ -1181,6 +1195,12 @@ fn decode_one_column<R: Read>(
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
             decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
+        ColumnKey::AlleleMapqSum => DecodedColumn::AlleleMapqSum(
+            decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
+        ),
+        ColumnKey::AlleleMapqSumSq => DecodedColumn::AlleleMapqSumSq(
+            decode_scalar_column_pod::<u64>(bytes, n_total_alleles, column_name)?,
+        ),
         ColumnKey::AlleleChainIds => DecodedColumn::AlleleChainIds(decode_list_column::<ChainId>(
             bytes,
             n_total_alleles,
@@ -1264,6 +1284,9 @@ mod tests {
                     fwd: 1,
                     placed_left: 0,
                     placed_start: 1,
+                
+                    mapq_sum: 0,
+                    mapq_sum_sq: 0,
                 },
                 chain_ids: Vec::new(),
             }],
@@ -1407,6 +1430,38 @@ mod tests {
                 fwd,
                 placed_left,
                 placed_start,
+                mapq_sum: 0,
+                mapq_sum_sq: 0,
+            },
+            chain_ids: chain_ids.to_vec(),
+        }
+    }
+
+    /// Variant of `allele()` that also pins the new mapq_sum /
+    /// mapq_sum_sq scalars. Used by the round-trip tests covering
+    /// the per-allele MAPQ tracking added in 2026-05.
+    #[allow(clippy::too_many_arguments)]
+    fn allele_with_mapq(
+        seq: &[u8],
+        num_obs: u32,
+        q_sum: f64,
+        fwd: u32,
+        placed_left: u32,
+        placed_start: u32,
+        mapq_sum: u32,
+        mapq_sum_sq: u64,
+        chain_ids: &[ChainId],
+    ) -> AlleleObservation {
+        AlleleObservation {
+            seq: seq.to_vec(),
+            support: AlleleSupportStats {
+                num_obs,
+                q_sum,
+                fwd,
+                placed_left,
+                placed_start,
+                mapq_sum,
+                mapq_sum_sq,
             },
             chain_ids: chain_ids.to_vec(),
         }
@@ -1444,6 +1499,46 @@ mod tests {
         assert_eq!(g.support.placed_left, w.support.placed_left);
         assert_eq!(g.support.placed_start, w.support.placed_start);
         assert_eq!(g.chain_ids, w.chain_ids);
+    }
+
+    /// Per-allele MAPQ scalars (`mapq_sum`, `mapq_sum_sq`) survive
+    /// the round-trip exactly. Covers the columns added for the
+    /// Welch's-t multi-mapper filter (2026-05).
+    #[test]
+    fn mapq_scalars_round_trip() {
+        // Two alleles with distinct MAPQ profiles: REF reads all
+        // MAPQ=60 (clean), ALT reads mixed 60/0 (multi-mapper).
+        // Numbers correspond to a hypothetical 10-read site:
+        //   REF n=7, mapq_sum=420, mapq_sum_sq=25200  (all MAPQ 60)
+        //   ALT n=3, mapq_sum= 60, mapq_sum_sq= 3600  (one MAPQ 60, two MAPQ 0)
+        let rec = PileupRecord {
+            chrom_id: 0,
+            pos: 500,
+            alleles: vec![
+                allele_with_mapq(b"A", 7, -14.0, 4, 0, 7, 420, 25_200, &[]),
+                allele_with_mapq(b"C", 3, -6.0, 1, 0, 3, 60, 3_600, &[]),
+            ],
+        };
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+        writer.write_record(&rec).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
+        let got: Vec<PileupRecord> = reader.records().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got.len(), 1);
+        let r = &got[0];
+        assert_eq!(r.alleles.len(), 2);
+        assert_eq!(r.alleles[0].support.mapq_sum, 420);
+        assert_eq!(r.alleles[0].support.mapq_sum_sq, 25_200);
+        assert_eq!(r.alleles[1].support.mapq_sum, 60);
+        assert_eq!(r.alleles[1].support.mapq_sum_sq, 3_600);
+        // Sanity: mean MAPQ recovers correctly.
+        let mean_ref = r.alleles[0].support.mapq_sum as f64
+            / r.alleles[0].support.num_obs as f64;
+        let mean_alt = r.alleles[1].support.mapq_sum as f64
+            / r.alleles[1].support.num_obs as f64;
+        assert!((mean_ref - 60.0).abs() < 1e-9);
+        assert!((mean_alt - 20.0).abs() < 1e-9);
     }
 
     /// (B2) Multi-allele records: a SNP at pos=100 and a
@@ -1666,8 +1761,9 @@ mod tests {
     #[test]
     fn region_across_multiple_blocks() {
         // Choose target so each block holds ~100 records.
-        // ~30 bytes per record, 100 records = ~3000 bytes.
-        let bytes = three_block_chrom0_fixture(3 * 1024);
+        // ~42 bytes per record (after adding mapq_sum + mapq_sum_sq),
+        // 100 records ≈ 4200 bytes.
+        let bytes = three_block_chrom0_fixture(4 * 1024);
         let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
         assert_eq!(
             reader.block_index().len(),

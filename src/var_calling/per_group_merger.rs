@@ -1406,6 +1406,8 @@ fn project_compound_scalars(
             let mut bias_left = 0_u64;
             let mut bias_start = 0_u64;
             let mut bias_basis: u64 = 0;
+            let mut bias_mapq_sum: u64 = 0;
+            let mut bias_mapq_sum_sq: u128 = 0;
             for &(record_idx, local_allele_idx) in sources {
                 let pp = &group.records[record_idx];
                 let Some(rec) = pp.per_sample.get(sample_idx).and_then(|s| s.as_ref()) else {
@@ -1433,6 +1435,8 @@ fn project_compound_scalars(
                 bias_left += stats.placed_left as u64;
                 bias_start += stats.placed_start as u64;
                 bias_basis += stats.num_obs as u64;
+                bias_mapq_sum += stats.mapq_sum as u64;
+                bias_mapq_sum_sq += stats.mapq_sum_sq as u128;
             }
             let count = inter;
             let mean_q =
@@ -1456,6 +1460,8 @@ fn project_compound_scalars(
                 fwd: ((bias_fwd as f64) * scale).round() as u32,
                 placed_left: ((bias_left as f64) * scale).round() as u32,
                 placed_start: ((bias_start as f64) * scale).round() as u32,
+                mapq_sum: ((bias_mapq_sum as f64) * scale).round() as u32,
+                mapq_sum_sq: ((bias_mapq_sum_sq as f64) * scale).round() as u64,
             };
         }
     }
@@ -1511,18 +1517,24 @@ fn subtract_compound_from_constituents(
                 }
                 let dest_idx = sample_idx * n_kept + constituent_idx;
                 let scale = (inter as f64) / (support.num_obs as f64);
+                let clamped = scale.min(1.0);
                 let mut to_subtract = AlleleSupportStats {
                     num_obs: inter.min(support.num_obs),
-                    q_sum: support.q_sum * scale.min(1.0),
-                    fwd: ((support.fwd as f64) * scale.min(1.0)).round() as u32,
-                    placed_left: ((support.placed_left as f64) * scale.min(1.0)).round() as u32,
-                    placed_start: ((support.placed_start as f64) * scale.min(1.0)).round() as u32,
+                    q_sum: support.q_sum * clamped,
+                    fwd: ((support.fwd as f64) * clamped).round() as u32,
+                    placed_left: ((support.placed_left as f64) * clamped).round() as u32,
+                    placed_start: ((support.placed_start as f64) * clamped).round() as u32,
+                    mapq_sum: ((support.mapq_sum as f64) * clamped).round() as u32,
+                    mapq_sum_sq: ((support.mapq_sum_sq as f64) * clamped).round() as u64,
                 };
                 to_subtract.fwd = to_subtract.fwd.min(scalars[dest_idx].fwd);
                 to_subtract.placed_left =
                     to_subtract.placed_left.min(scalars[dest_idx].placed_left);
                 to_subtract.placed_start =
                     to_subtract.placed_start.min(scalars[dest_idx].placed_start);
+                to_subtract.mapq_sum = to_subtract.mapq_sum.min(scalars[dest_idx].mapq_sum);
+                to_subtract.mapq_sum_sq =
+                    to_subtract.mapq_sum_sq.min(scalars[dest_idx].mapq_sum_sq);
                 subtract_support(&mut scalars[dest_idx], &to_subtract);
             }
         }
@@ -1570,12 +1582,16 @@ fn add_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
         fwd,
         placed_left,
         placed_start,
+        mapq_sum,
+        mapq_sum_sq,
     } = *src;
     into.num_obs = into.num_obs.saturating_add(num_obs);
     into.q_sum += q_sum;
     into.fwd = into.fwd.saturating_add(fwd);
     into.placed_left = into.placed_left.saturating_add(placed_left);
     into.placed_start = into.placed_start.saturating_add(placed_start);
+    into.mapq_sum = into.mapq_sum.saturating_add(mapq_sum);
+    into.mapq_sum_sq = into.mapq_sum_sq.saturating_add(mapq_sum_sq);
 }
 
 fn subtract_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
@@ -1590,12 +1606,16 @@ fn subtract_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {
         fwd,
         placed_left,
         placed_start,
+        mapq_sum,
+        mapq_sum_sq,
     } = *src;
     into.num_obs = into.num_obs.saturating_sub(num_obs);
     into.q_sum = (into.q_sum - q_sum).min(0.0);
     into.fwd = into.fwd.saturating_sub(fwd);
     into.placed_left = into.placed_left.saturating_sub(placed_left);
     into.placed_start = into.placed_start.saturating_sub(placed_start);
+    into.mapq_sum = into.mapq_sum.saturating_sub(mapq_sum);
+    into.mapq_sum_sq = into.mapq_sum_sq.saturating_sub(mapq_sum_sq);
 }
 
 // ---------------------------------------------------------------------
@@ -1979,7 +1999,7 @@ mod tests {
     // ---------- fixture builders ----------
 
     fn stats(num_obs: u32, q_sum: f64) -> AlleleSupportStats {
-        AlleleSupportStats::new(num_obs, q_sum, num_obs / 2, 0, 0)
+        AlleleSupportStats::new(num_obs, q_sum, num_obs / 2, 0, 0, 0, 0)
     }
 
     fn allele(seq: &[u8], support: AlleleSupportStats, chain_ids: &[ChainId]) -> AlleleObservation {
@@ -2666,8 +2686,8 @@ mod tests {
         // sum of `ln(P_err) ≤ 0`; subtracting a less-negative `src`
         // from a more-negative `into` must produce a more-negative
         // residual, capped at 0 (over-subtraction).
-        let mut into = AlleleSupportStats::new(10, -50.0, 5, 2, 1);
-        let src = AlleleSupportStats::new(3, -15.0, 1, 0, 0);
+        let mut into = AlleleSupportStats::new(10, -50.0, 5, 2, 1, 0, 0);
+        let src = AlleleSupportStats::new(3, -15.0, 1, 0, 0, 0, 0);
         subtract_support(&mut into, &src);
         assert_eq!(into.num_obs, 7);
         assert!(
@@ -2685,8 +2705,8 @@ mod tests {
         // If the scaled subtraction over-runs into.q_sum (a bug or a
         // pathological scaler), the clamp must hold the residual at
         // 0, not let it go positive.
-        let mut into = AlleleSupportStats::new(5, -10.0, 2, 1, 0);
-        let src = AlleleSupportStats::new(5, -25.0, 2, 1, 0);
+        let mut into = AlleleSupportStats::new(5, -10.0, 2, 1, 0, 0, 0);
+        let src = AlleleSupportStats::new(5, -25.0, 2, 1, 0, 0, 0);
         subtract_support(&mut into, &src);
         assert_eq!(into.num_obs, 0);
         assert_eq!(into.q_sum, 0.0);
@@ -2779,8 +2799,8 @@ mod tests {
 
     #[test]
     fn add_stats_saturates_on_overflow() {
-        let mut into = AlleleSupportStats::new(u32::MAX - 1, -1.0, 0, 0, 0);
-        let src = AlleleSupportStats::new(10, -2.0, 0, 0, 0);
+        let mut into = AlleleSupportStats::new(u32::MAX - 1, -1.0, 0, 0, 0, 0, 0);
+        let src = AlleleSupportStats::new(10, -2.0, 0, 0, 0, 0, 0);
         add_support(&mut into, &src);
         assert_eq!(into.num_obs, u32::MAX, "saturating add expected");
         assert!((into.q_sum - (-3.0)).abs() < 1e-9);

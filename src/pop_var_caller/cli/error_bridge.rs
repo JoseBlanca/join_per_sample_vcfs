@@ -141,8 +141,9 @@ mod tests {
             qname: Arc::<str>::from("r"),
             mate_role: MateRole::Solo,
             adaptor_boundary: None,
-        }
+                    mapq: 60,
     }
+}
 
     fn dummy_err() -> CramInputError {
         CramInputError::NoInputs

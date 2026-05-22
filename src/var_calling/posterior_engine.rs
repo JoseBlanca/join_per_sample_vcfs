@@ -3542,8 +3542,8 @@ mod tests {
             0.0
         };
         let scalars = vec![
-            AlleleSupportStats::new(num_obs_ref, q_sum_ref, num_obs_ref / 2, 0, 0),
-            AlleleSupportStats::new(num_obs_alt, q_sum_alt, num_obs_alt / 2, 0, 0),
+            AlleleSupportStats::new(num_obs_ref, q_sum_ref, num_obs_ref / 2, 0, 0, 0, 0),
+            AlleleSupportStats::new(num_obs_alt, q_sum_alt, num_obs_alt / 2, 0, 0, 0, 0),
         ];
         MergedRecord {
             chrom_id: 1,
@@ -3634,8 +3634,8 @@ mod tests {
             },
         ];
         let scalars = vec![
-            AlleleSupportStats::new(49, 0.001_f64.ln() * 49.0, 24, 0, 0),
-            AlleleSupportStats::new(1, 0.001_f64.ln(), 0, 0, 0),
+            AlleleSupportStats::new(49, 0.001_f64.ln() * 49.0, 24, 0, 0, 0, 0),
+            AlleleSupportStats::new(1, 0.001_f64.ln(), 0, 0, 0, 0, 0),
         ];
         let n_genotypes = genotype_order(2, 2).len();
         // Use a recognisable hom-REF-leaning likelihood vector.

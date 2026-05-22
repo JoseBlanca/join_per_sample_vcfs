@@ -451,7 +451,7 @@ mod tests {
     use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
 
     fn supp(num_obs: u32, fwd: u32) -> AlleleSupportStats {
-        AlleleSupportStats::new(num_obs, -1.234, fwd, 0, 0)
+        AlleleSupportStats::new(num_obs, -1.234, fwd, 0, 0, 0, 0)
     }
 
     fn allele(seq: &[u8], support: AlleleSupportStats) -> AlleleObservation {
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn allele_detail_includes_placed_counters() {
         let mut out = String::new();
-        let support = AlleleSupportStats::new(5, -2.0, 3, 1, 2);
+        let support = AlleleSupportStats::new(5, -2.0, 3, 1, 2, 0, 0);
         let record = PileupRecord::new(0, 1, vec![allele(b"A", support)]);
         emit_line(&mut out, &record, "chr1", false);
         let cols: Vec<&str> = out.split('\t').collect();

@@ -236,6 +236,7 @@ mod tests {
             seq: vec![b'A'; span as usize],
             bq_baq: vec![30; span as usize],
             mq_log_err: -3.0,
+            mapq: 60,
             is_reverse_strand: false,
             qname: Arc::from(qname),
             mate_role: super::super::MateRole::Solo,

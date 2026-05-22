@@ -672,6 +672,8 @@ struct BlockAccumulator {
     allele_fwd_count: Vec<u32>,
     allele_placed_left_count: Vec<u32>,
     allele_placed_start_count: Vec<u32>,
+    allele_mapq_sum: Vec<u32>,
+    allele_mapq_sum_sq: Vec<u64>,
     allele_chain_ids: ListColumn,
     /// Rough projection of the uncompressed byte total. Used to
     /// decide when to auto-flush.
@@ -693,6 +695,8 @@ impl BlockAccumulator {
             allele_fwd_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_left_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_placed_start_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_mapq_sum: Vec::with_capacity(INITIAL_ALLELES_HINT),
+            allele_mapq_sum_sq: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_chain_ids: ListColumn::with_capacity(
                 INITIAL_ALLELES_HINT,
                 INITIAL_CHAIN_IDS_HINT,
@@ -721,6 +725,8 @@ impl BlockAccumulator {
                 .push(allele.support.placed_left);
             self.allele_placed_start_count
                 .push(allele.support.placed_start);
+            self.allele_mapq_sum.push(allele.support.mapq_sum);
+            self.allele_mapq_sum_sq.push(allele.support.mapq_sum_sq);
             self.allele_chain_ids.push_row(&allele.chain_ids);
         }
 
@@ -736,9 +742,10 @@ impl BlockAccumulator {
             .alleles
             .iter()
             .map(|a| {
-                1                  // allele-seq-len varint typical
-                + a.seq.len()      // allele-seq bytes
-                + 4 + 8 + 4 + 4 + 4 // the five scalars
+                1                       // allele-seq-len varint typical
+                + a.seq.len()           // allele-seq bytes
+                + 4 + 8 + 4 + 4 + 4     // num_obs / q_sum / fwd / placed_left / placed_start
+                + 4 + 8                 // mapq_sum (u32) + mapq_sum_sq (u64)
                 + (1 + 8 * a.chain_ids.len()) // varint count + u64 ids
             })
             .sum();
@@ -787,6 +794,8 @@ fn encode_column_into(
         ColumnKey::AllelePlacedStartCount => {
             encode_scalar_column(&block.allele_placed_start_count, out)
         }
+        ColumnKey::AlleleMapqSum => encode_scalar_column(&block.allele_mapq_sum, out),
+        ColumnKey::AlleleMapqSumSq => encode_scalar_column(&block.allele_mapq_sum_sq, out),
         ColumnKey::AlleleChainIds => encode_list_column_csr(
             &block.allele_chain_ids.data,
             &block.allele_chain_ids.offsets,
@@ -883,6 +892,9 @@ mod tests {
             fwd: num_obs / 2,
             placed_left: 0,
             placed_start: num_obs,
+        
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         }
     }
 

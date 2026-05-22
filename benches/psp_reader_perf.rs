@@ -89,7 +89,9 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
                 14 + ((i as u32) % 3),
                 5 + ((i as u32) % 3),
                 1 + ((i as u32) % 3),
-            ),
+                            0,
+                0,
+),
             Vec::new(),
         ));
         if two_alleles {
@@ -102,7 +104,9 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
                     1 + ((i as u32) % 2),
                     1,
                     0,
-                ),
+                                    0,
+                    0,
+),
                 Vec::new(),
             ));
         }
@@ -139,7 +143,7 @@ fn build_phase_chain_heavy_records(n: usize) -> Vec<PileupRecord> {
         let chain_ids = active.clone();
         let alleles = vec![AlleleObservation::new(
             vec![ref_base],
-            AlleleSupportStats::new(20, -40.0, 10, 5, 2),
+            AlleleSupportStats::new(20, -40.0, 10, 5, 2, 0, 0),
             chain_ids,
         )];
 
@@ -158,24 +162,24 @@ fn build_multi_allele_records(n: usize) -> Vec<PileupRecord> {
             0 => vec![
                 AlleleObservation::new(
                     vec![r],
-                    AlleleSupportStats::new(25, -38.0, 12, 4, 2),
+                    AlleleSupportStats::new(25, -38.0, 12, 4, 2, 0, 0),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
                     vec![bases[(i + 1) & 3]],
-                    AlleleSupportStats::new(7, -10.0, 3, 1, 1),
+                    AlleleSupportStats::new(7, -10.0, 3, 1, 1, 0, 0),
                     Vec::new(),
                 ),
             ],
             1 => vec![
                 AlleleObservation::new(
                     vec![r],
-                    AlleleSupportStats::new(22, -36.0, 11, 3, 1),
+                    AlleleSupportStats::new(22, -36.0, 11, 3, 1, 0, 0),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
                     vec![r, b'A', b'C'],
-                    AlleleSupportStats::new(5, -8.0, 2, 1, 0),
+                    AlleleSupportStats::new(5, -8.0, 2, 1, 0, 0, 0),
                     Vec::new(),
                 ),
             ],
@@ -188,34 +192,34 @@ fn build_multi_allele_records(n: usize) -> Vec<PileupRecord> {
                         bases[(i + 3) & 3],
                         r,
                     ],
-                    AlleleSupportStats::new(18, -30.0, 9, 2, 1),
+                    AlleleSupportStats::new(18, -30.0, 9, 2, 1, 0, 0),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
                     vec![r],
-                    AlleleSupportStats::new(4, -7.0, 2, 0, 0),
+                    AlleleSupportStats::new(4, -7.0, 2, 0, 0, 0, 0),
                     Vec::new(),
                 ),
             ],
             _ => vec![
                 AlleleObservation::new(
                     vec![r],
-                    AlleleSupportStats::new(15, -25.0, 7, 2, 1),
+                    AlleleSupportStats::new(15, -25.0, 7, 2, 1, 0, 0),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
                     vec![r, b'G', b'T'],
-                    AlleleSupportStats::new(6, -9.0, 3, 1, 0),
+                    AlleleSupportStats::new(6, -9.0, 3, 1, 0, 0, 0),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
                     vec![bases[(i + 1) & 3]],
-                    AlleleSupportStats::new(3, -5.0, 1, 0, 0),
+                    AlleleSupportStats::new(3, -5.0, 1, 0, 0, 0, 0),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
                     vec![r, b'A', b'C', b'G', b'T', b'A', b'C', b'G', b'T', b'N'],
-                    AlleleSupportStats::new(2, -4.0, 1, 0, 0),
+                    AlleleSupportStats::new(2, -4.0, 1, 0, 0, 0, 0),
                     Vec::new(),
                 ),
             ],

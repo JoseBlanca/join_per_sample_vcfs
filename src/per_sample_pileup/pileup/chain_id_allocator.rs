@@ -397,8 +397,9 @@ mod tests {
             qname: Arc::from(qname),
             mate_role,
             adaptor_boundary: None,
-        }
+                    mapq: 60,
     }
+}
 
     #[test]
     fn solo_read_allocates_a_fresh_id_starting_at_zero() {

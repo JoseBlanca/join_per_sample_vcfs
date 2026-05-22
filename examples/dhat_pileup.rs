@@ -94,6 +94,8 @@ fn build_reads(read_len: u32, span: u32, coverage: u32) -> Vec<PreparedRead> {
             qname: Arc::from(format!("r{i}").as_str()),
             mate_role: MateRole::Solo,
             adaptor_boundary: None,
+        
+            mapq: 60,
         });
     }
     reads.sort_by_key(|r| r.alignment_start);

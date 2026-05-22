@@ -764,12 +764,15 @@ pub(super) fn process_position(
             apply_events_to_ref_into(allele_seq_buf, rec_pos, &alleles[0].seq, &window_events);
             let bq = ln_bq_for_read(&window_events, contrib.bq_baq_at_walker_pos);
             let ln_q = bq.max(contrib.mq_log_err);
+            let mapq = u32::from(contrib.mapq);
             let new_contribution = AlleleSupportStats {
                 num_obs: 1,
                 q_sum: ln_q,
                 fwd: u32::from(!contrib.is_reverse_strand),
                 placed_left: u32::from(contrib.alignment_start < rec_pos),
                 placed_start: u32::from(contrib.alignment_start == rec_pos),
+                mapq_sum: mapq,
+                mapq_sum_sq: (mapq as u64) * (mapq as u64),
             };
 
             // Subtract any prior contribution this read had to
@@ -843,6 +846,8 @@ fn add_contribution(support: &mut AlleleSupportStats, c: &AlleleSupportStats) {
     support.fwd += c.fwd;
     support.placed_left += c.placed_left;
     support.placed_start += c.placed_start;
+    support.mapq_sum += c.mapq_sum;
+    support.mapq_sum_sq += c.mapq_sum_sq;
 }
 
 fn subtract_contribution(support: &mut AlleleSupportStats, c: &AlleleSupportStats) {
@@ -881,11 +886,25 @@ fn subtract_contribution(support: &mut AlleleSupportStats, c: &AlleleSupportStat
         support.placed_start,
         c.placed_start,
     );
+    debug_assert!(
+        support.mapq_sum >= c.mapq_sum,
+        "subtract_contribution underflow on mapq_sum: {} -= {}",
+        support.mapq_sum,
+        c.mapq_sum,
+    );
+    debug_assert!(
+        support.mapq_sum_sq >= c.mapq_sum_sq,
+        "subtract_contribution underflow on mapq_sum_sq: {} -= {}",
+        support.mapq_sum_sq,
+        c.mapq_sum_sq,
+    );
     support.num_obs = support.num_obs.saturating_sub(c.num_obs);
     support.q_sum -= c.q_sum;
     support.fwd = support.fwd.saturating_sub(c.fwd);
     support.placed_left = support.placed_left.saturating_sub(c.placed_left);
     support.placed_start = support.placed_start.saturating_sub(c.placed_start);
+    support.mapq_sum = support.mapq_sum.saturating_sub(c.mapq_sum);
+    support.mapq_sum_sq = support.mapq_sum_sq.saturating_sub(c.mapq_sum_sq);
 }
 
 /// Per-read BQ for an allele's quality contribution: min over
@@ -958,6 +977,10 @@ pub(super) struct ReadContribution {
     /// returns no events — a clean REF read).
     pub bq_baq_at_walker_pos: u8,
     pub mq_log_err: f64,
+    /// Raw BAM MAPQ for this contributor, forwarded from
+    /// [`PreparedRead::mapq`] so the fold can accumulate
+    /// `mapq_sum` / `mapq_sum_sq` on the chosen allele bucket.
+    pub mapq: u8,
     pub is_reverse_strand: bool,
     pub alignment_start: u32,
     /// SAM-flag-derived mate role. Carries through from
@@ -1262,6 +1285,8 @@ mod tests {
             fwd: 1,
             placed_left: 0,
             placed_start: 0,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         };
         let c = AlleleSupportStats {
             num_obs: 5,
@@ -1269,6 +1294,8 @@ mod tests {
             fwd: 0,
             placed_left: 0,
             placed_start: 0,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         };
         subtract_contribution(&mut s, &c);
     }
@@ -1282,6 +1309,8 @@ mod tests {
             fwd: 1,
             placed_left: 0,
             placed_start: 1,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         };
         let c = AlleleSupportStats {
             num_obs: 5,
@@ -1289,6 +1318,8 @@ mod tests {
             fwd: 5,
             placed_left: 5,
             placed_start: 5,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         };
         subtract_contribution(&mut s, &c);
         assert_eq!(s.num_obs, 0);
@@ -1311,6 +1342,8 @@ mod tests {
             fwd: 4,
             placed_left: 2,
             placed_start: 1,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         };
         let c = AlleleSupportStats {
             num_obs: 1,
@@ -1318,6 +1351,8 @@ mod tests {
             fwd: 1,
             placed_left: 0,
             placed_start: 0,
+            mapq_sum: 0,
+            mapq_sum_sq: 0,
         };
         let snapshot = bucket;
         add_contribution(&mut bucket, &c);

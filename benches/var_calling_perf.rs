@@ -87,7 +87,7 @@ fn shared_fetcher(seq: Vec<u8>, base_offset: u32) -> SharedRefFetcher {
 }
 
 fn support(num_obs: u32, q_sum: f64) -> AlleleSupportStats {
-    AlleleSupportStats::new(num_obs, q_sum, num_obs / 2, num_obs / 4, num_obs / 8)
+    AlleleSupportStats::new(num_obs, q_sum, num_obs / 2, num_obs / 4, num_obs / 8, 0, 0)
 }
 
 fn ref_obs(ref_base: u8, num_obs: u32) -> AlleleObservation {

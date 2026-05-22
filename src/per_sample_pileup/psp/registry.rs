@@ -191,6 +191,8 @@ pub enum ColumnKey {
     AlleleFwdCount,
     AllelePlacedLeftCount,
     AllelePlacedStartCount,
+    AlleleMapqSum,
+    AlleleMapqSumSq,
     AlleleChainIds,
 }
 
@@ -424,6 +426,36 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
         finite_constraint: false,
         description: "Reads whose 5' end is the record's position \
             (freebayes' placedStart).",
+    },
+    ColumnDef {
+        tag: 0x15,
+        key: ColumnKey::AlleleMapqSum,
+        name: "allele-mapq-sum",
+        cardinality: Cardinality::PerAllele,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
+        required: true,
+        finite_constraint: false,
+        description: "Σ mapping quality over reads supporting this \
+            allele. Combined with allele-obs-count this gives the \
+            mean MAPQ; combined with allele-mapq-sum-sq it gives the \
+            sample variance for the Welch's t multi-mapper filter.",
+    },
+    ColumnDef {
+        tag: 0x16,
+        key: ColumnKey::AlleleMapqSumSq,
+        name: "allele-mapq-sum-sq",
+        cardinality: Cardinality::PerAllele,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U64,
+        },
+        required: true,
+        finite_constraint: false,
+        description: "Σ mapq² over reads supporting this allele. With \
+            allele-mapq-sum and allele-obs-count, computes sample \
+            variance: var = (sum_sq − sum²/n)/(n − 1). u64 to allow \
+            extreme-depth amplicons without overflow.",
     },
     ColumnDef {
         tag: 0x22,

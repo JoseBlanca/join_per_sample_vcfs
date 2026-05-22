@@ -228,6 +228,11 @@ pub struct PreparedRead {
     /// `ln(P_err)` derived from MAPQ once at filter time. Cached
     /// because every event-folding step uses it.
     pub mq_log_err: f64,
+    /// Raw BAM mapping quality, preserved alongside `mq_log_err` so
+    /// per-allele `mapq_sum` / `mapq_sum_sq` can be accumulated in
+    /// the pileup fold. Reads that pass `--min-mapq` carry their
+    /// original Phred MAPQ here (BWA-MEM caps at 60 in practice).
+    pub mapq: u8,
     pub is_reverse_strand: bool,
     pub qname: Arc<str>,
     /// SAM-flag-derived mate role. Collapses the SAM `0x1` (paired)
@@ -358,6 +363,14 @@ pub struct AlleleSupportStats {
     /// Reads whose mapped 5′ end *is* this record's anchor
     /// position (freebayes' `placedStart`).
     pub placed_start: u32,
+    /// Σ mapping quality over supporting reads. Combined with
+    /// `num_obs` this yields the mean MAPQ of the allele; with
+    /// `mapq_sum_sq` it yields the sample variance and Welch's t.
+    pub mapq_sum: u32,
+    /// Σ mapq² over supporting reads. With `mapq_sum` and `num_obs`
+    /// this gives the sample variance via the identity
+    /// `var = (mapq_sum_sq − mapq_sum² / num_obs) / (num_obs − 1)`.
+    pub mapq_sum_sq: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -463,13 +476,24 @@ impl AlleleObservation {
 impl AlleleSupportStats {
     /// Constructor for external code (benches, integration tests).
     /// See [`PileupRecord::new`].
-    pub fn new(num_obs: u32, q_sum: f64, fwd: u32, placed_left: u32, placed_start: u32) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        num_obs: u32,
+        q_sum: f64,
+        fwd: u32,
+        placed_left: u32,
+        placed_start: u32,
+        mapq_sum: u32,
+        mapq_sum_sq: u64,
+    ) -> Self {
         Self {
             num_obs,
             q_sum,
             fwd,
             placed_left,
             placed_start,
+            mapq_sum,
+            mapq_sum_sq,
         }
     }
 }

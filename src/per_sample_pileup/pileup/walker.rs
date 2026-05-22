@@ -404,6 +404,7 @@ impl WalkerState {
                 events_at_pos,
                 bq_baq_at_walker_pos: bq_at_walker,
                 mq_log_err: active_read.read.mq_log_err,
+                mapq: active_read.read.mapq,
                 is_reverse_strand: active_read.read.is_reverse_strand,
                 alignment_start: active_read.read.alignment_start,
                 mate_role: active_read.read.mate_role,
@@ -893,6 +894,7 @@ mod tests {
             events_at_pos: events,
             bq_baq_at_walker_pos: bq,
             mq_log_err: -3.0,
+            mapq: 60,
             is_reverse_strand: false,
             alignment_start,
             mate_role: if is_first_mate {

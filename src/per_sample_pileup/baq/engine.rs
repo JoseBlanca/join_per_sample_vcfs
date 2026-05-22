@@ -399,6 +399,7 @@ fn mapped_to_prepared(read: MappedRead, chrom_id: u32, bq_baq: Vec<u8>) -> Prepa
     let mate_role = derive_mate_role(read.flag);
     let is_reverse_strand = read.flag & FLAG_REVERSE_STRAND != 0;
     let mq_log_err = phred_to_ln_perr(read.mapq);
+    let mapq = read.mapq;
     PreparedRead {
         chrom_id,
         alignment_start,
@@ -407,6 +408,7 @@ fn mapped_to_prepared(read: MappedRead, chrom_id: u32, bq_baq: Vec<u8>) -> Prepa
         seq: read.seq,
         bq_baq,
         mq_log_err,
+        mapq,
         is_reverse_strand,
         qname,
         mate_role,

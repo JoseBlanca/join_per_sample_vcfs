@@ -87,6 +87,7 @@ pub fn snp_read(qname: &str, alignment_start: u32, seq: &[u8], qual: &[u8]) -> P
         seq: seq.to_vec(),
         bq_baq: qual.to_vec(),
         mq_log_err: -3.0,
+        mapq: 60,
         is_reverse_strand: false,
         qname: Arc::from(qname),
         mate_role: MateRole::Solo,
@@ -196,6 +197,8 @@ fn deletion_record_has_extended_ref_span() {
         qname: Arc::from("r1"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let records = drive_walker(vec![r], fa);
     let anchor = records
@@ -238,6 +241,8 @@ fn deletion_record_does_not_double_count_ref_reads() {
         qname: Arc::from("r1"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let r2 = PreparedRead {
         chrom_id: 0,
@@ -251,6 +256,8 @@ fn deletion_record_does_not_double_count_ref_reads() {
         qname: Arc::from("r2"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let records = drive_walker(vec![r1, r2], fa);
     let anchor = records
@@ -321,6 +328,8 @@ fn refold_after_widen_clears_chain_id_from_old_bucket() {
         qname: Arc::from("r0"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let r1 = PreparedRead {
         chrom_id: 0,
@@ -334,6 +343,8 @@ fn refold_after_widen_clears_chain_id_from_old_bucket() {
         qname: Arc::from("r1"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let r3 = PreparedRead {
         chrom_id: 0,
@@ -347,6 +358,8 @@ fn refold_after_widen_clears_chain_id_from_old_bucket() {
         qname: Arc::from("r3"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let records = drive_walker(vec![r0, r1, r3], fa);
     let anchor = records
@@ -389,6 +402,8 @@ fn insertion_record_has_alt_longer_than_ref() {
         qname: Arc::from("r1"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let records = drive_walker(vec![r], fa);
     let anchor = records.iter().find(|r| r.pos == 1).expect("anchor at 1");
@@ -538,6 +553,8 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
         qname: Arc::from("p"),
         mate_role: MateRole::FirstOfPair,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let m_second = PreparedRead {
         chrom_id: 0,
@@ -551,6 +568,8 @@ fn mate_overlap_bq_tie_prefers_first_mate_not_earlier_position() {
         qname: Arc::from("p"),
         mate_role: MateRole::SecondOfPair,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     // First-mate appears AFTER the second mate in the input stream,
     // even though both have alignment_start = 1, to make sure the
@@ -627,6 +646,8 @@ fn mate_overlap_agree_keeper_carries_summed_bq() {
             MateRole::SecondOfPair
         },
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let m1 = make(true, 20);
     let m2 = make(false, 20);
@@ -667,6 +688,8 @@ fn mate_overlap_agree_combined_bq_caps_at_200() {
             MateRole::SecondOfPair
         },
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let m1 = make(true, 150);
     let m2 = make(false, 100);
@@ -702,6 +725,8 @@ fn mate_overlap_disagree_winner_bq_scaled_by_0_8() {
             MateRole::SecondOfPair
         },
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     // Mate 1 has REF "A" with higher BQ → winner. Mate 2 has SNP
     // "G" with lower BQ → loser, zeroed.
@@ -783,6 +808,8 @@ fn paired_mate_indel_overlap_yields_single_observation() {
         qname: Arc::from("p"),
         mate_role: MateRole::FirstOfPair,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let mut mate_b = mate_a.clone();
     mate_b.mate_role = MateRole::SecondOfPair;
@@ -1082,6 +1109,8 @@ fn column_depth_cap_uses_indel_cap_when_any_indel_event_present() {
         qname: Arc::from("indel"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     reads.push(indel);
 
@@ -1202,6 +1231,8 @@ fn zero_ref_span_input_is_a_hard_error() {
         qname: Arc::from("zero"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let err = first_walker_error(vec![r], fa);
     assert!(
@@ -1232,6 +1263,8 @@ fn open_record_widening_past_max_record_span_errors() {
         qname: Arc::from("wide"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let err = first_walker_error(vec![r], fa);
     match err {
@@ -1262,6 +1295,8 @@ fn admit_rejects_seq_shorter_than_cigar_consumes() {
         qname: Arc::from("short"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let err = first_walker_error(vec![r], fa);
     match err {
@@ -1290,6 +1325,8 @@ fn admit_rejects_seq_bq_length_mismatch() {
         qname: Arc::from("bq_short"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let err = first_walker_error(vec![r], fa);
     match err {
@@ -1321,6 +1358,8 @@ fn admit_rejects_cigar_consuming_more_read_bases_than_seq_provides() {
         qname: Arc::from("cigar_long"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     let err = first_walker_error(vec![r], fa);
     match err {
@@ -1411,6 +1450,8 @@ fn prepared_read_length_with_insertion_includes_inserted_bases() {
         qname: Arc::from("r"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     assert_eq!(r.length(), Ok(5));
 }
@@ -1430,6 +1471,8 @@ fn prepared_read_length_with_deletion_excludes_deleted_bases() {
         qname: Arc::from("r"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     assert_eq!(r.length(), Ok(4));
 }
@@ -1462,6 +1505,8 @@ fn prepared_read_length_cigar_seq_mismatch_returns_typed_error() {
         qname: Arc::from("r"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     assert_eq!(
         r.length(),
@@ -1488,6 +1533,8 @@ fn prepared_read_length_checks_seq_bq_before_cigar() {
         qname: Arc::from("r"),
         mate_role: MateRole::Solo,
         adaptor_boundary: None,
+    
+        mapq: 60,
     };
     assert!(matches!(
         r.length(),
