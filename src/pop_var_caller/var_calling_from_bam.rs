@@ -388,7 +388,6 @@ fn run_cohort_pipeline_for_single_sample(
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        fetcher,
         chromosomes,
         min_qual_phred,
         min_alt_obs_per_sample,
@@ -398,6 +397,7 @@ fn run_cohort_pipeline_for_single_sample(
     let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
         merger,
         pipeline_params,
+        fetcher,
         output,
         metadata,
         writer_cfg,

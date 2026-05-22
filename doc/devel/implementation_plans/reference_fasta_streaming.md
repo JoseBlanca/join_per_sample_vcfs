@@ -123,9 +123,32 @@ review surface are both smaller this way.
   fetches — Phase A just stops doing it at startup.
 - Dropping the `noodles_fasta::Repository` runtime dependency.
 
-### Phase B — Evicting `Sync` fetcher (steady-state)
+### Phase B — Per-worker fetcher (steady-state)
 
-**In scope:**
+> **Design note added during implementation:** the plan originally
+> described a single `ChromLeaseSyncRefFetcher` shared across
+> workers via `Arc`, with per-`chrom_id` `Mutex<Slot>` and RAII
+> `ChromLease`. The user pointed out that since each worker only
+> touches its own chrom, the shared-Arc shape was unnecessary
+> machinery — per-thread fetchers with no shared state are simpler
+> and have zero possibility of cross-thread interference. The
+> shipped Phase B uses `SingleChromRefFetcher` (one chrom, owned
+> outright by the worker, no Mutex, no Arc-sharing). The plan
+> below is preserved as written; the **shipped shape** is documented
+> at the top of [src/per_sample_pileup/ref_fetcher.rs](../../src/per_sample_pileup/ref_fetcher.rs).
+
+**In scope (as shipped):**
+
+- New `SingleChromRefFetcher` in
+  [src/per_sample_pileup/ref_fetcher.rs](../../src/per_sample_pileup/ref_fetcher.rs)
+  alongside the existing two fetchers. Implements
+  [`RefSeqFetcher`](../../src/per_sample_pileup/pileup/mod.rs).
+  Bound to **one** `chrom_id` at construction; owns the contig's
+  uppercased `Vec<u8>` outright; `fetch` calls for any other
+  chrom_id are rejected with `InvalidInput`. No shared cache, no
+  Mutex, no lease.
+
+**In scope (original plan — superseded; kept for context):**
 
 - New `ChromLeaseSyncRefFetcher` (working name) in
   [src/per_sample_pileup/ref_fetcher.rs](../../src/per_sample_pileup/ref_fetcher.rs)

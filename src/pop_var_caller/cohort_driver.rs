@@ -14,8 +14,11 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
+use crate::per_sample_pileup::ref_fetcher::SingleChromRefFetcher;
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::var_calling::dust_filter::{DustFilter, DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
@@ -111,15 +114,23 @@ pub struct CohortDriveStats {
     pub records_dropped_low_mapq_diff_t: u64,
 }
 
-/// Bundle of per-stage configs + shared resources consumed by
+/// Bundle of per-stage configs consumed by
 /// [`drive_cohort_pipeline`]. Constructed by the caller; consumed
 /// (by-value) when the driver runs.
 ///
+/// The reference fetcher is **not** part of this struct — it's a
+/// separate parameter to `drive_cohort_pipeline`. That split lets
+/// the cohort `var-calling` path build a fresh per-chrom fetcher
+/// inside each worker (no shared state) while `var-calling-from-bam`
+/// keeps its single sample-wide `SyncRefFetcher`. Both paths pass
+/// the same per-stage configs in `CohortPipelineParams` and select
+/// the fetcher independently.
+///
 /// `Clone` is derived because the per-chromosome parallel path in
-/// [`run_var_calling`](super::var_calling::run_var_calling) builds
-/// one parameter set per chromosome from a shared template. Every
-/// field is cheap-Clone — the configs are `Copy` or wrap a small
-/// `Vec`; `fetcher` is an `Arc`; `chromosomes` is a `Vec<ParsedChromosome>`.
+/// [`run_var_calling`](super::var_calling::run_var_calling) clones
+/// one parameter set per worker from a shared template. Every field
+/// is cheap-Clone — the configs are `Copy` or wrap a small `Vec`;
+/// `chromosomes` is a `Vec<ParsedChromosome>`.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct CohortPipelineParams {
@@ -130,11 +141,6 @@ pub struct CohortPipelineParams {
     pub grouper_cfg: GrouperConfig,
     pub per_group_cfg: PerGroupMergerConfig,
     pub posterior_cfg: PosteriorEngineConfig,
-    /// Reference fetcher shared between DUST and the per-group
-    /// merger. The driver borrows from it for DUST and clones it for
-    /// the per-group merger — both ends see the same underlying
-    /// `Arc<dyn RefSeqFetcher>`.
-    pub fetcher: SharedRefFetcher,
     /// Chromosomes table — consumed by DUST when the filter is on
     /// (no use otherwise).
     pub chromosomes: Vec<ParsedChromosome>,
@@ -199,6 +205,7 @@ pub const MAPQ_FILTER_MIN_READS_PER_SIDE: u32 = 3;
 pub fn drive_cohort_pipeline<M, E>(
     merger: M,
     params: CohortPipelineParams,
+    fetcher: SharedRefFetcher,
     output: &Path,
     metadata: CohortMetadata,
     writer_cfg: WriterConfig,
@@ -217,7 +224,6 @@ where
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        fetcher,
         chromosomes,
         min_qual_phred,
         min_alt_obs_per_sample,
@@ -425,6 +431,12 @@ fn pool_allele_mapq(
 /// [`drive_cohort_pipeline`] uses; the per-chrom orchestrator
 /// collects worker results and returns the first error after every
 /// worker has joined.
+///
+/// `fasta_path` is the path to the reference FASTA. This function
+/// constructs a [`SingleChromRefFetcher`] bound to `chrom_id` from
+/// it — each worker owns its fetcher outright (no shared state).
+/// When the function returns, the fetcher drops and the contig's
+/// bytes are freed.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)] // shared template + per-worker inputs; bundling adds indirection without clarity gain
 pub fn process_one_chromosome<E>(
@@ -436,6 +448,7 @@ pub fn process_one_chromosome<E>(
     metadata: CohortMetadata,
     writer_cfg_template: WriterConfig,
     pipeline_params: CohortPipelineParams,
+    fasta_path: &Path,
 ) -> Result<(u32, CohortDriveStats), E>
 where
     E: From<std::io::Error>
@@ -447,10 +460,23 @@ where
         + From<PosteriorEngineError>
         + From<VcfWriteError>,
 {
-    let chrom_length = all_chromosomes
+    let chrom_entry = all_chromosomes
         .get(chrom_id as usize)
-        .map(|c| c.length)
         .expect("chrom_id past contig table — caller (run_var_calling) must validate the bound");
+    let chrom_length = chrom_entry.length;
+
+    // Build the per-worker reference fetcher. Each worker constructs
+    // its own — no Arc shared across threads, no Mutex, no lease.
+    // The fetcher reads its bound contig from disk in `new` (each
+    // worker opens its own indexed reader on the same FASTA, which
+    // noodles supports for read-only access). When this function
+    // returns, the fetcher drops and the contig bytes are freed.
+    let fetcher_concrete =
+        SingleChromRefFetcher::new(fasta_path, chrom_id, chrom_entry.name.clone())?;
+    // Wrap in Arc<dyn> for the DustFilter + PerGroupMerger trait-
+    // object alias. Refcount stays at 1–2 per worker; never crosses
+    // worker boundaries.
+    let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
 
     // Open one PspReader per sample. Per-worker ownership: no
     // cross-thread coordination on the read side.
@@ -482,6 +508,7 @@ where
     let stats = drive_cohort_pipeline::<_, E>(
         merger,
         pipeline_params,
+        fetcher,
         &fragment_path,
         metadata,
         writer_cfg,

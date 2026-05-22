@@ -26,7 +26,6 @@
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clap::Args;
 use rayon::prelude::*;
@@ -34,7 +33,6 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
-use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::cohort_driver::{
     CohortDriveStats, CohortPipelineParams, process_one_chromosome,
 };
@@ -48,7 +46,7 @@ use crate::pop_var_caller::contamination_artefact::{
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
-    DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
+    DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError,
 };
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 use crate::var_calling::posterior_engine::{
@@ -227,8 +225,10 @@ pub enum VarCallingCliError {
 /// 7. Verify the FASTA's per-contig bytes against the `.psp`
 ///    per-contig MD5s by streaming each contig through `Md5::update`
 ///    in parallel — peak memory is one 64 KiB window per worker, no
-///    contig-sized allocations. Then build the runtime
-///    [`SyncRefFetcher`] (used by DUST + per-group merger).
+///    contig-sized allocations. No process-wide reference fetcher
+///    is built — each per-chrom worker constructs its own
+///    `SingleChromRefFetcher` inside
+///    [`process_one_chromosome`](crate::pop_var_caller::cohort_driver::process_one_chromosome).
 /// 8. Cohort metadata + writer-config template.
 /// 9. Per-chromosome parallel partition: one worker per contig,
 ///    each writes a complete VCF fragment to a scratch TempDir
@@ -333,14 +333,14 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         }
     }
 
-    // 7b. Runtime fetcher (shared between DUST + per-group merger).
-    //     The .psp header's chrom table is the source of truth. The
-    //     cache is empty at this point — verify above no longer
-    //     pre-warms it; the first per-chrom worker fetch populates
-    //     its own slot.
-    let fetcher_concrete = SyncRefFetcher::new(&args.reference, contigs_from_parsed(&chromosomes))
-        .map_err(VarCallingCliError::Io)?;
-    let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
+    // 7b. No global fetcher is built here. Phase B's per-worker
+    //     design has each per-chrom worker construct its own
+    //     `SingleChromRefFetcher` inside `process_one_chromosome` —
+    //     no Arc shared across threads, no Mutex, no lease. The
+    //     contig's bytes live exactly for the worker's lifetime;
+    //     peak resident during the `par_iter` below is
+    //     `min(threads, n_chroms) × max_chrom_size`, not
+    //     `Σ contig.length`.
 
     // 8. Cohort metadata for the writer header + the writer-config
     //    template inherited by every per-chrom fragment writer.
@@ -378,15 +378,16 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         .collect();
 
     // 10. Drive per-chrom workers in parallel. CohortPipelineParams
-    //     is Clone so each worker takes its own params instance; the
-    //     fetcher's Arc::clone inside is one atomic per worker.
+    //     is Clone so each worker takes its own params instance. The
+    //     fetcher is *not* in params — each worker builds its own
+    //     `SingleChromRefFetcher` from `args.reference` inside
+    //     `process_one_chromosome` (Phase B).
     let pipeline_params = CohortPipelineParams {
         no_complexity_filter: args.no_complexity_filter,
         dust_cfg,
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        fetcher,
         chromosomes: chromosomes.clone(),
         min_qual_phred: args.cohort.min_qual_phred,
         min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
@@ -406,6 +407,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
                 metadata.clone(),
                 writer_cfg_template.clone(),
                 pipeline_params.clone(),
+                &args.reference,
             )
         })
         .collect();
@@ -454,51 +456,6 @@ fn load_contamination(
     let artefact = ContaminationArtefact::read(path)?;
     let refs: Vec<&str> = sample_names.iter().map(String::as_str).collect();
     Ok(Some(artefact.to_estimates_for_samples(&refs)?))
-}
-
-/// Convert the merger's chromosome table into the `ContigList` the
-/// [`SyncRefFetcher`] constructor expects. `ContigList` lives in the
-/// CRAM input module — we re-shape the .psp `ParsedChromosome` into
-/// it. Md5 round-trips through hex when present.
-pub(crate) fn contigs_from_parsed(
-    chromosomes: &[crate::per_sample_pileup::psp::header::ParsedChromosome],
-) -> crate::per_sample_pileup::cram_input::ContigList {
-    use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
-    let entries = chromosomes
-        .iter()
-        .map(|c| ContigEntry {
-            name: c.name.clone(),
-            length: c.length as u64,
-            md5: md5_hex_to_bytes(&c.md5),
-        })
-        .collect();
-    ContigList { entries }
-}
-
-/// Hex (32-char lowercase) → 16-byte MD5. Returns `None` when the
-/// .psp header carried no md5 string (empty); the .psp writer
-/// hard-errors on missing md5 so this branch should not trigger in
-/// production, but the conversion is defensive.
-fn md5_hex_to_bytes(hex: &str) -> Option<[u8; 16]> {
-    if hex.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let high = hex_digit(hex.as_bytes()[i * 2])?;
-        let low = hex_digit(hex.as_bytes()[i * 2 + 1])?;
-        *byte = (high << 4) | low;
-    }
-    Some(out)
-}
-
-fn hex_digit(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Print the one-shot stderr run summary.
@@ -590,32 +547,6 @@ fn print_run_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn md5_hex_round_trips() {
-        let bytes = [
-            0x6a, 0xef, 0x89, 0x7c, 0x3d, 0x6f, 0xf0, 0xc7, 0x8a, 0xff, 0x06, 0xac, 0x18, 0x91,
-            0x78, 0xdd,
-        ];
-        let hex = "6aef897c3d6ff0c78aff06ac189178dd";
-        assert_eq!(md5_hex_to_bytes(hex), Some(bytes));
-    }
-
-    #[test]
-    fn md5_hex_rejects_wrong_length() {
-        assert_eq!(md5_hex_to_bytes(""), None);
-        assert_eq!(md5_hex_to_bytes("6aef"), None);
-        assert_eq!(md5_hex_to_bytes(&"a".repeat(33)), None);
-    }
-
-    #[test]
-    fn md5_hex_rejects_non_hex() {
-        assert_eq!(md5_hex_to_bytes("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"), None);
-        // 31 valid + 1 invalid.
-        let mut bad = "6aef897c3d6ff0c78aff06ac189178d".to_string();
-        bad.push('Z');
-        assert_eq!(md5_hex_to_bytes(&bad), None);
-    }
 
     #[test]
     fn load_contamination_returns_none_without_path() {
