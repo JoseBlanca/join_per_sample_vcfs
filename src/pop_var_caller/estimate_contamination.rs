@@ -28,7 +28,6 @@ use thiserror::Error;
 use toml::value::Datetime;
 
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
-use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
 use crate::pop_var_caller::common::{
@@ -39,7 +38,6 @@ use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
 };
-use crate::pop_var_caller::var_calling::contigs_from_parsed;
 use crate::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, DEFAULT_BLOCK_SIZE, DEFAULT_C_S_INIT,
@@ -382,13 +380,11 @@ pub fn run_estimate_contamination(
     // The .psp readers' chromosome tables must agree across the
     // cohort before we can MD5-verify them as a single batch.
     let chromosomes = check_chromosome_agreement(&readers)?;
-    // The side-pass itself does not need the FASTA bytes; the
-    // SyncRefFetcher exists solely to drive the MD5 verification
-    // and is dropped immediately afterwards so the in-memory
-    // contig cache does not occupy the process for the side-pass.
-    let verify_fetcher = SyncRefFetcher::new(&args.reference, contigs_from_parsed(&chromosomes))
-        .map_err(EstimateContaminationCliError::Io)?;
-    match verify_fasta_matches_psp_chromosomes(&verify_fetcher, &chromosomes) {
+    // The side-pass itself does not need the FASTA bytes; cross-check
+    // the per-contig MD5s by streaming each contig through `Md5::update`
+    // in parallel — peak memory is one 64 KiB window per worker, no
+    // fetcher cache built (Phase A of reference_fasta_streaming).
+    match verify_fasta_matches_psp_chromosomes(&args.reference, &chromosomes) {
         Ok(()) => {}
         Err(FastaVerifyError::Md5Mismatch {
             contig,
@@ -405,7 +401,6 @@ pub fn run_estimate_contamination(
             return Err(EstimateContaminationCliError::FastaContigFetchFailed { contig, source });
         }
     }
-    drop(verify_fetcher);
 
     // 4. Batch assignment.
     let batches = match &args.batch_assignment {

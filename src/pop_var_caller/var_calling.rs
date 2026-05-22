@@ -224,8 +224,11 @@ pub enum VarCallingCliError {
 /// 5. Load `--contamination-estimates` if supplied and reconcile
 ///    sample names; absence → `c_s = 0` for every sample.
 /// 6. Build + validate every per-stage config from the CLI args.
-/// 7. Build the [`SyncRefFetcher`] and verify its bytes against the
-///    `.psp` per-contig MD5s (warms the cache as a side-effect).
+/// 7. Verify the FASTA's per-contig bytes against the `.psp`
+///    per-contig MD5s by streaming each contig through `Md5::update`
+///    in parallel — peak memory is one 64 KiB window per worker, no
+///    contig-sized allocations. Then build the runtime
+///    [`SyncRefFetcher`] (used by DUST + per-group merger).
 /// 8. Cohort metadata + writer-config template.
 /// 9. Per-chromosome parallel partition: one worker per contig,
 ///    each writes a complete VCF fragment to a scratch TempDir
@@ -305,15 +308,14 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
             &sample_names,
         )?)?;
 
-    // 7. Build the reference fetcher (shared between DUST + per-group
-    //    merger). The .psp header's chrom table is the source of truth.
-    let fetcher_concrete = SyncRefFetcher::new(&args.reference, contigs_from_parsed(&chromosomes))
-        .map_err(VarCallingCliError::Io)?;
-
-    // 7a. Cross-check FASTA bytes against the .psp per-contig MD5s.
-    //     Catches "right basename, wrong genome build". Warms the
-    //     SyncRefFetcher's in-memory cache as a side-effect.
-    match verify_fasta_matches_psp_chromosomes(&fetcher_concrete, &chromosomes) {
+    // 7a. Cross-check FASTA bytes against the .psp per-contig MD5s
+    //     *before* building the runtime fetcher. Catches "right
+    //     basename, wrong genome build". Streams each contig through
+    //     `Md5::update` in 64 KiB windows, per-chrom in parallel —
+    //     peak resident is one window per worker, zero contig-sized
+    //     allocations. No fetcher cache pre-warm (Phase A of
+    //     reference_fasta_streaming).
+    match verify_fasta_matches_psp_chromosomes(&args.reference, &chromosomes) {
         Ok(()) => {}
         Err(FastaVerifyError::Md5Mismatch {
             contig,
@@ -331,6 +333,13 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         }
     }
 
+    // 7b. Runtime fetcher (shared between DUST + per-group merger).
+    //     The .psp header's chrom table is the source of truth. The
+    //     cache is empty at this point — verify above no longer
+    //     pre-warms it; the first per-chrom worker fetch populates
+    //     its own slot.
+    let fetcher_concrete = SyncRefFetcher::new(&args.reference, contigs_from_parsed(&chromosomes))
+        .map_err(VarCallingCliError::Io)?;
     let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
 
     // 8. Cohort metadata for the writer header + the writer-config
@@ -341,8 +350,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line: current_command_line(),
     };
-    let writer_cfg_template =
-        WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
+    let writer_cfg_template = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
 
     // 9. Per-chromosome fragment paths under a TempDir placed
     //    *next to* the final output (so the concat's atomic rename
@@ -425,12 +433,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // frags_dir RAII-drops the scratch TempDir + fragments here.
 
     // 11. Stderr summary.
-    print_run_summary(
-        &sample_names,
-        total_stats,
-        args.threads,
-        chromosomes.len(),
-    );
+    print_run_summary(&sample_names, total_stats, args.threads, chromosomes.len());
     Ok(())
 }
 

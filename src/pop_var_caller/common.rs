@@ -16,14 +16,23 @@
 //! any downstream consumer needing them).
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use md5::{Digest, Md5};
+use noodles_fasta::fai;
+use rayon::prelude::*;
 
-use crate::per_sample_pileup::pileup::RefSeqFetcher;
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
+
+/// Window size used by [`compute_contig_md5_streaming`]. Bigger than
+/// the page (4 KiB) so each `read` syscall amortises across many
+/// kernel-side bytes; small enough that the buffer sits on the worker
+/// stack instead of the heap.
+const FASTA_MD5_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Buffered-I/O capacity used by every `BufReader::with_capacity` /
 /// `BufWriter::with_capacity` in the cohort CLI's file I/O. 64 KiB
@@ -134,9 +143,9 @@ pub(crate) fn configure_rayon_pool(n: Option<usize>) -> Result<(), rayon::Thread
 /// Why [`verify_fasta_matches_psp_chromosomes`] rejected the
 /// supplied FASTA. **M5 follow-up** wraps two distinct failure
 /// modes — actual MD5 mismatch (FASTA had the contig but the
-/// bytes don't match) vs the fetcher failing on a contig
-/// (contig name missing from FASTA, or I/O failure). Both fail
-/// the cross-check but the user-facing remediation differs.
+/// bytes don't match) vs an I/O / lookup failure (contig name
+/// missing from the FASTA index, truncated FASTA, etc.). Both
+/// fail the cross-check but the user-facing remediation differs.
 #[derive(Debug)]
 pub(crate) enum FastaVerifyError {
     /// Contig is present in the FASTA but its uppercase-bases MD5
@@ -153,13 +162,14 @@ pub(crate) enum FastaVerifyError {
         /// from the producing CRAM's `@SQ M5`).
         psp_md5: String,
     },
-    /// The fetcher failed to read the contig from the FASTA (the
-    /// contig name is missing, or an I/O error occurred). Carries
-    /// the contig name + the inner `io::Error` for context.
-    FetchFailed {
-        contig: String,
-        source: std::io::Error,
-    },
+    /// Reading the contig's bases from the FASTA failed — the
+    /// contig name is missing from the `.fai`, the `.fai` itself is
+    /// unreadable, the FASTA ended before the declared number of
+    /// bases was consumed, or some other I/O error. Carries the
+    /// contig name + the inner `io::Error` for context. For the
+    /// `.fai` read failure, `contig` carries the literal placeholder
+    /// `"<reading .fai>"`.
+    FetchFailed { contig: String, source: io::Error },
 }
 
 /// Cross-check that each `.psp` header's per-contig MD5 matches the
@@ -171,40 +181,121 @@ pub(crate) enum FastaVerifyError {
 /// bytes" failure mode the project's "no silent intermediates"
 /// principle exists to prevent.
 ///
-/// Costs: each call fetches every contig's full bytes from the
-/// supplied FASTA via `fetcher.fetch(chrom_id, 1, length)`. On
-/// `SyncRefFetcher` the fetch populates the per-contig in-memory
-/// cache, so the bytes survive for the rest of the pipeline — this
-/// helper effectively pre-warms the cache while doing the MD5
-/// comparison. On a 24-chrom human reference that means
-/// ~3 GiB of resident memory (already the dominant memory user) +
-/// a few seconds of I/O at process startup; on the tiny
-/// integration-test fixtures the overhead is negligible.
+/// Streaming + parallel (Phase A of the
+/// [`reference_fasta_streaming`](../../../doc/devel/implementation_plans/reference_fasta_streaming.md)
+/// plan): each contig's bases are streamed through `Md5::update` in
+/// 64 KiB windows, so per-worker resident memory is one window — not
+/// one contig. Per-contig work runs in parallel under rayon's global
+/// pool; wall time becomes `max_chrom_size / min(threads, n_chroms)`,
+/// not the serial sum. The previous "warms the `SyncRefFetcher`
+/// cache as a side-effect" coupling is gone by design — this helper
+/// never allocates a contig-sized buffer and never touches the
+/// runtime fetcher's cache.
 pub(crate) fn verify_fasta_matches_psp_chromosomes(
-    fetcher: &impl RefSeqFetcher,
+    fasta_path: &Path,
     chromosomes: &[ParsedChromosome],
 ) -> Result<(), FastaVerifyError> {
-    for (chrom_id, contig) in chromosomes.iter().enumerate() {
-        // `fetch` uppercases on the way out, so the MD5 is taken
-        // over the canonical SAM-spec form (`A`/`C`/`G`/`T`/`N`)
-        // regardless of how the FASTA is masked on disk.
-        let bytes = fetcher
-            .fetch(chrom_id as u32, 1, contig.length)
-            .map_err(|source| FastaVerifyError::FetchFailed {
-                contig: contig.name.clone(),
-                source,
-            })?;
-        let digest: [u8; 16] = Md5::digest(&bytes).into();
-        let fasta_md5 = format_md5_hex(digest);
-        if fasta_md5 != contig.md5 {
-            return Err(FastaVerifyError::Md5Mismatch {
-                contig: contig.name.clone(),
-                fasta_md5,
-                psp_md5: contig.md5.clone(),
-            });
+    // .fai sits at "<fasta>.fai" by convention. Read it once on the
+    // caller thread; rayon workers below share it by reference.
+    let mut fai_pathbuf = fasta_path.as_os_str().to_os_string();
+    fai_pathbuf.push(".fai");
+    let fai_path = PathBuf::from(fai_pathbuf);
+    let index = fai::fs::read(&fai_path).map_err(|source| FastaVerifyError::FetchFailed {
+        contig: String::from("<reading .fai>"),
+        source,
+    })?;
+
+    chromosomes
+        .par_iter()
+        .try_for_each(|contig| -> Result<(), FastaVerifyError> {
+            let record = index
+                .as_ref()
+                .iter()
+                .find(|r| AsRef::<[u8]>::as_ref(r.name()) == contig.name.as_bytes())
+                .ok_or_else(|| FastaVerifyError::FetchFailed {
+                    contig: contig.name.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("contig {} not in FASTA index", contig.name),
+                    ),
+                })?;
+            let fasta_md5 =
+                compute_contig_md5_streaming(fasta_path, record.offset(), contig.length).map_err(
+                    |source| FastaVerifyError::FetchFailed {
+                        contig: contig.name.clone(),
+                        source,
+                    },
+                )?;
+            if fasta_md5 != contig.md5 {
+                return Err(FastaVerifyError::Md5Mismatch {
+                    contig: contig.name.clone(),
+                    fasta_md5,
+                    psp_md5: contig.md5.clone(),
+                });
+            }
+            Ok(())
+        })
+}
+
+/// Compute the MD5 of one contig's uppercase bases by streaming
+/// fixed-size windows from disk. Matches `Md5::digest(uppercase_bytes)`
+/// bit-for-bit; resident memory is one [`FASTA_MD5_BUFFER_SIZE`]
+/// window regardless of contig size.
+///
+/// `offset` is the byte position of the contig's first base in the
+/// FASTA (from the `.fai`). `expected_length` is the `.psp`-declared
+/// number of bases; the function consumes exactly that many bases,
+/// errors with [`io::ErrorKind::UnexpectedEof`] if the file ends
+/// first, and ignores any trailing bytes if the FASTA contains more.
+fn compute_contig_md5_streaming(
+    fasta_path: &Path,
+    offset: u64,
+    expected_length: u32,
+) -> io::Result<String> {
+    let mut file = File::open(fasta_path)?;
+    file.seek(SeekFrom::Start(offset))?;
+
+    let mut md5 = Md5::new();
+    let mut remaining: usize = expected_length as usize;
+    // Read buffer holds raw FASTA bytes (sequence + newlines); upper
+    // buffer holds the uppercased, newline-stripped slice fed to md5.
+    // Both stack-allocated.
+    let mut read_buf = [0u8; FASTA_MD5_BUFFER_SIZE];
+    let mut upper_buf = [0u8; FASTA_MD5_BUFFER_SIZE];
+
+    while remaining > 0 {
+        let n = file.read(&mut read_buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "FASTA ended with {remaining} base(s) still expected (offset {offset}, \
+                     declared length {expected_length})"
+                ),
+            ));
+        }
+        let mut out_len = 0usize;
+        for &b in &read_buf[..n] {
+            if remaining == 0 {
+                // All declared bases consumed; ignore trailing
+                // bytes in this window (newlines, the next contig's
+                // header, etc.).
+                break;
+            }
+            if b == b'\n' || b == b'\r' {
+                continue;
+            }
+            upper_buf[out_len] = b.to_ascii_uppercase();
+            out_len += 1;
+            remaining -= 1;
+        }
+        if out_len > 0 {
+            md5.update(&upper_buf[..out_len]);
         }
     }
-    Ok(())
+
+    let digest: [u8; 16] = md5.finalize().into();
+    Ok(format_md5_hex(digest))
 }
 
 /// Howard Hinnant's `civil_from_days` — translate days-since-epoch
@@ -286,5 +377,253 @@ mod tests {
         configure_rayon_pool(None).unwrap();
         configure_rayon_pool(None).unwrap();
         configure_rayon_pool(None).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase A — streaming MD5 verify tests. The helper below writes a
+    // FASTA + sibling `.fai` with caller-chosen line wrapping so the
+    // newline-stripping logic in `compute_contig_md5_streaming` is
+    // exercised against multi-line contigs (the production case —
+    // Ensembl / Gencode FASTAs wrap at 60 chars).
+    // ---------------------------------------------------------------------
+
+    use std::fs::File;
+    use std::io::Write;
+
+    /// One contig in a synthetic FASTA fixture.
+    struct ContigFixture<'a> {
+        name: &'a str,
+        /// Bases as a single contiguous string; the helper will line-
+        /// wrap them to `line_bases` per line on disk.
+        seq: &'a str,
+        line_bases: usize,
+    }
+
+    /// Build a FASTA + `.fai` with the given contigs. Returns the
+    /// tempdir (keep it alive for the duration of the test) and the
+    /// FASTA path. Line-wraps each contig's bases per its
+    /// `line_bases`. The last line may be short.
+    fn build_wrapped_fasta(contigs: &[ContigFixture<'_>]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta_path = dir.path().join("ref.fa");
+        let fai_path = dir.path().join("ref.fa.fai");
+
+        let mut fa = File::create(&fasta_path).expect("fa");
+        let mut fai = File::create(&fai_path).expect("fai");
+        let mut offset: u64 = 0;
+
+        for c in contigs {
+            let header = format!(">{}\n", c.name);
+            fa.write_all(header.as_bytes()).expect("hdr");
+            offset += header.len() as u64;
+
+            // Sequence start offset is the .fai's `offset` column.
+            let seq_offset = offset;
+
+            let bytes = c.seq.as_bytes();
+            let mut written = 0usize;
+            while written < bytes.len() {
+                let end = (written + c.line_bases).min(bytes.len());
+                fa.write_all(&bytes[written..end]).expect("seq line");
+                fa.write_all(b"\n").expect("seq nl");
+                offset += (end - written) as u64 + 1;
+                written = end;
+            }
+
+            let length = c.seq.len();
+            let line_width = c.line_bases + 1; // +1 for '\n'
+            writeln!(
+                fai,
+                "{}\t{}\t{}\t{}\t{}",
+                c.name, length, seq_offset, c.line_bases, line_width
+            )
+            .expect("fai entry");
+        }
+
+        (dir, fasta_path)
+    }
+
+    fn one_shot_md5(uppercase_bytes: &[u8]) -> String {
+        let digest: [u8; 16] = Md5::digest(uppercase_bytes).into();
+        format_md5_hex(digest)
+    }
+
+    #[test]
+    fn streaming_md5_matches_one_shot_on_single_line_contig() {
+        // Single-line contig — no newline-stripping needed inside the
+        // contig body. Sanity check that the basic streaming pipeline
+        // matches `Md5::digest`.
+        let (_dir, fasta_path) = build_wrapped_fasta(&[ContigFixture {
+            name: "chr0",
+            seq: "ACGTACGTACGT",
+            line_bases: 12, // single line
+        }]);
+        let index = fai::fs::read(fasta_path.with_extension("fa.fai")).expect("fai");
+        let record = &index.as_ref()[0];
+
+        let streaming = compute_contig_md5_streaming(&fasta_path, record.offset(), 12).unwrap();
+        let one_shot = one_shot_md5(b"ACGTACGTACGT");
+        assert_eq!(streaming, one_shot);
+    }
+
+    #[test]
+    fn streaming_md5_matches_one_shot_on_line_wrapped_contig() {
+        // 60-char-per-line wrap is the Ensembl/Gencode default; this
+        // is the production case. The streaming function must skip
+        // every embedded `\n` for the digest to match.
+        let seq: String = (0..250).map(|i| b"ACGT"[i % 4] as char).collect();
+        let (_dir, fasta_path) = build_wrapped_fasta(&[ContigFixture {
+            name: "chr0",
+            seq: &seq,
+            line_bases: 60,
+        }]);
+        let index = fai::fs::read(fasta_path.with_extension("fa.fai")).expect("fai");
+        let record = &index.as_ref()[0];
+
+        let streaming = compute_contig_md5_streaming(&fasta_path, record.offset(), 250).unwrap();
+        let one_shot = one_shot_md5(seq.as_bytes());
+        assert_eq!(streaming, one_shot);
+    }
+
+    #[test]
+    fn streaming_md5_uppercases_soft_masked_bases() {
+        // Soft-masked FASTAs (Ensembl/Gencode default) encode repeat
+        // regions as lowercase `acgtn`. The MD5 contract is "MD5 of
+        // the uppercase bases" — the streaming pipeline must
+        // uppercase before feeding md5.
+        let (_dir, fasta_path) = build_wrapped_fasta(&[ContigFixture {
+            name: "chr0",
+            seq: "ACGTacgtNn",
+            line_bases: 5,
+        }]);
+        let index = fai::fs::read(fasta_path.with_extension("fa.fai")).expect("fai");
+        let record = &index.as_ref()[0];
+
+        let streaming = compute_contig_md5_streaming(&fasta_path, record.offset(), 10).unwrap();
+        let one_shot = one_shot_md5(b"ACGTACGTNN");
+        assert_eq!(streaming, one_shot);
+    }
+
+    #[test]
+    fn streaming_md5_truncated_contig_errors() {
+        // .psp claims the contig is 100 bases but the FASTA only has
+        // 10. The streaming function consumes whatever is there,
+        // hits EOF with `remaining > 0`, and surfaces UnexpectedEof.
+        let (_dir, fasta_path) = build_wrapped_fasta(&[ContigFixture {
+            name: "chr0",
+            seq: "ACGTACGTAC",
+            line_bases: 10,
+        }]);
+        let index = fai::fs::read(fasta_path.with_extension("fa.fai")).expect("fai");
+        let record = &index.as_ref()[0];
+
+        let err = compute_contig_md5_streaming(&fasta_path, record.offset(), 100).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn verify_detects_md5_mismatch() {
+        // End-to-end through `verify_fasta_matches_psp_chromosomes`:
+        // build a FASTA whose MD5 we know, but tell the function to
+        // expect a different MD5 (representing a "right basename,
+        // wrong genome build" failure). Must surface `Md5Mismatch`
+        // with the right contig name + actual vs. expected.
+        let (_dir, fasta_path) = build_wrapped_fasta(&[ContigFixture {
+            name: "chr0",
+            seq: "ACGTACGTACGT",
+            line_bases: 12,
+        }]);
+        let actual = one_shot_md5(b"ACGTACGTACGT");
+        let chromosomes = vec![ParsedChromosome {
+            name: "chr0".into(),
+            length: 12,
+            md5: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
+        }];
+        let err = verify_fasta_matches_psp_chromosomes(&fasta_path, &chromosomes).unwrap_err();
+        match err {
+            FastaVerifyError::Md5Mismatch {
+                contig,
+                fasta_md5,
+                psp_md5,
+            } => {
+                assert_eq!(contig, "chr0");
+                assert_eq!(fasta_md5, actual);
+                assert_eq!(psp_md5, "deadbeefdeadbeefdeadbeefdeadbeef");
+            }
+            other => panic!("expected Md5Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_missing_contig_in_fasta() {
+        // .psp declares `chr_missing` but FASTA only has `chr0`. The
+        // FASTA-index lookup must return `FetchFailed { source: kind
+        // NotFound }`.
+        let (_dir, fasta_path) = build_wrapped_fasta(&[ContigFixture {
+            name: "chr0",
+            seq: "ACGTACGTACGT",
+            line_bases: 12,
+        }]);
+        let chromosomes = vec![ParsedChromosome {
+            name: "chr_missing".into(),
+            length: 12,
+            // Value irrelevant — the lookup fails before the MD5 is
+            // computed.
+            md5: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
+        }];
+        let err = verify_fasta_matches_psp_chromosomes(&fasta_path, &chromosomes).unwrap_err();
+        match err {
+            FastaVerifyError::FetchFailed { contig, source } => {
+                assert_eq!(contig, "chr_missing");
+                assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            }
+            other => panic!("expected FetchFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_accepts_matching_md5_across_multiple_contigs() {
+        // Positive path: build a FASTA with three differently-wrapped
+        // contigs, compute the expected MD5 for each via the one-shot
+        // path, and assert that `verify` accepts them. Exercises the
+        // rayon `par_iter` happy path with > 1 worker.
+        let seq_a = "ACGTACGTACGT".to_string();
+        let seq_b: String = (0..150).map(|i| b"NACGT"[i % 5] as char).collect();
+        let seq_c = "T".to_string();
+        let (_dir, fasta_path) = build_wrapped_fasta(&[
+            ContigFixture {
+                name: "chr0",
+                seq: &seq_a,
+                line_bases: 12,
+            },
+            ContigFixture {
+                name: "chr1",
+                seq: &seq_b,
+                line_bases: 60,
+            },
+            ContigFixture {
+                name: "chr2",
+                seq: &seq_c,
+                line_bases: 1,
+            },
+        ]);
+        let chromosomes = vec![
+            ParsedChromosome {
+                name: "chr0".into(),
+                length: seq_a.len() as u32,
+                md5: one_shot_md5(seq_a.as_bytes()),
+            },
+            ParsedChromosome {
+                name: "chr1".into(),
+                length: seq_b.len() as u32,
+                md5: one_shot_md5(seq_b.as_bytes()),
+            },
+            ParsedChromosome {
+                name: "chr2".into(),
+                length: seq_c.len() as u32,
+                md5: one_shot_md5(seq_c.as_bytes()),
+            },
+        ];
+        verify_fasta_matches_psp_chromosomes(&fasta_path, &chromosomes).expect("verify");
     }
 }
