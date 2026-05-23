@@ -23,7 +23,7 @@ use crate::per_sample_pileup::cram_input::{
 };
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::{self, PileupWalker, PreparedRead, WalkerConfig};
-use crate::per_sample_pileup::ref_fetcher::{ChromBoundaryRefFetcher, SyncRefFetcher};
+use crate::per_sample_pileup::ref_fetcher::{SyncRefFetcher, WalkerLegacyAdapter};
 
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;
@@ -35,7 +35,7 @@ use super::cli::error_bridge::ErrorSheddingAdapter;
 /// costs one indirection per `PreparedRead` — invisible against the
 /// HMM / walker bookkeeping the per-record budget already pays.
 pub type Stage1Walker<'a> =
-    PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a ChromBoundaryRefFetcher>;
+    PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a WalkerLegacyAdapter>;
 
 /// Context handed to the [`with_stage1_pipeline`] callback. Contains
 /// the walker (by value — the closure may consume or drive it via
@@ -106,12 +106,16 @@ where
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
-    // 2. Reference fetchers — BAQ needs Send+Sync, walker is
-    //    single-threaded and uses the chrom-boundary-evicting one.
+    // 2. Reference fetchers — BAQ still uses SyncRefFetcher (shared
+    //    across rayon workers; migrated separately in step 2(c) of
+    //    the `unified_chrom_ref_fetcher` plan). Walker uses the new
+    //    [`WalkerLegacyAdapter`] (step 2(b)): a multi-chrom shell
+    //    that swaps a `StreamingChromRefFetcher` per chrom
+    //    transition. Peak memory is one ~1 MB sliding buffer instead
+    //    of one full contig.
     let baq_fetcher =
         SyncRefFetcher::new(reference, contigs.clone()).map_err(PileupCliError::Io)?;
-    let walker_fetcher =
-        ChromBoundaryRefFetcher::new(reference, contigs.clone()).map_err(PileupCliError::Io)?;
+    let walker_fetcher = WalkerLegacyAdapter::new(reference.to_path_buf(), contigs.clone());
 
     // 3. Build the boxed input iterator + handle for upstream errors,
     //    drive the closure, then snapshot every branch-local counter

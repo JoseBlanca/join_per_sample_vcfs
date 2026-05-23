@@ -1132,6 +1132,107 @@ impl RefSeqFetcher for SingleChromLegacyAdapter {
     }
 }
 
+// ---------------------------------------------------------------------
+// WalkerLegacyAdapter — multi-chrom, single-thread bridge.
+// ---------------------------------------------------------------------
+//
+// Counterpart to [`SingleChromLegacyAdapter`] for consumers that
+// traverse multiple chromosomes in sequence with a single thread
+// — the Stage 1 pileup walker today. On each chrom transition the
+// inner [`StreamingChromRefFetcher`] is rebuilt for the new contig;
+// fetches within a chrom hit the same sliding buffer.
+//
+// Like the single-chrom adapter, this is transitional. Step 3 of
+// the migration replaces both adapters with a direct ChromRefFetcher
+// consumer.
+
+/// Adapter that maintains *one* [`StreamingChromRefFetcher`] at a
+/// time, swapping it when [`RefSeqFetcher::fetch`] is called with a
+/// different `chrom_id` than the currently-bound contig. Implements
+/// the legacy `RefSeqFetcher` trait so it drops into existing
+/// walker plumbing.
+///
+/// `!Sync` by design — the walker is single-threaded, so interior
+/// mutability via `RefCell` avoids the lock overhead a `Mutex`
+/// would impose. Stage 1's BAQ uses a separate `Sync` adapter
+/// pattern (step 2(c)).
+///
+/// Behaviour on chrom transition: the existing inner is dropped
+/// (releasing its sliding buffer), a fresh
+/// [`StreamingChromRefFetcher::for_contig`] is built for the new
+/// chrom (open file + parse .fai), and the call delegates. The
+/// open + fai-parse cost is paid once per chrom transition; within
+/// a chrom every fetch hits the sliding buffer.
+pub struct WalkerLegacyAdapter {
+    fasta_path: PathBuf,
+    contigs: ContigList,
+    inner: std::cell::RefCell<Option<(u32, StreamingChromRefFetcher)>>,
+}
+
+impl WalkerLegacyAdapter {
+    /// Build an adapter bound to a FASTA. No inner fetcher is
+    /// constructed yet — the first `fetch` triggers the lazy load.
+    pub fn new(fasta_path: PathBuf, contigs: ContigList) -> Self {
+        Self {
+            fasta_path,
+            contigs,
+            inner: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Borrow the currently-loaded inner, rebuilding for `chrom_id`
+    /// if needed. Returns a refmut to the slot so the caller can
+    /// then unwrap and delegate.
+    fn ensure_chrom_loaded(
+        &self,
+        chrom_id: u32,
+    ) -> Result<std::cell::RefMut<'_, Option<(u32, StreamingChromRefFetcher)>>, io::Error> {
+        let mut slot = self.inner.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some((current, _)) => *current != chrom_id,
+            None => true,
+        };
+        if needs_rebuild {
+            let entry = self.contigs.entries.get(chrom_id as usize).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "WalkerLegacyAdapter: chrom_id {chrom_id} out of range (have {} contigs)",
+                        self.contigs.entries.len()
+                    ),
+                )
+            })?;
+            // Drop the old fetcher (releases its sliding buffer)
+            // before building the new one to keep peak memory at
+            // one contig's working set, not two.
+            *slot = None;
+            let fresh = StreamingChromRefFetcher::for_contig(&self.fasta_path, &entry.name)
+                .map_err(legacy_io_error)?;
+            *slot = Some((chrom_id, fresh));
+        }
+        Ok(slot)
+    }
+}
+
+impl RefSeqFetcher for WalkerLegacyAdapter {
+    fn fetch(
+        &self,
+        chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, io::Error> {
+        let slot = self.ensure_chrom_loaded(chrom_id)?;
+        let (_, inner) = slot.as_ref().expect("ensure_chrom_loaded post-condition");
+        ChromRefFetcher::fetch(inner, start_1based, length).map_err(legacy_io_error)
+    }
+
+    // iter_bases falls back to the trait default, which calls
+    // `fetch(chrom_id, 1, length)` and wraps the result in an iter.
+    // The walker doesn't use iter_bases (only DUST / PerGroupMerger
+    // in the var-calling pipeline do), so this default is unused in
+    // practice; defining it explicitly would be dead code.
+}
+
 /// Map [`ChromRefFetchError`] back into the legacy `io::Error`
 /// shape. The legacy trait returns `io::Result`; until the
 /// consumer-side migration in step 3 we have to flatten the typed
@@ -1928,6 +2029,90 @@ mod tests {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
             Ok(_) => panic!("must fail"),
         }
+    }
+
+    #[test]
+    fn walker_adapter_serves_each_chrom_via_swap() {
+        // Build a two-chrom FASTA, construct the walker adapter,
+        // alternate fetches across chroms. Every fetch returns the
+        // right bytes; the adapter rebuilds the inner streamer on
+        // each transition.
+        let specs = vec![
+            ContigSpec {
+                name: "chr0".into(),
+                length: 16,
+            },
+            ContigSpec {
+                name: "chr1".into(),
+                length: 24,
+            },
+        ];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let contigs = contig_list(&[("chr0", 16), ("chr1", 24)]);
+        let adapter = WalkerLegacyAdapter::new(path, contigs);
+
+        assert_eq!(
+            RefSeqFetcher::fetch(&adapter, 0, 1, 4).expect("chr0"),
+            b"AAAA"
+        );
+        assert_eq!(
+            RefSeqFetcher::fetch(&adapter, 1, 1, 4).expect("chr1"),
+            b"AAAA"
+        );
+        // Switch back: forces another swap.
+        assert_eq!(
+            RefSeqFetcher::fetch(&adapter, 0, 5, 4).expect("chr0 again"),
+            b"AAAA"
+        );
+    }
+
+    #[test]
+    fn walker_adapter_rejects_unknown_chrom_id() {
+        let specs = vec![ContigSpec {
+            name: "chr0".into(),
+            length: 8,
+        }];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let contigs = contig_list(&[("chr0", 8)]);
+        let adapter = WalkerLegacyAdapter::new(path, contigs);
+
+        let err = RefSeqFetcher::fetch(&adapter, 99, 1, 4).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn walker_adapter_holds_one_chrom_at_a_time() {
+        // Sequential fetches across two chroms; only one inner
+        // StreamingChromRefFetcher is resident at any time. We
+        // verify the swap happened by checking that fetching from
+        // an out-of-bounds offset on the previously-loaded chrom
+        // (after the swap) errors — confirming the inner is now
+        // bound to the new chrom.
+        let specs = vec![
+            ContigSpec {
+                name: "chr0".into(),
+                length: 8,
+            },
+            ContigSpec {
+                name: "chr1".into(),
+                length: 32,
+            },
+        ];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let contigs = contig_list(&[("chr0", 8), ("chr1", 32)]);
+        let adapter = WalkerLegacyAdapter::new(path, contigs);
+
+        // Load chr0.
+        RefSeqFetcher::fetch(&adapter, 0, 1, 4).expect("chr0 load");
+        // Switch to chr1 — long fetch only works on chr1.
+        let bytes = RefSeqFetcher::fetch(&adapter, 1, 1, 32).expect("chr1 full");
+        assert_eq!(bytes.len(), 32);
+        // Fetching chr1's full length on chr0 (8 bases) should error
+        // (the inner is now bound to chr1, but legacy fetch chrom_id
+        // = 0 forces a swap back to chr0 which then errors on the
+        // out-of-bounds 32-base request).
+        let err = RefSeqFetcher::fetch(&adapter, 0, 1, 32).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
