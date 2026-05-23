@@ -582,10 +582,11 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             return Ok(false);
         }
         let entry = self.reader.index[self.cur_block_idx];
-        self.reader
-            .source
-            .seek(SeekFrom::Start(entry.block_offset))
-            .map_err(io_err("block start seek"))?;
+        seek_to_offset(
+            &mut self.reader.source,
+            entry.block_offset,
+            "block start seek",
+        )?;
         let (block_header, _consumed) =
             read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
 
@@ -802,10 +803,16 @@ fn read_block_header<R: Read + Seek>(
             Ok((header, consumed)) => {
                 // We over-read into `buf`; rewind the source so
                 // the caller's cursor lands at the start of the
-                // column payloads.
-                source
-                    .seek(SeekFrom::Start(header_start + consumed as u64))
-                    .map_err(io_err("post-block-header seek"))?;
+                // column payloads. Rewind distance ≤ chunk size
+                // (≤ BLOCK_HEADER_READ_CAP), well inside the
+                // wrapped BufReader's 64 KiB buffer, so
+                // `seek_to_offset`'s SeekFrom::Current preserves
+                // the buffer.
+                seek_to_offset(
+                    source,
+                    header_start + consumed as u64,
+                    "post-block-header seek",
+                )?;
                 return Ok((header, consumed));
             }
             Err(PspReadError::BlockHeaderField {
@@ -1253,6 +1260,38 @@ fn predict_fixed_uncompressed_len(
 /// repeated closure literals.
 fn io_err(context: &'static str) -> impl Fn(std::io::Error) -> PspReadError {
     move |source| PspReadError::Io { context, source }
+}
+
+/// Move `source` to absolute file offset `target`. Uses
+/// `SeekFrom::Current(delta)` so a wrapped `BufReader` preserves its
+/// 64 KiB user-space buffer when the target lies in the existing
+/// window (per `std::io::BufReader`'s `Seek::seek` impl, which
+/// special-cases `SeekFrom::Current(n)` for `|n|` within the
+/// buffer). `SeekFrom::Start` would discard the buffer
+/// unconditionally — which matters because PSP blocks are written
+/// contiguously on disk and `RecordsIter` walks them sequentially,
+/// so the cohort driver's 64 KiB BufReader would otherwise be
+/// thrown away on every block transition.
+///
+/// `stream_position` on `BufReader<File>` does **not** issue an
+/// `lseek` — it computes from the buffered position (std impl).
+/// On a bare `File` source this falls through to a regular
+/// `lseek(0, SEEK_CUR)` — no slower than the previous
+/// `SeekFrom::Start` would have been.
+fn seek_to_offset<R: Read + Seek>(
+    source: &mut R,
+    target: u64,
+    context: &'static str,
+) -> Result<(), PspReadError> {
+    let current = source.stream_position().map_err(io_err(context))?;
+    if current == target {
+        return Ok(());
+    }
+    let delta = (target as i64) - (current as i64);
+    source
+        .seek(SeekFrom::Current(delta))
+        .map_err(io_err(context))?;
+    Ok(())
 }
 
 #[cfg(test)]
