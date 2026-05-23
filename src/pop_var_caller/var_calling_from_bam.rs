@@ -429,6 +429,10 @@ fn run_cohort_pipeline_for_single_sample(
                         "ref fetcher construction failed: {e}"
                     )))
                 })?;
+        // See cohort_driver::process_one_chromosome for the
+        // `Arc<!Sync>` rationale; switching to `Rc` is a tracked
+        // follow-up to the H1 perf fix.
+        #[allow(clippy::arc_with_non_send_sync)]
         let fetcher: SharedRefFetcher = Arc::new(streaming);
 
         // Build the per-chrom record iter. When the walker has no

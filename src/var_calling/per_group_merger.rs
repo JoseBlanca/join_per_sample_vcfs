@@ -479,13 +479,14 @@ fn collect_non_decreasing(
 // Public merger type
 // ---------------------------------------------------------------------
 
-/// Type-erased reference fetcher handle shared across per-chromosome
-/// workers. The `Send + Sync` bounds are mandatory because each
-/// per-chrom worker constructs its own `PerGroupMerger` and the
-/// shared fetcher `Arc` moves across the worker boundary; the merger
-/// itself only ever asks for `&` access, so an immutable shared
-/// handle is sufficient.
-pub type SharedRefFetcher = Arc<dyn ChromRefFetcher + Send + Sync>;
+/// Type-erased reference fetcher handle owned by one per-chromosome
+/// worker. `Send` (not `Sync`) — each worker constructs its own
+/// `PerGroupMerger` and the shared fetcher `Arc` moves across the
+/// worker boundary but is never *shared* between threads. Dropping
+/// `Sync` lets `StreamingChromRefFetcher` use `RefCell` interior
+/// mutability instead of `Mutex`, which removes a per-base atomic
+/// lock/unlock from the DUST mask scan.
+pub type SharedRefFetcher = Arc<dyn ChromRefFetcher + Send>;
 
 /// Streaming, internally-parallel per-group merger.
 pub struct PerGroupMerger<I>
@@ -664,7 +665,7 @@ where
 /// `None` if the group reduces to REF-only after unification).
 fn process_group(
     group: OverlappingVariantGroup,
-    ref_fetcher: &(dyn ChromRefFetcher + Send + Sync),
+    ref_fetcher: &(dyn ChromRefFetcher + Send),
     config: &PerGroupMergerConfig,
     genotype_tables: &[Vec<Vec<u8>>],
 ) -> Result<Option<MergedRecord>, PerGroupMergerError> {

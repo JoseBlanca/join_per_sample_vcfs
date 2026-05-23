@@ -42,6 +42,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::cell::RefCell;
 use std::sync::Mutex;
 
 use noodles_fasta::fai;
@@ -110,11 +111,14 @@ pub struct StreamingChromRefFetcher {
     /// layout. Captured at construction so we don't re-parse the
     /// `.fai` on every refill.
     fai: ContigFai,
-    /// All mutable streamer state. `Mutex` because the trait alias
-    /// `SharedRefFetcher = Arc<dyn RefSeqFetcher + Send + Sync>`
-    /// requires `Sync`, but each per-chrom worker owns its fetcher
-    /// outright, so contention is zero by construction.
-    inner: Mutex<StreamState>,
+    /// All mutable streamer state. `RefCell` (not `Mutex`) because
+    /// each per-chrom rayon worker owns its fetcher outright — no
+    /// cross-thread sharing — so we don't pay atomics on every
+    /// `ChromRefBaseIter::next`. The cohort `SharedRefFetcher` alias
+    /// is `Arc<dyn ChromRefFetcher + Send>` (not `Send + Sync`),
+    /// matching the per-worker ownership invariant documented at the
+    /// cohort driver's worker construction.
+    inner: RefCell<StreamState>,
 }
 
 /// Pared-down `.fai` record — just the fields the streamer needs.
@@ -224,7 +228,7 @@ impl StreamingChromRefFetcher {
                 line_bases,
                 line_width,
             },
-            inner: Mutex::new(StreamState {
+            inner: RefCell::new(StreamState {
                 source: Source::File(file),
                 buf: Vec::with_capacity(STREAMING_REF_BUFFER_BYTES),
                 buf_start_base: 0,
@@ -257,7 +261,7 @@ impl StreamingChromRefFetcher {
                 line_bases,
                 line_width,
             },
-            inner: Mutex::new(StreamState {
+            inner: RefCell::new(StreamState {
                 source: Source::Memory(io::Cursor::new(fasta_blob)),
                 buf: Vec::with_capacity(STREAMING_REF_BUFFER_BYTES),
                 buf_start_base: 0,
@@ -343,10 +347,7 @@ impl RefSeqFetcher for StreamingChromRefFetcher {
             ));
         }
 
-        let mut state = self
-            .inner
-            .lock()
-            .expect("StreamingChromRefFetcher mutex poisoned");
+        let mut state = self.inner.borrow_mut();
         // Check if the requested window already lies inside the
         // current buffer; refill otherwise.
         let buf_covers = !state.buf.is_empty()
@@ -389,15 +390,7 @@ impl Iterator for StreamingBaseIter<'_> {
         if self.done || self.next_base > self.fetcher.fai.length {
             return None;
         }
-        let mut state = match self.fetcher.inner.lock() {
-            Ok(s) => s,
-            Err(_) => {
-                self.done = true;
-                return Some(Err(io::Error::other(
-                    "StreamingChromRefFetcher mutex poisoned in bases()",
-                )));
-            }
-        };
+        let mut state = self.fetcher.inner.borrow_mut();
         let need_refill = state.buf.is_empty()
             || self.next_base < state.buf_start_base
             || (self.next_base as u64)
@@ -597,9 +590,9 @@ pub trait ChromRefFetcher {
 /// Forwarding impl so callers may pass either an owned fetcher or a
 /// shared reference to a generic `F: ChromRefFetcher`. The
 /// `drive_cohort_pipeline` call site is the motivating consumer:
-/// it holds a `SharedRefFetcher = Arc<dyn ChromRefFetcher + Send + Sync>`
-/// and passes `&*fetcher` (a `&(dyn ChromRefFetcher + Send + Sync)`)
-/// into `DustFilter::new`, which is generic over `F: ChromRefFetcher`.
+/// it holds a `SharedRefFetcher = Arc<dyn ChromRefFetcher + Send>`
+/// and passes `&*fetcher` (a `&(dyn ChromRefFetcher + Send)`) into
+/// `DustFilter::new`, which is generic over `F: ChromRefFetcher`.
 impl<T: ChromRefFetcher + ?Sized> ChromRefFetcher for &T {
     fn length(&self) -> u32 {
         (**self).length()
@@ -740,7 +733,7 @@ impl StreamingChromRefFetcher {
                 line_bases,
                 line_width,
             },
-            inner: Mutex::new(StreamState {
+            inner: RefCell::new(StreamState {
                 source: Source::File(file),
                 buf: Vec::with_capacity(buffer_bytes),
                 buf_start_base: 0,
@@ -771,12 +764,7 @@ impl Iterator for ChromRefBaseIter<'_> {
         if self.done || self.next_base > self.fetcher.fai.length {
             return None;
         }
-        let mut state = self.fetcher.inner.lock().unwrap_or_else(|e| {
-            // Mutex poisoning means another panic on this fetcher;
-            // surface it as an Io error rather than re-panicking.
-            self.done = true;
-            e.into_inner()
-        });
+        let mut state = self.fetcher.inner.borrow_mut();
         let need_refill = state.buf.is_empty()
             || self.next_base < state.buf_start_base
             || (self.next_base as u64)
@@ -810,10 +798,9 @@ impl Drop for ChromRefBaseIter<'_> {
         // Reset the sliding buffer so the next `fetch()` starts a
         // fresh access-pattern phase regardless of where the iter
         // left off.
-        if let Ok(mut state) = self.fetcher.inner.lock() {
-            state.buf.clear();
-            state.buf_start_base = 0;
-        }
+        let mut state = self.fetcher.inner.borrow_mut();
+        state.buf.clear();
+        state.buf_start_base = 0;
     }
 }
 
@@ -848,7 +835,7 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
             });
         }
 
-        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.borrow_mut();
 
         // OutOfPattern check: if the buffer is non-empty and the
         // request is before its origin, the consumer is violating
@@ -889,7 +876,7 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
         ChromRefFetchError,
     > {
         // Reset the buffer so the iter starts a fresh phase.
-        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.inner.borrow_mut();
         state.buf.clear();
         state.buf_start_base = 0;
         drop(state);

@@ -477,7 +477,12 @@ where
         .map_err(|e| io::Error::other(format!("ref fetcher construction failed: {e}")))?;
     // Wrap in Arc<dyn> for the DustFilter + PerGroupMerger trait-
     // object alias. Refcount stays at 1–2 per worker; never crosses
-    // worker boundaries.
+    // worker boundaries. `StreamingChromRefFetcher` is `!Sync` (uses
+    // `RefCell` interior mutability) — clippy correctly notes that
+    // `Arc<!Sync>` is strictly weaker than `Rc<!Sync>`, but the
+    // SharedRefFetcher = `Arc<…>` alias is kept for now so callers
+    // don't churn. Switching to `Rc` is a tracked follow-up.
+    #[allow(clippy::arc_with_non_send_sync)]
     let fetcher: SharedRefFetcher = Arc::new(streaming);
 
     // Open one PspReader per sample. Per-worker ownership: no
