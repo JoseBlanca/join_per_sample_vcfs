@@ -529,7 +529,10 @@ fn refill(
             if b == b'\n' || b == b'\r' {
                 continue;
             }
-            state.buf.push(b.to_ascii_uppercase());
+            // M26 (2026-05-23 code review): canonicalise to
+            // `A`/`C`/`G`/`T`/`N` so the trait contract holds for
+            // IUPAC-ambiguity and soft-masked input bytes.
+            state.buf.push(canonicalise(b));
         }
     }
     Ok(())
@@ -1453,6 +1456,31 @@ impl ManualEvictChromRefFetcher {
 /// append them to `dst`. Returns an `UnexpectedEof` if the source
 /// runs out before `n_bases` bases are gathered. Shared by both
 /// streaming and manual-evict fetchers.
+/// Canonicalise a single FASTA byte to SAM-spec uppercase `ACGT`/`N`.
+///
+/// M26 (2026-05-23 code review): the `ChromRefFetcher::fetch` trait
+/// docs promise output is "uppercased bases, SAM-spec canonical
+/// (`A`/`C`/`G`/`T`/`N`) regardless of how the FASTA is masked on
+/// disk". The previous implementation used only
+/// `b.to_ascii_uppercase()`, which leaves IUPAC ambiguity codes
+/// (`R`, `Y`, `S`, `W`, `K`, `M`, `B`, `D`, `H`, `V`), the RNA `U`,
+/// gap characters (`-`, `.`), and any other ASCII byte unchanged.
+/// Downstream DUST + BAQ + PerGroupMerger then saw raw IUPAC bytes
+/// that they were not built to handle.
+///
+/// This function folds any non-`ACGT` byte to `N` AFTER
+/// uppercasing — so `a`/`c`/`g`/`t` (soft-masked) map to `A`/`C`/
+/// `G`/`T`, and everything else (`R`, `n`, `N`, `U`, `-`, `.`,
+/// stray whitespace bytes that survived the newline filter) maps
+/// to `N`.
+#[inline]
+fn canonicalise(b: u8) -> u8 {
+    match b.to_ascii_uppercase() {
+        b'A' | b'C' | b'G' | b'T' => b.to_ascii_uppercase(),
+        _ => b'N',
+    }
+}
+
 fn read_uppercased_bases(reader: &mut File, dst: &mut Vec<u8>, n_bases: usize) -> io::Result<()> {
     let want_total = dst.len() + n_bases;
     let mut read_buf = [0u8; STREAMING_REF_FILE_READ_CHUNK];
@@ -1475,7 +1503,7 @@ fn read_uppercased_bases(reader: &mut File, dst: &mut Vec<u8>, n_bases: usize) -
             if b == b'\n' || b == b'\r' {
                 continue;
             }
-            dst.push(b.to_ascii_uppercase());
+            dst.push(canonicalise(b));
         }
     }
     Ok(())
@@ -2360,5 +2388,44 @@ mod tests {
             Err(ChromRefFetchError::Io { .. }) => {}
             Err(other) => panic!("expected Io error, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // M26 (2026-05-23 code review): IUPAC + soft-mask canonicalisation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn streaming_fetch_canonicalises_iupac_and_softmask_to_n_and_acgt() {
+        // Mix of soft-masked, IUPAC-ambiguity, gap, RNA, and N bytes.
+        // Expected: lowercase ACGT → uppercase; everything else → N.
+        // Input bytes:   a c g t  R Y S W K M  B D H V N  -  .  U  X
+        // Expected:      A C G T  N N N N N N  N N N N N  N  N  N  N
+        let input = b"acgtRYSWKMBDHVN-.UX";
+        let expected: Vec<u8> = vec![
+            b'A', b'C', b'G', b'T', // lowercase ACGT folded
+            b'N', b'N', b'N', b'N', b'N', b'N', // IUPAC 2-codes
+            b'N', b'N', b'N', b'N', // IUPAC 3-codes
+            b'N', // N stays N
+            b'N', b'N', // gap chars
+            b'N', // RNA U
+            b'N', // any other ASCII
+        ];
+        let (_dir, fa_path) = build_line_wrapped_fasta("chr0", input, 8);
+        let fetcher =
+            StreamingChromRefFetcher::for_contig(&fa_path, "chr0").expect("for_contig");
+        let bytes =
+            ChromRefFetcher::fetch(&fetcher, 1, input.len() as u32).expect("fetch");
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn manual_evict_fetch_canonicalises_iupac_to_n() {
+        let input = b"acgtRYSWKMBDHVN";
+        let expected: Vec<u8> = b"ACGTNNNNNNNNNNN".to_vec();
+        let (_dir, fa_path) = build_line_wrapped_fasta("chr0", input, 8);
+        let mut fetcher =
+            ManualEvictChromRefFetcher::for_contig(&fa_path, "chr0").expect("for_contig");
+        let bytes = fetcher.fetch(1, input.len() as u32).expect("fetch").to_vec();
+        assert_eq!(bytes, expected);
     }
 }
