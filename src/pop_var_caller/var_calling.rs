@@ -227,7 +227,7 @@ pub enum VarCallingCliError {
 ///    in parallel — peak memory is one 64 KiB window per worker, no
 ///    contig-sized allocations. No process-wide reference fetcher
 ///    is built — each per-chrom worker constructs its own
-///    `SingleChromRefFetcher` inside
+///    `StreamingChromRefFetcher` inside
 ///    [`process_one_chromosome`](crate::pop_var_caller::cohort_driver::process_one_chromosome).
 /// 8. Cohort metadata + writer-config template.
 /// 9. Per-chromosome parallel partition: one worker per contig,
@@ -333,14 +333,13 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         }
     }
 
-    // 7b. No global fetcher is built here. Phase B's per-worker
-    //     design has each per-chrom worker construct its own
-    //     `SingleChromRefFetcher` inside `process_one_chromosome` —
-    //     no Arc shared across threads, no Mutex, no lease. The
-    //     contig's bytes live exactly for the worker's lifetime;
-    //     peak resident during the `par_iter` below is
-    //     `min(threads, n_chroms) × max_chrom_size`, not
-    //     `Σ contig.length`.
+    // 7b. No global fetcher is built here. Each per-chrom worker
+    //     constructs its own `StreamingChromRefFetcher` inside
+    //     `process_one_chromosome` — no Arc shared across threads,
+    //     no Mutex contention. The contig's sliding buffer lives
+    //     exactly for the worker's lifetime; peak resident during
+    //     the `par_iter` below is `min(threads, n_chroms) × 1 MB`,
+    //     independent of contig size.
 
     // 8. Cohort metadata for the writer header + the writer-config
     //    template inherited by every per-chrom fragment writer.
@@ -380,8 +379,8 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // 10. Drive per-chrom workers in parallel. CohortPipelineParams
     //     is Clone so each worker takes its own params instance. The
     //     fetcher is *not* in params — each worker builds its own
-    //     `SingleChromRefFetcher` from `args.reference` inside
-    //     `process_one_chromosome` (Phase B).
+    //     `StreamingChromRefFetcher` from `args.reference` inside
+    //     `process_one_chromosome`.
     let pipeline_params = CohortPipelineParams {
         no_complexity_filter: args.no_complexity_filter,
         dust_cfg,

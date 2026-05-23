@@ -433,10 +433,10 @@ fn pool_allele_mapq(
 /// worker has joined.
 ///
 /// `fasta_path` is the path to the reference FASTA. This function
-/// constructs a [`SingleChromRefFetcher`] bound to `chrom_id` from
-/// it — each worker owns its fetcher outright (no shared state).
-/// When the function returns, the fetcher drops and the contig's
-/// bytes are freed.
+/// constructs a [`StreamingChromRefFetcher`] bound to `chrom_id`
+/// from it — each worker owns its fetcher outright (no shared
+/// state). When the function returns, the fetcher drops and its
+/// 1 MB sliding buffer is freed.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)] // shared template + per-worker inputs; bundling adds indirection without clarity gain
 pub fn process_one_chromosome<E>(
