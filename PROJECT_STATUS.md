@@ -19,7 +19,27 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** Posterior engine **emit-with-flag** for
+> - **Last completed task:** **Performance review of the FASTA fetcher**
+>   (`src/per_sample_pileup/ref_fetcher.rs`) after the Step-2
+>   `ChromRefFetcher` migration —
+>   [perf_ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/perf_ref_fetcher_2026-05-23.md).
+>   Verdict: **Apply the listed wins** — gated on H4 (benches don't
+>   compile). Profile evidence: `perf record --call-graph=dwarf` on
+>   `examples/profile_cohort_e2e --threads 4` against a real tomato
+>   N=10 cohort (58.85 s wall, 203 K samples) + Stage 1 pileup
+>   profile (30 K samples). Headline:
+>   `ChromRefBaseIter::next` is 10.96 % / 7.46 % wall and **4.02 % of
+>   total wall time is the `MutexGuard<StreamState>` drop alone** —
+>   per-base `Mutex::lock`/`unlock` on a fetcher whose own doc comment
+>   says "contention is zero by construction" (per-worker ownership).
+>   Four convergent Hot-path findings (H1 drop `Sync` + `RefCell`,
+>   H2 GAT-monomorphic `iter_bases`, H3 `fetch -> &[u8]`, H4 repair
+>   the four broken benches); 10 Likely (incl. `BufReader<File>`
+>   wrap, autovec uppercase pass, mimalloc on production binary,
+>   per-fetcher microbench); 4 Speculative; 5 Notes. BAQ-side
+>   fetcher (`ManualEvictChromRefFetcher`) is cold on this fixture
+>   (<0.1 % per-symbol); findings against it cap at Note.
+> - **Previous task:** Posterior engine **emit-with-flag** for
 >   non-converging records (commit `aab9ac0`). Records that hit
 >   `max_iterations` without satisfying `convergence_threshold` are
 >   now emitted with `FILTER=EMNoConv` instead of hard-erroring the
@@ -31,7 +51,7 @@ Skills and agents are instructed to leave it untouched.
 >   (~3.7 ppm of the cohort). Run summary surfaces the tally:
 >   `var-calling: ... records_emnoconv=5 (FILTER=EMNoConv; EM
 >   iteration cap)`. 850 lib tests + 39 integration tests pass.
-> - **Previous task:** **H1 (per-chromosome parallelism)** + **L1
+> - **Previous-previous task:** **H1 (per-chromosome parallelism)** + **L1
 >   (per-group `par_iter` removal)** for cohort `var-calling` — impl
 >   report
 >   [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md);
@@ -57,7 +77,7 @@ Skills and agents are instructed to leave it untouched.
 >   `0b1e958` (run_var_calling reshape + determinism integration
 >   test) → the bench validation + this status update.
 >   848 lib + 39 integration tests pass; clippy clean.
-> - **Previous-previous task:** End-to-end perf review of the `.psp` →
+> - **Earlier task:** End-to-end perf review of the `.psp` →
 >   cohort-VCF pipeline (Stages 3–6) on real tomato (SL4.0) data —
 >   [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md).
 >   Verdict: **Apply the listed wins.** Profile evidence: `perf record
@@ -76,7 +96,7 @@ Skills and agents are instructed to leave it untouched.
 >   release] debug = "line-tables-only"` → `debug = true`,
 >   SyncRefFetcher pre-warm, CSR decoder, SmallVec for AlleleObservation,
 >   per-group merger `par_iter` removal), 5 Speculative, 6 Notes.
-> - **Earlier task:** Cohort CLI follow-up **Wave 5**
+> - **Earlier-still task:** Cohort CLI follow-up **Wave 5**
 >   (Test infrastructure + missing coverage) fixes-applied
 >   2026-05-19 —
 >   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md).
@@ -192,6 +212,12 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Impl report (cohort slice):**
   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
 - **Latest reviews (cohort slice):**
+  [perf_ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/perf_ref_fetcher_2026-05-23.md)
+  (FASTA fetcher post-Step-2-migration — verdict: *Apply the listed
+  wins*, gated on H4; 4 Hot-path, 10 Likely, 4 Speculative;
+  headline: `ChromRefBaseIter::next` 10.96% wall with 4.02% on
+  `MutexGuard<StreamState>` drop alone — H1 drops the `Sync`
+  requirement, swaps `Mutex<StreamState>` for `RefCell<StreamState>`);
   [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md)
   (end-to-end perf review against real tomato data — verdict: *Apply
   the listed wins*; 7 Hot-path findings, 12 Likely, 5 Speculative;
@@ -226,6 +252,50 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   (Stage 1) and
   [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs)
   (cohort subcommands).
+- **Open (from 2026-05-23 ref-fetcher perf review):**
+  - **H4 (gate)** — Repair the four broken benches before any other
+    finding can be measured: `cohort_e2e_perf`, `var_calling_perf`,
+    `baq_perf`, `pileup_walker_scaling`. API drift from the Step-2
+    `ChromRefFetcher` migration (stale `SyncRefFetcher` import,
+    `CohortPipelineParams.fetcher`/`.chromosomes` field drift,
+    `drive_cohort_pipeline` arg count). Mechanical port; no new deps.
+  - **H1** — `src/per_sample_pileup/ref_fetcher.rs:117` —
+    `Mutex<StreamState>` → `RefCell<StreamState>` and relax
+    `SharedRefFetcher = Arc<dyn ChromRefFetcher + Send + Sync>` to
+    `Arc<dyn ChromRefFetcher + Send>`. Per-base mutex unlock is
+    4.02 % of cohort wall time; the `Mutex` is uncontended by
+    construction (per-worker ownership documented at L113-117).
+  - **H2** — `iter_bases` returns `Box<dyn Iterator>`; GAT-monomorphic
+    `type BaseIter<'a>` (or a `ChromRefFetcherTyped` subtrait that
+    keeps the dyn-safe surface intact) removes per-byte vtable
+    dispatch on the DUST mask scan.
+  - **H3** — `StreamingChromRefFetcher::fetch` returns owned `Vec<u8>`
+    where every PerGroupMerger consumer only borrows. Switch to
+    `&[u8]` — entangled with H1's `RefCell` (lands together).
+  - **L1 / L10** — Wrap `Source::File(File)` in `BufReader<File>` in
+    both `StreamingChromRefFetcher` and `ManualEvictChromRefFetcher`.
+  - **L2** — Autovec uppercase pass in `refill` /
+    `read_uppercased_bases` — strip-newlines via `filter+take+extend`
+    then `make_ascii_uppercase` on the destination slice.
+  - **L3** — `src/var_calling/dust_filter.rs:728` —
+    `io::Error::other(format!("{e}"))` → `io::Error::other(e)`
+    (drops the `String` alloc, preserves `source()`).
+  - **L5** — `ChromRefBaseIter::Drop` re-locks the mutex; folds
+    into H1 for free.
+  - **L6** — Add `[profile.release-with-debug]` to `Cargo.toml`
+    that `inherits = "release"` + `debug = true`, so future
+    profile captures reproduce the inlined-frame call-graph from
+    a clean checkout.
+  - **L7** — Wire `mimalloc::MiMalloc` as `#[global_allocator]`
+    behind `alloc-mimalloc` in `src/main.rs`. Glibc allocator
+    symbols sum to ~14.5 % cpu_atom / ~23.2 % cpu_core; gate
+    merge on a paired A/B against the 13-thread server.
+  - **L8** — Add `benches/ref_fetcher_perf.rs` with four
+    `criterion` functions (`streaming_iter_bases_full_contig`,
+    `streaming_fetch_per_group_window`, `manual_evict_fetch_then_evict`,
+    `refill_warm_cache`) so H1/H2/H3 effects can be localised below
+    the cohort_e2e noise floor.
+  - **L4 / L9 / S1–S4** — see the full report.
 - **Open (from 2026-05-20 perf review):**
   - **H1 — closed 2026-05-20** (per-chromosome parallelism shipped).
     Five-commit PR `309a5be` → `0b1e958`; impl report
