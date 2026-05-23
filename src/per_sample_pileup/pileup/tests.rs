@@ -9,16 +9,17 @@ use std::sync::Arc;
 
 use super::CigarOp;
 use super::MateRole;
+use super::MultiChromRefFetcher;
 use super::PreparedRead;
-use super::RefSeqFetcher;
 use super::WalkerConfig;
 use super::run;
+use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
 
 // ---------------------------------------------------------------------
 // MockFasta
 // ---------------------------------------------------------------------
 
-/// In-memory `RefSeqFetcher` implementation backed by a single
+/// In-memory `MultiChromRefFetcher` implementation backed by a single
 /// chromosome string. Tests inject their reference here directly
 /// instead of building a real FASTA file.
 #[derive(Debug, Clone)]
@@ -45,30 +46,38 @@ impl MockFasta {
     }
 }
 
-impl RefSeqFetcher for MockFasta {
+impl MultiChromRefFetcher for MockFasta {
     fn fetch(
         &self,
         chrom_id: u32,
         start_1based: u32,
         length: u32,
-    ) -> Result<Vec<u8>, std::io::Error> {
-        let chrom = self
-            .chromosomes
-            .get(chrom_id as usize)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "chrom"))?;
+    ) -> Result<Vec<u8>, ChromRefFetchError> {
+        let chrom_name = format!("chrom_id={chrom_id}");
+        let chrom =
+            self.chromosomes
+                .get(chrom_id as usize)
+                .ok_or_else(|| ChromRefFetchError::Io {
+                    contig_name: chrom_name.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("unknown chrom_id={chrom_id}"),
+                    ),
+                })?;
+        if start_1based == 0 {
+            return Err(ChromRefFetchError::InvalidStart);
+        }
+        let end_exclusive = start_1based + length;
+        if (end_exclusive - 1) as usize > chrom.len() {
+            return Err(ChromRefFetchError::OutOfBounds {
+                contig_name: chrom_name,
+                contig_length: chrom.len() as u32,
+                start: start_1based,
+                end: end_exclusive,
+            });
+        }
         let start_idx = (start_1based - 1) as usize;
         let end_idx = start_idx + length as usize;
-        if end_idx > chrom.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "fetch [{}, {}) past chrom len {}",
-                    start_1based,
-                    start_1based + length,
-                    chrom.len()
-                ),
-            ));
-        }
         Ok(chrom[start_idx..end_idx].to_vec())
     }
 }

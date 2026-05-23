@@ -1,42 +1,25 @@
-//! Reference-FASTA fetchers. One concrete impl —
-//! [`StreamingChromRefFetcher`] — backed by a sliding buffer that
-//! reads from disk on demand. Two trait-bridging adapters let it
-//! drop into both the new single-contig [`ChromRefFetcher`] API
-//! (used by cohort var-calling per-chrom workers) and the legacy
-//! multi-chrom `RefSeqFetcher` API (used by the Stage 1 walker, BAQ,
-//! and `var_calling_from_bam`).
+//! Reference-FASTA fetchers. Three types live here:
 //!
-//! ## Why one fetcher + two adapters, not one fetcher per access shape
+//! - [`StreamingChromRefFetcher`] — per-contig, sliding-buffer reader.
+//!   The workhorse for monotonic-forward access (cohort var-calling,
+//!   PerGroupMerger). Implements the single-contig typed-error
+//!   [`ChromRefFetcher`] trait. Bound to one contig at construction;
+//!   serves `fetch(start, length)` and `iter_bases()` through a 1 MB
+//!   sliding buffer.
+//! - [`ManualEvictChromRefFetcher`] — per-contig, caller-managed
+//!   buffer lifecycle. Designed for genuinely random-access patterns
+//!   within a known region (Stage 1 BAQ per-worker instance).
+//! - [`MultiChromStreamingRefFetcher`] — multi-contig fetcher used by
+//!   the Stage 1 pileup walker. Wraps a swappable
+//!   `StreamingChromRefFetcher` and rebuilds it on chrom transition.
+//!   Implements the multi-contig typed-error
+//!   [`super::pileup::MultiChromRefFetcher`] trait. `Sync` via an
+//!   internal `Mutex` (the only `Send + Sync` fetcher in the module).
 //!
-//! Earlier iterations had a separate fetcher type per access pattern
-//! (chrom-boundary-evicting for the walker, accumulating Sync cache
-//! for BAQ, single-chrom owned-bytes for cohort workers). The
-//! `unified_chrom_ref_fetcher` plan
-//! (`doc/devel/implementation_plans/unified_chrom_ref_fetcher.md`)
-//! collapsed that menu: the access pattern is encoded by *which
-//! adapter* a caller picks, not by which fetcher *type* exists. The
-//! sliding-buffer streamer underneath is the same in every case.
-//!
-//! ## Layout
-//!
-//! - [`StreamingChromRefFetcher`] — the workhorse. Bound to one
-//!   contig at construction; serves `fetch(start, length)` and
-//!   `iter_bases()` through a 1 MB sliding buffer. Implements both
-//!   the new [`ChromRefFetcher`] trait and (via the adapters below)
-//!   the legacy `RefSeqFetcher` trait.
-//! - [`WalkerLegacyAdapter`] — wraps a swappable
-//!   `StreamingChromRefFetcher` and exposes the legacy multi-chrom
-//!   `RefSeqFetcher` API for consumers that traverse multiple
-//!   contigs (Stage 1 walker, Stage 1 BAQ shared instance,
-//!   `var_calling_from_bam`). Rebuilds the inner streamer on chrom
-//!   transition. `Sync` via internal `Mutex`.
-//!
-//! Both adapters are transitional in spirit (the plan's step 3
-//! would migrate every legacy consumer to the new trait directly),
-//! but they're load-bearing today and would only go away if every
-//! multi-chrom consumer were restructured to per-chrom processing.
-//! That restructure is non-trivial; we ship the unified shape and
-//! revisit if the adapter layer becomes a real friction point.
+//! M12 (2026-05-23 code review): the legacy `RefSeqFetcher` trait
+//! (`io::Error`-returning, multi-chrom) was retired. All consumers
+//! migrated to the typed-error
+//! [`super::pileup::MultiChromRefFetcher`] trait.
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -48,7 +31,7 @@ use std::sync::Mutex;
 use noodles_fasta::fai;
 
 use super::cram_input::ContigList;
-use super::pileup::RefSeqFetcher;
+use super::pileup::MultiChromRefFetcher;
 
 /// Sliding-buffer size used by [`StreamingChromRefFetcher`]. 100× the
 /// `--var-group-max-span` default (10 KB), so under the
@@ -71,13 +54,13 @@ const STREAMING_REF_FILE_READ_CHUNK: usize = 64 * 1024;
 // StreamingChromRefFetcher — per-worker, sliding-buffer reader.
 // ---------------------------------------------------------------------
 
-/// `RefSeqFetcher` bound to one `chrom_id` that reads its bytes from
-/// disk through a small sliding buffer. Designed for the cohort
+/// Single-contig sliding-buffer FASTA reader. Implements the typed-
+/// error [`ChromRefFetcher`] trait. Designed for the cohort
 /// `var-calling` per-chromosome workers, where access to the contig
 /// is sequential and monotonically non-decreasing in position:
 ///
 /// - DUST mask construction does **one** forward sequential pass over
-///   the contig (see [`Self::bases`]).
+///   the contig (see [`ChromRefFetcher::iter_bases`]).
 /// - `PerGroupMerger` fetches small windows (≤ `--var-group-max-span`,
 ///   default 10 KB) at non-decreasing `start` positions.
 ///
@@ -90,21 +73,14 @@ const STREAMING_REF_FILE_READ_CHUNK: usize = 64 * 1024;
 /// one big read. With a warm page cache this is microseconds; with a
 /// cold cache the kernel readahead does the same work either way.
 ///
-/// **Contract.** `fetch` only answers for the bound `chrom_id`. The
-/// fetcher tolerates non-monotonic access today (refills on any
-/// miss), but is sized for the monotonic-forward case; a backwards
-/// seek beyond the sliding buffer triggers an extra refill (slow but
-/// correct). The follow-up
-/// [`unified_chrom_ref_fetcher`](../../../doc/devel/implementation_plans/unified_chrom_ref_fetcher.md)
-/// plan replaces this with an explicit `OutOfPattern` error.
-///
-/// Phase C of the
-/// [`reference_fasta_streaming`](../../../doc/devel/implementation_plans/reference_fasta_streaming.md)
-/// plan.
+/// **Contract.** Access must be monotonically non-decreasing in
+/// position. A backward jump beyond the sliding buffer returns
+/// [`ChromRefFetchError::OutOfPattern`]. Production callers
+/// (PerGroupMerger, DUST) satisfy this by construction; the
+/// [`MultiChromStreamingRefFetcher`] (the walker-side multi-contig
+/// wrapper) rebuilds the inner fetcher on chrom transition, so
+/// chrom-boundary backward jumps don't violate the contract either.
 pub struct StreamingChromRefFetcher {
-    /// Bound chromosome id. `fetch` calls with any other id are
-    /// rejected with `InvalidInput`.
-    chrom_id: u32,
     /// Contig name for error messages only.
     contig_name: String,
     /// `.fai` record for this contig — sequence start offset + line
@@ -197,45 +173,14 @@ impl ContigFai {
     }
 }
 
-/// Source of FASTA bytes for the streamer. Production uses a real
-/// `File`; tests use an in-memory `Vec<u8>` (`Cursor`) so the suite
-/// stays fast and hermetic.
-///
-/// M8 (2026-05-23 code review): the `Memory` variant is
-/// `#[cfg(test)]`-gated rather than always-present, so production
-/// builds carry no discriminant overhead for the test-only path
-/// and the `Source` enum is a single-variant production enum
-/// (which LLVM optimises out entirely).
-enum Source {
-    File(File),
-    #[cfg(test)]
-    Memory(io::Cursor<Vec<u8>>),
-}
-
-impl Source {
-    fn seek_to(&mut self, offset: u64) -> io::Result<()> {
-        match self {
-            Source::File(f) => {
-                f.seek(SeekFrom::Start(offset))?;
-            }
-            #[cfg(test)]
-            Source::Memory(c) => {
-                c.seek(SeekFrom::Start(offset))?;
-            }
-        }
-        Ok(())
-    }
-    fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Source::File(f) => f.read(buf),
-            #[cfg(test)]
-            Source::Memory(c) => c.read(buf),
-        }
-    }
-}
-
 struct StreamState {
-    source: Source,
+    /// Production reads from a `File`; tests reach the same code path
+    /// through real on-disk fixtures (`build_fasta` /
+    /// `build_line_wrapped_fasta` in the test module), so we don't
+    /// carry an in-memory variant. The previous `enum Source { File,
+    /// Memory }` was retired when M12 deleted the legacy
+    /// `from_memory` test helper.
+    source: File,
     /// Uppercased, newline-stripped bases currently resident.
     /// Length ≤ `STREAMING_REF_BUFFER_BYTES`.
     buf: Vec<u8>,
@@ -243,245 +188,6 @@ struct StreamState {
     /// cover contig positions `[buf_start_base, buf_start_base + buf.len())`.
     /// Zero when no buffer has been filled yet.
     buf_start_base: u32,
-}
-
-impl StreamingChromRefFetcher {
-    /// Open the FASTA at `fasta_path`, parse the sibling `.fai`, look
-    /// up `contig_name`, and return a fetcher ready to serve `fetch`
-    /// calls for `chrom_id`. The contig's bytes are **not** loaded
-    /// here — that happens lazily on the first fetch.
-    pub fn new(fasta_path: &Path, chrom_id: u32, contig_name: String) -> io::Result<Self> {
-        let mut fai_pathbuf: OsString = fasta_path.as_os_str().to_os_string();
-        fai_pathbuf.push(".fai");
-        let fai_path = PathBuf::from(fai_pathbuf);
-        let index = fai::fs::read(&fai_path)?;
-        let record = index
-            .as_ref()
-            .iter()
-            .find(|r| AsRef::<[u8]>::as_ref(r.name()) == contig_name.as_bytes())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("contig {contig_name} not in FASTA index"),
-                )
-            })?;
-        let length = u32::try_from(record.length()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "contig {} length {} exceeds u32::MAX",
-                    contig_name,
-                    record.length()
-                ),
-            )
-        })?;
-        let line_bases = u32::try_from(record.line_bases()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                ".fai line_bases exceeds u32::MAX",
-            )
-        })?;
-        let line_width = u32::try_from(record.line_width()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                ".fai line_width exceeds u32::MAX",
-            )
-        })?;
-        let fai = ContigFai {
-            seq_offset: record.offset(),
-            length,
-            line_bases,
-            line_width,
-        };
-        // B1: reject malformed .fai (line_bases = 0, etc.) before
-        // any fetch can panic on the offset arithmetic.
-        fai.validate(&contig_name)?;
-        let file = File::open(fasta_path)?;
-        Ok(Self {
-            chrom_id,
-            contig_name,
-            fai,
-            inner: RefCell::new(StreamState {
-                source: Source::File(file),
-                buf: Vec::with_capacity(STREAMING_REF_BUFFER_BYTES),
-                buf_start_base: 0,
-            }),
-        })
-    }
-
-    /// Test-only constructor: stream bytes out of an in-memory FASTA
-    /// blob instead of a real file. The blob must be a single
-    /// well-formed contig (one `>name\n` header line followed by
-    /// `line_bases`-wrapped sequence lines, ending with the contig's
-    /// final line). Used by the unit tests to keep the suite
-    /// hermetic + fast.
-    #[cfg(test)]
-    fn from_memory(
-        fasta_blob: Vec<u8>,
-        chrom_id: u32,
-        contig_name: String,
-        seq_offset: u64,
-        length: u32,
-        line_bases: u32,
-        line_width: u32,
-    ) -> Self {
-        Self {
-            chrom_id,
-            contig_name,
-            fai: ContigFai {
-                seq_offset,
-                length,
-                line_bases,
-                line_width,
-            },
-            inner: RefCell::new(StreamState {
-                source: Source::Memory(io::Cursor::new(fasta_blob)),
-                buf: Vec::with_capacity(STREAMING_REF_BUFFER_BYTES),
-                buf_start_base: 0,
-            }),
-        }
-    }
-
-    /// Bound chromosome id. Test-only.
-    #[cfg(test)]
-    pub fn chrom_id(&self) -> u32 {
-        self.chrom_id
-    }
-
-    /// Forward sequential iterator over every uppercased base of the
-    /// contig. Pulls bytes through the streamer's sliding buffer one
-    /// at a time, refilling on demand. Used by the DUST mask
-    /// construction in
-    /// [`crate::var_calling::dust_filter::DustFilter::ensure_mask_for`].
-    pub fn bases(&self) -> StreamingBaseIter<'_> {
-        StreamingBaseIter {
-            fetcher: self,
-            next_base: 1,
-            done: false,
-        }
-    }
-}
-
-impl RefSeqFetcher for StreamingChromRefFetcher {
-    fn iter_bases<'a>(
-        &'a self,
-        chrom_id: u32,
-        length: u32,
-    ) -> Result<Box<dyn Iterator<Item = io::Result<u8>> + 'a>, io::Error> {
-        if chrom_id != self.chrom_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "iter_bases on chrom_id {chrom_id} but this fetcher is bound to chrom_id {} ({})",
-                    self.chrom_id, self.contig_name
-                ),
-            ));
-        }
-        if length != self.fai.length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "iter_bases asked for {length} bases but contig {} has length {}",
-                    self.contig_name, self.fai.length
-                ),
-            ));
-        }
-        // Override: stream through the sliding buffer instead of
-        // materialising the contig.
-        Ok(Box::new(self.bases()))
-    }
-
-    fn fetch(&self, chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
-        if chrom_id != self.chrom_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "fetch on chrom_id {chrom_id} but this fetcher is bound to chrom_id {} ({})",
-                    self.chrom_id, self.contig_name
-                ),
-            ));
-        }
-        if start_1based == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "start_1based must be >= 1",
-            ));
-        }
-        let end_1based = start_1based
-            .checked_add(length)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow"))?;
-        if end_1based.saturating_sub(1) > self.fai.length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "fetch [{}, {}) past contig {} length {}",
-                    start_1based, end_1based, self.contig_name, self.fai.length
-                ),
-            ));
-        }
-
-        let mut state = self.inner.borrow_mut();
-        // Check if the requested window already lies inside the
-        // current buffer; refill otherwise.
-        let buf_covers = !state.buf.is_empty()
-            && start_1based >= state.buf_start_base
-            && (end_1based as u64) <= state.buf_start_base as u64 + state.buf.len() as u64;
-        if !buf_covers {
-            // Refill at least the requested span, capped at the
-            // configured buffer size. If the request exceeds the
-            // buffer size (rare — would mean a single fetch larger
-            // than `STREAMING_REF_BUFFER_BYTES`), grow the buffer for
-            // this one call. The capacity stays at the larger value
-            // afterward, but typical access keeps it at 1 MB.
-            let want = (length as usize).max(STREAMING_REF_BUFFER_BYTES);
-            refill(&mut state, &self.fai, start_1based, want)?;
-        }
-        let start_idx = (start_1based - state.buf_start_base) as usize;
-        let end_idx = start_idx + length as usize;
-        Ok(state.buf[start_idx..end_idx].to_vec())
-    }
-}
-
-/// Iterator over uppercased contig bases, in 1..=length order. Yields
-/// `io::Result<u8>` so the caller can surface refill errors. Used by
-/// the DUST mask construction; one logical pass per chrom.
-pub struct StreamingBaseIter<'a> {
-    fetcher: &'a StreamingChromRefFetcher,
-    /// 1-based coordinate of the next base to yield.
-    next_base: u32,
-    /// Latches on the first error so subsequent `next()` calls return
-    /// `None` (matches the convention for fused error-returning
-    /// iterators).
-    done: bool,
-}
-
-impl Iterator for StreamingBaseIter<'_> {
-    type Item = io::Result<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done || self.next_base > self.fetcher.fai.length {
-            return None;
-        }
-        let mut state = self.fetcher.inner.borrow_mut();
-        let need_refill = state.buf.is_empty()
-            || self.next_base < state.buf_start_base
-            || (self.next_base as u64) >= state.buf_start_base as u64 + state.buf.len() as u64;
-        if need_refill
-            && let Err(e) = refill(
-                &mut state,
-                &self.fetcher.fai,
-                self.next_base,
-                STREAMING_REF_BUFFER_BYTES,
-            )
-        {
-            self.done = true;
-            return Some(Err(e));
-        }
-        let idx = (self.next_base - state.buf_start_base) as usize;
-        let byte = state.buf[idx];
-        self.next_base += 1;
-        Some(Ok(byte))
-    }
 }
 
 /// Seek to `target_base_1based` in the FASTA and fill `state.buf`
@@ -495,7 +201,7 @@ fn refill(
     want: usize,
 ) -> io::Result<()> {
     let offset = fai.base_to_file_offset(target_base_1based);
-    state.source.seek_to(offset)?;
+    state.source.seek(SeekFrom::Start(offset))?;
     state.buf.clear();
     state.buf_start_base = target_base_1based;
 
@@ -510,7 +216,7 @@ fn refill(
     // `target_len` bases (or the source runs out, which is an error).
     let mut read_buf = [0u8; STREAMING_REF_FILE_READ_CHUNK];
     while state.buf.len() < target_len {
-        let n = state.source.read_chunk(&mut read_buf)?;
+        let n = state.source.read(&mut read_buf)?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -542,22 +248,20 @@ fn refill(
 // New unified ChromRefFetcher API (in-flight migration).
 // ---------------------------------------------------------------------
 //
-// The trait below is the target shape for the
-// `unified_chrom_ref_fetcher` plan. It coexists with the legacy
-// `RefSeqFetcher` trait during migration; consumers move one at a
-// time. Once every consumer is on the new trait, the old one (and
-// the old fetcher types that only implement it) get deleted.
+// The trait below is the single-contig typed-error fetcher API
+// used by per-chrom consumers (DUST, PerGroupMerger). The
+// multi-contig sibling is [`super::pileup::MultiChromRefFetcher`]
+// (used by the Stage 1 walker). Both use [`ChromRefFetchError`].
 //
-// Differences from the legacy trait:
+// Design choices:
 //
 // - **No `chrom_id` parameter.** The fetcher is bound to one contig
-//   at construction; passing `chrom_id` to every call was redundant
-//   and validated-but-never-useful (single-chrom impls returned
-//   `InvalidInput` on mismatch).
+//   at construction; the multi-contig wrapper
+//   [`MultiChromStreamingRefFetcher`] rebuilds the inner fetcher on
+//   chrom transition rather than passing chrom ids per call.
 // - **Typed error.** `ChromRefFetchError` distinguishes "I/O
 //   failure", "out of contig bounds", and "out of access pattern"
-//   so consumers can route them differently. The legacy trait uses
-//   `io::Error` for everything.
+//   so consumers can route them differently.
 // - **`OutOfPattern` is the load-bearing contract.** A streaming
 //   impl errors when a `fetch` start lies before the current sliding
 //   buffer's origin. The contract is "monotonic non-decreasing
@@ -762,10 +466,11 @@ impl<T: ChromRefFetcher + ?Sized> ChromRefFetcher for &T {
 }
 
 impl StreamingChromRefFetcher {
-    /// New-API constructor bound to one contig by name. Internally
-    /// stores the same state as the legacy [`Self::new`] but with
-    /// `chrom_id = 0` (the new trait doesn't expose `chrom_id`, so
-    /// the stored value is meaningless for new-API consumers).
+    /// Constructor bound to one contig by name. Opens the FASTA,
+    /// parses the sibling `.fai`, looks up the contig, and returns
+    /// a fetcher ready to serve `fetch` calls. The contig's bytes
+    /// are **not** loaded here — the sliding buffer fills lazily on
+    /// the first fetch.
     ///
     /// Allocates a sliding buffer of [`STREAMING_REF_BUFFER_BYTES`]
     /// (= 1 MiB by default) — the buffer is filled lazily on the
@@ -900,11 +605,10 @@ impl StreamingChromRefFetcher {
             source,
         })?;
         Ok(Self {
-            chrom_id: 0, // unused under the new API
             contig_name: contig_name.to_string(),
             fai,
             inner: RefCell::new(StreamState {
-                source: Source::File(file),
+                source: file,
                 buf: Vec::with_capacity(buffer_bytes),
                 buf_start_base: 0,
             }),
@@ -1081,50 +785,49 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
 }
 
 // ---------------------------------------------------------------------
-// WalkerLegacyAdapter — multi-chrom, single-thread bridge.
+// MultiChromStreamingRefFetcher — multi-chrom, single-thread bridge.
 // ---------------------------------------------------------------------
 //
 // Bridge for consumers that traverse multiple chromosomes in
-// sequence with a single thread — the Stage 1 pileup walker today.
-// On each chrom transition the inner [`StreamingChromRefFetcher`]
-// is rebuilt for the new contig; fetches within a chrom hit the
-// same sliding buffer.
-//
-// Transitional. A future migration replaces this adapter with a
-// direct `ChromRefFetcher` consumer in the Stage 1 walker.
+// sequence — the Stage 1 pileup walker today. On each chrom
+// transition the inner [`StreamingChromRefFetcher`] is rebuilt for
+// the new contig; fetches within a chrom hit the same sliding
+// buffer.
 
-/// Adapter that maintains *one* [`StreamingChromRefFetcher`] at a
-/// time, swapping it when [`RefSeqFetcher::fetch`] is called with a
-/// different `chrom_id` than the currently-bound contig. Implements
-/// the legacy `RefSeqFetcher` trait so it drops into existing
-/// walker plumbing.
+/// Multi-contig FASTA fetcher used by the Stage 1 pileup walker.
+/// Maintains *one* [`StreamingChromRefFetcher`] at a time, rebuilding
+/// it on the first `fetch` call for a different `chrom_id`.
+/// Implements [`MultiChromRefFetcher`], so it drops into the walker's
+/// generic plumbing.
 ///
 /// `Sync` via internal `Mutex<Option<...>>`. The walker itself is
 /// single-threaded so the Mutex is uncontended; `var_calling_from_bam`
-/// also uses this adapter and passes it through `Arc<dyn
-/// RefSeqFetcher + Send + Sync>`, so the `Sync` bound is real.
+/// also uses this fetcher and passes it through `Arc<dyn
+/// MultiChromRefFetcher + Send + Sync>`, so the `Sync` bound is real.
 /// Stage 1's BAQ uses a separate per-rayon-worker
 /// [`ManualEvictChromRefFetcher`] (built inside `BaqStream`'s
 /// `map_init`); BAQ does **not** share a fetcher with the walker
 /// — the access patterns are too different for one abstraction
 /// to serve both.
 ///
-/// Behaviour on chrom transition: the existing inner is dropped
-/// (releasing its sliding buffer), a fresh
+/// Behaviour on chrom transition: a fresh
 /// [`StreamingChromRefFetcher::for_contig`] is built for the new
-/// chrom (open file + parse .fai), and the call delegates via the
-/// legacy *tolerant* `RefSeqFetcher::fetch` path (silent backward
-/// refill). The walker doesn't need the strict `OutOfPattern`
-/// contract — its single-thread sequential access pattern doesn't
-/// produce backward jumps in the first place, and tolerating the
-/// rare one is simpler than adding monotonicity to its contract.
-pub struct WalkerLegacyAdapter {
+/// chrom *outside* the lock (M16 of the 2026-05-23 code review —
+/// the inner-fetcher build does the .fai parse + `File::open` work,
+/// which is millisecond-scale and shouldn't serialise other walker
+/// threads). The old fetcher is dropped when the new one is
+/// installed; both are briefly resident across the swap.
+/// Within-chrom fetches delegate to the strict
+/// [`ChromRefFetcher::fetch`] on the inner; the walker's
+/// single-threaded sequential access pattern satisfies the
+/// monotonic-forward contract.
+pub struct MultiChromStreamingRefFetcher {
     fasta_path: PathBuf,
     contigs: ContigList,
     inner: Mutex<Option<(u32, StreamingChromRefFetcher)>>,
 }
 
-impl WalkerLegacyAdapter {
+impl MultiChromStreamingRefFetcher {
     /// Build an adapter bound to a FASTA. No inner fetcher is
     /// constructed yet — the first `fetch` triggers the lazy load.
     pub fn new(fasta_path: PathBuf, contigs: ContigList) -> Self {
@@ -1134,71 +837,116 @@ impl WalkerLegacyAdapter {
             inner: Mutex::new(None),
         }
     }
+
+    /// M4: surface poison as a typed error rather than swallowing it.
+    /// The walker is single-threaded inside a chrom worker; the only
+    /// way to poison this mutex is for the inner
+    /// `StreamingChromRefFetcher::for_contig` rebuild to panic (which
+    /// panic-frees the critical section, leaving `inner = None`).
+    /// Returning here lets the caller terminate the chrom worker
+    /// rather than silently continuing with a possibly-inconsistent
+    /// inner state.
+    fn lock_inner(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, Option<(u32, StreamingChromRefFetcher)>>,
+        ChromRefFetchError,
+    > {
+        self.inner.lock().map_err(|_poison| ChromRefFetchError::Io {
+            contig_name: String::from("<walker-adapter>"),
+            source: io::Error::new(
+                io::ErrorKind::Other,
+                "MultiChromStreamingRefFetcher mutex poisoned (prior panic during rebuild)",
+            ),
+        })
+    }
 }
 
-impl RefSeqFetcher for WalkerLegacyAdapter {
-    fn fetch(&self, chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
-        let mut slot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let needs_rebuild = match slot.as_ref() {
-            Some((current, _)) => *current != chrom_id,
-            None => true,
+// M23 (2026-05-23 code review): MultiChromStreamingRefFetcher is the only
+// `Send + Sync` fetcher in the module — Stage 1 reader threads share
+// it through `Arc<dyn MultiChromRefFetcher + Send + Sync>`. Compile-
+// time assertion guards both bounds; a future field change that
+// flipped either would silently break the walker.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MultiChromStreamingRefFetcher>();
+};
+
+impl MultiChromRefFetcher for MultiChromStreamingRefFetcher {
+    fn fetch(
+        &self,
+        chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, ChromRefFetchError> {
+        // M16: rebuild outside the lock. The lock is taken twice (once
+        // to check, once to install), but each critical section is
+        // tiny (a pointer comparison or a single move). Previously the
+        // lock was held across `for_contig` (file open + .fai parse +
+        // contig lookup), serialising every walker thread through a
+        // millisecond-scale operation.
+        let needs_rebuild = {
+            let slot = self.lock_inner()?;
+            !matches!(slot.as_ref(), Some((current, _)) if *current == chrom_id)
         };
+
         if needs_rebuild {
             let entry = self.contigs.entries.get(chrom_id as usize).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "WalkerLegacyAdapter: chrom_id {chrom_id} out of range (have {} contigs)",
-                        self.contigs.entries.len()
+                ChromRefFetchError::Io {
+                    contig_name: String::from("<walker-adapter>"),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "MultiChromStreamingRefFetcher: chrom_id {chrom_id} out of range \
+                             (have {} contigs)",
+                            self.contigs.entries.len()
+                        ),
                     ),
-                )
+                }
             })?;
-            // Drop the old fetcher (releases its sliding buffer)
-            // before building the new one to keep peak memory at
-            // one contig's working set, not two.
-            *slot = None;
-            let fresh = StreamingChromRefFetcher::for_contig(&self.fasta_path, &entry.name)
-                .map_err(legacy_io_error)?;
+            // Build outside the lock (the expensive step: .fai parse
+            // + File::open + ContigFai::validate). The old fetcher
+            // for the previous chrom is still resident in the slot
+            // here, so peak memory briefly covers two contig
+            // working sets — accepted to keep the lock-holding
+            // window minimal.
+            let fresh = StreamingChromRefFetcher::for_contig(&self.fasta_path, &entry.name)?;
+            // Install the new fetcher; the old one drops here.
+            let mut slot = self.lock_inner()?;
             *slot = Some((chrom_id, fresh));
         }
-        let (_, inner) = slot.as_ref().expect("post-rebuild slot is populated");
-        // Use the legacy *tolerant* `RefSeqFetcher::fetch` on the
-        // inner (silent backward refill), not the new strict
-        // `ChromRefFetcher::fetch` with the `OutOfPattern` check.
-        // The strict contract suits the cohort var-calling path
-        // (monotonic by construction); the walker just needs a
-        // working multi-chrom fetcher and doesn't care about the
-        // contract.
-        //
-        // The inner's `chrom_id` field is 0 (set by `for_contig`);
-        // the legacy `fetch`'s `chrom_id == self.chrom_id` check
-        // accepts 0.
-        RefSeqFetcher::fetch(inner, 0, start_1based, length)
+
+        let slot = self.lock_inner()?;
+        // PANIC-FREE: when `needs_rebuild` was true, the block above
+        // installed `Some((chrom_id, _))` before releasing the lock;
+        // when it was false, the slot was already
+        // `Some((chrom_id, _))` from the matches! check. A concurrent
+        // racer could have rebuilt for a *different* chrom_id between
+        // our install and this re-lock — in that case we'd fall
+        // through, but the walker is single-threaded per chrom so
+        // this can't happen in production. Returning a typed error
+        // rather than panicking on the race is defence in depth.
+        let (_, inner) = match slot.as_ref() {
+            Some(pair) if pair.0 == chrom_id => pair,
+            _ => {
+                return Err(ChromRefFetchError::Io {
+                    contig_name: String::from("<walker-adapter>"),
+                    source: io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "MultiChromStreamingRefFetcher: slot raced — expected chrom_id {chrom_id} \
+                             but found a different binding"
+                        ),
+                    ),
+                });
+            }
+        };
+        ChromRefFetcher::fetch(inner, start_1based, length)
     }
 
     // iter_bases falls back to the trait default. The walker doesn't
     // use it (only DUST / PerGroupMerger in the var-calling pipeline
     // do), so defining it explicitly would be dead code.
-}
-
-/// Map [`ChromRefFetchError`] back into the legacy `io::Error`
-/// shape. The legacy trait returns `io::Result`; until the
-/// consumer-side migration in step 3 we have to flatten the typed
-/// error here. Each variant picks the closest `io::ErrorKind` so
-/// the legacy error-handling code still routes correctly.
-fn legacy_io_error(e: ChromRefFetchError) -> io::Error {
-    match e {
-        ChromRefFetchError::Io { source, .. } => source,
-        ChromRefFetchError::InvalidStart => {
-            io::Error::new(io::ErrorKind::InvalidInput, "start_1based must be >= 1")
-        }
-        ChromRefFetchError::OutOfBounds { .. } => {
-            io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string())
-        }
-        ChromRefFetchError::OutOfPattern { .. } => {
-            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
-        }
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1633,269 +1381,15 @@ mod tests {
     // StreamingChromRefFetcher tests
     // ---------------------------------------------------------------
 
-    /// Build an in-memory FASTA blob with a single contig wrapped at
-    /// `line_bases` chars per line, plus the `.fai`-equivalent
-    /// numbers (offset, length, line_bases, line_width). Used to
-    /// drive [`StreamingChromRefFetcher::from_memory`] without
-    /// touching disk.
-    fn build_memory_fasta(
-        name: &str,
-        seq: &[u8],
-        line_bases: u32,
-    ) -> (
-        Vec<u8>,
-        u64, /* seq_offset */
-        u32, /* line_width */
-    ) {
-        let header = format!(">{name}\n");
-        let mut blob = header.as_bytes().to_vec();
-        let seq_offset = blob.len() as u64;
-        let lb = line_bases as usize;
-        let mut i = 0;
-        while i < seq.len() {
-            let end = (i + lb).min(seq.len());
-            blob.extend_from_slice(&seq[i..end]);
-            blob.push(b'\n');
-            i = end;
-        }
-        let line_width = line_bases + 1;
-        (blob, seq_offset, line_width)
-    }
-
-    #[test]
-    fn streaming_fetcher_returns_bytes_for_bound_chrom() {
-        // 50-base contig wrapped at 50/line (single line). Fetch a
-        // window in the middle and assert the right bytes come back.
-        let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAN";
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", seq, 50);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            50,
-            line_width,
-        );
-        assert_eq!(fetcher.chrom_id(), 0);
-
-        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 5, 4).expect("fetch");
-        // 1-based start=5, length=4 → bytes at indices 4..8.
-        assert_eq!(bytes, &seq[4..8]);
-    }
-
-    #[test]
-    fn streaming_fetcher_serves_line_wrapped_contig() {
-        // 250-base contig wrapped at 60 chars/line (Ensembl default).
-        // Multiple fetches across line boundaries; every one must
-        // return the correct bases without picking up newlines.
-        let seq: Vec<u8> = (0..250).map(|i| b"ACGT"[i % 4]).collect();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 60);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            60,
-            line_width,
-        );
-
-        // Spans across line boundary.
-        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 58, 5).expect("fetch");
-        assert_eq!(bytes, seq[57..62]);
-        // Wholly inside one line.
-        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 70, 10).expect("fetch");
-        assert_eq!(bytes, seq[69..79]);
-    }
-
-    #[test]
-    fn streaming_fetcher_uppercases_soft_masked_bases() {
-        // Lowercase input → uppercased output. Same contract as the
-        // other fetchers.
-        let seq = b"ACGTacgtNnacgtACGT".to_vec();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 18);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            18,
-            line_width,
-        );
-        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 1, seq.len() as u32).expect("fetch");
-        assert_eq!(bytes, b"ACGTACGTNNACGTACGT");
-    }
-
-    #[test]
-    fn streaming_fetcher_buffer_refill_on_forward_jump() {
-        // Two fetches separated by a gap larger than the buffer.
-        // Validates the refill path: second fetch must re-seek and
-        // return the right bytes. We use a small synthetic buffer
-        // size by jumping past `STREAMING_REF_BUFFER_BYTES` worth of
-        // bases; cheaper to assert correctness with two short
-        // fetches at distant positions on a 2 MB contig.
-        let seq: Vec<u8> = (0..2_000_000_u32)
-            .map(|i| b"ACGT"[(i % 4) as usize])
-            .collect();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 80);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            80,
-            line_width,
-        );
-        // Fetch near the start.
-        let a = RefSeqFetcher::fetch(&fetcher, 0, 100, 16).expect("fetch a");
-        assert_eq!(a, seq[99..115]);
-        // Then jump well past the 1 MB buffer.
-        let b = RefSeqFetcher::fetch(&fetcher, 0, 1_500_000, 16).expect("fetch b");
-        assert_eq!(b, seq[1_499_999..1_500_015]);
-    }
-
-    #[test]
-    fn streaming_fetcher_buffer_refill_on_backward_jump() {
-        // Backward jump after a forward fetch. The streamer should
-        // detect the buffer miss and refill from the new (earlier)
-        // position. Documents the slower path; production access
-        // never hits this (PerGroupMerger is monotonic), but tests
-        // pin the behaviour.
-        let seq: Vec<u8> = (0..2_000_000_u32)
-            .map(|i| b"ACGT"[(i % 4) as usize])
-            .collect();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 80);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            80,
-            line_width,
-        );
-        let _ = RefSeqFetcher::fetch(&fetcher, 0, 1_500_000, 16).expect("fetch forward");
-        let back = RefSeqFetcher::fetch(&fetcher, 0, 100, 16).expect("fetch back");
-        assert_eq!(back, seq[99..115]);
-    }
-
-    #[test]
-    fn streaming_fetcher_fetch_past_contig_end_returns_unexpected_eof() {
-        let seq = b"ACGTACGTAC".to_vec();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 10);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            10,
-            line_width,
-        );
-        let err = RefSeqFetcher::fetch(&fetcher, 0, 8, 5).expect_err("must fail");
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-    }
-
-    #[test]
-    fn streaming_fetcher_fetch_on_wrong_chrom_id_errors() {
-        let seq = b"ACGT".to_vec();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 4);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            4,
-            line_width,
-        );
-        let err = RefSeqFetcher::fetch(&fetcher, 7, 1, 4).expect_err("must fail");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn streaming_fetcher_fetch_start_zero_is_rejected() {
-        let seq = b"ACGT".to_vec();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 4);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            4,
-            line_width,
-        );
-        let err = RefSeqFetcher::fetch(&fetcher, 0, 0, 1).expect_err("must fail");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn streaming_fetcher_construct_missing_contig_errors() {
-        // Real-file path: build a FASTA with one contig and try to
-        // open a fetcher for a contig that's not in the .fai.
-        let specs = vec![ContigSpec {
-            name: "chr0".into(),
-            length: 10,
-        }];
-        let (_dir, path) = build_fasta(&specs).expect("fasta");
-        assert!(StreamingChromRefFetcher::new(&path, 7, "chr_missing".into()).is_err());
-    }
-
-    #[test]
-    fn streaming_fetcher_bases_iterator_yields_uppercased_contig_in_order() {
-        // DUST mask path: bases() iterator must yield every contig
-        // base in 1..=length order, uppercased, exactly once. No
-        // newlines, no headers.
-        let seq: Vec<u8> = (0..200).map(|i| b"acgtACGTN"[i % 9]).collect();
-        let mut expected: Vec<u8> = seq.clone();
-        expected.make_ascii_uppercase();
-        let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 50);
-        let fetcher = StreamingChromRefFetcher::from_memory(
-            blob,
-            0,
-            "chr0".into(),
-            seq_offset,
-            seq.len() as u32,
-            50,
-            line_width,
-        );
-        let got: Vec<u8> = fetcher.bases().map(|b| b.expect("base")).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn streaming_fetcher_against_real_file() {
-        // Smoke test: the production constructor (real File + real
-        // .fai) returns the expected uppercase 'A' bytes that
-        // `build_fasta` writes for a 64-base contig.
-        let specs = vec![ContigSpec {
-            name: "chr0".into(),
-            length: 64,
-        }];
-        let (_dir, path) = build_fasta(&specs).expect("fasta");
-        let streaming = StreamingChromRefFetcher::new(&path, 0, "chr0".into()).expect("fetcher");
-
-        for (start, length) in [(1u32, 16u32), (8, 32), (50, 14), (64, 1)] {
-            let bytes = RefSeqFetcher::fetch(&streaming, 0, start, length).expect("streaming");
-            let expected = vec![b'A'; length as usize];
-            assert_eq!(bytes, expected, "mismatch at start={start} length={length}");
-        }
-    }
-
     // ---------------------------------------------------------------
     // ChromRefFetcher (new API) tests
     // ---------------------------------------------------------------
     //
-    // The new trait coexists with the legacy `RefSeqFetcher` impl on
-    // the same struct. These tests exercise the new-API methods:
-    // `for_contig` construction, `length()`, `fetch(start, length)`
-    // (without chrom_id), `iter_bases()` (with buffer reset
-    // semantics), and the `OutOfPattern` contract on backward
-    // jumps beyond the buffer.
+    // These tests exercise the new-API methods: `for_contig`
+    // construction, `length()`, `fetch(start, length)` (without
+    // chrom_id), `iter_bases()` (with buffer reset semantics), and
+    // the `OutOfPattern` contract on backward jumps beyond the
+    // buffer.
 
     use std::fs::File as StdFile;
     use std::io::Write as _;
@@ -2162,19 +1656,19 @@ mod tests {
         ];
         let (_dir, path) = build_fasta(&specs).expect("fasta");
         let contigs = contig_list(&[("chr0", 16), ("chr1", 24)]);
-        let adapter = WalkerLegacyAdapter::new(path, contigs);
+        let adapter = MultiChromStreamingRefFetcher::new(path, contigs);
 
         assert_eq!(
-            RefSeqFetcher::fetch(&adapter, 0, 1, 4).expect("chr0"),
+            MultiChromRefFetcher::fetch(&adapter, 0, 1, 4).expect("chr0"),
             b"AAAA"
         );
         assert_eq!(
-            RefSeqFetcher::fetch(&adapter, 1, 1, 4).expect("chr1"),
+            MultiChromRefFetcher::fetch(&adapter, 1, 1, 4).expect("chr1"),
             b"AAAA"
         );
         // Switch back: forces another swap.
         assert_eq!(
-            RefSeqFetcher::fetch(&adapter, 0, 5, 4).expect("chr0 again"),
+            MultiChromRefFetcher::fetch(&adapter, 0, 5, 4).expect("chr0 again"),
             b"AAAA"
         );
     }
@@ -2187,20 +1681,24 @@ mod tests {
         }];
         let (_dir, path) = build_fasta(&specs).expect("fasta");
         let contigs = contig_list(&[("chr0", 8)]);
-        let adapter = WalkerLegacyAdapter::new(path, contigs);
+        let adapter = MultiChromStreamingRefFetcher::new(path, contigs);
 
-        let err = RefSeqFetcher::fetch(&adapter, 99, 1, 4).expect_err("must fail");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let err = MultiChromRefFetcher::fetch(&adapter, 99, 1, 4).expect_err("must fail");
+        match err {
+            ChromRefFetchError::Io { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
     }
 
     #[test]
     fn walker_adapter_holds_one_chrom_at_a_time() {
         // Sequential fetches across two chroms; only one inner
-        // StreamingChromRefFetcher is resident at any time. We
-        // verify the swap happened by checking that fetching from
-        // an out-of-bounds offset on the previously-loaded chrom
-        // (after the swap) errors — confirming the inner is now
-        // bound to the new chrom.
+        // StreamingChromRefFetcher is resident at any time. After a
+        // swap to chr1 the adapter's `inner` slot is bound to chr1.
+        // Fetching chr0 again forces another rebuild; an out-of-bounds
+        // request on chr0 (8 bases) for 32 must surface OutOfBounds.
         let specs = vec![
             ContigSpec {
                 name: "chr0".into(),
@@ -2213,19 +1711,20 @@ mod tests {
         ];
         let (_dir, path) = build_fasta(&specs).expect("fasta");
         let contigs = contig_list(&[("chr0", 8), ("chr1", 32)]);
-        let adapter = WalkerLegacyAdapter::new(path, contigs);
+        let adapter = MultiChromStreamingRefFetcher::new(path, contigs);
 
         // Load chr0.
-        RefSeqFetcher::fetch(&adapter, 0, 1, 4).expect("chr0 load");
+        MultiChromRefFetcher::fetch(&adapter, 0, 1, 4).expect("chr0 load");
         // Switch to chr1 — long fetch only works on chr1.
-        let bytes = RefSeqFetcher::fetch(&adapter, 1, 1, 32).expect("chr1 full");
+        let bytes = MultiChromRefFetcher::fetch(&adapter, 1, 1, 32).expect("chr1 full");
         assert_eq!(bytes.len(), 32);
-        // Fetching chr1's full length on chr0 (8 bases) should error
-        // (the inner is now bound to chr1, but legacy fetch chrom_id
-        // = 0 forces a swap back to chr0 which then errors on the
-        // out-of-bounds 32-base request).
-        let err = RefSeqFetcher::fetch(&adapter, 0, 1, 32).expect_err("must fail");
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // After switching back to chr0, a 32-base fetch must error
+        // (chr0 is only 8 bases).
+        let err = MultiChromRefFetcher::fetch(&adapter, 0, 1, 32).expect_err("must fail");
+        assert!(
+            matches!(err, ChromRefFetchError::OutOfBounds { .. }),
+            "expected OutOfBounds, got {err:?}",
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2507,10 +2006,8 @@ mod tests {
             b'N', // any other ASCII
         ];
         let (_dir, fa_path) = build_line_wrapped_fasta("chr0", input, 8);
-        let fetcher =
-            StreamingChromRefFetcher::for_contig(&fa_path, "chr0").expect("for_contig");
-        let bytes =
-            ChromRefFetcher::fetch(&fetcher, 1, input.len() as u32).expect("fetch");
+        let fetcher = StreamingChromRefFetcher::for_contig(&fa_path, "chr0").expect("for_contig");
+        let bytes = ChromRefFetcher::fetch(&fetcher, 1, input.len() as u32).expect("fetch");
         assert_eq!(bytes, expected);
     }
 
@@ -2521,7 +2018,10 @@ mod tests {
         let (_dir, fa_path) = build_line_wrapped_fasta("chr0", input, 8);
         let mut fetcher =
             ManualEvictChromRefFetcher::for_contig(&fa_path, "chr0").expect("for_contig");
-        let bytes = fetcher.fetch(1, input.len() as u32).expect("fetch").to_vec();
+        let bytes = fetcher
+            .fetch(1, input.len() as u32)
+            .expect("fetch")
+            .to_vec();
         assert_eq!(bytes, expected);
     }
 
@@ -2542,11 +2042,7 @@ mod tests {
         fn length(&self) -> u32 {
             self.payload.len() as u32
         }
-        fn fetch(
-            &self,
-            start_1based: u32,
-            length: u32,
-        ) -> Result<Vec<u8>, ChromRefFetchError> {
+        fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError> {
             if start_1based == 0 {
                 return Err(ChromRefFetchError::InvalidStart);
             }
@@ -2556,10 +2052,8 @@ mod tests {
         }
         fn iter_bases<'a>(
             &'a self,
-        ) -> Result<
-            Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
-            ChromRefFetchError,
-        > {
+        ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
+        {
             Ok(Box::new(self.payload.iter().copied().map(Ok)))
         }
         // No fetch_into override: tests below pin the trait's default
@@ -2605,8 +2099,7 @@ mod tests {
         // initial fill (no warm cache).
         let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
         let (_dir, path) = build_line_wrapped_fasta("chr0", &seq, 60);
-        let fetcher =
-            StreamingChromRefFetcher::for_contig(&path, "chr0").expect("for_contig");
+        let fetcher = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("for_contig");
         let mut dst = b"GARBAGE".to_vec();
         ChromRefFetcher::fetch_into(&fetcher, 50, 32, &mut dst).expect("fetch_into");
         assert_eq!(dst.len(), 32);
@@ -2626,8 +2119,7 @@ mod tests {
             length: 4 * 1024 * 1024,
         }];
         let (_dir, path) = build_fasta(&specs).expect("fasta");
-        let fetcher =
-            StreamingChromRefFetcher::for_contig(&path, "chr0").expect("for_contig");
+        let fetcher = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("for_contig");
         // Forward fetch at 2 MiB — primes the buffer past its origin.
         ChromRefFetcher::fetch(&fetcher, 2 * 1024 * 1024, 16).expect("forward fetch");
         // Backward jump beyond the buffer's origin.

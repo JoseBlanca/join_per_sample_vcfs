@@ -368,7 +368,7 @@ impl SdustState {
 /// Slice-based convenience wrapper around [`sdust_mask_streaming`].
 /// Used by the in-module unit tests (which build the contig as a
 /// `Vec<u8>` fixture); production drives the streaming form directly
-/// via [`DustFilter::ensure_mask_for`]. Behaviour identical to
+/// via [`DustFilter::ensure_mask_loaded`]. Behaviour identical to
 /// driving the streaming form with `seq.iter().copied().map(Ok)`.
 #[cfg(test)]
 fn sdust_mask(seq: &[u8], window: u32, threshold: u32) -> SdustIntervals {
@@ -399,7 +399,7 @@ fn sdust_mask(seq: &[u8], window: u32, threshold: u32) -> SdustIntervals {
 /// still in `perf`.
 ///
 /// Private — every external entry point goes through
-/// [`DustFilter::ensure_mask_for`], which passes a validated
+/// [`DustFilter::ensure_mask_loaded`], which passes a validated
 /// `(window, threshold)` from [`DustFilterConfig`]. The
 /// preconditions below are stated for internal callers only:
 ///

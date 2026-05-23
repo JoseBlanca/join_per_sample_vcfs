@@ -22,7 +22,7 @@ use super::errors::WalkerError;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
 };
-use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerConfig};
+use super::{MultiChromRefFetcher, PileupRecord, PreparedRead, ReadLengthError, WalkerConfig};
 
 /// Construct a [`PileupWalker`] over a coordinate-sorted stream of
 /// prepared reads. The walker is an `Iterator<Item = Result<PileupRecord,
@@ -38,7 +38,7 @@ use super::{PileupRecord, PreparedRead, ReadLengthError, RefSeqFetcher, WalkerCo
 pub fn run<R, F>(reads: R, ref_fetcher: F, config: &WalkerConfig) -> PileupWalker<R::IntoIter, F>
 where
     R: IntoIterator<Item = PreparedRead>,
-    F: RefSeqFetcher,
+    F: MultiChromRefFetcher,
 {
     PileupWalker::new(reads.into_iter(), ref_fetcher, config)
 }
@@ -48,7 +48,7 @@ where
 pub struct PileupWalker<I, F>
 where
     I: Iterator<Item = PreparedRead>,
-    F: RefSeqFetcher,
+    F: MultiChromRefFetcher,
 {
     reads: Peekable<I>,
     ref_fetcher: F,
@@ -68,7 +68,7 @@ where
 impl<I, F> PileupWalker<I, F>
 where
     I: Iterator<Item = PreparedRead>,
-    F: RefSeqFetcher,
+    F: MultiChromRefFetcher,
 {
     pub fn new(reads: I, ref_fetcher: F, config: &WalkerConfig) -> Self {
         let mut reads = reads.peekable();
@@ -194,7 +194,7 @@ where
 impl<I, F> Iterator for PileupWalker<I, F>
 where
     I: Iterator<Item = PreparedRead>,
-    F: RefSeqFetcher,
+    F: MultiChromRefFetcher,
 {
     type Item = Result<PileupRecord, WalkerError>;
 
@@ -368,7 +368,10 @@ impl WalkerState {
         Ok(())
     }
 
-    fn process_position<F: RefSeqFetcher>(&mut self, ref_fetcher: &F) -> Result<(), WalkerError> {
+    fn process_position<F: MultiChromRefFetcher>(
+        &mut self,
+        ref_fetcher: &F,
+    ) -> Result<(), WalkerError> {
         // Step 1: query each active read's cursor for events
         // anchored at walker_pos. Reads with no event here are
         // silent (deletion interior or N-skip), so they are not

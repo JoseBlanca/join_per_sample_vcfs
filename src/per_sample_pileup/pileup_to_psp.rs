@@ -16,7 +16,7 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use super::pileup::{PileupWalker, PreparedRead, RefSeqFetcher, RunSummary, WalkerError};
+use super::pileup::{MultiChromRefFetcher, PileupWalker, PreparedRead, RunSummary, WalkerError};
 use super::psp::PspWriteError;
 use super::psp::writer::PspWriter;
 
@@ -53,7 +53,7 @@ pub fn drive_pileup_to_psp<I, F, W>(
 ) -> Result<(W, RunSummary), PileupToPspError>
 where
     I: Iterator<Item = PreparedRead>,
-    F: RefSeqFetcher,
+    F: MultiChromRefFetcher,
     W: Write,
 {
     for item in walker.by_ref() {

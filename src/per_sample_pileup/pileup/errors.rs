@@ -5,6 +5,8 @@
 
 use thiserror::Error;
 
+use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum WalkerError {
@@ -69,7 +71,7 @@ pub enum WalkerError {
         start: u32,
         start_plus_len: u32,
         #[source]
-        source: std::io::Error,
+        source: ChromRefFetchError,
     },
 
     #[error(

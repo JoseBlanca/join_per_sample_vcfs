@@ -23,7 +23,7 @@ use crate::per_sample_pileup::cram_input::{
 };
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::{self, PileupWalker, PreparedRead, WalkerConfig};
-use crate::per_sample_pileup::ref_fetcher::WalkerLegacyAdapter;
+use crate::per_sample_pileup::ref_fetcher::MultiChromStreamingRefFetcher;
 
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;
@@ -35,7 +35,7 @@ use super::cli::error_bridge::ErrorSheddingAdapter;
 /// costs one indirection per `PreparedRead` — invisible against the
 /// HMM / walker bookkeeping the per-record budget already pays.
 pub type Stage1Walker<'a> =
-    PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a WalkerLegacyAdapter>;
+    PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a MultiChromStreamingRefFetcher>;
 
 /// Context handed to the [`with_stage1_pipeline`] callback. Contains
 /// the walker (by value — the closure may consume or drive it via
@@ -106,7 +106,7 @@ where
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
-    // 2. Reference fetcher for the walker — [`WalkerLegacyAdapter`]
+    // 2. Reference fetcher for the walker — [`MultiChromStreamingRefFetcher`]
     //    wraps a `StreamingChromRefFetcher` and swaps it on chrom
     //    transition. The walker is single-threaded so the adapter
     //    can stay `!Sync` (RefCell-based interior mutability; no
@@ -120,7 +120,8 @@ where
     //    walker's streaming-sliding-buffer abstraction. The new
     //    manual-evict fetcher gives BAQ a per-worker buffer with
     //    caller-managed eviction.
-    let walker_fetcher = WalkerLegacyAdapter::new(reference.to_path_buf(), contigs.clone());
+    let walker_fetcher =
+        MultiChromStreamingRefFetcher::new(reference.to_path_buf(), contigs.clone());
 
     // 3. Build the boxed input iterator + handle for upstream errors,
     //    drive the closure, then snapshot every branch-local counter

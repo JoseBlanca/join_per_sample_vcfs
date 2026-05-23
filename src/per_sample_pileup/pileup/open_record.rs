@@ -18,7 +18,8 @@ use super::chain_id_allocator::ChainId;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::{
-    AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, PileupRecord, RefSeqFetcher,
+    AlleleObservation, AlleleSupportStats, DEFAULT_MAX_RECORD_SPAN, MultiChromRefFetcher,
+    PileupRecord,
 };
 
 /// Pre-allocated capacity for `OpenPileupRecord::folded_reads` —
@@ -330,7 +331,7 @@ impl OpenPileupRecordTable {
         &mut self,
         key: u32,
         new_end_exclusive: u32,
-        ref_fetcher: &dyn RefSeqFetcher,
+        ref_fetcher: &dyn MultiChromRefFetcher,
     ) -> Result<bool, WalkerError> {
         // PANIC-FREE: `widen` is only called from
         // `process_position` immediately after `find_overlapping`
@@ -407,7 +408,7 @@ impl OpenPileupRecordTable {
         chrom_id: u32,
         pos: u32,
         span: u32,
-        ref_fetcher: &dyn RefSeqFetcher,
+        ref_fetcher: &dyn MultiChromRefFetcher,
     ) -> Result<&mut OpenPileupRecord, WalkerError> {
         if span > self.max_record_span {
             return Err(WalkerError::RecordTooWide {
@@ -638,7 +639,7 @@ pub(super) fn process_position(
     chrom_id: u32,
     contributors: &[ReadContribution],
     active_reads: &ActiveReads,
-    ref_fetcher: &dyn RefSeqFetcher,
+    ref_fetcher: &dyn MultiChromRefFetcher,
 ) -> Result<ProcessOutcome, WalkerError> {
     let mut affected: Vec<u32> = Vec::new();
     let mut widen_count: u64 = 0;

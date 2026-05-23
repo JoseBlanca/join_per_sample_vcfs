@@ -307,7 +307,7 @@ pub(super) fn locate_alignment_span(
 /// second delta uses the already-updated `xb`).
 ///
 /// Note: this function does **not** clamp `xe` to the actual reference
-/// length. The caller relies on [`RefSeqFetcher::fetch`] to reject
+/// length. The caller relies on `ChromRefFetcher::fetch` to reject
 /// over-end windows; the test driver's separate copy used to clamp
 /// against a known `ref_len` for unit-test convenience.
 pub(super) fn extend_ref_window(
