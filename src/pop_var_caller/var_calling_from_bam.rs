@@ -25,16 +25,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Args;
+use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::per_sample_pileup::cram_input::ContigList;
 use crate::per_sample_pileup::pileup::{PileupRecord, WalkerError};
 use crate::per_sample_pileup::psp::PspReadError;
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
-use crate::per_sample_pileup::ref_fetcher::WalkerLegacyAdapter;
+use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
-use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
+use crate::pop_var_caller::cohort_driver::{
+    CohortDriveStats, CohortPipelineParams, drive_cohort_pipeline,
+};
 use crate::pop_var_caller::common::{configure_rayon_pool, current_command_line, format_md5_hex};
 use crate::pop_var_caller::stage1_pipeline::{Stage1PipelineContext, with_stage1_pipeline};
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
@@ -46,7 +49,8 @@ use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
-use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig};
+use crate::var_calling::vcf_writer::concat::concat_fragments;
+use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig, path_is_bgzf};
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -335,106 +339,168 @@ fn run_cohort_pipeline_for_single_sample(
     posterior_cfg: PosteriorEngineConfig,
 ) -> Result<(), VarCallingFromBamCliError> {
     // Convert ContigList → Vec<ParsedChromosome>. Single validated
-    // source of truth for chromosomes; the merger consumes a clone
-    // and the cohort driver takes the original through
-    // CohortPipelineParams.
+    // source of truth for chromosomes; the per-chrom loop clones it
+    // for each fragment.
     let chromosomes = contigs_to_parsed(ctx.contigs)?;
     let sample_name_owned = ctx.sample_name.to_string();
 
-    // Cohort metadata + writer config.
+    // Cohort metadata + writer config template.
     let metadata = CohortMetadata {
         sample_names: vec![sample_name_owned.clone()],
         contigs: chromosomes.clone(),
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line,
     };
-    let writer_cfg = WriterConfig::new(output.to_path_buf()).with_emit_gp(emit_gp);
+    let writer_cfg_template = WriterConfig::new(output.to_path_buf()).with_emit_gp(emit_gp);
 
-    // Reference fetcher shared between DUST + PerGroupMerger.
-    // `WalkerLegacyAdapter` wraps a `StreamingChromRefFetcher` that
-    // swaps per chrom transition; the multi-chrom records produced
-    // by the single-sample walker flow through DUST and the
-    // per-group merger, and the adapter rebuilds its inner whenever
-    // the chrom_id of an incoming record changes. Peak fetcher
-    // memory is ~1 MB regardless of genome size — vs the previous
-    // `SyncRefFetcher` that accumulated every visited contig
-    // (~3 GB on a human reference).
-    //
-    // Step 2(d) of `unified_chrom_ref_fetcher` plan.
-    let walker_adapter =
-        WalkerLegacyAdapter::new(reference.to_path_buf(), ctx.contigs.clone());
-    let fetcher: SharedRefFetcher = Arc::new(walker_adapter);
+    // Per-chromosome fragment paths under a TempDir placed next to the
+    // final output — matches the cohort `var-calling` path so the
+    // concat's atomic rename stays on one filesystem. The TempDir
+    // RAII-drops on Ok or on panic; the fragments live just long
+    // enough for `concat_fragments` to assemble them into `output`.
+    let output_parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let frags_dir = TempDir::new_in(output_parent).map_err(VarCallingFromBamCliError::Io)?;
+    let frag_ext = if path_is_bgzf(output) {
+        "vcf.gz"
+    } else {
+        "vcf"
+    };
+    let fragment_paths: Vec<PathBuf> = chromosomes
+        .iter()
+        .enumerate()
+        .map(|(cid, c)| {
+            frags_dir
+                .path()
+                .join(format!("chr_{cid:03}_{name}.{frag_ext}", name = c.name))
+        })
+        .collect();
 
-    // Wrap the walker as a k=1 input for PerPositionMerger. The
-    // adapter stashes walker errors and reports end-of-stream; the
-    // `.map(Ok)` lifts the bare `PileupRecord`s back into the
-    // `Result<_, PspReadError>` shape that `PerPositionMerger`
-    // wants (no walker error will ever flow through this Result —
-    // it is stashed in the handle instead).
+    // Wrap the walker as a clean `Result<_, PspReadError>` stream.
+    // Walker errors are stashed via `ErrorSheddingAdapter` (the
+    // merger sees a clean stream); the stash is surfaced after the
+    // per-chrom loop drains.
     //
     // Invariant: the stash is touched only on the merger's main
     // thread. `PerGroupMerger::refill` collects upstream items into
     // a `Vec` before fanning rayon workers across it, so the walker
-    // chain itself never crosses thread boundaries. If upstream of
-    // `PerGroupMerger` ever becomes multi-threaded, the stash
-    // becomes `Arc<Mutex<...>>` (and the constraint should move to
-    // `error_bridge`).
+    // chain itself never crosses thread boundaries.
     let walker_adapter: ErrorSheddingAdapter<_, PileupRecord, WalkerError> =
         ErrorSheddingAdapter::new(ctx.walker);
     let walker_error_handle = walker_adapter.error_handle();
     let walker_iter: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>>> =
         Box::new(walker_adapter.map(Ok));
 
-    // Build the merger from the walker-shim, then hand the rest of
-    // the pipeline to the shared cohort driver.
-    let merger = PerPositionMerger::new(
-        vec![walker_iter],
-        vec![sample_name_owned.clone()],
-        chromosomes.clone(),
-    )?;
+    // Drive the cohort pipeline per chrom. The walker emits records
+    // in coord order across all chroms; `PerChromRecordsIter` chunks
+    // that single stream by `chrom_id`. Each chrom builds its own
+    // `StreamingChromRefFetcher::for_contig` (1 MB sliding buffer)
+    // that drops at the end of the iteration — no contig is ever
+    // wholly resident.
     let pipeline_params = CohortPipelineParams {
         no_complexity_filter,
         dust_cfg,
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        chromosomes,
         min_qual_phred,
         min_alt_obs_per_sample,
         no_mapq_diff_filter,
         min_mapq_diff_t,
     };
-    let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
-        merger,
-        pipeline_params,
-        fetcher,
-        output,
-        metadata,
-        writer_cfg,
-    )?;
+
+    let mut per_chrom = PerChromRecordsIter::new(walker_iter);
+    let mut next_walker_chrom = per_chrom.open_next_chrom();
+    let mut total_stats = CohortDriveStats::default();
+
+    for (cid, chrom_entry) in chromosomes.iter().enumerate() {
+        let chrom_id = cid as u32;
+        let walker_is_on_this_chrom = next_walker_chrom == Some(chrom_id);
+
+        // Per-chrom reference fetcher: opens its own indexed FASTA
+        // reader, serves bases through a 1 MB sliding buffer, drops
+        // at end of scope.
+        let streaming =
+            StreamingChromRefFetcher::for_contig(reference, &chrom_entry.name)
+                .map_err(|e| {
+                    VarCallingFromBamCliError::Io(io::Error::other(format!(
+                        "ref fetcher construction failed: {e}"
+                    )))
+                })?;
+        let fetcher: SharedRefFetcher = Arc::new(streaming);
+
+        // Build the per-chrom record iter. When the walker has no
+        // records on this chrom, feed an empty iter — the cohort
+        // pipeline still writes a header-only fragment, matching the
+        // multi-sample `var-calling` flow.
+        let chrom_records: Box<
+            dyn Iterator<Item = Result<PileupRecord, PspReadError>> + '_,
+        > = if walker_is_on_this_chrom {
+            Box::new(per_chrom.consume_current_chrom())
+        } else {
+            Box::new(std::iter::empty())
+        };
+        let merger = PerPositionMerger::new(
+            vec![chrom_records],
+            vec![sample_name_owned.clone()],
+            chromosomes.clone(),
+        )?;
+
+        let fragment_path = fragment_paths[cid].clone();
+        let writer_cfg = WriterConfig {
+            output: fragment_path.clone(),
+            ..writer_cfg_template.clone()
+        };
+
+        let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
+            chrom_id,
+            merger,
+            pipeline_params.clone(),
+            fetcher,
+            &fragment_path,
+            metadata.clone(),
+            writer_cfg,
+        )?;
+        total_stats.records_written += stats.records_written;
+        total_stats.records_unconverged += stats.records_unconverged;
+        total_stats.records_dropped_hom_ref += stats.records_dropped_hom_ref;
+        total_stats.records_dropped_low_qual += stats.records_dropped_low_qual;
+        total_stats.records_dropped_low_alt_obs += stats.records_dropped_low_alt_obs;
+        total_stats.records_dropped_low_mapq_diff_t += stats.records_dropped_low_mapq_diff_t;
+
+        if walker_is_on_this_chrom {
+            next_walker_chrom = per_chrom.open_next_chrom();
+        }
+    }
+
+    // Concat fragments in contig-table order into the final output.
+    // `concat_fragments` owns the atomic rename + parent directory
+    // fsync; on Ok the file is durable at `output`.
+    concat_fragments(output, &fragment_paths)?;
+    // frags_dir RAII-drops the scratch TempDir + fragments here.
 
     // Surface walker errors stashed by the ErrorSheddingAdapter.
     // The pipeline ran to completion, so `<output>` has been
-    // renamed from `<output>.tmp` — retract that publish
-    // (publish-then-retract semantics: we'd rather no file than a
-    // truncated one).
+    // published — retract that publish (publish-then-retract
+    // semantics: we'd rather no file than a truncated one).
     if let Some(e) = walker_error_handle.take() {
-        // best-effort cleanup; the rename already happened
         let _ = std::fs::remove_file(output);
         return Err(VarCallingFromBamCliError::Walker(e));
     }
 
-    let emnoconv_note = if stats.records_unconverged > 0 {
+    let emnoconv_note = if total_stats.records_unconverged > 0 {
         format!(
             " records_emnoconv={} (FILTER=EMNoConv; EM iteration cap)",
-            stats.records_unconverged,
+            total_stats.records_unconverged,
         )
     } else {
         String::new()
     };
     eprintln!(
         "var-calling-from-bam: sample={} records_emitted={}{}",
-        sample_name_owned, stats.records_written, emnoconv_note,
+        sample_name_owned, total_stats.records_written, emnoconv_note,
     );
     Ok(())
 }

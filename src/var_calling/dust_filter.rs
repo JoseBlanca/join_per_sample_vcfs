@@ -59,11 +59,11 @@
 //! not the filter's responsibility to detect.
 
 use std::collections::VecDeque;
+use std::io;
 
 use thiserror::Error;
 
-use crate::per_sample_pileup::pileup::RefSeqFetcher;
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::per_sample_pileup::ref_fetcher::{ChromRefFetchError, ChromRefFetcher};
 use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 
 /// Default sdust window size (`W`). Matches the `lh3/sdust` and
@@ -582,22 +582,28 @@ pub enum DustFilterError {
     #[error("upstream merger failed")]
     Upstream(#[source] Box<PerPositionMergerError>),
 
-    /// Reference fetch failed when loading a chromosome's bases.
+    /// Reference fetch failed when loading the contig's bases.
     /// The cause is exposed via `source()`, not interpolated into
-    /// this variant's `Display`.
+    /// this variant's `Display`. After the
+    /// `cohort_chrom_ref_fetcher_migration` plan landed, the source
+    /// is `ChromRefFetchError` (typed) rather than the previous
+    /// `io::Error` — `DustFilter` is bound to a single contig at
+    /// construction, so the fetcher is a `ChromRefFetcher` impl and
+    /// surfaces its typed error directly.
     #[error("reference fetch failed for chrom {chrom_id}")]
     RefFetch {
         chrom_id: u32,
         #[source]
-        source: std::io::Error,
+        source: ChromRefFetchError,
     },
 
-    /// Upstream yielded a `chrom_id` not present in the chromosomes
-    /// table the filter was constructed with. Defensive — in
-    /// production the table comes from the same merger that emits
-    /// the records, so this fires only on pathological mocks.
-    #[error("upstream emitted unknown chrom_id {chrom_id}")]
-    UnknownChromId { chrom_id: u32 },
+    /// Upstream emitted a `PileupRecord` on a different chrom than
+    /// the one this `DustFilter` was constructed for. The filter is
+    /// single-contig after the
+    /// `cohort_chrom_ref_fetcher_migration` plan — multi-chrom
+    /// records would mean the upstream wasn't chunked correctly.
+    #[error("expected records on chrom_id {expected}, got chrom_id {got}")]
+    ChromIdMismatch { expected: u32, got: u32 },
 
     /// Upstream emitted a `PileupRecord` with `pos == 0`, which
     /// breaks the documented 1-based-pos contract. Surfaced as an
@@ -615,17 +621,6 @@ pub enum DustFilterError {
     InvalidWindow { window: u32 },
 }
 
-/// Cached mask state for a single chromosome. Bundling these three
-/// fields together makes their "all consistent together or all
-/// absent" invariant a type-level property: there is no way to have
-/// a `chrom_id` set without also having the matching mask and a
-/// reset sweep pointer.
-struct LoadedChrom {
-    chrom_id: u32,
-    mask: SdustIntervals,
-    sweep: usize,
-}
-
 /// Streaming low-complexity filter over a per-position pileup stream.
 ///
 /// Wraps an upstream iterator yielding
@@ -634,24 +629,34 @@ struct LoadedChrom {
 /// interval. Emits the surviving items in the same order as the
 /// upstream.
 ///
-/// On the first item for each chromosome, the filter fetches the
-/// whole chromosome's reference via the supplied [`RefSeqFetcher`]
-/// and runs `sdust_mask` over it once. Subsequent items on the
-/// same chromosome are answered by a sweep over the cached
-/// interval list (`O(1)` amortised per upstream position).
+/// Bound to one contig at construction
+/// (`bound_chrom_id`). On the first record, the filter streams the
+/// contig's bases through `sdust_mask_streaming` to build the mask;
+/// subsequent records on the same contig are answered by a sweep
+/// over the cached interval list (`O(1)` amortised per upstream
+/// position). Records on a different `chrom_id` are surfaced as
+/// `DustFilterError::ChromIdMismatch` — upstream is expected to
+/// have chunked records per chrom before reaching this filter (see
+/// `process_one_chromosome` for the cohort path and
+/// `PerChromRecordsIter` for the from-bam path).
 pub struct DustFilter<I, F>
 where
     I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
-    F: RefSeqFetcher,
+    F: ChromRefFetcher,
 {
     upstream: I,
     fetcher: F,
-    chromosomes: Vec<ParsedChromosome>,
+    /// Chrom this filter is bound to. Every incoming record must
+    /// match; mismatch is `DustFilterError::ChromIdMismatch`.
+    bound_chrom_id: u32,
     config: DustFilterConfig,
-    /// Currently-loaded chromosome's mask and sweep pointer.
-    /// `None` before the first item, and reassigned atomically on
-    /// every chromosome change.
-    loaded: Option<LoadedChrom>,
+    /// sdust mask for the bound contig. `None` before the first
+    /// record arrives (mask is built lazily); `Some` after.
+    mask: Option<SdustIntervals>,
+    /// Sweep pointer into `mask` advancing monotonically with the
+    /// upstream's per-position records. Reset to 0 when `mask` is
+    /// installed.
+    sweep: usize,
     /// Latches `true` after the upstream signals end or any error,
     /// so subsequent `next()` calls return `None`. Matches the
     /// upstream merger's contract.
@@ -661,24 +666,26 @@ where
 impl<I, F> DustFilter<I, F>
 where
     I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
-    F: RefSeqFetcher,
+    F: ChromRefFetcher,
 {
-    /// Wrap `upstream`. `chromosomes` is the same table the upstream
-    /// merger holds — pass `merger.chromosomes().to_vec()`. Infallible
+    /// Wrap `upstream` with a filter bound to `bound_chrom_id`. The
+    /// fetcher must be bound to the same contig (verified
+    /// implicitly via the typed errors at fetch time). Infallible
     /// because `config` has already been validated by
     /// [`DustFilterConfig::new`].
     pub fn new(
         upstream: I,
         fetcher: F,
-        chromosomes: Vec<ParsedChromosome>,
+        bound_chrom_id: u32,
         config: DustFilterConfig,
     ) -> Self {
         Self {
             upstream,
             fetcher,
-            chromosomes,
+            bound_chrom_id,
             config,
-            loaded: None,
+            mask: None,
+            sweep: 0,
             is_finished: false,
         }
     }
@@ -688,73 +695,81 @@ where
         self.config
     }
 
-    /// Load (or reload) the mask for `chrom_id` if it isn't already
-    /// the current one. Latches `is_finished` and returns the
-    /// appropriate error on any failure. Streams the contig's
-    /// bases through `sdust_mask_streaming` — no whole-contig
-    /// buffer is materialised when the fetcher implements
-    /// `iter_bases` natively (e.g. `StreamingChromRefFetcher`).
-    fn ensure_mask_for(&mut self, chrom_id: u32) -> Result<(), DustFilterError> {
-        if self.loaded.as_ref().is_some_and(|l| l.chrom_id == chrom_id) {
+    /// Build the mask if it isn't already built. Latches
+    /// `is_finished` and returns the appropriate error on any
+    /// failure. Streams the contig's bases through
+    /// `sdust_mask_streaming` — no whole-contig buffer is
+    /// materialised when the fetcher implements `iter_bases`
+    /// natively (every production `ChromRefFetcher` impl does).
+    fn ensure_mask_loaded(&mut self) -> Result<(), DustFilterError> {
+        if self.mask.is_some() {
             return Ok(());
         }
-        let entry = match self.chromosomes.get(chrom_id as usize) {
-            Some(e) => e,
-            None => {
-                self.is_finished = true;
-                return Err(DustFilterError::UnknownChromId { chrom_id });
-            }
-        };
-        let bases = match self.fetcher.iter_bases(chrom_id, entry.length) {
+        let length = self.fetcher.length();
+        let bases = match self.fetcher.iter_bases() {
             Ok(it) => it,
             Err(source) => {
                 self.is_finished = true;
-                return Err(DustFilterError::RefFetch { chrom_id, source });
+                return Err(DustFilterError::RefFetch {
+                    chrom_id: self.bound_chrom_id,
+                    source,
+                });
             }
         };
+        // The inner iter yields `Result<u8, ChromRefFetchError>`,
+        // but `sdust_mask_streaming` expects `Result<u8, io::Error>`.
+        // Map errors at the iterator level so the streaming scan
+        // surfaces ChromRefFetchError verbatim through `RefFetch`.
+        //
+        // We materialise the bases through a `.map(...)` because
+        // sdust_mask_streaming's signature takes
+        // `IntoIterator<Item = io::Result<u8>>`. Wrapping is cheap
+        // (one .map adapter); the byte stream still flows lazily.
+        let bases_io = bases.map(|res| {
+            res.map_err(|e| io::Error::other(format!("{e}")))
+        });
         let mask = match sdust_mask_streaming(
-            bases,
-            entry.length,
+            bases_io,
+            length,
             self.config.window,
             self.config.threshold,
         ) {
             Ok(m) => m,
             Err(source) => {
                 self.is_finished = true;
-                return Err(DustFilterError::RefFetch { chrom_id, source });
+                return Err(DustFilterError::RefFetch {
+                    chrom_id: self.bound_chrom_id,
+                    source: ChromRefFetchError::Io {
+                        contig_name: format!("chrom_id {}", self.bound_chrom_id),
+                        source,
+                    },
+                });
             }
         };
-        // Atomic install: the three previously-co-dependent fields
-        // (chrom_id, mask, sweep) move into the new `LoadedChrom` in
-        // a single assignment, so they can never be out of sync.
-        self.loaded = Some(LoadedChrom {
-            chrom_id,
-            mask,
-            sweep: 0,
-        });
+        self.mask = Some(mask);
+        self.sweep = 0;
         Ok(())
     }
 
     /// Returns `true` if the 0-based reference position `pos0` is
-    /// inside an sdust-masked interval on the currently-loaded
-    /// chromosome. Advances the cached sweep pointer past intervals
-    /// whose `finish` is `≤ pos0` (they cannot match any future,
-    /// larger position).
+    /// inside an sdust-masked interval. Advances the cached sweep
+    /// pointer past intervals whose `finish` is `≤ pos0` (they
+    /// cannot match any future, larger position).
     ///
-    /// Precondition: `ensure_mask_for` succeeded immediately before
-    /// this call, so `self.loaded` is `Some(_)`. The
+    /// Precondition: `ensure_mask_loaded` succeeded immediately
+    /// before this call, so `self.mask` is `Some(_)`. The
     /// [`debug_assert!`] makes a contract violation panic loudly
     /// under tests; in release, the `None` branch passes the record
     /// through unmasked rather than producing wrong output.
     fn is_masked(&mut self, pos0: u32) -> bool {
-        let Some(loaded) = self.loaded.as_mut() else {
-            debug_assert!(false, "is_masked called without a loaded chromosome");
+        let Some(mask) = self.mask.as_ref() else {
+            debug_assert!(false, "is_masked called without a loaded mask");
             return false;
         };
-        while loaded.sweep < loaded.mask.len() && loaded.mask[loaded.sweep].1 <= pos0 {
-            loaded.sweep += 1;
+        while self.sweep < mask.len() && mask[self.sweep].1 <= pos0 {
+            self.sweep += 1;
         }
-        match loaded.mask.get(loaded.sweep) {
+        match mask.get(self.sweep) {
             Some(&(start, finish)) => start <= pos0 && pos0 < finish,
             None => false,
         }
@@ -764,7 +779,7 @@ where
 impl<I, F> Iterator for DustFilter<I, F>
 where
     I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
-    F: RefSeqFetcher,
+    F: ChromRefFetcher,
 {
     type Item = Result<PerPositionPileups, DustFilterError>;
 
@@ -792,7 +807,14 @@ where
                 }
                 Some(Ok(p)) => p,
             };
-            if let Err(err) = self.ensure_mask_for(pileups.chrom_id) {
+            if pileups.chrom_id != self.bound_chrom_id {
+                self.is_finished = true;
+                return Some(Err(DustFilterError::ChromIdMismatch {
+                    expected: self.bound_chrom_id,
+                    got: pileups.chrom_id,
+                }));
+            }
+            if let Err(err) = self.ensure_mask_loaded() {
                 return Some(Err(err));
             }
             // `PileupRecord::pos` is 1-based; the internal sdust
@@ -1104,66 +1126,77 @@ mod tests {
     // ---- DustFilter: iterator plumbing ----
 
     use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
-    use std::cell::RefCell;
+    use std::cell::Cell;
     use std::io;
 
-    /// Stub fetcher backed by per-chromosome byte vectors. Records
-    /// the number of `fetch` calls per chromosome so tests can pin
-    /// that the filter loads each chromosome at most once.
-    struct StubFetcher {
-        seqs: Vec<Vec<u8>>,
-        fail_for: Option<u32>,
-        call_counts: RefCell<Vec<u32>>,
+    /// Stub `ChromRefFetcher` backed by one contig's bytes. Counts
+    /// `iter_bases` calls so tests can pin that the filter loads
+    /// the mask at most once per construction.
+    struct StubChromRefFetcher {
+        seq: Vec<u8>,
+        fail_iter: bool,
+        iter_bases_calls: Cell<u32>,
     }
 
-    impl StubFetcher {
-        fn new(seqs: Vec<Vec<u8>>) -> Self {
-            let n = seqs.len();
+    impl StubChromRefFetcher {
+        fn new(seq: Vec<u8>) -> Self {
             Self {
-                seqs,
-                fail_for: None,
-                call_counts: RefCell::new(vec![0; n]),
+                seq,
+                fail_iter: false,
+                iter_bases_calls: Cell::new(0),
             }
         }
 
-        fn with_failure_for(mut self, chrom_id: u32) -> Self {
-            self.fail_for = Some(chrom_id);
+        fn with_iter_bases_failure(mut self) -> Self {
+            self.fail_iter = true;
             self
         }
 
-        fn calls_for(&self, chrom_id: u32) -> u32 {
-            self.call_counts.borrow()[chrom_id as usize]
+        fn iter_bases_calls(&self) -> u32 {
+            self.iter_bases_calls.get()
         }
     }
 
-    impl RefSeqFetcher for StubFetcher {
+    impl ChromRefFetcher for StubChromRefFetcher {
+        fn length(&self) -> u32 {
+            self.seq.len() as u32
+        }
+
         fn fetch(
             &self,
-            chrom_id: u32,
-            _start_1based: u32,
+            start_1based: u32,
             length: u32,
-        ) -> Result<Vec<u8>, io::Error> {
-            self.call_counts.borrow_mut()[chrom_id as usize] += 1;
-            if self.fail_for == Some(chrom_id) {
-                return Err(io::Error::other("stub fetch failure"));
+        ) -> Result<Vec<u8>, ChromRefFetchError> {
+            if start_1based == 0 {
+                return Err(ChromRefFetchError::InvalidStart);
             }
-            let seq = &self.seqs[chrom_id as usize];
-            assert_eq!(
-                seq.len() as u32,
-                length,
-                "stub: caller asked for {} bases, have {}",
-                length,
-                seq.len()
-            );
-            Ok(seq.clone())
+            let s = (start_1based - 1) as usize;
+            let e = s + length as usize;
+            if e > self.seq.len() {
+                return Err(ChromRefFetchError::OutOfBounds {
+                    contig_name: "stub".into(),
+                    contig_length: self.seq.len() as u32,
+                    start: start_1based,
+                    end: start_1based + length,
+                });
+            }
+            Ok(self.seq[s..e].to_vec())
         }
-    }
 
-    fn make_chrom(name: &str, length: u32) -> ParsedChromosome {
-        ParsedChromosome {
-            name: name.to_string(),
-            length,
-            md5: "0".repeat(32),
+        fn iter_bases<'a>(
+            &'a self,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
+            ChromRefFetchError,
+        > {
+            self.iter_bases_calls.set(self.iter_bases_calls.get() + 1);
+            if self.fail_iter {
+                return Err(ChromRefFetchError::Io {
+                    contig_name: "stub".into(),
+                    source: io::Error::other("stub iter_bases failure"),
+                });
+            }
+            Ok(Box::new(self.seq.iter().copied().map(Ok)))
         }
     }
 
@@ -1186,25 +1219,22 @@ mod tests {
     #[test]
     fn filter_passes_through_high_complexity_bases() {
         let seq = high_complexity_bases(256);
-        let chromosomes = vec![make_chrom("chr1", seq.len() as u32)];
-        let fetcher = StubFetcher::new(vec![seq]);
+        let fetcher = StubChromRefFetcher::new(seq);
         let upstream = positions_iter((1..=10).map(|p| (0, p)).collect());
         let cfg = DustFilterConfig::default();
-        let filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
+        let filter = DustFilter::new(upstream, fetcher, 0, cfg);
         let out: Vec<u32> = filter.map(|r| r.unwrap().pos).collect();
         assert_eq!(out, (1..=10).collect::<Vec<_>>());
     }
 
     #[test]
     fn filter_drops_homopolymer_positions() {
-        // Whole chromosome is 128-bp poly-A. Every upstream position
+        // Whole contig is 128-bp poly-A. Every upstream position
         // should be dropped.
-        let seq = vec![b'A'; 128];
-        let chromosomes = vec![make_chrom("chr1", seq.len() as u32)];
-        let fetcher = StubFetcher::new(vec![seq]);
+        let fetcher = StubChromRefFetcher::new(vec![b'A'; 128]);
         let upstream = positions_iter((1..=20).map(|p| (0, p)).collect());
         let cfg = DustFilterConfig::default();
-        let filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
+        let filter = DustFilter::new(upstream, fetcher, 0, cfg);
         let out: Vec<_> = filter.collect();
         assert!(
             out.is_empty(),
@@ -1214,49 +1244,37 @@ mod tests {
     }
 
     #[test]
-    fn filter_fetcher_call_count_pinned() {
-        let chr1 = high_complexity_bases(128);
-        let chr2 = high_complexity_bases(128);
-        let chromosomes = vec![make_chrom("chr1", 128), make_chrom("chr2", 128)];
-        // We need to inspect the fetcher after the filter exhausts.
-        // Approach: wrap StubFetcher in &-borrow via the
-        // `impl RefSeqFetcher for &T` blanket impl, so the original
-        // remains accessible.
-        let fetcher = StubFetcher::new(vec![chr1, chr2]);
-        let positions: Vec<_> = (1..=50)
-            .map(|p| (0, p))
-            .chain((1..=50).map(|p| (1, p)))
-            .collect();
+    fn filter_iter_bases_called_exactly_once() {
+        // After the migration to single-contig DUST, the mask is
+        // built lazily on the first record and reused for every
+        // subsequent record. Pin that with a counter on the stub
+        // fetcher: many upstream positions, one `iter_bases` call.
+        let fetcher = StubChromRefFetcher::new(high_complexity_bases(128));
+        let upstream = positions_iter((1..=50).map(|p| (0, p)).collect());
         let cfg = DustFilterConfig::default();
-        let filter = DustFilter::new(positions_iter(positions), &fetcher, chromosomes, cfg);
+        let filter = DustFilter::new(upstream, &fetcher, 0, cfg);
         let _drain: Vec<_> = filter.collect();
-        assert_eq!(fetcher.calls_for(0), 1);
-        assert_eq!(fetcher.calls_for(1), 1);
+        assert_eq!(fetcher.iter_bases_calls(), 1);
     }
 
     #[test]
-    fn filter_resets_mask_across_chromosomes() {
-        // chr0 is a homopolymer (drops everything); chr1 is high
-        // complexity (passes everything). After switching to chr1,
-        // a position with the same pos as a dropped chr0 position
-        // must pass.
-        let chr0 = vec![b'A'; 128];
-        let chr1 = high_complexity_bases(128);
-        let chromosomes = vec![make_chrom("chr1", 128), make_chrom("chr2", 128)];
-        let fetcher = StubFetcher::new(vec![chr0, chr1]);
-        let upstream = positions_iter(vec![(0, 5), (0, 6), (1, 5), (1, 6)]);
+    fn filter_surfaces_chrom_id_mismatch_and_latches() {
+        // The filter is bound to chrom 0; upstream emits a record
+        // on chrom 1. Must surface `ChromIdMismatch` and latch.
+        let fetcher = StubChromRefFetcher::new(high_complexity_bases(128));
+        let upstream = positions_iter(vec![(1, 5)]);
         let cfg = DustFilterConfig::default();
-        let filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
-        let out: Vec<_> = filter.map(|r| r.unwrap()).collect();
-        assert_eq!(out.len(), 2);
-        assert_eq!((out[0].chrom_id, out[0].pos), (1, 5));
-        assert_eq!((out[1].chrom_id, out[1].pos), (1, 6));
+        let mut filter = DustFilter::new(upstream, fetcher, 0, cfg);
+        match filter.next() {
+            Some(Err(DustFilterError::ChromIdMismatch { expected: 0, got: 1 })) => {}
+            other => panic!("expected ChromIdMismatch {{0,1}}, got {:?}", other),
+        }
+        assert!(filter.next().is_none(), "iterator must latch after mismatch");
     }
 
     #[test]
     fn filter_surfaces_upstream_error_and_latches() {
-        let chromosomes = vec![make_chrom("chr1", 128)];
-        let fetcher = StubFetcher::new(vec![high_complexity_bases(128)]);
+        let fetcher = StubChromRefFetcher::new(high_complexity_bases(128));
         // First item is Ok, second is an OutOfOrder error. After
         // the error, subsequent next() must be None.
         let items: Vec<Result<PerPositionPileups, PerPositionMergerError>> = vec![
@@ -1272,7 +1290,7 @@ mod tests {
             Ok(empty_pileup(0, 6)),
         ];
         let cfg = DustFilterConfig::default();
-        let mut filter = DustFilter::new(items.into_iter(), fetcher, chromosomes, cfg);
+        let mut filter = DustFilter::new(items.into_iter(), fetcher, 0, cfg);
         assert!(matches!(filter.next(), Some(Ok(_))));
         assert!(matches!(
             filter.next(),
@@ -1284,11 +1302,10 @@ mod tests {
 
     #[test]
     fn filter_surfaces_ref_fetch_error_and_latches() {
-        let chromosomes = vec![make_chrom("chr1", 128)];
-        let fetcher = StubFetcher::new(vec![vec![b'A'; 128]]).with_failure_for(0);
+        let fetcher = StubChromRefFetcher::new(vec![b'A'; 128]).with_iter_bases_failure();
         let upstream = positions_iter(vec![(0, 5), (0, 6)]);
         let cfg = DustFilterConfig::default();
-        let mut filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
+        let mut filter = DustFilter::new(upstream, fetcher, 0, cfg);
         match filter.next() {
             Some(Err(DustFilterError::RefFetch {
                 chrom_id: 0,
@@ -1300,32 +1317,15 @@ mod tests {
     }
 
     #[test]
-    fn filter_surfaces_unknown_chrom_id_and_latches() {
-        // Upstream emits chrom_id=5, but the chromosomes table only
-        // has chrom_id=0.
-        let chromosomes = vec![make_chrom("chr1", 128)];
-        let fetcher = StubFetcher::new(vec![high_complexity_bases(128)]);
-        let upstream = positions_iter(vec![(5, 1)]);
-        let cfg = DustFilterConfig::default();
-        let mut filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
-        match filter.next() {
-            Some(Err(DustFilterError::UnknownChromId { chrom_id: 5 })) => {}
-            other => panic!("expected UnknownChromId, got {:?}", other),
-        }
-        assert!(filter.next().is_none());
-    }
-
-    #[test]
     fn filter_empty_upstream_does_no_work() {
-        let chromosomes = vec![make_chrom("chr1", 128)];
-        let fetcher = StubFetcher::new(vec![high_complexity_bases(128)]);
+        let fetcher = StubChromRefFetcher::new(high_complexity_bases(128));
         let upstream = positions_iter(Vec::<(u32, u32)>::new());
         let cfg = DustFilterConfig::default();
-        let filter = DustFilter::new(upstream, &fetcher, chromosomes, cfg);
+        let filter = DustFilter::new(upstream, &fetcher, 0, cfg);
         let out: Vec<_> = filter.collect();
         assert!(out.is_empty());
         // The fetcher was never asked for anything.
-        assert_eq!(fetcher.calls_for(0), 0);
+        assert_eq!(fetcher.iter_bases_calls(), 0);
     }
 
     // ---- Boundary and contract-violation tests added on review ----
@@ -1504,16 +1504,14 @@ mod tests {
         // `start` and `finish` endpoints. Uses the
         // `homopolymer_with_flanks` golden snippet (mask = (50, 100)).
         let bases = GOLDEN_SNIPPETS[0].bases.to_vec();
-        let len = bases.len() as u32;
-        let chromosomes = vec![make_chrom("chr1", len)];
-        let fetcher = StubFetcher::new(vec![bases]);
+        let fetcher = StubChromRefFetcher::new(bases);
         // 1-based probes: pos = 50  → 0-based 49, just before mask → pass.
         //                  pos = 51  → 0-based 50, first masked base → drop.
         //                  pos = 100 → 0-based 99, last masked base  → drop.
         //                  pos = 101 → 0-based 100, just past mask    → pass.
         let upstream = positions_iter(vec![(0, 50), (0, 51), (0, 100), (0, 101)]);
         let cfg = DustFilterConfig::default();
-        let filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
+        let filter = DustFilter::new(upstream, fetcher, 0, cfg);
         let kept: Vec<u32> = filter.map(|r| r.unwrap().pos).collect();
         assert_eq!(
             kept,
@@ -1526,11 +1524,10 @@ mod tests {
     fn filter_surfaces_invalid_pos_zero_and_latches() {
         // `pos == 0` violates the 1-based-pos contract. Must surface
         // `InvalidPos` (not silently underflow or panic) and latch.
-        let chromosomes = vec![make_chrom("chr1", 128)];
-        let fetcher = StubFetcher::new(vec![high_complexity_bases(128)]);
+        let fetcher = StubChromRefFetcher::new(high_complexity_bases(128));
         let upstream = positions_iter(vec![(0, 0)]);
         let cfg = DustFilterConfig::default();
-        let mut filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
+        let mut filter = DustFilter::new(upstream, fetcher, 0, cfg);
         match filter.next() {
             Some(Err(DustFilterError::InvalidPos { chrom_id: 0 })) => {}
             other => panic!("expected InvalidPos {{ chrom_id: 0 }}, got {:?}", other),
@@ -1546,11 +1543,10 @@ mod tests {
     fn filter_latches_after_upstream_exhaustion() {
         // Pinned behaviour: once the upstream returns None, the
         // filter latches and stays None even when polled again.
-        let chromosomes = vec![make_chrom("chr1", 128)];
-        let fetcher = StubFetcher::new(vec![high_complexity_bases(128)]);
+        let fetcher = StubChromRefFetcher::new(high_complexity_bases(128));
         let upstream = positions_iter(vec![(0, 1)]);
         let cfg = DustFilterConfig::default();
-        let mut filter = DustFilter::new(upstream, fetcher, chromosomes, cfg);
+        let mut filter = DustFilter::new(upstream, fetcher, 0, cfg);
         assert!(matches!(filter.next(), Some(Ok(_))));
         assert!(filter.next().is_none(), "upstream exhausted");
         assert!(

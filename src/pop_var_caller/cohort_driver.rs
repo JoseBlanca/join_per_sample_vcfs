@@ -18,9 +18,7 @@ use std::sync::Arc;
 
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
-use crate::per_sample_pileup::ref_fetcher::{
-    SingleChromLegacyAdapter, StreamingChromRefFetcher,
-};
+use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::var_calling::dust_filter::{DustFilter, DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
@@ -122,18 +120,15 @@ pub struct CohortDriveStats {
 ///
 /// The reference fetcher is **not** part of this struct — it's a
 /// separate parameter to `drive_cohort_pipeline`. That split lets
-/// the cohort `var-calling` path build a fresh per-chrom fetcher
-/// inside each worker (no shared state) while `var-calling-from-bam`
-/// passes one multi-chrom `WalkerLegacyAdapter` for the single
-/// sample's full traversal. Both paths pass the same per-stage
-/// configs in `CohortPipelineParams` and select the fetcher
-/// independently.
+/// each call site build its own per-chrom `StreamingChromRefFetcher`
+/// (no shared state) inside the per-chrom loop. Both `var-calling`
+/// and `var-calling-from-bam` pass the same per-stage configs in
+/// `CohortPipelineParams` and select the fetcher independently.
 ///
 /// `Clone` is derived because the per-chromosome parallel path in
 /// [`run_var_calling`](super::var_calling::run_var_calling) clones
 /// one parameter set per worker from a shared template. Every field
-/// is cheap-Clone — the configs are `Copy` or wrap a small `Vec`;
-/// `chromosomes` is a `Vec<ParsedChromosome>`.
+/// is cheap-Clone — the configs are `Copy` or wrap a small `Vec`.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct CohortPipelineParams {
@@ -144,9 +139,6 @@ pub struct CohortPipelineParams {
     pub grouper_cfg: GrouperConfig,
     pub per_group_cfg: PerGroupMergerConfig,
     pub posterior_cfg: PosteriorEngineConfig,
-    /// Chromosomes table — consumed by DUST when the filter is on
-    /// (no use otherwise).
-    pub chromosomes: Vec<ParsedChromosome>,
     /// Minimum site-level `QUAL` (phred) required to emit a record.
     /// Records with `qual_phred < min_qual_phred` are dropped before
     /// reaching the writer. `0.0` disables the filter. Default:
@@ -206,6 +198,7 @@ pub const MAPQ_FILTER_MIN_READS_PER_SIDE: u32 = 3;
 /// work.
 #[doc(hidden)]
 pub fn drive_cohort_pipeline<M, E>(
+    chrom_id: u32,
     merger: M,
     params: CohortPipelineParams,
     fetcher: SharedRefFetcher,
@@ -227,7 +220,6 @@ where
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        chromosomes,
         min_qual_phred,
         min_alt_obs_per_sample,
         no_mapq_diff_filter,
@@ -239,8 +231,8 @@ where
     // DUST branch + grouper convergence — both arms hand the grouper
     // a single `Result<_, GrouperError>` iterator so downstream
     // construction is monomorphic. `DustFilter` borrows from
-    // `&*fetcher` (the blanket `impl RefSeqFetcher for &T` makes
-    // this work for `Arc<dyn RefSeqFetcher>` after one deref). The
+    // `&*fetcher` (the blanket `impl ChromRefFetcher for &T` makes
+    // this work for `Arc<dyn ChromRefFetcher>` after one deref). The
     // anonymous `'_` lifetime ties the boxed iterator to the
     // local borrow of `fetcher`, which lives for the rest of this
     // function body.
@@ -249,7 +241,7 @@ where
     > = if no_complexity_filter {
         Box::new(merger.map(|r| r.map_err(GrouperError::from)))
     } else {
-        let dust = DustFilter::new(merger, &*fetcher, chromosomes, dust_cfg);
+        let dust = DustFilter::new(merger, &*fetcher, chrom_id, dust_cfg);
         Box::new(dust.map(|r| r.map_err(GrouperError::from)))
     };
 
@@ -477,23 +469,16 @@ where
     // drops, the buffer is freed, and the contig was never wholly
     // resident.
     //
-    // Phase 2(a) of the `unified_chrom_ref_fetcher` migration: the
-    // streaming fetcher is constructed via the new-API
-    // [`StreamingChromRefFetcher::for_contig`] (no `chrom_id` —
-    // bound by contig name only), then wrapped in a
-    // [`SingleChromLegacyAdapter`] that satisfies the legacy
-    // `RefSeqFetcher` trait. DUST and `PerGroupMerger` still
-    // consume the legacy trait through the adapter, but every
-    // `fetch` / `iter_bases` call routes through the new fetcher's
-    // typed-error path — exercising the `OutOfPattern` contract
-    // and the `iter_bases` reset-on-Drop behaviour in production.
+    // DUST and `PerGroupMerger` consume the new `ChromRefFetcher`
+    // trait directly; the streaming fetcher's typed-error path
+    // (including `OutOfPattern` and `iter_bases` reset-on-Drop)
+    // surfaces straight through.
     let streaming = StreamingChromRefFetcher::for_contig(fasta_path, &chrom_entry.name)
         .map_err(|e| io::Error::other(format!("ref fetcher construction failed: {e}")))?;
-    let adapter = SingleChromLegacyAdapter::new(chrom_id, streaming);
     // Wrap in Arc<dyn> for the DustFilter + PerGroupMerger trait-
     // object alias. Refcount stays at 1–2 per worker; never crosses
     // worker boundaries.
-    let fetcher: SharedRefFetcher = Arc::new(adapter);
+    let fetcher: SharedRefFetcher = Arc::new(streaming);
 
     // Open one PspReader per sample. Per-worker ownership: no
     // cross-thread coordination on the read side.
@@ -523,6 +508,7 @@ where
     };
 
     let stats = drive_cohort_pipeline::<_, E>(
+        chrom_id,
         merger,
         pipeline_params,
         fetcher,

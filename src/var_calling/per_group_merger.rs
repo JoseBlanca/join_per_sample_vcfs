@@ -42,7 +42,10 @@ use thiserror::Error;
 /// the dominant Stage 5 allocator cost per the perf review.
 type SourceList = SmallVec<[(usize, usize); 1]>;
 
-use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId, RefSeqFetcher};
+use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId};
+use crate::per_sample_pileup::ref_fetcher::ChromRefFetcher;
+#[cfg(test)]
+use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
 use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
 /// Maximum number of alleles retained in a single merged record
@@ -482,7 +485,7 @@ fn collect_non_decreasing(
 /// shared fetcher `Arc` moves across the worker boundary; the merger
 /// itself only ever asks for `&` access, so an immutable shared
 /// handle is sufficient.
-pub type SharedRefFetcher = Arc<dyn RefSeqFetcher + Send + Sync>;
+pub type SharedRefFetcher = Arc<dyn ChromRefFetcher + Send + Sync>;
 
 /// Streaming, internally-parallel per-group merger.
 pub struct PerGroupMerger<I>
@@ -661,7 +664,7 @@ where
 /// `None` if the group reduces to REF-only after unification).
 fn process_group(
     group: OverlappingVariantGroup,
-    ref_fetcher: &(dyn RefSeqFetcher + Send + Sync),
+    ref_fetcher: &(dyn ChromRefFetcher + Send + Sync),
     config: &PerGroupMergerConfig,
     genotype_tables: &[Vec<Vec<u8>>],
 ) -> Result<Option<MergedRecord>, PerGroupMergerError> {
@@ -701,12 +704,12 @@ fn process_group(
     }
     let span = end - start + 1;
 
-    let ref_seq = ref_fetcher.fetch(chrom_id, start, span).map_err(|source| {
+    let ref_seq = ref_fetcher.fetch(start, span).map_err(|source| {
         PerGroupMergerError::RefFetch {
             chrom_id,
             start,
             end,
-            source,
+            source: std::io::Error::other(format!("{source}")),
         }
     })?;
     if ref_seq.len() != span as usize {
@@ -1973,19 +1976,42 @@ mod tests {
         base_offset: u32,
     }
 
-    impl RefSeqFetcher for MockRef {
+    impl ChromRefFetcher for MockRef {
+        fn length(&self) -> u32 {
+            self.base_offset.saturating_sub(1) + self.seq.len() as u32
+        }
+
         fn fetch(
             &self,
-            _chrom_id: u32,
             start_1based: u32,
             length: u32,
-        ) -> Result<Vec<u8>, std::io::Error> {
+        ) -> Result<Vec<u8>, ChromRefFetchError> {
+            if start_1based < self.base_offset {
+                return Err(ChromRefFetchError::OutOfBounds {
+                    contig_name: "mock".into(),
+                    contig_length: self.length(),
+                    start: start_1based,
+                    end: start_1based + length,
+                });
+            }
             let start_idx = (start_1based - self.base_offset) as usize;
             let end_idx = start_idx + length as usize;
             if end_idx > self.seq.len() {
-                return Err(std::io::Error::other("out of range"));
+                return Err(ChromRefFetchError::OutOfBounds {
+                    contig_name: "mock".into(),
+                    contig_length: self.length(),
+                    start: start_1based,
+                    end: start_1based + length,
+                });
             }
             Ok(self.seq[start_idx..end_idx].to_vec())
+        }
+
+        fn iter_bases<'a>(
+            &'a self,
+        ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
+        {
+            Ok(Box::new(self.seq.iter().copied().map(Ok)))
         }
     }
 
@@ -2832,14 +2858,26 @@ mod tests {
     #[test]
     fn process_group_returns_error_on_short_fetcher_return() {
         struct ShortRef;
-        impl RefSeqFetcher for ShortRef {
+        impl ChromRefFetcher for ShortRef {
+            fn length(&self) -> u32 {
+                u32::MAX
+            }
+
             fn fetch(
                 &self,
-                _chrom_id: u32,
                 _start_1based: u32,
                 _length: u32,
-            ) -> Result<Vec<u8>, std::io::Error> {
+            ) -> Result<Vec<u8>, ChromRefFetchError> {
                 Ok(vec![b'A'])
+            }
+
+            fn iter_bases<'a>(
+                &'a self,
+            ) -> Result<
+                Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
+                ChromRefFetchError,
+            > {
+                Ok(Box::new(std::iter::once(Ok(b'A'))))
             }
         }
         let rec_s0 = record(

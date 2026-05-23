@@ -387,7 +387,6 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        chromosomes: chromosomes.clone(),
         min_qual_phred: args.cohort.min_qual_phred,
         min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
         no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
