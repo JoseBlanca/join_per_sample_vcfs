@@ -19,7 +19,39 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **Performance review of the PSP reader**
+> - **Last completed task:** **Code review of the FASTA fetcher
+>   module** (`src/per_sample_pileup/ref_fetcher.rs`) —
+>   [ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/ref_fetcher_2026-05-23.md).
+>   Status: **Request-changes** — 3 Blockers, 23 Major, 19 Minor,
+>   plus Nits. Production code paths exercised by callers are
+>   correct; the gaps are in the public-trait contract surface.
+>   Verification: `cargo clippy --lib --all-features` clean for this
+>   module; `cargo test --lib -- per_sample_pileup::ref_fetcher`
+>   34/34 pass; `cargo fmt --check` shows ~50 diffs in this file;
+>   `cargo doc --no-deps --lib` emits one stale intra-doc link
+>   warning at ref_fetcher.rs:282 (the deny gate at Cargo.toml
+>   `broken_intra_doc_links = "deny"` is firing but CI isn't
+>   enforcing it). Three Blockers: B1 `ContigFai::base_to_file_offset`
+>   panics on `.fai` with `line_bases = 0` (attacker-influenced via
+>   `--reference`); B2 `legacy_io_error` drops `contig_name` from
+>   every `Io`-variant flatten on the legacy walker surface; B3
+>   the load-bearing `OutOfPattern` contract has no
+>   production-buffer-size regression test (only a 4 KiB test
+>   buffer covers it). Six categories converge on the stale doc
+>   link (M1); errors+refactor_safety converge on missing
+>   `#[non_exhaustive]` on `ChromRefFetchError` (M2); idiomatic+
+>   smells+refactor_safety converge on `Source::Memory` cfg-gating
+>   (M8); smells+idiomatic converge on the vestigial legacy surface
+>   on `StreamingChromRefFetcher` (M12 — `bases()` +
+>   `StreamingBaseIter` + `RefSeqFetcher` impl have no production
+>   caller after the cohort migration); smells+idiomatic+extras+
+>   reliability cross-cat converge on ~80 LOC duplicated across
+>   three constructors (M13). Per-category audit trail at
+>   `tmp/review_2026-05-23_ref_fetcher/`. Four open questions for
+>   the author (migration completion timeline, error-enum evolution
+>   policy, public-trait stability bar, IUPAC handling) gate
+>   several Major findings.
+> - **Previous task:** **Performance review of the PSP reader**
 >   on the cohort var-calling hot path —
 >   [perf_psp_reader_2026-05-23.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-23.md).
 >   Verdict: **Apply the listed wins.** Profile basis: reused the
@@ -50,7 +82,7 @@ Skills and agents are instructed to leave it untouched.
 >   per-chrom worker ownership). Prior 2026-05-13 fixes (L5 varint
 >   fast/cold, L6 LE-slab cast, L8 BufReader doc, L1+L2 persistent
 >   Decompressor + scratch) all confirmed still in place.
-> - **Previous task:** **Performance review of the FASTA fetcher**
+> - **Previous-previous task — perf:** **Performance review of the FASTA fetcher**
 >   (`src/per_sample_pileup/ref_fetcher.rs`) after the Step-2
 >   `ChromRefFetcher` migration —
 >   [perf_ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/perf_ref_fetcher_2026-05-23.md).
@@ -70,7 +102,7 @@ Skills and agents are instructed to leave it untouched.
 >   per-fetcher microbench); 4 Speculative; 5 Notes. BAQ-side
 >   fetcher (`ManualEvictChromRefFetcher`) is cold on this fixture
 >   (<0.1 % per-symbol); findings against it cap at Note.
-> - **Previous-previous task:** Posterior engine **emit-with-flag** for
+> - **Earlier — emit-with-flag:** Posterior engine **emit-with-flag** for
 >   non-converging records (commit `aab9ac0`). Records that hit
 >   `max_iterations` without satisfying `convergence_threshold` are
 >   now emitted with `FILTER=EMNoConv` instead of hard-erroring the
@@ -82,7 +114,7 @@ Skills and agents are instructed to leave it untouched.
 >   (~3.7 ppm of the cohort). Run summary surfaces the tally:
 >   `var-calling: ... records_emnoconv=5 (FILTER=EMNoConv; EM
 >   iteration cap)`. 850 lib tests + 39 integration tests pass.
-> - **Earlier task:** **H1 (per-chromosome parallelism)** + **L1
+> - **Earlier — H1 per-chrom:** **H1 (per-chromosome parallelism)** + **L1
 >   (per-group `par_iter` removal)** for cohort `var-calling` — impl
 >   report
 >   [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md);
@@ -243,6 +275,19 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Impl report (cohort slice):**
   [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
 - **Latest reviews (cohort slice):**
+  [ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/ref_fetcher_2026-05-23.md)
+  (code review of `src/per_sample_pileup/ref_fetcher.rs` — status
+  *Request-changes*; 3 Blockers, 23 Major, 19 Minor. Production
+  code paths are correct; gaps are in the public-trait contract
+  surface. Highlights: B1 `.fai` `line_bases=0` panic on
+  attacker-influenced input; B2 `legacy_io_error` drops
+  `contig_name` from every legacy-walker diagnostic; B3 the
+  `OutOfPattern` contract has no production-buffer-size regression
+  test; convergent Majors: stale doc link at line 282 — 6
+  categories, missing `#[non_exhaustive]` on `ChromRefFetchError`,
+  `Source::Memory` cfg-gating, vestigial legacy surface on
+  `StreamingChromRefFetcher` after the Step-2 migration, ~80 LOC
+  constructor duplication across three sites.);
   [perf_ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/perf_ref_fetcher_2026-05-23.md)
   (FASTA fetcher post-Step-2-migration — verdict: *Apply the listed
   wins*, gated on H4; 4 Hot-path, 10 Likely, 4 Speculative;

@@ -38,11 +38,11 @@
 //! That restructure is non-trivial; we ship the unified shape and
 //! revisit if the adapter layer becomes a real friction point.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::cell::RefCell;
 use std::sync::Mutex;
 
 use noodles_fasta::fai;
@@ -209,14 +209,24 @@ impl StreamingChromRefFetcher {
         let length = u32::try_from(record.length()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("contig {} length {} exceeds u32::MAX", contig_name, record.length()),
+                format!(
+                    "contig {} length {} exceeds u32::MAX",
+                    contig_name,
+                    record.length()
+                ),
             )
         })?;
         let line_bases = u32::try_from(record.line_bases()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, ".fai line_bases exceeds u32::MAX")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                ".fai line_bases exceeds u32::MAX",
+            )
         })?;
         let line_width = u32::try_from(record.line_width()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, ".fai line_width exceeds u32::MAX")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                ".fai line_width exceeds u32::MAX",
+            )
         })?;
         let file = File::open(fasta_path)?;
         Ok(Self {
@@ -334,9 +344,9 @@ impl RefSeqFetcher for StreamingChromRefFetcher {
                 "start_1based must be >= 1",
             ));
         }
-        let end_1based = start_1based.checked_add(length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow")
-        })?;
+        let end_1based = start_1based
+            .checked_add(length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow"))?;
         if end_1based.saturating_sub(1) > self.fai.length {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -352,8 +362,7 @@ impl RefSeqFetcher for StreamingChromRefFetcher {
         // current buffer; refill otherwise.
         let buf_covers = !state.buf.is_empty()
             && start_1based >= state.buf_start_base
-            && (end_1based as u64)
-                <= state.buf_start_base as u64 + state.buf.len() as u64;
+            && (end_1based as u64) <= state.buf_start_base as u64 + state.buf.len() as u64;
         if !buf_covers {
             // Refill at least the requested span, capped at the
             // configured buffer size. If the request exceeds the
@@ -393,8 +402,7 @@ impl Iterator for StreamingBaseIter<'_> {
         let mut state = self.fetcher.inner.borrow_mut();
         let need_refill = state.buf.is_empty()
             || self.next_base < state.buf_start_base
-            || (self.next_base as u64)
-                >= state.buf_start_base as u64 + state.buf.len() as u64;
+            || (self.next_base as u64) >= state.buf_start_base as u64 + state.buf.len() as u64;
         if need_refill
             && let Err(e) = refill(
                 &mut state,
@@ -500,9 +508,7 @@ fn refill(
 pub enum ChromRefFetchError {
     /// The requested `[start, start+length)` window exceeds the
     /// bound contig's total length.
-    #[error(
-        "fetch [{start}, {end}) past contig {contig_name} length {contig_length}"
-    )]
+    #[error("fetch [{start}, {end}) past contig {contig_name} length {contig_length}")]
     OutOfBounds {
         contig_name: String,
         contig_length: u32,
@@ -562,11 +568,7 @@ pub trait ChromRefFetcher {
     /// Return `length` uppercased bases starting at 1-based
     /// `start`. Bytes are SAM-spec canonical (`A`/`C`/`G`/`T`/`N`)
     /// regardless of how the FASTA is masked on disk.
-    fn fetch(
-        &self,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, ChromRefFetchError>;
+    fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError>;
 
     /// Forward sequential iterator over every uppercased base of
     /// the bound contig in 1..=length order. Used by DUST's mask
@@ -581,10 +583,7 @@ pub trait ChromRefFetcher {
     /// starts a fresh buffer phase).
     fn iter_bases<'a>(
         &'a self,
-    ) -> Result<
-        Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
-        ChromRefFetchError,
-    >;
+    ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>;
 
     /// Append `length` bases starting at 1-based `start` into the
     /// caller-supplied `dst`. The buffer is cleared first; on success
@@ -621,20 +620,14 @@ impl<T: ChromRefFetcher + ?Sized> ChromRefFetcher for &T {
         (**self).length()
     }
 
-    fn fetch(
-        &self,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, ChromRefFetchError> {
+    fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError> {
         (**self).fetch(start_1based, length)
     }
 
     fn iter_bases<'a>(
         &'a self,
-    ) -> Result<
-        Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
-        ChromRefFetchError,
-    > {
+    ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
+    {
         (**self).iter_bases()
     }
 
@@ -653,10 +646,7 @@ impl StreamingChromRefFetcher {
     /// stores the same state as the legacy [`Self::new`] but with
     /// `chrom_id = 0` (the new trait doesn't expose `chrom_id`, so
     /// the stored value is meaningless for new-API consumers).
-    pub fn for_contig(
-        fasta_path: &Path,
-        contig_name: &str,
-    ) -> Result<Self, ChromRefFetchError> {
+    pub fn for_contig(fasta_path: &Path, contig_name: &str) -> Result<Self, ChromRefFetchError> {
         Self::for_contig_with_fai_path(fasta_path, None, contig_name)
     }
 
@@ -704,11 +694,9 @@ impl StreamingChromRefFetcher {
                 &fai_path_owned
             }
         };
-        let index = fai::fs::read(fai_path_resolved).map_err(|source| {
-            ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source,
-            }
+        let index = fai::fs::read(fai_path_resolved).map_err(|source| ChromRefFetchError::Io {
+            contig_name: contig_name.to_string(),
+            source,
         })?;
         let record = index
             .as_ref()
@@ -721,37 +709,33 @@ impl StreamingChromRefFetcher {
                     format!("contig {contig_name} not in FASTA index"),
                 ),
             })?;
-        let length = u32::try_from(record.length()).map_err(|_| {
-            ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "contig {} length {} exceeds u32::MAX",
-                        contig_name,
-                        record.length()
-                    ),
+        let length = u32::try_from(record.length()).map_err(|_| ChromRefFetchError::Io {
+            contig_name: contig_name.to_string(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "contig {} length {} exceeds u32::MAX",
+                    contig_name,
+                    record.length()
                 ),
-            }
+            ),
         })?;
-        let line_bases = u32::try_from(record.line_bases()).map_err(|_| {
-            ChromRefFetchError::Io {
+        let line_bases =
+            u32::try_from(record.line_bases()).map_err(|_| ChromRefFetchError::Io {
                 contig_name: contig_name.to_string(),
                 source: io::Error::new(
                     io::ErrorKind::InvalidData,
                     ".fai line_bases exceeds u32::MAX",
                 ),
-            }
-        })?;
-        let line_width = u32::try_from(record.line_width()).map_err(|_| {
-            ChromRefFetchError::Io {
+            })?;
+        let line_width =
+            u32::try_from(record.line_width()).map_err(|_| ChromRefFetchError::Io {
                 contig_name: contig_name.to_string(),
                 source: io::Error::new(
                     io::ErrorKind::InvalidData,
                     ".fai line_width exceeds u32::MAX",
                 ),
-            }
-        })?;
+            })?;
         let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
             contig_name: contig_name.to_string(),
             source,
@@ -799,8 +783,7 @@ impl Iterator for ChromRefBaseIter<'_> {
         let mut state = self.fetcher.inner.borrow_mut();
         let need_refill = state.buf.is_empty()
             || self.next_base < state.buf_start_base
-            || (self.next_base as u64)
-                >= state.buf_start_base as u64 + state.buf.len() as u64;
+            || (self.next_base as u64) >= state.buf_start_base as u64 + state.buf.len() as u64;
         if need_refill {
             // We don't know the buffer size from this scope — use the
             // production constant; tests that need a custom size go
@@ -841,11 +824,7 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
         self.fai.length
     }
 
-    fn fetch(
-        &self,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, ChromRefFetchError> {
+    fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError> {
         // fetch is just fetch_into into a fresh Vec; the heavy
         // lifting lives in fetch_into.
         let mut dst = Vec::with_capacity(length as usize);
@@ -862,15 +841,13 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
         if start_1based == 0 {
             return Err(ChromRefFetchError::InvalidStart);
         }
-        let end_1based = start_1based.checked_add(length).ok_or_else(|| {
-            ChromRefFetchError::Io {
-                contig_name: self.contig_name.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "fetch range overflow",
-                ),
-            }
-        })?;
+        let end_1based =
+            start_1based
+                .checked_add(length)
+                .ok_or_else(|| ChromRefFetchError::Io {
+                    contig_name: self.contig_name.clone(),
+                    source: io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow"),
+                })?;
         if end_1based.saturating_sub(1) > self.fai.length {
             return Err(ChromRefFetchError::OutOfBounds {
                 contig_name: self.contig_name.clone(),
@@ -894,8 +871,7 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
 
         let buf_covers = !state.buf.is_empty()
             && start_1based >= state.buf_start_base
-            && (end_1based as u64)
-                <= state.buf_start_base as u64 + state.buf.len() as u64;
+            && (end_1based as u64) <= state.buf_start_base as u64 + state.buf.len() as u64;
         if !buf_covers {
             // Refill forward (or initial fill on an empty buffer).
             // The forward direction is guaranteed by the OutOfPattern
@@ -918,10 +894,8 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
 
     fn iter_bases<'a>(
         &'a self,
-    ) -> Result<
-        Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
-        ChromRefFetchError,
-    > {
+    ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
+    {
         // Reset the buffer so the iter starts a fresh phase.
         let mut state = self.inner.borrow_mut();
         state.buf.clear();
@@ -992,12 +966,7 @@ impl WalkerLegacyAdapter {
 }
 
 impl RefSeqFetcher for WalkerLegacyAdapter {
-    fn fetch(
-        &self,
-        chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, io::Error> {
+    fn fetch(&self, chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
         let mut slot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let needs_rebuild = match slot.as_ref() {
             Some((current, _)) => *current != chrom_id,
@@ -1049,18 +1018,15 @@ impl RefSeqFetcher for WalkerLegacyAdapter {
 fn legacy_io_error(e: ChromRefFetchError) -> io::Error {
     match e {
         ChromRefFetchError::Io { source, .. } => source,
-        ChromRefFetchError::InvalidStart => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "start_1based must be >= 1",
-        ),
-        ChromRefFetchError::OutOfBounds { .. } => io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            e.to_string(),
-        ),
-        ChromRefFetchError::OutOfPattern { .. } => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            e.to_string(),
-        ),
+        ChromRefFetchError::InvalidStart => {
+            io::Error::new(io::ErrorKind::InvalidInput, "start_1based must be >= 1")
+        }
+        ChromRefFetchError::OutOfBounds { .. } => {
+            io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string())
+        }
+        ChromRefFetchError::OutOfPattern { .. } => {
+            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+        }
     }
 }
 
@@ -1119,10 +1085,7 @@ impl ManualEvictChromRefFetcher {
     /// Open the FASTA at `fasta_path`, parse the sibling `.fai`,
     /// look up `contig_name`, return a fetcher with an empty
     /// buffer ready to serve `fetch` calls.
-    pub fn for_contig(
-        fasta_path: &Path,
-        contig_name: &str,
-    ) -> Result<Self, ChromRefFetchError> {
+    pub fn for_contig(fasta_path: &Path, contig_name: &str) -> Result<Self, ChromRefFetchError> {
         Self::for_contig_with_fai_path(fasta_path, None, contig_name)
     }
 
@@ -1144,11 +1107,9 @@ impl ManualEvictChromRefFetcher {
                 &fai_path_owned
             }
         };
-        let index = fai::fs::read(fai_path_resolved).map_err(|source| {
-            ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source,
-            }
+        let index = fai::fs::read(fai_path_resolved).map_err(|source| ChromRefFetchError::Io {
+            contig_name: contig_name.to_string(),
+            source,
         })?;
         let record = index
             .as_ref()
@@ -1161,37 +1122,33 @@ impl ManualEvictChromRefFetcher {
                     format!("contig {contig_name} not in FASTA index"),
                 ),
             })?;
-        let length = u32::try_from(record.length()).map_err(|_| {
-            ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "contig {} length {} exceeds u32::MAX",
-                        contig_name,
-                        record.length()
-                    ),
+        let length = u32::try_from(record.length()).map_err(|_| ChromRefFetchError::Io {
+            contig_name: contig_name.to_string(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "contig {} length {} exceeds u32::MAX",
+                    contig_name,
+                    record.length()
                 ),
-            }
+            ),
         })?;
-        let line_bases = u32::try_from(record.line_bases()).map_err(|_| {
-            ChromRefFetchError::Io {
+        let line_bases =
+            u32::try_from(record.line_bases()).map_err(|_| ChromRefFetchError::Io {
                 contig_name: contig_name.to_string(),
                 source: io::Error::new(
                     io::ErrorKind::InvalidData,
                     ".fai line_bases exceeds u32::MAX",
                 ),
-            }
-        })?;
-        let line_width = u32::try_from(record.line_width()).map_err(|_| {
-            ChromRefFetchError::Io {
+            })?;
+        let line_width =
+            u32::try_from(record.line_width()).map_err(|_| ChromRefFetchError::Io {
                 contig_name: contig_name.to_string(),
                 source: io::Error::new(
                     io::ErrorKind::InvalidData,
                     ".fai line_width exceeds u32::MAX",
                 ),
-            }
-        })?;
+            })?;
         let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
             contig_name: contig_name.to_string(),
             source,
@@ -1219,23 +1176,17 @@ impl ManualEvictChromRefFetcher {
     /// as a borrowed slice. If the buffer doesn't cover the
     /// requested range, extends in whichever direction is needed
     /// (forward by appending, backward by prepending).
-    pub fn fetch(
-        &mut self,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<&[u8], ChromRefFetchError> {
+    pub fn fetch(&mut self, start_1based: u32, length: u32) -> Result<&[u8], ChromRefFetchError> {
         if start_1based == 0 {
             return Err(ChromRefFetchError::InvalidStart);
         }
-        let end_exclusive = start_1based.checked_add(length).ok_or_else(|| {
-            ChromRefFetchError::Io {
-                contig_name: self.contig_name.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "fetch range overflow",
-                ),
-            }
-        })?;
+        let end_exclusive =
+            start_1based
+                .checked_add(length)
+                .ok_or_else(|| ChromRefFetchError::Io {
+                    contig_name: self.contig_name.clone(),
+                    source: io::Error::new(io::ErrorKind::InvalidInput, "fetch range overflow"),
+                })?;
         // [start_1based, end_exclusive); valid only if end <= length+1.
         if end_exclusive.saturating_sub(1) > self.fai.length {
             return Err(ChromRefFetchError::OutOfBounds {
@@ -1369,10 +1320,7 @@ impl ManualEvictChromRefFetcher {
         extra_bases: usize,
     ) -> Result<(), ChromRefFetchError> {
         debug_assert!(new_start < self.buf_start_base);
-        debug_assert_eq!(
-            (self.buf_start_base - new_start) as usize,
-            extra_bases,
-        );
+        debug_assert_eq!((self.buf_start_base - new_start) as usize, extra_bases,);
 
         // Build the prefix bytes in a scratch Vec, then splice into
         // the front of `self.buf`. `Vec::splice` does the memmove
@@ -1402,11 +1350,7 @@ impl ManualEvictChromRefFetcher {
 /// append them to `dst`. Returns an `UnexpectedEof` if the source
 /// runs out before `n_bases` bases are gathered. Shared by both
 /// streaming and manual-evict fetchers.
-fn read_uppercased_bases(
-    reader: &mut File,
-    dst: &mut Vec<u8>,
-    n_bases: usize,
-) -> io::Result<()> {
+fn read_uppercased_bases(reader: &mut File, dst: &mut Vec<u8>, n_bases: usize) -> io::Result<()> {
     let want_total = dst.len() + n_bases;
     let mut read_buf = [0u8; STREAMING_REF_FILE_READ_CHUNK];
     while dst.len() < want_total {
@@ -1471,7 +1415,11 @@ mod tests {
         name: &str,
         seq: &[u8],
         line_bases: u32,
-    ) -> (Vec<u8>, u64 /* seq_offset */, u32 /* line_width */) {
+    ) -> (
+        Vec<u8>,
+        u64, /* seq_offset */
+        u32, /* line_width */
+    ) {
         let header = format!(">{name}\n");
         let mut blob = header.as_bytes().to_vec();
         let seq_offset = blob.len() as u64;
@@ -1504,7 +1452,7 @@ mod tests {
         );
         assert_eq!(fetcher.chrom_id(), 0);
 
-        let bytes = RefSeqFetcher::fetch(&fetcher,0, 5, 4).expect("fetch");
+        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 5, 4).expect("fetch");
         // 1-based start=5, length=4 → bytes at indices 4..8.
         assert_eq!(bytes, &seq[4..8]);
     }
@@ -1527,10 +1475,10 @@ mod tests {
         );
 
         // Spans across line boundary.
-        let bytes = RefSeqFetcher::fetch(&fetcher,0, 58, 5).expect("fetch");
+        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 58, 5).expect("fetch");
         assert_eq!(bytes, seq[57..62]);
         // Wholly inside one line.
-        let bytes = RefSeqFetcher::fetch(&fetcher,0, 70, 10).expect("fetch");
+        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 70, 10).expect("fetch");
         assert_eq!(bytes, seq[69..79]);
     }
 
@@ -1549,7 +1497,7 @@ mod tests {
             18,
             line_width,
         );
-        let bytes = RefSeqFetcher::fetch(&fetcher,0, 1, seq.len() as u32).expect("fetch");
+        let bytes = RefSeqFetcher::fetch(&fetcher, 0, 1, seq.len() as u32).expect("fetch");
         assert_eq!(bytes, b"ACGTACGTNNACGTACGT");
     }
 
@@ -1561,7 +1509,9 @@ mod tests {
         // size by jumping past `STREAMING_REF_BUFFER_BYTES` worth of
         // bases; cheaper to assert correctness with two short
         // fetches at distant positions on a 2 MB contig.
-        let seq: Vec<u8> = (0..2_000_000_u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+        let seq: Vec<u8> = (0..2_000_000_u32)
+            .map(|i| b"ACGT"[(i % 4) as usize])
+            .collect();
         let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 80);
         let fetcher = StreamingChromRefFetcher::from_memory(
             blob,
@@ -1573,10 +1523,10 @@ mod tests {
             line_width,
         );
         // Fetch near the start.
-        let a = RefSeqFetcher::fetch(&fetcher,0, 100, 16).expect("fetch a");
+        let a = RefSeqFetcher::fetch(&fetcher, 0, 100, 16).expect("fetch a");
         assert_eq!(a, seq[99..115]);
         // Then jump well past the 1 MB buffer.
-        let b = RefSeqFetcher::fetch(&fetcher,0, 1_500_000, 16).expect("fetch b");
+        let b = RefSeqFetcher::fetch(&fetcher, 0, 1_500_000, 16).expect("fetch b");
         assert_eq!(b, seq[1_499_999..1_500_015]);
     }
 
@@ -1587,7 +1537,9 @@ mod tests {
         // position. Documents the slower path; production access
         // never hits this (PerGroupMerger is monotonic), but tests
         // pin the behaviour.
-        let seq: Vec<u8> = (0..2_000_000_u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+        let seq: Vec<u8> = (0..2_000_000_u32)
+            .map(|i| b"ACGT"[(i % 4) as usize])
+            .collect();
         let (blob, seq_offset, line_width) = build_memory_fasta("chr0", &seq, 80);
         let fetcher = StreamingChromRefFetcher::from_memory(
             blob,
@@ -1598,8 +1550,8 @@ mod tests {
             80,
             line_width,
         );
-        let _ = RefSeqFetcher::fetch(&fetcher,0, 1_500_000, 16).expect("fetch forward");
-        let back = RefSeqFetcher::fetch(&fetcher,0, 100, 16).expect("fetch back");
+        let _ = RefSeqFetcher::fetch(&fetcher, 0, 1_500_000, 16).expect("fetch forward");
+        let back = RefSeqFetcher::fetch(&fetcher, 0, 100, 16).expect("fetch back");
         assert_eq!(back, seq[99..115]);
     }
 
@@ -1616,7 +1568,7 @@ mod tests {
             10,
             line_width,
         );
-        let err = RefSeqFetcher::fetch(&fetcher,0, 8, 5).expect_err("must fail");
+        let err = RefSeqFetcher::fetch(&fetcher, 0, 8, 5).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
@@ -1633,7 +1585,7 @@ mod tests {
             4,
             line_width,
         );
-        let err = RefSeqFetcher::fetch(&fetcher,7, 1, 4).expect_err("must fail");
+        let err = RefSeqFetcher::fetch(&fetcher, 7, 1, 4).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -1650,7 +1602,7 @@ mod tests {
             4,
             line_width,
         );
-        let err = RefSeqFetcher::fetch(&fetcher,0, 0, 1).expect_err("must fail");
+        let err = RefSeqFetcher::fetch(&fetcher, 0, 0, 1).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -1701,7 +1653,7 @@ mod tests {
         let streaming = StreamingChromRefFetcher::new(&path, 0, "chr0".into()).expect("fetcher");
 
         for (start, length) in [(1u32, 16u32), (8, 32), (50, 14), (64, 1)] {
-            let bytes = RefSeqFetcher::fetch(&streaming,0, start, length).expect("streaming");
+            let bytes = RefSeqFetcher::fetch(&streaming, 0, start, length).expect("streaming");
             let expected = vec![b'A'; length as usize];
             assert_eq!(bytes, expected, "mismatch at start={start} length={length}");
         }
@@ -1846,7 +1798,10 @@ mod tests {
 
         let result = StreamingChromRefFetcher::for_contig(&path, "chr_missing");
         match result {
-            Err(ChromRefFetchError::Io { contig_name, source }) => {
+            Err(ChromRefFetchError::Io {
+                contig_name,
+                source,
+            }) => {
                 assert_eq!(contig_name, "chr_missing");
                 assert_eq!(source.kind(), io::ErrorKind::NotFound);
             }
@@ -1859,7 +1814,9 @@ mod tests {
     fn chrom_ref_buffer_refill_on_forward_jump() {
         // Large forward jump triggers a refill; the second fetch
         // returns the correct bytes from the new buffer window.
-        let seq: Vec<u8> = (0..2_000_000_u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+        let seq: Vec<u8> = (0..2_000_000_u32)
+            .map(|i| b"ACGT"[(i % 4) as usize])
+            .collect();
         let (_dir, path) = build_line_wrapped_fasta("chr0", &seq, 80);
         let fetcher = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("fetcher");
 
@@ -1873,7 +1830,9 @@ mod tests {
     fn chrom_ref_small_backward_within_buffer() {
         // Backward jump that stays inside the current sliding
         // buffer: should serve from the buffer without error.
-        let seq: Vec<u8> = (0..2_000_000_u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+        let seq: Vec<u8> = (0..2_000_000_u32)
+            .map(|i| b"ACGT"[(i % 4) as usize])
+            .collect();
         let (_dir, path) = build_line_wrapped_fasta("chr0", &seq, 80);
         let fetcher = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("fetcher");
 
@@ -1895,12 +1854,9 @@ mod tests {
         // pins the contract for tests.
         let seq: Vec<u8> = (0..20_000_u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
         let (_dir, path) = build_line_wrapped_fasta("chr0", &seq, 80);
-        let fetcher = StreamingChromRefFetcher::for_contig_with_buffer_bytes(
-            &path,
-            "chr0",
-            4 * 1024,
-        )
-        .expect("fetcher");
+        let fetcher =
+            StreamingChromRefFetcher::for_contig_with_buffer_bytes(&path, "chr0", 4 * 1024)
+                .expect("fetcher");
 
         // Forward jump: loads buffer at start=10_000, capacity 4 KB.
         let _ = ChromRefFetcher::fetch(&fetcher, 10_000, 16).expect("forward");
@@ -1943,7 +1899,9 @@ mod tests {
         // start of the contig. The iter_bases Drop must reset the
         // sliding buffer so this composition doesn't trip
         // OutOfPattern.
-        let seq: Vec<u8> = (0..2_000_000_u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+        let seq: Vec<u8> = (0..2_000_000_u32)
+            .map(|i| b"ACGT"[(i % 4) as usize])
+            .collect();
         let (_dir, path) = build_line_wrapped_fasta("chr0", &seq, 80);
         let fetcher = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("fetcher");
 

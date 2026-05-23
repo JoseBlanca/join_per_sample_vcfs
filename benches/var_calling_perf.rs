@@ -45,9 +45,7 @@ use pop_var_caller::var_calling::per_position_merger::{
 use pop_var_caller::var_calling::posterior_engine::backends::{
     ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend,
 };
-use pop_var_caller::var_calling::posterior_engine::{
-    PosteriorEngine, PosteriorEngineConfig,
-};
+use pop_var_caller::var_calling::posterior_engine::{PosteriorEngine, PosteriorEngineConfig};
 use pop_var_caller::var_calling::variant_grouping::{
     GrouperConfig, OverlappingVariantGroup, VariantGrouper,
 };

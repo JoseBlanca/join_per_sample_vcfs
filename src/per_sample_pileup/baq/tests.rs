@@ -358,9 +358,7 @@ use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 /// `unified_chrom_ref_fetcher` migration: BAQ no longer takes a
 /// trait-object fetcher, so the tests now use the real production
 /// type with a tiny tempfile FASTA.
-fn fetcher_from_chrom_bytes(
-    chrom: &[u8],
-) -> (tempfile::TempDir, ManualEvictChromRefFetcher) {
+fn fetcher_from_chrom_bytes(chrom: &[u8]) -> (tempfile::TempDir, ManualEvictChromRefFetcher) {
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("tempdir");
     let fasta_path = dir.path().join("ref.fa");
@@ -434,7 +432,6 @@ fn stream_components_from_chrom_bytes(
     };
     (dir, fasta_path, contigs)
 }
-
 
 fn synthetic_read(
     flag: u16,
@@ -881,7 +878,13 @@ fn stream_yields_prepared_reads_in_order_within_chunk() {
             ))
         })
         .collect();
-    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
+    let stream = BaqStream::new(
+        inputs.into_iter(),
+        BaqConfig::default(),
+        fasta_path.clone(),
+        contigs.clone(),
+        16,
+    );
     let outputs: Vec<Result<PreparedRead, _>> = stream.collect();
     assert_eq!(outputs.len(), 4);
     let starts: Vec<u32> = outputs
@@ -908,7 +911,13 @@ fn stream_preserves_order_across_chunks() {
             ))
         })
         .collect();
-    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 2);
+    let stream = BaqStream::new(
+        inputs.into_iter(),
+        BaqConfig::default(),
+        fasta_path.clone(),
+        contigs.clone(),
+        2,
+    );
     let starts: Vec<u32> = stream.map(|r| r.unwrap().alignment_start).collect();
     assert_eq!(starts, vec![1, 2, 3, 4, 5]);
 }
@@ -938,7 +947,13 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
         .build()
         .unwrap();
     let starts = pool.install(|| {
-        let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
+        let stream = BaqStream::new(
+            inputs.into_iter(),
+            BaqConfig::default(),
+            fasta_path.clone(),
+            contigs.clone(),
+            16,
+        );
         stream
             .map(|r| r.unwrap().alignment_start)
             .collect::<Vec<u32>>()
@@ -948,8 +963,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
 
 #[test]
 fn stream_increments_skip_counts_per_reason() {
-    let (_dir, fasta_path, contigs) =
-        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
         // Capped — happy path.
         Ok(synthetic_read(
@@ -988,7 +1002,13 @@ fn stream_increments_skip_counts_per_reason() {
             vec![40; 5],
         )),
     ];
-    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
+    let mut stream = BaqStream::new(
+        inputs.into_iter(),
+        BaqConfig::default(),
+        fasta_path.clone(),
+        contigs.clone(),
+        16,
+    );
     let outputs: Vec<_> = (&mut stream).collect();
     assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 2);
     let counts = *stream.skip_counts();
@@ -1011,8 +1031,14 @@ fn stream_propagates_upstream_error_after_batched_reads() {
         )),
         Err(CramInputError::NoInputs),
     ];
-    let outputs: Vec<_> =
-        BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16).collect();
+    let outputs: Vec<_> = BaqStream::new(
+        inputs.into_iter(),
+        BaqConfig::default(),
+        fasta_path.clone(),
+        contigs.clone(),
+        16,
+    )
+    .collect();
     assert_eq!(outputs.len(), 2);
     assert!(outputs[0].is_ok());
     assert!(matches!(outputs[1], Err(CramInputError::NoInputs)));
@@ -1051,7 +1077,13 @@ fn stream_returns_success_after_all_skipped_chunks() {
             vec![40; 5],
         )),
     ];
-    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 1);
+    let mut stream = BaqStream::new(
+        inputs.into_iter(),
+        BaqConfig::default(),
+        fasta_path.clone(),
+        contigs.clone(),
+        1,
+    );
     let outputs: Vec<_> = (&mut stream).collect();
     assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 1);
     let counts = *stream.skip_counts();
@@ -1069,7 +1101,13 @@ fn stream_is_fused_after_exhaustion() {
         b"ACGTA".to_vec(),
         vec![40; 5],
     ))];
-    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
+    let mut stream = BaqStream::new(
+        inputs.into_iter(),
+        BaqConfig::default(),
+        fasta_path.clone(),
+        contigs.clone(),
+        16,
+    );
     assert!(stream.next().is_some());
     assert!(stream.next().is_none());
     // Confirmed fused: re-poll yields None.

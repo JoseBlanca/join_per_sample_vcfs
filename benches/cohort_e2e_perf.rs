@@ -74,7 +74,7 @@ use std::sync::Arc;
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use md5::{Digest, Md5};
 use tempfile::TempDir;
 
@@ -82,35 +82,36 @@ use pop_var_caller::per_sample_pileup::cram_input::{ContigEntry, ContigList};
 use pop_var_caller::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, PileupRecord,
 };
+use pop_var_caller::per_sample_pileup::psp::PspReadError;
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParsedChromosome, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
-use pop_var_caller::per_sample_pileup::psp::PspReadError;
 use pop_var_caller::per_sample_pileup::ref_fetcher::SyncRefFetcher;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{
-    drive_cohort_pipeline, CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
-    DEFAULT_MIN_QUAL_PHRED,
+    CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
+    DEFAULT_MIN_QUAL_PHRED, drive_cohort_pipeline,
 };
 use pop_var_caller::pop_var_caller::var_calling::{
-    run_var_calling, VarCallingArgs, VarCallingCliError,
+    VarCallingArgs, VarCallingCliError, run_var_calling,
 };
 use pop_var_caller::var_calling::dust_filter::{
-    DustFilterConfig, DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW,
+    DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW, DustFilterConfig,
 };
 use pop_var_caller::var_calling::per_group_merger::{
-    PerGroupMergerConfig, SharedRefFetcher, DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_PER_RECORD,
-    DEFAULT_PLOIDY,
+    DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY, PerGroupMergerConfig,
+    SharedRefFetcher,
 };
 use pop_var_caller::var_calling::per_position_merger::PerPositionMerger;
 use pop_var_caller::var_calling::posterior_engine::{
-    PosteriorEngineConfig, DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
     DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
+    PosteriorEngineConfig,
 };
 use pop_var_caller::var_calling::variant_grouping::{
-    GrouperConfig, DEFAULT_MAX_VARIANT_GROUP_SPAN,
+    DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig,
 };
 use pop_var_caller::var_calling::vcf_writer::{CohortMetadata, WriterConfig};
 
@@ -318,8 +319,8 @@ impl CohortFixture {
                 max_gq_phred: DEFAULT_MAX_GQ_PHRED,
                 min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
                 min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
-            no_mapq_diff_filter: false,
-            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
+                no_mapq_diff_filter: false,
+                min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
                 emit_gp: false,
             },
         }
@@ -433,9 +434,9 @@ fn build_sample_records(n_positions: u32, ref_seq: &[u8], sample_idx: usize) -> 
                         HET_REF_DEPTH / 2,
                         HET_REF_DEPTH / 4,
                         HET_REF_DEPTH / 8,
-                                            0,
                         0,
-),
+                        0,
+                    ),
                     Vec::new(),
                 ),
                 AlleleObservation::new(
@@ -446,9 +447,9 @@ fn build_sample_records(n_positions: u32, ref_seq: &[u8], sample_idx: usize) -> 
                         HET_ALT_DEPTH / 2,
                         HET_ALT_DEPTH / 4,
                         HET_ALT_DEPTH / 8,
-                                            0,
                         0,
-),
+                        0,
+                    ),
                     Vec::new(),
                 ),
             ]
@@ -461,9 +462,9 @@ fn build_sample_records(n_positions: u32, ref_seq: &[u8], sample_idx: usize) -> 
                     REF_DEPTH / 2,
                     REF_DEPTH / 4,
                     REF_DEPTH / 8,
-                                    0,
                     0,
-),
+                    0,
+                ),
                 Vec::new(),
             )]
         };

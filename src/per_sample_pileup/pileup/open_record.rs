@@ -141,9 +141,8 @@ impl OpenPileupRecord {
     /// the chain id set from `folded_reads` at finalise removes
     /// that drift surface entirely.
     pub fn finalise(self) -> PileupRecord {
-        let mut per_bucket: Vec<Vec<ChainId>> = (0..self.alleles.len())
-            .map(|_| Vec::new())
-            .collect();
+        let mut per_bucket: Vec<Vec<ChainId>> =
+            (0..self.alleles.len()).map(|_| Vec::new()).collect();
         for state in self.folded_reads.values() {
             per_bucket[state.allele_index].push(state.chain_id);
         }

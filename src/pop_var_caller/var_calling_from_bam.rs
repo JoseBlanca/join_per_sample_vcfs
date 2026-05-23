@@ -422,13 +422,12 @@ fn run_cohort_pipeline_for_single_sample(
         // Per-chrom reference fetcher: opens its own indexed FASTA
         // reader, serves bases through a 1 MB sliding buffer, drops
         // at end of scope.
-        let streaming =
-            StreamingChromRefFetcher::for_contig(reference, &chrom_entry.name)
-                .map_err(|e| {
-                    VarCallingFromBamCliError::Io(io::Error::other(format!(
-                        "ref fetcher construction failed: {e}"
-                    )))
-                })?;
+        let streaming = StreamingChromRefFetcher::for_contig(reference, &chrom_entry.name)
+            .map_err(|e| {
+                VarCallingFromBamCliError::Io(io::Error::other(format!(
+                    "ref fetcher construction failed: {e}"
+                )))
+            })?;
         // See cohort_driver::process_one_chromosome for the
         // `Arc<!Sync>` rationale; switching to `Rc` is a tracked
         // follow-up to the H1 perf fix.
@@ -439,13 +438,12 @@ fn run_cohort_pipeline_for_single_sample(
         // records on this chrom, feed an empty iter — the cohort
         // pipeline still writes a header-only fragment, matching the
         // multi-sample `var-calling` flow.
-        let chrom_records: Box<
-            dyn Iterator<Item = Result<PileupRecord, PspReadError>> + '_,
-        > = if walker_is_on_this_chrom {
-            Box::new(per_chrom.consume_current_chrom())
-        } else {
-            Box::new(std::iter::empty())
-        };
+        let chrom_records: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>> + '_> =
+            if walker_is_on_this_chrom {
+                Box::new(per_chrom.consume_current_chrom())
+            } else {
+                Box::new(std::iter::empty())
+            };
         let merger = PerPositionMerger::new(
             vec![chrom_records],
             vec![sample_name_owned.clone()],
@@ -771,10 +769,8 @@ mod tests {
 
     #[test]
     fn per_chrom_iter_handles_single_chrom() {
-        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
-            Ok(record_on(7, 100)),
-            Ok(record_on(7, 200)),
-        ];
+        let inputs: Vec<Result<PileupRecord, PspReadError>> =
+            vec![Ok(record_on(7, 100)), Ok(record_on(7, 200))];
         let mut iter = PerChromRecordsIter::new(inputs.into_iter());
         assert_eq!(iter.open_next_chrom(), Some(7));
         let positions: Vec<u32> = iter

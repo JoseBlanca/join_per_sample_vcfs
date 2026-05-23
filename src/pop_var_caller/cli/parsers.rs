@@ -189,7 +189,12 @@ pub fn parse_max_gq_phred(s: &str) -> Result<f64, String> {
 
 /// `--min-qual`: finite, `[0.0, 1000.0]`. `0.0` disables the filter.
 pub fn parse_min_qual_phred(s: &str) -> Result<f64, String> {
-    parse_f64_with(s, "min-qual", |v| (0.0..=1000.0).contains(&v), "[0.0, 1000.0]")
+    parse_f64_with(
+        s,
+        "min-qual",
+        |v| (0.0..=1000.0).contains(&v),
+        "[0.0, 1000.0]",
+    )
 }
 
 /// `--min-alt-obs-per-sample`: `0..=100`. `0` and `1` are no-ops.

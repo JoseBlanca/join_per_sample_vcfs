@@ -165,7 +165,8 @@ impl BaqEngine {
         self.encoded_ref.clear();
         match ref_fetcher.fetch((xb + 1) as u32, length) {
             Ok(bytes) if !bytes.is_empty() => {
-                self.encoded_ref.extend(bytes.iter().map(|&b| encode_base(b)));
+                self.encoded_ref
+                    .extend(bytes.iter().map(|&b| encode_base(b)));
             }
             Ok(_empty) => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
             Err(e) => {

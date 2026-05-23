@@ -723,9 +723,9 @@ mod tests {
             qname: Arc::from("r"),
             mate_role: super::super::MateRole::Solo,
             adaptor_boundary: None,
-                        mapq: 60,
+            mapq: 60,
+        }
     }
-}
 
     /// All the CIGAR shapes covered by `decompose`'s own tests,
     /// plus an explicit consecutive-indels case. Used by the

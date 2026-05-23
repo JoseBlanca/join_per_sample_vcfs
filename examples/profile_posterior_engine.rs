@@ -32,9 +32,7 @@ use pop_var_caller::var_calling::per_position_merger::PerPositionPileups;
 use pop_var_caller::var_calling::posterior_engine::backends::{
     ExactMath, InterpUnivariateMath, InterpUnivariateSimdMath, MathBackend,
 };
-use pop_var_caller::var_calling::posterior_engine::{
-    PosteriorEngine, PosteriorEngineConfig,
-};
+use pop_var_caller::var_calling::posterior_engine::{PosteriorEngine, PosteriorEngineConfig};
 use pop_var_caller::var_calling::variant_grouping::OverlappingVariantGroup;
 
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];

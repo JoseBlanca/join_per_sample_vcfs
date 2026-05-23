@@ -673,12 +673,7 @@ where
     /// implicitly via the typed errors at fetch time). Infallible
     /// because `config` has already been validated by
     /// [`DustFilterConfig::new`].
-    pub fn new(
-        upstream: I,
-        fetcher: F,
-        bound_chrom_id: u32,
-        config: DustFilterConfig,
-    ) -> Self {
+    pub fn new(upstream: I, fetcher: F, bound_chrom_id: u32, config: DustFilterConfig) -> Self {
         Self {
             upstream,
             fetcher,
@@ -725,27 +720,22 @@ where
         // sdust_mask_streaming's signature takes
         // `IntoIterator<Item = io::Result<u8>>`. Wrapping is cheap
         // (one .map adapter); the byte stream still flows lazily.
-        let bases_io = bases.map(|res| {
-            res.map_err(|e| io::Error::other(format!("{e}")))
-        });
-        let mask = match sdust_mask_streaming(
-            bases_io,
-            length,
-            self.config.window,
-            self.config.threshold,
-        ) {
-            Ok(m) => m,
-            Err(source) => {
-                self.is_finished = true;
-                return Err(DustFilterError::RefFetch {
-                    chrom_id: self.bound_chrom_id,
-                    source: ChromRefFetchError::Io {
-                        contig_name: format!("chrom_id {}", self.bound_chrom_id),
-                        source,
-                    },
-                });
-            }
-        };
+        let bases_io = bases.map(|res| res.map_err(|e| io::Error::other(format!("{e}"))));
+        let mask =
+            match sdust_mask_streaming(bases_io, length, self.config.window, self.config.threshold)
+            {
+                Ok(m) => m,
+                Err(source) => {
+                    self.is_finished = true;
+                    return Err(DustFilterError::RefFetch {
+                        chrom_id: self.bound_chrom_id,
+                        source: ChromRefFetchError::Io {
+                            contig_name: format!("chrom_id {}", self.bound_chrom_id),
+                            source,
+                        },
+                    });
+                }
+            };
         self.mask = Some(mask);
         self.sweep = 0;
         Ok(())
@@ -1162,11 +1152,7 @@ mod tests {
             self.seq.len() as u32
         }
 
-        fn fetch(
-            &self,
-            start_1based: u32,
-            length: u32,
-        ) -> Result<Vec<u8>, ChromRefFetchError> {
+        fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError> {
             if start_1based == 0 {
                 return Err(ChromRefFetchError::InvalidStart);
             }
@@ -1185,10 +1171,8 @@ mod tests {
 
         fn iter_bases<'a>(
             &'a self,
-        ) -> Result<
-            Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
-            ChromRefFetchError,
-        > {
+        ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
+        {
             self.iter_bases_calls.set(self.iter_bases_calls.get() + 1);
             if self.fail_iter {
                 return Err(ChromRefFetchError::Io {
@@ -1266,10 +1250,16 @@ mod tests {
         let cfg = DustFilterConfig::default();
         let mut filter = DustFilter::new(upstream, fetcher, 0, cfg);
         match filter.next() {
-            Some(Err(DustFilterError::ChromIdMismatch { expected: 0, got: 1 })) => {}
+            Some(Err(DustFilterError::ChromIdMismatch {
+                expected: 0,
+                got: 1,
+            })) => {}
             other => panic!("expected ChromIdMismatch {{0,1}}, got {:?}", other),
         }
-        assert!(filter.next().is_none(), "iterator must latch after mismatch");
+        assert!(
+            filter.next().is_none(),
+            "iterator must latch after mismatch"
+        );
     }
 
     #[test]

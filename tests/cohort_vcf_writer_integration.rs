@@ -15,9 +15,7 @@ use tempfile::tempdir;
 use pop_var_caller::per_sample_pileup::pileup::AlleleSupportStats;
 use pop_var_caller::per_sample_pileup::psp::header::ParsedChromosome;
 use pop_var_caller::var_calling::per_group_merger::MergedAllele;
-use pop_var_caller::var_calling::posterior_engine::{
-    EmDiagnostics, PosteriorRecord, RecordLocus,
-};
+use pop_var_caller::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 use pop_var_caller::var_calling::vcf_writer::{
     CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig,
 };
@@ -404,7 +402,7 @@ fn mapq_info_fields_reflect_cohort_pooled_stats() {
 #[test]
 fn mapq_diff_t_filter_decision_matches_thresholds() {
     use pop_var_caller::pop_var_caller::cohort_driver::{
-        record_fails_mapq_diff_t_for_test as record_fails, DEFAULT_MIN_MAPQ_DIFF_T,
+        DEFAULT_MIN_MAPQ_DIFF_T, record_fails_mapq_diff_t_for_test as record_fails,
     };
 
     // Same per-sample shape as the Phase B test: REF=20 reads MAPQ 60,

@@ -54,16 +54,16 @@ use std::time::Instant;
 use clap::Parser;
 
 use pop_var_caller::per_sample_pileup::pileup::PileupRecord;
+use pop_var_caller::per_sample_pileup::psp::PspReader;
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
-use pop_var_caller::per_sample_pileup::psp::PspReader;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{
     DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
-use pop_var_caller::pop_var_caller::var_calling::{run_var_calling, VarCallingArgs};
+use pop_var_caller::pop_var_caller::var_calling::{VarCallingArgs, run_var_calling};
 use pop_var_caller::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use pop_var_caller::var_calling::per_group_merger::{
     DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,

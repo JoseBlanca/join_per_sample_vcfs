@@ -379,7 +379,7 @@ pub struct CohortPipelineArgs {
         long = "no-mapq-diff-filter",
         hide_short_help = true,
         default_value_t = false,
-        help_heading = "Advanced — MAPQ filter",
+        help_heading = "Advanced — MAPQ filter"
     )]
     pub no_mapq_diff_filter: bool,
 

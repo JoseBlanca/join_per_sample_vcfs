@@ -1606,13 +1606,7 @@ impl RecordScratch {
     /// Size every buffer to the current record's shape. `Vec::resize`
     /// preserves capacity above the high-water mark, so steady-state
     /// records of the same shape allocate nothing.
-    fn resize_to(
-        &mut self,
-        n_samples: usize,
-        n_alleles: usize,
-        n_genotypes: usize,
-        ploidy: u8,
-    ) {
+    fn resize_to(&mut self, n_samples: usize, n_alleles: usize, n_genotypes: usize, ploidy: u8) {
         self.p_effective.resize(n_alleles, 0.0);
         self.log_p_effective.resize(n_alleles, 0.0);
         self.log_indep_per_g.resize(n_genotypes, 0.0);
@@ -2629,8 +2623,7 @@ fn compute_qual_via_exact_af<M: MathBackend>(
     // turns the per-allele Dirichlet pseudocounts into a Beta prior
     // on `f_non_ref` with shape (`α_alt`, `α_ref`), which in turn
     // induces Beta-Binomial(max_k, α_alt, α_ref) on `K`.
-    let log_beta_norm =
-        ln_gamma(alpha_alt) + ln_gamma(alpha_ref) - ln_gamma(alpha_alt + alpha_ref);
+    let log_beta_norm = ln_gamma(alpha_alt) + ln_gamma(alpha_ref) - ln_gamma(alpha_alt + alpha_ref);
     let max_k_f = max_k as f64;
     let log_max_k_fact = ln_gamma(max_k_f + 1.0);
     let log_denom = ln_gamma(alpha_alt + alpha_ref + max_k_f);
@@ -3059,10 +3052,7 @@ mod tests {
             100,
             vec![b"A", b"C"],
             2,
-            vec![
-                vec![0.0, -50.0, -50.0],
-                vec![0.0, -50.0, -50.0],
-            ],
+            vec![vec![0.0, -50.0, -50.0], vec![0.0, -50.0, -50.0]],
         );
         let pr = single_ok(record);
         assert_eq!(pr.best_genotype, vec![0, 0]);
@@ -3079,10 +3069,7 @@ mod tests {
             100,
             vec![b"A", b"C"],
             2,
-            vec![
-                vec![0.0, -50.0, -50.0],
-                vec![-50.0, -50.0, 0.0],
-            ],
+            vec![vec![0.0, -50.0, -50.0], vec![-50.0, -50.0, 0.0]],
         );
         let pr = single_ok(record);
         assert!(pr.is_variant_call());
@@ -3176,8 +3163,7 @@ mod tests {
         );
         assert_eq!(pr.diagnostics.iterations, 1);
         assert!(
-            pr.diagnostics.final_max_delta_p.is_finite()
-                && pr.diagnostics.final_max_delta_p >= 0.0,
+            pr.diagnostics.final_max_delta_p.is_finite() && pr.diagnostics.final_max_delta_p >= 0.0,
             "final_max_delta_p = {}",
             pr.diagnostics.final_max_delta_p,
         );
@@ -3345,8 +3331,7 @@ mod tests {
         // P(K = k | 2, α_alt, α_ref) for k = 0, 1, 2.
         let log_prior = |k: u32| -> f64 {
             let kf = k as f64;
-            let log_binom =
-                ln_gamma(3.0) - ln_gamma(kf + 1.0) - ln_gamma(2.0 - kf + 1.0);
+            let log_binom = ln_gamma(3.0) - ln_gamma(kf + 1.0) - ln_gamma(2.0 - kf + 1.0);
             let log_beta_kk = ln_gamma(alpha_alt + kf) + ln_gamma(alpha_ref + 2.0 - kf);
             log_binom + log_beta_kk - ln_gamma(alpha_alt + alpha_ref + 2.0) - log_beta_norm
         };

@@ -360,11 +360,7 @@ impl CohortMapqStats {
         } else {
             0.0
         };
-        Some(Self {
-            n,
-            mean,
-            variance,
-        })
+        Some(Self { n, mean, variance })
     }
 }
 
@@ -416,10 +412,8 @@ fn emit_mapq_info(record: &PosteriorRecord, n_alleles: usize, info: &mut Info) {
     // MQRef — Number=1 Type=Float. Emit only when defined; omit
     // entirely if no REF reads anywhere in the cohort.
     if let Some(r) = ref_stats.as_ref() {
-        info.as_mut().insert(
-            "MQRef".into(),
-            Some(InfoValue::Float(r.mean as f32)),
-        );
+        info.as_mut()
+            .insert("MQRef".into(), Some(InfoValue::Float(r.mean as f32)));
     }
     // Per-ALT MQAlt, MQDiff, MQDiffT
     let n_alts = n_alleles - 1;
@@ -634,7 +628,7 @@ mod tests {
             fwd: 0,
             placed_left: 0,
             placed_start: 0,
-        
+
             mapq_sum: 0,
             mapq_sum_sq: 0,
         }

@@ -12,6 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{WRONG_MD5, build_cram, build_fasta, fixture_md5, read_record};
+use noodles_sam::alignment::record_buf::RecordBuf;
 use pop_var_caller::per_sample_pileup::baq::{
     DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
     SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
@@ -40,9 +41,7 @@ use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
 use pop_var_caller::var_calling::contamination_estimation::{
     DEFAULT_C_S_INIT, DEFAULT_Q_B_INIT_PER_CLASS,
 };
-use pop_var_caller::var_calling::dust_filter::{
-    DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW,
-};
+use pop_var_caller::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use pop_var_caller::var_calling::per_group_merger::{
     DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
 };
@@ -52,7 +51,6 @@ use pop_var_caller::var_calling::posterior_engine::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
 use pop_var_caller::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
-use noodles_sam::alignment::record_buf::RecordBuf;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------

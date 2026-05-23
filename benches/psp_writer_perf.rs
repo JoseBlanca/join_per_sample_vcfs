@@ -96,9 +96,9 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
                 14 + ((i as u32) % 3),
                 5 + ((i as u32) % 3),
                 1 + ((i as u32) % 3),
-                            0,
                 0,
-),
+                0,
+            ),
             Vec::new(),
         ));
         if two_alleles {
@@ -111,9 +111,9 @@ fn build_snp_records(n: usize) -> Vec<PileupRecord> {
                     1 + ((i as u32) % 2),
                     1,
                     0,
-                                    0,
                     0,
-),
+                    0,
+                ),
                 Vec::new(),
             ));
         }

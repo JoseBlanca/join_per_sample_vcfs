@@ -52,11 +52,11 @@ use std::io::{BufReader, Write};
 use pop_var_caller::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, PileupRecord,
 };
+use pop_var_caller::per_sample_pileup::psp::PspReader;
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
-use pop_var_caller::per_sample_pileup::psp::PspReader;
 
 const NUM_RECORDS: usize = 500_000;
 

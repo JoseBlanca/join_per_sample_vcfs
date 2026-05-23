@@ -892,7 +892,7 @@ mod tests {
             fwd: num_obs / 2,
             placed_left: 0,
             placed_start: num_obs,
-        
+
             mapq_sum: 0,
             mapq_sum_sq: 0,
         }

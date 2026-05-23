@@ -43,9 +43,9 @@ use thiserror::Error;
 type SourceList = SmallVec<[(usize, usize); 1]>;
 
 use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId};
-use crate::per_sample_pileup::ref_fetcher::ChromRefFetcher;
 #[cfg(test)]
 use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
+use crate::per_sample_pileup::ref_fetcher::ChromRefFetcher;
 use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
 /// Maximum number of alleles retained in a single merged record
@@ -626,13 +626,7 @@ where
         let results: Vec<Result<Option<MergedRecord>, PerGroupMergerError>> = batch
             .into_iter()
             .map(|group| {
-                process_group(
-                    group,
-                    ref_fetcher,
-                    config,
-                    genotype_tables,
-                    ref_seq_scratch,
-                )
+                process_group(group, ref_fetcher, config, genotype_tables, ref_seq_scratch)
             })
             .collect();
 
@@ -2001,11 +1995,7 @@ mod tests {
             self.base_offset.saturating_sub(1) + self.seq.len() as u32
         }
 
-        fn fetch(
-            &self,
-            start_1based: u32,
-            length: u32,
-        ) -> Result<Vec<u8>, ChromRefFetchError> {
+        fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError> {
             if start_1based < self.base_offset {
                 return Err(ChromRefFetchError::OutOfBounds {
                     contig_name: "mock".into(),

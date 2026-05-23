@@ -304,9 +304,7 @@ where
                 stats.records_dropped_low_qual += 1;
                 continue;
             }
-            if !no_mapq_diff_filter
-                && record_fails_mapq_diff_t(&record, min_mapq_diff_t)
-            {
+            if !no_mapq_diff_filter && record_fails_mapq_diff_t(&record, min_mapq_diff_t) {
                 stats.records_dropped_low_mapq_diff_t += 1;
                 continue;
             }
@@ -323,8 +321,7 @@ where
         let _ = std::fs::remove_file(&tmp_path); // best-effort cleanup
         return Err(e);
     }
-    stats.records_dropped_low_alt_obs +=
-        alt_obs_dropped.load(std::sync::atomic::Ordering::Relaxed);
+    stats.records_dropped_low_alt_obs += alt_obs_dropped.load(std::sync::atomic::Ordering::Relaxed);
     Ok(stats)
 }
 
@@ -364,16 +361,15 @@ fn record_fails_mapq_diff_t(
         return false;
     }
     let mean_ref = sum_ref as f64 / n_ref as f64;
-    let var_ref = ((ssq_ref as f64 - (sum_ref as f64) * mean_ref).max(0.0))
-        / ((n_ref - 1) as f64);
+    let var_ref = ((ssq_ref as f64 - (sum_ref as f64) * mean_ref).max(0.0)) / ((n_ref - 1) as f64);
     for alt_idx in 1..n_alleles {
         let (n_alt, sum_alt, ssq_alt) = pool_allele_mapq(record, alt_idx);
         if n_alt < MAPQ_FILTER_MIN_READS_PER_SIDE {
             continue;
         }
         let mean_alt = sum_alt as f64 / n_alt as f64;
-        let var_alt = ((ssq_alt as f64 - (sum_alt as f64) * mean_alt).max(0.0))
-            / ((n_alt - 1) as f64);
+        let var_alt =
+            ((ssq_alt as f64 - (sum_alt as f64) * mean_alt).max(0.0)) / ((n_alt - 1) as f64);
         let se2 = var_alt / (n_alt as f64) + var_ref / (n_ref as f64);
         if se2 <= 0.0 {
             // Degenerate variance — let it pass.

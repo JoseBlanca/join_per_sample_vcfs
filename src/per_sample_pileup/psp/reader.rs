@@ -1074,8 +1074,7 @@ fn decode_block_payload<R: Read>(
             .expect("allele-placed-left-count column required by v1.0 schema"),
         allele_placed_start_count: allele_placed_start_count
             .expect("allele-placed-start-count column required by v1.0 schema"),
-        allele_mapq_sum: allele_mapq_sum
-            .expect("allele-mapq-sum column required by v1.0 schema"),
+        allele_mapq_sum: allele_mapq_sum.expect("allele-mapq-sum column required by v1.0 schema"),
         allele_mapq_sum_sq: allele_mapq_sum_sq
             .expect("allele-mapq-sum-sq column required by v1.0 schema"),
     })
@@ -1297,12 +1296,18 @@ fn decode_one_column<R: Read>(
         ColumnKey::AllelePlacedStartCount => DecodedColumn::AllelePlacedStartCount(
             decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
         ),
-        ColumnKey::AlleleMapqSum => DecodedColumn::AlleleMapqSum(
-            decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
-        ),
-        ColumnKey::AlleleMapqSumSq => DecodedColumn::AlleleMapqSumSq(
-            decode_scalar_column_pod::<u64>(bytes, n_total_alleles, column_name)?,
-        ),
+        ColumnKey::AlleleMapqSum => DecodedColumn::AlleleMapqSum(decode_scalar_column_pod::<u32>(
+            bytes,
+            n_total_alleles,
+            column_name,
+        )?),
+        ColumnKey::AlleleMapqSumSq => {
+            DecodedColumn::AlleleMapqSumSq(decode_scalar_column_pod::<u64>(
+                bytes,
+                n_total_alleles,
+                column_name,
+            )?)
+        }
         ColumnKey::AlleleChainIds => {
             // H1: write the CSR data + offsets into the caller-
             // supplied scratch buffers instead of allocating one
@@ -1426,7 +1431,7 @@ mod tests {
                     fwd: 1,
                     placed_left: 0,
                     placed_start: 1,
-                
+
                     mapq_sum: 0,
                     mapq_sum_sq: 0,
                 },
@@ -1675,10 +1680,8 @@ mod tests {
         assert_eq!(r.alleles[1].support.mapq_sum, 60);
         assert_eq!(r.alleles[1].support.mapq_sum_sq, 3_600);
         // Sanity: mean MAPQ recovers correctly.
-        let mean_ref = r.alleles[0].support.mapq_sum as f64
-            / r.alleles[0].support.num_obs as f64;
-        let mean_alt = r.alleles[1].support.mapq_sum as f64
-            / r.alleles[1].support.num_obs as f64;
+        let mean_ref = r.alleles[0].support.mapq_sum as f64 / r.alleles[0].support.num_obs as f64;
+        let mean_alt = r.alleles[1].support.mapq_sum as f64 / r.alleles[1].support.num_obs as f64;
         assert!((mean_ref - 60.0).abs() < 1e-9);
         assert!((mean_alt - 20.0).abs() < 1e-9);
     }
