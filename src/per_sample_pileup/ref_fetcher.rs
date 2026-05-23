@@ -659,6 +659,16 @@ pub trait ChromRefFetcher: sealed::Sealed {
     /// Return `length` uppercased bases starting at 1-based
     /// `start`. Bytes are SAM-spec canonical (`A`/`C`/`G`/`T`/`N`)
     /// regardless of how the FASTA is masked on disk.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChromRefFetchError::InvalidStart`] if `start_1based == 0`.
+    /// - [`ChromRefFetchError::OutOfBounds`] if
+    ///   `start_1based + length - 1` exceeds the contig length.
+    /// - [`ChromRefFetchError::OutOfPattern`] if `start_1based` is
+    ///   before the current sliding-buffer window (impls that enforce
+    ///   monotonic-forward access).
+    /// - [`ChromRefFetchError::Io`] if the underlying FASTA read fails.
     fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError>;
 
     /// Forward sequential iterator over every uppercased base of
@@ -672,6 +682,13 @@ pub trait ChromRefFetcher: sealed::Sealed {
     /// the buffer again. This makes `iter_bases()` followed by
     /// `fetch()` from an arbitrary `start` legal (the next `fetch`
     /// starts a fresh buffer phase).
+    ///
+    /// # Errors
+    ///
+    /// - [`ChromRefFetchError::Io`] if the initial seek to the contig
+    ///   start (or the first refill) fails. Per-byte refill errors are
+    ///   surfaced through the iterator's `Item = Result<u8, _>` rather
+    ///   than from this constructor.
     fn iter_bases<'a>(
         &'a self,
     ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>;
@@ -694,6 +711,11 @@ pub trait ChromRefFetcher: sealed::Sealed {
     /// allocation followed by a memcpy — exactly the per-call alloc
     /// the method exists to avoid. The `mem::swap` shape inherits
     /// the freshly-allocated buffer instead of memcpying through.
+    ///
+    /// # Errors
+    ///
+    /// Same failure modes as [`Self::fetch`]: `InvalidStart`,
+    /// `OutOfBounds`, `OutOfPattern`, and `Io`.
     fn fetch_into(
         &self,
         start_1based: u32,
@@ -744,12 +766,38 @@ impl StreamingChromRefFetcher {
     /// stores the same state as the legacy [`Self::new`] but with
     /// `chrom_id = 0` (the new trait doesn't expose `chrom_id`, so
     /// the stored value is meaningless for new-API consumers).
+    ///
+    /// Allocates a sliding buffer of [`STREAMING_REF_BUFFER_BYTES`]
+    /// (= 1 MiB by default) — the buffer is filled lazily on the
+    /// first fetch, not at construction. Tests can override the
+    /// buffer size via the `#[cfg(test)]`-only
+    /// `for_contig_with_buffer_bytes` constructor.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChromRefFetchError::Io`] wrapping an
+    ///   [`io::ErrorKind::NotFound`] error if `contig_name` is not
+    ///   present in the sibling `.fai` index.
+    /// - [`ChromRefFetchError::Io`] wrapping an
+    ///   [`io::ErrorKind::InvalidData`] error if the `.fai` is
+    ///   malformed (line_bases = 0 or line_width < line_bases — see
+    ///   [`ContigFai::validate`]), or if any of the contig's
+    ///   `length` / `line_bases` / `line_width` fields exceed
+    ///   `u32::MAX`.
+    /// - [`ChromRefFetchError::Io`] wrapping the underlying
+    ///   [`io::Error`] from `noodles_fasta::fai::fs::read` or
+    ///   `File::open` on a missing / unreadable FASTA or `.fai`
+    ///   file.
     pub fn for_contig(fasta_path: &Path, contig_name: &str) -> Result<Self, ChromRefFetchError> {
         Self::for_contig_with_fai_path(fasta_path, None, contig_name)
     }
 
     /// Variant of [`Self::for_contig`] for non-standard `.fai`
     /// locations. `None` falls back to `<fasta_path>.fai`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::for_contig`].
     pub fn for_contig_with_fai_path(
         fasta_path: &Path,
         fai_path: Option<&Path>,
@@ -1203,12 +1251,27 @@ impl ManualEvictChromRefFetcher {
     /// Open the FASTA at `fasta_path`, parse the sibling `.fai`,
     /// look up `contig_name`, return a fetcher with an empty
     /// buffer ready to serve `fetch` calls.
+    ///
+    /// # Errors
+    ///
+    /// - [`ChromRefFetchError::Io`] with `ErrorKind::NotFound` if
+    ///   `contig_name` is absent from the FASTA index.
+    /// - [`ChromRefFetchError::Io`] with `ErrorKind::InvalidData` if
+    ///   the `.fai` entry is malformed (zero `line_bases`,
+    ///   `line_width < line_bases`, lengths overflowing `u32`).
+    /// - [`ChromRefFetchError::Io`] propagating the underlying
+    ///   `io::Error` if the `.fai` read or `File::open(fasta_path)`
+    ///   fails.
     pub fn for_contig(fasta_path: &Path, contig_name: &str) -> Result<Self, ChromRefFetchError> {
         Self::for_contig_with_fai_path(fasta_path, None, contig_name)
     }
 
     /// Variant of [`Self::for_contig`] for non-standard `.fai`
     /// locations. `None` falls back to `<fasta_path>.fai`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::for_contig`].
     pub fn for_contig_with_fai_path(
         fasta_path: &Path,
         fai_path: Option<&Path>,
@@ -1302,6 +1365,14 @@ impl ManualEvictChromRefFetcher {
     /// as a borrowed slice. If the buffer doesn't cover the
     /// requested range, extends in whichever direction is needed
     /// (forward by appending, backward by prepending).
+    ///
+    /// # Errors
+    ///
+    /// - [`ChromRefFetchError::InvalidStart`] if `start_1based == 0`.
+    /// - [`ChromRefFetchError::OutOfBounds`] if
+    ///   `start_1based + length - 1 > self.length()`.
+    /// - [`ChromRefFetchError::Io`] if a refill from the underlying
+    ///   FASTA fails, or if the requested range overflows `u32`.
     pub fn fetch(&mut self, start_1based: u32, length: u32) -> Result<&[u8], ChromRefFetchError> {
         if start_1based == 0 {
             return Err(ChromRefFetchError::InvalidStart);
