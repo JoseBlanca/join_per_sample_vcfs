@@ -20,14 +20,28 @@
 //! - `psp_reader/region_window_chr1_mid` — over the SNP file, 100 k
 //!   `region_records(chr1, mid-50k, mid+50k)` queries against the
 //!   binary-search + per-block snapshot path.
+//!
+//! Two source-shape groups:
+//!
+//! - `psp_reader/*` — `Cursor<&[u8]>` source. No syscalls, no
+//!   `BufReader`. Measures the pure-decode CPU path.
+//! - `psp_reader_file/*` — `BufReader<File>` source over a
+//!   `tempfile::NamedTempFile`. Matches the cohort driver's
+//!   `process_one_chromosome` shape (64 KiB BufReader). Catches
+//!   regressions in the seek / BufReader interaction
+//!   (`SeekFrom::Start` vs `SeekFrom::Current` per the 2026-05-23
+//!   PSP reader review H2). The numeric gap between the two groups
+//!   on the same workload is the syscall + BufReader overhead.
 
 // Opt-in mimalloc global allocator (cargo bench --features alloc-mimalloc ...).
 #[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::fs::File;
 use std::hint::black_box;
-use std::io::Cursor;
+use std::io::{BufReader, Cursor, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -332,10 +346,107 @@ fn bench_reader_region(c: &mut Criterion) {
     group.finish();
 }
 
+/// Write `bytes` to a `tempfile::NamedTempFile` and return the
+/// guard. The temp file is kept alive by the caller; on drop it's
+/// removed from disk.
+fn write_to_tempfile(bytes: &[u8]) -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(bytes).expect("write all");
+    f.flush().expect("flush");
+    f
+}
+
+/// Mirror of `read_all_count` but reads from `BufReader<File>` so
+/// the timed body exercises the same I/O shape as the cohort
+/// driver's `process_one_chromosome`. Buffer capacity matches the
+/// driver's `DEFAULT_BUFFERED_IO_CAPACITY = 64 * 1024`.
+fn read_all_count_file_backed(path: &Path) -> u64 {
+    let file = File::open(path).expect("open psp");
+    let buf = BufReader::with_capacity(64 * 1024, file);
+    let mut reader = PspReader::new(buf).expect("reader new");
+    let mut n = 0u64;
+    for r in reader.records() {
+        let r = r.expect("record decode");
+        black_box(&r);
+        n += 1;
+    }
+    n
+}
+
+fn bench_reader_file_backed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("psp_reader_file");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(30));
+
+    // SNP-typical
+    let snp_records = build_snp_records(NUM_RECORDS_SNP);
+    let snp_header = writer_header(NUM_RECORDS_SNP, "snp");
+    let snp_bytes = serialise(&snp_records, snp_header);
+    drop(snp_records);
+    let snp_file = write_to_tempfile(&snp_bytes);
+    drop(snp_bytes);
+    eprintln!(
+        "snp_typical_3_3M (file-backed): {} bytes on disk",
+        snp_file.path().metadata().map(|m| m.len()).unwrap_or(0)
+    );
+    group.throughput(Throughput::Elements(NUM_RECORDS_SNP as u64));
+    group.bench_function("snp_typical_3_3M", |b| {
+        b.iter(|| {
+            let n = read_all_count_file_backed(black_box(snp_file.path()));
+            // Drained-count assertion (review L8): guards against a
+            // refactor that silently truncates the iterator output.
+            assert_eq!(n, NUM_RECORDS_SNP as u64);
+            black_box(n)
+        });
+    });
+
+    // Phase-chain-heavy
+    let phase_records = build_phase_chain_heavy_records(NUM_RECORDS_PHASE);
+    let phase_header = writer_header(NUM_RECORDS_PHASE, "phase");
+    let phase_bytes = serialise(&phase_records, phase_header);
+    drop(phase_records);
+    let phase_file = write_to_tempfile(&phase_bytes);
+    drop(phase_bytes);
+    eprintln!(
+        "phase_chain_heavy_1M (file-backed): {} bytes on disk",
+        phase_file.path().metadata().map(|m| m.len()).unwrap_or(0)
+    );
+    group.throughput(Throughput::Elements(NUM_RECORDS_PHASE as u64));
+    group.bench_function("phase_chain_heavy_1M", |b| {
+        b.iter(|| {
+            let n = read_all_count_file_backed(black_box(phase_file.path()));
+            assert_eq!(n, NUM_RECORDS_PHASE as u64);
+            black_box(n)
+        });
+    });
+
+    // Multi-allele
+    let multi_records = build_multi_allele_records(NUM_RECORDS_MULTI);
+    let multi_header = writer_header(NUM_RECORDS_MULTI, "multi");
+    let multi_bytes = serialise(&multi_records, multi_header);
+    drop(multi_records);
+    let multi_file = write_to_tempfile(&multi_bytes);
+    drop(multi_bytes);
+    eprintln!(
+        "multi_allele_500k (file-backed): {} bytes on disk",
+        multi_file.path().metadata().map(|m| m.len()).unwrap_or(0)
+    );
+    group.throughput(Throughput::Elements(NUM_RECORDS_MULTI as u64));
+    group.bench_function("multi_allele_500k", |b| {
+        b.iter(|| {
+            let n = read_all_count_file_backed(black_box(multi_file.path()));
+            assert_eq!(n, NUM_RECORDS_MULTI as u64);
+            black_box(n)
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_reader, bench_reader_region
+    targets = bench_reader, bench_reader_region, bench_reader_file_backed
 }
 
 criterion_main!(benches);
