@@ -534,76 +534,7 @@ impl StreamingChromRefFetcher {
         contig_name: &str,
         buffer_bytes: usize,
     ) -> Result<Self, ChromRefFetchError> {
-        let mut fai_pathbuf: OsString;
-        let fai_path_owned: PathBuf;
-        let fai_path_resolved: &Path = match fai_path {
-            Some(p) => p,
-            None => {
-                fai_pathbuf = fasta_path.as_os_str().to_os_string();
-                fai_pathbuf.push(".fai");
-                fai_path_owned = PathBuf::from(fai_pathbuf);
-                &fai_path_owned
-            }
-        };
-        let index = fai::fs::read(fai_path_resolved).map_err(|source| ChromRefFetchError::Io {
-            contig_name: contig_name.to_string(),
-            source,
-        })?;
-        let record = index
-            .as_ref()
-            .iter()
-            .find(|r| AsRef::<[u8]>::as_ref(r.name()) == contig_name.as_bytes())
-            .ok_or_else(|| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("contig {contig_name} not in FASTA index"),
-                ),
-            })?;
-        let length = u32::try_from(record.length()).map_err(|_| ChromRefFetchError::Io {
-            contig_name: contig_name.to_string(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "contig {} length {} exceeds u32::MAX",
-                    contig_name,
-                    record.length()
-                ),
-            ),
-        })?;
-        let line_bases =
-            u32::try_from(record.line_bases()).map_err(|_| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    ".fai line_bases exceeds u32::MAX",
-                ),
-            })?;
-        let line_width =
-            u32::try_from(record.line_width()).map_err(|_| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    ".fai line_width exceeds u32::MAX",
-                ),
-            })?;
-        let fai = ContigFai {
-            seq_offset: record.offset(),
-            length,
-            line_bases,
-            line_width,
-        };
-        // B1: reject malformed .fai (line_bases = 0, etc.) before
-        // any fetch can panic on the offset arithmetic.
-        fai.validate(contig_name)
-            .map_err(|source| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source,
-            })?;
-        let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
-            contig_name: contig_name.to_string(),
-            source,
-        })?;
+        let (fai, file) = open_contig(fasta_path, fai_path, contig_name)?;
         Ok(Self {
             contig_name: contig_name.to_string(),
             fai,
@@ -614,6 +545,81 @@ impl StreamingChromRefFetcher {
             }),
         })
     }
+}
+
+/// M13: shared `.fai`-open + index-load + record-lookup +
+/// `u32::try_from` + validation + `File::open` path used by both
+/// fetcher constructors. Returning `(ContigFai, File)` lets each
+/// caller wrap into its own state struct.
+///
+/// `fai_path = None` falls back to `<fasta_path>.fai`. The B1
+/// validation (`line_bases > 0`, `line_width >= line_bases`,
+/// no `u32::try_from` overflow) lives here, so every constructor
+/// inherits it.
+fn open_contig(
+    fasta_path: &Path,
+    fai_path: Option<&Path>,
+    contig_name: &str,
+) -> Result<(ContigFai, File), ChromRefFetchError> {
+    let mut fai_pathbuf: OsString;
+    let fai_path_owned: PathBuf;
+    let fai_path_resolved: &Path = match fai_path {
+        Some(p) => p,
+        None => {
+            fai_pathbuf = fasta_path.as_os_str().to_os_string();
+            fai_pathbuf.push(".fai");
+            fai_path_owned = PathBuf::from(fai_pathbuf);
+            &fai_path_owned
+        }
+    };
+    let wrap_io = |source: io::Error| ChromRefFetchError::Io {
+        contig_name: contig_name.to_string(),
+        source,
+    };
+    let index = fai::fs::read(fai_path_resolved).map_err(wrap_io)?;
+    let record = index
+        .as_ref()
+        .iter()
+        .find(|r| AsRef::<[u8]>::as_ref(r.name()) == contig_name.as_bytes())
+        .ok_or_else(|| {
+            wrap_io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("contig {contig_name} not in FASTA index"),
+            ))
+        })?;
+    let length = u32::try_from(record.length()).map_err(|_| {
+        wrap_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "contig {} length {} exceeds u32::MAX",
+                contig_name,
+                record.length()
+            ),
+        ))
+    })?;
+    let line_bases = u32::try_from(record.line_bases()).map_err(|_| {
+        wrap_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            ".fai line_bases exceeds u32::MAX",
+        ))
+    })?;
+    let line_width = u32::try_from(record.line_width()).map_err(|_| {
+        wrap_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            ".fai line_width exceeds u32::MAX",
+        ))
+    })?;
+    let fai = ContigFai {
+        seq_offset: record.offset(),
+        length,
+        line_bases,
+        line_width,
+    };
+    // B1: reject malformed .fai (line_bases = 0, etc.) before any
+    // fetch can panic on the offset arithmetic.
+    fai.validate(contig_name).map_err(wrap_io)?;
+    let file = File::open(fasta_path).map_err(wrap_io)?;
+    Ok((fai, file))
 }
 
 /// Forward sequential iterator returned by
@@ -1030,76 +1036,7 @@ impl ManualEvictChromRefFetcher {
         fai_path: Option<&Path>,
         contig_name: &str,
     ) -> Result<Self, ChromRefFetchError> {
-        let mut fai_pathbuf: OsString;
-        let fai_path_owned: PathBuf;
-        let fai_path_resolved: &Path = match fai_path {
-            Some(p) => p,
-            None => {
-                fai_pathbuf = fasta_path.as_os_str().to_os_string();
-                fai_pathbuf.push(".fai");
-                fai_path_owned = PathBuf::from(fai_pathbuf);
-                &fai_path_owned
-            }
-        };
-        let index = fai::fs::read(fai_path_resolved).map_err(|source| ChromRefFetchError::Io {
-            contig_name: contig_name.to_string(),
-            source,
-        })?;
-        let record = index
-            .as_ref()
-            .iter()
-            .find(|r| AsRef::<[u8]>::as_ref(r.name()) == contig_name.as_bytes())
-            .ok_or_else(|| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("contig {contig_name} not in FASTA index"),
-                ),
-            })?;
-        let length = u32::try_from(record.length()).map_err(|_| ChromRefFetchError::Io {
-            contig_name: contig_name.to_string(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "contig {} length {} exceeds u32::MAX",
-                    contig_name,
-                    record.length()
-                ),
-            ),
-        })?;
-        let line_bases =
-            u32::try_from(record.line_bases()).map_err(|_| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    ".fai line_bases exceeds u32::MAX",
-                ),
-            })?;
-        let line_width =
-            u32::try_from(record.line_width()).map_err(|_| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    ".fai line_width exceeds u32::MAX",
-                ),
-            })?;
-        let fai = ContigFai {
-            seq_offset: record.offset(),
-            length,
-            line_bases,
-            line_width,
-        };
-        // B1: reject malformed .fai (line_bases = 0, etc.) before
-        // any fetch can panic on the offset arithmetic.
-        fai.validate(contig_name)
-            .map_err(|source| ChromRefFetchError::Io {
-                contig_name: contig_name.to_string(),
-                source,
-            })?;
-        let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
-            contig_name: contig_name.to_string(),
-            source,
-        })?;
+        let (fai, file) = open_contig(fasta_path, fai_path, contig_name)?;
         Ok(Self {
             contig_name: contig_name.to_string(),
             fai,
