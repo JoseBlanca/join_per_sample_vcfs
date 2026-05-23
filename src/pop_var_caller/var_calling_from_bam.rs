@@ -472,6 +472,133 @@ fn contigs_to_parsed(
 }
 
 // ---------------------------------------------------------------------
+// PerChromRecordsIter — chunk a coord-sorted record stream by chrom.
+// ---------------------------------------------------------------------
+//
+// The Stage 1 walker emits `PileupRecord`s in coordinate order
+// across the whole CRAM input (all chroms in sequence). To drive
+// `drive_cohort_pipeline` per chrom — which the
+// `cohort_chrom_ref_fetcher_migration` plan requires so the
+// pipeline can use the single-contig `ChromRefFetcher` API — we
+// need to split that one stream into per-chrom sub-streams.
+//
+// This helper does it without buffering: it peeks one record
+// ahead from the upstream, and `consume_current_chrom()` yields a
+// borrowed iterator that stops the moment the next record's
+// `chrom_id` differs. The caller then loops, calling
+// `open_next_chrom()` to advance to the next chrom and again
+// `consume_current_chrom()` for that chrom's records, until
+// `open_next_chrom()` returns `None`.
+//
+// Errors from the upstream propagate through the consumed iter
+// — the upstream's `Err` is yielded as-is so the caller sees the
+// same `Result<PileupRecord, PspReadError>` shape `PerPositionMerger`
+// already expects.
+
+/// Per-chrom view over a coord-sorted record stream. See the
+/// module comment above for the lifecycle.
+pub struct PerChromRecordsIter<I>
+where
+    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
+{
+    upstream: std::iter::Peekable<I>,
+    /// Chrom currently being consumed by `consume_current_chrom`.
+    /// `None` before the first `open_next_chrom()` call and after
+    /// the upstream is exhausted.
+    current_chrom: Option<u32>,
+}
+
+impl<I> PerChromRecordsIter<I>
+where
+    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
+{
+    pub fn new(upstream: I) -> Self {
+        Self {
+            upstream: upstream.peekable(),
+            current_chrom: None,
+        }
+    }
+
+    /// Peek the next upstream record; if there is one, set the
+    /// "current chrom" to its `chrom_id` and return `Some(chrom_id)`.
+    /// Returns `None` when the upstream is exhausted (clean EOF).
+    ///
+    /// If the peeked item is an `Err`, the error is **left in the
+    /// peek slot** so the next `consume_current_chrom().next()`
+    /// returns it to the caller. This keeps error surfacing
+    /// uniform with how the underlying iterator behaves —
+    /// `open_next_chrom` itself never reports errors directly.
+    pub fn open_next_chrom(&mut self) -> Option<u32> {
+        match self.upstream.peek() {
+            Some(Ok(rec)) => {
+                self.current_chrom = Some(rec.chrom_id);
+                self.current_chrom
+            }
+            Some(Err(_)) => {
+                // Leave the error in place for `consume_current_chrom`
+                // to yield. We don't know the chrom_id of the next
+                // valid record, so pretend we're "on" the most
+                // recently seen chrom — the consume iter will yield
+                // the error and then None, the caller loops back to
+                // `open_next_chrom` which sees the iterator drained
+                // and returns None.
+                self.current_chrom
+            }
+            None => {
+                self.current_chrom = None;
+                None
+            }
+        }
+    }
+
+    /// Yield records while their `chrom_id` matches `current_chrom`.
+    /// Returns `None` at the chrom transition, at EOF, or after an
+    /// upstream error has been surfaced. The caller's loop should
+    /// drain this iterator, then call `open_next_chrom()` to advance.
+    pub fn consume_current_chrom(&mut self) -> ConsumeCurrentChromIter<'_, I> {
+        ConsumeCurrentChromIter { parent: self }
+    }
+}
+
+/// Borrowed iterator returned by
+/// [`PerChromRecordsIter::consume_current_chrom`]. Yields records
+/// for the current chrom only.
+pub struct ConsumeCurrentChromIter<'a, I>
+where
+    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
+{
+    parent: &'a mut PerChromRecordsIter<I>,
+}
+
+impl<'a, I> Iterator for ConsumeCurrentChromIter<'a, I>
+where
+    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
+{
+    type Item = Result<PileupRecord, PspReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.parent.current_chrom?;
+        match self.parent.upstream.peek() {
+            Some(Ok(rec)) if rec.chrom_id == current => {
+                // Consume the peeked record and yield it.
+                self.parent.upstream.next()
+            }
+            Some(Ok(_)) => {
+                // Different chrom — stop here so the caller loops.
+                None
+            }
+            Some(Err(_)) => {
+                // Surface the error to the caller; consuming it here
+                // also clears the peek slot so the next
+                // `open_next_chrom` sees the upstream cleanly.
+                self.parent.upstream.next()
+            }
+            None => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -527,5 +654,131 @@ mod tests {
             err,
             VarCallingFromBamCliError::ContigLengthOverflow { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // PerChromRecordsIter tests
+    // ---------------------------------------------------------------
+
+    use crate::per_sample_pileup::pileup::PileupRecord;
+
+    fn record_on(chrom_id: u32, pos: u32) -> PileupRecord {
+        // Use the public constructor and patch chrom_id/pos.
+        // PileupRecord::new takes (chrom_id, pos, alleles), so this
+        // is just a thin convenience.
+        PileupRecord::new(chrom_id, pos, Vec::new())
+    }
+
+    #[test]
+    fn per_chrom_iter_yields_chunked_records() {
+        // Three chroms, sizes 3 / 2 / 1 records. Two outer loops
+        // confirm `open_next_chrom` walks chroms in order and
+        // `consume_current_chrom` yields exactly the records on
+        // each.
+        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
+            Ok(record_on(0, 1)),
+            Ok(record_on(0, 2)),
+            Ok(record_on(0, 3)),
+            Ok(record_on(1, 1)),
+            Ok(record_on(1, 2)),
+            Ok(record_on(2, 1)),
+        ];
+        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
+
+        let mut seen: Vec<(u32, Vec<u32>)> = Vec::new();
+        while let Some(chrom_id) = iter.open_next_chrom() {
+            let positions: Vec<u32> = iter
+                .consume_current_chrom()
+                .map(|r| r.unwrap().pos)
+                .collect();
+            seen.push((chrom_id, positions));
+        }
+        assert_eq!(
+            seen,
+            vec![(0, vec![1, 2, 3]), (1, vec![1, 2]), (2, vec![1])],
+        );
+    }
+
+    #[test]
+    fn per_chrom_iter_handles_single_chrom() {
+        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
+            Ok(record_on(7, 100)),
+            Ok(record_on(7, 200)),
+        ];
+        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
+        assert_eq!(iter.open_next_chrom(), Some(7));
+        let positions: Vec<u32> = iter
+            .consume_current_chrom()
+            .map(|r| r.unwrap().pos)
+            .collect();
+        assert_eq!(positions, vec![100, 200]);
+        assert_eq!(iter.open_next_chrom(), None);
+    }
+
+    #[test]
+    fn per_chrom_iter_handles_empty_input() {
+        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![];
+        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
+        assert_eq!(iter.open_next_chrom(), None);
+    }
+
+    #[test]
+    fn per_chrom_iter_propagates_upstream_error_mid_stream() {
+        // An error mid-stream surfaces through the consumed iter.
+        // The caller looks at the Result; here we just confirm the
+        // error variant escapes the chunker.
+        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
+            Ok(record_on(0, 1)),
+            Err(PspReadError::Io {
+                context: "test",
+                source: std::io::Error::other("test"),
+            }),
+        ];
+        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
+        assert_eq!(iter.open_next_chrom(), Some(0));
+        let mut consumed = iter.consume_current_chrom();
+        // First the OK record.
+        assert_eq!(consumed.next().unwrap().unwrap().pos, 1);
+        // Then the error.
+        let err = consumed.next().unwrap();
+        assert!(err.is_err());
+        // Then EOF on the consume iter.
+        assert!(consumed.next().is_none());
+        // Re-borrow happens implicitly when `consumed` goes out of
+        // scope; no need for an explicit `drop` call (ConsumeCurrentChromIter
+        // is not Drop-impl'd, just a borrow).
+        let _ = consumed;
+        // And `open_next_chrom` returns None after the error path.
+        assert_eq!(iter.open_next_chrom(), None);
+    }
+
+    #[test]
+    fn per_chrom_iter_propagates_upstream_error_at_chrom_transition() {
+        // Error happens right at a chrom transition. The first
+        // chrom's records come through, then the error is yielded
+        // in the next consume cycle.
+        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
+            Ok(record_on(0, 1)),
+            Err(PspReadError::Io {
+                context: "test",
+                source: std::io::Error::other("test"),
+            }),
+            Ok(record_on(1, 1)),
+        ];
+        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
+        assert_eq!(iter.open_next_chrom(), Some(0));
+        let chrom0: Vec<_> = iter.consume_current_chrom().collect();
+        // chr0 had one OK record; the error halts the chunk
+        // boundary at the chrom-0 group.
+        assert_eq!(chrom0.len(), 2); // OK + Err in the same group
+        assert!(chrom0[0].is_ok());
+        assert!(chrom0[1].is_err());
+        // After draining, the next open advances to chrom 1.
+        assert_eq!(iter.open_next_chrom(), Some(1));
+        let chrom1_positions: Vec<u32> = iter
+            .consume_current_chrom()
+            .map(|r| r.unwrap().pos)
+            .collect();
+        assert_eq!(chrom1_positions, vec![1]);
     }
 }
