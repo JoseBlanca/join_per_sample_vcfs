@@ -11,14 +11,16 @@
 //! everything *after* the merger is identical.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
-use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
+use crate::per_sample_pileup::ref_fetcher::{
+    SingleChromLegacyAdapter, StreamingChromRefFetcher,
+};
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::var_calling::dust_filter::{DustFilter, DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
@@ -473,12 +475,24 @@ where
     // hit that buffer. When this function returns, the fetcher
     // drops, the buffer is freed, and the contig was never wholly
     // resident.
-    let fetcher_concrete =
-        StreamingChromRefFetcher::new(fasta_path, chrom_id, chrom_entry.name.clone())?;
+    //
+    // Phase 2(a) of the `unified_chrom_ref_fetcher` migration: the
+    // streaming fetcher is constructed via the new-API
+    // [`StreamingChromRefFetcher::for_contig`] (no `chrom_id` —
+    // bound by contig name only), then wrapped in a
+    // [`SingleChromLegacyAdapter`] that satisfies the legacy
+    // `RefSeqFetcher` trait. DUST and `PerGroupMerger` still
+    // consume the legacy trait through the adapter, but every
+    // `fetch` / `iter_bases` call routes through the new fetcher's
+    // typed-error path — exercising the `OutOfPattern` contract
+    // and the `iter_bases` reset-on-Drop behaviour in production.
+    let streaming = StreamingChromRefFetcher::for_contig(fasta_path, &chrom_entry.name)
+        .map_err(|e| io::Error::other(format!("ref fetcher construction failed: {e}")))?;
+    let adapter = SingleChromLegacyAdapter::new(chrom_id, streaming);
     // Wrap in Arc<dyn> for the DustFilter + PerGroupMerger trait-
     // object alias. Refcount stays at 1–2 per worker; never crosses
     // worker boundaries.
-    let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
+    let fetcher: SharedRefFetcher = Arc::new(adapter);
 
     // Open one PspReader per sample. Per-worker ownership: no
     // cross-thread coordination on the read side.

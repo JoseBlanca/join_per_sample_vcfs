@@ -1032,6 +1032,130 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
 }
 
 // ---------------------------------------------------------------------
+// SingleChromLegacyAdapter — bridge from new-API fetchers to the
+// legacy `RefSeqFetcher` trait during the in-flight migration.
+// ---------------------------------------------------------------------
+//
+// Step 2 of the
+// [`unified_chrom_ref_fetcher`](../../../doc/devel/implementation_plans/unified_chrom_ref_fetcher.md)
+// plan replaces each old fetcher *type* one code path at a time
+// with a new-API [`StreamingChromRefFetcher`] wrapped here. The
+// adapter satisfies the legacy `RefSeqFetcher` contract that
+// `drive_cohort_pipeline` / DUST / `PerGroupMerger` still consume
+// today; their *trait* migration happens later in step 3.
+//
+// What the adapter does:
+//
+// - Validates that the legacy `chrom_id` argument matches the contig
+//   the inner streaming fetcher was bound to at construction. The
+//   legacy trait threads `chrom_id` through every call; the new
+//   trait doesn't (the contig is fixed at construction). The
+//   adapter is where the impedance mismatch lives.
+// - Forwards `fetch` and `iter_bases` calls to the inner fetcher's
+//   *new-trait* methods. That's the load-bearing part — consumers
+//   thread their calls through the new fetcher's `OutOfPattern`
+//   check and `iter_bases` reset-on-Drop, even though the call
+//   site still uses the legacy API name.
+// - Maps `ChromRefFetchError` back into `io::Error` for the legacy
+//   trait's return shape.
+
+/// Adapter that wraps a [`StreamingChromRefFetcher`] (new API,
+/// single contig at construction) and exposes it through the legacy
+/// [`RefSeqFetcher`] trait. The bound `chrom_id` is validated on
+/// every call; any other id is rejected.
+///
+/// Transitional. After step 3 of the migration plan, the legacy
+/// trait disappears and consumers call the new trait methods
+/// directly — this adapter goes away with them.
+pub struct SingleChromLegacyAdapter {
+    /// `chrom_id` that legacy callers will pass on `fetch` /
+    /// `iter_bases`. Validated to match before forwarding.
+    bound_chrom_id: u32,
+    inner: StreamingChromRefFetcher,
+}
+
+impl SingleChromLegacyAdapter {
+    /// Bind `inner` to the supplied `chrom_id` for legacy-API
+    /// compatibility.
+    pub fn new(bound_chrom_id: u32, inner: StreamingChromRefFetcher) -> Self {
+        Self {
+            bound_chrom_id,
+            inner,
+        }
+    }
+}
+
+impl RefSeqFetcher for SingleChromLegacyAdapter {
+    fn fetch(
+        &self,
+        chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, io::Error> {
+        if chrom_id != self.bound_chrom_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SingleChromLegacyAdapter: legacy fetch on chrom_id {chrom_id} but bound to chrom_id {}",
+                    self.bound_chrom_id
+                ),
+            ));
+        }
+        ChromRefFetcher::fetch(&self.inner, start_1based, length).map_err(legacy_io_error)
+    }
+
+    fn iter_bases<'a>(
+        &'a self,
+        chrom_id: u32,
+        length: u32,
+    ) -> Result<Box<dyn Iterator<Item = io::Result<u8>> + 'a>, io::Error> {
+        if chrom_id != self.bound_chrom_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SingleChromLegacyAdapter: legacy iter_bases on chrom_id {chrom_id} but bound to chrom_id {}",
+                    self.bound_chrom_id
+                ),
+            ));
+        }
+        if length != ChromRefFetcher::length(&self.inner) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SingleChromLegacyAdapter: legacy iter_bases requested {length} bases but contig has {}",
+                    ChromRefFetcher::length(&self.inner)
+                ),
+            ));
+        }
+        let new_iter = ChromRefFetcher::iter_bases(&self.inner).map_err(legacy_io_error)?;
+        Ok(Box::new(new_iter.map(|r| r.map_err(legacy_io_error))))
+    }
+}
+
+/// Map [`ChromRefFetchError`] back into the legacy `io::Error`
+/// shape. The legacy trait returns `io::Result`; until the
+/// consumer-side migration in step 3 we have to flatten the typed
+/// error here. Each variant picks the closest `io::ErrorKind` so
+/// the legacy error-handling code still routes correctly.
+fn legacy_io_error(e: ChromRefFetchError) -> io::Error {
+    match e {
+        ChromRefFetchError::Io { source, .. } => source,
+        ChromRefFetchError::InvalidStart => io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "start_1based must be >= 1",
+        ),
+        ChromRefFetchError::OutOfBounds { .. } => io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            e.to_string(),
+        ),
+        ChromRefFetchError::OutOfPattern { .. } => io::Error::new(
+            io::ErrorKind::InvalidInput,
+            e.to_string(),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -1730,5 +1854,101 @@ mod tests {
         // OutOfPattern — iter_bases reset the buffer on Drop.
         let bytes = ChromRefFetcher::fetch(&fetcher, 100, 16).expect("post-iter fetch");
         assert_eq!(bytes, seq[99..115]);
+    }
+
+    // ---------------------------------------------------------------
+    // SingleChromLegacyAdapter tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn legacy_adapter_validates_chrom_id_on_fetch() {
+        // The adapter rejects legacy fetch calls whose chrom_id
+        // doesn't match the bound contig. Catches "wrong worker
+        // passed wrong fetcher" bugs at the legacy/new trait
+        // boundary.
+        let specs = vec![ContigSpec {
+            name: "chr0".into(),
+            length: 32,
+        }];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let inner = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("inner");
+        let adapter = SingleChromLegacyAdapter::new(5, inner);
+
+        // Wrong chrom_id: error.
+        let err = RefSeqFetcher::fetch(&adapter, 7, 1, 4).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Right chrom_id: forwards to inner.
+        let bytes = RefSeqFetcher::fetch(&adapter, 5, 1, 4).expect("fetch");
+        assert_eq!(bytes, b"AAAA");
+    }
+
+    #[test]
+    fn legacy_adapter_validates_chrom_id_on_iter_bases() {
+        // Same check for iter_bases: wrong chrom_id is rejected,
+        // right chrom_id forwards to the new-trait iter_bases (which
+        // resets the buffer on Drop).
+        let specs = vec![ContigSpec {
+            name: "chr0".into(),
+            length: 8,
+        }];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let inner = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("inner");
+        let adapter = SingleChromLegacyAdapter::new(3, inner);
+
+        // Wrong chrom_id: error.
+        let result = RefSeqFetcher::iter_bases(&adapter, 99, 8);
+        match result {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("must fail"),
+        }
+
+        // Right chrom_id + matching length: yields 8 'A' bases.
+        let bytes: Vec<u8> = RefSeqFetcher::iter_bases(&adapter, 3, 8)
+            .expect("iter")
+            .map(|r| r.expect("base"))
+            .collect();
+        assert_eq!(bytes, b"AAAAAAAA");
+    }
+
+    #[test]
+    fn legacy_adapter_iter_bases_rejects_wrong_length() {
+        // Bound contig is 8 bases; legacy iter_bases asks for 32.
+        // Adapter validates and rejects.
+        let specs = vec![ContigSpec {
+            name: "chr0".into(),
+            length: 8,
+        }];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let inner = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("inner");
+        let adapter = SingleChromLegacyAdapter::new(0, inner);
+
+        let result = RefSeqFetcher::iter_bases(&adapter, 0, 32);
+        match result {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("must fail"),
+        }
+    }
+
+    #[test]
+    fn legacy_adapter_maps_chrom_ref_errors_to_io_errors() {
+        // ChromRefFetchError::OutOfBounds → io::ErrorKind::UnexpectedEof.
+        // ChromRefFetchError::InvalidStart → io::ErrorKind::InvalidInput.
+        // Spot-check both via legacy fetch calls.
+        let specs = vec![ContigSpec {
+            name: "chr0".into(),
+            length: 10,
+        }];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let inner = StreamingChromRefFetcher::for_contig(&path, "chr0").expect("inner");
+        let adapter = SingleChromLegacyAdapter::new(0, inner);
+
+        // Past end → UnexpectedEof.
+        let err = RefSeqFetcher::fetch(&adapter, 0, 8, 10).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // start_1based == 0 → InvalidInput.
+        let err = RefSeqFetcher::fetch(&adapter, 0, 0, 1).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
