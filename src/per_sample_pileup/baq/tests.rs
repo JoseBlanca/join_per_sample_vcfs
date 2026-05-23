@@ -351,8 +351,9 @@ use crate::per_sample_pileup::pileup::{MateRole, RefSeqFetcher};
 use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 
 /// Single-chrom in-memory fetcher: serves byte windows from `chrom`,
-/// errors on any request that runs past the end. Mirrors what
-/// `ChromBoundaryRefFetcher` does, just without FASTA IO.
+/// errors on any request that runs past the end. Stand-in for the
+/// production fetcher in BAQ unit tests; avoids FASTA IO so the
+/// suite stays hermetic + fast.
 struct MockRefFetcher {
     chrom: Vec<u8>,
 }

@@ -516,32 +516,51 @@ state, it'll need to adapt; otherwise mechanical.
 
 ### Step 3 — final cleanup
 
-**Scope:**
+**Scope (as shipped):**
 
-- Delete the old `RefSeqFetcher` trait (`fetch(chrom_id, …)` and
-  `iter_bases(chrom_id, …)`) from
-  [per_sample_pileup/pileup/mod.rs](../../src/per_sample_pileup/pileup/mod.rs#L505-L555).
-- Delete `SyncRefFetcher`
-  ([ref_fetcher.rs:131-150](../../src/per_sample_pileup/ref_fetcher.rs#L131-L150))
-  + its impl + tests.
-- Delete `ChromBoundaryRefFetcher`
-  ([ref_fetcher.rs:52-102](../../src/per_sample_pileup/ref_fetcher.rs#L52-L102))
-  + its impl + tests, if step 2(b) successfully replaced it.
-- Delete the old-API `StreamingChromRefFetcher` (the
-  pre-step-1-rename one), keeping only the new-API one with the
-  short name.
-- Drop the `fetch_from_repository` shared helper if both legacy
-  callers are gone.
-- The `noodles_fasta::Repository` runtime dependency disappears
-  from production code (still used at construction time by the
-  streaming impl's `noodles_fasta::io::indexed_reader` path; no
-  cache survives).
+- Delete `SyncRefFetcher` (last production caller migrated in
+  step 2(d)) + impl + its 7 in-module unit tests.
+- Delete `ChromBoundaryRefFetcher` (last production caller migrated
+  in step 2(b)) + impl + tests.
+- Delete the `fetch_from_repository` shared helper (no callers).
+- Drop the `noodles_fasta as fasta` import (no remaining uses;
+  `noodles_fasta::fai` is still needed by
+  `StreamingChromRefFetcher::for_contig_internal` for `.fai`
+  parsing).
+- Drop the `std::cell::Cell` import (was only used by
+  `ChromBoundaryRefFetcher`'s `current_chrom: Cell<Option<u32>>`).
+- Rewrite the module-level doc to describe the new shape: one
+  fetcher type ([`StreamingChromRefFetcher`]) + two adapters
+  (`SingleChromLegacyAdapter`, `WalkerLegacyAdapter`) that bridge
+  it to the legacy `RefSeqFetcher` trait.
+- Fix one stale doc reference in cohort_driver.rs (mentioned
+  "SyncRefFetcher" in the from-bam path; now points at
+  `WalkerLegacyAdapter`). Fix one stale comment in
+  baq/tests.rs's mock fetcher.
 
-**Tests:** all existing tests pass.
+**Scope deferred (not part of this step):**
 
-**Acceptance:** lib test count net change is roughly neutral
-(removed legacy fetcher tests are replaced by new fetcher tests
-during steps 1, 2b); the module's line count drops substantially.
+- The legacy `RefSeqFetcher` trait stays. Walker, BAQ, and from-bam
+  all consume it via the adapters — none of them can be migrated to
+  the single-contig [`ChromRefFetcher`] trait without restructuring
+  their multi-chrom access patterns to per-chrom processing. That's
+  a meaningful refactor (especially for from-bam, which would need
+  to chunk the walker's coordinate-sorted record stream by chrom
+  and drive `drive_cohort_pipeline` per chrom). Tracked as future
+  work but not on the critical path — the unified shape we're after
+  is "one fetcher type behind the menu," not "one trait." Having
+  both `ChromRefFetcher` (single-contig) and `RefSeqFetcher`
+  (multi-chrom) coexist is honest about the two genuinely different
+  access patterns the codebase has.
+
+**Tests:** all existing tests pass; legacy fetcher tests are
+deleted along with their types (~7 tests removed, matching the
+deleted impls).
+
+**Acceptance:** lib test count drops from 889 → 882 (the 7 deleted
+`ChromBoundaryRefFetcher` tests). The module's surface shrinks
+substantially: one fetcher type + two adapters + two traits, vs
+the previous menu of three fetcher types + one trait.
 
 ## Test strategy
 

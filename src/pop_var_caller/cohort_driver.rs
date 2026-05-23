@@ -124,9 +124,10 @@ pub struct CohortDriveStats {
 /// separate parameter to `drive_cohort_pipeline`. That split lets
 /// the cohort `var-calling` path build a fresh per-chrom fetcher
 /// inside each worker (no shared state) while `var-calling-from-bam`
-/// keeps its single sample-wide `SyncRefFetcher`. Both paths pass
-/// the same per-stage configs in `CohortPipelineParams` and select
-/// the fetcher independently.
+/// passes one multi-chrom `WalkerLegacyAdapter` for the single
+/// sample's full traversal. Both paths pass the same per-stage
+/// configs in `CohortPipelineParams` and select the fetcher
+/// independently.
 ///
 /// `Clone` is derived because the per-chromosome parallel path in
 /// [`run_var_calling`](super::var_calling::run_var_calling) clones
