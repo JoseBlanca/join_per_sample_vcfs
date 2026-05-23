@@ -31,7 +31,7 @@ use crate::per_sample_pileup::cram_input::ContigList;
 use crate::per_sample_pileup::pileup::{PileupRecord, WalkerError};
 use crate::per_sample_pileup::psp::PspReadError;
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
-use crate::per_sample_pileup::ref_fetcher::SyncRefFetcher;
+use crate::per_sample_pileup::ref_fetcher::WalkerLegacyAdapter;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
 use crate::pop_var_caller::cohort_driver::{CohortPipelineParams, drive_cohort_pipeline};
@@ -351,9 +351,19 @@ fn run_cohort_pipeline_for_single_sample(
     let writer_cfg = WriterConfig::new(output.to_path_buf()).with_emit_gp(emit_gp);
 
     // Reference fetcher shared between DUST + PerGroupMerger.
-    let fetcher_concrete = SyncRefFetcher::new(reference, ctx.contigs.clone())
-        .map_err(VarCallingFromBamCliError::Io)?;
-    let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
+    // `WalkerLegacyAdapter` wraps a `StreamingChromRefFetcher` that
+    // swaps per chrom transition; the multi-chrom records produced
+    // by the single-sample walker flow through DUST and the
+    // per-group merger, and the adapter rebuilds its inner whenever
+    // the chrom_id of an incoming record changes. Peak fetcher
+    // memory is ~1 MB regardless of genome size — vs the previous
+    // `SyncRefFetcher` that accumulated every visited contig
+    // (~3 GB on a human reference).
+    //
+    // Step 2(d) of `unified_chrom_ref_fetcher` plan.
+    let walker_adapter =
+        WalkerLegacyAdapter::new(reference.to_path_buf(), ctx.contigs.clone());
+    let fetcher: SharedRefFetcher = Arc::new(walker_adapter);
 
     // Wrap the walker as a k=1 input for PerPositionMerger. The
     // adapter stashes walker errors and reports end-of-stream; the
