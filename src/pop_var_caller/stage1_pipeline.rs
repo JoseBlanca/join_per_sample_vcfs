@@ -23,7 +23,7 @@ use crate::per_sample_pileup::cram_input::{
 };
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::{self, PileupWalker, PreparedRead, WalkerConfig};
-use crate::per_sample_pileup::ref_fetcher::{SyncRefFetcher, WalkerLegacyAdapter};
+use crate::per_sample_pileup::ref_fetcher::WalkerLegacyAdapter;
 
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;
@@ -106,16 +106,18 @@ where
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
-    // 2. Reference fetchers — BAQ still uses SyncRefFetcher (shared
-    //    across rayon workers; migrated separately in step 2(c) of
-    //    the `unified_chrom_ref_fetcher` plan). Walker uses the new
-    //    [`WalkerLegacyAdapter`] (step 2(b)): a multi-chrom shell
-    //    that swaps a `StreamingChromRefFetcher` per chrom
-    //    transition. Peak memory is one ~1 MB sliding buffer instead
-    //    of one full contig.
-    let baq_fetcher =
-        SyncRefFetcher::new(reference, contigs.clone()).map_err(PileupCliError::Io)?;
-    let walker_fetcher = WalkerLegacyAdapter::new(reference.to_path_buf(), contigs.clone());
+    // 2. Reference fetcher — one [`WalkerLegacyAdapter`] shared
+    //    between the walker (single-threaded) and BAQ (rayon-parallel).
+    //    The adapter is `Sync` via an internal `Mutex<Option<...>>`;
+    //    BAQ's per-fetch lock acquisition is uncontended within a
+    //    chrom and pays a swap cost only at chrom transitions inside
+    //    a parallel chunk (rare on coordinate-sorted input). Peak
+    //    memory is one ~1 MB sliding buffer per Stage 1 worker — vs
+    //    the previous "one full contig in `SyncRefFetcher` + another
+    //    in `ChromBoundaryRefFetcher`" footprint.
+    //
+    //    Step 2(c) of `unified_chrom_ref_fetcher` plan.
+    let ref_fetcher = WalkerLegacyAdapter::new(reference.to_path_buf(), contigs.clone());
 
     // 3. Build the boxed input iterator + handle for upstream errors,
     //    drive the closure, then snapshot every branch-local counter
@@ -145,7 +147,7 @@ where
         }));
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = pileup::run(input, &walker_fetcher, &walker_cfg);
+        let walker = pileup::run(input, &ref_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,
@@ -159,11 +161,11 @@ where
         (r, None, stash)
     } else {
         // BAQ-on: reader → BaqStream → adapter → walker.
-        let mut baq_stream = BaqStream::new(reader.by_ref(), baq_cfg, &baq_fetcher, baq_chunk_size);
+        let mut baq_stream = BaqStream::new(reader.by_ref(), baq_cfg, &ref_fetcher, baq_chunk_size);
         let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = pileup::run(input, &walker_fetcher, &walker_cfg);
+        let walker = pileup::run(input, &ref_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,

@@ -1152,21 +1152,27 @@ impl RefSeqFetcher for SingleChromLegacyAdapter {
 /// the legacy `RefSeqFetcher` trait so it drops into existing
 /// walker plumbing.
 ///
-/// `!Sync` by design — the walker is single-threaded, so interior
-/// mutability via `RefCell` avoids the lock overhead a `Mutex`
-/// would impose. Stage 1's BAQ uses a separate `Sync` adapter
-/// pattern (step 2(c)).
+/// `Sync` (via `Mutex<Option<...>>`). Step 1 of the migration sized
+/// for the walker, which is single-threaded — but in step 2(c) the
+/// same adapter is shared with Stage 1's parallel BAQ stage, so the
+/// `Sync` requirement is real. Single-thread use sees uncontended
+/// `Mutex` acquisitions (a handful of nanoseconds per fetch);
+/// BAQ-style multi-thread use sees one acquisition per
+/// `engine.process(read, fetcher)` call. Reads within a chunk are
+/// coordinate-sorted, so chrom transitions inside the parallel
+/// section are rare and the swap cost is negligible vs the BAQ
+/// engine's per-read work.
 ///
 /// Behaviour on chrom transition: the existing inner is dropped
 /// (releasing its sliding buffer), a fresh
 /// [`StreamingChromRefFetcher::for_contig`] is built for the new
-/// chrom (open file + parse .fai), and the call delegates. The
-/// open + fai-parse cost is paid once per chrom transition; within
-/// a chrom every fetch hits the sliding buffer.
+/// chrom (open file + parse .fai), and the call delegates. Open +
+/// fai-parse is paid once per chrom transition; within a chrom every
+/// fetch hits the sliding buffer.
 pub struct WalkerLegacyAdapter {
     fasta_path: PathBuf,
     contigs: ContigList,
-    inner: std::cell::RefCell<Option<(u32, StreamingChromRefFetcher)>>,
+    inner: Mutex<Option<(u32, StreamingChromRefFetcher)>>,
 }
 
 impl WalkerLegacyAdapter {
@@ -1176,18 +1182,22 @@ impl WalkerLegacyAdapter {
         Self {
             fasta_path,
             contigs,
-            inner: std::cell::RefCell::new(None),
+            inner: Mutex::new(None),
         }
     }
+}
 
-    /// Borrow the currently-loaded inner, rebuilding for `chrom_id`
-    /// if needed. Returns a refmut to the slot so the caller can
-    /// then unwrap and delegate.
-    fn ensure_chrom_loaded(
+impl RefSeqFetcher for WalkerLegacyAdapter {
+    fn fetch(
         &self,
         chrom_id: u32,
-    ) -> Result<std::cell::RefMut<'_, Option<(u32, StreamingChromRefFetcher)>>, io::Error> {
-        let mut slot = self.inner.borrow_mut();
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, io::Error> {
+        let mut slot = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let needs_rebuild = match slot.as_ref() {
             Some((current, _)) => *current != chrom_id,
             None => true,
@@ -1210,19 +1220,7 @@ impl WalkerLegacyAdapter {
                 .map_err(legacy_io_error)?;
             *slot = Some((chrom_id, fresh));
         }
-        Ok(slot)
-    }
-}
-
-impl RefSeqFetcher for WalkerLegacyAdapter {
-    fn fetch(
-        &self,
-        chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, io::Error> {
-        let slot = self.ensure_chrom_loaded(chrom_id)?;
-        let (_, inner) = slot.as_ref().expect("ensure_chrom_loaded post-condition");
+        let (_, inner) = slot.as_ref().expect("post-rebuild slot is populated");
         ChromRefFetcher::fetch(inner, start_1based, length).map_err(legacy_io_error)
     }
 
