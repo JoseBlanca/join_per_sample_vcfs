@@ -7,12 +7,14 @@
 //! order-preserving `par_iter` plus our serial chunk-by-chunk drain.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use crate::per_sample_pileup::cram_input::MappedRead;
+use crate::per_sample_pileup::cram_input::{ContigList, MappedRead};
 use crate::per_sample_pileup::errors::CramInputError;
-use crate::per_sample_pileup::pileup::{PreparedRead, RefSeqFetcher};
+use crate::per_sample_pileup::pileup::PreparedRead;
+use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 use super::BaqConfig;
 use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
@@ -74,20 +76,32 @@ impl BaqSkipCounts {
 /// is fused: once exhausted (either by upstream returning `None` or
 /// after returning an upstream `Err`), it returns `None` forever.
 ///
-/// Implements `Send` when `R: Send` and `F: Sync`. Not `Sync` —
-/// `BaqStream` is single-consumer (interior mutation through
-/// `&mut self`).
-pub struct BaqStream<'a, R, F>
-where
-    F: RefSeqFetcher + Sync,
-{
+/// **Memory shape (after the `unified_chrom_ref_fetcher` migration).**
+/// Each rayon worker constructs its own
+/// [`ManualEvictChromRefFetcher`] in the `map_init` closure: per-worker
+/// fetchers, no shared state, no `Arc`/`Mutex` on the fetch hot path.
+/// After processing each read, the worker calls
+/// `fetcher.evict_before(read.pos)` so the buffer stays at the
+/// current-position window. Chunks are constrained not to span
+/// chrom transitions (see `refill_batch`); each chunk's fetcher
+/// binds to one contig.
+pub struct BaqStream<R> {
     reads: R,
     cfg: BaqConfig,
-    ref_fetcher: &'a F,
+    /// Path to the reference FASTA. Each rayon worker opens its own
+    /// `File` from this path on first use; cheap (one open per worker).
+    fasta_path: PathBuf,
+    /// Contigs table for `chrom_id → name` resolution. Cloned cheaply
+    /// into the rayon closure as a borrowed reference.
+    contigs: ContigList,
     chunk_size: usize,
     /// Reusable input-chunk buffer drained from upstream each refill.
     /// Its capacity sticks at `chunk_size` after the first refill.
     chunk_buf: Vec<MappedRead>,
+    /// A read picked from upstream that doesn't belong in the
+    /// current chunk (different chrom). Stashed so the next batch
+    /// starts with it. Preserves the chunk-per-chrom invariant.
+    pending_next_read: Option<MappedRead>,
     /// Reusable parallel-output buffer; `collect_into_vec` clears and
     /// refills it in place.
     outcomes_buf: Vec<BaqOutcome>,
@@ -100,22 +114,29 @@ where
     skip_counts: BaqSkipCounts,
 }
 
-impl<'a, R, F> BaqStream<'a, R, F>
+impl<R> BaqStream<R>
 where
     R: Iterator<Item = Result<MappedRead, CramInputError>>,
-    F: RefSeqFetcher + Sync,
 {
     /// Construct a `BaqStream`. Panics if `chunk_size == 0` — a
     /// programmer error in every call site (silently coercing to 1
     /// would mask a misconfigured CLI flag as a perf bug).
-    pub fn new(reads: R, cfg: BaqConfig, ref_fetcher: &'a F, chunk_size: usize) -> Self {
+    pub fn new(
+        reads: R,
+        cfg: BaqConfig,
+        fasta_path: PathBuf,
+        contigs: ContigList,
+        chunk_size: usize,
+    ) -> Self {
         assert!(chunk_size > 0, "BaqStream chunk_size must be > 0");
         Self {
             reads,
             cfg,
-            ref_fetcher,
+            fasta_path,
+            contigs,
             chunk_size,
             chunk_buf: Vec::new(),
+            pending_next_read: None,
             outcomes_buf: Vec::new(),
             current_batch: VecDeque::new(),
             pending_error: None,
@@ -132,13 +153,34 @@ where
     }
 
     fn refill_batch(&mut self) {
-        if self.upstream_done {
+        if self.upstream_done && self.pending_next_read.is_none() {
             return;
         }
         self.chunk_buf.clear();
+
+        // If a read from the previous batch was stashed because its
+        // chrom_id didn't match, that read seeds this batch.
+        if let Some(r) = self.pending_next_read.take() {
+            self.chunk_buf.push(r);
+        }
+
+        // Fill until chunk_size or a chrom transition (whichever
+        // comes first). The chunk-per-chrom invariant lets each
+        // worker construct a single-contig fetcher for the chunk's
+        // contig — the new `ManualEvictChromRefFetcher` is bound to
+        // one contig at construction.
         while self.chunk_buf.len() < self.chunk_size {
             match self.reads.next() {
-                Some(Ok(r)) => self.chunk_buf.push(r),
+                Some(Ok(r)) => {
+                    if let Some(first) = self.chunk_buf.first()
+                        && r.ref_id != first.ref_id
+                    {
+                        // Different chrom — stash for the next batch.
+                        self.pending_next_read = Some(r);
+                        break;
+                    }
+                    self.chunk_buf.push(r);
+                }
                 Some(Err(e)) => {
                     self.pending_error = Some(e);
                     self.upstream_done = true;
@@ -150,22 +192,63 @@ where
                 }
             }
         }
+
         if self.chunk_buf.is_empty() {
             return;
         }
+
+        // All reads in `chunk_buf` share `ref_id` by construction
+        // (see the chrom-boundary check above).
+        let chunk_ref_id = self.chunk_buf[0].ref_id;
+        let contig_entry = match self.contigs.entries.get(chunk_ref_id) {
+            Some(e) => e,
+            None => {
+                // Out-of-range ref_id — bail every read in this
+                // chunk as ChromIdOutOfRange and continue.
+                let n = self.chunk_buf.len() as u64;
+                self.chunk_buf.clear();
+                self.skip_counts.total += n;
+                self.skip_counts.chrom_id_out_of_range += n;
+                self.current_batch.clear();
+                return;
+            }
+        };
+        let contig_name: &str = &contig_entry.name;
+        let fasta_path: &std::path::Path = &self.fasta_path;
         let cfg = self.cfg;
-        let fetcher = self.ref_fetcher;
+
         // par_drain consumes the chunk by-value (so `engine.process`
         // can move the read's cigar/seq/qname straight into the
         // resulting PreparedRead) while preserving both input order
-        // and the chunk_buf's backing capacity.
+        // and the chunk_buf's backing capacity. Each rayon worker
+        // builds its own `(BaqEngine, ManualEvictChromRefFetcher)`
+        // pair via `map_init` — no shared state, no Arc, no Mutex.
+        // After processing each read the worker calls
+        // `fetcher.evict_before(read.pos)` so the per-worker buffer
+        // stays at "current-position window plus forward growth";
+        // see ManualEvictChromRefFetcher's module-level comment.
         self.chunk_buf
             .par_drain(..)
             .map_init(
-                || BaqEngine::new(cfg),
-                |engine, read| engine.process(read, fetcher),
+                || {
+                    let fetcher = ManualEvictChromRefFetcher::for_contig(fasta_path, contig_name)
+                        .expect(
+                            "BAQ per-worker fetcher construction failed; \
+                             FASTA path + contig name were validated at BaqStream construction time",
+                        );
+                    (BaqEngine::new(cfg), fetcher)
+                },
+                |(engine, fetcher), read| {
+                    let pos = read.pos;
+                    let outcome = engine.process(read, fetcher);
+                    if let Ok(p) = u32::try_from(pos) {
+                        fetcher.evict_before(p);
+                    }
+                    outcome
+                },
             )
             .collect_into_vec(&mut self.outcomes_buf);
+
         self.current_batch.clear();
         for outcome in self.outcomes_buf.drain(..) {
             match outcome {
@@ -176,10 +259,9 @@ where
     }
 }
 
-impl<R, F> Iterator for BaqStream<'_, R, F>
+impl<R> Iterator for BaqStream<R>
 where
     R: Iterator<Item = Result<MappedRead, CramInputError>>,
-    F: RefSeqFetcher + Sync,
 {
     type Item = Result<PreparedRead, CramInputError>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -190,7 +272,7 @@ where
             if let Some(e) = self.pending_error.take() {
                 return Some(Err(e));
             }
-            if self.upstream_done {
+            if self.upstream_done && self.pending_next_read.is_none() {
                 return None;
             }
             self.refill_batch();

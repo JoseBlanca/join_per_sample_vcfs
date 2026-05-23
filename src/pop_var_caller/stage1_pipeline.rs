@@ -106,18 +106,21 @@ where
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
-    // 2. Reference fetcher — one [`WalkerLegacyAdapter`] shared
-    //    between the walker (single-threaded) and BAQ (rayon-parallel).
-    //    The adapter is `Sync` via an internal `Mutex<Option<...>>`;
-    //    BAQ's per-fetch lock acquisition is uncontended within a
-    //    chrom and pays a swap cost only at chrom transitions inside
-    //    a parallel chunk (rare on coordinate-sorted input). Peak
-    //    memory is one ~1 MB sliding buffer per Stage 1 worker — vs
-    //    the previous "one full contig in `SyncRefFetcher` + another
-    //    in `ChromBoundaryRefFetcher`" footprint.
+    // 2. Reference fetcher for the walker — [`WalkerLegacyAdapter`]
+    //    wraps a `StreamingChromRefFetcher` and swaps it on chrom
+    //    transition. The walker is single-threaded so the adapter
+    //    can stay `!Sync` (RefCell-based interior mutability; no
+    //    Mutex overhead). BAQ builds its own per-rayon-worker
+    //    [`ManualEvictChromRefFetcher`] inside `BaqStream`, so there
+    //    is no shared fetcher between BAQ and the walker any more.
     //
-    //    Step 2(c) of `unified_chrom_ref_fetcher` plan.
-    let ref_fetcher = WalkerLegacyAdapter::new(reference.to_path_buf(), contigs.clone());
+    //    Step 2(c) of the `unified_chrom_ref_fetcher` plan walked
+    //    back: BAQ's parallel out-of-order access pattern is
+    //    genuinely random within a chunk, which doesn't fit the
+    //    walker's streaming-sliding-buffer abstraction. The new
+    //    manual-evict fetcher gives BAQ a per-worker buffer with
+    //    caller-managed eviction.
+    let walker_fetcher = WalkerLegacyAdapter::new(reference.to_path_buf(), contigs.clone());
 
     // 3. Build the boxed input iterator + handle for upstream errors,
     //    drive the closure, then snapshot every branch-local counter
@@ -147,7 +150,7 @@ where
         }));
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = pileup::run(input, &ref_fetcher, &walker_cfg);
+        let walker = pileup::run(input, &walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,
@@ -161,11 +164,17 @@ where
         (r, None, stash)
     } else {
         // BAQ-on: reader → BaqStream → adapter → walker.
-        let mut baq_stream = BaqStream::new(reader.by_ref(), baq_cfg, &ref_fetcher, baq_chunk_size);
+        let mut baq_stream = BaqStream::new(
+            reader.by_ref(),
+            baq_cfg,
+            reference.to_path_buf(),
+            contigs.clone(),
+            baq_chunk_size,
+        );
         let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = pileup::run(input, &ref_fetcher, &walker_cfg);
+        let walker = pileup::run(input, &walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,

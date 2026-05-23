@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::per_sample_pileup::cram_input::{
     CigarOp, FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
-use crate::per_sample_pileup::pileup::{MateRole, PreparedRead, RefSeqFetcher};
+use crate::per_sample_pileup::pileup::{MateRole, PreparedRead};
+use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 use super::BaqConfig;
 use super::probaln::probaln_glocal;
@@ -104,7 +105,11 @@ impl BaqEngine {
     /// `PreparedRead` instead of cloning them. The skip paths drop
     /// the `MappedRead` immediately, same as the previous borrowing
     /// API.
-    pub fn process(&mut self, read: MappedRead, ref_fetcher: &dyn RefSeqFetcher) -> BaqOutcome {
+    pub fn process(
+        &mut self,
+        read: MappedRead,
+        ref_fetcher: &mut ManualEvictChromRefFetcher,
+    ) -> BaqOutcome {
         if read.flag & FLAG_UNMAPPED != 0 {
             return BaqOutcome::Skipped(BaqSkipReason::Unmapped);
         }
@@ -126,6 +131,12 @@ impl BaqEngine {
             Ok(v) => v,
             Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ReadTooLong),
         };
+        // `chrom_id` is no longer passed to the fetcher (the new
+        // API binds it to one contig at construction — BAQ's
+        // per-worker fetcher is built for the chunk's chrom), but
+        // it's still needed downstream by `mapped_to_prepared` for
+        // the resulting `PreparedRead`. Range-checking here catches
+        // negative/invalid SAM rows the same as before.
         let chrom_id = match u32::try_from(read.ref_id) {
             Ok(v) => v,
             Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ChromIdOutOfRange),
@@ -145,8 +156,17 @@ impl BaqEngine {
         }
         let length = (xe - xb) as u32;
 
-        let ref_bytes = match ref_fetcher.fetch(chrom_id, (xb + 1) as u32, length) {
-            Ok(bytes) if !bytes.is_empty() => bytes,
+        // Fetch into `self.encoded_ref` directly from the borrowed
+        // slice — no allocation, no `Vec<u8>` round-trip. The
+        // `encoded_ref` `clear`+`extend` happens here (not after the
+        // fetch landing) because the borrow on `ref_fetcher` ends as
+        // soon as we finish iterating the slice, and that needs to
+        // be before any further fetcher mutation.
+        self.encoded_ref.clear();
+        match ref_fetcher.fetch((xb + 1) as u32, length) {
+            Ok(bytes) if !bytes.is_empty() => {
+                self.encoded_ref.extend(bytes.iter().map(|&b| encode_base(b)));
+            }
             Ok(_empty) => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
             Err(e) => {
                 // Surface genuine I/O failures distinct from past-chrom-end.
@@ -160,11 +180,7 @@ impl BaqEngine {
                 );
                 return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd);
             }
-        };
-
-        self.encoded_ref.clear();
-        self.encoded_ref
-            .extend(ref_bytes.iter().map(|&b| encode_base(b)));
+        }
         self.encoded_query.clear();
         self.encoded_query
             .extend(read.seq.iter().map(|&b| encode_base(b)));

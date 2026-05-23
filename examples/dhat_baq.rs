@@ -19,26 +19,42 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use std::io;
-
 use pop_var_caller::per_sample_pileup::baq::{BaqConfig, BaqEngine, BaqOutcome};
 use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, MappedRead};
-use pop_var_caller::per_sample_pileup::pileup::RefSeqFetcher;
+use pop_var_caller::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
-/// Constant-base reference; mirrors the bench's `ConstRefFetcher`.
-struct ConstRefFetcher {
-    len: usize,
-}
-
-impl RefSeqFetcher for ConstRefFetcher {
-    fn fetch(&self, _chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
-        let lo = (start_1based - 1) as usize;
-        let hi = lo + length as usize;
-        if hi > self.len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "off end"));
+/// Build a tempfile FASTA with `length` 'A' bases and return a
+/// [`ManualEvictChromRefFetcher`] over it. The BAQ engine now takes
+/// the concrete fetcher type, so the heap profile uses the same
+/// production code path that Stage 1 does.
+fn build_fetcher(length: usize) -> (tempfile::TempDir, ManualEvictChromRefFetcher) {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fasta_path = dir.path().join("ref.fa");
+    let fai_path = dir.path().join("ref.fa.fai");
+    let header = b">chr0\n";
+    {
+        let mut fa = std::fs::File::create(&fasta_path).expect("fa");
+        fa.write_all(header).expect("hdr");
+        for _ in 0..length {
+            fa.write_all(b"A").expect("seq");
         }
-        Ok(vec![b'A'; length as usize])
+        fa.write_all(b"\n").expect("nl");
     }
+    {
+        let mut fai = std::fs::File::create(&fai_path).expect("fai");
+        writeln!(
+            fai,
+            "chr0\t{}\t{}\t{}\t{}",
+            length,
+            header.len(),
+            length,
+            length + 1,
+        )
+        .expect("fai");
+    }
+    let fetcher = ManualEvictChromRefFetcher::for_contig(&fasta_path, "chr0").expect("fetcher");
+    (dir, fetcher)
 }
 
 fn build_mapped_reads(read_len: u32, span: u32, coverage: u32) -> Vec<MappedRead> {
@@ -73,9 +89,7 @@ fn main() {
     let span: u32 = 50_000;
     let coverage: u32 = 30;
     let read_len: u32 = 150;
-    let fetcher = ConstRefFetcher {
-        len: span as usize + 200,
-    };
+    let (_dir, mut fetcher) = build_fetcher(span as usize + 200);
 
     let reads = build_mapped_reads(read_len, span, coverage);
 
@@ -83,8 +97,12 @@ fn main() {
     let mut capped: u64 = 0;
     let n = reads.len();
     for r in reads {
-        if let BaqOutcome::Capped(_) = engine.process(r, &fetcher) {
+        let pos = r.pos;
+        if let BaqOutcome::Capped(_) = engine.process(r, &mut fetcher) {
             capped += 1;
+        }
+        if let Ok(p) = u32::try_from(pos) {
+            fetcher.evict_before(p);
         }
     }
     eprintln!("reads processed: {n} (capped: {capped})");

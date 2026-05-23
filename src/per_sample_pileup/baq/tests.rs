@@ -346,38 +346,95 @@ fn set_u_wraps_out_of_band_to_huge_usize() {
 use crate::per_sample_pileup::cram_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
-use crate::per_sample_pileup::pileup::{MateRole, RefSeqFetcher};
+use crate::per_sample_pileup::pileup::MateRole;
+use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 
-/// Single-chrom in-memory fetcher: serves byte windows from `chrom`,
-/// errors on any request that runs past the end. Stand-in for the
-/// production fetcher in BAQ unit tests; avoids FASTA IO so the
-/// suite stays hermetic + fast.
-struct MockRefFetcher {
-    chrom: Vec<u8>,
+/// Build a single-contig FASTA + sibling `.fai` in a tempdir,
+/// open a [`ManualEvictChromRefFetcher`] over it, and hand both back.
+/// The tempdir must outlive the fetcher so the file stays on disk.
+/// Replaces the in-memory `MockRefFetcher` the tests used before the
+/// `unified_chrom_ref_fetcher` migration: BAQ no longer takes a
+/// trait-object fetcher, so the tests now use the real production
+/// type with a tiny tempfile FASTA.
+fn fetcher_from_chrom_bytes(
+    chrom: &[u8],
+) -> (tempfile::TempDir, ManualEvictChromRefFetcher) {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fasta_path = dir.path().join("ref.fa");
+    let fai_path = dir.path().join("ref.fa.fai");
+
+    let header = b">chr0\n";
+    {
+        let mut fa = std::fs::File::create(&fasta_path).expect("fa");
+        fa.write_all(header).expect("hdr");
+        fa.write_all(chrom).expect("seq");
+        fa.write_all(b"\n").expect("nl");
+    }
+    {
+        let mut fai = std::fs::File::create(&fai_path).expect("fai");
+        writeln!(
+            fai,
+            "chr0\t{}\t{}\t{}\t{}",
+            chrom.len(),
+            header.len(),
+            chrom.len(),
+            chrom.len() + 1,
+        )
+        .expect("fai");
+    }
+    let fetcher = ManualEvictChromRefFetcher::for_contig(&fasta_path, "chr0").expect("fetcher");
+    (dir, fetcher)
 }
 
-impl RefSeqFetcher for MockRefFetcher {
-    fn fetch(
-        &self,
-        _chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, std::io::Error> {
-        let start = (start_1based as usize)
-            .checked_sub(1)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "0 start"))?;
-        let end = start + length as usize;
-        if end > self.chrom.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "past chrom end",
-            ));
-        }
-        Ok(self.chrom[start..end].to_vec())
+/// Companion to [`fetcher_from_chrom_bytes`] for [`BaqStream`]
+/// tests: returns the FASTA path and a one-entry [`ContigList`]
+/// instead of a built fetcher, since [`BaqStream::new`] now takes
+/// the FASTA path + contigs and builds per-rayon-worker fetchers
+/// inside its own `map_init`.
+fn stream_components_from_chrom_bytes(
+    chrom: &[u8],
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    crate::per_sample_pileup::cram_input::ContigList,
+) {
+    use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fasta_path = dir.path().join("ref.fa");
+    let fai_path = dir.path().join("ref.fa.fai");
+    let header = b">chr0\n";
+    {
+        let mut fa = std::fs::File::create(&fasta_path).expect("fa");
+        fa.write_all(header).expect("hdr");
+        fa.write_all(chrom).expect("seq");
+        fa.write_all(b"\n").expect("nl");
     }
+    {
+        let mut fai = std::fs::File::create(&fai_path).expect("fai");
+        writeln!(
+            fai,
+            "chr0\t{}\t{}\t{}\t{}",
+            chrom.len(),
+            header.len(),
+            chrom.len(),
+            chrom.len() + 1,
+        )
+        .expect("fai");
+    }
+    let contigs = ContigList {
+        entries: vec![ContigEntry {
+            name: "chr0".into(),
+            length: chrom.len() as u64,
+            md5: None,
+        }],
+    };
+    (dir, fasta_path, contigs)
 }
+
 
 fn synthetic_read(
     flag: u16,
@@ -405,9 +462,7 @@ fn synthetic_read(
 
 #[test]
 fn engine_happy_path_match_only() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let read = synthetic_read(
         0,
         1,
@@ -419,7 +474,7 @@ fn engine_happy_path_match_only() {
     let expected_seq = read.seq.clone();
     let expected_cigar = read.cigar.clone();
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(prepared) => {
             assert_eq!(prepared.alignment_start, 1);
             assert_eq!(prepared.alignment_end, 8);
@@ -438,9 +493,7 @@ fn engine_happy_path_match_only() {
 
 #[test]
 fn engine_mate_role_first_of_pair() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGT");
     let read = synthetic_read(
         FLAG_PAIRED | FLAG_FIRST_OF_PAIR,
         1,
@@ -450,7 +503,7 @@ fn engine_mate_role_first_of_pair() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(prepared) => assert_eq!(prepared.mate_role, MateRole::FirstOfPair),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -458,9 +511,7 @@ fn engine_mate_role_first_of_pair() {
 
 #[test]
 fn engine_mate_role_second_of_pair() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGT");
     let read = synthetic_read(
         FLAG_PAIRED, // paired but not first of pair → SecondOfPair
         1,
@@ -470,7 +521,7 @@ fn engine_mate_role_second_of_pair() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(prepared) => assert_eq!(prepared.mate_role, MateRole::SecondOfPair),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -478,9 +529,7 @@ fn engine_mate_role_second_of_pair() {
 
 #[test]
 fn engine_reverse_strand_propagates() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGT");
     let read = synthetic_read(
         FLAG_REVERSE_STRAND,
         1,
@@ -490,7 +539,7 @@ fn engine_reverse_strand_propagates() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(prepared) => assert!(prepared.is_reverse_strand),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -498,9 +547,7 @@ fn engine_reverse_strand_propagates() {
 
 #[test]
 fn engine_skip_unmapped() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGT");
     let read = synthetic_read(
         FLAG_UNMAPPED,
         1,
@@ -511,29 +558,25 @@ fn engine_skip_unmapped() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::Unmapped),
     );
 }
 
 #[test]
 fn engine_skip_empty_query() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGT");
     let read = synthetic_read(0, 1, 60, vec![], vec![], vec![]);
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::EmptyQuery),
     );
 }
 
 #[test]
 fn engine_skip_qual_absent_on_empty_qual() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGT");
     let read = synthetic_read(
         0,
         1,
@@ -544,7 +587,7 @@ fn engine_skip_qual_absent_on_empty_qual() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::QualAbsent),
     );
 }
@@ -553,9 +596,7 @@ fn engine_skip_qual_absent_on_empty_qual() {
 fn engine_skip_qual_absent_on_length_mismatch() {
     // M22: regression test for the second arm of the QualAbsent
     // guard (qual.len() != seq.len() with both nonzero).
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGT");
     let read = synthetic_read(
         0,
         1,
@@ -566,16 +607,14 @@ fn engine_skip_qual_absent_on_length_mismatch() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::QualAbsent),
     );
 }
 
 #[test]
 fn engine_skip_no_match_in_cigar() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGT");
     // All soft-clip — no M/=/X. Matches realn.c:192 (`xb == -1`).
     let read = synthetic_read(
         0,
@@ -587,16 +626,14 @@ fn engine_skip_no_match_in_cigar() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::NoMatchInCigar),
     );
 }
 
 #[test]
 fn engine_skip_contains_ref_skip() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let read = synthetic_read(
         0,
         1,
@@ -607,7 +644,7 @@ fn engine_skip_contains_ref_skip() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::ContainsRefSkip),
     );
 }
@@ -617,9 +654,7 @@ fn engine_skip_ref_window_past_chrom_end() {
     // 5 bp chrom, read at pos=4 with CIGAR=5M — match span [3..8) on a
     // ref that only has [0..5). The fetcher errs, and the engine
     // converts that to RefWindowPastChromEnd.
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTA".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTA");
     let read = synthetic_read(
         0,
         4,
@@ -630,7 +665,7 @@ fn engine_skip_ref_window_past_chrom_end() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::RefWindowPastChromEnd),
     );
 }
@@ -638,9 +673,7 @@ fn engine_skip_ref_window_past_chrom_end() {
 #[test]
 fn engine_skip_pos_out_of_range() {
     // M4: read.pos > i32::MAX → PosOutOfRange.
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGT");
     let read = synthetic_read(
         0,
         (i32::MAX as u64) + 10,
@@ -651,7 +684,7 @@ fn engine_skip_pos_out_of_range() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &fetcher)),
+        skip_reason(engine.process(read, &mut fetcher)),
         Some(BaqSkipReason::PosOutOfRange),
     );
 }
@@ -662,9 +695,7 @@ fn engine_skip_pos_out_of_range() {
 
 #[test]
 fn engine_happy_path_with_insertion() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGT");
     // CIGAR 3M2I3M: query bases 0-2 align to ref 0-2, bases 3-4 are
     // insertions (no ref pos), bases 5-7 align to ref 3-5.
     let read = synthetic_read(
@@ -676,7 +707,7 @@ fn engine_happy_path_with_insertion() {
         vec![40; 8],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(p) => {
             assert_eq!(p.bq_baq.len(), 8);
             // Insertion positions (indices 3, 4) carry the raw qual
@@ -691,9 +722,7 @@ fn engine_happy_path_with_insertion() {
 
 #[test]
 fn engine_happy_path_with_deletion() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGTACGT");
     // CIGAR 4M2D4M: query bases 0-3 align to ref 0-3, ref 4-5 deleted
     // (no query bases), query bases 4-7 align to ref 6-9.
     let read = synthetic_read(
@@ -705,7 +734,7 @@ fn engine_happy_path_with_deletion() {
         vec![40; 8],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(p) => {
             assert_eq!(p.bq_baq.len(), 8);
             for (i, &q) in p.bq_baq.iter().enumerate() {
@@ -722,9 +751,7 @@ fn engine_happy_path_with_deletion() {
 fn engine_happy_path_with_mixed_cigar() {
     // CIGAR 2S5M1I3M2D2M2S covers every arm of apply_baq_cap_into in
     // one walk.
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGTACGTACGT");
     let read = synthetic_read(
         0,
         1,
@@ -742,7 +769,7 @@ fn engine_happy_path_with_mixed_cigar() {
         vec![40; 16],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &fetcher) {
+    match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(p) => {
             assert_eq!(p.bq_baq.len(), 16);
             // Ref span (counts M, =, X, D, N): 5 + 3 + 2 + 2 = 12.
@@ -841,9 +868,7 @@ use super::stream::BaqStream;
 
 #[test]
 fn stream_yields_prepared_reads_in_order_within_chunk() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=4)
         .map(|pos| {
             Ok(synthetic_read(
@@ -856,7 +881,7 @@ fn stream_yields_prepared_reads_in_order_within_chunk() {
             ))
         })
         .collect();
-    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
     let outputs: Vec<Result<PreparedRead, _>> = stream.collect();
     assert_eq!(outputs.len(), 4);
     let starts: Vec<u32> = outputs
@@ -870,9 +895,7 @@ fn stream_yields_prepared_reads_in_order_within_chunk() {
 fn stream_preserves_order_across_chunks() {
     // Chunk size 2 with 5 inputs → three batches. Output order must
     // still match input order.
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=5)
         .map(|pos| {
             Ok(synthetic_read(
@@ -885,7 +908,7 @@ fn stream_preserves_order_across_chunks() {
             ))
         })
         .collect();
-    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 2);
+    let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 2);
     let starts: Vec<u32> = stream.map(|r| r.unwrap().alignment_start).collect();
     assert_eq!(starts, vec![1, 2, 3, 4, 5]);
 }
@@ -897,9 +920,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
     // the default rayon pool happens to do on a small CI runner.
     // Chrom needs to cover the extended ref window for the last read
     // (pos=64, 5M, ~p+7 extension); use a generous 128-byte chrom.
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=64)
         .map(|pos| {
             Ok(synthetic_read(
@@ -917,7 +938,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
         .build()
         .unwrap();
     let starts = pool.install(|| {
-        let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+        let stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
         stream
             .map(|r| r.unwrap().alignment_start)
             .collect::<Vec<u32>>()
@@ -927,9 +948,8 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
 
 #[test]
 fn stream_increments_skip_counts_per_reason() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGTACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
         // Capped — happy path.
         Ok(synthetic_read(
@@ -968,7 +988,7 @@ fn stream_increments_skip_counts_per_reason() {
             vec![40; 5],
         )),
     ];
-    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
     let outputs: Vec<_> = (&mut stream).collect();
     assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 2);
     let counts = *stream.skip_counts();
@@ -979,9 +999,7 @@ fn stream_increments_skip_counts_per_reason() {
 
 #[test]
 fn stream_propagates_upstream_error_after_batched_reads() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
         Ok(synthetic_read(
             0,
@@ -994,7 +1012,7 @@ fn stream_propagates_upstream_error_after_batched_reads() {
         Err(CramInputError::NoInputs),
     ];
     let outputs: Vec<_> =
-        BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16).collect();
+        BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16).collect();
     assert_eq!(outputs.len(), 2);
     assert!(outputs[0].is_ok());
     assert!(matches!(outputs[1], Err(CramInputError::NoInputs)));
@@ -1006,9 +1024,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
     // force three chunks where the first two yield only skips. next()
     // must not return None prematurely — it must loop through the
     // refills until it finds the surviving read.
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
         Ok(synthetic_read(
             FLAG_UNMAPPED,
@@ -1035,7 +1051,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
             vec![40; 5],
         )),
     ];
-    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 1);
+    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 1);
     let outputs: Vec<_> = (&mut stream).collect();
     assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 1);
     let counts = *stream.skip_counts();
@@ -1044,9 +1060,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
 
 #[test]
 fn stream_is_fused_after_exhaustion() {
-    let fetcher = MockRefFetcher {
-        chrom: b"ACGTACGT".to_vec(),
-    };
+    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
     let inputs: Vec<Result<MappedRead, CramInputError>> = vec![Ok(synthetic_read(
         0,
         1,
@@ -1055,7 +1069,7 @@ fn stream_is_fused_after_exhaustion() {
         b"ACGTA".to_vec(),
         vec![40; 5],
     ))];
-    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), &fetcher, 16);
+    let mut stream = BaqStream::new(inputs.into_iter(), BaqConfig::default(), fasta_path.clone(), contigs.clone(), 16);
     assert!(stream.next().is_some());
     assert!(stream.next().is_none());
     // Confirmed fused: re-poll yields None.
@@ -1067,11 +1081,12 @@ fn stream_is_fused_after_exhaustion() {
 fn stream_rejects_zero_chunk_size() {
     // M13: zero chunk_size is a programmer error, not a value to be
     // silently coerced.
-    let fetcher = MockRefFetcher { chrom: vec![] };
+    use crate::per_sample_pileup::cram_input::ContigList;
     let _ = BaqStream::new(
         std::iter::empty::<Result<MappedRead, CramInputError>>(),
         BaqConfig::default(),
-        &fetcher,
+        std::path::PathBuf::from("/dev/null"),
+        ContigList { entries: vec![] },
         0,
     );
 }
@@ -1082,9 +1097,7 @@ fn baqstream_is_send() {
     // move a BaqStream across a rayon::scope without a confusing
     // trait-bound error.
     fn assert_send<T: Send>() {}
-    assert_send::<
-        BaqStream<'_, std::vec::IntoIter<Result<MappedRead, CramInputError>>, MockRefFetcher>,
-    >();
+    assert_send::<BaqStream<std::vec::IntoIter<Result<MappedRead, CramInputError>>>>();
 }
 
 #[test]

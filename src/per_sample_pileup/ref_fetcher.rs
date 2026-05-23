@@ -997,23 +997,25 @@ impl RefSeqFetcher for SingleChromLegacyAdapter {
 /// the legacy `RefSeqFetcher` trait so it drops into existing
 /// walker plumbing.
 ///
-/// `Sync` (via `Mutex<Option<...>>`). Step 1 of the migration sized
-/// for the walker, which is single-threaded — but in step 2(c) the
-/// same adapter is shared with Stage 1's parallel BAQ stage, so the
-/// `Sync` requirement is real. Single-thread use sees uncontended
-/// `Mutex` acquisitions (a handful of nanoseconds per fetch);
-/// BAQ-style multi-thread use sees one acquisition per
-/// `engine.process(read, fetcher)` call. Reads within a chunk are
-/// coordinate-sorted, so chrom transitions inside the parallel
-/// section are rare and the swap cost is negligible vs the BAQ
-/// engine's per-read work.
+/// `Sync` via internal `Mutex<Option<...>>`. The walker itself is
+/// single-threaded so the Mutex is uncontended; `var_calling_from_bam`
+/// also uses this adapter and passes it through `Arc<dyn
+/// RefSeqFetcher + Send + Sync>`, so the `Sync` bound is real.
+/// Stage 1's BAQ uses a separate per-rayon-worker
+/// [`ManualEvictChromRefFetcher`] (built inside `BaqStream`'s
+/// `map_init`); BAQ does **not** share a fetcher with the walker
+/// — the access patterns are too different for one abstraction
+/// to serve both.
 ///
 /// Behaviour on chrom transition: the existing inner is dropped
 /// (releasing its sliding buffer), a fresh
 /// [`StreamingChromRefFetcher::for_contig`] is built for the new
-/// chrom (open file + parse .fai), and the call delegates. Open +
-/// fai-parse is paid once per chrom transition; within a chrom every
-/// fetch hits the sliding buffer.
+/// chrom (open file + parse .fai), and the call delegates via the
+/// legacy *tolerant* `RefSeqFetcher::fetch` path (silent backward
+/// refill). The walker doesn't need the strict `OutOfPattern`
+/// contract — its single-thread sequential access pattern doesn't
+/// produce backward jumps in the first place, and tolerating the
+/// rare one is simpler than adding monotonicity to its contract.
 pub struct WalkerLegacyAdapter {
     fasta_path: PathBuf,
     contigs: ContigList,
@@ -1039,10 +1041,7 @@ impl RefSeqFetcher for WalkerLegacyAdapter {
         start_1based: u32,
         length: u32,
     ) -> Result<Vec<u8>, io::Error> {
-        let mut slot = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let needs_rebuild = match slot.as_ref() {
             Some((current, _)) => *current != chrom_id,
             None => true,
@@ -1066,14 +1065,24 @@ impl RefSeqFetcher for WalkerLegacyAdapter {
             *slot = Some((chrom_id, fresh));
         }
         let (_, inner) = slot.as_ref().expect("post-rebuild slot is populated");
-        ChromRefFetcher::fetch(inner, start_1based, length).map_err(legacy_io_error)
+        // Use the legacy *tolerant* `RefSeqFetcher::fetch` on the
+        // inner (silent backward refill), not the new strict
+        // `ChromRefFetcher::fetch` with the `OutOfPattern` check.
+        // The strict contract suits the cohort var-calling path
+        // (monotonic by construction) — see
+        // [`SingleChromLegacyAdapter`], which does call the strict
+        // path. The walker just needs a working multi-chrom fetcher
+        // and doesn't care about the contract.
+        //
+        // The inner's `chrom_id` field is 0 (set by `for_contig`);
+        // the legacy `fetch`'s `chrom_id == self.chrom_id` check
+        // accepts 0.
+        RefSeqFetcher::fetch(inner, 0, start_1based, length)
     }
 
-    // iter_bases falls back to the trait default, which calls
-    // `fetch(chrom_id, 1, length)` and wraps the result in an iter.
-    // The walker doesn't use iter_bases (only DUST / PerGroupMerger
-    // in the var-calling pipeline do), so this default is unused in
-    // practice; defining it explicitly would be dead code.
+    // iter_bases falls back to the trait default. The walker doesn't
+    // use it (only DUST / PerGroupMerger in the var-calling pipeline
+    // do), so defining it explicitly would be dead code.
 }
 
 /// Map [`ChromRefFetchError`] back into the legacy `io::Error`
@@ -1097,6 +1106,376 @@ fn legacy_io_error(e: ChromRefFetchError) -> io::Error {
             e.to_string(),
         ),
     }
+}
+
+// ---------------------------------------------------------------------
+// ManualEvictChromRefFetcher — caller-managed buffer lifecycle.
+// ---------------------------------------------------------------------
+//
+// Designed for consumers whose access pattern is genuinely random
+// access *within a known region* — Stage 1 BAQ is the motivating
+// example. Each rayon worker owns its own instance via `map_init`
+// and processes reads that may visit positions in any order within
+// the current chunk's coord range. The worker calls `evict_before`
+// at deterministic points to keep memory bounded.
+//
+// Contract:
+//
+// - `fetch(start, length)` returns a borrowed `&[u8]` slice. If the
+//   range isn't covered, the buffer extends in whichever direction
+//   is needed — forward by appending fresh bytes, backward by
+//   prepending. Never shrinks on its own.
+// - `evict_before(pos)` is the *only* shrinking operation. The
+//   caller decides when bytes are no longer needed. CRAM is
+//   coordinate-sorted, so calling `evict_before(read.pos)` after
+//   each read keeps the buffer at "current-position window plus
+//   whatever the next read extends forward."
+//
+// Trade-off vs [`StreamingChromRefFetcher`]:
+//
+// - Streaming forces monotonic forward access (small look-back
+//   within the buffer is fine; large backward jumps are
+//   `OutOfPattern`). Good for cohort var-calling.
+// - ManualEvict tolerates any access pattern within the resident
+//   range and trusts the caller to keep memory bounded. Good for
+//   rayon-parallel random-access-within-chunk consumers. Worst case
+//   (no `evict_before` calls + adversarial input) is one whole
+//   contig resident — acceptable because the consumer controls it.
+//
+// Not `Sync`. Each thread holds its own instance; concurrent
+// fetches from multiple threads on a single instance are forbidden.
+// `Send` because every field is `Send`.
+
+/// Reference fetcher with caller-managed buffer lifecycle. See the
+/// module-level section comment above for the contract.
+pub struct ManualEvictChromRefFetcher {
+    contig_name: String,
+    fai: ContigFai,
+    file: File,
+    /// Uppercased, newline-stripped bases currently resident.
+    buf: Vec<u8>,
+    /// 1-based contig coordinate of `buf[0]`. Meaningful only when
+    /// `!buf.is_empty()`; treated as `1` when the buffer is empty.
+    buf_start_base: u32,
+}
+
+impl ManualEvictChromRefFetcher {
+    /// Open the FASTA at `fasta_path`, parse the sibling `.fai`,
+    /// look up `contig_name`, return a fetcher with an empty
+    /// buffer ready to serve `fetch` calls.
+    pub fn for_contig(
+        fasta_path: &Path,
+        contig_name: &str,
+    ) -> Result<Self, ChromRefFetchError> {
+        Self::for_contig_with_fai_path(fasta_path, None, contig_name)
+    }
+
+    /// Variant of [`Self::for_contig`] for non-standard `.fai`
+    /// locations. `None` falls back to `<fasta_path>.fai`.
+    pub fn for_contig_with_fai_path(
+        fasta_path: &Path,
+        fai_path: Option<&Path>,
+        contig_name: &str,
+    ) -> Result<Self, ChromRefFetchError> {
+        let mut fai_pathbuf: OsString;
+        let fai_path_owned: PathBuf;
+        let fai_path_resolved: &Path = match fai_path {
+            Some(p) => p,
+            None => {
+                fai_pathbuf = fasta_path.as_os_str().to_os_string();
+                fai_pathbuf.push(".fai");
+                fai_path_owned = PathBuf::from(fai_pathbuf);
+                &fai_path_owned
+            }
+        };
+        let index = fai::fs::read(fai_path_resolved).map_err(|source| {
+            ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source,
+            }
+        })?;
+        let record = index
+            .as_ref()
+            .iter()
+            .find(|r| AsRef::<[u8]>::as_ref(r.name()) == contig_name.as_bytes())
+            .ok_or_else(|| ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("contig {contig_name} not in FASTA index"),
+                ),
+            })?;
+        let length = u32::try_from(record.length()).map_err(|_| {
+            ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "contig {} length {} exceeds u32::MAX",
+                        contig_name,
+                        record.length()
+                    ),
+                ),
+            }
+        })?;
+        let line_bases = u32::try_from(record.line_bases()).map_err(|_| {
+            ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    ".fai line_bases exceeds u32::MAX",
+                ),
+            }
+        })?;
+        let line_width = u32::try_from(record.line_width()).map_err(|_| {
+            ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    ".fai line_width exceeds u32::MAX",
+                ),
+            }
+        })?;
+        let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
+            contig_name: contig_name.to_string(),
+            source,
+        })?;
+        Ok(Self {
+            contig_name: contig_name.to_string(),
+            fai: ContigFai {
+                seq_offset: record.offset(),
+                length,
+                line_bases,
+                line_width,
+            },
+            file,
+            buf: Vec::new(),
+            buf_start_base: 1,
+        })
+    }
+
+    /// Total bases in the bound contig.
+    pub fn length(&self) -> u32 {
+        self.fai.length
+    }
+
+    /// Return uppercased bases `[start_1based, start_1based+length)`
+    /// as a borrowed slice. If the buffer doesn't cover the
+    /// requested range, extends in whichever direction is needed
+    /// (forward by appending, backward by prepending).
+    pub fn fetch(
+        &mut self,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<&[u8], ChromRefFetchError> {
+        if start_1based == 0 {
+            return Err(ChromRefFetchError::InvalidStart);
+        }
+        let end_exclusive = start_1based.checked_add(length).ok_or_else(|| {
+            ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fetch range overflow",
+                ),
+            }
+        })?;
+        // [start_1based, end_exclusive); valid only if end <= length+1.
+        if end_exclusive.saturating_sub(1) > self.fai.length {
+            return Err(ChromRefFetchError::OutOfBounds {
+                contig_name: self.contig_name.clone(),
+                contig_length: self.fai.length,
+                start: start_1based,
+                end: end_exclusive,
+            });
+        }
+
+        if self.buf.is_empty() {
+            // Empty buffer: read [start, end) from disk fresh.
+            self.read_into_buffer_at(start_1based, length as usize)?;
+            return Ok(&self.buf[..length as usize]);
+        }
+
+        let buf_end_exclusive = self.buf_start_base as u64 + self.buf.len() as u64;
+        let want_start = start_1based as u64;
+        let want_end_exclusive = end_exclusive as u64;
+        let buf_start = self.buf_start_base as u64;
+
+        // Extend forward if requested end exceeds buffer end.
+        if want_end_exclusive > buf_end_exclusive {
+            let extra_bases = (want_end_exclusive - buf_end_exclusive) as usize;
+            self.append_forward(extra_bases)?;
+        }
+        // Extend backward if requested start precedes buffer start.
+        if want_start < buf_start {
+            let extra_bases = (buf_start - want_start) as usize;
+            self.prepend_backward(start_1based, extra_bases)?;
+        }
+
+        let local_start = (start_1based - self.buf_start_base) as usize;
+        let local_end = local_start + length as usize;
+        Ok(&self.buf[local_start..local_end])
+    }
+
+    /// Drop buffer bytes whose 1-based base coordinate is `< pos`.
+    /// Compacts in place; the `Vec`'s capacity is retained so the
+    /// next forward fetch can reuse the freed slots without
+    /// reallocating.
+    ///
+    /// No-op if `pos <= buf_start_base` or the buffer is empty.
+    /// If `pos` would drop the entire buffer, clears it
+    /// (and updates `buf_start_base` to `pos`).
+    pub fn evict_before(&mut self, pos: u32) {
+        if self.buf.is_empty() || pos <= self.buf_start_base {
+            return;
+        }
+        let buf_end_exclusive = self.buf_start_base as u64 + self.buf.len() as u64;
+        if (pos as u64) >= buf_end_exclusive {
+            self.buf.clear();
+            self.buf_start_base = pos;
+            return;
+        }
+        let drop_count = (pos - self.buf_start_base) as usize;
+        // `Vec::drain(..n)` shifts the remainder to the front; the
+        // backing allocation is preserved.
+        self.buf.drain(..drop_count);
+        self.buf_start_base = pos;
+    }
+
+    /// Current resident buffer length in bytes. Test/diagnostic.
+    #[cfg(test)]
+    pub fn buf_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Current 1-based buffer origin. Test/diagnostic.
+    #[cfg(test)]
+    pub fn buf_start_base(&self) -> u32 {
+        self.buf_start_base
+    }
+
+    /// Read `n_bases` uppercased, newline-stripped bases starting
+    /// at 1-based `start` directly into `self.buf` (which is empty
+    /// on entry). Sets `buf_start_base = start`.
+    fn read_into_buffer_at(
+        &mut self,
+        start_1based: u32,
+        n_bases: usize,
+    ) -> Result<(), ChromRefFetchError> {
+        debug_assert!(self.buf.is_empty());
+        let offset = self.fai.base_to_file_offset(start_1based);
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|source| ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source,
+            })?;
+        let remaining = (self.fai.length - start_1based + 1) as usize;
+        let target_len = n_bases.min(remaining);
+        self.buf.reserve(target_len);
+        self.buf_start_base = start_1based;
+        read_uppercased_bases(&mut self.file, &mut self.buf, target_len).map_err(|source| {
+            ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source,
+            }
+        })
+    }
+
+    /// Append `extra_bases` more bases to the end of the buffer by
+    /// reading from disk just past the current end.
+    fn append_forward(&mut self, extra_bases: usize) -> Result<(), ChromRefFetchError> {
+        let next_base = self.buf_start_base + self.buf.len() as u32;
+        let offset = self.fai.base_to_file_offset(next_base);
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|source| ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source,
+            })?;
+        let remaining = (self.fai.length - next_base + 1) as usize;
+        let take = extra_bases.min(remaining);
+        self.buf.reserve(take);
+        read_uppercased_bases(&mut self.file, &mut self.buf, take).map_err(|source| {
+            ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source,
+            }
+        })
+    }
+
+    /// Prepend `extra_bases` bases to the front of the buffer by
+    /// reading from disk at `new_start` and memmove-shifting the
+    /// existing buffer content to make room.
+    fn prepend_backward(
+        &mut self,
+        new_start: u32,
+        extra_bases: usize,
+    ) -> Result<(), ChromRefFetchError> {
+        debug_assert!(new_start < self.buf_start_base);
+        debug_assert_eq!(
+            (self.buf_start_base - new_start) as usize,
+            extra_bases,
+        );
+
+        // Build the prefix bytes in a scratch Vec, then splice into
+        // the front of `self.buf`. `Vec::splice` does the memmove
+        // for us and reuses capacity when possible.
+        let offset = self.fai.base_to_file_offset(new_start);
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|source| ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source,
+            })?;
+        let mut prefix = Vec::with_capacity(extra_bases);
+        read_uppercased_bases(&mut self.file, &mut prefix, extra_bases).map_err(|source| {
+            ChromRefFetchError::Io {
+                contig_name: self.contig_name.clone(),
+                source,
+            }
+        })?;
+        self.buf.splice(..0, prefix);
+        self.buf_start_base = new_start;
+        Ok(())
+    }
+}
+
+/// Read `n_bases` uppercased, newline-stripped bases from `reader`
+/// (currently positioned at the file offset for those bases) and
+/// append them to `dst`. Returns an `UnexpectedEof` if the source
+/// runs out before `n_bases` bases are gathered. Shared by both
+/// streaming and manual-evict fetchers.
+fn read_uppercased_bases(
+    reader: &mut File,
+    dst: &mut Vec<u8>,
+    n_bases: usize,
+) -> io::Result<()> {
+    let want_total = dst.len() + n_bases;
+    let mut read_buf = [0u8; STREAMING_REF_FILE_READ_CHUNK];
+    while dst.len() < want_total {
+        let n = reader.read(&mut read_buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "FASTA ended with {} base(s) still expected (want_total {})",
+                    want_total - dst.len(),
+                    want_total,
+                ),
+            ));
+        }
+        for &b in &read_buf[..n] {
+            if dst.len() >= want_total {
+                break;
+            }
+            if b == b'\n' || b == b'\r' {
+                continue;
+            }
+            dst.push(b.to_ascii_uppercase());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1802,5 +2181,184 @@ mod tests {
         // start_1based == 0 → InvalidInput.
         let err = RefSeqFetcher::fetch(&adapter, 0, 0, 1).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // ---------------------------------------------------------------
+    // ManualEvictChromRefFetcher tests
+    // ---------------------------------------------------------------
+
+    /// Helper for `ManualEvictChromRefFetcher` tests: build a small
+    /// line-wrapped FASTA on disk with one contig of arbitrary bytes
+    /// (already SAM-spec uppercase ACGT/N) and return a fetcher
+    /// pointing at it plus the tempdir guard.
+    fn manual_evict_fetcher_from_bytes(
+        seq: &[u8],
+        line_bases: usize,
+    ) -> (tempfile::TempDir, ManualEvictChromRefFetcher) {
+        let (dir, path) = build_line_wrapped_fasta("chr0", seq, line_bases);
+        let fetcher =
+            ManualEvictChromRefFetcher::for_contig(&path, "chr0").expect("manual-evict fetcher");
+        (dir, fetcher)
+    }
+
+    #[test]
+    fn manual_evict_fetch_grows_buffer_forward() {
+        // Two forward fetches at increasing positions. The buffer
+        // grows to cover the union of the two ranges; no eviction.
+        let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 60);
+
+        let first = fetcher.fetch(10, 8).expect("forward 1").to_vec();
+        assert_eq!(first, &seq[9..17]);
+        assert_eq!(fetcher.buf_start_base(), 10);
+        let len_after_first = fetcher.buf_len();
+        assert!(len_after_first >= 8);
+
+        let second = fetcher.fetch(80, 8).expect("forward 2").to_vec();
+        assert_eq!(second, &seq[79..87]);
+        // Buffer grew forward to cover up to base 87.
+        assert!(fetcher.buf_len() >= 87 - 10 + 1 - 1);
+        // Buffer origin unchanged (no eviction).
+        assert_eq!(fetcher.buf_start_base(), 10);
+    }
+
+    #[test]
+    fn manual_evict_fetch_grows_buffer_backward() {
+        // Fetch at a high position first, then at a lower position.
+        // The buffer must prepend bytes to cover the lower range.
+        let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 60);
+
+        let high = fetcher.fetch(120, 8).expect("high").to_vec();
+        assert_eq!(high, &seq[119..127]);
+        assert_eq!(fetcher.buf_start_base(), 120);
+
+        let low = fetcher.fetch(20, 8).expect("low").to_vec();
+        assert_eq!(low, &seq[19..27]);
+        // Buffer origin moved backward to 20.
+        assert_eq!(fetcher.buf_start_base(), 20);
+        // And still covers the high range (no eviction).
+        assert!(fetcher.buf_len() >= 127 - 20 + 1 - 1);
+    }
+
+    #[test]
+    fn manual_evict_evict_before_compacts_buffer() {
+        // After a few forward fetches the buffer covers a wide
+        // range. `evict_before` drops bytes before the given
+        // coordinate and updates `buf_start_base`.
+        let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 60);
+
+        let _ = fetcher.fetch(10, 8).expect("fetch 1");
+        let _ = fetcher.fetch(120, 8).expect("fetch 2");
+        let before_evict = fetcher.buf_len();
+
+        fetcher.evict_before(100);
+        assert_eq!(fetcher.buf_start_base(), 100);
+        // Buffer length shrank by 90 (bases 10..99 dropped).
+        assert_eq!(before_evict - fetcher.buf_len(), 90);
+
+        // Subsequent fetch in the retained range still works.
+        let bytes = fetcher.fetch(120, 8).expect("post-evict fetch");
+        assert_eq!(bytes, &seq[119..127]);
+    }
+
+    #[test]
+    fn manual_evict_evict_before_below_origin_is_noop() {
+        // `evict_before(pos)` when pos <= buf_start_base must not
+        // touch the buffer (no negative drain).
+        let seq: Vec<u8> = (0..50).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 50);
+
+        let _ = fetcher.fetch(20, 8).expect("fetch");
+        let origin = fetcher.buf_start_base();
+        let len_before = fetcher.buf_len();
+
+        fetcher.evict_before(origin);
+        assert_eq!(fetcher.buf_start_base(), origin);
+        assert_eq!(fetcher.buf_len(), len_before);
+
+        fetcher.evict_before(origin - 1);
+        assert_eq!(fetcher.buf_start_base(), origin);
+        assert_eq!(fetcher.buf_len(), len_before);
+    }
+
+    #[test]
+    fn manual_evict_evict_before_past_end_clears_buffer() {
+        // Edge case: evict_before pointing past the buffer's end
+        // clears the buffer entirely and pins `buf_start_base` to
+        // the evict point.
+        let seq: Vec<u8> = (0..50).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 50);
+
+        let _ = fetcher.fetch(10, 8).expect("fetch");
+
+        fetcher.evict_before(40);
+        assert_eq!(fetcher.buf_len(), 0);
+        assert_eq!(fetcher.buf_start_base(), 40);
+
+        // Fresh fetch after the buffer was cleared.
+        let bytes = fetcher.fetch(40, 8).expect("post-clear fetch");
+        assert_eq!(bytes, &seq[39..47]);
+    }
+
+    #[test]
+    fn manual_evict_fetch_uppercases_soft_masked() {
+        // Soft-masked input → uppercased output, same as the other
+        // fetchers.
+        let seq = b"ACGTacgtNn".to_vec();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 10);
+        let bytes = fetcher.fetch(1, seq.len() as u32).expect("fetch");
+        assert_eq!(bytes, b"ACGTACGTNN");
+    }
+
+    #[test]
+    fn manual_evict_fetch_past_contig_end_returns_out_of_bounds() {
+        let seq = b"ACGTACGT".to_vec();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 8);
+
+        let err = fetcher.fetch(6, 5).expect_err("must fail");
+        match err {
+            ChromRefFetchError::OutOfBounds { .. } => {}
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_evict_fetch_start_zero_is_rejected() {
+        let seq = b"ACGT".to_vec();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 4);
+        let err = fetcher.fetch(0, 1).expect_err("must fail");
+        match err {
+            ChromRefFetchError::InvalidStart => {}
+            other => panic!("expected InvalidStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_evict_full_lifecycle_simulates_baq_chunk_flow() {
+        // Simulate the BAQ access pattern: a "chunk" of reads at
+        // positions 10..50, processed in pseudo-random order (rayon
+        // work-stealing would scramble them similarly). The
+        // fetcher's buffer grows to cover the chunk's range; after
+        // each "read" we call evict_before. End state: buffer ≤
+        // chunk_max - chunk_min in size.
+        let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 60);
+
+        // Out-of-order reads in [10..=50].
+        let read_positions = [30u32, 50, 12, 40, 22, 18, 48];
+
+        for pos in read_positions {
+            let bytes = fetcher.fetch(pos, 6).expect("fetch").to_vec();
+            assert_eq!(bytes, &seq[(pos - 1) as usize..(pos - 1 + 6) as usize]);
+            fetcher.evict_before(pos);
+        }
+
+        // After the full chunk: buffer origin advanced to the last
+        // evicted position (48), buffer holds at most a small
+        // window.
+        assert_eq!(fetcher.buf_start_base(), 48);
+        assert!(fetcher.buf_len() <= 8);
     }
 }
