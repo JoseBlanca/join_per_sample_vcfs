@@ -137,6 +137,41 @@ struct ContigFai {
 }
 
 impl ContigFai {
+    /// Validate a parsed `.fai` record. The noodles parser accepts
+    /// values that would crash the byte-offset math:
+    ///
+    /// - `line_bases = 0` → `base_to_file_offset` divides by zero.
+    /// - `line_width < line_bases` → wrong file offsets (the trailing
+    ///   newline can't have negative width).
+    /// - `line_width = 0` (with non-zero `line_bases`) is rejected by
+    ///   the first check above transitively.
+    ///
+    /// B1 of the 2026-05-23 code review: the `--reference` path is
+    /// attacker-influenced; this validation guards every constructor
+    /// from a panic-on-construction surface.
+    fn validate(&self, contig_name: &str) -> Result<(), io::Error> {
+        if self.line_bases == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "malformed .fai for contig {contig_name}: line_bases = 0 \
+                     (would divide-by-zero in offset arithmetic)"
+                ),
+            ));
+        }
+        if self.line_width < self.line_bases {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "malformed .fai for contig {contig_name}: line_width ({}) \
+                     < line_bases ({}) — line_width must include the trailing newline",
+                    self.line_width, self.line_bases,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// File-byte offset of the (1-based) base coordinate `b`.
     fn base_to_file_offset(&self, b: u32) -> u64 {
         let zero_based = (b - 1) as u64;
@@ -228,16 +263,20 @@ impl StreamingChromRefFetcher {
                 ".fai line_width exceeds u32::MAX",
             )
         })?;
+        let fai = ContigFai {
+            seq_offset: record.offset(),
+            length,
+            line_bases,
+            line_width,
+        };
+        // B1: reject malformed .fai (line_bases = 0, etc.) before
+        // any fetch can panic on the offset arithmetic.
+        fai.validate(&contig_name)?;
         let file = File::open(fasta_path)?;
         Ok(Self {
             chrom_id,
             contig_name,
-            fai: ContigFai {
-                seq_offset: record.offset(),
-                length,
-                line_bases,
-                line_width,
-            },
+            fai,
             inner: RefCell::new(StreamState {
                 source: Source::File(file),
                 buf: Vec::with_capacity(STREAMING_REF_BUFFER_BYTES),
@@ -736,6 +775,19 @@ impl StreamingChromRefFetcher {
                     ".fai line_width exceeds u32::MAX",
                 ),
             })?;
+        let fai = ContigFai {
+            seq_offset: record.offset(),
+            length,
+            line_bases,
+            line_width,
+        };
+        // B1: reject malformed .fai (line_bases = 0, etc.) before
+        // any fetch can panic on the offset arithmetic.
+        fai.validate(contig_name)
+            .map_err(|source| ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source,
+            })?;
         let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
             contig_name: contig_name.to_string(),
             source,
@@ -743,12 +795,7 @@ impl StreamingChromRefFetcher {
         Ok(Self {
             chrom_id: 0, // unused under the new API
             contig_name: contig_name.to_string(),
-            fai: ContigFai {
-                seq_offset: record.offset(),
-                length,
-                line_bases,
-                line_width,
-            },
+            fai,
             inner: RefCell::new(StreamState {
                 source: Source::File(file),
                 buf: Vec::with_capacity(buffer_bytes),
@@ -1149,18 +1196,26 @@ impl ManualEvictChromRefFetcher {
                     ".fai line_width exceeds u32::MAX",
                 ),
             })?;
+        let fai = ContigFai {
+            seq_offset: record.offset(),
+            length,
+            line_bases,
+            line_width,
+        };
+        // B1: reject malformed .fai (line_bases = 0, etc.) before
+        // any fetch can panic on the offset arithmetic.
+        fai.validate(contig_name)
+            .map_err(|source| ChromRefFetchError::Io {
+                contig_name: contig_name.to_string(),
+                source,
+            })?;
         let file = File::open(fasta_path).map_err(|source| ChromRefFetchError::Io {
             contig_name: contig_name.to_string(),
             source,
         })?;
         Ok(Self {
             contig_name: contig_name.to_string(),
-            fai: ContigFai {
-                seq_offset: record.offset(),
-                length,
-                line_bases,
-                line_width,
-            },
+            fai,
             file,
             buf: Vec::new(),
             buf_start_base: 1,
@@ -2178,5 +2233,84 @@ mod tests {
         // window.
         assert_eq!(fetcher.buf_start_base(), 48);
         assert!(fetcher.buf_len() <= 8);
+    }
+
+    // ---------------------------------------------------------------
+    // B1 (2026-05-23 code review): .fai validation tests
+    // ---------------------------------------------------------------
+    //
+    // The .fai file format permits attacker-influenced values
+    // (noodles_fasta::fai::Record parses without validating
+    // `line_bases > 0` or `line_width >= line_bases`). The
+    // `--reference` CLI argument is a real attacker surface.
+    // Pre-B1 a malformed .fai with `line_bases = 0` would parse,
+    // and the first `fetch` call would panic inside
+    // ContigFai::base_to_file_offset on integer division by zero.
+
+    /// Write `<fa>` and `<fai>` with caller-supplied .fai fields.
+    /// Used to inject malformed .fai values that the noodles
+    /// parser accepts but that the fetcher should reject.
+    fn write_fixture_with_fai_line(
+        contig_name: &str,
+        contig_seq_len: u64,
+        seq_offset: u64,
+        line_bases: u64,
+        line_width: u64,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fa_path = dir.path().join("ref.fa");
+        let fai_path = dir.path().join("ref.fa.fai");
+        // The .fa is mostly placeholder; the validation under
+        // test fires at construction time (before any read).
+        let mut fa = StdFile::create(&fa_path).expect("fa");
+        write!(fa, ">{contig_name}\n").expect("fa header");
+        fa.write_all(&vec![b'A'; contig_seq_len as usize])
+            .expect("fa seq");
+        fa.write_all(b"\n").expect("fa nl");
+        let mut fai = StdFile::create(&fai_path).expect("fai");
+        writeln!(
+            fai,
+            "{contig_name}\t{contig_seq_len}\t{seq_offset}\t{line_bases}\t{line_width}"
+        )
+        .expect("fai entry");
+        (dir, fa_path)
+    }
+
+    #[test]
+    fn streaming_for_contig_returns_io_error_on_zero_line_bases() {
+        let (_dir, fa_path) =
+            write_fixture_with_fai_line("chr0", 10, b">chr0\n".len() as u64, 0, 0);
+        let result = StreamingChromRefFetcher::for_contig(&fa_path, "chr0");
+        match result {
+            Ok(_) => panic!("expected Io error, got Ok"),
+            Err(ChromRefFetchError::Io { .. }) => {}
+            Err(other) => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_for_contig_returns_io_error_on_line_width_less_than_line_bases() {
+        // line_bases=10 line_width=5 — line_width must be >= line_bases
+        // (line_width includes the trailing newline).
+        let (_dir, fa_path) =
+            write_fixture_with_fai_line("chr0", 100, b">chr0\n".len() as u64, 10, 5);
+        let result = StreamingChromRefFetcher::for_contig(&fa_path, "chr0");
+        match result {
+            Ok(_) => panic!("expected Io error, got Ok"),
+            Err(ChromRefFetchError::Io { .. }) => {}
+            Err(other) => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_evict_for_contig_returns_io_error_on_zero_line_bases() {
+        let (_dir, fa_path) =
+            write_fixture_with_fai_line("chr0", 10, b">chr0\n".len() as u64, 0, 0);
+        let result = ManualEvictChromRefFetcher::for_contig(&fa_path, "chr0");
+        match result {
+            Ok(_) => panic!("expected Io error, got Ok"),
+            Err(ChromRefFetchError::Io { .. }) => {}
+            Err(other) => panic!("expected Io error, got {other:?}"),
+        }
     }
 }
