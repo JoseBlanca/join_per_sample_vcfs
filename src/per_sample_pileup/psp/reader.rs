@@ -29,8 +29,9 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use super::block::{
-    BlockHeader, ColumnManifestEntry, decode_block_header, decode_bytes_split, decode_list_column,
-    decode_scalar_column_pod, decode_varint_column, new_column_decompressor, zstd_decompress_into,
+    BlockHeader, ColumnManifestEntry, decode_block_header, decode_bytes_split_csr,
+    decode_list_column_csr, decode_scalar_column_pod, decode_varint_column,
+    new_column_decompressor, zstd_decompress_into,
 };
 use super::errors::{BlockHeaderInvariantKind, PspReadError, ScalarDecodeError};
 use super::header::{
@@ -420,6 +421,15 @@ fn find_first_overlapping_block(
 /// Materialised columns for one decoded block. Constructed by
 /// [`RecordsIter::load_next_block`]; consumed record-by-record by
 /// [`RecordsIter::next`].
+///
+/// H1 (2026-05-23 PSP reader perf review): the two ragged columns
+/// (`allele-seq` bytes + `allele-chain-ids` lists) used to live here
+/// as `Vec<Vec<u8>>` / `Vec<Vec<ChainId>>`, allocating one inner
+/// `Vec` per allele on every block decode. They now live on
+/// [`RecordsIter`] as CSR `(data, offsets)` pairs that are reused
+/// across blocks — those per-allele allocations collapse to two
+/// per-block `extend_from_slice` calls. The block holds only the
+/// per-record columns and the per-allele fixed-width columns.
 #[derive(Debug)]
 struct DecodedBlock {
     chrom_id: u32,
@@ -428,8 +438,7 @@ struct DecodedBlock {
     // Per-record columns
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
-    // Per-allele columns
-    allele_seqs: Vec<Vec<u8>>,
+    // Per-allele fixed-width columns
     allele_obs_count: Vec<u32>,
     allele_q_sum_log: Vec<f64>,
     allele_fwd_count: Vec<u32>,
@@ -437,7 +446,8 @@ struct DecodedBlock {
     allele_placed_start_count: Vec<u32>,
     allele_mapq_sum: Vec<u32>,
     allele_mapq_sum_sq: Vec<u64>,
-    allele_chain_ids: Vec<Vec<ChainId>>,
+    // (the two ragged columns — allele_seqs + allele_chain_ids —
+    // live on RecordsIter; see the H1 doc comment above.)
 }
 
 /// Region-iteration window. `None` for sequential iteration
@@ -539,6 +549,24 @@ pub struct RecordsIter<'r, R: Read + Seek> {
     /// loop. One Vec per `RecordsIter` instead of one per
     /// `read_block_header` call.
     block_header_buf: Vec<u8>,
+    /// H1: CSR data slab for the `allele-seq` bytes column. Used to
+    /// be `DecodedBlock.allele_seqs: Vec<Vec<u8>>` (one inner Vec per
+    /// allele, allocated per block). Now: one `Vec<u8>` reused
+    /// across blocks via `extend_from_slice` of the whole column
+    /// payload at decode time. Capacity converges to the largest
+    /// allele-seq column the iterator has seen.
+    allele_seq_data: Vec<u8>,
+    /// H1: CSR row offsets for `allele-seq`. `allele_seq_offsets[j]`
+    /// is the start of allele `j`'s bytes in `allele_seq_data`;
+    /// `allele_seq_offsets[j+1]` is its end (exclusive).
+    /// `offsets.len() == n_total_alleles_in_block + 1`.
+    allele_seq_offsets: Vec<u32>,
+    /// H1: CSR data slab for the `allele-chain-ids` list column.
+    /// Mirror of [`Self::allele_seq_data`] for the ChainId payload.
+    allele_chain_ids_data: Vec<ChainId>,
+    /// H1: CSR row offsets for `allele-chain-ids`. Same shape as
+    /// [`Self::allele_seq_offsets`].
+    allele_chain_ids_offsets: Vec<u32>,
 }
 
 impl<'r, R: Read + Seek> RecordsIter<'r, R> {
@@ -566,6 +594,10 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             compressed_scratch: Vec::new(),
             decompressed_scratch: Vec::new(),
             block_header_buf: Vec::with_capacity(BLOCK_HEADER_INITIAL_CHUNK),
+            allele_seq_data: Vec::new(),
+            allele_seq_offsets: Vec::new(),
+            allele_chain_ids_data: Vec::new(),
+            allele_chain_ids_offsets: Vec::new(),
         }
     }
 
@@ -597,6 +629,10 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
             &mut self.decompressor,
             &mut self.compressed_scratch,
             &mut self.decompressed_scratch,
+            &mut self.allele_seq_data,
+            &mut self.allele_seq_offsets,
+            &mut self.allele_chain_ids_data,
+            &mut self.allele_chain_ids_offsets,
         )?;
         self.cur_block = Some(decoded);
         self.next_record_in_block = 0;
@@ -659,14 +695,41 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
         let allele_start = self.next_allele_in_block as usize;
         let allele_end = allele_start + n_alleles_here;
 
-        // M13: emission. Move ownership of the inner Vecs out of
-        // `block` rather than cloning each one. The block is dead
-        // for these indices the moment we return — see the
-        // function docstring for the forwards-only argument.
+        // H3 (2026-05-23 PSP reader perf review): leading asserts
+        // hoist the per-allele bounds checks out of the inner loop.
+        // The compiler can't share a bounds proof across the disjoint
+        // per-allele `Vec`s otherwise. PANIC-FREE in practice — B3
+        // in `decode_block_payload` already enforces
+        // `sum(n_alleles[i]) == n_total_alleles`, and `CHECK 7` /
+        // `predict_fixed_uncompressed_len` enforce each column's
+        // length equals `n_total_alleles`. The asserts are dead
+        // code on well-formed input but the dominator gives LLVM
+        // the bounds-proof it needs.
+        assert!(allele_end <= block.allele_obs_count.len());
+        assert!(allele_end <= block.allele_q_sum_log.len());
+        assert!(allele_end <= block.allele_fwd_count.len());
+        assert!(allele_end <= block.allele_placed_left_count.len());
+        assert!(allele_end <= block.allele_placed_start_count.len());
+        assert!(allele_end <= block.allele_mapq_sum.len());
+        assert!(allele_end <= block.allele_mapq_sum_sq.len());
+        // The CSR offset arrays have `n_total_alleles + 1` entries,
+        // so `allele_end` indexes the closing offset of the last
+        // emitted allele.
+        assert!(allele_end < self.allele_seq_offsets.len());
+        assert!(allele_end < self.allele_chain_ids_offsets.len());
+
+        // H1: slice from the iter-owned CSR data + offsets (`data`
+        // is reused across blocks; `to_vec()` here is the single
+        // remaining alloc per emitted allele). Replaces the previous
+        // `mem::take(&mut block.allele_seqs[j])` shape.
         let mut alleles = Vec::with_capacity(n_alleles_here);
         for j in allele_start..allele_end {
+            let seq_s = self.allele_seq_offsets[j] as usize;
+            let seq_e = self.allele_seq_offsets[j + 1] as usize;
+            let cid_s = self.allele_chain_ids_offsets[j] as usize;
+            let cid_e = self.allele_chain_ids_offsets[j + 1] as usize;
             alleles.push(AlleleObservation {
-                seq: std::mem::take(&mut block.allele_seqs[j]),
+                seq: self.allele_seq_data[seq_s..seq_e].to_vec(),
                 support: AlleleSupportStats {
                     num_obs: block.allele_obs_count[j],
                     q_sum: block.allele_q_sum_log[j],
@@ -676,7 +739,7 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
                     mapq_sum: block.allele_mapq_sum[j],
                     mapq_sum_sq: block.allele_mapq_sum_sq[j],
                 },
-                chain_ids: std::mem::take(&mut block.allele_chain_ids[j]),
+                chain_ids: self.allele_chain_ids_data[cid_s..cid_e].to_vec(),
             });
         }
 
@@ -851,6 +914,9 @@ fn read_block_header<R: Read + Seek>(
 /// `decompressor`, `compressed_scratch`, `decompressed_scratch` are
 /// `RecordsIter`-owned buffers reused across every column of every
 /// block. L1 / L2 in `ia/reviews/perf_psp_reader_2026-05-13.md`.
+// H1: four extra scratch buffers for the CSR ragged columns. Owned
+// by the caller (`RecordsIter`); reused across blocks.
+#[allow(clippy::too_many_arguments)]
 fn decode_block_payload<R: Read>(
     source: &mut R,
     header: &BlockHeader,
@@ -858,6 +924,10 @@ fn decode_block_payload<R: Read>(
     decompressor: &mut zstd::bulk::Decompressor<'static>,
     compressed_scratch: &mut Vec<u8>,
     decompressed_scratch: &mut Vec<u8>,
+    allele_seq_data: &mut Vec<u8>,
+    allele_seq_offsets: &mut Vec<u32>,
+    allele_chain_ids_data: &mut Vec<ChainId>,
+    allele_chain_ids_offsets: &mut Vec<u32>,
 ) -> Result<DecodedBlock, PspReadError> {
     // B1: coverage check. Every v1.0 required tag must appear in
     // the per-block manifest. Symmetric with the file-level TOML
@@ -885,7 +955,6 @@ fn decode_block_payload<R: Read>(
 
     // Per-allele slots.
     let mut allele_seq_len: Option<Vec<u64>> = None;
-    let mut allele_seqs: Option<Vec<Vec<u8>>> = None;
     let mut allele_obs_count: Option<Vec<u32>> = None;
     let mut allele_q_sum_log: Option<Vec<f64>> = None;
     let mut allele_fwd_count: Option<Vec<u32>> = None;
@@ -893,7 +962,10 @@ fn decode_block_payload<R: Read>(
     let mut allele_placed_start_count: Option<Vec<u32>> = None;
     let mut allele_mapq_sum: Option<Vec<u32>> = None;
     let mut allele_mapq_sum_sq: Option<Vec<u64>> = None;
-    let mut allele_chain_ids: Option<Vec<Vec<ChainId>>> = None;
+    // H1: allele-seq + allele-chain-ids slots dropped — the CSR
+    // data + offsets are written into the caller's `allele_seq_*` /
+    // `allele_chain_ids_*` buffers by `decode_one_column`. B1's
+    // manifest-coverage check above guarantees those columns fire.
 
     let mut remaining_budget = byte_budget;
     for entry in &header.manifest {
@@ -907,6 +979,10 @@ fn decode_block_payload<R: Read>(
             decompressor,
             compressed_scratch,
             decompressed_scratch,
+            allele_seq_data,
+            allele_seq_offsets,
+            allele_chain_ids_data,
+            allele_chain_ids_offsets,
         )?;
         remaining_budget = remaining_budget.saturating_sub(entry.compressed_len as u64);
         // M10: `decode_one_column` returns `None` for an unknown
@@ -944,7 +1020,11 @@ fn decode_block_payload<R: Read>(
             DecodedColumn::DeltaPos(v) => delta_pos = Some(v),
             DecodedColumn::NAlleles(v) => n_alleles = Some(v),
             DecodedColumn::AlleleSeqLen(v) => allele_seq_len = Some(v),
-            DecodedColumn::AlleleSeq(v) => allele_seqs = Some(v),
+            // H1: unit variants — payload landed in the caller's
+            // CSR scratches inside `decode_one_column`. Nothing to
+            // capture here; B1 above guarantees these arms fire on
+            // any well-formed v1.0 block.
+            DecodedColumn::AlleleSeq | DecodedColumn::AlleleChainIds => {}
             DecodedColumn::AlleleObsCount(v) => allele_obs_count = Some(v),
             DecodedColumn::AlleleQSumLog(v) => allele_q_sum_log = Some(v),
             DecodedColumn::AlleleFwdCount(v) => allele_fwd_count = Some(v),
@@ -952,7 +1032,6 @@ fn decode_block_payload<R: Read>(
             DecodedColumn::AllelePlacedStartCount(v) => allele_placed_start_count = Some(v),
             DecodedColumn::AlleleMapqSum(v) => allele_mapq_sum = Some(v),
             DecodedColumn::AlleleMapqSumSq(v) => allele_mapq_sum_sq = Some(v),
-            DecodedColumn::AlleleChainIds(v) => allele_chain_ids = Some(v),
         }
     }
 
@@ -985,7 +1064,6 @@ fn decode_block_payload<R: Read>(
         n_records: header.n_records,
         delta_pos: delta_pos.expect("delta-pos column required by v1.0 schema"),
         n_alleles,
-        allele_seqs: allele_seqs.expect("allele-seq column required by v1.0 schema"),
         allele_obs_count: allele_obs_count
             .expect("allele-obs-count column required by v1.0 schema"),
         allele_q_sum_log: allele_q_sum_log
@@ -1000,8 +1078,6 @@ fn decode_block_payload<R: Read>(
             .expect("allele-mapq-sum column required by v1.0 schema"),
         allele_mapq_sum_sq: allele_mapq_sum_sq
             .expect("allele-mapq-sum-sq column required by v1.0 schema"),
-        allele_chain_ids: allele_chain_ids
-            .expect("allele-chain-ids column required by v1.0 schema"),
     })
 }
 
@@ -1015,7 +1091,12 @@ enum DecodedColumn {
     DeltaPos(Vec<u64>),
     NAlleles(Vec<u64>),
     AlleleSeqLen(Vec<u64>),
-    AlleleSeq(Vec<Vec<u8>>),
+    /// H1 (2026-05-23): unit variant — the CSR `data` + `offsets`
+    /// were written through the caller's `allele_seq_*` `&mut Vec`
+    /// parameters during decode, not returned here. The dispatcher
+    /// just needs to know "AlleleSeq fired" so the per-block
+    /// manifest-coverage tracker can mark the slot as covered.
+    AlleleSeq,
     AlleleObsCount(Vec<u32>),
     AlleleQSumLog(Vec<f64>),
     AlleleFwdCount(Vec<u32>),
@@ -1023,7 +1104,9 @@ enum DecodedColumn {
     AllelePlacedStartCount(Vec<u32>),
     AlleleMapqSum(Vec<u32>),
     AlleleMapqSumSq(Vec<u64>),
-    AlleleChainIds(Vec<Vec<ChainId>>),
+    /// H1: unit variant — same shape as [`Self::AlleleSeq`] but for
+    /// the chain-ids list column.
+    AlleleChainIds,
 }
 
 /// Read + decompress + decode one column. `allele_seq_len` is
@@ -1042,11 +1125,13 @@ enum DecodedColumn {
 /// payload). M10: no `Unknown` escape hatch — the absence of a
 /// catch-all variant means a new `ColumnKey` forces both a new
 /// arm here *and* a new `DecodedColumn` variant.
-// L1 + L2: nine arguments because the persistent decompressor and the
-// two scratch buffers thread through to the per-column read +
-// decompress site. Bundling them would add a `ReaderScratch` struct
-// that exists only for this call shape; the line-noise from the extra
-// indirection is worse than the warning.
+// L1 + L2 + H1: thirteen arguments because the persistent
+// decompressor, the two compressed/decompressed scratches, and the
+// four CSR scratches (data + offsets for the two ragged columns)
+// thread through to the per-column read + decompress site.
+// Bundling them would add a `ReaderScratch` struct that exists only
+// for this call shape; the line-noise from the extra indirection is
+// worse than the warning.
 #[allow(clippy::too_many_arguments)]
 fn decode_one_column<R: Read>(
     source: &mut R,
@@ -1058,6 +1143,10 @@ fn decode_one_column<R: Read>(
     decompressor: &mut zstd::bulk::Decompressor<'static>,
     compressed_scratch: &mut Vec<u8>,
     decompressed_scratch: &mut Vec<u8>,
+    allele_seq_data: &mut Vec<u8>,
+    allele_seq_offsets: &mut Vec<u32>,
+    allele_chain_ids_data: &mut Vec<ChainId>,
+    allele_chain_ids_offsets: &mut Vec<u32>,
 ) -> Result<Option<DecodedColumn>, PspReadError> {
     // B2: reject `compressed_len` exceeding the block's remaining
     // byte budget before allocating. Catches the
@@ -1178,12 +1267,18 @@ fn decode_one_column<R: Read>(
             let lens = allele_seq_len.expect(
                 "allele-seq-len decoded before allele-seq per manifest tag-ascending order",
             );
-            DecodedColumn::AlleleSeq(decode_bytes_split(
+            // H1: write the CSR data + offsets into the caller-
+            // supplied scratch buffers instead of allocating one
+            // `Vec<u8>` per allele.
+            decode_bytes_split_csr(
                 bytes,
                 lens,
                 column_name,
                 Some(MAX_ALLELE_SEQ_LEN),
-            )?)
+                allele_seq_data,
+                allele_seq_offsets,
+            )?;
+            DecodedColumn::AlleleSeq
         }
         ColumnKey::AlleleObsCount => DecodedColumn::AlleleObsCount(
             decode_scalar_column_pod::<u32>(bytes, n_total_alleles, column_name)?,
@@ -1208,11 +1303,19 @@ fn decode_one_column<R: Read>(
         ColumnKey::AlleleMapqSumSq => DecodedColumn::AlleleMapqSumSq(
             decode_scalar_column_pod::<u64>(bytes, n_total_alleles, column_name)?,
         ),
-        ColumnKey::AlleleChainIds => DecodedColumn::AlleleChainIds(decode_list_column::<ChainId>(
-            bytes,
-            n_total_alleles,
-            column_name,
-        )?),
+        ColumnKey::AlleleChainIds => {
+            // H1: write the CSR data + offsets into the caller-
+            // supplied scratch buffers instead of allocating one
+            // `Vec<ChainId>` per allele.
+            decode_list_column_csr::<ChainId>(
+                bytes,
+                n_total_alleles,
+                column_name,
+                allele_chain_ids_data,
+                allele_chain_ids_offsets,
+            )?;
+            DecodedColumn::AlleleChainIds
+        }
     };
     Ok(Some(decoded))
 }
@@ -2058,6 +2161,10 @@ mod tests {
         let mut decompressor = new_column_decompressor().unwrap();
         let mut compressed = Vec::new();
         let mut decompressed = Vec::new();
+        let mut allele_seq_data = Vec::new();
+        let mut allele_seq_offsets = Vec::new();
+        let mut allele_chain_ids_data = Vec::new();
+        let mut allele_chain_ids_offsets = Vec::new();
         let err = decode_block_payload(
             &mut src,
             &header,
@@ -2065,6 +2172,10 @@ mod tests {
             &mut decompressor,
             &mut compressed,
             &mut decompressed,
+            &mut allele_seq_data,
+            &mut allele_seq_offsets,
+            &mut allele_chain_ids_data,
+            &mut allele_chain_ids_offsets,
         )
         .unwrap_err();
         match err {
@@ -2133,6 +2244,10 @@ mod tests {
             let mut decompressor = new_column_decompressor().unwrap();
             let mut compressed = Vec::new();
             let mut decompressed = Vec::new();
+            let mut allele_seq_data = Vec::new();
+            let mut allele_seq_offsets = Vec::new();
+            let mut allele_chain_ids_data = Vec::new();
+            let mut allele_chain_ids_offsets = Vec::new();
             let err = decode_block_payload(
                 &mut src,
                 &header,
@@ -2140,6 +2255,10 @@ mod tests {
                 &mut decompressor,
                 &mut compressed,
                 &mut decompressed,
+                &mut allele_seq_data,
+                &mut allele_seq_offsets,
+                &mut allele_chain_ids_data,
+                &mut allele_chain_ids_offsets,
             )
             .unwrap_err();
             match err {
@@ -2178,6 +2297,10 @@ mod tests {
         let mut decompressor = new_column_decompressor().unwrap();
         let mut compressed = Vec::new();
         let mut decompressed = Vec::new();
+        let mut allele_seq_data = Vec::new();
+        let mut allele_seq_offsets = Vec::new();
+        let mut allele_chain_ids_data = Vec::new();
+        let mut allele_chain_ids_offsets = Vec::new();
         let err = decode_one_column(
             &mut src,
             &entry,
@@ -2188,6 +2311,10 @@ mod tests {
             &mut decompressor,
             &mut compressed,
             &mut decompressed,
+            &mut allele_seq_data,
+            &mut allele_seq_offsets,
+            &mut allele_chain_ids_data,
+            &mut allele_chain_ids_offsets,
         )
         .unwrap_err();
         match err {

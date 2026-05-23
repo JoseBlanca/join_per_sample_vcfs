@@ -432,6 +432,91 @@ pub fn decode_list_column<T: WireScalar>(
     Ok(out)
 }
 
+/// CSR-shaped sibling of [`decode_list_column`]: instead of returning
+/// `Vec<Vec<T>>` (one inner `Vec` per row), append all values into a
+/// single contiguous `data` buffer and record per-row boundaries in
+/// `offsets` (`offsets.len() == expected_count + 1`,
+/// `offsets[i+1] - offsets[i]` is row `i`'s length, `data` is
+/// `concat(rows)`).
+///
+/// Per H1 of the 2026-05-23 PSP reader perf review: each per-row
+/// `Vec::with_capacity(k)` in the row form is one allocation per
+/// `allele-chain-ids` entry on every block decode. The CSR form
+/// collapses those `N_alleles` per-block allocations to two
+/// (`data` + `offsets`), both reused across blocks by the caller.
+/// Symmetric with the writer's
+/// [`encode_list_column_csr`](Self::encode_list_column_csr).
+///
+/// `data` and `offsets` are cleared first; capacity is preserved.
+pub fn decode_list_column_csr<T: WireScalar>(
+    bytes: &[u8],
+    expected_count: usize,
+    column_name: &str,
+    data: &mut Vec<T>,
+    offsets: &mut Vec<u32>,
+) -> Result<(), PspReadError> {
+    data.clear();
+    offsets.clear();
+    offsets.reserve(expected_count + 1);
+    offsets.push(0);
+    let mut cursor = 0usize;
+    for entry in 0..expected_count {
+        if cursor >= bytes.len() {
+            return Err(PspReadError::ColumnTruncated {
+                column: column_name.to_string(),
+                decoded: entry,
+                expected: expected_count,
+            });
+        }
+        let (k_u64, n_k) =
+            decode_u64_leb128(&bytes[cursor..]).map_err(|e| PspReadError::ColumnElementDecode {
+                column: column_name.to_string(),
+                entry,
+                source: ScalarDecodeError::from(e),
+            })?;
+        cursor += n_k;
+        let k = k_u64 as usize;
+        // DoS guard — same shape as the row form.
+        let remaining = bytes.len() - cursor;
+        let max_possible = remaining / T::FIXED_BYTE_WIDTH.max(1);
+        if k > max_possible {
+            return Err(PspReadError::ColumnElementDecode {
+                column: column_name.to_string(),
+                entry,
+                source: ScalarDecodeError::Truncated,
+            });
+        }
+        data.reserve(k);
+        for _ in 0..k {
+            let (v, n_v) = T::decode_le(&bytes[cursor..]).map_err(|source| {
+                PspReadError::ColumnElementDecode {
+                    column: column_name.to_string(),
+                    entry,
+                    source,
+                }
+            })?;
+            cursor += n_v;
+            data.push(v);
+        }
+        // u32 holds row offsets — same per-block bound as the bytes-
+        // column CSR form below; a malformed file with billions of
+        // chain-ids per block would overflow earlier (DoS guard above).
+        let off = u32::try_from(data.len()).map_err(|_| PspReadError::ColumnElementDecode {
+            column: column_name.to_string(),
+            entry,
+            source: ScalarDecodeError::Truncated,
+        })?;
+        offsets.push(off);
+    }
+    if cursor != bytes.len() {
+        return Err(PspReadError::ColumnTrailingBytes {
+            column: column_name.to_string(),
+            trailing: bytes.len() - cursor,
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Bytes column codecs
 // ---------------------------------------------------------------------
@@ -522,6 +607,97 @@ pub fn decode_bytes_split(
         cursor += n;
     }
     Ok(out)
+}
+
+/// CSR-shaped sibling of [`decode_bytes_split`]: instead of returning
+/// `Vec<Vec<u8>>` (one inner `Vec` per allele), append the whole
+/// concatenated payload into a single `data` buffer and record
+/// per-entry boundaries in `offsets`
+/// (`offsets.len() == lengths.len() + 1`, `offsets[i+1] - offsets[i]`
+/// is entry `i`'s byte length).
+///
+/// Per H1 of the 2026-05-23 PSP reader perf review: `decode_bytes_split`
+/// is the largest project-attributable allocator caller in the
+/// cohort var-calling pipeline (`bytes[..].to_vec()` once per allele
+/// = 2,099 P-core allocator-leaf samples = 87 % of project-side
+/// allocator pressure). The CSR form collapses N per-allele
+/// allocations to one per-block `extend_from_slice` of the whole
+/// payload, plus one `push` per entry into the `offsets` Vec.
+/// `data` + `offsets` capacity is reused across blocks by the caller.
+///
+/// `data` and `offsets` are cleared first; capacity is preserved.
+/// Validation (per-entry `max_entry_len` cap, total-length agreement,
+/// trailing-bytes detection) is identical to the row form.
+pub fn decode_bytes_split_csr(
+    bytes: &[u8],
+    lengths: &[u64],
+    column_name: &str,
+    max_entry_len: Option<u64>,
+    data: &mut Vec<u8>,
+    offsets: &mut Vec<u32>,
+) -> Result<(), PspReadError> {
+    // Same validation as `decode_bytes_split` — see its docs for the
+    // checked_add / max_entry_len / total-vs-buf-len reasoning.
+    let mut total: u64 = 0;
+    for (i, &len) in lengths.iter().enumerate() {
+        if let Some(cap) = max_entry_len
+            && len > cap
+        {
+            return Err(PspReadError::ColumnElementDecode {
+                column: column_name.to_string(),
+                entry: i,
+                source: ScalarDecodeError::Truncated,
+            });
+        }
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| PspReadError::ColumnTruncated {
+                column: column_name.to_string(),
+                decoded: i,
+                expected: lengths.len(),
+            })?;
+    }
+    let buf_len = bytes.len() as u64;
+    if total > buf_len {
+        return Err(PspReadError::ColumnTruncated {
+            column: column_name.to_string(),
+            decoded: 0,
+            expected: lengths.len(),
+        });
+    }
+    if total < buf_len {
+        return Err(PspReadError::ColumnTrailingBytes {
+            column: column_name.to_string(),
+            trailing: (buf_len - total) as usize,
+        });
+    }
+    // Per-block total bytes fit in u32 because every length is
+    // capped at `MAX_ALLELE_SEQ_LEN = 1024` and the writer's
+    // `BlockAccumulator` caps `n_total_alleles` so the sum stays
+    // well under `u32::MAX`. If a future column needs more, swap
+    // the offsets to u64.
+    let total_u32 = u32::try_from(total).map_err(|_| PspReadError::ColumnTruncated {
+        column: column_name.to_string(),
+        decoded: lengths.len(),
+        expected: lengths.len(),
+    })?;
+
+    data.clear();
+    data.reserve(total as usize);
+    data.extend_from_slice(bytes);
+
+    offsets.clear();
+    offsets.reserve(lengths.len() + 1);
+    offsets.push(0);
+    let mut cursor: u32 = 0;
+    for &len in lengths {
+        // len is already validated ≤ max_entry_len (or unbounded);
+        // the running sum is validated ≤ total_u32. Cast is safe.
+        cursor = cursor.wrapping_add(len as u32);
+        offsets.push(cursor);
+    }
+    debug_assert_eq!(cursor, total_u32, "CSR offsets disagree with payload total");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
