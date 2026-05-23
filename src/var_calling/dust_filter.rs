@@ -365,50 +365,88 @@ impl SdustState {
     }
 }
 
-/// Run sdust over `seq` (an ACGT/N byte slice — both cases accepted)
-/// and return the sorted, non-overlapping list of low-complexity
-/// intervals as BED-style 0-based half-open base coordinates.
+/// Slice-based convenience wrapper around [`sdust_mask_streaming`].
+/// Used by the in-module unit tests (which build the contig as a
+/// `Vec<u8>` fixture); production drives the streaming form directly
+/// via [`DustFilter::ensure_mask_for`]. Behaviour identical to
+/// driving the streaming form with `seq.iter().copied().map(Ok)`.
+#[cfg(test)]
+fn sdust_mask(seq: &[u8], window: u32, threshold: u32) -> SdustIntervals {
+    sdust_mask_streaming(
+        seq.iter().copied().map(Ok),
+        seq.len() as u32,
+        window,
+        threshold,
+    )
+    .expect("slice-backed iterator never yields Err")
+}
+
+/// Run sdust over a stream of bases and return the sorted,
+/// non-overlapping list of low-complexity intervals as BED-style
+/// 0-based half-open base coordinates.
 ///
-/// Direct port of `sdust_core` from `sdust/sdust.c:129-159`. The
-/// masking condition is `10·score > T·triplet_count` (strictly
+/// Direct port of `sdust_core` from `sdust/sdust.c:129-159`, made
+/// streaming so the caller never materialises the whole contig.
+/// The masking condition is `10·score > T·triplet_count` (strictly
 /// greater); `window` maps to `W` and `threshold` maps to `T`.
 ///
-/// Private — every external entry point goes through [`DustFilter`],
-/// which in turn passes a validated `(window, threshold)` from
-/// [`DustFilterConfig`]. The preconditions below are stated for
-/// internal callers only:
+/// `bases` yields each contig base as `io::Result<u8>` (ACGT/N,
+/// either case accepted — uppercased upstream in the production
+/// fetcher). The first `Err` short-circuits the scan and is
+/// returned to the caller. `length` is the declared contig length
+/// in bases; the function consumes exactly that many bases plus the
+/// trailing EOF-sentinel iteration that flushes any candidates
+/// still in `perf`.
+///
+/// Private — every external entry point goes through
+/// [`DustFilter::ensure_mask_for`], which passes a validated
+/// `(window, threshold)` from [`DustFilterConfig`]. The
+/// preconditions below are stated for internal callers only:
 ///
 /// - `window >= SD_WLEN = 3` (otherwise no triplet fits in a
 ///   window). [`DustFilterConfig::new`] enforces this and is the
 ///   only path to a valid config; the [`debug_assert!`] below
 ///   converts an internal contract violation into a loud panic
 ///   under tests.
-/// - `seq.len() <= u32::MAX` (so base coordinates fit in `u32`).
-///   In production this is guaranteed by `ParsedChromosome.length`
-///   being `u32` and the fetcher returning at most that many bytes.
-fn sdust_mask(seq: &[u8], window: u32, threshold: u32) -> SdustIntervals {
+/// - In production `length` comes from `ParsedChromosome.length`
+///   which is `u32`, so base coordinates fit naturally.
+pub(crate) fn sdust_mask_streaming<I>(
+    bases: I,
+    length: u32,
+    window: u32,
+    threshold: u32,
+) -> std::io::Result<SdustIntervals>
+where
+    I: IntoIterator<Item = std::io::Result<u8>>,
+{
     debug_assert!(
         window >= SD_WLEN,
-        "sdust_mask: window must be >= {SD_WLEN}; got {window}"
-    );
-    debug_assert!(
-        seq.len() <= u32::MAX as usize,
-        "sdust_mask: seq.len()={} exceeds u32::MAX; coordinates would wrap",
-        seq.len(),
+        "sdust_mask_streaming: window must be >= {SD_WLEN}; got {window}"
     );
 
     let mut state = SdustState::new(window, threshold);
-    // `l` is the run length of consecutive ACGT bases ending at the
-    // current position. `t` is the rolling 6-bit triplet word.
     let mut l: u32 = 0;
     let mut t: u32 = 0;
 
+    let len = length as usize;
+    let mut iter = bases.into_iter();
     // Loop bound mirrors the C `i <= l_seq` — the trailing iteration
     // with `b = 4` flushes any candidates still in `perf`.
-    let len = seq.len();
     for i in 0..=len {
         let b: u32 = if i < len {
-            SEQ_NT4[seq[i] as usize] as u32
+            match iter.next() {
+                Some(Ok(byte)) => SEQ_NT4[byte as usize] as u32,
+                Some(Err(e)) => return Err(e),
+                None => {
+                    // Stream ended before `length` bases were yielded.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "sdust_mask_streaming: stream ended after {i} bases (declared {length})"
+                        ),
+                    ));
+                }
+            }
         } else {
             4
         };
@@ -461,7 +499,7 @@ fn sdust_mask(seq: &[u8], window: u32, threshold: u32) -> SdustIntervals {
         }
     }
 
-    state.masked_intervals
+    Ok(state.masked_intervals)
 }
 
 // ============================================================
@@ -652,7 +690,10 @@ where
 
     /// Load (or reload) the mask for `chrom_id` if it isn't already
     /// the current one. Latches `is_finished` and returns the
-    /// appropriate error on any failure.
+    /// appropriate error on any failure. Streams the contig's
+    /// bases through `sdust_mask_streaming` — no whole-contig
+    /// buffer is materialised when the fetcher implements
+    /// `iter_bases` natively (e.g. `StreamingChromRefFetcher`).
     fn ensure_mask_for(&mut self, chrom_id: u32) -> Result<(), DustFilterError> {
         if self.loaded.as_ref().is_some_and(|l| l.chrom_id == chrom_id) {
             return Ok(());
@@ -664,8 +705,20 @@ where
                 return Err(DustFilterError::UnknownChromId { chrom_id });
             }
         };
-        let seq = match self.fetcher.fetch(chrom_id, 1, entry.length) {
-            Ok(s) => s,
+        let bases = match self.fetcher.iter_bases(chrom_id, entry.length) {
+            Ok(it) => it,
+            Err(source) => {
+                self.is_finished = true;
+                return Err(DustFilterError::RefFetch { chrom_id, source });
+            }
+        };
+        let mask = match sdust_mask_streaming(
+            bases,
+            entry.length,
+            self.config.window,
+            self.config.threshold,
+        ) {
+            Ok(m) => m,
             Err(source) => {
                 self.is_finished = true;
                 return Err(DustFilterError::RefFetch { chrom_id, source });
@@ -676,7 +729,7 @@ where
         // a single assignment, so they can never be out of sync.
         self.loaded = Some(LoadedChrom {
             chrom_id,
-            mask: sdust_mask(&seq, self.config.window, self.config.threshold),
+            mask,
             sweep: 0,
         });
         Ok(())

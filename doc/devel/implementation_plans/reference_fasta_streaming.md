@@ -646,3 +646,338 @@ one if the reviewer prefers.
 Total: ~550 net lines across two PRs. No new runtime dependencies;
 removes the runtime use of `noodles_fasta::Repository` (kept only
 at lease load time via `noodles_fasta::io::IndexedReader`).
+
+---
+
+## Phase C — sliding-buffer streaming fetcher (added after Phase B benchmarks)
+
+Phase B left a ~480 MB resident-cache contribution per run on the
+tomato T=8 measurement (each of the 8 in-flight workers held its
+whole contig in memory, ~60 MB average). On a human cohort at T=8
+the same shape projects to ~2 GB resident in the fetchers alone.
+Since the var-calling pipeline reads its contig **sequentially in
+monotonically-non-decreasing position order**, a sliding-window
+reader with a buffer of a few MB delivers the same data without
+holding the contig.
+
+Memory projection on tomato T=8:
+- Phase B (measured): 4.54 GB peak, ~480 MB in fetcher caches.
+- Phase C (target): ~4.06 GB peak, ~8 MB in fetcher buffers
+  (8 workers × 1 MB sliding buffer).
+- On human T=8: drops fetcher contribution from ~2 GB to ~8 MB.
+
+### Access pattern analysis
+
+The two consumers of ref bytes in the cohort var-calling path
+(verified by grep over `src/var_calling/` and `src/pop_var_caller/`
+on 2026-05-23):
+
+1. **DUST mask construction**
+   ([dust_filter.rs:667](../../src/var_calling/dust_filter.rs#L667))
+   — currently `fetch(chrom_id, 1, contig.length)`. The whole contig
+   in one call. `sdust_mask`
+   ([dust_filter.rs:389-444](../../src/var_calling/dust_filter.rs#L389-L444))
+   is a forward sequential byte-by-byte scan with rolling state; it
+   emits low-complexity intervals as it goes and never indexes
+   backwards. **Algorithmically streaming-friendly**; the current
+   `&[u8]` parameter is a caller-allocates-everything convenience.
+2. **PerGroupMerger**
+   ([per_group_merger.rs:704](../../src/var_calling/per_group_merger.rs#L704))
+   — many small `fetch(chrom_id, start, span)` calls. Spans are
+   bounded by `--var-group-max-span` (default 10 KB; see
+   [variant_grouping.rs:31](../../src/var_calling/variant_grouping.rs#L31)).
+   The grouper guarantees groups are emitted in non-decreasing
+   `start` order, so fetches are monotonic.
+
+The Stage 1 (per-sample pileup walker) BAQ stage also fetches but
+uses a different fetcher (`SyncRefFetcher` /
+`ChromBoundaryRefFetcher`) and a different parallelism shape;
+out of scope for Phase C.
+
+`var_calling_from_bam` runs the pipeline single-sample with no
+per-chrom outer parallelism and still uses `SyncRefFetcher`; out of
+scope for Phase C. Migration tracked as a follow-up.
+
+### Why both DUST and the per-group merger must change in the same slice
+
+If only the per-group merger streams, the DUST mask still calls
+`fetch(1, contig.length)`. The fetcher would have to materialise the
+full contig to satisfy that single call. `rayon::par_iter` starts
+all workers at roughly the same time, so the *peak* across workers
+is back to `T × max_chrom_size` during the DUST phase. The
+per-group merger savings come after the DUST peak — too late to
+lower peak RSS.
+
+So Phase C ships as one PR with two changes: the new streaming
+fetcher and the `sdust_mask` signature refactor.
+
+### Scope
+
+**In scope:**
+
+- New `StreamingChromRefFetcher` in
+  [src/per_sample_pileup/ref_fetcher.rs](../../src/per_sample_pileup/ref_fetcher.rs)
+  alongside the existing fetchers. Bound to one `chrom_id` like
+  `SingleChromRefFetcher`. Internal state: an open `File` + a
+  reused 1 MB buffer of uppercased non-newline bases + the buffer's
+  base-coordinate offset. `fetch(chrom_id, start, length)`:
+  - If `[start, start+length)` lies inside the current buffer →
+    slice it out (memcpy-only path, no I/O).
+  - Otherwise → seek to `start`, refill buffer with up to
+    `max(buffer_size, length)` bases, then slice. Under the
+    monotonic-forward access pattern this fires once every ~100
+    fetches on average (1 MB / 10 KB = 100).
+- Refactor `sdust_mask` from `(&[u8], window, threshold) -> SdustIntervals`
+  to `(impl Iterator<Item = u8>, length, window, threshold) -> SdustIntervals`.
+  The body stays the same; the `for i in 0..=len { let b = if i < len
+  { SEQ_NT4[seq[i] as usize] } else { 4 }; ... }` loop becomes
+  `for (i, b) in stream.chain(once_eof_sentinel()).enumerate() { ... }`.
+  `length` argument is the contig length needed for the EOF sentinel
+  trailing iteration.
+- New `bases(&self) -> impl Iterator<Item = io::Result<u8>> + '_`
+  method on `StreamingChromRefFetcher` for the DUST mask pass. Pulls
+  byte-at-a-time over the streamer's buffer (refilling as needed),
+  uppercased + newline-stripped. The mask construction goes through
+  this rather than `fetch(1, length)`.
+- `DustFilter::ensure_mask_for`
+  ([dust_filter.rs:656-683](../../src/var_calling/dust_filter.rs#L656-L683))
+  swaps `fetcher.fetch(chrom_id, 1, entry.length)` for the
+  streaming iterator. The fetcher trait gains a small extension
+  trait (or the streaming method lives on `SingleChromRefFetcher` /
+  `StreamingChromRefFetcher` directly without going through the
+  trait — DUST already knows the concrete fetcher kind via
+  `process_one_chromosome`'s wiring).
+
+**Out of scope (deferred):**
+
+- BAQ / Stage 1 migration. Uses `SyncRefFetcher` /
+  `ChromBoundaryRefFetcher` already; not in the cohort parallel
+  path.
+- `var_calling_from_bam` migration. Single-sample walker; different
+  shape.
+- A streaming fetcher that supports backward seeks gracefully. Today's
+  monotonic-forward access pattern means a backward seek is
+  *possible* (degrades to "extra refill per backward jump") but
+  not exercised. If a future code path needs random access, the
+  current shape still works, just slower.
+
+### Design details
+
+**Streaming over fai-indexed FASTA.** noodles' `IndexedReader::query`
+buffers the whole record into a `Vec`, so we can't use it for
+chunked reads. We roll our own contig reader:
+
+```rust
+struct StreamState {
+    file: File,
+    /// Cached contig metadata: byte offset, line layout. From the
+    /// `.fai` we read at fetcher-construction time.
+    fai: FaiEntry,
+    /// Buffer of uppercased, newline-stripped bases.
+    /// Length ≤ BUFFER_SIZE.
+    buf: Vec<u8>,
+    /// 1-based base coordinate of the first byte in `buf`.
+    /// Invariant: bases in `buf` are contig positions
+    /// `[buf_start_base, buf_start_base + buf.len())`.
+    buf_start_base: u32,
+}
+```
+
+`refill(target_base_1based, length_hint)`:
+
+1. Compute file offset of `target_base_1based` via `.fai` math:
+   `offset = fai.offset + (b-1) / line_bases * line_width + (b-1) % line_bases`
+   where `b = target_base_1based`.
+2. `file.seek(SeekFrom::Start(offset))`.
+3. `buf.clear()`; read raw FASTA bytes 64 KiB at a time
+   (`File::read` into a stack scratch); strip newlines and
+   uppercase; push into `buf` until `buf.len() >= length_hint`
+   capped at `BUFFER_SIZE`.
+4. Set `buf_start_base = target_base_1based`.
+
+`fetch(chrom_id, start, length)`:
+
+1. Validate `chrom_id == self.chrom_id` (same as Phase B's check).
+2. Lock `inner: Mutex<StreamState>` (uncontended — single-thread
+   use, the Mutex only exists to satisfy the `Sync` bound on the
+   trait alias).
+3. If `start >= buf_start_base && start + length <= buf_start_base + buf.len()`:
+   slice `buf[start - buf_start_base ..]`, return.
+4. Otherwise: `refill(start, length)`, then slice + return.
+
+**Why `Mutex`, not `RefCell`.** The trait alias is
+`Arc<dyn RefSeqFetcher + Send + Sync>`. Phase B's
+`SingleChromRefFetcher` is naturally `Sync` because all its fields
+are `Sync` (the inner `Vec<u8>` is read-only after construction).
+The streaming fetcher needs interior mutability for the buffer
+refill, which makes `Sync` non-automatic. `Mutex` is the cheapest
+choice that keeps the trait shape; lock contention is zero in
+practice (per Phase B's design, each worker owns its fetcher
+outright).
+
+**Buffer size constant.** 1 MB (`1024 * 1024`) — 100× the largest
+single fetch (10 KB `--var-group-max-span` default). The buffer
+sits in the per-worker `StreamingChromRefFetcher`, so peak across
+T workers is `T × 1 MB`. Picking the constant:
+
+- 64 KB: too small; some variant-dense regions would trigger
+  refills inside a group fetch.
+- 256 KB: 25× the max span. Safe but more refills.
+- 1 MB: 100× the max span. Roughly one refill per 100 group
+  fetches in dense regions; close to free in sparse regions.
+- 4 MB: 400× the max span. Wasteful for the small-genome case
+  (most contigs are < 100 MB; 4 MB doesn't help and increases
+  the per-worker footprint).
+
+1 MB is the sweet spot. Promote to a constant
+`STREAMING_REF_BUFFER_BYTES` with a doc comment explaining the
+sizing.
+
+**`sdust_mask` refactor.** Current signature:
+
+```rust
+fn sdust_mask(seq: &[u8], window: u32, threshold: u32) -> SdustIntervals
+```
+
+New signature:
+
+```rust
+fn sdust_mask(
+    bases: impl Iterator<Item = u8>,
+    length: u32,
+    window: u32,
+    threshold: u32,
+) -> SdustIntervals
+```
+
+The body's `for i in 0..=len { let b = if i < len { SEQ_NT4[seq[i] as usize] } else { 4 }; ... }`
+becomes:
+
+```rust
+let len = length as usize;
+let mut bytes = bases.fuse();
+for i in 0..=len {
+    let b: u32 = match bytes.next() {
+        Some(byte) => SEQ_NT4[byte as usize] as u32,
+        None => 4, // EOF sentinel — flushes any candidates still in `perf`
+    };
+    // ... rest of the existing loop unchanged
+}
+```
+
+The iterator API hides whether bases came from a `Vec<u8>` slice
+(today's tests) or from a streaming reader (production). Tests
+adapt to pass `seq.iter().copied()` and `seq.len() as u32`.
+
+**DUST mask source.** `DustFilter::ensure_mask_for` previously
+read the bytes via `self.fetcher.fetch(chrom_id, 1, entry.length)`
+on the trait object. The trait `RefSeqFetcher::fetch` stays
+unchanged (returns `Vec<u8>` for compatibility with the
+PerGroupMerger fetches). For the DUST mask we need a *streaming*
+byte iterator on the concrete fetcher type. Options:
+
+- **(a) Extension trait.** New trait `StreamingRefSeqBytes` with
+  `fn bases<'a>(&'a self, chrom_id: u32) -> io::Result<Box<dyn Iterator<Item = io::Result<u8>> + 'a>>`.
+  Implemented by `StreamingChromRefFetcher`; the trait-object
+  alias becomes `Arc<dyn RefSeqFetcher + StreamingRefSeqBytes + Send + Sync>`.
+  Cost: nested-trait combinators are ugly, and `var_calling_from_bam`
+  uses `SyncRefFetcher` (which doesn't naturally implement streaming
+  bytes) — would have to add a fallback impl that re-reads bytes
+  buffered.
+- **(b) Pass the concrete fetcher to DUST.** `process_one_chromosome`
+  constructs the `StreamingChromRefFetcher` and passes it both to
+  `DustFilter::new` (which takes a concrete generic-typed fetcher
+  or a streaming iterator directly) and to the
+  `CohortPipelineParams.fetcher` slot for the per-group merger
+  (via `Arc<dyn RefSeqFetcher>`). DUST's `ensure_mask_for` calls
+  `streaming_fetcher.bases()` on the concrete type.
+
+(b) is cleaner. DUST already has a `LoadedChrom` cache that
+fires once per chrom transition; it can hold a clone of the
+streaming fetcher Arc and call the streaming method. We change
+`DustFilter::new` to take `Arc<StreamingChromRefFetcher>` directly
+instead of `&dyn RefSeqFetcher`, or we keep `RefSeqFetcher` for
+the existing tests and add a new constructor `DustFilter::with_stream`.
+
+Decision: take the concrete `Arc<StreamingChromRefFetcher>` in
+`DustFilter::new`. The existing tests in `dust_filter.rs` already
+build a `MockFetcher` impl of `RefSeqFetcher`; they migrate to
+constructing a minimal `StreamingChromRefFetcher` over a tempfile,
+or we add a `from_bytes` constructor on `StreamingChromRefFetcher`
+purely for tests (in-memory byte buffer instead of a file). I'll
+go with the in-memory test constructor — keeps the tests fast and
+hermetic, and the production path stays simple.
+
+### Wiring in `process_one_chromosome`
+
+Replaces today's `SingleChromRefFetcher` construction:
+
+```rust
+let fetcher_concrete =
+    StreamingChromRefFetcher::new(fasta_path, chrom_id, &chrom_entry.name)?;
+let fetcher_arc: Arc<StreamingChromRefFetcher> = Arc::new(fetcher_concrete);
+// Trait-object view for the per-group merger fetches (small
+// windows; uses RefSeqFetcher::fetch through the trait).
+let fetcher: SharedRefFetcher = fetcher_arc.clone();
+// Concrete view passed to DUST for the streaming mask construction.
+let dust_stream = fetcher_arc;
+```
+
+Then `DustFilter::new` accepts `dust_stream` directly.
+
+### Test plan
+
+Unit tests on the new fetcher in
+[src/per_sample_pileup/ref_fetcher.rs](../../src/per_sample_pileup/ref_fetcher.rs):
+
+1. **`streaming_fetcher_returns_bytes_for_bound_chrom`** — basic
+   slice extraction, single-line FASTA fixture.
+2. **`streaming_fetcher_serves_line_wrapped_contig`** — 60-col
+   wrapped FASTA, multiple fetches at increasing positions, every
+   one returns the correct bases.
+3. **`streaming_fetcher_buffer_refill_on_forward_jump`** — fetch
+   at `start=1`, then `start=BUFFER_SIZE + 100`; assert second
+   fetch returns the right bytes (validates the refill path).
+4. **`streaming_fetcher_buffer_refill_on_backward_jump`** —
+   degenerate case; documents the slower path. Fetch at
+   `start=10000`, then `start=100`; assert correct bytes.
+5. **`streaming_fetcher_fetch_past_contig_end_errors`** — same as
+   `SingleChromRefFetcher`.
+6. **`streaming_fetcher_uppercases_soft_masked`** — same as
+   `SingleChromRefFetcher`.
+7. **`streaming_fetcher_bases_iterator_yields_all_bases`** —
+   driver for the DUST mask pass; iterator length = contig length.
+8. **`streaming_fetcher_bases_iterator_uppercases`** — same
+   uppercase contract on the iterator path.
+
+Unit tests on the refactored `sdust_mask`:
+
+9. Existing tests adapt to the new signature — pass
+   `bytes.iter().copied()` and `bytes.len() as u32`. No expected
+   output changes; the algorithm is unchanged.
+
+Integration: existing `tests/cohort_cli_integration.rs` covers
+end-to-end. We add no new integration test — output VCFs must be
+byte-identical to Phase B's (no algorithmic change).
+
+### Acceptance
+
+- **Peak RSS** drops on the tomato fixture by ~400 MB at T=8.
+  Acceptance threshold: ≥ 200 MB reduction vs Phase B; ≥ 600 MB
+  reduction vs the baseline. Measured via `tmp/measure_rss.sh`
+  back-to-back on `eac3843` (Phase B) vs Phase C HEAD.
+- **Output equivalence:** VCFs match Phase B's bit-for-bit (same
+  test fixture, same record set, same byte content).
+- **No wall regression:** Phase C should not be measurably slower
+  than Phase B. Streaming fetchers add a few thousand extra
+  `read(2)` syscalls per worker (~contig_size / 64 KB), which on a
+  warm page cache is microseconds.
+
+### Estimated effort
+
+- `StreamingChromRefFetcher` + tests: ~200 lines.
+- `sdust_mask` signature + DUST caller wiring: ~80 lines.
+- `process_one_chromosome` constructor swap: ~30 lines.
+- Test fixture / `from_bytes` constructor: ~40 lines.
+
+Total: ~350 lines.

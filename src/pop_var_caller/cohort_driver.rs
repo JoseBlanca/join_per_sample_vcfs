@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::psp::{PspReadError, PspReader};
-use crate::per_sample_pileup::ref_fetcher::SingleChromRefFetcher;
+use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::var_calling::dust_filter::{DustFilter, DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
@@ -466,13 +466,15 @@ where
     let chrom_length = chrom_entry.length;
 
     // Build the per-worker reference fetcher. Each worker constructs
-    // its own — no Arc shared across threads, no Mutex, no lease.
-    // The fetcher reads its bound contig from disk in `new` (each
-    // worker opens its own indexed reader on the same FASTA, which
-    // noodles supports for read-only access). When this function
-    // returns, the fetcher drops and the contig bytes are freed.
+    // its own — no Arc shared across threads, no Mutex, no eager
+    // contig load. The streaming fetcher opens its own indexed FASTA
+    // reader and serves bases through a 1 MB sliding buffer; the
+    // DUST mask pass and the per-group merger window fetches both
+    // hit that buffer. When this function returns, the fetcher
+    // drops, the buffer is freed, and the contig was never wholly
+    // resident.
     let fetcher_concrete =
-        SingleChromRefFetcher::new(fasta_path, chrom_id, chrom_entry.name.clone())?;
+        StreamingChromRefFetcher::new(fasta_path, chrom_id, chrom_entry.name.clone())?;
     // Wrap in Arc<dyn> for the DustFilter + PerGroupMerger trait-
     // object alias. Refcount stays at 1–2 per worker; never crosses
     // worker boundaries.

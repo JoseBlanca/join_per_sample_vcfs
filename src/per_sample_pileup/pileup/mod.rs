@@ -519,6 +519,25 @@ pub trait RefSeqFetcher {
         start_1based: u32,
         length: u32,
     ) -> Result<Vec<u8>, std::io::Error>;
+
+    /// Forward sequential iterator over every uppercased base of
+    /// `chrom_id`'s contig, in 1..=`length` order. Used by the DUST
+    /// mask construction (one pass per chrom) to avoid materialising
+    /// the whole contig as a single `Vec<u8>`.
+    ///
+    /// Default impl materialises via `fetch(chrom_id, 1, length)`;
+    /// streaming fetchers override to walk a sliding buffer instead.
+    /// The boxed iterator costs one heap allocation per chrom plus
+    /// one virtual dispatch per byte — the latter is dominated by
+    /// the inner sdust scoring work in practice.
+    fn iter_bases<'a>(
+        &'a self,
+        chrom_id: u32,
+        length: u32,
+    ) -> Result<Box<dyn Iterator<Item = std::io::Result<u8>> + 'a>, std::io::Error> {
+        let seq = self.fetch(chrom_id, 1, length)?;
+        Ok(Box::new(seq.into_iter().map(Ok)))
+    }
 }
 
 /// Forwarding impl so callers may pass either an owned fetcher or a
@@ -532,5 +551,13 @@ impl<T: RefSeqFetcher + ?Sized> RefSeqFetcher for &T {
         length: u32,
     ) -> Result<Vec<u8>, std::io::Error> {
         (**self).fetch(chrom_id, start_1based, length)
+    }
+
+    fn iter_bases<'a>(
+        &'a self,
+        chrom_id: u32,
+        length: u32,
+    ) -> Result<Box<dyn Iterator<Item = std::io::Result<u8>> + 'a>, std::io::Error> {
+        (**self).iter_bases(chrom_id, length)
     }
 }
