@@ -19,7 +19,38 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **Performance review of the FASTA fetcher**
+> - **Last completed task:** **Performance review of the PSP reader**
+>   on the cohort var-calling hot path —
+>   [perf_psp_reader_2026-05-23.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-23.md).
+>   Verdict: **Apply the listed wins.** Profile basis: reused the
+>   post-H3 cohort profile (`perf_h3.data` against
+>   `examples/profile_cohort_e2e --threads 4` on tomato N=10,
+>   142 K samples). PSP-related cpu_core sum: ~18.8% of wall time
+>   (RecordsIter::next 6.55%, zstd 8.3% combined, decode_list_column
+>   1.94%, decode_varint_column 0.78%, decode_bytes_split 0.74%,
+>   drop_in_place<DecodedBlock> 0.50%). Headline finding: PSP
+>   `decode_bytes_split` is the **#1 project-attributable allocator
+>   caller in the entire cohort pipeline** at 2099 P-core
+>   allocator-leaf samples = 87% of project-attributable allocator
+>   pressure (vs the next-biggest in-scope site `unify_alleles` at
+>   142 samples). Three of the six dispatched category sub-agents
+>   (allocations, data_layout, hot_loops) converged on the same
+>   structural fix: **H1 — CSR collapse of `DecodedBlock`'s
+>   `Vec<Vec<u8>>` + `Vec<Vec<ChainId>>` ragged columns**
+>   (mirrors the writer's existing `encode_list_column_csr`).
+>   **H2** is the 2026-05-20 review's H4 that was never applied:
+>   per-block `SeekFrom::Start` at reader.rs:587 + reader.rs:807
+>   discards the 64 KiB BufReader buffer on every block transition
+>   even though blocks are written contiguously on disk —
+>   `SeekFrom::Current(delta)` short-circuits when the target is
+>   in-window. **H3** (gated by H1): leading `assert!`s hoist 9
+>   per-allele bounds checks in `materialise_next_record` out of the
+>   inner loop. 10 Likely, 4 Speculative, multiple Notes. Concurrency
+>   clean (no findings — PSP reader is `!Send` by design;
+>   per-chrom worker ownership). Prior 2026-05-13 fixes (L5 varint
+>   fast/cold, L6 LE-slab cast, L8 BufReader doc, L1+L2 persistent
+>   Decompressor + scratch) all confirmed still in place.
+> - **Previous task:** **Performance review of the FASTA fetcher**
 >   (`src/per_sample_pileup/ref_fetcher.rs`) after the Step-2
 >   `ChromRefFetcher` migration —
 >   [perf_ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/perf_ref_fetcher_2026-05-23.md).
@@ -39,7 +70,7 @@ Skills and agents are instructed to leave it untouched.
 >   per-fetcher microbench); 4 Speculative; 5 Notes. BAQ-side
 >   fetcher (`ManualEvictChromRefFetcher`) is cold on this fixture
 >   (<0.1 % per-symbol); findings against it cap at Note.
-> - **Previous task:** Posterior engine **emit-with-flag** for
+> - **Previous-previous task:** Posterior engine **emit-with-flag** for
 >   non-converging records (commit `aab9ac0`). Records that hit
 >   `max_iterations` without satisfying `convergence_threshold` are
 >   now emitted with `FILTER=EMNoConv` instead of hard-erroring the
@@ -51,7 +82,7 @@ Skills and agents are instructed to leave it untouched.
 >   (~3.7 ppm of the cohort). Run summary surfaces the tally:
 >   `var-calling: ... records_emnoconv=5 (FILTER=EMNoConv; EM
 >   iteration cap)`. 850 lib tests + 39 integration tests pass.
-> - **Previous-previous task:** **H1 (per-chromosome parallelism)** + **L1
+> - **Earlier task:** **H1 (per-chromosome parallelism)** + **L1
 >   (per-group `par_iter` removal)** for cohort `var-calling` — impl
 >   report
 >   [cohort_per_chromosome_parallel_2026-05-20.md](doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md);
@@ -77,7 +108,7 @@ Skills and agents are instructed to leave it untouched.
 >   `0b1e958` (run_var_calling reshape + determinism integration
 >   test) → the bench validation + this status update.
 >   848 lib + 39 integration tests pass; clippy clean.
-> - **Earlier task:** End-to-end perf review of the `.psp` →
+> - **Earlier-still task:** End-to-end perf review of the `.psp` →
 >   cohort-VCF pipeline (Stages 3–6) on real tomato (SL4.0) data —
 >   [perf_psp_to_vcf_2026-05-20.md](doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md).
 >   Verdict: **Apply the listed wins.** Profile evidence: `perf record
@@ -96,7 +127,7 @@ Skills and agents are instructed to leave it untouched.
 >   release] debug = "line-tables-only"` → `debug = true`,
 >   SyncRefFetcher pre-warm, CSR decoder, SmallVec for AlleleObservation,
 >   per-group merger `par_iter` removal), 5 Speculative, 6 Notes.
-> - **Earlier-still task:** Cohort CLI follow-up **Wave 5**
+> - **Even-earlier task:** Cohort CLI follow-up **Wave 5**
 >   (Test infrastructure + missing coverage) fixes-applied
 >   2026-05-19 —
 >   [cohort_cli_2026-05-19_applied_wave5.md](doc/devel/reports/reviews/cohort_cli_2026-05-19_applied_wave5.md).
@@ -375,9 +406,53 @@ consume. Not a runtime step — an interface.
   - writer/reader bootstrap: [per_sample_pileup_writer_reader.md](doc/devel/implementation_plans/per_sample_pileup_writer_reader.md)
   - psp → pileup roundtrip: [psp_to_pileup.md](doc/devel/implementation_plans/psp_to_pileup.md)
 - **Impl reports:** [psp_reader_2026-05-13.md](doc/devel/reports/implementations/psp_reader_2026-05-13.md), [psp_to_pileup_2026-05-15.md](doc/devel/reports/implementations/psp_to_pileup_2026-05-15.md)
-- **Latest reviews:** [psp_2026-05-13.md](doc/devel/reports/reviews/psp_2026-05-13.md), [psp_reader_2026-05-13.md](doc/devel/reports/reviews/psp_reader_2026-05-13.md), [perf_psp_writer_2026-05-13.md](doc/devel/reports/reviews/perf_psp_writer_2026-05-13.md), [perf_psp_reader_2026-05-13.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-13.md)
+- **Latest reviews:** [perf_psp_reader_2026-05-23.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-23.md) (cohort-hot-path re-review against the post-H3 profile — verdict: *Apply the listed wins*; 3 Hot-path / 10 Likely / 4 Speculative; H1 CSR ragged-column collapse subsumes 87% of project-side allocator pressure, H2 = `SeekFrom::Current` for the 2026-05-20 H4 that was never applied, H3 = per-allele bounds-check hoist), [psp_2026-05-13.md](doc/devel/reports/reviews/psp_2026-05-13.md), [psp_reader_2026-05-13.md](doc/devel/reports/reviews/psp_reader_2026-05-13.md), [perf_psp_writer_2026-05-13.md](doc/devel/reports/reviews/perf_psp_writer_2026-05-13.md), [perf_psp_reader_2026-05-13.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-13.md)
 - **Latest fixes-applied:** [fixes_applied_psp_reader_2026-05-13.md](doc/devel/reports/implementations/fixes_applied_psp_reader_2026-05-13.md), [perf_psp_reader_2026-05-13_applied.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-13_applied.md), [perf_psp_writer_2026-05-13_applied.md](doc/devel/reports/reviews/perf_psp_writer_2026-05-13_applied.md)
-- **Open:** none
+- **Open (from 2026-05-23 PSP reader perf review):**
+  - **H1** — CSR collapse of `DecodedBlock`'s
+    `allele_seqs: Vec<Vec<u8>>` and
+    `allele_chain_ids: Vec<Vec<ChainId>>` into
+    `(data: Vec<u8>, offsets: Vec<u32>)` + per-`RecordsIter`
+    scratch reuse. Symmetric with the writer's existing
+    `encode_list_column_csr`. Stage A keeps `AlleleObservation.seq`
+    as `Vec<u8>` (one alloc per emit); Stage B (cross-cutting)
+    switches it to `Box<[u8]>` or arena handle. Gate Stage B
+    behind dhat data via the missing `examples/dhat_psp_reader.rs`
+    (L7).
+  - **H2** — `SeekFrom::Current(delta)` helper for the per-block
+    seek at `reader.rs:587` and the post-block-header rewind at
+    `reader.rs:807`. `SeekFrom::Start` discards `BufReader`'s
+    64 KiB user-space buffer on every block transition even
+    though blocks are written contiguously on disk; the 2026-05-20
+    review's H4. This was never applied.
+  - **H3 (gated by H1)** — leading `assert!(allele_end <=
+    block.<col>.len())` for the 9 ragged columns at the top of
+    `materialise_next_record`. Collapses the per-allele inner
+    loop's bounds checks to one each outside the loop.
+  - **L1** — `decode_list_column_pod<T: Pod>` LE-slab cast for
+    `ChainId = u64` (mirror of the writer's
+    `encode_list_column_csr`'s Pod fast path).
+  - **L2** — drop `stream_position()` from `read_block_header` by
+    threading `entry.block_offset` from the caller (saves one
+    `lseek(2)` per block).
+  - **L3** — `region_records` first-block seek (subsumed by H2).
+  - **L4 (gated by H1)** — pack the 7 fixed-width per-allele
+    columns into a single `#[repr(C)]` row for the
+    `materialise_next_record` gather.
+  - **L5** — `AlleleObservation` SmallVec (cross-cuts the
+    2026-05-20 L2; coordinate with that finding).
+  - **L6** — `benches/psp_reader_perf.rs` is `Cursor`-backed;
+    add a file-backed `BufReader<File>` group so H2 / L1 / L2 /
+    L3 have a microbench signal.
+  - **L7** — `examples/dhat_psp_reader.rs` (deferred since
+    2026-05-13 L9; the post-H3 profile justifies it as a
+    prerequisite for H1's Stage B decision).
+  - **L8** — bench bodies should `assert_eq!(count, expected)`
+    so a silent-truncate refactor can't pass.
+  - **S1** — sweep `DEFAULT_BUFFERED_IO_CAPACITY` (64 KiB
+    today) after H2 lands.
+  - Background-confirmed: L5 (varint fast/cold), L6 (LE-slab cast),
+    L8 (BufReader doc) from 2026-05-13 are all still in place.
 
 ---
 
