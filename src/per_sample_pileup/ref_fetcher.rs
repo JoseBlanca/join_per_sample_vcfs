@@ -1062,11 +1062,16 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
         &'a self,
     ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
     {
-        // Reset the buffer so the iter starts a fresh phase.
-        let mut state = self.inner.borrow_mut();
-        state.buf.clear();
-        state.buf_start_base = 0;
-        drop(state);
+        // Mi5: scope the borrow_mut so the RefCell guard is released
+        // before we return the iterator (which the caller will then
+        // poll, each .next() taking a fresh borrow_mut). Avoids an
+        // accidental long-lived borrow if this function ever grows
+        // post-reset work.
+        {
+            let mut state = self.inner.borrow_mut();
+            state.buf.clear();
+            state.buf_start_base = 0;
+        }
         Ok(Box::new(ChromRefBaseIter {
             fetcher: self,
             next_base: 1,
