@@ -2524,4 +2524,166 @@ mod tests {
         let bytes = fetcher.fetch(1, input.len() as u32).expect("fetch").to_vec();
         assert_eq!(bytes, expected);
     }
+
+    // ---------------------------------------------------------------
+    // B3 + M22 + M24 + M25 (2026-05-23 code review): contract /
+    // edge-case tests that were missing.
+    // ---------------------------------------------------------------
+
+    /// Stub [`ChromRefFetcher`] for M22: only overrides the required
+    /// methods (`length`, `fetch`, `iter_bases`). Inherits the
+    /// **default** `fetch_into` impl from the trait — the whole
+    /// point of the M22 tests below is to exercise that default.
+    struct DefaultFetchIntoStub {
+        payload: Vec<u8>,
+    }
+    impl sealed::Sealed for DefaultFetchIntoStub {}
+    impl ChromRefFetcher for DefaultFetchIntoStub {
+        fn length(&self) -> u32 {
+            self.payload.len() as u32
+        }
+        fn fetch(
+            &self,
+            start_1based: u32,
+            length: u32,
+        ) -> Result<Vec<u8>, ChromRefFetchError> {
+            if start_1based == 0 {
+                return Err(ChromRefFetchError::InvalidStart);
+            }
+            let start = (start_1based - 1) as usize;
+            let end = start + length as usize;
+            Ok(self.payload[start..end].to_vec())
+        }
+        fn iter_bases<'a>(
+            &'a self,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
+            ChromRefFetchError,
+        > {
+            Ok(Box::new(self.payload.iter().copied().map(Ok)))
+        }
+        // No fetch_into override: tests below pin the trait's default
+        // impl (mem::swap, dst-clearing).
+    }
+
+    #[test]
+    fn fetch_into_default_impl_clears_dst() {
+        // M22: the trait's default fetch_into impl must clear `dst`
+        // before writing. A regression that prepended stale bytes
+        // would silently corrupt every consumer relying on the
+        // default impl.
+        let stub = DefaultFetchIntoStub {
+            payload: b"ACGTACGTAC".to_vec(),
+        };
+        let mut dst = b"GARBAGE_PRE_EXISTING_BYTES".to_vec();
+        stub.fetch_into(3, 4, &mut dst).expect("fetch_into");
+        assert_eq!(dst, b"GTAC");
+        assert_eq!(dst.len(), 4);
+    }
+
+    #[test]
+    fn fetch_into_through_ref_forwarding_clears_dst() {
+        // M22: same contract via the `&T` blanket impl. The cohort
+        // driver passes `&*fetcher` into DustFilter::new, which is
+        // generic over `F: ChromRefFetcher`, so this seam is on the
+        // hot path.
+        let stub = DefaultFetchIntoStub {
+            payload: b"ACGTACGTAC".to_vec(),
+        };
+        let by_ref: &dyn ChromRefFetcher = &stub;
+        let mut dst = b"STALE".to_vec();
+        by_ref.fetch_into(1, 4, &mut dst).expect("fetch_into");
+        assert_eq!(dst, b"ACGT");
+        assert_eq!(dst.len(), 4);
+    }
+
+    #[test]
+    fn streaming_fetch_into_returns_exact_length_spanning_refill() {
+        // M22: the StreamingChromRefFetcher override copies straight
+        // from the slab. Test that the slab path also keeps the
+        // `dst.len() == length` invariant when the request spans the
+        // initial fill (no warm cache).
+        let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, path) = build_line_wrapped_fasta("chr0", &seq, 60);
+        let fetcher =
+            StreamingChromRefFetcher::for_contig(&path, "chr0").expect("for_contig");
+        let mut dst = b"GARBAGE".to_vec();
+        ChromRefFetcher::fetch_into(&fetcher, 50, 32, &mut dst).expect("fetch_into");
+        assert_eq!(dst.len(), 32);
+        assert_eq!(dst, &seq[49..81]);
+    }
+
+    #[test]
+    fn streaming_fetch_at_production_buffer_size_rejects_backward_jump() {
+        // B3: build a contig wider than the production sliding
+        // buffer (1 MiB) and exercise the OutOfPattern contract at
+        // the real buffer size, not the test-only 4 KiB. A refactor
+        // that silently turned OutOfPattern into a refill would
+        // shrink throughput on the cohort var-caller hot path but
+        // pass every other test in this file.
+        let specs = vec![ContigSpec {
+            name: "chr0".into(),
+            length: 4 * 1024 * 1024,
+        }];
+        let (_dir, path) = build_fasta(&specs).expect("fasta");
+        let fetcher =
+            StreamingChromRefFetcher::for_contig(&path, "chr0").expect("for_contig");
+        // Forward fetch at 2 MiB — primes the buffer past its origin.
+        ChromRefFetcher::fetch(&fetcher, 2 * 1024 * 1024, 16).expect("forward fetch");
+        // Backward jump beyond the buffer's origin.
+        let err = ChromRefFetcher::fetch(&fetcher, 1, 16).expect_err("backward must fail");
+        match err {
+            ChromRefFetchError::OutOfPattern { .. } => {}
+            other => panic!("expected OutOfPattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_evict_fetch_in_buffer_hit_does_not_refill() {
+        // M25: the warm-cache happy path for BAQ. After the first
+        // fetch primes the buffer, a request whose range is already
+        // covered must not touch `buf_start_base` and must not
+        // re-read from disk (verified by observing buf_len + origin
+        // are unchanged).
+        let seq: Vec<u8> = (0..200).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 60);
+
+        // Prime: fetch a 32-byte window starting at base 50.
+        let primed = fetcher.fetch(50, 32).expect("prime").to_vec();
+        assert_eq!(primed, &seq[49..81]);
+        let origin_after_prime = fetcher.buf_start_base();
+        let len_after_prime = fetcher.buf_len();
+
+        // In-buffer hit: fetch a sub-range covered by the primed
+        // window. Must not change buffer state.
+        let hit = fetcher.fetch(60, 8).expect("in-buffer").to_vec();
+        assert_eq!(hit, &seq[59..67]);
+        assert_eq!(fetcher.buf_start_base(), origin_after_prime);
+        assert_eq!(fetcher.buf_len(), len_after_prime);
+    }
+
+    #[test]
+    fn manual_evict_evict_before_past_contig_end_clears_and_pins_buffer() {
+        // M24: `evict_before(contig_length + 1)` is a legitimate
+        // caller intent (the BAQ chunk ran off the end of the
+        // contig and the caller wants to free the buffer). The
+        // buffer must clear and `buf_start_base` must pin to the
+        // requested coordinate; a subsequent fetch from anywhere
+        // valid in the contig still works.
+        let seq: Vec<u8> = (0..50).map(|i| b"ACGT"[i % 4]).collect();
+        let (_dir, mut fetcher) = manual_evict_fetcher_from_bytes(&seq, 50);
+
+        fetcher.fetch(20, 8).expect("prime");
+        assert!(fetcher.buf_len() > 0);
+
+        let past_end = (seq.len() as u32) + 1; // == contig_length + 1
+        fetcher.evict_before(past_end);
+        assert_eq!(fetcher.buf_len(), 0);
+        assert_eq!(fetcher.buf_start_base(), past_end);
+
+        // Buffer is empty: next fetch starts fresh from disk,
+        // ignoring the stale `buf_start_base = past_end`.
+        let bytes = fetcher.fetch(10, 8).expect("post-evict fetch").to_vec();
+        assert_eq!(bytes, &seq[9..17]);
+    }
 }
