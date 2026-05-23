@@ -511,6 +511,12 @@ where
     /// land here, so this queue only carries real records and
     /// surfaced errors.
     pending: VecDeque<Result<MergedRecord, PerGroupMergerError>>,
+    /// Reusable buffer that `process_group` fills with the per-group
+    /// reference window via `ChromRefFetcher::fetch_into`. Grows to
+    /// the largest group span seen and is then recycled — eliminates
+    /// the per-group `Vec<u8>` alloc/free pair that `ref_fetcher.fetch`
+    /// used to produce.
+    ref_seq_scratch: Vec<u8>,
     /// Latched after the first surfaced error or upstream exhaustion.
     done: bool,
 }
@@ -538,6 +544,7 @@ where
             config,
             genotype_tables: _,
             pending,
+            ref_seq_scratch: _,
             done,
         } = self;
         f.debug_struct("PerGroupMerger")
@@ -568,6 +575,7 @@ where
             config,
             genotype_tables,
             pending: VecDeque::new(),
+            ref_seq_scratch: Vec::new(),
             done: false,
         }
     }
@@ -607,14 +615,23 @@ where
         // records below the error. Per-chrom outer parallelism lives
         // in `cohort_driver`; this loop runs serially on a single
         // worker thread.
+        //
+        // Pull out the per-merger fields we need by reference so the
+        // closure can capture them disjointly — `ref_seq_scratch`
+        // needs `&mut`, the others need `&`.
+        let ref_fetcher = self.ref_fetcher.as_ref();
+        let config = &self.config;
+        let genotype_tables = &self.genotype_tables;
+        let ref_seq_scratch = &mut self.ref_seq_scratch;
         let results: Vec<Result<Option<MergedRecord>, PerGroupMergerError>> = batch
             .into_iter()
             .map(|group| {
                 process_group(
                     group,
-                    self.ref_fetcher.as_ref(),
-                    &self.config,
-                    &self.genotype_tables,
+                    ref_fetcher,
+                    config,
+                    genotype_tables,
+                    ref_seq_scratch,
                 )
             })
             .collect();
@@ -668,6 +685,7 @@ fn process_group(
     ref_fetcher: &(dyn ChromRefFetcher + Send),
     config: &PerGroupMergerConfig,
     genotype_tables: &[Vec<Vec<u8>>],
+    ref_seq_scratch: &mut Vec<u8>,
 ) -> Result<Option<MergedRecord>, PerGroupMergerError> {
     let chrom_id = group.chrom_id;
     let start = group.start;
@@ -705,14 +723,15 @@ fn process_group(
     }
     let span = end - start + 1;
 
-    let ref_seq = ref_fetcher.fetch(start, span).map_err(|source| {
-        PerGroupMergerError::RefFetch {
+    ref_fetcher
+        .fetch_into(start, span, ref_seq_scratch)
+        .map_err(|source| PerGroupMergerError::RefFetch {
             chrom_id,
             start,
             end,
             source: std::io::Error::other(format!("{source}")),
-        }
-    })?;
+        })?;
+    let ref_seq: &[u8] = ref_seq_scratch;
     if ref_seq.len() != span as usize {
         // The trait contract requires exactly `length` bytes; an
         // alternative fetcher implementation that returns fewer
@@ -742,7 +761,7 @@ fn process_group(
         "OverlappingVariantGroup records disagree on per_sample width",
     );
 
-    let unified = unify_alleles(&group, &ref_seq, n_samples)?;
+    let unified = unify_alleles(&group, ref_seq, n_samples)?;
     let unified = enforce_max_alleles(unified, config.max_alleles);
 
     // REF-only ⇒ no record. Compound rejection (no entry added) and

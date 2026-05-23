@@ -585,6 +585,29 @@ pub trait ChromRefFetcher {
         Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>,
         ChromRefFetchError,
     >;
+
+    /// Append `length` bases starting at 1-based `start` into the
+    /// caller-supplied `dst`. The buffer is cleared first; on success
+    /// `dst.len() == length`. Allocation-free in the hot path when
+    /// `dst` is reused across calls — that's the reason this method
+    /// exists alongside `fetch`, which returns an owned `Vec<u8>`.
+    ///
+    /// Default impl forwards to `fetch` + `extend_from_slice` so any
+    /// impl that hasn't specialised this method works unchanged;
+    /// the production [`StreamingChromRefFetcher`] override copies
+    /// straight from its sliding buffer, avoiding the per-call
+    /// `Vec::with_capacity(length)` / drop pair.
+    fn fetch_into(
+        &self,
+        start_1based: u32,
+        length: u32,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), ChromRefFetchError> {
+        let v = self.fetch(start_1based, length)?;
+        dst.clear();
+        dst.extend_from_slice(&v);
+        Ok(())
+    }
 }
 
 /// Forwarding impl so callers may pass either an owned fetcher or a
@@ -613,6 +636,15 @@ impl<T: ChromRefFetcher + ?Sized> ChromRefFetcher for &T {
         ChromRefFetchError,
     > {
         (**self).iter_bases()
+    }
+
+    fn fetch_into(
+        &self,
+        start_1based: u32,
+        length: u32,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), ChromRefFetchError> {
+        (**self).fetch_into(start_1based, length, dst)
     }
 }
 
@@ -814,6 +846,19 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
         start_1based: u32,
         length: u32,
     ) -> Result<Vec<u8>, ChromRefFetchError> {
+        // fetch is just fetch_into into a fresh Vec; the heavy
+        // lifting lives in fetch_into.
+        let mut dst = Vec::with_capacity(length as usize);
+        self.fetch_into(start_1based, length, &mut dst)?;
+        Ok(dst)
+    }
+
+    fn fetch_into(
+        &self,
+        start_1based: u32,
+        length: u32,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), ChromRefFetchError> {
         if start_1based == 0 {
             return Err(ChromRefFetchError::InvalidStart);
         }
@@ -866,7 +911,9 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
         }
         let start_idx = (start_1based - state.buf_start_base) as usize;
         let end_idx = start_idx + length as usize;
-        Ok(state.buf[start_idx..end_idx].to_vec())
+        dst.clear();
+        dst.extend_from_slice(&state.buf[start_idx..end_idx]);
+        Ok(())
     }
 
     fn iter_bases<'a>(
