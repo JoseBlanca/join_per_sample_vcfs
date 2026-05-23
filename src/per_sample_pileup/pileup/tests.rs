@@ -58,7 +58,7 @@ impl MultiChromRefFetcher for MockFasta {
             self.chromosomes
                 .get(chrom_id as usize)
                 .ok_or_else(|| ChromRefFetchError::Io {
-                    contig_name: chrom_name.clone(),
+                    chrom_name: chrom_name.clone(),
                     source: std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!("unknown chrom_id={chrom_id}"),
@@ -70,8 +70,8 @@ impl MultiChromRefFetcher for MockFasta {
         let end_exclusive = start_1based + length;
         if (end_exclusive - 1) as usize > chrom.len() {
             return Err(ChromRefFetchError::OutOfBounds {
-                contig_name: chrom_name,
-                contig_length: chrom.len() as u32,
+                chrom_name: chrom_name,
+                chrom_length: chrom.len() as u32,
                 start: start_1based,
                 end: end_exclusive,
             });

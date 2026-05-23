@@ -1999,8 +1999,8 @@ mod tests {
         fn fetch(&self, start_1based: u32, length: u32) -> Result<Vec<u8>, ChromRefFetchError> {
             if start_1based < self.base_offset {
                 return Err(ChromRefFetchError::OutOfBounds {
-                    contig_name: "mock".into(),
-                    contig_length: self.length(),
+                    chrom_name: "mock".into(),
+                    chrom_length: self.length(),
                     start: start_1based,
                     end: start_1based + length,
                 });
@@ -2009,8 +2009,8 @@ mod tests {
             let end_idx = start_idx + length as usize;
             if end_idx > self.seq.len() {
                 return Err(ChromRefFetchError::OutOfBounds {
-                    contig_name: "mock".into(),
-                    contig_length: self.length(),
+                    chrom_name: "mock".into(),
+                    chrom_length: self.length(),
                     start: start_1based,
                     end: start_1based + length,
                 });

@@ -730,7 +730,7 @@ where
                     return Err(DustFilterError::RefFetch {
                         chrom_id: self.bound_chrom_id,
                         source: ChromRefFetchError::Io {
-                            contig_name: format!("chrom_id {}", self.bound_chrom_id),
+                            chrom_name: format!("chrom_id {}", self.bound_chrom_id),
                             source,
                         },
                     });
@@ -1161,8 +1161,8 @@ mod tests {
             let e = s + length as usize;
             if e > self.seq.len() {
                 return Err(ChromRefFetchError::OutOfBounds {
-                    contig_name: "stub".into(),
-                    contig_length: self.seq.len() as u32,
+                    chrom_name: "stub".into(),
+                    chrom_length: self.seq.len() as u32,
                     start: start_1based,
                     end: start_1based + length,
                 });
@@ -1177,7 +1177,7 @@ mod tests {
             self.iter_bases_calls.set(self.iter_bases_calls.get() + 1);
             if self.fail_iter {
                 return Err(ChromRefFetchError::Io {
-                    contig_name: "stub".into(),
+                    chrom_name: "stub".into(),
                     source: io::Error::other("stub iter_bases failure"),
                 });
             }
