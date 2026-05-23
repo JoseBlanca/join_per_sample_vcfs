@@ -327,6 +327,33 @@ clean on the touched files.
   `Err(OutOfPattern { … })`. Forward refills happen transparently
   (no error).
 
+**Design decision on `iter_bases` + `fetch` composition.**
+
+DUST calls `iter_bases()` once at chrom load and walks the whole
+contig forward; the sliding buffer ends positioned near the contig's
+end. PerGroupMerger then calls `fetch(start, length)` starting near
+the first variant group's position, which is typically near the
+*start* of the contig. If `OutOfPattern` fired on
+`start < buf_start_base`, it would trigger on PerGroupMerger's very
+first call after DUST.
+
+**Resolution:** `iter_bases()` resets the sliding buffer on
+construction and on Drop. The buffer is then empty when
+PerGroupMerger's first `fetch` arrives, which refills from its own
+`start` and updates the watermark to that origin. Subsequent
+`fetch` calls must be monotonic non-decreasing relative to that
+origin; backward jumps beyond the buffer's origin fire
+`OutOfPattern`.
+
+Conceptually: `iter_bases()` is a one-shot phase that owns the
+buffer for its lifetime; `fetch()` is a separate phase that starts
+fresh. The trait doc states this contract explicitly. No extra
+memory cost (the buffer is reused, not duplicated). Alternative
+designs considered: (a) separate buffer for `iter_bases` (doubles
+per-worker memory); (b) drop `OutOfPattern` entirely (loses the
+fail-fast contract). Going with the reset-on-Drop approach because
+it costs nothing and keeps the contract crisp.
+
 **Tests:**
 
 All new unit tests live in `ref_fetcher.rs::tests`:
