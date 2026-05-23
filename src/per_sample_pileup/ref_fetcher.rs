@@ -616,6 +616,15 @@ pub enum ChromRefFetchError {
     },
 }
 
+/// Sealed-marker module for [`ChromRefFetcher`]. Visibility is
+/// `pub(crate)` so in-tree modules and tests can add new
+/// `ChromRefFetcher` impls (each one must also `impl
+/// sealed::Sealed`); external crates cannot. See M9 in the
+/// 2026-05-23 ref_fetcher code review.
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
 /// Reference-FASTA fetcher bound to a single contig at construction
 /// time. Implementations differ in the access patterns they accept:
 ///
@@ -634,7 +643,16 @@ pub enum ChromRefFetchError {
 /// pipeline runs `iter_bases()` (DUST mask construction) once at
 /// chrom load, then switches to `fetch()` (PerGroupMerger window
 /// reads).
-pub trait ChromRefFetcher {
+///
+/// M9 (2026-05-23 code review): the trait is **sealed** —
+/// `sealed::Sealed` is `pub(crate)` so in-tree modules and tests can
+/// add new impls but external crates cannot. The trait carries a
+/// non-trivial cross-call contract (`iter_bases` Drop-reset; the
+/// monotonic-forward `fetch` invariant) that a downstream impl
+/// could violate silently, and the API is still evolving (the
+/// `fetch_into` default impl was added in a perf-review fix).
+/// Sealing keeps both moving parts in-tree.
+pub trait ChromRefFetcher: sealed::Sealed {
     /// Total bases in the bound contig.
     fn length(&self) -> u32;
 
@@ -694,6 +712,7 @@ pub trait ChromRefFetcher {
 /// it holds a `SharedRefFetcher = Arc<dyn ChromRefFetcher + Send>`
 /// and passes `&*fetcher` (a `&(dyn ChromRefFetcher + Send)`) into
 /// `DustFilter::new`, which is generic over `F: ChromRefFetcher`.
+impl<T: ChromRefFetcher + ?Sized> sealed::Sealed for &T {}
 impl<T: ChromRefFetcher + ?Sized> ChromRefFetcher for &T {
     fn length(&self) -> u32 {
         (**self).length()
@@ -917,6 +936,7 @@ impl Drop for ChromRefBaseIter<'_> {
     }
 }
 
+impl sealed::Sealed for StreamingChromRefFetcher {}
 impl ChromRefFetcher for StreamingChromRefFetcher {
     fn length(&self) -> u32 {
         self.fai.length

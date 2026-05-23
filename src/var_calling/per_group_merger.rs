@@ -1990,6 +1990,7 @@ mod tests {
         base_offset: u32,
     }
 
+    impl crate::per_sample_pileup::ref_fetcher::sealed::Sealed for MockRef {}
     impl ChromRefFetcher for MockRef {
         fn length(&self) -> u32 {
             self.base_offset.saturating_sub(1) + self.seq.len() as u32
@@ -2868,6 +2869,7 @@ mod tests {
     #[test]
     fn process_group_returns_error_on_short_fetcher_return() {
         struct ShortRef;
+        impl crate::per_sample_pileup::ref_fetcher::sealed::Sealed for ShortRef {}
         impl ChromRefFetcher for ShortRef {
             fn length(&self) -> u32 {
                 u32::MAX

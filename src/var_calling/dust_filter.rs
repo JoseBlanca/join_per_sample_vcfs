@@ -1147,6 +1147,7 @@ mod tests {
         }
     }
 
+    impl crate::per_sample_pileup::ref_fetcher::sealed::Sealed for StubChromRefFetcher {}
     impl ChromRefFetcher for StubChromRefFetcher {
         fn length(&self) -> u32 {
             self.seq.len() as u32
