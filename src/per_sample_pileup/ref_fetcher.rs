@@ -508,12 +508,7 @@ impl StreamingChromRefFetcher {
         fai_path: Option<&Path>,
         chrom_name: &str,
     ) -> Result<Self, ChromRefFetchError> {
-        Self::for_contig_internal(
-            fasta_path,
-            fai_path,
-            chrom_name,
-            STREAMING_REF_BUFFER_BYTES,
-        )
+        Self::for_contig_internal(fasta_path, fai_path, chrom_name, STREAMING_REF_BUFFER_BYTES)
     }
 
     /// Test-only constructor allowing a custom buffer size so the
@@ -1456,10 +1451,7 @@ mod tests {
 
         let result = StreamingChromRefFetcher::for_contig(&path, "chr_missing");
         match result {
-            Err(ChromRefFetchError::Io {
-                chrom_name,
-                source,
-            }) => {
+            Err(ChromRefFetchError::Io { chrom_name, source }) => {
                 assert_eq!(chrom_name, "chr_missing");
                 assert_eq!(source.kind(), io::ErrorKind::NotFound);
             }
