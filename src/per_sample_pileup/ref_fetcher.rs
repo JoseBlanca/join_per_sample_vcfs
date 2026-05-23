@@ -121,6 +121,22 @@ pub struct StreamingChromRefFetcher {
     inner: RefCell<StreamState>,
 }
 
+// M14 (2026-05-23 code review): explicit compile-time assertion of
+// `Send + !Sync`. Today this holds because `RefCell<StreamState>`
+// auto-derives both bounds correctly — but the cohort concurrency
+// model documented at the `inner` field is load-bearing, and a
+// future field addition (e.g. an Arc<something> or a Mutex) could
+// silently flip the bounds and let the cohort driver share the
+// fetcher across threads via accident. The Send check below is a
+// hard fence; the !Sync requirement is enforced by `RefCell` itself
+// (it's `!Sync` by definition), so any field change that breaks the
+// !Sync property has to first remove the `RefCell`, which the
+// reviewer would catch.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<StreamingChromRefFetcher>();
+};
+
 /// Pared-down `.fai` record — just the fields the streamer needs.
 /// Avoids carrying around a `noodles::fai::Record` (which is harder
 /// to construct from raw values in the in-memory test fixture).
@@ -184,9 +200,15 @@ impl ContigFai {
 /// Source of FASTA bytes for the streamer. Production uses a real
 /// `File`; tests use an in-memory `Vec<u8>` (`Cursor`) so the suite
 /// stays fast and hermetic.
+///
+/// M8 (2026-05-23 code review): the `Memory` variant is
+/// `#[cfg(test)]`-gated rather than always-present, so production
+/// builds carry no discriminant overhead for the test-only path
+/// and the `Source` enum is a single-variant production enum
+/// (which LLVM optimises out entirely).
 enum Source {
     File(File),
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Memory(io::Cursor<Vec<u8>>),
 }
 
@@ -196,6 +218,7 @@ impl Source {
             Source::File(f) => {
                 f.seek(SeekFrom::Start(offset))?;
             }
+            #[cfg(test)]
             Source::Memory(c) => {
                 c.seek(SeekFrom::Start(offset))?;
             }
@@ -205,6 +228,7 @@ impl Source {
     fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Source::File(f) => f.read(buf),
+            #[cfg(test)]
             Source::Memory(c) => c.read(buf),
         }
     }
@@ -543,6 +567,13 @@ fn refill(
 //   constructor calls.
 
 /// Why a [`ChromRefFetcher`] call failed.
+// M2 (2026-05-23 code review): #[non_exhaustive] so adding a future
+// variant (e.g. an InvalidIndex variant for B1's validation if it
+// graduates from io::Error to a typed variant) doesn't break callers.
+// The enum lives behind a `pub` surface but the crate is unpublished;
+// in-tree matchers must accept the marker today so they pay the
+// add-a-variant cost upfront.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ChromRefFetchError {
     /// The requested `[start, start+length)` window exceeds the
@@ -630,20 +661,26 @@ pub trait ChromRefFetcher {
     /// `dst` is reused across calls — that's the reason this method
     /// exists alongside `fetch`, which returns an owned `Vec<u8>`.
     ///
-    /// Default impl forwards to `fetch` + `extend_from_slice` so any
-    /// impl that hasn't specialised this method works unchanged;
-    /// the production [`StreamingChromRefFetcher`] override copies
+    /// Default impl forwards to `fetch` and `mem::swap`s the
+    /// returned `Vec<u8>` into `dst` (transferring ownership of the
+    /// fresh buffer; the caller's previous `dst` is dropped). The
+    /// production [`StreamingChromRefFetcher`] override copies
     /// straight from its sliding buffer, avoiding the per-call
-    /// `Vec::with_capacity(length)` / drop pair.
+    /// `Vec::with_capacity(length)` / drop pair entirely.
+    ///
+    /// M10 (2026-05-23 code review): the default impl was previously
+    /// `dst.clear() + extend_from_slice(&v)`, which is a fresh
+    /// allocation followed by a memcpy — exactly the per-call alloc
+    /// the method exists to avoid. The `mem::swap` shape inherits
+    /// the freshly-allocated buffer instead of memcpying through.
     fn fetch_into(
         &self,
         start_1based: u32,
         length: u32,
         dst: &mut Vec<u8>,
     ) -> Result<(), ChromRefFetchError> {
-        let v = self.fetch(start_1based, length)?;
-        dst.clear();
-        dst.extend_from_slice(&v);
+        let mut v = self.fetch(start_1based, length)?;
+        std::mem::swap(dst, &mut v);
         Ok(())
     }
 }
@@ -860,9 +897,20 @@ impl Drop for ChromRefBaseIter<'_> {
         // Reset the sliding buffer so the next `fetch()` starts a
         // fresh access-pattern phase regardless of where the iter
         // left off.
-        let mut state = self.fetcher.inner.borrow_mut();
-        state.buf.clear();
-        state.buf_start_base = 0;
+        //
+        // M15 (2026-05-23 code review): `try_borrow_mut` (not
+        // `borrow_mut`) so a panic that escaped from `next()` while
+        // holding its own `borrow_mut` doesn't double-panic and
+        // abort the process. The buffer reset is best-effort:
+        // skipping it is safe because the next `iter_bases()` call
+        // resets the buffer at the top, and any post-panic
+        // `fetch()` would see the stale buffer and either return
+        // OutOfPattern (correct) or refill (correct on monotonic
+        // access).
+        if let Ok(mut state) = self.fetcher.inner.try_borrow_mut() {
+            state.buf.clear();
+            state.buf_start_base = 0;
+        }
     }
 }
 
