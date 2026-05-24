@@ -45,6 +45,7 @@ use super::errors::AlignmentInputError;
 /// `index_preflight` layer, downstream) hands us whichever it
 /// loaded.
 #[derive(Clone)]
+#[non_exhaustive]
 pub(super) enum BamIndex {
     /// `.bai` — the legacy BAM index. 16 kbp bins; cannot address
     /// contigs above 512 Mbp.

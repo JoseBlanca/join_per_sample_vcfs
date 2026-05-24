@@ -119,6 +119,7 @@ pub(crate) fn parse_mismatch_fraction(s: &str) -> Result<f32, String> {
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PileupCliError {
     #[error("alignment input: {0}")]
     AlignmentInput(#[from] AlignmentInputError),

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AlignmentInputError {
     #[error("at least one alignment-file input is required")]
     NoInputs,
