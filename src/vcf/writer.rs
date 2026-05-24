@@ -25,9 +25,9 @@ use super::errors::VcfWriteError;
 use super::header::{CohortMetadata, build_vcf_header};
 use super::record_encode::{build_format_keys, encode};
 use super::sink::{SinkKind, tmp_path_for};
+use super::writable::VcfWritable;
 use crate::psp::header::ParsedChromosome;
 use crate::var_calling::per_group_merger::genotype_order;
-use crate::var_calling::posterior_engine::PosteriorRecord;
 
 /// Streams `PosteriorRecord` items to a VCF file.
 ///
@@ -196,8 +196,8 @@ impl CohortVcfWriter {
     ///   (non-UTF-8 allele bytes, invalid `Position`, …).
     /// * [`VcfWriteError::WriteRecord`] — the sink rejected the
     ///   serialised bytes.
-    pub fn write_record(&mut self, record: &PosteriorRecord) -> Result<(), VcfWriteError> {
-        let locus = (record.locus.chrom_id, record.locus.start);
+    pub fn write_record<R: VcfWritable>(&mut self, record: &R) -> Result<(), VcfWriteError> {
+        let locus = (record.chrom_id(), record.pos_1based());
         if let Some(prev) = self.last_locus
             && locus <= prev
         {
@@ -211,8 +211,8 @@ impl CohortVcfWriter {
 
         let table = self
             .genotype_tables
-            .entry((record.ploidy, record.alleles.len()))
-            .or_insert_with(|| genotype_order(record.ploidy, record.alleles.len()))
+            .entry((record.ploidy(), record.n_alleles()))
+            .or_insert_with(|| genotype_order(record.ploidy(), record.n_alleles()))
             .clone();
         let buf = encode(
             record,

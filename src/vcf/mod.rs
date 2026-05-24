@@ -1,14 +1,16 @@
 //! Cohort VCF writer (Stage 6 sink).
 //!
-//! Streams [`PosteriorRecord`] items from the posterior engine and
-//! emits a multi-sample VCF (plain text or bgzipped). The writer is
-//! built around three boundaries:
+//! Streams [`VcfWritable`] items (any type implementing the
+//! `VcfWritable` contract; the pipeline's
+//! [`PosteriorRecord`](crate::var_calling::posterior_engine::PosteriorRecord)
+//! does) and emits a multi-sample VCF (plain text or bgzipped). The
+//! writer is built around three boundaries:
 //!
 //! * [`CohortMetadata`] carries everything pinned at construction
-//!   time — sample names (in the order matching
-//!   `PosteriorRecord.posteriors` rows), the contig table sourced
-//!   from the upstream merger's chromosome slice, and the provenance
-//!   strings that go into `##source` / `##commandline` header lines.
+//!   time — sample names (in the order matching the writable record's
+//!   per-sample-row layout), the contig table sourced from the
+//!   upstream merger's chromosome slice, and the provenance strings
+//!   that go into `##source` / `##commandline` header lines.
 //! * [`WriterConfig`] carries per-run knobs — the output path
 //!   (suffix selects plain vs bgzf, matched case-insensitively), and
 //!   the off-by-default [`WriterConfig::emit_gp`] flag. Construct via
@@ -16,8 +18,10 @@
 //!   `output` has no sensible default.
 //! * [`CohortVcfWriter`] is the runtime state — opens
 //!   `<output>.tmp`, writes the header at construction, accepts
-//!   per-record `write_record` calls, and atomically renames into
-//!   place on [`CohortVcfWriter::finish`].
+//!   per-record `write_record` calls (generic over `R: VcfWritable`,
+//!   monomorphised per call site so the trait dispatch inlines to a
+//!   direct field access), and atomically renames into place on
+//!   [`CohortVcfWriter::finish`].
 //!
 //! Errors flow through [`VcfWriteError`]; the enum is
 //! `#[non_exhaustive]`, so callers writing `match` against it must
@@ -26,8 +30,6 @@
 //! mode: callers do not see a half-written VCF.
 //!
 //! Plan: `doc/devel/implementation_plans/cohort_vcf_writer.md`.
-//!
-//! [`PosteriorRecord`]: crate::var_calling::posterior_engine::PosteriorRecord
 
 use std::path::PathBuf;
 
@@ -36,12 +38,14 @@ mod errors;
 mod header;
 mod record_encode;
 mod sink;
+mod writable;
 mod writer;
 
 pub use errors::VcfWriteError;
 pub use header::CohortMetadata;
 pub(crate) use sink::path_is_bgzf;
 pub use sink::tmp_path_for;
+pub use writable::VcfWritable;
 pub use writer::CohortVcfWriter;
 
 /// Default for [`WriterConfig::emit_gp`]. Off — `GP` is `Number=G`
@@ -75,7 +79,7 @@ pub const DEFAULT_EMIT_GP: bool = false;
 ///
 /// ```
 /// use std::path::PathBuf;
-/// use pop_var_caller::var_calling::vcf_writer::WriterConfig;
+/// use pop_var_caller::vcf::WriterConfig;
 ///
 /// let cfg = WriterConfig::new(PathBuf::from("out.vcf")).with_emit_gp(true);
 /// assert_eq!(cfg.emit_gp, true);

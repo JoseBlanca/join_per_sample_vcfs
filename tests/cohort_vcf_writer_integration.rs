@@ -16,9 +16,7 @@ use pop_var_caller::pileup_record::AlleleSupportStats;
 use pop_var_caller::psp::header::ParsedChromosome;
 use pop_var_caller::var_calling::per_group_merger::MergedAllele;
 use pop_var_caller::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
-use pop_var_caller::var_calling::vcf_writer::{
-    CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig,
-};
+use pop_var_caller::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig};
 
 fn ref_allele(seq: &[u8]) -> MergedAllele {
     MergedAllele {

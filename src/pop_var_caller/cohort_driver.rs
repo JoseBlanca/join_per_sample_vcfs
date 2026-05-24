@@ -31,9 +31,7 @@ use crate::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperError, VariantGrouper};
-use crate::var_calling::vcf_writer::{
-    CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig, tmp_path_for,
-};
+use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig, tmp_path_for};
 
 /// Default for [`CohortPipelineParams::min_qual_phred`]. Matches
 /// GATK HaplotypeCaller's `--standard-min-confidence-threshold-for-calling`
@@ -414,7 +412,7 @@ fn pool_allele_mapq(
 /// [`PspReader::region_records`](crate::psp::PspReader::region_records)
 /// with `start = 1`, `end = chrom.length`; chromosomes with zero
 /// records on disk yield an empty iterator + a header-only fragment,
-/// which [`crate::var_calling::vcf_writer::concat::concat_fragments`]
+/// which [`crate::vcf::concat::concat_fragments`]
 /// handles by stripping the header on non-first fragments.
 ///
 /// Returns `(chrom_id, CohortDriveStats)` on success. Errors are

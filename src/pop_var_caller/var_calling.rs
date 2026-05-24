@@ -53,8 +53,8 @@ use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
-use crate::var_calling::vcf_writer::concat::concat_fragments;
-use crate::var_calling::vcf_writer::{CohortMetadata, VcfWriteError, WriterConfig, path_is_bgzf};
+use crate::vcf::concat::concat_fragments;
+use crate::vcf::{CohortMetadata, VcfWriteError, WriterConfig, path_is_bgzf};
 
 // ---------------------------------------------------------------------
 // CLI surface

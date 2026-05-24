@@ -61,7 +61,7 @@ use crate::var_calling::posterior_engine::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
 use crate::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
-use crate::var_calling::vcf_writer::DEFAULT_EMIT_GP;
+use crate::vcf::DEFAULT_EMIT_GP;
 
 /// Stage 1 knobs (CRAM-input filters, BAQ HMM, pileup walker).
 /// Flattened into [`PileupArgs`](super::super::cli::PileupArgs) and

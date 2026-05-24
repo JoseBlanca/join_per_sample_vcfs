@@ -19,4 +19,3 @@ pub mod per_group_merger;
 pub mod per_position_merger;
 pub mod posterior_engine;
 pub mod variant_grouping;
-pub mod vcf_writer;

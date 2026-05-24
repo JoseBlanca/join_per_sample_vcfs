@@ -110,7 +110,7 @@ use pop_var_caller::var_calling::posterior_engine::{
 use pop_var_caller::var_calling::variant_grouping::{
     DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig,
 };
-use pop_var_caller::var_calling::vcf_writer::{CohortMetadata, WriterConfig};
+use pop_var_caller::vcf::{CohortMetadata, WriterConfig};
 
 // ---------------------------------------------------------------------
 // Bench dimensions

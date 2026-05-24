@@ -31,8 +31,8 @@ use noodles_vcf::variant::record_buf::{
 
 use super::WriterConfig;
 use super::errors::VcfWriteError;
+use super::writable::VcfWritable;
 use crate::psp::header::ParsedChromosome;
-use crate::var_calling::posterior_engine::PosteriorRecord;
 
 /// Hard cap on the QUAL column.
 ///
@@ -70,8 +70,8 @@ pub(super) fn build_format_keys(config: &WriterConfig) -> Keys {
 /// `table` is the canonical `genotype_order(ploidy, n_alleles)`
 /// table for this record's allele cardinality; the writer caches it
 /// per `(ploidy, n_alleles)` so we don't rebuild per record.
-pub(super) fn encode(
-    record: &PosteriorRecord,
+pub(super) fn encode<R: VcfWritable>(
+    record: &R,
     contigs: &[ParsedChromosome],
     config: &WriterConfig,
     format_keys: &Keys,
@@ -81,28 +81,23 @@ pub(super) fn encode(
     validate_record_shape(record, expected_samples, table)?;
 
     let chrom_name = contigs
-        .get(record.locus.chrom_id as usize)
+        .get(record.chrom_id() as usize)
         .map(|c| c.name.clone())
         .ok_or(VcfWriteError::UnknownChromId {
-            chrom_id: record.locus.chrom_id,
-            pos: record.locus.start,
+            chrom_id: record.chrom_id(),
+            pos: record.pos_1based(),
             n_contigs: contigs.len(),
         })?;
 
     let position = build_position(record)?;
 
-    let ref_bases = allele_to_string(
-        &record.alleles[0].seq,
-        record.locus.chrom_id,
-        record.locus.start,
-    )?;
-    let alt_strings: Vec<String> = record.alleles[1..]
-        .iter()
-        .map(|a| allele_to_string(&a.seq, record.locus.chrom_id, record.locus.start))
+    let ref_bases = allele_to_string(record.allele_seq(0), record.chrom_id(), record.pos_1based())?;
+    let alt_strings: Vec<String> = (1..record.n_alleles())
+        .map(|i| allele_to_string(record.allele_seq(i), record.chrom_id(), record.pos_1based()))
         .collect::<Result<_, _>>()?;
     let alternate_bases = AlternateBases::from(alt_strings);
 
-    let qual = clamp_qual(record.qual_phred);
+    let qual = clamp_qual(record.qual_phred());
 
     // FILTER policy:
     //   * `PASS`     — EM converged within `max_iterations`.
@@ -114,7 +109,7 @@ pub(super) fn encode(
     // A future filter slice will re-introduce filter *expressions*
     // through a typed-rule surface; the per-record bit here is the
     // engine's diagnostics signal, not the rule surface.
-    let filters = if record.diagnostics.converged {
+    let filters = if record.converged() {
         Filters::pass()
     } else {
         [String::from(super::header::EM_NO_CONV_FILTER_ID)]
@@ -122,7 +117,7 @@ pub(super) fn encode(
             .collect()
     };
 
-    let n_alleles = record.alleles.len();
+    let n_alleles = record.n_alleles();
 
     let info = build_info(record, n_alleles, table)?;
     let samples = build_samples(record, format_keys, config, table)?;
@@ -144,24 +139,24 @@ pub(super) fn encode(
 /// declared shape before any indexing. A malformed upstream becomes
 /// a typed `InconsistentRecord` or `SampleCountMismatch` instead of
 /// a panic at the Stage 6 sink.
-fn validate_record_shape(
-    record: &PosteriorRecord,
+fn validate_record_shape<R: VcfWritable>(
+    record: &R,
     expected_samples: usize,
     table: &[Vec<u8>],
 ) -> Result<(), VcfWriteError> {
-    if record.n_samples != expected_samples {
+    if record.n_samples() != expected_samples {
         return Err(VcfWriteError::SampleCountMismatch {
-            chrom_id: record.locus.chrom_id,
-            pos: record.locus.start,
+            chrom_id: record.chrom_id(),
+            pos: record.pos_1based(),
             expected_samples,
-            got_samples: record.n_samples,
+            got_samples: record.n_samples(),
         });
     }
-    let n_alleles = record.alleles.len();
+    let n_alleles = record.n_alleles();
     if n_alleles == 0 {
         return Err(VcfWriteError::InconsistentRecord {
-            chrom_id: record.locus.chrom_id,
-            pos: record.locus.start,
+            chrom_id: record.chrom_id(),
+            pos: record.pos_1based(),
             field: "alleles",
             expected: 1,
             actual: 0,
@@ -172,45 +167,45 @@ fn validate_record_shape(
     // a mismatch is an internal bug rather than upstream malformation,
     // but we surface it as `InconsistentRecord` so the error path is
     // uniform.
-    if table.len() != record.n_genotypes {
+    if table.len() != record.n_genotypes() {
         return Err(VcfWriteError::InconsistentRecord {
-            chrom_id: record.locus.chrom_id,
-            pos: record.locus.start,
+            chrom_id: record.chrom_id(),
+            pos: record.pos_1based(),
             field: "n_genotypes/genotype_order table",
-            expected: record.n_genotypes,
+            expected: record.n_genotypes(),
             actual: table.len(),
         });
     }
-    let n_samples = record.n_samples;
+    let n_samples = record.n_samples();
     for &(field, expected, actual) in &[
-        ("best_genotype", n_samples, record.best_genotype.len()),
-        ("gq_phred", n_samples, record.gq_phred.len()),
+        ("best_genotype", n_samples, record.best_genotype().len()),
+        ("gq_phred", n_samples, record.gq_phred().len()),
         (
             "allele_frequencies",
             n_alleles,
-            record.allele_frequencies.len(),
+            record.allele_frequencies().len(),
         ),
         (
             "compound_frequencies",
             n_alleles,
-            record.compound_frequencies.len(),
+            record.compound_frequencies().len(),
         ),
-        ("scalars", n_samples * n_alleles, record.scalars.len()),
+        ("scalars", n_samples * n_alleles, record.scalars_len()),
         (
             "posteriors",
-            n_samples * record.n_genotypes,
-            record.posteriors.len(),
+            n_samples * record.n_genotypes(),
+            record.posteriors_len(),
         ),
         (
             "chain_anchor_flags",
             n_samples * n_alleles,
-            record.chain_anchor_flags.len(),
+            record.chain_anchor_flags_len(),
         ),
     ] {
         if expected != actual {
             return Err(VcfWriteError::InconsistentRecord {
-                chrom_id: record.locus.chrom_id,
-                pos: record.locus.start,
+                chrom_id: record.chrom_id(),
+                pos: record.pos_1based(),
                 field,
                 expected,
                 actual,
@@ -222,8 +217,8 @@ fn validate_record_shape(
 
 /// Convert the record's 1-based `start` to a noodles `Position`.
 /// Carries operation context through `VcfWriteError::Encode`.
-fn build_position(record: &PosteriorRecord) -> Result<Position, VcfWriteError> {
-    let pos_usize = usize::try_from(record.locus.start).map_err(|e| VcfWriteError::Encode {
+fn build_position<R: VcfWritable>(record: &R) -> Result<Position, VcfWriteError> {
+    let pos_usize = usize::try_from(record.pos_1based()).map_err(|e| VcfWriteError::Encode {
         operation: "1-based position to usize",
         source: Box::new(e),
     })?;
@@ -261,8 +256,8 @@ fn clamp_qual(qual_phred: f64) -> f32 {
     q.clamp(0.0, QUAL_MAX)
 }
 
-fn build_info(
-    record: &PosteriorRecord,
+fn build_info<R: VcfWritable>(
+    record: &R,
     n_alleles: usize,
     table: &[Vec<u8>],
 ) -> Result<Info, VcfWriteError> {
@@ -272,7 +267,7 @@ fn build_info(
     // AF — allele frequencies for ALT alleles only (REF is implied).
     // `Number=A`: empty list when no ALTs.
     if n_alts > 0 {
-        let af_values: Vec<Option<f32>> = record.allele_frequencies[1..]
+        let af_values: Vec<Option<f32>> = record.allele_frequencies()[1..]
             .iter()
             .map(|f| Some(*f as f32))
             .collect();
@@ -297,7 +292,7 @@ fn build_info(
 
     // DP — total depth across samples = sum of all per-allele
     // observation counts.
-    let dp_total: u64 = (0..record.n_samples)
+    let dp_total: u64 = (0..record.n_samples())
         .map(|s| {
             record
                 .scalars_row(s)
@@ -307,8 +302,8 @@ fn build_info(
         })
         .sum();
     let dp_total_i32 = i32::try_from(dp_total).map_err(|_| VcfWriteError::DepthOverflow {
-        chrom_id: record.locus.chrom_id,
-        pos: record.locus.start,
+        chrom_id: record.chrom_id(),
+        pos: record.pos_1based(),
         sample_idx: None,
         depth: dp_total,
     })?;
@@ -316,9 +311,10 @@ fn build_info(
         .insert("DP".into(), Some(InfoValue::Integer(dp_total_i32)));
 
     // CA — flag set when any sample carries a chain-anchor-broken
-    // call. `chain_anchor_flags` is a flat `Vec<bool>` of length
-    // `n_samples * n_alleles`.
-    if record.chain_anchor_flags.iter().any(|&b| b) {
+    // call. `chain_anchor_flags` is a flat row-major `Vec<bool>` of
+    // length `n_samples * n_alleles`; iterate row-by-row through the
+    // trait's `chain_anchor_flags_row(sample_idx)` accessor.
+    if (0..record.n_samples()).any(|s| record.chain_anchor_flags_row(s).iter().any(|&b| b)) {
         info.as_mut().insert("CA".into(), Some(InfoValue::Flag));
     }
 
@@ -363,11 +359,11 @@ impl CohortMapqStats {
     }
 }
 
-fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> Option<CohortMapqStats> {
+fn pool_allele_mapq<R: VcfWritable>(record: &R, allele_idx: usize) -> Option<CohortMapqStats> {
     let mut n: u64 = 0;
     let mut sum: u64 = 0;
     let mut sum_sq: u128 = 0;
-    for sample_idx in 0..record.n_samples {
+    for sample_idx in 0..record.n_samples() {
         let row = record.scalars_row(sample_idx);
         let stats = &row[allele_idx];
         n += u64::from(stats.num_obs);
@@ -401,7 +397,7 @@ fn welch_t(alt: &CohortMapqStats, ref_: &CohortMapqStats) -> Option<f32> {
     Some(((alt.mean - ref_.mean) / se2.sqrt()) as f32)
 }
 
-fn emit_mapq_info(record: &PosteriorRecord, n_alleles: usize, info: &mut Info) {
+fn emit_mapq_info<R: VcfWritable>(record: &R, n_alleles: usize, info: &mut Info) {
     if n_alleles < 2 {
         // REF-only sites never reach the VCF writer (cohort_driver
         // drops them upstream), but guard defensively.
@@ -457,21 +453,21 @@ fn emit_mapq_info(record: &PosteriorRecord, n_alleles: usize, info: &mut Info) {
 /// silent drop. The previous shape (`if alt_pos < n_alts { tally
 /// += 1 }`) violated the VCF spec invariant `sum(AC) + REF == AN`
 /// when the upstream produced an inconsistent genotype.
-fn tally_called_alleles(
-    record: &PosteriorRecord,
+fn tally_called_alleles<R: VcfWritable>(
+    record: &R,
     n_alleles: usize,
     table: &[Vec<u8>],
 ) -> Result<(Vec<u32>, u32), VcfWriteError> {
     let n_alts = n_alleles.saturating_sub(1);
     let mut ac_per_alt = vec![0u32; n_alts];
     let mut an_total: u32 = 0;
-    for (sample_idx, &gt_idx) in record.best_genotype.iter().enumerate() {
+    for (sample_idx, &gt_idx) in record.best_genotype().iter().enumerate() {
         let gt = lookup_genotype(table, record, sample_idx, gt_idx)?;
         for &allele_idx in gt {
             if (allele_idx as usize) >= n_alleles {
                 return Err(VcfWriteError::AlleleIndexOutOfBounds {
-                    chrom_id: record.locus.chrom_id,
-                    pos: record.locus.start,
+                    chrom_id: record.chrom_id(),
+                    pos: record.pos_1based(),
                     sample_idx,
                     allele_idx,
                     n_alleles,
@@ -488,16 +484,16 @@ fn tally_called_alleles(
     Ok((ac_per_alt, an_total))
 }
 
-fn build_samples(
-    record: &PosteriorRecord,
+fn build_samples<R: VcfWritable>(
+    record: &R,
     format_keys: &Keys,
     config: &WriterConfig,
     table: &[Vec<u8>],
 ) -> Result<Samples, VcfWriteError> {
-    let n_alleles = record.alleles.len();
-    let mut rows: Vec<Vec<Option<SampleValue>>> = Vec::with_capacity(record.n_samples);
-    for sample_idx in 0..record.n_samples {
-        let gt_idx = record.best_genotype[sample_idx];
+    let n_alleles = record.n_alleles();
+    let mut rows: Vec<Vec<Option<SampleValue>>> = Vec::with_capacity(record.n_samples());
+    for sample_idx in 0..record.n_samples() {
+        let gt_idx = record.best_genotype()[sample_idx];
         let gt = lookup_genotype(table, record, sample_idx, gt_idx)?;
         // Mi8: drop the gt_buf clear/reuse pattern — the trailing
         // .clone() inside the loop allocated a fresh String per row
@@ -507,15 +503,15 @@ fn build_samples(
         let mut gt_buf = String::with_capacity(2 * gt.len());
         format_gt_unphased(&mut gt_buf, gt);
 
-        let gq = record.gq_phred[sample_idx]
+        let gq = record.gq_phred()[sample_idx]
             .round()
             .clamp(0.0, GQ_MAX as f64) as i32;
 
         let scalars = record.scalars_row(sample_idx);
         let dp_sample: u64 = scalars.iter().map(|stats| u64::from(stats.num_obs)).sum();
         let dp_value = i32::try_from(dp_sample).map_err(|_| VcfWriteError::DepthOverflow {
-            chrom_id: record.locus.chrom_id,
-            pos: record.locus.start,
+            chrom_id: record.chrom_id(),
+            pos: record.pos_1based(),
             sample_idx: Some(sample_idx),
             depth: dp_sample,
         })?;
@@ -529,8 +525,8 @@ fn build_samples(
                 i32::try_from(stats.num_obs)
                     .map(Some)
                     .map_err(|_| VcfWriteError::DepthOverflow {
-                        chrom_id: record.locus.chrom_id,
-                        pos: record.locus.start,
+                        chrom_id: record.chrom_id(),
+                        pos: record.pos_1based(),
                         sample_idx: Some(sample_idx),
                         depth: u64::from(stats.num_obs),
                     })
@@ -563,9 +559,9 @@ fn build_samples(
 /// resolve `gt_idx` against the table; centralising the lookup keeps
 /// the five-field `GenotypeIndexOutOfBounds` constructor in one
 /// place.
-fn lookup_genotype<'a>(
+fn lookup_genotype<'a, R: VcfWritable>(
     table: &'a [Vec<u8>],
-    record: &PosteriorRecord,
+    record: &R,
     sample_idx: usize,
     gt_idx: usize,
 ) -> Result<&'a [u8], VcfWriteError> {
@@ -573,8 +569,8 @@ fn lookup_genotype<'a>(
         .get(gt_idx)
         .map(Vec::as_slice)
         .ok_or(VcfWriteError::GenotypeIndexOutOfBounds {
-            chrom_id: record.locus.chrom_id,
-            pos: record.locus.start,
+            chrom_id: record.chrom_id(),
+            pos: record.pos_1based(),
             sample_idx,
             got: gt_idx,
             n_genotypes: table.len(),

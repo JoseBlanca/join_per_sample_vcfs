@@ -234,7 +234,7 @@ impl Default for StoppingMode {
 /// The pattern matches the cohort CLI plan's choice (Option C in
 /// the 2026-05-19 plan-review discussion): builder for the sharp
 /// configs ([`crate::var_calling::posterior_engine::PosteriorEngineConfig`],
-/// [`crate::var_calling::vcf_writer::WriterConfig`]),
+/// [`crate::vcf::WriterConfig`]),
 /// validate-after-build for this wide one. A 14-arg positional
 /// constructor would be hostile; a 14-step `.with_*` chain would be
 /// equally noisy.

@@ -767,6 +767,70 @@ impl PosteriorRecord {
     }
 }
 
+// VcfWritable: connect PosteriorRecord to the VCF writer's input
+// contract. Every method here is a one-line accessor for an existing
+// field or a delegation to the per-sample-row helper, so monomorphised
+// callers inline back to a direct field access.
+impl crate::vcf::VcfWritable for PosteriorRecord {
+    fn chrom_id(&self) -> u32 {
+        self.locus.chrom_id
+    }
+    fn pos_1based(&self) -> u32 {
+        self.locus.start
+    }
+    fn ploidy(&self) -> u8 {
+        self.ploidy
+    }
+    fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+    fn n_genotypes(&self) -> usize {
+        self.n_genotypes
+    }
+    fn n_alleles(&self) -> usize {
+        self.alleles.len()
+    }
+    fn allele_seq(&self, allele_idx: usize) -> &[u8] {
+        &self.alleles[allele_idx].seq
+    }
+    fn qual_phred(&self) -> f64 {
+        self.qual_phred
+    }
+    fn converged(&self) -> bool {
+        self.diagnostics.converged
+    }
+    fn allele_frequencies(&self) -> &[f64] {
+        &self.allele_frequencies
+    }
+    fn compound_frequencies(&self) -> &[Option<f64>] {
+        &self.compound_frequencies
+    }
+    fn best_genotype(&self) -> &[usize] {
+        &self.best_genotype
+    }
+    fn gq_phred(&self) -> &[f64] {
+        &self.gq_phred
+    }
+    fn posteriors_row(&self, sample_idx: usize) -> &[f64] {
+        self.posteriors_row(sample_idx)
+    }
+    fn scalars_row(&self, sample_idx: usize) -> &[AlleleSupportStats] {
+        self.scalars_row(sample_idx)
+    }
+    fn chain_anchor_flags_row(&self, sample_idx: usize) -> &[bool] {
+        self.chain_anchor_flags_row(sample_idx)
+    }
+    fn posteriors_len(&self) -> usize {
+        self.posteriors.len()
+    }
+    fn scalars_len(&self) -> usize {
+        self.scalars.len()
+    }
+    fn chain_anchor_flags_len(&self) -> usize {
+        self.chain_anchor_flags.len()
+    }
+}
+
 /// EM bookkeeping for a single record. A `PosteriorRecord` is emitted
 /// regardless of EM convergence — `converged` carries that bit so the
 /// VCF writer can route non-converging records into a flagged

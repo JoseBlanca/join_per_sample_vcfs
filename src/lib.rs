@@ -23,3 +23,4 @@ pub mod pileup_record;
 pub mod pop_var_caller;
 pub mod psp;
 pub mod var_calling;
+pub mod vcf;

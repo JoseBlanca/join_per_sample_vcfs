@@ -9,7 +9,7 @@
 //! Also hosts the project-wide buffered-I/O capacity constant
 //! ([`DEFAULT_BUFFERED_IO_CAPACITY`]) — Mi19 — used by every
 //! `BufReader::with_capacity` / `BufWriter::with_capacity` call site
-//! in the `pop_var_caller` and `var_calling::vcf_writer` modules.
+//! in the `pop_var_caller` and `vcf` modules.
 //!
 //! Everything here is `pub(crate)`; the helpers are not part of the
 //! library's public surface (they would just be re-implemented by
