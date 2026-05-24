@@ -480,12 +480,15 @@ pub fn run_var_calling_from_bam(
 /// Mirrors what
 /// [`crate::bam::alignment_input::AlignmentMergedReader::query`] does
 /// per-worker, lifted to driver-startup time so workers only pay an
-/// `Arc::clone`. Dispatches on the input file's extension — same
-/// policy the merged reader uses, just here for an early stand-alone
-/// header harvest.
+/// `Arc::clone`. Dispatches on the input file's extension via the
+/// shared per-format helpers `read_cram_header_only` /
+/// `read_bam_header_only` so the CRAM-version gate (and any future
+/// format-specific magic-byte check) stays in one place.
 fn load_per_input_headers(
     alignment_files: &[PathBuf],
 ) -> Result<Vec<Arc<noodles_sam::Header>>, VarCallingFromBamCliError> {
+    use crate::bam::bam_input::read_bam_header_only;
+    use crate::bam::cram_input::read_cram_header_only;
     use crate::bam::errors::AlignmentInputError;
     use crate::bam::index_preflight::AlignmentFileKind;
 
@@ -498,42 +501,10 @@ fn load_per_input_headers(
         })?;
         let header = match kind {
             AlignmentFileKind::Cram => {
-                let mut reader = noodles_cram::io::reader::Builder::default()
-                    .build_from_path(path)
-                    .map_err(|source| {
-                        PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                            path: path.clone(),
-                            source,
-                        })
-                    })?;
-                reader.read_file_definition().map_err(|source| {
-                    PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                        path: path.clone(),
-                        source,
-                    })
-                })?;
-                reader.read_file_header().map_err(|source| {
-                    PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                        path: path.clone(),
-                        source,
-                    })
-                })?
+                read_cram_header_only(path).map_err(PileupCliError::CramInput)?
             }
             AlignmentFileKind::Bam => {
-                let mut reader = noodles_bam::io::reader::Builder
-                    .build_from_path(path)
-                    .map_err(|source| {
-                        PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                            path: path.clone(),
-                            source,
-                        })
-                    })?;
-                reader.read_header().map_err(|source| {
-                    PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                        path: path.clone(),
-                        source,
-                    })
-                })?
+                read_bam_header_only(path).map_err(PileupCliError::CramInput)?
             }
         };
         headers.push(Arc::new(header));
