@@ -23,6 +23,8 @@ docs + 6 code) on `main`:
 | 4 | `a4d1f6d` | Per-extension dispatch in `alignment_input.rs`; BAM branches + mixed-format error in `index_preflight.rs` |
 | 5 | `bee6bc1` | `tests/common/mod.rs` BAM fixture helpers (`build_bam`, `build_csi`, `build_bai`) |
 | 6 | `d0af049` | CLI positional rename `crams` → `alignment_files`; BAM integration-test siblings on both subcommands |
+| 7 (this commit) | `344f1b2` | Internal helper-parameter renames `crams: &[PathBuf]` → `alignment_files: &[PathBuf]` (4 sites); `AlignmentInputError::PerInputHandleCountMismatch.crams` → `.inputs` field rename + Display update |
+| 8 (docs) | `be3b38a` | `PROJECT_STATUS.md` Open-list update: close the two items above |
 
 The plan's "commit 1" was split into two for tighter review: a
 pure type rename (`18a9b9e`) and a structural split (`4ad1e04`).
@@ -186,6 +188,23 @@ no commit on the branch is broken on its own.
   `UnsupportedExtension`. Same policy as the pre-existing
   CRAM-only world had.
 
+### Closed mid-PR (commit `344f1b2`)
+
+Two items the original plan had reserved as deferred follow-ups
+landed inside this same PR scope after additional discussion
+during the impl run:
+
+- **Internal helper-parameter renames** from `crams: &[PathBuf]`
+  to `alignment_files: &[PathBuf]` in
+  [`stage1_pipeline.rs`](../../../src/pop_var_caller/stage1_pipeline.rs)
+  and in three private helpers inside
+  [`var_calling_from_bam.rs`](../../../src/pop_var_caller/var_calling_from_bam.rs).
+  Internal-only; no API impact.
+- **`PerInputHandleCountMismatch.crams: usize` field** in
+  [`AlignmentInputError`](../../../src/bam/errors.rs) → renamed
+  to `.inputs: usize` + Display string update. Public-error-type
+  breaking change for any out-of-tree consumer (none in tree).
+
 ### Deferred to follow-ups
 
 - **Wall-time validation on real multi-chrom BAMs.** No real-data
@@ -196,18 +215,6 @@ no commit on the branch is broken on its own.
   earlier per-chromosome plan) was scoped out then and remains
   out of scope now. The standing parallelisation-tuning pass
   picks this up.
-- **Internal helper-parameter renames** from `crams: &[PathBuf]`
-  to `alignment_files: &[PathBuf]` in
-  [`stage1_pipeline.rs`](../../../src/pop_var_caller/stage1_pipeline.rs)
-  and in three private helpers inside
-  [`var_calling_from_bam.rs`](../../../src/pop_var_caller/var_calling_from_bam.rs).
-  Internal-only; no API impact; deferred as a polish pass.
-- **`PerInputHandleCountMismatch.crams: usize` field** in
-  [`AlignmentInputError`](../../../src/bam/errors.rs)
-  — the field name is now misleading. Renaming it is a public-
-  error-type breaking change for any out-of-tree consumer (none
-  in tree) and was deferred to a coordinated public-API naming
-  pass.
 - **Lift the no-mixing restriction** if a real workload appears
   with a per-sample need to merge CRAM and BAM. The pre-flight
   gate is the only place the restriction lives; the merge core
