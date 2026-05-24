@@ -17,9 +17,9 @@ use std::path::PathBuf;
 use clap::Args;
 use thiserror::Error;
 
-use crate::per_sample_pileup::psp::{PspReadError, PspReader, RecordsIter};
 use crate::pileup_record::{AlleleObservation, PileupRecord};
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
+use crate::psp::{PspReadError, PspReader, RecordsIter};
 
 // ---------------------------------------------------------------------
 // Clap surface

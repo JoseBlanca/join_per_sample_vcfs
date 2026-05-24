@@ -10,12 +10,10 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::Path;
 
-use pop_var_caller::per_sample_pileup::psp::header::{
-    ChromosomeEntry, WriterHeader, WriterProvenance,
-};
-use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
 use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::pop_var_caller::{PspToPileupArgs, run_psp_to_pileup};
+use pop_var_caller::psp::header::{ChromosomeEntry, WriterHeader, WriterProvenance};
+use pop_var_caller::psp::writer::PspWriter;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------

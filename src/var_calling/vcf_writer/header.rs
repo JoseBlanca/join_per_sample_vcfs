@@ -24,7 +24,7 @@ use noodles_vcf::header::record::value::map::{
 
 use super::WriterConfig;
 use super::errors::VcfWriteError;
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::psp::header::ParsedChromosome;
 
 /// Canonical FILTER ID emitted on records whose posterior EM hit the
 /// iteration cap. Shared between the header-declaration site (this

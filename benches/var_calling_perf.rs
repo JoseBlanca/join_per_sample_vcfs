@@ -35,9 +35,9 @@ use std::time::Duration;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-use pop_var_caller::per_sample_pileup::psp::PspReadError;
 use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
+use pop_var_caller::psp::PspReadError;
 use pop_var_caller::var_calling::contamination_estimation::ContaminationEstimates;
 use pop_var_caller::var_calling::per_group_merger::{
     MergedRecord, PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,

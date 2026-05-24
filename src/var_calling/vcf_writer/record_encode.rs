@@ -31,7 +31,7 @@ use noodles_vcf::variant::record_buf::{
 
 use super::WriterConfig;
 use super::errors::VcfWriteError;
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::psp::header::ParsedChromosome;
 use crate::var_calling::posterior_engine::PosteriorRecord;
 
 /// Hard cap on the QUAL column.

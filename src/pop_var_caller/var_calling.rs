@@ -32,7 +32,6 @@ use rayon::prelude::*;
 use tempfile::TempDir;
 use thiserror::Error;
 
-use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::pop_var_caller::cohort_driver::{
     CohortDriveStats, CohortPipelineParams, process_one_chromosome,
 };
@@ -43,6 +42,7 @@ use crate::pop_var_caller::common::{
 use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
+use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{

@@ -20,13 +20,11 @@ use crate::per_sample_pileup::cram_input::{ContigList, CramMergedReaderConfig, F
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::{RunSummary, WalkerConfig};
 use crate::per_sample_pileup::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
-use crate::per_sample_pileup::psp::header::{
-    ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
-};
-use crate::per_sample_pileup::psp::writer::PspWriter;
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, format_md5_hex, rfc3339_now,
 };
+use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
+use crate::psp::writer::PspWriter;
 
 pub mod error_bridge;
 pub mod parsers;

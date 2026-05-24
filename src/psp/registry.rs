@@ -162,7 +162,7 @@ impl ElementType {
 /// and a value over this cap is a producer bug.
 ///
 /// **Enforcement.** The writer rejects oversized alleles in
-/// [`PspWriter::write_record`](crate::per_sample_pileup::psp::writer::PspWriter::write_record).
+/// [`PspWriter::write_record`](crate::psp::writer::PspWriter::write_record).
 /// On the read side this cap is honoured by
 /// [`decode_bytes_split`](super::block::decode_bytes_split) when
 /// the caller passes `Some(MAX_ALLELE_SEQ_LEN)` as its

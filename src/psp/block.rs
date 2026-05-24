@@ -64,7 +64,7 @@ mod wire_scalar_sealed {
 /// little-endian bytes. Implemented for `u8`, `u16`, `u32`, `u64`,
 /// `i32`, `i64`, `f32`, `f64`, `bool`. **Not** implemented for the
 /// variable-width `varint` / `svarint` element types — those use
-/// the standalone codecs in [`crate::per_sample_pileup::psp::varint`]
+/// the standalone codecs in [`crate::psp::varint`]
 /// plus the [`encode_varint_column`] / [`decode_varint_column`]
 /// wrappers here.
 ///

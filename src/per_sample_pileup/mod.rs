@@ -8,8 +8,11 @@
 //! `doc/devel/specs/per_sample_pileup.md` §"Read filters".
 //!
 //! Downstream stages (BAQ, pileup walking, allele extraction, phase
-//! chains, `.psp` writing) are separate slices and live in sibling
-//! modules.
+//! chains, `.psp` writing) are separate slices. BAQ glue files
+//! (`baq_engine`, `baq_stream`) live as siblings here; the BAQ
+//! algorithm core lives at [`crate::baq`]. The per-position record
+//! data model lives at [`crate::pileup_record`]; the on-disk `.psp`
+//! format (reader, writer, codecs) lives at [`crate::psp`].
 
 pub mod baq_engine;
 pub mod baq_stream;
@@ -17,7 +20,6 @@ pub mod cram_input;
 pub mod errors;
 pub mod pileup;
 pub mod pileup_to_psp;
-pub mod psp;
 pub mod ref_fetcher;
 
 #[cfg(test)]

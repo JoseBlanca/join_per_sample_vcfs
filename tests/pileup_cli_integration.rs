@@ -26,10 +26,10 @@ use pop_var_caller::per_sample_pileup::pileup::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
 };
-use pop_var_caller::per_sample_pileup::psp::PspReader;
-use pop_var_caller::per_sample_pileup::psp::header::ParameterValue;
 use pop_var_caller::pop_var_caller::cli::shared_args::Stage1Args;
 use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
+use pop_var_caller::psp::PspReader;
+use pop_var_caller::psp::header::ParameterValue;
 use tempfile::TempDir;
 
 /// Default `PileupArgs` instance overridable by the test. We

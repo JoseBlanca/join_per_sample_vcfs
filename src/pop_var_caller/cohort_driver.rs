@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
-use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
+use crate::psp::header::ParsedChromosome;
+use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::dust_filter::{DustFilter, DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
     PerGroupMerger, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
@@ -411,7 +411,7 @@ fn pool_allele_mapq(
 /// — opens are cheap (one seek to the trailer + a small index read
 /// per file) and per-worker readers avoid cross-thread coordination
 /// on the read side. The whole-chromosome window is materialised via
-/// [`PspReader::region_records`](crate::per_sample_pileup::psp::PspReader::region_records)
+/// [`PspReader::region_records`](crate::psp::PspReader::region_records)
 /// with `start = 1`, `end = chrom.length`; chromosomes with zero
 /// records on disk yield an empty iterator + a header-only fragment,
 /// which [`crate::var_calling::vcf_writer::concat::concat_fragments`]

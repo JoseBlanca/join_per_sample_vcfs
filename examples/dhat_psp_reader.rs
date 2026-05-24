@@ -49,12 +49,12 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Write};
 
-use pop_var_caller::per_sample_pileup::psp::PspReader;
-use pop_var_caller::per_sample_pileup::psp::header::{
+use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
+use pop_var_caller::psp::PspReader;
+use pop_var_caller::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
-use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
-use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
+use pop_var_caller::psp::writer::PspWriter;
 
 const NUM_RECORDS: usize = 500_000;
 

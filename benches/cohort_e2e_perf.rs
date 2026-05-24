@@ -78,11 +78,6 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use md5::{Digest, Md5};
 use tempfile::TempDir;
 
-use pop_var_caller::per_sample_pileup::psp::PspReadError;
-use pop_var_caller::per_sample_pileup::psp::header::{
-    ChromosomeEntry, ParsedChromosome, WriterHeader, WriterProvenance,
-};
-use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
 use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
@@ -93,6 +88,11 @@ use pop_var_caller::pop_var_caller::cohort_driver::{
 use pop_var_caller::pop_var_caller::var_calling::{
     VarCallingArgs, VarCallingCliError, run_var_calling,
 };
+use pop_var_caller::psp::PspReadError;
+use pop_var_caller::psp::header::{
+    ChromosomeEntry, ParsedChromosome, WriterHeader, WriterProvenance,
+};
+use pop_var_caller::psp::writer::PspWriter;
 use pop_var_caller::var_calling::dust_filter::{
     DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW, DustFilterConfig,
 };

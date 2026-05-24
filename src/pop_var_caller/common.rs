@@ -26,7 +26,7 @@ use md5::{Digest, Md5};
 use noodles_fasta::fai;
 use rayon::prelude::*;
 
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::psp::header::ParsedChromosome;
 
 /// Window size used by [`compute_contig_md5_streaming`]. Bigger than
 /// the page (4 KiB) so each `read` syscall amortises across many
@@ -38,7 +38,7 @@ const FASTA_MD5_BUFFER_SIZE: usize = 64 * 1024;
 /// `BufWriter::with_capacity` in the cohort CLI's file I/O. 64 KiB
 /// matches the value the per-sample `.psp` reader/writer documents
 /// as the recommended minimum (see
-/// [`crate::per_sample_pileup::psp::reader::PspReader::new`]).
+/// [`crate::psp::reader::PspReader::new`]).
 ///
 /// Distinct from `BLOCK_HEADER_READ_CAP` (in the psp module), which
 /// sizes a different — and intentionally smaller — short-read

@@ -30,8 +30,6 @@ use thiserror::Error;
 
 use crate::per_sample_pileup::cram_input::ContigList;
 use crate::per_sample_pileup::pileup::WalkerError;
-use crate::per_sample_pileup::psp::PspReadError;
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use crate::pileup_record::PileupRecord;
 use crate::pop_var_caller::cli::PileupCliError;
@@ -41,6 +39,8 @@ use crate::pop_var_caller::cohort_driver::{
 };
 use crate::pop_var_caller::common::{configure_rayon_pool, current_command_line, format_md5_hex};
 use crate::pop_var_caller::stage1_pipeline::{Stage1PipelineContext, with_stage1_pipeline};
+use crate::psp::PspReadError;
+use crate::psp::header::ParsedChromosome;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,

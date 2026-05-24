@@ -118,7 +118,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use pop_var_caller::per_sample_pileup::psp::PspReader;
+    /// use pop_var_caller::psp::PspReader;
     ///
     /// let f = File::open("sample.psp")?;
     /// let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, f))?;
@@ -349,7 +349,7 @@ impl<R: Read + Seek> PspReader<R> {
     /// ```no_run
     /// use std::fs::File;
     /// use std::io::BufReader;
-    /// use pop_var_caller::per_sample_pileup::psp::PspReader;
+    /// use pop_var_caller::psp::PspReader;
     ///
     /// let f = File::open("sample.psp")?;
     /// let mut reader = PspReader::new(BufReader::with_capacity(64 * 1024, f))?;
@@ -1403,12 +1403,10 @@ fn seek_to_offset<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::psp::header::{
-        ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
-    };
-    use crate::per_sample_pileup::psp::test_fixtures::writer_header;
-    use crate::per_sample_pileup::psp::writer::PspWriter;
     use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
+    use crate::psp::test_fixtures::writer_header;
+    use crate::psp::writer::PspWriter;
     use std::collections::BTreeMap;
     use std::io::Cursor;
 

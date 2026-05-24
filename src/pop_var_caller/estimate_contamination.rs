@@ -27,7 +27,6 @@ use clap::Args;
 use thiserror::Error;
 use toml::value::Datetime;
 
-use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
 use crate::pop_var_caller::common::{
@@ -38,6 +37,7 @@ use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
 };
+use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, DEFAULT_BLOCK_SIZE, DEFAULT_C_S_INIT,

@@ -17,8 +17,8 @@ use std::io::Write;
 use thiserror::Error;
 
 use super::pileup::{MultiChromRefFetcher, PileupWalker, PreparedRead, RunSummary, WalkerError};
-use super::psp::PspWriteError;
-use super::psp::writer::PspWriter;
+use crate::psp::PspWriteError;
+use crate::psp::writer::PspWriter;
 
 /// Failure modes for [`drive_pileup_to_psp`]. Either the walker
 /// surfaced an error mid-stream, or the writer rejected a record /
@@ -75,10 +75,10 @@ mod tests {
 
     use super::super::pileup::tests::{MockFasta, snp_read};
     use super::super::pileup::{WalkerConfig, run};
-    use super::super::psp::PspReader;
-    use super::super::psp::test_fixtures::writer_header;
-    use super::super::psp::writer::PspWriter;
     use super::*;
+    use crate::psp::PspReader;
+    use crate::psp::test_fixtures::writer_header;
+    use crate::psp::writer::PspWriter;
 
     /// Drive a tiny pileup → psp run through the seam, then read the
     /// resulting bytes back through `PspReader` and confirm

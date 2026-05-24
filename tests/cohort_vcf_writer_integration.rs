@@ -12,8 +12,8 @@ use std::io::Read as _;
 
 use tempfile::tempdir;
 
-use pop_var_caller::per_sample_pileup::psp::header::ParsedChromosome;
 use pop_var_caller::pileup_record::AlleleSupportStats;
+use pop_var_caller::psp::header::ParsedChromosome;
 use pop_var_caller::var_calling::per_group_merger::MergedAllele;
 use pop_var_caller::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 use pop_var_caller::var_calling::vcf_writer::{

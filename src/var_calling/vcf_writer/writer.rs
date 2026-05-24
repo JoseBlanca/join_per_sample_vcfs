@@ -25,7 +25,7 @@ use super::errors::VcfWriteError;
 use super::header::{CohortMetadata, build_vcf_header};
 use super::record_encode::{build_format_keys, encode};
 use super::sink::{SinkKind, tmp_path_for};
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
+use crate::psp::header::ParsedChromosome;
 use crate::var_calling::per_group_merger::genotype_order;
 use crate::var_calling::posterior_engine::PosteriorRecord;
 

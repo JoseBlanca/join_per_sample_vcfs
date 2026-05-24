@@ -27,9 +27,9 @@ use std::io::{Read, Seek};
 
 use thiserror::Error;
 
-use crate::per_sample_pileup::psp::header::ParsedChromosome;
-use crate::per_sample_pileup::psp::{PspReadError, PspReader};
 use crate::pileup_record::PileupRecord;
+use crate::psp::header::ParsedChromosome;
+use crate::psp::{PspReadError, PspReader};
 
 /// One emitted item: a single `(chrom_id, pos)` with a per-sample
 /// slot for every sample passed to [`PerPositionMerger::new`].
@@ -402,10 +402,10 @@ pub fn check_chromosome_agreement<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::psp::header::{ChromosomeEntry, WriterHeader};
-    use crate::per_sample_pileup::psp::test_fixtures::writer_header;
-    use crate::per_sample_pileup::psp::writer::PspWriter;
     use crate::pileup_record::{AlleleObservation, AlleleSupportStats};
+    use crate::psp::header::{ChromosomeEntry, WriterHeader};
+    use crate::psp::test_fixtures::writer_header;
+    use crate::psp::writer::PspWriter;
     use std::io::Cursor;
 
     type Item = Result<PileupRecord, PspReadError>;
