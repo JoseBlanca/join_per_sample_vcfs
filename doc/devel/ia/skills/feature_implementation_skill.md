@@ -65,6 +65,26 @@ If critical information is missing and changes the implementation direction, ask
 - Avoid hidden defaults for behaviorally significant values.
 - Keep functions cohesive; split long functions by intent.
 
+## Module structure and refactoring process
+
+These rules govern *where* code lives and *how* to move it. The corresponding review-time checklist is `code_review/module_structure.md`; the rules here are the writer-side counterpart — apply them when creating a new module, lifting a type, or restructuring the tree.
+
+- **Crate-absolute paths over `super::super::*`.** When referencing items more than one module level up, use `crate::<module>::<item>` rather than chained `super::*`. The crate-absolute form survives file moves without breaking, reads self-evidently at the use-site, and shows up in editor go-to-definition. Single-level `super::*` is fine.
+
+- **New top-level modules: flat `.rs` unless submodules will follow.** A leaf module belongs at `src/<name>.rs`. Create `src/<name>/mod.rs` only when the module already has (or imminently will have) siblings inside the directory. The import path `crate::<name>::*` is identical either way; the directory form just costs a directory entry for nothing.
+
+- **Where to put a new data type.** If a type will be consumed by 3+ modules across pipeline-stage boundaries — even prospectively — define it as its own top-level peer (`src/<type>.rs`), not inside the producer's module. Otherwise the producer's module silently becomes the home for the pipeline's interchange data, and refactor pressure builds. Pre-checking at write time saves the lift later.
+
+- **Back-reference sanity check.** Before declaring a new top-level peer module (data model, algorithm, file format, utility) done, grep its `use crate::*` lines. Any import from a pipeline-stage module is a back-reference and probably means: lift the depended-on type too, move the new module inside the stage, or decouple the consumer via a trait. The trap is *moving a directory without addressing what it imports* — the new location misrepresents the dependencies.
+
+- **`pub` consumers of pipeline-stage types: consider a trait at the boundary.** When a `pub` module takes a concrete record type from a pipeline-stage module (e.g., a writer that consumes a specific `Record`), the natural cost is a back-reference into that stage. If the consumer's data needs are stable and read-only, a trait with read-only accessors monomorphises to zero runtime cost and removes the back-reference from the public API. Worth proposing only when (a) the consumer is `pub` and (b) the input type is stage-internal. Otherwise the trait is over-abstraction with one implementor.
+
+- **`clippy::module_inception` when promoting a flat file.** Promoting `foo.rs` into `foo/` with submodules leaves the original content at `foo/foo.rs`, which the lint fires on. Rename the inner file to something specific (`driver.rs`, `core.rs`, `impl.rs`) as part of the same change — not as a follow-up. The new name also tends to clarify the file's role.
+
+- **`git mv` for renames.** Use `git mv old new`, not `mv` + `git add new` + `git rm old`. Git's rename detection is heuristic and reliable only when both files are present and the content is close enough; explicit `git mv` works at any similarity level and keeps `git log --follow` cheap.
+
+- **Bulk path substitutions: `sed` is acceptable for mechanical renames.** When a refactor touches 20+ files with a purely-mechanical path change (e.g. `crate::old_path::` → `crate::new_path::`), a single `sed -i` pass across the affected files is more reviewable than 150 individual `Edit` calls — the diff at the end is the unit of review. Reserve `Edit` for changes that need per-call judgment. Restrict `sed` to substitutions whose correctness is obvious from the pattern alone.
+
 ## Data-processing style guidelines
 
 The codebase commonly processes very large datasets composed of smaller independent items.

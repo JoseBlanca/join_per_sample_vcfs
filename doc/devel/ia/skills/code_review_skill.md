@@ -65,6 +65,7 @@ Decide which per-category checklists apply. Each lives at `ia/skills/code_review
 | `defaults` | Scope contains public API, configuration, or any default-acting value. Skip pure-internal snippets with no parameters. |
 | `idiomatic` | Always. |
 | `refactor_safety` | Always. |
+| `module_structure` | Scope spans multiple files (crate / PR / module-level review). Skip pure single-file snippets. |
 | `unsafe_concurrency` | Code uses `unsafe`, `Arc`, `Mutex`/`RwLock`, atomics, channels, `async`, or thread spawning. Skip otherwise. |
 | `smells` | Always. |
 | `tooling` | Scope is a crate (has `Cargo.toml`). Skip pure snippets. |
