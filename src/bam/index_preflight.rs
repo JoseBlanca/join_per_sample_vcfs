@@ -62,6 +62,19 @@ pub enum AlignmentIndex {
     BamBai(Arc<noodles_bam::bai::Index>),
 }
 
+impl AlignmentIndex {
+    /// User-facing name for an [`AlignmentIndex`] variant, used in
+    /// [`crate::bam::errors::AlignmentInputError::AlignmentIndexFormatMismatch`]
+    /// messages. Mirror of [`AlignmentFileKind::display_name`].
+    pub(crate) fn display_name(&self) -> &'static str {
+        match self {
+            Self::Crai(_) => "CRAI",
+            Self::BamCsi(_) => "CSI",
+            Self::BamBai(_) => "BAI",
+        }
+    }
+}
+
 /// Load an alignment index from disk. The expected location is the
 /// canonical sibling path (`<input>.crai` for CRAM, `<input>.csi`
 /// preferred or `<input>.bai` fallback for BAM); for missing or

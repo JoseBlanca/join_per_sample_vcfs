@@ -473,16 +473,6 @@ fn with_fai_extension(fasta_path: &Path) -> PathBuf {
     PathBuf::from(buf)
 }
 
-/// User-facing name for an [`AlignmentIndex`] variant, used in
-/// [`AlignmentInputError::AlignmentIndexFormatMismatch`] messages.
-fn index_display_name(index: &AlignmentIndex) -> &'static str {
-    match index {
-        AlignmentIndex::Crai(_) => "CRAI",
-        AlignmentIndex::BamCsi(_) => "CSI",
-        AlignmentIndex::BamBai(_) => "BAI",
-    }
-}
-
 // ---------------------------------------------------------------------
 // AlignmentMergedReader
 // ---------------------------------------------------------------------
@@ -595,6 +585,11 @@ impl AlignmentMergedReader {
         // `pileup` does not run through pre-flight so the gate
         // lives here too. Same `display_name` strings on both
         // sides so the error message is consistent.
+        // Classify-pass: harvest the per-input kind once. The
+        // open-pass below zips this Vec back in, eliminating the
+        // need to re-call `AlignmentFileKind::from_path` (and the
+        // `.unwrap()` that pattern invited).
+        let mut input_kinds: Vec<AlignmentFileKind> = Vec::with_capacity(alignment_files.len());
         let mut first_seen_kind: Option<(usize, AlignmentFileKind)> = None;
         for (idx, input_path) in alignment_files.iter().enumerate() {
             let kind = AlignmentFileKind::from_path(input_path).ok_or_else(|| {
@@ -614,6 +609,7 @@ impl AlignmentMergedReader {
                 }
                 Some(_) => {}
             }
+            input_kinds.push(kind);
         }
 
         // Open every input, validate per-file invariants, and
@@ -624,18 +620,15 @@ impl AlignmentMergedReader {
         let mut canonical_sample: Option<String> = None;
         let mut reference_input_path: Option<PathBuf> = None;
 
-        for input_path in alignment_files {
+        for (input_path, kind) in alignment_files.iter().zip(input_kinds.iter().copied()) {
             // Format-specific decoder lives in the corresponding
             // sibling module; each helper opens the file, validates
             // any format-level invariants (CRAM version, BAM magic),
             // reads the SAM header, and returns the header + an
             // owned record iterator. Cross-file checks (contigs
             // identical, single SM tag) are this module's concern
-            // and run after. (`unwrap` here is safe — the classify
-            // pass above already errored on unknown extensions.)
-            let (noodles_sam_header, owned_records) = match AlignmentFileKind::from_path(input_path)
-                .unwrap()
-            {
+            // and run after.
+            let (noodles_sam_header, owned_records) = match kind {
                 AlignmentFileKind::Cram => open_cram_record_stream(input_path, repository.clone())?,
                 AlignmentFileKind::Bam => open_bam_record_stream(input_path)?,
             };
@@ -895,11 +888,22 @@ impl AlignmentMergedReader {
                         target_reference_sequence_id,
                     )?
                 }
-                (file_kind, index) => {
+                // Genuine driver-bug mismatches — enumerate each
+                // explicitly so adding a new AlignmentIndex variant
+                // forces a new arm here (the enum is
+                // `#[non_exhaustive]`; without enumeration the
+                // catch-all would silently absorb the new variant
+                // as a "format mismatch", defeating the
+                // extensibility intent).
+                (
+                    AlignmentFileKind::Cram,
+                    index @ (AlignmentIndex::BamCsi(_) | AlignmentIndex::BamBai(_)),
+                )
+                | (AlignmentFileKind::Bam, index @ AlignmentIndex::Crai(_)) => {
                     return Err(AlignmentInputError::AlignmentIndexFormatMismatch {
                         path: input_path.clone(),
                         file_format: file_kind.display_name(),
-                        index_format: index_display_name(index),
+                        index_format: index.display_name(),
                     });
                 }
             };
