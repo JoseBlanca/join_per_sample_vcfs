@@ -91,6 +91,74 @@ that promotes `bam/`, `baq/`, `fasta/`, `psp/`, `pileup/`, `vcf/`,
 | 2026-04-30 | Pivot: spec a full cohort caller from BAM          | design frozen; CRAM input slice landed                | ~9.4 k   | 24    |
 | 2026-05-24 | Implement six-stage cohort caller, run on real BAM | end-to-end working; tuning F1 vs GATK                 | ~59.8 k  | 96    |
 
+## Commits by category
+
+569 commits were classified by subject-line keywords (category-code
+fixes like `(M3)` or `Fix Mi7`, module prefixes like `psp::reader:`,
+explicit verbs like `Implement`, `Add`, `Fix`, `Apply`, `Review`,
+etc.). Each commit gets one primary category — review-driven
+correctness fixes count as review even when the diff is large,
+perf-review fixes (the `L`/`H` category codes) count as perf, etc.
+
+| Category                         | Commits | Share |
+| -------------------------------- | ------- | ----- |
+| **Implementation (new features)** | **192** | **33.7%** |
+| **Code review (correctness fixes)** | **141** | **24.8%** |
+| **Performance**                  | **94**  | **16.5%** |
+| Refactor / rename / cleanup      | 82      | 14.4% |
+| Docs / specs / plans / reports   | 47      | 8.3%  |
+| Tooling / container / skills     | 10      | 1.8%  |
+| Merge / revert / other           | 3       | 0.5%  |
+
+Headline: the three categories the user asked about account for
+**~75% of all commits**, split roughly 4 : 3 : 2 (implementation :
+review-fix : perf). Review and perf together (**41%**) are almost as
+large as raw implementation — the project spends as much effort
+reviewing and tuning code as writing it new.
+
+### Category mix by month
+
+The mix shifts dramatically over the project's life: the gVCF-parser
+months were almost pure implementation; the post-merger month
+(2026-04) was the first concentrated review pass; May is where every
+category fires at once.
+
+| Month   | impl | review | perf | refactor | docs | tooling | total |
+| ------- | ---: | -----: | ---: | -------: | ---: | ------: | ----: |
+| 2025-12 |    2 |      0 |    0 |        0 |    0 |       0 |     2 |
+| 2026-02 |   15 |      0 |    4 |        4 |    0 |       0 |    23 |
+| 2026-03 |   50 |      0 |    3 |       14 |    2 |       3 |    73 |
+| 2026-04 |   18 |     19 |    0 |       34 |   12 |       1 |    84 |
+| 2026-05 |  107 |    122 |   87 |       30 |   33 |       6 |   387 |
+
+What the table shows:
+
+- **Feb–Mar 2026 (parser + merger):** zero review commits, almost no
+  perf. The author is in pure-feature mode — implementations and
+  small refactors only.
+- **April 2026:** the first 19 review commits land. This is the
+  introduction of the `code-review` and `code-review-fixes` skills
+  (12 doc commits = the skill files themselves) and their first
+  application against the gVCF parser. Implementation drops from 50
+  → 18 — features stop, hardening starts.
+- **May 2026:** review (122) actually exceeds implementation (107),
+  and perf surfaces as its own column with 87 commits. This is the
+  six-stage pipeline being built and *immediately* reviewed and
+  tuned, stage by stage.
+
+### Caveats on classification
+
+- Commits often do more than one thing; each is bucketed by its
+  apparent primary intent. A commit like "Apply H1 + H4 from the
+  round-2 pileup perf review" counts as perf, not review.
+- "Refactor" includes renames, formatting, module promotions, and
+  small cleanups. Many of these are review-driven housekeeping; the
+  share of "review-influenced" work is therefore higher than the
+  review column alone suggests.
+- The 39-commit 2026-04-10 burst (gVCF parser review) is bulk-tagged
+  as review since every commit in that day was a category fix from
+  the same review.
+
 ## Activity chart — commits and lines of code per active day
 
 Each row is one active day (days with no commits are omitted).
