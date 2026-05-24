@@ -617,6 +617,261 @@ fn contigs_to_parsed(
 }
 
 // ---------------------------------------------------------------------
+// Per-chromosome worker (commit 3 of the
+// var-calling-from-bam-per-chromosome plan; commit 4 wires it into
+// `run_var_calling_from_bam` via `rayon::par_iter`).
+// ---------------------------------------------------------------------
+
+/// Drive Stages 1 + 3-6 for **one chromosome** of one sample.
+///
+/// Mirror of the cohort-side
+/// [`crate::pop_var_caller::cohort_driver::process_one_chromosome`]
+/// (PSP inputs) but the front of the chain is Stage 1 (CRAM →
+/// BAQ → walker) instead of a `PspReader`. Each call owns its
+/// reader set, BAQ stream, walker, reference fetcher, and writer
+/// outright — no shared mutable state with sibling workers.
+///
+/// Returns `(chrom_id, CohortDriveStats)` on success. Errors are
+/// surfaced through the same typed enum the serial driver uses;
+/// the per-chrom orchestrator (commit 4) collects worker results
+/// and returns the first error after every worker has joined.
+///
+/// Stage 1 borrow chain: the returned reader from
+/// [`CramMergedReader::query`] is owned on this function's stack;
+/// the BAQ stream (or no-BAQ passthrough) borrows from it; the
+/// error-shedding adapter borrows from BAQ; the pileup walker
+/// borrows from the adapter; the walker is wrapped in a second
+/// error-shedding adapter so its `WalkerError` is stashed before
+/// the merger sees the stream; the resulting
+/// `Result<PileupRecord, PspReadError>` stream is fed into a
+/// single-sample [`PerPositionMerger`] which is finally handed to
+/// [`drive_cohort_pipeline`].
+///
+/// `headers` and `indexes` are per-input handles loaded once at
+/// driver startup (commit 4) and shared across all workers via
+/// `Arc`. `all_chromosomes` is the canonical contig table —
+/// `chrom_id` indexes into it. `pipeline_params` is the Stages 3-6
+/// config bundle shared across workers (cohort-side
+/// `CohortPipelineParams` is `Clone`).
+///
+/// **No-Stage-1-summary**: per-chrom workers cannot meaningfully
+/// snapshot the global `FilterCounts` / `BaqSkipCounts` because
+/// the orchestrator runs N of them in parallel. The driver
+/// (commit 4) will either drop the per-Stage-1 counter summary
+/// for the parallel path, or aggregate counts across workers via
+/// a separate accumulator.
+// `dead_code` is intentional in commit 3 — this helper lands
+// standalone so its diff is reviewable in isolation; commit 4 of
+// the var-calling-from-bam-per-chromosome plan wires it into
+// `run_var_calling_from_bam` via `rayon::par_iter`, at which point
+// the attribute is removed.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)] // bundling would obscure the borrow chain
+fn process_one_chromosome_from_bam(
+    chrom_id: u32,
+    crams: &[PathBuf],
+    headers: &[Arc<noodles_sam::Header>],
+    indexes: &[crate::bam::index_preflight::AlignmentIndex],
+    canonical_contigs: ContigList,
+    sample_name: String,
+    all_chromosomes: Vec<ParsedChromosome>,
+    reference: &std::path::Path,
+    cram_cfg: crate::bam::cram_input::CramMergedReaderConfig,
+    baq_cfg: crate::baq::BaqConfig,
+    walker_cfg: crate::pileup::walker::WalkerConfig,
+    baq_chunk_size: usize,
+    no_baq: bool,
+    fragment_path: PathBuf,
+    metadata: crate::vcf::CohortMetadata,
+    writer_cfg_template: crate::vcf::WriterConfig,
+    pipeline_params: CohortPipelineParams,
+) -> Result<(u32, CohortDriveStats), VarCallingFromBamCliError> {
+    use crate::pileup::per_sample::baq_engine::prepare_passthrough;
+    use crate::pileup::per_sample::baq_stream::BaqStream;
+    use crate::pileup::walker::{self, PreparedRead};
+
+    let chrom_entry = all_chromosomes.get(chrom_id as usize).expect(
+        "chrom_id past contig table — caller (run_var_calling_from_bam) must validate the bound",
+    );
+
+    // 1. Per-worker CRAM record source, bounded to this chrom.
+    let mut reader = crate::bam::cram_input::CramMergedReader::query(
+        crams,
+        reference,
+        canonical_contigs.clone(),
+        sample_name.clone(),
+        headers,
+        indexes,
+        &chrom_entry.name,
+        cram_cfg,
+    )
+    .map_err(PileupCliError::CramInput)?;
+
+    // 2. Walker fetcher — multi-chrom by trait but only ever sees
+    //    this one chrom's records, so the swap-on-chrom-transition
+    //    path is exercised at most once.
+    let walker_fetcher = crate::fasta::MultiChromStreamingRefFetcher::new(
+        reference.to_path_buf(),
+        canonical_contigs,
+    );
+
+    // 3. Build the BAQ → adapter → walker chain. Mirror of
+    //    `with_stage1_pipeline`'s body, restricted to the
+    //    per-chrom record stream.
+    let (per_chrom_records, cram_error_handle): (
+        Box<dyn Iterator<Item = Result<crate::pileup_record::PileupRecord, PspReadError>>>,
+        _,
+    ) = {
+        // (a) Build the chain on this function's stack.
+        // (b) Consume it by collecting into a `Vec` — the merger
+        //     consumes the records by value anyway. This sidesteps
+        //     the self-referential borrow that `with_stage1_pipeline`
+        //     resolves via a callback, at the cost of materialising
+        //     one chrom's worth of `PileupRecord`s in memory before
+        //     handing them to the merger.
+        //
+        // Per-chrom record counts on real workloads are in the
+        // 1-100 K range (sites that survive the filter cascade);
+        // each record carries a small `Vec<AlleleObservation>`. The
+        // peak memory cost is bounded and rebuilds at the next
+        // worker — no cross-worker accumulation.
+        let baq_skip = if no_baq {
+            // No-BAQ branch: passthrough off the merged reader.
+            let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
+                r.map(|read| {
+                    let chrom = u32::try_from(read.ref_id).expect("ref_id fits u32");
+                    prepare_passthrough(read, chrom)
+                })
+            }));
+            let cram_error_handle = adapter.error_handle();
+            let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
+            let walker = walker::run(input, &walker_fetcher, &walker_cfg);
+
+            let mut walker_adapter: ErrorSheddingAdapter<_, _, WalkerError> =
+                ErrorSheddingAdapter::new(walker);
+            let walker_error_handle = walker_adapter.error_handle();
+            let records: Vec<crate::pileup_record::PileupRecord> =
+                walker_adapter.by_ref().collect();
+            drop(walker_adapter);
+            drop(adapter);
+
+            // If the walker errored mid-stream, surface that
+            // immediately — the merger should never see a partial
+            // chrom.
+            if let Some(e) = walker_error_handle.take() {
+                return Err(VarCallingFromBamCliError::Walker(e));
+            }
+
+            (records, cram_error_handle)
+        } else {
+            // BAQ-on: reader → BaqStream → adapter → walker.
+            let mut baq_stream = BaqStream::new(
+                reader.by_ref(),
+                baq_cfg,
+                reference.to_path_buf(),
+                all_chromosomes_to_contig_list(&all_chromosomes),
+                baq_chunk_size,
+            );
+            let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
+            let cram_error_handle = adapter.error_handle();
+            let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
+            let walker = walker::run(input, &walker_fetcher, &walker_cfg);
+
+            let mut walker_adapter: ErrorSheddingAdapter<_, _, WalkerError> =
+                ErrorSheddingAdapter::new(walker);
+            let walker_error_handle = walker_adapter.error_handle();
+            let records: Vec<crate::pileup_record::PileupRecord> =
+                walker_adapter.by_ref().collect();
+            drop(walker_adapter);
+            drop(adapter);
+            drop(baq_stream);
+
+            if let Some(e) = walker_error_handle.take() {
+                return Err(VarCallingFromBamCliError::Walker(e));
+            }
+
+            (records, cram_error_handle)
+        };
+        let cram_handle = baq_skip.1;
+        let iter: Box<dyn Iterator<Item = Result<_, PspReadError>>> =
+            Box::new(baq_skip.0.into_iter().map(Ok));
+        (iter, cram_handle)
+    };
+
+    // 4. Surface a stashed CRAM-input error from inside the chain
+    //    before going downstream.
+    if let Some(e) = cram_error_handle.take() {
+        return Err(VarCallingFromBamCliError::Stage1(
+            PileupCliError::CramInput(e),
+        ));
+    }
+
+    // 5. Single-sample merger over this chrom's records.
+    let merger = crate::var_calling::per_position_merger::PerPositionMerger::new(
+        vec![per_chrom_records],
+        vec![sample_name.clone()],
+        all_chromosomes.clone(),
+    )?;
+
+    // 6. Per-worker cohort-side fetcher (DUST + PerGroupMerger).
+    //    Mirror of `cohort_driver::process_one_chromosome`'s setup;
+    //    constructor returns the project's `StreamingChromRefFetcher`
+    //    bound to this chrom.
+    let streaming =
+        crate::fasta::StreamingChromRefFetcher::for_contig(reference, &chrom_entry.name).map_err(
+            |e| {
+                VarCallingFromBamCliError::Io(io::Error::other(format!(
+                    "ref fetcher construction failed: {e}"
+                )))
+            },
+        )?;
+    #[allow(clippy::arc_with_non_send_sync)]
+    let fetcher: SharedRefFetcher = Arc::new(streaming);
+
+    // 7. Writer config inherits `emit_gp` and any future flags from
+    //    the template; only the output path is per-fragment.
+    let writer_cfg = crate::vcf::WriterConfig {
+        output: fragment_path.clone(),
+        ..writer_cfg_template
+    };
+
+    let stats = crate::pop_var_caller::cohort_driver::drive_cohort_pipeline::<
+        _,
+        VarCallingFromBamCliError,
+    >(
+        chrom_id,
+        merger,
+        pipeline_params,
+        fetcher,
+        &fragment_path,
+        metadata,
+        writer_cfg,
+    )?;
+
+    Ok((chrom_id, stats))
+}
+
+/// `BaqStream::new` wants a `ContigList`, not the cohort-side
+/// `Vec<ParsedChromosome>`. This helper round-trips through the
+/// project's [`ContigList`] shape without losing names or lengths.
+///
+/// Dead-code-allowed for the same commit-3-only reason as
+/// [`process_one_chromosome_from_bam`].
+#[allow(dead_code)]
+fn all_chromosomes_to_contig_list(chromosomes: &[ParsedChromosome]) -> ContigList {
+    ContigList {
+        entries: chromosomes
+            .iter()
+            .map(|c| crate::fasta::ContigEntry {
+                name: c.name.clone(),
+                length: c.length as u64,
+                md5: None,
+            })
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------
 // PerChromRecordsIter — chunk a coord-sorted record stream by chrom.
 // ---------------------------------------------------------------------
 //
