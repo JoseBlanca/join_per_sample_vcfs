@@ -142,10 +142,12 @@ pub enum AlignmentInputError {
     },
 
     /// `AlignmentMergedReader::query` was given a `headers` or `indexes`
-    /// slice whose length does not match `crams.len()`.
-    #[error("per-input handle count mismatch: {crams} crams, {headers} headers, {indexes} indexes")]
+    /// slice whose length does not match `inputs.len()`.
+    #[error(
+        "per-input handle count mismatch: {inputs} inputs, {headers} headers, {indexes} indexes"
+    )]
     PerInputHandleCountMismatch {
-        crams: usize,
+        inputs: usize,
         headers: usize,
         indexes: usize,
     },

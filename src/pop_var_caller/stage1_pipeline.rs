@@ -89,7 +89,7 @@ pub struct Stage1Outputs<R> {
 /// the bridge.
 #[allow(clippy::too_many_arguments)]
 pub fn with_stage1_pipeline<R, E, F>(
-    crams: &[PathBuf],
+    alignment_files: &[PathBuf],
     reference: &Path,
     cram_cfg: AlignmentMergedReaderConfig,
     baq_cfg: BaqConfig,
@@ -103,8 +103,9 @@ where
     E: From<PileupCliError>,
 {
     // 1. Open the merged reader and capture identification metadata.
-    let mut reader: AlignmentMergedReader = AlignmentMergedReader::new(crams, reference, cram_cfg)
-        .map_err(PileupCliError::CramInput)?;
+    let mut reader: AlignmentMergedReader =
+        AlignmentMergedReader::new(alignment_files, reference, cram_cfg)
+            .map_err(PileupCliError::CramInput)?;
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 

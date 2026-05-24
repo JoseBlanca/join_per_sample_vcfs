@@ -484,13 +484,13 @@ pub fn run_var_calling_from_bam(
 /// policy the merged reader uses, just here for an early stand-alone
 /// header harvest.
 fn load_per_input_headers(
-    crams: &[PathBuf],
+    alignment_files: &[PathBuf],
 ) -> Result<Vec<Arc<noodles_sam::Header>>, VarCallingFromBamCliError> {
     use crate::bam::errors::AlignmentInputError;
     use crate::bam::index_preflight::AlignmentFileKind;
 
-    let mut headers = Vec::with_capacity(crams.len());
-    for path in crams {
+    let mut headers = Vec::with_capacity(alignment_files.len());
+    for path in alignment_files {
         let kind = AlignmentFileKind::from_path(path).ok_or_else(|| {
             PileupCliError::CramInput(AlignmentInputError::UnsupportedExtension {
                 path: path.clone(),
@@ -547,10 +547,10 @@ fn load_per_input_headers(
 /// `--build-map-file-index` was set, so a failure here is genuinely
 /// I/O.
 fn load_per_input_indexes(
-    crams: &[PathBuf],
+    alignment_files: &[PathBuf],
 ) -> Result<Vec<crate::bam::index_preflight::AlignmentIndex>, VarCallingFromBamCliError> {
-    let mut indexes = Vec::with_capacity(crams.len());
-    for path in crams {
+    let mut indexes = Vec::with_capacity(alignment_files.len());
+    for path in alignment_files {
         let index = crate::bam::index_preflight::load_alignment_index(path).map_err(|source| {
             VarCallingFromBamCliError::Io(io::Error::other(format!(
                 "failed to load alignment index for '{}': {source}",
@@ -641,7 +641,7 @@ fn contigs_to_parsed(
 #[allow(clippy::too_many_arguments)] // bundling would obscure the borrow chain
 fn process_one_chromosome_from_bam(
     chrom_id: u32,
-    crams: &[PathBuf],
+    alignment_files: &[PathBuf],
     headers: &[Arc<noodles_sam::Header>],
     indexes: &[crate::bam::index_preflight::AlignmentIndex],
     canonical_contigs: ContigList,
@@ -668,7 +668,7 @@ fn process_one_chromosome_from_bam(
 
     // 1. Per-worker CRAM record source, bounded to this chrom.
     let mut reader = crate::bam::alignment_input::AlignmentMergedReader::query(
-        crams,
+        alignment_files,
         reference,
         canonical_contigs.clone(),
         sample_name.clone(),

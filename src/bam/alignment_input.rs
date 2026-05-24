@@ -565,11 +565,11 @@ pub struct AlignmentMergedReader {
 
 impl AlignmentMergedReader {
     pub fn new(
-        crams: &[PathBuf],
+        alignment_files: &[PathBuf],
         fasta: &Path,
         config: AlignmentMergedReaderConfig,
     ) -> Result<Self, AlignmentInputError> {
-        if crams.is_empty() {
+        if alignment_files.is_empty() {
             return Err(AlignmentInputError::NoInputs);
         }
 
@@ -597,7 +597,7 @@ impl AlignmentMergedReader {
         // lives here too. Same `display_name` strings on both
         // sides so the error message is consistent.
         let mut first_seen_kind: Option<(usize, AlignmentFileKind)> = None;
-        for (idx, input_path) in crams.iter().enumerate() {
+        for (idx, input_path) in alignment_files.iter().enumerate() {
             let kind = AlignmentFileKind::from_path(input_path).ok_or_else(|| {
                 AlignmentInputError::UnsupportedExtension {
                     path: input_path.clone(),
@@ -607,7 +607,7 @@ impl AlignmentMergedReader {
                 None => first_seen_kind = Some((idx, kind)),
                 Some((first_idx, first_kind)) if first_kind != kind => {
                     return Err(AlignmentInputError::MixedAlignmentFileFormats {
-                        first_path: crams[first_idx].clone(),
+                        first_path: alignment_files[first_idx].clone(),
                         first_format: first_kind.display_name(),
                         other_path: input_path.clone(),
                         other_format: kind.display_name(),
@@ -619,12 +619,12 @@ impl AlignmentMergedReader {
 
         // Open every input, validate per-file invariants, and
         // collect per-file headers.
-        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(crams.len());
+        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(alignment_files.len());
         let mut canonical_contigs: Option<ContigList> = None;
         let mut canonical_sample: Option<String> = None;
         let mut reference_cram_path: Option<PathBuf> = None;
 
-        for cram_path in crams {
+        for cram_path in alignment_files {
             // Format-specific decoder lives in the corresponding
             // sibling module; each helper opens the file, validates
             // any format-level invariants (CRAM version, BAM magic),
@@ -796,7 +796,7 @@ impl AlignmentMergedReader {
     ///   any underlying CRAM or FASTA I/O failure during open.
     #[allow(clippy::too_many_arguments)]
     pub fn query(
-        crams: &[PathBuf],
+        alignment_files: &[PathBuf],
         fasta: &Path,
         contigs: ContigList,
         sample_name: String,
@@ -805,12 +805,12 @@ impl AlignmentMergedReader {
         contig_name: &str,
         config: AlignmentMergedReaderConfig,
     ) -> Result<Self, AlignmentInputError> {
-        if crams.is_empty() {
+        if alignment_files.is_empty() {
             return Err(AlignmentInputError::NoInputs);
         }
-        if headers.len() != crams.len() || indexes.len() != crams.len() {
+        if headers.len() != alignment_files.len() || indexes.len() != alignment_files.len() {
             return Err(AlignmentInputError::PerInputHandleCountMismatch {
-                crams: crams.len(),
+                inputs: alignment_files.len(),
                 headers: headers.len(),
                 indexes: indexes.len(),
             });
@@ -857,9 +857,11 @@ impl AlignmentMergedReader {
         // extensions here, that's a programmer error in the
         // driver — surfaced as a typed
         // `AlignmentIndexFormatMismatch` rather than a panic.
-        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(crams.len());
-        for ((cram_path, header), alignment_index) in
-            crams.iter().zip(headers.iter()).zip(indexes.iter())
+        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(alignment_files.len());
+        for ((cram_path, header), alignment_index) in alignment_files
+            .iter()
+            .zip(headers.iter())
+            .zip(indexes.iter())
         {
             let file_kind = AlignmentFileKind::from_path(cram_path).ok_or_else(|| {
                 AlignmentInputError::UnsupportedExtension {
@@ -4424,7 +4426,7 @@ mod tests {
         assert!(matches!(
             err,
             AlignmentInputError::PerInputHandleCountMismatch {
-                crams: 2,
+                inputs: 2,
                 headers: 1,
                 indexes: 1,
             }
