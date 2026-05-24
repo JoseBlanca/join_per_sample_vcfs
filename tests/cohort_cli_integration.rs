@@ -306,6 +306,7 @@ fn var_calling_from_bam_happy_path() {
         threads: None,
         crams: vec![cram],
         no_complexity_filter: true,
+        build_map_file_index: true,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: true,
@@ -643,6 +644,7 @@ fn var_calling_from_bam_surfaces_walker_error_on_max_active_reads_trip() {
         threads: None,
         crams: vec![cram],
         no_complexity_filter: true,
+        build_map_file_index: true,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: true,
@@ -719,4 +721,143 @@ fn run_pileup_can_be_called_back_to_back() {
 
     assert!(dir.path().join("a.psp").exists());
     assert!(dir.path().join("b.psp").exists());
+}
+
+// ---------------------------------------------------------------------
+// `--build-map-file-index` pre-flight (commit 1 of the per-chromosome
+// `var-calling-from-bam` parallelism plan, see
+// `doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md`).
+// ---------------------------------------------------------------------
+
+/// Helper that returns a baseline [`VarCallingFromBamArgs`] suitable
+/// for the new pre-flight tests below. Mirrors `var_calling_from_bam_happy_path`'s
+/// settings (single-sample, no DUST, no BAQ) so the only variable
+/// across the new tests is the index situation and the
+/// `build_map_file_index` flag.
+fn from_bam_args_for_preflight_tests(
+    reference: PathBuf,
+    output: PathBuf,
+    crams: Vec<PathBuf>,
+    build_map_file_index: bool,
+) -> VarCallingFromBamArgs {
+    VarCallingFromBamArgs {
+        reference,
+        output,
+        threads: None,
+        crams,
+        no_complexity_filter: true,
+        build_map_file_index,
+        stage1: Stage1Args {
+            min_mapq: DEFAULT_MIN_MAPQ,
+            no_baq: true,
+            min_read_length: 0,
+            keep_qc_fail: false,
+            keep_duplicates: false,
+            max_read_mismatch_fraction: DEFAULT_MAX_READ_MISMATCH_FRACTION,
+            mismatch_bq_floor: DEFAULT_MISMATCH_BQ_FLOOR,
+            baq_gap_open_prob: SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
+            baq_gap_extend_prob: SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
+            baq_band_half_width: SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH,
+            baq_chunk_size: DEFAULT_BAQ_CHUNK_SIZE,
+            max_snp_column_depth: DEFAULT_MAX_SNP_COLUMN_DEPTH,
+            max_indel_column_depth: DEFAULT_MAX_INDEL_COLUMN_DEPTH,
+            max_record_span: DEFAULT_MAX_RECORD_SPAN,
+            mate_lookup_window: DEFAULT_MATE_LOOKUP_WINDOW,
+            max_active_reads: DEFAULT_MAX_ACTIVE_READS,
+        },
+        cohort: CohortPipelineArgs {
+            ploidy: DEFAULT_PLOIDY,
+            complexity_window: DEFAULT_DUST_WINDOW,
+            complexity_threshold: DEFAULT_DUST_THRESHOLD,
+            var_group_max_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
+            max_alleles_per_var: DEFAULT_MAX_ALLELES_PER_RECORD,
+            inbreeding_coefficient: DEFAULT_INBREEDING_COEFFICIENT,
+            em_convergence_threshold: DEFAULT_CONVERGENCE_THRESHOLD,
+            em_max_iterations: DEFAULT_MAX_ITERATIONS,
+            ref_pseudocount: DEFAULT_REF_PSEUDOCOUNT,
+            snp_alt_pseudocount: DEFAULT_SNP_ALT_PSEUDOCOUNT,
+            indel_alt_pseudocount: DEFAULT_INDEL_ALT_PSEUDOCOUNT,
+            compound_alt_pseudocount: DEFAULT_COMPOUND_ALT_PSEUDOCOUNT,
+            max_gq_phred: DEFAULT_MAX_GQ_PHRED,
+            min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
+            min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
+            no_mapq_diff_filter: false,
+            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
+            emit_gp: false,
+        },
+    }
+}
+
+/// Pre-flight rejects a CRAM with no `.crai` next to it when
+/// `--build-map-file-index` was not passed, with an actionable
+/// error message naming the flag and the `samtools index` recipe.
+/// Uses a placeholder one-byte `.cram` because the pre-flight
+/// checks file existence and never opens the CRAM body in the
+/// no-build branch.
+#[test]
+fn from_bam_errors_when_cram_index_missing_and_flag_unset() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let cram = dir.path().join("sample.cram");
+    fs::write(&cram, b"x").expect("write placeholder cram");
+    let vcf_out = dir.path().join("out.vcf");
+
+    let args = from_bam_args_for_preflight_tests(fasta, vcf_out, vec![cram.clone()], false);
+
+    let err = run_var_calling_from_bam(&args).expect_err("pre-flight should fail without an index");
+
+    match err {
+        VarCallingFromBamCliError::MissingMapFileIndex {
+            path,
+            expected_index_path,
+        } => {
+            assert_eq!(path, cram);
+            assert_eq!(expected_index_path, dir.path().join("sample.cram.crai"));
+
+            // The Display impl carries both pieces of remediation
+            // advice. Asserting on the rendered string is the unit
+            // of behaviour the user actually reads.
+            let rendered = format!(
+                "{}",
+                VarCallingFromBamCliError::MissingMapFileIndex {
+                    path: path.clone(),
+                    expected_index_path: expected_index_path.clone(),
+                }
+            );
+            assert!(
+                rendered.contains("--build-map-file-index"),
+                "error must point at the flag: {rendered}"
+            );
+            assert!(
+                rendered.contains("samtools index"),
+                "error must point at the `samtools index` recipe: {rendered}"
+            );
+        }
+        other => panic!("expected MissingMapFileIndex, got: {other:?}"),
+    }
+}
+
+/// With `--build-map-file-index`, a CRAM without a sibling `.crai`
+/// has the index built in place; the run then completes end-to-end
+/// and the `.crai` is left next to the source.
+#[serial_test::serial]
+#[test]
+fn from_bam_builds_missing_cram_index_when_flag_set() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![
+        read_record("r1", 10, b"ACAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let cram = build_cram(dir.path(), &fasta, "NA12878", Some(fixture_md5()), &reads);
+    let crai = dir.path().join("NA12878.cram.crai");
+    assert!(!crai.exists(), "test precondition: no .crai yet");
+
+    let vcf_out = dir.path().join("solo.vcf");
+    let args = from_bam_args_for_preflight_tests(fasta, vcf_out.clone(), vec![cram], true);
+
+    run_var_calling_from_bam(&args).expect("run_var_calling_from_bam OK");
+
+    assert!(crai.exists(), ".crai must have been built next to the cram");
+    assert!(vcf_out.exists(), "VCF must exist at the final path");
 }

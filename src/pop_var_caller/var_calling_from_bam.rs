@@ -92,6 +92,17 @@ pub struct VarCallingFromBamArgs {
     #[arg(long)]
     pub no_complexity_filter: bool,
 
+    /// If any input CRAM/BAM lacks its alignment index (`.crai` for
+    /// CRAM; `.bai` or `.csi` for BAM), build it in place next to
+    /// the source file before running. Without this flag, missing
+    /// indexes are a hard error.
+    ///
+    /// Default off — per-chromosome parallelism requires an
+    /// alignment index for each input, but the caller must opt in
+    /// before we write files next to user inputs.
+    #[arg(long)]
+    pub build_map_file_index: bool,
+
     // ===== Stage 1 (shared with pileup) =======================
     #[command(flatten)]
     pub stage1: crate::pop_var_caller::cli::shared_args::Stage1Args,
@@ -165,6 +176,60 @@ pub enum VarCallingFromBamCliError {
     /// process. The binary calls it at most once.
     #[error("rayon thread pool already initialised — refusing to override")]
     RayonAlreadyConfigured,
+
+    /// An input alignment file has no index and `--build-map-file-index`
+    /// was not passed. The message names both the flag and the
+    /// `samtools index` recipe so the user can fix the run without
+    /// digging.
+    #[error(
+        "input alignment file '{path}' has no index (looked for '{expected_index_path}')\n\
+         per-chromosome parallelism requires an index for each input.\n\
+         either:\n\
+           - re-run with --build-map-file-index to have pop_var_caller build it, or\n\
+           - run `samtools index {path}` yourself before invoking this command"
+    )]
+    MissingMapFileIndex {
+        path: PathBuf,
+        expected_index_path: PathBuf,
+    },
+
+    /// `--build-map-file-index` was set but the build failed.
+    /// Commonly: the directory holding the source alignment file is
+    /// read-only.
+    #[error("failed to build alignment index for '{path}': {source}")]
+    IndexBuildFailed {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Input's extension is neither `.cram` nor `.bam`.
+    #[error(
+        "input alignment file '{path}' has an unsupported extension \
+         (expected .cram or .bam)"
+    )]
+    UnsupportedAlignmentExtension { path: PathBuf },
+}
+
+impl From<crate::bam::errors::AlignmentIndexError> for VarCallingFromBamCliError {
+    fn from(e: crate::bam::errors::AlignmentIndexError) -> Self {
+        use crate::bam::errors::AlignmentIndexError;
+        match e {
+            AlignmentIndexError::MissingAlignmentIndex {
+                path,
+                expected_index_path,
+            } => Self::MissingMapFileIndex {
+                path,
+                expected_index_path,
+            },
+            AlignmentIndexError::BuildFailed { path, source } => {
+                Self::IndexBuildFailed { path, source }
+            }
+            AlignmentIndexError::UnsupportedExtension { path } => {
+                Self::UnsupportedAlignmentExtension { path }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -178,6 +243,18 @@ pub fn run_var_calling_from_bam(
 ) -> Result<(), VarCallingFromBamCliError> {
     let stage1 = &args.stage1;
     let cohort = &args.cohort;
+
+    // 0. Alignment-index pre-flight. Per-chromosome parallelism (the
+    //    structural reason this driver exists) requires an index next
+    //    to every CRAM/BAM input so each rayon worker can issue a
+    //    contig-scoped `Reader::query(...)`. Runs before any other
+    //    setup so a missing-index error fires before tempdirs or
+    //    rayon pools are touched. Indexes are only created when the
+    //    user opts in via `--build-map-file-index`.
+    crate::bam::index_preflight::preflight_alignment_indexes(
+        &args.crams,
+        args.build_map_file_index,
+    )?;
 
     // 1. Rayon pool — idempotent under the silent-no-op policy
     //    (M13, locked 2026-05-19); first caller wins, subsequent

@@ -16,6 +16,10 @@
 //!   downstream by the BAQ stream and the cohort CLI's error bridge,
 //!   which is why they live here at the module root rather than
 //!   inside `cram_input`.
+//! - [`index_preflight`] — `.crai` / `.bai` / `.csi` detection +
+//!   opt-in auto-build for callers that need per-contig random
+//!   access (e.g. the per-chromosome parallel `var-calling-from-bam`
+//!   driver).
 //!
 //! The walker-side input types ([`MappedRead`](cram_input::MappedRead)
 //! → [`crate::pileup::walker::PreparedRead`]) are produced here and
@@ -24,3 +28,4 @@
 
 pub mod cram_input;
 pub mod errors;
+pub mod index_preflight;
