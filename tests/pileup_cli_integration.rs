@@ -275,3 +275,30 @@ fn pileup_rejects_mixed_cram_and_bam() {
         other => panic!("unexpected error variant: {other:?}"),
     }
 }
+
+/// M10 regression: `pileup` does not run through preflight, so the
+/// `AlignmentMergedReader::new`-side `UnsupportedExtension` arm is
+/// the only gate against an input whose extension is neither
+/// `.cram` nor `.bam`. A future refactor that dropped the
+/// classify pre-pass would let the open-pass's `.unwrap()` panic
+/// instead of surfacing the typed error.
+#[test]
+fn pileup_rejects_input_with_unknown_extension() {
+    use pop_var_caller::bam::errors::AlignmentInputError;
+    use pop_var_caller::pop_var_caller::cli::PileupCliError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let unknown = dir.path().join("sample.sam");
+    std::fs::write(&unknown, b"x").expect("write placeholder");
+    let output = dir.path().join("out.psp");
+    let args = default_args(fasta, output, vec![unknown.clone()]);
+
+    let err = run_pileup(&args).expect_err("must reject .sam");
+    match err {
+        PileupCliError::AlignmentInput(AlignmentInputError::UnsupportedExtension { path }) => {
+            assert_eq!(path, unknown);
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+}

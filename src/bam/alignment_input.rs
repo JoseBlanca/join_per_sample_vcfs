@@ -4728,4 +4728,62 @@ mod tests {
         .collect();
         assert_eq!(positions, vec![100, 200, 500, 600]);
     }
+
+    // --- M9: AlignmentIndexFormatMismatch ----------------------------
+    //
+    // The variant is the only safety net against a driver bug that
+    // pairs a `.cram` path with a BAM-side index (or vice versa).
+    // The catch-all branch was tightened by M6 — this test pins
+    // the typed-error contract.
+
+    #[test]
+    fn query_returns_alignment_index_format_mismatch_on_cram_path_with_bam_csi_index() {
+        use crate::bam::index_preflight::AlignmentIndex;
+        use noodles_csi::binning_index::Indexer;
+        use noodles_csi::binning_index::index::reference_sequence::index::BinnedIndex;
+
+        // Build a real one-contig CRAM via the existing test
+        // fixture (the merger needs a parseable header to reach
+        // the dispatch match).
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("build_fasta");
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &[])
+                .expect("build_cram");
+        let (header, _crai) = load_header_and_index(&cram_path);
+
+        // Construct a BamCsi-typed AlignmentIndex with an empty
+        // CSI Index — the match in `query` fires before any seek
+        // / decode happens, so the payload is never consulted.
+        let empty_csi: noodles_csi::Index = Indexer::<BinnedIndex>::new(14, 6).build(contigs.len());
+        let bad_index = AlignmentIndex::BamCsi(Arc::new(empty_csi));
+
+        let result = AlignmentMergedReader::query(
+            std::slice::from_ref(&cram_path),
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            std::slice::from_ref(&header),
+            std::slice::from_ref(&bad_index),
+            "chr1",
+            AlignmentMergedReaderConfig::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("CRAM path + BamCsi index must error"),
+            Err(e) => e,
+        };
+
+        match err {
+            AlignmentInputError::AlignmentIndexFormatMismatch {
+                path,
+                file_format,
+                index_format,
+            } => {
+                assert_eq!(path, cram_path);
+                assert_eq!(file_format, "CRAM");
+                assert_eq!(index_format, "CSI");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
 }

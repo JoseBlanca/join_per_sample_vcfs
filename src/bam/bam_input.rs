@@ -479,4 +479,170 @@ mod tests {
             assert!(stream.next().is_none());
         }
     }
+
+    /// M11: the indexed BAM iterator must walk multiple chunks
+    /// when the on-disk records span more than one BGZF block. A
+    /// regression in the "fall through to next chunk on
+    /// chunk_end exceeded" branch (`current_chunk_end = None;
+    /// continue` at the head of `OwnedIndexedBamRecords::next`)
+    /// would drop records at the boundary or loop indefinitely.
+    ///
+    /// We trip multiple chunks by writing ~1,500 records on one
+    /// contig (~150 KiB uncompressed → 2+ BGZF blocks → 2+
+    /// chunks per the indexer's per-block chunk emission).
+    #[test]
+    fn open_indexed_bam_record_stream_walks_two_chunks_in_order() {
+        let header = header_two_contigs();
+        // ~1500 records on sq0 plus a single boundary record on
+        // sq1 so the indexer definitely emits a contig boundary.
+        let mut records: Vec<RecordBuf> = (0..1500).map(|i| record_on(0, 1 + (i % 60))).collect();
+        records.push(record_on(1, 1));
+        let (_dir, bam_path) = write_bam(&records, &header);
+
+        let bai_index = build_bai_in_memory(&bam_path);
+        let header_arc = Arc::new(header.clone());
+
+        let mut stream = open_indexed_bam_record_stream(
+            &bam_path,
+            Arc::clone(&header_arc),
+            BamIndex::Bai(Arc::new(bai_index)),
+            /* target_reference_sequence_id = */ 0,
+        )
+        .expect("open indexed bam stream");
+
+        let actual: Vec<RecordBuf> = std::iter::from_fn(|| stream.next())
+            .map(|r| r.expect("decode record"))
+            .collect();
+        assert_eq!(
+            actual.len(),
+            1500,
+            "expected every sq0 record across all BGZF blocks"
+        );
+        assert!(
+            actual.iter().all(|r| r.reference_sequence_id() == Some(0)),
+            "every yielded record must be on the queried contig"
+        );
+    }
+
+    /// Mi17: linear BAM iterator must surface a read error as
+    /// `Some(Err(_))` rather than silently terminating with
+    /// `None`. The current implementation has no EOF latch (the
+    /// design choice rests on `read_record_buf` being idempotent
+    /// at EOF); a future regression that converted an I/O error
+    /// path into a silent termination would let a truncated BAM
+    /// emit partial output without the merge noticing.
+    ///
+    /// We trigger an error by writing a small BAM then truncating
+    /// the file mid-stream so the BGZF reader fails partway
+    /// through. The test asserts at least one `Some(Err(_))` is
+    /// yielded.
+    #[test]
+    fn open_bam_record_stream_surfaces_read_errors_as_some_err() {
+        use std::fs::OpenOptions;
+
+        let header = header_two_contigs();
+        // Enough records to guarantee at least one BGZF block
+        // beyond the header. Truncating mid-block invalidates
+        // the BGZF integrity check.
+        let records: Vec<RecordBuf> = (0..200).map(|i| record_on(0, 1 + (i % 60))).collect();
+        let (_dir, bam_path) = write_bam(&records, &header);
+
+        // Truncate to 4 KiB — that leaves the BAM header + the
+        // first BGZF block partially intact and breaks the
+        // following blocks.
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&bam_path)
+            .expect("open for truncate");
+        file.set_len(4096).expect("truncate to 4 KiB");
+        drop(file);
+
+        let (_header, mut stream) = open_bam_record_stream(&bam_path).expect("open truncated bam");
+
+        // Drain — somewhere along the way the iterator must
+        // surface an error (the EOF-block CRC check fails, or the
+        // body-bytes deserialisation fails). We accept either:
+        // (a) the iterator returns Some(Err) at some point, or
+        // (b) the iterator returns Ok records for a while then
+        //     terminates — but if the on-disk truncation breaks
+        //     the BGZF stream the noodles reader propagates the
+        //     io::Error.
+        let mut saw_err = false;
+        let mut polls = 0;
+        for item in stream.by_ref() {
+            polls += 1;
+            if item.is_err() {
+                saw_err = true;
+                break;
+            }
+            // Safety bound — even if every record decodes
+            // cleanly, the truncated tail should cap the iterator.
+            if polls > 5000 {
+                break;
+            }
+        }
+        assert!(
+            saw_err,
+            "truncated BAM should surface a Some(Err(_)) (saw {polls} successful polls then None)"
+        );
+    }
+
+    /// Mi16: the production path prefers CSI; the existing
+    /// indexed-BAM tests build a .bai. This test confirms the
+    /// `BamIndex::Csi` arm of `open_indexed_bam_record_stream`
+    /// works end-to-end with a real .csi.
+    #[test]
+    fn open_indexed_bam_record_stream_yields_target_contig_records_via_csi() {
+        use noodles_csi::binning_index::index::reference_sequence::index::BinnedIndex;
+
+        let header = header_two_contigs();
+        let records = [record_on(0, 1), record_on(1, 1), record_on(1, 8)];
+        let (_dir, bam_path) = write_bam(&records, &header);
+
+        // Build a .csi (rather than .bai) the same way
+        // build_csi_for_bam does (BinnedIndex parameterisation).
+        let mut reader = bam::io::reader::Builder
+            .build_from_path(&bam_path)
+            .expect("open bam");
+        let parsed_header = reader.read_header().expect("read header");
+        let mut indexer: Indexer<BinnedIndex> = Indexer::default();
+        let mut chunk_start = reader.get_ref().virtual_position();
+        let mut record = bam::Record::default();
+        while reader.read_record(&mut record).expect("read") != 0 {
+            let chunk_end = reader.get_ref().virtual_position();
+            let alignment_context = match (
+                record.reference_sequence_id().transpose().expect("ref"),
+                record.alignment_start().transpose().expect("start"),
+                record.alignment_end().transpose().expect("end"),
+            ) {
+                (Some(id), Some(start), Some(end)) => {
+                    Some((id, start, end, !record.flags().is_unmapped()))
+                }
+                _ => None,
+            };
+            indexer
+                .add_record(alignment_context, Chunk::new(chunk_start, chunk_end))
+                .expect("add");
+            chunk_start = chunk_end;
+        }
+        let csi_index = indexer.build(parsed_header.reference_sequences().len());
+
+        let header_arc = Arc::new(header.clone());
+        let mut stream = open_indexed_bam_record_stream(
+            &bam_path,
+            Arc::clone(&header_arc),
+            BamIndex::Csi(Arc::new(csi_index)),
+            /* target_reference_sequence_id = */ 1,
+        )
+        .expect("open csi-backed indexed bam stream");
+
+        let actual: Vec<RecordBuf> = std::iter::from_fn(|| stream.next())
+            .map(|r| r.expect("decode record"))
+            .collect();
+        assert_eq!(actual.len(), 2, "expected the two sq1 records via CSI");
+        assert!(
+            actual.iter().all(|r| r.reference_sequence_id() == Some(1)),
+            "every yielded record must be on the queried contig"
+        );
+    }
 }

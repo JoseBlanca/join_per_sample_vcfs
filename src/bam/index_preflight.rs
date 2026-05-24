@@ -652,4 +652,105 @@ mod tests {
             other => panic!("unexpected error variant: {other:?}"),
         }
     }
+
+    // --- M12: load_alignment_index direct unit tests ----------------
+    //
+    // The function is `pub`; integration tests only exercise one
+    // configuration each. A regression that reversed the csi/bai
+    // preference, dropped the bai fallback, or changed the
+    // missing-index path would slip past the integration tests
+    // and fail diffusely. These tests pin each branch in turn.
+
+    #[test]
+    fn load_alignment_index_returns_bam_csi_when_csi_present() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        let csi = dir.path().join("sample.bam.csi");
+        touch(&bam);
+        // The on-disk .csi here is a placeholder one-byte file
+        // (the loader will fail on parse). We assert that the
+        // loader picked the .csi *path* via the LoadFailed error
+        // — the typed surface tells us which file was tried.
+        touch(&csi);
+
+        let err = load_alignment_index(&bam).expect_err("parse fails on placeholder bytes");
+        match err {
+            AlignmentIndexError::LoadFailed {
+                path,
+                index_path,
+                source: _,
+            } => {
+                assert_eq!(path, bam);
+                assert_eq!(
+                    index_path, csi,
+                    "loader must have picked the .csi path, not the .bai"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_alignment_index_falls_back_to_bai_when_no_csi() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        let bai = dir.path().join("sample.bam.bai");
+        touch(&bam);
+        // Only .bai present; the .csi-preferred policy must
+        // still locate .bai as the fallback.
+        touch(&bai);
+
+        let err = load_alignment_index(&bam).expect_err("parse fails on placeholder bytes");
+        match err {
+            AlignmentIndexError::LoadFailed {
+                path,
+                index_path,
+                source: _,
+            } => {
+                assert_eq!(path, bam);
+                assert_eq!(index_path, bai, ".bai must be picked when .csi is absent");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_alignment_index_errors_with_missing_alignment_index_when_no_bam_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        touch(&bam);
+        // No .csi, no .bai. Loader must surface a typed
+        // MissingAlignmentIndex naming the .csi-canonical path
+        // (the policy build path).
+        let err = load_alignment_index(&bam).expect_err("must fail on missing index");
+        match err {
+            AlignmentIndexError::MissingAlignmentIndex {
+                path,
+                expected_index_path,
+            } => {
+                assert_eq!(path, bam);
+                assert_eq!(
+                    expected_index_path,
+                    dir.path().join("sample.bam.csi"),
+                    "expected_index_path must be the .csi-canonical build target"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_alignment_index_rejects_unsupported_extension() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join("sample.sam");
+        touch(&input);
+
+        let err = load_alignment_index(&input).expect_err("must reject .sam");
+        match err {
+            AlignmentIndexError::UnsupportedExtension { path } => {
+                assert_eq!(path, input);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
 }
