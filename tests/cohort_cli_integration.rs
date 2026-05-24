@@ -1015,3 +1015,38 @@ fn from_bam_rejects_mixed_cram_and_bam_inputs() {
         other => panic!("unexpected error variant: {other:?}"),
     }
 }
+
+/// M17 lock-step test: both `MixedAlignmentFileFormats` variants
+/// (one on `AlignmentInputError`, one on `AlignmentIndexError`)
+/// render the same user-facing wording. The two surfaces exist
+/// because `pileup` does not run through preflight; the variant
+/// duplication is intentional, but the wording must stay in
+/// lock-step so renaming one path's strings doesn't silently
+/// drift away from the other.
+#[test]
+fn mixed_format_error_renders_identical_strings_at_both_layers() {
+    use pop_var_caller::bam::errors::{AlignmentIndexError, AlignmentInputError};
+
+    let first = std::path::PathBuf::from("/data/sample_a.cram");
+    let other = std::path::PathBuf::from("/data/sample_b.bam");
+
+    let from_reader = AlignmentInputError::MixedAlignmentFileFormats {
+        first_path: first.clone(),
+        first_format: "CRAM",
+        other_path: other.clone(),
+        other_format: "BAM",
+    };
+    let from_preflight = AlignmentIndexError::MixedAlignmentFileFormats {
+        first_path: first,
+        first_format: "CRAM",
+        other_path: other,
+        other_format: "BAM",
+    };
+
+    assert_eq!(
+        format!("{from_reader}"),
+        format!("{from_preflight}"),
+        "the two MixedAlignmentFileFormats variants must render identical strings; \
+         any future wording change on one path must land on both"
+    );
+}

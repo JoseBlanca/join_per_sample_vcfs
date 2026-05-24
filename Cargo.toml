@@ -55,6 +55,11 @@ md-5 = "0.11"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 flate2 = "1.1.9"
 lru = "0.16.3"
+# noodles-bam and noodles-csi are promoted from transitive (via
+# noodles-cram / noodles-sam) to explicit so the BAM/CSI symbols
+# used by src/bam/* are compile-checked against the manifest
+# directly rather than relying on noodles-cram's re-export
+# surface (which can shrink at any minor bump).
 noodles-bam = "0.89.0"
 noodles-bgzf = "0.47.0"
 noodles-core = "0.20.0"
