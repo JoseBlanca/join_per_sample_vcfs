@@ -151,12 +151,26 @@ for that and was scoped out — see the "What landed" table.
    Land coverage via the integration tests of #2 (real CRAM
    writers produce single-ref slices per container in the typical
    case).
-4. **Streaming `CramMergedReader::new` on 2-CRAM-with-records
-   fixtures.** A surprise from commit 2: no existing in-module
-   test drives records through a 2-CRAM `new` merge (every 2-CRAM
-   test in group B passes `&[]` for records), and exercising it
-   surfaced an `UnexpectedEof` mid-stream. Independent of this
-   slice; track + investigate as a `cram_input.rs` follow-up.
+4. **~~Streaming `CramMergedReader::new` on 2-CRAM-with-records
+   fixtures.~~ Resolved 2026-05-24 (commit `0c6fe89`).** Root
+   cause: `noodles_cram::io::Reader::read_container` is not
+   idempotent at EOF — second call after a clean `Ok(0)` returns
+   `Err(InvalidData, TryFromIntError)`. `OwnedCramRecords::next`
+   did not memoise EOF, so any caller that polled past `None`
+   (notably the merger's `BufferedPeekable`, which peeks every
+   per-input stream on each merge step) re-entered noodles past
+   EOF and surfaced a spurious `MalformedRecord` after every real
+   record had emitted. User-facing impact: `pop_var_caller pileup`
+   with N≥2 CRAMs of the same sample silently failed at the end
+   of every successful run with a misleading malformed-record
+   error. Fix: `eof_latched: bool` on `OwnedCramRecords` (and
+   defensively on `OwnedIndexedCramRecords` from commit 2);
+   subsequent `next()` calls return `None` without re-entering
+   noodles. Six regression tests in `bam::cram_input::tests`
+   group D (`d1` is the canonical reproducer; `d4` pins the
+   no-trailing-error symptom; `d6` pins the upstream
+   non-idempotency so the latch can be removed if noodles ever
+   fixes its end of it).
 5. **Stage 1 counter reducer for the parallel driver.** Restore
    the `FilterCounts` / `BaqSkipCounts` summary by collecting each
    per-chrom worker's counters and folding them in the driver.
