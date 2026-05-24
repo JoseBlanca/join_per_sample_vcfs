@@ -17,11 +17,11 @@
 //! `doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md`
 //! §2 "Index pre-flight".
 //!
-//! Today the only alignment-file format we read is CRAM (matches
-//! [`crate::bam::alignment_input::AlignmentMergedReader`]). When BAM input
-//! support lands, extend [`AlignmentFileKind`] with a `Bam` variant
-//! and add the corresponding `.bai` / `.csi` detection + build
-//! branches; the rest of the pre-flight shape stays the same.
+//! Both CRAM (`.cram` + `.crai`) and BAM (`.bam` + `.csi`/`.bai`)
+//! inputs are accepted. The classification + missing-index pass
+//! also rejects mixed `.cram` + `.bam` inputs in one invocation —
+//! the merge downstream wants one format per sample and the
+//! all-or-nothing rule keeps both code and error messages clean.
 //!
 //! `noodles_cram::fs::index` stream-walks the source file once to
 //! collect container offsets, so an index build costs roughly one
@@ -47,17 +47,24 @@ use crate::bam::errors::AlignmentIndexError;
 /// worker pays one `Arc::clone` to get its own handle on the
 /// already-parsed index; no per-worker disk reads or re-parsing.
 ///
-/// Single-variant today (CRAM-only); when BAM input support lands,
-/// add `Bai(Arc<noodles_bam::bai::Index>)` and
-/// `Csi(Arc<noodles_csi::Index>)`.
+/// For BAM inputs we keep the on-disk format we loaded — either
+/// `.csi` or `.bai` — because the cohort driver wraps the payload
+/// in a per-format BAM-side enum before handing it to the
+/// indexed-record-stream opener. Both index formats satisfy
+/// noodles' [`noodles_csi::binning_index::BinningIndex`] trait, so
+/// the merge cares only about the on-disk file that's available
+/// locally.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum AlignmentIndex {
     Crai(Arc<noodles_cram::crai::Index>),
+    BamCsi(Arc<noodles_csi::Index>),
+    BamBai(Arc<noodles_bam::bai::Index>),
 }
 
 /// Load an alignment index from disk. The expected location is the
-/// canonical sibling path (`<input>.crai` for CRAM); for missing or
+/// canonical sibling path (`<input>.crai` for CRAM, `<input>.csi`
+/// preferred or `<input>.bai` fallback for BAM); for missing or
 /// malformed indexes, prefer running [`preflight_alignment_indexes`]
 /// first so the failure surfaces at the typed
 /// [`AlignmentIndexError`] layer rather than as a bare `io::Error`
@@ -67,6 +74,32 @@ pub fn load_alignment_index(input: &Path) -> std::io::Result<AlignmentIndex> {
         Some(AlignmentFileKind::Cram) => {
             let index = noodles_cram::crai::fs::read(crai_path_for(input))?;
             Ok(AlignmentIndex::Crai(Arc::new(index)))
+        }
+        Some(AlignmentFileKind::Bam) => {
+            // .csi preferred over .bai. If both exist, .csi wins;
+            // if neither exists, surface a NotFound on the .csi
+            // path (the same path `preflight_alignment_indexes`
+            // would report as "looked for") so the user sees the
+            // policy-canonical path in the error message.
+            let csi_path = csi_path_for(input);
+            if csi_path.exists() {
+                let index = noodles_csi::fs::read(&csi_path)?;
+                return Ok(AlignmentIndex::BamCsi(Arc::new(index)));
+            }
+            let bai_path = bai_path_for(input);
+            if bai_path.exists() {
+                let index = noodles_bam::bai::fs::read(&bai_path)?;
+                return Ok(AlignmentIndex::BamBai(Arc::new(index)));
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no BAM index next to '{}' (looked for '{}' then '{}')",
+                    input.display(),
+                    csi_path.display(),
+                    bai_path.display(),
+                ),
+            ))
         }
         None => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -96,21 +129,40 @@ pub fn load_alignment_index(input: &Path) -> std::io::Result<AlignmentIndex> {
 /// - [`AlignmentIndexError::BuildFailed`] — `build_if_missing` was
 ///   true and an index build (or write) failed.
 /// - [`AlignmentIndexError::UnsupportedExtension`] — an input's
-///   extension is not `.cram`; we do not guess the file format here.
+///   extension is neither `.cram` nor `.bam`; we do not guess the
+///   file format here.
+/// - [`AlignmentIndexError::MixedAlignmentFileFormats`] — the
+///   input list mixes `.cram` and `.bam` files. One format per
+///   invocation only; mixed-format support is an explicit
+///   non-goal in `doc/devel/implementation_plans/bam_input_support.md`.
 pub fn preflight_alignment_indexes(
     inputs: &[PathBuf],
     build_if_missing: bool,
 ) -> Result<(), AlignmentIndexError> {
-    // First pass: classify + find missing inputs. Done before any
-    // build so a `--build-map-file-index` run with one unbuildable
-    // input does not partially build the others before failing.
+    // First pass: classify + find missing inputs + reject mixed
+    // formats. Done before any build so a `--build-map-file-index`
+    // run with one unbuildable input does not partially build the
+    // others before failing.
     let mut missing: Vec<(usize, AlignmentFileKind)> = Vec::new();
+    let mut first_seen: Option<(usize, AlignmentFileKind)> = None;
     for (idx, input) in inputs.iter().enumerate() {
         let kind = AlignmentFileKind::from_path(input).ok_or_else(|| {
             AlignmentIndexError::UnsupportedExtension {
                 path: input.clone(),
             }
         })?;
+        match first_seen {
+            None => first_seen = Some((idx, kind)),
+            Some((first_idx, first_kind)) if first_kind != kind => {
+                return Err(AlignmentIndexError::MixedAlignmentFileFormats {
+                    first_path: inputs[first_idx].clone(),
+                    first_format: first_kind.display_name(),
+                    other_path: input.clone(),
+                    other_format: kind.display_name(),
+                });
+            }
+            Some(_) => {}
+        }
         if existing_index_for(input, kind).is_none() {
             missing.push((idx, kind));
         }
@@ -155,42 +207,78 @@ pub fn preflight_alignment_indexes(
 /// extension only. We do not sniff the file's magic bytes — an
 /// explicit extension is required.
 ///
-/// Single-variant today; the `enum` keeps the dispatch surface
-/// stable for when BAM support lands.
+/// `pub(crate)` so the
+/// [`crate::bam::alignment_input::AlignmentMergedReader::new`]
+/// dispatch can use the same classifier when opening the per-input
+/// record streams (avoids two different "which format is this
+/// path" rules drifting apart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AlignmentFileKind {
+pub(crate) enum AlignmentFileKind {
     Cram,
+    Bam,
 }
 
 impl AlignmentFileKind {
-    fn from_path(path: &Path) -> Option<Self> {
+    pub(crate) fn from_path(path: &Path) -> Option<Self> {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("cram") => Some(Self::Cram),
+            Some("bam") => Some(Self::Bam),
             _ => None,
+        }
+    }
+
+    /// User-facing format name embedded in error messages. Same
+    /// strings appear in [`AlignmentIndexError`] /
+    /// [`crate::bam::errors::AlignmentInputError`] mixed-format
+    /// messages.
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Cram => "CRAM",
+            Self::Bam => "BAM",
         }
     }
 }
 
 /// Resolve the alignment index that already exists for `input`, if
-/// any.
+/// any. For BAM, `.csi` is preferred over `.bai`.
 fn existing_index_for(input: &Path, kind: AlignmentFileKind) -> Option<PathBuf> {
     match kind {
         AlignmentFileKind::Cram => {
             let p = crai_path_for(input);
             p.exists().then_some(p)
         }
+        AlignmentFileKind::Bam => {
+            let csi = csi_path_for(input);
+            if csi.exists() {
+                return Some(csi);
+            }
+            let bai = bai_path_for(input);
+            bai.exists().then_some(bai)
+        }
     }
 }
 
-/// The index path we would *build* for `input` if asked.
+/// The index path we would *build* for `input` if asked. For BAM
+/// this is always the `.csi`-canonical path — `.csi` has no
+/// contig-length limit while `.bai`'s 16 kbp bin grid tops out at
+/// 512 Mbp, which already excludes some plant references.
 fn target_index_path(input: &Path, kind: AlignmentFileKind) -> PathBuf {
     match kind {
         AlignmentFileKind::Cram => crai_path_for(input),
+        AlignmentFileKind::Bam => csi_path_for(input),
     }
 }
 
 fn crai_path_for(cram: &Path) -> PathBuf {
     append_extension(cram, "crai")
+}
+
+fn csi_path_for(bam: &Path) -> PathBuf {
+    append_extension(bam, "csi")
+}
+
+fn bai_path_for(bam: &Path) -> PathBuf {
+    append_extension(bam, "bai")
 }
 
 /// Append `.<ext>` to a path. Unlike [`Path::with_extension`], this
@@ -209,7 +297,48 @@ fn build_index(input: &Path, kind: AlignmentFileKind) -> std::io::Result<()> {
             let index = noodles_cram::fs::index(input)?;
             noodles_cram::crai::fs::write(crai_path_for(input), &index)
         }
+        AlignmentFileKind::Bam => build_csi_for_bam(input),
     }
+}
+
+/// Build a `.csi` next to `bam_path` by scanning the BAM once and
+/// feeding the chunks into a [`noodles_csi::binning_index::Indexer`].
+/// Mirrors the helper in `noodles_bam` 0.89's own query tests; the
+/// inlined copy here keeps the build path independent of any
+/// test-support feature.
+fn build_csi_for_bam(bam_path: &Path) -> std::io::Result<()> {
+    use noodles_csi::binning_index::Indexer;
+    use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
+    use noodles_csi::binning_index::index::reference_sequence::index::BinnedIndex;
+    use noodles_sam::alignment::Record as _;
+
+    let mut reader = noodles_bam::io::reader::Builder.build_from_path(bam_path)?;
+    let header = reader.read_header()?;
+
+    let mut indexer: Indexer<BinnedIndex> = Indexer::default();
+    let mut chunk_start = reader.get_ref().virtual_position();
+    let mut record = noodles_bam::Record::default();
+
+    while reader.read_record(&mut record)? != 0 {
+        let chunk_end = reader.get_ref().virtual_position();
+        let alignment_context = match (
+            record.reference_sequence_id().transpose()?,
+            record.alignment_start().transpose()?,
+            record.alignment_end().transpose()?,
+        ) {
+            (Some(id), Some(start), Some(end)) => {
+                let is_mapped = !record.flags().is_unmapped();
+                Some((id, start, end, is_mapped))
+            }
+            _ => None,
+        };
+        let chunk = Chunk::new(chunk_start, chunk_end);
+        indexer.add_record(alignment_context, chunk)?;
+        chunk_start = chunk_end;
+    }
+
+    let index = indexer.build(header.reference_sequences().len());
+    noodles_csi::fs::write(csi_path_for(bam_path), &index)
 }
 
 // ---------------------------------------------------------------------
@@ -321,5 +450,138 @@ mod tests {
         let cram = Path::new("/tmp/sample.cram");
         let crai = target_index_path(cram, AlignmentFileKind::Cram);
         assert_eq!(crai, PathBuf::from("/tmp/sample.cram.crai"));
+    }
+
+    // --- BAM-side tests ----------------------------------------------
+
+    #[test]
+    fn target_index_path_for_bam_picks_csi_not_bai() {
+        // Build-side: always emits .csi (the format with no
+        // contig-length cap).
+        let bam = Path::new("/tmp/sample.bam");
+        let csi = target_index_path(bam, AlignmentFileKind::Bam);
+        assert_eq!(csi, PathBuf::from("/tmp/sample.bam.csi"));
+    }
+
+    #[test]
+    fn preflight_accepts_existing_csi() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        let csi = dir.path().join("sample.bam.csi");
+        touch(&bam);
+        touch(&csi);
+
+        preflight_alignment_indexes(&[bam], false).expect("preflight ok with .csi");
+    }
+
+    #[test]
+    fn preflight_accepts_existing_bai_as_fallback() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        let bai = dir.path().join("sample.bam.bai");
+        touch(&bam);
+        touch(&bai);
+
+        preflight_alignment_indexes(&[bam], false).expect("preflight ok with .bai");
+    }
+
+    #[test]
+    fn preflight_prefers_csi_over_bai_when_both_present() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        let csi = dir.path().join("sample.bam.csi");
+        let bai = dir.path().join("sample.bam.bai");
+        touch(&bam);
+        touch(&csi);
+        touch(&bai);
+
+        // Both exist; existing_index_for must return the .csi one.
+        let picked = existing_index_for(&bam, AlignmentFileKind::Bam).expect("some index");
+        assert_eq!(picked, csi, ".csi must win over .bai when both exist");
+    }
+
+    #[test]
+    fn preflight_errors_when_bam_missing_index_and_flag_unset() {
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("sample.bam");
+        touch(&bam);
+
+        let err = preflight_alignment_indexes(std::slice::from_ref(&bam), false)
+            .expect_err("preflight should fail without index");
+        match err {
+            AlignmentIndexError::MissingAlignmentIndex {
+                path,
+                expected_index_path,
+            } => {
+                assert_eq!(path, bam);
+                // Build path is .csi-canonical (see
+                // target_index_path); the missing-index error
+                // points the user at the file the build would
+                // create.
+                assert_eq!(expected_index_path, dir.path().join("sample.bam.csi"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_errors_on_mixed_cram_and_bam() {
+        let dir = TempDir::new().expect("tempdir");
+        let cram = dir.path().join("first.cram");
+        let bam = dir.path().join("second.bam");
+        // Touch all four to keep the test focused on the
+        // mixed-format check (no missing-index noise).
+        touch(&cram);
+        touch(&dir.path().join("first.cram.crai"));
+        touch(&bam);
+        touch(&dir.path().join("second.bam.csi"));
+
+        let err = preflight_alignment_indexes(&[cram.clone(), bam.clone()], false)
+            .expect_err("preflight should reject mixed cram + bam");
+        match err {
+            AlignmentIndexError::MixedAlignmentFileFormats {
+                first_path,
+                first_format,
+                other_path,
+                other_format,
+            } => {
+                assert_eq!(first_path, cram);
+                assert_eq!(first_format, "CRAM");
+                assert_eq!(other_path, bam);
+                assert_eq!(other_format, "BAM");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_bam_first_then_cram_too() {
+        // Reverse the input order to confirm the check is
+        // order-independent (and that the first-seen rule fires
+        // on whichever format appears first).
+        let dir = TempDir::new().expect("tempdir");
+        let bam = dir.path().join("first.bam");
+        let cram = dir.path().join("second.cram");
+        touch(&bam);
+        touch(&dir.path().join("first.bam.csi"));
+        touch(&cram);
+        touch(&dir.path().join("second.cram.crai"));
+
+        let err = preflight_alignment_indexes(&[bam.clone(), cram.clone()], false)
+            .expect_err("preflight should reject mixed bam + cram");
+        match err {
+            AlignmentIndexError::MixedAlignmentFileFormats {
+                first_path,
+                first_format,
+                other_path,
+                other_format,
+            } => {
+                assert_eq!(first_path, bam);
+                assert_eq!(first_format, "BAM");
+                assert_eq!(other_path, cram);
+                assert_eq!(other_format, "CRAM");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }

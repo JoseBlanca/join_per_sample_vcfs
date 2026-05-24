@@ -1,10 +1,3 @@
-// `dead_code` is suppressed here until commit 4 of the BAM-input
-// plan wires `open_bam_record_stream` / `open_indexed_bam_record_stream`
-// into `alignment_input.rs`'s per-input dispatch. After that commit,
-// every item below has at least one non-test caller and this
-// blanket allow goes away.
-#![allow(dead_code)]
-
 //! BAM record-stream decoders. Sibling of [`crate::bam::cram_input`]
 //! — see that module's docs for the design; this file is the BAM
 //! analogue with the same factory shape so the format-agnostic

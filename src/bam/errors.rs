@@ -149,6 +149,47 @@ pub enum AlignmentInputError {
         headers: usize,
         indexes: usize,
     },
+
+    /// Input file's extension is neither `.cram` nor `.bam`.
+    /// `AlignmentMergedReader::{new,query}` need to dispatch on
+    /// the source format and we do not sniff magic bytes.
+    #[error(
+        "input alignment file '{path}' has an unsupported extension \
+         (expected .cram or .bam)"
+    )]
+    UnsupportedExtension { path: PathBuf },
+
+    /// Inputs to a single invocation mixed `.cram` and `.bam`
+    /// files. One format per invocation only — same policy the
+    /// pre-flight enforces; surfaced here too because not every
+    /// caller (e.g. `pileup`) runs through the pre-flight.
+    #[error(
+        "mixed alignment-file formats are not supported in one \
+         invocation: '{first_path}' is {first_format}, '{other_path}' is {other_format}"
+    )]
+    MixedAlignmentFileFormats {
+        first_path: PathBuf,
+        first_format: &'static str,
+        other_path: PathBuf,
+        other_format: &'static str,
+    },
+
+    /// `AlignmentMergedReader::query` was handed an `AlignmentIndex`
+    /// variant whose on-disk format does not match the input
+    /// file's extension (e.g. a `.cram` paired with a
+    /// `BamCsi`-typed index, or vice versa). Indicates the
+    /// driver's index loader and file-classification logic
+    /// disagree — surfaced as a typed error rather than a panic
+    /// to keep the boundary clean.
+    #[error(
+        "alignment-index format does not match input file '{path}': \
+         input is {file_format}, index is {index_format}"
+    )]
+    AlignmentIndexFormatMismatch {
+        path: PathBuf,
+        file_format: &'static str,
+        index_format: &'static str,
+    },
 }
 
 /// Errors raised by [`crate::bam::index_preflight::preflight_alignment_indexes`].
@@ -186,4 +227,18 @@ pub enum AlignmentIndexError {
          (expected .cram or .bam)"
     )]
     UnsupportedExtension { path: PathBuf },
+
+    /// Inputs to a single invocation mixed `.cram` and `.bam`
+    /// files. One format per invocation only; mixed-format support
+    /// is an explicit non-goal of the BAM-input plan.
+    #[error(
+        "mixed alignment-file formats are not supported in one \
+         invocation: '{first_path}' is {first_format}, '{other_path}' is {other_format}"
+    )]
+    MixedAlignmentFileFormats {
+        first_path: PathBuf,
+        first_format: &'static str,
+        other_path: PathBuf,
+        other_format: &'static str,
+    },
 }

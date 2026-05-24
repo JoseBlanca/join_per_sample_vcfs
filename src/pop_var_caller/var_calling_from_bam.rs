@@ -207,6 +207,20 @@ pub enum VarCallingFromBamCliError {
          (expected .cram or .bam)"
     )]
     UnsupportedAlignmentExtension { path: PathBuf },
+
+    /// Inputs to a single invocation mixed `.cram` and `.bam` files.
+    /// One format per invocation only; the merge downstream consumes
+    /// one sample's reads as one ordered stream.
+    #[error(
+        "mixed alignment-file formats are not supported in one \
+         invocation: '{first_path}' is {first_format}, '{other_path}' is {other_format}"
+    )]
+    MixedAlignmentFormats {
+        first_path: PathBuf,
+        first_format: &'static str,
+        other_path: PathBuf,
+        other_format: &'static str,
+    },
 }
 
 impl From<crate::bam::errors::AlignmentIndexError> for VarCallingFromBamCliError {
@@ -226,6 +240,17 @@ impl From<crate::bam::errors::AlignmentIndexError> for VarCallingFromBamCliError
             AlignmentIndexError::UnsupportedExtension { path } => {
                 Self::UnsupportedAlignmentExtension { path }
             }
+            AlignmentIndexError::MixedAlignmentFileFormats {
+                first_path,
+                first_format,
+                other_path,
+                other_format,
+            } => Self::MixedAlignmentFormats {
+                first_path,
+                first_format,
+                other_path,
+                other_format,
+            },
         }
     }
 }

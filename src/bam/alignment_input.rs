@@ -16,9 +16,10 @@ use std::sync::Arc;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
+use crate::bam::bam_input::{BamIndex, open_bam_record_stream, open_indexed_bam_record_stream};
 use crate::bam::cram_input::{open_cram_record_stream, open_indexed_cram_record_stream};
 use crate::bam::errors::AlignmentInputError;
-use crate::bam::index_preflight::AlignmentIndex;
+use crate::bam::index_preflight::{AlignmentFileKind, AlignmentIndex};
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
 use crate::pileup::walker::CigarOp;
@@ -473,6 +474,16 @@ fn with_fai_extension(fasta_path: &Path) -> PathBuf {
     PathBuf::from(buf)
 }
 
+/// User-facing name for an [`AlignmentIndex`] variant, used in
+/// [`AlignmentInputError::AlignmentIndexFormatMismatch`] messages.
+fn index_display_name(index: &AlignmentIndex) -> &'static str {
+    match index {
+        AlignmentIndex::Crai(_) => "CRAI",
+        AlignmentIndex::BamCsi(_) => "CSI",
+        AlignmentIndex::BamBai(_) => "BAI",
+    }
+}
+
 // ---------------------------------------------------------------------
 // AlignmentMergedReader
 // ---------------------------------------------------------------------
@@ -578,22 +589,56 @@ impl AlignmentMergedReader {
         let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
         let repository = fasta::Repository::new(adapter);
 
-        // Open every CRAM, validate per-file invariants, and collect
-        // per-file headers.
+        // Reject mixed `.cram` + `.bam` inputs and unknown
+        // extensions before touching the filesystem. The
+        // `index_preflight::preflight_alignment_indexes` layer
+        // enforces the same policy for the indexed-query path;
+        // `pileup` does not run through pre-flight so the gate
+        // lives here too. Same `display_name` strings on both
+        // sides so the error message is consistent.
+        let mut first_seen_kind: Option<(usize, AlignmentFileKind)> = None;
+        for (idx, input_path) in crams.iter().enumerate() {
+            let kind = AlignmentFileKind::from_path(input_path).ok_or_else(|| {
+                AlignmentInputError::UnsupportedExtension {
+                    path: input_path.clone(),
+                }
+            })?;
+            match first_seen_kind {
+                None => first_seen_kind = Some((idx, kind)),
+                Some((first_idx, first_kind)) if first_kind != kind => {
+                    return Err(AlignmentInputError::MixedAlignmentFileFormats {
+                        first_path: crams[first_idx].clone(),
+                        first_format: first_kind.display_name(),
+                        other_path: input_path.clone(),
+                        other_format: kind.display_name(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Open every input, validate per-file invariants, and
+        // collect per-file headers.
         let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(crams.len());
         let mut canonical_contigs: Option<ContigList> = None;
         let mut canonical_sample: Option<String> = None;
         let mut reference_cram_path: Option<PathBuf> = None;
 
         for cram_path in crams {
-            // Format-specific decoder lives in the sibling
-            // `cram_input` module; the helper opens the file,
-            // validates the file definition + version, reads the
-            // SAM header, and returns the header + an owned record
-            // iterator. Cross-file checks (contigs identical, single
-            // SM tag) are this module's concern and run after.
-            let (noodles_sam_header, owned_records) =
-                open_cram_record_stream(cram_path, repository.clone())?;
+            // Format-specific decoder lives in the corresponding
+            // sibling module; each helper opens the file, validates
+            // any format-level invariants (CRAM version, BAM magic),
+            // reads the SAM header, and returns the header + an
+            // owned record iterator. Cross-file checks (contigs
+            // identical, single SM tag) are this module's concern
+            // and run after. (`unwrap` here is safe — the classify
+            // pass above already errored on unknown extensions.)
+            let (noodles_sam_header, owned_records) = match AlignmentFileKind::from_path(cram_path)
+                .unwrap()
+            {
+                AlignmentFileKind::Cram => open_cram_record_stream(cram_path, repository.clone())?,
+                AlignmentFileKind::Bam => open_bam_record_stream(cram_path)?,
+            };
             let cram_header = extract_header(cram_path, &noodles_sam_header)?;
 
             // Cross-file checks: contigs and sample name must be
@@ -799,22 +844,62 @@ impl AlignmentMergedReader {
         let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
         let repository = fasta::Repository::new(adapter);
 
-        // One indexed iterator per input. The CRAM-specific decoder
-        // lives in the `cram_input` sibling module.
+        // One indexed iterator per input. Format-specific decoders
+        // live in the `cram_input` / `bam_input` sibling modules;
+        // this loop's job is just to pick the right opener and
+        // match the per-input `AlignmentIndex` variant to the
+        // input file's extension.
+        //
+        // The cohort driver is responsible for loading indexes via
+        // [`crate::bam::index_preflight::load_alignment_index`],
+        // which projects the on-disk format onto the right enum
+        // variant. If the variants disagree with the file
+        // extensions here, that's a programmer error in the
+        // driver — surfaced as a typed
+        // `AlignmentIndexFormatMismatch` rather than a panic.
         let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(crams.len());
         for ((cram_path, header), alignment_index) in
             crams.iter().zip(headers.iter()).zip(indexes.iter())
         {
-            let index_arc = match alignment_index {
-                AlignmentIndex::Crai(idx) => Arc::clone(idx),
+            let file_kind = AlignmentFileKind::from_path(cram_path).ok_or_else(|| {
+                AlignmentInputError::UnsupportedExtension {
+                    path: cram_path.clone(),
+                }
+            })?;
+            let owned_records = match (file_kind, alignment_index) {
+                (AlignmentFileKind::Cram, AlignmentIndex::Crai(idx)) => {
+                    open_indexed_cram_record_stream(
+                        cram_path,
+                        Arc::clone(header),
+                        Arc::clone(idx),
+                        repository.clone(),
+                        target_reference_sequence_id,
+                    )?
+                }
+                (AlignmentFileKind::Bam, AlignmentIndex::BamCsi(idx)) => {
+                    open_indexed_bam_record_stream(
+                        cram_path,
+                        Arc::clone(header),
+                        BamIndex::Csi(Arc::clone(idx)),
+                        target_reference_sequence_id,
+                    )?
+                }
+                (AlignmentFileKind::Bam, AlignmentIndex::BamBai(idx)) => {
+                    open_indexed_bam_record_stream(
+                        cram_path,
+                        Arc::clone(header),
+                        BamIndex::Bai(Arc::clone(idx)),
+                        target_reference_sequence_id,
+                    )?
+                }
+                (file_kind, index) => {
+                    return Err(AlignmentInputError::AlignmentIndexFormatMismatch {
+                        path: cram_path.clone(),
+                        file_format: file_kind.display_name(),
+                        index_format: index_display_name(index),
+                    });
+                }
             };
-            let owned_records = open_indexed_cram_record_stream(
-                cram_path,
-                Arc::clone(header),
-                index_arc,
-                repository.clone(),
-                target_reference_sequence_id,
-            )?;
             open_crams.push(OpenAlignmentFile {
                 path: cram_path.clone(),
                 records: owned_records,
