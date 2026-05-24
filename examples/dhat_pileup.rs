@@ -24,19 +24,27 @@ use std::io;
 use std::sync::Arc;
 
 use pop_var_caller::per_sample_pileup::pileup::{
-    CigarOp, MateRole, PreparedRead, RefSeqFetcher, WalkerConfig, run,
+    ChromRefFetchError, CigarOp, MateRole, MultiChromRefFetcher, PreparedRead, WalkerConfig, run,
 };
 
 struct ConstFasta {
     len: usize,
 }
 
-impl RefSeqFetcher for ConstFasta {
-    fn fetch(&self, _chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
+impl MultiChromRefFetcher for ConstFasta {
+    fn fetch(
+        &self,
+        _chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, ChromRefFetchError> {
         let lo = (start_1based - 1) as usize;
         let hi = lo + length as usize;
         if hi > self.len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "off end"));
+            return Err(ChromRefFetchError::Io {
+                chrom_name: String::from("<bench-const>"),
+                source: io::Error::new(io::ErrorKind::UnexpectedEof, "off end"),
+            });
         }
         Ok(vec![b'A'; length as usize])
     }

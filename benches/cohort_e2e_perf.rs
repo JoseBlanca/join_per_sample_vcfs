@@ -78,7 +78,6 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use md5::{Digest, Md5};
 use tempfile::TempDir;
 
-use pop_var_caller::per_sample_pileup::cram_input::{ContigEntry, ContigList};
 use pop_var_caller::per_sample_pileup::pileup::{
     AlleleObservation, AlleleSupportStats, PileupRecord,
 };
@@ -87,7 +86,7 @@ use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParsedChromosome, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
-use pop_var_caller::per_sample_pileup::ref_fetcher::SyncRefFetcher;
+use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{
     CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
@@ -161,12 +160,20 @@ type CoreInputs = (
 /// - on-disk FASTA + per-sample `.psp` files (consumed by the `full`
 ///   bench group through `run_var_calling`);
 /// - pre-decoded per-sample `Vec<PileupRecord>` (cloned per iteration
-///   in the `core` group as the merger's input iterators);
-/// - a shared `SyncRefFetcher` so the `core` group doesn't re-open
-///   the FASTA each iteration.
+///   in the `core` group as the merger's input iterators).
 ///
-/// `_dir` is held to keep the `.psp` files alive until the fixture
-/// is dropped; bench code uses `dir()` for per-iter VCF output paths.
+///
+/// No shared fetcher: post-H1, `SharedRefFetcher` is
+/// `Arc<dyn ChromRefFetcher + Send>` (not `+ Sync`), so it can't be held
+/// in the fixture and reused across `pool.install` boundaries. Each
+/// `core` iteration builds its own `StreamingChromRefFetcher::for_contig`
+/// — same shape as `process_one_chromosome` in production. The per-iter
+/// `for_contig` cost (one `open(2)` + small `.fai` parse) is negligible
+/// against the pipeline it gates.
+///
+/// `_dir` is held to keep the `.psp` files and FASTA alive until the
+/// fixture is dropped; bench code uses `dir()` for per-iter VCF output
+/// paths.
 struct CohortFixture {
     _dir: TempDir,
     dir_path: PathBuf,
@@ -175,14 +182,14 @@ struct CohortFixture {
     records: Vec<Vec<PileupRecord>>,
     sample_names: Vec<String>,
     chromosomes: Vec<ParsedChromosome>,
-    fetcher: SharedRefFetcher,
     n_positions: u32,
     n_samples: usize,
 }
 
 impl CohortFixture {
     fn build(n_samples: usize, n_positions: u32) -> Self {
-        let dir = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all("tmp").expect("mkdir tmp");
+        let dir = TempDir::new_in("tmp").expect("tempdir");
         let dir_path = dir.path().to_path_buf();
 
         let contig_name = "chr1".to_string();
@@ -211,22 +218,10 @@ impl CohortFixture {
             .collect();
 
         let chromosomes = vec![ParsedChromosome {
-            name: contig_name.clone(),
+            name: contig_name,
             length: n_positions,
-            md5: contig_md5.clone(),
+            md5: contig_md5,
         }];
-
-        let contig_list = ContigList {
-            entries: vec![ContigEntry {
-                name: contig_name,
-                length: u64::from(n_positions),
-                md5: Some(md5_hex_to_bytes(&contig_md5)),
-            }],
-        };
-
-        let fetcher_concrete =
-            SyncRefFetcher::new(&fasta, contig_list).expect("SyncRefFetcher::new");
-        let fetcher: SharedRefFetcher = Arc::new(fetcher_concrete);
 
         Self {
             _dir: dir,
@@ -236,7 +231,6 @@ impl CohortFixture {
             records,
             sample_names,
             chromosomes,
-            fetcher,
             n_positions,
             n_samples,
         }
@@ -269,8 +263,6 @@ impl CohortFixture {
             )
             .expect("per-group cfg"),
             posterior_cfg: posterior_default_cfg(),
-            fetcher: self.fetcher.clone(),
-            chromosomes: self.chromosomes.clone(),
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
             no_mapq_diff_filter: false,
@@ -371,26 +363,6 @@ fn md5_hex(bytes: &[u8]) -> String {
         write!(&mut out, "{b:02x}").unwrap();
     }
     out
-}
-
-fn md5_hex_to_bytes(hex: &str) -> [u8; 16] {
-    assert_eq!(hex.len(), 32);
-    let mut out = [0u8; 16];
-    for (i, b) in out.iter_mut().enumerate() {
-        let high = hex_digit(hex.as_bytes()[i * 2]);
-        let low = hex_digit(hex.as_bytes()[i * 2 + 1]);
-        *b = (high << 4) | low;
-    }
-    out
-}
-
-fn hex_digit(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => panic!("non-hex digit in md5"),
-    }
 }
 
 fn write_fasta(dir: &Path, contig_name: &str, seq: &[u8]) -> PathBuf {
@@ -610,18 +582,49 @@ fn run_core_iters(
         let vcf_out = fixture.dir_path.join(format!("core_{counter:08}.vcf"));
         let (merger, params, metadata, writer_cfg) = fixture.core_inputs(vcf_out.clone());
 
+        // Build the fetcher per-iter inside the closure body. Post-H1
+        // `SharedRefFetcher` is `Arc<dyn ChromRefFetcher + Send>` (not
+        // `+ Sync`), so the Arc itself isn't `Send` — fetchers must be
+        // constructed on the thread that uses them, exactly as
+        // `process_one_chromosome` does in production
+        // (cohort_driver.rs:472).
+        let fasta_path = fixture.fasta.clone();
+        let chrom_name = fixture.chromosomes[0].name.clone();
+        let vcf_out_for_pipeline = vcf_out.clone();
         let start = Instant::now();
         let written = match pool {
-            Some(p) => p.install(|| {
+            Some(p) => p.install(move || {
+                let streaming = StreamingChromRefFetcher::for_contig(&fasta_path, &chrom_name)
+                    .expect("StreamingChromRefFetcher::for_contig");
+                #[allow(clippy::arc_with_non_send_sync)]
+                let fetcher: SharedRefFetcher = Arc::new(streaming);
                 drive_cohort_pipeline::<_, VarCallingCliError>(
-                    merger, params, &vcf_out, metadata, writer_cfg,
+                    0u32,
+                    merger,
+                    params,
+                    fetcher,
+                    &vcf_out_for_pipeline,
+                    metadata,
+                    writer_cfg,
                 )
                 .expect("drive_cohort_pipeline")
             }),
-            None => drive_cohort_pipeline::<_, VarCallingCliError>(
-                merger, params, &vcf_out, metadata, writer_cfg,
-            )
-            .expect("drive_cohort_pipeline"),
+            None => {
+                let streaming = StreamingChromRefFetcher::for_contig(&fasta_path, &chrom_name)
+                    .expect("StreamingChromRefFetcher::for_contig");
+                #[allow(clippy::arc_with_non_send_sync)]
+                let fetcher: SharedRefFetcher = Arc::new(streaming);
+                drive_cohort_pipeline::<_, VarCallingCliError>(
+                    0u32,
+                    merger,
+                    params,
+                    fetcher,
+                    &vcf_out_for_pipeline,
+                    metadata,
+                    writer_cfg,
+                )
+                .expect("drive_cohort_pipeline")
+            }
         };
         total += start.elapsed();
         black_box(written);

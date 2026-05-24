@@ -18,12 +18,18 @@
 //! Wall-time of each drain is printed to stderr; aggregate totals at
 //! the end give an off-Criterion baseline.
 
+use std::fs::{File, create_dir_all};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use tempfile::TempDir;
+
 use pop_var_caller::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, ChainId, PileupRecord, RefSeqFetcher,
+    AlleleObservation, AlleleSupportStats, ChainId, PileupRecord,
 };
+use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use pop_var_caller::var_calling::contamination_estimation::ContaminationEstimates;
 use pop_var_caller::var_calling::per_group_merger::{
     MergedRecord, PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
@@ -42,25 +48,38 @@ const N_GROUPS: u32 = 10_000;
 const SPACING: u32 = 10;
 const N_RUNS: usize = 30;
 
-struct InMemRef {
-    seq: Vec<u8>,
-    base_offset: u32,
+/// Write a single-contig FASTA + `.fai` to `dir`. Contig layout is
+/// `99 N` + `seq` so 1-based position 100 maps to `seq[0]`.
+fn write_fasta(dir: &Path, contig_name: &str, seq: &[u8]) -> PathBuf {
+    let fasta_path = dir.join("ref.fa");
+    let fai_path = dir.join("ref.fa.fai");
+    let mut fa = File::create(&fasta_path).expect("create fasta");
+    writeln!(fa, ">{contig_name}").expect("fa header");
+    let header_len = (contig_name.len() + 2) as u64;
+    let prefix = vec![b'N'; 99];
+    fa.write_all(&prefix).expect("fa prefix");
+    fa.write_all(seq).expect("fa seq");
+    fa.write_all(b"\n").expect("fa nl");
+    let total_len = prefix.len() + seq.len();
+    let mut fai = File::create(&fai_path).expect("create fai");
+    writeln!(
+        fai,
+        "{contig_name}\t{total_len}\t{header_len}\t{total_len}\t{}",
+        total_len + 1
+    )
+    .expect("fai write");
+    fasta_path
 }
 
-impl RefSeqFetcher for InMemRef {
-    fn fetch(
-        &self,
-        _chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, std::io::Error> {
-        let start_idx = (start_1based - self.base_offset) as usize;
-        let end_idx = start_idx + length as usize;
-        if end_idx > self.seq.len() {
-            return Err(std::io::Error::other("out of range"));
-        }
-        Ok(self.seq[start_idx..end_idx].to_vec())
-    }
+fn build_shared_fetcher(dir: &Path, seq: &[u8]) -> SharedRefFetcher {
+    let fasta_path = write_fasta(dir, "chr0", seq);
+    let streaming =
+        StreamingChromRefFetcher::for_contig(&fasta_path, "chr0").expect("for_contig(chr0)");
+    // See cohort_driver.rs:481 — SharedRefFetcher is Arc<dyn ChromRefFetcher + Send>
+    // but the concrete StreamingChromRefFetcher is !Sync (RefCell interior mutability).
+    #[allow(clippy::arc_with_non_send_sync)]
+    let fetcher: SharedRefFetcher = Arc::new(streaming);
+    fetcher
 }
 
 fn support(num_obs: u32, q_sum: f64) -> AlleleSupportStats {
@@ -181,10 +200,9 @@ fn main() {
     let setup_start = Instant::now();
 
     let (groups, ref_seq) = build_biallelic_snp_groups(N_GROUPS, N_SAMPLES, SPACING);
-    let fetcher: SharedRefFetcher = Arc::new(InMemRef {
-        seq: ref_seq,
-        base_offset: 100,
-    });
+    create_dir_all("tmp").expect("mkdir tmp");
+    let dir = TempDir::new_in("tmp").expect("tempdir");
+    let fetcher = build_shared_fetcher(dir.path(), &ref_seq);
     let merged = pre_merge(groups, fetcher);
     let config = PosteriorEngineConfig::with_project_defaults()
         .with_contamination(Some(representative_contamination(N_SAMPLES)))

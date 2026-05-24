@@ -19,21 +19,29 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pop_var_caller::per_sample_pileup::pileup::{
-    CigarOp, MateRole, PreparedRead, RefSeqFetcher, WalkerConfig, run,
+    ChromRefFetchError, CigarOp, MateRole, MultiChromRefFetcher, PreparedRead, WalkerConfig, run,
 };
 
-/// Constant-base reference. The walker only needs `RefSeqFetcher`,
+/// Constant-base reference. The walker only needs `MultiChromRefFetcher`,
 /// so we avoid the FASTA toolchain entirely.
 struct ConstFasta {
     len: usize,
 }
 
-impl RefSeqFetcher for ConstFasta {
-    fn fetch(&self, _chrom_id: u32, start_1based: u32, length: u32) -> Result<Vec<u8>, io::Error> {
+impl MultiChromRefFetcher for ConstFasta {
+    fn fetch(
+        &self,
+        _chrom_id: u32,
+        start_1based: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, ChromRefFetchError> {
         let lo = (start_1based - 1) as usize;
         let hi = lo + length as usize;
         if hi > self.len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "off end"));
+            return Err(ChromRefFetchError::Io {
+                chrom_name: String::from("<bench-const>"),
+                source: io::Error::new(io::ErrorKind::UnexpectedEof, "off end"),
+            });
         }
         Ok(vec![b'A'; length as usize])
     }
@@ -70,6 +78,7 @@ fn build_reads(read_len: u32, span: u32, coverage: u32) -> Vec<PreparedRead> {
             qname: Arc::from(format!("r{i}").as_str()),
             mate_role: MateRole::Solo,
             adaptor_boundary: None,
+            mapq: 60,
         });
     }
     // Walker requires non-decreasing alignment_start.
@@ -171,6 +180,7 @@ fn build_multi_op_reads(read_len: u32, span: u32, coverage: u32) -> Vec<Prepared
             qname: Arc::from(format!("r{i}").as_str()),
             mate_role: MateRole::Solo,
             adaptor_boundary: None,
+            mapq: 60,
         });
     }
     reads.sort_by_key(|r| r.alignment_start);

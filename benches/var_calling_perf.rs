@@ -25,16 +25,21 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::fs::{File, create_dir_all};
 use std::hint::black_box;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use tempfile::TempDir;
 
 use pop_var_caller::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, ChainId, PileupRecord, RefSeqFetcher,
+    AlleleObservation, AlleleSupportStats, ChainId, PileupRecord,
 };
 use pop_var_caller::per_sample_pileup::psp::PspReadError;
+use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use pop_var_caller::var_calling::contamination_estimation::ContaminationEstimates;
 use pop_var_caller::var_calling::per_group_merger::{
     MergedRecord, PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
@@ -56,32 +61,44 @@ use pop_var_caller::var_calling::variant_grouping::{
 
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
 
-/// Mock fetcher backed by an in-memory reference buffer. Returns
-/// uppercase ASCII per the `RefSeqFetcher` trait contract.
-struct InMemRef {
-    seq: Vec<u8>,
-    /// 1-based position of `seq[0]`.
-    base_offset: u32,
+/// Write a single-contig FASTA + matching `.fai` to `dir`. The
+/// resulting contig is `99 N` bases followed by `seq`, so 1-based
+/// position 100 maps to `seq[0]` — the same offset semantics the old
+/// inline `InMemRef { base_offset: 100 }` carried.
+fn write_fasta(dir: &Path, contig_name: &str, seq: &[u8]) -> PathBuf {
+    let fasta_path = dir.join("ref.fa");
+    let fai_path = dir.join("ref.fa.fai");
+    let mut fa = File::create(&fasta_path).expect("create fasta");
+    writeln!(fa, ">{contig_name}").expect("fa header");
+    let header_len = (contig_name.len() + 2) as u64;
+    let prefix = vec![b'N'; 99];
+    fa.write_all(&prefix).expect("fa prefix");
+    fa.write_all(seq).expect("fa seq");
+    fa.write_all(b"\n").expect("fa nl");
+    let total_len = prefix.len() + seq.len();
+    let mut fai = File::create(&fai_path).expect("create fai");
+    writeln!(
+        fai,
+        "{contig_name}\t{total_len}\t{header_len}\t{total_len}\t{}",
+        total_len + 1
+    )
+    .expect("fai write");
+    fasta_path
 }
 
-impl RefSeqFetcher for InMemRef {
-    fn fetch(
-        &self,
-        _chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, std::io::Error> {
-        let start_idx = (start_1based - self.base_offset) as usize;
-        let end_idx = start_idx + length as usize;
-        if end_idx > self.seq.len() {
-            return Err(std::io::Error::other("out of range"));
-        }
-        Ok(self.seq[start_idx..end_idx].to_vec())
-    }
-}
-
-fn shared_fetcher(seq: Vec<u8>, base_offset: u32) -> SharedRefFetcher {
-    Arc::new(InMemRef { seq, base_offset })
+/// Build a `SharedRefFetcher` over a freshly-written single-contig FASTA
+/// under `dir`. Contig is named `"chr0"`; the on-disk layout is `99 N`
+/// bases + `seq` so 1-based position 100 maps to `seq[0]`.
+fn build_shared_fetcher(dir: &Path, seq: &[u8]) -> SharedRefFetcher {
+    let fasta_path = write_fasta(dir, "chr0", seq);
+    let streaming =
+        StreamingChromRefFetcher::for_contig(&fasta_path, "chr0").expect("for_contig(chr0)");
+    // Mirrors the production allow at cohort_driver.rs:481: `SharedRefFetcher`
+    // is `Arc<dyn ChromRefFetcher + Send>`, but the concrete `StreamingChromRefFetcher`
+    // is `!Sync` so clippy fires before the dyn coercion.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let fetcher: SharedRefFetcher = Arc::new(streaming);
+    fetcher
 }
 
 fn support(num_obs: u32, q_sum: f64) -> AlleleSupportStats {
@@ -507,9 +524,14 @@ fn bench_per_group_merger(c: &mut Criterion) {
     const N_GROUPS: u32 = 10_000;
     const SPACING: u32 = 10;
 
+    create_dir_all("tmp").expect("mkdir tmp");
+    let dir_snp = TempDir::new_in("tmp").expect("tempdir snp");
+    let dir_compound = TempDir::new_in("tmp").expect("tempdir compound");
+    let dir_solo = TempDir::new_in("tmp").expect("tempdir solo");
+
     // --- biallelic SNP, no compounds ---
     let (groups_snp, ref_seq_snp) = build_biallelic_snp_groups(N_GROUPS, N_SAMPLES, SPACING);
-    let fetcher_snp = shared_fetcher(ref_seq_snp.clone(), 100);
+    let fetcher_snp = build_shared_fetcher(dir_snp.path(), &ref_seq_snp);
     group.throughput(Throughput::Elements(N_GROUPS as u64));
     group.bench_function(
         format!("biallelic_snp_{N_SAMPLES}_samples_{N_GROUPS}_groups"),
@@ -538,7 +560,7 @@ fn bench_per_group_merger(c: &mut Criterion) {
     // --- compound-heavy: every sample chain-anchored ---
     let (groups_compound_full, ref_seq_compound) =
         build_compound_groups(N_GROUPS, N_SAMPLES, SPACING, 1.0);
-    let fetcher_compound = shared_fetcher(ref_seq_compound.clone(), 100);
+    let fetcher_compound = build_shared_fetcher(dir_compound.path(), &ref_seq_compound);
     group.bench_function(
         format!("compound_all_anchored_{N_SAMPLES}_samples_{N_GROUPS}_groups"),
         |b| {
@@ -591,7 +613,7 @@ fn bench_per_group_merger(c: &mut Criterion) {
 
     // --- single-sample biallelic SNP (no rayon contention) ---
     let (groups_solo, ref_seq_solo) = build_biallelic_snp_groups(N_GROUPS, 1, SPACING);
-    let fetcher_solo = shared_fetcher(ref_seq_solo.clone(), 100);
+    let fetcher_solo = build_shared_fetcher(dir_solo.path(), &ref_seq_solo);
     group.bench_function(format!("biallelic_snp_1_sample_{N_GROUPS}_groups"), |b| {
         b.iter_batched(
             || groups_solo.clone(),
@@ -692,8 +714,11 @@ fn bench_posterior_engine(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements(N_GROUPS as u64));
 
+    create_dir_all("tmp").expect("mkdir tmp");
+    let dir_snp = TempDir::new_in("tmp").expect("tempdir snp");
+
     let (groups_snp, ref_seq_snp) = build_biallelic_snp_groups(N_GROUPS, N_SAMPLES, SPACING);
-    let fetcher_snp = shared_fetcher(ref_seq_snp.clone(), 100);
+    let fetcher_snp = build_shared_fetcher(dir_snp.path(), &ref_seq_snp);
     let merged_diploid = pre_merge(
         groups_snp.clone(),
         Arc::clone(&fetcher_snp),
