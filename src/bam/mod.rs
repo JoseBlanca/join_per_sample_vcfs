@@ -31,6 +31,7 @@
 //! and then by the walker. CIGAR ops use [`crate::pileup::walker::CigarOp`].
 
 pub mod alignment_input;
+pub mod bam_input;
 pub mod cram_input;
 pub mod errors;
 pub mod index_preflight;
