@@ -604,7 +604,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::per_sample_pileup::pileup::AlleleSupportStats;
+    use crate::pileup_record::AlleleSupportStats;
     use crate::var_calling::per_group_merger::{MergedAllele, genotype_order};
     use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 

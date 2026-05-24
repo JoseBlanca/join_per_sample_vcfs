@@ -1115,7 +1115,7 @@ mod tests {
 
     // ---- DustFilter: iterator plumbing ----
 
-    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
     use std::cell::Cell;
     use std::io;
 

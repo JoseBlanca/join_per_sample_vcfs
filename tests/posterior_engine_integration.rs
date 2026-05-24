@@ -5,7 +5,7 @@
 //! Stage 6's contract is independent of Stage 5's internal layout
 //! per the implementation plan.
 
-use pop_var_caller::per_sample_pileup::pileup::AlleleSupportStats;
+use pop_var_caller::pileup_record::AlleleSupportStats;
 use pop_var_caller::var_calling::per_group_merger::{
     MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
 };

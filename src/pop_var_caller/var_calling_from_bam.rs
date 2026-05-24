@@ -29,10 +29,11 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::per_sample_pileup::cram_input::ContigList;
-use crate::per_sample_pileup::pileup::{PileupRecord, WalkerError};
+use crate::per_sample_pileup::pileup::WalkerError;
 use crate::per_sample_pileup::psp::PspReadError;
 use crate::per_sample_pileup::psp::header::ParsedChromosome;
 use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
+use crate::pileup_record::PileupRecord;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
 use crate::pop_var_caller::cohort_driver::{
@@ -728,7 +729,7 @@ mod tests {
     // PerChromRecordsIter tests
     // ---------------------------------------------------------------
 
-    use crate::per_sample_pileup::pileup::PileupRecord;
+    use crate::pileup_record::PileupRecord;
 
     fn record_on(chrom_id: u32, pos: u32) -> PileupRecord {
         // Use the public constructor and patch chrom_id/pos.

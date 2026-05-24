@@ -62,7 +62,7 @@ impl<E> ErrorHandle<E> {
 ///
 /// `T` is the item type the downstream wants
 /// (e.g. [`PreparedRead`](crate::per_sample_pileup::pileup::PreparedRead),
-/// [`PileupRecord`](crate::per_sample_pileup::pileup::PileupRecord)).
+/// [`PileupRecord`](crate::pileup_record::PileupRecord)).
 /// `E` is the upstream error type stored in the handle.
 pub struct ErrorSheddingAdapter<I, T, E>
 where

@@ -5,8 +5,10 @@
 
 use ahash::AHashMap;
 
+use crate::pileup_record::ChainId;
+
 use super::PreparedRead;
-use super::chain_id_allocator::{ChainId, ChainIdAllocator};
+use super::chain_id_allocator::ChainIdAllocator;
 use super::cigar_cursor::CigarCursor;
 use super::errors::WalkerError;
 

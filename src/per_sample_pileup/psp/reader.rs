@@ -41,9 +41,7 @@ use super::header::{
 use super::index::{BlockIndexEntry, checksum_index, decode_index};
 use super::registry::{ColumnKey, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS, lookup_by_tag};
 use super::trailer::{TRAILER_BYTES, Trailer, decode_trailer};
-use crate::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, ChainId, PileupRecord,
-};
+use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 
 /// Cap on how many bytes the reader will pull off the source in
 /// pursuit of a single block header before giving up. The header is
@@ -1405,12 +1403,12 @@ fn seek_to_offset<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
     use crate::per_sample_pileup::psp::header::{
         ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
     };
     use crate::per_sample_pileup::psp::test_fixtures::writer_header;
     use crate::per_sample_pileup::psp::writer::PspWriter;
+    use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 

@@ -7,9 +7,7 @@
 //! directly rather than rounding through `.psp` on-disk artefacts —
 //! the on-disk path is exercised by `psp_to_pileup_integration.rs`.
 
-use pop_var_caller::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, PileupRecord,
-};
+use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, StoppingMode, estimate_contamination,

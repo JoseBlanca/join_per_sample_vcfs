@@ -2,11 +2,14 @@
 //! stream of prepared (filtered + BAQ-adjusted) reads into the
 //! per-position records that Stage 2 encodes to the `.psp` file.
 //!
-//! See `ia/specs/pileup_walker.md` for the implementation-ready
-//! specification. This module ships the public types
-//! (`PreparedRead`, `PileupRecord`, `AlleleObservation`, `AlleleSupportStats`,
-//! `ChainId`, `MultiChromRefFetcher`, `WalkerError`) and the public entry
-//! point `run`. Internal building blocks live in private submodules.
+//! See `doc/devel/specs/pileup_walker.md` for the implementation-ready
+//! specification. This module ships the walker (`PreparedRead`,
+//! `MultiChromRefFetcher`, `WalkerError`, `WalkerConfig`, and the
+//! public entry point `run`); the per-position record types it emits
+//! (`PileupRecord`, `AlleleObservation`, `AlleleSupportStats`,
+//! `ChainId`) live in [`crate::pileup_record`] because they are the
+//! pipeline-wide data interchange, not walker internals. Internal
+//! building blocks live in private submodules.
 
 mod active_read_set;
 mod chain_id_allocator;
@@ -23,7 +26,7 @@ use std::sync::Arc;
 
 pub use crate::per_sample_pileup::cram_input::CigarOp;
 pub use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
-pub use chain_id_allocator::{ChainId, DEFAULT_MAX_ACTIVE_READS};
+pub use chain_id_allocator::DEFAULT_MAX_ACTIVE_READS;
 pub use errors::WalkerError;
 pub use walker::{PileupWalker, RunSummary, run};
 
@@ -334,168 +337,6 @@ impl PreparedRead {
             });
         }
         Ok(cigar_consumed)
-    }
-}
-
-// ---------------------------------------------------------------------
-// AlleleSupportStats
-// ---------------------------------------------------------------------
-
-/// The fixed set of per-allele support statistics sufficient to
-/// reproduce freebayes' likelihood and observation-bias priors
-/// exactly. See `ia/specs/calling_pipeline_architecture.md` §"The
-/// five per-allele scalars" for the field-by-field justification.
-/// Stored compact because every record carries one of these per
-/// allele.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-#[non_exhaustive]
-pub struct AlleleSupportStats {
-    /// Number of supporting reads for this allele in this record.
-    pub num_obs: u32,
-    /// `Σ max(ln(P_err_BQ_BAQ), ln(P_err_MQ))` over supporting reads.
-    /// Sums in log-error space because freebayes' `prodQout`
-    /// reconstruction needs the per-read max combination pre-summed.
-    pub q_sum: f64,
-    /// Reads on the forward strand among `num_obs`.
-    pub fwd: u32,
-    /// Reads whose mapped 5′ end is strictly to the left of this
-    /// record's anchor position (freebayes' `placedLeft`).
-    pub placed_left: u32,
-    /// Reads whose mapped 5′ end *is* this record's anchor
-    /// position (freebayes' `placedStart`).
-    pub placed_start: u32,
-    /// Σ mapping quality over supporting reads. Combined with
-    /// `num_obs` this yields the mean MAPQ of the allele; with
-    /// `mapq_sum_sq` it yields the sample variance and Welch's t.
-    pub mapq_sum: u32,
-    /// Σ mapq² over supporting reads. With `mapq_sum` and `num_obs`
-    /// this gives the sample variance via the identity
-    /// `var = (mapq_sum_sq − mapq_sum² / num_obs) / (num_obs − 1)`.
-    pub mapq_sum_sq: u64,
-}
-
-// ---------------------------------------------------------------------
-// AlleleObservation
-// ---------------------------------------------------------------------
-
-/// One allele bucket inside a `PileupRecord`. `seq` is the literal
-/// allele over `{A,C,G,T,N}`: for SNP/MNP/DEL alleles the length
-/// equals the record's REF span (= `alleles[0].seq.len()`);
-/// INS-bearing alleles are longer.
-///
-/// **Observation count.** A `num_obs == 0` entry means "this allele
-/// exists in the record but no read in this sample currently has it
-/// as its haplotype." Two paths produce this:
-/// 1. The REF entry at a position no read covers as REF.
-/// 2. A non-REF bucket that *was* observed under an earlier
-///    (narrower) footprint and lost its only observer when the
-///    record widened and that read re-folded into a different
-///    bucket. The empty bucket stays in the record because its
-///    seq is still a legal haplotype call across the widened
-///    footprint — downstream consumers should treat it as having
-///    no evidence in this sample.
-///
-/// **Chain ids invariant.** `chain_ids` lists exactly the chains of
-/// reads currently folded into this bucket — derived from the open-
-/// record's fold map at finalise time, not accumulated during
-/// folding. Consequences:
-/// - `chain_ids.len() <= num_obs as usize` in every bucket (each
-///   chain id is backed by at least one observation; paired mates
-///   may share a chain id, so the inequality can be strict).
-/// - `num_obs == 0 ⇒ chain_ids.is_empty()`.
-///
-/// Downstream callers that match constituents by chain-id
-/// intersection (e.g. the per-group merger building chain-anchored
-/// compounds) can rely on the contrapositive: any bucket reachable
-/// via a chain id intersection has `num_obs >= 1`.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct AlleleObservation {
-    pub seq: Vec<u8>,
-    pub support: AlleleSupportStats,
-    /// Distinct phase-chain ids of reads currently folded into this
-    /// bucket, sorted ascending and deduplicated.
-    pub chain_ids: Vec<ChainId>,
-}
-
-// ---------------------------------------------------------------------
-// PileupRecord
-// ---------------------------------------------------------------------
-
-/// One emitted per-position record. `alleles[0]` is unconditionally
-/// REF — the walker invariant — so `ref_span` is derivable as
-/// `alleles[0].seq.len()` and is not stored separately.
-///
-/// Each `AlleleObservation`'s `chain_ids` field references chain
-/// ids minted by the walker's chain-id allocator. Chain ids are
-/// unique-per-`.psp`-file `u64` values; there is no recycling, no
-/// active-set bookkeeping, and no per-record lifecycle markers.
-/// Two allele observations sharing a chain id came from the same
-/// read or read-pair in this sample.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct PileupRecord {
-    pub chrom_id: u32,
-    /// 1-based anchor position.
-    pub pos: u32,
-    /// At least one entry; `alleles[0]` is always REF.
-    pub alleles: Vec<AlleleObservation>,
-}
-
-impl PileupRecord {
-    /// Number of reference positions this record covers, derived
-    /// from REF's `seq` length.
-    pub fn ref_span(&self) -> u32 {
-        self.alleles[0].seq.len() as u32
-    }
-
-    /// Constructor for external code (benches, integration tests).
-    /// The walker builds records via struct-update syntax internally
-    /// because [`PileupRecord`] is `#[non_exhaustive]`; this `new` is
-    /// the supported entry point from outside the crate.
-    pub fn new(chrom_id: u32, pos: u32, alleles: Vec<AlleleObservation>) -> Self {
-        Self {
-            chrom_id,
-            pos,
-            alleles,
-        }
-    }
-}
-
-impl AlleleObservation {
-    /// Constructor for external code (benches, integration tests).
-    /// See [`PileupRecord::new`].
-    pub fn new(seq: Vec<u8>, support: AlleleSupportStats, chain_ids: Vec<ChainId>) -> Self {
-        Self {
-            seq,
-            support,
-            chain_ids,
-        }
-    }
-}
-
-impl AlleleSupportStats {
-    /// Constructor for external code (benches, integration tests).
-    /// See [`PileupRecord::new`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        num_obs: u32,
-        q_sum: f64,
-        fwd: u32,
-        placed_left: u32,
-        placed_start: u32,
-        mapq_sum: u32,
-        mapq_sum_sq: u64,
-    ) -> Self {
-        Self {
-            num_obs,
-            q_sum,
-            fwd,
-            placed_left,
-            placed_start,
-            mapq_sum,
-            mapq_sum_sq,
-        }
     }
 }
 

@@ -24,13 +24,11 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::io;
 
-use pop_var_caller::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, PileupRecord,
-};
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
+use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use std::collections::BTreeMap;
 
 const NUM_RECORDS: usize = 1_000_000;

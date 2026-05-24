@@ -15,14 +15,16 @@ use std::iter::Peekable;
 
 use ahash::AHashMap;
 
+use crate::pileup_record::{ChainId, PileupRecord};
+
 use super::active_read_set::ActiveReads;
-use super::chain_id_allocator::{ChainId, ChainIdAllocator, ChainIdAllocatorCounters};
+use super::chain_id_allocator::{ChainIdAllocator, ChainIdAllocatorCounters};
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
 };
-use super::{MultiChromRefFetcher, PileupRecord, PreparedRead, ReadLengthError, WalkerConfig};
+use super::{MultiChromRefFetcher, PreparedRead, ReadLengthError, WalkerConfig};
 
 /// Construct a [`PileupWalker`] over a coordinate-sorted stream of
 /// prepared reads. The walker is an `Iterator<Item = Result<PileupRecord,

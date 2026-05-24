@@ -41,7 +41,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::per_sample_pileup::pileup::PileupRecord;
+use crate::pileup_record::PileupRecord;
 use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 
 // ---------------------------------------------------------------------
@@ -1454,7 +1454,7 @@ pub const MAX_BASE_ERROR: f64 = 0.5;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
     use proptest::prelude::*;
 
     // ----- Fixture builders ----------------------------------------

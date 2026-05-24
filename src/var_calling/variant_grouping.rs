@@ -376,7 +376,7 @@ fn max_ref_span(pp: &PerPositionPileups) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 
     type Item = Result<PerPositionPileups, PerPositionMergerError>;
     type TestIter = std::vec::IntoIter<Item>;

@@ -27,13 +27,10 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 
+use crate::pileup_record::ChainId;
+
 use super::PreparedRead;
 use super::errors::WalkerError;
-
-/// Phase-chain identifier. `u64` gives ~1.8 × 10¹⁹ values per file —
-/// well beyond any realistic read count. Overflow is still caught
-/// (see [`ChainIdAllocator::allocate_for_read`]).
-pub type ChainId = u64;
 
 /// Default value for [`WalkerConfig::max_active_reads`]: hard cap on
 /// the number of concurrently-active reads. Bounds *concurrent active

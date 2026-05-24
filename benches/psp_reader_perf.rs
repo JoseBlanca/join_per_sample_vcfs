@@ -46,13 +46,11 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
-use pop_var_caller::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, PileupRecord,
-};
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::{PspReader, writer::PspWriter};
+use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use std::collections::BTreeMap;
 
 const NUM_RECORDS_SNP: usize = 3_300_000;

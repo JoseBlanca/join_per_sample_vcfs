@@ -119,7 +119,10 @@ pub fn paired_snp_reads(
 }
 
 /// Drive `run` on a fixed input list, collecting emitted records.
-pub fn drive_walker(reads: Vec<PreparedRead>, ref_fetcher: MockFasta) -> Vec<super::PileupRecord> {
+pub fn drive_walker(
+    reads: Vec<PreparedRead>,
+    ref_fetcher: MockFasta,
+) -> Vec<crate::pileup_record::PileupRecord> {
     drive_walker_with_summary(reads, ref_fetcher).0
 }
 
@@ -128,7 +131,10 @@ pub fn drive_walker(reads: Vec<PreparedRead>, ref_fetcher: MockFasta) -> Vec<sup
 pub fn drive_walker_with_summary(
     reads: Vec<PreparedRead>,
     ref_fetcher: MockFasta,
-) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
+) -> (
+    Vec<crate::pileup_record::PileupRecord>,
+    super::walker::RunSummary,
+) {
     drive_walker_with_config(reads, ref_fetcher, &WalkerConfig::default())
 }
 
@@ -139,9 +145,12 @@ pub fn drive_walker_with_config(
     reads: Vec<PreparedRead>,
     ref_fetcher: MockFasta,
     config: &WalkerConfig,
-) -> (Vec<super::PileupRecord>, super::walker::RunSummary) {
+) -> (
+    Vec<crate::pileup_record::PileupRecord>,
+    super::walker::RunSummary,
+) {
     let mut walker = run(reads, &ref_fetcher, config);
-    let records: Vec<super::PileupRecord> = (&mut walker)
+    let records: Vec<crate::pileup_record::PileupRecord> = (&mut walker)
         .map(|r| r.expect("walker yielded error"))
         .collect();
     let summary = walker.summary();

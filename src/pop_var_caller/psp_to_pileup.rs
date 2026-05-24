@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use clap::Args;
 use thiserror::Error;
 
-use crate::per_sample_pileup::pileup::{AlleleObservation, PileupRecord};
 use crate::per_sample_pileup::psp::{PspReadError, PspReader, RecordsIter};
+use crate::pileup_record::{AlleleObservation, PileupRecord};
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 
 // ---------------------------------------------------------------------
@@ -448,7 +448,7 @@ fn emit_allele_detail(out: &mut String, allele: &AlleleObservation, show_chains:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 
     fn supp(num_obs: u32, fwd: u32) -> AlleleSupportStats {
         AlleleSupportStats::new(num_obs, -1.234, fwd, 0, 0, 0, 0)

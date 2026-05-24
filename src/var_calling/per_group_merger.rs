@@ -42,10 +42,10 @@ use thiserror::Error;
 /// the dominant Stage 5 allocator cost per the perf review.
 type SourceList = SmallVec<[(usize, usize); 1]>;
 
-use crate::per_sample_pileup::pileup::{AlleleSupportStats, ChainId};
 #[cfg(test)]
 use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
 use crate::per_sample_pileup::ref_fetcher::ChromRefFetcher;
+use crate::pileup_record::{AlleleSupportStats, ChainId};
 use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
 /// Maximum number of alleles retained in a single merged record
@@ -1978,7 +1978,7 @@ fn ln_factorial(n: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::pileup::{AlleleObservation, AlleleSupportStats, PileupRecord};
+    use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
     use crate::var_calling::per_position_merger::PerPositionPileups;
 
     // ---------- mock ref fetcher ----------

@@ -53,12 +53,12 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use pop_var_caller::per_sample_pileup::pileup::PileupRecord;
 use pop_var_caller::per_sample_pileup::psp::PspReader;
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
+use pop_var_caller::pileup_record::PileupRecord;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{
     DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,

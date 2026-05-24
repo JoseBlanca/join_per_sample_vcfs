@@ -59,7 +59,7 @@ use thiserror::Error;
 
 use self::backends::{InterpUnivariateSimdMath, MathBackend};
 use self::shape::{GenotypeShape, shape_for};
-use crate::per_sample_pileup::pileup::AlleleSupportStats;
+use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::contamination_estimation::{
     AlleleClass as ContamAlleleClass, ContaminationEstimates, MAX_BASE_ERROR, MIN_BASE_ERROR,
 };

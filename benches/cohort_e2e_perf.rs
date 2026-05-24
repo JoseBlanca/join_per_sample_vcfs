@@ -78,15 +78,13 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use md5::{Digest, Md5};
 use tempfile::TempDir;
 
-use pop_var_caller::per_sample_pileup::pileup::{
-    AlleleObservation, AlleleSupportStats, PileupRecord,
-};
 use pop_var_caller::per_sample_pileup::psp::PspReadError;
 use pop_var_caller::per_sample_pileup::psp::header::{
     ChromosomeEntry, ParsedChromosome, WriterHeader, WriterProvenance,
 };
 use pop_var_caller::per_sample_pileup::psp::writer::PspWriter;
 use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
+use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{
     CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,

@@ -267,7 +267,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::per_sample_pileup::pileup::AlleleSupportStats;
+    use crate::pileup_record::AlleleSupportStats;
     use crate::var_calling::per_group_merger::MergedAllele;
     use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 
