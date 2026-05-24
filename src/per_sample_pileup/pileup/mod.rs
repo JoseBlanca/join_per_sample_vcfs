@@ -4,12 +4,13 @@
 //!
 //! See `doc/devel/specs/pileup_walker.md` for the implementation-ready
 //! specification. This module ships the walker (`PreparedRead`,
-//! `MultiChromRefFetcher`, `WalkerError`, `WalkerConfig`, and the
-//! public entry point `run`); the per-position record types it emits
-//! (`PileupRecord`, `AlleleObservation`, `AlleleSupportStats`,
-//! `ChainId`) live in [`crate::pileup_record`] because they are the
-//! pipeline-wide data interchange, not walker internals. Internal
-//! building blocks live in private submodules.
+//! `WalkerError`, `WalkerConfig`, and the public entry point `run`).
+//! The per-position record types it emits (`PileupRecord`,
+//! `AlleleObservation`, `AlleleSupportStats`, `ChainId`) live in
+//! [`crate::pileup_record`]; the reference-FASTA fetcher trait
+//! (`MultiChromRefFetcher`) and its implementations live in
+//! [`crate::fasta`] — both are pipeline-wide concerns, not walker
+//! internals. Internal building blocks live in private submodules.
 
 mod active_read_set;
 mod chain_id_allocator;
@@ -25,7 +26,6 @@ pub(crate) mod tests;
 use std::sync::Arc;
 
 pub use crate::per_sample_pileup::cram_input::CigarOp;
-pub use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
 pub use chain_id_allocator::DEFAULT_MAX_ACTIVE_READS;
 pub use errors::WalkerError;
 pub use walker::{PileupWalker, RunSummary, run};
@@ -337,87 +337,5 @@ impl PreparedRead {
             });
         }
         Ok(cigar_consumed)
-    }
-}
-
-// ---------------------------------------------------------------------
-// MultiChromRefFetcher
-// ---------------------------------------------------------------------
-
-/// Multi-chromosome reference-FASTA fetcher used by the Stage 1
-/// pileup walker. Errors are typed (`ChromRefFetchError`) so
-/// callers can route I/O failures, range failures, and contract
-/// violations distinctly. Single-chromosome consumers (DUST, BAQ,
-/// PerGroupMerger) should use [`ChromRefFetcher`] instead — it
-/// drops the `chrom_id` parameter and exposes a sliding-buffer
-/// contract specifically for monotonic-forward access.
-///
-/// [`ChromRefFetcher`]: crate::per_sample_pileup::ref_fetcher::ChromRefFetcher
-pub trait MultiChromRefFetcher {
-    /// Fetch `length` reference bases starting at the 1-based
-    /// position `start` on chromosome `chrom_id`. Bytes are
-    /// uppercase ASCII over `{A,C,G,T,N}` (canonicalised by the
-    /// fetcher implementation).
-    ///
-    /// # Errors
-    ///
-    /// - [`ChromRefFetchError::OutOfBounds`] if the requested
-    ///   window exceeds the chromosome length.
-    /// - [`ChromRefFetchError::InvalidStart`] if `start_1based == 0`.
-    /// - [`ChromRefFetchError::Io`] on any underlying FASTA I/O
-    ///   failure or unknown `chrom_id`.
-    fn fetch(
-        &self,
-        chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, ChromRefFetchError>;
-
-    /// Forward sequential iterator over every uppercased base of
-    /// `chrom_id`'s contig, in 1..=`length` order. Used by the DUST
-    /// mask construction (one pass per chrom) to avoid materialising
-    /// the whole contig as a single `Vec<u8>`.
-    ///
-    /// Default impl materialises via `fetch(chrom_id, 1, length)`;
-    /// streaming fetchers override to walk a sliding buffer instead.
-    /// The boxed iterator costs one heap allocation per chrom plus
-    /// one virtual dispatch per byte — the latter is dominated by
-    /// the inner sdust scoring work in practice.
-    ///
-    /// # Errors
-    ///
-    /// Same failure modes as [`Self::fetch`] (the default impl
-    /// just calls `fetch(chrom_id, 1, length)`).
-    fn iter_bases<'a>(
-        &'a self,
-        chrom_id: u32,
-        length: u32,
-    ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
-    {
-        let seq = self.fetch(chrom_id, 1, length)?;
-        Ok(Box::new(seq.into_iter().map(Ok)))
-    }
-}
-
-/// Forwarding impl so callers may pass either an owned fetcher or a
-/// shared reference into [`PileupWalker::new`] / [`run`]. The walker
-/// only ever calls `&self` methods, so the borrow is sufficient.
-impl<T: MultiChromRefFetcher + ?Sized> MultiChromRefFetcher for &T {
-    fn fetch(
-        &self,
-        chrom_id: u32,
-        start_1based: u32,
-        length: u32,
-    ) -> Result<Vec<u8>, ChromRefFetchError> {
-        (**self).fetch(chrom_id, start_1based, length)
-    }
-
-    fn iter_bases<'a>(
-        &'a self,
-        chrom_id: u32,
-        length: u32,
-    ) -> Result<Box<dyn Iterator<Item = Result<u8, ChromRefFetchError>> + 'a>, ChromRefFetchError>
-    {
-        (**self).iter_bases(chrom_id, length)
     }
 }

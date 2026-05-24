@@ -23,8 +23,9 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::io;
 use std::sync::Arc;
 
+use pop_var_caller::fasta::{ChromRefFetchError, MultiChromRefFetcher};
 use pop_var_caller::per_sample_pileup::pileup::{
-    ChromRefFetchError, CigarOp, MateRole, MultiChromRefFetcher, PreparedRead, WalkerConfig, run,
+    CigarOp, MateRole, PreparedRead, WalkerConfig, run,
 };
 
 struct ConstFasta {

@@ -12,7 +12,9 @@
 //! (`baq_engine`, `baq_stream`) live as siblings here; the BAQ
 //! algorithm core lives at [`crate::baq`]. The per-position record
 //! data model lives at [`crate::pileup_record`]; the on-disk `.psp`
-//! format (reader, writer, codecs) lives at [`crate::psp`].
+//! format (reader, writer, codecs) lives at [`crate::psp`]; the
+//! reference-FASTA fetchers and the `ContigList` data type live at
+//! [`crate::fasta`].
 
 pub mod baq_engine;
 pub mod baq_stream;
@@ -20,7 +22,6 @@ pub mod cram_input;
 pub mod errors;
 pub mod pileup;
 pub mod pileup_to_psp;
-pub mod ref_fetcher;
 
 #[cfg(test)]
 mod baq_tests;

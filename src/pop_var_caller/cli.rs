@@ -15,8 +15,9 @@ use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
 use crate::baq::BaqConfig;
+use crate::fasta::ContigList;
 use crate::per_sample_pileup::baq_stream::BaqSkipCounts;
-use crate::per_sample_pileup::cram_input::{ContigList, CramMergedReaderConfig, FilterCounts};
+use crate::per_sample_pileup::cram_input::{CramMergedReaderConfig, FilterCounts};
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::{RunSummary, WalkerConfig};
 use crate::per_sample_pileup::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
@@ -570,7 +571,7 @@ mod tests {
 
     #[test]
     fn build_writer_header_errors_on_missing_md5() {
-        use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
+        use crate::fasta::{ContigEntry, ContigList};
         let contigs = ContigList {
             entries: vec![ContigEntry {
                 name: "chr1".into(),
@@ -586,7 +587,7 @@ mod tests {
 
     #[test]
     fn build_writer_header_strips_paths_to_basenames() {
-        use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
+        use crate::fasta::{ContigEntry, ContigList};
         let md5 = [0u8; 16];
         let contigs = ContigList {
             entries: vec![ContigEntry {

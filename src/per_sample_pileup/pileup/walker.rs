@@ -24,7 +24,8 @@ use super::errors::WalkerError;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
 };
-use super::{MultiChromRefFetcher, PreparedRead, ReadLengthError, WalkerConfig};
+use super::{PreparedRead, ReadLengthError, WalkerConfig};
+use crate::fasta::MultiChromRefFetcher;
 
 /// Construct a [`PileupWalker`] over a coordinate-sorted stream of
 /// prepared reads. The walker is an `Iterator<Item = Result<PileupRecord,

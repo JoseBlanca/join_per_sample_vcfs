@@ -63,7 +63,7 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::per_sample_pileup::ref_fetcher::{ChromRefFetchError, ChromRefFetcher};
+use crate::fasta::{ChromRefFetchError, ChromRefFetcher};
 use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 
 /// Default sdust window size (`W`). Matches the `lh3/sdust` and
@@ -1147,7 +1147,7 @@ mod tests {
         }
     }
 
-    impl crate::per_sample_pileup::ref_fetcher::sealed::Sealed for StubChromRefFetcher {}
+    impl crate::fasta::fetcher::sealed::Sealed for StubChromRefFetcher {}
     impl ChromRefFetcher for StubChromRefFetcher {
         fn length(&self) -> u32 {
             self.seq.len() as u32

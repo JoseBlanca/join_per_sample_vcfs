@@ -20,9 +20,9 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use pop_var_caller::baq::BaqConfig;
+use pop_var_caller::fasta::ManualEvictChromRefFetcher;
 use pop_var_caller::per_sample_pileup::baq_engine::{BaqEngine, BaqOutcome};
 use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, MappedRead};
-use pop_var_caller::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 /// Build a tempfile FASTA with `length` 'A' bases and return a
 /// [`ManualEvictChromRefFetcher`] over it. The BAQ engine now takes

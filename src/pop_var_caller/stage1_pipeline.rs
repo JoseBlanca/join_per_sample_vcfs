@@ -18,14 +18,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::baq::BaqConfig;
+use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
 use crate::per_sample_pileup::baq_engine::prepare_passthrough;
 use crate::per_sample_pileup::baq_stream::{BaqSkipCounts, BaqStream};
 use crate::per_sample_pileup::cram_input::{
-    ContigList, CramMergedReader, CramMergedReaderConfig, FilterCounts,
+    CramMergedReader, CramMergedReaderConfig, FilterCounts,
 };
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::{self, PileupWalker, PreparedRead, WalkerConfig};
-use crate::per_sample_pileup::ref_fetcher::MultiChromStreamingRefFetcher;
 
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;

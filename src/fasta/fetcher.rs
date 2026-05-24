@@ -30,8 +30,7 @@ use std::sync::Mutex;
 
 use noodles_fasta::fai;
 
-use super::cram_input::ContigList;
-use super::pileup::MultiChromRefFetcher;
+use super::{ContigList, MultiChromRefFetcher};
 
 /// Sliding-buffer size used by [`StreamingChromRefFetcher`]. 100× the
 /// `--var-group-max-span` default (10 KB), so under the
@@ -1289,8 +1288,8 @@ fn read_uppercased_bases(reader: &mut File, dst: &mut Vec<u8>, n_bases: usize) -
 mod tests {
     use super::*;
 
+    use crate::fasta::{ContigEntry, ContigList};
     use crate::per_sample_pileup::cram_files::{ContigSpec, build_fasta};
-    use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
 
     fn contig_list(entries: &[(&str, u64)]) -> ContigList {
         ContigList {

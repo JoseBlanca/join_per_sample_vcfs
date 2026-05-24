@@ -28,9 +28,8 @@ use clap::Args;
 use tempfile::TempDir;
 use thiserror::Error;
 
-use crate::per_sample_pileup::cram_input::ContigList;
+use crate::fasta::{ContigList, StreamingChromRefFetcher};
 use crate::per_sample_pileup::pileup::WalkerError;
-use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
 use crate::pileup_record::PileupRecord;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
@@ -674,7 +673,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::cram_input::ContigEntry;
+    use crate::fasta::ContigEntry;
 
     #[test]
     fn contigs_to_parsed_strips_md5_hex() {

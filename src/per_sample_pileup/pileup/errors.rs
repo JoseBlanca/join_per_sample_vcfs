@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
+use crate::fasta::ChromRefFetchError;
 
 #[derive(Error, Debug)]
 #[non_exhaustive]

@@ -43,8 +43,8 @@ use thiserror::Error;
 type SourceList = SmallVec<[(usize, usize); 1]>;
 
 #[cfg(test)]
-use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
-use crate::per_sample_pileup::ref_fetcher::ChromRefFetcher;
+use crate::fasta::ChromRefFetchError;
+use crate::fasta::ChromRefFetcher;
 use crate::pileup_record::{AlleleSupportStats, ChainId};
 use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
@@ -1990,7 +1990,7 @@ mod tests {
         base_offset: u32,
     }
 
-    impl crate::per_sample_pileup::ref_fetcher::sealed::Sealed for MockRef {}
+    impl crate::fasta::fetcher::sealed::Sealed for MockRef {}
     impl ChromRefFetcher for MockRef {
         fn length(&self) -> u32 {
             self.base_offset.saturating_sub(1) + self.seq.len() as u32
@@ -2869,7 +2869,7 @@ mod tests {
     #[test]
     fn process_group_returns_error_on_short_fetcher_return() {
         struct ShortRef;
-        impl crate::per_sample_pileup::ref_fetcher::sealed::Sealed for ShortRef {}
+        impl crate::fasta::fetcher::sealed::Sealed for ShortRef {}
         impl ChromRefFetcher for ShortRef {
             fn length(&self) -> u32 {
                 u32::MAX

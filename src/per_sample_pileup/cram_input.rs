@@ -12,6 +12,7 @@ use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
+use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
 use crate::per_sample_pileup::errors::CramInputError;
 
@@ -112,78 +113,6 @@ pub struct MappedRead {
     /// `G1` in `ia/reviews/pileup_gatk_comparison_2026-05-08.md`.
     pub adaptor_boundary: Option<u32>,
     pub source_file_index: usize,
-}
-
-// ---------------------------------------------------------------------
-// ContigList
-// ---------------------------------------------------------------------
-
-/// One reference sequence (`@SQ`) entry: name, length, and optional MD5.
-#[derive(Debug, Clone)]
-pub struct ContigEntry {
-    pub name: String,
-    pub length: u64,
-    pub md5: Option<[u8; 16]>,
-}
-
-impl PartialEq for ContigEntry {
-    fn eq(&self, other: &Self) -> bool {
-        if self.name != other.name || self.length != other.length {
-            return false;
-        }
-        match (self.md5, other.md5) {
-            (Some(a), Some(b)) => a == b,
-            // Absent MD5 acts as a wildcard: a CRAM that omits M5 is
-            // not contradicting a CRAM that carries one.
-            (None, _) | (_, None) => true,
-        }
-    }
-}
-
-impl Eq for ContigEntry {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ContigList {
-    pub entries: Vec<ContigEntry>,
-}
-
-impl ContigList {
-    /// First-difference report between two lists, intended for error
-    /// messages. Returns `Ok(())` when the lists agree; otherwise an
-    /// `Err` carrying a short string identifying which field
-    /// disagreed and where.
-    fn first_disagreement(&self, other: &Self) -> Result<(), String> {
-        if self.entries.len() != other.entries.len() {
-            return Err(format!(
-                "@SQ list length differs ({} vs {})",
-                self.entries.len(),
-                other.entries.len()
-            ));
-        }
-        for (i, (a, b)) in self.entries.iter().zip(other.entries.iter()).enumerate() {
-            if a.name != b.name {
-                return Err(format!(
-                    "name disagreement at index {} ('{}' vs '{}')",
-                    i, a.name, b.name
-                ));
-            }
-            if a.length != b.length {
-                return Err(format!(
-                    "length disagreement at index {} (contig '{}': {} vs {})",
-                    i, a.name, a.length, b.length
-                ));
-            }
-            if let (Some(ma), Some(mb)) = (a.md5, b.md5)
-                && ma != mb
-            {
-                return Err(format!(
-                    "md5 disagreement at index {} (contig '{}')",
-                    i, a.name
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------

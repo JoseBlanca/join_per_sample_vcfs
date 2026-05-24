@@ -204,11 +204,11 @@ fn parity_realn02() {
 // BaqEngine driver tests — synthetic MappedReads, no SAM parsing.
 // ---------------------------------------------------------------------
 
+use crate::fasta::ManualEvictChromRefFetcher;
 use crate::per_sample_pileup::cram_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
 use crate::per_sample_pileup::pileup::MateRole;
-use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 use super::baq_engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 
@@ -258,9 +258,9 @@ fn stream_components_from_chrom_bytes(
 ) -> (
     tempfile::TempDir,
     std::path::PathBuf,
-    crate::per_sample_pileup::cram_input::ContigList,
+    crate::fasta::ContigList,
 ) {
-    use crate::per_sample_pileup::cram_input::{ContigEntry, ContigList};
+    use crate::fasta::{ContigEntry, ContigList};
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("tempdir");
     let fasta_path = dir.path().join("ref.fa");
@@ -971,7 +971,7 @@ fn stream_is_fused_after_exhaustion() {
 fn stream_rejects_zero_chunk_size() {
     // M13: zero chunk_size is a programmer error, not a value to be
     // silently coerced.
-    use crate::per_sample_pileup::cram_input::ContigList;
+    use crate::fasta::ContigList;
     let _ = BaqStream::new(
         std::iter::empty::<Result<MappedRead, CramInputError>>(),
         BaqConfig::default(),

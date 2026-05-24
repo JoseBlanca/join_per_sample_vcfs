@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod baq;
+pub mod fasta;
 pub mod iter_ext;
 pub mod per_sample_pileup;
 pub mod pileup_record;

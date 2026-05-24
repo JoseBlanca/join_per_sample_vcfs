@@ -16,7 +16,8 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use super::pileup::{MultiChromRefFetcher, PileupWalker, PreparedRead, RunSummary, WalkerError};
+use super::pileup::{PileupWalker, PreparedRead, RunSummary, WalkerError};
+use crate::fasta::MultiChromRefFetcher;
 use crate::psp::PspWriteError;
 use crate::psp::writer::PspWriter;
 

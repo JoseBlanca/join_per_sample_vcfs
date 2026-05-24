@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
-use crate::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
+use crate::fasta::StreamingChromRefFetcher;
 use crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};

@@ -13,12 +13,13 @@ use std::collections::BTreeMap;
 
 use ahash::AHashMap;
 
+use crate::fasta::MultiChromRefFetcher;
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 
+use super::DEFAULT_MAX_RECORD_SPAN;
 use super::active_read_set::ActiveReads;
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
-use super::{DEFAULT_MAX_RECORD_SPAN, MultiChromRefFetcher};
 
 /// Pre-allocated capacity for `OpenPileupRecord::folded_reads` —
 /// sized for typical WGS coverage so the per-record fold doesn't

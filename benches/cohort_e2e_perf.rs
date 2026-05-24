@@ -78,7 +78,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use md5::{Digest, Md5};
 use tempfile::TempDir;
 
-use pop_var_caller::per_sample_pileup::ref_fetcher::StreamingChromRefFetcher;
+use pop_var_caller::fasta::StreamingChromRefFetcher;
 use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
 use pop_var_caller::pop_var_caller::cohort_driver::{

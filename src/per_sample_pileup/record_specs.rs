@@ -19,7 +19,8 @@ use noodles_sam::alignment::record_buf::QualityScores;
 use noodles_sam::alignment::record_buf::RecordBuf;
 use noodles_sam::alignment::record_buf::Sequence;
 
-use super::cram_input::{CigarOp, ContigEntry, ContigList, OpenCram};
+use super::cram_input::{CigarOp, OpenCram};
+use crate::fasta::{ContigEntry, ContigList};
 
 /// Spec for a synthetic record built by `record_spec`. Every test
 /// composes its records by mutating fields on a base — keeping the

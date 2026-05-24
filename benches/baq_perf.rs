@@ -24,11 +24,11 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use tempfile::TempDir;
 
 use pop_var_caller::baq::BaqConfig;
+use pop_var_caller::fasta::{ContigEntry, ContigList, ManualEvictChromRefFetcher};
 use pop_var_caller::per_sample_pileup::baq_engine::{BaqEngine, BaqOutcome};
 use pop_var_caller::per_sample_pileup::baq_stream::{BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
-use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, ContigEntry, ContigList, MappedRead};
+use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, MappedRead};
 use pop_var_caller::per_sample_pileup::errors::CramInputError;
-use pop_var_caller::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 /// Write a single-contig FASTA + `.fai` to `dir`. Contig is `length`
 /// bases of `b'A'` (every read in the bench is Match-only over A's, so

@@ -9,11 +9,10 @@ use std::sync::Arc;
 
 use super::CigarOp;
 use super::MateRole;
-use super::MultiChromRefFetcher;
 use super::PreparedRead;
 use super::WalkerConfig;
 use super::run;
-use crate::per_sample_pileup::ref_fetcher::ChromRefFetchError;
+use crate::fasta::{ChromRefFetchError, MultiChromRefFetcher};
 
 // ---------------------------------------------------------------------
 // MockFasta

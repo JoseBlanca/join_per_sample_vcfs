@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use crate::per_sample_pileup::cram_input::{ContigList, MappedRead};
+use crate::fasta::ContigList;
+use crate::fasta::ManualEvictChromRefFetcher;
+use crate::per_sample_pileup::cram_input::MappedRead;
 use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::PreparedRead;
-use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
 use super::baq_engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 use crate::baq::BaqConfig;
