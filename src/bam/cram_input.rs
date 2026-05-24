@@ -257,6 +257,23 @@ struct OwnedCramRecords {
     repository: fasta::Repository,
     container: cram::io::reader::Container,
     pending: std::vec::IntoIter<sam::alignment::RecordBuf>,
+    /// `true` once `read_container` returns 0 (clean EOF). Subsequent
+    /// `next()` calls return `None` without re-entering noodles —
+    /// `noodles_cram 0.93`'s `Reader::read_container` is **not**
+    /// idempotent at EOF: the second call returns
+    /// `Err(InvalidData, TryFromIntError)`, the third returns
+    /// `Err(UnexpectedEof, "failed to fill whole buffer")`. Without
+    /// the latch, any consumer that polls past the iterator's first
+    /// `None` (notably the k-way merge's `BufferedPeekable`, which
+    /// peeks every per-input stream on each merge step) re-enters
+    /// noodles past EOF and surfaces a spurious `MalformedRecord`
+    /// error after every real record has already been emitted.
+    /// Single-CRAM consumers never trip this because the outer
+    /// iterator stops at the first `None` from the only inner
+    /// iterator. Two-or-more-CRAM merges trip it on the trailing
+    /// post-last-record poll the merge does to confirm the second
+    /// stream is exhausted. Repro: `d1_repro_two_crams_…`.
+    eof_latched: bool,
 }
 
 impl OwnedCramRecords {
@@ -296,8 +313,14 @@ impl Iterator for OwnedCramRecords {
             if let Some(rb) = self.pending.next() {
                 return Some(Ok(rb));
             }
+            if self.eof_latched {
+                return None;
+            }
             match self.refill() {
-                Ok(true) => return None,
+                Ok(true) => {
+                    self.eof_latched = true;
+                    return None;
+                }
                 Ok(false) => continue,
                 Err(e) => return Some(Err(e)),
             }
@@ -349,6 +372,16 @@ struct OwnedIndexedCramRecords {
     /// struct free of self-referential borrows.
     next_index_record: usize,
     pending: std::vec::IntoIter<sam::alignment::RecordBuf>,
+    /// Same EOF-latch as [`OwnedCramRecords`] — once exhausted,
+    /// short-circuit subsequent `next()` calls without re-entering
+    /// noodles. The index-cursor exhaustion path is idempotent by
+    /// construction (re-reading past `index.len()` simply returns
+    /// `Ok(true)` again), but the read_container call on the LAST
+    /// matching container is not — and the merger's
+    /// `BufferedPeekable` will poll past `None` to confirm
+    /// exhaustion. Cheap defensive latch; same shape as the one
+    /// `OwnedCramRecords` carries.
+    eof_latched: bool,
 }
 
 impl OwnedIndexedCramRecords {
@@ -414,8 +447,14 @@ impl Iterator for OwnedIndexedCramRecords {
             if let Some(rb) = self.pending.next() {
                 return Some(Ok(rb));
             }
+            if self.eof_latched {
+                return None;
+            }
             match self.refill() {
-                Ok(true) => return None,
+                Ok(true) => {
+                    self.eof_latched = true;
+                    return None;
+                }
                 Ok(false) => continue,
                 Err(e) => return Some(Err(e)),
             }
@@ -820,6 +859,7 @@ impl CramMergedReader {
                 repository: repository.clone(),
                 container: cram::io::reader::Container::default(),
                 pending: Vec::new().into_iter(),
+                eof_latched: false,
             });
             open_crams.push(OpenCram {
                 path: cram_path.clone(),
@@ -1032,6 +1072,7 @@ impl CramMergedReader {
                 target_reference_sequence_id,
                 next_index_record: 0,
                 pending: Vec::new().into_iter(),
+                eof_latched: false,
             });
             open_crams.push(OpenCram {
                 path: cram_path.clone(),
@@ -4548,5 +4589,290 @@ mod tests {
                 indexes: 1,
             }
         ));
+    }
+
+    // --- Group D: 2-CRAM-with-records diagnostics ---------------------
+    //
+    // Investigation surface for the streaming `CramMergedReader::new`
+    // failure on two CRAMs of the same sample with records on both,
+    // surfaced during commit 2 of the var-calling-from-bam per-chrom
+    // parallelism plan (see
+    // doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md
+    // §"Open follow-ups" #4). Tests prefixed `d_` are diagnostic
+    // probes; tests prefixed `d_regression_` will be locked in once
+    // a fix or workaround ships.
+
+    /// Helper: build two CRAMs with `records_a` and `records_b` for
+    /// the same sample on chr1.
+    fn build_two_crams_for_diagnostics(
+        records_a: &[RecordBufForB],
+        records_b: &[RecordBufForB],
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+    ) {
+        let contigs = one_contig_chr1();
+        let (fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let header_overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let (a_dir, cram_a) =
+            build_cram(&fasta_path, &contigs, &header_overrides, records_a).expect("build cram_a");
+        let (b_dir, cram_b) =
+            build_cram(&fasta_path, &contigs, &header_overrides, records_b).expect("build cram_b");
+        (fasta_dir, fasta_path, a_dir, b_dir, cram_a, cram_b)
+    }
+
+    /// Regression for the 2-CRAM-with-records bug: two CRAMs, same
+    /// sample, single contig, two records each at interleaving
+    /// coordinates. Iteration must yield exactly four
+    /// `MappedRead`s in coordinate order — no spurious trailing
+    /// error from noodles' non-idempotent `read_container` at EOF.
+    /// Fixed by the `eof_latched` field on [`OwnedCramRecords`].
+    #[test]
+    fn d1_two_crams_with_records_emits_all_records_in_coord_order() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+
+        let header_overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let (_a_dir, cram_a) = build_cram(
+            &fasta_path,
+            &contigs,
+            &header_overrides,
+            &[
+                pass_record_for_b("Ra1", 0, 100),
+                pass_record_for_b("Ra2", 0, 500),
+            ],
+        )
+        .expect("build cram_a");
+        let (_b_dir, cram_b) = build_cram(
+            &fasta_path,
+            &contigs,
+            &header_overrides,
+            &[
+                pass_record_for_b("Rb1", 0, 200),
+                pass_record_for_b("Rb2", 0, 600),
+            ],
+        )
+        .expect("build cram_b");
+
+        let positions: Vec<(Vec<u8>, u64)> = CramMergedReader::new(
+            &[cram_a, cram_b],
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        )
+        .expect("merged reader open")
+        .map(|r| {
+            let r = r.expect("ok record");
+            (r.qname.clone(), r.pos)
+        })
+        .collect();
+
+        assert_eq!(
+            positions,
+            vec![
+                (b"Ra1".to_vec(), 100),
+                (b"Rb1".to_vec(), 200),
+                (b"Ra2".to_vec(), 500),
+                (b"Rb2".to_vec(), 600),
+            ]
+        );
+    }
+
+    /// Probe: open each of the two CRAMs alone via
+    /// `CramMergedReader::new` (passing a single-element slice), drain
+    /// each to completion. Tests whether the issue is per-CRAM or
+    /// specific to the merge of two.
+    #[test]
+    fn d2_each_cram_alone_via_new_works() {
+        let (_fasta_dir, fasta_path, _a_dir, _b_dir, cram_a, cram_b) =
+            build_two_crams_for_diagnostics(
+                &[
+                    pass_record_for_b("Ra1", 0, 100),
+                    pass_record_for_b("Ra2", 0, 500),
+                ],
+                &[
+                    pass_record_for_b("Rb1", 0, 200),
+                    pass_record_for_b("Rb2", 0, 600),
+                ],
+            );
+
+        let pos_a: Vec<u64> = CramMergedReader::new(
+            std::slice::from_ref(&cram_a),
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        )
+        .expect("open a")
+        .map(|r| r.expect("ok a").pos)
+        .collect();
+        assert_eq!(pos_a, vec![100, 500], "cram_a alone");
+
+        let pos_b: Vec<u64> = CramMergedReader::new(
+            std::slice::from_ref(&cram_b),
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        )
+        .expect("open b")
+        .map(|r| r.expect("ok b").pos)
+        .collect();
+        assert_eq!(pos_b, vec![200, 600], "cram_b alone");
+    }
+
+    /// Probe: two CRAMs, but `cram_b` is empty (no records). Does the
+    /// merge still trip the bug?
+    #[test]
+    fn d3_two_crams_one_empty_works() {
+        let (_fasta_dir, fasta_path, _a_dir, _b_dir, cram_a, cram_b) =
+            build_two_crams_for_diagnostics(
+                &[
+                    pass_record_for_b("Ra1", 0, 100),
+                    pass_record_for_b("Ra2", 0, 500),
+                ],
+                &[],
+            );
+
+        let positions: Vec<u64> = CramMergedReader::new(
+            &[cram_a, cram_b],
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        )
+        .expect("open")
+        .map(|r| r.expect("ok").pos)
+        .collect();
+        assert_eq!(positions, vec![100, 500]);
+    }
+
+    /// Regression: the pre-fix bug emitted every real record
+    /// correctly and then yielded a trailing `Err(MalformedRecord)`
+    /// instead of `None`. This test collects all `Result`s without
+    /// unwrapping and asserts exactly four `Ok` records, zero
+    /// `Err` records — i.e. no trailing spurious error.
+    #[test]
+    fn d4_no_spurious_trailing_error_after_clean_eof() {
+        let (_fasta_dir, fasta_path, _a_dir, _b_dir, cram_a, cram_b) =
+            build_two_crams_for_diagnostics(
+                &[
+                    pass_record_for_b("Ra1", 0, 100),
+                    pass_record_for_b("Ra2", 0, 500),
+                ],
+                &[
+                    pass_record_for_b("Rb1", 0, 200),
+                    pass_record_for_b("Rb2", 0, 600),
+                ],
+            );
+
+        let results: Vec<Result<MappedRead, CramInputError>> = CramMergedReader::new(
+            &[cram_a, cram_b],
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        )
+        .expect("open")
+        .collect();
+
+        let (oks, errs): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        assert_eq!(
+            oks.len(),
+            4,
+            "expected 4 Ok records; got {} (errs: {:?})",
+            oks.len(),
+            errs
+        );
+        assert!(
+            errs.is_empty(),
+            "expected zero trailing Err records; got: {errs:?}"
+        );
+    }
+
+    /// Pins the upstream behaviour the `eof_latched` field on
+    /// [`OwnedCramRecords`] / [`OwnedIndexedCramRecords`] is
+    /// guarding against: `noodles_cram::io::Reader::read_container`
+    /// is **not** idempotent at EOF. After the first `Ok(0)` (clean
+    /// EOF), the next call returns an error (currently
+    /// `Err(InvalidData, TryFromIntError)` on noodles-cram 0.93;
+    /// the exact variant is upstream-internal and not guaranteed
+    /// stable). If a noodles upgrade ever fixes this — i.e. the
+    /// second call returns `Ok(0)` too — this test will fail
+    /// loudly and the latch becomes redundant. Keep the test;
+    /// remove the latch only when this test starts failing on the
+    /// `Ok(0)` branch.
+    #[test]
+    fn d6_documents_noodles_read_container_non_idempotency_at_eof() {
+        let (_fasta_dir, fasta_path, _a_dir, _b_dir, cram_a, _cram_b) =
+            build_two_crams_for_diagnostics(
+                &[
+                    pass_record_for_b("Ra1", 0, 100),
+                    pass_record_for_b("Ra2", 0, 500),
+                ],
+                &[],
+            );
+
+        let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(&fasta_path)
+            .expect("fasta reader");
+        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
+        let repository = fasta::Repository::new(adapter);
+
+        let mut reader = cram::io::reader::Builder::default()
+            .set_reference_sequence_repository(repository)
+            .build_from_path(&cram_a)
+            .expect("open cram_a");
+        reader.read_file_definition().expect("file def");
+        let _header = reader.read_file_header().expect("file header");
+
+        // Drain by reading containers until Ok(0).
+        let mut container = cram::io::reader::Container::default();
+        loop {
+            match reader.read_container(&mut container) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("unexpected error during initial drain: {e:?}"),
+            }
+        }
+
+        let second = reader.read_container(&mut container);
+        assert!(
+            second.is_err(),
+            "noodles-cram changed: second read_container after Ok(0) now \
+             returned {second:?} (was Err on 0.93). If this is Ok(0), the \
+             non-idempotency is fixed upstream and the `eof_latched` field \
+             on OwnedCramRecords / OwnedIndexedCramRecords can be removed."
+        );
+    }
+
+    /// Probe: two CRAMs with records on _different_ positions on chr1,
+    /// where one CRAM's records all come BEFORE the other's. The
+    /// merge therefore drains one reader fully before touching the
+    /// other. If interleaving is the trigger, this should work.
+    #[test]
+    fn d5_two_crams_non_interleaving_positions() {
+        let (_fasta_dir, fasta_path, _a_dir, _b_dir, cram_a, cram_b) =
+            build_two_crams_for_diagnostics(
+                &[
+                    pass_record_for_b("Ra1", 0, 100),
+                    pass_record_for_b("Ra2", 0, 200),
+                ],
+                &[
+                    pass_record_for_b("Rb1", 0, 500),
+                    pass_record_for_b("Rb2", 0, 600),
+                ],
+            );
+
+        let positions: Vec<u64> = CramMergedReader::new(
+            &[cram_a, cram_b],
+            &fasta_path,
+            CramMergedReaderConfig::default(),
+        )
+        .expect("open")
+        .map(|r| r.expect("ok").pos)
+        .collect();
+        assert_eq!(positions, vec![100, 200, 500, 600]);
     }
 }
