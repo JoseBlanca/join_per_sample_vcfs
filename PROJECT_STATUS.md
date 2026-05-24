@@ -19,7 +19,48 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **`var-calling-from-bam` per-chromosome
+> - **Last completed task:** **BAM input support** (commits
+>   `b87ec89` → `18a9b9e` → `266e79a` → `4ad1e04` → `630ac7c` →
+>   `a4d1f6d` → `bee6bc1` → `d0af049`) — impl report
+>   [bam_input_support_2026-05-24.md](doc/devel/reports/implementations/bam_input_support_2026-05-24.md);
+>   plan
+>   [bam_input_support.md](doc/devel/implementation_plans/bam_input_support.md).
+>   Stage 1's per-file decoder grows a BAM-side sibling: the merge,
+>   filter cascade, header validation, and per-chromosome parallel
+>   driver are unchanged. Renames the CRAM-named public surface to
+>   format-neutral (`CramMergedReader` →
+>   `AlignmentMergedReader`, `OpenCram` → `OpenAlignmentFile`,
+>   `CramInputError` → `AlignmentInputError`); splits the old
+>   `bam/cram_input.rs` (4878 lines) into `bam/alignment_input.rs`
+>   (merge + filter + header validation) + a reduced
+>   `bam/cram_input.rs` (CRAM decoder bits) + new
+>   `bam/bam_input.rs` (BAM decoder bits — `OwnedBamRecords` and
+>   `OwnedIndexedBamRecords` with the chunk-walking `'static + Send`
+>   shape `OwnedIndexedCramRecords` already uses). Per-extension
+>   dispatch in `AlignmentMergedReader::{new, query}` plus the
+>   classify pass in
+>   `index_preflight::preflight_alignment_indexes` together gate
+>   mixed CRAM+BAM inputs with `AlignmentInputError::Mixed...` /
+>   `AlignmentIndexError::Mixed...` errors that name both
+>   offending paths. BAM index policy is `.csi`-preferred /
+>   `.bai`-fallback on read (the `BamIndex` enum carries either
+>   variant), `.csi`-only on build (`--build-map-file-index`).
+>   CLI positional arg `crams: Vec<PathBuf>` →
+>   `alignment_files: Vec<PathBuf>` on both `pileup` and
+>   `var-calling-from-bam`; help text now reads "Coordinate-sorted
+>   CRAM or BAM file(s) for one sample." Cargo deps `noodles-bam =
+>   0.89.0` and `noodles-csi = 0.56.0` (both already pulled
+>   transitively by `noodles-cram = 0.93.0`) are now explicit.
+>   Validation: `cargo fmt --check` clean; `cargo clippy --lib
+>   --tests --all-features -D warnings` clean; `cargo test --lib`
+>   915/915 (904 baseline + 4 `bam_input` unit tests + 7
+>   index_preflight BAM-side tests); `cargo test --test '*'` 43/43
+>   (36 baseline + 2 pileup BAM siblings + 5 cohort BAM siblings).
+>   Wall-time validation on real multi-chrom BAMs is deferred —
+>   the same `examples/profile_from_bam_e2e.rs` /
+>   `benches/from_bam_e2e_perf.rs` infrastructure called out in
+>   the prior task's follow-ups would cover both formats.
+> - **Previous task:** **`var-calling-from-bam` per-chromosome
 >   parallelism** (commits `29b28e8` → `e5261ba` → `050da41` →
 >   `a858832`) — impl report
 >   [var_calling_from_bam_per_chromosome_2026-05-24.md](doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md);
@@ -27,7 +68,7 @@ Skills and agents are instructed to leave it untouched.
 >   [var_calling_from_bam_per_chromosome.md](doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md).
 >   The direct CRAM → VCF subcommand now dispatches one rayon worker
 >   per contig: each worker opens its own `cram::io::Reader<File>`
->   via the new `CramMergedReader::query` indexed variant
+>   via the new `AlignmentMergedReader::query` indexed variant
 >   (`OwnedIndexedCramRecords` mirror of `OwnedCramRecords` driven
 >   by the `.crai`), runs Stage 1 (BAQ → walker) + Stages 3–6 (DUST
 >   → grouper → per-group merger → posterior → VCF fragment) on its
@@ -56,7 +97,7 @@ Skills and agents are instructed to leave it untouched.
 >   `benches/from_bam_e2e_perf.rs` infrastructure (commit 5 of the
 >   plan) was scoped out in favour of the impl report; tracked as
 >   the headline follow-up.
-> - **Previous task:** **Code review of the FASTA fetcher
+> - **Previous task — code review:** **Code review of the FASTA fetcher
 >   module** (`src/per_sample_pileup/ref_fetcher.rs`) —
 >   [ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/ref_fetcher_2026-05-23.md).
 >   Status: **Request-changes** — 3 Blockers, 23 Major, 19 Minor,
@@ -266,12 +307,21 @@ Stage descriptions are one-line reminders; the spec is authoritative.
 
 Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
-#### CRAM input
-- **Status:** shipped
-- **Plan:** [per_sample_caller_cram_input.md](doc/devel/implementation_plans/per_sample_caller_cram_input.md)
-- **Impl report:** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/implementations/per_sample_caller_cram_input_2026-04-29.md)
-- **Latest review / fixes:** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/reviews/per_sample_caller_cram_input_2026-04-29.md), [fixes_applied_2026-05-01.md](doc/devel/reports/implementations/fixes_applied_2026-05-01.md)
-- **Open:** none
+#### Alignment-file input (CRAM + BAM)
+- **Status:** implemented (BAM); shipped (CRAM)
+- **Plans:**
+  - CRAM slice: [per_sample_caller_cram_input.md](doc/devel/implementation_plans/per_sample_caller_cram_input.md)
+  - BAM slice: [bam_input_support.md](doc/devel/implementation_plans/bam_input_support.md)
+- **Impl reports:**
+  - CRAM slice: [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/implementations/per_sample_caller_cram_input_2026-04-29.md)
+  - BAM slice (2026-05-24): [bam_input_support_2026-05-24.md](doc/devel/reports/implementations/bam_input_support_2026-05-24.md)
+- **Code:** [src/bam/](src/bam/) — `alignment_input.rs` (merge + filter + header validators, format-agnostic), `cram_input.rs` + `bam_input.rs` (per-format owned record-stream decoders), `index_preflight.rs` (CRAI / CSI / BAI detection + build), `errors.rs`.
+- **Latest reviews / fixes (CRAM):** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/reviews/per_sample_caller_cram_input_2026-04-29.md), [fixes_applied_2026-05-01.md](doc/devel/reports/implementations/fixes_applied_2026-05-01.md)
+- **Open (BAM slice — from the impl report's deferred-list):**
+  - Wall-time validation on real multi-chrom BAMs (analogue of cohort H1's 3.85× at T=13 on tomato CRAMs). Picked up alongside the `examples/profile_from_bam_e2e.rs` + `benches/from_bam_e2e_perf.rs` infrastructure already deferred from the prior task.
+  - Internal helper-parameter renames `crams: &[PathBuf]` → `alignment_files: &[PathBuf]` in `stage1_pipeline.rs` and three private helpers in `var_calling_from_bam.rs`. Internal-only.
+  - `PerInputHandleCountMismatch.crams: usize` field rename to `inputs`. Public-error-type breaking change; defer to a coordinated naming pass.
+  - Lift the no-mixing restriction (CRAM + BAM in one invocation) if a real workload appears. Pre-flight gate is the only place the restriction lives; merge core is already format-agnostic.
 
 #### Pileup walker
 - **Status:** shipped
