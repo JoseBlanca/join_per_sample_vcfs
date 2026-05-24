@@ -33,6 +33,42 @@ use std::sync::Arc;
 use crate::bam::errors::AlignmentIndexError;
 
 // ---------------------------------------------------------------------
+// BAM index policy constants
+// ---------------------------------------------------------------------
+
+/// Read-side preference order when both `.csi` and `.bai` exist
+/// next to a BAM input. `.csi` wins because it has no 512 Mbp
+/// per-contig length cap (some plant references exceed this);
+/// `.bai` is accepted on read as a fallback for compatibility
+/// with existing data sets. See
+/// [`existing_index_for`] for the consuming policy and the
+/// `BAM_INDEX_BUILD_FORMAT` constant below for the build-side
+/// pin.
+pub const BAM_INDEX_READ_PREFERENCE: &[&str] = &["csi", "bai"];
+
+/// On-disk format produced by [`preflight_alignment_indexes`]
+/// when `--build-map-file-index` is set on a BAM input. Always
+/// `.csi`: at `CSI_DEPTH = 6` it addresses contigs up to ~2^32
+/// bp (~4.3 Gbp), well past the `.bai` 2^29 (~537 Mbp) cap that
+/// `.bai`'s 16 kbp bin grid imposes.
+pub const BAM_INDEX_BUILD_FORMAT: &str = "csi";
+
+/// `.csi` min-shift exponent. `14` → 16 kbp leaf bins (matches
+/// `.bai` resolution). Bumping widens leaf bins (smaller index,
+/// coarser queries); lowering narrows them. Default 14 is the
+/// noodles / htslib convention.
+pub const CSI_MIN_SHIFT: u8 = 14;
+
+/// `.csi` binning depth. Addressable contig length is
+/// approximately `2^(min_shift + 3 * depth)`. At our
+/// (`min_shift = 14`, `depth = 6`) the addressable length is
+/// ~2^32 ≈ 4.3 Gbp — well past the `.bai` cap, safe for
+/// large plant references the project may target in future
+/// (wheat ~700 Mbp, lily ~3 Gbp). Increase only if a use case
+/// surfaces with contigs > 4 Gbp.
+pub const CSI_DEPTH: u8 = 6;
+
+// ---------------------------------------------------------------------
 // Pre-loaded alignment index (shared across rayon workers)
 // ---------------------------------------------------------------------
 
@@ -264,33 +300,30 @@ impl AlignmentFileKind {
     }
 }
 
-/// Resolve the alignment index that already exists for `input`, if
-/// any. For BAM, `.csi` is preferred over `.bai`.
+/// Resolve the alignment index that already exists for `input`,
+/// if any. For BAM, walks [`BAM_INDEX_READ_PREFERENCE`] in order
+/// and returns the first format whose file is on disk
+/// (`.csi`-preferred, `.bai`-fallback).
 fn existing_index_for(input: &Path, kind: AlignmentFileKind) -> Option<PathBuf> {
     match kind {
         AlignmentFileKind::Cram => {
             let p = crai_path_for(input);
             p.exists().then_some(p)
         }
-        AlignmentFileKind::Bam => {
-            let csi = csi_path_for(input);
-            if csi.exists() {
-                return Some(csi);
-            }
-            let bai = bai_path_for(input);
-            bai.exists().then_some(bai)
-        }
+        AlignmentFileKind::Bam => BAM_INDEX_READ_PREFERENCE
+            .iter()
+            .map(|ext| bam_index_path_for(input, ext))
+            .find(|p| p.exists()),
     }
 }
 
 /// The index path we would *build* for `input` if asked. For BAM
-/// this is always the `.csi`-canonical path — `.csi` has no
-/// contig-length limit while `.bai`'s 16 kbp bin grid tops out at
-/// 512 Mbp, which already excludes some plant references.
+/// this is always `<input>.<BAM_INDEX_BUILD_FORMAT>` (`.csi`) —
+/// see the constant's doc for rationale.
 fn target_index_path(input: &Path, kind: AlignmentFileKind) -> PathBuf {
     match kind {
         AlignmentFileKind::Cram => crai_path_for(input),
-        AlignmentFileKind::Bam => csi_path_for(input),
+        AlignmentFileKind::Bam => bam_index_path_for(input, BAM_INDEX_BUILD_FORMAT),
     }
 }
 
@@ -298,12 +331,12 @@ fn crai_path_for(cram: &Path) -> PathBuf {
     append_extension(cram, "crai")
 }
 
-fn csi_path_for(bam: &Path) -> PathBuf {
-    append_extension(bam, "csi")
-}
-
-fn bai_path_for(bam: &Path) -> PathBuf {
-    append_extension(bam, "bai")
+/// `<bam>.<ext>` for any BAM-side index extension (`csi`, `bai`).
+/// Used by both the read-side preference walk and the build-side
+/// canonical-path helper so the path-construction rule lives in
+/// one place.
+fn bam_index_path_for(bam: &Path, ext: &str) -> PathBuf {
+    append_extension(bam, ext)
 }
 
 /// Append `.<ext>` to a path. Unlike [`Path::with_extension`], this
@@ -327,20 +360,30 @@ fn build_index(input: &Path, kind: AlignmentFileKind) -> std::io::Result<()> {
 }
 
 /// Build a `.csi` next to `bam_path` by scanning the BAM once and
-/// feeding the chunks into a [`noodles_csi::binning_index::Indexer`].
+/// feeding the chunks into a [`noodles_csi::binning_index::Indexer`]
+/// parameterised by [`CSI_MIN_SHIFT`] / [`CSI_DEPTH`].
+///
 /// Mirrors the helper in `noodles_bam` 0.89's own query tests; the
 /// inlined copy here keeps the build path independent of any
 /// test-support feature.
 fn build_csi_for_bam(bam_path: &Path) -> std::io::Result<()> {
     use noodles_csi::binning_index::Indexer;
     use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
+    // BinnedIndex is the CSI on-disk shape; LinearIndex would emit
+    // the .bai shape. We only build .csi here — see
+    // BAM_INDEX_BUILD_FORMAT / CSI_DEPTH constants.
     use noodles_csi::binning_index::index::reference_sequence::index::BinnedIndex;
     use noodles_sam::alignment::Record as _;
 
     let mut reader = noodles_bam::io::reader::Builder.build_from_path(bam_path)?;
     let header = reader.read_header()?;
 
-    let mut indexer: Indexer<BinnedIndex> = Indexer::default();
+    // Bypass `Indexer::default()` (which picks min_shift=14 /
+    // depth=5, capping addressable contig length at ~537 Mbp).
+    // We use the named constants explicitly so the bump to
+    // depth=6 (~4.3 Gbp cap) is visible at the build site
+    // rather than hidden behind a no-argument default.
+    let mut indexer: Indexer<BinnedIndex> = Indexer::new(CSI_MIN_SHIFT, CSI_DEPTH);
     let mut chunk_start = reader.get_ref().virtual_position();
     let mut record = noodles_bam::Record::default();
 
@@ -363,7 +406,7 @@ fn build_csi_for_bam(bam_path: &Path) -> std::io::Result<()> {
     }
 
     let index = indexer.build(header.reference_sequences().len());
-    noodles_csi::fs::write(csi_path_for(bam_path), &index)
+    noodles_csi::fs::write(bam_index_path_for(bam_path, BAM_INDEX_BUILD_FORMAT), &index)
 }
 
 // ---------------------------------------------------------------------

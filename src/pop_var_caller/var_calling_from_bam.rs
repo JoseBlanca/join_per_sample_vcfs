@@ -92,10 +92,15 @@ pub struct VarCallingFromBamArgs {
     #[arg(long)]
     pub no_complexity_filter: bool,
 
-    /// If any input CRAM/BAM lacks its alignment index (`.crai` for
-    /// CRAM; `.bai` or `.csi` for BAM), build it in place next to
-    /// the source file before running. Without this flag, missing
-    /// indexes are a hard error.
+    /// If any input lacks its alignment index, build it in place
+    /// next to the source file before running.
+    ///
+    /// On read: `.crai` for CRAM; `.csi` (preferred) or `.bai`
+    /// (fallback) for BAM. On build: `.crai` for CRAM, `.csi`
+    /// for BAM (`.bai`'s 16 kbp bin grid tops out at 512 Mbp
+    /// per contig and is not future-proof; see
+    /// `crate::bam::index_preflight::BAM_INDEX_BUILD_FORMAT`).
+    /// Without this flag, missing indexes are a hard error.
     ///
     /// Default off — per-chromosome parallelism requires an
     /// alignment index for each input, but the caller must opt in
@@ -202,8 +207,16 @@ pub enum VarCallingFromBamCliError {
     /// was not passed. The message names both the flag and the
     /// `samtools index` recipe so the user can fix the run without
     /// digging.
+    ///
+    /// `expected_index_path` is the path the build path would
+    /// create — `.crai` for CRAM, `.csi` for BAM. For BAM inputs
+    /// the loader also accepts a `.bai` next to the source as a
+    /// read-side fallback; the message calls this out so a user
+    /// with an existing `.bai` knows the tool would have honoured
+    /// it.
     #[error(
-        "input alignment file '{path}' has no index (looked for '{expected_index_path}')\n\
+        "input alignment file '{path}' has no index (looked for '{expected_index_path}'; \
+         for BAM inputs '<input>.bam.bai' is also accepted on read as a fallback)\n\
          per-chromosome parallelism requires an index for each input.\n\
          either:\n\
            - re-run with --build-map-file-index to have pop_var_caller build it, or\n\
