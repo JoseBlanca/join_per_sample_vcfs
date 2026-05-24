@@ -35,13 +35,13 @@ use tempfile::TempDir;
 /// Default `PileupArgs` instance overridable by the test. We
 /// disable the min-read-length filter (default 30) so the tiny
 /// synthetic 5-bp reads survive into the pipeline.
-fn default_args(reference: PathBuf, output: PathBuf, crams: Vec<PathBuf>) -> PileupArgs {
+fn default_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBuf>) -> PileupArgs {
     let _unused = DEFAULT_MIN_READ_LENGTH; // re-export sanity
     PileupArgs {
         reference,
         output,
         threads: None,
-        crams,
+        alignment_files,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: false,
@@ -188,3 +188,90 @@ fn no_baq_path_writes_valid_psp() {
 // write, so the produced CRAM always has @SQ M5 present even when
 // we omit it from the SAM header. Building such a CRAM would
 // require hand-rolling the CRAM bytes, which is out of scope.
+
+// ---------------------------------------------------------------------
+// BAM siblings (commit 6 of the BAM-input plan,
+// `doc/devel/implementation_plans/bam_input_support.md`).
+// ---------------------------------------------------------------------
+
+/// BAM analogue of [`happy_path_default_config`]. Same record set,
+/// same expected `.psp` records, with `.bam` as the input format.
+/// Verifies the format-dispatch in `AlignmentMergedReader::new`
+/// reaches `open_bam_record_stream` and the rest of the Stage-1
+/// pipeline runs through unmodified.
+#[test]
+fn happy_path_default_config_bam() {
+    use common::build_bam;
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let records = vec![
+        read_record("r1", 1, b"AAAAA"),
+        read_record("r2", 5, b"AAAAA"),
+        read_record("r3", 10, b"AAAAA"),
+    ];
+    let bam = build_bam(dir.path(), "NA12878", Some(fixture_md5()), &records);
+    let output = dir.path().join("out.psp");
+    let args = default_args(fasta.clone(), output.clone(), vec![bam.clone()]);
+
+    run_pileup(&args).expect("run_pileup OK on bam");
+
+    assert!(output.exists(), ".psp must exist at the final path");
+
+    let f = File::open(&output).expect("open .psp");
+    let reader = PspReader::new(BufReader::new(f)).expect("open psp reader");
+    let header = reader.header().clone();
+
+    assert_eq!(header.sample, "NA12878");
+    // The serialized `input_crams` field name is kept for backward
+    // compatibility with existing `.psp` files; for BAM inputs the
+    // basename is just the .bam one.
+    assert_eq!(header.writer.input_crams, vec!["NA12878.bam"]);
+    assert_eq!(header.chromosomes.len(), 1);
+    assert_eq!(header.chromosomes[0].name, CONTIG_NAME);
+
+    let mut reader = PspReader::new(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let positions: Vec<u32> = reader
+        .records()
+        .map(|r| r.expect("decode record").pos)
+        .collect();
+    assert_eq!(
+        positions,
+        (1u32..=14).collect::<Vec<_>>(),
+        "expected one record at each of positions 1..=14"
+    );
+}
+
+/// Mixed CRAM + BAM in one invocation is rejected before any reader
+/// opens. The error message names both offending paths.
+#[test]
+fn pileup_rejects_mixed_cram_and_bam() {
+    use common::build_bam;
+    use pop_var_caller::bam::errors::AlignmentInputError;
+    use pop_var_caller::pop_var_caller::cli::PileupCliError;
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![read_record("r1", 1, b"AAAAA")];
+    let cram = build_cram(dir.path(), &fasta, "NA00001", Some(fixture_md5()), &reads);
+    let bam = build_bam(dir.path(), "NA00002", Some(fixture_md5()), &reads);
+    let output = dir.path().join("mixed.psp");
+
+    let args = default_args(fasta, output, vec![cram.clone(), bam.clone()]);
+    let err = run_pileup(&args).expect_err("mixed cram + bam must error");
+
+    match err {
+        PileupCliError::CramInput(AlignmentInputError::MixedAlignmentFileFormats {
+            first_path,
+            first_format,
+            other_path,
+            other_format,
+        }) => {
+            assert_eq!(first_path, cram);
+            assert_eq!(first_format, "CRAM");
+            assert_eq!(other_path, bam);
+            assert_eq!(other_format, "BAM");
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+}

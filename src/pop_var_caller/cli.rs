@@ -91,9 +91,12 @@ pub struct PileupArgs {
     #[arg(long)]
     pub threads: Option<usize>,
 
-    /// One or more coordinate-sorted CRAMs for the sample.
+    /// One or more coordinate-sorted CRAM or BAM file(s) for one
+    /// sample. All inputs in one invocation must share the same
+    /// format (CRAM-only or BAM-only); mixed CRAM + BAM is rejected
+    /// with a typed error.
     #[arg(required = true)]
-    pub crams: Vec<PathBuf>,
+    pub alignment_files: Vec<PathBuf>,
 
     // ===== Stage 1 (shared with var-calling-from-bam) =========
     #[command(flatten)]
@@ -174,7 +177,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     //    runs while the chain is alive; counter snapshots happen
     //    afterwards inside the helper.
     let outputs = super::stage1_pipeline::with_stage1_pipeline::<_, PileupCliError, _>(
-        &args.crams,
+        &args.alignment_files,
         &args.reference,
         cram_cfg,
         baq_cfg,
@@ -188,7 +191,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
                 ctx.sample_name,
                 &args.reference,
                 ctx.contigs,
-                &args.crams,
+                &args.alignment_files,
                 stage1,
             )?;
             // Open the .tmp output, build the writer, drive the walker.
@@ -486,12 +489,16 @@ mod tests {
         DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
     };
 
-    fn default_args(reference: PathBuf, output: PathBuf, crams: Vec<PathBuf>) -> PileupArgs {
+    fn default_args(
+        reference: PathBuf,
+        output: PathBuf,
+        alignment_files: Vec<PathBuf>,
+    ) -> PileupArgs {
         PileupArgs {
             reference,
             output,
             threads: None,
-            crams,
+            alignment_files,
             stage1: shared_args::Stage1Args {
                 min_mapq: DEFAULT_MIN_MAPQ,
                 no_baq: false,
@@ -601,7 +608,7 @@ mod tests {
             PathBuf::from("o.psp"),
             vec![],
         );
-        let crams = [
+        let alignment_files = [
             PathBuf::from("/scratch/run1/sample.cram"),
             PathBuf::from("./run2/sample2.cram"),
         ];
@@ -609,7 +616,7 @@ mod tests {
             "NA12878",
             Path::new("/data/ref/grch38.fa"),
             &contigs,
-            &crams,
+            &alignment_files,
             &args.stage1,
         )
         .expect("build_writer_header");

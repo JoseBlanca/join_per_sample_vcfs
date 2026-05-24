@@ -81,9 +81,12 @@ pub struct VarCallingFromBamArgs {
     #[arg(long)]
     pub threads: Option<usize>,
 
-    /// One or more coordinate-sorted CRAMs for the sample.
+    /// One or more coordinate-sorted CRAM or BAM file(s) for one
+    /// sample. All inputs in one invocation must share the same
+    /// format (CRAM-only or BAM-only); mixed CRAM + BAM is rejected
+    /// with a typed error.
     #[arg(required = true)]
-    pub crams: Vec<PathBuf>,
+    pub alignment_files: Vec<PathBuf>,
 
     /// Skip the low-complexity (sdust) filter entirely.
     #[arg(long)]
@@ -275,7 +278,7 @@ pub fn run_var_calling_from_bam(
     //    rayon pools are touched. Indexes are only created when the
     //    user opts in via `--build-map-file-index`.
     crate::bam::index_preflight::preflight_alignment_indexes(
-        &args.crams,
+        &args.alignment_files,
         args.build_map_file_index,
     )?;
 
@@ -332,7 +335,7 @@ pub fn run_var_calling_from_bam(
     let sample_name;
     {
         let reader = crate::bam::alignment_input::AlignmentMergedReader::new(
-            &args.crams,
+            &args.alignment_files,
             &args.reference,
             cram_cfg,
         )
@@ -346,8 +349,8 @@ pub fn run_var_calling_from_bam(
     //    headers parsed here, plus the `Arc<crai::Index>` payloads,
     //    are cloned-by-Arc across rayon workers below — one atomic
     //    per worker, no per-worker disk parse.
-    let headers = load_per_input_headers(&args.crams)?;
-    let indexes = load_per_input_indexes(&args.crams)?;
+    let headers = load_per_input_headers(&args.alignment_files)?;
+    let indexes = load_per_input_indexes(&args.alignment_files)?;
 
     // 6. Cohort metadata + writer config template. Workers clone
     //    these per fragment; the template's `output` field is
@@ -412,7 +415,7 @@ pub fn run_var_calling_from_bam(
             .map(|(cid, _contig)| {
                 process_one_chromosome_from_bam(
                     cid as u32,
-                    &args.crams,
+                    &args.alignment_files,
                     &headers,
                     &indexes,
                     canonical_contigs.clone(),
@@ -472,39 +475,67 @@ pub fn run_var_calling_from_bam(
     Ok(())
 }
 
-/// Open each CRAM once, advance past the file definition and file
-/// header, and return the parsed headers wrapped in `Arc` for
-/// cross-worker sharing. Mirrors what
+/// Open each input once, read its SAM header, and return the
+/// parsed headers wrapped in `Arc` for cross-worker sharing.
+/// Mirrors what
 /// [`crate::bam::alignment_input::AlignmentMergedReader::query`] does
 /// per-worker, lifted to driver-startup time so workers only pay an
-/// `Arc::clone`.
+/// `Arc::clone`. Dispatches on the input file's extension — same
+/// policy the merged reader uses, just here for an early stand-alone
+/// header harvest.
 fn load_per_input_headers(
     crams: &[PathBuf],
 ) -> Result<Vec<Arc<noodles_sam::Header>>, VarCallingFromBamCliError> {
     use crate::bam::errors::AlignmentInputError;
+    use crate::bam::index_preflight::AlignmentFileKind;
 
     let mut headers = Vec::with_capacity(crams.len());
     for path in crams {
-        let mut reader = noodles_cram::io::reader::Builder::default()
-            .build_from_path(path)
-            .map_err(|source| {
-                PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                    path: path.clone(),
-                    source,
-                })
-            })?;
-        reader.read_file_definition().map_err(|source| {
-            PileupCliError::CramInput(AlignmentInputError::OpenFailed {
+        let kind = AlignmentFileKind::from_path(path).ok_or_else(|| {
+            PileupCliError::CramInput(AlignmentInputError::UnsupportedExtension {
                 path: path.clone(),
-                source,
             })
         })?;
-        let header = reader.read_file_header().map_err(|source| {
-            PileupCliError::CramInput(AlignmentInputError::OpenFailed {
-                path: path.clone(),
-                source,
-            })
-        })?;
+        let header = match kind {
+            AlignmentFileKind::Cram => {
+                let mut reader = noodles_cram::io::reader::Builder::default()
+                    .build_from_path(path)
+                    .map_err(|source| {
+                        PileupCliError::CramInput(AlignmentInputError::OpenFailed {
+                            path: path.clone(),
+                            source,
+                        })
+                    })?;
+                reader.read_file_definition().map_err(|source| {
+                    PileupCliError::CramInput(AlignmentInputError::OpenFailed {
+                        path: path.clone(),
+                        source,
+                    })
+                })?;
+                reader.read_file_header().map_err(|source| {
+                    PileupCliError::CramInput(AlignmentInputError::OpenFailed {
+                        path: path.clone(),
+                        source,
+                    })
+                })?
+            }
+            AlignmentFileKind::Bam => {
+                let mut reader = noodles_bam::io::reader::Builder
+                    .build_from_path(path)
+                    .map_err(|source| {
+                        PileupCliError::CramInput(AlignmentInputError::OpenFailed {
+                            path: path.clone(),
+                            source,
+                        })
+                    })?;
+                reader.read_header().map_err(|source| {
+                    PileupCliError::CramInput(AlignmentInputError::OpenFailed {
+                        path: path.clone(),
+                        source,
+                    })
+                })?
+            }
+        };
         headers.push(Arc::new(header));
     }
     Ok(headers)

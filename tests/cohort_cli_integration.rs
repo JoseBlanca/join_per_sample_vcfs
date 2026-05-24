@@ -61,12 +61,12 @@ use tempfile::TempDir;
 // `.psp` files).
 // ---------------------------------------------------------------------
 
-fn pileup_args(reference: PathBuf, output: PathBuf, crams: Vec<PathBuf>) -> PileupArgs {
+fn pileup_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBuf>) -> PileupArgs {
     PileupArgs {
         reference,
         output,
         threads: None,
-        crams,
+        alignment_files,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: true, // skip BAQ — tiny synthetic reads don't need it
@@ -304,7 +304,7 @@ fn var_calling_from_bam_happy_path() {
         reference: fasta.clone(),
         output: vcf_out.clone(),
         threads: None,
-        crams: vec![cram],
+        alignment_files: vec![cram],
         no_complexity_filter: true,
         build_map_file_index: true,
         stage1: Stage1Args {
@@ -642,7 +642,7 @@ fn var_calling_from_bam_surfaces_walker_error_on_max_active_reads_trip() {
         reference: fasta.clone(),
         output: vcf_out.clone(),
         threads: None,
-        crams: vec![cram],
+        alignment_files: vec![cram],
         no_complexity_filter: true,
         build_map_file_index: true,
         stage1: Stage1Args {
@@ -737,14 +737,14 @@ fn run_pileup_can_be_called_back_to_back() {
 fn from_bam_args_for_preflight_tests(
     reference: PathBuf,
     output: PathBuf,
-    crams: Vec<PathBuf>,
+    alignment_files: Vec<PathBuf>,
     build_map_file_index: bool,
 ) -> VarCallingFromBamArgs {
     VarCallingFromBamArgs {
         reference,
         output,
         threads: None,
-        crams,
+        alignment_files,
         no_complexity_filter: true,
         build_map_file_index,
         stage1: Stage1Args {
@@ -860,4 +860,158 @@ fn from_bam_builds_missing_cram_index_when_flag_set() {
 
     assert!(crai.exists(), ".crai must have been built next to the cram");
     assert!(vcf_out.exists(), "VCF must exist at the final path");
+}
+
+// ---------------------------------------------------------------------
+// BAM siblings (commit 6 of the BAM-input plan,
+// `doc/devel/implementation_plans/bam_input_support.md`). Each
+// mirrors the matching CRAM-side test above with the same fixture
+// data, swapping `build_cram` for `build_bam` and `.csi` / `.bai`
+// for `.crai` where the index format matters.
+// ---------------------------------------------------------------------
+
+/// BAM analogue of [`var_calling_from_bam_happy_path`].
+#[test]
+fn var_calling_from_bam_happy_path_bam() {
+    use common::{build_bam, build_csi};
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![
+        read_record("r1", 10, b"ACAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let bam = build_bam(dir.path(), "NA12878", Some(fixture_md5()), &reads);
+    let _csi = build_csi(&bam); // build_map_file_index = false in args
+    let vcf_out = dir.path().join("solo_bam.vcf");
+
+    let args =
+        from_bam_args_for_preflight_tests(fasta.clone(), vcf_out.clone(), vec![bam.clone()], false);
+    run_var_calling_from_bam(&args).expect("run_var_calling_from_bam OK on bam");
+
+    assert!(vcf_out.exists(), "VCF must exist at the final path");
+    let body = fs::read_to_string(&vcf_out).expect("read VCF");
+    assert!(body.contains("##fileformat=VCFv4"), "VCF header missing");
+    assert!(body.contains("\tNA12878\n") || body.contains("\tNA12878\r\n"));
+}
+
+/// BAM analogue of [`from_bam_errors_when_cram_index_missing_and_flag_unset`].
+/// The expected index path is the `.csi`-canonical one (the
+/// build-side preference); the `.bai`-fallback is read-side-only.
+#[test]
+fn from_bam_errors_when_bam_index_missing_and_flag_unset() {
+    use common::build_bam;
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![read_record("r1", 10, b"AAAAA")];
+    let bam = build_bam(dir.path(), "NA12878", Some(fixture_md5()), &reads);
+    let vcf_out = dir.path().join("out_bam.vcf");
+
+    let args = from_bam_args_for_preflight_tests(fasta, vcf_out, vec![bam.clone()], false);
+    let err = run_var_calling_from_bam(&args).expect_err("pre-flight should fail without an index");
+    match err {
+        VarCallingFromBamCliError::MissingMapFileIndex {
+            path,
+            expected_index_path,
+        } => {
+            assert_eq!(path, bam);
+            assert_eq!(expected_index_path, dir.path().join("NA12878.bam.csi"));
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+}
+
+/// BAM analogue of [`from_bam_builds_missing_cram_index_when_flag_set`].
+/// `--build-map-file-index` writes a `.csi` (not `.bai`).
+#[test]
+fn from_bam_builds_missing_bam_index_when_flag_set() {
+    use common::build_bam;
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![
+        read_record("r1", 10, b"ACAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let bam = build_bam(dir.path(), "NA12878", Some(fixture_md5()), &reads);
+    let csi = dir.path().join("NA12878.bam.csi");
+    let bai = dir.path().join("NA12878.bam.bai");
+    assert!(!csi.exists(), "test precondition: no .csi yet");
+    assert!(!bai.exists(), "test precondition: no .bai yet");
+
+    let vcf_out = dir.path().join("solo_bam_build.vcf");
+    let args = from_bam_args_for_preflight_tests(fasta, vcf_out.clone(), vec![bam], true);
+
+    run_var_calling_from_bam(&args).expect("run_var_calling_from_bam OK with index build");
+
+    assert!(csi.exists(), ".csi must have been built next to the bam");
+    assert!(
+        !bai.exists(),
+        "build path is .csi-only; no .bai must appear on disk"
+    );
+    assert!(vcf_out.exists(), "VCF must exist at the final path");
+}
+
+/// `.bai` fallback on read: pre-flight accepts a BAM whose only
+/// index is a `.bai`, and the per-chromosome driver runs through
+/// to completion against it.
+#[test]
+fn var_calling_from_bam_accepts_bai_when_no_csi() {
+    use common::{build_bai, build_bam};
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![
+        read_record("r1", 10, b"ACAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let bam = build_bam(dir.path(), "NA12878", Some(fixture_md5()), &reads);
+    let bai = build_bai(&bam);
+    let csi = dir.path().join("NA12878.bam.csi");
+    assert!(bai.exists(), "test precondition: .bai present");
+    assert!(!csi.exists(), "test precondition: no .csi");
+
+    let vcf_out = dir.path().join("solo_bai.vcf");
+    let args = from_bam_args_for_preflight_tests(fasta, vcf_out.clone(), vec![bam], false);
+    run_var_calling_from_bam(&args).expect("run_var_calling_from_bam OK on bai-only bam");
+
+    assert!(vcf_out.exists(), "VCF must exist at the final path");
+}
+
+/// Mixed `.cram` + `.bam` inputs are rejected before the per-chromosome
+/// driver opens any reader. Surfaces as `MixedAlignmentFormats`
+/// with both paths named.
+#[test]
+fn from_bam_rejects_mixed_cram_and_bam_inputs() {
+    use common::{build_bam, build_csi};
+
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let reads = vec![read_record("r1", 10, b"AAAAA")];
+    let cram = build_cram(dir.path(), &fasta, "NA00001", Some(fixture_md5()), &reads);
+    let bam = build_bam(dir.path(), "NA00002", Some(fixture_md5()), &reads);
+    // Both inputs index-backed so the failure isolates the
+    // mixed-format check (not a missing-index error from either).
+    fs::write(dir.path().join("NA00001.cram.crai"), b"x").expect("placeholder crai");
+    let _csi = build_csi(&bam);
+
+    let vcf_out = dir.path().join("mixed.vcf");
+    let args =
+        from_bam_args_for_preflight_tests(fasta, vcf_out, vec![cram.clone(), bam.clone()], false);
+    let err = run_var_calling_from_bam(&args).expect_err("mixed cram + bam must error");
+    match err {
+        VarCallingFromBamCliError::MixedAlignmentFormats {
+            first_path,
+            first_format,
+            other_path,
+            other_format,
+        } => {
+            assert_eq!(first_path, cram);
+            assert_eq!(first_format, "CRAM");
+            assert_eq!(other_path, bam);
+            assert_eq!(other_format, "BAM");
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
 }
