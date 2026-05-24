@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod baq;
 pub mod iter_ext;
 pub mod per_sample_pileup;
 pub mod pop_var_caller;

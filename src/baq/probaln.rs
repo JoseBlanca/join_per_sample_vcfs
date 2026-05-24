@@ -1,6 +1,6 @@
 //! Pure HMM-Glocal forward/backward + posterior decoding. Port of
 //! htslib's `probaln_glocal`
-//! ([htslib/probaln.c:77](../../../htslib/probaln.c#L77)). See Heng Li
+//! ([htslib/probaln.c:77](../../htslib/probaln.c#L77)). See Heng Li
 //! 2011 (doi:10.1093/bioinformatics/btr076) for the algorithm.
 //!
 //! The Rust port reads like htslib's PROBALN_ORIG branch
@@ -47,7 +47,7 @@ const PHRED_CAP: u8 = 99;
 /// Offset of HMM cell `(i, k)` inside its banded row, in 3-cell strides
 /// (one stride per HMM cell, holding M/I/D state probabilities). Direct
 /// port of htslib's `set_u` macro
-/// ([probaln.c:48](../../../htslib/probaln.c#L48)).
+/// ([probaln.c:48](../../htslib/probaln.c#L48)).
 ///
 /// Returns the raw `int` arithmetic htslib does — for callers that pass
 /// `(i, k)` outside the band (the `f[l_query+1]`, `b[l_query]`, `b[0]`
@@ -63,7 +63,7 @@ pub(super) fn set_u(bw: i32, i: i32, k: i32) -> usize {
 }
 
 /// Posterior-probability local realignment. Direct port of htslib's
-/// [`probaln_glocal`](../../../htslib/probaln.c#L77).
+/// [`probaln_glocal`](../../htslib/probaln.c#L77).
 ///
 /// `ref_seq` and `query` are encoded as 0/1/2/3/4 (A/C/G/T/N). `iqual`
 /// is the Phred 0-93 per-base quality of `query`, one byte per query
@@ -78,8 +78,8 @@ pub(super) fn set_u(bw: i32, i: i32, k: i32) -> usize {
 ///
 /// `scratch.q[i]` is the Phred-scaled posterior probability that
 /// `state[i]` is wrong, capped at 99 (htslib's same cap at
-/// [probaln.c:418](../../../htslib/probaln.c#L418)).
-pub(super) fn probaln_glocal(
+/// [probaln.c:418](../../htslib/probaln.c#L418)).
+pub fn probaln_glocal(
     scratch: &mut ProbalnScratch,
     ref_seq: &[u8],
     query: &[u8],

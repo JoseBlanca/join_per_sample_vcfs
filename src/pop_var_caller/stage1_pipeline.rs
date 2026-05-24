@@ -17,7 +17,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::per_sample_pileup::baq::{BaqConfig, BaqSkipCounts, BaqStream, prepare_passthrough};
+use crate::baq::BaqConfig;
+use crate::per_sample_pileup::baq_engine::prepare_passthrough;
+use crate::per_sample_pileup::baq_stream::{BaqSkipCounts, BaqStream};
 use crate::per_sample_pileup::cram_input::{
     ContigList, CramMergedReader, CramMergedReaderConfig, FilterCounts,
 };

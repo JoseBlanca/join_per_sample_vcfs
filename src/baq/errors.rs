@@ -1,13 +1,13 @@
 //! Errors produced by the BAQ stage.
 //!
-//! See [`ia/feature_implementation_plans/baq.md`](../../../ia/feature_implementation_plans/baq.md)
+//! See [`doc/devel/implementation_plans/baq.md`](../../doc/devel/implementation_plans/baq.md)
 //! §"Algorithm port" for how each variant maps onto htslib's failure modes.
 
 use thiserror::Error;
 
 /// Reasons `probaln_glocal` returns early without producing a usable
 /// alignment. Mirrors the `INT_MIN` / `errno` exits in
-/// [htslib/probaln.c:85-107](../../../htslib/probaln.c#L85-L107).
+/// [htslib/probaln.c:85-107](../../htslib/probaln.c#L85-L107).
 ///
 /// Marked `#[non_exhaustive]` so future variants can be added without a
 /// semver break for out-of-crate consumers.

@@ -12,9 +12,7 @@ use crate::per_sample_pileup::cram_input::{
 use crate::per_sample_pileup::pileup::{MateRole, PreparedRead};
 use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
-use super::BaqConfig;
-use super::probaln::probaln_glocal;
-use super::scratch::ProbalnScratch;
+use crate::baq::{BaqConfig, ProbalnScratch, probaln_glocal};
 
 /// Per-read result of [`BaqEngine::process`]: either a fully-built
 /// `PreparedRead` with `bq_baq = min(BQ, BAQ)`, or a structured skip
@@ -36,7 +34,7 @@ pub enum BaqSkipReason {
     EmptyQuery,
     /// `MappedRead.qual` is empty or its length disagrees with `seq`.
     /// Mirrors htslib's `qual[0] == 0xff` early-return at
-    /// [realn.c:134](../../../htslib/realn.c#L134).
+    /// [realn.c:134](../../htslib/realn.c#L134).
     QualAbsent,
     /// CIGAR is entirely insertions / soft-clips / pads — no M/=/X
     /// operation means no reference position to anchor the HMM to.
@@ -46,7 +44,7 @@ pub enum BaqSkipReason {
     /// splice gaps are out of scope; reject defensively. Mirrors
     /// realn.c:190.
     ContainsRefSkip,
-    /// `probaln_glocal` returned [`ProbalnError`](super::errors::ProbalnError)
+    /// `probaln_glocal` returned [`ProbalnError`](crate::baq::ProbalnError)
     /// — practically only triggered by pathological read lengths.
     HmmOverflow,
     /// Reference window extension reached past the chromosome end and
@@ -211,8 +209,8 @@ impl BaqEngine {
             &mut self.bq_baq_buf,
             &read.cigar,
             &read.qual,
-            &self.scratch.state,
-            &self.scratch.q,
+            self.scratch.state(),
+            self.scratch.q(),
             pos_0,
             xb,
         );

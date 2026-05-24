@@ -16,17 +16,18 @@ use crate::per_sample_pileup::errors::CramInputError;
 use crate::per_sample_pileup::pileup::PreparedRead;
 use crate::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 
-use super::BaqConfig;
-use super::engine::{BaqEngine, BaqOutcome, BaqSkipReason};
+use super::baq_engine::{BaqEngine, BaqOutcome, BaqSkipReason};
+use crate::baq::BaqConfig;
 
 /// Default chunk size — reads per rayon batch. Picked at 1024 from the
 /// `baq_stream_chunk_size` criterion bench
-/// ([benches/baq_perf.rs](../../../benches/baq_perf.rs)): on the
+/// ([benches/baq_perf.rs](../../benches/baq_perf.rs)): on the
 /// reference workstation (Intel i7-1260P, 16 logical CPUs) `/1024`
 /// runs at ~88 ms vs `/4096` at ~85 ms — under 5 % wall-time gap for
 /// 4× the memory footprint per chunk, so 1024 is the better default
 /// for typical per-sample workloads. See
-/// `ia/reviews/perf_baq_2026-05-12.md` for the saved baseline.
+/// [doc/devel/reports/reviews/perf_baq_2026-05-12.md](../../doc/devel/reports/reviews/perf_baq_2026-05-12.md)
+/// for the saved baseline.
 pub const DEFAULT_BAQ_CHUNK_SIZE: usize = 1024;
 
 /// Per-reason BAQ skip counters. `total` is what the pipeline rolls

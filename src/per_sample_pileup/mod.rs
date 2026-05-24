@@ -5,13 +5,14 @@
 //! their headers against each other and against the reference FASTA,
 //! merges them into a single coordinate-sorted record stream, and
 //! applies the per-read filter cascade specified in
-//! `ia/specs/per_sample_pileup.md` §"Read filters".
+//! `doc/devel/specs/per_sample_pileup.md` §"Read filters".
 //!
 //! Downstream stages (BAQ, pileup walking, allele extraction, phase
 //! chains, `.psp` writing) are separate slices and live in sibling
 //! modules.
 
-pub mod baq;
+pub mod baq_engine;
+pub mod baq_stream;
 pub mod cram_input;
 pub mod errors;
 pub mod pileup;
@@ -19,6 +20,8 @@ pub mod pileup_to_psp;
 pub mod psp;
 pub mod ref_fetcher;
 
+#[cfg(test)]
+mod baq_tests;
 #[cfg(test)]
 pub(crate) mod cram_files;
 #[cfg(test)]

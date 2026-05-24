@@ -19,7 +19,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use pop_var_caller::per_sample_pileup::baq::{BaqConfig, BaqEngine, BaqOutcome};
+use pop_var_caller::baq::BaqConfig;
+use pop_var_caller::per_sample_pileup::baq_engine::{BaqEngine, BaqOutcome};
 use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, MappedRead};
 use pop_var_caller::per_sample_pileup::ref_fetcher::ManualEvictChromRefFetcher;
 

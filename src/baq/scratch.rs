@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 // PARITY: computed at first use because `f32::powf` is not yet
 // `const fn`. The static `ENCODE_BASE` LUT in `engine.rs` is built
 // at compile time because its initialiser is `const`-evaluable.
-pub(super) static Q2P: LazyLock<[f32; 256]> = LazyLock::new(|| {
+pub static Q2P: LazyLock<[f32; 256]> = LazyLock::new(|| {
     let mut t = [0f32; 256];
     for (i, slot) in t.iter_mut().enumerate() {
         *slot = 10f32.powf(-(i as f32) / 10.0);
@@ -30,7 +30,7 @@ pub(super) static Q2P: LazyLock<[f32; 256]> = LazyLock::new(|| {
 /// Sized lazily by `resize_for`. The buffers grow to the largest
 /// problem seen so far and stay at that capacity, so a long read
 /// followed by a short one pays the long read's allocation only once.
-pub(super) struct ProbalnScratch {
+pub struct ProbalnScratch {
     pub(super) f: Vec<f64>,
     pub(super) b: Vec<f64>,
     pub(super) s: Vec<f64>,
@@ -44,8 +44,14 @@ pub(super) struct ProbalnScratch {
     pub(super) q: Vec<u8>,
 }
 
+impl Default for ProbalnScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProbalnScratch {
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             f: Vec::new(),
             b: Vec::new(),
@@ -54,6 +60,19 @@ impl ProbalnScratch {
             state: Vec::new(),
             q: Vec::new(),
         }
+    }
+
+    /// HMM output: the alignment state for each query base.
+    /// `state[i] >> 2` is the 0-based ref position the base was
+    /// aligned to; `state[i] & 3` is 0 (match) or 1 (insertion).
+    pub fn state(&self) -> &[i32] {
+        &self.state
+    }
+
+    /// HMM output: Phred-scaled posterior probability that `state[i]`
+    /// is wrong, capped at 99.
+    pub fn q(&self) -> &[u8] {
+        &self.q
     }
 
     /// Resize all DP buffers to fit an `(l_query, i_dim)`-sized problem

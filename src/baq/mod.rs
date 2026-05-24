@@ -3,34 +3,36 @@
 //! posterior probability that base `i` is correctly aligned to its
 //! reference position.
 //!
-//! This module is the Rust port of htslib's `probaln_glocal` plus a
-//! per-read driver layered on top. The algorithm and parameter choices
-//! are pinned in
-//! [`ia/feature_implementation_plans/baq.md`](../../../ia/feature_implementation_plans/baq.md);
-//! the architecture motivation is in
-//! [`ia/specs/calling_pipeline_architecture.md`](../../../ia/specs/calling_pipeline_architecture.md)
-//! §"Per-read likelihood quality".
+//! This module is the algorithmic core: a Rust port of htslib's
+//! `probaln_glocal` HMM plus the supporting scratch buffers and
+//! configuration types. It has no dependency on the per-sample-pileup
+//! walker — the pileup-specific per-read driver and the rayon stream
+//! adapter live in
+//! [`crate::per_sample_pileup::baq_engine`] and
+//! [`crate::per_sample_pileup::baq_stream`].
 //!
-//! - Layer 1 (`probaln.rs`) — the pure HMM kernel `probaln_glocal`.
-//! - Layer 2 (`engine.rs`) — `BaqEngine`: per-read driver with CIGAR
-//!   walks, ref-window extension, and `MappedRead` → `PreparedRead`
-//!   conversion.
-//! - Layer 3 (`stream.rs`) — `BaqStream`: rayon-parallel iterator
-//!   adapter that consumes a `MappedRead` stream and yields
-//!   `PreparedRead`s in coordinate-sorted input order.
+//! The algorithm and parameter choices are pinned in
+//! [`doc/devel/implementation_plans/baq.md`]; the architecture
+//! motivation is in
+//! [`doc/devel/specs/calling_pipeline_architecture.md`] §"Per-read
+//! likelihood quality".
+//!
+//! - [`probaln_glocal`] — the pure HMM kernel.
+//! - [`ProbalnScratch`] / [`Q2P`] — preallocated work buffers and the
+//!   Q-to-probability lookup table.
+//! - [`BaqConfig`] / [`ProbalnError`] — configuration and structured
+//!   error variants.
 
-mod engine;
 pub mod errors;
 mod probaln;
 mod scratch;
-mod stream;
 
 #[cfg(test)]
 mod tests;
 
-pub use engine::{BaqEngine, BaqOutcome, BaqSkipReason, prepare_passthrough};
 pub use errors::ProbalnError;
-pub use stream::{BaqSkipCounts, BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
+pub use probaln::probaln_glocal;
+pub use scratch::{ProbalnScratch, Q2P};
 
 // htslib/realn.c:115 — samtools' production gap-open probability for
 // Illumina short reads.
@@ -43,10 +45,10 @@ pub const SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB: f32 = 0.1;
 pub const SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH: i32 = 7;
 
 /// Parameters for `probaln_glocal`. Mirrors htslib's `probaln_par_t`
-/// ([htslib/htslib/hts.h:1435](../../../htslib/htslib/hts.h#L1435)).
+/// ([htslib/htslib/hts.h:1435](../../htslib/htslib/hts.h#L1435)).
 ///
 /// Default values come from samtools' production defaults in
-/// [`htslib/realn.c:115`](../../../htslib/realn.c#L115) — see the
+/// [`htslib/realn.c:115`](../../htslib/realn.c#L115) — see the
 /// "Parameters: htslib vs GATK" decision in the plan. Prefer
 /// [`BaqConfig::samtools_illumina`] at call sites so the parameter
 /// source is visible.

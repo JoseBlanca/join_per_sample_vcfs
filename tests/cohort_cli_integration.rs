@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 
 use common::{WRONG_MD5, build_cram, build_fasta, fixture_md5, read_record};
 use noodles_sam::alignment::record_buf::RecordBuf;
-use pop_var_caller::per_sample_pileup::baq::{
-    DEFAULT_BAQ_CHUNK_SIZE, SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
+use pop_var_caller::baq::{
+    SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
     SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
 };
+use pop_var_caller::per_sample_pileup::baq_stream::DEFAULT_BAQ_CHUNK_SIZE;
 use pop_var_caller::per_sample_pileup::cram_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MISMATCH_BQ_FLOOR,
 };
