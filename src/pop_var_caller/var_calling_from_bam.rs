@@ -1,24 +1,25 @@
 //! `pop_var_caller var-calling-from-bam` — single-sample BAM → VCF.
 //!
-//! Convenience subcommand for one-off calls: pileup + var-calling fused
-//! in one process, no intermediate `.psp` file. Single sample only —
-//! multi-sample work always goes through the `.psp` route (which is
-//! both faster and the only path that supports `--contamination-estimates`).
+//! Single-sample, single-VCF convenience subcommand: pileup + cohort
+//! var-calling fused in one process, no intermediate `.psp` file.
+//! Multi-sample work always goes through the `.psp` route (which is
+//! both faster and the only path that supports
+//! `--contamination-estimates`).
 //!
-//! Architecture: the Stage 1 borrow chain is built inside
-//! [`with_stage1_pipeline`]; the closure receives the walker, wraps it
-//! as a k=1 input to [`PerPositionMerger`], and chains the rest of the
-//! cohort pipeline exactly as `var-calling` does. The walker's
-//! `WalkerError` is stashed by an
-//! [`ErrorSheddingAdapter`](crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter)
-//! parameterised over `(PileupRecord, WalkerError)` — the same
-//! adapter used at the Stage 1 CRAM-input seam, just bound to
-//! different `T` and `E` — so the merger sees a clean
-//! `Result<_, PspReadError>` stream; any stashed walker error is
-//! surfaced after the pipeline drains.
+//! Architecture: the driver pre-flights every input's alignment
+//! index (and optionally builds one on demand via
+//! `--build-map-file-index`), harvests the canonical contig list +
+//! sample name once via [`crate::bam::cram_input::CramMergedReader::new`],
+//! loads each input's `Arc<sam::Header>` and
+//! `Arc<crai::Index>`, and dispatches one [`process_one_chromosome_from_bam`]
+//! worker per chromosome via `rayon::par_iter`. Each worker owns
+//! its own CRAM reader (via [`crate::bam::cram_input::CramMergedReader::query`]),
+//! BAQ chunk pool, walker, reference fetchers, and per-fragment VCF
+//! writer — no shared mutable state across workers. Fragments
+//! concat in contig-table order via [`crate::vcf::concat::concat_fragments`],
+//! which owns the atomic rename + parent-dir fsync.
 //!
-//! Plan: `doc/devel/implementation_plans/pop_var_caller_cohort_cli.md`
-//! §"Subcommand: var-calling-from-bam".
+//! Plan: `doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md`.
 
 use std::io;
 use std::path::PathBuf;
@@ -28,23 +29,19 @@ use clap::Args;
 use tempfile::TempDir;
 use thiserror::Error;
 
-use crate::fasta::{ContigList, StreamingChromRefFetcher};
+use crate::fasta::ContigList;
 use crate::pileup::walker::WalkerError;
-use crate::pileup_record::PileupRecord;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
-use crate::pop_var_caller::cohort_driver::{
-    CohortDriveStats, CohortPipelineParams, drive_cohort_pipeline,
-};
+use crate::pop_var_caller::cohort_driver::{CohortDriveStats, CohortPipelineParams};
 use crate::pop_var_caller::common::{configure_rayon_pool, current_command_line, format_md5_hex};
-use crate::pop_var_caller::stage1_pipeline::{Stage1PipelineContext, with_stage1_pipeline};
 use crate::psp::PspReadError;
 use crate::psp::header::ParsedChromosome;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };
-use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
+use crate::var_calling::per_position_merger::PerPositionMergerError;
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
@@ -120,7 +117,8 @@ pub struct VarCallingFromBamArgs {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum VarCallingFromBamCliError {
-    /// Stage 1 setup / IO failure surfaced from `with_stage1_pipeline`.
+    /// Stage 1 setup / IO failure: CRAM-input validation, reader
+    /// open, header parse.
     #[error("stage 1: {0}")]
     Stage1(#[from] PileupCliError),
 
@@ -296,151 +294,56 @@ pub fn run_var_calling_from_bam(
         .with_max_gq_phred(cohort.max_gq_phred)?
         .with_contamination(None)?;
 
-    // 4. Drive the Stage 1 chain via the shared helper. The named
-    //    helper `run_cohort_pipeline_for_single_sample` takes the
-    //    walker over and runs the rest of the cohort pipeline; its
-    //    signature names every captured value so the data flow is
-    //    legible (previously: ~95-line closure capturing six values).
-    let no_complexity_filter = args.no_complexity_filter;
-    let emit_gp = cohort.emit_gp;
-    let min_qual_phred = cohort.min_qual_phred;
-    let min_alt_obs_per_sample = cohort.min_alt_obs_per_sample;
-    let no_mapq_diff_filter = cohort.no_mapq_diff_filter;
-    let min_mapq_diff_t = cohort.min_mapq_diff_t;
-    let reference = args.reference.clone();
-    let output = args.output.clone();
-    let command_line = current_command_line();
-
-    let outputs = with_stage1_pipeline::<(), VarCallingFromBamCliError, _>(
-        &args.crams,
-        &args.reference,
-        cram_cfg,
-        baq_cfg,
-        walker_cfg,
-        stage1.baq_chunk_size,
-        stage1.no_baq,
-        |ctx| {
-            run_cohort_pipeline_for_single_sample(
-                ctx,
-                &reference,
-                &output,
-                command_line,
-                no_complexity_filter,
-                emit_gp,
-                min_qual_phred,
-                min_alt_obs_per_sample,
-                no_mapq_diff_filter,
-                min_mapq_diff_t,
-                dust_cfg,
-                grouper_cfg,
-                per_group_cfg,
-                posterior_cfg,
-            )
-        },
-    )?;
-
-    // 5. Stage 1 summary — print after the closure returns, mirrors
-    //    `run_pileup`'s pattern. Filter / BAQ counts come from the
-    //    helper's snapshot.
-    let filter_counts = outputs.run_summary.filter_counts;
-    let baq_skip = outputs.run_summary.baq_skip_counts;
-    eprintln!(
-        "filter_counts: unmapped={} secondary={} supplementary={} qc_fail={} duplicate={} \
-         low_mapq={} too_short={} high_mismatch_fraction={} bad_cigar={} baq_rejected={}",
-        filter_counts.unmapped,
-        filter_counts.secondary,
-        filter_counts.supplementary,
-        filter_counts.qc_fail,
-        filter_counts.duplicate,
-        filter_counts.low_mapq,
-        filter_counts.too_short,
-        filter_counts.high_mismatch_fraction,
-        filter_counts.bad_cigar,
-        filter_counts.baq_rejected,
-    );
-    match baq_skip {
-        Some(b) => eprintln!("baq: total_skipped={}", b.total),
-        None => eprintln!("baq: disabled"),
+    // 4. Harvest the canonical contig list + sample name via the
+    //    streaming `CramMergedReader::new`. Validates per-file headers
+    //    (sort order, `@RG SM`, `@SQ M5`), reconciles across CRAMs,
+    //    and cross-checks against the FASTA's `.fai`. The reader is
+    //    dropped immediately afterwards — per-chrom workers open
+    //    their own readers via `CramMergedReader::query`. The double
+    //    open per CRAM (once here for validation, once per worker
+    //    for query) is intentional: it keeps the validation surface
+    //    centralised and is small relative to the per-contig decode.
+    let canonical_contigs;
+    let sample_name;
+    {
+        let reader =
+            crate::bam::cram_input::CramMergedReader::new(&args.crams, &args.reference, cram_cfg)
+                .map_err(PileupCliError::CramInput)?;
+        canonical_contigs = reader.contigs().clone();
+        sample_name = reader.sample_name().to_string();
     }
+    let chromosomes = contigs_to_parsed(&canonical_contigs)?;
 
-    // 6. Surface a deferred CRAM-input error if one was stashed.
-    if let Some(e) = outputs.stashed_upstream_error {
-        let _ = std::fs::remove_file(&args.output);
-        return Err(VarCallingFromBamCliError::Stage1(
-            PileupCliError::CramInput(e),
-        ));
-    }
-    Ok(())
-}
+    // 5. Load per-input SAM headers + alignment indexes once. The
+    //    headers parsed here, plus the `Arc<crai::Index>` payloads,
+    //    are cloned-by-Arc across rayon workers below — one atomic
+    //    per worker, no per-worker disk parse.
+    let headers = load_per_input_headers(&args.crams)?;
+    let indexes = load_per_input_indexes(&args.crams)?;
 
-// ---------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------
-
-/// Drive Stages 3–6 over a single sample's Stage 1 walker.
-///
-/// Pulled out of the inline closure that used to live inside
-/// [`run_var_calling_from_bam`] so the data flow is legible (every
-/// captured value becomes a named parameter) and so an eventual
-/// shared `drive_cohort_pipeline` (deferred review item M11) has a
-/// clear extraction surface. The closure's outer captures map 1:1
-/// onto the parameters here.
-///
-/// Walker errors are stashed via an inline `.scan()` adapter — the
-/// merger sees a clean `Result<_, PspReadError>` stream and never
-/// observes the walker's `Err` arm; the stash is read after the
-/// pipeline drains and converted into [`VarCallingFromBamCliError::Walker`].
-///
-/// On any driver-loop failure (write_record / posterior emission /
-/// finish), the writer's `<output>.tmp` is best-effort removed —
-/// matching `run_pileup`'s discipline (M6 parity). The shared
-/// [`drive_cohort_pipeline`] handles the merger-onwards wiring and
-/// the cleanup loop; this wrapper sets up the walker-shim and
-/// metadata, then surfaces any stashed walker error after the
-/// driver returns.
-#[allow(clippy::too_many_arguments)]
-fn run_cohort_pipeline_for_single_sample(
-    ctx: Stage1PipelineContext<'_>,
-    reference: &std::path::Path,
-    output: &std::path::Path,
-    command_line: String,
-    no_complexity_filter: bool,
-    emit_gp: bool,
-    min_qual_phred: f64,
-    min_alt_obs_per_sample: u32,
-    no_mapq_diff_filter: bool,
-    min_mapq_diff_t: f32,
-    dust_cfg: DustFilterConfig,
-    grouper_cfg: GrouperConfig,
-    per_group_cfg: PerGroupMergerConfig,
-    posterior_cfg: PosteriorEngineConfig,
-) -> Result<(), VarCallingFromBamCliError> {
-    // Convert ContigList → Vec<ParsedChromosome>. Single validated
-    // source of truth for chromosomes; the per-chrom loop clones it
-    // for each fragment.
-    let chromosomes = contigs_to_parsed(ctx.contigs)?;
-    let sample_name_owned = ctx.sample_name.to_string();
-
-    // Cohort metadata + writer config template.
+    // 6. Cohort metadata + writer config template. Workers clone
+    //    these per fragment; the template's `output` field is
+    //    overridden per worker so each writes to its own fragment
+    //    path.
     let metadata = CohortMetadata {
-        sample_names: vec![sample_name_owned.clone()],
+        sample_names: vec![sample_name.clone()],
         contigs: chromosomes.clone(),
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
-        command_line,
+        command_line: current_command_line(),
     };
-    let writer_cfg_template = WriterConfig::new(output.to_path_buf()).with_emit_gp(emit_gp);
+    let writer_cfg_template = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
 
-    // Per-chromosome fragment paths under a TempDir placed next to the
-    // final output — matches the cohort `var-calling` path so the
-    // concat's atomic rename stays on one filesystem. The TempDir
-    // RAII-drops on Ok or on panic; the fragments live just long
-    // enough for `concat_fragments` to assemble them into `output`.
-    let output_parent = output
+    // 7. Per-chrom fragment paths under a TempDir placed next to the
+    //    final output. Mirror of the cohort `var-calling` driver — the
+    //    final atomic rename stays on one filesystem and the
+    //    `TempDir` RAII-drops the fragments on Ok and on panic.
+    let output_parent = args
+        .output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     let frags_dir = TempDir::new_in(output_parent).map_err(VarCallingFromBamCliError::Io)?;
-    let frag_ext = if path_is_bgzf(output) {
+    let frag_ext = if path_is_bgzf(&args.output) {
         "vcf.gz"
     } else {
         "vcf"
@@ -455,120 +358,77 @@ fn run_cohort_pipeline_for_single_sample(
         })
         .collect();
 
-    // Wrap the walker as a clean `Result<_, PspReadError>` stream.
-    // Walker errors are stashed via `ErrorSheddingAdapter` (the
-    // merger sees a clean stream); the stash is surfaced after the
-    // per-chrom loop drains.
-    //
-    // Invariant: the stash is touched only on the merger's main
-    // thread. `PerGroupMerger::refill` collects upstream items into
-    // a `Vec` before fanning rayon workers across it, so the walker
-    // chain itself never crosses thread boundaries.
-    let walker_adapter: ErrorSheddingAdapter<_, PileupRecord, WalkerError> =
-        ErrorSheddingAdapter::new(ctx.walker);
-    let walker_error_handle = walker_adapter.error_handle();
-    let walker_iter: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>>> =
-        Box::new(walker_adapter.map(Ok));
-
-    // Drive the cohort pipeline per chrom. The walker emits records
-    // in coord order across all chroms; `PerChromRecordsIter` chunks
-    // that single stream by `chrom_id`. Each chrom builds its own
-    // `StreamingChromRefFetcher::for_contig` (1 MB sliding buffer)
-    // that drops at the end of the iteration — no contig is ever
-    // wholly resident.
+    // 8. Pipeline params (cloned per worker; `CohortPipelineParams`
+    //    is `Clone` — cheap configs only).
     let pipeline_params = CohortPipelineParams {
-        no_complexity_filter,
+        no_complexity_filter: args.no_complexity_filter,
         dust_cfg,
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        min_qual_phred,
-        min_alt_obs_per_sample,
-        no_mapq_diff_filter,
-        min_mapq_diff_t,
+        min_qual_phred: cohort.min_qual_phred,
+        min_alt_obs_per_sample: cohort.min_alt_obs_per_sample,
+        no_mapq_diff_filter: cohort.no_mapq_diff_filter,
+        min_mapq_diff_t: cohort.min_mapq_diff_t,
     };
 
-    let mut per_chrom = PerChromRecordsIter::new(walker_iter);
-    let mut next_walker_chrom = per_chrom.open_next_chrom();
+    // 9. Parallel per-chrom drive. Each worker owns its own readers,
+    //    BAQ chunk pool, walker, fetchers, and writer — no shared
+    //    mutable state across workers. The rayon pool is the
+    //    process-global one configured in step 1.
+    use rayon::prelude::*;
+    let per_chrom_results: Vec<Result<(u32, CohortDriveStats), VarCallingFromBamCliError>> =
+        chromosomes
+            .par_iter()
+            .enumerate()
+            .map(|(cid, _contig)| {
+                process_one_chromosome_from_bam(
+                    cid as u32,
+                    &args.crams,
+                    &headers,
+                    &indexes,
+                    canonical_contigs.clone(),
+                    sample_name.clone(),
+                    chromosomes.clone(),
+                    &args.reference,
+                    cram_cfg,
+                    baq_cfg,
+                    walker_cfg,
+                    stage1.baq_chunk_size,
+                    stage1.no_baq,
+                    fragment_paths[cid].clone(),
+                    metadata.clone(),
+                    writer_cfg_template.clone(),
+                    pipeline_params.clone(),
+                )
+            })
+            .collect();
+
+    // 10. Fail-fast surfacing of the first error after all workers
+    //     joined. Mirror of the cohort path's discipline.
     let mut total_stats = CohortDriveStats::default();
-
-    for (cid, chrom_entry) in chromosomes.iter().enumerate() {
-        let chrom_id = cid as u32;
-        let walker_is_on_this_chrom = next_walker_chrom == Some(chrom_id);
-
-        // Per-chrom reference fetcher: opens its own indexed FASTA
-        // reader, serves bases through a 1 MB sliding buffer, drops
-        // at end of scope.
-        let streaming = StreamingChromRefFetcher::for_contig(reference, &chrom_entry.name)
-            .map_err(|e| {
-                VarCallingFromBamCliError::Io(io::Error::other(format!(
-                    "ref fetcher construction failed: {e}"
-                )))
-            })?;
-        // See cohort_driver::process_one_chromosome for the
-        // `Arc<!Sync>` rationale; switching to `Rc` is a tracked
-        // follow-up to the H1 perf fix.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let fetcher: SharedRefFetcher = Arc::new(streaming);
-
-        // Build the per-chrom record iter. When the walker has no
-        // records on this chrom, feed an empty iter — the cohort
-        // pipeline still writes a header-only fragment, matching the
-        // multi-sample `var-calling` flow.
-        let chrom_records: Box<dyn Iterator<Item = Result<PileupRecord, PspReadError>> + '_> =
-            if walker_is_on_this_chrom {
-                Box::new(per_chrom.consume_current_chrom())
-            } else {
-                Box::new(std::iter::empty())
-            };
-        let merger = PerPositionMerger::new(
-            vec![chrom_records],
-            vec![sample_name_owned.clone()],
-            chromosomes.clone(),
-        )?;
-
-        let fragment_path = fragment_paths[cid].clone();
-        let writer_cfg = WriterConfig {
-            output: fragment_path.clone(),
-            ..writer_cfg_template.clone()
-        };
-
-        let stats = drive_cohort_pipeline::<_, VarCallingFromBamCliError>(
-            chrom_id,
-            merger,
-            pipeline_params.clone(),
-            fetcher,
-            &fragment_path,
-            metadata.clone(),
-            writer_cfg,
-        )?;
+    for r in per_chrom_results {
+        let (_cid, stats) = r?;
         total_stats.records_written += stats.records_written;
         total_stats.records_unconverged += stats.records_unconverged;
         total_stats.records_dropped_hom_ref += stats.records_dropped_hom_ref;
         total_stats.records_dropped_low_qual += stats.records_dropped_low_qual;
         total_stats.records_dropped_low_alt_obs += stats.records_dropped_low_alt_obs;
         total_stats.records_dropped_low_mapq_diff_t += stats.records_dropped_low_mapq_diff_t;
-
-        if walker_is_on_this_chrom {
-            next_walker_chrom = per_chrom.open_next_chrom();
-        }
     }
 
-    // Concat fragments in contig-table order into the final output.
-    // `concat_fragments` owns the atomic rename + parent directory
-    // fsync; on Ok the file is durable at `output`.
-    concat_fragments(output, &fragment_paths)?;
-    // frags_dir RAII-drops the scratch TempDir + fragments here.
+    // 11. Concat fragments in contig-table order. `concat_fragments`
+    //     owns the atomic rename + parent directory fsync; on Ok the
+    //     file is durable at `args.output`. `frags_dir` RAII-drops
+    //     the scratch tempdir + fragments here.
+    concat_fragments(&args.output, &fragment_paths)?;
 
-    // Surface walker errors stashed by the ErrorSheddingAdapter.
-    // The pipeline ran to completion, so `<output>` has been
-    // published — retract that publish (publish-then-retract
-    // semantics: we'd rather no file than a truncated one).
-    if let Some(e) = walker_error_handle.take() {
-        let _ = std::fs::remove_file(output);
-        return Err(VarCallingFromBamCliError::Walker(e));
-    }
-
+    // 12. Run summary. Per-Stage-1 `FilterCounts` / `BaqSkipCounts`
+    //     are no longer surfaced because there is no shared
+    //     accumulator across the per-chrom workers; reintroducing
+    //     them would require an explicit cross-worker reducer
+    //     (tracked as a follow-up). The records-emitted summary is
+    //     authoritative for what landed in the VCF.
     let emnoconv_note = if total_stats.records_unconverged > 0 {
         format!(
             " records_emnoconv={} (FILTER=EMNoConv; EM iteration cap)",
@@ -579,9 +439,68 @@ fn run_cohort_pipeline_for_single_sample(
     };
     eprintln!(
         "var-calling-from-bam: sample={} records_emitted={}{}",
-        sample_name_owned, total_stats.records_written, emnoconv_note,
+        sample_name, total_stats.records_written, emnoconv_note,
     );
     Ok(())
+}
+
+/// Open each CRAM once, advance past the file definition and file
+/// header, and return the parsed headers wrapped in `Arc` for
+/// cross-worker sharing. Mirrors what
+/// [`crate::bam::cram_input::CramMergedReader::query`] does
+/// per-worker, lifted to driver-startup time so workers only pay an
+/// `Arc::clone`.
+fn load_per_input_headers(
+    crams: &[PathBuf],
+) -> Result<Vec<Arc<noodles_sam::Header>>, VarCallingFromBamCliError> {
+    use crate::bam::errors::CramInputError;
+
+    let mut headers = Vec::with_capacity(crams.len());
+    for path in crams {
+        let mut reader = noodles_cram::io::reader::Builder::default()
+            .build_from_path(path)
+            .map_err(|source| {
+                PileupCliError::CramInput(CramInputError::OpenFailed {
+                    path: path.clone(),
+                    source,
+                })
+            })?;
+        reader.read_file_definition().map_err(|source| {
+            PileupCliError::CramInput(CramInputError::OpenFailed {
+                path: path.clone(),
+                source,
+            })
+        })?;
+        let header = reader.read_file_header().map_err(|source| {
+            PileupCliError::CramInput(CramInputError::OpenFailed {
+                path: path.clone(),
+                source,
+            })
+        })?;
+        headers.push(Arc::new(header));
+    }
+    Ok(headers)
+}
+
+/// Load each input's alignment index from the canonical sibling
+/// path. Pre-flight (step 0 of `run_var_calling_from_bam`) has
+/// already confirmed each index exists or built one when
+/// `--build-map-file-index` was set, so a failure here is genuinely
+/// I/O.
+fn load_per_input_indexes(
+    crams: &[PathBuf],
+) -> Result<Vec<crate::bam::index_preflight::AlignmentIndex>, VarCallingFromBamCliError> {
+    let mut indexes = Vec::with_capacity(crams.len());
+    for path in crams {
+        let index = crate::bam::index_preflight::load_alignment_index(path).map_err(|source| {
+            VarCallingFromBamCliError::Io(io::Error::other(format!(
+                "failed to load alignment index for '{}': {source}",
+                path.display()
+            )))
+        })?;
+        indexes.push(index);
+    }
+    Ok(indexes)
 }
 
 /// Convert the CRAM-side [`ContigList`] into the .psp-shaped
@@ -660,12 +579,6 @@ fn contigs_to_parsed(
 /// (commit 4) will either drop the per-Stage-1 counter summary
 /// for the parallel path, or aggregate counts across workers via
 /// a separate accumulator.
-// `dead_code` is intentional in commit 3 — this helper lands
-// standalone so its diff is reviewable in isolation; commit 4 of
-// the var-calling-from-bam-per-chromosome plan wires it into
-// `run_var_calling_from_bam` via `rayon::par_iter`, at which point
-// the attribute is removed.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // bundling would obscure the borrow chain
 fn process_one_chromosome_from_bam(
     chrom_id: u32,
@@ -855,9 +768,6 @@ fn process_one_chromosome_from_bam(
 /// `Vec<ParsedChromosome>`. This helper round-trips through the
 /// project's [`ContigList`] shape without losing names or lengths.
 ///
-/// Dead-code-allowed for the same commit-3-only reason as
-/// [`process_one_chromosome_from_bam`].
-#[allow(dead_code)]
 fn all_chromosomes_to_contig_list(chromosomes: &[ParsedChromosome]) -> ContigList {
     ContigList {
         entries: chromosomes
@@ -868,133 +778,6 @@ fn all_chromosomes_to_contig_list(chromosomes: &[ParsedChromosome]) -> ContigLis
                 md5: None,
             })
             .collect(),
-    }
-}
-
-// ---------------------------------------------------------------------
-// PerChromRecordsIter — chunk a coord-sorted record stream by chrom.
-// ---------------------------------------------------------------------
-//
-// The Stage 1 walker emits `PileupRecord`s in coordinate order
-// across the whole CRAM input (all chroms in sequence). To drive
-// `drive_cohort_pipeline` per chrom — which the
-// `cohort_chrom_ref_fetcher_migration` plan requires so the
-// pipeline can use the single-contig `ChromRefFetcher` API — we
-// need to split that one stream into per-chrom sub-streams.
-//
-// This helper does it without buffering: it peeks one record
-// ahead from the upstream, and `consume_current_chrom()` yields a
-// borrowed iterator that stops the moment the next record's
-// `chrom_id` differs. The caller then loops, calling
-// `open_next_chrom()` to advance to the next chrom and again
-// `consume_current_chrom()` for that chrom's records, until
-// `open_next_chrom()` returns `None`.
-//
-// Errors from the upstream propagate through the consumed iter
-// — the upstream's `Err` is yielded as-is so the caller sees the
-// same `Result<PileupRecord, PspReadError>` shape `PerPositionMerger`
-// already expects.
-
-/// Per-chrom view over a coord-sorted record stream. See the
-/// module comment above for the lifecycle.
-pub struct PerChromRecordsIter<I>
-where
-    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
-{
-    upstream: std::iter::Peekable<I>,
-    /// Chrom currently being consumed by `consume_current_chrom`.
-    /// `None` before the first `open_next_chrom()` call and after
-    /// the upstream is exhausted.
-    current_chrom: Option<u32>,
-}
-
-impl<I> PerChromRecordsIter<I>
-where
-    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
-{
-    pub fn new(upstream: I) -> Self {
-        Self {
-            upstream: upstream.peekable(),
-            current_chrom: None,
-        }
-    }
-
-    /// Peek the next upstream record; if there is one, set the
-    /// "current chrom" to its `chrom_id` and return `Some(chrom_id)`.
-    /// Returns `None` when the upstream is exhausted (clean EOF).
-    ///
-    /// If the peeked item is an `Err`, the error is **left in the
-    /// peek slot** so the next `consume_current_chrom().next()`
-    /// returns it to the caller. This keeps error surfacing
-    /// uniform with how the underlying iterator behaves —
-    /// `open_next_chrom` itself never reports errors directly.
-    pub fn open_next_chrom(&mut self) -> Option<u32> {
-        match self.upstream.peek() {
-            Some(Ok(rec)) => {
-                self.current_chrom = Some(rec.chrom_id);
-                self.current_chrom
-            }
-            Some(Err(_)) => {
-                // Leave the error in place for `consume_current_chrom`
-                // to yield. We don't know the chrom_id of the next
-                // valid record, so pretend we're "on" the most
-                // recently seen chrom — the consume iter will yield
-                // the error and then None, the caller loops back to
-                // `open_next_chrom` which sees the iterator drained
-                // and returns None.
-                self.current_chrom
-            }
-            None => {
-                self.current_chrom = None;
-                None
-            }
-        }
-    }
-
-    /// Yield records while their `chrom_id` matches `current_chrom`.
-    /// Returns `None` at the chrom transition, at EOF, or after an
-    /// upstream error has been surfaced. The caller's loop should
-    /// drain this iterator, then call `open_next_chrom()` to advance.
-    pub fn consume_current_chrom(&mut self) -> ConsumeCurrentChromIter<'_, I> {
-        ConsumeCurrentChromIter { parent: self }
-    }
-}
-
-/// Borrowed iterator returned by
-/// [`PerChromRecordsIter::consume_current_chrom`]. Yields records
-/// for the current chrom only.
-pub struct ConsumeCurrentChromIter<'a, I>
-where
-    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
-{
-    parent: &'a mut PerChromRecordsIter<I>,
-}
-
-impl<'a, I> Iterator for ConsumeCurrentChromIter<'a, I>
-where
-    I: Iterator<Item = Result<PileupRecord, PspReadError>>,
-{
-    type Item = Result<PileupRecord, PspReadError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let current = self.parent.current_chrom?;
-        match self.parent.upstream.peek() {
-            Some(Ok(rec)) if rec.chrom_id == current => {
-                // Consume the peeked record and yield it.
-                self.parent.upstream.next()
-            }
-            Some(Ok(_)) => {
-                // Different chrom — stop here so the caller loops.
-                None
-            }
-            Some(Err(_)) => {
-                // Surface the error to the caller; consuming it here
-                // also clears the peek slot so the next
-                // `open_next_chrom` sees the upstream cleanly.
-                self.parent.upstream.next()
-            }
-            None => None,
-        }
     }
 }
 
@@ -1054,129 +837,5 @@ mod tests {
             err,
             VarCallingFromBamCliError::ContigLengthOverflow { .. }
         ));
-    }
-
-    // ---------------------------------------------------------------
-    // PerChromRecordsIter tests
-    // ---------------------------------------------------------------
-
-    use crate::pileup_record::PileupRecord;
-
-    fn record_on(chrom_id: u32, pos: u32) -> PileupRecord {
-        // Use the public constructor and patch chrom_id/pos.
-        // PileupRecord::new takes (chrom_id, pos, alleles), so this
-        // is just a thin convenience.
-        PileupRecord::new(chrom_id, pos, Vec::new())
-    }
-
-    #[test]
-    fn per_chrom_iter_yields_chunked_records() {
-        // Three chroms, sizes 3 / 2 / 1 records. Two outer loops
-        // confirm `open_next_chrom` walks chroms in order and
-        // `consume_current_chrom` yields exactly the records on
-        // each.
-        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
-            Ok(record_on(0, 1)),
-            Ok(record_on(0, 2)),
-            Ok(record_on(0, 3)),
-            Ok(record_on(1, 1)),
-            Ok(record_on(1, 2)),
-            Ok(record_on(2, 1)),
-        ];
-        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
-
-        let mut seen: Vec<(u32, Vec<u32>)> = Vec::new();
-        while let Some(chrom_id) = iter.open_next_chrom() {
-            let positions: Vec<u32> = iter
-                .consume_current_chrom()
-                .map(|r| r.unwrap().pos)
-                .collect();
-            seen.push((chrom_id, positions));
-        }
-        assert_eq!(
-            seen,
-            vec![(0, vec![1, 2, 3]), (1, vec![1, 2]), (2, vec![1])],
-        );
-    }
-
-    #[test]
-    fn per_chrom_iter_handles_single_chrom() {
-        let inputs: Vec<Result<PileupRecord, PspReadError>> =
-            vec![Ok(record_on(7, 100)), Ok(record_on(7, 200))];
-        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
-        assert_eq!(iter.open_next_chrom(), Some(7));
-        let positions: Vec<u32> = iter
-            .consume_current_chrom()
-            .map(|r| r.unwrap().pos)
-            .collect();
-        assert_eq!(positions, vec![100, 200]);
-        assert_eq!(iter.open_next_chrom(), None);
-    }
-
-    #[test]
-    fn per_chrom_iter_handles_empty_input() {
-        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![];
-        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
-        assert_eq!(iter.open_next_chrom(), None);
-    }
-
-    #[test]
-    fn per_chrom_iter_propagates_upstream_error_mid_stream() {
-        // An error mid-stream surfaces through the consumed iter.
-        // The caller looks at the Result; here we just confirm the
-        // error variant escapes the chunker.
-        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
-            Ok(record_on(0, 1)),
-            Err(PspReadError::Io {
-                context: "test",
-                source: std::io::Error::other("test"),
-            }),
-        ];
-        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
-        assert_eq!(iter.open_next_chrom(), Some(0));
-        let mut consumed = iter.consume_current_chrom();
-        // First the OK record.
-        assert_eq!(consumed.next().unwrap().unwrap().pos, 1);
-        // Then the error.
-        let err = consumed.next().unwrap();
-        assert!(err.is_err());
-        // Then EOF on the consume iter.
-        assert!(consumed.next().is_none());
-        // Re-borrow happens implicitly when `consumed` goes out of
-        // scope; no need for an explicit `drop` call (ConsumeCurrentChromIter
-        // is not Drop-impl'd, just a borrow).
-        let _ = consumed;
-        // And `open_next_chrom` returns None after the error path.
-        assert_eq!(iter.open_next_chrom(), None);
-    }
-
-    #[test]
-    fn per_chrom_iter_propagates_upstream_error_at_chrom_transition() {
-        // Error happens right at a chrom transition. The first
-        // chrom's records come through, then the error is yielded
-        // in the next consume cycle.
-        let inputs: Vec<Result<PileupRecord, PspReadError>> = vec![
-            Ok(record_on(0, 1)),
-            Err(PspReadError::Io {
-                context: "test",
-                source: std::io::Error::other("test"),
-            }),
-            Ok(record_on(1, 1)),
-        ];
-        let mut iter = PerChromRecordsIter::new(inputs.into_iter());
-        assert_eq!(iter.open_next_chrom(), Some(0));
-        let chrom0: Vec<_> = iter.consume_current_chrom().collect();
-        // chr0 had one OK record; the error halts the chunk
-        // boundary at the chrom-0 group.
-        assert_eq!(chrom0.len(), 2); // OK + Err in the same group
-        assert!(chrom0[0].is_ok());
-        assert!(chrom0[1].is_err());
-        // After draining, the next open advances to chrom 1.
-        assert_eq!(iter.open_next_chrom(), Some(1));
-        let chrom1_positions: Vec<u32> = iter
-            .consume_current_chrom()
-            .map(|r| r.unwrap().pos)
-            .collect();
-        assert_eq!(chrom1_positions, vec![1]);
     }
 }
