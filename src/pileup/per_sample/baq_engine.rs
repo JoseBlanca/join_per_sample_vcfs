@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
-use crate::fasta::ManualEvictChromRefFetcher;
-use crate::pileup::per_sample::cram_input::{
+use crate::bam::cram_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
+use crate::fasta::ManualEvictChromRefFetcher;
 use crate::pileup::walker::{CigarOp, MateRole, PreparedRead};
 
 use crate::baq::{BaqConfig, ProbalnScratch, probaln_glocal};

@@ -13,15 +13,15 @@ use std::io::BufReader;
 use std::path::PathBuf;
 
 use common::{CONTIG_NAME, build_cram, build_fasta, fixture_md5, read_record};
+use pop_var_caller::bam::cram_input::{
+    DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
+    DEFAULT_MISMATCH_BQ_FLOOR,
+};
 use pop_var_caller::baq::{
     SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
     SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
 };
 use pop_var_caller::pileup::per_sample::baq_stream::DEFAULT_BAQ_CHUNK_SIZE;
-use pop_var_caller::pileup::per_sample::cram_input::{
-    DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
-    DEFAULT_MISMATCH_BQ_FLOOR,
-};
 use pop_var_caller::pileup::walker::{
     DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,

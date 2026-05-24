@@ -26,7 +26,7 @@ use std::rc::Rc;
 /// (one `Rc::clone` per handle).
 ///
 /// Generic over the error type `E` — typically
-/// [`CramInputError`](crate::pileup::per_sample::errors::CramInputError)
+/// [`CramInputError`](crate::bam::errors::CramInputError)
 /// for the Stage 1 CRAM-input seam or
 /// [`WalkerError`](crate::pileup::walker::WalkerError) for
 /// the from-bam walker shim.
@@ -124,7 +124,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::pileup::per_sample::errors::CramInputError;
+    use crate::bam::errors::CramInputError;
     use crate::pileup::walker::CigarOp;
     use crate::pileup::walker::{MateRole, PreparedRead};
 

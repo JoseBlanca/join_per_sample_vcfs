@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
+use crate::bam::cram_input::{CramMergedReaderConfig, FilterCounts};
+use crate::bam::errors::CramInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::ContigList;
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
-use crate::pileup::per_sample::cram_input::{CramMergedReaderConfig, FilterCounts};
-use crate::pileup::per_sample::errors::CramInputError;
 use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
 use crate::pileup::walker::{RunSummary, WalkerConfig};
 use crate::pop_var_caller::common::{
@@ -472,15 +472,15 @@ fn print_run_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bam::cram_input::{
+        DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
+        DEFAULT_MISMATCH_BQ_FLOOR,
+    };
     use crate::baq::{
         SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
         SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
     };
     use crate::pileup::per_sample::baq_stream::DEFAULT_BAQ_CHUNK_SIZE;
-    use crate::pileup::per_sample::cram_input::{
-        DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
-        DEFAULT_MISMATCH_BQ_FLOOR,
-    };
     use crate::pileup::walker::{
         DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
         DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,

@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bam;
 pub mod baq;
 pub mod fasta;
 pub mod iter_ext;

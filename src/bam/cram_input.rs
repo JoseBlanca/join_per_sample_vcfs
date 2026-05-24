@@ -12,9 +12,9 @@ use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
+use crate::bam::errors::CramInputError;
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
-use crate::pileup::per_sample::errors::CramInputError;
 use crate::pileup::walker::CigarOp;
 
 // ---------------------------------------------------------------------

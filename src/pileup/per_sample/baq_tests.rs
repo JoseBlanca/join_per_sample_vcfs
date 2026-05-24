@@ -204,10 +204,10 @@ fn parity_realn02() {
 // BaqEngine driver tests — synthetic MappedReads, no SAM parsing.
 // ---------------------------------------------------------------------
 
-use crate::fasta::ManualEvictChromRefFetcher;
-use crate::pileup::per_sample::cram_input::{
+use crate::bam::cram_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
+use crate::fasta::ManualEvictChromRefFetcher;
 use crate::pileup::walker::MateRole;
 
 use super::baq_engine::{BaqEngine, BaqOutcome, BaqSkipReason};
@@ -710,7 +710,7 @@ fn baq_skip_counts_bump_is_exhaustive_per_variant() {
 // BaqStream — rayon-parallel adapter tests.
 // ---------------------------------------------------------------------
 
-use crate::pileup::per_sample::errors::CramInputError;
+use crate::bam::errors::CramInputError;
 use crate::pileup::walker::PreparedRead;
 
 use super::baq_stream::BaqStream;

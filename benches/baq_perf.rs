@@ -23,12 +23,12 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
+use pop_var_caller::bam::cram_input::MappedRead;
+use pop_var_caller::bam::errors::CramInputError;
 use pop_var_caller::baq::BaqConfig;
 use pop_var_caller::fasta::{ContigEntry, ContigList, ManualEvictChromRefFetcher};
 use pop_var_caller::pileup::per_sample::baq_engine::{BaqEngine, BaqOutcome};
 use pop_var_caller::pileup::per_sample::baq_stream::{BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
-use pop_var_caller::pileup::per_sample::cram_input::MappedRead;
-use pop_var_caller::pileup::per_sample::errors::CramInputError;
 use pop_var_caller::pileup::walker::CigarOp;
 
 /// Write a single-contig FASTA + `.fai` to `dir`. Contig is `length`

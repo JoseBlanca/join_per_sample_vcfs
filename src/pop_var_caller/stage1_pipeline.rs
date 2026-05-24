@@ -17,14 +17,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::bam::cram_input::{CramMergedReader, CramMergedReaderConfig, FilterCounts};
+use crate::bam::errors::CramInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
 use crate::pileup::per_sample::baq_engine::prepare_passthrough;
 use crate::pileup::per_sample::baq_stream::{BaqSkipCounts, BaqStream};
-use crate::pileup::per_sample::cram_input::{
-    CramMergedReader, CramMergedReaderConfig, FilterCounts,
-};
-use crate::pileup::per_sample::errors::CramInputError;
 use crate::pileup::walker::{self, PileupWalker, PreparedRead, WalkerConfig};
 
 use super::cli::PileupCliError;
@@ -242,7 +240,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pileup::per_sample::errors::CramInputError;
+    use crate::bam::errors::CramInputError;
 
     /// On success, the closure result is preserved and the stash (if
     /// any) is handed back to the caller.

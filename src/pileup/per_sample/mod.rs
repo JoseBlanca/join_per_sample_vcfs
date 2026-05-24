@@ -13,13 +13,12 @@
 //! algorithm core lives at [`crate::baq`]; the walker algorithm at
 //! [`crate::pileup::walker`]; the per-position record data model at
 //! [`crate::pileup_record`]; the on-disk `.psp` format at
-//! [`crate::psp`]; and the reference-FASTA fetchers and `ContigList`
-//! at [`crate::fasta`].
+//! [`crate::psp`]; the reference-FASTA fetchers and `ContigList` at
+//! [`crate::fasta`]; and the mapped-read input slice (CRAM reader,
+//! typed CRAM-input errors) at [`crate::bam`].
 
 pub mod baq_engine;
 pub mod baq_stream;
-pub mod cram_input;
-pub mod errors;
 pub mod pileup_to_psp;
 
 #[cfg(test)]

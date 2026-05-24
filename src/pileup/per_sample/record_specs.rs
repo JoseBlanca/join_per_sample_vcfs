@@ -19,7 +19,7 @@ use noodles_sam::alignment::record_buf::QualityScores;
 use noodles_sam::alignment::record_buf::RecordBuf;
 use noodles_sam::alignment::record_buf::Sequence;
 
-use super::cram_input::OpenCram;
+use crate::bam::cram_input::OpenCram;
 use crate::fasta::{ContigEntry, ContigList};
 use crate::pileup::walker::CigarOp;
 
