@@ -1,4 +1,6 @@
-//! Errors produced by the per-sample pileup's CRAM input slice.
+//! Errors produced by the per-sample pileup's alignment-file input
+//! slice (CRAM today; BAM support tracked in
+//! `doc/devel/implementation_plans/bam_input_support.md`).
 //!
 //! See `ia/specs/per_sample_pileup.md` §"Errors" for the catalogue of
 //! failure modes this enum covers.
@@ -8,7 +10,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum CramInputError {
+pub enum AlignmentInputError {
     #[error("at least one CRAM input is required")]
     NoInputs,
 
@@ -124,7 +126,7 @@ pub enum CramInputError {
         source: std::io::Error,
     },
 
-    /// `CramMergedReader::query` was asked for a contig name that
+    /// `AlignmentMergedReader::query` was asked for a contig name that
     /// the canonical contig list does not carry. Programmer error
     /// at the call site (the canonical list comes from a prior
     /// validation pass; the caller is expected to query contigs
@@ -139,7 +141,7 @@ pub enum CramInputError {
         known_contigs: usize,
     },
 
-    /// `CramMergedReader::query` was given a `headers` or `indexes`
+    /// `AlignmentMergedReader::query` was given a `headers` or `indexes`
     /// slice whose length does not match `crams.len()`.
     #[error("per-input handle count mismatch: {crams} crams, {headers} headers, {indexes} indexes")]
     PerInputHandleCountMismatch {

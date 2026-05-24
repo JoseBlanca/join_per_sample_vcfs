@@ -27,7 +27,7 @@
 
 use clap::Args;
 
-use crate::bam::cram_input::{
+use crate::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
     DEFAULT_MISMATCH_BQ_FLOOR,
 };

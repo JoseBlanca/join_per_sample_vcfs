@@ -1,8 +1,13 @@
-//! CRAM input slice: header validation, peek-and-scan merge, per-read
-//! filter cascade.
+//! Alignment-file input: header validation, peek-and-scan merge,
+//! per-read filter cascade. Format-agnostic at the merge/filter
+//! seam; per-input record-stream decoding (currently CRAM-only,
+//! inlined below) is the format-specific surface.
 //!
-//! See `ia/feature_implementation_plans/per_sample_caller_cram_input.md`
-//! for the design rationale.
+//! The CRAM-specific design rationale lives in
+//! `doc/devel/implementation_plans/per_sample_caller_cram_input.md`;
+//! the BAM extension plan that motivated lifting the merger out of
+//! the CRAM-named module lives in
+//! `doc/devel/implementation_plans/bam_input_support.md`.
 
 use std::fs::File;
 use std::io::{self, SeekFrom};
@@ -13,7 +18,7 @@ use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
-use crate::bam::errors::CramInputError;
+use crate::bam::errors::AlignmentInputError;
 use crate::bam::index_preflight::AlignmentIndex;
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
@@ -32,14 +37,14 @@ use crate::pileup::walker::CigarOp;
 /// convention.
 pub const DEFAULT_MIN_MAPQ: u8 = 20;
 
-/// Default for `CramMergedReaderConfig::max_read_mismatch_fraction`.
+/// Default for `AlignmentMergedReaderConfig::max_read_mismatch_fraction`.
 /// 10% — comfortably outside the ~0.5-1% mismatch rate of normal
 /// Illumina at MAPQ 20+, inside the regime where adapter-runthrough,
 /// contamination, and chimeric tails live. See finding `F1` in
 /// `ia/reviews/pileup_freebayes_comparison_2026-05-08.md`.
 pub const DEFAULT_MAX_READ_MISMATCH_FRACTION: f32 = 0.10;
 
-/// Default for `CramMergedReaderConfig::mismatch_bq_floor`. Matches
+/// Default for `AlignmentMergedReaderConfig::mismatch_bq_floor`. Matches
 /// freebayes' `BQL2`. Mismatches whose raw base quality is below this
 /// floor do not count toward the mismatch fraction — keeps the filter
 /// from firing on genuinely low-quality bases (which the downstream
@@ -115,7 +120,7 @@ pub struct FilterCounts {
     pub low_mapq: u64,
     pub too_short: u64,
     /// Reads dropped because their `M`-op mismatch fraction exceeded
-    /// `CramMergedReaderConfig::max_read_mismatch_fraction`. See
+    /// `AlignmentMergedReaderConfig::max_read_mismatch_fraction`. See
     /// finding `F1` in
     /// `ia/reviews/pileup_freebayes_comparison_2026-05-08.md`.
     pub high_mismatch_fraction: u64,
@@ -160,7 +165,7 @@ pub struct FilterCounts {
 /// document a strong reason and a redesign of the walker contract
 /// before diverging.
 #[derive(Debug, Clone, Copy)]
-pub struct CramMergedReaderConfig {
+pub struct AlignmentMergedReaderConfig {
     /// `None` = no minimum; `Some(n)` = drop reads with MAPQ < n.
     pub min_mapq: Option<u8>,
     /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
@@ -193,7 +198,7 @@ pub struct CramMergedReaderConfig {
     /// mismatch counts). Only meaningful when
     /// `max_read_mismatch_fraction` is `Some`.
     ///
-    /// At the `cram_input` stage the BQ is the raw value from the
+    /// At the `alignment_input` stage the BQ is the raw value from the
     /// CRAM, *not* BAQ-adjusted (BAQ runs in a later stage). Filtering
     /// on raw BQ is the correct level for this filter — we are
     /// rejecting whole reads, not per-base evidence, and want to do
@@ -214,7 +219,7 @@ pub const FLAG_QC_FAIL: u16 = 0x200;
 pub const FLAG_DUPLICATE: u16 = 0x400;
 pub const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-impl Default for CramMergedReaderConfig {
+impl Default for AlignmentMergedReaderConfig {
     fn default() -> Self {
         Self {
             min_mapq: Some(DEFAULT_MIN_MAPQ),
@@ -237,7 +242,7 @@ impl Default for CramMergedReaderConfig {
 /// `pub(crate)` on purpose — `RecordBuf` is a noodles type, and
 /// exposing it on a public type would re-couple our public API to
 /// noodles. Tests live in the same crate, so `pub(crate)` is enough.
-pub(crate) struct OpenCram {
+pub(crate) struct OpenAlignmentFile {
     pub path: PathBuf,
     pub records: Box<dyn Iterator<Item = io::Result<sam::alignment::RecordBuf>> + Send>,
 }
@@ -473,14 +478,17 @@ struct CramHeader {
 }
 
 /// Pull `@HD SO`, `@SQ` list, and the (single) `@RG SM` value out of a
-/// `sam::Header`. Returns `CramInputError` if any required invariant
+/// `sam::Header`. Returns `AlignmentInputError` if any required invariant
 /// fails: SO != coordinate, missing SM, multiple distinct SMs in the
 /// same file.
-fn extract_header(path: &Path, sam_header: &sam::Header) -> Result<CramHeader, CramInputError> {
+fn extract_header(
+    path: &Path,
+    sam_header: &sam::Header,
+) -> Result<CramHeader, AlignmentInputError> {
     // Sort order.
     let sort_order = sort_order_string(sam_header);
     if sort_order.as_deref() != Some("coordinate") {
-        return Err(CramInputError::NotCoordinateSorted {
+        return Err(AlignmentInputError::NotCoordinateSorted {
             path: path.to_path_buf(),
             sort_order: sort_order.unwrap_or_else(|| "<missing>".into()),
         });
@@ -518,7 +526,7 @@ fn md5_from_reference_sequence(
     ref_seq_map: &sam::header::record::value::Map<
         sam::header::record::value::map::ReferenceSequence,
     >,
-) -> Result<Option<[u8; 16]>, CramInputError> {
+) -> Result<Option<[u8; 16]>, AlignmentInputError> {
     use noodles_sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
     let Some(raw) = ref_seq_map.other_fields().get(&MD5_CHECKSUM) else {
         return Ok(None);
@@ -526,7 +534,7 @@ fn md5_from_reference_sequence(
     let bytes = raw.as_ref();
     decode_md5_hex(bytes)
         .map(Some)
-        .ok_or_else(|| CramInputError::MalformedMd5 {
+        .ok_or_else(|| AlignmentInputError::MalformedMd5 {
             path: path.to_path_buf(),
             contig: contig_name.to_string(),
             detail: if bytes.len() != 32 {
@@ -562,24 +570,22 @@ fn hex_nibble(b: u8) -> Option<u8> {
 fn extract_single_sample_name(
     path: &Path,
     sam_header: &sam::Header,
-) -> Result<String, CramInputError> {
+) -> Result<String, AlignmentInputError> {
     use noodles_sam::header::record::value::map::read_group::tag::SAMPLE;
     let mut current: Option<(String, String)> = None;
     for (rg_id_bstr, rg_map) in sam_header.read_groups() {
         let rg_id = String::from_utf8_lossy(rg_id_bstr.as_ref()).into_owned();
-        let sm_raw =
-            rg_map
-                .other_fields()
-                .get(&SAMPLE)
-                .ok_or_else(|| CramInputError::MissingSampleTag {
-                    path: path.to_path_buf(),
-                    read_group_id: rg_id.clone(),
-                })?;
+        let sm_raw = rg_map.other_fields().get(&SAMPLE).ok_or_else(|| {
+            AlignmentInputError::MissingSampleTag {
+                path: path.to_path_buf(),
+                read_group_id: rg_id.clone(),
+            }
+        })?;
         let sm = String::from_utf8_lossy(sm_raw.as_ref()).into_owned();
         match &current {
             None => current = Some((rg_id, sm)),
             Some((existing_rg, existing_sm)) if existing_sm != &sm => {
-                return Err(CramInputError::MultipleSampleNamesInFile {
+                return Err(AlignmentInputError::MultipleSampleNamesInFile {
                     path: path.to_path_buf(),
                     rg_a: existing_rg.clone(),
                     sm_a: existing_sm.clone(),
@@ -592,7 +598,7 @@ fn extract_single_sample_name(
     }
     current
         .map(|(_, sm)| sm)
-        .ok_or_else(|| CramInputError::MissingSampleTag {
+        .ok_or_else(|| AlignmentInputError::MissingSampleTag {
             path: path.to_path_buf(),
             read_group_id: "<no @RG entries>".into(),
         })
@@ -609,21 +615,22 @@ fn validate_fasta_agreement(
     fasta_path: &Path,
     canonical_contigs: &ContigList,
     cram_path: &Path,
-) -> Result<(), CramInputError> {
+) -> Result<(), AlignmentInputError> {
     let fai_path = with_fai_extension(fasta_path);
     if !fai_path.exists() {
-        return Err(CramInputError::MissingFastaIndex {
+        return Err(AlignmentInputError::MissingFastaIndex {
             fasta_path: fasta_path.to_path_buf(),
         });
     }
-    let index = noodles_fasta::fai::fs::read(&fai_path).map_err(|source| CramInputError::Io {
-        path: fai_path.clone(),
-        source,
-    })?;
+    let index =
+        noodles_fasta::fai::fs::read(&fai_path).map_err(|source| AlignmentInputError::Io {
+            path: fai_path.clone(),
+            source,
+        })?;
     let fai_records: &[noodles_fasta::fai::Record] = index.as_ref();
 
     if fai_records.len() != canonical_contigs.entries.len() {
-        return Err(CramInputError::FastaContigMismatch {
+        return Err(AlignmentInputError::FastaContigMismatch {
             fasta_path: fasta_path.to_path_buf(),
             cram_path: cram_path.to_path_buf(),
             detail: format!(
@@ -640,7 +647,7 @@ fn validate_fasta_agreement(
     {
         let fai_name = String::from_utf8_lossy(fai_record.name().as_ref()).into_owned();
         if fai_name != contig.name {
-            return Err(CramInputError::FastaContigMismatch {
+            return Err(AlignmentInputError::FastaContigMismatch {
                 fasta_path: fasta_path.to_path_buf(),
                 cram_path: cram_path.to_path_buf(),
                 detail: format!(
@@ -651,7 +658,7 @@ fn validate_fasta_agreement(
         }
         let fai_length: u64 = fai_record.length();
         if fai_length != contig.length {
-            return Err(CramInputError::FastaContigMismatch {
+            return Err(AlignmentInputError::FastaContigMismatch {
                 fasta_path: fasta_path.to_path_buf(),
                 cram_path: cram_path.to_path_buf(),
                 detail: format!(
@@ -671,7 +678,7 @@ fn with_fai_extension(fasta_path: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------
-// CramMergedReader
+// AlignmentMergedReader
 // ---------------------------------------------------------------------
 
 /// A genome location: index into the merged `ContigList` and 1-based
@@ -704,12 +711,12 @@ struct ReadFingerprintWithSourceFile {
 type CramRecordsIter = Box<dyn Iterator<Item = io::Result<sam::alignment::RecordBuf>> + Send>;
 type CramPeekable = BufferedPeekable<CramRecordsIter, sam::alignment::RecordBuf, io::Error>;
 
-pub struct CramMergedReader {
+pub struct AlignmentMergedReader {
     record_streams: Vec<CramPeekable>,
     paths: Vec<PathBuf>,
     contigs: ContigList,
     sample_name: String,
-    config: CramMergedReaderConfig,
+    config: AlignmentMergedReaderConfig,
     /// FASTA repository for the F1 mismatch-fraction filter. `None`
     /// disables that filter regardless of `config.max_read_mismatch_fraction`
     /// — only relevant for in-memory test fixtures that do not have a
@@ -749,26 +756,26 @@ pub struct CramMergedReader {
     fused: bool,
 }
 
-impl CramMergedReader {
+impl AlignmentMergedReader {
     pub fn new(
         crams: &[PathBuf],
         fasta: &Path,
-        config: CramMergedReaderConfig,
-    ) -> Result<Self, CramInputError> {
+        config: AlignmentMergedReaderConfig,
+    ) -> Result<Self, AlignmentInputError> {
         if crams.is_empty() {
-            return Err(CramInputError::NoInputs);
+            return Err(AlignmentInputError::NoInputs);
         }
 
         // FASTA repository — built once and shared across decoders.
         let fai_path = with_fai_extension(fasta);
         if !fai_path.exists() {
-            return Err(CramInputError::MissingFastaIndex {
+            return Err(AlignmentInputError::MissingFastaIndex {
                 fasta_path: fasta.to_path_buf(),
             });
         }
         let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
             .build_from_path(fasta)
-            .map_err(|source| CramInputError::Io {
+            .map_err(|source| AlignmentInputError::Io {
                 path: fasta.to_path_buf(),
                 source,
             })?;
@@ -777,7 +784,7 @@ impl CramMergedReader {
 
         // Open every CRAM, validate per-file invariants, and collect
         // per-file headers.
-        let mut open_crams: Vec<OpenCram> = Vec::with_capacity(crams.len());
+        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(crams.len());
         let mut canonical_contigs: Option<ContigList> = None;
         let mut canonical_sample: Option<String> = None;
         let mut reference_cram_path: Option<PathBuf> = None;
@@ -786,7 +793,7 @@ impl CramMergedReader {
             let mut noodles_cram_reader = cram::io::reader::Builder::default()
                 .set_reference_sequence_repository(repository.clone())
                 .build_from_path(cram_path)
-                .map_err(|source| CramInputError::OpenFailed {
+                .map_err(|source| AlignmentInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
                 })?;
@@ -795,13 +802,13 @@ impl CramMergedReader {
             // before any container is decoded.
             let file_definition = noodles_cram_reader
                 .read_file_definition()
-                .map_err(|source| CramInputError::OpenFailed {
+                .map_err(|source| AlignmentInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
                 })?;
             let version = file_definition.version();
             if version.major() != 3 {
-                return Err(CramInputError::UnsupportedCramVersion {
+                return Err(AlignmentInputError::UnsupportedCramVersion {
                     path: cram_path.clone(),
                     major: version.major(),
                     minor: version.minor(),
@@ -809,7 +816,7 @@ impl CramMergedReader {
             }
 
             let noodles_sam_header = noodles_cram_reader.read_file_header().map_err(|source| {
-                CramInputError::OpenFailed {
+                AlignmentInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
                 }
@@ -825,7 +832,7 @@ impl CramMergedReader {
                 }
                 Some(existing) => {
                     if let Err(detail) = existing.first_disagreement(&cram_header.contigs) {
-                        return Err(CramInputError::ContigListMismatch {
+                        return Err(AlignmentInputError::ContigListMismatch {
                             reference_path: reference_cram_path.clone().expect(
                                 "reference_cram_path is set when canonical_contigs is Some",
                             ),
@@ -838,7 +845,7 @@ impl CramMergedReader {
             match &canonical_sample {
                 None => canonical_sample = Some(cram_header.sample_name.clone()),
                 Some(existing) if existing != &cram_header.sample_name => {
-                    return Err(CramInputError::MultipleSampleNames {
+                    return Err(AlignmentInputError::MultipleSampleNames {
                         path_a: reference_cram_path
                             .clone()
                             .expect("reference_cram_path is set when canonical_sample is Some"),
@@ -851,7 +858,7 @@ impl CramMergedReader {
             }
 
             // Build the owned record iterator and pack it into an
-            // `OpenCram`. The reader and header are moved into the
+            // `OpenAlignmentFile`. The reader and header are moved into the
             // owned iterator — neither escapes from this scope.
             let owned_records: CramRecordsIter = Box::new(OwnedCramRecords {
                 reader: noodles_cram_reader,
@@ -861,7 +868,7 @@ impl CramMergedReader {
                 pending: Vec::new().into_iter(),
                 eof_latched: false,
             });
-            open_crams.push(OpenCram {
+            open_crams.push(OpenAlignmentFile {
                 path: cram_path.clone(),
                 records: owned_records,
             });
@@ -901,12 +908,12 @@ impl CramMergedReader {
     /// build CRAM records in memory and have no reference). The
     /// production `new()` always passes `Some`.
     pub(crate) fn from_open_crams(
-        open_crams: Vec<OpenCram>,
+        open_crams: Vec<OpenAlignmentFile>,
         contigs: ContigList,
         sample_name: String,
-        config: CramMergedReaderConfig,
+        config: AlignmentMergedReaderConfig,
         repository: Option<fasta::Repository>,
-    ) -> Result<Self, CramInputError> {
+    ) -> Result<Self, AlignmentInputError> {
         let n = open_crams.len();
         let mut record_streams = Vec::with_capacity(n);
         let mut paths = Vec::with_capacity(n);
@@ -970,15 +977,15 @@ impl CramMergedReader {
     ///
     /// # Errors
     ///
-    /// - [`CramInputError::NoInputs`] — `crams` is empty.
-    /// - [`CramInputError::PerInputHandleCountMismatch`] —
+    /// - [`AlignmentInputError::NoInputs`] — `crams` is empty.
+    /// - [`AlignmentInputError::PerInputHandleCountMismatch`] —
     ///   `headers.len()` or `indexes.len()` disagree with
     ///   `crams.len()`.
-    /// - [`CramInputError::MissingFastaIndex`] — `<fasta>.fai` is
+    /// - [`AlignmentInputError::MissingFastaIndex`] — `<fasta>.fai` is
     ///   not present next to `fasta`.
-    /// - [`CramInputError::ContigNotInList`] — `contig_name` is
+    /// - [`AlignmentInputError::ContigNotInList`] — `contig_name` is
     ///   not present in `contigs`.
-    /// - [`CramInputError::OpenFailed`] / [`CramInputError::Io`] —
+    /// - [`AlignmentInputError::OpenFailed`] / [`AlignmentInputError::Io`] —
     ///   any underlying CRAM or FASTA I/O failure during open.
     #[allow(clippy::too_many_arguments)]
     pub fn query(
@@ -989,13 +996,13 @@ impl CramMergedReader {
         headers: &[Arc<sam::Header>],
         indexes: &[AlignmentIndex],
         contig_name: &str,
-        config: CramMergedReaderConfig,
-    ) -> Result<Self, CramInputError> {
+        config: AlignmentMergedReaderConfig,
+    ) -> Result<Self, AlignmentInputError> {
         if crams.is_empty() {
-            return Err(CramInputError::NoInputs);
+            return Err(AlignmentInputError::NoInputs);
         }
         if headers.len() != crams.len() || indexes.len() != crams.len() {
-            return Err(CramInputError::PerInputHandleCountMismatch {
+            return Err(AlignmentInputError::PerInputHandleCountMismatch {
                 crams: crams.len(),
                 headers: headers.len(),
                 indexes: indexes.len(),
@@ -1006,7 +1013,7 @@ impl CramMergedReader {
             .entries
             .iter()
             .position(|c| c.name == contig_name)
-            .ok_or_else(|| CramInputError::ContigNotInList {
+            .ok_or_else(|| AlignmentInputError::ContigNotInList {
                 contig: contig_name.to_string(),
                 known_contigs: contigs.entries.len(),
             })?;
@@ -1017,13 +1024,13 @@ impl CramMergedReader {
         // that is not shareable across threads.
         let fai_path = with_fai_extension(fasta);
         if !fai_path.exists() {
-            return Err(CramInputError::MissingFastaIndex {
+            return Err(AlignmentInputError::MissingFastaIndex {
                 fasta_path: fasta.to_path_buf(),
             });
         }
         let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
             .build_from_path(fasta)
-            .map_err(|source| CramInputError::Io {
+            .map_err(|source| AlignmentInputError::Io {
                 path: fasta.to_path_buf(),
                 source,
             })?;
@@ -1031,14 +1038,14 @@ impl CramMergedReader {
         let repository = fasta::Repository::new(adapter);
 
         // One indexed iterator per input.
-        let mut open_crams: Vec<OpenCram> = Vec::with_capacity(crams.len());
+        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(crams.len());
         for ((cram_path, header), alignment_index) in
             crams.iter().zip(headers.iter()).zip(indexes.iter())
         {
             let mut noodles_cram_reader = cram::io::reader::Builder::default()
                 .set_reference_sequence_repository(repository.clone())
                 .build_from_path(cram_path)
-                .map_err(|source| CramInputError::OpenFailed {
+                .map_err(|source| AlignmentInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
                 })?;
@@ -1049,12 +1056,12 @@ impl CramMergedReader {
             // header via the caller's `Arc<sam::Header>`.
             noodles_cram_reader
                 .read_file_definition()
-                .map_err(|source| CramInputError::OpenFailed {
+                .map_err(|source| AlignmentInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
                 })?;
             noodles_cram_reader.read_file_header().map_err(|source| {
-                CramInputError::OpenFailed {
+                AlignmentInputError::OpenFailed {
                     path: cram_path.clone(),
                     source,
                 }
@@ -1074,7 +1081,7 @@ impl CramMergedReader {
                 pending: Vec::new().into_iter(),
                 eof_latched: false,
             });
-            open_crams.push(OpenCram {
+            open_crams.push(OpenAlignmentFile {
                 path: cram_path.clone(),
                 records: owned_records,
             });
@@ -1096,8 +1103,8 @@ impl CramMergedReader {
 /// §"Errors") and lets callers use the iterator with any consumer
 /// (`for`, `collect`, `try_fold`) without separate "stop on first
 /// error" bookkeeping.
-impl Iterator for CramMergedReader {
-    type Item = Result<MappedRead, CramInputError>;
+impl Iterator for AlignmentMergedReader {
+    type Item = Result<MappedRead, AlignmentInputError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.fused {
@@ -1125,7 +1132,7 @@ impl Iterator for CramMergedReader {
             if let Some((prev_ref, prev_pos)) = self.per_file_prev_locus[chosen_idx]
                 && (head.ref_id, head.pos) < (prev_ref, prev_pos)
             {
-                return self.fail(CramInputError::OutOfOrderRead {
+                return self.fail(AlignmentInputError::OutOfOrderRead {
                     path: self.paths[chosen_idx].clone(),
                     qname: String::from_utf8_lossy(&head.qname).into_owned(),
                     prev_ref_id: prev_ref,
@@ -1153,7 +1160,7 @@ impl Iterator for CramMergedReader {
                 .find(|entry| entry.key == new_key)
             {
                 let other_path = self.paths[other.source_file_index].clone();
-                return self.fail(CramInputError::DuplicateReadAcrossFiles {
+                return self.fail(AlignmentInputError::DuplicateReadAcrossFiles {
                     qname: String::from_utf8_lossy(&new_key.qname).into_owned(),
                     path_a: other_path,
                     path_b: self.paths[chosen_idx].clone(),
@@ -1166,7 +1173,7 @@ impl Iterator for CramMergedReader {
             let record = match self.record_streams[chosen_idx].next() {
                 Some(Ok(rb)) => rb,
                 Some(Err(e)) => {
-                    return self.fail(CramInputError::MalformedRecord {
+                    return self.fail(AlignmentInputError::MalformedRecord {
                         path: self.paths[chosen_idx].clone(),
                         qname: Some(String::from_utf8_lossy(&head.qname).into_owned()),
                         source: e,
@@ -1192,7 +1199,7 @@ impl Iterator for CramMergedReader {
             let mut mapped = match record_buf_to_mapped_read(&record, chosen_idx) {
                 Ok(m) => m,
                 Err(e) => {
-                    return self.fail(CramInputError::MalformedRecord {
+                    return self.fail(AlignmentInputError::MalformedRecord {
                         path: self.paths[chosen_idx].clone(),
                         qname: Some(String::from_utf8_lossy(&head.qname).into_owned()),
                         source: e,
@@ -1273,10 +1280,10 @@ impl Iterator for CramMergedReader {
     }
 }
 
-impl std::iter::FusedIterator for CramMergedReader {}
+impl std::iter::FusedIterator for AlignmentMergedReader {}
 
-impl CramMergedReader {
-    fn fail(&mut self, e: CramInputError) -> Option<<Self as Iterator>::Item> {
+impl AlignmentMergedReader {
+    fn fail(&mut self, e: AlignmentInputError) -> Option<<Self as Iterator>::Item> {
         self.fused = true;
         Some(Err(e))
     }
@@ -1343,7 +1350,7 @@ impl CramMergedReader {
         }
     }
 
-    fn refill_heads(&mut self) -> Result<(), CramInputError> {
+    fn refill_heads(&mut self) -> Result<(), AlignmentInputError> {
         let config = self.config;
         for idx in 0..self.record_streams.len() {
             loop {
@@ -1351,7 +1358,7 @@ impl CramMergedReader {
                     Ok(Some(rb)) => classify_pre_decode(&config, rb),
                     Ok(None) => break,
                     Err(e) => {
-                        return Err(CramInputError::MalformedRecord {
+                        return Err(AlignmentInputError::MalformedRecord {
                             path: self.paths[idx].clone(),
                             qname: None,
                             source: e,
@@ -1377,7 +1384,7 @@ impl CramMergedReader {
     /// record stream is exhausted (peek is None at this point — should not
     /// happen between `refill_heads` and `argmin_head`, but treat
     /// defensively).
-    fn peek_head_keys(&mut self, idx: usize) -> Result<Option<HeadKey>, CramInputError> {
+    fn peek_head_keys(&mut self, idx: usize) -> Result<Option<HeadKey>, AlignmentInputError> {
         match self.record_streams[idx].peek() {
             Ok(Some(rb)) => match head_key(rb) {
                 Some(key) => Ok(Some(key)),
@@ -1394,7 +1401,7 @@ impl CramMergedReader {
                     let qname = rb
                         .name()
                         .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned());
-                    Err(CramInputError::MalformedRecord {
+                    Err(AlignmentInputError::MalformedRecord {
                         path: self.paths[idx].clone(),
                         qname,
                         source: io::Error::new(
@@ -1405,7 +1412,7 @@ impl CramMergedReader {
                 }
             },
             Ok(None) => Ok(None),
-            Err(e) => Err(CramInputError::MalformedRecord {
+            Err(e) => Err(AlignmentInputError::MalformedRecord {
                 path: self.paths[idx].clone(),
                 qname: None,
                 source: e,
@@ -1446,7 +1453,7 @@ impl CramMergedReader {
 }
 
 fn classify_pre_decode(
-    config: &CramMergedReaderConfig,
+    config: &AlignmentMergedReaderConfig,
     rb: &sam::alignment::RecordBuf,
 ) -> PreDecodeOutcome {
     let flag = rb.flags().bits();
@@ -1468,7 +1475,7 @@ fn classify_pre_decode(
     }
     // 3. Supplementary (~1-5%) — unconditionally dropped; see the
     //    "Why no drop_secondary / drop_supplementary toggles" note
-    //    on `CramMergedReaderConfig`.
+    //    on `AlignmentMergedReaderConfig`.
     if (flag & FLAG_SUPPLEMENTARY) != 0 {
         return PreDecodeOutcome::Drop(FilterBucket::Supplementary);
     }
@@ -1531,7 +1538,7 @@ pub(super) enum FilterBucket {
     LowMapq,
     /// Bucket for reads the BAQ stage refused — incremented by the
     /// pipeline integration in a later commit; no call site in
-    /// `cram_input` itself today.
+    /// `alignment_input` itself today.
     #[allow(dead_code)]
     BaqRejected,
 }
@@ -2113,7 +2120,7 @@ mod tests {
 
     #[test]
     fn p2_malformed_record_message_omits_empty_qname() {
-        let with_qname = CramInputError::MalformedRecord {
+        let with_qname = AlignmentInputError::MalformedRecord {
             path: PathBuf::from("/foo.cram"),
             qname: Some("R1".into()),
             source: io::Error::new(io::ErrorKind::InvalidData, "bad"),
@@ -2123,7 +2130,7 @@ mod tests {
             "got {}",
             with_qname
         );
-        let no_qname = CramInputError::MalformedRecord {
+        let no_qname = AlignmentInputError::MalformedRecord {
             path: PathBuf::from("/foo.cram"),
             qname: None,
             source: io::Error::new(io::ErrorKind::InvalidData, "bad"),
@@ -2175,8 +2182,8 @@ mod tests {
     // --- Group A: via from_open_crams --------------------------------
 
     fn run_to_completion(
-        mut reader: CramMergedReader,
-    ) -> (Vec<MappedRead>, FilterCounts, Option<CramInputError>) {
+        mut reader: AlignmentMergedReader,
+    ) -> (Vec<MappedRead>, FilterCounts, Option<AlignmentInputError>) {
         let mut out = Vec::new();
         let mut err = None;
         loop {
@@ -2220,11 +2227,11 @@ mod tests {
                 record_spec(pass_record("R3", 0, 300)),
             ],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2258,11 +2265,11 @@ mod tests {
                 record_spec(pass_record("B3", 0, 400)),
             ],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2280,11 +2287,11 @@ mod tests {
             open_cram_from_records("a.cram", vec![record_spec(pass_record("R_A", 0, 100))]);
         let cram_b =
             open_cram_from_records("b.cram", vec![record_spec(pass_record("R_B", 0, 100))]);
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2306,11 +2313,11 @@ mod tests {
                 record_spec(pass_record("R2", 0, 100)),
             ],
         );
-        let mut reader = CramMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2318,7 +2325,7 @@ mod tests {
         assert_eq!(first.pos, 200);
         let err = reader.next().expect("err item").expect_err("expected err");
         match err {
-            CramInputError::OutOfOrderRead {
+            AlignmentInputError::OutOfOrderRead {
                 qname,
                 prev_ref_id,
                 prev_pos,
@@ -2346,11 +2353,11 @@ mod tests {
                 record_spec(pass_record("R2", 0, 100)),
             ],
         );
-        let mut reader = CramMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2365,11 +2372,11 @@ mod tests {
         let dup = pass_record("R1", 0, 100);
         let cram_a = open_cram_from_records("a.cram", vec![record_spec(dup.clone())]);
         let cram_b = open_cram_from_records("b.cram", vec![record_spec(dup)]);
-        let mut reader = CramMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2377,7 +2384,7 @@ mod tests {
         assert_eq!(first.pos, 100);
         let err = reader.next().expect("err item").expect_err("expected err");
         match err {
-            CramInputError::DuplicateReadAcrossFiles {
+            AlignmentInputError::DuplicateReadAcrossFiles {
                 qname, ref_id, pos, ..
             } => {
                 assert_eq!(qname, "R1");
@@ -2397,11 +2404,11 @@ mod tests {
                 record_spec(pass_record("R1", 0, 200)),
             ],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2428,11 +2435,11 @@ mod tests {
                 record_spec(above),
             ],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2453,11 +2460,11 @@ mod tests {
         let mut rec = pass_record("R", 0, 100);
         rec.mapq = 0;
         let cram = open_cram_from_records("a.cram", vec![record_spec(rec)]);
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2482,11 +2489,11 @@ mod tests {
                 record_spec(above),
             ],
         );
-        let cfg = CramMergedReaderConfig {
+        let cfg = AlignmentMergedReaderConfig {
             min_mapq: None,
             ..Default::default()
         };
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2529,12 +2536,12 @@ mod tests {
     fn a9_each_flag_drop_one_at_a_time() {
         // Only `drop_qc_fail` and `drop_duplicate` are toggleable;
         // secondary/supplementary are unconditionally dropped (see
-        // the policy note on `CramMergedReaderConfig`) and so they
+        // the policy note on `AlignmentMergedReaderConfig`) and so they
         // can't be isolated by toggling. Their behaviour is
         // covered by the all-defaults assertion at the bottom of
         // the test, which still expects each bucket count to be 1.
         type FlagCase = (
-            fn(&mut CramMergedReaderConfig),
+            fn(&mut AlignmentMergedReaderConfig),
             &'static str,
             fn(&FilterCounts) -> u64,
         );
@@ -2555,11 +2562,11 @@ mod tests {
             ),
         ];
         for (mutator, missing_qname, count_fn) in cases {
-            let mut cfg = CramMergedReaderConfig::default();
+            let mut cfg = AlignmentMergedReaderConfig::default();
             mutator(&mut cfg);
             let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
             let cram_a = open_cram_from_records("a.cram", recs);
-            let reader = CramMergedReader::from_open_crams(
+            let reader = AlignmentMergedReader::from_open_crams(
                 vec![cram_a],
                 default_contigs(),
                 "sample".into(),
@@ -2582,11 +2589,11 @@ mod tests {
         // All defaults: only `clean` survives, every bucket == 1.
         let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
         let cram_a = open_cram_from_records("a.cram", recs);
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2610,14 +2617,14 @@ mod tests {
         // three each tick exactly one filter bucket.
         let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
         let cram_a = open_cram_from_records("a.cram", recs);
-        let cfg = CramMergedReaderConfig {
+        let cfg = AlignmentMergedReaderConfig {
             min_mapq: None,
             min_read_length: None,
             drop_qc_fail: false,
             drop_duplicate: false,
             ..Default::default()
         };
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2655,11 +2662,11 @@ mod tests {
             "a.cram",
             vec![record_spec(long), record_spec(short), record_spec(empty)],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2684,11 +2691,11 @@ mod tests {
             "a.cram",
             vec![record_spec(long2), record_spec(short2), record_spec(empty2)],
         );
-        let cfg = CramMergedReaderConfig {
+        let cfg = AlignmentMergedReaderConfig {
             min_read_length: None,
             ..Default::default()
         };
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2722,11 +2729,11 @@ mod tests {
             "a.cram",
             vec![record_spec(combo), record_spec(mq_un), record_spec(un_only)],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2744,11 +2751,11 @@ mod tests {
     #[test]
     fn a13_empty_stream() {
         let cram_a = open_cram_from_records("a.cram", vec![]);
-        let mut reader = CramMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2765,11 +2772,11 @@ mod tests {
                 record_spec(pass_record("R2", 0, 200)),
             ],
         );
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2802,11 +2809,11 @@ mod tests {
             mate_pos: None,
         };
         let cram = open_cram_from_records("a.cram", vec![record_spec(unmapped)]);
-        let mut reader = CramMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_crams(
             vec![cram],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2824,11 +2831,11 @@ mod tests {
         let cram_a = open_cram_from_records("a.cram", vec![record_spec(rec)]);
         let mut contigs = default_contigs();
         contigs.entries[0].length = big_pos + 1_000;
-        let mut reader = CramMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_crams(
             vec![cram_a],
             contigs,
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2856,11 +2863,11 @@ mod tests {
         spec.seq = default_seq(len + 2);
         spec.qual = default_qual(len + 2);
         let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2887,11 +2894,11 @@ mod tests {
         spec.seq = default_seq(len - 2);
         spec.qual = default_qual(len - 2);
         let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2918,11 +2925,11 @@ mod tests {
         spec.seq = default_seq(len + 2);
         spec.qual = default_qual(len + 2);
         let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = CramMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_crams(
             vec![cram],
             default_contigs(),
             "sample".into(),
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
             None,
         )
         .expect("reader");
@@ -2939,10 +2946,11 @@ mod tests {
         // The .fai is checked after the empty-input guard; touching a
         // file isn't required because we expect to fail before the
         // FASTA is even opened.
-        let result = CramMergedReader::new(&[], &fasta_path, CramMergedReaderConfig::default());
+        let result =
+            AlignmentMergedReader::new(&[], &fasta_path, AlignmentMergedReaderConfig::default());
         match result {
             Ok(_) => panic!("expected NoInputs, got Ok"),
-            Err(CramInputError::NoInputs) => {}
+            Err(AlignmentInputError::NoInputs) => {}
             Err(other) => panic!("expected NoInputs, got {:?}", other),
         }
     }
@@ -2951,7 +2959,7 @@ mod tests {
     //
     // These exercise `read_exceeds_mismatch_fraction` directly, with
     // synthetic inputs (no Repository, no CRAM). Integration of the
-    // filter into the cram_input pipeline is covered by the
+    // filter into the alignment_input pipeline is covered by the
     // `default_config_*` tests below.
 
     fn m_only(len: u32) -> Vec<CigarOp> {
@@ -3104,7 +3112,7 @@ mod tests {
     #[test]
     fn f1_default_config_has_filter_enabled_at_ten_percent() {
         // Pin the default config: filter on, threshold 0.10, floor 10.
-        let cfg = CramMergedReaderConfig::default();
+        let cfg = AlignmentMergedReaderConfig::default();
         assert_eq!(cfg.max_read_mismatch_fraction, Some(0.10));
         assert_eq!(cfg.mismatch_bq_floor, 10);
         assert_eq!(DEFAULT_MAX_READ_MISMATCH_FRACTION, 0.10);
@@ -3631,7 +3639,7 @@ mod tests {
     // --- G2 cigar_is_bad helper: pure-logic tests --------------------
     //
     // These exercise `cigar_is_bad` directly. Integration with the
-    // cram_input filter cascade and the `FilterCounts.bad_cigar`
+    // alignment_input filter cascade and the `FilterCounts.bad_cigar`
     // counter is covered by the Group B tests below.
 
     #[test]
@@ -3790,13 +3798,13 @@ mod tests {
     };
 
     /// `expect_err` requires `Debug` on the success type;
-    /// `CramMergedReader` carries a boxed `Send` iterator and cannot be
+    /// `AlignmentMergedReader` carries a boxed `Send` iterator and cannot be
     /// `Debug`. This helper unwraps the error variant and panics with
     /// the supplied message if the result was `Ok`.
     fn err_or_panic(
-        result: Result<CramMergedReader, CramInputError>,
+        result: Result<AlignmentMergedReader, AlignmentInputError>,
         message: &str,
-    ) -> CramInputError {
+    ) -> AlignmentInputError {
         match result {
             Ok(_) => panic!("{message}"),
             Err(e) => e,
@@ -3846,9 +3854,12 @@ mod tests {
             &records,
         )
         .expect("build_cram");
-        let reader =
-            CramMergedReader::new(&[cram_path], &fasta_path, CramMergedReaderConfig::default())
-                .expect("CramMergedReader::new");
+        let reader = AlignmentMergedReader::new(
+            &[cram_path],
+            &fasta_path,
+            AlignmentMergedReaderConfig::default(),
+        )
+        .expect("AlignmentMergedReader::new");
         assert_eq!(reader.sample_name(), "s1");
         let contig_list = reader.contigs();
         assert_eq!(contig_list.entries.len(), 1);
@@ -3862,15 +3873,15 @@ mod tests {
         let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("build_fasta");
         let (_cram_dir, cram_path) = build_cram_with_major_version(4, 0).expect("build forced");
         let err = err_or_panic(
-            CramMergedReader::new(
+            AlignmentMergedReader::new(
                 std::slice::from_ref(&cram_path),
                 &fasta_path,
-                CramMergedReaderConfig::default(),
+                AlignmentMergedReaderConfig::default(),
             ),
             "expected UnsupportedCramVersion",
         );
         match err {
-            CramInputError::UnsupportedCramVersion { major, minor, path } => {
+            AlignmentInputError::UnsupportedCramVersion { major, minor, path } => {
                 assert_eq!(major, 4);
                 assert_eq!(minor, 0);
                 assert_eq!(path, cram_path);
@@ -3895,11 +3906,15 @@ mod tests {
         )
         .expect("build_cram");
         let err = err_or_panic(
-            CramMergedReader::new(&[cram_path], &fasta_path, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(
+                &[cram_path],
+                &fasta_path,
+                AlignmentMergedReaderConfig::default(),
+            ),
             "expected NotCoordinateSorted",
         );
         match err {
-            CramInputError::NotCoordinateSorted { sort_order, .. } => {
+            AlignmentInputError::NotCoordinateSorted { sort_order, .. } => {
                 assert_eq!(sort_order, "queryname");
             }
             other => panic!("unexpected: {:?}", other),
@@ -3924,7 +3939,8 @@ mod tests {
         )
         .expect("build");
         let reader =
-            CramMergedReader::new(&[c1], &fa1, CramMergedReaderConfig::default()).expect("reader");
+            AlignmentMergedReader::new(&[c1], &fa1, AlignmentMergedReaderConfig::default())
+                .expect("reader");
         assert_eq!(reader.sample_name(), "foo");
 
         // 2) Single CRAM with @RG that has no SM tag → MissingSampleTag
@@ -3940,11 +3956,11 @@ mod tests {
         )
         .expect("build");
         let err = err_or_panic(
-            CramMergedReader::new(&[c2], &fa2, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c2], &fa2, AlignmentMergedReaderConfig::default()),
             "expected MissingSampleTag",
         );
         assert!(
-            matches!(err, CramInputError::MissingSampleTag { .. }),
+            matches!(err, AlignmentInputError::MissingSampleTag { .. }),
             "got {:?}",
             err
         );
@@ -3972,11 +3988,11 @@ mod tests {
         )
         .expect("build bar");
         let err = err_or_panic(
-            CramMergedReader::new(&[c3a, c3b], &fa3, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c3a, c3b], &fa3, AlignmentMergedReaderConfig::default()),
             "expected MultipleSampleNames",
         );
         assert!(
-            matches!(err, CramInputError::MultipleSampleNames { .. }),
+            matches!(err, AlignmentInputError::MultipleSampleNames { .. }),
             "got {:?}",
             err
         );
@@ -3998,11 +4014,11 @@ mod tests {
         )
         .expect("build within-file");
         let err = err_or_panic(
-            CramMergedReader::new(&[c4], &fa4, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c4], &fa4, AlignmentMergedReaderConfig::default()),
             "expected MultipleSampleNamesInFile",
         );
         match err {
-            CramInputError::MultipleSampleNamesInFile {
+            AlignmentInputError::MultipleSampleNamesInFile {
                 rg_a,
                 sm_a,
                 rg_b,
@@ -4036,11 +4052,11 @@ mod tests {
         )
         .expect("build short md5");
         let err = err_or_panic(
-            CramMergedReader::new(&[c1], &fa1, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c1], &fa1, AlignmentMergedReaderConfig::default()),
             "expected MalformedMd5",
         );
         match err {
-            CramInputError::MalformedMd5 { contig, detail, .. } => {
+            AlignmentInputError::MalformedMd5 { contig, detail, .. } => {
                 assert_eq!(contig, "chr1");
                 assert!(
                     detail.contains("expected 32 hex chars"),
@@ -4064,11 +4080,11 @@ mod tests {
         )
         .expect("build short md5 30");
         let err = err_or_panic(
-            CramMergedReader::new(&[c2], &fa2, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c2], &fa2, AlignmentMergedReaderConfig::default()),
             "expected MalformedMd5 short",
         );
         assert!(
-            matches!(err, CramInputError::MalformedMd5 { .. }),
+            matches!(err, AlignmentInputError::MalformedMd5 { .. }),
             "got {:?}",
             err
         );
@@ -4088,11 +4104,11 @@ mod tests {
         )
         .expect("build non-hex md5");
         let err = err_or_panic(
-            CramMergedReader::new(&[c3], &fa3, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c3], &fa3, AlignmentMergedReaderConfig::default()),
             "expected MalformedMd5 non-hex",
         );
         match err {
-            CramInputError::MalformedMd5 { detail, .. } => {
+            AlignmentInputError::MalformedMd5 { detail, .. } => {
                 assert!(detail.contains("non-hex"), "detail = {}", detail);
             }
             other => panic!("expected MalformedMd5, got {:?}", other),
@@ -4136,11 +4152,11 @@ mod tests {
         let (_a2_dir, a2) = build_cram(&fa_two, &two_swapped, &HeaderOverrides::default(), &[])
             .expect("swapped cram");
         let err = err_or_panic(
-            CramMergedReader::new(&[a1, a2], &fa_two, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[a1, a2], &fa_two, AlignmentMergedReaderConfig::default()),
             "expected ContigListMismatch (name)",
         );
         match err {
-            CramInputError::ContigListMismatch { detail, .. } => {
+            AlignmentInputError::ContigListMismatch { detail, .. } => {
                 assert!(detail.contains("name disagreement"), "detail = {}", detail);
             }
             other => panic!("unexpected: {:?}", other),
@@ -4174,18 +4190,18 @@ mod tests {
         )
         .expect("short-length cram");
         let err = err_or_panic(
-            CramMergedReader::new(&[b1, b2], &fa2, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[b1, b2], &fa2, AlignmentMergedReaderConfig::default()),
             "expected ContigListMismatch (length)",
         );
         match err {
-            CramInputError::ContigListMismatch { detail, .. } => {
+            AlignmentInputError::ContigListMismatch { detail, .. } => {
                 assert!(
                     detail.contains("length disagreement"),
                     "detail = {}",
                     detail
                 );
             }
-            CramInputError::FastaContigMismatch { detail, .. } => {
+            AlignmentInputError::FastaContigMismatch { detail, .. } => {
                 // Acceptable alternate route: the second CRAM's @SQ
                 // length disagrees with the FASTA before the cross-
                 // CRAM check fires.
@@ -4220,11 +4236,11 @@ mod tests {
         )
         .expect("md5 f cram");
         let err = err_or_panic(
-            CramMergedReader::new(&[c1, c2], &fa, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[c1, c2], &fa, AlignmentMergedReaderConfig::default()),
             "expected ContigListMismatch (md5)",
         );
         match err {
-            CramInputError::ContigListMismatch { detail, .. } => {
+            AlignmentInputError::ContigListMismatch { detail, .. } => {
                 assert!(detail.contains("md5 disagreement"), "detail = {}", detail);
             }
             other => panic!("unexpected: {:?}", other),
@@ -4240,10 +4256,10 @@ mod tests {
         let (_fa_dir, fa) = build_fasta(&contigs).expect("fasta");
         let (_cram_dir, cram_path) =
             build_cram(&fa, &contigs, &HeaderOverrides::default(), &records).expect("cram");
-        CramMergedReader::new(
+        AlignmentMergedReader::new(
             std::slice::from_ref(&cram_path),
             &fa,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("reader");
 
@@ -4256,11 +4272,11 @@ mod tests {
         // indexable, but the missing-.fai check happens before any
         // CRAM is opened, so reuse the already-built CRAM path.
         let err = err_or_panic(
-            CramMergedReader::new(&[cram_path], &fa2, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[cram_path], &fa2, AlignmentMergedReaderConfig::default()),
             "expected MissingFastaIndex",
         );
         assert!(
-            matches!(err, CramInputError::MissingFastaIndex { .. }),
+            matches!(err, AlignmentInputError::MissingFastaIndex { .. }),
             "got {:?}",
             err
         );
@@ -4276,11 +4292,11 @@ mod tests {
         let (_cram_b_dir, cram_b) =
             build_cram(&fa, &contigs, &HeaderOverrides::default(), &records).expect("cram b");
         let err = err_or_panic(
-            CramMergedReader::new(&[cram_b], &fa3, CramMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[cram_b], &fa3, AlignmentMergedReaderConfig::default()),
             "expected FastaContigMismatch",
         );
         assert!(
-            matches!(err, CramInputError::FastaContigMismatch { .. }),
+            matches!(err, AlignmentInputError::FastaContigMismatch { .. }),
             "got {:?}",
             err
         );
@@ -4298,9 +4314,12 @@ mod tests {
         let (_cram_dir, cram_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
-        let reader =
-            CramMergedReader::new(&[cram_path], &fasta_path, CramMergedReaderConfig::default())
-                .expect("reader");
+        let reader = AlignmentMergedReader::new(
+            &[cram_path],
+            &fasta_path,
+            AlignmentMergedReaderConfig::default(),
+        )
+        .expect("reader");
         let mut decoded: Vec<MappedRead> = Vec::new();
         for item in reader {
             decoded.push(item.expect("ok record"));
@@ -4312,7 +4331,7 @@ mod tests {
         assert_eq!(decoded[0].qname, b"R1");
     }
 
-    // --- Group C: CramMergedReader::query (indexed, per-contig) ---------
+    // --- Group C: AlignmentMergedReader::query (indexed, per-contig) ---------
 
     /// Two-contig fixture used by the query tests below.
     fn two_contigs_chr1_chr2() -> Vec<ContigSpec> {
@@ -4345,7 +4364,7 @@ mod tests {
     }
 
     /// Convert a `ContigSpec` list (test fixture vocabulary) into the
-    /// project's `ContigList` shape that `CramMergedReader::query`
+    /// project's `ContigList` shape that `AlignmentMergedReader::query`
     /// expects.
     fn contigs_for(specs: &[ContigSpec]) -> ContigList {
         ContigList {
@@ -4385,7 +4404,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&cram_path);
-        let reader = CramMergedReader::query(
+        let reader = AlignmentMergedReader::query(
             std::slice::from_ref(&cram_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -4393,7 +4412,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1");
 
@@ -4421,7 +4440,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&cram_path);
-        let reader = CramMergedReader::query(
+        let reader = AlignmentMergedReader::query(
             std::slice::from_ref(&cram_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -4429,7 +4448,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1");
 
@@ -4441,7 +4460,7 @@ mod tests {
     /// interleaving positions. The query path's k-way merge must
     /// emit them in coordinate order. We compare against the
     /// expected positions directly rather than against
-    /// `CramMergedReader::new` because `new` 's two-CRAM-with-records
+    /// `AlignmentMergedReader::new` because `new` 's two-CRAM-with-records
     /// path is not currently exercised by any other test in this
     /// module and has surfaced as fragile during this commit's
     /// development; cross-validating the two readers is a follow-up
@@ -4473,7 +4492,7 @@ mod tests {
         let headers = vec![header_a, header_b];
         let indexes = vec![index_a, index_b];
 
-        let query_positions: Vec<(Vec<u8>, u64)> = CramMergedReader::query(
+        let query_positions: Vec<(Vec<u8>, u64)> = AlignmentMergedReader::query(
             &[cram_a, cram_b],
             &fasta_path,
             contigs_for(&contigs),
@@ -4481,7 +4500,7 @@ mod tests {
             &headers,
             &indexes,
             "chr1",
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1")
         .map(|r| {
@@ -4515,7 +4534,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&cram_path);
-        let reader = CramMergedReader::query(
+        let reader = AlignmentMergedReader::query(
             std::slice::from_ref(&cram_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -4523,7 +4542,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr2",
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr2");
 
@@ -4541,7 +4560,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&cram_path);
-        let err = CramMergedReader::query(
+        let err = AlignmentMergedReader::query(
             std::slice::from_ref(&cram_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -4549,12 +4568,12 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chrUnknown",
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         );
         let err = err_or_panic(err, "query should reject unknown contig");
         assert!(matches!(
             err,
-            CramInputError::ContigNotInList { ref contig, .. } if contig == "chrUnknown"
+            AlignmentInputError::ContigNotInList { ref contig, .. } if contig == "chrUnknown"
         ));
     }
 
@@ -4570,7 +4589,7 @@ mod tests {
         let (header, index) = load_header_and_index(&cram_path);
 
         // 2 crams, 1 header, 1 index → mismatch.
-        let err = CramMergedReader::query(
+        let err = AlignmentMergedReader::query(
             &[cram_path.clone(), cram_path.clone()],
             &fasta_path,
             contigs_for(&contigs),
@@ -4578,12 +4597,12 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         );
         let err = err_or_panic(err, "query should reject mismatched handle counts");
         assert!(matches!(
             err,
-            CramInputError::PerInputHandleCountMismatch {
+            AlignmentInputError::PerInputHandleCountMismatch {
                 crams: 2,
                 headers: 1,
                 indexes: 1,
@@ -4593,7 +4612,7 @@ mod tests {
 
     // --- Group D: 2-CRAM-with-records diagnostics ---------------------
     //
-    // Investigation surface for the streaming `CramMergedReader::new`
+    // Investigation surface for the streaming `AlignmentMergedReader::new`
     // failure on two CRAMs of the same sample with records on both,
     // surfaced during commit 2 of the var-calling-from-bam per-chrom
     // parallelism plan (see
@@ -4664,10 +4683,10 @@ mod tests {
         )
         .expect("build cram_b");
 
-        let positions: Vec<(Vec<u8>, u64)> = CramMergedReader::new(
+        let positions: Vec<(Vec<u8>, u64)> = AlignmentMergedReader::new(
             &[cram_a, cram_b],
             &fasta_path,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("merged reader open")
         .map(|r| {
@@ -4688,7 +4707,7 @@ mod tests {
     }
 
     /// Probe: open each of the two CRAMs alone via
-    /// `CramMergedReader::new` (passing a single-element slice), drain
+    /// `AlignmentMergedReader::new` (passing a single-element slice), drain
     /// each to completion. Tests whether the issue is per-CRAM or
     /// specific to the merge of two.
     #[test]
@@ -4705,20 +4724,20 @@ mod tests {
                 ],
             );
 
-        let pos_a: Vec<u64> = CramMergedReader::new(
+        let pos_a: Vec<u64> = AlignmentMergedReader::new(
             std::slice::from_ref(&cram_a),
             &fasta_path,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("open a")
         .map(|r| r.expect("ok a").pos)
         .collect();
         assert_eq!(pos_a, vec![100, 500], "cram_a alone");
 
-        let pos_b: Vec<u64> = CramMergedReader::new(
+        let pos_b: Vec<u64> = AlignmentMergedReader::new(
             std::slice::from_ref(&cram_b),
             &fasta_path,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("open b")
         .map(|r| r.expect("ok b").pos)
@@ -4739,10 +4758,10 @@ mod tests {
                 &[],
             );
 
-        let positions: Vec<u64> = CramMergedReader::new(
+        let positions: Vec<u64> = AlignmentMergedReader::new(
             &[cram_a, cram_b],
             &fasta_path,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("open")
         .map(|r| r.expect("ok").pos)
@@ -4769,10 +4788,10 @@ mod tests {
                 ],
             );
 
-        let results: Vec<Result<MappedRead, CramInputError>> = CramMergedReader::new(
+        let results: Vec<Result<MappedRead, AlignmentInputError>> = AlignmentMergedReader::new(
             &[cram_a, cram_b],
             &fasta_path,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("open")
         .collect();
@@ -4865,10 +4884,10 @@ mod tests {
                 ],
             );
 
-        let positions: Vec<u64> = CramMergedReader::new(
+        let positions: Vec<u64> = AlignmentMergedReader::new(
             &[cram_a, cram_b],
             &fasta_path,
-            CramMergedReaderConfig::default(),
+            AlignmentMergedReaderConfig::default(),
         )
         .expect("open")
         .map(|r| r.expect("ok").pos)

@@ -9,11 +9,11 @@
 //! Architecture: the driver pre-flights every input's alignment
 //! index (and optionally builds one on demand via
 //! `--build-map-file-index`), harvests the canonical contig list +
-//! sample name once via [`crate::bam::cram_input::CramMergedReader::new`],
+//! sample name once via [`crate::bam::alignment_input::AlignmentMergedReader::new`],
 //! loads each input's `Arc<sam::Header>` and
 //! `Arc<crai::Index>`, and dispatches one [`process_one_chromosome_from_bam`]
 //! worker per chromosome via `rayon::par_iter`. Each worker owns
-//! its own CRAM reader (via [`crate::bam::cram_input::CramMergedReader::query`]),
+//! its own CRAM reader (via [`crate::bam::alignment_input::AlignmentMergedReader::query`]),
 //! BAQ chunk pool, walker, reference fetchers, and per-fragment VCF
 //! writer — no shared mutable state across workers. Fragments
 //! concat in contig-table order via [`crate::vcf::concat::concat_fragments`],
@@ -295,20 +295,23 @@ pub fn run_var_calling_from_bam(
         .with_contamination(None)?;
 
     // 4. Harvest the canonical contig list + sample name via the
-    //    streaming `CramMergedReader::new`. Validates per-file headers
+    //    streaming `AlignmentMergedReader::new`. Validates per-file headers
     //    (sort order, `@RG SM`, `@SQ M5`), reconciles across CRAMs,
     //    and cross-checks against the FASTA's `.fai`. The reader is
     //    dropped immediately afterwards — per-chrom workers open
-    //    their own readers via `CramMergedReader::query`. The double
+    //    their own readers via `AlignmentMergedReader::query`. The double
     //    open per CRAM (once here for validation, once per worker
     //    for query) is intentional: it keeps the validation surface
     //    centralised and is small relative to the per-contig decode.
     let canonical_contigs;
     let sample_name;
     {
-        let reader =
-            crate::bam::cram_input::CramMergedReader::new(&args.crams, &args.reference, cram_cfg)
-                .map_err(PileupCliError::CramInput)?;
+        let reader = crate::bam::alignment_input::AlignmentMergedReader::new(
+            &args.crams,
+            &args.reference,
+            cram_cfg,
+        )
+        .map_err(PileupCliError::CramInput)?;
         canonical_contigs = reader.contigs().clone();
         sample_name = reader.sample_name().to_string();
     }
@@ -447,32 +450,32 @@ pub fn run_var_calling_from_bam(
 /// Open each CRAM once, advance past the file definition and file
 /// header, and return the parsed headers wrapped in `Arc` for
 /// cross-worker sharing. Mirrors what
-/// [`crate::bam::cram_input::CramMergedReader::query`] does
+/// [`crate::bam::alignment_input::AlignmentMergedReader::query`] does
 /// per-worker, lifted to driver-startup time so workers only pay an
 /// `Arc::clone`.
 fn load_per_input_headers(
     crams: &[PathBuf],
 ) -> Result<Vec<Arc<noodles_sam::Header>>, VarCallingFromBamCliError> {
-    use crate::bam::errors::CramInputError;
+    use crate::bam::errors::AlignmentInputError;
 
     let mut headers = Vec::with_capacity(crams.len());
     for path in crams {
         let mut reader = noodles_cram::io::reader::Builder::default()
             .build_from_path(path)
             .map_err(|source| {
-                PileupCliError::CramInput(CramInputError::OpenFailed {
+                PileupCliError::CramInput(AlignmentInputError::OpenFailed {
                     path: path.clone(),
                     source,
                 })
             })?;
         reader.read_file_definition().map_err(|source| {
-            PileupCliError::CramInput(CramInputError::OpenFailed {
+            PileupCliError::CramInput(AlignmentInputError::OpenFailed {
                 path: path.clone(),
                 source,
             })
         })?;
         let header = reader.read_file_header().map_err(|source| {
-            PileupCliError::CramInput(CramInputError::OpenFailed {
+            PileupCliError::CramInput(AlignmentInputError::OpenFailed {
                 path: path.clone(),
                 source,
             })
@@ -556,7 +559,7 @@ fn contigs_to_parsed(
 /// and returns the first error after every worker has joined.
 ///
 /// Stage 1 borrow chain: the returned reader from
-/// [`CramMergedReader::query`] is owned on this function's stack;
+/// [`AlignmentMergedReader::query`] is owned on this function's stack;
 /// the BAQ stream (or no-BAQ passthrough) borrows from it; the
 /// error-shedding adapter borrows from BAQ; the pileup walker
 /// borrows from the adapter; the walker is wrapped in a second
@@ -589,7 +592,7 @@ fn process_one_chromosome_from_bam(
     sample_name: String,
     all_chromosomes: Vec<ParsedChromosome>,
     reference: &std::path::Path,
-    cram_cfg: crate::bam::cram_input::CramMergedReaderConfig,
+    cram_cfg: crate::bam::alignment_input::AlignmentMergedReaderConfig,
     baq_cfg: crate::baq::BaqConfig,
     walker_cfg: crate::pileup::walker::WalkerConfig,
     baq_chunk_size: usize,
@@ -608,7 +611,7 @@ fn process_one_chromosome_from_bam(
     );
 
     // 1. Per-worker CRAM record source, bounded to this chrom.
-    let mut reader = crate::bam::cram_input::CramMergedReader::query(
+    let mut reader = crate::bam::alignment_input::AlignmentMergedReader::query(
         crams,
         reference,
         canonical_contigs.clone(),

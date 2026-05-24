@@ -1036,7 +1036,7 @@ fn column_depth_cap_keeps_first_n_of_admission_order() {
     // The cap is a defensive truncation, not a uniform sampler.
     // Pin the contract so an operator can reason about what
     // survives: the first `cap` contributors in admission order
-    // (= upstream coordinate-then-arrival order from `cram_input`)
+    // (= upstream coordinate-then-arrival order from `alignment_input`)
     // fold into the record; the rest are dropped. Mi5 in
     // `ia/reviews/pileup_2026-05-09.md`.
     //

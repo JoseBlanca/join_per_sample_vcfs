@@ -204,7 +204,7 @@ fn parity_realn02() {
 // BaqEngine driver tests — synthetic MappedReads, no SAM parsing.
 // ---------------------------------------------------------------------
 
-use crate::bam::cram_input::{
+use crate::bam::alignment_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
 use crate::fasta::ManualEvictChromRefFetcher;
@@ -710,7 +710,7 @@ fn baq_skip_counts_bump_is_exhaustive_per_variant() {
 // BaqStream — rayon-parallel adapter tests.
 // ---------------------------------------------------------------------
 
-use crate::bam::errors::CramInputError;
+use crate::bam::errors::AlignmentInputError;
 use crate::pileup::walker::PreparedRead;
 
 use super::baq_stream::BaqStream;
@@ -718,7 +718,7 @@ use super::baq_stream::BaqStream;
 #[test]
 fn stream_yields_prepared_reads_in_order_within_chunk() {
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=4)
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = (1..=4)
         .map(|pos| {
             Ok(synthetic_read(
                 0,
@@ -751,7 +751,7 @@ fn stream_preserves_order_across_chunks() {
     // Chunk size 2 with 5 inputs → three batches. Output order must
     // still match input order.
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=5)
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = (1..=5)
         .map(|pos| {
             Ok(synthetic_read(
                 0,
@@ -782,7 +782,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
     // Chrom needs to cover the extended ref window for the last read
     // (pos=64, 5M, ~p+7 extension); use a generous 128-byte chrom.
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = (1..=64)
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = (1..=64)
         .map(|pos| {
             Ok(synthetic_read(
                 0,
@@ -816,7 +816,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
 #[test]
 fn stream_increments_skip_counts_per_reason() {
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![
         // Capped — happy path.
         Ok(synthetic_read(
             0,
@@ -872,7 +872,7 @@ fn stream_increments_skip_counts_per_reason() {
 #[test]
 fn stream_propagates_upstream_error_after_batched_reads() {
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![
         Ok(synthetic_read(
             0,
             1,
@@ -881,7 +881,7 @@ fn stream_propagates_upstream_error_after_batched_reads() {
             b"ACGTA".to_vec(),
             vec![40; 5],
         )),
-        Err(CramInputError::NoInputs),
+        Err(AlignmentInputError::NoInputs),
     ];
     let outputs: Vec<_> = BaqStream::new(
         inputs.into_iter(),
@@ -893,7 +893,7 @@ fn stream_propagates_upstream_error_after_batched_reads() {
     .collect();
     assert_eq!(outputs.len(), 2);
     assert!(outputs[0].is_ok());
-    assert!(matches!(outputs[1], Err(CramInputError::NoInputs)));
+    assert!(matches!(outputs[1], Err(AlignmentInputError::NoInputs)));
 }
 
 #[test]
@@ -903,7 +903,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
     // must not return None prematurely — it must loop through the
     // refills until it finds the surviving read.
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![
         Ok(synthetic_read(
             FLAG_UNMAPPED,
             1,
@@ -945,7 +945,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
 #[test]
 fn stream_is_fused_after_exhaustion() {
     let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
-    let inputs: Vec<Result<MappedRead, CramInputError>> = vec![Ok(synthetic_read(
+    let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![Ok(synthetic_read(
         0,
         1,
         60,
@@ -973,7 +973,7 @@ fn stream_rejects_zero_chunk_size() {
     // silently coerced.
     use crate::fasta::ContigList;
     let _ = BaqStream::new(
-        std::iter::empty::<Result<MappedRead, CramInputError>>(),
+        std::iter::empty::<Result<MappedRead, AlignmentInputError>>(),
         BaqConfig::default(),
         std::path::PathBuf::from("/dev/null"),
         ContigList { entries: vec![] },
@@ -987,7 +987,7 @@ fn baqstream_is_send() {
     // move a BaqStream across a rayon::scope without a confusing
     // trait-bound error.
     fn assert_send<T: Send>() {}
-    assert_send::<BaqStream<std::vec::IntoIter<Result<MappedRead, CramInputError>>>>();
+    assert_send::<BaqStream<std::vec::IntoIter<Result<MappedRead, AlignmentInputError>>>>();
 }
 
 #[test]

@@ -18,7 +18,7 @@
 //! §2 "Index pre-flight".
 //!
 //! Today the only alignment-file format we read is CRAM (matches
-//! [`crate::bam::cram_input::CramMergedReader`]). When BAM input
+//! [`crate::bam::alignment_input::AlignmentMergedReader`]). When BAM input
 //! support lands, extend [`AlignmentFileKind`] with a `Bam` variant
 //! and add the corresponding `.bai` / `.csi` detection + build
 //! branches; the rest of the pre-flight shape stays the same.
@@ -43,7 +43,7 @@ use crate::bam::errors::AlignmentIndexError;
 /// [`load_alignment_index`] once per input at startup, wrap the
 /// result in this enum, and pass a `&[AlignmentIndex]` (or
 /// `Vec<AlignmentIndex>`) into
-/// [`crate::bam::cram_input::CramMergedReader::query`]. Each rayon
+/// [`crate::bam::alignment_input::AlignmentMergedReader::query`]. Each rayon
 /// worker pays one `Arc::clone` to get its own handle on the
 /// already-parsed index; no per-worker disk reads or re-parsing.
 ///

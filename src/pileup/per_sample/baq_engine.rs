@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::bam::cram_input::{
+use crate::bam::alignment_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
 use crate::fasta::ManualEvictChromRefFetcher;

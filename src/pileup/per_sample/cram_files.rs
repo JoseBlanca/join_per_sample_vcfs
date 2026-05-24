@@ -1,6 +1,6 @@
-//! Test fixtures for Group B tests of `cram_input` — synthetic CRAM
+//! Test fixtures for Group B tests of `alignment_input` — synthetic CRAM
 //! and FASTA files written to a tempdir, exercising the noodles
-//! writer and `CramMergedReader::new`'s file-open / header-parsing
+//! writer and `AlignmentMergedReader::new`'s file-open / header-parsing
 //! path.
 //!
 //! See `ia/feature_implementation_plans/per_sample_caller_cram_input.md`

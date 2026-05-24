@@ -14,7 +14,7 @@
 //!
 //! Parametric over both the item type and the error type so the
 //! same machinery serves the Stage 1 CRAM-input seam
-//! (`PreparedRead` / `CramInputError`) and the from-bam walker shim
+//! (`PreparedRead` / `AlignmentInputError`) and the from-bam walker shim
 //! (`PileupRecord` / `WalkerError`). M9 follow-up from the
 //! 2026-05-19 cohort CLI review.
 
@@ -26,7 +26,7 @@ use std::rc::Rc;
 /// (one `Rc::clone` per handle).
 ///
 /// Generic over the error type `E` — typically
-/// [`CramInputError`](crate::bam::errors::CramInputError)
+/// [`AlignmentInputError`](crate::bam::errors::AlignmentInputError)
 /// for the Stage 1 CRAM-input seam or
 /// [`WalkerError`](crate::pileup::walker::WalkerError) for
 /// the from-bam walker shim.
@@ -124,7 +124,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::bam::errors::CramInputError;
+    use crate::bam::errors::AlignmentInputError;
     use crate::pileup::walker::CigarOp;
     use crate::pileup::walker::{MateRole, PreparedRead};
 
@@ -145,16 +145,16 @@ mod tests {
         }
     }
 
-    fn dummy_err() -> CramInputError {
-        CramInputError::NoInputs
+    fn dummy_err() -> AlignmentInputError {
+        AlignmentInputError::NoInputs
     }
 
     /// Ok items pass through unchanged; the handle is empty after a
-    /// clean exhaustion. Concrete `T = PreparedRead, E = CramInputError`
+    /// clean exhaustion. Concrete `T = PreparedRead, E = AlignmentInputError`
     /// — the original Stage 1 CRAM-input use case.
     #[test]
     fn ok_items_pass_through() {
-        let input: Vec<Result<PreparedRead, CramInputError>> =
+        let input: Vec<Result<PreparedRead, AlignmentInputError>> =
             vec![Ok(dummy_prepared(1)), Ok(dummy_prepared(2))];
         let mut adapter = ErrorSheddingAdapter::new(input.into_iter());
         let handle = adapter.error_handle();
@@ -169,7 +169,7 @@ mod tests {
     /// end-of-stream from that point on.
     #[test]
     fn first_error_is_stashed_then_iterator_ends() {
-        let input: Vec<Result<PreparedRead, CramInputError>> = vec![
+        let input: Vec<Result<PreparedRead, AlignmentInputError>> = vec![
             Ok(dummy_prepared(1)),
             Err(dummy_err()),
             // Items past the error must not be observed even if
@@ -184,7 +184,7 @@ mod tests {
         assert!(adapter.next().is_none(), "still end-of-stream");
 
         let stashed = handle.take().expect("error must be stashed");
-        assert!(matches!(stashed, CramInputError::NoInputs));
+        assert!(matches!(stashed, AlignmentInputError::NoInputs));
     }
 
     /// `ErrorHandle::take` is idempotent — calling it after a
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn handle_take_is_idempotent() {
         let _ = PathBuf::new(); // silence unused import on cold compiles
-        let input: Vec<Result<PreparedRead, CramInputError>> = vec![Err(dummy_err())];
+        let input: Vec<Result<PreparedRead, AlignmentInputError>> = vec![Err(dummy_err())];
         let mut adapter = ErrorSheddingAdapter::new(input.into_iter());
         let handle = adapter.error_handle();
         assert!(adapter.next().is_none());
@@ -203,7 +203,7 @@ mod tests {
     /// Generic over arbitrary `T` and `E`. Locks the M9 follow-up
     /// fix in place — the adapter must be reusable for the from-bam
     /// walker shim (`T = PileupRecord, E = WalkerError`) and any
-    /// future seam, not coupled to `PreparedRead` / `CramInputError`.
+    /// future seam, not coupled to `PreparedRead` / `AlignmentInputError`.
     /// Uses primitive `T = i32, E = String` to decouple from any
     /// specific domain type.
     #[test]

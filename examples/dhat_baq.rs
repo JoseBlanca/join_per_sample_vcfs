@@ -19,7 +19,7 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use pop_var_caller::bam::cram_input::MappedRead;
+use pop_var_caller::bam::alignment_input::MappedRead;
 use pop_var_caller::baq::BaqConfig;
 use pop_var_caller::fasta::ManualEvictChromRefFetcher;
 use pop_var_caller::pileup::per_sample::baq_engine::{BaqEngine, BaqOutcome};

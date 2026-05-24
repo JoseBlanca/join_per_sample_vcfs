@@ -1,6 +1,6 @@
 //! `pop_var_caller pileup` — the Stage 1 CLI orchestrator.
 //!
-//! Glues `CramMergedReader` → `BaqStream` (or BAQ-bypass passthrough)
+//! Glues `AlignmentMergedReader` → `BaqStream` (or BAQ-bypass passthrough)
 //! → pileup walker → `.psp` writer. Argument parsing is delegated to
 //! clap; everything else is in [`run_pileup`].
 //!
@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
-use crate::bam::cram_input::{CramMergedReaderConfig, FilterCounts};
-use crate::bam::errors::CramInputError;
+use crate::bam::alignment_input::{AlignmentMergedReaderConfig, FilterCounts};
+use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::ContigList;
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
@@ -118,7 +118,7 @@ pub(crate) fn parse_mismatch_fraction(s: &str) -> Result<f32, String> {
 #[derive(Debug, Error)]
 pub enum PileupCliError {
     #[error("CRAM input: {0}")]
-    CramInput(#[from] CramInputError),
+    CramInput(#[from] AlignmentInputError),
     #[error("pipeline: {0}")]
     Pipeline(#[from] PileupToPspError),
     #[error(
@@ -230,8 +230,8 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
 // Helpers
 // ---------------------------------------------------------------------
 
-pub(super) fn cram_config_from_args(args: &shared_args::Stage1Args) -> CramMergedReaderConfig {
-    CramMergedReaderConfig {
+pub(super) fn cram_config_from_args(args: &shared_args::Stage1Args) -> AlignmentMergedReaderConfig {
+    AlignmentMergedReaderConfig {
         min_mapq: if args.min_mapq == 0 {
             None
         } else {
@@ -472,7 +472,7 @@ fn print_run_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bam::cram_input::{
+    use crate::bam::alignment_input::{
         DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
         DEFAULT_MISMATCH_BQ_FLOOR,
     };

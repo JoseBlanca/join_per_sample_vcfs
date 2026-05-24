@@ -23,8 +23,8 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-use pop_var_caller::bam::cram_input::MappedRead;
-use pop_var_caller::bam::errors::CramInputError;
+use pop_var_caller::bam::alignment_input::MappedRead;
+use pop_var_caller::bam::errors::AlignmentInputError;
 use pop_var_caller::baq::BaqConfig;
 use pop_var_caller::fasta::{ContigEntry, ContigList, ManualEvictChromRefFetcher};
 use pop_var_caller::pileup::per_sample::baq_engine::{BaqEngine, BaqOutcome};
@@ -148,7 +148,7 @@ fn bench_engine_read_length(c: &mut Criterion) {
 }
 
 fn drain_stream(
-    inputs: Vec<Result<MappedRead, CramInputError>>,
+    inputs: Vec<Result<MappedRead, AlignmentInputError>>,
     fasta_path: PathBuf,
     contigs: ContigList,
     chunk_size: usize,
@@ -196,7 +196,7 @@ fn bench_stream_chunk_size(c: &mut Criterion) {
                             reads
                                 .iter()
                                 .cloned()
-                                .map(Ok::<_, CramInputError>)
+                                .map(Ok::<_, AlignmentInputError>)
                                 .collect::<Vec<_>>(),
                             fasta_path.clone(),
                             contigs.clone(),

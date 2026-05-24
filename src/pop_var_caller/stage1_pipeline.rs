@@ -17,8 +17,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::bam::cram_input::{CramMergedReader, CramMergedReaderConfig, FilterCounts};
-use crate::bam::errors::CramInputError;
+use crate::bam::alignment_input::{
+    AlignmentMergedReader, AlignmentMergedReaderConfig, FilterCounts,
+};
+use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
 use crate::pileup::per_sample::baq_engine::prepare_passthrough;
@@ -71,7 +73,7 @@ pub struct Stage1Outputs<R> {
     pub sample_name: String,
     pub contigs: ContigList,
     pub run_summary: Stage1RunSummary,
-    pub stashed_upstream_error: Option<CramInputError>,
+    pub stashed_upstream_error: Option<AlignmentInputError>,
 }
 
 /// Build the Stage 1 pipeline on this function's stack and hand the
@@ -89,7 +91,7 @@ pub struct Stage1Outputs<R> {
 pub fn with_stage1_pipeline<R, E, F>(
     crams: &[PathBuf],
     reference: &Path,
-    cram_cfg: CramMergedReaderConfig,
+    cram_cfg: AlignmentMergedReaderConfig,
     baq_cfg: BaqConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
@@ -101,8 +103,8 @@ where
     E: From<PileupCliError>,
 {
     // 1. Open the merged reader and capture identification metadata.
-    let mut reader: CramMergedReader =
-        CramMergedReader::new(crams, reference, cram_cfg).map_err(PileupCliError::CramInput)?;
+    let mut reader: AlignmentMergedReader = AlignmentMergedReader::new(crams, reference, cram_cfg)
+        .map_err(PileupCliError::CramInput)?;
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
@@ -134,13 +136,13 @@ where
     let (result, baq_skip_counts, stashed_upstream_error): (
         Result<R, E>,
         Option<BaqSkipCounts>,
-        Option<CramInputError>,
+        Option<AlignmentInputError>,
     ) = if no_baq {
         // No-BAQ: passthrough map directly off the reader.
         let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
             r.map(|read| {
                 // PANIC-FREE: `ref_id` is the CRAM-side contig id;
-                // `CramMergedReader` only emits `PreparedRead`s with
+                // `AlignmentMergedReader` only emits `PreparedRead`s with
                 // a non-negative `ref_id` (mapped reads pass the
                 // pre-walker filter, unmapped reads are dropped
                 // upstream). The cast to `u32` is therefore total
@@ -223,8 +225,8 @@ where
 /// isolation.
 fn prefer_upstream_or_closure<R, E>(
     result: Result<R, E>,
-    stashed: Option<CramInputError>,
-) -> Result<(R, Option<CramInputError>), E>
+    stashed: Option<AlignmentInputError>,
+) -> Result<(R, Option<AlignmentInputError>), E>
 where
     E: From<PileupCliError>,
 {
@@ -240,25 +242,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bam::errors::CramInputError;
+    use crate::bam::errors::AlignmentInputError;
 
     /// On success, the closure result is preserved and the stash (if
     /// any) is handed back to the caller.
     #[test]
     fn prefer_upstream_or_closure_returns_ok_with_stash_when_closure_succeeded() {
-        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+        let r: Result<(u8, Option<AlignmentInputError>), PileupCliError> =
             prefer_upstream_or_closure(Ok(42), None);
         assert!(matches!(r, Ok((42, None))));
 
-        let stashed = CramInputError::Io {
+        let stashed = AlignmentInputError::Io {
             path: std::path::PathBuf::from("sample.cram"),
             source: std::io::Error::other("cram truncated"),
         };
-        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+        let r: Result<(u8, Option<AlignmentInputError>), PileupCliError> =
             prefer_upstream_or_closure(Ok(7), Some(stashed));
         let (v, stash) = r.expect("Ok branch must propagate");
         assert_eq!(v, 7);
-        assert!(matches!(stash, Some(CramInputError::Io { .. })));
+        assert!(matches!(stash, Some(AlignmentInputError::Io { .. })));
     }
 
     /// When the closure errors and the stash is empty, the closure
@@ -266,7 +268,7 @@ mod tests {
     #[test]
     fn prefer_upstream_or_closure_returns_closure_err_when_stash_is_none() {
         let closure_err = PileupCliError::TimestampFormat;
-        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+        let r: Result<(u8, Option<AlignmentInputError>), PileupCliError> =
             prefer_upstream_or_closure::<u8, _>(Err(closure_err), None);
         assert!(matches!(r, Err(PileupCliError::TimestampFormat)));
     }
@@ -277,14 +279,14 @@ mod tests {
     #[test]
     fn prefer_upstream_or_closure_prefers_stash_when_both_present() {
         let closure_err = PileupCliError::TimestampFormat;
-        let stashed = CramInputError::Io {
+        let stashed = AlignmentInputError::Io {
             path: std::path::PathBuf::from("sample.cram"),
             source: std::io::Error::other("cram truncated"),
         };
-        let r: Result<(u8, Option<CramInputError>), PileupCliError> =
+        let r: Result<(u8, Option<AlignmentInputError>), PileupCliError> =
             prefer_upstream_or_closure::<u8, _>(Err(closure_err), Some(stashed));
         match r {
-            Err(PileupCliError::CramInput(CramInputError::Io { .. })) => (),
+            Err(PileupCliError::CramInput(AlignmentInputError::Io { .. })) => (),
             other => panic!("expected upstream CramInput::Io, got {other:?}"),
         }
     }

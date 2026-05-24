@@ -1,6 +1,6 @@
-//! Test fixtures for Group A tests of `cram_input` — synthetic
+//! Test fixtures for Group A tests of `alignment_input` — synthetic
 //! `RecordBuf`s assembled from minimal field specs, plus an
-//! `OpenCram` factory that wraps a `Vec` in the boxed iterator shape
+//! `OpenAlignmentFile` factory that wraps a `Vec` in the boxed iterator shape
 //! the merge expects. No filesystem, no FASTA, no noodles writer.
 //!
 //! See `ia/feature_implementation_plans/per_sample_caller_cram_input.md`
@@ -19,7 +19,7 @@ use noodles_sam::alignment::record_buf::QualityScores;
 use noodles_sam::alignment::record_buf::RecordBuf;
 use noodles_sam::alignment::record_buf::Sequence;
 
-use crate::bam::cram_input::OpenCram;
+use crate::bam::alignment_input::OpenAlignmentFile;
 use crate::fasta::{ContigEntry, ContigList};
 use crate::pileup::walker::CigarOp;
 
@@ -79,9 +79,9 @@ pub(crate) fn record_spec(spec: RecordSpec) -> RecordBuf {
     rb
 }
 
-pub(crate) fn open_cram_from_records(path: &str, records: Vec<RecordBuf>) -> OpenCram {
+pub(crate) fn open_cram_from_records(path: &str, records: Vec<RecordBuf>) -> OpenAlignmentFile {
     let iter = records.into_iter().map(Ok::<_, io::Error>);
-    OpenCram {
+    OpenAlignmentFile {
         path: PathBuf::from(path),
         records: Box::new(iter),
     }

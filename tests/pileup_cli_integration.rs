@@ -13,7 +13,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 
 use common::{CONTIG_NAME, build_cram, build_fasta, fixture_md5, read_record};
-use pop_var_caller::bam::cram_input::{
+use pop_var_caller::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
     DEFAULT_MISMATCH_BQ_FLOOR,
 };

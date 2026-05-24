@@ -92,7 +92,7 @@ pub const DEFAULT_MAX_INDEL_COLUMN_DEPTH: u32 = 250;
 // ---------------------------------------------------------------------
 
 /// Tunable thresholds the walker reads at run time. Mirrors the
-/// per-stage pattern of `CramMergedReaderConfig` (input stage):
+/// per-stage pattern of `AlignmentMergedReaderConfig` (input stage):
 /// every value here is a parameter the future CLI binds to. New
 /// walker tunables go in this struct rather than as bare `pub
 /// const`s; existing consts are migrated opportunistically.
@@ -108,7 +108,7 @@ pub const DEFAULT_MAX_INDEL_COLUMN_DEPTH: u32 = 250;
 ///
 /// **Truncation contract.** When the contributor count at a column
 /// exceeds the cap, the walker keeps the first `cap` contributors
-/// in **admission order** (= the order `cram_input` delivered them,
+/// in **admission order** (= the order `alignment_input` delivered them,
 /// which under normal pipeline operation is coordinate-then-arrival
 /// order across the merged CRAMs) and drops the rest. This is *not*
 /// a uniform random sample. It is approximately unbiased under the

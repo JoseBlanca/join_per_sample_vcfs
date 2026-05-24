@@ -1,4 +1,4 @@
-//! Iterator adapter that sits between `CramMergedReader` and
+//! Iterator adapter that sits between `AlignmentMergedReader` and
 //! `pileup::walker::run`. Pulls a chunk of coordinate-sorted
 //! `MappedRead`s, BAQ-caps each in parallel via rayon (one engine per
 //! worker thread), and yields the resulting `PreparedRead`s in the
@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use crate::bam::cram_input::MappedRead;
-use crate::bam::errors::CramInputError;
+use crate::bam::alignment_input::MappedRead;
+use crate::bam::errors::AlignmentInputError;
 use crate::fasta::ContigList;
 use crate::fasta::ManualEvictChromRefFetcher;
 use crate::pileup::walker::PreparedRead;
@@ -68,8 +68,8 @@ impl BaqSkipCounts {
     }
 }
 
-/// Iterator adapter: `Iterator<Item = Result<MappedRead, CramInputError>>`
-/// → `Iterator<Item = Result<PreparedRead, CramInputError>>` with a
+/// Iterator adapter: `Iterator<Item = Result<MappedRead, AlignmentInputError>>`
+/// → `Iterator<Item = Result<PreparedRead, AlignmentInputError>>` with a
 /// rayon-parallel BAQ pass in between.
 ///
 /// Errors from the upstream are propagated **after** any
@@ -111,14 +111,14 @@ pub struct BaqStream<R> {
     /// front-to-back via `pop_front`. Lives on the stream so the
     /// backing buffer survives across refills.
     current_batch: VecDeque<PreparedRead>,
-    pending_error: Option<CramInputError>,
+    pending_error: Option<AlignmentInputError>,
     upstream_done: bool,
     skip_counts: BaqSkipCounts,
 }
 
 impl<R> BaqStream<R>
 where
-    R: Iterator<Item = Result<MappedRead, CramInputError>>,
+    R: Iterator<Item = Result<MappedRead, AlignmentInputError>>,
 {
     /// Construct a `BaqStream`. Panics if `chunk_size == 0` — a
     /// programmer error in every call site (silently coercing to 1
@@ -263,9 +263,9 @@ where
 
 impl<R> Iterator for BaqStream<R>
 where
-    R: Iterator<Item = Result<MappedRead, CramInputError>>,
+    R: Iterator<Item = Result<MappedRead, AlignmentInputError>>,
 {
-    type Item = Result<PreparedRead, CramInputError>;
+    type Item = Result<PreparedRead, AlignmentInputError>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(p) = self.current_batch.pop_front() {

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use common::{WRONG_MD5, build_cram, build_fasta, fixture_md5, read_record};
 use noodles_sam::alignment::record_buf::RecordBuf;
-use pop_var_caller::bam::cram_input::{
+use pop_var_caller::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MISMATCH_BQ_FLOOR,
 };
 use pop_var_caller::baq::{
