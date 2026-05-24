@@ -19,9 +19,46 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **BAM input support** (commits
+> - **Last completed task:** **Code review of the BAM input
+>   slice** —
+>   [bam_input_support_2026-05-24.md](doc/devel/reports/reviews/bam_input_support_2026-05-24.md).
+>   Verdict: **Approve-with-changes** (0 Blockers, 19 Major, 22
+>   Minor, grouped Nits). Architecture sound — `unsafe_concurrency`
+>   came back clean (no `unsafe`, no shared mutable state; `Send` /
+>   `Sync` correctness established structurally via two compile-time
+>   bounds); mixed-format gate enforced at both pipeline and
+>   pre-flight layers; the no-EOF-latch design on `OwnedBamRecords`
+>   is documented and regression-tested. Major findings cluster
+>   around: (a) rename-debt — CRAM vocabulary still in
+>   `PileupCliError::CramInput` variant + display string + six
+>   `AlignmentInputError` display strings + several locals → every
+>   BAM error currently prints as `stage 1: CRAM input: failed to
+>   open CRAM '/path/sample.bam': …`; (b) `AlignmentInputError` /
+>   `PileupCliError` / `BamIndex` missing `#[non_exhaustive]` while
+>   sibling types carry it (semver tax going forward); (c)
+>   `load_per_input_headers` reimplements per-format opener work
+>   without the CRAM-version gate that the canonical helper
+>   enforces — CRAM 4.x silently passes header-load and is only
+>   rejected later; (d) `.csi`/`.bai` policy + CSI depth defaults
+>   live in function bodies, not named constants; (e) test gaps for
+>   the new `AlignmentIndexFormatMismatch`, `UnsupportedExtension`,
+>   indexed-BAM chunk-walking, and `load_alignment_index` branches.
+>   Verification: `cargo fmt --check` / `cargo clippy --all-targets
+>   --all-features -D warnings` / `cargo test --all-targets
+>   --all-features` all clean; `cargo doc --no-deps --lib` fails on
+>   14 pre-existing intra-doc-link warnings (`git blame` confirms
+>   the one in-scope warning at `alignment_input.rs:135` dates to
+>   2026-05-12 — pre-existing). Six missing-test specs in §8 of the
+>   report. Per-category audit trail at
+>   `tmp/review_2026-05-24_bam-input/` (11 categories dispatched in
+>   parallel; `unsafe_concurrency` returned `No findings`). Four
+>   open questions for the author (rename strategy, `#[non_exhaustive]`
+>   omission was intent or oversight, CRAM-version gating skip,
+>   CSI depth=5 choice). The BAM-input slice itself remains:
+> - **Previous task:** **BAM input support** (commits
 >   `b87ec89` → `18a9b9e` → `266e79a` → `4ad1e04` → `630ac7c` →
->   `a4d1f6d` → `bee6bc1` → `d0af049`) — impl report
+>   `a4d1f6d` → `bee6bc1` → `d0af049` → `344f1b2` → `be3b38a`) —
+>   impl report
 >   [bam_input_support_2026-05-24.md](doc/devel/reports/implementations/bam_input_support_2026-05-24.md);
 >   plan
 >   [bam_input_support.md](doc/devel/implementation_plans/bam_input_support.md).
@@ -60,7 +97,7 @@ Skills and agents are instructed to leave it untouched.
 >   the same `examples/profile_from_bam_e2e.rs` /
 >   `benches/from_bam_e2e_perf.rs` infrastructure called out in
 >   the prior task's follow-ups would cover both formats.
-> - **Previous task:** **`var-calling-from-bam` per-chromosome
+> - **Previous-previous task:** **`var-calling-from-bam` per-chromosome
 >   parallelism** (commits `29b28e8` → `e5261ba` → `050da41` →
 >   `a858832`) — impl report
 >   [var_calling_from_bam_per_chromosome_2026-05-24.md](doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md);
@@ -308,7 +345,7 @@ Stage descriptions are one-line reminders; the spec is authoritative.
 Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
 #### Alignment-file input (CRAM + BAM)
-- **Status:** implemented (BAM); shipped (CRAM)
+- **Status:** reviewed (BAM slice); shipped (CRAM)
 - **Plans:**
   - CRAM slice: [per_sample_caller_cram_input.md](doc/devel/implementation_plans/per_sample_caller_cram_input.md)
   - BAM slice: [bam_input_support.md](doc/devel/implementation_plans/bam_input_support.md)
@@ -316,9 +353,13 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - CRAM slice: [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/implementations/per_sample_caller_cram_input_2026-04-29.md)
   - BAM slice (2026-05-24): [bam_input_support_2026-05-24.md](doc/devel/reports/implementations/bam_input_support_2026-05-24.md)
 - **Code:** [src/bam/](src/bam/) — `alignment_input.rs` (merge + filter + header validators, format-agnostic), `cram_input.rs` + `bam_input.rs` (per-format owned record-stream decoders), `index_preflight.rs` (CRAI / CSI / BAI detection + build), `errors.rs`.
+- **Latest reviews:**
+  - BAM slice (2026-05-24): [bam_input_support_2026-05-24.md](doc/devel/reports/reviews/bam_input_support_2026-05-24.md) — Approve-with-changes: 0 Blockers, 19 Major (M1–M19), 22 Minor (Mi1–Mi22), grouped Nits. Architecture sound (no `unsafe`, no shared mutable state, `'static + Send` iterators correct by construction); Major findings cluster around (a) rename-debt — CRAM vocabulary still in error displays + variant name `PileupCliError::CramInput` mislabels every BAM error; (b) missing `#[non_exhaustive]` on `AlignmentInputError` / `PileupCliError` / `BamIndex`; (c) `load_per_input_headers` reimplements opener work AND skips the CRAM-version gate that the per-format helper has — CRAM 4.x silently passes header-load; (d) `.csi`/`.bai` policy + CSI depth defaults live in function bodies, not named constants; (e) reliability test gaps for the new `AlignmentIndexFormatMismatch`, `UnsupportedExtension`, indexed-BAM chunk-walk, and `load_alignment_index` branches. Six missing-test specs in §8 of the report.
 - **Latest reviews / fixes (CRAM):** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/reviews/per_sample_caller_cram_input_2026-04-29.md), [fixes_applied_2026-05-01.md](doc/devel/reports/implementations/fixes_applied_2026-05-01.md)
-- **Open (BAM slice — from the impl report's deferred-list):**
+- **Open (BAM slice — from the 2026-05-24 review + impl-report deferred-list):**
   - Wall-time validation on real multi-chrom BAMs (analogue of cohort H1's 3.85× at T=13 on tomato CRAMs). Picked up alongside the `examples/profile_from_bam_e2e.rs` + `benches/from_bam_e2e_perf.rs` infrastructure already deferred from the prior task.
+  - **19 Major + 22 Minor findings from the 2026-05-24 review** — top 3: **M5** (`load_per_input_headers` reimplements opener work + skips CRAM-version gate), **M4** (`AlignmentInputError` missing `#[non_exhaustive]` — semver tax going forward), **M1** (error vocabulary still says "CRAM" on BAM inputs — mislabels every BAM error at three layers). Full list in the review report.
+  - **6 missing tests to add** (review §8): `AlignmentIndexFormatMismatch` typed-error path, pileup `UnsupportedExtension` path, indexed-BAM multi-chunk traversal, indexed-BAM IO-error propagation, `load_alignment_index` triplet (`.csi`-preferred / `.bai`-fallback / no-index), linear-BAM error propagation.
   - **Closed 2026-05-24** (commit `344f1b2`): internal `crams: &[PathBuf]` → `alignment_files: &[PathBuf]` rename across the four private helpers; `AlignmentInputError::PerInputHandleCountMismatch.crams` → `.inputs` field rename + message update.
   - Lift the no-mixing restriction (CRAM + BAM in one invocation) if a real workload appears. Pre-flight gate is the only place the restriction lives; merge core is already format-agnostic.
 
