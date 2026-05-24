@@ -19,9 +19,7 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use pop_var_caller::fasta::{ChromRefFetchError, MultiChromRefFetcher};
-use pop_var_caller::per_sample_pileup::pileup::{
-    CigarOp, MateRole, PreparedRead, WalkerConfig, run,
-};
+use pop_var_caller::pileup::walker::{CigarOp, MateRole, PreparedRead, WalkerConfig, run};
 
 /// Constant-base reference. The walker only needs `MultiChromRefFetcher`,
 /// so we avoid the FASTA toolchain entirely.

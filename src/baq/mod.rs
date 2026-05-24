@@ -8,8 +8,8 @@
 //! configuration types. It has no dependency on the per-sample-pileup
 //! walker — the pileup-specific per-read driver and the rayon stream
 //! adapter live in
-//! [`crate::per_sample_pileup::baq_engine`] and
-//! [`crate::per_sample_pileup::baq_stream`].
+//! [`crate::pileup::per_sample::baq_engine`] and
+//! [`crate::pileup::per_sample::baq_stream`].
 //!
 //! The algorithm and parameter choices are pinned in
 //! [`doc/devel/implementation_plans/baq.md`]; the architecture

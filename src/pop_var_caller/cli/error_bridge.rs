@@ -26,9 +26,9 @@ use std::rc::Rc;
 /// (one `Rc::clone` per handle).
 ///
 /// Generic over the error type `E` — typically
-/// [`CramInputError`](crate::per_sample_pileup::errors::CramInputError)
+/// [`CramInputError`](crate::pileup::per_sample::errors::CramInputError)
 /// for the Stage 1 CRAM-input seam or
-/// [`WalkerError`](crate::per_sample_pileup::pileup::WalkerError) for
+/// [`WalkerError`](crate::pileup::walker::WalkerError) for
 /// the from-bam walker shim.
 pub struct ErrorHandle<E>(Rc<RefCell<Option<E>>>);
 
@@ -61,7 +61,7 @@ impl<E> ErrorHandle<E> {
 /// after.
 ///
 /// `T` is the item type the downstream wants
-/// (e.g. [`PreparedRead`](crate::per_sample_pileup::pileup::PreparedRead),
+/// (e.g. [`PreparedRead`](crate::pileup::walker::PreparedRead),
 /// [`PileupRecord`](crate::pileup_record::PileupRecord)).
 /// `E` is the upstream error type stored in the handle.
 pub struct ErrorSheddingAdapter<I, T, E>
@@ -124,9 +124,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::per_sample_pileup::cram_input::CigarOp;
-    use crate::per_sample_pileup::errors::CramInputError;
-    use crate::per_sample_pileup::pileup::{MateRole, PreparedRead};
+    use crate::pileup::per_sample::errors::CramInputError;
+    use crate::pileup::walker::CigarOp;
+    use crate::pileup::walker::{MateRole, PreparedRead};
 
     fn dummy_prepared(pos: u32) -> PreparedRead {
         PreparedRead {

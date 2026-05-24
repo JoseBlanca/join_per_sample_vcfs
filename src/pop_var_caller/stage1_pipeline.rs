@@ -19,13 +19,13 @@ use std::path::{Path, PathBuf};
 
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
-use crate::per_sample_pileup::baq_engine::prepare_passthrough;
-use crate::per_sample_pileup::baq_stream::{BaqSkipCounts, BaqStream};
-use crate::per_sample_pileup::cram_input::{
+use crate::pileup::per_sample::baq_engine::prepare_passthrough;
+use crate::pileup::per_sample::baq_stream::{BaqSkipCounts, BaqStream};
+use crate::pileup::per_sample::cram_input::{
     CramMergedReader, CramMergedReaderConfig, FilterCounts,
 };
-use crate::per_sample_pileup::errors::CramInputError;
-use crate::per_sample_pileup::pileup::{self, PileupWalker, PreparedRead, WalkerConfig};
+use crate::pileup::per_sample::errors::CramInputError;
+use crate::pileup::walker::{self, PileupWalker, PreparedRead, WalkerConfig};
 
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;
@@ -153,7 +153,7 @@ where
         }));
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = pileup::run(input, &walker_fetcher, &walker_cfg);
+        let walker = walker::run(input, &walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,
@@ -177,7 +177,7 @@ where
         let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = pileup::run(input, &walker_fetcher, &walker_cfg);
+        let walker = walker::run(input, &walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,
@@ -242,7 +242,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::errors::CramInputError;
+    use crate::pileup::per_sample::errors::CramInputError;
 
     /// On success, the closure result is preserved and the stash (if
     /// any) is handed back to the caller.

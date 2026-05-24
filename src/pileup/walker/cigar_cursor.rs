@@ -686,8 +686,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::per_sample_pileup::pileup::CigarOp;
-    use crate::per_sample_pileup::pileup::decompose::decompose;
+    use crate::pileup::walker::CigarOp;
+    use crate::pileup::walker::decompose::decompose;
 
     fn make_read(
         cigar: Vec<CigarOp>,

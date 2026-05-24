@@ -1289,7 +1289,7 @@ mod tests {
     use super::*;
 
     use crate::fasta::{ContigEntry, ContigList};
-    use crate::per_sample_pileup::cram_files::{ContigSpec, build_fasta};
+    use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
 
     fn contig_list(entries: &[(&str, u64)]) -> ContigList {
         ContigList {

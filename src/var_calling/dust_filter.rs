@@ -49,7 +49,7 @@
 //!
 //! ## Coordinates
 //!
-//! [`PileupRecord::pos`](crate::per_sample_pileup::pileup::PileupRecord)
+//! [`PileupRecord::pos`](crate::pileup::walker::PileupRecord)
 //! is 1-based; the internal sdust mask is 0-based half-open. The
 //! conversion happens at the sweep-lookup boundary
 //! ([`DustFilter::next`]) and nowhere else. `DustFilter` assumes

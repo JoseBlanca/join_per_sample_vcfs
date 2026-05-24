@@ -25,10 +25,11 @@ use tempfile::TempDir;
 
 use pop_var_caller::baq::BaqConfig;
 use pop_var_caller::fasta::{ContigEntry, ContigList, ManualEvictChromRefFetcher};
-use pop_var_caller::per_sample_pileup::baq_engine::{BaqEngine, BaqOutcome};
-use pop_var_caller::per_sample_pileup::baq_stream::{BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
-use pop_var_caller::per_sample_pileup::cram_input::{CigarOp, MappedRead};
-use pop_var_caller::per_sample_pileup::errors::CramInputError;
+use pop_var_caller::pileup::per_sample::baq_engine::{BaqEngine, BaqOutcome};
+use pop_var_caller::pileup::per_sample::baq_stream::{BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
+use pop_var_caller::pileup::per_sample::cram_input::MappedRead;
+use pop_var_caller::pileup::per_sample::errors::CramInputError;
+use pop_var_caller::pileup::walker::CigarOp;
 
 /// Write a single-contig FASTA + `.fai` to `dir`. Contig is `length`
 /// bases of `b'A'` (every read in the bench is Match-only over A's, so

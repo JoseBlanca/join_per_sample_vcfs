@@ -161,8 +161,8 @@ pub trait MultiChromRefFetcher {
 /// shared reference into [`PileupWalker::new`] / [`run`]. The walker
 /// only ever calls `&self` methods, so the borrow is sufficient.
 ///
-/// [`PileupWalker::new`]: crate::per_sample_pileup::pileup::PileupWalker::new
-/// [`run`]: crate::per_sample_pileup::pileup::run
+/// [`PileupWalker::new`]: crate::pileup::walker::PileupWalker::new
+/// [`run`]: crate::pileup::walker::run
 impl<T: MultiChromRefFetcher + ?Sized> MultiChromRefFetcher for &T {
     fn fetch(
         &self,

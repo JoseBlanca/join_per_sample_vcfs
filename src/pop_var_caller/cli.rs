@@ -16,11 +16,11 @@ use thiserror::Error;
 
 use crate::baq::BaqConfig;
 use crate::fasta::ContigList;
-use crate::per_sample_pileup::baq_stream::BaqSkipCounts;
-use crate::per_sample_pileup::cram_input::{CramMergedReaderConfig, FilterCounts};
-use crate::per_sample_pileup::errors::CramInputError;
-use crate::per_sample_pileup::pileup::{RunSummary, WalkerConfig};
-use crate::per_sample_pileup::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
+use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
+use crate::pileup::per_sample::cram_input::{CramMergedReaderConfig, FilterCounts};
+use crate::pileup::per_sample::errors::CramInputError;
+use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
+use crate::pileup::walker::{RunSummary, WalkerConfig};
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, format_md5_hex, rfc3339_now,
 };
@@ -476,12 +476,12 @@ mod tests {
         SAMTOOLS_ILLUMINA_BAND_HALF_WIDTH, SAMTOOLS_ILLUMINA_GAP_EXTEND_PROB,
         SAMTOOLS_ILLUMINA_GAP_OPEN_PROB,
     };
-    use crate::per_sample_pileup::baq_stream::DEFAULT_BAQ_CHUNK_SIZE;
-    use crate::per_sample_pileup::cram_input::{
+    use crate::pileup::per_sample::baq_stream::DEFAULT_BAQ_CHUNK_SIZE;
+    use crate::pileup::per_sample::cram_input::{
         DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
         DEFAULT_MISMATCH_BQ_FLOOR,
     };
-    use crate::per_sample_pileup::pileup::{
+    use crate::pileup::walker::{
         DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
         DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
     };

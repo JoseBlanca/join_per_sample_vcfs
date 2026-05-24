@@ -20,7 +20,7 @@ use noodles_sam::{
 };
 
 use crate::baq::{BaqConfig, ProbalnScratch, probaln_glocal};
-use crate::per_sample_pileup::cram_input::CigarOp;
+use crate::pileup::walker::CigarOp;
 
 use super::baq_engine::{
     apply_baq_cap_into, compute_alignment_end, encode_base, extend_ref_window,
@@ -205,10 +205,10 @@ fn parity_realn02() {
 // ---------------------------------------------------------------------
 
 use crate::fasta::ManualEvictChromRefFetcher;
-use crate::per_sample_pileup::cram_input::{
+use crate::pileup::per_sample::cram_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
-use crate::per_sample_pileup::pileup::MateRole;
+use crate::pileup::walker::MateRole;
 
 use super::baq_engine::{BaqEngine, BaqOutcome, BaqSkipReason};
 
@@ -710,8 +710,8 @@ fn baq_skip_counts_bump_is_exhaustive_per_variant() {
 // BaqStream — rayon-parallel adapter tests.
 // ---------------------------------------------------------------------
 
-use crate::per_sample_pileup::errors::CramInputError;
-use crate::per_sample_pileup::pileup::PreparedRead;
+use crate::pileup::per_sample::errors::CramInputError;
+use crate::pileup::walker::PreparedRead;
 
 use super::baq_stream::BaqStream;
 

@@ -130,10 +130,7 @@ pub fn drive_walker(
 pub fn drive_walker_with_summary(
     reads: Vec<PreparedRead>,
     ref_fetcher: MockFasta,
-) -> (
-    Vec<crate::pileup_record::PileupRecord>,
-    super::walker::RunSummary,
-) {
+) -> (Vec<crate::pileup_record::PileupRecord>, super::RunSummary) {
     drive_walker_with_config(reads, ref_fetcher, &WalkerConfig::default())
 }
 
@@ -144,10 +141,7 @@ pub fn drive_walker_with_config(
     reads: Vec<PreparedRead>,
     ref_fetcher: MockFasta,
     config: &WalkerConfig,
-) -> (
-    Vec<crate::pileup_record::PileupRecord>,
-    super::walker::RunSummary,
-) {
+) -> (Vec<crate::pileup_record::PileupRecord>, super::RunSummary) {
     let mut walker = run(reads, &ref_fetcher, config);
     let records: Vec<crate::pileup_record::PileupRecord> = (&mut walker)
         .map(|r| r.expect("walker yielded error"))

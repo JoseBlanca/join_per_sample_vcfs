@@ -14,7 +14,8 @@ use noodles_sam as sam;
 
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
-use crate::per_sample_pileup::errors::CramInputError;
+use crate::pileup::per_sample::errors::CramInputError;
+use crate::pileup::walker::CigarOp;
 
 // ---------------------------------------------------------------------
 // Defaults
@@ -52,23 +53,6 @@ pub const DEFAULT_MIN_READ_LENGTH: u32 = 30;
 /// decoder underneath already does its own slice-level batching; an
 /// extra outer buffer would just delay records without saving work.
 const PER_PEEKER_BUFFER_SIZE: usize = 1;
-
-// ---------------------------------------------------------------------
-// CIGAR
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CigarOp {
-    Match(u32),
-    Insertion(u32),
-    Deletion(u32),
-    Skip(u32),
-    SoftClip(u32),
-    HardClip(u32),
-    Padding(u32),
-    SeqMatch(u32),
-    SeqMismatch(u32),
-}
 
 // ---------------------------------------------------------------------
 // MappedRead
@@ -1502,7 +1486,7 @@ fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
 /// decoding; `ref_seq` is the reference slice covering
 /// `[read.pos, read.pos + cigar_ref_span(cigar))`. Indexing into
 /// these slices uses the standard CIGAR semantics — see
-/// [`crate::per_sample_pileup::pileup::decompose`] for the
+/// [`crate::pileup::walker::decompose`] for the
 /// reference walk pattern this function mirrors.
 fn read_exceeds_mismatch_fraction(
     cigar: &[CigarOp],
@@ -1815,7 +1799,7 @@ fn cigar_to_ops(cigar: &sam::alignment::record_buf::Cigar) -> Vec<CigarOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per_sample_pileup::record_specs::{
+    use crate::pileup::per_sample::record_specs::{
         RecordSpec, default_contigs, open_cram_from_records, record_spec,
     };
 
@@ -3503,7 +3487,7 @@ mod tests {
 
     // --- Group B: via new (real CRAM + FASTA) ------------------------
 
-    use crate::per_sample_pileup::cram_files::{
+    use crate::pileup::per_sample::cram_files::{
         ContigSpec, HeaderOverrides, build_cram, build_cram_with_major_version, build_fasta,
     };
 

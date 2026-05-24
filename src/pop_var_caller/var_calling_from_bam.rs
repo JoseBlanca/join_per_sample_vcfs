@@ -29,7 +29,7 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::fasta::{ContigList, StreamingChromRefFetcher};
-use crate::per_sample_pileup::pileup::WalkerError;
+use crate::pileup::walker::WalkerError;
 use crate::pileup_record::PileupRecord;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;

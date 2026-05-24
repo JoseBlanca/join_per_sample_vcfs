@@ -18,7 +18,7 @@
 pub mod baq;
 pub mod fasta;
 pub mod iter_ext;
-pub mod per_sample_pileup;
+pub mod pileup;
 pub mod pileup_record;
 pub mod pop_var_caller;
 pub mod psp;

@@ -16,19 +16,40 @@ mod active_read_set;
 mod chain_id_allocator;
 mod cigar_cursor;
 mod decompose;
+mod driver;
 mod errors;
 mod open_record;
-mod walker;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 use std::sync::Arc;
 
-pub use crate::per_sample_pileup::cram_input::CigarOp;
 pub use chain_id_allocator::DEFAULT_MAX_ACTIVE_READS;
+pub use driver::{PileupWalker, RunSummary, run};
 pub use errors::WalkerError;
-pub use walker::{PileupWalker, RunSummary, run};
+
+// ---------------------------------------------------------------------
+// CIGAR
+// ---------------------------------------------------------------------
+
+/// One CIGAR operation: an opcode (M/I/D/N/S/H/P/=/X) with a length in
+/// reference or read positions, depending on the op. Mirrors htslib /
+/// noodles' op set; consumed by the walker's CIGAR cursor, the BAQ
+/// engine's window computation, and the CRAM input parser that builds
+/// it from each record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CigarOp {
+    Match(u32),
+    Insertion(u32),
+    Deletion(u32),
+    Skip(u32),
+    SoftClip(u32),
+    HardClip(u32),
+    Padding(u32),
+    SeqMatch(u32),
+    SeqMismatch(u32),
+}
 
 // ---------------------------------------------------------------------
 // Defaults / tunables

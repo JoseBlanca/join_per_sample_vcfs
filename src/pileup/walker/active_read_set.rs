@@ -227,7 +227,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::per_sample_pileup::pileup::CigarOp;
+    use crate::pileup::walker::CigarOp;
 
     fn solo_read(qname: &str, chrom_id: u32, alignment_start: u32, span: u32) -> PreparedRead {
         PreparedRead {

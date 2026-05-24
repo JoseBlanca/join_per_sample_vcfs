@@ -24,9 +24,7 @@ use std::io;
 use std::sync::Arc;
 
 use pop_var_caller::fasta::{ChromRefFetchError, MultiChromRefFetcher};
-use pop_var_caller::per_sample_pileup::pileup::{
-    CigarOp, MateRole, PreparedRead, WalkerConfig, run,
-};
+use pop_var_caller::pileup::walker::{CigarOp, MateRole, PreparedRead, WalkerConfig, run};
 
 struct ConstFasta {
     len: usize,

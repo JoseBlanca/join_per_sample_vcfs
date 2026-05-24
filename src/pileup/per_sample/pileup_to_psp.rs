@@ -16,8 +16,8 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use super::pileup::{PileupWalker, PreparedRead, RunSummary, WalkerError};
 use crate::fasta::MultiChromRefFetcher;
+use crate::pileup::walker::{PileupWalker, PreparedRead, RunSummary, WalkerError};
 use crate::psp::PspWriteError;
 use crate::psp::writer::PspWriter;
 
@@ -74,9 +74,9 @@ where
 mod tests {
     use std::io::Cursor;
 
-    use super::super::pileup::tests::{MockFasta, snp_read};
-    use super::super::pileup::{WalkerConfig, run};
     use super::*;
+    use crate::pileup::walker::tests::{MockFasta, snp_read};
+    use crate::pileup::walker::{WalkerConfig, run};
     use crate::psp::PspReader;
     use crate::psp::test_fixtures::writer_header;
     use crate::psp::writer::PspWriter;
