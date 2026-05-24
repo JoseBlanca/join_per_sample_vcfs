@@ -26,7 +26,9 @@ use std::sync::OnceLock;
 
 use bstr::BString;
 use md5::{Digest, Md5};
+use noodles_bam as bam;
 use noodles_cram as cram;
+use noodles_csi as csi;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 use sam::alignment::record::Flags;
@@ -164,6 +166,93 @@ pub fn build_cram(
     }
     sam::alignment::io::Write::finish(&mut writer, &header).expect("finish cram");
     cram_path
+}
+
+/// Build a single-contig BAM for `sample` with the given records.
+/// BAM filename is `{sample}.bam` under `dir`. `md5` controls the
+/// `@SQ M5` tag — see [`build_sam_header`] for the three intended
+/// values. Unlike CRAM, BAM stores sequences inline and does not
+/// take a reference repository.
+pub fn build_bam(dir: &Path, sample: &str, md5: Option<&str>, records: &[RecordBuf]) -> PathBuf {
+    let bam_path = dir.join(format!("{sample}.bam"));
+    let header = build_sam_header(sample, md5);
+
+    let file = File::create(&bam_path).expect("create bam");
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header).expect("write header");
+    for record in records {
+        sam::alignment::io::Write::write_alignment_record(&mut writer, &header, record)
+            .expect("write record");
+    }
+    writer.try_finish().expect("finish bam");
+    bam_path
+}
+
+/// Build a `.csi` next to `bam_path` by scanning the BAM. Returns
+/// the index path. Mirrors the build-csi-for-bam helper in
+/// `crate::bam::index_preflight` but lives here so the tests don't
+/// reach across the integration / library boundary for what is
+/// just a one-shot file-writing fixture.
+pub fn build_csi(bam_path: &Path) -> PathBuf {
+    use csi::binning_index::Indexer;
+    use csi::binning_index::index::reference_sequence::bin::Chunk;
+    use csi::binning_index::index::reference_sequence::index::BinnedIndex;
+    use sam::alignment::Record as _;
+
+    let mut reader = bam::io::reader::Builder
+        .build_from_path(bam_path)
+        .expect("open bam for csi build");
+    let header = reader.read_header().expect("read header for csi build");
+
+    let mut indexer: Indexer<BinnedIndex> = Indexer::default();
+    let mut chunk_start = reader.get_ref().virtual_position();
+    let mut record = bam::Record::default();
+
+    while reader.read_record(&mut record).expect("read record") != 0 {
+        let chunk_end = reader.get_ref().virtual_position();
+        let alignment_context = match (
+            record.reference_sequence_id().transpose().expect("ref id"),
+            record.alignment_start().transpose().expect("start"),
+            record.alignment_end().transpose().expect("end"),
+        ) {
+            (Some(id), Some(start), Some(end)) => {
+                let is_mapped = !record.flags().is_unmapped();
+                Some((id, start, end, is_mapped))
+            }
+            _ => None,
+        };
+        let chunk = Chunk::new(chunk_start, chunk_end);
+        indexer
+            .add_record(alignment_context, chunk)
+            .expect("add record");
+        chunk_start = chunk_end;
+    }
+
+    let index = indexer.build(header.reference_sequences().len());
+    let csi_path = csi_path_for(bam_path);
+    csi::fs::write(&csi_path, &index).expect("write csi");
+    csi_path
+}
+
+/// Build a `.bai` next to `bam_path` by scanning the BAM. Returns
+/// the index path. Used by the .bai-fallback integration test.
+pub fn build_bai(bam_path: &Path) -> PathBuf {
+    let index = bam::fs::index(bam_path).expect("build bai");
+    let bai_path = bai_path_for(bam_path);
+    bam::bai::fs::write(&bai_path, &index).expect("write bai");
+    bai_path
+}
+
+fn csi_path_for(bam: &Path) -> PathBuf {
+    let mut s = bam.as_os_str().to_owned();
+    s.push(".csi");
+    PathBuf::from(s)
+}
+
+fn bai_path_for(bam: &Path) -> PathBuf {
+    let mut s = bam.as_os_str().to_owned();
+    s.push(".bai");
+    PathBuf::from(s)
 }
 
 /// Build a synthetic single-end read at `pos` (1-based), all-Match
