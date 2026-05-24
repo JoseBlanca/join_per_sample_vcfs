@@ -319,8 +319,7 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Latest reviews / fixes (CRAM):** [per_sample_caller_cram_input_2026-04-29.md](doc/devel/reports/reviews/per_sample_caller_cram_input_2026-04-29.md), [fixes_applied_2026-05-01.md](doc/devel/reports/implementations/fixes_applied_2026-05-01.md)
 - **Open (BAM slice — from the impl report's deferred-list):**
   - Wall-time validation on real multi-chrom BAMs (analogue of cohort H1's 3.85× at T=13 on tomato CRAMs). Picked up alongside the `examples/profile_from_bam_e2e.rs` + `benches/from_bam_e2e_perf.rs` infrastructure already deferred from the prior task.
-  - Internal helper-parameter renames `crams: &[PathBuf]` → `alignment_files: &[PathBuf]` in `stage1_pipeline.rs` and three private helpers in `var_calling_from_bam.rs`. Internal-only.
-  - `PerInputHandleCountMismatch.crams: usize` field rename to `inputs`. Public-error-type breaking change; defer to a coordinated naming pass.
+  - **Closed 2026-05-24** (commit `344f1b2`): internal `crams: &[PathBuf]` → `alignment_files: &[PathBuf]` rename across the four private helpers; `AlignmentInputError::PerInputHandleCountMismatch.crams` → `.inputs` field rename + message update.
   - Lift the no-mixing restriction (CRAM + BAM in one invocation) if a real workload appears. Pre-flight gate is the only place the restriction lives; merge core is already format-agnostic.
 
 #### Pileup walker
