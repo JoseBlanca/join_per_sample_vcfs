@@ -120,8 +120,8 @@ pub struct VarCallingFromBamArgs {
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum VarCallingFromBamCliError {
-    /// Stage 1 setup / IO failure: CRAM-input validation, reader
-    /// open, header parse.
+    /// Stage 1 setup / IO failure: alignment-input validation,
+    /// reader open, header parse.
     #[error("stage 1: {0}")]
     Stage1(#[from] PileupCliError),
 
@@ -161,10 +161,10 @@ pub enum VarCallingFromBamCliError {
     #[error("posterior engine config: {0}")]
     PosteriorConfig(#[from] PosteriorEngineConfigError),
 
-    /// One contig in the CRAM header has no `@SQ M5` checksum.
+    /// One contig in the alignment-file header has no `@SQ M5` checksum.
     #[error(
-        "contig '{contig}' has no @SQ M5 checksum in the input CRAM(s); \
-         re-CRAM with a tool that emits M5 (e.g. samtools)"
+        "contig '{contig}' has no @SQ M5 checksum in the input alignment file(s); \
+         re-create the file with a tool that emits @SQ M5 (e.g. samtools view -t)"
     )]
     MissingMd5 { contig: String },
 
@@ -291,7 +291,7 @@ pub fn run_var_calling_from_bam(
     // 2. Build the Stage 1 configs from args. The helpers live in
     //    `cli.rs` and take `&Stage1Args` directly — same code path
     //    drives this subcommand and `pileup`, no duplication.
-    let cram_cfg = crate::pop_var_caller::cli::cram_config_from_args(stage1);
+    let alignment_cfg = crate::pop_var_caller::cli::alignment_config_from_args(stage1);
     let baq_cfg = crate::pop_var_caller::cli::baq_config_from_args(stage1);
     let walker_cfg = crate::pop_var_caller::cli::walker_config_from_args(stage1);
 
@@ -337,9 +337,9 @@ pub fn run_var_calling_from_bam(
         let reader = crate::bam::alignment_input::AlignmentMergedReader::new(
             &args.alignment_files,
             &args.reference,
-            cram_cfg,
+            alignment_cfg,
         )
-        .map_err(PileupCliError::CramInput)?;
+        .map_err(PileupCliError::AlignmentInput)?;
         canonical_contigs = reader.contigs().clone();
         sample_name = reader.sample_name().to_string();
     }
@@ -422,7 +422,7 @@ pub fn run_var_calling_from_bam(
                     sample_name.clone(),
                     chromosomes.clone(),
                     &args.reference,
-                    cram_cfg,
+                    alignment_cfg,
                     baq_cfg,
                     walker_cfg,
                     stage1.baq_chunk_size,
@@ -495,16 +495,16 @@ fn load_per_input_headers(
     let mut headers = Vec::with_capacity(alignment_files.len());
     for path in alignment_files {
         let kind = AlignmentFileKind::from_path(path).ok_or_else(|| {
-            PileupCliError::CramInput(AlignmentInputError::UnsupportedExtension {
+            PileupCliError::AlignmentInput(AlignmentInputError::UnsupportedExtension {
                 path: path.clone(),
             })
         })?;
         let header = match kind {
             AlignmentFileKind::Cram => {
-                read_cram_header_only(path).map_err(PileupCliError::CramInput)?
+                read_cram_header_only(path).map_err(PileupCliError::AlignmentInput)?
             }
             AlignmentFileKind::Bam => {
-                read_bam_header_only(path).map_err(PileupCliError::CramInput)?
+                read_bam_header_only(path).map_err(PileupCliError::AlignmentInput)?
             }
         };
         headers.push(Arc::new(header));
@@ -619,7 +619,7 @@ fn process_one_chromosome_from_bam(
     sample_name: String,
     all_chromosomes: Vec<ParsedChromosome>,
     reference: &std::path::Path,
-    cram_cfg: crate::bam::alignment_input::AlignmentMergedReaderConfig,
+    alignment_cfg: crate::bam::alignment_input::AlignmentMergedReaderConfig,
     baq_cfg: crate::baq::BaqConfig,
     walker_cfg: crate::pileup::walker::WalkerConfig,
     baq_chunk_size: usize,
@@ -646,9 +646,9 @@ fn process_one_chromosome_from_bam(
         headers,
         indexes,
         &chrom_entry.name,
-        cram_cfg,
+        alignment_cfg,
     )
-    .map_err(PileupCliError::CramInput)?;
+    .map_err(PileupCliError::AlignmentInput)?;
 
     // 2. Walker fetcher — multi-chrom by trait but only ever sees
     //    this one chrom's records, so the swap-on-chrom-transition
@@ -745,7 +745,7 @@ fn process_one_chromosome_from_bam(
     //    before going downstream.
     if let Some(e) = cram_error_handle.take() {
         return Err(VarCallingFromBamCliError::Stage1(
-            PileupCliError::CramInput(e),
+            PileupCliError::AlignmentInput(e),
         ));
     }
 

@@ -1,6 +1,5 @@
 //! Errors produced by the per-sample pileup's alignment-file input
-//! slice (CRAM today; BAM support tracked in
-//! `doc/devel/implementation_plans/bam_input_support.md`).
+//! slice (CRAM + BAM).
 //!
 //! See `ia/specs/per_sample_pileup.md` §"Errors" for the catalogue of
 //! failure modes this enum covers.
@@ -11,10 +10,10 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AlignmentInputError {
-    #[error("at least one CRAM input is required")]
+    #[error("at least one alignment-file input is required")]
     NoInputs,
 
-    #[error("failed to open CRAM '{path}': {source}")]
+    #[error("failed to open alignment file '{path}': {source}")]
     OpenFailed {
         path: PathBuf,
         #[source]
@@ -29,7 +28,7 @@ pub enum AlignmentInputError {
     )]
     UnsupportedCramVersion { path: PathBuf, major: u8, minor: u8 },
 
-    #[error("CRAM '{path}' is not coordinate-sorted (found SO:'{sort_order}')")]
+    #[error("alignment file '{path}' is not coordinate-sorted (found SO:'{sort_order}')")]
     NotCoordinateSorted { path: PathBuf, sort_order: String },
 
     #[error("@SQ list mismatch between '{reference_path}' and '{other_path}': {detail}")]
@@ -39,10 +38,10 @@ pub enum AlignmentInputError {
         detail: String,
     },
 
-    #[error("FASTA '{fasta_path}' disagrees with CRAM '{cram_path}': {detail}")]
+    #[error("FASTA '{fasta_path}' disagrees with alignment file '{alignment_file_path}': {detail}")]
     FastaContigMismatch {
         fasta_path: PathBuf,
-        cram_path: PathBuf,
+        alignment_file_path: PathBuf,
         detail: String,
     },
 
@@ -53,7 +52,7 @@ pub enum AlignmentInputError {
     },
 
     #[error(
-        "multiple sample names across CRAMs: '{path_a}' has SM:'{sm_a}', '{path_b}' has SM:'{sm_b}'"
+        "multiple sample names across alignment files: '{path_a}' has SM:'{sm_a}', '{path_b}' has SM:'{sm_b}'"
     )]
     MultipleSampleNames {
         path_a: PathBuf,
@@ -88,7 +87,7 @@ pub enum AlignmentInputError {
     },
 
     #[error(
-        "duplicate read across CRAMs: QNAME '{qname}' at ref_id={ref_id} pos={pos} appears in both '{path_a}' and '{path_b}'"
+        "duplicate read across alignment files: QNAME '{qname}' at ref_id={ref_id} pos={pos} appears in both '{path_a}' and '{path_b}'"
     )]
     DuplicateReadAcrossFiles {
         qname: String,

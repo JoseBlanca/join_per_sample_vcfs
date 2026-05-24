@@ -261,7 +261,7 @@ fn pileup_rejects_mixed_cram_and_bam() {
     let err = run_pileup(&args).expect_err("mixed cram + bam must error");
 
     match err {
-        PileupCliError::CramInput(AlignmentInputError::MixedAlignmentFileFormats {
+        PileupCliError::AlignmentInput(AlignmentInputError::MixedAlignmentFileFormats {
             first_path,
             first_format,
             other_path,

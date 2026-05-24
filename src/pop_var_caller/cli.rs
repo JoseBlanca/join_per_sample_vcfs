@@ -120,13 +120,13 @@ pub(crate) fn parse_mismatch_fraction(s: &str) -> Result<f32, String> {
 
 #[derive(Debug, Error)]
 pub enum PileupCliError {
-    #[error("CRAM input: {0}")]
-    CramInput(#[from] AlignmentInputError),
+    #[error("alignment input: {0}")]
+    AlignmentInput(#[from] AlignmentInputError),
     #[error("pipeline: {0}")]
     Pipeline(#[from] PileupToPspError),
     #[error(
-        "contig '{contig}' has no @SQ M5 checksum in the input CRAM(s); \
-         re-CRAM with a tool that emits M5 (e.g. samtools)"
+        "contig '{contig}' has no @SQ M5 checksum in the input alignment file(s); \
+         re-create the file with a tool that emits @SQ M5 (e.g. samtools view -t)"
     )]
     MissingMd5 { contig: String },
     #[error("rayon thread pool already initialised — refusing to override")]
@@ -157,7 +157,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let stage1 = &args.stage1;
 
     // 1. Translate CLI → module configs.
-    let cram_cfg = cram_config_from_args(stage1);
+    let alignment_cfg = alignment_config_from_args(stage1);
     let baq_cfg = baq_config_from_args(stage1);
     let walker_cfg = walker_config_from_args(stage1);
 
@@ -179,7 +179,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let outputs = super::stage1_pipeline::with_stage1_pipeline::<_, PileupCliError, _>(
         &args.alignment_files,
         &args.reference,
-        cram_cfg,
+        alignment_cfg,
         baq_cfg,
         walker_cfg,
         stage1.baq_chunk_size,
@@ -215,7 +215,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     //    perspective.
     if let Some(e) = outputs.stashed_upstream_error {
         let _ = fs::remove_file(&args.output); // best-effort cleanup
-        return Err(PileupCliError::CramInput(e));
+        return Err(PileupCliError::AlignmentInput(e));
     }
 
     // 6. Format the stderr run-summary block.
@@ -233,7 +233,9 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
 // Helpers
 // ---------------------------------------------------------------------
 
-pub(super) fn cram_config_from_args(args: &shared_args::Stage1Args) -> AlignmentMergedReaderConfig {
+pub(super) fn alignment_config_from_args(
+    args: &shared_args::Stage1Args,
+) -> AlignmentMergedReaderConfig {
     AlignmentMergedReaderConfig {
         min_mapq: if args.min_mapq == 0 {
             None

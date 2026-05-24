@@ -65,11 +65,11 @@ const PER_PEEKER_BUFFER_SIZE: usize = 1;
 // MappedRead
 // ---------------------------------------------------------------------
 
-/// A read decoded out of a CRAM. Every byte (qname, sequence,
-/// qualities, CIGAR) is owned by the `MappedRead` itself rather than
-/// borrowed from the noodles record it was decoded from. That lets
-/// downstream stages hold onto reads without being tied to the CRAM
-/// reader's lifetime.
+/// A read decoded out of an alignment file (CRAM or BAM). Every
+/// byte (qname, sequence, qualities, CIGAR) is owned by the
+/// `MappedRead` itself rather than borrowed from the noodles
+/// record it was decoded from. That lets downstream stages hold
+/// onto reads without being tied to the source reader's lifetime.
 ///
 /// Every field is public — downstream stages (BAQ, the pileup walker)
 /// need to read them directly.
@@ -233,11 +233,11 @@ impl Default for AlignmentMergedReaderConfig {
 }
 
 // ---------------------------------------------------------------------
-// Per-CRAM lazy record stream
+// Per-input lazy record stream
 // ---------------------------------------------------------------------
 
-/// One CRAM's worth of already-decoded records, plus the path string
-/// used for error messages.
+/// One alignment file's worth of already-decoded records, plus the
+/// path string used for error messages.
 ///
 /// `pub(crate)` on purpose — `RecordBuf` is a noodles type, and
 /// exposing it on a public type would re-couple our public API to
@@ -256,20 +256,19 @@ pub(super) type AlignmentRecordsIter =
 // ---------------------------------------------------------------------
 // Per-format record-stream decoders live in sibling submodules
 // ---------------------------------------------------------------------
-// CRAM-side decoders: [`crate::bam::cram_input`]. The factory
-// helpers `open_cram_record_stream` and `open_indexed_cram_record_stream`
-// produce an `AlignmentRecordsIter` from a path; this module wraps
-// the result into [`OpenAlignmentFile`] inside `new` and `query`.
-//
-// When BAM support lands, a `crate::bam::bam_input` sibling will host
-// the BAM-side analogues with the same factory shape.
+// CRAM-side: [`crate::bam::cram_input`] exports
+// `open_cram_record_stream` / `open_indexed_cram_record_stream`.
+// BAM-side: [`crate::bam::bam_input`] exports
+// `open_bam_record_stream` / `open_indexed_bam_record_stream`.
+// Both produce an `AlignmentRecordsIter`; this module wraps the
+// result into [`OpenAlignmentFile`] inside `new` and `query`.
 
 // ---------------------------------------------------------------------
 // Header validation
 // ---------------------------------------------------------------------
 
 /// Per-CRAM header summary, built once during pre-flight validation.
-struct CramHeader {
+struct AlignmentFileHeaderSummary {
     contigs: ContigList,
     sample_name: String,
 }
@@ -281,7 +280,7 @@ struct CramHeader {
 fn extract_header(
     path: &Path,
     sam_header: &sam::Header,
-) -> Result<CramHeader, AlignmentInputError> {
+) -> Result<AlignmentFileHeaderSummary, AlignmentInputError> {
     // Sort order.
     let sort_order = sort_order_string(sam_header);
     if sort_order.as_deref() != Some("coordinate") {
@@ -304,7 +303,7 @@ fn extract_header(
     // @RG SM. All SMs in this single file must collapse to one value.
     let sample_name = extract_single_sample_name(path, sam_header)?;
 
-    Ok(CramHeader {
+    Ok(AlignmentFileHeaderSummary {
         contigs,
         sample_name,
     })
@@ -406,12 +405,12 @@ fn extract_single_sample_name(
 // ---------------------------------------------------------------------
 
 /// Validate that the indexed FASTA's contigs match `contigs`
-/// (name + length, in the same order). The CRAM `@SQ M5` is trusted;
-/// we do not recompute it from the FASTA.
+/// (name + length, in the same order). The alignment file's
+/// `@SQ M5` is trusted; we do not recompute it from the FASTA.
 fn validate_fasta_agreement(
     fasta_path: &Path,
     canonical_contigs: &ContigList,
-    cram_path: &Path,
+    alignment_file_path: &Path,
 ) -> Result<(), AlignmentInputError> {
     let fai_path = with_fai_extension(fasta_path);
     if !fai_path.exists() {
@@ -429,9 +428,9 @@ fn validate_fasta_agreement(
     if fai_records.len() != canonical_contigs.entries.len() {
         return Err(AlignmentInputError::FastaContigMismatch {
             fasta_path: fasta_path.to_path_buf(),
-            cram_path: cram_path.to_path_buf(),
+            alignment_file_path: alignment_file_path.to_path_buf(),
             detail: format!(
-                "FASTA has {} contigs, CRAM has {}",
+                "FASTA has {} contigs, alignment file has {}",
                 fai_records.len(),
                 canonical_contigs.entries.len()
             ),
@@ -446,9 +445,9 @@ fn validate_fasta_agreement(
         if fai_name != contig.name {
             return Err(AlignmentInputError::FastaContigMismatch {
                 fasta_path: fasta_path.to_path_buf(),
-                cram_path: cram_path.to_path_buf(),
+                alignment_file_path: alignment_file_path.to_path_buf(),
                 detail: format!(
-                    "name disagreement at index {} ('{}' in FASTA vs '{}' in CRAM)",
+                    "name disagreement at index {} ('{}' in FASTA vs '{}' in alignment file)",
                     i, fai_name, contig.name
                 ),
             });
@@ -457,9 +456,9 @@ fn validate_fasta_agreement(
         if fai_length != contig.length {
             return Err(AlignmentInputError::FastaContigMismatch {
                 fasta_path: fasta_path.to_path_buf(),
-                cram_path: cram_path.to_path_buf(),
+                alignment_file_path: alignment_file_path.to_path_buf(),
                 detail: format!(
-                    "length disagreement at index {} (contig '{}': {} in FASTA vs {} in CRAM)",
+                    "length disagreement at index {} (contig '{}': {} in FASTA vs {} in alignment file)",
                     i, contig.name, fai_length, contig.length
                 ),
             });
@@ -619,12 +618,13 @@ impl AlignmentMergedReader {
 
         // Open every input, validate per-file invariants, and
         // collect per-file headers.
-        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(alignment_files.len());
+        let mut open_alignment_files: Vec<OpenAlignmentFile> =
+            Vec::with_capacity(alignment_files.len());
         let mut canonical_contigs: Option<ContigList> = None;
         let mut canonical_sample: Option<String> = None;
-        let mut reference_cram_path: Option<PathBuf> = None;
+        let mut reference_input_path: Option<PathBuf> = None;
 
-        for cram_path in alignment_files {
+        for input_path in alignment_files {
             // Format-specific decoder lives in the corresponding
             // sibling module; each helper opens the file, validates
             // any format-level invariants (CRAM version, BAM magic),
@@ -633,50 +633,50 @@ impl AlignmentMergedReader {
             // identical, single SM tag) are this module's concern
             // and run after. (`unwrap` here is safe — the classify
             // pass above already errored on unknown extensions.)
-            let (noodles_sam_header, owned_records) = match AlignmentFileKind::from_path(cram_path)
+            let (noodles_sam_header, owned_records) = match AlignmentFileKind::from_path(input_path)
                 .unwrap()
             {
-                AlignmentFileKind::Cram => open_cram_record_stream(cram_path, repository.clone())?,
-                AlignmentFileKind::Bam => open_bam_record_stream(cram_path)?,
+                AlignmentFileKind::Cram => open_cram_record_stream(input_path, repository.clone())?,
+                AlignmentFileKind::Bam => open_bam_record_stream(input_path)?,
             };
-            let cram_header = extract_header(cram_path, &noodles_sam_header)?;
+            let extracted_header = extract_header(input_path, &noodles_sam_header)?;
 
             // Cross-file checks: contigs and sample name must be
             // identical across every file in the input.
             match &canonical_contigs {
                 None => {
-                    canonical_contigs = Some(cram_header.contigs.clone());
-                    reference_cram_path = Some(cram_path.clone());
+                    canonical_contigs = Some(extracted_header.contigs.clone());
+                    reference_input_path = Some(input_path.clone());
                 }
                 Some(existing) => {
-                    if let Err(detail) = existing.first_disagreement(&cram_header.contigs) {
+                    if let Err(detail) = existing.first_disagreement(&extracted_header.contigs) {
                         return Err(AlignmentInputError::ContigListMismatch {
-                            reference_path: reference_cram_path.clone().expect(
-                                "reference_cram_path is set when canonical_contigs is Some",
+                            reference_path: reference_input_path.clone().expect(
+                                "reference_input_path is set when canonical_contigs is Some",
                             ),
-                            other_path: cram_path.clone(),
+                            other_path: input_path.clone(),
                             detail,
                         });
                     }
                 }
             }
             match &canonical_sample {
-                None => canonical_sample = Some(cram_header.sample_name.clone()),
-                Some(existing) if existing != &cram_header.sample_name => {
+                None => canonical_sample = Some(extracted_header.sample_name.clone()),
+                Some(existing) if existing != &extracted_header.sample_name => {
                     return Err(AlignmentInputError::MultipleSampleNames {
-                        path_a: reference_cram_path
+                        path_a: reference_input_path
                             .clone()
-                            .expect("reference_cram_path is set when canonical_sample is Some"),
+                            .expect("reference_input_path is set when canonical_sample is Some"),
                         sm_a: existing.clone(),
-                        path_b: cram_path.clone(),
-                        sm_b: cram_header.sample_name,
+                        path_b: input_path.clone(),
+                        sm_b: extracted_header.sample_name,
                     });
                 }
                 _ => {}
             }
 
-            open_crams.push(OpenAlignmentFile {
-                path: cram_path.clone(),
+            open_alignment_files.push(OpenAlignmentFile {
+                path: input_path.clone(),
                 records: owned_records,
             });
         }
@@ -691,11 +691,11 @@ impl AlignmentMergedReader {
         validate_fasta_agreement(
             fasta,
             &canonical_contigs,
-            reference_cram_path.as_deref().unwrap_or(fasta),
+            reference_input_path.as_deref().unwrap_or(fasta),
         )?;
 
-        Self::from_open_crams(
-            open_crams,
+        Self::from_open_alignment_files(
+            open_alignment_files,
             canonical_contigs,
             canonical_sample,
             config,
@@ -714,17 +714,17 @@ impl AlignmentMergedReader {
     /// filter. `None` disables that filter (intended for tests that
     /// build CRAM records in memory and have no reference). The
     /// production `new()` always passes `Some`.
-    pub(crate) fn from_open_crams(
-        open_crams: Vec<OpenAlignmentFile>,
+    pub(crate) fn from_open_alignment_files(
+        open_alignment_files: Vec<OpenAlignmentFile>,
         contigs: ContigList,
         sample_name: String,
         config: AlignmentMergedReaderConfig,
         repository: Option<fasta::Repository>,
     ) -> Result<Self, AlignmentInputError> {
-        let n = open_crams.len();
+        let n = open_alignment_files.len();
         let mut record_streams = Vec::with_capacity(n);
         let mut paths = Vec::with_capacity(n);
-        for open in open_crams {
+        for open in open_alignment_files {
             paths.push(open.path);
             record_streams.push(BufferedPeekable::with_buffer_size(
                 open.records,
@@ -857,21 +857,22 @@ impl AlignmentMergedReader {
         // extensions here, that's a programmer error in the
         // driver — surfaced as a typed
         // `AlignmentIndexFormatMismatch` rather than a panic.
-        let mut open_crams: Vec<OpenAlignmentFile> = Vec::with_capacity(alignment_files.len());
-        for ((cram_path, header), alignment_index) in alignment_files
+        let mut open_alignment_files: Vec<OpenAlignmentFile> =
+            Vec::with_capacity(alignment_files.len());
+        for ((input_path, header), alignment_index) in alignment_files
             .iter()
             .zip(headers.iter())
             .zip(indexes.iter())
         {
-            let file_kind = AlignmentFileKind::from_path(cram_path).ok_or_else(|| {
+            let file_kind = AlignmentFileKind::from_path(input_path).ok_or_else(|| {
                 AlignmentInputError::UnsupportedExtension {
-                    path: cram_path.clone(),
+                    path: input_path.clone(),
                 }
             })?;
             let owned_records = match (file_kind, alignment_index) {
                 (AlignmentFileKind::Cram, AlignmentIndex::Crai(idx)) => {
                     open_indexed_cram_record_stream(
-                        cram_path,
+                        input_path,
                         Arc::clone(header),
                         Arc::clone(idx),
                         repository.clone(),
@@ -880,7 +881,7 @@ impl AlignmentMergedReader {
                 }
                 (AlignmentFileKind::Bam, AlignmentIndex::BamCsi(idx)) => {
                     open_indexed_bam_record_stream(
-                        cram_path,
+                        input_path,
                         Arc::clone(header),
                         BamIndex::Csi(Arc::clone(idx)),
                         target_reference_sequence_id,
@@ -888,7 +889,7 @@ impl AlignmentMergedReader {
                 }
                 (AlignmentFileKind::Bam, AlignmentIndex::BamBai(idx)) => {
                     open_indexed_bam_record_stream(
-                        cram_path,
+                        input_path,
                         Arc::clone(header),
                         BamIndex::Bai(Arc::clone(idx)),
                         target_reference_sequence_id,
@@ -896,19 +897,25 @@ impl AlignmentMergedReader {
                 }
                 (file_kind, index) => {
                     return Err(AlignmentInputError::AlignmentIndexFormatMismatch {
-                        path: cram_path.clone(),
+                        path: input_path.clone(),
                         file_format: file_kind.display_name(),
                         index_format: index_display_name(index),
                     });
                 }
             };
-            open_crams.push(OpenAlignmentFile {
-                path: cram_path.clone(),
+            open_alignment_files.push(OpenAlignmentFile {
+                path: input_path.clone(),
                 records: owned_records,
             });
         }
 
-        Self::from_open_crams(open_crams, contigs, sample_name, config, Some(repository))
+        Self::from_open_alignment_files(
+            open_alignment_files,
+            contigs,
+            sample_name,
+            config,
+            Some(repository),
+        )
     }
 }
 
@@ -2002,7 +2009,7 @@ mod tests {
         assert_ne!(with_md5, different_length);
     }
 
-    // --- Group A: via from_open_crams --------------------------------
+    // --- Group A: via from_open_alignment_files --------------------------------
 
     fn run_to_completion(
         mut reader: AlignmentMergedReader,
@@ -2050,7 +2057,7 @@ mod tests {
                 record_spec(pass_record("R3", 0, 300)),
             ],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2088,7 +2095,7 @@ mod tests {
                 record_spec(pass_record("B3", 0, 400)),
             ],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
@@ -2110,7 +2117,7 @@ mod tests {
             open_cram_from_records("a.cram", vec![record_spec(pass_record("R_A", 0, 100))]);
         let cram_b =
             open_cram_from_records("b.cram", vec![record_spec(pass_record("R_B", 0, 100))]);
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
@@ -2136,7 +2143,7 @@ mod tests {
                 record_spec(pass_record("R2", 0, 100)),
             ],
         );
-        let mut reader = AlignmentMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2176,7 +2183,7 @@ mod tests {
                 record_spec(pass_record("R2", 0, 100)),
             ],
         );
-        let mut reader = AlignmentMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2195,7 +2202,7 @@ mod tests {
         let dup = pass_record("R1", 0, 100);
         let cram_a = open_cram_from_records("a.cram", vec![record_spec(dup.clone())]);
         let cram_b = open_cram_from_records("b.cram", vec![record_spec(dup)]);
-        let mut reader = AlignmentMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
@@ -2227,7 +2234,7 @@ mod tests {
                 record_spec(pass_record("R1", 0, 200)),
             ],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2258,7 +2265,7 @@ mod tests {
                 record_spec(above),
             ],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2283,7 +2290,7 @@ mod tests {
         let mut rec = pass_record("R", 0, 100);
         rec.mapq = 0;
         let cram = open_cram_from_records("a.cram", vec![record_spec(rec)]);
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram],
             default_contigs(),
             "sample".into(),
@@ -2316,7 +2323,7 @@ mod tests {
             min_mapq: None,
             ..Default::default()
         };
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2389,7 +2396,7 @@ mod tests {
             mutator(&mut cfg);
             let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
             let cram_a = open_cram_from_records("a.cram", recs);
-            let reader = AlignmentMergedReader::from_open_crams(
+            let reader = AlignmentMergedReader::from_open_alignment_files(
                 vec![cram_a],
                 default_contigs(),
                 "sample".into(),
@@ -2412,7 +2419,7 @@ mod tests {
         // All defaults: only `clean` survives, every bucket == 1.
         let recs: Vec<_> = six_flagged_records().into_iter().map(record_spec).collect();
         let cram_a = open_cram_from_records("a.cram", recs);
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2447,7 +2454,7 @@ mod tests {
             drop_duplicate: false,
             ..Default::default()
         };
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2485,7 +2492,7 @@ mod tests {
             "a.cram",
             vec![record_spec(long), record_spec(short), record_spec(empty)],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2518,7 +2525,7 @@ mod tests {
             min_read_length: None,
             ..Default::default()
         };
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2552,7 +2559,7 @@ mod tests {
             "a.cram",
             vec![record_spec(combo), record_spec(mq_un), record_spec(un_only)],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2574,7 +2581,7 @@ mod tests {
     #[test]
     fn a13_empty_stream() {
         let cram_a = open_cram_from_records("a.cram", vec![]);
-        let mut reader = AlignmentMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             default_contigs(),
             "sample".into(),
@@ -2595,7 +2602,7 @@ mod tests {
                 record_spec(pass_record("R2", 0, 200)),
             ],
         );
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a, cram_b],
             default_contigs(),
             "sample".into(),
@@ -2632,7 +2639,7 @@ mod tests {
             mate_pos: None,
         };
         let cram = open_cram_from_records("a.cram", vec![record_spec(unmapped)]);
-        let mut reader = AlignmentMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram],
             default_contigs(),
             "sample".into(),
@@ -2654,7 +2661,7 @@ mod tests {
         let cram_a = open_cram_from_records("a.cram", vec![record_spec(rec)]);
         let mut contigs = default_contigs();
         contigs.entries[0].length = big_pos + 1_000;
-        let mut reader = AlignmentMergedReader::from_open_crams(
+        let mut reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram_a],
             contigs,
             "sample".into(),
@@ -2686,7 +2693,7 @@ mod tests {
         spec.seq = default_seq(len + 2);
         spec.qual = default_qual(len + 2);
         let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram],
             default_contigs(),
             "sample".into(),
@@ -2717,7 +2724,7 @@ mod tests {
         spec.seq = default_seq(len - 2);
         spec.qual = default_qual(len - 2);
         let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram],
             default_contigs(),
             "sample".into(),
@@ -2748,7 +2755,7 @@ mod tests {
         spec.seq = default_seq(len + 2);
         spec.qual = default_qual(len + 2);
         let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = AlignmentMergedReader::from_open_crams(
+        let reader = AlignmentMergedReader::from_open_alignment_files(
             vec![cram],
             default_contigs(),
             "sample".into(),
@@ -3667,7 +3674,7 @@ mod tests {
             pass_record_for_b("R1", 0, 100),
             pass_record_for_b("R2", 0, 200),
         ];
-        let (_cram_dir, cram_path) = build_cram(
+        let (_cram_dir, input_path) = build_cram(
             &fasta_path,
             &contigs,
             &HeaderOverrides {
@@ -3678,7 +3685,7 @@ mod tests {
         )
         .expect("build_cram");
         let reader = AlignmentMergedReader::new(
-            &[cram_path],
+            &[input_path],
             &fasta_path,
             AlignmentMergedReaderConfig::default(),
         )
@@ -3694,10 +3701,10 @@ mod tests {
     fn b2_cram_4x_rejected_at_header_time() {
         let contigs = one_contig_chr1();
         let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("build_fasta");
-        let (_cram_dir, cram_path) = build_cram_with_major_version(4, 0).expect("build forced");
+        let (_cram_dir, input_path) = build_cram_with_major_version(4, 0).expect("build forced");
         let err = err_or_panic(
             AlignmentMergedReader::new(
-                std::slice::from_ref(&cram_path),
+                std::slice::from_ref(&input_path),
                 &fasta_path,
                 AlignmentMergedReaderConfig::default(),
             ),
@@ -3707,7 +3714,7 @@ mod tests {
             AlignmentInputError::UnsupportedCramVersion { major, minor, path } => {
                 assert_eq!(major, 4);
                 assert_eq!(minor, 0);
-                assert_eq!(path, cram_path);
+                assert_eq!(path, input_path);
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -3718,7 +3725,7 @@ mod tests {
         let contigs = one_contig_chr1();
         let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("build_fasta");
         let records = vec![pass_record_for_b("R1", 0, 100)];
-        let (_cram_dir, cram_path) = build_cram(
+        let (_cram_dir, input_path) = build_cram(
             &fasta_path,
             &contigs,
             &HeaderOverrides {
@@ -3730,7 +3737,7 @@ mod tests {
         .expect("build_cram");
         let err = err_or_panic(
             AlignmentMergedReader::new(
-                &[cram_path],
+                &[input_path],
                 &fasta_path,
                 AlignmentMergedReaderConfig::default(),
             ),
@@ -4077,10 +4084,10 @@ mod tests {
 
         // Happy path: matching FASTA.
         let (_fa_dir, fa) = build_fasta(&contigs).expect("fasta");
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fa, &contigs, &HeaderOverrides::default(), &records).expect("cram");
         AlignmentMergedReader::new(
-            std::slice::from_ref(&cram_path),
+            std::slice::from_ref(&input_path),
             &fa,
             AlignmentMergedReaderConfig::default(),
         )
@@ -4095,7 +4102,7 @@ mod tests {
         // indexable, but the missing-.fai check happens before any
         // CRAM is opened, so reuse the already-built CRAM path.
         let err = err_or_panic(
-            AlignmentMergedReader::new(&[cram_path], &fa2, AlignmentMergedReaderConfig::default()),
+            AlignmentMergedReader::new(&[input_path], &fa2, AlignmentMergedReaderConfig::default()),
             "expected MissingFastaIndex",
         );
         assert!(
@@ -4134,11 +4141,11 @@ mod tests {
             pass_record_for_b("R2", 0, 200),
             pass_record_for_b("R3", 0, 300),
         ];
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
         let reader = AlignmentMergedReader::new(
-            &[cram_path],
+            &[input_path],
             &fasta_path,
             AlignmentMergedReaderConfig::default(),
         )
@@ -4170,19 +4177,19 @@ mod tests {
         ]
     }
 
-    /// Build a `.crai` for `cram_path` in memory and return both the
+    /// Build a `.crai` for `input_path` in memory and return both the
     /// pre-loaded `Arc<sam::Header>` (parsed off the same CRAM) and
     /// the `AlignmentIndex` wrapper. Mirror of what the per-chrom
     /// driver will do once at startup.
-    fn load_header_and_index(cram_path: &Path) -> (Arc<sam::Header>, AlignmentIndex) {
+    fn load_header_and_index(input_path: &Path) -> (Arc<sam::Header>, AlignmentIndex) {
         // Header.
         let mut reader = cram::io::reader::Builder::default()
-            .build_from_path(cram_path)
+            .build_from_path(input_path)
             .expect("open cram for header");
         reader.read_file_definition().expect("read file definition");
         let header = reader.read_file_header().expect("read file header");
         // Index.
-        let index = noodles_cram::fs::index(cram_path).expect("build crai");
+        let index = noodles_cram::fs::index(input_path).expect("build crai");
         (Arc::new(header), AlignmentIndex::Crai(Arc::new(index)))
     }
 
@@ -4222,13 +4229,13 @@ mod tests {
             pass_record_for_b("R1", 0, 100),
             pass_record_for_b("R2", 0, 800),
         ];
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
 
-        let (header, index) = load_header_and_index(&cram_path);
+        let (header, index) = load_header_and_index(&input_path);
         let reader = AlignmentMergedReader::query(
-            std::slice::from_ref(&cram_path),
+            std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
             "s1".to_string(),
@@ -4258,13 +4265,13 @@ mod tests {
             pass_record_for_b("R3", 0, 500),
             pass_record_for_b("R4", 0, 700),
         ];
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
 
-        let (header, index) = load_header_and_index(&cram_path);
+        let (header, index) = load_header_and_index(&input_path);
         let reader = AlignmentMergedReader::query(
-            std::slice::from_ref(&cram_path),
+            std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
             "s1".to_string(),
@@ -4352,13 +4359,13 @@ mod tests {
             pass_record_for_b("R1", 0, 100),
             pass_record_for_b("R2", 0, 200),
         ];
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
 
-        let (header, index) = load_header_and_index(&cram_path);
+        let (header, index) = load_header_and_index(&input_path);
         let reader = AlignmentMergedReader::query(
-            std::slice::from_ref(&cram_path),
+            std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
             "s1".to_string(),
@@ -4378,13 +4385,13 @@ mod tests {
         let contigs = one_contig_chr1();
         let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
         let records = vec![pass_record_for_b("R1", 0, 100)];
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
 
-        let (header, index) = load_header_and_index(&cram_path);
+        let (header, index) = load_header_and_index(&input_path);
         let err = AlignmentMergedReader::query(
-            std::slice::from_ref(&cram_path),
+            std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
             "s1".to_string(),
@@ -4405,15 +4412,15 @@ mod tests {
         let contigs = one_contig_chr1();
         let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
         let records = vec![pass_record_for_b("R1", 0, 100)];
-        let (_cram_dir, cram_path) =
+        let (_cram_dir, input_path) =
             build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
                 .expect("build_cram");
 
-        let (header, index) = load_header_and_index(&cram_path);
+        let (header, index) = load_header_and_index(&input_path);
 
         // 2 crams, 1 header, 1 index → mismatch.
         let err = AlignmentMergedReader::query(
-            &[cram_path.clone(), cram_path.clone()],
+            &[input_path.clone(), input_path.clone()],
             &fasta_path,
             contigs_for(&contigs),
             "s1".to_string(),

@@ -91,7 +91,7 @@ pub struct Stage1Outputs<R> {
 pub fn with_stage1_pipeline<R, E, F>(
     alignment_files: &[PathBuf],
     reference: &Path,
-    cram_cfg: AlignmentMergedReaderConfig,
+    alignment_cfg: AlignmentMergedReaderConfig,
     baq_cfg: BaqConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
@@ -104,8 +104,8 @@ where
 {
     // 1. Open the merged reader and capture identification metadata.
     let mut reader: AlignmentMergedReader =
-        AlignmentMergedReader::new(alignment_files, reference, cram_cfg)
-            .map_err(PileupCliError::CramInput)?;
+        AlignmentMergedReader::new(alignment_files, reference, alignment_cfg)
+            .map_err(PileupCliError::AlignmentInput)?;
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
@@ -234,7 +234,7 @@ where
     match result {
         Ok(v) => Ok((v, stashed)),
         Err(closure_err) => match stashed {
-            Some(upstream) => Err(PileupCliError::CramInput(upstream).into()),
+            Some(upstream) => Err(PileupCliError::AlignmentInput(upstream).into()),
             None => Err(closure_err),
         },
     }
@@ -287,8 +287,8 @@ mod tests {
         let r: Result<(u8, Option<AlignmentInputError>), PileupCliError> =
             prefer_upstream_or_closure::<u8, _>(Err(closure_err), Some(stashed));
         match r {
-            Err(PileupCliError::CramInput(AlignmentInputError::Io { .. })) => (),
-            other => panic!("expected upstream CramInput::Io, got {other:?}"),
+            Err(PileupCliError::AlignmentInput(AlignmentInputError::Io { .. })) => (),
+            other => panic!("expected upstream AlignmentInput::Io, got {other:?}"),
         }
     }
 }

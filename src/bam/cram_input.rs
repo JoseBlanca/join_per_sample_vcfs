@@ -13,8 +13,9 @@
 //!
 //! The shape `Box<dyn Iterator<Item = io::Result<RecordBuf>> + Send>`
 //! (aliased as [`super::alignment_input::AlignmentRecordsIter`]) is
-//! the format-agnostic seam the merge consumes; BAM support lands as
-//! a sibling `bam_input` module that produces the same shape.
+//! the format-agnostic seam the merge consumes; BAM support lives
+//! in the sibling [`super::bam_input`] module that produces the
+//! same shape.
 
 use std::fs::File;
 use std::io::{self, SeekFrom};
