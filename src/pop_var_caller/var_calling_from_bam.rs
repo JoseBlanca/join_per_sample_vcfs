@@ -125,9 +125,29 @@ pub enum VarCallingFromBamCliError {
     #[error("stage 1: {0}")]
     Stage1(#[from] PileupCliError),
 
-    #[error("io: {0}")]
-    Io(#[from] io::Error),
+    /// Failed to create the per-run tempdir for the per-chrom
+    /// VCF fragments. Commonly the output's parent directory is
+    /// read-only or missing.
+    #[error("failed to create scratch directory under '{parent}': {source}")]
+    ScratchDir {
+        parent: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
+    /// Failed to build the per-chrom reference fetcher. Commonly
+    /// the FASTA's `.fai` is missing or unreadable, or the contig
+    /// name is not present in the indexed FASTA.
+    #[error("failed to build reference fetcher for contig '{contig}': {source}")]
+    RefFetcher {
+        contig: String,
+        #[source]
+        source: io::Error,
+    },
+    // NOTE: the previous `Io(#[from] io::Error)` catch-all variant
+    // was removed by M2. New `io::Error` origins should be wrapped
+    // in operation-named variants (like `ScratchDir` / `RefFetcher`
+    // above) at the `?` site, not collapsed back into one bag.
     #[error("walker: {0}")]
     Walker(#[from] WalkerError),
 
@@ -204,6 +224,17 @@ pub enum VarCallingFromBamCliError {
         source: io::Error,
     },
 
+    /// Loading a previously-built alignment index from disk
+    /// failed (corrupted index, permission denied, …). Surfaced
+    /// for both CRAM (`.crai`) and BAM (`.csi`/`.bai`) inputs.
+    #[error("failed to load alignment index '{index_path}' for '{path}': {source}")]
+    IndexLoadFailed {
+        path: PathBuf,
+        index_path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     /// Input's extension is neither `.cram` nor `.bam`.
     #[error(
         "input alignment file '{path}' has an unsupported extension \
@@ -240,6 +271,15 @@ impl From<crate::bam::errors::AlignmentIndexError> for VarCallingFromBamCliError
             AlignmentIndexError::BuildFailed { path, source } => {
                 Self::IndexBuildFailed { path, source }
             }
+            AlignmentIndexError::LoadFailed {
+                path,
+                index_path,
+                source,
+            } => Self::IndexLoadFailed {
+                path,
+                index_path,
+                source,
+            },
             AlignmentIndexError::UnsupportedExtension { path } => {
                 Self::UnsupportedAlignmentExtension { path }
             }
@@ -373,7 +413,11 @@ pub fn run_var_calling_from_bam(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    let frags_dir = TempDir::new_in(output_parent).map_err(VarCallingFromBamCliError::Io)?;
+    let frags_dir =
+        TempDir::new_in(output_parent).map_err(|source| VarCallingFromBamCliError::ScratchDir {
+            parent: output_parent.to_path_buf(),
+            source,
+        })?;
     let frag_ext = if path_is_bgzf(&args.output) {
         "vcf.gz"
     } else {
@@ -516,18 +560,16 @@ fn load_per_input_headers(
 /// path. Pre-flight (step 0 of `run_var_calling_from_bam`) has
 /// already confirmed each index exists or built one when
 /// `--build-map-file-index` was set, so a failure here is genuinely
-/// I/O.
+/// I/O. Failures route through the existing
+/// `From<AlignmentIndexError>` bridge for `VarCallingFromBamCliError`
+/// (M3 + M2: the loader is typed; the previous `io::Error::other`
+/// string-flattening is gone).
 fn load_per_input_indexes(
     alignment_files: &[PathBuf],
 ) -> Result<Vec<crate::bam::index_preflight::AlignmentIndex>, VarCallingFromBamCliError> {
     let mut indexes = Vec::with_capacity(alignment_files.len());
     for path in alignment_files {
-        let index = crate::bam::index_preflight::load_alignment_index(path).map_err(|source| {
-            VarCallingFromBamCliError::Io(io::Error::other(format!(
-                "failed to load alignment index for '{}': {source}",
-                path.display()
-            )))
-        })?;
+        let index = crate::bam::index_preflight::load_alignment_index(path)?;
         indexes.push(index);
     }
     Ok(indexes)
@@ -762,10 +804,9 @@ fn process_one_chromosome_from_bam(
     //    bound to this chrom.
     let streaming =
         crate::fasta::StreamingChromRefFetcher::for_contig(reference, &chrom_entry.name).map_err(
-            |e| {
-                VarCallingFromBamCliError::Io(io::Error::other(format!(
-                    "ref fetcher construction failed: {e}"
-                )))
+            |source| VarCallingFromBamCliError::RefFetcher {
+                contig: chrom_entry.name.clone(),
+                source: io::Error::other(format!("{source}")),
             },
         )?;
     #[allow(clippy::arc_with_non_send_sync)]

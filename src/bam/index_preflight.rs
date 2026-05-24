@@ -77,50 +77,62 @@ impl AlignmentIndex {
 
 /// Load an alignment index from disk. The expected location is the
 /// canonical sibling path (`<input>.crai` for CRAM, `<input>.csi`
-/// preferred or `<input>.bai` fallback for BAM); for missing or
-/// malformed indexes, prefer running [`preflight_alignment_indexes`]
-/// first so the failure surfaces at the typed
-/// [`AlignmentIndexError`] layer rather than as a bare `io::Error`
-/// here.
-pub fn load_alignment_index(input: &Path) -> std::io::Result<AlignmentIndex> {
-    match AlignmentFileKind::from_path(input) {
-        Some(AlignmentFileKind::Cram) => {
-            let index = noodles_cram::crai::fs::read(crai_path_for(input))?;
+/// preferred or `<input>.bai` fallback for BAM); missing or
+/// malformed indexes surface as the typed
+/// [`AlignmentIndexError`] variants `MissingAlignmentIndex`,
+/// `LoadFailed`, or `UnsupportedExtension`.
+pub fn load_alignment_index(input: &Path) -> Result<AlignmentIndex, AlignmentIndexError> {
+    let kind = AlignmentFileKind::from_path(input).ok_or_else(|| {
+        AlignmentIndexError::UnsupportedExtension {
+            path: input.to_path_buf(),
+        }
+    })?;
+    // Reuse `existing_index_for` so the `.csi`-preferred /
+    // `.bai`-fallback policy lives in exactly one place (M13 +
+    // Mi11). For BAM, this returns the actual on-disk path that
+    // exists; we then parse it with the matching index reader.
+    let index_path = existing_index_for(input, kind).ok_or_else(|| {
+        AlignmentIndexError::MissingAlignmentIndex {
+            path: input.to_path_buf(),
+            expected_index_path: target_index_path(input, kind),
+        }
+    })?;
+    match kind {
+        AlignmentFileKind::Cram => {
+            let index = noodles_cram::crai::fs::read(&index_path).map_err(|source| {
+                AlignmentIndexError::LoadFailed {
+                    path: input.to_path_buf(),
+                    index_path: index_path.clone(),
+                    source,
+                }
+            })?;
             Ok(AlignmentIndex::Crai(Arc::new(index)))
         }
-        Some(AlignmentFileKind::Bam) => {
-            // .csi preferred over .bai. If both exist, .csi wins;
-            // if neither exists, surface a NotFound on the .csi
-            // path (the same path `preflight_alignment_indexes`
-            // would report as "looked for") so the user sees the
-            // policy-canonical path in the error message.
-            let csi_path = csi_path_for(input);
-            if csi_path.exists() {
-                let index = noodles_csi::fs::read(&csi_path)?;
-                return Ok(AlignmentIndex::BamCsi(Arc::new(index)));
+        AlignmentFileKind::Bam => {
+            // `existing_index_for` picks `.csi` when both formats
+            // are present (Mi11 / M13); dispatch on the resolved
+            // path's extension.
+            let ext = index_path.extension().and_then(|e| e.to_str());
+            if ext == Some("csi") {
+                let index = noodles_csi::fs::read(&index_path).map_err(|source| {
+                    AlignmentIndexError::LoadFailed {
+                        path: input.to_path_buf(),
+                        index_path: index_path.clone(),
+                        source,
+                    }
+                })?;
+                Ok(AlignmentIndex::BamCsi(Arc::new(index)))
+            } else {
+                let index = noodles_bam::bai::fs::read(&index_path).map_err(|source| {
+                    AlignmentIndexError::LoadFailed {
+                        path: input.to_path_buf(),
+                        index_path: index_path.clone(),
+                        source,
+                    }
+                })?;
+                Ok(AlignmentIndex::BamBai(Arc::new(index)))
             }
-            let bai_path = bai_path_for(input);
-            if bai_path.exists() {
-                let index = noodles_bam::bai::fs::read(&bai_path)?;
-                return Ok(AlignmentIndex::BamBai(Arc::new(index)));
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "no BAM index next to '{}' (looked for '{}' then '{}')",
-                    input.display(),
-                    csi_path.display(),
-                    bai_path.display(),
-                ),
-            ))
         }
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "unsupported alignment-file extension for '{}'",
-                input.display()
-            ),
-        )),
     }
 }
 

@@ -222,6 +222,17 @@ pub enum AlignmentIndexError {
         source: std::io::Error,
     },
 
+    /// Loading a previously-built alignment index from disk
+    /// failed (corrupted index, permission denied, …). Surfaced
+    /// for both CRAM (`.crai`) and BAM (`.csi`/`.bai`) inputs.
+    #[error("failed to load alignment index '{index_path}' for '{path}': {source}")]
+    LoadFailed {
+        path: PathBuf,
+        index_path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Input's extension is neither `.cram` nor `.bam`. Pre-flight
     /// does not sniff file magic — an explicit extension is required.
     #[error(
