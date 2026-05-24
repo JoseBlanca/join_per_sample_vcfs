@@ -342,42 +342,23 @@ mod tests {
         (dir, bam_path)
     }
 
-    /// Build a `.bai` for the just-written BAM by scanning it. Mirror
-    /// of the helper noodles-bam's own query tests use; we keep our
-    /// own copy so the bam_input tests don't pull in noodles' test
-    /// support feature.
+    /// Build a `.bai` for the just-written BAM by scanning it.
+    /// Reuses the shared chunk-walking helper
+    /// `crate::bam::index_preflight::populate_binning_index` (Mi9)
+    /// so the production CSI builder and this BAI-side test
+    /// fixture share one source of truth for the
+    /// `(chunk_start, chunk_end, alignment_context)` triple.
     fn build_bai_in_memory(bam_path: &std::path::Path) -> bam::bai::Index {
+        use crate::bam::index_preflight::populate_binning_index;
+        use noodles_csi::binning_index::index::reference_sequence::index::LinearIndex;
+
         let mut reader = bam::io::reader::Builder
             .build_from_path(bam_path)
             .expect("open bam to index");
         let header = reader.read_header().expect("read header for index");
 
-        let mut indexer: Indexer<
-            noodles_csi::binning_index::index::reference_sequence::index::LinearIndex,
-        > = Indexer::default();
-        let mut chunk_start = reader.get_ref().virtual_position();
-        let mut record = bam::Record::default();
-
-        while reader.read_record(&mut record).expect("read record") != 0 {
-            let chunk_end = reader.get_ref().virtual_position();
-            let alignment_context = match (
-                record.reference_sequence_id().transpose().expect("ref id"),
-                record.alignment_start().transpose().expect("start"),
-                record.alignment_end().transpose().expect("end"),
-            ) {
-                (Some(id), Some(start), Some(end)) => {
-                    let is_mapped = !record.flags().is_unmapped();
-                    Some((id, start, end, is_mapped))
-                }
-                _ => None,
-            };
-            let chunk = Chunk::new(chunk_start, chunk_end);
-            indexer
-                .add_record(alignment_context, chunk)
-                .expect("add record");
-            chunk_start = chunk_end;
-        }
-
+        let mut indexer: Indexer<LinearIndex> = Indexer::default();
+        populate_binning_index(&mut reader, &mut indexer).expect("populate indexer");
         indexer.build(header.reference_sequences().len())
     }
 

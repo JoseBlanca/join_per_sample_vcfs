@@ -362,18 +362,12 @@ fn build_index(input: &Path, kind: AlignmentFileKind) -> std::io::Result<()> {
 /// Build a `.csi` next to `bam_path` by scanning the BAM once and
 /// feeding the chunks into a [`noodles_csi::binning_index::Indexer`]
 /// parameterised by [`CSI_MIN_SHIFT`] / [`CSI_DEPTH`].
-///
-/// Mirrors the helper in `noodles_bam` 0.89's own query tests; the
-/// inlined copy here keeps the build path independent of any
-/// test-support feature.
 fn build_csi_for_bam(bam_path: &Path) -> std::io::Result<()> {
     use noodles_csi::binning_index::Indexer;
-    use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
     // BinnedIndex is the CSI on-disk shape; LinearIndex would emit
     // the .bai shape. We only build .csi here — see
     // BAM_INDEX_BUILD_FORMAT / CSI_DEPTH constants.
     use noodles_csi::binning_index::index::reference_sequence::index::BinnedIndex;
-    use noodles_sam::alignment::Record as _;
 
     let mut reader = noodles_bam::io::reader::Builder.build_from_path(bam_path)?;
     let header = reader.read_header()?;
@@ -384,6 +378,35 @@ fn build_csi_for_bam(bam_path: &Path) -> std::io::Result<()> {
     // depth=6 (~4.3 Gbp cap) is visible at the build site
     // rather than hidden behind a no-argument default.
     let mut indexer: Indexer<BinnedIndex> = Indexer::new(CSI_MIN_SHIFT, CSI_DEPTH);
+    populate_binning_index(&mut reader, &mut indexer)?;
+
+    let index = indexer.build(header.reference_sequences().len());
+    noodles_csi::fs::write(bam_index_path_for(bam_path, BAM_INDEX_BUILD_FORMAT), &index)
+}
+
+/// Walk `reader` once and add a chunk per record to `indexer`.
+/// Shared body between [`build_csi_for_bam`] (production CSI
+/// build) and `crate::bam::bam_input::tests::build_bai_in_memory`
+/// (test fixture, LinearIndex parameterisation for `.bai`). Same
+/// chunk_start / chunk_end / alignment-context shape across the
+/// two callers; the indexer's type parameter is the only thing
+/// that differs.
+///
+/// Integration-test fixtures in `tests/common/mod.rs` carry their
+/// own copy because the test crate is outside `crate::bam` and
+/// cannot reach `pub(crate)` items. Reducing the production +
+/// in-crate-test duplication to one helper is the achievable
+/// part of the Mi9 cleanup; the integration-test copy stays.
+pub(crate) fn populate_binning_index<I>(
+    reader: &mut noodles_bam::io::Reader<noodles_bgzf::io::Reader<std::fs::File>>,
+    indexer: &mut noodles_csi::binning_index::Indexer<I>,
+) -> std::io::Result<()>
+where
+    I: noodles_csi::binning_index::index::reference_sequence::Index + Default,
+{
+    use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
+    use noodles_sam::alignment::Record as _;
+
     let mut chunk_start = reader.get_ref().virtual_position();
     let mut record = noodles_bam::Record::default();
 
@@ -404,9 +427,7 @@ fn build_csi_for_bam(bam_path: &Path) -> std::io::Result<()> {
         indexer.add_record(alignment_context, chunk)?;
         chunk_start = chunk_end;
     }
-
-    let index = indexer.build(header.reference_sequences().len());
-    noodles_csi::fs::write(bam_index_path_for(bam_path, BAM_INDEX_BUILD_FORMAT), &index)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
