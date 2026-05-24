@@ -15,7 +15,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod buffered_peekable;
+pub mod iter_ext;
 pub mod per_sample_pileup;
 pub mod pop_var_caller;
 pub mod var_calling;

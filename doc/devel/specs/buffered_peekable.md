@@ -251,14 +251,15 @@ caller.
 
 ## File layout
 
-Single file, single module:
+Single file, single module under the shared `iter_ext` namespace:
 
 ```
-src/buffered_peekable.rs    — struct, impls, tests
+src/iter_ext/mod.rs                — namespace + re-exports
+src/iter_ext/buffered_peekable.rs  — struct, impls, tests
 ```
 
-Re-exported from `lib.rs` so callers in the same crate use it as
-`crate::buffered_peekable::BufferedPeekable`.
+Re-exported from `iter_ext/mod.rs` so callers in the same crate use it as
+`crate::iter_ext::BufferedPeekable`.
 
 ## Follow-up: retrofit `VarIterator`
 

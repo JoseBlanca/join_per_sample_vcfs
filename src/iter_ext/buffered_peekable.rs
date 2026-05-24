@@ -1,6 +1,6 @@
 //! A peek+buffer adapter for fallible iterators.
 //!
-//! See `ia/specs/buffered_peekable.md` for the full specification.
+//! See `doc/devel/specs/buffered_peekable.md` for the full specification.
 
 use std::collections::VecDeque;
 

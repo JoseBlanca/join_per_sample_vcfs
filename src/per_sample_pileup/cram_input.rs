@@ -12,7 +12,7 @@ use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
-use crate::buffered_peekable::BufferedPeekable;
+use crate::iter_ext::BufferedPeekable;
 use crate::per_sample_pileup::errors::CramInputError;
 
 // ---------------------------------------------------------------------
