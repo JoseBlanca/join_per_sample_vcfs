@@ -19,7 +19,44 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **Code review of the FASTA fetcher
+> - **Last completed task:** **`var-calling-from-bam` per-chromosome
+>   parallelism** (commits `29b28e8` → `e5261ba` → `050da41` →
+>   `a858832`) — impl report
+>   [var_calling_from_bam_per_chromosome_2026-05-24.md](doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md);
+>   plan
+>   [var_calling_from_bam_per_chromosome.md](doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md).
+>   The direct CRAM → VCF subcommand now dispatches one rayon worker
+>   per contig: each worker opens its own `cram::io::Reader<File>`
+>   via the new `CramMergedReader::query` indexed variant
+>   (`OwnedIndexedCramRecords` mirror of `OwnedCramRecords` driven
+>   by the `.crai`), runs Stage 1 (BAQ → walker) + Stages 3–6 (DUST
+>   → grouper → per-group merger → posterior → VCF fragment) on its
+>   own slice, and the fragments concat in contig-table order via
+>   the existing `src/vcf/concat.rs` (no new file-format module).
+>   New flag `--build-map-file-index` (off by default) opts into
+>   auto-building any missing `.crai`; without it, missing indexes
+>   are a hard error whose `Display` impl names both the flag and
+>   the `samtools index` recipe. Pre-flight (new module
+>   `src/bam/index_preflight.rs` + typed `AlignmentIndexError`) runs
+>   as step 0 of `run_var_calling_from_bam`, before rayon init, so
+>   missing-index errors fire before any tempdir or pool setup.
+>   Net diff: +1320 / -520 across the four commits (the driver
+>   reshape was a net simplification: -341 from retiring
+>   `run_cohort_pipeline_for_single_sample` + `PerChromRecordsIter`
+>   + 5 owned tests). Validation: `cargo fmt --check` clean;
+>   `cargo clippy --lib --tests --all-features -D warnings` clean;
+>   `cargo test --all-targets --all-features` — 898 lib + every
+>   integration / bench-compile target pass. The 4 from-bam
+>   integration tests in `tests/cohort_cli_integration.rs` (happy
+>   path, walker-error surfacing, missing-index-without-flag,
+>   missing-index-with-flag-builds) now exercise the parallel
+>   par_iter path end-to-end. Wall-time validation on real
+>   multi-chrom tomato CRAMs (the analogue of cohort H1's 3.85× at
+>   T=13) is deferred: the `examples/profile_from_bam_e2e.rs` +
+>   `benches/from_bam_e2e_perf.rs` infrastructure (commit 5 of the
+>   plan) was scoped out in favour of the impl report; tracked as
+>   the headline follow-up.
+> - **Previous task:** **Code review of the FASTA fetcher
 >   module** (`src/per_sample_pileup/ref_fetcher.rs`) —
 >   [ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/ref_fetcher_2026-05-23.md).
 >   Status: **Request-changes** — 3 Blockers, 23 Major, 19 Minor,
@@ -51,7 +88,7 @@ Skills and agents are instructed to leave it untouched.
 >   the author (migration completion timeline, error-enum evolution
 >   policy, public-trait stability bar, IUPAC handling) gate
 >   several Major findings.
-> - **Previous task:** **Performance review of the PSP reader**
+> - **Previous task — perf:** **Performance review of the PSP reader**
 >   on the cohort var-calling hot path —
 >   [perf_psp_reader_2026-05-23.md](doc/devel/reports/reviews/perf_psp_reader_2026-05-23.md).
 >   Verdict: **Apply the listed wins.** Profile basis: reused the
@@ -272,8 +309,11 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - Cohort CLI (`var-calling`, `estimate-contamination`,
     `var-calling-from-bam`):
     [pop_var_caller_cohort_cli.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli.md)
-- **Impl report (cohort slice):**
-  [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
+- **Impl reports:**
+  - Cohort slice:
+    [pop_var_caller_cohort_cli_2026-05-19.md](doc/devel/reports/implementations/pop_var_caller_cohort_cli_2026-05-19.md)
+  - `var-calling-from-bam` per-chromosome parallelism (2026-05-24):
+    [var_calling_from_bam_per_chromosome_2026-05-24.md](doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md)
 - **Latest reviews (cohort slice):**
   [ref_fetcher_2026-05-23.md](doc/devel/reports/reviews/ref_fetcher_2026-05-23.md)
   (code review of `src/per_sample_pileup/ref_fetcher.rs` — status
@@ -799,5 +839,34 @@ list is clear.
     (acknowledged for follow-up). Includes L1 (per-group inner
     `par_iter` removed) and a new pure-Rust bgzf-aware concat
     module (`src/var_calling/vcf_writer/concat.rs`).
-  - **CRAM → `.psp` arm:** still pending.
+  - **CRAM → VCF arm (`var-calling-from-bam`) — per-chromosome
+    parallelism shipped 2026-05-24:**
+    [var_calling_from_bam_per_chromosome_2026-05-24.md](doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md);
+    plan
+    [var_calling_from_bam_per_chromosome.md](doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md).
+    Four-commit PR (`29b28e8` → `e5261ba` → `050da41` → `a858832`):
+    new `src/bam/index_preflight.rs` + `--build-map-file-index`
+    flag (opt-in `.crai` auto-build; off by default with a
+    samtools-pointing error), new
+    `CramMergedReader::query` indexed per-contig variant +
+    `OwnedIndexedCramRecords` iterator, new
+    `process_one_chromosome_from_bam` per-chrom worker, and a
+    `run_var_calling_from_bam` reshape that retires the serial
+    `run_cohort_pipeline_for_single_sample` + `PerChromRecordsIter`
+    helpers in favour of `rayon::par_iter` over chromosomes +
+    `vcf::concat::concat_fragments` (no new file-format module —
+    reuses the cohort H1's pure-Rust bgzf concat). Net diff
+    +1320 / -520 across the four commits; 898 lib + every
+    integration test pass; clippy + fmt clean. Wall-time
+    validation on real multi-chrom tomato CRAMs (the analogue of
+    cohort H1's 3.85× at T=13) is deferred: the
+    `examples/profile_from_bam_e2e.rs` + `benches/from_bam_e2e_perf.rs`
+    infrastructure (commit 5 of the plan) was scoped out.
+  - **CRAM → `.psp` arm (`pileup`): not planned** (design call
+    2026-05-24). The typical PSP workflow runs N independent samples
+    and the orchestrator (Snakemake, Nextflow, GNU parallel)
+    already provides the per-sample parallelism; a single `pileup`
+    invocation processes exactly one sample and stays serial.
+    Revisit only if a real workload appears where one sample's
+    `.psp` build dominates a pipeline's wall time.
 
