@@ -28,8 +28,55 @@
 //! extra pass over the CRAM's bytes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::bam::errors::AlignmentIndexError;
+
+// ---------------------------------------------------------------------
+// Pre-loaded alignment index (shared across rayon workers)
+// ---------------------------------------------------------------------
+
+/// Pre-loaded alignment index for a single input file, shareable
+/// across rayon workers via the `Arc` payload.
+///
+/// Drivers that need per-chromosome random access call
+/// [`load_alignment_index`] once per input at startup, wrap the
+/// result in this enum, and pass a `&[AlignmentIndex]` (or
+/// `Vec<AlignmentIndex>`) into
+/// [`crate::bam::cram_input::CramMergedReader::query`]. Each rayon
+/// worker pays one `Arc::clone` to get its own handle on the
+/// already-parsed index; no per-worker disk reads or re-parsing.
+///
+/// Single-variant today (CRAM-only); when BAM input support lands,
+/// add `Bai(Arc<noodles_bam::bai::Index>)` and
+/// `Csi(Arc<noodles_csi::Index>)`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum AlignmentIndex {
+    Crai(Arc<noodles_cram::crai::Index>),
+}
+
+/// Load an alignment index from disk. The expected location is the
+/// canonical sibling path (`<input>.crai` for CRAM); for missing or
+/// malformed indexes, prefer running [`preflight_alignment_indexes`]
+/// first so the failure surfaces at the typed
+/// [`AlignmentIndexError`] layer rather than as a bare `io::Error`
+/// here.
+pub fn load_alignment_index(input: &Path) -> std::io::Result<AlignmentIndex> {
+    match AlignmentFileKind::from_path(input) {
+        Some(AlignmentFileKind::Cram) => {
+            let index = noodles_cram::crai::fs::read(crai_path_for(input))?;
+            Ok(AlignmentIndex::Crai(Arc::new(index)))
+        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported alignment-file extension for '{}'",
+                input.display()
+            ),
+        )),
+    }
+}
 
 // ---------------------------------------------------------------------
 // Public entry point

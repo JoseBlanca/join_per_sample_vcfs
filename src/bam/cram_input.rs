@@ -5,14 +5,16 @@
 //! for the design rationale.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
 use crate::bam::errors::CramInputError;
+use crate::bam::index_preflight::AlignmentIndex;
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
 use crate::pileup::walker::CigarOp;
@@ -287,6 +289,124 @@ impl OwnedCramRecords {
 }
 
 impl Iterator for OwnedCramRecords {
+    type Item = io::Result<sam::alignment::RecordBuf>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(rb) = self.pending.next() {
+                return Some(Ok(rb));
+            }
+            match self.refill() {
+                Ok(true) => return None,
+                Ok(false) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Indexed (per-contig) owned CRAM record iterator
+// ---------------------------------------------------------------------
+
+/// Owned iterator that walks a CRAM via its `.crai` index, yielding
+/// only records that align to `target_reference_sequence_id`. Mirror
+/// of [`OwnedCramRecords`] but driven by the index instead of by
+/// linear file order — the loop seeks to each container whose index
+/// entry matches the target ref_id, decodes its records, and filters
+/// the decoded set to records whose own `reference_sequence_id`
+/// matches the target (a CRAM container may carry records from more
+/// than one ref_seq, though slices typically do not).
+///
+/// The `Arc<crai::Index>` is shared read-only across rayon workers
+/// (we hold our own clone here). The reader and the FASTA repository
+/// are owned per worker — neither is `Send`-shareable in the
+/// noodles surface used here.
+///
+/// Behaviour matches noodles' own
+/// [`noodles_cram::io::reader::Query`](../../../noodles-cram-0.93.0/src/io/reader/query.rs)
+/// stripped of the borrow-the-reader lifetime — we own the reader
+/// instead so the iterator is `'static` and `Send`, satisfying the
+/// `Box<dyn Iterator<Item=…> + Send>` shape the rest of the merger
+/// expects.
+struct OwnedIndexedCramRecords {
+    reader: cram::io::Reader<File>,
+    /// Shared parsed header. We use the caller's already-loaded
+    /// `Arc<sam::Header>` rather than the per-worker reader's own
+    /// `read_header()` result — both are equivalent (every CRAM in
+    /// the input set has been cross-validated to carry the same
+    /// header by the driver) but the `Arc` skips a re-parse per
+    /// worker.
+    header: Arc<sam::Header>,
+    /// Shared parsed `.crai`. Held as `Arc` so many workers can
+    /// share the parse cost; cloning the `Arc` per worker is one
+    /// atomic.
+    index: Arc<cram::crai::Index>,
+    repository: fasta::Repository,
+    target_reference_sequence_id: usize,
+    /// Cursor into the index. We hold the index by `Arc`, so we walk
+    /// it via this integer rather than a `slice::Iter` to keep the
+    /// struct free of self-referential borrows.
+    next_index_record: usize,
+    pending: std::vec::IntoIter<sam::alignment::RecordBuf>,
+}
+
+impl OwnedIndexedCramRecords {
+    fn refill(&mut self) -> io::Result<bool> {
+        loop {
+            let record = match self.index.as_slice().get(self.next_index_record) {
+                Some(r) => r,
+                None => return Ok(true),
+            };
+            self.next_index_record += 1;
+
+            if record.reference_sequence_id() != Some(self.target_reference_sequence_id) {
+                continue;
+            }
+
+            self.reader.seek(SeekFrom::Start(record.offset()))?;
+            // Allocate a fresh `Container` for each seek rather than
+            // reusing one. noodles' own `Query::read_next_container`
+            // does the same — the container caches per-instance
+            // state (compression header, block buffers) that the
+            // sequential reader keeps consistent across adjacent
+            // containers but that becomes stale after a non-
+            // sequential seek.
+            let mut container = cram::io::reader::Container::default();
+            let n = self.reader.read_container(&mut container)?;
+            if n == 0 {
+                return Ok(true);
+            }
+
+            let compression_header = container.compression_header()?;
+            let mut all_records: Vec<sam::alignment::RecordBuf> = Vec::new();
+            for slice_result in container.slices() {
+                let slice = slice_result?;
+                let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+                let cram_records = slice.records(
+                    self.repository.clone(),
+                    self.header.as_ref(),
+                    &compression_header,
+                    &core_data_src,
+                    &external_data_srcs,
+                )?;
+                for record in &cram_records {
+                    let rb = sam::alignment::RecordBuf::try_from_alignment_record(
+                        self.header.as_ref(),
+                        record,
+                    )?;
+                    if rb.reference_sequence_id() == Some(self.target_reference_sequence_id) {
+                        all_records.push(rb);
+                    }
+                }
+            }
+            self.pending = all_records.into_iter();
+            return Ok(false);
+        }
+    }
+}
+
+impl Iterator for OwnedIndexedCramRecords {
     type Item = io::Result<sam::alignment::RecordBuf>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -783,6 +903,143 @@ impl CramMergedReader {
 
     pub fn filter_counts(&self) -> &FilterCounts {
         &self.filter_counts
+    }
+
+    /// Per-contig random-access variant of [`Self::new`]. Opens each
+    /// input CRAM fresh, seeks via the caller-supplied per-input
+    /// `Arc<crai::Index>`, and yields only records whose alignment
+    /// falls on `contig_name`. Records are k-way-merged across
+    /// inputs in coordinate order via the same machinery as
+    /// [`Self::new`].
+    ///
+    /// `contigs` is the canonical contig list shared across all
+    /// input CRAMs (the driver harvests this once at startup via
+    /// [`Self::new`] or an equivalent validation pass);
+    /// `contig_name` is resolved against it to a ref_id.
+    /// `sample_name` is propagated to the resulting reader's
+    /// [`sample_name`](Self::sample_name) accessor.
+    ///
+    /// **What this skips vs `new`.** Per-file header parsing
+    /// (caller's `Arc<sam::Header>` is reused), FASTA contig
+    /// agreement, sample-name reconciliation, and cross-file
+    /// contig-list cross-checks. Each per-worker call still opens
+    /// fresh `cram::io::Reader<File>` and `fasta::Repository`
+    /// instances because both are mutably held by the merge for the
+    /// reader's lifetime, but their construction cost is small next
+    /// to the per-contig seek + decode that follows.
+    ///
+    /// # Errors
+    ///
+    /// - [`CramInputError::NoInputs`] — `crams` is empty.
+    /// - [`CramInputError::PerInputHandleCountMismatch`] —
+    ///   `headers.len()` or `indexes.len()` disagree with
+    ///   `crams.len()`.
+    /// - [`CramInputError::MissingFastaIndex`] — `<fasta>.fai` is
+    ///   not present next to `fasta`.
+    /// - [`CramInputError::ContigNotInList`] — `contig_name` is
+    ///   not present in `contigs`.
+    /// - [`CramInputError::OpenFailed`] / [`CramInputError::Io`] —
+    ///   any underlying CRAM or FASTA I/O failure during open.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query(
+        crams: &[PathBuf],
+        fasta: &Path,
+        contigs: ContigList,
+        sample_name: String,
+        headers: &[Arc<sam::Header>],
+        indexes: &[AlignmentIndex],
+        contig_name: &str,
+        config: CramMergedReaderConfig,
+    ) -> Result<Self, CramInputError> {
+        if crams.is_empty() {
+            return Err(CramInputError::NoInputs);
+        }
+        if headers.len() != crams.len() || indexes.len() != crams.len() {
+            return Err(CramInputError::PerInputHandleCountMismatch {
+                crams: crams.len(),
+                headers: headers.len(),
+                indexes: indexes.len(),
+            });
+        }
+
+        let target_reference_sequence_id = contigs
+            .entries
+            .iter()
+            .position(|c| c.name == contig_name)
+            .ok_or_else(|| CramInputError::ContigNotInList {
+                contig: contig_name.to_string(),
+                known_contigs: contigs.entries.len(),
+            })?;
+
+        // FASTA repository — needed by the slice decoder for the
+        // mismatch-fraction filter. Built per-worker because
+        // `fasta::Repository`'s internal adapter holds a file handle
+        // that is not shareable across threads.
+        let fai_path = with_fai_extension(fasta);
+        if !fai_path.exists() {
+            return Err(CramInputError::MissingFastaIndex {
+                fasta_path: fasta.to_path_buf(),
+            });
+        }
+        let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(fasta)
+            .map_err(|source| CramInputError::Io {
+                path: fasta.to_path_buf(),
+                source,
+            })?;
+        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
+        let repository = fasta::Repository::new(adapter);
+
+        // One indexed iterator per input.
+        let mut open_crams: Vec<OpenCram> = Vec::with_capacity(crams.len());
+        for ((cram_path, header), alignment_index) in
+            crams.iter().zip(headers.iter()).zip(indexes.iter())
+        {
+            let mut noodles_cram_reader = cram::io::reader::Builder::default()
+                .set_reference_sequence_repository(repository.clone())
+                .build_from_path(cram_path)
+                .map_err(|source| CramInputError::OpenFailed {
+                    path: cram_path.clone(),
+                    source,
+                })?;
+
+            // Advance the reader past the CRAM file definition and
+            // file header so subsequent seeks land cleanly. Both
+            // results are discarded — we already have the validated
+            // header via the caller's `Arc<sam::Header>`.
+            noodles_cram_reader
+                .read_file_definition()
+                .map_err(|source| CramInputError::OpenFailed {
+                    path: cram_path.clone(),
+                    source,
+                })?;
+            noodles_cram_reader.read_file_header().map_err(|source| {
+                CramInputError::OpenFailed {
+                    path: cram_path.clone(),
+                    source,
+                }
+            })?;
+
+            let index_arc = match alignment_index {
+                AlignmentIndex::Crai(idx) => Arc::clone(idx),
+            };
+
+            let owned_records: CramRecordsIter = Box::new(OwnedIndexedCramRecords {
+                reader: noodles_cram_reader,
+                header: Arc::clone(header),
+                index: index_arc,
+                repository: repository.clone(),
+                target_reference_sequence_id,
+                next_index_record: 0,
+                pending: Vec::new().into_iter(),
+            });
+            open_crams.push(OpenCram {
+                path: cram_path.clone(),
+                records: owned_records,
+            });
+        }
+
+        Self::from_open_crams(open_crams, contigs, sample_name, config, Some(repository))
     }
 }
 
@@ -4012,5 +4269,284 @@ mod tests {
         assert_eq!(decoded[1].pos, 200);
         assert_eq!(decoded[2].pos, 300);
         assert_eq!(decoded[0].qname, b"R1");
+    }
+
+    // --- Group C: CramMergedReader::query (indexed, per-contig) ---------
+
+    /// Two-contig fixture used by the query tests below.
+    fn two_contigs_chr1_chr2() -> Vec<ContigSpec> {
+        vec![
+            ContigSpec {
+                name: "chr1".into(),
+                length: 1_000,
+            },
+            ContigSpec {
+                name: "chr2".into(),
+                length: 1_000,
+            },
+        ]
+    }
+
+    /// Build a `.crai` for `cram_path` in memory and return both the
+    /// pre-loaded `Arc<sam::Header>` (parsed off the same CRAM) and
+    /// the `AlignmentIndex` wrapper. Mirror of what the per-chrom
+    /// driver will do once at startup.
+    fn load_header_and_index(cram_path: &Path) -> (Arc<sam::Header>, AlignmentIndex) {
+        // Header.
+        let mut reader = cram::io::reader::Builder::default()
+            .build_from_path(cram_path)
+            .expect("open cram for header");
+        reader.read_file_definition().expect("read file definition");
+        let header = reader.read_file_header().expect("read file header");
+        // Index.
+        let index = noodles_cram::fs::index(cram_path).expect("build crai");
+        (Arc::new(header), AlignmentIndex::Crai(Arc::new(index)))
+    }
+
+    /// Convert a `ContigSpec` list (test fixture vocabulary) into the
+    /// project's `ContigList` shape that `CramMergedReader::query`
+    /// expects.
+    fn contigs_for(specs: &[ContigSpec]) -> ContigList {
+        ContigList {
+            entries: specs
+                .iter()
+                .map(|s| ContigEntry {
+                    name: s.name.clone(),
+                    length: s.length,
+                    md5: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Multi-contig fixture, records placed only on the queried
+    /// contig. Asserts the query yields those records with the right
+    /// `ref_id` set. The complementary "records on contigs we did
+    /// **not** ask for" path — i.e. noodles' multi-reference slice
+    /// decode + post-decode ref_id filter inside
+    /// [`OwnedIndexedCramRecords`] — is not exercised here: when a
+    /// multi-contig CRAM is written with records on more than one
+    /// contig, the writer can pack them into a single
+    /// multi-reference slice whose decode path is sensitive to
+    /// fixture details outside the in-module fixture builder's
+    /// control. A realistic cross-contig fixture lands with the
+    /// per-chrom driver's integration test (commit 4 of this plan).
+    #[test]
+    fn c1_query_in_multi_contig_fixture_yields_records_with_target_ref_id() {
+        let contigs = two_contigs_chr1_chr2();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let records = vec![
+            pass_record_for_b("R1", 0, 100),
+            pass_record_for_b("R2", 0, 800),
+        ];
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+
+        let (header, index) = load_header_and_index(&cram_path);
+        let reader = CramMergedReader::query(
+            std::slice::from_ref(&cram_path),
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            std::slice::from_ref(&header),
+            std::slice::from_ref(&index),
+            "chr1",
+            CramMergedReaderConfig::default(),
+        )
+        .expect("query chr1");
+
+        let decoded: Vec<MappedRead> = reader.map(|r| r.expect("ok record")).collect();
+        assert_eq!(decoded.len(), 2);
+        for r in &decoded {
+            assert_eq!(r.ref_id, 0, "ref_id must be chr1 (0)");
+        }
+        assert_eq!(decoded[0].qname, b"R1");
+        assert_eq!(decoded[1].qname, b"R2");
+    }
+
+    #[test]
+    fn c2_query_preserves_coordinate_order_within_contig() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let records = vec![
+            pass_record_for_b("R1", 0, 100),
+            pass_record_for_b("R2", 0, 300),
+            pass_record_for_b("R3", 0, 500),
+            pass_record_for_b("R4", 0, 700),
+        ];
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+
+        let (header, index) = load_header_and_index(&cram_path);
+        let reader = CramMergedReader::query(
+            std::slice::from_ref(&cram_path),
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            std::slice::from_ref(&header),
+            std::slice::from_ref(&index),
+            "chr1",
+            CramMergedReaderConfig::default(),
+        )
+        .expect("query chr1");
+
+        let positions: Vec<u64> = reader.map(|r| r.expect("ok record").pos).collect();
+        assert_eq!(positions, vec![100, 300, 500, 700]);
+    }
+
+    /// Two CRAMs for the same sample, each with two chr1 reads at
+    /// interleaving positions. The query path's k-way merge must
+    /// emit them in coordinate order. We compare against the
+    /// expected positions directly rather than against
+    /// `CramMergedReader::new` because `new` 's two-CRAM-with-records
+    /// path is not currently exercised by any other test in this
+    /// module and has surfaced as fragile during this commit's
+    /// development; cross-validating the two readers is a follow-up
+    /// once that path has its own coverage.
+    #[test]
+    fn c3_query_k_way_merge_yields_coordinate_sorted_records_across_inputs() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+
+        let records_a = vec![
+            pass_record_for_b("Ra1", 0, 100),
+            pass_record_for_b("Ra2", 0, 500),
+        ];
+        let records_b = vec![
+            pass_record_for_b("Rb1", 0, 200),
+            pass_record_for_b("Rb2", 0, 600),
+        ];
+        let header_overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let (_a_dir, cram_a) =
+            build_cram(&fasta_path, &contigs, &header_overrides, &records_a).expect("build cram_a");
+        let (_b_dir, cram_b) =
+            build_cram(&fasta_path, &contigs, &header_overrides, &records_b).expect("build cram_b");
+
+        let (header_a, index_a) = load_header_and_index(&cram_a);
+        let (header_b, index_b) = load_header_and_index(&cram_b);
+        let headers = vec![header_a, header_b];
+        let indexes = vec![index_a, index_b];
+
+        let query_positions: Vec<(Vec<u8>, u64)> = CramMergedReader::query(
+            &[cram_a, cram_b],
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            &headers,
+            &indexes,
+            "chr1",
+            CramMergedReaderConfig::default(),
+        )
+        .expect("query chr1")
+        .map(|r| {
+            let r = r.expect("ok record");
+            (r.qname.clone(), r.pos)
+        })
+        .collect();
+
+        assert_eq!(
+            query_positions,
+            vec![
+                (b"Ra1".to_vec(), 100),
+                (b"Rb1".to_vec(), 200),
+                (b"Ra2".to_vec(), 500),
+                (b"Rb2".to_vec(), 600),
+            ]
+        );
+    }
+
+    #[test]
+    fn c4_query_empty_contig_yields_no_records() {
+        let contigs = two_contigs_chr1_chr2();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        // All records on chr1; chr2 is empty.
+        let records = vec![
+            pass_record_for_b("R1", 0, 100),
+            pass_record_for_b("R2", 0, 200),
+        ];
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+
+        let (header, index) = load_header_and_index(&cram_path);
+        let reader = CramMergedReader::query(
+            std::slice::from_ref(&cram_path),
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            std::slice::from_ref(&header),
+            std::slice::from_ref(&index),
+            "chr2",
+            CramMergedReaderConfig::default(),
+        )
+        .expect("query chr2");
+
+        let decoded: Vec<MappedRead> = reader.map(|r| r.expect("ok record")).collect();
+        assert!(decoded.is_empty(), "chr2 has no reads in fixture");
+    }
+
+    #[test]
+    fn c5_query_rejects_contig_not_in_canonical_list() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+
+        let (header, index) = load_header_and_index(&cram_path);
+        let err = CramMergedReader::query(
+            std::slice::from_ref(&cram_path),
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            std::slice::from_ref(&header),
+            std::slice::from_ref(&index),
+            "chrUnknown",
+            CramMergedReaderConfig::default(),
+        );
+        let err = err_or_panic(err, "query should reject unknown contig");
+        assert!(matches!(
+            err,
+            CramInputError::ContigNotInList { ref contig, .. } if contig == "chrUnknown"
+        ));
+    }
+
+    #[test]
+    fn c6_query_rejects_mismatched_per_input_handle_counts() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, cram_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+
+        let (header, index) = load_header_and_index(&cram_path);
+
+        // 2 crams, 1 header, 1 index → mismatch.
+        let err = CramMergedReader::query(
+            &[cram_path.clone(), cram_path.clone()],
+            &fasta_path,
+            contigs_for(&contigs),
+            "s1".to_string(),
+            std::slice::from_ref(&header),
+            std::slice::from_ref(&index),
+            "chr1",
+            CramMergedReaderConfig::default(),
+        );
+        let err = err_or_panic(err, "query should reject mismatched handle counts");
+        assert!(matches!(
+            err,
+            CramInputError::PerInputHandleCountMismatch {
+                crams: 2,
+                headers: 1,
+                indexes: 1,
+            }
+        ));
     }
 }

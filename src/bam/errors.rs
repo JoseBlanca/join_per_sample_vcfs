@@ -123,6 +123,30 @@ pub enum CramInputError {
         #[source]
         source: std::io::Error,
     },
+
+    /// `CramMergedReader::query` was asked for a contig name that
+    /// the canonical contig list does not carry. Programmer error
+    /// at the call site (the canonical list comes from a prior
+    /// validation pass; the caller is expected to query contigs
+    /// from that same list), but surfaced as a typed error rather
+    /// than a panic to keep the boundary clean.
+    #[error(
+        "contig '{contig}' is not in the canonical contig list \
+         (cohort has {known_contigs} contigs total)"
+    )]
+    ContigNotInList {
+        contig: String,
+        known_contigs: usize,
+    },
+
+    /// `CramMergedReader::query` was given a `headers` or `indexes`
+    /// slice whose length does not match `crams.len()`.
+    #[error("per-input handle count mismatch: {crams} crams, {headers} headers, {indexes} indexes")]
+    PerInputHandleCountMismatch {
+        crams: usize,
+        headers: usize,
+        indexes: usize,
+    },
 }
 
 /// Errors raised by [`crate::bam::index_preflight::preflight_alignment_indexes`].
