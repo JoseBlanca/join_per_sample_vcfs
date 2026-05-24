@@ -355,8 +355,7 @@ impl CohortMapqStats {
         // observation — Welch's t can't be computed regardless).
         let variance = if n >= 2 {
             let sum_sq_f = sum_sq as f64;
-            let bessel = ((sum_sq_f - (sum as f64) * mean) / ((n - 1) as f64)).max(0.0);
-            bessel
+            ((sum_sq_f - (sum as f64) * mean) / ((n - 1) as f64)).max(0.0)
         } else {
             0.0
         };

@@ -855,8 +855,7 @@ impl MultiChromStreamingRefFetcher {
     > {
         self.inner.lock().map_err(|_poison| ChromRefFetchError::Io {
             chrom_name: String::from("<walker-adapter>"),
-            source: io::Error::new(
-                io::ErrorKind::Other,
+            source: io::Error::other(
                 "MultiChromStreamingRefFetcher mutex poisoned (prior panic during rebuild)",
             ),
         })
@@ -932,13 +931,10 @@ impl MultiChromRefFetcher for MultiChromStreamingRefFetcher {
             _ => {
                 return Err(ChromRefFetchError::Io {
                     chrom_name: String::from("<walker-adapter>"),
-                    source: io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "MultiChromStreamingRefFetcher: slot raced — expected chrom_id {chrom_id} \
-                             but found a different binding"
-                        ),
-                    ),
+                    source: io::Error::other(format!(
+                        "MultiChromStreamingRefFetcher: slot raced — expected chrom_id {chrom_id} \
+                         but found a different binding"
+                    )),
                 });
             }
         };
@@ -1863,7 +1859,7 @@ mod tests {
         // The .fa is mostly placeholder; the validation under
         // test fires at construction time (before any read).
         let mut fa = StdFile::create(&fa_path).expect("fa");
-        write!(fa, ">{chrom_name}\n").expect("fa header");
+        writeln!(fa, ">{chrom_name}").expect("fa header");
         fa.write_all(&vec![b'A'; contig_seq_len as usize])
             .expect("fa seq");
         fa.write_all(b"\n").expect("fa nl");
