@@ -27,8 +27,7 @@ private_intra_doc_links = "allow"
 [lints.clippy]
 # Mi23: keep the lints table small and additive. `wildcard_enum_match_arm`
 # and `match_same_arms` would surface many pre-existing non-PSP
-# sites that are out of scope for the 2026-05-13 review fixes.
-# Re-enable when those modules get their own clippy pass.
+# sites. Re-enable when those modules get their own clippy pass.
 fallible_impl_from = "warn"
 fn_params_excessive_bools = "warn"
 
@@ -46,15 +45,13 @@ debug = true
 ahash = "0.8.12"
 anyhow = "1.0.102"
 # bytemuck: zero-copy `cast_slice` in PSP's `encode_list_column_csr`
-# fast path (per_sample_pileup/psp/block.rs). Avoids user-side
-# `unsafe`; single dependent call site.
+# fast path (src/psp/block.rs). Avoids user-side `unsafe`; single
+# dependent call site.
 bytemuck = "1"
 clap = { version = "4", features = ["derive"] }
 dhat = { version = "0.3", optional = true }
 md-5 = "0.11"
 mimalloc = { version = "0.1", default-features = false, optional = true }
-flate2 = "1.1.9"
-lru = "0.16.3"
 # noodles-bam and noodles-csi are promoted from transitive (via
 # noodles-cram / noodles-sam) to explicit so the BAM/CSI symbols
 # used by src/bam/* are compile-checked against the manifest
@@ -78,7 +75,7 @@ toml = "1.1"
 # server), NEON on aarch64 (Apple Silicon dev laptop). Single
 # source for both ISAs. Used by posterior_engine::simd for the
 # lane-parallel ln/exp tables.
-wide = "0.7"
+wide = "1.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.13"
 

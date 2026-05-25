@@ -1299,7 +1299,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
             scratch.mixture_c_s_all[s0 + 3],
         ]);
         let one_minus_c_s_v = f64x4::splat(1.0) - c_s_v;
-        let active_mask = c_s_v.cmp_gt(f64x4::splat(0.0));
+        let active_mask = c_s_v.simd_gt(f64x4::splat(0.0));
 
         if !active_mask.any() {
             // All 4 lanes inactive — fallback rows already in place,
@@ -1319,7 +1319,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
                     f64::from(scalars[(s0 + 2) * n_alleles + a].num_obs),
                     f64::from(scalars[(s0 + 3) * n_alleles + a].num_obs),
                 ]);
-                let n_a_mask = n_a_v.cmp_gt(f64x4::splat(0.0));
+                let n_a_mask = n_a_v.simd_gt(f64x4::splat(0.0));
 
                 // `eps` per lane.
                 let eps_v = f64x4::from([
@@ -1364,7 +1364,7 @@ fn compute_mixture_log_likelihoods_simd<M: MathBackend>(
                 // non-finite-posterior error (matches the scalar
                 // body's behaviour exactly).
                 let contributing_mask = active_mask & n_a_mask;
-                let bad_mask = mix_v.cmp_le(f64x4::splat(0.0)) & contributing_mask;
+                let bad_mask = mix_v.simd_le(f64x4::splat(0.0)) & contributing_mask;
                 if bad_mask.any() {
                     let mix_arr = mix_v.to_array();
                     for lane in 0..4 {
@@ -2927,7 +2927,7 @@ fn log_sum_exp_slice_x4<M: MathBackend>(math: &M, values: &[wide::f64x4]) -> wid
     let candidate = m + ln_sum;
     // Per-lane fallback: if a lane's `m == -∞`, force result to `-∞`.
     let neg_inf = wide::f64x4::splat(f64::NEG_INFINITY);
-    let all_neg_mask = m.cmp_eq(neg_inf);
+    let all_neg_mask = m.simd_eq(neg_inf);
     all_neg_mask.blend(neg_inf, candidate)
 }
 
