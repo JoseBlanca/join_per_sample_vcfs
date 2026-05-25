@@ -97,8 +97,8 @@ use pop_var_caller::var_calling::dust_filter::{
     DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW, DustFilterConfig,
 };
 use pop_var_caller::var_calling::per_group_merger::{
-    DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY, PerGroupMergerConfig,
-    SharedRefFetcher,
+    DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD,
+    DEFAULT_PLOIDY, PerGroupMergerConfig, SharedRefFetcher,
 };
 use pop_var_caller::var_calling::per_position_merger::PerPositionMerger;
 use pop_var_caller::var_calling::posterior_engine::{
@@ -257,6 +257,7 @@ impl CohortFixture {
             per_group_cfg: PerGroupMergerConfig::new(
                 DEFAULT_PLOIDY,
                 DEFAULT_MAX_ALLELES_PER_RECORD,
+                DEFAULT_MAX_ALLELES_LH_CALC,
                 DEFAULT_BATCH_SIZE,
             )
             .expect("per-group cfg"),
@@ -299,6 +300,7 @@ impl CohortFixture {
                 complexity_threshold: DEFAULT_DUST_THRESHOLD,
                 var_group_max_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
                 max_alleles_per_var: DEFAULT_MAX_ALLELES_PER_RECORD,
+                max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
                 inbreeding_coefficient: DEFAULT_INBREEDING_COEFFICIENT,
                 em_convergence_threshold: DEFAULT_CONVERGENCE_THRESHOLD,
                 em_max_iterations: DEFAULT_MAX_ITERATIONS,

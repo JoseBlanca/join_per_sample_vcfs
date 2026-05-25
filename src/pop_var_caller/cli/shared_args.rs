@@ -54,7 +54,9 @@ const fn pop_var_caller_default_min_mapq_diff_t() -> f32 {
     DEFAULT_MIN_MAPQ_DIFF_T
 }
 use crate::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
-use crate::var_calling::per_group_merger::{DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY};
+use crate::var_calling::per_group_merger::{
+    DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
+};
 use crate::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
     DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
@@ -263,6 +265,24 @@ pub struct CohortPipelineArgs {
         help_heading = "Advanced — Per-group merger",
     )]
     pub max_alleles_per_var: usize,
+
+    /// Absolute ceiling on the unified allele set per variant group
+    /// (REF + compounds + prunable), enforced *after*
+    /// `--max-alleles-per-var`. Backstops the per-genotype likelihood
+    /// routine's stack-allocated scratch + u64 genotype-membership
+    /// bitmask. Normally inert; only binds in pathological
+    /// low-complexity regions where chain-anchored compound alleles
+    /// pile up. When it bites, the lowest-cohort_count alleles are
+    /// dropped (REF excluded, compounds included) and the run summary
+    /// reports `allele_lh_cap_hit: groups=N alleles_dropped=M`.
+    #[arg(
+        long,
+        hide_short_help = true,
+        default_value_t = DEFAULT_MAX_ALLELES_LH_CALC,
+        value_parser = parsers::parse_max_alleles_lh_calc,
+        help_heading = "Advanced — Per-group merger",
+    )]
+    pub max_alleles_lh_calc: usize,
 
     // ===== Advanced — Posterior engine =========================
     #[arg(

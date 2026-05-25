@@ -25,7 +25,9 @@ use crate::var_calling::contamination_estimation::{
     MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE, STABILITY_TOLERANCE_RANGE_MAX,
 };
 use crate::var_calling::dust_filter::{MAX_DUST_WINDOW, SD_WLEN};
-use crate::var_calling::per_group_merger::{MAX_ALLELES_PER_VAR_CAP, MAX_PLOIDY};
+use crate::var_calling::per_group_merger::{
+    MAX_ALLELES_PER_VAR_CAP, MAX_BITMASK_ALLELES, MAX_PLOIDY,
+};
 use crate::var_calling::posterior_engine::{
     CONVERGENCE_THRESHOLD_RANGE_MAX, GQ_PHRED_RANGE_MAX, GQ_PHRED_RANGE_MIN_EXCLUSIVE,
     MAX_ITERATIONS_RANGE_MAX, PSEUDOCOUNT_RANGE_MAX,
@@ -125,6 +127,13 @@ pub fn parse_ploidy(s: &str) -> Result<u8, String> {
 /// `--max-alleles-per-var`: `2..=MAX_ALLELES_PER_VAR_CAP`.
 pub fn parse_max_alleles(s: &str) -> Result<usize, String> {
     parse_usize_in(s, "max-alleles-per-var", 2, MAX_ALLELES_PER_VAR_CAP)
+}
+
+/// `--max-alleles-lh-calc`: `2..=MAX_BITMASK_ALLELES`. Absolute
+/// ceiling on the unified allele set; backstops the likelihood
+/// routine's fixed-width bitmask + stack scratch.
+pub fn parse_max_alleles_lh_calc(s: &str) -> Result<usize, String> {
+    parse_usize_in(s, "max-alleles-lh-calc", 2, MAX_BITMASK_ALLELES)
 }
 
 // ---- Stage 4 (grouper) ------------------------------------------

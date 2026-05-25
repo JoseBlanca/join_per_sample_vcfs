@@ -289,6 +289,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     let per_group_cfg = PerGroupMergerConfig::new(
         cohort.ploidy,
         cohort.max_alleles_per_var,
+        cohort.max_alleles_lh_calc,
         DEFAULT_BATCH_SIZE,
     )?;
     // 5/6. Posterior config + contamination wired through the named-
@@ -423,6 +424,8 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         total_stats.records_dropped_low_qual += stats.records_dropped_low_qual;
         total_stats.records_dropped_low_alt_obs += stats.records_dropped_low_alt_obs;
         total_stats.records_dropped_low_mapq_diff_t += stats.records_dropped_low_mapq_diff_t;
+        total_stats.lh_cap_groups_skipped += stats.lh_cap_groups_skipped;
+        total_stats.lh_cap_alleles_in_skipped += stats.lh_cap_alleles_in_skipped;
     }
 
     // 10b. Concat fragments in contig-table order into the final
@@ -524,8 +527,16 @@ fn print_run_summary(
     } else {
         String::new()
     };
+    let lh_cap_note = if stats.lh_cap_groups_skipped > 0 {
+        format!(
+            " allele_lh_cap_hit: groups_skipped={} alleles_total={} (--max-alleles-lh-calc bound)",
+            stats.lh_cap_groups_skipped, stats.lh_cap_alleles_in_skipped,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}{}",
         sample_names.len(),
         stats.records_written,
         effective_threads,
@@ -535,6 +546,7 @@ fn print_run_summary(
         dropped_low_qual_note,
         dropped_low_alt_obs_note,
         dropped_low_mapq_diff_t_note,
+        lh_cap_note,
     );
 }
 

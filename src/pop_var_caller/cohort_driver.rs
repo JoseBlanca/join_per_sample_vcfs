@@ -110,6 +110,17 @@ pub struct CohortDriveStats {
     /// supporting reads for the test to be defined. See
     /// [`DEFAULT_MIN_MAPQ_DIFF_T`] and [`MAPQ_FILTER_MIN_READS_PER_SIDE`].
     pub records_dropped_low_mapq_diff_t: u64,
+    /// Variant groups skipped by the `--max-alleles-lh-calc` cap
+    /// because the unified allele set exceeded the absolute ceiling
+    /// (REF + compounds + prunable). Sourced from
+    /// [`crate::var_calling::per_group_merger::LhCapStats::groups_skipped`].
+    /// Surfaced in the run summary only when non-zero.
+    pub lh_cap_groups_skipped: u64,
+    /// Sum of `unified.alleles.len()` across every group skipped by
+    /// the lh-calc cap. Lets the user gauge how much allele evidence
+    /// got dropped without re-reading the input. Sourced from
+    /// [`crate::var_calling::per_group_merger::LhCapStats::alleles_total_in_skipped`].
+    pub lh_cap_alleles_in_skipped: u64,
 }
 
 /// Bundle of per-stage configs consumed by
@@ -247,6 +258,11 @@ where
     // `fetcher.clone()` is cheap (`Arc::clone`); the per-group
     // merger needs its own owned handle.
     let per_group = PerGroupMerger::with_config(grouper, fetcher.clone(), per_group_cfg);
+    // Snapshot the merger's `--max-alleles-lh-calc` counters before
+    // moving it into the iterator chain below. Both clones share the
+    // same `Arc<AtomicU64>`s, so reads after the drive loop see every
+    // skip the merger recorded.
+    let lh_cap_stats = per_group.lh_cap_stats().clone();
 
     // Min-alt-AD filter at the per-group merger → EM boundary. The
     // filter closure cannot mutably borrow `stats` (that borrow is
@@ -320,6 +336,8 @@ where
         return Err(e);
     }
     stats.records_dropped_low_alt_obs += alt_obs_dropped.load(std::sync::atomic::Ordering::Relaxed);
+    stats.lh_cap_groups_skipped += lh_cap_stats.groups_skipped();
+    stats.lh_cap_alleles_in_skipped += lh_cap_stats.alleles_total_in_skipped();
     Ok(stats)
 }
 

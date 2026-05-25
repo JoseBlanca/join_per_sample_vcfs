@@ -44,7 +44,7 @@ use pop_var_caller::var_calling::contamination_estimation::{
 };
 use pop_var_caller::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use pop_var_caller::var_calling::per_group_merger::{
-    DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
+    DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
 };
 use pop_var_caller::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
@@ -107,6 +107,7 @@ fn var_calling_args(
             complexity_threshold: DEFAULT_DUST_THRESHOLD,
             var_group_max_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
             max_alleles_per_var: DEFAULT_MAX_ALLELES_PER_RECORD,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             inbreeding_coefficient: DEFAULT_INBREEDING_COEFFICIENT,
             em_convergence_threshold: DEFAULT_CONVERGENCE_THRESHOLD,
             em_max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -331,6 +332,7 @@ fn var_calling_from_bam_happy_path() {
             complexity_threshold: DEFAULT_DUST_THRESHOLD,
             var_group_max_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
             max_alleles_per_var: DEFAULT_MAX_ALLELES_PER_RECORD,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             inbreeding_coefficient: DEFAULT_INBREEDING_COEFFICIENT,
             em_convergence_threshold: DEFAULT_CONVERGENCE_THRESHOLD,
             em_max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -670,6 +672,7 @@ fn var_calling_from_bam_surfaces_walker_error_on_max_active_reads_trip() {
             complexity_threshold: DEFAULT_DUST_THRESHOLD,
             var_group_max_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
             max_alleles_per_var: DEFAULT_MAX_ALLELES_PER_RECORD,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             inbreeding_coefficient: DEFAULT_INBREEDING_COEFFICIENT,
             em_convergence_threshold: DEFAULT_CONVERGENCE_THRESHOLD,
             em_max_iterations: DEFAULT_MAX_ITERATIONS,
@@ -771,6 +774,7 @@ fn from_bam_args_for_preflight_tests(
             complexity_threshold: DEFAULT_DUST_THRESHOLD,
             var_group_max_span: DEFAULT_MAX_VARIANT_GROUP_SPAN,
             max_alleles_per_var: DEFAULT_MAX_ALLELES_PER_RECORD,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             inbreeding_coefficient: DEFAULT_INBREEDING_COEFFICIENT,
             em_convergence_threshold: DEFAULT_CONVERGENCE_THRESHOLD,
             em_max_iterations: DEFAULT_MAX_ITERATIONS,

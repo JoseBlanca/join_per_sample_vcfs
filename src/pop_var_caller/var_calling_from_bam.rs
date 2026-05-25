@@ -355,6 +355,7 @@ pub fn run_var_calling_from_bam(
     let per_group_cfg = PerGroupMergerConfig::new(
         cohort.ploidy,
         cohort.max_alleles_per_var,
+        cohort.max_alleles_lh_calc,
         DEFAULT_BATCH_SIZE,
     )?;
     // Build the posterior-engine config via the validating
@@ -503,6 +504,8 @@ pub fn run_var_calling_from_bam(
         total_stats.records_dropped_low_qual += stats.records_dropped_low_qual;
         total_stats.records_dropped_low_alt_obs += stats.records_dropped_low_alt_obs;
         total_stats.records_dropped_low_mapq_diff_t += stats.records_dropped_low_mapq_diff_t;
+        total_stats.lh_cap_groups_skipped += stats.lh_cap_groups_skipped;
+        total_stats.lh_cap_alleles_in_skipped += stats.lh_cap_alleles_in_skipped;
     }
 
     // 11. Concat fragments in contig-table order. `concat_fragments`
@@ -525,9 +528,17 @@ pub fn run_var_calling_from_bam(
     } else {
         String::new()
     };
+    let lh_cap_note = if total_stats.lh_cap_groups_skipped > 0 {
+        format!(
+            " allele_lh_cap_hit: groups_skipped={} alleles_total={} (--max-alleles-lh-calc bound)",
+            total_stats.lh_cap_groups_skipped, total_stats.lh_cap_alleles_in_skipped,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling-from-bam: sample={} records_emitted={}{}",
-        sample_name, total_stats.records_written, emnoconv_note,
+        "var-calling-from-bam: sample={} records_emitted={}{}{}",
+        sample_name, total_stats.records_written, emnoconv_note, lh_cap_note,
     );
     Ok(())
 }

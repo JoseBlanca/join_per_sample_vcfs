@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::AHashMap;
 use smallvec::SmallVec;
@@ -70,6 +71,19 @@ pub const DEFAULT_PLOIDY: u8 = 2;
 /// batch-size sweep.
 pub const DEFAULT_BATCH_SIZE: usize = 32;
 
+/// Default absolute ceiling on the unified allele set per variant
+/// group, enforced after [`DEFAULT_MAX_ALLELES_PER_RECORD`]. Backstops
+/// the likelihood routine's stack-allocated `[u32; MAX_BITMASK_ALLELES]`
+/// scratch + `u64` genotype-membership bitmask. Equal to
+/// [`MAX_BITMASK_ALLELES`]; bounded above by it.
+///
+/// Normally inert — only binds in pathological low-complexity regions
+/// where many chain-anchored compounds accumulate in one group. When
+/// it bites, alleles are dropped by lowest cohort count first (REF
+/// excluded, compounds included), and the run summary reports
+/// `allele_lh_cap_hit: groups=N alleles_dropped=M`.
+pub const DEFAULT_MAX_ALLELES_LH_CALC: usize = MAX_BITMASK_ALLELES;
+
 /// Tunable knobs for the per-group merger.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -86,6 +100,16 @@ pub struct PerGroupMergerConfig {
     /// term. Defaults to [`DEFAULT_MAX_ALLELES_PER_RECORD`].
     pub max_alleles: usize,
 
+    /// Absolute ceiling on the unified allele set, enforced *after*
+    /// [`Self::max_alleles`]. Backstops the likelihood routine's
+    /// fixed-width bitmask + stack scratch (see
+    /// [`MAX_BITMASK_ALLELES`]). When this cap binds (only in
+    /// pathological low-complexity regions where compound alleles
+    /// pile up past the soft cap), alleles are dropped by lowest
+    /// `cohort_count` first — REF excluded, compounds included.
+    /// Defaults to [`DEFAULT_MAX_ALLELES_LH_CALC`].
+    pub max_alleles_lh_calc: usize,
+
     /// Number of upstream groups pulled and processed in parallel per
     /// `next()` refill. Defaults to [`DEFAULT_BATCH_SIZE`].
     pub batch_size: usize,
@@ -96,6 +120,7 @@ impl Default for PerGroupMergerConfig {
         Self {
             ploidy: DEFAULT_PLOIDY,
             max_alleles: DEFAULT_MAX_ALLELES_PER_RECORD,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             batch_size: DEFAULT_BATCH_SIZE,
         }
     }
@@ -118,6 +143,7 @@ impl PerGroupMergerConfig {
     ///
     /// * `ploidy` ∈ `1..=MAX_PLOIDY` (default `2`).
     /// * `max_alleles` ∈ `2..=MAX_ALLELES_PER_VAR_CAP` (default `6`).
+    /// * `max_alleles_lh_calc` ∈ `2..=MAX_BITMASK_ALLELES` (default `64`).
     /// * `batch_size` ≥ `1` (a zero batch would never refill).
     ///
     /// Public fields stay accessible for tests and library use; this
@@ -126,6 +152,7 @@ impl PerGroupMergerConfig {
     pub fn new(
         ploidy: u8,
         max_alleles: usize,
+        max_alleles_lh_calc: usize,
         batch_size: usize,
     ) -> Result<Self, PerGroupMergerConfigError> {
         if !(1..=MAX_PLOIDY).contains(&ploidy) {
@@ -134,14 +161,64 @@ impl PerGroupMergerConfig {
         if !(2..=MAX_ALLELES_PER_VAR_CAP).contains(&max_alleles) {
             return Err(PerGroupMergerConfigError::InvalidMaxAlleles { got: max_alleles });
         }
+        if !(2..=MAX_BITMASK_ALLELES).contains(&max_alleles_lh_calc) {
+            return Err(PerGroupMergerConfigError::InvalidMaxAllelesLhCalc {
+                got: max_alleles_lh_calc,
+            });
+        }
         if batch_size == 0 {
             return Err(PerGroupMergerConfigError::InvalidBatchSize { got: batch_size });
         }
         Ok(Self {
             ploidy,
             max_alleles,
+            max_alleles_lh_calc,
             batch_size,
         })
+    }
+}
+
+/// Counters for the `--max-alleles-lh-calc` cap. Held inside
+/// [`PerGroupMerger`] and queried by the cohort driver after the
+/// iterator has drained. Cheap to `Clone` — the underlying counters
+/// live behind a single `Arc`, so the driver grabs one handle before
+/// moving the merger into the per-chrom iterator chain and reads it
+/// after the chain finishes.
+///
+/// `record_skip` is the only mutating entry point: the merger calls
+/// it once per group skipped because `unified.alleles.len() >
+/// config.max_alleles_lh_calc`, passing the offending allele count so
+/// `alleles_total_in_skipped` accumulates a meaningful sum.
+#[derive(Debug, Default, Clone)]
+pub struct LhCapStats {
+    inner: Arc<LhCapStatsInner>,
+}
+
+#[derive(Debug, Default)]
+struct LhCapStatsInner {
+    groups_skipped: AtomicU64,
+    alleles_total_in_skipped: AtomicU64,
+}
+
+impl LhCapStats {
+    /// Number of variant groups skipped because their unified allele
+    /// set exceeded the `--max-alleles-lh-calc` cap.
+    pub fn groups_skipped(&self) -> u64 {
+        self.inner.groups_skipped.load(Ordering::Relaxed)
+    }
+
+    /// Sum of `unified.alleles.len()` across every skipped group.
+    /// Useful as a "how much evidence got dropped" headline; divide
+    /// by `groups_skipped()` for the per-group average.
+    pub fn alleles_total_in_skipped(&self) -> u64 {
+        self.inner.alleles_total_in_skipped.load(Ordering::Relaxed)
+    }
+
+    fn record_skip(&self, n_alleles: usize) {
+        self.inner.groups_skipped.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .alleles_total_in_skipped
+            .fetch_add(n_alleles as u64, Ordering::Relaxed);
     }
 }
 
@@ -156,6 +233,13 @@ pub enum PerGroupMergerConfigError {
     /// `max_alleles` was out of range `2..=MAX_ALLELES_PER_VAR_CAP`.
     #[error("max_alleles must be in 2..={MAX_ALLELES_PER_VAR_CAP}, got {got}")]
     InvalidMaxAlleles { got: usize },
+
+    /// `max_alleles_lh_calc` was out of range `2..=MAX_BITMASK_ALLELES`.
+    /// The upper bound is a hard implementation limit (the inner
+    /// likelihood loop's `u64` bitmask + stack-allocated `[u32; 64]`
+    /// scratch); raising it requires widening both data structures.
+    #[error("max_alleles_lh_calc must be in 2..={MAX_BITMASK_ALLELES}, got {got}")]
+    InvalidMaxAllelesLhCalc { got: usize },
 
     /// `batch_size` was zero. A zero batch would never refill the
     /// merger.
@@ -517,6 +601,10 @@ where
     /// the per-group `Vec<u8>` alloc/free pair that `ref_fetcher.fetch`
     /// used to produce.
     ref_seq_scratch: Vec<u8>,
+    /// Counters for the `--max-alleles-lh-calc` cap. The driver
+    /// `.clone()`s this *before* moving the merger into its iterator
+    /// chain so it can read the values after the chain drains.
+    lh_cap_stats: LhCapStats,
     /// Latched after the first surfaced error or upstream exhaustion.
     done: bool,
 }
@@ -545,11 +633,13 @@ where
             genotype_tables: _,
             pending,
             ref_seq_scratch: _,
+            lh_cap_stats,
             done,
         } = self;
         f.debug_struct("PerGroupMerger")
             .field("config", config)
             .field("pending_len", &pending.len())
+            .field("lh_cap_stats", lh_cap_stats)
             .field("done", done)
             .finish()
     }
@@ -576,8 +666,17 @@ where
             genotype_tables,
             pending: VecDeque::new(),
             ref_seq_scratch: Vec::new(),
+            lh_cap_stats: LhCapStats::default(),
             done: false,
         }
+    }
+
+    /// Clonable handle to the `--max-alleles-lh-calc` cap counters.
+    /// Grab a clone *before* moving this merger into an iterator
+    /// chain so the cohort driver can read the counters once the
+    /// chain has drained.
+    pub fn lh_cap_stats(&self) -> &LhCapStats {
+        &self.lh_cap_stats
     }
 
     pub fn config(&self) -> &PerGroupMergerConfig {
@@ -623,10 +722,18 @@ where
         let config = &self.config;
         let genotype_tables = &self.genotype_tables;
         let ref_seq_scratch = &mut self.ref_seq_scratch;
+        let lh_cap_stats = &self.lh_cap_stats;
         let results: Vec<Result<Option<MergedRecord>, PerGroupMergerError>> = batch
             .into_iter()
             .map(|group| {
-                process_group(group, ref_fetcher, config, genotype_tables, ref_seq_scratch)
+                process_group(
+                    group,
+                    ref_fetcher,
+                    config,
+                    genotype_tables,
+                    ref_seq_scratch,
+                    lh_cap_stats,
+                )
             })
             .collect();
 
@@ -680,6 +787,7 @@ fn process_group(
     config: &PerGroupMergerConfig,
     genotype_tables: &[Vec<Vec<u8>>],
     ref_seq_scratch: &mut Vec<u8>,
+    lh_cap_stats: &LhCapStats,
 ) -> Result<Option<MergedRecord>, PerGroupMergerError> {
     let chrom_id = group.chrom_id;
     let start = group.start;
@@ -757,6 +865,20 @@ fn process_group(
 
     let unified = unify_alleles(&group, ref_seq, n_samples)?;
     let unified = enforce_max_alleles(unified, config.max_alleles);
+
+    // `--max-alleles-lh-calc` ceiling. The soft cap above only drops
+    // prunable alleles, so REF + compounds can still exceed the
+    // bitmask-scratch width of the inner likelihood routine in
+    // pathological low-complexity regions. Skip the whole group
+    // rather than try to drop compounds (whose constituent
+    // bookkeeping interacts with `project_scalars`' compound
+    // subtraction in ways that would require an inverse step) — the
+    // call quality in such regions is suspect regardless. The user
+    // is informed via the `allele_lh_cap_hit` run-summary line.
+    if unified.alleles.len() > config.max_alleles_lh_calc {
+        lh_cap_stats.record_skip(unified.alleles.len());
+        return Ok(None);
+    }
 
     // REF-only ⇒ no record. Compound rejection (no entry added) and
     // the cap path (drops into `dropped_other`) both leave `alleles`
@@ -1773,14 +1895,17 @@ fn standard_log_likelihood(
     n_alleles: usize,
     ploidy: u8,
 ) -> f64 {
-    // Scratch is sized by `n_alleles ≤ 64`. The `max_alleles` cap
-    // defaults to 6 and would have to be raised an order of magnitude
-    // before the bitmask shape needs widening — pleasant to keep the
-    // allocation off the heap.
-    debug_assert!(
+    // Scratch is sized by `n_alleles ≤ MAX_BITMASK_ALLELES`. The
+    // `--max-alleles-lh-calc` cap (enforced in `process_group` before
+    // we get here) guarantees this invariant, but the assert is kept
+    // as a release-build backstop: a silent OOB on `p_counts[a]`
+    // below would be far worse than a panic with a clear message. If
+    // this ever fires, the upstream cap path has a bug.
+    assert!(
         n_alleles <= MAX_BITMASK_ALLELES,
-        "standard_log_likelihood assumes n_alleles ≤ {MAX_BITMASK_ALLELES} (u64 bitmask + \
-         fixed-size scratch); got {n_alleles}",
+        "standard_log_likelihood invariant violated: n_alleles={n_alleles} > \
+         MAX_BITMASK_ALLELES={MAX_BITMASK_ALLELES}. The --max-alleles-lh-calc cap should \
+         have skipped this group in process_group — please report this as a bug.",
     );
 
     // Bit `a` set iff allele `a` appears in `genotype`. Replaces the
@@ -1828,7 +1953,14 @@ fn standard_log_likelihood(
 /// Width of the per-allele bitmask used by [`standard_log_likelihood`]
 /// and its scratch tables. 64 leaves an order-of-magnitude headroom
 /// over the default `max_alleles` cap of 6.
-const MAX_BITMASK_ALLELES: usize = 64;
+///
+/// **This is a hard implementation limit, not a tuning knob.** Raising
+/// it requires widening `g_bits` to a multi-word bitmask and the
+/// stack-allocated `p_counts` to a `Vec`. The user-facing
+/// [`PerGroupMergerConfig::max_alleles_lh_calc`] cap is bounded above
+/// by this constant precisely because the inner loop cannot represent
+/// more alleles than the bitmask carries bits.
+pub const MAX_BITMASK_ALLELES: usize = 64;
 
 /// Chain-broken-compound fallback: decompose to per-position
 /// likelihoods at the compound's constituent positions. Non-constituent
@@ -2772,6 +2904,92 @@ mod tests {
     }
 
     #[test]
+    fn lh_cap_skips_group_when_alleles_exceed_ceiling() {
+        // Build a group whose unified set ends up at 4 alleles
+        // (REF + 3 ALTs at the same position). Set `max_alleles` to
+        // its max so the soft cap doesn't bite; set
+        // `max_alleles_lh_calc = 3` so only the lh-calc cap can
+        // trigger. Expect: no record emitted, counters reflect the
+        // skip with the right allele total.
+        let rec_s0 = record(
+            0,
+            100,
+            vec![
+                allele(b"A", stats(10, -1.0), &[]),
+                allele(b"T", stats(5, -2.0), &[]),
+                allele(b"G", stats(4, -2.0), &[]),
+                allele(b"C", stats(3, -2.0), &[]),
+            ],
+        );
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVariantGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+            records: vec![pp],
+        };
+        let config = PerGroupMergerConfig {
+            ploidy: DEFAULT_PLOIDY,
+            max_alleles: MAX_ALLELES_PER_VAR_CAP,
+            max_alleles_lh_calc: 3,
+            batch_size: DEFAULT_BATCH_SIZE,
+        };
+        let merger = PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
+        let lh_stats = merger.lh_cap_stats().clone();
+        let out: Vec<_> = merger.collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(
+            out.is_empty(),
+            "lh-cap must skip the group, got {} records",
+            out.len(),
+        );
+        assert_eq!(
+            lh_stats.groups_skipped(),
+            1,
+            "lh_cap groups_skipped must increment",
+        );
+        assert_eq!(
+            lh_stats.alleles_total_in_skipped(),
+            4,
+            "alleles_total_in_skipped must equal the unified allele count of the skipped group",
+        );
+    }
+
+    #[test]
+    fn lh_cap_inert_when_alleles_within_ceiling() {
+        // 2 alleles, cap at 2 → no skip. Counters stay zero, record
+        // emits normally.
+        let rec_s0 = record(
+            0,
+            100,
+            vec![
+                allele(b"A", stats(10, -1.0), &[]),
+                allele(b"T", stats(5, -2.0), &[]),
+            ],
+        );
+        let pp = pp_one(0, 100, 1, vec![(0, rec_s0)]);
+        let group = OverlappingVariantGroup {
+            chrom_id: 0,
+            start: 100,
+            end: 100,
+            records: vec![pp],
+        };
+        let config = PerGroupMergerConfig {
+            max_alleles_lh_calc: 2,
+            ..Default::default()
+        };
+        let merger = PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
+        let lh_stats = merger.lh_cap_stats().clone();
+        let out: Vec<_> = merger.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "record must be emitted when alleles fit within lh_cap",
+        );
+        assert_eq!(lh_stats.groups_skipped(), 0);
+        assert_eq!(lh_stats.alleles_total_in_skipped(), 0);
+    }
+
+    #[test]
     fn cap_one_returns_none_no_record_emitted() {
         // Regression: with `max_alleles = 1`, REF stays protected,
         // every ALT folds into the ghost OTHER entry; the merged
@@ -2796,6 +3014,7 @@ mod tests {
         let config = PerGroupMergerConfig {
             ploidy: DEFAULT_PLOIDY,
             max_alleles: 1,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             batch_size: DEFAULT_BATCH_SIZE,
         };
         let merger = PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
@@ -2827,6 +3046,7 @@ mod tests {
         let config = PerGroupMergerConfig {
             ploidy: DEFAULT_PLOIDY,
             max_alleles: 0,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             batch_size: DEFAULT_BATCH_SIZE,
         };
         let merger = PerGroupMerger::with_config(ok_iter(vec![group]), fetcher(b"A", 100), config);
@@ -2938,6 +3158,7 @@ mod tests {
         let config = PerGroupMergerConfig {
             ploidy: 0,
             max_alleles: DEFAULT_MAX_ALLELES_PER_RECORD,
+            max_alleles_lh_calc: DEFAULT_MAX_ALLELES_LH_CALC,
             batch_size: DEFAULT_BATCH_SIZE,
         };
         let mut merger =
@@ -3102,25 +3323,38 @@ mod tests {
         let cfg = PerGroupMergerConfig::new(
             DEFAULT_PLOIDY,
             DEFAULT_MAX_ALLELES_PER_RECORD,
+            DEFAULT_MAX_ALLELES_LH_CALC,
             DEFAULT_BATCH_SIZE,
         )
         .unwrap();
         assert_eq!(cfg.ploidy, DEFAULT_PLOIDY);
         assert_eq!(cfg.max_alleles, DEFAULT_MAX_ALLELES_PER_RECORD);
+        assert_eq!(cfg.max_alleles_lh_calc, DEFAULT_MAX_ALLELES_LH_CALC);
         assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE);
     }
 
     #[test]
     fn config_new_accepts_range_boundaries() {
         // Just inside both bounds.
-        PerGroupMergerConfig::new(1, 2, 1).unwrap();
-        PerGroupMergerConfig::new(MAX_PLOIDY, MAX_ALLELES_PER_VAR_CAP, 1024).unwrap();
+        PerGroupMergerConfig::new(1, 2, 2, 1).unwrap();
+        PerGroupMergerConfig::new(
+            MAX_PLOIDY,
+            MAX_ALLELES_PER_VAR_CAP,
+            MAX_BITMASK_ALLELES,
+            1024,
+        )
+        .unwrap();
     }
 
     #[test]
     fn config_new_rejects_zero_ploidy() {
-        let err = PerGroupMergerConfig::new(0, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_BATCH_SIZE)
-            .unwrap_err();
+        let err = PerGroupMergerConfig::new(
+            0,
+            DEFAULT_MAX_ALLELES_PER_RECORD,
+            DEFAULT_MAX_ALLELES_LH_CALC,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap_err();
         assert_eq!(err, PerGroupMergerConfigError::InvalidPloidy { got: 0 });
     }
 
@@ -3129,6 +3363,7 @@ mod tests {
         let err = PerGroupMergerConfig::new(
             MAX_PLOIDY + 1,
             DEFAULT_MAX_ALLELES_PER_RECORD,
+            DEFAULT_MAX_ALLELES_LH_CALC,
             DEFAULT_BATCH_SIZE,
         )
         .unwrap_err();
@@ -3142,7 +3377,13 @@ mod tests {
 
     #[test]
     fn config_new_rejects_one_allele() {
-        let err = PerGroupMergerConfig::new(DEFAULT_PLOIDY, 1, DEFAULT_BATCH_SIZE).unwrap_err();
+        let err = PerGroupMergerConfig::new(
+            DEFAULT_PLOIDY,
+            1,
+            DEFAULT_MAX_ALLELES_LH_CALC,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap_err();
         assert_eq!(err, PerGroupMergerConfigError::InvalidMaxAlleles { got: 1 });
     }
 
@@ -3151,6 +3392,7 @@ mod tests {
         let err = PerGroupMergerConfig::new(
             DEFAULT_PLOIDY,
             MAX_ALLELES_PER_VAR_CAP + 1,
+            DEFAULT_MAX_ALLELES_LH_CALC,
             DEFAULT_BATCH_SIZE,
         )
         .unwrap_err();
@@ -3163,9 +3405,46 @@ mod tests {
     }
 
     #[test]
+    fn config_new_rejects_lh_calc_below_two() {
+        let err = PerGroupMergerConfig::new(
+            DEFAULT_PLOIDY,
+            DEFAULT_MAX_ALLELES_PER_RECORD,
+            1,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PerGroupMergerConfigError::InvalidMaxAllelesLhCalc { got: 1 }
+        );
+    }
+
+    #[test]
+    fn config_new_rejects_lh_calc_above_bitmask() {
+        let err = PerGroupMergerConfig::new(
+            DEFAULT_PLOIDY,
+            DEFAULT_MAX_ALLELES_PER_RECORD,
+            MAX_BITMASK_ALLELES + 1,
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PerGroupMergerConfigError::InvalidMaxAllelesLhCalc {
+                got: MAX_BITMASK_ALLELES + 1
+            }
+        );
+    }
+
+    #[test]
     fn config_new_rejects_zero_batch_size() {
-        let err = PerGroupMergerConfig::new(DEFAULT_PLOIDY, DEFAULT_MAX_ALLELES_PER_RECORD, 0)
-            .unwrap_err();
+        let err = PerGroupMergerConfig::new(
+            DEFAULT_PLOIDY,
+            DEFAULT_MAX_ALLELES_PER_RECORD,
+            DEFAULT_MAX_ALLELES_LH_CALC,
+            0,
+        )
+        .unwrap_err();
         assert_eq!(err, PerGroupMergerConfigError::InvalidBatchSize { got: 0 });
     }
 }
