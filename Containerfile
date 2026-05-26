@@ -12,7 +12,12 @@ FROM docker.io/library/rust:1.95-bookworm
 #   - build-essential / pkg-config: required by a few cargo crates that
 #     may compile native code.
 #   - git / ca-certificates: needed by cargo for git-based deps and HTTPS.
-#   - bcftools / tabix: inspect and compare VCF output against reference tools.
+#   - samtools / bcftools / tabix: inspect and compare BAM/VCF output
+#     against reference tools.
+#   - freebayes: reference variant caller; one of the three we compare
+#     against in benchmarks/tomato1/.
+#   - openjdk-17-jre-headless: Java runtime for GATK (installed below).
+#   - unzip / wget: needed to fetch and unpack the GATK release.
 #   - curl: bootstraps the NodeSource apt repo for Node.js.
 #   - linux-perf: sampling profiler; backs cargo-flamegraph. In-container
 #     sampling needs the host's kernel.perf_event_paranoid relaxed
@@ -26,8 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         git \
         ca-certificates \
+        samtools \
         bcftools \
         tabix \
+        freebayes \
+        openjdk-17-jre-headless \
+        unzip \
+        wget \
         curl \
         linux-perf \
         hyperfine \
@@ -35,6 +45,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# GATK 4: HaplotypeCaller + GenotypeGVCFs reference caller. Distributed
+# as a Java fat-jar with a shell wrapper. Installs to /opt/gatk-<ver>/
+# with a stable /opt/gatk -> /opt/gatk-<ver>/ symlink so the runner
+# scripts (default `GATK_BIN=/opt/gatk/gatk`) stay valid across version
+# bumps. Bump GATK_VERSION when you want to upgrade.
+ARG GATK_VERSION=4.6.0.0
+RUN wget -q "https://github.com/broadinstitute/gatk/releases/download/${GATK_VERSION}/gatk-${GATK_VERSION}.zip" -O /tmp/gatk.zip \
+    && unzip -q /tmp/gatk.zip -d /opt/ \
+    && ln -s "/opt/gatk-${GATK_VERSION}" /opt/gatk \
+    && rm /tmp/gatk.zip
 
 # Rust components not included in the base image's minimal profile.
 RUN rustup component add rustfmt clippy
