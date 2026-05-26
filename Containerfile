@@ -18,6 +18,8 @@ FROM docker.io/library/rust:1.95-bookworm
 #     against in benchmarks/tomato1/.
 #   - openjdk-17-jre-headless: Java runtime for GATK (installed below).
 #   - unzip / wget: needed to fetch and unpack the GATK release.
+#   - python3-psutil: lets the perf experiment scripts measure
+#     subprocess RSS without needing uv inside the container.
 #   - curl: bootstraps the NodeSource apt repo for Node.js.
 #   - linux-perf: sampling profiler; backs cargo-flamegraph. In-container
 #     sampling needs the host's kernel.perf_event_paranoid relaxed
@@ -38,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jre-headless \
         unzip \
         wget \
+        python3-psutil \
         curl \
         linux-perf \
         hyperfine \
@@ -94,6 +97,15 @@ RUN mkdir -p src \
     && mv Cargo.toml.fetch Cargo.toml \
     && cargo fetch \
     && rm -rf src
+
+# GATK's `gatk` wrapper script uses `#!/usr/bin/env python`, but
+# Debian ships only `python3` (no plain `python` symlink). Installed
+# as its own layer so adding it doesn't invalidate the (slow) cargo
+# install + GATK download layers above. If the Containerfile is ever
+# rewritten, fold this back into the main apt-get block.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python-is-python3 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
 COPY scripts/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh

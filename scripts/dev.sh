@@ -50,6 +50,22 @@ fi
 MOUNT_SPEC="$PROJECT_DIR:$PROJECT_DIR"
 [[ "$RUNTIME" == podman ]] && MOUNT_SPEC="$MOUNT_SPEC:z"
 
+# Opt-in extra read-only bind mount for data that lives outside the
+# project tree (e.g. reference genomes at $HOME/genomes). Same path
+# inside the container as on the host, matching the convention used
+# for the project mount. Single path only; rerun with a different
+# value if you need a different mount.
+EXTRA_MOUNTS=()
+if [[ -n "${DEV_EXTRA_MOUNT:-}" ]]; then
+    if [[ ! -d "$DEV_EXTRA_MOUNT" ]]; then
+        echo "Error: DEV_EXTRA_MOUNT='$DEV_EXTRA_MOUNT' is not a directory." >&2
+        exit 1
+    fi
+    EXTRA_OPTS="ro"
+    [[ "$RUNTIME" == podman ]] && EXTRA_OPTS="${EXTRA_OPTS},z"
+    EXTRA_MOUNTS+=(-v "${DEV_EXTRA_MOUNT}:${DEV_EXTRA_MOUNT}:${EXTRA_OPTS}")
+fi
+
 # Only request a TTY when stdin actually is one; -t fails when invoked
 # from non-interactive contexts (CI, editor-spawned tooling).
 TTY_FLAGS=(-i)
@@ -64,9 +80,19 @@ if [[ "$RUNTIME" == container ]]; then
     RESOURCE_FLAGS+=(--memory "${DEV_MEM:-16g}" --cpus "${DEV_CPUS:-8}")
 fi
 
-exec "$RUNTIME" run --rm "${TTY_FLAGS[@]}" "${RESOURCE_FLAGS[@]}" \
-    -v "$MOUNT_SPEC" \
+# Empty-array expansions trip `set -u` on bash 3.2 (macOS default).
+# The `${arr[@]+"${arr[@]}"}` form expands to zero args when the
+# array is empty rather than erroring. TTY_FLAGS is always populated
+# with at least `-i` so doesn't need the guard.
+#
+# HOME is propagated from the host so scripts that compute paths via
+# `Path.home()` resolve to the same location as on the host (used by
+# DEV_EXTRA_MOUNT consumers like the perf scripts, which default the
+# reference path to $HOME/genomes/...).
+exec "$RUNTIME" run --rm "${TTY_FLAGS[@]}" ${RESOURCE_FLAGS[@]+"${RESOURCE_FLAGS[@]}"} \
+    -v "$MOUNT_SPEC" ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} \
     -w "$PROJECT_DIR" \
     -e CARGO_TARGET_DIR="$PROJECT_DIR/target-container" \
+    -e HOME="$HOME" \
     "$IMAGE" \
     "$@"
