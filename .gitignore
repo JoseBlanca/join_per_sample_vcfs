@@ -17,3 +17,9 @@ bcftools/
 gatk-protected/
 /CLAUDE.md
 /.claude/
+benchmarks/tomato1/crams/
+benchmarks/tomato1/results/
+# marimo per-notebook session cache (machine-specific, auto-generated)
+__marimo__/
+# macOS Finder metadata
+.DS_Store
