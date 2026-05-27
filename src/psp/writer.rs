@@ -37,41 +37,60 @@ use super::registry::{
 use super::trailer::{Trailer, encode_trailer};
 use crate::pileup_record::{ChainId, PileupRecord};
 
-/// Target uncompressed bytes per block. Spec §"Block sizing" pins
-/// this; it is not a tunable. The writer auto-flushes when an open
-/// block's projected payload reaches this value. Tests can override
-/// via [`PspWriter::new_with_block_target`] (Mi1, M14).
-pub const TARGET_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+/// Target uncompressed bytes per block. The writer auto-flushes when
+/// an open block's projected payload reaches this value. Tests can
+/// override via [`PspWriter::new_with_block_target`] (Mi1, M14).
+///
+/// **Trade-off: peak memory vs on-disk size.** Each `PspReader` holds
+/// one decoded block live; the cohort `var-calling` driver opens N
+/// readers per chromosome worker, so peak heap is
+/// `n_threads × N × per_block`. Smaller blocks → less heap, slightly
+/// worse compression context (so larger files).
+///
+/// 2026-05-27 sweep on tomato1 (N=18, T=4, real per-sample PSPs):
+///
+/// | target  | peak RSS | cohort size | wall  |
+/// |---------|---------:|------------:|------:|
+/// | 16 MiB  |  2501 MB |      183 MB | 10.4s |
+/// |  4 MiB  |   757 MB |      189 MB | 10.3s |
+/// |  1 MiB  |   261 MB |      206 MB | 10.6s |
+/// | 512 KiB |   161 MB |      233 MB | 10.6s | ← current
+/// | 256 KiB |   108 MB |      246 MB | 10.9s |
+/// |  64 KiB |    59 MB |      321 MB | 10.8s |
+///
+/// Wall time is flat across the sweep — there is no CPU cost to
+/// shrinking blocks. 512 KiB projects to ~45 GB peak at N=5000 / T=4
+/// (fits a 64 GB budget with ~20 GB headroom) for +27% disk vs the
+/// prior 16 MiB default.
+pub const TARGET_BLOCK_BYTES: usize = 512 * 1024;
 
 /// Initial `Vec::with_capacity` hint for per-record columns in a
 /// freshly-opened block (delta-pos, n-alleles, the per-record list
-/// columns). Sized at the records-per-block high-water mark for the
-/// SNP-typical bench workload (~31 uncompressed bytes per record),
-/// where the 16 MiB block target fills at ~530k records; the hint
-/// pre-allocates for the bulk so column `Vec`s do not realloc on
-/// the hot path.
+/// columns). Sized at ~66 % of the SNP-typical fill (block target ÷
+/// ~31 uncompressed bytes per record), so column `Vec`s do not
+/// realloc on the hot path. Derived from [`TARGET_BLOCK_BYTES`] so
+/// retuning the block size automatically retunes the hint.
 ///
 /// **Indel-heavy / multi-allelic workloads** carry more bytes per
-/// record, so blocks flush at fewer records (5k–50k typical). In
-/// that regime this hint *over-allocates* by ~5–10×; the excess
-/// capacity is held for the block's lifetime and freed at flush.
-/// No reallocation occurs in either direction — the trade is
-/// "spend some peak RAM, save the hot-path doubling cost on SNP
-/// runs."
-const INITIAL_RECORDS_HINT: usize = 350_000;
-/// Initial hint for per-allele columns. Sized a touch above
-/// `INITIAL_RECORDS_HINT` to absorb the typical excess of alleles
+/// record, so blocks flush at fewer records. In that regime this
+/// hint *over-allocates* by ~5–10×; the excess is freed at flush.
+/// No reallocation occurs either way — the trade is "spend some
+/// peak RAM, save the hot-path doubling cost on SNP runs."
+const INITIAL_RECORDS_HINT: usize = TARGET_BLOCK_BYTES / 48;
+/// Initial hint for per-allele columns. Slightly above
+/// [`INITIAL_RECORDS_HINT`] to absorb the typical excess of alleles
 /// over records (occasional multi-allelic positions). Same
-/// SNP-vs-indel trade as `INITIAL_RECORDS_HINT`.
-const INITIAL_ALLELES_HINT: usize = 360_000;
+/// SNP-vs-indel trade.
+const INITIAL_ALLELES_HINT: usize = TARGET_BLOCK_BYTES / 46;
 /// Initial hint for the concatenated allele-sequence byte buffer.
-/// On the SNP-typical workload one byte per allele = ~360 KiB; on
-/// indel-heavier workloads alleles run to ~10 bytes each. The 1 MiB
-/// hint covers both without leaving much slack.
-const INITIAL_ALLELE_SEQ_BYTES_HINT: usize = 1_000_000;
+/// SNP-typical workloads need ~1 byte/allele, indel-heavier ~10
+/// bytes; the 1/16 ratio to [`TARGET_BLOCK_BYTES`] covers both
+/// without much slack.
+const INITIAL_ALLELE_SEQ_BYTES_HINT: usize = TARGET_BLOCK_BYTES / 16;
 /// Initial chain-id-data capacity for the list-shaped chain-id
-/// column (Mi4). Most records carry zero chain ids; the
-/// SNP-typical workload's high-water mark sits well under this hint.
+/// column (Mi4). Most records carry zero chain ids; the SNP-typical
+/// high-water mark is already well under this hint, so it does not
+/// scale with block size.
 const INITIAL_CHAIN_IDS_HINT: usize = 4096;
 
 /// Byte mask of allele bytes the writer accepts. `ALLOWED[b]` is
