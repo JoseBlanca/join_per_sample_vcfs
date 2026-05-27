@@ -12,7 +12,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use common::{CONTIG_NAME, build_cram, build_fasta, fixture_md5, read_record};
+use common::{
+    CONTIG_NAME, build_cram, build_cram_with_len, build_fasta, build_fasta_with_len, fixture_md5,
+    read_record,
+};
 use pop_var_caller::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
     DEFAULT_MISMATCH_BQ_FLOOR,
@@ -30,6 +33,9 @@ use pop_var_caller::pop_var_caller::cli::shared_args::Stage1Args;
 use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
 use pop_var_caller::psp::PspReader;
 use pop_var_caller::psp::header::ParameterValue;
+use pop_var_caller::psp::writer::{
+    MAX_BLOCK_TARGET_BYTES, MIN_BLOCK_TARGET_BYTES, TARGET_BLOCK_BYTES,
+};
 use tempfile::TempDir;
 
 /// Default `PileupArgs` instance overridable by the test. We
@@ -42,6 +48,7 @@ fn default_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBu
         output,
         threads: None,
         alignment_files,
+        block_target_bytes: TARGET_BLOCK_BYTES,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: false,
@@ -127,10 +134,15 @@ fn happy_path_default_config() {
         "mate_lookup_window",
         "max_active_reads",
         "threads",
+        "block_target_bytes",
     ] {
         assert!(params.contains_key(*key), "missing param: {key}");
     }
     assert_eq!(params["baq_enabled"], ParameterValue::Boolean(true));
+    assert_eq!(
+        params["block_target_bytes"],
+        ParameterValue::Integer(TARGET_BLOCK_BYTES as i64)
+    );
 
     // Count records emitted — the three reads at 1, 5, 10 over a 5bp
     // each produce records at every position they cover. Reads
@@ -301,4 +313,73 @@ fn pileup_rejects_input_with_unknown_extension() {
         }
         other => panic!("unexpected error variant: {other:?}"),
     }
+}
+
+/// `--block-target-bytes` threads to the writer and changes the
+/// emitted .psp's block layout. We run the same large CRAM fixture
+/// with the minimum (16 KiB) and the maximum (16 MiB) accepted
+/// values; the small-target run must produce strictly more blocks
+/// and a strictly larger file. The parameter map round-trips the
+/// chosen value verbatim in each case (so the .psp self-describes
+/// the writer setting that produced it).
+#[test]
+fn block_target_bytes_changes_block_layout_end_to_end() {
+    // Contig long enough that the writer flushes several times at
+    // the small target. ~40 bytes/record × 4000 records ≈ 160 KB
+    // uncompressed → ~10 blocks at 16 KiB target, 1 block at 16 MiB.
+    const CONTIG_LEN: usize = 4000;
+    const READ_LEN: usize = 5;
+    let dir = TempDir::new().expect("tempdir");
+    let (fasta, md5) = build_fasta_with_len(dir.path(), CONTIG_LEN);
+
+    // One read per starting position, length 5 — guarantees a
+    // pileup record at every covered base (1..=CONTIG_LEN).
+    let mut records = Vec::with_capacity(CONTIG_LEN - READ_LEN + 1);
+    for i in 1..=(CONTIG_LEN - READ_LEN + 1) {
+        records.push(read_record(&format!("r{i}"), i, b"AAAAA"));
+    }
+    let cram = build_cram_with_len(
+        dir.path(),
+        &fasta,
+        "NA00001",
+        Some(md5.as_str()),
+        &records,
+        CONTIG_LEN,
+    );
+
+    let run = |target: usize, suffix: &str| -> (usize, u64) {
+        let output = dir.path().join(format!("out_{suffix}.psp"));
+        let mut args = default_args(fasta.clone(), output.clone(), vec![cram.clone()]);
+        args.block_target_bytes = target;
+        run_pileup(&args).expect("run_pileup OK");
+
+        let reader =
+            PspReader::new(BufReader::new(File::open(&output).unwrap())).expect("open psp reader");
+        // Self-describing parameter round-trips verbatim.
+        assert_eq!(
+            reader.header().writer.parameters["block_target_bytes"],
+            ParameterValue::Integer(target as i64),
+            "parameter map must record the chosen block target"
+        );
+        let n_blocks = reader.block_index().len();
+        let on_disk_size = std::fs::metadata(&output).unwrap().len();
+        (n_blocks, on_disk_size)
+    };
+
+    let (small_blocks, small_bytes) = run(MIN_BLOCK_TARGET_BYTES, "min");
+    let (large_blocks, large_bytes) = run(MAX_BLOCK_TARGET_BYTES, "max");
+
+    assert!(
+        small_blocks > large_blocks,
+        "smaller block target must produce more blocks: small={small_blocks} large={large_blocks}"
+    );
+    assert_eq!(
+        large_blocks, 1,
+        "16 MiB target should fit ~160 KB of records in a single block, got {large_blocks}"
+    );
+    assert!(
+        small_bytes > large_bytes,
+        "smaller blocks → more zstd-frame overhead → larger file: \
+         small={small_bytes} bytes, large={large_bytes} bytes"
+    );
 }

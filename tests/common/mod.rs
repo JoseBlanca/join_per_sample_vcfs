@@ -255,6 +255,107 @@ fn bai_path_for(bam: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Build a single-contig FASTA + `.fai` with a parameterised
+/// contig length (all-`A` bases). Returns `(fasta_path, md5_hex)`.
+/// Used by tests that need enough records to exercise PSP-writer
+/// block boundaries; the default [`build_fasta`] is too small
+/// (200 bp).
+pub fn build_fasta_with_len(dir: &Path, contig_len: usize) -> (PathBuf, String) {
+    let fasta_path = dir.join("ref.fa");
+    let fai_path = dir.join("ref.fa.fai");
+    let mut fa = File::create(&fasta_path).expect("create fasta");
+    let mut fai = File::create(&fai_path).expect("create fai");
+    writeln!(fa, ">{}", CONTIG_NAME).unwrap();
+    let header_len = (CONTIG_NAME.len() + 2) as u64;
+    let seq = vec![b'A'; contig_len];
+    fa.write_all(&seq).unwrap();
+    fa.write_all(b"\n").unwrap();
+    writeln!(
+        fai,
+        "{}\t{}\t{}\t{}\t{}",
+        CONTIG_NAME,
+        contig_len,
+        header_len,
+        contig_len,
+        contig_len + 1
+    )
+    .unwrap();
+    let mut h = Md5::new();
+    h.update(&seq);
+    let digest = h.finalize();
+    let mut md5_hex = String::with_capacity(32);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut md5_hex, "{b:02x}");
+    }
+    (fasta_path, md5_hex)
+}
+
+/// Like [`build_sam_header`] but with a parameterised contig length.
+pub fn build_sam_header_with_len(
+    sample: &str,
+    md5: Option<&str>,
+    contig_len: usize,
+) -> sam::Header {
+    use sam::header::record::value::map::header::tag::SORT_ORDER;
+    use sam::header::record::value::map::read_group::tag::SAMPLE;
+    use sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
+
+    let mut hd = Map::<HeaderMap>::new(Version::new(1, 6));
+    hd.other_fields_mut()
+        .insert(SORT_ORDER, BString::from(b"coordinate".as_ref()));
+
+    let length_nz = NonZero::new(contig_len).unwrap();
+    let mut ref_seq = Map::<ReferenceSequence>::new(length_nz);
+    if let Some(md5_str) = md5 {
+        ref_seq
+            .other_fields_mut()
+            .insert(MD5_CHECKSUM, BString::from(md5_str.as_bytes()));
+    }
+
+    let mut rg = Map::<ReadGroup>::default();
+    rg.other_fields_mut()
+        .insert(SAMPLE, BString::from(sample.as_bytes()));
+
+    sam::Header::builder()
+        .set_header(hd)
+        .add_reference_sequence(CONTIG_NAME.as_bytes().to_vec(), ref_seq)
+        .add_read_group(b"rg0".as_ref(), rg)
+        .build()
+}
+
+/// Like [`build_cram`] but with a parameterised contig length so it
+/// can pair with [`build_fasta_with_len`].
+pub fn build_cram_with_len(
+    dir: &Path,
+    fasta_path: &Path,
+    sample: &str,
+    md5: Option<&str>,
+    records: &[RecordBuf],
+    contig_len: usize,
+) -> PathBuf {
+    let cram_path = dir.join(format!("{sample}.cram"));
+    let header = build_sam_header_with_len(sample, md5, contig_len);
+
+    let indexed_reader = fasta::io::indexed_reader::Builder::default()
+        .build_from_path(fasta_path)
+        .expect("indexed fasta reader");
+    let adapter = fasta::repository::adapters::IndexedReader::new(indexed_reader);
+    let repository = fasta::Repository::new(adapter);
+
+    let mut writer = cram::io::writer::Builder::default()
+        .set_reference_sequence_repository(repository)
+        .build_from_path(&cram_path)
+        .expect("cram writer");
+    writer.write_header(&header).expect("write header");
+    for record in records {
+        sam::alignment::io::Write::write_alignment_record(&mut writer, &header, record)
+            .expect("write record");
+    }
+    sam::alignment::io::Write::finish(&mut writer, &header).expect("finish cram");
+    cram_path
+}
+
 /// Build a synthetic single-end read at `pos` (1-based), all-Match
 /// CIGAR, MAPQ 60, BQ 30. `qname` is the read name; `seq` is the
 /// read bases.

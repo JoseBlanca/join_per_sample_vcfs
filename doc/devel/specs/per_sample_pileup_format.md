@@ -840,9 +840,9 @@ trivially independent).
 
 ### Block sizing
 
-**Target uncompressed block size:** ~512 KiB (writer hardcoded; not
-exposed on the CLI in v1). The writer accumulates records until
-either:
+**Target uncompressed block size:** ~1 MiB by default; exposed on
+the `pileup` subcommand as `--block-target-bytes <BYTES>`
+(16 KiB..=16 MiB). The writer accumulates records until either:
 
 - the projected uncompressed column-payload total reaches the
   target, **or**
@@ -875,20 +875,29 @@ the file if any block in the body violates these:
 - Every per-allele `allele_chain_ids` list is strictly ascending
   and pairwise distinct.
 
-Rationale for 512 KiB. Earlier drafts and the 2026-05-13 resolution
-used 16 MiB on the (single-sample-correct) reasoning that ratio
-matters more than per-block decompression latency. The 2026-05-27
-cohort benchmark changed the calculus: the joint-genotyping driver
-opens one `PspReader` per sample per chromosome worker and runs
-`min(n_chromosomes, n_threads)` workers in parallel, so cohort-step
-peak heap scales as `n_threads × N × per_block`. A block-size sweep
-on tomato1 (N=18, T=4, real per-sample PSPs) showed wall time is
-essentially flat across a 256× range — shrinking the block is
-nearly free CPU-wise — while peak RSS varies from 2.5 GB (16 MiB)
-down to 59 MB (64 KiB). 512 KiB cuts peak ~15× vs 16 MiB at +27 %
-on-disk size, and projects to ~45 GB peak at N=5000 / T=4 (well
-within a 64 GB genomics-workstation budget). See the doc-comment
-on [`TARGET_BLOCK_BYTES` in src/psp/writer.rs](../../../src/psp/writer.rs)
+Rationale for the 1 MiB default + CLI knob. Earlier drafts and
+the 2026-05-13 resolution used 16 MiB on the (single-sample-correct)
+reasoning that ratio matters more than per-block decompression
+latency. The 2026-05-27 cohort benchmark changed the calculus: the
+joint-genotyping driver opens one `PspReader` per sample per
+chromosome worker and runs `min(n_chromosomes, n_threads)` workers
+in parallel, so cohort-step peak heap scales as
+`n_threads × N × per_block`. A block-size sweep on tomato1 (N=18,
+T=4, real per-sample PSPs) showed wall time is essentially flat
+across a 256× range — shrinking the block is nearly free CPU-wise —
+while peak RSS varies from 2.5 GB (16 MiB) down to 59 MB (64 KiB).
+Two user populations want different points on the curve:
+single-sample / archival users care about ratio (favour large
+blocks), while large-cohort joint-genotyping users care about peak
+heap (favour small blocks). Hardcoding either picks a fight with
+the other; CLI exposure lets each population pick.
+
+The default of 1 MiB pays +13 % on-disk size relative to the
+historical 16 MiB value, in exchange for ~10× lower cohort-step
+peak heap; it projects to ~180 GB at N=5000 / T=4, which still
+requires explicit dial-down on large cohorts but is a reasonable
+out-of-the-box pick. See the doc-comment on
+[`TARGET_BLOCK_BYTES` in src/psp/writer.rs](../../../src/psp/writer.rs)
 for the full sweep table.
 
 The on-disk format is unaffected — a reader handles any block size
@@ -1342,15 +1351,22 @@ benchmark on real data may change the writer's default — that is a
 writer change, not a format change. See §"Compression".*
 
 **~~Q-PL2 — default target uncompressed block size.~~**
-*Resolved 2026-05-13: 16 MiB. Revised 2026-05-27: 512 KiB. The
-initial resolution chose 16 MiB on the (single-sample-correct)
-reasoning that ratio matters more than per-block latency. The
-2026-05-27 cohort benchmark changed the calculus: cohort-step peak
-heap scales as `n_threads × N × per_block`, so block size dominates
-the memory ceiling at large N. 512 KiB cuts cohort peak ~15× vs
-16 MiB at +27 % on-disk size, with wall time flat across the swept
-range. Not CLI-exposed in v1; not recorded in the format. See
-§"Block sizing".*
+*Resolved 2026-05-13: 16 MiB. Revised 2026-05-27: 512 KiB
+(hardcoded). Revised 2026-05-27 (later same day): CLI-exposed on
+`pileup` as `--block-target-bytes <BYTES>` (16 KiB..=16 MiB);
+default 1 MiB. The initial resolution chose 16 MiB on the
+(single-sample-correct) reasoning that ratio matters more than
+per-block latency. The 2026-05-27 cohort benchmark changed the
+calculus: cohort-step peak heap scales as
+`n_threads × N × per_block`, so block size dominates the memory
+ceiling at large N. The interim 512 KiB hardcoded value cut cohort
+peak ~15× vs 16 MiB at +27 % on-disk size, but forced a compromise
+between archival (favour large blocks) and large-cohort
+joint-genotyping (favour small blocks) users. CLI exposure lets
+each pick; the 1 MiB default sits a bit on the compression side
+(+13 % disk vs 16 MiB, ~10× lower cohort-step heap). Not recorded
+in the on-disk format; readers handle any block size. See §"Block
+sizing".*
 
 **~~Q-PL3 — `f32` vs `f64` for `allele_q_sum_log`.~~**
 *Resolved 2026-05-13: `f64`, matching the implementation

@@ -20,6 +20,7 @@
 //! `parse_ploidy` parses `--ploidy`, `parse_max_gq_phred` parses
 //! `--max-gq-phred`, etc.
 
+use crate::psp::writer::{MAX_BLOCK_TARGET_BYTES, MIN_BLOCK_TARGET_BYTES};
 use crate::var_calling::contamination_estimation::{
     C_S_INIT_RANGE_MAX, MIN_COHORT_MINOR_FRACTION_RANGE_MAX_EXCLUSIVE,
     MIN_MAJOR_FRACTION_RANGE_MIN_EXCLUSIVE, STABILITY_TOLERANCE_RANGE_MAX,
@@ -351,6 +352,26 @@ pub fn parse_stability_blocks(s: &str) -> Result<u32, String> {
     parse_u32_min(s, "stability-blocks", 1)
 }
 
+// ---- Stage 1 (PSP writer) ---------------------------------------
+
+/// `--block-target-bytes`: `MIN_BLOCK_TARGET_BYTES..=MAX_BLOCK_TARGET_BYTES`
+/// (16 KiB..=16 MiB). PSP writer auto-flushes when an open block's
+/// projected uncompressed payload reaches this value.
+///
+/// The range matches the regime covered by the 2026-05-27 sweep on
+/// real per-sample PSPs. Below the floor zstd loses meaningful
+/// compression context (the sweep showed 64 KiB at +75% disk already
+/// past the knee); above the ceiling sits the legacy hardcoded
+/// 16 MiB default that was retired for cohort-step memory blow-up.
+pub fn parse_block_target_bytes(s: &str) -> Result<usize, String> {
+    parse_usize_in(
+        s,
+        "block-target-bytes",
+        MIN_BLOCK_TARGET_BYTES,
+        MAX_BLOCK_TARGET_BYTES,
+    )
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -572,5 +593,31 @@ mod tests {
         parse_stability_blocks("1").unwrap();
         parse_stability_blocks("3").unwrap();
         assert!(parse_stability_blocks("0").is_err());
+    }
+
+    #[test]
+    fn block_target_bytes_accepts_range_and_rejects_outside() {
+        // Both endpoints accepted.
+        assert_eq!(
+            parse_block_target_bytes(&MIN_BLOCK_TARGET_BYTES.to_string()).unwrap(),
+            MIN_BLOCK_TARGET_BYTES
+        );
+        assert_eq!(
+            parse_block_target_bytes(&MAX_BLOCK_TARGET_BYTES.to_string()).unwrap(),
+            MAX_BLOCK_TARGET_BYTES
+        );
+        // A representative point in the middle (the new default).
+        parse_block_target_bytes("1048576").unwrap(); // 1 MiB
+        // One below the floor and one above the ceiling — both errors,
+        // and the error mentions the flag name (so the user can tell
+        // which knob misbehaved).
+        let below = parse_block_target_bytes(&(MIN_BLOCK_TARGET_BYTES - 1).to_string());
+        assert!(below.is_err());
+        assert!(below.unwrap_err().contains("block-target-bytes"));
+        assert!(parse_block_target_bytes(&(MAX_BLOCK_TARGET_BYTES + 1).to_string()).is_err());
+        // Garbage input.
+        assert!(parse_block_target_bytes("0").is_err());
+        assert!(parse_block_target_bytes("abc").is_err());
+        assert!(parse_block_target_bytes("-1").is_err());
     }
 }

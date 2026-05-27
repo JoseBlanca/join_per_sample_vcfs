@@ -37,9 +37,11 @@ use super::registry::{
 use super::trailer::{Trailer, encode_trailer};
 use crate::pileup_record::{ChainId, PileupRecord};
 
-/// Target uncompressed bytes per block. The writer auto-flushes when
-/// an open block's projected payload reaches this value. Tests can
-/// override via [`PspWriter::new_with_block_target`] (Mi1, M14).
+/// Default target uncompressed bytes per block. The writer
+/// auto-flushes when an open block's projected payload reaches this
+/// value. The CLI (`pileup --block-target-bytes`) exposes the knob to
+/// users; library callers can also override directly via
+/// [`PspWriter::new_with_block_target`].
 ///
 /// **Trade-off: peak memory vs on-disk size.** Each `PspReader` holds
 /// one decoded block live; the cohort `var-calling` driver opens N
@@ -53,16 +55,35 @@ use crate::pileup_record::{ChainId, PileupRecord};
 /// |---------|---------:|------------:|------:|
 /// | 16 MiB  |  2501 MB |      183 MB | 10.4s |
 /// |  4 MiB  |   757 MB |      189 MB | 10.3s |
-/// |  1 MiB  |   261 MB |      206 MB | 10.6s |
-/// | 512 KiB |   161 MB |      233 MB | 10.6s | ← current
+/// |  1 MiB  |   261 MB |      206 MB | 10.6s | ← default
+/// | 512 KiB |   161 MB |      233 MB | 10.6s |
 /// | 256 KiB |   108 MB |      246 MB | 10.9s |
 /// |  64 KiB |    59 MB |      321 MB | 10.8s |
 ///
 /// Wall time is flat across the sweep — there is no CPU cost to
-/// shrinking blocks. 512 KiB projects to ~45 GB peak at N=5000 / T=4
-/// (fits a 64 GB budget with ~20 GB headroom) for +27% disk vs the
-/// prior 16 MiB default.
-pub const TARGET_BLOCK_BYTES: usize = 512 * 1024;
+/// shrinking blocks. 1 MiB pays +13% on-disk size relative to the
+/// historical 16 MiB hardcoded value, in exchange for ~10× lower
+/// cohort-step peak heap. Single-sample / archival users who only
+/// pay the disk-size axis can dial back up with
+/// `--block-target-bytes`; large-cohort joint-genotyping users who
+/// hit the memory ceiling dial it down explicitly.
+pub const TARGET_BLOCK_BYTES: usize = 1024 * 1024;
+
+/// Lower bound accepted by the `pileup --block-target-bytes` CLI
+/// parser. Below 16 KiB zstd loses meaningful compression context —
+/// the sweep showed 64 KiB already at +75% disk vs the 16 MiB
+/// baseline (well past the knee in the curve), so dropping further
+/// would just inflate output without any cohort-memory benefit the
+/// 64 KiB row didn't already deliver.
+pub const MIN_BLOCK_TARGET_BYTES: usize = 16 * 1024;
+
+/// Upper bound accepted by the `pileup --block-target-bytes` CLI
+/// parser. 16 MiB is the legacy hardcoded value retired in the
+/// 2026-05-27 sweep — it minimises on-disk size but produces the
+/// cohort-step memory blow-up (`n_threads × N × per_block`) that
+/// motivated this knob. Anything larger has no further compression
+/// payoff and exacerbates the memory issue.
+pub const MAX_BLOCK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
 /// Initial `Vec::with_capacity` hint for per-record columns in a
 /// freshly-opened block (delta-pos, n-alleles, the per-record list
@@ -247,11 +268,12 @@ impl<W: Write> PspWriter<W> {
     }
 
     /// Like [`Self::new`] but overrides the auto-flush projected-byte
-    /// threshold. Exposed (hidden from rustdoc) so tests can force
-    /// size-driven flushes with realistic record counts. Not for
-    /// production use — the spec pins the block target at
-    /// [`TARGET_BLOCK_BYTES`].
-    #[doc(hidden)]
+    /// threshold. Used by the `pileup --block-target-bytes` CLI knob
+    /// and by tests that need to force size-driven flushes with
+    /// realistic record counts. The spec leaves block sizing as a
+    /// writer-internal choice (a reader handles any block size); the
+    /// CLI gatekeeps the accepted range to
+    /// [`MIN_BLOCK_TARGET_BYTES`]..=[`MAX_BLOCK_TARGET_BYTES`].
     pub fn new_with_block_target(
         mut sink: W,
         header: WriterHeader,

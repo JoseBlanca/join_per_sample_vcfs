@@ -66,6 +66,53 @@ mounted so login and per-project auto-memory persist.
   created inside the container appear with the correct ownership on
   the host.
 
+## Memory tuning
+
+The cohort `var-calling` driver opens one `PspReader` per sample per
+chromosome worker, each holding one decoded block live, so peak heap
+scales as
+
+```
+peak_RSS ≈ ~5 GB + n_threads × N × per_block × 7
+```
+
+where `N` is the number of samples, `n_threads` is the rayon worker
+count (capped at `n_chromosomes`), and `per_block` is roughly
+`block-target-bytes × 7` (the writer's projected-byte threshold
+under-counts the live in-RAM footprint of decoded columns by about
+that factor).
+
+The PSP writer's `--block-target-bytes` knob on `pop_var_caller
+pileup` is the lever for this. Lower values cut peak heap; higher
+values shrink the .psp on disk. Wall time is essentially flat across
+the entire range. Sweep on tomato1 (N=18, T=4, real per-sample PSPs):
+
+| `--block-target-bytes` | peak cohort RSS | cohort .psp size | wall  |
+|------------------------|----------------:|-----------------:|------:|
+| 16 MiB                 |         2501 MB |           183 MB | 10.4s |
+|  4 MiB                 |          757 MB |           189 MB | 10.3s |
+|  1 MiB (default)       |          261 MB |           206 MB | 10.6s |
+|  512 KiB               |          161 MB |           233 MB | 10.6s |
+|  256 KiB               |          108 MB |           246 MB | 10.9s |
+|   64 KiB               |           59 MB |           321 MB | 10.8s |
+
+Picking a value:
+
+- **Single-sample / archival** workflows pay only the on-disk axis —
+  dial up (4 MiB, 16 MiB) for the smallest .psp.
+- **Large-cohort joint genotyping** (N in the hundreds to thousands)
+  pays the cohort-step memory axis — start from the default and dial
+  down if the formula above projects past the memory budget.
+
+The knob is exposed only on `pileup` (it's a writer-side setting);
+the cohort subcommands read whatever block size each input was
+written with, no extra flag needed. The accepted range is 16 KiB
+to 16 MiB — values outside that are rejected at parse time. Below
+16 KiB zstd loses meaningful compression context; above 16 MiB sits
+the legacy hardcoded default that motivated this knob in the first
+place. The full per-stage rationale is in
+[doc/devel/specs/per_sample_pileup_format.md §"Block sizing"](doc/devel/specs/per_sample_pileup_format.md).
+
 ## License
 
 Licensed under the MIT License — see [LICENSE](LICENSE) for the full
