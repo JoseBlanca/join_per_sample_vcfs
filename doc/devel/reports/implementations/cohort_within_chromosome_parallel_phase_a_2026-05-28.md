@@ -222,21 +222,176 @@ work items in Phase A.1 when the new kernels are written.
     fed alone or interleaved with other groups. Lands with Step 6 or
     earlier if a regression risk surfaces.
 
-## Validation status (so far)
+### Chunk-loop driver (commit `acd2107`)
 
-- `cargo fmt --check` — clean.
+[`src/var_calling/cohort_block/driver.rs`](../../../src/var_calling/cohort_block/driver.rs)
+— `drive_cohort_chunked` + `drive_one_chrom_generic` (`W: Read + Seek`
+generic so tests + production share one body). Owns the persistent
+chunk-loop scratch across every chunk and every chromosome
+(`ChunkLoadScratch`, `FixBoundariesScratch`, `PartitionScratch`,
+`MaterialisedChunk`, `WindowPartition`, the per-sample carryover, the
+per-window `Vec<PosteriorRecord>`) and the single `CohortVcfWriter`
+shared across chromosomes. PSP readers opened once, reused via
+`region_records` (block-index seek per call); no per-chrom file open.
+
+Per-chrom DUST mask built once from the whole-chrom reference via
+[`sdust_mask_streaming`](../../../src/var_calling/dust_filter.rs)
+(translated from 0-based half-open slice coords to 1-based half-open
+genomic), reused across every window on the chrom. Downstream filters
+(`min_alt_obs_per_sample`, `is_variant_call`, `qual_phred`, MAPQ-diff
+t-test in `record_fails_mapq_diff_t`) applied post-EM in
+`emit_or_drop`, mirroring [`drive_cohort_pipeline`](../../../src/pop_var_caller/cohort_driver.rs)'s
+drop semantics so the counters in `ChunkDriverStats` match
+`CohortDriveStats` field for field.
+
+The driver uses one notable trick to keep `fix_boundaries` unchanged
+at the chrom end: the last chunk inflates `chunk.range.end` past
+`chrom_length + max_group_span` so the pre-pass's case-A gap check
+trivially succeeds without `fix_boundaries` needing to be
+chromosome-end-aware. The PSP iterator still caps reads at
+`chrom_length` (`region_records(chrom_id, psp_cursor,
+min(chunk.range.end - 1, chrom_length))`), so no record is ever read
+past the chromosome.
+
+Two per-chunk state values track the offset semantics:
+- `chunk_range_start`: lower bound of the next chunk's logical range
+  (carryover positions live in `[chunk_range_start, psp_cursor)`).
+- `psp_cursor`: first position the PSP iterator picks up (records
+  before this were already consumed in a previous chunk or are in
+  carryover).
+
+These diverge after the first chunk; `chunk_range_start` advances by
+`safe_end` per iteration, `psp_cursor` advances by the chunk's actual
+`range.end`.
+
+### Rewiring `run_var_calling` (commit `2535ebd`)
+
+[`src/pop_var_caller/var_calling.rs`](../../../src/pop_var_caller/var_calling.rs)
+— the H1 per-chromosome `rayon::par_iter` at line 397 is gone.
+`process_one_chromosome`, the per-chrom `TempDir` + fragment paths,
+the `concat_fragments` call, and `CohortPipelineParams` are all
+removed from the var-calling path. A single `drive_cohort_chunked`
+call replaces them; `chunk_stats_to_cohort_stats` converts the
+driver's [`ChunkDriverStats`](../../../src/var_calling/cohort_block/driver.rs)
+into the [`CohortDriveStats`](../../../src/pop_var_caller/cohort_driver.rs)
+shape `print_run_summary` consumes.
+
+`var-calling-from-bam` is unaffected — it still uses the streaming
+`process_one_chromosome` + bgzf-aware `concat_fragments` (the
+`crate::vcf::concat` module stays).
+
+Net diff for the rewire: +54 / -79 in [var_calling.rs](../../../src/pop_var_caller/var_calling.rs).
+
+## Validation status
+
+- `cargo fmt --check` — clean across the branch.
 - `cargo clippy --lib --all-features -- -D warnings` — clean.
-- `cargo test --lib --features dhat-heap` — 977/977 pass.
-- Byte-identity vs `main` — not yet attempted; Step 6 gate.
+- `cargo test --lib --features dhat-heap` — **977/977 pass.**
+- `cargo test --test cohort_cli_integration --features dhat-heap`
+  — **18/18 pass.** These tests run `var-calling` end-to-end through
+  the new chunk-loop driver, including the
+  `var_calling_emits_deterministic_vcf_across_runs` test that diffs
+  two runs of the same input.
 
-## Next steps in this conversation
+**Byte-identity vs `main`** — not yet attempted. The integration suite
+runs through the new driver and produces a well-formed cohort VCF on
+every fixture, but the existing tests assert presence of header
+lines + sample-column names, not per-record VCF body content. The
+side-by-side `diff` against `main`'s streaming pipeline output on a
+real tomato fixture is the genuine byte-identity check and still owed.
 
-The skill workflow's Step 5 (driver) and Step 6 (validation +
-PROJECT_STATUS update) remain. Step 5 wires the new chunk-loop driver
-into `run_var_calling`, replacing the per-chromosome
-`rayon::par_iter`. Step 6 runs the existing
-[tests/cohort_cli_integration.rs](../../../tests/cohort_cli_integration.rs)
-suite + a side-by-side VCF diff against `main` on a tomato fixture +
-the wall + peak RSS sweep via
-[perf_scaling_synthetic.py](../../../benchmarks/tomato1/scripts/perf_scaling_synthetic.py)
-at T=1 on N=50 / N=200 / N=1000.
+## Decision on perf review for Phase A
+
+**Deferred until Phase A.1 lands.** The current worker
+([`worker.rs`](../../../src/var_calling/cohort_block/worker.rs)) is
+Phase A.0 — it builds an `OverlappingVariantGroup` row-shape from the
+columnar chunk and pipes it through the unchanged `PerGroupMerger` +
+`PosteriorEngine` kernels. Measuring wall + peak RSS at this point
+would be measuring the chunk-loop overhead *on top of* the
+unchanged per-record kernels, not the architecture the rewrite was
+sold on. The scaling-measurement report's bottleneck buckets
+(`per_position_merger` at 45 % at N=1000, `per_group_merger` at 58 %,
+allocator at 38 %) are all things the existing kernels generate —
+the new path inherits all of them via the adapter.
+
+A perf review only delivers actionable findings once the kernels
+themselves run column-native. That's Phase A.1.
+
+## Recommended next steps
+
+Two concrete pieces in this order:
+
+### 1. Byte-identity diff vs `main` (small, one-shot)
+
+Worth doing before Phase A.1 to lock in a known-good baseline:
+
+- Pick a real tomato fixture (the `SRR11450568.p1.psp × N=10`
+  used by the scaling measurement is a good size).
+- Run `cargo run --release -- var-calling …` on `main` and on
+  this branch with identical args.
+- `bcftools view` / `diff` the output VCFs. They should be
+  byte-identical for Phase A.0's contract to hold.
+
+If they aren't, that's a Phase A.0 bug to chase before touching
+the kernels. If they are, Phase A.1 can begin from a confirmed
+baseline.
+
+### 2. Phase A.1 — native columnar kernels (the substantive next step)
+
+The Phase A.0 adapter at
+[`worker.rs:101 build_overlapping_variant_group`](../../../src/var_calling/cohort_block/worker.rs#L101)
+materialises a row-shaped `OverlappingVariantGroup` per partition
+group (with a fresh `Vec<Option<PileupRecord>>` per cohort position),
+then feeds it through the streaming kernels. Phase A.1 replaces this
+end to end with kernels that walk the columnar chunk + partition
+directly.
+
+The work splits naturally into four layers, each portable as its own
+step (with the existing kernel as the reference oracle for the
+diff at every step):
+
+1. **Native allele unification** — walk `chunk.per_sample[s]`'s
+   `allele_seq_*` columns over the group's position list; produce a
+   `MergedAlleleColumns` (unified allele list, sorted by `(start,
+   end, seq_bytes)`). No `PileupRecord` materialisation.
+2. **Native per-(sample, allele) stats gather** — for each sample,
+   walk its per-allele scalar columns at the group's positions and
+   project onto the unified allele set. Output: a columnar
+   `PerGroupSampleStats` (the 7 `AlleleSupportStats` scalars +
+   per-allele chain_ids, all CSR-laid-out).
+3. **Native log-likelihood computation** — fill a flat
+   `log_likelihoods[sample × n_genotypes]` column from the per-sample
+   stats. Reuse the standard-likelihood and mixture-likelihood
+   formulas from `posterior_engine` (the math is well-defined; only
+   the input shape changes).
+4. **Native EM** — the M-step on `p̂` and `f̂_C` is closed-form +
+   intra-group (spike confirmed). Port the EM loop to read from the
+   columnar layout directly; reuse the E-step's HWE-with-F prior and
+   the QUAL-via-exact-AF marginalisation. Emit a `PosteriorRecord`
+   per group (or, eventually, push into a columnar `PosteriorBatch`
+   that the writer drains).
+
+Each layer ships on its own commit + tests against the existing
+kernel's output on the same input (byte-identity at every layer
+boundary). The first layer (allele unification) is the highest-risk
+piece because the chain-anchoring of compound alleles is intricate;
+isolating it as its own step keeps the diff reviewable.
+
+**Phase A.1 deliverables:**
+- New module `src/var_calling/cohort_block/kernels/` (or similar)
+  hosting the four layers as submodules.
+- `run_window` switches from the row-shape adapter to the native
+  kernel chain.
+- The Phase A.0 adapter (`build_overlapping_variant_group` +
+  `run_window` row-pipe) is removed once integration tests still pass.
+- Perf review (queued behind this).
+
+### 3. Then perf review + PROJECT_STATUS final update
+
+Once Phase A.1 lands and integration tests pass byte-identical, the
+perf review delivers actionable signal:
+
+- Re-run [`perf_scaling_synthetic.py`](../../../benchmarks/tomato1/scripts/perf_scaling_synthetic.py)
+  on N=50/200/1000 vs `main`.
+- Update the impl report with wall + peak RSS deltas.
+- Update PROJECT_STATUS's "Last completed task" with final numbers.
