@@ -394,9 +394,113 @@ where
 
     let mut chunk_range_start: u32 = 1;
     let mut psp_cursor: u32 = 1;
+    // Re-used between load attempts when fix_boundaries returns
+    // `NoSafeGap` and we have to retry the chunk with a wider range —
+    // the load consumes the driver-owned carryover, so we keep a
+    // shadow copy before each load and restore it on retry.
+    let mut carryover_snapshot: Vec<SampleColumns> = (0..carryover.len())
+        .map(|_| SampleColumns::empty())
+        .collect();
 
     while chunk_range_start < chrom_one_past_end {
-        let nominal_end = chunk_range_start.saturating_add(params.chunk_genomic_span);
+        let nominal_span = params.chunk_genomic_span.max(1);
+        let max_span = nominal_span.saturating_mul(MAX_CHUNK_SPAN_GROWTH);
+
+        let safe_end = load_and_run_chunk_with_retry(
+            chrom_id,
+            chrom_length,
+            chrom_one_past_end,
+            last_chunk_logical_extension,
+            chunk_range_start,
+            psp_cursor,
+            nominal_span,
+            max_span,
+            psp_readers,
+            &masked_intervals,
+            shared_fetcher.clone(),
+            params,
+            writer,
+            stats,
+            chunk_scratch,
+            fix_scratch,
+            partition_scratch,
+            chunk,
+            partition,
+            carryover,
+            &mut carryover_snapshot,
+            output_buf,
+            max_group_span,
+        )?;
+
+        if safe_end >= chrom_one_past_end {
+            break;
+        }
+        chunk_range_start = safe_end;
+        psp_cursor = chunk.range.end.min(chrom_one_past_end);
+    }
+
+    Ok(())
+}
+
+/// Hard cap on how much the chunk loader may grow a single chunk's
+/// nominal span when [`fix_boundaries`] cannot find a safe boundary —
+/// the plan's "fail loudly on pathological input" backstop. The cap
+/// is the largest multiplier of [`ChunkDriverParams::chunk_genomic_span`]
+/// we will attempt before surfacing `NoSafeGap` to the caller.
+const MAX_CHUNK_SPAN_GROWTH: u32 = 8;
+
+/// Load + pre-pass one chunk, retrying with a 2× wider load range if
+/// the pre-pass can't find a safe boundary inside the current range.
+/// Returns the chunk's `safe_end` on success — the caller advances
+/// `chunk_range_start` to that value.
+///
+/// On retry the carryover the previous chunk handed in is restored
+/// from a snapshot the helper takes before the first load attempt; the
+/// PSP iterators are re-created via `region_records`, which re-seeks
+/// the block index per call.
+#[allow(clippy::too_many_arguments)]
+fn load_and_run_chunk_with_retry<W>(
+    chrom_id: u32,
+    chrom_length: u32,
+    chrom_one_past_end: u32,
+    last_chunk_logical_extension: u32,
+    chunk_range_start: u32,
+    psp_cursor: u32,
+    nominal_span: u32,
+    max_span: u32,
+    psp_readers: &mut [PspReader<W>],
+    masked_intervals: &[std::ops::Range<u32>],
+    shared_fetcher: SharedRefFetcher,
+    params: &ChunkDriverParams,
+    writer: &mut CohortVcfWriter,
+    stats: &mut ChunkDriverStats,
+    chunk_scratch: &mut ChunkLoadScratch,
+    fix_scratch: &mut FixBoundariesScratch,
+    partition_scratch: &mut PartitionScratch,
+    chunk: &mut MaterialisedChunk,
+    partition: &mut WindowPartition,
+    carryover: &mut [SampleColumns],
+    carryover_snapshot: &mut [SampleColumns],
+    output_buf: &mut Vec<PosteriorRecord>,
+    max_group_span: u32,
+) -> Result<u32, ChunkDriverError>
+where
+    W: Read + Seek,
+{
+    debug_assert_eq!(carryover.len(), carryover_snapshot.len());
+    // Snapshot the carryover so we can restore it on `NoSafeGap` —
+    // `load_chunk_from_iters` drains it as part of the raw-load step
+    // and we need the original contents back for the retry attempt.
+    for (snap, carry) in carryover_snapshot.iter_mut().zip(carryover.iter()) {
+        snap.clear();
+        for row_idx in 0..carry.n_records() {
+            snap.push_row_from(carry, row_idx);
+        }
+    }
+
+    let mut attempt_span = nominal_span;
+    loop {
+        let nominal_end = chunk_range_start.saturating_add(attempt_span);
         let chunk_range_end = if nominal_end >= chrom_one_past_end {
             chrom_one_past_end.saturating_add(last_chunk_logical_extension)
         } else {
@@ -418,38 +522,49 @@ where
             carryover,
         )?;
 
-        fix_boundaries(chunk, carryover, fix_scratch, max_group_span, 1)?;
-
-        let windows = chunk.windows.clone();
-        for window in &windows {
-            partition_window(
-                chunk,
-                window,
-                &masked_intervals,
-                max_group_span,
-                partition_scratch,
-                partition,
-            )?;
-            run_window(
-                chunk,
-                partition,
-                shared_fetcher.clone(),
-                params.per_group_cfg,
-                params.posterior_cfg.clone(),
-                output_buf,
-            )?;
-            for record in output_buf.drain(..) {
-                emit_or_drop(record, params, writer, stats)?;
+        match fix_boundaries(chunk, carryover, fix_scratch, max_group_span, 1) {
+            Ok(()) => break,
+            Err(FixBoundariesError::NoSafeGap { .. }) if attempt_span < max_span => {
+                // Retry with double the span. Restore the carryover
+                // the previous chunk handed in (the load drained it).
+                for (carry, snap) in carryover.iter_mut().zip(carryover_snapshot.iter()) {
+                    carry.clear();
+                    for row_idx in 0..snap.n_records() {
+                        carry.push_row_from(snap, row_idx);
+                    }
+                }
+                attempt_span = attempt_span
+                    .checked_mul(2)
+                    .unwrap_or(max_span)
+                    .min(max_span);
+                continue;
             }
+            Err(e) => return Err(e.into()),
         }
-
-        let safe_end = chunk.safe_end;
-        if safe_end >= chrom_one_past_end {
-            break;
-        }
-        chunk_range_start = safe_end;
-        psp_cursor = chunk_range_end.min(chrom_one_past_end);
     }
 
-    Ok(())
+    let windows = chunk.windows.clone();
+    for window in &windows {
+        partition_window(
+            chunk,
+            window,
+            masked_intervals,
+            max_group_span,
+            partition_scratch,
+            partition,
+        )?;
+        run_window(
+            chunk,
+            partition,
+            shared_fetcher.clone(),
+            params.per_group_cfg,
+            params.posterior_cfg.clone(),
+            output_buf,
+        )?;
+        for record in output_buf.drain(..) {
+            emit_or_drop(record, params, writer, stats)?;
+        }
+    }
+
+    Ok(chunk.safe_end)
 }
