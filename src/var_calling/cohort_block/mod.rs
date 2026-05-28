@@ -26,8 +26,10 @@ pub mod partition;
 pub mod pre_pass;
 #[cfg(test)]
 pub(crate) mod test_helpers;
+pub mod worker;
 
 pub use columns::{MaterialisedChunk, SampleColumns};
 pub use loader::{ChunkLoadError, ChunkLoadScratch, load_chunk_from_iters};
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
 pub use pre_pass::{FixBoundariesError, FixBoundariesScratch, fix_boundaries};
+pub use worker::{run_window, shared_ref_fetcher};
