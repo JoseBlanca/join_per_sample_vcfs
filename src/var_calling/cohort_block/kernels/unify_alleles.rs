@@ -10,18 +10,23 @@
 //! arrays so layer 2 (per-(sample, allele) stats gather) can iterate
 //! without per-emit allocation.
 //!
-//! **Sub-step progress.** 1.0 (types) and 1.1 (per-position
-//! projection — [`project_per_position_alleles_columnar`]) have
-//! landed; 1.2 (compound detection) and 1.3 (max-alleles cap) are
-//! queued. Until layer 1.4 wires the assembled kernel into the
+//! **Sub-step progress.** 1.0 (types), 1.1 (per-position
+//! projection — [`project_per_position_alleles_columnar`]), and
+//! 1.2 (compound detection + admission — composed in
+//! [`unify_alleles_columnar`]) have landed; 1.3 (max-alleles cap)
+//! is queued. Until layer 1.4 wires the assembled kernel into the
 //! worker, this code is reachable only through its own unit tests;
 //! the Phase A.0 row-shape adapter remains the production path.
 
+use std::collections::BTreeMap;
+
 use ahash::AHashMap;
+use thiserror::Error;
 
 use crate::pileup_record::ChainId;
 use crate::var_calling::cohort_block::columns::MaterialisedChunk;
 use crate::var_calling::cohort_block::partition::WindowPartition;
+use crate::var_calling::per_group_merger::CompoundConstituent;
 
 /// Column-native unified allele set for one variant group. Same
 /// semantic content as the existing row-shape `UnifiedAlleleSet` in
@@ -200,34 +205,76 @@ impl Default for UnifiedAllelesColumns {
     }
 }
 
-/// Reusable scratch buffers for [`project_per_position_alleles_columnar`]
-/// and (in later sub-steps) the full
-/// `unify_alleles_columnar`. Cleared per group; capacities preserved
-/// across groups.
+/// One working allele entry, mutated during sub-steps 1.1 and 1.2
+/// and serialised into [`UnifiedAllelesColumns`] at the end. The
+/// intermediate row-shape representation lets sub-step 1.2
+/// (`admit_compound_candidates_columnar`) toggle `is_compound` and
+/// append `constituents` on an already-written allele without
+/// having to re-pack the output CSR offsets.
+#[derive(Debug, Default)]
+pub(crate) struct WorkingAllele {
+    pub(crate) seq: Vec<u8>,
+    pub(crate) is_compound: bool,
+    pub(crate) cap_protected: bool,
+    pub(crate) cohort_count: u64,
+    /// Sorted by `(record_idx, local_allele_idx)`. Empty for
+    /// non-compounds.
+    pub(crate) constituents: Vec<CompoundConstituent>,
+    /// Per-sample source pairs from per-position projection. Length
+    /// `n_samples`; each inner `Vec` holds the
+    /// `(record_idx, local_allele_idx)` pairs that project to this
+    /// allele for that sample.
+    pub(crate) sources_per_sample: Vec<Vec<(u32, u32)>>,
+    /// Per-sample chain-anchor count for compounds. Length
+    /// `n_samples`; zero for non-compounds.
+    pub(crate) chain_anchor_counts: Vec<u32>,
+}
+
+impl WorkingAllele {
+    /// Reset this allele in place, preserving every inner `Vec`'s
+    /// allocation. Used by the scratch pool when a previously-used
+    /// slot is recycled by a new group.
+    pub(crate) fn reset(&mut self, n_samples: usize) {
+        self.seq.clear();
+        self.is_compound = false;
+        self.cap_protected = false;
+        self.cohort_count = 0;
+        self.constituents.clear();
+        for cell in self.sources_per_sample.iter_mut() {
+            cell.clear();
+        }
+        if self.sources_per_sample.len() < n_samples {
+            self.sources_per_sample.resize_with(n_samples, Vec::new);
+        }
+        self.chain_anchor_counts.clear();
+        self.chain_anchor_counts.resize(n_samples, 0);
+    }
+}
+
+/// Reusable scratch buffers for the column-native allele unifier.
+/// Cleared per group; capacities preserved across groups.
 #[derive(Debug, Default)]
 pub struct UnifyAllelesScratch {
-    /// Per-position projection's byte-sequence → allele-index dedup
-    /// map. Cleared at entry to each per-group call.
+    /// Per-position projection's byte-sequence → working-allele-index
+    /// dedup map. Cleared at entry to each per-group call.
     pub(crate) byte_index: AHashMap<Vec<u8>, usize>,
     /// Working buffer for projecting a candidate allele's bytes onto
     /// the group's REF span before testing for byte-equality against
-    /// existing entries. Re-used inside the per-position projection
-    /// loop and (later) by compound projection.
+    /// existing entries.
     pub(crate) projection_buf: Vec<u8>,
-    /// Working buffer for chain-id intersection across constituent
-    /// records during compound detection (sub-step 1.2; unused in
-    /// 1.1).
+    /// Working buffer used by compound detection (sub-step 1.2).
     #[allow(dead_code)]
     pub(crate) chain_id_scratch: Vec<ChainId>,
-    /// Per-(allele, sample) working source lists in allele-major flat
-    /// order — `intermediate_sources[a * n_samples + s]` holds the
-    /// `(record_idx, local_allele_idx)` pairs in the group that
-    /// project to allele `a` for sample `s`. Serialised into
-    /// [`UnifiedAllelesColumns`]'s source-CSR at the end of each call.
-    /// The outer `Vec` may grow past the current group's
-    /// `n_alleles × n_samples`; only the first cells are valid, the
-    /// rest were cleared by the previous group's serialisation.
-    pub(crate) intermediate_sources: Vec<Vec<(u32, u32)>>,
+    /// Pool of working alleles. The outer `Vec` grows monotonically
+    /// across the lifetime of the scratch; [`Self::n_active_alleles`]
+    /// is the logical length used by the current group. Slots past
+    /// that index were cleared by [`Self::clear`] and stay
+    /// allocation-preserved for re-use.
+    pub(crate) working_alleles: Vec<WorkingAllele>,
+    /// Logical length of [`Self::working_alleles`] for the current
+    /// group. Serialisation reads exactly the first
+    /// `n_active_alleles` entries.
+    pub(crate) n_active_alleles: usize,
 }
 
 impl UnifyAllelesScratch {
@@ -239,15 +286,94 @@ impl UnifyAllelesScratch {
         self.byte_index.clear();
         self.projection_buf.clear();
         self.chain_id_scratch.clear();
-        for cell in self.intermediate_sources.iter_mut() {
-            cell.clear();
+        // Reset every previously-used working-allele slot in place so
+        // inner `Vec` capacities survive to the next group.
+        let prev_active = self.n_active_alleles;
+        for slot in self.working_alleles.iter_mut().take(prev_active) {
+            slot.reset(0);
         }
-        // Leave `intermediate_sources` outer length intact — the
-        // inner-Vec capacities are preserved for re-use by the next
-        // group, and the cells past the current group's logical
-        // length are empty so they contribute nothing to the
-        // serialised output.
+        self.n_active_alleles = 0;
     }
+
+    /// Return a `&mut` to the next working-allele slot, growing the
+    /// pool if necessary and resetting the slot to a fresh state.
+    /// Increments [`Self::n_active_alleles`] by one.
+    pub(crate) fn push_working_allele(&mut self, n_samples: usize) -> &mut WorkingAllele {
+        if self.n_active_alleles == self.working_alleles.len() {
+            self.working_alleles.push(WorkingAllele::default());
+        }
+        let idx = self.n_active_alleles;
+        self.n_active_alleles += 1;
+        let slot = &mut self.working_alleles[idx];
+        slot.reset(n_samples);
+        slot
+    }
+}
+
+/// Errors surfaced by [`admit_compound_candidates_columnar`].
+#[non_exhaustive]
+#[derive(Error, Debug, PartialEq)]
+pub enum UnifyAllelesError {
+    /// While projecting a chain-anchored compound's bytes onto the
+    /// group span, no sample at the constituent's position carried a
+    /// record with the named `local_allele_idx`. The walker invariant
+    /// guarantees at least one anchoring sample; surfacing this
+    /// signals a partition / chunk inconsistency, not a data
+    /// condition.
+    #[error(
+        "compound projection: no sample has constituent (record_idx={record_idx}, \
+         local_allele_idx={local_allele_idx}) in group \
+         {chrom_id}:{group_start}..{group_end}"
+    )]
+    MissingCompoundAlleleBytes {
+        chrom_id: u32,
+        group_start: u32,
+        group_end: u32,
+        record_idx: u32,
+        local_allele_idx: u32,
+    },
+}
+
+/// Serialise the working alleles in `scratch` into the column-native
+/// output. Called at the end of each per-group unification by
+/// callers that built up `WorkingAllele` entries during projection
+/// and compound admission.
+pub(crate) fn serialize_working_to_columns(
+    scratch: &UnifyAllelesScratch,
+    n_samples: usize,
+    out: &mut UnifiedAllelesColumns,
+) {
+    out.clear();
+    out.n_samples = n_samples;
+    let active = scratch.n_active_alleles;
+    for working in scratch.working_alleles.iter().take(active) {
+        out.is_compound.push(working.is_compound);
+        out.cap_protected.push(working.cap_protected);
+        out.cohort_count.push(working.cohort_count);
+        out.seq_bytes.extend_from_slice(&working.seq);
+        out.seq_offsets.push(out.seq_bytes.len() as u32);
+        for c in &working.constituents {
+            out.constituent_record_idx.push(c.record_idx as u32);
+            out.constituent_local_allele_idx
+                .push(c.local_allele_idx as u32);
+        }
+        out.constituent_offsets
+            .push(out.constituent_record_idx.len() as u32);
+        out.chain_anchor_counts
+            .extend_from_slice(&working.chain_anchor_counts);
+    }
+    // Source CSR — walk (allele, sample) in allele-major order.
+    for working in scratch.working_alleles.iter().take(active) {
+        for cell in working.sources_per_sample.iter().take(n_samples) {
+            for &(rec, loc) in cell {
+                out.source_record_idx.push(rec);
+                out.source_local_allele_idx.push(loc);
+            }
+            out.source_offsets.push(out.source_record_idx.len() as u32);
+        }
+    }
+    // OTHER pool empty in sub-step 1.2 (lands in 1.3).
+    out.other_offsets.resize(n_samples + 1, 0);
 }
 
 /// Phase A.1 sub-step 1.1 — per-position allele projection.
@@ -300,10 +426,23 @@ pub fn project_per_position_alleles_columnar(
     scratch: &mut UnifyAllelesScratch,
     out: &mut UnifiedAllelesColumns,
 ) {
-    out.clear();
-    out.n_samples = n_samples;
     scratch.clear();
+    project_per_position_into_scratch(chunk, partition, group_idx, ref_seq, n_samples, scratch);
+    serialize_working_to_columns(scratch, n_samples, out);
+}
 
+/// Fill `scratch.working_alleles` with the per-position projection
+/// (REF at index 0, then ALTs in insertion order). Separated from
+/// the serialisation step so sub-step 1.2 can mutate the working
+/// alleles before they're written to the output CSR.
+pub(crate) fn project_per_position_into_scratch(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    ref_seq: &[u8],
+    n_samples: usize,
+    scratch: &mut UnifyAllelesScratch,
+) {
     let group_start = partition.group_starts[group_idx];
     let group_end = partition.group_ends[group_idx];
     debug_assert_eq!(
@@ -317,7 +456,7 @@ pub fn project_per_position_alleles_columnar(
     debug_assert_eq!(n_samples, chunk.n_samples());
 
     // REF goes at index 0.
-    start_new_allele(out, ref_seq, false, true, n_samples, scratch);
+    push_allele_into_scratch(scratch, ref_seq, false, true, n_samples);
     scratch.byte_index.insert(ref_seq.to_vec(), 0);
 
     let position_range = partition.position_range_for_group(group_idx);
@@ -354,79 +493,344 @@ pub fn project_per_position_alleles_columnar(
                 let entry_idx = match scratch.byte_index.get(scratch.projection_buf.as_slice()) {
                     Some(&idx) => idx,
                     None => {
-                        let idx = out.n_alleles();
-                        // Insert into the index by cloning the bytes
-                        // out of the projection buffer — the buffer
-                        // will be overwritten in the next iteration.
-                        scratch
-                            .byte_index
-                            .insert(scratch.projection_buf.clone(), idx);
+                        let idx = scratch.n_active_alleles;
                         let seq_copy = scratch.projection_buf.clone();
-                        start_new_allele(out, &seq_copy, false, false, n_samples, scratch);
+                        scratch.byte_index.insert(seq_copy.clone(), idx);
+                        push_allele_into_scratch(scratch, &seq_copy, false, false, n_samples);
                         idx
                     }
                 };
 
-                // Cohort count and per-(allele, sample) source.
-                out.cohort_count[entry_idx] += u64::from(sample.allele_num_obs[k_allele]);
-                let flat = entry_idx * n_samples + sample_idx;
-                scratch.intermediate_sources[flat]
+                let working = &mut scratch.working_alleles[entry_idx];
+                working.cohort_count += u64::from(sample.allele_num_obs[k_allele]);
+                working.sources_per_sample[sample_idx]
                     .push((record_idx_in_group as u32, local_allele_idx as u32));
             }
         }
     }
-
-    // ── Serialise intermediate_sources into out's CSR. ──
-    out.source_offsets.clear();
-    out.source_offsets.push(0);
-    out.source_record_idx.clear();
-    out.source_local_allele_idx.clear();
-    let total_cells = out.n_alleles() * n_samples;
-    for cell in scratch.intermediate_sources.iter().take(total_cells) {
-        for &(rec_idx, local_allele_idx) in cell.iter() {
-            out.source_record_idx.push(rec_idx);
-            out.source_local_allele_idx.push(local_allele_idx);
-        }
-        out.source_offsets.push(out.source_record_idx.len() as u32);
-    }
-
-    // OTHER pool is empty in sub-step 1.1 — `n_samples` zero ranges
-    // so layer-2 consumers can index without an empty-check.
-    out.other_offsets.clear();
-    out.other_offsets.resize(n_samples + 1, 0);
 }
 
-/// Push a fresh allele entry into `out` and the matching working
-/// state into `scratch.intermediate_sources`. Used for both REF
-/// (at index 0) and every newly-discovered ALT during projection.
-fn start_new_allele(
-    out: &mut UnifiedAllelesColumns,
+/// Push a fresh working allele entry with the given seq + flags.
+/// Inner sample-indexed Vecs are pre-sized to `n_samples`.
+fn push_allele_into_scratch(
+    scratch: &mut UnifyAllelesScratch,
     seq: &[u8],
     is_compound: bool,
     cap_protected: bool,
     n_samples: usize,
-    scratch: &mut UnifyAllelesScratch,
 ) {
-    out.is_compound.push(is_compound);
-    out.cap_protected.push(cap_protected);
-    out.cohort_count.push(0);
-    out.seq_bytes.extend_from_slice(seq);
-    out.seq_offsets.push(out.seq_bytes.len() as u32);
-    // No constituents for non-compounds; the offset sentinel just
-    // repeats the current end-of-constituents.
-    out.constituent_offsets
-        .push(out.constituent_record_idx.len() as u32);
-    // Append n_samples zeros to the allele-major chain-anchor grid.
-    let new_len = out.chain_anchor_counts.len() + n_samples;
-    out.chain_anchor_counts.resize(new_len, 0);
-    // Grow `intermediate_sources` to cover this allele's per-sample
-    // slots. Existing slots past the new length (left over from a
-    // bigger previous group) keep their inner-Vec capacity and stay
-    // empty — they'll just be skipped during serialisation.
-    let needed = out.n_alleles() * n_samples;
-    if scratch.intermediate_sources.len() < needed {
-        scratch.intermediate_sources.resize_with(needed, Vec::new);
+    let working = scratch.push_working_allele(n_samples);
+    working.seq.extend_from_slice(seq);
+    working.is_compound = is_compound;
+    working.cap_protected = cap_protected;
+}
+
+// ============================================================
+// Sub-step 1.2 — compound detection and admission
+// ============================================================
+
+/// Per-sample chain-anchor evidence for one candidate compound.
+#[derive(Default, Clone)]
+struct ChainAnchorEvidence {
+    /// Number of distinct chain ids in this sample whose constituents
+    /// match the candidate's constituent tuple.
+    intersection: u32,
+    /// `(record_idx, local_allele_idx)` pairs for this sample's
+    /// constituent alleles in the compound. Populated only when
+    /// `intersection > 0`. Used by layer 2's scalar-subtraction
+    /// pass.
+    constituent_sources: Vec<(u32, u32)>,
+}
+
+/// A compound candidate proposed by chain-id evidence in at least
+/// one sample. Mirrors the private `CompoundCandidate` in
+/// `per_group_merger` so the column-native algorithm is line-by-line
+/// comparable.
+struct CompoundCandidate {
+    /// Constituents from the lex-smallest sample that proposed this
+    /// candidate, sorted by `(record_idx, local_allele_idx)`.
+    constituents_per_first_anchor: Vec<CompoundConstituent>,
+    /// Per-sample evidence indexed by `sample_idx`.
+    per_sample: Vec<ChainAnchorEvidence>,
+}
+
+/// Sub-step 1.2 — detect compound candidates from chain-id evidence
+/// and fold them into the working alleles already produced by
+/// sub-step 1.1.
+///
+/// Walks per-sample chain proposals: a chain id with ≥ 2 constituent
+/// non-REF allele observations across different records proposes a
+/// compound. Each candidate is keyed by its sorted constituent
+/// tuple; matching proposals from multiple samples aggregate into
+/// the same `CompoundCandidate`.
+///
+/// For each candidate, projects its bytes onto the group span. If
+/// the bytes match an existing working allele (typically a
+/// per-position projection), flag that entry as compound and record
+/// the constituents. Otherwise, push a new compound entry.
+///
+/// **Pre-condition.** Sub-step 1.1
+/// (`project_per_position_into_scratch`) must have populated
+/// `scratch.working_alleles` before this is called — the candidate
+/// admission re-uses the same `byte_index` and works on the
+/// scratch's working alleles.
+pub(crate) fn admit_compound_candidates_columnar(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    ref_seq: &[u8],
+    n_samples: usize,
+    scratch: &mut UnifyAllelesScratch,
+) -> Result<(), UnifyAllelesError> {
+    let candidates = detect_compound_candidates_columnar(chunk, partition, group_idx, n_samples);
+    let group_start = partition.group_starts[group_idx];
+    let group_end = partition.group_ends[group_idx];
+    let chrom_id = chunk.chrom_id;
+
+    for candidate in candidates {
+        project_compound_onto_group_columnar(
+            chunk,
+            partition,
+            group_idx,
+            ref_seq,
+            &candidate.constituents_per_first_anchor,
+            &mut scratch.projection_buf,
+            chrom_id,
+            group_start,
+            group_end,
+        )?;
+
+        let target_idx = match scratch.byte_index.get(scratch.projection_buf.as_slice()) {
+            Some(&idx) => {
+                let working = &mut scratch.working_alleles[idx];
+                if !working.is_compound {
+                    working.is_compound = true;
+                    working.cap_protected = true;
+                    working.constituents = candidate.constituents_per_first_anchor.clone();
+                }
+                idx
+            }
+            None => {
+                let idx = scratch.n_active_alleles;
+                let seq_copy = scratch.projection_buf.clone();
+                scratch.byte_index.insert(seq_copy.clone(), idx);
+                push_allele_into_scratch(scratch, &seq_copy, true, true, n_samples);
+                scratch.working_alleles[idx].constituents =
+                    candidate.constituents_per_first_anchor.clone();
+                idx
+            }
+        };
+
+        let working = &mut scratch.working_alleles[target_idx];
+        for (sample_idx, anchor) in candidate.per_sample.iter().enumerate() {
+            working.chain_anchor_counts[sample_idx] = anchor.intersection;
+            working.cohort_count += u64::from(anchor.intersection);
+            if anchor.intersection > 0 {
+                working.sources_per_sample[sample_idx].clone_from(&anchor.constituent_sources);
+            }
+        }
     }
+    Ok(())
+}
+
+/// Build the per-sample chain proposals for one group and aggregate
+/// them by constituent tuple into the candidate list. Iterates
+/// samples in ascending `sample_idx` so the "first anchoring sample"
+/// is deterministically the lex-smallest one.
+fn detect_compound_candidates_columnar(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    n_samples: usize,
+) -> Vec<CompoundCandidate> {
+    let mut candidates: BTreeMap<Vec<(usize, usize)>, CompoundCandidate> = BTreeMap::new();
+    let mut by_chain: BTreeMap<ChainId, Vec<CompoundConstituent>> = BTreeMap::new();
+    for sample_idx in 0..n_samples {
+        by_chain.clear();
+        build_chain_proposals_columnar(chunk, partition, group_idx, sample_idx, &mut by_chain);
+        for constituents in by_chain.values() {
+            if constituents.len() < 2 {
+                continue;
+            }
+            // Already sorted by (record_idx, local_allele_idx) below.
+            let key: Vec<(usize, usize)> = constituents
+                .iter()
+                .map(|c| (c.record_idx, c.local_allele_idx))
+                .collect();
+            let entry = candidates.entry(key).or_insert_with(|| CompoundCandidate {
+                constituents_per_first_anchor: constituents.clone(),
+                per_sample: vec![ChainAnchorEvidence::default(); n_samples],
+            });
+            entry.per_sample[sample_idx].intersection += 1;
+            if entry.per_sample[sample_idx].constituent_sources.is_empty() {
+                entry.per_sample[sample_idx].constituent_sources = constituents
+                    .iter()
+                    .map(|c| (c.record_idx as u32, c.local_allele_idx as u32))
+                    .collect();
+            }
+        }
+    }
+    candidates.into_values().collect()
+}
+
+/// Walk the group's positions for `sample_idx` and bucket each non-
+/// REF allele's `chain_ids` into the `by_chain` map (one entry per
+/// distinct chain id). Constituents are sorted by `(record_idx,
+/// local_allele_idx)` at the end so the candidate-keying step sees
+/// canonical tuples.
+fn build_chain_proposals_columnar(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    sample_idx: usize,
+    by_chain: &mut BTreeMap<ChainId, Vec<CompoundConstituent>>,
+) {
+    let position_range = partition.position_range_for_group(group_idx);
+    let group_position_lo = position_range.start;
+    for p in position_range.clone() {
+        let record_idx = p - group_position_lo;
+        let sample_range = partition.sample_range_for_position(p);
+        let samples_slice = &partition.samples_at_pos[sample_range.clone()];
+        let rows_slice = &partition.rows_at_pos[sample_range];
+        let Some(local_slot) = samples_slice.iter().position(|&s| s as usize == sample_idx) else {
+            continue;
+        };
+        let row_idx = rows_slice[local_slot] as usize;
+        let sample = &chunk.per_sample[sample_idx];
+        let allele_lo = sample.allele_offsets[row_idx] as usize;
+        let allele_hi = sample.allele_offsets[row_idx + 1] as usize;
+        // Skip allele 0 (REF) — never participates in a compound.
+        for k_allele in (allele_lo + 1)..allele_hi {
+            let local_allele_idx = k_allele - allele_lo;
+            let chain_lo = sample.allele_chain_ids_offsets[k_allele] as usize;
+            let chain_hi = sample.allele_chain_ids_offsets[k_allele + 1] as usize;
+            for &chain_id in &sample.allele_chain_ids[chain_lo..chain_hi] {
+                let entry = by_chain.entry(chain_id).or_default();
+                if !entry
+                    .iter()
+                    .any(|c| c.record_idx == record_idx && c.local_allele_idx == local_allele_idx)
+                {
+                    entry.push(CompoundConstituent {
+                        record_idx,
+                        local_allele_idx,
+                    });
+                }
+            }
+        }
+    }
+    // Sort each chain's constituents — canonical tuple ordering.
+    for constituents in by_chain.values_mut() {
+        constituents.sort_by_key(|c| (c.record_idx, c.local_allele_idx));
+    }
+}
+
+/// Project one compound candidate's bytes onto the group's REF
+/// span. Constituents are assumed sorted by `record_idx`. The
+/// algorithm walks them in order, substituting each one's local
+/// allele bytes at its offset within the group span; non-overlapping
+/// constituents (the typical case) just concatenate, overlapping
+/// ones fall back to a last-write-wins composition (same rule as
+/// the existing `project_compound_onto_group`).
+#[allow(clippy::too_many_arguments)]
+fn project_compound_onto_group_columnar(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    ref_seq: &[u8],
+    constituents: &[CompoundConstituent],
+    out: &mut Vec<u8>,
+    chrom_id: u32,
+    group_start: u32,
+    group_end: u32,
+) -> Result<(), UnifyAllelesError> {
+    out.clear();
+    if constituents.is_empty() {
+        out.extend_from_slice(ref_seq);
+        return Ok(());
+    }
+
+    debug_assert!(
+        constituents
+            .windows(2)
+            .all(|w| w[0].record_idx <= w[1].record_idx),
+        "constituents must be sorted by record_idx",
+    );
+
+    let position_range = partition.position_range_for_group(group_idx);
+    let group_position_lo = position_range.start;
+    let mut cursor_offset: usize = 0;
+
+    for c in constituents {
+        let p = group_position_lo + c.record_idx;
+        let pos = partition.positions[p];
+        let local_offset = (pos - group_start) as usize;
+        let sample_range = partition.sample_range_for_position(p);
+
+        let mut local_span: Option<usize> = None;
+        let mut found_seq: Option<(usize, std::ops::Range<usize>)> = None;
+        for k in sample_range {
+            let sample_idx = partition.samples_at_pos[k] as usize;
+            let row_idx = partition.rows_at_pos[k] as usize;
+            let sample = &chunk.per_sample[sample_idx];
+            if local_span.is_none() {
+                local_span = Some(sample.ref_span_at(row_idx) as usize);
+            }
+            let allele_lo = sample.allele_offsets[row_idx] as usize;
+            let allele_hi = sample.allele_offsets[row_idx + 1] as usize;
+            if c.local_allele_idx < (allele_hi - allele_lo) {
+                let k_allele = allele_lo + c.local_allele_idx;
+                let seq_lo = sample.allele_seq_offsets[k_allele] as usize;
+                let seq_hi = sample.allele_seq_offsets[k_allele + 1] as usize;
+                found_seq = Some((sample_idx, seq_lo..seq_hi));
+                break;
+            }
+        }
+        let (sample_idx, seq_range) =
+            found_seq.ok_or(UnifyAllelesError::MissingCompoundAlleleBytes {
+                chrom_id,
+                group_start,
+                group_end,
+                record_idx: c.record_idx as u32,
+                local_allele_idx: c.local_allele_idx as u32,
+            })?;
+        let local_span = local_span.unwrap_or(1);
+
+        if local_offset < cursor_offset {
+            let overlap = cursor_offset - local_offset;
+            out.truncate(out.len().saturating_sub(overlap));
+            cursor_offset = local_offset;
+        }
+        if local_offset > cursor_offset {
+            out.extend_from_slice(&ref_seq[cursor_offset..local_offset]);
+        }
+        out.extend_from_slice(&chunk.per_sample[sample_idx].allele_seq_bytes[seq_range]);
+        cursor_offset = local_offset + local_span;
+    }
+
+    if cursor_offset < ref_seq.len() {
+        out.extend_from_slice(&ref_seq[cursor_offset..]);
+    }
+    Ok(())
+}
+
+/// Full column-native allele unifier — composes sub-steps 1.1
+/// (per-position projection) and 1.2 (compound detection +
+/// admission). The max-alleles cap (sub-step 1.3) is queued; until
+/// it lands, `out`'s `other_*` columns stay empty.
+pub fn unify_alleles_columnar(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    ref_seq: &[u8],
+    n_samples: usize,
+    scratch: &mut UnifyAllelesScratch,
+    out: &mut UnifiedAllelesColumns,
+) -> Result<(), UnifyAllelesError> {
+    scratch.clear();
+    project_per_position_into_scratch(chunk, partition, group_idx, ref_seq, n_samples, scratch);
+    admit_compound_candidates_columnar(chunk, partition, group_idx, ref_seq, n_samples, scratch)?;
+    serialize_working_to_columns(scratch, n_samples, out);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -437,7 +841,7 @@ mod tests {
     use crate::fasta::ChromRefFetcher;
     use crate::fasta::fetcher::ChromRefFetchError;
     use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
-    use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
+    use crate::var_calling::cohort_block::columns::MaterialisedChunk;
     use crate::var_calling::cohort_block::partition::{
         PartitionScratch, WindowPartition, partition_window,
     };
@@ -811,6 +1215,192 @@ mod tests {
 
         let fetcher = shared_mock(&ref_full, 1);
         let oracle = unified_alleles_via_existing_kernel(&chunk, &partition, 0, fetcher);
+        assert_eq!(new_alleles, oracle);
+    }
+
+    /// Pull the existing kernel's allele set including `constituents`
+    /// so we can byte-identity-compare compound detection too.
+    fn unified_alleles_with_constituents(
+        chunk: &MaterialisedChunk,
+        partition: &WindowPartition,
+        group_idx: usize,
+        ref_fetcher: SharedRefFetcher,
+    ) -> Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> {
+        let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
+            chunk,
+            partition,
+            group_idx,
+            chunk.n_samples(),
+            chunk.chrom_id,
+        );
+        let config = PerGroupMergerConfig::new(2, 16, 64, 32).expect("merger config");
+        let iter: Vec<Result<OverlappingVariantGroup, GrouperError>> = vec![Ok(group)];
+        let mut merger = PerGroupMerger::with_config(iter.into_iter(), ref_fetcher, config);
+        let record = merger
+            .next()
+            .expect("merger yields at least one item")
+            .expect("merger succeeded");
+        record
+            .alleles
+            .iter()
+            .map(|a| {
+                (
+                    a.seq.clone(),
+                    a.is_compound,
+                    a.constituents
+                        .iter()
+                        .map(|c| (c.record_idx, c.local_allele_idx))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Pull the new column-native kernel's allele set including
+    /// `constituents` (the same shape the row-shape oracle returns).
+    fn columnar_alleles_with_constituents(
+        out: &UnifiedAllelesColumns,
+    ) -> Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> {
+        (0..out.n_alleles())
+            .map(|i| {
+                let lo = out.constituent_offsets[i] as usize;
+                let hi = out.constituent_offsets[i + 1] as usize;
+                let constituents: Vec<(usize, usize)> = (lo..hi)
+                    .map(|k| {
+                        (
+                            out.constituent_record_idx[k] as usize,
+                            out.constituent_local_allele_idx[k] as usize,
+                        )
+                    })
+                    .collect();
+                (out.allele_seq(i).to_vec(), out.is_compound[i], constituents)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unify_byte_identity_against_existing_kernel_with_compound() {
+        // Sample 0 has a chain-anchored compound: SNP A→T at pos 100
+        // (chain 1) and SNP A→G at pos 102 (chain 1). Same chain
+        // means the same read carries both ALTs → a compound.
+        // ref_span = 1 (SNPs) but the group spans [100, 102] because
+        // we'll attach another MNP somewhere to glue the positions.
+        //
+        // To get them in one group, sample 1 carries an MNP at pos
+        // 100 (REF=ACA, ALT=ACC) with ref_span=3, reaching to 102.
+        // That joins 100 and 102 into one group.
+        let mnp_record = PileupRecord::new(
+            0,
+            100,
+            vec![
+                AlleleObservation::new(
+                    b"ACA".to_vec(),
+                    AlleleSupportStats::new(4, -1.0, 4, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"ACC".to_vec(),
+                    AlleleSupportStats::new(3, -1.0, 3, 0, 0, 0, 0),
+                    vec![100],
+                ),
+            ],
+        );
+        // Sample 0: two SNPs with the same chain_id 1 — proposes a
+        // compound.
+        let snp_100 = PileupRecord::new(
+            0,
+            100,
+            vec![
+                AlleleObservation::new(
+                    b"A".to_vec(),
+                    AlleleSupportStats::new(5, -1.0, 5, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"T".to_vec(),
+                    AlleleSupportStats::new(4, -1.0, 4, 0, 0, 0, 0),
+                    vec![1],
+                ),
+            ],
+        );
+        let snp_102 = PileupRecord::new(
+            0,
+            102,
+            vec![
+                AlleleObservation::new(
+                    b"A".to_vec(),
+                    AlleleSupportStats::new(5, -1.0, 5, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"G".to_vec(),
+                    AlleleSupportStats::new(4, -1.0, 4, 0, 0, 0, 0),
+                    vec![1],
+                ),
+            ],
+        );
+        let s0 = vec![snp_100, snp_102];
+        let s1 = vec![mnp_record];
+        // Reference at positions 100..102 is "ACA" (matches the MNP's
+        // REF allele).
+        let mut ref_full = vec![b'A'; 200];
+        ref_full[99] = b'A';
+        ref_full[100] = b'C';
+        ref_full[101] = b'A';
+        let (chunk, partition, ref_seq) = group_fixture(vec![s0, s1], &ref_full, 1..200, 50);
+        assert_eq!(partition.group_starts[0], 100);
+        assert_eq!(partition.group_ends[0], 102);
+        assert_eq!(ref_seq.as_slice(), b"ACA");
+
+        // Column-native unify (1.1 + 1.2).
+        let mut scratch = UnifyAllelesScratch::new();
+        let mut out = UnifiedAllelesColumns::empty();
+        unify_alleles_columnar(
+            &chunk,
+            &partition,
+            0,
+            &ref_seq,
+            chunk.n_samples(),
+            &mut scratch,
+            &mut out,
+        )
+        .expect("unify succeeded");
+        let new_alleles = columnar_alleles_with_constituents(&out);
+
+        // Oracle (row-shape kernel).
+        let fetcher = shared_mock(&ref_full, 1);
+        let oracle = unified_alleles_with_constituents(&chunk, &partition, 0, fetcher);
+
+        assert_eq!(new_alleles, oracle);
+    }
+
+    #[test]
+    fn unify_byte_identity_against_existing_kernel_no_compounds() {
+        // Recap: when no chain ids are shared, unify_alleles_columnar
+        // should produce the same allele set as the per-position-only
+        // sub-step.
+        let s0 = vec![record(50, ref_plus_alt(3, 4))];
+        let s1 = vec![record(50, ref_plus_alt(5, 6))];
+        let ref_full = vec![b'A'; 200];
+        let (chunk, partition, ref_seq) = group_fixture(vec![s0, s1], &ref_full, 1..200, 50);
+
+        let mut scratch = UnifyAllelesScratch::new();
+        let mut out = UnifiedAllelesColumns::empty();
+        unify_alleles_columnar(
+            &chunk,
+            &partition,
+            0,
+            &ref_seq,
+            chunk.n_samples(),
+            &mut scratch,
+            &mut out,
+        )
+        .expect("unify succeeded");
+        let new_alleles = columnar_alleles_with_constituents(&out);
+
+        let fetcher = shared_mock(&ref_full, 1);
+        let oracle = unified_alleles_with_constituents(&chunk, &partition, 0, fetcher);
+
         assert_eq!(new_alleles, oracle);
     }
 
