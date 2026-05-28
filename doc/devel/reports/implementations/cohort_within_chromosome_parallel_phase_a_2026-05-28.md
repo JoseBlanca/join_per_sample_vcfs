@@ -293,12 +293,96 @@ Net diff for the rewire: +54 / -79 in [var_calling.rs](../../../src/pop_var_call
   `var_calling_emits_deterministic_vcf_across_runs` test that diffs
   two runs of the same input.
 
-**Byte-identity vs `main`** — not yet attempted. The integration suite
-runs through the new driver and produces a well-formed cohort VCF on
-every fixture, but the existing tests assert presence of header
-lines + sample-column names, not per-record VCF body content. The
-side-by-side `diff` against `main`'s streaming pipeline output on a
-real tomato fixture is the genuine byte-identity check and still owed.
+**Byte-identity vs `main`** — first attempt run; **two distinct
+Phase A.0 issues surfaced**.
+
+### Issue 1: NoSafeGap on dense real-data regions — fixed (commit `98da597`)
+
+The first tomato run died with
+`ChunkDriverError::FixBoundaries(NoSafeGap)` inside the dense
+`SL4.0ch01:14900001..15000001` window. Driver-side fix added: the
+chunk loader now retries with a doubled load range when the pre-pass
+can't find a safe boundary, up to `MAX_CHUNK_SPAN_GROWTH = 8 ×
+chunk_genomic_span` before surfacing `NoSafeGap` to the caller. A
+driver-owned `carryover_snapshot` is taken before each first load
+attempt and restored before retry (the load drains carryover as part
+of raw load). With this fix the 3-tomato cohort completes end to end
+on the branch (8333 records emitted).
+
+### Issue 2: variant filter drops pure-REF positions inside MNP/DEL/INS reach
+
+Diffing `branch.vcf` vs `main.vcf` on the same 3-tomato cohort
+(`SRR11450568.p1.psp` + `.569.psp` + `.570.psp` against `SL4.0`
+fasta) shows ~10 records differ out of 253 357 records processed:
+branch emits +4 records (8333 vs 8329), drops -5 as `hom_ref` (8303
+vs 8308), and drops +1 as low MAPQ-diff t (1135 vs 1134). Totals
+match (253 357), so the same set of records flows through both
+pipelines — just with slightly different EM outputs.
+
+Looking at the per-record diffs (e.g. `SL4.0ch01:14992675 AG → A,CG,AA`),
+the divergence pattern is consistent: **homref samples within a
+multi-position group have under-counted DP and AD on the branch.**
+At 14992675, sample 0's `AD = 26,0,0,0` on the branch vs `52,0,0,0`
+on main — a factor of 2× that matches the MNP's `ref_span = 2`.
+Sample 1 (the heterozygous one carrying the MNP) is identical on
+both. The het sample's record carries the full per-position bundle
+because `pos = 14992675` is in the variant set; the homref samples'
+records at the *covered* position 14992676 are getting dropped by
+the chunk loader's cohort-wide variant filter (no sample has a
+non-REF allele at 14992676 in isolation), so when the per-group
+merger pulls per-position evidence for the group span
+`[14992675, 14992676]`, the homref samples' REF evidence at 14992676
+is silently missing.
+
+**Root cause.** The current loader filter at
+[loader.rs](../../../src/var_calling/cohort_block/loader.rs)
+keeps a position iff at least one sample has a non-REF allele with
+`num_obs > 0` at that position (the plan's authorised fast path).
+This is correct for SNP groups (group span equals the variant
+position) but under-includes for multi-position groups: a record at
+position `P` with `ref_span = R` covers positions `[P, P + R - 1]`,
+and per-group merger semantics require per-position evidence at
+*every* covered position from *every* sample. A pure-REF position
+inside `[P, P + R - 1]` would be dropped by the current filter even
+though its records are needed.
+
+**Fix (commit `8b0a9b3`).** Replaced the position-local `is_variant`
+check with a grouping-simulation `is_kept` check: walks the post-load
+cohort-wide position timeline in order, builds provisional groups
+using `pos <= group_end_pos` (with `group_end_pos` the rolling max
+of `pos + ref_span - 1` across the group), marks a position as kept
+iff the group it lands in contains at least one variant position.
+The simulation mirrors the streaming `VariantGrouper`'s join rule on
+the same data. After this, the chunk holds the same set of records
+the streaming pipeline would have fed to the per-group merger.
+
+New `ChunkLoadScratch` columns:
+- `has_variant_at` (per-position non-REF flag; was `is_variant`).
+- `max_ref_span_at` (per-position max ref_span across samples).
+- `is_kept` (output of the grouping simulation).
+
+This fix lives entirely in the chunk loader and does not interact
+with the Phase A.0 worker adapter or the (future) Phase A.1
+columnar kernels — Phase A.1 would have inherited the bug if the
+loader had not been fixed first, so the fix landed now.
+
+### Byte-identity outcome
+
+After both fixes, re-running the 3-tomato cohort
+(`SRR11450568.p1.psp` + `.569.psp` + `.570.psp` against the SL4.0
+reference) and diffing branch.vcf vs main.vcf (modulo `##source`
+and `##commandline` headers):
+
+- Per-category stats: **identical** on both sides
+  (`records_emitted=8329`, `records_dropped_hom_ref=8308`,
+  `records_dropped_low_qual=1596`,
+  `records_dropped_low_alt_obs=233990`,
+  `records_dropped_low_mapq_diff_t=1134`).
+- `diff` line count on the VCF bodies: **0**. Byte-identical.
+
+Phase A.0's hard correctness contract — byte-identical VCFs vs the
+streaming pipeline on real tomato data — is now met. Phase A.1
+can begin from a confirmed baseline.
 
 ## Decision on perf review for Phase A
 
@@ -316,6 +400,9 @@ the new path inherits all of them via the adapter.
 
 A perf review only delivers actionable findings once the kernels
 themselves run column-native. That's Phase A.1.
+
+**Phase A.0 status:** byte-identical to `main` on the 3-tomato
+cohort fixture. Phase A.1 starts from a confirmed baseline.
 
 ## Recommended next steps
 
