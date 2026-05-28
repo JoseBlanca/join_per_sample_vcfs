@@ -722,8 +722,14 @@ pub(crate) fn admit_compound_candidates_columnar(
             Some(&idx) => {
                 let working = &mut scratch.working_alleles[idx];
                 if !working.is_compound {
+                    // Row-shape parity (per_group_merger.rs:1101–1106).
+                    // The compound's bytes match an existing per-position
+                    // allele; mark it as a compound and attach the
+                    // constituents, but leave `cap_protected` alone — the
+                    // entry stays prunable by `enforce_max_alleles` so
+                    // its per-position observations can be dropped if
+                    // its `cohort_count` is too low.
                     working.is_compound = true;
-                    working.cap_protected = true;
                     working.constituents = candidate.constituents_per_first_anchor.clone();
                 }
                 idx

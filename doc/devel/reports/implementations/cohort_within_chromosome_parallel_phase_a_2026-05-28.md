@@ -326,8 +326,89 @@ the row-shape kernels.
   and `MAX_BITMASK_ALLELES` were already public. All live in
   [`per_group_merger.rs`](../../../src/var_calling/per_group_merger.rs).
 
-- **Layer 4 — native EM.** Queued.
-- **Wiring + byte-identity diff + perf review.** Queued.
+- **Layer 4 — column-native pipeline + MergedRecord adapter.**
+  [`cohort_block/worker.rs`](../../../src/var_calling/cohort_block/worker.rs)
+  rewritten. `run_window` now drives a
+  [`ColumnarMergedRecordsIter`](../../../src/var_calling/cohort_block/worker.rs)
+  that runs layers 1+2+3 per group and builds a row-shape
+  [`MergedRecord`](../../../src/var_calling/per_group_merger.rs) by
+  cloning the columnar layer outputs into its owned `Vec`s; the
+  iterator feeds straight into
+  [`PosteriorEngine`](../../../src/var_calling/posterior_engine.rs).
+  The Phase A.0 `PerGroupMerger` is removed from the production
+  path; `build_overlapping_variant_group` stays `#[cfg(test)]` as
+  the row-shape oracle for layer 1/2/3 byte-identity tests.
+
+  **New scratch:**
+  [`ColumnarPipelineScratch`](../../../src/var_calling/cohort_block/worker.rs)
+  bundles layer-1/2/3 scratch + the chain-anchor-flags table + the
+  REF byte buffer + the LH-cap skip counters. The driver
+  ([`drive_cohort_chunked`](../../../src/var_calling/cohort_block/driver.rs))
+  owns one per chunk-loop and folds its
+  `take_lh_cap_stats` into
+  [`ChunkDriverStats`](../../../src/var_calling/cohort_block/driver.rs)
+  after each `run_window` call — Phase A.0 had this field stubbed
+  but never bumped because the row-shape merger owned its own
+  internal `LhCapStats`.
+
+  **Row-shape parity skips.** `build_merged_record_columnar`
+  returns `Ok(None)` for two cases the row-shape
+  `PerGroupMerger::process_group` returns `Ok(None)` for:
+  `unified.alleles.len() < 2` (REF-only post-cap) and
+  `unified.alleles.len() > cfg.max_alleles_lh_calc` (LH cap binds).
+  Without these skips the EM would emit `trivial_posterior_record`s
+  for REF-only groups that the driver would filter as hom-ref,
+  inflating per-category counts above the row-shape baseline.
+
+  **Layer 1 cap_protected bug — found during the 3-tomato
+  byte-identity check, fixed in this commit.** The pre-fix
+  [`admit_compound_candidates_columnar`](../../../src/var_calling/cohort_block/kernels/unify_alleles.rs)
+  toggled `working.cap_protected = true` whenever a compound's
+  projected bytes coincided with an existing per-position allele's
+  bytes. The row-shape `admit_compound_candidates` at
+  [per_group_merger.rs:1101](../../../src/var_calling/per_group_merger.rs#L1101)
+  leaves `cap_protected` alone in that branch (only newly-pushed
+  compounds are protected). The over-protection shrank the prunable
+  pool below what `enforce_max_alleles_columnar` needs, so the cap
+  couldn't trim alleles down to `max_alleles` — yielding emitted
+  records with up to 9 alleles where the row-shape kernel cleanly
+  capped at 6. Surfaced on `SL4.0ch05:49488201` (the cap fires +
+  compounds present).
+
+  A new worker-level regression test
+  [`run_window_columnar_matches_row_shape_under_cap_with_compounds`](../../../src/var_calling/cohort_block/worker.rs)
+  builds a fixture that triggers the cap with both compound +
+  per-position alleles, byte-identity-checks against the row-shape
+  oracle, and asserts `n_alleles <= max_alleles` so the invariant
+  is now codified by a unit test.
+
+  **End-to-end byte-identity** on the 3-tomato cohort
+  (`SRR11450568.p1.psp` + `.569.psp` + `.570.psp` against the SL4.0
+  reference): VCF body diff = **0 lines** between the layer 4
+  columnar pipeline and the layer 3 (commit `5adc390`) row-shape
+  oracle. Per-category counts (`records_emitted=8329`,
+  `records_dropped_hom_ref=8308`, `records_dropped_low_qual=1596`,
+  `records_dropped_low_alt_obs=233990`,
+  `records_dropped_low_mapq_diff_t=1134`) match the layer 3 baseline
+  exactly. Phase A.0 had previously proved layer 3 == `main` on the
+  same cohort, so transitively layer 4 == `main`.
+
+- **Layer 5 — native EM (deferred).** The EM, mixture-likelihood
+  pre-pass, posterior summarisation, and exact-AF QUAL passes still
+  run via `PosteriorEngine::run_em_for_record` on a row-shape
+  [`MergedRecord`](../../../src/var_calling/per_group_merger.rs)
+  that the layer 4 adapter builds from the columnar layer outputs.
+  The math itself reads from flat columnar-shaped buffers
+  (`scalars`, `other_scalars`, `log_likelihoods`,
+  `chain_anchor_flags`) that layers 2 + 3 produce natively — so the
+  remaining port is a signature refactor (consume `&[…]` slices)
+  rather than a math rewrite. Sketched as Phase A.2 in
+  [`cohort_within_chromosome_parallel_phase_a2_em.md`](../../implementation_plans/cohort_within_chromosome_parallel_phase_a2_em.md).
+
+- **Perf review.** Queued behind Phase A.2 — measuring wall + RSS
+  on the layer-4 adapter would conflate the columnar layers' wins
+  with the per-group `MergedRecord` clone tax, which Phase A.2
+  removes.
 
 ### Toolchain-bump clippy debt (out-of-scope for this branch)
 

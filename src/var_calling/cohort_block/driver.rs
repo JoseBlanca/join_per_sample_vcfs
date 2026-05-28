@@ -47,7 +47,7 @@ use crate::var_calling::cohort_block::partition::{
 use crate::var_calling::cohort_block::pre_pass::{
     FixBoundariesError, FixBoundariesScratch, fix_boundaries,
 };
-use crate::var_calling::cohort_block::worker::run_window;
+use crate::var_calling::cohort_block::worker::{ColumnarPipelineScratch, run_window};
 use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
 use crate::var_calling::per_group_merger::{
     PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
@@ -172,6 +172,7 @@ pub fn drive_cohort_chunked(
     let mut carryover: Vec<SampleColumns> =
         (0..n_samples).map(|_| SampleColumns::empty()).collect();
     let mut output_buf: Vec<PosteriorRecord> = Vec::new();
+    let mut worker_scratch = ColumnarPipelineScratch::empty();
 
     let mut stats = ChunkDriverStats::default();
 
@@ -193,6 +194,7 @@ pub fn drive_cohort_chunked(
                 &mut partition,
                 &mut carryover,
                 &mut output_buf,
+                &mut worker_scratch,
             )?;
         }
         writer.finish()?;
@@ -366,6 +368,7 @@ fn drive_one_chrom_generic<W>(
     partition: &mut WindowPartition,
     carryover: &mut [SampleColumns],
     output_buf: &mut Vec<PosteriorRecord>,
+    worker_scratch: &mut ColumnarPipelineScratch,
 ) -> Result<(), ChunkDriverError>
 where
     W: Read + Seek,
@@ -429,6 +432,7 @@ where
             carryover,
             &mut carryover_snapshot,
             output_buf,
+            worker_scratch,
             max_group_span,
         )?;
 
@@ -482,6 +486,7 @@ fn load_and_run_chunk_with_retry<W>(
     carryover: &mut [SampleColumns],
     carryover_snapshot: &mut [SampleColumns],
     output_buf: &mut Vec<PosteriorRecord>,
+    worker_scratch: &mut ColumnarPipelineScratch,
     max_group_span: u32,
 ) -> Result<u32, ChunkDriverError>
 where
@@ -559,8 +564,12 @@ where
             shared_fetcher.clone(),
             params.per_group_cfg,
             params.posterior_cfg.clone(),
+            worker_scratch,
             output_buf,
         )?;
+        let (cap_g, cap_a) = worker_scratch.take_lh_cap_stats();
+        stats.lh_cap_groups_skipped += cap_g;
+        stats.lh_cap_alleles_in_skipped += cap_a;
         for record in output_buf.drain(..) {
             emit_or_drop(record, params, writer, stats)?;
         }
