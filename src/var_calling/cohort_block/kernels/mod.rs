@@ -17,4 +17,5 @@
 //! Each layer is byte-identity-tested against the existing kernel's
 //! output on the same input as it lands.
 
+pub mod project_scalars;
 pub mod unify_alleles;
