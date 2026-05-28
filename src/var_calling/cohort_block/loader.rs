@@ -25,14 +25,25 @@ use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns
 ///   before the variant filter compacts them into the output chunk.
 /// - [`Self::position_union`]: sorted, dedup'd 1-based position
 ///   timeline across every sample in the current chunk.
-/// - [`Self::is_variant`]: parallel to [`Self::position_union`];
-///   each entry is `true` iff at least one sample at the position
-///   carries a non-reference allele with `num_obs > 0`.
+/// - [`Self::has_variant_at`]: parallel to [`Self::position_union`];
+///   each entry is `true` iff at least one sample at that position
+///   carries a non-reference allele with `num_obs > 0`. Used to
+///   propagate "variant" up to the group each position belongs to.
+/// - [`Self::max_ref_span_at`]: parallel to [`Self::position_union`];
+///   the max `ref_span` across samples that have a record at the
+///   position. Drives the grouping simulation's reach calculation.
+/// - [`Self::is_kept`]: parallel to [`Self::position_union`]; the
+///   result of the grouping simulation — `true` iff the position
+///   lands in a provisional group that contains at least one variant
+///   position. These are the positions whose records survive into
+///   the output chunk's `per_sample` columns.
 #[derive(Debug)]
 pub struct ChunkLoadScratch {
     raw_per_sample: Vec<SampleColumns>,
     position_union: Vec<u32>,
-    is_variant: Vec<bool>,
+    has_variant_at: Vec<bool>,
+    max_ref_span_at: Vec<u32>,
+    is_kept: Vec<bool>,
 }
 
 impl ChunkLoadScratch {
@@ -41,7 +52,9 @@ impl ChunkLoadScratch {
         Self {
             raw_per_sample: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
             position_union: Vec::new(),
-            is_variant: Vec::new(),
+            has_variant_at: Vec::new(),
+            max_ref_span_at: Vec::new(),
+            is_kept: Vec::new(),
         }
     }
 
@@ -57,7 +70,9 @@ impl ChunkLoadScratch {
             sample.clear();
         }
         self.position_union.clear();
-        self.is_variant.clear();
+        self.has_variant_at.clear();
+        self.max_ref_span_at.clear();
+        self.is_kept.clear();
     }
 }
 
@@ -230,24 +245,90 @@ where
     scratch.position_union.sort_unstable();
     scratch.position_union.dedup();
 
-    // ── Step 4: per-position variant predicate ──
+    // ── Step 4: per-position scan — `has_variant_at` and `max_ref_span_at`. ──
+    // For each cohort position we walk the samples that have a record
+    // there exactly once, computing both predicates in one pass:
+    //   - `has_variant_at[i]` — at least one sample's record carries a
+    //     non-REF allele with `num_obs > 0`. Used by Step 5 to decide
+    //     whether a provisional group has any variant evidence.
+    //   - `max_ref_span_at[i]` — max `ref_span` across samples with a
+    //     record. Drives the grouping simulation's reach calculation.
     scratch
-        .is_variant
+        .has_variant_at
         .resize(scratch.position_union.len(), false);
+    scratch
+        .max_ref_span_at
+        .resize(scratch.position_union.len(), 0);
     for (idx, &pos) in scratch.position_union.iter().enumerate() {
-        let mut variant = false;
+        let mut has_variant = false;
+        let mut max_ref_span: u32 = 0;
         for raw in &scratch.raw_per_sample {
-            if let Ok(row_idx) = raw.binary_search_position(pos)
-                && raw.has_observed_non_ref_allele_at(row_idx)
-            {
-                variant = true;
-                break;
+            if let Ok(row_idx) = raw.binary_search_position(pos) {
+                let ref_span = raw.ref_span_at(row_idx);
+                if ref_span > max_ref_span {
+                    max_ref_span = ref_span;
+                }
+                if !has_variant && raw.has_observed_non_ref_allele_at(row_idx) {
+                    has_variant = true;
+                }
             }
         }
-        scratch.is_variant[idx] = variant;
+        scratch.has_variant_at[idx] = has_variant;
+        scratch.max_ref_span_at[idx] = max_ref_span;
     }
 
-    // ── Step 5: per-sample compact ──
+    // ── Step 5: grouping simulation. ──
+    // Walk the cohort-wide timeline in order, building provisional
+    // groups under the same join rule the streaming grouper uses
+    // (`pos <= group_end`, where `group_end` is the rolling max of
+    // `pos + ref_span - 1` across the group). Mark every position in
+    // a group that contains at least one variant position as kept;
+    // positions in groups with no variants are dropped (matches the
+    // streaming pipeline, where the per-group merger drops pure-REF
+    // groups after merging).
+    //
+    // The point of this simulation — vs. the simpler per-position
+    // "has any non-REF" check — is that the per-group merger gathers
+    // per-(sample, allele) support from *every* position the group
+    // span covers, including positions that are pure-REF in isolation
+    // but inside the reach of another sample's MNP/DEL/INS. Dropping
+    // those positions here would silently under-count REF evidence
+    // for homref samples in multi-position groups.
+    scratch.is_kept.resize(scratch.position_union.len(), false);
+    let mut group_open = false;
+    let mut group_start_idx: usize = 0;
+    let mut group_end_pos: u32 = 0;
+    let mut group_has_variant = false;
+    for i in 0..scratch.position_union.len() {
+        let pos = scratch.position_union[i];
+        let reach = pos.saturating_add(scratch.max_ref_span_at[i].max(1)) - 1;
+
+        if group_open && pos <= group_end_pos {
+            if reach > group_end_pos {
+                group_end_pos = reach;
+            }
+            if scratch.has_variant_at[i] {
+                group_has_variant = true;
+            }
+        } else {
+            if group_open && group_has_variant {
+                for slot in scratch.is_kept[group_start_idx..i].iter_mut() {
+                    *slot = true;
+                }
+            }
+            group_open = true;
+            group_start_idx = i;
+            group_end_pos = reach;
+            group_has_variant = scratch.has_variant_at[i];
+        }
+    }
+    if group_open && group_has_variant {
+        for slot in scratch.is_kept[group_start_idx..].iter_mut() {
+            *slot = true;
+        }
+    }
+
+    // ── Step 6: per-sample compact ──
     for (sample_idx, raw) in scratch.raw_per_sample.iter().enumerate() {
         let dst = &mut out.per_sample[sample_idx];
         // Parallel walk over `raw.positions` and `position_union`:
@@ -265,7 +346,7 @@ where
                     && scratch.position_union[union_idx] == pos,
                 "raw position {pos} missing from union — invariant broken",
             );
-            if scratch.is_variant[union_idx] {
+            if scratch.is_kept[union_idx] {
                 dst.push_row_from(raw, row_idx);
             }
         }
@@ -278,7 +359,7 @@ where
 mod tests {
     use super::*;
     use crate::var_calling::cohort_block::test_helpers::{
-        record, ref_obs, ref_plus_alt, ref_plus_unobserved_alt, run_loader,
+        allele, record, ref_obs, ref_plus_alt, ref_plus_unobserved_alt, run_loader,
     };
 
     #[test]
@@ -301,6 +382,40 @@ mod tests {
         assert_eq!(chunk.per_sample[0].n_records(), 0);
         assert_eq!(chunk.per_sample[1].n_records(), 1);
         assert_eq!(chunk.per_sample[1].position_at(0), 14);
+    }
+
+    #[test]
+    fn loader_keeps_homref_position_inside_mnp_reach() {
+        // Sample 0 has a 3-bp MNP at position 10 (REF=AAA, ALT=ACA).
+        // Sample 1 has plain SNP-shape records at 10/11/12 — pure REF.
+        // Cohort-wide: position 10 is variant (sample 0 has ALT). But
+        // positions 11 and 12 are pure-REF in isolation (sample 0's
+        // 3-bp record covers them; sample 1 has REF-only records).
+        // The grouping simulation extends the kept set to 11 and 12
+        // because they fall inside sample 0's record's reach (10..12).
+        let s0 = vec![record(
+            10,
+            vec![
+                allele(b"AAA", 5, -1.0, &[]),
+                allele(b"ACA", 4, -1.0, &[]),
+            ],
+        )];
+        let s1 = vec![
+            record(10, vec![ref_obs(7)]),
+            record(11, vec![ref_obs(7)]),
+            record(12, vec![ref_obs(7)]),
+        ];
+        let chunk = run_loader(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+
+        // Sample 0 only has a record at 10. Kept.
+        assert_eq!(chunk.per_sample[0].n_records(), 1);
+        assert_eq!(chunk.per_sample[0].position_at(0), 10);
+        // Sample 1 has records at 10, 11, 12 — all three kept because
+        // they're inside sample 0's variant record's reach.
+        assert_eq!(chunk.per_sample[1].n_records(), 3);
+        assert_eq!(chunk.per_sample[1].position_at(0), 10);
+        assert_eq!(chunk.per_sample[1].position_at(1), 11);
+        assert_eq!(chunk.per_sample[1].position_at(2), 12);
     }
 
     #[test]
