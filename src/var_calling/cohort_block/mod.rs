@@ -22,6 +22,7 @@
 
 pub mod columns;
 pub mod driver;
+pub mod kernels;
 pub mod loader;
 pub mod partition;
 pub mod pre_pass;
