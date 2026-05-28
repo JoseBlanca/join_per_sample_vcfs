@@ -13,16 +13,28 @@
 //! Reusing the kernels lets the cohort-level rewrite reach
 //! byte-identical VCFs against `main` without re-deriving the
 //! allele-unification, likelihood, EM, and QUAL math from scratch.
-//! Phase A.1 (deferred) replaces this adapter with native columnar
-//! kernels operating directly on
-//! [`SampleColumns`](super::columns::SampleColumns) and
-//! [`WindowPartition`].
+//!
+//! **Phase A.1 progress.** Layer 1's column-native allele unifier
+//! (sub-steps 1.0–1.3) lives in
+//! [`super::kernels::unify_alleles`]. Sub-step 1.4 exposes it
+//! through this module via
+//! [`unified_alleles_for_group_columnar`] — the kernel is now
+//! reachable through the worker's API surface and can be exercised
+//! end-to-end on real partition data, but `run_window` still drives
+//! the row-shape `PerGroupMerger` for the downstream stages
+//! (scalar projection, likelihoods, EM). Layers 2–4 swap those in
+//! one at a time.
 
 use std::sync::Arc;
 
-use crate::fasta::fetcher::ChromRefFetcher;
+use thiserror::Error;
+
+use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
 use crate::pileup_record::PileupRecord;
 use crate::var_calling::cohort_block::columns::MaterialisedChunk;
+use crate::var_calling::cohort_block::kernels::unify_alleles::{
+    UnifiedAllelesColumns, UnifyAllelesError, UnifyAllelesScratch, unify_alleles_columnar,
+};
 use crate::var_calling::cohort_block::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
     PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
@@ -141,6 +153,66 @@ where
     F: ChromRefFetcher + Send + 'static,
 {
     Arc::new(fetcher)
+}
+
+/// Errors from [`unified_alleles_for_group_columnar`]. Wraps the
+/// kernel error and the ref-fetcher error so callers see a single
+/// surface.
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum WorkerUnifyError {
+    /// Kernel-side failure (compound projection couldn't find an
+    /// anchoring sample, etc.).
+    #[error(transparent)]
+    Kernel(#[from] UnifyAllelesError),
+
+    /// `fetch_into` failed while pulling the group's REF span — the
+    /// kernel needs those bytes as input.
+    #[error("reference fetch: {0}")]
+    RefFetch(#[from] ChromRefFetchError),
+}
+
+/// Phase A.1 sub-step 1.4 — column-native allele unification for one
+/// group of a [`WindowPartition`], fetched through the worker's
+/// ref-fetcher convention.
+///
+/// Composes the chunk + partition + group_idx into the kernel input,
+/// fetches the group's REF bytes into `ref_buf`, and runs
+/// [`unify_alleles_columnar`]. The output `out` is the
+/// column-native equivalent of `MergedRecord.alleles` (plus the
+/// per-sample source pointers layer 2 will need).
+///
+/// **Not yet on the production path.** `run_window` still drives
+/// the row-shape `PerGroupMerger` for the downstream scalar
+/// projection, likelihoods, and EM; this function exposes the
+/// kernel through the worker's API surface so layers 2–4 have a
+/// stepping stone to build against.
+#[allow(clippy::too_many_arguments)]
+pub fn unified_alleles_for_group_columnar(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    group_idx: usize,
+    ref_fetcher: &dyn ChromRefFetcher,
+    max_alleles: usize,
+    scratch: &mut UnifyAllelesScratch,
+    ref_buf: &mut Vec<u8>,
+    out: &mut UnifiedAllelesColumns,
+) -> Result<(), WorkerUnifyError> {
+    let group_start = partition.group_starts[group_idx];
+    let group_end = partition.group_ends[group_idx];
+    let span = group_end - group_start + 1;
+    ref_fetcher.fetch_into(group_start, span, ref_buf)?;
+    unify_alleles_columnar(
+        chunk,
+        partition,
+        group_idx,
+        ref_buf,
+        chunk.n_samples(),
+        max_alleles,
+        scratch,
+        out,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -271,6 +343,140 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(output.is_empty());
+    }
+
+    /// In-memory `ChromRefFetcher` for the column-native unify
+    /// integration test. Mirrors the `MockRef` inside the kernel
+    /// tests.
+    #[derive(Clone)]
+    struct MockRef {
+        seq: Vec<u8>,
+        /// 1-based position of `seq[0]`.
+        base_offset: u32,
+    }
+
+    impl crate::fasta::fetcher::sealed::Sealed for MockRef {}
+
+    impl crate::fasta::fetcher::ChromRefFetcher for MockRef {
+        fn length(&self) -> u32 {
+            self.base_offset.saturating_sub(1) + self.seq.len() as u32
+        }
+        fn fetch(
+            &self,
+            start_1based: u32,
+            length: u32,
+        ) -> Result<Vec<u8>, crate::fasta::fetcher::ChromRefFetchError> {
+            let start_idx = (start_1based - self.base_offset) as usize;
+            Ok(self.seq[start_idx..start_idx + length as usize].to_vec())
+        }
+        fn iter_bases<'a>(
+            &'a self,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<u8, crate::fasta::fetcher::ChromRefFetchError>> + 'a>,
+            crate::fasta::fetcher::ChromRefFetchError,
+        > {
+            Ok(Box::new(self.seq.iter().copied().map(Ok)))
+        }
+    }
+
+    #[test]
+    fn column_native_unify_matches_row_shape_on_worker_fixture() {
+        // Same multi-position fixture as the existing adapter test:
+        // sample 0 has a 10-bp MNP at pos 100 reaching to 109, plus
+        // an SNP at pos 105. The kernel + the row-shape PerGroupMerger
+        // should produce identical (seq, is_compound, constituents)
+        // tuples.
+        let s0 = vec![
+            record(
+                100,
+                vec![
+                    crate::var_calling::cohort_block::test_helpers::allele(
+                        b"AAAAAAAAAA",
+                        3,
+                        -1.0,
+                        &[],
+                    ),
+                    crate::var_calling::cohort_block::test_helpers::allele(
+                        b"AAACAAAAAA",
+                        4,
+                        -1.0,
+                        &[],
+                    ),
+                ],
+            ),
+            record(105, ref_plus_alt(3, 4)),
+        ];
+        let (chunk, partition) = fixture(vec![s0], 1, 200, 100);
+        assert_eq!(partition.n_groups(), 1);
+
+        let ref_full = vec![b'A'; 200];
+        let fetcher = MockRef {
+            seq: ref_full.clone(),
+            base_offset: 1,
+        };
+
+        // Column-native via the new worker-side entry point.
+        let mut scratch = UnifyAllelesScratch::new();
+        let mut ref_buf = Vec::new();
+        let mut cn_out = UnifiedAllelesColumns::empty();
+        unified_alleles_for_group_columnar(
+            &chunk,
+            &partition,
+            0,
+            &fetcher,
+            16,
+            &mut scratch,
+            &mut ref_buf,
+            &mut cn_out,
+        )
+        .expect("column-native unify succeeded");
+
+        let cn_alleles: Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> = (0..cn_out.n_alleles())
+            .map(|i| {
+                let lo = cn_out.constituent_offsets[i] as usize;
+                let hi = cn_out.constituent_offsets[i + 1] as usize;
+                let constituents: Vec<(usize, usize)> = (lo..hi)
+                    .map(|k| {
+                        (
+                            cn_out.constituent_record_idx[k] as usize,
+                            cn_out.constituent_local_allele_idx[k] as usize,
+                        )
+                    })
+                    .collect();
+                (
+                    cn_out.allele_seq(i).to_vec(),
+                    cn_out.is_compound[i],
+                    constituents,
+                )
+            })
+            .collect();
+
+        // Row-shape oracle via the existing kernel.
+        let fetcher_arc: SharedRefFetcher = Arc::new(fetcher);
+        let group = build_overlapping_variant_group(&chunk, &partition, 0, chunk.n_samples(), 0);
+        let config = PerGroupMergerConfig::new(2, 16, 64, 32).expect("merger config");
+        let iter: Vec<Result<OverlappingVariantGroup, GrouperError>> = vec![Ok(group)];
+        let mut merger = PerGroupMerger::with_config(iter.into_iter(), fetcher_arc, config);
+        let record = merger
+            .next()
+            .expect("merger yields at least one item")
+            .expect("merger succeeded");
+        let oracle: Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> = record
+            .alleles
+            .iter()
+            .map(|a| {
+                (
+                    a.seq.clone(),
+                    a.is_compound,
+                    a.constituents
+                        .iter()
+                        .map(|c| (c.record_idx, c.local_allele_idx))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        assert_eq!(cn_alleles, oracle);
     }
 
     /// A ChromRefFetcher whose every method panics — the
