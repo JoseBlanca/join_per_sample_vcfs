@@ -1,0 +1,455 @@
+//! Chunk-loop driver for the cohort var-calling pipeline.
+//!
+//! Replaces the per-chromosome `rayon::par_iter` from
+//! [`run_var_calling`](crate::pop_var_caller::var_calling::run_var_calling)
+//! with a sequential per-chromosome outer loop + a chunk-loop inner
+//! loop that uses the new columnar machinery in this module
+//! (loader, pre-pass, partition, worker). Phase A is sequential
+//! within and across chromosomes; Phase B extends to parallel
+//! windows.
+//!
+//! **Why "drive" not "iterate"** — the driver owns the persistent
+//! scratch buffers across every chunk and every chromosome
+//! (`ChunkLoadScratch`, `FixBoundariesScratch`, `PartitionScratch`,
+//! the `MaterialisedChunk` + `WindowPartition` buffers, the
+//! carryover, the per-window `Vec<PosteriorRecord>`). All of them
+//! are `clear()`-ed on every iteration and re-filled, never
+//! reallocated. This is the bulk of the memory-budget win the
+//! rewrite promises: one chunk × N samples, not T_chrom × N samples.
+//!
+//! **Downstream filters** (`is_variant_call`, `qual_phred`,
+//! `min_alt_obs_per_sample`, MAPQ-diff t-test) are applied
+//! post-EM in the driver, mirroring the streaming pipeline's drop
+//! semantics in
+//! [`drive_cohort_pipeline`](crate::pop_var_caller::cohort_driver::drive_cohort_pipeline).
+//! The same set of records is dropped from the final VCF, with
+//! the same per-category counters incremented — that's the
+//! byte-identity contract for Phase A.
+
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use thiserror::Error;
+
+use crate::fasta::StreamingChromRefFetcher;
+use crate::fasta::fetcher::ChromRefFetchError;
+use crate::psp::header::ParsedChromosome;
+use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
+use crate::var_calling::cohort_block::loader::{
+    ChunkLoadError, ChunkLoadScratch, load_chunk_from_iters,
+};
+use crate::var_calling::cohort_block::partition::{
+    PartitionError, PartitionScratch, WindowPartition, partition_window,
+};
+use crate::var_calling::cohort_block::pre_pass::{
+    FixBoundariesError, FixBoundariesScratch, fix_boundaries,
+};
+use crate::var_calling::cohort_block::worker::run_window;
+use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
+use crate::var_calling::per_group_merger::{
+    PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
+};
+use crate::var_calling::posterior_engine::{
+    PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
+};
+use crate::var_calling::variant_grouping::GrouperConfig;
+use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig, tmp_path_for};
+
+/// Default nominal genomic span per chunk, in bases. Picked to fit
+/// ~1–2 PSP blocks per sample at the median record density on
+/// tomato; the chunk-loop overhead is tiny so the exact value is
+/// not critical. Exposed as a knob in [`ChunkDriverParams`].
+pub const DEFAULT_CHUNK_GENOMIC_SPAN: u32 = 100_000;
+
+/// I/O buffer capacity for per-sample PSP `BufReader`s. Mirrors the
+/// `pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY` constant
+/// — kept local so the driver doesn't reach into the CLI module.
+const DRIVER_PSP_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Threshold from [`PerPositionMerger::record_fails_mapq_diff_t`]
+/// semantics: a side of the Welch's-t test needs at least this many
+/// supporting reads. Duplicated here so the chunk driver doesn't
+/// reach across modules.
+const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
+
+/// Per-driver tuning bundle. Carries every per-stage config the
+/// chunk loop needs.
+#[non_exhaustive]
+pub struct ChunkDriverParams {
+    pub no_complexity_filter: bool,
+    pub dust_cfg: DustFilterConfig,
+    pub grouper_cfg: GrouperConfig,
+    pub per_group_cfg: PerGroupMergerConfig,
+    pub posterior_cfg: PosteriorEngineConfig,
+    pub min_qual_phred: f64,
+    pub min_alt_obs_per_sample: u32,
+    pub no_mapq_diff_filter: bool,
+    pub min_mapq_diff_t: f32,
+    pub chunk_genomic_span: u32,
+}
+
+/// Per-driver counters; the shape mirrors
+/// [`CohortDriveStats`](crate::pop_var_caller::cohort_driver::CohortDriveStats)
+/// so the CLI summary code can consume either driver's output
+/// without a branch.
+#[derive(Debug, Default, Clone)]
+pub struct ChunkDriverStats {
+    pub records_written: u64,
+    pub records_unconverged: u64,
+    pub records_dropped_hom_ref: u64,
+    pub records_dropped_low_qual: u64,
+    pub records_dropped_low_alt_obs: u64,
+    pub records_dropped_low_mapq_diff_t: u64,
+    pub lh_cap_groups_skipped: u64,
+    pub lh_cap_alleles_in_skipped: u64,
+}
+
+/// Errors surfaced by the chunk-loop driver.
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ChunkDriverError {
+    #[error("chunk load: {0}")]
+    ChunkLoad(#[from] ChunkLoadError<PspReadError>),
+    #[error("fix_boundaries: {0}")]
+    FixBoundaries(#[from] FixBoundariesError),
+    #[error("partition_window: {0}")]
+    Partition(#[from] PartitionError),
+    #[error("posterior engine: {0}")]
+    Posterior(#[from] PosteriorEngineError),
+    #[error("per-group merger: {0}")]
+    PerGroupMerger(#[from] PerGroupMergerError),
+    #[error("reference fetch: {0}")]
+    RefFetch(#[from] ChromRefFetchError),
+    #[error("vcf write: {0}")]
+    VcfWrite(#[from] VcfWriteError),
+    #[error("psp read: {0}")]
+    PspRead(#[from] PspReadError),
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Top-level entry: drive the chunk loop across every chromosome
+/// in `chromosomes`, emitting the cohort VCF at `output`.
+///
+/// Owns the persistent scratch + the one `CohortVcfWriter` shared
+/// across chromosomes. Per-sample PSP readers are opened once and
+/// re-used across chromosomes via `PspReader::region_records`,
+/// which seeks via the block index per call.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_cohort_chunked(
+    psp_paths: &[PathBuf],
+    sample_names: Vec<String>,
+    chromosomes: Vec<ParsedChromosome>,
+    fasta_path: &Path,
+    output: &Path,
+    metadata: CohortMetadata,
+    writer_cfg: WriterConfig,
+    params: ChunkDriverParams,
+) -> Result<ChunkDriverStats, ChunkDriverError> {
+    let n_samples = sample_names.len();
+    debug_assert_eq!(psp_paths.len(), n_samples);
+
+    // Open one PSP reader per sample. Reused across chromosomes;
+    // `region_records` re-seeks via the block index per call.
+    let mut psp_readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(psp_paths.len());
+    for path in psp_paths {
+        let file = File::open(path)?;
+        let buf = BufReader::with_capacity(DRIVER_PSP_BUFFER_BYTES, file);
+        psp_readers.push(PspReader::new(buf)?);
+    }
+
+    let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
+
+    // Persistent buffers (scratch reuse across every chunk + every chrom).
+    let mut chunk_scratch = ChunkLoadScratch::with_n_samples(n_samples);
+    let mut fix_scratch = FixBoundariesScratch::new();
+    let mut partition_scratch = PartitionScratch::with_n_samples(n_samples);
+    let mut chunk = MaterialisedChunk::with_n_samples(n_samples);
+    let mut partition = WindowPartition::empty();
+    let mut carryover: Vec<SampleColumns> =
+        (0..n_samples).map(|_| SampleColumns::empty()).collect();
+    let mut output_buf: Vec<PosteriorRecord> = Vec::new();
+
+    let mut stats = ChunkDriverStats::default();
+
+    let driver_result: Result<(), ChunkDriverError> = (|| {
+        for (chrom_idx, chrom) in chromosomes.iter().enumerate() {
+            let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
+            drive_one_chrom_generic(
+                chrom_id,
+                chrom,
+                fasta_path,
+                &mut psp_readers,
+                &params,
+                &mut writer,
+                &mut stats,
+                &mut chunk_scratch,
+                &mut fix_scratch,
+                &mut partition_scratch,
+                &mut chunk,
+                &mut partition,
+                &mut carryover,
+                &mut output_buf,
+            )?;
+        }
+        writer.finish()?;
+        Ok(())
+    })();
+
+    if let Err(e) = driver_result {
+        // Best-effort cleanup of the writer's tmp file.
+        let _ = std::fs::remove_file(tmp_path_for(output));
+        return Err(e);
+    }
+
+    Ok(stats)
+}
+
+/// Apply the streaming pipeline's downstream filters to `record`
+/// in the same order; either write it to `writer` or increment the
+/// matching `stats` counter and drop it.
+fn emit_or_drop(
+    record: PosteriorRecord,
+    params: &ChunkDriverParams,
+    writer: &mut CohortVcfWriter,
+    stats: &mut ChunkDriverStats,
+) -> Result<(), ChunkDriverError> {
+    if !passes_min_alt_obs(&record, params.min_alt_obs_per_sample) {
+        stats.records_dropped_low_alt_obs += 1;
+        return Ok(());
+    }
+    if !record.is_variant_call() {
+        stats.records_dropped_hom_ref += 1;
+        return Ok(());
+    }
+    if record.qual_phred < params.min_qual_phred {
+        stats.records_dropped_low_qual += 1;
+        return Ok(());
+    }
+    if !params.no_mapq_diff_filter && record_fails_mapq_diff_t(&record, params.min_mapq_diff_t) {
+        stats.records_dropped_low_mapq_diff_t += 1;
+        return Ok(());
+    }
+    if !record.diagnostics.converged {
+        stats.records_unconverged += 1;
+    }
+    writer.write_record(&record)?;
+    stats.records_written += 1;
+    Ok(())
+}
+
+/// `min_alt_obs_per_sample` filter — same predicate as
+/// `drive_cohort_pipeline`'s `.filter_map` between merger and EM.
+/// Phase A.0 applies it post-EM (the EM has already run on the
+/// doomed record); Phase A.1's native-columnar kernel can push it
+/// back to the pre-EM boundary if perf review shows the wasted EM
+/// work matters.
+fn passes_min_alt_obs(record: &PosteriorRecord, min_obs: u32) -> bool {
+    if min_obs <= 1 || record.alleles.len() <= 1 {
+        return true;
+    }
+    let n_alleles = record.alleles.len();
+    (1..n_alleles).any(|allele_idx| {
+        let mut max_obs = 0_u32;
+        for sample_idx in 0..record.n_samples {
+            let obs = record.scalars[sample_idx * n_alleles + allele_idx].num_obs;
+            if obs > max_obs {
+                max_obs = obs;
+            }
+        }
+        max_obs >= min_obs
+    })
+}
+
+/// Welch's-t MAPQ-difference filter — direct port of the streaming
+/// driver's `record_fails_mapq_diff_t` so the chunk driver can
+/// match its drop semantics without a cross-module call.
+fn record_fails_mapq_diff_t(record: &PosteriorRecord, threshold: f32) -> bool {
+    if !threshold.is_finite() {
+        return false;
+    }
+    let n_alleles = record.alleles.len();
+    if n_alleles < 2 {
+        return false;
+    }
+    let (n_ref, sum_ref, ssq_ref) = pool_allele_mapq(record, 0);
+    if n_ref < MAPQ_FILTER_MIN_READS_PER_SIDE {
+        return false;
+    }
+    let mean_ref = sum_ref as f64 / n_ref as f64;
+    let var_ref = ((ssq_ref as f64 - (sum_ref as f64) * mean_ref).max(0.0)) / ((n_ref - 1) as f64);
+    for alt_idx in 1..n_alleles {
+        let (n_alt, sum_alt, ssq_alt) = pool_allele_mapq(record, alt_idx);
+        if n_alt < MAPQ_FILTER_MIN_READS_PER_SIDE {
+            continue;
+        }
+        let mean_alt = sum_alt as f64 / n_alt as f64;
+        let var_alt =
+            ((ssq_alt as f64 - (sum_alt as f64) * mean_alt).max(0.0)) / ((n_alt - 1) as f64);
+        let se2 = var_alt / (n_alt as f64) + var_ref / (n_ref as f64);
+        if se2 <= 0.0 {
+            continue;
+        }
+        let t = (mean_alt - mean_ref) / se2.sqrt();
+        if (t as f32) < threshold {
+            return true;
+        }
+    }
+    false
+}
+
+fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> (u64, u64, u128) {
+    let mut n: u64 = 0;
+    let mut sum: u64 = 0;
+    let mut ssq: u128 = 0;
+    for sample_idx in 0..record.n_samples {
+        let stats = &record.scalars_row(sample_idx)[allele_idx];
+        n += u64::from(stats.num_obs);
+        sum += u64::from(stats.mapq_sum);
+        ssq += stats.mapq_sum_sq as u128;
+    }
+    (n, sum, ssq)
+}
+
+/// Compute the DUST low-complexity mask for one chromosome by
+/// streaming its reference bases through `sdust_mask_streaming`
+/// once, then translating the resulting BED-style 0-based
+/// half-open slice intervals into 1-based half-open genomic
+/// intervals the partition expects.
+fn compute_dust_mask_for_chrom(
+    fetcher: &StreamingChromRefFetcher,
+    chrom_length: u32,
+    dust_cfg: &DustFilterConfig,
+) -> Result<Vec<std::ops::Range<u32>>, ChunkDriverError> {
+    use crate::fasta::fetcher::ChromRefFetcher;
+
+    let bases: Vec<u8> = fetcher
+        .iter_bases()?
+        .collect::<Result<Vec<u8>, ChromRefFetchError>>()?;
+    debug_assert_eq!(bases.len(), chrom_length as usize);
+
+    // sdust_mask_streaming takes an Iterator<Item = io::Result<u8>>;
+    // wrap the already-fetched bases to satisfy that signature.
+    let intervals = sdust_mask_streaming(
+        bases.into_iter().map(Ok::<_, io::Error>),
+        chrom_length,
+        dust_cfg.window(),
+        dust_cfg.threshold(),
+    )?;
+
+    Ok(intervals
+        .into_iter()
+        .map(|(s, e)| (s + 1)..(e + 1))
+        .collect())
+}
+
+/// Drive the chunk loop over one chromosome. Pure helper for
+/// [`drive_cohort_chunked`]; broken out so the per-chrom borrow
+/// graph is easier to read and so the function stays generic over
+/// the `PspReader`'s underlying `Read + Seek` source for testability.
+#[allow(clippy::too_many_arguments)]
+fn drive_one_chrom_generic<W>(
+    chrom_id: u32,
+    chrom: &ParsedChromosome,
+    fasta_path: &Path,
+    psp_readers: &mut [PspReader<W>],
+    params: &ChunkDriverParams,
+    writer: &mut CohortVcfWriter,
+    stats: &mut ChunkDriverStats,
+    chunk_scratch: &mut ChunkLoadScratch,
+    fix_scratch: &mut FixBoundariesScratch,
+    partition_scratch: &mut PartitionScratch,
+    chunk: &mut MaterialisedChunk,
+    partition: &mut WindowPartition,
+    carryover: &mut [SampleColumns],
+    output_buf: &mut Vec<PosteriorRecord>,
+) -> Result<(), ChunkDriverError>
+where
+    W: Read + Seek,
+{
+    let chrom_length = chrom.length;
+    if chrom_length == 0 {
+        return Ok(());
+    }
+
+    let fetcher = StreamingChromRefFetcher::for_contig(fasta_path, &chrom.name)?;
+    let masked_intervals: Vec<std::ops::Range<u32>> = if params.no_complexity_filter {
+        Vec::new()
+    } else {
+        compute_dust_mask_for_chrom(&fetcher, chrom_length, &params.dust_cfg)?
+    };
+    #[allow(clippy::arc_with_non_send_sync)]
+    let shared_fetcher: SharedRefFetcher = Arc::new(fetcher);
+
+    for c in carryover.iter_mut() {
+        c.clear();
+    }
+
+    let max_group_span = params.grouper_cfg.max_variant_group_span;
+    let chrom_one_past_end = chrom_length.saturating_add(1);
+    let last_chunk_logical_extension = max_group_span.saturating_add(2);
+
+    let mut chunk_range_start: u32 = 1;
+    let mut psp_cursor: u32 = 1;
+
+    while chunk_range_start < chrom_one_past_end {
+        let nominal_end = chunk_range_start.saturating_add(params.chunk_genomic_span);
+        let chunk_range_end = if nominal_end >= chrom_one_past_end {
+            chrom_one_past_end.saturating_add(last_chunk_logical_extension)
+        } else {
+            nominal_end
+        };
+        let psp_inclusive_end = chunk_range_end.saturating_sub(1).min(chrom_length);
+
+        let iters: Vec<_> = psp_readers
+            .iter_mut()
+            .map(|r| r.region_records(chrom_id, psp_cursor, psp_inclusive_end))
+            .collect();
+
+        load_chunk_from_iters(
+            chunk_scratch,
+            chunk,
+            chrom_id,
+            chunk_range_start..chunk_range_end,
+            iters,
+            carryover,
+        )?;
+
+        fix_boundaries(chunk, carryover, fix_scratch, max_group_span, 1)?;
+
+        let windows = chunk.windows.clone();
+        for window in &windows {
+            partition_window(
+                chunk,
+                window,
+                &masked_intervals,
+                max_group_span,
+                partition_scratch,
+                partition,
+            )?;
+            run_window(
+                chunk,
+                partition,
+                shared_fetcher.clone(),
+                params.per_group_cfg,
+                params.posterior_cfg.clone(),
+                output_buf,
+            )?;
+            for record in output_buf.drain(..) {
+                emit_or_drop(record, params, writer, stats)?;
+            }
+        }
+
+        let safe_end = chunk.safe_end;
+        if safe_end >= chrom_one_past_end {
+            break;
+        }
+        chunk_range_start = safe_end;
+        psp_cursor = chunk_range_end.min(chrom_one_past_end);
+    }
+
+    Ok(())
+}

@@ -21,6 +21,7 @@
 //!   windows, split records past `safe_end` into carryover.
 
 pub mod columns;
+pub mod driver;
 pub mod loader;
 pub mod partition;
 pub mod pre_pass;
@@ -29,6 +30,10 @@ pub(crate) mod test_helpers;
 pub mod worker;
 
 pub use columns::{MaterialisedChunk, SampleColumns};
+pub use driver::{
+    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, DEFAULT_CHUNK_GENOMIC_SPAN,
+    drive_cohort_chunked,
+};
 pub use loader::{ChunkLoadError, ChunkLoadScratch, load_chunk_from_iters};
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
 pub use pre_pass::{FixBoundariesError, FixBoundariesScratch, fix_boundaries};
