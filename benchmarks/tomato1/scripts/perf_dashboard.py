@@ -43,14 +43,31 @@ def _(mo):
 
     Two measurement pairs:
 
-    - **Full cohort from BAMs**: `ours_whole_pipeline` (parallel
-      pileup + joint var-calling) vs `freebayes` (one-shot CRAMs → VCF).
-      Both measure end-to-end time and peak RAM starting from CRAM
-      inputs.
-    - **Joint genotyping stage only** (per-sample intermediate → joint VCF):
-      `ours_joint` vs `gatk_joint`. PSP / GVCF inputs are assumed
-      pre-built; the per-sample (pileup / HaplotypeCaller) time is
-      excluded.
+    - **A. Full cohort from BAMs** (caller-vs-caller, whole process):
+      `ours_whole_pipeline` (parallel pileup + joint var-calling) vs
+      `freebayes` (one-shot CRAMs → VCF). End-to-end time and peak
+      RAM starting from CRAM inputs.
+    - **B. Per-sample intermediate** (CRAM → per-sample file):
+      `ours_pileup` (CRAM → PSP, 1 MiB blocks),
+      `ours_pileup_smallblock` (CRAM → PSP, 256 KiB blocks),
+      and `gatk_haplotype_caller` (CRAM → GVCF). All run THREADS
+      instances concurrently, each single-threaded. Block-size effect
+      on this stage is expected to be small (block target is a writer
+      flush threshold, not a working-set knob).
+    - **C. Joint genotyping stage** (per-sample intermediate → cohort VCF):
+      `ours_joint` (PSPs at 1 MiB blocks → VCF),
+      `ours_joint_smallblock` (PSPs at 256 KiB blocks → VCF),
+      and `gatk_joint` (CombineGVCFs + GenotypeGVCFs). Intermediates
+      assumed pre-built; per-sample time is excluded. This is where
+      the block-size effect should bite — the cohort reader holds one
+      decoded block per `n_threads × N` worker, so 4× smaller blocks
+      should roughly 4× lower peak heap.
+    - **D. Synthetic far-N scaling** (PSP → VCF, post-fcef495 512 KiB
+      block default): `ours_joint` (real cohort, N=1..26) +
+      `scaling_synthetic` (one tomato PSP replicated into a synthetic
+      cohort, N=50/200/1000). Same shape as Pair C, extended into the
+      range where memory linearity and CPU distribution are
+      load-bearing for future architecture decisions.
 
     Inputs: per-caller TSVs at `results/perf/<caller>.tsv`,
     written by `perf_<caller>.py`.
@@ -63,7 +80,13 @@ def _(Path):
     # tmp/dashboard.py -> tmp/  /  scripts/dashboard.py -> scripts/
     test_dir = Path(__file__).resolve().parent.parent
     perf_dir = test_dir / "results" / "perf"
-    callers = ("ours_whole_pipeline", "ours_joint", "freebayes", "gatk_joint")
+    callers = (
+        "ours_whole_pipeline",
+        "ours_pileup", "ours_pileup_smallblock",
+        "ours_joint",  "ours_joint_smallblock",
+        "freebayes", "gatk_haplotype_caller", "gatk_joint",
+        "scaling_synthetic",
+    )
     tsv_paths = {c: perf_dir / f"{c}.tsv" for c in callers}
     return callers, perf_dir, test_dir, tsv_paths
 
@@ -125,25 +148,32 @@ def _():
     # Stable colour per caller so the same caller looks the same
     # across the two pair figures.
     PALETTE = {
-        "ours_whole_pipeline": "#1f77b4",
-        "ours_joint":          "#2ca02c",
-        "freebayes":           "#d62728",
-        "gatk_joint":          "#9467bd",
+        "ours_whole_pipeline":     "#1f77b4",  # blue
+        "ours_pileup":             "#17becf",  # cyan
+        "ours_pileup_smallblock":  "#08527a",  # darker cyan/teal
+        "ours_joint":              "#2ca02c",  # green
+        "ours_joint_smallblock":   "#1a5d1a",  # darker green
+        "freebayes":               "#d62728",  # red
+        "gatk_haplotype_caller":   "#e377c2",  # pink
+        "gatk_joint":              "#9467bd",  # purple
+        "scaling_synthetic":       "#ff7f0e",  # orange
     }
 
     def plot_pair(rows_by_caller, pair, *, title, xscale_val, yscale_val):
-        """Render runtime + RSS panels for the two named callers in
-        `pair`. Both must be present in `rows_by_caller` to plot;
-        otherwise returns a markdown placeholder naming what's missing.
+        """Render runtime + RSS panels for the callers in `pair`
+        (2-or-more — supports default + smallblock variants alongside
+        the cross-tool comparison). Plots whichever callers are
+        present; reports the absent ones in a placeholder if NONE are
+        present.
 
         The two panels share the x-axis (N samples) but have
         independent y-axes — runtime and RSS are on incomparable
         scales, and yoking them via sharey=True would squash one."""
-        missing_callers = [c for c in pair if c not in rows_by_caller]
-        if missing_callers:
-            return None, missing_callers
+        present = [c for c in pair if c in rows_by_caller]
+        if not present:
+            return None, list(pair)
         fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
-        for caller in pair:
+        for caller in present:
             ok_rows = [r for r in rows_by_caller[caller] if r["exit_code"] == 0]
             if not ok_rows:
                 continue
@@ -173,11 +203,11 @@ def _():
 
 @app.cell
 def _(mo, plot_pair, rows_by_caller, xscale, yscale):
-    # Pair A — full cohort from BAMs (ours' full pipeline vs freebayes).
+    # Pair A — full cohort from BAMs (whole-process, caller vs caller).
     fig_a, missing_a = plot_pair(
         rows_by_caller,
         ("ours_whole_pipeline", "freebayes"),
-        title="Full cohort from BAMs — ours_whole_pipeline vs freebayes",
+        title="A. Full cohort from BAMs — ours_whole_pipeline vs freebayes",
         xscale_val=xscale.value,
         yscale_val=yscale.value,
     )
@@ -191,11 +221,13 @@ def _(mo, plot_pair, rows_by_caller, xscale, yscale):
 
 @app.cell
 def _(mo, plot_pair, rows_by_caller, xscale, yscale):
-    # Pair B — joint genotyping stage only (ours_joint vs gatk_joint).
+    # Pair B — per-sample intermediate (CRAM → per-sample file), both
+    # measured with THREADS-way concurrency for an apples-to-apples
+    # parallelism budget.
     fig_b, missing_b = plot_pair(
         rows_by_caller,
-        ("ours_joint", "gatk_joint"),
-        title="Joint genotyping stage only — ours_joint vs gatk_joint",
+        ("ours_pileup", "ours_pileup_smallblock", "gatk_haplotype_caller"),
+        title="B. Per-sample intermediate — ours_pileup (default + smallblock) vs gatk_haplotype_caller",
         xscale_val=xscale.value,
         yscale_val=yscale.value,
     )
@@ -205,6 +237,49 @@ def _(mo, plot_pair, rows_by_caller, xscale, yscale):
     )
     pair_b_view
     return fig_b, missing_b, pair_b_view
+
+
+@app.cell
+def _(mo, plot_pair, rows_by_caller, xscale, yscale):
+    # Pair C — joint genotyping stage only (per-sample intermediate
+    # → cohort VCF). Per-sample build time excluded.
+    fig_c, missing_c = plot_pair(
+        rows_by_caller,
+        ("ours_joint", "ours_joint_smallblock", "gatk_joint"),
+        title="C. Joint genotyping stage only — ours_joint (default + smallblock) vs gatk_joint",
+        xscale_val=xscale.value,
+        yscale_val=yscale.value,
+    )
+    pair_c_view = fig_c if fig_c is not None else mo.md(
+        "_(Pair C unavailable; missing TSV(s): "
+        + ", ".join(f"`{c}`" for c in missing_c) + ".)_"
+    )
+    pair_c_view
+    return fig_c, missing_c, pair_c_view
+
+
+@app.cell
+def _(mo, plot_pair, rows_by_caller, xscale, yscale):
+    # Pair D — far-N scaling. ours_joint covers N=1..26 from the real
+    # tomato1 cohort; scaling_synthetic extends the same shape to
+    # N=50/200/1000 by replicating one tomato PSP into a synthetic
+    # cohort. Both run the joint PSP → VCF stage end-to-end with the
+    # post-fcef495 512 KiB block default, so the two curves should
+    # extrapolate cleanly. Log-x usually wins here because of the
+    # 30× span; flip the toggle above if you prefer linear.
+    fig_d, missing_d = plot_pair(
+        rows_by_caller,
+        ("ours_joint", "scaling_synthetic"),
+        title="D. Joint stage, far-N scaling — ours_joint (N=1..26) + scaling_synthetic (N=50..1000)",
+        xscale_val=xscale.value,
+        yscale_val=yscale.value,
+    )
+    pair_d_view = fig_d if fig_d is not None else mo.md(
+        "_(Pair D unavailable; missing TSV(s): "
+        + ", ".join(f"`{c}`" for c in missing_d) + ".)_"
+    )
+    pair_d_view
+    return fig_d, missing_d, pair_d_view
 
 
 @app.cell
