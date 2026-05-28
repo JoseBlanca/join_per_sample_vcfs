@@ -1,0 +1,601 @@
+//! Columnar in-memory storage for one chunk × N samples.
+//!
+//! [`SampleColumns`] is per-sample parallel-array + CSR storage of
+//! [`PileupRecord`]-shaped data; [`MaterialisedChunk`] bundles N
+//! such columns with the chunk's chromosome, target range, the
+//! pre-pass-decided `safe_end`, and the partition into worker
+//! windows. Materialising an owned [`PileupRecord`] for one
+//! (sample, row) is on demand via [`SampleColumns::materialise_record`].
+
+use std::ops::Range;
+
+use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
+
+/// Per-sample, per-chunk columnar storage. Records are sorted by
+/// 1-based genomic `position` ascending. Per-allele data lives in
+/// CSR-laid-out flat columns indexed via [`Self::allele_offsets`].
+///
+/// **Why columnar.** PSP's on-disk blocks are already column-oriented;
+/// loading is a direct column-by-column copy with no intermediate
+/// `PileupRecord` synthesis on the read path. The chunk worker walks
+/// these columns directly; consumers that still want an owned
+/// [`PileupRecord`] get one via [`Self::materialise_record`].
+///
+/// **Per-record fixed-width columns:**
+/// - [`Self::positions`]: 1-based anchor position.
+/// - [`Self::allele_offsets`]: CSR offsets into every per-allele flat
+///   column; `[i, i+1)` gives the `i`-th record's allele range, and
+///   the final entry equals the total allele count.
+///
+/// **Per-(record, allele) fixed-width columns** — one entry per
+/// allele across all records; total length equals
+/// `allele_offsets[n_records]`:
+/// - [`Self::allele_num_obs`], [`Self::allele_q_sum`],
+///   [`Self::allele_fwd`], [`Self::allele_placed_left`],
+///   [`Self::allele_placed_start`], [`Self::allele_mapq_sum`],
+///   [`Self::allele_mapq_sum_sq`] — the 7 components of
+///   [`AlleleSupportStats`].
+///
+/// **Per-(record, allele) variable-length columns** — nested CSR:
+/// - [`Self::allele_seq_offsets`] + [`Self::allele_seq_bytes`]:
+///   allele sequence bytes.
+/// - [`Self::allele_chain_ids_offsets`] +
+///   [`Self::allele_chain_ids`]: phase-chain ids.
+///
+/// `chrom_id` is shared across the whole [`MaterialisedChunk`] and is
+/// not duplicated here.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SampleColumns {
+    pub positions: Vec<u32>,
+    pub allele_offsets: Vec<u32>,
+    pub allele_num_obs: Vec<u32>,
+    pub allele_q_sum: Vec<f64>,
+    pub allele_fwd: Vec<u32>,
+    pub allele_placed_left: Vec<u32>,
+    pub allele_placed_start: Vec<u32>,
+    pub allele_mapq_sum: Vec<u32>,
+    pub allele_mapq_sum_sq: Vec<u64>,
+    pub allele_seq_offsets: Vec<u32>,
+    pub allele_seq_bytes: Vec<u8>,
+    pub allele_chain_ids_offsets: Vec<u32>,
+    pub allele_chain_ids: Vec<ChainId>,
+}
+
+impl SampleColumns {
+    /// Empty columns ready to receive records. Both CSR offset
+    /// columns start with a single `0` so the invariant
+    /// `len(offsets) == n + 1` holds at every step.
+    pub fn empty() -> Self {
+        Self {
+            positions: Vec::new(),
+            allele_offsets: vec![0],
+            allele_num_obs: Vec::new(),
+            allele_q_sum: Vec::new(),
+            allele_fwd: Vec::new(),
+            allele_placed_left: Vec::new(),
+            allele_placed_start: Vec::new(),
+            allele_mapq_sum: Vec::new(),
+            allele_mapq_sum_sq: Vec::new(),
+            allele_seq_offsets: vec![0],
+            allele_seq_bytes: Vec::new(),
+            allele_chain_ids_offsets: vec![0],
+            allele_chain_ids: Vec::new(),
+        }
+    }
+
+    /// Number of records currently stored.
+    pub fn n_records(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// Total per-allele cells across all records.
+    pub fn n_alleles_total(&self) -> usize {
+        *self
+            .allele_offsets
+            .last()
+            .expect("CSR sentinel always present") as usize
+    }
+
+    /// Append one record's columnar data. Records must be pushed in
+    /// strictly ascending position order; debug-asserted.
+    ///
+    /// `record` is consumed; its [`AlleleObservation`] entries are
+    /// flattened into the per-(record, allele) columns.
+    pub fn push_record(&mut self, record: PileupRecord) {
+        if let Some(&prev_pos) = self.positions.last() {
+            debug_assert!(
+                record.pos > prev_pos,
+                "SampleColumns::push_record received non-monotonic position \
+                 (previous {prev_pos}, new {})",
+                record.pos,
+            );
+        }
+        self.positions.push(record.pos);
+
+        for allele in record.alleles {
+            let AlleleObservation {
+                seq,
+                support:
+                    AlleleSupportStats {
+                        num_obs,
+                        q_sum,
+                        fwd,
+                        placed_left,
+                        placed_start,
+                        mapq_sum,
+                        mapq_sum_sq,
+                        ..
+                    },
+                chain_ids,
+            } = allele;
+            self.allele_num_obs.push(num_obs);
+            self.allele_q_sum.push(q_sum);
+            self.allele_fwd.push(fwd);
+            self.allele_placed_left.push(placed_left);
+            self.allele_placed_start.push(placed_start);
+            self.allele_mapq_sum.push(mapq_sum);
+            self.allele_mapq_sum_sq.push(mapq_sum_sq);
+
+            self.allele_seq_bytes.extend_from_slice(&seq);
+            self.allele_seq_offsets
+                .push(u32_from_usize(self.allele_seq_bytes.len()));
+
+            self.allele_chain_ids.extend_from_slice(&chain_ids);
+            self.allele_chain_ids_offsets
+                .push(u32_from_usize(self.allele_chain_ids.len()));
+        }
+        self.allele_offsets
+            .push(u32_from_usize(self.allele_num_obs.len()));
+    }
+
+    /// 1-based position at row `record_idx`.
+    pub fn position_at(&self, record_idx: usize) -> u32 {
+        self.positions[record_idx]
+    }
+
+    /// Number of alleles at row `record_idx`.
+    pub fn n_alleles_at(&self, record_idx: usize) -> usize {
+        let lo = self.allele_offsets[record_idx] as usize;
+        let hi = self.allele_offsets[record_idx + 1] as usize;
+        hi - lo
+    }
+
+    /// Binary-search for a 1-based `position`. `Ok(i)` means the row
+    /// at index `i` has exactly that position; `Err(i)` is the
+    /// insertion point preserving sort order.
+    pub fn binary_search_position(&self, position: u32) -> Result<usize, usize> {
+        self.positions.binary_search(&position)
+    }
+
+    /// Materialise an owned [`PileupRecord`] for the row at
+    /// `record_idx`. Per-allele data is copied out of the columnar
+    /// storage — `Vec` allocations match what the PSP reader does on
+    /// every record emit today, so this is no worse than the
+    /// streaming path at the same boundary.
+    pub fn materialise_record(&self, chrom_id: u32, record_idx: usize) -> PileupRecord {
+        let pos = self.positions[record_idx];
+        let allele_lo = self.allele_offsets[record_idx] as usize;
+        let allele_hi = self.allele_offsets[record_idx + 1] as usize;
+        let mut alleles = Vec::with_capacity(allele_hi - allele_lo);
+        for k in allele_lo..allele_hi {
+            alleles.push(self.materialise_allele(k));
+        }
+        PileupRecord::new(chrom_id, pos, alleles)
+    }
+
+    /// Drop every record but preserve every column's allocated
+    /// capacity. CSR offset columns are reset to their single-`0`
+    /// sentinel state. Use this between iterations of the chunk loop
+    /// so the same buffer can absorb the next chunk without
+    /// reallocation.
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.allele_offsets.clear();
+        self.allele_offsets.push(0);
+        self.allele_num_obs.clear();
+        self.allele_q_sum.clear();
+        self.allele_fwd.clear();
+        self.allele_placed_left.clear();
+        self.allele_placed_start.clear();
+        self.allele_mapq_sum.clear();
+        self.allele_mapq_sum_sq.clear();
+        self.allele_seq_offsets.clear();
+        self.allele_seq_offsets.push(0);
+        self.allele_seq_bytes.clear();
+        self.allele_chain_ids_offsets.clear();
+        self.allele_chain_ids_offsets.push(0);
+        self.allele_chain_ids.clear();
+    }
+
+    /// Append the row at `src_row_idx` of `src` to `self` by copying
+    /// directly between columns — no [`PileupRecord`] is synthesised
+    /// in between. Position monotonicity is debug-asserted as in
+    /// [`Self::push_record`].
+    ///
+    /// Used by the chunk loader's compact step to move filtered
+    /// records out of a raw-load buffer into the post-filter chunk
+    /// columns without materialising rows.
+    pub fn push_row_from(&mut self, src: &SampleColumns, src_row_idx: usize) {
+        let pos = src.positions[src_row_idx];
+        if let Some(&prev_pos) = self.positions.last() {
+            debug_assert!(
+                pos > prev_pos,
+                "SampleColumns::push_row_from received non-monotonic position \
+                 (previous {prev_pos}, new {pos})",
+            );
+        }
+        self.positions.push(pos);
+
+        let allele_lo = src.allele_offsets[src_row_idx] as usize;
+        let allele_hi = src.allele_offsets[src_row_idx + 1] as usize;
+        self.allele_num_obs
+            .extend_from_slice(&src.allele_num_obs[allele_lo..allele_hi]);
+        self.allele_q_sum
+            .extend_from_slice(&src.allele_q_sum[allele_lo..allele_hi]);
+        self.allele_fwd
+            .extend_from_slice(&src.allele_fwd[allele_lo..allele_hi]);
+        self.allele_placed_left
+            .extend_from_slice(&src.allele_placed_left[allele_lo..allele_hi]);
+        self.allele_placed_start
+            .extend_from_slice(&src.allele_placed_start[allele_lo..allele_hi]);
+        self.allele_mapq_sum
+            .extend_from_slice(&src.allele_mapq_sum[allele_lo..allele_hi]);
+        self.allele_mapq_sum_sq
+            .extend_from_slice(&src.allele_mapq_sum_sq[allele_lo..allele_hi]);
+
+        let seq_lo = src.allele_seq_offsets[allele_lo] as usize;
+        let seq_hi = src.allele_seq_offsets[allele_hi] as usize;
+        let seq_base = self.allele_seq_bytes.len();
+        self.allele_seq_bytes
+            .extend_from_slice(&src.allele_seq_bytes[seq_lo..seq_hi]);
+        for k in (allele_lo + 1)..=allele_hi {
+            let inner_offset = src.allele_seq_offsets[k] as usize - seq_lo;
+            self.allele_seq_offsets
+                .push(u32_from_usize(seq_base + inner_offset));
+        }
+
+        let chain_lo = src.allele_chain_ids_offsets[allele_lo] as usize;
+        let chain_hi = src.allele_chain_ids_offsets[allele_hi] as usize;
+        let chain_base = self.allele_chain_ids.len();
+        self.allele_chain_ids
+            .extend_from_slice(&src.allele_chain_ids[chain_lo..chain_hi]);
+        for k in (allele_lo + 1)..=allele_hi {
+            let inner_offset = src.allele_chain_ids_offsets[k] as usize - chain_lo;
+            self.allele_chain_ids_offsets
+                .push(u32_from_usize(chain_base + inner_offset));
+        }
+
+        self.allele_offsets
+            .push(u32_from_usize(self.allele_num_obs.len()));
+    }
+
+    /// Reference span of the record at `record_idx` — the number of
+    /// reference bases the record's REF allele covers. By the
+    /// walker invariant `alleles[0]` is REF, so this is the byte
+    /// length of allele-index 0's `seq` (recoverable from the
+    /// nested-CSR offsets without materialising the bytes).
+    pub fn ref_span_at(&self, record_idx: usize) -> u32 {
+        let allele_lo = self.allele_offsets[record_idx] as usize;
+        let seq_lo = self.allele_seq_offsets[allele_lo];
+        let seq_hi = self.allele_seq_offsets[allele_lo + 1];
+        seq_hi - seq_lo
+    }
+
+    /// Truncate `self` to its first `keep_n_records` rows, dropping
+    /// every CSR-indexed allele payload past the cutoff. Capacities
+    /// are preserved — the CSR offset sentinels stay in place and
+    /// the underlying allocations can absorb future pushes.
+    pub fn truncate(&mut self, keep_n_records: usize) {
+        debug_assert!(
+            keep_n_records <= self.n_records(),
+            "SampleColumns::truncate cannot grow ({keep_n_records} > {})",
+            self.n_records(),
+        );
+        let allele_keep = self.allele_offsets[keep_n_records] as usize;
+        let seq_keep = self.allele_seq_offsets[allele_keep] as usize;
+        let chain_keep = self.allele_chain_ids_offsets[allele_keep] as usize;
+
+        self.positions.truncate(keep_n_records);
+        self.allele_offsets.truncate(keep_n_records + 1);
+        self.allele_num_obs.truncate(allele_keep);
+        self.allele_q_sum.truncate(allele_keep);
+        self.allele_fwd.truncate(allele_keep);
+        self.allele_placed_left.truncate(allele_keep);
+        self.allele_placed_start.truncate(allele_keep);
+        self.allele_mapq_sum.truncate(allele_keep);
+        self.allele_mapq_sum_sq.truncate(allele_keep);
+        self.allele_seq_offsets.truncate(allele_keep + 1);
+        self.allele_seq_bytes.truncate(seq_keep);
+        self.allele_chain_ids_offsets.truncate(allele_keep + 1);
+        self.allele_chain_ids.truncate(chain_keep);
+    }
+
+    /// Move rows `split_row_idx..n_records()` into `dst` (appending
+    /// in original order) and truncate `self` to `split_row_idx`
+    /// rows. Both endpoints preserve allocated capacity.
+    pub fn drain_rows_from_into(&mut self, split_row_idx: usize, dst: &mut SampleColumns) {
+        for row_idx in split_row_idx..self.n_records() {
+            dst.push_row_from(self, row_idx);
+        }
+        self.truncate(split_row_idx);
+    }
+
+    /// True when at least one allele at `record_idx` carries a
+    /// non-reference allele with `num_obs > 0`. The walker invariant
+    /// `alleles[0] == REF` means alleles at indices `>= 1` are
+    /// non-REF by construction; "any with `num_obs > 0`" is the
+    /// per-sample-per-position component of the cohort-wide
+    /// variant-position filter.
+    pub fn has_observed_non_ref_allele_at(&self, record_idx: usize) -> bool {
+        let allele_lo = self.allele_offsets[record_idx] as usize;
+        let allele_hi = self.allele_offsets[record_idx + 1] as usize;
+        // `alleles[0]` is REF; skip it. Walker invariant from
+        // `pileup_record.rs`.
+        self.allele_num_obs[(allele_lo + 1)..allele_hi]
+            .iter()
+            .any(|&n| n > 0)
+    }
+
+    fn materialise_allele(&self, allele_idx: usize) -> AlleleObservation {
+        let seq_lo = self.allele_seq_offsets[allele_idx] as usize;
+        let seq_hi = self.allele_seq_offsets[allele_idx + 1] as usize;
+        let chain_lo = self.allele_chain_ids_offsets[allele_idx] as usize;
+        let chain_hi = self.allele_chain_ids_offsets[allele_idx + 1] as usize;
+        let support = AlleleSupportStats::new(
+            self.allele_num_obs[allele_idx],
+            self.allele_q_sum[allele_idx],
+            self.allele_fwd[allele_idx],
+            self.allele_placed_left[allele_idx],
+            self.allele_placed_start[allele_idx],
+            self.allele_mapq_sum[allele_idx],
+            self.allele_mapq_sum_sq[allele_idx],
+        );
+        AlleleObservation::new(
+            self.allele_seq_bytes[seq_lo..seq_hi].to_vec(),
+            support,
+            self.allele_chain_ids[chain_lo..chain_hi].to_vec(),
+        )
+    }
+}
+
+/// One genomic chunk × N samples worth of [`SampleColumns`] plus the
+/// pre-pass-decided boundaries.
+///
+/// **Lifecycle.**
+/// 1. The chunk loader produces a chunk with
+///    `safe_end = range.end` and `windows` empty — the load already
+///    applied the cohort-wide variant-position filter.
+/// 2. `fix_boundaries` walks the loaded chunk once, picks
+///    `safe_end ≤ range.end` so no variant group can span the right
+///    boundary into the next chunk, and partitions
+///    `[range.start, safe_end)` into the [`Self::windows`] list. At
+///    T=1 the partition is a single window; T>1 places T-1 internal
+///    boundaries in safe gaps.
+/// 3. Workers process [`Self::windows`] in parallel; each worker
+///    runs the full pipeline on its window and emits final
+///    `PosteriorRecord`s.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterialisedChunk {
+    pub chrom_id: u32,
+    /// `[G_start, G_end)` — the initial target range. May be revised
+    /// down to a `safe_end ≤ G_end` by `fix_boundaries`.
+    pub range: Range<u32>,
+    /// Right boundary chosen by the pre-pass. Records at positions
+    /// `>= safe_end` are split into the carryover passed to the next
+    /// chunk's load.
+    pub safe_end: u32,
+    /// Partition of `[range.start, safe_end)` into disjoint windows
+    /// produced by `fix_boundaries`. Tile the chunk left-to-right;
+    /// each window is processed by one worker.
+    pub windows: Vec<Range<u32>>,
+    /// One [`SampleColumns`] per sample, sample-index aligned with
+    /// the cohort's `psp_paths`.
+    pub per_sample: Vec<SampleColumns>,
+}
+
+impl MaterialisedChunk {
+    /// Materialise the row at `record_idx` of `sample_idx`, mounting
+    /// the chunk's `chrom_id`.
+    pub fn materialise_record(&self, sample_idx: usize, record_idx: usize) -> PileupRecord {
+        self.per_sample[sample_idx].materialise_record(self.chrom_id, record_idx)
+    }
+
+    /// Number of samples represented by this chunk.
+    pub fn n_samples(&self) -> usize {
+        self.per_sample.len()
+    }
+
+    /// Construct an empty chunk pre-sized for `n_samples`. The
+    /// per-sample columns are empty, `range` is `0..0`, `safe_end`
+    /// is `0`, and `windows` is empty — the loader and pre-pass
+    /// will populate them.
+    pub fn with_n_samples(n_samples: usize) -> Self {
+        Self {
+            chrom_id: 0,
+            range: 0..0,
+            safe_end: 0,
+            windows: Vec::new(),
+            per_sample: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
+        }
+    }
+
+    /// Reset every record / window / range field but preserve all
+    /// allocated column capacity. The chunk loader calls this before
+    /// loading the next chunk; the driver holds one persistent
+    /// `MaterialisedChunk` across iterations.
+    pub fn clear_data(&mut self) {
+        self.chrom_id = 0;
+        self.range = 0..0;
+        self.safe_end = 0;
+        self.windows.clear();
+        for sample in &mut self.per_sample {
+            sample.clear();
+        }
+    }
+}
+
+/// Convert a `usize` length into a `u32` CSR offset. The PSP format
+/// already caps per-chunk record counts well below `u32::MAX`; a
+/// debug assertion catches any accidental overflow in tests, and
+/// release builds wrap silently — same contract as PSP's CSR writers.
+#[inline]
+pub(crate) fn u32_from_usize(value: usize) -> u32 {
+    debug_assert!(
+        value <= u32::MAX as usize,
+        "CSR offset exceeds u32::MAX ({value})",
+    );
+    value as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::var_calling::cohort_block::test_helpers::{allele, record, ref_plus_alt};
+
+    #[test]
+    fn empty_columns_carry_csr_sentinels() {
+        let columns = SampleColumns::empty();
+        assert_eq!(columns.n_records(), 0);
+        assert_eq!(columns.n_alleles_total(), 0);
+        assert_eq!(columns.allele_offsets, vec![0]);
+        assert_eq!(columns.allele_seq_offsets, vec![0]);
+        assert_eq!(columns.allele_chain_ids_offsets, vec![0]);
+    }
+
+    #[test]
+    fn push_record_round_trips_via_materialise() {
+        let mut columns = SampleColumns::empty();
+        let r1 = record(
+            10,
+            vec![
+                allele(b"A", 12, -1.5, &[1, 7]),
+                allele(b"AT", 3, -0.5, &[42]),
+            ],
+        );
+        let r2 = record(15, vec![allele(b"G", 8, -1.1, &[])]);
+
+        columns.push_record(r1.clone());
+        columns.push_record(r2.clone());
+
+        assert_eq!(columns.n_records(), 2);
+        assert_eq!(columns.n_alleles_total(), 3);
+        assert_eq!(columns.n_alleles_at(0), 2);
+        assert_eq!(columns.n_alleles_at(1), 1);
+
+        assert_eq!(columns.materialise_record(0, 0), r1);
+        assert_eq!(columns.materialise_record(0, 1), r2);
+    }
+
+    #[test]
+    fn binary_search_position_finds_present_and_absent_rows() {
+        let mut columns = SampleColumns::empty();
+        for pos in [10_u32, 15, 22, 23, 40] {
+            columns.push_record(record(pos, vec![allele(b"A", 1, -1.0, &[])]));
+        }
+        assert_eq!(columns.binary_search_position(10), Ok(0));
+        assert_eq!(columns.binary_search_position(23), Ok(3));
+        assert_eq!(columns.binary_search_position(11), Err(1));
+        assert_eq!(columns.binary_search_position(50), Err(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-monotonic position")]
+    fn push_record_rejects_non_monotonic_positions_in_debug() {
+        let mut columns = SampleColumns::empty();
+        columns.push_record(record(10, vec![allele(b"A", 1, -1.0, &[])]));
+        columns.push_record(record(10, vec![allele(b"A", 1, -1.0, &[])]));
+    }
+
+    #[test]
+    fn materialised_chunk_dispatches_record_to_per_sample_columns() {
+        let mut s0 = SampleColumns::empty();
+        s0.push_record(record(100, vec![allele(b"A", 5, -2.0, &[1])]));
+        let mut s1 = SampleColumns::empty();
+        s1.push_record(record(100, vec![allele(b"T", 7, -1.0, &[2])]));
+
+        let chunk = MaterialisedChunk {
+            chrom_id: 3,
+            range: 90..200,
+            safe_end: 200,
+            windows: vec![90..200],
+            per_sample: vec![s0, s1],
+        };
+        assert_eq!(chunk.n_samples(), 2);
+        let r0 = chunk.materialise_record(0, 0);
+        let r1 = chunk.materialise_record(1, 0);
+        assert_eq!(r0.chrom_id, 3);
+        assert_eq!(r0.alleles[0].seq, b"A".to_vec());
+        assert_eq!(r1.alleles[0].seq, b"T".to_vec());
+    }
+
+    #[test]
+    fn clear_preserves_csr_sentinels_and_capacity() {
+        let mut columns = SampleColumns::empty();
+        for pos in [10_u32, 12, 14] {
+            columns.push_record(record(pos, vec![allele(b"A", 5, -1.0, &[1])]));
+        }
+        let positions_cap_before = columns.positions.capacity();
+        columns.clear();
+        assert_eq!(columns.n_records(), 0);
+        assert_eq!(columns.n_alleles_total(), 0);
+        assert_eq!(columns.allele_offsets, vec![0]);
+        assert_eq!(columns.allele_seq_offsets, vec![0]);
+        assert_eq!(columns.allele_chain_ids_offsets, vec![0]);
+        assert!(columns.positions.capacity() >= positions_cap_before);
+    }
+
+    #[test]
+    fn push_row_from_preserves_record_payload() {
+        let mut src = SampleColumns::empty();
+        let r1 = record(
+            10,
+            vec![
+                allele(b"A", 12, -1.5, &[1, 7]),
+                allele(b"AT", 3, -0.5, &[42]),
+            ],
+        );
+        let r2 = record(15, vec![allele(b"G", 8, -1.1, &[3, 9, 11])]);
+        src.push_record(r1.clone());
+        src.push_record(r2.clone());
+
+        let mut dst = SampleColumns::empty();
+        dst.push_row_from(&src, 0);
+        dst.push_row_from(&src, 1);
+        assert_eq!(dst.n_records(), 2);
+        assert_eq!(dst.materialise_record(0, 0), r1);
+        assert_eq!(dst.materialise_record(0, 1), r2);
+    }
+
+    #[test]
+    fn truncate_drops_rows_and_keeps_csr_consistent() {
+        let mut columns = SampleColumns::empty();
+        for pos in [10_u32, 12, 14, 16] {
+            columns.push_record(record(pos, ref_plus_alt(3, 4)));
+        }
+        assert_eq!(columns.n_records(), 4);
+        columns.truncate(2);
+        assert_eq!(columns.n_records(), 2);
+        assert_eq!(columns.n_alleles_total(), 4); // 2 alleles × 2 rows
+        assert_eq!(columns.materialise_record(0, 0).pos, 10);
+        assert_eq!(columns.materialise_record(0, 1).pos, 12);
+        // Push more — the truncated buffer must accept ascending
+        // positions cleanly.
+        columns.push_record(record(20, ref_plus_alt(2, 3)));
+        assert_eq!(columns.n_records(), 3);
+        assert_eq!(columns.materialise_record(0, 2).pos, 20);
+    }
+
+    #[test]
+    fn drain_rows_from_into_moves_tail_preserving_round_trip() {
+        let mut src = SampleColumns::empty();
+        for pos in [10_u32, 12, 14, 16] {
+            src.push_record(record(pos, ref_plus_alt(3, 4)));
+        }
+        let mut dst = SampleColumns::empty();
+        src.drain_rows_from_into(2, &mut dst);
+        assert_eq!(src.n_records(), 2);
+        assert_eq!(dst.n_records(), 2);
+        assert_eq!(dst.materialise_record(0, 0).pos, 14);
+        assert_eq!(dst.materialise_record(0, 1).pos, 16);
+    }
+}
