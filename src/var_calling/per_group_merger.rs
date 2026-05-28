@@ -1791,11 +1791,11 @@ fn build_chain_anchor_flags(unified: &UnifiedAlleleSet, n_samples: usize) -> Vec
 
 /// Locus + ploidy context bundle threaded through likelihood
 /// computation so callers don't pass six positional `u32`/`u8`s.
-struct LikelihoodContext {
-    chrom_id: u32,
-    start: u32,
-    end: u32,
-    ploidy: u8,
+pub struct LikelihoodContext {
+    pub chrom_id: u32,
+    pub start: u32,
+    pub end: u32,
+    pub ploidy: u8,
 }
 
 /// Compute the flat row-major log-likelihood table. Returns
@@ -2057,7 +2057,7 @@ fn chain_broken_log_likelihood(
 
 /// `0 · log 0 = 0`. Matches the convention used in
 /// `genotype_posteriors.rs` and the architecture spec.
-fn xlogy(n: f64, p: f64) -> f64 {
+pub(crate) fn xlogy(n: f64, p: f64) -> f64 {
     if n == 0.0 { 0.0 } else { n * p.ln() }
 }
 
@@ -2091,7 +2091,7 @@ static LN_FACTORIAL_TABLE: std::sync::LazyLock<Vec<f64>> = std::sync::LazyLock::
 /// `ln(n!)` — O(1) for `n < LN_FACTORIAL_TABLE_SIZE` via lookup,
 /// O(n − table_size) for larger `n` via continued iterative summation
 /// from the last tabled value.
-fn ln_factorial(n: u64) -> f64 {
+pub(crate) fn ln_factorial(n: u64) -> f64 {
     let n_usize = n as usize;
     if n_usize < LN_FACTORIAL_TABLE_SIZE {
         return LN_FACTORIAL_TABLE[n_usize];

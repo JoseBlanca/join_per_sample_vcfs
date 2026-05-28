@@ -10,12 +10,15 @@
 //! 1. [`unify_alleles`] — column-native allele unification:
 //!    per-position projection, chain-anchored compound detection,
 //!    max-alleles cap. Phase A.1 layer 1.
-//! 2. *Per-(sample, allele) stats gather* (layer 2; queued).
-//! 3. *Log-likelihood computation* (layer 3; queued).
+//! 2. [`project_scalars`] — per-(sample, allele) `AlleleSupportStats`
+//!    projection. Phase A.1 layer 2.
+//! 3. [`compute_log_likelihoods`] — per-(sample, genotype) closed-form
+//!    log-likelihood plus chain-broken fallback. Phase A.1 layer 3.
 //! 4. *EM* (layer 4; queued).
 //!
 //! Each layer is byte-identity-tested against the existing kernel's
 //! output on the same input as it lands.
 
+pub mod compute_log_likelihoods;
 pub mod project_scalars;
 pub mod unify_alleles;

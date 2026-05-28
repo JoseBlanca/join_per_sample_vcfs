@@ -503,7 +503,7 @@ fn subtract_compound_from_constituents_columnar(
 /// in the group — the row-shape kernel skips silently in the same
 /// case (the source pointer would be missing in
 /// `per_sample_sources`).
-fn read_support_stats(
+pub(crate) fn read_support_stats(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     group_position_lo: usize,
@@ -511,19 +511,12 @@ fn read_support_stats(
     sample_idx: usize,
     local_allele_idx: usize,
 ) -> Option<AlleleSupportStats> {
-    let p = group_position_lo + record_idx_in_group;
-    let sample_range = partition.sample_range_for_position(p);
-    // Linear scan over `samples_at_pos` at this position to find
-    // `sample_idx` → row_idx. The slice is small (one entry per
-    // sample-with-a-record-at-this-position) so the scan is fast.
-    let mut row_idx: Option<usize> = None;
-    for k in sample_range {
-        if partition.samples_at_pos[k] as usize == sample_idx {
-            row_idx = Some(partition.rows_at_pos[k] as usize);
-            break;
-        }
-    }
-    let row_idx = row_idx?;
+    let row_idx = locate_sample_row_idx(
+        partition,
+        group_position_lo,
+        record_idx_in_group,
+        sample_idx,
+    )?;
     let sample = &chunk.per_sample[sample_idx];
     Some(read_support_stats_from_columns(
         sample,
@@ -532,10 +525,41 @@ fn read_support_stats(
     ))
 }
 
+/// Find `sample_idx`'s row index in `chunk.per_sample[sample_idx]` for
+/// the position located at `group_position_lo + record_idx_in_group`.
+/// Returns `None` if the sample has no record at that position.
+pub(crate) fn locate_sample_row_idx(
+    partition: &WindowPartition,
+    group_position_lo: usize,
+    record_idx_in_group: usize,
+    sample_idx: usize,
+) -> Option<usize> {
+    let p = group_position_lo + record_idx_in_group;
+    let sample_range = partition.sample_range_for_position(p);
+    // Linear scan over `samples_at_pos` at this position to find
+    // `sample_idx` → row_idx. The slice is small (one entry per
+    // sample-with-a-record-at-this-position) so the scan is fast.
+    for k in sample_range {
+        if partition.samples_at_pos[k] as usize == sample_idx {
+            return Some(partition.rows_at_pos[k] as usize);
+        }
+    }
+    None
+}
+
+/// Number of alleles emitted at `sample`'s `row_idx` row, derived
+/// from the CSR `allele_offsets`. Used by the chain-broken-compound
+/// path of layer 3 to iterate the row's per-allele stats.
+pub(crate) fn n_local_alleles_at_row(sample: &SampleColumns, row_idx: usize) -> usize {
+    let lo = sample.allele_offsets[row_idx] as usize;
+    let hi = sample.allele_offsets[row_idx + 1] as usize;
+    hi - lo
+}
+
 /// Extract the 7-component `AlleleSupportStats` for the allele at
 /// `(row_idx, local_allele_idx)` from `sample`'s parallel column
 /// vectors.
-fn read_support_stats_from_columns(
+pub(crate) fn read_support_stats_from_columns(
     sample: &SampleColumns,
     row_idx: usize,
     local_allele_idx: usize,

@@ -395,10 +395,7 @@ mod tests {
         // because they fall inside sample 0's record's reach (10..12).
         let s0 = vec![record(
             10,
-            vec![
-                allele(b"AAA", 5, -1.0, &[]),
-                allele(b"ACA", 4, -1.0, &[]),
-            ],
+            vec![allele(b"AAA", 5, -1.0, &[]), allele(b"ACA", 4, -1.0, &[])],
         )];
         let s1 = vec![
             record(10, vec![ref_obs(7)]),

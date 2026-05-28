@@ -282,6 +282,70 @@ shape `print_run_summary` consumes.
 
 Net diff for the rewire: +54 / -79 in [var_calling.rs](../../../src/pop_var_caller/var_calling.rs).
 
+### Phase A.1 column-native kernels (in progress)
+
+New module
+[`src/var_calling/cohort_block/kernels/`](../../../src/var_calling/cohort_block/kernels/)
+hosts each layer as its own submodule, byte-identity-tested against
+the row-shape kernels.
+
+- **Layer 1 — allele unification.**
+  [`kernels/unify_alleles.rs`](../../../src/var_calling/cohort_block/kernels/unify_alleles.rs)
+  (commits `1645933` → `446075f`). Output:
+  [`UnifiedAllelesColumns`](../../../src/var_calling/cohort_block/kernels/unify_alleles.rs)
+  — CSR seq + chain-anchor counts (`n_alleles × n_samples` flat) +
+  compound constituents + per-sample source pointers + OTHER pool
+  pointers. Four sub-passes (per-position projection, compound
+  admission, max-alleles cap, kept-indices serialisation). Byte-identity-tested
+  against `PerGroupMerger`'s `MergedAlleleSet`.
+- **Layer 2 — per-(sample, allele) scalar projection.**
+  [`kernels/project_scalars.rs`](../../../src/var_calling/cohort_block/kernels/project_scalars.rs)
+  (commit `49c8408`). Output:
+  [`ProjectedScalarsColumns`](../../../src/var_calling/cohort_block/kernels/project_scalars.rs)
+  — flat sample-major `scalars[sample × n_kept]` matrix + per-sample
+  `other_scalars`. Four sub-passes (per-position sum, OTHER pool,
+  compound projection with homogeneous-quality approximation, compound-
+  constituent clamped subtraction). Byte-identity-tested against
+  `MergedRecord.scalars` + `.other_scalars`.
+- **Layer 3 — per-(sample, genotype) log-likelihood.**
+  [`kernels/compute_log_likelihoods.rs`](../../../src/var_calling/cohort_block/kernels/compute_log_likelihoods.rs)
+  (this commit). Output:
+  [`LogLikelihoodsColumns`](../../../src/var_calling/cohort_block/kernels/compute_log_likelihoods.rs)
+  — flat sample-major `log_likelihoods[sample × n_genotypes]` + the
+  resolved `n_genotypes`. Standard closed-form multinomial path reads
+  from layer 2's projection; chain-broken-compound fallback walks the
+  compound's constituents and reads each constituent position's
+  per-allele stats directly from the chunk's per-sample columns.
+  Byte-identity-tested against `MergedRecord.log_likelihoods` on
+  no-compound, multi-position, with-compound, and cap-fires fixtures.
+
+  **Shared math helpers:** `ln_factorial`, `xlogy` bumped to
+  `pub(crate)`; `LikelihoodContext` bumped to `pub` (held back from
+  `pub(crate)` only because the visibility lint requires the kernel's
+  parameter types to match its own `pub` visibility); `genotype_order`
+  and `MAX_BITMASK_ALLELES` were already public. All live in
+  [`per_group_merger.rs`](../../../src/var_calling/per_group_merger.rs).
+
+- **Layer 4 — native EM.** Queued.
+- **Wiring + byte-identity diff + perf review.** Queued.
+
+### Toolchain-bump clippy debt (out-of-scope for this branch)
+
+The rustup channel resolved to `1.95.0` between layer 2 and layer 3.
+1.95 elevates 17 pre-existing lints to errors in this module (mostly
+`single_range_in_vec_init`, `type_complexity`,
+`assert_eq!`-with-literal-bool, `doc_lazy_continuation` in test
+helpers / worker test code / `unify_alleles` tests / `partition`
+tests). These are not regressions introduced by the columnar
+rewrite; they are pre-existing warnings the prior toolchain didn't
+treat as `-D warnings`. Layer 3's `cargo clippy --lib --tests --
+-D warnings` count is 17, identical to clean HEAD.
+
+Ratchet pass queued as a separate workstream (it touches
+`columns.rs`, `partition.rs`, `loader.rs`, `kernels/unify_alleles.rs`,
+`test_helpers.rs`, `worker.rs` test code — none on the hot path or
+the columnar API surface). Does not gate Phase A.1 layer 4.
+
 ## Validation status
 
 - `cargo fmt --check` — clean across the branch.
