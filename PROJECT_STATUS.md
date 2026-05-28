@@ -19,7 +19,77 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **BAM-input review fixes applied** —
+> - **Last completed task:** **Within-chromosome chunk-parallel
+>   rewrite — plan landed.**
+>   [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md).
+>   Drafted on `main` after a multi-round design discussion driven
+>   by the
+>   [2026-05-27 scaling measurement](doc/devel/reports/reviews/scaling_measurement_2026-05-27.md).
+>   Two-stage work in one focused session:
+>   **(1) Scaling measurement** (commit `0c854ab`). New sweep driver
+>   at
+>   [benchmarks/tomato1/scripts/perf_scaling_synthetic.py](benchmarks/tomato1/scripts/perf_scaling_synthetic.py)
+>   replicates one tomato PSP into synthetic cohorts at
+>   N=50/200/1000; captures bare wall + peak RSS, samply CPU
+>   profile parsed inline via an atos-based symbolicator for
+>   per-module CPU share, dhat heap profile inside the dev
+>   container (`DEV_MEM=48g`, `MAX_DHAT_N=200`). Per-N artefacts
+>   under `tmp/scaling_synthetic/`; three TSVs at
+>   `benchmarks/tomato1/results/perf/scaling_synthetic{,_cpu,_heap}.tsv`;
+>   new Pair D panel on
+>   [perf_dashboard.py](benchmarks/tomato1/scripts/perf_dashboard.py).
+>   Headlines: peak RSS is **linear at ~16.5 MB/sample** on
+>   synthetic data (4.5× the brief's predicted 3.6 MB/sample;
+>   N=5000 would need 40–80 GB depending on real-vs-synthetic
+>   spread); `posterior_engine` inclusive CPU
+>   **0.5 / 2.5 / 10.8 %** across N=50/200/1000 — squarely in the
+>   "rewrite pays back" decision band by N=1000;
+>   `per_group_merger` 58–68 % at every N (biggest single bucket);
+>   `dust_filter` 48–62 % (N-independent reference scan,
+>   removable via the deferred cached-BED follow-up);
+>   `per_position_merger` and `psp_reader` both grow ~16 % →
+>   ~44 % with N; allocator share grows 11 → 38 % with N. The
+>   four-question methodology in §4 of the report gives concrete
+>   answers and a Recommendation #1: per-variant-group
+>   parallelism for the merger + EM (combined ~68 % inclusive at
+>   N=1000; Amdahl predicts ~2× wall reduction at T=4); memory
+>   is the binding constraint for N ≥ 5000 on a single 64 GB host.
+>   **(2) Architectural rewrite plan** (this commit). Replaces
+>   H1's per-chromosome `rayon::par_iter` with a within-chromosome
+>   chunk-based architecture. Load one genomic chunk × N samples
+>   into memory, apply a **cohort-wide variant-position filter**
+>   (drop positions where no sample carries any non-reference
+>   allele — ~30–100× per-chunk record reduction on real cohorts),
+>   run a `fix_boundaries` pre-pass that picks the chunk's
+>   `safe_end` and partitions `[range.start, safe_end)` into
+>   windows whose boundaries fall in `max_group_span`-wide safe
+>   gaps. Spawn T workers, each running **the full pipeline**
+>   (per_position_merger + variant_grouper + per_group_merger +
+>   posterior_engine EM) on its window — workers are fully
+>   autonomous (no canonical-position rule, no inter-worker
+>   coordination); final variant records stream directly to
+>   `vcf_writer` in window-index order per chunk, no per-chrom
+>   buffer, no per-cohort buffer, no global EM post-pass. Both
+>   `MaterialisedChunk.SampleColumns` and the worker-local
+>   `GroupedVariantsBatch` are **columnar from Phase A** (parallel
+>   arrays + CSR for ragged dimensions, matching PSP's on-disk
+>   layout — loader does a column-copy with no intermediate row
+>   synthesis); `PileupRecordRef<'a>` borrowed-view type preserves
+>   existing merger call shapes. File-descriptor budget is
+>   OS-managed via `setrlimit` at startup, fail-fast on raise
+>   rejection (no software fallback — OS does this job well).
+>   Four phases: **A** (chunk loader + filter + pre-pass at T=1,
+>   byte-identical), **B** (parallel windows at T=4,
+>   byte-identical — headline A/B point vs `main`), **C**
+>   (pipelined chunk loading), **D** (perf-review-skill pass +
+>   SIMD optimisations the columnar layout enables).
+>   **Byte-identical VCFs vs `main` is a hard requirement**;
+>   memory and wall numbers are data-driven decisions at the
+>   Phase B comparison point. Implementation lands on feature
+>   branch `cohort-within-chromosome-parallel` cut from this
+>   commit; the plan stays on `main` as the spec (plan revisions
+>   land on `main` first; the branch rebases).
+> - **Previous task:** **BAM-input review fixes applied** —
 >   [fixes_applied_2026-05-24.md](doc/devel/reports/reviews/fixes_applied_2026-05-24.md).
 >   Status: **Completed.** 10 fix commits (`9fc1df0` → `7a8569b`):
 >   every Major (M1–M19) Applied; 13 of 22 Minors Applied;
@@ -54,13 +124,13 @@ Skills and agents are instructed to leave it untouched.
 >   Validation: `cargo fmt --check` / `cargo clippy --all-targets
 >   --all-features -D warnings` / `cargo test` all clean. Per-finding
 >   ledger + every commit hash in §2/§4 of the fixes report.
-> - **Previous task:** **Code review of the BAM input
+> - **Previous-previous task:** **Code review of the BAM input
 >   slice** —
 >   [bam_input_support_2026-05-24.md](doc/devel/reports/reviews/bam_input_support_2026-05-24.md).
 >   Verdict: **Approve-with-changes** (0 Blockers, 19 Major, 22
 >   Minor, grouped Nits) — now all closed by the fix run above
 >   (every Major Applied; 7 Minors Deferred per scope decision).
-> - **Previous-previous task:** **BAM input support** (commits
+> - **Earlier — BAM input:** **BAM input support** (commits
 >   `b87ec89` → `18a9b9e` → `266e79a` → `4ad1e04` → `630ac7c` →
 >   `a4d1f6d` → `bee6bc1` → `d0af049` → `344f1b2` → `be3b38a`) —
 >   impl report
@@ -325,19 +395,30 @@ Skills and agents are instructed to leave it untouched.
 >   (original slice),
 >   [pop_var_caller_cohort_cli_followup.md](doc/devel/implementation_plans/pop_var_caller_cohort_cli_followup.md)
 >   (five-wave deferred follow-up).
-> - **Next task:** _set by human PM._ Standing candidates: the
->   manual `bcftools view` / `bcftools stats` smoke against real
->   cohort data (the synthetic fixture in the integration tests is
->   too tiny to be meaningful); write the still-pending Stage 5
->   implementation report; re-bench the full Wave-1 set on a
->   quieter host with a clean pre-perf-review checkout baseline;
->   apply the remaining Hot-path findings from the perf review —
->   H5 (`DEFAULT_BATCH_SIZE` sweep), H6 (Stage 4 bench
->   fixture-rebuild fix), H7 (cohort-size sweep); the
->   parallelisation-tuning pass deferred until after the cohort CLI
->   (rayon-over-records, `--per-group-batch-size` exposure); pick
->   up the standing items below (BED-region skip, phase-chain
->   integration tests).
+> - **Next task:** _set by human PM._ Cut feature branch
+>   `cohort-within-chromosome-parallel` from current `main` and
+>   execute **Phase A** of the rewrite plan: columnar
+>   `MaterialisedChunk` with `SampleColumns` + CSR per-allele
+>   layout, single-threaded `load_chunk` (load → filter →
+>   compact, with `ChromRefFetcher` for the per-position variant
+>   predicate), `fix_boundaries` pre-pass (allele-extent +
+>   max_group_span gap detection with carryover to next chunk),
+>   `PileupRecordRef<'a>` borrowed-view type, columnar
+>   `GroupedVariantsBatch` accumulator inside each worker,
+>   chunk-loop driver, byte-identical VCFs at T=1 against the
+>   existing `tests/cohort_cli_integration.rs` fixture.
+>   **Pre-implementation spike:** confirm `posterior_engine`'s
+>   M-step is purely intra-group so the EM can live inside each
+>   worker (the per-window-EM design hinges on this; bake a
+>   regression test for the invariant once confirmed).
+>   Standing candidates that fall off this critical path:
+>   **DUST → BED cache** (trivial, can land on `main`
+>   independently any time per the plan's Open-work section);
+>   **SQUAREM EM acceleration** (may fall out of Phase D); manual
+>   `bcftools view` / `bcftools stats` smoke against real cohort
+>   data; pending Stage 5 implementation report; remaining
+>   Hot-path findings from the 2026-05-16 perf review (H5/H6/H7);
+>   BED-region skip; phase-chain integration tests.
 
 ---
 
