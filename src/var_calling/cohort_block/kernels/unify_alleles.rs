@@ -11,12 +11,13 @@
 //! without per-emit allocation.
 //!
 //! **Sub-step progress.** 1.0 (types), 1.1 (per-position
-//! projection — [`project_per_position_alleles_columnar`]), and
-//! 1.2 (compound detection + admission — composed in
-//! [`unify_alleles_columnar`]) have landed; 1.3 (max-alleles cap)
-//! is queued. Until layer 1.4 wires the assembled kernel into the
-//! worker, this code is reachable only through its own unit tests;
-//! the Phase A.0 row-shape adapter remains the production path.
+//! projection — [`project_per_position_alleles_columnar`]), 1.2
+//! (compound detection + admission), and 1.3 (max-alleles cap —
+//! composed in [`unify_alleles_columnar`]) have landed. Layer 1.4
+//! wires the assembled kernel into the worker as the production
+//! allele-set path; until then, this code is reachable only through
+//! its own unit tests, and the Phase A.0 row-shape adapter remains
+//! the production path.
 
 use std::collections::BTreeMap;
 
@@ -272,9 +273,20 @@ pub struct UnifyAllelesScratch {
     /// allocation-preserved for re-use.
     pub(crate) working_alleles: Vec<WorkingAllele>,
     /// Logical length of [`Self::working_alleles`] for the current
-    /// group. Serialisation reads exactly the first
-    /// `n_active_alleles` entries.
+    /// group. Serialisation reads exactly the kept indices
+    /// (see [`Self::kept_indices`]).
     pub(crate) n_active_alleles: usize,
+    /// Indices into [`Self::working_alleles`] that survive the
+    /// max-alleles cap (sub-step 1.3) in original order. Populated by
+    /// [`enforce_max_alleles_columnar`]; for groups where the cap
+    /// did not fire, this is simply `0..n_active_alleles`. The
+    /// serialiser uses this list, not `0..n_active_alleles`, to
+    /// write the output columns.
+    pub(crate) kept_indices: Vec<usize>,
+    /// Per-sample OTHER pool — pooled `(record_idx, local_allele_idx)`
+    /// pairs from cap-dropped alleles. Length is `n_samples` after
+    /// each call; empty when the cap did not drop anything.
+    pub(crate) other_per_sample: Vec<Vec<(u32, u32)>>,
 }
 
 impl UnifyAllelesScratch {
@@ -293,6 +305,10 @@ impl UnifyAllelesScratch {
             slot.reset(0);
         }
         self.n_active_alleles = 0;
+        self.kept_indices.clear();
+        for cell in self.other_per_sample.iter_mut() {
+            cell.clear();
+        }
     }
 
     /// Return a `&mut` to the next working-allele slot, growing the
@@ -337,7 +353,15 @@ pub enum UnifyAllelesError {
 /// Serialise the working alleles in `scratch` into the column-native
 /// output. Called at the end of each per-group unification by
 /// callers that built up `WorkingAllele` entries during projection
-/// and compound admission.
+/// + compound admission + the max-alleles cap.
+///
+/// Iterates [`UnifyAllelesScratch::kept_indices`] (not the full
+/// pool) so cap-dropped alleles are excluded from the output;
+/// [`UnifyAllelesScratch::other_per_sample`] is written into the
+/// OTHER columns at the end. When the cap did not fire,
+/// `other_per_sample` is empty and the OTHER offset column gets
+/// `n_samples + 1` zero entries so layer-2 consumers can index
+/// without an empty-check.
 pub(crate) fn serialize_working_to_columns(
     scratch: &UnifyAllelesScratch,
     n_samples: usize,
@@ -345,8 +369,8 @@ pub(crate) fn serialize_working_to_columns(
 ) {
     out.clear();
     out.n_samples = n_samples;
-    let active = scratch.n_active_alleles;
-    for working in scratch.working_alleles.iter().take(active) {
+    for &i in &scratch.kept_indices {
+        let working = &scratch.working_alleles[i];
         out.is_compound.push(working.is_compound);
         out.cap_protected.push(working.cap_protected);
         out.cohort_count.push(working.cohort_count);
@@ -362,8 +386,10 @@ pub(crate) fn serialize_working_to_columns(
         out.chain_anchor_counts
             .extend_from_slice(&working.chain_anchor_counts);
     }
-    // Source CSR — walk (allele, sample) in allele-major order.
-    for working in scratch.working_alleles.iter().take(active) {
+    // Source CSR — walk (allele, sample) in allele-major order over
+    // the kept alleles.
+    for &i in &scratch.kept_indices {
+        let working = &scratch.working_alleles[i];
         for cell in working.sources_per_sample.iter().take(n_samples) {
             for &(rec, loc) in cell {
                 out.source_record_idx.push(rec);
@@ -372,8 +398,96 @@ pub(crate) fn serialize_working_to_columns(
             out.source_offsets.push(out.source_record_idx.len() as u32);
         }
     }
-    // OTHER pool empty in sub-step 1.2 (lands in 1.3).
-    out.other_offsets.resize(n_samples + 1, 0);
+    // OTHER pool CSR — per-sample sources from cap-dropped alleles.
+    if scratch.other_per_sample.is_empty() {
+        out.other_offsets.resize(n_samples + 1, 0);
+    } else {
+        for cell in scratch.other_per_sample.iter().take(n_samples) {
+            for &(rec, loc) in cell {
+                out.other_record_idx.push(rec);
+                out.other_local_allele_idx.push(loc);
+            }
+            out.other_offsets.push(out.other_record_idx.len() as u32);
+        }
+    }
+}
+
+/// Phase A.1 sub-step 1.3 — max-alleles cap. Populates
+/// [`UnifyAllelesScratch::kept_indices`] with the surviving
+/// allele indices in original order, and
+/// [`UnifyAllelesScratch::other_per_sample`] with the per-sample
+/// `(record_idx, local_allele_idx)` pairs pooled from cap-dropped
+/// alleles. Mirrors `enforce_max_alleles` in
+/// [`per_group_merger`](crate::var_calling::per_group_merger):
+/// protected alleles (REF + chain-anchored compounds) always
+/// survive; among prunable alleles the top
+/// `max_alleles - protected_count` by `cohort_count` survive.
+pub(crate) fn enforce_max_alleles_columnar(
+    scratch: &mut UnifyAllelesScratch,
+    n_samples: usize,
+    max_alleles: usize,
+) {
+    let n_active = scratch.n_active_alleles;
+
+    // Default: keep all in original order.
+    scratch.kept_indices.clear();
+    scratch.kept_indices.extend(0..n_active);
+
+    if n_active <= max_alleles {
+        return;
+    }
+
+    // Partition into prunable indices (sorted by descending
+    // cohort_count) and protected count.
+    let mut prunable: Vec<usize> = (0..n_active)
+        .filter(|&i| !scratch.working_alleles[i].cap_protected)
+        .collect();
+    prunable.sort_by_key(|&i| std::cmp::Reverse(scratch.working_alleles[i].cohort_count));
+    let protected_count = n_active - prunable.len();
+    let budget_for_prunable = max_alleles.saturating_sub(protected_count);
+
+    if prunable.len() <= budget_for_prunable {
+        return;
+    }
+
+    // Mark cap-dropped indices.
+    let to_remove_sorted = {
+        let mut v: Vec<usize> = prunable[budget_for_prunable..].to_vec();
+        v.sort_unstable();
+        v
+    };
+
+    // Rebuild kept_indices in original order, skipping dropped.
+    scratch.kept_indices.clear();
+    {
+        let mut drop_cursor = 0;
+        for i in 0..n_active {
+            if drop_cursor < to_remove_sorted.len() && to_remove_sorted[drop_cursor] == i {
+                drop_cursor += 1;
+                continue;
+            }
+            scratch.kept_indices.push(i);
+        }
+    }
+
+    // Build OTHER pool from dropped alleles' per-sample sources.
+    if scratch.other_per_sample.len() < n_samples {
+        scratch.other_per_sample.resize_with(n_samples, Vec::new);
+    }
+    for cell in scratch.other_per_sample.iter_mut().take(n_samples) {
+        cell.clear();
+    }
+    for &dropped in &to_remove_sorted {
+        let working = &scratch.working_alleles[dropped];
+        for (s, sources) in working
+            .sources_per_sample
+            .iter()
+            .enumerate()
+            .take(n_samples)
+        {
+            scratch.other_per_sample[s].extend(sources.iter().copied());
+        }
+    }
 }
 
 /// Phase A.1 sub-step 1.1 — per-position allele projection.
@@ -428,6 +542,10 @@ pub fn project_per_position_alleles_columnar(
 ) {
     scratch.clear();
     project_per_position_into_scratch(chunk, partition, group_idx, ref_seq, n_samples, scratch);
+    // No cap in this sub-step — kept_indices is just the full active
+    // range so the serialiser writes everything.
+    scratch.kept_indices.clear();
+    scratch.kept_indices.extend(0..scratch.n_active_alleles);
     serialize_working_to_columns(scratch, n_samples, out);
 }
 
@@ -814,21 +932,30 @@ fn project_compound_onto_group_columnar(
 }
 
 /// Full column-native allele unifier — composes sub-steps 1.1
-/// (per-position projection) and 1.2 (compound detection +
-/// admission). The max-alleles cap (sub-step 1.3) is queued; until
-/// it lands, `out`'s `other_*` columns stay empty.
+/// (per-position projection), 1.2 (compound detection + admission),
+/// and 1.3 (max-alleles cap).
+///
+/// `max_alleles` is the cap on the kept-allele count. When the cap
+/// fires, the lowest-`cohort_count` non-protected alleles are
+/// dropped and their per-sample `(record_idx, local_allele_idx)`
+/// sources are folded into the OTHER pool (written to the
+/// `other_*` columns of `out`). REF and chain-anchored compounds
+/// are protected.
+#[allow(clippy::too_many_arguments)]
 pub fn unify_alleles_columnar(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     group_idx: usize,
     ref_seq: &[u8],
     n_samples: usize,
+    max_alleles: usize,
     scratch: &mut UnifyAllelesScratch,
     out: &mut UnifiedAllelesColumns,
 ) -> Result<(), UnifyAllelesError> {
     scratch.clear();
     project_per_position_into_scratch(chunk, partition, group_idx, ref_seq, n_samples, scratch);
     admit_compound_candidates_columnar(chunk, partition, group_idx, ref_seq, n_samples, scratch)?;
+    enforce_max_alleles_columnar(scratch, n_samples, max_alleles);
     serialize_working_to_columns(scratch, n_samples, out);
     Ok(())
 }
@@ -1361,6 +1488,7 @@ mod tests {
             0,
             &ref_seq,
             chunk.n_samples(),
+            16, // max_alleles — generous so cap never fires
             &mut scratch,
             &mut out,
         )
@@ -1392,6 +1520,7 @@ mod tests {
             0,
             &ref_seq,
             chunk.n_samples(),
+            16, // max_alleles — generous so cap never fires
             &mut scratch,
             &mut out,
         )
@@ -1402,6 +1531,217 @@ mod tests {
         let oracle = unified_alleles_with_constituents(&chunk, &partition, 0, fetcher);
 
         assert_eq!(new_alleles, oracle);
+    }
+
+    #[test]
+    fn unify_max_alleles_cap_drops_lowest_cohort_count_prunables() {
+        // Four ALTs at the same position with descending cohort_count;
+        // max_alleles = 2 (REF + 1 ALT). Only the highest-count ALT
+        // survives; the others' (record_idx, local_allele_idx) pairs
+        // go into the OTHER pool.
+        let alts = vec![
+            AlleleObservation::new(
+                b"A".to_vec(),
+                AlleleSupportStats::new(10, -1.0, 10, 0, 0, 0, 0),
+                Vec::new(),
+            ),
+            AlleleObservation::new(
+                b"T".to_vec(),
+                AlleleSupportStats::new(8, -1.0, 8, 0, 0, 0, 0),
+                Vec::new(),
+            ),
+            AlleleObservation::new(
+                b"C".to_vec(),
+                AlleleSupportStats::new(3, -1.0, 3, 0, 0, 0, 0),
+                Vec::new(),
+            ),
+            AlleleObservation::new(
+                b"G".to_vec(),
+                AlleleSupportStats::new(2, -1.0, 2, 0, 0, 0, 0),
+                Vec::new(),
+            ),
+            AlleleObservation::new(
+                b"N".to_vec(),
+                AlleleSupportStats::new(1, -1.0, 1, 0, 0, 0, 0),
+                Vec::new(),
+            ),
+        ];
+        let s0 = vec![PileupRecord::new(0, 50, alts)];
+        let ref_full = vec![b'A'; 200];
+        let (chunk, partition, ref_seq) = group_fixture(vec![s0], &ref_full, 1..200, 50);
+
+        let mut scratch = UnifyAllelesScratch::new();
+        let mut out = UnifiedAllelesColumns::empty();
+        unify_alleles_columnar(
+            &chunk,
+            &partition,
+            0,
+            &ref_seq,
+            chunk.n_samples(),
+            2, // max_alleles — REF + 1 ALT
+            &mut scratch,
+            &mut out,
+        )
+        .expect("unify succeeded");
+
+        // Cap survivors: REF (allele 0, A — the first non-REF allele
+        // in the record's alleles array is "A" which dedupes into REF)
+        // … wait — the first allele in the PileupRecord's alleles
+        // array is the REF, and in this fixture I wrote it as "A".
+        // The actual REF comes from `ref_seq[0]` which is also "A",
+        // so they dedupe.
+        //
+        // After dedup REF=A counts: REF own (10 in alleles[0]) +
+        // alleles[1..] that project to A; here alleles[1]="T" projects
+        // to T (different), so no other allele projects to A.
+        //
+        // Among non-REF projections (T, C, G, N — each with one sample
+        // source), the highest is T with cohort_count=8.
+        assert_eq!(out.n_alleles(), 2);
+        assert_eq!(out.allele_seq(0), b"A");
+        assert_eq!(out.cap_protected[0], true);
+        assert_eq!(out.allele_seq(1), b"T");
+        assert_eq!(out.cap_protected[1], false);
+
+        // OTHER pool: 3 dropped ALTs (C, G, N), each carrying one
+        // source pair (record_idx=0, local_allele_idx in 2..5).
+        let (lo, hi) = out.other_range(0);
+        let other_pairs: Vec<(u32, u32)> = (lo..hi)
+            .map(|k| (out.other_record_idx[k], out.other_local_allele_idx[k]))
+            .collect();
+        // Sort for stable comparison — the pool order isn't externally
+        // contracted, only the set is.
+        let mut sorted = other_pairs.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![(0, 2), (0, 3), (0, 4)]);
+    }
+
+    #[test]
+    fn unify_max_alleles_cap_protects_compound_even_with_low_count() {
+        // Sample 0 has two SNPs sharing chain_id=1 → compound (low
+        // cohort_count). Sample 1 has many high-count single SNPs.
+        // With max_alleles=3 the compound stays (protected) even
+        // though its count is lower than the dropped SNPs.
+        //
+        // Build via: sample 0 has SNPs at pos 100 (REF=A,ALT=T,
+        // chain=1) and pos 102 (REF=A,ALT=G, chain=1). Sample 1 has
+        // an MNP at pos 100 ref_span=3 to join positions, plus extra
+        // ALTs at pos 100 that compete on cohort_count.
+        let mnp_rec = PileupRecord::new(
+            0,
+            100,
+            vec![
+                AlleleObservation::new(
+                    b"ACA".to_vec(),
+                    AlleleSupportStats::new(20, -1.0, 20, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"TCA".to_vec(),
+                    AlleleSupportStats::new(15, -1.0, 15, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"GCA".to_vec(),
+                    AlleleSupportStats::new(12, -1.0, 12, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+            ],
+        );
+        let snp_100 = PileupRecord::new(
+            0,
+            100,
+            vec![
+                AlleleObservation::new(
+                    b"A".to_vec(),
+                    AlleleSupportStats::new(2, -1.0, 2, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"T".to_vec(),
+                    AlleleSupportStats::new(1, -1.0, 1, 0, 0, 0, 0),
+                    vec![1],
+                ),
+            ],
+        );
+        let snp_102 = PileupRecord::new(
+            0,
+            102,
+            vec![
+                AlleleObservation::new(
+                    b"A".to_vec(),
+                    AlleleSupportStats::new(2, -1.0, 2, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"G".to_vec(),
+                    AlleleSupportStats::new(1, -1.0, 1, 0, 0, 0, 0),
+                    vec![1],
+                ),
+            ],
+        );
+        let s0 = vec![snp_100, snp_102];
+        let s1 = vec![mnp_rec];
+        let mut ref_full = vec![b'A'; 200];
+        ref_full[99] = b'A';
+        ref_full[100] = b'C';
+        ref_full[101] = b'A';
+        let (chunk, partition, ref_seq) = group_fixture(vec![s0, s1], &ref_full, 1..200, 50);
+        assert_eq!(ref_seq.as_slice(), b"ACA");
+
+        // Byte-identity against the row-shape kernel — both should
+        // produce the same compound-protected output.
+        let mut scratch = UnifyAllelesScratch::new();
+        let mut out = UnifiedAllelesColumns::empty();
+        unify_alleles_columnar(
+            &chunk,
+            &partition,
+            0,
+            &ref_seq,
+            chunk.n_samples(),
+            3, // max_alleles — tight to force the cap
+            &mut scratch,
+            &mut out,
+        )
+        .expect("unify succeeded");
+        let new_alleles = columnar_alleles_with_constituents(&out);
+
+        let fetcher = shared_mock(&ref_full, 1);
+        let oracle = {
+            let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
+                &chunk,
+                &partition,
+                0,
+                chunk.n_samples(),
+                chunk.chrom_id,
+            );
+            // Use max_alleles=3 in the oracle config too.
+            let config = PerGroupMergerConfig::new(2, 3, 64, 32).expect("merger config");
+            let iter: Vec<Result<OverlappingVariantGroup, GrouperError>> = vec![Ok(group)];
+            let mut merger = PerGroupMerger::with_config(iter.into_iter(), fetcher, config);
+            let record = merger
+                .next()
+                .expect("merger yields at least one item")
+                .expect("merger succeeded");
+            record
+                .alleles
+                .iter()
+                .map(|a| {
+                    (
+                        a.seq.clone(),
+                        a.is_compound,
+                        a.constituents
+                            .iter()
+                            .map(|c| (c.record_idx, c.local_allele_idx))
+                            .collect::<Vec<(usize, usize)>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(new_alleles, oracle);
+        // Confirm compound is present.
+        assert!(out.is_compound.iter().any(|&x| x));
     }
 
     #[test]
