@@ -41,15 +41,11 @@ use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns
 use crate::var_calling::cohort_block::loader::{
     ChunkLoadError, ChunkLoadScratch, load_chunk_from_iters,
 };
-use crate::var_calling::cohort_block::partition::{
-    PartitionError, PartitionScratch, WindowPartition, partition_window,
-};
+use crate::var_calling::cohort_block::partition::{PartitionError, partition_window};
 use crate::var_calling::cohort_block::pre_pass::{
     FixBoundariesError, FixBoundariesScratch, fix_boundaries,
 };
-use crate::var_calling::cohort_block::worker::{
-    ColumnarPipelineScratch, prefetch_window_ref_bytes, run_window,
-};
+use crate::var_calling::cohort_block::worker::{WorkerPool, prefetch_window_ref_bytes, run_window};
 use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
 use crate::var_calling::per_group_merger::{
     PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
@@ -190,13 +186,10 @@ pub fn drive_cohort_chunked(
     // Persistent buffers (scratch reuse across every chunk + every chrom).
     let mut chunk_scratch = ChunkLoadScratch::with_n_samples(n_samples);
     let mut fix_scratch = FixBoundariesScratch::new();
-    let mut partition_scratch = PartitionScratch::with_n_samples(n_samples);
     let mut chunk = MaterialisedChunk::with_n_samples(n_samples);
-    let mut partition = WindowPartition::empty();
     let mut carryover: Vec<SampleColumns> =
         (0..n_samples).map(|_| SampleColumns::empty()).collect();
-    let mut output_buf: Vec<PosteriorRecord> = Vec::new();
-    let mut worker_scratch = ColumnarPipelineScratch::empty();
+    let mut worker_pool = WorkerPool::empty();
 
     let mut stats = ChunkDriverStats::default();
 
@@ -213,12 +206,9 @@ pub fn drive_cohort_chunked(
                 &mut stats,
                 &mut chunk_scratch,
                 &mut fix_scratch,
-                &mut partition_scratch,
                 &mut chunk,
-                &mut partition,
                 &mut carryover,
-                &mut output_buf,
-                &mut worker_scratch,
+                &mut worker_pool,
             )?;
         }
         writer.finish()?;
@@ -387,12 +377,9 @@ fn drive_one_chrom_generic<W>(
     stats: &mut ChunkDriverStats,
     chunk_scratch: &mut ChunkLoadScratch,
     fix_scratch: &mut FixBoundariesScratch,
-    partition_scratch: &mut PartitionScratch,
     chunk: &mut MaterialisedChunk,
-    partition: &mut WindowPartition,
     carryover: &mut [SampleColumns],
-    output_buf: &mut Vec<PosteriorRecord>,
-    worker_scratch: &mut ColumnarPipelineScratch,
+    worker_pool: &mut WorkerPool,
 ) -> Result<(), ChunkDriverError>
 where
     W: Read + Seek,
@@ -450,13 +437,10 @@ where
             stats,
             chunk_scratch,
             fix_scratch,
-            partition_scratch,
             chunk,
-            partition,
             carryover,
             &mut carryover_snapshot,
-            output_buf,
-            worker_scratch,
+            worker_pool,
             max_group_span,
         )?;
 
@@ -504,13 +488,10 @@ fn load_and_run_chunk_with_retry<W>(
     stats: &mut ChunkDriverStats,
     chunk_scratch: &mut ChunkLoadScratch,
     fix_scratch: &mut FixBoundariesScratch,
-    partition_scratch: &mut PartitionScratch,
     chunk: &mut MaterialisedChunk,
-    partition: &mut WindowPartition,
     carryover: &mut [SampleColumns],
     carryover_snapshot: &mut [SampleColumns],
-    output_buf: &mut Vec<PosteriorRecord>,
-    worker_scratch: &mut ColumnarPipelineScratch,
+    worker_pool: &mut WorkerPool,
     max_group_span: u32,
 ) -> Result<u32, ChunkDriverError>
 where
@@ -587,32 +568,45 @@ where
     }
 
     let windows = chunk.windows.clone();
-    // Reusable per-window REF-bytes buffer — capacity carries across
-    // windows.
-    let mut pre_fetched_ref_bytes: Vec<Vec<u8>> = Vec::new();
-    for window in &windows {
+    let n_windows = windows.len();
+    let n_samples = chunk.n_samples();
+    worker_pool.ensure_capacity(n_windows.max(1), n_samples);
+
+    // ── Per-window math (sequential today; Phase B step 4 swaps
+    //    this loop for a rayon par_iter over `worker_pool.slots`). ──
+    for (window, slot) in windows.iter().zip(worker_pool.slots.iter_mut()) {
         partition_window(
             chunk,
             window,
             masked_intervals,
             max_group_span,
-            partition_scratch,
-            partition,
+            &mut slot.partition_scratch,
+            &mut slot.partition,
         )?;
-        prefetch_window_ref_bytes(partition, &*shared_fetcher, &mut pre_fetched_ref_bytes)?;
+        prefetch_window_ref_bytes(
+            &slot.partition,
+            &*shared_fetcher,
+            &mut slot.pre_fetched_ref_bytes,
+        )?;
         run_window(
             chunk,
-            partition,
-            &pre_fetched_ref_bytes,
+            &slot.partition,
+            &slot.pre_fetched_ref_bytes,
             params.per_group_cfg,
             params.posterior_cfg.clone(),
-            worker_scratch,
-            output_buf,
+            &mut slot.scratch,
+            &mut slot.output_buf,
         )?;
-        let (cap_g, cap_a) = worker_scratch.take_lh_cap_stats();
+    }
+
+    // ── Sequential drain in window order — preserves the prior
+    //    per-record emit order even when step 4 runs the workers
+    //    concurrently. ──
+    for slot in worker_pool.slots.iter_mut().take(n_windows) {
+        let (cap_g, cap_a) = slot.scratch.take_lh_cap_stats();
         stats.lh_cap_groups_skipped += cap_g;
         stats.lh_cap_alleles_in_skipped += cap_a;
-        for record in output_buf.drain(..) {
+        for record in slot.output_buf.drain(..) {
             emit_or_drop(record, params, writer, stats)?;
         }
     }
