@@ -40,6 +40,8 @@ use crate::var_calling::cohort_block::partition::WindowPartition;
 /// - [`Self::other_scalars`] — one entry per sample; the pooled
 ///   contributions from alleles dropped by the max-alleles cap.
 ///   Length is `n_samples`.
+// Mi1: `#[non_exhaustive]` — kernel-output columns.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedScalarsColumns {
     pub n_samples: usize,

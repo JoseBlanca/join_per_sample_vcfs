@@ -134,7 +134,15 @@ pub fn fix_boundaries(
     for sample in &chunk.per_sample {
         for row_idx in 0..sample.n_records() {
             let pos = sample.position_at(row_idx);
-            let reach = pos + sample.ref_span_at(row_idx) - 1;
+            // M26: `ref_span` is `>= 1` by the `PileupRecord` walker
+            // invariant (`alleles[0]` is REF with `seq.len() >= 1`),
+            // but PSP is a disk-derived boundary and a corrupted /
+            // future-extended record could in principle deliver a
+            // zero-length REF. Saturate to avoid silent underflow in
+            // release builds.
+            let reach = pos
+                .saturating_add(sample.ref_span_at(row_idx).max(1))
+                .saturating_sub(1);
             scratch.timeline.push((pos, reach));
         }
     }
@@ -200,6 +208,11 @@ fn pick_safe_end(
     // Case A — the gap from the rightmost record to range.end is
     // already wide enough, and no allele reaches into / past
     // range.end. safe_end = range.end (no carryover).
+    //
+    // M25 PANIC-FREE: the empty-timeline early return above means
+    // `scratch.timeline` is non-empty here. `prefix_max_reach` is
+    // populated 1:1 from `timeline` upstream in this function, so
+    // both `.last()` calls return `Some(_)`.
     let last_pos = scratch.timeline.last().unwrap().0;
     let overall_max_reach = *scratch.prefix_max_reach.last().unwrap();
     if chunk.range.end > last_pos

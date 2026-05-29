@@ -44,7 +44,16 @@ use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, Pileu
 ///
 /// `chrom_id` is shared across the whole [`MaterialisedChunk`] and is
 /// not duplicated here.
-#[derive(Debug, Clone, Default, PartialEq)]
+// Mi1: `#[non_exhaustive]` so external callers must use the
+// `SampleColumns::empty()` / `Default::default()` factories (both
+// produce the CSR-sentinel-seeded invariant-honoring state) rather
+// than struct-literal construction. M1: hand-written `Default`
+// delegating to `empty()` — the derived `Default` would have
+// produced empty offset columns missing the `vec![0]` CSR sentinel
+// and tripped `n_alleles_total()`'s `expect("CSR sentinel always
+// present")`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SampleColumns {
     pub positions: Vec<u32>,
     pub allele_offsets: Vec<u32>,
@@ -59,6 +68,17 @@ pub struct SampleColumns {
     pub allele_seq_bytes: Vec<u8>,
     pub allele_chain_ids_offsets: Vec<u32>,
     pub allele_chain_ids: Vec<ChainId>,
+}
+
+impl Default for SampleColumns {
+    /// M1: delegate to [`Self::empty`] — the derived `Default` would
+    /// produce empty offset columns missing the `vec![0]` CSR
+    /// sentinel and break every consumer that calls
+    /// [`Self::n_alleles_total`] or indexes
+    /// `allele_offsets[record_idx + 1]`.
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl SampleColumns {
@@ -395,6 +415,11 @@ impl SampleColumns {
 /// 3. Workers process [`Self::windows`] in parallel; each worker
 ///    runs the full pipeline on its window and emits final
 ///    `PosteriorRecord`s.
+// Mi1: `#[non_exhaustive]` — external callers construct via
+// `MaterialisedChunk::with_n_samples(n)` (or the test-only struct
+// literal). Future column additions land without breaking out-of-crate
+// struct-literal sites.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaterialisedChunk {
     pub chrom_id: u32,

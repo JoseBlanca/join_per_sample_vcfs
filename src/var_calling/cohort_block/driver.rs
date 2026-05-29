@@ -26,12 +26,10 @@
 //! the same per-category counters incremented — that's the
 //! byte-identity contract for Phase A.
 
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::fasta::StreamingChromRefFetcher;
@@ -48,9 +46,7 @@ use crate::var_calling::cohort_block::pre_pass::{
 };
 use crate::var_calling::cohort_block::worker::{WorkerPool, prefetch_window_ref_bytes, run_window};
 use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
-use crate::var_calling::per_group_merger::{
-    PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
-};
+use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
@@ -115,6 +111,10 @@ pub struct ChunkDriverParams {
 /// [`CohortDriveStats`](crate::pop_var_caller::cohort_driver::CohortDriveStats)
 /// so the CLI summary code can consume either driver's output
 /// without a branch.
+// Mi1: `#[non_exhaustive]` — driver-level counter struct; future
+// per-stage counts can be added without breaking out-of-crate
+// consumers.
+#[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct ChunkDriverStats {
     pub records_written: u64,
@@ -335,6 +335,11 @@ pub fn drive_cohort_chunked(
     // rather than silently swallowed.
     let driver_result: Result<(), ChunkDriverError> = (|| {
         for (chrom_idx, chrom) in chromosomes.iter().enumerate() {
+            // M25 PANIC-FREE: `chrom_idx` comes from
+            // `chromosomes.iter().enumerate()` where `chromosomes`
+            // originates from the PSP header. PSP `chrom_id`s are
+            // `u32` by file-format definition, so the contig table
+            // never exceeds `u32::MAX` entries.
             let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
             drive_one_chrom_generic(
                 chrom_id,
@@ -574,8 +579,13 @@ where
     } else {
         compute_dust_mask_for_chrom(&fetcher, &chrom.name, chrom_length, &params.dust_cfg)?
     };
-    #[allow(clippy::arc_with_non_send_sync)]
-    let shared_fetcher: SharedRefFetcher = Arc::new(fetcher);
+    // Mi9: borrow the per-chrom fetcher through the retry helper instead
+    // of wrapping it in an `Arc<dyn …>`. The fetcher is owned by this
+    // function, has exactly one consumer (`prefetch_window_ref_bytes`'s
+    // sequential pre-pass), and never crosses the rayon `par_iter_mut`
+    // boundary — the parallel block reads only the per-slot
+    // `pre_fetched_ref_bytes`. The previous shape carried an Arc with
+    // an `#[allow(clippy::arc_with_non_send_sync)]` justifying it.
 
     for c in carryover.iter_mut() {
         c.clear();
@@ -610,7 +620,7 @@ where
             max_span,
             psp_readers,
             &masked_intervals,
-            shared_fetcher.clone(),
+            &fetcher,
             params,
             writer,
             stats,
@@ -661,7 +671,7 @@ fn load_and_run_chunk_with_retry<W>(
     max_span: u32,
     psp_readers: &mut [PspReader<W>],
     masked_intervals: &[std::ops::Range<u32>],
-    shared_fetcher: SharedRefFetcher,
+    ref_fetcher: &dyn crate::fasta::fetcher::ChromRefFetcher,
     params: &ChunkDriverParams,
     writer: &mut CohortVcfWriter,
     stats: &mut ChunkDriverStats,
@@ -757,8 +767,13 @@ where
         }
     }
 
-    let windows = chunk.windows.clone();
-    let n_windows = windows.len();
+    // Mi10: iterate `chunk.windows` directly — the loop body's only
+    // `chunk` access is the immutable read `partition_window(chunk,
+    // window, …)`, which is a shared reborrow under modern Rust's
+    // NLL. The previous `chunk.windows.clone()` was a defensive copy
+    // that allocated a fresh `Vec<Range<u32>>` per chunk for no
+    // borrow-checker reason.
+    let n_windows = chunk.windows.len();
     let n_samples = chunk.n_samples();
     worker_pool.ensure_capacity(n_windows.max(1), n_samples);
 
@@ -767,10 +782,8 @@ where
     //    in parallel; the partition could, but it's cheap relative
     //    to the math and parallelising it would add rayon overhead
     //    for little gain. ──
-    for (window, slot) in windows
-        .iter()
-        .zip(worker_pool.slots.iter_mut().take(n_windows))
-    {
+    for (window_idx, slot) in worker_pool.slots.iter_mut().take(n_windows).enumerate() {
+        let window = &chunk.windows[window_idx];
         partition_window(
             chunk,
             window,
@@ -782,7 +795,7 @@ where
         .map_err(|source| ChunkDriverError::Partition { chrom_id, source })?;
         prefetch_window_ref_bytes(
             &slot.partition,
-            &*shared_fetcher,
+            ref_fetcher,
             &mut slot.pre_fetched_ref_bytes,
         )
         .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
@@ -804,7 +817,7 @@ where
                 &slot.partition,
                 &slot.pre_fetched_ref_bytes,
                 per_group_cfg,
-                posterior_cfg.clone(),
+                posterior_cfg,
                 &mut slot.scratch,
                 &mut slot.output_buf,
             )

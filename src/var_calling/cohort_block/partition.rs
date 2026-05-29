@@ -85,6 +85,9 @@ use crate::var_calling::cohort_block::columns::{MaterialisedChunk, u32_from_usiz
 /// **Lifecycle:** the driver holds one persistent `WindowPartition`
 /// across every window in every chunk. [`Self::clear`] resets it
 /// without freeing the underlying allocations.
+// Mi1: `#[non_exhaustive]` — external callers construct via
+// `WindowPartition::empty()` / `Default::default()`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowPartition {
     pub chrom_id: u32,
@@ -372,8 +375,10 @@ pub fn partition_window(
         for (s, sample) in chunk.per_sample.iter().enumerate() {
             let cursor = scratch.sample_cursors[s];
             if cursor < sample.n_records() && sample.position_at(cursor) == pos {
-                let ref_span = sample.ref_span_at(cursor);
-                pos_reach = pos_reach.max(pos + ref_span - 1);
+                // M26: saturate over `ref_span = 0` (the walker
+                // invariant says `>= 1`, but PSP is disk-derived).
+                let ref_span = sample.ref_span_at(cursor).max(1);
+                pos_reach = pos_reach.max(pos.saturating_add(ref_span).saturating_sub(1));
                 out.samples_at_pos.push(u32_from_usize(s));
                 out.rows_at_pos.push(u32_from_usize(cursor));
                 scratch.sample_cursors[s] = cursor + 1;

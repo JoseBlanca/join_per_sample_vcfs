@@ -77,6 +77,9 @@ impl ChunkLoadScratch {
 /// Per-chunk diagnostic stats returned by
 /// [`load_chunk_from_iters`]. Drivers fold these into their own
 /// cumulative counters; callers that don't care can drop the value.
+// Mi1: `#[non_exhaustive]` — counter struct; future per-chunk stats
+// can be added without breaking out-of-crate consumers.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkLoadStats {
     /// Number of cohort-wide positions kept by the variant filter —
@@ -217,8 +220,20 @@ where
             end: range_start,
         });
     }
-    let effective_initial_span = initial_span.min(max_span.max(initial_span));
-    let max_attempt_end = range_start.saturating_add(max_span.max(effective_initial_span));
+    // M8: validate the load-extent contract instead of silently
+    // upgrading a too-small `max_span` to `initial_span` (the previous
+    // `initial_span.min(max_span.max(initial_span))` was structurally
+    // `initial_span`, masking a caller bug). Today's driver passes
+    // `max_load_span >= initial_load_span` (B3), so this branch is
+    // unreachable on the production path; the explicit error pins
+    // the API contract for future callers.
+    if max_span < initial_span {
+        return Err(ChunkLoadError::InvalidRange {
+            start: range_start,
+            end: range_start.saturating_add(max_span),
+        });
+    }
+    let max_attempt_end = range_start.saturating_add(max_span);
 
     scratch.clear();
     out.clear_data();
@@ -247,7 +262,7 @@ where
         .into_iter()
         .map(|iter| iter.into_iter().peekable())
         .collect();
-    let mut attempt_end = range_start.saturating_add(effective_initial_span);
+    let mut attempt_end = range_start.saturating_add(initial_span);
     let mut variant_count: u32;
     loop {
         let clamped_end = attempt_end.min(max_attempt_end);
@@ -463,6 +478,11 @@ where
                 iter.next();
             }
             PullDecision::Consume => {
+                // M25 PANIC-FREE: `decision` was set from
+                // `iter.peek()` above, which returned `Some(Ok(_))`
+                // for this branch. `Peekable` guarantees the next
+                // `next()` returns the same `Some(Ok(_))`; no other
+                // mutation occurred (we hold `&mut iter` exclusively).
                 let record = iter
                     .next()
                     .and_then(Result::ok)
@@ -470,6 +490,9 @@ where
                 raw.push_record(record);
             }
             PullDecision::SurfaceUpstreamErr => {
+                // M25 PANIC-FREE: same invariant as Consume — `peek`
+                // returned `Some(Err(_))` for this branch, so `next`
+                // returns the same `Some(Err(_))`.
                 let err = iter
                     .next()
                     .and_then(Result::err)

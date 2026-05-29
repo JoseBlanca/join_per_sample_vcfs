@@ -238,13 +238,21 @@ impl WorkerPool {
 ///   slot and reuses it across every window in every chunk.
 /// - `output`: appended-to record buffer. Cleared on entry so the
 ///   driver can reuse it across windows.
+// Mi11: take `posterior_cfg` by `&` — nothing inside `run_window`
+// needs ownership (the function only borrows the config to forward
+// into `build_posterior_record_columnar`'s `&PosteriorEngineConfig`
+// parameter). The previous by-value shape forced the driver's rayon
+// dispatch to `posterior_cfg.clone()` per worker slot, even though
+// `PosteriorEngineConfig` is not `Copy` (owns
+// `Option<Vec<f64>>` for per-sample fixation overrides).
+// `per_group_cfg` stays by value: `PerGroupMergerConfig` is `Copy`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_window(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     pre_fetched_ref_bytes: &[Vec<u8>],
     per_group_cfg: PerGroupMergerConfig,
-    posterior_cfg: PosteriorEngineConfig,
+    posterior_cfg: &PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
     output: &mut Vec<PosteriorRecord>,
 ) -> Result<(), PosteriorEngineError> {
@@ -265,7 +273,7 @@ pub fn run_window(
             g,
             group_ref_bytes,
             &per_group_cfg,
-            &posterior_cfg,
+            posterior_cfg,
             scratch,
         )? {
             output.push(record);
@@ -822,7 +830,7 @@ mod tests {
             &partition,
             &[],
             PerGroupMergerConfig::default(),
-            PosteriorEngineConfig::default(),
+            &PosteriorEngineConfig::default(),
             &mut scratch,
             &mut output,
         );
@@ -1032,7 +1040,7 @@ mod tests {
             &partition,
             &cn_pre_fetched,
             cfg,
-            PosteriorEngineConfig::default(),
+            &PosteriorEngineConfig::default(),
             &mut cn_scratch,
             &mut cn_out,
         )
@@ -1143,7 +1151,7 @@ mod tests {
             &partition,
             &cn_pre_fetched,
             cfg,
-            PosteriorEngineConfig::default(),
+            &PosteriorEngineConfig::default(),
             &mut cn_scratch,
             &mut cn_out,
         )

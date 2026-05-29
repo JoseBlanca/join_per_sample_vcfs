@@ -82,6 +82,9 @@ use crate::var_calling::per_group_merger::CompoundConstituent;
 /// group. Sentinels (`[0]` for every CSR offset column) survive the
 /// clear so the invariant `len(offsets) == n + 1` holds at every
 /// step.
+// Mi1: `#[non_exhaustive]` — kernel-output columns; future column
+// additions land without breaking out-of-crate struct-literal sites.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedAllelesColumns {
     pub n_samples: usize,

@@ -48,6 +48,8 @@ use crate::var_calling::per_group_merger::{
 /// - [`Self::n_genotypes`] — number of genotypes resolved from
 ///   `(ploidy, n_alleles)` against `genotype_tables` (or the
 ///   `genotype_order` fallback).
+// Mi1: `#[non_exhaustive]` — kernel-output columns.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogLikelihoodsColumns {
     pub n_samples: usize,
