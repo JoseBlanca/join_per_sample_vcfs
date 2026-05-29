@@ -697,8 +697,25 @@ fn run_full_iters(fixture: &CohortFixture, counter: &mut u64, iters: u64) -> Dur
 // ---------------------------------------------------------------------
 // Criterion plumbing
 // ---------------------------------------------------------------------
+//
+// Mi24: regression threshold convention. Criterion's CI machinery is
+// the threshold — `--baseline pre-fixes` flips each bench to
+// `improved` / `no change` / `regressed` based on its own statistical
+// model, no hand-picked percentage on top. The comments below pin the
+// **intent** so a reviewer can tell whether a `regressed` verdict on a
+// given group is expected or actionable.
+//
+// REGRESSION THRESHOLD: 10% per group is the team-accepted budget for
+// any fix that does *not* itself buy back correctness — see Wave 6's
+// performance check policy in the code-review-fixes skill. Correctness
+// and security fixes are kept regardless of perf delta (the trade-off
+// this fix workflow is explicitly designed to accept).
 
 criterion_group!(
+    // REGRESSION THRESHOLD: 10% per group.
+    // Core driver wall (`drive_cohort_pipeline` in isolation, PSP open
+    // + FASTA verify outside the timed region). Scales over samples,
+    // region length, and threads.
     name = e2e_core;
     config = Criterion::default();
     targets =
@@ -708,6 +725,12 @@ criterion_group!(
 );
 
 criterion_group!(
+    // REGRESSION THRESHOLD: 10% per group.
+    // Full `run_var_calling` wall — header validate + config build +
+    // FASTA MD5 verify + driver. Cannot sweep thread count within
+    // one `cargo bench` invocation (`configure_rayon_pool` is
+    // once-per-process); use `RAYON_NUM_THREADS=N cargo bench` for
+    // separate-process thread sweeps.
     name = e2e_full;
     config = Criterion::default();
     targets =
