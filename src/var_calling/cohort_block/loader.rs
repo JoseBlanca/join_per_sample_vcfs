@@ -3,8 +3,6 @@
 //! and compact the survivors into a [`MaterialisedChunk`] for the
 //! pre-pass and worker.
 
-use std::ops::Range;
-
 use thiserror::Error;
 
 use crate::pileup_record::PileupRecord;
@@ -136,47 +134,64 @@ pub enum ChunkLoadError<E> {
 
 /// Load one chunk from per-sample record iterators, apply the
 /// cohort-wide variant-position filter, and compact the survivors
-/// into `out`.
+/// into `out`. The chunk's BP span grows adaptively to hit a target
+/// post-filter variant count — the Phase B prerequisite that
+/// decouples worker workload from PSP block size + variant density.
 ///
 /// **Inputs.**
 /// - `scratch`, `out`: caller-owned scratch and output chunk; both
 ///   are cleared at entry.
-/// - `chrom_id`, `range`: the chunk's genomic window. Only records
-///   with `range.start <= pos < range.end` are taken from the
-///   upstream iterators.
+/// - `chrom_id`, `range_start`: the chunk's starting locus
+///   (inclusive).
+/// - `initial_span`: BP span of the loader's first pull attempt.
+///   The first attempt pulls records with
+///   `range_start <= pos < range_start + initial_span`.
+/// - `target_variants`: the post-filter kept-position count the
+///   loader tries to reach before stopping. The loader doubles its
+///   attempt span until the count is met or `max_span` is reached.
+///   `0` disables extension (one attempt only — the legacy
+///   behaviour).
+/// - `max_span`: hard cap on the chunk's BP span across all
+///   extension iterations. The loader never pulls records past
+///   `range_start + max_span`. Callers should clamp this to
+///   chromosome length.
 /// - `per_sample_iters`: one iterator per sample, in cohort order.
-///   Iterators are consumed up to the first record at
-///   `pos >= range.end` (or until exhausted) — callers that want to
-///   keep reading must hand in a fresh iterator next chunk.
+///   Iterators are wrapped in [`std::iter::Peekable`] internally
+///   so the loader can pause at the current attempt's boundary
+///   without consuming the next record, then resume on the next
+///   extension iteration with a larger boundary.
 /// - `carryover`: per-sample [`SampleColumns`] holding records from
 ///   the previous chunk's `>= safe_end` tail. These are *prepended*
-///   to each sample's raw load. Cleared after consumption so the
-///   caller can refill them from the next pre-pass's split.
+///   to each sample's raw load. Cleared after consumption.
 ///
 /// **Algorithm.**
-/// 1. Drain `carryover[s]` into `scratch.raw_per_sample[s]` (move
-///    rows, no row materialisation).
-/// 2. Pull records from `per_sample_iters[s]` while
-///    `pos < range.end`, pushing into `scratch.raw_per_sample[s]`.
-///    Records with `pos < range.start` are dropped (PSP's
-///    `region_records` already clamps; this is the defensive
-///    fallback against hand-rolled iterators).
-/// 3. Build the sorted, dedup'd position union across all samples.
-/// 4. For each position in the union, set `is_variant` true iff any
-///    sample's record at that position carries a non-REF allele with
-///    `num_obs > 0` (the walker's `alleles[0] == REF` invariant
-///    makes this the fast path; no reference-base fetch needed).
-/// 5. Compact: for each sample, walk its raw rows and the
-///    `position_union`/`is_variant` arrays in parallel; push every
-///    row whose position is marked variant into `out.per_sample[s]`.
-/// 6. Set `out.chrom_id = chrom_id`, `out.range = range`,
-///    `out.safe_end = range.end` (the pre-pass may revise it down),
-///    leave `out.windows` empty for the pre-pass to populate.
+/// 1. Drain `carryover[s]` into `scratch.raw_per_sample[s]`.
+/// 2. Extension loop. With `attempt_end` starting at
+///    `range_start + initial_span` and doubling each iteration up
+///    to `max_span`: pull records with `pos < attempt_end` from
+///    each iterator into `scratch.raw_per_sample[s]` (records at
+///    or above `attempt_end` are left in the iterator for the
+///    next pass), then rebuild the cohort-wide position union +
+///    per-position `has_variant_at` + `max_ref_span_at`, re-run
+///    the grouping simulation into `is_kept`, and count the
+///    `true` entries. Break when the count reaches
+///    `target_variants` or `attempt_end >= range_start + max_span`.
+/// 3. Compact: for each sample, walk its raw rows and the
+///    `position_union`/`is_kept` arrays in parallel; push every
+///    row whose position is kept into `out.per_sample[s]`.
+/// 4. Set `out.chrom_id = chrom_id`,
+///    `out.range = range_start..final_attempt_end`,
+///    `out.safe_end = final_attempt_end` (the pre-pass may revise
+///    it down), leave `out.windows` empty for the pre-pass.
+#[allow(clippy::too_many_arguments)]
 pub fn load_chunk_from_iters<I, E>(
     scratch: &mut ChunkLoadScratch,
     out: &mut MaterialisedChunk,
     chrom_id: u32,
-    range: Range<u32>,
+    range_start: u32,
+    initial_span: u32,
+    target_variants: u32,
+    max_span: u32,
     per_sample_iters: Vec<I>,
     carryover: &mut [SampleColumns],
 ) -> Result<ChunkLoadStats, ChunkLoadError<E>>
@@ -196,18 +211,18 @@ where
             got: carryover.len(),
         });
     }
-    if range.start >= range.end {
+    if initial_span == 0 {
         return Err(ChunkLoadError::InvalidRange {
-            start: range.start,
-            end: range.end,
+            start: range_start,
+            end: range_start,
         });
     }
+    let effective_initial_span = initial_span.min(max_span.max(initial_span));
+    let max_attempt_end = range_start.saturating_add(max_span.max(effective_initial_span));
 
     scratch.clear();
     out.clear_data();
     out.chrom_id = chrom_id;
-    out.range = range.clone();
-    out.safe_end = range.end;
     // Make sure the output is sized for the cohort: a fresh
     // `MaterialisedChunk` may have come in with no samples slotted.
     if out.per_sample.len() != n_samples {
@@ -225,36 +240,84 @@ where
         carry.clear();
     }
 
-    // ── Step 2: peek-and-pull from each per-sample iterator. ──
-    // Each iterator is wrapped in `Peekable` so the pull pauses
-    // cleanly at the first record past the attempt boundary without
-    // consuming it; subsequent extension iterations (Phase B
-    // variant-bounded loading, step 3) resume from the same point.
+    // ── Step 2: extension loop — pull + filter + variant-count
+    //            check, doubling attempt_end until target_variants
+    //            is hit or max_span is reached. ──
     let mut peekable_iters: Vec<std::iter::Peekable<I::IntoIter>> = per_sample_iters
         .into_iter()
         .map(|iter| iter.into_iter().peekable())
         .collect();
-    let attempt_end = range.end;
-    for (sample_idx, iter) in peekable_iters.iter_mut().enumerate() {
-        let raw = &mut scratch.raw_per_sample[sample_idx];
-        pull_records_with_pos_under(
-            iter,
-            sample_idx,
-            chrom_id,
-            range.start,
-            attempt_end,
-            raw,
-        )?;
+    let mut attempt_end = range_start.saturating_add(effective_initial_span);
+    let mut variant_count: u32;
+    loop {
+        let clamped_end = attempt_end.min(max_attempt_end);
+        for (sample_idx, iter) in peekable_iters.iter_mut().enumerate() {
+            let raw = &mut scratch.raw_per_sample[sample_idx];
+            pull_records_with_pos_under(iter, sample_idx, chrom_id, range_start, clamped_end, raw)?;
+        }
+        attempt_end = clamped_end;
+
+        rebuild_position_union_and_is_kept(scratch);
+        variant_count = scratch.is_kept.iter().filter(|kept| **kept).count() as u32;
+
+        if variant_count >= target_variants {
+            break;
+        }
+        if attempt_end >= max_attempt_end {
+            break;
+        }
+        // Double the span up to max_attempt_end. Saturating arithmetic
+        // keeps us safe at the u32 ceiling (a u32-overflowing span is
+        // pathological — chromosomes top out near 2^28).
+        let next_span = (attempt_end - range_start).saturating_mul(2);
+        attempt_end = range_start.saturating_add(next_span).min(max_attempt_end);
     }
 
-    // ── Step 3: cohort-wide position union ──
+    out.range = range_start..attempt_end;
+    out.safe_end = attempt_end;
+
+    // ── Step 3: per-sample compact (run once on final accumulated
+    //            data). ──
+    for (sample_idx, raw) in scratch.raw_per_sample.iter().enumerate() {
+        let dst = &mut out.per_sample[sample_idx];
+        // Parallel walk over `raw.positions` and `position_union`:
+        // both are sorted ascending, so we never need to backtrack.
+        let mut union_idx = 0_usize;
+        for row_idx in 0..raw.n_records() {
+            let pos = raw.position_at(row_idx);
+            while union_idx < scratch.position_union.len()
+                && scratch.position_union[union_idx] < pos
+            {
+                union_idx += 1;
+            }
+            debug_assert!(
+                union_idx < scratch.position_union.len()
+                    && scratch.position_union[union_idx] == pos,
+                "raw position {pos} missing from union — invariant broken",
+            );
+            if scratch.is_kept[union_idx] {
+                dst.push_row_from(raw, row_idx);
+            }
+        }
+    }
+
+    Ok(ChunkLoadStats { variant_count })
+}
+
+/// Rebuild `scratch.position_union`, `scratch.has_variant_at`,
+/// `scratch.max_ref_span_at`, and `scratch.is_kept` from the
+/// current `scratch.raw_per_sample` accumulator. Idempotent —
+/// called once per extension iteration inside the loader's loop.
+fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
+    // ── Position union ──
+    scratch.position_union.clear();
     for raw in &scratch.raw_per_sample {
         scratch.position_union.extend_from_slice(&raw.positions);
     }
     scratch.position_union.sort_unstable();
     scratch.position_union.dedup();
 
-    // ── Step 4: per-position scan — `has_variant_at` and `max_ref_span_at`. ──
+    // ── Per-position scan: has_variant_at + max_ref_span_at ──
     // For each cohort position we walk the samples that have a record
     // there exactly once, computing both predicates in one pass:
     //   - `has_variant_at[i]` — at least one sample's record carries a
@@ -336,33 +399,6 @@ where
             *slot = true;
         }
     }
-
-    // ── Step 6: per-sample compact ──
-    for (sample_idx, raw) in scratch.raw_per_sample.iter().enumerate() {
-        let dst = &mut out.per_sample[sample_idx];
-        // Parallel walk over `raw.positions` and `position_union`:
-        // both are sorted ascending, so we never need to backtrack.
-        let mut union_idx = 0_usize;
-        for row_idx in 0..raw.n_records() {
-            let pos = raw.position_at(row_idx);
-            while union_idx < scratch.position_union.len()
-                && scratch.position_union[union_idx] < pos
-            {
-                union_idx += 1;
-            }
-            debug_assert!(
-                union_idx < scratch.position_union.len()
-                    && scratch.position_union[union_idx] == pos,
-                "raw position {pos} missing from union — invariant broken",
-            );
-            if scratch.is_kept[union_idx] {
-                dst.push_row_from(raw, row_idx);
-            }
-        }
-    }
-
-    let variant_count = scratch.is_kept.iter().filter(|kept| **kept).count() as u32;
-    Ok(ChunkLoadStats { variant_count })
 }
 
 /// Decision branches surfaced by the peek phase of
@@ -464,10 +500,14 @@ mod tests {
 
     /// Helper: run the loader and return the post-load
     /// `ChunkLoadStats` along with the chunk. Mirrors `run_loader`
-    /// but exposes the variant count.
+    /// but exposes the variant count and lets callers control the
+    /// extension knobs.
     fn run_loader_with_stats(
         chrom_id: u32,
-        range: std::ops::Range<u32>,
+        range_start: u32,
+        initial_span: u32,
+        target_variants: u32,
+        max_span: u32,
         per_sample_records: Vec<Vec<PileupRecord>>,
         mut carryover: Vec<SampleColumns>,
     ) -> (MaterialisedChunk, ChunkLoadStats) {
@@ -482,7 +522,10 @@ mod tests {
             &mut scratch,
             &mut out,
             chrom_id,
-            range,
+            range_start,
+            initial_span,
+            target_variants,
+            max_span,
             iters,
             &mut carryover,
         )
@@ -503,8 +546,15 @@ mod tests {
             record(12, vec![ref_obs(15)]),
             record(14, ref_plus_alt(5, 6)),
         ];
-        let (chunk, stats) =
-            run_loader_with_stats(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+        let (chunk, stats) = run_loader_with_stats(
+            0,
+            1,
+            99,
+            0,
+            99,
+            vec![s0, s1],
+            vec![SampleColumns::empty(); 2],
+        );
         assert_eq!(stats.variant_count, 2);
         // Sanity-check the chunk shape too.
         assert_eq!(chunk.per_sample[0].n_records(), 1);
@@ -517,8 +567,15 @@ mod tests {
         // every position and variant_count = 0.
         let s0 = vec![record(10, vec![ref_obs(20)])];
         let s1 = vec![record(20, vec![ref_obs(15)])];
-        let (chunk, stats) =
-            run_loader_with_stats(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+        let (chunk, stats) = run_loader_with_stats(
+            0,
+            1,
+            99,
+            0,
+            99,
+            vec![s0, s1],
+            vec![SampleColumns::empty(); 2],
+        );
         assert_eq!(stats.variant_count, 0);
         assert_eq!(chunk.per_sample[0].n_records(), 0);
         assert_eq!(chunk.per_sample[1].n_records(), 0);
@@ -541,9 +598,126 @@ mod tests {
             record(11, vec![ref_obs(7)]),
             record(12, vec![ref_obs(7)]),
         ];
-        let (_, stats) =
-            run_loader_with_stats(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+        let (_, stats) = run_loader_with_stats(
+            0,
+            1,
+            99,
+            0,
+            99,
+            vec![s0, s1],
+            vec![SampleColumns::empty(); 2],
+        );
         assert_eq!(stats.variant_count, 3);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Phase B step 3 — extension loop tests.
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn loader_extension_doubles_span_until_target_variants_reached() {
+        // Variants at positions 10, 110, 210, 310, 410, 510. Each
+        // variant is one position (ref_span=1). With initial_span=50
+        // (covers only the first variant) and target_variants=4,
+        // the loader must extend: 50 → 100 (still 1) → 200 (2) →
+        // 400 (4 = target). Final attempt_end = range_start + 400 =
+        // 410. Final chunk has 4 kept positions (10, 110, 210, 310).
+        let positions = [10, 110, 210, 310, 410, 510];
+        let s0: Vec<_> = positions
+            .iter()
+            .map(|&p| record(p, ref_plus_alt(3, 4)))
+            .collect();
+        let (chunk, stats) = run_loader_with_stats(
+            0,
+            1,
+            50,   // initial_span
+            4,    // target_variants
+            1000, // max_span (plenty of headroom)
+            vec![s0],
+            vec![SampleColumns::empty()],
+        );
+        assert!(
+            stats.variant_count >= 4,
+            "expected at least 4 variants after extension, got {}",
+            stats.variant_count
+        );
+        assert!(
+            chunk.range.end >= 311,
+            "expected range.end past variant at 310, got {}",
+            chunk.range.end
+        );
+    }
+
+    #[test]
+    fn loader_extension_stops_at_max_span_under_target() {
+        // Sparse fixture: only one variant in the whole chromosome.
+        // With target=10 the loader cannot satisfy the target; it
+        // must stop at max_span and return whatever was loaded
+        // (graceful degradation).
+        let s0 = vec![record(50, ref_plus_alt(3, 4))];
+        let (chunk, stats) = run_loader_with_stats(
+            0,
+            1,
+            20,  // initial_span
+            10,  // target_variants (impossible — only 1 variant exists)
+            100, // max_span (cap)
+            vec![s0],
+            vec![SampleColumns::empty()],
+        );
+        // Variant count is 1 (whatever was loaded), and chunk.range.end
+        // == range_start + max_span.
+        assert_eq!(stats.variant_count, 1);
+        assert_eq!(chunk.range.end, 101);
+    }
+
+    #[test]
+    fn loader_no_extension_when_target_is_zero() {
+        // target_variants = 0 disables extension: the loader runs
+        // a single pull attempt covering initial_span and returns
+        // whatever was found. Same shape as the legacy behaviour
+        // every other test uses.
+        let s0 = vec![
+            record(10, ref_plus_alt(3, 4)),
+            record(60, ref_plus_alt(3, 4)),
+            record(110, ref_plus_alt(3, 4)),
+        ];
+        let (chunk, stats) = run_loader_with_stats(
+            0,
+            1,
+            50,  // initial_span — only first variant lands inside
+            0,   // target_variants = 0 disables extension
+            500, // max_span (would allow extension if target > 0)
+            vec![s0],
+            vec![SampleColumns::empty()],
+        );
+        assert_eq!(stats.variant_count, 1);
+        assert_eq!(chunk.range.end, 51);
+        assert_eq!(chunk.per_sample[0].n_records(), 1);
+    }
+
+    #[test]
+    fn loader_no_extension_when_target_already_met_by_initial_span() {
+        // Dense initial span already exceeds target — zero
+        // extensions needed.
+        let s0 = vec![
+            record(10, ref_plus_alt(3, 4)),
+            record(20, ref_plus_alt(3, 4)),
+            record(30, ref_plus_alt(3, 4)),
+            record(40, ref_plus_alt(3, 4)),
+            record(50, ref_plus_alt(3, 4)),
+        ];
+        let (chunk, stats) = run_loader_with_stats(
+            0,
+            1,
+            100,  // initial_span covers all 5 variants
+            3,    // target_variants — already met after first pass
+            1000, // max_span (wouldn't trigger anyway)
+            vec![s0],
+            vec![SampleColumns::empty()],
+        );
+        assert_eq!(stats.variant_count, 5);
+        // No extension: chunk.range.end == range_start + initial_span.
+        assert_eq!(chunk.range.end, 101);
     }
 
     #[test]
@@ -648,7 +822,7 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        load_chunk_from_iters(&mut scratch, &mut out, 0, 10..100, iters, &mut carry).unwrap();
+        load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry).unwrap();
 
         assert_eq!(carry[0].n_records(), 0);
         assert_eq!(carry[1].n_records(), 0);
@@ -677,8 +851,8 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        let err = load_chunk_from_iters(&mut scratch, &mut out, 0, 100..50, iters, &mut carry)
-            .expect_err("inverted range rejected");
+        let err = load_chunk_from_iters(&mut scratch, &mut out, 0, 100, 0, 0, 0, iters, &mut carry)
+            .expect_err("zero initial_span rejected");
         assert!(matches!(err, ChunkLoadError::InvalidRange { .. }));
     }
 
@@ -693,8 +867,9 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        let err = load_chunk_from_iters(&mut scratch, &mut out, 0, 10..100, iters, &mut carry)
-            .expect_err("wrong-chromosome record rejected");
+        let err =
+            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
+                .expect_err("wrong-chromosome record rejected");
         assert!(matches!(
             err,
             ChunkLoadError::UnexpectedChromosome {
@@ -713,8 +888,9 @@ mod tests {
         let mut carry = vec![SampleColumns::empty()];
         let iters: Vec<Box<dyn Iterator<Item = Result<PileupRecord, &'static str>>>> =
             vec![Box::new(std::iter::once(Err("psp blew up")))];
-        let err = load_chunk_from_iters(&mut scratch, &mut out, 0, 10..100, iters, &mut carry)
-            .expect_err("upstream error surfaced");
+        let err =
+            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
+                .expect_err("upstream error surfaced");
         assert!(matches!(
             err,
             ChunkLoadError::UpstreamRead {
@@ -738,7 +914,18 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        load_chunk_from_iters(&mut scratch, &mut out, 0, 10..50, iters_a, &mut carry).unwrap();
+        load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            0,
+            10,
+            40,
+            0,
+            40,
+            iters_a,
+            &mut carry,
+        )
+        .unwrap();
         assert_eq!(out.chrom_id, 0);
         assert_eq!(out.range, 10..50);
         assert_eq!(out.per_sample[0].n_records(), 1);
@@ -747,7 +934,18 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        load_chunk_from_iters(&mut scratch, &mut out, 7, 200..300, iters_b, &mut carry).unwrap();
+        load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            7,
+            200,
+            100,
+            0,
+            100,
+            iters_b,
+            &mut carry,
+        )
+        .unwrap();
         assert_eq!(out.chrom_id, 7);
         assert_eq!(out.range, 200..300);
         assert_eq!(out.per_sample[0].n_records(), 1);

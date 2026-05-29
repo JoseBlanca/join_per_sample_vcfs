@@ -86,11 +86,17 @@ pub(crate) fn run_loader(
         .into_iter()
         .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
         .collect();
+    let span = range.end - range.start;
+    // Legacy behaviour: no variant target, no extension (max_span ==
+    // initial_span ⇒ single pull attempt).
     load_chunk_from_iters(
         &mut scratch,
         &mut out,
         chrom_id,
-        range,
+        range.start,
+        span,
+        0,
+        span,
         iters,
         &mut carryover,
     )

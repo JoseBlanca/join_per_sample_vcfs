@@ -518,11 +518,19 @@ where
             .map(|r| r.region_records(chrom_id, psp_cursor, psp_inclusive_end))
             .collect();
 
-        load_chunk_from_iters(
+        let load_span = chunk_range_end - chunk_range_start;
+        let _ = load_chunk_from_iters(
             chunk_scratch,
             chunk,
             chrom_id,
-            chunk_range_start..chunk_range_end,
+            chunk_range_start,
+            load_span,
+            // Phase B step 4 wires `target_variants` + `max_span` from
+            // `ChunkDriverParams`; for now the loader takes one pull
+            // attempt of `load_span` (legacy behaviour) — extension
+            // happens via the existing NoSafeGap retry one level up.
+            0,
+            load_span,
             iters,
             carryover,
         )?;
