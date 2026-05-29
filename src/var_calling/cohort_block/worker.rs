@@ -313,9 +313,24 @@ pub fn prefetch_window_ref_bytes(
     out: &mut Vec<Vec<u8>>,
 ) -> Result<(), ChromRefFetchError> {
     out.clear();
+    // M24: pin the invariant that every group's `[start, end]` span
+    // is inside the contig the fetcher serves. The walker invariant
+    // (record positions ≤ chrom_length, ref_span = 1 at the chrom
+    // edge) makes this hold by construction on real input; a
+    // regression that emits a group with `group_end > chrom_length`
+    // would otherwise surface as a typed `ChromRefFetchError` from
+    // `fetch_into` deep on the parallel-dispatch hot path. The
+    // debug_assert catches it at the prefetch step under tests, with
+    // a focused error message naming the offending group.
+    let chrom_length = ref_fetcher.length();
     for g in 0..partition.n_groups() {
         let group_start = partition.group_starts[g];
         let group_end = partition.group_ends[g];
+        debug_assert!(
+            group_end <= chrom_length,
+            "prefetch_window_ref_bytes: group {g} ends at {group_end} \
+             past chrom length {chrom_length}",
+        );
         let span = group_end - group_start + 1;
         let mut bytes = Vec::with_capacity(span as usize);
         ref_fetcher.fetch_into(group_start, span, &mut bytes)?;
