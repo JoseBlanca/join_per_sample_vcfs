@@ -220,3 +220,50 @@ fn build_cigar_strips_leading_deletion_only_when_requested() {
     assert_eq!(stripped.cigar, vec![Match(4)]);
     assert_eq!(stripped.leading_deletion_bases_removed, 2);
 }
+
+// --- left_align_indels: the in-place wrapper the reader calls ---------
+//
+// These drive `left_align_indels(&mut cigar, seq, ref_seq)` — the
+// `(&mut Vec<CigarOp>, seq, ref_seq)` drop-in for the reader's F3 site
+// (`read_start = 0`, end-deletions kept). They exercise the wrapper's
+// fast path and its debug mismatch-count invariant (which `left_align_cigar`
+// callers bypass), and pin the `seq`-vs-`ref_seq` argument order: a swapped
+// pair would trip the invariant on these repeat fixtures.
+
+#[test]
+fn wrapper_left_aligns_homopolymer_deletion_in_place() {
+    let mut cigar = vec![Match(4), Deletion(1), Match(1)];
+    left_align_indels(&mut cigar, b"GAAAT", b"GAAAAT");
+    assert_eq!(cigar, vec![Match(1), Deletion(1), Match(4)]);
+}
+
+#[test]
+fn wrapper_left_aligns_homopolymer_insertion_in_place() {
+    let mut cigar = vec![Match(4), Insertion(1), Match(1)];
+    left_align_indels(&mut cigar, b"GAAAAT", b"GAAAT");
+    assert_eq!(cigar, vec![Match(1), Insertion(1), Match(4)]);
+}
+
+#[test]
+fn wrapper_two_reads_converge_in_place() {
+    // Same biological deletion, opposite placements → identical CIGAR.
+    let mut right = vec![Match(5), Deletion(1), Match(1)];
+    let mut left = vec![Match(1), Deletion(1), Match(5)];
+    left_align_indels(&mut right, b"GAAAAC", b"GAAAAAC");
+    left_align_indels(&mut left, b"GAAAAC", b"GAAAAAC");
+    assert_eq!(right, left);
+    assert_eq!(right, vec![Match(1), Deletion(1), Match(5)]);
+}
+
+#[test]
+fn wrapper_keeps_leading_deletion_and_is_noop_without_indel() {
+    // End-deletion not stripped (alignment_start stays fixed); and a
+    // pure-match CIGAR is untouched (fast path).
+    let mut rolled = vec![Match(3), Deletion(1), Match(1)];
+    left_align_indels(&mut rolled, b"AAAT", b"AAAAT");
+    assert_eq!(rolled, vec![Deletion(1), Match(4)]);
+
+    let mut plain = vec![Match(5)];
+    left_align_indels(&mut plain, b"ACGTA", b"ACGTA");
+    assert_eq!(plain, vec![Match(5)]);
+}

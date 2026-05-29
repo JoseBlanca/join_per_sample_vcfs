@@ -286,6 +286,8 @@ fn build_cigar(elements: &[CigarOp], remove_deletions_at_ends: bool) -> LeftAlig
                     match op {
                         CigarOp::Deletion(n) => del_len += n,
                         CigarOp::Insertion(n) => ins_len += n,
+                        // UNREACHABLE: `j` advanced only across `is_indel`
+                        // ops, so every op in `nonzero[i..j]` is D or I.
                         _ => unreachable!("run is all indels"),
                     }
                 }
@@ -543,7 +545,7 @@ pub(crate) fn left_align_indels(cigar: &mut Vec<CigarOp>, seq: &[u8], ref_seq: &
 /// a debug invariant: left-alignment is a lossless re-placement of the
 /// same indels, so it must leave the mismatch count unchanged. Mirrors
 /// freebayes' `countMismatches`. Debug-only — the sole caller is the
-/// `debug_assert_eq!` in [`left_align_prepared`].
+/// `debug_assert_eq!` in [`left_align_indels`].
 #[cfg(debug_assertions)]
 fn count_mismatches(
     cigar: &[CigarOp],

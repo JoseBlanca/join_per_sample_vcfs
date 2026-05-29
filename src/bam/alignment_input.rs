@@ -1565,10 +1565,13 @@ fn cigar_ref_span(cigar: &[CigarOp]) -> u32 {
 /// its job. Pre-F3 boundary deletions are the case where the
 /// aligner itself produced the suspect alignment.
 ///
-/// Adjacent indels are invariant under F3 (F3 explicitly skips
-/// adjacent-indel triplets), so the consecutive-`I`/`D` rule is
-/// timing-independent — but for symmetry we run both checks at the
-/// same place in the cascade.
+/// Rule 1 (consecutive `I`/`D`) targets the **aligner's** original
+/// CIGAR — an adjacent I/D pair as emitted is the suspect signal. It
+/// must run before left-alignment: the GATK port left-alignment can
+/// *itself* merge two colliding indels into a canonical adjacent
+/// `D`/`I` pair, which is a legitimate (parsimonious) representation,
+/// not the aligner artefact this rule rejects. Running rule 1 first
+/// checks only what the aligner produced.
 fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
     // Rule 1 — adjacent I/D in either order.
     for window in cigar.windows(2) {
