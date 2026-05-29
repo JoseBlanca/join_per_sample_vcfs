@@ -27,7 +27,7 @@ The post-call MIN_QUAL=30 filter that run_freebayes_*.sh applies is
 *not* re-applied here — that's a separate awk pass that doesn't
 affect freebayes' own footprint.
 
-Sample sizes: 1, 2, 4, 8, 12, 16, 18 (full tomato1 cohort).
+Sample sizes: 1, 2, 4, 8, 12, 16, 20, 24, 26 (full tomato1 cohort).
 Inputs:       benchmarks/tomato1/crams/*.bench.cram
               benchmarks/tomato1/regions.bed
 Output:       benchmarks/tomato1/results/perf/freebayes.tsv
@@ -40,7 +40,7 @@ Env overrides:
   PLOIDY          --ploidy (default: 2)
   THREADS         worker concurrency (default: 4 — matches the pileup
                   concurrency in perf_ours_whole_pipeline so CPU budgets align)
-  SIZES           comma-separated sample sizes (default: 1,2,4,8,12,16,18)
+  SIZES           comma-separated sample sizes (default: 1,2,4,8,12,16,20,24,26)
 
 Invoke:
   uv run --script benchmarks/tomato1/scripts/perf_freebayes.py

@@ -4,22 +4,27 @@
 #     "psutil",
 # ]
 # ///
-"""Scaling perf experiment for `pop_var_caller var-calling`
-(PSP -> VCF, joint genotyping over pre-built per-sample PSP files).
+"""Scaling perf experiment for `pop_var_caller var-calling` over PSPs
+that were built with `--block-target-bytes 262144` (256 KiB, 1/4 of
+the 1 MiB default).
 
-Comparable in shape to GATK's CombineGVCFs + GenotypeGVCFs flow
-(per-sample intermediate -> joint VCF); the (perf_ours_joint,
-perf_gatk_joint) pair shows how our joint-genotyping stage scales
-relative to GATK's. The per-sample pileup time is excluded — this
-measures the joint step only.
+Companion to perf_ours_joint.py. The cohort reader holds one decoded
+block per `n_threads × N` worker; shrinking the block target should
+drop peak heap roughly 4x relative to the default-block run, with
+slightly worse zstd compression (so larger .psp on disk). This is
+the scenario where the block-size change is expected to matter most.
 
-PSP inputs must already exist; they're built by run_ours_cohort.sh
-(stage 1) and live at results/ours/cohort/psp/*.psp.
+PSP inputs must already exist at results/ours/cohort/psp_smallblock/
+— a separate cohort PSP set built with the small block target so it
+doesn't disturb the default-block PSPs that perf_ours_joint reads.
+Build them with:
+
+  ./benchmarks/tomato1/scripts/build_smallblock_psps.sh
 
 Sample sizes: 1, 2, 4, 8, 12, 16, 20, 24, 26 (full tomato1 cohort).
-Inputs:       benchmarks/tomato1/results/ours/cohort/psp/*.psp
-Output:       benchmarks/tomato1/results/perf/ours_joint.tsv
-              benchmarks/tomato1/results/perf/ours_joint/N<nn>.vcf
+Inputs:       benchmarks/tomato1/results/ours/cohort/psp_smallblock/*.psp
+Output:       benchmarks/tomato1/results/perf/ours_joint_smallblock.tsv
+              benchmarks/tomato1/results/perf/ours_joint_smallblock/N<nn>.vcf
 
 Env overrides:
   POP_VAR_CALLER_BIN  binary (default: $PROJECT_ROOT/target/release/pop_var_caller)
@@ -28,7 +33,7 @@ Env overrides:
   SIZES               comma-separated sample sizes (default: 1,2,4,8,12,16,20,24,26)
 
 Invoke:
-  uv run --script benchmarks/tomato1/scripts/perf_ours_joint.py
+  uv run --script benchmarks/tomato1/scripts/perf_ours_joint_smallblock.py
 """
 
 import os
@@ -37,12 +42,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from perf_common import (  # noqa: E402
-    DEFAULT_REFERENCE, DEFAULT_THREADS, PERF_DIR, PROJECT_ROOT, PSP_DIR,
+    DEFAULT_REFERENCE, DEFAULT_THREADS, PERF_DIR, PROJECT_ROOT,
+    PSP_SMALLBLOCK_DIR,
     Measurement, banner, check_exists, list_inputs, measure, pick_subset,
     sizes_from_env, write_tsv,
 )
 
-CALLER = "ours_joint"
+CALLER = "ours_joint_smallblock"
 BIN = Path(os.environ.get(
     "POP_VAR_CALLER_BIN",
     str(PROJECT_ROOT / "target" / "release" / "pop_var_caller"),
@@ -53,7 +59,7 @@ OUT_DIR = PERF_DIR / CALLER
 def main() -> int:
     sizes = sizes_from_env()
     check_exists(BIN, DEFAULT_REFERENCE, Path(str(DEFAULT_REFERENCE) + ".fai"))
-    psps = list_inputs(PSP_DIR, ".psp")
+    psps = list_inputs(PSP_SMALLBLOCK_DIR, ".psp")
     banner(CALLER, sizes)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -68,7 +74,7 @@ def main() -> int:
             "--threads", str(DEFAULT_THREADS),
             *[str(p) for p in subset],
         ]
-        print(f"[{CALLER}] N={n:>2}: var-calling over {len(subset)} PSPs")
+        print(f"[{CALLER}] N={n:>2}: var-calling over {len(subset)} smallblock PSPs")
         wall, peak_bytes, exit_code = measure(cmd)
         peak_mb = peak_bytes / 1024 / 1024
         rows.append(Measurement(CALLER, n, wall, peak_mb, exit_code))

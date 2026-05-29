@@ -24,7 +24,7 @@ Note on availability:
   mount for the reference genome (which lives outside the project
   tree, default $HOME/genomes/...).
 
-Sample sizes: 1, 2, 4, 8, 12, 16, 18 (full tomato1 cohort).
+Sample sizes: 1, 2, 4, 8, 12, 16, 20, 24, 26 (full tomato1 cohort).
 Inputs:       benchmarks/tomato1/results/gatk/cohort/gvcf/*.g.vcf.gz
               benchmarks/tomato1/regions.bed
 Output:       benchmarks/tomato1/results/perf/gatk_joint.tsv
@@ -35,7 +35,7 @@ Env overrides:
   GATK_BIN    binary (default: /opt/gatk/gatk)
   REFERENCE   SL4.0 fasta (.fai + .dict siblings required)
   JAVA_HEAP   -Xmx for both stages (default: 4g)
-  SIZES       comma-separated sample sizes (default: 1,2,4,8,12,16,18)
+  SIZES       comma-separated sample sizes (default: 1,2,4,8,12,16,20,24,26)
 
 Invoke:
   uv run --script benchmarks/tomato1/scripts/perf_gatk_joint.py

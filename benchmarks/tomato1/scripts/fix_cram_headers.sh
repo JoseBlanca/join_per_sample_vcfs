@@ -39,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRAM_DIR="$TEST_DIR/crams"
 
-REFERENCE="${REFERENCE:-/home/jose/genomes/s_lycopersicum/4.00/S_lycopersicum_chromosomes.4.00.fa}"
+REFERENCE="${REFERENCE:-$HOME/genomes/s_lycopersicum/4.00/S_lycopersicum_chromosomes.4.00.fa}"
 
 DRY_RUN=0
 if [[ "${1:-}" == "-n" || "${1:-}" == "--dry-run" ]]; then

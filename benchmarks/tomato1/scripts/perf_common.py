@@ -36,12 +36,17 @@ DEFAULT_REFERENCE = Path(os.environ.get(
     str(Path.home() / "genomes/s_lycopersicum/4.00/S_lycopersicum_chromosomes.4.00.fa"),
 ))
 DEFAULT_BED = TEST_DIR / "regions.bed"
-DEFAULT_SIZES = [1, 2, 4, 8, 12, 16, 18]
+DEFAULT_SIZES = [1, 2, 4, 8, 12, 16, 20, 24, 26]
 DEFAULT_THREADS = int(os.environ.get("THREADS", "4"))
 
 PERF_DIR = TEST_DIR / "results" / "perf"
 CRAM_DIR = TEST_DIR / "crams"
 PSP_DIR = TEST_DIR / "results" / "ours" / "cohort" / "psp"
+# Parallel cohort PSP directory for the small-block (--block-target-bytes
+# 262144 = 256 KiB, i.e. 1/4 of the 1 MiB default) variant. Used by
+# perf_ours_joint_smallblock to measure the joint-stage memory savings
+# without disturbing the default-block PSPs that perf_ours_joint reads.
+PSP_SMALLBLOCK_DIR = TEST_DIR / "results" / "ours" / "cohort" / "psp_smallblock"
 GVCF_DIR = TEST_DIR / "results" / "gatk" / "cohort" / "gvcf"
 
 

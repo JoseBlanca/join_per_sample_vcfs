@@ -28,7 +28,7 @@ The (perf_ours_whole_pipeline, perf_freebayes) pair shows how the two
 (perf_ours_joint, perf_gatk_joint) pair compares only the joint
 genotyping stage (intermediates assumed pre-built).
 
-Sample sizes: 1, 2, 4, 8, 12, 16, 18 (full tomato1 cohort).
+Sample sizes: 1, 2, 4, 8, 12, 16, 20, 24, 26 (full tomato1 cohort).
 Inputs:       benchmarks/tomato1/crams/*.bench.cram
 Output:       benchmarks/tomato1/results/perf/ours_whole_pipeline.tsv
               benchmarks/tomato1/results/perf/ours_whole_pipeline/N<nn>/<sample>.psp
@@ -39,7 +39,7 @@ Env overrides:
   REFERENCE           SL4.0 fasta (.fai sibling required)
   THREADS             parallelism budget (default: 4 — drives pileup
                       concurrency in stage 1 and --threads in stage 2)
-  SIZES               comma-separated sample sizes (default: 1,2,4,8,12,16,18)
+  SIZES               comma-separated sample sizes (default: 1,2,4,8,12,16,20,24,26)
 
 Invoke:
   uv run --script benchmarks/tomato1/scripts/perf_ours_whole_pipeline.py
