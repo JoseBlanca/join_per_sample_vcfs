@@ -370,7 +370,7 @@ fn build_posterior_record_columnar(
         &mut scratch.unify,
         &mut scratch.unified,
     )
-    .map_err(|e| unify_error_to_merger(chrom_id, group_start, group_end, e))?;
+    .map_err(|e| unify_alleles_error_to_merger(chrom_id, group_start, group_end, e))?;
 
     let n_alleles = scratch.unified.n_alleles();
 
@@ -418,7 +418,7 @@ fn build_posterior_record_columnar(
         &[],
         &mut scratch.log_likelihoods,
     )
-    .map_err(|e| compute_ll_error_to_merger(chrom_id, group_start, group_end, e))?;
+    .map_err(|e| compute_log_likelihoods_error_to_merger(chrom_id, group_start, group_end, e))?;
 
     // chain_anchor_flags table (row-shape boolean flat): `true` iff
     // the allele is a compound AND the sample's chain_anchor_count is
@@ -516,7 +516,7 @@ fn build_posterior_record_columnar(
     Ok(Some(record))
 }
 
-fn unify_error_to_merger(
+fn unify_alleles_error_to_merger(
     _chrom_id: u32,
     _group_start: u32,
     _group_end: u32,
@@ -590,7 +590,7 @@ fn project_scalars_error_to_merger(
     inner.into()
 }
 
-fn compute_ll_error_to_merger(
+fn compute_log_likelihoods_error_to_merger(
     chrom_id: u32,
     group_start: u32,
     group_end: u32,
@@ -880,7 +880,7 @@ mod tests {
         assert!(output.is_empty());
     }
 
-    /// B4: `compute_ll_error_to_merger` maps the kernel's
+    /// B4: `compute_log_likelihoods_error_to_merger` maps the kernel's
     /// `NAllelesExceedsBitmask` directly to
     /// `PosteriorEngineError::NAllelesExceedsBitmask`, preserving the
     /// real `n_alleles` and the group locus. Replaces the prior
@@ -888,8 +888,8 @@ mod tests {
     /// as a `DegenerateLikelihood { sample_idx: usize::MAX,
     /// genotype_idx: usize::MAX, kind: NaN }` placeholder.
     #[test]
-    fn compute_ll_error_to_merger_preserves_n_alleles_and_locus() {
-        let err = compute_ll_error_to_merger(
+    fn compute_log_likelihoods_error_to_merger_preserves_n_alleles_and_locus() {
+        let err = compute_log_likelihoods_error_to_merger(
             7,
             123,
             456,
