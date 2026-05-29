@@ -9,6 +9,7 @@ pub mod cli;
 pub mod cohort_driver;
 pub(crate) mod common;
 pub mod contamination_artefact;
+pub(crate) mod contamination_chunked_stream;
 pub mod estimate_contamination;
 pub mod psp_to_pileup;
 pub mod stage1_pipeline;
