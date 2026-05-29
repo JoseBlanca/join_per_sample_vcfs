@@ -79,6 +79,12 @@ TSV_OUT="${TSV_OUT:-$OUT_ROOT/comparison/accuracy.tsv}"
 mkdir -p "$(dirname "$TSV_OUT")"
 printf 'caller\tclass\ttp\tfp\tfn\tprecision\trecall\tf1\n' > "$TSV_OUT"
 
+# Per-record QUAL of each caller's own calls, labelled TP/FP, for the
+# quality-distribution panels in the dashboard. One row per called
+# variant (so this file is large — thousands of rows).
+QUAL_TSV="${QUAL_TSV:-$OUT_ROOT/comparison/qual_dist.tsv}"
+printf 'caller\tclass\tstatus\tqual\n' > "$QUAL_TSV"
+
 printf '%-26s %-7s %7s %7s %7s %9s %9s %7s\n' \
     caller class TP FP FN precision recall F1
 printf '%s\n' "--------------------------------------------------------------------------------------"
@@ -94,10 +100,19 @@ for cls in $CLASSES; do
 
         isec_dir="$TMP/isec.$name.$cls"
         bcftools isec -p "$isec_dir" "$truth_norm" "$q_norm" >/dev/null 2>&1
-        # 0000=truth-only(FN) 0001=query-only(FP) 0002=shared-from-truth(TP)
+        # 0000=truth-only(FN)  0001=query-only(FP)
+        # 0002=shared-from-truth  0003=shared-from-query
+        # Counts use the truth side (0002) for TP; QUAL distributions use
+        # the query side (0003 = the caller's own record for each TP).
         local_fn=$(count_records "$isec_dir/0000.vcf")
         local_fp=$(count_records "$isec_dir/0001.vcf")
         local_tp=$(count_records "$isec_dir/0002.vcf")
+
+        # Per-record QUAL, labelled by status, from the caller's own calls.
+        bcftools query -f '%QUAL\n' "$isec_dir/0003.vcf" 2>/dev/null \
+          | awk -v c="$name" -v cl="$cls" '$1!="."{print c"\t"cl"\tTP\t"$1}' >> "$QUAL_TSV"
+        bcftools query -f '%QUAL\n' "$isec_dir/0001.vcf" 2>/dev/null \
+          | awk -v c="$name" -v cl="$cls" '$1!="."{print c"\t"cl"\tFP\t"$1}' >> "$QUAL_TSV"
 
         read -r prec rec f1 < <(awk -v tp="$local_tp" -v fp="$local_fp" -v fn="$local_fn" 'BEGIN{
             p = (tp+fp>0) ? tp/(tp+fp) : 0;
@@ -114,3 +129,4 @@ done
 
 echo
 echo "tsv: $TSV_OUT"
+echo "qual: $QUAL_TSV"
