@@ -176,10 +176,16 @@ an external dependency and an IO round-trip for no saved work.
    derivable from the scalars when the joint stage needs them; see
    Stage 2 §"Why PLs are *not* stored".
 4. **Indel alleles are anchored at the position one before the variable
-   region** (VCF convention). A deletion is stored as one allele at the
-   anchor position; interior positions of the deletion appear in the
-   `.psp` only if they are covered by non-deleting reads. See Stage 2
-   §"Indel anchoring" for the exact REF/ALT shape.
+   region** (VCF convention) and **left-normalized to their leftmost
+   equivalent position** against the reference, so that reads an aligner
+   placed at different offsets inside a tandem repeat or homopolymer
+   collapse onto one anchor and one REF/ALT pair instead of fragmenting
+   into several near-duplicate alleles. A deletion is stored as one
+   allele at the (normalized) anchor position; interior positions of the
+   deletion appear in the `.psp` only if they are covered by non-deleting
+   reads. See §"Indel normalization (left-alignment)" below for the
+   algorithm and rationale, and Stage 2 §"Indel anchoring" for the exact
+   REF/ALT shape.
 5. **Indel BQ proxy.** A deleted base has no sequencing quality of its
    own, so for a supporting read we take the window of `l + 2`
    BAQ-adjusted base qualities centred on the indel (where `l` is the
@@ -214,6 +220,88 @@ an external dependency and an IO round-trip for no saved work.
    upstream; the closure rule, the filter, and the handling of
    out-of-bound reads are specified in §"Open-record closure
    and the read-span filter" below.
+
+### Indel normalization (left-alignment)
+
+**Problem.** A short-read aligner places an indel inside a tandem repeat
+or homopolymer at an essentially arbitrary offset among equally-scoring
+positions (the same ambiguity Stage 3's DUST filter exists to mitigate —
+see Stage 3 §"Why this filter exists"). Two reads carrying the *same*
+biological indel can therefore present it at different CIGAR offsets, and
+recorded verbatim they become different `(anchor, REF, ALT)` triples. The
+cohort merge (Stage 5) unifies alleles by exact sequence match over the
+group span, so these near-duplicates are bucketed as *distinct* alleles:
+the read support for one real indel fragments across several allele
+entries, none individually accumulates enough signal, and the joint
+genotyper resolves the site to hom-ref or sub-threshold QUAL. Because the
+large majority of real indels sit in exactly these repeat contexts, the
+fragmentation is a dominant cause of missed indels — DUST removes the
+worst regions, but every indel in a region that *passes* the complexity
+threshold still needs its evidence consolidated.
+
+**What Stage 1 does.** Before an indel read-event is recorded as an
+allele observation, the walker **left-aligns** it against the reference:
+shift it to its leftmost equivalent position and trim shared flanking
+bases, producing the canonical form that `bcftools norm`, `vt normalize`,
+and GATK `LeftAlignAndTrimVariants` emit — and the form GIAB and other
+truth sets are distributed in. After normalization every read carrying a
+given indel contributes to one anchor and one REF/ALT pair, so support
+sums instead of fragmenting, and the emitted allele matches the truth's
+representation without a downstream re-alignment pass.
+
+**Algorithm** (per read-event, against the reference):
+
+1. **Trim** the right end first: while REF and ALT share a common
+   trailing base and both are longer than one, drop it. Then trim the
+   common prefix down to the single anchor base required by the VCF
+   convention.
+2. **Roll left**: while the indel lies fully within a repeat — i.e. the
+   reference base immediately left of the allele equals the allele's last
+   base — shift the whole allele one position left (prepend the
+   reference base, drop the trailing base). Repeat until no further left
+   shift is possible.
+
+This needs only the reference — already available in Stage 1 via the same
+per-contig fetcher BAQ uses — plus, for insertions, the inserted bases
+carried by the read. Deletions left-align from the reference alone.
+
+**Why Stage 1, not the merge.** Left-alignment is a *deterministic,
+lossless canonicalization* of the same event: it rewrites coordinates,
+never drops or thresholds an observation. That is categorically unlike
+the DUST filter, a tunable cohort policy deliberately kept out of Stage 1
+(Stage 3 §"Shape") to keep `.psp` files faithful and re-runnable.
+Normalizing in Stage 1 places the canonical coordinate in the `.psp`
+itself, which is precisely what lets the merge unify the same indel
+*across samples* by exact `(anchor, REF, ALT)` match — the merge cannot
+retroactively re-align indels each sample already bucketed under
+different coordinates. The `.psp` stays faithful: it still represents
+exactly the indels the reads showed, in their canonical form.
+
+**Bounds and edge cases.**
+
+- The left roll stops at the start of the read's aligned reference
+  footprint, or chromosome position 1, whichever comes first; an indel
+  whose canonical position would fall left of the read's own evidence is
+  left at the furthest in-bounds position. In practice a repeat's left
+  boundary is well within the read for the indels this matters for.
+- Reads reporting an indel as their **first or last** CIGAR op are
+  rejected before normalization (no flanking evidence — the existing
+  freebayes rule, conceptual step 5).
+- The indel **BQ-proxy** window (conceptual step 5) is centred on the
+  *normalized* anchor.
+- **Phase-chain ids** are unaffected — normalization moves the anchor,
+  not the read's chain membership.
+- For **overlapping-event** records (Stage 2 §"Overlapping events extend
+  the anchor REF") each constituent indel is normalized before the
+  widest-span REF for the record is computed.
+
+**Relationship to DUST (Stage 3).** The two are complementary, not
+redundant. Normalization consolidates placement ambiguity *within* a
+repeat so a callable repeat yields one confident allele; DUST still drops
+regions whose complexity makes even a normalized call unreliable. With
+normalization in place the DUST threshold is less load-bearing for indel
+recall and can be revisited (it is opt-out and tunable — Stage 3
+§"Parameters and opt-out").
 
 ### Per-read likelihood quality: BAQ vs. PairHMM vs. trust-the-aligner
 
@@ -604,7 +692,12 @@ stretch.
   Stage 1.
 
 **Indel anchoring follows VCF convention** — indels are anchored at
-the position one before the variable region.
+the position one before the variable region, and the anchor is the
+**left-normalized** (leftmost equivalent) position: Stage 1 left-aligns
+each indel against the reference before recording it, so the stored
+`(anchor, REF, ALT)` is the canonical `bcftools norm` / GIAB-truth form
+and identical indels never appear under competing coordinates. See
+Stage 1 §"Indel normalization (left-alignment)" for the algorithm.
 
 - Deletion of bases at reference positions X..X+l−1:
   - record at position X−1
@@ -918,6 +1011,16 @@ adjust per-base confidence, not repeat-wide placement ambiguity. Both
 freebayes and GATK routinely emit false-positive variant calls in
 these regions, and the cheapest reliable mitigation across the whole
 field is to drop the affected reference positions up front.
+
+This filter handles the *placement* ambiguity by removal; it is
+complementary to the *representation* canonicalization done upstream in
+Stage 1 §"Indel normalization (left-alignment)". Normalization
+consolidates the evidence for an indel that survives the complexity
+threshold into a single allele; DUST removes the regions where the
+complexity is high enough that even a consolidated call is untrustworthy.
+With normalization carrying the recall load inside callable repeats, the
+DUST threshold can be set primarily for false-positive control rather
+than doubling as the only defence against indel fragmentation.
 
 Filtering at the iterator level (rather than at Stage 1) keeps the
 per-sample `.psp` files faithful to what the BAM actually showed: the
