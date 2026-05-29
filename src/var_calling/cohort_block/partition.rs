@@ -1,7 +1,7 @@
 //! Variant-group partitioning of one worker window.
 //!
 //! After [`load_chunk_from_iters`](super::loader::load_chunk_from_iters)
-//! has filled a chunk and [`fix_boundaries`](super::pre_pass::fix_boundaries)
+//! has filled a chunk and [`finalise_chunk_boundaries`](super::chunk_boundaries::finalise_chunk_boundaries)
 //! has sliced it into worker windows, this stage takes one window
 //! and produces the variant-group work items the worker math will
 //! iterate.
@@ -219,12 +219,13 @@ pub enum PartitionError {
     #[error("scratch sized for {expected} samples but chunk has {got}")]
     ScratchSampleCountMismatch { expected: usize, got: usize },
 
-    /// A variant group would exceed `max_group_span`. The pre-pass
-    /// in [`fix_boundaries`](super::pre_pass::fix_boundaries) makes
-    /// this impossible for window-aligned groups — surfacing means
-    /// a single-position record's REF span alone exceeds the cap,
-    /// or the caller passed a `max_group_span` smaller than the
-    /// pre-pass used.
+    /// A variant group would exceed `max_group_span`. The chunk-
+    /// boundary finalisation pass
+    /// [`finalise_chunk_boundaries`](super::chunk_boundaries::finalise_chunk_boundaries)
+    /// makes this impossible for window-aligned groups — surfacing
+    /// means a single-position record's REF span alone exceeds the
+    /// cap, or the caller passed a `max_group_span` smaller than
+    /// the value the boundary-finalisation pass used.
     #[error(
         "variant group at {start}..{attempted_end} exceeds \
          max_group_span={max_group_span}"
@@ -246,8 +247,9 @@ pub enum PartitionError {
 /// iff `pos <= current_end` (the rolling max of `pos + ref_span -
 /// 1` across the group); otherwise it closes the open group and
 /// opens a new one. `attempted_end - start + 1` is checked against
-/// `max_group_span`; the pre-pass guarantees window-aligned groups
-/// stay under the cap, but the check defends against caller error.
+/// `max_group_span`; the chunk-boundary finalisation pass guarantees
+/// window-aligned groups stay under the cap, but the check defends
+/// against caller error.
 ///
 /// **DUST.** `masked_intervals` is a sorted, non-overlapping list
 /// of half-open 1-based genomic intervals to skip — typically the
@@ -260,7 +262,7 @@ pub enum PartitionError {
 /// `out` is cleared at entry — callers hold one persistent
 /// [`WindowPartition`] across windows. Same scratch-reuse contract
 /// as [`load_chunk_from_iters`](super::loader::load_chunk_from_iters)
-/// and [`fix_boundaries`](super::pre_pass::fix_boundaries).
+/// and [`finalise_chunk_boundaries`](super::chunk_boundaries::finalise_chunk_boundaries).
 pub fn partition_window(
     chunk: &MaterialisedChunk,
     window: &Range<u32>,

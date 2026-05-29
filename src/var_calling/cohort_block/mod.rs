@@ -15,21 +15,24 @@
 //!   [`ChunkLoadScratch`] + [`ChunkLoadError`]: read per-sample
 //!   record iterators, apply the cohort-wide variant-position
 //!   filter, compact survivors into the chunk.
-//! - [`pre_pass`] — [`fix_boundaries`] +
-//!   [`FixBoundariesScratch`] + [`FixBoundariesError`]: pick the
+//! - [`chunk_boundaries`] — [`finalise_chunk_boundaries`] +
+//!   [`BoundaryFinalisationScratch`] + [`BoundaryFinalisationError`]: pick the
 //!   chunk's `safe_end`, partition `[range.start, safe_end)` into
 //!   windows, split records past `safe_end` into carryover.
 
+pub mod chunk_boundaries;
 pub mod columns;
 pub mod driver;
 pub mod kernels;
 pub mod loader;
 pub mod partition;
-pub mod pre_pass;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 pub mod worker;
 
+pub use chunk_boundaries::{
+    BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
+};
 pub use columns::{MaterialisedChunk, SampleColumns};
 pub use driver::{
     ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
@@ -39,5 +42,4 @@ pub use loader::{
     ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, ChunkLoadStats, load_chunk_from_iters,
 };
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
-pub use pre_pass::{FixBoundariesError, FixBoundariesScratch, fix_boundaries};
 pub use worker::{WindowRunStats, into_shared_ref_fetcher, run_window};

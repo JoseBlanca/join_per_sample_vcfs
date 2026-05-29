@@ -7,12 +7,12 @@ use thiserror::Error;
 
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 
-/// Reusable scratch for the [`fix_boundaries`] pre-pass — the
+/// Reusable scratch for the [`finalise_chunk_boundaries`] pre-pass — the
 /// cohort-wide `(position, max_reach)` timeline plus its prefix-max
 /// helper column. The driver owns one of these next to the chunk
 /// loader's scratch.
 #[derive(Debug, Default)]
-pub struct FixBoundariesScratch {
+pub struct BoundaryFinalisationScratch {
     /// `(position, max_reach)` — one entry per **unique** position in
     /// the post-filter chunk, sorted ascending by position. `max_reach`
     /// is the maximum value of `position + ref_span - 1` across the
@@ -26,7 +26,7 @@ pub struct FixBoundariesScratch {
     prefix_max_reach: Vec<u32>,
 }
 
-impl FixBoundariesScratch {
+impl BoundaryFinalisationScratch {
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,10 +37,10 @@ impl FixBoundariesScratch {
     }
 }
 
-/// Errors surfaced by the [`fix_boundaries`] pre-pass.
+/// Errors surfaced by the [`finalise_chunk_boundaries`] pre-pass.
 #[non_exhaustive]
 #[derive(Error, Debug, PartialEq)]
-pub enum FixBoundariesError {
+pub enum BoundaryFinalisationError {
     /// The chunk contains records but no gap of width
     /// `> max_group_span` exists between any pair of adjacent
     /// cohort-wide positions, nor between the rightmost record and
@@ -110,18 +110,18 @@ pub enum FixBoundariesError {
 /// `carryover` is assumed empty on entry — the loader cleared it.
 /// On the chunk that ends at chromosome end, `safe_end == range.end`
 /// and no records carry over.
-pub fn fix_boundaries(
+pub fn finalise_chunk_boundaries(
     chunk: &mut MaterialisedChunk,
     carryover: &mut [SampleColumns],
-    scratch: &mut FixBoundariesScratch,
+    scratch: &mut BoundaryFinalisationScratch,
     max_group_span: u32,
     target_window_count: usize,
-) -> Result<(), FixBoundariesError> {
+) -> Result<(), BoundaryFinalisationError> {
     if target_window_count == 0 {
-        return Err(FixBoundariesError::ZeroTargetWindowCount);
+        return Err(BoundaryFinalisationError::ZeroTargetWindowCount);
     }
     if carryover.len() != chunk.n_samples() {
-        return Err(FixBoundariesError::CarryoverLengthMismatch {
+        return Err(BoundaryFinalisationError::CarryoverLengthMismatch {
             expected: chunk.n_samples(),
             got: carryover.len(),
         });
@@ -196,9 +196,9 @@ pub fn fix_boundaries(
 /// over to the next chunk's fresh grouper.
 fn pick_safe_end(
     chunk: &MaterialisedChunk,
-    scratch: &FixBoundariesScratch,
+    scratch: &BoundaryFinalisationScratch,
     max_group_span: u32,
-) -> Result<u32, FixBoundariesError> {
+) -> Result<u32, BoundaryFinalisationError> {
     // Empty chunk (no variant positions): the whole logical range
     // is safe.
     if scratch.timeline.is_empty() {
@@ -233,7 +233,7 @@ fn pick_safe_end(
         }
     }
 
-    Err(FixBoundariesError::NoSafeGap {
+    Err(BoundaryFinalisationError::NoSafeGap {
         chrom_id: chunk.chrom_id,
         range_start: chunk.range.start,
         range_end: chunk.range.end,
@@ -256,7 +256,7 @@ fn pick_safe_end(
 ///   safe positions are sparse, but never errors).
 fn emit_windows(
     chunk: &mut MaterialisedChunk,
-    scratch: &FixBoundariesScratch,
+    scratch: &BoundaryFinalisationScratch,
     target_window_count: usize,
 ) {
     let range_start = chunk.range.start;
@@ -309,7 +309,7 @@ fn slide_left_to_safe(
     desired: u32,
     min_open: u32,
     safe_end: u32,
-    scratch: &FixBoundariesScratch,
+    scratch: &BoundaryFinalisationScratch,
 ) -> Option<u32> {
     // Clamp the starting candidate into the open interval
     // `(min_open, safe_end)`. `safe_end` itself is not a valid
@@ -331,7 +331,7 @@ fn slide_left_to_safe(
 /// 2. no earlier variant's reach extends to or past `b` —
 ///    `prefix_max_reach[i] < b` where `i` is the largest timeline
 ///    index with `position < b`.
-fn is_internal_split_safe(b: u32, scratch: &FixBoundariesScratch) -> bool {
+fn is_internal_split_safe(b: u32, scratch: &BoundaryFinalisationScratch) -> bool {
     // partition_point returns the smallest index `i` with
     // `timeline[i].0 >= b`; positions strictly less than `b` are
     // `timeline[..pp]`.
@@ -353,17 +353,17 @@ fn is_internal_split_safe(b: u32, scratch: &FixBoundariesScratch) -> bool {
 mod tests {
     use super::*;
     use crate::var_calling::cohort_block::test_helpers::{
-        loaded_chunk, record, ref_plus_alt, run_pre_pass,
+        loaded_chunk, record, ref_plus_alt, run_finalise_chunk_boundaries,
     };
 
     #[test]
-    fn pre_pass_empty_chunk_sets_safe_end_to_range_end() {
+    fn finalise_empty_chunk_sets_safe_end_to_range_end() {
         let mut chunk = MaterialisedChunk::with_n_samples(2);
         chunk.chrom_id = 0;
         chunk.range = 1..1000;
         chunk.safe_end = 1000;
         let mut carry = vec![SampleColumns::empty(); 2];
-        run_pre_pass(&mut chunk, &mut carry, 100).unwrap();
+        run_finalise_chunk_boundaries(&mut chunk, &mut carry, 100).unwrap();
         assert_eq!(chunk.safe_end, 1000);
         assert_eq!(chunk.windows, vec![1..1000]);
         assert_eq!(carry[0].n_records(), 0);
@@ -371,13 +371,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_no_carryover_when_range_end_is_far_past_last_record() {
+    fn finalise_no_carryover_when_range_end_is_far_past_last_record() {
         // Single variant at position 50; chunk range goes out to 5000.
         // Gap to range.end is 4950 > max_group_span=100, so safe_end =
         // range.end and there's no carryover.
         let recs = vec![vec![record(50, ref_plus_alt(2, 4))]];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..5000, recs);
-        run_pre_pass(&mut chunk, &mut carry, 100).unwrap();
+        run_finalise_chunk_boundaries(&mut chunk, &mut carry, 100).unwrap();
         assert_eq!(chunk.safe_end, 5000);
         assert_eq!(chunk.windows, vec![1..5000]);
         assert_eq!(carry[0].n_records(), 0);
@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_splits_tail_at_internal_safe_gap() {
+    fn finalise_splits_tail_at_internal_safe_gap() {
         // Variants at 100, 105, then a big gap, then 600, 605, 610.
         // `range.end == 615` keeps the gap-to-range-end small (5 ≤
         // max_group_span=50), so case-A is bypassed and the pre-pass
@@ -399,7 +399,7 @@ mod tests {
             record(610, ref_plus_alt(3, 4)),
         ];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..615, vec![s0]);
-        run_pre_pass(&mut chunk, &mut carry, 50).unwrap();
+        run_finalise_chunk_boundaries(&mut chunk, &mut carry, 50).unwrap();
         assert_eq!(chunk.safe_end, 600);
         assert_eq!(chunk.windows, vec![1..600]);
         assert_eq!(chunk.per_sample[0].n_records(), 2);
@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_safe_end_equals_range_end_when_gap_to_right_is_wide() {
+    fn finalise_safe_end_equals_range_end_when_gap_to_right_is_wide() {
         // Same record layout as above but with range extended well past
         // the last record — case A (the range-end-is-far branch) must
         // pick safe_end = range.end and produce no carryover.
@@ -420,7 +420,7 @@ mod tests {
             record(610, ref_plus_alt(3, 4)),
         ];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..1000, vec![s0]);
-        run_pre_pass(&mut chunk, &mut carry, 50).unwrap();
+        run_finalise_chunk_boundaries(&mut chunk, &mut carry, 50).unwrap();
         assert_eq!(chunk.safe_end, 1000);
         assert_eq!(chunk.windows, vec![1..1000]);
         assert_eq!(carry[0].n_records(), 0);
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_returns_no_safe_gap_when_records_are_dense() {
+    fn finalise_returns_no_safe_gap_when_records_are_dense() {
         // Five records, all within max_group_span of each other and
         // less than max_group_span from range.end. No safe boundary
         // exists inside this chunk.
@@ -440,36 +440,38 @@ mod tests {
             record(260, ref_plus_alt(3, 4)),
         ];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..300, vec![s0]);
-        let err = run_pre_pass(&mut chunk, &mut carry, 100).unwrap_err();
-        assert!(matches!(err, FixBoundariesError::NoSafeGap { .. }));
+        let err = run_finalise_chunk_boundaries(&mut chunk, &mut carry, 100).unwrap_err();
+        assert!(matches!(err, BoundaryFinalisationError::NoSafeGap { .. }));
     }
 
     #[test]
-    fn pre_pass_rejects_zero_target_window_count() {
+    fn finalise_chunk_boundaries_rejects_zero_target_window_count() {
         let mut chunk = MaterialisedChunk::with_n_samples(1);
         chunk.range = 1..100;
         let mut carry = vec![SampleColumns::empty()];
-        let mut scratch = FixBoundariesScratch::new();
-        let err = fix_boundaries(&mut chunk, &mut carry, &mut scratch, 50, 0).unwrap_err();
-        assert_eq!(err, FixBoundariesError::ZeroTargetWindowCount);
+        let mut scratch = BoundaryFinalisationScratch::new();
+        let err =
+            finalise_chunk_boundaries(&mut chunk, &mut carry, &mut scratch, 50, 0).unwrap_err();
+        assert_eq!(err, BoundaryFinalisationError::ZeroTargetWindowCount);
     }
 
-    /// M30: `fix_boundaries` returns `CarryoverLengthMismatch` when
+    /// M30: `finalise_chunk_boundaries` returns `CarryoverLengthMismatch` when
     /// the supplied carryover slice's length differs from the chunk's
     /// `n_samples()`. Without this regression test, a refactor that
     /// moves the guard into a debug-assert (or drops it entirely)
     /// would surface the mismatch as an `index out of range` panic
     /// inside the splitting loop instead of a clean typed error.
     #[test]
-    fn pre_pass_rejects_mismatched_carryover_length() {
+    fn finalise_chunk_boundaries_rejects_mismatched_carryover_length() {
         let mut chunk = MaterialisedChunk::with_n_samples(2);
         chunk.range = 1..100;
         let mut carry = vec![SampleColumns::empty()]; // 1 sample, chunk has 2
-        let mut scratch = FixBoundariesScratch::new();
-        let err = fix_boundaries(&mut chunk, &mut carry, &mut scratch, 50, 1).unwrap_err();
+        let mut scratch = BoundaryFinalisationScratch::new();
+        let err =
+            finalise_chunk_boundaries(&mut chunk, &mut carry, &mut scratch, 50, 1).unwrap_err();
         assert_eq!(
             err,
-            FixBoundariesError::CarryoverLengthMismatch {
+            BoundaryFinalisationError::CarryoverLengthMismatch {
                 expected: 2,
                 got: 1
             }
@@ -481,14 +483,14 @@ mod tests {
     // ──────────────────────────────────────────────────────────────
 
     /// Helper: run with explicit `target_window_count`.
-    fn run_pre_pass_with_t(
+    fn run_finalise_chunk_boundaries_with_t(
         chunk: &mut MaterialisedChunk,
         carryover: &mut [SampleColumns],
         max_group_span: u32,
         target_window_count: usize,
-    ) -> Result<(), FixBoundariesError> {
-        let mut scratch = FixBoundariesScratch::new();
-        fix_boundaries(
+    ) -> Result<(), BoundaryFinalisationError> {
+        let mut scratch = BoundaryFinalisationScratch::new();
+        finalise_chunk_boundaries(
             chunk,
             carryover,
             &mut scratch,
@@ -498,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_t2_with_no_variants_splits_at_midpoint() {
+    fn chunk_boundaries_t2_with_no_variants_splits_at_midpoint() {
         // Empty chunk + T=2 → one boundary at the midpoint of the
         // logical range; both halves are valid windows.
         let mut chunk = MaterialisedChunk::with_n_samples(1);
@@ -506,7 +508,7 @@ mod tests {
         chunk.range = 1..1001;
         chunk.safe_end = 1001;
         let mut carry = vec![SampleColumns::empty(); 1];
-        run_pre_pass_with_t(&mut chunk, &mut carry, 100, 2).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 100, 2).unwrap();
         assert_eq!(chunk.safe_end, 1001);
         // Midpoint = 1 + 500 = 501; the probe is non-variant +
         // no-earlier-reach (no variants exist), so it's accepted as
@@ -515,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_t4_with_no_variants_splits_evenly() {
+    fn chunk_boundaries_t4_with_no_variants_splits_evenly() {
         // Empty chunk + T=4 → three boundaries at the 1/4, 2/4, 3/4
         // marks of the logical range.
         let mut chunk = MaterialisedChunk::with_n_samples(1);
@@ -523,12 +525,12 @@ mod tests {
         chunk.range = 1..401;
         chunk.safe_end = 401;
         let mut carry = vec![SampleColumns::empty(); 1];
-        run_pre_pass_with_t(&mut chunk, &mut carry, 50, 4).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 50, 4).unwrap();
         assert_eq!(chunk.windows, vec![1..101, 101..201, 201..301, 301..401]);
     }
 
     #[test]
-    fn pre_pass_t2_slides_left_off_variant_to_nearest_safe_position() {
+    fn chunk_boundaries_t2_slides_left_off_variant_to_nearest_safe_position() {
         // Variant at position 500 with ref_span=1; T=2 picks desired
         // boundary at 501 (midpoint of 1..1001). 501 is non-variant
         // and no earlier reach (variant at 500 reaches 500), so 501
@@ -541,7 +543,7 @@ mod tests {
         let s0 = vec![record(501, ref_plus_alt(2, 4))];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..1001, vec![s0]);
         // safe_end picked via case A — gap to 1001 is 499 > 100.
-        run_pre_pass_with_t(&mut chunk, &mut carry, 100, 2).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 100, 2).unwrap();
         assert_eq!(chunk.safe_end, 1001);
         // Slide-left lands at the first non-variant position below
         // the desired (501): 500.
@@ -549,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_t2_slides_left_off_deletion_reach() {
+    fn chunk_boundaries_t2_slides_left_off_deletion_reach() {
         // Crucial test: a deletion at pos 400 with ref_span=110
         // reaches 509. T=2 picks desired boundary at 501 (midpoint
         // of 1..1001). 501 is non-variant but IS inside the
@@ -571,7 +573,7 @@ mod tests {
             ],
         )];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..1001, vec![s0]);
-        run_pre_pass_with_t(&mut chunk, &mut carry, 200, 2).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 200, 2).unwrap();
         assert_eq!(chunk.safe_end, 1001);
         // Slide-left from desired=501. 501 is non-variant but
         // prefix_max_reach[idx for variants < 501] = 509 → unsafe.
@@ -582,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_t2_with_no_safe_internal_position_emits_single_window() {
+    fn chunk_boundaries_t2_with_no_safe_internal_position_emits_single_window() {
         // Variant at position 1 with ref_span reaching all the way
         // past the midpoint: only the chunk boundary can act as a
         // split. T=2 desired boundary slides all the way to
@@ -597,7 +599,7 @@ mod tests {
             ],
         )];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..1001, vec![s0]);
-        run_pre_pass_with_t(&mut chunk, &mut carry, 100, 2).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 100, 2).unwrap();
         // Desired boundary midpoint=501 slides left:
         //   - 501..600 inside reach → unsafe.
         //   - 1..1 (range_start) → loop exits without finding a
@@ -607,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_t_above_one_lands_boundaries_around_variant_cluster() {
+    fn chunk_boundaries_t_above_one_lands_boundaries_around_variant_cluster() {
         // T=4 over a variant cluster near the middle of the range.
         // Variants at 250 and 260 (ref_span=1 each); range 1..501,
         // safe_end=501 (case A — gap to 501 is 241 > max_group_span=100).
@@ -623,12 +625,12 @@ mod tests {
             record(260, ref_plus_alt(3, 4)),
         ];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..501, vec![s0]);
-        run_pre_pass_with_t(&mut chunk, &mut carry, 100, 4).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 100, 4).unwrap();
         assert_eq!(chunk.windows, vec![1..126, 126..251, 251..376, 376..501]);
     }
 
     #[test]
-    fn pre_pass_t_above_one_drops_boundaries_that_cannot_slide_above_min_open() {
+    fn chunk_boundaries_t_above_one_drops_boundaries_that_cannot_slide_above_min_open() {
         // A single wide-reach variant covers most of the chunk; T=4
         // desired boundaries at 251 / 501 / 751 all fall inside the
         // reach. The first probe slides left of the variant and
@@ -656,7 +658,7 @@ mod tests {
             ],
         )];
         let (mut chunk, mut carry) = loaded_chunk(0, 1..1001, vec![s0]);
-        run_pre_pass_with_t(&mut chunk, &mut carry, 100, 4).unwrap();
+        run_finalise_chunk_boundaries_with_t(&mut chunk, &mut carry, 100, 4).unwrap();
         assert_eq!(chunk.windows, vec![1..199, 199..1001]);
     }
 
@@ -672,7 +674,7 @@ mod tests {
     /// trivially safe, and `b = desired` is returned immediately.
     #[test]
     fn slide_left_to_safe_returns_desired_when_already_safe() {
-        let scratch = FixBoundariesScratch::new();
+        let scratch = BoundaryFinalisationScratch::new();
         // Empty timeline ⇒ no variants ⇒ every position is safe.
         let result = slide_left_to_safe(50, 0, 100, &scratch);
         assert_eq!(result, Some(50));
@@ -682,7 +684,7 @@ mod tests {
     /// down to `safe_end - 1` before the slide-left loop begins.
     #[test]
     fn slide_left_to_safe_clamps_above_safe_end() {
-        let scratch = FixBoundariesScratch::new();
+        let scratch = BoundaryFinalisationScratch::new();
         // desired = 200 but safe_end = 100. The clamp pulls b to
         // safe_end - 1 = 99; empty timeline ⇒ that's safe.
         let result = slide_left_to_safe(200, 0, 100, &scratch);
@@ -693,7 +695,7 @@ mod tests {
     /// function returns `None` (no safe position above the floor).
     #[test]
     fn slide_left_to_safe_returns_none_when_min_open_meets_desired() {
-        let scratch = FixBoundariesScratch::new();
+        let scratch = BoundaryFinalisationScratch::new();
         // Floor equals desired ⇒ b = 50, b > min_open (=50) is false,
         // loop body never executes ⇒ None.
         let result = slide_left_to_safe(50, 50, 100, &scratch);

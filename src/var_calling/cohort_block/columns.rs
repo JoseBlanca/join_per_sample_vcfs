@@ -406,7 +406,7 @@ impl SampleColumns {
 /// 1. The chunk loader produces a chunk with
 ///    `safe_end = range.end` and `windows` empty — the load already
 ///    applied the cohort-wide variant-position filter.
-/// 2. `fix_boundaries` walks the loaded chunk once, picks
+/// 2. `finalise_chunk_boundaries` walks the loaded chunk once, picks
 ///    `safe_end ≤ range.end` so no variant group can span the right
 ///    boundary into the next chunk, and partitions
 ///    `[range.start, safe_end)` into the [`Self::windows`] list. At
@@ -424,14 +424,14 @@ impl SampleColumns {
 pub struct MaterialisedChunk {
     pub chrom_id: u32,
     /// `[G_start, G_end)` — the initial target range. May be revised
-    /// down to a `safe_end ≤ G_end` by `fix_boundaries`.
+    /// down to a `safe_end ≤ G_end` by `finalise_chunk_boundaries`.
     pub range: Range<u32>,
     /// Right boundary chosen by the pre-pass. Records at positions
     /// `>= safe_end` are split into the carryover passed to the next
     /// chunk's load.
     pub safe_end: u32,
     /// Partition of `[range.start, safe_end)` into disjoint windows
-    /// produced by `fix_boundaries`. Tile the chunk left-to-right;
+    /// produced by `finalise_chunk_boundaries`. Tile the chunk left-to-right;
     /// each window is processed by one worker.
     pub windows: Vec<Range<u32>>,
     /// One [`SampleColumns`] per sample, sample-index aligned with

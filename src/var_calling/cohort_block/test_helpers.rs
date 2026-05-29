@@ -9,14 +9,14 @@
 use std::ops::Range;
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
+use crate::var_calling::cohort_block::chunk_boundaries::{
+    BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
+};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::cohort_block::loader::{
     ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
 use crate::var_calling::cohort_block::partition::WindowPartition;
-use crate::var_calling::cohort_block::pre_pass::{
-    FixBoundariesError, FixBoundariesScratch, fix_boundaries,
-};
 use crate::var_calling::per_position_merger::PerPositionPileups;
 use crate::var_calling::variant_grouping::OverlappingVariantGroup;
 
@@ -113,7 +113,7 @@ pub(crate) fn run_loader(
 
 /// Build a fresh chunk via [`run_loader`] and pair it with an
 /// empty carryover sized to the cohort. Convenient setup for the
-/// pre-pass tests.
+/// boundary-finalisation tests.
 pub(crate) fn loaded_chunk(
     chrom_id: u32,
     range: Range<u32>,
@@ -130,15 +130,15 @@ pub(crate) fn loaded_chunk(
     (chunk, carryover)
 }
 
-/// Run the pre-pass with `target_window_count = 1` and a freshly
-/// allocated [`FixBoundariesScratch`].
-pub(crate) fn run_pre_pass(
+/// Run the boundary-finalisation pass with `target_window_count = 1`
+/// and a freshly allocated [`BoundaryFinalisationScratch`].
+pub(crate) fn run_finalise_chunk_boundaries(
     chunk: &mut MaterialisedChunk,
     carryover: &mut [SampleColumns],
     max_group_span: u32,
-) -> Result<(), FixBoundariesError> {
-    let mut scratch = FixBoundariesScratch::new();
-    fix_boundaries(chunk, carryover, &mut scratch, max_group_span, 1)
+) -> Result<(), BoundaryFinalisationError> {
+    let mut scratch = BoundaryFinalisationScratch::new();
+    finalise_chunk_boundaries(chunk, carryover, &mut scratch, max_group_span, 1)
 }
 
 /// Mi16: byte-identity oracle that materialises one

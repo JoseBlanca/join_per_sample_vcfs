@@ -10,7 +10,7 @@
 //!
 //! **Why "drive" not "iterate"** — the driver owns the persistent
 //! scratch buffers across every chunk and every chromosome
-//! (`ChunkLoadScratch`, `FixBoundariesScratch`, `PartitionScratch`,
+//! (`ChunkLoadScratch`, `BoundaryFinalisationScratch`, `PartitionScratch`,
 //! the `MaterialisedChunk` + `WindowPartition` buffers, the
 //! carryover, the per-window `Vec<PosteriorRecord>`). All of them
 //! are `clear()`-ed on every iteration and re-filled, never
@@ -37,14 +37,14 @@ use crate::fasta::StreamingChromRefFetcher;
 use crate::fasta::fetcher::ChromRefFetchError;
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::cohort_block::chunk_boundaries::{
+    BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
+};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::cohort_block::loader::{
     ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
 use crate::var_calling::cohort_block::partition::{PartitionError, partition_window};
-use crate::var_calling::cohort_block::pre_pass::{
-    FixBoundariesError, FixBoundariesScratch, fix_boundaries,
-};
 use crate::var_calling::cohort_block::worker::{WorkerPool, prefetch_window_ref_bytes, run_window};
 use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
 use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
@@ -97,7 +97,7 @@ pub struct ChunkSizingParams {
     /// [the Phase B prereq plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md).
     pub target_variants_per_chunk: Option<NonZeroU32>,
     /// M7: number of parallel worker windows per chunk.
-    /// [`fix_boundaries`] places `target_window_count - 1` internal
+    /// [`finalise_chunk_boundaries`] places `target_window_count - 1` internal
     /// boundaries inside each chunk's `[range.start, safe_end)` so
     /// the [`WorkerPool`] can dispatch the per-window math
     /// concurrently. `NonZeroUsize::MIN` (1) preserves the
@@ -105,7 +105,7 @@ pub struct ChunkSizingParams {
     /// `0` is rejected at the type level. The previous shape was a
     /// bare `usize` where the driver silently mapped `0` to `1` via
     /// `.max(1)`, bypassing the pre-pass's
-    /// `FixBoundariesError::ZeroTargetWindowCount` validation.
+    /// `BoundaryFinalisationError::ZeroTargetWindowCount` validation.
     /// See [the Phase B plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md).
     pub target_window_count: NonZeroUsize,
 }
@@ -189,7 +189,7 @@ pub struct ChunkDriverStats {
     /// kept-position count per chunk — a quick sanity check that
     /// `target_variants_per_chunk` is doing what the operator expects.
     pub chunk_variants_total: u64,
-    /// Mi21: chunks where `fix_boundaries` produced fewer windows
+    /// Mi21: chunks where `finalise_chunk_boundaries` produced fewer windows
     /// than `params.sizing.target_window_count` requested. The pre-pass
     /// silently down-grades when safe positions are sparse; an
     /// operator setting `--worker-windows-per-chunk 8` and seeing
@@ -215,7 +215,7 @@ pub struct ChunkDriverStats {
 /// - **Reference / DUST**: `OpenRefFetcher` (per-chrom fetcher
 ///   construction), `ComputeDustMask` (chromosome-wide mask scan),
 ///   `PrefetchRefBytes` (per-window REF pre-fetch).
-/// - **Per-chunk pipeline**: `LoadChunk`, `FixBoundaries`, `Partition`
+/// - **Per-chunk pipeline**: `LoadChunk`, `FinaliseChunkBoundaries`, `Partition`
 ///   (each carries `chrom_id`), `RunWindow` (per-window math via
 ///   `run_window`).
 #[non_exhaustive]
@@ -290,10 +290,10 @@ pub enum ChunkDriverError {
         source: ChunkLoadError<PspReadError>,
     },
     #[error("failed to commit chunk boundaries on chromosome {chrom_id}")]
-    FixBoundaries {
+    FinaliseChunkBoundaries {
         chrom_id: u32,
         #[source]
-        source: FixBoundariesError,
+        source: BoundaryFinalisationError,
     },
     #[error("failed to partition window on chromosome {chrom_id}")]
     Partition {
@@ -404,7 +404,7 @@ pub fn drive_cohort_chunked(
 
     // Persistent buffers (scratch reuse across every chunk + every chrom).
     let mut chunk_scratch = ChunkLoadScratch::with_n_samples(n_samples);
-    let mut fix_scratch = FixBoundariesScratch::new();
+    let mut fix_scratch = BoundaryFinalisationScratch::new();
     let mut chunk = MaterialisedChunk::with_n_samples(n_samples);
     let mut carryover: Vec<SampleColumns> =
         (0..n_samples).map(|_| SampleColumns::empty()).collect();
@@ -663,7 +663,7 @@ fn drive_one_chrom_generic<W>(
     writer: &mut CohortVcfWriter,
     stats: &mut ChunkDriverStats,
     chunk_scratch: &mut ChunkLoadScratch,
-    fix_scratch: &mut FixBoundariesScratch,
+    fix_scratch: &mut BoundaryFinalisationScratch,
     chunk: &mut MaterialisedChunk,
     carryover: &mut [SampleColumns],
     worker_pool: &mut WorkerPool,
@@ -712,7 +712,7 @@ where
 
     let mut chunk_range_start: u32 = 1;
     let mut psp_cursor: u32 = 1;
-    // Re-used between load attempts when fix_boundaries returns
+    // Re-used between load attempts when finalise_chunk_boundaries returns
     // `NoSafeGap` and we have to retry the chunk with a wider range —
     // the load consumes the driver-owned carryover, so we keep a
     // shadow copy before each load and restore it on retry.
@@ -766,7 +766,7 @@ where
 }
 
 /// Hard cap on how much the chunk loader may grow a single chunk's
-/// nominal span when [`fix_boundaries`] cannot find a safe boundary —
+/// nominal span when [`finalise_chunk_boundaries`] cannot find a safe boundary —
 /// the plan's "fail loudly on pathological input" backstop. The cap
 /// is the largest multiplier of [`ChunkDriverParams::chunk_genomic_span`]
 /// we will attempt before surfacing `NoSafeGap` to the caller.
@@ -799,7 +799,7 @@ struct ChunkLoopState<'a, W: Read + Seek> {
     writer: &'a mut CohortVcfWriter,
     stats: &'a mut ChunkDriverStats,
     chunk_scratch: &'a mut ChunkLoadScratch,
-    fix_scratch: &'a mut FixBoundariesScratch,
+    fix_scratch: &'a mut BoundaryFinalisationScratch,
     chunk: &'a mut MaterialisedChunk,
     carryover: &'a mut [SampleColumns],
     carryover_snapshot: &'a mut [SampleColumns],
@@ -918,7 +918,7 @@ where
         // `.max(1)` driver-side fallback that bypassed the pre-pass's
         // `ZeroTargetWindowCount` validation.
         let target_window_count = state.params.sizing.target_window_count.get();
-        match fix_boundaries(
+        match finalise_chunk_boundaries(
             state.chunk,
             state.carryover,
             state.fix_scratch,
@@ -926,14 +926,14 @@ where
             target_window_count,
         ) {
             Ok(()) => {
-                // Mi21: surface when fix_boundaries silently produced
+                // Mi21: surface when finalise_chunk_boundaries silently produced
                 // fewer windows than the operator asked for.
                 if state.chunk.windows.len() < target_window_count {
                     state.stats.chunks_with_fewer_windows_than_requested += 1;
                 }
                 return Ok(());
             }
-            Err(FixBoundariesError::NoSafeGap { .. }) if attempt_span < max_span => {
+            Err(BoundaryFinalisationError::NoSafeGap { .. }) if attempt_span < max_span => {
                 // M14: retry with double the span. Restore the carryover
                 // the previous chunk handed in (the load drained it).
                 for (carry, snap) in state
@@ -950,7 +950,7 @@ where
                 continue;
             }
             Err(source) => {
-                return Err(ChunkDriverError::FixBoundaries { chrom_id, source });
+                return Err(ChunkDriverError::FinaliseChunkBoundaries { chrom_id, source });
             }
         }
     }
