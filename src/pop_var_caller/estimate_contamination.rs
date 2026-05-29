@@ -81,6 +81,16 @@ pub struct EstimateContaminationArgs {
     #[arg(long)]
     pub batch_assignment: Option<PathBuf>,
 
+    /// Soft lower bound on the post-filter variant count per chunk.
+    /// The loader grows each chunk's BP span adaptively until the
+    /// kept-position count crosses this target — decoupling
+    /// per-chunk workload from PSP block size and per-region
+    /// variant density. Pass `0` (the default) to keep the legacy
+    /// BP-only loop. Same semantics as the var-calling subcommand's
+    /// knob.
+    #[arg(long, default_value_t = 0)]
+    pub target_variants_per_chunk: u32,
+
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
     pub psp_files: Vec<PathBuf>,
@@ -448,11 +458,7 @@ pub fn run_estimate_contamination(
         readers,
         chromosomes,
         DEFAULT_CHUNK_GENOMIC_SPAN,
-        // Phase B step 4 will wire `--target-variants-per-chunk`
-        // through here; for now the loader takes one pull attempt
-        // of `DEFAULT_CHUNK_GENOMIC_SPAN` per chunk (legacy
-        // behaviour).
-        0,
+        args.target_variants_per_chunk,
     );
 
     // 8. Run side-pass.

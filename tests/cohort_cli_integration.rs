@@ -157,6 +157,7 @@ fn estimate_contamination_args(
         output,
         threads: None,
         batch_assignment: None,
+        target_variants_per_chunk: 0,
         psp_files,
         // Relaxed convergence: any one block of stability ends the run.
         // 0.1 is the engine's hard upper bound (STABILITY_TOLERANCE_RANGE_MAX).
