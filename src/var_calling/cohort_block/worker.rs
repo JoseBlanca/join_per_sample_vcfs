@@ -483,7 +483,7 @@ fn build_posterior_record_columnar(
         });
     }
 
-    Ok(Some(PosteriorRecord {
+    let mut record = PosteriorRecord {
         locus,
         alleles,
         ploidy: per_group_cfg.ploidy,
@@ -499,7 +499,15 @@ fn build_posterior_record_columnar(
         other_scalars: scratch.projection.other_scalars.clone(),
         chain_anchor_flags: scratch.chain_anchor_flags.clone(),
         diagnostics: em_outputs.diagnostics,
-    }))
+    };
+    // Drop candidate ALT alleles no sample's argmax genotype uses, so
+    // the VCF never carries AC=0 alleles (and no phantom 0/0 records
+    // after `bcftools norm -m`). This is the column-native cohort path's
+    // copy of the prune `run_em_for_record` applies on the row-shape /
+    // from-bam path — `run_em_columnar` returns the raw `EmOutputs`
+    // without it, so the chokepoint is here. No-op for biallelic groups.
+    record.prune_unsupported_alleles(posterior_cfg.max_gq_phred);
+    Ok(Some(record))
 }
 
 fn unify_error_to_merger(
