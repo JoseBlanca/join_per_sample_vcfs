@@ -55,9 +55,9 @@ incrementally as each finding is processed.
 | M1  | Major    | `#[derive(Default)]` on `SampleColumns` yields invariant-violating value | Apply | — | No | — | — | — |
 | M2  | Major    | `prefetch_window_ref_bytes` drops inner Vec<u8> allocations | Apply | — | No | — | — | — |
 | M3  | Major    | `detect_compound_candidates_columnar` allocates BTreeMaps per call | Apply | — | No (proptest part needs care) | — | — | — |
-| M4  | Major    | `ChunkDriverError` design: `#[from]` funnel + mechanism-named variants | Apply | — | No | — | — | — |
+| M4  | Major    | `ChunkDriverError` design: `#[from]` funnel + mechanism-named variants | Apply | Applied (Wave 3) | No | `src/var_calling/cohort_block/driver.rs` | lib 1026 pass; cohort_cli integration 21 pass | Bundles M21; drops blanket `#[from]` on `Io` and `PspRead`; renames every variant by operation; adds `#[source]` + chrom/window/path context fields. |
 | M5  | Major    | `let _ = remove_file` swallows tmp-cleanup error | Apply | Applied | No (bundled with B1) | (same as B1) | (covered by B1) | No |
-| M6  | Major    | `u32_from_usize` wraps silently in release | Ask | — | Yes (Q5: typed error vs `try_into().expect`?) | — | — | — |
+| M6  | Major    | `u32_from_usize` wraps silently in release | Apply with adaptation | Applied (Wave 3) | No | `src/var_calling/cohort_block/columns.rs` | lib 1026 pass | Picked the `try_into().expect(...)` option per the review's "if the cost of plumbing `Result` through is too high" clause. Wrap silently is gone; both debug and release now panic with `"CSR offset exceeds u32::MAX"` on overflow. Typed-error variant deferred (would ripple through `SampleColumns::push_record`, `push_row_from`, `clear`, every loader site). |
 | M7  | Major    | `params.target_window_count.max(1)` silently rewrites CLI input | Apply | — | Yes (Q3 — picks the propagate-vs-default branch) | — | — | — |
 | M8  | Major    | `effective_initial_span` no-op chain | Apply | — | No | — | — | — |
 | M9  | Major    | `target_variants_per_chunk == 0` sentinel-as-toggle | Ask | — | Yes (Q3) | — | — | — |
@@ -72,7 +72,7 @@ incrementally as each finding is processed.
 | M18 | Major    | `#[allow(dead_code)] chain_id_scratch` is unused | Apply | Applied | No (deleted field + clear + test reference) | `src/var_calling/cohort_block/kernels/unify_alleles.rs` | cohort_block 89 pass | No |
 | M19 | Major    | `partition_window` doesn't validate sorted `masked_intervals` | Apply | Applied | No | `src/var_calling/cohort_block/partition.rs` | full lib 1026 pass | The review also suggested a release-mode `PartitionError::MaskNotSorted` variant; deferred per minimal-diff discipline (debug_assert covers the regression-test case; only production caller `compute_dust_mask_for_chrom` is sdust-derived, which is sorted by construction). |
 | M20 | Major    | `emit_or_drop` filter order not pinned by test | Apply | — | Yes (Q4 — clarifies oracle policy) | — | — | — |
-| M21 | Major    | `emit_or_drop` doesn't surface VCF write errors with locus context | Apply | — | No (bundled with M4) | — | — | — |
+| M21 | Major    | `emit_or_drop` doesn't surface VCF write errors with locus context | Apply | Applied (Wave 3) | No (bundled with M4) | (same as M4) | (covered by M4) | `WriteVcf { chrom_id, start, end, source }` carries the failing record's locus |
 | M22 | Major    | `enforce_max_alleles` tie-break not tested against row-shape oracle | Apply | — | No | — | — | — |
 | M23 | Major    | `n_alleles < 2` silent skip has no counter | Apply | — | No | — | — | — |
 | M24 | Major    | `prefetch_window_ref_bytes` may fetch past chrom_length | Apply | — | No | — | — | — |

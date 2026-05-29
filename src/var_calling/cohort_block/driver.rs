@@ -137,27 +137,138 @@ pub struct ChunkDriverStats {
 }
 
 /// Errors surfaced by the chunk-loop driver.
+///
+/// M4 / M21 — variants name the *operation* being attempted, not the
+/// subsystem. Inner errors are carried via `#[source]` so
+/// `source()` produces the canonical cause-chain rendering; the
+/// `#[error]` message describes what the driver was doing when the
+/// failure occurred. Drop categories:
+///
+/// - **PSP I/O at construction time**: `OpenPspFile` (`io::Error` on
+///   `File::open`), `OpenPspReader` (`PspReadError` on header parse).
+/// - **Cohort VCF writer**: `OpenVcfWriter` (constructor),
+///   `FinishVcfWriter` (terminal rename + flush), `WriteVcf`
+///   (per-record; carries the failing record's `(chrom_id, start, end)`
+///   per M21).
+/// - **Reference / DUST**: `OpenRefFetcher` (per-chrom fetcher
+///   construction), `ComputeDustMask` (chromosome-wide mask scan),
+///   `PrefetchRefBytes` (per-window REF pre-fetch).
+/// - **Per-chunk pipeline**: `LoadChunk`, `FixBoundaries`, `Partition`
+///   (each carries `chrom_id`), `RunWindow` (per-window math via
+///   `run_window`).
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChunkDriverError {
-    #[error("chunk load: {0}")]
-    ChunkLoad(#[from] ChunkLoadError<PspReadError>),
-    #[error("fix_boundaries: {0}")]
-    FixBoundaries(#[from] FixBoundariesError),
-    #[error("partition_window: {0}")]
-    Partition(#[from] PartitionError),
-    #[error("posterior engine: {0}")]
-    Posterior(#[from] PosteriorEngineError),
-    #[error("per-group merger: {0}")]
-    PerGroupMerger(#[from] PerGroupMergerError),
-    #[error("reference fetch: {0}")]
-    RefFetch(#[from] ChromRefFetchError),
-    #[error("vcf write: {0}")]
-    VcfWrite(#[from] VcfWriteError),
-    #[error("psp read: {0}")]
-    PspRead(#[from] PspReadError),
-    #[error("io: {0}")]
-    Io(#[from] io::Error),
+    #[error("failed to open PSP file for sample {sample_idx} at {path}")]
+    OpenPspFile {
+        sample_idx: usize,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read PSP header for sample {sample_idx} at {path}")]
+    OpenPspReader {
+        sample_idx: usize,
+        path: PathBuf,
+        #[source]
+        source: PspReadError,
+    },
+    #[error("failed to open cohort VCF writer at {output}")]
+    OpenVcfWriter {
+        output: PathBuf,
+        #[source]
+        source: VcfWriteError,
+    },
+    #[error("failed to finalise cohort VCF writer at {output}")]
+    FinishVcfWriter {
+        output: PathBuf,
+        #[source]
+        source: VcfWriteError,
+    },
+    /// M21: per-record write failure carries the failing record's
+    /// `(chrom_id, start, end)` so operators triaging a mid-run I/O
+    /// failure (ENOSPC, broken pipe, etc.) can locate the source
+    /// position.
+    #[error("failed to write VCF record at {chrom_id}:{start}..{end}")]
+    WriteVcf {
+        chrom_id: u32,
+        start: u32,
+        end: u32,
+        #[source]
+        source: VcfWriteError,
+    },
+    #[error("failed to open reference fetcher for contig {contig}")]
+    OpenRefFetcher {
+        contig: String,
+        #[source]
+        source: ChromRefFetchError,
+    },
+    #[error("failed to compute DUST mask for contig {contig}")]
+    ComputeDustMask {
+        contig: String,
+        #[source]
+        source: ChromRefFetchError,
+    },
+    #[error("DUST mask scan failed for contig {contig}")]
+    DustMaskIo {
+        contig: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to pre-fetch REF bytes for window on chromosome {chrom_id}")]
+    PrefetchRefBytes {
+        chrom_id: u32,
+        #[source]
+        source: ChromRefFetchError,
+    },
+    #[error("failed to load chunk on chromosome {chrom_id}")]
+    LoadChunk {
+        chrom_id: u32,
+        #[source]
+        source: ChunkLoadError<PspReadError>,
+    },
+    #[error("failed to commit chunk boundaries on chromosome {chrom_id}")]
+    FixBoundaries {
+        chrom_id: u32,
+        #[source]
+        source: FixBoundariesError,
+    },
+    #[error("failed to partition window on chromosome {chrom_id}")]
+    Partition {
+        chrom_id: u32,
+        #[source]
+        source: PartitionError,
+    },
+    /// Per-window math (`run_window`) failed: layer 1 / 2 / 3 / EM
+    /// surfaced an error. Does not currently carry the failing
+    /// chromosome / window — `PosteriorEngineError`'s inner variants
+    /// carry their own `RecordLocus` for diagnostic.
+    #[error("per-window math failed")]
+    RunWindow(#[source] PosteriorEngineError),
+    /// Carried for `From<PerGroupMergerError>` compatibility with
+    /// callers that still surface that type directly (e.g. the
+    /// `var-calling-from-bam` shim before its own migration). Wraps
+    /// the error with no extra context — provenance lives in the
+    /// inner variants.
+    #[error("per-group merger error")]
+    PerGroupMerger(#[source] PerGroupMergerError),
+}
+
+// `From` impls — kept narrow. Each `From` has exactly one production
+// origin in this module, so provenance is preserved by the variant
+// itself. `?` sites use explicit `.map_err(|source| …)` to attach the
+// chrom/window/path context that the variant fields require.
+
+impl From<PosteriorEngineError> for ChunkDriverError {
+    fn from(source: PosteriorEngineError) -> Self {
+        Self::RunWindow(source)
+    }
+}
+
+impl From<PerGroupMergerError> for ChunkDriverError {
+    fn from(source: PerGroupMergerError) -> Self {
+        Self::PerGroupMerger(source)
+    }
 }
 
 /// Top-level entry: drive the chunk loop across every chromosome
@@ -184,13 +295,27 @@ pub fn drive_cohort_chunked(
     // Open one PSP reader per sample. Reused across chromosomes;
     // `region_records` re-seeks via the block index per call.
     let mut psp_readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(psp_paths.len());
-    for path in psp_paths {
-        let file = File::open(path)?;
+    for (sample_idx, path) in psp_paths.iter().enumerate() {
+        let file = File::open(path).map_err(|source| ChunkDriverError::OpenPspFile {
+            sample_idx,
+            path: path.clone(),
+            source,
+        })?;
         let buf = BufReader::with_capacity(DRIVER_PSP_BUFFER_BYTES, file);
-        psp_readers.push(PspReader::new(buf)?);
+        let reader = PspReader::new(buf).map_err(|source| ChunkDriverError::OpenPspReader {
+            sample_idx,
+            path: path.clone(),
+            source,
+        })?;
+        psp_readers.push(reader);
     }
 
-    let mut writer = CohortVcfWriter::new(metadata, writer_cfg)?;
+    let mut writer = CohortVcfWriter::new(metadata, writer_cfg).map_err(|source| {
+        ChunkDriverError::OpenVcfWriter {
+            output: output.to_path_buf(),
+            source,
+        }
+    })?;
 
     // Persistent buffers (scratch reuse across every chunk + every chrom).
     let mut chunk_scratch = ChunkLoadScratch::with_n_samples(n_samples);
@@ -231,7 +356,12 @@ pub fn drive_cohort_chunked(
 
     match driver_result {
         Ok(()) => {
-            writer.finish()?;
+            writer
+                .finish()
+                .map_err(|source| ChunkDriverError::FinishVcfWriter {
+                    output: output.to_path_buf(),
+                    source,
+                })?;
             Ok(stats)
         }
         Err(e) => {
@@ -275,7 +405,17 @@ fn emit_or_drop(
     if !record.diagnostics.converged {
         stats.records_unconverged += 1;
     }
-    writer.write_record(&record)?;
+    // M21: attach the failing record's locus to the typed write
+    // error so operators triaging mid-run I/O failures can locate the
+    // source position from the error chain.
+    writer
+        .write_record(&record)
+        .map_err(|source| ChunkDriverError::WriteVcf {
+            chrom_id: record.locus.chrom_id,
+            start: record.locus.start,
+            end: record.locus.end,
+            source,
+        })?;
     stats.records_written += 1;
     Ok(())
 }
@@ -360,6 +500,7 @@ fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> (u64, u64, u
 /// intervals the partition expects.
 fn compute_dust_mask_for_chrom(
     fetcher: &StreamingChromRefFetcher,
+    contig: &str,
     chrom_length: u32,
     dust_cfg: &DustFilterConfig,
 ) -> Result<Vec<std::ops::Range<u32>>, ChunkDriverError> {
@@ -371,12 +512,22 @@ fn compute_dust_mask_for_chrom(
     // (~90 MB for tomato chrom 1) just to re-iterate them — defeating
     // the chunk driver's "per-chunk memory bounded by
     // `target_variants_per_chunk × n_samples`" contract.
+    let base_iter = fetcher
+        .iter_bases()
+        .map_err(|source| ChunkDriverError::ComputeDustMask {
+            contig: contig.to_string(),
+            source,
+        })?;
     let intervals = sdust_mask_streaming(
-        fetcher.iter_bases()?.map(|r| r.map_err(io::Error::other)),
+        base_iter.map(|r| r.map_err(io::Error::other)),
         chrom_length,
         dust_cfg.window(),
         dust_cfg.threshold(),
-    )?;
+    )
+    .map_err(|source| ChunkDriverError::DustMaskIo {
+        contig: contig.to_string(),
+        source,
+    })?;
 
     Ok(intervals
         .into_iter()
@@ -411,11 +562,17 @@ where
         return Ok(());
     }
 
-    let fetcher = StreamingChromRefFetcher::for_contig(fasta_path, &chrom.name)?;
+    let fetcher =
+        StreamingChromRefFetcher::for_contig(fasta_path, &chrom.name).map_err(|source| {
+            ChunkDriverError::OpenRefFetcher {
+                contig: chrom.name.clone(),
+                source,
+            }
+        })?;
     let masked_intervals: Vec<std::ops::Range<u32>> = if params.no_complexity_filter {
         Vec::new()
     } else {
-        compute_dust_mask_for_chrom(&fetcher, chrom_length, &params.dust_cfg)?
+        compute_dust_mask_for_chrom(&fetcher, &chrom.name, chrom_length, &params.dust_cfg)?
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let shared_fetcher: SharedRefFetcher = Arc::new(fetcher);
@@ -569,7 +726,8 @@ where
             max_load_span,
             iters,
             carryover,
-        )?;
+        )
+        .map_err(|source| ChunkDriverError::LoadChunk { chrom_id, source })?;
         stats.chunks_loaded += 1;
         stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
@@ -593,7 +751,9 @@ where
                     .min(max_span);
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(source) => {
+                return Err(ChunkDriverError::FixBoundaries { chrom_id, source });
+            }
         }
     }
 
@@ -618,12 +778,14 @@ where
             max_group_span,
             &mut slot.partition_scratch,
             &mut slot.partition,
-        )?;
+        )
+        .map_err(|source| ChunkDriverError::Partition { chrom_id, source })?;
         prefetch_window_ref_bytes(
             &slot.partition,
             &*shared_fetcher,
             &mut slot.pre_fetched_ref_bytes,
-        )?;
+        )
+        .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
     }
 
     // ── Phase 2 (parallel): the per-window math (layers 1+2+3 + EM
@@ -646,7 +808,8 @@ where
                 &mut slot.scratch,
                 &mut slot.output_buf,
             )
-        })?;
+        })
+        .map_err(ChunkDriverError::RunWindow)?;
 
     // ── Sequential drain in window order — preserves the prior
     //    per-record emit order even when step 4 runs the workers

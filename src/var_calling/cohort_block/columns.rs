@@ -455,17 +455,25 @@ impl MaterialisedChunk {
     }
 }
 
-/// Convert a `usize` length into a `u32` CSR offset. The PSP format
-/// already caps per-chunk record counts well below `u32::MAX`; a
-/// debug assertion catches any accidental overflow in tests, and
-/// release builds wrap silently — same contract as PSP's CSR writers.
+/// Convert a `usize` length into a `u32` CSR offset.
+///
+/// M6: the PSP format caps per-chunk record counts well below
+/// `u32::MAX` for any realistic input — but PSP is a disk-derived
+/// boundary, so a corrupted or adversarial input could in principle
+/// push the offsets past `u32::MAX` and silently corrupt every
+/// downstream column index. The previous "release builds wrap
+/// silently" contract turned that into wrong likelihoods on the
+/// affected chunk. The new contract: panic loudly with a named
+/// invariant in both debug and release builds. The cost on the hot
+/// path is one branch — well below the cost of a single CSR push.
 #[inline]
 pub(crate) fn u32_from_usize(value: usize) -> u32 {
-    debug_assert!(
-        value <= u32::MAX as usize,
-        "CSR offset exceeds u32::MAX ({value})",
-    );
-    value as u32
+    // PANIC-FREE on realistic inputs: PSP per-chunk record counts are
+    // bounded by `target_variants_per_chunk × n_samples` (operator
+    // input, capped at u32::MAX by the field type itself). A panic
+    // here surfaces a corrupted PSP or an upstream invariant break;
+    // either way it is a hard error, not a silent miscompute.
+    u32::try_from(value).expect("CSR offset exceeds u32::MAX")
 }
 
 #[cfg(test)]
