@@ -15,7 +15,8 @@ stages only.
 
 Wall time is reported as the sum of the two stages; peak RSS as the
 max (they run sequentially, not concurrently). GVCF inputs must
-already exist; they're built by run_gatk_cohort.sh (stage 1).
+already exist; they're built by stage 1 of
+`../../lib/run_gatk.sh bench.config.sh cohort`.
 
 Note on availability:
   GATK isn't in Homebrew. On macOS you either install it natively

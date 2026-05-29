@@ -109,7 +109,7 @@ def _default_source_psp() -> Path:
     if not psps:
         sys.exit(
             f"no source .psp in {PSP_DIR}; set SOURCE_PSP=<path> or "
-            "rebuild tomato1 PSPs (run_ours_cohort.sh stage 1)"
+            "rebuild tomato1 PSPs (../../lib/run_ours.sh bench.config.sh cohort, stage 1)"
         )
     return psps[0]
 
