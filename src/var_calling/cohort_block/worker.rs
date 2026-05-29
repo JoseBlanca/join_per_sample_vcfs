@@ -6,15 +6,14 @@
 //! [`project_scalars_columnar`],
 //! [`compute_log_likelihoods_columnar`]) and feeds the resulting
 //! column-native buffers straight into
-//! [`run_em_columnar`](crate::var_calling::posterior_engine::run_em_columnar)
-//! through borrowed slices + a [`ColumnarAllelesView`]. No row-shape
+//! [`run_em_columnar`] through borrowed slices + a [`ColumnarAllelesView`]. No row-shape
 //! `MergedRecord` is ever materialised on the production path.
 //! `PosteriorRecord` is still row-shape (the VCF writer's input);
 //! `Vec<MergedAllele>` is allocated once per group at emit time
 //! rather than at EM input time.
 //!
 //! The Phase A.0 row-shape adapter
-//! ([`build_overlapping_variant_group`]) is retained `#[cfg(test)]`
+//! `build_overlapping_variant_group` is retained `#[cfg(test)]`
 //! as the byte-identity oracle for the kernels' unit tests.
 
 use std::sync::Arc;
@@ -229,11 +228,11 @@ impl WorkerPool {
 ///   `[group_starts[g], group_ends[g]]`. Driver-side pre-fetch
 ///   lifts the fetcher state out of the per-window math so the
 ///   worker is `Sync`-friendly for Phase B's parallel dispatch.
-/// - `per_group_config`: tuning for the column-native kernels
+/// - `per_group_cfg`: tuning for the column-native kernels
 ///   (`ploidy`, `max_alleles`, `max_alleles_lh_calc`). The
 ///   `batch_size` field is ignored — Phase A.1 doesn't batch.
-/// - `posterior_config`: tuning passed straight to
-///   [`PosteriorEngine`].
+/// - `posterior_cfg`: tuning passed straight to
+///   [`PosteriorEngine`](crate::var_calling::posterior_engine::PosteriorEngine).
 /// - `scratch`: per-window columnar scratch (
 ///   [`ColumnarPipelineScratch`]). The driver owns one per worker
 ///   slot and reuses it across every window in every chunk.
@@ -244,8 +243,8 @@ pub fn run_window(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     pre_fetched_ref_bytes: &[Vec<u8>],
-    per_group_config: PerGroupMergerConfig,
-    posterior_config: PosteriorEngineConfig,
+    per_group_cfg: PerGroupMergerConfig,
+    posterior_cfg: PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
     output: &mut Vec<PosteriorRecord>,
 ) -> Result<(), PosteriorEngineError> {
@@ -265,8 +264,8 @@ pub fn run_window(
             partition,
             g,
             group_ref_bytes,
-            &per_group_config,
-            &posterior_config,
+            &per_group_cfg,
+            &posterior_cfg,
             scratch,
         )? {
             output.push(record);
@@ -313,8 +312,8 @@ fn build_posterior_record_columnar(
     partition: &WindowPartition,
     group_idx: usize,
     ref_bytes: &[u8],
-    per_group_config: &PerGroupMergerConfig,
-    posterior_config: &PosteriorEngineConfig,
+    per_group_cfg: &PerGroupMergerConfig,
+    posterior_cfg: &PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
 ) -> Result<Option<PosteriorRecord>, PosteriorEngineError> {
     let chrom_id = chunk.chrom_id;
@@ -336,7 +335,7 @@ fn build_posterior_record_columnar(
         group_idx,
         ref_bytes,
         n_samples,
-        per_group_config.max_alleles,
+        per_group_cfg.max_alleles,
         &mut scratch.unify,
         &mut scratch.unified,
     )
@@ -345,7 +344,7 @@ fn build_posterior_record_columnar(
     let n_alleles = scratch.unified.n_alleles();
 
     // Row-shape parity — see [`PerGroupMerger::process_group`].
-    if n_alleles > per_group_config.max_alleles_lh_calc {
+    if n_alleles > per_group_cfg.max_alleles_lh_calc {
         scratch.lh_cap_groups_skipped += 1;
         scratch.lh_cap_alleles_in_skipped += n_alleles as u64;
         return Ok(None);
@@ -370,7 +369,7 @@ fn build_posterior_record_columnar(
         chrom_id,
         start: group_start,
         end: group_end,
-        ploidy: per_group_config.ploidy,
+        ploidy: per_group_cfg.ploidy,
     };
     compute_log_likelihoods_columnar(
         chunk,
@@ -418,7 +417,7 @@ fn build_posterior_record_columnar(
         let view = ColumnarAllelesView::new(&scratch.unified);
         let inputs = EmInputs {
             locus,
-            ploidy: per_group_config.ploidy,
+            ploidy: per_group_cfg.ploidy,
             n_samples,
             n_genotypes,
             alleles: &view,
@@ -428,7 +427,7 @@ fn build_posterior_record_columnar(
         };
         run_em_columnar(
             inputs,
-            posterior_config,
+            posterior_cfg,
             &scratch.math,
             &mut scratch.record_scratch,
         )?
@@ -456,7 +455,7 @@ fn build_posterior_record_columnar(
     Ok(Some(PosteriorRecord {
         locus,
         alleles,
-        ploidy: per_group_config.ploidy,
+        ploidy: per_group_cfg.ploidy,
         n_samples,
         n_genotypes: em_outputs.n_genotypes,
         allele_frequencies: em_outputs.allele_frequencies,
@@ -636,7 +635,10 @@ pub(crate) fn build_overlapping_variant_group(
 /// natural type for the per-chromosome ref fetcher held by the
 /// driver — `run_window` derefs into a `&dyn ChromRefFetcher` for
 /// the columnar layer 1 fetch.
-pub fn shared_ref_fetcher<F>(fetcher: F) -> SharedRefFetcher
+// M28: verb-named constructor. Bare-noun function names are reserved
+// for field-like accessors; converting constructors are
+// `from_X` / `into_X` / `to_X`.
+pub fn into_shared_ref_fetcher<F>(fetcher: F) -> SharedRefFetcher
 where
     F: ChromRefFetcher + Send + 'static,
 {

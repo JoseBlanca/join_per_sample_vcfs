@@ -4,7 +4,7 @@
 **Source review:** [cohort_block_2026-05-29.md](cohort_block_2026-05-29.md)
 **Source state reviewed against:** branch `cohort-within-chromosome-parallel`, commit `36989d6f53460042c5219d0ff5fa6d67a7b1b129` (review committed at `536e8db`).
 **Execution mode:** interactive
-**Overall status:** In progress — Wave 1 (Blockers + M5/M11 unblockers + quick-win Majors M14/M17/M18/M19) complete; remaining 28 Majors + 26 Minors + Nits + B5 staged for follow-up waves per the user's "apply all structural refactors" decision on Q4.
+**Overall status:** In progress — Wave 1 (Blockers + M5/M11 unblockers + quick-win Majors M14/M17/M18/M19) and Wave 2 (mechanical Majors M10/M27/M28 + small Minors Mi14/Mi25/Mi26) complete. Remaining 24 Majors + 23 Minors + Nits + B5 staged for follow-up waves per the user's "apply all structural refactors" decision on Q4.
 
 ---
 
@@ -16,8 +16,8 @@
 - Minors: 26
 - Nits: grouped (16 clippy errors + 14 `#[allow]` annotations needing justification + several small style items)
 
-### Outcome totals (Wave 1)
-- Applied: 11 (B1, B2, B3, B4, M5, M11, M14, M17, M18, M19, B4-test, B1-tests)
+### Outcome totals (Waves 1–2)
+- Applied: 17 (Wave 1: B1, B2, B3, B4, M5, M11, M14, M17, M18, M19 + B4-test + 2 B1-tests; Wave 2: M10, M27, M28, Mi14, Mi25, Mi26)
 - Applied with adaptation: 0
 - Already fixed: 0
 - Deferred: 47 (remaining — staged for Wave 2 onward per Q4 "apply all structural refactors")
@@ -61,7 +61,7 @@ incrementally as each finding is processed.
 | M7  | Major    | `params.target_window_count.max(1)` silently rewrites CLI input | Apply | — | Yes (Q3 — picks the propagate-vs-default branch) | — | — | — |
 | M8  | Major    | `effective_initial_span` no-op chain | Apply | — | No | — | — | — |
 | M9  | Major    | `target_variants_per_chunk == 0` sentinel-as-toggle | Ask | — | Yes (Q3) | — | — | — |
-| M10 | Major    | 2 in-scope `cargo doc` unresolved-link errors | Apply | — | No | — | — | — |
+| M10 | Major    | 2 in-scope `cargo doc` unresolved-link errors | Apply | Applied (Wave 2) | No | `src/var_calling/cohort_block/worker.rs` | `cargo doc --no-deps` no longer reports the two `cohort_block/worker.rs:17,236` errors; remaining 14 are pre-existing out-of-scope per the review | No |
 | M11 | Major    | `VarCallingArgs` API drift breaks bench + 2 examples | Apply | Applied | No | `benches/cohort_e2e_perf.rs`, `examples/profile_cohort_e2e.rs`, `examples/dhat_var_calling.rs` | clippy --all-targets: 3 E0063 errors cleared; 16 in-scope clippy errors remain (tracked under Nits) | No |
 | M12 | Major    | `load_and_run_chunk_with_retry` 19 params / 5 phases | Defer | — | Yes (Q6: refactor scope) | — | — | — |
 | M13 | Major    | `load_chunk_from_iters` 9 params; needs `ChunkLoadExtent` struct | Defer | — | Yes (Q6) | — | — | — |
@@ -78,8 +78,8 @@ incrementally as each finding is processed.
 | M24 | Major    | `prefetch_window_ref_bytes` may fetch past chrom_length | Apply | — | No | — | — | — |
 | M25 | Major    | Five `expect/unwrap` sites lack `// PANIC-FREE:` comments | Apply | — | No (mechanical) | — | — | — |
 | M26 | Major    | `pos + ref_span - 1` plain arithmetic on PSP-derived input | Apply | — | No | — | — | — |
-| M27 | Major    | `*_cfg` vs `*_config` naming inconsistency across driver/worker | Apply | — | No | — | — | — |
-| M28 | Major    | `shared_ref_fetcher` noun-named function | Apply | — | No | — | — | — |
+| M27 | Major    | `*_cfg` vs `*_config` naming inconsistency across driver/worker | Apply | Applied (Wave 2) | No | `src/var_calling/cohort_block/worker.rs` | lib 1026 pass; renamed `posterior_config` → `posterior_cfg`, `per_group_config` → `per_group_cfg` (14 sites) | No |
+| M28 | Major    | `shared_ref_fetcher` noun-named function | Apply | Applied (Wave 2) | No | `src/var_calling/cohort_block/worker.rs`, `src/var_calling/cohort_block/mod.rs` | lib 1026 pass; `pub use` updated | No |
 | M29 | Major    | No tests for `SampleCountMismatch` / `CarryoverLengthMismatch` (loader) | Apply | — | No | — | — | — |
 | M30 | Major    | No test for `CarryoverLengthMismatch` (pre_pass) | Apply | — | No | — | — | — |
 | M31 | Major    | No concurrency test for `par_iter_mut` driver path | Apply | — | No | — | — | — |
@@ -97,7 +97,7 @@ incrementally as each finding is processed.
 | Mi11 | Minor   | `run_window` takes `posterior_config` by value | Apply | — | No (bundled with Mi9 borrow refactor) | — | — | — |
 | Mi12 | Minor   | Double-clone of `projection_buf` in unify | Apply | — | No | — | — | — |
 | Mi13 | Minor   | Three `pub` items have no out-of-module caller | Apply | — | Yes (gated by Q1) | — | — | — |
-| Mi14 | Minor   | `match Ok | Err` should merge arms | Apply | — | No | — | — | — |
+| Mi14 | Minor   | `match Ok | Err` should merge arms | Apply | Applied (Wave 2) | No | `src/var_calling/cohort_block/pre_pass.rs`, `src/var_calling/cohort_block/partition.rs` | lib 1026 pass | No |
 | Mi15 | Minor   | Three files past the soft-cap line count | Defer | — | Yes (Q6) | — | — | — |
 | Mi16 | Minor   | `build_overlapping_variant_group` vestigial cross-module reach | Apply | — | No (subsumes part of M10's worker.rs:17 link error) | — | — | — |
 | Mi17 | Minor   | Three `Vec<Vec<_>>` jagged arrays should be CSR | Defer | — | Yes (Q6) | — | — | — |
@@ -108,8 +108,8 @@ incrementally as each finding is processed.
 | Mi22 | Minor   | `drain_rows_from_into` boundary tests missing | Apply | — | No | — | — | — |
 | Mi23 | Minor   | `slide_left_to_safe` direct unit tests missing | Apply | — | No | — | — | — |
 | Mi24 | Minor   | `cohort_e2e_perf.rs` lacks `// REGRESSION THRESHOLD` comment | Apply | — | No | — | — | — |
-| Mi25 | Minor   | `clippy::doc_lazy_continuation` ×2 in `test_helpers.rs` | Apply | — | No | — | — | — |
-| Mi26 | Minor   | Three `rustdoc::redundant_explicit_links` | Apply | — | No | — | — | — |
+| Mi25 | Minor   | `clippy::doc_lazy_continuation` ×2 in `test_helpers.rs` | Apply | Applied (Wave 2) | No | `src/var_calling/cohort_block/test_helpers.rs` | clippy `doc_lazy_continuation` errors at test_helpers.rs:20,21 cleared | No |
+| Mi26 | Minor   | Three `rustdoc::redundant_explicit_links` | Apply | Applied (Wave 2) | No | `src/var_calling/cohort_block/driver.rs`, `src/var_calling/cohort_block/worker.rs` | three `redundant_explicit_links` warnings at driver.rs:105/108 and worker.rs:9 cleared | No |
 | Nits | Nits     | 16 clippy errors + 14 `#[allow]` annotations + small style items | Apply | — | No (single mechanical pass) | — | — | — |
 
 ## 3. Questions asked and answers

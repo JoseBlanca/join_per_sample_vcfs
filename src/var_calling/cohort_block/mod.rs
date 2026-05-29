@@ -38,4 +38,4 @@ pub use driver::{
 pub use loader::{ChunkLoadError, ChunkLoadScratch, ChunkLoadStats, load_chunk_from_iters};
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
 pub use pre_pass::{FixBoundariesError, FixBoundariesScratch, fix_boundaries};
-pub use worker::{run_window, shared_ref_fetcher};
+pub use worker::{into_shared_ref_fetcher, run_window};

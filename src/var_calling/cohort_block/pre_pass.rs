@@ -170,8 +170,7 @@ pub fn fix_boundaries(
     //            into carryover. Carryover is assumed empty here.
     for (sample_idx, sample) in chunk.per_sample.iter_mut().enumerate() {
         let split_row_idx = match sample.binary_search_position(safe_end) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
+            Ok(idx) | Err(idx) => idx,
         };
         sample.drain_rows_from_into(split_row_idx, &mut carryover[sample_idx]);
     }

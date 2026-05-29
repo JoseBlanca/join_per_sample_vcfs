@@ -15,10 +15,10 @@ use crate::var_calling::cohort_block::pre_pass::{
     FixBoundariesError, FixBoundariesScratch, fix_boundaries,
 };
 
-/// Build an [`AlleleObservation`] with a fully-specified `num_obs`
-/// + `q_sum` + `chain_ids` triple. The strand-bias and MAPQ moments
-/// are filled in from `num_obs` with stable default shapes — no
-/// downstream test on this slice inspects them.
+/// Build an [`AlleleObservation`] with a fully-specified
+/// `(num_obs, q_sum, chain_ids)` triple. The strand-bias and MAPQ
+/// moments are filled in from `num_obs` with stable default shapes
+/// — no downstream test on this slice inspects them.
 pub(crate) fn allele(
     seq: &[u8],
     num_obs: u32,

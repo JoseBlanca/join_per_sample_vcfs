@@ -102,11 +102,10 @@ pub struct ChunkDriverParams {
     /// [the Phase B prereq plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md).
     pub target_variants_per_chunk: u32,
     /// Number of parallel worker windows per chunk.
-    /// [`fix_boundaries`](super::pre_pass::fix_boundaries) places
-    /// `target_window_count - 1` internal boundaries inside each
-    /// chunk's `[range.start, safe_end)` so the
-    /// [`WorkerPool`](super::worker::WorkerPool) can dispatch the
-    /// per-window math concurrently. `1` (default) preserves the
+    /// [`fix_boundaries`] places `target_window_count - 1` internal
+    /// boundaries inside each chunk's `[range.start, safe_end)` so
+    /// the [`WorkerPool`] can dispatch the per-window math
+    /// concurrently. `1` (default) preserves the
     /// sequential single-window-per-chunk behaviour byte-for-byte.
     /// See [the Phase B plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md).
     pub target_window_count: usize,

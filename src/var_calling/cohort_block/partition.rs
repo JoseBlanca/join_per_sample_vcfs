@@ -306,8 +306,7 @@ pub fn partition_window(
     // is the right starting cursor.
     for (s, sample) in chunk.per_sample.iter().enumerate() {
         let cursor = match sample.binary_search_position(window.start) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
+            Ok(idx) | Err(idx) => idx,
         };
         scratch.sample_cursors[s] = cursor;
     }
