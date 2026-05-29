@@ -112,6 +112,7 @@ def _(bench_selector, csv, mo, tsv_by_bench):
 
 @app.cell
 def _():
+    import bisect
     import math
 
     import matplotlib.pyplot as plt
@@ -322,7 +323,82 @@ def _():
         fig.tight_layout()
         return fig
 
-    return PALETTE, plot_metrics, plot_pr_scatter, plot_qual, plot_venn, plt
+    def qual_sweep(tp_quals, fp_quals, n_positives):
+        """Sweep a QUAL cutoff over a caller's calls. At each candidate
+        threshold t (every distinct QUAL value), keep calls with
+        QUAL >= t and recompute the confusion counts:
+          TP(t) = TP-labelled calls with QUAL >= t
+          FP(t) = FP-labelled calls with QUAL >= t
+          FN(t) = n_positives - TP(t)   (truth not recovered at t)
+        n_positives = TP+FN total (all reference variants for the class),
+        so recall is anchored to the full truth, not just emitted calls.
+        Returns the list of operating points (low->high threshold)."""
+        tps = sorted(tp_quals)
+        fps = sorted(fp_quals)
+        candidates = sorted(set(tps) | set(fps))
+        points = []
+        for t in candidates:
+            tp = len(tps) - bisect.bisect_left(tps, t)
+            fp = len(fps) - bisect.bisect_left(fps, t)
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+            rec = tp / n_positives if n_positives > 0 else 0.0
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+            points.append({"t": t, "tp": tp, "fp": fp,
+                           "precision": prec, "recall": rec, "f1": f1})
+        return points
+
+    def plot_roc(qual_rows, rows, cls):
+        """PR curve (parametric in QUAL) + F1-vs-threshold per caller.
+        The dot on the PR curve and the dotted vertical line mark each
+        caller's F1-optimal threshold. Returns (fig, best) where best
+        maps caller -> its max-F1 operating point."""
+        callers_r = sorted({r[0] for r in qual_rows if r[1] == cls})
+        positives = {r["caller"]: r["tp"] + r["fn"]
+                     for r in rows if r["class"] == cls}
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.2))
+        best = {}
+        for c in callers_r:
+            tpq = [r[3] for r in qual_rows
+                   if r[0] == c and r[1] == cls and r[2] == "TP"]
+            fpq = [r[3] for r in qual_rows
+                   if r[0] == c and r[1] == cls and r[2] == "FP"]
+            pts = qual_sweep(tpq, fpq, positives.get(c, len(tpq)))
+            if not pts:
+                continue
+            colour = PALETTE.get(c, "#555555")
+            ax1.plot([p["recall"] for p in pts], [p["precision"] for p in pts],
+                     color=colour, lw=1.6, label=c)
+            ax2.plot([p["t"] for p in pts], [p["f1"] for p in pts],
+                     color=colour, lw=1.6, label=c)
+            bp = max(pts, key=lambda p: p["f1"])
+            best[c] = bp
+            ax1.scatter([bp["recall"]], [bp["precision"]], color=colour,
+                        s=80, edgecolor="black", linewidth=0.5, zorder=4)
+            ax2.axvline(bp["t"], color=colour, ls=":", alpha=0.7)
+        ax1.set_xlabel("recall")
+        ax1.set_ylabel("precision")
+        ax1.set_xlim(0, 1.02)
+        ax1.set_ylim(0, 1.02)
+        ax1.grid(alpha=0.3)
+        ax1.legend(fontsize=8, loc="lower left")
+        ax1.set_title(f"{cls} — precision-recall (dot = max-F1 cutoff)")
+        # Zoom the threshold axis to the region around the optima — the
+        # QUAL tail runs to ~20k and would otherwise squash everything.
+        if best:
+            xmax = max(2.5 * bp["t"] for bp in best.values()) or 1.0
+            ax2.set_xlim(0, xmax)
+        ax2.set_xlabel("QUAL threshold")
+        ax2.set_ylabel("F1")
+        ax2.grid(alpha=0.3)
+        ax2.legend(fontsize=8, loc="lower right")
+        ax2.set_title(f"{cls} — F1 vs QUAL threshold (dotted = optimum)")
+        fig.suptitle("QUAL sweep — finding the best per-caller cutoff",
+                     fontsize=13, y=1.01)
+        fig.tight_layout()
+        return fig, best
+
+    return (PALETTE, plot_metrics, plot_pr_scatter, plot_qual, plot_roc,
+            plot_venn, qual_sweep, plt)
 
 
 @app.cell
@@ -428,6 +504,45 @@ def _(bins_sel, class_sel, density_sel, logy_sel, mo, plot_qual, qmax_sel, qual_
         qual_rows, class_sel.value, bins_sel.value, qmax_sel.value,
         density_sel.value, logy_sel.value,
     )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+    ## QUAL sweep — best per-caller cutoff (ROC-style)
+
+    Sweeping a QUAL threshold over each caller's calls traces a
+    precision-recall curve: raising the cutoff drops low-QUAL calls,
+    trading recall for precision. The dot marks each caller's
+    **F1-optimal** threshold; the right panel shows F1 vs threshold
+    directly. Recall is anchored to the full reference (TP+FN), so it
+    reflects truth missed, not just calls dropped. Uses the variant
+    class selected above.
+    """)
+    return
+
+
+@app.cell
+def _(class_sel, mo, plot_roc, qual_rows, rows):
+    mo.stop(not qual_rows, mo.md(""))
+    roc_fig, roc_best = plot_roc(qual_rows, rows, class_sel.value)
+    roc_fig
+    return (roc_best,)
+
+
+@app.cell
+def _(class_sel, mo, roc_best):
+    mo.stop(not roc_best, mo.md(""))
+    _md = f"### F1-optimal QUAL threshold — {class_sel.value}\n\n"
+    _md += "| caller | best QUAL | TP | FP | precision | recall | F1 |\n"
+    _md += "|---|---:|---:|---:|---:|---:|---:|\n"
+    for _c, _bp in sorted(roc_best.items()):
+        _md += (f"| {_c} | {_bp['t']:.1f} | {_bp['tp']} | {_bp['fp']} | "
+                f"{_bp['precision']:.4f} | {_bp['recall']:.4f} | "
+                f"{_bp['f1']:.4f} |\n")
+    mo.md(_md)
     return
 
 
