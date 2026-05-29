@@ -460,7 +460,7 @@ mod tests {
         ref_fetcher: SharedRefFetcher,
         max_alleles: usize,
     ) -> (Vec<f64>, usize, u32, u32, u32) {
-        let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
+        let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,

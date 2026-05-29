@@ -13,8 +13,9 @@
 //! rather than at EM input time.
 //!
 //! The Phase A.0 row-shape adapter
-//! `build_overlapping_variant_group` is retained `#[cfg(test)]`
-//! as the byte-identity oracle for the kernels' unit tests.
+//! `build_overlapping_variant_group` is retained `#[cfg(test)]` in
+//! `super::test_helpers` (Mi16) as the byte-identity oracle for the
+//! kernels' unit tests.
 
 use std::sync::Arc;
 
@@ -40,11 +41,6 @@ use crate::var_calling::posterior_engine::backends::InterpUnivariateSimdMath;
 use crate::var_calling::posterior_engine::{
     AllelesView, EmInputs, PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
     RecordScratch, run_em_columnar,
-};
-#[cfg(test)]
-use crate::{
-    pileup_record::PileupRecord, var_calling::per_position_merger::PerPositionPileups,
-    var_calling::variant_grouping::OverlappingVariantGroup,
 };
 
 /// Reusable scratch for the column-native pipeline. The driver owns
@@ -632,49 +628,6 @@ fn compute_log_likelihoods_error_to_merger(
     }
 }
 
-/// Build one [`OverlappingVariantGroup`] from group `g` of
-/// `partition`. Per-position records are materialised on demand
-/// from the chunk's columnar slices via
-/// [`SampleColumns::materialise_record`](super::columns::SampleColumns::materialise_record).
-///
-/// Retained from Phase A.0 as the byte-identity oracle in the
-/// kernels' unit tests. Not on the production path — `run_window`
-/// builds [`MergedRecord`]s column-natively via
-/// [`build_merged_record_columnar`].
-#[cfg(test)]
-pub(crate) fn build_overlapping_variant_group(
-    chunk: &MaterialisedChunk,
-    partition: &WindowPartition,
-    g: usize,
-    n_samples: usize,
-    chrom_id: u32,
-) -> OverlappingVariantGroup {
-    let position_range = partition.position_range_for_group(g);
-    let mut records: Vec<PerPositionPileups> = Vec::with_capacity(position_range.len());
-    for p in position_range {
-        let pos = partition.positions[p];
-        let mut per_sample: Vec<Option<PileupRecord>> = vec![None; n_samples];
-        let sample_range = partition.sample_range_for_position(p);
-        for k in sample_range {
-            let sample_idx = partition.samples_at_pos[k] as usize;
-            let row_idx = partition.rows_at_pos[k] as usize;
-            per_sample[sample_idx] =
-                Some(chunk.per_sample[sample_idx].materialise_record(chrom_id, row_idx));
-        }
-        records.push(PerPositionPileups {
-            chrom_id,
-            pos,
-            per_sample,
-        });
-    }
-    OverlappingVariantGroup {
-        chrom_id,
-        start: partition.group_starts[g],
-        end: partition.group_ends[g],
-        records,
-    }
-}
-
 /// Construct the `SharedRefFetcher` shape `run_window` expects from
 /// an owned [`ChromRefFetcher`] implementor. The Arc is still the
 /// natural type for the per-chromosome ref fetcher held by the
@@ -746,10 +699,12 @@ mod tests {
     use crate::var_calling::cohort_block::partition::{
         PartitionScratch, WindowPartition, partition_window,
     };
-    use crate::var_calling::cohort_block::test_helpers::{loaded_chunk, record, ref_plus_alt};
+    use crate::var_calling::cohort_block::test_helpers::{
+        build_overlapping_variant_group, loaded_chunk, record, ref_plus_alt,
+    };
     use crate::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
     use crate::var_calling::posterior_engine::PosteriorEngine;
-    use crate::var_calling::variant_grouping::GrouperError;
+    use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
     /// Nits (Wave 6): byte-identity oracle shape — `(seq,
     /// is_compound, constituents)`. Naming the triple drops the

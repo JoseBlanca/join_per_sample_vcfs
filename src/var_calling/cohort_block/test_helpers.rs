@@ -11,9 +11,12 @@ use std::ops::Range;
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::cohort_block::loader::{ChunkLoadScratch, load_chunk_from_iters};
+use crate::var_calling::cohort_block::partition::WindowPartition;
 use crate::var_calling::cohort_block::pre_pass::{
     FixBoundariesError, FixBoundariesScratch, fix_boundaries,
 };
+use crate::var_calling::per_position_merger::PerPositionPileups;
+use crate::var_calling::variant_grouping::OverlappingVariantGroup;
 
 /// Build an [`AlleleObservation`] with a fully-specified
 /// `(num_obs, q_sum, chain_ids)` triple. The strand-bias and MAPQ
@@ -132,4 +135,51 @@ pub(crate) fn run_pre_pass(
 ) -> Result<(), FixBoundariesError> {
     let mut scratch = FixBoundariesScratch::new();
     fix_boundaries(chunk, carryover, &mut scratch, max_group_span, 1)
+}
+
+/// Mi16: byte-identity oracle that materialises one
+/// [`OverlappingVariantGroup`] from group `g` of `partition`. Per-
+/// position records are materialised on demand from the chunk's
+/// columnar slices via
+/// [`SampleColumns::materialise_record`](super::columns::SampleColumns::materialise_record).
+///
+/// Retained from Phase A.0 as the byte-identity oracle in the
+/// kernels' unit tests. Not on the production path — `run_window`
+/// builds merged records column-natively via
+/// `build_posterior_record_columnar`.
+///
+/// Lifted from `worker.rs` so the cross-module test reach reads as
+/// "test helper imported from `test_helpers`" rather than "test
+/// helper reached back through the `worker` module surface".
+pub(crate) fn build_overlapping_variant_group(
+    chunk: &MaterialisedChunk,
+    partition: &WindowPartition,
+    g: usize,
+    n_samples: usize,
+    chrom_id: u32,
+) -> OverlappingVariantGroup {
+    let position_range = partition.position_range_for_group(g);
+    let mut records: Vec<PerPositionPileups> = Vec::with_capacity(position_range.len());
+    for p in position_range {
+        let pos = partition.positions[p];
+        let mut per_sample: Vec<Option<PileupRecord>> = vec![None; n_samples];
+        let sample_range = partition.sample_range_for_position(p);
+        for k in sample_range {
+            let sample_idx = partition.samples_at_pos[k] as usize;
+            let row_idx = partition.rows_at_pos[k] as usize;
+            per_sample[sample_idx] =
+                Some(chunk.per_sample[sample_idx].materialise_record(chrom_id, row_idx));
+        }
+        records.push(PerPositionPileups {
+            chrom_id,
+            pos,
+            per_sample,
+        });
+    }
+    OverlappingVariantGroup {
+        chrom_id,
+        start: partition.group_starts[g],
+        end: partition.group_ends[g],
+        records,
+    }
 }

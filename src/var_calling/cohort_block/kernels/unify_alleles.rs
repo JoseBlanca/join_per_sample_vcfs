@@ -1077,7 +1077,7 @@ mod tests {
         group_idx: usize,
         ref_fetcher: SharedRefFetcher,
     ) -> Vec<(Vec<u8>, bool)> {
-        let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
+        let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,
@@ -1372,7 +1372,7 @@ mod tests {
         group_idx: usize,
         ref_fetcher: SharedRefFetcher,
     ) -> Vec<OracleAllele> {
-        let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
+        let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,
@@ -1725,7 +1725,7 @@ mod tests {
 
         let fetcher = shared_mock(&ref_full, 1);
         let oracle = {
-            let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
+            let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
                 &chunk,
                 &partition,
                 0,
