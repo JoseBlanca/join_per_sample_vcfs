@@ -95,6 +95,15 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub no_complexity_filter: bool,
 
+    /// Soft lower bound on the post-filter variant count per chunk.
+    /// The loader grows each chunk's BP span adaptively until the
+    /// kept-position count crosses this target — decoupling worker
+    /// workload from PSP block size and per-region variant density.
+    /// Pass `0` (the default) to keep the legacy BP-only loop (one
+    /// pull of `--chunk-genomic-span` BP per chunk).
+    #[arg(long, default_value_t = 0)]
+    pub target_variants_per_chunk: u32,
+
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
     pub psp_files: Vec<PathBuf>,
@@ -377,9 +386,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
         min_mapq_diff_t: args.cohort.min_mapq_diff_t,
         chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
-        // Variant-bounded chunk loading default: off. CLI flag wired
-        // in Phase B step 5.
-        target_variants_per_chunk: 0,
+        target_variants_per_chunk: args.target_variants_per_chunk,
     };
     let chunk_stats = drive_cohort_chunked(
         &args.psp_files,
@@ -419,6 +426,8 @@ fn chunk_stats_to_cohort_stats(stats: ChunkDriverStats) -> CohortDriveStats {
         records_dropped_low_mapq_diff_t: stats.records_dropped_low_mapq_diff_t,
         lh_cap_groups_skipped: stats.lh_cap_groups_skipped,
         lh_cap_alleles_in_skipped: stats.lh_cap_alleles_in_skipped,
+        chunks_loaded: stats.chunks_loaded,
+        chunk_variants_total: stats.chunk_variants_total,
     }
 }
 
@@ -513,8 +522,17 @@ fn print_run_summary(
     } else {
         String::new()
     };
+    let chunks_loaded_note = if stats.chunks_loaded > 0 {
+        let avg = stats.chunk_variants_total as f64 / stats.chunks_loaded as f64;
+        format!(
+            " chunks_loaded={} avg_variants_per_chunk={:.1}",
+            stats.chunks_loaded, avg,
+        )
+    } else {
+        String::new()
+    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}{}{}",
         sample_names.len(),
         stats.records_written,
         effective_threads,
@@ -525,6 +543,7 @@ fn print_run_summary(
         dropped_low_alt_obs_note,
         dropped_low_mapq_diff_t_note,
         lh_cap_note,
+        chunks_loaded_note,
     );
 }
 

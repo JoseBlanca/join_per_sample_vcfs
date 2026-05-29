@@ -533,18 +533,22 @@ where
         } else {
             nominal_end
         };
-        let psp_inclusive_end = chunk_range_end.saturating_sub(1).min(chrom_length);
+
+        let initial_load_span = chunk_range_end - chunk_range_start;
+        // The variant-bounded extension cap is the same chrom-side
+        // ceiling the outer NoSafeGap retry uses. PSP iterators must
+        // be opened with this same cap so the loader's internal
+        // extension can keep pulling beyond `initial_load_span`
+        // without exhausting the iterator early.
+        let extension_cap_end = chrom_one_past_end.saturating_add(last_chunk_logical_extension);
+        let max_load_span = extension_cap_end.saturating_sub(chunk_range_start);
+        let psp_inclusive_end = extension_cap_end.saturating_sub(1).min(chrom_length);
 
         let iters: Vec<_> = psp_readers
             .iter_mut()
             .map(|r| r.region_records(chrom_id, psp_cursor, psp_inclusive_end))
             .collect();
 
-        let initial_load_span = chunk_range_end - chunk_range_start;
-        // Variant-bounded extension cap: never grow past the
-        // chrom-side end the outer NoSafeGap retry would have used.
-        let extension_cap_end = chrom_one_past_end.saturating_add(last_chunk_logical_extension);
-        let max_load_span = extension_cap_end.saturating_sub(chunk_range_start);
         let load_stats = load_chunk_from_iters(
             chunk_scratch,
             chunk,

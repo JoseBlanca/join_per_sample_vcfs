@@ -121,6 +121,16 @@ pub struct CohortDriveStats {
     /// got dropped without re-reading the input. Sourced from
     /// [`crate::var_calling::per_group_merger::LhCapStats::alleles_total_in_skipped`].
     pub lh_cap_alleles_in_skipped: u64,
+    /// Total chunks loaded by the chunk-based driver — populated
+    /// when the var-calling driver is the chunked one. Zero under
+    /// the streaming driver.
+    pub chunks_loaded: u64,
+    /// Sum of post-filter `variant_count` across every loaded
+    /// chunk. Divided by `chunks_loaded` it gives the average
+    /// kept-position count per chunk — a sanity check that the
+    /// `--target-variants-per-chunk` knob is doing what the
+    /// operator expects.
+    pub chunk_variants_total: u64,
 }
 
 /// Bundle of per-stage configs consumed by
