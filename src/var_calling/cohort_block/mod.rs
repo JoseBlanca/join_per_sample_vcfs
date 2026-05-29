@@ -40,4 +40,4 @@ pub use loader::{
 };
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
 pub use pre_pass::{FixBoundariesError, FixBoundariesScratch, fix_boundaries};
-pub use worker::{into_shared_ref_fetcher, run_window};
+pub use worker::{WindowRunStats, into_shared_ref_fetcher, run_window};

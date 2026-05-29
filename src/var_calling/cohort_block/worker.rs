@@ -78,25 +78,45 @@ pub struct ColumnarPipelineScratch {
     /// symmetry with the Phase A.1 design where the backend was a
     /// `PosteriorEngine` parameter.
     math: InterpUnivariateSimdMath,
+}
+
+/// M15: per-window run statistics produced by `run_window`. Lives on
+/// the `WorkerSlot` as a sibling to `pipeline_scratch` so the driver
+/// drains it after each parallel-dispatch round and rolls the
+/// per-slot counts into [`ChunkDriverStats`](super::driver::ChunkDriverStats).
+///
+/// Previously these three counters lived inside
+/// `ColumnarPipelineScratch` next to the per-group scratch buffers,
+/// mixing two different lifetimes (scratch is per-group; counters are
+/// per-`run_window`). Splitting them gives `ColumnarPipelineScratch`
+/// a single, scratch-only purpose and lets the driver's stats-rollup
+/// code talk to `WindowRunStats` directly instead of through a
+/// `take_*` API.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WindowRunStats {
     /// Number of groups skipped because
-    /// `unified.alleles.len() > cfg.max_alleles_lh_calc`. Accumulated
-    /// across every `run_window` call; the driver reads + clears via
-    /// [`Self::take_lh_cap_stats`] after each call to roll into
-    /// [`ChunkDriverStats`](super::driver::ChunkDriverStats).
-    lh_cap_groups_skipped: u64,
+    /// `unified.alleles.len() > cfg.max_alleles_lh_calc`.
+    pub lh_cap_groups_skipped: u64,
     /// Sum of `unified.alleles.len()` across every skipped group —
     /// the row-shape merger reports this in `allele_lh_cap_hit:
     /// alleles_total=N`.
-    lh_cap_alleles_in_skipped: u64,
+    pub lh_cap_alleles_in_skipped: u64,
     /// M23: groups whose post-unification allele set has only REF
-    /// (every ALT was absorbed into the OTHER pool by the
-    /// max-alleles cap, or none survived the per-position projection
-    /// dedup). These are emitted as `Ok(None)` from
-    /// `build_posterior_record_columnar` (matching the row-shape
-    /// merger's REF-only no-op skip). Accumulated across every
-    /// `run_window` call; the driver reads + clears via
-    /// [`Self::take_post_unify_ref_only_count`] after each call.
-    groups_skipped_post_unify_ref_only: u64,
+    /// (every ALT was absorbed into the OTHER pool by the max-alleles
+    /// cap, or none survived the per-position projection dedup). These
+    /// are emitted as `Ok(None)` from `build_posterior_record_columnar`
+    /// (matching the row-shape merger's REF-only no-op skip).
+    pub groups_skipped_post_unify_ref_only: u64,
+}
+
+impl WindowRunStats {
+    /// Reset every counter to zero while preserving the field shape.
+    /// The driver's drain calls `std::mem::take(&mut slot.stats)`
+    /// directly; this method exists for tests that want to clear in
+    /// place without moving.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// [`AllelesView`] over [`UnifiedAllelesColumns`]. Phase A.2 step 2:
@@ -137,23 +157,6 @@ impl ColumnarPipelineScratch {
     pub fn empty() -> Self {
         Self::default()
     }
-
-    /// Take the LH-cap skip counters accumulated since the last
-    /// `take_lh_cap_stats` call. The driver rolls these into
-    /// `ChunkDriverStats` after every `run_window`.
-    pub fn take_lh_cap_stats(&mut self) -> (u64, u64) {
-        let g = std::mem::take(&mut self.lh_cap_groups_skipped);
-        let a = std::mem::take(&mut self.lh_cap_alleles_in_skipped);
-        (g, a)
-    }
-
-    /// M23: take the post-unify-REF-only skip count accumulated
-    /// since the last call. Mirrors [`Self::take_lh_cap_stats`]; the
-    /// driver rolls it into `ChunkDriverStats` after every
-    /// `run_window`.
-    pub fn take_post_unify_ref_only_count(&mut self) -> u64 {
-        std::mem::take(&mut self.groups_skipped_post_unify_ref_only)
-    }
 }
 
 /// Per-worker state for one window: everything the driver needs to
@@ -186,6 +189,13 @@ pub struct WorkerSlot {
     /// reads as what it is; the previous `output_buf` was a bare
     /// generic name.
     pub posterior_records: Vec<PosteriorRecord>,
+    /// M15: per-window run statistics. The driver `std::mem::take`s
+    /// this after each `run_window` call and rolls the counts into
+    /// `ChunkDriverStats`. Sibling to `pipeline_scratch` (which holds
+    /// per-group buffers); the two structs have different lifetimes
+    /// (counters are per-window, scratch is per-group), so they live
+    /// side by side rather than bundled.
+    pub stats: WindowRunStats,
 }
 
 impl WorkerSlot {
@@ -196,6 +206,7 @@ impl WorkerSlot {
             pre_fetched_ref_bytes: Vec::new(),
             pipeline_scratch: ColumnarPipelineScratch::empty(),
             posterior_records: Vec::new(),
+            stats: WindowRunStats::default(),
         }
     }
 }
@@ -274,6 +285,7 @@ pub fn run_window(
     posterior_cfg: &PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
     output: &mut Vec<PosteriorRecord>,
+    stats: &mut WindowRunStats,
 ) -> Result<(), PosteriorEngineError> {
     output.clear();
     if partition.n_groups() == 0 {
@@ -294,6 +306,7 @@ pub fn run_window(
             &per_group_cfg,
             posterior_cfg,
             scratch,
+            stats,
         )? {
             output.push(record);
         }
@@ -376,6 +389,7 @@ fn build_posterior_record_columnar(
     per_group_cfg: &PerGroupMergerConfig,
     posterior_cfg: &PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
+    stats: &mut WindowRunStats,
 ) -> Result<Option<PosteriorRecord>, PosteriorEngineError> {
     let chrom_id = chunk.chrom_id;
     let group_start = partition.group_starts[group_idx];
@@ -406,8 +420,8 @@ fn build_posterior_record_columnar(
 
     // Row-shape parity — see [`PerGroupMerger::process_group`].
     if n_alleles > per_group_cfg.max_alleles_lh_calc {
-        scratch.lh_cap_groups_skipped += 1;
-        scratch.lh_cap_alleles_in_skipped += n_alleles as u64;
+        stats.lh_cap_groups_skipped += 1;
+        stats.lh_cap_alleles_in_skipped += n_alleles as u64;
         return Ok(None);
     }
     if n_alleles < 2 {
@@ -416,7 +430,7 @@ fn build_posterior_record_columnar(
         // a breadcrumb. This path fires when post-unification every
         // ALT was absorbed into the OTHER pool by the max-alleles
         // cap, leaving only REF.
-        scratch.groups_skipped_post_unify_ref_only += 1;
+        stats.groups_skipped_post_unify_ref_only += 1;
         return Ok(None);
     }
 
@@ -856,6 +870,7 @@ mod tests {
         let mut scratch = ColumnarPipelineScratch::empty();
 
         // Empty partition ⇒ no groups ⇒ no REF bytes needed.
+        let mut stats = WindowRunStats::default();
         let result = run_window(
             &chunk,
             &partition,
@@ -864,6 +879,7 @@ mod tests {
             &PosteriorEngineConfig::default(),
             &mut scratch,
             &mut output,
+            &mut stats,
         );
         assert!(result.is_ok());
         assert!(output.is_empty());
@@ -969,6 +985,7 @@ mod tests {
         let mut cn_pre_fetched: Vec<Vec<u8>> = Vec::new();
         prefetch_window_ref_bytes(&partition, &fetcher, &mut cn_pre_fetched)
             .expect("prefetch succeeded");
+        let mut cn_stats = WindowRunStats::default();
         run_window(
             &chunk,
             &partition,
@@ -977,6 +994,7 @@ mod tests {
             &PosteriorEngineConfig::default(),
             &mut cn_scratch,
             &mut cn_out,
+            &mut cn_stats,
         )
         .expect("columnar run_window succeeded");
 
@@ -1155,6 +1173,7 @@ mod tests {
         let mut cn_pre_fetched: Vec<Vec<u8>> = Vec::new();
         prefetch_window_ref_bytes(&partition, &fetcher, &mut cn_pre_fetched)
             .expect("prefetch succeeded");
+        let mut cn_stats = WindowRunStats::default();
         run_window(
             &chunk,
             &partition,
@@ -1163,6 +1182,7 @@ mod tests {
             &PosteriorEngineConfig::default(),
             &mut cn_scratch,
             &mut cn_out,
+            &mut cn_stats,
         )
         .expect("columnar run_window succeeded");
 
@@ -1266,6 +1286,7 @@ mod tests {
         let mut cn_pre_fetched: Vec<Vec<u8>> = Vec::new();
         prefetch_window_ref_bytes(&partition, &fetcher, &mut cn_pre_fetched)
             .expect("prefetch succeeded");
+        let mut cn_stats = WindowRunStats::default();
         run_window(
             &chunk,
             &partition,
@@ -1274,6 +1295,7 @@ mod tests {
             &PosteriorEngineConfig::default(),
             &mut cn_scratch,
             &mut cn_out,
+            &mut cn_stats,
         )
         .expect("columnar run_window succeeded");
 

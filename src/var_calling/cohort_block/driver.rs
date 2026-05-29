@@ -951,6 +951,7 @@ where
                 posterior_cfg,
                 &mut slot.pipeline_scratch,
                 &mut slot.posterior_records,
+                &mut slot.stats,
             )
         })
         .map_err(ChunkDriverError::RunWindow)?;
@@ -958,12 +959,15 @@ where
     // ── Sequential drain in window order — preserves the prior
     //    per-record emit order even when step 4 runs the workers
     //    concurrently. ──
+    // M15: `slot.stats` lives next to `slot.pipeline_scratch` as a
+    // separate `WindowRunStats` struct; the drive takes its contents
+    // (by `std::mem::take`) so the slot's counters reset for the next
+    // chunk while the per-driver `ChunkDriverStats` totals accumulate.
     for slot in worker_pool.slots.iter_mut().take(n_windows) {
-        let (cap_g, cap_a) = slot.pipeline_scratch.take_lh_cap_stats();
-        stats.lh_cap_groups_skipped += cap_g;
-        stats.lh_cap_alleles_in_skipped += cap_a;
-        stats.groups_skipped_post_unify_ref_only +=
-            slot.pipeline_scratch.take_post_unify_ref_only_count();
+        let slot_stats = std::mem::take(&mut slot.stats);
+        stats.lh_cap_groups_skipped += slot_stats.lh_cap_groups_skipped;
+        stats.lh_cap_alleles_in_skipped += slot_stats.lh_cap_alleles_in_skipped;
+        stats.groups_skipped_post_unify_ref_only += slot_stats.groups_skipped_post_unify_ref_only;
         for record in slot.posterior_records.drain(..) {
             emit_or_drop(record, params, writer, stats)?;
         }
