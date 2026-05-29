@@ -19,9 +19,78 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **Within-chromosome chunk-parallel
->   rewrite — plan landed.**
->   [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md).
+> - **Last completed task:** **Code review of the `cohort_block`
+>   module** (the chunk-based cohort var-calling rewrite, ~8 400 LoC
+>   across 12 files on branch `cohort-within-chromosome-parallel`,
+>   commit `36989d6`) —
+>   [cohort_block_2026-05-29.md](doc/devel/reports/reviews/cohort_block_2026-05-29.md).
+>   Verdict: **Request-changes** — 5 Blockers, 32 Major, 26 Minor,
+>   grouped Nits. Architecture sound (`unsafe_concurrency` returned
+>   `No findings.` — the parallel-section soundness is statically
+>   enforced by the `Send + !Sync` typedef on `SharedRefFetcher` plus
+>   the driver-side sequential REF pre-fetch). The 5 Blockers cluster
+>   on (B1) writer-tmp leak on the driver-error path
+>   ([driver.rs:206-226](src/var_calling/cohort_block/driver.rs#L206-L226));
+>   (B2) `compute_dust_mask_for_chrom` materialises the full
+>   chromosome's REF bases into a `Vec<u8>` before re-streaming to
+>   sdust — defeats the "one chunk × N samples" memory contract
+>   ([driver.rs:348-373](src/var_calling/cohort_block/driver.rs#L348-L373));
+>   (B3) `load_and_run_chunk_with_retry`'s `NoSafeGap` retry is a
+>   no-op when `target_variants_per_chunk > 0` (the
+>   operator-recommended mode) because the loader's `max_load_span`
+>   is the chromosome-wide cap regardless of the outer `attempt_span`
+>   ([driver.rs:521-583](src/var_calling/cohort_block/driver.rs#L521-L583));
+>   (B4) `compute_ll_error_to_merger` silently rewrites
+>   `NAllelesExceedsBitmask` (an upstream-invariant break carrying
+>   the only useful diagnostic `n_alleles`) as a fake
+>   `DegenerateLikelihood { sample_idx: usize::MAX, genotype_idx:
+>   usize::MAX, kind: NaN }` and discards `n_alleles` via `let _ =
+>   n_alleles;` — flagged convergently by `errors` (Blocker),
+>   `reliability` (Major), and `smells` (Major)
+>   ([worker.rs:571,586](src/var_calling/cohort_block/worker.rs#L571));
+>   (B5) no in-tree byte-identity test against the still-extant
+>   streaming `drive_cohort_pipeline` oracle, and no unit tests for
+>   `drive_cohort_chunked` / `drive_one_chrom_generic` /
+>   `load_and_run_chunk_with_retry` / `emit_or_drop` /
+>   `compute_dust_mask_for_chrom` — the hard-correctness contract
+>   ("byte-identical VCFs vs `main` on the 3-tomato fixture") is
+>   today only verified by the manually-run benchmark quoted in the
+>   Phase A impl report, not by CI. Major findings include the
+>   `#[derive(Default)]` on `SampleColumns` (yields an
+>   invariant-violating empty-CSR state — convergent finding from
+>   `defaults` + `idiomatic`), `prefetch_window_ref_bytes` dropping
+>   every per-group `Vec<u8>` allocation on each call (defeats the
+>   `WorkerSlot` scratch-reuse design — `idiomatic` + `reliability`
+>   minor convergence), the `ChunkDriverError` design (9 variants,
+>   `#[from]` funnels `io::Error` / `PspReadError` through single
+>   variants, `: {0}` interpolation flattens `source()` chains),
+>   `enforce_max_alleles_columnar` tie-break not pinned by any test
+>   against the row-shape kernel, `target_variants_per_chunk = 0` /
+>   `target_window_count.max(1)` sentinel-as-toggle without named
+>   defaults or startup logs, and 16 in-scope clippy errors + 2
+>   in-scope unresolved intra-doc-link errors blocking the CI gate.
+>   `cargo clippy --all-targets --all-features -- -D warnings` also
+>   fails because the rewrite added two required fields to
+>   `VarCallingArgs` (`target_variants_per_chunk`,
+>   `worker_windows_per_chunk`) without updating
+>   `benches/cohort_e2e_perf.rs:286`,
+>   `examples/profile_cohort_e2e.rs:152`, or
+>   `examples/dhat_var_calling.rs:121` — exactly the
+>   `refactor_safety` mechanism working as intended; the breakage
+>   was just left unfixed. Four open questions for the author
+>   (stable-API intent on the new pub data structs, streaming
+>   driver's long-term fate, sentinel-vs-NonZero policy for the two
+>   knobs, filter-order equivalence vs streaming pipeline) gate
+>   several Major findings. Per-category audit trail at
+>   `tmp/review_2026-05-29_cohort_block/`; verification commands ran
+>   inside the dev container against commit
+>   `36989d6f53460042c5219d0ff5fa6d67a7b1b129` (1 023 lib tests pass,
+>   88 of those in `var_calling::cohort_block::*`).
+> - **Previous task — plan + Phase A/B implementation:** Within-chromosome
+>   chunk-parallel rewrite, **plan landed** —
+>   [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md);
+>   Phase A impl report
+>   [cohort_within_chromosome_parallel_phase_a_2026-05-28.md](doc/devel/reports/implementations/cohort_within_chromosome_parallel_phase_a_2026-05-28.md).
 >   Drafted on `main` after a multi-round design discussion driven
 >   by the
 >   [2026-05-27 scaling measurement](doc/devel/reports/reviews/scaling_measurement_2026-05-27.md).
@@ -89,7 +158,7 @@ Skills and agents are instructed to leave it untouched.
 >   branch `cohort-within-chromosome-parallel` cut from this
 >   commit; the plan stays on `main` as the spec (plan revisions
 >   land on `main` first; the branch rebases).
-> - **Previous task:** **BAM-input review fixes applied** —
+> - **Previous-previous task:** **BAM-input review fixes applied** —
 >   [fixes_applied_2026-05-24.md](doc/devel/reports/reviews/fixes_applied_2026-05-24.md).
 >   Status: **Completed.** 10 fix commits (`9fc1df0` → `7a8569b`):
 >   every Major (M1–M19) Applied; 13 of 22 Minors Applied;
@@ -124,7 +193,7 @@ Skills and agents are instructed to leave it untouched.
 >   Validation: `cargo fmt --check` / `cargo clippy --all-targets
 >   --all-features -D warnings` / `cargo test` all clean. Per-finding
 >   ledger + every commit hash in §2/§4 of the fixes report.
-> - **Previous-previous task:** **Code review of the BAM input
+> - **Earlier task:** **Code review of the BAM input
 >   slice** —
 >   [bam_input_support_2026-05-24.md](doc/devel/reports/reviews/bam_input_support_2026-05-24.md).
 >   Verdict: **Approve-with-changes** (0 Blockers, 19 Major, 22
@@ -832,6 +901,38 @@ via rayon.
       per the original perf review). Unblocks Stage 4 code-level findings.
     - **H7** — cohort-size sweep at N=10/64/256/1024 samples.
   - Wave 2 / 3 / Likely / Speculative findings tracked in the report.
+
+#### Within-chromosome chunk-parallel rewrite (`cohort_block/`)
+- **Status:** reviewed
+- **Plans:**
+  - Master: [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md)
+  - Phase A.2 column-native EM: [cohort_within_chromosome_parallel_phase_a2_em.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_a2_em.md)
+  - Phase B prereq (variant-bounded chunks): [cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md)
+  - Phase B prereq (estimate-contamination migration): [cohort_within_chromosome_parallel_phase_b2_estimate_contamination.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b2_estimate_contamination.md)
+  - Phase B parallel windows: [cohort_within_chromosome_parallel_phase_b_parallel_windows.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md)
+- **Impl reports:**
+  - Phase A (2026-05-28): [cohort_within_chromosome_parallel_phase_a_2026-05-28.md](doc/devel/reports/implementations/cohort_within_chromosome_parallel_phase_a_2026-05-28.md)
+- **Code:** [src/var_calling/cohort_block/](src/var_calling/cohort_block/) — `mod.rs`, `columns.rs`, `loader.rs`, `pre_pass.rs`, `partition.rs`, `driver.rs`, `worker.rs`, `test_helpers.rs`, plus `kernels/{mod, unify_alleles, project_scalars, compute_log_likelihoods}.rs`.
+- **Tests:** 88 unit tests in the module (per `cargo test --lib var_calling::cohort_block` at commit `36989d6`); 3 integration tests in [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs) (`var_calling_emits_deterministic_vcf_across_runs`, `var_calling_byte_identical_across_worker_windows_per_chunk`, `var_calling_byte_identical_across_target_variants_per_chunk`).
+- **Latest review:** [cohort_block_2026-05-29.md](doc/devel/reports/reviews/cohort_block_2026-05-29.md) — **Request-changes**: 5 Blockers (B1 writer-tmp leak on driver-error path; B2 full-chrom `Vec<u8>` materialisation in `compute_dust_mask_for_chrom` defeats per-chunk memory contract; B3 `NoSafeGap` retry is a no-op when `target_variants_per_chunk > 0`; B4 `NAllelesExceedsBitmask` silently rewritten as `DegenerateLikelihood { usize::MAX, … }`; B5 missing cross-driver byte-identity oracle test + missing unit tests for `drive_cohort_chunked` / `drive_one_chrom_generic` / `load_and_run_chunk_with_retry` / `emit_or_drop` / `compute_dust_mask_for_chrom`), 32 Major, 26 Minor, grouped Nits. `unsafe_concurrency` returned `No findings.` — the parallel-section soundness is statically enforced by the `Send + !Sync` typedef on `SharedRefFetcher`. Four open questions for the author (stable-API intent on the new pub data structs; streaming `drive_cohort_pipeline` oracle's long-term fate; sentinel-vs-`NonZero` policy for `target_variants_per_chunk` / `target_window_count`; filter-order equivalence vs streaming pipeline) gate several Major findings. Per-category audit trail at `tmp/review_2026-05-29_cohort_block/`.
+- **Open (from the 2026-05-29 review):**
+  - **B1** — Add `CohortVcfWriter::abort()` that takes the tmp path it actually used and removes it; call from the error branch. Add an integration test injecting a mid-loop error and asserting no leftover tmp on disk.
+  - **B2** — Stream `fetcher.iter_bases()?` directly into `sdust_mask_streaming` (the helper already accepts `Iterator<Item = io::Result<u8>>`). Add a regression test using a synthetic fetcher that panics on `.collect::<Vec<_>>()`.
+  - **B3** — Thread `attempt_span` into the loader's `max_span` so retries can actually load more data, or push the retry inside the loader as "extend until safe gap or chrom cap". Add a test for a chunk that satisfies `target_variants_per_chunk` on the first attempt but has no safe gap.
+  - **B4** — Add a dedicated `PerGroupMergerError::NAllelesExceedsBitmask { n_alleles, chrom_id, group_start, group_end }` variant; drop the `let _ = n_alleles;`. Add a test triggering the path with `cfg.max_alleles > MAX_BITMASK_ALLELES`.
+  - **B5** — Add one integration test in [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs) that runs both `drive_cohort_chunked` and the streaming `drive_cohort_pipeline` on a multi-position fixture (≥3 samples, ≥1 MNP, ≥1 LH-cap site, ≥1 hom-REF group, ≥1 below-`min_alt_obs` site, ≥1 below-`qual_phred` site, ≥1 above-`mapq_diff_t` site); assert VCF bodies byte-equal **and** field-by-field equal counter sets. If the streaming driver is scheduled for removal, capture a checked-in golden VCF first.
+  - **M1** — Replace `#[derive(Default)]` on `SampleColumns` with a hand-written `impl Default for SampleColumns { fn default() -> Self { Self::empty() } }`.
+  - **M2** — Rewrite `prefetch_window_ref_bytes` so the outer `Vec<Vec<u8>>` resizes-without-dropping and each inner `Vec<u8>` is cleared-in-place rather than freshly allocated.
+  - **M3** — Move `detect_compound_candidates_columnar`'s two `BTreeMap`s into `UnifyAllelesScratch` for per-group reuse; add a permutation-invariance proptest.
+  - **M4 / M5 / M21** — Reshape `ChunkDriverError`: drop `#[from]` on `Io` / `PspRead`; rename variants by operation (`OpenPsp`, `WriteVcf { chrom_id, start, end, … }`, `FetchRefBases`, …); drop `: {0}` interpolation; add chrom/range context to `WriteVcf`. Replace `let _ = std::fs::remove_file(...)` with a structured `tracing::warn!` event.
+  - **M6** — Surface `u32_from_usize` as a typed `ChunkLoadError::CsrOffsetOverflow` error or use `try_into().expect(...)` to panic loudly with a named invariant rather than wrap silently.
+  - **M7 / M9 / Mi20 / Mi21** — Either propagate `ZeroTargetWindowCount` from the pre-pass (dropping the `.max(1)`) or name the default with `pub const DEFAULT_WORKER_WINDOWS_PER_CHUNK` and emit `tracing::debug!` when applied. Same shape for `target_variants_per_chunk == 0` (name `TARGET_VARIANTS_DISABLED` or lift to `Option<NonZeroU32>`). Add startup `tracing::info!` listing every effective `ChunkDriverParams` value. Add `chunks_with_fewer_windows_than_requested: u64` counter to `ChunkDriverStats`.
+  - **M8** — Either reject `max_span < initial_span` with a new `ChunkLoadError::MaxSpanBelowInitial` variant or delete the `effective_initial_span` no-op chain and document the invariant.
+  - **M10 + Mi26** — Fix the 2 in-scope unresolved-link errors and 3 redundant-link warnings (`worker.rs:17`, `worker.rs:236`, `driver.rs:105`, `driver.rs:108`, `worker.rs:9`).
+  - **M11** — Add the two new `VarCallingArgs` fields to `benches/cohort_e2e_perf.rs:286`, `examples/profile_cohort_e2e.rs:152`, `examples/dhat_var_calling.rs:121` with the legacy defaults (`target_variants_per_chunk: 0`, `worker_windows_per_chunk: 1`). Optional follow-up: add a `VarCallingArgs::for_profiling(...)` constructor.
+  - **M12 / M13 / M14 / M15 / M16 / M17 / M18 / M19 / M20 / M22 / M23 / M24 / M25 / M26 / M27 / M28 / M29 / M30 / M31 / M32** — see the report's §6 Findings section and §8 Missing tests. Highlights: split `load_and_run_chunk_with_retry`'s 19-param body into three phase helpers; group `load_chunk_from_iters`'s span/variant knobs into `ChunkLoadExtent`; add `SampleColumns::clone_from_columns` and use it for both carryover snapshot / restore loops; split per-window counters out of `ColumnarPipelineScratch`; drop the trailing `..` from the `AlleleSupportStats` destructure at `columns.rs:116`; delete or wire `chain_id_scratch` (`#[allow(dead_code)]`); validate `masked_intervals` sorting in `partition_window`; pin filter order in `emit_or_drop` with five per-category unit tests; pin `enforce_max_alleles_columnar` tie-break against the row-shape kernel; clamp `safe_end` to `chrom_one_past_end` on the last chunk; rename `*_cfg` vs `*_config` to a single form crate-wide; rename `shared_ref_fetcher` to `into_shared_ref_fetcher`; add tests for `SampleCountMismatch` / `CarryoverLengthMismatch` (both loader and pre-pass); add a `par_iter_mut` vs sequential equivalence test.
+  - **Mi-class** (~26 minors): `#[non_exhaustive]` on the new pub data structs (gated on Open Question 1); `pub mod` → `pub(crate) mod` for every submodule that has no out-of-crate consumer (gated on Open Question 1); rename `MaterialisedChunk::clear_data` → `clear`; rename `WorkerSlot.output_buf` / `WorkerSlot.scratch` to carry domain nouns; collapse `Arc::new(StreamingChromRefFetcher)` to a borrow; drop `chunk.windows.clone()`; take `&PosteriorEngineConfig` in `run_window`; remove double-clone in `push_allele_into_scratch`; demote `pub` items with no caller; merge `Ok(idx) | Err(idx)` arms; split `unify_alleles.rs`/`worker.rs`/`loader.rs` along their existing internal sub-step boundaries; move `build_overlapping_variant_group` out of `worker.rs` and into `test_helpers.rs`; convert the three `Vec<Vec<_>>` jagged arrays to CSR; consider `OneBasedPos` / `OneBasedRange` / `ChromId` newtypes; group `ChunkDriverParams` along stage boundaries; add `// REGRESSION THRESHOLD: N%` to `benches/cohort_e2e_perf.rs`; add `--ignored` should-panic regression for `u32_from_usize` overflow.
+  - **Nits** — single mechanical pass to clear the 16 in-scope clippy errors (`single_range_in_vec_init` ×8, `type_complexity` ×4, `bool_assert_comparison` ×2, `doc_lazy_continuation` ×2) plus add per-call-site justification comments to the 14 `#[allow(...)]` annotations (12 `clippy::too_many_arguments` + `clippy::arc_with_non_send_sync` + `clippy::needless_range_loop`).
 
 ---
 
