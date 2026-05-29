@@ -287,6 +287,61 @@ fn var_calling_emits_deterministic_vcf_across_runs() {
     );
 }
 
+/// **Variant-bounded chunk loading byte-identity.** The
+/// `--target-variants-per-chunk` knob is a workload-sizing knob,
+/// not a correctness knob: changing it must never change the
+/// emitted VCF body. This test runs the same fixture twice — once
+/// with `target_variants_per_chunk = 0` (default, BP-only loop)
+/// and once with `target_variants_per_chunk = 1` (forces the
+/// extension loop to engage on every chunk) — and asserts the VCF
+/// bodies match.
+///
+/// Phase B prerequisite — see
+/// `doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md`.
+#[test]
+fn var_calling_byte_identical_across_target_variants_per_chunk() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    let reads_a = vec![
+        read_record("r1", 10, b"AAAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let reads_b = vec![
+        read_record("r1", 10, b"ACAAA"), // SNP at pos 11
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let psp_a = make_psp_for_sample(dir.path(), &fasta, "NA00001", &reads_a);
+    let psp_b = make_psp_for_sample(dir.path(), &fasta, "NA00002", &reads_b);
+    let psps = vec![psp_a, psp_b];
+
+    let vcf_default = dir.path().join("cohort_target0.vcf");
+    let vcf_low = dir.path().join("cohort_target1.vcf");
+
+    let mut args_default = var_calling_args(fasta.clone(), vcf_default.clone(), psps.clone(), None);
+    args_default.target_variants_per_chunk = 0; // explicit default for clarity
+    run_var_calling(&args_default).expect("default-target run OK");
+
+    let mut args_low = var_calling_args(fasta, vcf_low.clone(), psps, None);
+    args_low.target_variants_per_chunk = 1; // smallest non-zero — extension on every chunk
+    run_var_calling(&args_low).expect("low-target run OK");
+
+    let body_default = fs::read_to_string(&vcf_default).expect("read default vcf");
+    let body_low = fs::read_to_string(&vcf_low).expect("read low vcf");
+    let strip_volatile = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("##source=") && !l.starts_with("##commandline="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip_volatile(&body_default),
+        strip_volatile(&body_low),
+        "--target-variants-per-chunk is a workload-sizing knob, not a \
+         correctness knob: changing it must never change the emitted VCF"
+    );
+}
+
 /// **var-calling-from-bam happy path.** One CRAM directly → VCF.
 /// No `.psp` is written by the test (the helper internally writes
 /// the .psp for the cohort path, but `run_var_calling_from_bam`
