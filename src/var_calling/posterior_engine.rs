@@ -747,6 +747,159 @@ impl PosteriorRecord {
         &self.chain_anchor_flags[start..start + n_alleles]
     }
 
+    /// Drop ALT alleles that no sample's argmax genotype references and
+    /// re-index every allele-keyed field, so the emitted VCF lists only
+    /// alleles the cohort actually carries. Returns the number of ALT
+    /// alleles removed.
+    ///
+    /// Why this exists: the upstream allele set is the read-supported
+    /// *candidate* set for the whole variant group (the cohort union,
+    /// capped at `max_alleles`), and the engine genotypes over all of
+    /// it. The per-sample argmax can leave candidates with zero genotype
+    /// support; emitting them yields VCF ALT alleles with `AC=0` (and,
+    /// after `bcftools norm -m`, phantom `0/0` records). GATK's
+    /// `GenotypeGVCFs` prunes the same way. REF (index 0) is always kept.
+    ///
+    /// Only multiallelic records (`alleles.len() >= 3`) can carry an
+    /// unsupported ALT *alongside* a supported one. A biallelic record's
+    /// single ALT is either supported, or the whole record is hom-ref
+    /// everywhere and dropped upstream by [`Self::is_variant_call`] — so
+    /// those short-circuit with no work or allocation.
+    ///
+    /// Re-indexing: `alleles`, `allele_frequencies` (renormalised to sum
+    /// 1), `compound_frequencies`, and the per-sample `scalars` /
+    /// `chain_anchor_flags` allele columns are compacted to the kept
+    /// alleles; `posteriors` are restricted to the surviving genotypes
+    /// and renormalised per sample; `best_genotype` and `gq_phred` are
+    /// recomputed from the restricted rows (GQ capped at `max_gq_phred`,
+    /// matching the engine's `summarise_posteriors`); `n_genotypes` is
+    /// updated. A dropped allele's per-sample read support leaves
+    /// `scalars`, so it no longer counts toward DP/AD — the same
+    /// convention the `max_alleles` cap path uses for its OTHER pool.
+    pub fn prune_unsupported_alleles(&mut self, max_gq_phred: f64) -> usize {
+        let n_alleles = self.alleles.len();
+        if n_alleles < 3 {
+            return 0;
+        }
+        let ploidy = self.ploidy;
+        let old_table = genotype_order(ploidy, n_alleles);
+
+        // 1. Mark alleles referenced by some sample's argmax genotype.
+        let mut supported = vec![false; n_alleles];
+        supported[0] = true; // REF is always kept
+        for &gt_idx in &self.best_genotype {
+            for &allele in &old_table[gt_idx] {
+                supported[allele as usize] = true;
+            }
+        }
+        if supported.iter().all(|&keep| keep) {
+            return 0;
+        }
+        // If no ALT survives, the site is hom-ref in every sample. Leave
+        // it intact: the whole-site `is_variant_call` filter drops it,
+        // and pruning to a REF-only record here would needlessly destroy
+        // the EM's allele-frequency estimates for a discarded record.
+        if !supported[1..].iter().any(|&keep| keep) {
+            return 0;
+        }
+
+        // 2. kept[new] = old allele index (REF first); compaction map.
+        let kept: Vec<usize> = (0..n_alleles).filter(|&i| supported[i]).collect();
+        let new_n_alleles = kept.len();
+        let removed = n_alleles - new_n_alleles;
+
+        // 3. New genotype enumeration + an old-tuple -> old-index lookup.
+        //    Each new genotype's allele indices map back to old via
+        //    `kept` (monotone, so the tuple stays non-decreasing) and we
+        //    look its old position up to copy the right posterior.
+        let new_table = genotype_order(ploidy, new_n_alleles);
+        let new_n_genotypes = new_table.len();
+        let old_index_of: std::collections::HashMap<&[u8], usize> = old_table
+            .iter()
+            .enumerate()
+            .map(|(i, gt)| (gt.as_slice(), i))
+            .collect();
+        let mut new_to_old_gt = vec![0usize; new_n_genotypes];
+        let mut tuple_buf: Vec<u8> = Vec::with_capacity(ploidy as usize);
+        for (j, gt_new) in new_table.iter().enumerate() {
+            tuple_buf.clear();
+            tuple_buf.extend(gt_new.iter().map(|&a_new| kept[a_new as usize] as u8));
+            new_to_old_gt[j] = old_index_of[tuple_buf.as_slice()];
+        }
+
+        // 4. Per-allele vectors (compact to kept; renormalise AF).
+        let mut alleles = Vec::with_capacity(new_n_alleles);
+        let mut allele_frequencies = Vec::with_capacity(new_n_alleles);
+        let mut compound_frequencies = Vec::with_capacity(new_n_alleles);
+        for &old_i in &kept {
+            alleles.push(self.alleles[old_i].clone());
+            allele_frequencies.push(self.allele_frequencies[old_i]);
+            compound_frequencies.push(self.compound_frequencies[old_i]);
+        }
+        let af_sum: f64 = allele_frequencies.iter().sum();
+        if af_sum > 0.0 {
+            for v in &mut allele_frequencies {
+                *v /= af_sum;
+            }
+        }
+
+        // 5. Per-sample per-allele tables (drop the removed columns).
+        let mut scalars = Vec::with_capacity(self.n_samples * new_n_alleles);
+        let mut chain_anchor_flags = Vec::with_capacity(self.n_samples * new_n_alleles);
+        for s in 0..self.n_samples {
+            let base = s * n_alleles;
+            for &old_i in &kept {
+                scalars.push(self.scalars[base + old_i]);
+                chain_anchor_flags.push(self.chain_anchor_flags[base + old_i]);
+            }
+        }
+
+        // 6. Posteriors restricted to surviving genotypes + renormalised;
+        //    best_genotype + GQ recomputed from the restricted rows.
+        let mut posteriors = vec![0.0_f64; self.n_samples * new_n_genotypes];
+        let mut best_genotype = vec![0usize; self.n_samples];
+        let mut gq_phred = vec![0.0_f64; self.n_samples];
+        for s in 0..self.n_samples {
+            let old_base = s * self.n_genotypes;
+            let new_base = s * new_n_genotypes;
+            let mut row_sum = 0.0;
+            for j in 0..new_n_genotypes {
+                let p = self.posteriors[old_base + new_to_old_gt[j]];
+                posteriors[new_base + j] = p;
+                row_sum += p;
+            }
+            let inv = if row_sum > 0.0 { 1.0 / row_sum } else { 1.0 };
+            let mut best_j = 0usize;
+            let mut best_p = f64::NEG_INFINITY;
+            for j in 0..new_n_genotypes {
+                let p = posteriors[new_base + j] * inv;
+                posteriors[new_base + j] = p;
+                if p > best_p {
+                    best_p = p;
+                    best_j = j;
+                }
+            }
+            best_genotype[s] = best_j;
+            let p_best_clamped = best_p.min(1.0 - f64::EPSILON);
+            gq_phred[s] =
+                (PHRED_SCALE * (1.0 - p_best_clamped).log10()).clamp(0.0, max_gq_phred);
+        }
+
+        // 7. Commit. `n_alleles` is derived from `alleles.len()`, so
+        //    swapping the vector updates it; `n_genotypes` is explicit.
+        self.alleles = alleles;
+        self.allele_frequencies = allele_frequencies;
+        self.compound_frequencies = compound_frequencies;
+        self.scalars = scalars;
+        self.chain_anchor_flags = chain_anchor_flags;
+        self.posteriors = posteriors;
+        self.best_genotype = best_genotype;
+        self.gq_phred = gq_phred;
+        self.n_genotypes = new_n_genotypes;
+
+        removed
+    }
+
     /// True iff at least one sample's argmax genotype carries a
     /// non-reference allele.
     ///
@@ -1984,7 +2137,7 @@ fn run_em_for_record<M: MathBackend>(
         };
     }
 
-    Ok(PosteriorRecord {
+    let mut record = PosteriorRecord {
         locus,
         alleles,
         ploidy,
@@ -2004,7 +2157,12 @@ fn run_em_for_record<M: MathBackend>(
         other_scalars,
         chain_anchor_flags,
         diagnostics,
-    })
+    };
+    // Drop candidate ALT alleles no sample's argmax genotype uses, so
+    // the VCF never carries AC=0 alleles (see the method docs). No-op
+    // for biallelic records.
+    record.prune_unsupported_alleles(config.max_gq_phred);
+    Ok(record)
 }
 
 fn validate_record_shape(
@@ -2970,6 +3128,136 @@ mod tests {
                 constituents: Vec::new(),
             })
             .collect()
+    }
+
+    /// Diploid triallelic record (A=REF, T, C) with per-sample argmax
+    /// genotypes + posterior rows, for the allele-prune tests.
+    /// `genotype_order(2, 3)` is `AA, AB, BB, AC, BC, CC` (indices 0..5).
+    fn triallelic_record(best: Vec<usize>, posteriors: Vec<f64>) -> PosteriorRecord {
+        let n_samples = best.len();
+        let n_genotypes = genotype_order(2, 3).len();
+        assert_eq!(posteriors.len(), n_samples * n_genotypes);
+        let scalars: Vec<AlleleSupportStats> = (0..n_samples)
+            .flat_map(|_| {
+                [
+                    AlleleSupportStats { num_obs: 20, ..Default::default() },
+                    AlleleSupportStats { num_obs: 5, ..Default::default() },
+                    AlleleSupportStats { num_obs: 7, ..Default::default() },
+                ]
+            })
+            .collect();
+        PosteriorRecord {
+            locus: RecordLocus { chrom_id: 0, start: 100, end: 101 },
+            alleles: simple_alleles(&[b"A", b"T", b"C"]),
+            ploidy: 2,
+            n_samples,
+            n_genotypes,
+            allele_frequencies: vec![0.6, 0.25, 0.15],
+            compound_frequencies: vec![None, None, None],
+            posteriors,
+            best_genotype: best,
+            gq_phred: vec![0.0; n_samples],
+            qual_phred: 50.0,
+            scalars,
+            other_scalars: vec![],
+            chain_anchor_flags: vec![false; n_samples * 3],
+            diagnostics: EmDiagnostics {
+                iterations: 1,
+                final_max_delta_p: 0.0,
+                converged: true,
+            },
+        }
+    }
+
+    #[test]
+    fn prune_drops_alt_no_genotype_supports_and_reindexes() {
+        // One sample, best genotype = idx 3 = [0,2] = ref/C, so ALT T
+        // (allele 1) has zero genotype support and must be dropped.
+        // Posteriors also carry mass on idx0 (0/0) and idx5 (2/2) so the
+        // renormalised survivor row is checkable.
+        let post = vec![0.05, 0.05, 0.05, 0.70, 0.10, 0.05];
+        let mut rec = triallelic_record(vec![3], post);
+        let removed = rec.prune_unsupported_alleles(99.0);
+
+        assert_eq!(removed, 1, "exactly the unsupported ALT T is dropped");
+        assert_eq!(rec.alleles.len(), 2);
+        assert_eq!(rec.alleles[0].seq, b"A");
+        assert_eq!(rec.alleles[1].seq, b"C", "T dropped, C compacted to ALT 1");
+        assert_eq!(rec.n_genotypes, 3, "2 alleles diploid -> 3 genotypes");
+        // old [0,2] (ref/C) re-indexes to new [0,1] = genotype index 1.
+        assert_eq!(rec.best_genotype, vec![1]);
+        assert!(rec.is_variant_call());
+
+        // Surviving genotypes 00/0C/CC = old posteriors 0.05/0.70/0.05,
+        // renormalised over their 0.80 sum.
+        let row = rec.posteriors_row(0);
+        assert_eq!(row.len(), 3);
+        assert!((row[0] - 0.05 / 0.80).abs() < 1e-9);
+        assert!((row[1] - 0.70 / 0.80).abs() < 1e-9);
+        assert!((row[2] - 0.05 / 0.80).abs() < 1e-9);
+
+        // AF: keep A=0.6, C=0.15, renormalise over 0.75 -> 0.8, 0.2.
+        assert!((rec.allele_frequencies[0] - 0.8).abs() < 1e-9);
+        assert!((rec.allele_frequencies[1] - 0.2).abs() < 1e-9);
+
+        // scalars compacted to the A and C columns (20, 7); T's 5 dropped.
+        assert_eq!(rec.scalars.len(), 2);
+        assert_eq!(rec.scalars[0].num_obs, 20);
+        assert_eq!(rec.scalars[1].num_obs, 7);
+
+        // GQ recomputed from the renormalised best p = 0.70/0.80 = 0.875.
+        let expected_gq = (PHRED_SCALE * (1.0 - 0.875_f64).log10()).clamp(0.0, 99.0);
+        assert!((rec.gq_phred[0] - expected_gq).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prune_is_noop_when_every_alt_is_supported() {
+        // Two samples: s0 = 0/1 (carries T), s1 = 0/2 (carries C), so
+        // every allele is referenced -> nothing to prune.
+        let post = vec![
+            0.1, 0.7, 0.05, 0.05, 0.05, 0.05, // s0 best = idx1 (0/1)
+            0.05, 0.05, 0.05, 0.7, 0.1, 0.05, // s1 best = idx3 (0/2)
+        ];
+        let mut rec = triallelic_record(vec![1, 3], post.clone());
+        let removed = rec.prune_unsupported_alleles(99.0);
+
+        assert_eq!(removed, 0);
+        assert_eq!(rec.alleles.len(), 3);
+        assert_eq!(rec.n_genotypes, 6);
+        assert_eq!(rec.best_genotype, vec![1, 3]);
+        assert_eq!(rec.posteriors, post, "posteriors untouched on no-op");
+    }
+
+    #[test]
+    fn prune_short_circuits_for_biallelic() {
+        // 2 alleles -> the < 3 guard returns immediately, untouched.
+        let mut rec = PosteriorRecord {
+            locus: RecordLocus { chrom_id: 0, start: 1, end: 2 },
+            alleles: simple_alleles(&[b"A", b"T"]),
+            ploidy: 2,
+            n_samples: 1,
+            n_genotypes: 3,
+            allele_frequencies: vec![0.7, 0.3],
+            compound_frequencies: vec![None, None],
+            posteriors: vec![0.1, 0.8, 0.1],
+            best_genotype: vec![1],
+            gq_phred: vec![30.0],
+            qual_phred: 50.0,
+            scalars: vec![
+                AlleleSupportStats { num_obs: 10, ..Default::default() },
+                AlleleSupportStats { num_obs: 10, ..Default::default() },
+            ],
+            other_scalars: vec![],
+            chain_anchor_flags: vec![false, false],
+            diagnostics: EmDiagnostics {
+                iterations: 1,
+                final_max_delta_p: 0.0,
+                converged: true,
+            },
+        };
+        assert_eq!(rec.prune_unsupported_alleles(99.0), 0);
+        assert_eq!(rec.alleles.len(), 2);
+        assert_eq!(rec.best_genotype, vec![1]);
     }
 
     /// Build a `MergedRecord` from per-sample, per-genotype log-likelihood
