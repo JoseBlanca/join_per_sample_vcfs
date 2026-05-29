@@ -22,7 +22,6 @@
 //! architecture spec §"Indel normalization (left-alignment)".
 
 use super::CigarOp;
-use super::PreparedRead;
 
 /// Result of left-aligning a read's CIGAR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +140,10 @@ struct Range {
 impl Range {
     #[inline]
     fn size(self) -> usize {
+        // The range is always well-formed (`start <= end`) when `size` is
+        // read for op-length emission; the assert catches a future edit
+        // that inverts it rather than letting `as usize` wrap to ~2^64.
+        debug_assert!(self.end >= self.start, "inverted Range: {self:?}");
         (self.end - self.start) as usize
     }
     #[inline]
@@ -378,11 +381,25 @@ pub(crate) fn left_align_cigar(
         };
     }
 
-    // Reference bases are needed from the read start to the rightmost
-    // indel. If the window is too short (should not happen — the caller
-    // fetches the read footprint) fail safe by leaving the CIGAR as is.
+    // Fail safe on malformed or under-provisioned input by leaving the
+    // CIGAR untouched (the downstream walker's `read.length()` check then
+    // rejects a genuinely malformed read, exactly as without normalization):
+    //
+    // - the reference window must cover the read's footprint
+    //   (`read_start + ref_length`) — should always hold, since the caller
+    //   fetches that footprint;
+    // - the CIGAR's read-consumption must equal `read_seq.len()`. This is an
+    //   *untrusted-input* guard: a CIGAR from a corrupt/adversarial CRAM/BAM
+    //   whose read-consuming ops disagree with `seq` would otherwise drive
+    //   the right-to-left walk to a non-zero residual and emit a
+    //   wrong-length CIGAR in release (where the `read_indel_range.start`
+    //   debug-assert below is compiled out).
     let ref_length: usize = cigar.iter().copied().map(length_on_ref).sum();
-    if read_start + ref_length > ref_bases.len() || read_seq.is_empty() {
+    let read_length: usize = cigar.iter().copied().map(length_on_read).sum();
+    if read_start + ref_length > ref_bases.len()
+        || read_length != read_seq.len()
+        || read_seq.is_empty()
+    {
         return LeftAlignResult {
             cigar: cigar.to_vec(),
             leading_deletion_bases_removed: 0,
@@ -488,36 +505,37 @@ pub(crate) fn left_align_cigar(
     build_cigar(&result_right_to_left, remove_deletions_at_ends)
 }
 
-/// Left-align a prepared read's indels in place against `ref_bases`, whose
-/// index `read_start` holds the read's first aligned base. Rewrites
-/// `prepared.cigar` to the canonical (leftmost) form; `alignment_start` is
-/// left untouched (uses `remove_deletions_at_ends = false`, so the read
-/// stream stays coordinate-sorted and the cursor rejects any first/last-op
-/// deletion). No-op for reads with no indel.
+/// Left-align every indel in a read's `cigar` to its leftmost equivalent
+/// position, in place. `ref_seq` is the reference slice covering the read's
+/// aligned footprint, with `ref_seq[0]` the base at the read's first aligned
+/// position (`read_start = 0`); `seq` is the read sequence. The CIGAR is
+/// rewritten to the canonical (leftmost) form, leaving the read's start
+/// position untouched (`remove_deletions_at_ends = false`, so a deletion
+/// that rolls to a read edge stays a first/last-op deletion the cursor
+/// rejects). No-op for reads with no indel.
+///
+/// This is the drop-in replacement for the alignment-input cascade's F3
+/// pass: same `(&mut cigar, seq, ref_seq)` shape, but backed by the GATK
+/// `leftAlignIndels` port instead of the prior single-forward-pass shifter.
 ///
 /// A debug-only invariant checks that left-alignment — a lossless
 /// re-placement of the same indels — leaves the read's reference-mismatch
 /// count unchanged, guarding the port against silent corruption.
-pub(crate) fn left_align_prepared(
-    prepared: &mut PreparedRead,
-    ref_bases: &[u8],
-    read_start: usize,
-) {
-    if !prepared.cigar.iter().copied().any(is_indel) {
+pub(crate) fn left_align_indels(cigar: &mut Vec<CigarOp>, seq: &[u8], ref_seq: &[u8]) {
+    if !cigar.iter().copied().any(is_indel) {
         return;
     }
-    let result = left_align_cigar(&prepared.cigar, ref_bases, &prepared.seq, read_start, false);
+    let result = left_align_cigar(cigar, ref_seq, seq, 0, false);
     #[cfg(debug_assertions)]
     {
-        let before = count_mismatches(&prepared.cigar, ref_bases, &prepared.seq, read_start);
-        let after = count_mismatches(&result.cigar, ref_bases, &prepared.seq, read_start);
+        let before = count_mismatches(cigar, ref_seq, seq, 0);
+        let after = count_mismatches(&result.cigar, ref_seq, seq, 0);
         debug_assert_eq!(
             before, after,
-            "indel left-alignment changed mismatch count for qname='{}'",
-            prepared.qname
+            "indel left-alignment changed the read's reference-mismatch count",
         );
     }
-    prepared.cigar = result.cigar;
+    *cigar = result.cigar;
 }
 
 /// Count read/reference mismatches across `cigar`'s alignment blocks,

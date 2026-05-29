@@ -98,7 +98,7 @@ fn process_all(
 ) -> u64 {
     let mut capped: u64 = 0;
     for r in reads {
-        if let BaqOutcome::Capped(_) = engine.process(r, fetcher, true) {
+        if let BaqOutcome::Capped(_) = engine.process(r, fetcher) {
             capped += 1;
         }
     }
@@ -159,7 +159,6 @@ fn drain_stream(
         fasta_path,
         contigs,
         chunk_size,
-        true,
     );
     let mut capped: u64 = 0;
     for outcome in stream {

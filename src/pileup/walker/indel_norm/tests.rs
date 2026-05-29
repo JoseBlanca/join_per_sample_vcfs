@@ -148,3 +148,75 @@ fn deletion_to_read_start_kept_when_not_removing_ends() {
     assert_eq!(r.cigar, vec![Deletion(1), Match(4)]);
     assert_eq!(r.leading_deletion_bases_removed, 0);
 }
+
+#[test]
+fn malformed_read_consumption_returns_input_unchanged() {
+    // Untrusted-input guard: a CIGAR whose read-consuming ops (4+1+1 = 6)
+    // disagree with seq.len() (5) is left untouched rather than producing a
+    // wrong-length CIGAR. The downstream walker length check then rejects
+    // the read, exactly as without normalization.
+    let cigar = [Match(4), Insertion(1), Match(1)];
+    let r = left_align_cigar(&cigar, "AAAAAA".as_bytes(), "AAAAA".as_bytes(), 0, false);
+    assert_eq!(r.cigar, cigar.to_vec());
+    assert_eq!(r.leading_deletion_bases_removed, 0);
+}
+
+#[test]
+fn two_reads_with_same_deletion_converge() {
+    // The core recall fix: the same biological deletion of one A from a
+    // homopolymer, placed by the aligner at opposite ends (5M1D1M vs
+    // 1M1D5M), must canonicalise to the *same* CIGAR so the cohort merge
+    // buckets the two reads onto one allele.
+    let right = la(&[Match(5), Deletion(1), Match(1)], "GAAAAAC", "GAAAAC");
+    let left = la(&[Match(1), Deletion(1), Match(5)], "GAAAAAC", "GAAAAC");
+    assert_eq!(right.cigar, left.cigar);
+    assert_eq!(right.cigar, vec![Match(1), Deletion(1), Match(5)]);
+}
+
+#[test]
+fn multi_base_ssr_insertion_shifts_to_leftmost_unit() {
+    // ref GCACAC (G + CA + CA), read GCACACAC (one extra CA unit). The
+    // inserted CA left-aligns to the first unit.
+    let r = la(&[Match(2), Insertion(2), Match(4)], "GCACAC", "GCACACAC");
+    assert_eq!(r.cigar, vec![Match(1), Insertion(2), Match(5)]);
+}
+
+// --- build_cigar: canonical-form assembly (review M7) ----------------
+//
+// The right-to-left emitter can produce an insertion before a deletion and
+// adjacent same-ops; `build_cigar` is what makes the output canonical, and
+// it is the logic that lets identical events bucket together. Tested
+// directly because the end-to-end paths rarely produce a colliding run.
+
+#[test]
+fn build_cigar_orders_deletion_before_insertion() {
+    // An I-before-D run must come out D-before-I (canonical order).
+    let r = build_cigar(&[Match(2), Insertion(1), Deletion(1), Match(2)], false);
+    assert_eq!(r.cigar, vec![Match(2), Deletion(1), Insertion(1), Match(2)],);
+}
+
+#[test]
+fn build_cigar_merges_adjacent_identical_ops_and_drops_zeros() {
+    // Adjacent same-ops merge; zero-length ops are dropped.
+    assert_eq!(
+        build_cigar(&[Match(1), Match(0), Match(4)], false).cigar,
+        vec![Match(5)],
+    );
+    assert_eq!(
+        build_cigar(&[Deletion(1), Deletion(2)], false).cigar,
+        vec![Deletion(3)],
+    );
+}
+
+#[test]
+fn build_cigar_strips_leading_deletion_only_when_requested() {
+    // remove_deletions_at_ends gates the leading-deletion strip + its
+    // reported reference length.
+    let kept = build_cigar(&[Deletion(2), Match(4)], false);
+    assert_eq!(kept.cigar, vec![Deletion(2), Match(4)]);
+    assert_eq!(kept.leading_deletion_bases_removed, 0);
+
+    let stripped = build_cigar(&[Deletion(2), Match(4)], true);
+    assert_eq!(stripped.cigar, vec![Match(4)]);
+    assert_eq!(stripped.leading_deletion_bases_removed, 2);
+}

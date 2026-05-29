@@ -695,6 +695,7 @@ fn process_one_chromosome_from_bam(
     writer_cfg_template: crate::vcf::WriterConfig,
     pipeline_params: CohortPipelineParams,
 ) -> Result<(u32, CohortDriveStats), VarCallingFromBamCliError> {
+    use crate::pileup::per_sample::baq_engine::prepare_passthrough;
     use crate::pileup::per_sample::baq_stream::BaqStream;
     use crate::pileup::walker::{self, PreparedRead};
 
@@ -743,17 +744,42 @@ fn process_one_chromosome_from_bam(
         // each record carries a small `Vec<AlleleObservation>`. The
         // peak memory cost is bounded and rebuilds at the next
         // worker — no cross-worker accumulation.
-        let baq_skip = {
-            // Both modes flow through BaqStream: indel left-alignment is
-            // mandatory and runs in `BaqEngine::process` regardless of BAQ;
-            // `apply_baq = !no_baq` gates only the HMM (raw qual when off).
+        let baq_skip = if no_baq {
+            // No-BAQ branch: passthrough off the merged reader.
+            let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
+                r.map(|read| {
+                    let chrom = u32::try_from(read.ref_id).expect("ref_id fits u32");
+                    prepare_passthrough(read, chrom)
+                })
+            }));
+            let cram_error_handle = adapter.error_handle();
+            let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
+            let walker = walker::run(input, &walker_fetcher, &walker_cfg);
+
+            let mut walker_adapter: ErrorSheddingAdapter<_, _, WalkerError> =
+                ErrorSheddingAdapter::new(walker);
+            let walker_error_handle = walker_adapter.error_handle();
+            let records: Vec<crate::pileup_record::PileupRecord> =
+                walker_adapter.by_ref().collect();
+            drop(walker_adapter);
+            drop(adapter);
+
+            // If the walker errored mid-stream, surface that
+            // immediately — the merger should never see a partial
+            // chrom.
+            if let Some(e) = walker_error_handle.take() {
+                return Err(VarCallingFromBamCliError::Walker(e));
+            }
+
+            (records, cram_error_handle)
+        } else {
+            // BAQ-on: reader → BaqStream → adapter → walker.
             let mut baq_stream = BaqStream::new(
                 reader.by_ref(),
                 baq_cfg,
                 reference.to_path_buf(),
                 all_chromosomes_to_contig_list(&all_chromosomes),
                 baq_chunk_size,
-                !no_baq,
             );
             let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
             let cram_error_handle = adapter.error_handle();
@@ -769,8 +795,6 @@ fn process_one_chromosome_from_bam(
             drop(adapter);
             drop(baq_stream);
 
-            // If the walker errored mid-stream, surface that immediately —
-            // the merger should never see a partial chrom.
             if let Some(e) = walker_error_handle.take() {
                 return Err(VarCallingFromBamCliError::Walker(e));
             }

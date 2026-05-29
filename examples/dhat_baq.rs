@@ -100,7 +100,7 @@ fn main() {
     let n = reads.len();
     for r in reads {
         let pos = r.pos;
-        if let BaqOutcome::Capped(_) = engine.process(r, &mut fetcher, true) {
+        if let BaqOutcome::Capped(_) = engine.process(r, &mut fetcher) {
             capped += 1;
         }
         if let Ok(p) = u32::try_from(pos) {

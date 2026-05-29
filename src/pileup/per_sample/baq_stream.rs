@@ -1,11 +1,9 @@
 //! Iterator adapter that sits between `AlignmentMergedReader` and
-//! `pileup::walker::run` — the per-read prep stage. Pulls a chunk of
-//! coordinate-sorted `MappedRead`s, runs `BaqEngine::process` on each in
-//! parallel via rayon (one engine per worker thread), and yields the
-//! resulting `PreparedRead`s in the original order. Each read is
-//! **indel-left-aligned** here regardless of BAQ; the `apply_baq` flag
-//! gates only the BAQ HMM capping (`--no-baq` still normalizes). The
-//! walker's non-decreasing-coordinate invariant is preserved by rayon's
+//! `pileup::walker::run`. Pulls a chunk of coordinate-sorted
+//! `MappedRead`s, BAQ-caps each in parallel via rayon (one engine per
+//! worker thread), and yields the resulting `PreparedRead`s in the
+//! original order. The walker's
+//! non-decreasing-coordinate invariant is preserved by rayon's
 //! order-preserving `par_iter` plus our serial chunk-by-chunk drain.
 
 use std::collections::VecDeque;
@@ -99,10 +97,6 @@ pub struct BaqStream<R> {
     /// into the rayon closure as a borrowed reference.
     contigs: ContigList,
     chunk_size: usize,
-    /// Whether to run the BAQ HMM. `false` (`--no-baq`) still performs the
-    /// mandatory indel left-alignment in `BaqEngine::process`; only the
-    /// HMM capping is skipped (`bq_baq` is the raw qual).
-    apply_baq: bool,
     /// Reusable input-chunk buffer drained from upstream each refill.
     /// Its capacity sticks at `chunk_size` after the first refill.
     chunk_buf: Vec<MappedRead>,
@@ -135,7 +129,6 @@ where
         fasta_path: PathBuf,
         contigs: ContigList,
         chunk_size: usize,
-        apply_baq: bool,
     ) -> Self {
         assert!(chunk_size > 0, "BaqStream chunk_size must be > 0");
         Self {
@@ -144,7 +137,6 @@ where
             fasta_path,
             contigs,
             chunk_size,
-            apply_baq,
             chunk_buf: Vec::new(),
             pending_next_read: None,
             outcomes_buf: Vec::new(),
@@ -226,7 +218,6 @@ where
         let contig_name: &str = &contig_entry.name;
         let fasta_path: &std::path::Path = &self.fasta_path;
         let cfg = self.cfg;
-        let apply_baq = self.apply_baq;
 
         // par_drain consumes the chunk by-value (so `engine.process`
         // can move the read's cigar/seq/qname straight into the
@@ -251,7 +242,7 @@ where
                 },
                 |(engine, fetcher), read| {
                     let pos = read.pos;
-                    let outcome = engine.process(read, fetcher, apply_baq);
+                    let outcome = engine.process(read, fetcher);
                     if let Ok(p) = u32::try_from(pos) {
                         fetcher.evict_before(p);
                     }

@@ -1,5 +1,21 @@
 # Indel normalization (left-alignment)
 
+> **Final approach (revised — read first).** This plan designed
+> normalization as a new pass in the per-read BAQ prep stage. Code review
+> then found the BAM/CRAM input cascade *already* left-aligns every read
+> (the always-on "F3" pass `left_align_indels` in
+> `src/bam/alignment_input.rs`, pre-existing on `main`). The feature was
+> therefore restructured (option 2): **F3's single-forward-pass shifter is
+> replaced by the GATK `leftAlignIndels` port** (`indel_norm::left_align_indels`,
+> called at F3's site in the reader), and the BaqEngine prep-stage wiring
+> this plan describes was reverted. The algorithm design below (the GATK
+> port: right-to-left, trim-first, dual ref+read check, collision-merge)
+> is current and accurate; the *placement* sections ("Why in read-prep",
+> "Wiring", "Phasing") describe the superseded BaqEngine detour — the live
+> placement is the reader's F3 call site, which reuses the F1
+> mismatch-filter reference fetch and is structurally upstream of
+> everything (so `--no-baq` normalizes for free).
+
 Implementation plan for the Stage 1 indel-normalization slice of the
 calling pipeline. Specified in
 [calling_pipeline_architecture.md §"Indel normalization (left-alignment)"](../specs/calling_pipeline_architecture.md#L224)
