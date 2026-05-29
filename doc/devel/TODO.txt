@@ -1,13 +1,94 @@
 
-compilation OK including the benches, clippy, format and tests before every commit
 
-let's add regions to skip using a bed file. For instance to avoid pathological regions.
+
+
+
+
+Goal: restructure cohort var-calling parallelism from per-chromosome
+rayon to single-pool per-variant-group parallelism. This is an
+architectural refactor, not a small fix.
+
+Why: today the cohort driver opens N PspReaders per chromosome worker and
+runs min(n_chromosomes, n_threads) workers in parallel (see
+src/pop_var_caller/cohort_driver.rs:502-517 and src/pop_var_caller/var_calling.rs:400).
+Peak heap scales as n_threads × N × per_block. With per-block at ~4 MB
+(post-commit fcef495), an N=5000 cohort at T=4 sits at ~45 GB — fits a 64 GB
+workstation, but the n_threads multiplier means bumping T further blows the
+budget.
+
+The dhat profile (tmp/dhat/N18.dhat-heap.json, 2026-05-27) confirms 99.5 %
+of peak heap is the PSP reader's per-block decoded columns held across the
+n_threads × N concurrent readers; no other subsystem shows up.
+
+Proposed structure:
+- Phase 1 (per-chromosome, *sequential* within a chrom): open N readers →
+  per_position_merger (k-way merge over readers) → variant grouper. Produces
+  a stream of OverlappingVariantGroups.
+- Phase 2 (single rayon pool over groups across all chromosomes): per-group
+  merger → posterior engine → emit posterior records.
+- Phase 3: order-preserving write to VCF (sort by position within a chrom,
+  concat chroms in contig-table order — the existing src/vcf/concat.rs
+  already handles the per-chrom concat shape).
+
+Memory: peak becomes N × per_block (no n_threads multiplier). At N=5000 with
+512 KiB blocks, that's ~20 GB regardless of thread count. The cohort-step
+memory problem goes away.
+
+Side benefit: ch00's read-imbalance long pole stops gating wall time. The
+2026-05-20 per-chrom parallel impl report measured a 3.85× speedup ceiling
+at T=13 because ch00 carries 1.4 M reads vs ~85–125 K on every other tomato
+contig. Group-level work-stealing across chromosomes lifts that ceiling.
+
+Trade-off / risk: Phase 1 becomes sequential per chromosome (today it runs
+in parallel across chromosomes). At small N where Phase 1 dominates wall
+time, this is a wall-time regression. The crossover N at which the trade
+pays off needs measuring — see the companion "measurement plan" prompt.
+
+Code touchpoints:
+- src/pop_var_caller/var_calling.rs:400 (the current per-chrom par_iter that
+  needs to go)
+- src/pop_var_caller/cohort_driver.rs:502-517 (process_one_chromosome —
+  needs to split into "read+merge+group" vs "analyze")
+- src/var_calling/per_position_merger.rs (Phase 1, unchanged)
+- src/var_calling/variant_grouping.rs (Phase 1 output — needs to yield groups
+  to a queue instead of feeding directly into the per-group merger)
+- src/var_calling/per_group_merger.rs (Phase 2 — should become rayon-friendly)
+- src/var_calling/posterior_engine.rs (Phase 2 — already per-record; RecordScratch
+  reuse pattern needs to become thread-local instead of shared-across-records)
+- src/vcf/writer.rs, src/vcf/concat.rs (Phase 3 — ordering)
+
+Background reading:
+- doc/devel/reports/implementations/cohort_per_chromosome_parallel_2026-05-20.md
+  (the current architecture's impl report)
+- doc/devel/reports/reviews/perf_psp_to_vcf_2026-05-20.md (the perf review
+  that led to it — note H1 there is the per-chrom parallel; L1 is the
+  removal of an *inner* per-group par_iter that would now be reinstated in
+  a single-pool form)
+- doc/devel/specs/calling_pipeline_architecture.md
+
+Start with a design doc (doc/devel/feature_implementation_plans/per_group_parallel.md)
+before any code. The work-queue shape, ordering strategy (in-memory sort vs
+ordered-channel), and posterior-scratch ownership are all decisions that
+benefit from being argued through on paper first.
+
+Working dir: /Users/jose/devel/pop_var_caller. See CLAUDE.md.
+
+
+
+
+
+
+
+
+let's add regions to analyze using a bed file.
+For instance to do only some selected regions or to avoid pathological regions.
+what do you think about this? Do you see any problems? How would we do it?
+
+
 
 Add an issue, create integration tests that check that the phase chains are correctely considered in the likelihood calculation.
 
 
-psp in parallel
 
-bam
 
 
