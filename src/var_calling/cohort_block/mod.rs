@@ -32,10 +32,12 @@ pub mod worker;
 
 pub use columns::{MaterialisedChunk, SampleColumns};
 pub use driver::{
-    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, DEFAULT_CHUNK_GENOMIC_SPAN,
-    drive_cohort_chunked,
+    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
+    DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
 };
-pub use loader::{ChunkLoadError, ChunkLoadScratch, ChunkLoadStats, load_chunk_from_iters};
+pub use loader::{
+    ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, ChunkLoadStats, load_chunk_from_iters,
+};
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
 pub use pre_pass::{FixBoundariesError, FixBoundariesScratch, fix_boundaries};
 pub use worker::{into_shared_ref_fetcher, run_window};

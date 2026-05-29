@@ -70,19 +70,14 @@ const DRIVER_PSP_BUFFER_BYTES: usize = 64 * 1024;
 /// reach across modules.
 const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
 
-/// Per-driver tuning bundle. Carries every per-stage config the
-/// chunk loop needs.
+/// Mi19: chunk-loop sizing knobs. Bundled separately from
+/// `ChunkDriverParams` so the chunk loader / pre-pass / worker-
+/// dispatch axis is named and the three fields can be passed around
+/// together without dragging along the per-stage configs and
+/// downstream filters.
 #[non_exhaustive]
-pub struct ChunkDriverParams {
-    pub no_complexity_filter: bool,
-    pub dust_cfg: DustFilterConfig,
-    pub grouper_cfg: GrouperConfig,
-    pub per_group_cfg: PerGroupMergerConfig,
-    pub posterior_cfg: PosteriorEngineConfig,
-    pub min_qual_phred: f64,
-    pub min_alt_obs_per_sample: u32,
-    pub no_mapq_diff_filter: bool,
-    pub min_mapq_diff_t: f32,
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkSizingParams {
     /// Nominal BP span of the loader's first pull attempt per chunk.
     /// Acts as a starting size; the loader grows up to
     /// `chunk_genomic_span × MAX_CHUNK_SPAN_GROWTH` when
@@ -105,6 +100,51 @@ pub struct ChunkDriverParams {
     /// sequential single-window-per-chunk behaviour byte-for-byte.
     /// See [the Phase B plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md).
     pub target_window_count: usize,
+}
+
+/// Mi19: post-EM downstream filters applied by `emit_or_drop` before
+/// each record reaches the VCF writer. Grouped separately from
+/// `ChunkDriverParams` so the per-record filter axis is named and
+/// `emit_or_drop`'s signature can take `&DownstreamFilterParams`
+/// instead of the whole driver bundle.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct DownstreamFilterParams {
+    /// Minimum per-allele alt-read support — at the per-group merger
+    /// → EM boundary, a record is dropped if no ALT allele has
+    /// `max(num_obs across samples) >= min_alt_obs_per_sample`.
+    pub min_alt_obs_per_sample: u32,
+    /// Minimum site-level `QUAL` (phred) required to emit a record.
+    /// Records with `qual_phred < min_qual_phred` are dropped.
+    pub min_qual_phred: f64,
+    /// Skip the Welch's-t MAPQ-difference drop entirely.
+    pub no_mapq_diff_filter: bool,
+    /// Drop records whose worst per-ALT Welch's t-statistic for the
+    /// MAPQ(alt) − MAPQ(ref) distribution falls below this threshold.
+    pub min_mapq_diff_t: f32,
+}
+
+/// Per-driver tuning bundle. Carries every per-stage config the
+/// chunk loop needs.
+///
+/// Mi19: the per-axis knobs live in dedicated sub-structs
+/// ([`ChunkSizingParams`], [`DownstreamFilterParams`]) so the top-
+/// level field set names the axes rather than mixing 12 flat
+/// `u32` / `bool` / `f64` fields. Per-stage configs (`dust_cfg`,
+/// `grouper_cfg`, `per_group_cfg`, `posterior_cfg`) stay at the top
+/// level — each is a single subsystem's config bundle and already
+/// carries its own internal grouping.
+#[non_exhaustive]
+pub struct ChunkDriverParams {
+    pub no_complexity_filter: bool,
+    pub dust_cfg: DustFilterConfig,
+    pub grouper_cfg: GrouperConfig,
+    pub per_group_cfg: PerGroupMergerConfig,
+    pub posterior_cfg: PosteriorEngineConfig,
+    /// Chunk-loop sizing knobs — see [`ChunkSizingParams`].
+    pub sizing: ChunkSizingParams,
+    /// Post-EM downstream filters — see [`DownstreamFilterParams`].
+    pub downstream: DownstreamFilterParams,
 }
 
 /// Per-driver counters; the shape mirrors
@@ -142,7 +182,7 @@ pub struct ChunkDriverStats {
     /// `target_variants_per_chunk` is doing what the operator expects.
     pub chunk_variants_total: u64,
     /// Mi21: chunks where `fix_boundaries` produced fewer windows
-    /// than `params.target_window_count` requested. The pre-pass
+    /// than `params.sizing.target_window_count` requested. The pre-pass
     /// silently down-grades when safe positions are sparse; an
     /// operator setting `--worker-windows-per-chunk 8` and seeing
     /// `chunks_with_fewer_windows_than_requested > 0` knows the
@@ -316,13 +356,13 @@ pub fn drive_cohort_chunked(
         "var-calling: chunk_genomic_span={} target_variants_per_chunk={} \
          target_window_count={} min_qual_phred={} min_alt_obs_per_sample={} \
          no_mapq_diff_filter={} min_mapq_diff_t={} no_complexity_filter={}",
-        params.chunk_genomic_span,
-        params.target_variants_per_chunk,
-        params.target_window_count,
-        params.min_qual_phred,
-        params.min_alt_obs_per_sample,
-        params.no_mapq_diff_filter,
-        params.min_mapq_diff_t,
+        params.sizing.chunk_genomic_span,
+        params.sizing.target_variants_per_chunk,
+        params.sizing.target_window_count,
+        params.downstream.min_qual_phred,
+        params.downstream.min_alt_obs_per_sample,
+        params.downstream.no_mapq_diff_filter,
+        params.downstream.min_mapq_diff_t,
         params.no_complexity_filter,
     );
 
@@ -425,7 +465,7 @@ fn emit_or_drop(
     writer: &mut CohortVcfWriter,
     stats: &mut ChunkDriverStats,
 ) -> Result<(), ChunkDriverError> {
-    if !passes_min_alt_obs(&record, params.min_alt_obs_per_sample) {
+    if !passes_min_alt_obs(&record, params.downstream.min_alt_obs_per_sample) {
         stats.records_dropped_low_alt_obs += 1;
         return Ok(());
     }
@@ -433,11 +473,13 @@ fn emit_or_drop(
         stats.records_dropped_hom_ref += 1;
         return Ok(());
     }
-    if record.qual_phred < params.min_qual_phred {
+    if record.qual_phred < params.downstream.min_qual_phred {
         stats.records_dropped_low_qual += 1;
         return Ok(());
     }
-    if !params.no_mapq_diff_filter && record_fails_mapq_diff_t(&record, params.min_mapq_diff_t) {
+    if !params.downstream.no_mapq_diff_filter
+        && record_fails_mapq_diff_t(&record, params.downstream.min_mapq_diff_t)
+    {
         stats.records_dropped_low_mapq_diff_t += 1;
         return Ok(());
     }
@@ -668,7 +710,7 @@ where
         .collect();
 
     while chunk_range_start < chrom_one_past_end {
-        let nominal_span = params.chunk_genomic_span.max(1);
+        let nominal_span = params.sizing.chunk_genomic_span.max(1);
         let max_span = nominal_span.saturating_mul(MAX_CHUNK_SPAN_GROWTH);
 
         let safe_end = load_and_run_chunk_with_retry(
@@ -795,7 +837,7 @@ where
                 chrom_id,
                 range_start: chunk_range_start,
                 initial_span: initial_load_span,
-                target_variants: params.target_variants_per_chunk,
+                target_variants: params.sizing.target_variants_per_chunk,
                 max_span: max_load_span,
             },
             iters,
@@ -805,7 +847,7 @@ where
         stats.chunks_loaded += 1;
         stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
-        let target_window_count = params.target_window_count.max(1);
+        let target_window_count = params.sizing.target_window_count.max(1);
         match fix_boundaries(
             chunk,
             carryover,
@@ -1096,13 +1138,17 @@ mod tests {
             grouper_cfg: GrouperConfig::new(50).expect("grouper"),
             per_group_cfg: PerGroupMergerConfig::default(),
             posterior_cfg: PosteriorEngineConfig::default(),
-            min_qual_phred,
-            min_alt_obs_per_sample,
-            no_mapq_diff_filter,
-            min_mapq_diff_t,
-            chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
-            target_variants_per_chunk: 0,
-            target_window_count: 1,
+            sizing: ChunkSizingParams {
+                chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
+                target_variants_per_chunk: 0,
+                target_window_count: 1,
+            },
+            downstream: DownstreamFilterParams {
+                min_alt_obs_per_sample,
+                min_qual_phred,
+                no_mapq_diff_filter,
+                min_mapq_diff_t,
+            },
         }
     }
 

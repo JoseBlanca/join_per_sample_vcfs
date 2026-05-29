@@ -40,8 +40,8 @@ use crate::pop_var_caller::contamination_artefact::{
 };
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::cohort_block::{
-    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, DEFAULT_CHUNK_GENOMIC_SPAN,
-    drive_cohort_chunked,
+    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
+    DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
 };
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
@@ -392,13 +392,17 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        min_qual_phred: args.cohort.min_qual_phred,
-        min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
-        no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
-        min_mapq_diff_t: args.cohort.min_mapq_diff_t,
-        chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
-        target_variants_per_chunk: args.target_variants_per_chunk,
-        target_window_count: args.worker_windows_per_chunk,
+        sizing: ChunkSizingParams {
+            chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
+            target_variants_per_chunk: args.target_variants_per_chunk,
+            target_window_count: args.worker_windows_per_chunk,
+        },
+        downstream: DownstreamFilterParams {
+            min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
+            min_qual_phred: args.cohort.min_qual_phred,
+            no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
+            min_mapq_diff_t: args.cohort.min_mapq_diff_t,
+        },
     };
     let chunk_stats = drive_cohort_chunked(
         &args.psp_files,
