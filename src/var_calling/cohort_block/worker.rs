@@ -74,9 +74,6 @@ pub struct ColumnarPipelineScratch {
     /// 2. The emitted [`PosteriorRecord`]'s `chain_anchor_flags`
     ///    field, which the VCF writer reads for the `CA` flag.
     chain_anchor_flags: Vec<bool>,
-    /// REF byte buffer for the group span. Refilled by
-    /// [`ChromRefFetcher::fetch_into`] per group; capacity carries.
-    ref_buf: Vec<u8>,
     /// Per-engine EM scratch — owned at the worker level (rather
     /// than inside a `PosteriorEngine` instance) so the chunk loop
     /// reuses the same EM intermediates across every group.
@@ -155,26 +152,28 @@ impl ColumnarPipelineScratch {
 /// - `partition`: the variant-group partition produced by
 ///   [`partition_window`](super::partition::partition_window) for
 ///   one of `chunk.windows`. Its `n_groups()` may be 0 — empty
-///   partitions are a fast no-op that never queries the fetcher.
-/// - `ref_fetcher`: shared reference fetcher used by the columnar
-///   allele-unification layer to gather REF bases for the group span.
-///   The driver typically holds an `Arc<StreamingChromRefFetcher>`
-///   per chromosome.
+///   partitions are a fast no-op that never reads any REF bytes.
+/// - `pre_fetched_ref_bytes`: one entry per variant group in
+///   `partition` (`pre_fetched_ref_bytes.len() ==
+///   partition.n_groups()`); each entry is the REF bases over
+///   `[group_starts[g], group_ends[g]]`. Driver-side pre-fetch
+///   lifts the fetcher state out of the per-window math so the
+///   worker is `Sync`-friendly for Phase B's parallel dispatch.
 /// - `per_group_config`: tuning for the column-native kernels
 ///   (`ploidy`, `max_alleles`, `max_alleles_lh_calc`). The
 ///   `batch_size` field is ignored — Phase A.1 doesn't batch.
 /// - `posterior_config`: tuning passed straight to
 ///   [`PosteriorEngine`].
 /// - `scratch`: per-window columnar scratch (
-///   [`ColumnarPipelineScratch`]). The driver owns one and reuses it
-///   across every window in every chunk.
+///   [`ColumnarPipelineScratch`]). The driver owns one per worker
+///   slot and reuses it across every window in every chunk.
 /// - `output`: appended-to record buffer. Cleared on entry so the
 ///   driver can reuse it across windows.
 #[allow(clippy::too_many_arguments)]
 pub fn run_window(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
-    ref_fetcher: SharedRefFetcher,
+    pre_fetched_ref_bytes: &[Vec<u8>],
     per_group_config: PerGroupMergerConfig,
     posterior_config: PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
@@ -184,19 +183,47 @@ pub fn run_window(
     if partition.n_groups() == 0 {
         return Ok(());
     }
+    debug_assert_eq!(
+        pre_fetched_ref_bytes.len(),
+        partition.n_groups(),
+        "one pre-fetched REF buffer required per variant group in the partition",
+    );
 
-    for g in 0..partition.n_groups() {
+    for (g, group_ref_bytes) in pre_fetched_ref_bytes.iter().enumerate() {
         if let Some(record) = build_posterior_record_columnar(
             chunk,
             partition,
             g,
-            &*ref_fetcher,
+            group_ref_bytes,
             &per_group_config,
             &posterior_config,
             scratch,
         )? {
             output.push(record);
         }
+    }
+    Ok(())
+}
+
+/// Sequentially populate `out` with one `Vec<u8>` of REF bases per
+/// variant group in `partition`. The driver calls this once per
+/// window before [`run_window`] so the worker math (parallelised
+/// by Phase B's window dispatch) consumes `Sync`-friendly
+/// pre-fetched bytes rather than a `!Sync`
+/// [`StreamingChromRefFetcher`](crate::fasta::fetcher::StreamingChromRefFetcher).
+pub fn prefetch_window_ref_bytes(
+    partition: &WindowPartition,
+    ref_fetcher: &dyn ChromRefFetcher,
+    out: &mut Vec<Vec<u8>>,
+) -> Result<(), ChromRefFetchError> {
+    out.clear();
+    for g in 0..partition.n_groups() {
+        let group_start = partition.group_starts[g];
+        let group_end = partition.group_ends[g];
+        let span = group_end - group_start + 1;
+        let mut bytes = Vec::with_capacity(span as usize);
+        ref_fetcher.fetch_into(group_start, span, &mut bytes)?;
+        out.push(bytes);
     }
     Ok(())
 }
@@ -215,7 +242,7 @@ fn build_posterior_record_columnar(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     group_idx: usize,
-    ref_fetcher: &dyn ChromRefFetcher,
+    ref_bytes: &[u8],
     per_group_config: &PerGroupMergerConfig,
     posterior_config: &PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
@@ -225,17 +252,19 @@ fn build_posterior_record_columnar(
     let group_end = partition.group_ends[group_idx];
     let n_samples = chunk.n_samples();
 
-    // Layer 1 — allele unification.
-    let span = group_end - group_start + 1;
-    scratch.ref_buf.clear();
-    ref_fetcher
-        .fetch_into(group_start, span, &mut scratch.ref_buf)
-        .map_err(|source| ref_fetch_error_to_merger(chrom_id, group_start, group_end, source))?;
+    // Layer 1 — allele unification reads REF bases pre-fetched by
+    // the driver (no fetcher state on the hot path; see
+    // [`prefetch_window_ref_bytes`]).
+    debug_assert_eq!(
+        ref_bytes.len() as u32,
+        group_end - group_start + 1,
+        "pre-fetched REF bytes length must match the group's reference span",
+    );
     unify_alleles_columnar(
         chunk,
         partition,
         group_idx,
-        &scratch.ref_buf,
+        ref_bytes,
         n_samples,
         per_group_config.max_alleles,
         &mut scratch.unify,
@@ -371,21 +400,6 @@ fn build_posterior_record_columnar(
         chain_anchor_flags: scratch.chain_anchor_flags.clone(),
         diagnostics: em_outputs.diagnostics,
     }))
-}
-
-fn ref_fetch_error_to_merger(
-    chrom_id: u32,
-    start: u32,
-    end: u32,
-    source: ChromRefFetchError,
-) -> PosteriorEngineError {
-    PerGroupMergerError::RefFetch {
-        chrom_id,
-        start,
-        end,
-        source: std::io::Error::other(source.to_string()),
-    }
-    .into()
 }
 
 fn unify_error_to_merger(
@@ -739,11 +753,11 @@ mod tests {
         let mut output: Vec<PosteriorRecord> = Vec::new();
         let mut scratch = ColumnarPipelineScratch::empty();
 
-        let fetcher: SharedRefFetcher = Arc::new(NeverCalledFetcher);
+        // Empty partition ⇒ no groups ⇒ no REF bytes needed.
         let result = run_window(
             &chunk,
             &partition,
-            fetcher,
+            &[],
             PerGroupMergerConfig::default(),
             PosteriorEngineConfig::default(),
             &mut scratch,
@@ -918,14 +932,16 @@ mod tests {
         };
 
         // Column-native path.
-        let cn_fetcher: SharedRefFetcher = Arc::new(fetcher.clone());
         let mut cn_scratch = ColumnarPipelineScratch::empty();
         let mut cn_out: Vec<PosteriorRecord> = Vec::new();
         let cfg = PerGroupMergerConfig::new(2, 16, 64, 32).expect("merger config");
+        let mut cn_pre_fetched: Vec<Vec<u8>> = Vec::new();
+        prefetch_window_ref_bytes(&partition, &fetcher, &mut cn_pre_fetched)
+            .expect("prefetch succeeded");
         run_window(
             &chunk,
             &partition,
-            cn_fetcher,
+            &cn_pre_fetched,
             cfg,
             PosteriorEngineConfig::default(),
             &mut cn_scratch,
@@ -1028,13 +1044,15 @@ mod tests {
         // `max_alleles = 3` forces the cap; compounds are present.
         let cfg = PerGroupMergerConfig::new(2, 3, 64, 32).expect("merger config");
 
-        let cn_fetcher: SharedRefFetcher = Arc::new(fetcher.clone());
         let mut cn_scratch = ColumnarPipelineScratch::empty();
         let mut cn_out: Vec<PosteriorRecord> = Vec::new();
+        let mut cn_pre_fetched: Vec<Vec<u8>> = Vec::new();
+        prefetch_window_ref_bytes(&partition, &fetcher, &mut cn_pre_fetched)
+            .expect("prefetch succeeded");
         run_window(
             &chunk,
             &partition,
-            cn_fetcher,
+            &cn_pre_fetched,
             cfg,
             PosteriorEngineConfig::default(),
             &mut cn_scratch,
@@ -1073,33 +1091,6 @@ mod tests {
                 cn.alleles.len(),
             );
             assert_eq!(cn, row);
-        }
-    }
-
-    /// A ChromRefFetcher whose every method panics — the
-    /// empty-partition fast path must never invoke it.
-    struct NeverCalledFetcher;
-
-    impl crate::fasta::fetcher::sealed::Sealed for NeverCalledFetcher {}
-
-    impl crate::fasta::fetcher::ChromRefFetcher for NeverCalledFetcher {
-        fn length(&self) -> u32 {
-            unreachable!("empty-partition path must not query the fetcher");
-        }
-        fn fetch(
-            &self,
-            _start_1based: u32,
-            _length: u32,
-        ) -> Result<Vec<u8>, crate::fasta::fetcher::ChromRefFetchError> {
-            unreachable!("empty-partition path must not query the fetcher");
-        }
-        fn iter_bases<'a>(
-            &'a self,
-        ) -> Result<
-            Box<dyn Iterator<Item = Result<u8, crate::fasta::fetcher::ChromRefFetchError>> + 'a>,
-            crate::fasta::fetcher::ChromRefFetchError,
-        > {
-            unreachable!("empty-partition path must not query the fetcher");
         }
     }
 }

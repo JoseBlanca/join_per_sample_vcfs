@@ -47,7 +47,9 @@ use crate::var_calling::cohort_block::partition::{
 use crate::var_calling::cohort_block::pre_pass::{
     FixBoundariesError, FixBoundariesScratch, fix_boundaries,
 };
-use crate::var_calling::cohort_block::worker::{ColumnarPipelineScratch, run_window};
+use crate::var_calling::cohort_block::worker::{
+    ColumnarPipelineScratch, prefetch_window_ref_bytes, run_window,
+};
 use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
 use crate::var_calling::per_group_merger::{
     PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
@@ -585,6 +587,9 @@ where
     }
 
     let windows = chunk.windows.clone();
+    // Reusable per-window REF-bytes buffer — capacity carries across
+    // windows.
+    let mut pre_fetched_ref_bytes: Vec<Vec<u8>> = Vec::new();
     for window in &windows {
         partition_window(
             chunk,
@@ -594,10 +599,11 @@ where
             partition_scratch,
             partition,
         )?;
+        prefetch_window_ref_bytes(partition, &*shared_fetcher, &mut pre_fetched_ref_bytes)?;
         run_window(
             chunk,
             partition,
-            shared_fetcher.clone(),
+            &pre_fetched_ref_bytes,
             params.per_group_cfg,
             params.posterior_cfg.clone(),
             worker_scratch,
