@@ -377,6 +377,9 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
         min_mapq_diff_t: args.cohort.min_mapq_diff_t,
         chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
+        // Variant-bounded chunk loading default: off. CLI flag wired
+        // in Phase B step 5.
+        target_variants_per_chunk: 0,
     };
     let chunk_stats = drive_cohort_chunked(
         &args.psp_files,

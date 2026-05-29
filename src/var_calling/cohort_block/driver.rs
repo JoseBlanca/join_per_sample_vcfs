@@ -88,7 +88,20 @@ pub struct ChunkDriverParams {
     pub min_alt_obs_per_sample: u32,
     pub no_mapq_diff_filter: bool,
     pub min_mapq_diff_t: f32,
+    /// Nominal BP span of the loader's first pull attempt per chunk.
+    /// Acts as a starting size; the loader grows up to
+    /// `chunk_genomic_span × MAX_CHUNK_SPAN_GROWTH` when
+    /// `target_variants_per_chunk` is not satisfied or the pre-pass
+    /// can't find a safe boundary.
     pub chunk_genomic_span: u32,
+    /// Soft lower bound on the post-filter variant count per chunk.
+    /// `0` disables the variant-bounded extension (each chunk is one
+    /// pull attempt of `chunk_genomic_span` BP). Non-zero values let
+    /// the loader grow each chunk's span adaptively until the
+    /// kept-position count crosses this target — decoupling worker
+    /// workload from PSP block size + variant density. See
+    /// [the Phase B prereq plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md).
+    pub target_variants_per_chunk: u32,
 }
 
 /// Per-driver counters; the shape mirrors
@@ -105,6 +118,15 @@ pub struct ChunkDriverStats {
     pub records_dropped_low_mapq_diff_t: u64,
     pub lh_cap_groups_skipped: u64,
     pub lh_cap_alleles_in_skipped: u64,
+    /// Total chunks loaded — includes both terminal loads and
+    /// (in the future) retry attempts. Useful for capacity planning
+    /// alongside `lh_cap_*` counters.
+    pub chunks_loaded: u64,
+    /// Sum of `ChunkLoadStats.variant_count` across every chunk
+    /// load. Divided by `chunks_loaded` it gives the average
+    /// kept-position count per chunk — a quick sanity check that
+    /// `target_variants_per_chunk` is doing what the operator expects.
+    pub chunk_variants_total: u64,
 }
 
 /// Errors surfaced by the chunk-loop driver.
@@ -518,22 +540,24 @@ where
             .map(|r| r.region_records(chrom_id, psp_cursor, psp_inclusive_end))
             .collect();
 
-        let load_span = chunk_range_end - chunk_range_start;
-        let _ = load_chunk_from_iters(
+        let initial_load_span = chunk_range_end - chunk_range_start;
+        // Variant-bounded extension cap: never grow past the
+        // chrom-side end the outer NoSafeGap retry would have used.
+        let extension_cap_end = chrom_one_past_end.saturating_add(last_chunk_logical_extension);
+        let max_load_span = extension_cap_end.saturating_sub(chunk_range_start);
+        let load_stats = load_chunk_from_iters(
             chunk_scratch,
             chunk,
             chrom_id,
             chunk_range_start,
-            load_span,
-            // Phase B step 4 wires `target_variants` + `max_span` from
-            // `ChunkDriverParams`; for now the loader takes one pull
-            // attempt of `load_span` (legacy behaviour) — extension
-            // happens via the existing NoSafeGap retry one level up.
-            0,
-            load_span,
+            initial_load_span,
+            params.target_variants_per_chunk,
+            max_load_span.max(initial_load_span),
             iters,
             carryover,
         )?;
+        stats.chunks_loaded += 1;
+        stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
         match fix_boundaries(chunk, carryover, fix_scratch, max_group_span, 1) {
             Ok(()) => break,
