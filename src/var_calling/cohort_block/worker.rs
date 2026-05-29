@@ -312,7 +312,27 @@ pub fn prefetch_window_ref_bytes(
     ref_fetcher: &dyn ChromRefFetcher,
     out: &mut Vec<Vec<u8>>,
 ) -> Result<(), ChromRefFetchError> {
-    out.clear();
+    // M2: preserve the inner `Vec<u8>` allocations across calls.
+    // The previous `out.clear()` shape dropped every inner buffer,
+    // making the next pass allocate fresh on every group; this
+    // defeated the WorkerSlot scratch-reuse design (one slot per
+    // worker × n_groups per window × chunks per chrom).
+    //
+    // Strategy: shrink the outer Vec to the new `n_groups` without
+    // freeing the kept inner buffers (`Vec::truncate` drops the tail
+    // — that's expected when the high-water mark drops), then grow
+    // with empty buffers if needed, then `clear()` each inner Vec
+    // in place and `fetch_into` straight into it. `fetch_into`'s
+    // contract is "buffer is cleared first, on success
+    // `dst.len() == length`"; subsequent calls reuse the underlying
+    // allocator capacity.
+    let n_groups = partition.n_groups();
+    if out.len() < n_groups {
+        out.resize_with(n_groups, Vec::new);
+    } else {
+        out.truncate(n_groups);
+    }
+
     // M24: pin the invariant that every group's `[start, end]` span
     // is inside the contig the fetcher serves. The walker invariant
     // (record positions ≤ chrom_length, ref_span = 1 at the chrom
@@ -323,7 +343,7 @@ pub fn prefetch_window_ref_bytes(
     // debug_assert catches it at the prefetch step under tests, with
     // a focused error message naming the offending group.
     let chrom_length = ref_fetcher.length();
-    for g in 0..partition.n_groups() {
+    for (g, bytes) in out.iter_mut().enumerate().take(n_groups) {
         let group_start = partition.group_starts[g];
         let group_end = partition.group_ends[g];
         debug_assert!(
@@ -332,9 +352,8 @@ pub fn prefetch_window_ref_bytes(
              past chrom length {chrom_length}",
         );
         let span = group_end - group_start + 1;
-        let mut bytes = Vec::with_capacity(span as usize);
-        ref_fetcher.fetch_into(group_start, span, &mut bytes)?;
-        out.push(bytes);
+        bytes.reserve(span as usize);
+        ref_fetcher.fetch_into(group_start, span, bytes)?;
     }
     Ok(())
 }
