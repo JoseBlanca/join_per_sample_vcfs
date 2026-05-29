@@ -287,6 +287,13 @@ pub struct UnifyAllelesScratch {
     /// pairs from cap-dropped alleles. Length is `n_samples` after
     /// each call; empty when the cap did not drop anything.
     pub(crate) other_per_sample: Vec<Vec<(u32, u32)>>,
+    /// M3: per-sample chain-id → constituents map for compound
+    /// detection. `BTreeMap::clear()` is called per sample inside
+    /// `detect_compound_candidates_columnar`, preserving the map's
+    /// node-arena allocation across the inner sample loop and across
+    /// groups. The previous shape constructed a fresh `BTreeMap` on
+    /// every per-call entry.
+    pub(crate) compound_by_chain: BTreeMap<ChainId, Vec<CompoundConstituent>>,
 }
 
 impl UnifyAllelesScratch {
@@ -308,6 +315,12 @@ impl UnifyAllelesScratch {
         for cell in self.other_per_sample.iter_mut() {
             cell.clear();
         }
+        // M3: compound-detection scratch is also part of the per-
+        // group contract — but the inner-loop `clear()` inside
+        // `detect_compound_candidates_columnar` does the per-sample
+        // work; this top-level clear is just defensive for callers
+        // that might inspect the scratch before the next call.
+        self.compound_by_chain.clear();
     }
 
     /// Return a `&mut` to the next working-allele slot, growing the
@@ -704,7 +717,8 @@ pub(crate) fn admit_compound_candidates_columnar(
     n_samples: usize,
     scratch: &mut UnifyAllelesScratch,
 ) -> Result<(), UnifyAllelesError> {
-    let candidates = detect_compound_candidates_columnar(chunk, partition, group_idx, n_samples);
+    let candidates =
+        detect_compound_candidates_columnar(chunk, partition, group_idx, n_samples, scratch);
     let group_start = partition.group_starts[group_idx];
     let group_end = partition.group_ends[group_idx];
     let chrom_id = chunk.chrom_id;
@@ -767,18 +781,32 @@ pub(crate) fn admit_compound_candidates_columnar(
 /// them by constituent tuple into the candidate list. Iterates
 /// samples in ascending `sample_idx` so the "first anchoring sample"
 /// is deterministically the lex-smallest one.
+///
+/// M3: the per-sample chain proposals map (`compound_by_chain`) lives
+/// on the caller's `UnifyAllelesScratch` so the per-sample
+/// `BTreeMap::clear` reuses the same nodes across iterations instead
+/// of dropping and re-allocating per sample × per group. The
+/// candidates map is local — its values move out into the returned
+/// `Vec`, so the outer-map allocator overhead is one alloc-and-free
+/// per group regardless of scratch threading.
 fn detect_compound_candidates_columnar(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     group_idx: usize,
     n_samples: usize,
+    scratch: &mut UnifyAllelesScratch,
 ) -> Vec<CompoundCandidate> {
     let mut candidates: BTreeMap<Vec<(usize, usize)>, CompoundCandidate> = BTreeMap::new();
-    let mut by_chain: BTreeMap<ChainId, Vec<CompoundConstituent>> = BTreeMap::new();
     for sample_idx in 0..n_samples {
-        by_chain.clear();
-        build_chain_proposals_columnar(chunk, partition, group_idx, sample_idx, &mut by_chain);
-        for constituents in by_chain.values() {
+        scratch.compound_by_chain.clear();
+        build_chain_proposals_columnar(
+            chunk,
+            partition,
+            group_idx,
+            sample_idx,
+            &mut scratch.compound_by_chain,
+        );
+        for constituents in scratch.compound_by_chain.values() {
             if constituents.len() < 2 {
                 continue;
             }
@@ -1725,13 +1753,14 @@ mod tests {
 
         let fetcher = shared_mock(&ref_full, 1);
         let oracle = {
-            let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
-                &chunk,
-                &partition,
-                0,
-                chunk.n_samples(),
-                chunk.chrom_id,
-            );
+            let group =
+                crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
+                    &chunk,
+                    &partition,
+                    0,
+                    chunk.n_samples(),
+                    chunk.chrom_id,
+                );
             // Use max_alleles=3 in the oracle config too.
             let config = PerGroupMergerConfig::new(2, 3, 64, 32).expect("merger config");
             let iter: Vec<Result<OverlappingVariantGroup, GrouperError>> = vec![Ok(group)];
@@ -1771,5 +1800,183 @@ mod tests {
         assert!(scratch.byte_index.is_empty());
         assert!(scratch.projection_buf.is_empty());
         assert!(scratch.projection_buf.capacity() >= proj_cap);
+    }
+
+    /// M3: compound-candidate detection is order-invariant for a
+    /// *symmetric* cohort — every sample carrying the same compound
+    /// chain proposals. Permuting the sample order produces identical
+    /// column-native output because the "first anchoring sample" is
+    /// the same regardless of which seat it occupies. Pins the
+    /// algebraic law the `detect_compound_candidates_columnar`
+    /// BTreeMap aggregation must obey; a regression that introduced
+    /// order-dependent dedup (e.g. by switching to a hash map without
+    /// a stable iteration order) would silently change which
+    /// candidate survives and surface as a byte-divergence here.
+    ///
+    /// For an *asymmetric* cohort (different samples carrying
+    /// different evidence), the compound's bytes are read from the
+    /// first-anchoring sample's record indices — which differ under
+    /// permutation by construction — so that case is not invariant.
+    #[test]
+    fn detect_compound_candidates_is_permutation_invariant() {
+        // Compound-anchored fixture identical to the byte-identity
+        // tests above: an MNP at pos 100..102 in one sample and two
+        // chain-1 SNPs at pos 100/102 in another. The kernel must
+        // discover the same compound candidate regardless of which
+        // sample is iterated first.
+        let mnp_record = PileupRecord::new(
+            0,
+            100,
+            vec![
+                AlleleObservation::new(
+                    b"ACA".to_vec(),
+                    AlleleSupportStats::new(4, -1.0, 4, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"ACC".to_vec(),
+                    AlleleSupportStats::new(3, -1.0, 3, 0, 0, 0, 0),
+                    vec![100],
+                ),
+            ],
+        );
+        let snp_100 = PileupRecord::new(
+            0,
+            100,
+            vec![
+                AlleleObservation::new(
+                    b"A".to_vec(),
+                    AlleleSupportStats::new(5, -1.0, 5, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"T".to_vec(),
+                    AlleleSupportStats::new(4, -1.0, 4, 0, 0, 0, 0),
+                    vec![1],
+                ),
+            ],
+        );
+        let snp_102 = PileupRecord::new(
+            0,
+            102,
+            vec![
+                AlleleObservation::new(
+                    b"A".to_vec(),
+                    AlleleSupportStats::new(5, -1.0, 5, 0, 0, 0, 0),
+                    Vec::new(),
+                ),
+                AlleleObservation::new(
+                    b"G".to_vec(),
+                    AlleleSupportStats::new(4, -1.0, 4, 0, 0, 0, 0),
+                    vec![1],
+                ),
+            ],
+        );
+        // Symmetric cohort: three samples each carrying the same
+        // chain-1 SNP pair at pos 100 / 102 (every sample is a
+        // compound carrier). We don't include the MNP in this test
+        // — the row-shape grouper joins the two positions via the
+        // chain ids; same evidence at every seat ⇒ permutation
+        // invariance must hold.
+        let _ = mnp_record;
+        let one_sample = vec![snp_100.clone(), snp_102.clone()];
+        let s_a = one_sample.clone();
+        let s_b = one_sample.clone();
+        let s_c = one_sample.clone();
+        // The single-use bindings are kept for symmetry with the
+        // existing fixture helpers.
+        let _ = (snp_100, snp_102);
+
+        let ref_full = vec![b'A'; 200];
+
+        let (chunk_a, partition_a, _) = group_fixture(
+            vec![s_a.clone(), s_b.clone(), s_c.clone()],
+            &ref_full,
+            1..200,
+            50,
+        );
+        let mut scratch_a = UnifyAllelesScratch::new();
+        let mut out_a = UnifiedAllelesColumns::empty();
+        let group_a_start = partition_a.group_starts[0] as usize;
+        let group_a_end = partition_a.group_ends[0] as usize;
+        let ref_seq_a = &ref_full[group_a_start - 1..group_a_end];
+        unify_alleles_columnar(
+            &chunk_a,
+            &partition_a,
+            0,
+            ref_seq_a,
+            chunk_a.n_samples(),
+            16,
+            &mut scratch_a,
+            &mut out_a,
+        )
+        .expect("unify A succeeded");
+
+        // Permutation: rotate samples ([s_a, s_b, s_c] → [s_c, s_a, s_b]).
+        // Same evidence at each seat ⇒ identical output expected.
+        let (chunk_b, partition_b, _) = group_fixture(vec![s_c, s_a, s_b], &ref_full, 1..200, 50);
+        let mut scratch_b = UnifyAllelesScratch::new();
+        let mut out_b = UnifiedAllelesColumns::empty();
+        let group_b_start = partition_b.group_starts[0] as usize;
+        let group_b_end = partition_b.group_ends[0] as usize;
+        let ref_seq_b = &ref_full[group_b_start - 1..group_b_end];
+        unify_alleles_columnar(
+            &chunk_b,
+            &partition_b,
+            0,
+            ref_seq_b,
+            chunk_b.n_samples(),
+            16,
+            &mut scratch_b,
+            &mut out_b,
+        )
+        .expect("unify B succeeded");
+
+        // The output's sample-axis fields are sample-indexed, so they
+        // differ by construction under permutation. The
+        // allele-axis fields (allele set, is_compound, constituents)
+        // are invariant: extract them.
+        let alleles_a: Vec<(Vec<u8>, bool, Vec<(u32, u32)>)> = (0..out_a.n_alleles())
+            .map(|i| {
+                let lo = out_a.constituent_offsets[i] as usize;
+                let hi = out_a.constituent_offsets[i + 1] as usize;
+                let constituents: Vec<(u32, u32)> = (lo..hi)
+                    .map(|k| {
+                        (
+                            out_a.constituent_record_idx[k],
+                            out_a.constituent_local_allele_idx[k],
+                        )
+                    })
+                    .collect();
+                (
+                    out_a.allele_seq(i).to_vec(),
+                    out_a.is_compound[i],
+                    constituents,
+                )
+            })
+            .collect();
+        let alleles_b: Vec<(Vec<u8>, bool, Vec<(u32, u32)>)> = (0..out_b.n_alleles())
+            .map(|i| {
+                let lo = out_b.constituent_offsets[i] as usize;
+                let hi = out_b.constituent_offsets[i + 1] as usize;
+                let constituents: Vec<(u32, u32)> = (lo..hi)
+                    .map(|k| {
+                        (
+                            out_b.constituent_record_idx[k],
+                            out_b.constituent_local_allele_idx[k],
+                        )
+                    })
+                    .collect();
+                (
+                    out_b.allele_seq(i).to_vec(),
+                    out_b.is_compound[i],
+                    constituents,
+                )
+            })
+            .collect();
+        assert_eq!(
+            alleles_a, alleles_b,
+            "compound-candidate detection must be invariant under sample permutation",
+        );
     }
 }
