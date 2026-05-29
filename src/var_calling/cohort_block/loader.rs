@@ -76,6 +76,19 @@ impl ChunkLoadScratch {
     }
 }
 
+/// Per-chunk diagnostic stats returned by
+/// [`load_chunk_from_iters`]. Drivers fold these into their own
+/// cumulative counters; callers that don't care can drop the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkLoadStats {
+    /// Number of cohort-wide positions kept by the variant filter —
+    /// the count of `true` entries in
+    /// [`ChunkLoadScratch::is_kept`](ChunkLoadScratch). This is the
+    /// per-chunk workload size used by the variant-count-bounded
+    /// loading loop (Phase B prerequisite).
+    pub variant_count: u32,
+}
+
 /// Errors surfaced by the chunk loader. Generic over `E`, the upstream
 /// per-sample iterator's error type — typically `PspReadError` for the
 /// production glue, or a unit-test error type for fixture-driven tests.
@@ -166,7 +179,7 @@ pub fn load_chunk_from_iters<I, E>(
     range: Range<u32>,
     per_sample_iters: Vec<I>,
     carryover: &mut [SampleColumns],
-) -> Result<(), ChunkLoadError<E>>
+) -> Result<ChunkLoadStats, ChunkLoadError<E>>
 where
     I: IntoIterator<Item = Result<PileupRecord, E>>,
 {
@@ -352,7 +365,8 @@ where
         }
     }
 
-    Ok(())
+    let variant_count = scratch.is_kept.iter().filter(|kept| **kept).count() as u32;
+    Ok(ChunkLoadStats { variant_count })
 }
 
 #[cfg(test)]
@@ -361,6 +375,91 @@ mod tests {
     use crate::var_calling::cohort_block::test_helpers::{
         allele, record, ref_obs, ref_plus_alt, ref_plus_unobserved_alt, run_loader,
     };
+    use std::convert::Infallible;
+
+    /// Helper: run the loader and return the post-load
+    /// `ChunkLoadStats` along with the chunk. Mirrors `run_loader`
+    /// but exposes the variant count.
+    fn run_loader_with_stats(
+        chrom_id: u32,
+        range: std::ops::Range<u32>,
+        per_sample_records: Vec<Vec<PileupRecord>>,
+        mut carryover: Vec<SampleColumns>,
+    ) -> (MaterialisedChunk, ChunkLoadStats) {
+        let n_samples = per_sample_records.len();
+        let mut scratch = ChunkLoadScratch::with_n_samples(n_samples);
+        let mut out = MaterialisedChunk::with_n_samples(n_samples);
+        let iters: Vec<_> = per_sample_records
+            .into_iter()
+            .map(|rs| rs.into_iter().map(Ok::<_, Infallible>))
+            .collect();
+        let stats = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            chrom_id,
+            range,
+            iters,
+            &mut carryover,
+        )
+        .expect("load_chunk_from_iters succeeded");
+        (out, stats)
+    }
+
+    #[test]
+    fn loader_variant_count_matches_kept_position_set() {
+        // Sample 0 + 1: variants at pos 10 (sample 0 only) and pos 14
+        // (sample 1 only). Pos 12 is REF-only in both samples (drops
+        // out of the variant filter). Expected variant_count = 2.
+        let s0 = vec![
+            record(10, ref_plus_alt(3, 4)),
+            record(12, vec![ref_obs(15)]),
+        ];
+        let s1 = vec![
+            record(12, vec![ref_obs(15)]),
+            record(14, ref_plus_alt(5, 6)),
+        ];
+        let (chunk, stats) =
+            run_loader_with_stats(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+        assert_eq!(stats.variant_count, 2);
+        // Sanity-check the chunk shape too.
+        assert_eq!(chunk.per_sample[0].n_records(), 1);
+        assert_eq!(chunk.per_sample[1].n_records(), 1);
+    }
+
+    #[test]
+    fn loader_variant_count_is_zero_for_pure_ref_chunk() {
+        // No samples carry any non-REF allele; the filter drops
+        // every position and variant_count = 0.
+        let s0 = vec![record(10, vec![ref_obs(20)])];
+        let s1 = vec![record(20, vec![ref_obs(15)])];
+        let (chunk, stats) =
+            run_loader_with_stats(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+        assert_eq!(stats.variant_count, 0);
+        assert_eq!(chunk.per_sample[0].n_records(), 0);
+        assert_eq!(chunk.per_sample[1].n_records(), 0);
+    }
+
+    #[test]
+    fn loader_variant_count_includes_homref_positions_inside_mnp_reach() {
+        // A 3-bp MNP at position 10 makes positions 10/11/12 all
+        // "kept" by the grouping-simulation filter (matching the
+        // streaming pipeline's behaviour — see
+        // `loader_keeps_homref_position_inside_mnp_reach`). The
+        // variant_count therefore reflects the kept set, not the
+        // "has any non-REF" set.
+        let s0 = vec![record(
+            10,
+            vec![allele(b"AAA", 5, -1.0, &[]), allele(b"ACA", 4, -1.0, &[])],
+        )];
+        let s1 = vec![
+            record(10, vec![ref_obs(7)]),
+            record(11, vec![ref_obs(7)]),
+            record(12, vec![ref_obs(7)]),
+        ];
+        let (_, stats) =
+            run_loader_with_stats(0, 1..100, vec![s0, s1], vec![SampleColumns::empty(); 2]);
+        assert_eq!(stats.variant_count, 3);
+    }
 
     #[test]
     fn loader_drops_positions_with_no_observed_non_ref_allele() {
