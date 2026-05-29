@@ -124,6 +124,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         threads: args.threads,
         contamination_estimates: None,
         no_complexity_filter: args.no_complexity_filter,
+        // Legacy single-pull / single-window behaviour so the dhat
+        // heap profile reflects the pre-rewrite per-chunk shape.
+        target_variants_per_chunk: 0,
+        worker_windows_per_chunk: 1,
         psp_files: psps,
         cohort: CohortPipelineArgs {
             ploidy: DEFAULT_PLOIDY,

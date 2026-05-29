@@ -640,6 +640,26 @@ pub enum PosteriorEngineError {
     #[error("approximate-posterior calculation is not yet implemented")]
     ApproximateModeNotYetImplemented,
 
+    /// B4: the column-native log-likelihood kernel was handed more
+    /// alleles than its bitmask-based per-genotype bitset can index.
+    /// The Phase A.1 unifier caps `n_alleles` upstream at
+    /// `MAX_BITMASK_ALLELES`, so surfacing this variant means the
+    /// caller passed `cfg.max_alleles > MAX_BITMASK_ALLELES` — an
+    /// upstream-invariant break, **not** a math-degeneracy
+    /// condition. The locus and `n_alleles` are the only useful
+    /// diagnostic fields (no single sample / genotype to blame), so
+    /// the variant carries them directly rather than synthesising
+    /// `usize::MAX` placeholders on a sibling variant.
+    #[error(
+        "column-native log-likelihood kernel was handed n_alleles={n_alleles} \
+         at {locus}, exceeding the bitmask cap — `max_alleles_lh_calc` \
+         (or `max_alleles`) misconfigured"
+    )]
+    NAllelesExceedsBitmask {
+        locus: RecordLocus,
+        n_alleles: usize,
+    },
+
     /// `PosteriorEngineConfig::contamination.sample_to_batch.len()`
     /// did not match the upstream record's `n_samples`. The frozen
     /// contamination estimates were produced for a different cohort

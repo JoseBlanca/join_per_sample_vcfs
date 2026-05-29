@@ -284,6 +284,18 @@ pub fn partition_window(
         });
     }
 
+    // M19: lock the documented `masked_intervals` invariant
+    // ("sorted, non-overlapping list"). The mask-cursor logic below
+    // checks only the *current* interval; a malformed mask makes
+    // emit/skip decisions silently wrong. `compute_dust_mask_for_chrom`
+    // (the only production caller today) returns sorted+non-overlapping
+    // intervals by sdust's construction; a future caller or test helper
+    // that breaks the invariant trips this assertion under tests.
+    debug_assert!(
+        masked_intervals.windows(2).all(|w| w[0].end <= w[1].start),
+        "partition_window: masked_intervals must be sorted and non-overlapping",
+    );
+
     scratch.clear();
     out.clear();
     out.chrom_id = chunk.chrom_id;

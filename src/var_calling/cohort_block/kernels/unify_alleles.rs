@@ -263,9 +263,6 @@ pub struct UnifyAllelesScratch {
     /// the group's REF span before testing for byte-equality against
     /// existing entries.
     pub(crate) projection_buf: Vec<u8>,
-    /// Working buffer used by compound detection (sub-step 1.2).
-    #[allow(dead_code)]
-    pub(crate) chain_id_scratch: Vec<ChainId>,
     /// Pool of working alleles. The outer `Vec` grows monotonically
     /// across the lifetime of the scratch; [`Self::n_active_alleles`]
     /// is the logical length used by the current group. Slots past
@@ -297,7 +294,6 @@ impl UnifyAllelesScratch {
     pub fn clear(&mut self) {
         self.byte_index.clear();
         self.projection_buf.clear();
-        self.chain_id_scratch.clear();
         // Reset every previously-used working-allele slot in place so
         // inner `Vec` capacities survive to the next group.
         let prev_active = self.n_active_alleles;
@@ -1755,12 +1751,10 @@ mod tests {
         let mut scratch = UnifyAllelesScratch::new();
         scratch.byte_index.insert(b"AC".to_vec(), 1);
         scratch.projection_buf.extend_from_slice(b"ACGT");
-        scratch.chain_id_scratch.push(7);
         let proj_cap = scratch.projection_buf.capacity();
         scratch.clear();
         assert!(scratch.byte_index.is_empty());
         assert!(scratch.projection_buf.is_empty());
-        assert!(scratch.chain_id_scratch.is_empty());
         assert!(scratch.projection_buf.capacity() >= proj_cap);
     }
 }

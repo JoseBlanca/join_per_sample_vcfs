@@ -34,7 +34,7 @@ use crate::var_calling::cohort_block::kernels::unify_alleles::{
 };
 use crate::var_calling::cohort_block::partition::{PartitionScratch, WindowPartition};
 use crate::var_calling::per_group_merger::{
-    CompoundConstituent, DegeneracyKind, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
+    CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
     PerGroupMergerError, SharedRefFetcher,
 };
 use crate::var_calling::posterior_engine::backends::InterpUnivariateSimdMath;
@@ -552,7 +552,8 @@ fn compute_ll_error_to_merger(
     group_end: u32,
     e: ComputeLogLikelihoodsError,
 ) -> PosteriorEngineError {
-    let inner = match e {
+    use crate::var_calling::posterior_engine::RecordLocus;
+    match e {
         ComputeLogLikelihoodsError::DegenerateLikelihood {
             chrom_id,
             start,
@@ -567,34 +568,24 @@ fn compute_ll_error_to_merger(
             sample_idx,
             genotype_idx,
             kind,
-        },
+        }
+        .into(),
+        // B4: surface the upstream-invariant break directly with the
+        // real `n_alleles` and group locus, instead of synthesising a
+        // `DegenerateLikelihood` with `usize::MAX` placeholders that
+        // misled operators into chasing a non-existent sample /
+        // genotype.
         ComputeLogLikelihoodsError::NAllelesExceedsBitmask { n_alleles } => {
-            // The row-shape kernel doesn't surface this as an Error;
-            // its equivalent invariant fires `assert!` inside
-            // `standard_log_likelihood`. The Phase A.1 cap (set
-            // upstream in `unify_alleles_columnar`) is bounded by
-            // `MAX_BITMASK_ALLELES`, so the kernel surfacing this
-            // variant means the caller passed `cfg.max_alleles >
-            // MAX_BITMASK_ALLELES`. Map it to a synthetic
-            // `DegenerateLikelihood` carrying enough context for
-            // diagnosis: at this point we have group locus +
-            // n_alleles but no sample/genotype, so the bookkeeping
-            // fields are placeholders. `DegeneracyKind::NaN` is
-            // chosen as the "internal-bug, finite formula went
-            // wrong" sentinel — it matches the same diagnostic
-            // family the row-shape kernel uses for self-reports.
-            let _ = n_alleles;
-            PerGroupMergerError::DegenerateLikelihood {
-                chrom_id,
-                start: group_start,
-                end: group_end,
-                sample_idx: usize::MAX,
-                genotype_idx: usize::MAX,
-                kind: DegeneracyKind::NaN,
+            PosteriorEngineError::NAllelesExceedsBitmask {
+                locus: RecordLocus {
+                    chrom_id,
+                    start: group_start,
+                    end: group_end,
+                },
+                n_alleles,
             }
         }
-    };
-    inner.into()
+    }
 }
 
 /// Build one [`OverlappingVariantGroup`] from group `g` of
@@ -835,6 +826,32 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(output.is_empty());
+    }
+
+    /// B4: `compute_ll_error_to_merger` maps the kernel's
+    /// `NAllelesExceedsBitmask` directly to
+    /// `PosteriorEngineError::NAllelesExceedsBitmask`, preserving the
+    /// real `n_alleles` and the group locus. Replaces the prior
+    /// behaviour of silently rewriting the upstream-invariant break
+    /// as a `DegenerateLikelihood { sample_idx: usize::MAX,
+    /// genotype_idx: usize::MAX, kind: NaN }` placeholder.
+    #[test]
+    fn compute_ll_error_to_merger_preserves_n_alleles_and_locus() {
+        let err = compute_ll_error_to_merger(
+            7,
+            123,
+            456,
+            ComputeLogLikelihoodsError::NAllelesExceedsBitmask { n_alleles: 99 },
+        );
+        match err {
+            PosteriorEngineError::NAllelesExceedsBitmask { locus, n_alleles } => {
+                assert_eq!(locus.chrom_id, 7);
+                assert_eq!(locus.start, 123);
+                assert_eq!(locus.end, 456);
+                assert_eq!(n_alleles, 99);
+            }
+            other => panic!("expected NAllelesExceedsBitmask, got {other:?}",),
+        }
     }
 
     /// In-memory `ChromRefFetcher` for the column-native unify

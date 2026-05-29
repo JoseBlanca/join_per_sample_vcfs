@@ -19,7 +19,50 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **Code review of the `cohort_block`
+> - **Last completed task:** **`cohort_block` review — Wave 1 fixes
+>   applied** —
+>   [cohort_block_2026-05-29_applied.md](doc/devel/reports/reviews/cohort_block_2026-05-29_applied.md).
+>   Closed all 5 Blockers (B1 writer-tmp leak via new
+>   `CohortVcfWriter::abort()`; B2 `compute_dust_mask_for_chrom`
+>   now streams `iter_bases()?` directly into `sdust_mask_streaming`;
+>   B3 `NoSafeGap` retry's `max_load_span` decoupled from the
+>   chrom-wide cap; B4 new `PosteriorEngineError::NAllelesExceedsBitmask`
+>   variant replaces the `usize::MAX`-placeholder rewrite; B5 deferred
+>   to Wave 2 per Open Question 2 — operator picked oracle-test-vs-streaming-driver shape)
+>   plus M5 (bundled with B1), M11 (the bench/example unblocker — now
+>   `cargo bench --bench cohort_e2e_perf` compiles), M14
+>   (`SampleColumns::clone_from_columns` consolidates the carryover
+>   snapshot/restore loops), M17 (drop trailing `..` from the
+>   `AlleleSupportStats` destructure), M18 (delete `chain_id_scratch`
+>   dead field), M19 (`debug_assert!` on sorted `masked_intervals`).
+>   `cargo test --lib` 1 026/1 026 pass (was 1 023; +3 from
+>   `abort_*` × 2 + `compute_ll_error_to_merger_preserves_n_alleles_and_locus`).
+>   `cargo test --test cohort_cli_integration` 21/21 pass including both
+>   byte-identity gates (`--worker-windows-per-chunk` and
+>   `--target-variants-per-chunk`). `cargo fmt --check` clean. Clippy
+>   `--all-targets` still exits 101 on the 16 in-scope clippy errors
+>   that are tracked under Nits (mechanical pass deferred to Wave 3).
+>   Criterion baseline saved on `cohort_e2e_perf` as `pre-fixes` before
+>   any perf-sensitive change landed; final comparison runs at the end of
+>   Wave 3. **Four operator answers locked the remaining wave plan:**
+>   Q1 stable in-crate API (Mi1 `#[non_exhaustive]`, Mi8 / Mi13 Won't
+>   fix); Q2 oracle test vs streaming `drive_cohort_pipeline`; Q3 lift
+>   both `target_variants_per_chunk` / `target_window_count` to
+>   `Option<NonZeroU32>` / `NonZeroUsize`; Q4 apply all structural
+>   refactors now (M12 / M13 / M15 / M16 + Mi7 / Mi15 / Mi17–Mi19).
+>   **Outcome totals (Wave 1 of N):** 11 Applied (B1/B2/B3/B4 + M5 + M11
+>   + M14 + M17 + M18 + M19 + 2 abort tests + 1 B4 test), 47 Deferred,
+>   2 Won't fix (Mi8, Mi13 per Q1). Wave 2 starts at B5 + the
+>   `ChunkDriverError` redesign (M4 + M21) + the structural-refactor
+>   Majors (M12/M13/M15/M16) + the remaining small Majors. Per-finding
+>   log + commands run + command results captured in §4 / §10 / §11 of
+>   the saved report; audit trail at
+>   `tmp/review_2026-05-29_cohort_block/`. Out-of-scope edits made in
+>   Wave 1: `src/var_calling/posterior_engine.rs` (added non-breaking
+>   `#[non_exhaustive]` enum variant — review explicitly approved this
+>   option), `src/vcf/writer.rs` (new `abort()` method),
+>   `benches/cohort_e2e_perf.rs` + 2 examples (M11 field updates).
+> - **Previous task — code review:** **Code review of the `cohort_block`
 >   module** (the chunk-based cohort var-calling rewrite, ~8 400 LoC
 >   across 12 files on branch `cohort-within-chromosome-parallel`,
 >   commit `36989d6`) —
@@ -903,7 +946,7 @@ via rayon.
   - Wave 2 / 3 / Likely / Speculative findings tracked in the report.
 
 #### Within-chromosome chunk-parallel rewrite (`cohort_block/`)
-- **Status:** reviewed
+- **Status:** fixes-applied (Wave 1 of N)
 - **Plans:**
   - Master: [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md)
   - Phase A.2 column-native EM: [cohort_within_chromosome_parallel_phase_a2_em.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_a2_em.md)
@@ -914,6 +957,7 @@ via rayon.
   - Phase A (2026-05-28): [cohort_within_chromosome_parallel_phase_a_2026-05-28.md](doc/devel/reports/implementations/cohort_within_chromosome_parallel_phase_a_2026-05-28.md)
 - **Code:** [src/var_calling/cohort_block/](src/var_calling/cohort_block/) — `mod.rs`, `columns.rs`, `loader.rs`, `pre_pass.rs`, `partition.rs`, `driver.rs`, `worker.rs`, `test_helpers.rs`, plus `kernels/{mod, unify_alleles, project_scalars, compute_log_likelihoods}.rs`.
 - **Tests:** 88 unit tests in the module (per `cargo test --lib var_calling::cohort_block` at commit `36989d6`); 3 integration tests in [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs) (`var_calling_emits_deterministic_vcf_across_runs`, `var_calling_byte_identical_across_worker_windows_per_chunk`, `var_calling_byte_identical_across_target_variants_per_chunk`).
+- **Latest fixes-applied:** [cohort_block_2026-05-29_applied.md](doc/devel/reports/reviews/cohort_block_2026-05-29_applied.md) — **Wave 1**: all 5 Blockers Applied (B1 / B2 / B3 / B4 / B5-deferred-to-Wave-2 per Q2) + M5 (bundled with B1) + M11 (bench/example unblocker) + M14 (carryover snapshot helper) + M17 (drop trailing `..`) + M18 (delete dead `chain_id_scratch`) + M19 (`debug_assert!` on sorted `masked_intervals`). 1 026/1 026 lib pass (+3); 21/21 cohort_cli integration pass; fmt clean; criterion baseline saved. 47 findings deferred to Waves 2–3 per Q4 ("apply all structural refactors now"). 2 Won't fix per Q1 (Mi8 / Mi13). Out-of-scope edits flagged in §12.
 - **Latest review:** [cohort_block_2026-05-29.md](doc/devel/reports/reviews/cohort_block_2026-05-29.md) — **Request-changes**: 5 Blockers (B1 writer-tmp leak on driver-error path; B2 full-chrom `Vec<u8>` materialisation in `compute_dust_mask_for_chrom` defeats per-chunk memory contract; B3 `NoSafeGap` retry is a no-op when `target_variants_per_chunk > 0`; B4 `NAllelesExceedsBitmask` silently rewritten as `DegenerateLikelihood { usize::MAX, … }`; B5 missing cross-driver byte-identity oracle test + missing unit tests for `drive_cohort_chunked` / `drive_one_chrom_generic` / `load_and_run_chunk_with_retry` / `emit_or_drop` / `compute_dust_mask_for_chrom`), 32 Major, 26 Minor, grouped Nits. `unsafe_concurrency` returned `No findings.` — the parallel-section soundness is statically enforced by the `Send + !Sync` typedef on `SharedRefFetcher`. Four open questions for the author (stable-API intent on the new pub data structs; streaming `drive_cohort_pipeline` oracle's long-term fate; sentinel-vs-`NonZero` policy for `target_variants_per_chunk` / `target_window_count`; filter-order equivalence vs streaming pipeline) gate several Major findings. Per-category audit trail at `tmp/review_2026-05-29_cohort_block/`.
 - **Open (from the 2026-05-29 review):**
   - **B1** — Add `CohortVcfWriter::abort()` that takes the tmp path it actually used and removes it; call from the error branch. Add an integration test injecting a mid-loop error and asserting no leftover tmp on disk.

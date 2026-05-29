@@ -203,6 +203,12 @@ pub fn drive_cohort_chunked(
 
     let mut stats = ChunkDriverStats::default();
 
+    // B1 + M5: drive the per-chrom loop inside a closure that borrows
+    // `writer` (does not move it), so the outer scope can route to
+    // `writer.finish()` on success or `writer.abort()` on error. The
+    // tmp file is removed via `abort()` at the exact path the writer
+    // used (single source of truth); a remove failure is logged
+    // rather than silently swallowed.
     let driver_result: Result<(), ChunkDriverError> = (|| {
         for (chrom_idx, chrom) in chromosomes.iter().enumerate() {
             let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
@@ -221,17 +227,25 @@ pub fn drive_cohort_chunked(
                 &mut worker_pool,
             )?;
         }
-        writer.finish()?;
         Ok(())
     })();
 
-    if let Err(e) = driver_result {
-        // Best-effort cleanup of the writer's tmp file.
-        let _ = std::fs::remove_file(tmp_path_for(output));
-        return Err(e);
+    match driver_result {
+        Ok(()) => {
+            writer.finish()?;
+            Ok(stats)
+        }
+        Err(e) => {
+            if let Err(remove_err) = writer.abort() {
+                eprintln!(
+                    "var-calling: failed to remove tmp VCF {} during error cleanup: {}",
+                    tmp_path_for(output).display(),
+                    remove_err,
+                );
+            }
+            Err(e)
+        }
     }
-
-    Ok(stats)
 }
 
 /// Apply the streaming pipeline's downstream filters to `record`
@@ -352,15 +366,14 @@ fn compute_dust_mask_for_chrom(
 ) -> Result<Vec<std::ops::Range<u32>>, ChunkDriverError> {
     use crate::fasta::fetcher::ChromRefFetcher;
 
-    let bases: Vec<u8> = fetcher
-        .iter_bases()?
-        .collect::<Result<Vec<u8>, ChromRefFetchError>>()?;
-    debug_assert_eq!(bases.len(), chrom_length as usize);
-
-    // sdust_mask_streaming takes an Iterator<Item = io::Result<u8>>;
-    // wrap the already-fetched bases to satisfy that signature.
+    // B2: stream `iter_bases()` directly into `sdust_mask_streaming`
+    // instead of materialising the whole chromosome's REF into a
+    // `Vec<u8>`. The previous shape allocated O(chrom_length) bytes
+    // (~90 MB for tomato chrom 1) just to re-iterate them — defeating
+    // the chunk driver's "per-chunk memory bounded by
+    // `target_variants_per_chunk × n_samples`" contract.
     let intervals = sdust_mask_streaming(
-        bases.into_iter().map(Ok::<_, io::Error>),
+        fetcher.iter_bases()?.map(|r| r.map_err(io::Error::other)),
         chrom_length,
         dust_cfg.window(),
         dust_cfg.threshold(),
@@ -508,14 +521,11 @@ where
     W: Read + Seek,
 {
     debug_assert_eq!(carryover.len(), carryover_snapshot.len());
-    // Snapshot the carryover so we can restore it on `NoSafeGap` —
+    // M14: snapshot the carryover so we can restore it on `NoSafeGap` —
     // `load_chunk_from_iters` drains it as part of the raw-load step
     // and we need the original contents back for the retry attempt.
     for (snap, carry) in carryover_snapshot.iter_mut().zip(carryover.iter()) {
-        snap.clear();
-        for row_idx in 0..carry.n_records() {
-            snap.push_row_from(carry, row_idx);
-        }
+        snap.clone_from_columns(carry);
     }
 
     let mut attempt_span = nominal_span;
@@ -528,14 +538,22 @@ where
         };
 
         let initial_load_span = chunk_range_end - chunk_range_start;
-        // The variant-bounded extension cap is the same chrom-side
-        // ceiling the outer NoSafeGap retry uses. PSP iterators must
-        // be opened with this same cap so the loader's internal
-        // extension can keep pulling beyond `initial_load_span`
-        // without exhausting the iterator early.
-        let extension_cap_end = chrom_one_past_end.saturating_add(last_chunk_logical_extension);
-        let max_load_span = extension_cap_end.saturating_sub(chunk_range_start);
-        let psp_inclusive_end = extension_cap_end.saturating_sub(1).min(chrom_length);
+        // B3: bound the loader's `max_span` by this attempt's
+        // `chunk_range_end` (which already reflects `attempt_span` +
+        // the last-chunk extension). The previous shape passed
+        // `extension_cap_end - chunk_range_start` (chrom-wide cap)
+        // unconditionally, so the loader's internal variant-bounded
+        // extension already ran to chrom-end on the *first* attempt,
+        // making NoSafeGap retries produce identical chunks — the
+        // outer retry's `attempt_span` doubling was a no-op when
+        // `target_variants_per_chunk > 0`. Tying `max_load_span` to
+        // `chunk_range_end` decouples the two axes: the loader's
+        // variant-bounded extension grows within `attempt_span`, the
+        // outer NoSafeGap retry grows `attempt_span` itself. PSP
+        // iterators are re-opened per attempt via `region_records`
+        // and respect the same `chunk_range_end` cap.
+        let max_load_span = initial_load_span;
+        let psp_inclusive_end = chunk_range_end.saturating_sub(1).min(chrom_length);
 
         let iters: Vec<_> = psp_readers
             .iter_mut()
@@ -549,7 +567,7 @@ where
             chunk_range_start,
             initial_load_span,
             params.target_variants_per_chunk,
-            max_load_span.max(initial_load_span),
+            max_load_span,
             iters,
             carryover,
         )?;
@@ -565,13 +583,10 @@ where
         ) {
             Ok(()) => break,
             Err(FixBoundariesError::NoSafeGap { .. }) if attempt_span < max_span => {
-                // Retry with double the span. Restore the carryover
+                // M14: retry with double the span. Restore the carryover
                 // the previous chunk handed in (the load drained it).
                 for (carry, snap) in carryover.iter_mut().zip(carryover_snapshot.iter()) {
-                    carry.clear();
-                    for row_idx in 0..snap.n_records() {
-                        carry.push_row_from(snap, row_idx);
-                    }
+                    carry.clone_from_columns(snap);
                 }
                 attempt_span = attempt_span
                     .checked_mul(2)

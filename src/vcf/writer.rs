@@ -260,6 +260,28 @@ impl CohortVcfWriter {
         sink.finish(&self.final_path)?;
         Ok(())
     }
+
+    /// Abandon the in-progress run: drop the sink (which closes the
+    /// tmp file handle) and delete the tmp file at the exact path
+    /// this writer used (`tmp_path_for(&self.final_path)`).
+    ///
+    /// Pair with [`finish`](Self::finish): a driver that returns
+    /// early on error should call `abort()` instead of leaving the
+    /// `<output>.tmp` file behind. Both consume `self`, so the type
+    /// system forces a single terminal call.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(io::Error)` if `std::fs::remove_file` failed
+    /// (typically `NotFound` if the tmp file was never created, or a
+    /// permission/IO failure). Callers should generally log and
+    /// continue — the original driver error is the operator-facing
+    /// one to surface.
+    pub fn abort(self) -> std::io::Result<()> {
+        let tmp = tmp_path_for(&self.final_path);
+        drop(self.inner); // close the file handle
+        std::fs::remove_file(tmp)
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +377,44 @@ mod tests {
         assert!(data_lines[0].starts_with("chr1\t100\t"));
         assert!(data_lines[1].starts_with("chr1\t200\t"));
         assert!(!out.with_extension("vcf.tmp").exists());
+    }
+
+    /// B1: `abort()` removes the writer's tmp file (the exact path it
+    /// used, derived from `tmp_path_for(&final_path)`) and leaves no
+    /// final output behind. Compare against `finish()`'s success-path
+    /// guarantee (the previous test asserts the tmp does not exist
+    /// after `finish` because the rename consumed it).
+    #[test]
+    fn abort_removes_tmp_file_and_leaves_no_final_output() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let tmp = tmp_path_for(&out);
+        let metadata = fixture_metadata();
+
+        let writer = CohortVcfWriter::new(metadata, cfg_for(out.clone())).unwrap();
+        // Constructor wrote the header into `tmp` already.
+        assert!(tmp.exists(), "tmp file present after constructor");
+
+        writer.abort().expect("abort succeeded");
+        assert!(!tmp.exists(), "abort removed the tmp file");
+        assert!(!out.exists(), "abort did not rename to final path");
+    }
+
+    /// B1: a second `abort()` call (or, equivalently, calling `abort`
+    /// after the tmp file was already removed elsewhere) surfaces the
+    /// underlying `io::Error` so the driver can log it rather than
+    /// silently swallow it.
+    #[test]
+    fn abort_surfaces_remove_file_error_when_tmp_already_gone() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let tmp = tmp_path_for(&out);
+        let metadata = fixture_metadata();
+
+        let writer = CohortVcfWriter::new(metadata, cfg_for(out)).unwrap();
+        std::fs::remove_file(&tmp).expect("manual remove succeeded");
+        let err = writer.abort().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

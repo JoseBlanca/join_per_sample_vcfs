@@ -115,6 +115,11 @@ impl SampleColumns {
         for allele in record.alleles {
             let AlleleObservation {
                 seq,
+                // M17: no trailing `..` — the 7 named fields cover
+                // every field on `AlleleSupportStats` today, and a
+                // future field addition should be a compile error
+                // here (the columnar storage must carry every per-
+                // allele scalar to preserve byte-identity downstream).
                 support:
                     AlleleSupportStats {
                         num_obs,
@@ -124,7 +129,6 @@ impl SampleColumns {
                         placed_start,
                         mapq_sum,
                         mapq_sum_sq,
-                        ..
                     },
                 chain_ids,
             } = allele;
@@ -267,6 +271,23 @@ impl SampleColumns {
 
         self.allele_offsets
             .push(u32_from_usize(self.allele_num_obs.len()));
+    }
+
+    /// M14: replace this column's contents with a copy of `other`'s,
+    /// preserving `self`'s allocated capacity.
+    ///
+    /// Used by the chunk driver's `NoSafeGap` retry path to snapshot
+    /// and restore the carryover the previous chunk handed in (the
+    /// loader drains it as part of the raw-load step, so a retry has
+    /// to put it back). The single-method form replaces two
+    /// hand-written `clear()` + `push_row_from` loops at the call
+    /// sites — adding a new column field to `SampleColumns` now
+    /// updates one place instead of two parallel loops.
+    pub fn clone_from_columns(&mut self, other: &SampleColumns) {
+        self.clear();
+        for row_idx in 0..other.n_records() {
+            self.push_row_from(other, row_idx);
+        }
     }
 
     /// Reference span of the record at `record_idx` — the number of

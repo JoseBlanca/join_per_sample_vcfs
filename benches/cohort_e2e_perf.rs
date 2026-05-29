@@ -293,6 +293,10 @@ impl CohortFixture {
             threads: None,
             contamination_estimates: None,
             no_complexity_filter: false,
+            // Legacy single-pull behaviour so bench numbers stay
+            // comparable to the pre-rewrite shape.
+            target_variants_per_chunk: 0,
+            worker_windows_per_chunk: 1,
             psp_files: self.psp_files.clone(),
             cohort: CohortPipelineArgs {
                 ploidy: DEFAULT_PLOIDY,
