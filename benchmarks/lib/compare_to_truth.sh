@@ -73,6 +73,12 @@ echo "classes   : $CLASSES"
 echo "queries   : ${#queries[@]}"
 echo
 
+# Machine-readable output for the dashboard (mirrors the perf_*.py ->
+# perf_dashboard.py convention). One row per (caller, class).
+TSV_OUT="${TSV_OUT:-$OUT_ROOT/comparison/accuracy.tsv}"
+mkdir -p "$(dirname "$TSV_OUT")"
+printf 'caller\tclass\ttp\tfp\tfn\tprecision\trecall\tf1\n' > "$TSV_OUT"
+
 printf '%-26s %-7s %7s %7s %7s %9s %9s %7s\n' \
     caller class TP FP FN precision recall F1
 printf '%s\n' "--------------------------------------------------------------------------------------"
@@ -101,5 +107,10 @@ for cls in $CLASSES; do
         }')
         printf '%-26s %-7s %7d %7d %7d %9s %9s %7s\n' \
             "$name" "$cls" "$local_tp" "$local_fp" "$local_fn" "$prec" "$rec" "$f1"
+        printf '%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n' \
+            "$name" "$cls" "$local_tp" "$local_fp" "$local_fn" "$prec" "$rec" "$f1" >> "$TSV_OUT"
     done
 done
+
+echo
+echo "tsv: $TSV_OUT"
