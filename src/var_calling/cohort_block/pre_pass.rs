@@ -659,4 +659,44 @@ mod tests {
         run_pre_pass_with_t(&mut chunk, &mut carry, 100, 4).unwrap();
         assert_eq!(chunk.windows, vec![1..199, 199..1001]);
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // Mi23 — direct unit tests for `slide_left_to_safe` so the
+    //         clamp paths and no-iteration path are pinned.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Mi23: `min_open == desired - 1` shape: `b` starts at
+    /// `desired.min(safe_end - 1)`; the loop runs once and either
+    /// returns the safe `b` or steps below `min_open` and yields
+    /// `None`. Here the timeline is empty so every position is
+    /// trivially safe, and `b = desired` is returned immediately.
+    #[test]
+    fn slide_left_to_safe_returns_desired_when_already_safe() {
+        let scratch = FixBoundariesScratch::new();
+        // Empty timeline ⇒ no variants ⇒ every position is safe.
+        let result = slide_left_to_safe(50, 0, 100, &scratch);
+        assert_eq!(result, Some(50));
+    }
+
+    /// Mi23: `desired > safe_end` clamp — the candidate is pulled
+    /// down to `safe_end - 1` before the slide-left loop begins.
+    #[test]
+    fn slide_left_to_safe_clamps_above_safe_end() {
+        let scratch = FixBoundariesScratch::new();
+        // desired = 200 but safe_end = 100. The clamp pulls b to
+        // safe_end - 1 = 99; empty timeline ⇒ that's safe.
+        let result = slide_left_to_safe(200, 0, 100, &scratch);
+        assert_eq!(result, Some(99));
+    }
+
+    /// Mi23: `min_open >= desired` ⇒ the loop never runs and the
+    /// function returns `None` (no safe position above the floor).
+    #[test]
+    fn slide_left_to_safe_returns_none_when_min_open_meets_desired() {
+        let scratch = FixBoundariesScratch::new();
+        // Floor equals desired ⇒ b = 50, b > min_open (=50) is false,
+        // loop body never executes ⇒ None.
+        let result = slide_left_to_safe(50, 50, 100, &scratch);
+        assert_eq!(result, None);
+    }
 }
