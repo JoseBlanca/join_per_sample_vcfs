@@ -23,7 +23,6 @@ use crate::bam::alignment_input::{
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
-use crate::pileup::per_sample::baq_engine::prepare_passthrough;
 use crate::pileup::per_sample::baq_stream::{BaqSkipCounts, BaqStream};
 use crate::pileup::walker::{self, PileupWalker, PreparedRead, WalkerConfig};
 
@@ -127,61 +126,27 @@ where
         MultiChromStreamingRefFetcher::new(reference.to_path_buf(), contigs.clone());
 
     // 3. Build the boxed input iterator + handle for upstream errors,
-    //    drive the closure, then snapshot every branch-local counter
-    //    into a single tuple. Both arms must produce the same tuple
-    //    shape, so a future per-branch counter cannot land in only
-    //    one arm — adding a field forces both arms to update.
-    //    Both branches also converge on `Box<dyn Iterator<Item =
-    //    PreparedRead>>` so the walker has the same concrete type
-    //    either way (see `Stage1Walker`).
+    //    drive the closure, then snapshot the skip counters.
+    //
+    //    Both BAQ-on and `--no-baq` flow through `BaqStream`: it is the
+    //    per-read prep stage, and **indel left-alignment is mandatory and
+    //    runs in either mode** (`BaqEngine::process` with `apply_baq =
+    //    !no_baq`). `--no-baq` only skips the BAQ HMM (`bq_baq` becomes the
+    //    raw qual); the read is still normalized. `baq_skip_counts` is
+    //    reported as `None` ("baq: disabled") in no-BAQ mode to preserve
+    //    that signal.
     let (result, baq_skip_counts, stashed_upstream_error): (
         Result<R, E>,
         Option<BaqSkipCounts>,
         Option<AlignmentInputError>,
-    ) = if no_baq {
-        // No-BAQ: passthrough map directly off the reader.
-        //
-        // NB: indel left-alignment lives in the BAQ read-prep stage
-        // (`BaqEngine::process`, reusing the BAQ ref window), so `--no-baq`
-        // also bypasses normalization — it cannot reuse `walker_fetcher`
-        // (a forward-only streaming fetcher the walker is concurrently
-        // driving at different positions). `--no-baq` is a BAQ A/B-testing
-        // bypass; production/benchmark runs keep BAQ on and get
-        // normalization.
-        let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
-            r.map(|read| {
-                // PANIC-FREE: `ref_id` is the CRAM-side contig id;
-                // `AlignmentMergedReader` only emits `PreparedRead`s with
-                // a non-negative `ref_id` (mapped reads pass the
-                // pre-walker filter, unmapped reads are dropped
-                // upstream). The cast to `u32` is therefore total
-                // for every value this iterator surfaces.
-                let chrom_id = u32::try_from(read.ref_id).expect("ref_id fits u32");
-                prepare_passthrough(read, chrom_id)
-            })
-        }));
-        let error_handle = adapter.error_handle();
-        let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = walker::run(input, &walker_fetcher, &walker_cfg);
-        let ctx = Stage1PipelineContext {
-            walker,
-            sample_name: &sample_name,
-            contigs: &contigs,
-        };
-        let r = f(ctx);
-        // Closure dropped ctx (and walker inside it) — `&mut adapter`
-        // borrow released. Now drop adapter to release `&mut reader`.
-        drop(adapter);
-        let stash = error_handle.take();
-        (r, None, stash)
-    } else {
-        // BAQ-on: reader → BaqStream → adapter → walker.
+    ) = {
         let mut baq_stream = BaqStream::new(
             reader.by_ref(),
             baq_cfg,
             reference.to_path_buf(),
             contigs.clone(),
             baq_chunk_size,
+            !no_baq,
         );
         let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
         let error_handle = adapter.error_handle();
@@ -197,7 +162,11 @@ where
         // adapter → `&mut baq_stream` released. Then snapshot.
         drop(adapter);
         let stash = error_handle.take();
-        let skip = Some(*baq_stream.skip_counts());
+        let skip = if no_baq {
+            None
+        } else {
+            Some(*baq_stream.skip_counts())
+        };
         drop(baq_stream);
         (r, skip, stash)
     };

@@ -332,7 +332,7 @@ fn engine_happy_path_match_only() {
     let expected_seq = read.seq.clone();
     let expected_cigar = read.cigar.clone();
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(prepared) => {
             assert_eq!(prepared.alignment_start, 1);
             assert_eq!(prepared.alignment_end, 8);
@@ -350,14 +350,48 @@ fn engine_happy_path_match_only() {
 }
 
 /// Helper: run one read through a fresh engine over `chrom` and return
-/// the normalized `PreparedRead`, panicking on a BAQ skip.
-fn process_one(chrom: &[u8], read: MappedRead) -> PreparedRead {
+/// the prepared `PreparedRead`, panicking on a skip. `apply_baq` gates the
+/// BAQ HMM; indel normalization runs either way.
+fn process_one_with(chrom: &[u8], read: MappedRead, apply_baq: bool) -> PreparedRead {
     let (_dir, mut fetcher) = fetcher_from_chrom_bytes(chrom);
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, apply_baq) {
         BaqOutcome::Capped(prepared) => prepared,
         BaqOutcome::Skipped(reason) => panic!("expected Capped, got Skipped({reason:?})"),
     }
+}
+
+/// Helper: run one read through a fresh engine over `chrom` with BAQ on.
+fn process_one(chrom: &[u8], read: MappedRead) -> PreparedRead {
+    process_one_with(chrom, read, true)
+}
+
+#[test]
+fn no_baq_still_left_aligns_indels() {
+    // The hard requirement: `--no-baq` skips the HMM but indel
+    // normalization is mandatory. A homopolymer deletion placed at the
+    // rightmost A (5M1D1M) must still left-align to 1M1D5M, and bq_baq
+    // must be the raw qual (no capping).
+    let chrom = b"TTTTTTTTTTTTTTTTTTTTGAAAAACTTTTTTTTTTTTTTTTTTTT";
+    let read = synthetic_read(
+        0,
+        21,
+        60,
+        vec![CigarOp::Match(5), CigarOp::Deletion(1), CigarOp::Match(1)],
+        b"GAAAAC".to_vec(),
+        vec![37; 6],
+    );
+    let prepared = process_one_with(chrom, read, false);
+    assert_eq!(
+        prepared.cigar,
+        vec![CigarOp::Match(1), CigarOp::Deletion(1), CigarOp::Match(5)],
+        "no-baq must still left-align indels",
+    );
+    assert_eq!(
+        prepared.bq_baq,
+        vec![37; 6],
+        "no-baq leaves base qualities uncapped (raw qual)",
+    );
 }
 
 #[test]
@@ -450,7 +484,7 @@ fn engine_mate_role_first_of_pair() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(prepared) => assert_eq!(prepared.mate_role, MateRole::FirstOfPair),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -468,7 +502,7 @@ fn engine_mate_role_second_of_pair() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(prepared) => assert_eq!(prepared.mate_role, MateRole::SecondOfPair),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -486,7 +520,7 @@ fn engine_reverse_strand_propagates() {
         vec![40; 5],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(prepared) => assert!(prepared.is_reverse_strand),
         other => panic!("expected Capped, got {other:?}"),
     }
@@ -505,7 +539,7 @@ fn engine_skip_unmapped() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::Unmapped),
     );
 }
@@ -516,7 +550,7 @@ fn engine_skip_empty_query() {
     let read = synthetic_read(0, 1, 60, vec![], vec![], vec![]);
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::EmptyQuery),
     );
 }
@@ -534,7 +568,7 @@ fn engine_skip_qual_absent_on_empty_qual() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::QualAbsent),
     );
 }
@@ -554,7 +588,7 @@ fn engine_skip_qual_absent_on_length_mismatch() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::QualAbsent),
     );
 }
@@ -573,7 +607,7 @@ fn engine_skip_no_match_in_cigar() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::NoMatchInCigar),
     );
 }
@@ -591,7 +625,7 @@ fn engine_skip_contains_ref_skip() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::ContainsRefSkip),
     );
 }
@@ -612,7 +646,7 @@ fn engine_skip_ref_window_past_chrom_end() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::RefWindowPastChromEnd),
     );
 }
@@ -631,7 +665,7 @@ fn engine_skip_pos_out_of_range() {
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     assert_eq!(
-        skip_reason(engine.process(read, &mut fetcher)),
+        skip_reason(engine.process(read, &mut fetcher, true)),
         Some(BaqSkipReason::PosOutOfRange),
     );
 }
@@ -654,7 +688,7 @@ fn engine_happy_path_with_insertion() {
         vec![40; 8],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(p) => {
             assert_eq!(p.bq_baq.len(), 8);
             // Insertion positions (indices 3, 4) carry the raw qual
@@ -681,7 +715,7 @@ fn engine_happy_path_with_deletion() {
         vec![40; 8],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(p) => {
             assert_eq!(p.bq_baq.len(), 8);
             for (i, &q) in p.bq_baq.iter().enumerate() {
@@ -719,7 +753,7 @@ fn engine_happy_path_with_mixed_cigar() {
         vec![40; 15],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
-    match engine.process(read, &mut fetcher) {
+    match engine.process(read, &mut fetcher, true) {
         BaqOutcome::Capped(p) => {
             assert_eq!(p.bq_baq.len(), 15);
             // Ref span (counts M, =, X, D, N): 5 + 3 + 2 + 2 = 12.
@@ -828,6 +862,7 @@ fn stream_yields_prepared_reads_in_order_within_chunk() {
         fasta_path.clone(),
         contigs.clone(),
         16,
+        true,
     );
     let outputs: Vec<Result<PreparedRead, _>> = stream.collect();
     assert_eq!(outputs.len(), 4);
@@ -861,6 +896,7 @@ fn stream_preserves_order_across_chunks() {
         fasta_path.clone(),
         contigs.clone(),
         2,
+        true,
     );
     let starts: Vec<u32> = stream.map(|r| r.unwrap().alignment_start).collect();
     assert_eq!(starts, vec![1, 2, 3, 4, 5]);
@@ -897,6 +933,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
             fasta_path.clone(),
             contigs.clone(),
             16,
+            true,
         );
         stream
             .map(|r| r.unwrap().alignment_start)
@@ -952,6 +989,7 @@ fn stream_increments_skip_counts_per_reason() {
         fasta_path.clone(),
         contigs.clone(),
         16,
+        true,
     );
     let outputs: Vec<_> = (&mut stream).collect();
     assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 2);
@@ -981,6 +1019,7 @@ fn stream_propagates_upstream_error_after_batched_reads() {
         fasta_path.clone(),
         contigs.clone(),
         16,
+        true,
     )
     .collect();
     assert_eq!(outputs.len(), 2);
@@ -1027,6 +1066,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
         fasta_path.clone(),
         contigs.clone(),
         1,
+        true,
     );
     let outputs: Vec<_> = (&mut stream).collect();
     assert_eq!(outputs.iter().filter(|r| r.is_ok()).count(), 1);
@@ -1051,6 +1091,7 @@ fn stream_is_fused_after_exhaustion() {
         fasta_path.clone(),
         contigs.clone(),
         16,
+        true,
     );
     assert!(stream.next().is_some());
     assert!(stream.next().is_none());
@@ -1070,6 +1111,7 @@ fn stream_rejects_zero_chunk_size() {
         std::path::PathBuf::from("/dev/null"),
         ContigList { entries: vec![] },
         0,
+        true,
     );
 }
 

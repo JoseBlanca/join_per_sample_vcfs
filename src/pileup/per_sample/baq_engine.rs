@@ -101,18 +101,27 @@ impl BaqEngine {
         }
     }
 
-    /// Run BAQ on one read. See the [`BaqOutcome`] / [`BaqSkipReason`]
-    /// docs for the success and skip shapes.
+    /// Prepare one read for the walker: indel left-alignment (always) plus
+    /// — when `apply_baq` — BAQ base-quality capping.
+    ///
+    /// Indel left-alignment (architecture spec §"Indel normalization") is
+    /// **mandatory and independent of BAQ**: it runs here, in the parallel
+    /// per-read prep, whether or not the BAQ HMM runs. `apply_baq` gates
+    /// *only* the HMM:
+    /// - `true`  → `bq_baq = min(BQ, BAQ)` (HMM-capped), reusing the
+    ///   reference window the HMM fetches for normalization;
+    /// - `false` → `bq_baq` is the raw `qual` (no HMM), and the reference
+    ///   window is fetched only when the read carries an indel that needs
+    ///   normalizing.
     ///
     /// Takes `MappedRead` by value so the success path can **move**
     /// `cigar`, `seq`, and `qname` straight into the resulting
-    /// `PreparedRead` instead of cloning them. The skip paths drop
-    /// the `MappedRead` immediately, same as the previous borrowing
-    /// API.
+    /// `PreparedRead` instead of cloning them.
     pub fn process(
         &mut self,
         read: MappedRead,
         ref_fetcher: &mut ManualEvictChromRefFetcher,
+        apply_baq: bool,
     ) -> BaqOutcome {
         if read.flag & FLAG_UNMAPPED != 0 {
             return BaqOutcome::Skipped(BaqSkipReason::Unmapped);
@@ -135,112 +144,115 @@ impl BaqEngine {
             Ok(v) => v,
             Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ReadTooLong),
         };
-        // `chrom_id` is no longer passed to the fetcher (the new
-        // API binds it to one contig at construction — BAQ's
-        // per-worker fetcher is built for the chunk's chrom), but
-        // it's still needed downstream by `mapped_to_prepared` for
-        // the resulting `PreparedRead`. Range-checking here catches
-        // negative/invalid SAM rows the same as before.
+        // `chrom_id` is needed downstream by `mapped_to_prepared` for the
+        // resulting `PreparedRead`. Range-checking here catches
+        // negative/invalid SAM rows.
         let chrom_id = match u32::try_from(read.ref_id) {
             Ok(v) => v,
             Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ChromIdOutOfRange),
         };
 
-        // Indel left-alignment (architecture spec §"Indel normalization")
-        // happens here, in the parallel per-read prep — not in the
-        // single-threaded walker — reusing the reference window BAQ already
-        // fetches. Only reads that carry an indel need the raw-ASCII copy.
         let needs_norm = read.cigar.iter().copied().any(is_indel_op);
 
-        // (xb..xe): ref span; (yb..ye): query span. Both 0-based,
-        // half-open. `bw` may be wider than `cfg.band_half_width` if a
-        // single indel forces it.
-        let (xb0, xe0, yb, ye, bw) =
-            match locate_alignment_span(&read.cigar, pos_0, self.cfg.band_half_width) {
-                Ok(span) => span,
-                Err(reason) => return BaqOutcome::Skipped(reason),
-            };
-        let (xb, xe) = extend_ref_window(xb0, xe0, yb, ye, l_qseq, bw);
-        if xe <= xb {
-            return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd);
-        }
-        let length = (xe - xb) as u32;
-
-        // Fetch into `self.encoded_ref` directly from the borrowed
-        // slice — no allocation, no `Vec<u8>` round-trip. The
-        // `encoded_ref` `clear`+`extend` happens here (not after the
-        // fetch landing) because the borrow on `ref_fetcher` ends as
-        // soon as we finish iterating the slice, and that needs to
-        // be before any further fetcher mutation.
-        self.encoded_ref.clear();
-        self.raw_ref.clear();
-        match ref_fetcher.fetch((xb + 1) as u32, length) {
-            Ok(bytes) if !bytes.is_empty() => {
-                self.encoded_ref
-                    .extend(bytes.iter().map(|&b| encode_base(b)));
-                // Keep the raw window only when this read needs left-alignment.
-                if needs_norm {
-                    self.raw_ref.extend_from_slice(bytes);
-                }
-            }
-            Ok(_empty) => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
-            Err(e) => {
-                // Surface genuine I/O failures distinct from past-chrom-end.
-                // The pileup-walker side has no way to tell from skip
-                // telemetry alone whether a transient fetch failure
-                // occurred, so log it here and still drop the read.
-                eprintln!(
-                    "warning: BAQ ref fetch failed (ref_id={}, xb={}, length={}): {}; \
-                     skipping read",
-                    read.ref_id, xb, length, e,
-                );
+        // A reference window is needed to run the HMM and/or to left-align
+        // an indel. When neither applies (no-BAQ, indel-free read) we skip
+        // the fetch entirely. `read_start_in_window` is the read's first
+        // aligned base within the fetched window, for normalization.
+        let mut read_start_in_window: usize = 0;
+        if apply_baq || needs_norm {
+            // (xb..xe): ref span; (yb..ye): query span. `bw` may widen
+            // beyond `cfg.band_half_width` if a single indel forces it.
+            let (xb0, xe0, yb, ye, bw) =
+                match locate_alignment_span(&read.cigar, pos_0, self.cfg.band_half_width) {
+                    Ok(span) => span,
+                    Err(reason) => return BaqOutcome::Skipped(reason),
+                };
+            let (xb, xe) = extend_ref_window(xb0, xe0, yb, ye, l_qseq, bw);
+            if xe <= xb {
                 return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd);
             }
-        }
-        self.encoded_query.clear();
-        self.encoded_query
-            .extend(read.seq.iter().map(|&b| encode_base(b)));
+            let length = (xe - xb) as u32;
+            read_start_in_window = (pos_0 - xb) as usize;
 
-        // Spell every BaqConfig field — adding a new field becomes a
-        // compile error at this site rather than silently inheriting
-        // from `self.cfg` (refactor-safety: parity drift hazard).
-        let hmm_cfg = BaqConfig {
-            gap_open_prob: self.cfg.gap_open_prob,
-            gap_extend_prob: self.cfg.gap_extend_prob,
-            band_half_width: bw,
+            // Fetch once; fill `encoded_ref` only when the HMM will run and
+            // the raw window only when normalization will run. The borrow
+            // on `ref_fetcher` ends as the slice is consumed, before any
+            // further fetcher mutation.
+            self.encoded_ref.clear();
+            self.raw_ref.clear();
+            match ref_fetcher.fetch((xb + 1) as u32, length) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if apply_baq {
+                        self.encoded_ref
+                            .extend(bytes.iter().map(|&b| encode_base(b)));
+                    }
+                    if needs_norm {
+                        self.raw_ref.extend_from_slice(bytes);
+                    }
+                }
+                Ok(_empty) => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
+                Err(e) => {
+                    // Surface genuine I/O failures distinct from
+                    // past-chrom-end, then still drop the read.
+                    eprintln!(
+                        "warning: reference fetch failed (ref_id={}, xb={}, length={}): {}; \
+                         skipping read",
+                        read.ref_id, xb, length, e,
+                    );
+                    return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd);
+                }
+            }
+
+            if apply_baq {
+                self.encoded_query.clear();
+                self.encoded_query
+                    .extend(read.seq.iter().map(|&b| encode_base(b)));
+
+                // Spell every BaqConfig field — adding a new field becomes a
+                // compile error here rather than silently inheriting from
+                // `self.cfg` (refactor-safety: parity drift hazard).
+                let hmm_cfg = BaqConfig {
+                    gap_open_prob: self.cfg.gap_open_prob,
+                    gap_extend_prob: self.cfg.gap_extend_prob,
+                    band_half_width: bw,
+                };
+
+                if probaln_glocal(
+                    &mut self.scratch,
+                    &self.encoded_ref,
+                    &self.encoded_query,
+                    &read.qual,
+                    &hmm_cfg,
+                )
+                .is_err()
+                {
+                    return BaqOutcome::Skipped(BaqSkipReason::HmmOverflow);
+                }
+
+                apply_baq_cap_into(
+                    &mut self.bq_baq_buf,
+                    &read.cigar,
+                    &read.qual,
+                    self.scratch.state(),
+                    self.scratch.q(),
+                    pos_0,
+                    xb,
+                );
+            }
+        }
+
+        // `bq_baq` is the HMM-capped buffer when BAQ ran, else the raw qual.
+        let bq_baq = if apply_baq {
+            std::mem::take(&mut self.bq_baq_buf)
+        } else {
+            read.qual.clone()
         };
-
-        if probaln_glocal(
-            &mut self.scratch,
-            &self.encoded_ref,
-            &self.encoded_query,
-            &read.qual,
-            &hmm_cfg,
-        )
-        .is_err()
-        {
-            return BaqOutcome::Skipped(BaqSkipReason::HmmOverflow);
-        }
-
-        apply_baq_cap_into(
-            &mut self.bq_baq_buf,
-            &read.cigar,
-            &read.qual,
-            self.scratch.state(),
-            self.scratch.q(),
-            pos_0,
-            xb,
-        );
-        let bq_baq = std::mem::take(&mut self.bq_baq_buf);
 
         let mut prepared = mapped_to_prepared(read, chrom_id, bq_baq);
 
-        // Left-align this read's indels against the reference now that the
-        // window is in hand — reusing the BAQ window (no extra fetch). The
-        // read's first aligned base sits at `pos_0 - xb` within it.
+        // Mandatory indel left-alignment, reusing the window fetched above.
         if needs_norm {
-            let read_start = (pos_0 - xb) as usize;
-            indel_norm::left_align_prepared(&mut prepared, &self.raw_ref, read_start);
+            indel_norm::left_align_prepared(&mut prepared, &self.raw_ref, read_start_in_window);
         }
 
         BaqOutcome::Capped(prepared)
@@ -424,20 +436,6 @@ fn op_len(op: CigarOp) -> usize {
 #[inline]
 fn is_indel_op(op: CigarOp) -> bool {
     matches!(op, CigarOp::Insertion(_) | CigarOp::Deletion(_))
-}
-
-/// Build a [`PreparedRead`] from a [`MappedRead`] *without* running
-/// the BAQ HMM — `bq_baq` is a clone of the raw `qual` from the CRAM
-/// record. Used by `pop_var_caller pileup --no-baq` to bypass BAQ
-/// while keeping the rest of the pipeline unchanged.
-///
-/// Reuses the same field-wiring as the BAQ-on path
-/// ([`mapped_to_prepared`]) so the two branches stay in lockstep on
-/// alignment-end computation, mate-role derivation, and adaptor
-/// boundary propagation.
-pub fn prepare_passthrough(read: MappedRead, chrom_id: u32) -> PreparedRead {
-    let bq_baq = read.qual.clone();
-    mapped_to_prepared(read, chrom_id, bq_baq)
 }
 
 fn mapped_to_prepared(read: MappedRead, chrom_id: u32, bq_baq: Vec<u8>) -> PreparedRead {

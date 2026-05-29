@@ -276,11 +276,17 @@ inserted sequence. No separate rotation step is needed.
    fetch, pure walker. (An earlier draft wired it into `admit_read`; that
    was reverted.)
 
-   **`--no-baq` caveat.** Normalization lives in the BAQ read-prep stage,
-   so `--no-baq` (a BAQ A/B bypass) also skips normalization — it cannot
-   reuse the walker's forward-streaming fetcher without thrashing it.
-   Production/benchmark runs keep BAQ on. Documented at the passthrough
-   site in `stage1_pipeline.rs`.
+   **Normalization is mandatory, including under `--no-baq`.**
+   `BaqEngine::process` takes an `apply_baq: bool` that gates **only** the
+   BAQ HMM: every read is left-aligned either way (`bq_baq` is the raw
+   qual when BAQ is off). Both the `pileup`/`var-calling` path
+   (`stage1_pipeline`) and `var-calling-from-bam` now route *both* modes
+   through `BaqStream` with `apply_baq = !no_baq`; the separate
+   `prepare_passthrough` no-baq map (which skipped normalization) is
+   deleted. `baq_skip_counts` is still reported as `None` ("baq:
+   disabled") under `--no-baq` to preserve that signal. So `--no-baq`
+   gives exactly no-BAQ — nothing more, nothing less — and still
+   normalizes.
 
    Tests: engine-level normalization tests in `baq_tests.rs` (deletion +
    insertion left-align to the leftmost; two reads at different offsets
