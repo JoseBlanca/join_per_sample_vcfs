@@ -299,6 +299,14 @@ fn var_calling_emits_deterministic_vcf_across_runs() {
 ///
 /// Phase B — see
 /// `doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md`.
+///
+/// M31 (cohort_block review): this test **is** the parallel-vs-
+/// sequential equivalence test the review asked for. T=4 forces the
+/// rayon `par_iter_mut().try_for_each(|slot| run_window(...))`
+/// dispatch path; T=1 runs the same code with `slots[..1]` (a single
+/// iteration through the same `par_iter_mut`). If a per-slot
+/// disjointness regression were to land in `WorkerSlot`, the VCF
+/// bodies would diverge byte-for-byte and this test would fail.
 #[test]
 fn var_calling_byte_identical_across_worker_windows_per_chunk() {
     let dir = TempDir::new().expect("tempdir");
