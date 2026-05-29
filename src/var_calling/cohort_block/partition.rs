@@ -484,6 +484,39 @@ mod tests {
             .collect()
     }
 
+    /// M32: pin the invariant that `samples_at_pos[lo..hi]` for each
+    /// position is strictly ascending — `partition_window` walks
+    /// `chunk.per_sample.iter().enumerate()` in order and emits at
+    /// most one row per sample per position. Downstream consumers
+    /// (specifically `kernels::project_scalars::locate_sample_row_idx`)
+    /// rely on this property for their linear-scan early-return
+    /// semantics; a regression in the dedup would silently return the
+    /// first row from a duplicated sample without ever surfacing an
+    /// error.
+    #[test]
+    fn samples_at_pos_is_strictly_ascending_within_each_position_range() {
+        // Three samples; two positions inside the window. Each
+        // position is covered by a different subset of samples, so
+        // the per-position sample lists vary in size — the strict-
+        // ascending property must hold for every non-empty range.
+        let s0 = vec![record(10, ref_plus_alt(3, 4))];
+        let s1 = vec![
+            record(10, ref_plus_alt(3, 4)),
+            record(20, ref_plus_alt(2, 5)),
+        ];
+        let s2 = vec![record(20, ref_plus_alt(4, 4))];
+        let (chunk, _) = loaded_chunk(0, 1..1000, vec![s0, s1, s2]);
+        let partition = run_partition(&chunk, &(1..100), 5);
+        for position_idx in 0..partition.n_positions() {
+            let range = partition.sample_range_for_position(position_idx);
+            let samples: Vec<u32> = range.clone().map(|k| partition.samples_at_pos[k]).collect();
+            assert!(
+                samples.windows(2).all(|w| w[0] < w[1]),
+                "samples_at_pos[{range:?}] must be strictly ascending; got {samples:?}",
+            );
+        }
+    }
+
     #[test]
     fn empty_window_produces_empty_partition() {
         let s0 = vec![record(100, ref_plus_alt(3, 4))];

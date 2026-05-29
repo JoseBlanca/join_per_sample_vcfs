@@ -556,6 +556,79 @@ mod tests {
         (out, stats)
     }
 
+    /// M29: `load_chunk_from_iters` returns `SampleCountMismatch`
+    /// when the per-sample iter vec length differs from the scratch's
+    /// `n_samples()`. Without this regression test a refactor that
+    /// drops the check would surface as an `index out of range` panic
+    /// inside `scratch.raw_per_sample[sample_idx]` instead of a clean
+    /// typed error.
+    #[test]
+    fn loader_rejects_sample_count_mismatch() {
+        let mut scratch = ChunkLoadScratch::with_n_samples(2);
+        let mut out = MaterialisedChunk::with_n_samples(2);
+        let mut carry = vec![SampleColumns::empty(); 2];
+        let iters: Vec<_> = vec![Vec::<PileupRecord>::new()] // 1 iter, scratch is sized for 2
+            .into_iter()
+            .map(|rs| rs.into_iter().map(Ok::<_, Infallible>))
+            .collect();
+        let err =
+            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkLoadError::SampleCountMismatch {
+                expected: 2,
+                got: 1
+            }
+        ));
+    }
+
+    /// M29: same shape, on the carryover slice's length check.
+    #[test]
+    fn loader_rejects_carryover_length_mismatch() {
+        let mut scratch = ChunkLoadScratch::with_n_samples(2);
+        let mut out = MaterialisedChunk::with_n_samples(2);
+        let mut carry = vec![SampleColumns::empty(); 1]; // mismatched length
+        let iters: Vec<_> = (0..2)
+            .map(|_| Vec::<PileupRecord>::new())
+            .map(|rs| rs.into_iter().map(Ok::<_, Infallible>))
+            .collect();
+        let err =
+            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkLoadError::CarryoverLengthMismatch {
+                expected: 2,
+                got: 1
+            }
+        ));
+    }
+
+    /// M8: `load_chunk_from_iters` rejects `max_span < initial_span`
+    /// with `InvalidRange` rather than silently treating it as
+    /// `max_span = initial_span` (the previous structurally-no-op
+    /// `effective_initial_span = initial_span.min(max_span.max(initial_span))`).
+    /// Today's driver passes `max_load_span >= initial_load_span`
+    /// (B3), so this branch is unreachable on the production path;
+    /// the test pins the API contract for future callers.
+    #[test]
+    fn loader_rejects_max_span_below_initial_span() {
+        let mut scratch = ChunkLoadScratch::with_n_samples(1);
+        let mut out = MaterialisedChunk::with_n_samples(1);
+        let mut carry = vec![SampleColumns::empty(); 1];
+        let iters: Vec<_> = vec![Vec::<PileupRecord>::new()]
+            .into_iter()
+            .map(|rs| rs.into_iter().map(Ok::<_, Infallible>))
+            .collect();
+        // initial_span = 100, max_span = 50 — the loader cannot honour
+        // a 100-BP load when capped at 50 BP.
+        let err =
+            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 100, 0, 50, iters, &mut carry)
+                .unwrap_err();
+        assert!(matches!(err, ChunkLoadError::InvalidRange { .. }));
+    }
+
     #[test]
     fn loader_variant_count_matches_kept_position_set() {
         // Sample 0 + 1: variants at pos 10 (sample 0 only) and pos 14

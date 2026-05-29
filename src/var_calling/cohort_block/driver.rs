@@ -125,6 +125,13 @@ pub struct ChunkDriverStats {
     pub records_dropped_low_mapq_diff_t: u64,
     pub lh_cap_groups_skipped: u64,
     pub lh_cap_alleles_in_skipped: u64,
+    /// M23: groups skipped because post-unification the allele set
+    /// was REF-only (every ALT was absorbed into the OTHER pool by
+    /// the max-alleles cap, or none survived the per-position
+    /// dedup). Mirrors the row-shape merger's REF-only no-op skip;
+    /// surfaced separately from `lh_cap_groups_skipped` because the
+    /// trigger is different (post-unify vs cap-trip).
+    pub groups_skipped_post_unify_ref_only: u64,
     /// Total chunks loaded — includes both terminal loads and
     /// (in the future) retry attempts. Useful for capacity planning
     /// alongside `lh_cap_*` counters.
@@ -831,6 +838,7 @@ where
         let (cap_g, cap_a) = slot.scratch.take_lh_cap_stats();
         stats.lh_cap_groups_skipped += cap_g;
         stats.lh_cap_alleles_in_skipped += cap_a;
+        stats.groups_skipped_post_unify_ref_only += slot.scratch.take_post_unify_ref_only_count();
         for record in slot.output_buf.drain(..) {
             emit_or_drop(record, params, writer, stats)?;
         }

@@ -538,6 +538,22 @@ pub(crate) fn locate_sample_row_idx(
 ) -> Option<usize> {
     let p = group_position_lo + record_idx_in_group;
     let sample_range = partition.sample_range_for_position(p);
+    // M32: pin the `partition_window` invariant that
+    // `samples_at_pos[sample_range]` is strictly sorted ascending by
+    // sample_idx (each cohort sample contributes at most one record
+    // per cohort position). The linear scan below relies on early-
+    // return; without uniqueness a regression in `partition_window`'s
+    // dedup could silently return the first row from a duplicated
+    // sample without ever surfacing the error.
+    debug_assert!(
+        sample_range
+            .clone()
+            .map(|k| partition.samples_at_pos[k])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[0] < w[1]),
+        "locate_sample_row_idx: samples_at_pos[sample_range] must be strictly ascending",
+    );
     // Linear scan over `samples_at_pos` at this position to find
     // `sample_idx` → row_idx. The slice is small (one entry per
     // sample-with-a-record-at-this-position) so the scan is fast.

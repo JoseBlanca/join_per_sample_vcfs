@@ -454,6 +454,28 @@ mod tests {
         assert_eq!(err, FixBoundariesError::ZeroTargetWindowCount);
     }
 
+    /// M30: `fix_boundaries` returns `CarryoverLengthMismatch` when
+    /// the supplied carryover slice's length differs from the chunk's
+    /// `n_samples()`. Without this regression test, a refactor that
+    /// moves the guard into a debug-assert (or drops it entirely)
+    /// would surface the mismatch as an `index out of range` panic
+    /// inside the splitting loop instead of a clean typed error.
+    #[test]
+    fn pre_pass_rejects_mismatched_carryover_length() {
+        let mut chunk = MaterialisedChunk::with_n_samples(2);
+        chunk.range = 1..100;
+        let mut carry = vec![SampleColumns::empty()]; // 1 sample, chunk has 2
+        let mut scratch = FixBoundariesScratch::new();
+        let err = fix_boundaries(&mut chunk, &mut carry, &mut scratch, 50, 1).unwrap_err();
+        assert_eq!(
+            err,
+            FixBoundariesError::CarryoverLengthMismatch {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
     // ──────────────────────────────────────────────────────────────
     // Phase B — target_window_count > 1 (probe-and-slide).
     // ──────────────────────────────────────────────────────────────

@@ -92,6 +92,15 @@ pub struct ColumnarPipelineScratch {
     /// the row-shape merger reports this in `allele_lh_cap_hit:
     /// alleles_total=N`.
     lh_cap_alleles_in_skipped: u64,
+    /// M23: groups whose post-unification allele set has only REF
+    /// (every ALT was absorbed into the OTHER pool by the
+    /// max-alleles cap, or none survived the per-position projection
+    /// dedup). These are emitted as `Ok(None)` from
+    /// `build_posterior_record_columnar` (matching the row-shape
+    /// merger's REF-only no-op skip). Accumulated across every
+    /// `run_window` call; the driver reads + clears via
+    /// [`Self::take_post_unify_ref_only_count`] after each call.
+    groups_skipped_post_unify_ref_only: u64,
 }
 
 /// [`AllelesView`] over [`UnifiedAllelesColumns`]. Phase A.2 step 2:
@@ -140,6 +149,14 @@ impl ColumnarPipelineScratch {
         let g = std::mem::take(&mut self.lh_cap_groups_skipped);
         let a = std::mem::take(&mut self.lh_cap_alleles_in_skipped);
         (g, a)
+    }
+
+    /// M23: take the post-unify-REF-only skip count accumulated
+    /// since the last call. Mirrors [`Self::take_lh_cap_stats`]; the
+    /// driver rolls it into `ChunkDriverStats` after every
+    /// `run_window`.
+    pub fn take_post_unify_ref_only_count(&mut self) -> u64 {
+        std::mem::take(&mut self.groups_skipped_post_unify_ref_only)
     }
 }
 
@@ -358,6 +375,12 @@ fn build_posterior_record_columnar(
         return Ok(None);
     }
     if n_alleles < 2 {
+        // M23: surface the silent skip via a counter so operators
+        // auditing why a known variant locus produced no record have
+        // a breadcrumb. This path fires when post-unification every
+        // ALT was absorbed into the OTHER pool by the max-alleles
+        // cap, leaving only REF.
+        scratch.groups_skipped_post_unify_ref_only += 1;
         return Ok(None);
     }
 
@@ -895,6 +918,95 @@ mod tests {
             crate::fasta::fetcher::ChromRefFetchError,
         > {
             Ok(Box::new(self.seq.iter().copied().map(Ok)))
+        }
+    }
+
+    /// M22: when multiple prunable ALTs have equal `cohort_count`,
+    /// the column-native `enforce_max_alleles_columnar` tie-break
+    /// must match the row-shape `PerGroupMerger` oracle's tie-break
+    /// — otherwise byte-identity against `main` could silently break
+    /// on a real-data input that hits the tie. Fixture: 3 ALTs all
+    /// at cohort_count=5; `max_alleles = 3` keeps REF + 2 ALTs and
+    /// forces the cap to drop exactly one of the three.
+    #[test]
+    fn unify_max_alleles_ties_match_row_shape_kernel() {
+        // Two samples; pos 100 covered by both. Each sample
+        // contributes the same three ALTs (T, C, G), each at
+        // num_obs=5, so the cohort-pooled count for each is 10. The
+        // cap (max_alleles=3 → REF + 2 ALTs) must drop one of the
+        // three; the column-native and row-shape kernels must agree
+        // on which.
+        let alts = || {
+            vec![
+                crate::var_calling::cohort_block::test_helpers::allele(b"A", 5, -1.0, &[]),
+                crate::var_calling::cohort_block::test_helpers::allele(b"T", 5, -1.0, &[]),
+                crate::var_calling::cohort_block::test_helpers::allele(b"C", 5, -1.0, &[]),
+                crate::var_calling::cohort_block::test_helpers::allele(b"G", 5, -1.0, &[]),
+            ]
+        };
+        let s0 = vec![record(100, alts())];
+        let s1 = vec![record(100, alts())];
+        let (chunk, partition) = fixture(vec![s0, s1], 1, 200, 5);
+
+        let ref_full = vec![b'A'; 200];
+        let fetcher = MockRef {
+            seq: ref_full.clone(),
+            base_offset: 1,
+        };
+
+        // Column-native pipeline.
+        let mut cn_scratch = ColumnarPipelineScratch::empty();
+        let mut cn_out: Vec<PosteriorRecord> = Vec::new();
+        let cfg = PerGroupMergerConfig::new(2, 3, 64, 32).expect("merger config");
+        let mut cn_pre_fetched: Vec<Vec<u8>> = Vec::new();
+        prefetch_window_ref_bytes(&partition, &fetcher, &mut cn_pre_fetched)
+            .expect("prefetch succeeded");
+        run_window(
+            &chunk,
+            &partition,
+            &cn_pre_fetched,
+            cfg,
+            &PosteriorEngineConfig::default(),
+            &mut cn_scratch,
+            &mut cn_out,
+        )
+        .expect("columnar run_window succeeded");
+
+        // Row-shape oracle.
+        let row_fetcher: SharedRefFetcher = Arc::new(fetcher);
+        let mut row_out: Vec<PosteriorRecord> = Vec::new();
+        let groups: Vec<OverlappingVariantGroup> = (0..partition.n_groups())
+            .map(|g| {
+                build_overlapping_variant_group(
+                    &chunk,
+                    &partition,
+                    g,
+                    chunk.n_samples(),
+                    chunk.chrom_id,
+                )
+            })
+            .collect();
+        let merger = PerGroupMerger::with_config(
+            groups.into_iter().map(Ok::<_, GrouperError>),
+            row_fetcher,
+            cfg,
+        );
+        let engine = PosteriorEngine::with_config(merger, PosteriorEngineConfig::default());
+        for record in engine {
+            row_out.push(record.expect("row-shape pipeline succeeded"));
+        }
+
+        // Both pipelines must emit the same set of ALT-allele bytes.
+        assert_eq!(cn_out.len(), row_out.len(), "record count mismatch");
+        for (cn, row) in cn_out.iter().zip(row_out.iter()) {
+            assert!(
+                cn.alleles.len() <= 3,
+                "max_alleles cap should hold ({} alleles emitted)",
+                cn.alleles.len(),
+            );
+            // Pin the *same* allele set is picked under tie — the
+            // strongest possible assertion against tie-break drift.
+            assert_eq!(cn, row, "tie-break must match row-shape oracle");
         }
     }
 
