@@ -214,41 +214,37 @@ where
         out.per_sample.resize_with(n_samples, SampleColumns::empty);
     }
 
-    // ── Step 1+2: raw load (carryover prefix + iterator pull) ──
-    for (sample_idx, (iter, carry)) in per_sample_iters
-        .into_iter()
-        .zip(carryover.iter_mut())
-        .enumerate()
-    {
+    // ── Step 1: drain carryover (records from the prior chunk that
+    //            sat past its safe_end) into the per-sample raw
+    //            buffers. ──
+    for (sample_idx, carry) in carryover.iter_mut().enumerate() {
         let raw = &mut scratch.raw_per_sample[sample_idx];
-        // Move carryover rows in first (preserve order).
         for row_idx in 0..carry.n_records() {
             raw.push_row_from(carry, row_idx);
         }
         carry.clear();
+    }
 
-        for record in iter {
-            let record =
-                record.map_err(|source| ChunkLoadError::UpstreamRead { sample_idx, source })?;
-            if record.chrom_id != chrom_id {
-                return Err(ChunkLoadError::UnexpectedChromosome {
-                    sample_idx,
-                    expected_chrom_id: chrom_id,
-                    got_chrom_id: record.chrom_id,
-                });
-            }
-            if record.pos < range.start {
-                continue;
-            }
-            if record.pos >= range.end {
-                // First record past the right boundary: stop
-                // pulling. Caller is responsible for any rows past
-                // `range.end` (re-read next chunk; the iterator is
-                // discarded).
-                break;
-            }
-            raw.push_record(record);
-        }
+    // ── Step 2: peek-and-pull from each per-sample iterator. ──
+    // Each iterator is wrapped in `Peekable` so the pull pauses
+    // cleanly at the first record past the attempt boundary without
+    // consuming it; subsequent extension iterations (Phase B
+    // variant-bounded loading, step 3) resume from the same point.
+    let mut peekable_iters: Vec<std::iter::Peekable<I::IntoIter>> = per_sample_iters
+        .into_iter()
+        .map(|iter| iter.into_iter().peekable())
+        .collect();
+    let attempt_end = range.end;
+    for (sample_idx, iter) in peekable_iters.iter_mut().enumerate() {
+        let raw = &mut scratch.raw_per_sample[sample_idx];
+        pull_records_with_pos_under(
+            iter,
+            sample_idx,
+            chrom_id,
+            range.start,
+            attempt_end,
+            raw,
+        )?;
     }
 
     // ── Step 3: cohort-wide position union ──
@@ -367,6 +363,95 @@ where
 
     let variant_count = scratch.is_kept.iter().filter(|kept| **kept).count() as u32;
     Ok(ChunkLoadStats { variant_count })
+}
+
+/// Decision branches surfaced by the peek phase of
+/// [`pull_records_with_pos_under`]. Split out so the immutable
+/// peek-borrow of `iter` is released before the mutable
+/// `iter.next()` consumes the same record. Mirroring the borrow
+/// boundary in the type lets the loop body read straightforwardly.
+enum PullDecision {
+    /// No more records, or the next record is at `pos >=
+    /// attempt_end`. Stop pulling without consuming.
+    Stop,
+    /// Next record is below `range_start`; consume + discard.
+    SkipBelowRangeStart,
+    /// Next record is in `[range_start, attempt_end)`; consume +
+    /// push into `raw`.
+    Consume,
+    /// `iter.peek()` returned `Some(Err(_))`. Consume to extract
+    /// the error and surface it.
+    SurfaceUpstreamErr,
+    /// Next record's `chrom_id` does not match the expected
+    /// chromosome. Carries the observed value for the error.
+    ReturnChromMismatch(u32),
+}
+
+/// Drain `iter` of every record with `range_start <= pos <
+/// attempt_end`, pushing each into `raw`. Records before
+/// `range_start` are consumed + skipped (the iterator's start may
+/// be slightly before the chunk start because of PSP block
+/// alignment). The first record at or above `attempt_end` is left
+/// in the iterator — the loader's extension loop (step 3) resumes
+/// the pull from there with a larger `attempt_end`.
+fn pull_records_with_pos_under<I, E>(
+    iter: &mut std::iter::Peekable<I>,
+    sample_idx: usize,
+    chrom_id: u32,
+    range_start: u32,
+    attempt_end: u32,
+    raw: &mut SampleColumns,
+) -> Result<(), ChunkLoadError<E>>
+where
+    I: Iterator<Item = Result<PileupRecord, E>>,
+{
+    loop {
+        let decision = match iter.peek() {
+            None => PullDecision::Stop,
+            Some(Err(_)) => PullDecision::SurfaceUpstreamErr,
+            Some(Ok(record)) => {
+                if record.chrom_id != chrom_id {
+                    PullDecision::ReturnChromMismatch(record.chrom_id)
+                } else if record.pos >= attempt_end {
+                    PullDecision::Stop
+                } else if record.pos < range_start {
+                    PullDecision::SkipBelowRangeStart
+                } else {
+                    PullDecision::Consume
+                }
+            }
+        };
+        match decision {
+            PullDecision::Stop => return Ok(()),
+            PullDecision::SkipBelowRangeStart => {
+                iter.next();
+            }
+            PullDecision::Consume => {
+                let record = iter
+                    .next()
+                    .and_then(Result::ok)
+                    .expect("peek returned Some(Ok(_))");
+                raw.push_record(record);
+            }
+            PullDecision::SurfaceUpstreamErr => {
+                let err = iter
+                    .next()
+                    .and_then(Result::err)
+                    .expect("peek returned Some(Err(_))");
+                return Err(ChunkLoadError::UpstreamRead {
+                    sample_idx,
+                    source: err,
+                });
+            }
+            PullDecision::ReturnChromMismatch(got_chrom_id) => {
+                return Err(ChunkLoadError::UnexpectedChromosome {
+                    sample_idx,
+                    expected_chrom_id: chrom_id,
+                    got_chrom_id,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
