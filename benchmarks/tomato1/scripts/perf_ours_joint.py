@@ -13,8 +13,9 @@ perf_gatk_joint) pair shows how our joint-genotyping stage scales
 relative to GATK's. The per-sample pileup time is excluded — this
 measures the joint step only.
 
-PSP inputs must already exist; they're built by run_ours_cohort.sh
-(stage 1) and live at results/ours/cohort/psp/*.psp.
+PSP inputs must already exist; they're built by stage 1 of
+`../../lib/run_ours.sh bench.config.sh cohort` and live at
+results/ours/cohort/psp/*.psp.
 
 Sample sizes: 1, 2, 4, 8, 12, 16, 18 (full tomato1 cohort).
 Inputs:       benchmarks/tomato1/results/ours/cohort/psp/*.psp

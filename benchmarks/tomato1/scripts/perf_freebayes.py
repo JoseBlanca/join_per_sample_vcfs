@@ -23,7 +23,7 @@ so the freebayes vs ours_whole_pipeline numbers are an apples-to-apples
 Wall time = freebayes pool wall + merge time. Peak RSS is the max
 sum-across-alive-workers observed by the polling loop in
 measure_pool (the merge step is trivial Python, negligible RSS).
-The post-call MIN_QUAL=30 filter that run_freebayes_*.sh applies is
+The post-call MIN_QUAL=30 filter that ../../lib/run_freebayes.sh applies is
 *not* re-applied here — that's a separate awk pass that doesn't
 affect freebayes' own footprint.
 
