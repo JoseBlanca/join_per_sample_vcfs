@@ -21,10 +21,11 @@ use super::active_read_set::ActiveReads;
 use super::chain_id_allocator::{ChainIdAllocator, ChainIdAllocatorCounters};
 use super::decompose::ReadEvent;
 use super::errors::WalkerError;
+use super::indel_norm;
 use super::open_record::{
     OpenPileupRecord, OpenPileupRecordTable, ReadContribution, process_position,
 };
-use super::{PreparedRead, ReadLengthError, WalkerConfig};
+use super::{CigarOp, PreparedRead, ReadLengthError, WalkerConfig};
 use crate::fasta::MultiChromRefFetcher;
 
 /// Construct a [`PileupWalker`] over a coordinate-sorted stream of
@@ -169,7 +170,7 @@ where
                 // condition above, and `self.reads` has not been
                 // advanced between then and here.
                 let r = self.reads.next().expect("peek matched");
-                self.state.admit_read(r)?;
+                self.state.admit_read(r, &self.ref_fetcher)?;
             }
 
             // Process events at walker_pos, expire passed reads,
@@ -336,8 +337,18 @@ impl WalkerState {
         self.last_admitted_chrom_id = Some(chrom_id);
     }
 
-    fn admit_read(&mut self, read: PreparedRead) -> Result<(), WalkerError> {
-        // Order-invariant check.
+    fn admit_read<F: MultiChromRefFetcher>(
+        &mut self,
+        mut read: PreparedRead,
+        ref_fetcher: &F,
+    ) -> Result<(), WalkerError> {
+        // Order-invariant check on the read's *original* alignment start.
+        // The read stream is coordinate-sorted by it, and indel
+        // normalization below may bump this read's start right (a leading
+        // deletion that left-aligns to the read edge is removed); doing
+        // the order bookkeeping on the original start keeps the
+        // monotonicity invariant intact when a later, un-bumped read
+        // follows a bumped one.
         let read_locus = Locus {
             chrom_id: read.chrom_id,
             pos: read.alignment_start,
@@ -362,9 +373,16 @@ impl WalkerState {
             });
         }
         // Length invariants the cursor relies on. See
-        // `PreparedRead::length` for the rationale.
+        // `PreparedRead::length` for the rationale. Validated *before*
+        // normalization so a malformed read errors cleanly rather than
+        // panicking on out-of-bounds indexing inside the normalizer.
         read.length()
             .map_err(|e| malformed_read_from_length_err(e, &read))?;
+        // Left-align this read's indels against the reference before the
+        // cursor is built, so the cursor emits canonical (leftmost)
+        // anchors and the same biological indel consolidates across reads
+        // (architecture spec §"Indel normalization (left-alignment)").
+        normalize_read_indels(&mut read, ref_fetcher)?;
         self.last_admitted_locus = Some(read_locus);
         self.active_reads.admit(read, &mut self.chain_ids)?;
         self.summary.reads_admitted += 1;
@@ -588,6 +606,63 @@ fn malformed_read_from_length_err(err: ReadLengthError, read: &PreparedRead) -> 
         chrom_id: read.chrom_id,
         pos: read.alignment_start,
     }
+}
+
+/// Left-align the read's indels in place (rewrite `cigar`, and bump
+/// `alignment_start` if a leading deletion was removed). No-op fast path
+/// for reads with no indel op — the overwhelming majority.
+///
+/// The reference window fetched is exactly the read's footprint
+/// `[alignment_start, alignment_end]`, so the left roll is naturally
+/// bounded by the read's own aligned region (the spec's footprint bound,
+/// and the window freebayes passes).
+fn normalize_read_indels<F: MultiChromRefFetcher>(
+    read: &mut PreparedRead,
+    ref_fetcher: &F,
+) -> Result<(), WalkerError> {
+    if !read
+        .cigar
+        .iter()
+        .any(|op| matches!(op, CigarOp::Insertion(_) | CigarOp::Deletion(_)))
+    {
+        return Ok(());
+    }
+
+    let start = read.alignment_start;
+    let span = read.alignment_end - read.alignment_start + 1;
+    let ref_bases = ref_fetcher
+        .fetch(read.chrom_id, start, span)
+        .map_err(|source| WalkerError::Fasta {
+            chrom_id: read.chrom_id,
+            start,
+            start_plus_len: start + span,
+            source,
+        })?;
+
+    let result = indel_norm::left_align_cigar(&read.cigar, &ref_bases, &read.seq, 0);
+
+    // Left-alignment is a lossless re-placement of the same indels, so it
+    // must leave the read's reference-mismatch count unchanged. Guard the
+    // port against silent corruption in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        let before = indel_norm::count_mismatches(&read.cigar, &ref_bases, &read.seq, 0);
+        let after = indel_norm::count_mismatches(
+            &result.cigar,
+            &ref_bases,
+            &read.seq,
+            result.leading_deletion_bases_removed as usize,
+        );
+        debug_assert_eq!(
+            before, after,
+            "indel left-alignment changed mismatch count for qname='{}'",
+            read.qname
+        );
+    }
+
+    read.cigar = result.cigar;
+    read.alignment_start += result.leading_deletion_bases_removed;
+    Ok(())
 }
 
 /// Resolve mate-overlap at the current walker position.

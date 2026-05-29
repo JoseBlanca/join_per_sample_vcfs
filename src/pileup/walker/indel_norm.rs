@@ -20,11 +20,6 @@
 //! cross the previous (a collision merges them). See
 //! `doc/devel/implementation_plans/indel_normalization.md` and the
 //! architecture spec §"Indel normalization (left-alignment)".
-//!
-//! Phase 1 lands the pure routine and its tests; the walker wiring that
-//! calls [`left_align_cigar`] at read-admit time lands in Phase 2, at
-//! which point this allow is removed.
-#![allow(dead_code)]
 
 use super::CigarOp;
 
@@ -475,6 +470,42 @@ pub(super) fn left_align_cigar(
 
     result_right_to_left.reverse();
     build_cigar(&result_right_to_left)
+}
+
+/// Count read/reference mismatches across `cigar`'s alignment blocks,
+/// with the read's first aligned base at `ref_bases[read_start]`. Used as
+/// a debug invariant: left-alignment is a lossless re-placement of the
+/// same indels, so it must leave the mismatch count unchanged. Mirrors
+/// freebayes' `countMismatches`.
+pub(super) fn count_mismatches(
+    cigar: &[CigarOp],
+    ref_bases: &[u8],
+    read_seq: &[u8],
+    read_start: usize,
+) -> usize {
+    let mut sp = read_start;
+    let mut rp = 0usize;
+    let mut mismatches = 0usize;
+    for &op in cigar {
+        match op {
+            CigarOp::Match(n) | CigarOp::SeqMatch(n) | CigarOp::SeqMismatch(n) => {
+                for _ in 0..n {
+                    if sp >= ref_bases.len() || rp >= read_seq.len() {
+                        return mismatches;
+                    }
+                    if read_seq[rp] != ref_bases[sp] {
+                        mismatches += 1;
+                    }
+                    sp += 1;
+                    rp += 1;
+                }
+            }
+            CigarOp::Deletion(n) | CigarOp::Skip(n) => sp += n as usize,
+            CigarOp::Insertion(n) | CigarOp::SoftClip(n) => rp += n as usize,
+            CigarOp::HardClip(_) | CigarOp::Padding(_) => {}
+        }
+    }
+    mismatches
 }
 
 #[cfg(test)]

@@ -100,6 +100,21 @@ Distilled, the learnings that change the plan:
    `alignment_start` (GATK), reconciled with our existing first/last-op
    indel rejection.
 
+## Decision: ref+read dual check (Option A)
+
+The shift core requires the moved base to match **both the reference and
+the read** (what freebayes and GATK do), rather than reference-only
+(`bcftools norm`). The two agree whenever the read matches the reference
+through the repeat — i.e. on every clean repeat-region indel, which is
+the consolidation case — and diverge only when a read carries a mismatch
+inside the repeat. There, Option A stays faithful to the read (never
+records an indel the read's own bases contradict, upholding the `.psp`
+faithfulness principle) and refuses to roll over a sequencing error;
+reference-only would not. Revisiting reference-only is a **data-driven
+follow-up gated on the HG002 numbers** (only relevant if reads with
+frequent in-repeat sequencing errors are shown to lose recall), not a
+now decision.
+
 ## Scope
 
 In:
@@ -242,18 +257,25 @@ inserted sequence. No separate rotation step is needed.
 
 ## Phasing (incremental)
 
-1. **Pure routine + tests.** Port `left_align_cigar` /
-   `normalize_alleles` into a new module; exhaustive unit tests against
-   the canonical cases listed in Scope. No walker wiring.
-2. **Admit-time wiring.** Thread the fetcher to `admit_read`, rewrite
-   `read.cigar` (+ leading-deletion position bump), fast-path skip,
-   debug mismatch-invariant assert. Cursor unchanged; cursor/oracle
-   parity tests on normalized fixtures.
-3. **Walker + integration.** Repeat-fixture collapse test; review the
-   deliberate output diffs on the existing pileup/cohort integration
-   fixtures (normalization *changes* output where repeats exist — not a
-   byte-identical gate); HG002 indel-recall re-measurement noted as the
-   downstream acceptance signal.
+1. **Pure routine + tests.** ✅ Done (commit `db4acc9`). Ported
+   `left_align_cigar` / `normalize_alleles` + a CIGAR builder into
+   `src/pileup/walker/indel_norm.rs`; 10 unit tests over the canonical
+   cases. No walker wiring.
+2. **Admit-time wiring.** ✅ Done. Threaded the fetcher to `admit_read`,
+   rewrite `read.cigar` (+ leading-deletion position bump) in
+   `normalize_read_indels`, fast-path skip for indel-free reads, debug
+   mismatch-invariant assert (`count_mismatches`). Cursor unchanged.
+   Two walker-level **consolidation tests** (deletion + insertion at
+   different CIGAR offsets collapse to one allele with summed support)
+   landed here as the end-to-end proof. Length validation reordered
+   before normalization so malformed reads still error cleanly; one
+   degenerate widening-test fixture changed from a pure-`A` homopolymer
+   to a non-rollable deletion context.
+3. **Integration + benchmark.** Review the deliberate output diffs on
+   real pileup/cohort data (normalization *changes* output where repeats
+   exist — not a byte-identical gate; the synthetic integration fixtures
+   showed no drift); HG002 indel-recall re-measurement is the downstream
+   acceptance signal.
 
 Pause between phases per the project's incremental-steps convention.
 
