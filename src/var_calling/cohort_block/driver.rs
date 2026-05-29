@@ -100,6 +100,15 @@ pub struct ChunkDriverParams {
     /// workload from PSP block size + variant density. See
     /// [the Phase B prereq plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md).
     pub target_variants_per_chunk: u32,
+    /// Number of parallel worker windows per chunk.
+    /// [`fix_boundaries`](super::pre_pass::fix_boundaries) places
+    /// `target_window_count - 1` internal boundaries inside each
+    /// chunk's `[range.start, safe_end)` so the
+    /// [`WorkerPool`](super::worker::WorkerPool) can dispatch the
+    /// per-window math concurrently. `1` (default) preserves the
+    /// sequential single-window-per-chunk behaviour byte-for-byte.
+    /// See [the Phase B plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md).
+    pub target_window_count: usize,
 }
 
 /// Per-driver counters; the shape mirrors
@@ -546,7 +555,13 @@ where
         stats.chunks_loaded += 1;
         stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
-        match fix_boundaries(chunk, carryover, fix_scratch, max_group_span, 1) {
+        match fix_boundaries(
+            chunk,
+            carryover,
+            fix_scratch,
+            max_group_span,
+            params.target_window_count.max(1),
+        ) {
             Ok(()) => break,
             Err(FixBoundariesError::NoSafeGap { .. }) if attempt_span < max_span => {
                 // Retry with double the span. Restore the carryover

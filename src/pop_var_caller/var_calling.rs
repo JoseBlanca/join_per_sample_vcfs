@@ -387,6 +387,10 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         min_mapq_diff_t: args.cohort.min_mapq_diff_t,
         chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
         target_variants_per_chunk: args.target_variants_per_chunk,
+        // Phase B step 5 will wire `--worker-windows-per-chunk` to
+        // this field. For now the driver runs one window per chunk
+        // (the prior sequential behaviour).
+        target_window_count: 1,
     };
     let chunk_stats = drive_cohort_chunked(
         &args.psp_files,
