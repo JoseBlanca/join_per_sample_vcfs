@@ -9,9 +9,7 @@
 # outputs under OUT_ROOT (ours / gatk / freebayes), skipping any absent.
 #
 # Method (bcftools): both query and truth are restricted to the BED,
-# left-aligned and biallelic-split (`norm -m -any`), filtered to alleles
-# the sample actually carries (`view -c 1` — drops the 0/0 records that
-# splitting a multiallelic site can leave behind), then class-filtered
+# left-aligned and biallelic-split (`norm -m -any`), then class-filtered
 # and intersected (`isec`, matching on POS+REF+ALT). So this scores
 # ALLELE concordance, not genotype concordance — a 0/1-vs-1/1 mismatch at
 # a correctly-called site still counts as a TP. (Genotype-level eval
@@ -60,14 +58,9 @@ trap 'rm -rf "$TMP"' EXIT
 # the truth call add `-f PASS`.
 normalize() {
     local src="$1" cls="$2" out="$3"; shift 3
-    # -c 1 (min allele count 1) drops alleles no sample carries — after
-    # `norm -m -any` splits a multiallelic record, any ALT the sample
-    # doesn't have becomes a 0/0 biallelic record; keeping those would
-    # count phantom alleles as calls. Standard carried-allele semantics
-    # (what hap.py / vcfeval do).
     bcftools view "$@" -T "$BED" "$src" -Ou \
       | bcftools norm -f "$REFERENCE" -m -any -Ou 2>/dev/null \
-      | bcftools view -v "$cls" -c 1 -Oz -o "$out"
+      | bcftools view -v "$cls" -Oz -o "$out"
     bcftools index -t "$out"
 }
 
