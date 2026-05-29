@@ -558,6 +558,74 @@ fn estimate_contamination_then_var_calling_chain() {
     assert!(body.contains("\tNA00001\tNA00002"));
 }
 
+/// **Variant-bounded chunk loading byte-identity on
+/// estimate-contamination.** Same fixture as
+/// `estimate_contamination_then_var_calling_chain`, run twice:
+/// once with `target_variants_per_chunk = 0` (legacy BP-only
+/// loop) and once with `target_variants_per_chunk = 1` (forces
+/// the loader's extension loop to engage). The emitted
+/// `.estcontam` TOML body must match — the variant-bounded knob
+/// is a workload-sizing knob, not a correctness knob.
+///
+/// Phase B prereq — see
+/// `doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b2_estimate_contamination.md`.
+#[test]
+fn estimate_contamination_byte_identical_across_target_variants_per_chunk() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    let long_ref = b"AAAAAAAAAAAAAAAAAAAA";
+    let reads_a = vec![
+        read_record("ra1", 10, long_ref),
+        read_record("ra2", 10, long_ref),
+        read_record("ra3", 10, long_ref),
+    ];
+    let reads_b = vec![
+        read_record("rb1", 10, long_ref),
+        read_record("rb2", 10, long_ref),
+        read_record("rb3", 10, long_ref),
+        read_record("rb4", 10, b"CAAAAAAAAAAAAAAAAAAA"),
+        read_record("rb5", 10, b"ACAAAAAAAAAAAAAAAAAA"),
+        read_record("rb6", 10, b"AACAAAAAAAAAAAAAAAAA"),
+        read_record("rb7", 10, b"AAACAAAAAAAAAAAAAAAA"),
+        read_record("rb8", 10, b"AAAACAAAAAAAAAAAAAAA"),
+    ];
+    let psp_a = make_psp_for_sample(dir.path(), &fasta, "NA00001", &reads_a);
+    let psp_b = make_psp_for_sample(dir.path(), &fasta, "NA00002", &reads_b);
+    let psps = vec![psp_a, psp_b];
+
+    let toml_default = dir.path().join("contam_target0.toml");
+    let toml_low = dir.path().join("contam_target1.toml");
+
+    let mut args_default =
+        estimate_contamination_args(fasta.clone(), toml_default.clone(), psps.clone());
+    args_default.target_variants_per_chunk = 0;
+    run_estimate_contamination(&args_default).expect("default-target run OK");
+
+    let mut args_low = estimate_contamination_args(fasta, toml_low.clone(), psps);
+    args_low.target_variants_per_chunk = 1;
+    run_estimate_contamination(&args_low).expect("low-target run OK");
+
+    let body_default = fs::read_to_string(&toml_default).expect("read default TOML");
+    let body_low = fs::read_to_string(&toml_low).expect("read low TOML");
+    // Strip the `created` timestamp + the `commandline` provenance
+    // line that differ between runs but don't carry the side-pass
+    // result. Any other drift signals a real correctness regression.
+    let strip_volatile = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("created = ") && !l.starts_with("commandline = "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip_volatile(&body_default),
+        strip_volatile(&body_low),
+        "--target-variants-per-chunk is a workload-sizing knob, not a \
+         correctness knob: changing it must never change the emitted \
+         .estcontam artefact body"
+    );
+}
+
 /// **M5 follow-up — FASTA → `.psp` MD5 mismatch.** Build a `.psp`
 /// whose header `chromosome.md5` is `WRONG_MD5` (forced via the
 /// CRAM `@SQ M5`), then run `run_var_calling` against the real
