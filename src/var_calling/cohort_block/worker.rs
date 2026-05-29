@@ -1,27 +1,21 @@
 //! Per-window variant-calling math.
 //!
-//! Phase A.1 layer 4 — column-native pipeline. The worker runs each
+//! Phase A.2 step 2 — column-native end-to-end. The worker runs each
 //! partition group through the three columnar kernels
 //! ([`unify_alleles_columnar`],
 //! [`project_scalars_columnar`],
-//! [`compute_log_likelihoods_columnar`]) and adapts their outputs into
-//! the row-shape
-//! [`MergedRecord`](crate::var_calling::per_group_merger::MergedRecord)
-//! that
-//! [`PosteriorEngine`](crate::var_calling::posterior_engine::PosteriorEngine)
-//! consumes for the EM, posterior, GQ, and QUAL passes. The
-//! row-shape
-//! [`PerGroupMerger`](crate::var_calling::per_group_merger::PerGroupMerger)
-//! is no longer on the production path — its emit was the
-//! `MergedRecord` shape that the EM still wants, so layer 4 keeps the
-//! type but builds it column-natively rather than by going through
-//! `MergedAlleleSet` + `ScalarProjection` + `compute_log_likelihoods`
-//! in the row pipeline. A future Phase A.2 step ports the EM to
-//! consume columnar slices directly.
+//! [`compute_log_likelihoods_columnar`]) and feeds the resulting
+//! column-native buffers straight into
+//! [`run_em_columnar`](crate::var_calling::posterior_engine::run_em_columnar)
+//! through borrowed slices + a [`ColumnarAllelesView`]. No row-shape
+//! `MergedRecord` is ever materialised on the production path.
+//! `PosteriorRecord` is still row-shape (the VCF writer's input);
+//! `Vec<MergedAllele>` is allocated once per group at emit time
+//! rather than at EM input time.
 //!
 //! The Phase A.0 row-shape adapter
-//! ([`build_overlapping_variant_group`]) is retained for use as the
-//! byte-identity oracle in the kernels' unit tests.
+//! ([`build_overlapping_variant_group`]) is retained `#[cfg(test)]`
+//! as the byte-identity oracle for the kernels' unit tests.
 
 use std::sync::Arc;
 
@@ -40,16 +34,17 @@ use crate::var_calling::cohort_block::kernels::unify_alleles::{
 };
 use crate::var_calling::cohort_block::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
-    CompoundConstituent, DegeneracyKind, LikelihoodContext, MergedAllele, MergedRecord,
-    PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
+    CompoundConstituent, DegeneracyKind, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
+    PerGroupMergerError, SharedRefFetcher,
 };
+use crate::var_calling::posterior_engine::backends::InterpUnivariateSimdMath;
 use crate::var_calling::posterior_engine::{
-    PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
+    AllelesView, EmInputs, PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
+    RecordScratch, run_em_columnar,
 };
 #[cfg(test)]
 use crate::{
-    pileup_record::PileupRecord,
-    var_calling::per_position_merger::PerPositionPileups,
+    pileup_record::PileupRecord, var_calling::per_position_merger::PerPositionPileups,
     var_calling::variant_grouping::OverlappingVariantGroup,
 };
 
@@ -60,7 +55,7 @@ use crate::{
 /// [`Self::empty`] and let the first call populate it; subsequent
 /// calls only grow buffers when a group exceeds the prior high-water
 /// mark.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ColumnarPipelineScratch {
     unify: UnifyAllelesScratch,
     unified: UnifiedAllelesColumns,
@@ -71,10 +66,26 @@ pub struct ColumnarPipelineScratch {
     /// `chain_anchor_flags[sample × n_alleles + allele]` is `true` iff
     /// the allele is a compound and the sample is chain-broken at it.
     /// Refilled per group; capacity carries across groups.
+    ///
+    /// Built once and used for two distinct downstream consumers:
+    /// 1. EM input validation
+    ///    ([`run_em_columnar`](crate::var_calling::posterior_engine::run_em_columnar)
+    ///    checks its length).
+    /// 2. The emitted [`PosteriorRecord`]'s `chain_anchor_flags`
+    ///    field, which the VCF writer reads for the `CA` flag.
     chain_anchor_flags: Vec<bool>,
     /// REF byte buffer for the group span. Refilled by
     /// [`ChromRefFetcher::fetch_into`] per group; capacity carries.
     ref_buf: Vec<u8>,
+    /// Per-engine EM scratch — owned at the worker level (rather
+    /// than inside a `PosteriorEngine` instance) so the chunk loop
+    /// reuses the same EM intermediates across every group.
+    record_scratch: RecordScratch,
+    /// Math backend instance. `InterpUnivariateSimdMath` is a unit
+    /// struct so this holds no data; we keep it as a field for
+    /// symmetry with the Phase A.1 design where the backend was a
+    /// `PosteriorEngine` parameter.
+    math: InterpUnivariateSimdMath,
     /// Number of groups skipped because
     /// `unified.alleles.len() > cfg.max_alleles_lh_calc`. Accumulated
     /// across every `run_window` call; the driver reads + clears via
@@ -85,6 +96,40 @@ pub struct ColumnarPipelineScratch {
     /// the row-shape merger reports this in `allele_lh_cap_hit:
     /// alleles_total=N`.
     lh_cap_alleles_in_skipped: u64,
+}
+
+/// [`AllelesView`] over [`UnifiedAllelesColumns`]. Phase A.2 step 2:
+/// lets the column-native worker feed `run_em_columnar` without
+/// allocating a row-shape `Vec<MergedAllele>` for the EM's
+/// per-allele queries. The `Vec<MergedAllele>` is still allocated —
+/// but only at the end of the group's pipeline, for the emitted
+/// [`PosteriorRecord`] that the VCF writer reads.
+pub(crate) struct ColumnarAllelesView<'a> {
+    columns: &'a UnifiedAllelesColumns,
+}
+
+impl<'a> ColumnarAllelesView<'a> {
+    pub(crate) fn new(columns: &'a UnifiedAllelesColumns) -> Self {
+        Self { columns }
+    }
+}
+
+impl AllelesView for ColumnarAllelesView<'_> {
+    fn len(&self) -> usize {
+        self.columns.n_alleles()
+    }
+    fn ref_len(&self) -> usize {
+        // REF is allele 0 by construction; its bytes are the
+        // projected-onto-group-span sequence, which equals the
+        // group's REF span length.
+        self.columns.allele_seq(0).len()
+    }
+    fn seq_len(&self, allele_idx: usize) -> usize {
+        self.columns.allele_seq(allele_idx).len()
+    }
+    fn is_compound(&self, allele_idx: usize) -> bool {
+        self.columns.is_compound[allele_idx]
+    }
 }
 
 impl ColumnarPipelineScratch {
@@ -140,86 +185,41 @@ pub fn run_window(
         return Ok(());
     }
 
-    let iter = ColumnarMergedRecordsIter {
-        chunk,
-        partition,
-        ref_fetcher: &*ref_fetcher,
-        cfg: per_group_config,
-        scratch,
-        cursor: 0,
-    };
-    let engine = PosteriorEngine::with_config(iter, posterior_config);
-    for record in engine {
-        output.push(record?);
+    for g in 0..partition.n_groups() {
+        if let Some(record) = build_posterior_record_columnar(
+            chunk,
+            partition,
+            g,
+            &*ref_fetcher,
+            &per_group_config,
+            &posterior_config,
+            scratch,
+        )? {
+            output.push(record);
+        }
     }
     Ok(())
 }
 
-/// Iterator over the partition's groups; each `next()` runs layers
-/// 1+2+3 + builds a `MergedRecord` from the columnar outputs.
-///
-/// Borrowed-scratch lifetime: the iterator holds a `&mut` into the
-/// driver-owned [`ColumnarPipelineScratch`]; the borrow is released
-/// when the iterator is dropped at the end of the engine drain.
-struct ColumnarMergedRecordsIter<'a> {
-    chunk: &'a MaterialisedChunk,
-    partition: &'a WindowPartition,
-    ref_fetcher: &'a dyn ChromRefFetcher,
-    cfg: PerGroupMergerConfig,
-    scratch: &'a mut ColumnarPipelineScratch,
-    cursor: usize,
-}
-
-impl Iterator for ColumnarMergedRecordsIter<'_> {
-    type Item = Result<MergedRecord, PerGroupMergerError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.cursor >= self.partition.n_groups() {
-                return None;
-            }
-            let g = self.cursor;
-            self.cursor += 1;
-            match build_merged_record_columnar(
-                self.chunk,
-                self.partition,
-                g,
-                self.ref_fetcher,
-                &self.cfg,
-                self.scratch,
-            ) {
-                Ok(Some(rec)) => return Some(Ok(rec)),
-                Ok(None) => continue,
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-}
-
-/// Run layers 1+2+3 on group `g` and adapt the columnar outputs into
-/// a row-shape [`MergedRecord`] for the EM. Reuses every buffer in
-/// `scratch`; per-group allocations are limited to the
-/// [`MergedRecord`]'s owned `Vec`s.
-///
-/// Returns `Ok(None)` for groups the row-shape merger would skip:
-/// post-unification `unified.alleles.len() < 2` (REF-only after the
-/// max-alleles cap dropped every ALT into the OTHER pool) and
-/// `unified.alleles.len() > cfg.max_alleles_lh_calc` (LH-cap bind in
-/// pathological low-complexity regions). The downstream
-/// `PosteriorEngine` does have a `trivial_posterior_record` branch
-/// for the former case, but emitting through it would let the
-/// driver's hom-ref counter inflate above the row-shape baseline —
-/// the skip here mirrors `PerGroupMerger::process_group`'s
-/// `Ok(None)` returns so the per-category counts stay byte-identical
-/// against `main`.
-fn build_merged_record_columnar(
+/// Run layers 1+2+3 on group `g`, drive the EM via
+/// [`run_em_columnar`], and emit a [`PosteriorRecord`] for the VCF
+/// writer. Returns `Ok(None)` for groups the row-shape merger would
+/// skip: post-unification `unified.alleles.len() < 2` (REF-only
+/// after the max-alleles cap dropped every ALT into the OTHER pool)
+/// and `unified.alleles.len() > cfg.max_alleles_lh_calc` (LH-cap
+/// bind in pathological low-complexity regions). The skip mirrors
+/// `PerGroupMerger::process_group`'s `Ok(None)` returns so the
+/// per-category counts stay byte-identical against `main`.
+#[allow(clippy::too_many_arguments)]
+fn build_posterior_record_columnar(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
     group_idx: usize,
     ref_fetcher: &dyn ChromRefFetcher,
-    cfg: &PerGroupMergerConfig,
+    per_group_config: &PerGroupMergerConfig,
+    posterior_config: &PosteriorEngineConfig,
     scratch: &mut ColumnarPipelineScratch,
-) -> Result<Option<MergedRecord>, PerGroupMergerError> {
+) -> Result<Option<PosteriorRecord>, PosteriorEngineError> {
     let chrom_id = chunk.chrom_id;
     let group_start = partition.group_starts[group_idx];
     let group_end = partition.group_ends[group_idx];
@@ -237,7 +237,7 @@ fn build_merged_record_columnar(
         group_idx,
         &scratch.ref_buf,
         n_samples,
-        cfg.max_alleles,
+        per_group_config.max_alleles,
         &mut scratch.unify,
         &mut scratch.unified,
     )
@@ -246,7 +246,7 @@ fn build_merged_record_columnar(
     let n_alleles = scratch.unified.n_alleles();
 
     // Row-shape parity — see [`PerGroupMerger::process_group`].
-    if n_alleles > cfg.max_alleles_lh_calc {
+    if n_alleles > per_group_config.max_alleles_lh_calc {
         scratch.lh_cap_groups_skipped += 1;
         scratch.lh_cap_alleles_in_skipped += n_alleles as u64;
         return Ok(None);
@@ -267,11 +267,11 @@ fn build_merged_record_columnar(
     .map_err(|e| project_scalars_error_to_merger(chrom_id, group_start, group_end, e))?;
 
     // Layer 3 — per-(sample, genotype) log-likelihood.
-    let ctx = LikelihoodContext {
+    let lh_ctx = LikelihoodContext {
         chrom_id,
         start: group_start,
         end: group_end,
-        ploidy: cfg.ploidy,
+        ploidy: per_group_config.ploidy,
     };
     compute_log_likelihoods_columnar(
         chunk,
@@ -279,7 +279,7 @@ fn build_merged_record_columnar(
         group_idx,
         &scratch.unified,
         &scratch.projection,
-        &ctx,
+        &lh_ctx,
         &[],
         &mut scratch.log_likelihoods,
     )
@@ -288,6 +288,9 @@ fn build_merged_record_columnar(
     // chain_anchor_flags table (row-shape boolean flat): `true` iff
     // the allele is a compound AND the sample's chain_anchor_count is
     // zero. Matches `build_chain_anchor_flags` in `per_group_merger`.
+    // Built here for two consumers: `run_em_columnar`'s length-check
+    // validation + the emitted `PosteriorRecord.chain_anchor_flags`
+    // field that the VCF writer reads for the `CA` flag.
     scratch.chain_anchor_flags.clear();
     scratch
         .chain_anchor_flags
@@ -303,10 +306,37 @@ fn build_merged_record_columnar(
         }
     }
 
-    // Build the row-shape `Vec<MergedAllele>` from
-    // `UnifiedAllelesColumns`. Walks the per-allele constituent
-    // pointers and clones the seq bytes (PosteriorRecord ends up
-    // owning them, so the clone is just timing — not extra).
+    // Layer 4 — EM, mixture pre-pass, posterior summarisation,
+    // exact-AF QUAL. Reads the layer 1/2/3 outputs as borrowed
+    // slices through the `EmInputs` bundle.
+    let n_genotypes = scratch.log_likelihoods.n_genotypes;
+    let locus = crate::var_calling::posterior_engine::RecordLocus {
+        chrom_id,
+        start: group_start,
+        end: group_end,
+    };
+    let em_outputs = {
+        let view = ColumnarAllelesView::new(&scratch.unified);
+        let inputs = EmInputs {
+            locus,
+            ploidy: per_group_config.ploidy,
+            n_samples,
+            n_genotypes,
+            alleles: &view,
+            scalars: &scratch.projection.scalars,
+            log_likelihoods: &scratch.log_likelihoods.log_likelihoods,
+            chain_anchor_flags_for_validation: &scratch.chain_anchor_flags,
+        };
+        run_em_columnar(
+            inputs,
+            posterior_config,
+            &scratch.math,
+            &mut scratch.record_scratch,
+        )?
+    };
+
+    // Build the row-shape `Vec<MergedAllele>` for the emitted
+    // `PosteriorRecord` at emit time, not at EM input time.
     let mut alleles: Vec<MergedAllele> = Vec::with_capacity(n_alleles);
     for a in 0..n_alleles {
         let lo = scratch.unified.constituent_offsets[a] as usize;
@@ -324,18 +354,22 @@ fn build_merged_record_columnar(
         });
     }
 
-    Ok(Some(MergedRecord {
-        chrom_id,
-        start: group_start,
-        end: group_end,
+    Ok(Some(PosteriorRecord {
+        locus,
         alleles,
-        ploidy: cfg.ploidy,
+        ploidy: per_group_config.ploidy,
         n_samples,
-        n_genotypes: scratch.log_likelihoods.n_genotypes,
+        n_genotypes: em_outputs.n_genotypes,
+        allele_frequencies: em_outputs.allele_frequencies,
+        compound_frequencies: em_outputs.compound_frequencies,
+        posteriors: em_outputs.posteriors,
+        best_genotype: em_outputs.best_genotype,
+        gq_phred: em_outputs.gq_phred,
+        qual_phred: em_outputs.qual_phred,
         scalars: scratch.projection.scalars.clone(),
         other_scalars: scratch.projection.other_scalars.clone(),
         chain_anchor_flags: scratch.chain_anchor_flags.clone(),
-        log_likelihoods: scratch.log_likelihoods.log_likelihoods.clone(),
+        diagnostics: em_outputs.diagnostics,
     }))
 }
 
@@ -344,13 +378,14 @@ fn ref_fetch_error_to_merger(
     start: u32,
     end: u32,
     source: ChromRefFetchError,
-) -> PerGroupMergerError {
+) -> PosteriorEngineError {
     PerGroupMergerError::RefFetch {
         chrom_id,
         start,
         end,
         source: std::io::Error::other(source.to_string()),
     }
+    .into()
 }
 
 fn unify_error_to_merger(
@@ -358,8 +393,8 @@ fn unify_error_to_merger(
     _group_start: u32,
     _group_end: u32,
     e: UnifyAllelesError,
-) -> PerGroupMergerError {
-    match e {
+) -> PosteriorEngineError {
+    let inner = match e {
         UnifyAllelesError::MissingCompoundAlleleBytes {
             chrom_id,
             group_start,
@@ -373,7 +408,8 @@ fn unify_error_to_merger(
             record_idx: record_idx as usize,
             local_allele_idx: local_allele_idx as usize,
         },
-    }
+    };
+    inner.into()
 }
 
 fn project_scalars_error_to_merger(
@@ -381,10 +417,10 @@ fn project_scalars_error_to_merger(
     _group_start: u32,
     _group_end: u32,
     e: ProjectScalarsError,
-) -> PerGroupMergerError {
+) -> PosteriorEngineError {
     use crate::var_calling::cohort_block::kernels::project_scalars::CompoundPhase as CnPhase;
     use crate::var_calling::per_group_merger::CompoundPhase as RowPhase;
-    match e {
+    let inner = match e {
         ProjectScalarsError::ZeroObservationConstituent {
             chrom_id,
             group_start,
@@ -422,7 +458,8 @@ fn project_scalars_error_to_merger(
             allele_idx,
             inter,
         },
-    }
+    };
+    inner.into()
 }
 
 fn compute_ll_error_to_merger(
@@ -430,8 +467,8 @@ fn compute_ll_error_to_merger(
     group_start: u32,
     group_end: u32,
     e: ComputeLogLikelihoodsError,
-) -> PerGroupMergerError {
-    match e {
+) -> PosteriorEngineError {
+    let inner = match e {
         ComputeLogLikelihoodsError::DegenerateLikelihood {
             chrom_id,
             start,
@@ -450,7 +487,7 @@ fn compute_ll_error_to_merger(
         ComputeLogLikelihoodsError::NAllelesExceedsBitmask { n_alleles } => {
             // The row-shape kernel doesn't surface this as an Error;
             // its equivalent invariant fires `assert!` inside
-            // `standard_log_likelihood`. The Phase-A.1 cap (set
+            // `standard_log_likelihood`. The Phase A.1 cap (set
             // upstream in `unify_alleles_columnar`) is bounded by
             // `MAX_BITMASK_ALLELES`, so the kernel surfacing this
             // variant means the caller passed `cfg.max_alleles >
@@ -462,12 +499,6 @@ fn compute_ll_error_to_merger(
             // chosen as the "internal-bug, finite formula went
             // wrong" sentinel — it matches the same diagnostic
             // family the row-shape kernel uses for self-reports.
-            //
-            // The diagnostic guard above this point in the worker
-            // would clamp `max_alleles` to ≤ `MAX_BITMASK_ALLELES`
-            // before we ever reach here; if a future code path
-            // bypasses that guard, the assert-equivalent surfaces
-            // via this variant.
             let _ = n_alleles;
             PerGroupMergerError::DegenerateLikelihood {
                 chrom_id,
@@ -478,7 +509,8 @@ fn compute_ll_error_to_merger(
                 kind: DegeneracyKind::NaN,
             }
         }
-    }
+    };
+    inner.into()
 }
 
 /// Build one [`OverlappingVariantGroup`] from group `g` of
@@ -594,6 +626,7 @@ mod tests {
     };
     use crate::var_calling::cohort_block::test_helpers::{loaded_chunk, record, ref_plus_alt};
     use crate::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
+    use crate::var_calling::posterior_engine::PosteriorEngine;
     use crate::var_calling::variant_grouping::GrouperError;
 
     /// Build a chunk + partition for the worker's adapter tests.

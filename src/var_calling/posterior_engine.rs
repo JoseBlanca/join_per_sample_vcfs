@@ -1746,7 +1746,7 @@ pub(crate) struct RecordScratch {
 
 impl RecordScratch {
     /// All Vecs empty; capacity grows on first `resize_to` call.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             p_effective: Vec::new(),
             log_p_effective: Vec::new(),
@@ -1779,7 +1779,15 @@ impl RecordScratch {
             mixture_mean_err_all: Vec::new(),
         }
     }
+}
 
+impl Default for RecordScratch {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl RecordScratch {
     /// Size every buffer to the current record's shape. `Vec::resize`
     /// preserves capacity above the high-water mark, so steady-state
     /// records of the same shape allocate nothing.
