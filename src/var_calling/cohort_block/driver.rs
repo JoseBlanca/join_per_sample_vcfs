@@ -31,6 +31,7 @@ use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::fasta::StreamingChromRefFetcher;
@@ -587,9 +588,15 @@ where
     let n_samples = chunk.n_samples();
     worker_pool.ensure_capacity(n_windows.max(1), n_samples);
 
-    // ── Per-window math (sequential today; Phase B step 4 swaps
-    //    this loop for a rayon par_iter over `worker_pool.slots`). ──
-    for (window, slot) in windows.iter().zip(worker_pool.slots.iter_mut()) {
+    // ── Phase 1 (sequential): partition + prefetch REF bytes per
+    //    window. The fetcher is `!Sync` so the prefetch can't run
+    //    in parallel; the partition could, but it's cheap relative
+    //    to the math and parallelising it would add rayon overhead
+    //    for little gain. ──
+    for (window, slot) in windows
+        .iter()
+        .zip(worker_pool.slots.iter_mut().take(n_windows))
+    {
         partition_window(
             chunk,
             window,
@@ -603,16 +610,29 @@ where
             &*shared_fetcher,
             &mut slot.pre_fetched_ref_bytes,
         )?;
-        run_window(
-            chunk,
-            &slot.partition,
-            &slot.pre_fetched_ref_bytes,
-            params.per_group_cfg,
-            params.posterior_cfg.clone(),
-            &mut slot.scratch,
-            &mut slot.output_buf,
-        )?;
     }
+
+    // ── Phase 2 (parallel): the per-window math (layers 1+2+3 + EM
+    //    + posterior summarisation + QUAL). Each slot's
+    //    `pre_fetched_ref_bytes` + `scratch` + `output_buf` are
+    //    disjoint, so the dispatch is structurally
+    //    Send-safe. rayon's `par_iter_mut().try_for_each` collects
+    //    the first error and propagates. ──
+    let per_group_cfg = params.per_group_cfg;
+    let posterior_cfg = &params.posterior_cfg;
+    worker_pool.slots[..n_windows]
+        .par_iter_mut()
+        .try_for_each(|slot| {
+            run_window(
+                chunk,
+                &slot.partition,
+                &slot.pre_fetched_ref_bytes,
+                per_group_cfg,
+                posterior_cfg.clone(),
+                &mut slot.scratch,
+                &mut slot.output_buf,
+            )
+        })?;
 
     // ── Sequential drain in window order — preserves the prior
     //    per-record emit order even when step 4 runs the workers
