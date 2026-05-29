@@ -236,7 +236,7 @@ where
     let max_attempt_end = range_start.saturating_add(max_span);
 
     scratch.clear();
-    out.clear_data();
+    out.clear();
     out.chrom_id = chrom_id;
     // Make sure the output is sized for the cohort: a fresh
     // `MaterialisedChunk` may have come in with no samples slotted.

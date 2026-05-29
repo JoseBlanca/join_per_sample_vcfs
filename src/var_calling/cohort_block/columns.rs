@@ -469,7 +469,13 @@ impl MaterialisedChunk {
     /// allocated column capacity. The chunk loader calls this before
     /// loading the next chunk; the driver holds one persistent
     /// `MaterialisedChunk` across iterations.
-    pub fn clear_data(&mut self) {
+    ///
+    /// Mi2: named `clear()` to match the module-wide convention
+    /// (`SampleColumns::clear`, `WindowPartition::clear`,
+    /// `ChunkLoadScratch::clear`, etc.). Previously `clear_data` —
+    /// the `_data` suffix carried no meaning the type didn't already
+    /// imply.
+    pub fn clear(&mut self) {
         self.chrom_id = 0;
         self.range = 0..0;
         self.safe_end = 0;
