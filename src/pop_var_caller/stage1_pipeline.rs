@@ -140,6 +140,14 @@ where
         Option<AlignmentInputError>,
     ) = if no_baq {
         // No-BAQ: passthrough map directly off the reader.
+        //
+        // NB: indel left-alignment lives in the BAQ read-prep stage
+        // (`BaqEngine::process`, reusing the BAQ ref window), so `--no-baq`
+        // also bypasses normalization — it cannot reuse `walker_fetcher`
+        // (a forward-only streaming fetcher the walker is concurrently
+        // driving at different positions). `--no-baq` is a BAQ A/B-testing
+        // bypass; production/benchmark runs keep BAQ on and get
+        // normalization.
         let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
             r.map(|read| {
                 // PANIC-FREE: `ref_id` is the CRAM-side contig id;

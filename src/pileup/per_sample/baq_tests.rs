@@ -349,6 +349,95 @@ fn engine_happy_path_match_only() {
     }
 }
 
+/// Helper: run one read through a fresh engine over `chrom` and return
+/// the normalized `PreparedRead`, panicking on a BAQ skip.
+fn process_one(chrom: &[u8], read: MappedRead) -> PreparedRead {
+    let (_dir, mut fetcher) = fetcher_from_chrom_bytes(chrom);
+    let mut engine = BaqEngine::new(BaqConfig::default());
+    match engine.process(read, &mut fetcher) {
+        BaqOutcome::Capped(prepared) => prepared,
+        BaqOutcome::Skipped(reason) => panic!("expected Capped, got Skipped({reason:?})"),
+    }
+}
+
+#[test]
+fn engine_left_aligns_homopolymer_deletion() {
+    // chrom: ...T G AAAAA C T... — the read deletes one A but the aligner
+    // placed it at the rightmost A (5M1D1M). BAQ prep must left-align it
+    // to the leftmost A (1M1D5M) so it carries a canonical anchor.
+    let chrom = b"TTTTTTTTTTTTTTTTTTTTGAAAAACTTTTTTTTTTTTTTTTTTTT";
+    let read = synthetic_read(
+        0,
+        21, // 1-based: the G
+        60,
+        vec![CigarOp::Match(5), CigarOp::Deletion(1), CigarOp::Match(1)],
+        b"GAAAAC".to_vec(),
+        vec![40; 6],
+    );
+    let prepared = process_one(chrom, read);
+    assert_eq!(
+        prepared.cigar,
+        vec![CigarOp::Match(1), CigarOp::Deletion(1), CigarOp::Match(5)],
+    );
+    assert_eq!(
+        prepared.alignment_start, 21,
+        "start unchanged (no end strip)"
+    );
+}
+
+#[test]
+fn engine_left_aligns_homopolymer_insertion() {
+    // chrom: ...T G AAAA C T... — the read inserts one A at the rightmost
+    // position (5M1I1M); prep left-aligns it to the leftmost (1M1I5M).
+    let chrom = b"TTTTTTTTTTTTTTTTTTTTGAAAACTTTTTTTTTTTTTTTTTTTT";
+    let read = synthetic_read(
+        0,
+        21,
+        60,
+        vec![CigarOp::Match(5), CigarOp::Insertion(1), CigarOp::Match(1)],
+        b"GAAAAAC".to_vec(),
+        vec![40; 7],
+    );
+    let prepared = process_one(chrom, read);
+    assert_eq!(
+        prepared.cigar,
+        vec![CigarOp::Match(1), CigarOp::Insertion(1), CigarOp::Match(5)],
+    );
+}
+
+#[test]
+fn engine_normalizes_same_deletion_to_one_anchor() {
+    // The core recall fix at the prep layer: two reads carry the same
+    // biological deletion at opposite ends of the homopolymer (5M1D1M vs
+    // 1M1D5M). After prep both carry the *same* normalized CIGAR and
+    // start, so the walker buckets them onto one allele.
+    let chrom = b"TTTTTTTTTTTTTTTTTTTTGAAAAACTTTTTTTTTTTTTTTTTTTT";
+    let right = synthetic_read(
+        0,
+        21,
+        60,
+        vec![CigarOp::Match(5), CigarOp::Deletion(1), CigarOp::Match(1)],
+        b"GAAAAC".to_vec(),
+        vec![40; 6],
+    );
+    let left = synthetic_read(
+        0,
+        21,
+        60,
+        vec![CigarOp::Match(1), CigarOp::Deletion(1), CigarOp::Match(5)],
+        b"GAAAAC".to_vec(),
+        vec![40; 6],
+    );
+    let pr = process_one(chrom, right);
+    let pl = process_one(chrom, left);
+    assert_eq!(pr.cigar, pl.cigar, "both reads normalize to one anchor");
+    assert_eq!(pr.alignment_start, pl.alignment_start);
+    assert_eq!(
+        pr.cigar,
+        vec![CigarOp::Match(1), CigarOp::Deletion(1), CigarOp::Match(5)],
+    );
+}
+
 #[test]
 fn engine_mate_role_first_of_pair() {
     let (_dir, mut fetcher) = fetcher_from_chrom_bytes(b"ACGTACGTACGT");
@@ -623,13 +712,16 @@ fn engine_happy_path_with_mixed_cigar() {
             CigarOp::Match(2),
             CigarOp::SoftClip(2),
         ],
-        b"NNACGTACTACGCGNN".to_vec(),
-        vec![40; 16],
+        // Read-consuming ops total 2+5+1+3+2+2 = 15 bases; seq/qual must
+        // match (an earlier 16-byte seq was an off-by-one the walker's
+        // length check — and now indel normalization — would reject).
+        b"NNACGTACGTAGTNN".to_vec(),
+        vec![40; 15],
     );
     let mut engine = BaqEngine::new(BaqConfig::default());
     match engine.process(read, &mut fetcher) {
         BaqOutcome::Capped(p) => {
-            assert_eq!(p.bq_baq.len(), 16);
+            assert_eq!(p.bq_baq.len(), 15);
             // Ref span (counts M, =, X, D, N): 5 + 3 + 2 + 2 = 12.
             assert_eq!(p.alignment_end, 12);
         }

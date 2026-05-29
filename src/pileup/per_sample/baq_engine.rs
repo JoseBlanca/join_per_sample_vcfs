@@ -10,6 +10,7 @@ use crate::bam::alignment_input::{
     FLAG_FIRST_OF_PAIR, FLAG_PAIRED, FLAG_REVERSE_STRAND, FLAG_UNMAPPED, MappedRead,
 };
 use crate::fasta::ManualEvictChromRefFetcher;
+use crate::pileup::walker::indel_norm;
 use crate::pileup::walker::{CigarOp, MateRole, PreparedRead};
 
 use crate::baq::{BaqConfig, ProbalnScratch, probaln_glocal};
@@ -78,6 +79,10 @@ pub struct BaqEngine {
     encoded_ref: Vec<u8>,
     encoded_query: Vec<u8>,
     bq_baq_buf: Vec<u8>,
+    /// Raw (un-encoded) ASCII copy of the fetched reference window, kept
+    /// only for indel left-alignment (which compares reference vs read
+    /// bases). Filled lazily — only for reads that carry an indel.
+    raw_ref: Vec<u8>,
 }
 
 impl BaqEngine {
@@ -92,6 +97,7 @@ impl BaqEngine {
             encoded_ref: Vec::new(),
             encoded_query: Vec::new(),
             bq_baq_buf: Vec::new(),
+            raw_ref: Vec::new(),
         }
     }
 
@@ -140,6 +146,12 @@ impl BaqEngine {
             Err(_) => return BaqOutcome::Skipped(BaqSkipReason::ChromIdOutOfRange),
         };
 
+        // Indel left-alignment (architecture spec §"Indel normalization")
+        // happens here, in the parallel per-read prep — not in the
+        // single-threaded walker — reusing the reference window BAQ already
+        // fetches. Only reads that carry an indel need the raw-ASCII copy.
+        let needs_norm = read.cigar.iter().copied().any(is_indel_op);
+
         // (xb..xe): ref span; (yb..ye): query span. Both 0-based,
         // half-open. `bw` may be wider than `cfg.band_half_width` if a
         // single indel forces it.
@@ -161,10 +173,15 @@ impl BaqEngine {
         // soon as we finish iterating the slice, and that needs to
         // be before any further fetcher mutation.
         self.encoded_ref.clear();
+        self.raw_ref.clear();
         match ref_fetcher.fetch((xb + 1) as u32, length) {
             Ok(bytes) if !bytes.is_empty() => {
                 self.encoded_ref
                     .extend(bytes.iter().map(|&b| encode_base(b)));
+                // Keep the raw window only when this read needs left-alignment.
+                if needs_norm {
+                    self.raw_ref.extend_from_slice(bytes);
+                }
             }
             Ok(_empty) => return BaqOutcome::Skipped(BaqSkipReason::RefWindowPastChromEnd),
             Err(e) => {
@@ -216,7 +233,17 @@ impl BaqEngine {
         );
         let bq_baq = std::mem::take(&mut self.bq_baq_buf);
 
-        BaqOutcome::Capped(mapped_to_prepared(read, chrom_id, bq_baq))
+        let mut prepared = mapped_to_prepared(read, chrom_id, bq_baq);
+
+        // Left-align this read's indels against the reference now that the
+        // window is in hand — reusing the BAQ window (no extra fetch). The
+        // read's first aligned base sits at `pos_0 - xb` within it.
+        if needs_norm {
+            let read_start = (pos_0 - xb) as usize;
+            indel_norm::left_align_prepared(&mut prepared, &self.raw_ref, read_start);
+        }
+
+        BaqOutcome::Capped(prepared)
     }
 }
 
@@ -391,6 +418,12 @@ fn op_len(op: CigarOp) -> usize {
         | CigarOp::SeqMatch(l)
         | CigarOp::SeqMismatch(l) => l as usize,
     }
+}
+
+/// Does this op carry an indel (the only reads that need left-alignment)?
+#[inline]
+fn is_indel_op(op: CigarOp) -> bool {
+    matches!(op, CigarOp::Insertion(_) | CigarOp::Deletion(_))
 }
 
 /// Build a [`PreparedRead`] from a [`MappedRead`] *without* running

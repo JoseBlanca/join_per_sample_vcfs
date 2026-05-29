@@ -158,22 +158,22 @@ Out:
   unchanged.
 - Multi-allelic decomposition / MNP splitting.
 
-## Why Stage 1, and why at admit time
+## Why in read-prep, before the cursor is built
 
 Left-alignment moves an indel's anchor **leftward**. The walker collects
 an event only when `walker_pos == anchor`
 ([`process_position`](../../src/pileup/walker/driver.rs#L374) →
 [`events_at`](../../src/pileup/walker/cigar_cursor.rs#L478)). A
 post-collection rewrite would point at a position the walker already
-passed — so normalization must happen **before the cursor is built**,
-which is what rewriting `read.cigar` at
-[`admit_read`](../../src/pileup/walker/driver.rs#L339) achieves. This
-mirrors freebayes doing it before allele parsing.
+passed — so normalization must happen **before the cursor is built**.
+Rewriting the `PreparedRead`'s `cigar` in `BaqEngine::process` (the
+per-read prep stage, upstream of the walker) achieves that and keeps the
+walker free of any normalization concern. This mirrors freebayes doing
+it before allele parsing.
 
 ### Timing is safe (no event is lost)
 
-The concern "the anchor moves to a position the walker already passed"
-does not occur:
+The walker still sees every normalized anchor because:
 
 1. [`advance`](../../src/pileup/walker/driver.rs#L499) steps strictly
    `+1` whenever the active set is non-empty; it only jumps over gaps
@@ -181,14 +181,14 @@ does not occur:
    ([driver.rs:519](../../src/pileup/walker/driver.rs#L519)). So while a
    read is alive the walker visits **every** position it spans.
 2. Left-alignment never moves an indel left of the read's own footprint
-   (the reference window is the footprint; the shift is bounded by the
-   preceding alignment block), so
-   `alignment_start ≤ normalized_anchor ≤ alignment_end`.
+   (the shift is bounded by the preceding alignment block), and
+   `remove_deletions_at_ends = false` leaves `alignment_start` fixed, so
+   `alignment_start ≤ normalized_anchor ≤ alignment_end` and the read
+   stream stays coordinate-sorted.
 
 The read is therefore active across the whole interval containing the
 normalized anchor, and the walker steps one-by-one across it — it is
-guaranteed to land on the normalized anchor with the read active. No
-re-anchoring machinery is required.
+guaranteed to land on the normalized anchor with the read active.
 
 ## The algorithm (pure routine)
 
@@ -218,22 +218,17 @@ inserted sequence. No separate rotation step is needed.
 ## Wiring
 
 - Rewrite happens in
-  [`WalkerState::admit_read`](../../src/pileup/walker/driver.rs#L339),
-  which today does not hold the fetcher (it reaches the walker only at
-  `process_position`). Thread the fetcher — already a field on
-  `PileupWalker` — down to `admit_read`/`ActiveReads::admit`
-  ([active_read_set.rs:120](../../src/pileup/walker/active_read_set.rs#L120),
-  where the cursor is built), and rewrite `read.cigar` (and
-  `alignment_start`, if a leading deletion was removed) before
-  `CigarCursor::new`. `CigarCursor::new` keeps its pure-CIGAR signature
-  and existing tests.
-- Reference window: fetch the read footprint
-  `[alignment_start, alignment_end]` once per read via
-  `MultiChromRefFetcher::fetch(chrom_id, start, len)` (random-access —
-  [mod.rs:127](../../src/fasta/mod.rs#L127)). This is exactly the window
-  freebayes passes.
-- Fast path: skip the fetch+rewrite entirely when the CIGAR has no
-  indel op or `≤ 1` element — the overwhelming majority of reads.
+  [`BaqEngine::process`](../../src/pileup/per_sample/baq_engine.rs) — the
+  per-read transform that `baq_stream` already runs in parallel — via the
+  shared [`indel_norm::left_align_prepared`](../../src/pileup/walker/indel_norm.rs)
+  helper, after the HMM and `mapped_to_prepared`. The cursor is later
+  built from the already-normalized CIGAR in the walker, unchanged.
+- Reference window: **reused from BAQ**, which already fetches a window
+  `[xb, xe]` wider than the read footprint. No extra fetch; the read's
+  first aligned base is at index `pos_0 - xb`. A raw-ASCII copy of the
+  window (`BaqEngine::raw_ref`) is kept only for indel-bearing reads.
+- Fast path: skip the raw-window copy + rewrite entirely when the CIGAR
+  has no indel op — the overwhelming majority of reads.
 
 ## Interactions to confirm
 
@@ -261,16 +256,39 @@ inserted sequence. No separate rotation step is needed.
    `left_align_cigar` / `normalize_alleles` + a CIGAR builder into
    `src/pileup/walker/indel_norm.rs`; 10 unit tests over the canonical
    cases. No walker wiring.
-2. **Admit-time wiring.** ✅ Done. Threaded the fetcher to `admit_read`,
-   rewrite `read.cigar` (+ leading-deletion position bump) in
-   `normalize_read_indels`, fast-path skip for indel-free reads, debug
-   mismatch-invariant assert (`count_mismatches`). Cursor unchanged.
-   Two walker-level **consolidation tests** (deletion + insertion at
-   different CIGAR offsets collapse to one allele with summed support)
-   landed here as the end-to-end proof. Length validation reordered
-   before normalization so malformed reads still error cleanly; one
-   degenerate widening-test fixture changed from a pure-`A` homopolymer
-   to a non-rollable deletion context.
+2. **Read-prep wiring (in the parallel BAQ stage).** ✅ Done.
+   Normalization runs in `BaqEngine::process`
+   ([baq_engine.rs](../../src/pileup/per_sample/baq_engine.rs)) — the
+   existing per-read transform that `baq_stream` already fans out over a
+   rayon `par_iter`. It **reuses the reference window BAQ fetches** (no
+   second fetch; the read's first aligned base sits at `pos_0 - xb`
+   within it) and rewrites the `PreparedRead`'s CIGAR via the shared
+   `indel_norm::left_align_prepared` helper, with the debug
+   mismatch-invariant. `remove_deletions_at_ends = false` keeps
+   `alignment_start` fixed so the chunk stays coordinate-sorted; the
+   cursor rejects any resulting first/last-op deletion.
+
+   **Why here, not the walker.** BAQ is placement-invariant (its HMM
+   realigns the read against the window regardless of input indel
+   placement), so order doesn't matter for correctness — which freed us
+   to put normalization in the *parallel* prep stage rather than the
+   serial walker `admit_read`. Net wins: free parallelism, zero extra
+   fetch, pure walker. (An earlier draft wired it into `admit_read`; that
+   was reverted.)
+
+   **`--no-baq` caveat.** Normalization lives in the BAQ read-prep stage,
+   so `--no-baq` (a BAQ A/B bypass) also skips normalization — it cannot
+   reuse the walker's forward-streaming fetcher without thrashing it.
+   Production/benchmark runs keep BAQ on. Documented at the passthrough
+   site in `stage1_pipeline.rs`.
+
+   Tests: engine-level normalization tests in `baq_tests.rs` (deletion +
+   insertion left-align to the leftmost; two reads at different offsets
+   normalize to one anchor — the consolidation proof at the prep layer)
+   and a non-stripping unit test in `indel_norm`. One pre-existing
+   mixed-CIGAR BAQ fixture had a latent off-by-one (CIGAR consumed 15
+   read bases, seq was 16) that the normalizer's invariant correctly
+   surfaced — fixed to be consistent.
 3. **Integration + benchmark.** Review the deliberate output diffs on
    real pileup/cohort data (normalization *changes* output where repeats
    exist — not a byte-identical gate; the synthetic integration fixtures

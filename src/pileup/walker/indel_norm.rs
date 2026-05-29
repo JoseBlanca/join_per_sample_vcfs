@@ -22,19 +22,21 @@
 //! architecture spec §"Indel normalization (left-alignment)".
 
 use super::CigarOp;
+use super::PreparedRead;
 
 /// Result of left-aligning a read's CIGAR.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct LeftAlignResult {
+pub(crate) struct LeftAlignResult {
     /// The normalized CIGAR. Synthesized alignment runs are emitted as
     /// [`CigarOp::Match`]; the original op variant is preserved for the
     /// un-shifted remainder of each alignment block.
-    pub(super) cigar: Vec<CigarOp>,
+    pub(crate) cigar: Vec<CigarOp>,
     /// Reference bases removed because a deletion left-aligned all the
     /// way to the read's start (a leading deletion). The caller bumps
     /// the read's `alignment_start` right by this much. Mirrors GATK's
-    /// `leadingDeletionBasesRemoved`.
-    pub(super) leading_deletion_bases_removed: u32,
+    /// `leadingDeletionBasesRemoved`. Always 0 when the routine is called
+    /// with `remove_deletions_at_ends = false`.
+    pub(crate) leading_deletion_bases_removed: u32,
 }
 
 // --- CigarOp classification helpers -------------------------------------
@@ -251,9 +253,13 @@ fn normalize_alleles(
 /// 1. drop zero-length elements,
 /// 2. order a deletion before an adjacent insertion (canonical form),
 /// 3. merge consecutive identical operators,
-/// 4. strip leading and trailing deletions, recording the leading
-///    deletion's reference length so the caller can bump the read start.
-fn build_cigar(elements: &[CigarOp]) -> LeftAlignResult {
+/// 4. when `remove_deletions_at_ends`, strip leading and trailing
+///    deletions, recording the leading deletion's reference length so the
+///    caller can bump the read start. With it `false`, a leading/trailing
+///    deletion is left in place (the walker's cursor rejects first/last-op
+///    indels anyway, and keeping `alignment_start` fixed preserves the
+///    coordinate-sort invariant the read stream relies on).
+fn build_cigar(elements: &[CigarOp], remove_deletions_at_ends: bool) -> LeftAlignResult {
     // (1) drop zeros.
     let mut nonzero: Vec<CigarOp> = elements
         .iter()
@@ -308,27 +314,29 @@ fn build_cigar(elements: &[CigarOp]) -> LeftAlignResult {
         }
     }
 
-    // (4) strip leading / trailing deletions. Clips may sit outside the
-    // deletion (e.g. `S D M`), so skip past leading/trailing clips when
-    // locating the boundary deletion.
+    // (4) optionally strip leading / trailing deletions. Clips may sit
+    // outside the deletion (e.g. `S D M`), so skip past leading/trailing
+    // clips when locating the boundary deletion.
     let mut leading_deletion_bases_removed = 0u32;
-    let is_clip = |op: CigarOp| matches!(op, CigarOp::SoftClip(_) | CigarOp::HardClip(_));
+    if remove_deletions_at_ends {
+        let is_clip = |op: CigarOp| matches!(op, CigarOp::SoftClip(_) | CigarOp::HardClip(_));
 
-    // Leading: first non-clip element.
-    let lead_idx = merged.iter().position(|op| !is_clip(*op));
-    if let Some(idx) = lead_idx
-        && let CigarOp::Deletion(n) = merged[idx]
-    {
-        leading_deletion_bases_removed = n;
-        merged.remove(idx);
-    }
+        // Leading: first non-clip element.
+        let lead_idx = merged.iter().position(|op| !is_clip(*op));
+        if let Some(idx) = lead_idx
+            && let CigarOp::Deletion(n) = merged[idx]
+        {
+            leading_deletion_bases_removed = n;
+            merged.remove(idx);
+        }
 
-    // Trailing: last non-clip element.
-    let trail_idx = merged.iter().rposition(|op| !is_clip(*op));
-    if let Some(idx) = trail_idx
-        && matches!(merged[idx], CigarOp::Deletion(_))
-    {
-        merged.remove(idx);
+        // Trailing: last non-clip element.
+        let trail_idx = merged.iter().rposition(|op| !is_clip(*op));
+        if let Some(idx) = trail_idx
+            && matches!(merged[idx], CigarOp::Deletion(_))
+        {
+            merged.remove(idx);
+        }
     }
 
     LeftAlignResult {
@@ -348,12 +356,20 @@ fn build_cigar(elements: &[CigarOp]) -> LeftAlignResult {
 /// mismatch on either the reference or the read, with adjacent indels
 /// merged. If `cigar` has no indel the input is returned unchanged.
 ///
+/// `remove_deletions_at_ends` controls whether a deletion that left-aligns
+/// to a read end is stripped (bumping `alignment_start` via
+/// `leading_deletion_bases_removed`) or kept in place. The per-sample read
+/// prep passes `false` so `alignment_start` stays fixed and the read
+/// stream stays coordinate-sorted; the cursor rejects the resulting
+/// first-op deletion anyway.
+///
 /// Port of GATK `AlignmentUtils.leftAlignIndels`.
-pub(super) fn left_align_cigar(
+pub(crate) fn left_align_cigar(
     cigar: &[CigarOp],
     ref_bases: &[u8],
     read_seq: &[u8],
     read_start: usize,
+    remove_deletions_at_ends: bool,
 ) -> LeftAlignResult {
     if !cigar.iter().copied().any(is_indel) {
         return LeftAlignResult {
@@ -459,7 +475,7 @@ pub(super) fn left_align_cigar(
 
     // Any indel still pending at the read start (no alignment block to its
     // left) is emitted here; `build_cigar` strips a resulting leading
-    // deletion and records its length.
+    // deletion (and records its length) when `remove_deletions_at_ends`.
     result_right_to_left.push(CigarOp::Deletion(ref_indel_range.size() as u32));
     result_right_to_left.push(CigarOp::Insertion(read_indel_range.size() as u32));
 
@@ -469,15 +485,49 @@ pub(super) fn left_align_cigar(
     );
 
     result_right_to_left.reverse();
-    build_cigar(&result_right_to_left)
+    build_cigar(&result_right_to_left, remove_deletions_at_ends)
+}
+
+/// Left-align a prepared read's indels in place against `ref_bases`, whose
+/// index `read_start` holds the read's first aligned base. Rewrites
+/// `prepared.cigar` to the canonical (leftmost) form; `alignment_start` is
+/// left untouched (uses `remove_deletions_at_ends = false`, so the read
+/// stream stays coordinate-sorted and the cursor rejects any first/last-op
+/// deletion). No-op for reads with no indel.
+///
+/// A debug-only invariant checks that left-alignment — a lossless
+/// re-placement of the same indels — leaves the read's reference-mismatch
+/// count unchanged, guarding the port against silent corruption.
+pub(crate) fn left_align_prepared(
+    prepared: &mut PreparedRead,
+    ref_bases: &[u8],
+    read_start: usize,
+) {
+    if !prepared.cigar.iter().copied().any(is_indel) {
+        return;
+    }
+    let result = left_align_cigar(&prepared.cigar, ref_bases, &prepared.seq, read_start, false);
+    #[cfg(debug_assertions)]
+    {
+        let before = count_mismatches(&prepared.cigar, ref_bases, &prepared.seq, read_start);
+        let after = count_mismatches(&result.cigar, ref_bases, &prepared.seq, read_start);
+        debug_assert_eq!(
+            before, after,
+            "indel left-alignment changed mismatch count for qname='{}'",
+            prepared.qname
+        );
+    }
+    prepared.cigar = result.cigar;
 }
 
 /// Count read/reference mismatches across `cigar`'s alignment blocks,
 /// with the read's first aligned base at `ref_bases[read_start]`. Used as
 /// a debug invariant: left-alignment is a lossless re-placement of the
 /// same indels, so it must leave the mismatch count unchanged. Mirrors
-/// freebayes' `countMismatches`.
-pub(super) fn count_mismatches(
+/// freebayes' `countMismatches`. Debug-only — the sole caller is the
+/// `debug_assert_eq!` in [`left_align_prepared`].
+#[cfg(debug_assertions)]
+fn count_mismatches(
     cigar: &[CigarOp],
     ref_bases: &[u8],
     read_seq: &[u8],

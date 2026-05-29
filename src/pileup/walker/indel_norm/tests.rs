@@ -9,9 +9,9 @@ use super::*;
 use crate::pileup::walker::CigarOp::{self, *};
 
 /// Left-align with `read_start = 0` (reference window begins at the read's
-/// first aligned base — what the walker fetches per read).
+/// first aligned base) and end-deletion stripping on (the canonical form).
 fn la(cigar: &[CigarOp], ref_bases: &str, read: &str) -> LeftAlignResult {
-    left_align_cigar(cigar, ref_bases.as_bytes(), read.as_bytes(), 0)
+    left_align_cigar(cigar, ref_bases.as_bytes(), read.as_bytes(), 0, true)
 }
 
 #[test]
@@ -125,7 +125,26 @@ fn soft_clips_are_preserved_and_not_crossed() {
         "GAAAAT".as_bytes(),
         "TTGAAAT".as_bytes(),
         0,
+        true,
     );
     assert_eq!(r.cigar, vec![SoftClip(2), Match(1), Deletion(1), Match(4)]);
+    assert_eq!(r.leading_deletion_bases_removed, 0);
+}
+
+#[test]
+fn deletion_to_read_start_kept_when_not_removing_ends() {
+    // Same input as `deletion_shifted_to_read_start_becomes_leading`, but
+    // with end-deletion stripping off (the per-sample read-prep mode): the
+    // leading deletion stays in the CIGAR and alignment_start is *not*
+    // bumped, preserving the coordinate-sort invariant. The cursor rejects
+    // this first-op deletion downstream.
+    let r = left_align_cigar(
+        &[Match(3), Deletion(1), Match(1)],
+        "AAAAT".as_bytes(),
+        "AAAT".as_bytes(),
+        0,
+        false,
+    );
+    assert_eq!(r.cigar, vec![Deletion(1), Match(4)]);
     assert_eq!(r.leading_deletion_bases_removed, 0);
 }

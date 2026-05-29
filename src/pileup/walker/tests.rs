@@ -429,102 +429,6 @@ fn insertion_record_has_alt_longer_than_ref() {
 }
 
 #[test]
-fn same_deletion_at_different_cigar_offsets_consolidates() {
-    // Reference G AAAAA C — a 5-base A homopolymer. Both reads carry the
-    // same biological deletion of one A but the aligner placed it at
-    // opposite ends of the run (5M1D1M vs 1M1D5M), so verbatim they are
-    // distinct (anchor, REF, ALT) triples. Indel normalization left-aligns
-    // both to the leftmost A, so they consolidate onto one DEL allele with
-    // summed support instead of fragmenting (the core recall fix).
-    let fa = MockFasta::new("GAAAAAC");
-    let read_right = PreparedRead {
-        chrom_id: 0,
-        alignment_start: 1,
-        alignment_end: 7,
-        cigar: vec![CigarOp::Match(5), CigarOp::Deletion(1), CigarOp::Match(1)],
-        seq: b"GAAAAC".to_vec(),
-        bq_baq: vec![30; 6],
-        mq_log_err: -3.0,
-        is_reverse_strand: false,
-        qname: Arc::from("right"),
-        mate_role: MateRole::Solo,
-        adaptor_boundary: None,
-        mapq: 60,
-    };
-    let read_left = PreparedRead {
-        cigar: vec![CigarOp::Match(1), CigarOp::Deletion(1), CigarOp::Match(5)],
-        qname: Arc::from("left"),
-        ..read_right.clone()
-    };
-
-    let records = drive_walker(vec![read_right, read_left], fa);
-
-    let anchor = records
-        .iter()
-        .find(|r| r.pos == 1)
-        .expect("consolidated deletion anchors at pos 1 (leftmost A's predecessor)");
-    assert_eq!(anchor.ref_span(), 2, "anchor + 1 deleted A");
-    let del = anchor
-        .alleles
-        .iter()
-        .find(|a| a.seq.as_slice() == b"G")
-        .expect("DEL allele = anchor base only");
-    assert_eq!(
-        del.support.num_obs, 2,
-        "both reads' deletions consolidated onto one allele",
-    );
-    assert_eq!(
-        records.iter().filter(|r| r.ref_span() > 1).count(),
-        1,
-        "exactly one deletion record — no fragment at the right end",
-    );
-}
-
-#[test]
-fn same_insertion_at_different_cigar_offsets_consolidates() {
-    // Reference G AAAA C. Both reads insert one A into the homopolymer
-    // but at opposite ends (5M1I1M vs 1M1I5M). Left-alignment consolidates
-    // them onto one INS allele anchored at the leftmost position.
-    let fa = MockFasta::new("GAAAAC");
-    let read_right = PreparedRead {
-        chrom_id: 0,
-        alignment_start: 1,
-        alignment_end: 6,
-        cigar: vec![CigarOp::Match(5), CigarOp::Insertion(1), CigarOp::Match(1)],
-        seq: b"GAAAAAC".to_vec(),
-        bq_baq: vec![30; 7],
-        mq_log_err: -3.0,
-        is_reverse_strand: false,
-        qname: Arc::from("right"),
-        mate_role: MateRole::Solo,
-        adaptor_boundary: None,
-        mapq: 60,
-    };
-    let read_left = PreparedRead {
-        cigar: vec![CigarOp::Match(1), CigarOp::Insertion(1), CigarOp::Match(5)],
-        qname: Arc::from("left"),
-        ..read_right.clone()
-    };
-
-    let records = drive_walker(vec![read_right, read_left], fa);
-
-    let anchor = records
-        .iter()
-        .find(|r| r.pos == 1)
-        .expect("anchor at pos 1");
-    let ins = anchor
-        .alleles
-        .iter()
-        .find(|a| a.seq.len() > anchor.ref_span() as usize)
-        .expect("consolidated INS allele longer than REF");
-    assert_eq!(ins.seq, b"GA", "anchor base + 1 inserted A");
-    assert_eq!(
-        ins.support.num_obs, 2,
-        "both reads' insertions consolidated onto one allele",
-    );
-}
-
-#[test]
 fn forward_strand_count_recorded_correctly() {
     // Reference ACG. Two reads: forward, reverse. Both REF.
     let fa = MockFasta::new("ACG");
@@ -1352,19 +1256,8 @@ fn zero_ref_span_input_is_a_hard_error() {
 fn open_record_widening_past_max_record_span_errors() {
     // M16 widen path. A single read with a deletion that pushes the
     // open record's footprint past MAX_RECORD_SPAN must error.
-    //
-    // The deleted region is a distinct base run flanked by the matched
-    // anchor bases so indel normalization cannot left-align the deletion
-    // out of existence (a pure homopolymer reference would let it roll to
-    // the read edge and collapse — see the indel_norm module).
-    let del_len = super::DEFAULT_MAX_RECORD_SPAN as usize + 1;
     let ref_len = (super::DEFAULT_MAX_RECORD_SPAN as usize) + 50;
-    let ref_seq = format!(
-        "A{}{}",
-        "C".repeat(del_len),
-        "A".repeat(ref_len - 1 - del_len)
-    );
-    let fa = MockFasta::new(&ref_seq);
+    let fa = MockFasta::new(&"A".repeat(ref_len));
     let r = PreparedRead {
         chrom_id: 0,
         alignment_start: 1,
