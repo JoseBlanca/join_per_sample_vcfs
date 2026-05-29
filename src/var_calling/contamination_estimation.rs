@@ -42,9 +42,9 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::pileup_record::PileupRecord;
-use crate::var_calling::per_position_merger::PerPositionPileups;
 #[cfg(test)]
 use crate::var_calling::per_position_merger::PerPositionMergerError;
+use crate::var_calling::per_position_merger::PerPositionPileups;
 
 // ---------------------------------------------------------------------
 // Default constants

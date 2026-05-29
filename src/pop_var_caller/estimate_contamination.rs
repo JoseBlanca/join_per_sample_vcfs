@@ -29,8 +29,6 @@ use toml::value::Datetime;
 
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
-use crate::pop_var_caller::contamination_chunked_stream::ChunkedPositionStream;
-use crate::var_calling::cohort_block::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool, rfc3339_now,
     verify_fasta_matches_psp_chromosomes,
@@ -39,7 +37,9 @@ use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
 };
+use crate::pop_var_caller::contamination_chunked_stream::ChunkedPositionStream;
 use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::cohort_block::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
 use crate::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, DEFAULT_BLOCK_SIZE, DEFAULT_C_S_INIT,
