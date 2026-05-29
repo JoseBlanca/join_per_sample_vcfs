@@ -104,6 +104,17 @@ pub struct VarCallingArgs {
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
 
+    /// Number of parallel worker windows per chunk. The pre-pass
+    /// places `worker-windows-per-chunk - 1` internal boundaries
+    /// inside each chunk's safe range so the rayon dispatch runs
+    /// `worker-windows-per-chunk` independent per-window math
+    /// pipelines concurrently. `1` (the default) preserves the
+    /// sequential single-window-per-chunk behaviour. Pair with
+    /// `--target-variants-per-chunk` so each window has a
+    /// meaningful amount of work to do.
+    #[arg(long, default_value_t = 1)]
+    pub worker_windows_per_chunk: usize,
+
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
     pub psp_files: Vec<PathBuf>,
@@ -387,10 +398,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         min_mapq_diff_t: args.cohort.min_mapq_diff_t,
         chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
         target_variants_per_chunk: args.target_variants_per_chunk,
-        // Phase B step 5 will wire `--worker-windows-per-chunk` to
-        // this field. For now the driver runs one window per chunk
-        // (the prior sequential behaviour).
-        target_window_count: 1,
+        target_window_count: args.worker_windows_per_chunk,
     };
     let chunk_stats = drive_cohort_chunked(
         &args.psp_files,
