@@ -29,6 +29,7 @@
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -84,22 +85,29 @@ pub struct ChunkSizingParams {
     /// `target_variants_per_chunk` is not satisfied or the pre-pass
     /// can't find a safe boundary.
     pub chunk_genomic_span: u32,
-    /// Soft lower bound on the post-filter variant count per chunk.
-    /// `0` disables the variant-bounded extension (each chunk is one
-    /// pull attempt of `chunk_genomic_span` BP). Non-zero values let
-    /// the loader grow each chunk's span adaptively until the
-    /// kept-position count crosses this target — decoupling worker
-    /// workload from PSP block size + variant density. See
+    /// M9: soft lower bound on the post-filter variant count per
+    /// chunk. `None` disables the variant-bounded extension (each
+    /// chunk is one pull attempt of `chunk_genomic_span` BP).
+    /// `Some(n)` lets the loader grow each chunk's span adaptively
+    /// until the kept-position count crosses `n` — decoupling worker
+    /// workload from PSP block size + variant density. Previously a
+    /// bare `u32` with `0` as the disabling sentinel; the
+    /// `Option<NonZero…>` form makes the disabled/enabled split
+    /// visible in the type. See
     /// [the Phase B prereq plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md).
-    pub target_variants_per_chunk: u32,
-    /// Number of parallel worker windows per chunk.
+    pub target_variants_per_chunk: Option<NonZeroU32>,
+    /// M7: number of parallel worker windows per chunk.
     /// [`fix_boundaries`] places `target_window_count - 1` internal
     /// boundaries inside each chunk's `[range.start, safe_end)` so
     /// the [`WorkerPool`] can dispatch the per-window math
-    /// concurrently. `1` (default) preserves the
-    /// sequential single-window-per-chunk behaviour byte-for-byte.
+    /// concurrently. `NonZeroUsize::MIN` (1) preserves the
+    /// sequential single-window-per-chunk behaviour byte-for-byte;
+    /// `0` is rejected at the type level. The previous shape was a
+    /// bare `usize` where the driver silently mapped `0` to `1` via
+    /// `.max(1)`, bypassing the pre-pass's
+    /// `FixBoundariesError::ZeroTargetWindowCount` validation.
     /// See [the Phase B plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md).
-    pub target_window_count: usize,
+    pub target_window_count: NonZeroUsize,
 }
 
 /// Mi19: post-EM downstream filters applied by `emit_or_drop` before
@@ -357,8 +365,11 @@ pub fn drive_cohort_chunked(
          target_window_count={} min_qual_phred={} min_alt_obs_per_sample={} \
          no_mapq_diff_filter={} min_mapq_diff_t={} no_complexity_filter={}",
         params.sizing.chunk_genomic_span,
-        params.sizing.target_variants_per_chunk,
-        params.sizing.target_window_count,
+        params
+            .sizing
+            .target_variants_per_chunk
+            .map_or(0, NonZeroU32::get),
+        params.sizing.target_window_count.get(),
         params.downstream.min_qual_phred,
         params.downstream.min_alt_obs_per_sample,
         params.downstream.no_mapq_diff_filter,
@@ -837,7 +848,10 @@ where
                 chrom_id,
                 range_start: chunk_range_start,
                 initial_span: initial_load_span,
-                target_variants: params.sizing.target_variants_per_chunk,
+                target_variants: params
+                    .sizing
+                    .target_variants_per_chunk
+                    .map_or(0, NonZeroU32::get),
                 max_span: max_load_span,
             },
             iters,
@@ -847,7 +861,10 @@ where
         stats.chunks_loaded += 1;
         stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
-        let target_window_count = params.sizing.target_window_count.max(1);
+        // M7: `target_window_count` is `NonZeroUsize` — no more
+        // `.max(1)` driver-side fallback that bypassed the pre-pass's
+        // `ZeroTargetWindowCount` validation.
+        let target_window_count = params.sizing.target_window_count.get();
         match fix_boundaries(
             chunk,
             carryover,
@@ -1140,8 +1157,8 @@ mod tests {
             posterior_cfg: PosteriorEngineConfig::default(),
             sizing: ChunkSizingParams {
                 chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
-                target_variants_per_chunk: 0,
-                target_window_count: 1,
+                target_variants_per_chunk: None,
+                target_window_count: NonZeroUsize::MIN,
             },
             downstream: DownstreamFilterParams {
                 min_alt_obs_per_sample,

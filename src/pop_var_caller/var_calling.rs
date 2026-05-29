@@ -196,6 +196,14 @@ pub enum VarCallingCliError {
     #[error("rayon thread pool already initialised — refusing to override")]
     RayonAlreadyConfigured,
 
+    /// M7: `--worker-windows-per-chunk` must be `>= 1`. The previous
+    /// behaviour silently mapped `0` to `1` driver-side via `.max(1)`,
+    /// bypassing the pre-pass's `ZeroTargetWindowCount` validation;
+    /// the type-level lift to `NonZeroUsize` rejects the `0` input at
+    /// the CLI boundary instead.
+    #[error("--worker-windows-per-chunk must be >= 1, got {got}")]
+    InvalidWorkerWindowsPerChunk { got: usize },
+
     /// FASTA contig bytes don't match the `.psp` header's
     /// per-contig MD5. The basename cross-check (variant
     /// `ReferenceMismatch`) is necessary but not sufficient — this
@@ -394,8 +402,18 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         posterior_cfg,
         sizing: ChunkSizingParams {
             chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
-            target_variants_per_chunk: args.target_variants_per_chunk,
-            target_window_count: args.worker_windows_per_chunk,
+            // M9: `0` from the CLI maps to `None` (disabled);
+            // non-zero values are wrapped in `NonZeroU32`.
+            target_variants_per_chunk: std::num::NonZeroU32::new(args.target_variants_per_chunk),
+            // M7: reject `--worker-windows-per-chunk 0` at the
+            // boundary (NonZeroUsize). The CLI parser's default is
+            // `1`, so this only fires when an operator explicitly
+            // passes `0`.
+            target_window_count: std::num::NonZeroUsize::new(args.worker_windows_per_chunk).ok_or(
+                VarCallingCliError::InvalidWorkerWindowsPerChunk {
+                    got: args.worker_windows_per_chunk,
+                },
+            )?,
         },
         downstream: DownstreamFilterParams {
             min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
