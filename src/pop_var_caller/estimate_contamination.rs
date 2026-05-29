@@ -29,6 +29,8 @@ use toml::value::Datetime;
 
 use crate::pop_var_caller::batch_assignment::{BatchAssignment, BatchAssignmentError};
 use crate::pop_var_caller::cli::parsers;
+use crate::pop_var_caller::contamination_chunked_stream::ChunkedPositionStream;
+use crate::var_calling::cohort_block::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool, rfc3339_now,
     verify_fasta_matches_psp_chromosomes,
@@ -47,9 +49,7 @@ use crate::var_calling::contamination_estimation::{
     DEFAULT_SNP_ALT_PSEUDOCOUNT, DEFAULT_STABILITY_BLOCKS, DEFAULT_STABILITY_TOLERANCE,
     StoppingMode, estimate_contamination,
 };
-use crate::var_calling::per_position_merger::{
-    PerPositionMerger, PerPositionMergerError, check_chromosome_agreement,
-};
+use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -247,8 +247,11 @@ pub enum EstimateContaminationCliError {
     #[error("psp reader: {0}")]
     PspReader(#[from] PspReadError),
 
-    #[error("merger: {0}")]
-    Merger(#[from] PerPositionMergerError),
+    /// Pre-side-pass chromosome-agreement check failure across
+    /// the cohort's `.psp` headers (different chromosome tables /
+    /// contig lengths / md5s).
+    #[error("chromosome agreement: {0}")]
+    ChromosomeAgreement(#[from] PerPositionMergerError),
 
     #[error("contamination side-pass: {0}")]
     Engine(#[from] ContaminationEstimationError),
@@ -437,15 +440,24 @@ pub fn run_estimate_contamination(
     };
     cfg.validate()?;
 
-    // 7. Build the merger from the .psp readers. Chromosome
-    //    agreement + FASTA MD5 cross-check happened earlier
-    //    (step 3); the `chromosomes` table from there is reused.
-    let record_iters: Vec<_> = readers.iter_mut().map(|r| r.records()).collect();
-    let merger = PerPositionMerger::new(record_iters, sample_names.clone(), chromosomes)?;
+    // 7. Build the chunk-driven per-position stream from the .psp
+    //    readers. Chromosome agreement + FASTA MD5 cross-check
+    //    happened earlier (step 3); the `chromosomes` table from
+    //    there is reused. The stream takes ownership of the readers.
+    let stream = ChunkedPositionStream::new(
+        readers,
+        chromosomes,
+        DEFAULT_CHUNK_GENOMIC_SPAN,
+        // Phase B step 4 will wire `--target-variants-per-chunk`
+        // through here; for now the loader takes one pull attempt
+        // of `DEFAULT_CHUNK_GENOMIC_SPAN` per chunk (legacy
+        // behaviour).
+        0,
+    );
 
     // 8. Run side-pass.
     let estimates = estimate_contamination(
-        merger,
+        stream,
         n_samples,
         sample_to_batch.clone(),
         n_batches,

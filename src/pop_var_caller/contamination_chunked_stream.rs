@@ -1,8 +1,3 @@
-// Step 3 of the Phase B prereq's contamination-migration plan
-// wires these into `run_estimate_contamination`; until then
-// they're only exercised by the in-module unit tests.
-#![allow(dead_code)]
-
 //! Chunk-driven stream of [`PerPositionPileups`] for the
 //! contamination side-pass.
 //!
