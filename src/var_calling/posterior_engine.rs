@@ -881,8 +881,7 @@ impl PosteriorRecord {
             }
             best_genotype[s] = best_j;
             let p_best_clamped = best_p.min(1.0 - f64::EPSILON);
-            gq_phred[s] =
-                (PHRED_SCALE * (1.0 - p_best_clamped).log10()).clamp(0.0, max_gq_phred);
+            gq_phred[s] = (PHRED_SCALE * (1.0 - p_best_clamped).log10()).clamp(0.0, max_gq_phred);
         }
 
         // 7. Commit. `n_alleles` is derived from `alleles.len()`, so
@@ -3140,14 +3139,27 @@ mod tests {
         let scalars: Vec<AlleleSupportStats> = (0..n_samples)
             .flat_map(|_| {
                 [
-                    AlleleSupportStats { num_obs: 20, ..Default::default() },
-                    AlleleSupportStats { num_obs: 5, ..Default::default() },
-                    AlleleSupportStats { num_obs: 7, ..Default::default() },
+                    AlleleSupportStats {
+                        num_obs: 20,
+                        ..Default::default()
+                    },
+                    AlleleSupportStats {
+                        num_obs: 5,
+                        ..Default::default()
+                    },
+                    AlleleSupportStats {
+                        num_obs: 7,
+                        ..Default::default()
+                    },
                 ]
             })
             .collect();
         PosteriorRecord {
-            locus: RecordLocus { chrom_id: 0, start: 100, end: 101 },
+            locus: RecordLocus {
+                chrom_id: 0,
+                start: 100,
+                end: 101,
+            },
             alleles: simple_alleles(&[b"A", b"T", b"C"]),
             ploidy: 2,
             n_samples,
@@ -3232,7 +3244,11 @@ mod tests {
     fn prune_short_circuits_for_biallelic() {
         // 2 alleles -> the < 3 guard returns immediately, untouched.
         let mut rec = PosteriorRecord {
-            locus: RecordLocus { chrom_id: 0, start: 1, end: 2 },
+            locus: RecordLocus {
+                chrom_id: 0,
+                start: 1,
+                end: 2,
+            },
             alleles: simple_alleles(&[b"A", b"T"]),
             ploidy: 2,
             n_samples: 1,
@@ -3244,8 +3260,14 @@ mod tests {
             gq_phred: vec![30.0],
             qual_phred: 50.0,
             scalars: vec![
-                AlleleSupportStats { num_obs: 10, ..Default::default() },
-                AlleleSupportStats { num_obs: 10, ..Default::default() },
+                AlleleSupportStats {
+                    num_obs: 10,
+                    ..Default::default()
+                },
+                AlleleSupportStats {
+                    num_obs: 10,
+                    ..Default::default()
+                },
             ],
             other_scalars: vec![],
             chain_anchor_flags: vec![false, false],
