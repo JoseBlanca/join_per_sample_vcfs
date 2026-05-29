@@ -720,39 +720,46 @@ where
         .map(|_| SampleColumns::empty())
         .collect();
 
+    // M12: bundle the per-iteration mutable state once so the three
+    // phase helpers don't restate the borrow graph in their
+    // signatures.
+    let mut state = ChunkLoopState {
+        chrom_id,
+        chrom_length,
+        chrom_one_past_end,
+        last_chunk_logical_extension,
+        max_group_span,
+        masked_intervals: &masked_intervals,
+        ref_fetcher: &ref_fetcher,
+        params,
+        psp_readers,
+        writer,
+        stats,
+        chunk_scratch,
+        fix_scratch,
+        chunk,
+        carryover,
+        carryover_snapshot: &mut carryover_snapshot,
+        worker_pool,
+    };
+
     while chunk_range_start < chrom_one_past_end {
-        let nominal_span = params.sizing.chunk_genomic_span.max(1);
+        let nominal_span = state.params.sizing.chunk_genomic_span.max(1);
         let max_span = nominal_span.saturating_mul(MAX_CHUNK_SPAN_GROWTH);
 
         let safe_end = load_and_run_chunk_with_retry(
-            chrom_id,
-            chrom_length,
-            chrom_one_past_end,
-            last_chunk_logical_extension,
+            &mut state,
             chunk_range_start,
             psp_cursor,
             nominal_span,
             max_span,
-            psp_readers,
-            &masked_intervals,
-            &ref_fetcher,
-            params,
-            writer,
-            stats,
-            chunk_scratch,
-            fix_scratch,
-            chunk,
-            carryover,
-            &mut carryover_snapshot,
-            worker_pool,
-            max_group_span,
         )?;
 
         if safe_end >= chrom_one_past_end {
             break;
         }
         chunk_range_start = safe_end;
-        psp_cursor = chunk.range.end.min(chrom_one_past_end);
+        psp_cursor = state.chunk.range.end.min(chrom_one_past_end);
     }
 
     Ok(())
@@ -765,49 +772,103 @@ where
 /// we will attempt before surfacing `NoSafeGap` to the caller.
 const MAX_CHUNK_SPAN_GROWTH: u32 = 8;
 
-/// Load + pre-pass one chunk, retrying with a 2× wider load range if
-/// the pre-pass can't find a safe boundary inside the current range.
-/// Returns the chunk's `safe_end` on success — the caller advances
-/// `chunk_range_start` to that value.
+/// M12: per-chrom mutable state bundle. Carries every long-lived
+/// borrow that `load_and_run_chunk_with_retry` and its three phase
+/// helpers need so the helpers' signatures stay short and the
+/// borrow graph is visible at one place. Constructed in
+/// `drive_one_chrom_generic` and reused across every chunk on the
+/// chromosome.
 ///
-/// On retry the carryover the previous chunk handed in is restored
-/// from a snapshot the helper takes before the first load attempt; the
-/// PSP iterators are re-created via `region_records`, which re-seeks
-/// the block index per call.
-#[allow(clippy::too_many_arguments)]
-fn load_and_run_chunk_with_retry<W>(
+/// Field grouping mirrors the helpers' phase responsibilities:
+/// 1. Inputs (constants for the per-chrom loop): `chrom_id`,
+///    `chrom_length`, `chrom_one_past_end`, `last_chunk_logical_extension`,
+///    `max_group_span`, `masked_intervals`, `ref_fetcher`, `params`.
+/// 2. Owned mutable state: `psp_readers`, `writer`, `stats`,
+///    `chunk_scratch`, `fix_scratch`, `chunk`, `carryover`,
+///    `carryover_snapshot`, `worker_pool`.
+struct ChunkLoopState<'a, W: Read + Seek> {
     chrom_id: u32,
     chrom_length: u32,
     chrom_one_past_end: u32,
     last_chunk_logical_extension: u32,
+    max_group_span: u32,
+    masked_intervals: &'a [std::ops::Range<u32>],
+    ref_fetcher: &'a dyn crate::fasta::fetcher::ChromRefFetcher,
+    params: &'a ChunkDriverParams,
+    psp_readers: &'a mut [PspReader<W>],
+    writer: &'a mut CohortVcfWriter,
+    stats: &'a mut ChunkDriverStats,
+    chunk_scratch: &'a mut ChunkLoadScratch,
+    fix_scratch: &'a mut FixBoundariesScratch,
+    chunk: &'a mut MaterialisedChunk,
+    carryover: &'a mut [SampleColumns],
+    carryover_snapshot: &'a mut [SampleColumns],
+    worker_pool: &'a mut WorkerPool,
+}
+
+/// M12: orchestrate the three phases for one chunk — load with the
+/// NoSafeGap retry, partition+prefetch per window, run the per-
+/// window math in parallel + drain in order. Returns the chunk's
+/// `safe_end` so the per-chrom loop can advance `chunk_range_start`.
+///
+/// On retry the carryover the previous chunk handed in is restored
+/// from a snapshot the helper takes before the first load attempt;
+/// the PSP iterators are re-created via `region_records`, which
+/// re-seeks the block index per call.
+fn load_and_run_chunk_with_retry<W>(
+    state: &mut ChunkLoopState<W>,
     chunk_range_start: u32,
     psp_cursor: u32,
     nominal_span: u32,
     max_span: u32,
-    psp_readers: &mut [PspReader<W>],
-    masked_intervals: &[std::ops::Range<u32>],
-    ref_fetcher: &dyn crate::fasta::fetcher::ChromRefFetcher,
-    params: &ChunkDriverParams,
-    writer: &mut CohortVcfWriter,
-    stats: &mut ChunkDriverStats,
-    chunk_scratch: &mut ChunkLoadScratch,
-    fix_scratch: &mut FixBoundariesScratch,
-    chunk: &mut MaterialisedChunk,
-    carryover: &mut [SampleColumns],
-    carryover_snapshot: &mut [SampleColumns],
-    worker_pool: &mut WorkerPool,
-    max_group_span: u32,
 ) -> Result<u32, ChunkDriverError>
 where
     W: Read + Seek,
 {
-    debug_assert_eq!(carryover.len(), carryover_snapshot.len());
+    load_chunk_with_safe_boundary_retry(
+        state,
+        chunk_range_start,
+        psp_cursor,
+        nominal_span,
+        max_span,
+    )?;
+    run_chunk_windows_parallel(state)?;
+    drain_window_outputs(state)?;
+    Ok(state.chunk.safe_end)
+}
+
+/// M12 phase 1: snapshot the carryover, then loop over load + pre-pass
+/// attempts doubling `attempt_span` on every `NoSafeGap`. Updates
+/// `state.chunk` and `state.carryover` in place; bumps the
+/// `chunks_loaded` / `chunk_variants_total` / `chunks_with_fewer_windows_than_requested`
+/// counters as it goes.
+fn load_chunk_with_safe_boundary_retry<W>(
+    state: &mut ChunkLoopState<W>,
+    chunk_range_start: u32,
+    psp_cursor: u32,
+    nominal_span: u32,
+    max_span: u32,
+) -> Result<(), ChunkDriverError>
+where
+    W: Read + Seek,
+{
+    debug_assert_eq!(state.carryover.len(), state.carryover_snapshot.len());
     // M14: snapshot the carryover so we can restore it on `NoSafeGap` —
     // `load_chunk_from_iters` drains it as part of the raw-load step
     // and we need the original contents back for the retry attempt.
-    for (snap, carry) in carryover_snapshot.iter_mut().zip(carryover.iter()) {
+    for (snap, carry) in state
+        .carryover_snapshot
+        .iter_mut()
+        .zip(state.carryover.iter())
+    {
         snap.clone_from_columns(carry);
     }
+
+    let chrom_id = state.chrom_id;
+    let chrom_length = state.chrom_length;
+    let chrom_one_past_end = state.chrom_one_past_end;
+    let last_chunk_logical_extension = state.last_chunk_logical_extension;
+    let max_group_span = state.max_group_span;
 
     let mut attempt_span = nominal_span;
     loop {
@@ -821,69 +882,65 @@ where
         let initial_load_span = chunk_range_end - chunk_range_start;
         // B3: bound the loader's `max_span` by this attempt's
         // `chunk_range_end` (which already reflects `attempt_span` +
-        // the last-chunk extension). The previous shape passed
-        // `extension_cap_end - chunk_range_start` (chrom-wide cap)
-        // unconditionally, so the loader's internal variant-bounded
-        // extension already ran to chrom-end on the *first* attempt,
-        // making NoSafeGap retries produce identical chunks — the
-        // outer retry's `attempt_span` doubling was a no-op when
-        // `target_variants_per_chunk > 0`. Tying `max_load_span` to
-        // `chunk_range_end` decouples the two axes: the loader's
-        // variant-bounded extension grows within `attempt_span`, the
-        // outer NoSafeGap retry grows `attempt_span` itself. PSP
-        // iterators are re-opened per attempt via `region_records`
-        // and respect the same `chunk_range_end` cap.
+        // the last-chunk extension). See the original B3 commit for
+        // the decoupling rationale.
         let max_load_span = initial_load_span;
         let psp_inclusive_end = chunk_range_end.saturating_sub(1).min(chrom_length);
 
-        let iters: Vec<_> = psp_readers
+        let iters: Vec<_> = state
+            .psp_readers
             .iter_mut()
             .map(|r| r.region_records(chrom_id, psp_cursor, psp_inclusive_end))
             .collect();
 
         let load_stats = load_chunk_from_iters(
-            chunk_scratch,
-            chunk,
+            state.chunk_scratch,
+            state.chunk,
             ChunkLoadExtent {
                 chrom_id,
                 range_start: chunk_range_start,
                 initial_span: initial_load_span,
-                target_variants: params
+                target_variants: state
+                    .params
                     .sizing
                     .target_variants_per_chunk
                     .map_or(0, NonZeroU32::get),
                 max_span: max_load_span,
             },
             iters,
-            carryover,
+            state.carryover,
         )
         .map_err(|source| ChunkDriverError::LoadChunk { chrom_id, source })?;
-        stats.chunks_loaded += 1;
-        stats.chunk_variants_total += u64::from(load_stats.variant_count);
+        state.stats.chunks_loaded += 1;
+        state.stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
         // M7: `target_window_count` is `NonZeroUsize` — no more
         // `.max(1)` driver-side fallback that bypassed the pre-pass's
         // `ZeroTargetWindowCount` validation.
-        let target_window_count = params.sizing.target_window_count.get();
+        let target_window_count = state.params.sizing.target_window_count.get();
         match fix_boundaries(
-            chunk,
-            carryover,
-            fix_scratch,
+            state.chunk,
+            state.carryover,
+            state.fix_scratch,
             max_group_span,
             target_window_count,
         ) {
             Ok(()) => {
                 // Mi21: surface when fix_boundaries silently produced
                 // fewer windows than the operator asked for.
-                if chunk.windows.len() < target_window_count {
-                    stats.chunks_with_fewer_windows_than_requested += 1;
+                if state.chunk.windows.len() < target_window_count {
+                    state.stats.chunks_with_fewer_windows_than_requested += 1;
                 }
-                break;
+                return Ok(());
             }
             Err(FixBoundariesError::NoSafeGap { .. }) if attempt_span < max_span => {
                 // M14: retry with double the span. Restore the carryover
                 // the previous chunk handed in (the load drained it).
-                for (carry, snap) in carryover.iter_mut().zip(carryover_snapshot.iter()) {
+                for (carry, snap) in state
+                    .carryover
+                    .iter_mut()
+                    .zip(state.carryover_snapshot.iter())
+                {
                     carry.clone_from_columns(snap);
                 }
                 attempt_span = attempt_span
@@ -897,16 +954,33 @@ where
             }
         }
     }
+}
 
+/// M12 phase 2: partition + REF prefetch per window (sequential),
+/// then run the per-window math in parallel via rayon.
+fn run_chunk_windows_parallel<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
+where
+    W: Read + Seek,
+{
     // Mi10: iterate `chunk.windows` directly — the loop body's only
     // `chunk` access is the immutable read `partition_window(chunk,
     // window, …)`, which is a shared reborrow under modern Rust's
-    // NLL. The previous `chunk.windows.clone()` was a defensive copy
-    // that allocated a fresh `Vec<Range<u32>>` per chunk for no
-    // borrow-checker reason.
-    let n_windows = chunk.windows.len();
-    let n_samples = chunk.n_samples();
-    worker_pool.ensure_capacity(n_windows.max(1), n_samples);
+    // NLL.
+    let n_windows = state.chunk.windows.len();
+    let n_samples = state.chunk.n_samples();
+    state
+        .worker_pool
+        .ensure_capacity(n_windows.max(1), n_samples);
+
+    let chrom_id = state.chrom_id;
+    let max_group_span = state.max_group_span;
+    let masked_intervals = state.masked_intervals;
+    let ref_fetcher = state.ref_fetcher;
+    // Split-borrow: `chunk` is read-only inside the loop while the
+    // worker pool's slots are mutated; rust accepts the disjoint
+    // field borrows here as long as we name them separately.
+    let chunk: &MaterialisedChunk = state.chunk;
+    let worker_pool = &mut *state.worker_pool;
 
     // ── Phase 1 (sequential): partition + prefetch REF bytes per
     //    window. The fetcher is `!Sync` so the prefetch can't run
@@ -934,12 +1008,12 @@ where
 
     // ── Phase 2 (parallel): the per-window math (layers 1+2+3 + EM
     //    + posterior summarisation + QUAL). Each slot's
-    //    `pre_fetched_ref_bytes` + `scratch` + `output_buf` are
-    //    disjoint, so the dispatch is structurally
+    //    `pre_fetched_ref_bytes` + `pipeline_scratch` + `posterior_records`
+    //    + `stats` are disjoint, so the dispatch is structurally
     //    Send-safe. rayon's `par_iter_mut().try_for_each` collects
     //    the first error and propagates. ──
-    let per_group_cfg = params.per_group_cfg;
-    let posterior_cfg = &params.posterior_cfg;
+    let per_group_cfg = state.params.per_group_cfg;
+    let posterior_cfg = &state.params.posterior_cfg;
     worker_pool.slots[..n_windows]
         .par_iter_mut()
         .try_for_each(|slot| {
@@ -955,14 +1029,27 @@ where
             )
         })
         .map_err(ChunkDriverError::RunWindow)?;
+    Ok(())
+}
 
-    // ── Sequential drain in window order — preserves the prior
-    //    per-record emit order even when step 4 runs the workers
-    //    concurrently. ──
-    // M15: `slot.stats` lives next to `slot.pipeline_scratch` as a
-    // separate `WindowRunStats` struct; the drive takes its contents
-    // (by `std::mem::take`) so the slot's counters reset for the next
-    // chunk while the per-driver `ChunkDriverStats` totals accumulate.
+/// M12 phase 3: sequential drain over the slots in window order —
+/// preserves the prior per-record emit order even when phase 2 runs
+/// the workers concurrently. M15: `slot.stats` lives next to
+/// `slot.pipeline_scratch` as a separate `WindowRunStats` struct; the
+/// drive takes its contents (by `std::mem::take`) so the slot's
+/// counters reset for the next chunk while the per-driver
+/// `ChunkDriverStats` totals accumulate.
+fn drain_window_outputs<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
+where
+    W: Read + Seek,
+{
+    let n_windows = state.chunk.windows.len();
+    // Split-borrow: take the &mut on worker_pool but keep the
+    // params/writer/stats refs for emit_or_drop.
+    let worker_pool = &mut *state.worker_pool;
+    let writer = &mut *state.writer;
+    let stats = &mut *state.stats;
+    let params = state.params;
     for slot in worker_pool.slots.iter_mut().take(n_windows) {
         let slot_stats = std::mem::take(&mut slot.stats);
         stats.lh_cap_groups_skipped += slot_stats.lh_cap_groups_skipped;
@@ -972,8 +1059,7 @@ where
             emit_or_drop(record, params, writer, stats)?;
         }
     }
-
-    Ok(chunk.safe_end)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -1031,7 +1117,7 @@ mod tests {
                 vec![
                     // REF: keep mapq moments low so REF-vs-ALT
                     // difference is the test knob.
-                    AlleleSupportStats::new(r, 0.0, r, 0, 0, u32::from(r) * 30, u64::from(r) * 900),
+                    AlleleSupportStats::new(r, 0.0, r, 0, 0, r * 30, u64::from(r) * 900),
                     // ALT: caller-supplied moments so the
                     // mapq-diff-t test can be triggered or skipped.
                     AlleleSupportStats::new(

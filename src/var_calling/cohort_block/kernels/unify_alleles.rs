@@ -1936,15 +1936,15 @@ mod tests {
         // differ by construction under permutation. The
         // allele-axis fields (allele set, is_compound, constituents)
         // are invariant: extract them.
-        let alleles_a: Vec<(Vec<u8>, bool, Vec<(u32, u32)>)> = (0..out_a.n_alleles())
+        let alleles_a: Vec<OracleAllele> = (0..out_a.n_alleles())
             .map(|i| {
                 let lo = out_a.constituent_offsets[i] as usize;
                 let hi = out_a.constituent_offsets[i + 1] as usize;
-                let constituents: Vec<(u32, u32)> = (lo..hi)
+                let constituents: Vec<(usize, usize)> = (lo..hi)
                     .map(|k| {
                         (
-                            out_a.constituent_record_idx[k],
-                            out_a.constituent_local_allele_idx[k],
+                            out_a.constituent_record_idx[k] as usize,
+                            out_a.constituent_local_allele_idx[k] as usize,
                         )
                     })
                     .collect();
@@ -1955,15 +1955,15 @@ mod tests {
                 )
             })
             .collect();
-        let alleles_b: Vec<(Vec<u8>, bool, Vec<(u32, u32)>)> = (0..out_b.n_alleles())
+        let alleles_b: Vec<OracleAllele> = (0..out_b.n_alleles())
             .map(|i| {
                 let lo = out_b.constituent_offsets[i] as usize;
                 let hi = out_b.constituent_offsets[i + 1] as usize;
-                let constituents: Vec<(u32, u32)> = (lo..hi)
+                let constituents: Vec<(usize, usize)> = (lo..hi)
                     .map(|k| {
                         (
-                            out_b.constituent_record_idx[k],
-                            out_b.constituent_local_allele_idx[k],
+                            out_b.constituent_record_idx[k] as usize,
+                            out_b.constituent_local_allele_idx[k] as usize,
                         )
                     })
                     .collect();
