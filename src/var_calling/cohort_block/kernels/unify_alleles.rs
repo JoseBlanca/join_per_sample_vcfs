@@ -610,10 +610,15 @@ pub(crate) fn project_per_position_into_scratch(
                 let entry_idx = match scratch.byte_index.get(scratch.projection_buf.as_slice()) {
                     Some(&idx) => idx,
                     None => {
+                        // Mi12: one clone is enough — `push_allele_into_scratch`
+                        // copies the bytes into the working allele's own `seq`,
+                        // so `key` is free to be moved into the dedup map after
+                        // the push. Previously this cloned twice (one local
+                        // `seq_copy`, one `seq_copy.clone()` for the insert).
                         let idx = scratch.n_active_alleles;
-                        let seq_copy = scratch.projection_buf.clone();
-                        scratch.byte_index.insert(seq_copy.clone(), idx);
-                        push_allele_into_scratch(scratch, &seq_copy, false, false, n_samples);
+                        let key = scratch.projection_buf.clone();
+                        push_allele_into_scratch(scratch, &key, false, false, n_samples);
+                        scratch.byte_index.insert(key, idx);
                         idx
                     }
                 };
@@ -734,10 +739,12 @@ pub(crate) fn admit_compound_candidates_columnar(
                 idx
             }
             None => {
+                // Mi12: one clone is enough — see the per-position
+                // dedup branch above.
                 let idx = scratch.n_active_alleles;
-                let seq_copy = scratch.projection_buf.clone();
-                scratch.byte_index.insert(seq_copy.clone(), idx);
-                push_allele_into_scratch(scratch, &seq_copy, true, true, n_samples);
+                let key = scratch.projection_buf.clone();
+                push_allele_into_scratch(scratch, &key, true, true, n_samples);
+                scratch.byte_index.insert(key, idx);
                 scratch.working_alleles[idx].constituents =
                     candidate.constituents_per_first_anchor.clone();
                 idx
