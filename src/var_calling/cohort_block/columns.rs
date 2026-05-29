@@ -663,4 +663,36 @@ mod tests {
         assert_eq!(dst.materialise_record(0, 0).pos, 14);
         assert_eq!(dst.materialise_record(0, 1).pos, 16);
     }
+
+    /// Mi22: `split_row_idx == 0` boundary — drain every row into the
+    /// destination, leaving the source empty.
+    #[test]
+    fn drain_rows_from_into_split_at_zero_moves_everything() {
+        let mut src = SampleColumns::empty();
+        for pos in [10_u32, 12, 14, 16] {
+            src.push_record(record(pos, ref_plus_alt(3, 4)));
+        }
+        let mut dst = SampleColumns::empty();
+        src.drain_rows_from_into(0, &mut dst);
+        assert_eq!(src.n_records(), 0);
+        assert_eq!(dst.n_records(), 4);
+        assert_eq!(dst.materialise_record(0, 0).pos, 10);
+        assert_eq!(dst.materialise_record(0, 3).pos, 16);
+    }
+
+    /// Mi22: `split_row_idx == n_records()` boundary — drain nothing.
+    /// The destination stays empty and the source is unchanged.
+    #[test]
+    fn drain_rows_from_into_split_at_end_moves_nothing() {
+        let mut src = SampleColumns::empty();
+        for pos in [10_u32, 12, 14, 16] {
+            src.push_record(record(pos, ref_plus_alt(3, 4)));
+        }
+        let mut dst = SampleColumns::empty();
+        src.drain_rows_from_into(src.n_records(), &mut dst);
+        assert_eq!(src.n_records(), 4);
+        assert_eq!(dst.n_records(), 0);
+        assert_eq!(src.materialise_record(0, 0).pos, 10);
+        assert_eq!(src.materialise_record(0, 3).pos, 16);
+    }
 }
