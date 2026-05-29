@@ -909,3 +909,308 @@ where
 
     Ok(chunk.safe_end)
 }
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! M20: per-category filter tests for `emit_or_drop` and its
+    //! helper predicates `passes_min_alt_obs` and
+    //! `record_fails_mapq_diff_t`. Pins each filter's boundary
+    //! behaviour and the order in which `emit_or_drop` applies them.
+
+    use super::*;
+    use crate::pileup_record::AlleleSupportStats;
+    use crate::psp::header::ParsedChromosome;
+    use crate::var_calling::per_group_merger::MergedAllele;
+    use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
+    use crate::vcf::CohortMetadata;
+    use tempfile::tempdir;
+
+    fn ref_allele() -> MergedAllele {
+        MergedAllele {
+            seq: b"A".to_vec(),
+            is_compound: false,
+            constituents: Vec::new(),
+        }
+    }
+
+    fn alt_allele() -> MergedAllele {
+        MergedAllele {
+            seq: b"T".to_vec(),
+            is_compound: false,
+            constituents: Vec::new(),
+        }
+    }
+
+    /// Build a 2-sample biallelic `PosteriorRecord` with caller-
+    /// supplied per-sample (REF_num_obs, ALT_num_obs) and per-sample
+    /// (best_genotype_idx, qual_phred). Other fields are filled with
+    /// stable defaults so the test surface stays small.
+    #[allow(clippy::too_many_arguments)]
+    fn mk_record(
+        pos: u32,
+        per_sample_num_obs: &[(u32, u32)],
+        best_genotype: Vec<usize>,
+        qual_phred: f64,
+        per_sample_alt_mapq_sum: u32,
+        per_sample_alt_mapq_sum_sq: u64,
+    ) -> PosteriorRecord {
+        let n_samples = per_sample_num_obs.len();
+        let scalars: Vec<AlleleSupportStats> = per_sample_num_obs
+            .iter()
+            .flat_map(|&(r, a)| {
+                vec![
+                    // REF: keep mapq moments low so REF-vs-ALT
+                    // difference is the test knob.
+                    AlleleSupportStats::new(r, 0.0, r, 0, 0, u32::from(r) * 30, u64::from(r) * 900),
+                    // ALT: caller-supplied moments so the
+                    // mapq-diff-t test can be triggered or skipped.
+                    AlleleSupportStats::new(
+                        a,
+                        0.0,
+                        a,
+                        0,
+                        0,
+                        per_sample_alt_mapq_sum,
+                        per_sample_alt_mapq_sum_sq,
+                    ),
+                ]
+            })
+            .collect();
+        PosteriorRecord {
+            locus: RecordLocus {
+                chrom_id: 0,
+                start: pos,
+                end: pos,
+            },
+            alleles: vec![ref_allele(), alt_allele()],
+            ploidy: 2,
+            n_samples,
+            n_genotypes: 3,
+            allele_frequencies: vec![0.5, 0.5],
+            compound_frequencies: vec![None, None],
+            posteriors: vec![0.0; n_samples * 3],
+            best_genotype,
+            gq_phred: vec![60.0; n_samples],
+            qual_phred,
+            scalars,
+            other_scalars: vec![],
+            chain_anchor_flags: vec![false; n_samples * 2],
+            diagnostics: EmDiagnostics {
+                iterations: 5,
+                final_max_delta_p: 1e-6,
+                converged: true,
+            },
+        }
+    }
+
+    // ── passes_min_alt_obs ───────────────────────────────────────────
+
+    /// `min_obs <= 1` short-circuits to `true`.
+    #[test]
+    fn passes_min_alt_obs_returns_true_when_min_obs_is_zero() {
+        let r = mk_record(100, &[(10, 0)], vec![0, 0], 100.0, 0, 0);
+        assert!(passes_min_alt_obs(&r, 0));
+    }
+
+    /// REF-only record (n_alleles == 1) short-circuits to `true`.
+    #[test]
+    fn passes_min_alt_obs_returns_true_when_record_has_only_ref_allele() {
+        let mut r = mk_record(100, &[(10, 0)], vec![0, 0], 100.0, 0, 0);
+        r.alleles = vec![ref_allele()];
+        r.scalars = vec![AlleleSupportStats::new(10, 0.0, 10, 0, 0, 0, 0)];
+        assert!(passes_min_alt_obs(&r, 5));
+    }
+
+    /// All samples have ALT obs < min_obs ⇒ false.
+    #[test]
+    fn passes_min_alt_obs_returns_false_when_all_alts_below_threshold() {
+        let r = mk_record(100, &[(10, 1), (10, 2)], vec![0, 0], 100.0, 0, 0);
+        assert!(!passes_min_alt_obs(&r, 5));
+    }
+
+    /// At least one sample's ALT obs >= min_obs ⇒ true (max-across-
+    /// samples wins).
+    #[test]
+    fn passes_min_alt_obs_returns_true_when_one_alt_meets_threshold_in_one_sample() {
+        let r = mk_record(100, &[(10, 1), (10, 7)], vec![0, 0], 100.0, 0, 0);
+        assert!(passes_min_alt_obs(&r, 5));
+    }
+
+    // ── record_fails_mapq_diff_t ─────────────────────────────────────
+
+    /// Non-finite threshold (`NaN`/`±INF`) short-circuits to `false`
+    /// (filter inert).
+    #[test]
+    fn record_fails_mapq_diff_t_returns_false_when_threshold_is_nan() {
+        let r = mk_record(100, &[(10, 10)], vec![0, 0], 100.0, 100, 4000);
+        assert!(!record_fails_mapq_diff_t(&r, f32::NAN));
+    }
+
+    /// REF count below the minimum (n_ref < 3) ⇒ filter inert
+    /// regardless of ALT moments.
+    #[test]
+    fn record_fails_mapq_diff_t_returns_false_when_n_ref_below_minimum() {
+        let r = mk_record(100, &[(1, 10)], vec![0, 0], 100.0, 100, 4000);
+        assert!(!record_fails_mapq_diff_t(&r, -1.0));
+    }
+
+    /// Both sides ≥ MAPQ_FILTER_MIN_READS_PER_SIDE; zero pooled
+    /// variance (every per-read mapq is identical) ⇒ `se2 == 0.0` ⇒
+    /// the helper short-circuits with `continue` and never trips.
+    /// Documents the `se2 <= 0.0` early-exit branch the Welch's-t
+    /// formula needs against degenerate cohorts.
+    #[test]
+    fn record_fails_mapq_diff_t_skips_alts_with_zero_pooled_variance() {
+        // REF mapq is 30 per read; ALT mapq is 1 per read; both
+        // are constant across samples ⇒ variance is zero on both
+        // sides ⇒ se2 == 0.0 ⇒ no trip even though means differ
+        // sharply.
+        let r = mk_record(100, &[(10, 10)], vec![0, 0], 100.0, 10, 10);
+        assert!(!record_fails_mapq_diff_t(&r, 0.0));
+    }
+
+    // ── emit_or_drop — filter order ──────────────────────────────────
+
+    /// Build a minimal `ChunkDriverParams` with explicit drop
+    /// thresholds. Other fields use the in-tree config defaults.
+    fn params_for_filters(
+        min_qual_phred: f64,
+        min_alt_obs_per_sample: u32,
+        min_mapq_diff_t: f32,
+        no_mapq_diff_filter: bool,
+    ) -> ChunkDriverParams {
+        use crate::var_calling::dust_filter::DustFilterConfig;
+        use crate::var_calling::per_group_merger::PerGroupMergerConfig;
+        use crate::var_calling::posterior_engine::PosteriorEngineConfig;
+        use crate::var_calling::variant_grouping::GrouperConfig;
+        ChunkDriverParams {
+            no_complexity_filter: true,
+            dust_cfg: DustFilterConfig::new(64, 20).expect("dust"),
+            grouper_cfg: GrouperConfig::new(50).expect("grouper"),
+            per_group_cfg: PerGroupMergerConfig::default(),
+            posterior_cfg: PosteriorEngineConfig::default(),
+            min_qual_phred,
+            min_alt_obs_per_sample,
+            no_mapq_diff_filter,
+            min_mapq_diff_t,
+            chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
+            target_variants_per_chunk: 0,
+            target_window_count: 1,
+        }
+    }
+
+    fn open_writer(out: &Path) -> CohortVcfWriter {
+        let metadata = CohortMetadata {
+            sample_names: vec!["S0".into(), "S1".into()],
+            contigs: vec![ParsedChromosome {
+                name: "chr1".into(),
+                length: 1_000_000,
+                md5: "00000000000000000000000000000001".into(),
+            }],
+            tool_string: "pop_var_caller test".into(),
+            command_line: String::new(),
+        };
+        let cfg = WriterConfig::new(out.to_path_buf());
+        CohortVcfWriter::new(metadata, cfg).expect("writer")
+    }
+
+    /// `emit_or_drop` increments `records_dropped_low_alt_obs` (not
+    /// any other counter) when the record fails `min_alt_obs`.
+    #[test]
+    fn emit_or_drop_increments_low_alt_obs_when_record_fails_min_alt_obs() {
+        let dir = tempdir().unwrap();
+        let mut writer = open_writer(&dir.path().join("out.vcf"));
+        let params = params_for_filters(0.0, 5, f32::NEG_INFINITY, true);
+        let mut stats = ChunkDriverStats::default();
+        // Both samples have ALT obs = 1 < min_alt_obs_per_sample = 5.
+        let r = mk_record(100, &[(10, 1), (10, 1)], vec![1, 1], 100.0, 0, 0);
+        emit_or_drop(r, &params, &mut writer, &mut stats).unwrap();
+        assert_eq!(stats.records_dropped_low_alt_obs, 1);
+        assert_eq!(stats.records_dropped_hom_ref, 0);
+        assert_eq!(stats.records_dropped_low_qual, 0);
+        assert_eq!(stats.records_dropped_low_mapq_diff_t, 0);
+        assert_eq!(stats.records_written, 0);
+        let _ = writer.abort();
+    }
+
+    /// `is_variant_call` returns false for all-hom-REF best_genotype
+    /// ⇒ records_dropped_hom_ref bumps.
+    #[test]
+    fn emit_or_drop_increments_hom_ref_when_is_variant_call_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut writer = open_writer(&dir.path().join("out.vcf"));
+        let params = params_for_filters(0.0, 0, f32::NEG_INFINITY, true);
+        let mut stats = ChunkDriverStats::default();
+        // All-hom-REF: best_genotype index 0 in every sample.
+        let r = mk_record(100, &[(10, 5), (10, 5)], vec![0, 0], 100.0, 0, 0);
+        emit_or_drop(r, &params, &mut writer, &mut stats).unwrap();
+        assert_eq!(stats.records_dropped_hom_ref, 1);
+        assert_eq!(stats.records_dropped_low_alt_obs, 0);
+        assert_eq!(stats.records_dropped_low_qual, 0);
+        assert_eq!(stats.records_dropped_low_mapq_diff_t, 0);
+        let _ = writer.abort();
+    }
+
+    /// `qual_phred < min_qual_phred` after the variant-call check
+    /// passes ⇒ records_dropped_low_qual bumps.
+    #[test]
+    fn emit_or_drop_increments_low_qual_when_qual_phred_below_threshold() {
+        let dir = tempdir().unwrap();
+        let mut writer = open_writer(&dir.path().join("out.vcf"));
+        let params = params_for_filters(50.0, 0, f32::NEG_INFINITY, true);
+        let mut stats = ChunkDriverStats::default();
+        // Variant call (best_genotype != [0,0]); qual = 10 < 50.
+        let r = mk_record(100, &[(10, 5), (10, 5)], vec![1, 1], 10.0, 0, 0);
+        emit_or_drop(r, &params, &mut writer, &mut stats).unwrap();
+        assert_eq!(stats.records_dropped_low_qual, 1);
+        assert_eq!(stats.records_dropped_low_alt_obs, 0);
+        assert_eq!(stats.records_dropped_hom_ref, 0);
+        assert_eq!(stats.records_dropped_low_mapq_diff_t, 0);
+        let _ = writer.abort();
+    }
+
+    /// Filter order: a record that *would* trip both `is_variant_call`
+    /// (hom_ref) and `qual_phred` (low qual) increments **only**
+    /// `records_dropped_hom_ref` — the order is `min_alt_obs →
+    /// is_variant_call → qual_phred → mapq_diff_t`, and hom_ref
+    /// short-circuits first.
+    #[test]
+    fn emit_or_drop_filter_order_pins_hom_ref_winning_over_low_qual() {
+        let dir = tempdir().unwrap();
+        let mut writer = open_writer(&dir.path().join("out.vcf"));
+        let params = params_for_filters(50.0, 0, f32::NEG_INFINITY, true);
+        let mut stats = ChunkDriverStats::default();
+        // hom-REF best genotype AND qual below threshold — both
+        // filters would trip; hom_ref's branch is reached first.
+        let r = mk_record(100, &[(10, 1), (10, 1)], vec![0, 0], 10.0, 0, 0);
+        emit_or_drop(r, &params, &mut writer, &mut stats).unwrap();
+        assert_eq!(
+            stats.records_dropped_hom_ref, 1,
+            "hom_ref wins the order race"
+        );
+        assert_eq!(stats.records_dropped_low_qual, 0);
+        let _ = writer.abort();
+    }
+
+    /// All filters pass ⇒ records_written bumps.
+    #[test]
+    fn emit_or_drop_writes_record_and_increments_records_written_on_pass() {
+        let dir = tempdir().unwrap();
+        let mut writer = open_writer(&dir.path().join("out.vcf"));
+        let params = params_for_filters(0.0, 0, f32::NEG_INFINITY, true);
+        let mut stats = ChunkDriverStats::default();
+        let r = mk_record(100, &[(10, 5), (10, 5)], vec![1, 1], 100.0, 0, 0);
+        emit_or_drop(r, &params, &mut writer, &mut stats).unwrap();
+        assert_eq!(stats.records_written, 1);
+        assert_eq!(stats.records_dropped_low_alt_obs, 0);
+        assert_eq!(stats.records_dropped_hom_ref, 0);
+        assert_eq!(stats.records_dropped_low_qual, 0);
+        assert_eq!(stats.records_dropped_low_mapq_diff_t, 0);
+        // finish() consumes the writer cleanly.
+        writer.finish().unwrap();
+    }
+}
