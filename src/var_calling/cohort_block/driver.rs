@@ -299,6 +299,26 @@ pub fn drive_cohort_chunked(
     let n_samples = sample_names.len();
     debug_assert_eq!(psp_paths.len(), n_samples);
 
+    // Mi20: surface every effective `ChunkDriverParams` value on
+    // stderr at startup so an operator looking at a run log can
+    // recover "what config did this run actually use?" without
+    // having to read the CLI invocation. Pairs with the variant-
+    // filter and chunk-loop counters that already land in
+    // `print_run_summary` at the end of the run.
+    eprintln!(
+        "var-calling: chunk_genomic_span={} target_variants_per_chunk={} \
+         target_window_count={} min_qual_phred={} min_alt_obs_per_sample={} \
+         no_mapq_diff_filter={} min_mapq_diff_t={} no_complexity_filter={}",
+        params.chunk_genomic_span,
+        params.target_variants_per_chunk,
+        params.target_window_count,
+        params.min_qual_phred,
+        params.min_alt_obs_per_sample,
+        params.no_mapq_diff_filter,
+        params.min_mapq_diff_t,
+        params.no_complexity_filter,
+    );
+
     // Open one PSP reader per sample. Reused across chromosomes;
     // `region_records` re-seeks via the block index per call.
     let mut psp_readers: Vec<PspReader<BufReader<File>>> = Vec::with_capacity(psp_paths.len());
