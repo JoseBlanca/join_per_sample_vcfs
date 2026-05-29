@@ -38,7 +38,7 @@ use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::cohort_block::loader::{
-    ChunkLoadError, ChunkLoadScratch, load_chunk_from_iters,
+    ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
 use crate::var_calling::cohort_block::partition::{PartitionError, partition_window};
 use crate::var_calling::cohort_block::pre_pass::{
@@ -572,12 +572,13 @@ fn compute_dust_mask_for_chrom(
     // (~90 MB for tomato chrom 1) just to re-iterate them — defeating
     // the chunk driver's "per-chunk memory bounded by
     // `target_variants_per_chunk × n_samples`" contract.
-    let base_iter = ref_fetcher
-        .iter_bases()
-        .map_err(|source| ChunkDriverError::ComputeDustMask {
-            contig: contig.to_string(),
-            source,
-        })?;
+    let base_iter =
+        ref_fetcher
+            .iter_bases()
+            .map_err(|source| ChunkDriverError::ComputeDustMask {
+                contig: contig.to_string(),
+                source,
+            })?;
     let intervals = sdust_mask_streaming(
         base_iter.map(|r| r.map_err(io::Error::other)),
         chrom_length,
@@ -790,11 +791,13 @@ where
         let load_stats = load_chunk_from_iters(
             chunk_scratch,
             chunk,
-            chrom_id,
-            chunk_range_start,
-            initial_load_span,
-            params.target_variants_per_chunk,
-            max_load_span,
+            ChunkLoadExtent {
+                chrom_id,
+                range_start: chunk_range_start,
+                initial_span: initial_load_span,
+                target_variants: params.target_variants_per_chunk,
+                max_span: max_load_span,
+            },
             iters,
             carryover,
         )

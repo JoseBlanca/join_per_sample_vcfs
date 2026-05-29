@@ -42,7 +42,7 @@ use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::cohort_block::loader::{
-    ChunkLoadError, ChunkLoadScratch, load_chunk_from_iters,
+    ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
 use crate::var_calling::per_position_merger::PerPositionPileups;
 
@@ -177,11 +177,13 @@ impl<R: Read + Seek> ChunkedPositionStream<R> {
             let _stats = load_chunk_from_iters(
                 &mut self.chunk_scratch,
                 &mut self.chunk,
-                chrom_id,
-                range_start,
-                initial_span,
-                self.target_variants_per_chunk,
-                max_span,
+                ChunkLoadExtent {
+                    chrom_id,
+                    range_start,
+                    initial_span,
+                    target_variants: self.target_variants_per_chunk,
+                    max_span,
+                },
                 iters,
                 &mut self.carryover,
             )?;

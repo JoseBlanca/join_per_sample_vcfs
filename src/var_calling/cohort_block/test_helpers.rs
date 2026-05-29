@@ -10,7 +10,9 @@ use std::ops::Range;
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
-use crate::var_calling::cohort_block::loader::{ChunkLoadScratch, load_chunk_from_iters};
+use crate::var_calling::cohort_block::loader::{
+    ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
+};
 use crate::var_calling::cohort_block::partition::WindowPartition;
 use crate::var_calling::cohort_block::pre_pass::{
     FixBoundariesError, FixBoundariesScratch, fix_boundaries,
@@ -95,11 +97,13 @@ pub(crate) fn run_loader(
     load_chunk_from_iters(
         &mut scratch,
         &mut out,
-        chrom_id,
-        range.start,
-        span,
-        0,
-        span,
+        ChunkLoadExtent {
+            chrom_id,
+            range_start: range.start,
+            initial_span: span,
+            target_variants: 0,
+            max_span: span,
+        },
         iters,
         &mut carryover,
     )

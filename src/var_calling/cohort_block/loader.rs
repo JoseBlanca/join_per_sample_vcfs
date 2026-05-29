@@ -74,6 +74,58 @@ impl ChunkLoadScratch {
     }
 }
 
+/// M13: per-call load-extent policy bundle for
+/// [`load_chunk_from_iters`].
+///
+/// The four span/variant knobs always travel together —
+/// `range_start`, `initial_span`, `target_variants`, `max_span` —
+/// and a `u32`-only signature like
+/// `load_chunk_from_iters(.., 10, 100, 0, 90, ..)` makes argument-
+/// order mistakes silent. Bundling them into a named struct turns
+/// the call site into a field-by-field literal and the helper into
+/// a single-`extent: ChunkLoadExtent` parameter.
+///
+/// **Fields.**
+/// - `chrom_id` — chromosome the chunk's records belong to.
+/// - `range_start` — 1-based inclusive lower bound of the chunk's
+///   load span.
+/// - `initial_span` — BP span of the loader's first pull attempt.
+/// - `target_variants` — soft lower bound on the post-filter variant
+///   count (`0` disables the variant-bounded extension loop).
+/// - `max_span` — hard cap on the chunk's BP span across every
+///   extension iteration. `>= initial_span` is enforced; the loader
+///   returns `ChunkLoadError::InvalidRange` otherwise.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkLoadExtent {
+    pub chrom_id: u32,
+    pub range_start: u32,
+    pub initial_span: u32,
+    pub target_variants: u32,
+    pub max_span: u32,
+}
+
+impl ChunkLoadExtent {
+    /// Build an extent from positional values. The struct-literal
+    /// form is preferred at production call sites; this constructor
+    /// exists for terse test fixtures.
+    pub fn new(
+        chrom_id: u32,
+        range_start: u32,
+        initial_span: u32,
+        target_variants: u32,
+        max_span: u32,
+    ) -> Self {
+        Self {
+            chrom_id,
+            range_start,
+            initial_span,
+            target_variants,
+            max_span,
+        }
+    }
+}
+
 /// Per-chunk diagnostic stats returned by
 /// [`load_chunk_from_iters`]. Drivers fold these into their own
 /// cumulative counters; callers that don't care can drop the value.
@@ -186,21 +238,23 @@ pub enum ChunkLoadError<E> {
 ///    `out.range = range_start..final_attempt_end`,
 ///    `out.safe_end = final_attempt_end` (the pre-pass may revise
 ///    it down), leave `out.windows` empty for the pre-pass.
-#[allow(clippy::too_many_arguments)]
 pub fn load_chunk_from_iters<I, E>(
     scratch: &mut ChunkLoadScratch,
     out: &mut MaterialisedChunk,
-    chrom_id: u32,
-    range_start: u32,
-    initial_span: u32,
-    target_variants: u32,
-    max_span: u32,
+    extent: ChunkLoadExtent,
     per_sample_iters: Vec<I>,
     carryover: &mut [SampleColumns],
 ) -> Result<ChunkLoadStats, ChunkLoadError<E>>
 where
     I: IntoIterator<Item = Result<PileupRecord, E>>,
 {
+    let ChunkLoadExtent {
+        chrom_id,
+        range_start,
+        initial_span,
+        target_variants,
+        max_span,
+    } = extent;
     let n_samples = scratch.n_samples();
     if per_sample_iters.len() != n_samples {
         return Err(ChunkLoadError::SampleCountMismatch {
@@ -544,11 +598,13 @@ mod tests {
         let stats = load_chunk_from_iters(
             &mut scratch,
             &mut out,
-            chrom_id,
-            range_start,
-            initial_span,
-            target_variants,
-            max_span,
+            ChunkLoadExtent::new(
+                chrom_id,
+                range_start,
+                initial_span,
+                target_variants,
+                max_span,
+            ),
             iters,
             &mut carryover,
         )
@@ -571,9 +627,14 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, Infallible>))
             .collect();
-        let err =
-            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
-                .unwrap_err();
+        let err = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 10, 90, 0, 90),
+            iters,
+            &mut carry,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             ChunkLoadError::SampleCountMismatch {
@@ -593,9 +654,14 @@ mod tests {
             .map(|_| Vec::<PileupRecord>::new())
             .map(|rs| rs.into_iter().map(Ok::<_, Infallible>))
             .collect();
-        let err =
-            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
-                .unwrap_err();
+        let err = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 10, 90, 0, 90),
+            iters,
+            &mut carry,
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             ChunkLoadError::CarryoverLengthMismatch {
@@ -623,9 +689,14 @@ mod tests {
             .collect();
         // initial_span = 100, max_span = 50 — the loader cannot honour
         // a 100-BP load when capped at 50 BP.
-        let err =
-            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 100, 0, 50, iters, &mut carry)
-                .unwrap_err();
+        let err = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 10, 100, 0, 50),
+            iters,
+            &mut carry,
+        )
+        .unwrap_err();
         assert!(matches!(err, ChunkLoadError::InvalidRange { .. }));
     }
 
@@ -918,7 +989,14 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry).unwrap();
+        load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 10, 90, 0, 90),
+            iters,
+            &mut carry,
+        )
+        .unwrap();
 
         assert_eq!(carry[0].n_records(), 0);
         assert_eq!(carry[1].n_records(), 0);
@@ -947,8 +1025,14 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        let err = load_chunk_from_iters(&mut scratch, &mut out, 0, 100, 0, 0, 0, iters, &mut carry)
-            .expect_err("zero initial_span rejected");
+        let err = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 100, 0, 0, 0),
+            iters,
+            &mut carry,
+        )
+        .expect_err("zero initial_span rejected");
         assert!(matches!(err, ChunkLoadError::InvalidRange { .. }));
     }
 
@@ -963,9 +1047,14 @@ mod tests {
             .into_iter()
             .map(|rs| rs.into_iter().map(Ok::<_, std::convert::Infallible>))
             .collect();
-        let err =
-            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
-                .expect_err("wrong-chromosome record rejected");
+        let err = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 10, 90, 0, 90),
+            iters,
+            &mut carry,
+        )
+        .expect_err("wrong-chromosome record rejected");
         assert!(matches!(
             err,
             ChunkLoadError::UnexpectedChromosome {
@@ -984,9 +1073,14 @@ mod tests {
         let mut carry = vec![SampleColumns::empty()];
         let iters: Vec<Box<dyn Iterator<Item = Result<PileupRecord, &'static str>>>> =
             vec![Box::new(std::iter::once(Err("psp blew up")))];
-        let err =
-            load_chunk_from_iters(&mut scratch, &mut out, 0, 10, 90, 0, 90, iters, &mut carry)
-                .expect_err("upstream error surfaced");
+        let err = load_chunk_from_iters(
+            &mut scratch,
+            &mut out,
+            ChunkLoadExtent::new(0, 10, 90, 0, 90),
+            iters,
+            &mut carry,
+        )
+        .expect_err("upstream error surfaced");
         assert!(matches!(
             err,
             ChunkLoadError::UpstreamRead {
@@ -1013,11 +1107,7 @@ mod tests {
         load_chunk_from_iters(
             &mut scratch,
             &mut out,
-            0,
-            10,
-            40,
-            0,
-            40,
+            ChunkLoadExtent::new(0, 10, 40, 0, 40),
             iters_a,
             &mut carry,
         )
@@ -1033,11 +1123,7 @@ mod tests {
         load_chunk_from_iters(
             &mut scratch,
             &mut out,
-            7,
-            200,
-            100,
-            0,
-            100,
+            ChunkLoadExtent::new(7, 200, 100, 0, 100),
             iters_b,
             &mut carry,
         )
