@@ -584,15 +584,7 @@ pub(crate) fn read_support_stats_from_columns(
 ) -> AlleleSupportStats {
     let allele_lo = sample.allele_offsets[row_idx] as usize;
     let k = allele_lo + local_allele_idx;
-    AlleleSupportStats::new(
-        sample.allele_num_obs[k],
-        sample.allele_q_sum[k],
-        sample.allele_fwd[k],
-        sample.allele_placed_left[k],
-        sample.allele_placed_start[k],
-        sample.allele_mapq_sum[k],
-        sample.allele_mapq_sum_sq[k],
-    )
+    sample.per_allele_fixed.support_at(k)
 }
 
 fn add_support(into: &mut AlleleSupportStats, src: &AlleleSupportStats) {

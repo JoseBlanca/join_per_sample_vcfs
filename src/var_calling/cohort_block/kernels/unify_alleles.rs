@@ -605,9 +605,9 @@ pub(crate) fn project_per_position_into_scratch(
             let local_span = sample.ref_span_at(row_idx) as usize;
             for k_allele in allele_lo..allele_hi {
                 let local_allele_idx = k_allele - allele_lo;
-                let seq_lo = sample.allele_seq_offsets[k_allele] as usize;
-                let seq_hi = sample.allele_seq_offsets[k_allele + 1] as usize;
-                let local_seq = &sample.allele_seq_bytes[seq_lo..seq_hi];
+                let seq_lo = sample.per_allele_seq.offsets[k_allele] as usize;
+                let seq_hi = sample.per_allele_seq.offsets[k_allele + 1] as usize;
+                let local_seq = &sample.per_allele_seq.bytes[seq_lo..seq_hi];
 
                 // Project local seq onto group span: prefix from REF +
                 // allele bytes + suffix from REF.
@@ -637,7 +637,7 @@ pub(crate) fn project_per_position_into_scratch(
                 };
 
                 let working = &mut scratch.working_alleles[entry_idx];
-                working.cohort_count += u64::from(sample.allele_num_obs[k_allele]);
+                working.cohort_count += u64::from(sample.per_allele_fixed.num_obs[k_allele]);
                 working.sources_per_sample[sample_idx]
                     .push((record_idx_in_group as u32, local_allele_idx as u32));
             }
@@ -860,9 +860,9 @@ fn build_chain_proposals_columnar(
         // Skip allele 0 (REF) — never participates in a compound.
         for k_allele in (allele_lo + 1)..allele_hi {
             let local_allele_idx = k_allele - allele_lo;
-            let chain_lo = sample.allele_chain_ids_offsets[k_allele] as usize;
-            let chain_hi = sample.allele_chain_ids_offsets[k_allele + 1] as usize;
-            for &chain_id in &sample.allele_chain_ids[chain_lo..chain_hi] {
+            let chain_lo = sample.per_allele_chain_ids.offsets[k_allele] as usize;
+            let chain_hi = sample.per_allele_chain_ids.offsets[k_allele + 1] as usize;
+            for &chain_id in &sample.per_allele_chain_ids.ids[chain_lo..chain_hi] {
                 let entry = by_chain.entry(chain_id).or_default();
                 if !entry
                     .iter()
@@ -937,8 +937,8 @@ fn project_compound_onto_group_columnar(
             let allele_hi = sample.allele_offsets[row_idx + 1] as usize;
             if c.local_allele_idx < (allele_hi - allele_lo) {
                 let k_allele = allele_lo + c.local_allele_idx;
-                let seq_lo = sample.allele_seq_offsets[k_allele] as usize;
-                let seq_hi = sample.allele_seq_offsets[k_allele + 1] as usize;
+                let seq_lo = sample.per_allele_seq.offsets[k_allele] as usize;
+                let seq_hi = sample.per_allele_seq.offsets[k_allele + 1] as usize;
                 found_seq = Some((sample_idx, seq_lo..seq_hi));
                 break;
             }
@@ -961,7 +961,7 @@ fn project_compound_onto_group_columnar(
         if local_offset > cursor_offset {
             out.extend_from_slice(&ref_seq[cursor_offset..local_offset]);
         }
-        out.extend_from_slice(&chunk.per_sample[sample_idx].allele_seq_bytes[seq_range]);
+        out.extend_from_slice(&chunk.per_sample[sample_idx].per_allele_seq.bytes[seq_range]);
         cursor_offset = local_offset + local_span;
     }
 

@@ -6,14 +6,253 @@
 //! pre-pass-decided `safe_end`, and the partition into worker
 //! windows. Materialising an owned [`PileupRecord`] for one
 //! (sample, row) is on demand via [`SampleColumns::materialise_record`].
+//!
+//! M16: per-allele columns are grouped into three sibling sub-structs
+//! ([`PerAlleleFixed`], [`PerAlleleSeq`], [`PerAlleleChainIds`]) so
+//! that `clear` / `push_row_from` / `truncate` etc. become "delegate
+//! to each group's same-named method" instead of one flat 11-column
+//! enumeration per method. Adding a new per-allele column lands on
+//! the matching sub-struct, not on every method of `SampleColumns`.
 
 use std::ops::Range;
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 
+/// Per-(record, allele) fixed-width scalar columns — the 7 components
+/// of [`AlleleSupportStats`]. One entry per allele across the whole
+/// sample's chunk; total length equals the parent's
+/// `allele_offsets[n_records]`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PerAlleleFixed {
+    pub num_obs: Vec<u32>,
+    pub q_sum: Vec<f64>,
+    pub fwd: Vec<u32>,
+    pub placed_left: Vec<u32>,
+    pub placed_start: Vec<u32>,
+    pub mapq_sum: Vec<u32>,
+    pub mapq_sum_sq: Vec<u64>,
+}
+
+impl PerAlleleFixed {
+    /// Total per-allele cells across all records.
+    pub fn len(&self) -> usize {
+        self.num_obs.len()
+    }
+
+    /// True when no per-allele cells are stored.
+    pub fn is_empty(&self) -> bool {
+        self.num_obs.is_empty()
+    }
+
+    /// Drop every cell while preserving every column's allocated
+    /// capacity.
+    pub fn clear(&mut self) {
+        self.num_obs.clear();
+        self.q_sum.clear();
+        self.fwd.clear();
+        self.placed_left.clear();
+        self.placed_start.clear();
+        self.mapq_sum.clear();
+        self.mapq_sum_sq.clear();
+    }
+
+    /// Append the components of one allele's [`AlleleSupportStats`]
+    /// — destructured up front so a future field on
+    /// [`AlleleSupportStats`] is a compile error here (the columnar
+    /// storage must carry every per-allele scalar to preserve byte-
+    /// identity downstream).
+    pub fn push(&mut self, support: AlleleSupportStats) {
+        // M17: no trailing `..` — the 7 named fields cover every field
+        // on `AlleleSupportStats` today, and a future field addition
+        // should be a compile error here.
+        let AlleleSupportStats {
+            num_obs,
+            q_sum,
+            fwd,
+            placed_left,
+            placed_start,
+            mapq_sum,
+            mapq_sum_sq,
+        } = support;
+        self.num_obs.push(num_obs);
+        self.q_sum.push(q_sum);
+        self.fwd.push(fwd);
+        self.placed_left.push(placed_left);
+        self.placed_start.push(placed_start);
+        self.mapq_sum.push(mapq_sum);
+        self.mapq_sum_sq.push(mapq_sum_sq);
+    }
+
+    /// Append `src`'s cells in `range` to `self`.
+    pub fn extend_from_range(&mut self, src: &Self, range: Range<usize>) {
+        self.num_obs.extend_from_slice(&src.num_obs[range.clone()]);
+        self.q_sum.extend_from_slice(&src.q_sum[range.clone()]);
+        self.fwd.extend_from_slice(&src.fwd[range.clone()]);
+        self.placed_left
+            .extend_from_slice(&src.placed_left[range.clone()]);
+        self.placed_start
+            .extend_from_slice(&src.placed_start[range.clone()]);
+        self.mapq_sum
+            .extend_from_slice(&src.mapq_sum[range.clone()]);
+        self.mapq_sum_sq.extend_from_slice(&src.mapq_sum_sq[range]);
+    }
+
+    /// Truncate every column to `len` cells.
+    pub fn truncate(&mut self, len: usize) {
+        self.num_obs.truncate(len);
+        self.q_sum.truncate(len);
+        self.fwd.truncate(len);
+        self.placed_left.truncate(len);
+        self.placed_start.truncate(len);
+        self.mapq_sum.truncate(len);
+        self.mapq_sum_sq.truncate(len);
+    }
+
+    /// Build an [`AlleleSupportStats`] from the cell at `allele_idx`.
+    pub fn support_at(&self, allele_idx: usize) -> AlleleSupportStats {
+        AlleleSupportStats::new(
+            self.num_obs[allele_idx],
+            self.q_sum[allele_idx],
+            self.fwd[allele_idx],
+            self.placed_left[allele_idx],
+            self.placed_start[allele_idx],
+            self.mapq_sum[allele_idx],
+            self.mapq_sum_sq[allele_idx],
+        )
+    }
+}
+
+/// Per-allele variable-length sequence-bytes column, nested-CSR-laid-
+/// out. `offsets[k]..offsets[k+1]` gives allele `k`'s slice of
+/// [`Self::bytes`]; the sentinel `0` at the start keeps the invariant
+/// `offsets.len() == n_alleles + 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerAlleleSeq {
+    pub offsets: Vec<u32>,
+    pub bytes: Vec<u8>,
+}
+
+impl PerAlleleSeq {
+    /// Empty columns ready to receive alleles. `offsets` starts with
+    /// the CSR sentinel `0`.
+    pub fn empty() -> Self {
+        Self {
+            offsets: vec![0],
+            bytes: Vec::new(),
+        }
+    }
+
+    /// Drop every cell while preserving allocated capacity. The CSR
+    /// offset sentinel is restored so the post-clear state still
+    /// honours the invariant.
+    pub fn clear(&mut self) {
+        self.offsets.clear();
+        self.offsets.push(0);
+        self.bytes.clear();
+    }
+
+    /// Append one allele's sequence bytes and push the resulting CSR
+    /// offset.
+    pub fn push(&mut self, seq: &[u8]) {
+        self.bytes.extend_from_slice(seq);
+        self.offsets.push(u32_from_usize(self.bytes.len()));
+    }
+
+    /// Append `src`'s alleles in `allele_range` to `self`, copying
+    /// their bytes and rewriting offsets to be `self`-relative.
+    pub fn extend_from_range(&mut self, src: &Self, allele_range: Range<usize>) {
+        let seq_lo = src.offsets[allele_range.start] as usize;
+        let seq_hi = src.offsets[allele_range.end] as usize;
+        let bytes_base = self.bytes.len();
+        self.bytes.extend_from_slice(&src.bytes[seq_lo..seq_hi]);
+        for k in (allele_range.start + 1)..=allele_range.end {
+            let inner_offset = src.offsets[k] as usize - seq_lo;
+            self.offsets.push(u32_from_usize(bytes_base + inner_offset));
+        }
+    }
+
+    /// Truncate to `n_alleles` alleles (drops their bytes too).
+    pub fn truncate(&mut self, n_alleles: usize) {
+        let bytes_keep = self.offsets[n_alleles] as usize;
+        self.offsets.truncate(n_alleles + 1);
+        self.bytes.truncate(bytes_keep);
+    }
+
+    /// Allele `allele_idx`'s sequence as a byte slice.
+    pub fn slice_at(&self, allele_idx: usize) -> &[u8] {
+        let lo = self.offsets[allele_idx] as usize;
+        let hi = self.offsets[allele_idx + 1] as usize;
+        &self.bytes[lo..hi]
+    }
+}
+
+/// Per-allele variable-length chain-id column, nested-CSR-laid-out.
+/// `offsets[k]..offsets[k+1]` gives allele `k`'s slice of
+/// [`Self::ids`]; the sentinel `0` at the start keeps the invariant
+/// `offsets.len() == n_alleles + 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerAlleleChainIds {
+    pub offsets: Vec<u32>,
+    pub ids: Vec<ChainId>,
+}
+
+impl PerAlleleChainIds {
+    /// Empty columns ready to receive alleles. `offsets` starts with
+    /// the CSR sentinel `0`.
+    pub fn empty() -> Self {
+        Self {
+            offsets: vec![0],
+            ids: Vec::new(),
+        }
+    }
+
+    /// Drop every cell while preserving allocated capacity. The CSR
+    /// offset sentinel is restored so the post-clear state still
+    /// honours the invariant.
+    pub fn clear(&mut self) {
+        self.offsets.clear();
+        self.offsets.push(0);
+        self.ids.clear();
+    }
+
+    /// Append one allele's chain ids and push the resulting CSR offset.
+    pub fn push(&mut self, chain_ids: &[ChainId]) {
+        self.ids.extend_from_slice(chain_ids);
+        self.offsets.push(u32_from_usize(self.ids.len()));
+    }
+
+    /// Append `src`'s alleles in `allele_range` to `self`, copying
+    /// their ids and rewriting offsets to be `self`-relative.
+    pub fn extend_from_range(&mut self, src: &Self, allele_range: Range<usize>) {
+        let id_lo = src.offsets[allele_range.start] as usize;
+        let id_hi = src.offsets[allele_range.end] as usize;
+        let ids_base = self.ids.len();
+        self.ids.extend_from_slice(&src.ids[id_lo..id_hi]);
+        for k in (allele_range.start + 1)..=allele_range.end {
+            let inner_offset = src.offsets[k] as usize - id_lo;
+            self.offsets.push(u32_from_usize(ids_base + inner_offset));
+        }
+    }
+
+    /// Truncate to `n_alleles` alleles (drops their ids too).
+    pub fn truncate(&mut self, n_alleles: usize) {
+        let ids_keep = self.offsets[n_alleles] as usize;
+        self.offsets.truncate(n_alleles + 1);
+        self.ids.truncate(ids_keep);
+    }
+
+    /// Allele `allele_idx`'s chain ids as a slice.
+    pub fn slice_at(&self, allele_idx: usize) -> &[ChainId] {
+        let lo = self.offsets[allele_idx] as usize;
+        let hi = self.offsets[allele_idx + 1] as usize;
+        &self.ids[lo..hi]
+    }
+}
+
 /// Per-sample, per-chunk columnar storage. Records are sorted by
 /// 1-based genomic `position` ascending. Per-allele data lives in
-/// CSR-laid-out flat columns indexed via [`Self::allele_offsets`].
+/// three sub-structs that each hold their own CSR-laid-out flat
+/// columns indexed via [`Self::allele_offsets`].
 ///
 /// **Why columnar.** PSP's on-disk blocks are already column-oriented;
 /// loading is a direct column-by-column copy with no intermediate
@@ -27,20 +266,13 @@ use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, Pileu
 ///   column; `[i, i+1)` gives the `i`-th record's allele range, and
 ///   the final entry equals the total allele count.
 ///
-/// **Per-(record, allele) fixed-width columns** — one entry per
-/// allele across all records; total length equals
-/// `allele_offsets[n_records]`:
-/// - [`Self::allele_num_obs`], [`Self::allele_q_sum`],
-///   [`Self::allele_fwd`], [`Self::allele_placed_left`],
-///   [`Self::allele_placed_start`], [`Self::allele_mapq_sum`],
-///   [`Self::allele_mapq_sum_sq`] — the 7 components of
-///   [`AlleleSupportStats`].
-///
-/// **Per-(record, allele) variable-length columns** — nested CSR:
-/// - [`Self::allele_seq_offsets`] + [`Self::allele_seq_bytes`]:
-///   allele sequence bytes.
-/// - [`Self::allele_chain_ids_offsets`] +
-///   [`Self::allele_chain_ids`]: phase-chain ids.
+/// **Per-(record, allele) sub-structs** — each indexed by the same
+/// CSR built on top of [`Self::allele_offsets`]:
+/// - [`Self::per_allele_fixed`]: 7 scalar columns from
+///   [`AlleleSupportStats`] (num_obs, q_sum, fwd, placed_left,
+///   placed_start, mapq_sum, mapq_sum_sq).
+/// - [`Self::per_allele_seq`]: allele-sequence bytes + nested CSR.
+/// - [`Self::per_allele_chain_ids`]: phase-chain ids + nested CSR.
 ///
 /// `chrom_id` is shared across the whole [`MaterialisedChunk`] and is
 /// not duplicated here.
@@ -57,17 +289,9 @@ use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, Pileu
 pub struct SampleColumns {
     pub positions: Vec<u32>,
     pub allele_offsets: Vec<u32>,
-    pub allele_num_obs: Vec<u32>,
-    pub allele_q_sum: Vec<f64>,
-    pub allele_fwd: Vec<u32>,
-    pub allele_placed_left: Vec<u32>,
-    pub allele_placed_start: Vec<u32>,
-    pub allele_mapq_sum: Vec<u32>,
-    pub allele_mapq_sum_sq: Vec<u64>,
-    pub allele_seq_offsets: Vec<u32>,
-    pub allele_seq_bytes: Vec<u8>,
-    pub allele_chain_ids_offsets: Vec<u32>,
-    pub allele_chain_ids: Vec<ChainId>,
+    pub per_allele_fixed: PerAlleleFixed,
+    pub per_allele_seq: PerAlleleSeq,
+    pub per_allele_chain_ids: PerAlleleChainIds,
 }
 
 impl Default for SampleColumns {
@@ -82,24 +306,17 @@ impl Default for SampleColumns {
 }
 
 impl SampleColumns {
-    /// Empty columns ready to receive records. Both CSR offset
-    /// columns start with a single `0` so the invariant
+    /// Empty columns ready to receive records. The top-level CSR
+    /// offset column and each per-allele sub-struct start with a
+    /// single `0` sentinel so the invariant
     /// `len(offsets) == n + 1` holds at every step.
     pub fn empty() -> Self {
         Self {
             positions: Vec::new(),
             allele_offsets: vec![0],
-            allele_num_obs: Vec::new(),
-            allele_q_sum: Vec::new(),
-            allele_fwd: Vec::new(),
-            allele_placed_left: Vec::new(),
-            allele_placed_start: Vec::new(),
-            allele_mapq_sum: Vec::new(),
-            allele_mapq_sum_sq: Vec::new(),
-            allele_seq_offsets: vec![0],
-            allele_seq_bytes: Vec::new(),
-            allele_chain_ids_offsets: vec![0],
-            allele_chain_ids: Vec::new(),
+            per_allele_fixed: PerAlleleFixed::default(),
+            per_allele_seq: PerAlleleSeq::empty(),
+            per_allele_chain_ids: PerAlleleChainIds::empty(),
         }
     }
 
@@ -120,7 +337,7 @@ impl SampleColumns {
     /// strictly ascending position order; debug-asserted.
     ///
     /// `record` is consumed; its [`AlleleObservation`] entries are
-    /// flattened into the per-(record, allele) columns.
+    /// flattened into the per-(record, allele) sub-structs.
     pub fn push_record(&mut self, record: PileupRecord) {
         if let Some(&prev_pos) = self.positions.last() {
             debug_assert!(
@@ -135,41 +352,15 @@ impl SampleColumns {
         for allele in record.alleles {
             let AlleleObservation {
                 seq,
-                // M17: no trailing `..` — the 7 named fields cover
-                // every field on `AlleleSupportStats` today, and a
-                // future field addition should be a compile error
-                // here (the columnar storage must carry every per-
-                // allele scalar to preserve byte-identity downstream).
-                support:
-                    AlleleSupportStats {
-                        num_obs,
-                        q_sum,
-                        fwd,
-                        placed_left,
-                        placed_start,
-                        mapq_sum,
-                        mapq_sum_sq,
-                    },
+                support,
                 chain_ids,
             } = allele;
-            self.allele_num_obs.push(num_obs);
-            self.allele_q_sum.push(q_sum);
-            self.allele_fwd.push(fwd);
-            self.allele_placed_left.push(placed_left);
-            self.allele_placed_start.push(placed_start);
-            self.allele_mapq_sum.push(mapq_sum);
-            self.allele_mapq_sum_sq.push(mapq_sum_sq);
-
-            self.allele_seq_bytes.extend_from_slice(&seq);
-            self.allele_seq_offsets
-                .push(u32_from_usize(self.allele_seq_bytes.len()));
-
-            self.allele_chain_ids.extend_from_slice(&chain_ids);
-            self.allele_chain_ids_offsets
-                .push(u32_from_usize(self.allele_chain_ids.len()));
+            self.per_allele_fixed.push(support);
+            self.per_allele_seq.push(&seq);
+            self.per_allele_chain_ids.push(&chain_ids);
         }
         self.allele_offsets
-            .push(u32_from_usize(self.allele_num_obs.len()));
+            .push(u32_from_usize(self.per_allele_fixed.len()));
     }
 
     /// 1-based position at row `record_idx`.
@@ -216,19 +407,9 @@ impl SampleColumns {
         self.positions.clear();
         self.allele_offsets.clear();
         self.allele_offsets.push(0);
-        self.allele_num_obs.clear();
-        self.allele_q_sum.clear();
-        self.allele_fwd.clear();
-        self.allele_placed_left.clear();
-        self.allele_placed_start.clear();
-        self.allele_mapq_sum.clear();
-        self.allele_mapq_sum_sq.clear();
-        self.allele_seq_offsets.clear();
-        self.allele_seq_offsets.push(0);
-        self.allele_seq_bytes.clear();
-        self.allele_chain_ids_offsets.clear();
-        self.allele_chain_ids_offsets.push(0);
-        self.allele_chain_ids.clear();
+        self.per_allele_fixed.clear();
+        self.per_allele_seq.clear();
+        self.per_allele_chain_ids.clear();
     }
 
     /// Append the row at `src_row_idx` of `src` to `self` by copying
@@ -252,45 +433,17 @@ impl SampleColumns {
 
         let allele_lo = src.allele_offsets[src_row_idx] as usize;
         let allele_hi = src.allele_offsets[src_row_idx + 1] as usize;
-        self.allele_num_obs
-            .extend_from_slice(&src.allele_num_obs[allele_lo..allele_hi]);
-        self.allele_q_sum
-            .extend_from_slice(&src.allele_q_sum[allele_lo..allele_hi]);
-        self.allele_fwd
-            .extend_from_slice(&src.allele_fwd[allele_lo..allele_hi]);
-        self.allele_placed_left
-            .extend_from_slice(&src.allele_placed_left[allele_lo..allele_hi]);
-        self.allele_placed_start
-            .extend_from_slice(&src.allele_placed_start[allele_lo..allele_hi]);
-        self.allele_mapq_sum
-            .extend_from_slice(&src.allele_mapq_sum[allele_lo..allele_hi]);
-        self.allele_mapq_sum_sq
-            .extend_from_slice(&src.allele_mapq_sum_sq[allele_lo..allele_hi]);
+        let allele_range = allele_lo..allele_hi;
 
-        let seq_lo = src.allele_seq_offsets[allele_lo] as usize;
-        let seq_hi = src.allele_seq_offsets[allele_hi] as usize;
-        let seq_base = self.allele_seq_bytes.len();
-        self.allele_seq_bytes
-            .extend_from_slice(&src.allele_seq_bytes[seq_lo..seq_hi]);
-        for k in (allele_lo + 1)..=allele_hi {
-            let inner_offset = src.allele_seq_offsets[k] as usize - seq_lo;
-            self.allele_seq_offsets
-                .push(u32_from_usize(seq_base + inner_offset));
-        }
-
-        let chain_lo = src.allele_chain_ids_offsets[allele_lo] as usize;
-        let chain_hi = src.allele_chain_ids_offsets[allele_hi] as usize;
-        let chain_base = self.allele_chain_ids.len();
-        self.allele_chain_ids
-            .extend_from_slice(&src.allele_chain_ids[chain_lo..chain_hi]);
-        for k in (allele_lo + 1)..=allele_hi {
-            let inner_offset = src.allele_chain_ids_offsets[k] as usize - chain_lo;
-            self.allele_chain_ids_offsets
-                .push(u32_from_usize(chain_base + inner_offset));
-        }
+        self.per_allele_fixed
+            .extend_from_range(&src.per_allele_fixed, allele_range.clone());
+        self.per_allele_seq
+            .extend_from_range(&src.per_allele_seq, allele_range.clone());
+        self.per_allele_chain_ids
+            .extend_from_range(&src.per_allele_chain_ids, allele_range);
 
         self.allele_offsets
-            .push(u32_from_usize(self.allele_num_obs.len()));
+            .push(u32_from_usize(self.per_allele_fixed.len()));
     }
 
     /// M14: replace this column's contents with a copy of `other`'s,
@@ -317,8 +470,8 @@ impl SampleColumns {
     /// nested-CSR offsets without materialising the bytes).
     pub fn ref_span_at(&self, record_idx: usize) -> u32 {
         let allele_lo = self.allele_offsets[record_idx] as usize;
-        let seq_lo = self.allele_seq_offsets[allele_lo];
-        let seq_hi = self.allele_seq_offsets[allele_lo + 1];
+        let seq_lo = self.per_allele_seq.offsets[allele_lo];
+        let seq_hi = self.per_allele_seq.offsets[allele_lo + 1];
         seq_hi - seq_lo
     }
 
@@ -333,22 +486,12 @@ impl SampleColumns {
             self.n_records(),
         );
         let allele_keep = self.allele_offsets[keep_n_records] as usize;
-        let seq_keep = self.allele_seq_offsets[allele_keep] as usize;
-        let chain_keep = self.allele_chain_ids_offsets[allele_keep] as usize;
 
         self.positions.truncate(keep_n_records);
         self.allele_offsets.truncate(keep_n_records + 1);
-        self.allele_num_obs.truncate(allele_keep);
-        self.allele_q_sum.truncate(allele_keep);
-        self.allele_fwd.truncate(allele_keep);
-        self.allele_placed_left.truncate(allele_keep);
-        self.allele_placed_start.truncate(allele_keep);
-        self.allele_mapq_sum.truncate(allele_keep);
-        self.allele_mapq_sum_sq.truncate(allele_keep);
-        self.allele_seq_offsets.truncate(allele_keep + 1);
-        self.allele_seq_bytes.truncate(seq_keep);
-        self.allele_chain_ids_offsets.truncate(allele_keep + 1);
-        self.allele_chain_ids.truncate(chain_keep);
+        self.per_allele_fixed.truncate(allele_keep);
+        self.per_allele_seq.truncate(allele_keep);
+        self.per_allele_chain_ids.truncate(allele_keep);
     }
 
     /// Move rows `split_row_idx..n_records()` into `dst` (appending
@@ -372,29 +515,17 @@ impl SampleColumns {
         let allele_hi = self.allele_offsets[record_idx + 1] as usize;
         // `alleles[0]` is REF; skip it. Walker invariant from
         // `pileup_record.rs`.
-        self.allele_num_obs[(allele_lo + 1)..allele_hi]
+        self.per_allele_fixed.num_obs[(allele_lo + 1)..allele_hi]
             .iter()
             .any(|&n| n > 0)
     }
 
     fn materialise_allele(&self, allele_idx: usize) -> AlleleObservation {
-        let seq_lo = self.allele_seq_offsets[allele_idx] as usize;
-        let seq_hi = self.allele_seq_offsets[allele_idx + 1] as usize;
-        let chain_lo = self.allele_chain_ids_offsets[allele_idx] as usize;
-        let chain_hi = self.allele_chain_ids_offsets[allele_idx + 1] as usize;
-        let support = AlleleSupportStats::new(
-            self.allele_num_obs[allele_idx],
-            self.allele_q_sum[allele_idx],
-            self.allele_fwd[allele_idx],
-            self.allele_placed_left[allele_idx],
-            self.allele_placed_start[allele_idx],
-            self.allele_mapq_sum[allele_idx],
-            self.allele_mapq_sum_sq[allele_idx],
-        );
+        let support = self.per_allele_fixed.support_at(allele_idx);
         AlleleObservation::new(
-            self.allele_seq_bytes[seq_lo..seq_hi].to_vec(),
+            self.per_allele_seq.slice_at(allele_idx).to_vec(),
             support,
-            self.allele_chain_ids[chain_lo..chain_hi].to_vec(),
+            self.per_allele_chain_ids.slice_at(allele_idx).to_vec(),
         )
     }
 }
@@ -523,8 +654,8 @@ mod tests {
         assert_eq!(columns.n_records(), 0);
         assert_eq!(columns.n_alleles_total(), 0);
         assert_eq!(columns.allele_offsets, vec![0]);
-        assert_eq!(columns.allele_seq_offsets, vec![0]);
-        assert_eq!(columns.allele_chain_ids_offsets, vec![0]);
+        assert_eq!(columns.per_allele_seq.offsets, vec![0]);
+        assert_eq!(columns.per_allele_chain_ids.offsets, vec![0]);
     }
 
     #[test]
@@ -604,8 +735,8 @@ mod tests {
         assert_eq!(columns.n_records(), 0);
         assert_eq!(columns.n_alleles_total(), 0);
         assert_eq!(columns.allele_offsets, vec![0]);
-        assert_eq!(columns.allele_seq_offsets, vec![0]);
-        assert_eq!(columns.allele_chain_ids_offsets, vec![0]);
+        assert_eq!(columns.per_allele_seq.offsets, vec![0]);
+        assert_eq!(columns.per_allele_chain_ids.offsets, vec![0]);
         assert!(columns.positions.capacity() >= positions_cap_before);
     }
 
