@@ -178,12 +178,18 @@ pub struct WorkerSlot {
     /// always `partition.n_groups()` after the driver runs the
     /// [`prefetch_window_ref_bytes`] sequential pre-pass.
     pub pre_fetched_ref_bytes: Vec<Vec<u8>>,
-    /// Column-native pipeline scratch — UnifyAlleles, ProjectScalars,
-    /// LogLikelihoods buffers, the EM `RecordScratch`, etc.
-    pub scratch: ColumnarPipelineScratch,
-    /// Per-window emitted records. Drained sequentially in window
-    /// order after the driver's per-window math finishes.
-    pub output_buf: Vec<PosteriorRecord>,
+    /// Mi3: column-native pipeline scratch — UnifyAlleles,
+    /// ProjectScalars, LogLikelihoods buffers, the EM `RecordScratch`,
+    /// etc. Named `pipeline_scratch` to mirror the sibling
+    /// `partition_scratch` field; the bare `scratch` name didn't say
+    /// *which* scratch this is when the slot already has another.
+    pub pipeline_scratch: ColumnarPipelineScratch,
+    /// Mi3: per-window emitted records, drained sequentially in
+    /// window order after the driver's per-window math finishes. Named
+    /// `posterior_records` so the slot drain `for r in slot.posterior_records.drain(..)`
+    /// reads as what it is; the previous `output_buf` was a bare
+    /// generic name.
+    pub posterior_records: Vec<PosteriorRecord>,
 }
 
 impl WorkerSlot {
@@ -192,8 +198,8 @@ impl WorkerSlot {
             partition_scratch: PartitionScratch::with_n_samples(n_samples),
             partition: WindowPartition::empty(),
             pre_fetched_ref_bytes: Vec::new(),
-            scratch: ColumnarPipelineScratch::empty(),
-            output_buf: Vec::new(),
+            pipeline_scratch: ColumnarPipelineScratch::empty(),
+            posterior_records: Vec::new(),
         }
     }
 }

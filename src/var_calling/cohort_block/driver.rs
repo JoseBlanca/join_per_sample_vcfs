@@ -825,8 +825,8 @@ where
                 &slot.pre_fetched_ref_bytes,
                 per_group_cfg,
                 posterior_cfg,
-                &mut slot.scratch,
-                &mut slot.output_buf,
+                &mut slot.pipeline_scratch,
+                &mut slot.posterior_records,
             )
         })
         .map_err(ChunkDriverError::RunWindow)?;
@@ -835,11 +835,12 @@ where
     //    per-record emit order even when step 4 runs the workers
     //    concurrently. ──
     for slot in worker_pool.slots.iter_mut().take(n_windows) {
-        let (cap_g, cap_a) = slot.scratch.take_lh_cap_stats();
+        let (cap_g, cap_a) = slot.pipeline_scratch.take_lh_cap_stats();
         stats.lh_cap_groups_skipped += cap_g;
         stats.lh_cap_alleles_in_skipped += cap_a;
-        stats.groups_skipped_post_unify_ref_only += slot.scratch.take_post_unify_ref_only_count();
-        for record in slot.output_buf.drain(..) {
+        stats.groups_skipped_post_unify_ref_only +=
+            slot.pipeline_scratch.take_post_unify_ref_only_count();
+        for record in slot.posterior_records.drain(..) {
             emit_or_drop(record, params, writer, stats)?;
         }
     }
