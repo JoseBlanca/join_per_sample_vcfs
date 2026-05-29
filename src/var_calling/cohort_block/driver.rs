@@ -141,6 +141,13 @@ pub struct ChunkDriverStats {
     /// kept-position count per chunk — a quick sanity check that
     /// `target_variants_per_chunk` is doing what the operator expects.
     pub chunk_variants_total: u64,
+    /// Mi21: chunks where `fix_boundaries` produced fewer windows
+    /// than `params.target_window_count` requested. The pre-pass
+    /// silently down-grades when safe positions are sparse; an
+    /// operator setting `--worker-windows-per-chunk 8` and seeing
+    /// `chunks_with_fewer_windows_than_requested > 0` knows the
+    /// requested parallelism didn't fully realise on those chunks.
+    pub chunks_with_fewer_windows_than_requested: u64,
 }
 
 /// Errors surfaced by the chunk-loop driver.
@@ -795,14 +802,22 @@ where
         stats.chunks_loaded += 1;
         stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
+        let target_window_count = params.target_window_count.max(1);
         match fix_boundaries(
             chunk,
             carryover,
             fix_scratch,
             max_group_span,
-            params.target_window_count.max(1),
+            target_window_count,
         ) {
-            Ok(()) => break,
+            Ok(()) => {
+                // Mi21: surface when fix_boundaries silently produced
+                // fewer windows than the operator asked for.
+                if chunk.windows.len() < target_window_count {
+                    stats.chunks_with_fewer_windows_than_requested += 1;
+                }
+                break;
+            }
             Err(FixBoundariesError::NoSafeGap { .. }) if attempt_span < max_span => {
                 // M14: retry with double the span. Restore the carryover
                 // the previous chunk handed in (the load drained it).
