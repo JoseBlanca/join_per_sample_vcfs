@@ -436,6 +436,14 @@ pub fn partition_window(
     Ok(())
 }
 
+// Nits (Wave 6): the test fixtures below use `&[a..b]` literals for the
+// `masked_intervals` parameter — these read naturally as "a single
+// masked range from a to b" but clippy's `single_range_in_vec_init`
+// lint flags them as ambiguous between "an array containing one
+// Range" and "an array of length b filled with value a". Allow at the
+// module level since rewriting every test would obscure the
+// fixture-shape intent.
+#[allow(clippy::single_range_in_vec_init)]
 #[cfg(test)]
 mod tests {
     use super::*;

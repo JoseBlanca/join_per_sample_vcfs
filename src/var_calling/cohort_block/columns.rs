@@ -501,6 +501,11 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).expect("CSR offset exceeds u32::MAX")
 }
 
+// Nits (Wave 6): `vec![a..b]` is the natural test-fixture form for
+// `MaterialisedChunk.windows` — clippy's `single_range_in_vec_init`
+// flags it as ambiguous between "a Vec of one Range" and "a Vec of
+// length b filled with value a". Allow at the module level.
+#[allow(clippy::single_range_in_vec_init)]
 #[cfg(test)]
 mod tests {
     use super::*;

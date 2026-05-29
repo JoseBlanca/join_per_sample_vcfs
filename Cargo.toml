@@ -30,6 +30,17 @@ private_intra_doc_links = "allow"
 # sites. Re-enable when those modules get their own clippy pass.
 fallible_impl_from = "warn"
 fn_params_excessive_bools = "warn"
+# cohort_block review M4 (Wave 3): `ChunkDriverError` carries `PathBuf`
+# + operation-context fields + a nested `VcfWriteError` / `PspReadError`
+# per variant so the operator-facing message names *what* the driver
+# was doing when the error fired (review §M4). The result is an
+# `Err`-arm wider than clippy's default 128-byte threshold; the
+# alternative is wrapping every typed-error inner field in `Box<…>`,
+# which pays a heap allocation per error and breaks the `#[source]`
+# chain anyhow-style rendering. Allow this lint cohort-wide — the
+# cost lives only on error paths and the diagnostic value is the
+# whole point.
+result_large_err = "allow"
 
 [profile.release]
 lto = "fat"

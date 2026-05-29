@@ -983,6 +983,13 @@ mod tests {
     };
     use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
+    /// Nits (Wave 6): the test-side `(seq, is_compound, constituents)`
+    /// triple is the byte-identity oracle shape the column-native and
+    /// row-shape kernels both produce. Naming it lets us drop the
+    /// `clippy::type_complexity` lint trips at the helper return
+    /// types.
+    type OracleAllele = (Vec<u8>, bool, Vec<(usize, usize)>);
+
     /// In-memory `ChromRefFetcher` for the kernel tests — mirrors the
     /// `MockRef` used inside `per_group_merger`'s test module so this
     /// suite can construct the same `SharedRefFetcher` for byte-
@@ -1357,7 +1364,7 @@ mod tests {
         partition: &WindowPartition,
         group_idx: usize,
         ref_fetcher: SharedRefFetcher,
-    ) -> Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> {
+    ) -> Vec<OracleAllele> {
         let group = crate::var_calling::cohort_block::worker::build_overlapping_variant_group(
             chunk,
             partition,
@@ -1390,9 +1397,7 @@ mod tests {
 
     /// Pull the new column-native kernel's allele set including
     /// `constituents` (the same shape the row-shape oracle returns).
-    fn columnar_alleles_with_constituents(
-        out: &UnifiedAllelesColumns,
-    ) -> Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> {
+    fn columnar_alleles_with_constituents(out: &UnifiedAllelesColumns) -> Vec<OracleAllele> {
         (0..out.n_alleles())
             .map(|i| {
                 let lo = out.constituent_offsets[i] as usize;
@@ -1604,9 +1609,9 @@ mod tests {
         // source), the highest is T with cohort_count=8.
         assert_eq!(out.n_alleles(), 2);
         assert_eq!(out.allele_seq(0), b"A");
-        assert_eq!(out.cap_protected[0], true);
+        assert!(out.cap_protected[0]);
         assert_eq!(out.allele_seq(1), b"T");
-        assert_eq!(out.cap_protected[1], false);
+        assert!(!out.cap_protected[1]);
 
         // OTHER pool: 3 dropped ALTs (C, G, N), each carrying one
         // source pair (record_idx=0, local_allele_idx in 2..5).

@@ -737,6 +737,11 @@ mod tests {
     use crate::var_calling::posterior_engine::PosteriorEngine;
     use crate::var_calling::variant_grouping::GrouperError;
 
+    /// Nits (Wave 6): byte-identity oracle shape — `(seq,
+    /// is_compound, constituents)`. Naming the triple drops the
+    /// `clippy::type_complexity` lint trips at the helper locals.
+    type OracleAllele = (Vec<u8>, bool, Vec<(usize, usize)>);
+
     /// Build a chunk + partition for the worker's adapter tests.
     /// Returns `(chunk, partition)` so callers can probe both
     /// surfaces.
@@ -1062,7 +1067,7 @@ mod tests {
         )
         .expect("column-native unify succeeded");
 
-        let cn_alleles: Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> = (0..cn_out.n_alleles())
+        let cn_alleles: Vec<OracleAllele> = (0..cn_out.n_alleles())
             .map(|i| {
                 let lo = cn_out.constituent_offsets[i] as usize;
                 let hi = cn_out.constituent_offsets[i + 1] as usize;
@@ -1092,7 +1097,7 @@ mod tests {
             .next()
             .expect("merger yields at least one item")
             .expect("merger succeeded");
-        let oracle: Vec<(Vec<u8>, bool, Vec<(usize, usize)>)> = record
+        let oracle: Vec<OracleAllele> = record
             .alleles
             .iter()
             .map(|a| {
