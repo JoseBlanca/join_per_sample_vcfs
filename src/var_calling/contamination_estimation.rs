@@ -42,7 +42,9 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::pileup_record::PileupRecord;
-use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
+use crate::var_calling::per_position_merger::PerPositionPileups;
+#[cfg(test)]
+use crate::var_calling::per_position_merger::PerPositionMergerError;
 
 // ---------------------------------------------------------------------
 // Default constants
@@ -622,11 +624,18 @@ pub enum ContaminationEstimationError {
     /// progress context (`sites_processed`) so the user can
     /// distinguish a transient mid-stream failure from a fatal
     /// header-mismatch on the first record.
+    ///
+    /// The boxed `dyn Error` lets the side-pass accept either the
+    /// streaming pipeline's [`PerPositionMergerError`] or the
+    /// chunk-driven
+    /// [`ContaminationStreamError`](crate::pop_var_caller::contamination_chunked_stream::ContaminationStreamError)
+    /// without a hard dependency on either concrete type. Callers
+    /// that need the underlying type can downcast.
     #[error("upstream merger failed after {sites_processed} informative sites")]
     Upstream {
         sites_processed: u32,
         #[source]
-        source: PerPositionMergerError,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
     /// Convergence mode, upstream exhausted before convergence fired.
@@ -815,7 +824,7 @@ fn validate_sample_to_batch(
 /// tests. The merger is the production source.
 ///
 /// [`PerPositionMerger`]: crate::var_calling::per_position_merger::PerPositionMerger
-pub fn estimate_contamination<I>(
+pub fn estimate_contamination<I, E>(
     upstream: I,
     n_samples: usize,
     sample_to_batch: Vec<usize>,
@@ -823,7 +832,8 @@ pub fn estimate_contamination<I>(
     config: ContaminationEstimationConfig,
 ) -> Result<ContaminationEstimates, ContaminationEstimationError>
 where
-    I: Iterator<Item = Result<PerPositionPileups, PerPositionMergerError>>,
+    I: Iterator<Item = Result<PerPositionPileups, E>>,
+    E: std::error::Error + Send + Sync + 'static,
 {
     validate_sample_to_batch(&sample_to_batch, n_samples, n_batches)?;
     if config.block_size == 0 {
@@ -845,7 +855,7 @@ where
     for item in upstream {
         let pileups = item.map_err(|source| ContaminationEstimationError::Upstream {
             sites_processed,
-            source,
+            source: Box::new(source),
         })?;
         // M15: per-position scratch with `&[u8]` keys — borrows die
         // with `pileups` at end-of-iteration, so the buffer is
