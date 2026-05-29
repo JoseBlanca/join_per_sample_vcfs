@@ -95,33 +95,60 @@ matters is the work amount they receive, not the BP range it spans.
 
 ## Design
 
-### Why driver-level retry vs loader-level streaming
+### Loader-level streaming (option B)
 
-Two paths were considered:
+The loader owns the "how much to load" decision. Two paths were
+considered:
 
-- **(A) Driver retry with extended range.** Reuse the existing
-  retry-with-extended-range loop in
+- **(A) Driver-level retry with extended range.** Reuse the
+  existing retry-with-extended-range loop in
   [`load_and_run_chunk_with_retry`](../../../src/var_calling/cohort_block/driver.rs)
-  (currently triggered by `NoSafeGap`). Add an "under variant
-  target" branch that grows `attempt_span` the same way.
+  (currently triggered by `NoSafeGap`) for the under-variant case
+  too. Cheapest diff but the loader's contract becomes "load
+  whatever fits, you'll call me again if it wasn't enough", and
+  every retry re-reads + re-decompresses the same PSP blocks.
 - **(B) Loader-level streaming.** Restructure
   [`load_chunk_from_iters`](../../../src/var_calling/cohort_block/loader.rs)
-  to pull PSP records incrementally, count variants after each
-  batch, stop when target reached. Avoids re-decompression but
-  requires interleaving per-sample iterator pulls and re-running
-  the position-union / variant-filter passes incrementally.
+  to pull PSP records incrementally — wrap each per-sample iterator
+  in `Peekable`, pull all records with `pos < attempt_end`, run
+  the position-union / variant-filter pass on the accumulated
+  data, count variants, grow `attempt_end` and resume the pull
+  if we're under target. PSP blocks are decoded once.
 
-The plan picks (A). Reasons:
+The plan picks (B). Cleaner end state:
 
-- The existing carryover-snapshot retry already handles the
-  re-load case; (A) is `cargo diff`-small.
-- The loader's variant-filter pass is straightforward to amortise
-  on the BP span we already grow during retry — re-decompression
-  on the second attempt re-reads PSP blocks that were just decoded,
-  which is a known cost shape we accept for `NoSafeGap` already.
-- Loader-level streaming (B) is a substantive rewrite of the
-  loader's batched position-union logic; deferred until a perf
-  review shows the wasted decompression actually matters.
+- The loader's contract becomes "give me a chunk with ≥ N
+  variants" — semantically aligned with the perf goal.
+- The driver's chunk loop becomes one call per chunk; the
+  `attempt_span × 2` + `carryover_snapshot` dance shrinks to the
+  rare `NoSafeGap` case only.
+- No re-decompression on the common (under-variant) retry path.
+  The iterators stay open across the loader's internal extension
+  steps and resume from where they paused.
+
+The trade-off vs (A) is a bigger loader rewrite. Mitigated by
+splitting the work into byte-identity-gated steps below.
+
+### Streaming pull mechanics
+
+Each per-sample iterator is wrapped in `std::iter::Peekable`. The
+inner pull is:
+
+```text
+for each per-sample iter:
+    while iter.peek().is_ok_and(|r| r.pos < attempt_end):
+        record = iter.next()?
+        push_into raw_per_sample[s]
+```
+
+The peek-and-pull stops cleanly at the first record past
+`attempt_end` without consuming it — the next extension iteration
+picks up at the same point.
+
+The position-union + `is_kept` filter is recomputed on the full
+accumulated data after each extension (CPU work proportional to
+`n_positions_so_far`, no PSP I/O). Incremental updates are a perf
+refinement deferred until profiling justifies them.
 
 ### Where the variant count comes from
 
@@ -129,60 +156,77 @@ The cohort-wide variant count for one chunk is the number of `true`
 entries in
 [`ChunkLoadScratch.is_kept`](../../../src/var_calling/cohort_block/loader.rs).
 Today the loader produces `is_kept` as the post-filter "keep this
-position" predicate; counting `true`s is one extra `.iter().filter(|x|
-**x).count()` after the existing pass. The count is then exposed via
-the loader's return value or a `ChunkLoadStats` field.
+position" predicate; counting `true`s is one extra
+`.iter().filter(|x| **x).count()` after the existing pass.
 
-Proposal: `load_chunk_from_iters` returns
-`Result<ChunkLoadStats, ChunkLoadError<E>>` instead of `Result<(),
-…>`. `ChunkLoadStats` carries `variant_count: u32` (the kept-position
-count) and any other counters useful for diagnostics. Drivers that
-ignore stats just discard the return value.
+The loader returns `Result<ChunkLoadStats, ChunkLoadError<E>>`
+where `ChunkLoadStats` carries:
 
-### Where the retry sits
+- `variant_count: u32` (the kept-position count),
+- `attempt_end: u32` (the actual BP end the loader stopped at —
+  the chunk's `range.end`),
+- `under_variant_extensions: u32` (how many internal extension
+  iterations the loader ran on this chunk).
 
-The retry loop lives in
-[`load_and_run_chunk_with_retry`](../../../src/var_calling/cohort_block/driver.rs)
-and currently has one termination condition (`NoSafeGap` resolved or
-`attempt_span ≥ max_span`). The new termination condition adds:
+Drivers that ignore stats discard the return value with `.map(|_|
+())`.
 
-```text
-attempt_span = nominal_span
-loop:
-    load with chunk_range_end = chunk_range_start + attempt_span
-    stats = load result
-    if stats.variant_count < target_variants_per_chunk
-       AND attempt_span < max_span:
-        carryover_snapshot.restore()
-        attempt_span *= 2
-        under_variant_retries += 1
-        continue
-    match pre_pass:
-        Ok: break
-        NoSafeGap + attempt_span < max_span:
-            carryover_snapshot.restore()
-            attempt_span *= 2
-            no_safe_gap_retries += 1
-            continue
-        Err(_): return
+### Loader contract (new)
+
+```rust
+pub fn load_chunk_from_iters<I, E>(
+    scratch: &mut ChunkLoadScratch,
+    out: &mut MaterialisedChunk,
+    chrom_id: u32,
+    range_start: u32,
+    initial_span: u32,
+    target_variants: u32,    // 0 = no minimum (legacy behaviour)
+    max_span: u32,
+    per_sample_iters: Vec<I>,
+    carryover: &mut [SampleColumns],
+) -> Result<ChunkLoadStats, ChunkLoadError<E>>
 ```
 
-Both retry paths use the same `attempt_span *= 2` growth and the
-same `carryover_snapshot` restore. Two diagnostic counters
-(`under_variant_retries`, `no_safe_gap_retries`) report the cause
-mix at end-of-run for capacity planning.
+`range_start` + `initial_span` set the first attempt's end;
+`max_span` caps growth; `target_variants` is the soft lower bound
+on the kept-position count. Caller constructs iterators with end =
+chromosome length (or a generous bound) so the loader can pull
+beyond `initial_span` when needed.
+
+### Driver simplification
+
+[`load_and_run_chunk_with_retry`](../../../src/var_calling/cohort_block/driver.rs)
+keeps the `NoSafeGap` retry (with `carryover_snapshot` restore + a
+fresh load), but the inner extension loop is gone. Pseudocode:
+
+```text
+loop:
+    construct fresh per-sample iterators
+    stats = load_chunk_from_iters(target_variants, max_span)
+    stats.variant_count and stats.attempt_end now reflect the
+        loader's final accumulated state.
+    match pre_pass(chunk, target_window_count):
+        Ok(()): break
+        NoSafeGap and max_span_can_still_grow:
+            carryover_snapshot.restore()
+            max_span *= 2
+            no_safe_gap_retries += 1
+            continue
+        Err(other): return
+```
 
 ### What the default looks like
 
-A target of 0 means "no minimum"; the loop behaves like today (pure
-BP-bounded). Tests that build a driver with default params should
+A `target_variants = 0` is a no-op — the loader's extension loop
+exits immediately on the first attempt and returns whatever fits
+in `initial_span`. Tests that build a driver with default params
 fall through to today's behaviour byte-identically.
 
 CLI default: under discussion. A reasonable starting point is
-something like 10 000 — large enough that Phase B's T=4 / 8 / 16
-dispatch yields meaningful per-window work even on sparse
-chromosomes; small enough that the chunk fits comfortably in
-allocator-friendly RSS even at N=1000 samples.
+~10 000 — large enough that Phase B's T=4 / 8 / 16 dispatch yields
+meaningful per-window work even on sparse chromosomes; small
+enough that the chunk fits comfortably in allocator-friendly RSS
+even at N=1000 samples.
 
 ## Steps
 
@@ -190,63 +234,103 @@ Each step ships as its own commit + tests. The byte-identity oracle
 across every step is the current Phase B baseline (`target_variants
 = 0`).
 
-### Step 1 — loader reports variant count
+### Step 1 — `ChunkLoadStats` return + `variant_count`
 
 [`load_chunk_from_iters`](../../../src/var_calling/cohort_block/loader.rs)
-returns
-`Result<ChunkLoadStats, ChunkLoadError<E>>` where `ChunkLoadStats`
-carries:
-- `variant_count: u32` (number of `true` in `is_kept`).
+returns `Result<ChunkLoadStats, ChunkLoadError<E>>` instead of
+`Result<(), …>`. `ChunkLoadStats` carries `variant_count: u32`
+(number of `true` in `is_kept` after the existing filter pass).
 
-The change is mechanical: count after the existing variant-filter
-pass; thread the count through the return. All existing callers
-discard the value with `.map(|_| ())` until step 3 wires the
-counter through.
+Mechanical change: one count after the existing variant-filter pass;
+thread the stats through the return. All existing callers discard
+the value with `.map(|_| ())` until step 3 wires it through.
 
-Unit tests in [`loader.rs`](../../../src/var_calling/cohort_block/loader.rs)
+Unit tests in
+[`loader.rs`](../../../src/var_calling/cohort_block/loader.rs)
 assert the count matches the expected variant set on fixtures
 already in the suite.
 
-### Step 2 — driver params + stats fields
+### Step 2 — `Peekable` wrapper + restructured pull (no behaviour change)
+
+Wrap each per-sample iterator in `std::iter::Peekable`. Restructure
+the carryover-drain + record-pull blocks into the streaming shape
+sketched above — pull only records with `pos < attempt_end` where
+`attempt_end` is the input `range.end` for now.
+
+No variant-count check or extension yet. The behaviour is byte-
+identical to step 1; this step is a pure refactor that sets up the
+extension loop in step 3.
+
+Existing loader tests + the cohort CLI integration test catch any
+regression.
+
+### Step 3 — under-variant extension loop in the loader
+
+Add `target_variants: u32` + `max_span: u32` parameters to
+`load_chunk_from_iters`. Wrap the existing pull + filter pass in
+an `extension` loop:
+
+```text
+attempt_end = range_start + initial_span
+loop:
+    pull records with pos < attempt_end (resumable via Peekable)
+    rebuild position_union + is_kept on accumulated data
+    variant_count = count true in is_kept
+    if variant_count >= target_variants or attempt_end >= max_end:
+        break
+    attempt_end = min(2 * attempt_end - range_start + range_start, max_end)
+    stats.under_variant_extensions += 1
+```
+
+`target_variants = 0` makes the loop exit after the first iteration
+(the `>= target_variants` check is always true with `0`), preserving
+today's behaviour exactly.
+
+Unit tests:
+- Sparse fixture: target = 100, initial_span = 50bp. Multiple
+  extensions; final variant count `≥ 100` or `max_span` reached.
+- Dense fixture: target = 100 already met by initial_span. Zero
+  extensions; stats.under_variant_extensions == 0.
+- Edge: target = 0 → no extensions ever.
+- Edge: target very large + max_span hit → graceful degradation,
+  variant_count is whatever was loaded.
+
+### Step 4 — driver wiring
 
 [`ChunkDriverParams`](../../../src/var_calling/cohort_block/driver.rs)
 gains `target_variants_per_chunk: u32` (default `0`).
 [`ChunkDriverStats`](../../../src/var_calling/cohort_block/driver.rs)
-gains `under_variant_retries: u64` + `under_variant_retry_failures:
-u64`. No behaviour change yet.
-
-### Step 3 — driver loop honours the target
+gains a `chunk_extensions: u64` counter aggregated across all loads.
 
 [`load_and_run_chunk_with_retry`](../../../src/var_calling/cohort_block/driver.rs)
-adds the under-variant retry branch sketched above. The retry uses
-the existing `carryover_snapshot` restore + `attempt_span *= 2`
-growth + `max_span` cap. When `target_variants_per_chunk == 0`, the
-retry branch is a no-op and the loop matches today's behaviour
-byte-for-byte.
+constructs each per-sample iterator with end = chromosome length
+(or a generous bound), passes `target_variants` + `max_span` to
+the loader, and folds returned stats into `ChunkDriverStats`. The
+existing `NoSafeGap` retry stays; when triggered, it re-creates
+iterators and re-calls the loader with a bigger `max_span` (re-
+decompression accepted on this rare path).
 
-New tests use `cohort_cli_integration`-style fixtures with
-artificially low `target_variants_per_chunk` (e.g., target = 100 on
-a fixture with sparse + dense regions) and check:
-1. The chunk loop grows `attempt_span` in the sparse region.
-2. The chunk's variant count after growth is `≥ target` or hits
-   the `max_span` cap (whichever comes first).
-3. Stats reflect the retry count.
+The advance condition for the chunk loop becomes
+`chunk_range_start = chunk.safe_end` (which it already was) — but
+now `chunk.range.end` reflects the loader's actual stop point
+rather than the input nominal span.
 
-### Step 4 — CLI knob
+### Step 5 — CLI knob
 
 Add `--target-variants-per-chunk <N>` to the `var-calling`
-subcommand under [`src/pop_var_caller/var_calling.rs`](../../../src/pop_var_caller/var_calling.rs).
-Default: TBD (likely `10000`); revisit after step-3 perf data.
-Help text explains the trade-off (large = bigger chunks, fewer
-overheads, more memory; small = smaller chunks, more overhead per
-chunk).
+subcommand under
+[`src/pop_var_caller/var_calling.rs`](../../../src/pop_var_caller/var_calling.rs).
+Default: `0` initially (preserves today's behaviour); revisit
+after end-to-end perf numbers from step 4.
 
-Plumb through `ChunkDriverParams.target_variants_per_chunk`.
+Help text explains the trade-off: large values = bigger chunks,
+fewer per-chunk overheads, more steady-state RSS; small values =
+smaller chunks, more overhead per chunk, less RSS.
 
-End-of-run summary line adds `under_variant_retries=N` next to the
+End-of-run summary line adds `chunk_extensions=N` next to the
 existing diagnostic counters.
 
-### Step 5 — byte-identity gate + integration test
+### Step 6 — byte-identity gate + integration test
 
 The 3-tomato cohort run with `--target-variants-per-chunk 0`
 (default off) must remain byte-identical to the prior commit.
@@ -254,10 +338,9 @@ The 3-tomato cohort run with `--target-variants-per-chunk 0`
 A new integration test in
 [`tests/cohort_cli_integration.rs`](../../../tests/cohort_cli_integration.rs)
 runs the same fixture twice — once with `target_variants_per_chunk =
-0`, once with a non-zero value — and asserts equal VCF bodies. This
-codifies that the variant-count knob is a *workload-sizing* knob,
-not a *correctness* knob: changing it must never change emitted
-records.
+0`, once with a non-zero value — and asserts equal VCF bodies. The
+variant-count knob is a *workload-sizing* knob, not a *correctness*
+knob: changing it must never change emitted records.
 
 ## Tests
 
