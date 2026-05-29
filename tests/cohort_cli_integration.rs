@@ -289,6 +289,64 @@ fn var_calling_emits_deterministic_vcf_across_runs() {
     );
 }
 
+/// **Parallel per-window dispatch byte-identity.** The
+/// `--worker-windows-per-chunk` knob controls the rayon dispatch
+/// concurrency (sequential vs T parallel windows per chunk) and
+/// must not change the emitted VCF body. Same fixture run twice
+/// with T=1 vs T=4 (paired with a small
+/// `--target-variants-per-chunk` so each chunk produces multiple
+/// windows the rayon dispatch can split). The bodies must match.
+///
+/// Phase B — see
+/// `doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md`.
+#[test]
+fn var_calling_byte_identical_across_worker_windows_per_chunk() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    let reads_a = vec![
+        read_record("r1", 10, b"AAAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let reads_b = vec![
+        read_record("r1", 10, b"ACAAA"), // SNP at pos 11
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let psp_a = make_psp_for_sample(dir.path(), &fasta, "NA00001", &reads_a);
+    let psp_b = make_psp_for_sample(dir.path(), &fasta, "NA00002", &reads_b);
+    let psps = vec![psp_a, psp_b];
+
+    let vcf_t1 = dir.path().join("cohort_t1.vcf");
+    let vcf_t4 = dir.path().join("cohort_t4.vcf");
+
+    let mut args_t1 = var_calling_args(fasta.clone(), vcf_t1.clone(), psps.clone(), None);
+    args_t1.worker_windows_per_chunk = 1;
+    // Pair with a small target_variants_per_chunk so multiple
+    // chunks load and the per-chunk window placement can be exercised.
+    args_t1.target_variants_per_chunk = 1;
+    run_var_calling(&args_t1).expect("T=1 run OK");
+
+    let mut args_t4 = var_calling_args(fasta, vcf_t4.clone(), psps, None);
+    args_t4.worker_windows_per_chunk = 4;
+    args_t4.target_variants_per_chunk = 1;
+    run_var_calling(&args_t4).expect("T=4 run OK");
+
+    let body_t1 = fs::read_to_string(&vcf_t1).expect("read T=1 vcf");
+    let body_t4 = fs::read_to_string(&vcf_t4).expect("read T=4 vcf");
+    let strip_volatile = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("##source=") && !l.starts_with("##commandline="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        strip_volatile(&body_t1),
+        strip_volatile(&body_t4),
+        "--worker-windows-per-chunk controls the rayon dispatch \
+         concurrency and must not change the emitted VCF body"
+    );
+}
+
 /// **Variant-bounded chunk loading byte-identity.** The
 /// `--target-variants-per-chunk` knob is a workload-sizing knob,
 /// not a correctness knob: changing it must never change the
