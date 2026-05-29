@@ -28,7 +28,6 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
-use crate::pileup_record::PileupRecord;
 use crate::var_calling::cohort_block::columns::MaterialisedChunk;
 use crate::var_calling::cohort_block::kernels::compute_log_likelihoods::{
     ComputeLogLikelihoodsError, LogLikelihoodsColumns, compute_log_likelihoods_columnar,
@@ -44,11 +43,15 @@ use crate::var_calling::per_group_merger::{
     CompoundConstituent, DegeneracyKind, LikelihoodContext, MergedAllele, MergedRecord,
     PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };
-use crate::var_calling::per_position_merger::PerPositionPileups;
 use crate::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
-use crate::var_calling::variant_grouping::OverlappingVariantGroup;
+#[cfg(test)]
+use crate::{
+    pileup_record::PileupRecord,
+    var_calling::per_position_merger::PerPositionPileups,
+    var_calling::variant_grouping::OverlappingVariantGroup,
+};
 
 /// Reusable scratch for the column-native pipeline. The driver owns
 /// one of these per chunk-loop instance and threads it into every
@@ -865,18 +868,8 @@ mod tests {
         let s0_mnp = record(
             100,
             vec![
-                crate::var_calling::cohort_block::test_helpers::allele(
-                    b"AAAAAAAAAA",
-                    3,
-                    -1.0,
-                    &[],
-                ),
-                crate::var_calling::cohort_block::test_helpers::allele(
-                    b"AAACAAAAAA",
-                    4,
-                    -1.0,
-                    &[],
-                ),
+                crate::var_calling::cohort_block::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
+                crate::var_calling::cohort_block::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
             ],
         );
         let s0_snp_inside = record(105, ref_plus_alt(3, 4));
@@ -958,29 +951,17 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"A", 10, -1.0, &[],
-                    ),
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"T", 6, -1.0, &[101],
-                    ),
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"G", 2, -1.0, &[],
-                    ),
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"C", 1, -1.0, &[],
-                    ),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"A", 10, -1.0, &[]),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"T", 6, -1.0, &[101]),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"G", 2, -1.0, &[]),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"C", 1, -1.0, &[]),
                 ],
             ),
             record(
                 101,
                 vec![
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"A", 10, -1.0, &[],
-                    ),
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"G", 5, -1.0, &[101],
-                    ),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"A", 10, -1.0, &[]),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"G", 5, -1.0, &[101]),
                 ],
             ),
         ];
@@ -988,21 +969,18 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"A", 8, -1.0, &[],
-                    ),
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"G", 3, -1.0, &[],
-                    ),
-                    crate::var_calling::cohort_block::test_helpers::allele(
-                        b"T", 1, -1.0, &[],
-                    ),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"A", 8, -1.0, &[]),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"G", 3, -1.0, &[]),
+                    crate::var_calling::cohort_block::test_helpers::allele(b"T", 1, -1.0, &[]),
                 ],
             ),
             record(
                 101,
                 vec![crate::var_calling::cohort_block::test_helpers::allele(
-                    b"A", 10, -1.0, &[],
+                    b"A",
+                    10,
+                    -1.0,
+                    &[],
                 )],
             ),
         ];

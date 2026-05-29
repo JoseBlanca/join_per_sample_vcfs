@@ -857,6 +857,118 @@ pub struct EmDiagnostics {
     pub converged: bool,
 }
 
+// ---------------------------------------------------------------------
+// Phase A.2 step 1 — column-native EM input boundary
+//
+// `run_em_for_record(record: MergedRecord)` keeps its existing
+// signature for the row-shape consumers (the in-module test surface +
+// `var-calling-from-bam`'s streaming pipeline). It is a thin shim
+// around the borrowed-slice [`run_em_columnar`] body, which reads its
+// per-allele queries through the [`AllelesView`] trait. Two
+// `AllelesView` impls live in this crate:
+//
+// - [`MergedAllelesView`] here — wraps `&[MergedAllele]`. Used by the
+//   row-shape shim.
+// - `ColumnarAllelesView` in
+//   [`crate::var_calling::cohort_block::worker`] — wraps
+//   `&UnifiedAllelesColumns`. Used by the column-native worker once
+//   Phase A.2 step 2 lands.
+//
+// The hot EM loops never touch the view: they read
+// `scratch.compound_mask: &[bool]` which is populated once per record
+// via `inputs.alleles.is_compound(a)`. The view's `&dyn` virtual
+// dispatch only costs at the per-record per-allele classify step.
+
+/// Minimal accessor surface for the per-allele queries the EM body
+/// makes on the allele set. Designed for cheap implementation over
+/// both row-shape `&[MergedAllele]` and column-native
+/// `&UnifiedAllelesColumns`.
+///
+/// The EM reads:
+/// - [`Self::len`] — for `n_alleles` bound checks.
+/// - [`Self::ref_len`] — for `classify_allele`'s SNP-vs-indel test.
+/// - [`Self::seq_len`] — per-allele, also for `classify_allele`.
+/// - [`Self::is_compound`] — for `compound_mask`,
+///   `mixture_contam_class_per_allele`, and `compound_frequencies`.
+///
+/// The EM never asks for per-allele bytes or compound constituents —
+/// those live on `PosteriorRecord` for the VCF writer's `ALT` /
+/// compound-emit path, downstream of the EM.
+pub(crate) trait AllelesView {
+    fn len(&self) -> usize;
+    fn ref_len(&self) -> usize;
+    fn seq_len(&self, allele_idx: usize) -> usize;
+    fn is_compound(&self, allele_idx: usize) -> bool;
+}
+
+/// Row-shape [`AllelesView`] over a `&[MergedAllele]` slice. Used by
+/// the [`run_em_for_record`] row-shape shim.
+pub(crate) struct MergedAllelesView<'a> {
+    alleles: &'a [MergedAllele],
+}
+
+impl<'a> MergedAllelesView<'a> {
+    pub(crate) fn new(alleles: &'a [MergedAllele]) -> Self {
+        Self { alleles }
+    }
+}
+
+impl AllelesView for MergedAllelesView<'_> {
+    fn len(&self) -> usize {
+        self.alleles.len()
+    }
+    fn ref_len(&self) -> usize {
+        self.alleles.first().map_or(0, |a| a.seq.len())
+    }
+    fn seq_len(&self, allele_idx: usize) -> usize {
+        self.alleles[allele_idx].seq.len()
+    }
+    fn is_compound(&self, allele_idx: usize) -> bool {
+        self.alleles[allele_idx].is_compound
+    }
+}
+
+/// Borrowed-slice view of one group's EM inputs. Same logical content
+/// as a [`MergedRecord`] minus the per-allele bytes (carried through
+/// `alleles` as an [`AllelesView`]) and minus the
+/// `other_scalars` / `chain_anchor_flags` row-shape buffers that the
+/// EM body never reads (those are forwarded straight to
+/// [`PosteriorRecord`] by the caller).
+///
+/// The EM body itself reads:
+/// - `locus`, `ploidy`, `n_samples`, `n_genotypes` — scalars.
+/// - `alleles` via the [`AllelesView`] trait — per-allele classify.
+/// - `scalars` — only the mixture pre-pass reads this (contamination on).
+/// - `log_likelihoods` — the E-step's core input.
+/// - `chain_anchor_flags_for_validation` — only [`validate_record_shape`]
+///   reads this, as a length check. The bool table itself never feeds
+///   any math; it is forwarded to `PosteriorRecord` by the caller.
+pub(crate) struct EmInputs<'a> {
+    pub locus: RecordLocus,
+    pub ploidy: u8,
+    pub n_samples: usize,
+    pub n_genotypes: usize,
+    pub alleles: &'a dyn AllelesView,
+    pub scalars: &'a [AlleleSupportStats],
+    pub log_likelihoods: &'a [f64],
+    pub chain_anchor_flags_for_validation: &'a [bool],
+}
+
+/// Owned outputs produced by [`run_em_columnar`]. The caller joins
+/// these with the per-record allele bytes + row-shape
+/// `scalars` / `other_scalars` / `chain_anchor_flags` to form the
+/// emitted [`PosteriorRecord`].
+pub(crate) struct EmOutputs {
+    pub n_genotypes: usize,
+    pub allele_frequencies: Vec<f64>,
+    pub compound_frequencies: Vec<Option<f64>>,
+    pub posteriors: Vec<f64>,
+    pub best_genotype: Vec<usize>,
+    pub gq_phred: Vec<f64>,
+    pub qual_phred: f64,
+    pub diagnostics: EmDiagnostics,
+}
+
 /// Streaming posterior engine. Wraps an upstream `MergedRecord`
 /// iterator; emits one [`PosteriorRecord`] per upstream record.
 ///
@@ -1041,6 +1153,7 @@ enum AlleleClass {
 /// (which writes the result into `scratch.allele_classes` per allele
 /// without a Vec allocation) and the test-only [`classify_alleles`]
 /// helper.
+#[cfg(test)]
 fn classify_allele(allele: &MergedAllele, ref_len: usize, is_first: bool) -> AlleleClass {
     if is_first {
         AlleleClass::Ref
@@ -1525,7 +1638,7 @@ struct EmContext<'a> {
 /// into the scratch removes the alloc entirely from the EM
 /// iteration loop (`m_step_*_p_hat` no longer collects a fresh `Vec`
 /// every EM iter).
-struct RecordScratch {
+pub(crate) struct RecordScratch {
     // ===== EM working set (previously EmScratch). =====
     /// Effective per-allele frequency seen by the prior (compounds
     /// substituted with `f̂_C`). Length `n_alleles`.
@@ -1745,24 +1858,77 @@ fn run_em_for_record<M: MathBackend>(
         start,
         end,
     };
+
+    let view = MergedAllelesView::new(&alleles);
+    let inputs = EmInputs {
+        locus,
+        ploidy,
+        n_samples,
+        n_genotypes,
+        alleles: &view,
+        scalars: &scalars,
+        log_likelihoods: &log_likelihoods,
+        chain_anchor_flags_for_validation: &chain_anchor_flags,
+    };
+    let em_outputs = run_em_columnar(inputs, config, math, scratch)?;
+
+    Ok(PosteriorRecord {
+        locus,
+        alleles,
+        ploidy,
+        n_samples,
+        n_genotypes: em_outputs.n_genotypes,
+        allele_frequencies: em_outputs.allele_frequencies,
+        compound_frequencies: em_outputs.compound_frequencies,
+        posteriors: em_outputs.posteriors,
+        best_genotype: em_outputs.best_genotype,
+        gq_phred: em_outputs.gq_phred,
+        qual_phred: em_outputs.qual_phred,
+        scalars,
+        other_scalars,
+        chain_anchor_flags,
+        diagnostics: em_outputs.diagnostics,
+    })
+}
+
+/// Column-native EM entry point — Phase A.2 step 1. Same body as
+/// [`run_em_for_record`] but reads its inputs by borrow through
+/// [`EmInputs`] + [`AllelesView`]. Used by the row-shape shim
+/// (above) and, after Phase A.2 step 2, directly by the cohort
+/// worker.
+///
+/// **Returns:** [`EmOutputs`] — the EM-specific fields. The caller
+/// joins these with the per-record allele bytes + row-shape
+/// `scalars` / `other_scalars` / `chain_anchor_flags` to form the
+/// emitted [`PosteriorRecord`].
+pub(crate) fn run_em_columnar<M: MathBackend>(
+    inputs: EmInputs<'_>,
+    config: &PosteriorEngineConfig,
+    math: &M,
+    scratch: &mut RecordScratch,
+) -> Result<EmOutputs, PosteriorEngineError> {
+    let EmInputs {
+        locus,
+        ploidy,
+        n_samples,
+        n_genotypes,
+        alleles,
+        scalars,
+        log_likelihoods,
+        chain_anchor_flags_for_validation,
+    } = inputs;
     let n_alleles = alleles.len();
 
-    // Belt-and-braces: Stage 5 drops REF-only groups (alleles.len() <
-    // 2). If one slips through, emit a trivial posterior record per
-    // the plan §"Edge cases" — every sample is hom-REF with QUAL 0.
-    // (Checked before the mixture pre-pass and the scratch.resize_to
-    // call since the trivial path doesn't touch scratch.)
+    // Belt-and-braces: Stage 5 drops REF-only groups (n_alleles < 2).
+    // If one slips through, emit a trivial posterior per the plan
+    // §"Edge cases" — every sample is hom-REF with QUAL 0. (Checked
+    // before the mixture pre-pass and `scratch.resize_to` since the
+    // trivial path doesn't touch scratch.)
     if n_alleles < 2 {
-        return Ok(trivial_posterior_record(
-            TrivialRecordInputs {
-                locus,
-                alleles,
-                ploidy,
-                n_samples,
-                scalars,
-                other_scalars,
-                chain_anchor_flags,
-            },
+        return Ok(trivial_em_outputs(
+            alleles,
+            ploidy,
+            n_samples,
             config.max_gq_phred,
         ));
     }
@@ -1773,8 +1939,8 @@ fn run_em_for_record<M: MathBackend>(
         n_alleles,
         n_samples,
         n_genotypes,
-        &log_likelihoods,
-        &chain_anchor_flags,
+        log_likelihoods,
+        chain_anchor_flags_for_validation,
     )?;
 
     // Resize the per-engine scratch to the current record's shape
@@ -1819,12 +1985,12 @@ fn run_em_for_record<M: MathBackend>(
     // contamination class — all record-static. Fill into scratch so
     // the EM loop and the mixture pre-pass read them by slice rather
     // than rebuilding per call.
-    let ref_len = alleles[0].seq.len();
-    for (a, allele) in alleles.iter().enumerate() {
-        let class = classify_allele(allele, ref_len, a == 0);
+    let ref_len = alleles.ref_len();
+    for a in 0..n_alleles {
+        let class = classify_allele_via_view(alleles, ref_len, a);
         scratch.allele_classes[a] = class;
         scratch.pseudocounts[a] = pseudocount_for(class, config);
-        scratch.compound_mask[a] = allele.is_compound;
+        scratch.compound_mask[a] = alleles.is_compound(a);
         scratch.mixture_contam_class_per_allele[a] = map_to_contam_class(class);
     }
 
@@ -1836,13 +2002,11 @@ fn run_em_for_record<M: MathBackend>(
     let shape = shape_for(ploidy, n_alleles);
 
     // Mixture-likelihood branch: when contamination is configured,
-    // replace the Stage-5-supplied (c_s = 0) log-likelihood table
-    // with the mixture-recomputed version before the EM loop runs.
-    // The mixture function fills `scratch.mixture_log_likelihoods`;
-    // we then `mem::swap` it into the local `log_likelihoods` owner
-    // so EM can read a slice through a borrow that doesn't tie up
-    // `scratch`.
-    let mut log_likelihoods = log_likelihoods;
+    // fill `scratch.mixture_log_likelihoods` with the c_s≠0 version,
+    // then `mem::take` it into a local owner so the EM body can read
+    // a slice that does NOT alias `scratch`. We restore the buffer
+    // before returning so the next record reuses the capacity.
+    let mut local_mixture_ll: Vec<f64> = Vec::new();
     let did_mixture = if let Some(estimates) = config.contamination.as_ref() {
         if estimates.c_s_per_sample.len() != n_samples {
             return Err(PosteriorEngineError::ContaminationCohortSizeMismatch {
@@ -1882,9 +2046,9 @@ fn run_em_for_record<M: MathBackend>(
                 n_genotypes,
                 n_samples,
                 ploidy,
-                &scalars,
+                scalars,
                 estimates,
-                &log_likelihoods,
+                log_likelihoods,
                 math,
                 scratch,
             )?;
@@ -1896,26 +2060,25 @@ fn run_em_for_record<M: MathBackend>(
                 n_genotypes,
                 n_samples,
                 ploidy,
-                &scalars,
+                scalars,
                 estimates,
-                &log_likelihoods,
+                log_likelihoods,
                 math,
                 scratch,
             )?;
         }
+        // Move the mixture buffer out of scratch so the EM body can
+        // read it via a slice that does NOT alias `scratch`.
+        local_mixture_ll = std::mem::take(&mut scratch.mixture_log_likelihoods);
         true
     } else {
         false
     };
-    if did_mixture {
-        // Swap the mixture-recomputed buffer into `log_likelihoods` so
-        // the EM loop reads it via a borrow that does NOT alias
-        // `scratch.mixture_log_likelihoods`. The buffer that used to
-        // be `log_likelihoods` is now sitting in
-        // `scratch.mixture_log_likelihoods`; the next record will
-        // overwrite it during its own `resize_to` + mixture pre-pass.
-        std::mem::swap(&mut log_likelihoods, &mut scratch.mixture_log_likelihoods);
-    }
+    let ll_for_em: &[f64] = if did_mixture {
+        &local_mixture_ll
+    } else {
+        log_likelihoods
+    };
 
     let ctx = EmContext {
         locus,
@@ -1938,7 +2101,7 @@ fn run_em_for_record<M: MathBackend>(
         *slot = p_init;
     }
 
-    let diagnostics = run_em_loop(ctx, config, math, &log_likelihoods, scratch)?;
+    let diagnostics = run_em_loop(ctx, config, math, ll_for_em, scratch)?;
 
     // Final E-step under the converged (p̂, f̂_C) so the emitted
     // posteriors reflect the *post-final-M-step* parameters rather
@@ -1948,9 +2111,9 @@ fn run_em_for_record<M: MathBackend>(
     // `M::HAS_LANE_4` is a compile-time const so the unused branch is
     // dead-code-eliminated after monomorphisation.
     if M::HAS_LANE_4 {
-        e_step_simd(ctx, math, &log_likelihoods, scratch)?;
+        e_step_simd(ctx, math, ll_for_em, scratch)?;
     } else {
-        e_step(ctx, math, &log_likelihoods, scratch)?;
+        e_step(ctx, math, ll_for_em, scratch)?;
     }
 
     summarise_posteriors(n_samples, n_genotypes, scratch, config.max_gq_phred);
@@ -1966,12 +2129,19 @@ fn run_em_for_record<M: MathBackend>(
         n_genotypes,
         n_alleles,
         ploidy,
-        &log_likelihoods,
+        ll_for_em,
         &shape,
         alpha_ref,
         alpha_alt,
         scratch,
     );
+
+    // Restore the mixture buffer (if we took it) so the next record's
+    // `resize_to` + mixture pre-pass reuse the high-water-mark
+    // capacity instead of reallocating from empty.
+    if did_mixture {
+        scratch.mixture_log_likelihoods = local_mixture_ll;
+    }
 
     // Fill `scratch.compound_frequencies` from the converged f̂_C and
     // the compound mask, then clone-out below. Reuses the scratch
@@ -1984,11 +2154,7 @@ fn run_em_for_record<M: MathBackend>(
         };
     }
 
-    Ok(PosteriorRecord {
-        locus,
-        alleles,
-        ploidy,
-        n_samples,
+    Ok(EmOutputs {
         n_genotypes,
         // Clone the converged outputs out of scratch. The clone is a
         // single malloc-then-memcpy per Vec — cheaper than the
@@ -2000,11 +2166,27 @@ fn run_em_for_record<M: MathBackend>(
         best_genotype: scratch.best_genotype.clone(),
         gq_phred: scratch.gq_phred.clone(),
         qual_phred,
-        scalars,
-        other_scalars,
-        chain_anchor_flags,
         diagnostics,
     })
+}
+
+/// Allele-classification helper that reads through the
+/// [`AllelesView`] trait — the column-native equivalent of
+/// [`classify_allele`]. Identical decision tree.
+fn classify_allele_via_view(
+    alleles: &dyn AllelesView,
+    ref_len: usize,
+    allele_idx: usize,
+) -> AlleleClass {
+    if allele_idx == 0 {
+        AlleleClass::Ref
+    } else if alleles.is_compound(allele_idx) {
+        AlleleClass::CompoundAlt
+    } else if alleles.seq_len(allele_idx) == ref_len {
+        AlleleClass::SnpAlt
+    } else {
+        AlleleClass::IndelAlt
+    }
 }
 
 fn validate_record_shape(
@@ -2719,30 +2901,18 @@ fn compute_qual_via_exact_af<M: MathBackend>(
     PHRED_SCALE * (log_p_k0_post / std::f64::consts::LN_10)
 }
 
-/// Inputs to [`trivial_posterior_record`]. Grouped into a struct
-/// because the trivial-path fixture forwards seven distinct
-/// `MergedRecord` fields verbatim and `too_many_arguments` would
-/// otherwise fire.
-struct TrivialRecordInputs {
-    locus: RecordLocus,
-    alleles: Vec<MergedAllele>,
+/// EM-output fields for the trivial path — `n_alleles < 2`. Reads
+/// the allele set through the [`AllelesView`] trait so both the
+/// row-shape shim and the column-native worker share one body. The
+/// caller joins this with the per-record allele bytes + row-shape
+/// `scalars` / `other_scalars` / `chain_anchor_flags` to form the
+/// trivial [`PosteriorRecord`].
+fn trivial_em_outputs(
+    alleles: &dyn AllelesView,
     ploidy: u8,
     n_samples: usize,
-    scalars: Vec<AlleleSupportStats>,
-    other_scalars: Vec<AlleleSupportStats>,
-    chain_anchor_flags: Vec<bool>,
-}
-
-fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> PosteriorRecord {
-    let TrivialRecordInputs {
-        locus,
-        alleles,
-        ploidy,
-        n_samples,
-        scalars,
-        other_scalars,
-        chain_anchor_flags,
-    } = inputs;
+    max_gq: f64,
+) -> EmOutputs {
     let n_alleles = alleles.len();
     let n_genotypes = genotype_order(ploidy, n_alleles).len();
 
@@ -2758,23 +2928,24 @@ fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> Posteri
     let best_genotype = vec![HOM_REF_GENOTYPE_IDX; n_samples];
     let gq_phred = vec![max_gq; n_samples];
 
-    let allele_frequencies = if alleles.is_empty() {
+    let allele_frequencies = if n_alleles == 0 {
         Vec::new()
     } else {
         let mut p = vec![0.0; n_alleles];
         p[0] = 1.0;
         p
     };
-    let compound_frequencies = alleles
-        .iter()
-        .map(|a| if a.is_compound { Some(0.0) } else { None })
+    let compound_frequencies = (0..n_alleles)
+        .map(|a| {
+            if alleles.is_compound(a) {
+                Some(0.0)
+            } else {
+                None
+            }
+        })
         .collect();
 
-    PosteriorRecord {
-        locus,
-        alleles,
-        ploidy,
-        n_samples,
+    EmOutputs {
         n_genotypes,
         allele_frequencies,
         compound_frequencies,
@@ -2782,9 +2953,6 @@ fn trivial_posterior_record(inputs: TrivialRecordInputs, max_gq: f64) -> Posteri
         best_genotype,
         gq_phred,
         qual_phred: 0.0,
-        scalars,
-        other_scalars,
-        chain_anchor_flags,
         diagnostics: EmDiagnostics {
             iterations: 0,
             final_max_delta_p: 0.0,
