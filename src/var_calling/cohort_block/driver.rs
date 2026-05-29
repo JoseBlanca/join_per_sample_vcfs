@@ -466,21 +466,24 @@ fn record_fails_mapq_diff_t(record: &PosteriorRecord, threshold: f32) -> bool {
     if n_alleles < 2 {
         return false;
     }
-    let (n_ref, sum_ref, ssq_ref) = pool_allele_mapq(record, 0);
-    if n_ref < MAPQ_FILTER_MIN_READS_PER_SIDE {
+    let ref_moments = pool_allele_mapq(record, 0);
+    if ref_moments.n < MAPQ_FILTER_MIN_READS_PER_SIDE {
         return false;
     }
-    let mean_ref = sum_ref as f64 / n_ref as f64;
-    let var_ref = ((ssq_ref as f64 - (sum_ref as f64) * mean_ref).max(0.0)) / ((n_ref - 1) as f64);
+    let mean_ref = ref_moments.sum as f64 / ref_moments.n as f64;
+    let var_ref = ((ref_moments.sum_of_squares as f64 - (ref_moments.sum as f64) * mean_ref)
+        .max(0.0))
+        / ((ref_moments.n - 1) as f64);
     for alt_idx in 1..n_alleles {
-        let (n_alt, sum_alt, ssq_alt) = pool_allele_mapq(record, alt_idx);
-        if n_alt < MAPQ_FILTER_MIN_READS_PER_SIDE {
+        let alt_moments = pool_allele_mapq(record, alt_idx);
+        if alt_moments.n < MAPQ_FILTER_MIN_READS_PER_SIDE {
             continue;
         }
-        let mean_alt = sum_alt as f64 / n_alt as f64;
-        let var_alt =
-            ((ssq_alt as f64 - (sum_alt as f64) * mean_alt).max(0.0)) / ((n_alt - 1) as f64);
-        let se2 = var_alt / (n_alt as f64) + var_ref / (n_ref as f64);
+        let mean_alt = alt_moments.sum as f64 / alt_moments.n as f64;
+        let var_alt = ((alt_moments.sum_of_squares as f64 - (alt_moments.sum as f64) * mean_alt)
+            .max(0.0))
+            / ((alt_moments.n - 1) as f64);
+        let se2 = var_alt / (alt_moments.n as f64) + var_ref / (ref_moments.n as f64);
         if se2 <= 0.0 {
             continue;
         }
@@ -492,17 +495,35 @@ fn record_fails_mapq_diff_t(record: &PosteriorRecord, threshold: f32) -> bool {
     false
 }
 
-fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> (u64, u64, u128) {
-    let mut n: u64 = 0;
-    let mut sum: u64 = 0;
-    let mut ssq: u128 = 0;
+/// Mi5: per-allele MAPQ moments pooled across the cohort. Used by
+/// [`record_fails_mapq_diff_t`]'s Welch's-t test to compare an ALT's
+/// MAPQ distribution against REF's. Wrapping the previously-anonymous
+/// `(u64, u64, u128)` tuple in a named struct turns the call site's
+/// positional destructure into field access and pins the meaning of
+/// each scalar at the type level.
+struct PooledMapqMoments {
+    /// Total pooled read count across every sample at the allele.
+    n: u64,
+    /// Sum of per-read MAPQ scores across all those reads.
+    sum: u64,
+    /// Sum of squares of per-read MAPQ scores (`u128` to absorb the
+    /// `mapq² × n` worst case without saturation).
+    sum_of_squares: u128,
+}
+
+fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> PooledMapqMoments {
+    let mut moments = PooledMapqMoments {
+        n: 0,
+        sum: 0,
+        sum_of_squares: 0,
+    };
     for sample_idx in 0..record.n_samples {
         let stats = &record.scalars_row(sample_idx)[allele_idx];
-        n += u64::from(stats.num_obs);
-        sum += u64::from(stats.mapq_sum);
-        ssq += stats.mapq_sum_sq as u128;
+        moments.n += u64::from(stats.num_obs);
+        moments.sum += u64::from(stats.mapq_sum);
+        moments.sum_of_squares += stats.mapq_sum_sq as u128;
     }
-    (n, sum, ssq)
+    moments
 }
 
 /// Compute the DUST low-complexity mask for one chromosome by
