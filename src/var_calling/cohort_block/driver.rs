@@ -532,7 +532,7 @@ fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> PooledMapqMo
 /// half-open slice intervals into 1-based half-open genomic
 /// intervals the partition expects.
 fn compute_dust_mask_for_chrom(
-    fetcher: &StreamingChromRefFetcher,
+    ref_fetcher: &StreamingChromRefFetcher,
     contig: &str,
     chrom_length: u32,
     dust_cfg: &DustFilterConfig,
@@ -545,7 +545,7 @@ fn compute_dust_mask_for_chrom(
     // (~90 MB for tomato chrom 1) just to re-iterate them — defeating
     // the chunk driver's "per-chunk memory bounded by
     // `target_variants_per_chunk × n_samples`" contract.
-    let base_iter = fetcher
+    let base_iter = ref_fetcher
         .iter_bases()
         .map_err(|source| ChunkDriverError::ComputeDustMask {
             contig: contig.to_string(),
@@ -595,7 +595,13 @@ where
         return Ok(());
     }
 
-    let fetcher =
+    // Mi6: per-chrom reference fetcher. Naming the binding
+    // `ref_fetcher` matches the parameter names in
+    // `load_and_run_chunk_with_retry` and
+    // `prefetch_window_ref_bytes`; the codebase has multiple kinds
+    // of fetchers (PSP, FASTA), so the `ref_` qualifier carries
+    // meaning the bare `fetcher` did not.
+    let ref_fetcher =
         StreamingChromRefFetcher::for_contig(fasta_path, &chrom.name).map_err(|source| {
             ChunkDriverError::OpenRefFetcher {
                 contig: chrom.name.clone(),
@@ -605,7 +611,7 @@ where
     let masked_intervals: Vec<std::ops::Range<u32>> = if params.no_complexity_filter {
         Vec::new()
     } else {
-        compute_dust_mask_for_chrom(&fetcher, &chrom.name, chrom_length, &params.dust_cfg)?
+        compute_dust_mask_for_chrom(&ref_fetcher, &chrom.name, chrom_length, &params.dust_cfg)?
     };
     // Mi9: borrow the per-chrom fetcher through the retry helper instead
     // of wrapping it in an `Arc<dyn …>`. The fetcher is owned by this
@@ -648,7 +654,7 @@ where
             max_span,
             psp_readers,
             &masked_intervals,
-            &fetcher,
+            &ref_fetcher,
             params,
             writer,
             stats,
