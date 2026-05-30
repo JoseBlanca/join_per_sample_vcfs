@@ -3,6 +3,7 @@
 //! and compact the survivors into a [`MaterialisedChunk`] for the
 //! pre-pass and worker.
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::pileup_record::PileupRecord;
@@ -247,6 +248,8 @@ pub fn load_chunk_from_iters<I, E>(
 ) -> Result<ChunkLoadStats, ChunkLoadError<E>>
 where
     I: IntoIterator<Item = Result<PileupRecord, E>>,
+    I::IntoIter: Send,
+    E: Send,
 {
     let ChunkLoadExtent {
         chrom_id,
@@ -320,10 +323,26 @@ where
     let mut variant_count: u32;
     loop {
         let clamped_end = attempt_end.min(max_attempt_end);
-        for (sample_idx, iter) in peekable_iters.iter_mut().enumerate() {
-            let raw = &mut scratch.raw_per_sample[sample_idx];
-            pull_records_with_pos_under(iter, sample_idx, chrom_id, range_start, clamped_end, raw)?;
-        }
+        // Per-sample decode is independent — each sample has its own
+        // iterator and raw buffer — so pull in parallel. At high N this
+        // is the dominant cost (N× zstd decompress + record
+        // materialise) and was previously serial. Determinism is
+        // unaffected: each sample fills its own buffer.
+        scratch
+            .raw_per_sample
+            .par_iter_mut()
+            .zip(peekable_iters.par_iter_mut())
+            .enumerate()
+            .try_for_each(|(sample_idx, (raw, iter))| {
+                pull_records_with_pos_under(
+                    iter,
+                    sample_idx,
+                    chrom_id,
+                    range_start,
+                    clamped_end,
+                    raw,
+                )
+            })?;
         attempt_end = clamped_end;
 
         rebuild_position_union_and_is_kept(scratch);
@@ -347,28 +366,35 @@ where
 
     // ── Step 3: per-sample compact (run once on final accumulated
     //            data). ──
-    for (sample_idx, raw) in scratch.raw_per_sample.iter().enumerate() {
-        let dst = &mut out.per_sample[sample_idx];
-        // Parallel walk over `raw.positions` and `position_union`:
-        // both are sorted ascending, so we never need to backtrack.
-        let mut union_idx = 0_usize;
-        for row_idx in 0..raw.n_records() {
-            let pos = raw.position_at(row_idx);
-            while union_idx < scratch.position_union.len()
-                && scratch.position_union[union_idx] < pos
-            {
-                union_idx += 1;
+    // Per-sample compact is independent — each reads its own raw rows
+    // plus the shared (immutable) union/is_kept and writes its own
+    // column — so run in parallel. `out.per_sample` was cleared +
+    // resized to `n_samples` above, so each slot is an empty column
+    // ready to receive in row order (per-sample order is preserved, so
+    // output is unchanged).
+    let position_union = &scratch.position_union;
+    let is_kept = &scratch.is_kept;
+    out.per_sample
+        .par_iter_mut()
+        .zip(scratch.raw_per_sample.par_iter())
+        .for_each(|(dst, raw)| {
+            // Parallel walk over `raw.positions` and `position_union`:
+            // both are sorted ascending, so we never need to backtrack.
+            let mut union_idx = 0_usize;
+            for row_idx in 0..raw.n_records() {
+                let pos = raw.position_at(row_idx);
+                while union_idx < position_union.len() && position_union[union_idx] < pos {
+                    union_idx += 1;
+                }
+                debug_assert!(
+                    union_idx < position_union.len() && position_union[union_idx] == pos,
+                    "raw position {pos} missing from union — invariant broken",
+                );
+                if is_kept[union_idx] {
+                    dst.push_row_from(raw, row_idx);
+                }
             }
-            debug_assert!(
-                union_idx < scratch.position_union.len()
-                    && scratch.position_union[union_idx] == pos,
-                "raw position {pos} missing from union — invariant broken",
-            );
-            if scratch.is_kept[union_idx] {
-                dst.push_row_from(raw, row_idx);
-            }
-        }
-    }
+        });
 
     Ok(ChunkLoadStats { variant_count })
 }
@@ -1071,7 +1097,7 @@ mod tests {
         let mut scratch = ChunkLoadScratch::with_n_samples(n_samples);
         let mut out = MaterialisedChunk::with_n_samples(n_samples);
         let mut carry = vec![SampleColumns::empty()];
-        let iters: Vec<Box<dyn Iterator<Item = Result<PileupRecord, &'static str>>>> =
+        let iters: Vec<Box<dyn Iterator<Item = Result<PileupRecord, &'static str>> + Send>> =
             vec![Box::new(std::iter::once(Err("psp blew up")))];
         let err = load_chunk_from_iters(
             &mut scratch,

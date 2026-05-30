@@ -658,7 +658,7 @@ fn covered_intervals_for_chrom<W>(
     max_group_span: u32,
 ) -> Vec<std::ops::Range<u32>>
 where
-    W: Read + Seek,
+    W: Read + Seek + Send,
 {
     let ranges = psp_readers.iter().flat_map(|r| {
         r.block_index()
@@ -689,7 +689,7 @@ fn drive_one_chrom_generic<W>(
     worker_pool: &mut WorkerPool,
 ) -> Result<(), ChunkDriverError>
 where
-    W: Read + Seek,
+    W: Read + Seek + Send,
 {
     let chrom_length = chrom.length;
     if chrom_length == 0 {
@@ -850,7 +850,7 @@ const MIN_CHUNK_SPAN: u32 = 50_000;
 /// 2. Owned mutable state: `dust_fetcher`, `chunk_mask`, `psp_readers`,
 ///    `writer`, `stats`, `chunk_scratch`, `fix_scratch`, `chunk`,
 ///    `carryover`, `carryover_snapshot`, `worker_pool`.
-struct ChunkLoopState<'a, W: Read + Seek> {
+struct ChunkLoopState<'a, W: Read + Seek + Send> {
     chrom_id: u32,
     chrom_length: u32,
     chrom_one_past_end: u32,
@@ -894,7 +894,7 @@ fn load_and_run_chunk_with_retry<W>(
     max_span: u32,
 ) -> Result<u32, ChunkDriverError>
 where
-    W: Read + Seek,
+    W: Read + Seek + Send,
 {
     load_chunk_with_safe_boundary_retry(
         state,
@@ -921,7 +921,7 @@ fn load_chunk_with_safe_boundary_retry<W>(
     max_span: u32,
 ) -> Result<(), ChunkDriverError>
 where
-    W: Read + Seek,
+    W: Read + Seek + Send,
 {
     debug_assert_eq!(state.carryover.len(), state.carryover_snapshot.len());
     // M14: snapshot the carryover so we can restore it on `NoSafeGap` —
@@ -1031,7 +1031,7 @@ where
 /// then run the per-window math in parallel via rayon.
 fn run_chunk_windows_parallel<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
 where
-    W: Read + Seek,
+    W: Read + Seek + Send,
 {
     // Mi10: iterate `chunk.windows` directly — the loop body's only
     // `chunk` access is the immutable read `partition_window(chunk,
@@ -1148,7 +1148,7 @@ where
 /// `ChunkDriverStats` totals accumulate.
 fn drain_window_outputs<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
 where
-    W: Read + Seek,
+    W: Read + Seek + Send,
 {
     let n_windows = state.chunk.windows.len();
     // Split-borrow: take the &mut on worker_pool but keep the

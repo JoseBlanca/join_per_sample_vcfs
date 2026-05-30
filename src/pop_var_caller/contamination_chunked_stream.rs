@@ -102,7 +102,7 @@ pub struct ChunkedPositionStream<R: Read + Seek> {
     is_exhausted: bool,
 }
 
-impl<R: Read + Seek> ChunkedPositionStream<R> {
+impl<R: Read + Seek + Send> ChunkedPositionStream<R> {
     /// Build a stream over `psp_readers` covering every chromosome
     /// in `chromosomes`. The readers are taken by value because the
     /// stream needs `&mut` access to each one across every chunk.
@@ -218,7 +218,7 @@ impl<R: Read + Seek> ChunkedPositionStream<R> {
     }
 }
 
-impl<R: Read + Seek> Iterator for ChunkedPositionStream<R> {
+impl<R: Read + Seek + Send> Iterator for ChunkedPositionStream<R> {
     type Item = Result<PerPositionPileups, ContaminationStreamError>;
 
     fn next(&mut self) -> Option<Self::Item> {
