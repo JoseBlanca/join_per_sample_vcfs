@@ -55,6 +55,15 @@ use crate::var_calling::posterior_engine::{
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
 use crate::vcf::{CohortMetadata, VcfWriteError, WriterConfig};
 
+/// Auto-default variants per worker window. When
+/// `--target-variants-per-chunk` is left at `0`, the per-chunk variant
+/// target is `window_count × AUTO_VARIANTS_PER_WINDOW`, sizing each
+/// window to carry enough variants to amortise its per-window setup
+/// (partition scan, REF prefetch, EM init). Tunable; the right value is
+/// empirical and should be validated against the high-N synthetic
+/// scaling benchmark, where the per-sample math dominates.
+const AUTO_VARIANTS_PER_WINDOW: u32 = 256;
+
 // ---------------------------------------------------------------------
 // CLI surface
 // ---------------------------------------------------------------------
@@ -401,23 +410,35 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         grouper_cfg,
         per_group_cfg,
         posterior_cfg,
-        sizing: ChunkSizingParams {
-            chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
-            // M9: `0` from the CLI maps to `None` (disabled);
-            // non-zero values are wrapped in `NonZeroU32`.
-            target_variants_per_chunk: std::num::NonZeroU32::new(args.target_variants_per_chunk),
-            // `0` (the default) means auto: one window per worker
-            // thread (the rayon pool, already configured above), so the
-            // per-window math fills every thread. Explicit non-zero
-            // values are an operator override. Always `>= 1`.
-            target_window_count: {
-                let n = if args.worker_windows_per_chunk == 0 {
-                    rayon::current_num_threads().max(1)
-                } else {
-                    args.worker_windows_per_chunk
-                };
-                std::num::NonZeroUsize::new(n).expect("auto/override window count is >= 1")
-            },
+        sizing: {
+            // Window count: `0` (default) = auto = one window per worker
+            // thread (the rayon pool, already configured above) so the
+            // per-window math fills every thread; explicit values are an
+            // operator override. Always `>= 1`.
+            let window_count = if args.worker_windows_per_chunk == 0 {
+                rayon::current_num_threads().max(1)
+            } else {
+                args.worker_windows_per_chunk
+            };
+            // Variant target per chunk: `0` (default) = auto =
+            // `window_count × AUTO_VARIANTS_PER_WINDOW`, so each chunk
+            // carries enough variants for every window to do meaningful
+            // work (the loader grows a chunk's span until it reaches the
+            // target or exhausts the covered interval). Explicit values
+            // override. Bigger target ⇒ more variants resident per chunk
+            // (memory ∝ target × n_samples), which is the one-chunk-at-a-
+            // time bound the rewrite trades span for.
+            let target_variants = if args.target_variants_per_chunk == 0 {
+                (window_count as u32).saturating_mul(AUTO_VARIANTS_PER_WINDOW)
+            } else {
+                args.target_variants_per_chunk
+            };
+            ChunkSizingParams {
+                chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
+                target_variants_per_chunk: std::num::NonZeroU32::new(target_variants),
+                target_window_count: std::num::NonZeroUsize::new(window_count)
+                    .expect("auto/override window count is >= 1"),
+            }
         },
         downstream: DownstreamFilterParams {
             min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
