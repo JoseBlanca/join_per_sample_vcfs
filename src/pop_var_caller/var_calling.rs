@@ -106,13 +106,14 @@ pub struct VarCallingArgs {
 
     /// Number of parallel worker windows per chunk. The pre-pass
     /// places `worker-windows-per-chunk - 1` internal boundaries
-    /// inside each chunk's safe range so the rayon dispatch runs
-    /// `worker-windows-per-chunk` independent per-window math
-    /// pipelines concurrently. `1` (the default) preserves the
-    /// sequential single-window-per-chunk behaviour. Pair with
-    /// `--target-variants-per-chunk` so each window has a
-    /// meaningful amount of work to do.
-    #[arg(long, default_value_t = 1)]
+    /// inside each chunk's safe range (sliding each to a safe,
+    /// non-variant gap) so the rayon dispatch runs that many
+    /// independent per-window math pipelines concurrently; the
+    /// pre-pass collapses to fewer windows when safe gaps are scarce.
+    /// `0` (the default) means **auto** — one window per worker thread
+    /// (`rayon` pool size), so the per-window math fills all threads.
+    /// `1` forces the sequential single-window-per-chunk behaviour.
+    #[arg(long, default_value_t = 0)]
     pub worker_windows_per_chunk: usize,
 
     /// One or more cohort `.psp` files.
@@ -405,15 +406,18 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
             // M9: `0` from the CLI maps to `None` (disabled);
             // non-zero values are wrapped in `NonZeroU32`.
             target_variants_per_chunk: std::num::NonZeroU32::new(args.target_variants_per_chunk),
-            // M7: reject `--worker-windows-per-chunk 0` at the
-            // boundary (NonZeroUsize). The CLI parser's default is
-            // `1`, so this only fires when an operator explicitly
-            // passes `0`.
-            target_window_count: std::num::NonZeroUsize::new(args.worker_windows_per_chunk).ok_or(
-                VarCallingCliError::InvalidWorkerWindowsPerChunk {
-                    got: args.worker_windows_per_chunk,
-                },
-            )?,
+            // `0` (the default) means auto: one window per worker
+            // thread (the rayon pool, already configured above), so the
+            // per-window math fills every thread. Explicit non-zero
+            // values are an operator override. Always `>= 1`.
+            target_window_count: {
+                let n = if args.worker_windows_per_chunk == 0 {
+                    rayon::current_num_threads().max(1)
+                } else {
+                    args.worker_windows_per_chunk
+                };
+                std::num::NonZeroUsize::new(n).expect("auto/override window count is >= 1")
+            },
         },
         downstream: DownstreamFilterParams {
             min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
