@@ -159,13 +159,12 @@ impl ColumnarPipelineScratch {
     }
 }
 
-/// Per-worker state for one window: everything the driver needs to
-/// partition the window, pre-fetch its REF bytes, run the column-
-/// native math, and accumulate the emitted [`PosteriorRecord`]s.
+/// Per-block worker scratch: everything needed to partition the block,
+/// pre-fetch its REF bytes, run the column-native math, and accumulate
+/// the emitted [`PosteriorRecord`]s. The [`BlockIterator`] owns one and
+/// reuses it across blocks.
 ///
-/// Owned indirectly by [`WorkerPool`]; the driver pairs each
-/// `chunk.windows[i]` with `pool.slots[i]` so concurrent execution
-/// gets disjoint scratch buffers.
+/// [`BlockIterator`]: crate::var_calling::cohort_block::driver
 pub struct WorkerSlot {
     /// Reusable per-window partition scratch (sample-stride buffers).
     pub partition_scratch: PartitionScratch,
@@ -207,38 +206,6 @@ impl WorkerSlot {
             pipeline_scratch: ColumnarPipelineScratch::empty(),
             posterior_records: Vec::new(),
             stats: WindowRunStats::default(),
-        }
-    }
-}
-
-/// Pool of per-window worker state, sized to the chunk's window
-/// count. The driver grows the pool on demand via
-/// [`Self::ensure_capacity`]; buffers in slots `[0, target)`
-/// retain their high-water-mark capacity across chunks (and
-/// across chromosomes).
-///
-/// Phase B step 4 will run the per-window math in parallel via
-/// `slots[..target].par_iter_mut()`; today the driver still walks
-/// the slots sequentially.
-#[derive(Default)]
-pub struct WorkerPool {
-    /// Per-window state. Length grows monotonically; the driver
-    /// works on `slots[..target]` where `target = chunk.windows.len()`
-    /// for the current chunk.
-    pub slots: Vec<WorkerSlot>,
-}
-
-impl WorkerPool {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Grow the pool until it holds at least `target` slots. New
-    /// slots get freshly-allocated buffers sized for `n_samples`;
-    /// existing slots keep their high-water-mark capacity.
-    pub fn ensure_capacity(&mut self, target: usize, n_samples: usize) {
-        while self.slots.len() < target {
-            self.slots.push(WorkerSlot::new(n_samples));
         }
     }
 }

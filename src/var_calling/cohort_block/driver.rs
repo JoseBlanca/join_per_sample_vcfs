@@ -28,7 +28,7 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -95,18 +95,6 @@ pub struct ChunkSizingParams {
     /// visible in the type. See
     /// [the Phase B prereq plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md).
     pub target_variants_per_chunk: Option<NonZeroU32>,
-    /// M7: number of parallel worker windows per chunk.
-    /// [`finalise_chunk_boundaries`] places `target_window_count - 1` internal
-    /// boundaries inside each chunk's `[range.start, safe_end)` so
-    /// the [`WorkerPool`] can dispatch the per-window math
-    /// concurrently. `NonZeroUsize::MIN` (1) preserves the
-    /// sequential single-window-per-chunk behaviour byte-for-byte;
-    /// `0` is rejected at the type level. The previous shape was a
-    /// bare `usize` where the driver silently mapped `0` to `1` via
-    /// `.max(1)`, bypassing the pre-pass's
-    /// `BoundaryFinalisationError::ZeroTargetWindowCount` validation.
-    /// See [the Phase B plan](https://github.com/JoseBlanca/join_per_sample_vcfs/blob/main/doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b_parallel_windows.md).
-    pub target_window_count: NonZeroUsize,
 }
 
 /// Mi19: post-EM downstream filters applied by `emit_or_drop` before
@@ -188,13 +176,6 @@ pub struct ChunkDriverStats {
     /// kept-position count per chunk — a quick sanity check that
     /// `target_variants_per_chunk` is doing what the operator expects.
     pub chunk_variants_total: u64,
-    /// Mi21: chunks where `finalise_chunk_boundaries` produced fewer windows
-    /// than `params.sizing.target_window_count` requested. The pre-pass
-    /// silently down-grades when safe positions are sparse; an
-    /// operator setting `--worker-windows-per-chunk 8` and seeing
-    /// `chunks_with_fewer_windows_than_requested > 0` knows the
-    /// requested parallelism didn't fully realise on those chunks.
-    pub chunks_with_fewer_windows_than_requested: u64,
 }
 
 /// Errors surfaced by the chunk-loop driver.
@@ -361,14 +342,13 @@ pub fn drive_cohort_chunked(
     // `print_run_summary` at the end of the run.
     eprintln!(
         "var-calling: chunk_genomic_span={} target_variants_per_chunk={} \
-         target_window_count={} min_qual_phred={} min_alt_obs_per_sample={} \
+         min_qual_phred={} min_alt_obs_per_sample={} \
          no_mapq_diff_filter={} min_mapq_diff_t={} no_complexity_filter={}",
         params.sizing.chunk_genomic_span,
         params
             .sizing
             .target_variants_per_chunk
             .map_or(0, NonZeroU32::get),
-        params.sizing.target_window_count.get(),
         params.downstream.min_qual_phred,
         params.downstream.min_alt_obs_per_sample,
         params.downstream.no_mapq_diff_filter,
@@ -942,7 +922,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             *chunks_loaded += 1;
             *chunk_variants_total += u64::from(load_stats.variant_count);
 
-            match finalise_chunk_boundaries(chunk, carryover, fix_scratch, max_group_span, 1) {
+            match finalise_chunk_boundaries(chunk, carryover, fix_scratch, max_group_span) {
                 Ok(()) => break,
                 Err(BoundaryFinalisationError::NoSafeGap { .. }) if attempt_span < max_span => {
                     for (carry, snap) in carryover.iter_mut().zip(carryover_snapshot.iter()) {
@@ -1271,7 +1251,6 @@ mod tests {
             sizing: ChunkSizingParams {
                 chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
                 target_variants_per_chunk: None,
-                target_window_count: NonZeroUsize::MIN,
             },
             downstream: DownstreamFilterParams {
                 min_alt_obs_per_sample,

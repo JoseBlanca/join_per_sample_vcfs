@@ -130,15 +130,15 @@ pub(crate) fn loaded_chunk(
     (chunk, carryover)
 }
 
-/// Run the boundary-finalisation pass with `target_window_count = 1`
-/// and a freshly allocated [`BoundaryFinalisationScratch`].
+/// Run the boundary-finalisation pass with a freshly allocated
+/// [`BoundaryFinalisationScratch`].
 pub(crate) fn run_finalise_chunk_boundaries(
     chunk: &mut MaterialisedChunk,
     carryover: &mut [SampleColumns],
     max_group_span: u32,
 ) -> Result<(), BoundaryFinalisationError> {
     let mut scratch = BoundaryFinalisationScratch::new();
-    finalise_chunk_boundaries(chunk, carryover, &mut scratch, max_group_span, 1)
+    finalise_chunk_boundaries(chunk, carryover, &mut scratch, max_group_span)
 }
 
 /// Mi16: byte-identity oracle that materialises one

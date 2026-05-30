@@ -530,22 +530,18 @@ impl SampleColumns {
     }
 }
 
-/// One genomic chunk × N samples worth of [`SampleColumns`] plus the
-/// pre-pass-decided boundaries.
+/// One materialised block × N samples worth of [`SampleColumns`] plus
+/// the pre-pass-decided right boundary.
 ///
 /// **Lifecycle.**
-/// 1. The chunk loader produces a chunk with
-///    `safe_end = range.end` and `windows` empty — the load already
-///    applied the cohort-wide variant-position filter.
-/// 2. `finalise_chunk_boundaries` walks the loaded chunk once, picks
-///    `safe_end ≤ range.end` so no variant group can span the right
-///    boundary into the next chunk, and partitions
-///    `[range.start, safe_end)` into the [`Self::windows`] list. At
-///    T=1 the partition is a single window; T>1 places T-1 internal
-///    boundaries in safe gaps.
-/// 3. Workers process [`Self::windows`] in parallel; each worker
-///    runs the full pipeline on its window and emits final
-///    `PosteriorRecord`s.
+/// 1. The chunk loader produces a block with `safe_end = range.end`,
+///    having applied the cohort-wide variant-position filter.
+/// 2. `finalise_chunk_boundaries` walks the loaded block once and picks
+///    `safe_end ≤ range.end` at a clean group boundary so no variant
+///    group can span the right boundary into the next block; records
+///    past `safe_end` are split into the carryover (the reserve).
+/// 3. The consumer runs the full per-group pipeline on the whole block
+///    `[range.start, safe_end)` and emits final `PosteriorRecord`s.
 // Mi1: `#[non_exhaustive]` — external callers construct via
 // `MaterialisedChunk::with_n_samples(n)` (or the test-only struct
 // literal). Future column additions land without breaking out-of-crate
@@ -561,10 +557,6 @@ pub struct MaterialisedChunk {
     /// `>= safe_end` are split into the carryover passed to the next
     /// chunk's load.
     pub safe_end: u32,
-    /// Partition of `[range.start, safe_end)` into disjoint windows
-    /// produced by `finalise_chunk_boundaries`. Tile the chunk left-to-right;
-    /// each window is processed by one worker.
-    pub windows: Vec<Range<u32>>,
     /// One [`SampleColumns`] per sample, sample-index aligned with
     /// the cohort's `psp_paths`.
     pub per_sample: Vec<SampleColumns>,
@@ -583,20 +575,18 @@ impl MaterialisedChunk {
     }
 
     /// Construct an empty chunk pre-sized for `n_samples`. The
-    /// per-sample columns are empty, `range` is `0..0`, `safe_end`
-    /// is `0`, and `windows` is empty — the loader and pre-pass
-    /// will populate them.
+    /// per-sample columns are empty and `range` is `0..0` /
+    /// `safe_end` is `0` — the loader and pre-pass will populate them.
     pub fn with_n_samples(n_samples: usize) -> Self {
         Self {
             chrom_id: 0,
             range: 0..0,
             safe_end: 0,
-            windows: Vec::new(),
             per_sample: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
         }
     }
 
-    /// Reset every record / window / range field but preserve all
+    /// Reset every record / range field but preserve all
     /// allocated column capacity. The chunk loader calls this before
     /// loading the next chunk; the driver holds one persistent
     /// `MaterialisedChunk` across iterations.
@@ -610,7 +600,6 @@ impl MaterialisedChunk {
         self.chrom_id = 0;
         self.range = 0..0;
         self.safe_end = 0;
-        self.windows.clear();
         for sample in &mut self.per_sample {
             sample.clear();
         }
@@ -713,7 +702,6 @@ mod tests {
             chrom_id: 3,
             range: 90..200,
             safe_end: 200,
-            windows: vec![90..200],
             per_sample: vec![s0, s1],
         };
         assert_eq!(chunk.n_samples(), 2);

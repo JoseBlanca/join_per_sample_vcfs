@@ -55,14 +55,14 @@ use crate::var_calling::posterior_engine::{
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
 use crate::vcf::{CohortMetadata, VcfWriteError, WriterConfig};
 
-/// Auto-default variants per worker window. When
-/// `--target-variants-per-chunk` is left at `0`, the per-chunk variant
-/// target is `window_count × AUTO_VARIANTS_PER_WINDOW`, sizing each
-/// window to carry enough variants to amortise its per-window setup
-/// (partition scan, REF prefetch, EM init). Tunable; the right value is
-/// empirical and should be validated against the high-N synthetic
-/// scaling benchmark, where the per-sample math dominates.
-const AUTO_VARIANTS_PER_WINDOW: u32 = 256;
+/// Default desired number of variable variants per materialised block
+/// (the `BlockIterator`'s accumulation target) when
+/// `--target-variants-per-chunk` is left at `0`. Sets block size: the
+/// iterator pulls .psp chunks until it has this many variable variants,
+/// then cuts at a clean group boundary. Output is independent of it;
+/// it trades block size for memory (resident ≈ target × n_samples).
+/// Tunable; validate against the high-N synthetic scaling benchmark.
+const DEFAULT_DESIRED_VARIANTS_PER_BLOCK: u32 = 1024;
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -112,18 +112,6 @@ pub struct VarCallingArgs {
     /// pull of `--chunk-genomic-span` BP per chunk).
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
-
-    /// Number of parallel worker windows per chunk. The pre-pass
-    /// places `worker-windows-per-chunk - 1` internal boundaries
-    /// inside each chunk's safe range (sliding each to a safe,
-    /// non-variant gap) so the rayon dispatch runs that many
-    /// independent per-window math pipelines concurrently; the
-    /// pre-pass collapses to fewer windows when safe gaps are scarce.
-    /// `0` (the default) means **auto** — one window per worker thread
-    /// (`rayon` pool size), so the per-window math fills all threads.
-    /// `1` forces the sequential single-window-per-chunk behaviour.
-    #[arg(long, default_value_t = 0)]
-    pub worker_windows_per_chunk: usize,
 
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
@@ -205,14 +193,6 @@ pub enum VarCallingCliError {
     /// process. The binary calls it at most once.
     #[error("rayon thread pool already initialised — refusing to override")]
     RayonAlreadyConfigured,
-
-    /// M7: `--worker-windows-per-chunk` must be `>= 1`. The previous
-    /// behaviour silently mapped `0` to `1` driver-side via `.max(1)`,
-    /// bypassing the pre-pass's `ZeroTargetWindowCount` validation;
-    /// the type-level lift to `NonZeroUsize` rejects the `0` input at
-    /// the CLI boundary instead.
-    #[error("--worker-windows-per-chunk must be >= 1, got {got}")]
-    InvalidWorkerWindowsPerChunk { got: usize },
 
     /// FASTA contig bytes don't match the `.psp` header's
     /// per-contig MD5. The basename cross-check (variant
@@ -411,33 +391,21 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         per_group_cfg,
         posterior_cfg,
         sizing: {
-            // Window count: `0` (default) = auto = one window per worker
-            // thread (the rayon pool, already configured above) so the
-            // per-window math fills every thread; explicit values are an
-            // operator override. Always `>= 1`.
-            let window_count = if args.worker_windows_per_chunk == 0 {
-                rayon::current_num_threads().max(1)
-            } else {
-                args.worker_windows_per_chunk
-            };
-            // Variant target per chunk: `0` (default) = auto =
-            // `window_count × AUTO_VARIANTS_PER_WINDOW`, so each chunk
-            // carries enough variants for every window to do meaningful
-            // work (the loader grows a chunk's span until it reaches the
-            // target or exhausts the covered interval). Explicit values
-            // override. Bigger target ⇒ more variants resident per chunk
-            // (memory ∝ target × n_samples), which is the one-chunk-at-a-
-            // time bound the rewrite trades span for.
+            // Desired variable-variants per block — the BlockIterator's
+            // accumulation target. `0` (default) uses the const default;
+            // an explicit `--target-variants-per-chunk` overrides. Output
+            // is independent of this (the iterator always cuts at clean
+            // group boundaries); it trades block size for memory
+            // (resident ≈ target × n_samples — the one-chunk-at-a-time
+            // bound the rewrite trades genomic span for).
             let target_variants = if args.target_variants_per_chunk == 0 {
-                (window_count as u32).saturating_mul(AUTO_VARIANTS_PER_WINDOW)
+                DEFAULT_DESIRED_VARIANTS_PER_BLOCK
             } else {
                 args.target_variants_per_chunk
             };
             ChunkSizingParams {
                 chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
                 target_variants_per_chunk: std::num::NonZeroU32::new(target_variants),
-                target_window_count: std::num::NonZeroUsize::new(window_count)
-                    .expect("auto/override window count is >= 1"),
             }
         },
         downstream: DownstreamFilterParams {
