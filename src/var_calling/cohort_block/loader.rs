@@ -404,13 +404,30 @@ where
 /// current `scratch.raw_per_sample` accumulator. Idempotent —
 /// called once per extension iteration inside the loader's loop.
 fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
+    // Destructure for disjoint field borrows so the per-position scan
+    // can write `has_variant_at` / `max_ref_span_at` in parallel while
+    // reading `raw_per_sample` / `position_union`.
+    let ChunkLoadScratch {
+        raw_per_sample,
+        position_union,
+        has_variant_at,
+        max_ref_span_at,
+        is_kept,
+    } = scratch;
+
     // ── Position union ──
-    scratch.position_union.clear();
-    for raw in &scratch.raw_per_sample {
-        scratch.position_union.extend_from_slice(&raw.positions);
+    position_union.clear();
+    for raw in raw_per_sample.iter() {
+        position_union.extend_from_slice(&raw.positions);
     }
-    scratch.position_union.sort_unstable();
-    scratch.position_union.dedup();
+    // Parallel sort: at high N this union is N× a single sample's
+    // positions. `par_sort_unstable` falls back to sequential for
+    // small inputs and produces the same total order, so the dedup'd
+    // union — and everything downstream — is unchanged.
+    position_union.par_sort_unstable();
+    position_union.dedup();
+
+    let n = position_union.len();
 
     // ── Per-position scan: has_variant_at + max_ref_span_at ──
     // For each cohort position we walk the samples that have a record
@@ -420,29 +437,33 @@ fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
     //     whether a provisional group has any variant evidence.
     //   - `max_ref_span_at[i]` — max `ref_span` across samples with a
     //     record. Drives the grouping simulation's reach calculation.
-    scratch
-        .has_variant_at
-        .resize(scratch.position_union.len(), false);
-    scratch
-        .max_ref_span_at
-        .resize(scratch.position_union.len(), 0);
-    for (idx, &pos) in scratch.position_union.iter().enumerate() {
-        let mut has_variant = false;
-        let mut max_ref_span: u32 = 0;
-        for raw in &scratch.raw_per_sample {
-            if let Ok(row_idx) = raw.binary_search_position(pos) {
-                let ref_span = raw.ref_span_at(row_idx);
-                if ref_span > max_ref_span {
-                    max_ref_span = ref_span;
-                }
-                if !has_variant && raw.has_observed_non_ref_allele_at(row_idx) {
-                    has_variant = true;
+    // Positions are independent, so the scan (O(positions × samples) —
+    // the dominant fold cost at high N) runs in parallel. Every slot is
+    // overwritten, so determinism/output is unchanged.
+    has_variant_at.resize(n, false);
+    max_ref_span_at.resize(n, 0);
+    let raw_ref: &[SampleColumns] = raw_per_sample;
+    has_variant_at
+        .par_iter_mut()
+        .zip(max_ref_span_at.par_iter_mut())
+        .zip(position_union.par_iter())
+        .for_each(|((hv, mrs), &pos)| {
+            let mut has_variant = false;
+            let mut max_ref_span: u32 = 0;
+            for raw in raw_ref {
+                if let Ok(row_idx) = raw.binary_search_position(pos) {
+                    let ref_span = raw.ref_span_at(row_idx);
+                    if ref_span > max_ref_span {
+                        max_ref_span = ref_span;
+                    }
+                    if !has_variant && raw.has_observed_non_ref_allele_at(row_idx) {
+                        has_variant = true;
+                    }
                 }
             }
-        }
-        scratch.has_variant_at[idx] = has_variant;
-        scratch.max_ref_span_at[idx] = max_ref_span;
-    }
+            *hv = has_variant;
+            *mrs = max_ref_span;
+        });
 
     // ── Step 5: grouping simulation. ──
     // Walk the cohort-wide timeline in order, building provisional
@@ -461,36 +482,36 @@ fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
     // but inside the reach of another sample's MNP/DEL/INS. Dropping
     // those positions here would silently under-count REF evidence
     // for homref samples in multi-position groups.
-    scratch.is_kept.resize(scratch.position_union.len(), false);
+    is_kept.resize(n, false);
     let mut group_open = false;
     let mut group_start_idx: usize = 0;
     let mut group_end_pos: u32 = 0;
     let mut group_has_variant = false;
-    for i in 0..scratch.position_union.len() {
-        let pos = scratch.position_union[i];
-        let reach = pos.saturating_add(scratch.max_ref_span_at[i].max(1)) - 1;
+    for i in 0..n {
+        let pos = position_union[i];
+        let reach = pos.saturating_add(max_ref_span_at[i].max(1)) - 1;
 
         if group_open && pos <= group_end_pos {
             if reach > group_end_pos {
                 group_end_pos = reach;
             }
-            if scratch.has_variant_at[i] {
+            if has_variant_at[i] {
                 group_has_variant = true;
             }
         } else {
             if group_open && group_has_variant {
-                for slot in scratch.is_kept[group_start_idx..i].iter_mut() {
+                for slot in is_kept[group_start_idx..i].iter_mut() {
                     *slot = true;
                 }
             }
             group_open = true;
             group_start_idx = i;
             group_end_pos = reach;
-            group_has_variant = scratch.has_variant_at[i];
+            group_has_variant = has_variant_at[i];
         }
     }
     if group_open && group_has_variant {
-        for slot in scratch.is_kept[group_start_idx..].iter_mut() {
+        for slot in is_kept[group_start_idx..].iter_mut() {
             *slot = true;
         }
     }
