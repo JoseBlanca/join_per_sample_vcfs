@@ -1020,8 +1020,12 @@ where
     }
 }
 
-/// Compute the chunk's DUST mask, then partition + prefetch + run the
-/// per-group math on the whole chunk as a single unit of work.
+/// Prepare the loaded chunk for processing (the *data-shaping* half of
+/// the chunk loop): compute its DUST mask, partition the whole chunk
+/// `[range.start, safe_end)` into variant groups, and prefetch their
+/// REF bytes into the single worker slot. The *math* half (run + emit)
+/// is [`drain_window_outputs`]. This produce/consume split is the seam
+/// the BlockIterator will formalise.
 fn run_chunk_windows_parallel<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
 where
     W: Read + Seek + Send,
@@ -1077,8 +1081,6 @@ where
     let max_group_span = state.max_group_span;
     let masked_intervals: &[std::ops::Range<u32>] = state.chunk_mask;
     let ref_fetcher = state.ref_fetcher;
-    let per_group_cfg = state.params.per_group_cfg;
-    let posterior_cfg = &state.params.posterior_cfg;
     let chunk: &MaterialisedChunk = state.chunk;
     let slot = &mut state.worker_pool.slots[0];
     let window = span_start..span_end;
@@ -1097,31 +1099,39 @@ where
         &mut slot.pre_fetched_ref_bytes,
     )
     .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
-    run_window(
-        chunk,
-        &slot.partition,
-        &slot.pre_fetched_ref_bytes,
-        per_group_cfg,
-        posterior_cfg,
-        &mut slot.pipeline_scratch,
-        &mut slot.posterior_records,
-        &mut slot.stats,
-    )
-    .map_err(ChunkDriverError::RunWindow)?;
     Ok(())
 }
 
-/// M12 phase 3: sequential drain over the slots in window order —
-/// preserves the prior per-record emit order even when phase 2 runs
-/// the workers concurrently. M15: `slot.stats` lives next to
-/// `slot.pipeline_scratch` as a separate `WindowRunStats` struct; the
-/// drive takes its contents (by `std::mem::take`) so the slot's
-/// counters reset for the next chunk while the per-driver
-/// `ChunkDriverStats` totals accumulate.
+/// Consume the prepared chunk: run the per-group math (layers 1+2+3 +
+/// EM + posterior + QUAL) over the chunk's single partition, then
+/// emit/drop the resulting records and roll up the chunk's counters.
+/// This is the *math* half of the chunk loop; `run_chunk_windows_parallel`
+/// is the *data-shaping* half (DUST + partition + REF prefetch). The
+/// split mirrors the eventual producer/consumer (BlockIterator) seam.
 fn drain_window_outputs<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
 where
     W: Read + Seek + Send,
 {
+    // ── Math: run the per-group pipeline on the prepared partition. ──
+    {
+        let per_group_cfg = state.params.per_group_cfg;
+        let posterior_cfg = &state.params.posterior_cfg;
+        let chunk: &MaterialisedChunk = state.chunk;
+        let slot = &mut state.worker_pool.slots[0];
+        run_window(
+            chunk,
+            &slot.partition,
+            &slot.pre_fetched_ref_bytes,
+            per_group_cfg,
+            posterior_cfg,
+            &mut slot.pipeline_scratch,
+            &mut slot.posterior_records,
+            &mut slot.stats,
+        )
+        .map_err(ChunkDriverError::RunWindow)?;
+    }
+
+    // ── Emit + roll up the chunk's counters. ──
     // Split-borrow: take the &mut on worker_pool but keep the
     // params/writer/stats refs for emit_or_drop. One slot per chunk.
     let writer = &mut *state.writer;
