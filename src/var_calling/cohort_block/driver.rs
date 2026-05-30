@@ -26,7 +26,6 @@
 //! the same per-category counters incremented — that's the
 //! byte-identity contract for Phase A.
 
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -985,23 +984,17 @@ where
         state.stats.chunks_loaded += 1;
         state.stats.chunk_variants_total += u64::from(load_stats.variant_count);
 
-        // M7: `target_window_count` is `NonZeroUsize` — no more
-        // `.max(1)` driver-side fallback that bypassed the pre-pass's
-        // `ZeroTargetWindowCount` validation.
-        let target_window_count = state.params.sizing.target_window_count.get();
+        // One window per chunk: the pre-pass only needs to pick
+        // `safe_end` + split carryover; the whole `[range.start,
+        // safe_end)` is processed as one unit (no sub-chunk windows).
         match finalise_chunk_boundaries(
             state.chunk,
             state.carryover,
             state.fix_scratch,
             max_group_span,
-            target_window_count,
+            1,
         ) {
             Ok(()) => {
-                // Mi21: surface when finalise_chunk_boundaries silently produced
-                // fewer windows than the operator asked for.
-                if state.chunk.windows.len() < target_window_count {
-                    state.stats.chunks_with_fewer_windows_than_requested += 1;
-                }
                 return Ok(());
             }
             Err(BoundaryFinalisationError::NoSafeGap { .. }) if attempt_span < max_span => {
@@ -1027,21 +1020,14 @@ where
     }
 }
 
-/// M12 phase 2: partition + REF prefetch per window (sequential),
-/// then run the per-window math in parallel via rayon.
+/// Compute the chunk's DUST mask, then partition + prefetch + run the
+/// per-group math on the whole chunk as a single unit of work.
 fn run_chunk_windows_parallel<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDriverError>
 where
     W: Read + Seek + Send,
 {
-    // Mi10: iterate `chunk.windows` directly — the loop body's only
-    // `chunk` access is the immutable read `partition_window(chunk,
-    // window, …)`, which is a shared reborrow under modern Rust's
-    // NLL.
-    let n_windows = state.chunk.windows.len();
     let n_samples = state.chunk.n_samples();
-    state
-        .worker_pool
-        .ensure_capacity(n_windows.max(1), n_samples);
+    state.worker_pool.ensure_capacity(1, n_samples);
 
     // ── Per-chunk DUST mask over the analysed span [range.start,
     //    safe_end). Replaces the whole-chromosome pre-pass: only the
@@ -1079,63 +1065,49 @@ where
         }
     }
 
+    // ── One chunk = one unit of work. The genomic-window subdivision
+    //    was removed: partition the whole chunk `[range.start,
+    //    safe_end)` into variant groups, prefetch their REF bytes, and
+    //    run the per-group math (layers 1+2+3 + EM + posterior + QUAL)
+    //    on a single worker slot. Parallelism, when the per-sample math
+    //    needs it, comes from consuming whole chunks concurrently
+    //    (chunk size tuned by `target_variants_per_chunk`), not from
+    //    sub-chunk windows. ──
     let chrom_id = state.chrom_id;
     let max_group_span = state.max_group_span;
     let masked_intervals: &[std::ops::Range<u32>] = state.chunk_mask;
     let ref_fetcher = state.ref_fetcher;
-    // Split-borrow: `chunk` is read-only inside the loop while the
-    // worker pool's slots are mutated; rust accepts the disjoint
-    // field borrows here as long as we name them separately.
-    let chunk: &MaterialisedChunk = state.chunk;
-    let worker_pool = &mut *state.worker_pool;
-
-    // ── Phase 1 (sequential): partition + prefetch REF bytes per
-    //    window. The fetcher is `!Sync` so the prefetch can't run
-    //    in parallel; the partition could, but it's cheap relative
-    //    to the math and parallelising it would add rayon overhead
-    //    for little gain. ──
-    for (window_idx, slot) in worker_pool.slots.iter_mut().take(n_windows).enumerate() {
-        let window = &chunk.windows[window_idx];
-        partition_window(
-            chunk,
-            window,
-            masked_intervals,
-            max_group_span,
-            &mut slot.partition_scratch,
-            &mut slot.partition,
-        )
-        .map_err(|source| ChunkDriverError::Partition { chrom_id, source })?;
-        prefetch_window_ref_bytes(
-            &slot.partition,
-            ref_fetcher,
-            &mut slot.pre_fetched_ref_bytes,
-        )
-        .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
-    }
-
-    // ── Phase 2 (parallel): the per-window math (layers 1+2+3 + EM
-    //    + posterior summarisation + QUAL). Each slot's
-    //    `pre_fetched_ref_bytes` + `pipeline_scratch` + `posterior_records`
-    //    + `stats` are disjoint, so the dispatch is structurally
-    //    Send-safe. rayon's `par_iter_mut().try_for_each` collects
-    //    the first error and propagates. ──
     let per_group_cfg = state.params.per_group_cfg;
     let posterior_cfg = &state.params.posterior_cfg;
-    worker_pool.slots[..n_windows]
-        .par_iter_mut()
-        .try_for_each(|slot| {
-            run_window(
-                chunk,
-                &slot.partition,
-                &slot.pre_fetched_ref_bytes,
-                per_group_cfg,
-                posterior_cfg,
-                &mut slot.pipeline_scratch,
-                &mut slot.posterior_records,
-                &mut slot.stats,
-            )
-        })
-        .map_err(ChunkDriverError::RunWindow)?;
+    let chunk: &MaterialisedChunk = state.chunk;
+    let slot = &mut state.worker_pool.slots[0];
+    let window = span_start..span_end;
+    partition_window(
+        chunk,
+        &window,
+        masked_intervals,
+        max_group_span,
+        &mut slot.partition_scratch,
+        &mut slot.partition,
+    )
+    .map_err(|source| ChunkDriverError::Partition { chrom_id, source })?;
+    prefetch_window_ref_bytes(
+        &slot.partition,
+        ref_fetcher,
+        &mut slot.pre_fetched_ref_bytes,
+    )
+    .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
+    run_window(
+        chunk,
+        &slot.partition,
+        &slot.pre_fetched_ref_bytes,
+        per_group_cfg,
+        posterior_cfg,
+        &mut slot.pipeline_scratch,
+        &mut slot.posterior_records,
+        &mut slot.stats,
+    )
+    .map_err(ChunkDriverError::RunWindow)?;
     Ok(())
 }
 
@@ -1150,21 +1122,18 @@ fn drain_window_outputs<W>(state: &mut ChunkLoopState<W>) -> Result<(), ChunkDri
 where
     W: Read + Seek + Send,
 {
-    let n_windows = state.chunk.windows.len();
     // Split-borrow: take the &mut on worker_pool but keep the
-    // params/writer/stats refs for emit_or_drop.
-    let worker_pool = &mut *state.worker_pool;
+    // params/writer/stats refs for emit_or_drop. One slot per chunk.
     let writer = &mut *state.writer;
     let stats = &mut *state.stats;
     let params = state.params;
-    for slot in worker_pool.slots.iter_mut().take(n_windows) {
-        let slot_stats = std::mem::take(&mut slot.stats);
-        stats.lh_cap_groups_skipped += slot_stats.lh_cap_groups_skipped;
-        stats.lh_cap_alleles_in_skipped += slot_stats.lh_cap_alleles_in_skipped;
-        stats.groups_skipped_post_unify_ref_only += slot_stats.groups_skipped_post_unify_ref_only;
-        for record in slot.posterior_records.drain(..) {
-            emit_or_drop(record, params, writer, stats)?;
-        }
+    let slot = &mut state.worker_pool.slots[0];
+    let slot_stats = std::mem::take(&mut slot.stats);
+    stats.lh_cap_groups_skipped += slot_stats.lh_cap_groups_skipped;
+    stats.lh_cap_alleles_in_skipped += slot_stats.lh_cap_alleles_in_skipped;
+    stats.groups_skipped_post_unify_ref_only += slot_stats.groups_skipped_post_unify_ref_only;
+    for record in slot.posterior_records.drain(..) {
+        emit_or_drop(record, params, writer, stats)?;
     }
     Ok(())
 }
