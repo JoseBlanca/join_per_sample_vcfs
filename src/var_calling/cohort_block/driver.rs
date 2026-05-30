@@ -606,6 +606,69 @@ fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> PooledMapqMo
     moments
 }
 
+/// Merge per-block genomic ranges (1-based **inclusive** `(first_pos,
+/// last_pos)`) from every sample into sorted, non-overlapping "covered
+/// intervals" (1-based **half-open**). Two ranges are merged unless the
+/// record gap between them exceeds `max_group_span` — so every gap
+/// *between* the returned intervals is `> max_group_span` and is thus a
+/// safe chunk boundary (no variant group can reach across it, even after
+/// a full chain of joins to the `max_group_span` cap). The chunk loop
+/// can therefore process each interval independently and skip the gaps
+/// without changing any group — the byte-identity argument for
+/// block-index-driven advancement.
+///
+/// Input order is arbitrary (block indices from N samples interleave);
+/// the function sorts. Empty input → empty output.
+fn merge_block_ranges(
+    ranges: impl IntoIterator<Item = (u32, u32)>,
+    max_group_span: u32,
+) -> Vec<std::ops::Range<u32>> {
+    let mut v: Vec<(u32, u32)> = ranges.into_iter().collect();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    v.sort_unstable();
+    let mut out: Vec<std::ops::Range<u32>> = Vec::new();
+    let (mut cur_start, mut cur_last) = v[0];
+    for &(s, last) in &v[1..] {
+        // Merge when the next block's first record is within
+        // `max_group_span` of the current interval's last record — i.e.
+        // the gap is NOT a safe boundary. `cur_last + max_group_span`
+        // can't overflow in practice (positions are << u32::MAX) but
+        // saturate to be safe.
+        if s <= cur_last.saturating_add(max_group_span) {
+            cur_last = cur_last.max(last);
+        } else {
+            out.push(cur_start..cur_last.saturating_add(1));
+            cur_start = s;
+            cur_last = last;
+        }
+    }
+    out.push(cur_start..cur_last.saturating_add(1));
+    out
+}
+
+/// Covered intervals for one chromosome: every block's `[first_pos,
+/// last_pos]` for `chrom_id`, across all `psp_readers`, merged via
+/// [`merge_block_ranges`]. Reads only the in-memory block indices
+/// (decoded from the PSP trailer at open) — no file I/O.
+fn covered_intervals_for_chrom<W>(
+    psp_readers: &[PspReader<W>],
+    chrom_id: u32,
+    max_group_span: u32,
+) -> Vec<std::ops::Range<u32>>
+where
+    W: Read + Seek,
+{
+    let ranges = psp_readers.iter().flat_map(|r| {
+        r.block_index()
+            .iter()
+            .filter(move |b| b.chrom_id == chrom_id)
+            .map(|b| (b.first_pos, b.last_pos))
+    });
+    merge_block_ranges(ranges, max_group_span)
+}
+
 /// Drive the chunk loop over one chromosome. Pure helper for
 /// [`drive_cohort_chunked`]; broken out so the per-chrom borrow
 /// graph is easier to read and so the function stays generic over
@@ -633,12 +696,31 @@ where
         return Ok(());
     }
 
-    // Mi6: per-chrom reference fetcher. Naming the binding
-    // `ref_fetcher` matches the parameter names in
-    // `load_and_run_chunk_with_retry` and
-    // `prefetch_window_ref_bytes`; the codebase has multiple kinds
-    // of fetchers (PSP, FASTA), so the `ref_` qualifier carries
-    // meaning the bare `fetcher` did not.
+    let max_group_span = params.grouper_cfg.max_variant_group_span;
+
+    // Block-index-driven covered intervals: process only the genomic
+    // segments where some sample has PSP data, skipping uncovered
+    // reference entirely (the loop used to walk every
+    // `chunk_genomic_span` window of the whole contig). Coalesce on
+    // `max(max_group_span, MIN_CHUNK_SPAN)` so (a) every gap between
+    // intervals exceeds `max_group_span` — a guaranteed-safe chunk
+    // boundary no variant group can cross — and (b) nearby/misaligned
+    // blocks merge into chunk segments of a sensible minimum span.
+    // Reads only the in-memory block indices (decoded from each PSP
+    // trailer at open); no file I/O.
+    let covered =
+        covered_intervals_for_chrom(psp_readers, chrom_id, max_group_span.max(MIN_CHUNK_SPAN));
+    if covered.is_empty() {
+        // No sample carries data on this chromosome: open no fetchers,
+        // compute no DUST, load no chunks.
+        return Ok(());
+    }
+
+    // Mi6: per-chrom reference fetchers — opened only now that we know
+    // the chromosome has data. `ref_fetcher` (forward-only) feeds the
+    // per-window prefetch; `dust_fetcher` (random-access, `None` when
+    // the complexity filter is off) feeds the per-chunk
+    // `sdust_mask_for_span` and is evicted as the loop advances.
     let ref_fetcher =
         StreamingChromRefFetcher::for_contig(fasta_path, &chrom.name).map_err(|source| {
             ChunkDriverError::OpenRefFetcher {
@@ -646,12 +728,6 @@ where
                 source,
             }
         })?;
-    // Per-chunk DUST mask fetcher: random-access (supports the backward
-    // left-halo + `evict_before` to stay bounded), distinct from the
-    // forward-only `ref_fetcher` the prefetch uses. `None` when the
-    // complexity filter is disabled. Replaces the old whole-chromosome
-    // `compute_dust_mask_for_chrom` pre-pass with a per-chunk
-    // `sdust_mask_for_span` over `[range.start, safe_end)`.
     let mut dust_fetcher: Option<ManualEvictChromRefFetcher> = if params.no_complexity_filter {
         None
     } else {
@@ -666,24 +742,9 @@ where
     };
     // Per-chunk DUST mask scratch, refilled each chunk.
     let mut chunk_mask: Vec<std::ops::Range<u32>> = Vec::new();
-    // Mi9: borrow the per-chrom fetcher through the retry helper instead
-    // of wrapping it in an `Arc<dyn …>`. The fetcher is owned by this
-    // function, has exactly one consumer (`prefetch_window_ref_bytes`'s
-    // sequential pre-pass), and never crosses the rayon `par_iter_mut`
-    // boundary — the parallel block reads only the per-slot
-    // `pre_fetched_ref_bytes`. The previous shape carried an Arc with
-    // an `#[allow(clippy::arc_with_non_send_sync)]` justifying it.
 
-    for c in carryover.iter_mut() {
-        c.clear();
-    }
-
-    let max_group_span = params.grouper_cfg.max_variant_group_span;
     let chrom_one_past_end = chrom_length.saturating_add(1);
     let last_chunk_logical_extension = max_group_span.saturating_add(2);
-
-    let mut chunk_range_start: u32 = 1;
-    let mut psp_cursor: u32 = 1;
     // Re-used between load attempts when finalise_chunk_boundaries returns
     // `NoSafeGap` and we have to retry the chunk with a wider range —
     // the load consumes the driver-owned carryover, so we keep a
@@ -717,23 +778,41 @@ where
         worker_pool,
     };
 
-    while chunk_range_start < chrom_one_past_end {
-        let nominal_span = state.params.sizing.chunk_genomic_span.max(1);
-        let max_span = nominal_span.saturating_mul(MAX_CHUNK_SPAN_GROWTH);
-
-        let safe_end = load_and_run_chunk_with_retry(
-            &mut state,
-            chunk_range_start,
-            psp_cursor,
-            nominal_span,
-            max_span,
-        )?;
-
-        if safe_end >= chrom_one_past_end {
-            break;
+    // Process each covered interval as an independent mini-chromosome:
+    // its own carryover lifecycle and its own logical end for the
+    // last-chunk flush. The gap to the next interval exceeds
+    // `max_group_span`, so no variant group spans it — clearing carryover
+    // between intervals and skipping the gap are both byte-identity-safe.
+    for interval in &covered {
+        for c in state.carryover.iter_mut() {
+            c.clear();
         }
-        chunk_range_start = safe_end;
-        psp_cursor = state.chunk.range.end.min(chrom_one_past_end);
+        let interval_one_past_end = interval.end.min(chrom_one_past_end);
+        // The per-interval logical end drives the last-chunk flush in
+        // `load_chunk_with_safe_boundary_retry`; reads still clamp to the
+        // physical `chrom_length`.
+        state.chrom_one_past_end = interval_one_past_end;
+        let mut chunk_range_start = interval.start;
+        let mut psp_cursor = interval.start;
+
+        while chunk_range_start < interval_one_past_end {
+            let nominal_span = state.params.sizing.chunk_genomic_span.max(1);
+            let max_span = nominal_span.saturating_mul(MAX_CHUNK_SPAN_GROWTH);
+
+            let safe_end = load_and_run_chunk_with_retry(
+                &mut state,
+                chunk_range_start,
+                psp_cursor,
+                nominal_span,
+                max_span,
+            )?;
+
+            if safe_end >= interval_one_past_end {
+                break;
+            }
+            chunk_range_start = safe_end;
+            psp_cursor = state.chunk.range.end.min(interval_one_past_end);
+        }
     }
 
     Ok(())
@@ -745,6 +824,17 @@ where
 /// is the largest multiplier of [`ChunkDriverParams::chunk_genomic_span`]
 /// we will attempt before surfacing `NoSafeGap` to the caller.
 const MAX_CHUNK_SPAN_GROWTH: u32 = 8;
+
+/// Coalescing distance (bases) for block-index-driven covered
+/// intervals. Adjacent or cross-sample-misaligned blocks within this
+/// distance merge into one chunk segment, keeping the chunk count and
+/// per-chunk overhead bounded when coverage is fragmented and absorbing
+/// block-boundary misalignment across samples. Larger than any
+/// realistic `max_group_span`, so coalescing only ever *merges* (loads
+/// a little extra empty reference) and never splits a variant group —
+/// it cannot change output. Gaps wider than this become safe chunk
+/// boundaries the loop skips entirely.
+const MIN_CHUNK_SPAN: u32 = 50_000;
 
 /// M12: per-chrom mutable state bundle. Carries every long-lived
 /// borrow that `load_and_run_chunk_with_retry` and its three phase
@@ -1097,6 +1187,60 @@ mod tests {
     use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
     use crate::vcf::CohortMetadata;
     use tempfile::tempdir;
+
+    // ── merge_block_ranges ───────────────────────────────────────────
+
+    #[test]
+    fn merge_block_ranges_empty_is_empty() {
+        assert!(merge_block_ranges(std::iter::empty(), 50).is_empty());
+    }
+
+    #[test]
+    fn merge_block_ranges_single_block_is_one_half_open_interval() {
+        // (first=100, last=200) inclusive -> [100, 201) half-open.
+        assert_eq!(merge_block_ranges([(100u32, 200u32)], 50), vec![100..201]);
+    }
+
+    #[test]
+    fn merge_block_ranges_merges_within_max_group_span() {
+        // gap = next.first - cur.last = 230 - 200 = 30 <= 50 -> merge.
+        assert_eq!(
+            merge_block_ranges([(100, 200), (230, 300)], 50),
+            vec![100..301]
+        );
+    }
+
+    #[test]
+    fn merge_block_ranges_splits_when_gap_exceeds_max_group_span() {
+        // gap = 260 - 200 = 60 > 50 -> separate (the gap is a safe boundary).
+        assert_eq!(
+            merge_block_ranges([(100, 200), (260, 300)], 50),
+            vec![100..201, 260..301]
+        );
+    }
+
+    #[test]
+    fn merge_block_ranges_sorts_and_merges_overlapping_cross_sample_blocks() {
+        // Unsorted, overlapping ranges (e.g. two samples covering the
+        // same region with different block splits) collapse to one.
+        assert_eq!(
+            merge_block_ranges([(260, 300), (100, 200), (150, 270)], 50),
+            vec![100..301]
+        );
+    }
+
+    /// Boundary: gap exactly `max_group_span` merges; one more splits.
+    #[test]
+    fn merge_block_ranges_boundary_at_max_group_span() {
+        assert_eq!(
+            merge_block_ranges([(100, 200), (250, 300)], 50),
+            vec![100..301]
+        );
+        assert_eq!(
+            merge_block_ranges([(100, 200), (251, 300)], 50),
+            vec![100..201, 251..301]
+        );
+    }
 
     fn ref_allele() -> MergedAllele {
         MergedAllele {
