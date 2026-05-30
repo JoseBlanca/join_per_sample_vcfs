@@ -502,6 +502,143 @@ where
     Ok(state.masked_intervals)
 }
 
+/// Default minimum halo (bases) loaded on each side of an analysed span
+/// before running DUST. Empirically large enough that the per-span mask
+/// is byte-identical to a whole-contig scan at every position inside the
+/// span for all >= 1 kb spans on whole-genome data (validated on the
+/// tomato SL4.0 reference incl. the repeat-rich unplaced contig). The
+/// `>= window` reset-barrier check in [`sdust_mask_for_span`] is the
+/// correctness guarantee; this constant only sets where the search for
+/// that barrier starts.
+pub(crate) const MIN_DUST_HALO: u32 = 10_000;
+
+/// True iff `buf[lo..hi]` contains a run of `>= w` consecutive `false`
+/// (unmasked) entries — a DUST "reset barrier": the sliding window has
+/// fully turned over with non-masking content, so the masked verdict to
+/// its far side is independent of anything beyond the barrier.
+fn has_unmasked_run(buf: &[bool], lo: usize, hi: usize, w: usize) -> bool {
+    let mut run = 0usize;
+    for &m in &buf[lo..hi.min(buf.len())] {
+        if m {
+            run = 0;
+        } else {
+            run += 1;
+            if run >= w {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Compute the DUST low-complexity mask for the analysed span
+/// `[span_start, span_end)` (1-based, half-open) **without scanning the
+/// whole contig** — the per-chunk replacement for a whole-chromosome
+/// `sdust_mask_streaming` pre-pass.
+///
+/// DUST's masked verdict at a position depends on a left/right
+/// neighbourhood that is bounded in practice but not by a fixed constant
+/// (this sdust implementation extends masked runs across its window and
+/// does not reset on sequence breaks). So we load the span plus a `halo`
+/// on each side and *verify* the halo is large enough: each side's
+/// padding must contain a reset barrier (a `>= window` run of unmasked
+/// bases) or sit against the contig edge. If a side lacks a barrier (the
+/// span is inside a low-complexity tract longer than the halo) the halo
+/// is doubled and the span re-DUSTed. The starting halo is
+/// `max(min_halo, window)`; on whole-genome data at >= 1 kb spans it
+/// never needs to grow.
+///
+/// Returns `(mask, buffer_start)`: `mask` is the 1-based half-open
+/// intervals **clipped to the span**, sorted and non-overlapping — the
+/// shape [`partition_window`] expects; the verdict at every position
+/// inside the span is byte-identical to a whole-contig
+/// `sdust_mask_streaming`. `buffer_start` is the leftmost 1-based
+/// position the computation actually read (after any halo expansion) —
+/// the caller may `evict_before(buffer_start)` on its reference buffer
+/// knowing nothing to the left of it was needed.
+///
+/// `fetch_bases(start_1based, len)` must return exactly `len` uppercased
+/// bases of the contig starting at `start_1based`; `contig_len` is the
+/// contig's total base count.
+pub(crate) fn sdust_mask_for_span<F>(
+    span_start: u32,
+    span_end: u32,
+    contig_len: u32,
+    window: u32,
+    threshold: u32,
+    min_halo: u32,
+    mut fetch_bases: F,
+) -> std::io::Result<(Vec<std::ops::Range<u32>>, u32)>
+where
+    F: FnMut(u32, u32) -> std::io::Result<Vec<u8>>,
+{
+    debug_assert!(span_start >= 1, "span is 1-based");
+    // The chunk's `safe_end` may be extended past the contig end (the
+    // last-chunk logical extension); clamp to one-past-the-contig since
+    // positions beyond the contig have no reference base (and no kept
+    // records), so they carry no mask.
+    let span_end = span_end.min(contig_len + 1);
+    if span_start >= span_end {
+        return Ok((Vec::new(), span_start));
+    }
+    let w = window as usize;
+    let mut halo = min_halo.max(window);
+
+    loop {
+        // 1-based buffer bounds [a, b), clamped to [1, contig_len + 1).
+        let a = span_start.saturating_sub(halo).max(1);
+        let b = span_end.saturating_add(halo).min(contig_len + 1);
+        let buf = fetch_bases(a, b - a)?;
+        debug_assert_eq!(
+            buf.len(),
+            (b - a) as usize,
+            "fetch_bases returned wrong length"
+        );
+
+        // sdust over the buffer; intervals are 0-based, buffer-relative.
+        // The buffer is in memory so every base yields `Ok`; the Result
+        // is propagated only for type-correctness and never errs here.
+        let blen = buf.len() as u32;
+        let intervals = sdust_mask_streaming(buf.iter().copied().map(Ok), blen, window, threshold)?;
+        let mut buf_masked = vec![false; buf.len()];
+        for (s, e) in &intervals {
+            for p in *s..(*e).min(blen) {
+                buf_masked[p as usize] = true;
+            }
+        }
+
+        // Padding offsets within the buffer: left [0, span_start-a),
+        // right [span_end-a, blen).
+        let left_pad_end = (span_start - a) as usize;
+        let right_pad_start = (span_end - a) as usize;
+        let left_clean = a == 1 || has_unmasked_run(&buf_masked, 0, left_pad_end, w);
+        let right_clean =
+            b == contig_len + 1 || has_unmasked_run(&buf_masked, right_pad_start, buf.len(), w);
+
+        if (left_clean && right_clean) || (a == 1 && b == contig_len + 1) {
+            // Coalesce masked runs within [span_start, span_end), emit as
+            // 1-based genomic half-open intervals (offset `off` in the
+            // buffer is genomic position `a + off`).
+            let lo = (span_start - a) as usize;
+            let hi = (span_end - a) as usize;
+            let mut out: Vec<std::ops::Range<u32>> = Vec::new();
+            let mut run_start: Option<usize> = None;
+            for off in lo..hi {
+                if buf_masked[off] {
+                    run_start.get_or_insert(off);
+                } else if let Some(rs) = run_start.take() {
+                    out.push((rs as u32 + a)..(off as u32 + a));
+                }
+            }
+            if let Some(rs) = run_start {
+                out.push((rs as u32 + a)..(hi as u32 + a));
+            }
+            return Ok((out, a));
+        }
+        halo = halo.saturating_mul(2);
+    }
+}
+
 // ============================================================
 // Iterator-adaptor layer — `DustFilter`
 // ============================================================
@@ -1543,6 +1680,259 @@ mod tests {
         assert!(
             filter.next().is_none(),
             "polling after exhaustion must remain None"
+        );
+    }
+
+    /// `sdust_mask_for_span` over a span buried inside a low-complexity
+    /// tract LONGER than the starting halo must (a) expand the halo until
+    /// it finds an unmasked reset barrier in the high-complexity flanks,
+    /// and (b) reproduce the whole-sequence mask's verdict bit-for-bit at
+    /// every position in the span.
+    #[test]
+    fn sdust_mask_for_span_matches_whole_seq_with_expansion() {
+        // high(200) + "AT"*150 (=300 bp low-complexity) + high(200).
+        let mut seq = high_complexity_bases(200);
+        for _ in 0..150 {
+            seq.extend_from_slice(b"AT");
+        }
+        seq.extend(high_complexity_bases(200));
+        let contig_len = seq.len() as u32; // 700
+        let window = 64u32;
+        let threshold = 20u32;
+
+        // Ground truth: whole-sequence mask -> per-base bitvec (0-based).
+        let gt = sdust_mask(&seq, window, threshold);
+        let mut truth = vec![false; seq.len()];
+        for (s, e) in &gt {
+            for p in *s..*e {
+                truth[p as usize] = true;
+            }
+        }
+        // Sanity: the AT tract interior really is masked (else the test
+        // would pass trivially).
+        assert!(truth[300], "expected AT-tract interior to be masked");
+
+        let fetch = |start_1based: u32, len: u32| -> std::io::Result<Vec<u8>> {
+            let a = (start_1based - 1) as usize;
+            Ok(seq[a..a + len as usize].to_vec())
+        };
+
+        // Span deep inside the AT tract (1-based [301, 401)); min_halo=32
+        // is far smaller than the 300 bp tract, forcing 32->...->256
+        // expansion to reach the unmasked flanks.
+        let span_start = 301u32;
+        let span_end = 401u32;
+        let (mask, buf_start) = sdust_mask_for_span(
+            span_start, span_end, contig_len, window, threshold, 32, fetch,
+        )
+        .unwrap();
+        // Expansion reached back into the high-complexity left flank
+        // (well before the span), so the watermark precedes the tract.
+        assert!(
+            buf_start < span_start,
+            "expected halo expansion to read left of the span"
+        );
+
+        for pos in span_start..span_end {
+            let masked_here = mask.iter().any(|r| r.start <= pos && pos < r.end);
+            let truth_here = truth[(pos - 1) as usize];
+            assert_eq!(
+                masked_here, truth_here,
+                "verdict mismatch at 1-based pos {pos}"
+            );
+        }
+
+        // A high-complexity span (in the right flank) yields no mask and
+        // is clean immediately (contig edge on the right, barrier left).
+        let (hc, _) =
+            sdust_mask_for_span(601, 701, contig_len, window, threshold, 32, fetch).unwrap();
+        for pos in 601..701 {
+            assert!(
+                !hc.iter().any(|r| r.start <= pos && pos < r.end),
+                "high-complexity pos {pos} should be unmasked"
+            );
+            assert!(
+                !truth[(pos - 1) as usize],
+                "ground truth disagrees at {pos}"
+            );
+        }
+    }
+
+    /// PROBE (2026-05-30 perf redesign): confirm that computing the
+    /// DUST mask per-segment over `[seg.start - halo, seg.end + halo]`
+    /// and clipping to the segment reproduces the whole-contig mask's
+    /// masked/unmasked verdict at **every** position. This is the
+    /// byte-identity gate for moving DUST from a whole-chromosome
+    /// pre-pass to a per-chunk computation.
+    ///
+    /// Reads a real reference FASTA (env-gated, so it's a no-op in CI):
+    ///   DUST_PROBE_FASTA=<path.fa> DUST_PROBE_CONTIG=<name> \
+    ///   cargo test --release -- --ignored --nocapture dust_per_segment
+    /// Optional: DUST_PROBE_W, DUST_PROBE_T, DUST_PROBE_SEG (segment bp).
+    #[test]
+    #[ignore = "reads a real reference FASTA; run manually (see doc comment)"]
+    fn dust_per_segment_halo_matches_whole_contig() {
+        use crate::fasta::StreamingChromRefFetcher;
+        use crate::fasta::fetcher::ChromRefFetcher;
+
+        let Ok(fasta) = std::env::var("DUST_PROBE_FASTA") else {
+            eprintln!("DUST_PROBE_FASTA unset; skipping probe");
+            return;
+        };
+        let contig = std::env::var("DUST_PROBE_CONTIG").unwrap_or_else(|_| "SL4.0ch01".into());
+        let env_u32 = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let window = env_u32("DUST_PROBE_W", DEFAULT_DUST_WINDOW);
+        let threshold = env_u32("DUST_PROBE_T", DEFAULT_DUST_THRESHOLD);
+        let seg_size = env_u32("DUST_PROBE_SEG", 100_000) as usize;
+
+        let fetcher =
+            StreamingChromRefFetcher::for_contig(std::path::Path::new(&fasta), &contig).unwrap();
+        let length = fetcher.length();
+        eprintln!("probe: contig={contig} length={length} W={window} T={threshold} seg={seg_size}");
+        let seq = fetcher.fetch(1, length).unwrap();
+        assert_eq!(seq.len(), length as usize);
+
+        // Ground truth: whole-contig mask -> per-base bitvec.
+        let gt = sdust_mask(&seq, window, threshold);
+        let mut masked = vec![false; length as usize];
+        for (s, e) in &gt {
+            for p in *s..*e {
+                masked[p as usize] = true;
+            }
+        }
+
+        // FIXED-HALO sweep: when DUST_PROBE_FIXED_HALO is set, test a
+        // sweep of *fixed* halos (no expansion) and report mismatches
+        // for each. Answers "is a fixed N-kb halo byte-identical
+        // everywhere?". Returns early (skips the barrier path).
+        if std::env::var("DUST_PROBE_FIXED_HALO").is_ok() {
+            let len = length as usize;
+            for halo in [1000usize, 2000, 5000, 10000, 20000] {
+                let mut mismatches = 0usize;
+                let mut first: Vec<(usize, bool, bool)> = Vec::new();
+                let mut s = 0usize;
+                while s < len {
+                    let e = (s + seg_size).min(len);
+                    let a = s.saturating_sub(halo);
+                    let b = (e + halo).min(len);
+                    let seg_iv = sdust_mask(&seq[a..b], window, threshold);
+                    let buf_len = (b - a) as u32;
+                    let mut buf_masked = vec![false; b - a];
+                    for (is, ie) in &seg_iv {
+                        for p in *is..(*ie).min(buf_len) {
+                            buf_masked[p as usize] = true;
+                        }
+                    }
+                    for p in s..e {
+                        if buf_masked[p - a] != masked[p] {
+                            mismatches += 1;
+                            if first.len() < 6 {
+                                first.push((p, masked[p], buf_masked[p - a]));
+                            }
+                        }
+                    }
+                    s = e;
+                }
+                eprintln!(
+                    "probe(fixed halo={halo:>6}): mismatches={mismatches} / {length}  first={first:?}"
+                );
+            }
+            return;
+        }
+
+        // Barrier-termination criterion. A run of >= W consecutive
+        // *unmasked* bases is a genuine sdust reset point: the window
+        // (<= W bases) has fully turned over with non-masking content,
+        // so positions to its right are independent of anything to its
+        // left. For each segment, expand the halo until BOTH the left
+        // padding [a, s) and the right padding (e, b] contain such a
+        // barrier (or hit the contig edge, which is trivially clean),
+        // then accept the segment's verdict. Self-terminating: the
+        // whole contig is always clean.
+        let len = length as usize;
+        // True iff buf_masked[lo..hi] contains >= w consecutive false.
+        let has_unmasked_run = |buf: &[bool], lo: usize, hi: usize, w: usize| -> bool {
+            let mut run = 0usize;
+            for &m in &buf[lo..hi] {
+                if m {
+                    run = 0;
+                } else {
+                    run += 1;
+                    if run >= w {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let w = window as usize;
+        // COMBINED rule: a fixed minimum halo (kills the false-early-
+        // stop failure of the pure barrier) PLUS the ≥W-unmasked-gap
+        // barrier verification (catches tracts longer than the floor).
+        let min_halo = env_u32("DUST_PROBE_MIN_HALO", 10_000) as usize;
+
+        let mut mismatches = 0usize;
+        let mut first: Vec<(usize, bool, bool)> = Vec::new();
+        let mut max_halo = 0usize;
+        let mut total_expansions = 0usize;
+        let mut contig_fallbacks = 0usize; // segments that expanded to a contig edge
+        let mut dust_bases: u128 = 0;
+        let mut s = 0usize;
+        while s < len {
+            let e = (s + seg_size).min(len);
+            let mut halo = w.max(min_halo); // fixed floor, then barrier-expand
+            let (a, b, buf_masked) = loop {
+                let a = s.saturating_sub(halo);
+                let b = (e + halo).min(len);
+                let seg_iv = sdust_mask(&seq[a..b], window, threshold);
+                dust_bases += (b - a) as u128;
+                let buf_len = (b - a) as u32;
+                let mut buf_masked = vec![false; b - a];
+                for (is, ie) in &seg_iv {
+                    for p in *is..(*ie).min(buf_len) {
+                        buf_masked[p as usize] = true;
+                    }
+                }
+                let left_clean = a == 0 || has_unmasked_run(&buf_masked, 0, s - a, w);
+                let right_clean = b == len || has_unmasked_run(&buf_masked, e - a, b - a, w);
+                let full = a == 0 && b == len;
+                if (left_clean && right_clean) || full {
+                    if full && !(left_clean && right_clean) {
+                        contig_fallbacks += 1;
+                    }
+                    break (a, b, buf_masked);
+                }
+                halo = halo.saturating_mul(2);
+                total_expansions += 1;
+            };
+            let _ = b;
+            max_halo = max_halo.max(halo);
+            for p in s..e {
+                if buf_masked[p - a] != masked[p] {
+                    mismatches += 1;
+                    if first.len() < 10 {
+                        first.push((p, masked[p], buf_masked[p - a]));
+                    }
+                }
+            }
+            s = e;
+        }
+        let n_segs = len.div_ceil(seg_size);
+        eprintln!(
+            "probe(combined min_halo={min_halo}): mismatches={mismatches} / {length}  \
+             max_halo={max_halo}  expansions={total_expansions} over {n_segs} segs  \
+             contig_fallbacks={contig_fallbacks}  \
+             dusted_bases={dust_bases} ({:.2}x contig)  first={first:?}",
+            dust_bases as f64 / length as f64
+        );
+        assert_eq!(
+            mismatches, 0,
+            "combined per-segment DUST diverged from whole-contig mask"
         );
     }
 }

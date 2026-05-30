@@ -33,8 +33,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::fasta::StreamingChromRefFetcher;
 use crate::fasta::fetcher::ChromRefFetchError;
+use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::cohort_block::chunk_boundaries::{
@@ -46,7 +46,7 @@ use crate::var_calling::cohort_block::loader::{
 };
 use crate::var_calling::cohort_block::partition::{PartitionError, partition_window};
 use crate::var_calling::cohort_block::worker::{WorkerPool, prefetch_window_ref_bytes, run_window};
-use crate::var_calling::dust_filter::{DustFilterConfig, sdust_mask_streaming};
+use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
@@ -606,49 +606,6 @@ fn pool_allele_mapq(record: &PosteriorRecord, allele_idx: usize) -> PooledMapqMo
     moments
 }
 
-/// Compute the DUST low-complexity mask for one chromosome by
-/// streaming its reference bases through `sdust_mask_streaming`
-/// once, then translating the resulting BED-style 0-based
-/// half-open slice intervals into 1-based half-open genomic
-/// intervals the partition expects.
-fn compute_dust_mask_for_chrom(
-    ref_fetcher: &StreamingChromRefFetcher,
-    contig: &str,
-    chrom_length: u32,
-    dust_cfg: &DustFilterConfig,
-) -> Result<Vec<std::ops::Range<u32>>, ChunkDriverError> {
-    use crate::fasta::fetcher::ChromRefFetcher;
-
-    // B2: stream `iter_bases()` directly into `sdust_mask_streaming`
-    // instead of materialising the whole chromosome's REF into a
-    // `Vec<u8>`. The previous shape allocated O(chrom_length) bytes
-    // (~90 MB for tomato chrom 1) just to re-iterate them — defeating
-    // the chunk driver's "per-chunk memory bounded by
-    // `target_variants_per_chunk × n_samples`" contract.
-    let base_iter =
-        ref_fetcher
-            .iter_bases()
-            .map_err(|source| ChunkDriverError::ComputeDustMask {
-                contig: contig.to_string(),
-                source,
-            })?;
-    let intervals = sdust_mask_streaming(
-        base_iter.map(|r| r.map_err(io::Error::other)),
-        chrom_length,
-        dust_cfg.window(),
-        dust_cfg.threshold(),
-    )
-    .map_err(|source| ChunkDriverError::DustMaskIo {
-        contig: contig.to_string(),
-        source,
-    })?;
-
-    Ok(intervals
-        .into_iter()
-        .map(|(s, e)| (s + 1)..(e + 1))
-        .collect())
-}
-
 /// Drive the chunk loop over one chromosome. Pure helper for
 /// [`drive_cohort_chunked`]; broken out so the per-chrom borrow
 /// graph is easier to read and so the function stays generic over
@@ -689,11 +646,26 @@ where
                 source,
             }
         })?;
-    let masked_intervals: Vec<std::ops::Range<u32>> = if params.no_complexity_filter {
-        Vec::new()
+    // Per-chunk DUST mask fetcher: random-access (supports the backward
+    // left-halo + `evict_before` to stay bounded), distinct from the
+    // forward-only `ref_fetcher` the prefetch uses. `None` when the
+    // complexity filter is disabled. Replaces the old whole-chromosome
+    // `compute_dust_mask_for_chrom` pre-pass with a per-chunk
+    // `sdust_mask_for_span` over `[range.start, safe_end)`.
+    let mut dust_fetcher: Option<ManualEvictChromRefFetcher> = if params.no_complexity_filter {
+        None
     } else {
-        compute_dust_mask_for_chrom(&ref_fetcher, &chrom.name, chrom_length, &params.dust_cfg)?
+        Some(
+            ManualEvictChromRefFetcher::for_contig(fasta_path, &chrom.name).map_err(|source| {
+                ChunkDriverError::OpenRefFetcher {
+                    contig: chrom.name.clone(),
+                    source,
+                }
+            })?,
+        )
     };
+    // Per-chunk DUST mask scratch, refilled each chunk.
+    let mut chunk_mask: Vec<std::ops::Range<u32>> = Vec::new();
     // Mi9: borrow the per-chrom fetcher through the retry helper instead
     // of wrapping it in an `Arc<dyn …>`. The fetcher is owned by this
     // function, has exactly one consumer (`prefetch_window_ref_bytes`'s
@@ -729,7 +701,9 @@ where
         chrom_one_past_end,
         last_chunk_logical_extension,
         max_group_span,
-        masked_intervals: &masked_intervals,
+        chrom_name: &chrom.name,
+        dust_fetcher: dust_fetcher.as_mut(),
+        chunk_mask: &mut chunk_mask,
         ref_fetcher: &ref_fetcher,
         params,
         psp_readers,
@@ -782,19 +756,26 @@ const MAX_CHUNK_SPAN_GROWTH: u32 = 8;
 /// Field grouping mirrors the helpers' phase responsibilities:
 /// 1. Inputs (constants for the per-chrom loop): `chrom_id`,
 ///    `chrom_length`, `chrom_one_past_end`, `last_chunk_logical_extension`,
-///    `max_group_span`, `masked_intervals`, `ref_fetcher`, `params`.
-/// 2. Owned mutable state: `psp_readers`, `writer`, `stats`,
-///    `chunk_scratch`, `fix_scratch`, `chunk`, `carryover`,
-///    `carryover_snapshot`, `worker_pool`.
+///    `max_group_span`, `chrom_name`, `ref_fetcher`, `params`.
+/// 2. Owned mutable state: `dust_fetcher`, `chunk_mask`, `psp_readers`,
+///    `writer`, `stats`, `chunk_scratch`, `fix_scratch`, `chunk`,
+///    `carryover`, `carryover_snapshot`, `worker_pool`.
 struct ChunkLoopState<'a, W: Read + Seek> {
     chrom_id: u32,
     chrom_length: u32,
     chrom_one_past_end: u32,
     last_chunk_logical_extension: u32,
     max_group_span: u32,
-    masked_intervals: &'a [std::ops::Range<u32>],
+    chrom_name: &'a str,
     ref_fetcher: &'a dyn crate::fasta::fetcher::ChromRefFetcher,
     params: &'a ChunkDriverParams,
+    /// Per-chunk DUST mask fetcher (random-access). `None` when the
+    /// complexity filter is off. Used only by the sequential per-chunk
+    /// mask computation in `run_chunk_windows_parallel`.
+    dust_fetcher: Option<&'a mut ManualEvictChromRefFetcher>,
+    /// Per-chunk DUST mask scratch (1-based half-open intervals clipped
+    /// to the chunk), refilled each chunk and fed to `partition_window`.
+    chunk_mask: &'a mut Vec<std::ops::Range<u32>>,
     psp_readers: &'a mut [PspReader<W>],
     writer: &'a mut CohortVcfWriter,
     stats: &'a mut ChunkDriverStats,
@@ -972,9 +953,45 @@ where
         .worker_pool
         .ensure_capacity(n_windows.max(1), n_samples);
 
+    // ── Per-chunk DUST mask over the analysed span [range.start,
+    //    safe_end). Replaces the whole-chromosome pre-pass: only the
+    //    bases we actually analyse (plus a verified halo) are DUSTed,
+    //    and the random-access fetcher's buffer is evicted up to the
+    //    leftmost byte this chunk needed (barrier-bounded). ──
+    state.chunk_mask.clear();
+    let span_start = state.chunk.range.start;
+    let span_end = state.chunk.safe_end;
+    let chrom_length = state.chrom_length;
+    let dust_window = state.params.dust_cfg.window();
+    let dust_threshold = state.params.dust_cfg.threshold();
+    if let Some(dust_fetcher) = state.dust_fetcher.as_deref_mut() {
+        if span_start < span_end {
+            let (mask, buf_start) = sdust_mask_for_span(
+                span_start,
+                span_end,
+                chrom_length,
+                dust_window,
+                dust_threshold,
+                MIN_DUST_HALO,
+                |start_1based, len| {
+                    dust_fetcher
+                        .fetch(start_1based, len)
+                        .map(<[u8]>::to_vec)
+                        .map_err(io::Error::other)
+                },
+            )
+            .map_err(|source| ChunkDriverError::DustMaskIo {
+                contig: state.chrom_name.to_string(),
+                source,
+            })?;
+            *state.chunk_mask = mask;
+            dust_fetcher.evict_before(buf_start);
+        }
+    }
+
     let chrom_id = state.chrom_id;
     let max_group_span = state.max_group_span;
-    let masked_intervals = state.masked_intervals;
+    let masked_intervals: &[std::ops::Range<u32>] = state.chunk_mask;
     let ref_fetcher = state.ref_fetcher;
     // Split-borrow: `chunk` is read-only inside the loop while the
     // worker pool's slots are mutated; rust accepts the disjoint
