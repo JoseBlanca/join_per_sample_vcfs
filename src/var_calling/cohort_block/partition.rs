@@ -1,7 +1,7 @@
 //! Variant-group partitioning of one worker window.
 //!
 //! After [`load_chunk_from_iters`](super::loader::load_chunk_from_iters)
-//! has filled a chunk and [`finalise_chunk_boundaries`](super::chunk_boundaries::finalise_chunk_boundaries)
+//! has filled a chunk and the producer's streaming fold+compact
 //! has sliced it into worker windows, this stage takes one window
 //! and produces the variant-group work items the worker math will
 //! iterate.
@@ -221,7 +221,7 @@ pub enum PartitionError {
 
     /// A variant group would exceed `max_group_span`. The chunk-
     /// boundary finalisation pass
-    /// [`finalise_chunk_boundaries`](super::chunk_boundaries::finalise_chunk_boundaries)
+    /// the producer's streaming fold+compact
     /// makes this impossible for window-aligned groups — surfacing
     /// means a single-position record's REF span alone exceeds the
     /// cap, or the caller passed a `max_group_span` smaller than
@@ -262,7 +262,7 @@ pub enum PartitionError {
 /// `out` is cleared at entry — callers hold one persistent
 /// [`WindowPartition`] across windows. Same scratch-reuse contract
 /// as [`load_chunk_from_iters`](super::loader::load_chunk_from_iters)
-/// and [`finalise_chunk_boundaries`](super::chunk_boundaries::finalise_chunk_boundaries).
+/// and the producer's streaming fold+compact.
 pub fn partition_window(
     chunk: &MaterialisedChunk,
     window: &Range<u32>,

@@ -9,13 +9,12 @@
 //! windows.
 //!
 //! **Why "drive" not "iterate"** — the driver owns the persistent
-//! scratch buffers across every chunk and every chromosome
-//! (`ChunkLoadScratch`, `BoundaryFinalisationScratch`, `PartitionScratch`,
-//! the `MaterialisedChunk` + `WindowPartition` buffers, the
-//! carryover, the per-window `Vec<PosteriorRecord>`). All of them
-//! are `clear()`-ed on every iteration and re-filled, never
-//! reallocated. This is the bulk of the memory-budget win the
-//! rewrite promises: one chunk × N samples, not T_chrom × N samples.
+//! scratch reused across every block and chromosome: the
+//! `StreamingBlockLoader` (its pending columns + fold scratch), the
+//! `PartitionScratch`, the DUST-mask buffer, and the recycled
+//! `ReadyBlock` buffers. Streaming compaction keeps the resident set at
+//! ~one block per sample + a group-sized straddle, not the whole span ×
+//! N — the bulk of the memory-budget win the rewrite promises.
 //!
 //! **Downstream filters** (`is_variant_call`, `qual_phred`,
 //! `min_alt_obs_per_sample`, MAPQ-diff t-test) are applied
@@ -39,7 +38,6 @@ use crate::fasta::fetcher::ChromRefFetchError;
 use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
-use crate::var_calling::cohort_block::chunk_boundaries::BoundaryFinalisationError;
 use crate::var_calling::cohort_block::column_span_reader::ColumnSpanReader;
 use crate::var_calling::cohort_block::columns::MaterialisedChunk;
 use crate::var_calling::cohort_block::loader::{ChunkLoadError, StreamingBlockLoader};
@@ -199,9 +197,8 @@ pub struct ChunkDriverStats {
 /// - **Reference / DUST**: `OpenRefFetcher` (per-chrom fetcher
 ///   construction), `ComputeDustMask` (chromosome-wide mask scan),
 ///   `PrefetchRefBytes` (per-window REF pre-fetch).
-/// - **Per-chunk pipeline**: `LoadChunk`, `FinaliseChunkBoundaries`, `Partition`
-///   (each carries `chrom_id`), `RunWindow` (per-window math via
-///   `run_window`).
+/// - **Per-block pipeline**: `StreamRead`, `Partition` (each carries
+///   `chrom_id`), `RunWindow` (per-block math via `run_window`).
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChunkDriverError {
@@ -278,12 +275,6 @@ pub enum ChunkDriverError {
         chrom_id: u32,
         #[source]
         source: PspReadError,
-    },
-    #[error("failed to commit chunk boundaries on chromosome {chrom_id}")]
-    FinaliseChunkBoundaries {
-        chrom_id: u32,
-        #[source]
-        source: BoundaryFinalisationError,
     },
     #[error("failed to partition window on chromosome {chrom_id}")]
     Partition {
@@ -1236,12 +1227,11 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         }
     }
 
-    /// Load, accumulate to the variant target, pick the safe cut
-    /// (reserving the tail), then DUST-mask, partition, and prefetch the
-    /// REF bytes for one block of the current interval, advancing the
-    /// cursor. Mirrors the old `load_chunk_with_safe_boundary_retry` plus
-    /// prepare step, now writing into the owned [`ReadyBlock`] rather
-    /// than the iterator's scratch.
+    /// Stream one block of the current interval into `block`: fold +
+    /// compact to the variant target (the open group carries forward as
+    /// the loader's pending), then DUST-mask, partition, and prefetch
+    /// the REF bytes. Returns the block's variant count, or `0` when the
+    /// interval is exhausted (no block produced).
     fn produce_block(&mut self, block: &mut ReadyBlock) -> Result<u32, ChunkDriverError> {
         let ReadyBlock {
             chunk,

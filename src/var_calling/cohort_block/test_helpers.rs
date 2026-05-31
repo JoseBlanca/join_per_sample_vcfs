@@ -9,9 +9,6 @@
 use std::ops::Range;
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
-use crate::var_calling::cohort_block::chunk_boundaries::{
-    BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
-};
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::cohort_block::loader::{
     ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
@@ -128,17 +125,6 @@ pub(crate) fn loaded_chunk(
     );
     let carryover = (0..n).map(|_| SampleColumns::empty()).collect();
     (chunk, carryover)
-}
-
-/// Run the boundary-finalisation pass with a freshly allocated
-/// [`BoundaryFinalisationScratch`].
-pub(crate) fn run_finalise_chunk_boundaries(
-    chunk: &mut MaterialisedChunk,
-    carryover: &mut [SampleColumns],
-    max_group_span: u32,
-) -> Result<(), BoundaryFinalisationError> {
-    let mut scratch = BoundaryFinalisationScratch::new();
-    finalise_chunk_boundaries(chunk, carryover, &mut scratch, max_group_span)
 }
 
 /// Mi16: byte-identity oracle that materialises one

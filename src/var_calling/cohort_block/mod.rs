@@ -11,16 +11,12 @@
 //! **Submodule layout.**
 //! - [`columns`] — [`SampleColumns`] (per-sample CSR columnar
 //!   storage) and [`MaterialisedChunk`] (one chunk × N samples).
-//! - [`loader`] — [`load_chunk_from_iters`] +
-//!   [`ChunkLoadScratch`] + [`ChunkLoadError`]: read per-sample
-//!   record iterators, apply the cohort-wide variant-position
-//!   filter, compact survivors into the chunk.
-//! - [`chunk_boundaries`] — [`finalise_chunk_boundaries`] +
-//!   [`BoundaryFinalisationScratch`] + [`BoundaryFinalisationError`]: pick the
-//!   chunk's `safe_end`, partition `[range.start, safe_end)` into
-//!   windows, split records past `safe_end` into carryover.
+//! - [`loader`] — the batch [`load_chunk_from_iters`] (retained as the
+//!   streaming loader's equivalence-test oracle) and the streaming
+//!   [`StreamingBlockLoader`], which folds the cohort forward through
+//!   [`SpanColumnSource`]s and compacts closed variant groups
+//!   incrementally — the production producer's engine.
 
-pub mod chunk_boundaries;
 pub mod column_span_reader;
 pub mod columns;
 pub mod driver;
@@ -31,9 +27,6 @@ pub mod partition;
 pub(crate) mod test_helpers;
 pub mod worker;
 
-pub use chunk_boundaries::{
-    BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
-};
 pub use column_span_reader::ColumnSpanReader;
 pub use columns::{MaterialisedChunk, SampleColumns};
 pub use driver::{
