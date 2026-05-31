@@ -26,10 +26,13 @@
 //! the same per-category counters incremented — that's the
 //! byte-identity contract for Phase A.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::{Condvar, Mutex};
 use thiserror::Error;
 
 use crate::fasta::fetcher::ChromRefFetchError;
@@ -47,7 +50,7 @@ use crate::var_calling::cohort_block::partition::{
     PartitionError, PartitionScratch, WindowPartition, partition_window,
 };
 use crate::var_calling::cohort_block::worker::{
-    WorkerScratch, prefetch_window_ref_bytes, run_window,
+    WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
 };
 use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
@@ -395,66 +398,36 @@ pub fn drive_cohort_chunked(
     let posterior_cfg = &params.posterior_cfg;
     let mut producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params);
 
-    // B1 + M5: consume inside a closure that borrows `writer` (does not
-    // move it), so the outer scope can route to `writer.finish()` on
-    // success or `writer.abort()` on error.
-    // Env-gated phase timing (COHORT_PHASE_TIMING=1): accumulate wall
-    // time in block PRODUCTION (next_block: decode+fold+compact+DUST+
-    // partition) vs CONSUMPTION (run_window+emit: group+merge+EM+
-    // posterior). Unambiguous split — no symbol bucketing. Off by
-    // default (one env read + cheap Instant calls only when on).
-    let phase_timing = std::env::var_os("COHORT_PHASE_TIMING").is_some();
-    let mut t_produce = std::time::Duration::ZERO;
-    let mut t_consume = std::time::Duration::ZERO;
-    let mut worker = WorkerScratch::new();
-    let driver_result: Result<(), ChunkDriverError> = (|| {
-        loop {
-            let p0 = std::time::Instant::now();
-            let next = producer.next_block();
-            if phase_timing {
-                t_produce += p0.elapsed();
-            }
-            let block = match next {
-                None => break,
-                Some(res) => res?,
-            };
-            let c0 = std::time::Instant::now();
-            // Math on the prepared block: layers 1+2+3 + EM + posterior
-            // + QUAL over the block's single partition.
-            process_block(&block, per_group_cfg, posterior_cfg, &mut worker)
-                .map_err(ChunkDriverError::RunWindow)?;
-            // Emit + roll up the block's counters.
-            let slot_stats = std::mem::take(&mut worker.stats);
-            stats.lh_cap_groups_skipped += slot_stats.lh_cap_groups_skipped;
-            stats.lh_cap_alleles_in_skipped += slot_stats.lh_cap_alleles_in_skipped;
-            stats.groups_skipped_post_unify_ref_only +=
-                slot_stats.groups_skipped_post_unify_ref_only;
-            for record in worker.posterior_records.drain(..) {
-                emit_or_drop(record, &params, &mut writer, &mut stats)?;
-            }
-            // Return the block's buffers to the producer's free-list.
-            producer.recycle(block);
-            if phase_timing {
-                t_consume += c0.elapsed();
-            }
-        }
-        Ok(())
-    })();
-    stats.chunks_loaded += producer.chunks_loaded;
-    stats.chunk_variants_total += producer.chunk_variants_total;
-    if phase_timing {
-        let total = t_produce + t_consume;
-        eprintln!(
-            "COHORT_PHASE_TIMING: produce={:.3}s consume={:.3}s total={:.3}s \
-             produce={:.1}% consume={:.1}% (blocks={})",
-            t_produce.as_secs_f64(),
-            t_consume.as_secs_f64(),
-            total.as_secs_f64(),
-            100.0 * t_produce.as_secs_f64() / total.as_secs_f64().max(1e-9),
-            100.0 * t_consume.as_secs_f64() / total.as_secs_f64().max(1e-9),
-            stats.chunks_loaded,
-        );
-    }
+    // Consume the blocks: per-group EM/posterior math + downstream
+    // filtering + emit. The math is the dominant cost at realistic N
+    // (consume grows ~N^1.8, overtaking produce at N≈24), so it is
+    // parallelised across blocks when the pool has > 1 thread — a single
+    // producer thread feeds a bounded queue, `n_workers` worker threads
+    // map `process_block` in parallel, and a collector re-imposes genomic
+    // order before emit (byte-identical to the serial path). With a
+    // 1-thread pool the serial path runs. Both paths fold the producer's
+    // chunk counters into `stats`.
+    let n_workers = rayon::current_num_threads();
+    let driver_result: Result<(), ChunkDriverError> = if n_workers <= 1 {
+        drive_blocks_serial(
+            &mut producer,
+            per_group_cfg,
+            posterior_cfg,
+            &params,
+            &mut writer,
+            &mut stats,
+        )
+    } else {
+        drive_blocks_parallel(
+            producer,
+            n_workers,
+            per_group_cfg,
+            posterior_cfg,
+            &params,
+            &mut writer,
+            &mut stats,
+        )
+    };
 
     match driver_result {
         Ok(()) => {
@@ -476,6 +449,284 @@ pub fn drive_cohort_chunked(
             }
             Err(e)
         }
+    }
+}
+
+/// Roll one block's [`WindowRunStats`] counters into the driver's
+/// running totals. Additive, so the result is independent of the order
+/// blocks finish — the parallel collector and the serial loop produce
+/// identical totals.
+fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
+    stats.lh_cap_groups_skipped += block.lh_cap_groups_skipped;
+    stats.lh_cap_alleles_in_skipped += block.lh_cap_alleles_in_skipped;
+    stats.groups_skipped_post_unify_ref_only += block.groups_skipped_post_unify_ref_only;
+}
+
+/// Serial consume: pull each block in genomic order, run the math, emit.
+/// The reference path for byte-identity, and the path taken when the
+/// rayon pool has a single thread.
+fn drive_blocks_serial<R: Read + Seek + Send>(
+    producer: &mut BlockIterator<R>,
+    per_group_cfg: PerGroupMergerConfig,
+    posterior_cfg: &PosteriorEngineConfig,
+    params: &ChunkDriverParams,
+    writer: &mut CohortVcfWriter,
+    stats: &mut ChunkDriverStats,
+) -> Result<(), ChunkDriverError> {
+    let mut worker = WorkerScratch::new();
+    let result: Result<(), ChunkDriverError> = (|| {
+        while let Some(res) = producer.next_block() {
+            let block = res?;
+            process_block(&block, per_group_cfg, posterior_cfg, &mut worker)
+                .map_err(ChunkDriverError::RunWindow)?;
+            roll_window_stats(stats, &worker.stats);
+            worker.stats.clear();
+            for record in worker.posterior_records.drain(..) {
+                emit_or_drop(record, params, writer, stats)?;
+            }
+            producer.recycle(block);
+        }
+        Ok(())
+    })();
+    stats.chunks_loaded += producer.chunks_loaded;
+    stats.chunk_variants_total += producer.chunk_variants_total;
+    result
+}
+
+/// One finished block's math output, handed worker → collector. The
+/// records are already in genomic order *within* the block; the
+/// collector emits blocks in `seq_idx` order, so the global emit order
+/// equals the serial path's — that's the byte-identity argument.
+struct BlockResult {
+    seq_idx: u64,
+    records: Vec<PosteriorRecord>,
+    stats: WindowRunStats,
+}
+
+/// Parallel consume. A single producer thread feeds prepared blocks
+/// into a bounded [`BlockQueue`] (back-pressure bounds resident memory
+/// to ~`cap` + `n_workers` blocks); `n_workers` worker threads pop
+/// blocks, run [`process_block`] with their own persistent
+/// [`WorkerScratch`], and forward owned [`BlockResult`]s while recycling
+/// the spent block buffers back to the producer. The collector (this
+/// thread) re-imposes `seq_idx` order and emits — byte-identical to
+/// [`drive_blocks_serial`].
+///
+/// Workers are dedicated OS threads, **not** rayon tasks: a worker
+/// blocked on `queue.pop()` must not occupy a rayon pool thread, because
+/// the producer's per-sample decode uses that pool — parking workers on
+/// it could starve or deadlock the decode. The producer thread is the
+/// only one that touches the rayon pool (via the loader's `par_iter`).
+///
+/// On the success path no errors occur and output is identical to
+/// serial. On error (a worker's math, a produced block, or a VCF write)
+/// the first error wins, the queue is closed to wind every thread down,
+/// and that error is returned (the run aborts regardless of which block
+/// failed first — errors are pathological-input aborts, not part of the
+/// byte-identity contract).
+fn drive_blocks_parallel<R: Read + Seek + Send>(
+    mut producer: BlockIterator<R>,
+    n_workers: usize,
+    per_group_cfg: PerGroupMergerConfig,
+    posterior_cfg: &PosteriorEngineConfig,
+    params: &ChunkDriverParams,
+    writer: &mut CohortVcfWriter,
+    stats: &mut ChunkDriverStats,
+) -> Result<(), ChunkDriverError> {
+    // Bounded look-ahead: a few blocks per worker keeps every worker fed
+    // without letting the producer run far ahead (memory is ~this many
+    // blocks × N samples). 2× workers is enough to hide per-block
+    // production jitter behind the math.
+    let queue = BlockQueue::new(n_workers * 2);
+    let (result_tx, result_rx) = mpsc::channel::<Result<BlockResult, ChunkDriverError>>();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<ReadyBlock>();
+
+    std::thread::scope(|scope| {
+        // ── Producer: generate blocks in genomic order, recycling spent
+        //    buffers drained from `recycle_rx`. Returns the chunk
+        //    counters (or the first production error) via join. ──
+        let queue_ref = &queue;
+        let producer_handle = scope.spawn(move || -> Result<(u64, u64), ChunkDriverError> {
+            loop {
+                while let Ok(spent) = recycle_rx.try_recv() {
+                    producer.recycle(spent);
+                }
+                match producer.next_block() {
+                    None => break,
+                    Some(Ok(block)) => {
+                        if queue_ref.push(block).is_err() {
+                            // Queue closed (shutdown after an error).
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        queue_ref.close();
+                        return Err(e);
+                    }
+                }
+            }
+            queue_ref.close();
+            Ok((producer.chunks_loaded, producer.chunk_variants_total))
+        });
+
+        // ── Workers: map `process_block` over blocks with private
+        //    scratch; forward results, recycle blocks. ──
+        for _ in 0..n_workers {
+            let queue_ref = &queue;
+            let result_tx = result_tx.clone();
+            let recycle_tx = recycle_tx.clone();
+            scope.spawn(move || {
+                let mut worker = WorkerScratch::new();
+                while let Some(block) = queue_ref.pop() {
+                    match process_block(&block, per_group_cfg, posterior_cfg, &mut worker) {
+                        Ok(()) => {
+                            let out = BlockResult {
+                                seq_idx: block.seq_idx,
+                                records: std::mem::take(&mut worker.posterior_records),
+                                stats: std::mem::take(&mut worker.stats),
+                            };
+                            // Recycle first so the producer can reuse the
+                            // buffer while we ship the result.
+                            let _ = recycle_tx.send(block);
+                            if result_tx.send(Ok(out)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = result_tx.send(Err(ChunkDriverError::RunWindow(e)));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        // Drop the originals so `result_rx` closes once every worker's
+        // clone is dropped (and `recycle_rx` once producer + workers end).
+        drop(result_tx);
+        drop(recycle_tx);
+
+        // ── Collector (this thread): emit in `seq_idx` order. ──
+        let mut next_expected: u64 = 0;
+        let mut pending: BTreeMap<u64, BlockResult> = BTreeMap::new();
+        let mut first_err: Option<ChunkDriverError> = None;
+        for msg in result_rx {
+            match msg {
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                        queue.close(); // wind down producer + workers
+                    }
+                }
+                Ok(out) => {
+                    if first_err.is_some() {
+                        continue; // draining; nothing more is emitted
+                    }
+                    pending.insert(out.seq_idx, out);
+                    while let Some(out) = pending.remove(&next_expected) {
+                        roll_window_stats(stats, &out.stats);
+                        for record in out.records {
+                            if let Err(e) = emit_or_drop(record, params, writer, stats) {
+                                first_err = Some(e);
+                                queue.close();
+                                break;
+                            }
+                        }
+                        if first_err.is_some() {
+                            break;
+                        }
+                        next_expected += 1;
+                    }
+                }
+            }
+        }
+
+        // All workers have ended (result_rx closed). Join the producer
+        // for its counters / production error.
+        let producer_result = producer_handle.join().expect("producer thread panicked");
+
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        match producer_result {
+            Ok((chunks_loaded, chunk_variants_total)) => {
+                stats.chunks_loaded += chunks_loaded;
+                stats.chunk_variants_total += chunk_variants_total;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// A bounded, blocking multi-producer/multi-consumer queue of prepared
+/// blocks. The single producer `push`es (blocking while `cap` blocks are
+/// already in flight — the back-pressure that bounds resident memory);
+/// the worker pool `pop`s (blocking while empty). `close` wakes everyone
+/// for shutdown: after it, `push` returns `Err` and `pop` drains then
+/// returns `None`.
+struct BlockQueue {
+    inner: Mutex<BlockQueueInner>,
+    not_empty: Condvar,
+    not_full: Condvar,
+}
+
+struct BlockQueueInner {
+    q: VecDeque<ReadyBlock>,
+    cap: usize,
+    closed: bool,
+}
+
+impl BlockQueue {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: Mutex::new(BlockQueueInner {
+                q: VecDeque::with_capacity(cap),
+                cap: cap.max(1),
+                closed: false,
+            }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+        }
+    }
+
+    /// Enqueue, blocking while full. `Err(block)` if closed (shutdown).
+    fn push(&self, block: ReadyBlock) -> Result<(), ReadyBlock> {
+        let mut g = self.inner.lock().expect("BlockQueue mutex poisoned");
+        while g.q.len() >= g.cap && !g.closed {
+            g = self.not_full.wait(g).expect("BlockQueue mutex poisoned");
+        }
+        if g.closed {
+            return Err(block);
+        }
+        g.q.push_back(block);
+        drop(g);
+        self.not_empty.notify_one();
+        Ok(())
+    }
+
+    /// Dequeue, blocking while empty. `None` once closed *and* drained.
+    fn pop(&self) -> Option<ReadyBlock> {
+        let mut g = self.inner.lock().expect("BlockQueue mutex poisoned");
+        loop {
+            if let Some(block) = g.q.pop_front() {
+                drop(g);
+                self.not_full.notify_one();
+                return Some(block);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self.not_empty.wait(g).expect("BlockQueue mutex poisoned");
+        }
+    }
+
+    /// Signal shutdown: unblock all waiters. Idempotent.
+    fn close(&self) {
+        let mut g = self.inner.lock().expect("BlockQueue mutex poisoned");
+        g.closed = true;
+        drop(g);
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
     }
 }
 
@@ -1074,7 +1325,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         cur.chunk_range_start = chunk.safe_end;
         cur.psp_cursor = chunk.range.end.min(interval_one_past_end);
 
-        // ── DUST mask + partition + prefetch (data-shaping). ──
+        // ── DUST mask (data-shaping). ──
         mask.clear();
         let span_start = chunk.range.start;
         let span_end = chunk.safe_end;
@@ -1102,6 +1353,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
                 dust_fetcher.evict_before(buf_start);
             }
         }
+        // ── Partition + REF prefetch (data-shaping). ──
         let window = span_start..span_end;
         partition_window(
             chunk,
