@@ -25,8 +25,8 @@ use ahash::AHashMap;
 use thiserror::Error;
 
 use crate::pileup_record::ChainId;
-use crate::var_calling::cohort_block::columns::MaterialisedChunk;
-use crate::var_calling::cohort_block::partition::WindowPartition;
+use crate::var_calling::from_psp::columns::MaterialisedChunk;
+use crate::var_calling::from_psp::partition::WindowPartition;
 use crate::var_calling::per_group_merger::CompoundConstituent;
 
 /// Column-native unified allele set for one variant group. Same
@@ -1008,11 +1008,11 @@ mod tests {
     use crate::fasta::ChromRefFetcher;
     use crate::fasta::fetcher::ChromRefFetchError;
     use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
-    use crate::var_calling::cohort_block::columns::MaterialisedChunk;
-    use crate::var_calling::cohort_block::partition::{
+    use crate::var_calling::from_psp::columns::MaterialisedChunk;
+    use crate::var_calling::from_psp::partition::{
         PartitionScratch, WindowPartition, partition_window,
     };
-    use crate::var_calling::cohort_block::test_helpers::{loaded_chunk, record, ref_plus_alt};
+    use crate::var_calling::from_psp::test_helpers::{loaded_chunk, record, ref_plus_alt};
     use crate::var_calling::per_group_merger::{
         PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
     };
@@ -1105,7 +1105,7 @@ mod tests {
         group_idx: usize,
         ref_fetcher: SharedRefFetcher,
     ) -> Vec<(Vec<u8>, bool)> {
-        let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
+        let group = crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,
@@ -1400,7 +1400,7 @@ mod tests {
         group_idx: usize,
         ref_fetcher: SharedRefFetcher,
     ) -> Vec<OracleAllele> {
-        let group = crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
+        let group = crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,
@@ -1754,7 +1754,7 @@ mod tests {
         let fetcher = shared_mock(&ref_full, 1);
         let oracle = {
             let group =
-                crate::var_calling::cohort_block::test_helpers::build_overlapping_variant_group(
+                crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
                     &chunk,
                     &partition,
                     0,

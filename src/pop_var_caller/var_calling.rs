@@ -39,7 +39,7 @@ use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
 use crate::psp::{PspReadError, PspReader};
-use crate::var_calling::cohort_block::{
+use crate::var_calling::from_psp::{
     ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
     DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
 };

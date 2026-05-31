@@ -21,7 +21,7 @@
 use std::io::{Read, Seek};
 
 use crate::psp::{BlockColumnReader, PspReadError, PspReader, ScalarDecodeError};
-use crate::var_calling::cohort_block::columns::SampleColumns;
+use crate::var_calling::from_psp::columns::SampleColumns;
 
 /// Per-sample columnar reader bound to one chromosome region. Serves
 /// records in `[region_start, region_end]` (1-based inclusive) in
@@ -215,7 +215,7 @@ impl<R: Read + Seek> ColumnSpanReader<R> {
     }
 }
 
-impl<R: Read + Seek> crate::var_calling::cohort_block::loader::SpanColumnSource
+impl<R: Read + Seek> crate::var_calling::from_psp::loader::SpanColumnSource
     for ColumnSpanReader<R>
 {
     fn peek_next_span(&self) -> Option<u32> {
@@ -254,7 +254,7 @@ mod tests {
     use crate::pileup_record::PileupRecord;
     use crate::psp::test_fixtures::writer_header;
     use crate::psp::writer::PspWriter;
-    use crate::var_calling::cohort_block::test_helpers::{allele, record};
+    use crate::var_calling::from_psp::test_helpers::{allele, record};
 
     /// A small fixture cohort of multi-allele records (varied allele
     /// counts, sequences, scalars, and chain-id lists) at ascending

@@ -39,13 +39,13 @@ use crate::fasta::fetcher::ChromRefFetchError;
 use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
-use crate::var_calling::cohort_block::column_span_reader::ColumnSpanReader;
-use crate::var_calling::cohort_block::columns::MaterialisedChunk;
-use crate::var_calling::cohort_block::loader::{ChunkLoadError, StreamingBlockLoader};
-use crate::var_calling::cohort_block::partition::{
+use crate::var_calling::from_psp::column_span_reader::ColumnSpanReader;
+use crate::var_calling::from_psp::columns::MaterialisedChunk;
+use crate::var_calling::from_psp::loader::{ChunkLoadError, StreamingBlockLoader};
+use crate::var_calling::from_psp::partition::{
     PartitionError, PartitionScratch, WindowPartition, partition_window,
 };
-use crate::var_calling::cohort_block::worker::{
+use crate::var_calling::from_psp::worker::{
     WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
 };
 use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
@@ -1346,7 +1346,7 @@ fn spawn_dust_pool(
 /// Slice the precomputed interval mask to the block span
 /// `[span_start, span_end)`, clipping each overlapping run to the span and
 /// appending it to `out` (sorted, non-overlapping — the shape
-/// [`partition_window`](crate::var_calling::cohort_block::partition::partition_window)
+/// [`partition_window`](crate::var_calling::from_psp::partition::partition_window)
 /// expects). `sweep` is a per-interval forward cursor over
 /// `interval_mask`, advanced past runs ending at or before `span_start`; a
 /// run straddling the block boundary stays for the next block. Reproduces

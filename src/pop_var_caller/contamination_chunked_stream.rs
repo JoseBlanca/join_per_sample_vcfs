@@ -40,8 +40,8 @@ use thiserror::Error;
 use crate::pileup_record::PileupRecord;
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
-use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
-use crate::var_calling::cohort_block::loader::{
+use crate::var_calling::from_psp::columns::{MaterialisedChunk, SampleColumns};
+use crate::var_calling::from_psp::loader::{
     ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
 use crate::var_calling::per_position_merger::PerPositionPileups;

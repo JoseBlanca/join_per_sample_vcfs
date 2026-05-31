@@ -722,7 +722,7 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::var_calling::cohort_block::test_helpers::{allele, record, ref_plus_alt};
+    use crate::var_calling::from_psp::test_helpers::{allele, record, ref_plus_alt};
 
     #[test]
     fn empty_columns_carry_csr_sentinels() {

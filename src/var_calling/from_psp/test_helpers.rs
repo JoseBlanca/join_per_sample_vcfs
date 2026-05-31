@@ -1,5 +1,5 @@
 //! `#[cfg(test)]`-only fixture builders shared across the
-//! [`cohort_block`](super) submodules' test suites.
+//! [`from_psp`](super) submodules' test suites.
 //!
 //! These are crate-visible (`pub(crate)`) so siblings can pull
 //! them in without each having its own copy. The shapes match the
@@ -9,11 +9,11 @@
 use std::ops::Range;
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
-use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
-use crate::var_calling::cohort_block::loader::{
+use crate::var_calling::from_psp::columns::{MaterialisedChunk, SampleColumns};
+use crate::var_calling::from_psp::loader::{
     ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
-use crate::var_calling::cohort_block::partition::WindowPartition;
+use crate::var_calling::from_psp::partition::WindowPartition;
 use crate::var_calling::per_position_merger::PerPositionPileups;
 use crate::var_calling::variant_grouping::OverlappingVariantGroup;
 

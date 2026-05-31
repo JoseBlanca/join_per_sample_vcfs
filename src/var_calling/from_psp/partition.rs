@@ -42,7 +42,7 @@ use std::ops::Range;
 
 use thiserror::Error;
 
-use crate::var_calling::cohort_block::columns::{MaterialisedChunk, u32_from_usize};
+use crate::var_calling::from_psp::columns::{MaterialisedChunk, u32_from_usize};
 
 /// One worker window's variant-group partitions in CSR-style
 /// columnar layout. Symmetric with
@@ -450,7 +450,7 @@ pub fn partition_window(
 mod tests {
     use super::*;
     use crate::pileup_record::PileupRecord;
-    use crate::var_calling::cohort_block::test_helpers::{
+    use crate::var_calling::from_psp::test_helpers::{
         allele, loaded_chunk, record, ref_plus_alt,
     };
 
