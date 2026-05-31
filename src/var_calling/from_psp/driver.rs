@@ -20,7 +20,7 @@
 //! `min_alt_obs_per_sample`, MAPQ-diff t-test) are applied
 //! post-EM in the driver, mirroring the streaming pipeline's drop
 //! semantics in
-//! [`drive_cohort_pipeline`](crate::pop_var_caller::cohort_driver::drive_cohort_pipeline).
+//! [`drive_cohort_pipeline`](crate::var_calling::from_bam::pipeline::drive_cohort_pipeline).
 //! The same set of records is dropped from the final VCF, with
 //! the same per-category counters incremented — that's the
 //! byte-identity contract for Phase A.
@@ -146,7 +146,7 @@ pub struct ChunkDriverParams {
 }
 
 /// Per-driver counters; the shape mirrors
-/// [`CohortDriveStats`](crate::pop_var_caller::cohort_driver::CohortDriveStats)
+/// [`CohortDriveStats`](crate::var_calling::from_bam::pipeline::CohortDriveStats)
 /// so the CLI summary code can consume either driver's output
 /// without a branch.
 // Mi1: `#[non_exhaustive]` — driver-level counter struct; future

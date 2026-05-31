@@ -23,7 +23,7 @@
 //!
 //! [`PileupArgs`]: super::super::cli::PileupArgs
 //! [`VarCallingArgs`]: super::super::var_calling::VarCallingArgs
-//! [`VarCallingFromBamArgs`]: super::super::var_calling_from_bam::VarCallingFromBamArgs
+//! [`VarCallingFromBamArgs`]: super::crate::var_calling::from_bam::driver::VarCallingFromBamArgs
 
 use clap::Args;
 
@@ -42,7 +42,7 @@ use crate::pileup::walker::{
 };
 use crate::pop_var_caller::cli::parse_mismatch_fraction;
 use crate::pop_var_caller::cli::parsers;
-use crate::pop_var_caller::cohort_driver::{
+use crate::var_calling::from_bam::pipeline::{
     DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
 
@@ -67,7 +67,7 @@ use crate::vcf::DEFAULT_EMIT_GP;
 
 /// Stage 1 knobs (CRAM-input filters, BAQ HMM, pileup walker).
 /// Flattened into [`PileupArgs`](super::super::cli::PileupArgs) and
-/// [`VarCallingFromBamArgs`](super::super::var_calling_from_bam::VarCallingFromBamArgs).
+/// [`VarCallingFromBamArgs`](super::crate::var_calling::from_bam::driver::VarCallingFromBamArgs).
 #[derive(Debug, Args, Clone)]
 pub struct Stage1Args {
     // ===== Common flags (visible in `-h`) =====================
@@ -219,7 +219,7 @@ pub struct Stage1Args {
 /// Cohort-pipeline knobs (DUST filter, variant grouping, per-group
 /// merger, posterior engine, ploidy, VCF writer). Flattened into
 /// [`VarCallingArgs`](super::super::var_calling::VarCallingArgs) and
-/// [`VarCallingFromBamArgs`](super::super::var_calling_from_bam::VarCallingFromBamArgs).
+/// [`VarCallingFromBamArgs`](super::crate::var_calling::from_bam::driver::VarCallingFromBamArgs).
 #[derive(Debug, Args, Clone)]
 pub struct CohortPipelineArgs {
     // ===== Common (visible in `-h`) ===========================

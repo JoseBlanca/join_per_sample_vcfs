@@ -57,7 +57,7 @@
 //! numbers; criterion comparisons (`--save-baseline` + `--baseline`)
 //! within a single session are reliable.
 //!
-//! [drive_cohort_pipeline]: pop_var_caller::pop_var_caller::cohort_driver::drive_cohort_pipeline
+//! [drive_cohort_pipeline]: pop_var_caller::var_calling::from_bam::pipeline::drive_cohort_pipeline
 //! [run_var_calling]: pop_var_caller::pop_var_caller::var_calling::run_var_calling
 
 // Opt-in mimalloc global allocator (cargo bench --features alloc-mimalloc).
@@ -81,7 +81,7 @@ use tempfile::TempDir;
 use pop_var_caller::fasta::StreamingChromRefFetcher;
 use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
-use pop_var_caller::pop_var_caller::cohort_driver::{
+use pop_var_caller::var_calling::from_bam::pipeline::{
     CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
     DEFAULT_MIN_QUAL_PHRED, drive_cohort_pipeline,
 };

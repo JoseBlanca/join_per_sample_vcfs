@@ -33,7 +33,7 @@ use crate::fasta::ContigList;
 use crate::pileup::walker::WalkerError;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
-use crate::pop_var_caller::cohort_driver::{CohortDriveStats, CohortPipelineParams};
+use crate::var_calling::from_bam::pipeline::{CohortDriveStats, CohortPipelineParams};
 use crate::pop_var_caller::common::{configure_rayon_pool, current_command_line, format_md5_hex};
 use crate::psp::PspReadError;
 use crate::psp::header::ParsedChromosome;
@@ -640,7 +640,7 @@ fn contigs_to_parsed(
 /// Drive Stages 1 + 3-6 for **one chromosome** of one sample.
 ///
 /// Mirror of the cohort-side
-/// [`crate::pop_var_caller::cohort_driver::process_one_chromosome`]
+/// [`crate::var_calling::from_bam::pipeline::process_one_chromosome`]
 /// (PSP inputs) but the front of the chain is Stage 1 (CRAM →
 /// BAQ → walker) instead of a `PspReader`. Each call owns its
 /// reader set, BAQ stream, walker, reference fetcher, and writer
@@ -843,7 +843,7 @@ fn process_one_chromosome_from_bam(
         ..writer_cfg_template
     };
 
-    let stats = crate::pop_var_caller::cohort_driver::drive_cohort_pipeline::<
+    let stats = crate::var_calling::from_bam::pipeline::drive_cohort_pipeline::<
         _,
         VarCallingFromBamCliError,
     >(

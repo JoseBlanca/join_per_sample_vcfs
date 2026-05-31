@@ -26,7 +26,7 @@ use pop_var_caller::pileup::walker::{
     DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
 };
 use pop_var_caller::pop_var_caller::cli::shared_args::{CohortPipelineArgs, Stage1Args};
-use pop_var_caller::pop_var_caller::cohort_driver::{
+use pop_var_caller::var_calling::from_bam::pipeline::{
     DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
 use pop_var_caller::pop_var_caller::estimate_contamination::{
@@ -35,7 +35,7 @@ use pop_var_caller::pop_var_caller::estimate_contamination::{
 use pop_var_caller::pop_var_caller::var_calling::{
     VarCallingArgs, VarCallingCliError, run_var_calling,
 };
-use pop_var_caller::pop_var_caller::var_calling_from_bam::{
+use pop_var_caller::var_calling::from_bam::driver::{
     VarCallingFromBamArgs, VarCallingFromBamCliError, run_var_calling_from_bam,
 };
 use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};

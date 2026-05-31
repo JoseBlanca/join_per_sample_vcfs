@@ -399,7 +399,7 @@ fn mapq_info_fields_reflect_cohort_pooled_stats() {
 ///    same suspect t.
 #[test]
 fn mapq_diff_t_filter_decision_matches_thresholds() {
-    use pop_var_caller::pop_var_caller::cohort_driver::{
+    use pop_var_caller::var_calling::from_bam::pipeline::{
         DEFAULT_MIN_MAPQ_DIFF_T, record_fails_mapq_diff_t_for_test as record_fails,
     };
 

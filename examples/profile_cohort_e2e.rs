@@ -55,7 +55,7 @@ use clap::Parser;
 
 use pop_var_caller::pileup_record::PileupRecord;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
-use pop_var_caller::pop_var_caller::cohort_driver::{
+use pop_var_caller::var_calling::from_bam::pipeline::{
     DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
 use pop_var_caller::pop_var_caller::var_calling::{VarCallingArgs, run_var_calling};

@@ -1,7 +1,7 @@
 //! Pure-Rust bgzf-aware concatenation of complete VCF fragments.
 //!
 //! The per-chromosome parallel path in
-//! [`crate::pop_var_caller::cohort_driver`] drives one
+//! [`crate::var_calling::from_bam::pipeline`] drives one
 //! [`CohortVcfWriter`](super::CohortVcfWriter) per chromosome, each
 //! emitting a self-contained `.vcf` / `.vcf.gz` fragment. After all
 //! per-chrom workers join, [`concat_fragments`] assembles those

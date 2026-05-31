@@ -9,7 +9,7 @@
 //! both branches converge on the same downstream chain via a
 //! `Box<dyn Iterator>` adapter that lifts the upstream error into
 //! [`GrouperError`] — the wiring lives in
-//! [`crate::pop_var_caller::cohort_driver::drive_cohort_pipeline`].
+//! [`crate::var_calling::from_bam::pipeline::drive_cohort_pipeline`].
 //!
 //! Contamination plumbing:
 //!
@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use thiserror::Error;
 
-use crate::pop_var_caller::cohort_driver::CohortDriveStats;
+use crate::var_calling::from_bam::pipeline::CohortDriveStats;
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
     current_command_line, verify_fasta_matches_psp_chromosomes,
@@ -252,7 +252,7 @@ pub enum VarCallingCliError {
 ///    contig-sized allocations. No process-wide reference fetcher
 ///    is built — each per-chrom worker constructs its own
 ///    `StreamingChromRefFetcher` inside
-///    [`process_one_chromosome`](crate::pop_var_caller::cohort_driver::process_one_chromosome).
+///    [`process_one_chromosome`](crate::var_calling::from_bam::pipeline::process_one_chromosome).
 /// 8. Cohort metadata + writer-config template.
 /// 9. Per-chromosome parallel partition: one worker per contig,
 ///    each writes a complete VCF fragment to a scratch TempDir

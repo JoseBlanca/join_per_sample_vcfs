@@ -62,7 +62,7 @@ pub enum PopVarCallerCommand {
     /// One-off: BAM(s) of a single sample → single-sample VCF, no
     /// `.psp` intermediate. No contamination correction (use the
     /// `.psp` route for that).
-    VarCallingFromBam(super::var_calling_from_bam::VarCallingFromBamArgs),
+    VarCallingFromBam(crate::var_calling::from_bam::driver::VarCallingFromBamArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the
@@ -264,7 +264,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
 // Helpers
 // ---------------------------------------------------------------------
 
-pub(super) fn alignment_config_from_args(
+pub(crate) fn alignment_config_from_args(
     args: &shared_args::Stage1Args,
 ) -> AlignmentMergedReaderConfig {
     AlignmentMergedReaderConfig {
@@ -289,7 +289,7 @@ pub(super) fn alignment_config_from_args(
     }
 }
 
-pub(super) fn baq_config_from_args(args: &shared_args::Stage1Args) -> BaqConfig {
+pub(crate) fn baq_config_from_args(args: &shared_args::Stage1Args) -> BaqConfig {
     BaqConfig {
         gap_open_prob: args.baq_gap_open_prob,
         gap_extend_prob: args.baq_gap_extend_prob,
@@ -297,7 +297,7 @@ pub(super) fn baq_config_from_args(args: &shared_args::Stage1Args) -> BaqConfig 
     }
 }
 
-pub(super) fn walker_config_from_args(args: &shared_args::Stage1Args) -> WalkerConfig {
+pub(crate) fn walker_config_from_args(args: &shared_args::Stage1Args) -> WalkerConfig {
     WalkerConfig {
         max_snp_column_depth: args.max_snp_column_depth,
         max_indel_column_depth: args.max_indel_column_depth,
