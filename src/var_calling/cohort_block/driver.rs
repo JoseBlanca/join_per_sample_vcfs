@@ -32,6 +32,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex};
+use std::thread::JoinHandle;
 use thiserror::Error;
 
 use crate::fasta::fetcher::ChromRefFetchError;
@@ -276,6 +277,12 @@ pub enum ChunkDriverError {
         #[source]
         source: PspReadError,
     },
+    /// The DUST-ahead thread ended before serving the covered interval
+    /// the producer was entering — the producer-vs-DUST interval
+    /// sequences fell out of lockstep, or the thread panicked. Surfaced
+    /// rather than silently DUSTing nothing (which would change output).
+    #[error("DUST-ahead thread ended before serving an interval on chromosome {chrom_id}")]
+    DustAheadGone { chrom_id: u32 },
     #[error("failed to partition window on chromosome {chrom_id}")]
     Partition {
         chrom_id: u32,
@@ -926,6 +933,243 @@ where
     merge_block_ranges(ranges, max_group_span)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Stage 3 — DUST-ahead queue.
+//
+// DUST depends only on the reference sequence + the region, nothing about
+// the PSP data or the fold, and the covered intervals are known up front
+// from the block indices. So a background thread DUSTs the covered
+// intervals in genomic order and feeds the masks to the producer through
+// a bounded queue; the producer slices out the mask for its current block
+// span instead of computing it inline (the ~10 s serial DUST that, after
+// Stage 2, was the producer's largest serial floor).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Number of covered-interval DUST masks the DUST-ahead thread may run in
+/// front of the producer. Bounds the queue — and thus how far ahead the
+/// thread can race and how much mask memory is resident — to a few
+/// intervals; small because each mask is cheap and the producer drains
+/// them one covered interval at a time.
+const DUST_AHEAD_QUEUE_CAP: usize = 4;
+
+/// Sub-span (bases) the DUST-ahead thread DUSTs at a time within a covered
+/// interval. `sdust_mask_for_span`'s per-position verdict is byte-
+/// identical to a whole-contig scan for any span past the reset barrier,
+/// so chunking a long interval into sub-spans and coalescing the masked
+/// runs at the boundaries yields the same mask as one whole-interval scan
+/// — while keeping the resident reference buffer to ~one sub-span + halo
+/// instead of a whole chromosome arm.
+const DUST_AHEAD_SUBSPAN: u32 = 1_000_000;
+
+/// Per-chromosome plan shared by the producer and the DUST-ahead thread:
+/// the chromosome's id / name / length plus its block-index-driven
+/// covered intervals. Both sides iterate the *same* plan list in the same
+/// order, so they stay in lockstep on the interval sequence (the producer
+/// enters interval N exactly when the thread has served interval N's
+/// mask). Built once from the in-memory PSP block indices — no file I/O.
+#[derive(Clone)]
+struct DustChromPlan {
+    chrom_id: u32,
+    name: String,
+    length: u32,
+    /// Block-index-driven covered intervals (1-based half-open),
+    /// non-empty. Same value the producer's [`ChromCursor::covered`] holds.
+    covered: Vec<std::ops::Range<u32>>,
+}
+
+/// One covered interval's precomputed DUST mask, handed DUST-ahead thread
+/// → producer over the bounded queue. `interval` is the 1-based half-open
+/// covered interval (matched against the interval the producer is
+/// entering — a lockstep sanity check); `mask` is the sorted,
+/// non-overlapping low-complexity intervals over it, which the producer
+/// slices per block.
+struct IntervalDustMask {
+    chrom_id: u32,
+    interval: std::ops::Range<u32>,
+    mask: Vec<std::ops::Range<u32>>,
+}
+
+/// Build the per-chromosome plans (id / name / length + covered
+/// intervals) for every chromosome that carries data, in genomic order.
+/// Mirrors the skip rules the producer's chromosome advance uses (drop
+/// zero-length contigs and contigs no sample covers) so the plan sequence
+/// is exactly the interval sequence the producer walks. Reads only the
+/// in-memory block indices.
+fn build_dust_plans<W>(
+    sources: &[ColumnSpanReader<W>],
+    chromosomes: &[ParsedChromosome],
+    max_group_span: u32,
+) -> Vec<DustChromPlan>
+where
+    W: Read + Seek + Send,
+{
+    let mut plans = Vec::new();
+    for (chrom_idx, chrom) in chromosomes.iter().enumerate() {
+        if chrom.length == 0 {
+            continue;
+        }
+        // M25 PANIC-FREE: chrom_id fits in u32 (PSP file-format invariant).
+        let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
+        let covered =
+            covered_intervals_for_chrom(sources, chrom_id, max_group_span.max(MIN_CHUNK_SPAN));
+        if covered.is_empty() {
+            continue;
+        }
+        plans.push(DustChromPlan {
+            chrom_id,
+            name: chrom.name.clone(),
+            length: chrom.length,
+            covered,
+        });
+    }
+    plans
+}
+
+/// Compute the coalesced DUST mask over the covered `interval` (1-based
+/// half-open) by DUSTing [`DUST_AHEAD_SUBSPAN`] sub-spans left-to-right
+/// and coalescing masked runs across sub-span boundaries. Byte-identical
+/// to a single [`sdust_mask_for_span`] over the whole interval (the
+/// per-position verdict is identical past the reset barrier), with the
+/// reference buffer bounded to ~one sub-span + halo via `evict_before`.
+/// Returned intervals are sorted, non-overlapping, 1-based half-open,
+/// clipped to `interval`.
+fn dust_mask_for_interval(
+    fetcher: &mut ManualEvictChromRefFetcher,
+    interval: &std::ops::Range<u32>,
+    chrom_length: u32,
+    window: u32,
+    threshold: u32,
+    subspan: u32,
+) -> io::Result<Vec<std::ops::Range<u32>>> {
+    let subspan = subspan.max(1);
+    let mut mask: Vec<std::ops::Range<u32>> = Vec::new();
+    let mut sub_start = interval.start;
+    while sub_start < interval.end {
+        let sub_end = sub_start.saturating_add(subspan).min(interval.end);
+        let (sub_mask, buf_start) = sdust_mask_for_span(
+            sub_start,
+            sub_end,
+            chrom_length,
+            window,
+            threshold,
+            MIN_DUST_HALO,
+            |s, l| {
+                fetcher
+                    .fetch(s, l)
+                    .map(<[u8]>::to_vec)
+                    .map_err(io::Error::other)
+            },
+        )?;
+        // Coalesce a run that the sub-span boundary split: if the first
+        // run of this sub-span abuts the last run carried so far, merge
+        // them so the result equals a single whole-interval scan.
+        for run in sub_mask {
+            match mask.last_mut() {
+                Some(last) if last.end == run.start => last.end = run.end,
+                _ => mask.push(run),
+            }
+        }
+        // Everything left of this sub-span's buffer is done with; the
+        // next sub-span only reads from `sub_end - halo` onward, so this
+        // keeps the resident reference window to ~one sub-span + halo.
+        fetcher.evict_before(buf_start);
+        sub_start = sub_end;
+    }
+    Ok(mask)
+}
+
+/// Spawn the DUST-ahead thread: DUST every covered interval in `plans`
+/// (genomic order), pushing each `(interval → mask)` into a bounded queue
+/// the producer drains as it enters intervals. Off the producer's
+/// critical path. Returns the receiver + join handle; the thread exits
+/// when it finishes the plans, hits an error (after queueing it), or the
+/// receiver is dropped (a `send` to a gone receiver errs).
+fn spawn_dust_ahead(
+    fasta_path: &Path,
+    plans: &[DustChromPlan],
+    window: u32,
+    threshold: u32,
+) -> (
+    mpsc::Receiver<Result<IntervalDustMask, ChunkDriverError>>,
+    JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::sync_channel(DUST_AHEAD_QUEUE_CAP);
+    let fasta_path = fasta_path.to_path_buf();
+    let plans = plans.to_vec();
+    let handle = std::thread::spawn(move || {
+        for plan in &plans {
+            let mut fetcher = match ManualEvictChromRefFetcher::for_contig(&fasta_path, &plan.name)
+            {
+                Ok(fetcher) => fetcher,
+                Err(source) => {
+                    let _ = tx.send(Err(ChunkDriverError::OpenRefFetcher {
+                        contig: plan.name.clone(),
+                        source,
+                    }));
+                    return;
+                }
+            };
+            for interval in &plan.covered {
+                let msg = match dust_mask_for_interval(
+                    &mut fetcher,
+                    interval,
+                    plan.length,
+                    window,
+                    threshold,
+                    DUST_AHEAD_SUBSPAN,
+                ) {
+                    Ok(mask) => Ok(IntervalDustMask {
+                        chrom_id: plan.chrom_id,
+                        interval: interval.clone(),
+                        mask,
+                    }),
+                    Err(source) => Err(ChunkDriverError::DustMaskIo {
+                        contig: plan.name.clone(),
+                        source,
+                    }),
+                };
+                let queued_fatal = msg.is_err();
+                // Receiver gone (producer stopped) or we just queued a
+                // fatal error: nothing more to produce.
+                if tx.send(msg).is_err() || queued_fatal {
+                    return;
+                }
+            }
+        }
+    });
+    (rx, handle)
+}
+
+/// Slice the precomputed interval mask to the block span
+/// `[span_start, span_end)`, clipping each overlapping run to the span and
+/// appending it to `out` (sorted, non-overlapping — the shape
+/// [`partition_window`](crate::var_calling::cohort_block::partition::partition_window)
+/// expects). `sweep` is a per-interval forward cursor over
+/// `interval_mask`, advanced past runs ending at or before `span_start`; a
+/// run straddling the block boundary stays for the next block. Reproduces
+/// the inline per-block `sdust_mask_for_span` output exactly because the
+/// interval mask carries the same per-position verdict.
+fn slice_interval_mask(
+    interval_mask: &[std::ops::Range<u32>],
+    sweep: &mut usize,
+    span_start: u32,
+    span_end: u32,
+    out: &mut Vec<std::ops::Range<u32>>,
+) {
+    while *sweep < interval_mask.len() && interval_mask[*sweep].end <= span_start {
+        *sweep += 1;
+    }
+    let mut idx = *sweep;
+    while idx < interval_mask.len() && interval_mask[idx].start < span_end {
+        let start = interval_mask[idx].start.max(span_start);
+        let end = interval_mask[idx].end.min(span_end);
+        if start < end {
+            out.push(start..end);
+        }
+        idx += 1;
+    }
+}
+
 /// A fully-prepared, **owned** block: the materialised columns, their
 /// variant-group partition, and the per-group pre-fetched REF bytes —
 /// exactly the inputs [`process_block`] needs, and nothing the producer
@@ -992,14 +1236,9 @@ pub fn process_block(
 /// advance.
 struct ChromCursor {
     chrom_id: u32,
-    chrom_name: String,
-    chrom_length: u32,
     chrom_one_past_end: u32,
     /// Forward-only fetcher feeding the per-block REF prefetch.
     ref_fetcher: StreamingChromRefFetcher,
-    /// Random-access fetcher feeding the per-block DUST mask; `None`
-    /// when the complexity filter is disabled.
-    dust_fetcher: Option<ManualEvictChromRefFetcher>,
     /// Block-index-driven covered intervals (data-bearing segments).
     covered: Vec<std::ops::Range<u32>>,
     /// Index into `covered` of the interval currently being produced.
@@ -1017,8 +1256,8 @@ struct ChromCursor {
 /// blocks of ~`desired_num_variants` variable variants. `next_block`
 /// reads .psp chunks (decode in parallel across samples), folds to the
 /// cohort's variable sites, accumulates until the variant target is
-/// met, cuts at a clean group boundary (reserving the tail), then
-/// DUST-masks + partitions + prefetches REF bytes for the block.
+/// met, cuts at a clean group boundary, then slices the precomputed
+/// DUST-ahead mask + partitions + prefetches REF bytes for the block.
 ///
 /// This is the *data-shaping* half. `next_block` yields an owned
 /// [`ReadyBlock`]; the consumer runs the per-group math via
@@ -1027,7 +1266,6 @@ struct ChromCursor {
 /// are returned via [`recycle`](Self::recycle) so their buffers feed the
 /// next production without reallocating.
 struct BlockIterator<'a, W: Read + Seek + Send> {
-    chromosomes: &'a [ParsedChromosome],
     fasta_path: &'a Path,
     params: &'a ChunkDriverParams,
     /// One span-addressable columnar reader per sample; each owns its
@@ -1038,9 +1276,29 @@ struct BlockIterator<'a, W: Read + Seek + Send> {
     /// Streaming fold+compact engine: holds the per-sample pending
     /// (open-group straddle) and the fold scratch, reused across blocks.
     streaming: StreamingBlockLoader,
-    /// Reusable per-block partition scratch + DUST-mask buffer.
+    /// Reusable per-block partition scratch.
     partition_scratch: PartitionScratch,
+    /// Reusable per-block DUST-mask buffer — the current block's slice of
+    /// `cur_interval_mask` fed to `partition_window`.
     mask: Vec<std::ops::Range<u32>>,
+
+    // ── Stage 3 DUST-ahead. ──
+    /// Per-chromosome plans (covered intervals) built once at construction
+    /// and walked by [`advance_chrom`](Self::advance_chrom); the same list
+    /// the DUST-ahead thread iterates, keeping the two in lockstep.
+    chrom_plans: Vec<DustChromPlan>,
+    next_plan_idx: usize,
+    /// Bounded queue of precomputed covered-interval DUST masks from the
+    /// DUST-ahead thread, drained one per interval entered. `None` when the
+    /// complexity filter is disabled (no thread spawned).
+    dust_rx: Option<mpsc::Receiver<Result<IntervalDustMask, ChunkDriverError>>>,
+    /// Join handle for the DUST-ahead thread; joined on drop (after the
+    /// receiver is released so the thread's pending send unblocks).
+    dust_handle: Option<JoinHandle<()>>,
+    /// The current covered interval's DUST mask (whole interval, coalesced)
+    /// and a forward sweep cursor into it advanced as blocks progress.
+    cur_interval_mask: Vec<std::ops::Range<u32>>,
+    mask_sweep: usize,
 
     // Free-list of recycled block buffers (columns + CSR arrays + REF
     // byte buffers). `next_block` pops one (or makes a fresh one) to
@@ -1050,9 +1308,20 @@ struct BlockIterator<'a, W: Read + Seek + Send> {
 
     // Production cursor + counters.
     cur: Option<ChromCursor>,
-    next_chrom_idx: usize,
     chunks_loaded: u64,
     chunk_variants_total: u64,
+}
+
+impl<W: Read + Seek + Send> Drop for BlockIterator<'_, W> {
+    fn drop(&mut self) {
+        // Release the receiver first so the DUST-ahead thread's next
+        // `send` fails (it stops promptly even mid-interval), then join
+        // it so no background thread outlives the producer.
+        self.dust_rx = None;
+        if let Some(handle) = self.dust_handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
@@ -1063,9 +1332,33 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         params: &'a ChunkDriverParams,
     ) -> Self {
         let n_samples = psp_readers.len();
-        let sources = psp_readers.into_iter().map(ColumnSpanReader::detached).collect();
-        Self {
+        let sources: Vec<ColumnSpanReader<W>> = psp_readers
+            .into_iter()
+            .map(ColumnSpanReader::detached)
+            .collect();
+
+        // Plan the covered intervals once (from the in-memory block
+        // indices) so the producer and the DUST-ahead thread agree on the
+        // interval sequence. DUST off the critical path on a background
+        // thread, unless the complexity filter is disabled.
+        let chrom_plans = build_dust_plans(
+            &sources,
             chromosomes,
+            params.grouper_cfg.max_variant_group_span,
+        );
+        let (dust_rx, dust_handle) = if params.no_complexity_filter {
+            (None, None)
+        } else {
+            let (rx, handle) = spawn_dust_ahead(
+                fasta_path,
+                &chrom_plans,
+                params.dust_cfg.window(),
+                params.dust_cfg.threshold(),
+            );
+            (Some(rx), Some(handle))
+        };
+
+        Self {
             fasta_path,
             params,
             sources,
@@ -1073,10 +1366,15 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             streaming: StreamingBlockLoader::with_n_samples(n_samples),
             partition_scratch: PartitionScratch::with_n_samples(n_samples),
             mask: Vec::new(),
+            chrom_plans,
+            next_plan_idx: 0,
+            dust_rx,
+            dust_handle,
+            cur_interval_mask: Vec::new(),
+            mask_sweep: 0,
             free_blocks: Vec::new(),
             next_seq_idx: 0,
             cur: None,
-            next_chrom_idx: 0,
             chunks_loaded: 0,
             chunk_variants_total: 0,
         }
@@ -1089,86 +1387,80 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
     }
 
     /// Advance to the next chromosome that carries data, building its
-    /// cursor (covered intervals + fetchers) positioned at interval 0.
-    /// Returns `Ok(false)` when no chromosomes remain. Does not touch
-    /// the sources — [`enter_current_interval`](Self::enter_current_interval)
+    /// cursor (covered intervals + REF fetcher) positioned at interval 0.
+    /// Returns `Ok(false)` when no chromosomes remain. Walks the
+    /// precomputed [`chrom_plans`](Self::chrom_plans), so the interval
+    /// sequence matches the DUST-ahead thread's. Does not touch the
+    /// sources — [`enter_current_interval`](Self::enter_current_interval)
     /// resets them to interval 0.
     fn advance_chrom(&mut self) -> Result<bool, ChunkDriverError> {
-        let max_group_span = self.params.grouper_cfg.max_variant_group_span;
-        while self.next_chrom_idx < self.chromosomes.len() {
-            let chrom_idx = self.next_chrom_idx;
-            self.next_chrom_idx += 1;
-            let chrom = &self.chromosomes[chrom_idx];
-            let chrom_length = chrom.length;
-            if chrom_length == 0 {
-                continue;
-            }
-            // M25 PANIC-FREE: chrom_id fits in u32 (PSP file-format invariant).
-            let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
-            let covered = covered_intervals_for_chrom(
-                &self.sources,
-                chrom_id,
-                max_group_span.max(MIN_CHUNK_SPAN),
-            );
-            if covered.is_empty() {
-                // No sample carries data here: open no fetchers, read nothing.
-                continue;
-            }
-            let ref_fetcher = StreamingChromRefFetcher::for_contig(self.fasta_path, &chrom.name)
-                .map_err(|source| ChunkDriverError::OpenRefFetcher {
-                    contig: chrom.name.clone(),
-                    source,
-                })?;
-            let dust_fetcher: Option<ManualEvictChromRefFetcher> =
-                if self.params.no_complexity_filter {
-                    None
-                } else {
-                    Some(
-                        ManualEvictChromRefFetcher::for_contig(self.fasta_path, &chrom.name)
-                            .map_err(|source| ChunkDriverError::OpenRefFetcher {
-                                contig: chrom.name.clone(),
-                                source,
-                            })?,
-                    )
-                };
-            self.cur = Some(ChromCursor {
-                chrom_id,
-                chrom_name: chrom.name.clone(),
-                chrom_length,
-                chrom_one_past_end: chrom_length.saturating_add(1),
-                ref_fetcher,
-                dust_fetcher,
-                covered,
-                interval_idx: 0,
-                // Filled by `enter_current_interval`.
-                chunk_range_start: 0,
-                interval_one_past_end: 0,
-            });
-            return Ok(true);
-        }
-        self.cur = None;
-        Ok(false)
+        let Some(plan) = self.chrom_plans.get(self.next_plan_idx) else {
+            self.cur = None;
+            return Ok(false);
+        };
+        self.next_plan_idx += 1;
+        let ref_fetcher = StreamingChromRefFetcher::for_contig(self.fasta_path, &plan.name)
+            .map_err(|source| ChunkDriverError::OpenRefFetcher {
+                contig: plan.name.clone(),
+                source,
+            })?;
+        self.cur = Some(ChromCursor {
+            chrom_id: plan.chrom_id,
+            chrom_one_past_end: plan.length.saturating_add(1),
+            ref_fetcher,
+            covered: plan.covered.clone(),
+            interval_idx: 0,
+            // Filled by `enter_current_interval`.
+            chunk_range_start: 0,
+            interval_one_past_end: 0,
+        });
+        Ok(true)
     }
 
     /// Point the per-sample sources and the streaming loader at the
-    /// cursor's current covered interval, and set the block range to its
-    /// start. Called when a chromosome or interval is (re-)entered; the
-    /// interval boundary is wider than any group span, so the streaming
-    /// loader starts with empty pending.
-    fn enter_current_interval(&mut self) {
-        let (chrom_id, start, interval_one_past_end) = {
+    /// cursor's current covered interval, set the block range to its
+    /// start, and pull the interval's precomputed DUST mask off the
+    /// DUST-ahead queue. Called when a chromosome or interval is
+    /// (re-)entered; the interval boundary is wider than any group span,
+    /// so the streaming loader starts with empty pending.
+    fn enter_current_interval(&mut self) -> Result<(), ChunkDriverError> {
+        let (chrom_id, interval, start, interval_one_past_end) = {
             let cur = self.cur.as_ref().expect("cur set before enter");
             let iv = &cur.covered[cur.interval_idx];
-            (cur.chrom_id, iv.start, iv.end.min(cur.chrom_one_past_end))
+            (
+                cur.chrom_id,
+                iv.clone(),
+                iv.start,
+                iv.end.min(cur.chrom_one_past_end),
+            )
         };
         let end_inclusive = interval_one_past_end.saturating_sub(1);
         for source in &mut self.sources {
             source.reset(chrom_id, start, end_inclusive);
         }
         self.streaming.reset_interval();
+
+        // Take this interval's DUST mask from the DUST-ahead thread. The
+        // thread produces one mask per covered interval in the same
+        // genomic order the producer enters them, so this `recv` is the
+        // mask for exactly this interval (asserted below).
+        if let Some(rx) = self.dust_rx.as_ref() {
+            match rx.recv() {
+                Ok(Ok(interval_mask)) => {
+                    debug_assert_eq!(interval_mask.chrom_id, chrom_id);
+                    debug_assert_eq!(interval_mask.interval, interval);
+                    self.cur_interval_mask = interval_mask.mask;
+                    self.mask_sweep = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(ChunkDriverError::DustAheadGone { chrom_id }),
+            }
+        }
+
         let cur = self.cur.as_mut().expect("cur set before enter");
         cur.chunk_range_start = start;
         cur.interval_one_past_end = interval_one_past_end;
+        Ok(())
     }
 
     /// Yield the next prepared block (owned), or `None` when the genome
@@ -1180,7 +1472,11 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             // Make sure a covered interval is entered.
             if self.cur.is_none() {
                 match self.advance_chrom() {
-                    Ok(true) => self.enter_current_interval(),
+                    Ok(true) => {
+                        if let Err(e) = self.enter_current_interval() {
+                            return Some(Err(e));
+                        }
+                    }
                     Ok(false) => return None,
                     Err(e) => return Some(Err(e)),
                 }
@@ -1210,10 +1506,16 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
                         _ => false,
                     };
                     if advanced_interval {
-                        self.enter_current_interval();
+                        if let Err(e) = self.enter_current_interval() {
+                            return Some(Err(e));
+                        }
                     } else {
                         match self.advance_chrom() {
-                            Ok(true) => self.enter_current_interval(),
+                            Ok(true) => {
+                                if let Err(e) = self.enter_current_interval() {
+                                    return Some(Err(e));
+                                }
+                            }
                             Ok(false) => return None,
                             Err(e) => return Some(Err(e)),
                         }
@@ -1229,9 +1531,9 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
 
     /// Stream one block of the current interval into `block`: fold +
     /// compact to the variant target (the open group carries forward as
-    /// the loader's pending), then DUST-mask, partition, and prefetch
-    /// the REF bytes. Returns the block's variant count, or `0` when the
-    /// interval is exhausted (no block produced).
+    /// the loader's pending), then slice the precomputed DUST-ahead mask,
+    /// partition, and prefetch the REF bytes. Returns the block's variant
+    /// count, or `0` when the interval is exhausted (no block produced).
     fn produce_block(&mut self, block: &mut ReadyBlock) -> Result<u32, ChunkDriverError> {
         let ReadyBlock {
             chunk,
@@ -1246,6 +1548,8 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             partition_scratch,
             mask,
             cur,
+            cur_interval_mask,
+            mask_sweep,
             ..
         } = self;
         let cur = cur
@@ -1261,7 +1565,6 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             .map_or(0, NonZeroU32::get)
             .max(1);
         let chrom_id = cur.chrom_id;
-        let chrom_length = cur.chrom_length;
         let range_start = cur.chunk_range_start;
         let interval_end_inclusive = cur.interval_one_past_end.saturating_sub(1);
 
@@ -1286,32 +1589,20 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         cur.chunk_range_start = chunk.safe_end;
 
         // ── DUST mask (data-shaping). ──
+        // Slice the block's span out of the interval mask the DUST-ahead
+        // thread precomputed (taken in `enter_current_interval`), instead
+        // of DUSTing inline — byte-identical, but off the critical path.
         mask.clear();
         let span_start = chunk.range.start;
         let span_end = chunk.safe_end;
-        if let Some(dust_fetcher) = cur.dust_fetcher.as_mut()
-            && span_start < span_end
-        {
-            let (m, buf_start) = sdust_mask_for_span(
+        if !params.no_complexity_filter && span_start < span_end {
+            slice_interval_mask(
+                cur_interval_mask.as_slice(),
+                mask_sweep,
                 span_start,
                 span_end,
-                chrom_length,
-                params.dust_cfg.window(),
-                params.dust_cfg.threshold(),
-                MIN_DUST_HALO,
-                |s, l| {
-                    dust_fetcher
-                        .fetch(s, l)
-                        .map(<[u8]>::to_vec)
-                        .map_err(io::Error::other)
-                },
-            )
-            .map_err(|source| ChunkDriverError::DustMaskIo {
-                contig: cur.chrom_name.clone(),
-                source,
-            })?;
-            *mask = m;
-            dust_fetcher.evict_before(buf_start);
+                mask,
+            );
         }
         // ── Partition + REF prefetch (data-shaping). ──
         let window = span_start..span_end;
@@ -1412,6 +1703,141 @@ mod tests {
             merge_block_ranges([(100, 200), (251, 300)], 50),
             vec![100..201, 251..301]
         );
+    }
+
+    // ── Stage 3: slice_interval_mask ─────────────────────────────────
+
+    /// Consecutive blocks tiling an interval each get the runs that fall
+    /// inside their span, and the sweep cursor advances monotonically so
+    /// later blocks never re-scan consumed runs.
+    #[test]
+    fn slice_interval_mask_clips_and_advances_across_blocks() {
+        let interval_mask = vec![10..20, 40..50, 80..100];
+        let mut sweep = 0usize;
+
+        let mut out = Vec::new();
+        slice_interval_mask(&interval_mask, &mut sweep, 1, 30, &mut out);
+        assert_eq!(out, vec![10..20]);
+
+        out.clear();
+        slice_interval_mask(&interval_mask, &mut sweep, 30, 60, &mut out);
+        assert_eq!(out, vec![40..50]);
+
+        out.clear();
+        slice_interval_mask(&interval_mask, &mut sweep, 60, 200, &mut out);
+        assert_eq!(out, vec![80..100]);
+    }
+
+    /// A masked run straddling a block boundary is clipped into both
+    /// blocks (the cursor does not advance past it until a block fully
+    /// clears it) — the case that makes the slice byte-identical to a
+    /// per-block inline DUST over the same span.
+    #[test]
+    fn slice_interval_mask_reemits_run_straddling_block_boundary() {
+        let interval_mask = vec![10..20, 45..70];
+        let mut sweep = 0usize;
+
+        let mut out = Vec::new();
+        slice_interval_mask(&interval_mask, &mut sweep, 1, 50, &mut out);
+        assert_eq!(out, vec![10..20, 45..50]);
+
+        out.clear();
+        slice_interval_mask(&interval_mask, &mut sweep, 50, 100, &mut out);
+        assert_eq!(out, vec![50..70]);
+    }
+
+    /// A block whose span misses every run yields an empty slice and
+    /// leaves the cursor where the next block can pick up.
+    #[test]
+    fn slice_interval_mask_empty_when_span_misses_every_run() {
+        let interval_mask = vec![10..20, 80..90];
+        let mut sweep = 0usize;
+        let mut out = Vec::new();
+        slice_interval_mask(&interval_mask, &mut sweep, 30, 40, &mut out);
+        assert!(out.is_empty());
+    }
+
+    // ── Stage 3: dust_mask_for_interval ──────────────────────────────
+
+    /// Write a single-contig unwrapped FASTA (+ sibling `.fai`) holding
+    /// `seq` and return the tempdir guard + the FASTA path.
+    fn write_unwrapped_fasta(seq: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+        let dir = tempdir().expect("tempdir");
+        let fa_path = dir.path().join("ref.fa");
+        let mut f = std::fs::File::create(&fa_path).expect("create fasta");
+        f.write_all(b">chr0\n").expect("write header");
+        f.write_all(seq).expect("write seq");
+        f.write_all(b"\n").expect("write newline");
+        let header_len = b">chr0\n".len();
+        std::fs::write(
+            dir.path().join("ref.fa.fai"),
+            // name, length, seq-offset, line_bases, line_width
+            format!(
+                "chr0\t{}\t{}\t{}\t{}\n",
+                seq.len(),
+                header_len,
+                seq.len(),
+                seq.len() + 1
+            ),
+        )
+        .expect("write fai");
+        (dir, fa_path)
+    }
+
+    /// Chunking a covered interval into sub-spans and coalescing the
+    /// masked runs at the boundaries reproduces a single whole-interval
+    /// `sdust_mask_for_span` exactly — for any sub-span size. This is the
+    /// byte-identity argument for the DUST-ahead thread's sub-span loop.
+    #[test]
+    fn dust_mask_for_interval_matches_whole_interval_scan() {
+        // High-complexity flanks (unmasked) around a long poly-A tract
+        // (masked) that crosses the sub-span boundaries.
+        let flank: &[u8] = b"ACGTCAGTACGATCAGTAGCATGCAGTAGCATCAGTACGAGCATCAGCAG";
+        let mut seq = Vec::new();
+        seq.extend_from_slice(flank);
+        seq.extend(std::iter::repeat_n(b'A', 120));
+        seq.extend_from_slice(flank);
+        let len = seq.len() as u32;
+        let (dir, fa_path) = write_unwrapped_fasta(&seq);
+
+        let (window, threshold) = (64u32, 20u32);
+        let interval = 1..len + 1;
+
+        // One-shot reference scan over the whole interval.
+        let mut whole_fetcher =
+            ManualEvictChromRefFetcher::for_contig(&fa_path, "chr0").expect("fetcher");
+        let (whole, _) = sdust_mask_for_span(
+            interval.start,
+            interval.end,
+            len,
+            window,
+            threshold,
+            MIN_DUST_HALO,
+            |s, l| {
+                whole_fetcher
+                    .fetch(s, l)
+                    .map(<[u8]>::to_vec)
+                    .map_err(io::Error::other)
+            },
+        )
+        .expect("whole scan");
+        assert!(
+            !whole.is_empty(),
+            "fixture must mask the poly-A tract to exercise coalescing"
+        );
+
+        // Chunked + coalesced over a range of sub-span sizes (small ones
+        // force many boundary merges; `len` is the whole-interval case).
+        for subspan in [7u32, 13, 41, len] {
+            let mut fetcher =
+                ManualEvictChromRefFetcher::for_contig(&fa_path, "chr0").expect("fetcher");
+            let chunked =
+                dust_mask_for_interval(&mut fetcher, &interval, len, window, threshold, subspan)
+                    .expect("chunked scan");
+            assert_eq!(chunked, whole, "subspan={subspan}");
+        }
+        drop(dir);
     }
 
     fn ref_allele() -> MergedAllele {
