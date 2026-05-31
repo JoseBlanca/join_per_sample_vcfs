@@ -19,25 +19,25 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **streaming columnar produce — Stage 3
->   (DUST-ahead queue; serial DUST off the critical path)** —
->   [cohort_produce_streaming_columnar_stage3_2026-05-31.md](ia/reports/implementations/cohort_produce_streaming_columnar_stage3_2026-05-31.md).
->   A background thread precomputes the sdust DUST masks for the covered
->   intervals (known up front from the block indices) in genomic order
->   and feeds them to the producer over a bounded queue; the producer
->   slices its block's span out of the interval mask instead of DUSTing
->   inline. Byte-identical — `sdust_mask_for_span`'s per-position verdict
->   is position-stable, so slice == inline (sub-spanned + coalesced in the
->   thread to bound the reference buffer). At N=26/8 threads wall
->   **15.2 → 9.8 s** (`main` 9.1 s; the 1.76× gap essentially closes to
->   1.06×) and peak RSS drops further **550 → 294 MB** (now *below*
->   `main`'s 395 MB). Byte-identical (drop `^##`, md5) at N=8/26, serial +
->   8 threads. 1056 lib + integration tests pass. The remaining gap is at
->   low N (single producer thread is the floor) — parallel producers over
->   intervals is the next lever. Plan:
->   [cohort_produce_streaming_columnar.md](doc/devel/implementation_plans/cohort_produce_streaming_columnar.md).
->   Stage 2 (the memory fix) preceded it:
->   [cohort_produce_streaming_columnar_stage2_2026-05-31.md](ia/reports/implementations/cohort_produce_streaming_columnar_stage2_2026-05-31.md).
+> - **Last completed task:** **DUST worker pool — parallel DUST-ahead** —
+>   [cohort_dust_worker_pool_2026-05-31.md](ia/reports/implementations/cohort_dust_worker_pool_2026-05-31.md).
+>   Profiling (samply + a DUST-on/off ablation) showed the Stage 3 single
+>   DUST-ahead thread was the wall floor — sdust over the whole genome is
+>   ~10 s of single-threaded work and the producer waited on it (~79 % of
+>   N=8/8-thread wall). The covered intervals are independent, so a
+>   **bounded, ordered worker pool** (`DustAheadPool`) now DUSTs them in
+>   parallel and delivers masks in genomic order. Byte-identical by
+>   construction (parallelism changes only *when* a mask is computed). At
+>   8 threads, wall **8.7 → 4.0 s** (N=8) and **9.5 → 7.6 s** (N=26); the
+>   branch now **beats `main` on wall and RSS at both sizes** (N=8 4.1 s /
+>   79 MB vs 6.0 s / 142 MB = 1.47×; N=26 7.8 s / 291 MB vs 8.9 s / 403 MB
+>   = 1.14×). Byte-identical (drop `^##`, md5) at N=8/26, serial + 8
+>   threads. 1061 lib tests pass. Plan:
+>   [cohort_dust_worker_pool.md](doc/devel/implementation_plans/cohort_dust_worker_pool.md).
+>   Preceded by streaming-columnar produce Stage 3 (DUST-ahead queue,
+>   [report](ia/reports/implementations/cohort_produce_streaming_columnar_stage3_2026-05-31.md))
+>   and Stage 2 (the memory fix,
+>   [report](ia/reports/implementations/cohort_produce_streaming_columnar_stage2_2026-05-31.md)).
 > - **Previous task — code review:** **Code review of the `cohort_block`
 >   module** (the chunk-based cohort var-calling rewrite, ~8 400 LoC
 >   across 12 files on branch `cohort-within-chromosome-parallel`,
@@ -924,13 +924,17 @@ via rayon.
 #### Within-chromosome chunk-parallel rewrite (`cohort_block/`)
 - **Status:** fixes-applied (Wave 1); parallel block-consume shipped
   (`0d49cf8`, `51b5c63`); **streaming-columnar produce rewrite —
-  Stages 1, 2 & 3 implemented**. Memory fix landed (Stage 2: N=26 peak
-  RSS 3963→550 MB) and serial DUST is now off the critical path (Stage 3:
-  N=26/8-threads wall 15.2→9.8 s ≈ `main` 9.1 s; peak RSS 550→294 MB,
-  below `main`'s 395 MB). Remaining wall gap is at low N — parallel
-  producers over covered intervals is the next (out-of-plan) lever.
+  Stages 1, 2 & 3 implemented**, plus the **DUST worker pool**
+  (parallel DUST-ahead). Memory fix landed (Stage 2: N=26 peak RSS
+  3963→550 MB); serial DUST moved off the critical path (Stage 3) then
+  parallelised across the independent covered intervals (DUST pool). The
+  branch now **beats `main` on both wall and RSS** at N=8 (4.1 s / 79 MB
+  vs 6.0 s / 142 MB) and N=26 (7.8 s / 291 MB vs 8.9 s / 403 MB), 8
+  threads. Optional follow-up: sub-span DUST jobs if a single giant
+  interval ever dominates the floor.
 - **Plans:**
   - Streaming-columnar produce (current): [cohort_produce_streaming_columnar.md](doc/devel/implementation_plans/cohort_produce_streaming_columnar.md)
+  - DUST worker pool (implemented; parallel DUST-ahead — the measured wall floor after Stage 3): [cohort_dust_worker_pool.md](doc/devel/implementation_plans/cohort_dust_worker_pool.md)
   - Master: [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md)
   - Phase A.2 column-native EM: [cohort_within_chromosome_parallel_phase_a2_em.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_a2_em.md)
   - Phase B prereq (variant-bounded chunks): [cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel_phase_b1_variant_bounded_chunks.md)
@@ -941,6 +945,7 @@ via rayon.
   - Streaming produce Stage 1 — span-addressable columnar PSP reader (2026-05-31): [cohort_produce_streaming_columnar_stage1_2026-05-31.md](ia/reports/implementations/cohort_produce_streaming_columnar_stage1_2026-05-31.md)
   - Streaming produce Stage 2 — streaming fold+compact producer / memory fix (2026-05-31): [cohort_produce_streaming_columnar_stage2_2026-05-31.md](ia/reports/implementations/cohort_produce_streaming_columnar_stage2_2026-05-31.md)
   - Streaming produce Stage 3 — DUST-ahead queue / serial DUST off the critical path (2026-05-31): [cohort_produce_streaming_columnar_stage3_2026-05-31.md](ia/reports/implementations/cohort_produce_streaming_columnar_stage3_2026-05-31.md)
+  - DUST worker pool — parallel DUST-ahead (2026-05-31): [cohort_dust_worker_pool_2026-05-31.md](ia/reports/implementations/cohort_dust_worker_pool_2026-05-31.md)
 - **Code:** [src/var_calling/cohort_block/](src/var_calling/cohort_block/) — `mod.rs`, `columns.rs`, `loader.rs`, `pre_pass.rs`, `partition.rs`, `driver.rs`, `worker.rs`, `test_helpers.rs`, plus `kernels/{mod, unify_alleles, project_scalars, compute_log_likelihoods}.rs`.
 - **Tests:** 88 unit tests in the module (per `cargo test --lib var_calling::cohort_block` at commit `36989d6`); 3 integration tests in [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs) (`var_calling_emits_deterministic_vcf_across_runs`, `var_calling_byte_identical_across_worker_windows_per_chunk`, `var_calling_byte_identical_across_target_variants_per_chunk`).
 - **Latest fixes-applied:** [cohort_block_2026-05-29_applied.md](doc/devel/reports/reviews/cohort_block_2026-05-29_applied.md) — **Wave 1**: all 5 Blockers Applied (B1 / B2 / B3 / B4 / B5-deferred-to-Wave-2 per Q2) + M5 (bundled with B1) + M11 (bench/example unblocker) + M14 (carryover snapshot helper) + M17 (drop trailing `..`) + M18 (delete dead `chain_id_scratch`) + M19 (`debug_assert!` on sorted `masked_intervals`). 1 026/1 026 lib pass (+3); 21/21 cohort_cli integration pass; fmt clean; criterion baseline saved. 47 findings deferred to Waves 2–3 per Q4 ("apply all structural refactors now"). 2 Won't fix per Q1 (Mi8 / Mi13). Out-of-scope edits flagged in §12.

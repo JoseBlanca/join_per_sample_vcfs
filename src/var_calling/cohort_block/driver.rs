@@ -25,13 +25,13 @@
 //! the same per-category counters incremented — that's the
 //! byte-identity contract for Phase A.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use thiserror::Error;
 
@@ -938,19 +938,23 @@ where
 //
 // DUST depends only on the reference sequence + the region, nothing about
 // the PSP data or the fold, and the covered intervals are known up front
-// from the block indices. So a background thread DUSTs the covered
-// intervals in genomic order and feeds the masks to the producer through
-// a bounded queue; the producer slices out the mask for its current block
-// span instead of computing it inline (the ~10 s serial DUST that, after
-// Stage 2, was the producer's largest serial floor).
+// from the block indices. Those intervals are independent (no variant
+// group reaches across the gap between them), so a **worker pool** DUSTs
+// them in parallel and hands the masks to the producer in genomic order;
+// the producer slices out the mask for its current block span instead of
+// computing it inline. sdust over the whole genome is ~10 s of
+// single-threaded work — after Stage 2 the largest serial floor, and the
+// wall floor after the Stage 3 single DUST thread — so parallelising it
+// across the (independent) intervals is the lever.
 // ─────────────────────────────────────────────────────────────────────
 
-/// Number of covered-interval DUST masks the DUST-ahead thread may run in
-/// front of the producer. Bounds the queue — and thus how far ahead the
-/// thread can race and how much mask memory is resident — to a few
-/// intervals; small because each mask is cheap and the producer drains
-/// them one covered interval at a time.
-const DUST_AHEAD_QUEUE_CAP: usize = 4;
+/// Look-ahead the [`DustAheadPool`] grants per worker: the pool may keep
+/// up to `n_workers × this` covered intervals in flight or
+/// completed-but-undelivered ahead of what the producer has consumed. The
+/// back-pressure bound — caps in-flight DUST work and resident masks;
+/// small because masks are cheap and each in-flight worker already bounds
+/// its own reference buffer to ~one sub-span via [`dust_mask_for_interval`].
+const DUST_POOL_LOOKAHEAD_PER_WORKER: usize = 2;
 
 /// Sub-span (bases) the DUST-ahead thread DUSTs at a time within a covered
 /// interval. `sdust_mask_for_span`'s per-position verdict is byte-
@@ -983,6 +987,7 @@ struct DustChromPlan {
 /// entering — a lockstep sanity check); `mask` is the sorted,
 /// non-overlapping low-complexity intervals over it, which the producer
 /// slices per block.
+#[derive(Debug)]
 struct IntervalDustMask {
     chrom_id: u32,
     interval: std::ops::Range<u32>,
@@ -1084,60 +1089,258 @@ fn dust_mask_for_interval(
 /// critical path. Returns the receiver + join handle; the thread exits
 /// when it finishes the plans, hits an error (after queueing it), or the
 /// receiver is dropped (a `send` to a gone receiver errs).
-fn spawn_dust_ahead(
+/// One covered interval queued for the [`DustAheadPool`]: everything a
+/// worker needs to DUST it. The job's index in the pool's job list is its
+/// delivery sequence — the order the producer enters intervals.
+#[derive(Clone)]
+struct IntervalJob {
+    chrom_id: u32,
+    name: String,
+    length: u32,
+    interval: std::ops::Range<u32>,
+}
+
+/// Flatten the per-chromosome plans into one delivery-ordered job list:
+/// chromosome-major, interval-order within a chromosome — exactly the
+/// order the producer enters intervals (`advance_chrom` walks the plans in
+/// order, `interval_idx` 0..n within each). So job index `k` is the k-th
+/// interval the producer enters, which is what lets the pool deliver masks
+/// in lockstep with the producer.
+fn flatten_to_jobs(plans: &[DustChromPlan]) -> Vec<IntervalJob> {
+    let mut jobs = Vec::new();
+    for plan in plans {
+        for interval in &plan.covered {
+            jobs.push(IntervalJob {
+                chrom_id: plan.chrom_id,
+                name: plan.name.clone(),
+                length: plan.length,
+                interval: interval.clone(),
+            });
+        }
+    }
+    jobs
+}
+
+/// The per-interval DUST computation a [`DustAheadPool`] worker runs.
+/// Behind a trait object so the coordinator can be unit-tested with a stub
+/// in place of the real sdust + reference fetch.
+type DustComputeFn =
+    dyn Fn(&IntervalJob) -> Result<IntervalDustMask, ChunkDriverError> + Send + Sync;
+
+/// Mutable coordination state of a [`DustAheadPool`], behind one mutex.
+///
+/// Invariants, held under the lock:
+/// `next_deliver <= next_dispatch <= next_deliver + lookahead`, and `done`
+/// only ever holds keys in `[next_deliver, next_dispatch)`.
+struct DustPoolState {
+    /// Index of the next job a worker will claim.
+    next_dispatch: usize,
+    /// Index of the next job the producer will be handed (in order).
+    next_deliver: usize,
+    /// Completed-but-undelivered results, keyed by job index.
+    done: HashMap<usize, Result<IntervalDustMask, ChunkDriverError>>,
+    /// Set on shutdown so workers and `recv_next` wind down.
+    abort: bool,
+}
+
+/// Shared (cross-thread) part of a [`DustAheadPool`].
+struct DustPoolShared {
+    jobs: Vec<IntervalJob>,
+    /// Max `next_dispatch - next_deliver` — how far the pool may run ahead
+    /// of what the producer has consumed.
+    lookahead: usize,
+    state: Mutex<DustPoolState>,
+    /// Workers wait here when they are `lookahead` jobs ahead of delivery.
+    not_full: Condvar,
+    /// `recv_next` waits here for the next-in-order job to complete.
+    ready: Condvar,
+}
+
+/// A bounded, ordered pool that DUSTs covered intervals in parallel and
+/// hands the masks to the producer in genomic order.
+///
+/// DUST over independent covered intervals is embarrassingly parallel; the
+/// only coordination is (a) re-imposing the producer's genomic order on
+/// out-of-order completions and (b) bounding how far the pool runs ahead.
+/// Workers claim the lowest undispatched job — so they always work on what
+/// the producer needs soonest — compute its mask, and stash it; the
+/// producer pulls masks in order via [`recv_next`](Self::recv_next). A
+/// 1-worker pool reproduces the prior single-thread DUST-ahead.
+struct DustAheadPool {
+    shared: Arc<DustPoolShared>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl DustAheadPool {
+    /// Spawn `n_workers` threads over `jobs`, each running `compute`.
+    /// `lookahead` bounds how many jobs may be dispatched ahead of the
+    /// delivery frontier. `compute` is shared across workers and must open
+    /// its own per-call reference fetcher (no shared mutable state).
+    fn spawn(
+        jobs: Vec<IntervalJob>,
+        lookahead: usize,
+        n_workers: usize,
+        compute: Arc<DustComputeFn>,
+    ) -> Self {
+        let shared = Arc::new(DustPoolShared {
+            jobs,
+            lookahead: lookahead.max(1),
+            state: Mutex::new(DustPoolState {
+                next_dispatch: 0,
+                next_deliver: 0,
+                done: HashMap::new(),
+                abort: false,
+            }),
+            not_full: Condvar::new(),
+            ready: Condvar::new(),
+        });
+        let n_workers = n_workers.max(1);
+        let mut handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let shared = Arc::clone(&shared);
+            let compute = Arc::clone(&compute);
+            handles.push(std::thread::spawn(move || {
+                dust_pool_worker(&shared, &*compute)
+            }));
+        }
+        Self { shared, handles }
+    }
+
+    /// Hand the producer the next interval's mask, in genomic order,
+    /// blocking until that specific interval completes. `None` once every
+    /// interval has been delivered (or on shutdown).
+    fn recv_next(&self) -> Option<Result<IntervalDustMask, ChunkDriverError>> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("DustAheadPool mutex poisoned");
+        loop {
+            let want = state.next_deliver;
+            if let Some(result) = state.done.remove(&want) {
+                state.next_deliver = want + 1;
+                drop(state);
+                // A delivery slot freed: workers may advance one more job.
+                self.shared.not_full.notify_all();
+                return Some(result);
+            }
+            if want >= self.shared.jobs.len() || state.abort {
+                return None;
+            }
+            state = self
+                .shared
+                .ready
+                .wait(state)
+                .expect("DustAheadPool mutex poisoned");
+        }
+    }
+
+    /// Signal shutdown and join every worker. Idempotent. A worker mid-DUST
+    /// finishes its current interval first, so this blocks at most one
+    /// interval's compute.
+    fn shutdown(&mut self) {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("DustAheadPool mutex poisoned");
+            state.abort = true;
+        }
+        self.shared.not_full.notify_all();
+        self.shared.ready.notify_all();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for DustAheadPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// One DUST-pool worker: claim the lowest undispatched job (respecting the
+/// look-ahead bound), compute its mask outside the lock, stash it, and
+/// repeat until the jobs are exhausted or shutdown is signalled.
+fn dust_pool_worker(shared: &DustPoolShared, compute: &DustComputeFn) {
+    loop {
+        // ── Claim a job (or exit). ──
+        let job_idx = {
+            let mut state = shared.state.lock().expect("DustAheadPool mutex poisoned");
+            loop {
+                if state.abort || state.next_dispatch >= shared.jobs.len() {
+                    return;
+                }
+                if state.next_dispatch - state.next_deliver < shared.lookahead {
+                    let idx = state.next_dispatch;
+                    state.next_dispatch = idx + 1;
+                    break idx;
+                }
+                // Too far ahead of delivery: wait for a slot to free.
+                state = shared
+                    .not_full
+                    .wait(state)
+                    .expect("DustAheadPool mutex poisoned");
+            }
+        };
+
+        let result = compute(&shared.jobs[job_idx]);
+
+        // Stash + wake the producer (it may be waiting for this seq).
+        shared
+            .state
+            .lock()
+            .expect("DustAheadPool mutex poisoned")
+            .done
+            .insert(job_idx, result);
+        shared.ready.notify_all();
+    }
+}
+
+/// Build the production DUST-ahead pool over `plans`: one job per covered
+/// interval, a worker per available thread (capped at the job count), each
+/// opening its own reference fetcher and running the same
+/// [`dust_mask_for_interval`] the single-thread version used. Off the
+/// producer's critical path; masks are byte-identical regardless of how
+/// many workers race to compute them.
+fn spawn_dust_pool(
     fasta_path: &Path,
     plans: &[DustChromPlan],
     window: u32,
     threshold: u32,
-) -> (
-    mpsc::Receiver<Result<IntervalDustMask, ChunkDriverError>>,
-    JoinHandle<()>,
-) {
-    let (tx, rx) = mpsc::sync_channel(DUST_AHEAD_QUEUE_CAP);
+) -> DustAheadPool {
+    let jobs = flatten_to_jobs(plans);
+    let n_workers = rayon::current_num_threads().clamp(1, jobs.len().max(1));
+    let lookahead = (n_workers * DUST_POOL_LOOKAHEAD_PER_WORKER).max(1);
     let fasta_path = fasta_path.to_path_buf();
-    let plans = plans.to_vec();
-    let handle = std::thread::spawn(move || {
-        for plan in &plans {
-            let mut fetcher = match ManualEvictChromRefFetcher::for_contig(&fasta_path, &plan.name)
-            {
-                Ok(fetcher) => fetcher,
-                Err(source) => {
-                    let _ = tx.send(Err(ChunkDriverError::OpenRefFetcher {
-                        contig: plan.name.clone(),
-                        source,
-                    }));
-                    return;
-                }
-            };
-            for interval in &plan.covered {
-                let msg = match dust_mask_for_interval(
-                    &mut fetcher,
-                    interval,
-                    plan.length,
-                    window,
-                    threshold,
-                    DUST_AHEAD_SUBSPAN,
-                ) {
-                    Ok(mask) => Ok(IntervalDustMask {
-                        chrom_id: plan.chrom_id,
-                        interval: interval.clone(),
-                        mask,
-                    }),
-                    Err(source) => Err(ChunkDriverError::DustMaskIo {
-                        contig: plan.name.clone(),
-                        source,
-                    }),
-                };
-                let queued_fatal = msg.is_err();
-                // Receiver gone (producer stopped) or we just queued a
-                // fatal error: nothing more to produce.
-                if tx.send(msg).is_err() || queued_fatal {
-                    return;
-                }
-            }
-        }
-    });
-    (rx, handle)
+    let compute: Arc<DustComputeFn> =
+        Arc::new(move |job: &IntervalJob| {
+            let mut fetcher = ManualEvictChromRefFetcher::for_contig(&fasta_path, &job.name)
+                .map_err(|source| ChunkDriverError::OpenRefFetcher {
+                    contig: job.name.clone(),
+                    source,
+                })?;
+            let mask = dust_mask_for_interval(
+                &mut fetcher,
+                &job.interval,
+                job.length,
+                window,
+                threshold,
+                DUST_AHEAD_SUBSPAN,
+            )
+            .map_err(|source| ChunkDriverError::DustMaskIo {
+                contig: job.name.clone(),
+                source,
+            })?;
+            Ok(IntervalDustMask {
+                chrom_id: job.chrom_id,
+                interval: job.interval.clone(),
+                mask,
+            })
+        });
+    DustAheadPool::spawn(jobs, lookahead, n_workers, compute)
 }
 
 /// Slice the precomputed interval mask to the block span
@@ -1282,19 +1485,18 @@ struct BlockIterator<'a, W: Read + Seek + Send> {
     /// `cur_interval_mask` fed to `partition_window`.
     mask: Vec<std::ops::Range<u32>>,
 
-    // ── Stage 3 DUST-ahead. ──
+    // ── DUST-ahead. ──
     /// Per-chromosome plans (covered intervals) built once at construction
     /// and walked by [`advance_chrom`](Self::advance_chrom); the same list
-    /// the DUST-ahead thread iterates, keeping the two in lockstep.
+    /// the DUST-ahead pool's jobs are flattened from, keeping the producer
+    /// and the pool in lockstep on the interval sequence.
     chrom_plans: Vec<DustChromPlan>,
     next_plan_idx: usize,
-    /// Bounded queue of precomputed covered-interval DUST masks from the
-    /// DUST-ahead thread, drained one per interval entered. `None` when the
-    /// complexity filter is disabled (no thread spawned).
-    dust_rx: Option<mpsc::Receiver<Result<IntervalDustMask, ChunkDriverError>>>,
-    /// Join handle for the DUST-ahead thread; joined on drop (after the
-    /// receiver is released so the thread's pending send unblocks).
-    dust_handle: Option<JoinHandle<()>>,
+    /// Worker pool DUSTing the covered intervals in parallel, delivering
+    /// masks in genomic order one per interval entered. `None` when the
+    /// complexity filter is disabled (no pool spawned). Joins its workers
+    /// when dropped.
+    dust_pool: Option<DustAheadPool>,
     /// The current covered interval's DUST mask (whole interval, coalesced)
     /// and a forward sweep cursor into it advanced as blocks progress.
     cur_interval_mask: Vec<std::ops::Range<u32>>,
@@ -1312,18 +1514,6 @@ struct BlockIterator<'a, W: Read + Seek + Send> {
     chunk_variants_total: u64,
 }
 
-impl<W: Read + Seek + Send> Drop for BlockIterator<'_, W> {
-    fn drop(&mut self) {
-        // Release the receiver first so the DUST-ahead thread's next
-        // `send` fails (it stops promptly even mid-interval), then join
-        // it so no background thread outlives the producer.
-        self.dust_rx = None;
-        if let Some(handle) = self.dust_handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
 impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
     fn new(
         psp_readers: Vec<PspReader<W>>,
@@ -1338,24 +1528,23 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             .collect();
 
         // Plan the covered intervals once (from the in-memory block
-        // indices) so the producer and the DUST-ahead thread agree on the
-        // interval sequence. DUST off the critical path on a background
-        // thread, unless the complexity filter is disabled.
+        // indices) so the producer and the DUST-ahead pool agree on the
+        // interval sequence. DUST off the critical path on a worker pool,
+        // unless the complexity filter is disabled.
         let chrom_plans = build_dust_plans(
             &sources,
             chromosomes,
             params.grouper_cfg.max_variant_group_span,
         );
-        let (dust_rx, dust_handle) = if params.no_complexity_filter {
-            (None, None)
+        let dust_pool = if params.no_complexity_filter {
+            None
         } else {
-            let (rx, handle) = spawn_dust_ahead(
+            Some(spawn_dust_pool(
                 fasta_path,
                 &chrom_plans,
                 params.dust_cfg.window(),
                 params.dust_cfg.threshold(),
-            );
-            (Some(rx), Some(handle))
+            ))
         };
 
         Self {
@@ -1368,8 +1557,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             mask: Vec::new(),
             chrom_plans,
             next_plan_idx: 0,
-            dust_rx,
-            dust_handle,
+            dust_pool,
             cur_interval_mask: Vec::new(),
             mask_sweep: 0,
             free_blocks: Vec::new(),
@@ -1440,20 +1628,20 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         }
         self.streaming.reset_interval();
 
-        // Take this interval's DUST mask from the DUST-ahead thread. The
-        // thread produces one mask per covered interval in the same
-        // genomic order the producer enters them, so this `recv` is the
-        // mask for exactly this interval (asserted below).
-        if let Some(rx) = self.dust_rx.as_ref() {
-            match rx.recv() {
-                Ok(Ok(interval_mask)) => {
+        // Take this interval's DUST mask from the DUST-ahead pool. The pool
+        // delivers one mask per covered interval in the same genomic order
+        // the producer enters them, so this is the mask for exactly this
+        // interval (asserted below).
+        if let Some(pool) = self.dust_pool.as_ref() {
+            match pool.recv_next() {
+                Some(Ok(interval_mask)) => {
                     debug_assert_eq!(interval_mask.chrom_id, chrom_id);
                     debug_assert_eq!(interval_mask.interval, interval);
                     self.cur_interval_mask = interval_mask.mask;
                     self.mask_sweep = 0;
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(ChunkDriverError::DustAheadGone { chrom_id }),
+                Some(Err(e)) => return Err(e),
+                None => return Err(ChunkDriverError::DustAheadGone { chrom_id }),
             }
         }
 
@@ -1838,6 +2026,154 @@ mod tests {
             assert_eq!(chunked, whole, "subspan={subspan}");
         }
         drop(dir);
+    }
+
+    // ── Stage 4: DustAheadPool coordinator ───────────────────────────
+    //
+    // These test the bounded-ordered coordinator with a *stub* compute
+    // closure (no FASTA / no sdust): ordered delivery despite out-of-order
+    // completion, look-ahead back-pressure, in-order error propagation,
+    // parallelism-invariance, and clean shutdown.
+
+    /// One stub job; the interval start doubles as the job's identity, so a
+    /// delivered mask's `interval.start` reveals which job produced it.
+    fn dust_job(idx: u32) -> IntervalJob {
+        IntervalJob {
+            chrom_id: 0,
+            name: format!("c{idx}"),
+            length: 1000,
+            interval: idx..(idx + 1),
+        }
+    }
+
+    fn dust_jobs(n: u32) -> Vec<IntervalJob> {
+        (0..n).map(dust_job).collect()
+    }
+
+    fn ok_dust_mask(job: &IntervalJob) -> IntervalDustMask {
+        IntervalDustMask {
+            chrom_id: job.chrom_id,
+            interval: job.interval.clone(),
+            mask: Vec::new(),
+        }
+    }
+
+    /// Masks are delivered in job (genomic) order even when the workers
+    /// complete them in the exact reverse order — the reordering contract.
+    #[test]
+    fn dust_pool_delivers_in_order_despite_reverse_completion() {
+        let njobs = 6u32;
+        // Gate: job `s` may only finish after job `s+1` has — forces
+        // strict reverse completion. `done[s]` set when job `s` finishes.
+        let gate: Arc<(Mutex<Vec<bool>>, Condvar)> =
+            Arc::new((Mutex::new(vec![false; njobs as usize + 1]), Condvar::new()));
+        let gate_c = Arc::clone(&gate);
+        let compute: Arc<DustComputeFn> = Arc::new(move |job: &IntervalJob| {
+            let s = job.interval.start as usize;
+            let (lock, cv) = &*gate_c;
+            let mut done = lock.lock().unwrap();
+            while s + 1 < njobs as usize && !done[s + 1] {
+                done = cv.wait(done).unwrap();
+            }
+            done[s] = true;
+            cv.notify_all();
+            Ok(ok_dust_mask(job))
+        });
+        // n_workers = njobs and lookahead = njobs so all jobs run at once.
+        let pool = DustAheadPool::spawn(dust_jobs(njobs), njobs as usize, njobs as usize, compute);
+        for expected in 0..njobs {
+            let mask = pool.recv_next().expect("delivered").expect("ok");
+            assert_eq!(mask.interval.start, expected, "delivered out of order");
+        }
+        assert!(pool.recv_next().is_none());
+    }
+
+    /// Without the producer consuming, the pool dispatches at most
+    /// `lookahead` jobs; each consumed mask frees exactly one slot.
+    #[test]
+    fn dust_pool_respects_lookahead_backpressure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_c = Arc::clone(&started);
+        let compute: Arc<DustComputeFn> = Arc::new(move |job: &IntervalJob| {
+            started_c.fetch_add(1, Ordering::SeqCst);
+            Ok(ok_dust_mask(job))
+        });
+        let lookahead = 3usize;
+        let pool = DustAheadPool::spawn(dust_jobs(20), lookahead, 4, compute);
+
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            lookahead,
+            "pool dispatched beyond the look-ahead before any delivery",
+        );
+
+        let _ = pool.recv_next().expect("first").expect("ok");
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            lookahead + 1,
+            "consuming one mask should free exactly one look-ahead slot",
+        );
+    }
+
+    /// A compute error surfaces at its own seq, in order, without
+    /// disturbing the masks before or after it.
+    #[test]
+    fn dust_pool_surfaces_compute_error_in_order() {
+        let compute: Arc<DustComputeFn> = Arc::new(|job: &IntervalJob| {
+            if job.interval.start == 2 {
+                Err(ChunkDriverError::DustMaskIo {
+                    contig: "boom".into(),
+                    source: io::Error::other("boom"),
+                })
+            } else {
+                Ok(ok_dust_mask(job))
+            }
+        });
+        let pool = DustAheadPool::spawn(dust_jobs(5), 8, 4, compute);
+        assert_eq!(pool.recv_next().unwrap().unwrap().interval.start, 0);
+        assert_eq!(pool.recv_next().unwrap().unwrap().interval.start, 1);
+        assert!(matches!(
+            pool.recv_next().unwrap().unwrap_err(),
+            ChunkDriverError::DustMaskIo { .. }
+        ));
+        assert_eq!(pool.recv_next().unwrap().unwrap().interval.start, 3);
+        assert_eq!(pool.recv_next().unwrap().unwrap().interval.start, 4);
+        assert!(pool.recv_next().is_none());
+    }
+
+    /// The delivered sequence is identical whether one worker or many
+    /// compute the masks — parallelism changes timing, never order.
+    #[test]
+    fn dust_pool_delivery_is_parallelism_invariant() {
+        let run = |n_workers: usize| -> Vec<u32> {
+            let compute: Arc<DustComputeFn> = Arc::new(|job: &IntervalJob| Ok(ok_dust_mask(job)));
+            let pool = DustAheadPool::spawn(dust_jobs(12), 24, n_workers, compute);
+            let mut out = Vec::new();
+            while let Some(r) = pool.recv_next() {
+                out.push(r.unwrap().interval.start);
+            }
+            out
+        };
+        let one = run(1);
+        let many = run(8);
+        assert_eq!(one, (0..12).collect::<Vec<_>>());
+        assert_eq!(one, many, "delivery order differs by worker count");
+    }
+
+    /// Dropping the pool mid-flight (workers still computing) shuts down
+    /// and joins cleanly — the test simply completing proves no hang.
+    #[test]
+    fn dust_pool_shuts_down_cleanly_mid_flight() {
+        let compute: Arc<DustComputeFn> = Arc::new(|job: &IntervalJob| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            Ok(ok_dust_mask(job))
+        });
+        let pool = DustAheadPool::spawn(dust_jobs(50), 8, 4, compute);
+        let _ = pool.recv_next().expect("one").unwrap();
+        drop(pool); // Drop → shutdown → join; reaching the end == clean.
     }
 
     fn ref_allele() -> MergedAllele {
