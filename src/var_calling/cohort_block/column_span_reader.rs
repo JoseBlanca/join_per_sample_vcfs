@@ -26,8 +26,8 @@ use crate::var_calling::cohort_block::columns::SampleColumns;
 /// Per-sample columnar reader bound to one chromosome region. Serves
 /// records in `[region_start, region_end]` (1-based inclusive) in
 /// ascending position order across successive `read_span` calls.
-pub struct ColumnSpanReader<'r, R: Read + Seek> {
-    blocks: BlockColumnReader<'r, R>,
+pub struct ColumnSpanReader<R: Read + Seek> {
+    blocks: BlockColumnReader<R>,
     chrom_id: u32,
     /// Inclusive upper bound of the region; records past it are never
     /// served (the next region / chromosome owns them).
@@ -46,26 +46,36 @@ pub struct ColumnSpanReader<'r, R: Read + Seek> {
     abs_scratch: Vec<u32>,
 }
 
-impl<'r, R: Read + Seek> ColumnSpanReader<'r, R> {
-    /// Open a reader over `[region_start, region_end]` of `chrom_id`.
-    pub fn new(
-        reader: &'r mut PspReader<R>,
-        chrom_id: u32,
-        region_start: u32,
-        region_end: u32,
-    ) -> Self {
-        let mut blocks = reader.column_blocks();
-        blocks.seek_to(chrom_id, region_start, region_end);
+impl<R: Read + Seek> ColumnSpanReader<R> {
+    /// Open a reader over `[region_start, region_end]` of `chrom_id`,
+    /// taking ownership of `reader`.
+    pub fn new(reader: PspReader<R>, chrom_id: u32, region_start: u32, region_end: u32) -> Self {
+        let mut this = Self::detached(reader);
+        this.reset(chrom_id, region_start, region_end);
+        this
+    }
+
+    /// Wrap `reader` without positioning it anywhere — `peek_next_span`
+    /// is `None` and `read_span` serves nothing until [`reset`](Self::reset)
+    /// names a region. The cohort producer builds one per sample up
+    /// front and `reset`s it at every covered interval (reusing the
+    /// decode buffers across the whole run).
+    pub fn detached(reader: PspReader<R>) -> Self {
         Self {
-            blocks,
-            chrom_id,
-            region_end,
-            floor: region_start,
+            blocks: reader.into_column_blocks(),
+            chrom_id: 0,
+            region_end: 0,
+            floor: 0,
             next_record: 0,
             next_allele: 0,
             next_pos: None,
             abs_scratch: Vec::new(),
         }
+    }
+
+    /// Recover the owned [`PspReader`].
+    pub fn into_reader(self) -> PspReader<R> {
+        self.blocks.into_reader()
     }
 
     /// Re-point the reader at a new region, reusing the decode buffers.
@@ -198,6 +208,18 @@ impl<'r, R: Read + Seek> ColumnSpanReader<'r, R> {
     }
 }
 
+impl<R: Read + Seek> crate::var_calling::cohort_block::loader::SpanColumnSource
+    for ColumnSpanReader<R>
+{
+    fn peek_next_span(&self) -> Option<u32> {
+        ColumnSpanReader::peek_next_span(self)
+    }
+
+    fn read_span(&mut self, end: u32, out: &mut SampleColumns) -> Result<(), PspReadError> {
+        ColumnSpanReader::read_span(self, end, out)
+    }
+}
+
 /// Advance a delta-encoded position, mirroring the row reader's
 /// overflow contract: a `delta` that does not fit `u32` is a corrupt /
 /// truncated column, surfaced as the same typed error
@@ -291,9 +313,9 @@ mod tests {
         end: u32,
         split_points: &[u32],
     ) -> SampleColumns {
-        let mut reader = PspReader::new(Cursor::new(bytes.to_vec())).expect("reader opens");
+        let reader = PspReader::new(Cursor::new(bytes.to_vec())).expect("reader opens");
         let mut sc = SampleColumns::empty();
-        let mut span = ColumnSpanReader::new(&mut reader, chrom, start, end);
+        let mut span = ColumnSpanReader::new(reader, chrom, start, end);
         for &sp in split_points {
             span.read_span(sp, &mut sc).expect("read_span");
         }
@@ -357,8 +379,8 @@ mod tests {
     fn peek_reports_servable_ends_and_terminates() {
         let recs = fixture_records();
         let bytes = psp_bytes(&recs, 512);
-        let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
-        let mut span = ColumnSpanReader::new(&mut reader, 0, 1, 1_000_000);
+        let reader = PspReader::new(Cursor::new(bytes)).unwrap();
+        let mut span = ColumnSpanReader::new(reader, 0, 1, 1_000_000);
         let mut sc = SampleColumns::empty();
         let mut peeks = Vec::new();
         // Drive by consensus-of-one: always ask for exactly the peeked
@@ -395,8 +417,8 @@ mod tests {
         let bytes_a = psp_bytes(&recs, 256); // smaller blocks
         let bytes_b = psp_bytes(&recs, 1024); // larger blocks
 
-        let mut reader_a = PspReader::new(Cursor::new(bytes_a.clone())).unwrap();
-        let mut reader_b = PspReader::new(Cursor::new(bytes_b.clone())).unwrap();
+        let reader_a = PspReader::new(Cursor::new(bytes_a.clone())).unwrap();
+        let reader_b = PspReader::new(Cursor::new(bytes_b.clone())).unwrap();
         // Confirm the boundaries really differ.
         assert_ne!(
             reader_a.block_index().len(),
@@ -404,8 +426,8 @@ mod tests {
             "fixture should be misaligned across the two samples"
         );
 
-        let mut span_a = ColumnSpanReader::new(&mut reader_a, 0, 1, 1_000_000);
-        let mut span_b = ColumnSpanReader::new(&mut reader_b, 0, 1, 1_000_000);
+        let mut span_a = ColumnSpanReader::new(reader_a, 0, 1, 1_000_000);
+        let mut span_b = ColumnSpanReader::new(reader_b, 0, 1, 1_000_000);
         let mut sc_a = SampleColumns::empty();
         let mut sc_b = SampleColumns::empty();
 

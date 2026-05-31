@@ -324,7 +324,11 @@ impl<R: Read + Seek> PspReader<R> {
     /// hands the consumer the block's columns to copy in bulk. The
     /// cohort loader uses it to fill `SampleColumns` without the
     /// columnar→row→columnar round-trip.
-    pub fn column_blocks(&mut self) -> BlockColumnReader<'_, R> {
+    ///
+    /// Consumes the reader (the columnar cursor owns it) so the caller
+    /// can hold one per sample in a `Vec`; recover it with
+    /// [`BlockColumnReader::into_reader`].
+    pub fn into_column_blocks(self) -> BlockColumnReader<R> {
         BlockColumnReader::new(self)
     }
 
@@ -888,8 +892,13 @@ pub struct BlockColumns<'a> {
 /// whether a block is worth decoding before paying for it.
 ///
 /// [`peek_block`]: Self::peek_block
-pub struct BlockColumnReader<'r, R: Read + Seek> {
-    reader: &'r mut PspReader<R>,
+///
+/// Owns its [`PspReader`] (rather than borrowing it) so a cohort
+/// producer can hold one per sample in a `Vec` without a
+/// self-referential borrow. Recover the reader with
+/// [`into_reader`](Self::into_reader) if needed.
+pub struct BlockColumnReader<R: Read + Seek> {
+    reader: PspReader<R>,
     cur_block_idx: usize,
     cur_block: Option<DecodedBlock>,
     decompressor: zstd::bulk::Decompressor<'static>,
@@ -902,8 +911,8 @@ pub struct BlockColumnReader<'r, R: Read + Seek> {
     allele_chain_ids_offsets: Vec<u32>,
 }
 
-impl<'r, R: Read + Seek> BlockColumnReader<'r, R> {
-    fn new(reader: &'r mut PspReader<R>) -> Self {
+impl<R: Read + Seek> BlockColumnReader<R> {
+    fn new(reader: PspReader<R>) -> Self {
         let decompressor = new_column_decompressor()
             .expect("zstd::bulk::Decompressor::new is infallible on supported platforms");
         Self {
@@ -919,6 +928,12 @@ impl<'r, R: Read + Seek> BlockColumnReader<'r, R> {
             allele_chain_ids_data: Vec::new(),
             allele_chain_ids_offsets: Vec::new(),
         }
+    }
+
+    /// Recover the owned [`PspReader`] (e.g. to reuse the open file
+    /// handle for something else). Drops the decode buffers.
+    pub fn into_reader(self) -> PspReader<R> {
+        self.reader
     }
 
     /// The block index (sorted by `(chrom_id, first_pos)`).

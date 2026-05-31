@@ -7,7 +7,28 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::pileup_record::PileupRecord;
+use crate::psp::PspReadError;
 use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
+
+/// A per-sample source of pileup columns addressed by genomic span.
+///
+/// The streaming loader pulls one of these per sample. It hides the
+/// `.psp` block layout: the loader peeks the next servable span end,
+/// takes the cohort-wide `min` (the watermark every sample now covers),
+/// and asks each source for the columns up to it. The production
+/// implementor is
+/// [`ColumnSpanReader`](crate::var_calling::cohort_block::column_span_reader::ColumnSpanReader);
+/// tests use an in-memory `Vec<PileupRecord>` source.
+pub trait SpanColumnSource {
+    /// Inclusive end of the next span this source can serve without a
+    /// new decode, or `None` once its region is exhausted. The loader
+    /// takes `min` across sources to pick the watermark.
+    fn peek_next_span(&self) -> Option<u32>;
+
+    /// Append every not-yet-served record with position `< end` (in
+    /// ascending order, within the source's region) to `out`.
+    fn read_span(&mut self, end: u32, out: &mut SampleColumns) -> Result<(), PspReadError>;
+}
 
 /// Reusable scratch buffers for one iteration of the chunk loader.
 ///
@@ -482,6 +503,11 @@ fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
     // but inside the reach of another sample's MNP/DEL/INS. Dropping
     // those positions here would silently under-count REF evidence
     // for homref samples in multi-position groups.
+    // Reset to all-false: the grouping sim only ever *sets* `true`, so
+    // a bare `resize` would leak stale `true`s from a previous call when
+    // the scratch is reused across rounds (the streaming loader). The
+    // batch loader cleared the whole scratch per call and never hit this.
+    is_kept.clear();
     is_kept.resize(n, false);
     let mut group_open = false;
     let mut group_start_idx: usize = 0;
@@ -514,6 +540,197 @@ fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
         for slot in is_kept[group_start_idx..].iter_mut() {
             *slot = true;
         }
+    }
+}
+
+/// Streaming block loader — the memory-bounded replacement for
+/// [`load_chunk_from_iters`].
+///
+/// It reads the cohort forward through [`SpanColumnSource`]s, folding
+/// and **compacting incrementally** so that only the open variant group
+/// at the working frontier is held in memory (the `pending` columns),
+/// not the whole span needed to reach the variant target. Closed groups
+/// are compacted into the output block and their raw records dropped on
+/// every round — the fix for the "grown span × N samples" footprint of
+/// the batch loader.
+///
+/// One block is produced per [`fill_block`](Self::fill_block) call;
+/// `pending` carries the still-open group across calls within a covered
+/// interval, and is reset at the interval boundary
+/// ([`reset_interval`](Self::reset_interval)).
+pub struct StreamingBlockLoader {
+    /// `raw_per_sample` holds the *pending* (not-yet-finalised) records
+    /// — the open group at the frontier plus the current round's read.
+    /// The other fields are the per-round fold scratch.
+    scratch: ChunkLoadScratch,
+    /// Reused split buffer: receives the records that stay pending
+    /// (position `>= cut`) while the closed prefix is compacted out,
+    /// then swapped back into `scratch.raw_per_sample`.
+    next_pending: Vec<SampleColumns>,
+}
+
+impl StreamingBlockLoader {
+    pub fn with_n_samples(n_samples: usize) -> Self {
+        Self {
+            scratch: ChunkLoadScratch::with_n_samples(n_samples),
+            next_pending: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
+        }
+    }
+
+    /// Drop all pending records — called at a covered-interval /
+    /// chromosome boundary, where the gap is wider than any group span
+    /// so nothing carries over.
+    pub fn reset_interval(&mut self) {
+        for sample in &mut self.scratch.raw_per_sample {
+            sample.clear();
+        }
+    }
+
+    /// Produce one block into `out` from `sources`, covering
+    /// `[range_start, …]` within `[…, interval_end]` (1-based
+    /// inclusive). Accumulates closed variant groups until the kept
+    /// (variable) position count reaches `target_variants`, then cuts at
+    /// the start of the still-open group (a clean boundary by
+    /// construction) and reserves that group as `pending` for the next
+    /// call. At the interval's end every group is closed and flushed.
+    ///
+    /// Returns `Ok(false)` when the interval is exhausted with nothing
+    /// left to emit (`out` empty); `Ok(true)` when a block was produced.
+    pub fn fill_block<S: SpanColumnSource + Send>(
+        &mut self,
+        sources: &mut [S],
+        out: &mut MaterialisedChunk,
+        chrom_id: u32,
+        range_start: u32,
+        interval_end: u32,
+        target_variants: u32,
+    ) -> Result<bool, PspReadError> {
+        out.clear();
+        out.chrom_id = chrom_id;
+        let n_samples = sources.len();
+        if out.per_sample.len() != n_samples {
+            out.per_sample.resize_with(n_samples, SampleColumns::empty);
+        }
+        debug_assert_eq!(self.scratch.raw_per_sample.len(), n_samples);
+
+        let mut kept_positions: u32 = 0;
+        loop {
+            let watermark = sources.iter().filter_map(SpanColumnSource::peek_next_span).min();
+            let Some(watermark) = watermark else {
+                // Interval exhausted: every remaining group is closed,
+                // so flush all pending (cut past the interval end).
+                rebuild_position_union_and_is_kept(&mut self.scratch);
+                let cut = interval_end.saturating_add(1);
+                kept_positions += self.compact_closed_prefix(out, cut);
+                out.range = range_start..cut;
+                out.safe_end = cut;
+                let produced = kept_positions > 0
+                    || out.per_sample.iter().any(|s| s.n_records() > 0);
+                return Ok(produced);
+            };
+
+            // Pull every sample up to the shared watermark (parallel —
+            // each fills its own pending column).
+            let read_end = watermark.saturating_add(1);
+            self.scratch
+                .raw_per_sample
+                .par_iter_mut()
+                .zip(sources.par_iter_mut())
+                .try_for_each(|(pending, source)| source.read_span(read_end, pending))?;
+
+            rebuild_position_union_and_is_kept(&mut self.scratch);
+            let cut = find_block_cut(
+                &self.scratch.position_union,
+                &self.scratch.max_ref_span_at,
+                watermark,
+            );
+            kept_positions += self.compact_closed_prefix(out, cut);
+
+            if kept_positions >= target_variants {
+                out.range = range_start..cut;
+                out.safe_end = cut;
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Move records with position `< cut` out of `pending`: kept
+    /// (variable / in-reach) ones append to `out`, the rest are dropped;
+    /// records `>= cut` become the new `pending`. Returns the number of
+    /// distinct kept cohort positions in `[…, cut)` (the block's variant
+    /// tally). Reuses the fold's `position_union` / `is_kept`, valid for
+    /// the current `pending`.
+    fn compact_closed_prefix(&mut self, out: &mut MaterialisedChunk, cut: u32) -> u32 {
+        let position_union = &self.scratch.position_union;
+        let is_kept = &self.scratch.is_kept;
+
+        out.per_sample
+            .par_iter_mut()
+            .zip(self.next_pending.par_iter_mut())
+            .zip(self.scratch.raw_per_sample.par_iter())
+            .for_each(|((dst, stays_pending), pending)| {
+                stays_pending.clear();
+                let mut union_idx = 0_usize;
+                for row_idx in 0..pending.n_records() {
+                    let pos = pending.position_at(row_idx);
+                    if pos >= cut {
+                        stays_pending.push_row_from(pending, row_idx);
+                        continue;
+                    }
+                    while union_idx < position_union.len() && position_union[union_idx] < pos {
+                        union_idx += 1;
+                    }
+                    debug_assert!(
+                        union_idx < position_union.len() && position_union[union_idx] == pos,
+                        "pending position {pos} missing from union — invariant broken",
+                    );
+                    if is_kept[union_idx] {
+                        dst.push_row_from(pending, row_idx);
+                    }
+                }
+            });
+
+        // The split buffer is now the new pending; the old pending
+        // columns are recycled as next round's split buffer.
+        std::mem::swap(&mut self.scratch.raw_per_sample, &mut self.next_pending);
+
+        position_union
+            .iter()
+            .zip(is_kept.iter())
+            .take_while(|(pos, _)| **pos < cut)
+            .filter(|(_, kept)| **kept)
+            .count() as u32
+    }
+}
+
+/// Find the block cut for the streaming loader: the start position of
+/// the still-open variant group (the last group whose reach extends
+/// past `watermark`), or `watermark + 1` when every group is closed.
+///
+/// Replays the same overlapping-reach grouping the fold uses
+/// ([`rebuild_position_union_and_is_kept`]), so the cut always lands on
+/// a clean group boundary — no group straddles it, which is what makes
+/// the block split independent of where it falls.
+fn find_block_cut(position_union: &[u32], max_ref_span_at: &[u32], watermark: u32) -> u32 {
+    let reach = |pos: u32, span: u32| pos.saturating_add(span.max(1)) - 1;
+    let mut sites = position_union.iter().zip(max_ref_span_at.iter());
+    let Some((&first_pos, &first_span)) = sites.next() else {
+        return watermark.saturating_add(1);
+    };
+    let mut group_start_pos = first_pos;
+    let mut group_end_pos = reach(first_pos, first_span);
+    for (&pos, &span) in sites {
+        if pos <= group_end_pos {
+            group_end_pos = group_end_pos.max(reach(pos, span));
+        } else {
+            group_start_pos = pos;
+            group_end_pos = reach(pos, span);
+        }
+    }
+    if group_end_pos > watermark {
+        group_start_pos
+    } else {
+        watermark.saturating_add(1)
     }
 }
 
@@ -621,6 +838,187 @@ mod tests {
         allele, record, ref_obs, ref_plus_alt, ref_plus_unobserved_alt, run_loader,
     };
     use std::convert::Infallible;
+
+    // ──────────────────────────────────────────────────────────────
+    // Streaming loader equivalence — the streaming loader's kept
+    // records (concatenated across all the blocks it emits) must equal
+    // the batch loader's compacted output over the same region, for any
+    // block granularity / variant target / cross-sample misalignment.
+    // ──────────────────────────────────────────────────────────────
+
+    /// In-memory [`SpanColumnSource`] over one sample's pre-sorted
+    /// records, chopped into artificial "blocks" of `block_records` to
+    /// exercise the watermark/round logic (and, with different sizes
+    /// per sample, cross-sample misalignment).
+    struct VecColumnSource {
+        records: Vec<PileupRecord>,
+        cursor: usize,
+        region_end: u32,
+        block_records: usize,
+    }
+
+    impl VecColumnSource {
+        fn new(records: Vec<PileupRecord>, region_start: u32, region_end: u32, block_records: usize) -> Self {
+            let cursor = records
+                .iter()
+                .position(|r| r.pos >= region_start)
+                .unwrap_or(records.len());
+            Self { records, cursor, region_end, block_records: block_records.max(1) }
+        }
+    }
+
+    impl SpanColumnSource for VecColumnSource {
+        fn peek_next_span(&self) -> Option<u32> {
+            let head = self.records.get(self.cursor)?;
+            if head.pos > self.region_end {
+                return None;
+            }
+            let last = (self.cursor + self.block_records - 1).min(self.records.len() - 1);
+            Some(self.records[last].pos.min(self.region_end))
+        }
+
+        fn read_span(&mut self, end: u32, out: &mut SampleColumns) -> Result<(), PspReadError> {
+            let upper = end.min(self.region_end.saturating_add(1));
+            while let Some(r) = self.records.get(self.cursor) {
+                if r.pos >= upper {
+                    break;
+                }
+                out.push_record(r.clone());
+                self.cursor += 1;
+            }
+            Ok(())
+        }
+    }
+
+    /// Batch reference: fold + compact the whole region in one shot.
+    fn batch_kept(per_sample: &[Vec<PileupRecord>], start: u32, end_inclusive: u32) -> Vec<SampleColumns> {
+        let n = per_sample.len();
+        let span = end_inclusive - start + 1;
+        let mut scratch = ChunkLoadScratch::with_n_samples(n);
+        let mut chunk = MaterialisedChunk::with_n_samples(n);
+        let iters: Vec<_> = per_sample
+            .iter()
+            .map(|rs| rs.clone().into_iter().map(Ok::<_, Infallible>))
+            .collect();
+        let mut carry: Vec<SampleColumns> = (0..n).map(|_| SampleColumns::empty()).collect();
+        load_chunk_from_iters(
+            &mut scratch,
+            &mut chunk,
+            ChunkLoadExtent::new(0, start, span, 0, span),
+            iters,
+            &mut carry,
+        )
+        .expect("batch load");
+        chunk.per_sample
+    }
+
+    /// Streaming: emit blocks until the interval is exhausted and
+    /// concatenate each sample's kept records across all blocks.
+    fn streaming_kept(
+        per_sample: &[Vec<PileupRecord>],
+        start: u32,
+        end_inclusive: u32,
+        block_records_per_sample: &[usize],
+        target_variants: u32,
+    ) -> Vec<SampleColumns> {
+        let n = per_sample.len();
+        let mut sources: Vec<VecColumnSource> = per_sample
+            .iter()
+            .zip(block_records_per_sample)
+            .map(|(rs, &bs)| VecColumnSource::new(rs.clone(), start, end_inclusive, bs))
+            .collect();
+        let mut loader = StreamingBlockLoader::with_n_samples(n);
+        let mut out = MaterialisedChunk::with_n_samples(n);
+        let mut combined: Vec<SampleColumns> = (0..n).map(|_| SampleColumns::empty()).collect();
+        let mut range_start = start;
+        let mut blocks = 0;
+        while loader
+            .fill_block(&mut sources, &mut out, 0, range_start, end_inclusive, target_variants)
+            .expect("fill_block")
+        {
+            for s in 0..n {
+                for row in 0..out.per_sample[s].n_records() {
+                    combined[s].push_row_from(&out.per_sample[s], row);
+                }
+            }
+            range_start = out.safe_end;
+            blocks += 1;
+            assert!(blocks < 100_000, "fill_block did not terminate");
+        }
+        combined
+    }
+
+    /// Multi-sample fixture: SNPs, a homref sample at a variant
+    /// position, a 3-bp MNP whose reach keeps in-span homref positions,
+    /// and pure-REF positions that must drop — spread over many
+    /// positions so block chopping splits groups across rounds.
+    fn streaming_fixture() -> Vec<Vec<PileupRecord>> {
+        let mut s0 = Vec::new();
+        let mut s1 = Vec::new();
+        for i in 0..60u32 {
+            let pos = 100 + i * 13;
+            match i % 4 {
+                0 => {
+                    // SNP in both.
+                    s0.push(record(pos, ref_plus_alt(8, 4)));
+                    s1.push(record(pos, ref_plus_alt(9, 3)));
+                }
+                1 => {
+                    // Variant in s0 only; s1 homref at the same position.
+                    s0.push(record(pos, ref_plus_alt(7, 5)));
+                    s1.push(record(pos, vec![ref_obs(20)]));
+                }
+                2 => {
+                    // 3-bp MNP in s0 reaching pos..pos+2; s1 plain REF at
+                    // all three (in-reach homref must be kept).
+                    s0.push(record(
+                        pos,
+                        vec![allele(b"AAA", 6, -1.0, &[]), allele(b"ACA", 5, -1.0, &[])],
+                    ));
+                    s1.push(record(pos, vec![ref_obs(7)]));
+                    s1.push(record(pos + 1, vec![ref_obs(7)]));
+                    s1.push(record(pos + 2, vec![ref_obs(7)]));
+                }
+                _ => {
+                    // Pure REF in both (must drop) + an unobserved ALT.
+                    s0.push(record(pos, ref_plus_unobserved_alt(15)));
+                    s1.push(record(pos, vec![ref_obs(12)]));
+                }
+            }
+        }
+        vec![s0, s1]
+    }
+
+    #[test]
+    fn streaming_matches_batch_aligned() {
+        let f = streaming_fixture();
+        let expected = batch_kept(&f, 1, 1_000_000);
+        for &target in &[1u32, 4, 64, 100_000] {
+            let got = streaming_kept(&f, 1, 1_000_000, &[5, 5], target);
+            assert_eq!(got, expected, "target={target}");
+        }
+    }
+
+    #[test]
+    fn streaming_matches_batch_misaligned_blocks() {
+        let f = streaming_fixture();
+        let expected = batch_kept(&f, 1, 1_000_000);
+        // Different artificial block sizes per sample → staggered
+        // watermarks, the cross-sample case.
+        for sizes in [[1usize, 7], [3, 2], [11, 4]] {
+            let got = streaming_kept(&f, 1, 1_000_000, &sizes, 4);
+            assert_eq!(got, expected, "sizes={sizes:?}");
+        }
+    }
+
+    #[test]
+    fn streaming_matches_batch_clamped_region() {
+        let f = streaming_fixture();
+        let (start, end) = (220u32, 600u32);
+        let expected = batch_kept(&f, start, end);
+        let got = streaming_kept(&f, start, end, &[3, 5], 4);
+        assert_eq!(got, expected);
+    }
 
     /// Helper: run the loader and return the post-load
     /// `ChunkLoadStats` along with the chunk. Mirrors `run_loader`
