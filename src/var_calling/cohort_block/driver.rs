@@ -43,8 +43,12 @@ use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns
 use crate::var_calling::cohort_block::loader::{
     ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
 };
-use crate::var_calling::cohort_block::partition::{PartitionError, partition_window};
-use crate::var_calling::cohort_block::worker::{WorkerSlot, prefetch_window_ref_bytes, run_window};
+use crate::var_calling::cohort_block::partition::{
+    PartitionError, PartitionScratch, WindowPartition, partition_window,
+};
+use crate::var_calling::cohort_block::worker::{
+    WorkerScratch, prefetch_window_ref_bytes, run_window,
+};
 use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
 use crate::var_calling::posterior_engine::{
@@ -394,36 +398,63 @@ pub fn drive_cohort_chunked(
     // B1 + M5: consume inside a closure that borrows `writer` (does not
     // move it), so the outer scope can route to `writer.finish()` on
     // success or `writer.abort()` on error.
+    // Env-gated phase timing (COHORT_PHASE_TIMING=1): accumulate wall
+    // time in block PRODUCTION (next_block: decode+fold+compact+DUST+
+    // partition) vs CONSUMPTION (run_window+emit: group+merge+EM+
+    // posterior). Unambiguous split — no symbol bucketing. Off by
+    // default (one env read + cheap Instant calls only when on).
+    let phase_timing = std::env::var_os("COHORT_PHASE_TIMING").is_some();
+    let mut t_produce = std::time::Duration::ZERO;
+    let mut t_consume = std::time::Duration::ZERO;
+    let mut worker = WorkerScratch::new();
     let driver_result: Result<(), ChunkDriverError> = (|| {
-        while let Some(res) = producer.next_block() {
-            res?;
+        loop {
+            let p0 = std::time::Instant::now();
+            let next = producer.next_block();
+            if phase_timing {
+                t_produce += p0.elapsed();
+            }
+            let block = match next {
+                None => break,
+                Some(res) => res?,
+            };
+            let c0 = std::time::Instant::now();
             // Math on the prepared block: layers 1+2+3 + EM + posterior
             // + QUAL over the block's single partition.
-            run_window(
-                &producer.chunk,
-                &producer.slot.partition,
-                &producer.slot.pre_fetched_ref_bytes,
-                per_group_cfg,
-                posterior_cfg,
-                &mut producer.slot.pipeline_scratch,
-                &mut producer.slot.posterior_records,
-                &mut producer.slot.stats,
-            )
-            .map_err(ChunkDriverError::RunWindow)?;
+            process_block(&block, per_group_cfg, posterior_cfg, &mut worker)
+                .map_err(ChunkDriverError::RunWindow)?;
             // Emit + roll up the block's counters.
-            let slot_stats = std::mem::take(&mut producer.slot.stats);
+            let slot_stats = std::mem::take(&mut worker.stats);
             stats.lh_cap_groups_skipped += slot_stats.lh_cap_groups_skipped;
             stats.lh_cap_alleles_in_skipped += slot_stats.lh_cap_alleles_in_skipped;
             stats.groups_skipped_post_unify_ref_only +=
                 slot_stats.groups_skipped_post_unify_ref_only;
-            for record in producer.slot.posterior_records.drain(..) {
+            for record in worker.posterior_records.drain(..) {
                 emit_or_drop(record, &params, &mut writer, &mut stats)?;
+            }
+            // Return the block's buffers to the producer's free-list.
+            producer.recycle(block);
+            if phase_timing {
+                t_consume += c0.elapsed();
             }
         }
         Ok(())
     })();
     stats.chunks_loaded += producer.chunks_loaded;
     stats.chunk_variants_total += producer.chunk_variants_total;
+    if phase_timing {
+        let total = t_produce + t_consume;
+        eprintln!(
+            "COHORT_PHASE_TIMING: produce={:.3}s consume={:.3}s total={:.3}s \
+             produce={:.1}% consume={:.1}% (blocks={})",
+            t_produce.as_secs_f64(),
+            t_consume.as_secs_f64(),
+            total.as_secs_f64(),
+            100.0 * t_produce.as_secs_f64() / total.as_secs_f64().max(1e-9),
+            100.0 * t_consume.as_secs_f64() / total.as_secs_f64().max(1e-9),
+            stats.chunks_loaded,
+        );
+    }
 
     match driver_result {
         Ok(()) => {
@@ -650,6 +681,66 @@ where
     merge_block_ranges(ranges, max_group_span)
 }
 
+/// A fully-prepared, **owned** block: the materialised columns, their
+/// variant-group partition, and the per-group pre-fetched REF bytes —
+/// exactly the inputs [`process_block`] needs, and nothing the producer
+/// keeps. Owning the payload (rather than borrowing the iterator's
+/// reused scratch) is what lets blocks be handed to parallel workers.
+///
+/// `seq_idx` records the genomic production order so the collector can
+/// re-impose it after workers finish out of order. Buffers are recycled
+/// through the producer's free-list ([`BlockIterator::recycle`]) so the
+/// per-block allocations (columns, CSR arrays, REF byte buffers) are
+/// reused, not re-grown, across the run — the scratch-reuse discipline,
+/// preserved through the ownership change.
+pub struct ReadyBlock {
+    /// Monotonic production index (0, 1, 2, …) assigned by the producer
+    /// in genomic order. The collector emits records in `seq_idx` order.
+    seq_idx: u64,
+    /// The loaded columns for `[range.start, safe_end)`.
+    chunk: MaterialisedChunk,
+    /// The block's single variant-group partition.
+    partition: WindowPartition,
+    /// One REF byte buffer per group in `partition`
+    /// (`len() == partition.n_groups()`).
+    pre_fetched_ref_bytes: Vec<Vec<u8>>,
+}
+
+impl ReadyBlock {
+    /// An empty block pre-sized for `n_samples`; the producer fills it.
+    fn with_n_samples(n_samples: usize) -> Self {
+        Self {
+            seq_idx: 0,
+            chunk: MaterialisedChunk::with_n_samples(n_samples),
+            partition: WindowPartition::empty(),
+            pre_fetched_ref_bytes: Vec::new(),
+        }
+    }
+}
+
+/// Map one prepared block to its final [`PosteriorRecord`]s — the pure
+/// data→math seam. Reads only the block + the (per-worker) `scratch`,
+/// writes the emitted records into `scratch.posterior_records` and the
+/// run counters into `scratch.stats`. No producer state, no shared
+/// mutation: this is the function the parallel workers map over blocks.
+pub fn process_block(
+    block: &ReadyBlock,
+    per_group_cfg: PerGroupMergerConfig,
+    posterior_cfg: &PosteriorEngineConfig,
+    scratch: &mut WorkerScratch,
+) -> Result<(), PosteriorEngineError> {
+    run_window(
+        &block.chunk,
+        &block.partition,
+        &block.pre_fetched_ref_bytes,
+        per_group_cfg,
+        posterior_cfg,
+        &mut scratch.pipeline_scratch,
+        &mut scratch.posterior_records,
+        &mut scratch.stats,
+    )
+}
+
 /// Per-chromosome production cursor owned by [`BlockIterator`]: the
 /// reference fetchers, the covered intervals, and the position cursors
 /// for the chromosome currently being read. Rebuilt on each chromosome
@@ -681,26 +772,34 @@ struct ChromCursor {
 /// met, cuts at a clean group boundary (reserving the tail), then
 /// DUST-masks + partitions + prefetches REF bytes for the block.
 ///
-/// This is the *data-shaping* half. The consumer pulls a prepared block
-/// (`self.chunk` / `self.mask` / `self.slot.{partition, pre_fetched_ref_bytes}`),
-/// runs the per-group math, and emits — never seeing how the block was
-/// made. Genomic windows are gone: one block = one unit of work.
+/// This is the *data-shaping* half. `next_block` yields an owned
+/// [`ReadyBlock`]; the consumer runs the per-group math via
+/// [`process_block`] and emits — never seeing how the block was made.
+/// Genomic windows are gone: one block = one unit of work. Spent blocks
+/// are returned via [`recycle`](Self::recycle) so their buffers feed the
+/// next production without reallocating.
 struct BlockIterator<'a, W: Read + Seek + Send> {
     chromosomes: &'a [ParsedChromosome],
     fasta_path: &'a Path,
     params: &'a ChunkDriverParams,
     psp_readers: Vec<PspReader<W>>,
+    n_samples: usize,
 
-    // Reusable scratch + the reserve (carryover from the prior block).
+    // Reusable producer scratch + the reserve (carryover from the prior
+    // block). The partition scratch lives here (data-shaping), while the
+    // partition *output* travels inside the owned block.
     chunk_scratch: ChunkLoadScratch,
     fix_scratch: BoundaryFinalisationScratch,
+    partition_scratch: PartitionScratch,
+    mask: Vec<std::ops::Range<u32>>,
     carryover: Vec<SampleColumns>,
     carryover_snapshot: Vec<SampleColumns>,
 
-    // The prepared block (filled by `next_block`, read by the consumer).
-    chunk: MaterialisedChunk,
-    mask: Vec<std::ops::Range<u32>>,
-    slot: WorkerSlot,
+    // Free-list of recycled block buffers (columns + CSR arrays + REF
+    // byte buffers). `next_block` pops one (or makes a fresh one) to
+    // fill; the consumer pushes spent blocks back via `recycle`.
+    free_blocks: Vec<ReadyBlock>,
+    next_seq_idx: u64,
 
     // Production cursor + counters.
     cur: Option<ChromCursor>,
@@ -722,18 +821,26 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             fasta_path,
             params,
             psp_readers,
+            n_samples,
             chunk_scratch: ChunkLoadScratch::with_n_samples(n_samples),
             fix_scratch: BoundaryFinalisationScratch::new(),
+            partition_scratch: PartitionScratch::with_n_samples(n_samples),
+            mask: Vec::new(),
             carryover: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
             carryover_snapshot: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
-            chunk: MaterialisedChunk::with_n_samples(n_samples),
-            mask: Vec::new(),
-            slot: WorkerSlot::new(n_samples),
+            free_blocks: Vec::new(),
+            next_seq_idx: 0,
             cur: None,
             next_chrom_idx: 0,
             chunks_loaded: 0,
             chunk_variants_total: 0,
         }
+    }
+
+    /// Return a spent block's buffers to the free-list so the next
+    /// production reuses them instead of allocating.
+    fn recycle(&mut self, block: ReadyBlock) {
+        self.free_blocks.push(block);
     }
 
     /// Advance to the next chromosome that carries data, building its
@@ -805,10 +912,11 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         Ok(false)
     }
 
-    /// Yield the next prepared block, or `None` when the genome is
-    /// exhausted. On `Some(Ok(()))` the block is in `self.chunk` /
-    /// `self.mask` / `self.slot.{partition, pre_fetched_ref_bytes}`.
-    fn next_block(&mut self) -> Option<Result<(), ChunkDriverError>> {
+    /// Yield the next prepared block (owned), or `None` when the genome
+    /// is exhausted. The block carries its own columns / partition /
+    /// pre-fetched REF bytes and a monotonic `seq_idx` for ordered emit;
+    /// recycle it with [`recycle`](Self::recycle) once consumed.
+    fn next_block(&mut self) -> Option<Result<ReadyBlock, ChunkDriverError>> {
         loop {
             let need_advance = match &self.cur {
                 None => true,
@@ -844,25 +952,46 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
                     }
                 }
             }
-            return Some(self.produce_block());
+            // Acquire a recycled buffer (or a fresh one) and fill it.
+            let mut block = self
+                .free_blocks
+                .pop()
+                .unwrap_or_else(|| ReadyBlock::with_n_samples(self.n_samples));
+            return match self.produce_block(&mut block) {
+                Ok(()) => {
+                    block.seq_idx = self.next_seq_idx;
+                    self.next_seq_idx += 1;
+                    Some(Ok(block))
+                }
+                Err(e) => {
+                    self.free_blocks.push(block);
+                    Some(Err(e))
+                }
+            };
         }
     }
 
     /// Load + accumulate-to-target + safe-cut (reserve the tail) + DUST
-    /// + partition + prefetch one block from the current interval, then
-    /// advance the cursor. Mirrors the old `load_chunk_with_safe_boundary_retry`
-    /// + prepare step, now owned by the iterator.
-    fn produce_block(&mut self) -> Result<(), ChunkDriverError> {
+    /// + partition + prefetch one block from the current interval into
+    /// `block`, then advance the cursor. Mirrors the old
+    /// `load_chunk_with_safe_boundary_retry` + prepare step, now writing
+    /// into the owned [`ReadyBlock`] rather than the iterator's scratch.
+    fn produce_block(&mut self, block: &mut ReadyBlock) -> Result<(), ChunkDriverError> {
+        let ReadyBlock {
+            chunk,
+            partition,
+            pre_fetched_ref_bytes,
+            ..
+        } = block;
         let Self {
             params,
             psp_readers,
             chunk_scratch,
             fix_scratch,
+            partition_scratch,
+            mask,
             carryover,
             carryover_snapshot,
-            chunk,
-            mask,
-            slot,
             cur,
             chunks_loaded,
             chunk_variants_total,
@@ -979,16 +1108,12 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             &window,
             mask,
             max_group_span,
-            &mut slot.partition_scratch,
-            &mut slot.partition,
+            partition_scratch,
+            partition,
         )
         .map_err(|source| ChunkDriverError::Partition { chrom_id, source })?;
-        prefetch_window_ref_bytes(
-            &slot.partition,
-            &cur.ref_fetcher,
-            &mut slot.pre_fetched_ref_bytes,
-        )
-        .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
+        prefetch_window_ref_bytes(partition, &cur.ref_fetcher, pre_fetched_ref_bytes)
+            .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
         Ok(())
     }
 }

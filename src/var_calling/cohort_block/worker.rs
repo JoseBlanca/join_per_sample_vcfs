@@ -32,7 +32,7 @@ use crate::var_calling::cohort_block::kernels::project_scalars::{
 use crate::var_calling::cohort_block::kernels::unify_alleles::{
     UnifiedAllelesColumns, UnifyAllelesError, UnifyAllelesScratch, unify_alleles_columnar,
 };
-use crate::var_calling::cohort_block::partition::{PartitionScratch, WindowPartition};
+use crate::var_calling::cohort_block::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
     CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
     PerGroupMergerError, SharedRefFetcher,
@@ -159,54 +159,48 @@ impl ColumnarPipelineScratch {
     }
 }
 
-/// Per-block worker scratch: everything needed to partition the block,
-/// pre-fetch its REF bytes, run the column-native math, and accumulate
-/// the emitted [`PosteriorRecord`]s. The [`BlockIterator`] owns one and
-/// reuses it across blocks.
+/// Per-**worker** math scratch: the column-native pipeline buffers, the
+/// emitted-record accumulator, and the per-block run statistics. One
+/// per parallel worker (so each worker mutates only its own scratch);
+/// reused across every block that worker processes.
 ///
-/// [`BlockIterator`]: crate::var_calling::cohort_block::driver
-pub struct WorkerSlot {
-    /// Reusable per-window partition scratch (sample-stride buffers).
-    pub partition_scratch: PartitionScratch,
-    /// Reusable per-window partition output (CSR group + position
-    /// arrays; refilled by
-    /// [`partition_window`](super::partition::partition_window)).
-    pub partition: WindowPartition,
-    /// Pre-fetched REF bytes per group in `partition`. Length is
-    /// always `partition.n_groups()` after the driver runs the
-    /// [`prefetch_window_ref_bytes`] sequential pre-pass.
-    pub pre_fetched_ref_bytes: Vec<Vec<u8>>,
-    /// Mi3: column-native pipeline scratch — UnifyAlleles,
-    /// ProjectScalars, LogLikelihoods buffers, the EM `RecordScratch`,
-    /// etc. Named `pipeline_scratch` to mirror the sibling
-    /// `partition_scratch` field; the bare `scratch` name didn't say
-    /// *which* scratch this is when the slot already has another.
+/// This is the *math* half of what used to be `WorkerSlot`. The
+/// *data-shaping* half (the partition + its scratch + the pre-fetched
+/// REF bytes) moved onto the producer / into the owned
+/// [`ReadyBlock`](crate::var_calling::cohort_block::driver), so a block
+/// is a self-contained unit of work and the worker holds no producer
+/// state. That split is what lets [`process_block`] run on many workers
+/// in parallel.
+///
+/// [`process_block`]: crate::var_calling::cohort_block::driver::process_block
+pub struct WorkerScratch {
+    /// Column-native pipeline scratch — UnifyAlleles, ProjectScalars,
+    /// LogLikelihoods buffers, the EM `RecordScratch`, etc.
     pub pipeline_scratch: ColumnarPipelineScratch,
-    /// Mi3: per-window emitted records, drained sequentially in
-    /// window order after the driver's per-window math finishes. Named
-    /// `posterior_records` so the slot drain `for r in slot.posterior_records.drain(..)`
-    /// reads as what it is; the previous `output_buf` was a bare
-    /// generic name.
+    /// Per-block emitted records, drained by the collector after the
+    /// math finishes (in genomic order for the parallel path).
     pub posterior_records: Vec<PosteriorRecord>,
-    /// M15: per-window run statistics. The driver `std::mem::take`s
-    /// this after each `run_window` call and rolls the counts into
-    /// `ChunkDriverStats`. Sibling to `pipeline_scratch` (which holds
-    /// per-group buffers); the two structs have different lifetimes
-    /// (counters are per-window, scratch is per-group), so they live
-    /// side by side rather than bundled.
+    /// Per-block run statistics. The collector `std::mem::take`s this
+    /// after each [`process_block`] and rolls the counts into
+    /// [`ChunkDriverStats`](super::driver::ChunkDriverStats).
+    ///
+    /// [`process_block`]: crate::var_calling::cohort_block::driver::process_block
     pub stats: WindowRunStats,
 }
 
-impl WorkerSlot {
-    pub fn new(n_samples: usize) -> Self {
+impl WorkerScratch {
+    pub fn new() -> Self {
         Self {
-            partition_scratch: PartitionScratch::with_n_samples(n_samples),
-            partition: WindowPartition::empty(),
-            pre_fetched_ref_bytes: Vec::new(),
             pipeline_scratch: ColumnarPipelineScratch::empty(),
             posterior_records: Vec::new(),
             stats: WindowRunStats::default(),
         }
+    }
+}
+
+impl Default for WorkerScratch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

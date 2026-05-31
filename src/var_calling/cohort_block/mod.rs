@@ -42,4 +42,4 @@ pub use loader::{
     ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, ChunkLoadStats, load_chunk_from_iters,
 };
 pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
-pub use worker::{WindowRunStats, into_shared_ref_fetcher, run_window};
+pub use worker::{WindowRunStats, WorkerScratch, into_shared_ref_fetcher, run_window};
