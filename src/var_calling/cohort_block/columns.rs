@@ -363,6 +363,93 @@ impl SampleColumns {
             .push(u32_from_usize(self.per_allele_fixed.len()));
     }
 
+    /// Append records `[record_lo, record_hi)` of a decoded PSP block
+    /// straight from its columns — the same shape [`push_record`] would
+    /// build, but with no intermediate row-shape `PileupRecord` (and no
+    /// per-allele `Vec`). This is the columnar→columnar fast path the
+    /// span reader uses in place of the `columnar → row → columnar`
+    /// round-trip.
+    ///
+    /// `allele_lo` is the cumulative allele offset of `record_lo` in
+    /// `cols` (`Σ n_alleles[0..record_lo]`). `abs_positions` carries the
+    /// already-decoded absolute 1-based positions of the appended
+    /// records — the caller decodes them while it windows the block, so
+    /// the delta-varint overflow check lives there rather than here;
+    /// `abs_positions.len()` must equal `record_hi - record_lo`.
+    ///
+    /// The fixed-width per-allele columns are bulk-copied one slice each
+    /// (they align 1:1 with the block's columns); the two ragged columns
+    /// are pushed per allele, slicing straight from the block's CSR
+    /// data; positions and the per-record CSR offsets are bulk / running
+    /// appends. No allocation beyond the destination columns' growth.
+    pub fn append_block_window(
+        &mut self,
+        cols: &crate::psp::BlockColumns<'_>,
+        record_lo: usize,
+        record_hi: usize,
+        allele_lo: usize,
+        abs_positions: &[u32],
+    ) {
+        debug_assert_eq!(abs_positions.len(), record_hi - record_lo);
+        if record_lo == record_hi {
+            return;
+        }
+        if let (Some(&prev), Some(&first)) = (self.positions.last(), abs_positions.first()) {
+            debug_assert!(
+                first > prev,
+                "append_block_window: non-monotonic position (previous {prev}, new {first})",
+            );
+        }
+
+        // Cumulative allele count of the appended record range, and the
+        // allele base in *this* column set before the append.
+        let n_alleles_appended: usize = cols.n_alleles[record_lo..record_hi]
+            .iter()
+            .map(|&n| n as usize)
+            .sum();
+        let allele_hi = allele_lo + n_alleles_appended;
+        let base = self.per_allele_fixed.len();
+
+        // Per-record positions — bulk copy of the caller's decode.
+        self.positions.extend_from_slice(abs_positions);
+
+        // Per-allele fixed-width columns — one bulk slice each.
+        let f = &mut self.per_allele_fixed;
+        f.num_obs
+            .extend_from_slice(&cols.allele_obs_count[allele_lo..allele_hi]);
+        f.q_sum
+            .extend_from_slice(&cols.allele_q_sum_log[allele_lo..allele_hi]);
+        f.fwd
+            .extend_from_slice(&cols.allele_fwd_count[allele_lo..allele_hi]);
+        f.placed_left
+            .extend_from_slice(&cols.allele_placed_left_count[allele_lo..allele_hi]);
+        f.placed_start
+            .extend_from_slice(&cols.allele_placed_start_count[allele_lo..allele_hi]);
+        f.mapq_sum
+            .extend_from_slice(&cols.allele_mapq_sum[allele_lo..allele_hi]);
+        f.mapq_sum_sq
+            .extend_from_slice(&cols.allele_mapq_sum_sq[allele_lo..allele_hi]);
+
+        // Ragged per-allele columns — CSR push straight from the block.
+        for j in allele_lo..allele_hi {
+            let seq_s = cols.allele_seq_offsets[j] as usize;
+            let seq_e = cols.allele_seq_offsets[j + 1] as usize;
+            self.per_allele_seq
+                .push(&cols.allele_seq_data[seq_s..seq_e]);
+            let cid_s = cols.allele_chain_ids_offsets[j] as usize;
+            let cid_e = cols.allele_chain_ids_offsets[j + 1] as usize;
+            self.per_allele_chain_ids
+                .push(&cols.allele_chain_ids_data[cid_s..cid_e]);
+        }
+
+        // Per-record CSR offset (cumulative allele end, base-relative).
+        let mut cum = 0usize;
+        for &n in &cols.n_alleles[record_lo..record_hi] {
+            cum += n as usize;
+            self.allele_offsets.push(u32_from_usize(base + cum));
+        }
+    }
+
     /// 1-based position at row `record_idx`.
     pub fn position_at(&self, record_idx: usize) -> u32 {
         self.positions[record_idx]

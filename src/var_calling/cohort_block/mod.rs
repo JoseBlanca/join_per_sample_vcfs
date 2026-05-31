@@ -21,6 +21,7 @@
 //!   windows, split records past `safe_end` into carryover.
 
 pub mod chunk_boundaries;
+pub mod column_span_reader;
 pub mod columns;
 pub mod driver;
 pub mod kernels;
@@ -33,6 +34,7 @@ pub mod worker;
 pub use chunk_boundaries::{
     BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
 };
+pub use column_span_reader::ColumnSpanReader;
 pub use columns::{MaterialisedChunk, SampleColumns};
 pub use driver::{
     ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,

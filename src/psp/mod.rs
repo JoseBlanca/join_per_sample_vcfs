@@ -46,4 +46,4 @@ pub use errors::{
     BlockHeaderInvariantKind, InvalidRecordKind, PspReadError, PspWriteError, ScalarDecodeError,
     TomlSerError, VarintError,
 };
-pub use reader::{PspReader, RecordsIter};
+pub use reader::{BlockColumnReader, BlockColumns, PspReader, RecordsIter};

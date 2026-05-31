@@ -312,6 +312,22 @@ impl<R: Read + Seek> PspReader<R> {
         &self.index
     }
 
+    /// Block-granular **columnar** reader over this file. Decodes
+    /// blocks on demand and exposes each as borrowed [`BlockColumns`]
+    /// — the decoded columns straight from disk, with no row-shape
+    /// [`PileupRecord`] materialised. Record-level windowing and
+    /// accumulation are the caller's job; this only walks + decodes
+    /// blocks and gives access to the block index.
+    ///
+    /// This is the columnar counterpart to [`Self::region_records`]:
+    /// where that yields one allocated `PileupRecord` per record, this
+    /// hands the consumer the block's columns to copy in bulk. The
+    /// cohort loader uses it to fill `SampleColumns` without the
+    /// columnar→row→columnar round-trip.
+    pub fn column_blocks(&mut self) -> BlockColumnReader<'_, R> {
+        BlockColumnReader::new(self)
+    }
+
     /// Trailer in strong-typed form. Mi8: crate-private — the
     /// trailer fields are derived from `block_index()` plus the
     /// file size, and downstream consumers should not need them.
@@ -814,6 +830,187 @@ impl<R: Read + Seek> Iterator for RecordsIter<'_, R> {
                 }
             }
         }
+    }
+}
+
+/// Borrowed columnar view of one decoded block, handed out by
+/// [`BlockColumnReader::columns`]. The slices live in the reader's
+/// reusable decode buffers and stay valid only until the next
+/// [`BlockColumnReader::load_current`] / [`BlockColumnReader::advance`].
+///
+/// **Positions are delta-encoded.** Record `i`'s 1-based reference
+/// position is `first_pos + Σ delta_pos[0..=i]` (with `delta_pos[0] == 0`,
+/// so record 0 sits at `first_pos`). The per-allele fixed-width columns
+/// and the two ragged CSR columns (`allele_seq` / `allele_chain_ids`)
+/// are indexed by the cumulative allele offset `Σ n_alleles[0..i]` plus
+/// the within-record allele index; the ragged columns slice their data
+/// with the matching `*_offsets[j] .. *_offsets[j + 1]`. The `*_offsets`
+/// arrays carry `total_alleles + 1` entries.
+pub struct BlockColumns<'a> {
+    /// Chromosome the block's records belong to.
+    pub chrom_id: u32,
+    /// 1-based position of record 0.
+    pub first_pos: u32,
+    /// Records in the block.
+    pub n_records: u32,
+    /// Per-record position deltas (`delta_pos[0] == 0`).
+    pub delta_pos: &'a [u64],
+    /// Per-record allele counts.
+    pub n_alleles: &'a [u64],
+    /// Per-allele fixed-width columns (aligned with `SampleColumns`'
+    /// `PerAlleleFixed`).
+    pub allele_obs_count: &'a [u32],
+    pub allele_q_sum_log: &'a [f64],
+    pub allele_fwd_count: &'a [u32],
+    pub allele_placed_left_count: &'a [u32],
+    pub allele_placed_start_count: &'a [u32],
+    pub allele_mapq_sum: &'a [u32],
+    pub allele_mapq_sum_sq: &'a [u64],
+    /// Ragged `allele-seq` CSR (`data` indexed by `offsets`).
+    pub allele_seq_data: &'a [u8],
+    pub allele_seq_offsets: &'a [u32],
+    /// Ragged `allele-chain-ids` CSR.
+    pub allele_chain_ids_data: &'a [ChainId],
+    pub allele_chain_ids_offsets: &'a [u32],
+}
+
+/// Block-granular columnar cursor over a [`PspReader`]. Decodes blocks
+/// on demand and exposes each as borrowed [`BlockColumns`] without
+/// materialising rows. Holds a mutable borrow of the source, so it is
+/// **not `Send`** and only one lives at a time per reader — exactly
+/// like [`RecordsIter`].
+///
+/// The decode buffers (zstd context, compressed/decompressed scratch,
+/// the two ragged CSR slabs) mirror `RecordsIter`'s and are reused
+/// across blocks; the heavy lifting is the shared
+/// [`decode_block_payload`] free function. Stepping is explicit so the
+/// caller can decide — from the block index alone, via [`peek_block`] —
+/// whether a block is worth decoding before paying for it.
+///
+/// [`peek_block`]: Self::peek_block
+pub struct BlockColumnReader<'r, R: Read + Seek> {
+    reader: &'r mut PspReader<R>,
+    cur_block_idx: usize,
+    cur_block: Option<DecodedBlock>,
+    decompressor: zstd::bulk::Decompressor<'static>,
+    compressed_scratch: Vec<u8>,
+    decompressed_scratch: Vec<u8>,
+    block_header_buf: Vec<u8>,
+    allele_seq_data: Vec<u8>,
+    allele_seq_offsets: Vec<u32>,
+    allele_chain_ids_data: Vec<ChainId>,
+    allele_chain_ids_offsets: Vec<u32>,
+}
+
+impl<'r, R: Read + Seek> BlockColumnReader<'r, R> {
+    fn new(reader: &'r mut PspReader<R>) -> Self {
+        let decompressor = new_column_decompressor()
+            .expect("zstd::bulk::Decompressor::new is infallible on supported platforms");
+        Self {
+            reader,
+            cur_block_idx: 0,
+            cur_block: None,
+            decompressor,
+            compressed_scratch: Vec::new(),
+            decompressed_scratch: Vec::new(),
+            block_header_buf: Vec::with_capacity(BLOCK_HEADER_INITIAL_CHUNK),
+            allele_seq_data: Vec::new(),
+            allele_seq_offsets: Vec::new(),
+            allele_chain_ids_data: Vec::new(),
+            allele_chain_ids_offsets: Vec::new(),
+        }
+    }
+
+    /// The block index (sorted by `(chrom_id, first_pos)`).
+    pub fn index(&self) -> &[BlockIndexEntry] {
+        &self.reader.index
+    }
+
+    /// Index of the block the cursor points at — the one
+    /// [`load_current`](Self::load_current) decodes and
+    /// [`columns`](Self::columns) then borrows.
+    pub fn cur_block_idx(&self) -> usize {
+        self.cur_block_idx
+    }
+
+    /// Position the cursor at the first block overlapping
+    /// `[start, end]` on `chrom_id` (or past-the-end when none),
+    /// dropping any currently-decoded block.
+    pub fn seek_to(&mut self, chrom_id: u32, start: u32, end: u32) {
+        self.cur_block = None;
+        self.cur_block_idx = find_first_overlapping_block(&self.reader.index, chrom_id, start, end)
+            .unwrap_or(self.reader.index.len());
+    }
+
+    /// The index entry the cursor points at, or `None` past the last
+    /// block. Free — reads the in-memory index, decodes nothing.
+    pub fn peek_block(&self) -> Option<&BlockIndexEntry> {
+        self.reader.index.get(self.cur_block_idx)
+    }
+
+    /// Decode the block at the cursor into the reader's buffers.
+    /// `Ok(false)` when the cursor is past the last block. After
+    /// `Ok(true)`, [`columns`](Self::columns) borrows it.
+    pub fn load_current(&mut self) -> Result<bool, PspReadError> {
+        if self.cur_block_idx >= self.reader.index.len() {
+            self.cur_block = None;
+            return Ok(false);
+        }
+        let entry = self.reader.index[self.cur_block_idx];
+        seek_to_offset(
+            &mut self.reader.source,
+            entry.block_offset,
+            "block start seek",
+        )?;
+        let (block_header, _consumed) =
+            read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
+        let decoded = decode_block_payload(
+            &mut self.reader.source,
+            &block_header,
+            block_byte_budget(&self.reader.index, &self.reader.trailer, self.cur_block_idx),
+            &mut self.decompressor,
+            &mut self.compressed_scratch,
+            &mut self.decompressed_scratch,
+            &mut self.allele_seq_data,
+            &mut self.allele_seq_offsets,
+            &mut self.allele_chain_ids_data,
+            &mut self.allele_chain_ids_offsets,
+        )?;
+        self.cur_block = Some(decoded);
+        Ok(true)
+    }
+
+    /// Advance the cursor to the next block, dropping the current
+    /// decoded one. Pair with [`peek_block`](Self::peek_block) +
+    /// [`load_current`](Self::load_current).
+    pub fn advance(&mut self) {
+        self.cur_block = None;
+        self.cur_block_idx += 1;
+    }
+
+    /// Borrow the currently-decoded block's columns, or `None` when no
+    /// block is loaded (before the first `load_current`, or after an
+    /// `advance` without a reload).
+    pub fn columns(&self) -> Option<BlockColumns<'_>> {
+        let b = self.cur_block.as_ref()?;
+        Some(BlockColumns {
+            chrom_id: b.chrom_id,
+            first_pos: b.first_pos,
+            n_records: b.n_records,
+            delta_pos: &b.delta_pos,
+            n_alleles: &b.n_alleles,
+            allele_obs_count: &b.allele_obs_count,
+            allele_q_sum_log: &b.allele_q_sum_log,
+            allele_fwd_count: &b.allele_fwd_count,
+            allele_placed_left_count: &b.allele_placed_left_count,
+            allele_placed_start_count: &b.allele_placed_start_count,
+            allele_mapq_sum: &b.allele_mapq_sum,
+            allele_mapq_sum_sq: &b.allele_mapq_sum_sq,
+            allele_seq_data: &self.allele_seq_data,
+            allele_seq_offsets: &self.allele_seq_offsets,
+            allele_chain_ids_data: &self.allele_chain_ids_data,
+            allele_chain_ids_offsets: &self.allele_chain_ids_offsets,
+        })
     }
 }
 
