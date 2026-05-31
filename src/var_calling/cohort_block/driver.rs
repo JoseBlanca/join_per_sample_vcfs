@@ -1168,65 +1168,69 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
     /// pre-fetched REF bytes and a monotonic `seq_idx` for ordered emit;
     /// recycle it with [`recycle`](Self::recycle) once consumed.
     fn next_block(&mut self) -> Option<Result<ReadyBlock, ChunkDriverError>> {
-        loop {
-            let need_advance = match &self.cur {
-                None => true,
-                Some(cur) => cur.chunk_range_start >= cur.interval_one_past_end,
-            };
-            if need_advance {
-                // Advance to the next covered interval within the current
-                // chromosome; if exhausted, advance to the next chromosome.
-                let advanced_interval = if let Some(cur) = self.cur.as_mut() {
-                    cur.interval_idx += 1;
-                    if cur.interval_idx < cur.covered.len() {
-                        let iv = &cur.covered[cur.interval_idx];
-                        cur.chunk_range_start = iv.start;
-                        cur.psp_cursor = iv.start;
-                        cur.interval_one_past_end = iv.end.min(cur.chrom_one_past_end);
-                        true
-                    } else {
-                        false
-                    }
+        // Advance to the next data-bearing interval / chromosome if the
+        // current one is exhausted, then produce exactly one block. (No
+        // loop: `advance_chrom` already skips empty chromosomes and
+        // covered intervals are non-empty by construction, so a single
+        // advance always lands on producible data or the genome's end.)
+        let need_advance = match &self.cur {
+            None => true,
+            Some(cur) => cur.chunk_range_start >= cur.interval_one_past_end,
+        };
+        if need_advance {
+            // Advance to the next covered interval within the current
+            // chromosome; if exhausted, advance to the next chromosome.
+            let advanced_interval = if let Some(cur) = self.cur.as_mut() {
+                cur.interval_idx += 1;
+                if cur.interval_idx < cur.covered.len() {
+                    let iv = &cur.covered[cur.interval_idx];
+                    cur.chunk_range_start = iv.start;
+                    cur.psp_cursor = iv.start;
+                    cur.interval_one_past_end = iv.end.min(cur.chrom_one_past_end);
+                    true
                 } else {
                     false
-                };
-                if advanced_interval {
-                    // New interval = mini-chromosome: reset the reserve.
-                    for c in self.carryover.iter_mut() {
-                        c.clear();
-                    }
-                } else {
-                    match self.advance_chrom() {
-                        Ok(true) => {}
-                        Ok(false) => return None,
-                        Err(e) => return Some(Err(e)),
-                    }
+                }
+            } else {
+                false
+            };
+            if advanced_interval {
+                // New interval = mini-chromosome: reset the reserve.
+                for c in self.carryover.iter_mut() {
+                    c.clear();
+                }
+            } else {
+                match self.advance_chrom() {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
                 }
             }
-            // Acquire a recycled buffer (or a fresh one) and fill it.
-            let mut block = self
-                .free_blocks
-                .pop()
-                .unwrap_or_else(|| ReadyBlock::with_n_samples(self.n_samples));
-            return match self.produce_block(&mut block) {
-                Ok(()) => {
-                    block.seq_idx = self.next_seq_idx;
-                    self.next_seq_idx += 1;
-                    Some(Ok(block))
-                }
-                Err(e) => {
-                    self.free_blocks.push(block);
-                    Some(Err(e))
-                }
-            };
+        }
+        // Acquire a recycled buffer (or a fresh one) and fill it.
+        let mut block = self
+            .free_blocks
+            .pop()
+            .unwrap_or_else(|| ReadyBlock::with_n_samples(self.n_samples));
+        match self.produce_block(&mut block) {
+            Ok(()) => {
+                block.seq_idx = self.next_seq_idx;
+                self.next_seq_idx += 1;
+                Some(Ok(block))
+            }
+            Err(e) => {
+                self.free_blocks.push(block);
+                Some(Err(e))
+            }
         }
     }
 
-    /// Load + accumulate-to-target + safe-cut (reserve the tail) + DUST
-    /// + partition + prefetch one block from the current interval into
-    /// `block`, then advance the cursor. Mirrors the old
-    /// `load_chunk_with_safe_boundary_retry` + prepare step, now writing
-    /// into the owned [`ReadyBlock`] rather than the iterator's scratch.
+    /// Load, accumulate to the variant target, pick the safe cut
+    /// (reserving the tail), then DUST-mask, partition, and prefetch the
+    /// REF bytes for one block of the current interval, advancing the
+    /// cursor. Mirrors the old `load_chunk_with_safe_boundary_retry` plus
+    /// prepare step, now writing into the owned [`ReadyBlock`] rather
+    /// than the iterator's scratch.
     fn produce_block(&mut self, block: &mut ReadyBlock) -> Result<(), ChunkDriverError> {
         let ReadyBlock {
             chunk,
@@ -1329,29 +1333,29 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         mask.clear();
         let span_start = chunk.range.start;
         let span_end = chunk.safe_end;
-        if let Some(dust_fetcher) = cur.dust_fetcher.as_mut() {
-            if span_start < span_end {
-                let (m, buf_start) = sdust_mask_for_span(
-                    span_start,
-                    span_end,
-                    chrom_length,
-                    params.dust_cfg.window(),
-                    params.dust_cfg.threshold(),
-                    MIN_DUST_HALO,
-                    |s, l| {
-                        dust_fetcher
-                            .fetch(s, l)
-                            .map(<[u8]>::to_vec)
-                            .map_err(io::Error::other)
-                    },
-                )
-                .map_err(|source| ChunkDriverError::DustMaskIo {
-                    contig: cur.chrom_name.clone(),
-                    source,
-                })?;
-                *mask = m;
-                dust_fetcher.evict_before(buf_start);
-            }
+        if let Some(dust_fetcher) = cur.dust_fetcher.as_mut()
+            && span_start < span_end
+        {
+            let (m, buf_start) = sdust_mask_for_span(
+                span_start,
+                span_end,
+                chrom_length,
+                params.dust_cfg.window(),
+                params.dust_cfg.threshold(),
+                MIN_DUST_HALO,
+                |s, l| {
+                    dust_fetcher
+                        .fetch(s, l)
+                        .map(<[u8]>::to_vec)
+                        .map_err(io::Error::other)
+                },
+            )
+            .map_err(|source| ChunkDriverError::DustMaskIo {
+                contig: cur.chrom_name.clone(),
+                source,
+            })?;
+            *mask = m;
+            dust_fetcher.evict_before(buf_start);
         }
         // ── Partition + REF prefetch (data-shaping). ──
         let window = span_start..span_end;
