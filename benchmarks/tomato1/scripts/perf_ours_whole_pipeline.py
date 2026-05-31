@@ -78,10 +78,13 @@ def main() -> int:
         n_dir.mkdir(parents=True, exist_ok=True)
         out_vcf = OUT_DIR / f"N{n:02d}.vcf"
 
-        # --- Stage 1: parallel per-sample pileup ---
-        # Each pileup is single-threaded; we run up to THREADS of them
-        # at a time. This exhausts the parallelism budget across
-        # processes rather than within one.
+        # --- Stage 1: per-sample pileup, one process at a time ---
+        # Each pileup runs as ONE internally-threaded process
+        # (--threads N), sequentially — never several pileup processes in
+        # parallel. Our caller exhausts the CPU budget with threads inside
+        # one process; running several processes concurrently would
+        # time-share the CPU (inflating wall) and sum their RSS (inflating
+        # footprint), distorting the per-caller measurement.
         pileup_cmds = []
         psp_paths = []
         for cram in subset:
@@ -92,14 +95,13 @@ def main() -> int:
                 str(BIN), "pileup",
                 "--reference", str(DEFAULT_REFERENCE),
                 "--output", str(psp),
-                "--threads", "1",
+                "--threads", str(DEFAULT_THREADS),
                 str(cram),
             ])
-        concurrency = min(DEFAULT_THREADS, len(pileup_cmds))
-        print(f"[{CALLER}] N={n:>2}: stage 1 — {len(pileup_cmds)} pileups @ concurrency={concurrency}")
-        s1_wall, s1_peak, s1_ec = measure_pool(pileup_cmds, max_concurrent=concurrency)
+        print(f"[{CALLER}] N={n:>2}: stage 1 — {len(pileup_cmds)} pileups, sequential @ --threads {DEFAULT_THREADS}")
+        s1_wall, s1_peak, s1_ec = measure_pool(pileup_cmds, max_concurrent=1)
         s1_peak_mb = s1_peak / 1024 / 1024
-        print(f"  stage 1 -> {s1_wall:.1f}s, peak {s1_peak_mb:.0f} MB (sum across alive pileups)")
+        print(f"  stage 1 -> {s1_wall:.1f}s, peak {s1_peak_mb:.0f} MB (single pileup process)")
 
         if s1_ec != 0:
             rows.append(Measurement(CALLER, n, s1_wall, s1_peak_mb, s1_ec))

@@ -72,13 +72,15 @@ def main() -> int:
                 str(BIN), "pileup",
                 "--reference", str(DEFAULT_REFERENCE),
                 "--output", str(psp),
-                "--threads", "1",
+                "--threads", str(DEFAULT_THREADS),
                 "--block-target-bytes", BLOCK_TARGET_BYTES,
                 str(cram),
             ])
-        concurrency = min(DEFAULT_THREADS, len(cmds))
-        print(f"[{CALLER}] N={n:>2}: {len(cmds)} pileups @ concurrency={concurrency}")
-        wall, peak_bytes, exit_code = measure_pool(cmds, max_concurrent=concurrency)
+        # One caller process at a time, each internally threaded
+        # (--threads N) — never several pileup processes in parallel
+        # (contention + summed RSS distorts the per-caller measurement).
+        print(f"[{CALLER}] N={n:>2}: {len(cmds)} pileups, sequential @ --threads {DEFAULT_THREADS}")
+        wall, peak_bytes, exit_code = measure_pool(cmds, max_concurrent=1)
         peak_mb = peak_bytes / 1024 / 1024
         rows.append(Measurement(CALLER, n, wall, peak_mb, exit_code))
         status = "ok" if exit_code == 0 else f"FAILED (exit {exit_code})"
