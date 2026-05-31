@@ -39,13 +39,10 @@ use crate::fasta::fetcher::ChromRefFetchError;
 use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
-use crate::var_calling::cohort_block::chunk_boundaries::{
-    BoundaryFinalisationError, BoundaryFinalisationScratch, finalise_chunk_boundaries,
-};
-use crate::var_calling::cohort_block::columns::{MaterialisedChunk, SampleColumns};
-use crate::var_calling::cohort_block::loader::{
-    ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, load_chunk_from_iters,
-};
+use crate::var_calling::cohort_block::chunk_boundaries::BoundaryFinalisationError;
+use crate::var_calling::cohort_block::column_span_reader::ColumnSpanReader;
+use crate::var_calling::cohort_block::columns::MaterialisedChunk;
+use crate::var_calling::cohort_block::loader::{ChunkLoadError, StreamingBlockLoader};
 use crate::var_calling::cohort_block::partition::{
     PartitionError, PartitionScratch, WindowPartition, partition_window,
 };
@@ -275,6 +272,12 @@ pub enum ChunkDriverError {
         chrom_id: u32,
         #[source]
         source: ChunkLoadError<PspReadError>,
+    },
+    #[error("failed to read columns on chromosome {chrom_id}")]
+    StreamRead {
+        chrom_id: u32,
+        #[source]
+        source: PspReadError,
     },
     #[error("failed to commit chunk boundaries on chromosome {chrom_id}")]
     FinaliseChunkBoundaries {
@@ -916,15 +919,15 @@ fn merge_block_ranges(
 /// [`merge_block_ranges`]. Reads only the in-memory block indices
 /// (decoded from the PSP trailer at open) — no file I/O.
 fn covered_intervals_for_chrom<W>(
-    psp_readers: &[PspReader<W>],
+    sources: &[ColumnSpanReader<W>],
     chrom_id: u32,
     max_group_span: u32,
 ) -> Vec<std::ops::Range<u32>>
 where
     W: Read + Seek + Send,
 {
-    let ranges = psp_readers.iter().flat_map(|r| {
-        r.block_index()
+    let ranges = sources.iter().flat_map(|s| {
+        s.block_index()
             .iter()
             .filter(move |b| b.chrom_id == chrom_id)
             .map(|b| (b.first_pos, b.last_pos))
@@ -1001,7 +1004,6 @@ struct ChromCursor {
     chrom_name: String,
     chrom_length: u32,
     chrom_one_past_end: u32,
-    last_chunk_logical_extension: u32,
     /// Forward-only fetcher feeding the per-block REF prefetch.
     ref_fetcher: StreamingChromRefFetcher,
     /// Random-access fetcher feeding the per-block DUST mask; `None`
@@ -1009,9 +1011,13 @@ struct ChromCursor {
     dust_fetcher: Option<ManualEvictChromRefFetcher>,
     /// Block-index-driven covered intervals (data-bearing segments).
     covered: Vec<std::ops::Range<u32>>,
+    /// Index into `covered` of the interval currently being produced.
     interval_idx: usize,
+    /// Genomic start of the next block within the current interval
+    /// (advances to each block's `safe_end`; reset to the interval
+    /// start when the interval is entered).
     chunk_range_start: u32,
-    psp_cursor: u32,
+    /// Exclusive end of the current interval (clamped to the chrom).
     interval_one_past_end: u32,
 }
 
@@ -1033,18 +1039,17 @@ struct BlockIterator<'a, W: Read + Seek + Send> {
     chromosomes: &'a [ParsedChromosome],
     fasta_path: &'a Path,
     params: &'a ChunkDriverParams,
-    psp_readers: Vec<PspReader<W>>,
+    /// One span-addressable columnar reader per sample; each owns its
+    /// `PspReader`. Re-`reset` to the current covered interval.
+    sources: Vec<ColumnSpanReader<W>>,
     n_samples: usize,
 
-    // Reusable producer scratch + the reserve (carryover from the prior
-    // block). The partition scratch lives here (data-shaping), while the
-    // partition *output* travels inside the owned block.
-    chunk_scratch: ChunkLoadScratch,
-    fix_scratch: BoundaryFinalisationScratch,
+    /// Streaming fold+compact engine: holds the per-sample pending
+    /// (open-group straddle) and the fold scratch, reused across blocks.
+    streaming: StreamingBlockLoader,
+    /// Reusable per-block partition scratch + DUST-mask buffer.
     partition_scratch: PartitionScratch,
     mask: Vec<std::ops::Range<u32>>,
-    carryover: Vec<SampleColumns>,
-    carryover_snapshot: Vec<SampleColumns>,
 
     // Free-list of recycled block buffers (columns + CSR arrays + REF
     // byte buffers). `next_block` pops one (or makes a fresh one) to
@@ -1067,18 +1072,16 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         params: &'a ChunkDriverParams,
     ) -> Self {
         let n_samples = psp_readers.len();
+        let sources = psp_readers.into_iter().map(ColumnSpanReader::detached).collect();
         Self {
             chromosomes,
             fasta_path,
             params,
-            psp_readers,
+            sources,
             n_samples,
-            chunk_scratch: ChunkLoadScratch::with_n_samples(n_samples),
-            fix_scratch: BoundaryFinalisationScratch::new(),
+            streaming: StreamingBlockLoader::with_n_samples(n_samples),
             partition_scratch: PartitionScratch::with_n_samples(n_samples),
             mask: Vec::new(),
-            carryover: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
-            carryover_snapshot: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
             free_blocks: Vec::new(),
             next_seq_idx: 0,
             cur: None,
@@ -1095,9 +1098,10 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
     }
 
     /// Advance to the next chromosome that carries data, building its
-    /// cursor (covered intervals + fetchers). Returns `Ok(false)` when
-    /// no chromosomes remain. Clears the reserve at each chromosome
-    /// boundary (the gap is `> max_group_span`, so no group spans it).
+    /// cursor (covered intervals + fetchers) positioned at interval 0.
+    /// Returns `Ok(false)` when no chromosomes remain. Does not touch
+    /// the sources — [`enter_current_interval`](Self::enter_current_interval)
+    /// resets them to interval 0.
     fn advance_chrom(&mut self) -> Result<bool, ChunkDriverError> {
         let max_group_span = self.params.grouper_cfg.max_variant_group_span;
         while self.next_chrom_idx < self.chromosomes.len() {
@@ -1111,7 +1115,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             // M25 PANIC-FREE: chrom_id fits in u32 (PSP file-format invariant).
             let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
             let covered = covered_intervals_for_chrom(
-                &self.psp_readers,
+                &self.sources,
                 chrom_id,
                 max_group_span.max(MIN_CHUNK_SPAN),
             );
@@ -1136,26 +1140,18 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
                             })?,
                     )
                 };
-            let chrom_one_past_end = chrom_length.saturating_add(1);
-            let first = &covered[0];
-            let interval_one_past_end = first.end.min(chrom_one_past_end);
-            let (chunk_range_start, psp_cursor) = (first.start, first.start);
-            for c in self.carryover.iter_mut() {
-                c.clear();
-            }
             self.cur = Some(ChromCursor {
                 chrom_id,
                 chrom_name: chrom.name.clone(),
                 chrom_length,
-                chrom_one_past_end,
-                last_chunk_logical_extension: max_group_span.saturating_add(2),
+                chrom_one_past_end: chrom_length.saturating_add(1),
                 ref_fetcher,
                 dust_fetcher,
                 covered,
                 interval_idx: 0,
-                chunk_range_start,
-                psp_cursor,
-                interval_one_past_end,
+                // Filled by `enter_current_interval`.
+                chunk_range_start: 0,
+                interval_one_past_end: 0,
             });
             return Ok(true);
         }
@@ -1163,64 +1159,79 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         Ok(false)
     }
 
+    /// Point the per-sample sources and the streaming loader at the
+    /// cursor's current covered interval, and set the block range to its
+    /// start. Called when a chromosome or interval is (re-)entered; the
+    /// interval boundary is wider than any group span, so the streaming
+    /// loader starts with empty pending.
+    fn enter_current_interval(&mut self) {
+        let (chrom_id, start, interval_one_past_end) = {
+            let cur = self.cur.as_ref().expect("cur set before enter");
+            let iv = &cur.covered[cur.interval_idx];
+            (cur.chrom_id, iv.start, iv.end.min(cur.chrom_one_past_end))
+        };
+        let end_inclusive = interval_one_past_end.saturating_sub(1);
+        for source in &mut self.sources {
+            source.reset(chrom_id, start, end_inclusive);
+        }
+        self.streaming.reset_interval();
+        let cur = self.cur.as_mut().expect("cur set before enter");
+        cur.chunk_range_start = start;
+        cur.interval_one_past_end = interval_one_past_end;
+    }
+
     /// Yield the next prepared block (owned), or `None` when the genome
     /// is exhausted. The block carries its own columns / partition /
     /// pre-fetched REF bytes and a monotonic `seq_idx` for ordered emit;
     /// recycle it with [`recycle`](Self::recycle) once consumed.
     fn next_block(&mut self) -> Option<Result<ReadyBlock, ChunkDriverError>> {
-        // Advance to the next data-bearing interval / chromosome if the
-        // current one is exhausted, then produce exactly one block. (No
-        // loop: `advance_chrom` already skips empty chromosomes and
-        // covered intervals are non-empty by construction, so a single
-        // advance always lands on producible data or the genome's end.)
-        let need_advance = match &self.cur {
-            None => true,
-            Some(cur) => cur.chunk_range_start >= cur.interval_one_past_end,
-        };
-        if need_advance {
-            // Advance to the next covered interval within the current
-            // chromosome; if exhausted, advance to the next chromosome.
-            let advanced_interval = if let Some(cur) = self.cur.as_mut() {
-                cur.interval_idx += 1;
-                if cur.interval_idx < cur.covered.len() {
-                    let iv = &cur.covered[cur.interval_idx];
-                    cur.chunk_range_start = iv.start;
-                    cur.psp_cursor = iv.start;
-                    cur.interval_one_past_end = iv.end.min(cur.chrom_one_past_end);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if advanced_interval {
-                // New interval = mini-chromosome: reset the reserve.
-                for c in self.carryover.iter_mut() {
-                    c.clear();
-                }
-            } else {
+        loop {
+            // Make sure a covered interval is entered.
+            if self.cur.is_none() {
                 match self.advance_chrom() {
-                    Ok(true) => {}
+                    Ok(true) => self.enter_current_interval(),
                     Ok(false) => return None,
                     Err(e) => return Some(Err(e)),
                 }
             }
-        }
-        // Acquire a recycled buffer (or a fresh one) and fill it.
-        let mut block = self
-            .free_blocks
-            .pop()
-            .unwrap_or_else(|| ReadyBlock::with_n_samples(self.n_samples));
-        match self.produce_block(&mut block) {
-            Ok(()) => {
-                block.seq_idx = self.next_seq_idx;
-                self.next_seq_idx += 1;
-                Some(Ok(block))
-            }
-            Err(e) => {
-                self.free_blocks.push(block);
-                Some(Err(e))
+            // Produce one block from the current interval.
+            let mut block = self
+                .free_blocks
+                .pop()
+                .unwrap_or_else(|| ReadyBlock::with_n_samples(self.n_samples));
+            match self.produce_block(&mut block) {
+                Ok(variant_count) if variant_count > 0 => {
+                    block.seq_idx = self.next_seq_idx;
+                    self.next_seq_idx += 1;
+                    self.chunks_loaded += 1;
+                    self.chunk_variants_total += u64::from(variant_count);
+                    return Some(Ok(block));
+                }
+                Ok(_) => {
+                    // The current interval is exhausted: advance to the
+                    // next interval (then chromosome) and keep going.
+                    self.free_blocks.push(block);
+                    let advanced_interval = match self.cur.as_mut() {
+                        Some(cur) if cur.interval_idx + 1 < cur.covered.len() => {
+                            cur.interval_idx += 1;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if advanced_interval {
+                        self.enter_current_interval();
+                    } else {
+                        match self.advance_chrom() {
+                            Ok(true) => self.enter_current_interval(),
+                            Ok(false) => return None,
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.free_blocks.push(block);
+                    return Some(Err(e));
+                }
             }
         }
     }
@@ -1231,7 +1242,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
     /// cursor. Mirrors the old `load_chunk_with_safe_boundary_retry` plus
     /// prepare step, now writing into the owned [`ReadyBlock`] rather
     /// than the iterator's scratch.
-    fn produce_block(&mut self, block: &mut ReadyBlock) -> Result<(), ChunkDriverError> {
+    fn produce_block(&mut self, block: &mut ReadyBlock) -> Result<u32, ChunkDriverError> {
         let ReadyBlock {
             chunk,
             partition,
@@ -1240,16 +1251,11 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         } = block;
         let Self {
             params,
-            psp_readers,
-            chunk_scratch,
-            fix_scratch,
+            sources,
+            streaming,
             partition_scratch,
             mask,
-            carryover,
-            carryover_snapshot,
             cur,
-            chunks_loaded,
-            chunk_variants_total,
             ..
         } = self;
         let cur = cur
@@ -1257,77 +1263,37 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             .expect("produce_block needs a current interval");
 
         let max_group_span = params.grouper_cfg.max_variant_group_span;
+        // `.max(1)` so a `0` (disabled) target still cuts at the first
+        // closed group rather than yielding an empty block.
         let target_variants = params
             .sizing
             .target_variants_per_chunk
-            .map_or(0, NonZeroU32::get);
-        let nominal_span = params.sizing.chunk_genomic_span.max(1);
-        let max_span = nominal_span.saturating_mul(MAX_CHUNK_SPAN_GROWTH);
+            .map_or(0, NonZeroU32::get)
+            .max(1);
         let chrom_id = cur.chrom_id;
         let chrom_length = cur.chrom_length;
-        let interval_one_past_end = cur.interval_one_past_end;
-        let chunk_range_start = cur.chunk_range_start;
-        let psp_cursor = cur.psp_cursor;
+        let range_start = cur.chunk_range_start;
+        let interval_end_inclusive = cur.interval_one_past_end.saturating_sub(1);
 
-        // ── Load + finalise, doubling the span on `NoSafeGap`. The
-        //    reserve (carryover) is snapshotted and restored on retry
-        //    because the load drains it. ──
-        for (snap, carry) in carryover_snapshot.iter_mut().zip(carryover.iter()) {
-            snap.clone_from_columns(carry);
-        }
-        let mut attempt_span = nominal_span;
-        loop {
-            let nominal_end = chunk_range_start.saturating_add(attempt_span);
-            let chunk_range_end = if nominal_end >= interval_one_past_end {
-                interval_one_past_end.saturating_add(cur.last_chunk_logical_extension)
-            } else {
-                nominal_end
-            };
-            let initial_load_span = chunk_range_end - chunk_range_start;
-            let psp_inclusive_end = chunk_range_end.saturating_sub(1).min(chrom_length);
-            let iters: Vec<_> = psp_readers
-                .iter_mut()
-                .map(|r| r.region_records(chrom_id, psp_cursor, psp_inclusive_end))
-                .collect();
-            let load_stats = load_chunk_from_iters(
-                chunk_scratch,
+        // Stream one block of ≥ `target_variants` variable variants (or
+        // the interval's tail), cutting at the open group's clean
+        // boundary; the open group carries forward as `streaming`'s
+        // pending. `0` means the interval is exhausted.
+        let variant_count = streaming
+            .fill_block(
+                sources,
                 chunk,
-                ChunkLoadExtent {
-                    chrom_id,
-                    range_start: chunk_range_start,
-                    initial_span: initial_load_span,
-                    target_variants,
-                    max_span: initial_load_span,
-                },
-                iters,
-                carryover,
+                chrom_id,
+                range_start,
+                interval_end_inclusive,
+                target_variants,
             )
-            .map_err(|source| ChunkDriverError::LoadChunk { chrom_id, source })?;
-            *chunks_loaded += 1;
-            *chunk_variants_total += u64::from(load_stats.variant_count);
-
-            match finalise_chunk_boundaries(chunk, carryover, fix_scratch, max_group_span) {
-                Ok(()) => break,
-                Err(BoundaryFinalisationError::NoSafeGap { .. }) if attempt_span < max_span => {
-                    for (carry, snap) in carryover.iter_mut().zip(carryover_snapshot.iter()) {
-                        carry.clone_from_columns(snap);
-                    }
-                    attempt_span = attempt_span
-                        .checked_mul(2)
-                        .unwrap_or(max_span)
-                        .min(max_span);
-                    continue;
-                }
-                Err(source) => {
-                    return Err(ChunkDriverError::FinaliseChunkBoundaries { chrom_id, source });
-                }
-            }
+            .map_err(|source| ChunkDriverError::StreamRead { chrom_id, source })?;
+        if variant_count == 0 {
+            return Ok(0);
         }
-
-        // Advance the cursor past this block (the tail beyond `safe_end`
-        // is reserved in `carryover` for the next block).
+        // The next block resumes where this one cut.
         cur.chunk_range_start = chunk.safe_end;
-        cur.psp_cursor = chunk.range.end.min(interval_one_past_end);
 
         // ── DUST mask (data-shaping). ──
         mask.clear();
@@ -1370,16 +1336,9 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         .map_err(|source| ChunkDriverError::Partition { chrom_id, source })?;
         prefetch_window_ref_bytes(partition, &cur.ref_fetcher, pre_fetched_ref_bytes)
             .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
-        Ok(())
+        Ok(variant_count)
     }
 }
-
-/// Hard cap on how much the chunk loader may grow a single chunk's
-/// nominal span when [`finalise_chunk_boundaries`] cannot find a safe boundary —
-/// the plan's "fail loudly on pathological input" backstop. The cap
-/// is the largest multiplier of [`ChunkDriverParams::chunk_genomic_span`]
-/// we will attempt before surfacing `NoSafeGap` to the caller.
-const MAX_CHUNK_SPAN_GROWTH: u32 = 8;
 
 /// Coalescing distance (bases) for block-index-driven covered
 /// intervals. Adjacent or cross-sample-misaligned blocks within this

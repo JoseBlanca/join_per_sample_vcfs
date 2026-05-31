@@ -78,6 +78,13 @@ impl<R: Read + Seek> ColumnSpanReader<R> {
         self.blocks.into_reader()
     }
 
+    /// The sample's on-disk block index — the producer unions these
+    /// across samples to find the covered intervals (data-bearing
+    /// segments) per chromosome.
+    pub fn block_index(&self) -> &[crate::psp::BlockIndexEntry] {
+        self.blocks.index()
+    }
+
     /// Re-point the reader at a new region, reusing the decode buffers.
     /// The cohort producer calls this at every covered-interval /
     /// chromosome boundary so the zstd context + column slabs persist

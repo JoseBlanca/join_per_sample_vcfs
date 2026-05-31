@@ -604,7 +604,7 @@ impl StreamingBlockLoader {
         range_start: u32,
         interval_end: u32,
         target_variants: u32,
-    ) -> Result<bool, PspReadError> {
+    ) -> Result<u32, PspReadError> {
         out.clear();
         out.chrom_id = chrom_id;
         let n_samples = sources.len();
@@ -618,15 +618,14 @@ impl StreamingBlockLoader {
             let watermark = sources.iter().filter_map(SpanColumnSource::peek_next_span).min();
             let Some(watermark) = watermark else {
                 // Interval exhausted: every remaining group is closed,
-                // so flush all pending (cut past the interval end).
+                // so flush all pending (cut past the interval end). A
+                // zero return means nothing was left to emit.
                 rebuild_position_union_and_is_kept(&mut self.scratch);
                 let cut = interval_end.saturating_add(1);
                 kept_positions += self.compact_closed_prefix(out, cut);
                 out.range = range_start..cut;
                 out.safe_end = cut;
-                let produced = kept_positions > 0
-                    || out.per_sample.iter().any(|s| s.n_records() > 0);
-                return Ok(produced);
+                return Ok(kept_positions);
             };
 
             // Pull every sample up to the shared watermark (parallel —
@@ -649,7 +648,7 @@ impl StreamingBlockLoader {
             if kept_positions >= target_variants {
                 out.range = range_start..cut;
                 out.safe_end = cut;
-                return Ok(true);
+                return Ok(kept_positions);
             }
         }
     }
@@ -935,6 +934,7 @@ mod tests {
         while loader
             .fill_block(&mut sources, &mut out, 0, range_start, end_inclusive, target_variants)
             .expect("fill_block")
+            > 0
         {
             for s in 0..n {
                 for row in 0..out.per_sample[s].n_records() {
