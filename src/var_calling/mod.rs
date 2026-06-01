@@ -29,8 +29,7 @@ pub mod variant_grouping;
 // filters applied post-EM (or, for `min_alt_obs`, at the merger→EM
 // boundary). They live here, at the `var_calling` root, because they are
 // consumed both by the CLI args layer (`cli::shared_args`) and by the
-// chunk driver's `DownstreamFilterParams`. (They previously lived in the
-// now-removed `from_bam::pipeline` streaming driver.)
+// chunk driver's `DownstreamFilterParams`.
 
 /// Default minimum site-level `QUAL` (phred) required to emit a record.
 /// Matches GATK HaplotypeCaller's

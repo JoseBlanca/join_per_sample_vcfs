@@ -626,7 +626,9 @@ pub enum ContaminationEstimationError {
     /// header-mismatch on the first record.
     ///
     /// The boxed `dyn Error` lets the side-pass accept either the
-    /// streaming pipeline's [`PerPositionMergerError`] or the
+    /// streaming pipeline's
+    /// [`PerPositionMergerError`](crate::var_calling::per_position_merger::PerPositionMergerError)
+    /// or the
     /// chunk-driven
     /// [`ContaminationStreamError`](crate::pop_var_caller::contamination_chunked_stream::ContaminationStreamError)
     /// without a hard dependency on either concrete type. Callers

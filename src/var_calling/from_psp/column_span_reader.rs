@@ -1,7 +1,7 @@
 //! Span-addressable columnar reader over one sample's `.psp`.
 //!
-//! Wraps a [`BlockColumnReader`](crate::psp::BlockColumnReader) and
-//! turns it into a *genomic-span* interface: the caller asks for the
+//! Wraps a [`BlockColumnReader`] and turns it into a *genomic-span*
+//! interface: the caller asks for the
 //! next servable span ([`peek_next_span`](ColumnSpanReader::peek_next_span),
 //! free — from the block index) and then for the columns over a span
 //! ([`read_span`](ColumnSpanReader::read_span), appended straight into a

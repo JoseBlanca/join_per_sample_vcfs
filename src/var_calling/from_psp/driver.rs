@@ -18,12 +18,10 @@
 //!
 //! **Downstream filters** (`is_variant_call`, `qual_phred`,
 //! `min_alt_obs_per_sample`, MAPQ-diff t-test) are applied
-//! post-EM in the driver, mirroring the streaming pipeline's drop
-//! semantics in
-//! [`drive_cohort_pipeline`](crate::var_calling::from_bam::pipeline::drive_cohort_pipeline).
-//! The same set of records is dropped from the final VCF, with
-//! the same per-category counters incremented — that's the
-//! byte-identity contract for Phase A.
+//! post-EM in the driver, mirroring the drop semantics of the prior
+//! (now-removed) per-chromosome streaming pipeline: the same set of
+//! records is dropped from the final VCF, with the same per-category
+//! counters incremented.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
@@ -49,7 +47,7 @@ use crate::var_calling::from_psp::partition::{
 use crate::var_calling::from_psp::worker::{
     WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
 };
-use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
+use crate::var_calling::per_group_merger::PerGroupMergerConfig;
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
@@ -74,22 +72,15 @@ const DRIVER_PSP_BUFFER_BYTES: usize = 64 * 1024;
 const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
 
 /// Mi19: chunk-loop sizing knobs. Bundled separately from
-/// `ChunkDriverParams` so the chunk loader / pre-pass / worker-
-/// dispatch axis is named and the three fields can be passed around
-/// together without dragging along the per-stage configs and
-/// downstream filters.
+/// `ChunkDriverParams` so the chunk loader / worker-dispatch axis is
+/// named and can be passed around without dragging along the
+/// per-stage configs and downstream filters.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkSizingParams {
-    /// Nominal BP span of the loader's first pull attempt per chunk.
-    /// Acts as a starting size; the loader grows up to
-    /// `chunk_genomic_span × MAX_CHUNK_SPAN_GROWTH` when
-    /// `target_variants_per_chunk` is not satisfied or the pre-pass
-    /// can't find a safe boundary.
-    pub chunk_genomic_span: u32,
     /// M9: soft lower bound on the post-filter variant count per
     /// chunk. `None` disables the variant-bounded extension (each
-    /// chunk is one pull attempt of `chunk_genomic_span` BP).
+    /// chunk is a single pull attempt at the loader's default span).
     /// `Some(n)` lets the loader grow each chunk's span adaptively
     /// until the kept-position count crosses `n` — decoupling worker
     /// workload from PSP block size + variant density. Previously a
@@ -146,10 +137,7 @@ pub struct ChunkDriverParams {
     pub downstream: DownstreamFilterParams,
 }
 
-/// Per-driver counters; the shape mirrors
-/// [`CohortDriveStats`](crate::var_calling::from_bam::pipeline::CohortDriveStats)
-/// so the CLI summary code can consume either driver's output
-/// without a branch.
+/// Per-driver counters consumed by the CLI run-summary code.
 // Mi1: `#[non_exhaustive]` — driver-level counter struct; future
 // per-stage counts can be added without breaking out-of-crate
 // consumers.
@@ -296,13 +284,6 @@ pub enum ChunkDriverError {
     /// carry their own `RecordLocus` for diagnostic.
     #[error("per-window math failed")]
     RunWindow(#[source] PosteriorEngineError),
-    /// Carried for `From<PerGroupMergerError>` compatibility with
-    /// callers that still surface that type directly (e.g. the
-    /// `var-calling-from-bam` shim before its own migration). Wraps
-    /// the error with no extra context — provenance lives in the
-    /// inner variants.
-    #[error("per-group merger error")]
-    PerGroupMerger(#[source] PerGroupMergerError),
 }
 
 // `From` impls — kept narrow. Each `From` has exactly one production
@@ -313,12 +294,6 @@ pub enum ChunkDriverError {
 impl From<PosteriorEngineError> for ChunkDriverError {
     fn from(source: PosteriorEngineError) -> Self {
         Self::RunWindow(source)
-    }
-}
-
-impl From<PerGroupMergerError> for ChunkDriverError {
-    fn from(source: PerGroupMergerError) -> Self {
-        Self::PerGroupMerger(source)
     }
 }
 
@@ -350,10 +325,9 @@ pub fn drive_cohort_chunked(
     // filter and chunk-loop counters that already land in
     // `print_run_summary` at the end of the run.
     eprintln!(
-        "var-calling: chunk_genomic_span={} target_variants_per_chunk={} \
+        "var-calling: target_variants_per_chunk={} \
          min_qual_phred={} min_alt_obs_per_sample={} \
          no_mapq_diff_filter={} min_mapq_diff_t={} no_complexity_filter={}",
-        params.sizing.chunk_genomic_span,
         params
             .sizing
             .target_variants_per_chunk
@@ -398,38 +372,28 @@ pub fn drive_cohort_chunked(
     // how the block was produced (data-shaping vs math decoupled).
     let per_group_cfg = params.per_group_cfg;
     let posterior_cfg = &params.posterior_cfg;
-    let mut producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params);
+    let producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params);
 
     // Consume the blocks: per-group EM/posterior math + downstream
     // filtering + emit. The math is the dominant cost at realistic N
-    // (consume grows ~N^1.8, overtaking produce at N≈24), so it is
-    // parallelised across blocks when the pool has > 1 thread — a single
-    // producer thread feeds a bounded queue, `n_workers` worker threads
-    // map `process_block` in parallel, and a collector re-imposes genomic
-    // order before emit (byte-identical to the serial path). With a
-    // 1-thread pool the serial path runs. Both paths fold the producer's
-    // chunk counters into `stats`.
-    let n_workers = rayon::current_num_threads();
-    let driver_result: Result<(), ChunkDriverError> = if n_workers <= 1 {
-        drive_blocks_serial(
-            &mut producer,
-            per_group_cfg,
-            posterior_cfg,
-            &params,
-            &mut writer,
-            &mut stats,
-        )
-    } else {
-        drive_blocks_parallel(
-            producer,
-            n_workers,
-            per_group_cfg,
-            posterior_cfg,
-            &params,
-            &mut writer,
-            &mut stats,
-        )
-    };
+    // (consume grows ~N^1.8, overtaking produce at N≈24), so it is always
+    // parallelised across blocks: a single producer thread feeds a bounded
+    // queue, `n_workers` worker threads map `process_block` in parallel,
+    // and a collector re-imposes genomic order before emit. `n_workers` is
+    // clamped to at least 1, so a single-thread rayon pool (`--threads 1`)
+    // runs one producer + one worker — correct, just without cross-block
+    // parallelism. The collector folds the producer's chunk counters into
+    // `stats`.
+    let n_workers = rayon::current_num_threads().max(1);
+    let driver_result = drive_blocks_parallel(
+        producer,
+        n_workers,
+        per_group_cfg,
+        posterior_cfg,
+        &params,
+        &mut writer,
+        &mut stats,
+    );
 
     match driver_result {
         Ok(()) => {
@@ -456,8 +420,7 @@ pub fn drive_cohort_chunked(
 
 /// Roll one block's [`WindowRunStats`] counters into the driver's
 /// running totals. Additive, so the result is independent of the order
-/// blocks finish — the parallel collector and the serial loop produce
-/// identical totals.
+/// blocks finish — the totals are the same regardless of `n_workers`.
 fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
     stats.lh_cap_groups_skipped += block.lh_cap_groups_skipped;
     stats.lh_cap_alleles_in_skipped += block.lh_cap_alleles_in_skipped;
@@ -465,47 +428,10 @@ fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
     stats.records_dropped_low_alt_obs += block.records_dropped_low_alt_obs;
 }
 
-/// Serial consume: pull each block in genomic order, run the math, emit.
-/// The reference path for byte-identity, and the path taken when the
-/// rayon pool has a single thread.
-fn drive_blocks_serial<R: Read + Seek + Send>(
-    producer: &mut BlockIterator<R>,
-    per_group_cfg: PerGroupMergerConfig,
-    posterior_cfg: &PosteriorEngineConfig,
-    params: &ChunkDriverParams,
-    writer: &mut CohortVcfWriter,
-    stats: &mut ChunkDriverStats,
-) -> Result<(), ChunkDriverError> {
-    let mut worker = WorkerScratch::new();
-    let result: Result<(), ChunkDriverError> = (|| {
-        while let Some(res) = producer.next_block() {
-            let block = res?;
-            process_block(
-                &block,
-                per_group_cfg,
-                posterior_cfg,
-                params.downstream.min_alt_obs_per_sample,
-                &mut worker,
-            )
-            .map_err(ChunkDriverError::RunWindow)?;
-            roll_window_stats(stats, &worker.stats);
-            worker.stats.clear();
-            for record in worker.posterior_records.drain(..) {
-                emit_or_drop(record, params, writer, stats)?;
-            }
-            producer.recycle(block);
-        }
-        Ok(())
-    })();
-    stats.chunks_loaded += producer.chunks_loaded;
-    stats.chunk_variants_total += producer.chunk_variants_total;
-    result
-}
-
 /// One finished block's math output, handed worker → collector. The
 /// records are already in genomic order *within* the block; the
 /// collector emits blocks in `seq_idx` order, so the global emit order
-/// equals the serial path's — that's the byte-identity argument.
+/// is the genomic order — that's the determinism argument.
 struct BlockResult {
     seq_idx: u64,
     records: Vec<PosteriorRecord>,
@@ -518,8 +444,8 @@ struct BlockResult {
 /// blocks, run [`process_block`] with their own persistent
 /// [`WorkerScratch`], and forward owned [`BlockResult`]s while recycling
 /// the spent block buffers back to the producer. The collector (this
-/// thread) re-imposes `seq_idx` order and emits — byte-identical to
-/// [`drive_blocks_serial`].
+/// thread) re-imposes `seq_idx` order and emits, so the emitted VCF is
+/// in genomic order and independent of the number of worker threads.
 ///
 /// Workers are dedicated OS threads, **not** rayon tasks: a worker
 /// blocked on `queue.pop()` must not occupy a rayon pool thread, because
@@ -527,8 +453,8 @@ struct BlockResult {
 /// it could starve or deadlock the decode. The producer thread is the
 /// only one that touches the rayon pool (via the loader's `par_iter`).
 ///
-/// On the success path no errors occur and output is identical to
-/// serial. On error (a worker's math, a produced block, or a VCF write)
+/// On the success path the emitted VCF is in genomic order regardless of
+/// `n_workers`. On error (a worker's math, a produced block, or a VCF write)
 /// the first error wins, the queue is closed to wind every thread down,
 /// and that error is returned (the run aborts regardless of which block
 /// failed first — errors are pathological-input aborts, not part of the
@@ -2315,7 +2241,6 @@ mod tests {
             per_group_cfg: PerGroupMergerConfig::default(),
             posterior_cfg: PosteriorEngineConfig::default(),
             sizing: ChunkSizingParams {
-                chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
                 target_variants_per_chunk: None,
             },
             downstream: DownstreamFilterParams {

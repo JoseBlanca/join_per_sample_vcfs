@@ -21,8 +21,8 @@
 //!
 //! The merger pulls a batch of upstream groups, processes them
 //! serially, and emits the resulting records one-by-one in input
-//! order. Parallelism above the merger lives at the per-chromosome
-//! seam in [`crate::var_calling::from_bam::pipeline`]; running an inner
+//! order. Parallelism around the merger lives at the block-level
+//! consume in [`crate::var_calling::from_psp::driver`]; running an inner
 //! `rayon::par_iter` here would only nest under that outer
 //! decomposition.
 

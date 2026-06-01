@@ -17,8 +17,6 @@
 //! `super::test_helpers` (Mi16) as the byte-identity oracle for the
 //! kernels' unit tests.
 
-use std::sync::Arc;
-
 use thiserror::Error;
 
 use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
@@ -35,8 +33,7 @@ use crate::var_calling::from_psp::kernels::unify_alleles::{
 };
 use crate::var_calling::from_psp::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
-    CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
-    PerGroupMergerError, SharedRefFetcher,
+    CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig, PerGroupMergerError,
 };
 use crate::var_calling::posterior_engine::backends::InterpUnivariateSimdMath;
 use crate::var_calling::posterior_engine::{
@@ -699,21 +696,6 @@ fn compute_log_likelihoods_error_to_merger(
     }
 }
 
-/// Construct the `SharedRefFetcher` shape `run_window` expects from
-/// an owned [`ChromRefFetcher`] implementor. The Arc is still the
-/// natural type for the per-chromosome ref fetcher held by the
-/// driver — `run_window` derefs into a `&dyn ChromRefFetcher` for
-/// the columnar layer 1 fetch.
-// M28: verb-named constructor. Bare-noun function names are reserved
-// for field-like accessors; converting constructors are
-// `from_X` / `into_X` / `to_X`.
-pub fn into_shared_ref_fetcher<F>(fetcher: F) -> SharedRefFetcher
-where
-    F: ChromRefFetcher + Send + 'static,
-{
-    Arc::new(fetcher)
-}
-
 /// Errors from [`unified_alleles_for_group_columnar`]. Wraps the
 /// kernel error and the ref-fetcher error so callers see a single
 /// surface.
@@ -766,6 +748,8 @@ pub fn unified_alleles_for_group_columnar(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::var_calling::from_psp::partition::{
         PartitionScratch, WindowPartition, partition_window,

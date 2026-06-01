@@ -364,8 +364,8 @@ impl SampleColumns {
     }
 
     /// Append records `[record_lo, record_hi)` of a decoded PSP block
-    /// straight from its columns — the same shape [`push_record`] would
-    /// build, but with no intermediate row-shape `PileupRecord` (and no
+    /// straight from its columns — the same shape [`push_record`](Self::push_record)
+    /// would build, but with no intermediate row-shape `PileupRecord` (and no
     /// per-allele `Vec`). This is the columnar→columnar fast path the
     /// span reader uses in place of the `columnar → row → columnar`
     /// round-trip.

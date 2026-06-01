@@ -9,7 +9,7 @@
 //! both branches converge on the same downstream chain via a
 //! `Box<dyn Iterator>` adapter that lifts the upstream error into
 //! [`GrouperError`] — the wiring lives in
-//! [`crate::var_calling::from_bam::pipeline::drive_cohort_pipeline`].
+//! [`crate::var_calling::from_psp::driver::drive_cohort_chunked`].
 //!
 //! Contamination plumbing:
 //!
@@ -42,7 +42,7 @@ use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::from_psp::{
     ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
-    DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
+    DownstreamFilterParams, drive_cohort_chunked,
 };
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError,
@@ -401,7 +401,6 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
                 args.target_variants_per_chunk
             };
             ChunkSizingParams {
-                chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
                 target_variants_per_chunk: std::num::NonZeroU32::new(target_variants),
             }
         },

@@ -922,8 +922,8 @@ impl PosteriorRecord {
     /// True iff at least one sample's argmax genotype carries a
     /// non-reference allele.
     ///
-    /// The canonical [`genotype_order`](crate::var_calling::per_group_merger::genotype_order)
-    /// table places the all-REF genotype at index 0 for every
+    /// The canonical [`genotype_order`] table places the all-REF
+    /// genotype at index 0 for every
     /// `(ploidy, n_alleles)` (e.g. `0/0` for diploid biallelic,
     /// `AAAA` for tetraploid biallelic), so the check is just
     /// `best_genotype.iter().any(|&i| i != 0)`.
@@ -1222,14 +1222,14 @@ where
 {
     /// Construct an engine with the [project defaults] and the default
     /// math backend ([`InterpUnivariateSimdMath`], ~25 % faster than
-    /// [`ExactMath`] on the contam-on bench with ~50× margin under the
+    /// [`ExactMath`](backends::ExactMath) on the contam-on bench with ~50× margin under the
     /// approximate-parity budget — see the 2026-05-18 SIMD analysis
     /// report).
     ///
     /// For bit-identical reproducibility against the unoptimised
     /// engine, construct with
     /// [`with_math_backend`](Self::with_math_backend) and pass
-    /// [`ExactMath`] explicitly.
+    /// [`ExactMath`](backends::ExactMath) explicitly.
     ///
     /// [project defaults]: PosteriorEngineConfig::with_project_defaults
     pub fn new(upstream: I) -> Self {
@@ -1250,7 +1250,7 @@ where
 {
     /// Construct an engine with explicit tuning and an explicit math
     /// backend. Use this to opt into a scalar-only approximate backend
-    /// (`InterpUnivariateMath`) or to opt back into [`ExactMath`] if
+    /// (`InterpUnivariateMath`) or to opt back into [`ExactMath`](backends::ExactMath) if
     /// bit-identical reproducibility against the unoptimised engine
     /// matters.
     pub fn with_math_backend(upstream: I, config: PosteriorEngineConfig, math: M) -> Self {
