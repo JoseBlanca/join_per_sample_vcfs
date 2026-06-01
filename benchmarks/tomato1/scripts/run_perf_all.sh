@@ -10,12 +10,16 @@
 #     so it's mounted via DEV_EXTRA_MOUNT.
 #
 # Sections and the scripts that feed them:
-#   §1 single-sample direct (CRAM→VCF): perf_ours_from_bam, perf_freebayes,
-#                                        perf_gatk_direct   (all N=1 rows)
+#   §1 single-sample direct (CRAM→VCF): perf_ours_from_bam, perf_freebayes
+#                                        (N=1 rows)
 #   §2 one intermediate, 4 threads:      perf_ours_psp_4t, perf_gatk_gvcf_4t
-#   §3 scaling CRAM→VCF:                 perf_ours_whole_pipeline,
-#                                        perf_freebayes, perf_gatk_direct
+#   §3 scaling CRAM→VCF:                 perf_ours_whole_pipeline, perf_freebayes
 #   §4 scaling intermediate→VCF:         perf_ours_joint, perf_gatk_joint
+#
+# NOTE: GATK direct multi-sample HaplotypeCaller (CRAM→VCF) is deliberately
+# NOT measured — its wall is super-linear in N (re-assembly over pooled deep
+# coverage), so it's impractical past a few samples. GATK's scalable route
+# is the GVCF flow (§4, perf_gatk_joint).
 #
 # §4 assumes the per-sample intermediates already exist:
 #   - ours: results/ours/cohort/psp/*.psp
@@ -60,7 +64,6 @@ HOST_SCRIPTS=(
     perf_freebayes.py            # §1 + §3
 )
 CONTAINER_SCRIPTS=(
-    perf_gatk_direct.py          # §1 + §3
     perf_gatk_gvcf_4t.py         # §2
     perf_gatk_joint.py           # §4
 )

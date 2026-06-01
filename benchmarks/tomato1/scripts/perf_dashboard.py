@@ -62,17 +62,21 @@ def _(mo):
     tomato1 cohort (CRAMs pre-sliced to `regions.bed`). Four sections:
 
     - **1. Single-sample direct calling** (CRAM → VCF, bar charts).
-      freebayes, GATK (direct `HaplotypeCaller`), and pop_var_caller
-      (`var-calling-from-bam`, the direct single-sample route). 4-thread
-      budget each (ours `--threads 4`; GATK `--native-pair-hmm-threads 4`;
-      freebayes 4 concurrent region workers).
+      freebayes vs pop_var_caller (`var-calling-from-bam`, the direct
+      single-sample route). 4-thread budget each (ours `--threads 4`;
+      freebayes 4 concurrent region workers). _GATK is excluded here — its
+      only "direct cram→vcf" path is multi-sample HaplotypeCaller, which
+      doesn't scale (see §3 note); GATK appears in §2 and §4._
     - **2. Build one per-sample intermediate** (one sample, 4 threads, bar
       charts). GATK `HaplotypeCaller -ERC GVCF` → GVCF vs pop_var_caller
       `pileup` → `.psp`.
     - **3. Scaling CRAM → VCF, N samples** (line charts). freebayes
-      (region-parallel), GATK (one direct multi-sample `HaplotypeCaller`),
-      pop_var_caller (4 parallel pileups, then one 4-thread joint
-      `var-calling`).
+      (region-parallel) vs pop_var_caller (4 parallel pileups, then one
+      4-thread joint `var-calling`). _GATK's direct multi-sample
+      `HaplotypeCaller` is excluded: it re-assembles over pooled deep
+      coverage, so wall is super-linear in N (≈3.5× per sample-doubling on
+      tomato1) — impractical past a few samples. GATK's scalable route is
+      the GVCF flow shown in §4._
     - **4. Scaling intermediate → VCF, N samples** (line charts; the step
       you re-run when new samples arrive). GATK `CombineGVCFs` +
       `GenotypeGVCFs` vs pop_var_caller `.psp` → VCF (4 threads).
@@ -81,8 +85,8 @@ def _(mo):
       how well one `var-calling` process uses more cores.
 
     Inputs: per-caller TSVs at `results/perf/<caller>.tsv`, written by
-    `perf_<caller>.py`. Section 5 reads `ours_joint_threads.tsv`
-    (`perf_ours_joint_threads.py`).
+    `perf_<caller>.py`. `freebayes.tsv` feeds both §1 (N=1 row) and §3.
+    Section 5 reads `ours_joint_threads.tsv` (`perf_ours_joint_threads.py`).
     """)
     return
 
@@ -91,12 +95,12 @@ def _(mo):
 def _(Path):
     test_dir = Path(__file__).resolve().parent.parent
     perf_dir = test_dir / "results" / "perf"
-    # Every TSV any section needs. freebayes / gatk_direct are shared.
+    # Every TSV any section needs. freebayes is shared across §1 and §3.
     callers = (
-        "ours_from_bam", "freebayes", "gatk_direct",   # §1
-        "ours_psp_4t", "gatk_gvcf_4t",                 # §2
-        "ours_whole_pipeline",                         # §3 (+freebayes, gatk_direct)
-        "ours_joint", "gatk_joint",                    # §4
+        "ours_from_bam", "freebayes",   # §1 (freebayes also §3)
+        "ours_psp_4t", "gatk_gvcf_4t",  # §2
+        "ours_whole_pipeline",          # §3 (+freebayes)
+        "ours_joint", "gatk_joint",     # §4
     )
     tsv_paths = {c: perf_dir / f"{c}.tsv" for c in callers}
     return callers, perf_dir, test_dir, tsv_paths
@@ -181,7 +185,6 @@ def _():
         "ours_whole_pipeline":  "#2ca02c",  # green
         "ours_joint":           "#1a5d1a",  # dark green
         "freebayes":            "#d62728",  # red
-        "gatk_direct":          "#9467bd",  # purple
         "gatk_gvcf_4t":         "#e377c2",  # pink
         "gatk_joint":           "#8c564b",  # brown
     }
@@ -192,7 +195,6 @@ def _():
         "ours_whole_pipeline":  "pop_var_caller\n(pileup+joint)",
         "ours_joint":           "pop_var_caller\n(psp→vcf)",
         "freebayes":            "freebayes",
-        "gatk_direct":          "GATK\n(direct HC)",
         "gatk_gvcf_4t":         "GATK\n(HC→gvcf)",
         "gatk_joint":           "GATK\n(Combine+Genotype)",
     }
@@ -319,7 +321,7 @@ def _(bar_pair, mo, rows_by_caller):
     # Section 1 — single-sample direct calling (CRAM -> VCF), N=1 bars.
     fig_1, missing_1 = bar_pair(
         rows_by_caller,
-        ("freebayes", "gatk_direct", "ours_from_bam"),
+        ("freebayes", "ours_from_bam"),
         target_n=1,
         title="1. Single-sample direct calling (CRAM → VCF, 4-thread budget)",
     )
@@ -331,11 +333,12 @@ def _(bar_pair, mo, rows_by_caller):
     - **freebayes** — one process per BED region (20 regions), **up to 4
       concurrent processes, 1 thread each** (freebayes has no internal
       threading); per-region VCFs concatenated at the end.
-    - **GATK (direct HC)** — **1 `HaplotypeCaller` process, 4 pair-HMM
-      threads** (`--native-pair-hmm-threads 4`), `--intervals regions.bed`.
     - **pop_var_caller (direct)** — **1 `var-calling-from-bam` process, 4
       threads** (`--threads 4`). Runs genome-wide (no BED flag), but the
       pre-sliced CRAM confines the work to the same regions.
+
+    _GATK omitted: its only direct cram→vcf route is multi-sample
+    HaplotypeCaller, excluded for the scaling reason noted in §3._
     """)
     _body_1 = mo.as_html(fig_1) if fig_1 is not None else mo.md(
         "_(Section 1 unavailable; missing TSV(s)/N=1 row: "
@@ -379,7 +382,7 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
     # Section 3 — scaling CRAM -> VCF with N samples.
     fig_3, missing_3 = line_pair(
         rows_by_caller,
-        ("freebayes", "gatk_direct", "ours_whole_pipeline"),
+        ("freebayes", "ours_whole_pipeline"),
         title="3. Scaling CRAM → VCF vs N samples",
         xscale_val=xscale.value,
         yscale_val=yscale.value,
@@ -392,12 +395,17 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
     - **freebayes** — per-region processes, **up to 4 concurrent, 1 thread
       each**; each process calls all N samples in its region → per-region
       multi-sample VCFs, concatenated.
-    - **GATK (direct HC)** — **1 `HaplotypeCaller` process** given all N
-      CRAMs (`--input` ×N) → one joint VCF, **4 pair-HMM threads**.
     - **pop_var_caller (pileup + joint)** — stage 1: **up to 4 concurrent
       `pileup` processes, 1 thread each** (one per sample); stage 2: **1
       `var-calling` process, 4 threads**. Wall = stage1 + stage2; peak RSS
       = max(stage1, stage2).
+
+    _GATK's direct multi-sample `HaplotypeCaller` (one process, all N
+    `--input`s → joint VCF) is excluded: it re-assembles haplotypes over
+    the pooled deep coverage of every sample per active region, so wall is
+    super-linear in N (on tomato1: N=1→0.8 min, 2→2.1, 4→7.7, ≈3.5× per
+    doubling) — impractical past a few samples. GATK's scalable path is the
+    GVCF flow in §4._
     """)
     _body_3 = mo.as_html(fig_3) if fig_3 is not None else mo.md(
         "_(Section 3 unavailable; missing TSV(s): "
