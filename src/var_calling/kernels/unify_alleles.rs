@@ -261,8 +261,12 @@ impl WorkingAllele {
 #[derive(Debug, Default)]
 pub struct UnifyAllelesScratch {
     /// Per-position projection's byte-sequence → working-allele-index
-    /// dedup map. Cleared at entry to each per-group call.
-    pub(crate) byte_index: AHashMap<Vec<u8>, usize>,
+    /// dedup map. Cleared at entry to each per-group call. The key is a
+    /// `SmallVec<[u8; 16]>` (H3): a SNP / short-indel projected sequence
+    /// stays inline, so the per-distinct-allele insert no longer
+    /// heap-allocates an owned key `Vec` (the #1 site by block count
+    /// after H2). Lookups still borrow `&[u8]` via `SmallVec: Borrow<[u8]>`.
+    pub(crate) byte_index: AHashMap<SmallVec<[u8; 16]>, usize>,
     /// Working buffer for projecting a candidate allele's bytes onto
     /// the group's REF span before testing for byte-equality against
     /// existing entries.
@@ -593,7 +597,7 @@ pub(crate) fn project_per_position_into_scratch(
 
     // REF goes at index 0.
     push_allele_into_scratch(scratch, ref_seq, false, true, n_samples);
-    scratch.byte_index.insert(ref_seq.to_vec(), 0);
+    scratch.byte_index.insert(SmallVec::from_slice(ref_seq), 0);
 
     let position_range = partition.position_range_for_group(group_idx);
     let group_position_lo = position_range.start;
@@ -629,14 +633,15 @@ pub(crate) fn project_per_position_into_scratch(
                 let entry_idx = match scratch.byte_index.get(scratch.projection_buf.as_slice()) {
                     Some(&idx) => idx,
                     None => {
-                        // Mi12: one clone is enough — `push_allele_into_scratch`
+                        // Mi12: one copy is enough — `push_allele_into_scratch`
                         // copies the bytes into the working allele's own `seq`,
                         // so `key` is free to be moved into the dedup map after
-                        // the push. Previously this cloned twice (one local
-                        // `seq_copy`, one `seq_copy.clone()` for the insert).
+                        // the push. H3: the key is a `SmallVec<[u8; 16]>`, so a
+                        // SNP / short-indel projection stays inline (no heap
+                        // alloc); only alleles longer than 16 bytes spill.
                         let idx = scratch.n_active_alleles;
-                        let key = scratch.projection_buf.clone();
-                        push_allele_into_scratch(scratch, &key, false, false, n_samples);
+                        let key: SmallVec<[u8; 16]> = SmallVec::from_slice(&scratch.projection_buf);
+                        push_allele_into_scratch(scratch, key.as_slice(), false, false, n_samples);
                         scratch.byte_index.insert(key, idx);
                         idx
                     }
@@ -759,11 +764,11 @@ pub(crate) fn admit_compound_candidates_columnar(
                 idx
             }
             None => {
-                // Mi12: one clone is enough — see the per-position
-                // dedup branch above.
+                // Mi12: one copy is enough — see the per-position
+                // dedup branch above. H3: inline `SmallVec` key.
                 let idx = scratch.n_active_alleles;
-                let key = scratch.projection_buf.clone();
-                push_allele_into_scratch(scratch, &key, true, true, n_samples);
+                let key: SmallVec<[u8; 16]> = SmallVec::from_slice(&scratch.projection_buf);
+                push_allele_into_scratch(scratch, key.as_slice(), true, true, n_samples);
                 scratch.byte_index.insert(key, idx);
                 scratch.working_alleles[idx].constituents =
                     candidate.constituents_per_first_anchor.clone();
@@ -1797,7 +1802,7 @@ mod tests {
     #[test]
     fn scratch_clear_drops_contents_preserves_capacity() {
         let mut scratch = UnifyAllelesScratch::new();
-        scratch.byte_index.insert(b"AC".to_vec(), 1);
+        scratch.byte_index.insert(SmallVec::from_slice(b"AC"), 1);
         scratch.projection_buf.extend_from_slice(b"ACGT");
         let proj_cap = scratch.projection_buf.capacity();
         scratch.clear();
