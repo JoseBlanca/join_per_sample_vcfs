@@ -1,0 +1,10 @@
+caller	n_samples	wall_seconds	peak_rss_mb	exit_code
+gatk_joint	1	14.354	724.7	0
+gatk_joint	2	16.814	713.2	0
+gatk_joint	4	31.358	706.5	0
+gatk_joint	8	61.101	727.9	0
+gatk_joint	16	132.178	643.6	0
+gatk_joint	24	200.146	718.0	0
+gatk_joint	32	277.924	678.2	0
+gatk_joint	40	362.557	814.3	0
+gatk_joint	50	447.448	764.5	0

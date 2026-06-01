@@ -1,0 +1,2 @@
+caller	n_samples	wall_seconds	peak_rss_mb	exit_code
+ours_psp_4t	1	16.045	1070.4	0

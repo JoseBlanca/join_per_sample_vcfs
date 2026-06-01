@@ -1,0 +1,10 @@
+caller	n_samples	wall_seconds	peak_rss_mb	exit_code
+freebayes	1	11.287	1254.2	0
+freebayes	2	21.425	1376.0	0
+freebayes	4	38.651	1573.2	0
+freebayes	8	72.950	2011.2	0
+freebayes	16	195.514	3081.3	0
+freebayes	24	339.413	5029.5	0
+freebayes	32	761.496	6360.7	0
+freebayes	40	3770.887	7680.4	0
+freebayes	50	1424.275	9617.2	0

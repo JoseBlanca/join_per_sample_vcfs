@@ -1,0 +1,10 @@
+caller	n_samples	wall_seconds	peak_rss_mb	exit_code
+ours_joint	1	6.199	42.8	0
+ours_joint	2	6.308	52.2	0
+ours_joint	4	6.495	75.9	0
+ours_joint	8	7.942	115.6	0
+ours_joint	16	14.157	226.7	0
+ours_joint	24	16.014	349.2	0
+ours_joint	32	21.778	601.8	0
+ours_joint	40	26.829	714.9	0
+ours_joint	50	31.710	830.7	0

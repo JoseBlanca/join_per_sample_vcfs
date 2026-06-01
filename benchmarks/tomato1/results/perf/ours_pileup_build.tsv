@@ -1,0 +1,10 @@
+caller	n_samples	wall_seconds	peak_rss_mb	exit_code
+ours_pileup_build	1	26.974	4068.3	0
+ours_pileup_build	2	61.774	4068.3	0
+ours_pileup_build	4	61.774	4068.3	0
+ours_pileup_build	8	71.205	4068.3	0
+ours_pileup_build	16	148.800	4068.3	0
+ours_pileup_build	24	185.818	4068.3	0
+ours_pileup_build	32	266.781	4068.3	0
+ours_pileup_build	40	323.747	4068.3	0
+ours_pileup_build	50	375.566	4068.3	0
