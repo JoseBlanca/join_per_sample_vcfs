@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 
 use ahash::AHashMap;
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::pileup_record::ChainId;
@@ -287,13 +288,18 @@ pub struct UnifyAllelesScratch {
     /// pairs from cap-dropped alleles. Length is `n_samples` after
     /// each call; empty when the cap did not drop anything.
     pub(crate) other_per_sample: Vec<Vec<(u32, u32)>>,
-    /// M3: per-sample chain-id → constituents map for compound
-    /// detection. `BTreeMap::clear()` is called per sample inside
-    /// `detect_compound_candidates_columnar`, preserving the map's
-    /// node-arena allocation across the inner sample loop and across
-    /// groups. The previous shape constructed a fresh `BTreeMap` on
-    /// every per-call entry.
-    pub(crate) compound_by_chain: BTreeMap<ChainId, Vec<CompoundConstituent>>,
+    /// Per-sample chain-id → constituents map for compound detection,
+    /// cleared per sample inside `detect_compound_candidates_columnar`.
+    /// An `AHashMap` (not `BTreeMap`) because `HashMap::clear()` retains
+    /// the bucket allocation across the inner sample loop and across
+    /// groups, whereas `BTreeMap::clear()` drops its nodes (and their
+    /// value `Vec`s) and re-allocates them on the next insert — the H2
+    /// allocation hot spot in the 2026-06-01 perf review. The value is a
+    /// `SmallVec<[_; 2]>` so the common ≤2-constituent compound stays
+    /// inline (no per-chain heap alloc). Iteration order does not affect
+    /// output: the caller keys candidates by the canonical constituent
+    /// tuple and folds order-independently, so an unordered map is sound.
+    pub(crate) compound_by_chain: AHashMap<ChainId, SmallVec<[CompoundConstituent; 2]>>,
 }
 
 impl UnifyAllelesScratch {
@@ -782,13 +788,14 @@ pub(crate) fn admit_compound_candidates_columnar(
 /// samples in ascending `sample_idx` so the "first anchoring sample"
 /// is deterministically the lex-smallest one.
 ///
-/// M3: the per-sample chain proposals map (`compound_by_chain`) lives
-/// on the caller's `UnifyAllelesScratch` so the per-sample
-/// `BTreeMap::clear` reuses the same nodes across iterations instead
-/// of dropping and re-allocating per sample × per group. The
-/// candidates map is local — its values move out into the returned
-/// `Vec`, so the outer-map allocator overhead is one alloc-and-free
-/// per group regardless of scratch threading.
+/// The per-sample chain proposals map (`compound_by_chain`) lives on
+/// the caller's `UnifyAllelesScratch` and is an `AHashMap`, so the
+/// per-sample `clear()` retains the bucket allocation across iterations
+/// instead of dropping and re-allocating per sample × per group (H2 —
+/// `BTreeMap::clear` does not retain its node arena). The candidates
+/// map is local — its values move out into the returned `Vec`, so the
+/// outer-map allocator overhead is one alloc-and-free per group
+/// regardless of scratch threading.
 fn detect_compound_candidates_columnar(
     chunk: &MaterialisedChunk,
     partition: &WindowPartition,
@@ -816,7 +823,7 @@ fn detect_compound_candidates_columnar(
                 .map(|c| (c.record_idx, c.local_allele_idx))
                 .collect();
             let entry = candidates.entry(key).or_insert_with(|| CompoundCandidate {
-                constituents_per_first_anchor: constituents.clone(),
+                constituents_per_first_anchor: constituents.to_vec(),
                 per_sample: vec![ChainAnchorEvidence::default(); n_samples],
             });
             entry.per_sample[sample_idx].intersection += 1;
@@ -841,7 +848,7 @@ fn build_chain_proposals_columnar(
     partition: &WindowPartition,
     group_idx: usize,
     sample_idx: usize,
-    by_chain: &mut BTreeMap<ChainId, Vec<CompoundConstituent>>,
+    by_chain: &mut AHashMap<ChainId, SmallVec<[CompoundConstituent; 2]>>,
 ) {
     let position_range = partition.position_range_for_group(group_idx);
     let group_position_lo = position_range.start;
