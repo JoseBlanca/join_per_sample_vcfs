@@ -14,9 +14,6 @@ pub mod psp_to_pileup;
 pub mod stage1_pipeline;
 pub mod var_calling;
 
-pub use crate::var_calling::from_bam::driver::{
-    VarCallingFromBamArgs, VarCallingFromBamCliError, run_var_calling_from_bam,
-};
 pub use batch_assignment::{BatchAssignment, BatchAssignmentError, DEFAULT_BATCH_ID};
 pub use cli::{Cli, PileupArgs, PileupCliError, PopVarCallerCommand, run_pileup};
 pub use contamination_artefact::{ContaminationArtefact, ContaminationArtefactError};

@@ -8,7 +8,7 @@ use std::process;
 use clap::Parser;
 use pop_var_caller::pop_var_caller::{
     Cli, PopVarCallerCommand, run_estimate_contamination, run_pileup, run_psp_to_pileup,
-    run_var_calling, run_var_calling_from_bam,
+    run_var_calling,
 };
 
 // Walk the `std::error::Error::source()` chain joining messages with
@@ -46,9 +46,6 @@ fn main() {
         }
         PopVarCallerCommand::VarCalling(args) => {
             run_var_calling(&args).map_err(|e| format_error_chain(&e))
-        }
-        PopVarCallerCommand::VarCallingFromBam(args) => {
-            run_var_calling_from_bam(&args).map_err(|e| format_error_chain(&e))
         }
     };
     if let Err(msg) = result {

@@ -193,22 +193,9 @@ pub(super) fn open_bam_record_stream(
     Ok((header, records))
 }
 
-/// Open a BAM, read its SAM header, and discard the reader. Same
-/// validation as the first half of [`open_bam_record_stream`]
-/// (BAM magic-byte check is folded into `read_header`); used by
-/// callers that only need the header (e.g. the cohort driver's
-/// per-input header harvest) so they pay one open + one
-/// header-read per input rather than duplicating the sequence
-/// inline.
-pub(crate) fn read_bam_header_only(path: &Path) -> Result<sam::Header, AlignmentInputError> {
-    let (_reader, header) = open_bam_reader_with_header(path)?;
-    Ok(header)
-}
-
-/// Shared BAM open + header-read sequence. Both
-/// `open_bam_record_stream` and `read_bam_header_only` call
-/// through here so the magic-byte check and the error wrapping
-/// stay in one place.
+/// Shared BAM open + header-read sequence used by
+/// `open_bam_record_stream` so the magic-byte check and the error
+/// wrapping stay in one place.
 fn open_bam_reader_with_header(
     path: &Path,
 ) -> Result<(bam::io::Reader<bgzf::io::Reader<File>>, sam::Header), AlignmentInputError> {

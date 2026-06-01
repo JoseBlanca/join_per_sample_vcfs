@@ -793,9 +793,16 @@ fn emit_or_drop(
     Ok(())
 }
 
-/// Welch's-t MAPQ-difference filter — direct port of the streaming
-/// driver's `record_fails_mapq_diff_t` so the chunk driver can
-/// match its drop semantics without a cross-module call.
+/// Integration-test alias for [`record_fails_mapq_diff_t`]. The helper
+/// itself is private to the driver (single call site in `emit_or_drop`);
+/// the alias lets `cohort_vcf_writer_integration` exercise the decision
+/// without exposing the production helper as `pub`.
+#[doc(hidden)]
+pub fn record_fails_mapq_diff_t_for_test(record: &PosteriorRecord, threshold: f32) -> bool {
+    record_fails_mapq_diff_t(record, threshold)
+}
+
+/// Welch's-t MAPQ-difference filter applied post-EM in `emit_or_drop`.
 fn record_fails_mapq_diff_t(record: &PosteriorRecord, threshold: f32) -> bool {
     if !threshold.is_finite() {
         return false;

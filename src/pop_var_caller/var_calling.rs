@@ -40,7 +40,6 @@ use crate::pop_var_caller::contamination_artefact::{
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
-use crate::var_calling::from_bam::pipeline::CohortDriveStats;
 use crate::var_calling::from_psp::{
     ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
     DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
@@ -249,20 +248,18 @@ pub enum VarCallingCliError {
 /// 7. Verify the FASTA's per-contig bytes against the `.psp`
 ///    per-contig MD5s by streaming each contig through `Md5::update`
 ///    in parallel — peak memory is one 64 KiB window per worker, no
-///    contig-sized allocations. No process-wide reference fetcher
-///    is built — each per-chrom worker constructs its own
-///    `StreamingChromRefFetcher` inside
-///    [`process_one_chromosome`](crate::var_calling::from_bam::pipeline::process_one_chromosome).
+///    contig-sized allocations. No process-wide reference fetcher is
+///    built — the chunk driver constructs a per-chromosome
+///    `StreamingChromRefFetcher` as it advances.
 /// 8. Cohort metadata + writer-config template.
-/// 9. Per-chromosome parallel partition: one worker per contig,
-///    each writes a complete VCF fragment to a scratch TempDir
-///    located next to the final output. Workers run via
-///    `rayon::par_iter`; results are collected and the first error
-///    (if any) is surfaced after every worker has joined.
-/// 10. [`concat_fragments`] assembles the per-chrom fragments in
-///     contig-table order into the final output via the writer's
-///     atomic-rename + parent-dir-fsync discipline.
-/// 11. Print a one-shot stderr run-summary block (includes
+/// 9. Drive the chunk loop ([`drive_cohort_chunked`]): a sequential
+///    per-chromosome outer loop with a within-chromosome chunk loop
+///    that materialises one chunk × N samples at a time, partitions it
+///    into windows, and runs the per-group merger + posterior EM on
+///    each window. Records stream straight into a single
+///    [`CohortVcfWriter`](crate::vcf::CohortVcfWriter) in genomic order
+///    — no per-chromosome fragments, no concat.
+/// 10. Print a one-shot stderr run-summary block (includes
 ///     `effective_threads` + the `requested … capped by N chromosomes`
 ///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
@@ -425,38 +422,15 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         writer_cfg_template,
         driver_params,
     )?;
-    let total_stats = chunk_stats_to_cohort_stats(chunk_stats);
 
     // 11. Stderr summary.
-    print_run_summary(&sample_names, total_stats, args.threads, chromosomes.len());
+    print_run_summary(&sample_names, chunk_stats, args.threads, chromosomes.len());
     Ok(())
 }
 
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
-
-/// Sum the chunk driver's per-category counters into the shared
-/// [`CohortDriveStats`] shape `print_run_summary` consumes. The
-/// streaming driver populates [`CohortDriveStats`] directly; the
-/// chunk driver populates [`ChunkDriverStats`] (the two structs
-/// carry the same fields). Phase A.1 may collapse the two into a
-/// shared type once the streaming driver is retired from this
-/// path.
-fn chunk_stats_to_cohort_stats(stats: ChunkDriverStats) -> CohortDriveStats {
-    CohortDriveStats {
-        records_written: stats.records_written,
-        records_unconverged: stats.records_unconverged,
-        records_dropped_hom_ref: stats.records_dropped_hom_ref,
-        records_dropped_low_qual: stats.records_dropped_low_qual,
-        records_dropped_low_alt_obs: stats.records_dropped_low_alt_obs,
-        records_dropped_low_mapq_diff_t: stats.records_dropped_low_mapq_diff_t,
-        lh_cap_groups_skipped: stats.lh_cap_groups_skipped,
-        lh_cap_alleles_in_skipped: stats.lh_cap_alleles_in_skipped,
-        chunks_loaded: stats.chunks_loaded,
-        chunk_variants_total: stats.chunk_variants_total,
-    }
-}
 
 /// Load and reconcile a contamination-estimates artefact against the
 /// cohort sample order. Returns `None` if `path` is `None`.
@@ -489,7 +463,7 @@ fn load_contamination(
 /// the happy-path summary tight.
 fn print_run_summary(
     sample_names: &[String],
-    stats: CohortDriveStats,
+    stats: ChunkDriverStats,
     requested_threads: Option<usize>,
     n_chromosomes: usize,
 ) {

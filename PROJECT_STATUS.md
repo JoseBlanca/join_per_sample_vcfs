@@ -19,7 +19,32 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task:** **DUST worker pool — parallel DUST-ahead** —
+> - **Last completed task (2026-06-01):** **Direct path removed —
+>   `var-calling-from-bam` deleted.** The single-sample BAM/CRAM → VCF
+>   subcommand and the old streaming engine behind it were removed
+>   outright; the **only** route to a VCF is now `pileup` (→ `.psp`)
+>   followed by `var-calling` (the chunked cohort driver). Deleted: the
+>   `var-calling-from-bam` CLI subcommand (cli/main/re-exports); the
+>   whole `src/var_calling/from_bam/` module (direct driver +
+>   `drive_cohort_pipeline` streaming engine + `process_one_chromosome` +
+>   `CohortPipelineParams`); the now-dead `src/vcf/concat.rs`
+>   fragment-concat module + its `VcfWriteError` concat variants; the
+>   per-input header helpers `read_{bam,cram}_header_only` (the
+>   CRAM-version-gate regression test was retargeted to the surviving
+>   `open_cram_reader_with_header`); the 4 from-bam integration tests;
+>   and the `cohort_e2e_perf` bench (it only exercised the streaming
+>   driver — the chunked path's perf/heap coverage lives in the
+>   `profile_cohort_e2e` + `dhat_var_calling` examples). Shared survivors
+>   relocated: `DEFAULT_MIN_{QUAL_PHRED,ALT_OBS_PER_SAMPLE,MAPQ_DIFF_T}`
+>   → `crate::var_calling` root; `CohortDriveStats` collapsed into
+>   `ChunkDriverStats` (the `chunk_stats_to_cohort_stats` shim is gone).
+>   `cargo fmt --check` / `clippy --all-targets --all-features -D warnings`
+>   / full test suite (1059 lib + all integration binaries) green.
+>   Context: this branch first explored *unifying* the direct path onto
+>   the chunk architecture (a `WalkerColumnSource` feeding the streaming
+>   loader), but the path is only used for FreeBayes comparison and not
+>   in the lab pipeline, so the PM chose removal over unification.
+> - **Previous task:** **DUST worker pool — parallel DUST-ahead** —
 >   [cohort_dust_worker_pool_2026-05-31.md](ia/reports/implementations/cohort_dust_worker_pool_2026-05-31.md).
 >   Profiling (samply + a DUST-on/off ablation) showed the Stage 3 single
 >   DUST-ahead thread was the wall floor — sdust over the whole genome is
@@ -1208,8 +1233,12 @@ list is clear.
     (acknowledged for follow-up). Includes L1 (per-group inner
     `par_iter` removed) and a new pure-Rust bgzf-aware concat
     module (`src/var_calling/vcf_writer/concat.rs`).
-  - **CRAM → VCF arm (`var-calling-from-bam`) — per-chromosome
-    parallelism shipped 2026-05-24:**
+  - **CRAM → VCF arm (`var-calling-from-bam`) — REMOVED 2026-06-01.**
+    The direct single-sample BAM/CRAM → VCF subcommand was deleted
+    entirely (see the Current-focus "Last completed task"); the only
+    route to a VCF is now `pileup` → `.psp` → `var-calling`. The
+    history below is retained for the record. Per-chromosome
+    parallelism shipped 2026-05-24:
     [var_calling_from_bam_per_chromosome_2026-05-24.md](doc/devel/reports/implementations/var_calling_from_bam_per_chromosome_2026-05-24.md);
     plan
     [var_calling_from_bam_per_chromosome.md](doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md).
