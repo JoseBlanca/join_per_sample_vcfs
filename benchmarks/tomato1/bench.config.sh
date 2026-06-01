@@ -18,7 +18,7 @@ CRAM_GLOB="${CRAM_GLOB:-*.bench.cram}"
 CRAM_SUFFIX="${CRAM_SUFFIX:-.bench.cram}"
 
 # Sample used by `single` mode (matches the original run_*_single.sh).
-SINGLE_CRAM="${SINGLE_CRAM:-SRR17274057.p1.bench.cram}"
+SINGLE_CRAM="${SINGLE_CRAM:-SRR7279481.p1.bench.cram}"
 
 PLOIDY="${PLOIDY:-2}"
 THREADS="${THREADS:-4}"

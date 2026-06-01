@@ -242,25 +242,43 @@ def _():
     def line_pair(rows_by_caller, callers, *, title, xscale_val, yscale_val):
         """Two line panels (runtime + peak RSS) vs N samples over
         `callers`. Returns (fig, missing_callers); fig is None only if NO
-        caller is present."""
+        caller is present.
+
+        Runs that exited non-zero (e.g. an OOM-kill at high N) are NOT
+        dropped — they're drawn as a distinct ✗ marker at the (N, value)
+        the run reached before dying. For a memory-scaling comparison the
+        point where a tool falls over is a headline result, not noise."""
         present = [c for c in callers if c in rows_by_caller]
         if not present:
             return None, list(callers)
         fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
+        failed_any = False
         for caller in present:
-            ok_rows = sorted(
-                (r for r in rows_by_caller[caller] if r["exit_code"] == 0),
-                key=lambda r: r["n_samples"],
-            )
-            if not ok_rows:
-                continue
-            xs = [r["n_samples"] for r in ok_rows]
-            ts = [r["wall_seconds"] for r in ok_rows]
-            ms = [r["peak_rss_mb"] for r in ok_rows]
+            rows = sorted(rows_by_caller[caller], key=lambda r: r["n_samples"])
+            ok_rows = [r for r in rows if r["exit_code"] == 0]
+            bad_rows = [r for r in rows if r["exit_code"] != 0]
             colour = PALETTE.get(caller)
             label = LABELS.get(caller, caller).replace("\n", " ")
-            ax_t.plot(xs, ts, marker="o", label=label, color=colour)
-            ax_m.plot(xs, ms, marker="o", label=label, color=colour)
+            if ok_rows:
+                ax_t.plot([r["n_samples"] for r in ok_rows],
+                          [r["wall_seconds"] for r in ok_rows],
+                          marker="o", label=label, color=colour)
+                ax_m.plot([r["n_samples"] for r in ok_rows],
+                          [r["peak_rss_mb"] for r in ok_rows],
+                          marker="o", label=label, color=colour)
+            for r in bad_rows:
+                failed_any = True
+                ax_t.scatter([r["n_samples"]], [r["wall_seconds"]],
+                             marker="x", s=90, color=colour, zorder=5)
+                ax_m.scatter([r["n_samples"]], [r["peak_rss_mb"]],
+                             marker="x", s=90, color=colour, zorder=5)
+            # Annotate the first failing N on the memory panel (where OOM bites).
+            if bad_rows:
+                first_bad = bad_rows[0]
+                ax_m.annotate(f"{label.split()[0]} ✗ N={first_bad['n_samples']}",
+                              (first_bad["n_samples"], first_bad["peak_rss_mb"]),
+                              textcoords="offset points", xytext=(6, 6),
+                              fontsize=8, color=colour)
         for ax, ylabel, panel_title in (
             (ax_t, "wall-clock seconds", "Runtime"),
             (ax_m, "peak RSS (MB)",      "Peak memory"),
@@ -271,7 +289,14 @@ def _():
             ax.set_xscale(xscale_val)
             ax.set_yscale(yscale_val)
             ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=9)
+        # Legends last; append the failed-marker entry so it isn't clobbered.
+        handles, _lab = ax_t.get_legend_handles_labels()
+        if failed_any:
+            from matplotlib.lines import Line2D
+            handles = handles + [Line2D([], [], marker="x", linestyle="none",
+                                        color="grey", label="run failed (exit≠0, e.g. OOM)")]
+        ax_t.legend(handles=handles, fontsize=9)
+        ax_m.legend(fontsize=9)
         fig.suptitle(title, fontsize=13, y=1.02)
         fig.tight_layout()
         return fig, []
@@ -390,7 +415,10 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
     sec3_methods = mo.md("""
     **Materials & methods.** Cohort CRAM → VCF as N grows, `regions.bed`.
     Parallelism budget = 4 for every tool. Wall + peak RSS over the whole
-    process tree.
+    process tree. A **✗** marks a run that died at that N (e.g. OOM-killed) —
+    for a memory-scaling comparison, the point where a tool falls over is
+    itself a headline result (pop_var_caller's design trades RAM for the
+    ability to keep scaling to more samples).
 
     - **freebayes** — per-region processes, **up to 4 concurrent, 1 thread
       each**; each process calls all N samples in its region → per-region
