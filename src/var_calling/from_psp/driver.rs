@@ -100,11 +100,12 @@ pub struct ChunkSizingParams {
     pub target_variants_per_chunk: Option<NonZeroU32>,
 }
 
-/// Mi19: post-EM downstream filters applied by `emit_or_drop` before
+/// Mi19: downstream per-record filters. `min_alt_obs_per_sample` is
+/// applied **pre-EM** at the merger→EM boundary (in
+/// `build_posterior_record_columnar`); the rest (`min_qual_phred`,
+/// MAPQ-diff t-test) are applied **post-EM** by `emit_or_drop` before
 /// each record reaches the VCF writer. Grouped separately from
-/// `ChunkDriverParams` so the per-record filter axis is named and
-/// `emit_or_drop`'s signature can take `&DownstreamFilterParams`
-/// instead of the whole driver bundle.
+/// `ChunkDriverParams` so the per-record filter axis is named.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct DownstreamFilterParams {
@@ -461,6 +462,7 @@ fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
     stats.lh_cap_groups_skipped += block.lh_cap_groups_skipped;
     stats.lh_cap_alleles_in_skipped += block.lh_cap_alleles_in_skipped;
     stats.groups_skipped_post_unify_ref_only += block.groups_skipped_post_unify_ref_only;
+    stats.records_dropped_low_alt_obs += block.records_dropped_low_alt_obs;
 }
 
 /// Serial consume: pull each block in genomic order, run the math, emit.
@@ -478,8 +480,14 @@ fn drive_blocks_serial<R: Read + Seek + Send>(
     let result: Result<(), ChunkDriverError> = (|| {
         while let Some(res) = producer.next_block() {
             let block = res?;
-            process_block(&block, per_group_cfg, posterior_cfg, &mut worker)
-                .map_err(ChunkDriverError::RunWindow)?;
+            process_block(
+                &block,
+                per_group_cfg,
+                posterior_cfg,
+                params.downstream.min_alt_obs_per_sample,
+                &mut worker,
+            )
+            .map_err(ChunkDriverError::RunWindow)?;
             roll_window_stats(stats, &worker.stats);
             worker.stats.clear();
             for record in worker.posterior_records.drain(..) {
@@ -572,6 +580,8 @@ fn drive_blocks_parallel<R: Read + Seek + Send>(
 
         // ── Workers: map `process_block` over blocks with private
         //    scratch; forward results, recycle blocks. ──
+        // `u32`, captured by Copy into each worker closure.
+        let min_alt_obs_per_sample = params.downstream.min_alt_obs_per_sample;
         for _ in 0..n_workers {
             let queue_ref = &queue;
             let result_tx = result_tx.clone();
@@ -579,7 +589,13 @@ fn drive_blocks_parallel<R: Read + Seek + Send>(
             scope.spawn(move || {
                 let mut worker = WorkerScratch::new();
                 while let Some(block) = queue_ref.pop() {
-                    match process_block(&block, per_group_cfg, posterior_cfg, &mut worker) {
+                    match process_block(
+                        &block,
+                        per_group_cfg,
+                        posterior_cfg,
+                        min_alt_obs_per_sample,
+                        &mut worker,
+                    ) {
                         Ok(()) => {
                             let out = BlockResult {
                                 seq_idx: block.seq_idx,
@@ -740,10 +756,11 @@ fn emit_or_drop(
     writer: &mut CohortVcfWriter,
     stats: &mut ChunkDriverStats,
 ) -> Result<(), ChunkDriverError> {
-    if !passes_min_alt_obs(&record, params.downstream.min_alt_obs_per_sample) {
-        stats.records_dropped_low_alt_obs += 1;
-        return Ok(());
-    }
+    // NB: the `min_alt_obs_per_sample` filter is NOT here — it runs
+    // pre-EM in `build_posterior_record_columnar` (the merger→EM
+    // boundary), matching `drive_cohort_pipeline` so the decision is
+    // made on the pre-prune allele set. See
+    // `WindowRunStats::records_dropped_low_alt_obs`.
     if !record.is_variant_call() {
         stats.records_dropped_hom_ref += 1;
         return Ok(());
@@ -774,29 +791,6 @@ fn emit_or_drop(
         })?;
     stats.records_written += 1;
     Ok(())
-}
-
-/// `min_alt_obs_per_sample` filter — same predicate as
-/// `drive_cohort_pipeline`'s `.filter_map` between merger and EM.
-/// Phase A.0 applies it post-EM (the EM has already run on the
-/// doomed record); Phase A.1's native-columnar kernel can push it
-/// back to the pre-EM boundary if perf review shows the wasted EM
-/// work matters.
-fn passes_min_alt_obs(record: &PosteriorRecord, min_obs: u32) -> bool {
-    if min_obs <= 1 || record.alleles.len() <= 1 {
-        return true;
-    }
-    let n_alleles = record.alleles.len();
-    (1..n_alleles).any(|allele_idx| {
-        let mut max_obs = 0_u32;
-        for sample_idx in 0..record.n_samples {
-            let obs = record.scalars[sample_idx * n_alleles + allele_idx].num_obs;
-            if obs > max_obs {
-                max_obs = obs;
-            }
-        }
-        max_obs >= min_obs
-    })
 }
 
 /// Welch's-t MAPQ-difference filter — direct port of the streaming
@@ -1419,6 +1413,7 @@ pub fn process_block(
     block: &ReadyBlock,
     per_group_cfg: PerGroupMergerConfig,
     posterior_cfg: &PosteriorEngineConfig,
+    min_alt_obs_per_sample: u32,
     scratch: &mut WorkerScratch,
 ) -> Result<(), PosteriorEngineError> {
     run_window(
@@ -1427,6 +1422,7 @@ pub fn process_block(
         &block.pre_fetched_ref_bytes,
         per_group_cfg,
         posterior_cfg,
+        min_alt_obs_per_sample,
         &mut scratch.pipeline_scratch,
         &mut scratch.posterior_records,
         &mut scratch.stats,
@@ -1827,9 +1823,10 @@ const MIN_CHUNK_SPAN: u32 = 50_000;
 #[cfg(test)]
 mod tests {
     //! M20: per-category filter tests for `emit_or_drop` and its
-    //! helper predicates `passes_min_alt_obs` and
-    //! `record_fails_mapq_diff_t`. Pins each filter's boundary
-    //! behaviour and the order in which `emit_or_drop` applies them.
+    //! helper predicate `record_fails_mapq_diff_t`. Pins each filter's
+    //! boundary behaviour and the post-EM order in which `emit_or_drop`
+    //! applies them. (The pre-EM `min_alt_obs_per_sample` predicate
+    //! lives in `worker::columnar_passes_min_alt_obs`.)
 
     use super::*;
     use crate::pileup_record::AlleleSupportStats;
@@ -2254,38 +2251,8 @@ mod tests {
         }
     }
 
-    // ── passes_min_alt_obs ───────────────────────────────────────────
-
-    /// `min_obs <= 1` short-circuits to `true`.
-    #[test]
-    fn passes_min_alt_obs_returns_true_when_min_obs_is_zero() {
-        let r = mk_record(100, &[(10, 0)], vec![0, 0], 100.0, 0, 0);
-        assert!(passes_min_alt_obs(&r, 0));
-    }
-
-    /// REF-only record (n_alleles == 1) short-circuits to `true`.
-    #[test]
-    fn passes_min_alt_obs_returns_true_when_record_has_only_ref_allele() {
-        let mut r = mk_record(100, &[(10, 0)], vec![0, 0], 100.0, 0, 0);
-        r.alleles = vec![ref_allele()];
-        r.scalars = vec![AlleleSupportStats::new(10, 0.0, 10, 0, 0, 0, 0)];
-        assert!(passes_min_alt_obs(&r, 5));
-    }
-
-    /// All samples have ALT obs < min_obs ⇒ false.
-    #[test]
-    fn passes_min_alt_obs_returns_false_when_all_alts_below_threshold() {
-        let r = mk_record(100, &[(10, 1), (10, 2)], vec![0, 0], 100.0, 0, 0);
-        assert!(!passes_min_alt_obs(&r, 5));
-    }
-
-    /// At least one sample's ALT obs >= min_obs ⇒ true (max-across-
-    /// samples wins).
-    #[test]
-    fn passes_min_alt_obs_returns_true_when_one_alt_meets_threshold_in_one_sample() {
-        let r = mk_record(100, &[(10, 1), (10, 7)], vec![0, 0], 100.0, 0, 0);
-        assert!(passes_min_alt_obs(&r, 5));
-    }
+    // (The `min_alt_obs_per_sample` predicate now lives pre-EM in
+    // `worker::columnar_passes_min_alt_obs`, tested there.)
 
     // ── record_fails_mapq_diff_t ─────────────────────────────────────
 
@@ -2368,25 +2335,6 @@ mod tests {
         CohortVcfWriter::new(metadata, cfg).expect("writer")
     }
 
-    /// `emit_or_drop` increments `records_dropped_low_alt_obs` (not
-    /// any other counter) when the record fails `min_alt_obs`.
-    #[test]
-    fn emit_or_drop_increments_low_alt_obs_when_record_fails_min_alt_obs() {
-        let dir = tempdir().unwrap();
-        let mut writer = open_writer(&dir.path().join("out.vcf"));
-        let params = params_for_filters(0.0, 5, f32::NEG_INFINITY, true);
-        let mut stats = ChunkDriverStats::default();
-        // Both samples have ALT obs = 1 < min_alt_obs_per_sample = 5.
-        let r = mk_record(100, &[(10, 1), (10, 1)], vec![1, 1], 100.0, 0, 0);
-        emit_or_drop(r, &params, &mut writer, &mut stats).unwrap();
-        assert_eq!(stats.records_dropped_low_alt_obs, 1);
-        assert_eq!(stats.records_dropped_hom_ref, 0);
-        assert_eq!(stats.records_dropped_low_qual, 0);
-        assert_eq!(stats.records_dropped_low_mapq_diff_t, 0);
-        assert_eq!(stats.records_written, 0);
-        let _ = writer.abort();
-    }
-
     /// `is_variant_call` returns false for all-hom-REF best_genotype
     /// ⇒ records_dropped_hom_ref bumps.
     #[test]
@@ -2425,9 +2373,9 @@ mod tests {
 
     /// Filter order: a record that *would* trip both `is_variant_call`
     /// (hom_ref) and `qual_phred` (low qual) increments **only**
-    /// `records_dropped_hom_ref` — the order is `min_alt_obs →
-    /// is_variant_call → qual_phred → mapq_diff_t`, and hom_ref
-    /// short-circuits first.
+    /// `records_dropped_hom_ref` — the post-EM order is
+    /// `is_variant_call → qual_phred → mapq_diff_t`, and hom_ref
+    /// short-circuits first. (`min_alt_obs` runs earlier, pre-EM.)
     #[test]
     fn emit_or_drop_filter_order_pins_hom_ref_winning_over_low_qual() {
         let dir = tempdir().unwrap();

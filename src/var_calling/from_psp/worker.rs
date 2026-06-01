@@ -32,6 +32,7 @@ use crate::var_calling::from_psp::kernels::project_scalars::{
 use crate::var_calling::from_psp::kernels::unify_alleles::{
     UnifiedAllelesColumns, UnifyAllelesError, UnifyAllelesScratch, unify_alleles_columnar,
 };
+use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::from_psp::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
     CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
@@ -107,6 +108,15 @@ pub struct WindowRunStats {
     /// are emitted as `Ok(None)` from `build_posterior_record_columnar`
     /// (matching the row-shape merger's REF-only no-op skip).
     pub groups_skipped_post_unify_ref_only: u64,
+    /// Groups dropped at the merger→EM boundary because no ALT allele
+    /// reached `--min-alt-obs-per-sample` (`max(num_obs across
+    /// samples) >= threshold`). Applied **pre-EM, pre-prune** on the
+    /// unified allele set so the decision matches
+    /// `drive_cohort_pipeline`'s filter stage byte-for-byte — a record
+    /// whose high-obs ALT is later pruned (AC=0) is still kept here as
+    /// long as some ALT cleared the threshold. Rolls into
+    /// `ChunkDriverStats.records_dropped_low_alt_obs`.
+    pub records_dropped_low_alt_obs: u64,
 }
 
 impl WindowRunStats {
@@ -244,6 +254,7 @@ pub fn run_window(
     pre_fetched_ref_bytes: &[Vec<u8>],
     per_group_cfg: PerGroupMergerConfig,
     posterior_cfg: &PosteriorEngineConfig,
+    min_alt_obs_per_sample: u32,
     scratch: &mut ColumnarPipelineScratch,
     output: &mut Vec<PosteriorRecord>,
     stats: &mut WindowRunStats,
@@ -266,6 +277,7 @@ pub fn run_window(
             group_ref_bytes,
             &per_group_cfg,
             posterior_cfg,
+            min_alt_obs_per_sample,
             scratch,
             stats,
         )? {
@@ -349,6 +361,7 @@ fn build_posterior_record_columnar(
     ref_bytes: &[u8],
     per_group_cfg: &PerGroupMergerConfig,
     posterior_cfg: &PosteriorEngineConfig,
+    min_alt_obs_per_sample: u32,
     scratch: &mut ColumnarPipelineScratch,
     stats: &mut WindowRunStats,
 ) -> Result<Option<PosteriorRecord>, PosteriorEngineError> {
@@ -405,6 +418,26 @@ fn build_posterior_record_columnar(
         &mut scratch.projection,
     )
     .map_err(|e| project_scalars_error_to_merger(chrom_id, group_start, group_end, e))?;
+
+    // Min-alt-obs filter at the per-group merger → EM boundary
+    // (pre-EM, pre-prune), mirroring `drive_cohort_pipeline`'s
+    // `.filter_map` between merger and EM. Evaluated on the unified
+    // (pre-prune) allele set + its projected scalars: a record whose
+    // high-obs ALT is later dropped by `prune_unsupported_alleles`
+    // (post-EM, AC=0) is still kept here as long as some ALT cleared
+    // the threshold — byte-identical to `main`. Applying it post-EM
+    // (the old emit-time site) would instead test the pruned survivor
+    // and wrongly drop the record. Doing it here also skips the EM
+    // work on doomed groups, matching main's pre-EM placement.
+    if !columnar_passes_min_alt_obs(
+        &scratch.projection.scalars,
+        n_samples,
+        n_alleles,
+        min_alt_obs_per_sample,
+    ) {
+        stats.records_dropped_low_alt_obs += 1;
+        return Ok(None);
+    }
 
     // Layer 3 — per-(sample, genotype) log-likelihood.
     let lh_ctx = LikelihoodContext {
@@ -519,6 +552,35 @@ fn build_posterior_record_columnar(
     // without it, so the chokepoint is here. No-op for biallelic groups.
     record.prune_unsupported_alleles(posterior_cfg.max_gq_phred);
     Ok(Some(record))
+}
+
+/// Pre-EM `min_alt_obs_per_sample` predicate over the projected
+/// `scalars` (length `n_samples * n_alleles`, laid out
+/// `[sample * n_alleles + allele]`). Identical logic to
+/// `drive_cohort_pipeline`'s merger→EM `.filter_map`: `true` (keep)
+/// when the filter is inert (`min_obs <= 1` or REF-only) or when some
+/// ALT allele has `max(num_obs across samples) >= min_obs`. Reads the
+/// columnar projection directly so the decision is made on the
+/// pre-prune allele set.
+fn columnar_passes_min_alt_obs(
+    scalars: &[AlleleSupportStats],
+    n_samples: usize,
+    n_alleles: usize,
+    min_obs: u32,
+) -> bool {
+    if min_obs <= 1 || n_alleles <= 1 {
+        return true;
+    }
+    (1..n_alleles).any(|allele_idx| {
+        let mut max_obs = 0_u32;
+        for sample_idx in 0..n_samples {
+            let obs = scalars[sample_idx * n_alleles + allele_idx].num_obs;
+            if obs > max_obs {
+                max_obs = obs;
+            }
+        }
+        max_obs >= min_obs
+    })
 }
 
 fn unify_alleles_error_to_merger(
@@ -720,6 +782,58 @@ mod tests {
     /// `clippy::type_complexity` lint trips at the helper locals.
     type OracleAllele = (Vec<u8>, bool, Vec<(usize, usize)>);
 
+    // ── columnar_passes_min_alt_obs (pre-EM min-alt-obs predicate) ──
+
+    /// Build a `[sample * n_alleles + allele]` scalars table from
+    /// per-(sample, allele) `num_obs` rows. Other fields are inert.
+    fn scalars_from_obs(rows: &[&[u32]]) -> Vec<AlleleSupportStats> {
+        rows.iter()
+            .flat_map(|row| {
+                row.iter()
+                    .map(|&n| AlleleSupportStats::new(n, 0.0, n, 0, 0, 0, 0))
+            })
+            .collect()
+    }
+
+    /// `min_obs <= 1` and REF-only (`n_alleles <= 1`) short-circuit to
+    /// keep — matching `drive_cohort_pipeline`'s guard.
+    #[test]
+    fn columnar_passes_min_alt_obs_short_circuits_when_inert() {
+        let s = scalars_from_obs(&[&[10, 0], &[10, 0]]);
+        assert!(columnar_passes_min_alt_obs(&s, 2, 2, 0));
+        assert!(columnar_passes_min_alt_obs(&s, 2, 2, 1));
+        // REF-only: only the REF column exists.
+        let ref_only = scalars_from_obs(&[&[10], &[10]]);
+        assert!(columnar_passes_min_alt_obs(&ref_only, 2, 1, 5));
+    }
+
+    /// Every ALT below threshold across all samples ⇒ drop.
+    #[test]
+    fn columnar_passes_min_alt_obs_drops_when_all_alts_below_threshold() {
+        // 2 samples, biallelic; ALT obs = 1 and 2, both < 5.
+        let s = scalars_from_obs(&[&[10, 1], &[10, 2]]);
+        assert!(!columnar_passes_min_alt_obs(&s, 2, 2, 5));
+    }
+
+    /// max(num_obs across samples) for some ALT clears threshold ⇒
+    /// keep, even if other samples are below it.
+    #[test]
+    fn columnar_passes_min_alt_obs_keeps_when_one_sample_clears_threshold() {
+        let s = scalars_from_obs(&[&[10, 1], &[10, 7]]);
+        assert!(columnar_passes_min_alt_obs(&s, 2, 2, 5));
+    }
+
+    /// Multiallelic: a high-obs ALT in column 2 carries the record
+    /// even when column 1's ALT is below threshold — the predicate is
+    /// `any` over ALT columns, mirroring the pre-prune behaviour that
+    /// keeps records `main` keeps.
+    #[test]
+    fn columnar_passes_min_alt_obs_keeps_when_any_alt_column_clears() {
+        // 1 sample, 3 alleles: REF=10, ALT1=1 (below), ALT2=6 (clears).
+        let s = scalars_from_obs(&[&[10, 1, 6]]);
+        assert!(columnar_passes_min_alt_obs(&s, 1, 3, 5));
+    }
+
     /// Build a chunk + partition for the worker's adapter tests.
     /// Returns `(chunk, partition)` so callers can probe both
     /// surfaces.
@@ -838,6 +952,7 @@ mod tests {
             &[],
             PerGroupMergerConfig::default(),
             &PosteriorEngineConfig::default(),
+            0, // min_alt_obs inert for this fixture
             &mut scratch,
             &mut output,
             &mut stats,
@@ -953,6 +1068,7 @@ mod tests {
             &cn_pre_fetched,
             cfg,
             &PosteriorEngineConfig::default(),
+            0, // min_alt_obs inert: pins byte-identity vs the row-shape oracle
             &mut cn_scratch,
             &mut cn_out,
             &mut cn_stats,
@@ -1141,6 +1257,7 @@ mod tests {
             &cn_pre_fetched,
             cfg,
             &PosteriorEngineConfig::default(),
+            0, // min_alt_obs inert: pins byte-identity vs the row-shape oracle
             &mut cn_scratch,
             &mut cn_out,
             &mut cn_stats,
@@ -1254,6 +1371,7 @@ mod tests {
             &cn_pre_fetched,
             cfg,
             &PosteriorEngineConfig::default(),
+            0, // min_alt_obs inert: pins byte-identity vs the row-shape oracle
             &mut cn_scratch,
             &mut cn_out,
             &mut cn_stats,
