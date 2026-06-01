@@ -62,6 +62,21 @@ macOS blockers that *do* exist (less common, mention only if hit):
 - System Integrity Protection (SIP) restricts some kernel-level DTrace probes; user-space sampling against your own process is unaffected. If `dtrace` complains about probe registration, disabling specific SIP features requires a Recovery-mode `csrutil` change — flag to user, don't recommend casually.
 - Profiling a signed third-party binary (cross-process attach) needs the binary's entitlements to allow it. Not relevant for our own `cargo bench` output.
 
+#### Tools verified available on this project's machine (macOS / Apple Silicon dev host)
+
+Confirmed present as of 2026-06-01 (re-check with `command -v` if a run is far in the future — installs drift):
+
+- **`samply`** (`~/.cargo/bin/samply`) — sampling profiler. `samply record --save-only -o out.json.gz -r 2000 -- <binary> …`. **Gotcha:** `--save-only` writes *unsymbolicated* module-relative addresses; symbolication happens in the Firefox-profiler UI (or via a symbol server samply runs). For a *headless* self-time ranking, prefer `sample` (below), which symbolicates inline.
+- **`sample` (macOS built-in)** — attach to a running PID: `sample <pid> <secs> -file out.txt`. Produces a **symbolicated** call tree directly. This is the path that worked headlessly for the 2026-06-01 `var_calling` review. Note rayon pool threads show up as idle `Sleep::sleep` frames with the full sample count — filter them out.
+- **`xctrace` (Instruments)** — `xcrun xctrace record --template 'Time Profiler' …`. GUI-oriented; `.trace` output is awkward to parse headlessly. Use `sample`/`samply` first.
+- **host `cargo` + `rustc` (native arm64-apple-darwin)** — the dev container builds *Linux* binaries (`target-container/`), which cannot be profiled natively on the macOS host and whose in-VM `perf` targets the VM kernel. So for any host profiling you must **build natively on the host** (`cargo bench --no-run` / `cargo build --release --example …`), which lands in `target/` (gitignored) — this is the sanctioned exception to "cargo runs in the container". First native build is ~1 min.
+- **DHAT** — no install needed; wired via the `dhat` crate behind the `dhat-heap` feature. `cargo run --release --example dhat_var_calling --features dhat-heap -- …` writes `dhat-heap.json` (open at <https://nnethercote.github.io/dh_view/dh_view.html>, or parse offline — the stacks are deep, so attribute to the first `src/<crate-module>/…rs:line` frame, skipping the `examples/dhat_*` alloc-hook frame and the alloc/core/BTreeMap internals). Sibling examples: `dhat_pileup`, `dhat_psp_reader`, `dhat_psp_writer`, `dhat_baq`. Run on the **host** when the fixture needs `$HOME/genomes/…` (the macOS container mounts only the project tree).
+- **`cargo-show-asm`** (`cargo asm …`, installed 2026-06-01) — codegen inspection for the `hot_loops` category: confirm autovectorization / bounds-check elision on a named hot function (`cargo asm --lib --simplify "<crate>::path::to::fn"`). Functions that the profiler sees as distinct symbols are not fully inlined and `cargo asm` will find them; fully-inlined helpers must be inspected at their caller.
+- **criterion benches** — `./scripts/dev.sh cargo bench --bench <name> -- <filter>` for reproducible wall numbers (run in the container for the committed baseline; run the native host build only when you also want to `samply`/`sample` it).
+- **Not installed** (install only if a finding hinges on it): `cargo-flamegraph` (use `samply`/`sample`), valgrind/cachegrind (unreliable on Apple Silicon — avoid).
+
+The reference FASTA for tomato fixtures lives at `~/genomes/s_lycopersicum/4.00/S_lycopersicum_chromosomes.4.00.fa`; real per-sample `.psp` cohorts are under `benchmarks/tomato1/results/ours/cohort/psp/`.
+
 **Other OSes / WSL** — Treat as the closest match (WSL2 ≈ Linux; FreeBSD has `dtrace`). If you cannot match it, file the gap and ask the user.
 
 **Other profilers are not substitutes.** Each of them answers one narrow question:
