@@ -41,11 +41,14 @@ Skills and agents are instructed to leave it untouched.
 >   also applied — the two `unify_alleles` allocation sites (BTreeMap→AHashMap
 >   + SmallVec value; `Vec<u8>`→`SmallVec<[u8;16]>` dedup key). Byte-identical;
 >   DHAT total **51.4M → 27.86M blocks (−45.8 %)** on the tomato N=18 cohort.
->   **Caveat:** DHAT peak-live rose 816 → 1224 MB across H1–H3 (likely producer
->   run-ahead — M13 unbounded channels / L11 queue depth); needs a controlled
->   peak-RSS check before claiming a net RAM effect. Next candidates: validate
->   peak-RSS at high N (scaling harness) + consider M13; then L4 (SIMD the QUAL
->   k-loop) or the remaining Likely tier.
+>   **Peak RSS verified flat** (`/usr/bin/time -l`, N=50: 2.303 → 2.286 GB,
+>   −0.7 %) — the DHAT t-gmax rise was a timing artifact (the BlockQueue bounds
+>   producer run-ahead), so no RAM regression and M13 isn't needed as a fix.
+>   **L4 closed** (won't-do): a re-profile shows H1 took the QUAL convolution
+>   cold (0 frames); the hot region moved to the already-SIMD EM E-step, so
+>   SIMD-ing the convolution would optimize dead code. Cheap consume + alloc
+>   wins are now harvested; remaining levers are the Likely tier (L1 mimalloc
+>   A/B, L5 thread oversubscription, …) and algorithmic EM work.
 > - **Previous task (2026-06-01):** **Code review of `src/var_calling/`
 >   + a PM-directed first pass of fixes.** Review of the whole subtree
 >   (Stages 3–6 + the `from_psp/` chunk driver; 23 files, 27 489 LoC,
