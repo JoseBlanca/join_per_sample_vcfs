@@ -105,6 +105,35 @@ Skills and agents are instructed to leave it untouched.
 >   inside the dev container against commit
 >   `36989d6f53460042c5219d0ff5fa6d67a7b1b129` (1 023 lib tests pass,
 >   88 of those in `var_calling::cohort_block::*`).
+> - **Merged from `main` (2026-06-01) — indel normalization:** **Indel
+>   normalization — reviewed, then
+>   restructured to replace the pre-existing F3 left-aligner** (branch
+>   `indel-normalization`, merged into this feature branch on 2026-06-01
+>   so the architecture rewrite carries the SSR-capable left-alignment).
+>   The
+>   [code review](doc/devel/reports/reviews/indel_normalization_2026-05-29.md)
+>   (Approve-with-changes, 7 Major) of the first implementation surfaced
+>   that the BAM/CRAM input cascade **already** left-aligned every read's
+>   indels — the always-on "F3" pass in `src/bam/alignment_input.rs`,
+>   pre-existing on `main`. So the feature was restructured (option 2):
+>   **F3's single-forward-pass shifter is replaced by the GATK
+>   `leftAlignIndels` port** (`indel_norm::left_align_indels`, called where
+>   F3 was), and the earlier BaqEngine prep-stage detour was reverted. The
+>   port adds collision-merge / trim-first / dual ref+read-check refinements
+>   F3 lacked; normalization stays structurally mandatory (reader is
+>   upstream of everything, `--no-baq` included). The restructure **mooted
+>   review M2/M3/M4/M5**, **resolved M7** (canonical-form `build_cigar`
+>   tests added), and **applied M1 + Mi1** (untrusted-input footprint guard
+>   + `Range::size` wrap guard). A
+>   [fresh review of the F3-replacement diff](doc/devel/reports/reviews/indel_normalization_f3_replacement_2026-05-29.md)
+>   (Approve-with-changes) then confirmed the call-site integration and
+>   fixed the defects it introduced (stale F3 comment, a broken doc link,
+>   missing `// UNREACHABLE:`, untested wrapper). Open: reader-level
+>   integration test (M2), hot-path allocation + bench (M4), `indel_norm`
+>   module move to `src/bam/` (M5), collision-merge-vs-G2 check (M6).
+>   Next: those fixes, then the deferred HG002/tomato indel-recall
+>   measurements. See the Stage 1 §"Indel normalization (left-alignment)"
+>   block.
 > - **Previous task — plan + Phase A/B implementation:** Within-chromosome
 >   chunk-parallel rewrite, **plan landed** —
 >   [cohort_within_chromosome_parallel.md](doc/devel/implementation_plans/cohort_within_chromosome_parallel.md);
@@ -555,6 +584,35 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Impl report:** [baq_2026-05-12.md](doc/devel/reports/implementations/baq_2026-05-12.md)
 - **Latest review / perf review / fixes:** [baq_2026-05-12.md](doc/devel/reports/reviews/baq_2026-05-12.md), [perf_baq_2026-05-12.md](doc/devel/reports/reviews/perf_baq_2026-05-12.md), [fixes_applied_2026-05-12.md](doc/devel/reports/implementations/fixes_applied_2026-05-12.md)
 - **Open:** none
+
+#### Indel normalization (left-alignment)
+- **Status:** implemented + reviewed + restructured (branch `indel-normalization`, not yet merged to `main`)
+- **Spec:** [calling_pipeline_architecture.md §"Indel normalization (left-alignment)"](doc/devel/specs/calling_pipeline_architecture.md) (commit `8d7dd17`)
+- **Plan:** [indel_normalization.md](doc/devel/implementation_plans/indel_normalization.md)
+- **Final approach (revised — option 2):** the code review surfaced that the
+  BAM/CRAM input cascade **already** left-aligned every read's indels (the
+  always-on "F3" pass `left_align_indels` in
+  [src/bam/alignment_input.rs](src/bam/alignment_input.rs), pre-existing on
+  `main`). Rather than add a second normalization in the BAQ prep stage, the
+  feature now **replaces F3's single-forward-pass shifter with the GATK
+  `leftAlignIndels` port** at F3's call site: F3's `left_align_indels` /
+  `try_apply_indel_shift` (+ helpers, + its `f3_*` tests) are deleted, and
+  the reader calls [`indel_norm::left_align_indels`](src/pileup/walker/indel_norm.rs)
+  (GATK port: right-to-left, trim-first, dual ref+read check, **collision-merge**
+  — the refinement F3 explicitly punted on). The reader's existing reference
+  fetch (for the F1 mismatch filter) is reused; nothing else in the merged
+  reader changes. Because the reader is upstream of everything, normalization
+  is structurally mandatory — including under `--no-baq` (no BaqEngine
+  wiring; the earlier prep-stage detour was reverted).
+- **Code:** [src/pileup/walker/indel_norm.rs](src/pileup/walker/indel_norm.rs) (the GATK port + tests); call site at [src/bam/alignment_input.rs](src/bam/alignment_input.rs) ("F3").
+- **Latest review:** [indel_normalization_f3_replacement_2026-05-29.md](doc/devel/reports/reviews/indel_normalization_f3_replacement_2026-05-29.md) — Approve-with-changes, of the F3-replacement diff. Confirmed the call-site integration is correct (`ref_seq[0]` is the read's first aligned base → `read_start=0`; reference fetch reused from the F1 filter; F3 fully deleted, port a faithful drop-in). Fixed during the review: a stale F3 comment falsely claiming "adjacent indels invariant" (the port merges them), a broken `[left_align_prepared]` doc link (a `cargo doc` regression this PR introduced), the missing `// UNREACHABLE:` comment, and the untested `left_align_indels` wrapper/debug-invariant (added `wrapper_*` tests). The [first review](doc/devel/reports/reviews/indel_normalization_2026-05-29.md) (BaqEngine detour) is superseded.
+- **Open (from the F3-replacement review):**
+  - **M2** — add a reader-level integration test (`AlignmentMergedReader` → `fetch_ref_for_read` → `left_align_indels`); the deleted `f3_*` unit tests have no integration equivalent, so a slice-offset/`read_start` wiring regression would be invisible.
+  - **M4** — hot-path allocation regression: F3 shifted in place (zero-alloc); the port allocates 4–5 `Vec`s per indel read on the single-threaded reader loop. Add scratch reuse + a normalization criterion bench (no bench covers this path).
+  - **M5** — move `indel_norm` to `src/bam/` (beside its sole consumer; removes a `bam → pileup` edge) — or a neutral peer if a second consumer appears.
+  - **M6** (needs verification) — the port can merge colliding indels into an adjacent `D`/`I` pair that G2 `cigar_is_bad` (run earlier) doesn't re-check; confirm reachability + walker handling with a test.
+  - **Minors:** read-consume guard emits no telemetry (Mi1); demote `left_align_cigar`/`LeftAlignResult` to private (Mi2); `indel_norm/tests.rs` dir convention (Mi3); plus carryovers `Range`→`IndexRange`, predicate-helper factoring, `build_cigar` splice→fold.
+  - Deferred measurement: HG002/tomato indel-recall delta (the original acceptance signal).
 
 #### Pileup → psp seam
 - **Status:** shipped

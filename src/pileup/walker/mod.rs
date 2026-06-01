@@ -18,6 +18,7 @@ mod cigar_cursor;
 mod decompose;
 mod driver;
 mod errors;
+pub(crate) mod indel_norm;
 mod open_record;
 
 #[cfg(test)]
