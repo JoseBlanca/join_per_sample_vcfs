@@ -13,13 +13,13 @@
 //!   the Stage 1 pileup walker. Wraps a swappable
 //!   `StreamingChromRefFetcher` and rebuilds it on chrom transition.
 //!   Implements the multi-contig typed-error
-//!   [`super::pileup::MultiChromRefFetcher`] trait. `Sync` via an
+//!   [`MultiChromRefFetcher`] trait. `Sync` via an
 //!   internal `Mutex` (the only `Send + Sync` fetcher in the module).
 //!
 //! M12 (2026-05-23 code review): the legacy `RefSeqFetcher` trait
 //! (`io::Error`-returning, multi-chrom) was retired. All consumers
 //! migrated to the typed-error
-//! [`super::pileup::MultiChromRefFetcher`] trait.
+//! [`MultiChromRefFetcher`] trait.
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -249,7 +249,7 @@ fn refill(
 //
 // The trait below is the single-contig typed-error fetcher API
 // used by per-chrom consumers (DUST, PerGroupMerger). The
-// multi-contig sibling is [`super::pileup::MultiChromRefFetcher`]
+// multi-contig sibling is [`MultiChromRefFetcher`]
 // (used by the Stage 1 walker). Both use [`ChromRefFetchError`].
 //
 // Design choices:

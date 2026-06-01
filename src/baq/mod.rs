@@ -12,9 +12,9 @@
 //! [`crate::pileup::per_sample::baq_stream`].
 //!
 //! The algorithm and parameter choices are pinned in
-//! [`doc/devel/implementation_plans/baq.md`]; the architecture
+//! `doc/devel/implementation_plans/baq.md`; the architecture
 //! motivation is in
-//! [`doc/devel/specs/calling_pipeline_architecture.md`] §"Per-read
+//! `doc/devel/specs/calling_pipeline_architecture.md` §"Per-read
 //! likelihood quality".
 //!
 //! - [`probaln_glocal`] — the pure HMM kernel.

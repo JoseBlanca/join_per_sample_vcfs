@@ -2,8 +2,8 @@
 //! writer.
 //!
 //! [`drive_pileup_to_psp`] pulls every record from a
-//! [`pileup::PileupWalker`] and feeds it through a
-//! [`psp::writer::PspWriter`], finalising the writer when the
+//! [`PileupWalker`] and feeds it
+//! through a [`PspWriter`], finalising the writer when the
 //! walker exhausts. Errors from either side surface through the
 //! combined [`PileupToPspError`] enum.
 //!

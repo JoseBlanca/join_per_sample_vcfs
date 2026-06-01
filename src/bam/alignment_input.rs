@@ -133,7 +133,7 @@ pub struct FilterCounts {
     /// Reads dropped because the BAQ stage refused to produce a usable
     /// per-base posterior (HMM overflow, ref window past chrom end,
     /// CIGAR with `N`/no-match, etc.). One bucket per
-    /// [`BaqSkipReason`](super::baq::BaqSkipReason) currently does not
+    /// [`BaqSkipReason`](crate::pileup::per_sample::baq_engine::BaqSkipReason) currently does not
     /// exist — every BAQ skip reason rolls up into this counter. Split
     /// later if a deployment cares which reason dominates.
     pub baq_rejected: u64,

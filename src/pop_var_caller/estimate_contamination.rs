@@ -349,8 +349,9 @@ pub enum EstimateContaminationCliError {
 ///    mapping (every sample → `all_samples`).
 /// 5. Build a [`ContaminationEstimationConfig`] from CLI args and
 ///    validate it.
-/// 6. Combine the readers into a [`PerPositionMerger`] (k-way merge
-///    over the cohort).
+/// 6. Combine the readers into a
+///    [`PerPositionMerger`](crate::var_calling::per_position_merger::PerPositionMerger)
+///    (k-way merge over the cohort).
 /// 7. Run [`estimate_contamination`].
 /// 8. Convert the engine-side
 ///    [`ContaminationEstimates`]

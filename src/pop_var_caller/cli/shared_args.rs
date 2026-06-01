@@ -1,19 +1,19 @@
 //! Shared clap-derive sub-structs for the `pop_var_caller`
 //! subcommands. Closes **M10** from the 2026-05-19 cohort CLI
-//! review — the three top-level args structs ([`PileupArgs`],
-//! [`VarCallingArgs`], [`VarCallingFromBamArgs`]) used to duplicate
-//! ~30 fields verbatim, three places for the same flag-set.
+//! review — the top-level args structs ([`PileupArgs`],
+//! [`VarCallingArgs`]) used to duplicate ~30 fields verbatim, the
+//! same flag-set spelled out in each place. (A third struct,
+//! `VarCallingFromBamArgs`, also shared them before the direct
+//! BAM→VCF path was removed.)
 //!
 //! Two shared sub-structs cover the duplication:
 //!
 //! - [`Stage1Args`] — every CRAM-input / BAQ / walker knob; flattened
-//!   into `PileupArgs` and `VarCallingFromBamArgs` (the two
-//!   subcommands that drive Stage 1).
+//!   into `PileupArgs` (the subcommand that drives Stage 1).
 //! - [`CohortPipelineArgs`] — every cohort-pipeline knob (DUST,
 //!   variant grouping, per-group merger, posterior engine, VCF
-//!   writer, ploidy); flattened into `VarCallingArgs` and
-//!   `VarCallingFromBamArgs` (the two subcommands that drive Stages
-//!   3 – 6).
+//!   writer, ploidy); flattened into `VarCallingArgs` (the subcommand
+//!   that drives Stages 3 – 6).
 //!
 //! At the user-visible CLI surface, clap-derive's `#[command(flatten)]`
 //! is transparent: the flags appear in `--help` exactly as before,
@@ -23,7 +23,6 @@
 //!
 //! [`PileupArgs`]: super::super::cli::PileupArgs
 //! [`VarCallingArgs`]: super::super::var_calling::VarCallingArgs
-//! [`VarCallingFromBamArgs`]: super::crate::var_calling::from_bam::driver::VarCallingFromBamArgs
 
 use clap::Args;
 
@@ -66,8 +65,7 @@ use crate::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
 use crate::vcf::DEFAULT_EMIT_GP;
 
 /// Stage 1 knobs (CRAM-input filters, BAQ HMM, pileup walker).
-/// Flattened into [`PileupArgs`](super::super::cli::PileupArgs) and
-/// [`VarCallingFromBamArgs`](super::crate::var_calling::from_bam::driver::VarCallingFromBamArgs).
+/// Flattened into [`PileupArgs`](super::super::cli::PileupArgs).
 #[derive(Debug, Args, Clone)]
 pub struct Stage1Args {
     // ===== Common flags (visible in `-h`) =====================
@@ -218,8 +216,7 @@ pub struct Stage1Args {
 
 /// Cohort-pipeline knobs (DUST filter, variant grouping, per-group
 /// merger, posterior engine, ploidy, VCF writer). Flattened into
-/// [`VarCallingArgs`](super::super::var_calling::VarCallingArgs) and
-/// [`VarCallingFromBamArgs`](super::crate::var_calling::from_bam::driver::VarCallingFromBamArgs).
+/// [`VarCallingArgs`](super::super::var_calling::VarCallingArgs).
 #[derive(Debug, Args, Clone)]
 pub struct CohortPipelineArgs {
     // ===== Common (visible in `-h`) ===========================

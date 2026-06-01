@@ -1,10 +1,10 @@
 //! Alignment-index pre-flight: detect `.crai` next to each input
 //! CRAM, and optionally build the index in place if it is missing.
 //!
-//! Per-chromosome parallelism in
-//! [`crate::pop_var_caller::var_calling_from_bam`] requires an
-//! alignment index next to every input alignment file so each rayon
-//! worker can issue a contig-scoped `noodles` `Reader::query(...)`.
+//! Per-chromosome parallelism in the alignment-input subcommands
+//! requires an alignment index next to every input alignment file so
+//! each rayon worker can issue a contig-scoped `noodles`
+//! `Reader::query(...)`.
 //! This module is the gate that enforces the requirement: callers
 //! either pass `build_if_missing = false` (hard-error on the first
 //! input without an index, intended for non-interactive pipelines
