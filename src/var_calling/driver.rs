@@ -18,12 +18,10 @@
 //!
 //! **Downstream filters** (`is_variant_call`, `qual_phred`,
 //! `min_alt_obs_per_sample`, MAPQ-diff t-test) are applied
-//! post-EM in the driver, mirroring the streaming pipeline's drop
-//! semantics in
-//! [`drive_cohort_pipeline`](crate::var_calling::from_bam::pipeline::drive_cohort_pipeline).
-//! The same set of records is dropped from the final VCF, with
-//! the same per-category counters incremented — that's the
-//! byte-identity contract for Phase A.
+//! post-EM in the driver, mirroring the drop semantics of the prior
+//! (now-removed) per-chromosome streaming pipeline: the same set of
+//! records is dropped from the final VCF, with the same per-category
+//! counters incremented.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
@@ -39,21 +37,21 @@ use crate::fasta::fetcher::ChromRefFetchError;
 use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::column_span_reader::ColumnSpanReader;
+use crate::var_calling::columns::MaterialisedChunk;
 use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
-use crate::var_calling::from_psp::column_span_reader::ColumnSpanReader;
-use crate::var_calling::from_psp::columns::MaterialisedChunk;
-use crate::var_calling::from_psp::loader::{ChunkLoadError, StreamingBlockLoader};
-use crate::var_calling::from_psp::partition::{
+use crate::var_calling::loader::{ChunkLoadError, StreamingBlockLoader};
+use crate::var_calling::partition::{
     PartitionError, PartitionScratch, WindowPartition, partition_window,
 };
-use crate::var_calling::from_psp::worker::{
-    WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
-};
-use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
+use crate::var_calling::per_group_merger::PerGroupMergerConfig;
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
 use crate::var_calling::variant_grouping::GrouperConfig;
+use crate::var_calling::worker::{
+    WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
+};
 use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig, tmp_path_for};
 
 /// Default nominal genomic span per chunk, in bases. Picked to fit
@@ -74,22 +72,15 @@ const DRIVER_PSP_BUFFER_BYTES: usize = 64 * 1024;
 const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
 
 /// Mi19: chunk-loop sizing knobs. Bundled separately from
-/// `ChunkDriverParams` so the chunk loader / pre-pass / worker-
-/// dispatch axis is named and the three fields can be passed around
-/// together without dragging along the per-stage configs and
-/// downstream filters.
+/// `ChunkDriverParams` so the chunk loader / worker-dispatch axis is
+/// named and can be passed around without dragging along the
+/// per-stage configs and downstream filters.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkSizingParams {
-    /// Nominal BP span of the loader's first pull attempt per chunk.
-    /// Acts as a starting size; the loader grows up to
-    /// `chunk_genomic_span × MAX_CHUNK_SPAN_GROWTH` when
-    /// `target_variants_per_chunk` is not satisfied or the pre-pass
-    /// can't find a safe boundary.
-    pub chunk_genomic_span: u32,
     /// M9: soft lower bound on the post-filter variant count per
     /// chunk. `None` disables the variant-bounded extension (each
-    /// chunk is one pull attempt of `chunk_genomic_span` BP).
+    /// chunk is a single pull attempt at the loader's default span).
     /// `Some(n)` lets the loader grow each chunk's span adaptively
     /// until the kept-position count crosses `n` — decoupling worker
     /// workload from PSP block size + variant density. Previously a
@@ -146,10 +137,7 @@ pub struct ChunkDriverParams {
     pub downstream: DownstreamFilterParams,
 }
 
-/// Per-driver counters; the shape mirrors
-/// [`CohortDriveStats`](crate::var_calling::from_bam::pipeline::CohortDriveStats)
-/// so the CLI summary code can consume either driver's output
-/// without a branch.
+/// Per-driver counters consumed by the CLI run-summary code.
 // Mi1: `#[non_exhaustive]` — driver-level counter struct; future
 // per-stage counts can be added without breaking out-of-crate
 // consumers.
@@ -296,13 +284,6 @@ pub enum ChunkDriverError {
     /// carry their own `RecordLocus` for diagnostic.
     #[error("per-window math failed")]
     RunWindow(#[source] PosteriorEngineError),
-    /// Carried for `From<PerGroupMergerError>` compatibility with
-    /// callers that still surface that type directly (e.g. the
-    /// `var-calling-from-bam` shim before its own migration). Wraps
-    /// the error with no extra context — provenance lives in the
-    /// inner variants.
-    #[error("per-group merger error")]
-    PerGroupMerger(#[source] PerGroupMergerError),
 }
 
 // `From` impls — kept narrow. Each `From` has exactly one production
@@ -313,12 +294,6 @@ pub enum ChunkDriverError {
 impl From<PosteriorEngineError> for ChunkDriverError {
     fn from(source: PosteriorEngineError) -> Self {
         Self::RunWindow(source)
-    }
-}
-
-impl From<PerGroupMergerError> for ChunkDriverError {
-    fn from(source: PerGroupMergerError) -> Self {
-        Self::PerGroupMerger(source)
     }
 }
 
@@ -350,10 +325,9 @@ pub fn drive_cohort_chunked(
     // filter and chunk-loop counters that already land in
     // `print_run_summary` at the end of the run.
     eprintln!(
-        "var-calling: chunk_genomic_span={} target_variants_per_chunk={} \
+        "var-calling: target_variants_per_chunk={} \
          min_qual_phred={} min_alt_obs_per_sample={} \
          no_mapq_diff_filter={} min_mapq_diff_t={} no_complexity_filter={}",
-        params.sizing.chunk_genomic_span,
         params
             .sizing
             .target_variants_per_chunk
@@ -363,6 +337,18 @@ pub fn drive_cohort_chunked(
         params.downstream.no_mapq_diff_filter,
         params.downstream.min_mapq_diff_t,
         params.no_complexity_filter,
+    );
+    // M6: the line above only covers the chunk-sizing + downstream-filter
+    // knobs. Dump the per-stage configs too (each derives `Debug`) so the
+    // behaviourally-significant defaults — DUST window/threshold, group
+    // span, ploidy / max-alleles / batch size, and every posterior-engine
+    // pseudocount / convergence / GQ setting — are recoverable from a run
+    // log without re-reading the source. (`PosteriorEngineConfig`'s private
+    // `contamination` field still renders as `Some`/`None`, the
+    // operator-relevant bit.)
+    eprintln!(
+        "var-calling: dust={:?} grouper={:?} per_group={:?} posterior={:?}",
+        params.dust_cfg, params.grouper_cfg, params.per_group_cfg, params.posterior_cfg,
     );
 
     // Open one PSP reader per sample. Reused across chromosomes;
@@ -398,38 +384,28 @@ pub fn drive_cohort_chunked(
     // how the block was produced (data-shaping vs math decoupled).
     let per_group_cfg = params.per_group_cfg;
     let posterior_cfg = &params.posterior_cfg;
-    let mut producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params);
+    let producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params);
 
     // Consume the blocks: per-group EM/posterior math + downstream
     // filtering + emit. The math is the dominant cost at realistic N
-    // (consume grows ~N^1.8, overtaking produce at N≈24), so it is
-    // parallelised across blocks when the pool has > 1 thread — a single
-    // producer thread feeds a bounded queue, `n_workers` worker threads
-    // map `process_block` in parallel, and a collector re-imposes genomic
-    // order before emit (byte-identical to the serial path). With a
-    // 1-thread pool the serial path runs. Both paths fold the producer's
-    // chunk counters into `stats`.
-    let n_workers = rayon::current_num_threads();
-    let driver_result: Result<(), ChunkDriverError> = if n_workers <= 1 {
-        drive_blocks_serial(
-            &mut producer,
-            per_group_cfg,
-            posterior_cfg,
-            &params,
-            &mut writer,
-            &mut stats,
-        )
-    } else {
-        drive_blocks_parallel(
-            producer,
-            n_workers,
-            per_group_cfg,
-            posterior_cfg,
-            &params,
-            &mut writer,
-            &mut stats,
-        )
-    };
+    // (consume grows ~N^1.8, overtaking produce at N≈24), so it is always
+    // parallelised across blocks: a single producer thread feeds a bounded
+    // queue, `n_workers` worker threads map `process_block` in parallel,
+    // and a collector re-imposes genomic order before emit. `n_workers` is
+    // clamped to at least 1, so a single-thread rayon pool (`--threads 1`)
+    // runs one producer + one worker — correct, just without cross-block
+    // parallelism. The collector folds the producer's chunk counters into
+    // `stats`.
+    let n_workers = rayon::current_num_threads().max(1);
+    let driver_result = drive_blocks_parallel(
+        producer,
+        n_workers,
+        per_group_cfg,
+        posterior_cfg,
+        &params,
+        &mut writer,
+        &mut stats,
+    );
 
     match driver_result {
         Ok(()) => {
@@ -456,8 +432,7 @@ pub fn drive_cohort_chunked(
 
 /// Roll one block's [`WindowRunStats`] counters into the driver's
 /// running totals. Additive, so the result is independent of the order
-/// blocks finish — the parallel collector and the serial loop produce
-/// identical totals.
+/// blocks finish — the totals are the same regardless of `n_workers`.
 fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
     stats.lh_cap_groups_skipped += block.lh_cap_groups_skipped;
     stats.lh_cap_alleles_in_skipped += block.lh_cap_alleles_in_skipped;
@@ -465,47 +440,10 @@ fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
     stats.records_dropped_low_alt_obs += block.records_dropped_low_alt_obs;
 }
 
-/// Serial consume: pull each block in genomic order, run the math, emit.
-/// The reference path for byte-identity, and the path taken when the
-/// rayon pool has a single thread.
-fn drive_blocks_serial<R: Read + Seek + Send>(
-    producer: &mut BlockIterator<R>,
-    per_group_cfg: PerGroupMergerConfig,
-    posterior_cfg: &PosteriorEngineConfig,
-    params: &ChunkDriverParams,
-    writer: &mut CohortVcfWriter,
-    stats: &mut ChunkDriverStats,
-) -> Result<(), ChunkDriverError> {
-    let mut worker = WorkerScratch::new();
-    let result: Result<(), ChunkDriverError> = (|| {
-        while let Some(res) = producer.next_block() {
-            let block = res?;
-            process_block(
-                &block,
-                per_group_cfg,
-                posterior_cfg,
-                params.downstream.min_alt_obs_per_sample,
-                &mut worker,
-            )
-            .map_err(ChunkDriverError::RunWindow)?;
-            roll_window_stats(stats, &worker.stats);
-            worker.stats.clear();
-            for record in worker.posterior_records.drain(..) {
-                emit_or_drop(record, params, writer, stats)?;
-            }
-            producer.recycle(block);
-        }
-        Ok(())
-    })();
-    stats.chunks_loaded += producer.chunks_loaded;
-    stats.chunk_variants_total += producer.chunk_variants_total;
-    result
-}
-
 /// One finished block's math output, handed worker → collector. The
 /// records are already in genomic order *within* the block; the
 /// collector emits blocks in `seq_idx` order, so the global emit order
-/// equals the serial path's — that's the byte-identity argument.
+/// is the genomic order — that's the determinism argument.
 struct BlockResult {
     seq_idx: u64,
     records: Vec<PosteriorRecord>,
@@ -518,8 +456,8 @@ struct BlockResult {
 /// blocks, run [`process_block`] with their own persistent
 /// [`WorkerScratch`], and forward owned [`BlockResult`]s while recycling
 /// the spent block buffers back to the producer. The collector (this
-/// thread) re-imposes `seq_idx` order and emits — byte-identical to
-/// [`drive_blocks_serial`].
+/// thread) re-imposes `seq_idx` order and emits, so the emitted VCF is
+/// in genomic order and independent of the number of worker threads.
 ///
 /// Workers are dedicated OS threads, **not** rayon tasks: a worker
 /// blocked on `queue.pop()` must not occupy a rayon pool thread, because
@@ -527,8 +465,8 @@ struct BlockResult {
 /// it could starve or deadlock the decode. The producer thread is the
 /// only one that touches the rayon pool (via the loader's `par_iter`).
 ///
-/// On the success path no errors occur and output is identical to
-/// serial. On error (a worker's math, a produced block, or a VCF write)
+/// On the success path the emitted VCF is in genomic order regardless of
+/// `n_workers`. On error (a worker's math, a produced block, or a VCF write)
 /// the first error wins, the queue is closed to wind every thread down,
 /// and that error is returned (the run aborts regardless of which block
 /// failed first — errors are pathological-input aborts, not part of the
@@ -547,6 +485,17 @@ fn drive_blocks_parallel<R: Read + Seek + Send>(
     // blocks × N samples). 2× workers is enough to hide per-block
     // production jitter behind the math.
     let queue = BlockQueue::new(n_workers * 2);
+    // M13: these `mpsc` channels are unbounded, but resident memory is
+    // still bounded by a transitive invariant, NOT by the channel type:
+    // the producer cannot push more than `BlockQueue`'s `cap = n_workers*2`
+    // blocks before it blocks on `queue.push`, and each block yields
+    // exactly one `BlockResult` and recycles exactly one `ReadyBlock`. So
+    // at most `cap + n_workers` blocks (and the collector's `pending`
+    // reorder map) are in flight — the back-pressure that the
+    // RAM-for-scaling thesis relies on lives in `BlockQueue`, not here. If
+    // the queue cap or the one-result-per-block fan-out ever changes,
+    // revisit this (a `sync_channel(cap + n_workers)` would then enforce
+    // the bound by type instead of by argument).
     let (result_tx, result_rx) = mpsc::channel::<Result<BlockResult, ChunkDriverError>>();
     let (recycle_tx, recycle_rx) = mpsc::channel::<ReadyBlock>();
 
@@ -1251,7 +1200,16 @@ impl DustAheadPool {
         self.shared.not_full.notify_all();
         self.shared.ready.notify_all();
         for handle in self.handles.drain(..) {
-            let _ = handle.join();
+            // M12: surface a panicking DUST-ahead worker rather than
+            // discarding the join result. We're frequently called from
+            // `Drop` (and may already be unwinding), so log instead of
+            // re-panicking — a re-panic here would abort the process. A
+            // worker panic also poisons `state`, so the producer's
+            // `recv_next` already aborts loudly via its `.expect(...)`;
+            // this line makes the *origin* visible too.
+            if let Err(panic) = handle.join() {
+                eprintln!("var-calling: DUST-ahead worker panicked: {panic:?}");
+            }
         }
     }
 }
@@ -1347,7 +1305,7 @@ fn spawn_dust_pool(
 /// Slice the precomputed interval mask to the block span
 /// `[span_start, span_end)`, clipping each overlapping run to the span and
 /// appending it to `out` (sorted, non-overlapping — the shape
-/// [`partition_window`](crate::var_calling::from_psp::partition::partition_window)
+/// [`partition_window`](crate::var_calling::partition::partition_window)
 /// expects). `sweep` is a per-interval forward cursor over
 /// `interval_mask`, advanced past runs ending at or before `span_start`; a
 /// run straddling the block boundary stays for the next block. Reproduces
@@ -1386,6 +1344,7 @@ fn slice_interval_mask(
 /// per-block allocations (columns, CSR arrays, REF byte buffers) are
 /// reused, not re-grown, across the run — the scratch-reuse discipline,
 /// preserved through the ownership change.
+#[derive(Debug)]
 pub struct ReadyBlock {
     /// Monotonic production index (0, 1, 2, …) assigned by the producer
     /// in genomic order. The collector emits records in `seq_idx` order.
@@ -2180,6 +2139,121 @@ mod tests {
         drop(pool); // Drop → shutdown → join; reaching the end == clean.
     }
 
+    // ── BlockQueue (M11) ─────────────────────────────────────────────
+    // The hand-rolled bounded queue (Mutex + two Condvars) backs the
+    // producer→worker hand-off in `drive_blocks_parallel`. Its contracts
+    // (block-while-full, drain-then-None-after-close, idempotent close
+    // that wakes every waiter) had no direct tests; a lost wakeup here is a
+    // hang, not a panic, so the integration tests would not localise it.
+
+    /// Minimal `ReadyBlock` for queue-mechanics tests — only `seq_idx`
+    /// matters here (FIFO identity); the payload is empty.
+    fn ready_block(seq_idx: u64) -> ReadyBlock {
+        ReadyBlock {
+            seq_idx,
+            chunk: MaterialisedChunk::with_n_samples(0),
+            partition: WindowPartition::empty(),
+            pre_fetched_ref_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn block_queue_push_errs_after_close() {
+        let q = BlockQueue::new(4);
+        q.close();
+        let rejected = q.push(ready_block(0));
+        assert!(rejected.is_err(), "push after close must return Err(block)");
+        assert_eq!(
+            rejected.unwrap_err().seq_idx,
+            0,
+            "the rejected block is handed back to the caller"
+        );
+    }
+
+    #[test]
+    fn block_queue_pop_drains_then_returns_none_after_close() {
+        let q = BlockQueue::new(4);
+        q.push(ready_block(0)).expect("push 0");
+        q.push(ready_block(1)).expect("push 1");
+        q.close();
+        // Closing does not discard already-queued blocks.
+        assert_eq!(q.pop().map(|b| b.seq_idx), Some(0), "drains in FIFO order");
+        assert_eq!(q.pop().map(|b| b.seq_idx), Some(1));
+        assert!(q.pop().is_none(), "None once closed AND drained");
+    }
+
+    #[test]
+    fn block_queue_push_blocks_until_pop_frees_a_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let q = Arc::new(BlockQueue::new(1));
+        q.push(ready_block(0)).expect("fill the single slot");
+
+        let pushed = Arc::new(AtomicBool::new(false));
+        let q2 = Arc::clone(&q);
+        let pushed2 = Arc::clone(&pushed);
+        let pusher = std::thread::spawn(move || {
+            q2.push(ready_block(1))
+                .expect("second push eventually succeeds");
+            pushed2.store(true, Ordering::SeqCst);
+        });
+
+        // While the queue is full the pusher must be parked on `not_full`.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !pushed.load(Ordering::SeqCst),
+            "push must block while the queue is at capacity"
+        );
+
+        // Freeing a slot wakes the pusher.
+        assert_eq!(q.pop().map(|b| b.seq_idx), Some(0));
+        pusher.join().expect("pusher thread joins (no deadlock)");
+        assert!(
+            pushed.load(Ordering::SeqCst),
+            "push completed once a slot freed"
+        );
+        assert_eq!(
+            q.pop().map(|b| b.seq_idx),
+            Some(1),
+            "the second block is queued"
+        );
+    }
+
+    #[test]
+    fn block_queue_close_wakes_a_push_blocked_on_full() {
+        let q = Arc::new(BlockQueue::new(1));
+        q.push(ready_block(0)).expect("fill the single slot");
+        let q2 = Arc::clone(&q);
+        let pusher = std::thread::spawn(move || q2.push(ready_block(1)));
+        // Let the pusher park on `not_full` before we close.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        q.close();
+        let res = pusher
+            .join()
+            .expect("pusher joins (close woke it, no hang)");
+        assert!(
+            res.is_err(),
+            "a push blocked on full returns Err once closed"
+        );
+    }
+
+    #[test]
+    fn block_queue_close_wakes_a_pop_blocked_on_empty() {
+        let q = Arc::new(BlockQueue::new(4)); // empty
+        let q2 = Arc::clone(&q);
+        let popper = std::thread::spawn(move || q2.pop());
+        // Let the popper park on `not_empty` before we close.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        q.close();
+        let res = popper
+            .join()
+            .expect("popper joins (close woke it, no hang)");
+        assert!(
+            res.is_none(),
+            "a pop blocked on empty returns None once closed"
+        );
+    }
+
     fn ref_allele() -> MergedAllele {
         MergedAllele {
             seq: b"A".to_vec(),
@@ -2315,7 +2389,6 @@ mod tests {
             per_group_cfg: PerGroupMergerConfig::default(),
             posterior_cfg: PosteriorEngineConfig::default(),
             sizing: ChunkSizingParams {
-                chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
                 target_variants_per_chunk: None,
             },
             downstream: DownstreamFilterParams {

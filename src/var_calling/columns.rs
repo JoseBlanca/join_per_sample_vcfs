@@ -364,8 +364,8 @@ impl SampleColumns {
     }
 
     /// Append records `[record_lo, record_hi)` of a decoded PSP block
-    /// straight from its columns — the same shape [`push_record`] would
-    /// build, but with no intermediate row-shape `PileupRecord` (and no
+    /// straight from its columns — the same shape [`push_record`](Self::push_record)
+    /// would build, but with no intermediate row-shape `PileupRecord` (and no
     /// per-allele `Vec`). This is the columnar→columnar fast path the
     /// span reader uses in place of the `columnar → row → columnar`
     /// round-trip.
@@ -722,7 +722,7 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::var_calling::from_psp::test_helpers::{allele, record, ref_plus_alt};
+    use crate::var_calling::test_helpers::{allele, record, ref_plus_alt};
 
     #[test]
     fn empty_columns_carry_csr_sentinels() {

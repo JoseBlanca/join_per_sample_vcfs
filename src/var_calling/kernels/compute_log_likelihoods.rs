@@ -23,13 +23,13 @@
 
 use thiserror::Error;
 
-use crate::var_calling::from_psp::columns::MaterialisedChunk;
-use crate::var_calling::from_psp::kernels::project_scalars::{
+use crate::var_calling::columns::MaterialisedChunk;
+use crate::var_calling::kernels::project_scalars::{
     ProjectedScalarsColumns, locate_sample_row_idx, n_local_alleles_at_row,
     read_support_stats_from_columns,
 };
-use crate::var_calling::from_psp::kernels::unify_alleles::UnifiedAllelesColumns;
-use crate::var_calling::from_psp::partition::WindowPartition;
+use crate::var_calling::kernels::unify_alleles::UnifiedAllelesColumns;
+use crate::var_calling::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
     DegeneracyKind, LikelihoodContext, MAX_BITMASK_ALLELES, genotype_order, ln_factorial, xlogy,
 };
@@ -380,20 +380,18 @@ mod tests {
     use crate::fasta::ChromRefFetcher;
     use crate::fasta::fetcher::ChromRefFetchError;
     use crate::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
-    use crate::var_calling::from_psp::columns::MaterialisedChunk;
-    use crate::var_calling::from_psp::kernels::project_scalars::{
+    use crate::var_calling::columns::MaterialisedChunk;
+    use crate::var_calling::kernels::project_scalars::{
         ProjectScalarsScratch, ProjectedScalarsColumns, project_scalars_columnar,
     };
-    use crate::var_calling::from_psp::kernels::unify_alleles::{
+    use crate::var_calling::kernels::unify_alleles::{
         UnifiedAllelesColumns, UnifyAllelesScratch, unify_alleles_columnar,
     };
-    use crate::var_calling::from_psp::partition::{
-        PartitionScratch, WindowPartition, partition_window,
-    };
-    use crate::var_calling::from_psp::test_helpers::{loaded_chunk, record, ref_plus_alt};
+    use crate::var_calling::partition::{PartitionScratch, WindowPartition, partition_window};
     use crate::var_calling::per_group_merger::{
         PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
     };
+    use crate::var_calling::test_helpers::{loaded_chunk, record, ref_plus_alt};
     use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
     #[derive(Clone)]
@@ -460,7 +458,7 @@ mod tests {
         ref_fetcher: SharedRefFetcher,
         max_alleles: usize,
     ) -> (Vec<f64>, usize, u32, u32, u32) {
-        let group = crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
+        let group = crate::var_calling::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,

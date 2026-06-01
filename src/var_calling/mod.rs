@@ -15,11 +15,55 @@
 
 pub mod contamination_estimation;
 pub mod dust_filter;
-pub mod from_psp;
 pub mod per_group_merger;
 pub mod per_position_merger;
 pub mod posterior_engine;
 pub mod variant_grouping;
+
+// Cohort-level chunk-at-a-time materialisation (formerly the `from_psp`
+// submodule, merged up after the direct from-BAM path was removed). At each
+// step of the chunk loop the driver loads one genomic chunk × N samples into
+// memory (variant positions only), partitions it into windows whose
+// boundaries fall in `max_group_span`-wide safe gaps, and runs the worker
+// pipeline on each window to produce final variant records.
+//
+// - [`columns`] — [`SampleColumns`] (per-sample CSR columnar storage) and
+//   [`MaterialisedChunk`] (one chunk × N samples).
+// - [`loader`] — the batch [`load_chunk_from_iters`] (equivalence-test oracle)
+//   and the production streaming [`StreamingBlockLoader`].
+// M8 (review finding): the chunk-driver internals are implementation detail
+// of this crate's cohort `var-calling`, not a public library surface —
+// nothing outside the crate consumes them (the only external reach is the
+// root `DEFAULT_*` consts below and `driver::record_fails_mapq_diff_t_for_test`,
+// used by an integration test). They are kept `pub` for now: tightening to
+// `pub(crate)` un-masks a layer of dead / test-only items that `pub` hid
+// from dead-code analysis (unused re-exports + ~15 never-used methods/types
+// — e.g. `WorkerUnifyError`, `clone_from_columns`, `materialise_record`,
+// `into_reader`, `project_per_position_alleles_columnar`). Internalising the
+// surface therefore needs a dead-code removal pass first; tracked as a
+// follow-up rather than bundled into the review-fix run.
+pub mod column_span_reader;
+pub mod columns;
+pub mod driver;
+pub mod kernels;
+pub mod loader;
+pub mod partition;
+#[cfg(test)]
+pub(crate) mod test_helpers;
+pub mod worker;
+
+pub use column_span_reader::ColumnSpanReader;
+pub use columns::{MaterialisedChunk, SampleColumns};
+pub use driver::{
+    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
+    DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
+};
+pub use loader::{
+    ChunkLoadError, ChunkLoadExtent, ChunkLoadScratch, ChunkLoadStats, SpanColumnSource,
+    StreamingBlockLoader, load_chunk_from_iters,
+};
+pub use partition::{PartitionError, PartitionScratch, WindowPartition, partition_window};
+pub use worker::{WindowRunStats, WorkerScratch, run_window};
 
 // ---------------------------------------------------------------------
 // Cohort-pipeline downstream-filter defaults
@@ -29,8 +73,7 @@ pub mod variant_grouping;
 // filters applied post-EM (or, for `min_alt_obs`, at the merger→EM
 // boundary). They live here, at the `var_calling` root, because they are
 // consumed both by the CLI args layer (`cli::shared_args`) and by the
-// chunk driver's `DownstreamFilterParams`. (They previously lived in the
-// now-removed `from_bam::pipeline` streaming driver.)
+// chunk driver's `DownstreamFilterParams`.
 
 /// Default minimum site-level `QUAL` (phred) required to emit a record.
 /// Matches GATK HaplotypeCaller's

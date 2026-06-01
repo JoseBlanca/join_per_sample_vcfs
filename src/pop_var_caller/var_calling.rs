@@ -9,7 +9,7 @@
 //! both branches converge on the same downstream chain via a
 //! `Box<dyn Iterator>` adapter that lifts the upstream error into
 //! [`GrouperError`] — the wiring lives in
-//! [`crate::var_calling::from_bam::pipeline::drive_cohort_pipeline`].
+//! [`crate::var_calling::driver::drive_cohort_chunked`].
 //!
 //! Contamination plumbing:
 //!
@@ -40,10 +40,6 @@ use crate::pop_var_caller::contamination_artefact::{
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
-use crate::var_calling::from_psp::{
-    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
-    DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
-};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError,
 };
@@ -52,6 +48,10 @@ use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
+use crate::var_calling::{
+    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
+    DownstreamFilterParams, drive_cohort_chunked,
+};
 use crate::vcf::{CohortMetadata, VcfWriteError, WriterConfig};
 
 /// Default desired number of variable variants per materialised block
@@ -401,7 +401,6 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
                 args.target_variants_per_chunk
             };
             ChunkSizingParams {
-                chunk_genomic_span: DEFAULT_CHUNK_GENOMIC_SPAN,
                 target_variants_per_chunk: std::num::NonZeroU32::new(target_variants),
             }
         },

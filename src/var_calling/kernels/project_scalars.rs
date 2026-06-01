@@ -23,9 +23,9 @@ use ahash::AHashMap;
 use thiserror::Error;
 
 use crate::pileup_record::AlleleSupportStats;
-use crate::var_calling::from_psp::columns::{MaterialisedChunk, SampleColumns};
-use crate::var_calling::from_psp::kernels::unify_alleles::UnifiedAllelesColumns;
-use crate::var_calling::from_psp::partition::WindowPartition;
+use crate::var_calling::columns::{MaterialisedChunk, SampleColumns};
+use crate::var_calling::kernels::unify_alleles::UnifiedAllelesColumns;
+use crate::var_calling::partition::WindowPartition;
 
 /// Sample-major flat scalars matrix produced by
 /// [`project_scalars_columnar`]. Same logical shape as
@@ -634,16 +634,14 @@ mod tests {
     use crate::fasta::ChromRefFetcher;
     use crate::fasta::fetcher::ChromRefFetchError;
     use crate::pileup_record::{AlleleObservation, PileupRecord};
-    use crate::var_calling::from_psp::kernels::unify_alleles::{
+    use crate::var_calling::kernels::unify_alleles::{
         UnifiedAllelesColumns, UnifyAllelesScratch, unify_alleles_columnar,
     };
-    use crate::var_calling::from_psp::partition::{
-        PartitionScratch, WindowPartition, partition_window,
-    };
-    use crate::var_calling::from_psp::test_helpers::{loaded_chunk, record, ref_plus_alt};
+    use crate::var_calling::partition::{PartitionScratch, WindowPartition, partition_window};
     use crate::var_calling::per_group_merger::{
         PerGroupMerger, PerGroupMergerConfig, SharedRefFetcher,
     };
+    use crate::var_calling::test_helpers::{loaded_chunk, record, ref_plus_alt};
     use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
     #[derive(Clone)]
@@ -682,7 +680,7 @@ mod tests {
         window: std::ops::Range<u32>,
         max_group_span: u32,
     ) -> (
-        crate::var_calling::from_psp::columns::MaterialisedChunk,
+        crate::var_calling::columns::MaterialisedChunk,
         WindowPartition,
         Vec<u8>,
     ) {
@@ -715,7 +713,7 @@ mod tests {
         ref_fetcher: SharedRefFetcher,
         max_alleles: usize,
     ) -> (Vec<AlleleSupportStats>, Vec<AlleleSupportStats>) {
-        let group = crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
+        let group = crate::var_calling::test_helpers::build_overlapping_variant_group(
             chunk,
             partition,
             group_idx,
