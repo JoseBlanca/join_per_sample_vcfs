@@ -50,7 +50,17 @@ use pop_var_caller::var_calling::posterior_engine::backends::{
 };
 use pop_var_caller::var_calling::posterior_engine::{PosteriorEngine, PosteriorEngineConfig};
 use pop_var_caller::var_calling::variant_grouping::{
-    GrouperConfig, OverlappingVariantGroup, VariantGrouper,
+    DEFAULT_MAX_VARIANT_GROUP_SPAN, GrouperConfig, OverlappingVariantGroup, VariantGrouper,
+};
+// Chunk-driver (from_psp) hot path — produce (loader/columns) + consume
+// (the three columnar kernels + per-group EM, via `run_window`).
+use pop_var_caller::var_calling::posterior_engine::PosteriorRecord;
+use pop_var_caller::var_calling::worker::{
+    ColumnarPipelineScratch, WindowRunStats, prefetch_window_ref_bytes, run_window,
+};
+use pop_var_caller::var_calling::{
+    ChunkLoadExtent, ChunkLoadScratch, MaterialisedChunk, PartitionScratch, SampleColumns,
+    WindowPartition, load_chunk_from_iters, partition_window,
 };
 
 // ---------------------------------------------------------------------
@@ -809,6 +819,182 @@ fn bench_posterior_engine(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------
+// chunk-driver (from_psp) benches
+// ---------------------------------------------------------------------
+//
+// The four groups above bench the streaming stage iterators. They do NOT
+// cover the production chunk driver — the columnar loader + the three
+// column-native kernels (unify → project → log-likelihoods) + the
+// per-group EM run by `run_window`. These two groups close that gap
+// (the M10 finding from the 2026-06-01 code review).
+//
+// Workload: a dense biallelic-SNP cohort chunk — every sample carries a
+// REF+ALT observation at every variant position, so the cohort variant
+// filter keeps all positions and each position (`ref_span = 1`) forms its
+// own single-SNP group. Swept over sample count N because the consume-side
+// cost grows super-linearly in N (the RAM-for-sample-scaling thesis).
+
+type LoadIter = std::vec::IntoIter<Result<PileupRecord, std::convert::Infallible>>;
+
+/// Build `n_samples` per-sample record streams, each carrying a biallelic
+/// SNP at positions `100, 100 + spacing, …` (`n_groups` of them). Even
+/// samples ALT-leaning, odd REF-leaning — same support shape as
+/// [`build_biallelic_snp_groups`]. Returns the streams plus the matching
+/// REF sequence for the fetcher.
+fn build_chunk_streams(n_samples: usize, n_groups: u32, spacing: u32) -> (Vec<LoadIter>, Vec<u8>) {
+    let last_pos = (n_groups - 1) * spacing + 100;
+    let ref_len = (last_pos - 100 + 1) as usize;
+    let ref_seq: Vec<u8> = (0..ref_len).map(|i| BASES[i & 3]).collect();
+    let streams = (0..n_samples)
+        .map(|s| {
+            let recs: Vec<Result<PileupRecord, std::convert::Infallible>> = (0..n_groups)
+                .map(|g| {
+                    let pos = g * spacing + 100;
+                    let ref_base = ref_seq[(pos - 100) as usize];
+                    let alt_base = BASES[((pos - 100) as usize + 1) & 3];
+                    let (n_ref, n_alt) = if s.is_multiple_of(2) {
+                        (4, 26)
+                    } else {
+                        (24, 6)
+                    };
+                    Ok(PileupRecord::new(
+                        0,
+                        pos,
+                        vec![
+                            ref_obs(ref_base, n_ref),
+                            alt_obs(
+                                alt_base,
+                                n_alt,
+                                -2.0 * n_alt as f64,
+                                vec![pos as u64 + s as u64],
+                            ),
+                        ],
+                    ))
+                })
+                .collect();
+            recs.into_iter()
+        })
+        .collect();
+    (streams, ref_seq)
+}
+
+/// Load a synthetic chunk from per-sample streams. `span` must cover every
+/// position; `target_variants = 0` keeps a single pull (no extension).
+fn load_synthetic_chunk(n_samples: usize, streams: Vec<LoadIter>, span: u32) -> MaterialisedChunk {
+    let mut scratch = ChunkLoadScratch::with_n_samples(n_samples);
+    let mut out = MaterialisedChunk::with_n_samples(n_samples);
+    let mut carryover: Vec<SampleColumns> =
+        (0..n_samples).map(|_| SampleColumns::empty()).collect();
+    load_chunk_from_iters(
+        &mut scratch,
+        &mut out,
+        // (chrom_id, range_start, initial_span, target_variants, max_span)
+        ChunkLoadExtent::new(0, 100, span, 0, span),
+        streams,
+        &mut carryover,
+    )
+    .expect("load_chunk_from_iters");
+    out
+}
+
+fn bench_chunk_loader(c: &mut Criterion) {
+    let mut group = c.benchmark_group("var_calling_chunk_loader");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+
+    const N_GROUPS: u32 = 5_000;
+    const SPACING: u32 = 4;
+    let span = N_GROUPS * SPACING; // covers all positions from range_start = 100
+
+    // REGRESSION THRESHOLD: 5% — the loader's per-sample column copy + the
+    // cohort variant filter are the produce-side hot path; flag a >5% wall
+    // regression against the committed baseline.
+    for &n_samples in &[8usize, 64, 200] {
+        group.throughput(Throughput::Elements(N_GROUPS as u64));
+        group.bench_function(
+            format!("snp_dense_{n_samples}_samples_{N_GROUPS}_pos"),
+            |b| {
+                b.iter_batched(
+                    || build_chunk_streams(n_samples, N_GROUPS, SPACING).0,
+                    |streams| black_box(load_synthetic_chunk(n_samples, streams, span)),
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_run_window(c: &mut Criterion) {
+    let mut group = c.benchmark_group("var_calling_run_window");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    const N_GROUPS: u32 = 2_000;
+    const SPACING: u32 = 4;
+    let span = N_GROUPS * SPACING;
+
+    create_dir_all("tmp").expect("mkdir tmp");
+    let per_group_cfg = PerGroupMergerConfig::default();
+    let posterior_cfg = PosteriorEngineConfig::with_project_defaults();
+    let min_alt_obs = 2u32;
+
+    // REGRESSION THRESHOLD: 5% — `run_window` drives the three columnar
+    // kernels (unify → project → log-likelihoods) plus the per-group EM, the
+    // consume-side hot path that dominates at high sample count.
+    for &n_samples in &[8usize, 64, 200] {
+        let dir = TempDir::new_in("tmp").expect("tempdir");
+        let (streams, ref_seq) = build_chunk_streams(n_samples, N_GROUPS, SPACING);
+        let chunk = load_synthetic_chunk(n_samples, streams, span);
+        let window = chunk.range.start..chunk.safe_end;
+        let mut pscratch = PartitionScratch::with_n_samples(n_samples);
+        let mut partition = WindowPartition::empty();
+        partition_window(
+            &chunk,
+            &window,
+            &[],
+            DEFAULT_MAX_VARIANT_GROUP_SPAN,
+            &mut pscratch,
+            &mut partition,
+        )
+        .expect("partition_window");
+        let fetcher = build_shared_fetcher(dir.path(), &ref_seq);
+        let mut ref_bytes: Vec<Vec<u8>> = Vec::new();
+        prefetch_window_ref_bytes(&partition, &*fetcher, &mut ref_bytes).expect("prefetch");
+
+        let n_groups_actual = partition.n_groups();
+        group.throughput(Throughput::Elements(n_groups_actual as u64));
+
+        // Scratch + output are reused across iterations — the production
+        // pattern (one WorkerScratch per worker, retained across windows).
+        let mut scratch = ColumnarPipelineScratch::empty();
+        let mut output: Vec<PosteriorRecord> = Vec::new();
+        let mut stats = WindowRunStats::default();
+        group.bench_function(
+            format!("snp_dense_{n_samples}_samples_{n_groups_actual}_groups"),
+            |b| {
+                b.iter(|| {
+                    run_window(
+                        &chunk,
+                        &partition,
+                        &ref_bytes,
+                        per_group_cfg,
+                        &posterior_cfg,
+                        min_alt_obs,
+                        &mut scratch,
+                        &mut output,
+                        &mut stats,
+                    )
+                    .expect("run_window");
+                    black_box(&output);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
@@ -816,7 +1002,9 @@ criterion_group! {
         bench_per_position_merger,
         bench_variant_grouper,
         bench_per_group_merger,
-        bench_posterior_engine
+        bench_posterior_engine,
+        bench_chunk_loader,
+        bench_run_window
 }
 
 criterion_main!(benches);
