@@ -58,11 +58,6 @@ pub enum PopVarCallerCommand {
 
     /// Call SNPs across a cohort: `.psp` files → multi-sample VCF.
     VarCalling(super::var_calling::VarCallingArgs),
-
-    /// One-off: BAM(s) of a single sample → single-sample VCF, no
-    /// `.psp` intermediate. No contamination correction (use the
-    /// `.psp` route for that).
-    VarCallingFromBam(crate::var_calling::from_bam::driver::VarCallingFromBamArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the

@@ -468,51 +468,8 @@ fn roll_window_stats(stats: &mut ChunkDriverStats, block: &WindowRunStats) {
 /// Serial consume: pull each block in genomic order, run the math, emit.
 /// The reference path for byte-identity, and the path taken when the
 /// rayon pool has a single thread.
-/// The source-agnostic seam between block *production* (PSP-backed
-/// today; walker-backed for the direct path) and block *consumption*
-/// (the per-group math + downstream filtering + VCF emit, which is
-/// identical for both inputs).
-///
-/// A producer yields fully-prepared [`ReadyBlock`]s in genomic order,
-/// accepts spent blocks back for buffer recycling, and reports the
-/// running chunk counters the driver folds into [`ChunkDriverStats`].
-/// [`BlockIterator`] (the PSP producer) is the only implementor today;
-/// the direct path's walker producer (Phase B of
-/// `var_calling_from_bam_chunk_unification.md`) will be the second.
-///
-/// The serial consumer ([`drive_blocks_serial`]) is generic over this
-/// trait. The parallel consumer ([`drive_blocks_parallel`]) stays
-/// `BlockIterator`-specific for now — its producer-thread + free-list
-/// recycling shape is PSP-shaped; generalising it is Phase C.
-pub trait BlockProducer {
-    /// Next prepared block in genomic order, `None` at end of input.
-    fn next_block(&mut self) -> Option<Result<ReadyBlock, ChunkDriverError>>;
-    /// Hand a spent block back so its buffers can be reused.
-    fn recycle(&mut self, block: ReadyBlock);
-    /// Total chunks loaded so far (folded into `stats.chunks_loaded`).
-    fn chunks_loaded(&self) -> u64;
-    /// Sum of post-filter variant counts so far (folded into
-    /// `stats.chunk_variants_total`).
-    fn chunk_variants_total(&self) -> u64;
-}
-
-impl<W: Read + Seek + Send> BlockProducer for BlockIterator<'_, W> {
-    fn next_block(&mut self) -> Option<Result<ReadyBlock, ChunkDriverError>> {
-        BlockIterator::next_block(self)
-    }
-    fn recycle(&mut self, block: ReadyBlock) {
-        BlockIterator::recycle(self, block);
-    }
-    fn chunks_loaded(&self) -> u64 {
-        self.chunks_loaded
-    }
-    fn chunk_variants_total(&self) -> u64 {
-        self.chunk_variants_total
-    }
-}
-
-fn drive_blocks_serial<P: BlockProducer>(
-    producer: &mut P,
+fn drive_blocks_serial<R: Read + Seek + Send>(
+    producer: &mut BlockIterator<R>,
     per_group_cfg: PerGroupMergerConfig,
     posterior_cfg: &PosteriorEngineConfig,
     params: &ChunkDriverParams,
@@ -540,8 +497,8 @@ fn drive_blocks_serial<P: BlockProducer>(
         }
         Ok(())
     })();
-    stats.chunks_loaded += producer.chunks_loaded();
-    stats.chunk_variants_total += producer.chunk_variants_total();
+    stats.chunks_loaded += producer.chunks_loaded;
+    stats.chunk_variants_total += producer.chunk_variants_total;
     result
 }
 
@@ -836,9 +793,16 @@ fn emit_or_drop(
     Ok(())
 }
 
-/// Welch's-t MAPQ-difference filter — direct port of the streaming
-/// driver's `record_fails_mapq_diff_t` so the chunk driver can
-/// match its drop semantics without a cross-module call.
+/// Integration-test alias for [`record_fails_mapq_diff_t`]. The helper
+/// itself is private to the driver (single call site in `emit_or_drop`);
+/// the alias lets `cohort_vcf_writer_integration` exercise the decision
+/// without exposing the production helper as `pub`.
+#[doc(hidden)]
+pub fn record_fails_mapq_diff_t_for_test(record: &PosteriorRecord, threshold: f32) -> bool {
+    record_fails_mapq_diff_t(record, threshold)
+}
+
+/// Welch's-t MAPQ-difference filter applied post-EM in `emit_or_drop`.
 fn record_fails_mapq_diff_t(record: &PosteriorRecord, threshold: f32) -> bool {
     if !threshold.is_finite() {
         return false;

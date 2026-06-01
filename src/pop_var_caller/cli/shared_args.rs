@@ -42,7 +42,7 @@ use crate::pileup::walker::{
 };
 use crate::pop_var_caller::cli::parse_mismatch_fraction;
 use crate::pop_var_caller::cli::parsers;
-use crate::var_calling::from_bam::pipeline::{
+use crate::var_calling::{
     DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
 };
 

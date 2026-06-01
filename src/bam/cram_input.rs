@@ -280,30 +280,13 @@ pub(super) fn open_cram_record_stream(
     Ok((noodles_sam_header, records))
 }
 
-/// Open a CRAM, validate the file definition (rejects CRAM
-/// major-version != 3), read the SAM header, and discard the
-/// reader. Same validation as the first half of
-/// [`open_cram_record_stream`]; used by callers that only need
-/// the header (e.g. the cohort driver's per-input header harvest)
-/// so they pay one open + one header-read per input rather than
-/// duplicating the validation sequence inline.
-///
-/// Does not take a `fasta::Repository` — header-reading does not
-/// consult the reference; slice decoding does.
-pub(crate) fn read_cram_header_only(path: &Path) -> Result<sam::Header, AlignmentInputError> {
-    let (_reader, header) = open_cram_reader_with_header(path, None)?;
-    Ok(header)
-}
-
 /// Shared CRAM open + file-definition + header-read sequence.
-/// One source of truth for the CRAM-version gate; both
-/// `open_cram_record_stream` and `read_cram_header_only` call
-/// through here.
+/// One source of truth for the CRAM-version gate (rejects CRAM
+/// major-version != 3), called by `open_cram_record_stream`.
 ///
-/// `repository = None` is used by `read_cram_header_only`, which
-/// does not need the reference (header reading does not consult
-/// it). Slice decoding does, so `open_cram_record_stream` always
-/// passes `Some`.
+/// `repository = None` reads the header without the reference
+/// (header reading does not consult it); slice decoding does, so
+/// `open_cram_record_stream` always passes `Some`.
 fn open_cram_reader_with_header(
     path: &Path,
     repository: Option<&fasta::Repository>,
@@ -409,16 +392,15 @@ mod tests {
     use super::*;
     use crate::pileup::per_sample::cram_files::build_cram_with_major_version;
 
-    /// `read_cram_header_only` must fire the CRAM-version gate
-    /// before returning a header. Regression for the bug closed by
-    /// the M5 fix (the cohort driver's old inline header loader
-    /// skipped this check, letting CRAM 4.x files pass header-load
-    /// and only be rejected later by the per-worker `query`).
+    /// The shared CRAM open path must fire the CRAM-version gate
+    /// (rejecting major-version != 3) before returning a header, so
+    /// CRAM 4.x is refused at open time rather than mid-decode.
     #[test]
-    fn read_cram_header_only_rejects_cram_4x() {
+    fn open_cram_reader_rejects_cram_4x() {
         let (_dir, cram_path) = build_cram_with_major_version(4, 0).expect("build forced cram 4.0");
-        let err = read_cram_header_only(&cram_path)
-            .expect_err("CRAM 4.0 must be rejected at header time");
+        let err = open_cram_reader_with_header(&cram_path, None)
+            .map(|_| ())
+            .expect_err("CRAM 4.0 must be rejected at open time");
         match err {
             AlignmentInputError::UnsupportedCramVersion { major, minor, path } => {
                 assert_eq!(major, 4);
