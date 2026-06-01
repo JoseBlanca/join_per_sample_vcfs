@@ -21,17 +21,17 @@ use thiserror::Error;
 
 use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
 use crate::pileup_record::AlleleSupportStats;
-use crate::var_calling::from_psp::columns::MaterialisedChunk;
-use crate::var_calling::from_psp::kernels::compute_log_likelihoods::{
+use crate::var_calling::columns::MaterialisedChunk;
+use crate::var_calling::kernels::compute_log_likelihoods::{
     ComputeLogLikelihoodsError, LogLikelihoodsColumns, compute_log_likelihoods_columnar,
 };
-use crate::var_calling::from_psp::kernels::project_scalars::{
+use crate::var_calling::kernels::project_scalars::{
     ProjectScalarsError, ProjectScalarsScratch, ProjectedScalarsColumns, project_scalars_columnar,
 };
-use crate::var_calling::from_psp::kernels::unify_alleles::{
+use crate::var_calling::kernels::unify_alleles::{
     UnifiedAllelesColumns, UnifyAllelesError, UnifyAllelesScratch, unify_alleles_columnar,
 };
-use crate::var_calling::from_psp::partition::WindowPartition;
+use crate::var_calling::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
     CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig, PerGroupMergerError,
 };
@@ -174,12 +174,12 @@ impl ColumnarPipelineScratch {
 /// This is the *math* half of what used to be `WorkerSlot`. The
 /// *data-shaping* half (the partition + its scratch + the pre-fetched
 /// REF bytes) moved onto the producer / into the owned
-/// [`ReadyBlock`](crate::var_calling::from_psp::driver), so a block
+/// [`ReadyBlock`](crate::var_calling::driver), so a block
 /// is a self-contained unit of work and the worker holds no producer
 /// state. That split is what lets [`process_block`] run on many workers
 /// in parallel.
 ///
-/// [`process_block`]: crate::var_calling::from_psp::driver::process_block
+/// [`process_block`]: crate::var_calling::driver::process_block
 pub struct WorkerScratch {
     /// Column-native pipeline scratch — UnifyAlleles, ProjectScalars,
     /// LogLikelihoods buffers, the EM `RecordScratch`, etc.
@@ -191,7 +191,7 @@ pub struct WorkerScratch {
     /// after each [`process_block`] and rolls the counts into
     /// [`ChunkDriverStats`](super::driver::ChunkDriverStats).
     ///
-    /// [`process_block`]: crate::var_calling::from_psp::driver::process_block
+    /// [`process_block`]: crate::var_calling::driver::process_block
     pub stats: WindowRunStats,
 }
 
@@ -610,7 +610,7 @@ fn project_scalars_error_to_merger(
     _group_end: u32,
     e: ProjectScalarsError,
 ) -> PosteriorEngineError {
-    use crate::var_calling::from_psp::kernels::project_scalars::CompoundPhase as CnPhase;
+    use crate::var_calling::kernels::project_scalars::CompoundPhase as CnPhase;
     use crate::var_calling::per_group_merger::CompoundPhase as RowPhase;
     let inner = match e {
         ProjectScalarsError::ZeroObservationConstituent {
@@ -751,14 +751,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::var_calling::from_psp::partition::{
-        PartitionScratch, WindowPartition, partition_window,
-    };
-    use crate::var_calling::from_psp::test_helpers::{
-        build_overlapping_variant_group, loaded_chunk, record, ref_plus_alt,
-    };
+    use crate::var_calling::partition::{PartitionScratch, WindowPartition, partition_window};
     use crate::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
     use crate::var_calling::posterior_engine::PosteriorEngine;
+    use crate::var_calling::test_helpers::{
+        build_overlapping_variant_group, loaded_chunk, record, ref_plus_alt,
+    };
     use crate::var_calling::variant_grouping::{GrouperError, OverlappingVariantGroup};
 
     /// Nits (Wave 6): byte-identity oracle shape — `(seq,
@@ -851,8 +849,8 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
                 ],
             ),
             record(105, ref_plus_alt(3, 4)),
@@ -1012,10 +1010,10 @@ mod tests {
         // on which.
         let alts = || {
             vec![
-                crate::var_calling::from_psp::test_helpers::allele(b"A", 5, -1.0, &[]),
-                crate::var_calling::from_psp::test_helpers::allele(b"T", 5, -1.0, &[]),
-                crate::var_calling::from_psp::test_helpers::allele(b"C", 5, -1.0, &[]),
-                crate::var_calling::from_psp::test_helpers::allele(b"G", 5, -1.0, &[]),
+                crate::var_calling::test_helpers::allele(b"A", 5, -1.0, &[]),
+                crate::var_calling::test_helpers::allele(b"T", 5, -1.0, &[]),
+                crate::var_calling::test_helpers::allele(b"C", 5, -1.0, &[]),
+                crate::var_calling::test_helpers::allele(b"G", 5, -1.0, &[]),
             ]
         };
         let s0 = vec![record(100, alts())];
@@ -1098,8 +1096,8 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
                 ],
             ),
             record(105, ref_plus_alt(3, 4)),
@@ -1191,8 +1189,8 @@ mod tests {
         let s0_mnp = record(
             100,
             vec![
-                crate::var_calling::from_psp::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
-                crate::var_calling::from_psp::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
+                crate::var_calling::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
+                crate::var_calling::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
             ],
         );
         let s0_snp_inside = record(105, ref_plus_alt(3, 4));
@@ -1279,17 +1277,17 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(b"A", 10, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"T", 6, -1.0, &[101]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"G", 2, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"C", 1, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"A", 10, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"T", 6, -1.0, &[101]),
+                    crate::var_calling::test_helpers::allele(b"G", 2, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"C", 1, -1.0, &[]),
                 ],
             ),
             record(
                 101,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(b"A", 10, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"G", 5, -1.0, &[101]),
+                    crate::var_calling::test_helpers::allele(b"A", 10, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"G", 5, -1.0, &[101]),
                 ],
             ),
         ];
@@ -1297,14 +1295,14 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(b"A", 8, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"G", 3, -1.0, &[]),
-                    crate::var_calling::from_psp::test_helpers::allele(b"T", 1, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"A", 8, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"G", 3, -1.0, &[]),
+                    crate::var_calling::test_helpers::allele(b"T", 1, -1.0, &[]),
                 ],
             ),
             record(
                 101,
-                vec![crate::var_calling::from_psp::test_helpers::allele(
+                vec![crate::var_calling::test_helpers::allele(
                     b"A",
                     10,
                     -1.0,

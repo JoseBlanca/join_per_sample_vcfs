@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::pileup_record::PileupRecord;
 use crate::psp::PspReadError;
-use crate::var_calling::from_psp::columns::{MaterialisedChunk, SampleColumns};
+use crate::var_calling::columns::{MaterialisedChunk, SampleColumns};
 
 /// A per-sample source of pileup columns addressed by genomic span.
 ///
@@ -17,7 +17,7 @@ use crate::var_calling::from_psp::columns::{MaterialisedChunk, SampleColumns};
 /// takes the cohort-wide `min` (the watermark every sample now covers),
 /// and asks each source for the columns up to it. The production
 /// implementor is
-/// [`ColumnSpanReader`](crate::var_calling::from_psp::column_span_reader::ColumnSpanReader);
+/// [`ColumnSpanReader`](crate::var_calling::column_span_reader::ColumnSpanReader);
 /// tests use an in-memory `Vec<PileupRecord>` source.
 pub trait SpanColumnSource {
     /// Inclusive end of the next span this source can serve without a
@@ -836,7 +836,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::var_calling::from_psp::test_helpers::{
+    use crate::var_calling::test_helpers::{
         allele, record, ref_obs, ref_plus_alt, ref_plus_unobserved_alt, run_loader,
     };
     use std::convert::Infallible;

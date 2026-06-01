@@ -48,7 +48,7 @@ use crate::var_calling::contamination_estimation::{
     DEFAULT_SNP_ALT_PSEUDOCOUNT, DEFAULT_STABILITY_BLOCKS, DEFAULT_STABILITY_TOLERANCE,
     StoppingMode, estimate_contamination,
 };
-use crate::var_calling::from_psp::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
+use crate::var_calling::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 
 // ---------------------------------------------------------------------

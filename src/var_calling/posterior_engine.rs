@@ -1042,7 +1042,7 @@ pub struct EmDiagnostics {
 // - [`MergedAllelesView`] here — wraps `&[MergedAllele]`. Used by the
 //   row-shape shim.
 // - `ColumnarAllelesView` in
-//   [`crate::var_calling::from_psp::worker`] — wraps
+//   [`crate::var_calling::worker`] — wraps
 //   `&UnifiedAllelesColumns`. Used by the column-native worker once
 //   Phase A.2 step 2 lands.
 //
