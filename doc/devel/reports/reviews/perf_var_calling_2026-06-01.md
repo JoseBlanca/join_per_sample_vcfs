@@ -109,6 +109,10 @@ The DHAT #1 site: a `BTreeMap<u64, Vec<CompoundConstituent>>` `or_default()` + `
 - **The E-step already has a homogeneous-fixation fast path** ([posterior_engine.rs](../../../../src/var_calling/posterior_engine.rs)) that skips the per-genotype `log_sum_exp` work entirely when `fixation_index = 0` (the default) — which is why the hot spot is the QUAL convolution, not the EM.
 - **Build config is already tuned** (`lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, pinned `target-cpu` floors) — the methodology's highest-leverage knobs are set; only the production allocator (L1) is left on the table.
 
+### Author responses
+
+- **H1 — applied (2026-06-01).** Replaced the QUAL convolution's pairwise `log_sum_exp_2` fold with a single `log_sum_exp_slice` over the gathered ≤`ploidy+1` finite terms (stack buffer). **Measured** (`var_calling_run_window` vs the `h1-before` criterion baseline, container): N=8 −0% (noise), **N=64 −16.0%**, **N=200 −21.3%** (p<0.05) — the win grows with N, matching the O(N²) mechanism. **Not byte-identical**: log-sum-exp reassociation shifts QUAL by ≤1 f32 ULP (max rel. delta 1.4e-6) in **71/5062 records (1.4%)** on the tomato fixture — QUAL column only, **no** AF/AC/GT/GQ/AD/FILTER changes, record count unchanged. PM accepted the trade and will rebaseline the out-of-tree byte-identity oracle. 409 lib + 11 cohort-integration tests pass; fmt/clippy clean.
+
 ### Author response convention
 
 Address each finding by id (`H1`, `L5`, …) with `applied in <commit>` / `experiment shows no gain — closing` / `disputed because …` / `deferred to <issue>` / `won't fix because …`. The "no gain" path is expected and welcome — that is what the §3 measurement plan is for. Apply H1/H2/H3 one at a time, each gated on its own measurement.

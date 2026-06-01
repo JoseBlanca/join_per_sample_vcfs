@@ -32,8 +32,13 @@ Skills and agents are instructed to leave it untouched.
 >   the two `unify_alleles` allocation sites = ~23 M of the run's 51 M
 >   allocated blocks), 11 Likely, 4 Speculative. The
 >   `performance_review_skill.md` now carries a verified-tools list for this
->   machine. Next: apply H1 (log_sum_exp_slice reform), then H2/H3, one
->   change per measurement.
+>   machine. **H1 applied** (2026-06-01): the QUAL convolution's pairwise
+>   `log_sum_exp_2` fold → one `log_sum_exp_slice`; measured **−16 % (N=64) /
+>   −21 % (N=200)** on `var_calling_run_window` vs the saved baseline. Not
+>   byte-identical — QUAL shifts ≤1 f32 ULP in ~1.4 % of records (QUAL-only,
+>   no genotype/FILTER change); PM accepted and will rebaseline the
+>   out-of-tree byte-identity oracle. Next: H2/H3 (the `unify_alleles`
+>   allocation sites — byte-identity-neutral), one change per measurement.
 > - **Previous task (2026-06-01):** **Code review of `src/var_calling/`
 >   + a PM-directed first pass of fixes.** Review of the whole subtree
 >   (Stages 3–6 + the `from_psp/` chunk driver; 23 files, 27 489 LoC,

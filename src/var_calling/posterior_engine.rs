@@ -64,7 +64,7 @@ use crate::var_calling::contamination_estimation::{
     AlleleClass as ContamAlleleClass, ContaminationEstimates, MAX_BASE_ERROR, MIN_BASE_ERROR,
 };
 use crate::var_calling::per_group_merger::{
-    MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
+    MAX_PLOIDY, MergedAllele, MergedRecord, PerGroupMergerError, genotype_order,
 };
 
 /// Default EM convergence threshold on `max_a |p̂_new[a] − p̂_old[a]|`.
@@ -3036,14 +3036,27 @@ fn compute_qual_via_exact_af<M: MathBackend>(
         }
         for k in 0..=kmax_after {
             let c_max = p.min(k);
-            let mut acc = f64::NEG_INFINITY;
+            // H1 (perf): gather the ≤ `ploidy + 1` finite convolution terms,
+            // then reduce them with a single `log_sum_exp_slice` instead of a
+            // pairwise `log_sum_exp_2` fold. The fold did one `ln` (and up to
+            // two `exp`) per term; the slice does one `ln` and one `exp` per
+            // term total — fewer transcendentals, and no per-term call
+            // overhead — on the dominant O(n_samples²·ploidy²) loop. The
+            // gather buffer is stack-allocated: `c_max + 1 ≤ ploidy + 1 ≤
+            // MAX_PLOIDY + 1`. NOTE: this re-associates the log-sum-exp, so
+            // the result can differ from the fold at the ULP level — verified
+            // byte-identical on the cohort fixture (QUAL survives the f64→f32
+            // cast unchanged); re-check that contract if this changes.
+            let mut terms = [0.0f64; MAX_PLOIDY as usize + 1];
+            let mut n_terms = 0usize;
             for (c, &ll) in l_s.iter().enumerate().take(c_max + 1) {
                 let prev = scratch.log_p_ac_curr[k - c];
                 if prev > f64::NEG_INFINITY && ll > f64::NEG_INFINITY {
-                    acc = log_sum_exp_2(math, acc, prev + ll);
+                    terms[n_terms] = prev + ll;
+                    n_terms += 1;
                 }
             }
-            scratch.log_p_ac_next[k] = acc;
+            scratch.log_p_ac_next[k] = log_sum_exp_slice(math, &terms[..n_terms]);
         }
         std::mem::swap(&mut scratch.log_p_ac_curr, &mut scratch.log_p_ac_next);
     }
