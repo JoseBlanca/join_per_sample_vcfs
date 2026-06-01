@@ -31,6 +31,17 @@ pub mod variant_grouping;
 //   [`MaterialisedChunk`] (one chunk × N samples).
 // - [`loader`] — the batch [`load_chunk_from_iters`] (equivalence-test oracle)
 //   and the production streaming [`StreamingBlockLoader`].
+// M8 (review finding): the chunk-driver internals are implementation detail
+// of this crate's cohort `var-calling`, not a public library surface —
+// nothing outside the crate consumes them (the only external reach is the
+// root `DEFAULT_*` consts below and `driver::record_fails_mapq_diff_t_for_test`,
+// used by an integration test). They are kept `pub` for now: tightening to
+// `pub(crate)` un-masks a layer of dead / test-only items that `pub` hid
+// from dead-code analysis (unused re-exports + ~15 never-used methods/types
+// — e.g. `WorkerUnifyError`, `clone_from_columns`, `materialise_record`,
+// `into_reader`, `project_per_position_alleles_columnar`). Internalising the
+// surface therefore needs a dead-code removal pass first; tracked as a
+// follow-up rather than bundled into the review-fix run.
 pub mod column_span_reader;
 pub mod columns;
 pub mod driver;
