@@ -37,8 +37,15 @@ Skills and agents are instructed to leave it untouched.
 >   −21 % (N=200)** on `var_calling_run_window` vs the saved baseline. Not
 >   byte-identical — QUAL shifts ≤1 f32 ULP in ~1.4 % of records (QUAL-only,
 >   no genotype/FILTER change); PM accepted and will rebaseline the
->   out-of-tree byte-identity oracle. Next: H2/H3 (the `unify_alleles`
->   allocation sites — byte-identity-neutral), one change per measurement.
+>   out-of-tree byte-identity oracle. **H2** (`65e8c4d`) + **H3** (`c42f23e`)
+>   also applied — the two `unify_alleles` allocation sites (BTreeMap→AHashMap
+>   + SmallVec value; `Vec<u8>`→`SmallVec<[u8;16]>` dedup key). Byte-identical;
+>   DHAT total **51.4M → 27.86M blocks (−45.8 %)** on the tomato N=18 cohort.
+>   **Caveat:** DHAT peak-live rose 816 → 1224 MB across H1–H3 (likely producer
+>   run-ahead — M13 unbounded channels / L11 queue depth); needs a controlled
+>   peak-RSS check before claiming a net RAM effect. Next candidates: validate
+>   peak-RSS at high N (scaling harness) + consider M13; then L4 (SIMD the QUAL
+>   k-loop) or the remaining Likely tier.
 > - **Previous task (2026-06-01):** **Code review of `src/var_calling/`
 >   + a PM-directed first pass of fixes.** Review of the whole subtree
 >   (Stages 3–6 + the `from_psp/` chunk driver; 23 files, 27 489 LoC,
