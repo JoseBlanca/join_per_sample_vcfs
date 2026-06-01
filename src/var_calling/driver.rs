@@ -338,6 +338,18 @@ pub fn drive_cohort_chunked(
         params.downstream.min_mapq_diff_t,
         params.no_complexity_filter,
     );
+    // M6: the line above only covers the chunk-sizing + downstream-filter
+    // knobs. Dump the per-stage configs too (each derives `Debug`) so the
+    // behaviourally-significant defaults — DUST window/threshold, group
+    // span, ploidy / max-alleles / batch size, and every posterior-engine
+    // pseudocount / convergence / GQ setting — are recoverable from a run
+    // log without re-reading the source. (`PosteriorEngineConfig`'s private
+    // `contamination` field still renders as `Some`/`None`, the
+    // operator-relevant bit.)
+    eprintln!(
+        "var-calling: dust={:?} grouper={:?} per_group={:?} posterior={:?}",
+        params.dust_cfg, params.grouper_cfg, params.per_group_cfg, params.posterior_cfg,
+    );
 
     // Open one PSP reader per sample. Reused across chromosomes;
     // `region_records` re-seeks via the block index per call.
@@ -473,6 +485,17 @@ fn drive_blocks_parallel<R: Read + Seek + Send>(
     // blocks × N samples). 2× workers is enough to hide per-block
     // production jitter behind the math.
     let queue = BlockQueue::new(n_workers * 2);
+    // M13: these `mpsc` channels are unbounded, but resident memory is
+    // still bounded by a transitive invariant, NOT by the channel type:
+    // the producer cannot push more than `BlockQueue`'s `cap = n_workers*2`
+    // blocks before it blocks on `queue.push`, and each block yields
+    // exactly one `BlockResult` and recycles exactly one `ReadyBlock`. So
+    // at most `cap + n_workers` blocks (and the collector's `pending`
+    // reorder map) are in flight — the back-pressure that the
+    // RAM-for-scaling thesis relies on lives in `BlockQueue`, not here. If
+    // the queue cap or the one-result-per-block fan-out ever changes,
+    // revisit this (a `sync_channel(cap + n_workers)` would then enforce
+    // the bound by type instead of by argument).
     let (result_tx, result_rx) = mpsc::channel::<Result<BlockResult, ChunkDriverError>>();
     let (recycle_tx, recycle_rx) = mpsc::channel::<ReadyBlock>();
 
@@ -1177,7 +1200,16 @@ impl DustAheadPool {
         self.shared.not_full.notify_all();
         self.shared.ready.notify_all();
         for handle in self.handles.drain(..) {
-            let _ = handle.join();
+            // M12: surface a panicking DUST-ahead worker rather than
+            // discarding the join result. We're frequently called from
+            // `Drop` (and may already be unwinding), so log instead of
+            // re-panicking — a re-panic here would abort the process. A
+            // worker panic also poisons `state`, so the producer's
+            // `recv_next` already aborts loudly via its `.expect(...)`;
+            // this line makes the *origin* visible too.
+            if let Err(panic) = handle.join() {
+                eprintln!("var-calling: DUST-ahead worker panicked: {panic:?}");
+            }
         }
     }
 }

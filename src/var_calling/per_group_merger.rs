@@ -215,6 +215,14 @@ impl LhCapStats {
     }
 
     fn record_skip(&self, n_alleles: usize) {
+        // Mi8: `Relaxed` is sufficient — these are two independent,
+        // monotonic counters that never publish any other state. They are
+        // read (via `groups_skipped` / `alleles_total_in_skipped`) only
+        // *after* the producing iterator chain has finished and joined, so
+        // the join supplies the happens-before; no ordering between the two
+        // `fetch_add`s is required. (A mid-run progress read would observe
+        // a transiently inconsistent ratio — don't add one without
+        // upgrading the ordering story.)
         self.inner.groups_skipped.fetch_add(1, Ordering::Relaxed);
         self.inner
             .alleles_total_in_skipped
@@ -407,10 +415,10 @@ pub enum PerGroupMergerError {
     // `GrouperError`. If a second site is ever added, drop `#[from]`
     // here and convert explicitly at each site so error provenance
     // does not silently collapse into the same variant.
-    #[error("upstream: {0}")]
+    #[error("failed to consume upstream merged record")]
     Upstream(#[from] GrouperError),
 
-    #[error("reference fetch at chrom {chrom_id} {start}-{end}: {source}")]
+    #[error("reference fetch failed at chrom {chrom_id} {start}-{end}")]
     RefFetch {
         chrom_id: u32,
         start: u32,

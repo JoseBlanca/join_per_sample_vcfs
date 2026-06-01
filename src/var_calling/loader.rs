@@ -594,8 +594,9 @@ impl StreamingBlockLoader {
     /// construction) and reserves that group as `pending` for the next
     /// call. At the interval's end every group is closed and flushed.
     ///
-    /// Returns `Ok(false)` when the interval is exhausted with nothing
-    /// left to emit (`out` empty); `Ok(true)` when a block was produced.
+    /// Returns the number of distinct kept (variable) cohort positions in
+    /// the produced block; `0` means the interval is exhausted with nothing
+    /// left to emit (`out` is left empty).
     pub fn fill_block<S: SpanColumnSource + Send>(
         &mut self,
         sources: &mut [S],

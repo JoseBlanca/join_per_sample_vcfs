@@ -709,7 +709,7 @@ pub enum WorkerUnifyError {
 
     /// `fetch_into` failed while pulling the group's REF span — the
     /// kernel needs those bytes as input.
-    #[error("reference fetch: {0}")]
+    #[error("failed to fetch reference span for allele unification")]
     RefFetch(#[from] ChromRefFetchError),
 }
 
