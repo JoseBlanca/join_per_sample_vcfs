@@ -623,8 +623,8 @@ where
             let hi = (span_end - a) as usize;
             let mut out: Vec<std::ops::Range<u32>> = Vec::new();
             let mut run_start: Option<usize> = None;
-            for off in lo..hi {
-                if buf_masked[off] {
+            for (off, &masked) in buf_masked.iter().enumerate().take(hi).skip(lo) {
+                if masked {
                     run_start.get_or_insert(off);
                 } else if let Some(rs) = run_start.take() {
                     out.push((rs as u32 + a)..(off as u32 + a));

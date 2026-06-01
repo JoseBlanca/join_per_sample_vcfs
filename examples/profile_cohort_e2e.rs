@@ -55,9 +55,6 @@ use clap::Parser;
 
 use pop_var_caller::pileup_record::PileupRecord;
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
-use pop_var_caller::var_calling::from_bam::pipeline::{
-    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
-};
 use pop_var_caller::pop_var_caller::var_calling::{VarCallingArgs, run_var_calling};
 use pop_var_caller::psp::PspReader;
 use pop_var_caller::psp::header::{
@@ -65,6 +62,9 @@ use pop_var_caller::psp::header::{
 };
 use pop_var_caller::psp::writer::PspWriter;
 use pop_var_caller::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
+use pop_var_caller::var_calling::from_bam::pipeline::{
+    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
+};
 use pop_var_caller::var_calling::per_group_merger::{
     DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
 };

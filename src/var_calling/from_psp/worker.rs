@@ -22,6 +22,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
+use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::from_psp::columns::MaterialisedChunk;
 use crate::var_calling::from_psp::kernels::compute_log_likelihoods::{
     ComputeLogLikelihoodsError, LogLikelihoodsColumns, compute_log_likelihoods_columnar,
@@ -32,7 +33,6 @@ use crate::var_calling::from_psp::kernels::project_scalars::{
 use crate::var_calling::from_psp::kernels::unify_alleles::{
     UnifiedAllelesColumns, UnifyAllelesError, UnifyAllelesScratch, unify_alleles_columnar,
 };
-use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::from_psp::partition::WindowPartition;
 use crate::var_calling::per_group_merger::{
     CompoundConstituent, LikelihoodContext, MergedAllele, PerGroupMergerConfig,
@@ -867,18 +867,8 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(
-                        b"AAAAAAAAAA",
-                        3,
-                        -1.0,
-                        &[],
-                    ),
-                    crate::var_calling::from_psp::test_helpers::allele(
-                        b"AAACAAAAAA",
-                        4,
-                        -1.0,
-                        &[],
-                    ),
+                    crate::var_calling::from_psp::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
+                    crate::var_calling::from_psp::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
                 ],
             ),
             record(105, ref_plus_alt(3, 4)),
@@ -1124,18 +1114,8 @@ mod tests {
             record(
                 100,
                 vec![
-                    crate::var_calling::from_psp::test_helpers::allele(
-                        b"AAAAAAAAAA",
-                        3,
-                        -1.0,
-                        &[],
-                    ),
-                    crate::var_calling::from_psp::test_helpers::allele(
-                        b"AAACAAAAAA",
-                        4,
-                        -1.0,
-                        &[],
-                    ),
+                    crate::var_calling::from_psp::test_helpers::allele(b"AAAAAAAAAA", 3, -1.0, &[]),
+                    crate::var_calling::from_psp::test_helpers::allele(b"AAACAAAAAA", 4, -1.0, &[]),
                 ],
             ),
             record(105, ref_plus_alt(3, 4)),

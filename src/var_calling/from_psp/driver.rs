@@ -39,6 +39,7 @@ use crate::fasta::fetcher::ChromRefFetchError;
 use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::from_psp::column_span_reader::ColumnSpanReader;
 use crate::var_calling::from_psp::columns::MaterialisedChunk;
 use crate::var_calling::from_psp::loader::{ChunkLoadError, StreamingBlockLoader};
@@ -48,7 +49,6 @@ use crate::var_calling::from_psp::partition::{
 use crate::var_calling::from_psp::worker::{
     WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
 };
-use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::per_group_merger::{PerGroupMergerConfig, PerGroupMergerError};
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,

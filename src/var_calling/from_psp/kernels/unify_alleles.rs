@@ -1753,14 +1753,13 @@ mod tests {
 
         let fetcher = shared_mock(&ref_full, 1);
         let oracle = {
-            let group =
-                crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
-                    &chunk,
-                    &partition,
-                    0,
-                    chunk.n_samples(),
-                    chunk.chrom_id,
-                );
+            let group = crate::var_calling::from_psp::test_helpers::build_overlapping_variant_group(
+                &chunk,
+                &partition,
+                0,
+                chunk.n_samples(),
+                chunk.chrom_id,
+            );
             // Use max_alleles=3 in the oracle config too.
             let config = PerGroupMergerConfig::new(2, 3, 64, 32).expect("merger config");
             let iter: Vec<Result<OverlappingVariantGroup, GrouperError>> = vec![Ok(group)];

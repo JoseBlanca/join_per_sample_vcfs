@@ -615,7 +615,10 @@ impl StreamingBlockLoader {
 
         let mut kept_positions: u32 = 0;
         loop {
-            let watermark = sources.iter().filter_map(SpanColumnSource::peek_next_span).min();
+            let watermark = sources
+                .iter()
+                .filter_map(SpanColumnSource::peek_next_span)
+                .min();
             let Some(watermark) = watermark else {
                 // Interval exhausted: every remaining group is closed,
                 // so flush all pending (cut past the interval end). A
@@ -857,12 +860,22 @@ mod tests {
     }
 
     impl VecColumnSource {
-        fn new(records: Vec<PileupRecord>, region_start: u32, region_end: u32, block_records: usize) -> Self {
+        fn new(
+            records: Vec<PileupRecord>,
+            region_start: u32,
+            region_end: u32,
+            block_records: usize,
+        ) -> Self {
             let cursor = records
                 .iter()
                 .position(|r| r.pos >= region_start)
                 .unwrap_or(records.len());
-            Self { records, cursor, region_end, block_records: block_records.max(1) }
+            Self {
+                records,
+                cursor,
+                region_end,
+                block_records: block_records.max(1),
+            }
         }
     }
 
@@ -890,7 +903,11 @@ mod tests {
     }
 
     /// Batch reference: fold + compact the whole region in one shot.
-    fn batch_kept(per_sample: &[Vec<PileupRecord>], start: u32, end_inclusive: u32) -> Vec<SampleColumns> {
+    fn batch_kept(
+        per_sample: &[Vec<PileupRecord>],
+        start: u32,
+        end_inclusive: u32,
+    ) -> Vec<SampleColumns> {
         let n = per_sample.len();
         let span = end_inclusive - start + 1;
         let mut scratch = ChunkLoadScratch::with_n_samples(n);
@@ -932,13 +949,20 @@ mod tests {
         let mut range_start = start;
         let mut blocks = 0;
         while loader
-            .fill_block(&mut sources, &mut out, 0, range_start, end_inclusive, target_variants)
+            .fill_block(
+                &mut sources,
+                &mut out,
+                0,
+                range_start,
+                end_inclusive,
+                target_variants,
+            )
             .expect("fill_block")
             > 0
         {
-            for s in 0..n {
-                for row in 0..out.per_sample[s].n_records() {
-                    combined[s].push_row_from(&out.per_sample[s], row);
+            for (combined_s, per_sample_s) in combined.iter_mut().zip(&out.per_sample) {
+                for row in 0..per_sample_s.n_records() {
+                    combined_s.push_row_from(per_sample_s, row);
                 }
             }
             range_start = out.safe_end;

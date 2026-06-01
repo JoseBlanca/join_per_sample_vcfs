@@ -33,11 +33,11 @@ use crate::fasta::ContigList;
 use crate::pileup::walker::WalkerError;
 use crate::pop_var_caller::cli::PileupCliError;
 use crate::pop_var_caller::cli::error_bridge::ErrorSheddingAdapter;
-use crate::var_calling::from_bam::pipeline::{CohortDriveStats, CohortPipelineParams};
 use crate::pop_var_caller::common::{configure_rayon_pool, current_command_line, format_md5_hex};
 use crate::psp::PspReadError;
 use crate::psp::header::ParsedChromosome;
 use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
+use crate::var_calling::from_bam::pipeline::{CohortDriveStats, CohortPipelineParams};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError, SharedRefFetcher,
 };

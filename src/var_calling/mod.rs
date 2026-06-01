@@ -13,10 +13,10 @@
 //! the merger's output into `OverlappingVariantGroup`s for Stage 5.
 //! Later stages land in sibling modules as they are implemented.
 
-pub mod from_bam;
-pub mod from_psp;
 pub mod contamination_estimation;
 pub mod dust_filter;
+pub mod from_bam;
+pub mod from_psp;
 pub mod per_group_merger;
 pub mod per_position_merger;
 pub mod posterior_engine;

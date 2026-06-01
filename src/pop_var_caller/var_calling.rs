@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use thiserror::Error;
 
-use crate::var_calling::from_bam::pipeline::CohortDriveStats;
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
     current_command_line, verify_fasta_matches_psp_chromosomes,
@@ -39,12 +38,13 @@ use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
 use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::contamination_estimation::ContaminationEstimates;
+use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
+use crate::var_calling::from_bam::pipeline::CohortDriveStats;
 use crate::var_calling::from_psp::{
     ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
     DEFAULT_CHUNK_GENOMIC_SPAN, DownstreamFilterParams, drive_cohort_chunked,
 };
-use crate::var_calling::contamination_estimation::ContaminationEstimates;
-use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError,
 };

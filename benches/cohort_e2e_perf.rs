@@ -81,10 +81,6 @@ use tempfile::TempDir;
 use pop_var_caller::fasta::StreamingChromRefFetcher;
 use pop_var_caller::pileup_record::{AlleleObservation, AlleleSupportStats, PileupRecord};
 use pop_var_caller::pop_var_caller::cli::shared_args::CohortPipelineArgs;
-use pop_var_caller::var_calling::from_bam::pipeline::{
-    CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
-    DEFAULT_MIN_QUAL_PHRED, drive_cohort_pipeline,
-};
 use pop_var_caller::pop_var_caller::var_calling::{
     VarCallingArgs, VarCallingCliError, run_var_calling,
 };
@@ -95,6 +91,10 @@ use pop_var_caller::psp::header::{
 use pop_var_caller::psp::writer::PspWriter;
 use pop_var_caller::var_calling::dust_filter::{
     DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW, DustFilterConfig,
+};
+use pop_var_caller::var_calling::from_bam::pipeline::{
+    CohortPipelineParams, DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T,
+    DEFAULT_MIN_QUAL_PHRED, drive_cohort_pipeline,
 };
 use pop_var_caller::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD,

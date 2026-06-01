@@ -450,9 +450,7 @@ pub fn partition_window(
 mod tests {
     use super::*;
     use crate::pileup_record::PileupRecord;
-    use crate::var_calling::from_psp::test_helpers::{
-        allele, loaded_chunk, record, ref_plus_alt,
-    };
+    use crate::var_calling::from_psp::test_helpers::{allele, loaded_chunk, record, ref_plus_alt};
 
     fn run_partition(
         chunk: &MaterialisedChunk,
