@@ -188,29 +188,55 @@ This is the bulk of the new code, and it is small.
    decision 4). The `Vec<PileupRecord>::into_iter().map(Ok)` shape
    satisfies `load_chunk_from_iters`'s `IntoIterator<Item = Result<…>>`
    + `Send` bound (the `VecColumnSource` test fixture proves this works).
-2. **`WalkerBlockProducer: BlockProducer`.** Per chromosome, holds: the
-   sample's records (as a re-sliceable cursor over the `Vec`), the
-   per-chrom `StreamingChromRefFetcher`, a `ChunkLoadScratch`, a
-   `PartitionScratch`, a DUST-mask buffer, a single-element carryover
-   `Vec<SampleColumns>`, and the chunk-sizing knobs. `next_block`:
-   1. `load_chunk_from_iters` for the next span (`chunk_genomic_span`,
-      `target_variants_per_chunk`, `max_span = remaining chromosome`),
-      feeding the records `>= range_start` and threading the carryover.
-      This applies the **shared** variant filter + carryover.
-   2. `partition_window` → `WindowPartition` (the safe-gap boundary
-      logic; step 3 of the original proposal lives here, shared).
-   3. `sdust_mask_for_span` over the chunk's REF span (unless
-      `--no-complexity-filter`); `prefetch_window_ref_bytes` per group.
-   4. Assemble the `ReadyBlock`, advance `range_start` to the chunk's
-      `safe_end`, return.
-   `recycle` pushes spent buffers onto a free-list (mirror
-   `BlockIterator::recycle`); `chunk_counters` returns the running totals.
-   - *Open detail:* `load_chunk_from_iters` consumes its iterators by
-     value each call. With a whole-chromosome `Vec`, the producer slices
-     the `Vec` per chunk (`records[cursor..]`) — cheap for one sample.
-     If/when Phase C wants true streaming off a live walker, this is where
-     a persistent `SpanColumnSource`/`Peekable` would replace the
-     re-slice; flagged but out of Phase B scope.
+2. **`WalkerBlockProducer: BlockProducer` — one block per chromosome.**
+
+   *Design correction (2026-06-01, found while coding Phase A):*
+   `load_chunk_from_iters` is the **batch** loader — it *consumes* a
+   carryover prefix but never *emits* one, and it compacts the whole
+   requested range in a single call. Group-aware cutting + carry-forward
+   of an open group across blocks is exclusively `StreamingBlockLoader`'s
+   job, and that needs a `SpanColumnSource` (random-access peek), which a
+   forward-only walker stream does not provide. So the batch loader
+   **cannot** do chunk-at-a-time with carryover; the natural unit is one
+   `load_chunk_from_iters` call over the **whole chromosome**, yielding
+   **one `ReadyBlock` per chromosome**.
+
+   This is byte-identical to the `.psp` path's many-small-blocks output:
+   `partition_window` cuts the block into variant groups at
+   `max_group_span` safe gaps, and a group is determined by variant
+   positions + gaps, *independent of block boundaries*. The `.psp` path's
+   safe-gap cutting guarantees it never splits a group across blocks, so
+   both paths see the same natural groups → same `run_window` output. (The
+   in-tree `var_calling_byte_identical_across_target_variants_per_chunk`
+   test already proves the `.psp` path's block-boundary independence.) It
+   also matches today's direct-path memory profile (whole-chromosome
+   materialisation) — fine per decision 4.
+
+   `WalkerBlockProducer` holds: the chromosome list + a cursor over it,
+   a way to obtain each chromosome's single-sample records (Stage 1 —
+   B.2), the per-chrom `StreamingChromRefFetcher`, a `ChunkLoadScratch`,
+   a `PartitionScratch`, a DUST-mask buffer, and the per-stage configs.
+   `next_block` advances to the next data-bearing chromosome and:
+   1. `load_chunk_from_iters` once over `[1, chrom_length]` (single
+      sample iterator; empty carryover) → the chromosome's `MaterialisedChunk`,
+      applying the **shared** variant filter.
+   2. `sdust_mask_for_span` over the block's `[range.start, safe_end)`
+      span (unless `--no-complexity-filter`). The per-position DUST
+      verdict is span-independent past the `MIN_DUST_HALO` barrier, so a
+      single span call matches the `.psp` path's per-interval mask for the
+      same positions. (For very long contigs, sub-span chunking like
+      `dust_mask_for_interval` bounds the REF buffer — a memory refinement,
+      not a correctness one; deferrable.)
+   3. `partition_window` → `WindowPartition`; `prefetch_window_ref_bytes`
+      per group.
+   4. Assemble + return the `ReadyBlock`.
+   `recycle` pushes spent buffers onto a free-list; `chunks_loaded` /
+   `chunk_variants_total` return the running totals (1 chunk/chrom).
+   - *Phase C note:* true within-chromosome chunking (multiple blocks per
+     chromosome, the prerequisite for within-chromosome parallelism) needs
+     a **walker-backed `SpanColumnSource`** feeding `StreamingBlockLoader`
+     — a forward buffer with `peek_next_span`/`read_span` — not the batch
+     loader. That's deferred with the parallelism work.
 3. **Driver.** New `drive_from_bam_chunked` (sibling of
    `drive_cohort_chunked`): per chromosome, build a `WalkerBlockProducer`,
    call the shared `drive_blocks_serial` into one process-wide
