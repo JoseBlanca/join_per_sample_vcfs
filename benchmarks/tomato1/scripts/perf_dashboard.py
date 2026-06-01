@@ -97,10 +97,10 @@ def _(Path):
     perf_dir = test_dir / "results" / "perf"
     # Every TSV any section needs. freebayes is shared across §1 and §3.
     callers = (
-        "ours_from_bam", "freebayes",   # §1 (freebayes also §3)
-        "ours_psp_4t", "gatk_gvcf_4t",  # §2
-        "ours_whole_pipeline",          # §3 (+freebayes)
-        "ours_joint", "gatk_joint",     # §4
+        "ours_from_bam", "freebayes",      # §1 (freebayes also §3)
+        "ours_psp_4t", "gatk_gvcf_4t",     # §2
+        "ours_pileup_build",               # §3 stage-1 (+ ours_joint, freebayes)
+        "ours_joint", "gatk_joint",        # §3 stage-2 + §4
     )
     tsv_paths = {c: perf_dir / f"{c}.tsv" for c in callers}
     return callers, perf_dir, test_dir, tsv_paths
@@ -182,7 +182,8 @@ def _():
     PALETTE = {
         "ours_from_bam":        "#1f77b4",  # blue
         "ours_psp_4t":          "#17becf",  # cyan
-        "ours_whole_pipeline":  "#2ca02c",  # green
+        "ours_pileup_build":    "#2ca02c",  # green
+        "ours_cram_to_vcf":     "#2ca02c",  # green (§3 combined ours line)
         "ours_joint":           "#1a5d1a",  # dark green
         "freebayes":            "#d62728",  # red
         "gatk_gvcf_4t":         "#e377c2",  # pink
@@ -192,7 +193,8 @@ def _():
     LABELS = {
         "ours_from_bam":        "pop_var_caller\n(direct)",
         "ours_psp_4t":          "pop_var_caller\n(pileup→psp)",
-        "ours_whole_pipeline":  "pop_var_caller\n(pileup+joint)",
+        "ours_pileup_build":    "pop_var_caller\n(PSP build)",
+        "ours_cram_to_vcf":     "pop_var_caller\n(pileup build + joint)",
         "ours_joint":           "pop_var_caller\n(psp→vcf)",
         "freebayes":            "freebayes",
         "gatk_gvcf_4t":         "GATK\n(HC→gvcf)",
@@ -405,9 +407,25 @@ def _(bar_pair, mo, rows_by_caller):
 @app.cell
 def _(line_pair, mo, rows_by_caller, xscale, yscale):
     # Section 3 — scaling CRAM -> VCF with N samples.
+    # ours CRAM→VCF = build the PSPs ONCE (makespan per N) + joint psp→vcf
+    # per N. A sample's .psp is cohort-size-independent, so the build is not
+    # repeated per N; with a FIFO worker pool, makespan(first N) is exact.
+    _build = {r["n_samples"]: r for r in rows_by_caller.get("ours_pileup_build", [])}
+    _joint = {r["n_samples"]: r for r in rows_by_caller.get("ours_joint", [])}
+    _combined = []
+    for _n in sorted(set(_build) & set(_joint)):
+        _b, _j = _build[_n], _joint[_n]
+        _combined.append({
+            "n_samples": _n,
+            "wall_seconds": _b["wall_seconds"] + _j["wall_seconds"],
+            "peak_rss_mb": max(_b["peak_rss_mb"], _j["peak_rss_mb"]),
+            "exit_code": 0 if (_b["exit_code"] == 0 and _j["exit_code"] == 0) else 1,
+        })
+    _rows3 = dict(rows_by_caller)
+    _rows3["ours_cram_to_vcf"] = _combined
     fig_3, missing_3 = line_pair(
-        rows_by_caller,
-        ("freebayes", "ours_whole_pipeline"),
+        _rows3,
+        ("freebayes", "ours_cram_to_vcf"),
         title="3. Scaling CRAM → VCF vs N samples",
         xscale_val=xscale.value,
         yscale_val=yscale.value,
@@ -423,10 +441,14 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
     - **freebayes** — per-region processes, **up to 4 concurrent, 1 thread
       each**; each process calls all N samples in its region → per-region
       multi-sample VCFs, concatenated.
-    - **pop_var_caller (pileup + joint)** — stage 1: **up to 4 concurrent
-      `pileup` processes, 1 thread each** (one per sample); stage 2: **1
-      `var-calling` process, 4 threads**. Wall = stage1 + stage2; peak RSS
-      = max(stage1, stage2).
+    - **pop_var_caller (pileup build + joint)** — plotted wall is
+      **PSP-build makespan(N) + joint(N)**. Stage 1 builds the per-sample
+      `.psp` files **once** through a FIFO pool of **4 `pileup` workers,
+      1 thread each**; `makespan(N)` (wall until the first N are ready) is
+      read off that single build — a `.psp` is cohort-size-independent, so
+      nothing is re-called per N. Stage 2 is **1 `var-calling` process, 4
+      threads** over the first N PSPs. Peak RSS = max(build peak ≈ the fixed
+      4-pileup footprint, joint peak(N)).
 
     _GATK's direct multi-sample `HaplotypeCaller` (one process, all N
     `--input`s → joint VCF) is excluded: it re-assembles haplotypes over

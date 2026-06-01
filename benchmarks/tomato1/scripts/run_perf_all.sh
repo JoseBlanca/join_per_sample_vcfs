@@ -55,12 +55,17 @@ case "$MODE" in
     *) echo "usage: $0 [all|host|container]" >&2; exit 2 ;;
 esac
 
-# Host scripts in dashboard order; container (GATK) scripts separately.
+# Host scripts; pileup_build runs first because it (cold-)builds the
+# canonical cohort PSPs that perf_ours_joint then reads.
+#   §3 ours CRAM→VCF = pileup_build makespan(N) + ours_joint wall(N)
+#       (build the PSPs ONCE, reuse for every N — a sample's .psp is
+#        cohort-size-independent, so no re-calling per N).
+#   §1 ours-direct only needs the single-sample (N=1) point.
 HOST_SCRIPTS=(
-    perf_ours_from_bam.py        # §1
+    perf_ours_pileup_build.py    # §3 stage-1 (builds canonical PSPs once, timed)
+    perf_ours_from_bam.py        # §1 (N=1 only)
     perf_ours_psp_4t.py          # §2
-    perf_ours_whole_pipeline.py  # §3
-    perf_ours_joint.py           # §4
+    perf_ours_joint.py           # §3 stage-2 + §4 (psp→vcf per N)
     perf_freebayes.py            # §1 + §3
 )
 CONTAINER_SCRIPTS=(
@@ -73,14 +78,17 @@ declare -a RESULTS=()
 record() { RESULTS+=("$1"); }
 
 run_host() {
-    local script="$1"
+    local script="$1" sizes_override="${2:-}"
     echo
     echo "=== [host] $script ==="
-    if uv run --script "$SCRIPT_DIR/$script"; then
-        record "ok   host/$script"
+    local rc=0
+    if [[ -n "$sizes_override" ]]; then
+        SIZES="$sizes_override" uv run --script "$SCRIPT_DIR/$script" || rc=$?
     else
-        record "FAIL host/$script (exit $?)"
+        uv run --script "$SCRIPT_DIR/$script" || rc=$?
     fi
+    if [[ $rc -eq 0 ]]; then record "ok   host/$script"
+    else record "FAIL host/$script (exit $rc)"; fi
 }
 
 run_container() {
@@ -95,21 +103,23 @@ run_container() {
     fi
 }
 
-# --- Pre-flight warnings for §4 (intermediates must be pre-built) -------
-psp_dir="$TEST_DIR/results/ours/cohort/psp"
+# --- Pre-flight warning for §4 GATK (GVCFs must be pre-built) -----------
+# The ours PSPs are (re)built by perf_ours_pileup_build.py at the top of
+# the host run, so only the GATK GVCFs need to pre-exist.
 gvcf_dir="$TEST_DIR/results/gatk/cohort/gvcf"
-if [[ "$MODE" != container ]] && ! compgen -G "$psp_dir/*.psp" >/dev/null; then
-    echo "WARNING: no *.psp in $psp_dir — §4 perf_ours_joint will have no inputs." >&2
-    echo "         build them first (cohort pileup), or §4-ours will be skipped/empty." >&2
-fi
 if [[ "$MODE" != host ]] && ! compgen -G "$gvcf_dir/*.g.vcf.gz" >/dev/null; then
     echo "WARNING: no *.g.vcf.gz in $gvcf_dir — §4 perf_gatk_joint will have no inputs." >&2
-    echo "         build them first (cohort HaplotypeCaller), or §4-GATK will be skipped/empty." >&2
+    echo "         build them first: DEV_EXTRA_MOUNT=\$HOME/genomes ./scripts/dev.sh \\" >&2
+    echo "             benchmarks/tomato1/scripts/build_cohort_intermediates.sh gvcf" >&2
 fi
 
 # --- Run -----------------------------------------------------------------
 if [[ "$MODE" == all || "$MODE" == host ]]; then
-    for s in "${HOST_SCRIPTS[@]}"; do run_host "$s"; done
+    for s in "${HOST_SCRIPTS[@]}"; do
+        # §1 ours-direct only needs N=1 (the single-sample comparison).
+        if [[ "$s" == perf_ours_from_bam.py ]]; then run_host "$s" 1
+        else run_host "$s"; fi
+    done
 fi
 if [[ "$MODE" == all || "$MODE" == container ]]; then
     for s in "${CONTAINER_SCRIPTS[@]}"; do run_container "$s"; done
