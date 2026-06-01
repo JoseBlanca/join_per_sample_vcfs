@@ -1344,6 +1344,7 @@ fn slice_interval_mask(
 /// per-block allocations (columns, CSR arrays, REF byte buffers) are
 /// reused, not re-grown, across the run — the scratch-reuse discipline,
 /// preserved through the ownership change.
+#[derive(Debug)]
 pub struct ReadyBlock {
     /// Monotonic production index (0, 1, 2, …) assigned by the producer
     /// in genomic order. The collector emits records in `seq_idx` order.
@@ -2136,6 +2137,121 @@ mod tests {
         let pool = DustAheadPool::spawn(dust_jobs(50), 8, 4, compute);
         let _ = pool.recv_next().expect("one").unwrap();
         drop(pool); // Drop → shutdown → join; reaching the end == clean.
+    }
+
+    // ── BlockQueue (M11) ─────────────────────────────────────────────
+    // The hand-rolled bounded queue (Mutex + two Condvars) backs the
+    // producer→worker hand-off in `drive_blocks_parallel`. Its contracts
+    // (block-while-full, drain-then-None-after-close, idempotent close
+    // that wakes every waiter) had no direct tests; a lost wakeup here is a
+    // hang, not a panic, so the integration tests would not localise it.
+
+    /// Minimal `ReadyBlock` for queue-mechanics tests — only `seq_idx`
+    /// matters here (FIFO identity); the payload is empty.
+    fn ready_block(seq_idx: u64) -> ReadyBlock {
+        ReadyBlock {
+            seq_idx,
+            chunk: MaterialisedChunk::with_n_samples(0),
+            partition: WindowPartition::empty(),
+            pre_fetched_ref_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn block_queue_push_errs_after_close() {
+        let q = BlockQueue::new(4);
+        q.close();
+        let rejected = q.push(ready_block(0));
+        assert!(rejected.is_err(), "push after close must return Err(block)");
+        assert_eq!(
+            rejected.unwrap_err().seq_idx,
+            0,
+            "the rejected block is handed back to the caller"
+        );
+    }
+
+    #[test]
+    fn block_queue_pop_drains_then_returns_none_after_close() {
+        let q = BlockQueue::new(4);
+        q.push(ready_block(0)).expect("push 0");
+        q.push(ready_block(1)).expect("push 1");
+        q.close();
+        // Closing does not discard already-queued blocks.
+        assert_eq!(q.pop().map(|b| b.seq_idx), Some(0), "drains in FIFO order");
+        assert_eq!(q.pop().map(|b| b.seq_idx), Some(1));
+        assert!(q.pop().is_none(), "None once closed AND drained");
+    }
+
+    #[test]
+    fn block_queue_push_blocks_until_pop_frees_a_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let q = Arc::new(BlockQueue::new(1));
+        q.push(ready_block(0)).expect("fill the single slot");
+
+        let pushed = Arc::new(AtomicBool::new(false));
+        let q2 = Arc::clone(&q);
+        let pushed2 = Arc::clone(&pushed);
+        let pusher = std::thread::spawn(move || {
+            q2.push(ready_block(1))
+                .expect("second push eventually succeeds");
+            pushed2.store(true, Ordering::SeqCst);
+        });
+
+        // While the queue is full the pusher must be parked on `not_full`.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !pushed.load(Ordering::SeqCst),
+            "push must block while the queue is at capacity"
+        );
+
+        // Freeing a slot wakes the pusher.
+        assert_eq!(q.pop().map(|b| b.seq_idx), Some(0));
+        pusher.join().expect("pusher thread joins (no deadlock)");
+        assert!(
+            pushed.load(Ordering::SeqCst),
+            "push completed once a slot freed"
+        );
+        assert_eq!(
+            q.pop().map(|b| b.seq_idx),
+            Some(1),
+            "the second block is queued"
+        );
+    }
+
+    #[test]
+    fn block_queue_close_wakes_a_push_blocked_on_full() {
+        let q = Arc::new(BlockQueue::new(1));
+        q.push(ready_block(0)).expect("fill the single slot");
+        let q2 = Arc::clone(&q);
+        let pusher = std::thread::spawn(move || q2.push(ready_block(1)));
+        // Let the pusher park on `not_full` before we close.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        q.close();
+        let res = pusher
+            .join()
+            .expect("pusher joins (close woke it, no hang)");
+        assert!(
+            res.is_err(),
+            "a push blocked on full returns Err once closed"
+        );
+    }
+
+    #[test]
+    fn block_queue_close_wakes_a_pop_blocked_on_empty() {
+        let q = Arc::new(BlockQueue::new(4)); // empty
+        let q2 = Arc::clone(&q);
+        let popper = std::thread::spawn(move || q2.pop());
+        // Let the popper park on `not_empty` before we close.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        q.close();
+        let res = popper
+            .join()
+            .expect("popper joins (close woke it, no hang)");
+        assert!(
+            res.is_none(),
+            "a pop blocked on empty returns None once closed"
+        );
     }
 
     fn ref_allele() -> MergedAllele {
