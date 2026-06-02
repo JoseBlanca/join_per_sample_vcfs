@@ -25,7 +25,7 @@ use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, format_md5_hex, rfc3339_now,
 };
 use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
-use crate::psp::writer::{PspWriter, TARGET_BLOCK_BYTES};
+use crate::psp::writer::{DEFAULT_BLOCK_WINDOW_BP, MAX_BLOCK_TARGET_BYTES, PspWriter};
 
 pub mod error_bridge;
 pub mod parsers;
@@ -93,8 +93,12 @@ pub struct PileupArgs {
     #[arg(required = true)]
     pub alignment_files: Vec<PathBuf>,
 
-    /// PSP writer auto-flush threshold (uncompressed bytes per block).
-    /// Range 16 KiB..=16 MiB. Default 1 MiB.
+    /// PSP writer **safety cap** (uncompressed bytes per block): force a
+    /// block flush mid-window if projected bytes reach this, guarding
+    /// against a pathological window blowing up resident memory. The
+    /// primary cut is now `--block-window-bp` (a fixed genomic grid);
+    /// this cap should sit well above a typical window's size so it only
+    /// fires on extreme density. Range 16 KiB..=16 MiB, default 16 MiB.
     ///
     /// Trade-off — peak memory vs on-disk size. The cohort
     /// var-calling driver opens one `PspReader` per sample per
@@ -115,11 +119,29 @@ pub struct PileupArgs {
     /// matters more than cohort-step heap.
     #[arg(
         long,
-        default_value_t = TARGET_BLOCK_BYTES,
+        default_value_t = MAX_BLOCK_TARGET_BYTES,
         value_parser = parsers::parse_block_target_bytes,
         help_heading = "Advanced — PSP writer",
     )]
     pub block_target_bytes: usize,
+
+    /// PSP block-cut genomic window, in bases (the **primary** cut).
+    /// Blocks are cut on a fixed reference grid (`pos / window`), so
+    /// every independently-written sample cuts at the same positions.
+    /// This alignment is what lets the cohort `var-calling` reader
+    /// advance all samples in lockstep — without it, misaligned blocks
+    /// inflate the per-block synchronisation count ~N-fold and the read
+    /// stops scaling with threads. PSP stores a fixed per-position
+    /// summary, so a window ≈ that many records ≈ roughly-constant
+    /// memory per block regardless of read depth. Default 20 kb
+    /// (~2.5 MB blocks). `--block-target-bytes` is the safety cap for
+    /// pathological windows.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BLOCK_WINDOW_BP,
+        help_heading = "Advanced — PSP writer",
+    )]
+    pub block_window_bp: u32,
 
     // ===== Stage 1 (shared with var-calling-from-bam) =========
     #[command(flatten)]
@@ -218,12 +240,18 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
                 &args.alignment_files,
                 stage1,
                 args.block_target_bytes,
+                args.block_window_bp,
             )?;
             // Open the .tmp output, build the writer, drive the walker.
             let file = File::create(&tmp_path).map_err(PileupCliError::Io)?;
             let buf = BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
-            let psp_writer = PspWriter::new_with_block_target(buf, header, args.block_target_bytes)
-                .map_err(PileupToPspError::from)?;
+            let psp_writer = PspWriter::new_with_block_layout(
+                buf,
+                header,
+                args.block_target_bytes,
+                args.block_window_bp,
+            )
+            .map_err(PileupToPspError::from)?;
             let (sink, run_summary) = drive_pileup_to_psp(ctx.walker, psp_writer)?;
             Ok((sink, run_summary))
         },
@@ -337,6 +365,7 @@ fn build_writer_header(
     cram_paths: &[PathBuf],
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
+    block_window_bp: u32,
 ) -> Result<WriterHeader, PileupCliError> {
     let mut chromosomes = Vec::with_capacity(contigs.entries.len());
     for entry in &contigs.entries {
@@ -364,7 +393,7 @@ fn build_writer_header(
 
     let input_crams: Vec<String> = cram_paths.iter().map(|p| basename(p)).collect();
     let input_fasta = basename(fasta_path);
-    let parameters = effective_parameters(args, block_target_bytes);
+    let parameters = effective_parameters(args, block_target_bytes, block_window_bp);
 
     Ok(WriterHeader {
         format_version: (1, 0),
@@ -389,6 +418,7 @@ fn build_writer_header(
 fn effective_parameters(
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
+    block_window_bp: u32,
 ) -> BTreeMap<String, ParameterValue> {
     let mut p = BTreeMap::new();
     // CRAM input filters
@@ -463,6 +493,10 @@ fn effective_parameters(
         "block_target_bytes".into(),
         ParameterValue::Integer(block_target_bytes as i64),
     );
+    p.insert(
+        "block_window_bp".into(),
+        ParameterValue::Integer(block_window_bp as i64),
+    );
     p
 }
 
@@ -525,6 +559,7 @@ mod tests {
         DEFAULT_MATE_LOOKUP_WINDOW, DEFAULT_MAX_ACTIVE_READS, DEFAULT_MAX_INDEL_COLUMN_DEPTH,
         DEFAULT_MAX_RECORD_SPAN, DEFAULT_MAX_SNP_COLUMN_DEPTH,
     };
+    use crate::psp::writer::TARGET_BLOCK_BYTES;
 
     fn default_args(
         reference: PathBuf,
@@ -537,6 +572,7 @@ mod tests {
             threads: None,
             alignment_files,
             block_target_bytes: TARGET_BLOCK_BYTES,
+            block_window_bp: DEFAULT_BLOCK_WINDOW_BP,
             stage1: shared_args::Stage1Args {
                 min_mapq: DEFAULT_MIN_MAPQ,
                 no_baq: false,
@@ -586,7 +622,7 @@ mod tests {
     #[test]
     fn effective_parameters_records_every_knob() {
         let args = default_args(PathBuf::from("r.fa"), PathBuf::from("o.psp"), vec![]);
-        let p = effective_parameters(&args.stage1, args.block_target_bytes);
+        let p = effective_parameters(&args.stage1, args.block_target_bytes, args.block_window_bp);
         // Sanity: every knob shows up.
         for key in &[
             "min_mapq",
@@ -607,6 +643,7 @@ mod tests {
             "max_active_reads",
             "threads",
             "block_target_bytes",
+            "block_window_bp",
         ] {
             assert!(p.contains_key(*key), "missing parameter: {key}");
         }
@@ -617,6 +654,11 @@ mod tests {
         assert_eq!(
             p.get("block_target_bytes"),
             Some(&ParameterValue::Integer(TARGET_BLOCK_BYTES as i64))
+        );
+        // Block-window default tracks `DEFAULT_BLOCK_WINDOW_BP`.
+        assert_eq!(
+            p.get("block_window_bp"),
+            Some(&ParameterValue::Integer(DEFAULT_BLOCK_WINDOW_BP as i64))
         );
     }
 
@@ -638,6 +680,7 @@ mod tests {
             &[],
             &args.stage1,
             args.block_target_bytes,
+            args.block_window_bp,
         )
         .expect_err("must error");
         assert!(matches!(err, PileupCliError::MissingMd5 { ref contig } if contig == "chr1"));
@@ -670,6 +713,7 @@ mod tests {
             &alignment_files,
             &args.stage1,
             args.block_target_bytes,
+            args.block_window_bp,
         )
         .expect("build_writer_header");
         assert_eq!(header.writer.input_fasta, "grch38.fa");

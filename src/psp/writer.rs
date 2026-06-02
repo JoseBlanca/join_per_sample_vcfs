@@ -85,6 +85,19 @@ pub const MIN_BLOCK_TARGET_BYTES: usize = 16 * 1024;
 /// payoff and exacerbates the memory issue.
 pub const MAX_BLOCK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
+/// Default genomic window (bases) per block — the **primary** block-cut
+/// criterion (2026-06-02 scaling work). Blocks are cut on a fixed
+/// reference-coordinate grid (`pos / block_window_bp`), so every sample
+/// — written independently — cuts at the *same* positions. That
+/// alignment is what collapses the cohort reader's per-block sync count
+/// (one shared step per covered window instead of one per sample's
+/// every block). PSP stores a fixed per-position summary (not per-read
+/// data), so a fixed genomic window holds roughly constant memory
+/// regardless of read depth. `target_block_bytes` remains as a *safety
+/// cap* for pathological windows. See
+/// [the architecture review](../../doc/devel/reports/reviews/architecture_psp_to_vcf_scaling_2026-06-02.md).
+pub const DEFAULT_BLOCK_WINDOW_BP: u32 = 20_000;
+
 /// Initial `Vec::with_capacity` hint for per-record columns in a
 /// freshly-opened block (delta-pos, n-alleles, the per-record list
 /// columns). Sized at ~66 % of the SNP-typical fill (block target ÷
@@ -243,11 +256,18 @@ pub struct PspWriter<W: Write> {
     ingest: IngestState,
     /// Reused per-flush scratch buffers + zstd compressor.
     scratch: WriterScratch,
-    /// Auto-flush trigger: the writer flushes when an open block's
-    /// projected uncompressed bytes reach this value. Defaults to
-    /// [`TARGET_BLOCK_BYTES`]; tests override via
-    /// [`PspWriter::new_with_block_target`] (M14, Mi26).
+    /// Safety-cap auto-flush trigger: the writer force-flushes when an
+    /// open block's projected uncompressed bytes reach this value, even
+    /// mid-window. Protects against a pathological window (extreme
+    /// multi-allelic density) blowing up resident memory. The *primary*
+    /// cut is [`block_window_bp`](Self::block_window_bp); this is the
+    /// backstop.
     target_block_bytes: usize,
+    /// Primary block-cut grid (bases). A block holds records whose
+    /// position falls in one `[k·w, (k+1)·w)` window; the next record in
+    /// a different window starts a new block. Identical across samples ⇒
+    /// aligned block boundaries. See [`DEFAULT_BLOCK_WINDOW_BP`].
+    block_window_bp: u32,
 }
 
 impl<W: Write> PspWriter<W> {
@@ -275,9 +295,24 @@ impl<W: Write> PspWriter<W> {
     /// CLI gatekeeps the accepted range to
     /// [`MIN_BLOCK_TARGET_BYTES`]..=[`MAX_BLOCK_TARGET_BYTES`].
     pub fn new_with_block_target(
+        sink: W,
+        header: WriterHeader,
+        target_block_bytes: usize,
+    ) -> Result<Self, PspWriteError> {
+        Self::new_with_block_layout(sink, header, target_block_bytes, DEFAULT_BLOCK_WINDOW_BP)
+    }
+
+    /// Like [`Self::new_with_block_target`] but also sets the primary
+    /// genomic-window block-cut grid (`block_window_bp`). The `pileup`
+    /// CLI passes both knobs; the window is the aligned primary cut and
+    /// `target_block_bytes` is the safety cap. A `block_window_bp` of 0
+    /// is clamped to 1 (every record its own window — degenerate, but
+    /// never panics).
+    pub fn new_with_block_layout(
         mut sink: W,
         header: WriterHeader,
         target_block_bytes: usize,
+        block_window_bp: u32,
     ) -> Result<Self, PspWriteError> {
         let header_bytes = build_header_bytes(&header)?;
         sink.write_all(&header_bytes)
@@ -298,6 +333,7 @@ impl<W: Write> PspWriter<W> {
             ingest: IngestState::new(),
             scratch,
             target_block_bytes,
+            block_window_bp: block_window_bp.max(1),
         })
     }
 
@@ -311,12 +347,21 @@ impl<W: Write> PspWriter<W> {
 
         // Should we flush before appending? Flush triggers:
         // - chrom_id change (blocks never cross chromosomes)
-        // - projected uncompressed size at or past the target
+        // - PRIMARY: the record crosses into a new genomic window
+        //   (`pos / block_window_bp`), so block boundaries land on a
+        //   fixed reference grid shared by every independently-written
+        //   sample → aligned boundaries → far fewer cohort-read sync
+        //   steps.
+        // - SAFETY CAP: projected uncompressed size past the cap (guards
+        //   against a pathological window blowing up resident memory).
         let pre_flush_bytes = self.sink_offset;
+        let w = self.block_window_bp;
         let should_flush = match &self.block {
             None => false,
             Some(b) => {
-                b.chrom_id != record.chrom_id || b.projected_bytes >= self.target_block_bytes
+                b.chrom_id != record.chrom_id
+                    || (record.pos / w) != (b.first_pos / w)
+                    || b.projected_bytes >= self.target_block_bytes
             }
         };
         if should_flush {
@@ -1250,6 +1295,62 @@ mod tests {
             entries[1].block_offset > entries[0].block_offset,
             "second block's offset must come after first"
         );
+    }
+
+    /// Window-based cut: blocks fall on a fixed genomic grid
+    /// (`pos / block_window_bp`), so every block lies within a single
+    /// window and the boundaries are deterministic regardless of
+    /// record content. This is the cross-sample alignment property the
+    /// cohort reader relies on. The byte target is set generous
+    /// (`MAX_BLOCK_TARGET_BYTES`) so only the window drives the cut.
+    #[test]
+    fn block_window_cuts_on_a_fixed_genomic_grid() {
+        let window = 100u32;
+        let mut writer = PspWriter::new_with_block_layout(
+            Cursor::new(Vec::new()),
+            writer_header(1),
+            MAX_BLOCK_TARGET_BYTES,
+            window,
+        )
+        .unwrap();
+        // Positions across several 100bp windows, with multiple records
+        // sharing some windows (windows 0, 1, 2, 4, 9 are populated).
+        let positions = [50u32, 60, 150, 250, 251, 252, 470, 999];
+        for p in positions {
+            writer
+                .write_record(&record(0, p, vec![allele(b"A", 1, -1.0, &[])]))
+                .unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let trailer: &[u8; TRAILER_BYTES] =
+            bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
+        let trailer = decode_trailer(trailer).unwrap();
+        let index_bytes = &bytes[trailer.index_offset as usize
+            ..(trailer.index_offset + trailer.index_byte_length) as usize];
+        let entries = decode_index(index_bytes, trailer.n_blocks).unwrap();
+
+        // Every block lies within a single window.
+        for e in &entries {
+            assert_eq!(
+                e.first_pos / window,
+                e.last_pos / window,
+                "block [{}, {}] straddles a {window}bp window boundary",
+                e.first_pos,
+                e.last_pos,
+            );
+        }
+        // One block per populated window — deterministic from the grid,
+        // independent of how many records fall in each.
+        let populated: std::collections::BTreeSet<u32> =
+            positions.iter().map(|p| p / window).collect();
+        assert_eq!(entries.len(), populated.len());
+        // Block boundaries land on the grid: each block's window index
+        // is distinct and ascending.
+        let block_windows: Vec<u32> = entries.iter().map(|e| e.first_pos / window).collect();
+        let mut sorted = block_windows.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(block_windows, sorted, "blocks ascending, one per window");
     }
 
     // The `active_slot_snapshot_carries_across_blocks` and
