@@ -423,7 +423,29 @@ grid-cut unit test; the temporary instrumentation was reverted. fmt / clippy
 calibration tools `examples/psp_block_stats.rs` and `examples/psp_rechunk.rs`
 ship alongside. Production `.psp` files must be regenerated via `pileup` to
 inherit the 20 kb default (the validation used `psp_rechunk` to avoid re-running
-pileup); the cohort benchmark re-measurement is the next step.
+pileup).
+
+**Production benchmark (PSPs regenerated via `pileup` at the 20 kb default,
+tomato N=50).** Thread sweep — the ~2× plateau is gone:
+
+| threads | before (misaligned) | after (20 kb) |
+|--:|--:|--:|
+| 1 | 60.0 s | 56.2 s |
+| 2 | 33.0 s (1.8×) | 29.0 s (1.9×) |
+| 4 | 29.7 s (2.0×) | 16.8 s (3.4×) |
+| 6 | 29.6 s (2.0×) | 12.5 s (4.5×) |
+| 8 | 30.6 s (2.0×) | 10.8 s (**5.2×**) |
+
+Cohort-size sweep (T=4): wall N=50 31.7 → 16.6 s; N=8 7.9 → 2.2 s. Peak RSS rose
+~6× (~16 → ~100 MB/sample; N=50 831 MB → 5.0 GB) — memory stays **linear** in N
+(the no-OOM-blowup thesis holds, just a steeper line) because the bigger blocks
+now keep the bounded queue full. **PM decision: keep the 20 kb default — the
+memory increase is acceptable for this workload.** TSVs at
+`benchmarks/tomato1/results/perf/ours_joint{,_threads}.tsv`.
+
+Next levers (now that reading scales): parallelise the single producer thread
+(pool over the independent covered intervals) and/or the EM consume side
+(`unify_alleles`, e-step).
 
 ### What this means for the redesign
 
