@@ -11,23 +11,18 @@
 # TSVs written by the perf_<caller>.py scripts; any missing TSV is skipped
 # with a friendly note so partial runs still render.
 #
-#   1. Single-sample direct calling (CRAM -> VCF) — bar charts (time + RAM)
-#      for freebayes, GATK (direct HaplotypeCaller), and pop_var_caller
-#      (var-calling-from-bam, the direct single-sample route). All three
-#      with a 4-thread budget.
-#   2. Build one per-sample intermediate (one sample, 4 threads) — bar
+#   1. Build one per-sample intermediate (one sample, 4 threads) — bar
 #      charts for GATK (HaplotypeCaller -ERC GVCF) and pop_var_caller
 #      (pileup -> .psp).
-#   3. Scaling CRAM -> VCF with N samples — line charts. freebayes (region
+#   2. Scaling CRAM -> VCF with N samples — line charts. freebayes (region
 #      parallel, 4 workers), GATK (one direct multi-sample HaplotypeCaller,
 #      4 pair-HMM threads), pop_var_caller (4 parallel pileups then one
 #      4-thread joint var-calling).
-#   4. Scaling intermediate -> VCF with N samples (the re-run-on-new-samples
+#   3. Scaling intermediate -> VCF with N samples (the re-run-on-new-samples
 #      step) — line charts. GATK (CombineGVCFs + GenotypeGVCFs) and
 #      pop_var_caller (.psp -> VCF, 4 threads).
 #
-# Some measurements are shared across sections: freebayes.tsv and
-# gatk_direct.tsv each feed both section 1 (N=1 row) and section 3.
+# freebayes.tsv feeds section 2 (the CRAM -> VCF scaling lines).
 #
 # Recommended invocation:
 #
@@ -61,32 +56,26 @@ def _(mo):
     Wall-clock time and peak RSS (summed across the process tree) on the
     tomato1 cohort (CRAMs pre-sliced to `regions.bed`). Four sections:
 
-    - **1. Single-sample direct calling** (CRAM → VCF, bar charts).
-      freebayes vs pop_var_caller (`var-calling-from-bam`, the direct
-      single-sample route). 4-thread budget each (ours `--threads 4`;
-      freebayes 4 concurrent region workers). _GATK is excluded here — its
-      only "direct cram→vcf" path is multi-sample HaplotypeCaller, which
-      doesn't scale (see §3 note); GATK appears in §2 and §4._
-    - **2. Build one per-sample intermediate** (one sample, 4 threads, bar
+    - **1. Build one per-sample intermediate** (one sample, 4 threads, bar
       charts). GATK `HaplotypeCaller -ERC GVCF` → GVCF vs pop_var_caller
       `pileup` → `.psp`.
-    - **3. Scaling CRAM → VCF, N samples** (line charts). freebayes
+    - **2. Scaling CRAM → VCF, N samples** (line charts). freebayes
       (region-parallel) vs pop_var_caller (4 parallel pileups, then one
       4-thread joint `var-calling`). _GATK's direct multi-sample
       `HaplotypeCaller` is excluded: it re-assembles over pooled deep
       coverage, so wall is super-linear in N (≈3.5× per sample-doubling on
       tomato1) — impractical past a few samples. GATK's scalable route is
-      the GVCF flow shown in §4._
-    - **4. Scaling intermediate → VCF, N samples** (line charts; the step
+      the GVCF flow shown in §3._
+    - **3. Scaling intermediate → VCF, N samples** (line charts; the step
       you re-run when new samples arrive). GATK `CombineGVCFs` +
       `GenotypeGVCFs` vs pop_var_caller `.psp` → VCF (4 threads).
-    - **5. Thread scaling** (line charts) of pop_var_caller's joint stage
+    - **4. Thread scaling** (line charts) of pop_var_caller's joint stage
       (`.psp` → VCF) at the *maximum* cohort size, sweeping `--threads` —
       how well one `var-calling` process uses more cores.
 
     Inputs: per-caller TSVs at `results/perf/<caller>.tsv`, written by
-    `perf_<caller>.py`. `freebayes.tsv` feeds both §1 (N=1 row) and §3.
-    Section 5 reads `ours_joint_threads.tsv` (`perf_ours_joint_threads.py`).
+    `perf_<caller>.py`. `freebayes.tsv` feeds §2 (CRAM → VCF scaling).
+    Section 4 reads `ours_joint_threads.tsv` (`perf_ours_joint_threads.py`).
     """)
     return
 
@@ -95,12 +84,12 @@ def _(mo):
 def _(Path):
     test_dir = Path(__file__).resolve().parent.parent
     perf_dir = test_dir / "results" / "perf"
-    # Every TSV any section needs. freebayes is shared across §1 and §3.
+    # Every TSV any section needs.
     callers = (
-        "ours_from_bam", "freebayes",      # §1 (freebayes also §3)
-        "ours_psp_4t", "gatk_gvcf_4t",     # §2
-        "ours_pileup_build",               # §3 stage-1 (+ ours_joint, freebayes)
-        "ours_joint", "gatk_joint",        # §3 stage-2 + §4
+        "ours_psp_4t", "gatk_gvcf_4t",     # §1
+        "freebayes",                       # §2 (with ours_pileup_build + ours_joint)
+        "ours_pileup_build",               # §2 stage-1
+        "ours_joint", "gatk_joint",        # §2 stage-2 + §3
     )
     tsv_paths = {c: perf_dir / f"{c}.tsv" for c in callers}
     return callers, perf_dir, test_dir, tsv_paths
@@ -180,7 +169,6 @@ def _():
     # Stable colour per caller; ours = blue/green family, freebayes = red,
     # GATK = purple/brown/pink family.
     PALETTE = {
-        "ours_from_bam":        "#1f77b4",  # blue
         "ours_psp_4t":          "#17becf",  # cyan
         "ours_pileup_build":    "#2ca02c",  # green
         "ours_cram_to_vcf":     "#2ca02c",  # green (§3 combined ours line)
@@ -191,7 +179,6 @@ def _():
     }
     # Human-friendly labels for legends / bar x-ticks.
     LABELS = {
-        "ours_from_bam":        "pop_var_caller\n(direct)",
         "ours_psp_4t":          "pop_var_caller\n(pileup→psp)",
         "ours_pileup_build":    "pop_var_caller\n(PSP build)",
         "ours_cram_to_vcf":     "pop_var_caller\n(pileup build + joint)",
@@ -345,45 +332,12 @@ def _():
 
 @app.cell
 def _(bar_pair, mo, rows_by_caller):
-    # Section 1 — single-sample direct calling (CRAM -> VCF), N=1 bars.
-    fig_1, missing_1 = bar_pair(
-        rows_by_caller,
-        ("freebayes", "ours_from_bam"),
-        target_n=1,
-        title="1. Single-sample direct calling (CRAM → VCF, 4-thread budget)",
-    )
-    sec1_methods = mo.md("""
-    **Materials & methods.** One sample (N=1), CRAM → VCF, restricted to
-    `regions.bed` (~2 Mb; CRAMs pre-sliced to it). Wall + peak RSS summed
-    across the whole process tree.
-
-    - **freebayes** — one process per BED region (20 regions), **up to 4
-      concurrent processes, 1 thread each** (freebayes has no internal
-      threading); per-region VCFs concatenated at the end.
-    - **pop_var_caller (direct)** — **1 `var-calling-from-bam` process, 4
-      threads** (`--threads 4`). Runs genome-wide (no BED flag), but the
-      pre-sliced CRAM confines the work to the same regions.
-
-    _GATK omitted: its only direct cram→vcf route is multi-sample
-    HaplotypeCaller, excluded for the scaling reason noted in §3._
-    """)
-    _body_1 = mo.as_html(fig_1) if fig_1 is not None else mo.md(
-        "_(Section 1 unavailable; missing TSV(s)/N=1 row: "
-        + ", ".join(f"`{c}`" for c in missing_1) + ".)_"
-    )
-    sec1_view = mo.vstack([sec1_methods, _body_1])
-    sec1_view
-    return fig_1, missing_1, sec1_view
-
-
-@app.cell
-def _(bar_pair, mo, rows_by_caller):
-    # Section 2 — build one per-sample intermediate (one sample, 4 threads).
+    # Section 1 — build one per-sample intermediate (one sample, 4 threads).
     fig_2, missing_2 = bar_pair(
         rows_by_caller,
         ("gatk_gvcf_4t", "ours_psp_4t"),
         target_n=1,
-        title="2. Build one per-sample intermediate (one sample, 4 threads)",
+        title="1. Build one per-sample intermediate (one sample, 4 threads)",
     )
     sec2_methods = mo.md("""
     **Materials & methods.** Build one sample's per-sample intermediate
@@ -406,7 +360,7 @@ def _(bar_pair, mo, rows_by_caller):
 
 @app.cell
 def _(line_pair, mo, rows_by_caller, xscale, yscale):
-    # Section 3 — scaling CRAM -> VCF with N samples.
+    # Section 2 — scaling CRAM -> VCF with N samples.
     # ours CRAM→VCF = build the PSPs ONCE (makespan per N) + joint psp→vcf
     # per N. A sample's .psp is cohort-size-independent, so the build is not
     # repeated per N; with a FIFO worker pool, makespan(first N) is exact.
@@ -426,7 +380,7 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
     fig_3, missing_3 = line_pair(
         _rows3,
         ("freebayes", "ours_cram_to_vcf"),
-        title="3. Scaling CRAM → VCF vs N samples",
+        title="2. Scaling CRAM → VCF vs N samples",
         xscale_val=xscale.value,
         yscale_val=yscale.value,
     )
@@ -455,7 +409,7 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
     the pooled deep coverage of every sample per active region, so wall is
     super-linear in N (on tomato1: N=1→0.8 min, 2→2.1, 4→7.7, ≈3.5× per
     doubling) — impractical past a few samples. GATK's scalable path is the
-    GVCF flow in §4._
+    GVCF flow in §3._
     """)
     _body_3 = mo.as_html(fig_3) if fig_3 is not None else mo.md(
         "_(Section 3 unavailable; missing TSV(s): "
@@ -468,11 +422,11 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
 
 @app.cell
 def _(line_pair, mo, rows_by_caller, xscale, yscale):
-    # Section 4 — scaling intermediate -> VCF (re-run-on-new-samples step).
+    # Section 3 — scaling intermediate -> VCF (re-run-on-new-samples step).
     fig_4, missing_4 = line_pair(
         rows_by_caller,
         ("gatk_joint", "ours_joint"),
-        title="4. Scaling intermediate → VCF vs N samples (GVCF/PSP → cohort VCF)",
+        title="3. Scaling intermediate → VCF vs N samples (GVCF/PSP → cohort VCF)",
         xscale_val=xscale.value,
         yscale_val=yscale.value,
     )
@@ -499,11 +453,11 @@ def _(line_pair, mo, rows_by_caller, xscale, yscale):
 
 @app.cell
 def _(mo, thread_pair, thread_rows, yscale):
-    # Section 5 — thread scaling of the cohort joint stage (PSP -> VCF) at
+    # Section 4 — thread scaling of the cohort joint stage (PSP -> VCF) at
     # the MAXIMUM cohort size. One var-calling process, --threads swept.
     fig_5 = thread_pair(
         thread_rows,
-        title="5. Thread scaling — pop_var_caller joint (PSP → VCF) at max N",
+        title="4. Thread scaling — pop_var_caller joint (PSP → VCF) at max N",
         yscale_val=yscale.value,
     )
     sec5_methods = mo.md("""

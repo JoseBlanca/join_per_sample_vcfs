@@ -10,11 +10,10 @@
 #     so it's mounted via DEV_EXTRA_MOUNT.
 #
 # Sections and the scripts that feed them:
-#   §1 single-sample direct (CRAM→VCF): perf_ours_from_bam, perf_freebayes
-#                                        (N=1 rows)
-#   §2 one intermediate, 4 threads:      perf_ours_psp_4t, perf_gatk_gvcf_4t
-#   §3 scaling CRAM→VCF:                 perf_ours_whole_pipeline, perf_freebayes
-#   §4 scaling intermediate→VCF:         perf_ours_joint, perf_gatk_joint
+#   §1 one intermediate, 4 threads:      perf_ours_psp_4t, perf_gatk_gvcf_4t
+#   §2 scaling CRAM→VCF:                 perf_ours_pileup_build + perf_ours_joint,
+#                                        perf_freebayes
+#   §3 scaling intermediate→VCF:         perf_ours_joint, perf_gatk_joint
 #
 # NOTE: GATK direct multi-sample HaplotypeCaller (CRAM→VCF) is deliberately
 # NOT measured — its wall is super-linear in N (re-assembly over pooled deep
@@ -57,20 +56,18 @@ esac
 
 # Host scripts; pileup_build runs first because it (cold-)builds the
 # canonical cohort PSPs that perf_ours_joint then reads.
-#   §3 ours CRAM→VCF = pileup_build makespan(N) + ours_joint wall(N)
+#   §2 ours CRAM→VCF = pileup_build makespan(N) + ours_joint wall(N)
 #       (build the PSPs ONCE, reuse for every N — a sample's .psp is
 #        cohort-size-independent, so no re-calling per N).
-#   §1 ours-direct only needs the single-sample (N=1) point.
 HOST_SCRIPTS=(
-    perf_ours_pileup_build.py    # §3 stage-1 (builds canonical PSPs once, timed)
-    perf_ours_from_bam.py        # §1 (N=1 only)
-    perf_ours_psp_4t.py          # §2
-    perf_ours_joint.py           # §3 stage-2 + §4 (psp→vcf per N)
-    perf_freebayes.py            # §1 + §3
+    perf_ours_pileup_build.py    # §2 stage-1 (builds canonical PSPs once, timed)
+    perf_ours_psp_4t.py          # §1
+    perf_ours_joint.py           # §2 stage-2 + §3 (psp→vcf per N)
+    perf_freebayes.py            # §2
 )
 CONTAINER_SCRIPTS=(
-    perf_gatk_gvcf_4t.py         # §2
-    perf_gatk_joint.py           # §4
+    perf_gatk_gvcf_4t.py         # §1
+    perf_gatk_joint.py           # §3
 )
 
 declare -a RESULTS=()
@@ -115,11 +112,7 @@ fi
 
 # --- Run -----------------------------------------------------------------
 if [[ "$MODE" == all || "$MODE" == host ]]; then
-    for s in "${HOST_SCRIPTS[@]}"; do
-        # §1 ours-direct only needs N=1 (the single-sample comparison).
-        if [[ "$s" == perf_ours_from_bam.py ]]; then run_host "$s" 1
-        else run_host "$s"; fi
-    done
+    for s in "${HOST_SCRIPTS[@]}"; do run_host "$s"; done
 fi
 if [[ "$MODE" == all || "$MODE" == container ]]; then
     for s in "${CONTAINER_SCRIPTS[@]}"; do run_container "$s"; done
