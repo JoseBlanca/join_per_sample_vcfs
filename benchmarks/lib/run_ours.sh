@@ -3,9 +3,11 @@
 #
 #   benchmarks/lib/run_ours.sh <bench.config.sh> [single|cohort]
 #
-# single : one CRAM -> single-sample VCF via the direct path
-#          (`var-calling-from-bam`, no .psp intermediate). The CRAM is
-#          config's SINGLE_CRAM.
+# single : one CRAM -> single-sample VCF via the two-stage path —
+#          `pileup` (CRAM -> .psp) then `var-calling` (.psp -> VCF). The
+#          CRAM is config's SINGLE_CRAM. (The old one-shot direct path,
+#          `var-calling-from-bam`, was removed; pileup->psp->var-calling
+#          is now the only route to a VCF.)
 # cohort : all CRAMs -> per-sample .psp (`pileup`) -> joined multi-sample
 #          VCF (`var-calling`). Pileups run sequentially (each at THREADS
 #          workers) to stay within the host P-core budget; already-built
@@ -20,8 +22,9 @@
 #   THREADS             rayon worker count (default: 4)
 #   REFERENCE           reference FASTA (.fai sibling required)
 #   PILEUP_EXTRA        appended to each `pileup` invocation
-#   VARCALL_EXTRA       appended to the `var-calling` / `var-calling-from-bam`
-#                       invocation (e.g. --no-complexity-filter)
+#   VARCALL_EXTRA       appended to the `var-calling` invocation
+#                       (e.g. --no-complexity-filter to disable the DUST
+#                       low-complexity filter for a fair cross-caller cmp)
 #   DRY_RUN=1           print commands instead of running them
 
 set -euo pipefail
@@ -37,37 +40,55 @@ VARCALL_EXTRA=${VARCALL_EXTRA:-}
 OUT_DIR="$OUT_ROOT/ours"
 
 run_single() {
-    local cram base out_vcf log
+    local cram base psp out_vcf psp_log log
     cram="$(bench_single_cram)"
     base="$(bench_sample_base "$cram")"
     bench_preflight "$cram" "${cram}.crai" "$REFERENCE" "${REFERENCE}.fai"
 
+    psp="$OUT_DIR/single_${base}.psp"
+    psp_log="$OUT_DIR/single_${base}.pileup.log"
     out_vcf="$OUT_DIR/single_${base}.vcf"
     log="$OUT_DIR/single_${base}.log"
     mkdir -p "$OUT_DIR"
 
     echo "binary    : $POP_VAR_CALLER_BIN"
-    echo "mode      : single ($BENCH_NAME)"
+    echo "mode      : single ($BENCH_NAME) — pileup -> .psp -> var-calling"
     echo "sample    : $base"
     echo "input     : $cram"
     echo "reference : $REFERENCE"
     echo "threads   : $THREADS"
+    echo "psp       : $psp"
     echo "output    : $out_vcf"
     echo
 
-    local t0 t1
+    local t0 t_mid t1
     t0=$(bench_now)
+    # ---- Stage 1: pileup (CRAM -> .psp) ----
+    echo "[pileup] $base -> $psp"
     # shellcheck disable=SC2086
-    bench_run "$log" -- "$POP_VAR_CALLER_BIN" var-calling-from-bam \
+    bench_run "$psp_log" -- "$POP_VAR_CALLER_BIN" pileup \
+        --reference "$REFERENCE" \
+        --output "$psp" \
+        --threads "$THREADS" \
+        $PILEUP_EXTRA \
+        "$cram"
+    t_mid=$(bench_now)
+
+    # ---- Stage 2: var-calling (.psp -> VCF) ----
+    echo "[var-calling] $psp -> $out_vcf"
+    # shellcheck disable=SC2086
+    bench_run "$log" -- "$POP_VAR_CALLER_BIN" var-calling \
         --reference "$REFERENCE" \
         --output "$out_vcf" \
         --threads "$THREADS" \
         $VARCALL_EXTRA \
-        "$cram"
+        "$psp"
     t1=$(bench_now)
     [[ "${DRY_RUN:-0}" == "1" ]] && return 0
     echo
-    echo "elapsed: $((t1 - t0)) s"
+    echo "stage 1 (pileup)      : $((t_mid - t0)) s"
+    echo "stage 2 (var-calling) : $((t1 - t_mid)) s"
+    echo "total   elapsed       : $((t1 - t0)) s"
     echo "records: $(bench_record_count "$out_vcf") (single sample)"
 }
 
