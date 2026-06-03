@@ -1895,6 +1895,16 @@ pub(crate) struct RecordScratch {
     /// Swap target for [`Self::log_p_ac_curr`] during the convolution.
     /// Same length.
     log_p_ac_next: Vec<f64>,
+    /// Left-padded (`ploidy` leading `0.0` slots) **linear-domain**
+    /// rolling AC buffer for the convolution ([`convolve_ac_linear`]).
+    /// The hot O(n_samples²·ploidy) fold runs here as a transcendental-
+    /// free multiply-add FIR (the log-domain fold spent ~88 % of the
+    /// consume path in scalar `exp`/`ln`); per-sample renormalisation
+    /// keeps the values in range and the running log-scale recovers the
+    /// log-domain result afterwards. Length `ploidy + ploidy*n_samples + 1`.
+    log_p_ac_curr_lin: Vec<f64>,
+    /// Swap target for [`Self::log_p_ac_curr_lin`]. Same length.
+    log_p_ac_next_lin: Vec<f64>,
 
     // ===== Mixture pre-pass buffers (only used when contam-on). =====
     /// Mixture-recomputed log-likelihoods. Length
@@ -1944,6 +1954,8 @@ impl RecordScratch {
             per_sample_alt_log_lik: Vec::new(),
             log_p_ac_curr: Vec::new(),
             log_p_ac_next: Vec::new(),
+            log_p_ac_curr_lin: Vec::new(),
+            log_p_ac_next_lin: Vec::new(),
             mixture_log_likelihoods: Vec::new(),
             mixture_n_obs: Vec::new(),
             mixture_mean_err: Vec::new(),
@@ -1999,6 +2011,12 @@ impl RecordScratch {
         let ac_len = n_samples * p + 1;
         self.log_p_ac_curr.resize(ac_len, f64::NEG_INFINITY);
         self.log_p_ac_next.resize(ac_len, f64::NEG_INFINITY);
+        // Linear-domain convolution buffers: `p` leading `0.0` pad slots
+        // (so the FIR's `curr[k-c]` read is branch-free at the left edge)
+        // + the AC range.
+        let lin_len = p + ac_len;
+        self.log_p_ac_curr_lin.resize(lin_len, 0.0);
+        self.log_p_ac_next_lin.resize(lin_len, 0.0);
 
         // Mixture buffers are only used when contam-on; resize
         // unconditionally so the buffer is the right shape if a
@@ -3021,45 +3039,22 @@ fn compute_qual_via_exact_af<M: MathBackend>(
         }
     }
 
-    // Step 2: convolution. Initialise with the empty-prefix
-    // distribution (mass 1 on `K = 0`, zero elsewhere).
-    for slot in scratch.log_p_ac_curr[..max_k_p1].iter_mut() {
-        *slot = f64::NEG_INFINITY;
-    }
-    scratch.log_p_ac_curr[0] = 0.0;
-
-    for s in 0..n_samples {
-        let l_s = &scratch.per_sample_alt_log_lik[s * (p + 1)..(s + 1) * (p + 1)];
-        let kmax_after = (s + 1) * p;
-        for slot in scratch.log_p_ac_next[..max_k_p1].iter_mut() {
-            *slot = f64::NEG_INFINITY;
-        }
-        for k in 0..=kmax_after {
-            let c_max = p.min(k);
-            // H1 (perf): gather the ≤ `ploidy + 1` finite convolution terms,
-            // then reduce them with a single `log_sum_exp_slice` instead of a
-            // pairwise `log_sum_exp_2` fold. The fold did one `ln` (and up to
-            // two `exp`) per term; the slice does one `ln` and one `exp` per
-            // term total — fewer transcendentals, and no per-term call
-            // overhead — on the dominant O(n_samples²·ploidy²) loop. The
-            // gather buffer is stack-allocated: `c_max + 1 ≤ ploidy + 1 ≤
-            // MAX_PLOIDY + 1`. NOTE: this re-associates the log-sum-exp, so
-            // the result can differ from the fold at the ULP level — verified
-            // byte-identical on the cohort fixture (QUAL survives the f64→f32
-            // cast unchanged); re-check that contract if this changes.
-            let mut terms = [0.0f64; MAX_PLOIDY as usize + 1];
-            let mut n_terms = 0usize;
-            for (c, &ll) in l_s.iter().enumerate().take(c_max + 1) {
-                let prev = scratch.log_p_ac_curr[k - c];
-                if prev > f64::NEG_INFINITY && ll > f64::NEG_INFINITY {
-                    terms[n_terms] = prev + ll;
-                    n_terms += 1;
-                }
-            }
-            scratch.log_p_ac_next[k] = log_sum_exp_slice(math, &terms[..n_terms]);
-        }
-        std::mem::swap(&mut scratch.log_p_ac_curr, &mut scratch.log_p_ac_next);
-    }
+    // Step 2: convolution. The log-domain fold spent ~88 % of the
+    // consume path's self-time in scalar `exp`/`ln` and is
+    // O(n_samples²·ploidy), so it runs in the linear domain as a
+    // transcendental-free multiply-add FIR with per-sample
+    // renormalisation. The result is written back into
+    // `log_p_ac_curr[..max_k_p1]` in the log domain, so Steps 3–4 are
+    // unchanged.
+    convolve_ac_linear(
+        n_samples,
+        p,
+        max_k_p1,
+        &scratch.per_sample_alt_log_lik,
+        &mut scratch.log_p_ac_curr_lin,
+        &mut scratch.log_p_ac_next_lin,
+        &mut scratch.log_p_ac_curr,
+    );
 
     // Step 3: apply the Beta-Binomial log-prior on `K`.
     //
@@ -3097,6 +3092,118 @@ fn compute_qual_via_exact_af<M: MathBackend>(
     }
     // QUAL = −10 · log10(P(K = 0 | data)).
     PHRED_SCALE * (log_p_k0_post / std::f64::consts::LN_10)
+}
+
+/// Step 2 of [`compute_qual_via_exact_af`] — fold each sample's
+/// `(ploidy + 1)`-tap collapsed-likelihood kernel into the rolling
+/// allele-count distribution — run in the **linear domain**.
+///
+/// The mathematically-equivalent log-domain fold
+/// (`next[k] = log Σ_c exp(curr[k-c] + l_s[c])`) spends its whole
+/// O(n_samples²·ploidy) inner loop in `exp`/`ln` (~88 % of the consume
+/// path's self-time at N=200). Here the inner loop is instead the plain
+/// linear convolution `next[k] = Σ_c curr[k-c] · Lₛ[c]` — a fixed-tap
+/// multiply-add FIR with **no transcendentals**, which autovectorises
+/// to FMA. The only transcendentals left are O(n_samples): one `exp`
+/// per kernel tap and one `ln` per sample for the renormalisation.
+///
+/// **Numerical scheme.** A scaled forward algorithm. After folding `s`
+/// samples the invariant is `P(AC = k) = cur[p + k] · exp(log_scale)`:
+/// each sample's kernel is divided by its max (folded into `log_scale`)
+/// and the post-fold distribution is renormalised by its max (also
+/// folded in), keeping the live values in `(0, 1]`. The absolute
+/// log-probabilities `ln(cur[p+k]) + log_scale` are recovered at the
+/// end. Tail entries that underflow to `0.0` map to `-∞`; they are
+/// negligible in the partition `Z` and are never read individually.
+///
+/// **K = 0 is tracked exactly** in the log domain (`log P(AC = 0) =
+/// Σ_s l_s[0]`, a trivial recurrence). It is the QUAL numerator and can
+/// decay far below the linear range for a confident large cohort, so
+/// reading it back from the renormalised linear buffer would lose it to
+/// underflow (and report QUAL = +∞). The exact value overrides
+/// `out_log[0]` and stays consistent with the bulk because `log_scale`
+/// is the shared true scale.
+///
+/// `cur`/`nxt` are the left-padded (`ploidy` leading `0.0` slots) linear
+/// buffers; `out_log` receives the log-domain result in `[..max_k_p1]`.
+/// Transcendentals use the exact `std` `exp`/`ln` (not the approximate
+/// math backend) — they are off the hot path now, so exact costs
+/// nothing and keeps QUAL backend-independent.
+fn convolve_ac_linear<'a>(
+    n_samples: usize,
+    p: usize,
+    max_k_p1: usize,
+    per_sample_alt_log_lik: &[f64],
+    mut cur: &'a mut [f64],
+    mut nxt: &'a mut [f64],
+    out_log: &mut [f64],
+) {
+    // Empty-prefix distribution: mass 1 on `K = 0` (logical index 0 ->
+    // padded index `p`).
+    cur.fill(0.0);
+    cur[p] = 1.0;
+    let mut log_scale = 0.0f64;
+    let mut log_pk0 = 0.0f64; // exact log P(AC = 0)
+
+    for s in 0..n_samples {
+        let l_s = &per_sample_alt_log_lik[s * (p + 1)..(s + 1) * (p + 1)];
+        let kmax_after = (s + 1) * p;
+
+        // Exact K=0 recurrence — independent of the linear bulk.
+        log_pk0 += l_s[0];
+
+        // Linear kernel, normalised by its max so the taps land in
+        // `(0, 1]`; the max folds back into the running log-scale.
+        let kmax_s = l_s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut lker = [0.0f64; MAX_PLOIDY as usize + 1];
+        for (c, &ll) in l_s.iter().enumerate().take(p + 1) {
+            lker[c] = if ll > f64::NEG_INFINITY {
+                (ll - kmax_s).exp()
+            } else {
+                0.0
+            };
+        }
+
+        // FIR: next[k] = Σ_c cur[k-c] · lker[c], tap-major so each pass
+        // is a contiguous `dst[k] += src[k] · lc` axpy that vectorises.
+        let live = kmax_after + 1;
+        nxt[..p + live].fill(0.0);
+        for (c, &lc) in lker.iter().enumerate().take(p + 1) {
+            if lc == 0.0 {
+                continue;
+            }
+            let src = &cur[(p - c)..(p - c) + live];
+            let dst = &mut nxt[p..p + live];
+            for (d, &sv) in dst.iter_mut().zip(src.iter()) {
+                *d += sv * lc;
+            }
+        }
+
+        // Renormalise the live region by its max; fold both the kernel
+        // max and the renorm factor into the running log-scale.
+        log_scale += kmax_s;
+        let m = nxt[p..p + live].iter().copied().fold(0.0f64, f64::max);
+        if m > 0.0 {
+            let inv = 1.0 / m;
+            for v in nxt[p..p + live].iter_mut() {
+                *v *= inv;
+            }
+            log_scale += m.ln();
+        }
+
+        std::mem::swap(&mut cur, &mut nxt);
+    }
+
+    // Recover absolute log P(AC = k); override K=0 with the exact value.
+    for (k, slot) in out_log[..max_k_p1].iter_mut().enumerate() {
+        let v = cur[p + k];
+        *slot = if v > 0.0 {
+            v.ln() + log_scale
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+    out_log[0] = log_pk0;
 }
 
 /// EM-output fields for the trivial path — `n_alleles < 2`. Reads
