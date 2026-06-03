@@ -159,6 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Legacy single-pull / single-window behaviour so the
         // profile reflects the pre-rewrite per-chunk shape.
         target_variants_per_chunk: 0,
+        low_memory: false,
         psp_files,
         cohort: CohortPipelineArgs {
             ploidy: DEFAULT_PLOIDY,

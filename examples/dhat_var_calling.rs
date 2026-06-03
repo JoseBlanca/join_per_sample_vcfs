@@ -98,6 +98,10 @@ struct Cli {
     /// *current* memory-bounded path.
     #[arg(long, default_value_t = 0)]
     target_variants_per_chunk: u32,
+
+    /// Profile the low-memory two-pass producer.
+    #[arg(long, default_value_t = false)]
+    low_memory: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -137,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         contamination_estimates: None,
         no_complexity_filter: args.no_complexity_filter,
         target_variants_per_chunk: args.target_variants_per_chunk,
+        low_memory: args.low_memory,
         psp_files: psps,
         cohort: CohortPipelineArgs {
             ploidy: DEFAULT_PLOIDY,

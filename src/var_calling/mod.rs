@@ -50,6 +50,7 @@ pub mod loader;
 pub mod partition;
 #[cfg(test)]
 pub(crate) mod test_helpers;
+pub mod two_pass;
 pub mod worker;
 
 pub use column_span_reader::ColumnSpanReader;
