@@ -607,6 +607,22 @@ impl SampleColumns {
             .any(|&n| n > 0)
     }
 
+    /// Sum of observed counts across the **non-reference** alleles at
+    /// `record_idx` (`alleles[0]` is REF by the walker invariant, so
+    /// alleles `>= 1` are summed). Used by the loader's variant-group
+    /// filter to push the downstream `min_alt_obs_per_sample` threshold
+    /// up to load time: a sample's non-REF obs summed across a group's
+    /// positions is an upper bound on any single unified allele's obs,
+    /// so a group whose every sample's group-sum stays below the
+    /// threshold can be dropped without ever reaching the worker.
+    pub fn non_ref_obs_sum_at(&self, record_idx: usize) -> u32 {
+        let allele_lo = self.allele_offsets[record_idx] as usize;
+        let allele_hi = self.allele_offsets[record_idx + 1] as usize;
+        self.per_allele_fixed.num_obs[(allele_lo + 1)..allele_hi]
+            .iter()
+            .fold(0u32, |acc, &n| acc.saturating_add(n))
+    }
+
     fn materialise_allele(&self, allele_idx: usize) -> AlleleObservation {
         let support = self.per_allele_fixed.support_at(allele_idx);
         AlleleObservation::new(

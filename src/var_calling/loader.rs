@@ -3,6 +3,8 @@
 //! and compact the survivors into a [`MaterialisedChunk`] for the
 //! pre-pass and worker.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -64,6 +66,16 @@ pub struct ChunkLoadScratch {
     has_variant_at: Vec<bool>,
     max_ref_span_at: Vec<u32>,
     is_kept: Vec<bool>,
+    /// Variant-group index spans over [`Self::position_union`] —
+    /// `(start_idx, end_idx)` half-open ranges built by the grouping
+    /// simulation. Reused so the ALT-count filter can score whole
+    /// groups without re-deriving boundaries.
+    group_ranges: Vec<(usize, usize)>,
+    /// Parallel to [`Self::position_union`]: the group index each
+    /// position belongs to. Only populated when the ALT-count
+    /// pushdown is active (`min_alt_obs > 1`); lets each sample's
+    /// per-record scan attribute its observations to a group.
+    group_of: Vec<u32>,
 }
 
 impl ChunkLoadScratch {
@@ -75,6 +87,8 @@ impl ChunkLoadScratch {
             has_variant_at: Vec::new(),
             max_ref_span_at: Vec::new(),
             is_kept: Vec::new(),
+            group_ranges: Vec::new(),
+            group_of: Vec::new(),
         }
     }
 
@@ -93,6 +107,8 @@ impl ChunkLoadScratch {
         self.has_variant_at.clear();
         self.max_ref_span_at.clear();
         self.is_kept.clear();
+        self.group_ranges.clear();
+        self.group_of.clear();
     }
 }
 
@@ -366,7 +382,12 @@ where
             })?;
         attempt_end = clamped_end;
 
-        rebuild_position_union_and_is_kept(scratch);
+        // Legacy batch loader keeps the historical "any observed
+        // non-REF" criterion (`min_alt_obs = 1`): it is the
+        // streaming-vs-batch equivalence oracle and feeds the
+        // contamination estimator, neither of which wants the ALT-count
+        // pushdown. Only the streaming var-calling path opts in.
+        rebuild_position_union_and_is_kept(scratch, 1);
         variant_count = scratch.is_kept.iter().filter(|kept| **kept).count() as u32;
 
         if variant_count >= target_variants {
@@ -424,7 +445,19 @@ where
 /// `scratch.max_ref_span_at`, and `scratch.is_kept` from the
 /// current `scratch.raw_per_sample` accumulator. Idempotent —
 /// called once per extension iteration inside the loader's loop.
-fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
+///
+/// `min_alt_obs` is the downstream `min_alt_obs_per_sample` threshold
+/// pushed up to load time. `<= 1` reproduces the historical criterion
+/// exactly (keep a group iff any position carries any observed non-REF
+/// allele — `1` is the `>= 1` special case). `> 1` activates the
+/// conservative ALT-count pushdown: a group survives only if some
+/// sample's non-REF observations, summed across the group's positions,
+/// reach the threshold. This is a safe over-approximation of the
+/// worker's per-(sample, unified-allele) filter (a unified allele's
+/// obs is a subset-sum of the sample's group non-REF obs), so it never
+/// drops a group the worker would have kept — the VCF is byte-identical
+/// while the doomed-singleton groups never get materialised.
+fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch, min_alt_obs: u32) {
     // Destructure for disjoint field borrows so the per-position scan
     // can write `has_variant_at` / `max_ref_span_at` in parallel while
     // reading `raw_per_sample` / `position_union`.
@@ -434,6 +467,8 @@ fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
         has_variant_at,
         max_ref_span_at,
         is_kept,
+        group_ranges,
+        group_of,
     } = scratch;
 
     // ── Position union ──
@@ -509,36 +544,94 @@ fn rebuild_position_union_and_is_kept(scratch: &mut ChunkLoadScratch) {
     // batch loader cleared the whole scratch per call and never hit this.
     is_kept.clear();
     is_kept.resize(n, false);
-    let mut group_open = false;
-    let mut group_start_idx: usize = 0;
-    let mut group_end_pos: u32 = 0;
-    let mut group_has_variant = false;
-    for i in 0..n {
-        let pos = position_union[i];
-        let reach = pos.saturating_add(max_ref_span_at[i].max(1)) - 1;
 
-        if group_open && pos <= group_end_pos {
-            if reach > group_end_pos {
+    // Build the group index spans (half-open `[start, end)` over
+    // `position_union`) under the overlapping-reach join rule. The
+    // group is the unit kept or dropped as a whole — splitting it would
+    // under-count REF evidence for homref samples inside a multi-position
+    // group (see above).
+    group_ranges.clear();
+    {
+        let mut group_open = false;
+        let mut group_start_idx: usize = 0;
+        let mut group_end_pos: u32 = 0;
+        for i in 0..n {
+            let pos = position_union[i];
+            let reach = pos.saturating_add(max_ref_span_at[i].max(1)) - 1;
+            if group_open && pos <= group_end_pos {
+                if reach > group_end_pos {
+                    group_end_pos = reach;
+                }
+            } else {
+                if group_open {
+                    group_ranges.push((group_start_idx, i));
+                }
+                group_open = true;
+                group_start_idx = i;
                 group_end_pos = reach;
             }
-            if has_variant_at[i] {
-                group_has_variant = true;
-            }
-        } else {
-            if group_open && group_has_variant {
-                for slot in is_kept[group_start_idx..i].iter_mut() {
-                    *slot = true;
-                }
-            }
-            group_open = true;
-            group_start_idx = i;
-            group_end_pos = reach;
-            group_has_variant = has_variant_at[i];
+        }
+        if group_open {
+            group_ranges.push((group_start_idx, n));
         }
     }
-    if group_open && group_has_variant {
-        for slot in is_kept[group_start_idx..].iter_mut() {
-            *slot = true;
+
+    let threshold = min_alt_obs.max(1);
+    if threshold <= 1 {
+        // Historical criterion: keep a group iff any position in it
+        // carries an observed non-REF allele. `threshold == 1` is the
+        // `group-sum >= 1` special case, so this is exact.
+        for &(start, end) in group_ranges.iter() {
+            if has_variant_at[start..end].iter().any(|&v| v) {
+                is_kept[start..end].iter_mut().for_each(|slot| *slot = true);
+            }
+        }
+    } else {
+        // ALT-count pushdown. Score whole groups by each sample's
+        // non-REF obs summed across the group; keep the group if any
+        // sample reaches the threshold. Parallel over samples (the
+        // architecture's existing axis); the per-group flag is an
+        // order-independent OR, so the result is deterministic.
+        group_of.clear();
+        group_of.resize(n, u32::MAX);
+        for (g, &(start, end)) in group_ranges.iter().enumerate() {
+            group_of[start..end]
+                .iter_mut()
+                .for_each(|slot| *slot = g as u32);
+        }
+        let qualifies: Vec<AtomicBool> = (0..group_ranges.len())
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        let group_of_ref: &[u32] = group_of;
+        let union_ref: &[u32] = position_union;
+        raw_per_sample.par_iter().for_each(|raw| {
+            let mut cur_group = u32::MAX;
+            let mut sum: u32 = 0;
+            for row_idx in 0..raw.n_records() {
+                let pos = raw.position_at(row_idx);
+                // Every record position contributed to the union, so the
+                // search always hits; skip defensively if it ever doesn't.
+                let Ok(uidx) = union_ref.binary_search(&pos) else {
+                    continue;
+                };
+                let g = group_of_ref[uidx];
+                if g != cur_group {
+                    cur_group = g;
+                    sum = 0;
+                }
+                if qualifies[g as usize].load(Ordering::Relaxed) {
+                    continue;
+                }
+                sum = sum.saturating_add(raw.non_ref_obs_sum_at(row_idx));
+                if sum >= threshold {
+                    qualifies[g as usize].store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        for (g, &(start, end)) in group_ranges.iter().enumerate() {
+            if qualifies[g].load(Ordering::Relaxed) {
+                is_kept[start..end].iter_mut().for_each(|slot| *slot = true);
+            }
         }
     }
 }
@@ -567,13 +660,18 @@ pub struct StreamingBlockLoader {
     /// (position `>= cut`) while the closed prefix is compacted out,
     /// then swapped back into `scratch.raw_per_sample`.
     next_pending: Vec<SampleColumns>,
+    /// Downstream `min_alt_obs_per_sample` threshold pushed up to the
+    /// load-time variant-group filter. See
+    /// [`rebuild_position_union_and_is_kept`].
+    min_alt_obs: u32,
 }
 
 impl StreamingBlockLoader {
-    pub fn with_n_samples(n_samples: usize) -> Self {
+    pub fn with_n_samples(n_samples: usize, min_alt_obs: u32) -> Self {
         Self {
             scratch: ChunkLoadScratch::with_n_samples(n_samples),
             next_pending: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
+            min_alt_obs,
         }
     }
 
@@ -624,7 +722,7 @@ impl StreamingBlockLoader {
                 // Interval exhausted: every remaining group is closed,
                 // so flush all pending (cut past the interval end). A
                 // zero return means nothing was left to emit.
-                rebuild_position_union_and_is_kept(&mut self.scratch);
+                rebuild_position_union_and_is_kept(&mut self.scratch, self.min_alt_obs);
                 let cut = interval_end.saturating_add(1);
                 kept_positions += self.compact_closed_prefix(out, cut);
                 out.range = range_start..cut;
@@ -641,7 +739,7 @@ impl StreamingBlockLoader {
                 .zip(sources.par_iter_mut())
                 .try_for_each(|(pending, source)| source.read_span(read_end, pending))?;
 
-            rebuild_position_union_and_is_kept(&mut self.scratch);
+            rebuild_position_union_and_is_kept(&mut self.scratch, self.min_alt_obs);
             let cut = find_block_cut(
                 &self.scratch.position_union,
                 &self.scratch.max_ref_span_at,
@@ -944,7 +1042,11 @@ mod tests {
             .zip(block_records_per_sample)
             .map(|(rs, &bs)| VecColumnSource::new(rs.clone(), start, end_inclusive, bs))
             .collect();
-        let mut loader = StreamingBlockLoader::with_n_samples(n);
+        // Threshold 1 = historical criterion, matching `batch_kept`'s
+        // oracle (which always passes 1). The ALT-count pushdown
+        // (threshold > 1) is validated end-to-end against `main`'s VCF,
+        // not by this streaming-vs-batch equivalence test.
+        let mut loader = StreamingBlockLoader::with_n_samples(n, 1);
         let mut out = MaterialisedChunk::with_n_samples(n);
         let mut combined: Vec<SampleColumns> = (0..n).map(|_| SampleColumns::empty()).collect();
         let mut range_start = start;
