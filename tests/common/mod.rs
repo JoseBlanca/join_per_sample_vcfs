@@ -360,10 +360,16 @@ pub fn build_cram_with_len(
 /// CIGAR, MAPQ 60, BQ 30. `qname` is the read name; `seq` is the
 /// read bases.
 pub fn read_record(qname: &str, pos: usize, seq: &[u8]) -> RecordBuf {
+    read_record_on(qname, 0, pos, seq)
+}
+
+/// Like [`read_record`] but on a chosen `reference_sequence_id` — used
+/// by the multi-contig fixtures below to place reads on chr2.
+pub fn read_record_on(qname: &str, ref_id: usize, pos: usize, seq: &[u8]) -> RecordBuf {
     let mut rb = RecordBuf::default();
     *rb.name_mut() = Some(BString::from(qname.as_bytes()));
     *rb.flags_mut() = Flags::from(0u16);
-    *rb.reference_sequence_id_mut() = Some(0);
+    *rb.reference_sequence_id_mut() = Some(ref_id);
     *rb.alignment_start_mut() = noodles_core::Position::new(pos);
     *rb.mapping_quality_mut() = MappingQuality::new(60);
     let cigar_ops = vec![Op::new(Kind::Match, seq.len())];
@@ -371,4 +377,98 @@ pub fn read_record(qname: &str, pos: usize, seq: &[u8]) -> RecordBuf {
     *rb.sequence_mut() = Sequence::from(seq.to_vec());
     *rb.quality_scores_mut() = QualityScores::from(vec![30u8; seq.len()]);
     rb
+}
+
+// ---------------------------------------------------------------------
+// Two-contig fixtures (chr1 + chr2, both CONTIG_LEN all-`A`)
+//
+// Used to exercise contig-boundary behaviour the single-contig fixtures
+// can't reach (multi-contig `--regions`, and the per-region pileup
+// emitting each contig's tail coverage).
+// ---------------------------------------------------------------------
+
+pub const SECOND_CONTIG_NAME: &str = "chr2";
+
+/// Write a two-contig FASTA + `.fai` (`chr1`, `chr2`, each `CONTIG_LEN`
+/// all-`A` bases — so both share [`fixture_md5`]).
+pub fn build_fasta_2contig(dir: &Path) -> PathBuf {
+    let fasta_path = dir.join("ref.fa");
+    let fai_path = dir.join("ref.fa.fai");
+    let mut fa = File::create(&fasta_path).expect("create fasta");
+    let mut fai = File::create(&fai_path).expect("create fai");
+    let line_width = (CONTIG_LEN + 1) as u64; // bases + newline
+    let mut offset = 0u64;
+    for name in [CONTIG_NAME, SECOND_CONTIG_NAME] {
+        writeln!(fa, ">{}", name).unwrap();
+        let header_len = (name.len() + 2) as u64; // '>' + name + '\n'
+        offset += header_len;
+        let seq = vec![b'A'; CONTIG_LEN];
+        fa.write_all(&seq).unwrap();
+        fa.write_all(b"\n").unwrap();
+        writeln!(
+            fai,
+            "{}\t{}\t{}\t{}\t{}",
+            name, CONTIG_LEN, offset, CONTIG_LEN, line_width
+        )
+        .unwrap();
+        offset += CONTIG_LEN as u64 + 1; // bases + newline
+    }
+    fasta_path
+}
+
+/// Two-contig SAM header (`chr1`, `chr2`), each `@SQ` tagged with `md5`
+/// when `Some`. Mirror of [`build_sam_header`].
+pub fn build_sam_header_2contig(sample: &str, md5: Option<&str>) -> sam::Header {
+    use sam::header::record::value::map::header::tag::SORT_ORDER;
+    use sam::header::record::value::map::read_group::tag::SAMPLE;
+    use sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
+
+    let mut hd = Map::<HeaderMap>::new(Version::new(1, 6));
+    hd.other_fields_mut()
+        .insert(SORT_ORDER, BString::from(b"coordinate".as_ref()));
+
+    let make_ref = || {
+        let mut ref_seq = Map::<ReferenceSequence>::new(NonZero::new(CONTIG_LEN).unwrap());
+        if let Some(md5_str) = md5 {
+            ref_seq
+                .other_fields_mut()
+                .insert(MD5_CHECKSUM, BString::from(md5_str.as_bytes()));
+        }
+        ref_seq
+    };
+
+    let mut rg = Map::<ReadGroup>::default();
+    rg.other_fields_mut()
+        .insert(SAMPLE, BString::from(sample.as_bytes()));
+
+    sam::Header::builder()
+        .set_header(hd)
+        .add_reference_sequence(CONTIG_NAME.as_bytes().to_vec(), make_ref())
+        .add_reference_sequence(SECOND_CONTIG_NAME.as_bytes().to_vec(), make_ref())
+        .add_read_group(b"rg0".as_ref(), rg)
+        .build()
+}
+
+/// Two-contig BAM for `sample`. Mirror of [`build_bam`] using the
+/// two-contig header. BAM stores sequences inline, so (unlike a
+/// multi-reference CRAM slice) records on more than one contig decode
+/// without fixture-sensitive reference plumbing.
+pub fn build_bam_2contig(
+    dir: &Path,
+    sample: &str,
+    md5: Option<&str>,
+    records: &[RecordBuf],
+) -> PathBuf {
+    let bam_path = dir.join(format!("{sample}.bam"));
+    let header = build_sam_header_2contig(sample, md5);
+
+    let file = File::create(&bam_path).expect("create bam");
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header).expect("write header");
+    for record in records {
+        sam::alignment::io::Write::write_alignment_record(&mut writer, &header, record)
+            .expect("write record");
+    }
+    writer.try_finish().expect("finish bam");
+    bam_path
 }

@@ -13,8 +13,9 @@ use std::io::BufReader;
 use std::path::PathBuf;
 
 use common::{
-    CONTIG_NAME, build_cram, build_cram_with_len, build_fasta, build_fasta_with_len, fixture_md5,
-    read_record,
+    CONTIG_NAME, SECOND_CONTIG_NAME, build_bam_2contig, build_cram, build_cram_with_len,
+    build_fasta, build_fasta_2contig, build_fasta_with_len, fixture_md5, read_record,
+    read_record_on,
 };
 use pop_var_caller::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
@@ -177,6 +178,108 @@ fn psp_positions(path: &std::path::Path) -> Vec<u32> {
         .records()
         .map(|r| r.expect("decode record").pos)
         .collect()
+}
+
+/// Read every record's `(chrom_id, pos)` out of a `.psp`.
+fn psp_records(path: &std::path::Path) -> Vec<(u32, u32)> {
+    let mut reader = PspReader::new(BufReader::new(File::open(path).unwrap())).unwrap();
+    reader
+        .records()
+        .map(|r| {
+            let r = r.expect("decode record");
+            (r.chrom_id, r.pos)
+        })
+        .collect()
+}
+
+/// Positions emitted on `chrom_id`, in order.
+fn positions_on(records: &[(u32, u32)], chrom_id: u32) -> Vec<u32> {
+    records
+        .iter()
+        .filter(|(c, _)| *c == chrom_id)
+        .map(|(_, p)| *p)
+        .collect()
+}
+
+/// **Regression guard for the contig-boundary behaviour the
+/// investigation surfaced.** A two-contig CRAM (chr1, chr2): chr1's only
+/// read at 100 (`AAAAA`) covers chr1:[100,104], chr2's read at 50 covers
+/// chr2:[50,54]. The per-region pileup processes each contig to
+/// end-of-input, so chr1's full 5-base footprint — *including the tail
+/// 101..104* — is emitted, even though chr2 follows. (A continuous
+/// multi-contig walker drops that tail at the chr1→chr2 transition;
+/// pinning the full footprint here keeps that regression out.)
+#[test]
+fn multi_contig_pileup_emits_each_contig_full_tail() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta_2contig(dir.path());
+    let records = vec![
+        read_record_on("r1", 0, 100, b"AAAAA"), // chr1:[100,104]
+        read_record_on("r2", 1, 50, b"AAAAA"),  // chr2:[50,54]
+    ];
+    let cram = build_bam_2contig(dir.path(), "NA12878", Some(fixture_md5()), &records);
+    let out = dir.path().join("multi.psp");
+    run_pileup(&default_args(fasta, out.clone(), vec![cram])).expect("run_pileup OK");
+
+    let recs = psp_records(&out);
+    // Both contigs present (multi-contig handling)...
+    assert_eq!(
+        positions_on(&recs, 0),
+        vec![100, 101, 102, 103, 104],
+        "chr1 full footprint incl. tail"
+    );
+    assert_eq!(
+        positions_on(&recs, 1),
+        vec![50, 51, 52, 53, 54],
+        "chr2 full footprint"
+    );
+    // ...and a header that declares both contigs.
+    let reader = PspReader::new(BufReader::new(File::open(&out).unwrap())).unwrap();
+    let names: Vec<&str> = reader
+        .header()
+        .chromosomes
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, vec![CONTIG_NAME, SECOND_CONTIG_NAME]);
+}
+
+/// A BED spanning two contigs restricts each independently: chr1:[101,103]
+/// (0-based [100,103)) and chr2:[51,52] (0-based [50,52)) yield exactly
+/// those positions — each contig's reads are clamped to its own span.
+#[test]
+fn regions_bed_spanning_two_contigs_restricts_each() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta_2contig(dir.path());
+    let records = vec![
+        read_record_on("r1", 0, 100, b"AAAAA"),
+        read_record_on("r2", 1, 50, b"AAAAA"),
+    ];
+    let cram = build_bam_2contig(dir.path(), "NA12878", Some(fixture_md5()), &records);
+
+    let bed = dir.path().join("two.bed");
+    std::fs::write(
+        &bed,
+        format!("{CONTIG_NAME}\t100\t103\n{SECOND_CONTIG_NAME}\t50\t52\n"),
+    )
+    .expect("write bed");
+
+    let out = dir.path().join("two_region.psp");
+    let mut args = default_args(fasta, out.clone(), vec![cram]);
+    args.regions = Some(bed);
+    run_pileup(&args).expect("run_pileup OK");
+
+    let recs = psp_records(&out);
+    assert_eq!(
+        positions_on(&recs, 0),
+        vec![101, 102, 103],
+        "chr1 clamped to [101,103]"
+    );
+    assert_eq!(
+        positions_on(&recs, 1),
+        vec![51, 52],
+        "chr2 clamped to [51,52]"
+    );
 }
 
 /// `--regions` restricts the emitted `.psp` to the BED's positions.
