@@ -40,6 +40,7 @@ fn writer_header_for(chrom_names: &[&str]) -> WriterHeader {
             subcommand: "pileup".to_string(),
             input_crams: vec!["sample.cram".to_string()],
             input_fasta: "ref.fa".to_string(),
+            command_line: String::new(),
             parameters: BTreeMap::new(),
         },
     }

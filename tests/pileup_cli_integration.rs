@@ -148,6 +148,11 @@ fn happy_path_default_config() {
         params["block_target_bytes"],
         ParameterValue::Integer(TARGET_BLOCK_BYTES as i64)
     );
+    // The command line is always recorded; a whole-genome run carries
+    // no regions provenance.
+    assert!(!header.writer.command_line.is_empty());
+    assert!(!params.contains_key("regions_bed"));
+    assert!(!params.contains_key("regions_count"));
 
     // Count records emitted — the three reads at 1, 5, 10 over a 5bp
     // each produce records at every position they cover. Reads
@@ -221,6 +226,23 @@ fn regions_bed_restricts_pileup_to_listed_positions() {
         .filter(|p| (5..=9).contains(p))
         .collect();
     assert_eq!(region_positions, expected);
+
+    // Provenance: the .psp header records the invoking command line
+    // (always) and the analysis-regions BED basename + span count.
+    let reader = PspReader::new(BufReader::new(File::open(&out_region).unwrap())).unwrap();
+    let writer = &reader.header().writer;
+    assert!(
+        !writer.command_line.is_empty(),
+        "command line must be recorded in the .psp header"
+    );
+    assert_eq!(
+        writer.parameters.get("regions_bed"),
+        Some(&ParameterValue::String("regions.bed".to_string()))
+    );
+    assert_eq!(
+        writer.parameters.get("regions_count"),
+        Some(&ParameterValue::Integer(1))
+    );
 }
 
 /// `--no-baq` path: the pipeline runs with BAQ bypassed. We verify

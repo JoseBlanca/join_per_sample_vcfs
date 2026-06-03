@@ -231,6 +231,7 @@ fn read_psp(
             subcommand: parsed.writer.subcommand.clone(),
             input_crams: parsed.writer.input_crams.clone(),
             input_fasta: parsed.writer.input_fasta.clone(),
+            command_line: parsed.writer.command_line.clone(),
             parameters: parameters_clone(&parsed.writer.parameters),
         },
     };

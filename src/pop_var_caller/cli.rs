@@ -25,7 +25,8 @@ use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
 use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_region_into_writer};
 use crate::pileup::walker::{RunSummary, WalkerConfig};
 use crate::pop_var_caller::common::{
-    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, format_md5_hex, rfc3339_now,
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, current_command_line,
+    format_md5_hex, rfc3339_now,
 };
 use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
 use crate::psp::writer::{DEFAULT_BLOCK_WINDOW_BP, MAX_BLOCK_TARGET_BYTES, PspWriter};
@@ -251,7 +252,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     // 4. Writer header (validates per-contig u32 lengths + @SQ M5). Built
     //    before the region set so the latter can borrow the header's
     //    already-u32-validated contig bounds.
-    let header = build_writer_header(
+    let mut header = build_writer_header(
         &inputs.sample_name,
         &args.reference,
         &inputs.contigs,
@@ -259,6 +260,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         stage1,
         args.block_target_bytes,
         args.block_window_bp,
+        args.regions.as_deref(),
     )?;
 
     // 5. Region set: the BED, or one full-length span per contig. The
@@ -280,6 +282,14 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         // `contig_bounds` borrows `header`; drop it here so `header` can
         // move into the writer below.
     };
+    // Record how many analysis spans the BED resolved to (provenance);
+    // omitted for the whole-genome default.
+    if args.regions.is_some() {
+        header.writer.parameters.insert(
+            "regions_count".to_string(),
+            ParameterValue::Integer(region_set.len() as i64),
+        );
+    }
 
     // 6. Open the shared writer on the .tmp path.
     let tmp_path = tmp_path_for(&args.output);
@@ -445,6 +455,7 @@ fn finalise_output(
 
 /// Build a [`WriterHeader`] from the merged reader's metadata + CLI
 /// inputs. Hard-errors when a contig has no `@SQ M5`.
+#[allow(clippy::too_many_arguments)]
 fn build_writer_header(
     sample: &str,
     fasta_path: &Path,
@@ -453,6 +464,7 @@ fn build_writer_header(
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
     block_window_bp: u32,
+    regions_bed: Option<&Path>,
 ) -> Result<WriterHeader, PileupCliError> {
     let mut chromosomes = Vec::with_capacity(contigs.entries.len());
     for entry in &contigs.entries {
@@ -480,7 +492,17 @@ fn build_writer_header(
 
     let input_crams: Vec<String> = cram_paths.iter().map(|p| basename(p)).collect();
     let input_fasta = basename(fasta_path);
-    let parameters = effective_parameters(args, block_target_bytes, block_window_bp);
+    let mut parameters = effective_parameters(args, block_target_bytes, block_window_bp);
+    // Record the analysis-regions BED basename when one was supplied, so
+    // the `.psp` self-describes that it covers only those regions (the
+    // full path is also in `command_line`). `regions_count` is added by
+    // the caller once the BED has been resolved to a region set.
+    if let Some(bed) = regions_bed {
+        parameters.insert(
+            "regions_bed".to_string(),
+            ParameterValue::String(basename(bed)),
+        );
+    }
 
     Ok(WriterHeader {
         format_version: (1, 0),
@@ -494,6 +516,7 @@ fn build_writer_header(
             subcommand: "pileup".to_string(),
             input_crams,
             input_fasta,
+            command_line: current_command_line(),
             parameters,
         },
     })
@@ -770,6 +793,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            None,
         )
         .expect_err("must error");
         assert!(matches!(err, PileupCliError::MissingMd5 { ref contig } if contig == "chr1"));
@@ -803,6 +827,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            None,
         )
         .expect("build_writer_header");
         assert_eq!(header.writer.input_fasta, "grch38.fa");

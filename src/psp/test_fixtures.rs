@@ -38,6 +38,7 @@ pub(crate) fn writer_header(n_chroms: usize) -> WriterHeader {
             subcommand: "per-sample".to_string(),
             input_crams: vec!["a.cram".to_string()],
             input_fasta: "ref.fa".to_string(),
+            command_line: String::new(),
             parameters: params,
         },
     }
@@ -65,6 +66,7 @@ pub(crate) fn realistic_writer_header() -> WriterHeader {
             subcommand: "per-sample".to_string(),
             input_crams: vec!["sample.cram".to_string()],
             input_fasta: "GRCh38.fa".to_string(),
+            command_line: String::new(),
             parameters: params,
         },
     }

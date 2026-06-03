@@ -80,6 +80,7 @@ fn writer_header(n_records: usize, sample: &str) -> WriterHeader {
             subcommand: "psp-reader-perf".to_string(),
             input_crams: vec!["a.cram".to_string()],
             input_fasta: "ref.fa".to_string(),
+            command_line: String::new(),
             parameters: params,
         },
     }

@@ -125,6 +125,7 @@ fn read_psp(path: &Path) -> Result<(Vec<PileupRecord>, WriterHeader), Box<dyn st
             subcommand: parsed.writer.subcommand.clone(),
             input_crams: parsed.writer.input_crams.clone(),
             input_fasta: parsed.writer.input_fasta.clone(),
+            command_line: parsed.writer.command_line.clone(),
             parameters: clone_params(&parsed.writer.parameters),
         },
     };

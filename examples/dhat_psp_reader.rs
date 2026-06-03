@@ -77,6 +77,7 @@ fn writer_header() -> WriterHeader {
             subcommand: "psp-reader-dhat".to_string(),
             input_crams: vec!["a.cram".to_string()],
             input_fasta: "ref.fa".to_string(),
+            command_line: String::new(),
             parameters: params,
         },
     }
