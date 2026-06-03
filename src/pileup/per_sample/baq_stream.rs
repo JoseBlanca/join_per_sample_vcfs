@@ -66,6 +66,22 @@ impl BaqSkipCounts {
             BaqSkipReason::ChromIdOutOfRange => self.chrom_id_out_of_range += 1,
         }
     }
+
+    /// Add `other`'s tallies into `self`, field by field. Totals the
+    /// per-region BAQ skip counts when the pileup runs region by region.
+    pub fn merge(&mut self, other: &BaqSkipCounts) {
+        self.total += other.total;
+        self.unmapped += other.unmapped;
+        self.empty_query += other.empty_query;
+        self.qual_absent += other.qual_absent;
+        self.no_match_in_cigar += other.no_match_in_cigar;
+        self.contains_ref_skip += other.contains_ref_skip;
+        self.hmm_overflow += other.hmm_overflow;
+        self.ref_window_past_chrom_end += other.ref_window_past_chrom_end;
+        self.pos_out_of_range += other.pos_out_of_range;
+        self.read_too_long += other.read_too_long;
+        self.chrom_id_out_of_range += other.chrom_id_out_of_range;
+    }
 }
 
 /// Iterator adapter: `Iterator<Item = Result<MappedRead, AlignmentInputError>>`

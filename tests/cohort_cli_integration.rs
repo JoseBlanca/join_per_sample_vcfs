@@ -62,6 +62,10 @@ fn pileup_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBuf
     PileupArgs {
         reference,
         output,
+        regions: None,
+        // The indexed pileup path needs an alignment index next to each
+        // input; the fixtures don't ship one, so build it in place.
+        build_map_file_index: true,
         threads: None,
         alignment_files,
         block_target_bytes: pop_var_caller::psp::writer::TARGET_BLOCK_BYTES,

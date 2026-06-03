@@ -141,6 +141,24 @@ pub struct FilterCounts {
     pub baq_rejected: u64,
 }
 
+impl FilterCounts {
+    /// Add `other`'s tallies into `self`, field by field. Used to total
+    /// the per-region readers' filter counts into one run summary when
+    /// the pileup is driven region by region.
+    pub fn merge(&mut self, other: &FilterCounts) {
+        self.unmapped += other.unmapped;
+        self.secondary += other.secondary;
+        self.supplementary += other.supplementary;
+        self.qc_fail += other.qc_fail;
+        self.duplicate += other.duplicate;
+        self.low_mapq += other.low_mapq;
+        self.too_short += other.too_short;
+        self.high_mismatch_fraction += other.high_mismatch_fraction;
+        self.bad_cigar += other.bad_cigar;
+        self.baq_rejected += other.baq_rejected;
+    }
+}
+
 // ---------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------

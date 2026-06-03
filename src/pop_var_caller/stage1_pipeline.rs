@@ -15,11 +15,9 @@
 //! project's "no silent intermediates" principle — if a subcommand
 //! exists to skip an artefact, don't fall back to a hidden one.)
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::bam::alignment_input::{
-    AlignmentMergedReader, AlignmentMergedReaderConfig, FilterCounts,
-};
+use crate::bam::alignment_input::{AlignmentMergedReader, FilterCounts};
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
@@ -76,22 +74,23 @@ pub struct Stage1Outputs<R> {
     pub stashed_upstream_error: Option<AlignmentInputError>,
 }
 
-/// Build the Stage 1 pipeline on this function's stack and hand the
-/// walker to `f`. After `f` returns, snapshots `FilterCounts`,
-/// `BaqSkipCounts`, sample name and contigs, plus any stashed
-/// upstream error, and returns them bundled with `f`'s result.
+/// Build the Stage 1 BAQ → walker chain over an already-opened
+/// `reader` on this function's stack and hand the walker to `f`. After
+/// `f` returns, snapshots `FilterCounts`, `BaqSkipCounts`, sample name
+/// and contigs, plus any stashed upstream error, and returns them
+/// bundled with `f`'s result.
 ///
-/// `E: From<PileupCliError>` lets internal setup errors (reader open,
-/// fetcher init) lift into the closure's error type without changing
-/// the caller's surface. For `run_pileup` the closure picks
-/// `E = PileupCliError` (identity); for `run_var_calling_from_bam`,
-/// a manual `From<PileupCliError>` on the from-bam error provides
-/// the bridge.
+/// The caller owns reader construction: `run_pileup` opens one
+/// `query()` reader per analysis region and calls this once per region,
+/// reusing the shared PSP writer inside `f`.
+///
+/// `E: From<PileupCliError>` lets internal setup errors (fetcher init)
+/// lift into the closure's error type without changing the caller's
+/// surface; `run_pileup`'s closure picks `E = PileupCliError`.
 #[allow(clippy::too_many_arguments)]
-pub fn with_stage1_pipeline<R, E, F>(
-    alignment_files: &[PathBuf],
+pub fn with_stage1_chain<R, E, F>(
+    mut reader: AlignmentMergedReader,
     reference: &Path,
-    alignment_cfg: AlignmentMergedReaderConfig,
     baq_cfg: BaqConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
@@ -102,10 +101,9 @@ where
     F: FnOnce(Stage1PipelineContext<'_>) -> Result<R, E>,
     E: From<PileupCliError>,
 {
-    // 1. Open the merged reader and capture identification metadata.
-    let mut reader: AlignmentMergedReader =
-        AlignmentMergedReader::new(alignment_files, reference, alignment_cfg)
-            .map_err(PileupCliError::AlignmentInput)?;
+    // The reader is already opened and validated (via `new()` for a
+    // whole-file stream, or `query()` for one region). Capture the
+    // identification metadata it carries.
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 

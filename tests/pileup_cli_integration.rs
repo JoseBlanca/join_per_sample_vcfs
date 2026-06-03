@@ -46,6 +46,10 @@ fn default_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBu
     PileupArgs {
         reference,
         output,
+        regions: None,
+        // The indexed pileup path needs an alignment index next to each
+        // input; the fixtures don't ship one, so build it in place.
+        build_map_file_index: true,
         threads: None,
         alignment_files,
         block_target_bytes: TARGET_BLOCK_BYTES,
@@ -161,6 +165,64 @@ fn happy_path_default_config() {
     );
 }
 
+/// Read every record position out of a `.psp` at `path`.
+fn psp_positions(path: &std::path::Path) -> Vec<u32> {
+    let mut reader = PspReader::new(BufReader::new(File::open(path).unwrap())).unwrap();
+    reader
+        .records()
+        .map(|r| r.expect("decode record").pos)
+        .collect()
+}
+
+/// `--regions` restricts the emitted `.psp` to the BED's positions.
+/// The fixture's whole-genome run covers 1..=14; a BED selecting the
+/// 1-based span [5, 9] (0-based half-open `[4, 9)`) yields exactly
+/// those positions — reads entirely outside are seeked past, and the
+/// read straddling the lower edge still contributes its in-region
+/// columns. The region output equals the whole-genome output clamped
+/// to the region.
+#[test]
+fn regions_bed_restricts_pileup_to_listed_positions() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let records = vec![
+        read_record("r1", 1, b"AAAAA"),
+        read_record("r2", 5, b"AAAAA"),
+        read_record("r3", 10, b"AAAAA"),
+    ];
+    let cram = build_cram(dir.path(), &fasta, "NA12878", Some(fixture_md5()), &records);
+
+    // Whole-genome baseline.
+    let out_all = dir.path().join("all.psp");
+    run_pileup(&default_args(
+        fasta.clone(),
+        out_all.clone(),
+        vec![cram.clone()],
+    ))
+    .expect("whole-genome run");
+    let all_positions = psp_positions(&out_all);
+    assert_eq!(all_positions, (1u32..=14).collect::<Vec<_>>());
+
+    // BED selecting 1-based [5, 9].
+    let bed = dir.path().join("regions.bed");
+    std::fs::write(&bed, format!("{CONTIG_NAME}\t4\t9\n")).expect("write bed");
+
+    let out_region = dir.path().join("region.psp");
+    let mut args = default_args(fasta, out_region.clone(), vec![cram]);
+    args.regions = Some(bed);
+    run_pileup(&args).expect("region run");
+
+    let region_positions = psp_positions(&out_region);
+    assert_eq!(region_positions, vec![5, 6, 7, 8, 9]);
+
+    // Equivalence: the region output is the whole-genome output clamped.
+    let expected: Vec<u32> = all_positions
+        .into_iter()
+        .filter(|p| (5..=9).contains(p))
+        .collect();
+    assert_eq!(region_positions, expected);
+}
+
 /// `--no-baq` path: the pipeline runs with BAQ bypassed. We verify
 /// `WriterProvenance.parameters["baq_enabled"] == Boolean(false)`
 /// and that the .psp still round-trips.
@@ -260,7 +322,7 @@ fn happy_path_default_config_bam() {
 #[test]
 fn pileup_rejects_mixed_cram_and_bam() {
     use common::build_bam;
-    use pop_var_caller::bam::errors::AlignmentInputError;
+    use pop_var_caller::bam::errors::{AlignmentIndexError, AlignmentInputError};
     use pop_var_caller::pop_var_caller::cli::PileupCliError;
 
     let dir = TempDir::new().expect("tempdir");
@@ -273,13 +335,17 @@ fn pileup_rejects_mixed_cram_and_bam() {
     let args = default_args(fasta, output, vec![cram.clone(), bam.clone()]);
     let err = run_pileup(&args).expect_err("mixed cram + bam must error");
 
+    // The indexed pileup path runs through index pre-flight, whose
+    // classify pass rejects mixed CRAM + BAM before any header parse.
     match err {
-        PileupCliError::AlignmentInput(AlignmentInputError::MixedAlignmentFileFormats {
-            first_path,
-            first_format,
-            other_path,
-            other_format,
-        }) => {
+        PileupCliError::AlignmentInput(AlignmentInputError::AlignmentIndex(
+            AlignmentIndexError::MixedAlignmentFileFormats {
+                first_path,
+                first_format,
+                other_path,
+                other_format,
+            },
+        )) => {
             assert_eq!(first_path, cram);
             assert_eq!(first_format, "CRAM");
             assert_eq!(other_path, bam);
@@ -289,15 +355,13 @@ fn pileup_rejects_mixed_cram_and_bam() {
     }
 }
 
-/// M10 regression: `pileup` does not run through preflight, so the
-/// `AlignmentMergedReader::new`-side `UnsupportedExtension` arm is
-/// the only gate against an input whose extension is neither
-/// `.cram` nor `.bam`. A future refactor that dropped the
-/// classify pre-pass would let the open-pass's `.unwrap()` panic
-/// instead of surfacing the typed error.
+/// An input whose extension is neither `.cram` nor `.bam` is rejected
+/// by the index pre-flight's classify pass (the indexed pileup path
+/// runs through pre-flight), surfacing the typed `UnsupportedExtension`
+/// rather than panicking.
 #[test]
 fn pileup_rejects_input_with_unknown_extension() {
-    use pop_var_caller::bam::errors::AlignmentInputError;
+    use pop_var_caller::bam::errors::{AlignmentIndexError, AlignmentInputError};
     use pop_var_caller::pop_var_caller::cli::PileupCliError;
 
     let dir = TempDir::new().expect("tempdir");
@@ -309,7 +373,9 @@ fn pileup_rejects_input_with_unknown_extension() {
 
     let err = run_pileup(&args).expect_err("must reject .sam");
     match err {
-        PileupCliError::AlignmentInput(AlignmentInputError::UnsupportedExtension { path }) => {
+        PileupCliError::AlignmentInput(AlignmentInputError::AlignmentIndex(
+            AlignmentIndexError::UnsupportedExtension { path },
+        )) => {
             assert_eq!(path, unknown);
         }
         other => panic!("unexpected error variant: {other:?}"),
