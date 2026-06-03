@@ -1565,7 +1565,10 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             params,
             sources,
             n_samples,
-            streaming: StreamingBlockLoader::with_n_samples(n_samples),
+            streaming: StreamingBlockLoader::with_n_samples(
+                n_samples,
+                params.downstream.min_alt_obs_per_sample,
+            ),
             partition_scratch: PartitionScratch::with_n_samples(n_samples),
             mask: Vec::new(),
             chrom_plans,

@@ -87,6 +87,17 @@ struct Cli {
     /// Bypass the DUST (low-complexity) filter.
     #[arg(long, default_value_t = false)]
     no_complexity_filter: bool,
+
+    /// Restrict to a BED of regions (keeps the profile run small).
+    #[arg(long)]
+    regions: Option<PathBuf>,
+
+    /// `0` = legacy single-pull batch loader (pre-rewrite shape);
+    /// `>0` = streaming `StreamingBlockLoader` with this variant target
+    /// per block (production default is 1024). Set this to profile the
+    /// *current* memory-bounded path.
+    #[arg(long, default_value_t = 0)]
+    target_variants_per_chunk: u32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -121,13 +132,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let var_calling_args = VarCallingArgs {
         reference: args.reference,
         output: args.output.clone(),
-        regions: None,
+        regions: args.regions.clone(),
         threads: args.threads,
         contamination_estimates: None,
         no_complexity_filter: args.no_complexity_filter,
-        // Legacy single-pull / single-window behaviour so the dhat
-        // heap profile reflects the pre-rewrite per-chunk shape.
-        target_variants_per_chunk: 0,
+        target_variants_per_chunk: args.target_variants_per_chunk,
         psp_files: psps,
         cohort: CohortPipelineArgs {
             ploidy: DEFAULT_PLOIDY,
