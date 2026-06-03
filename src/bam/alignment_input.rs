@@ -508,6 +508,39 @@ struct ReadFingerprintWithSourceFile {
 type AlignmentPeekable =
     BufferedPeekable<AlignmentRecordsIter, sam::alignment::RecordBuf, io::Error>;
 
+/// A 1-based inclusive position range within a single contig, used to
+/// narrow [`AlignmentMergedReader::query`] to a sub-contig region.
+/// `start <= end`, both `>= 1`.
+///
+/// The query yields every read whose reference footprint *overlaps*
+/// the range — including reads that start before `start` and extend
+/// into it — so a downstream pileup that clamps emitted columns to the
+/// range still has the flanking reads it needs for BAQ. Passing `None`
+/// to `query` (or a range that already spans the whole contig) reads
+/// the entire contig with no per-record overlap check.
+#[derive(Debug, Clone, Copy)]
+pub struct ContigInterval {
+    /// 1-based inclusive lower bound.
+    pub start: u32,
+    /// 1-based inclusive upper bound.
+    pub end: u32,
+}
+
+impl ContigInterval {
+    /// Whether `record`'s reference footprint `[alignment_start,
+    /// alignment_end]` overlaps this interval. A record with no mapped
+    /// position never overlaps.
+    pub(crate) fn overlaps_record(&self, record: &sam::alignment::RecordBuf) -> bool {
+        match (record.alignment_start(), record.alignment_end()) {
+            (Some(first), Some(last)) => {
+                usize::from(first) as u64 <= self.end as u64
+                    && usize::from(last) as u64 >= self.start as u64
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct AlignmentMergedReader {
     record_streams: Vec<AlignmentPeekable>,
     paths: Vec<PathBuf>,
@@ -797,6 +830,7 @@ impl AlignmentMergedReader {
         headers: &[Arc<sam::Header>],
         indexes: &[AlignmentIndex],
         contig_name: &str,
+        region: Option<ContigInterval>,
         config: AlignmentMergedReaderConfig,
     ) -> Result<Self, AlignmentInputError> {
         if alignment_files.is_empty() {
@@ -818,6 +852,13 @@ impl AlignmentMergedReader {
                 contig: contig_name.to_string(),
                 known_contigs: contigs.entries.len(),
             })?;
+
+        // A range that already covers the whole contig is equivalent to
+        // no range at all — drop it so the indexed openers take the
+        // unbounded, no-per-record-filter fast path (preserving the
+        // whole-contig read's cost and output exactly).
+        let contig_length = contigs.entries[target_reference_sequence_id].length;
+        let region = region.filter(|iv| !(iv.start <= 1 && u64::from(iv.end) >= contig_length));
 
         // FASTA repository — needed by the slice decoder for the
         // mismatch-fraction filter. Built per-worker because
@@ -871,6 +912,7 @@ impl AlignmentMergedReader {
                         Arc::clone(idx),
                         repository.clone(),
                         target_reference_sequence_id,
+                        region,
                     )?
                 }
                 (AlignmentFileKind::Bam, AlignmentIndex::BamCsi(idx)) => {
@@ -879,6 +921,7 @@ impl AlignmentMergedReader {
                         Arc::clone(header),
                         BamIndex::Csi(Arc::clone(idx)),
                         target_reference_sequence_id,
+                        region,
                     )?
                 }
                 (AlignmentFileKind::Bam, AlignmentIndex::BamBai(idx)) => {
@@ -887,6 +930,7 @@ impl AlignmentMergedReader {
                         Arc::clone(header),
                         BamIndex::Bai(Arc::clone(idx)),
                         target_reference_sequence_id,
+                        region,
                     )?
                 }
                 // Genuine driver-bug mismatches — enumerate each
@@ -3668,6 +3712,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1");
@@ -3704,6 +3749,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1");
@@ -3756,6 +3802,7 @@ mod tests {
             &headers,
             &indexes,
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1")
@@ -3798,6 +3845,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr2",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr2");
@@ -3824,6 +3872,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chrUnknown",
+            None,
             AlignmentMergedReaderConfig::default(),
         );
         let err = err_or_panic(err, "query should reject unknown contig");
@@ -3853,6 +3902,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         );
         let err = err_or_panic(err, "query should reject mismatched handle counts");
@@ -3864,6 +3914,136 @@ mod tests {
                 indexes: 1,
             }
         ));
+    }
+
+    // --- Group C2: sub-contig region narrowing ------------------------
+    //
+    // chr1 (length 1000) with four 50 bp reads at 100/300/500/700 —
+    // footprints [100,149], [300,349], [500,549], [700,749]. The
+    // `region` argument to `query` restricts the stream to reads whose
+    // footprint overlaps a 1-based inclusive sub-contig range.
+
+    /// Build the four-read chr1 fixture; returns the two `TempDir`
+    /// guards (kept alive by the caller), the FASTA + CRAM paths, and
+    /// the pre-loaded header + index.
+    fn chr1_four_reads_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Arc<sam::Header>,
+        AlignmentIndex,
+    ) {
+        let contigs = one_contig_chr1();
+        let (fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let records = vec![
+            pass_record_for_b("R1", 0, 100),
+            pass_record_for_b("R2", 0, 300),
+            pass_record_for_b("R3", 0, 500),
+            pass_record_for_b("R4", 0, 700),
+        ];
+        let (cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+        let (header, index) = load_header_and_index(&input_path);
+        (fasta_dir, cram_dir, fasta_path, input_path, header, index)
+    }
+
+    /// Query chr1 of the four-read fixture, optionally narrowed to
+    /// `region`, and collect the 1-based start positions yielded.
+    fn query_chr1_positions(
+        input_path: &Path,
+        fasta_path: &Path,
+        header: &Arc<sam::Header>,
+        index: &AlignmentIndex,
+        region: Option<ContigInterval>,
+    ) -> Vec<u64> {
+        let inputs = [input_path.to_path_buf()];
+        AlignmentMergedReader::query(
+            &inputs,
+            fasta_path,
+            contigs_for(&one_contig_chr1()),
+            "s1".to_string(),
+            std::slice::from_ref(header),
+            std::slice::from_ref(index),
+            "chr1",
+            region,
+            AlignmentMergedReaderConfig::default(),
+        )
+        .expect("query chr1")
+        .map(|r| r.expect("ok record").pos)
+        .collect()
+    }
+
+    #[test]
+    fn c7_query_sub_region_yields_only_overlapping_reads() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 280,
+                end: 520,
+            }),
+        );
+        // R2 [300,349] and R3 [500,549] overlap [280,520]; R1 and R4 do not.
+        assert_eq!(positions, vec![300, 500]);
+    }
+
+    #[test]
+    fn c8_query_sub_region_includes_read_spanning_the_start_edge() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        // The region starts at 330, inside R2's footprint [300,349]:
+        // R2 begins *before* the region but extends into it, so it must
+        // be fetched (a clamped pileup still needs it for BAQ context).
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 330,
+                end: 520,
+            }),
+        );
+        assert_eq!(positions, vec![300, 500]);
+    }
+
+    #[test]
+    fn c9_query_whole_contig_range_matches_unbounded() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        // A range covering the whole contig is normalized to "no range"
+        // and yields every read, exactly as `None` would.
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 1,
+                end: 1000,
+            }),
+        );
+        assert_eq!(positions, vec![100, 300, 500, 700]);
+    }
+
+    #[test]
+    fn c10_query_sub_region_with_no_overlap_is_empty() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        // [200,250] falls in the gap between R1 [100,149] and R2 [300,349].
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 200,
+                end: 250,
+            }),
+        );
+        assert!(positions.is_empty());
     }
 
     // --- Group D: 2-CRAM-with-records diagnostics ---------------------
@@ -4188,6 +4368,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&bad_index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         );
         let err = match result {

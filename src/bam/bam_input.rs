@@ -28,12 +28,13 @@ use std::vec;
 
 use noodles_bam as bam;
 use noodles_bgzf as bgzf;
+use noodles_core::Position;
 use noodles_core::region::Interval;
 use noodles_csi::binning_index::BinningIndex;
 use noodles_csi::binning_index::index::reference_sequence::bin::Chunk;
 use noodles_sam as sam;
 
-use super::alignment_input::AlignmentRecordsIter;
+use super::alignment_input::{AlignmentRecordsIter, ContigInterval};
 use super::errors::AlignmentInputError;
 
 // ---------------------------------------------------------------------
@@ -116,6 +117,12 @@ struct OwnedIndexedBamRecords {
     /// because we hit EOF mid-chunk on the last chunk).
     current_chunk_end: Option<bgzf::VirtualPosition>,
     target_reference_sequence_id: usize,
+    /// Optional 1-based inclusive sub-contig range. The index query is
+    /// narrowed to it; this field additionally drops records the
+    /// (bin-granular) chunk set over-returns at the range edges, so the
+    /// stream yields exactly the records overlapping the range. `None`
+    /// reads the whole target contig.
+    region: Option<ContigInterval>,
 }
 
 impl Iterator for OwnedIndexedBamRecords {
@@ -159,13 +166,15 @@ impl Iterator for OwnedIndexedBamRecords {
                 }
                 Ok(_) => {
                     if record_buf.reference_sequence_id() == Some(self.target_reference_sequence_id)
+                        && self.region.is_none_or(|iv| iv.overlaps_record(&record_buf))
                     {
                         return Some(Ok(record_buf));
                     }
-                    // Record on a different contig — happens at
-                    // chunk boundaries when a chunk straddles
-                    // contigs. Skip; the loop re-checks the
-                    // virtual position and reads on.
+                    // Record on a different contig (a chunk straddling
+                    // contigs) or outside the requested range (the
+                    // chunk set is bin-granular and over-returns at the
+                    // edges). Skip; the loop re-checks the virtual
+                    // position and reads on.
                 }
                 Err(e) => return Some(Err(e)),
             }
@@ -216,17 +225,19 @@ fn open_bam_reader_with_header(
 
 /// Open `path` as a BAM, advance past its header (the caller
 /// already holds the validated header via `header`), ask the index
-/// for the chunks covering the entire target contig, and return an
-/// owned per-contig indexed record-stream iterator.
+/// for the chunks covering the target contig (or a sub-contig
+/// `region`), and return an owned indexed record-stream iterator.
 ///
 /// `target_reference_sequence_id` must be valid against the
 /// canonical contig list the caller resolved against (the driver
-/// does this once at startup).
+/// does this once at startup). `region` optionally narrows the query
+/// to a 1-based inclusive sub-contig range.
 pub(super) fn open_indexed_bam_record_stream(
     path: &Path,
     header: Arc<sam::Header>,
     index: BamIndex,
     target_reference_sequence_id: usize,
+    region: Option<ContigInterval>,
 ) -> Result<AlignmentRecordsIter, AlignmentInputError> {
     let mut reader = bam::io::reader::Builder
         .build_from_path(path)
@@ -244,12 +255,14 @@ pub(super) fn open_indexed_bam_record_stream(
             source,
         })?;
 
-    // Ask the index for the chunks covering the whole target contig
-    // (interval = unbounded). `BinningIndex::query` is the polymorphic
-    // entry point both `.bai` and `.csi` implement.
+    // Ask the index for the chunks covering the requested span — the
+    // whole contig (unbounded) or a sub-contig range.
+    // `BinningIndex::query` is the polymorphic entry point both `.bai`
+    // and `.csi` implement.
+    let interval = query_interval(region);
     let chunks = match &index {
-        BamIndex::Bai(idx) => idx.query(target_reference_sequence_id, Interval::from(..)),
-        BamIndex::Csi(idx) => idx.query(target_reference_sequence_id, Interval::from(..)),
+        BamIndex::Bai(idx) => idx.query(target_reference_sequence_id, interval),
+        BamIndex::Csi(idx) => idx.query(target_reference_sequence_id, interval),
     }
     .map_err(|source| AlignmentInputError::Io {
         path: path.to_path_buf(),
@@ -262,8 +275,24 @@ pub(super) fn open_indexed_bam_record_stream(
         chunks: chunks.into_iter(),
         current_chunk_end: None,
         target_reference_sequence_id,
+        region,
     });
     Ok(records)
+}
+
+/// The `noodles` query interval for a `region`: the 1-based inclusive
+/// range when `Some`, or the whole contig (unbounded) when `None`.
+fn query_interval(region: Option<ContigInterval>) -> Interval {
+    match region {
+        Some(iv) => {
+            // `iv.start`/`iv.end` are >= 1 by construction, so the
+            // `Position::new` calls cannot fail.
+            let start = Position::new(iv.start as usize).expect("region start >= 1");
+            let end = Position::new(iv.end as usize).expect("region end >= 1");
+            Interval::from(start..=end)
+        }
+        None => Interval::from(..),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -407,6 +436,7 @@ mod tests {
             Arc::clone(&header_arc),
             BamIndex::Bai(Arc::new(bai_index)),
             /* target_reference_sequence_id = */ 1,
+            /* region = */ None,
         )
         .expect("open indexed bam stream");
 
@@ -435,6 +465,7 @@ mod tests {
             Arc::clone(&header_arc),
             BamIndex::Bai(Arc::new(bai_index)),
             /* target_reference_sequence_id = */ 1,
+            /* region = */ None,
         )
         .expect("open indexed bam stream");
 
@@ -475,6 +506,7 @@ mod tests {
             Arc::clone(&header_arc),
             BamIndex::Bai(Arc::new(bai_index)),
             /* target_reference_sequence_id = */ 0,
+            /* region = */ None,
         )
         .expect("open indexed bam stream");
 
@@ -601,6 +633,7 @@ mod tests {
             Arc::clone(&header_arc),
             BamIndex::Csi(Arc::new(csi_index)),
             /* target_reference_sequence_id = */ 1,
+            /* region = */ None,
         )
         .expect("open csi-backed indexed bam stream");
 
@@ -612,5 +645,72 @@ mod tests {
             actual.iter().all(|r| r.reference_sequence_id() == Some(1)),
             "every yielded record must be on the queried contig"
         );
+    }
+
+    /// A sub-contig `region` restricts the indexed BAM stream to reads
+    /// whose 4 bp footprint overlaps the 1-based inclusive range —
+    /// including a read that starts *before* the range but extends into
+    /// it (the BAQ-context contract).
+    #[test]
+    fn open_indexed_bam_record_stream_narrows_to_region() {
+        use noodles_csi::binning_index::index::reference_sequence::index::BinnedIndex;
+
+        let header = header_two_contigs();
+        // All on contig 1; footprints (Match(4)) are [start, start+3]:
+        // [1,4] [6,9] [8,11] [20,23] [40,43].
+        let records = [
+            record_on(1, 1),
+            record_on(1, 6),
+            record_on(1, 8),
+            record_on(1, 20),
+            record_on(1, 40),
+        ];
+        let (_dir, bam_path) = write_bam(&records, &header);
+
+        let mut reader = bam::io::reader::Builder
+            .build_from_path(&bam_path)
+            .expect("open bam");
+        let parsed_header = reader.read_header().expect("read header");
+        let mut indexer: Indexer<BinnedIndex> = Indexer::default();
+        let mut chunk_start = reader.get_ref().virtual_position();
+        let mut record = bam::Record::default();
+        while reader.read_record(&mut record).expect("read") != 0 {
+            let chunk_end = reader.get_ref().virtual_position();
+            let alignment_context = match (
+                record.reference_sequence_id().transpose().expect("ref"),
+                record.alignment_start().transpose().expect("start"),
+                record.alignment_end().transpose().expect("end"),
+            ) {
+                (Some(id), Some(start), Some(end)) => {
+                    Some((id, start, end, !record.flags().is_unmapped()))
+                }
+                _ => None,
+            };
+            indexer
+                .add_record(alignment_context, Chunk::new(chunk_start, chunk_end))
+                .expect("add");
+            chunk_start = chunk_end;
+        }
+        let csi_index = indexer.build(parsed_header.reference_sequences().len());
+
+        let header_arc = Arc::new(header.clone());
+        let mut stream = open_indexed_bam_record_stream(
+            &bam_path,
+            Arc::clone(&header_arc),
+            BamIndex::Csi(Arc::new(csi_index)),
+            /* target_reference_sequence_id = */ 1,
+            Some(ContigInterval { start: 8, end: 25 }),
+        )
+        .expect("open csi-backed indexed bam stream");
+
+        let starts: Vec<usize> = std::iter::from_fn(|| stream.next())
+            .map(|r| {
+                let r = r.expect("decode record");
+                usize::from(r.alignment_start().expect("mapped"))
+            })
+            .collect();
+        // [6,9] spans the start edge (in), [8,11] and [20,23] are inside;
+        // [1,4] and [40,43] are outside.
+        assert_eq!(starts, vec![6, 8, 20]);
     }
 }
