@@ -120,6 +120,15 @@ pub struct VarCallingArgs {
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
 
+    /// Low-memory mode: summarise each covered interval and re-read it to
+    /// materialise only the kept positions, instead of folding every
+    /// sample's window records into memory at once. Holds ≤ pool-width
+    /// decoded blocks plus a compact per-position summary, trading a
+    /// second pass over the `.psp` files for a much smaller peak RSS.
+    /// Output is byte-identical to the default path.
+    #[arg(long, default_value_t = false)]
+    pub low_memory: bool,
+
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
     pub psp_files: Vec<PathBuf>,
@@ -421,6 +430,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
             no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
             min_mapq_diff_t: args.cohort.min_mapq_diff_t,
         },
+        low_memory: args.low_memory,
     };
     // Region set: the --regions BED resolved against the cohort
     // chromosomes, or None (whole genome — the driver runs the

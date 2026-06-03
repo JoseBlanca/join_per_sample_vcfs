@@ -26,6 +26,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
+
+use rayon::prelude::*;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -39,7 +41,7 @@ use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
 use crate::regions::{Region, RegionSet};
 use crate::var_calling::column_span_reader::ColumnSpanReader;
-use crate::var_calling::columns::MaterialisedChunk;
+use crate::var_calling::columns::{MaterialisedChunk, SampleColumns};
 use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::loader::{ChunkLoadError, StreamingBlockLoader};
 use crate::var_calling::partition::{
@@ -49,6 +51,7 @@ use crate::var_calling::per_group_merger::PerGroupMergerConfig;
 use crate::var_calling::posterior_engine::{
     PosteriorEngineConfig, PosteriorEngineError, PosteriorRecord,
 };
+use crate::var_calling::two_pass::WindowSummary;
 use crate::var_calling::variant_grouping::GrouperConfig;
 use crate::var_calling::worker::{
     WindowRunStats, WorkerScratch, prefetch_window_ref_bytes, run_window,
@@ -136,6 +139,14 @@ pub struct ChunkDriverParams {
     pub sizing: ChunkSizingParams,
     /// Post-EM downstream filters — see [`DownstreamFilterParams`].
     pub downstream: DownstreamFilterParams,
+    /// Low-memory mode: when `true`, the producer summarises each
+    /// covered interval into a compact per-position structure (pass 1,
+    /// ≤ pool-width decoded blocks resident) and re-reads it to
+    /// materialise only the kept positions (pass 2), instead of folding
+    /// every sample's window records into memory at once. Trades a second
+    /// read of the `.psp` files for a much smaller peak working set;
+    /// output is byte-identical.
+    pub low_memory: bool,
 }
 
 /// Per-driver counters consumed by the CLI run-summary code.
@@ -1521,6 +1532,22 @@ struct BlockIterator<'a, W: Read + Seek + Send> {
     cur: Option<ChromCursor>,
     chunks_loaded: u64,
     chunk_variants_total: u64,
+
+    // ── Low-memory two-pass state (only used when `params.low_memory`). ──
+    /// Pass-1 per-position summary of the *current covered interval*
+    /// (N-independent). Rebuilt on every `enter_current_interval`.
+    summary: WindowSummary,
+    /// Parallel to `summary.positions()`: the kept (variable) decision.
+    is_kept: Vec<bool>,
+    /// Cut positions partitioning the interval into worker-chunks at
+    /// clean group boundaries — chunk `i` spans `[cuts[i], cuts[i+1])`.
+    chunk_cuts: Vec<u32>,
+    /// Index of the next chunk to materialise from `chunk_cuts`.
+    next_chunk_idx: usize,
+    /// Per-sample scratch holding one chunk's re-read records during the
+    /// pass-2 materialise (filtered down to kept positions into the
+    /// output chunk).
+    materialize_temps: Vec<SampleColumns>,
 }
 
 impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
@@ -1581,6 +1608,11 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             cur: None,
             chunks_loaded: 0,
             chunk_variants_total: 0,
+            summary: WindowSummary::new(),
+            is_kept: Vec::new(),
+            chunk_cuts: Vec::new(),
+            next_chunk_idx: 0,
+            materialize_temps: (0..n_samples).map(|_| SampleColumns::empty()).collect(),
         }
     }
 
@@ -1661,9 +1693,39 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             }
         }
 
-        let cur = self.cur.as_mut().expect("cur set before enter");
-        cur.chunk_range_start = start;
-        cur.interval_one_past_end = interval_one_past_end;
+        {
+            let cur = self.cur.as_mut().expect("cur set before enter");
+            cur.chunk_range_start = start;
+            cur.interval_one_past_end = interval_one_past_end;
+        }
+
+        // Low-memory mode: pass 1 — summarise the whole interval into the
+        // compact per-position structure and pre-compute the kept set +
+        // chunk partition. `produce_block` then materialises one chunk per
+        // call (pass 2). Resets the readers back to the interval start for
+        // that second read.
+        if self.params.low_memory {
+            let min_alt_obs = self.params.downstream.min_alt_obs_per_sample;
+            let target = self
+                .params
+                .sizing
+                .target_variants_per_chunk
+                .map_or(0, NonZeroU32::get)
+                .max(1);
+            summarize_interval(
+                &mut self.sources,
+                &mut self.summary,
+                &mut self.is_kept,
+                &mut self.chunk_cuts,
+                chrom_id,
+                start,
+                end_inclusive,
+                min_alt_obs,
+                target,
+            )
+            .map_err(|source| ChunkDriverError::StreamRead { chrom_id, source })?;
+            self.next_chunk_idx = 0;
+        }
         Ok(())
     }
 
@@ -1754,6 +1816,11 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             cur,
             cur_interval_mask,
             mask_sweep,
+            summary,
+            is_kept,
+            chunk_cuts,
+            next_chunk_idx,
+            materialize_temps,
             ..
         } = self;
         let cur = cur
@@ -1772,20 +1839,37 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         let range_start = cur.chunk_range_start;
         let interval_end_inclusive = cur.interval_one_past_end.saturating_sub(1);
 
-        // Stream one block of ≥ `target_variants` variable variants (or
-        // the interval's tail), cutting at the open group's clean
-        // boundary; the open group carries forward as `streaming`'s
-        // pending. `0` means the interval is exhausted.
-        let variant_count = streaming
-            .fill_block(
+        // Low-memory mode: materialise the next pre-partitioned chunk
+        // (pass 2 — re-read + keep). The interval was already summarised
+        // in `enter_current_interval`; `0` means its chunks are exhausted.
+        let variant_count = if params.low_memory {
+            materialize_next_chunk(
                 sources,
+                materialize_temps,
+                summary,
+                is_kept,
+                chunk_cuts,
+                next_chunk_idx,
                 chunk,
                 chrom_id,
-                range_start,
-                interval_end_inclusive,
-                target_variants,
             )
-            .map_err(|source| ChunkDriverError::StreamRead { chrom_id, source })?;
+            .map_err(|source| ChunkDriverError::StreamRead { chrom_id, source })?
+        } else {
+            // Stream one block of ≥ `target_variants` variable variants (or
+            // the interval's tail), cutting at the open group's clean
+            // boundary; the open group carries forward as `streaming`'s
+            // pending. `0` means the interval is exhausted.
+            streaming
+                .fill_block(
+                    sources,
+                    chunk,
+                    chrom_id,
+                    range_start,
+                    interval_end_inclusive,
+                    target_variants,
+                )
+                .map_err(|source| ChunkDriverError::StreamRead { chrom_id, source })?
+        };
         if variant_count == 0 {
             return Ok(0);
         }
@@ -1823,6 +1907,124 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
             .map_err(|source| ChunkDriverError::PrefetchRefBytes { chrom_id, source })?;
         Ok(variant_count)
     }
+}
+
+/// Pass 1 of the low-memory two-pass producer. Summarises an entire
+/// covered interval into `summary` via a parallel map/reduce over the
+/// per-sample readers: each task reads its sample's blocks **one at a
+/// time** (dropped after folding into a per-thread partial), so at most
+/// pool-width decoded blocks are resident — never one per sample. Then
+/// derives `is_kept` and the chunk partition `chunk_cuts`, and resets the
+/// readers to the interval start for the pass-2 re-read.
+#[allow(clippy::too_many_arguments)]
+fn summarize_interval<W: Read + Seek + Send>(
+    sources: &mut [ColumnSpanReader<W>],
+    summary: &mut WindowSummary,
+    is_kept: &mut Vec<bool>,
+    chunk_cuts: &mut Vec<u32>,
+    chrom_id: u32,
+    interval_start: u32,
+    interval_end_inclusive: u32,
+    min_alt_obs: u32,
+    target_variants: u32,
+) -> Result<(), PspReadError> {
+    let folded = sources
+        .par_iter_mut()
+        .map(|reader| -> Result<WindowSummary, PspReadError> {
+            let mut partial = WindowSummary::new();
+            let mut temp = SampleColumns::empty();
+            // Serve the reader's whole interval block-by-block; each
+            // `read_span` consumes one block's span, folded then dropped.
+            while let Some(watermark) = reader.peek_next_span() {
+                temp.clear();
+                reader.read_span(watermark.saturating_add(1), &mut temp)?;
+                partial.fold_sample(&temp);
+            }
+            Ok(partial)
+        })
+        .reduce(
+            || Ok(WindowSummary::new()),
+            |a, b| {
+                let mut a = a?;
+                a.merge(&b?);
+                Ok(a)
+            },
+        )?;
+    *summary = folded;
+    summary.derive_is_kept(min_alt_obs, is_kept);
+    *chunk_cuts = summary.chunk_cuts(
+        min_alt_obs,
+        target_variants,
+        interval_start,
+        interval_end_inclusive.saturating_add(1),
+    );
+
+    // Reset every reader to the interval start for the pass-2 re-read.
+    for reader in sources.iter_mut() {
+        reader.reset(chrom_id, interval_start, interval_end_inclusive);
+    }
+    Ok(())
+}
+
+/// Pass 2 of the low-memory two-pass producer. Materialises the next
+/// pre-partitioned chunk (`chunk_cuts[next..next+1]`) by re-reading each
+/// sample's records in the chunk span and appending only the kept
+/// positions into `chunk`. Returns the chunk's distinct kept-position
+/// count, or `0` when the interval's chunks are exhausted.
+#[allow(clippy::too_many_arguments)]
+fn materialize_next_chunk<W: Read + Seek + Send>(
+    sources: &mut [ColumnSpanReader<W>],
+    temps: &mut [SampleColumns],
+    summary: &WindowSummary,
+    is_kept: &[bool],
+    chunk_cuts: &[u32],
+    next_chunk_idx: &mut usize,
+    chunk: &mut MaterialisedChunk,
+    chrom_id: u32,
+) -> Result<u32, PspReadError> {
+    // `chunk_cuts` has one more boundary than chunks; past the last one
+    // the interval is exhausted.
+    if *next_chunk_idx + 1 >= chunk_cuts.len() {
+        return Ok(0);
+    }
+    let chunk_start = chunk_cuts[*next_chunk_idx];
+    let chunk_end = chunk_cuts[*next_chunk_idx + 1]; // exclusive
+    *next_chunk_idx += 1;
+
+    chunk.clear();
+    chunk.chrom_id = chrom_id;
+    let n_samples = sources.len();
+    if chunk.per_sample.len() != n_samples {
+        chunk
+            .per_sample
+            .resize_with(n_samples, SampleColumns::empty);
+    }
+
+    let positions = summary.positions();
+    sources
+        .par_iter_mut()
+        .zip(temps.par_iter_mut())
+        .zip(chunk.per_sample.par_iter_mut())
+        .try_for_each(|((reader, temp), out_s)| -> Result<(), PspReadError> {
+            temp.clear();
+            reader.read_span(chunk_end, temp)?;
+            for row in 0..temp.n_records() {
+                let pos = temp.position_at(row);
+                if positions.binary_search(&pos).is_ok_and(|idx| is_kept[idx]) {
+                    out_s.push_row_from(temp, row);
+                }
+            }
+            Ok(())
+        })?;
+
+    chunk.range = chunk_start..chunk_end;
+    chunk.safe_end = chunk_end;
+
+    // Distinct kept (variable) positions in [chunk_start, chunk_end).
+    let lo = positions.partition_point(|&p| p < chunk_start);
+    let hi = positions.partition_point(|&p| p < chunk_end);
+    let variant_count = is_kept[lo..hi].iter().filter(|&&kept| kept).count() as u32;
+    Ok(variant_count)
 }
 
 /// Coalescing distance (bases) for block-index-driven covered
@@ -2515,6 +2717,7 @@ mod tests {
                 no_mapq_diff_filter,
                 min_mapq_diff_t,
             },
+            low_memory: false,
         }
     }
 

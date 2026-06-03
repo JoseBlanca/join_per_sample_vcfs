@@ -105,6 +105,7 @@ fn var_calling_args(
         contamination_estimates,
         no_complexity_filter: true, // tiny ref; sdust would mask everything
         target_variants_per_chunk: 0,
+        low_memory: false,
         psp_files,
         cohort: CohortPipelineArgs {
             ploidy: DEFAULT_PLOIDY,
