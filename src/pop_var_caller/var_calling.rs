@@ -88,6 +88,14 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub output: PathBuf,
 
+    /// BED file restricting variant calling to the listed regions; the
+    /// rest of the genome is ignored. Coordinates are 0-based half-open
+    /// (standard BED). Without this flag every position in the `.psp`
+    /// files is called. The `.psp` block index is used to seek to the
+    /// regions, so a sparse BED is cheap.
+    #[arg(long)]
+    pub regions: Option<PathBuf>,
+
     /// Worker threads for the rayon pool. If omitted, rayon picks
     /// the default (all logical cores).
     #[arg(long)]
@@ -163,6 +171,9 @@ pub enum VarCallingCliError {
 
     #[error("contamination artefact: {0}")]
     ContamArtefact(#[from] ContaminationArtefactError),
+
+    #[error("regions BED: {0}")]
+    Bed(#[from] crate::regions::BedError),
 
     #[error("grouper config: {0}")]
     GrouperConfig(#[from] GrouperConfigError),
@@ -411,6 +422,26 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
             min_mapq_diff_t: args.cohort.min_mapq_diff_t,
         },
     };
+    // Region set: the --regions BED resolved against the cohort
+    // chromosomes, or None (whole genome — the driver runs the
+    // identical, byte-for-byte path when this is None).
+    let region_set = match &args.regions {
+        Some(bed_path) => {
+            let contig_bounds: Vec<crate::regions::ContigBounds> = chromosomes
+                .iter()
+                .map(|c| crate::regions::ContigBounds {
+                    name: &c.name,
+                    length: c.length,
+                })
+                .collect();
+            Some(crate::regions::RegionSet::from_bed_path(
+                bed_path,
+                &contig_bounds,
+            )?)
+        }
+        None => None,
+    };
+
     let chunk_stats = drive_cohort_chunked(
         &args.psp_files,
         sample_names.clone(),
@@ -420,6 +451,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         metadata,
         writer_cfg_template,
         driver_params,
+        region_set.as_ref(),
     )?;
 
     // 11. Stderr summary.

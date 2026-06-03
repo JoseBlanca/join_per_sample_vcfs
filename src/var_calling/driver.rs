@@ -37,6 +37,7 @@ use crate::fasta::fetcher::ChromRefFetchError;
 use crate::fasta::{ManualEvictChromRefFetcher, StreamingChromRefFetcher};
 use crate::psp::header::ParsedChromosome;
 use crate::psp::{PspReadError, PspReader};
+use crate::regions::{Region, RegionSet};
 use crate::var_calling::column_span_reader::ColumnSpanReader;
 use crate::var_calling::columns::MaterialisedChunk;
 use crate::var_calling::dust_filter::{DustFilterConfig, MIN_DUST_HALO, sdust_mask_for_span};
@@ -314,6 +315,7 @@ pub fn drive_cohort_chunked(
     metadata: CohortMetadata,
     writer_cfg: WriterConfig,
     params: ChunkDriverParams,
+    region_set: Option<&RegionSet>,
 ) -> Result<ChunkDriverStats, ChunkDriverError> {
     let n_samples = sample_names.len();
     debug_assert_eq!(psp_paths.len(), n_samples);
@@ -384,7 +386,7 @@ pub fn drive_cohort_chunked(
     // how the block was produced (data-shaping vs math decoupled).
     let per_group_cfg = params.per_group_cfg;
     let posterior_cfg = &params.posterior_cfg;
-    let producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params);
+    let producer = BlockIterator::new(psp_readers, &chromosomes, fasta_path, &params, region_set);
 
     // Consume the blocks: per-group EM/posterior math + downstream
     // filtering + emit. The math is the dominant cost at realistic N
@@ -954,6 +956,7 @@ fn build_dust_plans<W>(
     sources: &[ColumnSpanReader<W>],
     chromosomes: &[ParsedChromosome],
     max_group_span: u32,
+    region_set: Option<&RegionSet>,
 ) -> Vec<DustChromPlan>
 where
     W: Read + Seek + Send,
@@ -967,6 +970,14 @@ where
         let chrom_id = u32::try_from(chrom_idx).expect("chrom_id fits in u32");
         let covered =
             covered_intervals_for_chrom(sources, chrom_id, max_group_span.max(MIN_CHUNK_SPAN));
+        // `--regions`: keep only the parts of the covered intervals that
+        // fall in an analysis region. With no region set this is a no-op
+        // — the whole-genome path runs the identical code below — so the
+        // output stays byte-identical when `--regions` is absent.
+        let covered = match region_set {
+            Some(regions) => restrict_intervals_to_regions(&covered, regions.regions_for(chrom_id)),
+            None => covered,
+        };
         if covered.is_empty() {
             continue;
         }
@@ -978,6 +989,42 @@ where
         });
     }
     plans
+}
+
+/// Intersect a sorted, non-overlapping list of `covered` intervals
+/// (1-based half-open `[first_pos, last_pos+1)`) with a sorted,
+/// non-overlapping list of analysis `regions` (1-based **inclusive**
+/// `[start, end]`). Returns the overlap spans, sorted and
+/// non-overlapping, in the covered intervals' half-open convention.
+///
+/// Both inputs are sorted, so a two-pointer sweep yields the result in
+/// one pass; whichever interval ends first is advanced.
+fn restrict_intervals_to_regions(
+    covered: &[std::ops::Range<u32>],
+    regions: &[Region],
+) -> Vec<std::ops::Range<u32>> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < covered.len() && j < regions.len() {
+        let c = &covered[i];
+        // Region inclusive `[start, end]` → half-open `[start, end+1)`.
+        // `saturating_add` guards the u32 ceiling (region ends are
+        // clamped to contig length, far below it, so this never fires).
+        let region_end_excl = regions[j].end.saturating_add(1);
+        let lo = c.start.max(regions[j].start);
+        let hi = c.end.min(region_end_excl);
+        if lo < hi {
+            out.push(lo..hi);
+        }
+        // Advance the interval that ends first; the other may still
+        // overlap a later interval on the opposite side.
+        if c.end <= region_end_excl {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
 
 /// Compute the coalesced DUST mask over the covered `interval` (1-based
@@ -1482,6 +1529,7 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
         chromosomes: &'a [ParsedChromosome],
         fasta_path: &'a Path,
         params: &'a ChunkDriverParams,
+        region_set: Option<&RegionSet>,
     ) -> Self {
         let n_samples = psp_readers.len();
         let sources: Vec<ColumnSpanReader<W>> = psp_readers
@@ -1491,12 +1539,15 @@ impl<'a, W: Read + Seek + Send> BlockIterator<'a, W> {
 
         // Plan the covered intervals once (from the in-memory block
         // indices) so the producer and the DUST-ahead pool agree on the
-        // interval sequence. DUST off the critical path on a worker pool,
-        // unless the complexity filter is disabled.
+        // interval sequence. `--regions` narrows the intervals here, so
+        // both the producer and the pool stay in lockstep on the
+        // restricted sequence. DUST off the critical path on a worker
+        // pool, unless the complexity filter is disabled.
         let chrom_plans = build_dust_plans(
             &sources,
             chromosomes,
             params.grouper_cfg.max_variant_group_span,
+            region_set,
         );
         let dust_pool = if params.no_complexity_filter {
             None
@@ -1854,6 +1905,70 @@ mod tests {
             merge_block_ranges([(100, 200), (251, 300)], 50),
             vec![100..201, 251..301]
         );
+    }
+
+    // ── restrict_intervals_to_regions ───────────────────────────────
+
+    fn region(chrom_id: u32, start: u32, end: u32) -> Region {
+        Region {
+            chrom_id,
+            start,
+            end,
+        }
+    }
+
+    /// Half-open interval helper (sidesteps clippy's
+    /// `single_range_in_vec_init` on `vec![a..b]`).
+    fn iv(start: u32, end: u32) -> std::ops::Range<u32> {
+        start..end
+    }
+
+    #[test]
+    fn restrict_intervals_clips_covered_to_inclusive_regions() {
+        // Covered half-open [100,200); region inclusive [120,160] →
+        // half-open [120,161). Overlap = [120,161).
+        let covered = vec![iv(100, 200)];
+        let regions = vec![region(0, 120, 160)];
+        assert_eq!(
+            restrict_intervals_to_regions(&covered, &regions),
+            vec![iv(120, 161)]
+        );
+    }
+
+    #[test]
+    fn restrict_intervals_one_covered_split_by_two_regions() {
+        // A single covered span split into two by two disjoint regions.
+        let covered = vec![iv(100, 300)];
+        let regions = vec![region(0, 110, 140), region(0, 200, 230)];
+        assert_eq!(
+            restrict_intervals_to_regions(&covered, &regions),
+            vec![iv(110, 141), iv(200, 231)]
+        );
+    }
+
+    #[test]
+    fn restrict_intervals_two_covered_one_region() {
+        // One region spanning a gap between two covered intervals keeps
+        // each covered interval's overlapping part.
+        let covered = vec![iv(100, 150), iv(200, 260)];
+        let regions = vec![region(0, 120, 240)];
+        assert_eq!(
+            restrict_intervals_to_regions(&covered, &regions),
+            vec![iv(120, 150), iv(200, 241)]
+        );
+    }
+
+    #[test]
+    fn restrict_intervals_no_overlap_is_empty() {
+        let covered = vec![iv(100, 150)];
+        let regions = vec![region(0, 200, 300)];
+        assert!(restrict_intervals_to_regions(&covered, &regions).is_empty());
+    }
+
+    #[test]
+    fn restrict_intervals_empty_regions_is_empty() {
+        let covered = vec![iv(100, 150)];
+        assert!(restrict_intervals_to_regions(&covered, &[]).is_empty());
     }
 
     // ── Stage 3: slice_interval_mask ─────────────────────────────────

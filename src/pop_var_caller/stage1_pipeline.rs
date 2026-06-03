@@ -1,25 +1,23 @@
-//! Stage 1 pipeline helper — shared core of `run_pileup` and (when
-//! Task 8 lands) `run_var_calling_from_bam`.
+//! Stage 1 pipeline helper — the BAQ → walker chain `run_pileup`
+//! drives once per analysis region.
 //!
-//! Builds the CRAM → BAQ → walker borrow chain on its own stack and
-//! hands the walker into a caller-supplied closure. The chain is
-//! self-referential by Rust's standards (BaqStream borrows from the
-//! reader, the error-shedding adapter borrows from BaqStream, the
-//! walker borrows from the adapter), so the only way to expose it
-//! externally is via the callback pattern: the helper owns every
-//! layer for the duration of the closure, then snapshots counters
-//! after the closure returns and the borrow chain unwinds.
+//! Builds the BAQ → walker borrow chain over an already-opened reader
+//! on its own stack and hands the walker into a caller-supplied
+//! closure. The chain is self-referential by Rust's standards
+//! (BaqStream borrows from the reader, the error-shedding adapter
+//! borrows from BaqStream, the walker borrows from the adapter), so
+//! the only way to expose it externally is via the callback pattern:
+//! the helper owns every layer for the duration of the closure, then
+//! snapshots counters after the closure returns and the borrow chain
+//! unwinds.
 //!
-//! No temp `.psp` is ever written — the var-calling-from-bam path
-//! consumes the walker's record stream directly. (Rationale: the
-//! project's "no silent intermediates" principle — if a subcommand
-//! exists to skip an artefact, don't fall back to a hidden one.)
+//! `run_pileup` opens one `AlignmentMergedReader::query` reader per
+//! region and calls [`with_stage1_chain`] once per region, writing the
+//! in-region columns to one shared PSP writer inside the closure.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::bam::alignment_input::{
-    AlignmentMergedReader, AlignmentMergedReaderConfig, FilterCounts,
-};
+use crate::bam::alignment_input::{AlignmentMergedReader, FilterCounts};
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
@@ -39,7 +37,7 @@ use super::cli::error_bridge::ErrorSheddingAdapter;
 pub type Stage1Walker<'a> =
     PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a MultiChromStreamingRefFetcher>;
 
-/// Context handed to the [`with_stage1_pipeline`] callback. Contains
+/// Context handed to the [`with_stage1_chain`] callback. Contains
 /// the walker (by value — the closure may consume or drive it via
 /// `by_ref`) plus borrowed metadata the caller typically needs for
 /// header building.
@@ -50,7 +48,7 @@ pub struct Stage1PipelineContext<'a> {
 }
 
 /// Counter snapshots collected after the closure returns. The fields
-/// are owned values — safe to use past `with_stage1_pipeline`'s
+/// are owned values — safe to use past `with_stage1_chain`'s
 /// return.
 pub struct Stage1RunSummary {
     pub filter_counts: FilterCounts,
@@ -58,7 +56,7 @@ pub struct Stage1RunSummary {
     pub baq_skip_counts: Option<BaqSkipCounts>,
 }
 
-/// Bundle returned by [`with_stage1_pipeline`]. Carries the closure's
+/// Bundle returned by [`with_stage1_chain`]. Carries the closure's
 /// result `R`, the metadata the caller needs (sample name, contigs),
 /// the counter snapshot, and any upstream error stashed by the
 /// error-shedding adapter while the walker was running.
@@ -76,22 +74,23 @@ pub struct Stage1Outputs<R> {
     pub stashed_upstream_error: Option<AlignmentInputError>,
 }
 
-/// Build the Stage 1 pipeline on this function's stack and hand the
-/// walker to `f`. After `f` returns, snapshots `FilterCounts`,
-/// `BaqSkipCounts`, sample name and contigs, plus any stashed
-/// upstream error, and returns them bundled with `f`'s result.
+/// Build the Stage 1 BAQ → walker chain over an already-opened
+/// `reader` on this function's stack and hand the walker to `f`. After
+/// `f` returns, snapshots `FilterCounts`, `BaqSkipCounts`, sample name
+/// and contigs, plus any stashed upstream error, and returns them
+/// bundled with `f`'s result.
 ///
-/// `E: From<PileupCliError>` lets internal setup errors (reader open,
-/// fetcher init) lift into the closure's error type without changing
-/// the caller's surface. For `run_pileup` the closure picks
-/// `E = PileupCliError` (identity); for `run_var_calling_from_bam`,
-/// a manual `From<PileupCliError>` on the from-bam error provides
-/// the bridge.
+/// The caller owns reader construction: `run_pileup` opens one
+/// `query()` reader per analysis region and calls this once per region,
+/// reusing the shared PSP writer inside `f`.
+///
+/// `E: From<PileupCliError>` lets internal setup errors (fetcher init)
+/// lift into the closure's error type without changing the caller's
+/// surface; `run_pileup`'s closure picks `E = PileupCliError`.
 #[allow(clippy::too_many_arguments)]
-pub fn with_stage1_pipeline<R, E, F>(
-    alignment_files: &[PathBuf],
+pub fn with_stage1_chain<R, E, F>(
+    mut reader: AlignmentMergedReader,
     reference: &Path,
-    alignment_cfg: AlignmentMergedReaderConfig,
     baq_cfg: BaqConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
@@ -102,10 +101,9 @@ where
     F: FnOnce(Stage1PipelineContext<'_>) -> Result<R, E>,
     E: From<PileupCliError>,
 {
-    // 1. Open the merged reader and capture identification metadata.
-    let mut reader: AlignmentMergedReader =
-        AlignmentMergedReader::new(alignment_files, reference, alignment_cfg)
-            .map_err(PileupCliError::AlignmentInput)?;
+    // The reader is already opened and validated (via `new()` for a
+    // whole-file stream, or `query()` for one region). Capture the
+    // identification metadata it carries.
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
@@ -218,7 +216,7 @@ where
     })
 }
 
-/// Surface-order rule used by [`with_stage1_pipeline`]: if both the
+/// Surface-order rule used by [`with_stage1_chain`]: if both the
 /// closure failed *and* an upstream CRAM-input error was stashed by
 /// the `ErrorSheddingAdapter`, prefer the upstream error — it is the
 /// root cause. On Ok the stash is handed back to the caller for

@@ -1713,6 +1713,7 @@ mod tests {
                     "c.cram".to_string(),
                 ],
                 input_fasta: "GRCh38.fa".to_string(),
+                command_line: String::new(),
                 parameters: params,
             },
         };

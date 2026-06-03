@@ -65,6 +65,7 @@ fn rechunk(input: &Path, output: &Path, window: u32) -> Result<(), Box<dyn std::
             subcommand: parsed.writer.subcommand.clone(),
             input_crams: parsed.writer.input_crams.clone(),
             input_fasta: parsed.writer.input_fasta.clone(),
+            command_line: parsed.writer.command_line.clone(),
             parameters: parsed
                 .writer
                 .parameters

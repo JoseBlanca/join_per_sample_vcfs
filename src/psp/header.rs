@@ -123,6 +123,11 @@ pub struct WriterProvenance {
     pub input_crams: Vec<String>,
     /// **Basename only**.
     pub input_fasta: String,
+    /// The full invoking command line (space-joined argv), so the
+    /// `.psp` records exactly how it was produced — including any
+    /// `--regions` BED path. Empty string in `.psp` files written
+    /// before this field existed.
+    pub command_line: String,
     /// One entry per CLI-exposed knob, in any order (`BTreeMap`
     /// gives a deterministic order on the wire).
     pub parameters: BTreeMap<String, ParameterValue>,
@@ -169,6 +174,9 @@ pub struct ParsedWriter {
     pub subcommand: String,
     pub input_crams: Vec<String>,
     pub input_fasta: String,
+    /// Full invoking command line; empty for `.psp` files written
+    /// before this field existed.
+    pub command_line: String,
     pub parameters: BTreeMap<String, ParameterValue>,
 }
 
@@ -265,6 +273,8 @@ struct WireWriter {
     input_crams: Vec<String>,
     #[serde(rename = "input-fasta")]
     input_fasta: String,
+    #[serde(rename = "command-line", default)]
+    command_line: String,
     parameters: BTreeMap<String, ParameterValue>,
 }
 
@@ -345,6 +355,7 @@ fn wire_from_writer_header(header: &WriterHeader) -> WireHeader {
         subcommand: header.writer.subcommand.clone(),
         input_crams: header.writer.input_crams.clone(),
         input_fasta: header.writer.input_fasta.clone(),
+        command_line: header.writer.command_line.clone(),
         parameters: header.writer.parameters.clone(),
     };
     let columns = V1_0_COLUMNS.iter().map(wire_column_from_def).collect();
@@ -584,6 +595,7 @@ fn parse_writer(w: WireWriter) -> Result<ParsedWriter, PspReadError> {
         subcommand: w.subcommand,
         input_crams: w.input_crams,
         input_fasta: w.input_fasta,
+        command_line: w.command_line,
         parameters: w.parameters,
     })
 }
@@ -1220,6 +1232,7 @@ mod tests {
                 subcommand: parsed_1.writer.subcommand.clone(),
                 input_crams: parsed_1.writer.input_crams.clone(),
                 input_fasta: parsed_1.writer.input_fasta.clone(),
+                command_line: parsed_1.writer.command_line.clone(),
                 parameters: parsed_1.writer.parameters.clone(),
             },
         };
@@ -1269,6 +1282,7 @@ mod tests {
                 subcommand: "per-sample".to_string(),
                 input_crams: vec!["a.cram".to_string()],
                 input_fasta: "GRCh38.fa".to_string(),
+                command_line: String::new(),
                 parameters: BTreeMap::new(),
             },
             columns: V1_0_COLUMNS.iter().map(wire_column_from_def).collect(),

@@ -152,6 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let var_calling_args = VarCallingArgs {
         reference: args.reference,
         output: args.output.clone(),
+        regions: None,
         threads: args.threads,
         contamination_estimates: None,
         no_complexity_filter: args.no_complexity_filter,
@@ -230,6 +231,7 @@ fn read_psp(
             subcommand: parsed.writer.subcommand.clone(),
             input_crams: parsed.writer.input_crams.clone(),
             input_fasta: parsed.writer.input_fasta.clone(),
+            command_line: parsed.writer.command_line.clone(),
             parameters: parameters_clone(&parsed.writer.parameters),
         },
     };

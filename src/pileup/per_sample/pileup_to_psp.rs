@@ -66,6 +66,41 @@ where
     Ok((sink, summary))
 }
 
+/// Drive one region's [`PileupWalker`] into a **shared** [`PspWriter`],
+/// writing only records whose position lies in the 1-based inclusive
+/// range `[start, end]`. Returns the walker's [`RunSummary`].
+///
+/// Unlike [`drive_pileup_to_psp`], the writer is borrowed and **not**
+/// finalised here: the region-driven pileup calls this once per region
+/// against one shared writer, then finalises after the last region.
+///
+/// The walker runs over reads that *overlap* the region — including
+/// reads starting before `start`, so BAQ keeps its flanking context —
+/// so it can emit columns just outside the range; the clamp drops
+/// those, leaving exactly the region's columns. Because analysis
+/// regions are disjoint, every emitted column is written by exactly one
+/// region, so concatenating the per-region writes yields a coordinate-
+/// sorted, duplicate-free record stream.
+pub fn drive_region_into_writer<I, F, W>(
+    mut walker: PileupWalker<I, F>,
+    writer: &mut PspWriter<W>,
+    start: u32,
+    end: u32,
+) -> Result<RunSummary, PileupToPspError>
+where
+    I: Iterator<Item = PreparedRead>,
+    F: MultiChromRefFetcher,
+    W: Write,
+{
+    for item in walker.by_ref() {
+        let record = item?;
+        if record.pos >= start && record.pos <= end {
+            writer.write_record(&record)?;
+        }
+    }
+    Ok(walker.summary())
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -132,6 +167,44 @@ mod tests {
             read_back, expected,
             "records read back must equal records the walker emitted",
         );
+    }
+
+    /// Two regions driven into one shared writer, each clamped to its
+    /// range, produce a single `.psp` carrying exactly the in-range
+    /// positions in coordinate order. Mirrors how the region-driven
+    /// pileup reuses one writer across regions.
+    #[test]
+    fn drive_region_into_writer_clamps_and_shares_one_writer() {
+        let mut writer = PspWriter::new(Cursor::new(Vec::<u8>::new()), writer_header(1))
+            .expect("writer construction");
+
+        // Region A: positions [2, 4]. Reads cover the whole 1..=5 ref.
+        let fa_a = MockFasta::new("ACGTA");
+        let walker_a = run(
+            vec![snp_read("r1", 1, b"ACGTA", &[30; 5])],
+            &fa_a,
+            &WalkerConfig::default(),
+        );
+        drive_region_into_writer(walker_a, &mut writer, 2, 4).expect("region A drives");
+
+        // Region B: a single position [5, 5] (disjoint from A).
+        let fa_b = MockFasta::new("ACGTA");
+        let walker_b = run(
+            vec![snp_read("r2", 1, b"ACGTA", &[30; 5])],
+            &fa_b,
+            &WalkerConfig::default(),
+        );
+        drive_region_into_writer(walker_b, &mut writer, 5, 5).expect("region B drives");
+
+        let bytes = writer.finish().expect("finish").into_inner();
+        let mut reader = PspReader::new(Cursor::new(bytes)).expect("reader open");
+        let positions: Vec<u32> = reader
+            .records()
+            .map(|r| r.expect("record decodes").pos)
+            .collect();
+        // A contributes 2,3,4; B contributes 5 — clamped and in order,
+        // no out-of-range (1) position and no duplicates.
+        assert_eq!(positions, vec![2, 3, 4, 5]);
     }
 
     /// Walker error surfaces as [`PileupToPspError::Walker`], not as

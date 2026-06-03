@@ -19,7 +19,9 @@ use noodles_sam as sam;
 use crate::bam::bam_input::{BamIndex, open_bam_record_stream, open_indexed_bam_record_stream};
 use crate::bam::cram_input::{open_cram_record_stream, open_indexed_cram_record_stream};
 use crate::bam::errors::AlignmentInputError;
-use crate::bam::index_preflight::{AlignmentFileKind, AlignmentIndex};
+use crate::bam::index_preflight::{
+    AlignmentFileKind, AlignmentIndex, load_alignment_index, preflight_alignment_indexes,
+};
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
 use crate::pileup::walker::CigarOp;
@@ -137,6 +139,24 @@ pub struct FilterCounts {
     /// exist — every BAQ skip reason rolls up into this counter. Split
     /// later if a deployment cares which reason dominates.
     pub baq_rejected: u64,
+}
+
+impl FilterCounts {
+    /// Add `other`'s tallies into `self`, field by field. Used to total
+    /// the per-region readers' filter counts into one run summary when
+    /// the pileup is driven region by region.
+    pub fn merge(&mut self, other: &FilterCounts) {
+        self.unmapped += other.unmapped;
+        self.secondary += other.secondary;
+        self.supplementary += other.supplementary;
+        self.qc_fail += other.qc_fail;
+        self.duplicate += other.duplicate;
+        self.low_mapq += other.low_mapq;
+        self.too_short += other.too_short;
+        self.high_mismatch_fraction += other.high_mismatch_fraction;
+        self.bad_cigar += other.bad_cigar;
+        self.baq_rejected += other.baq_rejected;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -508,6 +528,39 @@ struct ReadFingerprintWithSourceFile {
 type AlignmentPeekable =
     BufferedPeekable<AlignmentRecordsIter, sam::alignment::RecordBuf, io::Error>;
 
+/// A 1-based inclusive position range within a single contig, used to
+/// narrow [`AlignmentMergedReader::query`] to a sub-contig region.
+/// `start <= end`, both `>= 1`.
+///
+/// The query yields every read whose reference footprint *overlaps*
+/// the range — including reads that start before `start` and extend
+/// into it — so a downstream pileup that clamps emitted columns to the
+/// range still has the flanking reads it needs for BAQ. Passing `None`
+/// to `query` (or a range that already spans the whole contig) reads
+/// the entire contig with no per-record overlap check.
+#[derive(Debug, Clone, Copy)]
+pub struct ContigInterval {
+    /// 1-based inclusive lower bound.
+    pub start: u32,
+    /// 1-based inclusive upper bound.
+    pub end: u32,
+}
+
+impl ContigInterval {
+    /// Whether `record`'s reference footprint `[alignment_start,
+    /// alignment_end]` overlaps this interval. A record with no mapped
+    /// position never overlaps.
+    pub(crate) fn overlaps_record(&self, record: &sam::alignment::RecordBuf) -> bool {
+        match (record.alignment_start(), record.alignment_end()) {
+            (Some(first), Some(last)) => {
+                usize::from(first) as u64 <= self.end as u64
+                    && usize::from(last) as u64 >= self.start as u64
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct AlignmentMergedReader {
     record_streams: Vec<AlignmentPeekable>,
     paths: Vec<PathBuf>,
@@ -797,6 +850,7 @@ impl AlignmentMergedReader {
         headers: &[Arc<sam::Header>],
         indexes: &[AlignmentIndex],
         contig_name: &str,
+        region: Option<ContigInterval>,
         config: AlignmentMergedReaderConfig,
     ) -> Result<Self, AlignmentInputError> {
         if alignment_files.is_empty() {
@@ -818,6 +872,13 @@ impl AlignmentMergedReader {
                 contig: contig_name.to_string(),
                 known_contigs: contigs.entries.len(),
             })?;
+
+        // A range that already covers the whole contig is equivalent to
+        // no range at all — drop it so the indexed openers take the
+        // unbounded, no-per-record-filter fast path (preserving the
+        // whole-contig read's cost and output exactly).
+        let contig_length = contigs.entries[target_reference_sequence_id].length;
+        let region = region.filter(|iv| !(iv.start <= 1 && u64::from(iv.end) >= contig_length));
 
         // FASTA repository — needed by the slice decoder for the
         // mismatch-fraction filter. Built per-worker because
@@ -871,6 +932,7 @@ impl AlignmentMergedReader {
                         Arc::clone(idx),
                         repository.clone(),
                         target_reference_sequence_id,
+                        region,
                     )?
                 }
                 (AlignmentFileKind::Bam, AlignmentIndex::BamCsi(idx)) => {
@@ -879,6 +941,7 @@ impl AlignmentMergedReader {
                         Arc::clone(header),
                         BamIndex::Csi(Arc::clone(idx)),
                         target_reference_sequence_id,
+                        region,
                     )?
                 }
                 (AlignmentFileKind::Bam, AlignmentIndex::BamBai(idx)) => {
@@ -887,6 +950,7 @@ impl AlignmentMergedReader {
                         Arc::clone(header),
                         BamIndex::Bai(Arc::clone(idx)),
                         target_reference_sequence_id,
+                        region,
                     )?
                 }
                 // Genuine driver-bug mismatches — enumerate each
@@ -922,6 +986,144 @@ impl AlignmentMergedReader {
             Some(repository),
         )
     }
+}
+
+// ---------------------------------------------------------------------
+// Indexed pileup inputs (metadata + per-input handles for `query`)
+// ---------------------------------------------------------------------
+
+/// Per-sample alignment inputs prepared for the indexed (region-driven)
+/// pileup path. Bundles the validated cross-file metadata (sample name,
+/// canonical contig list) with the per-input handles
+/// [`AlignmentMergedReader::query`] needs (one `Arc<sam::Header>` and
+/// one [`AlignmentIndex`] per input, parallel to the input-file slice).
+///
+/// Built once at startup by [`load_pileup_inputs`]; the region loop
+/// then calls `query` per region, reusing these handles.
+#[derive(Debug)]
+pub struct PileupInputs {
+    /// Single sample name shared by every input (cross-validated).
+    pub sample_name: String,
+    /// Canonical contig list (identical across inputs), in `@SQ`
+    /// order — the `chrom_id` space the [`crate::regions::RegionSet`]
+    /// and the PSP writer use.
+    pub contigs: ContigList,
+    /// One parsed header per input, in input order.
+    pub headers: Vec<Arc<sam::Header>>,
+    /// One loaded alignment index per input, in input order.
+    pub indexes: Vec<AlignmentIndex>,
+}
+
+/// Prepare [`PileupInputs`] for the indexed pileup path: pre-flight the
+/// alignment indexes, then open each input once to validate it and
+/// collect the handles `query` needs.
+///
+/// `build_index_if_missing` is forwarded to
+/// [`preflight_alignment_indexes`]: `false` hard-errors on the first
+/// input without a `.crai`/`.csi`/`.bai`; `true` builds the missing
+/// index in place. The reference `.fai` is required (a missing one is
+/// [`AlignmentInputError::MissingFastaIndex`]) — this loader does not
+/// build it.
+///
+/// Cross-file invariants (identical `@SQ` lists, a single sample name,
+/// coordinate sort order, per-contig `@SQ M5`) are enforced exactly as
+/// [`AlignmentMergedReader::new`] does; mixed CRAM + BAM and
+/// unknown-extension inputs are rejected by the pre-flight pass.
+pub fn load_pileup_inputs(
+    alignment_files: &[PathBuf],
+    fasta: &Path,
+    build_index_if_missing: bool,
+) -> Result<PileupInputs, AlignmentInputError> {
+    if alignment_files.is_empty() {
+        return Err(AlignmentInputError::NoInputs);
+    }
+
+    // Index pre-flight first: a missing index (without the build
+    // opt-in) should fail before any header parse. This pass also
+    // rejects mixed CRAM + BAM and unknown extensions.
+    preflight_alignment_indexes(alignment_files, build_index_if_missing)?;
+
+    // FASTA repository — needed to open CRAM inputs. Requires the
+    // sibling `.fai`.
+    let fai_path = with_fai_extension(fasta);
+    if !fai_path.exists() {
+        return Err(AlignmentInputError::MissingFastaIndex {
+            fasta_path: fasta.to_path_buf(),
+        });
+    }
+    let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
+        .build_from_path(fasta)
+        .map_err(|source| AlignmentInputError::Io {
+            path: fasta.to_path_buf(),
+            source,
+        })?;
+    let repository = fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(
+        indexed_fasta_reader,
+    ));
+
+    // One pass per input: open, read + validate the header, and
+    // collect the header + index handles. Cross-file checks mirror
+    // `new()` (contigs identical, single sample).
+    let mut headers: Vec<Arc<sam::Header>> = Vec::with_capacity(alignment_files.len());
+    let mut indexes: Vec<AlignmentIndex> = Vec::with_capacity(alignment_files.len());
+    let mut canonical_contigs: Option<ContigList> = None;
+    let mut canonical_sample: Option<String> = None;
+    let mut reference_input_path: Option<PathBuf> = None;
+
+    for path in alignment_files {
+        let kind = AlignmentFileKind::from_path(path)
+            .ok_or_else(|| AlignmentInputError::UnsupportedExtension { path: path.clone() })?;
+        // The per-format opener reads (and format-validates) the
+        // header; we keep the header and drop the unused record
+        // iterator (no records are decoded here).
+        let (sam_header, _records) = match kind {
+            AlignmentFileKind::Cram => open_cram_record_stream(path, repository.clone())?,
+            AlignmentFileKind::Bam => open_bam_record_stream(path)?,
+        };
+        let summary = extract_header(path, &sam_header)?;
+
+        match &canonical_contigs {
+            None => {
+                canonical_contigs = Some(summary.contigs.clone());
+                reference_input_path = Some(path.clone());
+            }
+            Some(existing) => {
+                if let Err(detail) = existing.first_disagreement(&summary.contigs) {
+                    return Err(AlignmentInputError::ContigListMismatch {
+                        reference_path: reference_input_path
+                            .clone()
+                            .expect("reference_input_path set when canonical_contigs is Some"),
+                        other_path: path.clone(),
+                        detail,
+                    });
+                }
+            }
+        }
+        match &canonical_sample {
+            None => canonical_sample = Some(summary.sample_name.clone()),
+            Some(existing) if existing != &summary.sample_name => {
+                return Err(AlignmentInputError::MultipleSampleNames {
+                    path_a: reference_input_path
+                        .clone()
+                        .expect("reference_input_path set when canonical_sample is Some"),
+                    sm_a: existing.clone(),
+                    path_b: path.clone(),
+                    sm_b: summary.sample_name.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+
+        headers.push(Arc::new(sam_header));
+        indexes.push(load_alignment_index(path)?);
+    }
+
+    Ok(PileupInputs {
+        sample_name: canonical_sample.expect("at least one input validated above"),
+        contigs: canonical_contigs.expect("at least one input validated above"),
+        headers,
+        indexes,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -3668,6 +3870,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1");
@@ -3704,6 +3907,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1");
@@ -3756,6 +3960,7 @@ mod tests {
             &headers,
             &indexes,
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr1")
@@ -3798,6 +4003,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr2",
+            None,
             AlignmentMergedReaderConfig::default(),
         )
         .expect("query chr2");
@@ -3824,6 +4030,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chrUnknown",
+            None,
             AlignmentMergedReaderConfig::default(),
         );
         let err = err_or_panic(err, "query should reject unknown contig");
@@ -3853,6 +4060,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         );
         let err = err_or_panic(err, "query should reject mismatched handle counts");
@@ -3863,6 +4071,206 @@ mod tests {
                 headers: 1,
                 indexes: 1,
             }
+        ));
+    }
+
+    // --- Group C2: sub-contig region narrowing ------------------------
+    //
+    // chr1 (length 1000) with four 50 bp reads at 100/300/500/700 —
+    // footprints [100,149], [300,349], [500,549], [700,749]. The
+    // `region` argument to `query` restricts the stream to reads whose
+    // footprint overlaps a 1-based inclusive sub-contig range.
+
+    /// Build the four-read chr1 fixture; returns the two `TempDir`
+    /// guards (kept alive by the caller), the FASTA + CRAM paths, and
+    /// the pre-loaded header + index.
+    fn chr1_four_reads_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Arc<sam::Header>,
+        AlignmentIndex,
+    ) {
+        let contigs = one_contig_chr1();
+        let (fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let records = vec![
+            pass_record_for_b("R1", 0, 100),
+            pass_record_for_b("R2", 0, 300),
+            pass_record_for_b("R3", 0, 500),
+            pass_record_for_b("R4", 0, 700),
+        ];
+        let (cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &HeaderOverrides::default(), &records)
+                .expect("build_cram");
+        let (header, index) = load_header_and_index(&input_path);
+        (fasta_dir, cram_dir, fasta_path, input_path, header, index)
+    }
+
+    /// Query chr1 of the four-read fixture, optionally narrowed to
+    /// `region`, and collect the 1-based start positions yielded.
+    fn query_chr1_positions(
+        input_path: &Path,
+        fasta_path: &Path,
+        header: &Arc<sam::Header>,
+        index: &AlignmentIndex,
+        region: Option<ContigInterval>,
+    ) -> Vec<u64> {
+        let inputs = [input_path.to_path_buf()];
+        AlignmentMergedReader::query(
+            &inputs,
+            fasta_path,
+            contigs_for(&one_contig_chr1()),
+            "s1".to_string(),
+            std::slice::from_ref(header),
+            std::slice::from_ref(index),
+            "chr1",
+            region,
+            AlignmentMergedReaderConfig::default(),
+        )
+        .expect("query chr1")
+        .map(|r| r.expect("ok record").pos)
+        .collect()
+    }
+
+    #[test]
+    fn c7_query_sub_region_yields_only_overlapping_reads() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 280,
+                end: 520,
+            }),
+        );
+        // R2 [300,349] and R3 [500,549] overlap [280,520]; R1 and R4 do not.
+        assert_eq!(positions, vec![300, 500]);
+    }
+
+    #[test]
+    fn c8_query_sub_region_includes_read_spanning_the_start_edge() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        // The region starts at 330, inside R2's footprint [300,349]:
+        // R2 begins *before* the region but extends into it, so it must
+        // be fetched (a clamped pileup still needs it for BAQ context).
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 330,
+                end: 520,
+            }),
+        );
+        assert_eq!(positions, vec![300, 500]);
+    }
+
+    #[test]
+    fn c9_query_whole_contig_range_matches_unbounded() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        // A range covering the whole contig is normalized to "no range"
+        // and yields every read, exactly as `None` would.
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 1,
+                end: 1000,
+            }),
+        );
+        assert_eq!(positions, vec![100, 300, 500, 700]);
+    }
+
+    #[test]
+    fn c10_query_sub_region_with_no_overlap_is_empty() {
+        let (_fd, _cd, fasta_path, input_path, header, index) = chr1_four_reads_fixture();
+        // [200,250] falls in the gap between R1 [100,149] and R2 [300,349].
+        let positions = query_chr1_positions(
+            &input_path,
+            &fasta_path,
+            &header,
+            &index,
+            Some(ContigInterval {
+                start: 200,
+                end: 250,
+            }),
+        );
+        assert!(positions.is_empty());
+    }
+
+    // --- Group C3: load_pileup_inputs (metadata + handles) ------------
+
+    /// `load_pileup_inputs` with `build_if_missing = true` builds the
+    /// missing `.crai` in place and returns the validated metadata plus
+    /// one header + index handle per input.
+    #[test]
+    fn load_pileup_inputs_builds_missing_index_and_returns_metadata() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &overrides, &records).expect("build_cram");
+
+        let inputs = load_pileup_inputs(
+            std::slice::from_ref(&input_path),
+            &fasta_path,
+            /* build = */ true,
+        )
+        .expect("load_pileup_inputs");
+
+        assert_eq!(inputs.sample_name, "s1");
+        assert_eq!(inputs.contigs.entries.len(), 1);
+        assert_eq!(inputs.contigs.entries[0].name, "chr1");
+        assert_eq!(inputs.headers.len(), 1);
+        assert_eq!(inputs.indexes.len(), 1);
+
+        // The `.crai` was created next to the input.
+        let crai = {
+            let mut s = input_path.clone().into_os_string();
+            s.push(".crai");
+            PathBuf::from(s)
+        };
+        assert!(
+            crai.exists(),
+            "build_if_missing should have written the .crai"
+        );
+    }
+
+    /// With `build_if_missing = false`, a missing index hard-errors via
+    /// the pre-flight pass (bridged into `AlignmentInputError`).
+    #[test]
+    fn load_pileup_inputs_errors_when_index_missing_and_build_disabled() {
+        use crate::bam::errors::AlignmentIndexError;
+
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &overrides, &records).expect("build_cram");
+
+        let err = load_pileup_inputs(
+            std::slice::from_ref(&input_path),
+            &fasta_path,
+            /* build = */ false,
+        )
+        .expect_err("missing index must error when build is disabled");
+        assert!(matches!(
+            err,
+            AlignmentInputError::AlignmentIndex(AlignmentIndexError::MissingAlignmentIndex { .. })
         ));
     }
 
@@ -4188,6 +4596,7 @@ mod tests {
             std::slice::from_ref(&header),
             std::slice::from_ref(&bad_index),
             "chr1",
+            None,
             AlignmentMergedReaderConfig::default(),
         );
         let err = match result {

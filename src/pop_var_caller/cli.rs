@@ -14,18 +14,23 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
-use crate::bam::alignment_input::{AlignmentMergedReaderConfig, FilterCounts};
+use crate::bam::alignment_input::{
+    AlignmentMergedReader, AlignmentMergedReaderConfig, ContigInterval, FilterCounts,
+    load_pileup_inputs,
+};
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::ContigList;
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
-use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_pileup_to_psp};
+use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_region_into_writer};
 use crate::pileup::walker::{RunSummary, WalkerConfig};
 use crate::pop_var_caller::common::{
-    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, format_md5_hex, rfc3339_now,
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, current_command_line,
+    format_md5_hex, rfc3339_now,
 };
 use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
 use crate::psp::writer::{DEFAULT_BLOCK_WINDOW_BP, MAX_BLOCK_TARGET_BYTES, PspWriter};
+use crate::regions::{ContigBounds, RegionSet};
 
 pub mod error_bridge;
 pub mod parsers;
@@ -80,6 +85,22 @@ pub struct PileupArgs {
     /// supported (the .psp format is random-access on read).
     #[arg(long)]
     pub output: PathBuf,
+
+    /// BED file restricting analysis to the listed regions; the rest of
+    /// the genome is ignored. Coordinates are 0-based half-open
+    /// (standard BED). Without this flag the whole genome — every
+    /// contig in the reference — is analysed. The reads are seeked to
+    /// via the alignment index rather than streamed, so a sparse BED is
+    /// cheap.
+    #[arg(long)]
+    pub regions: Option<PathBuf>,
+
+    /// Build a missing alignment index (`.crai` for CRAM, `.csi` for
+    /// BAM) in place instead of erroring. Off by default: a missing
+    /// index is a hard error naming the path it looked for. The
+    /// reference `.fai` is always required and is never built.
+    #[arg(long)]
+    pub build_map_file_index: bool,
 
     /// Worker threads for the BAQ stage and any other rayon work.
     /// If omitted, rayon's default (all logical cores) is used.
@@ -170,6 +191,8 @@ pub enum PileupCliError {
     AlignmentInput(#[from] AlignmentInputError),
     #[error("pipeline: {0}")]
     Pipeline(#[from] PileupToPspError),
+    #[error("regions BED: {0}")]
+    Bed(#[from] crate::regions::BedError),
     #[error(
         "contig '{contig}' has no @SQ M5 checksum in the input alignment file(s); \
          re-create the file with a tool that emits @SQ M5 (e.g. samtools view -t)"
@@ -189,16 +212,22 @@ pub enum PileupCliError {
 // Top-level driver
 // ---------------------------------------------------------------------
 
-/// Construct the four stages from `args` and drive the pipeline.
-/// Records on success are written to `<output>.tmp` and atomically
-/// renamed to `<output>` on success. Stderr receives a one-shot
-/// run-summary block after the pipeline exhausts.
+/// Drive the region-by-region pileup and emit one `.psp`.
 ///
-/// The Stage 1 borrow chain (`reader → BAQ → adapter → walker`) is
-/// extracted into
-/// [`with_stage1_pipeline`](super::stage1_pipeline::with_stage1_pipeline)
-/// so the same code path drives both this subcommand and (Task 8)
-/// `var-calling-from-bam`.
+/// There is a single code path: the pileup always operates on a
+/// [`RegionSet`] — the `--regions` BED, or (without it) one full-length
+/// span per contig. For each region the alignment index is used to
+/// *seek* to the reads overlapping it
+/// ([`AlignmentMergedReader::query`]); the BAQ → walker chain
+/// ([`with_stage1_chain`](super::stage1_pipeline::with_stage1_chain))
+/// runs over those reads, and only the columns inside the region are
+/// written to one shared [`PspWriter`]. "Whole genome" is not a special
+/// case — it is the region set whose every span covers an entire
+/// contig.
+///
+/// Records are written to `<output>.tmp` and atomically renamed to
+/// `<output>` on success. Stderr receives a one-shot run-summary block
+/// totalling every region's counters.
 pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let stage1 = &args.stage1;
 
@@ -207,77 +236,145 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let baq_cfg = baq_config_from_args(stage1);
     let walker_cfg = walker_config_from_args(stage1);
 
-    // 2. Size rayon's global pool when --threads is given. The
-    //    helper is idempotent (silent no-op on second call) so
-    //    library consumers and test runners can invoke multiple
-    //    `run_*` helpers back-to-back; the first caller wins. M13
-    //    from the 2026-05-19 cohort CLI review.
+    // 2. Size rayon's global pool when --threads is given (idempotent;
+    //    first caller wins).
     configure_rayon_pool(args.threads).map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
 
-    // 3. Tmp output path. The closure opens the file lazily so the
-    //    .tmp file only appears once the Stage 1 chain is fully set
-    //    up — failures before this point leave no garbage on disk.
-    let tmp_path = tmp_path_for(&args.output);
-
-    // 4. Drive the Stage 1 chain via the shared helper. The closure
-    //    runs while the chain is alive; counter snapshots happen
-    //    afterwards inside the helper.
-    let outputs = super::stage1_pipeline::with_stage1_pipeline::<_, PileupCliError, _>(
+    // 3. Load metadata + per-input handles. Index pre-flight runs here:
+    //    a missing alignment index is built (with --build-map-file-index)
+    //    or hard-errors. The reference `.fai` is required.
+    let inputs = load_pileup_inputs(
         &args.alignment_files,
         &args.reference,
-        alignment_cfg,
-        baq_cfg,
-        walker_cfg,
-        stage1.baq_chunk_size,
-        stage1.no_baq,
-        |ctx| {
-            // Build the writer header from the reader's metadata (the
-            // M5 hard-error fires here).
-            let header = build_writer_header(
-                ctx.sample_name,
-                &args.reference,
-                ctx.contigs,
-                &args.alignment_files,
-                stage1,
-                args.block_target_bytes,
-                args.block_window_bp,
-            )?;
-            // Open the .tmp output, build the writer, drive the walker.
-            let file = File::create(&tmp_path).map_err(PileupCliError::Io)?;
-            let buf = BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
-            let psp_writer = PspWriter::new_with_block_layout(
-                buf,
-                header,
-                args.block_target_bytes,
-                args.block_window_bp,
-            )
-            .map_err(PileupToPspError::from)?;
-            let (sink, run_summary) = drive_pileup_to_psp(ctx.walker, psp_writer)?;
-            Ok((sink, run_summary))
-        },
+        args.build_map_file_index,
     )?;
 
-    let (buf_sink, summary) = outputs.result;
-    let filter_counts_for_summary = outputs.run_summary.filter_counts;
-    let baq_skip_counts_for_summary = outputs.run_summary.baq_skip_counts;
+    // 4. Writer header (validates per-contig u32 lengths + @SQ M5). Built
+    //    before the region set so the latter can borrow the header's
+    //    already-u32-validated contig bounds.
+    let mut header = build_writer_header(
+        &inputs.sample_name,
+        &args.reference,
+        &inputs.contigs,
+        &args.alignment_files,
+        stage1,
+        args.block_target_bytes,
+        args.block_window_bp,
+        args.regions.as_deref(),
+    )?;
 
+    // 5. Region set: the BED, or one full-length span per contig. The
+    //    contig slice index is the `chrom_id` used by the writer and the
+    //    `query` reader, so this preserves the reference's contig order.
+    let region_set = {
+        let contig_bounds: Vec<ContigBounds> = header
+            .chromosomes
+            .iter()
+            .map(|c| ContigBounds {
+                name: &c.name,
+                length: c.length,
+            })
+            .collect();
+        match &args.regions {
+            Some(bed_path) => RegionSet::from_bed_path(bed_path, &contig_bounds)?,
+            None => RegionSet::whole_contigs(&contig_bounds),
+        }
+        // `contig_bounds` borrows `header`; drop it here so `header` can
+        // move into the writer below.
+    };
+    // Record how many analysis spans the BED resolved to (provenance);
+    // omitted for the whole-genome default.
+    if args.regions.is_some() {
+        header.writer.parameters.insert(
+            "regions_count".to_string(),
+            ParameterValue::Integer(region_set.len() as i64),
+        );
+    }
+
+    // 6. Open the shared writer on the .tmp path.
+    let tmp_path = tmp_path_for(&args.output);
+    let file = File::create(&tmp_path).map_err(PileupCliError::Io)?;
+    let buf = BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, file);
+    let mut writer = PspWriter::new_with_block_layout(
+        buf,
+        header,
+        args.block_target_bytes,
+        args.block_window_bp,
+    )
+    .map_err(PileupToPspError::from)?;
+
+    // 7. Drive each region into the shared writer, totalling counters.
+    let mut total_filter = FilterCounts::default();
+    let mut total_walker = RunSummary::default();
+    let mut total_baq_skip = (!stage1.no_baq).then(BaqSkipCounts::default);
+    let mut stashed_upstream: Option<AlignmentInputError> = None;
+
+    for region in region_set.iter() {
+        let contig_name = inputs.contigs.entries[region.chrom_id as usize]
+            .name
+            .clone();
+        let reader = AlignmentMergedReader::query(
+            &args.alignment_files,
+            &args.reference,
+            inputs.contigs.clone(),
+            inputs.sample_name.clone(),
+            &inputs.headers,
+            &inputs.indexes,
+            &contig_name,
+            Some(ContigInterval {
+                start: region.start,
+                end: region.end,
+            }),
+            alignment_cfg,
+        )?;
+
+        let outputs = super::stage1_pipeline::with_stage1_chain::<RunSummary, PileupCliError, _>(
+            reader,
+            &args.reference,
+            baq_cfg,
+            walker_cfg,
+            stage1.baq_chunk_size,
+            stage1.no_baq,
+            |ctx| {
+                drive_region_into_writer(ctx.walker, &mut writer, region.start, region.end)
+                    .map_err(PileupCliError::from)
+            },
+        )?;
+
+        total_walker.merge(&outputs.result);
+        total_filter.merge(&outputs.run_summary.filter_counts);
+        if let (Some(acc), Some(region_skip)) = (
+            total_baq_skip.as_mut(),
+            outputs.run_summary.baq_skip_counts.as_ref(),
+        ) {
+            acc.merge(region_skip);
+        }
+
+        // An upstream read error on any region halts the run. Stop the
+        // loop and surface it after the writer is torn down.
+        if let Some(e) = outputs.stashed_upstream_error {
+            stashed_upstream = Some(e);
+            break;
+        }
+    }
+
+    // 8. Finalise: fsync + atomically rename the .tmp into place.
+    let buf_sink = writer.finish().map_err(PileupToPspError::from)?;
     finalise_output(buf_sink, &tmp_path, &args.output)?;
 
-    // 5. Surface a deferred upstream error if one was stashed by the
-    //    bridge. This is the only place upstream errors are
-    //    reported — the walker would have exited cleanly from its
-    //    perspective.
-    if let Some(e) = outputs.stashed_upstream_error {
+    // 9. Surface a stashed upstream read error (the walker exited cleanly
+    //    from its own perspective, so this is the only report site).
+    if let Some(e) = stashed_upstream {
         let _ = fs::remove_file(&args.output); // best-effort cleanup
         return Err(PileupCliError::AlignmentInput(e));
     }
 
-    // 6. Format the stderr run-summary block.
+    // 10. Stderr run-summary block, totalled across regions.
     print_run_summary(
-        &outputs.sample_name,
-        &filter_counts_for_summary,
-        baq_skip_counts_for_summary.as_ref(),
-        &summary,
+        &inputs.sample_name,
+        &total_filter,
+        total_baq_skip.as_ref(),
+        &total_walker,
     );
 
     Ok(())
@@ -358,6 +455,7 @@ fn finalise_output(
 
 /// Build a [`WriterHeader`] from the merged reader's metadata + CLI
 /// inputs. Hard-errors when a contig has no `@SQ M5`.
+#[allow(clippy::too_many_arguments)]
 fn build_writer_header(
     sample: &str,
     fasta_path: &Path,
@@ -366,6 +464,7 @@ fn build_writer_header(
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
     block_window_bp: u32,
+    regions_bed: Option<&Path>,
 ) -> Result<WriterHeader, PileupCliError> {
     let mut chromosomes = Vec::with_capacity(contigs.entries.len());
     for entry in &contigs.entries {
@@ -393,7 +492,17 @@ fn build_writer_header(
 
     let input_crams: Vec<String> = cram_paths.iter().map(|p| basename(p)).collect();
     let input_fasta = basename(fasta_path);
-    let parameters = effective_parameters(args, block_target_bytes, block_window_bp);
+    let mut parameters = effective_parameters(args, block_target_bytes, block_window_bp);
+    // Record the analysis-regions BED basename when one was supplied, so
+    // the `.psp` self-describes that it covers only those regions (the
+    // full path is also in `command_line`). `regions_count` is added by
+    // the caller once the BED has been resolved to a region set.
+    if let Some(bed) = regions_bed {
+        parameters.insert(
+            "regions_bed".to_string(),
+            ParameterValue::String(basename(bed)),
+        );
+    }
 
     Ok(WriterHeader {
         format_version: (1, 0),
@@ -407,6 +516,7 @@ fn build_writer_header(
             subcommand: "pileup".to_string(),
             input_crams,
             input_fasta,
+            command_line: current_command_line(),
             parameters,
         },
     })
@@ -569,6 +679,8 @@ mod tests {
         PileupArgs {
             reference,
             output,
+            regions: None,
+            build_map_file_index: false,
             threads: None,
             alignment_files,
             block_target_bytes: TARGET_BLOCK_BYTES,
@@ -681,6 +793,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            None,
         )
         .expect_err("must error");
         assert!(matches!(err, PileupCliError::MissingMd5 { ref contig } if contig == "chr1"));
@@ -714,6 +827,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            None,
         )
         .expect("build_writer_header");
         assert_eq!(header.writer.input_fasta, "grch38.fa");

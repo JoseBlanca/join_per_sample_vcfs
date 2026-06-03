@@ -26,7 +26,7 @@ use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
-use super::alignment_input::AlignmentRecordsIter;
+use super::alignment_input::{AlignmentRecordsIter, ContigInterval};
 use super::errors::AlignmentInputError;
 
 // ---------------------------------------------------------------------
@@ -155,6 +155,11 @@ struct OwnedIndexedCramRecords {
     index: Arc<cram::crai::Index>,
     repository: fasta::Repository,
     target_reference_sequence_id: usize,
+    /// Optional 1-based inclusive sub-contig range. `Some` narrows the
+    /// container walk (skip containers disjoint from the range) and
+    /// filters decoded records to those overlapping it; `None` reads
+    /// the whole target contig.
+    region: Option<ContigInterval>,
     /// Cursor into the index. We hold the index by `Arc`, so we walk
     /// it via this integer rather than a `slice::Iter` to keep the
     /// struct free of self-referential borrows.
@@ -183,6 +188,23 @@ impl OwnedIndexedCramRecords {
 
             if record.reference_sequence_id() != Some(self.target_reference_sequence_id) {
                 continue;
+            }
+
+            // Container-level skip: when a sub-contig range is set, a
+            // container whose footprint `[start, start+span-1]` is
+            // disjoint from the range holds nothing we want, so we can
+            // avoid the seek + decode entirely.
+            if let Some(iv) = self.region
+                && let Some(container_start) = record.alignment_start()
+            {
+                let container_start = usize::from(container_start) as u64;
+                let span = record.alignment_span() as u64;
+                if span > 0 {
+                    let container_end = container_start + span - 1;
+                    if container_end < u64::from(iv.start) || container_start > u64::from(iv.end) {
+                        continue;
+                    }
+                }
             }
 
             self.reader.seek(SeekFrom::Start(record.offset()))?;
@@ -216,7 +238,9 @@ impl OwnedIndexedCramRecords {
                         self.header.as_ref(),
                         record,
                     )?;
-                    if rb.reference_sequence_id() == Some(self.target_reference_sequence_id) {
+                    if rb.reference_sequence_id() == Some(self.target_reference_sequence_id)
+                        && self.region.is_none_or(|iv| iv.overlaps_record(&rb))
+                    {
                         all_records.push(rb);
                     }
                 }
@@ -337,13 +361,15 @@ fn open_cram_reader_with_header(
 /// `target_reference_sequence_id` must be valid against `header`'s
 /// `@SQ` order (the caller is expected to have resolved the contig
 /// name into an integer index against the canonical contig list
-/// before invoking).
+/// before invoking). `region` optionally narrows the walk to a
+/// 1-based inclusive sub-contig range.
 pub(super) fn open_indexed_cram_record_stream(
     path: &Path,
     header: Arc<sam::Header>,
     index: Arc<cram::crai::Index>,
     repository: fasta::Repository,
     target_reference_sequence_id: usize,
+    region: Option<ContigInterval>,
 ) -> Result<AlignmentRecordsIter, AlignmentInputError> {
     let mut noodles_cram_reader = cram::io::reader::Builder::default()
         .set_reference_sequence_repository(repository.clone())
@@ -376,6 +402,7 @@ pub(super) fn open_indexed_cram_record_stream(
         index,
         repository,
         target_reference_sequence_id,
+        region,
         next_index_record: 0,
         pending: Vec::new().into_iter(),
         eof_latched: false,
