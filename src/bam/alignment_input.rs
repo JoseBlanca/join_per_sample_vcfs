@@ -19,7 +19,9 @@ use noodles_sam as sam;
 use crate::bam::bam_input::{BamIndex, open_bam_record_stream, open_indexed_bam_record_stream};
 use crate::bam::cram_input::{open_cram_record_stream, open_indexed_cram_record_stream};
 use crate::bam::errors::AlignmentInputError;
-use crate::bam::index_preflight::{AlignmentFileKind, AlignmentIndex};
+use crate::bam::index_preflight::{
+    AlignmentFileKind, AlignmentIndex, load_alignment_index, preflight_alignment_indexes,
+};
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
 use crate::pileup::walker::CigarOp;
@@ -966,6 +968,144 @@ impl AlignmentMergedReader {
             Some(repository),
         )
     }
+}
+
+// ---------------------------------------------------------------------
+// Indexed pileup inputs (metadata + per-input handles for `query`)
+// ---------------------------------------------------------------------
+
+/// Per-sample alignment inputs prepared for the indexed (region-driven)
+/// pileup path. Bundles the validated cross-file metadata (sample name,
+/// canonical contig list) with the per-input handles
+/// [`AlignmentMergedReader::query`] needs (one `Arc<sam::Header>` and
+/// one [`AlignmentIndex`] per input, parallel to the input-file slice).
+///
+/// Built once at startup by [`load_pileup_inputs`]; the region loop
+/// then calls `query` per region, reusing these handles.
+#[derive(Debug)]
+pub struct PileupInputs {
+    /// Single sample name shared by every input (cross-validated).
+    pub sample_name: String,
+    /// Canonical contig list (identical across inputs), in `@SQ`
+    /// order — the `chrom_id` space the [`crate::regions::RegionSet`]
+    /// and the PSP writer use.
+    pub contigs: ContigList,
+    /// One parsed header per input, in input order.
+    pub headers: Vec<Arc<sam::Header>>,
+    /// One loaded alignment index per input, in input order.
+    pub indexes: Vec<AlignmentIndex>,
+}
+
+/// Prepare [`PileupInputs`] for the indexed pileup path: pre-flight the
+/// alignment indexes, then open each input once to validate it and
+/// collect the handles `query` needs.
+///
+/// `build_index_if_missing` is forwarded to
+/// [`preflight_alignment_indexes`]: `false` hard-errors on the first
+/// input without a `.crai`/`.csi`/`.bai`; `true` builds the missing
+/// index in place. The reference `.fai` is required (a missing one is
+/// [`AlignmentInputError::MissingFastaIndex`]) — this loader does not
+/// build it.
+///
+/// Cross-file invariants (identical `@SQ` lists, a single sample name,
+/// coordinate sort order, per-contig `@SQ M5`) are enforced exactly as
+/// [`AlignmentMergedReader::new`] does; mixed CRAM + BAM and
+/// unknown-extension inputs are rejected by the pre-flight pass.
+pub fn load_pileup_inputs(
+    alignment_files: &[PathBuf],
+    fasta: &Path,
+    build_index_if_missing: bool,
+) -> Result<PileupInputs, AlignmentInputError> {
+    if alignment_files.is_empty() {
+        return Err(AlignmentInputError::NoInputs);
+    }
+
+    // Index pre-flight first: a missing index (without the build
+    // opt-in) should fail before any header parse. This pass also
+    // rejects mixed CRAM + BAM and unknown extensions.
+    preflight_alignment_indexes(alignment_files, build_index_if_missing)?;
+
+    // FASTA repository — needed to open CRAM inputs. Requires the
+    // sibling `.fai`.
+    let fai_path = with_fai_extension(fasta);
+    if !fai_path.exists() {
+        return Err(AlignmentInputError::MissingFastaIndex {
+            fasta_path: fasta.to_path_buf(),
+        });
+    }
+    let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
+        .build_from_path(fasta)
+        .map_err(|source| AlignmentInputError::Io {
+            path: fasta.to_path_buf(),
+            source,
+        })?;
+    let repository = fasta::Repository::new(fasta::repository::adapters::IndexedReader::new(
+        indexed_fasta_reader,
+    ));
+
+    // One pass per input: open, read + validate the header, and
+    // collect the header + index handles. Cross-file checks mirror
+    // `new()` (contigs identical, single sample).
+    let mut headers: Vec<Arc<sam::Header>> = Vec::with_capacity(alignment_files.len());
+    let mut indexes: Vec<AlignmentIndex> = Vec::with_capacity(alignment_files.len());
+    let mut canonical_contigs: Option<ContigList> = None;
+    let mut canonical_sample: Option<String> = None;
+    let mut reference_input_path: Option<PathBuf> = None;
+
+    for path in alignment_files {
+        let kind = AlignmentFileKind::from_path(path)
+            .ok_or_else(|| AlignmentInputError::UnsupportedExtension { path: path.clone() })?;
+        // The per-format opener reads (and format-validates) the
+        // header; we keep the header and drop the unused record
+        // iterator (no records are decoded here).
+        let (sam_header, _records) = match kind {
+            AlignmentFileKind::Cram => open_cram_record_stream(path, repository.clone())?,
+            AlignmentFileKind::Bam => open_bam_record_stream(path)?,
+        };
+        let summary = extract_header(path, &sam_header)?;
+
+        match &canonical_contigs {
+            None => {
+                canonical_contigs = Some(summary.contigs.clone());
+                reference_input_path = Some(path.clone());
+            }
+            Some(existing) => {
+                if let Err(detail) = existing.first_disagreement(&summary.contigs) {
+                    return Err(AlignmentInputError::ContigListMismatch {
+                        reference_path: reference_input_path
+                            .clone()
+                            .expect("reference_input_path set when canonical_contigs is Some"),
+                        other_path: path.clone(),
+                        detail,
+                    });
+                }
+            }
+        }
+        match &canonical_sample {
+            None => canonical_sample = Some(summary.sample_name.clone()),
+            Some(existing) if existing != &summary.sample_name => {
+                return Err(AlignmentInputError::MultipleSampleNames {
+                    path_a: reference_input_path
+                        .clone()
+                        .expect("reference_input_path set when canonical_sample is Some"),
+                    sm_a: existing.clone(),
+                    path_b: path.clone(),
+                    sm_b: summary.sample_name.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+
+        headers.push(Arc::new(sam_header));
+        indexes.push(load_alignment_index(path)?);
+    }
+
+    Ok(PileupInputs {
+        sample_name: canonical_sample.expect("at least one input validated above"),
+        contigs: canonical_contigs.expect("at least one input validated above"),
+        headers,
+        indexes,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -4044,6 +4184,76 @@ mod tests {
             }),
         );
         assert!(positions.is_empty());
+    }
+
+    // --- Group C3: load_pileup_inputs (metadata + handles) ------------
+
+    /// `load_pileup_inputs` with `build_if_missing = true` builds the
+    /// missing `.crai` in place and returns the validated metadata plus
+    /// one header + index handle per input.
+    #[test]
+    fn load_pileup_inputs_builds_missing_index_and_returns_metadata() {
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &overrides, &records).expect("build_cram");
+
+        let inputs = load_pileup_inputs(
+            std::slice::from_ref(&input_path),
+            &fasta_path,
+            /* build = */ true,
+        )
+        .expect("load_pileup_inputs");
+
+        assert_eq!(inputs.sample_name, "s1");
+        assert_eq!(inputs.contigs.entries.len(), 1);
+        assert_eq!(inputs.contigs.entries[0].name, "chr1");
+        assert_eq!(inputs.headers.len(), 1);
+        assert_eq!(inputs.indexes.len(), 1);
+
+        // The `.crai` was created next to the input.
+        let crai = {
+            let mut s = input_path.clone().into_os_string();
+            s.push(".crai");
+            PathBuf::from(s)
+        };
+        assert!(
+            crai.exists(),
+            "build_if_missing should have written the .crai"
+        );
+    }
+
+    /// With `build_if_missing = false`, a missing index hard-errors via
+    /// the pre-flight pass (bridged into `AlignmentInputError`).
+    #[test]
+    fn load_pileup_inputs_errors_when_index_missing_and_build_disabled() {
+        use crate::bam::errors::AlignmentIndexError;
+
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            ..Default::default()
+        };
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &overrides, &records).expect("build_cram");
+
+        let err = load_pileup_inputs(
+            std::slice::from_ref(&input_path),
+            &fasta_path,
+            /* build = */ false,
+        )
+        .expect_err("missing index must error when build is disabled");
+        assert!(matches!(
+            err,
+            AlignmentInputError::AlignmentIndex(AlignmentIndexError::MissingAlignmentIndex { .. })
+        ));
     }
 
     // --- Group D: 2-CRAM-with-records diagnostics ---------------------

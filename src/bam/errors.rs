@@ -192,6 +192,13 @@ pub enum AlignmentInputError {
         file_format: &'static str,
         index_format: &'static str,
     },
+
+    /// Index pre-flight or per-input index load failed (missing index
+    /// with no build opt-in, a failed build, etc.). Carries the typed
+    /// [`AlignmentIndexError`] so the CLI layer can name the
+    /// responsible flag.
+    #[error("alignment index: {0}")]
+    AlignmentIndex(#[from] AlignmentIndexError),
 }
 
 /// Errors raised by [`crate::bam::index_preflight::preflight_alignment_indexes`].
