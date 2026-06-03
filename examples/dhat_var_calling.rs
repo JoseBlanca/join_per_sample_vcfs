@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let var_calling_args = VarCallingArgs {
         reference: args.reference,
         output: args.output.clone(),
+        regions: None,
         threads: args.threads,
         contamination_estimates: None,
         no_complexity_filter: args.no_complexity_filter,

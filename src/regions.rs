@@ -152,6 +152,15 @@ impl RegionSet {
         &self.regions
     }
 
+    /// The spans on `chrom_id`, in ascending `start` order (empty if
+    /// none). A sub-slice of [`regions`](Self::regions), found by binary
+    /// search since the backing vector is sorted by `(chrom_id, start)`.
+    pub fn regions_for(&self, chrom_id: u32) -> &[Region] {
+        let start = self.regions.partition_point(|r| r.chrom_id < chrom_id);
+        let end = self.regions.partition_point(|r| r.chrom_id <= chrom_id);
+        &self.regions[start..end]
+    }
+
     /// Iterate the spans in genomic order.
     pub fn iter(&self) -> std::slice::Iter<'_, Region> {
         self.regions.iter()
@@ -634,6 +643,18 @@ mod tests {
             err,
             BedError::UnknownContig { line_number: 3, .. }
         ));
+    }
+
+    #[test]
+    fn regions_for_returns_the_per_contig_slice() {
+        let set = parse("chr1\t0\t10\nchr1\t20\t30\nchr2\t0\t50\n").unwrap();
+        let chr1 = set.regions_for(0);
+        assert_eq!(chr1.len(), 2);
+        assert!(chr1.iter().all(|r| r.chrom_id == 0));
+        assert_eq!(set.regions_for(1).len(), 1);
+        assert_eq!(set.regions_for(1)[0].chrom_id, 1);
+        // A contig with no spans yields an empty slice.
+        assert!(set.regions_for(2).is_empty());
     }
 
     #[test]

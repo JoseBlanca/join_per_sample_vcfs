@@ -11,7 +11,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{WRONG_MD5, build_cram, build_fasta, fixture_md5, read_record};
+use common::{CONTIG_NAME, WRONG_MD5, build_cram, build_fasta, fixture_md5, read_record};
 use noodles_sam::alignment::record_buf::RecordBuf;
 use pop_var_caller::bam::alignment_input::{
     DEFAULT_MAX_READ_MISMATCH_FRACTION, DEFAULT_MIN_MAPQ, DEFAULT_MISMATCH_BQ_FLOOR,
@@ -100,6 +100,7 @@ fn var_calling_args(
     VarCallingArgs {
         reference,
         output,
+        regions: None,
         threads: None,
         contamination_estimates,
         no_complexity_filter: true, // tiny ref; sdust would mask everything
@@ -230,6 +231,104 @@ fn var_calling_happy_path_three_samples() {
         body.contains("\tNA00001\tNA00002\tNA00003"),
         "sample columns missing"
     );
+}
+
+/// Variant POS values (column 2) of every non-header VCF record.
+fn vcf_positions(path: &Path) -> Vec<u32> {
+    let body = fs::read_to_string(path).expect("read VCF");
+    body.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let mut cols = l.split('\t');
+            cols.next(); // CHROM
+            cols.next()
+                .expect("POS column")
+                .parse::<u32>()
+                .expect("POS is an integer")
+        })
+        .collect()
+}
+
+/// Build a `.psp` with the per-read mismatch-fraction filter disabled,
+/// so SNP-bearing synthetic reads (1 mismatch in 5 bp = 0.2, above the
+/// 0.10 default) survive into the pileup and produce variant evidence.
+fn make_psp_keep_snps(dir: &Path, fasta_path: &Path, sample: &str, reads: &[RecordBuf]) -> PathBuf {
+    let cram = build_cram(dir, fasta_path, sample, Some(fixture_md5()), reads);
+    let psp = dir.join(format!("{sample}.psp"));
+    let mut args = pileup_args(fasta_path.to_path_buf(), psp.clone(), vec![cram]);
+    args.stage1.max_read_mismatch_fraction = 0.0; // 0.0 = disable the filter
+    run_pileup(&args).expect("pileup OK");
+    psp
+}
+
+/// `--regions` restricts variant calling to the BED's spans: the
+/// region run's emitted positions are exactly the whole-genome run's
+/// positions clamped to the region. The cohort carries strong SNPs at
+/// two separated positions (11 and 30); a BED selecting only the first
+/// must drop the second.
+#[test]
+fn var_calling_regions_bed_restricts_emitted_positions() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    // Every sample is homozygous-alt (C) at pos 11 and pos 30, with
+    // depth 4 at each — a strong cohort signal that survives the
+    // downstream filters (relaxed below).
+    let snp_reads = || {
+        let mut v = Vec::new();
+        for i in 0..4 {
+            v.push(read_record(&format!("p11_{i}"), 11, b"CAAAA")); // C at pos 11
+        }
+        for i in 0..4 {
+            v.push(read_record(&format!("p30_{i}"), 30, b"CAAAA")); // C at pos 30
+        }
+        v
+    };
+    let psps = vec![
+        make_psp_keep_snps(dir.path(), &fasta, "NA00001", &snp_reads()),
+        make_psp_keep_snps(dir.path(), &fasta, "NA00002", &snp_reads()),
+        make_psp_keep_snps(dir.path(), &fasta, "NA00003", &snp_reads()),
+    ];
+
+    // Relax the downstream filters so the homozygous-alt sites emit.
+    let relaxed = |fasta: PathBuf, out: PathBuf, psps: Vec<PathBuf>| {
+        let mut args = var_calling_args(fasta, out, psps, None);
+        args.cohort.min_alt_obs_per_sample = 1;
+        args.cohort.min_qual_phred = 0.0;
+        args.cohort.no_mapq_diff_filter = true;
+        args
+    };
+
+    // Whole-genome baseline.
+    let vcf_all = dir.path().join("all.vcf");
+    run_var_calling(&relaxed(fasta.clone(), vcf_all.clone(), psps.clone())).expect("whole-genome");
+    let all_positions = vcf_positions(&vcf_all);
+    assert!(
+        all_positions.contains(&11) && all_positions.contains(&30),
+        "fixture must emit variants at both 11 and 30 (got {all_positions:?})"
+    );
+
+    // BED selecting 1-based [11, 13] (0-based half-open [10, 13)).
+    let bed = dir.path().join("regions.bed");
+    std::fs::write(&bed, format!("{CONTIG_NAME}\t10\t13\n")).expect("write bed");
+    let vcf_region = dir.path().join("region.vcf");
+    let mut args = relaxed(fasta, vcf_region.clone(), psps);
+    args.regions = Some(bed);
+    run_var_calling(&args).expect("region run");
+
+    let region_positions = vcf_positions(&vcf_region);
+    // Every emitted position is inside the region...
+    assert!(
+        region_positions.iter().all(|&p| (11..=13).contains(&p)),
+        "region run emitted an out-of-region position: {region_positions:?}"
+    );
+    // ...and the region output is exactly the whole-genome output clamped.
+    let expected: Vec<u32> = all_positions
+        .iter()
+        .copied()
+        .filter(|p| (11..=13).contains(p))
+        .collect();
+    assert_eq!(region_positions, expected);
 }
 
 /// **Determinism under the per-chromosome parallel path.** Run the

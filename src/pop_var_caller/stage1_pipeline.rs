@@ -1,19 +1,19 @@
-//! Stage 1 pipeline helper — shared core of `run_pileup` and (when
-//! Task 8 lands) `run_var_calling_from_bam`.
+//! Stage 1 pipeline helper — the BAQ → walker chain `run_pileup`
+//! drives once per analysis region.
 //!
-//! Builds the CRAM → BAQ → walker borrow chain on its own stack and
-//! hands the walker into a caller-supplied closure. The chain is
-//! self-referential by Rust's standards (BaqStream borrows from the
-//! reader, the error-shedding adapter borrows from BaqStream, the
-//! walker borrows from the adapter), so the only way to expose it
-//! externally is via the callback pattern: the helper owns every
-//! layer for the duration of the closure, then snapshots counters
-//! after the closure returns and the borrow chain unwinds.
+//! Builds the BAQ → walker borrow chain over an already-opened reader
+//! on its own stack and hands the walker into a caller-supplied
+//! closure. The chain is self-referential by Rust's standards
+//! (BaqStream borrows from the reader, the error-shedding adapter
+//! borrows from BaqStream, the walker borrows from the adapter), so
+//! the only way to expose it externally is via the callback pattern:
+//! the helper owns every layer for the duration of the closure, then
+//! snapshots counters after the closure returns and the borrow chain
+//! unwinds.
 //!
-//! No temp `.psp` is ever written — the var-calling-from-bam path
-//! consumes the walker's record stream directly. (Rationale: the
-//! project's "no silent intermediates" principle — if a subcommand
-//! exists to skip an artefact, don't fall back to a hidden one.)
+//! `run_pileup` opens one `AlignmentMergedReader::query` reader per
+//! region and calls [`with_stage1_chain`] once per region, writing the
+//! in-region columns to one shared PSP writer inside the closure.
 
 use std::path::Path;
 
@@ -37,7 +37,7 @@ use super::cli::error_bridge::ErrorSheddingAdapter;
 pub type Stage1Walker<'a> =
     PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a MultiChromStreamingRefFetcher>;
 
-/// Context handed to the [`with_stage1_pipeline`] callback. Contains
+/// Context handed to the [`with_stage1_chain`] callback. Contains
 /// the walker (by value — the closure may consume or drive it via
 /// `by_ref`) plus borrowed metadata the caller typically needs for
 /// header building.
@@ -48,7 +48,7 @@ pub struct Stage1PipelineContext<'a> {
 }
 
 /// Counter snapshots collected after the closure returns. The fields
-/// are owned values — safe to use past `with_stage1_pipeline`'s
+/// are owned values — safe to use past `with_stage1_chain`'s
 /// return.
 pub struct Stage1RunSummary {
     pub filter_counts: FilterCounts,
@@ -56,7 +56,7 @@ pub struct Stage1RunSummary {
     pub baq_skip_counts: Option<BaqSkipCounts>,
 }
 
-/// Bundle returned by [`with_stage1_pipeline`]. Carries the closure's
+/// Bundle returned by [`with_stage1_chain`]. Carries the closure's
 /// result `R`, the metadata the caller needs (sample name, contigs),
 /// the counter snapshot, and any upstream error stashed by the
 /// error-shedding adapter while the walker was running.
@@ -216,7 +216,7 @@ where
     })
 }
 
-/// Surface-order rule used by [`with_stage1_pipeline`]: if both the
+/// Surface-order rule used by [`with_stage1_chain`]: if both the
 /// closure failed *and* an upstream CRAM-input error was stashed by
 /// the `ErrorSheddingAdapter`, prefer the upstream error — it is the
 /// root cause. On Ok the stash is handed back to the caller for
