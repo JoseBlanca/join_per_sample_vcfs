@@ -21,6 +21,7 @@ benchmarks/tomato1/crams/
 benchmarks/tomato1/results/
 benchmarks/human_genome_bottle/crams/
 benchmarks/human_genome_bottle/results/
+benchmarks/human_genome_bottle/results_nobaq/
 # marimo per-notebook session cache (machine-specific, auto-generated)
 __marimo__/
 # macOS Finder metadata
