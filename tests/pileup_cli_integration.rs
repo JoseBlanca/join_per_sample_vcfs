@@ -34,7 +34,7 @@ use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
 use pop_var_caller::psp::PspReader;
 use pop_var_caller::psp::header::ParameterValue;
 use pop_var_caller::psp::writer::{
-    MAX_BLOCK_TARGET_BYTES, MIN_BLOCK_TARGET_BYTES, TARGET_BLOCK_BYTES,
+    DEFAULT_BLOCK_WINDOW_BP, MAX_BLOCK_TARGET_BYTES, MIN_BLOCK_TARGET_BYTES, TARGET_BLOCK_BYTES,
 };
 use tempfile::TempDir;
 
@@ -49,6 +49,7 @@ fn default_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBu
         threads: None,
         alignment_files,
         block_target_bytes: TARGET_BLOCK_BYTES,
+        block_window_bp: DEFAULT_BLOCK_WINDOW_BP,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: false,
