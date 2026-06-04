@@ -283,6 +283,16 @@ pub enum VarCallingCliError {
 ///     `effective_threads` + the `requested … capped by N chromosomes`
 ///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
+    // TEMP (P6 measurement, re-architecture): route to the new pipeline when
+    // `PVC_NEW_PIPELINE` is set, so the same CLI invocation A/B-tests both paths
+    // for byte-identity + RSS/wall. Removed at the P7 swap (which repoints the
+    // CLI to the new entry directly). Off by default → no behaviour change.
+    if std::env::var_os("PVC_NEW_PIPELINE").is_some() {
+        crate::var_calling_new::pipeline::run_var_calling(args)
+            .unwrap_or_else(|e| panic!("new pipeline failed: {e}"));
+        return Ok(());
+    }
+
     let cohort = &args.cohort;
 
     // 1. Rayon pool — idempotent under the silent-no-op policy
