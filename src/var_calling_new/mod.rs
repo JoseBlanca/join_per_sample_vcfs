@@ -57,3 +57,6 @@ pub mod pipeline;
 pub mod sample_reader;
 pub mod types;
 pub mod vcf_writer;
+
+#[cfg(test)]
+mod test_helpers;

@@ -998,8 +998,8 @@ mod tests {
     use crate::psp::PspReader;
     use crate::psp::test_fixtures::writer_header;
     use crate::psp::writer::PspWriter;
-    use crate::var_calling::test_helpers::{allele, record};
     use crate::var_calling_new::sample_reader::SamplePspReader;
+    use crate::var_calling_new::test_helpers::{allele, record};
     use crate::var_calling_new::types::CohortPileupRecord;
     use std::io::Cursor;
 

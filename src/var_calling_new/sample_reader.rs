@@ -588,7 +588,7 @@ mod tests {
     use crate::pileup_record::PileupRecord;
     use crate::psp::test_fixtures::writer_header;
     use crate::psp::writer::PspWriter;
-    use crate::var_calling::test_helpers::{allele, record};
+    use crate::var_calling_new::test_helpers::{allele, record};
 
     /// Multi-allele records at ascending positions, dense enough that a
     /// small block target yields several segments.

@@ -186,9 +186,9 @@ mod tests {
     use super::*;
     use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
     use crate::pileup_record::{AlleleObservation, PileupRecord};
-    use crate::var_calling::test_helpers::allele;
     use crate::var_calling_new::per_group_merger::{PerGroupMerger, SharedRefFetcher};
     use crate::var_calling_new::pileup_overlaps::overlapping_groups;
+    use crate::var_calling_new::test_helpers::allele;
     use crate::var_calling_new::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
     use std::sync::Arc;
 
