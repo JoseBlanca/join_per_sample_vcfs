@@ -58,22 +58,12 @@ pub mod sample_reader;
 pub mod types;
 pub mod vcf_writer;
 
-// --- Legacy columnar psp-cohort reader, retained for the
-//     `estimate-contamination` subcommand (its `contamination_chunked_stream`
-//     reads cohorts via this loader). Self-contained (`columns` has no
-//     `var_calling` deps; `loader` depends only on `columns`); the var-calling
-//     path uses the rebuilt `sample_reader` instead. ---
-pub mod columns;
-pub mod loader;
-
 /// Default `--min-qual` (phred) emission gate (CLI default).
 pub const DEFAULT_MIN_QUAL_PHRED: f64 = 30.0;
 /// Default `--min-alt-obs-per-sample` (CLI default).
 pub const DEFAULT_MIN_ALT_OBS_PER_SAMPLE: u32 = 2;
 /// Default `--min-mapq-diff-t` Welch's-t threshold (CLI default).
 pub const DEFAULT_MIN_MAPQ_DIFF_T: f32 = -3.0;
-/// Default per-chunk genomic span used by `estimate-contamination`'s loader.
-pub const DEFAULT_CHUNK_GENOMIC_SPAN: u32 = 100_000;
 
 #[cfg(test)]
 mod test_helpers;

@@ -37,7 +37,7 @@ use crate::psp::ScalarDecodeError;
 use crate::psp::{BlockColumnReader, BlockColumns, BlockIndexEntry, PspReadError, PspReader};
 
 // ---------------------------------------------------------------------------
-// Heavy per-allele column carriers (copied from `var_calling::columns`).
+// Heavy per-allele column carriers (copied from the old columnar reader).
 //
 // These are the byte-identity-sensitive destination shapes the appendix §A
 // take-getters return. `var_calling::columns` was deliberately not
