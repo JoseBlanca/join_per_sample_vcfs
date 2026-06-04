@@ -69,3 +69,31 @@ is that a few records within ~1 phred of `--min-qual` may appear/disappear vs
 (b) pursue bit-exact QUAL parity with the columnar EM (not required by §6, and
 would mean reviving the columnar EM input path we deliberately dropped). **(a)
 is recommended** — it is within the letter and spirit of the §6 contract.
+(User decision: accepted.)
+
+## Addendum — parallel topology (crossbeam), N=50 whole genome
+
+After P6, the bounded-crossbeam producer→caller→writer topology was added
+(producer on the main thread; W caller threads share `&VariantCaller`; writer
+thread reorders by `chunk_order`). Re-measured at production thread counts
+(`--min-qual 0` to compare calls):
+
+| T | old wall | new wall | old RSS | new RSS | calls identical |
+|---|----------|----------|---------|---------|-----------------|
+| 4 | 11.4 s   | 27.2 s   | 2982 MB | 2099 MB | ✅ 204 118       |
+| 8 | 7.8 s    | 27.3 s   | 2998 MB | 2184 MB | ✅ 204 118       |
+
+- **Byte-identity holds under parallelism** (the writer's `chunk_order` reorder
+  makes the output independent of worker completion order).
+- **Memory now beats `main`** — ~2.1 GB vs ~3.0 GB (≈ −30 %). `main`'s peak grows
+  with threads (peak ∝ in-flight blocks ∝ W); the new pipeline's is bounded by
+  the queue cap + the single producer.
+- **Wall does NOT scale with threads** — flat ~27 s at T=4 and T=8, ~3.5× slower
+  than `main` at T=8. **The producer is the serial bottleneck**, not the callers
+  (parallelizing the callers left wall unchanged). In `main` the producer's
+  per-sample decode is rayon-parallel across samples and the *workers* are the
+  bottleneck; here the producer is fully serial — serial per-sample segment
+  decode + the record-building allocation churn the design (§2.2) flagged as
+  "the cost to watch". Closing the gap needs **intra-producer parallelism**
+  (rayon across samples for the per-sample read/decode), which is the next perf
+  decision.

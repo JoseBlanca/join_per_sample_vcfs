@@ -37,6 +37,7 @@ use crate::var_calling_new::per_position_merger::{
 };
 use crate::var_calling_new::posterior_engine::PosteriorEngineConfig;
 use crate::var_calling_new::sample_reader::SamplePspReader;
+use crate::var_calling_new::types::{CalledChunk, PileupCohortChunk};
 use crate::var_calling_new::variant_grouping::GrouperConfig;
 use crate::var_calling_new::vcf_writer::{DownstreamFilters, VcfWriter, WriterError};
 use crate::vcf::{CohortMetadata, WriterConfig};
@@ -167,50 +168,119 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
     let mut producer =
         CohortChunkIntegrator::new(readers, sample_names, min_alt_obs, target_variants);
 
-    // --- Per-chromosome REF + dust fetchers (built on demand, monotonic). ---
-    let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
-    let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
+    // --- Parallel topology: producer (this thread) → W callers → writer. ---
+    //
+    // Two bounded crossbeam hand-offs give back-pressure (peak ≈ queue cap).
+    // The producer stays on the main thread (its per-sample readers + REF/dust
+    // fetchers are thread-local); the callers share `&caller` (it is `Sync` —
+    // stateless `call_chunk`), and the writer owns the (`Send`) `CohortVcfWriter`
+    // and reorders the out-of-order `CalledChunk`s by `chunk_order`, so the
+    // emitted VCF is byte-identical regardless of worker count.
+    let n_workers = args
+        .threads
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .max(1);
+    let cap = (2 * n_workers).max(1);
+    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<PileupCohortChunk>(cap);
+    let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
+    let caller = &caller;
 
-    // --- Drive: chromosome → covered interval → chunk → call → write. ---
-    for chrom_id in 0..n_chromosomes {
-        let intervals = producer.covered_intervals(chrom_id, max_group_span);
-        for interval in intervals {
-            let mask = dust_mask_for(
-                &mut dust_fetcher,
-                chrom_id,
-                &interval,
-                &args.reference,
-                &chrom_names,
-                &chrom_lengths,
-                args.no_complexity_filter,
-                cohort.complexity_window,
-                cohort.complexity_threshold,
-            )?;
-            producer.begin_interval(chrom_id, interval, mask);
-
-            loop {
-                let chunk = {
-                    let mut fetch = |start: u32, len: u32| -> Result<Vec<u8>, String> {
-                        ref_fetch(
-                            &mut ref_fetcher,
-                            chrom_id,
-                            &args.reference,
-                            &chrom_names,
-                            start,
-                            len,
-                        )
-                    };
-                    producer.produce_chunk(&mut fetch)?
-                };
-                let Some(chunk) = chunk else { break };
-                let called = caller.call_chunk(chunk)?;
+    std::thread::scope(|scope| -> Result<(), PipelineError> {
+        // Writer thread: drain CalledChunks (reorder + filter + write).
+        let writer_handle = scope.spawn(move || -> Result<(), PipelineError> {
+            for called in called_rx {
                 writer.handle(called)?;
             }
-        }
-    }
+            writer.finish()?;
+            Ok(())
+        });
 
-    writer.finish()?;
-    Ok(())
+        // Caller threads: pop chunks, call, push results.
+        let mut caller_handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let chunk_rx = chunk_rx.clone();
+            let called_tx = called_tx.clone();
+            caller_handles.push(scope.spawn(move || -> Result<(), PipelineError> {
+                for chunk in chunk_rx {
+                    let called = caller.call_chunk(chunk)?;
+                    if called_tx.send(called).is_err() {
+                        break; // writer gone (it errored) — stop
+                    }
+                }
+                Ok(())
+            }));
+        }
+        // Main holds no extra channel handles, so the channels close once the
+        // producer / callers finish.
+        drop(chunk_rx);
+        drop(called_tx);
+
+        // Producer on the main thread.
+        let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
+        let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
+        let produce = (|| -> Result<(), PipelineError> {
+            for chrom_id in 0..n_chromosomes {
+                let intervals = producer.covered_intervals(chrom_id, max_group_span);
+                for interval in intervals {
+                    let mask = dust_mask_for(
+                        &mut dust_fetcher,
+                        chrom_id,
+                        &interval,
+                        &args.reference,
+                        &chrom_names,
+                        &chrom_lengths,
+                        args.no_complexity_filter,
+                        cohort.complexity_window,
+                        cohort.complexity_threshold,
+                    )?;
+                    producer.begin_interval(chrom_id, interval, mask);
+                    loop {
+                        let chunk = {
+                            let mut fetch = |start: u32, len: u32| -> Result<Vec<u8>, String> {
+                                ref_fetch(
+                                    &mut ref_fetcher,
+                                    chrom_id,
+                                    &args.reference,
+                                    &chrom_names,
+                                    start,
+                                    len,
+                                )
+                            };
+                            producer.produce_chunk(&mut fetch)?
+                        };
+                        let Some(chunk) = chunk else { break };
+                        if chunk_tx.send(chunk).is_err() {
+                            // All callers gone (errored); stop. The real error
+                            // surfaces from a caller's join below.
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        // Signal the callers there are no more chunks.
+        drop(chunk_tx);
+
+        // First error wins across producer, callers, and writer.
+        let mut first_err = produce.err();
+        for handle in caller_handles {
+            if let Err(e) = handle.join().expect("caller thread panicked") {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Err(e) = writer_handle.join().expect("writer thread panicked") {
+            first_err.get_or_insert(e);
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
 }
 
 /// Fetch REF bytes for `chrom_id`, building a fresh per-contig
