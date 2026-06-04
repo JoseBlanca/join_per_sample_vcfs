@@ -415,6 +415,35 @@ fn ok_record(r: PileupRecord) -> Result<PileupRecord, PspReadError> {
     Ok(r)
 }
 
+/// Merge per-block `(first_pos, last_pos)` ranges (across all samples, any
+/// order) into the chromosome's **covered intervals** `[start, end)`: two
+/// blocks join unless the gap between them exceeds `max_group_span`, so every
+/// interval boundary is a safe gap no variant group can span — the producer
+/// processes each interval independently. Copied from `driver::merge_block_ranges`.
+fn merge_block_ranges(
+    ranges: impl IntoIterator<Item = (u32, u32)>,
+    max_group_span: u32,
+) -> Vec<Range<u32>> {
+    let mut v: Vec<(u32, u32)> = ranges.into_iter().collect();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    v.sort_unstable();
+    let mut out: Vec<Range<u32>> = Vec::new();
+    let (mut cur_start, mut cur_last) = v[0];
+    for &(s, last) in &v[1..] {
+        if s <= cur_last.saturating_add(max_group_span) {
+            cur_last = cur_last.max(last);
+        } else {
+            out.push(cur_start..cur_last.saturating_add(1));
+            cur_start = s;
+            cur_last = last;
+        }
+    }
+    out.push(cur_start..cur_last.saturating_add(1));
+    out
+}
+
 type KeptRecordIter = std::iter::Map<
     std::vec::IntoIter<PileupRecord>,
     fn(PileupRecord) -> Result<PileupRecord, PspReadError>,
@@ -492,6 +521,61 @@ impl<R: Read + Seek> CohortChunkIntegrator<R> {
             fold: CohortSpanFold::new(),
             is_kept: Vec::new(),
         }
+    }
+
+    /// The chromosome's covered intervals — every sample's blocks for
+    /// `chrom_id`, unioned and gap-merged at `max_group_span` (no file I/O,
+    /// reads only the in-memory block indexes).
+    pub fn covered_intervals(&self, chrom_id: u32, max_group_span: u32) -> Vec<Range<u32>> {
+        let ranges = self.readers.iter().flat_map(|r| {
+            r.block_index()
+                .iter()
+                .filter(move |b| b.chrom_id == chrom_id)
+                .map(|b| (b.first_pos, b.last_pos))
+        });
+        merge_block_ranges(ranges, max_group_span)
+    }
+
+    /// Drive the whole cohort: walk `0..n_chromosomes`, and within each its
+    /// covered intervals, emitting every [`PileupCohortChunk`] (in genomic
+    /// order, `chunk_order` monotonic across the whole run). The REF bytes and
+    /// dust mask are **injected** — the chromosome→FASTA fetcher and the sdust
+    /// computation are the caller's (built FASTA-backed at the pipeline wiring;
+    /// dummy in tests), keeping this loop pure orchestration.
+    ///
+    /// - `ref_fetch(chrom_id, start_1based, len)` → the REF bases for a chunk's
+    ///   span (monotonic-forward within a chromosome);
+    /// - `dust_for(chrom_id, &interval)` → that interval's sorted, half-open
+    ///   low-complexity mask (empty when complexity filtering is off);
+    /// - `emit(chunk)` receives each produced chunk.
+    pub fn run<RefF, DustF, Emit>(
+        &mut self,
+        n_chromosomes: u32,
+        max_group_span: u32,
+        mut ref_fetch: RefF,
+        mut dust_for: DustF,
+        mut emit: Emit,
+    ) -> Result<(), ProducerError>
+    where
+        RefF: FnMut(u32, u32, u32) -> Result<Vec<u8>, String>,
+        DustF: FnMut(u32, &Range<u32>) -> Vec<Range<u32>>,
+        Emit: FnMut(PileupCohortChunk),
+    {
+        for chrom_id in 0..n_chromosomes {
+            let intervals = self.covered_intervals(chrom_id, max_group_span);
+            for interval in intervals {
+                let mask = dust_for(chrom_id, &interval);
+                self.begin_interval(chrom_id, interval, mask);
+                loop {
+                    let mut rf = |s: u32, l: u32| ref_fetch(chrom_id, s, l);
+                    match self.produce_chunk(&mut rf)? {
+                        Some(chunk) => emit(chunk),
+                        None => break,
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Point every reader at `[interval.start, interval.end)` of `chrom_id`
@@ -1085,5 +1169,176 @@ mod tests {
             .collect();
         let got = streaming(&flat, &[128, 128], 1, 4, Vec::new());
         assert!(got.is_empty(), "no variants ⇒ no chunks");
+    }
+
+    #[test]
+    fn merge_block_ranges_gap_merges_and_splits() {
+        // Unsorted input; gap ≤ 10 merges, gap > 10 splits.
+        let got = merge_block_ranges(vec![(200, 210), (10, 20), (25, 30)], 10);
+        // 25 ≤ 20+10 → merge into [10,30]; 200 > 30+10 → new interval.
+        assert_eq!(got, vec![10..31, 200..211]);
+        assert!(merge_block_ranges(Vec::<(u32, u32)>::new(), 10).is_empty());
+    }
+
+    // --- 2b-wiring: the multi-chromosome / multi-interval run loop ---
+
+    const MGS: u32 = 50; // max_group_span (≪ the inter-cluster gap, ≥ ref spans)
+
+    /// Records for one `(chrom_id, sample)` at the given positions, same
+    /// variant/coverage pattern as [`gen_sample`].
+    fn gen_records(
+        chrom_id: u32,
+        s: u32,
+        positions: impl Iterator<Item = u32>,
+    ) -> Vec<PileupRecord> {
+        positions
+            .enumerate()
+            .filter_map(|(k, pos)| {
+                let i = k as u32;
+                if (i + s).is_multiple_of(4) {
+                    return None;
+                }
+                let ref_seq: &[u8] = if i.is_multiple_of(9) { b"AC" } else { b"A" };
+                let mut alleles = vec![allele(ref_seq, 5, -1.0, &[])];
+                if (i * 7 + s * 3).is_multiple_of(5) {
+                    alleles.push(allele(b"T", 2, -1.5, &[u64::from(i) + 1]));
+                }
+                Some(PileupRecord::new(chrom_id, pos, alleles))
+            })
+            .collect()
+    }
+
+    /// One sample across 2 chromosomes; chrom 0 has two clusters separated by
+    /// a > MGS gap (⇒ two covered intervals), chrom 1 has one.
+    fn multichrom_sample(s: u32) -> Vec<PileupRecord> {
+        let mut recs = Vec::new();
+        recs.extend(gen_records(0, s, (0..80).map(|i| 10 + i * 5))); // chrom0 cluster1
+        recs.extend(gen_records(0, s, (0..80).map(|i| 1000 + i * 5))); // chrom0 cluster2 (gap ~600)
+        recs.extend(gen_records(1, s, (0..80).map(|i| 10 + i * 5))); // chrom1
+        recs
+    }
+
+    fn psp_bytes_2chrom(records: &[PileupRecord], block_target: usize) -> Vec<u8> {
+        // Small window grid so blocks cut on a fixed genomic grid (the
+        // cross-sample segment alignment); the inter-cluster gap then lands on
+        // a block boundary and splits the chromosome into two covered intervals.
+        let mut w = PspWriter::new_with_block_layout(
+            Cursor::new(Vec::new()),
+            writer_header(2),
+            block_target,
+            128,
+        )
+        .expect("writer opens");
+        for r in records {
+            w.write_record(r).expect("write_record");
+        }
+        w.finish().expect("finish").into_inner()
+    }
+
+    /// One-shot reference over both chromosomes: fold + assemble per chrom,
+    /// concatenated in chrom order (interval boundaries are safe gaps, so a
+    /// whole-chrom fold equals the per-interval runs).
+    fn reference_2chrom(
+        samples: &[Vec<PileupRecord>],
+        min_alt_obs: u32,
+    ) -> Vec<CohortPileupRecord> {
+        let mut out = Vec::new();
+        for chrom_id in 0..2u32 {
+            let per_chrom: Vec<Vec<PileupRecord>> = samples
+                .iter()
+                .map(|recs| {
+                    recs.iter()
+                        .filter(|r| r.chrom_id == chrom_id)
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+            out.extend(reference(&per_chrom, min_alt_obs, &[]));
+        }
+        out
+    }
+
+    fn run_cohort(
+        samples: &[Vec<PileupRecord>],
+        block_targets: &[usize],
+        min_alt_obs: u32,
+        target_variants: u32,
+    ) -> Vec<CohortPileupRecord> {
+        let readers: Vec<_> = samples
+            .iter()
+            .zip(block_targets)
+            .map(|(recs, &bt)| {
+                let bytes = psp_bytes_2chrom(recs, bt);
+                SamplePspReader::new(PspReader::new(Cursor::new(bytes)).unwrap(), 0, 1, 1)
+            })
+            .collect();
+        let mut integ =
+            CohortChunkIntegrator::new(readers, names(samples.len()), min_alt_obs, target_variants);
+
+        let mut out: Vec<CohortPileupRecord> = Vec::new();
+        let mut expected_order = 0u64;
+        integ
+            .run(
+                2,
+                MGS,
+                |_chrom, _start, len| Ok(vec![b'N'; len as usize]),
+                |_chrom, _interval| Vec::new(),
+                |chunk| {
+                    assert_eq!(
+                        chunk.chunk_order, expected_order,
+                        "chunk_order gapless across run"
+                    );
+                    expected_order += 1;
+                    out.extend(chunk.records);
+                },
+            )
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn run_walks_chromosomes_and_intervals() {
+        let samples = vec![
+            multichrom_sample(0),
+            multichrom_sample(1),
+            multichrom_sample(2),
+        ];
+        let bts = vec![200usize, 350, 512];
+
+        // Two covered intervals on chrom 0 (the gap splits it), one on chrom 1.
+        {
+            let readers: Vec<_> = samples
+                .iter()
+                .zip(&bts)
+                .map(|(recs, &bt)| {
+                    let bytes = psp_bytes_2chrom(recs, bt);
+                    SamplePspReader::new(PspReader::new(Cursor::new(bytes)).unwrap(), 0, 1, 1)
+                })
+                .collect();
+            let integ = CohortChunkIntegrator::new(readers, names(3), 1, 4);
+            assert_eq!(
+                integ.covered_intervals(0, MGS).len(),
+                2,
+                "chrom0 splits at the gap"
+            );
+            assert_eq!(integ.covered_intervals(1, MGS).len(), 1);
+        }
+
+        for &min_alt_obs in &[1u32, 2] {
+            let want = reference_2chrom(&samples, min_alt_obs);
+            assert!(!want.is_empty());
+            for &target in &[1u32, 7, 100_000] {
+                let got = run_cohort(&samples, &bts, min_alt_obs, target);
+                assert_eq!(got, want, "min_alt_obs={min_alt_obs} target={target}");
+            }
+        }
+
+        // Emit order: all chrom 0 before chrom 1, ascending within each chrom.
+        let got = run_cohort(&samples, &bts, 1, 7);
+        let boundary = got.iter().position(|r| r.chrom_id == 1).unwrap();
+        assert!(got[..boundary].iter().all(|r| r.chrom_id == 0));
+        assert!(got[boundary..].iter().all(|r| r.chrom_id == 1));
+        assert!(got[..boundary].windows(2).all(|w| w[0].pos < w[1].pos));
+        assert!(got[boundary..].windows(2).all(|w| w[0].pos < w[1].pos));
     }
 }
