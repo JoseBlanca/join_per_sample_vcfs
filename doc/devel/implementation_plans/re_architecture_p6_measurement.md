@@ -97,3 +97,25 @@ thread reorders by `chunk_order`). Re-measured at production thread counts
   "the cost to watch". Closing the gap needs **intra-producer parallelism**
   (rayon across samples for the per-sample read/decode), which is the next perf
   decision.
+
+## Addendum 2 — parallel per-sample decode (`read_samples`)
+
+Parallelized the producer's per-sample segment decode across a rayon worker set
+(`CohortChunkIntegrator::read_samples`); the cohort fold stays the serial
+barrier (`--threads`-sized pool; `--min-qual 0`; byte-identical at every T):
+
+| T | old wall | new wall | old RSS | new RSS |
+|---|----------|----------|---------|---------|
+| 1 | 37.6 s   | **30.9 s** | 2158 MB | 2034 MB |
+| 4 | 11.1 s   | 15.1 s   | 2873 MB | 2412 MB |
+| 8 | 7.9 s    | 13.8 s   | 2984 MB | 2589 MB |
+
+- **New is faster than `main` single-threaded** (30.9 vs 37.6 s) with lower RSS
+  at every T — the record-streaming path is more CPU-efficient per core.
+- Parallel decode cut new's T=8 wall ~27 s → ~13.8 s (**3.5× → 1.74× vs `main`**).
+- **New scales well to ~T=4 then plateaus** (15.1 → 13.8); `main` keeps scaling
+  to T=8 (7.9 s). The remaining cap is the **serial record-building**
+  (`records_for` + the per-position merge on the producer thread) — the EM
+  callers are already parallel and not the bottleneck. Closing the T≥4 gap would
+  need parallelizing record-building too (rayon across samples), at the cost of
+  rayon/caller oversubscription — a diminishing-returns call.
