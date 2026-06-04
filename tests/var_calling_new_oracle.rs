@@ -201,10 +201,9 @@ fn assert_oracle_byte_identical(dir: &Path, fasta: PathBuf, psps: Vec<PathBuf>) 
 
 /// Three-sample cohort with a single SNP — the smallest end-to-end oracle.
 ///
-/// `#[ignore]` until Phase 4 wires the new pipeline (the stub entry returns
-/// `NotImplemented`, so this is red by design). Remove the attribute in P4.
+/// Green from Phase 4: the new pipeline is wired end-to-end and must match the
+/// old VCF byte-for-byte (QUAL excluded).
 #[test]
-#[ignore = "re-architecture oracle: green from Phase 4 (new pipeline entry is a P0 stub)"]
 fn oracle_three_sample_cohort_byte_identical() {
     let dir = TempDir::new().expect("tempdir");
     let fasta = build_fasta(dir.path());
@@ -224,6 +223,68 @@ fn oracle_three_sample_cohort_byte_identical() {
     let reads_c = vec![
         read_record("r1", 10, b"AAAAA"),
         read_record("r2", 15, b"AAAAA"),
+    ];
+
+    let psps = vec![
+        make_psp_for_sample(dir.path(), &fasta, "NA00001", &reads_a),
+        make_psp_for_sample(dir.path(), &fasta, "NA00002", &reads_b),
+        make_psp_for_sample(dir.path(), &fasta, "NA00003", &reads_c),
+    ];
+
+    assert_oracle_byte_identical(dir.path(), fasta, psps);
+}
+
+/// A 10 bp read covering `site` (1-based), all REF (`A`) except an optional
+/// single-base substitution at `site` — the building block for SNP fixtures.
+fn cov(qname: &str, site: usize, alt: Option<u8>) -> RecordBuf {
+    let start = site - 4; // offset 4 within the read lands on `site`
+    let mut seq = vec![b'A'; 10];
+    if let Some(base) = alt {
+        seq[4] = base;
+    }
+    read_record(qname, start, &seq)
+}
+
+/// Richer three-sample cohort: four well-separated variant sites — three SNPs
+/// with different per-sample genotypes (30, 60, 90) and a **multiallelic** site
+/// (120: sample A carries `C`, sample B carries `G`). Every alt-bearing sample
+/// has ≥2 alt reads so the sites clear `min_alt_obs_per_sample = 2`. Exercises
+/// grouping, het/hom genotype assignment, the multiallelic path, AC/AF/AD, and
+/// the downstream filters end-to-end against `main`.
+#[test]
+fn oracle_multi_site_multiallelic_cohort_byte_identical() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    let reads_a = vec![
+        cov("a30_1", 30, Some(b'C')),
+        cov("a30_2", 30, Some(b'C')),
+        cov("a60_1", 60, None),
+        cov("a60_2", 60, None),
+        cov("a90_1", 90, None),
+        cov("a90_2", 90, None),
+        cov("a120_1", 120, Some(b'C')),
+        cov("a120_2", 120, Some(b'C')),
+    ];
+    let reads_b = vec![
+        cov("b30_1", 30, Some(b'C')),
+        cov("b30_2", 30, None),
+        cov("b60_1", 60, Some(b'C')),
+        cov("b60_2", 60, Some(b'C')),
+        cov("b90_1", 90, None),
+        cov("b90_2", 90, None),
+        cov("b120_1", 120, Some(b'G')),
+        cov("b120_2", 120, Some(b'G')),
+    ];
+    let reads_c = vec![
+        cov("c30_1", 30, None),
+        cov("c30_2", 30, None),
+        cov("c60_1", 60, None),
+        cov("c60_2", 60, None),
+        cov("c90_1", 90, Some(b'C')),
+        cov("c90_2", 90, Some(b'C')),
+        cov("c120_1", 120, None),
+        cov("c120_2", 120, None),
     ];
 
     let psps = vec![
