@@ -26,3 +26,6 @@ benchmarks/human_genome_bottle/results_nobaq/
 __marimo__/
 # macOS Finder metadata
 .DS_Store
+
+# Claude Code personal overrides (not for commit)
+.claude/settings.local.json

@@ -25,4 +25,8 @@ pub mod pop_var_caller;
 pub mod psp;
 pub mod regions;
 pub mod var_calling;
+/// Re-architected cohort `.psp` → VCF pipeline, built in parallel with
+/// [`var_calling`] until the one-commit swap. See
+/// `doc/devel/implementation_plans/re_architecture_execution_plan.md`.
+pub mod var_calling_new;
 pub mod vcf;
