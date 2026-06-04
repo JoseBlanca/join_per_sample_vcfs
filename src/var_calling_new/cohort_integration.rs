@@ -31,9 +31,17 @@
 //!   `positions`/`ref_spans`/`nonref_obs`) instead of a `SampleColumns`.
 //!   Plus [`drop_dust_masked`], the dust step. Byte-identity-critical, so the
 //!   arithmetic is copied verbatim from `two_pass.rs`.
-//! - **2b** (`CohortChunkIntegrator`): the streaming integrator — segment
-//!   buffering to the watermark, per-position record building via `take_*`,
-//!   REF fetch, `chunk_order` stamping, the `run` loop.
+//! - **2b** ([`CohortChunkIntegrator`]): the streaming integrator over **one
+//!   covered interval** — segment buffering to the watermark, per-position
+//!   record building (columnar→record via
+//!   [`SamplePspChunk::records_for`](crate::var_calling_new::sample_reader::SamplePspChunk::records_for),
+//!   merged by the revived [`PerPositionMerger`](crate::var_calling_new::per_position_merger::PerPositionMerger)),
+//!   safe-gap cut, REF fetch (closure-injected), `chunk_order` stamping.
+//!   The chromosome / interval iteration, per-chromosome REF fetcher, and
+//!   `DustAheadPool` wiring are the next step (2b-wiring); `produce_chunk`
+//!   takes the REF fetch as a closure and the dust mask per
+//!   [`begin_interval`](CohortChunkIntegrator::begin_interval) so the engine
+//!   stays decoupled and unit-testable.
 
 use std::ops::Range;
 
@@ -265,6 +273,34 @@ impl CohortSpanFold {
         }
     }
 
+    /// Count kept (variable) positions with `position < cut`, by the same
+    /// group/threshold rule as [`derive_is_kept`](Self::derive_is_kept).
+    /// `cut` should land on a clean group boundary (e.g. from
+    /// [`find_cut`](Self::find_cut)) so no group straddles it. Copied from
+    /// `WindowSummary::count_kept_below`. Used by the read-ahead to size a
+    /// chunk to ~`target_variants` kept positions.
+    pub fn count_kept_below(&self, cut: u32, min_alt_obs: u32) -> u32 {
+        let n = self.positions.len();
+        let threshold = u64::from(min_alt_obs.max(1));
+        let mut kept = 0u32;
+        let mut i = 0usize;
+        while i < n && self.positions[i] < cut {
+            let mut group_end = reach(self.positions[i], self.max_ref_span[i]);
+            let mut obs_sum = u64::from(self.max_nonref_obs[i]);
+            let mut j = i + 1;
+            while j < n && self.positions[j] <= group_end {
+                group_end = group_end.max(reach(self.positions[j], self.max_ref_span[j]));
+                obs_sum += u64::from(self.max_nonref_obs[j]);
+                j += 1;
+            }
+            if obs_sum >= threshold {
+                kept += (j - i) as u32;
+            }
+            i = j;
+        }
+        kept
+    }
+
     /// Partition `[interval_start, interval_end_exclusive)` into chunk
     /// boundaries: each chunk accumulates ~`target_variants` kept positions
     /// and ends at the next variant group's start (a clean boundary). Copied
@@ -343,6 +379,380 @@ pub fn drop_dust_masked(positions: &[u32], is_kept: &mut [bool], mask: &[Range<u
             // `pos` ∈ [start, end) — masked.
             is_kept[p_idx] = false;
         }
+    }
+}
+
+// ===========================================================================
+// 2b — the streaming integrator (single covered interval)
+// ===========================================================================
+
+use crate::pileup_record::PileupRecord;
+use crate::psp::PspReadError;
+use crate::var_calling_new::per_position_merger::{PerPositionMerger, PerPositionMergerError};
+use crate::var_calling_new::sample_reader::{SamplePspChunk, SamplePspReader};
+use crate::var_calling_new::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
+use std::io::{Read, Seek};
+
+/// Errors the cohort producer can surface.
+#[derive(Debug, thiserror::Error)]
+pub enum ProducerError {
+    /// A per-sample `.psp` decode failed.
+    #[error("psp decode failed: {0}")]
+    Decode(#[from] PspReadError),
+    /// The per-position cohort merge failed (pathological input only — the
+    /// in-memory kept-record streams are monotone by construction).
+    #[error("per-position merge failed: {0}")]
+    Merge(Box<PerPositionMergerError>),
+    /// The reference-fetch closure failed.
+    #[error("reference fetch failed: {0}")]
+    Ref(String),
+}
+
+/// Wrap an owned [`PileupRecord`] as the `Result` item the
+/// [`PerPositionMerger`] consumes. A named `fn` (not a closure) so every
+/// per-sample iterator has the *same* type and they collect into a `Vec<I>`.
+fn ok_record(r: PileupRecord) -> Result<PileupRecord, PspReadError> {
+    Ok(r)
+}
+
+type KeptRecordIter = std::iter::Map<
+    std::vec::IntoIter<PileupRecord>,
+    fn(PileupRecord) -> Result<PileupRecord, PspReadError>,
+>;
+
+/// Streaming cohort producer over **one covered interval** (appendix §B).
+///
+/// Owns the N [`SamplePspReader`]s. [`begin_interval`](Self::begin_interval)
+/// points them at a `[start, end)` interval (+ its dust mask);
+/// [`produce_chunk`](Self::produce_chunk) then yields one
+/// [`PileupCohortChunk`] of variable [`CohortPileupRecord`]s at a time, cut at
+/// safe gaps, until the interval is drained (`Ok(None)`). The chromosome /
+/// interval iteration, per-chromosome REF fetcher, and dust computation are
+/// the wiring layer (Phase 2b-wiring); `produce_chunk` takes the REF fetch as
+/// a closure so it stays decoupled and unit-testable.
+///
+/// Per chunk: lockstep-read segments to the watermark → fold the **light**
+/// columns → `derive_is_kept` → drop dust → cut at a safe gap → build records
+/// (columnar→record via [`SamplePspChunk::records_for`], merged per-position
+/// by the revived [`PerPositionMerger`]) → fetch the REF span → stamp
+/// `chunk_order`. Only the variable positions are ever built (the memory
+/// invariant); buffered columnar segments straddling a cut survive to the next
+/// chunk (records_for is non-consuming).
+pub struct CohortChunkIntegrator<R: Read + Seek> {
+    readers: Vec<SamplePspReader<R>>,
+    sample_names: Vec<String>,
+    n: usize,
+    min_alt_obs: u32,
+    target_variants: u32,
+
+    // Current-interval state.
+    chrom_id: u32,
+    interval_end: u32, // exclusive
+    next_chunk_start: u32,
+    /// Per sample: buffered columnar segments (carryover + read-ahead), in
+    /// genomic order; dropped once fully below `next_chunk_start`.
+    buffers: Vec<Vec<SamplePspChunk>>,
+    /// Per sample: reader exhausted within the current interval.
+    exhausted: Vec<bool>,
+    dust_mask: Vec<Range<u32>>,
+
+    /// Monotonic genomic-order chunk counter (the writer's reorder ticket).
+    /// **Not** reset per interval.
+    chunk_order: u64,
+
+    // Reusable scratch.
+    fold: CohortSpanFold,
+    is_kept: Vec<bool>,
+}
+
+impl<R: Read + Seek> CohortChunkIntegrator<R> {
+    /// Build a producer over the N per-sample readers (`sample_names`
+    /// parallel to `readers`). `min_alt_obs` is the cohort keep threshold;
+    /// `target_variants` the soft per-chunk kept-position target (`0` ⇒ 1).
+    pub fn new(
+        readers: Vec<SamplePspReader<R>>,
+        sample_names: Vec<String>,
+        min_alt_obs: u32,
+        target_variants: u32,
+    ) -> Self {
+        let n = readers.len();
+        Self {
+            readers,
+            sample_names,
+            n,
+            min_alt_obs,
+            target_variants: target_variants.max(1),
+            chrom_id: 0,
+            interval_end: 0,
+            next_chunk_start: 0,
+            buffers: vec![Vec::new(); n],
+            exhausted: vec![false; n],
+            dust_mask: Vec::new(),
+            chunk_order: 0,
+            fold: CohortSpanFold::new(),
+            is_kept: Vec::new(),
+        }
+    }
+
+    /// Point every reader at `[interval.start, interval.end)` of `chrom_id`
+    /// (reusing decode buffers) and install the interval's dust mask. Clears
+    /// the per-interval buffers; preserves `chunk_order`.
+    pub fn begin_interval(
+        &mut self,
+        chrom_id: u32,
+        interval: Range<u32>,
+        dust_mask: Vec<Range<u32>>,
+    ) {
+        debug_assert!(interval.start < interval.end, "empty interval");
+        let region_end = interval.end - 1; // reader region_end is inclusive
+        for r in &mut self.readers {
+            r.reset(chrom_id, interval.start, region_end);
+        }
+        self.chrom_id = chrom_id;
+        self.interval_end = interval.end;
+        self.next_chunk_start = interval.start;
+        for b in &mut self.buffers {
+            b.clear();
+        }
+        for e in &mut self.exhausted {
+            *e = false;
+        }
+        self.dust_mask = dust_mask;
+    }
+
+    /// The last position every sample's buffered data reaches (`interval_end`
+    /// for exhausted / empty-buffer samples) — `min` over samples is the
+    /// cohort watermark: positions `≤ W` have complete cohort data.
+    fn coverage(&self, s: usize) -> u32 {
+        if self.exhausted[s] {
+            self.interval_end
+        } else {
+            self.buffers[s]
+                .last()
+                .and_then(|c| c.positions().last().copied())
+                .unwrap_or(0)
+        }
+    }
+
+    fn watermark(&self) -> u32 {
+        (0..self.n)
+            .map(|s| self.coverage(s))
+            .min()
+            .unwrap_or(self.interval_end)
+    }
+
+    fn all_exhausted(&self) -> bool {
+        self.exhausted.iter().all(|&e| e)
+    }
+
+    /// Read one more segment for sample `s` (or mark it exhausted).
+    fn read_one(&mut self, s: usize) -> Result<(), ProducerError> {
+        match self.readers[s].next_chunk()? {
+            Some(c) => self.buffers[s].push(c),
+            None => self.exhausted[s] = true,
+        }
+        Ok(())
+    }
+
+    /// Rebuild [`self.fold`] over the buffered light columns in
+    /// `[next_chunk_start, w]` (all samples' data is complete there).
+    fn rebuild_fold(&mut self, w: u32) {
+        let mut fold = std::mem::take(&mut self.fold);
+        fold.clear();
+        let lo_bound = self.next_chunk_start;
+        for buf in &self.buffers {
+            for chunk in buf {
+                let pos = chunk.positions();
+                let lo = pos.partition_point(|&p| p < lo_bound);
+                let hi = pos.partition_point(|&p| p <= w);
+                if lo < hi {
+                    fold.fold_sample_light(
+                        &pos[lo..hi],
+                        &chunk.ref_spans()[lo..hi],
+                        &chunk.nonref_obs()[lo..hi],
+                    );
+                }
+            }
+        }
+        self.fold = fold;
+    }
+
+    /// Read-ahead: pull segments (advancing the laggard samples) until the
+    /// chunk has ~`target_variants` kept positions *and* a safe gap to cut at,
+    /// or the interval is fully read. Leaves [`self.fold`] valid over
+    /// `[next_chunk_start, watermark]`.
+    fn fill_to_target(&mut self) -> Result<(), ProducerError> {
+        loop {
+            // Seed any non-exhausted sample that has no buffered segment.
+            for s in 0..self.n {
+                if !self.exhausted[s] && self.buffers[s].is_empty() {
+                    self.read_one(s)?;
+                }
+            }
+            let w = self.watermark();
+            self.rebuild_fold(w);
+            let kept = self
+                .fold
+                .count_kept_below(w.saturating_add(1), self.min_alt_obs);
+            let has_safe_cut =
+                self.all_exhausted() || self.fold.find_cut(w) > self.next_chunk_start;
+            if (kept >= self.target_variants && has_safe_cut)
+                || self.all_exhausted()
+                || w >= self.interval_end
+            {
+                return Ok(());
+            }
+            // Advance the laggards (coverage == W) to raise the watermark.
+            let mut advanced = false;
+            for s in 0..self.n {
+                if !self.exhausted[s] && self.coverage(s) == w {
+                    self.read_one(s)?;
+                    advanced = true;
+                }
+            }
+            if !advanced {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Produce the next chunk of the current interval, or `Ok(None)` when the
+    /// interval is drained. `fetch_ref` returns the REF bases for a 1-based
+    /// `(start, length)` span (errors stringified into [`ProducerError::Ref`]).
+    pub fn produce_chunk(
+        &mut self,
+        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, String>,
+    ) -> Result<Option<PileupCohortChunk>, ProducerError> {
+        loop {
+            if self.next_chunk_start >= self.interval_end {
+                return Ok(None);
+            }
+
+            self.fill_to_target()?;
+            let w = self.watermark();
+            let cut = if self.all_exhausted() {
+                self.interval_end
+            } else {
+                self.fold.find_cut(w).min(self.interval_end)
+            };
+            debug_assert!(
+                cut > self.next_chunk_start,
+                "chunk cut must make progress ({} <= {})",
+                cut,
+                self.next_chunk_start,
+            );
+
+            // Keep decision over the (complete) fold, then drop dust.
+            self.fold
+                .derive_is_kept(self.min_alt_obs, &mut self.is_kept);
+            drop_dust_masked(self.fold.positions(), &mut self.is_kept, &self.dust_mask);
+            let variable: Vec<u32> = self
+                .fold
+                .positions()
+                .iter()
+                .zip(self.is_kept.iter())
+                .filter(|&(&p, &k)| k && p < cut)
+                .map(|(&p, _)| p)
+                .collect();
+
+            let chunk_start = self.next_chunk_start;
+
+            if variable.is_empty() {
+                // Variant-free span — emit nothing, keep chunk_order gapless.
+                self.next_chunk_start = cut;
+                self.drop_buffers_below(cut);
+                continue;
+            }
+
+            // Build from the buffers *before* advancing past them.
+            let records = self.build_records(&variable, chunk_start, cut)?;
+            let ref_span = self.fetch_ref_span(&variable, fetch_ref)?;
+            self.next_chunk_start = cut;
+            self.drop_buffers_below(cut);
+
+            let chunk_order = self.chunk_order;
+            self.chunk_order += 1;
+            return Ok(Some(PileupCohortChunk {
+                chunk_order,
+                records,
+                ref_span,
+            }));
+        }
+    }
+
+    /// Drop buffered segments wholly below `cut` (fully consumed).
+    fn drop_buffers_below(&mut self, cut: u32) {
+        for buf in &mut self.buffers {
+            buf.retain(|c| c.positions().last().is_some_and(|&p| p >= cut));
+        }
+    }
+
+    /// Build the chunk's [`CohortPileupRecord`]s: per sample, reconstruct its
+    /// records on the variable positions in `[chunk_start, cut)` (columnar→
+    /// record), then merge per-position across samples via [`PerPositionMerger`].
+    fn build_records(
+        &self,
+        variable: &[u32],
+        chunk_start: u32,
+        cut: u32,
+    ) -> Result<Vec<CohortPileupRecord>, ProducerError> {
+        let mut iters: Vec<KeptRecordIter> = Vec::with_capacity(self.n);
+        for buf in &self.buffers {
+            let mut recs: Vec<PileupRecord> = Vec::new();
+            for chunk in buf {
+                let pos = chunk.positions();
+                let keep: Vec<bool> = pos
+                    .iter()
+                    .map(|&p| p >= chunk_start && p < cut && variable.binary_search(&p).is_ok())
+                    .collect();
+                if keep.iter().any(|&k| k) {
+                    recs.extend(chunk.records_for(&keep));
+                }
+            }
+            iters.push(
+                recs.into_iter()
+                    .map(ok_record as fn(PileupRecord) -> Result<PileupRecord, PspReadError>),
+            );
+        }
+
+        let merger = PerPositionMerger::new(iters, self.sample_names.clone(), Vec::new())
+            .map_err(|e| ProducerError::Merge(Box::new(e)))?;
+        let mut records = Vec::with_capacity(variable.len());
+        for item in merger {
+            let pp = item.map_err(|e| ProducerError::Merge(Box::new(e)))?;
+            records.push(CohortPileupRecord {
+                chrom_id: pp.chrom_id,
+                pos: pp.pos,
+                per_sample: pp.per_sample,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Fetch the chunk's one contiguous REF span `[first_kept, max_reach]`
+    /// (monotonic-forward across chunks). `max_reach` uses the cohort
+    /// `max_ref_span` (the grouping reach), matching the old per-group fetch.
+    fn fetch_ref_span(
+        &self,
+        variable: &[u32],
+        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, String>,
+    ) -> Result<RefSpan, ProducerError> {
+        let first = variable[0];
+        let positions = self.fold.positions();
+        let spans = self.fold.max_ref_span();
+        let mut max_reach = first;
+        for &p in variable {
+            let idx = positions
+                .binary_search(&p)
+                .expect("variable position must be in the fold");
+            max_reach = max_reach.max(reach(p, spans[idx]));
+        }
+        let len = max_reach - first + 1;
+        let bytes = fetch_ref(first, len).map_err(ProducerError::Ref)?;
+        Ok(RefSpan {
+            genomic_start: first,
+            bytes,
+        })
     }
 }
 
@@ -466,5 +876,214 @@ mod tests {
         drop_dust_masked(&positions, &mut is_kept, &[8..12, 22..30]);
         // 10 masked by [8,12); 25 masked by [22,30).
         assert_eq!(is_kept, vec![true, false, true, true, false]);
+    }
+
+    // --- 2b: the streaming integrator (cross-checked against a one-shot ref) ---
+
+    use crate::pileup_record::PileupRecord;
+    use crate::psp::PspReader;
+    use crate::psp::test_fixtures::writer_header;
+    use crate::psp::writer::PspWriter;
+    use crate::var_calling::test_helpers::{allele, record};
+    use crate::var_calling_new::sample_reader::SamplePspReader;
+    use crate::var_calling_new::types::CohortPileupRecord;
+    use std::io::Cursor;
+
+    const INTERVAL_END: u32 = 4000;
+
+    /// One synthetic sample: a misaligned, multi-allele record stream with a
+    /// mix of variant / non-variant positions and the occasional 2-base REF
+    /// (MNP reach). `s` shifts coverage + obs so samples disagree per position.
+    fn gen_sample(s: u32, n: u32) -> Vec<PileupRecord> {
+        (0..n)
+            .filter_map(|i| {
+                // Per-sample coverage gaps → misaligned position sets.
+                if (i + s).is_multiple_of(4) {
+                    return None;
+                }
+                let pos = 10 + i * 5;
+                let ref_seq: &[u8] = if i.is_multiple_of(9) { b"AC" } else { b"A" };
+                let mut alleles = vec![allele(ref_seq, 5, -1.0, &[])];
+                let alt_obs = if (i * 7 + s * 3).is_multiple_of(5) {
+                    2
+                } else {
+                    0
+                };
+                if alt_obs > 0 {
+                    alleles.push(allele(b"T", alt_obs, -1.5, &[u64::from(i) + 1]));
+                }
+                Some(record(pos, alleles))
+            })
+            .collect()
+    }
+
+    fn psp_bytes(records: &[PileupRecord], block_target: usize) -> Vec<u8> {
+        let mut w = PspWriter::new_with_block_target(
+            Cursor::new(Vec::new()),
+            writer_header(1),
+            block_target,
+        )
+        .expect("writer opens");
+        for r in records {
+            w.write_record(r).expect("write_record");
+        }
+        w.finish().expect("finish").into_inner()
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("S{i}")).collect()
+    }
+
+    /// One-shot reference: fold all samples fully, derive kept positions, drop
+    /// dust, assemble per-position cohort records — no streaming / chunking.
+    fn reference(
+        samples: &[Vec<PileupRecord>],
+        min_alt_obs: u32,
+        mask: &[Range<u32>],
+    ) -> Vec<CohortPileupRecord> {
+        let mut fold = CohortSpanFold::new();
+        for recs in samples {
+            let pos: Vec<u32> = recs.iter().map(|r| r.pos).collect();
+            let rs: Vec<u32> = recs.iter().map(|r| r.alleles[0].seq.len() as u32).collect();
+            let nro: Vec<u32> = recs
+                .iter()
+                .map(|r| {
+                    r.alleles[1..]
+                        .iter()
+                        .fold(0u32, |a, al| a.saturating_add(al.support.num_obs))
+                })
+                .collect();
+            fold.fold_sample_light(&pos, &rs, &nro);
+        }
+        let mut is_kept = Vec::new();
+        fold.derive_is_kept(min_alt_obs, &mut is_kept);
+        drop_dust_masked(fold.positions(), &mut is_kept, mask);
+        let variable: Vec<u32> = fold
+            .positions()
+            .iter()
+            .zip(&is_kept)
+            .filter(|&(_, &k)| k)
+            .map(|(&p, _)| p)
+            .collect();
+
+        let iters: Vec<KeptRecordIter> = samples
+            .iter()
+            .map(|recs| {
+                let kept: Vec<PileupRecord> = recs
+                    .iter()
+                    .filter(|r| variable.binary_search(&r.pos).is_ok())
+                    .cloned()
+                    .collect();
+                kept.into_iter()
+                    .map(ok_record as fn(PileupRecord) -> Result<PileupRecord, PspReadError>)
+            })
+            .collect();
+        let merger = PerPositionMerger::new(iters, names(samples.len()), Vec::new()).unwrap();
+        merger
+            .map(|x| {
+                let pp = x.unwrap();
+                CohortPileupRecord {
+                    chrom_id: pp.chrom_id,
+                    pos: pp.pos,
+                    per_sample: pp.per_sample,
+                }
+            })
+            .collect()
+    }
+
+    /// Streaming output: drain `produce_chunk` over one interval, asserting
+    /// `chunk_order` is gapless and records stay genomically sorted.
+    fn streaming(
+        samples: &[Vec<PileupRecord>],
+        block_targets: &[usize],
+        min_alt_obs: u32,
+        target_variants: u32,
+        mask: Vec<Range<u32>>,
+    ) -> Vec<CohortPileupRecord> {
+        let readers: Vec<_> = samples
+            .iter()
+            .zip(block_targets)
+            .map(|(recs, &bt)| {
+                let bytes = psp_bytes(recs, bt);
+                let reader = PspReader::new(Cursor::new(bytes)).unwrap();
+                SamplePspReader::new(reader, 0, 1, 1)
+            })
+            .collect();
+        let mut integ =
+            CohortChunkIntegrator::new(readers, names(samples.len()), min_alt_obs, target_variants);
+        integ.begin_interval(0, 1..INTERVAL_END, mask);
+
+        let mut fetch = |_start: u32, len: u32| Ok::<_, String>(vec![b'N'; len as usize]);
+        let mut out: Vec<CohortPileupRecord> = Vec::new();
+        let mut expected_order = 0u64;
+        while let Some(chunk) = integ.produce_chunk(&mut fetch).unwrap() {
+            assert_eq!(chunk.chunk_order, expected_order, "chunk_order gapless");
+            expected_order += 1;
+            assert!(!chunk.records.is_empty(), "empty chunks are never emitted");
+            // RefSpan covers the chunk's first kept position.
+            assert_eq!(chunk.ref_span.genomic_start, chunk.records[0].pos);
+            out.extend(chunk.records);
+        }
+        // Globally sorted, strictly ascending positions.
+        assert!(
+            out.windows(2).all(|w| w[0].pos < w[1].pos),
+            "records strictly ascending across chunks",
+        );
+        out
+    }
+
+    fn cohort() -> (Vec<Vec<PileupRecord>>, Vec<usize>) {
+        let samples = vec![gen_sample(0, 300), gen_sample(1, 300), gen_sample(2, 300)];
+        let block_targets = vec![200usize, 350, 512]; // misaligned blocks
+        (samples, block_targets)
+    }
+
+    #[test]
+    fn streaming_matches_reference_across_chunk_sizes() {
+        let (samples, bts) = cohort();
+        for &min_alt_obs in &[1u32, 2] {
+            let want = reference(&samples, min_alt_obs, &[]);
+            assert!(!want.is_empty(), "fixture should yield variants");
+            // Same output regardless of how the interval is partitioned.
+            for &target in &[1u32, 3, 17, 100_000] {
+                let got = streaming(&samples, &bts, min_alt_obs, target, Vec::new());
+                assert_eq!(got, want, "min_alt_obs={min_alt_obs} target={target}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_applies_dust_mask() {
+        let (samples, bts) = cohort();
+        let min_alt_obs = 1;
+        // Mask a chunk of the genome; reference and streaming must agree, and
+        // the masked span must actually drop some records.
+        let masked_span = 500u32..900;
+        let mask = vec![masked_span];
+        let want = reference(&samples, min_alt_obs, &mask);
+        let unmasked = reference(&samples, min_alt_obs, &[]);
+        assert!(want.len() < unmasked.len(), "mask should drop records");
+        for &target in &[1u32, 5, 100_000] {
+            let got = streaming(&samples, &bts, min_alt_obs, target, mask.clone());
+            assert_eq!(got, want, "dust target={target}");
+        }
+        assert!(
+            want.iter().all(|r| !(500..900).contains(&r.pos)),
+            "no masked position survives",
+        );
+    }
+
+    #[test]
+    fn interval_with_no_variants_yields_no_chunks() {
+        // A cohort with zero ALT obs anywhere → no variant positions.
+        let flat: Vec<Vec<PileupRecord>> = (0..2)
+            .map(|_| {
+                (0..50)
+                    .map(|i| record(10 + i * 5, vec![allele(b"A", 4, -1.0, &[])]))
+                    .collect()
+            })
+            .collect();
+        let got = streaming(&flat, &[128, 128], 1, 4, Vec::new());
+        assert!(got.is_empty(), "no variants ⇒ no chunks");
     }
 }

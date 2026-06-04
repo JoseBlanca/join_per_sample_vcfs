@@ -32,7 +32,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::pileup_record::{AlleleSupportStats, ChainId};
+use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 use crate::psp::ScalarDecodeError;
 use crate::psp::{BlockColumnReader, BlockColumns, BlockIndexEntry, PspReadError, PspReader};
 
@@ -396,6 +396,34 @@ impl SamplePspChunk {
         hi - lo
     }
 
+    /// Reconstruct owned [`PileupRecord`]s for the `keep` records — the
+    /// columnar→record boundary at the producer (§2.2 step 3). **Non-consuming**
+    /// (copies via `slice_at`/`support_at`), so a segment straddling a chunk
+    /// cut survives in the buffer to serve the next chunk; the move-out
+    /// [`take_seq`](Self::take_seq) / `take_*` getters are the Phase-5
+    /// column-selective seam instead. `keep.len()` must equal [`len`](Self::len).
+    pub fn records_for(&self, keep: &[bool]) -> Vec<PileupRecord> {
+        debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
+        let mut out = Vec::new();
+        for (r, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            let lo = self.allele_offsets[r] as usize;
+            let hi = self.allele_offsets[r + 1] as usize;
+            let mut alleles = Vec::with_capacity(hi - lo);
+            for a in lo..hi {
+                alleles.push(AlleleObservation::new(
+                    self.seq.slice_at(a).to_vec(),
+                    self.fixed.support_at(a),
+                    self.chain_ids.slice_at(a).to_vec(),
+                ));
+            }
+            out.push(PileupRecord::new(self.chrom_id, self.positions[r], alleles));
+        }
+        out
+    }
+
     /// Move out the fixed-scalar columns for the `keep` records (appendix
     /// §A typed getter). `keep.len()` must equal [`len`](Self::len);
     /// the column is emptied, so a second call yields nothing.
@@ -482,6 +510,16 @@ impl<R: Read + Seek> SamplePspReader<R> {
     /// Recover the owned [`PspReader`].
     pub fn into_reader(self) -> PspReader<R> {
         self.blocks.into_reader()
+    }
+
+    /// Re-point at a new region, reusing the decode buffers (the cohort
+    /// producer resets one reader per sample at every covered-interval /
+    /// chromosome boundary so the zstd context + column slabs persist).
+    pub fn reset(&mut self, chrom_id: u32, region_start: u32, region_end: u32) {
+        self.blocks.seek_to(chrom_id, region_start, region_end);
+        self.chrom_id = chrom_id;
+        self.region_end = region_end;
+        self.floor = region_start;
     }
 
     /// The sample's on-disk block index — the producer unions these across
