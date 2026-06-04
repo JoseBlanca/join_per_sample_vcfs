@@ -620,7 +620,10 @@ where
 /// Build the per-(ploidy, n_alleles) genotype table cache used by
 /// `PerGroupMerger`. Tests that drive `process_group` directly call
 /// this with the test's own config so the cache slice matches.
-fn build_genotype_tables(config: &PerGroupMergerConfig) -> Vec<Vec<Vec<u8>>> {
+///
+/// `pub` so the record-based caller ([`crate::var_calling_new::em_posterior_calc`])
+/// can build the identical cache once and feed it to [`merge_group_with_ref`].
+pub fn build_genotype_tables(config: &PerGroupMergerConfig) -> Vec<Vec<Vec<u8>>> {
     (0..=config.max_alleles)
         .map(|n_alleles| genotype_order(config.ploidy, n_alleles))
         .collect()
@@ -800,27 +803,12 @@ fn process_group(
     let chrom_id = group.chrom_id;
     let start = group.start;
     let end = group.end;
-    // Defensive: a `ploidy = 0` config would make `genotype_order`
-    // return `[[]]` and force a divide-by-zero in the chain-broken
-    // fallback. Surface it as a typed error rather than producing a
-    // degenerate record.
-    if config.ploidy == 0 {
-        return Err(PerGroupMergerError::RefFetch {
-            chrom_id,
-            start,
-            end,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "PerGroupMergerConfig::ploidy must be >= 1",
-            ),
-        });
-    }
     if end < start {
         // `OverlappingVariantGroup` is a `pub` struct with no
         // constructor invariant. The cohort's own grouper guarantees
         // `start <= end`, but a hand-built fixture or alternative
         // upstream could feed an inverted range; surface it as a
-        // typed error rather than wrapping `u32`.
+        // typed error rather than wrapping `u32` computing the span.
         return Err(PerGroupMergerError::RefFetch {
             chrom_id,
             start,
@@ -841,19 +829,86 @@ fn process_group(
             end,
             source: std::io::Error::other(format!("{source}")),
         })?;
-    let ref_seq: &[u8] = ref_seq_scratch;
+
+    // Delegate the post-fetch merge to the REF-slice entry, mapping its
+    // typed skip outcome back onto this fn's `Option` + side-channel stats
+    // (the `PerGroupMerger` iterator's existing contract).
+    match merge_group_with_ref(group, ref_seq_scratch, config, genotype_tables)? {
+        MergeGroupOutcome::Merged(record) => Ok(Some(record)),
+        MergeGroupOutcome::SkippedLhCap { n_alleles } => {
+            lh_cap_stats.record_skip(n_alleles);
+            Ok(None)
+        }
+        MergeGroupOutcome::SkippedRefOnly => Ok(None),
+    }
+}
+
+/// Outcome of merging one overlapping group given its REF bytes
+/// ([`merge_group_with_ref`]). Makes the two skip reasons explicit (the
+/// fetcher-based [`process_group`] collapses both to `Ok(None)` + a stats
+/// side-channel; the record-based caller reads them directly for its
+/// per-chunk counters).
+#[derive(Debug)]
+pub enum MergeGroupOutcome {
+    /// A real multi-allele record (`alleles.len() >= 2`).
+    Merged(MergedRecord),
+    /// Post-unification REF-only — every ALT was deduped/absorbed away, so no
+    /// record is emitted (mirrors `groups_skipped_post_unify_ref_only`).
+    SkippedRefOnly,
+    /// The unified allele set exceeded `max_alleles_lh_calc`; the whole group
+    /// is skipped (mirrors `lh_cap_groups_skipped` / `…_alleles_in_skipped`).
+    SkippedLhCap { n_alleles: usize },
+}
+
+/// Merge one overlapping group into a [`MergedRecord`] given the group's REF
+/// bytes **directly** — the record-based caller slices them from the chunk's
+/// `RefSpan` (no per-group fetch). `ref_seq` must be exactly the
+/// `[group.start, group.end]` (1-based inclusive) reference bases. This is
+/// `process_group`'s post-fetch body verbatim, so it is byte-identical to the
+/// fetcher path; `genotype_tables` must come from [`build_genotype_tables`]
+/// with the same `config`.
+pub fn merge_group_with_ref(
+    group: OverlappingVariantGroup,
+    ref_seq: &[u8],
+    config: &PerGroupMergerConfig,
+    genotype_tables: &[Vec<Vec<u8>>],
+) -> Result<MergeGroupOutcome, PerGroupMergerError> {
+    let chrom_id = group.chrom_id;
+    let start = group.start;
+    let end = group.end;
+    // Defensive: a `ploidy = 0` config would make `genotype_order` return
+    // `[[]]` and force a divide-by-zero in the chain-broken fallback.
+    if config.ploidy == 0 {
+        return Err(PerGroupMergerError::RefFetch {
+            chrom_id,
+            start,
+            end,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PerGroupMergerConfig::ploidy must be >= 1",
+            ),
+        });
+    }
+    if end < start {
+        return Err(PerGroupMergerError::RefFetch {
+            chrom_id,
+            start,
+            end,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("group end ({end}) precedes start ({start})"),
+            ),
+        });
+    }
+    let span = end - start + 1;
     if ref_seq.len() != span as usize {
-        // The trait contract requires exactly `length` bytes; an
-        // alternative fetcher implementation that returns fewer
-        // would otherwise blow up downstream in
-        // `project_local_allele`'s slice arithmetic.
         return Err(PerGroupMergerError::RefFetch {
             chrom_id,
             start,
             end,
             source: std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("fetcher returned {} bytes for span {}", ref_seq.len(), span,),
+                format!("REF slice is {} bytes for span {span}", ref_seq.len()),
             ),
         });
     }
@@ -874,25 +929,18 @@ fn process_group(
     let unified = unify_alleles(&group, ref_seq, n_samples)?;
     let unified = enforce_max_alleles(unified, config.max_alleles);
 
-    // `--max-alleles-lh-calc` ceiling. The soft cap above only drops
-    // prunable alleles, so REF + compounds can still exceed the
-    // bitmask-scratch width of the inner likelihood routine in
-    // pathological low-complexity regions. Skip the whole group
-    // rather than try to drop compounds (whose constituent
-    // bookkeeping interacts with `project_scalars`' compound
-    // subtraction in ways that would require an inverse step) — the
-    // call quality in such regions is suspect regardless. The user
-    // is informed via the `allele_lh_cap_hit` run-summary line.
+    // `--max-alleles-lh-calc` ceiling. The soft cap above only drops prunable
+    // alleles, so REF + compounds can still exceed the bitmask-scratch width
+    // of the inner likelihood routine in pathological low-complexity regions.
     if unified.alleles.len() > config.max_alleles_lh_calc {
-        lh_cap_stats.record_skip(unified.alleles.len());
-        return Ok(None);
+        return Ok(MergeGroupOutcome::SkippedLhCap {
+            n_alleles: unified.alleles.len(),
+        });
     }
 
-    // REF-only ⇒ no record. Compound rejection (no entry added) and
-    // the cap path (drops into `dropped_other`) both leave `alleles`
-    // shorter; the OTHER pool never enters as a real allele.
+    // REF-only ⇒ no record.
     if unified.alleles.len() < 2 {
-        return Ok(None);
+        return Ok(MergeGroupOutcome::SkippedRefOnly);
     }
 
     let projection = project_scalars(&group, &unified, n_samples)?;
@@ -921,7 +969,7 @@ fn process_group(
         })
         .collect();
 
-    Ok(Some(MergedRecord {
+    Ok(MergeGroupOutcome::Merged(MergedRecord {
         chrom_id,
         start,
         end,
