@@ -28,6 +28,7 @@ use crate::fasta::{
 };
 use crate::pop_var_caller::var_calling::VarCallingArgs;
 use crate::psp::{PspReadError, PspReader};
+use crate::regions::{ContigBounds, Region, RegionSet};
 use crate::var_calling_new::cohort_integration::{CohortChunkIntegrator, ProducerError};
 use crate::var_calling_new::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling_new::em_posterior_calc::{CallerError, VariantCaller};
@@ -144,6 +145,22 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
         args.target_variants_per_chunk
     };
 
+    // --- Optional `--regions` BED: covered intervals get clipped to it
+    //     (whole genome when absent — the identical byte-for-byte path). ---
+    let region_set = match &args.regions {
+        Some(bed) => {
+            let contig_bounds: Vec<ContigBounds> = chromosomes
+                .iter()
+                .map(|c| ContigBounds {
+                    name: &c.name,
+                    length: c.length,
+                })
+                .collect();
+            Some(RegionSet::from_bed_path(bed, &contig_bounds).map_err(|e| cfg_err(&e))?)
+        }
+        None => None,
+    };
+
     // --- Per-sample segment readers (region overridden per interval). ---
     let readers: Vec<SamplePspReader<BufReader<File>>> = psp_readers
         .into_iter()
@@ -224,7 +241,10 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
         let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
         let produce = (|| -> Result<(), PipelineError> {
             for chrom_id in 0..n_chromosomes {
-                let intervals = producer.covered_intervals(chrom_id, max_group_span);
+                let mut intervals = producer.covered_intervals(chrom_id, max_group_span);
+                if let Some(rs) = &region_set {
+                    intervals = restrict_intervals_to_regions(&intervals, rs.regions_for(chrom_id));
+                }
                 for interval in intervals {
                     let mask = dust_mask_for(
                         &mut dust_fetcher,
@@ -380,4 +400,29 @@ fn dust_mask_for_interval(
         sub_start = sub_end;
     }
     Ok(mask)
+}
+
+/// Clip the chromosome's covered intervals (1-based half-open) to its analysis
+/// `regions` (1-based inclusive `[start, end]`), returning the overlap spans in
+/// the half-open convention. Two-pointer sweep over the two sorted lists.
+/// Copied verbatim from `driver::restrict_intervals_to_regions`; with no
+/// `--regions` this is never called and the path is byte-identical.
+fn restrict_intervals_to_regions(covered: &[Range<u32>], regions: &[Region]) -> Vec<Range<u32>> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < covered.len() && j < regions.len() {
+        let c = &covered[i];
+        let region_end_excl = regions[j].end.saturating_add(1);
+        let lo = c.start.max(regions[j].start);
+        let hi = c.end.min(region_end_excl);
+        if lo < hi {
+            out.push(lo..hi);
+        }
+        if c.end <= region_end_excl {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
