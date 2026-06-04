@@ -283,22 +283,24 @@ pub enum VarCallingCliError {
 ///     `effective_threads` + the `requested … capped by N chromosomes`
 ///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
-    // TEMP (P6 measurement, re-architecture): route to the new pipeline when
-    // `PVC_NEW_PIPELINE` is set, so the same CLI invocation A/B-tests both paths
-    // for byte-identity + RSS/wall. Removed at the P7 swap (which repoints the
-    // CLI to the new entry directly). Off by default → no behaviour change.
-    if std::env::var_os("PVC_NEW_PIPELINE").is_some() {
-        crate::var_calling_new::pipeline::run_var_calling(args)
-            .unwrap_or_else(|e| panic!("new pipeline failed: {e}"));
-        return Ok(());
-    }
-
     let cohort = &args.cohort;
 
     // 1. Rayon pool — idempotent under the silent-no-op policy
     //    (M13, locked 2026-05-19); first caller wins, subsequent
     //    callers' --threads is silently ignored.
     configure_rayon_pool(args.threads).map_err(|_| VarCallingCliError::RayonAlreadyConfigured)?;
+
+    // TEMP (P6 measurement, re-architecture): route to the new pipeline when
+    // `PVC_NEW_PIPELINE` is set, so the same CLI invocation A/B-tests both paths
+    // for byte-identity + RSS/wall. Placed *after* the rayon-pool config so the
+    // new pipeline's parallel per-sample decode honours `--threads` too (same as
+    // the old path). Removed at the P7 swap (which repoints the CLI to the new
+    // entry directly). Off by default → no behaviour change.
+    if std::env::var_os("PVC_NEW_PIPELINE").is_some() {
+        crate::var_calling_new::pipeline::run_var_calling(args)
+            .unwrap_or_else(|e| panic!("new pipeline failed: {e}"));
+        return Ok(());
+    }
 
     // 2. Open every .psp once for header validation. Per-chrom
     //    workers re-open their own readers below; keeping the

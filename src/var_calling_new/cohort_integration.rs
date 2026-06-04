@@ -494,7 +494,10 @@ pub struct CohortChunkIntegrator<R: Read + Seek> {
     is_kept: Vec<bool>,
 }
 
-impl<R: Read + Seek> CohortChunkIntegrator<R> {
+// `R: Send` so the producer can decode the N per-sample readers in parallel
+// (`read_samples`); the pipeline's `BufReader<File>` and the tests' `Cursor`
+// are both `Send`.
+impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     /// Build a producer over the N per-sample readers (`sample_names`
     /// parallel to `readers`). `min_alt_obs` is the cohort keep threshold;
     /// `target_variants` the soft per-chunk kept-position target (`0` ⇒ 1).
@@ -629,11 +632,35 @@ impl<R: Read + Seek> CohortChunkIntegrator<R> {
         self.exhausted.iter().all(|&e| e)
     }
 
-    /// Read one more segment for sample `s` (or mark it exhausted).
-    fn read_one(&mut self, s: usize) -> Result<(), ProducerError> {
-        match self.readers[s].next_chunk()? {
-            Some(c) => self.buffers[s].push(c),
-            None => self.exhausted[s] = true,
+    /// Read the next segment of each selected sample (`which[s] == true`) **in
+    /// parallel**, pushing it to that sample's buffer (or marking the sample
+    /// exhausted).
+    ///
+    /// The per-sample `.psp` decode (decompress every column of a segment) is
+    /// the producer's heavy work; the readers are independent, so this is the
+    /// §1-decode parallelism (`main` does the same with rayon-across-samples),
+    /// kept inside the producer class. The cohort fold downstream is the serial
+    /// barrier; reads are order-independent into its max-aggregation, so this
+    /// does not affect byte-identity. (Whether the read-ahead made *progress*
+    /// is `which.any()` at the call site — a selected sample always changes
+    /// state, pushing a segment **or** exhausting, and an exhausting sample
+    /// still raises the watermark, so progress must not hinge on a push.)
+    fn read_samples(&mut self, which: &[bool]) -> Result<(), ProducerError> {
+        use rayon::prelude::*;
+        debug_assert_eq!(which.len(), self.n);
+        // Disjoint `&mut readers[s]` via `par_iter_mut().enumerate()`; decode
+        // the selected readers concurrently, collect, then apply serially.
+        let outcomes: Vec<(usize, Result<Option<SamplePspChunk>, PspReadError>)> = self
+            .readers
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(s, reader)| which[s].then(|| (s, reader.next_chunk())))
+            .collect();
+        for (s, outcome) in outcomes {
+            match outcome? {
+                Some(chunk) => self.buffers[s].push(chunk),
+                None => self.exhausted[s] = true,
+            }
         }
         Ok(())
     }
@@ -667,11 +694,12 @@ impl<R: Read + Seek> CohortChunkIntegrator<R> {
     /// `[next_chunk_start, watermark]`.
     fn fill_to_target(&mut self) -> Result<(), ProducerError> {
         loop {
-            // Seed any non-exhausted sample that has no buffered segment.
-            for s in 0..self.n {
-                if !self.exhausted[s] && self.buffers[s].is_empty() {
-                    self.read_one(s)?;
-                }
+            // Seed any non-exhausted sample that has no buffered segment (parallel).
+            let seed: Vec<bool> = (0..self.n)
+                .map(|s| !self.exhausted[s] && self.buffers[s].is_empty())
+                .collect();
+            if seed.iter().any(|&b| b) {
+                self.read_samples(&seed)?;
             }
             let w = self.watermark();
             self.rebuild_fold(w);
@@ -686,15 +714,17 @@ impl<R: Read + Seek> CohortChunkIntegrator<R> {
             {
                 return Ok(());
             }
-            // Advance the laggards (coverage == W) to raise the watermark.
-            let mut advanced = false;
-            for s in 0..self.n {
-                if !self.exhausted[s] && self.coverage(s) == w {
-                    self.read_one(s)?;
-                    advanced = true;
-                }
-            }
-            if !advanced {
+            // Advance the laggards (coverage == W) to raise the watermark
+            // (parallel). "Progress" is whether there *were* laggards to
+            // process — each changes state (push or exhaust), and an exhausting
+            // sample still raises W, so the loop must continue when any was
+            // selected (matches the old serial `advanced` flag).
+            let lag: Vec<bool> = (0..self.n)
+                .map(|s| !self.exhausted[s] && self.coverage(s) == w)
+                .collect();
+            let any_laggard = lag.iter().any(|&b| b);
+            self.read_samples(&lag)?;
+            if !any_laggard {
                 return Ok(());
             }
         }
