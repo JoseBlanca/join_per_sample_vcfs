@@ -39,6 +39,7 @@ use crate::pop_var_caller::contamination_artefact::{
 };
 use crate::pop_var_caller::contamination_chunked_stream::ChunkedPositionStream;
 use crate::psp::{PspReadError, PspReader};
+use crate::var_calling::DEFAULT_CHUNK_GENOMIC_SPAN;
 use crate::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
     ContaminationEstimationError, DEFAULT_BLOCK_SIZE, DEFAULT_C_S_INIT,
@@ -48,7 +49,6 @@ use crate::var_calling::contamination_estimation::{
     DEFAULT_SNP_ALT_PSEUDOCOUNT, DEFAULT_STABILITY_BLOCKS, DEFAULT_STABILITY_TOLERANCE,
     StoppingMode, estimate_contamination,
 };
-use crate::var_calling::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 
 // ---------------------------------------------------------------------

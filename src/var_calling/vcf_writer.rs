@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig};
 
-use crate::var_calling_new::types::{CalledChunk, Variant};
+use crate::var_calling::types::{CalledChunk, Variant};
 
 /// Post-EM downstream filters applied per record at write time (the
 /// `emit_or_drop` decision). Pulled out of `VarCallingArgs` /
@@ -30,8 +30,10 @@ pub struct DownstreamFilters {
     pub min_mapq_diff_t: f32,
 }
 
-/// Run-level emit counters (the subset of `ChunkDriverStats` decided at the
-/// writer). Not part of the VCF; surfaced for the run summary.
+/// Run-level counters for the run summary (≈ the old `ChunkDriverStats`). The
+/// emit-side counters are decided here; the caller-side counters
+/// (`lh_cap_*` / `groups_skipped_*` / `records_dropped_low_alt_obs`) are rolled
+/// from each [`CalledChunk`]'s [`CallStats`]. Not part of the VCF.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WriterStats {
     pub records_written: u64,
@@ -39,6 +41,11 @@ pub struct WriterStats {
     pub records_dropped_low_qual: u64,
     pub records_dropped_low_mapq_diff_t: u64,
     pub records_unconverged: u64,
+    // Rolled from the callers' per-chunk CallStats.
+    pub records_dropped_low_alt_obs: u64,
+    pub lh_cap_groups_skipped: u64,
+    pub lh_cap_alleles_in_skipped: u64,
+    pub groups_skipped_post_unify_ref_only: u64,
 }
 
 /// Errors the writer can surface.
@@ -113,6 +120,12 @@ impl VcfWriter {
     }
 
     fn emit_chunk(&mut self, chunk: CalledChunk) -> Result<(), WriterError> {
+        // Roll the caller-side counters into the run summary.
+        self.stats.records_dropped_low_alt_obs += chunk.stats.records_dropped_low_alt_obs;
+        self.stats.lh_cap_groups_skipped += chunk.stats.lh_cap_groups_skipped;
+        self.stats.lh_cap_alleles_in_skipped += chunk.stats.lh_cap_alleles_in_skipped;
+        self.stats.groups_skipped_post_unify_ref_only +=
+            chunk.stats.groups_skipped_post_unify_ref_only;
         for record in chunk.records {
             self.emit_or_drop(record)?;
         }
@@ -151,6 +164,14 @@ impl VcfWriter {
 // ---------------------------------------------------------------------------
 
 const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
+
+/// Test alias for the private MAPQ Welch's-t filter
+/// ([`record_fails_mapq_diff_t`]) so the integration suite can exercise the
+/// decision in isolation (was `driver::record_fails_mapq_diff_t_for_test`).
+#[doc(hidden)]
+pub fn record_fails_mapq_diff_t_for_test(record: &Variant, threshold: f32) -> bool {
+    record_fails_mapq_diff_t(record, threshold)
+}
 
 /// Per-allele MAPQ moments pooled across the cohort.
 struct PooledMapqMoments {

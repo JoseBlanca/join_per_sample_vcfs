@@ -6,12 +6,12 @@
 //! `OverlappingPileupRecords` → `Vec<Variant>`, one group at a time:
 //!
 //! - per-group merge via the copied
-//!   [`per_group_merger`](crate::var_calling_new::per_group_merger) — its
+//!   [`per_group_merger`](crate::var_calling::per_group_merger) — its
 //!   row-shape `MergedRecord` already carries the **flat SoA**
 //!   `log_likelihoods` buffer (`[sample * n_genotypes + g]`), so it feeds the
 //!   SIMD EM directly through `MergedAllelesView` — **no SIMD loss**;
 //! - per-record EM via the copied
-//!   [`posterior_engine`](crate::var_calling_new::posterior_engine) — the
+//!   [`posterior_engine`](crate::var_calling::posterior_engine) — the
 //!   `InterpUnivariateSimdMath` lane-of-4 `ln`/`exp` backend, kept verbatim.
 //!
 //! > **Design note (verified Phase 0).** The columnar `kernels/` chain
@@ -28,16 +28,16 @@
 //! Phase 3 builds the `VariantCaller` worker here.
 
 use crate::pileup_record::AlleleSupportStats;
-use crate::var_calling_new::per_group_merger::{
+use crate::var_calling::per_group_merger::{
     MergeGroupOutcome, MergedRecord, PerGroupMergerConfig, PerGroupMergerError,
     build_genotype_tables, merge_group_with_ref,
 };
-use crate::var_calling_new::pileup_overlaps::overlapping_groups;
-use crate::var_calling_new::posterior_engine::{
+use crate::var_calling::pileup_overlaps::overlapping_groups;
+use crate::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError,
 };
-use crate::var_calling_new::types::{CallStats, CalledChunk, PileupCohortChunk, Variant};
-use crate::var_calling_new::variant_grouping::{GrouperConfig, GrouperError};
+use crate::var_calling::types::{CallStats, CalledChunk, PileupCohortChunk, Variant};
+use crate::var_calling::variant_grouping::{GrouperConfig, GrouperError};
 
 /// Errors the caller can surface (all pathological-input only — the EM math
 /// itself is total on well-formed records).
@@ -186,10 +186,10 @@ mod tests {
     use super::*;
     use crate::fasta::fetcher::{ChromRefFetchError, ChromRefFetcher};
     use crate::pileup_record::{AlleleObservation, PileupRecord};
-    use crate::var_calling_new::per_group_merger::{PerGroupMerger, SharedRefFetcher};
-    use crate::var_calling_new::pileup_overlaps::overlapping_groups;
-    use crate::var_calling_new::test_helpers::allele;
-    use crate::var_calling_new::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
+    use crate::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
+    use crate::var_calling::pileup_overlaps::overlapping_groups;
+    use crate::var_calling::test_helpers::allele;
+    use crate::var_calling::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
     use std::sync::Arc;
 
     /// In-memory all-`A` reference, base 1 — matches every fixture's REF

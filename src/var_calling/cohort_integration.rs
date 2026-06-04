@@ -21,21 +21,21 @@
 //! materialise a full-coverage cohort structure.
 //!
 //! `CohortPerPositionMerge` is the cohort join — the revived
-//! [`per_position_merger`](crate::var_calling_new::per_position_merger), here
+//! [`per_position_merger`](crate::var_calling::per_position_merger), here
 //! in the producer.
 //!
 //! Phase 2 builds this module, in two steps:
 //! - **2a** ([`CohortSpanFold`]): the cohort keep/cut math — the revived
 //!   `two_pass::WindowSummary`, folding over the reader's *light* columns
-//!   ([`SamplePspChunk`](crate::var_calling_new::sample_reader::SamplePspChunk)
+//!   ([`SamplePspChunk`](crate::var_calling::sample_reader::SamplePspChunk)
 //!   `positions`/`ref_spans`/`nonref_obs`) instead of a `SampleColumns`.
 //!   Plus [`drop_dust_masked`], the dust step. Byte-identity-critical, so the
 //!   arithmetic is copied verbatim from `two_pass.rs`.
 //! - **2b** ([`CohortChunkIntegrator`]): the streaming integrator over **one
 //!   covered interval** — segment buffering to the watermark, per-position
 //!   record building (columnar→record via
-//!   [`SamplePspChunk::records_for`](crate::var_calling_new::sample_reader::SamplePspChunk::records_for),
-//!   merged by the revived [`PerPositionMerger`](crate::var_calling_new::per_position_merger::PerPositionMerger)),
+//!   [`SamplePspChunk::records_for`](crate::var_calling::sample_reader::SamplePspChunk::records_for),
+//!   merged by the revived [`PerPositionMerger`](crate::var_calling::per_position_merger::PerPositionMerger)),
 //!   safe-gap cut, REF fetch (closure-injected), `chunk_order` stamping.
 //!   The chromosome / interval iteration, per-chromosome REF fetcher, and
 //!   `DustAheadPool` wiring are the next step (2b-wiring); `produce_chunk`
@@ -63,7 +63,7 @@ fn reach(pos: u32, span: u32) -> u32 {
 /// [`find_cut`](Self::find_cut) / [`chunk_cuts`](Self::chunk_cuts)) is copied
 /// verbatim from `two_pass.rs` — it is the byte-identity core. The only change
 /// is the fold's input: light-column slices from a
-/// [`SamplePspChunk`](crate::var_calling_new::sample_reader::SamplePspChunk)
+/// [`SamplePspChunk`](crate::var_calling::sample_reader::SamplePspChunk)
 /// rather than `SampleColumns` accessors (the values are identical:
 /// `ref_spans[i]` == `ref_span_at(i)`, `nonref_obs[i]` == `non_ref_obs_sum_at(i)`).
 #[derive(Debug, Default)]
@@ -388,9 +388,9 @@ pub fn drop_dust_masked(positions: &[u32], is_kept: &mut [bool], mask: &[Range<u
 
 use crate::pileup_record::PileupRecord;
 use crate::psp::PspReadError;
-use crate::var_calling_new::per_position_merger::{PerPositionMerger, PerPositionMergerError};
-use crate::var_calling_new::sample_reader::{SamplePspChunk, SamplePspReader};
-use crate::var_calling_new::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
+use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
+use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader};
+use crate::var_calling::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
 use std::io::{Read, Seek};
 
 /// Errors the cohort producer can surface.
@@ -998,9 +998,9 @@ mod tests {
     use crate::psp::PspReader;
     use crate::psp::test_fixtures::writer_header;
     use crate::psp::writer::PspWriter;
-    use crate::var_calling_new::sample_reader::SamplePspReader;
-    use crate::var_calling_new::test_helpers::{allele, record};
-    use crate::var_calling_new::types::CohortPileupRecord;
+    use crate::var_calling::sample_reader::SamplePspReader;
+    use crate::var_calling::test_helpers::{allele, record};
+    use crate::var_calling::types::CohortPileupRecord;
     use std::io::Cursor;
 
     const INTERVAL_END: u32 = 4000;

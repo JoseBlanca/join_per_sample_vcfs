@@ -29,18 +29,17 @@ use crate::fasta::{
 use crate::pop_var_caller::var_calling::VarCallingArgs;
 use crate::psp::{PspReadError, PspReader};
 use crate::regions::{ContigBounds, Region, RegionSet};
-use crate::var_calling_new::cohort_integration::{CohortChunkIntegrator, ProducerError};
-use crate::var_calling_new::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
-use crate::var_calling_new::em_posterior_calc::{CallerError, VariantCaller};
-use crate::var_calling_new::per_group_merger::{DEFAULT_BATCH_SIZE, PerGroupMergerConfig};
-use crate::var_calling_new::per_position_merger::{
-    PerPositionMergerError, check_chromosome_agreement,
-};
-use crate::var_calling_new::posterior_engine::PosteriorEngineConfig;
-use crate::var_calling_new::sample_reader::SamplePspReader;
-use crate::var_calling_new::types::{CalledChunk, PileupCohortChunk};
-use crate::var_calling_new::variant_grouping::GrouperConfig;
-use crate::var_calling_new::vcf_writer::{DownstreamFilters, VcfWriter, WriterError};
+use crate::var_calling::cohort_integration::{CohortChunkIntegrator, ProducerError};
+use crate::var_calling::contamination_estimation::ContaminationEstimates;
+use crate::var_calling::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
+use crate::var_calling::em_posterior_calc::{CallerError, VariantCaller};
+use crate::var_calling::per_group_merger::{DEFAULT_BATCH_SIZE, PerGroupMergerConfig};
+use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
+use crate::var_calling::posterior_engine::PosteriorEngineConfig;
+use crate::var_calling::sample_reader::SamplePspReader;
+use crate::var_calling::types::{CalledChunk, PileupCohortChunk};
+use crate::var_calling::variant_grouping::GrouperConfig;
+use crate::var_calling::vcf_writer::{DownstreamFilters, VcfWriter, WriterError, WriterStats};
 use crate::vcf::{CohortMetadata, WriterConfig};
 
 /// Open-file buffer size (matches `pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY`).
@@ -83,12 +82,16 @@ pub enum PipelineError {
 /// to the CLI layer is temporary: at the P7 swap this becomes the production
 /// entry the CLI invokes directly.
 ///
-/// (Input *validation* the old entry performs — reference-basename check,
-/// FASTA-vs-`.psp` per-contig MD5 cross-check — is intentionally omitted here:
-/// it guards against bad input but does not affect the emitted VCF bytes, so
-/// it is out of scope for the byte-identity gate. Contamination estimates are
-/// likewise not yet wired; the oracle path passes none.)
-pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
+/// `contamination` (loaded by the CLI from `--contamination-estimates`, or
+/// `None`) is wired into the EM's [`PosteriorEngineConfig`]. Returns the
+/// run-level [`WriterStats`] for the CLI's stderr run summary.
+///
+/// (Reference-basename and FASTA-vs-`.psp` MD5 *validation* stay in the CLI
+/// wrapper — they guard bad input but do not affect the emitted VCF.)
+pub fn run_var_calling(
+    args: &VarCallingArgs,
+    contamination: Option<ContaminationEstimates>,
+) -> Result<WriterStats, PipelineError> {
     let cohort = &args.cohort;
 
     // --- Open every .psp; validate chromosome agreement; collect metadata. ---
@@ -134,7 +137,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
         .map_err(|e| cfg_err(&e))?
         .with_max_gq_phred(cohort.max_gq_phred)
         .map_err(|e| cfg_err(&e))?
-        .with_contamination(None)
+        .with_contamination(contamination)
         .map_err(|e| cfg_err(&e))?;
 
     let min_alt_obs = cohort.min_alt_obs_per_sample;
@@ -206,14 +209,14 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
 
-    std::thread::scope(|scope| -> Result<(), PipelineError> {
-        // Writer thread: drain CalledChunks (reorder + filter + write).
-        let writer_handle = scope.spawn(move || -> Result<(), PipelineError> {
+    std::thread::scope(|scope| -> Result<WriterStats, PipelineError> {
+        // Writer thread: drain CalledChunks (reorder + filter + write); returns
+        // the run-level stats for the summary.
+        let writer_handle = scope.spawn(move || -> Result<WriterStats, PipelineError> {
             for called in called_rx {
                 writer.handle(called)?;
             }
-            writer.finish()?;
-            Ok(())
+            Ok(writer.finish()?)
         });
 
         // Caller threads: pop chunks, call, push results.
@@ -286,19 +289,18 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), PipelineError> {
         // Signal the callers there are no more chunks.
         drop(chunk_tx);
 
-        // First error wins across producer, callers, and writer.
+        // First error wins across producer, callers, and writer; otherwise
+        // return the writer's run stats.
         let mut first_err = produce.err();
         for handle in caller_handles {
             if let Err(e) = handle.join().expect("caller thread panicked") {
                 first_err.get_or_insert(e);
             }
         }
-        if let Err(e) = writer_handle.join().expect("writer thread panicked") {
-            first_err.get_or_insert(e);
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        let writer_result = writer_handle.join().expect("writer thread panicked");
+        match (first_err, writer_result) {
+            (Some(e), _) | (None, Err(e)) => Err(e),
+            (None, Ok(stats)) => Ok(stats),
         }
     })
 }

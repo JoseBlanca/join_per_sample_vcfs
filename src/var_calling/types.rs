@@ -16,7 +16,7 @@
 //!   carrying [`CallStats`] (today's `WindowRunStats`).
 
 use crate::pileup_record::PileupRecord;
-use crate::var_calling_new::posterior_engine::PosteriorRecord;
+use crate::var_calling::posterior_engine::PosteriorRecord;
 
 /// One **variable cohort position** with every sample's pileup data at it
 /// (appendix §C, `[REVIVE — cf. PerPositionPileups]`).
@@ -24,7 +24,7 @@ use crate::var_calling_new::posterior_engine::PosteriorRecord;
 /// The producer emits one of these per position the cohort fold deems
 /// variable (AC / `min_alt_obs`, dust applied); the caller's grouper
 /// consumes them. Same shape as
-/// [`per_position_merger::PerPositionPileups`](crate::var_calling_new::per_position_merger::PerPositionPileups),
+/// [`per_position_merger::PerPositionPileups`](crate::var_calling::per_position_merger::PerPositionPileups),
 /// but only the variable positions are ever built into one — the ~96 % of
 /// non-variant positions are dropped at the per-position merge and never
 /// materialised cohort-wide (the memory invariant, appendix §B).
@@ -108,7 +108,7 @@ pub struct PileupCohortChunk {
 /// The final emitted record (appendix §C, `[RENAME PosteriorRecord]`).
 ///
 /// A type alias onto the copied-verbatim kernel output
-/// [`PosteriorRecord`](crate::var_calling_new::posterior_engine::PosteriorRecord)
+/// [`PosteriorRecord`](crate::var_calling::posterior_engine::PosteriorRecord)
 /// — keeping it the *same* type the SIMD EM produces is how byte-identity is
 /// preserved (no conversion). The standalone `Variant` name becomes the real
 /// type at the P7 swap.
