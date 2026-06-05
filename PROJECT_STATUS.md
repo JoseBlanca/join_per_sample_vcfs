@@ -1210,7 +1210,9 @@ via rayon.
   - **Nits** — single mechanical pass to clear the 16 in-scope clippy errors (`single_range_in_vec_init` ×8, `type_complexity` ×4, `bool_assert_comparison` ×2, `doc_lazy_continuation` ×2) plus add per-call-site justification comments to the 14 `#[allow(...)]` annotations (12 `clippy::too_many_arguments` + `clippy::arc_with_non_send_sync` + `clippy::needless_range_loop`).
 
 #### Re-architected record-streaming pipeline (replaces the chunk-parallel rewrite)
-- **Status:** reviewed (2026-06-05). Shipped to production on branch
+- **Status:** fixes-applied (2026-06-05) — all 8 Major review findings +
+  2 Minors applied across 3 commits (`b4e767c` review, `8210f46`
+  M1/M2/M5/Mi2, `ed141ff` M3/M4/M6/M8/Mi8); reviewed (2026-06-05). Shipped to production on branch
   `re-architect` (Phase 7 swap, `1d34f85`). The columnar driver/worker/
   loader/columns/partition/two_pass/kernels chain is **deleted**; the only
   cohort `.psp` → VCF path is now the three-component record-streaming
@@ -1249,60 +1251,50 @@ via rayon.
   `merge_block_ranges`/`emit_or_drop`/`passes_min_alt_obs`/
   `merge_group_with_ref` are line-by-line identical to `main`. Per-category
   audit trail at `tmp/review_2026-06-05_re-architect-pipeline/`.
-- **Open (from the 2026-06-05 review — see report §6/§8):**
-  - **M1** — Turn the `cargo doc` gate green: fix the 7 unresolved
-    intra-doc links (dead refs to `driver` / `drive_cohort_chunked` /
-    `contamination_chunked_stream` in `var_calling.rs:11,12,19,223`,
-    `contamination_estimation.rs:633`, `per_group_merger.rs:25`; the
-    broken `CallStats` link at `vcf_writer.rs:36`) + the 5 redundant-link
-    warnings (`types.rs:111`, `cohort_integration.rs:30/38/66`,
-    `estimate_contamination.rs:353`).
-  - **M2** — Restore `current_command_line()` for the VCF `##commandline`
-    header (currently hard-coded `"var-calling"` in `pipeline.rs:179`).
-  - **M3** — Make a zero-allele `.psp` record a typed `PspReadError`, not
-    a panic / silent wrong `ref_span`, in `from_block` (`sample_reader.rs:344`)
-    — preferably via a per-record `n_alleles >= 1` invariant in
-    `decode_block_payload`.
-  - **M4** — Carry the typed `ChromRefFetchError` through
-    `ProducerError::Ref` (currently flattened to `String` in
-    `cohort_integration.rs:407` + double-stringified in `pipeline.rs::ref_fetch`).
-  - **M5** — Remove the stale crate-wide `#![allow(dead_code)]`
-    (`mod.rs:42`) and prune / `pub(crate)`-restrict the dead surface it
-    masks.
-  - **M6** — Promote the producer loop-progress (`cohort_integration.rs:752`)
-    and writer gapless (`vcf_writer.rs:112`) `debug_assert!`s to typed
-    release errors (`StalledCut` / `MissingChunks`).
+- **Applied (2026-06-05, commits `8210f46` + `ed141ff`):** **M1** (doc gate
+  green: 7 dead intra-doc links repointed/removed + 5 redundant targets
+  dropped; verified under `RUSTDOCFLAGS=-D warnings`), **M2** (restored
+  `current_command_line()` for the `##commandline` header), **M3**
+  (zero-allele `.psp` rejected at the decode boundary via new
+  `BlockHeaderInvariantKind::ZeroAlleleRecord` + `validate_n_alleles_column`
+  helper + 4 unit tests), **M4** (typed `ChromRefFetchError` boxed through
+  `ProducerError::Ref` — new `pub type RefFetchError`), **M5** (dropped the
+  crate-wide `#![allow(dead_code)]` + deleted the 3 zero-caller items
+  `into_reader`/`n_positions`/`chunk_cuts`), **M6** (`ProducerError::StalledCut`
+  + `WriterError::MissingChunks` replace the two release-load-bearing
+  `debug_assert!`s), **M8** (named `QUEUE_DEPTH_PER_WORKER`, startup log of
+  resolved `workers`/`queue_cap`/`target_variants_per_chunk`, rewrote stale
+  `--threads`/`--target-variants-per-chunk` CLI docs), **Mi2** (removed the
+  inert `--target-variants-per-chunk` from `estimate-contamination` + its
+  vacuous test), **Mi8** (refreshed stale "Phase 4 / `!Send`" module docs).
+  Verified in container: `fmt` / `clippy --all-targets -D warnings` / `doc -D
+  warnings` clean; 1000 lib + cohort integration tests pass.
+- **Open (deferred — lower-priority Minors + the test additions):**
   - **M7** — Add unit tests for the writer reorder buffer (permuted +
-    buffered-future-chunk), `emit_or_drop` per-gate ordering/counters, and
-    a multi-thread `read_samples`-vs-reference test; record the out-of-tree
-    byte-identity verification now that `main`'s in-repo A/B oracle is
-    deleted (cf. the var_calling 2026-06-01 M9 decision).
-  - **M8** — Surface the hidden defaults: make the CLI
-    `--target-variants-per-chunk` reference a shared const (drop/​document
-    the `0 → 1024` sentinel; the arg doc still describes the deleted
-    `--chunk-genomic-span`), name the `cap = 2 × n_workers` multiplier, and
-    log resolved `target_variants` / `n_workers` / `cap`.
+    buffered-future-chunk; the `MissingChunks` gap path is now testable),
+    `emit_or_drop` per-gate ordering/counters, a multi-thread
+    `read_samples`-vs-reference test, and the new `StalledCut` guard. (PM:
+    byte-identity is verified out-of-tree vs the previous version + the GIAB
+    benchmark, so no in-tree A/B oracle is needed.)
   - **Minors** — dropped `chunks_loaded`/`avg_variants_per_chunk` run
-    summary (Mi1); inert `--target-variants-per-chunk` in
-    `estimate-contamination` (Mi2); no in-tree contamination equivalence
-    oracle (Mi3); ploidy-vs-inverted-range error precedence in
-    `merge_group_with_ref` (Mi4); missing `// PANIC-FREE:` on the thread
-    joins (Mi5) and `fetch_ref_span` `binary_search().expect()` (Mi6);
-    `ProducerError::Merge` not `#[source]` (Mi7); stale "Phase 4 /
-    single-threaded / `!Send`" module docs (Mi8); const-via-comment drift
-    (Mi9); two `0 ⇒ ?` target conventions (Mi10); `em_posterior_calc`
-    named after a sub-step (Mi11); `CohortPileupRecord`/`PileupCohortChunk`
-    near-anagram (Mi12); co-dependent mapq-filter fields (Mi13); pipeline →
-    CLI `VarCallingArgs` back-reference (Mi14); stale Cargo.toml crossbeam
-    comment path (Mi15); unguarded `max_reach - first + 1` (Mi16). Plus the
-    §8 missing tests and the out-of-scope `benches/psp_writer_perf.rs:386`
-    panic (breaks `cargo test --all-targets`; not the CI gate, which uses
-    `--lib --tests`).
-  - **Open questions (gate M2/M5/M7/Mi2):** is the `##commandline` change
-    intentional? should `--target-variants-per-chunk` stay a no-op for
-    `estimate-contamination`? where does the byte-identity oracle live now
-    that `main`'s columnar path is deleted? is the crate-wide
-    `#![allow(dead_code)]` meant to persist?
+    summary (Mi1, needs a chunk counter in `WriterStats`); ploidy-vs-inverted-range
+    error precedence test in `merge_group_with_ref` (Mi4); missing
+    `// PANIC-FREE:` on the thread joins (Mi5) and `fetch_ref_span`
+    `binary_search().expect()` (Mi6); `ProducerError::Merge` not `#[source]`
+    (Mi7); const-via-comment drift (Mi9); two `0 ⇒ ?` target conventions
+    (Mi10); `em_posterior_calc` named after a sub-step (Mi11);
+    `CohortPileupRecord`/`PileupCohortChunk` near-anagram (Mi12);
+    co-dependent mapq-filter fields (Mi13); pipeline → CLI `VarCallingArgs`
+    back-reference (Mi14); stale Cargo.toml crossbeam comment path (Mi15);
+    unguarded `max_reach - first + 1` (Mi16). Plus the out-of-scope
+    `benches/psp_writer_perf.rs:386` panic (breaks `cargo test --all-targets`;
+    not the CI gate, which uses `--lib --tests`).
+  - **Open questions — resolved by the PM (2026-06-05):** the `##commandline`
+    change was unintentional → fixed (M2); `--target-variants-per-chunk`
+    should not stay a no-op → removed from `estimate-contamination` (Mi2);
+    byte-identity is verified out-of-tree (vs the previous version + the GIAB
+    benchmark), so no in-tree oracle is needed; dead code should be removed →
+    the `#![allow(dead_code)]` and its dead surface are gone (M5).
 
 ---
 
