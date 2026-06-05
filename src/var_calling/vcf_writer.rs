@@ -54,6 +54,13 @@ pub struct WriterStats {
 pub enum WriterError {
     #[error("VCF write failed: {0}")]
     Vcf(#[from] VcfWriteError),
+    /// `finish` was called with chunks still buffered: a gap in `chunk_order`
+    /// stalled the reorder drain (a caller dropped a chunk instead of shipping
+    /// exactly one `CalledChunk` per chunk), which would silently truncate the
+    /// VCF. Release-level guard for the gapless invariant (was a
+    /// `debug_assert!`).
+    #[error("{count} chunk(s) never emitted — a gap in chunk_order stalled the writer drain")]
+    MissingChunks { count: usize },
 }
 
 /// Section 3 — the VCF writer (appendix §E). Single consumer of the
@@ -111,11 +118,11 @@ impl VcfWriter {
     /// gapless invariant — one `CalledChunk` per chunk, empty included), so the
     /// reorder buffer must be empty.
     pub fn finish(self) -> Result<WriterStats, WriterError> {
-        debug_assert!(
-            self.reorder.is_empty(),
-            "{} chunk(s) never emitted — a gap in chunk_order stalled the drain",
-            self.reorder.len(),
-        );
+        if !self.reorder.is_empty() {
+            return Err(WriterError::MissingChunks {
+                count: self.reorder.len(),
+            });
+        }
         self.inner.finish()?;
         Ok(self.stats)
     }

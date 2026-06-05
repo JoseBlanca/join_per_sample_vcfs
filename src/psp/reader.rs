@@ -1124,6 +1124,38 @@ fn read_block_header<R: Read + Seek>(
 /// `decompressor`, `compressed_scratch`, `decompressed_scratch` are
 /// `RecordsIter`-owned buffers reused across every column of every
 /// block. L1 / L2 in `ia/reviews/perf_psp_reader_2026-05-13.md`.
+/// Post-decode validation of the per-record `n-alleles` column against
+/// the block header. Catches the two corruptions that would otherwise
+/// drive panics or silent mis-attribution in per-allele indexing:
+///
+/// - **sum disagreement** (B3): `Σ n_alleles[i] != n_total_alleles` — an
+///   over-run panics on per-allele indexing in `materialise_next_record`,
+///   an under-run silently emits truncated allele lists;
+/// - **zero-allele record**: a record with `n_alleles[i] == 0`. Every
+///   record carries at least its REF allele (the writer enforces this via
+///   [`InvalidRecordKind::ZeroAlleles`](super::errors::InvalidRecordKind::ZeroAlleles));
+///   a `0` aliases the next record's CSR allele range — a trailing one
+///   indexes past `allele_*_offsets` (panic in the columnar `from_block`),
+///   an interior one mis-attributes the following record's span.
+fn validate_n_alleles_column(
+    n_alleles: &[u64],
+    n_total_alleles: u32,
+) -> Result<(), BlockHeaderInvariantKind> {
+    let sum_n_alleles: u64 = n_alleles.iter().sum();
+    if sum_n_alleles != u64::from(n_total_alleles) {
+        return Err(BlockHeaderInvariantKind::NAllelesSumMismatch {
+            n_total_alleles,
+            sum_n_alleles,
+        });
+    }
+    if let Some(record_index) = n_alleles.iter().position(|&n| n == 0) {
+        return Err(BlockHeaderInvariantKind::ZeroAlleleRecord {
+            record_index: record_index as u32,
+        });
+    }
+    Ok(())
+}
+
 // H1: four extra scratch buffers for the CSR ragged columns. Owned
 // by the caller (`RecordsIter`); reused across blocks.
 #[allow(clippy::too_many_arguments)]
@@ -1258,15 +1290,8 @@ fn decode_block_payload<R: Read>(
     // `materialise_next_record`; an under-run silently emits
     // truncated allele lists. Spec §"Per-block manifest
     // agreement": "Any over- or under-run is a hard error."
-    let sum_n_alleles: u64 = n_alleles.iter().sum();
-    if sum_n_alleles != header.n_total_alleles as u64 {
-        return Err(PspReadError::BlockHeaderInvariant {
-            kind: BlockHeaderInvariantKind::NAllelesSumMismatch {
-                n_total_alleles: header.n_total_alleles,
-                sum_n_alleles,
-            },
-        });
-    }
+    validate_n_alleles_column(&n_alleles, header.n_total_alleles)
+        .map_err(|kind| PspReadError::BlockHeaderInvariant { kind })?;
 
     Ok(DecodedBlock {
         chrom_id: header.chrom_id,
@@ -2596,6 +2621,48 @@ mod tests {
             } | PspReadError::ColumnTruncated { .. }
                 | PspReadError::UncompressedLenSchemaMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn validate_n_alleles_column_accepts_all_nonzero() {
+        // sum 4 == n_total_alleles, every record has >= 1 allele.
+        assert!(validate_n_alleles_column(&[1, 2, 1], 4).is_ok());
+        // single record, single allele.
+        assert!(validate_n_alleles_column(&[1], 1).is_ok());
+    }
+
+    #[test]
+    fn validate_n_alleles_column_rejects_sum_mismatch() {
+        let err = validate_n_alleles_column(&[1, 1], 3).unwrap_err();
+        assert_eq!(
+            err,
+            BlockHeaderInvariantKind::NAllelesSumMismatch {
+                n_total_alleles: 3,
+                sum_n_alleles: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_n_alleles_column_rejects_interior_zero_allele_record() {
+        // [2, 0, 1] sums to 3 (matches n_total_alleles) but record 1
+        // carries zero alleles — the corruption the sum check misses.
+        let err = validate_n_alleles_column(&[2, 0, 1], 3).unwrap_err();
+        assert_eq!(
+            err,
+            BlockHeaderInvariantKind::ZeroAlleleRecord { record_index: 1 }
+        );
+    }
+
+    #[test]
+    fn validate_n_alleles_column_rejects_trailing_zero_allele_record() {
+        // The trailing-zero case that would index one past the offsets
+        // array in the columnar `from_block`.
+        let err = validate_n_alleles_column(&[3, 0], 3).unwrap_err();
+        assert_eq!(
+            err,
+            BlockHeaderInvariantKind::ZeroAlleleRecord { record_index: 1 }
+        );
     }
 
     // (M7) The "region mode rejects non-empty snapshot at chrom

@@ -340,6 +340,13 @@ use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader};
 use crate::var_calling::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
 use std::io::{Read, Seek};
 
+/// Boxed error type the producer's REF-fetch closure yields. Boxing keeps
+/// the producer decoupled from the concrete fetcher while preserving the
+/// typed cause through [`ProducerError::Ref`]'s `source()` chain (the
+/// pipeline's closure boxes a [`ChromRefFetchError`](crate::fasta::ChromRefFetchError)
+/// directly, no stringification).
+pub type RefFetchError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Errors the cohort producer can surface.
 #[derive(Debug, thiserror::Error)]
 pub enum ProducerError {
@@ -350,9 +357,16 @@ pub enum ProducerError {
     /// in-memory kept-record streams are monotone by construction).
     #[error("per-position merge failed: {0}")]
     Merge(Box<PerPositionMergerError>),
-    /// The reference-fetch closure failed.
-    #[error("reference fetch failed: {0}")]
-    Ref(String),
+    /// The reference-fetch closure failed; the fetcher's typed cause is
+    /// preserved through `source()`.
+    #[error("reference fetch failed")]
+    Ref(#[source] RefFetchError),
+    /// The chunk cut failed to advance past `next_chunk_start`. A degenerate
+    /// fold (every reach collapsing at the boundary) would otherwise spin
+    /// `produce_chunk` forever; this is the release-level guard for the
+    /// progress invariant (previously a `debug_assert!`).
+    #[error("chunk cut {cut} did not advance past next_chunk_start {next_chunk_start}")]
+    StalledCut { next_chunk_start: u32, cut: u32 },
 }
 
 /// Wrap an owned [`PileupRecord`] as the `Result` item the
@@ -507,7 +521,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         mut emit: Emit,
     ) -> Result<(), ProducerError>
     where
-        RefF: FnMut(u32, u32, u32) -> Result<Vec<u8>, String>,
+        RefF: FnMut(u32, u32, u32) -> Result<Vec<u8>, RefFetchError>,
         DustF: FnMut(u32, &Range<u32>) -> Vec<Range<u32>>,
         Emit: FnMut(PileupCohortChunk),
     {
@@ -679,10 +693,11 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
 
     /// Produce the next chunk of the current interval, or `Ok(None)` when the
     /// interval is drained. `fetch_ref` returns the REF bases for a 1-based
-    /// `(start, length)` span (errors stringified into [`ProducerError::Ref`]).
+    /// `(start, length)` span (errors carried through [`ProducerError::Ref`]
+    /// with their typed cause intact).
     pub fn produce_chunk(
         &mut self,
-        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, String>,
+        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, RefFetchError>,
     ) -> Result<Option<PileupCohortChunk>, ProducerError> {
         loop {
             if self.next_chunk_start >= self.interval_end {
@@ -696,12 +711,15 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             } else {
                 self.fold.find_cut(w).min(self.interval_end)
             };
-            debug_assert!(
-                cut > self.next_chunk_start,
-                "chunk cut must make progress ({} <= {})",
-                cut,
-                self.next_chunk_start,
-            );
+            // Forward progress: the loop sets `next_chunk_start = cut` on a
+            // variant-free span and `continue`s, so a non-advancing cut would
+            // spin forever. Guard it at release level (was a `debug_assert!`).
+            if cut <= self.next_chunk_start {
+                return Err(ProducerError::StalledCut {
+                    next_chunk_start: self.next_chunk_start,
+                    cut,
+                });
+            }
 
             // Keep decision over the (complete) fold, then drop dust.
             self.fold
@@ -796,7 +814,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     fn fetch_ref_span(
         &self,
         variable: &[u32],
-        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, String>,
+        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, RefFetchError>,
     ) -> Result<RefSpan, ProducerError> {
         let first = variable[0];
         let positions = self.fold.positions();
@@ -1074,7 +1092,7 @@ mod tests {
             CohortChunkIntegrator::new(readers, names(samples.len()), min_alt_obs, target_variants);
         integ.begin_interval(0, 1..INTERVAL_END, mask);
 
-        let mut fetch = |_start: u32, len: u32| Ok::<_, String>(vec![b'N'; len as usize]);
+        let mut fetch = |_start: u32, len: u32| Ok::<_, RefFetchError>(vec![b'N'; len as usize]);
         let mut out: Vec<CohortPileupRecord> = Vec::new();
         let mut expected_order = 0u64;
         while let Some(chunk) = integ.produce_chunk(&mut fetch).unwrap() {

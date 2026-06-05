@@ -1,21 +1,19 @@
 //! Driver / wiring — section orchestration (appendix §G).
 //!
-//! *(today: `var_calling::driver` `drive_blocks_parallel` + the
-//! `pop_var_caller::var_calling::run_var_calling` CLI entry)*
+//! Wires the three sections producer → caller → writer and exposes the cohort
+//! `.psp` → VCF entry point ([`run_var_calling`]) the CLI invokes.
 //!
-//! Wires the three sections producer → caller → writer and exposes the new
-//! cohort `.psp` → VCF entry point ([`run_var_calling`]), the one the
-//! byte-identity oracle drives against the old `var_calling::` path.
-//!
-//! **Phase 4: single-threaded.** The pipeline runs the producer
-//! ([`CohortChunkIntegrator`]) inline, calling the caller ([`VariantCaller`])
-//! and writer ([`VcfWriter`]) for each chunk in genomic order. This is enough
-//! to turn the byte-identity oracle green — the producer already emits in
-//! `chunk_order` order, so the writer's reorder is a no-op here. The bounded
-//! `crossbeam-channel` parallel topology (producer thread / W caller threads /
-//! writer thread; the writer's `BTreeMap` reorder then does real work) is a
-//! follow-up perf step that does not change the bytes (the writer reorders by
-//! `chunk_order` regardless).
+//! **Parallel topology.** A bounded-`crossbeam-channel` pipeline inside a
+//! [`std::thread::scope`]: the producer ([`CohortChunkIntegrator`]) runs on
+//! the main thread (its per-sample readers + REF/dust fetchers are
+//! thread-local) and ships [`PileupCohortChunk`]s; `W` caller threads
+//! ([`VariantCaller`]) pop chunks, call them, and push [`CalledChunk`]s; one
+//! writer thread ([`VcfWriter`]) drains them, reordering by `chunk_order` via a
+//! `BTreeMap` so the emitted VCF is in genomic order regardless of how the
+//! callers finish. Both hand-offs are count-bounded (depth ≈
+//! `QUEUE_DEPTH_PER_WORKER × n_workers`) for back-pressure, so peak tracks the
+//! queue capacity rather than scheduling. The output is byte-identical for any
+//! worker count.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -29,7 +27,7 @@ use crate::fasta::{
 use crate::pop_var_caller::var_calling::VarCallingArgs;
 use crate::psp::{PspReadError, PspReader};
 use crate::regions::{ContigBounds, Region, RegionSet};
-use crate::var_calling::cohort_integration::{CohortChunkIntegrator, ProducerError};
+use crate::var_calling::cohort_integration::{CohortChunkIntegrator, ProducerError, RefFetchError};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::em_posterior_calc::{CallerError, VariantCaller};
@@ -44,8 +42,15 @@ use crate::vcf::{CohortMetadata, WriterConfig};
 
 /// Open-file buffer size (matches `pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY`).
 const BUFFERED_IO_CAPACITY: usize = 64 * 1024;
-/// Default per-chunk variable-position target (matches `DEFAULT_DESIRED_VARIANTS_PER_BLOCK`).
+/// Default per-chunk variable-position target when `--target-variants-per-chunk`
+/// is left at its `0` sentinel. Trades chunk size for memory (resident ≈ target
+/// × n_samples); output is independent of it (chunks always cut at clean group
+/// boundaries). Surfaced in the startup log so the effective value is visible.
 const DEFAULT_TARGET_VARIANTS: u32 = 1024;
+/// Bounded-queue depth per worker on both hand-offs: peak resident chunks ≈
+/// `QUEUE_DEPTH_PER_WORKER × n_workers`. `2` keeps every worker fed across one
+/// hand-off without unbounded look-ahead — the back-pressure cap.
+const QUEUE_DEPTH_PER_WORKER: usize = 2;
 /// DUST sub-span for the resident-buffer bound. The mask is byte-identical for
 /// any sub-span (runs are coalesced across boundaries); this just caps RAM.
 const DUST_SUBSPAN: u32 = 1_000_000;
@@ -204,7 +209,13 @@ pub fn run_var_calling(
                 .unwrap_or(1)
         })
         .max(1);
-    let cap = (2 * n_workers).max(1);
+    let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
+    // Surface the resolved concurrency / chunk-sizing defaults so an operator
+    // can recover what a running instance actually chose (the values default
+    // implicitly from `--threads` / the `--target-variants-per-chunk` sentinel).
+    eprintln!(
+        "var-calling: workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants}"
+    );
     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<PileupCohortChunk>(cap);
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
@@ -263,16 +274,17 @@ pub fn run_var_calling(
                     producer.begin_interval(chrom_id, interval, mask);
                     loop {
                         let chunk = {
-                            let mut fetch = |start: u32, len: u32| -> Result<Vec<u8>, String> {
-                                ref_fetch(
-                                    &mut ref_fetcher,
-                                    chrom_id,
-                                    &args.reference,
-                                    &chrom_names,
-                                    start,
-                                    len,
-                                )
-                            };
+                            let mut fetch =
+                                |start: u32, len: u32| -> Result<Vec<u8>, RefFetchError> {
+                                    ref_fetch(
+                                        &mut ref_fetcher,
+                                        chrom_id,
+                                        &args.reference,
+                                        &chrom_names,
+                                        start,
+                                        len,
+                                    )
+                                };
                             producer.produce_chunk(&mut fetch)?
                         };
                         let Some(chunk) = chunk else { break };
@@ -308,7 +320,9 @@ pub fn run_var_calling(
 /// Fetch REF bytes for `chrom_id`, building a fresh per-contig
 /// [`StreamingChromRefFetcher`] when the chromosome changes (fetches within a
 /// chromosome are monotonic-forward across chunks, satisfying the fetcher's
-/// sliding-window contract). Errors are stringified for the producer's closure.
+/// sliding-window contract). The typed [`ChromRefFetchError`] is boxed (not
+/// stringified) so the producer's [`ProducerError::Ref`] keeps it in the
+/// `source()` chain.
 fn ref_fetch(
     cache: &mut Option<(u32, StreamingChromRefFetcher)>,
     chrom_id: u32,
@@ -316,15 +330,14 @@ fn ref_fetch(
     chrom_names: &[String],
     start: u32,
     len: u32,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RefFetchError> {
     if cache.as_ref().map(|(c, _)| *c) != Some(chrom_id) {
-        let f = StreamingChromRefFetcher::for_contig(fasta, &chrom_names[chrom_id as usize])
-            .map_err(|e| e.to_string())?;
+        let f = StreamingChromRefFetcher::for_contig(fasta, &chrom_names[chrom_id as usize])?;
         *cache = Some((chrom_id, f));
     }
     let (_, fetcher) = cache.as_mut().expect("just set");
     // `ChromRefFetcher::fetch` (trait) returns an owned `Vec<u8>`.
-    fetcher.fetch(start, len).map_err(|e| e.to_string())
+    Ok(fetcher.fetch(start, len)?)
 }
 
 /// Compute the interval's DUST mask (empty when complexity filtering is off),

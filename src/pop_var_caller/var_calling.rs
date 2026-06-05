@@ -73,8 +73,10 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub regions: Option<PathBuf>,
 
-    /// Worker threads for the rayon pool. If omitted, rayon picks
-    /// the default (all logical cores).
+    /// Worker threads. If omitted, defaults to all logical cores
+    /// (`available_parallelism`). Also sizes the pipeline's caller-thread
+    /// pool and the two bounded hand-off queues (depth ≈ 2 × threads), so
+    /// it is the primary peak-memory knob.
     #[arg(long)]
     pub threads: Option<usize>,
 
@@ -88,12 +90,13 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub no_complexity_filter: bool,
 
-    /// Soft lower bound on the post-filter variant count per chunk.
-    /// The loader grows each chunk's BP span adaptively until the
-    /// kept-position count crosses this target — decoupling worker
-    /// workload from PSP block size and per-region variant density.
-    /// Pass `0` (the default) to keep the legacy BP-only loop (one
-    /// pull of `--chunk-genomic-span` BP per chunk).
+    /// Soft target for the number of variable (cohort-variant) positions
+    /// per chunk — the producer accumulates records until it reaches this
+    /// many, then cuts at the next safe gap. Trades chunk size for memory
+    /// (resident ≈ target × n_samples); the emitted VCF is independent of
+    /// it (cuts always fall on clean group boundaries). `0` (the default)
+    /// selects the built-in default of 1024; any positive value overrides.
+    /// The resolved value is printed in the startup log.
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
 

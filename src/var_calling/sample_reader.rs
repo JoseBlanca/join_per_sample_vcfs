@@ -10,8 +10,9 @@
 //!   one [`SamplePspChunk`] per psp **segment** (the natural read unit), via
 //!   [`next_chunk`](SamplePspReader::next_chunk); the producer takes
 //!   `min(peek_next_span)` across readers to advance the cohort in lockstep.
-//!   Used single-threaded (one reader owned per sample on the producer
-//!   thread) — the `!Send`-by-ownership invariant of appendix §A.
+//!   One reader is owned per sample; the producer decodes the per-sample
+//!   readers in parallel via disjoint `&mut` (`par_iter_mut`), so `R: Send`
+//!   is required (appendix §A).
 //! - [`SamplePspChunk`] — one sample's columns for **one psp segment**.
 //!   `new` decodes the *light* fold columns eagerly
 //!   ([`positions`](SamplePspChunk::positions) /
