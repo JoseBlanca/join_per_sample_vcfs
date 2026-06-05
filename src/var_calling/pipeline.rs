@@ -175,7 +175,7 @@ pub fn run_var_calling(
         sample_names: sample_names.clone(),
         contigs: chromosomes.clone(),
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
-        command_line: "var-calling".to_string(),
+        command_line: crate::pop_var_caller::common::current_command_line(),
     };
     let writer_config = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
     let filters = DownstreamFilters {

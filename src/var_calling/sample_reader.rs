@@ -507,11 +507,6 @@ impl<R: Read + Seek> SamplePspReader<R> {
         }
     }
 
-    /// Recover the owned [`PspReader`].
-    pub fn into_reader(self) -> PspReader<R> {
-        self.blocks.into_reader()
-    }
-
     /// Re-point at a new region, reusing the decode buffers (the cohort
     /// producer resets one reader per sample at every covered-interval /
     /// chromosome boundary so the zstd context + column slabs persist).

@@ -625,13 +625,10 @@ pub enum ContaminationEstimationError {
     /// distinguish a transient mid-stream failure from a fatal
     /// header-mismatch on the first record.
     ///
-    /// The boxed `dyn Error` lets the side-pass accept either the
-    /// streaming pipeline's
+    /// The boxed `dyn Error` lets the side-pass accept the
+    /// merger's
     /// [`PerPositionMergerError`](crate::var_calling::per_position_merger::PerPositionMergerError)
-    /// or the
-    /// chunk-driven
-    /// [`ContaminationStreamError`](crate::pop_var_caller::contamination_chunked_stream::ContaminationStreamError)
-    /// without a hard dependency on either concrete type. Callers
+    /// without a hard dependency on the concrete type. Callers
     /// that need the underlying type can downcast.
     #[error("upstream merger failed after {sites_processed} informative sites")]
     Upstream {

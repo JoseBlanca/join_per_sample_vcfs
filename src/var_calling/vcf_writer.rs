@@ -33,7 +33,8 @@ pub struct DownstreamFilters {
 /// Run-level counters for the run summary (≈ the old `ChunkDriverStats`). The
 /// emit-side counters are decided here; the caller-side counters
 /// (`lh_cap_*` / `groups_skipped_*` / `records_dropped_low_alt_obs`) are rolled
-/// from each [`CalledChunk`]'s [`CallStats`]. Not part of the VCF.
+/// from each [`CalledChunk`]'s [`CallStats`](crate::var_calling::types::CallStats).
+/// Not part of the VCF.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WriterStats {
     pub records_written: u64,

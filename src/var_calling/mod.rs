@@ -35,12 +35,6 @@
 //! path keeps the SIMD EM with no SIMD loss (appendix §D.2 conditional,
 //! verified against the code in Phase 0).
 
-// Build-phase only: the package is wired incrementally (P1→P4), so verbatim
-// kernels carry pub(crate) items whose only callers were the dropped columnar
-// driver/worker. Removed at the P7 swap, when the package becomes
-// `var_calling::` and the old consumers are deleted/ported.
-#![allow(dead_code)]
-
 // --- Copied verbatim from `var_calling` (the numeric kernels) ---
 pub mod contamination_estimation;
 pub mod dust_filter;

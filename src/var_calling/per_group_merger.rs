@@ -21,10 +21,11 @@
 //!
 //! The merger pulls a batch of upstream groups, processes them
 //! serially, and emits the resulting records one-by-one in input
-//! order. Parallelism around the merger lives at the block-level
-//! consume in [`crate::var_calling::driver`]; running an inner
-//! `rayon::par_iter` here would only nest under that outer
-//! decomposition.
+//! order. Parallelism around the merger lives at the chunk-level
+//! consume in the [`pipeline`](crate::var_calling::pipeline) (one
+//! [`VariantCaller`](crate::var_calling::em_posterior_calc::VariantCaller)
+//! per worker thread); running an inner `rayon::par_iter` here would only
+//! nest under that outer decomposition.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;

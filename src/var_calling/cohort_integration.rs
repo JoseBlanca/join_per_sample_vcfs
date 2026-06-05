@@ -27,15 +27,15 @@
 //! Phase 2 builds this module, in two steps:
 //! - **2a** ([`CohortSpanFold`]): the cohort keep/cut math — the revived
 //!   `two_pass::WindowSummary`, folding over the reader's *light* columns
-//!   ([`SamplePspChunk`](crate::var_calling::sample_reader::SamplePspChunk)
+//!   ([`SamplePspChunk`]
 //!   `positions`/`ref_spans`/`nonref_obs`) instead of a `SampleColumns`.
 //!   Plus [`drop_dust_masked`], the dust step. Byte-identity-critical, so the
 //!   arithmetic is copied verbatim from `two_pass.rs`.
 //! - **2b** ([`CohortChunkIntegrator`]): the streaming integrator over **one
 //!   covered interval** — segment buffering to the watermark, per-position
 //!   record building (columnar→record via
-//!   [`SamplePspChunk::records_for`](crate::var_calling::sample_reader::SamplePspChunk::records_for),
-//!   merged by the revived [`PerPositionMerger`](crate::var_calling::per_position_merger::PerPositionMerger)),
+//!   [`SamplePspChunk::records_for`],
+//!   merged by the revived [`PerPositionMerger`]),
 //!   safe-gap cut, REF fetch (closure-injected), `chunk_order` stamping.
 //!   The chromosome / interval iteration, per-chromosome REF fetcher, and
 //!   `DustAheadPool` wiring are the next step (2b-wiring); `produce_chunk`
@@ -60,10 +60,10 @@ fn reach(pos: u32, span: u32) -> u32 {
 ///
 /// Parallel sorted arrays keyed by [`positions`](Self::positions). The keep /
 /// cut logic ([`derive_is_kept`](Self::derive_is_kept) /
-/// [`find_cut`](Self::find_cut) / [`chunk_cuts`](Self::chunk_cuts)) is copied
+/// [`find_cut`](Self::find_cut)) is copied
 /// verbatim from `two_pass.rs` — it is the byte-identity core. The only change
 /// is the fold's input: light-column slices from a
-/// [`SamplePspChunk`](crate::var_calling::sample_reader::SamplePspChunk)
+/// [`SamplePspChunk`]
 /// rather than `SampleColumns` accessors (the values are identical:
 /// `ref_spans[i]` == `ref_span_at(i)`, `nonref_obs[i]` == `non_ref_obs_sum_at(i)`).
 #[derive(Debug, Default)]
@@ -94,11 +94,6 @@ impl CohortSpanFold {
         self.positions.clear();
         self.max_ref_span.clear();
         self.max_nonref_obs.clear();
-    }
-
-    /// Number of distinct positions folded so far.
-    pub fn n_positions(&self) -> usize {
-        self.positions.len()
     }
 
     /// The folded positions (sorted, unique).
@@ -299,54 +294,6 @@ impl CohortSpanFold {
             i = j;
         }
         kept
-    }
-
-    /// Partition `[interval_start, interval_end_exclusive)` into chunk
-    /// boundaries: each chunk accumulates ~`target_variants` kept positions
-    /// and ends at the next variant group's start (a clean boundary). Copied
-    /// from `WindowSummary::chunk_cuts`.
-    pub fn chunk_cuts(
-        &self,
-        min_alt_obs: u32,
-        target_variants: u32,
-        interval_start: u32,
-        interval_end_exclusive: u32,
-    ) -> Vec<u32> {
-        let n = self.positions.len();
-        let threshold = u64::from(min_alt_obs.max(1));
-        let target = target_variants.max(1);
-        let mut cuts = vec![interval_start];
-        let mut kept_in_chunk = 0u32;
-        let mut i = 0usize;
-        while i < n {
-            let mut group_end = reach(self.positions[i], self.max_ref_span[i]);
-            let mut obs_sum = u64::from(self.max_nonref_obs[i]);
-            let mut j = i + 1;
-            while j < n && self.positions[j] <= group_end {
-                group_end = group_end.max(reach(self.positions[j], self.max_ref_span[j]));
-                obs_sum += u64::from(self.max_nonref_obs[j]);
-                j += 1;
-            }
-            if obs_sum >= threshold {
-                kept_in_chunk += (j - i) as u32;
-            }
-            i = j;
-            if kept_in_chunk >= target {
-                let cut = if i < n {
-                    self.positions[i]
-                } else {
-                    interval_end_exclusive
-                };
-                if cut > *cuts.last().expect("seeded with interval_start") {
-                    cuts.push(cut);
-                }
-                kept_in_chunk = 0;
-            }
-        }
-        if *cuts.last().expect("seeded with interval_start") < interval_end_exclusive {
-            cuts.push(interval_end_exclusive);
-        }
-        cuts
     }
 }
 

@@ -81,16 +81,6 @@ pub struct EstimateContaminationArgs {
     #[arg(long)]
     pub batch_assignment: Option<PathBuf>,
 
-    /// Soft lower bound on the post-filter variant count per chunk.
-    /// The loader grows each chunk's BP span adaptively until the
-    /// kept-position count crosses this target — decoupling
-    /// per-chunk workload from PSP block size and per-region
-    /// variant density. Pass `0` (the default) to keep the legacy
-    /// BP-only loop. Same semantics as the var-calling subcommand's
-    /// knob.
-    #[arg(long, default_value_t = 0)]
-    pub target_variants_per_chunk: u32,
-
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
     pub psp_files: Vec<PathBuf>,
@@ -350,7 +340,7 @@ pub enum EstimateContaminationCliError {
 /// 5. Build a [`ContaminationEstimationConfig`] from CLI args and
 ///    validate it.
 /// 6. Combine the readers into a
-///    [`PerPositionMerger`](crate::var_calling::per_position_merger::PerPositionMerger)
+///    [`PerPositionMerger`]
 ///    (k-way merge over the cohort).
 /// 7. Run [`estimate_contamination`].
 /// 8. Convert the engine-side

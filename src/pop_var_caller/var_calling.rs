@@ -5,18 +5,16 @@
 //!   PspReader(s) → PerPositionMerger → DustFilter → VariantGrouper
 //!   → PerGroupMerger → PosteriorEngine → CohortVcfWriter
 //!
-//! The DUST filter is bypassed when `--no-complexity-filter` is set;
-//! both branches converge on the same downstream chain via a
-//! `Box<dyn Iterator>` adapter that lifts the upstream error into
-//! [`GrouperError`] — the wiring lives in
-//! [`crate::var_calling::driver::drive_cohort_chunked`].
+//! This CLI layer validates inputs (chromosome agreement, FASTA-vs-`.psp`
+//! MD5), loads any `--contamination-estimates`, and hands off to the
+//! re-architected record-streaming pipeline that runs those stages — the
+//! wiring lives in [`crate::var_calling::pipeline::run_var_calling`].
 //!
 //! Contamination plumbing:
 //!
 //! - With `--contamination-estimates <FILE>`: the artefact is loaded
 //!   and reconciled against the cohort sample names (extras are
-//!   tolerated, absences are not), then handed to the posterior engine
-//!   via [`PosteriorEngineConfig::contamination`].
+//!   tolerated, absences are not), then handed to the posterior engine.
 //! - Without: the engine runs in "no contamination" mode and the
 //!   `contamination` field stays `None`.
 //!
@@ -220,8 +218,8 @@ pub enum VarCallingCliError {
 ///    built — the chunk driver constructs a per-chromosome
 ///    `StreamingChromRefFetcher` as it advances.
 /// 8. Cohort metadata + writer-config template.
-/// 9. Drive the chunk loop ([`drive_cohort_chunked`]): a sequential
-///    per-chromosome outer loop with a within-chromosome chunk loop
+/// 9. Drive the record-streaming pipeline
+///    ([`crate::var_calling::pipeline::run_var_calling`]): a producer
 ///    that materialises one chunk × N samples at a time, partitions it
 ///    into windows, and runs the per-group merger + posterior EM on
 ///    each window. Records stream straight into a single

@@ -108,7 +108,7 @@ pub struct PileupCohortChunk {
 /// The final emitted record (appendix §C, `[RENAME PosteriorRecord]`).
 ///
 /// A type alias onto the copied-verbatim kernel output
-/// [`PosteriorRecord`](crate::var_calling::posterior_engine::PosteriorRecord)
+/// [`PosteriorRecord`]
 /// — keeping it the *same* type the SIMD EM produces is how byte-identity is
 /// preserved (no conversion). The standalone `Variant` name becomes the real
 /// type at the P7 swap.
