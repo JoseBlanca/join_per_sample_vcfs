@@ -19,7 +19,41 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-03):** **Analysis regions from a BED
+> - **Last completed task (2026-06-05):** **Code review of the
+>   re-architected record-streaming cohort `.psp` → VCF pipeline**
+>   (the Phases 0–7 rewrite, swapped into production on branch
+>   `re-architect` @ `ef93b67`; ~5 k LoC across 8 new modules +
+>   3 modified production files, replacing the deleted
+>   `driver`/`worker`/`loader`/`columns`/`partition`/`two_pass`/`kernels`
+>   chain). Orchestrator skill, all 11 categories.
+>   [re_architecture_pipeline_2026-06-05.md](doc/devel/reports/reviews/re_architecture_pipeline_2026-06-05.md).
+>   Verdict: **Request-changes** — 0 Blockers, 8 Major, 16 Minor, grouped
+>   Nits. No correctness Blockers in the emitted calls (`fmt`/`clippy`
+>   clean; 996 lib + all integration tests pass; `unsafe_concurrency`
+>   clean — no `unsafe`, sound `thread::scope`/crossbeam close ordering,
+>   order-independent parallel fold; `refactor_safety` verified the
+>   byte-identity-sensitive math is line-by-line identical to `main`).
+>   Verdict driven by: **M1** a red `cargo doc` CI gate (7 unresolved
+>   intra-doc-link errors — dead refs to the deleted
+>   `driver`/`drive_cohort_chunked`/`contamination_chunked_stream` +
+>   broken `GrouperError`/`CallStats`/`PosteriorEngineConfig::contamination`
+>   — plus 5 redundant-link warnings); **M2** the VCF `##commandline`
+>   header hard-coded to `"var-calling"` (provenance regression vs
+>   `main`'s `current_command_line()`; not a byte-identity-contract
+>   break since the oracle strips `^##`); **M3** a zero-allele `.psp`
+>   record panics / mis-decodes `from_block` (robustness regression vs
+>   the row reader); **M4** REF-fetch error flattened to
+>   `ProducerError::Ref(String)`; **M5** stale crate-wide
+>   `#![allow(dead_code)]` post-P7; **M6** release-load-bearing invariants
+>   (producer loop-progress, writer gapless) guarded only by
+>   `debug_assert!`; **M7** the writer reorder buffer (sole genomic-order
+>   guarantor under parallelism) + `emit_or_drop` + parallel `read_samples`
+>   untested at the unit level — the rewrite deleted its own A/B oracle;
+>   **M8** hidden `target_variants_per_chunk` 0→1024 sentinel /
+>   `n_workers`/`cap` magic-number defaults. Per-category audit trail at
+>   `tmp/review_2026-06-05_re-architect-pipeline/`. See the Stage 5
+>   §"Re-architected record-streaming pipeline" block.
+> - **Previous task (2026-06-03):** **Analysis regions from a BED
 >   file (`--regions`) — implemented, benchmarked, reviewed, merged.**
 >   Adds `--regions <bed>` to both `pileup` and `var-calling`; the
 >   pipeline always operates on a `RegionSet` (the BED, or one
@@ -1111,7 +1145,11 @@ via rayon.
   - Wave 2 / 3 / Likely / Speculative findings tracked in the report.
 
 #### Within-chromosome chunk-parallel rewrite (now flat under `src/var_calling/`; formerly `from_psp/`, originally `cohort_block/`)
-- **Status:** fixes-applied (2026-06-01 review — see "Applied" note below); reviewed (2026-06-01, full-but-prioritized subtree review); parallel block-consume shipped
+- **Status:** **superseded (2026-06-05)** — the columnar
+  `driver`/`worker`/`loader`/`columns`/`partition`/`two_pass`/`kernels`
+  chain this block describes was deleted and replaced by the
+  record-streaming pipeline; see the "Re-architected record-streaming
+  pipeline" block below. (Historical status follows.) fixes-applied (2026-06-01 review — see "Applied" note below); reviewed (2026-06-01, full-but-prioritized subtree review); parallel block-consume shipped
   (`0d49cf8`, `51b5c63`); **streaming-columnar produce rewrite —
   Stages 1, 2 & 3 implemented**, plus the **DUST worker pool**
   (parallel DUST-ahead). Memory fix landed (Stage 2: N=26 peak RSS
@@ -1170,6 +1208,101 @@ via rayon.
   - **M12 / M13 / M14 / M15 / M16 / M17 / M18 / M19 / M20 / M22 / M23 / M24 / M25 / M26 / M27 / M28 / M29 / M30 / M31 / M32** — see the report's §6 Findings section and §8 Missing tests. Highlights: split `load_and_run_chunk_with_retry`'s 19-param body into three phase helpers; group `load_chunk_from_iters`'s span/variant knobs into `ChunkLoadExtent`; add `SampleColumns::clone_from_columns` and use it for both carryover snapshot / restore loops; split per-window counters out of `ColumnarPipelineScratch`; drop the trailing `..` from the `AlleleSupportStats` destructure at `columns.rs:116`; delete or wire `chain_id_scratch` (`#[allow(dead_code)]`); validate `masked_intervals` sorting in `partition_window`; pin filter order in `emit_or_drop` with five per-category unit tests; pin `enforce_max_alleles_columnar` tie-break against the row-shape kernel; clamp `safe_end` to `chrom_one_past_end` on the last chunk; rename `*_cfg` vs `*_config` to a single form crate-wide; rename `shared_ref_fetcher` to `into_shared_ref_fetcher`; add tests for `SampleCountMismatch` / `CarryoverLengthMismatch` (both loader and pre-pass); add a `par_iter_mut` vs sequential equivalence test.
   - **Mi-class** (~26 minors): `#[non_exhaustive]` on the new pub data structs (gated on Open Question 1); `pub mod` → `pub(crate) mod` for every submodule that has no out-of-crate consumer (gated on Open Question 1); rename `MaterialisedChunk::clear_data` → `clear`; rename `WorkerSlot.output_buf` / `WorkerSlot.scratch` to carry domain nouns; collapse `Arc::new(StreamingChromRefFetcher)` to a borrow; drop `chunk.windows.clone()`; take `&PosteriorEngineConfig` in `run_window`; remove double-clone in `push_allele_into_scratch`; demote `pub` items with no caller; merge `Ok(idx) | Err(idx)` arms; split `unify_alleles.rs`/`worker.rs`/`loader.rs` along their existing internal sub-step boundaries; move `build_overlapping_variant_group` out of `worker.rs` and into `test_helpers.rs`; convert the three `Vec<Vec<_>>` jagged arrays to CSR; consider `OneBasedPos` / `OneBasedRange` / `ChromId` newtypes; group `ChunkDriverParams` along stage boundaries; add `// REGRESSION THRESHOLD: N%` to `benches/cohort_e2e_perf.rs`; add `--ignored` should-panic regression for `u32_from_usize` overflow.
   - **Nits** — single mechanical pass to clear the 16 in-scope clippy errors (`single_range_in_vec_init` ×8, `type_complexity` ×4, `bool_assert_comparison` ×2, `doc_lazy_continuation` ×2) plus add per-call-site justification comments to the 14 `#[allow(...)]` annotations (12 `clippy::too_many_arguments` + `clippy::arc_with_non_send_sync` + `clippy::needless_range_loop`).
+
+#### Re-architected record-streaming pipeline (replaces the chunk-parallel rewrite)
+- **Status:** reviewed (2026-06-05). Shipped to production on branch
+  `re-architect` (Phase 7 swap, `1d34f85`). The columnar driver/worker/
+  loader/columns/partition/two_pass/kernels chain is **deleted**; the only
+  cohort `.psp` → VCF path is now the three-component record-streaming
+  topology (producer `CohortChunkIntegrator` → W `VariantCaller` callers →
+  `VcfWriter`), wired with two bounded crossbeam channels inside a
+  `std::thread::scope`. Goal was **clarity** (runtime stages map to named
+  logical sections), with byte-identical calls vs `main` as the hard
+  contract and memory/wall as a measured guardrail.
+- **Spec / plan:**
+  [re_architecture_streaming_pipeline.md](doc/devel/implementation_plans/re_architecture_streaming_pipeline.md)
+  (architecture, constraints, build strategy),
+  [re_architecture_module_outline.md](doc/devel/implementation_plans/re_architecture_module_outline.md)
+  (module/type map),
+  [re_architecture_execution_plan.md](doc/devel/implementation_plans/re_architecture_execution_plan.md)
+  (the byte-identity-gated phases),
+  [re_architecture_p6_measurement.md](doc/devel/implementation_plans/re_architecture_p6_measurement.md)
+  (Phase 6 vs `main` at scale).
+- **Code:** [src/var_calling/](src/var_calling/) — new modules `types.rs`,
+  `sample_reader.rs`, `cohort_integration.rs`, `pileup_overlaps.rs`,
+  `em_posterior_calc.rs`, `vcf_writer.rs`, `pipeline.rs`, rewritten
+  `mod.rs`; the numeric kernels (`per_group_merger`, `posterior_engine`,
+  `variant_grouping`, `per_position_merger`, `dust_filter`,
+  `contamination_estimation`) are carried verbatim. CLI rewired in
+  [src/pop_var_caller/var_calling.rs](src/pop_var_caller/var_calling.rs);
+  contamination estimator ported to the record-based `PerPositionMerger`
+  in [src/pop_var_caller/estimate_contamination.rs](src/pop_var_caller/estimate_contamination.rs).
+- **Tests:** 996 lib + all cohort integration pass (in container, commit
+  `ef93b67`); `fmt --check` + `clippy --all-targets --all-features -D warnings`
+  clean.
+- **Latest review:** [re_architecture_pipeline_2026-06-05.md](doc/devel/reports/reviews/re_architecture_pipeline_2026-06-05.md)
+  — **Request-changes** (orchestrator skill, all 11 categories; HEAD
+  `ef93b67`). 0 Blockers, 8 Major, 16 Minor, grouped Nits. No correctness
+  Blockers in emitted calls; `unsafe_concurrency` clean (no `unsafe`,
+  sound channel-close ordering, order-independent parallel-decode/serial-fold);
+  `refactor_safety` verified `derive_is_kept`/`find_cut`/`chunk_cuts`/
+  `merge_block_ranges`/`emit_or_drop`/`passes_min_alt_obs`/
+  `merge_group_with_ref` are line-by-line identical to `main`. Per-category
+  audit trail at `tmp/review_2026-06-05_re-architect-pipeline/`.
+- **Open (from the 2026-06-05 review — see report §6/§8):**
+  - **M1** — Turn the `cargo doc` gate green: fix the 7 unresolved
+    intra-doc links (dead refs to `driver` / `drive_cohort_chunked` /
+    `contamination_chunked_stream` in `var_calling.rs:11,12,19,223`,
+    `contamination_estimation.rs:633`, `per_group_merger.rs:25`; the
+    broken `CallStats` link at `vcf_writer.rs:36`) + the 5 redundant-link
+    warnings (`types.rs:111`, `cohort_integration.rs:30/38/66`,
+    `estimate_contamination.rs:353`).
+  - **M2** — Restore `current_command_line()` for the VCF `##commandline`
+    header (currently hard-coded `"var-calling"` in `pipeline.rs:179`).
+  - **M3** — Make a zero-allele `.psp` record a typed `PspReadError`, not
+    a panic / silent wrong `ref_span`, in `from_block` (`sample_reader.rs:344`)
+    — preferably via a per-record `n_alleles >= 1` invariant in
+    `decode_block_payload`.
+  - **M4** — Carry the typed `ChromRefFetchError` through
+    `ProducerError::Ref` (currently flattened to `String` in
+    `cohort_integration.rs:407` + double-stringified in `pipeline.rs::ref_fetch`).
+  - **M5** — Remove the stale crate-wide `#![allow(dead_code)]`
+    (`mod.rs:42`) and prune / `pub(crate)`-restrict the dead surface it
+    masks.
+  - **M6** — Promote the producer loop-progress (`cohort_integration.rs:752`)
+    and writer gapless (`vcf_writer.rs:112`) `debug_assert!`s to typed
+    release errors (`StalledCut` / `MissingChunks`).
+  - **M7** — Add unit tests for the writer reorder buffer (permuted +
+    buffered-future-chunk), `emit_or_drop` per-gate ordering/counters, and
+    a multi-thread `read_samples`-vs-reference test; record the out-of-tree
+    byte-identity verification now that `main`'s in-repo A/B oracle is
+    deleted (cf. the var_calling 2026-06-01 M9 decision).
+  - **M8** — Surface the hidden defaults: make the CLI
+    `--target-variants-per-chunk` reference a shared const (drop/​document
+    the `0 → 1024` sentinel; the arg doc still describes the deleted
+    `--chunk-genomic-span`), name the `cap = 2 × n_workers` multiplier, and
+    log resolved `target_variants` / `n_workers` / `cap`.
+  - **Minors** — dropped `chunks_loaded`/`avg_variants_per_chunk` run
+    summary (Mi1); inert `--target-variants-per-chunk` in
+    `estimate-contamination` (Mi2); no in-tree contamination equivalence
+    oracle (Mi3); ploidy-vs-inverted-range error precedence in
+    `merge_group_with_ref` (Mi4); missing `// PANIC-FREE:` on the thread
+    joins (Mi5) and `fetch_ref_span` `binary_search().expect()` (Mi6);
+    `ProducerError::Merge` not `#[source]` (Mi7); stale "Phase 4 /
+    single-threaded / `!Send`" module docs (Mi8); const-via-comment drift
+    (Mi9); two `0 ⇒ ?` target conventions (Mi10); `em_posterior_calc`
+    named after a sub-step (Mi11); `CohortPileupRecord`/`PileupCohortChunk`
+    near-anagram (Mi12); co-dependent mapq-filter fields (Mi13); pipeline →
+    CLI `VarCallingArgs` back-reference (Mi14); stale Cargo.toml crossbeam
+    comment path (Mi15); unguarded `max_reach - first + 1` (Mi16). Plus the
+    §8 missing tests and the out-of-scope `benches/psp_writer_perf.rs:386`
+    panic (breaks `cargo test --all-targets`; not the CI gate, which uses
+    `--lib --tests`).
+  - **Open questions (gate M2/M5/M7/Mi2):** is the `##commandline` change
+    intentional? should `--target-variants-per-chunk` stay a no-op for
+    `estimate-contamination`? where does the byte-identity oracle live now
+    that `main`'s columnar path is deleted? is the crate-wide
+    `#![allow(dead_code)]` meant to persist?
 
 ---
 
