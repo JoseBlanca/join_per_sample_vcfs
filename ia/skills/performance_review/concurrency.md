@@ -2,7 +2,7 @@
 
 **Purpose.** Surface lock-contention bottlenecks, atomic-ordering overhead, and parallelism that costs more than it saves.
 
-**Triggers.** Code uses `Arc`, `Mutex`, `RwLock`, atomics, channels (`mpsc`, `crossbeam-channel`, `tokio::sync`), `rayon::par_iter` / `rayon::scope`, `tokio::spawn`, `std::thread::spawn`, `async fn` with `.await` while holding shared state.
+**Triggers.** Code uses `Arc`, `Mutex`, `RwLock`, atomics, channels (`mpsc`, `crossbeam-channel`, `tokio::sync`), `rayon::par_iter` / `rayon::scope`, `tokio::spawn`, `std::thread::spawn`, `async fn` with `.await` while holding shared state. **Also trigger when two thread pools can be live at once** — e.g. a `rayon` global pool *and* a `std::thread`/`crossbeam` worker set, nested `par_iter`, or `rayon` alongside a `tokio` runtime — even if no lock is in sight; oversubscription is a scheduler cost, not a lock cost.
 
 **Skip when.** Single-threaded code with no shared state. If dispatched anyway, write `No findings.`
 
@@ -39,3 +39,50 @@
 - **Rayon's default splitting assumes roughly uniform per-item cost.** Pre-divided binary-tree ranges leave fast threads idle while one thread finishes the heavy tail when per-item cost varies widely (e.g., variable-coverage pileups, simple vs. complex sites). `with_min_len` controls split *depth*, not runtime balance, so it does not fix this. Symptoms: high wall-clock variance across runs, threads finishing at very different times, `perf` showing futex/sched_yield concentrated near end-of-run. Mitigations to consider: cost-aware partitioning at the producer (split heavy items before handing to Rayon), smaller chunks via `with_min_len`, or a custom adaptive stealing loop. Profile with `perf` before tuning — Rayon overhead is often not the real bottleneck.
 - **Atomic counters cause cross-CPU traffic.** A single global `AtomicU64` incremented from many threads becomes the bottleneck on its own cache line. Patterns: per-thread counters summed at end-of-phase, or `crossbeam_utils::CachePadded<AtomicU64>` per shard. Cross-reference: `data_layout.md` on false sharing.
 - **`Arc::clone` is one atomic increment, not free.** Gratuitous `Arc::clone` in a hot loop (e.g., capturing into a closure that does not outlive the iteration) shows up. Borrow when possible.
+- **Two thread pools sized to the core count oversubscribe by 2×.** When a `rayon` global pool *and* a separately-spawned worker set (`std::thread::scope`, `crossbeam`, a second `rayon::ThreadPool`, or a `tokio` runtime) are both live and both sized to `available_parallelism()` / `--threads`, the machine runs `~2·N` CPU-bound threads on `N` cores. The default of every pool is "I own the machine" — two such defaults collide. This is a scheduler cost (context switches, futex waits), not a lock cost, and it is invisible to lock-focused rules. **See the diagnostic playbook below.** Filed whenever a producer/consumer pipeline pairs a parallel producer (rayon fold/decode) with a parallel consumer (worker threads).
+- **Nested `par_iter` (or a blocking call inside `par_iter`) can starve or deadlock the pool, not just slow it.** A `par_iter` whose closure itself calls `par_iter`, or blocks on a full channel / `Mutex` / I/O, occupies a pool thread while making no progress; enough of them exhaust the fixed pool. Symptom is a *stall*, not just high wall — confirm with a debugger stack dump (below), and isolate the inner/ blocking work onto its own `ThreadPool::install(...)` or off the rayon pool entirely. Cross-reference the deadlock angle to `unsafe_concurrency`.
+
+## Diagnosing thread oversubscription and pool collisions
+
+A distinct sub-task: when a parallel program is *slower than expected as thread count rises* (or scales worse than `main` / a prior version specifically at T≥2), the cause is often **not** any single hot function but **too many runnable threads fighting for too few cores**. The classic shape is two thread pools, each defaulting to "use all cores," live at the same time. This playbook is for confirming or refuting that before recommending a topology change — do not pattern-match a pool rewrite without the evidence below.
+
+### The shapes that cause it
+
+- **Coexisting pools.** A `rayon` global pool (driving a `par_iter`/`par_iter_mut` producer fold or decode) running concurrently with a separate worker set spawned by `std::thread::scope` / `crossbeam` / a second `rayon::ThreadPool` / a `tokio` runtime — both sized to the same `N`. Net `~2·N` CPU-bound threads on `N` cores.
+- **Nested parallelism.** `par_iter` inside `par_iter` (the inner one re-enters the same global pool). E.g. *"30 fields each wanting 16 sort threads on a 16-thread pool = 30× theoretical oversubscription."*
+- **A wrong core count.** `available_parallelism()` reads the cgroup **limit** under Kubernetes/containers, not the **request**; both Tokio and Rayon then build pools to a number the scheduler will throttle. (PostHog: pinning to the CPU *request* instead of the *limit* was part of the fix.)
+- **Blocking inside a pool thread.** Channel send/recv, `Mutex`, or I/O inside a `par_iter` closure parks a worker while holding its slot (see the nested-`par_iter` rule) — this can *stall*, not just slow.
+
+### Symptoms in a sampling profile (what to look for)
+
+The signature is **threads blocked waiting, plus scheduler churn, while mean CPU utilisation stays low and per-item work is unchanged.** Concretely:
+
+- **The producer/dispatcher thread spends most of its samples *blocked* inside the pool's wait primitive**, not doing work. For rayon that is `bridge_producer_consumer` → `in_worker_cold` → `LockLatch::wait_and_reset` → the OS wait. If the thread that *should* be feeding work is 50–70 % parked in the pool latch, it is waiting on workers that the scheduler cannot run.
+- **Scheduler / futex frames rise with thread count.** Compare a T=1 capture against a high-T capture of the *same* workload:
+  - **Linux (`perf`)**: `futex`, `__sched_yield`, high **involuntary** context-switch count (`perf stat -e context-switches,cpu-migrations`; `perf sched`), `finish_task_switch`.
+  - **macOS (`sample`)**: `__psynch_cvwait`, `__psynch_mutexwait`, `__ulock_wait`/`__ulock_wait2`, `swtch_pri`, `semaphore_wait_trap`. These growing *as a share* from T=1 to T=8 (rather than staying flat) is the tell. (Note: a parked rayon pool also shows idle `Sleep::sleep` frames — those are normal idle, distinct from the *contention* frames above.)
+- **Thread count ≫ core count.** Count the OS threads in the profile's thread list and compare to physical cores. `~2·N` threads with `N` cores is the smoking gun; the profiler's per-thread roots make this a 10-second check.
+- **Low mean CPU, spiky demand.** PostHog's breakthrough metric was **CFS throttling spiking in lockstep with p99 latency while mean CPU utilisation stayed low** — brief intense bursts of more-threads-than-cores, not sustained saturation. On a server, watch cgroup `cpu.stat` `nr_throttled` / `throttled_time`; treat **>30 % throttling** as "reduce oversubscription."
+
+### Confirm it before prescribing
+
+- **Diff two thread counts.** Re-run the workload at T=1 and at high T and compare the contention-frame share. If the gap appears *only* at T≥2 and grows with T, oversubscription is implicated (per-item cost is constant, so a per-function fix would not be T-dependent).
+- **Count threads vs cores** from the profile's thread roots.
+- **For a stall (not a slowdown), dump stacks.** Load the stuck process in a debugger (`lldb`/`gdb`, or `sample`/`eu-stack` once) and read every thread's call stack — exhaustion shows as "stage A's threads all blocked on a full channel, stage B's threads all waiting for a free pool worker." A debugger snapshot is faster than reasoning about it.
+
+### Fixes (cheapest first; each is its own experiment)
+
+1. **Size the pools so the total ≈ cores, not `2·cores`.** Cap one pool below the core count (`ThreadPoolBuilder::num_threads`, or pass `N − k` to whatever sizes the rayon pool) so producer-pool + consumer-pool ≈ `N`. One-line change; sweep the split. *"Tokio gets half the cores for I/O, Rayon the full count, accepting mild oversubscription since the I/O threads are mostly parked"* is the asymmetric version — parked threads don't contend, CPU-bound ones do, so reserve cores for whichever side is actually on-CPU.
+2. **Collapse to one pool.** Run both phases on the same pool (move the producer's parallel work onto the consumer threads, or vice-versa) so there is a single scheduler of `N` threads. Largest change; highest risk if it reorders work — gate on output-identity.
+3. **Serialize the cheaper side.** If one pool's parallel section is small, drop its `par_iter` and let the other side own all the cores. Often the simplest win.
+4. **Isolate, don't share.** For nested or blocking work, give it its own `rayon::ThreadPool` via `ThreadPool::install(...)` so it cannot starve the main pool; or move blocking I/O off the pool entirely (`spawn_blocking` for tokio).
+5. **Sequential below a threshold.** For small inputs, skip parallelism entirely (PostHog evaluated batches under 100–200 items sequentially) — fork-join + oversubscription overhead dominates tiny work.
+6. **Fix the core count.** In a container, derive the pool size from the CPU *request*/quota you actually own, not `available_parallelism()`'s view of the limit.
+
+### Measurement plan template for an oversubscription finding
+
+- **Metric:** wall time at T=1, 2, 4, 8 (and peak RSS if memory is a project constraint), best-of-3 median; **plus** the contention-frame share (`swtch_pri`/`__ulock_wait`/`futex`/throttling) from a fresh profile at the top T.
+- **Threshold to merge:** the high-T wall gap closes by a meaningful fraction **and** the contention frames fall toward their T=1 level, with **output identical** (diff whatever the project's correctness oracle is — calls, bytes, results).
+- **Complexity cost:** name it honestly — pool-sizing is trivial; collapsing/relocating a pool is a topology change that can reorder work and threaten output-identity, so it must be gated on the oracle and is usually deferred behind the one-line sizing experiment.
+
+Sources: PostHog, [*Untangling Tokio and Rayon in production*](https://posthog.com/blog/untangling-rayon-and-tokio); Daniel Imfeld, [*Avoiding Deadlock from Rayon Thread Pool Exhaustion*](https://imfeld.dev/writing/avoiding_rayon_thread_pool_exhaustion); Piotr Kołaczkowski, [*Multiple Thread Pools in Rust*](https://pkolaczk.github.io/multiple-threadpools-rust/); rayon [`ThreadPool`](https://docs.rs/rayon/latest/rayon/struct.ThreadPool.html) / [`ThreadPoolBuilder`](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html) docs; Intel VTune [*Threading Efficiency View*](https://www.intel.com/content/www/us/en/docs/vtune-profiler/user-guide/2024-2/threading-efficiency-view.html).
