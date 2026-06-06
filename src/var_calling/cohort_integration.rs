@@ -335,8 +335,9 @@ pub fn drop_dust_masked(positions: &[u32], is_kept: &mut [bool], mask: &[Range<u
 
 use crate::pileup_record::PileupRecord;
 use crate::psp::PspReadError;
+use crate::psp::block::new_column_decompressor;
 use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
-use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader};
+use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader, TwoPhaseSegment};
 use crate::var_calling::types::{CohortPileupRecord, RawCohortChunk, RefSpan};
 use std::io::{Read, Seek};
 
@@ -441,6 +442,107 @@ pub fn merge_compacted_samples(
     Ok(records)
 }
 
+/// A finalised buffered segment: full-block light columns (the fold still reads
+/// them) + the variable-only compacted heavy (sliced into cohort chunks by
+/// [`SamplePspChunk::append_range`]).
+struct ReadySegment {
+    positions: Vec<u32>,
+    ref_spans: Vec<u32>,
+    nonref_obs: Vec<u32>,
+    chunk: SamplePspChunk,
+}
+
+/// A buffered per-sample segment. The light columns (positions / ref-spans /
+/// non-REF obs — what the fold needs) are always resident; the heavy columns
+/// are deferred-compressed (`Pending`) until the segment's variable mask is
+/// final, then inflated + compacted to the variable rows once (`Ready`). The
+/// full-block light columns stay resident in both states so `rebuild_fold`
+/// works regardless of the heavy state.
+///
+/// `Ready` is boxed: most buffered segments are transient `Pending` read-ahead
+/// (folded, then dropped at the next cut), so keeping the larger finalised
+/// payload behind a pointer keeps the per-sample buffer `Vec` dense.
+enum BufferedSegment {
+    Pending(TwoPhaseSegment),
+    Ready(Box<ReadySegment>),
+}
+
+impl BufferedSegment {
+    fn positions(&self) -> &[u32] {
+        match self {
+            BufferedSegment::Pending(s) => s.positions(),
+            BufferedSegment::Ready(r) => &r.positions,
+        }
+    }
+    fn ref_spans(&self) -> &[u32] {
+        match self {
+            BufferedSegment::Pending(s) => s.ref_spans(),
+            BufferedSegment::Ready(r) => &r.ref_spans,
+        }
+    }
+    fn nonref_obs(&self) -> &[u32] {
+        match self {
+            BufferedSegment::Pending(s) => s.nonref_obs(),
+            BufferedSegment::Ready(r) => &r.nonref_obs,
+        }
+    }
+    fn last_pos(&self) -> Option<u32> {
+        self.positions().last().copied()
+    }
+
+    /// If this is a `Pending` segment whose variable mask is now final — its
+    /// `last_pos < cut`, so every row sits below the safe-gap cut and is in a
+    /// **closed** variant group (its `is_kept` won't change) — inflate +
+    /// compact it to variable-only **once** and become `Ready`. No-op when
+    /// already `Ready` or not yet finalisable (a segment straddling `cut`, whose
+    /// suffix may still be in an open group, is partial-inflated instead).
+    /// `kept_all` is the sorted set of variable (post-dust) positions;
+    /// `keep[r] = positions[r] ∈ kept_all`.
+    fn finalize_if_ready(
+        &mut self,
+        kept_all: &[u32],
+        cut: u32,
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed_scratch: &mut Vec<u8>,
+        decompressed_scratch: &mut Vec<u8>,
+    ) -> Result<(), ProducerError> {
+        let finalisable = match self {
+            BufferedSegment::Pending(s) => s.last_pos().is_some_and(|lp| lp < cut),
+            BufferedSegment::Ready(_) => false,
+        };
+        if !finalisable {
+            return Ok(());
+        }
+        let keep: Vec<bool> = self
+            .positions()
+            .iter()
+            .map(|&p| kept_all.binary_search(&p).is_ok())
+            .collect();
+        // Take ownership of the Pending segment to consume it (free its blobs).
+        let placeholder = BufferedSegment::Ready(Box::new(ReadySegment {
+            positions: Vec::new(),
+            ref_spans: Vec::new(),
+            nonref_obs: Vec::new(),
+            chunk: SamplePspChunk::empty_compacted(0),
+        }));
+        if let BufferedSegment::Pending(seg) = std::mem::replace(self, placeholder) {
+            let (positions, ref_spans, nonref_obs, chunk) = seg.finalize(
+                &keep,
+                decompressor,
+                compressed_scratch,
+                decompressed_scratch,
+            )?;
+            *self = BufferedSegment::Ready(Box::new(ReadySegment {
+                positions,
+                ref_spans,
+                nonref_obs,
+                chunk,
+            }));
+        }
+        Ok(())
+    }
+}
+
 /// Streaming cohort producer over **one covered interval** (appendix §B).
 ///
 /// Owns the N [`SamplePspReader`]s. [`begin_interval`](Self::begin_interval)
@@ -469,9 +571,11 @@ pub struct CohortChunkIntegrator<R: Read + Seek> {
     chrom_id: u32,
     interval_end: u32, // exclusive
     next_chunk_start: u32,
-    /// Per sample: buffered columnar segments (carryover + read-ahead), in
-    /// genomic order; dropped once fully below `next_chunk_start`.
-    buffers: Vec<Vec<SamplePspChunk>>,
+    /// Per sample: buffered segments (carryover + read-ahead), in genomic
+    /// order; dropped once fully below `next_chunk_start`. Each is `Pending`
+    /// (light + compressed heavy) until its variable mask is final, then
+    /// finalised once to `Ready` (variable-only).
+    buffers: Vec<Vec<BufferedSegment>>,
     /// Per sample: reader exhausted within the current interval.
     exhausted: Vec<bool>,
     dust_mask: Vec<Range<u32>>,
@@ -503,7 +607,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             chrom_id: 0,
             interval_end: 0,
             next_chunk_start: 0,
-            buffers: vec![Vec::new(); n],
+            buffers: (0..n).map(|_| Vec::new()).collect(),
             exhausted: vec![false; n],
             dust_mask: Vec::new(),
             chunk_order: 0,
@@ -636,15 +740,15 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         debug_assert_eq!(which.len(), self.n);
         // Disjoint `&mut readers[s]` via `par_iter_mut().enumerate()`; decode
         // the selected readers concurrently, collect, then apply serially.
-        let outcomes: Vec<(usize, Result<Option<SamplePspChunk>, PspReadError>)> = self
+        let outcomes: Vec<(usize, Result<Option<TwoPhaseSegment>, PspReadError>)> = self
             .readers
             .par_iter_mut()
             .enumerate()
-            .filter_map(|(s, reader)| which[s].then(|| (s, reader.next_chunk())))
+            .filter_map(|(s, reader)| which[s].then(|| (s, reader.next_two_phase())))
             .collect();
         for (s, outcome) in outcomes {
             match outcome? {
-                Some(chunk) => self.buffers[s].push(chunk),
+                Some(seg) => self.buffers[s].push(BufferedSegment::Pending(seg)),
                 None => self.exhausted[s] = true,
             }
         }
@@ -750,14 +854,20 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             self.fold
                 .derive_is_kept(self.min_alt_obs, &mut self.is_kept);
             drop_dust_masked(self.fold.positions(), &mut self.is_kept, &self.dust_mask);
-            let variable: Vec<u32> = self
+            // `kept_all` = every variable (post-dust) position over the whole
+            // fold — the mask used to finalise a fully-folded segment to
+            // variable-only. `variable` is the prefix `< cut`: this chunk's
+            // positions (for the REF span and the variant-free check). Both are
+            // sorted ascending (the fold is).
+            let kept_all: Vec<u32> = self
                 .fold
                 .positions()
                 .iter()
                 .zip(self.is_kept.iter())
-                .filter(|&(&p, &k)| k && p < cut)
+                .filter(|&(_, &k)| k)
                 .map(|(&p, _)| p)
                 .collect();
+            let variable: Vec<u32> = kept_all.iter().copied().take_while(|&p| p < cut).collect();
 
             let chunk_start = self.next_chunk_start;
 
@@ -768,10 +878,10 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 continue;
             }
 
-            // Compact each sample's variable rows from the buffers *before*
-            // advancing past them — the cheap columnar gather; the expensive
-            // columns→records rebuild is deferred to the caller.
-            let per_sample = self.compact_samples(&variable, chunk_start, cut);
+            // Compact each sample's variable rows in `[chunk_start, cut)`:
+            // finalise each fully-folded segment to variable-only (once) and
+            // slice it, partial-inflating any not-yet-finalisable straddler.
+            let per_sample = self.compact_samples(&kept_all, chunk_start, cut)?;
             let ref_span = self.fetch_ref_span(&variable, fetch_ref)?;
             self.next_chunk_start = cut;
             self.drop_buffers_below(cut);
@@ -794,34 +904,68 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     }
 
     /// Compact each sample's variable rows in `[chunk_start, cut)` into one
-    /// columnar [`SamplePspChunk`] per sample — the cheap bulk-copy gather that
-    /// replaces the producer's old `records_for` + per-position merge. The
-    /// expensive columns→records rebuild and the merge run on the caller
-    /// ([`merge_compacted_samples`]); this thread only copies columns.
+    /// columnar [`SamplePspChunk`] per sample. For each buffered segment that
+    /// overlaps the chunk's span: if it is fully folded, **finalise it once**
+    /// (inflate + compact the heavy columns to variable-only — `Ready`) and
+    /// slice `[chunk_start, cut)` out of it; a not-yet-finalisable straddler
+    /// (extends past the watermark) is **partial-inflated** for just this
+    /// chunk's rows and left `Pending` to be inflated again next chunk. The
+    /// expensive columns→records rebuild + merge still run on the caller.
     ///
-    /// Non-consuming: a buffered segment straddling the chunk cut survives to
-    /// serve the next chunk.
-    fn compact_samples(&self, variable: &[u32], chunk_start: u32, cut: u32) -> Vec<SamplePspChunk> {
+    /// Per-sample independent → rayon across the N samples (CPU-heavy
+    /// decompression). `kept_all` is the sorted variable-position set.
+    fn compact_samples(
+        &mut self,
+        kept_all: &[u32],
+        chunk_start: u32,
+        cut: u32,
+    ) -> Result<Vec<SamplePspChunk>, ProducerError> {
         use rayon::prelude::*;
         let chrom_id = self.chrom_id;
-        // Per-sample independent (like `read_samples` decode) → rayon across the
-        // N buffered samples. Output stays compacted (variable rows only), so
-        // memory is unchanged; only the serial gather cost is parallelised.
         self.buffers
-            .par_iter()
-            .map(|buf| {
+            .par_iter_mut()
+            .map(|buf| -> Result<SamplePspChunk, ProducerError> {
+                // Per-task zstd context + scratch, created lazily (most touched
+                // segments are already `Ready`, so no decompression at all).
+                let mut decompressor: Option<zstd::bulk::Decompressor<'static>> = None;
+                let (mut cs, mut ds) = (Vec::new(), Vec::new());
                 let mut compacted = SamplePspChunk::empty_compacted(chrom_id);
-                for chunk in buf {
-                    let pos = chunk.positions();
-                    let keep: Vec<bool> = pos
-                        .iter()
-                        .map(|&p| p >= chunk_start && p < cut && variable.binary_search(&p).is_ok())
-                        .collect();
-                    if keep.iter().any(|&k| k) {
-                        compacted.append_kept(chunk, &keep);
+                for seg in buf.iter_mut() {
+                    let first = seg.positions().first().copied().unwrap_or(0);
+                    let last = seg.last_pos().unwrap_or(0);
+                    // No overlap with [chunk_start, cut): skip (untouched
+                    // read-ahead segments stay compressed).
+                    if first >= cut || last < chunk_start {
+                        continue;
+                    }
+                    let dz = decompressor.get_or_insert_with(|| {
+                        new_column_decompressor().expect(
+                            "zstd::bulk::Decompressor::new is infallible on supported platforms",
+                        )
+                    });
+                    seg.finalize_if_ready(kept_all, cut, dz, &mut cs, &mut ds)?;
+                    match seg {
+                        BufferedSegment::Ready(r) => {
+                            compacted.append_range(&r.chunk, chunk_start, cut);
+                        }
+                        // Not finalisable (last_pos > watermark): partial-inflate
+                        // just this chunk's variable rows; leave it Pending.
+                        BufferedSegment::Pending(tp) => {
+                            let keep: Vec<bool> = tp
+                                .positions()
+                                .iter()
+                                .map(|&p| {
+                                    p >= chunk_start
+                                        && p < cut
+                                        && kept_all.binary_search(&p).is_ok()
+                                })
+                                .collect();
+                            let chunk = tp.set_variable_rows(&keep, dz, &mut cs, &mut ds)?;
+                            compacted.append_range(&chunk, chunk_start, cut);
+                        }
                     }
                 }
-                compacted
+                Ok(compacted)
             })
             .collect()
     }

@@ -449,8 +449,6 @@ impl SamplePspChunk {
     /// copies the heavy columns for that row range (no decode, no filter). The
     /// producer slices each `Ready` segment overlapping `[chunk_start, cut)`
     /// this way to build a cohort chunk's per-sample columns.
-    // Used by the two-phase producer loop (next step); kept building-block.
-    #[allow(dead_code)]
     pub fn append_range(&mut self, src: &SamplePspChunk, lo: u32, hi: u32) {
         let r_lo = src.positions.partition_point(|&p| p < lo);
         let r_hi = src.positions.partition_point(|&p| p < hi);
@@ -574,7 +572,6 @@ impl SamplePspChunk {
 
 /// Append `full[lo..hi]` for every kept row's allele range to `out` — the
 /// per-allele scalar compaction used by [`TwoPhaseSegment::set_variable_rows`].
-#[allow(dead_code)]
 fn extend_kept<T: Copy>(out: &mut Vec<T>, full: &[T], ranges: &[(usize, usize)]) {
     for &(lo, hi) in ranges {
         out.extend_from_slice(&full[lo..hi]);
@@ -588,9 +585,8 @@ fn extend_kept<T: Copy>(out: &mut Vec<T>, full: &[T], ranges: &[(usize, usize)])
 /// [`SamplePspChunk`]. The producer folds over the light accessors, then once a
 /// segment's variable mask is final converts it in one column-by-column
 /// inflate→compact→free pass (transient ≈ one inflated column).
-// Constructed by `SamplePspReader` and finalised by the producer in the next
-// step; exercised now by `two_phase_segment_set_variable_rows_matches_eager`.
-#[allow(dead_code)]
+// Constructed by `SamplePspReader::next_two_phase`, folded over via the light
+// accessors, then finalised by the cohort producer's `compact_samples`.
 pub(crate) struct TwoPhaseSegment {
     chrom_id: u32,
     positions: Vec<u32>,      // 1-based, full block
@@ -603,7 +599,6 @@ pub(crate) struct TwoPhaseSegment {
     retained: Vec<RetainedColumn>,
 }
 
-#[allow(dead_code)] // methods wired into the producer in the next step
 impl TwoPhaseSegment {
     /// Build from a two-phase-decoded block: delta-decode positions and derive
     /// the fold columns (ref span, Σ non-REF obs) from the light columns; keep
@@ -663,22 +658,21 @@ impl TwoPhaseSegment {
     pub fn nonref_obs(&self) -> &[u32] {
         &self.nonref_obs
     }
-    /// Number of (full-block) records.
-    pub fn len(&self) -> usize {
-        self.positions.len()
-    }
-    /// True when the segment has no records.
-    pub fn is_empty(&self) -> bool {
-        self.positions.is_empty()
+    /// The segment's last 1-based position (its true extent — for the cohort
+    /// watermark / finalisation check), or `None` when empty.
+    pub fn last_pos(&self) -> Option<u32> {
+        self.positions.last().copied()
     }
 
     /// Phase 1 → 2: inflate the deferred columns **one at a time**, compacting
     /// each to the `keep` rows and freeing the inflated buffer before the next
     /// (resident transient ≈ one inflated column). Returns a variable-only
     /// [`SamplePspChunk`] ready for record building. `keep.len()` must equal
-    /// [`len`](Self::len).
+    /// [`len`](Self::len). **Non-consuming** — the producer partial-inflates a
+    /// not-yet-finalisable straddling segment with this, then re-inflates it on
+    /// the next chunk; a finalisable segment is consumed via [`finalize`](Self::finalize).
     pub fn set_variable_rows(
-        self,
+        &self,
         keep: &[bool],
         decompressor: &mut zstd::bulk::Decompressor<'static>,
         compressed_scratch: &mut Vec<u8>,
@@ -779,7 +773,28 @@ impl TwoPhaseSegment {
             chain_ids,
         })
     }
+
+    /// Finalise the segment: compact the heavy columns to the `keep` rows
+    /// (variable-only) **and** hand back the full-block light columns the
+    /// producer keeps resident for the fold. Consumes `self`, freeing the
+    /// retained compressed blobs.
+    pub fn finalize(
+        self,
+        keep: &[bool],
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed_scratch: &mut Vec<u8>,
+        decompressed_scratch: &mut Vec<u8>,
+    ) -> Result<FinalizedSegment, PspReadError> {
+        let chunk =
+            self.set_variable_rows(keep, decompressor, compressed_scratch, decompressed_scratch)?;
+        Ok((self.positions, self.ref_spans, self.nonref_obs, chunk))
+    }
 }
+
+/// A finalised [`TwoPhaseSegment`]: `(positions, ref_spans, nonref_obs,
+/// variable_only_chunk)` — the full-block light columns the producer keeps
+/// resident for the fold, plus the compacted heavy chunk for record building.
+pub(crate) type FinalizedSegment = (Vec<u32>, Vec<u32>, Vec<u32>, SamplePspChunk);
 
 // ---------------------------------------------------------------------------
 // SamplePspReader
@@ -874,9 +889,7 @@ impl<R: Read + Seek> SamplePspReader<R> {
     /// region-clamped — the deferred columns can't be sliced while compressed,
     /// and the producer's fold bounds (`[next_chunk_start, watermark]`) already
     /// exclude out-of-interval rows, which therefore never enter a variable mask.
-    // Wired into the producer in the next step; exercised now by
-    // `sample_reader_next_two_phase_matches_next_chunk`.
-    #[allow(dead_code)]
+    // Drives the cohort producer's column-selective read path.
     pub(crate) fn next_two_phase(&mut self) -> Result<Option<TwoPhaseSegment>, PspReadError> {
         match self.blocks.peek_block() {
             Some(entry)
@@ -1050,7 +1063,7 @@ mod tests {
             let mut dz = crate::psp::block::new_column_decompressor().unwrap();
             let (mut cs, mut ds) = (Vec::new(), Vec::new());
             while let Some(seg) = sr.next_two_phase().unwrap() {
-                let keep = vec![true; seg.len()];
+                let keep = vec![true; seg.positions().len()];
                 let chunk = seg
                     .set_variable_rows(&keep, &mut dz, &mut cs, &mut ds)
                     .unwrap();

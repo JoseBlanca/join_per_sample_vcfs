@@ -1003,7 +1003,6 @@ impl<R: Read + Seek> BlockColumnReader<R> {
     /// columns are inflated later, once the cohort fold knows the variable mask.
     // Wired into `SamplePspReader` in the next step; exercised now by
     // `block_reader_two_phase_matches_eager`.
-    #[allow(dead_code)]
     pub(crate) fn decode_current_two_phase(
         &mut self,
     ) -> Result<Option<TwoPhaseBlock>, PspReadError> {
@@ -1601,7 +1600,6 @@ fn decode_one_column<R: Read>(
 /// `source` at the column payload (manifest order).
 // Wired into the two-phase block decode in the next step; exercised now by
 // `two_phase_inflate_matches_eager_decode`.
-#[allow(dead_code)]
 fn read_compressed_blob<R: Read>(
     source: &mut R,
     entry: &ColumnManifestEntry,
@@ -1674,7 +1672,6 @@ fn is_light_tag(tag: u16) -> bool {
 
 /// One deferred column retained as its raw zstd blob (with its manifest entry,
 /// so [`inflate_retained_column`] can size + dispatch it later).
-#[allow(dead_code)]
 pub(crate) struct RetainedColumn {
     pub entry: ColumnManifestEntry,
     pub blob: Vec<u8>,
@@ -1685,7 +1682,6 @@ pub(crate) struct RetainedColumn {
 /// [`retained`](Self::retained). Mirrors the eager [`DecodedBlock`] for the
 /// light columns; the heavy columns are inflated on demand by the consumer
 /// (`SamplePspChunk::set_variable_rows`) once the variable mask is known.
-#[allow(dead_code)]
 pub(crate) struct TwoPhaseBlock {
     pub chrom_id: u32,
     pub first_pos: u32,
@@ -1706,7 +1702,6 @@ pub(crate) struct TwoPhaseBlock {
 /// `compressed_len` bytes in manifest order, light-decoded or retained).
 // Wired into `BlockColumnReader` in the next step; exercised now by
 // `two_phase_block_decode_matches_eager`.
-#[allow(dead_code)]
 fn decode_block_payload_two_phase<R: Read>(
     source: &mut R,
     header: &BlockHeader,
@@ -2182,7 +2177,8 @@ mod tests {
             cols.allele_chain_ids_data.to_vec(),
             cols.allele_chain_ids_offsets.to_vec(),
         );
-        drop(cols);
+        // `cols`'s borrow of `br_e` ends here (NLL); the two-phase reader below
+        // owns a separate `PspReader`.
 
         // Two-phase via the bridge method.
         let mut br = PspReader::new(Cursor::new(bytes))
