@@ -397,6 +397,74 @@ impl SamplePspChunk {
         hi - lo
     }
 
+    /// An empty chunk for `chrom_id`, ready to accumulate compacted records
+    /// via [`append_kept`](Self::append_kept).
+    ///
+    /// Used by the producer to gather a chunk's variable rows (across the
+    /// sample's buffered segments) into one columnar object shipped to the
+    /// caller, which rebuilds the records ([`records_all`](Self::records_all)).
+    /// The light fold columns (`nonref_obs` / `ref_spans`) are left empty: a
+    /// compacted chunk lives *past* the fold, so only the record-building
+    /// columns (`positions` / `allele_offsets` / heavy) are populated.
+    pub fn empty_compacted(chrom_id: u32) -> Self {
+        Self {
+            chrom_id,
+            positions: Vec::new(),
+            nonref_obs: Vec::new(),
+            ref_spans: Vec::new(),
+            allele_offsets: vec![0],
+            fixed: PerAlleleFixed::default(),
+            seq: PerAlleleSeq::empty(),
+            chain_ids: PerAlleleChainIds::empty(),
+        }
+    }
+
+    /// Append `src`'s `keep`-selected records onto `self` — a **non-consuming
+    /// compacting gather** (bulk column copies via `extend_from_range`, *not*
+    /// the per-allele heap allocation of [`records_for`](Self::records_for)).
+    /// Copies each kept row's position + heavy columns and extends the CSR
+    /// record→allele offsets. `keep.len()` must equal `src.len()`; `src` is
+    /// left intact so a segment straddling a chunk cut survives in the buffer.
+    pub fn append_kept(&mut self, src: &SamplePspChunk, keep: &[bool]) {
+        debug_assert_eq!(keep.len(), src.len(), "keep mask must cover every record");
+        for (r, &k) in keep.iter().enumerate() {
+            if !k {
+                continue;
+            }
+            let lo = src.allele_offsets[r] as usize;
+            let hi = src.allele_offsets[r + 1] as usize;
+            self.positions.push(src.positions[r]);
+            self.fixed.extend_from_range(&src.fixed, lo..hi);
+            self.seq.extend_from_range(&src.seq, lo..hi);
+            self.chain_ids.extend_from_range(&src.chain_ids, lo..hi);
+            let cum = self.allele_offsets.last().copied().unwrap_or(0) + (hi - lo) as u32;
+            self.allele_offsets.push(cum);
+        }
+    }
+
+    /// Reconstruct every record (a compacted chunk holds only kept rows) —
+    /// the columns→records boundary, now run **on the caller**. Equivalent to
+    /// `records_for(&vec![true; len()])` without allocating the mask. This is
+    /// the per-allele-allocation work the record-building lever moves off the
+    /// producer's single thread.
+    pub fn records_all(&self) -> Vec<PileupRecord> {
+        let mut out = Vec::with_capacity(self.len());
+        for r in 0..self.len() {
+            let lo = self.allele_offsets[r] as usize;
+            let hi = self.allele_offsets[r + 1] as usize;
+            let mut alleles = Vec::with_capacity(hi - lo);
+            for a in lo..hi {
+                alleles.push(AlleleObservation::new(
+                    self.seq.slice_at(a).to_vec(),
+                    self.fixed.support_at(a),
+                    self.chain_ids.slice_at(a).to_vec(),
+                ));
+            }
+            out.push(PileupRecord::new(self.chrom_id, self.positions[r], alleles));
+        }
+        out
+    }
+
     /// Reconstruct owned [`PileupRecord`]s for the `keep` records — the
     /// columnar→record boundary at the producer (§2.2 step 3). **Non-consuming**
     /// (copies via `slice_at`/`support_at`), so a segment straddling a chunk

@@ -28,15 +28,19 @@
 //! Phase 3 builds the `VariantCaller` worker here.
 
 use crate::pileup_record::AlleleSupportStats;
+use crate::var_calling::cohort_integration::merge_compacted_samples;
 use crate::var_calling::per_group_merger::{
     MergeGroupOutcome, MergedRecord, PerGroupMergerConfig, PerGroupMergerError,
     build_genotype_tables, merge_group_with_ref,
 };
+use crate::var_calling::per_position_merger::PerPositionMergerError;
 use crate::var_calling::pileup_overlaps::overlapping_groups;
 use crate::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError,
 };
-use crate::var_calling::types::{CallStats, CalledChunk, PileupCohortChunk, Variant};
+use crate::var_calling::types::{
+    CallStats, CalledChunk, CohortPileupRecord, RawCohortChunk, RefSpan, Variant,
+};
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperError};
 
 /// Errors the caller can surface (all pathological-input only — the EM math
@@ -52,6 +56,9 @@ pub enum CallerError {
     /// The EM / posterior calculation failed.
     #[error("posterior calculation failed: {0}")]
     Em(#[from] PosteriorEngineError),
+    /// The per-position merge (columns→records, moved onto the caller) failed.
+    #[error("per-position merge failed: {0}")]
+    PerPosition(#[from] PerPositionMergerError),
 }
 
 /// Section 2 — the cohort variant caller (appendix §D). One per worker thread;
@@ -73,6 +80,10 @@ pub struct VariantCaller {
     merger_cfg: PerGroupMergerConfig,
     posterior_cfg: PosteriorEngineConfig,
     min_alt_obs: u32,
+    /// Cohort sample names, in sample order — passed to the per-position
+    /// merger (diagnostics metadata) now that the columns→records merge runs
+    /// on the caller. Immutable, so `&VariantCaller` stays `Sync`.
+    sample_names: Vec<String>,
     /// Per-(ploidy, n_alleles) genotype enumeration cache, built once from
     /// `merger_cfg` (identical to what `PerGroupMerger` builds internally).
     genotype_tables: Vec<Vec<Vec<u8>>>,
@@ -84,6 +95,7 @@ impl VariantCaller {
         merger_cfg: PerGroupMergerConfig,
         posterior_cfg: PosteriorEngineConfig,
         min_alt_obs: u32,
+        sample_names: Vec<String>,
     ) -> Self {
         let genotype_tables = build_genotype_tables(&merger_cfg);
         Self {
@@ -91,17 +103,34 @@ impl VariantCaller {
             merger_cfg,
             posterior_cfg,
             min_alt_obs,
+            sample_names,
             genotype_tables,
         }
     }
 
     /// Call one chunk → its [`CalledChunk`] (records may be empty).
-    pub fn call_chunk(&self, chunk: PileupCohortChunk) -> Result<CalledChunk, CallerError> {
-        let PileupCohortChunk {
+    pub fn call_chunk(&self, chunk: RawCohortChunk) -> Result<CalledChunk, CallerError> {
+        let RawCohortChunk {
             chunk_order,
-            records,
+            per_sample,
             ref_span,
         } = chunk;
+        // Columns → records + per-position merge — the record-building work
+        // moved off the single producer thread onto this parallel caller.
+        let records = merge_compacted_samples(&per_sample, &self.sample_names)?;
+        self.call_records(chunk_order, records, ref_span)
+    }
+
+    /// Group + per-group merge + EM over already-merged cohort `records`. Split
+    /// from [`call_chunk`] so this byte-identity-critical path can be tested
+    /// directly against the fetcher row pipeline (the `call_chunk` front-end
+    /// only adds the columns→records reconstruction).
+    pub fn call_records(
+        &self,
+        chunk_order: u64,
+        records: Vec<CohortPileupRecord>,
+        ref_span: RefSpan,
+    ) -> Result<CalledChunk, CallerError> {
         let mut stats = CallStats::default();
 
         // Steps 1 + 2a: group, then merge each group (REF sliced from the
@@ -189,7 +218,7 @@ mod tests {
     use crate::var_calling::per_group_merger::{PerGroupMerger, SharedRefFetcher};
     use crate::var_calling::pileup_overlaps::overlapping_groups;
     use crate::var_calling::test_helpers::allele;
-    use crate::var_calling::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
+    use crate::var_calling::types::{CohortPileupRecord, RefSpan};
     use std::sync::Arc;
 
     /// In-memory all-`A` reference, base 1 — matches every fixture's REF
@@ -245,15 +274,11 @@ mod tests {
         ]
     }
 
-    fn chunk_of(records: Vec<CohortPileupRecord>) -> PileupCohortChunk {
-        PileupCohortChunk {
-            chunk_order: 7,
-            records,
-            // Over-covering all-A span [1, 200].
-            ref_span: RefSpan {
-                genomic_start: 1,
-                bytes: vec![b'A'; 200],
-            },
+    /// Over-covering all-`A` span `[1, 200]` (matches every fixture's REF).
+    fn test_ref_span() -> RefSpan {
+        RefSpan {
+            genomic_start: 1,
+            bytes: vec![b'A'; 200],
         }
     }
 
@@ -263,6 +288,7 @@ mod tests {
             PerGroupMergerConfig::default(),
             PosteriorEngineConfig::default(),
             min_alt_obs,
+            vec!["S0".to_string(), "S1".to_string()],
         )
     }
 
@@ -283,7 +309,9 @@ mod tests {
         let records = fixture();
         // min_alt_obs inert (0) so the new caller doesn't filter — the row
         // pipeline (PerGroupMerger) doesn't either; outputs must be identical.
-        let got = caller(0).call_chunk(chunk_of(records.clone())).unwrap();
+        let got = caller(0)
+            .call_records(7, records.clone(), test_ref_span())
+            .unwrap();
         let want = row_pipeline(records);
         assert_eq!(got.chunk_order, 7);
         assert_eq!(
@@ -296,20 +324,26 @@ mod tests {
     #[test]
     fn min_alt_obs_drops_singletons_and_counts_stat() {
         // Threshold 2: the pos-40 singleton-ALT group is dropped pre-EM.
-        let got = caller(2).call_chunk(chunk_of(fixture())).unwrap();
+        let got = caller(2)
+            .call_records(7, fixture(), test_ref_span())
+            .unwrap();
         assert_eq!(got.stats.records_dropped_low_alt_obs, 1);
         let positions: Vec<u32> = got.records.iter().map(|r| r.locus.start).collect();
         assert!(positions.contains(&10) && positions.contains(&25));
         assert!(!positions.contains(&40), "singleton-ALT site filtered out");
         // Inert threshold keeps all three.
-        let all = caller(0).call_chunk(chunk_of(fixture())).unwrap();
+        let all = caller(0)
+            .call_records(7, fixture(), test_ref_span())
+            .unwrap();
         assert_eq!(all.records.len(), 3);
         assert_eq!(all.stats.records_dropped_low_alt_obs, 0);
     }
 
     #[test]
     fn empty_chunk_yields_empty_called_chunk() {
-        let got = caller(0).call_chunk(chunk_of(Vec::new())).unwrap();
+        let got = caller(0)
+            .call_records(7, Vec::new(), test_ref_span())
+            .unwrap();
         assert_eq!(got.chunk_order, 7);
         assert!(got.records.is_empty());
         assert_eq!(got.stats, CallStats::default());
@@ -327,7 +361,7 @@ mod tests {
                 Some(vec![allele(b"A", 6, -1.0, &[])]),
             ],
         )];
-        let got = caller(0).call_chunk(chunk_of(recs)).unwrap();
+        let got = caller(0).call_records(7, recs, test_ref_span()).unwrap();
         assert!(got.records.is_empty());
     }
 }

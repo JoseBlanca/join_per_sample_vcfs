@@ -337,7 +337,7 @@ use crate::pileup_record::PileupRecord;
 use crate::psp::PspReadError;
 use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
 use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader};
-use crate::var_calling::types::{CohortPileupRecord, PileupCohortChunk, RefSpan};
+use crate::var_calling::types::{CohortPileupRecord, RawCohortChunk, RefSpan};
 use std::io::{Read, Seek};
 
 /// Boxed error type the producer's REF-fetch closure yields. Boxing keeps
@@ -353,10 +353,6 @@ pub enum ProducerError {
     /// A per-sample `.psp` decode failed.
     #[error("psp decode failed: {0}")]
     Decode(#[from] PspReadError),
-    /// The per-position cohort merge failed (pathological input only — the
-    /// in-memory kept-record streams are monotone by construction).
-    #[error("per-position merge failed: {0}")]
-    Merge(Box<PerPositionMergerError>),
     /// The reference-fetch closure failed; the fetcher's typed cause is
     /// preserved through `source()`.
     #[error("reference fetch failed")]
@@ -410,6 +406,41 @@ type KeptRecordIter = std::iter::Map<
     fn(PileupRecord) -> Result<PileupRecord, PspReadError>,
 >;
 
+/// Reconstruct the chunk's [`CohortPileupRecord`]s from the per-sample
+/// compacted columns — the columns→records conversion + per-position merge
+/// the record-building lever moved from the producer onto the **caller**.
+///
+/// Reuses the byte-identity-critical [`PerPositionMerger`] verbatim; the
+/// per-sample [`records_all`](SamplePspChunk::records_all) feeds it exactly
+/// the records the producer's old `records_for` produced, in the same sample
+/// and position order, so the merged output is identical to the producer-side
+/// merge it replaces. `sample_names` is merger metadata only (diagnostics) —
+/// any cohort-length list yields identical records.
+pub fn merge_compacted_samples(
+    per_sample: &[SamplePspChunk],
+    sample_names: &[String],
+) -> Result<Vec<CohortPileupRecord>, PerPositionMergerError> {
+    let iters: Vec<KeptRecordIter> = per_sample
+        .iter()
+        .map(|c| {
+            c.records_all()
+                .into_iter()
+                .map(ok_record as fn(PileupRecord) -> Result<PileupRecord, PspReadError>)
+        })
+        .collect();
+    let merger = PerPositionMerger::new(iters, sample_names.to_vec(), Vec::new())?;
+    let mut records = Vec::new();
+    for item in merger {
+        let pp = item?;
+        records.push(CohortPileupRecord {
+            chrom_id: pp.chrom_id,
+            pos: pp.pos,
+            per_sample: pp.per_sample,
+        });
+    }
+    Ok(records)
+}
+
 /// Streaming cohort producer over **one covered interval** (appendix §B).
 ///
 /// Owns the N [`SamplePspReader`]s. [`begin_interval`](Self::begin_interval)
@@ -430,7 +461,6 @@ type KeptRecordIter = std::iter::Map<
 /// chunk (records_for is non-consuming).
 pub struct CohortChunkIntegrator<R: Read + Seek> {
     readers: Vec<SamplePspReader<R>>,
-    sample_names: Vec<String>,
     n: usize,
     min_alt_obs: u32,
     target_variants: u32,
@@ -459,19 +489,14 @@ pub struct CohortChunkIntegrator<R: Read + Seek> {
 // (`read_samples`); the pipeline's `BufReader<File>` and the tests' `Cursor`
 // are both `Send`.
 impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
-    /// Build a producer over the N per-sample readers (`sample_names`
-    /// parallel to `readers`). `min_alt_obs` is the cohort keep threshold;
-    /// `target_variants` the soft per-chunk kept-position target (`0` ⇒ 1).
-    pub fn new(
-        readers: Vec<SamplePspReader<R>>,
-        sample_names: Vec<String>,
-        min_alt_obs: u32,
-        target_variants: u32,
-    ) -> Self {
+    /// Build a producer over the N per-sample readers. `min_alt_obs` is the
+    /// cohort keep threshold; `target_variants` the soft per-chunk
+    /// kept-position target (`0` ⇒ 1). (Sample names are no longer needed
+    /// here — the per-position merge that used them now runs on the caller.)
+    pub fn new(readers: Vec<SamplePspReader<R>>, min_alt_obs: u32, target_variants: u32) -> Self {
         let n = readers.len();
         Self {
             readers,
-            sample_names,
             n,
             min_alt_obs,
             target_variants: target_variants.max(1),
@@ -523,7 +548,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     where
         RefF: FnMut(u32, u32, u32) -> Result<Vec<u8>, RefFetchError>,
         DustF: FnMut(u32, &Range<u32>) -> Vec<Range<u32>>,
-        Emit: FnMut(PileupCohortChunk),
+        Emit: FnMut(RawCohortChunk),
     {
         for chrom_id in 0..n_chromosomes {
             let intervals = self.covered_intervals(chrom_id, max_group_span);
@@ -698,7 +723,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     pub fn produce_chunk(
         &mut self,
         fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, RefFetchError>,
-    ) -> Result<Option<PileupCohortChunk>, ProducerError> {
+    ) -> Result<Option<RawCohortChunk>, ProducerError> {
         loop {
             if self.next_chunk_start >= self.interval_end {
                 return Ok(None);
@@ -743,17 +768,19 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 continue;
             }
 
-            // Build from the buffers *before* advancing past them.
-            let records = self.build_records(&variable, chunk_start, cut)?;
+            // Compact each sample's variable rows from the buffers *before*
+            // advancing past them — the cheap columnar gather; the expensive
+            // columns→records rebuild is deferred to the caller.
+            let per_sample = self.compact_samples(&variable, chunk_start, cut);
             let ref_span = self.fetch_ref_span(&variable, fetch_ref)?;
             self.next_chunk_start = cut;
             self.drop_buffers_below(cut);
 
             let chunk_order = self.chunk_order;
             self.chunk_order += 1;
-            return Ok(Some(PileupCohortChunk {
+            return Ok(Some(RawCohortChunk {
                 chunk_order,
-                records,
+                per_sample,
                 ref_span,
             }));
         }
@@ -766,46 +793,37 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         }
     }
 
-    /// Build the chunk's [`CohortPileupRecord`]s: per sample, reconstruct its
-    /// records on the variable positions in `[chunk_start, cut)` (columnar→
-    /// record), then merge per-position across samples via [`PerPositionMerger`].
-    fn build_records(
-        &self,
-        variable: &[u32],
-        chunk_start: u32,
-        cut: u32,
-    ) -> Result<Vec<CohortPileupRecord>, ProducerError> {
-        let mut iters: Vec<KeptRecordIter> = Vec::with_capacity(self.n);
-        for buf in &self.buffers {
-            let mut recs: Vec<PileupRecord> = Vec::new();
-            for chunk in buf {
-                let pos = chunk.positions();
-                let keep: Vec<bool> = pos
-                    .iter()
-                    .map(|&p| p >= chunk_start && p < cut && variable.binary_search(&p).is_ok())
-                    .collect();
-                if keep.iter().any(|&k| k) {
-                    recs.extend(chunk.records_for(&keep));
+    /// Compact each sample's variable rows in `[chunk_start, cut)` into one
+    /// columnar [`SamplePspChunk`] per sample — the cheap bulk-copy gather that
+    /// replaces the producer's old `records_for` + per-position merge. The
+    /// expensive columns→records rebuild and the merge run on the caller
+    /// ([`merge_compacted_samples`]); this thread only copies columns.
+    ///
+    /// Non-consuming: a buffered segment straddling the chunk cut survives to
+    /// serve the next chunk.
+    fn compact_samples(&self, variable: &[u32], chunk_start: u32, cut: u32) -> Vec<SamplePspChunk> {
+        use rayon::prelude::*;
+        let chrom_id = self.chrom_id;
+        // Per-sample independent (like `read_samples` decode) → rayon across the
+        // N buffered samples. Output stays compacted (variable rows only), so
+        // memory is unchanged; only the serial gather cost is parallelised.
+        self.buffers
+            .par_iter()
+            .map(|buf| {
+                let mut compacted = SamplePspChunk::empty_compacted(chrom_id);
+                for chunk in buf {
+                    let pos = chunk.positions();
+                    let keep: Vec<bool> = pos
+                        .iter()
+                        .map(|&p| p >= chunk_start && p < cut && variable.binary_search(&p).is_ok())
+                        .collect();
+                    if keep.iter().any(|&k| k) {
+                        compacted.append_kept(chunk, &keep);
+                    }
                 }
-            }
-            iters.push(
-                recs.into_iter()
-                    .map(ok_record as fn(PileupRecord) -> Result<PileupRecord, PspReadError>),
-            );
-        }
-
-        let merger = PerPositionMerger::new(iters, self.sample_names.clone(), Vec::new())
-            .map_err(|e| ProducerError::Merge(Box::new(e)))?;
-        let mut records = Vec::with_capacity(variable.len());
-        for item in merger {
-            let pp = item.map_err(|e| ProducerError::Merge(Box::new(e)))?;
-            records.push(CohortPileupRecord {
-                chrom_id: pp.chrom_id,
-                pos: pp.pos,
-                per_sample: pp.per_sample,
-            });
-        }
-        Ok(records)
+                compacted
+            })
+            .collect()
     }
 
     /// Fetch the chunk's one contiguous REF span `[first_kept, max_reach]`
@@ -1088,20 +1106,23 @@ mod tests {
                 SamplePspReader::new(reader, 0, 1, 1)
             })
             .collect();
-        let mut integ =
-            CohortChunkIntegrator::new(readers, names(samples.len()), min_alt_obs, target_variants);
+        let mut integ = CohortChunkIntegrator::new(readers, min_alt_obs, target_variants);
         integ.begin_interval(0, 1..INTERVAL_END, mask);
 
         let mut fetch = |_start: u32, len: u32| Ok::<_, RefFetchError>(vec![b'N'; len as usize]);
+        let names = names(samples.len());
         let mut out: Vec<CohortPileupRecord> = Vec::new();
         let mut expected_order = 0u64;
         while let Some(chunk) = integ.produce_chunk(&mut fetch).unwrap() {
             assert_eq!(chunk.chunk_order, expected_order, "chunk_order gapless");
             expected_order += 1;
-            assert!(!chunk.records.is_empty(), "empty chunks are never emitted");
+            // Reconstruct the cohort records the caller would build (the
+            // columns→records + per-position merge moved off the producer).
+            let records = merge_compacted_samples(&chunk.per_sample, &names).unwrap();
+            assert!(!records.is_empty(), "empty chunks are never emitted");
             // RefSpan covers the chunk's first kept position.
-            assert_eq!(chunk.ref_span.genomic_start, chunk.records[0].pos);
-            out.extend(chunk.records);
+            assert_eq!(chunk.ref_span.genomic_start, records[0].pos);
+            out.extend(records);
         }
         // Globally sorted, strictly ascending positions.
         assert!(
@@ -1267,9 +1288,9 @@ mod tests {
                 SamplePspReader::new(PspReader::new(Cursor::new(bytes)).unwrap(), 0, 1, 1)
             })
             .collect();
-        let mut integ =
-            CohortChunkIntegrator::new(readers, names(samples.len()), min_alt_obs, target_variants);
+        let mut integ = CohortChunkIntegrator::new(readers, min_alt_obs, target_variants);
 
+        let names = names(samples.len());
         let mut out: Vec<CohortPileupRecord> = Vec::new();
         let mut expected_order = 0u64;
         integ
@@ -1284,7 +1305,7 @@ mod tests {
                         "chunk_order gapless across run"
                     );
                     expected_order += 1;
-                    out.extend(chunk.records);
+                    out.extend(merge_compacted_samples(&chunk.per_sample, &names).unwrap());
                 },
             )
             .unwrap();
@@ -1310,7 +1331,7 @@ mod tests {
                     SamplePspReader::new(PspReader::new(Cursor::new(bytes)).unwrap(), 0, 1, 1)
                 })
                 .collect();
-            let integ = CohortChunkIntegrator::new(readers, names(3), 1, 4);
+            let integ = CohortChunkIntegrator::new(readers, 1, 4);
             assert_eq!(
                 integ.covered_intervals(0, MGS).len(),
                 2,

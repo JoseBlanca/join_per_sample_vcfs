@@ -5,6 +5,15 @@
 use std::error::Error;
 use std::process;
 
+// Opt-in `mimalloc` global allocator (`--features alloc-mimalloc`, off by
+// default). The cohort `var-calling` path is allocation-churn-heavy (per-allele
+// record building across the worker pool); on a T=8 / N=50 tomato cohort
+// mimalloc cut peak RSS ~9% and shaved wall time vs the system allocator,
+// byte-identical. Off by default so production builds carry no vendored-C dep.
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use pop_var_caller::pop_var_caller::{
     Cli, PopVarCallerCommand, run_estimate_contamination, run_pileup, run_psp_to_pileup,

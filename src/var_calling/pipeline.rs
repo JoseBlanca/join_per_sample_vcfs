@@ -35,7 +35,7 @@ use crate::var_calling::per_group_merger::{DEFAULT_BATCH_SIZE, PerGroupMergerCon
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 use crate::var_calling::posterior_engine::PosteriorEngineConfig;
 use crate::var_calling::sample_reader::SamplePspReader;
-use crate::var_calling::types::{CalledChunk, PileupCohortChunk};
+use crate::var_calling::types::{CalledChunk, RawCohortChunk};
 use crate::var_calling::variant_grouping::GrouperConfig;
 use crate::var_calling::vcf_writer::{DownstreamFilters, VcfWriter, WriterError, WriterStats};
 use crate::vcf::{CohortMetadata, WriterConfig};
@@ -43,10 +43,13 @@ use crate::vcf::{CohortMetadata, WriterConfig};
 /// Open-file buffer size (matches `pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY`).
 const BUFFERED_IO_CAPACITY: usize = 64 * 1024;
 /// Default per-chunk variable-position target when `--target-variants-per-chunk`
-/// is left at its `0` sentinel. Trades chunk size for memory (resident ≈ target
-/// × n_samples); output is independent of it (chunks always cut at clean group
-/// boundaries). Surfaced in the startup log so the effective value is visible.
-const DEFAULT_TARGET_VARIANTS: u32 = 1024;
+/// is left at its `0` sentinel. Finer chunks load-balance the producer→caller
+/// pipeline better (the producer is the wall floor, so smaller work-units keep
+/// the callers fed sooner): a T=8 / N=50 sweep gave 7.9 s at 256 vs 9.0 s at
+/// 1024, with peak memory flat and calls byte-identical (chunks always cut at
+/// clean group boundaries). Surfaced in the startup log so the effective value
+/// is visible.
+const DEFAULT_TARGET_VARIANTS: u32 = 256;
 /// Bounded-queue depth per worker on both hand-offs: peak resident chunks ≈
 /// `QUEUE_DEPTH_PER_WORKER × n_workers`. `2` keeps every worker fed across one
 /// hand-off without unbounded look-ahead — the back-pressure cap.
@@ -189,9 +192,14 @@ pub fn run_var_calling(
         min_mapq_diff_t: cohort.min_mapq_diff_t,
     };
     let mut writer = VcfWriter::new(metadata, writer_config, filters)?;
-    let caller = VariantCaller::new(grouper_cfg, merger_cfg, posterior_cfg, min_alt_obs);
-    let mut producer =
-        CohortChunkIntegrator::new(readers, sample_names, min_alt_obs, target_variants);
+    let caller = VariantCaller::new(
+        grouper_cfg,
+        merger_cfg,
+        posterior_cfg,
+        min_alt_obs,
+        sample_names.clone(),
+    );
+    let mut producer = CohortChunkIntegrator::new(readers, min_alt_obs, target_variants);
 
     // --- Parallel topology: producer (this thread) → W callers → writer. ---
     //
@@ -216,7 +224,7 @@ pub fn run_var_calling(
     eprintln!(
         "var-calling: workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants}"
     );
-    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<PileupCohortChunk>(cap);
+    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<RawCohortChunk>(cap);
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
 

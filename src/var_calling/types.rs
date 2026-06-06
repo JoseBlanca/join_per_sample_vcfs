@@ -17,6 +17,7 @@
 
 use crate::pileup_record::PileupRecord;
 use crate::var_calling::posterior_engine::PosteriorRecord;
+use crate::var_calling::sample_reader::SamplePspChunk;
 
 /// One **variable cohort position** with every sample's pileup data at it
 /// (appendix §C, `[REVIVE — cf. PerPositionPileups]`).
@@ -102,6 +103,31 @@ pub struct PileupCohortChunk {
     /// Monotonic, genomic-order production index stamped by the producer.
     pub chunk_order: u64,
     pub records: Vec<CohortPileupRecord>,
+    pub ref_span: RefSpan,
+}
+
+/// The producer→caller **work-unit**, columnar variant (the record-building
+/// lever).
+///
+/// Carries, per sample, a [`SamplePspChunk`] **compacted to this chunk's
+/// variable rows only** (positions the cohort fold kept, dust applied) — the
+/// columnar form, *not* yet rebuilt into [`PileupRecord`]s. The expensive
+/// columns→records conversion + per-position merge (which used to run on the
+/// single producer thread, ~½ its time) is deferred to the parallel caller,
+/// which calls [`SamplePspChunk::records_all`] + the per-position merger to
+/// reconstruct the [`CohortPileupRecord`]s before grouping. Chunk boundaries
+/// are still the producer's safe-gap cuts, so each chunk groups in isolation.
+///
+/// `per_sample.len()` equals the cohort's sample count; a sample with no
+/// variable row in this chunk carries an empty compacted chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawCohortChunk {
+    /// Monotonic, genomic-order production index stamped by the producer
+    /// (the writer's reorder ticket — same role as in [`PileupCohortChunk`]).
+    pub chunk_order: u64,
+    /// Per sample, in cohort sample order: the chunk's variable rows in
+    /// columnar form, ready for [`SamplePspChunk::records_all`].
+    pub per_sample: Vec<SamplePspChunk>,
     pub ref_span: RefSpan,
 }
 
