@@ -35,6 +35,7 @@ use std::io::{Read, Seek};
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 use crate::psp::ScalarDecodeError;
+use crate::psp::reader::{DecodedColumn, RetainedColumn, TwoPhaseBlock, inflate_retained_column};
 use crate::psp::{BlockColumnReader, BlockColumns, BlockIndexEntry, PspReadError, PspReader};
 
 // ---------------------------------------------------------------------------
@@ -442,6 +443,29 @@ impl SamplePspChunk {
         }
     }
 
+    /// Append `src`'s records whose position is in `[lo, hi)` onto `self` — the
+    /// cohort-chunk slice over a **finalised** (variable-only) two-phase
+    /// segment. `src`'s positions are ascending, so the range is contiguous;
+    /// copies the heavy columns for that row range (no decode, no filter). The
+    /// producer slices each `Ready` segment overlapping `[chunk_start, cut)`
+    /// this way to build a cohort chunk's per-sample columns.
+    // Used by the two-phase producer loop (next step); kept building-block.
+    #[allow(dead_code)]
+    pub fn append_range(&mut self, src: &SamplePspChunk, lo: u32, hi: u32) {
+        let r_lo = src.positions.partition_point(|&p| p < lo);
+        let r_hi = src.positions.partition_point(|&p| p < hi);
+        for r in r_lo..r_hi {
+            let a_lo = src.allele_offsets[r] as usize;
+            let a_hi = src.allele_offsets[r + 1] as usize;
+            self.positions.push(src.positions[r]);
+            self.fixed.extend_from_range(&src.fixed, a_lo..a_hi);
+            self.seq.extend_from_range(&src.seq, a_lo..a_hi);
+            self.chain_ids.extend_from_range(&src.chain_ids, a_lo..a_hi);
+            let cum = self.allele_offsets.last().copied().unwrap_or(0) + (a_hi - a_lo) as u32;
+            self.allele_offsets.push(cum);
+        }
+    }
+
     /// Reconstruct every record (a compacted chunk holds only kept rows) —
     /// the columns→records boundary, now run **on the caller**. Equivalent to
     /// `records_for(&vec![true; len()])` without allocating the mask. This is
@@ -545,6 +569,219 @@ impl SamplePspChunk {
 }
 
 // ---------------------------------------------------------------------------
+// TwoPhaseSegment — column-selective decode (light eager, heavy deferred)
+// ---------------------------------------------------------------------------
+
+/// Append `full[lo..hi]` for every kept row's allele range to `out` — the
+/// per-allele scalar compaction used by [`TwoPhaseSegment::set_variable_rows`].
+#[allow(dead_code)]
+fn extend_kept<T: Copy>(out: &mut Vec<T>, full: &[T], ranges: &[(usize, usize)]) {
+    for &(lo, hi) in ranges {
+        out.extend_from_slice(&full[lo..hi]);
+    }
+}
+
+/// A `.psp` segment decoded in two phases (the column-selective producer read):
+/// the fold columns are materialised; the per-allele heavy columns stay
+/// compressed in `retained` until [`set_variable_rows`](Self::set_variable_rows)
+/// inflates + compacts them to the kept (variable) rows, yielding a variable-only
+/// [`SamplePspChunk`]. The producer folds over the light accessors, then once a
+/// segment's variable mask is final converts it in one column-by-column
+/// inflate→compact→free pass (transient ≈ one inflated column).
+// Constructed by `SamplePspReader` and finalised by the producer in the next
+// step; exercised now by `two_phase_segment_set_variable_rows_matches_eager`.
+#[allow(dead_code)]
+pub(crate) struct TwoPhaseSegment {
+    chrom_id: u32,
+    positions: Vec<u32>,      // 1-based, full block
+    ref_spans: Vec<u32>,      // allele-0 ref span, full block (fold)
+    nonref_obs: Vec<u32>,     // Σ non-REF obs, full block (fold)
+    allele_offsets: Vec<u32>, // CSR record→allele, full block
+    n_total_alleles: usize,
+    allele_seq_len: Vec<u64>, // full block — rebuilds the seq/chain CSR offsets
+    allele_obs_count: Vec<u32>, // full block (light; supplies the num_obs stat)
+    retained: Vec<RetainedColumn>,
+}
+
+#[allow(dead_code)] // methods wired into the producer in the next step
+impl TwoPhaseSegment {
+    /// Build from a two-phase-decoded block: delta-decode positions and derive
+    /// the fold columns (ref span, Σ non-REF obs) from the light columns; keep
+    /// the deferred columns compressed. **Whole block, no region clamp** — the
+    /// cohort fold's `[next_chunk_start, watermark]` bounds already exclude
+    /// out-of-interval rows, and such rows never enter the variable mask.
+    pub fn from_two_phase_block(tp: TwoPhaseBlock) -> Result<Self, PspReadError> {
+        let n = tp.n_records as usize;
+        let mut positions = Vec::with_capacity(n);
+        let mut p = tp.first_pos;
+        for i in 0..n {
+            if i > 0 {
+                p = advance_pos(p, tp.delta_pos[i], i)?;
+            }
+            positions.push(p);
+        }
+        let mut allele_offsets = Vec::with_capacity(n + 1);
+        allele_offsets.push(0u32);
+        let mut cum = 0u32;
+        for &na in &tp.n_alleles {
+            cum += na as u32;
+            allele_offsets.push(cum);
+        }
+        let mut ref_spans = Vec::with_capacity(n);
+        let mut nonref_obs = Vec::with_capacity(n);
+        for r in 0..n {
+            let lo = allele_offsets[r] as usize;
+            let hi = allele_offsets[r + 1] as usize;
+            ref_spans.push(tp.allele_seq_len[lo] as u32);
+            let nro = tp.allele_obs_count[(lo + 1).min(hi)..hi]
+                .iter()
+                .fold(0u32, |acc, &c| acc.saturating_add(c));
+            nonref_obs.push(nro);
+        }
+        Ok(Self {
+            chrom_id: tp.chrom_id,
+            positions,
+            ref_spans,
+            nonref_obs,
+            allele_offsets,
+            n_total_alleles: tp.n_total_alleles as usize,
+            allele_seq_len: tp.allele_seq_len,
+            allele_obs_count: tp.allele_obs_count,
+            retained: tp.retained,
+        })
+    }
+
+    /// 1-based positions, one per record (the fold's key).
+    pub fn positions(&self) -> &[u32] {
+        &self.positions
+    }
+    /// Per-record REF-allele reference span (fold reach).
+    pub fn ref_spans(&self) -> &[u32] {
+        &self.ref_spans
+    }
+    /// Per-record Σ non-REF obs (fold AC).
+    pub fn nonref_obs(&self) -> &[u32] {
+        &self.nonref_obs
+    }
+    /// Number of (full-block) records.
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+    /// True when the segment has no records.
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    /// Phase 1 → 2: inflate the deferred columns **one at a time**, compacting
+    /// each to the `keep` rows and freeing the inflated buffer before the next
+    /// (resident transient ≈ one inflated column). Returns a variable-only
+    /// [`SamplePspChunk`] ready for record building. `keep.len()` must equal
+    /// [`len`](Self::len).
+    pub fn set_variable_rows(
+        self,
+        keep: &[bool],
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed_scratch: &mut Vec<u8>,
+        decompressed_scratch: &mut Vec<u8>,
+    ) -> Result<SamplePspChunk, PspReadError> {
+        debug_assert_eq!(
+            keep.len(),
+            self.positions.len(),
+            "keep mask covers every record"
+        );
+        let n_records = self.positions.len();
+
+        // Kept positions + re-based CSR + each kept row's full-block allele range.
+        let mut positions = Vec::new();
+        let mut allele_offsets = vec![0u32];
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut cum = 0u32;
+        for (r, &k) in keep.iter().enumerate() {
+            if k {
+                let lo = self.allele_offsets[r] as usize;
+                let hi = self.allele_offsets[r + 1] as usize;
+                positions.push(self.positions[r]);
+                ranges.push((lo, hi));
+                cum += (hi - lo) as u32;
+                allele_offsets.push(cum);
+            }
+        }
+
+        // `num_obs` is the light obs-count column (already decoded, not deferred).
+        let mut fixed = PerAlleleFixed::default();
+        extend_kept(&mut fixed.num_obs, &self.allele_obs_count, &ranges);
+
+        // Inflate + compact each deferred column, freeing between (one resident).
+        let mut seq = PerAlleleSeq::empty();
+        let mut chain_ids = PerAlleleChainIds::empty();
+        let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for rc in &self.retained {
+            let col = inflate_retained_column(
+                &rc.blob,
+                &rc.entry,
+                n_records,
+                self.n_total_alleles,
+                Some(&self.allele_seq_len),
+                decompressor,
+                compressed_scratch,
+                decompressed_scratch,
+                &mut sd,
+                &mut so,
+                &mut cd,
+                &mut co,
+            )?;
+            match col {
+                Some(DecodedColumn::AlleleQSumLog(v)) => extend_kept(&mut fixed.q_sum, &v, &ranges),
+                Some(DecodedColumn::AlleleFwdCount(v)) => extend_kept(&mut fixed.fwd, &v, &ranges),
+                Some(DecodedColumn::AllelePlacedLeftCount(v)) => {
+                    extend_kept(&mut fixed.placed_left, &v, &ranges)
+                }
+                Some(DecodedColumn::AllelePlacedStartCount(v)) => {
+                    extend_kept(&mut fixed.placed_start, &v, &ranges)
+                }
+                Some(DecodedColumn::AlleleMapqSum(v)) => {
+                    extend_kept(&mut fixed.mapq_sum, &v, &ranges)
+                }
+                Some(DecodedColumn::AlleleMapqSumSq(v)) => {
+                    extend_kept(&mut fixed.mapq_sum_sq, &v, &ranges)
+                }
+                Some(DecodedColumn::AlleleSeq) => {
+                    let full = PerAlleleSeq {
+                        offsets: std::mem::take(&mut so),
+                        bytes: std::mem::take(&mut sd),
+                    };
+                    for &(lo, hi) in &ranges {
+                        seq.extend_from_range(&full, lo..hi);
+                    }
+                }
+                Some(DecodedColumn::AlleleChainIds) => {
+                    let full = PerAlleleChainIds {
+                        offsets: std::mem::take(&mut co),
+                        ids: std::mem::take(&mut cd),
+                    };
+                    for &(lo, hi) in &ranges {
+                        chain_ids.extend_from_range(&full, lo..hi);
+                    }
+                }
+                // Light columns are never retained; an unknown optional → None.
+                _ => {}
+            }
+        }
+
+        Ok(SamplePspChunk {
+            chrom_id: self.chrom_id,
+            positions,
+            nonref_obs: Vec::new(),
+            ref_spans: Vec::new(),
+            allele_offsets,
+            fixed,
+            seq,
+            chain_ids,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SamplePspReader
 // ---------------------------------------------------------------------------
 
@@ -628,6 +865,31 @@ impl<R: Read + Seek> SamplePspReader<R> {
             }
         }
     }
+
+    /// Decode and return the next in-region segment as a [`TwoPhaseSegment`]
+    /// (column-selective: light columns eager, the rest retained compressed),
+    /// advancing the cursor past it. `None` once the region is exhausted.
+    ///
+    /// Unlike [`next_chunk`](Self::next_chunk) the segment is **not**
+    /// region-clamped — the deferred columns can't be sliced while compressed,
+    /// and the producer's fold bounds (`[next_chunk_start, watermark]`) already
+    /// exclude out-of-interval rows, which therefore never enter a variable mask.
+    // Wired into the producer in the next step; exercised now by
+    // `sample_reader_next_two_phase_matches_next_chunk`.
+    #[allow(dead_code)]
+    pub(crate) fn next_two_phase(&mut self) -> Result<Option<TwoPhaseSegment>, PspReadError> {
+        match self.blocks.peek_block() {
+            Some(entry)
+                if entry.chrom_id == self.chrom_id && entry.first_pos <= self.region_end => {}
+            _ => return Ok(None),
+        }
+        let tp = self.blocks.decode_current_two_phase()?;
+        self.blocks.advance();
+        match tp {
+            Some(tp) => Ok(Some(TwoPhaseSegment::from_two_phase_block(tp)?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Advance a delta-encoded position, surfacing a `u32`-overflowing delta as
@@ -693,6 +955,149 @@ mod tests {
             writer.write_record(r).expect("write_record");
         }
         writer.finish().expect("finish").into_inner()
+    }
+
+    /// Step 3b: `TwoPhaseSegment::from_two_phase_block` + `set_variable_rows`
+    /// (column-selective: light eager, heavy deferred) must build **identical**
+    /// records to the eager `from_block` + `records_for` for the same `keep`.
+    #[test]
+    fn two_phase_segment_set_variable_rows_matches_eager() {
+        let records = vec![
+            record(
+                10,
+                vec![
+                    allele(b"A", 5, -1.0, &[]),
+                    allele(b"ACGT", 2, -1.5, &[7, 9]),
+                ],
+            ),
+            record(
+                25,
+                vec![allele(b"T", 6, -1.0, &[3]), allele(b"TT", 1, -2.0, &[])],
+            ),
+            record(40, vec![allele(b"G", 4, -1.0, &[])]),
+            record(
+                55,
+                vec![allele(b"C", 3, -1.0, &[]), allele(b"CC", 2, -1.0, &[5])],
+            ),
+        ];
+        let bytes = psp_bytes(&records, 1024); // single block
+        let keep = vec![true, false, true, true]; // drop row 1
+
+        // Eager reference: from_block + records_for(keep).
+        let eager_records = {
+            let mut br = PspReader::new(Cursor::new(bytes.clone()))
+                .unwrap()
+                .into_column_blocks();
+            assert!(br.load_current().unwrap());
+            let cols = br.columns().unwrap();
+            let chunk = SamplePspChunk::from_block(&cols, 0, 1, u32::MAX)
+                .unwrap()
+                .unwrap();
+            chunk.records_for(&keep)
+        };
+
+        // Two-phase: from_two_phase_block + set_variable_rows(keep) + records_all.
+        let tp_records = {
+            let mut br = PspReader::new(Cursor::new(bytes))
+                .unwrap()
+                .into_column_blocks();
+            let tp = br.decode_current_two_phase().unwrap().unwrap();
+            let seg = TwoPhaseSegment::from_two_phase_block(tp).unwrap();
+            let mut dz = crate::psp::block::new_column_decompressor().unwrap();
+            let (mut cs, mut ds) = (Vec::new(), Vec::new());
+            let chunk = seg
+                .set_variable_rows(&keep, &mut dz, &mut cs, &mut ds)
+                .unwrap();
+            chunk.records_all()
+        };
+
+        assert_eq!(tp_records, eager_records);
+        assert_eq!(tp_records.len(), 3); // kept rows 0, 2, 3
+        // The light fold accessors match the eager chunk too.
+        let seg = {
+            let mut br = PspReader::new(Cursor::new(psp_bytes(&records, 1024)))
+                .unwrap()
+                .into_column_blocks();
+            let tp = br.decode_current_two_phase().unwrap().unwrap();
+            TwoPhaseSegment::from_two_phase_block(tp).unwrap()
+        };
+        assert_eq!(seg.positions(), &[10, 25, 40, 55]);
+        assert_eq!(seg.ref_spans(), &[1, 1, 1, 1]); // allele-0 lengths: A,T,G,C
+        assert_eq!(seg.nonref_obs(), &[2, 1, 0, 2]); // Σ non-REF obs
+    }
+
+    /// Step 4 (reader side): draining `next_two_phase` (+ `set_variable_rows`
+    /// keep-all per segment) over a whole-file region rebuilds **the same
+    /// records** as draining the eager `next_chunk`, across multiple segments.
+    #[test]
+    fn sample_reader_next_two_phase_matches_next_chunk() {
+        let records = fixture_records();
+        let bytes = psp_bytes(&records, 2); // small block target → several segments
+
+        let mut eager = Vec::new();
+        {
+            let reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
+            let mut sr = SamplePspReader::new(reader, 0, 1, u32::MAX);
+            while let Some(chunk) = sr.next_chunk().unwrap() {
+                eager.extend(chunk.records_all());
+            }
+        }
+
+        let mut tp = Vec::new();
+        {
+            let reader = PspReader::new(Cursor::new(bytes)).unwrap();
+            let mut sr = SamplePspReader::new(reader, 0, 1, u32::MAX);
+            let mut dz = crate::psp::block::new_column_decompressor().unwrap();
+            let (mut cs, mut ds) = (Vec::new(), Vec::new());
+            while let Some(seg) = sr.next_two_phase().unwrap() {
+                let keep = vec![true; seg.len()];
+                let chunk = seg
+                    .set_variable_rows(&keep, &mut dz, &mut cs, &mut ds)
+                    .unwrap();
+                tp.extend(chunk.records_all());
+            }
+        }
+
+        assert_eq!(tp, eager);
+        assert!(!eager.is_empty());
+    }
+
+    /// `append_range(src, lo, hi)` slices a finalised (variable-only) segment by
+    /// position — equivalent to `records_for` over the same row range.
+    #[test]
+    fn append_range_slices_a_compacted_segment_by_position() {
+        let records = vec![
+            record(
+                10,
+                vec![allele(b"A", 5, -1.0, &[]), allele(b"AC", 2, -1.5, &[7])],
+            ),
+            record(25, vec![allele(b"T", 6, -1.0, &[3])]),
+            record(40, vec![allele(b"G", 4, -1.0, &[])]),
+            record(
+                55,
+                vec![allele(b"C", 3, -1.0, &[]), allele(b"CC", 1, -2.0, &[])],
+            ),
+        ];
+        let bytes = psp_bytes(&records, 1024);
+        let chunk = {
+            let mut br = PspReader::new(Cursor::new(bytes))
+                .unwrap()
+                .into_column_blocks();
+            assert!(br.load_current().unwrap());
+            let cols = br.columns().unwrap();
+            SamplePspChunk::from_block(&cols, 0, 1, u32::MAX)
+                .unwrap()
+                .unwrap()
+        };
+
+        // Slice [25, 55) → positions 25, 40.
+        let mut dst = SamplePspChunk::empty_compacted(0);
+        dst.append_range(&chunk, 25, 55);
+        let got = dst.records_all();
+
+        let want = chunk.records_for(&[false, true, true, false]);
+        assert_eq!(got, want);
+        assert_eq!(got.iter().map(|r| r.pos).collect::<Vec<_>>(), vec![25, 40]);
     }
 
     /// Reference: full row decode of `[start, end]`.

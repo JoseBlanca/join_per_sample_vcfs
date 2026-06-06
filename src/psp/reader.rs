@@ -995,6 +995,40 @@ impl<R: Read + Seek> BlockColumnReader<R> {
         Ok(true)
     }
 
+    /// Decode the block at the cursor in **two phases** — light columns
+    /// eagerly, the rest retained compressed (column-selective decode) —
+    /// returning the owned [`TwoPhaseBlock`] (or `None` past the last block).
+    /// Mirrors [`load_current`](Self::load_current) but does not store the
+    /// block in `self`; pair with [`advance`](Self::advance). The deferred
+    /// columns are inflated later, once the cohort fold knows the variable mask.
+    // Wired into `SamplePspReader` in the next step; exercised now by
+    // `block_reader_two_phase_matches_eager`.
+    #[allow(dead_code)]
+    pub(crate) fn decode_current_two_phase(
+        &mut self,
+    ) -> Result<Option<TwoPhaseBlock>, PspReadError> {
+        if self.cur_block_idx >= self.reader.index.len() {
+            return Ok(None);
+        }
+        let entry = self.reader.index[self.cur_block_idx];
+        seek_to_offset(
+            &mut self.reader.source,
+            entry.block_offset,
+            "block start seek",
+        )?;
+        let (block_header, _consumed) =
+            read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
+        let tp = decode_block_payload_two_phase(
+            &mut self.reader.source,
+            &block_header,
+            block_byte_budget(&self.reader.index, &self.reader.trailer, self.cur_block_idx),
+            &mut self.decompressor,
+            &mut self.compressed_scratch,
+            &mut self.decompressed_scratch,
+        )?;
+        Ok(Some(tp))
+    }
+
     /// Advance the cursor to the next block, dropping the current
     /// decoded one. Pair with [`peek_block`](Self::peek_block) +
     /// [`load_current`](Self::load_current).
@@ -1321,7 +1355,7 @@ fn decode_block_payload<R: Read>(
 /// returns `Option<DecodedColumn>`, with `None` for unknown
 /// optional columns.
 #[derive(Debug)]
-enum DecodedColumn {
+pub(crate) enum DecodedColumn {
     DeltaPos(Vec<u64>),
     NAlleles(Vec<u64>),
     AlleleSeqLen(Vec<u64>),
@@ -1560,6 +1594,204 @@ fn decode_one_column<R: Read>(
     Ok(Some(decoded))
 }
 
+/// Read one column's raw compressed bytes (budget-checked) **without inflating**
+/// — the two-phase decode retains the deferred columns this way until
+/// [`inflate_retained_column`] materialises them. Mirrors the budget guard +
+/// `read_exact` at the head of [`decode_one_column`]; the caller positions
+/// `source` at the column payload (manifest order).
+// Wired into the two-phase block decode in the next step; exercised now by
+// `two_phase_inflate_matches_eager_decode`.
+#[allow(dead_code)]
+fn read_compressed_blob<R: Read>(
+    source: &mut R,
+    entry: &ColumnManifestEntry,
+    remaining_budget: u64,
+) -> Result<Vec<u8>, PspReadError> {
+    if entry.compressed_len as u64 > remaining_budget {
+        return Err(PspReadError::ColumnTruncated {
+            column: lookup_by_tag(entry.tag)
+                .map(|d| d.name.to_string())
+                .unwrap_or_else(|| format!("tag {:#x}", entry.tag)),
+            decoded: 0,
+            expected: entry.compressed_len as usize,
+        });
+    }
+    let mut buf = vec![0u8; entry.compressed_len as usize];
+    source
+        .read_exact(&mut buf)
+        .map_err(io_err("block column payload"))?;
+    Ok(buf)
+}
+
+/// Inflate a retained compressed-column blob, **reusing [`decode_one_column`]**
+/// over an in-memory cursor. The blob is exactly `entry.compressed_len` bytes,
+/// so its own length is the budget and the inner `read_exact` consumes it whole
+/// — byte-identical to the eager path by construction (same decode, deferred).
+/// `allele_seq_len` (a light column, decoded up front) chunks the `allele-seq` /
+/// `allele-chain-ids` CSR columns.
+// Used by `TwoPhaseSegment::set_variable_rows`, which is wired into the producer
+// in the next step; exercised now by the two-phase round-trip tests.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn inflate_retained_column(
+    blob: &[u8],
+    entry: &ColumnManifestEntry,
+    n_records: usize,
+    n_total_alleles: usize,
+    allele_seq_len: Option<&[u64]>,
+    decompressor: &mut zstd::bulk::Decompressor<'static>,
+    compressed_scratch: &mut Vec<u8>,
+    decompressed_scratch: &mut Vec<u8>,
+    allele_seq_data: &mut Vec<u8>,
+    allele_seq_offsets: &mut Vec<u32>,
+    allele_chain_ids_data: &mut Vec<ChainId>,
+    allele_chain_ids_offsets: &mut Vec<u32>,
+) -> Result<Option<DecodedColumn>, PspReadError> {
+    let mut cursor = std::io::Cursor::new(blob);
+    decode_one_column(
+        &mut cursor,
+        entry,
+        n_records,
+        n_total_alleles,
+        allele_seq_len,
+        blob.len() as u64,
+        decompressor,
+        compressed_scratch,
+        decompressed_scratch,
+        allele_seq_data,
+        allele_seq_offsets,
+        allele_chain_ids_data,
+        allele_chain_ids_offsets,
+    )
+}
+
+/// The four "light" column tags — decoded eagerly because the cohort fold
+/// needs them (positions, the record→allele CSR base, ref-span/seq-len, and the
+/// AC obs count). Every other v1.0 column is "deferred": retained compressed by
+/// the two-phase decode and inflated only for the variable rows.
+fn is_light_tag(tag: u16) -> bool {
+    matches!(tag, 0x01 | 0x02 | 0x03 | 0x10)
+}
+
+/// One deferred column retained as its raw zstd blob (with its manifest entry,
+/// so [`inflate_retained_column`] can size + dispatch it later).
+#[allow(dead_code)]
+pub(crate) struct RetainedColumn {
+    pub entry: ColumnManifestEntry,
+    pub blob: Vec<u8>,
+}
+
+/// A block decoded in two phases: the light columns are materialised (the fold
+/// reads them); the deferred columns are retained compressed in
+/// [`retained`](Self::retained). Mirrors the eager [`DecodedBlock`] for the
+/// light columns; the heavy columns are inflated on demand by the consumer
+/// (`SamplePspChunk::set_variable_rows`) once the variable mask is known.
+#[allow(dead_code)]
+pub(crate) struct TwoPhaseBlock {
+    pub chrom_id: u32,
+    pub first_pos: u32,
+    pub n_records: u32,
+    pub n_total_alleles: u32,
+    pub delta_pos: Vec<u64>,
+    pub n_alleles: Vec<u64>,
+    pub allele_seq_len: Vec<u64>,
+    pub allele_obs_count: Vec<u32>,
+    pub retained: Vec<RetainedColumn>,
+}
+
+/// Two-phase sibling of [`decode_block_payload`]: decode the four light columns
+/// eagerly; read every other column's bytes but **retain them compressed**
+/// (via [`read_compressed_blob`]) for deferred, column-selective inflation. The
+/// B1 manifest-coverage and B3 `n_alleles` cross-checks are kept identical to
+/// the eager path; the source stays aligned (every column consumes its
+/// `compressed_len` bytes in manifest order, light-decoded or retained).
+// Wired into `BlockColumnReader` in the next step; exercised now by
+// `two_phase_block_decode_matches_eager`.
+#[allow(dead_code)]
+fn decode_block_payload_two_phase<R: Read>(
+    source: &mut R,
+    header: &BlockHeader,
+    byte_budget: u64,
+    decompressor: &mut zstd::bulk::Decompressor<'static>,
+    compressed_scratch: &mut Vec<u8>,
+    decompressed_scratch: &mut Vec<u8>,
+) -> Result<TwoPhaseBlock, PspReadError> {
+    // B1: every v1.0 required tag must appear in the manifest (same as eager).
+    for def in V1_0_COLUMNS {
+        if def.required && !header.manifest.iter().any(|e| e.tag == def.tag) {
+            return Err(PspReadError::MissingRequiredColumnInManifest {
+                name: def.name.to_string(),
+                tag: def.tag,
+            });
+        }
+    }
+
+    let n_records = header.n_records as usize;
+    let n_total_alleles = header.n_total_alleles as usize;
+    let mut delta_pos: Option<Vec<u64>> = None;
+    let mut n_alleles: Option<Vec<u64>> = None;
+    let mut allele_seq_len: Option<Vec<u64>> = None;
+    let mut allele_obs_count: Option<Vec<u32>> = None;
+    let mut retained: Vec<RetainedColumn> = Vec::new();
+
+    // The light columns are scalar/varint — they never touch the CSR scratch,
+    // so a single throwaway set suffices (the ragged seq/chain columns are
+    // deferred, not decoded here).
+    let mut csr_sink = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut remaining_budget = byte_budget;
+    for entry in &header.manifest {
+        if is_light_tag(entry.tag) {
+            let column = decode_one_column(
+                source,
+                entry,
+                n_records,
+                n_total_alleles,
+                allele_seq_len.as_deref(),
+                remaining_budget,
+                decompressor,
+                compressed_scratch,
+                decompressed_scratch,
+                &mut csr_sink.0,
+                &mut csr_sink.1,
+                &mut csr_sink.2,
+                &mut csr_sink.3,
+            )?;
+            match column {
+                Some(DecodedColumn::DeltaPos(v)) => delta_pos = Some(v),
+                Some(DecodedColumn::NAlleles(v)) => n_alleles = Some(v),
+                Some(DecodedColumn::AlleleSeqLen(v)) => allele_seq_len = Some(v),
+                Some(DecodedColumn::AlleleObsCount(v)) => allele_obs_count = Some(v),
+                // `is_light_tag` only admits the four above.
+                _ => {}
+            }
+        } else {
+            let blob = read_compressed_blob(source, entry, remaining_budget)?;
+            retained.push(RetainedColumn {
+                entry: *entry,
+                blob,
+            });
+        }
+        remaining_budget = remaining_budget.saturating_sub(entry.compressed_len as u64);
+    }
+
+    // B3: `sum(n_alleles) == n_total_alleles` (same as eager).
+    let n_alleles = n_alleles.expect("n-alleles column required by v1.0 schema");
+    validate_n_alleles_column(&n_alleles, header.n_total_alleles)
+        .map_err(|kind| PspReadError::BlockHeaderInvariant { kind })?;
+
+    Ok(TwoPhaseBlock {
+        chrom_id: header.chrom_id,
+        first_pos: header.first_pos,
+        n_records: header.n_records,
+        n_total_alleles: header.n_total_alleles,
+        delta_pos: delta_pos.expect("delta-pos column required by v1.0 schema"),
+        n_alleles,
+        allele_seq_len: allele_seq_len.expect("allele-seq-len column required by v1.0 schema"),
+        allele_obs_count: allele_obs_count
+            .expect("allele-obs-count column required by v1.0 schema"),
+        retained,
+    })
+}
+
 /// Compute the geographic byte budget for the block at `block_idx`.
 /// Bytes available between block N's start and the start of block
 /// N+1 (or, for the last block, the index region). Used by
@@ -1671,6 +1903,323 @@ mod tests {
                 chain_ids: Vec::new(),
             }],
         }
+    }
+
+    /// Multi-allele record exercising the ragged seq / chain-id CSR columns
+    /// and every per-allele scalar stat (distinct values per allele).
+    fn multi_allele_record(pos: u32, alleles: &[(&[u8], &[ChainId])]) -> PileupRecord {
+        PileupRecord {
+            chrom_id: 0,
+            pos,
+            alleles: alleles
+                .iter()
+                .enumerate()
+                .map(|(i, (seq, chains))| AlleleObservation {
+                    seq: seq.to_vec(),
+                    support: AlleleSupportStats {
+                        num_obs: i as u32 + 1,
+                        q_sum: -1.0 - i as f64,
+                        fwd: i as u32,
+                        placed_left: i as u32,
+                        placed_start: 1,
+                        mapq_sum: 10 * i as u32,
+                        mapq_sum_sq: 100 * i as u64,
+                    },
+                    chain_ids: chains.to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Step 1 of column-selective decode: `read_compressed_blob` +
+    /// `inflate_retained_column` (deferred decode of a retained blob) must
+    /// produce **byte-identical** columns to the eager `decode_block_payload`,
+    /// for every v1.0 column type incl. the ragged seq / chain-id CSR.
+    #[test]
+    fn two_phase_inflate_matches_eager_decode() {
+        let records = vec![
+            multi_allele_record(10, &[(b"A", &[]), (b"ACGT", &[7, 9])]),
+            multi_allele_record(25, &[(b"T", &[3]), (b"TT", &[])]),
+            multi_allele_record(40, &[(b"G", &[])]),
+        ];
+        let bytes = {
+            let mut w = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+            for r in &records {
+                w.write_record(r).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+
+        // Slice out block 0's [header + payload] bytes.
+        let (off, end) = {
+            let reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
+            let idx = reader.block_index();
+            let off = idx[0].block_offset as usize;
+            let end = idx
+                .get(1)
+                .map(|e| e.block_offset)
+                .unwrap_or(reader.trailer().index_offset) as usize;
+            (off, end)
+        };
+        let mut src = Cursor::new(bytes[off..end].to_vec());
+        let mut header_buf = Vec::new();
+        let (header, _) = read_block_header(&mut src, &mut header_buf).unwrap();
+        let payload_start = src.position();
+        let n_rec = header.n_records as usize;
+        let n_tot = header.n_total_alleles as usize;
+
+        // --- Eager reference decode. ---
+        let mut dz = new_column_decompressor().unwrap();
+        let (mut cs, mut ds) = (Vec::new(), Vec::new());
+        let (mut e_sd, mut e_so, mut e_cd, mut e_co) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let eager = decode_block_payload(
+            &mut src,
+            &header,
+            u64::MAX,
+            &mut dz,
+            &mut cs,
+            &mut ds,
+            &mut e_sd,
+            &mut e_so,
+            &mut e_cd,
+            &mut e_co,
+        )
+        .unwrap();
+
+        // --- Two-phase: read each column's blob, then inflate it. ---
+        src.set_position(payload_start);
+        let mut seq_len: Option<Vec<u64>> = None;
+        let (mut obs, mut q, mut fwd, mut pl, mut ps, mut ms, mut mss) =
+            (None, None, None, None, None, None, None);
+        let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut budget = u64::MAX;
+        for entry in &header.manifest {
+            let blob = read_compressed_blob(&mut src, entry, budget).unwrap();
+            budget -= entry.compressed_len as u64;
+            let col = inflate_retained_column(
+                &blob,
+                entry,
+                n_rec,
+                n_tot,
+                seq_len.as_deref(),
+                &mut dz,
+                &mut cs,
+                &mut ds,
+                &mut sd,
+                &mut so,
+                &mut cd,
+                &mut co,
+            )
+            .unwrap();
+            match col {
+                Some(DecodedColumn::AlleleSeqLen(v)) => seq_len = Some(v),
+                Some(DecodedColumn::AlleleObsCount(v)) => obs = Some(v),
+                Some(DecodedColumn::AlleleQSumLog(v)) => q = Some(v),
+                Some(DecodedColumn::AlleleFwdCount(v)) => fwd = Some(v),
+                Some(DecodedColumn::AllelePlacedLeftCount(v)) => pl = Some(v),
+                Some(DecodedColumn::AllelePlacedStartCount(v)) => ps = Some(v),
+                Some(DecodedColumn::AlleleMapqSum(v)) => ms = Some(v),
+                Some(DecodedColumn::AlleleMapqSumSq(v)) => mss = Some(v),
+                Some(DecodedColumn::DeltaPos(_))
+                | Some(DecodedColumn::NAlleles(_))
+                | Some(DecodedColumn::AlleleSeq)
+                | Some(DecodedColumn::AlleleChainIds)
+                | None => {}
+            }
+        }
+
+        // Heavy scalar columns inflate byte-identically.
+        assert_eq!(obs.unwrap(), eager.allele_obs_count);
+        assert_eq!(q.unwrap(), eager.allele_q_sum_log);
+        assert_eq!(fwd.unwrap(), eager.allele_fwd_count);
+        assert_eq!(pl.unwrap(), eager.allele_placed_left_count);
+        assert_eq!(ps.unwrap(), eager.allele_placed_start_count);
+        assert_eq!(ms.unwrap(), eager.allele_mapq_sum);
+        assert_eq!(mss.unwrap(), eager.allele_mapq_sum_sq);
+        // Ragged CSR columns inflate byte-identically.
+        assert_eq!((sd, so), (e_sd, e_so), "allele-seq CSR");
+        assert_eq!((cd, co), (e_cd, e_co), "chain-ids CSR");
+        // The fixture actually exercised the ragged columns.
+        assert_eq!(n_tot, 5);
+    }
+
+    /// Step 2: `decode_block_payload_two_phase` must yield light columns
+    /// identical to the eager decode, plus retained blobs that inflate to the
+    /// eager heavy columns (scalars + ragged seq/chain CSR).
+    #[test]
+    fn two_phase_block_decode_matches_eager() {
+        let records = vec![
+            multi_allele_record(10, &[(b"A", &[]), (b"ACGT", &[7, 9])]),
+            multi_allele_record(25, &[(b"T", &[3]), (b"TT", &[])]),
+            multi_allele_record(40, &[(b"G", &[])]),
+        ];
+        let bytes = {
+            let mut w = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+            for r in &records {
+                w.write_record(r).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+        let (off, end) = {
+            let reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
+            let idx = reader.block_index();
+            let off = idx[0].block_offset as usize;
+            let end = idx
+                .get(1)
+                .map(|e| e.block_offset)
+                .unwrap_or(reader.trailer().index_offset) as usize;
+            (off, end)
+        };
+        let mut src = Cursor::new(bytes[off..end].to_vec());
+        let mut header_buf = Vec::new();
+        let (header, _) = read_block_header(&mut src, &mut header_buf).unwrap();
+        let payload_start = src.position();
+        let n_rec = header.n_records as usize;
+        let n_tot = header.n_total_alleles as usize;
+
+        let mut dz = new_column_decompressor().unwrap();
+        let (mut cs, mut ds) = (Vec::new(), Vec::new());
+        let (mut e_sd, mut e_so, mut e_cd, mut e_co) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let eager = decode_block_payload(
+            &mut src,
+            &header,
+            u64::MAX,
+            &mut dz,
+            &mut cs,
+            &mut ds,
+            &mut e_sd,
+            &mut e_so,
+            &mut e_cd,
+            &mut e_co,
+        )
+        .unwrap();
+
+        src.set_position(payload_start);
+        let tp =
+            decode_block_payload_two_phase(&mut src, &header, u64::MAX, &mut dz, &mut cs, &mut ds)
+                .unwrap();
+
+        // Light columns identical to eager.
+        assert_eq!(tp.delta_pos, eager.delta_pos);
+        assert_eq!(tp.n_alleles, eager.n_alleles);
+        assert_eq!(tp.allele_obs_count, eager.allele_obs_count);
+        assert_eq!(tp.n_total_alleles, header.n_total_alleles);
+        // The 8 deferred columns (seq, six stats, chain-ids) were retained.
+        assert_eq!(tp.retained.len(), 8);
+
+        // Each retained blob inflates to the eager heavy column.
+        let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for rc in &tp.retained {
+            let col = inflate_retained_column(
+                &rc.blob,
+                &rc.entry,
+                n_rec,
+                n_tot,
+                Some(&tp.allele_seq_len),
+                &mut dz,
+                &mut cs,
+                &mut ds,
+                &mut sd,
+                &mut so,
+                &mut cd,
+                &mut co,
+            )
+            .unwrap();
+            match col {
+                Some(DecodedColumn::AlleleQSumLog(v)) => assert_eq!(v, eager.allele_q_sum_log),
+                Some(DecodedColumn::AlleleFwdCount(v)) => assert_eq!(v, eager.allele_fwd_count),
+                Some(DecodedColumn::AllelePlacedLeftCount(v)) => {
+                    assert_eq!(v, eager.allele_placed_left_count)
+                }
+                Some(DecodedColumn::AllelePlacedStartCount(v)) => {
+                    assert_eq!(v, eager.allele_placed_start_count)
+                }
+                Some(DecodedColumn::AlleleMapqSum(v)) => assert_eq!(v, eager.allele_mapq_sum),
+                Some(DecodedColumn::AlleleMapqSumSq(v)) => assert_eq!(v, eager.allele_mapq_sum_sq),
+                Some(DecodedColumn::AlleleSeq) | Some(DecodedColumn::AlleleChainIds) => {}
+                other => panic!("unexpected retained column {other:?}"),
+            }
+        }
+        assert_eq!((sd, so), (e_sd, e_so), "allele-seq CSR");
+        assert_eq!((cd, co), (e_cd, e_co), "chain-ids CSR");
+    }
+
+    /// Step 3 bridge: `BlockColumnReader::decode_current_two_phase` (the real
+    /// reader path — seek + header read + two-phase payload) yields light
+    /// columns + retained blobs identical to the eager `load_current` columns.
+    #[test]
+    fn block_reader_two_phase_matches_eager() {
+        let records = vec![
+            multi_allele_record(10, &[(b"A", &[]), (b"ACGT", &[7, 9])]),
+            multi_allele_record(25, &[(b"T", &[3]), (b"TT", &[])]),
+        ];
+        let bytes = {
+            let mut w = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+            for r in &records {
+                w.write_record(r).unwrap();
+            }
+            w.finish().unwrap().into_inner()
+        };
+
+        // Eager reference via load_current + columns.
+        let mut br_e = PspReader::new(Cursor::new(bytes.clone()))
+            .unwrap()
+            .into_column_blocks();
+        assert!(br_e.load_current().unwrap());
+        let cols = br_e.columns().unwrap();
+        let n_rec = cols.n_records as usize;
+        let n_tot: usize = cols.n_alleles.iter().map(|&n| n as usize).sum();
+        let e_delta = cols.delta_pos.to_vec();
+        let e_obs = cols.allele_obs_count.to_vec();
+        let e_qsum = cols.allele_q_sum_log.to_vec();
+        let e_seq = (
+            cols.allele_seq_data.to_vec(),
+            cols.allele_seq_offsets.to_vec(),
+        );
+        let e_chain = (
+            cols.allele_chain_ids_data.to_vec(),
+            cols.allele_chain_ids_offsets.to_vec(),
+        );
+        drop(cols);
+
+        // Two-phase via the bridge method.
+        let mut br = PspReader::new(Cursor::new(bytes))
+            .unwrap()
+            .into_column_blocks();
+        let tp = br.decode_current_two_phase().unwrap().unwrap();
+        assert_eq!(tp.delta_pos, e_delta);
+        assert_eq!(tp.allele_obs_count, e_obs);
+        assert_eq!(tp.retained.len(), 8);
+
+        let mut dz = new_column_decompressor().unwrap();
+        let (mut cs, mut ds) = (Vec::new(), Vec::new());
+        let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut qsum = None;
+        for rc in &tp.retained {
+            let col = inflate_retained_column(
+                &rc.blob,
+                &rc.entry,
+                n_rec,
+                n_tot,
+                Some(&tp.allele_seq_len),
+                &mut dz,
+                &mut cs,
+                &mut ds,
+                &mut sd,
+                &mut so,
+                &mut cd,
+                &mut co,
+            )
+            .unwrap();
+            if let Some(DecodedColumn::AlleleQSumLog(v)) = col {
+                qsum = Some(v);
+            }
+        }
+        assert_eq!(qsum.unwrap(), e_qsum);
+        assert_eq!((sd, so), e_seq, "allele-seq CSR");
+        assert_eq!((cd, co), e_chain, "chain-ids CSR");
     }
 
     /// (R1) Zero-record file round-trips through `PspReader::new`
