@@ -329,6 +329,24 @@ pub fn drop_dust_masked(positions: &[u32], is_kept: &mut [bool], mask: &[Range<u
     }
 }
 
+/// Membership mask `out[i] = needles[i] ∈ haystack`, for two ascending,
+/// duplicate-free `u32` position slices, via one two-pointer merge-walk —
+/// O(|needles| + |haystack|) instead of one binary search per needle (L7).
+/// Both inputs are position-sorted by the `SamplePspChunk` / fold invariants;
+/// byte-identical to the per-row `haystack.binary_search(&p).is_ok()` it
+/// replaces.
+fn membership_mask(needles: &[u32], haystack: &[u32]) -> Vec<bool> {
+    let mut out = Vec::with_capacity(needles.len());
+    let mut j = 0usize;
+    for &p in needles {
+        while j < haystack.len() && haystack[j] < p {
+            j += 1;
+        }
+        out.push(j < haystack.len() && haystack[j] == p);
+    }
+    out
+}
+
 // ===========================================================================
 // 2b — the streaming integrator (single covered interval)
 // ===========================================================================
@@ -513,11 +531,7 @@ impl BufferedSegment {
         if !finalisable {
             return Ok(());
         }
-        let keep: Vec<bool> = self
-            .positions()
-            .iter()
-            .map(|&p| kept_all.binary_search(&p).is_ok())
-            .collect();
+        let keep = membership_mask(self.positions(), kept_all);
         // Take ownership of the Pending segment to consume it (free its blobs).
         let placeholder = BufferedSegment::Ready(Box::new(ReadySegment {
             positions: Vec::new(),
@@ -968,15 +982,14 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                         // Not finalisable (last_pos > watermark): partial-inflate
                         // just this chunk's variable rows; leave it Pending.
                         BufferedSegment::Pending(tp) => {
-                            let keep: Vec<bool> = tp
-                                .positions()
-                                .iter()
-                                .map(|&p| {
-                                    p >= chunk_start
-                                        && p < cut
-                                        && kept_all.binary_search(&p).is_ok()
-                                })
-                                .collect();
+                            // Membership in `kept_all` via merge-walk (both
+                            // ascending), then restrict to this chunk's
+                            // [chunk_start, cut) (L7).
+                            let positions = tp.positions();
+                            let mut keep = membership_mask(positions, kept_all);
+                            for (k, &p) in keep.iter_mut().zip(positions.iter()) {
+                                *k &= p >= chunk_start && p < cut;
+                            }
                             let chunk = tp.set_variable_rows(&keep, dz, &mut cs, &mut ds)?;
                             compacted.append_range(&chunk, chunk_start, cut);
                         }
@@ -1017,6 +1030,33 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn membership_mask_matches_binary_search() {
+        // Byte-identity oracle: the merge-walk must equal the per-row
+        // `haystack.binary_search(&p).is_ok()` it replaces (L7), across
+        // disjoint, overlapping, prefix/suffix, empty, and singleton cases.
+        let cases: &[(&[u32], &[u32])] = &[
+            (&[], &[1, 2, 3]),
+            (&[1, 2, 3], &[]),
+            (&[1, 2, 3, 4, 5], &[2, 4]),
+            (&[2, 4], &[1, 2, 3, 4, 5]),
+            (&[1, 5, 9], &[1, 5, 9]),
+            (&[1, 5, 9], &[2, 6, 10]),
+            (&[10, 20, 30], &[5, 15, 30, 40]),
+            (&[5], &[5]),
+            (&[5], &[6]),
+            (&[0, u32::MAX], &[0, 7, u32::MAX]),
+        ];
+        for (needles, haystack) in cases {
+            let got = membership_mask(needles, haystack);
+            let want: Vec<bool> = needles
+                .iter()
+                .map(|&p| haystack.binary_search(&p).is_ok())
+                .collect();
+            assert_eq!(got, want, "needles={needles:?} haystack={haystack:?}");
+        }
+    }
 
     /// Fold a set of per-sample light columns `(positions, ref_spans,
     /// nonref_obs)` into a fresh [`CohortSpanFold`].
