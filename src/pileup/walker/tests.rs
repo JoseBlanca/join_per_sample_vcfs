@@ -317,15 +317,17 @@ fn refold_after_widen_clears_chain_id_from_old_bucket() {
     // `widen()` from "ACG" to "ACGT").
     //
     // Walker invariant under test: after R1 re-folds out of
-    // the REF bucket into "ACGC", the REF bucket must not
-    // retain R1's chain id. With the open-record bug,
-    // `subtract_contribution` zeroes the scalars but never
-    // removes the read's chain id from the old
-    // `OpenAllele.chain_ids` vector — so REF ends up with
-    // num_obs = 0 and chain_ids = [1] (R1's stale id).
-    // Downstream, the merger sees a chain-anchored
-    // constituent with no observations and (rightly) refuses
-    // to compute a quality from it.
+    // the REF bucket into "ACGC", no bucket may retain a chain
+    // id without a backing observation. Chain ids are derived
+    // from `folded_reads` at finalise (each read appears once,
+    // under its current bucket), so a re-fold can never leave a
+    // stale id behind. REF (`alleles[0]`) chain ids are dropped
+    // unconditionally, so the meaningful check here is on the
+    // ALT "ACGC" bucket R1 moved into: it must carry exactly
+    // R1's one chain id (`len <= num_obs`, asserted below over
+    // every allele). A stale, observation-less id would break
+    // that bound and, downstream, hand the merger a
+    // chain-anchored constituent with no observations.
     let fa = MockFasta::new("ACGTAC");
     let r0 = PreparedRead {
         chrom_id: 0,
@@ -477,11 +479,20 @@ fn paired_mates_with_overlapping_positions_share_chain_id() {
     // Both mates start at the same position; the second admits
     // while the first is still in the active set. They collapse
     // onto the same chain id via the `pending_mates` hash lookup.
+    //
+    // The reads carry a non-reference base (`C` over a `A` reference)
+    // so the shared chain id is observable on the ALT allele
+    // (`alleles[1]`): the walker drops REF (`alleles[0]`) chain ids.
     let fa = MockFasta::new("AAAAA");
-    let (m1, m2) = paired_snp_reads("pair", 1, 1, b"AAA", &[30; 3]);
+    let (m1, m2) = paired_snp_reads("pair", 1, 1, b"CCC", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
-    assert_eq!(rec1.alleles[0].chain_ids, vec![0u64]);
+    assert!(
+        rec1.alleles[0].chain_ids.is_empty(),
+        "REF chain ids are dropped"
+    );
+    assert_eq!(rec1.alleles[1].seq, b"C");
+    assert_eq!(rec1.alleles[1].chain_ids, vec![0u64]);
 }
 
 #[test]
@@ -497,14 +508,16 @@ fn paired_mates_within_lookup_window_share_chain_id_across_active_set_exit() {
     // at walker_pos=4 must *not* drop the pending entry; the
     // 10 → 1 = 9 bp separation is well inside the default
     // `mate_lookup_window` of 10 000 bp.
+    // Non-reference reads (`C` over `A`) so the shared chain id shows on
+    // the ALT allele; the walker drops REF (`alleles[0]`) chain ids.
     let fa = MockFasta::new("AAAAAAAAAAAAAAAAAAAA");
-    let (m1, m2) = paired_snp_reads("pair", 1, 10, b"AAA", &[30; 3]);
+    let (m1, m2) = paired_snp_reads("pair", 1, 10, b"CCC", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec1 = records.iter().find(|r| r.pos == 1).unwrap();
     let rec10 = records.iter().find(|r| r.pos == 10).unwrap();
-    assert_eq!(rec1.alleles[0].chain_ids, vec![0u64]);
+    assert_eq!(rec1.alleles[1].chain_ids, vec![0u64]);
     assert_eq!(
-        rec10.alleles[0].chain_ids,
+        rec10.alleles[1].chain_ids,
         vec![0u64],
         "the two mates of a single pair must share one chain id"
     );
@@ -525,14 +538,16 @@ fn paired_mates_separated_beyond_lookup_window_get_distinct_chain_ids() {
     // `mate_lookup_window = 10_000`, m2 is past the eviction
     // threshold (1 + 10_000 + 1 = 10 002 first hits it).
     let n = 12_010_usize;
+    // Non-reference reads (`C` over `A`) so the chain ids show on the ALT
+    // allele; the walker drops REF (`alleles[0]`) chain ids.
     let fa = MockFasta::new(&"A".repeat(n));
-    let (m1, m2) = paired_snp_reads("pair", 1, 12_001, b"AAA", &[30; 3]);
+    let (m1, m2) = paired_snp_reads("pair", 1, 12_001, b"CCC", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let rec_a = records.iter().find(|r| r.pos == 1).unwrap();
     let rec_b = records.iter().find(|r| r.pos == 12_001).unwrap();
-    assert_eq!(rec_a.alleles[0].chain_ids, vec![0u64]);
+    assert_eq!(rec_a.alleles[1].chain_ids, vec![0u64]);
     assert_eq!(
-        rec_b.alleles[0].chain_ids,
+        rec_b.alleles[1].chain_ids,
         vec![1u64],
         "beyond the lookup window the pair-tracking entry has been evicted; \
          the second mate gets a fresh id"
@@ -930,11 +945,13 @@ fn chain_ids_are_unique_and_monotonically_allocated() {
     // Three solo reads admit cleanly; every chain id observed across
     // emitted records must be unique (no recycling) and the ids
     // appear in non-decreasing order of first reference position.
-    let fa = MockFasta::new("ACGTACGTAC");
+    // Reads carry a non-reference base (`C` over an `A` reference) so
+    // the ids land on ALT alleles — the walker drops REF chain ids.
+    let fa = MockFasta::new("AAAAAAAAAA");
     let reads = vec![
-        snp_read("a", 1, b"AC", &[30; 2]),
-        snp_read("b", 4, b"AC", &[30; 2]),
-        snp_read("c", 7, b"AC", &[30; 2]),
+        snp_read("a", 1, b"CC", &[30; 2]),
+        snp_read("b", 4, b"CC", &[30; 2]),
+        snp_read("c", 7, b"CC", &[30; 2]),
     ];
     let records = drive_walker(reads, fa);
 
@@ -959,8 +976,10 @@ fn chain_ids_are_unique_and_monotonically_allocated() {
 #[test]
 fn paired_mates_share_a_single_chain_id() {
     // First and second mates of a pair must collapse to one chain id.
-    let fa = MockFasta::new("ACG");
-    let (m1, m2) = paired_snp_reads("p", 1, 1, b"ACG", &[30; 3]);
+    // Non-reference reads (`C` over `A`) so the id lands on the ALT
+    // allele — the walker drops REF chain ids.
+    let fa = MockFasta::new("AAA");
+    let (m1, m2) = paired_snp_reads("p", 1, 1, b"CCC", &[30; 3]);
     let records = drive_walker(vec![m1, m2], fa);
     let mut all_ids: Vec<u64> = records
         .iter()
@@ -980,10 +999,12 @@ fn chain_ids_persist_across_chromosome_boundaries() {
     // Chain ids are per-`.psp`-file unique, not per-chromosome. The
     // walker's chain-id allocator must NOT reset `next_id` on
     // chromosome change.
-    let fa = MockFasta::with_chromosomes(&["AC", "AC"]);
-    let mut r0 = snp_read("a", 1, b"AC", &[30; 2]);
+    // Non-reference reads (`C` over `A`) so the ids land on ALT alleles —
+    // the walker drops REF chain ids.
+    let fa = MockFasta::with_chromosomes(&["AA", "AA"]);
+    let mut r0 = snp_read("a", 1, b"CC", &[30; 2]);
     r0.chrom_id = 0;
-    let mut r1 = snp_read("b", 1, b"AC", &[30; 2]);
+    let mut r1 = snp_read("b", 1, b"CC", &[30; 2]);
     r1.chrom_id = 1;
     let records = drive_walker(vec![r0, r1], fa);
     let mut all_ids: Vec<u64> = records

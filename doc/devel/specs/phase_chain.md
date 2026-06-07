@@ -722,6 +722,26 @@ actual question — *"in this sample, do the alleles at p₁ and p₂
 co-occur on the same physical molecule?"* — the narrow rule above
 is the entire scope.
 
+### REF chain ids are never stored
+
+A direct consequence of the scope above: the compound-haplotype
+check only ever intersects the chain ids of **non-reference**
+allele observations (a compound is, by construction, a combination
+of ≥2 non-REF alleles — the merger's proposal builder skips
+allele 0). The REF allele's chain ids are therefore never read by
+anything. So the walker **does not emit them**: every record's
+`alleles[0].chain_ids` is empty in the `.psp`. On real cohorts REF
+chain ids would be ~96.6% of all chain ids, so dropping them is the
+single biggest reduction in the chain-id payload — on disk, through
+the decoder, and in the joint stage's working set — for zero effect
+on calls. (A read that supports REF at a position still contributes
+its *counts* to `alleles[0].support`; only the per-read identity
+list is dropped, and that list is exactly the thing no consumer
+reads for REF.) The walker enforces this in
+`OpenPileupRecord::finalise`; the var-calling reader additionally
+hands the merger an empty REF list defensively, so even a legacy
+`.psp` that still stored REF chain ids behaves identically.
+
 ### How Stage 5 walks the records
 
 Sequentially. Under the unique-`u64`-id design there is no active

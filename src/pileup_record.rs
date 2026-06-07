@@ -120,6 +120,14 @@ impl AlleleSupportStats {
 ///   chain id is backed by at least one observation; paired mates
 ///   may share a chain id, so the inequality can be strict).
 /// - `num_obs == 0 ⇒ chain_ids.is_empty()`.
+/// - **The REF bucket (`alleles[0]`) always has `chain_ids.is_empty()`,
+///   even when `num_obs > 0`.** The walker deliberately drops REF chain
+///   ids at finalise: the only consumer of `chain_ids` is the per-group
+///   merger's compound-haplotype check, which links non-reference
+///   alleles only and skips allele 0, so REF chain ids are never read.
+///   Storing them would be dead weight (~96.6% of all chain ids on real
+///   cohorts). See `pileup::walker::open_record::OpenPileupRecord::finalise`
+///   and doc/devel/specs/phase_chain.md §8.
 ///
 /// Downstream callers that match constituents by chain-id
 /// intersection (e.g. the per-group merger building chain-anchored

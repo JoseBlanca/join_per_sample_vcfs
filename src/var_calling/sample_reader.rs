@@ -244,6 +244,24 @@ pub struct SamplePspChunk {
     chain_ids: PerAlleleChainIds,
 }
 
+/// Chain ids to attach to allele index `a` of a record whose allele range
+/// is `lo..hi`. The REF allele is always the record's first allele
+/// (`a == lo`), and its chain ids are never read downstream — Stage 5's
+/// compound-haplotype check (`per_group_merger::build_chain_proposals`)
+/// links non-reference alleles only and skips allele 0. So REF gets an
+/// empty `Vec` instead of a clone of the column. New `.psp` files no
+/// longer store REF chain ids at all (the walker drops them); this guard
+/// also covers any legacy `.psp` that still carries them, so they never
+/// reach the merger regardless of file age. See phase_chain.md §8.
+#[inline]
+fn chain_ids_for_allele(chain_ids: &PerAlleleChainIds, a: usize, lo: usize) -> Vec<ChainId> {
+    if a == lo {
+        Vec::new()
+    } else {
+        chain_ids.slice_at(a).to_vec()
+    }
+}
+
 impl SamplePspChunk {
     /// Decode one block's region-clamped records into an owned chunk.
     ///
@@ -479,7 +497,7 @@ impl SamplePspChunk {
                 alleles.push(AlleleObservation::new(
                     self.seq.slice_at(a).to_vec(),
                     self.fixed.support_at(a),
-                    self.chain_ids.slice_at(a).to_vec(),
+                    chain_ids_for_allele(&self.chain_ids, a, lo),
                 ));
             }
             out.push(PileupRecord::new(self.chrom_id, self.positions[r], alleles));
@@ -507,7 +525,7 @@ impl SamplePspChunk {
                 alleles.push(AlleleObservation::new(
                     self.seq.slice_at(a).to_vec(),
                     self.fixed.support_at(a),
-                    self.chain_ids.slice_at(a).to_vec(),
+                    chain_ids_for_allele(&self.chain_ids, a, lo),
                 ));
             }
             out.push(PileupRecord::new(self.chrom_id, self.positions[r], alleles));
