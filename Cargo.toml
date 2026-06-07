@@ -136,3 +136,7 @@ harness = false
 name = "psp_reader_perf"
 harness = false
 
+[[bench]]
+name = "cohort_var_calling_perf"
+harness = false
+
