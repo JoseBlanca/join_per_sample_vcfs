@@ -19,7 +19,35 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-06):** **Performance review of the
+> - **Last completed task (2026-06-07):** **Worked through the perf-review
+>   findings on `re-architect`, then merged the branch into `main`.** Built the
+>   missing committed cohort end-to-end bench
+>   ([benches/cohort_var_calling_perf.rs](benches/cohort_var_calling_perf.rs),
+>   `237ac38`) + fixed the profiling-driver fidelity, then addressed the review's
+>   tiers: **H2** chain-id dead-weight dropped end-to-end (`31f8a5b`); **H3**
+>   `ln_factorial` inlined (`5e393b8`, codegen-verified byte-identical); **L1**
+>   the producer fold (`rebuild_fold`) parallelized via `CohortSpanFold::merge`
+>   (`158dd02`, byte-identical integer-max reduction). **H1** (cap the producer
+>   rayon pool) shows no gain on real data — the producer is parked-not-
+>   contending — so the sizing mechanism was kept behind
+>   `PVC_PRODUCER_THREADS`/`PVC_CALLER_THREADS` but the default is unchanged.
+>   **L2** (scalar posterior backend) closed: faster per-record on aarch64 but no
+>   end-to-end gain and it flips GQ/AF (not byte-identical). **L3** resolved by
+>   H2; **L5** cold (grouper scan not a leaf); **L7** keep-mask merge-walk
+>   (`47eaffa`, byte-identical). **Measurement lesson:** L1's first "3×" was an
+>   18-IDENTICAL-replica fixture artifact — on a real 50-distinct-sample cohort
+>   the fold gain is ~3%; always validate perf on distinct samples.
+>   **Head-to-head N=50/T6 (50 real tomato samples) vs `main`:** calls match
+>   (GT/GQ/AD/AF/AC/FILTER byte-identical; the only diff is one borderline-QUAL
+>   singleton, QUAL exempt); wall **~14 % slower** (9.99 s vs 8.76 s) for **~15 %
+>   less peak RSS** (2.68 vs 3.15 GB). **PM accepted the wall-for-memory trade
+>   for the clearer architecture (to be improved later) and merged
+>   `re-architect` → `main`.** All gates green on the production-target container
+>   (fmt, clippy `-D warnings`, `cargo doc` deny-broken-links — M1 fixed
+>   `076c422`, 1007 lib + 49 integration tests). **Caveat:** the 2026-06-05
+>   review's M2–M8 (robustness/quality, not gate-caught) were not re-verified
+>   this session — deferred follow-ups.
+> - **Previous task (2026-06-06):** **Performance review of the
 >   re-architected cohort `var-calling` pipeline** (`.psp` → multi-sample VCF,
 >   branch `re-architect` @ `37e02c2`; orchestrator skill, 6 categories) —
 >   [perf_var_calling_cohort_2026-06-06.md](doc/devel/reports/reviews/perf_var_calling_cohort_2026-06-06.md).
