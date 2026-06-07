@@ -2148,11 +2148,30 @@ static LN_FACTORIAL_TABLE: std::sync::LazyLock<Vec<f64>> = std::sync::LazyLock::
 /// `ln(n!)` — O(1) for `n < LN_FACTORIAL_TABLE_SIZE` via lookup,
 /// O(n − table_size) for larger `n` via continued iterative summation
 /// from the last tabled value.
+///
+/// `#[inline]` (H3): the hot path is a single bounds-checked table load,
+/// called `n_samples × n_genotypes × (kept_alleles + 1)` times per record in
+/// [`compute_log_likelihoods`]. Inlining lets LLVM fold the load into the
+/// caller and keep the accumulator in registers instead of a `bl` per call.
+/// The rare `n ≥ table_size` summation is split into the `#[cold]`
+/// `#[inline(never)]` [`ln_factorial_large`] so it never bloats the inlined
+/// fast path. Pure codegen — byte-identical (same arithmetic).
+#[inline]
 pub(crate) fn ln_factorial(n: u64) -> f64 {
     let n_usize = n as usize;
     if n_usize < LN_FACTORIAL_TABLE_SIZE {
         return LN_FACTORIAL_TABLE[n_usize];
     }
+    ln_factorial_large(n_usize)
+}
+
+/// Iterative `ln(n!)` for `n ≥ LN_FACTORIAL_TABLE_SIZE`, continuing from the
+/// last tabled value. Cold by construction (WGS per-allele depths are
+/// O(10)–O(100), well inside the table); kept out-of-line so the iterative
+/// loop never bloats [`ln_factorial`]'s inlined fast path.
+#[cold]
+#[inline(never)]
+fn ln_factorial_large(n_usize: usize) -> f64 {
     let mut acc = LN_FACTORIAL_TABLE[LN_FACTORIAL_TABLE_SIZE - 1];
     for i in LN_FACTORIAL_TABLE_SIZE..=n_usize {
         acc += (i as f64).ln();
