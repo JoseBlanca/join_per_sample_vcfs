@@ -18,7 +18,10 @@ gatk-protected/
 /CLAUDE.md
 /.claude/
 benchmarks/tomato1/crams/
-benchmarks/tomato1/results/
+benchmarks/tomato1/results/**
+# ...but keep the small perf result TSVs (reference snapshots the dashboard reads).
+!benchmarks/tomato1/results/perf/
+!benchmarks/tomato1/results/perf/*.tsv
 benchmarks/human_genome_bottle/crams/
 benchmarks/human_genome_bottle/results/
 benchmarks/human_genome_bottle/results_nobaq/
