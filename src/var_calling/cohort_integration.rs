@@ -562,7 +562,8 @@ impl BufferedSegment {
 /// Owns the N [`SamplePspReader`]s. [`begin_interval`](Self::begin_interval)
 /// points them at a `[start, end)` interval (+ its dust mask);
 /// [`produce_chunk`](Self::produce_chunk) then yields one
-/// [`PileupCohortChunk`] of variable [`CohortPileupRecord`]s at a time, cut at
+/// [`RawCohortChunk`] (the chunk's variable rows in columnar per-sample form,
+/// rebuilt into [`CohortPileupRecord`]s on the caller) at a time, cut at
 /// safe gaps, until the interval is drained (`Ok(None)`). The chromosome /
 /// interval iteration, per-chromosome REF fetcher, and dust computation are
 /// the wiring layer (Phase 2b-wiring); `produce_chunk` takes the REF fetch as
@@ -644,7 +645,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     }
 
     /// Drive the whole cohort: walk `0..n_chromosomes`, and within each its
-    /// covered intervals, emitting every [`PileupCohortChunk`] (in genomic
+    /// covered intervals, emitting every [`RawCohortChunk`] (in genomic
     /// order, `chunk_order` monotonic across the whole run). The REF bytes and
     /// dust mask are **injected** — the chromosome→FASTA fetcher and the sdust
     /// computation are the caller's (built FASTA-backed at the pipeline wiring;

@@ -62,7 +62,7 @@ pub enum CallerError {
 }
 
 /// Section 2 — the cohort variant caller (appendix §D). One per worker thread;
-/// turns a single [`PileupCohortChunk`] into a [`CalledChunk`] of [`Variant`]s.
+/// turns a single [`RawCohortChunk`] into a [`CalledChunk`] of [`Variant`]s.
 ///
 /// Composes the two record-based steps back-to-back, group by group:
 /// 1. **group** the chunk's records into overlapping variant groups
@@ -122,8 +122,8 @@ impl VariantCaller {
     }
 
     /// Group + per-group merge + EM over already-merged cohort `records`. Split
-    /// from [`call_chunk`] so this byte-identity-critical path can be tested
-    /// directly against the fetcher row pipeline (the `call_chunk` front-end
+    /// from [`call_chunk`](Self::call_chunk) so this byte-identity-critical path
+    /// can be tested directly against the fetcher row pipeline (the `call_chunk` front-end
     /// only adds the columns→records reconstruction).
     pub fn call_records(
         &self,

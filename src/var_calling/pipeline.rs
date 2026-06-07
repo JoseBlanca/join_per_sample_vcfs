@@ -6,7 +6,7 @@
 //! **Parallel topology.** A bounded-`crossbeam-channel` pipeline inside a
 //! [`std::thread::scope`]: the producer ([`CohortChunkIntegrator`]) runs on
 //! the main thread (its per-sample readers + REF/dust fetchers are
-//! thread-local) and ships [`PileupCohortChunk`]s; `W` caller threads
+//! thread-local) and ships [`RawCohortChunk`]s; `W` caller threads
 //! ([`VariantCaller`]) pop chunks, call them, and push [`CalledChunk`]s; one
 //! writer thread ([`VcfWriter`]) drains them, reordering by `chunk_order` via a
 //! `BTreeMap` so the emitted VCF is in genomic order regardless of how the
