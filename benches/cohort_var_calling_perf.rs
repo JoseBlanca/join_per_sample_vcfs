@@ -20,31 +20,26 @@
 //! so a fixture or chunking regression trips the bench instead of silently
 //! changing the workload.
 //!
-//! ## Why the pipeline entry point + a per-combo `install`d pool
+//! ## Why the pipeline entry point (not the CLI `run_var_calling`)
 //!
 //! The CLI-level entry calls `configure_rayon_pool`, which is **once per
-//! process** — a criterion run that sweeps the thread count in one process
-//! could only set rayon's global pool once, and the producer's `par_iter_mut`
-//! decode/compaction would then run on a fixed all-cores pool regardless of
-//! `t` (measuring only caller scaling, the *opposite* of the production gap).
+//! process** — a criterion run can't re-size the global pool per iteration.
+//! The **pipeline** entry instead sizes its own producer (rayon) pool from
+//! `--threads` via `resolve_thread_split` and `install`s the producer loop on
+//! it (H1), independently of the global pool — so the `t` axis here drives the
+//! exact same producer + caller sizing the CLI gets. Each timed run therefore
+//! has `t` (or the env-overridden split) rayon producer workers **plus** the
+//! caller threads live concurrently — the oversubscription **H1** targets.
 //!
-//! Instead we drive the **pipeline** entry inside a per-combo
-//! `rayon::ThreadPool` of `t` threads via [`rayon::ThreadPool::install`]: the
-//! producer runs on the calling (main) thread inside that scope, so its
-//! `par_iter_mut` uses the `t`-sized pool — exactly what production's
-//! `configure_rayon_pool(t)` does to the global pool. The `t` crossbeam
-//! **caller** threads are spawned separately, so each timed run has `t` rayon
-//! producer workers **plus** `t` callers live concurrently — the `~2·t`
-//! oversubscription on the box's cores that **H1** is about. The pool is built
-//! once per combo (outside `b.iter`) so thread spawn cost is not timed.
+//! ## Sweeping the split
 //!
-//! This composes with the upcoming Variant-1 fix: once the production code
-//! caps the producer's pool via its *own* inner `install`, that inner pool
-//! wins over this outer one, so the same bench then measures the fix (callers
-//! still `t`, producer capped) — the high-`t` wall should fall back toward the
-//! single-pool curve. The authoritative cross-process "vs `main`" sweep on
-//! real data (`examples/profile_cohort_e2e` + hyperfine, perf review §3.3)
-//! stays the headline experiment; this is the committed in-process guard.
+//! The committed bench measures the **default** split (`resolve_thread_split`,
+//! currently producer = callers = `t`). To sweep candidate splits set
+//! `PVC_PRODUCER_THREADS` / `PVC_CALLER_THREADS` (process-global, so one value
+//! per `cargo bench` invocation) — but the authoritative split sweep is the
+//! cross-process run on real data (`examples/profile_cohort_e2e` + those env
+//! vars + hyperfine, perf review §3.3). This bench is the in-process guard
+//! that the chosen default does not regress.
 //!
 //! Run (container, production arch):
 //! ```text
@@ -331,20 +326,13 @@ fn bench_cohort(c: &mut Criterion) {
         );
 
         for &t in THREAD_COUNTS {
-            // Per-combo producer pool of `t` threads (built once, outside the
-            // timed region). `install` makes the producer's `par_iter_mut` use
-            // it — reproducing production's `configure_rayon_pool(t)` so the
-            // `t` axis drives both the producer pool *and* the `t` callers.
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(t)
-                .build()
-                .expect("build producer pool");
+            // `run_var_calling` sizes its own producer pool (resolve_thread_split)
+            // and caller pool from `args.threads` and `install`s the producer on
+            // the former — so calling it directly exercises the production sizing.
             group.bench_function(format!("N{n}/T{t}"), |b| {
                 b.iter(|| {
                     let args = make_args(&fx, t);
-                    let stats = pool
-                        .install(|| run_var_calling(black_box(&args), None))
-                        .expect("pipeline run");
+                    let stats = run_var_calling(black_box(&args), None).expect("pipeline run");
                     assert_eq!(
                         stats.records_written, expected,
                         "records_written drifted — fixture/chunking regression"

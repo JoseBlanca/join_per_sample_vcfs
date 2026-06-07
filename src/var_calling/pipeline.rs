@@ -58,6 +58,29 @@ const QUEUE_DEPTH_PER_WORKER: usize = 2;
 /// any sub-span (runs are coalesced across boundaries); this just caps RAM.
 const DUST_SUBSPAN: u32 = 1_000_000;
 
+/// Resolve `(producer_threads, caller_threads)` from the requested thread
+/// budget `t`. The producer's rayon decode/compaction pool and the crossbeam
+/// caller pool are *independent*; left both at `t` they oversubscribe a
+/// `t`-core box ~2× (perf finding **H1**). This is the single point that sizes
+/// them, so the producer pool can be capped below the caller count.
+///
+/// Default: both `t` — byte-identical and perf-neutral vs the pre-H1 behaviour
+/// (the producer's `par_iter_mut` ran on the global pool sized to `t`). The
+/// `PVC_PRODUCER_THREADS` / `PVC_CALLER_THREADS` environment variables override
+/// each, used for the H1 split sweep (perf review §3.3); once the winning split
+/// is chosen it replaces this default. Each value is floored at 1.
+fn resolve_thread_split(t: usize) -> (usize, usize) {
+    let from_env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    };
+    let producer = from_env("PVC_PRODUCER_THREADS").unwrap_or(t).max(1);
+    let callers = from_env("PVC_CALLER_THREADS").unwrap_or(t).max(1);
+    (producer, callers)
+}
+
 /// Errors surfaced by the re-architected pipeline entry point.
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -209,7 +232,7 @@ pub fn run_var_calling(
     // stateless `call_chunk`), and the writer owns the (`Send`) `CohortVcfWriter`
     // and reorders the out-of-order `CalledChunk`s by `chunk_order`, so the
     // emitted VCF is byte-identical regardless of worker count.
-    let n_workers = args
+    let requested_threads = args
         .threads
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -217,12 +240,22 @@ pub fn run_var_calling(
                 .unwrap_or(1)
         })
         .max(1);
+    // H1: size the producer (rayon) and caller (crossbeam) pools from one
+    // budget so they don't each claim `T` cores and oversubscribe ~2×. The
+    // producer's `par_iter_mut` runs inside `producer_pool.install(...)` below,
+    // so it uses this pool — not the global one — and the bench (which drives
+    // this entry directly) measures the same sizing the CLI gets.
+    let (producer_threads, n_workers) = resolve_thread_split(requested_threads);
+    let producer_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(producer_threads)
+        .build()
+        .map_err(|e| PipelineError::Config(format!("building producer rayon pool: {e}")))?;
     let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
     // Surface the resolved concurrency / chunk-sizing defaults so an operator
     // can recover what a running instance actually chose (the values default
     // implicitly from `--threads` / the `--target-variants-per-chunk` sentinel).
     eprintln!(
-        "var-calling: workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants}"
+        "var-calling: producer_threads={producer_threads} workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants}"
     );
     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<RawCohortChunk>(cap);
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
@@ -258,10 +291,12 @@ pub fn run_var_calling(
         drop(chunk_rx);
         drop(called_tx);
 
-        // Producer on the main thread.
+        // Producer on the main thread. Its `par_iter_mut` decode/compaction
+        // runs on `producer_pool` (H1: sized independently of the callers)
+        // because the whole loop executes inside `producer_pool.install(...)`.
         let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
         let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
-        let produce = (|| -> Result<(), PipelineError> {
+        let produce = producer_pool.install(|| -> Result<(), PipelineError> {
             for chrom_id in 0..n_chromosomes {
                 let mut intervals = producer.covered_intervals(chrom_id, max_group_span);
                 if let Some(rs) = &region_set {
@@ -305,7 +340,7 @@ pub fn run_var_calling(
                 }
             }
             Ok(())
-        })();
+        });
         // Signal the callers there are no more chunks.
         drop(chunk_tx);
 
