@@ -757,24 +757,41 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
 
     /// Rebuild [`self.fold`] over the buffered light columns in
     /// `[next_chunk_start, w]` (all samples' data is complete there).
+    ///
+    /// L1 (perf review): this fold is the producer's serial floor — profiling
+    /// pinned it as the dominant non-decode self-time, re-run every read-ahead
+    /// iteration over the growing window. The aggregation is per-position
+    /// **integer `max`** on ref-span / non-REF obs plus a position union — both
+    /// associative and commutative — so each sample folds independently and the
+    /// partials reduce via [`CohortSpanFold::merge`] in **any order** for a
+    /// **byte-identical** result. Run it across the producer pool (this method
+    /// executes inside `producer_pool.install(...)`).
     fn rebuild_fold(&mut self, w: u32) {
-        let mut fold = std::mem::take(&mut self.fold);
-        fold.clear();
+        use rayon::prelude::*;
         let lo_bound = self.next_chunk_start;
-        for buf in &self.buffers {
-            for chunk in buf {
-                let pos = chunk.positions();
-                let lo = pos.partition_point(|&p| p < lo_bound);
-                let hi = pos.partition_point(|&p| p <= w);
-                if lo < hi {
-                    fold.fold_sample_light(
-                        &pos[lo..hi],
-                        &chunk.ref_spans()[lo..hi],
-                        &chunk.nonref_obs()[lo..hi],
-                    );
+        let fold = self
+            .buffers
+            .par_iter()
+            .map(|buf| {
+                let mut f = CohortSpanFold::new();
+                for chunk in buf {
+                    let pos = chunk.positions();
+                    let lo = pos.partition_point(|&p| p < lo_bound);
+                    let hi = pos.partition_point(|&p| p <= w);
+                    if lo < hi {
+                        f.fold_sample_light(
+                            &pos[lo..hi],
+                            &chunk.ref_spans()[lo..hi],
+                            &chunk.nonref_obs()[lo..hi],
+                        );
+                    }
                 }
-            }
-        }
+                f
+            })
+            .reduce(CohortSpanFold::new, |mut a, b| {
+                a.merge(&b);
+                a
+            });
         self.fold = fold;
     }
 
