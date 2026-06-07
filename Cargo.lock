@@ -1065,6 +1065,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "criterion",
+ "crossbeam-channel",
  "dhat",
  "md-5",
  "mimalloc",

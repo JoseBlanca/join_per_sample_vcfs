@@ -37,7 +37,6 @@ use crate::pop_var_caller::contamination_artefact::{
     BatchEntry, ContaminationArtefact, ContaminationArtefactError, Provenance, ProvenanceInputs,
     SampleEntry,
 };
-use crate::pop_var_caller::contamination_chunked_stream::ChunkedPositionStream;
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::contamination_estimation::{
     ContaminationEstimateSource, ContaminationEstimates, ContaminationEstimationConfig,
@@ -48,8 +47,9 @@ use crate::var_calling::contamination_estimation::{
     DEFAULT_SNP_ALT_PSEUDOCOUNT, DEFAULT_STABILITY_BLOCKS, DEFAULT_STABILITY_TOLERANCE,
     StoppingMode, estimate_contamination,
 };
-use crate::var_calling::driver::DEFAULT_CHUNK_GENOMIC_SPAN;
-use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
+use crate::var_calling::per_position_merger::{
+    PerPositionMerger, PerPositionMergerError, check_chromosome_agreement,
+};
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -80,16 +80,6 @@ pub struct EstimateContaminationArgs {
     /// `all_samples`.
     #[arg(long)]
     pub batch_assignment: Option<PathBuf>,
-
-    /// Soft lower bound on the post-filter variant count per chunk.
-    /// The loader grows each chunk's BP span adaptively until the
-    /// kept-position count crosses this target — decoupling
-    /// per-chunk workload from PSP block size and per-region
-    /// variant density. Pass `0` (the default) to keep the legacy
-    /// BP-only loop. Same semantics as the var-calling subcommand's
-    /// knob.
-    #[arg(long, default_value_t = 0)]
-    pub target_variants_per_chunk: u32,
 
     /// One or more cohort `.psp` files.
     #[arg(required = true)]
@@ -350,7 +340,7 @@ pub enum EstimateContaminationCliError {
 /// 5. Build a [`ContaminationEstimationConfig`] from CLI args and
 ///    validate it.
 /// 6. Combine the readers into a
-///    [`PerPositionMerger`](crate::var_calling::per_position_merger::PerPositionMerger)
+///    [`PerPositionMerger`]
 ///    (k-way merge over the cohort).
 /// 7. Run [`estimate_contamination`].
 /// 8. Convert the engine-side
@@ -451,16 +441,14 @@ pub fn run_estimate_contamination(
     };
     cfg.validate()?;
 
-    // 7. Build the chunk-driven per-position stream from the .psp
-    //    readers. Chromosome agreement + FASTA MD5 cross-check
-    //    happened earlier (step 3); the `chromosomes` table from
-    //    there is reused. The stream takes ownership of the readers.
-    let stream = ChunkedPositionStream::new(
-        readers,
-        chromosomes,
-        DEFAULT_CHUNK_GENOMIC_SPAN,
-        args.target_variants_per_chunk,
-    );
+    // 7. Build the cohort-wide per-position stream directly from the .psp
+    //    readers via the per-position merger over each sample's full-genome
+    //    record iterator. The estimator's own step-1a filter drops the
+    //    positions that are monomorphic in the cohort, so this is byte-identical
+    //    to the former chunk-loader stream (which was a columnar reimplementation
+    //    of exactly this merger). `chromosomes` (step 3) carries the metadata.
+    let iters: Vec<_> = readers.iter_mut().map(|r| r.records()).collect();
+    let stream = PerPositionMerger::new(iters, sample_names.clone(), chromosomes)?;
 
     // 8. Run side-pass.
     let estimates = estimate_contamination(

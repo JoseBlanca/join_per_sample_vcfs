@@ -400,7 +400,7 @@ fn mapq_info_fields_reflect_cohort_pooled_stats() {
 #[test]
 fn mapq_diff_t_filter_decision_matches_thresholds() {
     use pop_var_caller::var_calling::DEFAULT_MIN_MAPQ_DIFF_T;
-    use pop_var_caller::var_calling::driver::record_fails_mapq_diff_t_for_test as record_fails;
+    use pop_var_caller::var_calling::vcf_writer::record_fails_mapq_diff_t_for_test as record_fails;
 
     // Same per-sample shape as the Phase B test: REF=20 reads MAPQ 60,
     // ALT=4 reads MAPQ (0, 20, 30, 30) on sample S1.

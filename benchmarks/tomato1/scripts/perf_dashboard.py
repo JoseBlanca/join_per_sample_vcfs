@@ -148,6 +148,27 @@ def _(csv, perf_dir):
 
 
 @app.cell
+def _(csv, perf_dir):
+    # 2-D memory-scaling TSV for §5/§6 — keyed by BOTH `threads` and
+    # `n_samples`, written by perf_ours_joint_mem_scaling.py. One row per
+    # (threads, n_samples) cell. Loaded separately (own schema). Empty list
+    # if the sweep hasn't been run yet.
+    mem_tsv = perf_dir / "ours_joint_mem_scaling.tsv"
+    mem_rows: list[dict] = []
+    if mem_tsv.exists():
+        with mem_tsv.open() as _fh:
+            for _r in csv.DictReader(_fh, delimiter="\t"):
+                mem_rows.append({
+                    "threads": int(_r["threads"]),
+                    "n_samples": int(_r["n_samples"]),
+                    "wall_seconds": float(_r["wall_seconds"]),
+                    "peak_rss_mb": float(_r["peak_rss_mb"]),
+                    "exit_code": int(_r["exit_code"]),
+                })
+    return (mem_rows,)
+
+
+@app.cell
 def _(mo):
     # Axis-scale toggles for the scaling (line) sections. Log-y is the
     # bigger lever when callers differ by an order of magnitude; log-x
@@ -331,6 +352,97 @@ def _():
 
 
 @app.cell
+def _(plt):
+    # Panel factories for the 2-D memory-scaling sweep (threads x N). Both
+    # take `mem_rows` (one dict per (threads, n_samples) cell) and draw a
+    # runtime | peak-RSS pair, with one coloured line per slice of the OTHER
+    # axis. The point of each is the memory panel on the right; runtime is
+    # carried along for context.
+
+    def _series_colour(i, n):
+        return plt.get_cmap("viridis")(i / max(n - 1, 1))
+
+    def mem_sample_panel(mem_rows, *, yscale_val):
+        """Peak RSS (and wall) vs cohort size N, one line per thread count.
+        Tests the *plateau-with-samples* claim: if the producer bounds the
+        in-flight set by `target_variants_per_chunk`, each thread-line should
+        flatten (sub-linear) as N grows, not climb linearly. Returns the fig,
+        or None if there are no usable rows."""
+        ok = [r for r in mem_rows if r["exit_code"] == 0]
+        if not ok:
+            return None
+        threads = sorted({r["threads"] for r in ok})
+        fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(14, 5))
+        for i, t in enumerate(threads):
+            colour = _series_colour(i, len(threads))
+            pts = sorted((r for r in ok if r["threads"] == t),
+                         key=lambda r: r["n_samples"])
+            xs = [r["n_samples"] for r in pts]
+            ax_t.plot(xs, [r["wall_seconds"] for r in pts], marker="o",
+                      color=colour, label=f"{t}")
+            ax_m.plot(xs, [r["peak_rss_mb"] for r in pts], marker="o",
+                      color=colour, label=f"{t}")
+        for ax, ylabel, panel_title in (
+            (ax_t, "wall-clock seconds", "Runtime"),
+            (ax_m, "peak RSS (MB)",      "Peak memory"),
+        ):
+            ax.set_xlabel("cohort size N (samples)")
+            ax.set_ylabel(ylabel)
+            ax.set_title(panel_title)
+            ax.set_yscale(yscale_val)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, title="--threads")
+        fig.suptitle(
+            "5. Memory scaling vs N (one line per thread count) — "
+            "does peak RSS plateau with samples?",
+            fontsize=13, y=1.02,
+        )
+        fig.tight_layout()
+        return fig
+
+    def mem_thread_panel(mem_rows, *, yscale_val):
+        """Peak RSS (and wall) vs `--threads`, one line per cohort size N.
+        Tests the *linear-with-threads* claim: queue depth ~ 2x threads and
+        one in-flight chunk per caller, so each N-line's memory panel should
+        climb ~linearly with threads. Returns the fig, or None."""
+        ok = [r for r in mem_rows if r["exit_code"] == 0]
+        if not ok:
+            return None
+        sizes = sorted({r["n_samples"] for r in ok})
+        all_threads = sorted({r["threads"] for r in ok})
+        fig, (ax_t, ax_m) = plt.subplots(1, 2, figsize=(14, 5), sharex=True)
+        for i, n in enumerate(sizes):
+            colour = plt.get_cmap("plasma")(i / max(len(sizes) - 1, 1))
+            pts = sorted((r for r in ok if r["n_samples"] == n),
+                         key=lambda r: r["threads"])
+            xs = [r["threads"] for r in pts]
+            ax_t.plot(xs, [r["wall_seconds"] for r in pts], marker="o",
+                      color=colour, label=f"N={n}")
+            ax_m.plot(xs, [r["peak_rss_mb"] for r in pts], marker="o",
+                      color=colour, label=f"N={n}")
+        for ax, ylabel, panel_title in (
+            (ax_t, "wall-clock seconds", "Runtime"),
+            (ax_m, "peak RSS (MB)",      "Peak memory"),
+        ):
+            ax.set_xlabel("threads (--threads)")
+            ax.set_ylabel(ylabel)
+            ax.set_title(panel_title)
+            ax.set_xticks(all_threads)
+            ax.set_yscale(yscale_val)
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=8, title="cohort N")
+        fig.suptitle(
+            "6. Memory scaling vs threads (one line per N) — "
+            "is peak RSS ~linear in thread count?",
+            fontsize=13, y=1.02,
+        )
+        fig.tight_layout()
+        return fig
+
+    return mem_sample_panel, mem_thread_panel
+
+
+@app.cell
 def _(bar_pair, mo, rows_by_caller):
     # Section 1 — build one per-sample intermediate (one sample, 4 threads).
     fig_2, missing_2 = bar_pair(
@@ -474,6 +586,55 @@ def _(mo, thread_pair, thread_rows, yscale):
     sec5_view = mo.vstack([sec5_methods, _body_5])
     sec5_view
     return fig_5, sec5_view
+
+
+@app.cell
+def _(mem_rows, mem_sample_panel, mo, yscale):
+    # Section 5 — peak RSS vs N at several thread counts. Investigates the
+    # "memory plateaus with samples" claim of the streaming architecture.
+    fig_6 = mem_sample_panel(mem_rows, yscale_val=yscale.value)
+    sec6_methods = mo.md("""
+    **Materials & methods.** One `var-calling` process per point, `.psp` →
+    VCF over the first N per-sample PSPs, `--threads` fixed per line. Wall +
+    peak RSS (psutil, process-tree max). **Reading it:** the architecture
+    bounds the in-flight working set by `target_variants_per_chunk` (it never
+    materialises all-samples data at once), so each thread-line's **peak RSS
+    should flatten as N grows** rather than climb linearly — a memory
+    *plateau* with cohort size. A straight line climbing with N would falsify
+    that. Data: `ours_joint_mem_scaling.tsv`
+    (`perf_ours_joint_mem_scaling.py`).
+    """)
+    _body_6 = mo.as_html(fig_6) if fig_6 is not None else mo.md(
+        "_(Section 5 unavailable; run `perf_ours_joint_mem_scaling.py` to "
+        "write `ours_joint_mem_scaling.tsv`.)_"
+    )
+    sec6_view = mo.vstack([sec6_methods, _body_6])
+    sec6_view
+    return fig_6, sec6_view
+
+
+@app.cell
+def _(mem_rows, mem_thread_panel, mo, yscale):
+    # Section 6 — peak RSS vs --threads at several cohort sizes. Investigates
+    # the "memory grows with threads" claim (queue depth ~ 2x threads).
+    fig_7 = mem_thread_panel(mem_rows, yscale_val=yscale.value)
+    sec7_methods = mo.md("""
+    **Materials & methods.** Same sweep as §5, re-sliced: one `var-calling`
+    process per point, cohort size N fixed per line, `--threads` on the x.
+    **Reading it:** the hand-off queues are sized `≈ 2 × threads` and each
+    caller thread holds one in-flight chunk, so **peak RSS should climb
+    ~linearly with thread count** (the memory cost of parallelism). The
+    runtime panel is the matching speed-up. Together with §5 this isolates
+    the two knobs: threads set the height, N is bounded. Data:
+    `ours_joint_mem_scaling.tsv`.
+    """)
+    _body_7 = mo.as_html(fig_7) if fig_7 is not None else mo.md(
+        "_(Section 6 unavailable; run `perf_ours_joint_mem_scaling.py` to "
+        "write `ours_joint_mem_scaling.tsv`.)_"
+    )
+    sec7_view = mo.vstack([sec7_methods, _body_7])
+    sec7_view
+    return fig_7, sec7_view
 
 
 @app.cell

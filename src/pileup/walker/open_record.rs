@@ -140,10 +140,24 @@ impl OpenPileupRecord {
     /// chain id unless the walker explicitly tracked it. Deriving
     /// the chain id set from `folded_reads` at finalise removes
     /// that drift surface entirely.
+    ///
+    /// REF (allele 0) chain ids are intentionally **not** emitted —
+    /// see the skip in the projection loop below.
     pub fn finalise(self) -> PileupRecord {
         let mut per_bucket: Vec<Vec<ChainId>> =
             (0..self.alleles.len()).map(|_| Vec::new()).collect();
         for state in self.folded_reads.values() {
+            // Drop REF (allele 0) chain ids. The only downstream reader
+            // of `chain_ids` is Stage 5's compound-haplotype check
+            // (`per_group_merger::build_chain_proposals`), which links
+            // *non-reference* alleles only and explicitly skips allele 0,
+            // so REF chain ids are provably never read. They are the vast
+            // majority of all chain ids (~96.6% on real cohorts), so not
+            // materialising them keeps them out of the `.psp` entirely.
+            // See doc/devel/specs/phase_chain.md §8.
+            if state.allele_index == 0 {
+                continue;
+            }
             per_bucket[state.allele_index].push(state.chain_id);
         }
         for chain_ids in &mut per_bucket {

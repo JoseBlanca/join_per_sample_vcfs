@@ -78,6 +78,26 @@ RUN cargo install samply --locked
 # without disassembling the whole binary.
 RUN cargo install cargo-show-asm --locked
 
+# coz: causal profiler — built for the cohort var-calling pipeline's
+# producer->workers->writer shape, where "speed up which line actually
+# improves end-to-end throughput?" is the question wall-clock and self-time
+# profiles can't answer. Crucially it samples on PERF_TYPE_SOFTWARE /
+# PERF_COUNT_SW_TASK_CLOCK, so it works inside the Apple-`container` Linux VM
+# where the PMU is NOT virtualized (hardware counters, `perf c2c`, and
+# `perf sched` off-CPU all return <not supported> there). Built from source
+# pinned to a verified commit; CMake fetches LIEF + libelfin. Installs
+# libcoz.so + the `coz` CLI to /usr/local. cmake is the only added build dep
+# (build-essential / pkg-config are already present above).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && git clone --recursive https://github.com/plasma-umass/coz /tmp/coz \
+    && git -C /tmp/coz checkout 10630c542bc6d8a24595fd8283bea33bef892016 \
+    && cmake -S /tmp/coz -B /tmp/coz/build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/coz/build -j \
+    && cmake --install /tmp/coz/build \
+    && ldconfig \
+    && rm -rf /tmp/coz /var/lib/apt/lists/*
+
 # Claude Code CLI, used when the container hosts an agent session.
 RUN npm install -g @anthropic-ai/claude-code
 

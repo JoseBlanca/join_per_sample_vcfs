@@ -468,12 +468,16 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
         required: true,
         finite_constraint: false,
         description: "Phase-chain identifiers contributing to each \
-            allele observation. Ascending fixed-width little-endian \
-            u64s (relying on zstd to compress the leading zero bytes \
-            on early ids). Identifiers are unique within the .psp \
-            file and never recycled, so two observations sharing an \
+            non-reference allele observation. Ascending fixed-width \
+            little-endian u64s (relying on zstd to compress the leading \
+            zero bytes on early ids). Identifiers are unique within the \
+            .psp file and never recycled, so two observations sharing an \
             identifier came from the same read or read-pair in this \
-            sample.",
+            sample. The REF allele (the first allele of every record) \
+            always carries an EMPTY list: its chain ids are never read \
+            downstream (the compound-haplotype check links non-reference \
+            alleles only), so the walker drops them — they would \
+            otherwise be ~96.6% of all chain ids. See phase_chain.md §8.",
     },
 ];
 

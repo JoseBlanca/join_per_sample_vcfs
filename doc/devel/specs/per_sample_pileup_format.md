@@ -14,7 +14,10 @@ document's Stage 2 section. The artefact's high-level shape:
 - five per-allele scalars (observation count, `Σ max(ln_BQ, ln_MQ)`,
   forward-strand count, placed-left count, placed-start count);
 - per-allele phase chain identifiers — unique-per-file `u64`s, no
-  recycling, no lifecycle markers (see Q-FC8);
+  recycling, no lifecycle markers (see Q-FC8); stored for non-reference
+  alleles only — the REF allele (first allele of every record) always
+  carries an empty list, since its chain ids are never read downstream
+  (see [phase_chain.md](phase_chain.md) §8);
 - columnar storage within zstd-compressed blocks;
 - a mandatory tail-mounted **block index**;
 - a plain-text **TOML file header** framed by a `PSP\n` magic, an
@@ -580,7 +583,10 @@ where noted):
     `allele_chain_ids` list is strictly ascending with no
     duplicates. The reader rejects any record that violates this
     well-formedness check, naming the block, the record index, and
-    the allele index.
+    the allele index. The REF allele (allele 0) always carries an
+    empty list (its chain ids are dropped by the walker — see
+    [phase_chain.md](phase_chain.md) §8); an empty list trivially
+    satisfies this ordering rule.
 
 (Checks #10–11 in earlier drafts of this document — the
 "phase-chain active-set consistency" and "inter-block phase-chain
@@ -729,7 +735,7 @@ cardinality  = "per-allele"
 shape        = "list"
 element-type = "u64"
 required     = true
-description  = "Phase-chain identifiers contributing to each allele observation. Ascending fixed-width little-endian u64s. Identifiers are unique within the .psp file and never recycled; two observations sharing an identifier came from the same read or read-pair in this sample. Tags 0x20 and 0x21 (the old new-chain-ids / expired-chain-ids lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8."
+description  = "Phase-chain identifiers contributing to each non-reference allele observation. Ascending fixed-width little-endian u64s. Identifiers are unique within the .psp file and never recycled; two observations sharing an identifier came from the same read or read-pair in this sample. The REF allele (first allele of every record) always carries an empty list — its chain ids are never read downstream (the compound-haplotype check links non-reference alleles only), so the walker drops them. Tags 0x20 and 0x21 (the old new-chain-ids / expired-chain-ids lifecycle markers) are reserved-unused under the unique-id design — see Q-FC8."
 ---END-HEADER---
 ```
 

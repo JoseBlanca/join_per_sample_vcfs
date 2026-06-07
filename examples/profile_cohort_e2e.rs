@@ -9,8 +9,8 @@
 //! between the next code-level perf levers (rayon-over-records vs.
 //! `DEFAULT_BATCH_SIZE` tuning).
 //!
-//! **Not a committed bench.** The `cohort_e2e_perf` criterion bench
-//! is the maintained perf surface and uses fully synthetic input.
+//! **Not a committed bench.** The `cohort_var_calling_perf` criterion
+//! bench is the maintained perf surface and uses fully synthetic input.
 //! This example is for diagnostics against real per-sample pileup
 //! data the user happens to have on disk; the data itself is never
 //! committed.
@@ -114,6 +114,13 @@ struct Cli {
     /// rewrite) so back-to-back runs at the same N are fast.
     #[arg(long, default_value = "tmp/cohort_synth")]
     cohort_dir: PathBuf,
+
+    /// Per-chunk variable-position target. Defaults to the production
+    /// value (`256`) so the profile reflects the chunked/streaming shape
+    /// the pipeline actually runs; `0` selects the legacy single-pull
+    /// loader (pre-rewrite shape) for back-to-back comparison.
+    #[arg(long, default_value_t = 256)]
+    target_variants_per_chunk: u32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,9 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         threads: args.threads,
         contamination_estimates: None,
         no_complexity_filter: args.no_complexity_filter,
-        // Legacy single-pull / single-window behaviour so the
-        // profile reflects the pre-rewrite per-chunk shape.
-        target_variants_per_chunk: 0,
+        // Production chunked/streaming shape by default (256); `0`
+        // selects the legacy single-pull loader for comparison.
+        target_variants_per_chunk: args.target_variants_per_chunk,
         low_memory: false,
         psp_files,
         cohort: CohortPipelineArgs {

@@ -117,6 +117,16 @@ pub enum BlockHeaderInvariantKind {
         n_total_alleles: u32,
         sum_n_alleles: u64,
     },
+
+    /// A record's decoded `n-alleles` entry is `0`. The writer forbids
+    /// zero-allele records (the REF allele is always present —
+    /// [`InvalidRecordKind::ZeroAlleles`]), so a `0` here marks a
+    /// corrupt block. Without this check the per-allele CSR offsets
+    /// alias the next record's range: a trailing zero-allele record
+    /// indexes one past the offsets array (panic), an interior one
+    /// silently mis-attributes the following record's allele span.
+    #[error("record {record_index} has zero alleles (every record has at least one allele)")]
+    ZeroAlleleRecord { record_index: u32 },
 }
 
 /// Rules a record handed to `write_record` can violate. Carried as

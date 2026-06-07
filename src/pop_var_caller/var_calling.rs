@@ -5,18 +5,16 @@
 //!   PspReader(s) → PerPositionMerger → DustFilter → VariantGrouper
 //!   → PerGroupMerger → PosteriorEngine → CohortVcfWriter
 //!
-//! The DUST filter is bypassed when `--no-complexity-filter` is set;
-//! both branches converge on the same downstream chain via a
-//! `Box<dyn Iterator>` adapter that lifts the upstream error into
-//! [`GrouperError`] — the wiring lives in
-//! [`crate::var_calling::driver::drive_cohort_chunked`].
+//! This CLI layer validates inputs (chromosome agreement, FASTA-vs-`.psp`
+//! MD5), loads any `--contamination-estimates`, and hands off to the
+//! re-architected record-streaming pipeline that runs those stages — the
+//! wiring lives in [`crate::var_calling::pipeline::run_var_calling`].
 //!
 //! Contamination plumbing:
 //!
 //! - With `--contamination-estimates <FILE>`: the artefact is loaded
 //!   and reconciled against the cohort sample names (extras are
-//!   tolerated, absences are not), then handed to the posterior engine
-//!   via [`PosteriorEngineConfig::contamination`].
+//!   tolerated, absences are not), then handed to the posterior engine.
 //! - Without: the engine runs in "no contamination" mode and the
 //!   `contamination` field stays `None`.
 //!
@@ -32,36 +30,15 @@ use thiserror::Error;
 
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
-    current_command_line, verify_fasta_matches_psp_chromosomes,
+    verify_fasta_matches_psp_chromosomes,
 };
 use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
 };
 use crate::psp::{PspReadError, PspReader};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
-use crate::var_calling::dust_filter::{DustFilterConfig, DustFilterError};
-use crate::var_calling::per_group_merger::{
-    DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerError,
-};
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
-use crate::var_calling::posterior_engine::{
-    PosteriorEngineConfig, PosteriorEngineConfigError, PosteriorEngineError,
-};
-use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError, GrouperError};
-use crate::var_calling::{
-    ChunkDriverError, ChunkDriverParams, ChunkDriverStats, ChunkSizingParams,
-    DownstreamFilterParams, drive_cohort_chunked,
-};
-use crate::vcf::{CohortMetadata, VcfWriteError, WriterConfig};
-
-/// Default desired number of variable variants per materialised block
-/// (the `BlockIterator`'s accumulation target) when
-/// `--target-variants-per-chunk` is left at `0`. Sets block size: the
-/// iterator pulls .psp chunks until it has this many variable variants,
-/// then cuts at a clean group boundary. Output is independent of it;
-/// it trades block size for memory (resident ≈ target × n_samples).
-/// Tunable; validate against the high-N synthetic scaling benchmark.
-const DEFAULT_DESIRED_VARIANTS_PER_BLOCK: u32 = 1024;
+use crate::var_calling::pipeline::PipelineError;
 
 // ---------------------------------------------------------------------
 // CLI surface
@@ -96,8 +73,10 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub regions: Option<PathBuf>,
 
-    /// Worker threads for the rayon pool. If omitted, rayon picks
-    /// the default (all logical cores).
+    /// Worker threads. If omitted, defaults to all logical cores
+    /// (`available_parallelism`). Also sizes the pipeline's caller-thread
+    /// pool and the two bounded hand-off queues (depth ≈ 2 × threads), so
+    /// it is the primary peak-memory knob.
     #[arg(long)]
     pub threads: Option<usize>,
 
@@ -111,12 +90,13 @@ pub struct VarCallingArgs {
     #[arg(long)]
     pub no_complexity_filter: bool,
 
-    /// Soft lower bound on the post-filter variant count per chunk.
-    /// The loader grows each chunk's BP span adaptively until the
-    /// kept-position count crosses this target — decoupling worker
-    /// workload from PSP block size and per-region variant density.
-    /// Pass `0` (the default) to keep the legacy BP-only loop (one
-    /// pull of `--chunk-genomic-span` BP per chunk).
+    /// Soft target for the number of variable (cohort-variant) positions
+    /// per chunk — the producer accumulates records until it reaches this
+    /// many, then cuts at the next safe gap. Trades chunk size for memory
+    /// (resident ≈ target × n_samples); the emitted VCF is independent of
+    /// it (cuts always fall on clean group boundaries). `0` (the default)
+    /// selects the built-in default of 1024; any positive value overrides.
+    /// The resolved value is printed in the startup log.
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
 
@@ -156,46 +136,15 @@ pub enum VarCallingCliError {
     #[error("merger: {0}")]
     Merger(#[from] PerPositionMergerError),
 
-    #[error("dust filter: {0}")]
-    Dust(#[from] DustFilterError),
-
-    #[error("grouper: {0}")]
-    Grouper(#[from] GrouperError),
-
-    #[error("per-group merger: {0}")]
-    PerGroup(#[from] PerGroupMergerError),
-
-    #[error("posterior engine: {0}")]
-    Posterior(#[from] PosteriorEngineError),
-
-    #[error("vcf writer: {0}")]
-    Vcf(#[from] VcfWriteError),
-
-    /// Surfaced by [`drive_cohort_chunked`] — wraps every per-stage
-    /// error from the chunk-loop driver (loader, pre-pass, partition,
-    /// worker, vcf writer, etc.) so they all flow through one
-    /// CLI-side variant.
-    #[error("chunk driver: {0}")]
-    ChunkDriver(#[from] ChunkDriverError),
+    /// Surfaced by the re-architected pipeline — wraps every per-stage error
+    /// (config build, .psp decode, REF/dust, grouping/merge/EM, VCF write) so
+    /// they flow through one CLI-side variant.
+    #[error("pipeline: {0}")]
+    Pipeline(#[from] PipelineError),
 
     #[error("contamination artefact: {0}")]
     ContamArtefact(#[from] ContaminationArtefactError),
 
-    #[error("regions BED: {0}")]
-    Bed(#[from] crate::regions::BedError),
-
-    #[error("grouper config: {0}")]
-    GrouperConfig(#[from] GrouperConfigError),
-
-    #[error("per-group merger config: {0}")]
-    PerGroupConfig(#[from] crate::var_calling::per_group_merger::PerGroupMergerConfigError),
-
-    #[error("posterior engine config: {0}")]
-    PosteriorConfig(#[from] PosteriorEngineConfigError),
-
-    // `DustFilterConfig::new` also returns `DustFilterError`, which
-    // funnels through the `Dust` variant above — no separate
-    // `DustConfig` slot needed.
     /// A `.psp` file's `reference` field doesn't match the basename
     /// of `--reference`. Surfaces before any record is read.
     #[error(
@@ -272,8 +221,8 @@ pub enum VarCallingCliError {
 ///    built — the chunk driver constructs a per-chromosome
 ///    `StreamingChromRefFetcher` as it advances.
 /// 8. Cohort metadata + writer-config template.
-/// 9. Drive the chunk loop ([`drive_cohort_chunked`]): a sequential
-///    per-chromosome outer loop with a within-chromosome chunk loop
+/// 9. Drive the record-streaming pipeline
+///    ([`crate::var_calling::pipeline::run_var_calling`]): a producer
 ///    that materialises one chunk × N samples at a time, partitions it
 ///    into windows, and runs the per-group merger + posterior EM on
 ///    each window. Records stream straight into a single
@@ -283,8 +232,6 @@ pub enum VarCallingCliError {
 ///     `effective_threads` + the `requested … capped by N chromosomes`
 ///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
-    let cohort = &args.cohort;
-
     // 1. Rayon pool — idempotent under the silent-no-op policy
     //    (M13, locked 2026-05-19); first caller wins, subsequent
     //    callers' --threads is silently ignored.
@@ -324,33 +271,12 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     // N_samples × N_chromosomes.
     drop(readers);
 
-    // 5. Build + validate every per-stage config.
-    let dust_cfg = DustFilterConfig::new(cohort.complexity_window, cohort.complexity_threshold)?;
-    let grouper_cfg = GrouperConfig::new(cohort.var_group_max_span)?;
-    let per_group_cfg = PerGroupMergerConfig::new(
-        cohort.ploidy,
-        cohort.max_alleles_per_var,
-        cohort.max_alleles_lh_calc,
-        DEFAULT_BATCH_SIZE,
-    )?;
-    // 5/6. Posterior config + contamination wired through the named-
-    //      setter builder chain so out-of-range values surface as
-    //      typed errors at construction time.
-    let posterior_cfg = PosteriorEngineConfig::new()
-        .with_convergence_threshold(cohort.em_convergence_threshold)?
-        .with_max_iterations(cohort.em_max_iterations)?
-        .with_ref_pseudocount(cohort.ref_pseudocount)?
-        .with_snp_alt_pseudocount(cohort.snp_alt_pseudocount)?
-        .with_indel_alt_pseudocount(cohort.indel_alt_pseudocount)?
-        .with_compound_alt_pseudocount(cohort.compound_alt_pseudocount)?
-        .with_fixation_index_default(cohort.inbreeding_coefficient)?
-        .with_max_gq_phred(cohort.max_gq_phred)?
-        .with_contamination(load_contamination(
-            args.contamination_estimates.as_deref(),
-            &sample_names,
-        )?)?;
+    // 5. Load `--contamination-estimates` (reconciled to the cohort order;
+    //    `None` → no contamination). The per-stage EM / grouper / merger
+    //    configs are built inside the pipeline from the args.
+    let contamination = load_contamination(args.contamination_estimates.as_deref(), &sample_names)?;
 
-    // 7a. Cross-check FASTA bytes against the .psp per-contig MD5s
+    // 6. Cross-check FASTA bytes against the .psp per-contig MD5s
     //     *before* building the runtime fetcher. Catches "right
     //     basename, wrong genome build". Streams each contig through
     //     `Md5::update` in 64 KiB windows, per-chrom in parallel —
@@ -375,97 +301,14 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
         }
     }
 
-    // 7b. No global fetcher is built here. Each per-chrom worker
-    //     constructs its own `StreamingChromRefFetcher` inside
-    //     `process_one_chromosome` — no Arc shared across threads,
-    //     no Mutex contention. The contig's sliding buffer lives
-    //     exactly for the worker's lifetime; peak resident during
-    //     the `par_iter` below is `min(threads, n_chroms) × 1 MB`,
-    //     independent of contig size.
+    // 7. Run the re-architected pipeline (producer → W callers → writer). It
+    //    opens its own per-sample readers, builds every per-stage config from
+    //    the args, applies `--regions`, and writes the VCF; it returns the
+    //    run-level counters for the summary.
+    let stats = crate::var_calling::pipeline::run_var_calling(args, contamination)?;
 
-    // 8. Cohort metadata for the writer header + the writer-config
-    //    template inherited by every per-chrom fragment writer.
-    let metadata = CohortMetadata {
-        sample_names: sample_names.clone(),
-        contigs: chromosomes.clone(),
-        tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
-        command_line: current_command_line(),
-    };
-    let writer_cfg_template = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
-
-    // 9. Drive the chunk loop. The within-chromosome chunk-parallel
-    //    rewrite (Phase A — see
-    //    `doc/devel/implementation_plans/cohort_within_chromosome_parallel.md`)
-    //    runs the entire cohort end-to-end through one
-    //    `CohortVcfWriter`; no per-chrom fragments, no concat. The
-    //    new driver owns its own per-sample PSP readers + per-chrom
-    //    `StreamingChromRefFetcher` + the persistent chunk-loop
-    //    scratch.
-    let driver_params = ChunkDriverParams {
-        no_complexity_filter: args.no_complexity_filter,
-        dust_cfg,
-        grouper_cfg,
-        per_group_cfg,
-        posterior_cfg,
-        sizing: {
-            // Desired variable-variants per block — the BlockIterator's
-            // accumulation target. `0` (default) uses the const default;
-            // an explicit `--target-variants-per-chunk` overrides. Output
-            // is independent of this (the iterator always cuts at clean
-            // group boundaries); it trades block size for memory
-            // (resident ≈ target × n_samples — the one-chunk-at-a-time
-            // bound the rewrite trades genomic span for).
-            let target_variants = if args.target_variants_per_chunk == 0 {
-                DEFAULT_DESIRED_VARIANTS_PER_BLOCK
-            } else {
-                args.target_variants_per_chunk
-            };
-            ChunkSizingParams {
-                target_variants_per_chunk: std::num::NonZeroU32::new(target_variants),
-            }
-        },
-        downstream: DownstreamFilterParams {
-            min_alt_obs_per_sample: args.cohort.min_alt_obs_per_sample,
-            min_qual_phred: args.cohort.min_qual_phred,
-            no_mapq_diff_filter: args.cohort.no_mapq_diff_filter,
-            min_mapq_diff_t: args.cohort.min_mapq_diff_t,
-        },
-        low_memory: args.low_memory,
-    };
-    // Region set: the --regions BED resolved against the cohort
-    // chromosomes, or None (whole genome — the driver runs the
-    // identical, byte-for-byte path when this is None).
-    let region_set = match &args.regions {
-        Some(bed_path) => {
-            let contig_bounds: Vec<crate::regions::ContigBounds> = chromosomes
-                .iter()
-                .map(|c| crate::regions::ContigBounds {
-                    name: &c.name,
-                    length: c.length,
-                })
-                .collect();
-            Some(crate::regions::RegionSet::from_bed_path(
-                bed_path,
-                &contig_bounds,
-            )?)
-        }
-        None => None,
-    };
-
-    let chunk_stats = drive_cohort_chunked(
-        &args.psp_files,
-        sample_names.clone(),
-        chromosomes.clone(),
-        &args.reference,
-        &args.output,
-        metadata,
-        writer_cfg_template,
-        driver_params,
-        region_set.as_ref(),
-    )?;
-
-    // 11. Stderr summary.
-    print_run_summary(&sample_names, chunk_stats, args.threads, chromosomes.len());
+    // 8. Stderr summary.
+    print_run_summary(&sample_names, stats, args.threads, chromosomes.len());
     Ok(())
 }
 
@@ -504,7 +347,7 @@ fn load_contamination(
 /// the happy-path summary tight.
 fn print_run_summary(
     sample_names: &[String],
-    stats: ChunkDriverStats,
+    stats: crate::var_calling::vcf_writer::WriterStats,
     requested_threads: Option<usize>,
     n_chromosomes: usize,
 ) {
@@ -564,17 +407,8 @@ fn print_run_summary(
     } else {
         String::new()
     };
-    let chunks_loaded_note = if stats.chunks_loaded > 0 {
-        let avg = stats.chunk_variants_total as f64 / stats.chunks_loaded as f64;
-        format!(
-            " chunks_loaded={} avg_variants_per_chunk={:.1}",
-            stats.chunks_loaded, avg,
-        )
-    } else {
-        String::new()
-    };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}{}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}{}",
         sample_names.len(),
         stats.records_written,
         effective_threads,
@@ -585,7 +419,6 @@ fn print_run_summary(
         dropped_low_alt_obs_note,
         dropped_low_mapq_diff_t_note,
         lh_cap_note,
-        chunks_loaded_note,
     );
 }
 
