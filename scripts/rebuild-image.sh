@@ -12,13 +12,24 @@
 #   ./scripts/rebuild-image.sh --no-cache   # full rebuild from scratch
 #   ./scripts/rebuild-image.sh --pull       # also refresh the FROM base image
 #
-# Any extra arguments are forwarded to `podman build`.
+# Any extra arguments are forwarded to the container runtime's `build`.
 set -euo pipefail
 
 IMAGE="${IMAGE:-pop-var-caller-dev}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-exec podman build \
+# Pick the same runtime dev.sh does: podman (Linux dev box) or Apple's
+# `container` CLI (macOS). Both accept `build -t … -f … <context>`.
+if command -v podman >/dev/null 2>&1; then
+    RUNTIME=podman
+elif command -v container >/dev/null 2>&1; then
+    RUNTIME=container
+else
+    echo "Error: neither 'podman' nor 'container' (Apple) found on PATH." >&2
+    exit 1
+fi
+
+exec "$RUNTIME" build \
     -t "$IMAGE" \
     -f "$PROJECT_DIR/Containerfile" \
     "$@" \
