@@ -26,17 +26,19 @@ use crate::fasta::{
 };
 use crate::pop_var_caller::var_calling::VarCallingArgs;
 use crate::psp::{PspReadError, PspReader};
-use crate::regions::{ContigBounds, Region, RegionSet};
+use crate::regions::{BedError, ContigBounds, Region, RegionSet};
 use crate::var_calling::cohort_integration::{CohortChunkIntegrator, ProducerError, RefFetchError};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::em_posterior_calc::{CallerError, VariantCaller};
-use crate::var_calling::per_group_merger::{DEFAULT_BATCH_SIZE, PerGroupMergerConfig};
+use crate::var_calling::per_group_merger::{
+    DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerConfigError,
+};
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
-use crate::var_calling::posterior_engine::PosteriorEngineConfig;
+use crate::var_calling::posterior_engine::{PosteriorEngineConfig, PosteriorEngineConfigError};
 use crate::var_calling::sample_reader::SamplePspReader;
 use crate::var_calling::types::{CalledChunk, RawCohortChunk};
-use crate::var_calling::variant_grouping::GrouperConfig;
+use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError};
 use crate::var_calling::vcf_writer::{DownstreamFilters, VcfWriter, WriterError, WriterStats};
 use crate::vcf::{CohortMetadata, WriterConfig};
 
@@ -94,8 +96,16 @@ pub enum PipelineError {
     Psp(#[from] PspReadError),
     #[error("cohort chromosome agreement: {0}")]
     ChromAgreement(#[from] PerPositionMergerError),
-    #[error("invalid configuration: {0}")]
-    Config(String),
+    #[error("invalid grouper configuration")]
+    GrouperConfig(#[from] GrouperConfigError),
+    #[error("invalid per-group-merger configuration")]
+    MergerConfig(#[from] PerGroupMergerConfigError),
+    #[error("invalid posterior-engine configuration")]
+    PosteriorConfig(#[from] PosteriorEngineConfigError),
+    #[error("invalid --regions BED")]
+    Regions(#[from] BedError),
+    #[error("building the producer rayon thread pool")]
+    ProducerPool(#[from] rayon::ThreadPoolBuildError),
     #[error("reference fetch: {0}")]
     RefFetch(#[from] ChromRefFetchError),
     #[error("dust mask computation: {0}")]
@@ -145,35 +155,27 @@ pub fn run_var_calling(
     let chrom_lengths: Vec<u32> = chromosomes.iter().map(|c| c.length).collect();
     let n_chromosomes = chromosomes.len() as u32;
 
-    // --- Build every per-stage config from the args. ---
-    let cfg_err = |e: &dyn std::fmt::Display| PipelineError::Config(e.to_string());
-    let grouper_cfg = GrouperConfig::new(cohort.var_group_max_span).map_err(|e| cfg_err(&e))?;
+    // --- Build every per-stage config from the args. Each builder returns a
+    //     typed config error, surfaced through its own `PipelineError` variant
+    //     (via `?` / `#[from]`) so the cause is preserved in the `source()`
+    //     chain and the failing knob is identifiable. ---
+    let grouper_cfg = GrouperConfig::new(cohort.var_group_max_span)?;
     let merger_cfg = PerGroupMergerConfig::new(
         cohort.ploidy,
         cohort.max_alleles_per_var,
         cohort.max_alleles_lh_calc,
         DEFAULT_BATCH_SIZE,
-    )
-    .map_err(|e| cfg_err(&e))?;
+    )?;
     let posterior_cfg = PosteriorEngineConfig::new()
-        .with_convergence_threshold(cohort.em_convergence_threshold)
-        .map_err(|e| cfg_err(&e))?
-        .with_max_iterations(cohort.em_max_iterations)
-        .map_err(|e| cfg_err(&e))?
-        .with_ref_pseudocount(cohort.ref_pseudocount)
-        .map_err(|e| cfg_err(&e))?
-        .with_snp_alt_pseudocount(cohort.snp_alt_pseudocount)
-        .map_err(|e| cfg_err(&e))?
-        .with_indel_alt_pseudocount(cohort.indel_alt_pseudocount)
-        .map_err(|e| cfg_err(&e))?
-        .with_compound_alt_pseudocount(cohort.compound_alt_pseudocount)
-        .map_err(|e| cfg_err(&e))?
-        .with_fixation_index_default(cohort.inbreeding_coefficient)
-        .map_err(|e| cfg_err(&e))?
-        .with_max_gq_phred(cohort.max_gq_phred)
-        .map_err(|e| cfg_err(&e))?
-        .with_contamination(contamination)
-        .map_err(|e| cfg_err(&e))?;
+        .with_convergence_threshold(cohort.em_convergence_threshold)?
+        .with_max_iterations(cohort.em_max_iterations)?
+        .with_ref_pseudocount(cohort.ref_pseudocount)?
+        .with_snp_alt_pseudocount(cohort.snp_alt_pseudocount)?
+        .with_indel_alt_pseudocount(cohort.indel_alt_pseudocount)?
+        .with_compound_alt_pseudocount(cohort.compound_alt_pseudocount)?
+        .with_fixation_index_default(cohort.inbreeding_coefficient)?
+        .with_max_gq_phred(cohort.max_gq_phred)?
+        .with_contamination(contamination)?;
 
     let min_alt_obs = cohort.min_alt_obs_per_sample;
     let max_group_span = cohort.var_group_max_span;
@@ -194,7 +196,7 @@ pub fn run_var_calling(
                     length: c.length,
                 })
                 .collect();
-            Some(RegionSet::from_bed_path(bed, &contig_bounds).map_err(|e| cfg_err(&e))?)
+            Some(RegionSet::from_bed_path(bed, &contig_bounds)?)
         }
         None => None,
     };
@@ -252,8 +254,7 @@ pub fn run_var_calling(
     let (producer_threads, n_workers) = resolve_thread_split(requested_threads);
     let producer_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(producer_threads)
-        .build()
-        .map_err(|e| PipelineError::Config(format!("building producer rayon pool: {e}")))?;
+        .build()?;
     let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
     // Surface the resolved concurrency / chunk-sizing defaults so an operator
     // can recover what a running instance actually chose (the values default
