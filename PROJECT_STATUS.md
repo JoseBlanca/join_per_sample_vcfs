@@ -19,7 +19,38 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-07):** **Worked through the perf-review
+> - **Last completed task (2026-06-08):** **Code review of `src/var_calling/`**
+>   (orchestrator skill, 10 categories; `main` @ `35a6b67`; the re-architected
+>   record-streaming pipeline, excluding the PM-deferred `posterior_engine`
+>   module) —
+>   [var_calling_2026-06-08.md](doc/devel/reports/reviews/var_calling_2026-06-08.md).
+>   Verdict **Approve-with-changes** — 0 Blockers, 8 Major, 13 Minor + Nits. All
+>   gates green (fmt / clippy `-D warnings` / `doc` clean; 1052 lib + integration
+>   tests pass on the CI gate `--lib --tests`; the only `--all-targets` failure is
+>   the pre-existing out-of-scope `psp_writer_perf` bench panic). No correctness
+>   Blockers — `unsafe_concurrency` re-confirmed the topology is sound (no
+>   `unsafe`, deadlock-free bounded channels, order-independent parallel fold,
+>   `VariantCaller: Sync`); byte-identity remains verified out-of-tree. Verdict
+>   driven by maintainability + test-coverage debt: **M1** dead `pub`
+>   `PileupCohortChunk` at the producer→caller seam (convergent across 4
+>   categories; confirmed by grep — only its def + 3 doc refs); **M2** five
+>   rebuilt-structure modules `pub` with zero external consumers (extends prior
+>   M8); **M3** config errors flattened to `PipelineError::Config(String)`
+>   (typed-cause/`source()`-chain regression); **M4** `merge_compacted_samples`
+>   lives in the producer but is the caller's work (cyclic stage coupling); **M5**
+>   no test varies worker count to pin the byte-identical-for-any-W contract;
+>   **M6** dead/mislabeled `SamplePspChunk` decode API (`append_kept`/`chrom_id()`
+>   dead, `take_*`/`from_block` test-only — module doc misdirects on the live
+>   two-phase path); **M7** stale migration-era docs whose "copied verbatim from
+>   `two_pass`/`driver`/`worker`/`loader`" provenance points at deleted modules
+>   (in-tree byte-identity safety net unreachable — pin to a commit hash); **M8**
+>   release-level guards + byte-identity helpers untested (`MissingChunks`,
+>   `StalledCut`, `emit_or_drop`, `overlapping_groups`, `--regions`/dust seams,
+>   `rebuild_fold` reduce-order, `compact_samples` straddler). Four open questions
+>   gate M1/M2/M5/M7 (mostly: resolve the deferred-until-P7 doc debt now that the
+>   swap has happened). Per-category audit trail at
+>   `tmp/review_2026-06-08_var-calling/`.
+> - **Previous task (2026-06-07):** **Worked through the perf-review
 >   findings on `re-architect`, then merged the branch into `main`.** Built the
 >   missing committed cohort end-to-end bench
 >   ([benches/cohort_var_calling_perf.rs](benches/cohort_var_calling_perf.rs),
@@ -1254,9 +1285,12 @@ via rayon.
   - **Nits** — single mechanical pass to clear the 16 in-scope clippy errors (`single_range_in_vec_init` ×8, `type_complexity` ×4, `bool_assert_comparison` ×2, `doc_lazy_continuation` ×2) plus add per-call-site justification comments to the 14 `#[allow(...)]` annotations (12 `clippy::too_many_arguments` + `clippy::arc_with_non_send_sync` + `clippy::needless_range_loop`).
 
 #### Re-architected record-streaming pipeline (replaces the chunk-parallel rewrite)
-- **Status:** fixes-applied (2026-06-05) — all 8 Major review findings +
+- **Status:** reviewed (2026-06-08) — re-reviewed on `main` post-merge
+  (subtree review excluding `posterior_engine`; verdict Approve-with-changes, 0
+  Blockers / 8 Major / 13 Minor; see Latest review). Prior: fixes-applied
+  (2026-06-05) — all 8 Major review findings +
   2 Minors applied across 3 commits (`b4e767c` review, `8210f46`
-  M1/M2/M5/Mi2, `ed141ff` M3/M4/M6/M8/Mi8); reviewed (2026-06-05). Shipped to production on branch
+  M1/M2/M5/Mi2, `ed141ff` M3/M4/M6/M8/Mi8). Shipped to production on branch
   `re-architect` (Phase 7 swap, `1d34f85`). The columnar driver/worker/
   loader/columns/partition/two_pass/kernels chain is **deleted**; the only
   cohort `.psp` → VCF path is now the three-component record-streaming
@@ -1286,7 +1320,21 @@ via rayon.
 - **Tests:** 996 lib + all cohort integration pass (in container, commit
   `ef93b67`); `fmt --check` + `clippy --all-targets --all-features -D warnings`
   clean.
-- **Latest review:** [re_architecture_pipeline_2026-06-05.md](doc/devel/reports/reviews/re_architecture_pipeline_2026-06-05.md)
+- **Latest review:** [var_calling_2026-06-08.md](doc/devel/reports/reviews/var_calling_2026-06-08.md)
+  — **Approve-with-changes** (orchestrator skill, 10 categories; `main` @
+  `35a6b67`; subtree review excluding the PM-deferred `posterior_engine`). 0
+  Blockers, 8 Major, 13 Minor + Nits. All gates green (fmt / clippy `-D warnings`
+  / `doc`; 1052 lib + integration tests pass; only `--all-targets` failure is the
+  pre-existing out-of-scope `psp_writer_perf` bench panic). `unsafe_concurrency`
+  clean (deadlock-free channels, order-independent parallel fold,
+  `VariantCaller: Sync`). Drivers: M1 dead `PileupCohortChunk`, M2 over-broad
+  `pub` surface (extends prior M8), M3 `PipelineError::Config(String)`
+  flattening, M4 caller→producer coupling (`merge_compacted_samples`), M5
+  no worker-count byte-identity test, M6 dead/mislabeled `SamplePspChunk` API,
+  M7 stale verbatim-provenance pointing at deleted modules, M8 untested
+  release-guards/byte-identity helpers. Per-category audit trail at
+  `tmp/review_2026-06-08_var-calling/`.
+- **Previous review:** [re_architecture_pipeline_2026-06-05.md](doc/devel/reports/reviews/re_architecture_pipeline_2026-06-05.md)
   — **Request-changes** (orchestrator skill, all 11 categories; HEAD
   `ef93b67`). 0 Blockers, 8 Major, 16 Minor, grouped Nits. No correctness
   Blockers in emitted calls; `unsafe_concurrency` clean (no `unsafe`,
@@ -1334,6 +1382,17 @@ via rayon.
   vacuous test), **Mi8** (refreshed stale "Phase 4 / `!Send`" module docs).
   Verified in container: `fmt` / `clippy --all-targets -D warnings` / `doc -D
   warnings` clean; 1000 lib + cohort integration tests pass.
+- **Open (from the 2026-06-08 code review — see report §6/§8 for full text + fixes):**
+  - **M1** — delete the dead `pub` `PileupCohortChunk` (types.rs); retarget its 3 doc refs at `RawCohortChunk`.
+  - **M2** — demote the 5 zero-external-consumer rebuilt modules (`types`/`sample_reader`/`cohort_integration`/`pileup_overlaps`/`em_posterior_calc`) to `pub(crate)`; consider re-exporting `WriterStats` from `pipeline` to demote `vcf_writer` too.
+  - **M3** — replace `PipelineError::Config(String)` flattening with operation-named variants carrying each typed cause via `#[source]`.
+  - **M4** — move `merge_compacted_samples` (+ `ok_record`/`KeptRecordIter`) from the producer module into the caller.
+  - **M5** — add a `var_calling_byte_identical_across_worker_counts` integration test + a direct `VcfWriter` out-of-order reorder unit test.
+  - **M6** — delete dead `append_kept`/`SamplePspChunk::chrom_id()`; `#[cfg(test)]`-gate or relabel the eager `from_block`/`take_*` oracle path; fix the misdirecting module doc.
+  - **M7** — pin each "copied verbatim from `two_pass`/`driver`/`worker`/`loader`" provenance to the source commit hash; rewrite the migration-future-tense `mod.rs`/`types.rs`/kernel docs to present tense (P7 swap has happened); resolve the deferred `Variant`-alias decision; fix stale `doc/devel/...` doc links.
+  - **M8** — add the targeted unit tests for `MissingChunks`, `StalledCut`, `emit_or_drop` ordering/counters, `overlapping_groups`, `restrict_intervals_to_regions`/`dust_mask_for_interval`, `rebuild_fold` reduce-order independence, and the `compact_samples` straddler.
+  - **Minors** — Mi1 startup-log provenance tags; Mi2 `BUFFERED_IO_CAPACITY` const drift; Mi3 collapse `DownstreamFilters` mapq fields to an enum; Mi4 rename `em_posterior_calc`→`variant_caller`; Mi5 `CohortPileupRecord`/`PileupCohortChunk` near-anagram (resolved by M1); Mi6 `RefSpan::empty()` fictional-doc; Mi7 `CallStats`→`WriterStats` exhaustive-destructure; Mi8 `// PANIC-FREE:` comments on release `.expect()`s; Mi9 caller-panic→typed-error vs fatal-by-design; Mi10 `SamplePspReader::new(r,0,1,1)` placeholder comment; Mi11 `sd`/`so`/`cd`/`co` scratch names; Mi12 hot-path bench regression threshold; Mi13 `passes_min_alt_obs` layout-coupling.
+  - **Out of scope (follow-ups):** `dust_filter::is_masked` release-path passthrough on an unloaded mask (verbatim kernel correctness); the pre-existing `psp_writer_perf.rs:386` bench panic; the deferred `posterior_engine` review.
 - **Open (perf — from [perf_var_calling_cohort_2026-06-06.md](doc/devel/reports/reviews/perf_var_calling_cohort_2026-06-06.md), verdict Run experiments):**
   - **Bench gap (do first)** — add `benches/cohort_var_calling_perf.rs` (criterion,
     `harness=false`) sweeping N∈{1,8,50}×T∈{1,2,8} at tvpc=256; without it no
