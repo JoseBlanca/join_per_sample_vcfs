@@ -90,6 +90,11 @@ const PLAN_QUEUE_DEPTH: usize = 2;
 /// (overlapping decode with folding) without reading unboundedly ahead — peak
 /// memory tracks this depth × N samples (each slot a still-compressed segment).
 const READ_QUEUE_DEPTH: usize = 2;
+/// Minimum producer-thread count at which the staged read→fold→compact pipeline
+/// is used. Below it the stage threads' coordination overhead outweighs the
+/// decode/fold overlap (the overlap needs spare pool capacity), so a single
+/// inline producer is faster — see the `staged` decision in [`run_var_calling`].
+const STAGED_MIN_THREADS: usize = 4;
 /// DUST sub-span for the resident-buffer bound. The mask is byte-identical for
 /// any sub-span (runs are coalesced across boundaries); this just caps RAM.
 const DUST_SUBSPAN: u32 = 1_000_000;
@@ -282,24 +287,7 @@ pub fn run_var_calling(
         min_alt_obs,
         sample_names.clone(),
     );
-    // Per-sample read-stage queues + the fold stage's back-pressure wake. The
-    // read stage owns the readers and decodes ahead into `seg_txs`; the fold
-    // stage (the integrator) pulls from `seg_rxs`.
-    let (seg_txs, seg_rxs): (
-        Vec<crossbeam_channel::Sender<ReadMsg>>,
-        Vec<crossbeam_channel::Receiver<ReadMsg>>,
-    ) = (0..n_samples)
-        .map(|_| crossbeam_channel::bounded::<ReadMsg>(READ_QUEUE_DEPTH))
-        .unzip();
-    let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
-    let mut producer = CohortChunkIntegrator::<BufReader<File>>::new_streaming(
-        seg_rxs,
-        wake_tx,
-        min_alt_obs,
-        target_variants,
-    );
-
-    // --- Parallel topology: producer (this thread) → W callers → writer. ---
+    // --- Parallel topology: producer → W callers → writer. ---
     //
     // Two bounded crossbeam hand-offs give back-pressure (peak ≈ queue cap).
     // The producer stays on the main thread (its per-sample readers + REF/dust
@@ -328,25 +316,23 @@ pub fn run_var_calling(
     // Straddler decode cache: on by default, off under `--low-memory` (trades
     // the cache's cohort-scaling RSS for re-decompressing cut-spanning segments).
     let cache_straddlers = !args.low_memory;
+    // The staged read→fold→compact pipeline (the read + compact stage threads)
+    // overlaps decode with folding, but only pays off when the producer pool has
+    // spare capacity for the overlap. Below `STAGED_MIN_THREADS` its coordination
+    // cost — three stages contending for a tiny pool — outweighs the gain
+    // (measured: a regression at 2 threads), so fall back to a single inline
+    // producer (decode + fold + compact on the main thread, no stage threads),
+    // which matches `main`'s topology and keeps the straddler cache. Output is
+    // byte-identical either way.
+    let staged = producer_threads >= STAGED_MIN_THREADS;
     // Surface the resolved concurrency / chunk-sizing defaults so an operator
     // can recover what a running instance actually chose (the values default
     // implicitly from `--threads` / the `--target-variants-per-chunk` sentinel).
     eprintln!(
-        "var-calling: producer_threads={producer_threads} workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants} low_memory={}",
+        "var-calling: producer_threads={producer_threads} workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants} low_memory={} staged={staged}",
         args.low_memory
     );
-    // The producer is split into two internal stages connected by a bounded
-    // plan queue: the **fold/plan** stage (main thread) advances the cohort
-    // fold, derives each chunk's variable positions + safe-gap cut, fetches its
-    // REF span, and ships a `ChunkPlan` (the still-compressed per-sample
-    // segments, shared by `Arc`); the **compact** stage (its own thread)
-    // inflates only those segments' heavy columns for the variable rows. The
-    // depth-2 plan queue lets the next plan's fold overlap this plan's heavy
-    // decode — closing the gap where the producer pool idled between the serial
-    // fold and the parallel compaction. Both stages fan out across the N samples
-    // on the same `producer_pool`. Output is byte-identical to the single-stage
-    // `produce_chunk` (same fold/cut math and genomic row order).
-    let (plan_tx, plan_rx) = crossbeam_channel::bounded::<ChunkPlan>(PLAN_QUEUE_DEPTH);
+    // Common hand-offs: producer → callers → writer (back-pressured).
     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<RawCohortChunk>(cap);
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
@@ -355,7 +341,10 @@ pub fn run_var_calling(
 
     std::thread::scope(|scope| -> Result<WriterStats, PipelineError> {
         // Writer thread: drain CalledChunks (reorder + filter + write); returns
-        // the run-level stats for the summary.
+        // the run-level stats for the summary. The callers share `&caller` (it
+        // is `Sync` — stateless `call_chunk`); the writer reorders out-of-order
+        // `CalledChunk`s by `chunk_order`, so the VCF is byte-identical
+        // regardless of worker count or producer topology.
         let writer_handle = scope.spawn(move || -> Result<WriterStats, PipelineError> {
             for called in called_rx {
                 writer.handle(called)?;
@@ -379,111 +368,175 @@ pub fn run_var_calling(
             }));
         }
         // Main holds no caller/writer channel handles, so they close once the
-        // compact stage / callers finish.
+        // producer side / callers finish.
         drop(chunk_rx);
         drop(called_tx);
 
-        // Compact stage: inflate each plan'd chunk's heavy columns (fanning out
-        // across the N samples on `producer_pool`) and forward the cohort chunk
-        // to the callers. Owns `chunk_tx`, so the caller queue closes when the
-        // plan queue drains.
-        let compact_handle = scope.spawn(move || -> Result<(), PipelineError> {
-            for plan in plan_rx {
-                let chunk = producer_pool.install(|| compact_plan(plan, cache_straddlers))?;
-                if chunk_tx.send(chunk).is_err() {
-                    break; // all callers gone (errored); real error surfaces on join
-                }
-            }
-            Ok(())
-        });
+        // Producer side — yields the producer-side first error (`None` on
+        // success). Two topologies (see the `staged` decision above):
+        let mut first_err: Option<PipelineError> = if staged {
+            // STAGED: read → fold → compact, three internal stages joined by
+            // bounded queues. The read stage decodes light columns ahead into
+            // per-sample queues; the fold stage (main) pulls them, finds the
+            // chunk's variable positions + cut, and ships a `ChunkPlan` over a
+            // depth-2 queue; the compact stage inflates the heavy columns. The
+            // queues let each stage's work overlap the others — the win on a
+            // pool with spare capacity.
+            let (seg_txs, seg_rxs): (
+                Vec<crossbeam_channel::Sender<ReadMsg>>,
+                Vec<crossbeam_channel::Receiver<ReadMsg>>,
+            ) = (0..n_samples)
+                .map(|_| crossbeam_channel::bounded::<ReadMsg>(READ_QUEUE_DEPTH))
+                .unzip();
+            let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+            let mut producer = CohortChunkIntegrator::<BufReader<File>>::new_streaming(
+                seg_rxs,
+                wake_tx,
+                min_alt_obs,
+                target_variants,
+            );
+            let (plan_tx, plan_rx) = crossbeam_channel::bounded::<ChunkPlan>(PLAN_QUEUE_DEPTH);
 
-        // Read stage: owns the readers, walks `schedule` decoding each sample's
-        // light-column segments ahead into the per-sample queues (fanning out
-        // on `producer_pool`) so the fold stage never blocks on decode. Owns
-        // `seg_txs`, so the per-sample queues close when the schedule is drained.
-        let read_handle = scope.spawn(move || -> Result<(), PipelineError> {
-            drive_read_stage(
-                readers,
-                schedule,
-                &seg_txs,
-                &wake_rx,
-                producer_pool,
-                READ_QUEUE_DEPTH,
-            )?;
-            Ok(())
-        });
-
-        // Fold/plan stage on the main thread. It pulls already-decoded segments
-        // from the read stage's per-sample queues and runs `rebuild_fold` on
-        // `producer_pool` (H1: sized independently of the callers) because the
-        // whole loop executes inside `producer_pool.install(...)`. It walks the
-        // same `schedule` the read stage does, in lockstep.
-        let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
-        let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
-        let produce = producer_pool.install(|| -> Result<(), PipelineError> {
-            for (chrom_id, interval) in schedule {
-                let chrom_id = *chrom_id;
-                let mask = dust_mask_for(
-                    &mut dust_fetcher,
-                    chrom_id,
-                    interval,
-                    &args.reference,
-                    &chrom_names,
-                    &chrom_lengths,
-                    args.no_complexity_filter,
-                    cohort.complexity_window,
-                    cohort.complexity_threshold,
-                )?;
-                producer.begin_interval(chrom_id, interval.clone(), mask);
-                loop {
-                    let plan = {
-                        let mut fetch = |start: u32, len: u32| -> Result<Vec<u8>, RefFetchError> {
-                            ref_fetch(
-                                &mut ref_fetcher,
-                                chrom_id,
-                                &args.reference,
-                                &chrom_names,
-                                start,
-                                len,
-                            )
-                        };
-                        producer.plan_chunk(&mut fetch)?
-                    };
-                    let Some(plan) = plan else { break };
-                    if plan_tx.send(plan).is_err() {
-                        // Compact stage gone (errored); stop. The real error
-                        // surfaces from its join below.
-                        return Ok(());
+            // Compact stage: inflate each plan'd chunk's heavy columns (fanning
+            // out across the N samples on `producer_pool`) and forward the
+            // cohort chunk. Owns `chunk_tx`, so the caller queue closes when the
+            // plan queue drains.
+            let compact_handle = scope.spawn(move || -> Result<(), PipelineError> {
+                for plan in plan_rx {
+                    let chunk = producer_pool.install(|| compact_plan(plan, cache_straddlers))?;
+                    if chunk_tx.send(chunk).is_err() {
+                        break; // callers gone; real error surfaces on join
                     }
                 }
-            }
-            Ok(())
-        });
-        // Signal the compact stage there are no more plans.
-        drop(plan_tx);
-        // Drop the fold stage's read-queue receivers + wake sender (held in
-        // `producer`) now the fold loop is done. This releases the read stage if
-        // it is parked on `wake` or blocked sending into a full queue — whether
-        // the loop finished normally or returned early on a downstream error —
-        // so its join below can't hang.
-        drop(producer);
+                Ok(())
+            });
 
-        // First error wins across the fold/plan stage, compact stage, callers,
-        // and writer; otherwise return the writer's run stats.
-        //
-        // The `.join().expect(...)` re-raises a worker-thread panic on this
-        // (the scope-owning) thread. A worker panic is treated as
-        // fatal-by-design: it is a bug, not a recoverable run error. It does
-        // not deadlock — a panicking thread unwinds and drops its channel-handle
-        // clones, so the surviving threads observe channel close, drain, and
-        // join (`scope` then completes). `join()` only returns `Err` on panic.
-        let mut first_err = produce.err();
-        if let Err(e) = read_handle.join().expect("read thread panicked") {
-            first_err.get_or_insert(e);
-        }
-        if let Err(e) = compact_handle.join().expect("compact thread panicked") {
-            first_err.get_or_insert(e);
-        }
+            // Read stage: owns the readers, walks `schedule` decoding ahead into
+            // the per-sample queues. Owns `seg_txs`, so they close when drained.
+            let read_handle = scope.spawn(move || -> Result<(), PipelineError> {
+                drive_read_stage(
+                    readers,
+                    schedule,
+                    &seg_txs,
+                    &wake_rx,
+                    producer_pool,
+                    READ_QUEUE_DEPTH,
+                )?;
+                Ok(())
+            });
+
+            // Fold/plan stage on the main thread (its `rebuild_fold` runs on
+            // `producer_pool` because the whole loop is inside `install`).
+            let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
+            let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
+            let produce = producer_pool.install(|| -> Result<(), PipelineError> {
+                for (chrom_id, interval) in schedule {
+                    let chrom_id = *chrom_id;
+                    let mask = dust_mask_for(
+                        &mut dust_fetcher,
+                        chrom_id,
+                        interval,
+                        &args.reference,
+                        &chrom_names,
+                        &chrom_lengths,
+                        args.no_complexity_filter,
+                        cohort.complexity_window,
+                        cohort.complexity_threshold,
+                    )?;
+                    producer.begin_interval(chrom_id, interval.clone(), mask);
+                    loop {
+                        let plan = {
+                            let mut fetch =
+                                |start: u32, len: u32| -> Result<Vec<u8>, RefFetchError> {
+                                    ref_fetch(
+                                        &mut ref_fetcher,
+                                        chrom_id,
+                                        &args.reference,
+                                        &chrom_names,
+                                        start,
+                                        len,
+                                    )
+                                };
+                            producer.plan_chunk(&mut fetch)?
+                        };
+                        let Some(plan) = plan else { break };
+                        if plan_tx.send(plan).is_err() {
+                            return Ok(()); // compact stage gone; error on join
+                        }
+                    }
+                }
+                Ok(())
+            });
+            // Close the plan queue; drop `producer` (holds the read-queue
+            // receivers + wake sender) so the read stage is released even if it
+            // is parked on `wake` or blocked sending — no hang on join.
+            drop(plan_tx);
+            drop(producer);
+
+            let mut e = produce.err();
+            if let Err(x) = read_handle.join().expect("read thread panicked") {
+                e.get_or_insert(x);
+            }
+            if let Err(x) = compact_handle.join().expect("compact thread panicked") {
+                e.get_or_insert(x);
+            }
+            e
+        } else {
+            // INLINE: one producer on the main thread — decode + fold + compact
+            // in a single loop, shipping straight to the callers. No read /
+            // compact stage threads (their coordination loses at low thread
+            // counts). `produce_chunk` math, just without the stage queues.
+            let mut producer = CohortChunkIntegrator::new(readers, min_alt_obs, target_variants);
+            let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
+            let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
+            let produce = producer_pool.install(|| -> Result<(), PipelineError> {
+                for (chrom_id, interval) in schedule {
+                    let chrom_id = *chrom_id;
+                    let mask = dust_mask_for(
+                        &mut dust_fetcher,
+                        chrom_id,
+                        interval,
+                        &args.reference,
+                        &chrom_names,
+                        &chrom_lengths,
+                        args.no_complexity_filter,
+                        cohort.complexity_window,
+                        cohort.complexity_threshold,
+                    )?;
+                    producer.begin_interval(chrom_id, interval.clone(), mask);
+                    loop {
+                        let plan = {
+                            let mut fetch =
+                                |start: u32, len: u32| -> Result<Vec<u8>, RefFetchError> {
+                                    ref_fetch(
+                                        &mut ref_fetcher,
+                                        chrom_id,
+                                        &args.reference,
+                                        &chrom_names,
+                                        start,
+                                        len,
+                                    )
+                                };
+                            producer.plan_chunk(&mut fetch)?
+                        };
+                        let Some(plan) = plan else { break };
+                        let chunk = compact_plan(plan, cache_straddlers)?;
+                        if chunk_tx.send(chunk).is_err() {
+                            return Ok(()); // callers gone; error on join
+                        }
+                    }
+                }
+                Ok(())
+            });
+            drop(chunk_tx); // close the caller queue
+            produce.err()
+        };
+
+        // First error wins across the producer side, callers, and writer;
+        // otherwise return the writer's run stats. `.join().expect(...)`
+        // re-raises a worker-thread panic here (fatal-by-design); it cannot
+        // deadlock (a panicking thread drops its channel handles, so the rest
+        // observe close, drain, and join). `join()` only returns `Err` on panic.
         for handle in caller_handles {
             if let Err(e) = handle.join().expect("caller thread panicked") {
                 first_err.get_or_insert(e);
