@@ -743,7 +743,9 @@ impl TwoPhaseSegment {
                 &mut co,
             )?;
             match col {
-                Some(DecodedColumn::AlleleQSumLog(v)) => extend_kept(&mut scalar.q_sum, &v, &ranges),
+                Some(DecodedColumn::AlleleQSumLog(v)) => {
+                    extend_kept(&mut scalar.q_sum, &v, &ranges)
+                }
                 Some(DecodedColumn::AlleleFwdCount(v)) => extend_kept(&mut scalar.fwd, &v, &ranges),
                 Some(DecodedColumn::AllelePlacedLeftCount(v)) => {
                     extend_kept(&mut scalar.placed_left, &v, &ranges)
