@@ -59,11 +59,13 @@ Skills and agents are instructed to leave it untouched.
 >   Minors Mi2/Mi3/Mi7/Mi8/Mi10/Mi11; M5/M8 targeted tests (writer reorder +
 >   `MissingChunks` + `emit_or_drop` counters, `overlapping_groups`,
 >   `CohortSpanFold` reduce-order, `restrict_intervals_to_regions`,
->   `RefSpan::slice` precondition). All gates green (1018 lib + integration
->   tests). **M2 deferred** (the `pub(crate)` demotion unmasks ~15 dead/test-only
->   items — needs the dead-code cleanup the prior M8 named as a prerequisite);
->   plus the harder M8 leftovers (`StalledCut` / `compact_samples` straddler /
->   `dust_mask_for_interval` sub-span / a multi-thread e2e byte-identity test).
+>   `RefSpan::slice` precondition); and **M2** — demote the 5 internal modules
+>   to `pub(crate)` + the dead-code cleanup it unmasks (delete fully-dead
+>   `is_empty`/`clear`; `#[cfg(test)]`-gate the eager-decode oracle the prior M8
+>   named as a prerequisite). All gates green (1021 lib + integration tests).
+>   Still open (harder, deferred): the M8 leftovers — `StalledCut` /
+>   `compact_samples` straddler / `dust_mask_for_interval` sub-span paths and a
+>   multi-thread end-to-end byte-identity test.
 > - **Previous task (2026-06-07):** **Worked through the perf-review
 >   findings on `re-architect`, then merged the branch into `main`.** Built the
 >   missing committed cohort end-to-end bench
@@ -1299,16 +1301,18 @@ via rayon.
   - **Nits** — single mechanical pass to clear the 16 in-scope clippy errors (`single_range_in_vec_init` ×8, `type_complexity` ×4, `bool_assert_comparison` ×2, `doc_lazy_continuation` ×2) plus add per-call-site justification comments to the 14 `#[allow(...)]` annotations (12 `clippy::too_many_arguments` + `clippy::arc_with_non_send_sync` + `clippy::needless_range_loop`).
 
 #### Re-architected record-streaming pipeline (replaces the chunk-parallel rewrite)
-- **Status:** fixes-applied (2026-06-08) — most of the 2026-06-08 review
-  applied on branch `var-calling-review-fixes` (4 commits: M1/M4/M6/Mi6
-  deletions+move; M3 typed errors; Mi4 rename + M7/Q1 doc sweep + Minors;
-  M5/M8 tests). **M2 deferred** (demoting modules to `pub(crate)` unmasks ~15
-  dead/test-only items — the dead-code cleanup the prior M8 flagged as a
-  prerequisite; needs its own pass). All gates green (fmt / clippy
-  `-D warnings` / `doc`; 1018 lib + integration tests). Open questions resolved
-  with the PM: P7-swap doc debt resolved now (Q1), dead code deleted (Q2),
-  cheap in-tree tests added over out-of-tree oracle (Q3), `pub(crate)` demotion
-  wanted but deferred behind the cleanup (Q4). Prior: reviewed (2026-06-08) —
+- **Status:** fixes-applied (2026-06-08) — the 2026-06-08 review applied on
+  branch `var-calling-review-fixes` (6 commits: M1/M4/M6/Mi6 deletions+move; M3
+  typed errors; Mi4 rename + M7/Q1 doc sweep + Minors; M5/M8 tests; **M2**
+  `pub(crate)` demotion + the dead-code cleanup it unmasks — delete fully-dead
+  `is_empty`/`clear`, `#[cfg(test)]`-gate the eager-decode oracle the prior M8
+  named as a prerequisite). All gates green (fmt / clippy `-D warnings` / `doc`;
+  1021 lib + integration tests). Open questions resolved with the PM: P7-swap
+  doc debt resolved now (Q1), dead code deleted (Q2), cheap in-tree tests over
+  the out-of-tree oracle (Q3), modules demoted to `pub(crate)` (Q4). Deferred:
+  the harder M8 leftovers (`StalledCut` / `compact_samples` straddler /
+  `dust_mask_for_interval` sub-span paths + a multi-thread e2e byte-identity
+  test). Prior: reviewed (2026-06-08) —
   re-reviewed on `main` post-merge (subtree review excluding `posterior_engine`;
   verdict Approve-with-changes, 0 Blockers / 8 Major / 13 Minor; see Latest
   review). Prior: fixes-applied
