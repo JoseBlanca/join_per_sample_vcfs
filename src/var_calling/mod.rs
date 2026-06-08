@@ -43,7 +43,7 @@ pub mod per_position_merger;
 pub mod posterior_engine;
 pub mod variant_grouping;
 
-// --- Rebuilt structure (Phases 1–4) ---
+// --- Rebuilt structure ---
 pub mod cohort_integration;
 pub mod em_posterior_calc;
 pub mod pileup_overlaps;

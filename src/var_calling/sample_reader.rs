@@ -377,11 +377,6 @@ impl SamplePspChunk {
         }))
     }
 
-    /// Chromosome id of every record in this chunk.
-    pub fn chrom_id(&self) -> u32 {
-        self.chrom_id
-    }
-
     /// Number of (region-clamped) records.
     pub fn len(&self) -> usize {
         self.positions.len()
@@ -417,7 +412,7 @@ impl SamplePspChunk {
     }
 
     /// An empty chunk for `chrom_id`, ready to accumulate compacted records
-    /// via [`append_kept`](Self::append_kept).
+    /// via [`append_range`](Self::append_range).
     ///
     /// Used by the producer to gather a chunk's variable rows (across the
     /// sample's buffered segments) into one columnar object shipped to the
@@ -435,29 +430,6 @@ impl SamplePspChunk {
             scalar: AlleleScalarColumns::default(),
             seq: AlleleSeqColumns::empty(),
             chain_ids: AlleleChainIdColumns::empty(),
-        }
-    }
-
-    /// Append `src`'s `keep`-selected records onto `self` — a **non-consuming
-    /// compacting gather** (bulk column copies via `extend_from_range`, *not*
-    /// the per-allele heap allocation of [`records_for`](Self::records_for)).
-    /// Copies each kept row's position + heavy columns and extends the CSR
-    /// record→allele offsets. `keep.len()` must equal `src.len()`; `src` is
-    /// left intact so a segment straddling a chunk cut survives in the buffer.
-    pub fn append_kept(&mut self, src: &SamplePspChunk, keep: &[bool]) {
-        debug_assert_eq!(keep.len(), src.len(), "keep mask must cover every record");
-        for (r, &k) in keep.iter().enumerate() {
-            if !k {
-                continue;
-            }
-            let lo = src.allele_offsets[r] as usize;
-            let hi = src.allele_offsets[r + 1] as usize;
-            self.positions.push(src.positions[r]);
-            self.scalar.extend_from_range(&src.scalar, lo..hi);
-            self.seq.extend_from_range(&src.seq, lo..hi);
-            self.chain_ids.extend_from_range(&src.chain_ids, lo..hi);
-            let cum = self.allele_offsets.last().copied().unwrap_or(0) + (hi - lo) as u32;
-            self.allele_offsets.push(cum);
         }
     }
 

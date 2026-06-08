@@ -27,17 +27,18 @@
 //!
 //! Phase 3 builds the `VariantCaller` worker here.
 
-use crate::pileup_record::AlleleSupportStats;
-use crate::var_calling::cohort_integration::merge_compacted_samples;
+use crate::pileup_record::{AlleleSupportStats, PileupRecord};
+use crate::psp::PspReadError;
 use crate::var_calling::per_group_merger::{
     MergeGroupOutcome, MergedRecord, PerGroupMergerConfig, PerGroupMergerError,
     build_genotype_tables, merge_group_with_ref,
 };
-use crate::var_calling::per_position_merger::PerPositionMergerError;
+use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
 use crate::var_calling::pileup_overlaps::overlapping_groups;
 use crate::var_calling::posterior_engine::{
     PosteriorEngine, PosteriorEngineConfig, PosteriorEngineError,
 };
+use crate::var_calling::sample_reader::SamplePspChunk;
 use crate::var_calling::types::{
     CallStats, CalledChunk, CohortPileupRecord, RawCohortChunk, RefSpan, Variant,
 };
@@ -59,6 +60,54 @@ pub enum CallerError {
     /// The per-position merge (columns→records, moved onto the caller) failed.
     #[error("per-position merge failed: {0}")]
     PerPosition(#[from] PerPositionMergerError),
+}
+
+/// Wrap an owned [`PileupRecord`] as the `Result` item the
+/// [`PerPositionMerger`] consumes. A named `fn` (not a closure) so every
+/// per-sample iterator has the *same* type and they collect into a `Vec<I>`.
+pub(crate) fn ok_record(r: PileupRecord) -> Result<PileupRecord, PspReadError> {
+    Ok(r)
+}
+
+pub(crate) type KeptRecordIter = std::iter::Map<
+    std::vec::IntoIter<PileupRecord>,
+    fn(PileupRecord) -> Result<PileupRecord, PspReadError>,
+>;
+
+/// Reconstruct a chunk's [`CohortPileupRecord`]s from the per-sample compacted
+/// columns — the columns→records conversion + per-position merge the caller
+/// runs before grouping (the record-building lever runs here, off the single
+/// producer thread).
+///
+/// Reuses the byte-identity-critical [`PerPositionMerger`] verbatim; the
+/// per-sample [`records_all`](SamplePspChunk::records_all) feeds it exactly
+/// the records the producer's compacted columns hold, in the same sample and
+/// position order, so the merged output is identical to a producer-side merge.
+/// `sample_names` is merger metadata only (diagnostics) — any cohort-length
+/// list yields identical records.
+pub(crate) fn merge_compacted_samples(
+    per_sample: &[SamplePspChunk],
+    sample_names: &[String],
+) -> Result<Vec<CohortPileupRecord>, PerPositionMergerError> {
+    let iters: Vec<KeptRecordIter> = per_sample
+        .iter()
+        .map(|c| {
+            c.records_all()
+                .into_iter()
+                .map(ok_record as fn(PileupRecord) -> Result<PileupRecord, PspReadError>)
+        })
+        .collect();
+    let merger = PerPositionMerger::new(iters, sample_names.to_vec(), Vec::new())?;
+    let mut records = Vec::new();
+    for item in merger {
+        let pp = item?;
+        records.push(CohortPileupRecord {
+            chrom_id: pp.chrom_id,
+            pos: pp.pos,
+            per_sample: pp.per_sample,
+        });
+    }
+    Ok(records)
 }
 
 /// Section 2 — the cohort variant caller (appendix §D). One per worker thread;

@@ -351,12 +351,10 @@ fn membership_mask(needles: &[u32], haystack: &[u32]) -> Vec<bool> {
 // 2b — the streaming integrator (single covered interval)
 // ===========================================================================
 
-use crate::pileup_record::PileupRecord;
 use crate::psp::PspReadError;
 use crate::psp::block::new_column_decompressor;
-use crate::var_calling::per_position_merger::{PerPositionMerger, PerPositionMergerError};
 use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader, TwoPhaseSegment};
-use crate::var_calling::types::{CohortPileupRecord, RawCohortChunk, RefSpan};
+use crate::var_calling::types::{RawCohortChunk, RefSpan};
 use std::io::{Read, Seek};
 
 /// Boxed error type the producer's REF-fetch closure yields. Boxing keeps
@@ -382,13 +380,6 @@ pub enum ProducerError {
     /// progress invariant (previously a `debug_assert!`).
     #[error("chunk cut {cut} did not advance past next_chunk_start {next_chunk_start}")]
     StalledCut { next_chunk_start: u32, cut: u32 },
-}
-
-/// Wrap an owned [`PileupRecord`] as the `Result` item the
-/// [`PerPositionMerger`] consumes. A named `fn` (not a closure) so every
-/// per-sample iterator has the *same* type and they collect into a `Vec<I>`.
-fn ok_record(r: PileupRecord) -> Result<PileupRecord, PspReadError> {
-    Ok(r)
 }
 
 /// Merge per-block `(first_pos, last_pos)` ranges (across all samples, any
@@ -418,46 +409,6 @@ fn merge_block_ranges(
     }
     out.push(cur_start..cur_last.saturating_add(1));
     out
-}
-
-type KeptRecordIter = std::iter::Map<
-    std::vec::IntoIter<PileupRecord>,
-    fn(PileupRecord) -> Result<PileupRecord, PspReadError>,
->;
-
-/// Reconstruct the chunk's [`CohortPileupRecord`]s from the per-sample
-/// compacted columns — the columns→records conversion + per-position merge
-/// the record-building lever moved from the producer onto the **caller**.
-///
-/// Reuses the byte-identity-critical [`PerPositionMerger`] verbatim; the
-/// per-sample [`records_all`](SamplePspChunk::records_all) feeds it exactly
-/// the records the producer's old `records_for` produced, in the same sample
-/// and position order, so the merged output is identical to the producer-side
-/// merge it replaces. `sample_names` is merger metadata only (diagnostics) —
-/// any cohort-length list yields identical records.
-pub fn merge_compacted_samples(
-    per_sample: &[SamplePspChunk],
-    sample_names: &[String],
-) -> Result<Vec<CohortPileupRecord>, PerPositionMergerError> {
-    let iters: Vec<KeptRecordIter> = per_sample
-        .iter()
-        .map(|c| {
-            c.records_all()
-                .into_iter()
-                .map(ok_record as fn(PileupRecord) -> Result<PileupRecord, PspReadError>)
-        })
-        .collect();
-    let merger = PerPositionMerger::new(iters, sample_names.to_vec(), Vec::new())?;
-    let mut records = Vec::new();
-    for item in merger {
-        let pp = item?;
-        records.push(CohortPileupRecord {
-            chrom_id: pp.chrom_id,
-            pos: pp.pos,
-            per_sample: pp.per_sample,
-        });
-    }
-    Ok(records)
 }
 
 /// A finalised buffered segment: full-block light columns (the fold still reads
@@ -1183,6 +1134,12 @@ mod tests {
     use crate::psp::PspReader;
     use crate::psp::test_fixtures::writer_header;
     use crate::psp::writer::PspWriter;
+    // The columns→records rebuild helpers now live on the caller; the producer's
+    // tests reuse them to reconstruct the cohort records a caller would build.
+    use crate::var_calling::em_posterior_calc::{
+        KeptRecordIter, merge_compacted_samples, ok_record,
+    };
+    use crate::var_calling::per_position_merger::PerPositionMerger;
     use crate::var_calling::sample_reader::SamplePspReader;
     use crate::var_calling::test_helpers::{allele, record};
     use crate::var_calling::types::CohortPileupRecord;

@@ -7,8 +7,9 @@
 //! - [`CohortPileupRecord`] — one variable cohort position with every
 //!   sample's pileup data at it (the producer's emit unit, the grouper's
 //!   input). Revived from `per_position_merger::PerPositionPileups`.
-//! - [`PileupCohortChunk`] — the producer→caller work-unit: a safe-gap-bounded
-//!   list of [`CohortPileupRecord`]s + its [`RefSpan`], tagged `chunk_order`.
+//! - [`RawCohortChunk`] — the producer→caller work-unit: a safe-gap-bounded
+//!   per-sample columnar slice (`SamplePspChunk`s) + its [`RefSpan`], tagged
+//!   `chunk_order`; the caller rebuilds the [`CohortPileupRecord`]s from it.
 //! - [`RefSpan`] — the chunk's contiguous REF bytes, fetched once on the
 //!   producer (monotonic-forward) and sliced per group by the caller.
 //! - [`Variant`] — the final emitted record (today's `PosteriorRecord`).
@@ -62,13 +63,6 @@ pub struct RefSpan {
 }
 
 impl RefSpan {
-    /// An empty span — a placeholder for buffer recycling (the producer
-    /// refills `genomic_start` + `bytes` before shipping). Slicing an empty
-    /// span panics, by design: it must be refilled first.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
     /// The REF bases over the 1-based **inclusive** span
     /// `[group_start, group_end]` — exactly the per-group REF slice the
     /// caller's allele unification reads, with no padding (matching the old
@@ -93,22 +87,6 @@ impl RefSpan {
 /// The producer→caller **work-unit** (appendix §C, `[NEW]` — replaces the
 /// columnar `MaterialisedChunk`).
 ///
-/// A list of [`CohortPileupRecord`]s for one safe-gap-bounded span, plus the
-/// span's [`RefSpan`], tagged with a monotonic `chunk_order` the producer
-/// stamps in genomic order (the ticket the writer reorders on). "Chunk" =
-/// one ordered piece of parallel work; its contents are **records**, so the
-/// caller groups them without first splitting a columnar block.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PileupCohortChunk {
-    /// Monotonic, genomic-order production index stamped by the producer.
-    pub chunk_order: u64,
-    pub records: Vec<CohortPileupRecord>,
-    pub ref_span: RefSpan,
-}
-
-/// The producer→caller **work-unit**, columnar variant (the record-building
-/// lever).
-///
 /// Carries, per sample, a [`SamplePspChunk`] **compacted to this chunk's
 /// variable rows only** (positions the cohort fold kept, dust applied) — the
 /// columnar form, *not* yet rebuilt into [`PileupRecord`]s. The expensive
@@ -123,7 +101,7 @@ pub struct PileupCohortChunk {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawCohortChunk {
     /// Monotonic, genomic-order production index stamped by the producer
-    /// (the writer's reorder ticket — same role as in [`PileupCohortChunk`]).
+    /// (the writer's reorder ticket).
     pub chunk_order: u64,
     /// Per sample, in cohort sample order: the chunk's variable rows in
     /// columnar form, ready for [`SamplePspChunk::records_all`].
@@ -170,7 +148,7 @@ pub struct CallStats {
 /// allocate, and the writer treats it uniformly).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CalledChunk {
-    /// Carried through untouched from the source [`PileupCohortChunk`].
+    /// Carried through untouched from the source [`RawCohortChunk`].
     pub chunk_order: u64,
     pub records: Vec<Variant>,
     pub stats: CallStats,
@@ -217,8 +195,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_ref_span_is_zeroed() {
-        let e = RefSpan::empty();
+    fn default_ref_span_is_zeroed() {
+        let e = RefSpan::default();
         assert_eq!(e.genomic_start, 0);
         assert!(e.bytes.is_empty());
     }
