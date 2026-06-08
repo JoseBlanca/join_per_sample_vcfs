@@ -1,7 +1,5 @@
 //! Cohort producer — section 1 (appendix §B).
 //!
-//! *(today: `var_calling::driver` `BlockIterator`, `two_pass`, `loader`)*
-//!
 //! `CohortChunkIntegrator` owns the N `SamplePspReader`s, the `DustAheadPool`,
 //! and the REF fetcher. It **streams `CohortPileupRecord`s, sliced into chunks
 //! at safe gaps** (the producer algorithm, §2.2):
@@ -24,30 +22,26 @@
 //! [`per_position_merger`](crate::var_calling::per_position_merger), here
 //! in the producer.
 //!
-//! Phase 2 builds this module, in two steps:
-//! - **2a** ([`CohortSpanFold`]): the cohort keep/cut math — the revived
-//!   `two_pass::WindowSummary`, folding over the reader's *light* columns
-//!   ([`SamplePspChunk`]
-//!   `positions`/`ref_spans`/`nonref_obs`) instead of a `SampleColumns`.
-//!   Plus [`drop_dust_masked`], the dust step. Byte-identity-critical, so the
-//!   arithmetic is copied verbatim from `two_pass.rs`.
-//! - **2b** ([`CohortChunkIntegrator`]): the streaming integrator over **one
-//!   covered interval** — segment buffering to the watermark, per-position
-//!   record building (columnar→record via
-//!   [`SamplePspChunk::records_for`],
-//!   merged by the revived [`PerPositionMerger`]),
-//!   safe-gap cut, REF fetch (closure-injected), `chunk_order` stamping.
-//!   The chromosome / interval iteration, per-chromosome REF fetcher, and
-//!   `DustAheadPool` wiring are the next step (2b-wiring); `produce_chunk`
-//!   takes the REF fetch as a closure and the dust mask per
+//! Two parts:
+//! - [`CohortSpanFold`]: the cohort keep/cut math, folding over the reader's
+//!   *light* columns ([`SamplePspChunk`]
+//!   `positions`/`ref_spans`/`nonref_obs`). Plus [`drop_dust_masked`], the dust
+//!   step. Byte-identity-critical: the arithmetic is byte-for-byte the
+//!   pre-rewrite cohort keep/cut (verified out-of-tree).
+//! - [`CohortChunkIntegrator`]: the streaming integrator over **one covered
+//!   interval** — segment buffering to the watermark, safe-gap cut, REF fetch
+//!   (closure-injected), `chunk_order` stamping. `produce_chunk` takes the REF
+//!   fetch as a closure and the dust mask per
 //!   [`begin_interval`](CohortChunkIntegrator::begin_interval) so the engine
-//!   stays decoupled and unit-testable.
+//!   stays decoupled and unit-testable. The columns→records rebuild + the
+//!   per-position merge run on the **caller**
+//!   ([`merge_compacted_samples`](crate::var_calling::variant_caller::merge_compacted_samples)).
 
 use std::ops::Range;
 
 /// Reach of a position given its (max) ref span — `pos + max(span, 1) - 1`,
-/// saturating. Copied from `two_pass::reach`; the grouping arithmetic must
-/// match byte-for-byte.
+/// saturating. Byte-for-byte the pre-rewrite grouping `reach` (the grouping
+/// arithmetic must match exactly; verified out-of-tree).
 #[inline]
 fn reach(pos: u32, span: u32) -> u32 {
     pos.saturating_add(span.max(1)).saturating_sub(1)
@@ -175,7 +169,7 @@ impl CohortSpanFold {
     /// folded in (masked positions still contribute obs+reach to the group
     /// decision) and dropped afterward by [`drop_dust_masked`], matching the
     /// old `is_kept` (pre-dust) → materialise → partition-skips-masked order.
-    /// Copied verbatim from `WindowSummary::derive_is_kept`.
+    /// Byte-for-byte the pre-rewrite cohort keep rule (verified out-of-tree).
     pub fn derive_is_kept(&self, min_alt_obs: u32, out: &mut Vec<bool>) {
         let n = self.positions.len();
         out.clear();
@@ -200,8 +194,8 @@ impl CohortSpanFold {
     }
 
     /// Merge another fold into `self` (`max` aggregation, position union) —
-    /// the reduce step for a parallel per-sample fold. Copied from
-    /// `WindowSummary::merge`.
+    /// the reduce step for a parallel per-sample fold (associative +
+    /// commutative, so the reduce is order-independent).
     pub fn merge(&mut self, other: &CohortSpanFold) {
         self.tmp_positions.clear();
         self.tmp_max_ref_span.clear();
@@ -243,8 +237,8 @@ impl CohortSpanFold {
     }
 
     /// The clean group boundary at or before `watermark`: the start of the
-    /// still-open group, or `watermark + 1` if every group is closed. Copied
-    /// from `WindowSummary::find_cut` / `loader::find_block_cut`.
+    /// still-open group, or `watermark + 1` if every group is closed.
+    /// Byte-for-byte the pre-rewrite safe-gap cut (verified out-of-tree).
     pub fn find_cut(&self, watermark: u32) -> u32 {
         let n = self.positions.len();
         if n == 0 {
@@ -271,9 +265,8 @@ impl CohortSpanFold {
     /// Count kept (variable) positions with `position < cut`, by the same
     /// group/threshold rule as [`derive_is_kept`](Self::derive_is_kept).
     /// `cut` should land on a clean group boundary (e.g. from
-    /// [`find_cut`](Self::find_cut)) so no group straddles it. Copied from
-    /// `WindowSummary::count_kept_below`. Used by the read-ahead to size a
-    /// chunk to ~`target_variants` kept positions.
+    /// [`find_cut`](Self::find_cut)) so no group straddles it. Used by the
+    /// read-ahead to size a chunk to ~`target_variants` kept positions.
     pub fn count_kept_below(&self, cut: u32, min_alt_obs: u32) -> u32 {
         let n = self.positions.len();
         let threshold = u64::from(min_alt_obs.max(1));
@@ -386,7 +379,7 @@ pub enum ProducerError {
 /// order) into the chromosome's **covered intervals** `[start, end)`: two
 /// blocks join unless the gap between them exceeds `max_group_span`, so every
 /// interval boundary is a safe gap no variant group can span — the producer
-/// processes each interval independently. Copied from `driver::merge_block_ranges`.
+/// processes each interval independently.
 fn merge_block_ranges(
     ranges: impl IntoIterator<Item = (u32, u32)>,
     max_group_span: u32,
@@ -513,20 +506,19 @@ impl BufferedSegment {
 /// Owns the N [`SamplePspReader`]s. [`begin_interval`](Self::begin_interval)
 /// points them at a `[start, end)` interval (+ its dust mask);
 /// [`produce_chunk`](Self::produce_chunk) then yields one
-/// [`RawCohortChunk`] (the chunk's variable rows in columnar per-sample form,
-/// rebuilt into [`CohortPileupRecord`]s on the caller) at a time, cut at
-/// safe gaps, until the interval is drained (`Ok(None)`). The chromosome /
-/// interval iteration, per-chromosome REF fetcher, and dust computation are
-/// the wiring layer (Phase 2b-wiring); `produce_chunk` takes the REF fetch as
-/// a closure so it stays decoupled and unit-testable.
+/// [`RawCohortChunk`] (the chunk's variable rows in columnar per-sample form)
+/// at a time, cut at safe gaps, until the interval is drained (`Ok(None)`).
+/// `produce_chunk` takes the REF fetch as a closure so it stays decoupled and
+/// unit-testable.
 ///
 /// Per chunk: lockstep-read segments to the watermark → fold the **light**
-/// columns → `derive_is_kept` → drop dust → cut at a safe gap → build records
-/// (columnar→record via [`SamplePspChunk::records_for`], merged per-position
-/// by the revived [`PerPositionMerger`]) → fetch the REF span → stamp
-/// `chunk_order`. Only the variable positions are ever built (the memory
-/// invariant); buffered columnar segments straddling a cut survive to the next
-/// chunk (records_for is non-consuming).
+/// columns → `derive_is_kept` → drop dust → cut at a safe gap → compact each
+/// sample's variable rows → fetch the REF span → stamp `chunk_order`. Only the
+/// variable positions are ever compacted (the memory invariant); buffered
+/// columnar segments straddling a cut survive to the next chunk. The
+/// columns→records rebuild + per-position merge run on the **caller**
+/// ([`merge_compacted_samples`](crate::var_calling::variant_caller::merge_compacted_samples)),
+/// not here.
 pub struct CohortChunkIntegrator<R: Read + Seek> {
     readers: Vec<SamplePspReader<R>>,
     n: usize,
@@ -922,6 +914,8 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                         continue;
                     }
                     let dz = decompressor.get_or_insert_with(|| {
+                        // PANIC-FREE: `zstd::bulk::Decompressor::new` is
+                        // infallible on every supported platform.
                         new_column_decompressor().expect(
                             "zstd::bulk::Decompressor::new is infallible on supported platforms",
                         )
@@ -965,6 +959,9 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         let spans = self.fold.max_ref_span();
         let mut max_reach = first;
         for &p in variable {
+            // PANIC-FREE: every `variable` position is drawn from
+            // `self.fold.positions()` (filtered by `is_kept`), so it is always
+            // present in the fold.
             let idx = positions
                 .binary_search(&p)
                 .expect("variable position must be in the fold");
@@ -1136,13 +1133,11 @@ mod tests {
     use crate::psp::writer::PspWriter;
     // The columns→records rebuild helpers now live on the caller; the producer's
     // tests reuse them to reconstruct the cohort records a caller would build.
-    use crate::var_calling::em_posterior_calc::{
-        KeptRecordIter, merge_compacted_samples, ok_record,
-    };
     use crate::var_calling::per_position_merger::PerPositionMerger;
     use crate::var_calling::sample_reader::SamplePspReader;
     use crate::var_calling::test_helpers::{allele, record};
     use crate::var_calling::types::CohortPileupRecord;
+    use crate::var_calling::variant_caller::{KeptRecordIter, merge_compacted_samples, ok_record};
     use std::io::Cursor;
 
     const INTERVAL_END: u32 = 4000;

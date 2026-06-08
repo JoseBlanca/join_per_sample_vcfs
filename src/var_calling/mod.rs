@@ -1,41 +1,41 @@
-//! Re-architected cohort `.psp` → VCF pipeline (parallel build package).
+//! Cohort `.psp` → multi-sample VCF pipeline (the production record-streaming
+//! topology).
 //!
-//! This is the **`var_calling::`** package from the re-architecture plan —
-//! built alongside the shipping [`var_calling`](crate::var_calling) until the
-//! one-commit swap (execution-plan §P7). The design docs:
+//! The runtime is a three-section parallel pipeline — producer
+//! ([`cohort_integration`]) → caller ([`variant_caller`]) → writer
+//! ([`vcf_writer`]) — wired by [`pipeline`] with two bounded crossbeam
+//! channels inside a `std::thread::scope`. The output is byte-identical for
+//! any worker count.
 //!
-//! - `doc/devel/implementation_plans/re_architecture_streaming_pipeline.md` —
-//!   the architecture, constraints, build strategy;
-//! - `doc/devel/implementation_plans/re_architecture_module_outline.md` —
-//!   the module/type map (the names below are its **target** names);
-//! - `doc/devel/implementation_plans/re_architecture_execution_plan.md` —
-//!   the ordered, byte-identity-gated phases.
+//! The architecture and its design rationale are documented in the
+//! re-architecture plans under `doc/devel/implementation_plans/`
+//! (`re_architecture_streaming_pipeline.md`, `re_architecture_module_outline.md`,
+//! `re_architecture_execution_plan.md`).
 //!
-//! ## Structure (rebuilt) vs kernels (copied verbatim)
+//! ## Structure modules vs numeric kernels
 //!
-//! The pipeline structure is rebuilt from scratch; the byte-identity-sensitive
-//! numeric kernels are **copied verbatim** from [`var_calling`](crate::var_calling)
-//! (plan §7 / principle 2):
+//! Two groups of modules:
 //!
-//! - **Rebuilt** (Phases 1–4): [`types`], [`sample_reader`],
-//!   [`cohort_integration`], [`pileup_overlaps`], [`em_posterior_calc`]
-//!   (the `VariantCaller` worker), [`vcf_writer`], [`pipeline`].
-//! - **Copied verbatim** (the kernels — a closed, columnar-free subset whose
-//!   only outside dependencies are the shared `psp` / `fasta` / `pileup_record`
-//!   crate modules): [`per_group_merger`], [`posterior_engine`],
-//!   [`variant_grouping`], [`per_position_merger`], [`dust_filter`],
-//!   [`contamination_estimation`].
+//! - **Structure** — the producer/caller/writer plumbing and the interchange
+//!   types: [`types`], [`sample_reader`], [`cohort_integration`],
+//!   [`pileup_overlaps`], [`variant_caller`] (the `VariantCaller` worker),
+//!   [`vcf_writer`], [`pipeline`].
+//! - **Numeric kernels** — the byte-identity-sensitive math (a closed,
+//!   columnar-free subset whose only outside dependencies are the shared
+//!   `psp` / `fasta` / `pileup_record` crate modules): [`per_group_merger`],
+//!   [`posterior_engine`], [`variant_grouping`], [`per_position_merger`],
+//!   [`dust_filter`], [`contamination_estimation`]. These carry the
+//!   variant-calling arithmetic byte-for-byte from the pre-rewrite pipeline;
+//!   byte-identity of the emitted VCF is verified out-of-tree (against the
+//!   pre-rewrite pipeline + the GIAB benchmark), so edits to them must hold
+//!   that contract.
 //!
-//! The columnar `kernels/` chain (`unify_alleles_columnar` /
-//! `project_scalars_columnar` / `compute_log_likelihoods_columnar`) and its
-//! `columns.rs` / `partition.rs` / `MaterialisedChunk` dependencies are
-//! deliberately **not** transplanted: the row [`per_group_merger`] already
-//! produces the flat SoA `log_likelihoods` buffer the SIMD EM consumes, and
-//! the closed-form log-likelihood is scalar in both paths — so the record-based
-//! path keeps the SIMD EM with no SIMD loss (appendix §D.2 conditional,
-//! verified against the code in Phase 0).
+//! The row [`per_group_merger`] produces the flat SoA `log_likelihoods` buffer
+//! the SIMD EM consumes directly, and the closed-form log-likelihood is scalar
+//! — so the record-based path runs the SIMD EM with no SIMD loss (no separate
+//! columnar likelihood path is needed).
 
-// --- Copied verbatim from `var_calling` (the numeric kernels) ---
+// --- Numeric kernels (byte-identity-sensitive math) ---
 pub mod contamination_estimation;
 pub mod dust_filter;
 pub mod per_group_merger;
@@ -43,13 +43,13 @@ pub mod per_position_merger;
 pub mod posterior_engine;
 pub mod variant_grouping;
 
-// --- Rebuilt structure ---
+// --- Structure (producer / caller / writer plumbing) ---
 pub mod cohort_integration;
-pub mod em_posterior_calc;
 pub mod pileup_overlaps;
 pub mod pipeline;
 pub mod sample_reader;
 pub mod types;
+pub mod variant_caller;
 pub mod vcf_writer;
 
 /// Default `--min-qual` (phred) emission gate (CLI default).

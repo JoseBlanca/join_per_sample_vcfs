@@ -1,31 +1,22 @@
-//! Caller step 2 — per-group merge + per-record EM (appendix §D.2), plus the
-//! `VariantCaller` worker that composes grouping (§D.1) with the math here.
-//!
-//! *(today: `var_calling::per_group_merger`, `posterior_engine`, `worker`)*
+//! Caller section 2 — the `VariantCaller` worker (appendix §D). Composes
+//! grouping (§D.1) with the per-group merge + per-record EM (§D.2): one
+//! `VariantCaller` per worker thread turns a `RawCohortChunk` into a
+//! `CalledChunk`.
 //!
 //! `OverlappingPileupRecords` → `Vec<Variant>`, one group at a time:
 //!
-//! - per-group merge via the copied
-//!   [`per_group_merger`](crate::var_calling::per_group_merger) — its
-//!   row-shape `MergedRecord` already carries the **flat SoA**
+//! - per-group merge via [`per_group_merger`](crate::var_calling::per_group_merger)
+//!   — its row-shape `MergedRecord` already carries the **flat SoA**
 //!   `log_likelihoods` buffer (`[sample * n_genotypes + g]`), so it feeds the
 //!   SIMD EM directly through `MergedAllelesView` — **no SIMD loss**;
-//! - per-record EM via the copied
-//!   [`posterior_engine`](crate::var_calling::posterior_engine) — the
-//!   `InterpUnivariateSimdMath` lane-of-4 `ln`/`exp` backend, kept verbatim.
+//! - per-record EM via [`posterior_engine`](crate::var_calling::posterior_engine)
+//!   — the `InterpUnivariateSimdMath` lane-of-4 `ln`/`exp` backend.
 //!
-//! > **Design note (verified Phase 0).** The columnar `kernels/` chain
-//! > (`unify_alleles_columnar` / `project_scalars_columnar` /
-//! > `compute_log_likelihoods_columnar`) and its `MaterialisedChunk` /
-//! > `WindowPartition` dependencies are **not** transplanted: they were a
-//! > byte-identical reimplementation of the row `per_group_merger`, whose
-//! > closed-form log-likelihood is scalar in *both* paths (the SIMD is only in
-//! > the EM iteration, which fills its lanes from the flat SoA buffer either
-//! > path produces). This is the design's §D.2 conditional — "row-shape
-//! > `MergedRecord` is fine as long as it hands SoA likelihood buffers to the
-//! > EM" — with its predicate confirmed against the code.
-//!
-//! Phase 3 builds the `VariantCaller` worker here.
+//! > **Design note.** There is no separate columnar likelihood path: the row
+//! > `per_group_merger`'s closed-form log-likelihood is scalar, and the SIMD
+//! > lives only in the EM iteration, which fills its lanes from the flat SoA
+//! > buffer the row merger produces. So the record-based path runs the SIMD EM
+//! > with no SIMD loss.
 
 use crate::pileup_record::{AlleleSupportStats, PileupRecord};
 use crate::psp::PspReadError;
@@ -190,9 +181,9 @@ impl VariantCaller {
             let ref_slice = ref_span.slice(group.start, group.end);
             match merge_group_with_ref(group, ref_slice, &self.merger_cfg, &self.genotype_tables)? {
                 MergeGroupOutcome::Merged(record) => {
-                    // Pre-EM `min_alt_obs_per_sample` filter (matches main's
-                    // columnar `columnar_passes_min_alt_obs`, applied on the
-                    // projected, pre-prune scalars).
+                    // Pre-EM `min_alt_obs_per_sample` filter, applied on the
+                    // projected, pre-prune scalars (byte-identical to the
+                    // pre-rewrite filter; verified out-of-tree).
                     if passes_min_alt_obs(
                         &record.scalars,
                         record.n_samples,
@@ -236,8 +227,8 @@ impl VariantCaller {
 
 /// Pre-EM `min_alt_obs_per_sample` predicate over the projected per-allele
 /// scalars (`[sample * n_alleles + allele]`). Keep the record iff some ALT
-/// column's max `num_obs` across samples reaches `min_obs`. Copied verbatim
-/// from `worker::columnar_passes_min_alt_obs` — the byte-identity filter.
+/// column's max `num_obs` across samples reaches `min_obs`. Byte-identical to
+/// the pre-rewrite filter (verified out-of-tree).
 fn passes_min_alt_obs(
     scalars: &[AlleleSupportStats],
     n_samples: usize,

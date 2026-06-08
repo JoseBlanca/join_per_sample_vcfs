@@ -30,7 +30,6 @@ use crate::regions::{BedError, ContigBounds, Region, RegionSet};
 use crate::var_calling::cohort_integration::{CohortChunkIntegrator, ProducerError, RefFetchError};
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
-use crate::var_calling::em_posterior_calc::{CallerError, VariantCaller};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerConfigError,
 };
@@ -38,12 +37,16 @@ use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chro
 use crate::var_calling::posterior_engine::{PosteriorEngineConfig, PosteriorEngineConfigError};
 use crate::var_calling::sample_reader::SamplePspReader;
 use crate::var_calling::types::{CalledChunk, RawCohortChunk};
+use crate::var_calling::variant_caller::{CallerError, VariantCaller};
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError};
-use crate::var_calling::vcf_writer::{DownstreamFilters, VcfWriter, WriterError, WriterStats};
+use crate::var_calling::vcf_writer::{
+    DownstreamFilters, MapqDiffFilter, VcfWriter, WriterError, WriterStats,
+};
 use crate::vcf::{CohortMetadata, WriterConfig};
 
-/// Open-file buffer size (matches `pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY`).
-const BUFFERED_IO_CAPACITY: usize = 64 * 1024;
+/// Open-file buffer size — the shared default, referenced directly so it can't
+/// drift from the canonical value.
+const BUFFERED_IO_CAPACITY: usize = crate::pop_var_caller::common::DEFAULT_BUFFERED_IO_CAPACITY;
 /// Default per-chunk variable-position target when `--target-variants-per-chunk`
 /// is left at its `0` sentinel. Finer chunks load-balance the producer→caller
 /// pipeline better (the producer is the wall floor, so smaller work-units keep
@@ -118,14 +121,10 @@ pub enum PipelineError {
     Writer(#[from] WriterError),
 }
 
-/// Re-architected cohort `.psp` → VCF entry point.
-///
-/// Mirrors the old CLI-level
-/// [`run_var_calling`](crate::pop_var_caller::var_calling::run_var_calling) so
-/// the byte-identity oracle can drive both pipelines from the same
-/// [`VarCallingArgs`] and diff the resulting VCFs. The argument-type coupling
-/// to the CLI layer is temporary: at the P7 swap this becomes the production
-/// entry the CLI invokes directly.
+/// Cohort `.psp` → VCF entry point — the production pipeline the CLI's
+/// [`run_var_calling`](crate::pop_var_caller::var_calling::run_var_calling)
+/// invokes. Takes a [`VarCallingArgs`] (the CLI layer also runs the
+/// reference-basename / FASTA-vs-`.psp` MD5 validation before calling here).
 ///
 /// `contamination` (loaded by the CLI from `--contamination-estimates`, or
 /// `None`) is wired into the EM's [`PosteriorEngineConfig`]. Returns the
@@ -201,7 +200,10 @@ pub fn run_var_calling(
         None => None,
     };
 
-    // --- Per-sample segment readers (region overridden per interval). ---
+    // --- Per-sample segment readers. The (chrom_id, region_start, region_end)
+    //     = (0, 1, 1) triple is an inert placeholder: the producer's
+    //     `begin_interval` calls `reset()` on every reader before the first
+    //     read, so these values are never observed. ---
     let readers: Vec<SamplePspReader<BufReader<File>>> = psp_readers
         .into_iter()
         .map(|r| SamplePspReader::new(r, 0, 1, 1))
@@ -217,8 +219,13 @@ pub fn run_var_calling(
     let writer_config = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
     let filters = DownstreamFilters {
         min_qual_phred: cohort.min_qual_phred,
-        no_mapq_diff_filter: cohort.no_mapq_diff_filter,
-        min_mapq_diff_t: cohort.min_mapq_diff_t,
+        mapq_diff: if cohort.no_mapq_diff_filter {
+            MapqDiffFilter::Off
+        } else {
+            MapqDiffFilter::On {
+                min_t: cohort.min_mapq_diff_t,
+            }
+        },
     };
     let mut writer = VcfWriter::new(metadata, writer_config, filters)?;
     let caller = VariantCaller::new(
@@ -351,6 +358,13 @@ pub fn run_var_calling(
 
         // First error wins across producer, callers, and writer; otherwise
         // return the writer's run stats.
+        //
+        // The `.join().expect(...)` re-raises a worker-thread panic on this
+        // (the scope-owning) thread. A caller/writer panic is treated as
+        // fatal-by-design: it is a bug, not a recoverable run error. It does
+        // not deadlock — a panicking thread unwinds and drops its channel-handle
+        // clones, so the surviving threads observe channel close, drain, and
+        // join (`scope` then completes). `join()` only returns `Err` on panic.
         let mut first_err = produce.err();
         for handle in caller_handles {
             if let Err(e) = handle.join().expect("caller thread panicked") {
@@ -383,6 +397,8 @@ fn ref_fetch(
         let f = StreamingChromRefFetcher::for_contig(fasta, &chrom_names[chrom_id as usize])?;
         *cache = Some((chrom_id, f));
     }
+    // UNREACHABLE: `cache` is `Some` on both branches above — either the `if`
+    // just set it, or it already matched `chrom_id`.
     let (_, fetcher) = cache.as_mut().expect("just set");
     // `ChromRefFetcher::fetch` (trait) returns an owned `Vec<u8>`.
     Ok(fetcher.fetch(start, len)?)
@@ -409,6 +425,8 @@ fn dust_mask_for(
         let f = ManualEvictChromRefFetcher::for_contig(fasta, &chrom_names[chrom_id as usize])?;
         *cache = Some((chrom_id, f));
     }
+    // UNREACHABLE: `cache` is `Some` on both branches above (just set, or it
+    // already matched `chrom_id`).
     let (_, fetcher) = cache.as_mut().expect("just set");
     dust_mask_for_interval(
         fetcher,
@@ -421,11 +439,10 @@ fn dust_mask_for(
     .map_err(PipelineError::Dust)
 }
 
-/// The interval's low-complexity (sdust) mask — copied verbatim from
-/// `driver::dust_mask_for_interval`. Scans the interval in `subspan` windows
-/// (evicting the buffer between them to bound resident RAM) and coalesces runs
-/// across the window boundaries, so the result equals a single whole-interval
-/// scan (byte-identical regardless of `subspan`).
+/// The interval's low-complexity (sdust) mask. Scans the interval in `subspan`
+/// windows (evicting the buffer between them to bound resident RAM) and
+/// coalesces runs across the window boundaries, so the result equals a single
+/// whole-interval scan (byte-identical regardless of `subspan`).
 fn dust_mask_for_interval(
     fetcher: &mut ManualEvictChromRefFetcher,
     interval: &Range<u32>,
@@ -467,9 +484,8 @@ fn dust_mask_for_interval(
 
 /// Clip the chromosome's covered intervals (1-based half-open) to its analysis
 /// `regions` (1-based inclusive `[start, end]`), returning the overlap spans in
-/// the half-open convention. Two-pointer sweep over the two sorted lists.
-/// Copied verbatim from `driver::restrict_intervals_to_regions`; with no
-/// `--regions` this is never called and the path is byte-identical.
+/// the half-open convention. Two-pointer sweep over the two sorted lists. With
+/// no `--regions` this is never called and the path is byte-identical.
 fn restrict_intervals_to_regions(covered: &[Range<u32>], regions: &[Region]) -> Vec<Range<u32>> {
     let mut out = Vec::new();
     let (mut i, mut j) = (0usize, 0usize);

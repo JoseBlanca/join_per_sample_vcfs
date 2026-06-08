@@ -23,7 +23,7 @@
 //! serially, and emits the resulting records one-by-one in input
 //! order. Parallelism around the merger lives at the chunk-level
 //! consume in the [`pipeline`](crate::var_calling::pipeline) (one
-//! [`VariantCaller`](crate::var_calling::em_posterior_calc::VariantCaller)
+//! [`VariantCaller`](crate::var_calling::variant_caller::VariantCaller)
 //! per worker thread); running an inner `rayon::par_iter` here would only
 //! nest under that outer decomposition.
 
@@ -622,7 +622,7 @@ where
 /// `PerGroupMerger`. Tests that drive `process_group` directly call
 /// this with the test's own config so the cache slice matches.
 ///
-/// `pub` so the record-based caller ([`crate::var_calling::em_posterior_calc`])
+/// `pub` so the record-based caller ([`crate::var_calling::variant_caller`])
 /// can build the identical cache once and feed it to [`merge_group_with_ref`].
 pub fn build_genotype_tables(config: &PerGroupMergerConfig) -> Vec<Vec<Vec<u8>>> {
     (0..=config.max_alleles)

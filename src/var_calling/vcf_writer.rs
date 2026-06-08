@@ -1,39 +1,44 @@
 //! Writer — section 3 (appendix §E).
 //!
-//! *(today: `var_calling::driver` `drive_blocks_parallel`'s receive loop)*
-//!
 //! `VcfWriter` consumes `CalledChunk`s and writes VCF, **single consumer**,
 //! reordering by `chunk_order` via a `BTreeMap` reorder buffer drained on the
 //! *next expected* `chunk_order`.
 //!
 //! **Gapless invariant:** every chunk yields exactly one `CalledChunk` (empty
-//! ones included), or the drain stalls; a debug-assert checks the consumed
-//! `chunk_order` sequence is contiguous.
-//!
-//! Phase 4 builds this module.
+//! ones included), or the drain stalls; [`finish`](VcfWriter::finish) surfaces a
+//! leftover-buffer gap as [`WriterError::MissingChunks`] rather than silently
+//! truncating the VCF.
 
 use std::collections::BTreeMap;
 
 use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig};
 
-use crate::var_calling::types::{CalledChunk, Variant};
+use crate::var_calling::types::{CallStats, CalledChunk, Variant};
+
+/// The MAPQ-difference Welch's-t filter setting: either off, or on with a
+/// threshold. A single value so the "off" state cannot carry a stale,
+/// silently-ignored threshold (the two old co-dependent fields collapse here).
+#[derive(Debug, Clone, Copy)]
+pub enum MapqDiffFilter {
+    /// `--no-mapq-diff-filter`: the test is never run.
+    Off,
+    /// Drop a record whose MAPQ-difference Welch's-t falls below `min_t`.
+    On { min_t: f32 },
+}
 
 /// Post-EM downstream filters applied per record at write time (the
-/// `emit_or_drop` decision). Pulled out of `VarCallingArgs` /
-/// `ChunkDriverParams.downstream`; the order and predicates are copied verbatim
-/// from `driver::emit_or_drop` — they decide *which* records reach the VCF, so
+/// `emit_or_drop` decision). They decide *which* records reach the VCF, so
 /// they are part of the byte-identity contract.
 #[derive(Debug, Clone, Copy)]
 pub struct DownstreamFilters {
     pub min_qual_phred: f64,
-    pub no_mapq_diff_filter: bool,
-    pub min_mapq_diff_t: f32,
+    pub mapq_diff: MapqDiffFilter,
 }
 
 /// Run-level counters for the run summary (≈ the old `ChunkDriverStats`). The
 /// emit-side counters are decided here; the caller-side counters
 /// (`lh_cap_*` / `groups_skipped_*` / `records_dropped_low_alt_obs`) are rolled
-/// from each [`CalledChunk`]'s [`CallStats`](crate::var_calling::types::CallStats).
+/// from each [`CalledChunk`]'s [`CallStats`].
 /// Not part of the VCF.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WriterStats {
@@ -128,21 +133,34 @@ impl VcfWriter {
     }
 
     fn emit_chunk(&mut self, chunk: CalledChunk) -> Result<(), WriterError> {
-        // Roll the caller-side counters into the run summary.
-        self.stats.records_dropped_low_alt_obs += chunk.stats.records_dropped_low_alt_obs;
-        self.stats.lh_cap_groups_skipped += chunk.stats.lh_cap_groups_skipped;
-        self.stats.lh_cap_alleles_in_skipped += chunk.stats.lh_cap_alleles_in_skipped;
-        self.stats.groups_skipped_post_unify_ref_only +=
-            chunk.stats.groups_skipped_post_unify_ref_only;
-        for record in chunk.records {
+        let CalledChunk {
+            chunk_order: _,
+            records,
+            stats,
+        } = chunk;
+        // Roll the caller-side counters into the run summary. Destructured
+        // exhaustively so a new `CallStats` counter is a compile error here
+        // (rather than being silently dropped from the run summary).
+        let CallStats {
+            lh_cap_groups_skipped,
+            lh_cap_alleles_in_skipped,
+            groups_skipped_post_unify_ref_only,
+            records_dropped_low_alt_obs,
+        } = stats;
+        self.stats.records_dropped_low_alt_obs += records_dropped_low_alt_obs;
+        self.stats.lh_cap_groups_skipped += lh_cap_groups_skipped;
+        self.stats.lh_cap_alleles_in_skipped += lh_cap_alleles_in_skipped;
+        self.stats.groups_skipped_post_unify_ref_only += groups_skipped_post_unify_ref_only;
+        for record in records {
             self.emit_or_drop(record)?;
         }
         Ok(())
     }
 
-    /// Per-record filter + write, copied verbatim from `driver::emit_or_drop`
-    /// (the `min_alt_obs_per_sample` filter is upstream, in the caller). Order
-    /// is load-bearing: hom-ref, then QUAL, then the MAPQ-diff t-test.
+    /// Per-record filter + write (the `min_alt_obs_per_sample` filter is
+    /// upstream, in the caller). Order is load-bearing: hom-ref, then QUAL, then
+    /// the MAPQ-diff t-test — byte-identical to the pre-rewrite emit gate
+    /// (verified out-of-tree).
     fn emit_or_drop(&mut self, record: Variant) -> Result<(), WriterError> {
         if !record.is_variant_call() {
             self.stats.records_dropped_hom_ref += 1;
@@ -152,8 +170,8 @@ impl VcfWriter {
             self.stats.records_dropped_low_qual += 1;
             return Ok(());
         }
-        if !self.filters.no_mapq_diff_filter
-            && record_fails_mapq_diff_t(&record, self.filters.min_mapq_diff_t)
+        if let MapqDiffFilter::On { min_t } = self.filters.mapq_diff
+            && record_fails_mapq_diff_t(&record, min_t)
         {
             self.stats.records_dropped_low_mapq_diff_t += 1;
             return Ok(());
@@ -168,7 +186,7 @@ impl VcfWriter {
 }
 
 // ---------------------------------------------------------------------------
-// MAPQ-difference Welch's-t filter (copied verbatim from `driver`).
+// MAPQ-difference Welch's-t filter (byte-identical to the pre-rewrite filter).
 // ---------------------------------------------------------------------------
 
 const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;

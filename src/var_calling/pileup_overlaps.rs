@@ -1,19 +1,13 @@
 //! Caller step 1 — grouping (appendix §D.1).
 //!
-//! *(today: the `#[cfg(test)]` `build_overlapping_variant_group` oracle +
-//! [`variant_grouping`](crate::var_calling::variant_grouping))*
-//!
 //! Turns a chunk's `CohortPileupRecord`s into `OverlappingPileupRecords`:
 //! walk the records, joining ones whose reach overlaps into groups (bridging
-//! the gaps left by dropped dust positions). **Record-based** — the row
-//! grouper (`OverlappingVariantGroup`) is promoted to production; this is
-//! byte-identical by construction (and grouping is not perf-critical).
+//! the gaps left by dropped dust positions), via the
+//! [`variant_grouping`](crate::var_calling::variant_grouping) grouper. The
+//! grouping is byte-identical by construction (and is not perf-critical).
 //!
 //! Built and consumed inside the caller — `OverlappingPileupRecords` never
 //! crosses a queue.
-//!
-//! Phase 3 builds this module on top of the copied
-//! [`variant_grouping`](crate::var_calling::variant_grouping).
 
 use crate::var_calling::per_position_merger::{PerPositionMergerError, PerPositionPileups};
 use crate::var_calling::types::CohortPileupRecord;
@@ -34,7 +28,7 @@ use crate::var_calling::variant_grouping::{
 /// byte-identical by construction.
 ///
 /// Returned lazily (the grouper is a streaming iterator); the
-/// [`VariantCaller`](crate::var_calling::em_posterior_calc::VariantCaller)
+/// [`VariantCaller`](crate::var_calling::variant_caller::VariantCaller)
 /// consumes it group-by-group, so the grouped records never cross a queue.
 pub fn overlapping_groups(
     records: Vec<CohortPileupRecord>,

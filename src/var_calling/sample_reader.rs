@@ -1,35 +1,29 @@
 //! Per-sample reading (appendix §A) — `SamplePspReader` + `SamplePspChunk`.
 //!
-//! *(today: `var_calling::column_span_reader`, backed by `psp::PspReader`)*
+//! All per-sample responsibility lives here. **No dust** (the producer is the
+//! sole dust consumer, §2.3). One reader is owned per sample; the producer
+//! decodes the readers in parallel via disjoint `&mut` (`par_iter_mut`), so
+//! `R: Send` is required (appendix §A).
 //!
-//! All per-sample responsibility lives here:
+//! ## Two decode paths
 //!
-//! - [`SamplePspReader`] — one per sample, created from a
-//!   [`psp::PspReader`](crate::psp::PspReader) + a chromosome region.
-//!   **No dust** (the producer is the sole dust consumer, §2.3). Hands out
-//!   one [`SamplePspChunk`] per psp **segment** (the natural read unit), via
-//!   [`next_chunk`](SamplePspReader::next_chunk); the producer takes
-//!   `min(peek_next_span)` across readers to advance the cohort in lockstep.
-//!   One reader is owned per sample; the producer decodes the per-sample
-//!   readers in parallel via disjoint `&mut` (`par_iter_mut`), so `R: Send`
-//!   is required (appendix §A).
-//! - [`SamplePspChunk`] — one sample's columns for **one psp segment**.
-//!   `new` decodes the *light* fold columns eagerly
-//!   ([`positions`](SamplePspChunk::positions) /
-//!   [`nonref_obs`](SamplePspChunk::nonref_obs) /
-//!   [`ref_spans`](SamplePspChunk::ref_spans), cached); the typed getters
-//!   ([`take_seq`](SamplePspChunk::take_seq) /
+//! - **Production — column-selective two-phase.**
+//!   [`next_two_phase`](SamplePspReader::next_two_phase) yields one
+//!   [`TwoPhaseSegment`] per psp **segment** with the *light* fold columns
+//!   ([`positions`](TwoPhaseSegment::positions) /
+//!   [`nonref_obs`](TwoPhaseSegment::nonref_obs) /
+//!   [`ref_spans`](TwoPhaseSegment::ref_spans)) decoded eagerly and the heavy
+//!   columns left deferred-compressed. Once the cohort fold decides which rows
+//!   are variable, [`set_variable_rows`](TwoPhaseSegment::set_variable_rows)
+//!   inflates only the heavy columns of the *kept* rows into a
+//!   [`SamplePspChunk`]. This is the path the producer uses.
+//! - **Oracle — eager whole-segment decode.**
+//!   [`SamplePspChunk::from_block`] decodes every column of a segment up front
+//!   and the typed getters ([`take_seq`](SamplePspChunk::take_seq) /
 //!   [`take_chain_ids`](SamplePspChunk::take_chain_ids) /
-//!   [`take_scalar`](SamplePspChunk::take_scalar)) move out their heavy
-//!   column(s) for the `keep` rows only.
-//!
-//! Phase 1 uses a **simple decode**: `SamplePspReader` decodes the whole
-//! segment up front (via the shared [`BlockColumnReader`]) and the chunk
-//! owns a copy of every column; the take-getters slice the `keep` rows out
-//! of that copy. The column-selective *skip-the-rest* lever (decode only the
-//! light columns to decide variable, then only the heavy columns of the
-//! variable rows, freeing the compressed bytes) is Phase 5 — the take-getter
-//! signatures (`&mut self`, move-out, once-only) are already shaped for it.
+//!   [`take_scalar`](SamplePspChunk::take_scalar)) move out a `keep` subset.
+//!   This is **only** used by the tests, as the byte-identity oracle the
+//!   two-phase path is checked against.
 
 use std::io::{Read, Seek};
 
@@ -39,13 +33,11 @@ use crate::psp::reader::{DecodedColumn, RetainedColumn, TwoPhaseBlock, inflate_r
 use crate::psp::{BlockColumnReader, BlockColumns, BlockIndexEntry, PspReadError, PspReader};
 
 // ---------------------------------------------------------------------------
-// Heavy per-allele column carriers (copied from the old columnar reader).
+// Heavy per-allele column carriers.
 //
 // These are the byte-identity-sensitive destination shapes the appendix §A
-// take-getters return. `var_calling::columns` was deliberately not
-// transplanted (the columnar EM block is gone), and referencing it would
-// break at the P7 swap when the old package is deleted — so the minimal
-// subset the reader needs is copied here.
+// take-getters return — the minimal columnar subset the reader needs (the
+// full columnar EM machinery is not part of this pipeline).
 // ---------------------------------------------------------------------------
 
 /// Per-(record, allele) fixed-width scalar columns — the 7 components of
@@ -654,9 +646,10 @@ impl TwoPhaseSegment {
         self.positions.last().copied()
     }
 
-    /// Phase 1 → 2: inflate the deferred columns **one at a time**, compacting
-    /// each to the `keep` rows and freeing the inflated buffer before the next
-    /// (resident transient ≈ one inflated column). Returns a variable-only
+    /// Phase 2 of the two-phase decode: inflate the deferred columns **one at a
+    /// time**, compacting each to the `keep` rows and freeing the inflated
+    /// buffer before the next (resident transient ≈ one inflated column).
+    /// Returns a variable-only
     /// [`SamplePspChunk`] ready for record building. `keep.len()` must equal
     /// [`len`](Self::len). **Non-consuming** — the producer partial-inflates a
     /// not-yet-finalisable straddling segment with this, then re-inflates it on
@@ -698,7 +691,9 @@ impl TwoPhaseSegment {
         // Inflate + compact each deferred column, freeing between (one resident).
         let mut seq = AlleleSeqColumns::empty();
         let mut chain_ids = AlleleChainIdColumns::empty();
-        let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Per-column inflate scratch: seq bytes/offsets, chain-id data/offsets.
+        let (mut seq_bytes, mut seq_offsets, mut chain_data, mut chain_offsets) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for rc in &self.retained {
             let col = inflate_retained_column(
                 &rc.blob,
@@ -709,10 +704,10 @@ impl TwoPhaseSegment {
                 decompressor,
                 compressed_scratch,
                 decompressed_scratch,
-                &mut sd,
-                &mut so,
-                &mut cd,
-                &mut co,
+                &mut seq_bytes,
+                &mut seq_offsets,
+                &mut chain_data,
+                &mut chain_offsets,
             )?;
             match col {
                 Some(DecodedColumn::AlleleQSumLog(v)) => {
@@ -733,8 +728,8 @@ impl TwoPhaseSegment {
                 }
                 Some(DecodedColumn::AlleleSeq) => {
                     let full = AlleleSeqColumns {
-                        offsets: std::mem::take(&mut so),
-                        bytes: std::mem::take(&mut sd),
+                        offsets: std::mem::take(&mut seq_offsets),
+                        bytes: std::mem::take(&mut seq_bytes),
                     };
                     for &(lo, hi) in &ranges {
                         seq.extend_from_range(&full, lo..hi);
@@ -742,8 +737,8 @@ impl TwoPhaseSegment {
                 }
                 Some(DecodedColumn::AlleleChainIds) => {
                     let full = AlleleChainIdColumns {
-                        offsets: std::mem::take(&mut co),
-                        ids: std::mem::take(&mut cd),
+                        offsets: std::mem::take(&mut chain_offsets),
+                        ids: std::mem::take(&mut chain_data),
                     };
                     for &(lo, hi) in &ranges {
                         chain_ids.extend_from_range(&full, lo..hi);

@@ -109,13 +109,12 @@ pub struct RawCohortChunk {
     pub ref_span: RefSpan,
 }
 
-/// The final emitted record (appendix §C, `[RENAME PosteriorRecord]`).
+/// The final emitted record.
 ///
-/// A type alias onto the copied-verbatim kernel output
-/// [`PosteriorRecord`]
-/// — keeping it the *same* type the SIMD EM produces is how byte-identity is
-/// preserved (no conversion). The standalone `Variant` name becomes the real
-/// type at the P7 swap.
+/// A type alias onto the kernel output [`PosteriorRecord`] — keeping it the
+/// *same* type the SIMD EM produces is how byte-identity is preserved (no
+/// conversion at the caller→writer boundary). `Variant` is the name the
+/// pipeline uses for it.
 pub type Variant = PosteriorRecord;
 
 /// Per-chunk run statistics carried alongside the calls (appendix §E; revival
