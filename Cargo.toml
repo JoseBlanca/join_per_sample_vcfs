@@ -52,6 +52,15 @@ panic = "abort"
 inherits = "release"
 debug = true
 
+# Symbolised heap/CPU profiling: release-like codegen but with full debug
+# info and without fat-LTO frame collapsing, so dhat backtraces resolve to
+# `pop_var_caller::` source sites (line-tables-only release builds don't).
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = true
+
 [dependencies]
 ahash = "0.8.12"
 anyhow = "1.0.102"
