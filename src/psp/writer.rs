@@ -96,7 +96,25 @@ pub const MAX_BLOCK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 /// regardless of read depth. `target_block_bytes` remains as a *safety
 /// cap* for pathological windows. See
 /// [the architecture review](../../doc/devel/reports/reviews/architecture_psp_to_vcf_scaling_2026-06-02.md).
-pub const DEFAULT_BLOCK_WINDOW_BP: u32 = 20_000;
+///
+/// 2026-06-08 window sweep (tomato1, N=50, T=6, real cohort) — the block is
+/// the cohort reader's decode unit, so psp→VCF peak RSS scales strongly with
+/// it while wall stays flat and on-disk size has long-since kneed:
+///
+/// | window | psp→VCF RSS | psp→VCF wall | cohort on-disk |
+/// |--------|------------:|-------------:|---------------:|
+/// |  80 kb |    3237 MB |  ~7.4s |  1510 MB |
+/// |  40 kb |    2680 MB |  ~7.1s |  1531 MB |
+/// |  20 kb |    1995 MB |  ~6.8s |  1571 MB |  ← old default
+/// |  10 kb |    1337 MB |  ~6.9s |  1649 MB |
+/// |   5 kb |    1062 MB |  ~7.3s |  1774 MB |  ← default
+///
+/// Compression has effectively plateaued by 20 kb (5 kb pays only +13% disk
+/// vs 20 kb), but RSS keeps falling, so 5 kb trades a little disk + ~2% wall
+/// for ~48% lower psp→VCF peak RSS — the right call when RAM is the binding
+/// constraint at large N (the memory thesis). Dial up with `--block-window-bp`
+/// for archival/disk-bound single-sample use.
+pub const DEFAULT_BLOCK_WINDOW_BP: u32 = 5_000;
 
 /// Initial `Vec::with_capacity` hint for per-record columns in a
 /// freshly-opened block (delta-pos, n-alleles, the per-record list
@@ -1239,12 +1257,14 @@ mod tests {
                 .unwrap();
         // Records up to ~the target are absorbed with no flush.
         let mut saw_flush = false;
+        let mut flush_pos = 0u32;
         for i in 1u32..=2000 {
             let pushed = writer
                 .write_record(&record(0, i, vec![allele(b"A", 1, -1.0, &[])]))
                 .unwrap();
             if pushed > 0 {
                 saw_flush = true;
+                flush_pos = i;
                 break;
             }
         }
@@ -1252,10 +1272,12 @@ mod tests {
             saw_flush,
             "expected at least one auto-flush before record 2000"
         );
-        // The very next record after a flush is on a fresh block — it
-        // must report 0 bytes pushed.
+        // The very next record after a flush is on a fresh block — it must
+        // report 0 bytes pushed. Keep it adjacent to `flush_pos` so it lands in
+        // the same genomic window (no window-boundary flush, independent of the
+        // `block_window_bp` default) and doesn't refill the byte target.
         let post_flush = writer
-            .write_record(&record(0, 10_000, vec![allele(b"A", 1, -1.0, &[])]))
+            .write_record(&record(0, flush_pos + 1, vec![allele(b"A", 1, -1.0, &[])]))
             .unwrap();
         assert_eq!(post_flush, 0, "post-flush record must not push bytes");
     }
