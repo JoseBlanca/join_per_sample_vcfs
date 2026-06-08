@@ -45,11 +45,15 @@ const BUFFERED_IO_CAPACITY: usize = 64 * 1024;
 /// Default per-chunk variable-position target when `--target-variants-per-chunk`
 /// is left at its `0` sentinel. Finer chunks load-balance the producer→caller
 /// pipeline better (the producer is the wall floor, so smaller work-units keep
-/// the callers fed sooner): a T=8 / N=50 sweep gave 7.9 s at 256 vs 9.0 s at
-/// 1024, with peak memory flat and calls byte-identical (chunks always cut at
-/// clean group boundaries). Surfaced in the startup log so the effective value
-/// is visible.
-const DEFAULT_TARGET_VARIANTS: u32 = 256;
+/// the callers fed sooner), and peak RSS is flat across chunk size — so the
+/// tuning is purely a wall trade. A T=6 sweep (2026-06-08) confirmed the trend
+/// continues below 256: at N=1000 wall fell monotonically 256→128→64
+/// (208→201→196 s), and N=50 was flat within noise; 128 captures most of the
+/// gain without pushing toward the per-chunk overhead (REF fetch / safe-gap
+/// search) that eventually dominates at very small targets. Calls are
+/// byte-identical regardless (chunks always cut at clean group boundaries).
+/// Surfaced in the startup log so the effective value is visible.
+const DEFAULT_TARGET_VARIANTS: u32 = 128;
 /// Bounded-queue depth per worker on both hand-offs: peak resident chunks ≈
 /// `QUEUE_DEPTH_PER_WORKER × n_workers`. `2` keeps every worker fed across one
 /// hand-off without unbounded look-ahead — the back-pressure cap.

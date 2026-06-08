@@ -92,11 +92,13 @@ pub struct VarCallingArgs {
 
     /// Soft target for the number of variable (cohort-variant) positions
     /// per chunk — the producer accumulates records until it reaches this
-    /// many, then cuts at the next safe gap. Trades chunk size for memory
-    /// (resident ≈ target × n_samples); the emitted VCF is independent of
-    /// it (cuts always fall on clean group boundaries). `0` (the default)
-    /// selects the built-in default of 1024; any positive value overrides.
-    /// The resolved value is printed in the startup log.
+    /// many, then cuts at the next safe gap. Primarily a wall trade (finer
+    /// chunks load-balance the producer→caller pipeline better); peak RSS is
+    /// flat across chunk size at sane targets, so it is not a memory knob.
+    /// The emitted VCF is independent of it (cuts always fall on clean group
+    /// boundaries). `0` (the default) selects the built-in default of 128;
+    /// any positive value overrides. The resolved value is printed in the
+    /// startup log.
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
 
