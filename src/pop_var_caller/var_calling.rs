@@ -102,12 +102,14 @@ pub struct VarCallingArgs {
     #[arg(long, default_value_t = 0)]
     pub target_variants_per_chunk: u32,
 
-    /// Low-memory mode: summarise each covered interval and re-read it to
-    /// materialise only the kept positions, instead of folding every
-    /// sample's window records into memory at once. Holds ≤ pool-width
-    /// decoded blocks plus a compact per-position summary, trading a
-    /// second pass over the `.psp` files for a much smaller peak RSS.
-    /// Output is byte-identical to the default path.
+    /// Low-memory mode: trade wall time for a smaller peak RSS by turning off
+    /// the speed-for-memory optimisations the default path uses. Currently this
+    /// disables the producer's straddler decode cache — a segment that spans a
+    /// chunk boundary is re-decompressed for each chunk instead of being held
+    /// decompressed in memory (whose cost scales with the cohort size). Expect a
+    /// few percent slower for a peak-RSS reduction that grows with sample count.
+    /// A bucket for further low-memory toggles. Output is byte-identical to the
+    /// default path either way.
     #[arg(long, default_value_t = false)]
     pub low_memory: bool,
 

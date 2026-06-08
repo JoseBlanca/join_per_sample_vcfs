@@ -325,11 +325,15 @@ pub fn run_var_calling(
         .num_threads(producer_threads)
         .build()?;
     let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
+    // Straddler decode cache: on by default, off under `--low-memory` (trades
+    // the cache's cohort-scaling RSS for re-decompressing cut-spanning segments).
+    let cache_straddlers = !args.low_memory;
     // Surface the resolved concurrency / chunk-sizing defaults so an operator
     // can recover what a running instance actually chose (the values default
     // implicitly from `--threads` / the `--target-variants-per-chunk` sentinel).
     eprintln!(
-        "var-calling: producer_threads={producer_threads} workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants}"
+        "var-calling: producer_threads={producer_threads} workers={n_workers} queue_cap={cap} target_variants_per_chunk={target_variants} low_memory={}",
+        args.low_memory
     );
     // The producer is split into two internal stages connected by a bounded
     // plan queue: the **fold/plan** stage (main thread) advances the cohort
@@ -385,7 +389,7 @@ pub fn run_var_calling(
         // plan queue drains.
         let compact_handle = scope.spawn(move || -> Result<(), PipelineError> {
             for plan in plan_rx {
-                let chunk = producer_pool.install(|| compact_plan(plan))?;
+                let chunk = producer_pool.install(|| compact_plan(plan, cache_straddlers))?;
                 if chunk_tx.send(chunk).is_err() {
                     break; // all callers gone (errored); real error surfaces on join
                 }

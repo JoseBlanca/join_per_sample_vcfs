@@ -445,10 +445,19 @@ pub(crate) struct ChunkPlan {
 /// Compact stage: inflate each plan'd segment's heavy columns for its variable
 /// rows in `[chunk_start, cut)` and assemble the cohort chunk. Stateless and
 /// `self`-free, so it runs on a separate stage thread (still fanning out across
-/// the N samples on the producer rayon pool). Byte-identical to the inline
-/// `compact_samples` it replaces: same per-segment `set_variable_rows` inflate
-/// restricted to `kept_all ∩ [chunk_start, cut)`, same genomic row order.
-pub(crate) fn compact_plan(plan: ChunkPlan) -> Result<RawCohortChunk, ProducerError> {
+/// the N samples on the producer rayon pool). Byte-identical regardless of
+/// `cache_straddlers`: same per-segment inflate restricted to
+/// `kept_all ∩ [chunk_start, cut)`, same genomic row order.
+///
+/// `cache_straddlers` (the default; `false` under `--low-memory`) decodes a
+/// cut-spanning segment's heavy columns once into its cache and slices both
+/// overlapping chunks from it. With it `false`, every chunk re-decompresses the
+/// straddler instead — a few percent slower for a peak-RSS reduction that scales
+/// with the cohort size.
+pub(crate) fn compact_plan(
+    plan: ChunkPlan,
+    cache_straddlers: bool,
+) -> Result<RawCohortChunk, ProducerError> {
     use rayon::prelude::*;
     let ChunkPlan {
         chunk_order,
@@ -476,14 +485,33 @@ pub(crate) fn compact_plan(plan: ChunkPlan) -> Result<RawCohortChunk, ProducerEr
                 if !keep.iter().any(|&b| b) {
                     continue;
                 }
-                let dz = decompressor.get_or_insert_with(|| {
-                    // PANIC-FREE: `zstd::bulk::Decompressor::new` is infallible
-                    // on every supported platform.
-                    new_column_decompressor().expect(
-                        "zstd::bulk::Decompressor::new is infallible on supported platforms",
-                    )
-                });
-                let chunk = seg.set_variable_rows(&keep, dz, &mut cs, &mut ds)?;
+                // Decode-once (default): a segment that extends past this
+                // chunk's cut is a straddler — the next chunk needs it too — so
+                // inflate every heavy column once into the segment's cache and
+                // slice both chunks from it (no repeat zstd decode). A
+                // fully-consumed segment (used only here) takes the memory-frugal
+                // one-column-at-a-time `set_variable_rows`. Under `--low-memory`
+                // (`cache_straddlers == false`) every segment takes that frugal
+                // path — straddlers re-decompress per chunk, no cache held.
+                let chunk = if let Some(decoded) = seg.decoded_cache() {
+                    seg.compact_rows(decoded, &keep)
+                } else {
+                    let dz = decompressor.get_or_insert_with(|| {
+                        // PANIC-FREE: `zstd::bulk::Decompressor::new` is
+                        // infallible on every supported platform.
+                        new_column_decompressor().expect(
+                            "zstd::bulk::Decompressor::new is infallible on supported platforms",
+                        )
+                    });
+                    if cache_straddlers && seg.last_pos().is_some_and(|lp| lp >= cut) {
+                        let decoded = seg.inflate_all(dz, &mut cs, &mut ds)?;
+                        let chunk = seg.compact_rows(&decoded, &keep);
+                        seg.cache_decoded(decoded);
+                        chunk
+                    } else {
+                        seg.set_variable_rows(&keep, dz, &mut cs, &mut ds)?
+                    }
+                };
                 compacted.append_range(&chunk, chunk_start, cut);
             }
             Ok(compacted)
@@ -986,8 +1014,10 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         &mut self,
         fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, RefFetchError>,
     ) -> Result<Option<RawCohortChunk>, ProducerError> {
+        // `true`: exercise the straddler-cache (default) path in the
+        // byte-identity oracle tests. The output is identical either way.
         match self.plan_chunk(fetch_ref)? {
-            Some(plan) => Ok(Some(compact_plan(plan)?)),
+            Some(plan) => Ok(Some(compact_plan(plan, true)?)),
             None => Ok(None),
         }
     }
@@ -1459,6 +1489,34 @@ mod tests {
                 assert_eq!(got, want, "min_alt_obs={min_alt_obs} target={target}");
             }
         }
+    }
+
+    #[test]
+    fn low_memory_cache_off_matches_reference() {
+        // The `--low-memory` path (`compact_plan(.., cache_straddlers = false)`)
+        // re-decompresses straddlers instead of caching them — it must still be
+        // byte-identical to the reference (and hence to the default cache path).
+        let (samples, bts) = cohort();
+        let min_alt_obs = 1u32;
+        let want = reference(&samples, min_alt_obs, &[]);
+        let readers: Vec<_> = samples
+            .iter()
+            .zip(&bts)
+            .map(|(recs, &bt)| {
+                let reader = PspReader::new(Cursor::new(psp_bytes(recs, bt))).unwrap();
+                SamplePspReader::new(reader, 0, 1, 1)
+            })
+            .collect();
+        let mut integ = CohortChunkIntegrator::new(readers, min_alt_obs, 3);
+        integ.begin_interval(0, 1..INTERVAL_END, Vec::new());
+        let mut fetch = |_s: u32, len: u32| Ok::<_, RefFetchError>(vec![b'N'; len as usize]);
+        let names = names(samples.len());
+        let mut out: Vec<CohortPileupRecord> = Vec::new();
+        while let Some(plan) = integ.plan_chunk(&mut fetch).unwrap() {
+            let chunk = compact_plan(plan, false).unwrap();
+            out.extend(merge_compacted_samples(&chunk.per_sample, &names).unwrap());
+        }
+        assert_eq!(out, want);
     }
 
     #[test]

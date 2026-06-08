@@ -568,15 +568,33 @@ fn extend_kept<T: Copy>(out: &mut Vec<T>, full: &[T], ranges: &[(usize, usize)])
     }
 }
 
+/// One block's heavy columns inflated to **full** (all rows) — the decode-once
+/// cache for a segment that straddles a chunk cut. The cohort producer slices
+/// the variable rows for each overlapping chunk out of this
+/// ([`compact_rows`](TwoPhaseSegment::compact_rows)) instead of re-inflating the
+/// zstd blobs per chunk. `scalar` carries all 7 per-allele stats (including the
+/// light `num_obs`); `seq` / `chain_ids` are the full-block ragged columns.
+pub(crate) struct DecodedHeavy {
+    scalar: AlleleScalarColumns,
+    seq: AlleleSeqColumns,
+    chain_ids: AlleleChainIdColumns,
+}
+
 /// A `.psp` segment decoded in two phases (the column-selective producer read):
 /// the fold columns are materialised; the per-allele heavy columns stay
-/// compressed in `retained` until [`set_variable_rows`](Self::set_variable_rows)
-/// inflates + compacts them to the kept (variable) rows, yielding a variable-only
-/// [`SamplePspChunk`]. The producer folds over the light accessors, then once a
-/// segment's variable mask is final converts it in one column-by-column
-/// inflate→compact→free pass (transient ≈ one inflated column).
+/// compressed in `retained` until they are inflated + compacted to the kept
+/// (variable) rows, yielding a variable-only [`SamplePspChunk`].
+///
+/// Two compaction paths (the cohort producer picks per segment):
+/// - **fully-consumed** segment (sits wholly below the chunk cut, used once) —
+///   [`set_variable_rows`](Self::set_variable_rows) inflates one column at a
+///   time and frees it (transient ≈ one inflated column);
+/// - **straddler** (extends past the cut, so the *next* chunk needs it too) —
+///   [`inflate_all`](Self::inflate_all) decodes every heavy column once into the
+///   [`decoded`](Self::decoded) cache; both chunks then slice their rows via
+///   [`compact_rows`](Self::compact_rows) with **no** repeat zstd decode.
 // Constructed by `SamplePspReader::next_two_phase`, folded over via the light
-// accessors, then finalised by the cohort producer's `compact_samples`.
+// accessors, then compacted by the cohort producer's compact stage.
 pub(crate) struct TwoPhaseSegment {
     chrom_id: u32,
     positions: Vec<u32>,      // 1-based, full block
@@ -587,6 +605,10 @@ pub(crate) struct TwoPhaseSegment {
     allele_seq_len: Vec<u64>, // full block — rebuilds the seq/chain CSR offsets
     allele_obs_count: Vec<u32>, // full block (light; supplies the num_obs stat)
     retained: Vec<RetainedColumn>,
+    /// Decode-once cache for a straddling segment (see the type doc). Empty for
+    /// fully-consumed segments. `OnceLock` so the shared `Arc<TwoPhaseSegment>`
+    /// stays `Sync` and the first compaction populates it for the next.
+    decoded: std::sync::OnceLock<Box<DecodedHeavy>>,
 }
 
 impl TwoPhaseSegment {
@@ -633,6 +655,7 @@ impl TwoPhaseSegment {
             allele_seq_len: tp.allele_seq_len,
             allele_obs_count: tp.allele_obs_count,
             retained: tp.retained,
+            decoded: std::sync::OnceLock::new(),
         })
     }
 
@@ -767,6 +790,124 @@ impl TwoPhaseSegment {
             seq,
             chain_ids,
         })
+    }
+
+    /// The straddler decode-once cache, if already populated.
+    pub(crate) fn decoded_cache(&self) -> Option<&DecodedHeavy> {
+        self.decoded.get().map(|b| &**b)
+    }
+
+    /// Store the full-block decoded heavy columns for reuse by the next chunk's
+    /// compaction (no-op if another caller already set it — same data).
+    pub(crate) fn cache_decoded(&self, decoded: DecodedHeavy) {
+        let _ = self.decoded.set(Box::new(decoded));
+    }
+
+    /// Inflate **every** heavy column to full-block form (all rows) — the
+    /// decode-once step for a straddling segment. Unlike
+    /// [`set_variable_rows`](Self::set_variable_rows) (which inflates one column
+    /// at a time and immediately compacts to the kept rows), this keeps the
+    /// whole decoded block so [`compact_rows`](Self::compact_rows) can slice it
+    /// for each chunk that overlaps the segment with no repeat zstd decode.
+    pub(crate) fn inflate_all(
+        &self,
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed_scratch: &mut Vec<u8>,
+        decompressed_scratch: &mut Vec<u8>,
+    ) -> Result<DecodedHeavy, PspReadError> {
+        let n_records = self.positions.len();
+        let mut scalar = AlleleScalarColumns {
+            num_obs: self.allele_obs_count.clone(),
+            ..Default::default()
+        };
+        let mut seq = AlleleSeqColumns::empty();
+        let mut chain_ids = AlleleChainIdColumns::empty();
+        let (mut seq_bytes, mut seq_offsets, mut chain_data, mut chain_offsets) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for rc in &self.retained {
+            let col = inflate_retained_column(
+                &rc.blob,
+                &rc.entry,
+                n_records,
+                self.n_total_alleles,
+                Some(&self.allele_seq_len),
+                decompressor,
+                compressed_scratch,
+                decompressed_scratch,
+                &mut seq_bytes,
+                &mut seq_offsets,
+                &mut chain_data,
+                &mut chain_offsets,
+            )?;
+            match col {
+                Some(DecodedColumn::AlleleQSumLog(v)) => scalar.q_sum = v,
+                Some(DecodedColumn::AlleleFwdCount(v)) => scalar.fwd = v,
+                Some(DecodedColumn::AllelePlacedLeftCount(v)) => scalar.placed_left = v,
+                Some(DecodedColumn::AllelePlacedStartCount(v)) => scalar.placed_start = v,
+                Some(DecodedColumn::AlleleMapqSum(v)) => scalar.mapq_sum = v,
+                Some(DecodedColumn::AlleleMapqSumSq(v)) => scalar.mapq_sum_sq = v,
+                Some(DecodedColumn::AlleleSeq) => {
+                    seq = AlleleSeqColumns {
+                        offsets: std::mem::take(&mut seq_offsets),
+                        bytes: std::mem::take(&mut seq_bytes),
+                    };
+                }
+                Some(DecodedColumn::AlleleChainIds) => {
+                    chain_ids = AlleleChainIdColumns {
+                        offsets: std::mem::take(&mut chain_offsets),
+                        ids: std::mem::take(&mut chain_data),
+                    };
+                }
+                // Light columns are never retained; an unknown optional → None.
+                _ => {}
+            }
+        }
+        Ok(DecodedHeavy {
+            scalar,
+            seq,
+            chain_ids,
+        })
+    }
+
+    /// Slice the `keep` (variable) rows out of an already-decoded full block into
+    /// a variable-only [`SamplePspChunk`]. Byte-identical to
+    /// [`set_variable_rows`](Self::set_variable_rows) for the same `keep` (same
+    /// kept-row CSR + per-allele copies) — it just reads from `decoded` instead
+    /// of inflating. `keep.len()` must equal the block's record count.
+    pub(crate) fn compact_rows(&self, decoded: &DecodedHeavy, keep: &[bool]) -> SamplePspChunk {
+        debug_assert_eq!(keep.len(), self.positions.len(), "keep covers every record");
+        let mut positions = Vec::new();
+        let mut allele_offsets = vec![0u32];
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut cum = 0u32;
+        for (r, &k) in keep.iter().enumerate() {
+            if k {
+                let lo = self.allele_offsets[r] as usize;
+                let hi = self.allele_offsets[r + 1] as usize;
+                positions.push(self.positions[r]);
+                ranges.push((lo, hi));
+                cum += (hi - lo) as u32;
+                allele_offsets.push(cum);
+            }
+        }
+        let mut scalar = AlleleScalarColumns::default();
+        let mut seq = AlleleSeqColumns::empty();
+        let mut chain_ids = AlleleChainIdColumns::empty();
+        for &(lo, hi) in &ranges {
+            scalar.extend_from_range(&decoded.scalar, lo..hi);
+            seq.extend_from_range(&decoded.seq, lo..hi);
+            chain_ids.extend_from_range(&decoded.chain_ids, lo..hi);
+        }
+        SamplePspChunk {
+            chrom_id: self.chrom_id,
+            positions,
+            nonref_obs: Vec::new(),
+            ref_spans: Vec::new(),
+            allele_offsets,
+            scalar,
+            seq,
+            chain_ids,
+        }
     }
 }
 
