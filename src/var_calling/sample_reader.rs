@@ -28,9 +28,11 @@
 use std::io::{Read, Seek};
 
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
+#[cfg(test)]
+use crate::psp::BlockColumns;
 use crate::psp::ScalarDecodeError;
 use crate::psp::reader::{DecodedColumn, RetainedColumn, TwoPhaseBlock, inflate_retained_column};
-use crate::psp::{BlockColumnReader, BlockColumns, BlockIndexEntry, PspReadError, PspReader};
+use crate::psp::{BlockColumnReader, BlockIndexEntry, PspReadError, PspReader};
 
 // ---------------------------------------------------------------------------
 // Heavy per-allele column carriers.
@@ -54,14 +56,12 @@ pub struct AlleleScalarColumns {
 }
 
 impl AlleleScalarColumns {
-    /// Total per-allele cells across all records.
+    /// Total per-allele cells across all records. Test-only (the eager-decode
+    /// oracle path); production reads cells via [`support_at`](Self::support_at).
+    #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.num_obs.len()
-    }
-
-    /// True when no per-allele cells are stored.
-    pub fn is_empty(&self) -> bool {
-        self.num_obs.is_empty()
     }
 
     /// Append `src`'s cells in `range` to `self`.
@@ -110,7 +110,10 @@ impl AlleleSeqColumns {
         }
     }
 
-    /// Append one allele's sequence bytes and push the CSR offset.
+    /// Append one allele's sequence bytes and push the CSR offset. Test-only
+    /// (the eager-decode oracle builds columns allele-by-allele); production
+    /// fills columns via [`extend_from_range`](Self::extend_from_range).
+    #[cfg(test)]
     pub fn push(&mut self, seq: &[u8]) {
         self.bytes.extend_from_slice(seq);
         self.offsets.push(u32_from_usize(self.bytes.len()));
@@ -129,14 +132,11 @@ impl AlleleSeqColumns {
         }
     }
 
-    /// Number of alleles stored.
+    /// Number of alleles stored. Test-only (the eager-decode oracle).
+    #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.offsets.len() - 1
-    }
-
-    /// True when no alleles are stored.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Allele `allele_idx`'s sequence bytes.
@@ -164,7 +164,10 @@ impl AlleleChainIdColumns {
         }
     }
 
-    /// Append one allele's chain ids and push the CSR offset.
+    /// Append one allele's chain ids and push the CSR offset. Test-only (the
+    /// eager-decode oracle); production fills via
+    /// [`extend_from_range`](Self::extend_from_range).
+    #[cfg(test)]
     pub fn push(&mut self, chain_ids: &[ChainId]) {
         self.ids.extend_from_slice(chain_ids);
         self.offsets.push(u32_from_usize(self.ids.len()));
@@ -182,14 +185,11 @@ impl AlleleChainIdColumns {
         }
     }
 
-    /// Number of alleles stored.
+    /// Number of alleles stored. Test-only (the eager-decode oracle).
+    #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.offsets.len() - 1
-    }
-
-    /// True when no alleles are stored.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Allele `allele_idx`'s chain ids.
@@ -255,11 +255,14 @@ fn chain_ids_for_allele(chain_ids: &AlleleChainIdColumns, a: usize, lo: usize) -
 }
 
 impl SamplePspChunk {
-    /// Decode one block's region-clamped records into an owned chunk.
+    /// Decode one block's region-clamped records into an owned chunk — the
+    /// eager whole-block decode used as the **test-only byte-identity oracle**
+    /// (production decodes column-selectively via [`TwoPhaseSegment`]).
     ///
     /// Records with `pos < floor` or `pos > region_end` are dropped (only
     /// the region-edge blocks carry any). Returns `None` when no record of
     /// the block falls in `[floor, region_end]`.
+    #[cfg(test)]
     fn from_block(
         cols: &BlockColumns<'_>,
         chrom_id: u32,
@@ -370,33 +373,33 @@ impl SamplePspChunk {
     }
 
     /// Number of (region-clamped) records.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.positions.len()
     }
 
-    /// True when the chunk has no records.
-    pub fn is_empty(&self) -> bool {
-        self.positions.is_empty()
-    }
-
-    /// 1-based positions, one per record (light, cached).
+    /// 1-based positions, one per record (light, cached). Test-only accessor
+    /// (the eager-decode oracle); production reads the field directly.
+    #[cfg(test)]
     pub fn positions(&self) -> &[u32] {
         &self.positions
     }
 
-    /// Per-record sum of non-REF allele obs (light, cached). The
-    /// per-sample input to the cohort `min_alt_obs` fold.
+    /// Per-record sum of non-REF allele obs (light, cached). Test-only accessor.
+    #[cfg(test)]
     pub fn nonref_obs(&self) -> &[u32] {
         &self.nonref_obs
     }
 
-    /// Per-record REF-allele reference span in bases (light, cached). The
-    /// per-sample reach input to the cohort fold / grouping.
+    /// Per-record REF-allele reference span in bases (light, cached). Test-only
+    /// accessor.
+    #[cfg(test)]
     pub fn ref_spans(&self) -> &[u32] {
         &self.ref_spans
     }
 
-    /// Number of alleles at record `record_idx`.
+    /// Number of alleles at record `record_idx`. Test-only accessor.
+    #[cfg(test)]
     pub fn n_alleles_at(&self, record_idx: usize) -> usize {
         let lo = self.allele_offsets[record_idx] as usize;
         let hi = self.allele_offsets[record_idx + 1] as usize;
@@ -469,12 +472,11 @@ impl SamplePspChunk {
         out
     }
 
-    /// Reconstruct owned [`PileupRecord`]s for the `keep` records — the
-    /// columnar→record boundary at the producer (§2.2 step 3). **Non-consuming**
-    /// (copies via `slice_at`/`support_at`), so a segment straddling a chunk
-    /// cut survives in the buffer to serve the next chunk; the move-out
-    /// [`take_seq`](Self::take_seq) / `take_*` getters are the Phase-5
-    /// column-selective seam instead. `keep.len()` must equal [`len`](Self::len).
+    /// Reconstruct owned [`PileupRecord`]s for the `keep` records (copies via
+    /// `slice_at`/`support_at`). Test-only — part of the eager-decode oracle;
+    /// production rebuilds records via [`records_all`](Self::records_all) off the
+    /// two-phase path. `keep.len()` must equal [`len`](Self::len).
+    #[cfg(test)]
     pub fn records_for(&self, keep: &[bool]) -> Vec<PileupRecord> {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
         let mut out = Vec::new();
@@ -499,7 +501,9 @@ impl SamplePspChunk {
 
     /// Move out the scalar columns for the `keep` records (appendix
     /// §A typed getter). `keep.len()` must equal [`len`](Self::len);
-    /// the column is emptied, so a second call yields nothing.
+    /// the column is emptied, so a second call yields nothing. Test-only (the
+    /// eager-decode oracle's column-selective seam).
+    #[cfg(test)]
     pub fn take_scalar(&mut self, keep: &[bool]) -> AlleleScalarColumns {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
         let src = std::mem::take(&mut self.scalar);
@@ -518,6 +522,8 @@ impl SamplePspChunk {
     ///
     /// Call-once (per the appendix §A "fetched at most once" contract): the
     /// column is moved out, so a second call on the same chunk is misuse.
+    /// Test-only (the eager-decode oracle's column-selective seam).
+    #[cfg(test)]
     pub fn take_seq(&mut self, keep: &[bool]) -> AlleleSeqColumns {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
         let src = std::mem::replace(&mut self.seq, AlleleSeqColumns::empty());
@@ -532,7 +538,9 @@ impl SamplePspChunk {
         out
     }
 
-    /// Move out the allele-chain-id column for the `keep` records.
+    /// Move out the allele-chain-id column for the `keep` records. Test-only
+    /// (the eager-decode oracle's column-selective seam).
+    #[cfg(test)]
     pub fn take_chain_ids(&mut self, keep: &[bool]) -> AlleleChainIdColumns {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
         let src = std::mem::replace(&mut self.chain_ids, AlleleChainIdColumns::empty());
@@ -833,8 +841,10 @@ impl<R: Read + Seek> SamplePspReader<R> {
 
     /// Inclusive end of the next segment this reader serves **without a new
     /// decode** (the next block's `last_pos`), clamped to `region_end`.
-    /// `None` once the region is exhausted. The producer takes `min` of
-    /// this across samples to advance the cohort in lockstep.
+    /// `None` once the region is exhausted. Test-only — paired with the eager
+    /// [`next_chunk`](Self::next_chunk) oracle; production advances the cohort
+    /// via the two-phase [`next_two_phase`](Self::next_two_phase) path.
+    #[cfg(test)]
     pub fn peek_next_span(&self) -> Option<u32> {
         let entry = self.blocks.peek_block()?;
         if entry.chrom_id != self.chrom_id || entry.first_pos > self.region_end {
@@ -846,6 +856,9 @@ impl<R: Read + Seek> SamplePspReader<R> {
     /// Decode and return the next in-region segment as a [`SamplePspChunk`],
     /// advancing the cursor past it. `None` once the region is exhausted.
     /// Blocks whose records all fall below `floor` are skipped transparently.
+    /// Test-only — the eager whole-segment decode oracle; production uses the
+    /// column-selective [`next_two_phase`](Self::next_two_phase).
+    #[cfg(test)]
     pub fn next_chunk(&mut self) -> Result<Option<SamplePspChunk>, PspReadError> {
         loop {
             match self.blocks.peek_block() {

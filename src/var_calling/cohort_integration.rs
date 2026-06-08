@@ -83,13 +83,6 @@ impl CohortSpanFold {
         Self::default()
     }
 
-    /// Reset to empty, preserving allocated capacity for reuse across spans.
-    pub fn clear(&mut self) {
-        self.positions.clear();
-        self.max_ref_span.clear();
-        self.max_nonref_obs.clear();
-    }
-
     /// The folded positions (sorted, unique).
     pub fn positions(&self) -> &[u32] {
         &self.positions
@@ -591,14 +584,20 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     /// covered intervals, emitting every [`RawCohortChunk`] (in genomic
     /// order, `chunk_order` monotonic across the whole run). The REF bytes and
     /// dust mask are **injected** — the chromosome→FASTA fetcher and the sdust
-    /// computation are the caller's (built FASTA-backed at the pipeline wiring;
-    /// dummy in tests), keeping this loop pure orchestration.
+    /// computation are the caller's, keeping this loop pure orchestration.
+    ///
+    /// Test-only convenience driver: production
+    /// ([`pipeline::run_var_calling`](crate::var_calling::pipeline::run_var_calling))
+    /// runs the equivalent `covered_intervals` → `begin_interval` →
+    /// `produce_chunk` loop itself, inside the producer rayon pool, so the
+    /// per-chunk REF/dust fetchers can stay thread-local.
     ///
     /// - `ref_fetch(chrom_id, start_1based, len)` → the REF bases for a chunk's
     ///   span (monotonic-forward within a chromosome);
     /// - `dust_for(chrom_id, &interval)` → that interval's sorted, half-open
     ///   low-complexity mask (empty when complexity filtering is off);
     /// - `emit(chunk)` receives each produced chunk.
+    #[cfg(test)]
     pub fn run<RefF, DustF, Emit>(
         &mut self,
         n_chromosomes: u32,

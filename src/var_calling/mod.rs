@@ -44,12 +44,15 @@ pub mod posterior_engine;
 pub mod variant_grouping;
 
 // --- Structure (producer / caller / writer plumbing) ---
-pub mod cohort_integration;
-pub mod pileup_overlaps;
+// `pipeline` is the production entry point (CLI / `main`); `vcf_writer` exposes
+// `WriterStats` (a CLI struct field) + a test-only filter helper. The rest is
+// crate-internal plumbing with no consumer outside this subtree.
+pub(crate) mod cohort_integration;
+pub(crate) mod pileup_overlaps;
 pub mod pipeline;
-pub mod sample_reader;
-pub mod types;
-pub mod variant_caller;
+pub(crate) mod sample_reader;
+pub(crate) mod types;
+pub(crate) mod variant_caller;
 pub mod vcf_writer;
 
 /// Default `--min-qual` (phred) emission gate (CLI default).

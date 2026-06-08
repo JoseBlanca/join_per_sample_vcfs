@@ -258,3 +258,172 @@ fn record_fails_mapq_diff_t(record: &Variant, threshold: f32) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pileup_record::AlleleSupportStats;
+    use crate::psp::header::ParsedChromosome;
+    use crate::var_calling::per_group_merger::MergedAllele;
+    use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
+    use tempfile::tempdir;
+
+    fn allele(seq: &[u8]) -> MergedAllele {
+        MergedAllele {
+            seq: seq.to_vec(),
+            is_compound: false,
+            constituents: Vec::new(),
+        }
+    }
+
+    fn support(num_obs: u32) -> AlleleSupportStats {
+        AlleleSupportStats::new(num_obs, 0.0, 0, 0, 0, 0, 0)
+    }
+
+    fn metadata_two_samples() -> CohortMetadata {
+        CohortMetadata {
+            sample_names: vec!["S0".into(), "S1".into()],
+            contigs: vec![ParsedChromosome {
+                name: "chr1".into(),
+                length: 1_000_000,
+                md5: "0123456789abcdef0123456789abcdef".into(),
+            }],
+            tool_string: "pop_var_caller vcf-writer-test".into(),
+            command_line: "pop_var_caller cohort --output out.vcf".into(),
+        }
+    }
+
+    /// A biallelic A→T SNP at `pos` for a 2-sample cohort. `best` is each
+    /// sample's argmax genotype index (0 = hom-ref); a non-zero entry makes it a
+    /// variant call. Scalars are inert (MAPQ filtering is disabled in these
+    /// tests, so the per-allele moments are unused).
+    fn snp_variant(pos: u32, qual: f64, best: [usize; 2], converged: bool) -> Variant {
+        PosteriorRecord {
+            locus: RecordLocus {
+                chrom_id: 0,
+                start: pos,
+                end: pos,
+            },
+            alleles: vec![allele(b"A"), allele(b"T")],
+            ploidy: 2,
+            n_samples: 2,
+            n_genotypes: 3,
+            allele_frequencies: vec![0.5, 0.5],
+            compound_frequencies: vec![None, None],
+            posteriors: vec![0.0; 6],
+            best_genotype: best.to_vec(),
+            gq_phred: vec![50.0, 50.0],
+            qual_phred: qual,
+            scalars: vec![support(20), support(0), support(20), support(0)],
+            other_scalars: vec![],
+            chain_anchor_flags: vec![false; 4],
+            diagnostics: EmDiagnostics {
+                iterations: 1,
+                final_max_delta_p: 1e-6,
+                converged,
+            },
+        }
+    }
+
+    fn called(chunk_order: u64, records: Vec<Variant>) -> CalledChunk {
+        CalledChunk {
+            chunk_order,
+            records,
+            stats: CallStats::default(),
+        }
+    }
+
+    fn filters_no_mapq() -> DownstreamFilters {
+        DownstreamFilters {
+            min_qual_phred: 30.0,
+            mapq_diff: MapqDiffFilter::Off,
+        }
+    }
+
+    #[test]
+    fn emits_in_chunk_order_when_chunks_arrive_out_of_order() {
+        // chunk_order is genomic order (0 ⇒ pos 100, 1 ⇒ 200, 2 ⇒ 300);
+        // delivered out of order, the BTreeMap reorder must still emit 100, 200,
+        // 300 — the byte-identical-for-any-worker-count mechanism.
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let mut writer = VcfWriter::new(
+            metadata_two_samples(),
+            WriterConfig::new(out.clone()),
+            filters_no_mapq(),
+        )
+        .unwrap();
+        writer
+            .handle(called(2, vec![snp_variant(300, 100.0, [1, 0], true)]))
+            .unwrap();
+        writer
+            .handle(called(0, vec![snp_variant(100, 100.0, [1, 0], true)]))
+            .unwrap();
+        writer
+            .handle(called(1, vec![snp_variant(200, 100.0, [1, 0], true)]))
+            .unwrap();
+        let stats = writer.finish().unwrap();
+        assert_eq!(stats.records_written, 3);
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let positions: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.split('\t').nth(1).unwrap())
+            .collect();
+        assert_eq!(
+            positions,
+            ["100", "200", "300"],
+            "emitted in chunk_order, not arrival order"
+        );
+    }
+
+    #[test]
+    fn finish_errors_with_missing_chunks_on_gap() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let mut writer = VcfWriter::new(
+            metadata_two_samples(),
+            WriterConfig::new(out),
+            filters_no_mapq(),
+        )
+        .unwrap();
+        writer
+            .handle(called(0, vec![snp_variant(100, 100.0, [1, 0], true)]))
+            .unwrap();
+        // chunk_order 1 is never delivered; chunk 2 stays buffered behind the gap.
+        writer
+            .handle(called(2, vec![snp_variant(300, 100.0, [1, 0], true)]))
+            .unwrap();
+        match writer.finish() {
+            Err(WriterError::MissingChunks { count }) => assert_eq!(count, 1),
+            other => panic!("expected MissingChunks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_or_drop_counts_each_bucket() {
+        // One chunk carrying one record per outcome (the MAPQ-diff gate is
+        // covered in isolation by `record_fails_mapq_diff_t_for_test`):
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        let mut writer = VcfWriter::new(
+            metadata_two_samples(),
+            WriterConfig::new(out),
+            filters_no_mapq(),
+        )
+        .unwrap();
+        let records = vec![
+            snp_variant(100, 100.0, [0, 0], true), // hom-ref ⇒ dropped_hom_ref
+            snp_variant(200, 5.0, [1, 0], true),   // QUAL 5 < 30 ⇒ dropped_low_qual
+            snp_variant(300, 100.0, [1, 0], true), // written
+            snp_variant(400, 100.0, [0, 1], false), // written + unconverged
+        ];
+        writer.handle(called(0, records)).unwrap();
+        let stats = writer.finish().unwrap();
+        assert_eq!(stats.records_written, 2);
+        assert_eq!(stats.records_dropped_hom_ref, 1);
+        assert_eq!(stats.records_dropped_low_qual, 1);
+        assert_eq!(stats.records_unconverged, 1);
+    }
+}
