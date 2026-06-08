@@ -768,28 +768,7 @@ impl TwoPhaseSegment {
             chain_ids,
         })
     }
-
-    /// Finalise the segment: compact the heavy columns to the `keep` rows
-    /// (variable-only) **and** hand back the full-block light columns the
-    /// producer keeps resident for the fold. Consumes `self`, freeing the
-    /// retained compressed blobs.
-    pub fn finalize(
-        self,
-        keep: &[bool],
-        decompressor: &mut zstd::bulk::Decompressor<'static>,
-        compressed_scratch: &mut Vec<u8>,
-        decompressed_scratch: &mut Vec<u8>,
-    ) -> Result<FinalizedSegment, PspReadError> {
-        let chunk =
-            self.set_variable_rows(keep, decompressor, compressed_scratch, decompressed_scratch)?;
-        Ok((self.positions, self.ref_spans, self.nonref_obs, chunk))
-    }
 }
-
-/// A finalised [`TwoPhaseSegment`]: `(positions, ref_spans, nonref_obs,
-/// variable_only_chunk)` — the full-block light columns the producer keeps
-/// resident for the fold, plus the compacted heavy chunk for record building.
-pub(crate) type FinalizedSegment = (Vec<u32>, Vec<u32>, Vec<u32>, SamplePspChunk);
 
 // ---------------------------------------------------------------------------
 // SamplePspReader

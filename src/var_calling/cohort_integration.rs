@@ -342,6 +342,7 @@ use crate::psp::block::new_column_decompressor;
 use crate::var_calling::sample_reader::{SamplePspChunk, SamplePspReader, TwoPhaseSegment};
 use crate::var_calling::types::{RawCohortChunk, RefSpan};
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 /// Boxed error type the producer's REF-fetch closure yields. Boxing keeps
 /// the producer decoupled from the concrete fetcher while preserving the
@@ -397,101 +398,85 @@ fn merge_block_ranges(
     out
 }
 
-/// A finalised buffered segment: full-block light columns (the fold still reads
-/// them) + the variable-only compacted heavy (sliced into cohort chunks by
-/// [`SamplePspChunk::append_range`]).
-struct ReadySegment {
-    positions: Vec<u32>,
-    ref_spans: Vec<u32>,
-    nonref_obs: Vec<u32>,
-    chunk: SamplePspChunk,
-}
-
-/// A buffered per-sample segment. The light columns (positions / ref-spans /
-/// non-REF obs — what the fold needs) are always resident; the heavy columns
-/// are deferred-compressed (`Pending`) until the segment's variable mask is
-/// final, then inflated + compacted to the variable rows once (`Ready`). The
-/// full-block light columns stay resident in both states so `rebuild_fold`
-/// works regardless of the heavy state.
+/// A planned-but-not-yet-compacted cohort chunk — the hand-off between the
+/// producer's two internal stages (appendix §B, "fold/plan" → "compact").
 ///
-/// `Ready` is boxed: most buffered segments are transient `Pending` read-ahead
-/// (folded, then dropped at the next cut), so keeping the larger finalised
-/// payload behind a pointer keeps the per-sample buffer `Vec` dense.
-enum BufferedSegment {
-    Pending(TwoPhaseSegment),
-    Ready(Box<ReadySegment>),
+/// The **fold/plan** stage ([`plan_chunk`](CohortChunkIntegrator::plan_chunk))
+/// runs the cohort fold over the light columns, derives the variable positions
+/// and the safe-gap cut, fetches the chunk's REF span, and captures — per
+/// sample — the (still-compressed) [`TwoPhaseSegment`]s overlapping
+/// `[chunk_start, cut)` as shared `Arc`s. The **compact** stage
+/// ([`compact_plan`]) then inflates only those segments' heavy columns for the
+/// variable rows, off the fold stage's critical path. A bounded queue between
+/// the two lets the next plan's fold overlap this plan's heavy decode; the
+/// `Arc` sharing keeps a segment that straddles two chunks resident once (no
+/// copy), so peak memory tracks the queue depth, not duplication.
+pub(crate) struct ChunkPlan {
+    chunk_order: u64,
+    chrom_id: u32,
+    chunk_start: u32,
+    cut: u32,
+    /// Every variable (post-dust) position over the whole current fold, sorted.
+    kept_all: Vec<u32>,
+    ref_span: RefSpan,
+    /// Per sample: the buffered segments overlapping `[chunk_start, cut)`,
+    /// shared with the producer's live buffer (a straddler is referenced by two
+    /// consecutive plans).
+    per_sample_segments: Vec<Vec<Arc<TwoPhaseSegment>>>,
 }
 
-impl BufferedSegment {
-    fn positions(&self) -> &[u32] {
-        match self {
-            BufferedSegment::Pending(s) => s.positions(),
-            BufferedSegment::Ready(r) => &r.positions,
-        }
-    }
-    fn ref_spans(&self) -> &[u32] {
-        match self {
-            BufferedSegment::Pending(s) => s.ref_spans(),
-            BufferedSegment::Ready(r) => &r.ref_spans,
-        }
-    }
-    fn nonref_obs(&self) -> &[u32] {
-        match self {
-            BufferedSegment::Pending(s) => s.nonref_obs(),
-            BufferedSegment::Ready(r) => &r.nonref_obs,
-        }
-    }
-    fn last_pos(&self) -> Option<u32> {
-        self.positions().last().copied()
-    }
-
-    /// If this is a `Pending` segment whose variable mask is now final — its
-    /// `last_pos < cut`, so every row sits below the safe-gap cut and is in a
-    /// **closed** variant group (its `is_kept` won't change) — inflate +
-    /// compact it to variable-only **once** and become `Ready`. No-op when
-    /// already `Ready` or not yet finalisable (a segment straddling `cut`, whose
-    /// suffix may still be in an open group, is partial-inflated instead).
-    /// `kept_all` is the sorted set of variable (post-dust) positions;
-    /// `keep[r] = positions[r] ∈ kept_all`.
-    fn finalize_if_ready(
-        &mut self,
-        kept_all: &[u32],
-        cut: u32,
-        decompressor: &mut zstd::bulk::Decompressor<'static>,
-        compressed_scratch: &mut Vec<u8>,
-        decompressed_scratch: &mut Vec<u8>,
-    ) -> Result<(), ProducerError> {
-        let finalisable = match self {
-            BufferedSegment::Pending(s) => s.last_pos().is_some_and(|lp| lp < cut),
-            BufferedSegment::Ready(_) => false,
-        };
-        if !finalisable {
-            return Ok(());
-        }
-        let keep = membership_mask(self.positions(), kept_all);
-        // Take ownership of the Pending segment to consume it (free its blobs).
-        let placeholder = BufferedSegment::Ready(Box::new(ReadySegment {
-            positions: Vec::new(),
-            ref_spans: Vec::new(),
-            nonref_obs: Vec::new(),
-            chunk: SamplePspChunk::empty_compacted(0),
-        }));
-        if let BufferedSegment::Pending(seg) = std::mem::replace(self, placeholder) {
-            let (positions, ref_spans, nonref_obs, chunk) = seg.finalize(
-                &keep,
-                decompressor,
-                compressed_scratch,
-                decompressed_scratch,
-            )?;
-            *self = BufferedSegment::Ready(Box::new(ReadySegment {
-                positions,
-                ref_spans,
-                nonref_obs,
-                chunk,
-            }));
-        }
-        Ok(())
-    }
+/// Compact stage: inflate each plan'd segment's heavy columns for its variable
+/// rows in `[chunk_start, cut)` and assemble the cohort chunk. Stateless and
+/// `self`-free, so it runs on a separate stage thread (still fanning out across
+/// the N samples on the producer rayon pool). Byte-identical to the inline
+/// `compact_samples` it replaces: same per-segment `set_variable_rows` inflate
+/// restricted to `kept_all ∩ [chunk_start, cut)`, same genomic row order.
+pub(crate) fn compact_plan(plan: ChunkPlan) -> Result<RawCohortChunk, ProducerError> {
+    use rayon::prelude::*;
+    let ChunkPlan {
+        chunk_order,
+        chrom_id,
+        chunk_start,
+        cut,
+        kept_all,
+        ref_span,
+        per_sample_segments,
+    } = plan;
+    let per_sample: Vec<SamplePspChunk> = per_sample_segments
+        .par_iter()
+        .map(|segs| -> Result<SamplePspChunk, ProducerError> {
+            // Per-task zstd context + scratch, created lazily.
+            let mut decompressor: Option<zstd::bulk::Decompressor<'static>> = None;
+            let (mut cs, mut ds) = (Vec::new(), Vec::new());
+            let mut compacted = SamplePspChunk::empty_compacted(chrom_id);
+            for seg in segs {
+                // Rows that are variable (∈ kept_all) and in this chunk's span.
+                let positions = seg.positions();
+                let mut keep = membership_mask(positions, &kept_all);
+                for (k, &p) in keep.iter_mut().zip(positions.iter()) {
+                    *k &= p >= chunk_start && p < cut;
+                }
+                if !keep.iter().any(|&b| b) {
+                    continue;
+                }
+                let dz = decompressor.get_or_insert_with(|| {
+                    // PANIC-FREE: `zstd::bulk::Decompressor::new` is infallible
+                    // on every supported platform.
+                    new_column_decompressor().expect(
+                        "zstd::bulk::Decompressor::new is infallible on supported platforms",
+                    )
+                });
+                let chunk = seg.set_variable_rows(&keep, dz, &mut cs, &mut ds)?;
+                compacted.append_range(&chunk, chunk_start, cut);
+            }
+            Ok(compacted)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RawCohortChunk {
+        chunk_order,
+        per_sample,
+        ref_span,
+    })
 }
 
 /// Streaming cohort producer over **one covered interval** (appendix §B).
@@ -523,10 +508,11 @@ pub struct CohortChunkIntegrator<R: Read + Seek> {
     interval_end: u32, // exclusive
     next_chunk_start: u32,
     /// Per sample: buffered segments (carryover + read-ahead), in genomic
-    /// order; dropped once fully below `next_chunk_start`. Each is `Pending`
-    /// (light + compressed heavy) until its variable mask is final, then
-    /// finalised once to `Ready` (variable-only).
-    buffers: Vec<Vec<BufferedSegment>>,
+    /// order; dropped once fully below `next_chunk_start`. Each carries the
+    /// light fold columns + the still-compressed heavy columns; held behind an
+    /// `Arc` so a [`ChunkPlan`] can share a straddling segment with the live
+    /// buffer (compaction inflates the heavy columns on its own stage).
+    buffers: Vec<Vec<Arc<TwoPhaseSegment>>>,
     /// Per sample: reader exhausted within the current interval.
     exhausted: Vec<bool>,
     dust_mask: Vec<Range<u32>>,
@@ -705,7 +691,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             .collect();
         for (s, outcome) in outcomes {
             match outcome? {
-                Some(seg) => self.buffers[s].push(BufferedSegment::Pending(seg)),
+                Some(seg) => self.buffers[s].push(Arc::new(seg)),
                 None => self.exhausted[s] = true,
             }
         }
@@ -795,13 +781,33 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     }
 
     /// Produce the next chunk of the current interval, or `Ok(None)` when the
-    /// interval is drained. `fetch_ref` returns the REF bases for a 1-based
-    /// `(start, length)` span (errors carried through [`ProducerError::Ref`]
-    /// with their typed cause intact).
+    /// interval is drained — [`plan_chunk`](Self::plan_chunk) followed by the
+    /// inline [`compact_plan`]. The production pipeline runs the two as
+    /// **separate stages** (a bounded queue between them lets the next plan's
+    /// fold overlap this plan's heavy decode); this convenience wrapper keeps
+    /// the single-call shape the producer's tests + the test `run` driver use.
+    #[cfg(test)]
     pub fn produce_chunk(
         &mut self,
         fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, RefFetchError>,
     ) -> Result<Option<RawCohortChunk>, ProducerError> {
+        match self.plan_chunk(fetch_ref)? {
+            Some(plan) => Ok(Some(compact_plan(plan)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fold/plan stage: advance the cohort fold to the next safe-gap cut, derive
+    /// the chunk's variable positions, fetch its REF span, and capture the
+    /// (still-compressed) per-sample segments overlapping `[chunk_start, cut)`
+    /// as a [`ChunkPlan`]. `Ok(None)` once the interval is drained. The heavy
+    /// decode runs later in [`compact_plan`]; this stage stays on the producer's
+    /// critical path so REF fetch (monotonic-forward within a contig) and the
+    /// serial fold bookkeeping keep their ordering.
+    pub fn plan_chunk(
+        &mut self,
+        fetch_ref: &mut dyn FnMut(u32, u32) -> Result<Vec<u8>, RefFetchError>,
+    ) -> Result<Option<ChunkPlan>, ProducerError> {
         loop {
             if self.next_chunk_start >= self.interval_end {
                 return Ok(None);
@@ -829,7 +835,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 .derive_is_kept(self.min_alt_obs, &mut self.is_kept);
             drop_dust_masked(self.fold.positions(), &mut self.is_kept, &self.dust_mask);
             // `kept_all` = every variable (post-dust) position over the whole
-            // fold — the mask used to finalise a fully-folded segment to
+            // fold — the mask the compact stage uses to slice each segment to
             // variable-only. `variable` is the prefix `< cut`: this chunk's
             // positions (for the REF span and the variant-free check). Both are
             // sorted ascending (the fold is).
@@ -852,22 +858,45 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 continue;
             }
 
-            // Compact each sample's variable rows in `[chunk_start, cut)`:
-            // finalise each fully-folded segment to variable-only (once) and
-            // slice it, partial-inflating any not-yet-finalisable straddler.
-            let per_sample = self.compact_samples(&kept_all, chunk_start, cut)?;
+            // Capture the segments overlapping [chunk_start, cut) (shared Arcs)
+            // and fetch the REF span — both before dropping consumed buffers.
+            let per_sample_segments = self.collect_overlapping(chunk_start, cut);
             let ref_span = self.fetch_ref_span(&variable, fetch_ref)?;
             self.next_chunk_start = cut;
             self.drop_buffers_below(cut);
 
             let chunk_order = self.chunk_order;
             self.chunk_order += 1;
-            return Ok(Some(RawCohortChunk {
+            return Ok(Some(ChunkPlan {
                 chunk_order,
-                per_sample,
+                chrom_id: self.chrom_id,
+                chunk_start,
+                cut,
+                kept_all,
                 ref_span,
+                per_sample_segments,
             }));
         }
+    }
+
+    /// Per sample: the buffered segments overlapping `[chunk_start, cut)`, as
+    /// shared `Arc` clones (cheap refcount bump — a straddler is shared with the
+    /// live buffer, never copied). The compact stage inflates their heavy
+    /// columns off the fold stage's critical path.
+    fn collect_overlapping(&self, chunk_start: u32, cut: u32) -> Vec<Vec<Arc<TwoPhaseSegment>>> {
+        self.buffers
+            .iter()
+            .map(|buf| {
+                buf.iter()
+                    .filter(|seg| {
+                        let first = seg.positions().first().copied().unwrap_or(0);
+                        let last = seg.last_pos().unwrap_or(0);
+                        first < cut && last >= chunk_start
+                    })
+                    .map(Arc::clone)
+                    .collect()
+            })
+            .collect()
     }
 
     /// Drop buffered segments wholly below `cut` (fully consumed).
@@ -875,74 +904,6 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         for buf in &mut self.buffers {
             buf.retain(|c| c.positions().last().is_some_and(|&p| p >= cut));
         }
-    }
-
-    /// Compact each sample's variable rows in `[chunk_start, cut)` into one
-    /// columnar [`SamplePspChunk`] per sample. For each buffered segment that
-    /// overlaps the chunk's span: if it is fully folded, **finalise it once**
-    /// (inflate + compact the heavy columns to variable-only — `Ready`) and
-    /// slice `[chunk_start, cut)` out of it; a not-yet-finalisable straddler
-    /// (extends past the watermark) is **partial-inflated** for just this
-    /// chunk's rows and left `Pending` to be inflated again next chunk. The
-    /// expensive columns→records rebuild + merge still run on the caller.
-    ///
-    /// Per-sample independent → rayon across the N samples (CPU-heavy
-    /// decompression). `kept_all` is the sorted variable-position set.
-    fn compact_samples(
-        &mut self,
-        kept_all: &[u32],
-        chunk_start: u32,
-        cut: u32,
-    ) -> Result<Vec<SamplePspChunk>, ProducerError> {
-        use rayon::prelude::*;
-        let chrom_id = self.chrom_id;
-        self.buffers
-            .par_iter_mut()
-            .map(|buf| -> Result<SamplePspChunk, ProducerError> {
-                // Per-task zstd context + scratch, created lazily (most touched
-                // segments are already `Ready`, so no decompression at all).
-                let mut decompressor: Option<zstd::bulk::Decompressor<'static>> = None;
-                let (mut cs, mut ds) = (Vec::new(), Vec::new());
-                let mut compacted = SamplePspChunk::empty_compacted(chrom_id);
-                for seg in buf.iter_mut() {
-                    let first = seg.positions().first().copied().unwrap_or(0);
-                    let last = seg.last_pos().unwrap_or(0);
-                    // No overlap with [chunk_start, cut): skip (untouched
-                    // read-ahead segments stay compressed).
-                    if first >= cut || last < chunk_start {
-                        continue;
-                    }
-                    let dz = decompressor.get_or_insert_with(|| {
-                        // PANIC-FREE: `zstd::bulk::Decompressor::new` is
-                        // infallible on every supported platform.
-                        new_column_decompressor().expect(
-                            "zstd::bulk::Decompressor::new is infallible on supported platforms",
-                        )
-                    });
-                    seg.finalize_if_ready(kept_all, cut, dz, &mut cs, &mut ds)?;
-                    match seg {
-                        BufferedSegment::Ready(r) => {
-                            compacted.append_range(&r.chunk, chunk_start, cut);
-                        }
-                        // Not finalisable (last_pos > watermark): partial-inflate
-                        // just this chunk's variable rows; leave it Pending.
-                        BufferedSegment::Pending(tp) => {
-                            // Membership in `kept_all` via merge-walk (both
-                            // ascending), then restrict to this chunk's
-                            // [chunk_start, cut) (L7).
-                            let positions = tp.positions();
-                            let mut keep = membership_mask(positions, kept_all);
-                            for (k, &p) in keep.iter_mut().zip(positions.iter()) {
-                                *k &= p >= chunk_start && p < cut;
-                            }
-                            let chunk = tp.set_variable_rows(&keep, dz, &mut cs, &mut ds)?;
-                            compacted.append_range(&chunk, chunk_start, cut);
-                        }
-                    }
-                }
-                Ok(compacted)
-            })
-            .collect()
     }
 
     /// Fetch the chunk's one contiguous REF span `[first_kept, max_reach]`
