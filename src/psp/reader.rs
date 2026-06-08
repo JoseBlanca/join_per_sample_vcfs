@@ -862,7 +862,7 @@ pub struct BlockColumns<'a> {
     /// Per-record allele counts.
     pub n_alleles: &'a [u64],
     /// Per-allele fixed-width columns (aligned with `SampleColumns`'
-    /// `PerAlleleFixed`).
+    /// `AlleleScalarColumns`).
     pub allele_obs_count: &'a [u32],
     pub allele_q_sum_log: &'a [f64],
     pub allele_fwd_count: &'a [u32],

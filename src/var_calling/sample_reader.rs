@@ -20,7 +20,7 @@
 //!   [`ref_spans`](SamplePspChunk::ref_spans), cached); the typed getters
 //!   ([`take_seq`](SamplePspChunk::take_seq) /
 //!   [`take_chain_ids`](SamplePspChunk::take_chain_ids) /
-//!   [`take_fixed`](SamplePspChunk::take_fixed)) move out their heavy
+//!   [`take_scalar`](SamplePspChunk::take_scalar)) move out their heavy
 //!   column(s) for the `keep` rows only.
 //!
 //! Phase 1 uses a **simple decode**: `SamplePspReader` decodes the whole
@@ -51,7 +51,7 @@ use crate::psp::{BlockColumnReader, BlockColumns, BlockIndexEntry, PspReadError,
 /// Per-(record, allele) fixed-width scalar columns — the 7 components of
 /// [`AlleleSupportStats`], one cell per allele.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct PerAlleleFixed {
+pub struct AlleleScalarColumns {
     pub num_obs: Vec<u32>,
     pub q_sum: Vec<f64>,
     pub fwd: Vec<u32>,
@@ -61,7 +61,7 @@ pub struct PerAlleleFixed {
     pub mapq_sum_sq: Vec<u64>,
 }
 
-impl PerAlleleFixed {
+impl AlleleScalarColumns {
     /// Total per-allele cells across all records.
     pub fn len(&self) -> usize {
         self.num_obs.len()
@@ -104,12 +104,12 @@ impl PerAlleleFixed {
 /// `offsets[k]..offsets[k + 1]` is allele `k`'s slice of [`Self::bytes`];
 /// the leading `0` keeps `offsets.len() == n_alleles + 1`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PerAlleleSeq {
+pub struct AlleleSeqColumns {
     pub offsets: Vec<u32>,
     pub bytes: Vec<u8>,
 }
 
-impl PerAlleleSeq {
+impl AlleleSeqColumns {
     /// Empty columns, CSR sentinel seeded.
     pub fn empty() -> Self {
         Self {
@@ -156,14 +156,14 @@ impl PerAlleleSeq {
 }
 
 /// Per-allele variable-length chain-id column, nested-CSR (mirrors
-/// [`PerAlleleSeq`] for [`ChainId`]s).
+/// [`AlleleSeqColumns`] for [`ChainId`]s).
 #[derive(Debug, Clone, PartialEq)]
-pub struct PerAlleleChainIds {
+pub struct AlleleChainIdColumns {
     pub offsets: Vec<u32>,
     pub ids: Vec<ChainId>,
 }
 
-impl PerAlleleChainIds {
+impl AlleleChainIdColumns {
     /// Empty columns, CSR sentinel seeded.
     pub fn empty() -> Self {
         Self {
@@ -239,9 +239,9 @@ pub struct SamplePspChunk {
     /// index to its allele range in the heavy columns.
     allele_offsets: Vec<u32>,
     /// Heavy columns, owned; moved out (and emptied) by the take-getters.
-    fixed: PerAlleleFixed,
-    seq: PerAlleleSeq,
-    chain_ids: PerAlleleChainIds,
+    scalar: AlleleScalarColumns,
+    seq: AlleleSeqColumns,
+    chain_ids: AlleleChainIdColumns,
 }
 
 /// Chain ids to attach to allele index `a` of a record whose allele range
@@ -254,7 +254,7 @@ pub struct SamplePspChunk {
 /// also covers any legacy `.psp` that still carries them, so they never
 /// reach the merger regardless of file age. See phase_chain.md §8.
 #[inline]
-fn chain_ids_for_allele(chain_ids: &PerAlleleChainIds, a: usize, lo: usize) -> Vec<ChainId> {
+fn chain_ids_for_allele(chain_ids: &AlleleChainIdColumns, a: usize, lo: usize) -> Vec<ChainId> {
     if a == lo {
         Vec::new()
     } else {
@@ -312,31 +312,31 @@ impl SamplePspChunk {
         }
 
         // Heavy columns for the clamped allele range.
-        let mut fixed = PerAlleleFixed::default();
-        fixed
+        let mut scalar = AlleleScalarColumns::default();
+        scalar
             .num_obs
             .extend_from_slice(&cols.allele_obs_count[a_lo..a_hi]);
-        fixed
+        scalar
             .q_sum
             .extend_from_slice(&cols.allele_q_sum_log[a_lo..a_hi]);
-        fixed
+        scalar
             .fwd
             .extend_from_slice(&cols.allele_fwd_count[a_lo..a_hi]);
-        fixed
+        scalar
             .placed_left
             .extend_from_slice(&cols.allele_placed_left_count[a_lo..a_hi]);
-        fixed
+        scalar
             .placed_start
             .extend_from_slice(&cols.allele_placed_start_count[a_lo..a_hi]);
-        fixed
+        scalar
             .mapq_sum
             .extend_from_slice(&cols.allele_mapq_sum[a_lo..a_hi]);
-        fixed
+        scalar
             .mapq_sum_sq
             .extend_from_slice(&cols.allele_mapq_sum_sq[a_lo..a_hi]);
 
-        let mut seq = PerAlleleSeq::empty();
-        let mut chain_ids = PerAlleleChainIds::empty();
+        let mut seq = AlleleSeqColumns::empty();
+        let mut chain_ids = AlleleChainIdColumns::empty();
         for k in a_lo..a_hi {
             let s = cols.allele_seq_offsets[k] as usize;
             let e = cols.allele_seq_offsets[k + 1] as usize;
@@ -371,7 +371,7 @@ impl SamplePspChunk {
             nonref_obs,
             ref_spans,
             allele_offsets,
-            fixed,
+            scalar,
             seq,
             chain_ids,
         }))
@@ -432,9 +432,9 @@ impl SamplePspChunk {
             nonref_obs: Vec::new(),
             ref_spans: Vec::new(),
             allele_offsets: vec![0],
-            fixed: PerAlleleFixed::default(),
-            seq: PerAlleleSeq::empty(),
-            chain_ids: PerAlleleChainIds::empty(),
+            scalar: AlleleScalarColumns::default(),
+            seq: AlleleSeqColumns::empty(),
+            chain_ids: AlleleChainIdColumns::empty(),
         }
     }
 
@@ -453,7 +453,7 @@ impl SamplePspChunk {
             let lo = src.allele_offsets[r] as usize;
             let hi = src.allele_offsets[r + 1] as usize;
             self.positions.push(src.positions[r]);
-            self.fixed.extend_from_range(&src.fixed, lo..hi);
+            self.scalar.extend_from_range(&src.scalar, lo..hi);
             self.seq.extend_from_range(&src.seq, lo..hi);
             self.chain_ids.extend_from_range(&src.chain_ids, lo..hi);
             let cum = self.allele_offsets.last().copied().unwrap_or(0) + (hi - lo) as u32;
@@ -474,7 +474,7 @@ impl SamplePspChunk {
             let a_lo = src.allele_offsets[r] as usize;
             let a_hi = src.allele_offsets[r + 1] as usize;
             self.positions.push(src.positions[r]);
-            self.fixed.extend_from_range(&src.fixed, a_lo..a_hi);
+            self.scalar.extend_from_range(&src.scalar, a_lo..a_hi);
             self.seq.extend_from_range(&src.seq, a_lo..a_hi);
             self.chain_ids.extend_from_range(&src.chain_ids, a_lo..a_hi);
             let cum = self.allele_offsets.last().copied().unwrap_or(0) + (a_hi - a_lo) as u32;
@@ -496,7 +496,7 @@ impl SamplePspChunk {
             for a in lo..hi {
                 alleles.push(AlleleObservation::new(
                     self.seq.slice_at(a).to_vec(),
-                    self.fixed.support_at(a),
+                    self.scalar.support_at(a),
                     chain_ids_for_allele(&self.chain_ids, a, lo),
                 ));
             }
@@ -524,7 +524,7 @@ impl SamplePspChunk {
             for a in lo..hi {
                 alleles.push(AlleleObservation::new(
                     self.seq.slice_at(a).to_vec(),
-                    self.fixed.support_at(a),
+                    self.scalar.support_at(a),
                     chain_ids_for_allele(&self.chain_ids, a, lo),
                 ));
             }
@@ -533,13 +533,13 @@ impl SamplePspChunk {
         out
     }
 
-    /// Move out the fixed-scalar columns for the `keep` records (appendix
+    /// Move out the scalar columns for the `keep` records (appendix
     /// §A typed getter). `keep.len()` must equal [`len`](Self::len);
     /// the column is emptied, so a second call yields nothing.
-    pub fn take_fixed(&mut self, keep: &[bool]) -> PerAlleleFixed {
+    pub fn take_scalar(&mut self, keep: &[bool]) -> AlleleScalarColumns {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
-        let src = std::mem::take(&mut self.fixed);
-        let mut out = PerAlleleFixed::default();
+        let src = std::mem::take(&mut self.scalar);
+        let mut out = AlleleScalarColumns::default();
         for (r, &k) in keep.iter().enumerate() {
             if k {
                 let lo = self.allele_offsets[r] as usize;
@@ -554,10 +554,10 @@ impl SamplePspChunk {
     ///
     /// Call-once (per the appendix §A "fetched at most once" contract): the
     /// column is moved out, so a second call on the same chunk is misuse.
-    pub fn take_seq(&mut self, keep: &[bool]) -> PerAlleleSeq {
+    pub fn take_seq(&mut self, keep: &[bool]) -> AlleleSeqColumns {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
-        let src = std::mem::replace(&mut self.seq, PerAlleleSeq::empty());
-        let mut out = PerAlleleSeq::empty();
+        let src = std::mem::replace(&mut self.seq, AlleleSeqColumns::empty());
+        let mut out = AlleleSeqColumns::empty();
         for (r, &k) in keep.iter().enumerate() {
             if k {
                 let lo = self.allele_offsets[r] as usize;
@@ -569,10 +569,10 @@ impl SamplePspChunk {
     }
 
     /// Move out the allele-chain-id column for the `keep` records.
-    pub fn take_chain_ids(&mut self, keep: &[bool]) -> PerAlleleChainIds {
+    pub fn take_chain_ids(&mut self, keep: &[bool]) -> AlleleChainIdColumns {
         debug_assert_eq!(keep.len(), self.len(), "keep mask must cover every record");
-        let src = std::mem::replace(&mut self.chain_ids, PerAlleleChainIds::empty());
-        let mut out = PerAlleleChainIds::empty();
+        let src = std::mem::replace(&mut self.chain_ids, AlleleChainIdColumns::empty());
+        let mut out = AlleleChainIdColumns::empty();
         for (r, &k) in keep.iter().enumerate() {
             if k {
                 let lo = self.allele_offsets[r] as usize;
@@ -720,12 +720,12 @@ impl TwoPhaseSegment {
         }
 
         // `num_obs` is the light obs-count column (already decoded, not deferred).
-        let mut fixed = PerAlleleFixed::default();
-        extend_kept(&mut fixed.num_obs, &self.allele_obs_count, &ranges);
+        let mut scalar = AlleleScalarColumns::default();
+        extend_kept(&mut scalar.num_obs, &self.allele_obs_count, &ranges);
 
         // Inflate + compact each deferred column, freeing between (one resident).
-        let mut seq = PerAlleleSeq::empty();
-        let mut chain_ids = PerAlleleChainIds::empty();
+        let mut seq = AlleleSeqColumns::empty();
+        let mut chain_ids = AlleleChainIdColumns::empty();
         let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for rc in &self.retained {
             let col = inflate_retained_column(
@@ -743,22 +743,22 @@ impl TwoPhaseSegment {
                 &mut co,
             )?;
             match col {
-                Some(DecodedColumn::AlleleQSumLog(v)) => extend_kept(&mut fixed.q_sum, &v, &ranges),
-                Some(DecodedColumn::AlleleFwdCount(v)) => extend_kept(&mut fixed.fwd, &v, &ranges),
+                Some(DecodedColumn::AlleleQSumLog(v)) => extend_kept(&mut scalar.q_sum, &v, &ranges),
+                Some(DecodedColumn::AlleleFwdCount(v)) => extend_kept(&mut scalar.fwd, &v, &ranges),
                 Some(DecodedColumn::AllelePlacedLeftCount(v)) => {
-                    extend_kept(&mut fixed.placed_left, &v, &ranges)
+                    extend_kept(&mut scalar.placed_left, &v, &ranges)
                 }
                 Some(DecodedColumn::AllelePlacedStartCount(v)) => {
-                    extend_kept(&mut fixed.placed_start, &v, &ranges)
+                    extend_kept(&mut scalar.placed_start, &v, &ranges)
                 }
                 Some(DecodedColumn::AlleleMapqSum(v)) => {
-                    extend_kept(&mut fixed.mapq_sum, &v, &ranges)
+                    extend_kept(&mut scalar.mapq_sum, &v, &ranges)
                 }
                 Some(DecodedColumn::AlleleMapqSumSq(v)) => {
-                    extend_kept(&mut fixed.mapq_sum_sq, &v, &ranges)
+                    extend_kept(&mut scalar.mapq_sum_sq, &v, &ranges)
                 }
                 Some(DecodedColumn::AlleleSeq) => {
-                    let full = PerAlleleSeq {
+                    let full = AlleleSeqColumns {
                         offsets: std::mem::take(&mut so),
                         bytes: std::mem::take(&mut sd),
                     };
@@ -767,7 +767,7 @@ impl TwoPhaseSegment {
                     }
                 }
                 Some(DecodedColumn::AlleleChainIds) => {
-                    let full = PerAlleleChainIds {
+                    let full = AlleleChainIdColumns {
                         offsets: std::mem::take(&mut co),
                         ids: std::mem::take(&mut cd),
                     };
@@ -786,7 +786,7 @@ impl TwoPhaseSegment {
             nonref_obs: Vec::new(),
             ref_spans: Vec::new(),
             allele_offsets,
-            fixed,
+            scalar,
             seq,
             chain_ids,
         })
@@ -1152,9 +1152,9 @@ mod tests {
         Vec<u32>,
         Vec<u32>,
         Vec<u32>,
-        PerAlleleFixed,
-        PerAlleleSeq,
-        PerAlleleChainIds,
+        AlleleScalarColumns,
+        AlleleSeqColumns,
+        AlleleChainIdColumns,
     ) {
         let reader = PspReader::new(Cursor::new(bytes.to_vec())).expect("reader opens");
         let mut sr = SamplePspReader::new(reader, chrom, start, end);
@@ -1162,24 +1162,24 @@ mod tests {
         let mut positions = Vec::new();
         let mut nonref_obs = Vec::new();
         let mut ref_spans = Vec::new();
-        let mut fixed = PerAlleleFixed::default();
-        let mut seq = PerAlleleSeq::empty();
-        let mut chain = PerAlleleChainIds::empty();
+        let mut scalar = AlleleScalarColumns::default();
+        let mut seq = AlleleSeqColumns::empty();
+        let mut chain = AlleleChainIdColumns::empty();
 
         while let Some(mut chunk) = sr.next_chunk().expect("next_chunk") {
             positions.extend_from_slice(chunk.positions());
             nonref_obs.extend_from_slice(chunk.nonref_obs());
             ref_spans.extend_from_slice(chunk.ref_spans());
             let keep = vec![true; chunk.len()];
-            let cf = chunk.take_fixed(&keep);
+            let cf = chunk.take_scalar(&keep);
             let cs = chunk.take_seq(&keep);
             let cc = chunk.take_chain_ids(&keep);
             let n = cf.len();
-            fixed.extend_from_range(&cf, 0..n);
+            scalar.extend_from_range(&cf, 0..n);
             seq.extend_from_range(&cs, 0..cs.len());
             chain.extend_from_range(&cc, 0..cc.len());
         }
-        (positions, nonref_obs, ref_spans, fixed, seq, chain)
+        (positions, nonref_obs, ref_spans, scalar, seq, chain)
     }
 
     /// Build the expected flat columns straight from the row records.
@@ -1189,16 +1189,16 @@ mod tests {
         Vec<u32>,
         Vec<u32>,
         Vec<u32>,
-        PerAlleleFixed,
-        PerAlleleSeq,
-        PerAlleleChainIds,
+        AlleleScalarColumns,
+        AlleleSeqColumns,
+        AlleleChainIdColumns,
     ) {
         let mut positions = Vec::new();
         let mut nonref_obs = Vec::new();
         let mut ref_spans = Vec::new();
-        let mut fixed = PerAlleleFixed::default();
-        let mut seq = PerAlleleSeq::empty();
-        let mut chain = PerAlleleChainIds::empty();
+        let mut scalar = AlleleScalarColumns::default();
+        let mut seq = AlleleSeqColumns::empty();
+        let mut chain = AlleleChainIdColumns::empty();
         for r in recs {
             positions.push(r.pos);
             let nro = r.alleles[1..]
@@ -1207,18 +1207,18 @@ mod tests {
             nonref_obs.push(nro);
             ref_spans.push(r.alleles[0].seq.len() as u32);
             for a in &r.alleles {
-                fixed.num_obs.push(a.support.num_obs);
-                fixed.q_sum.push(a.support.q_sum);
-                fixed.fwd.push(a.support.fwd);
-                fixed.placed_left.push(a.support.placed_left);
-                fixed.placed_start.push(a.support.placed_start);
-                fixed.mapq_sum.push(a.support.mapq_sum);
-                fixed.mapq_sum_sq.push(a.support.mapq_sum_sq);
+                scalar.num_obs.push(a.support.num_obs);
+                scalar.q_sum.push(a.support.q_sum);
+                scalar.fwd.push(a.support.fwd);
+                scalar.placed_left.push(a.support.placed_left);
+                scalar.placed_start.push(a.support.placed_start);
+                scalar.mapq_sum.push(a.support.mapq_sum);
+                scalar.mapq_sum_sq.push(a.support.mapq_sum_sq);
                 seq.push(&a.seq);
                 chain.push(&a.chain_ids);
             }
         }
-        (positions, nonref_obs, ref_spans, fixed, seq, chain)
+        (positions, nonref_obs, ref_spans, scalar, seq, chain)
     }
 
     #[test]
@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!(got.0, want.0, "positions");
         assert_eq!(got.1, want.1, "nonref_obs");
         assert_eq!(got.2, want.2, "ref_spans");
-        assert_eq!(got.3, want.3, "fixed");
+        assert_eq!(got.3, want.3, "scalar");
         assert_eq!(got.4, want.4, "seq");
         assert_eq!(got.5, want.5, "chain_ids");
     }
@@ -1250,7 +1250,7 @@ mod tests {
         let got = drain_all(&bytes, 0, start, end);
         let want = expected_from_rows(&rows(&bytes, 0, start, end));
         assert_eq!(got.0, want.0, "positions");
-        assert_eq!(got.3, want.3, "fixed");
+        assert_eq!(got.3, want.3, "scalar");
         assert_eq!(got.4, want.4, "seq");
         assert_eq!(got.5, want.5, "chain_ids");
         // The clamp really dropped records outside the window.
@@ -1280,10 +1280,10 @@ mod tests {
             .map(|i| chunk.n_alleles_at(i))
             .sum();
 
-        let fixed = chunk.take_fixed(&keep);
+        let scalar = chunk.take_scalar(&keep);
         let seq = chunk.take_seq(&keep);
         let chain = chunk.take_chain_ids(&keep);
-        assert_eq!(fixed.len(), expected_alleles, "fixed allele count");
+        assert_eq!(scalar.len(), expected_alleles, "scalar allele count");
         assert_eq!(seq.len(), expected_alleles, "seq allele count");
         assert_eq!(chain.len(), expected_alleles, "chain allele count");
         // Cross-check against a fresh decode of just those positions.
