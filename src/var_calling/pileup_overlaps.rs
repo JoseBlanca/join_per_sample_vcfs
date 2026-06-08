@@ -48,3 +48,44 @@ pub fn overlapping_groups(
     });
     VariantGrouper::with_config(upstream, config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pileup_record::PileupRecord;
+    use crate::var_calling::test_helpers::allele;
+
+    /// One single-sample variable position: REF `ref_seq` + an ALT `T` so the
+    /// position seeds a group. `ref_seq.len()` is the REF span (the grouping
+    /// reach driver).
+    fn rec(pos: u32, ref_seq: &[u8]) -> CohortPileupRecord {
+        let alleles = vec![allele(ref_seq, 5, -1.0, &[]), allele(b"T", 3, -1.5, &[])];
+        CohortPileupRecord {
+            chrom_id: 0,
+            pos,
+            per_sample: vec![Some(PileupRecord::new(0, pos, alleles))],
+        }
+    }
+
+    #[test]
+    fn overlapping_groups_bridges_by_reach_and_splits_on_gap() {
+        // pos 10 has a 3-base REF span ⇒ reach [10, 12]; pos 12 falls inside it
+        // and joins the same group. pos 1000 is far past the reach ⇒ its own
+        // group. Verifies the reach-overlap join + the gap split.
+        let records = vec![rec(10, b"AAA"), rec(12, b"A"), rec(1000, b"A")];
+        let groups: Vec<_> = overlapping_groups(records, GrouperConfig::default())
+            .map(|g| g.expect("grouping"))
+            .collect();
+        assert_eq!(groups.len(), 2, "two groups: {groups:?}");
+        assert_eq!((groups[0].start, groups[0].end), (10, 12));
+        assert_eq!(groups[0].records.len(), 2, "pos 10 + 12 bridged");
+        assert_eq!((groups[1].start, groups[1].end), (1000, 1000));
+        assert_eq!(groups[1].records.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_groups_empty_input_yields_no_groups() {
+        let groups: Vec<_> = overlapping_groups(Vec::new(), GrouperConfig::default()).collect();
+        assert!(groups.is_empty());
+    }
+}

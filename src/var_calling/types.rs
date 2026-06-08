@@ -194,6 +194,15 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn ref_span_slice_below_span_start_panics() {
+        // group_start 5 precedes the span's genomic_start (10): the documented
+        // precondition violation (a `debug_assert!`; in release the lower-bound
+        // subtraction would underflow into an out-of-range index).
+        let _ = span().slice(5, 12);
+    }
+
+    #[test]
     fn default_ref_span_is_zeroed() {
         let e = RefSpan::default();
         assert_eq!(e.genomic_start, 0);

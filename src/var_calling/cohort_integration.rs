@@ -1511,4 +1511,52 @@ mod tests {
         assert!(got[..boundary].windows(2).all(|w| w[0].pos < w[1].pos));
         assert!(got[boundary..].windows(2).all(|w| w[0].pos < w[1].pos));
     }
+
+    #[test]
+    fn merge_reduce_tree_is_order_independent_with_ties() {
+        // `rebuild_fold` reduces per-sample folds via `merge` over an arbitrary
+        // rayon tree, so byte-identity needs `merge` associative + commutative.
+        // `merge_matches_sequential_fold` only checks a two-way merge of
+        // *distinct* values; this checks two different reduce-tree shapes over
+        // folds that **tie** at a shared position (where a non-commutative
+        // tie-break bug would hide).
+        let a = (vec![10u32, 20], vec![1u32, 2], vec![0u32, 3]);
+        let b = (vec![20u32, 30], vec![2u32, 1], vec![3u32, 1]);
+        let c = (vec![20u32, 25], vec![2u32, 1], vec![3u32, 0]);
+        let d = (vec![15u32, 20], vec![1u32, 2], vec![2u32, 3]);
+
+        use std::slice::from_ref;
+        // ((a ∘ b) ∘ c) ∘ d
+        let mut left = fold(from_ref(&a));
+        left.merge(&fold(from_ref(&b)));
+        left.merge(&fold(from_ref(&c)));
+        left.merge(&fold(from_ref(&d)));
+
+        // (a ∘ b) ∘ (c ∘ d)
+        let mut ab = fold(from_ref(&a));
+        ab.merge(&fold(from_ref(&b)));
+        let mut cd = fold(from_ref(&c));
+        cd.merge(&fold(from_ref(&d)));
+        ab.merge(&cd);
+
+        assert_eq!(left.positions(), ab.positions());
+        assert_eq!(left.max_ref_span, ab.max_ref_span);
+        assert_eq!(left.max_nonref_obs, ab.max_nonref_obs);
+        // And both equal the flat sequential fold of all four.
+        let seq = fold(&[a, b, c, d]);
+        assert_eq!(left.positions(), seq.positions());
+        assert_eq!(left.max_ref_span, seq.max_ref_span);
+        assert_eq!(left.max_nonref_obs, seq.max_nonref_obs);
+    }
+
+    #[test]
+    fn produce_chunk_with_zero_samples_yields_none() {
+        // Degenerate cohort (no readers): `watermark`/`all_exhausted` must drive
+        // the interval straight to `Ok(None)` rather than spin or panic.
+        let mut integ =
+            CohortChunkIntegrator::new(Vec::<SamplePspReader<Cursor<Vec<u8>>>>::new(), 1, 4);
+        integ.begin_interval(0, 1..100, Vec::new());
+        let mut fetch = |_s: u32, l: u32| Ok::<_, RefFetchError>(vec![b'N'; l as usize]);
+        assert!(integ.produce_chunk(&mut fetch).unwrap().is_none());
+    }
 }

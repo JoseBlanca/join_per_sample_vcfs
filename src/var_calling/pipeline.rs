@@ -505,3 +505,61 @@ fn restrict_intervals_to_regions(covered: &[Range<u32>], regions: &[Region]) -> 
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    // The `&[lo..hi]` covered-interval literals are intentional single-element
+    // arrays of `Range`, not a misformed range expression.
+    #![allow(clippy::single_range_in_vec_init)]
+    use super::*;
+
+    fn region(start: u32, end: u32) -> Region {
+        Region {
+            chrom_id: 0,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn restrict_intervals_clips_region_inside_one_interval() {
+        // Region [12,15] (1-based inclusive) inside covered [10,20): the
+        // half-open overlap is [12, 16).
+        let got = restrict_intervals_to_regions(&[10..20], &[region(12, 15)]);
+        assert_eq!(got, vec![12..16]);
+    }
+
+    #[test]
+    fn restrict_intervals_straddling_region_splits_across_intervals() {
+        // Region [18,34] straddles the gap between covered [10,20) and
+        // [30,40): clipped to [18,20) ∪ [30,35).
+        let got = restrict_intervals_to_regions(&[10..20, 30..40], &[region(18, 34)]);
+        assert_eq!(got, vec![18..20, 30..35]);
+    }
+
+    #[test]
+    fn restrict_intervals_touching_exclusive_end_is_empty() {
+        // Region [20,25]: covered [10,20) is half-open, so position 20 is not
+        // covered — no overlap.
+        let got = restrict_intervals_to_regions(&[10..20], &[region(20, 25)]);
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn restrict_intervals_region_left_of_covered_is_empty() {
+        let got = restrict_intervals_to_regions(&[10..20], &[region(1, 5)]);
+        assert!(got.is_empty(), "got {got:?}");
+    }
+
+    #[test]
+    fn restrict_intervals_empty_regions_yields_empty() {
+        assert!(restrict_intervals_to_regions(&[10..20, 30..40], &[]).is_empty());
+    }
+
+    #[test]
+    fn restrict_intervals_multiple_regions_in_one_interval() {
+        // Two disjoint regions inside one covered interval, each clipped.
+        let got = restrict_intervals_to_regions(&[10..50], &[region(12, 15), region(30, 40)]);
+        assert_eq!(got, vec![12..16, 30..41]);
+    }
+}
