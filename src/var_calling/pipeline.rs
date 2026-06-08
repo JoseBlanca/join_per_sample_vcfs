@@ -1,19 +1,33 @@
 //! Driver / wiring — section orchestration (appendix §G).
 //!
-//! Wires the three sections producer → caller → writer and exposes the cohort
-//! `.psp` → VCF entry point ([`run_var_calling`]) the CLI invokes.
+//! Wires the staged pipeline read → fold → compact → caller → writer and
+//! exposes the cohort `.psp` → VCF entry point ([`run_var_calling`]) the CLI
+//! invokes.
 //!
 //! **Parallel topology.** A bounded-`crossbeam-channel` pipeline inside a
-//! [`std::thread::scope`]: the producer ([`CohortChunkIntegrator`]) runs on
-//! the main thread (its per-sample readers + REF/dust fetchers are
-//! thread-local) and ships [`RawCohortChunk`]s; `W` caller threads
-//! ([`VariantCaller`]) pop chunks, call them, and push [`CalledChunk`]s; one
-//! writer thread ([`VcfWriter`]) drains them, reordering by `chunk_order` via a
-//! `BTreeMap` so the emitted VCF is in genomic order regardless of how the
-//! callers finish. Both hand-offs are count-bounded (depth ≈
-//! `QUEUE_DEPTH_PER_WORKER × n_workers`) for back-pressure, so peak tracks the
-//! queue capacity rather than scheduling. The output is byte-identical for any
-//! worker count.
+//! [`std::thread::scope`], all hand-offs count-bounded for back-pressure (peak
+//! tracks the queue capacities, not scheduling):
+//!
+//! 1. **read stage** ([`drive_read_stage`]) — owns the per-sample readers,
+//!    decodes each sample's light-column segments ahead on the producer pool
+//!    into per-sample bounded queues (depth [`READ_QUEUE_DEPTH`]);
+//! 2. **fold/plan stage** (main thread, the [`CohortChunkIntegrator`]) — pulls
+//!    decoded segments, folds the light columns to find the chunk's variable
+//!    positions + safe-gap cut, fetches its REF span, and ships a `ChunkPlan`
+//!    (still-compressed per-sample segments, shared by `Arc`) over a depth-2
+//!    queue;
+//! 3. **compact stage** ([`compact_plan`]) — inflates only those segments' heavy
+//!    columns for the variable rows and ships a [`RawCohortChunk`];
+//! 4. `W` **caller threads** ([`VariantCaller`]) pop chunks, call them, push
+//!    [`CalledChunk`]s;
+//! 5. one **writer thread** ([`VcfWriter`]) drains them, reordering by
+//!    `chunk_order` via a `BTreeMap` so the emitted VCF is in genomic order
+//!    regardless of how the callers finish.
+//!
+//! Splitting read / fold / compact into concurrent stages keeps the producer
+//! pool fed — the light decode (the fold stage's dominant critical-path cost)
+//! overlaps folding + compaction instead of blocking the fold thread. The
+//! output is byte-identical for any worker count and any stage timing.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -28,7 +42,8 @@ use crate::pop_var_caller::var_calling::VarCallingArgs;
 use crate::psp::{PspReadError, PspReader};
 use crate::regions::{BedError, ContigBounds, Region, RegionSet};
 use crate::var_calling::cohort_integration::{
-    ChunkPlan, CohortChunkIntegrator, ProducerError, RefFetchError, compact_plan,
+    ChunkPlan, CohortChunkIntegrator, ProducerError, ReadMsg, RefFetchError, compact_plan,
+    covered_intervals_for, drive_read_stage,
 };
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
 use crate::var_calling::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
@@ -70,6 +85,11 @@ const QUEUE_DEPTH_PER_WORKER: usize = 2;
 /// heavy decode without reading unboundedly ahead — peak memory tracks this
 /// depth (each in-flight plan pins its chunk's still-compressed segments).
 const PLAN_QUEUE_DEPTH: usize = 2;
+/// Depth of each per-sample queue between the producer's read stage and its
+/// fold stage. `2` lets the read stage decode one segment ahead per sample
+/// (overlapping decode with folding) without reading unboundedly ahead — peak
+/// memory tracks this depth × N samples (each slot a still-compressed segment).
+const READ_QUEUE_DEPTH: usize = 2;
 /// DUST sub-span for the resident-buffer bound. The mask is byte-identical for
 /// any sub-span (runs are coalesced across boundaries); this just caps RAM.
 const DUST_SUBSPAN: u32 = 1_000_000;
@@ -208,13 +228,33 @@ pub fn run_var_calling(
     };
 
     // --- Per-sample segment readers. The (chrom_id, region_start, region_end)
-    //     = (0, 1, 1) triple is an inert placeholder: the producer's
-    //     `begin_interval` calls `reset()` on every reader before the first
+    //     = (0, 1, 1) triple is an inert placeholder: the read stage calls
+    //     `reset()` on every reader at the first interval before the first
     //     read, so these values are never observed. ---
     let readers: Vec<SamplePspReader<BufReader<File>>> = psp_readers
         .into_iter()
         .map(|r| SamplePspReader::new(r, 0, 1, 1))
         .collect();
+    let n_samples = readers.len();
+
+    // --- Whole-cohort interval schedule, computed once from the in-memory
+    //     block indexes (no I/O) and shared by the read stage and the fold
+    //     loop so both walk the covered intervals in identical order. With
+    //     `--regions` each interval is clipped to the analysis regions (the
+    //     byte-identical whole-genome path when absent). ---
+    let schedule: Vec<(u32, Range<u32>)> = {
+        let mut sched = Vec::new();
+        for chrom_id in 0..n_chromosomes {
+            let mut intervals = covered_intervals_for(&readers, chrom_id, max_group_span);
+            if let Some(rs) = &region_set {
+                intervals = restrict_intervals_to_regions(&intervals, rs.regions_for(chrom_id));
+            }
+            for interval in intervals {
+                sched.push((chrom_id, interval));
+            }
+        }
+        sched
+    };
 
     // --- The three sections. ---
     let metadata = CohortMetadata {
@@ -242,7 +282,22 @@ pub fn run_var_calling(
         min_alt_obs,
         sample_names.clone(),
     );
-    let mut producer = CohortChunkIntegrator::new(readers, min_alt_obs, target_variants);
+    // Per-sample read-stage queues + the fold stage's back-pressure wake. The
+    // read stage owns the readers and decodes ahead into `seg_txs`; the fold
+    // stage (the integrator) pulls from `seg_rxs`.
+    let (seg_txs, seg_rxs): (
+        Vec<crossbeam_channel::Sender<ReadMsg>>,
+        Vec<crossbeam_channel::Receiver<ReadMsg>>,
+    ) = (0..n_samples)
+        .map(|_| crossbeam_channel::bounded::<ReadMsg>(READ_QUEUE_DEPTH))
+        .unzip();
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+    let mut producer = CohortChunkIntegrator::<BufReader<File>>::new_streaming(
+        seg_rxs,
+        wake_tx,
+        min_alt_obs,
+        target_variants,
+    );
 
     // --- Parallel topology: producer (this thread) → W callers → writer. ---
     //
@@ -292,6 +347,7 @@ pub fn run_var_calling(
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
     let producer_pool = &producer_pool;
+    let schedule = &schedule;
 
     std::thread::scope(|scope| -> Result<WriterStats, PipelineError> {
         // Writer thread: drain CalledChunks (reorder + filter + write); returns
@@ -337,51 +393,63 @@ pub fn run_var_calling(
             Ok(())
         });
 
-        // Fold/plan stage on the main thread. Its `par_iter` read + fold bursts
-        // run on `producer_pool` (H1: sized independently of the callers)
-        // because the whole loop executes inside `producer_pool.install(...)`.
+        // Read stage: owns the readers, walks `schedule` decoding each sample's
+        // light-column segments ahead into the per-sample queues (fanning out
+        // on `producer_pool`) so the fold stage never blocks on decode. Owns
+        // `seg_txs`, so the per-sample queues close when the schedule is drained.
+        let read_handle = scope.spawn(move || -> Result<(), PipelineError> {
+            drive_read_stage(
+                readers,
+                schedule,
+                &seg_txs,
+                &wake_rx,
+                producer_pool,
+                READ_QUEUE_DEPTH,
+            )?;
+            Ok(())
+        });
+
+        // Fold/plan stage on the main thread. It pulls already-decoded segments
+        // from the read stage's per-sample queues and runs `rebuild_fold` on
+        // `producer_pool` (H1: sized independently of the callers) because the
+        // whole loop executes inside `producer_pool.install(...)`. It walks the
+        // same `schedule` the read stage does, in lockstep.
         let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
         let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
         let produce = producer_pool.install(|| -> Result<(), PipelineError> {
-            for chrom_id in 0..n_chromosomes {
-                let mut intervals = producer.covered_intervals(chrom_id, max_group_span);
-                if let Some(rs) = &region_set {
-                    intervals = restrict_intervals_to_regions(&intervals, rs.regions_for(chrom_id));
-                }
-                for interval in intervals {
-                    let mask = dust_mask_for(
-                        &mut dust_fetcher,
-                        chrom_id,
-                        &interval,
-                        &args.reference,
-                        &chrom_names,
-                        &chrom_lengths,
-                        args.no_complexity_filter,
-                        cohort.complexity_window,
-                        cohort.complexity_threshold,
-                    )?;
-                    producer.begin_interval(chrom_id, interval, mask);
-                    loop {
-                        let plan = {
-                            let mut fetch =
-                                |start: u32, len: u32| -> Result<Vec<u8>, RefFetchError> {
-                                    ref_fetch(
-                                        &mut ref_fetcher,
-                                        chrom_id,
-                                        &args.reference,
-                                        &chrom_names,
-                                        start,
-                                        len,
-                                    )
-                                };
-                            producer.plan_chunk(&mut fetch)?
+            for (chrom_id, interval) in schedule {
+                let chrom_id = *chrom_id;
+                let mask = dust_mask_for(
+                    &mut dust_fetcher,
+                    chrom_id,
+                    interval,
+                    &args.reference,
+                    &chrom_names,
+                    &chrom_lengths,
+                    args.no_complexity_filter,
+                    cohort.complexity_window,
+                    cohort.complexity_threshold,
+                )?;
+                producer.begin_interval(chrom_id, interval.clone(), mask);
+                loop {
+                    let plan = {
+                        let mut fetch = |start: u32, len: u32| -> Result<Vec<u8>, RefFetchError> {
+                            ref_fetch(
+                                &mut ref_fetcher,
+                                chrom_id,
+                                &args.reference,
+                                &chrom_names,
+                                start,
+                                len,
+                            )
                         };
-                        let Some(plan) = plan else { break };
-                        if plan_tx.send(plan).is_err() {
-                            // Compact stage gone (errored); stop. The real error
-                            // surfaces from its join below.
-                            return Ok(());
-                        }
+                        producer.plan_chunk(&mut fetch)?
+                    };
+                    let Some(plan) = plan else { break };
+                    if plan_tx.send(plan).is_err() {
+                        // Compact stage gone (errored); stop. The real error
+                        // surfaces from its join below.
+                        return Ok(());
                     }
                 }
             }
@@ -389,6 +457,12 @@ pub fn run_var_calling(
         });
         // Signal the compact stage there are no more plans.
         drop(plan_tx);
+        // Drop the fold stage's read-queue receivers + wake sender (held in
+        // `producer`) now the fold loop is done. This releases the read stage if
+        // it is parked on `wake` or blocked sending into a full queue — whether
+        // the loop finished normally or returned early on a downstream error —
+        // so its join below can't hang.
+        drop(producer);
 
         // First error wins across the fold/plan stage, compact stage, callers,
         // and writer; otherwise return the writer's run stats.
@@ -400,6 +474,9 @@ pub fn run_var_calling(
         // clones, so the surviving threads observe channel close, drain, and
         // join (`scope` then completes). `join()` only returns `Err` on panic.
         let mut first_err = produce.err();
+        if let Err(e) = read_handle.join().expect("read thread panicked") {
+            first_err.get_or_insert(e);
+        }
         if let Err(e) = compact_handle.join().expect("compact thread panicked") {
             first_err.get_or_insert(e);
         }

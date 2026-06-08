@@ -398,6 +398,23 @@ fn merge_block_ranges(
     out
 }
 
+/// One chromosome's covered intervals for a slice of readers — every sample's
+/// blocks for `chrom_id`, unioned and gap-merged at `max_group_span` (no file
+/// I/O, reads only the in-memory block indexes).
+pub(crate) fn covered_intervals_for<R: Read + Seek>(
+    readers: &[SamplePspReader<R>],
+    chrom_id: u32,
+    max_group_span: u32,
+) -> Vec<Range<u32>> {
+    let ranges = readers.iter().flat_map(|r| {
+        r.block_index()
+            .iter()
+            .filter(move |b| b.chrom_id == chrom_id)
+            .map(|b| (b.first_pos, b.last_pos))
+    });
+    merge_block_ranges(ranges, max_group_span)
+}
+
 /// A planned-but-not-yet-compacted cohort chunk — the hand-off between the
 /// producer's two internal stages (appendix §B, "fold/plan" → "compact").
 ///
@@ -479,6 +496,86 @@ pub(crate) fn compact_plan(plan: ChunkPlan) -> Result<RawCohortChunk, ProducerEr
     })
 }
 
+/// The producer's **read stage** (the second internal queue). Owns the N
+/// readers, walks the precomputed `schedule` (same order the fold loop walks),
+/// and decodes each sample's light-column segments **ahead** into per-sample
+/// bounded channels so the fold stage never blocks on decode — overlapping the
+/// light decode (the fold stage's dominant critical-path cost) with folding +
+/// compaction.
+///
+/// Back-pressure without deadlock: each round decodes one segment for every
+/// sample whose channel currently has room (`< depth`) in parallel on `pool`,
+/// then sends (room was checked and only the fold drains, so the send never
+/// blocks). When every non-exhausted channel is full it blocks on `wake` until
+/// the fold drains one. A closed channel / `wake` (the fold stage stopped on an
+/// error) ends the stage. Resets the readers at each interval boundary, in
+/// lockstep with the fold loop's [`begin_interval`](CohortChunkIntegrator::begin_interval),
+/// and emits one [`ReadMsg::IntervalEnd`] per sample per interval — so the fold
+/// stage sees exactly the segment stream (and exhaustion points) the owned
+/// decode would, byte-identically.
+pub(crate) fn drive_read_stage<R: Read + Seek + Send>(
+    mut readers: Vec<SamplePspReader<R>>,
+    schedule: &[(u32, Range<u32>)],
+    txs: &[crossbeam_channel::Sender<ReadMsg>],
+    wake: &crossbeam_channel::Receiver<()>,
+    pool: &rayon::ThreadPool,
+    depth: usize,
+) -> Result<(), ProducerError> {
+    use rayon::prelude::*;
+    let n = readers.len();
+    let mut which = vec![false; n];
+    for (chrom_id, interval) in schedule {
+        let region_end = interval.end - 1; // reader region_end is inclusive
+        for r in &mut readers {
+            r.reset(*chrom_id, interval.start, region_end);
+        }
+        let mut exhausted = vec![false; n];
+        loop {
+            // Samples to refill this round: not exhausted, channel has room.
+            let mut any = false;
+            for s in 0..n {
+                which[s] = !exhausted[s] && txs[s].len() < depth;
+                any |= which[s];
+            }
+            if !any {
+                if exhausted.iter().all(|&e| e) {
+                    break; // interval drained
+                }
+                // Every non-exhausted channel is full — wait for the fold to
+                // drain one (or stop if it's gone).
+                if wake.recv().is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Decode one segment per selected sample, in parallel.
+            let outcomes: Vec<(usize, Result<Option<TwoPhaseSegment>, PspReadError>)> = pool
+                .install(|| {
+                    readers
+                        .par_iter_mut()
+                        .enumerate()
+                        .filter_map(|(s, r)| which[s].then(|| (s, r.next_two_phase())))
+                        .collect()
+                });
+            for (s, res) in outcomes {
+                let msg = match res? {
+                    Some(seg) => ReadMsg::Segment(Box::new(seg)),
+                    None => {
+                        exhausted[s] = true;
+                        ReadMsg::IntervalEnd
+                    }
+                };
+                // Room was checked and only the fold drains, so this won't
+                // block; an `Err` means the fold stage dropped the receiver.
+                if txs[s].send(msg).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Streaming cohort producer over **one covered interval** (appendix §B).
 ///
 /// Owns the N [`SamplePspReader`]s. [`begin_interval`](Self::begin_interval)
@@ -497,8 +594,43 @@ pub(crate) fn compact_plan(plan: ChunkPlan) -> Result<RawCohortChunk, ProducerEr
 /// columns→records rebuild + per-position merge run on the **caller**
 /// ([`merge_compacted_samples`](crate::var_calling::variant_caller::merge_compacted_samples)),
 /// not here.
+/// One per-sample read result from the producer's **read stage** (the second
+/// internal queue). `Segment` carries the next decoded (light columns eager,
+/// heavy retained) segment for the sample; `IntervalEnd` marks that sample's
+/// reader has no more blocks in the current covered interval. Boxed segment so
+/// the enum is small (the channel buffers many).
+pub(crate) enum ReadMsg {
+    Segment(Box<TwoPhaseSegment>),
+    IntervalEnd,
+}
+
+/// Where the integrator's [`read_samples`](CohortChunkIntegrator::read_samples)
+/// gets each sample's next segment.
+///
+/// - `Owned`: the integrator owns the readers and decodes inline on the
+///   producer pool. The byte-identity oracle path the tests + the test `run`
+///   driver use.
+/// - `Channel`: a separate **read stage** ([`drive_read_stage`]) owns the
+///   readers and decodes ahead into per-sample bounded channels; the fold stage
+///   just pulls. This decouples the light-column decode (the fold stage's
+///   dominant critical-path cost) from folding so it overlaps fold + compact —
+///   the production path.
+enum ReadSource<R: Read + Seek> {
+    /// Test/`run`-driver path only (the production pipeline always uses the
+    /// `Channel` read stage) — kept out of `cfg(test)` so `R` stays used and
+    /// the match arms compile unconditionally.
+    #[allow(dead_code)]
+    Owned(Vec<SamplePspReader<R>>),
+    Channel {
+        rx: Vec<crossbeam_channel::Receiver<ReadMsg>>,
+        /// Pulsed after each receive so the read stage rechecks channel room
+        /// (its back-pressure release). Bounded(1) — a pending pulse coalesces.
+        wake: crossbeam_channel::Sender<()>,
+    },
+}
+
 pub struct CohortChunkIntegrator<R: Read + Seek> {
-    readers: Vec<SamplePspReader<R>>,
+    source: ReadSource<R>,
     n: usize,
     min_alt_obs: u32,
     target_variants: u32,
@@ -534,10 +666,44 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     /// cohort keep threshold; `target_variants` the soft per-chunk
     /// kept-position target (`0` ⇒ 1). (Sample names are no longer needed
     /// here — the per-position merge that used them now runs on the caller.)
+    #[allow(dead_code)] // owned-reader path: tests + the `run` driver only
     pub fn new(readers: Vec<SamplePspReader<R>>, min_alt_obs: u32, target_variants: u32) -> Self {
         let n = readers.len();
+        Self::with_source(ReadSource::Owned(readers), n, min_alt_obs, target_variants)
+    }
+
+    /// Build a producer that pulls each sample's segments from a per-sample
+    /// channel (the production read-stage path; see [`ReadSource`]). `n` is the
+    /// sample count (= `receivers.len()`). The caller spawns
+    /// [`drive_read_stage`] to feed the channels and drives the fold loop over a
+    /// precomputed interval schedule ([`cohort_intervals`]) — `covered_intervals`
+    /// is unavailable here (the integrator owns no readers).
+    pub(crate) fn new_streaming(
+        receivers: Vec<crossbeam_channel::Receiver<ReadMsg>>,
+        wake: crossbeam_channel::Sender<()>,
+        min_alt_obs: u32,
+        target_variants: u32,
+    ) -> Self {
+        let n = receivers.len();
+        Self::with_source(
+            ReadSource::Channel {
+                rx: receivers,
+                wake,
+            },
+            n,
+            min_alt_obs,
+            target_variants,
+        )
+    }
+
+    fn with_source(
+        source: ReadSource<R>,
+        n: usize,
+        min_alt_obs: u32,
+        target_variants: u32,
+    ) -> Self {
         Self {
-            readers,
+            source,
             n,
             min_alt_obs,
             target_variants: target_variants.max(1),
@@ -555,15 +721,16 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
 
     /// The chromosome's covered intervals — every sample's blocks for
     /// `chrom_id`, unioned and gap-merged at `max_group_span` (no file I/O,
-    /// reads only the in-memory block indexes).
+    /// reads only the in-memory block indexes). Only available in `Owned` mode
+    /// (the test/`run` path); the production read-stage path precomputes the
+    /// whole-cohort schedule from [`covered_intervals_for`] before the readers
+    /// move into the stage.
+    #[cfg(test)]
     pub fn covered_intervals(&self, chrom_id: u32, max_group_span: u32) -> Vec<Range<u32>> {
-        let ranges = self.readers.iter().flat_map(|r| {
-            r.block_index()
-                .iter()
-                .filter(move |b| b.chrom_id == chrom_id)
-                .map(|b| (b.first_pos, b.last_pos))
-        });
-        merge_block_ranges(ranges, max_group_span)
+        match &self.source {
+            ReadSource::Owned(readers) => covered_intervals_for(readers, chrom_id, max_group_span),
+            ReadSource::Channel { .. } => unreachable!("covered_intervals is owned-mode only"),
+        }
     }
 
     /// Drive the whole cohort: walk `0..n_chromosomes`, and within each its
@@ -624,9 +791,14 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         dust_mask: Vec<Range<u32>>,
     ) {
         debug_assert!(interval.start < interval.end, "empty interval");
-        let region_end = interval.end - 1; // reader region_end is inclusive
-        for r in &mut self.readers {
-            r.reset(chrom_id, interval.start, region_end);
+        // `Owned`: reset the readers to the interval. `Channel`: the read stage
+        // resets its own readers from the same schedule, in lockstep — the fold
+        // stage only resets its per-interval buffer state below.
+        if let ReadSource::Owned(readers) = &mut self.source {
+            let region_end = interval.end - 1; // reader region_end is inclusive
+            for r in readers {
+                r.reset(chrom_id, interval.start, region_end);
+            }
         }
         self.chrom_id = chrom_id;
         self.interval_end = interval.end;
@@ -679,20 +851,43 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
     /// state, pushing a segment **or** exhausting, and an exhausting sample
     /// still raises the watermark, so progress must not hinge on a push.)
     fn read_samples(&mut self, which: &[bool]) -> Result<(), ProducerError> {
-        use rayon::prelude::*;
         debug_assert_eq!(which.len(), self.n);
-        // Disjoint `&mut readers[s]` via `par_iter_mut().enumerate()`; decode
-        // the selected readers concurrently, collect, then apply serially.
-        let outcomes: Vec<(usize, Result<Option<TwoPhaseSegment>, PspReadError>)> = self
-            .readers
-            .par_iter_mut()
-            .enumerate()
-            .filter_map(|(s, reader)| which[s].then(|| (s, reader.next_two_phase())))
-            .collect();
-        for (s, outcome) in outcomes {
-            match outcome? {
-                Some(seg) => self.buffers[s].push(Arc::new(seg)),
-                None => self.exhausted[s] = true,
+        match &mut self.source {
+            ReadSource::Owned(readers) => {
+                use rayon::prelude::*;
+                // Disjoint `&mut readers[s]` via `par_iter_mut().enumerate()`;
+                // decode the selected readers concurrently, collect, apply.
+                let outcomes: Vec<(usize, Result<Option<TwoPhaseSegment>, PspReadError>)> = readers
+                    .par_iter_mut()
+                    .enumerate()
+                    .filter_map(|(s, reader)| which[s].then(|| (s, reader.next_two_phase())))
+                    .collect();
+                for (s, outcome) in outcomes {
+                    match outcome? {
+                        Some(seg) => self.buffers[s].push(Arc::new(seg)),
+                        None => self.exhausted[s] = true,
+                    }
+                }
+            }
+            ReadSource::Channel { rx, wake } => {
+                // Pull one already-decoded segment per selected sample (the
+                // read stage decodes ahead concurrently). A closed channel or an
+                // `IntervalEnd` marks the sample exhausted for this interval.
+                // Each sample's channel is FIFO, so the segments arrive in
+                // genomic order and the interval-boundary markers stay in step
+                // with the fold loop's schedule walk — byte-identical to the
+                // owned decode. Each receive frees a channel slot; pulse `wake`
+                // so the read stage rechecks room (best-effort, coalesced).
+                for s in 0..self.n {
+                    if !which[s] {
+                        continue;
+                    }
+                    match rx[s].recv() {
+                        Ok(ReadMsg::Segment(seg)) => self.buffers[s].push(Arc::from(seg)),
+                        Ok(ReadMsg::IntervalEnd) | Err(_) => self.exhausted[s] = true,
+                    }
+                    let _ = wake.try_send(());
+                }
             }
         }
         Ok(())
