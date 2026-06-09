@@ -220,12 +220,18 @@ portability**, not speed.
   byte-identical at N∈{1,2,4,6,8} on multi-interval input, wall at the
   honest-budget partition optimum. The one-pool code was reverted (kept only in
   history); [[project_thread_budget_split_sweep]] records the measurements.
-- **Phase 3 — trim coordinators / revisit staging.** §3.3. Collapse to the
-  minimum justified threads; re-evaluate `STAGED_MIN_THREADS`. Target
-  `≈ N + 2`. **Bonus:** Phase 2 may let the inline and staged paths converge
-  into one model (deleting `STAGED_MIN_THREADS`) — adopt that *only* if
-  one-pool matches the staged overlap at higher thread counts (verify at
-  `T=16` as a rough big-machine proxy; note this box's E-cores).
+- **Phase 3 — trim coordinators / revisit staging. [DROPPED — `N+4` is fine.]**
+  The motivation was to claw the staged path's two coordinator threads back to
+  `≈ N + 2`. Decision (2026-06-09): **not worth it.** The target audience runs
+  on machines that sustain a handful of threads without issue, so `N + 4` (a
+  small fixed constant, two of which are low-CPU coordinators that mostly block
+  on queues — they don't thrash a core) satisfies the contract. The staged path
+  stays as-is; `STAGED_MIN_THREADS` now trips at `N ≥ 8` (since the producer
+  pool is `P = ⌊N/2⌋`). Removing the staged machinery would simplify the code
+  but risks the **production-box** regime where staging earns its keep (the
+  dev box's 6 P-cores can't measure the 32-fast-core case), so it is not
+  pursued. The remaining work is the §6 startup thread-count assertion test and
+  the §5.1 cold-cache / human-bottle gates, not thread trimming.
 
 ### 5.1 Measurement matrix (our current benchmarks don't represent the audience)
 
