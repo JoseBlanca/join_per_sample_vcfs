@@ -218,8 +218,9 @@ inference** (we are already a cohort caller; pooling demonstrably helps) and
    enumeration (P6)** as the ploidy generalization for polyploid samples.
 6. **Output:** VCF using the **repeat-unit / copy-number representation** (GA4GH
    STR conventions) — sidesteps normalization ambiguity by construction.
-7. **Later extensions:** SNP-phase scaffold (we already produce SNP calls);
-   GangSTR-style FRR + insert-size (P4) only if alleles beyond read length matter.
+7. **Later extensions:** GangSTR-style FRR + insert-size (P4) only if alleles
+   beyond read length matter. (**SNP-phasing deliberately excluded** — see
+   "Independence" in §6b.)
 
 ### Critical caveat for our codebase
 
@@ -314,11 +315,25 @@ per locus:
   `12/15`, `GL`/`PL`, `GP`, `GQ`). Following the GangSTR/EnsembleTR `REPCN`
   convention unlocks the whole popgen toolchain.
 
-**Independence (constraint 4).** A **standalone binary/crate** with its own
-pipeline and VCF; shares only low-level BAM/CRAM I/O (noodles) and sdust if
-useful. The realignment + per-read-spanning-sequence-over-a-window data model
-does **not** fit our per-position `.psp`, so extraction is independent (not a
-`pileup` reuse). Same-repo separate binary vs a new repo is a later call.
+**Independence (constraint 4) — two independent callers from one BAM.** The SNP/
+indel caller and the SSR caller are **fully independent pipelines that share only
+the raw input data** (BAM/CRAM), each emitting **its own VCF** (an allele-base
+VCF and an allele-length VCF). Rationale: their statistical models are
+fundamentally different (per-position substitution/indel likelihoods vs
+per-locus repeat-length + stutter), and keeping the callsets independent lets
+population hypotheses be analysed **independently** on each marker type. Concrete
+consequences:
+- A **standalone binary/crate** with its own pipeline and VCF; shares only
+  low-level BAM/CRAM I/O (noodles) and sdust if useful. The realignment +
+  per-read-spanning-sequence-over-a-window data model does **not** fit our
+  per-position `.psp`, so extraction is independent (not a `pileup` reuse).
+  Same-repo separate binary vs a new repo is a later call.
+- **No SNP-phasing / no coupling to the SNP callset.** HipSTR improves accuracy by
+  physically phasing the STR against nearby heterozygous SNPs, but that needs a
+  read co-spanning the STR *and* an informative SNP — rare here, because SSRs are
+  sparse and far apart — and it would couple the two callers, defeating the
+  independence goal. **Excluded by design**, not deferred. (The SSR caller never
+  reads SNP calls; the only shared substrate is the alignments.)
 
 **Read-length scope.** Start **spanning-only** (precise for common, short plant
 SSRs); add GangSTR-style **FRR + insert-size** later only if alleles beyond read
@@ -440,6 +455,36 @@ must not silently drop true loci.
 → This decision seeds the **Stage 0 implementation plan** (catalog builder +
 accuracy harness).
 
+### Catalog format & schema (final, 2026-06-09)
+
+- **One self-describing file** — a bgzip+tabix BED-like TSV with a VCF/GFF-style
+  `##` metadata header (reference path + md5, TRF params, filters, tool/version,
+  date), then a `#`-prefixed column header, then rows. **No sidecar** (metadata
+  travels with the data; tabix skips comment lines). *Unifying principle: every
+  artifact is self-describing — catalog `##` header, evidence Parquet footer
+  metadata, VCF `##` header.*
+- **Minimal schema — only non-derivable columns** (PM: don't store redundant
+  data, QA at the test level):
+
+  ```
+  chrom   start   end   motif   purity
+  ```
+
+  Dropped as derivable: `period` = len(motif); `ref_copies` = (end−start)/period;
+  `class` (perfect/imperfect) = threshold(purity), perfect ⟺ purity = 1.0;
+  `locus_id` = f(chrom,start,motif). **Cross-file linkage is positional** (the
+  evidence file is one row per catalog locus in catalog order); the VCF `ID` is
+  constructed at output. `purity` is the one judgment call — keep iff Stage 2 uses
+  it for confidence weighting (noisier low-purity loci → FP-aversion); drop if it
+  is only a build-time filter.
+- **Imperfect single-motif loci: kept and genotyped.** **Compound loci: split**
+  into their component single-motif sub-loci (each a normal perfect/imperfect
+  locus) → the catalog builder needs a TRF-output **compound-splitting** post-step.
+  - ⚠ **Stage-1 implication (captured for that stage):** a split sub-locus's
+    *inner* flank is the adjacent motif's repeat — **not unique sequence**. Flank-
+    anchoring / realignment must treat that boundary as *known repeat structure*,
+    not a random unique flank, or extraction misbehaves at compound junctions.
+
 ## 6d. Stage 1 — Per-sample evidence extraction (detailed)
 
 *Goal: for each catalog locus × sample, read the BAM and emit a compact evidence
@@ -480,14 +525,101 @@ do realignment-quality genotyping and learn stutter), but stored compactly.
    #flanking+bounds, #IRR, depth, #filtered). Plus locus context (motif, ref
    copies, flank seqs).
 
-### Data-schema decision (the engineering crux)
+### Per-sample evidence schema (what to store — the engineering crux)
 
-The on-disk schema of this STR-`.psp` is what makes the **cohort** stage scale
-(directly analogous to our existing `.psp`). Candidate-allele set must be fixed
-enough to share across samples in Stage 2 — resolve by emitting per-read scores
-over a **stutter-padded range** of observed lengths (union'd across the cohort in
-Stage 2), or a per-read descriptor cheap to re-score. **Open: design this schema
-explicitly before coding** (columnar, memory-efficient — our house style).
+Determined entirely by the Stage-2 math
+`P(reads|G,θ) = Πᵣ (1/ploidy) Σ_{a∈G} Σ_L Qᵣ(L)·S_θ(L|a)` plus the cohort EM for
+`θ` (stutter) and `π` (allele freqs). The on-disk schema is what makes the cohort
+stage scale (directly analogous to our `.psp`).
+
+**Non-negotiable rule: store the *stutter-free* per-read length likelihood
+`Qᵣ(L)` (sequencing/alignment only), NOT `P(read|allele)`.** Baking stutter in at
+Stage 1 would make the cohort stutter model unlearnable in Stage 2. Stage 1 does
+the heavy per-read realignment once; Stage 2 convolves with `S_θ` and runs the
+light EM.
+
+**Per locus × sample, store:**
+
+1. **Per-spanning-read length evidence (θ-free) — the core.** Per read: ML
+   observed length `L*` (motif units) + a compact `Qᵣ(L)` profile (log-liks at
+   `L*` and a few neighbours), over a window wide enough to cover the cohort
+   candidate alleles ± stutter; plus `mapq`, `strand`, base-quality summary, and a
+   **purity flag** (read repeat matches motif vs interrupted/SNP).
+   - **Compression (cohort-scaling form):** aggregate confident reads into a
+     **`(length × quality-class)` count histogram**; keep explicit `Qᵣ(L)`
+     profiles only for *ambiguous* reads (e.g. bimodal at a homopolymer edge).
+     Columnar, `.psp`-style.
+2. **Read-class & QC counts:** depth; `n_spanning`, `n_flanking` (+ length lower
+   bounds), `n_FRR`; `n_filtered` (low-mapq/dup/clip); `n_stutter_artifact`,
+   `n_flank_indel` (HipSTR's ≤10% gate); per-length support counts (candidate
+   `≥2 reads & ≥20%` rule + the `≥20%` support filter); mapped-read count
+   (ConSTRain normalized-depth = reads / CN).
+3. **Locus reference by id** into the catalog (motif, ref length, flanks) — *not*
+   duplicated per sample.
+4. **Deferred / optional** (only if spanning-only is lifted): flanking length
+   bounds, FRR counts, insert-size deviations (GangSTR classes). *No SNP-phasing
+   evidence* — the SSR caller is independent of the SNP callset by design (§6b).
+
+**Why each piece (→ Stage 2):** `Qᵣ(L)` → genotype likelihood **and** stutter EM
+(`u,d,ρ` from posterior-weighted observed-vs-assigned length diffs); length
+histogram → allele-frequency EM + candidate set; counts → the precision-first
+filters and call quality. Candidate alleles are shared across samples by union'ing
+each sample's observed-length support in Stage 2, padded by the stutter range —
+so the per-sample `Qᵣ(L)` window must extend a few stutter units beyond the
+locus's observed lengths.
+
+### Evidence file format (final, A2 — 2026-06-09)
+
+**Parquet, one file per sample, a single table with exactly one row per catalog
+locus in catalog (genomic) order — including no-coverage loci as zero/empty
+rows** (they compress to ~nothing via RLE/dictionary). Two invariants at once:
+- **Synchronized scan:** row `i` is the same locus in every sample's file →
+  Stage 2 reads row `i` across all N files, no join/merge logic. (The catalog
+  defines the row universe + order; each per-sample file is a parallel column over
+  it.)
+- **Position query:** rows sorted by `(chrom, start)` → Parquet per-row-group
+  **min/max statistics** + the **page index** prune to relevant row groups; no
+  tabix needed (DuckDB/pyarrow/polars get range filtering for free). Optional
+  `contig → row-group range` map in the footer for O(1) seek.
+
+Single table (not normalized); variable-length evidence goes in **nested list /
+CSR columns** (`.psp`-style), so it stays one file per sample.
+
+| column | type | notes |
+|---|---|---|
+| `chrom` | dict&lt;string&gt; | contig; row-group min/max → position pruning |
+| `start` | int32 | 0-based tract start; **rows sorted by (chrom,start)** |
+| `end` | int32 | tract end (exclusive) |
+| `depth` | int32 | total reads at locus |
+| `n_spanning` | int32 | usable spanning reads |
+| `n_flanking` | int32 | (length lower-bounds carried later if scope lifts) |
+| `n_frr` | int32 | fully-repetitive |
+| `n_filtered` | int32 | low-mapq / dup / clipped |
+| `n_stutter_artifact` | int32 | HipSTR ≤10% gate |
+| `n_flank_indel` | int32 | |
+| `mapped_reads` | int32 | ConSTRain normalized depth |
+| `hist_lengths` | list&lt;int16&gt; | distinct observed allele lengths (**repeat units**), ascending |
+| `hist_counts` | list&lt;int32&gt; | confident-read count per length (parallel to `hist_lengths`) |
+| `hist_weight` | list&lt;float32&gt; | *optional* base-qual aggregate weight per length |
+| `amb_read_offsets` | list&lt;int32&gt; | CSR prefix offsets for ambiguous reads (len = n_amb + 1) |
+| `amb_lengths` | list&lt;int16&gt; | flattened per-read candidate lengths |
+| `amb_logliks` | list&lt;float32&gt; | flattened **stutter-free** log-liks (parallel to `amb_lengths`) |
+
+**The ambiguous `Qᵣ(L)` profiles (the `amb_*` CSR columns) are in v1** (PM
+decision — not deferred): confident reads collapse to the `(length → count)`
+histogram; genuinely bimodal reads carry an explicit sparse profile. (A later
+refinement could make the confident block 2-D `(length × quality-class)` via
+parallel `hist_lengths/hist_qualbins/hist_counts`.)
+
+**Footer key-value metadata (self-describing, no sidecar):** `schema_version,
+sample_name, reference_md5, catalog_md5, n_loci, ploidy(if fixed),
+extraction_params{min_mapq, min_flank_bp, min_base_qual, ambiguity_threshold},
+tool_version` + a `contig` name↔id table.
+
+**Invariants:** `int16` repeat-unit lengths; **all stored likelihoods are
+stutter-free**; every per-sample file has exactly `len(catalog)` rows in catalog
+order. **Write knobs:** sort by `(chrom,start)`; row-group ≈ a few × 10⁴ loci;
+enable the page/column index; ZSTD.
 
 ### Testing
 
@@ -608,12 +740,51 @@ polysomic IBD coefficient (defer; note double-reduction).
 fixation index `f̂` (per locus or cohort). **TRtools-compatible** VCF coded with
 allele lengths/copy numbers (FORMAT `GT:REPCN:GL:GP:GQ`, INFO `RU`,`AF`/`AC`/`AN`,`F`).
 
+### Output VCF format (final, A3 — 2026-06-09)
+
+Decided against the **live TRtools source** (cloned at `TRTools/`, gitignored;
+verified in `TRTools/trtools/utils/tr_harmonizer.py`): **emit a GangSTR-format-
+compatible VCF** — the cleanest TRtools target for a copy-number/length
+genotyper (native `REPCN` integer copy numbers; no HipSTR START/END flank-offset
+gymnastics).
+
+- **TRtools detection:** the harmonizer types a VCF as GangSTR iff the header
+  contains both `command=` *and* the substring `gangstr` (case-insensitive). We
+  trigger this **honestly** via a `##source`/`##command` line stating the VCF is
+  *GangSTR-compatible* (the substring `GangSTR` legitimately appears); users can
+  also force it with `--vcftype gangstr`. **No TRtools source change needed.**
+- **REF/ALT = actual repeat-tract sequences** (not symbolic `<STR>`): TRtools
+  derives lengths as `len(allele)/period`, and `REPCN` gives the copy number.
+- **Required (GangSTR-compatible):** INFO `END`, `RU` (motif), `PERIOD`, `REF`
+  (reference copy number, Float); FORMAT `GT`, `DP`, `Q` (genotype posterior 0–1 —
+  TRtools' quality field), `REPCN` (per-allele copy numbers, e.g. `12,15`).
+- **Our model maps onto GangSTR's own fields:** learned stutter `(u,d,ρ)` →
+  INFO `STUTTERUP`/`STUTTERDOWN`/`STUTTERP`; per-allele CI (if bootstrapped) →
+  FORMAT `REPCI`, bootstrap SE → `STDERR`.
+- **Our extras (TRtools ignores them, harmless):** FORMAT `GP` (posteriors),
+  `GL`/`PL`, `GQ` (phred) — carry our full posterior + Beagle/imputation compat;
+  INFO `AF`/`AC`/`AN` (per-length population), `NS`, `F` (used/estimated fixation
+  index). FILTER `PASS` + `lowGQ`/`lowDepth`/`segdup`/`lowSupport` (§6e/§6f gates).
+  *Note TRtools reads only the scalar `Q`, not `GL`/`PL`/`GP` — so `Q` must carry
+  the called genotype's posterior.*
+- **Ploidy caveat:** GangSTR `REPCN` is `Number=2` (diploid). Diploid cohorts are
+  fully TRtools-harmonizable; **polyploid** VCFs stay valid (REPCN with ploidy
+  entries + ploidy-general `GT`) but the TRtools harmonizer is human-diploid-
+  centric, so polyploid harmonization may need `--vcftype` care or fall outside
+  TRtools.
+
+Supersedes the earlier "GA4GH conventions" placeholder. Reference repos cloned
+for this (gitignored, per the freebayes/gatk/... convention): `TRTools/`,
+`HipSTR/`, `GangSTR/`.
+
 **Differences from HipSTR (deliberate):** (1) clean Stage-1/Stage-2 split with a
 θ-free per-sample artifact (mirrors `pileup→.psp→var-calling`, lets the cohort
 stage scale); (2) **hierarchical motif-class stutter** vs per-locus-only;
 (3) **posteriors + explicit precision-first operating point** as first-class
-outputs; (4) **polyploid-general** genotype space (ConSTRain). HipSTR's physical
-SNP-phasing is a deferred Phase-2 add (we already produce SNP calls).
+outputs; (4) **polyploid-general** genotype space (ConSTRain). **We deliberately do NOT
+adopt HipSTR's SNP-phasing** — SSRs are too sparse for reads to co-span an STR and
+an informative SNP, and coupling to the SNP callset would break the
+two-independent-callers design (§6b).
 
 **FP-aversion is baked in (precision ≫ recall):**
 - The **stutter model** is the first defence — it explains the ladder as noise
@@ -634,7 +805,8 @@ SNP-phasing is a deferred Phase-2 add (we already produce SNP calls).
   testable on tomato capillary markers.
 - **v2:** hierarchical per-locus stutter shrinkage; polyploid genotypes;
   likelihood-ratio QUAL.
-- **v3:** SNP-phase scaffold; incremental cohort addition (popSTR2-style).
+- **v3:** incremental cohort addition (popSTR2-style); beyond-read-length classes
+  (GangSTR) if needed. *(No SNP-phasing — excluded by design, §6b.)*
 
 ### FP-aversion (the PM's stated priority — precision ≫ recall)
 

@@ -15,6 +15,9 @@ htslib/
 sdust/
 bcftools/
 gatk-protected/
+TRTools/
+HipSTR/
+GangSTR/
 /CLAUDE.md
 /.claude/
 benchmarks/tomato1/crams/
