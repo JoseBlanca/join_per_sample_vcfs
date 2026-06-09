@@ -99,27 +99,33 @@ const STAGED_MIN_THREADS: usize = 4;
 /// any sub-span (runs are coalesced across boundaries); this just caps RAM.
 const DUST_SUBSPAN: u32 = 1_000_000;
 
-/// Resolve `(producer_threads, caller_threads)` from the requested thread
-/// budget `t`. The producer's rayon decode/compaction pool and the crossbeam
-/// caller pool are *independent*; left both at `t` they oversubscribe a
-/// `t`-core box ~2× (perf finding **H1**). This is the single point that sizes
-/// them, so the producer pool can be capped below the caller count.
-///
-/// Default: both `t` — byte-identical and perf-neutral vs the pre-H1 behaviour
-/// (the producer's `par_iter_mut` ran on the global pool sized to `t`). The
-/// `PVC_PRODUCER_THREADS` / `PVC_CALLER_THREADS` environment variables override
-/// each, used for the H1 split sweep (perf review §3.3); once the winning split
-/// is chosen it replaces this default. Each value is floored at 1.
-fn resolve_thread_split(t: usize) -> (usize, usize) {
-    let from_env = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-    };
-    let producer = from_env("PVC_PRODUCER_THREADS").unwrap_or(t).max(1);
-    let callers = from_env("PVC_CALLER_THREADS").unwrap_or(t).max(1);
-    (producer, callers)
+/// Resolve the thread budget `N` from `--threads`: the explicit value, else
+/// `available_parallelism`, floored at 1. The CLI uses this to size the one
+/// work-stealing pool it builds, and [`run_var_calling`] uses it for the
+/// caller-thread default — both must agree, so it lives in one place.
+pub(crate) fn resolve_thread_budget(threads: Option<usize>) -> usize {
+    threads
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .max(1)
+}
+
+/// Resolve the caller (EM) thread count from the budget `t`. Since Phase 1 of
+/// the thread-budget single-pool plan, the producer-side CPU work runs on the
+/// shared pool (sized to the budget, built by the caller), so there is no
+/// longer a producer split knob. The EM callers are still dedicated threads
+/// until they fold onto the pool (Phase 2); `PVC_CALLER_THREADS` overrides
+/// their count for measurement. Floored at 1.
+fn resolve_caller_threads(t: usize) -> usize {
+    std::env::var("PVC_CALLER_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(t)
+        .max(1)
 }
 
 /// Errors surfaced by the re-architected pipeline entry point.
@@ -139,8 +145,6 @@ pub enum PipelineError {
     PosteriorConfig(#[from] PosteriorEngineConfigError),
     #[error("invalid --regions BED")]
     Regions(#[from] BedError),
-    #[error("building the producer rayon thread pool")]
-    ProducerPool(#[from] rayon::ThreadPoolBuildError),
     #[error("reference fetch: {0}")]
     RefFetch(#[from] ChromRefFetchError),
     #[error("dust mask computation: {0}")]
@@ -167,6 +171,7 @@ pub enum PipelineError {
 pub fn run_var_calling(
     args: &VarCallingArgs,
     contamination: Option<ContaminationEstimates>,
+    pool: &rayon::ThreadPool,
 ) -> Result<WriterStats, PipelineError> {
     let cohort = &args.cohort;
 
@@ -295,23 +300,17 @@ pub fn run_var_calling(
     // stateless `call_chunk`), and the writer owns the (`Send`) `CohortVcfWriter`
     // and reorders the out-of-order `CalledChunk`s by `chunk_order`, so the
     // emitted VCF is byte-identical regardless of worker count.
-    let requested_threads = args
-        .threads
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        })
-        .max(1);
-    // H1: size the producer (rayon) and caller (crossbeam) pools from one
-    // budget so they don't each claim `T` cores and oversubscribe ~2×. The
-    // producer's `par_iter_mut` runs inside `producer_pool.install(...)` below,
-    // so it uses this pool — not the global one — and the bench (which drives
-    // this entry directly) measures the same sizing the CLI gets.
-    let (producer_threads, n_workers) = resolve_thread_split(requested_threads);
-    let producer_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(producer_threads)
-        .build()?;
+    let requested_threads = resolve_thread_budget(args.threads);
+    // Phase 1 (thread-budget single-pool plan §3.1): one work-stealing pool —
+    // built by the caller and sized to the budget `N` — runs all producer-side
+    // CPU work (decode / fold / compact). It also ran the startup FASTA verify,
+    // so the old idle verify pool and the producer's own pool collapse into this
+    // single pool. The EM callers are still `n_workers` dedicated threads
+    // (Phase 2 folds them onto the pool); `PVC_CALLER_THREADS` sizes them for
+    // measurement. `producer_threads` (= the pool's size) still drives the
+    // `staged` decision and the startup log.
+    let producer_threads = pool.current_num_threads();
+    let n_workers = resolve_caller_threads(requested_threads);
     let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
     // Straddler decode cache: on by default, off under `--low-memory` (trades
     // the cache's cohort-scaling RSS for re-decompressing cut-spanning segments).
@@ -336,7 +335,7 @@ pub fn run_var_calling(
     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<RawCohortChunk>(cap);
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
-    let producer_pool = &producer_pool;
+    let producer_pool = pool;
     let schedule = &schedule;
 
     std::thread::scope(|scope| -> Result<WriterStats, PipelineError> {

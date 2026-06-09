@@ -22,24 +22,21 @@
 //!
 //! ## Why the pipeline entry point (not the CLI `run_var_calling`)
 //!
-//! The CLI-level entry calls `configure_rayon_pool`, which is **once per
-//! process** — a criterion run can't re-size the global pool per iteration.
-//! The **pipeline** entry instead sizes its own producer (rayon) pool from
-//! `--threads` via `resolve_thread_split` and `install`s the producer loop on
-//! it (H1), independently of the global pool — so the `t` axis here drives the
-//! exact same producer + caller sizing the CLI gets. Each timed run therefore
-//! has `t` (or the env-overridden split) rayon producer workers **plus** the
-//! caller threads live concurrently — the oversubscription **H1** targets.
+//! The CLI-level entry builds its rayon pool once and drives the FASTA verify
+//! on it; a criterion run wants a fresh pool sized to `t` per combo. The
+//! **pipeline** entry takes the pool by `&ref` (Phase 1 of the thread-budget
+//! single-pool plan), so the bench builds a `t`-thread pool itself and passes
+//! it — the same one pool that runs the producer-side CPU work the CLI uses.
+//! Each timed run therefore has the `t`-thread pool **plus** the still-separate
+//! EM caller threads live concurrently.
 //!
-//! ## Sweeping the split
+//! ## Sweeping the caller count
 //!
-//! The committed bench measures the **default** split (`resolve_thread_split`,
-//! currently producer = callers = `t`). To sweep candidate splits set
-//! `PVC_PRODUCER_THREADS` / `PVC_CALLER_THREADS` (process-global, so one value
-//! per `cargo bench` invocation) — but the authoritative split sweep is the
-//! cross-process run on real data (`examples/profile_cohort_e2e` + those env
-//! vars + hyperfine, perf review §3.3). This bench is the in-process guard
-//! that the chosen default does not regress.
+//! The producer side is sized by the passed pool (`t`); the EM callers are
+//! still dedicated threads whose count `PVC_CALLER_THREADS` overrides
+//! (process-global, one value per `cargo bench` invocation). The authoritative
+//! sweep is the cross-process run on real data (the env knob + hyperfine). This
+//! bench is the in-process guard that the default does not regress.
 //!
 //! Run (container, production arch):
 //! ```text
@@ -317,7 +314,11 @@ fn bench_cohort(c: &mut Criterion) {
         // One untimed run pins the expected emit count so the in-loop assert
         // catches a fixture/chunking regression (output is thread-independent
         // by design, so any thread count yields the same count).
-        let expected = run_var_calling(&make_args(&fx, 1), None)
+        let warm_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("build warm pool");
+        let expected = run_var_calling(&make_args(&fx, 1), None, &warm_pool)
             .expect("warm pipeline run")
             .records_written;
         assert!(
@@ -326,13 +327,19 @@ fn bench_cohort(c: &mut Criterion) {
         );
 
         for &t in THREAD_COUNTS {
-            // `run_var_calling` sizes its own producer pool (resolve_thread_split)
-            // and caller pool from `args.threads` and `install`s the producer on
-            // the former — so calling it directly exercises the production sizing.
+            // Phase 1: the caller builds the one work-stealing pool (sized to the
+            // budget `t`) and passes it in; the verify + producer-side CPU work
+            // share it. Built inside `b.iter` so the pool-spawn cost stays in the
+            // timed region (matching the pre-Phase-1 in-pipeline pool build).
             group.bench_function(format!("N{n}/T{t}"), |b| {
                 b.iter(|| {
                     let args = make_args(&fx, t);
-                    let stats = run_var_calling(black_box(&args), None).expect("pipeline run");
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(t)
+                        .build()
+                        .expect("build pool");
+                    let stats =
+                        run_var_calling(black_box(&args), None, &pool).expect("pipeline run");
                     assert_eq!(
                         stats.records_written, expected,
                         "records_written drifted — fixture/chunking regression"

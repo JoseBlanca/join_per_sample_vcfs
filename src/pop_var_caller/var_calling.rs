@@ -29,8 +29,7 @@ use clap::Args;
 use thiserror::Error;
 
 use crate::pop_var_caller::common::{
-    DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, configure_rayon_pool,
-    verify_fasta_matches_psp_chromosomes,
+    DEFAULT_BUFFERED_IO_CAPACITY, FastaVerifyError, basename, verify_fasta_matches_psp_chromosomes,
 };
 use crate::pop_var_caller::contamination_artefact::{
     ContaminationArtefact, ContaminationArtefactError,
@@ -161,10 +160,11 @@ pub enum VarCallingCliError {
         supplied_ref: String,
     },
 
-    /// `rayon::ThreadPoolBuilder::build_global()` already ran in this
-    /// process. The binary calls it at most once.
-    #[error("rayon thread pool already initialised — refusing to override")]
-    RayonAlreadyConfigured,
+    /// Building the var-calling rayon work-stealing pool failed (Phase 1 of the
+    /// thread-budget single-pool plan builds one explicit pool sized to
+    /// `--threads`, in place of the old process-global `build_global`).
+    #[error("building the rayon thread pool: {0}")]
+    ThreadPoolBuild(#[from] rayon::ThreadPoolBuildError),
 
     /// FASTA contig bytes don't match the `.psp` header's
     /// per-contig MD5. The basename cross-check (variant
@@ -236,10 +236,16 @@ pub enum VarCallingCliError {
 ///     `effective_threads` + the `requested … capped by N chromosomes`
 ///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
-    // 1. Rayon pool — idempotent under the silent-no-op policy
-    //    (M13, locked 2026-05-19); first caller wins, subsequent
-    //    callers' --threads is silently ignored.
-    configure_rayon_pool(args.threads).map_err(|_| VarCallingCliError::RayonAlreadyConfigured)?;
+    // 1. Build the one work-stealing pool sized to the thread budget. Phase 1
+    //    of the thread-budget single-pool plan: this single pool runs both the
+    //    FASTA verify (step 6, via `pool.install`) and all of the pipeline's
+    //    producer-side CPU work, replacing the old `build_global` verify pool +
+    //    the pipeline's separate producer pool. (`pileup` keeps
+    //    `configure_rayon_pool` — out of scope for this change.)
+    let budget = crate::var_calling::pipeline::resolve_thread_budget(args.threads);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(budget)
+        .build()?;
 
     // 2. Open every .psp once for header validation. Per-chrom
     //    workers re-open their own readers below; keeping the
@@ -287,7 +293,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     //     peak resident is one window per worker, zero contig-sized
     //     allocations. No fetcher cache pre-warm (Phase A of
     //     reference_fasta_streaming).
-    match verify_fasta_matches_psp_chromosomes(&args.reference, &chromosomes) {
+    match pool.install(|| verify_fasta_matches_psp_chromosomes(&args.reference, &chromosomes)) {
         Ok(()) => {}
         Err(FastaVerifyError::Md5Mismatch {
             contig,
@@ -309,7 +315,7 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     //    opens its own per-sample readers, builds every per-stage config from
     //    the args, applies `--regions`, and writes the VCF; it returns the
     //    run-level counters for the summary.
-    let stats = crate::var_calling::pipeline::run_var_calling(args, contamination)?;
+    let stats = crate::var_calling::pipeline::run_var_calling(args, contamination, &pool)?;
 
     // 8. Stderr summary.
     print_run_summary(&sample_names, stats, args.threads, chromosomes.len());
