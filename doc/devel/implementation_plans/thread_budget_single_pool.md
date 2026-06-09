@@ -194,9 +194,16 @@ portability**, not speed.
   table** — see §5.2. Primary question it must answer: *does one pool + an
   in-flight cap keep the producer fed across the matrix, or is a partition
   needed?* If one pool suffices, there is no table to write (best outcome).
-- **Phase 1 — one rayon pool.** §3.1. Pass `&pool` through verify + pipeline;
-  drop `build_global` from var-calling. Removes the idle verify pool (−`N`).
-  `T=5`: 19 → ~14. Low risk; byte-identical; measure wall-neutral.
+- **Phase 1 — one rayon pool. [DONE — `b8d1fcc`]** §3.1. CLI builds one
+  `ThreadPool` of `N`, runs verify via `pool.install`, passes `&pool` to the
+  pipeline (which no longer builds its own producer pool); `build_global`
+  dropped from var-calling (kept for pileup). `resolve_thread_split` →
+  `resolve_thread_budget` + `resolve_caller_threads`; `PVC_PRODUCER_THREADS`
+  retired (pool == budget). Removes the idle verify pool (−`N`): measured
+  **3N+c → 2N+c** (peak threads at N=1/2/4/8 = 4/6/12/20; T=6: 22 → 16).
+  Byte-identical (md5 `5164f285…`) at every N, both `--low-memory` modes, on the
+  multi-interval tomato input; wall-neutral (N=8 5.7s). The remaining `N` is the
+  caller threads → Phase 2.
 - **Phase 2 — EM as pool tasks (prototype, measure, *then* decide).** §3.2.
   Removes the `N` caller threads (−`N`). `T=5`: ~14 → ~7. The substantial
   phase: ordering, the in-flight liveness cap, scratch reuse, byte-identity.
