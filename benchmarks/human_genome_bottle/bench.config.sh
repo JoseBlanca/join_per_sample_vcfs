@@ -25,14 +25,6 @@ SINGLE_CRAM="${SINGLE_CRAM:-HG002_reads_selected_1000_rg.cram}"
 # compare_to_truth.sh as the truth set.
 TRUTH_VCF="${TRUTH_VCF:-$BENCH_DIR/results/HG002_bottle_reference_1000rg.vcf.gz}"
 
-# Disable our BAQ HMM for this accuracy benchmark. BAQ is applied in our
-# pileup stage and baked into the .psp's per-allele `q_sum`, where it shifts
-# indel (and SNP) qualities; GATK and freebayes do no BAQ here, so leaving it
-# on makes the cross-caller indel comparison unfair. `--no-baq` makes `bq_baq`
-# a copy of the raw CRAM QUAL — regenerate the .psp after changing this.
-# (Env-overridable: set PILEUP_EXTRA= to re-enable BAQ.)
-PILEUP_EXTRA="${PILEUP_EXTRA:---no-baq}"
-
 PLOIDY="${PLOIDY:-2}"
 THREADS="${THREADS:-4}"
 
@@ -46,12 +38,12 @@ THREADS="${THREADS:-4}"
 MIN_QUAL="${MIN_QUAL:-0}"                       # freebayes: no post-call QUAL cap
 HC_EXTRA="${HC_EXTRA:--stand-call-conf 0}"      # GATK HaplotypeCaller: emit low-conf too
 
-# ours: emit every site (--min-qual 0) and disable the DUST low-complexity
-# filter (--no-complexity-filter). DUST masks microsatellites/homopolymers,
-# which is exactly where indels live: with it on it dropped 222 of our 311
-# missed truth indels (recall 0.74 -> 0.93) to avoid just ~9 FP indels, and it
-# even cost SNP TPs. GATK and freebayes apply no such mask, so disabling ours
-# keeps the indel comparison fair. (See the indel-loss investigation.)
-VARCALL_EXTRA="${VARCALL_EXTRA:---min-qual 0 --no-complexity-filter}"
+# ours: emit every site (--min-qual 0) for the full-range QUAL sweep. BAQ and
+# the DUST low-complexity filter are kept ON by default (the caller's real
+# defaults) for now — note this penalises our indel/SNP recall vs GATK/freebayes
+# in low-complexity regions (DUST masks the microsatellites/homopolymers where
+# indels live: ~222 of 311 missed truth indels, plus some true SNPs). Revisit
+# as a caller-level class-aware-DUST question rather than a benchmark override.
+VARCALL_EXTRA="${VARCALL_EXTRA:---min-qual 0}"
 GATK_HEAP="${GATK_HEAP:-4g}"
 GATK_COMBINE_HEAP="${GATK_COMBINE_HEAP:-8g}"
