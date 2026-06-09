@@ -662,6 +662,105 @@ fragments before extraction → raises the spanning ceiling without any FRR/inse
 machinery. Recommend: **spanning-only + optional read-pair merging; defer
 FRR/insert-size** unless long-locus recall becomes a requirement.
 
+## 6f. Lessons from deep-reading HipSTR, GangSTR, ConSTRain (2026-06-09)
+
+Full texts read: HipSTR (PMC5482724), GangSTR (PMC6735967), ConSTRain
+(PMC12504596). Extraction was via a fast model over the PMC full text —
+**high-confidence on structure/formulas, but confirm exact constants in the
+supplements + source before coding.** Concrete refinements to the §6e model:
+
+### Stutter model — adopt HipSTR's exact 3-parameter geometric form
+
+This *is* our `S_θ`. Stutter `δ` measured in **whole repeat units**; per-locus
+params `u` (insertion prob), `d` (deletion prob), `ρ` (geometric step size):
+
+```
+S_θ(δ) =  1 − u − d              if δ = 0
+          u · ρ · (1−ρ)^(δ−1)    if δ > 0   (gain of δ units)
+          d · ρ · (1−ρ)^(−δ−1)   if δ < 0   (loss of |δ| units)
+```
+with `L = a + δ·motif`. Only **in-frame** (whole-unit) stutter is modelled here;
+**out-of-frame** changes are absorbed by the base-error term (our Stage-1
+`Q_r(L)`), not the stutter model. HipSTR **EM M-step** (gives us the stutter-EM
+update directly): `u` = posterior-weighted fraction of reads whose called allele
+is *longer* than the assigned true allele; `d` = fraction *shorter*; `ρ` = 1 /
+mean-weighted-step-size (the geometric MLE); `f_j` = allele frequency.
+- Contrast: **GangSTR uses a cruder fixed `Geometric(P=0.9)`** on enclosing-read
+  counts (no per-locus EM); **ConSTRain models no stutter at all** (leans on dup
+  marking + depth filters). Both confirm our choice of HipSTR-style per-locus
+  (hierarchical, motif-class-shrunk) stutter as the precision lever they lack.
+
+### Stage-1 per-read likelihood `Q_r(L)` — HipSTR's realignment, minus stutter
+
+HipSTR uses a **flanking-sequence HMM** (Match/Ins/Del states, emission
+`Q(b,h) = q_b` if match else `(1−q_b)/3`, base-error per **Albers et al. 2011 /
+Dindel**) plus an **STR model** that assumes the read differs from a haplotype by
+**≤ 1 indel of magnitude D** (a multiple of the motif), inserted bases assumed to
+be periodic copies of the motif. Our Stage-1 `Q_r(L)` = exactly this realignment
+likelihood **without** the stutter term (we moved stutter to Stage-2). Adopt the
+Dindel emission model + the ≤1-indel STR alignment.
+
+### Candidate-allele set — adopt the support thresholds
+
+- HipSTR: a spanning read needs **≥10 bp exact match on both ends** and **no
+  longer exact match 15 bp up/down**; a length becomes a candidate if seen in
+  **≥2 reads AND ≥20% of a sample's reads**; then **iterate** (re-derive
+  candidates from stutter-corrected alignments after a genotyping round).
+- GangSTR: candidates from enclosing reads with **support ≥2**. ConSTRain:
+  spanning = **≥5 bp flank each side**.
+- → **Our rule:** candidate length set = {lengths in ≥2 reads & ≥20% of a sample}
+  ∪ reference, **union'd across the cohort**, padded by the stutter range; one
+  refinement iteration. (Resolves the §6d "candidate set shared across samples"
+  open question.)
+
+### Polyploid genotype space — adopt ConSTRain's integer-partition enumeration
+
+ConSTRain's key tractability trick: enumerate genotypes as **integer partitions
+of the copy number `c`** (alleles in descending abundance), **not** weak
+compositions — `c = 20` ⇒ **627 partitions vs 6.9×10¹⁰ compositions**. This makes
+our polyploid posteriors tractable. Reuse ConSTRain's "**each allele contributes
+≈ total_reads / c reads**" as the *mean* of our read mixture, but **keep the
+proper likelihood + stutter + posterior** instead of ConSTRain's crude
+`argmin ‖D_i − O‖₁` (Manhattan-distance fit, which has no stutter and no
+posteriors).
+
+### Quality + FP-aversion — adopt the concrete filter thresholds
+
+- **HipSTR:** genotype posterior **Q ≥ 0.9**; **≥10 spanning reads**; **≤10% reads
+  with stutter/flank-indel artifacts**; **≥20% allele support**; "drop the 10%
+  least-confident → 95.2→98.9%". These are ready-made FP-averse defaults.
+- **GangSTR:** `Q = −10·log₁₀(1 − L_ML/L)` (a uniform-prior posterior; we compute
+  the analogue from our *real* population posterior → `GQ`); bootstrap-resample
+  reads for a CI (optional, → `REPCI`).
+- **ConSTRain:** **normalized depth = reads / copy_number**, keep within
+  `[--min-norm-depth=1.0, drop top/bottom 2.5%]`; **exclude segmental
+  duplications**. Adopt normalized-depth bounds + segdup/mappability exclusion.
+- **Call-rate caveat (precision↔recall):** at matched ~98% accuracy on HG002,
+  loci-called were **HipSTR 69% vs GangSTR 81% vs ConSTRain 82%** — HipSTR
+  no-calls far more (stricter gate). So our precision-first stance will cost call
+  rate; make the trade explicit via the GQ sweep.
+
+### Cohort mechanics
+
+HipSTR genotypes **200 samples per batch**, learning allele frequencies `f_j` in
+the EM — direct confirmation of our cohort-pooled design. ConSTRain is **Rust +
+multithreaded** (architecturally identical to us; HG002 in ~19.5 min/32 threads).
+
+### On file — GangSTR's beyond-read-length read-class likelihoods
+
+If we ever lift the spanning-only scope (§6e), GangSTR's exact per-class terms:
+**Enclosing** `Geometric(P=0.9)` on repeat count; **Spanning** `Normal(μ = L_frag
+− A·m, σ)` on fragment length; **FRR** count `Poisson(λ)` with
+`λ = C_v·r·[u(A·m−r)+u(B·m−r)]/m`; **Flanking** `Uniform[1, A]`. Joint
+`LL(A,B) = Σ_pairs log[0.5·P(·|A)+0.5·P(·|B)] + log Poisson(|FRR|; λ)` — the same
+0.5/0.5 diploid mixture we use, plus the Poisson FRR term.
+
+**Net effect on the design:** §6e's `S_θ` is now concretely the `(u,d,ρ)`
+geometric form with HipSTR's EM updates; Stage-1 `Q_r(L)` is the Dindel-emission
+≤1-indel realignment; the polyploid genotype space uses integer-partition
+enumeration; and FP-aversion has ready-made thresholds. No change to the
+two-stage split or the inbreeding-adjusted prior.
+
 ## 7. Open questions / next steps
 
 - [ ] **Deep-read the 3 core papers** to pin exact formulations before coding:
@@ -692,8 +791,16 @@ Primary (verified-source-backed claims):
 - Low-complexity regions & variant-call error — Li 2014. https://pmc.ncbi.nlm.nih.gov/articles/PMC4271055/
 - HipSTR docs/repo — https://hipstr-tool.github.io/HipSTR/ , https://github.com/HipSTR-Tool/HipSTR
 - Krait (SSR mining) — http://krait.biosv.com/
-- Additional fetched: bioinformatics 36/7/2269; PMC6262739 (GangSTR); PMC7327730;
-  pubmed 34260828; frontiers fgene 1474611; bioinformatics 33/24/4041.
+- Additional fetched: bioinformatics 36/7/2269; PMC7327730; pubmed 34260828;
+  frontiers fgene 1474611; bioinformatics 33/24/4041.
+  *(Note: the run had mislabelled `PMC6262739` as GangSTR — it is actually
+  Šarhanová et al. SSR-seq, unrelated; corrected below.)*
+
+**Deep-read in full (PMC full text, 2026-06-09 — basis for §6f):**
+- HipSTR — Willems et al., *Nat Methods* 2017 — https://pmc.ncbi.nlm.nih.gov/articles/PMC5482724/
+- GangSTR — Mousavi et al., *NAR* 2019;47(15):e90 — https://pmc.ncbi.nlm.nih.gov/articles/PMC6735967/
+- ConSTRain — *Commun Biol* 2025 — https://pmc.ncbi.nlm.nih.gov/articles/PMC12504596/
+  (bioRxiv: 10.1101/2024.12.13.628141)
 
 Run stats: 5 angles, 20 sources, 99 claims, 25 verified (8 confirmed, 1 refuted,
 16 abstained/rate-limited). Full machine output retained in the session task
