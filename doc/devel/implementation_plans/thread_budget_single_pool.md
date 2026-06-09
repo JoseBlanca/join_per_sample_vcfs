@@ -204,12 +204,22 @@ portability**, not speed.
   Byte-identical (md5 `5164f285…`) at every N, both `--low-memory` modes, on the
   multi-interval tomato input; wall-neutral (N=8 5.7s). The remaining `N` is the
   caller threads → Phase 2.
-- **Phase 2 — EM as pool tasks (prototype, measure, *then* decide).** §3.2.
-  Removes the `N` caller threads (−`N`). `T=5`: ~14 → ~7. The substantial
-  phase: ordering, the in-flight liveness cap, scratch reuse, byte-identity.
-  Build it as a prototype, run the full matrix (§5.1), and **commit only if it
-  holds the contract *and* does not regress small machines**; otherwise fall
-  back to the §3.2 budget partition. Producer starvation is the thing to watch.
+- **Phase 2 — EM as pool tasks → fell back to Plan B partition. [DONE —
+  `5f6c1b1`]** §3.2. The one-pool prototype (EM dispatched as transient
+  `pool.scope` tasks behind an in-flight cap) was built and measured: it is
+  **byte-identical** but **~2× slower than a same-budget partition at every
+  thread count** (N=6/12/18: 19.4/13.5/11.1s vs Phase-1 2N's 6.9/5.3/5.4s; the
+  same-budget partition was ~8.8s at N=8). Root cause exactly as §3.2 warned —
+  heavy *non-preemptible* EM tasks steal the decode-bound producer's threads, so
+  the producer (the wall limiter) runs *below* its floor; the in-flight cap does
+  not fix it (the producer wants bursty access to *all* threads, which a fixed
+  cap can't grant). So per the pre-specified fallback we took the **budget
+  partition**: a `P`-thread producer pool + `C` dedicated caller threads,
+  `P+C=N` (`resolve_split`), default balanced with a small-cohort nudge (§5.2).
+  Result: **3N+c → N+c** (c=2 inline / c=4 staged; N=8: 28 → 12 threads),
+  byte-identical at N∈{1,2,4,6,8} on multi-interval input, wall at the
+  honest-budget partition optimum. The one-pool code was reverted (kept only in
+  history); [[project_thread_budget_split_sweep]] records the measurements.
 - **Phase 3 — trim coordinators / revisit staging.** §3.3. Collapse to the
   minimum justified threads; re-evaluate `STAGED_MIN_THREADS`. Target
   `≈ N + 2`. **Bonus:** Phase 2 may let the inline and staged paths converge
@@ -262,6 +272,19 @@ that generalizes** (a *regime threshold* like the existing
 fitted per-`N` optima), env-/flag-overridable for power users. Order:
 **measure → decide one-pool-vs-partition → if partition, derive the simplest
 robust rule, not a fitted per-`N` table.** The ideal result is *no table*.
+
+**Chosen rule (`resolve_split`, `5f6c1b1`).** The threads × cohort-size sweep
+(2026-06-09) showed the optimal *ratio* is ~`0.5` and **stable across `N`** — so
+no per-`N` table — but it **shifts with cohort size**: at `N=8` the best `P` is
+4 / 5 / 6 for 50 / 8 / 1 samples (heavy EM at many samples pulls toward
+balanced; trivial EM at few samples pulls toward producer). The rule is
+therefore a *ratio*, not counts: `P = ⌊N/2⌋` (balanced) for cohorts above
+[`SMALL_COHORT_SAMPLES`]` = 8`, nudged to `P = ⌈2N/3⌉` for cohorts at/below it.
+This keys on `n_samples` (an **input** property, not hardware), so it stays
+portable; the threshold sits at the largest cohort still measured to prefer the
+nudge, because over-nudging a large cohort is the steep-penalty direction
+(N=8/50-sample P=6 → +67 % vs balanced) while under-nudging a small one costs
+only tens of ms on sub-2 s runs. Env knobs override each side.
 
 ## 6. Hard constraints
 
