@@ -675,6 +675,11 @@ pub struct CohortChunkIntegrator<R: Read + Seek> {
     buffers: Vec<Vec<Arc<TwoPhaseSegment>>>,
     /// Per sample: reader exhausted within the current interval.
     exhausted: Vec<bool>,
+    /// `false` until the first [`begin_interval`](Self::begin_interval). Gates
+    /// the `Channel`-source leftover-drain: there is no prior interval to drain
+    /// on the first call, and draining then would discard the first interval's
+    /// real segments.
+    started: bool,
     dust_mask: Vec<Range<u32>>,
 
     /// Monotonic genomic-order chunk counter (the writer's reorder ticket).
@@ -740,6 +745,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             next_chunk_start: 0,
             buffers: (0..n).map(|_| Vec::new()).collect(),
             exhausted: vec![false; n],
+            started: false,
             dust_mask: Vec::new(),
             chunk_order: 0,
             fold: CohortSpanFold::new(),
@@ -822,12 +828,42 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         // `Owned`: reset the readers to the interval. `Channel`: the read stage
         // resets its own readers from the same schedule, in lockstep — the fold
         // stage only resets its per-interval buffer state below.
-        if let ReadSource::Owned(readers) = &mut self.source {
-            let region_end = interval.end - 1; // reader region_end is inclusive
-            for r in readers {
-                r.reset(chrom_id, interval.start, region_end);
+        match &mut self.source {
+            ReadSource::Owned(readers) => {
+                let region_end = interval.end - 1; // reader region_end is inclusive
+                for r in readers {
+                    r.reset(chrom_id, interval.start, region_end);
+                }
             }
+            // The read stage sends exactly one `IntervalEnd` per sample per
+            // interval. The fold loop normally consumes it (a sample is read to
+            // exhaustion), but `plan_chunk` can finish an interval *early* when a
+            // cut reaches `interval_end` before the reader exhausts — leaving that
+            // sample's `IntervalEnd` (and any trailing segments) queued. If they
+            // are not drained, the *next* interval's first read pulls the stale
+            // marker, marks the sample exhausted immediately, and the whole
+            // schedule desyncs (every later interval then folds nothing — the
+            // multi-interval staged-path bug). So before starting a new interval,
+            // pull each not-yet-exhausted sample up to and including its pending
+            // `IntervalEnd`, discarding the leftovers. Skipped on the first
+            // interval (`started == false`): there is no prior interval, and the
+            // queued messages are this interval's real data.
+            ReadSource::Channel { rx, wake } if self.started => {
+                for (s, rx_s) in rx.iter().enumerate() {
+                    while !self.exhausted[s] {
+                        match rx_s.recv() {
+                            Ok(ReadMsg::Segment(_)) => {}
+                            Ok(ReadMsg::IntervalEnd) | Err(_) => self.exhausted[s] = true,
+                        }
+                        // Free a slot so a read stage parked on a full channel
+                        // can make progress (best-effort, coalesced).
+                        let _ = wake.try_send(());
+                    }
+                }
+            }
+            ReadSource::Channel { .. } => {}
         }
+        self.started = true;
         self.chrom_id = chrom_id;
         self.interval_end = interval.end;
         self.next_chunk_start = interval.start;
@@ -1723,6 +1759,141 @@ mod tests {
         assert!(got[boundary..].iter().all(|r| r.chrom_id == 1));
         assert!(got[..boundary].windows(2).all(|w| w[0].pos < w[1].pos));
         assert!(got[boundary..].windows(2).all(|w| w[0].pos < w[1].pos));
+    }
+
+    /// Drive the cohort through the **production staged path**: a
+    /// [`drive_read_stage`] thread decodes ahead into per-sample channels and the
+    /// fold loop pulls from them via a `Channel`-source integrator — mirroring
+    /// the staged branch of `pipeline.rs` (read stage + bounded queues + the
+    /// per-interval `begin_interval` / `plan_chunk` walk). Returns the assembled
+    /// records in genomic order. `run_cohort` is the owned-reader analogue.
+    fn run_cohort_staged(
+        samples: &[Vec<PileupRecord>],
+        block_targets: &[usize],
+        min_alt_obs: u32,
+        target_variants: u32,
+    ) -> Vec<CohortPileupRecord> {
+        const DEPTH: usize = 2; // mirrors pipeline.rs READ_QUEUE_DEPTH
+        let readers: Vec<_> = samples
+            .iter()
+            .zip(block_targets)
+            .map(|(recs, &bt)| {
+                let bytes = psp_bytes_2chrom(recs, bt);
+                SamplePspReader::new(PspReader::new(Cursor::new(bytes)).unwrap(), 0, 1, 1)
+            })
+            .collect();
+
+        // Whole-cohort interval schedule (both chroms), shared by the read stage
+        // and the fold loop — exactly as the pipeline builds it.
+        let mut schedule: Vec<(u32, Range<u32>)> = Vec::new();
+        for chrom_id in 0..2u32 {
+            for iv in covered_intervals_for(&readers, chrom_id, MGS) {
+                schedule.push((chrom_id, iv));
+            }
+        }
+
+        let n = readers.len();
+        let (seg_txs, seg_rxs): (
+            Vec<crossbeam_channel::Sender<ReadMsg>>,
+            Vec<crossbeam_channel::Receiver<ReadMsg>>,
+        ) = (0..n)
+            .map(|_| crossbeam_channel::bounded::<ReadMsg>(DEPTH))
+            .unzip();
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+
+        let names = names(n);
+        let mut out: Vec<CohortPileupRecord> = Vec::new();
+        let schedule_ref = &schedule;
+        let pool_ref = &pool;
+        std::thread::scope(|scope| {
+            let read_handle = scope.spawn(move || {
+                drive_read_stage(readers, schedule_ref, &seg_txs, &wake_rx, pool_ref, DEPTH)
+                    .unwrap();
+            });
+
+            let mut integ = CohortChunkIntegrator::<Cursor<Vec<u8>>>::new_streaming(
+                seg_rxs,
+                wake_tx,
+                min_alt_obs,
+                target_variants,
+            );
+            let mut fetch = |_c: u32, len: u32| Ok::<_, RefFetchError>(vec![b'N'; len as usize]);
+            let mut expected_order = 0u64;
+            for (chrom_id, iv) in schedule_ref {
+                integ.begin_interval(*chrom_id, iv.clone(), Vec::new());
+                while let Some(plan) = integ.plan_chunk(&mut fetch).unwrap() {
+                    assert_eq!(plan.chunk_order, expected_order, "chunk_order gapless");
+                    expected_order += 1;
+                    let chunk = compact_plan(plan, true).unwrap();
+                    out.extend(merge_compacted_samples(&chunk.per_sample, &names).unwrap());
+                }
+            }
+            // Drop the integrator (releases the channel receivers + the wake
+            // sender) so a read stage parked on a full queue or on `wake`
+            // observes the disconnect and the scope can join.
+            drop(integ);
+            read_handle.join().unwrap();
+        });
+        out
+    }
+
+    #[test]
+    fn staged_channel_path_matches_owned_across_intervals() {
+        // Regression guard for the multi-interval staged-path desync bug. The
+        // production path (read stage → per-sample channels → `Channel`-source
+        // fold) sends one `IntervalEnd` marker per sample per interval. When an
+        // interval finishes via a cut reaching `interval_end` *before* the reader
+        // exhausts, that marker (and any trailing segments) stays queued; if
+        // `begin_interval` doesn't drain it, every *later* interval pulls the
+        // stale marker first, folds nothing, and the run emits almost nothing.
+        //
+        // Single-interval fixtures never trip it (the lone interval always drains
+        // to exhaustion), which is why the tomato bench — one ~2 Mb region — and
+        // every owned-path test missed it; the human bottle (≈1000 BED intervals)
+        // collapsed to 3 records. So this drives the *channel* path across MANY
+        // intervals (chrom0 ×2 + chrom1 ×1) and asserts byte-equality with the
+        // owned reference. Small `target_variants` forces the early-cut leak;
+        // large reads to exhaustion — both must match.
+        // A SINGLE-sample cohort is the reliable trigger (and the real-world
+        // shape that surfaced this — GIAB HG002): with one sample the cohort
+        // watermark is that sample's own coverage, so an interval's last chunk is
+        // cut at `interval_end` the moment the watermark reaches the last position
+        // — no extra read, so the `IntervalEnd` is never consumed → leak. With
+        // several unequal-length samples the `min` watermark forces a laggard read
+        // to exhaustion, which consumes the marker and masks the bug; we test that
+        // shape too (it must stay correct), but n=1 is what actually fails.
+        let single = vec![multichrom_sample(0)];
+        let multi = vec![
+            multichrom_sample(0),
+            multichrom_sample(1),
+            multichrom_sample(2),
+        ];
+        let cases: &[(&[Vec<PileupRecord>], &[usize])] =
+            &[(&single, &[200]), (&multi, &[200, 350, 512])];
+
+        for (samples, bts) in cases {
+            for &min_alt_obs in &[1u32, 2] {
+                let want = reference_2chrom(samples, min_alt_obs);
+                assert!(!want.is_empty(), "fixture should yield variants");
+                for &target in &[1u32, 3, 7, 100_000] {
+                    let got = run_cohort_staged(samples, bts, min_alt_obs, target);
+                    // Cross-check the owned path too, so a future divergence in
+                    // either direction is caught.
+                    let owned = run_cohort(samples, bts, min_alt_obs, target);
+                    assert_eq!(owned, want, "owned path sanity: target={target}");
+                    assert_eq!(
+                        got,
+                        want,
+                        "staged channel path diverged: n={} min_alt_obs={min_alt_obs} target={target}",
+                        samples.len(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
