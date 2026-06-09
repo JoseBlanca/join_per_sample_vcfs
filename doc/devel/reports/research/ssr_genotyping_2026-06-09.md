@@ -525,6 +525,53 @@ do realignment-quality genotyping and learn stutter), but stored compactly.
    #flanking+bounds, #IRR, depth, #filtered). Plus locus context (motif, ref
    copies, flank seqs).
 
+### Qᵣ(L) algorithm decision (final, B — 2026-06-09)
+
+**Two-tier extraction** producing the stutter-free per-read length-likelihood
+`Qᵣ(L)`; both tiers realign against candidate-length haplotypes
+`H_L = outer_flank + (motif × L) + inner_context` (full read **including
+soft-clips**; flanks/motif from catalog + reference) to **escape reference bias**.
+
+- **Fast path — flank-anchored exact motif count.** A read takes it iff it spans
+  with ≥ `min_flank` (~10 bp) clean matched bases on both sides AND its tract is a
+  pure integer motif tiling, no interior seq-indel, boundary base-qual ≥ `min_bq`
+  (~Q20). → confident `L*` (+ weight) → the **histogram**. O(read len), handles
+  the bulk.
+- **Slow path — banded pair-HMM forward** over `L ∈ [count−w, count+w]`
+  (`w ≈ 3`) for impure/ambiguous reads → a real `Qᵣ(L)` distribution → the **CSR
+  ambiguous columns**. **Forward (sum over alignments), not max** — true
+  likelihood, honest ambiguity.
+
+**Concrete choices (PM delegated #2–#5):**
+- **#1 scorer:** **forward pair-HMM** for the slow path; fall back to a cheaper
+  scorer *only* on a measured perf problem (unlikely — see perf note).
+- **#2 base-error model:** **Dindel/Albers** (HipSTR's) — 3-state pair-HMM
+  (M/I/D), per-base-quality emissions (`match = 1 − 10^(−Q/10)`,
+  `mismatch = (10^(−Q/10))/3`), affine gaps for **sequencing** indels (distinct
+  from stutter, which lives in Stage 2). Transition defaults from Dindel;
+  calibratable.
+- **#3 ambiguity criterion:** the fast-path test above; anything failing it →
+  slow path. The A2-footer `ambiguity_threshold` bundles `min_flank`, `min_bq`,
+  "0 interior indels".
+- **#4 window:** `w = 3` motif units around the read's apparent count
+  (configurable); Stage 2 floors `Qᵣ(L)` outside the stored window.
+- **#5 compound inner-flank** (from A1 splitting): anchor on the **outer** unique
+  flank; build the **inner context** of `H_L` from the catalog neighbour (its
+  `motif × ref_copies`), detected via coordinate adjacency — *not* treated as
+  unique sequence. A sub-locus sandwiched between two repeats (rare) → flag
+  low-confidence.
+- **#6 implementation:** **build a small bespoke banded pair-HMM in Rust** (no
+  `rust-bio` dependency); learn the banded-forward pattern from the project's BAQ
+  HMM (`baq_engine`) but keep the SSR module **independent** (no coupling).
+
+**Perf note:** cost ≈ (#ambiguous reads) × (2w+1) banded forwards over
+~read-length haplotypes; SSR loci are sparse and most reads take the fast path, so
+it is negligible next to the whole-genome alignment already paid to make the BAM.
+
+**Independently testable (→ C):** push simulated reads of known length/purity
+through extraction and check `Qᵣ(L)` peaks at the truth, broken down by
+motif/purity/base-quality — validates the extractor before any genotyping.
+
 ### Per-sample evidence schema (what to store — the engineering crux)
 
 Determined entirely by the Stage-2 math
