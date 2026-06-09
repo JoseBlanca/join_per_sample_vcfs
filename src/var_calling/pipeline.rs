@@ -99,27 +99,82 @@ const STAGED_MIN_THREADS: usize = 4;
 /// any sub-span (runs are coalesced across boundaries); this just caps RAM.
 const DUST_SUBSPAN: u32 = 1_000_000;
 
-/// Resolve `(producer_threads, caller_threads)` from the requested thread
-/// budget `t`. The producer's rayon decode/compaction pool and the crossbeam
-/// caller pool are *independent*; left both at `t` they oversubscribe a
-/// `t`-core box ~2× (perf finding **H1**). This is the single point that sizes
-/// them, so the producer pool can be capped below the caller count.
+/// Resolve the thread budget `N` from `--threads`: the explicit value, else
+/// `available_parallelism`, floored at 1. The CLI / bench use this to size the
+/// producer pool + caller threads (via [`resolve_split`]); both must agree on
+/// the budget, so it lives in one place.
+pub fn resolve_thread_budget(threads: Option<usize>) -> usize {
+    threads
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .max(1)
+}
+
+/// Cohort size at or below which the producer (the decode-bound wall limiter)
+/// should get extra threads: with few samples the per-chunk EM is cheap, so the
+/// producer dominates and wants the budget. Measured (split sweep across
+/// threads × cohort size, 2026-06-09): at ≤8 samples the optimum is
+/// producer-heavy (≈`2N/3`), at 50 samples it is balanced (`N/2`). The penalty
+/// for *over*-nudging a large cohort is steep (N=8/50-sample: P=6 → +67 % vs
+/// balanced), so this stays at the largest cohort confirmed to still prefer the
+/// nudge — it never extrapolates into the unmeasured 9–49 range (those default
+/// to the safe balanced split).
+const SMALL_COHORT_SAMPLES: usize = 8;
+
+/// Partition the thread budget `n` into `(producer_pool, caller_threads)`,
+/// `P + C = n`. Plan B of the thread-budget single-pool plan: a shared pool
+/// let heavy non-preemptible EM tasks starve the decode-bound producer (~2×
+/// slower than this partition at the same budget — measured), so the two stages
+/// get dedicated threads that genuinely overlap.
 ///
-/// Default: both `t` — byte-identical and perf-neutral vs the pre-H1 behaviour
-/// (the producer's `par_iter_mut` ran on the global pool sized to `t`). The
-/// `PVC_PRODUCER_THREADS` / `PVC_CALLER_THREADS` environment variables override
-/// each, used for the H1 split sweep (perf review §3.3); once the winning split
-/// is chosen it replaces this default. Each value is floored at 1.
-fn resolve_thread_split(t: usize) -> (usize, usize) {
-    let from_env = |k: &str| {
+/// Rule (measured): **balanced** `P = ⌊n/2⌋` for normal cohorts — the optimum
+/// for large cohorts, where wall actually matters; the caller gets the rounding
+/// since caller-starvation is the cliff there. **Nudged** `P = ⌈2n/3⌉` when
+/// `n_samples ≤ `[`SMALL_COHORT_SAMPLES`] — EM is cheap, the producer wants the
+/// threads (matches the sweep: N=4→3, N=8→6). `PVC_PRODUCER_THREADS` /
+/// `PVC_CALLER_THREADS` override each side (the split sweep / power users).
+/// Each side floored at 1, so `n = 1` yields `(1, 1)` (the irreducible
+/// producer + caller pair; a true 1-thread total is not expressible).
+pub fn resolve_split(n: usize, n_samples: usize) -> (usize, usize) {
+    let p_default = if n_samples <= SMALL_COHORT_SAMPLES {
+        (2 * n).div_ceil(3) // ⌈2n/3⌉ — producer-heavy
+    } else {
+        n / 2 // ⌊n/2⌋ — balanced (caller takes the rounding)
+    };
+    // Keep both sides ≥ 1: for n ≥ 2 that pins P into [1, n-1]; for n = 1 the
+    // upper bound collapses to 1 and C floors back up to 1 → (1, 1).
+    let p_default = p_default.clamp(1, n.saturating_sub(1).max(1));
+    let env = |k: &str| {
         std::env::var(k)
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
+            .filter(|&v| v > 0)
     };
-    let producer = from_env("PVC_PRODUCER_THREADS").unwrap_or(t).max(1);
-    let callers = from_env("PVC_CALLER_THREADS").unwrap_or(t).max(1);
-    (producer, callers)
+    let p = env("PVC_PRODUCER_THREADS").unwrap_or(p_default).max(1);
+    let c = env("PVC_CALLER_THREADS")
+        .unwrap_or_else(|| n.saturating_sub(p))
+        .max(1);
+    (p, c)
+}
+
+/// Log the process's live OS-thread count (Linux only; a no-op elsewhere),
+/// called once the full pipeline topology is up: `main`, the producer pool, the
+/// caller threads, the writer, and (on the staged path) the two coordinators.
+/// The thread-budget contract (plan §6) is that this stays at `N + c` for a
+/// small constant `c` (not the historical `~3N`); the
+/// `thread_budget_integration` test parses this line and asserts it, guarding
+/// against the budget silently drifting back. Read from `/proc/self/status` so
+/// it reflects *actual* spawned threads, not a recomputed estimate.
+fn log_live_thread_count() {
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+        && let Some(n) = status.lines().find_map(|l| l.strip_prefix("Threads:"))
+    {
+        eprintln!("var-calling: live_threads={}", n.trim());
+    }
 }
 
 /// Errors surfaced by the re-architected pipeline entry point.
@@ -139,8 +194,6 @@ pub enum PipelineError {
     PosteriorConfig(#[from] PosteriorEngineConfigError),
     #[error("invalid --regions BED")]
     Regions(#[from] BedError),
-    #[error("building the producer rayon thread pool")]
-    ProducerPool(#[from] rayon::ThreadPoolBuildError),
     #[error("reference fetch: {0}")]
     RefFetch(#[from] ChromRefFetchError),
     #[error("dust mask computation: {0}")]
@@ -162,11 +215,19 @@ pub enum PipelineError {
 /// `None`) is wired into the EM's [`PosteriorEngineConfig`]. Returns the
 /// run-level [`WriterStats`] for the CLI's stderr run summary.
 ///
+/// `pool` is the producer-side rayon pool (built by the caller, sized to `P` —
+/// the producer half of the [`resolve_split`] budget) that runs the decode /
+/// fold / compact fan-out; `caller_threads` is `C`, the dedicated EM caller
+/// count. `P + C = N` honours the `--threads` budget. The caller (CLI / bench)
+/// owns pool construction because the criterion bench re-sizes per iteration.
+///
 /// (Reference-basename and FASTA-vs-`.psp` MD5 *validation* stay in the CLI
 /// wrapper — they guard bad input but do not affect the emitted VCF.)
 pub fn run_var_calling(
     args: &VarCallingArgs,
     contamination: Option<ContaminationEstimates>,
+    pool: &rayon::ThreadPool,
+    caller_threads: usize,
 ) -> Result<WriterStats, PipelineError> {
     let cohort = &args.cohort;
 
@@ -295,23 +356,16 @@ pub fn run_var_calling(
     // stateless `call_chunk`), and the writer owns the (`Send`) `CohortVcfWriter`
     // and reorders the out-of-order `CalledChunk`s by `chunk_order`, so the
     // emitted VCF is byte-identical regardless of worker count.
-    let requested_threads = args
-        .threads
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        })
-        .max(1);
-    // H1: size the producer (rayon) and caller (crossbeam) pools from one
-    // budget so they don't each claim `T` cores and oversubscribe ~2×. The
-    // producer's `par_iter_mut` runs inside `producer_pool.install(...)` below,
-    // so it uses this pool — not the global one — and the bench (which drives
-    // this entry directly) measures the same sizing the CLI gets.
-    let (producer_threads, n_workers) = resolve_thread_split(requested_threads);
-    let producer_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(producer_threads)
-        .build()?;
+    //
+    // Plan B of the thread-budget single-pool plan: the budget `N` is split into
+    // a `P`-thread producer pool (this `pool`, sized by the caller) + `C = N-P`
+    // dedicated EM caller threads, `P + C = N` (see [`resolve_split`]). A single
+    // shared pool was tried first but let heavy non-preemptible EM tasks starve
+    // the decode-bound producer (~2× slower at the same budget); dedicated
+    // threads for the two stages overlap genuinely. `producer_threads` (= the
+    // pool's size `P`) drives the `staged` decision and the startup log.
+    let producer_threads = pool.current_num_threads();
+    let n_workers = caller_threads;
     let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
     // Straddler decode cache: on by default, off under `--low-memory` (trades
     // the cache's cohort-scaling RSS for re-decompressing cut-spanning segments).
@@ -336,7 +390,7 @@ pub fn run_var_calling(
     let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<RawCohortChunk>(cap);
     let (called_tx, called_rx) = crossbeam_channel::bounded::<CalledChunk>(cap);
     let caller = &caller;
-    let producer_pool = &producer_pool;
+    let producer_pool = pool;
     let schedule = &schedule;
 
     std::thread::scope(|scope| -> Result<WriterStats, PipelineError> {
@@ -430,6 +484,10 @@ pub fn run_var_calling(
             let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
             let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
             let produce = producer_pool.install(|| -> Result<(), PipelineError> {
+                // Full topology (main + pool + callers + writer [+ coordinators])
+                // is live by here — log the OS thread count for the §6 budget
+                // guard (≤ N + c). See `log_live_thread_count`.
+                log_live_thread_count();
                 for (chrom_id, interval) in schedule {
                     let chrom_id = *chrom_id;
                     let mask = dust_mask_for(
@@ -490,6 +548,10 @@ pub fn run_var_calling(
             let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
             let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
             let produce = producer_pool.install(|| -> Result<(), PipelineError> {
+                // Full topology (main + pool + callers + writer [+ coordinators])
+                // is live by here — log the OS thread count for the §6 budget
+                // guard (≤ N + c). See `log_live_thread_count`.
+                log_live_thread_count();
                 for (chrom_id, interval) in schedule {
                     let chrom_id = *chrom_id;
                     let mask = dust_mask_for(
