@@ -44,7 +44,14 @@ THREADS="${THREADS:-4}"
 # F1-optimal threshold. So the fairness lives in the sweep, not in matched
 # pre-filters — keep all three emission gates at 0 here.
 MIN_QUAL="${MIN_QUAL:-0}"                       # freebayes: no post-call QUAL cap
-VARCALL_EXTRA="${VARCALL_EXTRA:---min-qual 0}"  # ours: emit every site
 HC_EXTRA="${HC_EXTRA:--stand-call-conf 0}"      # GATK HaplotypeCaller: emit low-conf too
+
+# ours: emit every site (--min-qual 0) and disable the DUST low-complexity
+# filter (--no-complexity-filter). DUST masks microsatellites/homopolymers,
+# which is exactly where indels live: with it on it dropped 222 of our 311
+# missed truth indels (recall 0.74 -> 0.93) to avoid just ~9 FP indels, and it
+# even cost SNP TPs. GATK and freebayes apply no such mask, so disabling ours
+# keeps the indel comparison fair. (See the indel-loss investigation.)
+VARCALL_EXTRA="${VARCALL_EXTRA:---min-qual 0 --no-complexity-filter}"
 GATK_HEAP="${GATK_HEAP:-4g}"
 GATK_COMBINE_HEAP="${GATK_COMBINE_HEAP:-8g}"
