@@ -236,15 +236,20 @@ pub enum VarCallingCliError {
 ///     `effective_threads` + the `requested … capped by N chromosomes`
 ///     parenthetical when the soft cap bit).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
-    // 1. Build the one work-stealing pool sized to the thread budget. Phase 1
-    //    of the thread-budget single-pool plan: this single pool runs both the
-    //    FASTA verify (step 6, via `pool.install`) and all of the pipeline's
-    //    producer-side CPU work, replacing the old `build_global` verify pool +
-    //    the pipeline's separate producer pool. (`pileup` keeps
-    //    `configure_rayon_pool` — out of scope for this change.)
+    // 1. Split the thread budget `N` into a `P`-thread producer pool + `C`
+    //    dedicated EM caller threads (`P + C = N`), then build the producer
+    //    pool. Plan B of the thread-budget single-pool plan: dedicated threads
+    //    for the two stages (a shared pool starved the decode-bound producer).
+    //    The producer pool also runs the FASTA verify (step 6, via
+    //    `pool.install`), so there is no separate idle verify pool. The split
+    //    nudges producer-heavy for small cohorts (see `resolve_split`), so it
+    //    needs the sample count up front. (`pileup` keeps `configure_rayon_pool`
+    //    — out of scope for this change.)
     let budget = crate::var_calling::pipeline::resolve_thread_budget(args.threads);
+    let (producer_threads, caller_threads) =
+        crate::var_calling::pipeline::resolve_split(budget, args.psp_files.len());
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(budget)
+        .num_threads(producer_threads)
         .build()?;
 
     // 2. Open every .psp once for header validation. Per-chrom
@@ -315,7 +320,8 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     //    opens its own per-sample readers, builds every per-stage config from
     //    the args, applies `--regions`, and writes the VCF; it returns the
     //    run-level counters for the summary.
-    let stats = crate::var_calling::pipeline::run_var_calling(args, contamination, &pool)?;
+    let stats =
+        crate::var_calling::pipeline::run_var_calling(args, contamination, &pool, caller_threads)?;
 
     // 8. Stderr summary.
     print_run_summary(&sample_names, stats, args.threads, chromosomes.len());

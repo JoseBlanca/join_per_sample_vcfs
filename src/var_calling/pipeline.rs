@@ -100,10 +100,10 @@ const STAGED_MIN_THREADS: usize = 4;
 const DUST_SUBSPAN: u32 = 1_000_000;
 
 /// Resolve the thread budget `N` from `--threads`: the explicit value, else
-/// `available_parallelism`, floored at 1. The CLI uses this to size the one
-/// work-stealing pool it builds, and [`run_var_calling`] uses it for the
-/// caller-thread default — both must agree, so it lives in one place.
-pub(crate) fn resolve_thread_budget(threads: Option<usize>) -> usize {
+/// `available_parallelism`, floored at 1. The CLI / bench use this to size the
+/// producer pool + caller threads (via [`resolve_split`]); both must agree on
+/// the budget, so it lives in one place.
+pub fn resolve_thread_budget(threads: Option<usize>) -> usize {
     threads
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -113,19 +113,51 @@ pub(crate) fn resolve_thread_budget(threads: Option<usize>) -> usize {
         .max(1)
 }
 
-/// Resolve the caller (EM) thread count from the budget `t`. Since Phase 1 of
-/// the thread-budget single-pool plan, the producer-side CPU work runs on the
-/// shared pool (sized to the budget, built by the caller), so there is no
-/// longer a producer split knob. The EM callers are still dedicated threads
-/// until they fold onto the pool (Phase 2); `PVC_CALLER_THREADS` overrides
-/// their count for measurement. Floored at 1.
-fn resolve_caller_threads(t: usize) -> usize {
-    std::env::var("PVC_CALLER_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(t)
-        .max(1)
+/// Cohort size at or below which the producer (the decode-bound wall limiter)
+/// should get extra threads: with few samples the per-chunk EM is cheap, so the
+/// producer dominates and wants the budget. Measured (split sweep across
+/// threads × cohort size, 2026-06-09): at ≤8 samples the optimum is
+/// producer-heavy (≈`2N/3`), at 50 samples it is balanced (`N/2`). The penalty
+/// for *over*-nudging a large cohort is steep (N=8/50-sample: P=6 → +67 % vs
+/// balanced), so this stays at the largest cohort confirmed to still prefer the
+/// nudge — it never extrapolates into the unmeasured 9–49 range (those default
+/// to the safe balanced split).
+const SMALL_COHORT_SAMPLES: usize = 8;
+
+/// Partition the thread budget `n` into `(producer_pool, caller_threads)`,
+/// `P + C = n`. Plan B of the thread-budget single-pool plan: a shared pool
+/// let heavy non-preemptible EM tasks starve the decode-bound producer (~2×
+/// slower than this partition at the same budget — measured), so the two stages
+/// get dedicated threads that genuinely overlap.
+///
+/// Rule (measured): **balanced** `P = ⌊n/2⌋` for normal cohorts — the optimum
+/// for large cohorts, where wall actually matters; the caller gets the rounding
+/// since caller-starvation is the cliff there. **Nudged** `P = ⌈2n/3⌉` when
+/// `n_samples ≤ `[`SMALL_COHORT_SAMPLES`] — EM is cheap, the producer wants the
+/// threads (matches the sweep: N=4→3, N=8→6). `PVC_PRODUCER_THREADS` /
+/// `PVC_CALLER_THREADS` override each side (the split sweep / power users).
+/// Each side floored at 1, so `n = 1` yields `(1, 1)` (the irreducible
+/// producer + caller pair; a true 1-thread total is not expressible).
+pub fn resolve_split(n: usize, n_samples: usize) -> (usize, usize) {
+    let p_default = if n_samples <= SMALL_COHORT_SAMPLES {
+        (2 * n).div_ceil(3) // ⌈2n/3⌉ — producer-heavy
+    } else {
+        n / 2 // ⌊n/2⌋ — balanced (caller takes the rounding)
+    };
+    // Keep both sides ≥ 1: for n ≥ 2 that pins P into [1, n-1]; for n = 1 the
+    // upper bound collapses to 1 and C floors back up to 1 → (1, 1).
+    let p_default = p_default.clamp(1, n.saturating_sub(1).max(1));
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+    };
+    let p = env("PVC_PRODUCER_THREADS").unwrap_or(p_default).max(1);
+    let c = env("PVC_CALLER_THREADS")
+        .unwrap_or_else(|| n.saturating_sub(p))
+        .max(1);
+    (p, c)
 }
 
 /// Errors surfaced by the re-architected pipeline entry point.
@@ -166,12 +198,19 @@ pub enum PipelineError {
 /// `None`) is wired into the EM's [`PosteriorEngineConfig`]. Returns the
 /// run-level [`WriterStats`] for the CLI's stderr run summary.
 ///
+/// `pool` is the producer-side rayon pool (built by the caller, sized to `P` —
+/// the producer half of the [`resolve_split`] budget) that runs the decode /
+/// fold / compact fan-out; `caller_threads` is `C`, the dedicated EM caller
+/// count. `P + C = N` honours the `--threads` budget. The caller (CLI / bench)
+/// owns pool construction because the criterion bench re-sizes per iteration.
+///
 /// (Reference-basename and FASTA-vs-`.psp` MD5 *validation* stay in the CLI
 /// wrapper — they guard bad input but do not affect the emitted VCF.)
 pub fn run_var_calling(
     args: &VarCallingArgs,
     contamination: Option<ContaminationEstimates>,
     pool: &rayon::ThreadPool,
+    caller_threads: usize,
 ) -> Result<WriterStats, PipelineError> {
     let cohort = &args.cohort;
 
@@ -300,17 +339,16 @@ pub fn run_var_calling(
     // stateless `call_chunk`), and the writer owns the (`Send`) `CohortVcfWriter`
     // and reorders the out-of-order `CalledChunk`s by `chunk_order`, so the
     // emitted VCF is byte-identical regardless of worker count.
-    let requested_threads = resolve_thread_budget(args.threads);
-    // Phase 1 (thread-budget single-pool plan §3.1): one work-stealing pool —
-    // built by the caller and sized to the budget `N` — runs all producer-side
-    // CPU work (decode / fold / compact). It also ran the startup FASTA verify,
-    // so the old idle verify pool and the producer's own pool collapse into this
-    // single pool. The EM callers are still `n_workers` dedicated threads
-    // (Phase 2 folds them onto the pool); `PVC_CALLER_THREADS` sizes them for
-    // measurement. `producer_threads` (= the pool's size) still drives the
-    // `staged` decision and the startup log.
+    //
+    // Plan B of the thread-budget single-pool plan: the budget `N` is split into
+    // a `P`-thread producer pool (this `pool`, sized by the caller) + `C = N-P`
+    // dedicated EM caller threads, `P + C = N` (see [`resolve_split`]). A single
+    // shared pool was tried first but let heavy non-preemptible EM tasks starve
+    // the decode-bound producer (~2× slower at the same budget); dedicated
+    // threads for the two stages overlap genuinely. `producer_threads` (= the
+    // pool's size `P`) drives the `staged` decision and the startup log.
     let producer_threads = pool.current_num_threads();
-    let n_workers = resolve_caller_threads(requested_threads);
+    let n_workers = caller_threads;
     let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
     // Straddler decode cache: on by default, off under `--low-memory` (trades
     // the cache's cohort-scaling RSS for re-decompressing cut-spanning segments).

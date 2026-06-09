@@ -71,7 +71,7 @@ use pop_var_caller::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_D
 use pop_var_caller::var_calling::per_group_merger::{
     DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
 };
-use pop_var_caller::var_calling::pipeline::run_var_calling;
+use pop_var_caller::var_calling::pipeline::{resolve_split, run_var_calling};
 use pop_var_caller::var_calling::posterior_engine::{
     DEFAULT_COMPOUND_ALT_PSEUDOCOUNT, DEFAULT_CONVERGENCE_THRESHOLD,
     DEFAULT_INBREEDING_COEFFICIENT, DEFAULT_INDEL_ALT_PSEUDOCOUNT, DEFAULT_MAX_GQ_PHRED,
@@ -314,11 +314,12 @@ fn bench_cohort(c: &mut Criterion) {
         // One untimed run pins the expected emit count so the in-loop assert
         // catches a fixture/chunking regression (output is thread-independent
         // by design, so any thread count yields the same count).
+        let (warm_p, warm_c) = resolve_split(1, n);
         let warm_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(warm_p)
             .build()
             .expect("build warm pool");
-        let expected = run_var_calling(&make_args(&fx, 1), None, &warm_pool)
+        let expected = run_var_calling(&make_args(&fx, 1), None, &warm_pool, warm_c)
             .expect("warm pipeline run")
             .records_written;
         assert!(
@@ -327,19 +328,20 @@ fn bench_cohort(c: &mut Criterion) {
         );
 
         for &t in THREAD_COUNTS {
-            // Phase 1: the caller builds the one work-stealing pool (sized to the
-            // budget `t`) and passes it in; the verify + producer-side CPU work
-            // share it. Built inside `b.iter` so the pool-spawn cost stays in the
-            // timed region (matching the pre-Phase-1 in-pipeline pool build).
+            // Plan B: the caller splits the budget `t` into a producer pool `P`
+            // + `C` caller threads (`resolve_split`), builds the `P`-pool, and
+            // passes both. Built inside `b.iter` so the pool-spawn cost stays in
+            // the timed region (matching the pre-split in-pipeline pool build).
             group.bench_function(format!("N{n}/T{t}"), |b| {
                 b.iter(|| {
                     let args = make_args(&fx, t);
+                    let (p, c) = resolve_split(t, n);
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(t)
+                        .num_threads(p)
                         .build()
                         .expect("build pool");
                     let stats =
-                        run_var_calling(black_box(&args), None, &pool).expect("pipeline run");
+                        run_var_calling(black_box(&args), None, &pool, c).expect("pipeline run");
                     assert_eq!(
                         stats.records_written, expected,
                         "records_written drifted — fixture/chunking regression"
