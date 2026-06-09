@@ -160,6 +160,23 @@ pub fn resolve_split(n: usize, n_samples: usize) -> (usize, usize) {
     (p, c)
 }
 
+/// Log the process's live OS-thread count (Linux only; a no-op elsewhere),
+/// called once the full pipeline topology is up: `main`, the producer pool, the
+/// caller threads, the writer, and (on the staged path) the two coordinators.
+/// The thread-budget contract (plan §6) is that this stays at `N + c` for a
+/// small constant `c` (not the historical `~3N`); the
+/// `thread_budget_integration` test parses this line and asserts it, guarding
+/// against the budget silently drifting back. Read from `/proc/self/status` so
+/// it reflects *actual* spawned threads, not a recomputed estimate.
+fn log_live_thread_count() {
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+        && let Some(n) = status.lines().find_map(|l| l.strip_prefix("Threads:"))
+    {
+        eprintln!("var-calling: live_threads={}", n.trim());
+    }
+}
+
 /// Errors surfaced by the re-architected pipeline entry point.
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -467,6 +484,10 @@ pub fn run_var_calling(
             let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
             let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
             let produce = producer_pool.install(|| -> Result<(), PipelineError> {
+                // Full topology (main + pool + callers + writer [+ coordinators])
+                // is live by here — log the OS thread count for the §6 budget
+                // guard (≤ N + c). See `log_live_thread_count`.
+                log_live_thread_count();
                 for (chrom_id, interval) in schedule {
                     let chrom_id = *chrom_id;
                     let mask = dust_mask_for(
@@ -527,6 +548,10 @@ pub fn run_var_calling(
             let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
             let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
             let produce = producer_pool.install(|| -> Result<(), PipelineError> {
+                // Full topology (main + pool + callers + writer [+ coordinators])
+                // is live by here — log the OS thread count for the §6 budget
+                // guard (≤ N + c). See `log_live_thread_count`.
+                log_live_thread_count();
                 for (chrom_id, interval) in schedule {
                     let chrom_id = *chrom_id;
                     let mask = dust_mask_for(
