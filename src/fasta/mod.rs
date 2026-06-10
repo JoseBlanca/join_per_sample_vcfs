@@ -9,7 +9,7 @@
 //!
 //! - [`fetcher::StreamingChromRefFetcher`] /
 //!   [`fetcher::ManualEvictChromRefFetcher`] /
-//!   [`fetcher::MultiChromStreamingRefFetcher`] — the production
+//!   [`fetcher::RepositoryRefFetcher`] — the production
 //!   implementations; see [`fetcher`] for the per-impl tradeoffs.
 //! - [`fetcher::ChromRefFetcher`] — single-chromosome trait
 //!   (sliding-buffer contract, used by single-chrom consumers).
@@ -25,7 +25,7 @@ pub mod fetcher;
 
 pub use fetcher::{
     ChromRefBaseIter, ChromRefFetchError, ChromRefFetcher, ManualEvictChromRefFetcher,
-    MultiChromStreamingRefFetcher, STREAMING_REF_BUFFER_BYTES, StreamingChromRefFetcher,
+    RepositoryRefFetcher, STREAMING_REF_BUFFER_BYTES, StreamingChromRefFetcher,
 };
 
 // ---------------------------------------------------------------------

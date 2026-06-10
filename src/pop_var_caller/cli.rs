@@ -20,7 +20,7 @@ use crate::bam::alignment_input::{
 };
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
-use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
+use crate::fasta::{ContigList, RepositoryRefFetcher};
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
 use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_region_into_writer};
 use crate::pileup::walker::{RunSummary, WalkerConfig};
@@ -319,12 +319,14 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let repository = build_fasta_repository(&args.reference)?;
     let mut current_chrom_id: Option<u32> = None;
 
-    // The walker's reference fetcher is likewise built once and reused
-    // across regions (it streams, swapping its inner per-contig fetcher
-    // on chrom transition). Rebuilding it per region re-parsed the
-    // `.fai` and re-opened the FASTA every time.
-    let walker_fetcher =
-        MultiChromStreamingRefFetcher::new(args.reference.clone(), inputs.contigs.clone());
+    // The walker reads its reference windows from the same shared
+    // `repository` the reader keeps resident (CRAM decode + the per-read
+    // F1/F3 fetch already load each contig there, for both CRAM and
+    // BAM). So the walker no longer opens a second, independent
+    // streaming reader over the same FASTA — it shares the resident
+    // contig at zero extra memory, observing the per-contig `clear()`
+    // through the shared `Arc`.
+    let walker_fetcher = RepositoryRefFetcher::new(repository.clone(), inputs.contigs.clone());
 
     let mut total_filter = FilterCounts::default();
     let mut total_walker = RunSummary::default();

@@ -9,12 +9,13 @@
 //! - [`ManualEvictChromRefFetcher`] — per-contig, caller-managed
 //!   buffer lifecycle. Designed for genuinely random-access patterns
 //!   within a known region (Stage 1 BAQ per-worker instance).
-//! - [`MultiChromStreamingRefFetcher`] — multi-contig fetcher used by
-//!   the Stage 1 pileup walker. Wraps a swappable
-//!   `StreamingChromRefFetcher` and rebuilds it on chrom transition.
-//!   Implements the multi-contig typed-error
-//!   [`MultiChromRefFetcher`] trait. `Sync` via an
-//!   internal `Mutex` (the only `Send + Sync` fetcher in the module).
+//! - [`RepositoryRefFetcher`] — multi-contig fetcher used by the
+//!   Stage 1 pileup walker. Reads windows out of the shared noodles
+//!   `fasta::Repository` the reader already keeps resident (for CRAM
+//!   decode and the per-read F1/F3 fetch), so the walker does not open a
+//!   second reader over the same FASTA. Implements the multi-contig
+//!   typed-error [`MultiChromRefFetcher`] trait; `Send + Sync` (holds
+//!   only an `Arc` clone of the repository).
 //!
 //! M12 (2026-05-23 code review): the legacy `RefSeqFetcher` trait
 //! (`io::Error`-returning, multi-chrom) was retired. All consumers
@@ -26,8 +27,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
+use noodles_fasta as fasta;
 use noodles_fasta::fai;
 
 use super::{ContigList, MultiChromRefFetcher};
@@ -75,10 +76,8 @@ const STREAMING_REF_FILE_READ_CHUNK: usize = 64 * 1024;
 /// **Contract.** Access must be monotonically non-decreasing in
 /// position. A backward jump beyond the sliding buffer returns
 /// [`ChromRefFetchError::OutOfPattern`]. Production callers
-/// (PerGroupMerger, DUST) satisfy this by construction; the
-/// [`MultiChromStreamingRefFetcher`] (the walker-side multi-contig
-/// wrapper) rebuilds the inner fetcher on chrom transition, so
-/// chrom-boundary backward jumps don't violate the contract either.
+/// (PerGroupMerger, DUST on the cohort side) satisfy this by
+/// construction, each building one fetcher per contig.
 pub struct StreamingChromRefFetcher {
     /// Contig name for error messages only.
     chrom_name: String,
@@ -255,9 +254,8 @@ fn refill(
 // Design choices:
 //
 // - **No `chrom_id` parameter.** The fetcher is bound to one contig
-//   at construction; the multi-contig wrapper
-//   [`MultiChromStreamingRefFetcher`] rebuilds the inner fetcher on
-//   chrom transition rather than passing chrom ids per call.
+//   at construction; multi-contig consumers build one fetcher per
+//   contig rather than passing chrom ids per call.
 // - **Typed error.** `ChromRefFetchError` distinguishes "I/O
 //   failure", "out of contig bounds", and "out of access pattern"
 //   so consumers can route them differently.
@@ -785,164 +783,129 @@ impl ChromRefFetcher for StreamingChromRefFetcher {
 }
 
 // ---------------------------------------------------------------------
-// MultiChromStreamingRefFetcher — multi-chrom, single-thread bridge.
+// RepositoryRefFetcher — multi-chrom view over a shared noodles
+// `fasta::Repository`.
 // ---------------------------------------------------------------------
 //
-// Bridge for consumers that traverse multiple chromosomes in
-// sequence — the Stage 1 pileup walker today. On each chrom
-// transition the inner [`StreamingChromRefFetcher`] is rebuilt for
-// the new contig; fetches within a chrom hit the same sliding
-// buffer.
+// The Stage 1 pileup path already builds (and keeps resident) one
+// noodles `fasta::Repository` per run: the CRAM slice decoder needs it
+// to reconstruct read bases, and the reader's per-read F1/F3
+// reference-slice fetch (`fetch_ref_for_read`) pulls from it for BOTH
+// CRAM and BAM input. The repository is a whole-contig cache, so by the
+// time the walker processes a read, that read's contig is already
+// resident.
+//
+// This fetcher lets the walker read its reference windows from that same
+// resident sequence instead of opening a *second*, independent streaming
+// reader over the same FASTA. It holds only an `Arc`-clone of the
+// repository (no per-fetch state, no separate file handle, no extra
+// bytes), so it is `Send + Sync` and adds zero memory beyond the
+// repository the run already pays for. When the caller `clear()`s the
+// repository on a contig transition, this fetcher transparently observes
+// the cleared cache (it owns no `Arc<Sequence>` of its own).
+//
+// Byte-identity: the repository stores raw FASTA bytes (the reader's
+// F1/F3 path slices them verbatim), so this fetcher applies the same
+// [`canonicalise`] the streaming fetcher used — uppercase, non-ACGT → N
+// — to return the exact bytes the walker expects.
 
-/// Multi-contig FASTA fetcher used by the Stage 1 pileup walker.
-/// Maintains *one* [`StreamingChromRefFetcher`] at a time, rebuilding
-/// it on the first `fetch` call for a different `chrom_id`.
-/// Implements [`MultiChromRefFetcher`], so it drops into the walker's
-/// generic plumbing.
-///
-/// `Sync` via internal `Mutex<Option<...>>`. The walker itself is
-/// single-threaded so the Mutex is uncontended; `var_calling_from_bam`
-/// also uses this fetcher and passes it through `Arc<dyn
-/// MultiChromRefFetcher + Send + Sync>`, so the `Sync` bound is real.
-/// Stage 1's BAQ uses a separate per-rayon-worker
-/// [`ManualEvictChromRefFetcher`] (built inside `BaqStream`'s
-/// `map_init`); BAQ does **not** share a fetcher with the walker
-/// — the access patterns are too different for one abstraction
-/// to serve both.
-///
-/// Behaviour on chrom transition: a fresh
-/// [`StreamingChromRefFetcher::for_contig`] is built for the new
-/// chrom *outside* the lock (M16 of the 2026-05-23 code review —
-/// the inner-fetcher build does the .fai parse + `File::open` work,
-/// which is millisecond-scale and shouldn't serialise other walker
-/// threads). The old fetcher is dropped when the new one is
-/// installed; both are briefly resident across the swap.
-/// Within-chrom fetches delegate to the strict
-/// [`ChromRefFetcher::fetch`] on the inner; the walker's
-/// single-threaded sequential access pattern satisfies the
-/// monotonic-forward contract.
-pub struct MultiChromStreamingRefFetcher {
-    fasta_path: PathBuf,
+/// Multi-contig reference fetcher backed by a shared noodles
+/// [`fasta::Repository`]. Used by the Stage 1 pileup walker: it slices
+/// the walker's windows out of the contig the reader already keeps
+/// resident (CRAM decode + the reader's per-read F1/F3 fetch), so the
+/// walker does not open a second reader over the same FASTA.
+pub struct RepositoryRefFetcher {
+    repository: fasta::Repository,
     contigs: ContigList,
-    inner: Mutex<Option<(u32, StreamingChromRefFetcher)>>,
 }
 
-impl MultiChromStreamingRefFetcher {
-    /// Build an adapter bound to a FASTA. No inner fetcher is
-    /// constructed yet — the first `fetch` triggers the lazy load.
-    pub fn new(fasta_path: PathBuf, contigs: ContigList) -> Self {
+impl RepositoryRefFetcher {
+    /// Build a fetcher over a shared repository. The `repository` is an
+    /// `Arc`-backed handle (cheap clone); pass the same instance the
+    /// reader uses so the walker shares its resident contigs.
+    pub fn new(repository: fasta::Repository, contigs: ContigList) -> Self {
         Self {
-            fasta_path,
+            repository,
             contigs,
-            inner: Mutex::new(None),
         }
     }
-
-    /// M4: surface poison as a typed error rather than swallowing it.
-    /// The walker is single-threaded inside a chrom worker; the only
-    /// way to poison this mutex is for the inner
-    /// `StreamingChromRefFetcher::for_contig` rebuild to panic (which
-    /// panic-frees the critical section, leaving `inner = None`).
-    /// Returning here lets the caller terminate the chrom worker
-    /// rather than silently continuing with a possibly-inconsistent
-    /// inner state.
-    fn lock_inner(
-        &self,
-    ) -> Result<
-        std::sync::MutexGuard<'_, Option<(u32, StreamingChromRefFetcher)>>,
-        ChromRefFetchError,
-    > {
-        self.inner.lock().map_err(|_poison| ChromRefFetchError::Io {
-            chrom_name: String::from("<walker-adapter>"),
-            source: io::Error::other(
-                "MultiChromStreamingRefFetcher mutex poisoned (prior panic during rebuild)",
-            ),
-        })
-    }
 }
 
-// M23 (2026-05-23 code review): MultiChromStreamingRefFetcher is the only
-// `Send + Sync` fetcher in the module — Stage 1 reader threads share
-// it through `Arc<dyn MultiChromRefFetcher + Send + Sync>`. Compile-
-// time assertion guards both bounds; a future field change that
-// flipped either would silently break the walker.
+// RepositoryRefFetcher is `Send + Sync` (both fields are): the walker
+// shares it as `&self` and a future multi-thread reader could share it
+// through an `Arc<dyn MultiChromRefFetcher + Send + Sync>`.
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<MultiChromStreamingRefFetcher>();
+    assert_send_sync::<RepositoryRefFetcher>();
 };
 
-impl MultiChromRefFetcher for MultiChromStreamingRefFetcher {
+impl MultiChromRefFetcher for RepositoryRefFetcher {
     fn fetch(
         &self,
         chrom_id: u32,
         start_1based: u32,
         length: u32,
     ) -> Result<Vec<u8>, ChromRefFetchError> {
-        // M16: rebuild outside the lock. The lock is taken twice (once
-        // to check, once to install), but each critical section is
-        // tiny (a pointer comparison or a single move). Previously the
-        // lock was held across `for_contig` (file open + .fai parse +
-        // contig lookup), serialising every walker thread through a
-        // millisecond-scale operation.
-        let needs_rebuild = {
-            let slot = self.lock_inner()?;
-            !matches!(slot.as_ref(), Some((current, _)) if *current == chrom_id)
-        };
-
-        if needs_rebuild {
-            let entry = self.contigs.entries.get(chrom_id as usize).ok_or_else(|| {
-                ChromRefFetchError::Io {
-                    chrom_name: String::from("<walker-adapter>"),
+        if start_1based == 0 {
+            return Err(ChromRefFetchError::InvalidStart);
+        }
+        let entry =
+            self.contigs
+                .entries
+                .get(chrom_id as usize)
+                .ok_or_else(|| ChromRefFetchError::Io {
+                    chrom_name: String::from("<repository-adapter>"),
                     source: io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "MultiChromStreamingRefFetcher: chrom_id {chrom_id} out of range \
+                            "RepositoryRefFetcher: chrom_id {chrom_id} out of range \
                              (have {} contigs)",
                             self.contigs.entries.len()
                         ),
                     ),
-                }
-            })?;
-            // Build outside the lock (the expensive step: .fai parse
-            // + File::open + ContigFai::validate). The old fetcher
-            // for the previous chrom is still resident in the slot
-            // here, so peak memory briefly covers two contig
-            // working sets — accepted to keep the lock-holding
-            // window minimal.
-            let fresh = StreamingChromRefFetcher::for_contig(&self.fasta_path, &entry.name)?;
-            // Install the new fetcher; the old one drops here.
-            let mut slot = self.lock_inner()?;
-            *slot = Some((chrom_id, fresh));
-        }
+                })?;
 
-        let slot = self.lock_inner()?;
-        // PANIC-FREE: when `needs_rebuild` was true, the block above
-        // installed `Some((chrom_id, _))` before releasing the lock;
-        // when it was false, the slot was already
-        // `Some((chrom_id, _))` from the matches! check. A concurrent
-        // racer could have rebuilt for a *different* chrom_id between
-        // our install and this re-lock — in that case we'd fall
-        // through, but the walker is single-threaded per chrom so
-        // this can't happen in production. Returning a typed error
-        // rather than panicking on the race is defence in depth.
-        let (_, inner) = match slot.as_ref() {
-            Some(pair) if pair.0 == chrom_id => pair,
-            _ => {
+        // Whole-contig sequence from the shared cache. `get` loads it on
+        // a miss (the same load the reader's F1/F3 path would do) and
+        // returns an `Arc`-clone on a hit; the clone is dropped at the
+        // end of this call, so no contig is pinned beyond the
+        // repository's own cache.
+        let seq = match self.repository.get(entry.name.as_bytes()) {
+            Some(Ok(seq)) => seq,
+            Some(Err(source)) => {
                 return Err(ChromRefFetchError::Io {
-                    chrom_name: String::from("<walker-adapter>"),
-                    source: io::Error::other(format!(
-                        "MultiChromStreamingRefFetcher: slot raced — expected chrom_id {chrom_id} \
-                         but found a different binding"
-                    )),
+                    chrom_name: entry.name.clone(),
+                    source,
+                });
+            }
+            None => {
+                return Err(ChromRefFetchError::Io {
+                    chrom_name: entry.name.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("contig {} not in FASTA repository", entry.name),
+                    ),
                 });
             }
         };
-        ChromRefFetcher::fetch(inner, start_1based, length)
-    }
 
-    // iter_bases falls back to the trait default. The walker doesn't
-    // use it (only DUST / PerGroupMerger in the var-calling pipeline
-    // do), so defining it explicitly would be dead code.
+        let raw: &[u8] = AsRef::<[u8]>::as_ref(seq.as_ref());
+        let chrom_length = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+        let start0 = (start_1based - 1) as usize;
+        let end = start0 + length as usize;
+        if end > raw.len() {
+            return Err(ChromRefFetchError::OutOfBounds {
+                chrom_name: entry.name.clone(),
+                chrom_length,
+                start: start_1based,
+                end: start_1based.saturating_add(length),
+            });
+        }
+
+        // Match the streaming fetcher's canonicalisation exactly so the
+        // walker sees byte-identical reference windows.
+        Ok(raw[start0..end].iter().map(|&b| canonicalise(b)).collect())
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1562,95 +1525,6 @@ mod tests {
         assert_eq!(bytes, seq[99..115]);
     }
 
-    #[test]
-    fn walker_adapter_serves_each_chrom_via_swap() {
-        // Build a two-chrom FASTA, construct the walker adapter,
-        // alternate fetches across chroms. Every fetch returns the
-        // right bytes; the adapter rebuilds the inner streamer on
-        // each transition.
-        let specs = vec![
-            ContigSpec {
-                name: "chr0".into(),
-                length: 16,
-            },
-            ContigSpec {
-                name: "chr1".into(),
-                length: 24,
-            },
-        ];
-        let (_dir, path) = build_fasta(&specs).expect("fasta");
-        let contigs = contig_list(&[("chr0", 16), ("chr1", 24)]);
-        let adapter = MultiChromStreamingRefFetcher::new(path, contigs);
-
-        assert_eq!(
-            MultiChromRefFetcher::fetch(&adapter, 0, 1, 4).expect("chr0"),
-            b"AAAA"
-        );
-        assert_eq!(
-            MultiChromRefFetcher::fetch(&adapter, 1, 1, 4).expect("chr1"),
-            b"AAAA"
-        );
-        // Switch back: forces another swap.
-        assert_eq!(
-            MultiChromRefFetcher::fetch(&adapter, 0, 5, 4).expect("chr0 again"),
-            b"AAAA"
-        );
-    }
-
-    #[test]
-    fn walker_adapter_rejects_unknown_chrom_id() {
-        let specs = vec![ContigSpec {
-            name: "chr0".into(),
-            length: 8,
-        }];
-        let (_dir, path) = build_fasta(&specs).expect("fasta");
-        let contigs = contig_list(&[("chr0", 8)]);
-        let adapter = MultiChromStreamingRefFetcher::new(path, contigs);
-
-        let err = MultiChromRefFetcher::fetch(&adapter, 99, 1, 4).expect_err("must fail");
-        match err {
-            ChromRefFetchError::Io { source, .. } => {
-                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
-            }
-            other => panic!("expected Io(InvalidInput), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn walker_adapter_holds_one_chrom_at_a_time() {
-        // Sequential fetches across two chroms; only one inner
-        // StreamingChromRefFetcher is resident at any time. After a
-        // swap to chr1 the adapter's `inner` slot is bound to chr1.
-        // Fetching chr0 again forces another rebuild; an out-of-bounds
-        // request on chr0 (8 bases) for 32 must surface OutOfBounds.
-        let specs = vec![
-            ContigSpec {
-                name: "chr0".into(),
-                length: 8,
-            },
-            ContigSpec {
-                name: "chr1".into(),
-                length: 32,
-            },
-        ];
-        let (_dir, path) = build_fasta(&specs).expect("fasta");
-        let contigs = contig_list(&[("chr0", 8), ("chr1", 32)]);
-        let adapter = MultiChromStreamingRefFetcher::new(path, contigs);
-
-        // Load chr0.
-        MultiChromRefFetcher::fetch(&adapter, 0, 1, 4).expect("chr0 load");
-        // Switch to chr1 — long fetch only works on chr1.
-        let bytes = MultiChromRefFetcher::fetch(&adapter, 1, 1, 32).expect("chr1 full");
-        assert_eq!(bytes.len(), 32);
-        // After switching back to chr0, a 32-base fetch must error
-        // (chr0 is only 8 bases).
-        let err = MultiChromRefFetcher::fetch(&adapter, 0, 1, 32).expect_err("must fail");
-        assert!(
-            matches!(err, ChromRefFetchError::OutOfBounds { .. }),
-            "expected OutOfBounds, got {err:?}",
-        );
-    }
-
     // ---------------------------------------------------------------
     // ManualEvictChromRefFetcher tests
     // ---------------------------------------------------------------
@@ -2101,5 +1975,123 @@ mod tests {
         // ignoring the stale `buf_start_base = past_end`.
         let bytes = fetcher.fetch(10, 8).expect("post-evict fetch").to_vec();
         assert_eq!(bytes, &seq[9..17]);
+    }
+
+    // -----------------------------------------------------------------
+    // RepositoryRefFetcher
+    // -----------------------------------------------------------------
+
+    /// Build a single-contig FASTA + `.fai` with caller-supplied
+    /// (possibly soft-masked / ambiguous) bases on one line. Returns the
+    /// tempdir guard + FASTA path. Unlike `build_fasta` (all-`A`), this
+    /// lets the canonicalisation contract be exercised.
+    fn build_fasta_with_bases(name: &str, bases: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fasta = dir.path().join("ref.fa");
+        let fai = dir.path().join("ref.fa.fai");
+        let header = format!(">{name}\n");
+        let mut fa = std::fs::File::create(&fasta).expect("create fasta");
+        fa.write_all(header.as_bytes()).expect("hdr");
+        fa.write_all(bases).expect("seq");
+        fa.write_all(b"\n").expect("nl");
+        // name\tlength\toffset\tline_bases\tline_width
+        std::fs::write(
+            &fai,
+            format!(
+                "{name}\t{len}\t{off}\t{len}\t{width}\n",
+                len = bases.len(),
+                off = header.len(),
+                width = bases.len() + 1
+            ),
+        )
+        .expect("write fai");
+        (dir, fasta)
+    }
+
+    fn repository_for(fasta: &Path) -> fasta::Repository {
+        let indexed = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(fasta)
+            .expect("indexed fasta");
+        let adapter = fasta::repository::adapters::IndexedReader::new(indexed);
+        fasta::Repository::new(adapter)
+    }
+
+    /// The repository-backed fetcher must apply the same
+    /// canonicalisation the walker relied on from the streaming fetcher:
+    /// uppercase soft-masked bases, fold every non-`ACGT` (including `N`
+    /// and IUPAC ambiguity codes) to `N`. Builds a contig carrying
+    /// lowercase + `N` + ambiguity codes, fetches the whole thing, and
+    /// asserts the exact canonicalised bytes — then sweeps every
+    /// `(start, length)` sub-window and checks each equals the
+    /// corresponding slice of that canonical string.
+    #[test]
+    fn repository_fetcher_canonicalises_bytes() {
+        //              123456789...                    (1-based)
+        let bases = b"ACGTacgtNNNRYKMacgtACGTnnnnTTTTaaaaCCCCgggg";
+        // canonicalise: lower->upper, every non-ACGT -> N.
+        let expected: Vec<u8> = bases
+            .iter()
+            .map(|&b| match b.to_ascii_uppercase() {
+                u @ (b'A' | b'C' | b'G' | b'T') => u,
+                _ => b'N',
+            })
+            .collect();
+        // Pin the expected string literally so a change to `canonicalise`
+        // can't silently drift both sides together.
+        assert_eq!(&expected, b"ACGTACGTNNNNNNNACGTACGTNNNNTTTTAAAACCCCGGGG");
+
+        let len = bases.len() as u32;
+        let (_dir, fasta) = build_fasta_with_bases("chr1", bases);
+        let contigs = contig_list(&[("chr1", bases.len() as u64)]);
+        let repo = RepositoryRefFetcher::new(repository_for(&fasta), contigs);
+
+        // Whole contig.
+        assert_eq!(
+            MultiChromRefFetcher::fetch(&repo, 0, 1, len).expect("full contig"),
+            expected
+        );
+
+        // Every sub-window equals the matching slice of the canonical
+        // string (1-based start → 0-based slice).
+        for start in 1..=len {
+            for length in 1..=(len - start + 1) {
+                let got = MultiChromRefFetcher::fetch(&repo, 0, start, length).expect("window");
+                let s = (start - 1) as usize;
+                let e = s + length as usize;
+                assert_eq!(got, expected[s..e], "window start={start} length={length}");
+            }
+        }
+    }
+
+    /// Error contract: 1-based start, bounds, and unknown `chrom_id`.
+    #[test]
+    fn repository_fetcher_error_cases() {
+        let bases = b"ACGTACGT";
+        let (_dir, fasta) = build_fasta_with_bases("chr1", bases);
+        let contigs = contig_list(&[("chr1", bases.len() as u64)]);
+        let repo = RepositoryRefFetcher::new(repository_for(&fasta), contigs);
+
+        assert!(matches!(
+            MultiChromRefFetcher::fetch(&repo, 0, 0, 1),
+            Err(ChromRefFetchError::InvalidStart)
+        ));
+        // [7,9) exceeds the 8-base contig.
+        assert!(matches!(
+            MultiChromRefFetcher::fetch(&repo, 0, 7, 3),
+            Err(ChromRefFetchError::OutOfBounds {
+                chrom_length: 8,
+                ..
+            })
+        ));
+        // Exact-fit window at the contig end is allowed.
+        assert_eq!(
+            MultiChromRefFetcher::fetch(&repo, 0, 5, 4).expect("tail window"),
+            b"ACGT"
+        );
+        // chrom_id past the contig table.
+        assert!(matches!(
+            MultiChromRefFetcher::fetch(&repo, 99, 1, 1),
+            Err(ChromRefFetchError::Io { .. })
+        ));
     }
 }

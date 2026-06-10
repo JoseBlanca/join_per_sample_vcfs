@@ -208,32 +208,59 @@ streams and never loads a whole contig). It removes only the per-region
   walker uses `fetch` only (not `iter_bases`), so there is no
   phase-reset interaction to worry about.
 
-### Phase 2 (optional, later) — one resident contig, read once
+### Phase 2 (implemented) — the walker reads from the resident repository
 
-For CRAM input the `Repository` already holds the whole current contig
-as an `Arc<Sequence>`. The walker (and the F1 filter, already on the
-repository) re-read the same bytes through a *separate* streaming
-reader. A deeper unification would expose one **`ContigReference`**
-abstraction, built once per contig, that:
+Investigation while implementing Phase 1 found the key fact that makes
+Phase 2 trivial and zero-cost: **the whole contig is already resident
+for both CRAM and BAM.** The reader's per-read F1/F3 reference slice
+(`fetch_ref_for_read`, [alignment_input.rs:1360](../../src/bam/alignment_input.rs#L1360))
+calls `repository.get(name)` (whole contig) for *every* mapped read,
+not gated on format. So the walker's separate streaming reader was a
+*second, redundant* read of a contig already in memory.
 
-- is sourced from the `Repository`'s `Arc<Sequence>` for CRAM (zero
-  extra bytes read), and from a streamed/loaded buffer for BAM (which
-  has no repository);
-- serves the walker (forward windows), the F1 filter (per-read slices),
-  and BAQ (random-access-within-chunk views) from that one resident
-  copy.
+Phase 2 replaces the walker's `MultiChromStreamingRefFetcher` with a new
+[`RepositoryRefFetcher`](../../src/fasta/fetcher.rs) — a
+`MultiChromRefFetcher` that slices the walker's windows out of the
+shared `Repository`'s resident `Arc<Sequence>`. It holds only an `Arc`
+clone of the repository (no file handle, no buffer, no per-fetch state),
+so it is `Send + Sync` and adds **zero** memory. It observes the
+per-contig `clear()` through the shared handle. The walker fetches only
+once per open record (+ widening), so the per-fetch
+`repository.get` + slice is cheap.
 
-This removes reads #2/#2′ entirely for CRAM. It is deferred because it
-touches the byte-identity-critical walker reference path and the BAM
-path's memory profile (loading a whole contig for BAM is a memory
-regression vs today's streaming; needs a per-input-format decision).
-Phase 1 already eliminates the regression, so Phase 2 is a cleanliness
-/ micro-optimization follow-up, not a fix.
+**Byte-identity:** the repository stores *raw* FASTA bytes (the reader's
+F1/F3 path slices them verbatim), so `RepositoryRefFetcher` applies the
+same `canonicalise` the streaming fetcher used (uppercase soft-masked,
+fold non-`ACGT` → `N`). A unit test sweeps every `(start, length)`
+window over a lowercase/`N`/IUPAC contig and asserts the two fetchers
+agree byte-for-byte.
 
-BAQ's per-chunk `ManualEvictChromRefFetcher` rebuild (the `.fai`
-re-parse per chunk) is folded into Phase 2 as well — or addressed
-independently by handing BAQ a pre-parsed `.fai` / fetcher factory if a
-BAQ-on profile shows it matters.
+This applies uniformly to CRAM and BAM — no per-format split, no BAM
+memory regression (BAM already loaded the contig for F1/F3). With the
+walker migrated, `MultiChromStreamingRefFetcher` had no remaining
+production consumer and was **deleted** (struct + impl + its three
+`walker_adapter_*` tests); the byte-identity test now asserts against a
+literal canonicalised string rather than comparing to it. The pileup
+path is left with exactly one reference reader (the noodles
+`Repository`); the single-contig `StreamingChromRefFetcher` stays for the
+cohort var-calling / DUST / per-group-merger consumers.
+
+BAQ's per-chunk `ManualEvictChromRefFetcher` is **not** part of Phase 2:
+it is a per-rayon-worker random-access buffer, and routing it through
+the shared repository would mean either lock contention on
+`Repository`'s `RwLock` or each worker holding its own `Arc<Sequence>`
+(fine, but a separate change). The pileup bench is `--no-baq`, so this
+is deferred until a BAQ-on profile justifies it.
+
+#### Phase 2 result
+
+Same `human_genome_bottle` run: **199 s / 0.74 GB**, byte-identical
+(decoded pileup SHA-256 unchanged). No measurable perf/memory delta vs
+Phase 1 — expected, since the walker's streaming read was already cheap
+and the contig was already resident. The win is architectural: the
+pileup path now has **one** reference reader (the repository) feeding
+CRAM decode, the F1/F3 filter, and the walker, instead of two readers
+over the same FASTA.
 
 ## 5. API changes (Phase 1)
 

@@ -284,14 +284,13 @@ fn regions_bed_spanning_two_contigs_restricts_each() {
 
 /// **Regression guard for the shared-FASTA-reader lifecycle.** Two
 /// regions on chr1 plus one on chr2 exercise the per-run FASTA
-/// reference readers (the noodles `Repository` and the walker's
-/// `MultiChromStreamingRefFetcher`), which are now built once and reused
-/// across regions rather than rebuilt per region:
+/// reference reading: the walker and the reader's F1/F3 filter both read
+/// from the one shared noodles `Repository`, built once and cleared on
+/// contig transition rather than rebuilt per region:
 ///
 /// - the two chr1 regions reuse the same resident chr1 reference (the
-///   repository cache is *not* cleared between them; the walker's
-///   streaming buffer advances forward across the region boundary);
-/// - the chr1→chr2 transition clears/swaps to chr2.
+///   repository cache is *not* cleared between them);
+/// - the chr1→chr2 transition clears the cache and loads chr2.
 ///
 /// Each region is clamped to its own span. A bug in the
 /// shared-reader state (stale buffer across the boundary, premature
