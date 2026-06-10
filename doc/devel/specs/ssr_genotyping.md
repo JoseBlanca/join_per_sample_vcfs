@@ -13,6 +13,76 @@ trade-offs spelled out; no magic numbers — every non-trivial literal is a name
 
 ---
 
+## Glossary — acronyms & terms
+
+Defined once here; used unqualified thereafter.
+
+**Domain / biology**
+
+- **SSR** — Simple Sequence Repeat (microsatellite); a tandem repeat with a short
+  motif. Used interchangeably with **STR**.
+- **STR** — Short Tandem Repeat. Synonym of SSR in this document.
+- **VNTR** — Variable Number Tandem Repeat; the broader family (minisatellites and
+  up), explicitly out of scope here (period ≤ 6 only).
+- **period** — length of the repeat unit (motif) in bp; period 1 = mono-, …, 6 =
+  hexanucleotide.
+- **motif / RU** — the repeat unit itself (e.g. `CAG`). RU = Repeat Unit (the VCF
+  field name).
+- **stutter** — PCR/replication slippage that shifts the observed repeat count by
+  whole units; the dominant STR artifact, modelled in Stage 2.
+- **FRR** — Fully Repetitive Read; a read lying entirely inside the repeat tract
+  (no flank), used as a length lower bound for long alleles.
+- **purity** — fraction of the tract matching a perfect motif tiling; 1.0 =
+  perfect repeat, < 1.0 = imperfect / interrupted.
+
+**Tools / file formats**
+
+- **TRF** — Tandem Repeats Finder; the catalog detector (Stage 0).
+- **DUST / sdust** — low-complexity sequence masker; optional TRF prefilter.
+- **BAM / CRAM** — aligned-read containers (input).
+- **VCF** — Variant Call Format (output). **GFF / BED / TSV** — annotation/tabular
+  formats used for the catalog.
+- **Parquet** — columnar storage format for the per-sample evidence table.
+- **psp** — the project's per-sample pileup/evidence artifact ("STR `.psp`"); here
+  the Stage-1 evidence file.
+- **md5** — checksum used to bind artifacts to their reference/catalog.
+
+**Methods / statistics**
+
+- **CSR** — Compressed Sparse Row: a ragged array stored as one flat values array
+  plus an offsets array marking each row's slice. Here: `amb_read_offsets`
+  (offsets) + `amb_lengths`/`amb_logliks` (values) hold a variable number of
+  candidate lengths per ambiguous read.
+- **HMM** — Hidden Markov Model; the banded pair-HMM is the slow-path realigner.
+- **pair-HMM** — a 3-state (Match/Insertion/Deletion) HMM scoring two sequences.
+- **BAQ** — Base Alignment Quality; the existing engine whose banded-forward
+  pattern the pair-HMM borrows.
+- **EM** — Expectation-Maximization; the Stage-2 cohort inference loop.
+- **HWE** — Hardy-Weinberg Equilibrium; the random-mating genotype prior, here
+  relaxed by the inbreeding index `F`.
+- **IBD** — Identity By Descent; two alleles inherited from a common ancestor
+  (the `F` component of the prior).
+- **SMM** — Stepwise Mutation Model; the reference-centred allele-length prior.
+- **`θ` (stutter)** — the stutter-kernel parameters `(u, d, ρ)` of §5.2. Distinct
+  from `θ_pop`.
+- **`θ_pop` = `4·Nₑ·μ`** — population mutation parameter (`Nₑ` effective size, `μ`
+  per-generation mutation rate); sets the SMM allele-spread variance in §5.5. Not
+  the stutter `θ`.
+- **PCR** — Polymerase Chain Reaction; its absence/presence (PCR-free vs PCR+)
+  drives the stutter kernel.
+- **FP / FN** — False Positive / False Negative. **QC** — Quality Control.
+
+**VCF / genotype fields**
+
+- **GT** — genotype; **DP** — depth; **GQ** — genotype quality; **GP** — genotype
+  posterior probabilities; **GL / PL** — genotype likelihoods (log / Phred).
+- **AF / AC / AN** — allele frequency / allele count / allele number; **NS** —
+  number of samples with data.
+- **REPCN** — per-allele repeat copy numbers (GangSTR field).
+- **F** — fixation index (inbreeding coefficient), per sample.
+
+---
+
 ## 1. Overview, scope, goals
 
 A tool that **genotypes short tandem repeats (SSRs / microsatellites / STRs)
@@ -46,8 +116,7 @@ population hypotheses be analysed independently on each marker type. Concretely:
 - **Precision ≫ recall (FP-averse).** Prefer a no-call over a low-confidence call.
   Quality is a first-class output and the operating point is tunable and measured.
 - **Population-first.** The cohort is pooled to learn stutter and allele
-  frequencies and to set genotype priors; this is the structural advantage over
-  single-sample tools.
+  frequencies and to set genotype priors.
 - **Memory-efficient, cohort-scaling**, in the project's house style (columnar
   intermediates; the two-stage extract→genotype pattern mirrors
   `pileup → .psp → var-calling`).
@@ -185,6 +254,19 @@ per-read length-likelihood summary — the "STR `.psp`".
 
 ### 4.2 Qᵣ(L) — the per-read length likelihood (two-tier)
 
+**Reads fall into two natural classes, which is why the likelihood is computed
+two ways.** For many reads the repeat count is unambiguous: the read clearly
+spans the tract with clean unique flanks on both sides, and the tract itself is a
+clean integer tiling of the motif — you can simply *count* the repeats and read
+off a single confident length. Other reads are ambiguous, for any of several
+reasons: an interior sequencing indel or substitution blurs the motif boundaries,
+the repeat is impure/interrupted so the count is not integer-obvious, low base
+quality near a boundary makes the last unit uncertain, or the read only partially
+covers the tract. For these, no single length is defensible — the honest answer
+is a *distribution* over plausible lengths. The fast path handles the first class
+by direct counting; the slow path handles the second by full probabilistic
+realignment.
+
 `Qᵣ(L)` is the likelihood the read came from a molecule of repeat length `L`
 units, under **sequencing/alignment error only** — stutter is *not* applied here
 (it is learned and applied in Stage 2). Both tiers realign against candidate-length
@@ -212,6 +294,33 @@ catalog + reference) to **escape reference bias**.
     coordinate adjacency. A sub-locus sandwiched between two repeats → flag
     low-confidence.
 
+**How `Qᵣ(L)` is stored — the two tiers map onto two storage regimes (§4.3),
+not a uniform per-read profile.** A read produces *either* a single length or a
+sparse distribution, never a dense vector:
+
+- **Fast-path reads store one length, and not per-read.** A confident `L*`
+  carries no distribution — `Qᵣ` is a point mass at `L*`. These reads are *not*
+  written individually; they collapse into the locus-level histogram
+  (`hist_lengths` / `hist_counts` / `hist_weight`). The per-read identity is
+  discarded; only the tally survives. This is the bulk of reads.
+- **Slow-path reads store many likelihoods, per-read.** The forward is
+  *evaluated* over the `2W + 1` candidate lengths `L ∈ [count − W, count + W]`
+  (`W = STUTTER_WINDOW_UNITS`), but the *stored* profile is **sparse**: drop
+  candidates whose log-lik is more than `AMB_LL_DROP` below the per-read max,
+  then renormalize over what remains. So the per-read entry count is **variable
+  and usually ≪ 2W + 1** (typically the 1–3 lengths with real mass). These are
+  the only reads written individually, in the `amb_*` CSR columns
+  (`amb_read_offsets` gives each read's variable-length slice).
+
+So: one stored length for the confident majority (aggregated, not per-read), and
+a short sparse `(length, log-lik)` list for each genuinely ambiguous read.
+
+> **Naming note:** `STUTTER_WINDOW_UNITS` sizes the candidate-`L` range even
+> though Stage 1 is stutter-free — the window must be wide enough to cover
+> plausible stutter excursions so Stage 2 has the support points to convolve the
+> stutter kernel against. The window bounds *which lengths get a likelihood*, not
+> a stutter computation here.
+
 Performance is negligible (sparse loci, most reads fast-path) next to the
 whole-genome alignment already paid for the BAM.
 
@@ -234,10 +343,9 @@ rows** (they compress to ~nothing). Two invariants:
 | `end` | int32 | tract end (exclusive) |
 | `depth` | int32 | total reads at locus |
 | `n_spanning` | int32 | usable spanning reads |
-| `n_flanking` | int32 | (length bounds carried later if scope lifts) |
+| `n_flanking` | int32 | count only in v1; per-read length *lower bounds* (allele ≥ X) would be added here if scope lifts beyond spanning-only to call long alleles |
 | `n_frr` | int32 | fully-repetitive |
 | `n_filtered` | int32 | low-mapq / dup / clipped |
-| `n_stutter_artifact` | int32 | for the ≤10% gate |
 | `n_flank_indel` | int32 | |
 | `mapped_reads` | int32 | for normalized-depth QC |
 | `hist_lengths` | list&lt;int16&gt; | distinct observed allele lengths (repeat units), ascending |
@@ -251,7 +359,8 @@ Confident reads collapse to the `(length → count)` histogram; genuinely bimoda
 reads carry an explicit sparse `Qᵣ(L)` profile in the `amb_*` CSR columns (in
 v1, not deferred). Footer key-value metadata: `schema_version, sample_name,
 reference_md5, catalog_md5, n_loci, ploidy, extraction_params{MIN_FLANK_BP,
-MIN_BASE_QUAL, AMBIGUITY_THRESHOLD, STUTTER_WINDOW_UNITS}, tool_version` + a
+MIN_BASE_QUAL, AMBIGUITY_THRESHOLD, STUTTER_WINDOW_UNITS, AMB_LL_DROP},
+tool_version` + a
 contig name↔id table. Write knobs: sort by `(chrom,start)`; row-group ≈ a few ×
 10⁴ loci; page index; ZSTD. All stored likelihoods are **stutter-free**; lengths
 are `int16` repeat units.
@@ -265,12 +374,25 @@ posteriors, biased toward precision.
 
 ### 5.1 Generative model (per locus ℓ)
 
-1. Population allele frequencies `π = (π_a)` over candidate allele lengths.
+1. **Population allele frequencies `π = (π_a)` over candidate allele lengths.** At
+   this locus an allele *is* a repeat length (10 units, 11, 12, …); the candidate
+   lengths are the plausible ones. `π_a` is the fraction of chromosomes in the
+   cohort carrying length `a`, so `π` is a probability distribution over those
+   lengths (`π_a ≥ 0`, `Σ_a π_a = 1`). It is one of the two unknowns Stage-2 EM
+   estimates (§5.4) and the root of the hierarchy: `π` → genotype (2) → reads (3).
 2. Sample `s` draws genotype `G_s` = multiset of `ploidy` alleles under the
    **inbreeding-adjusted prior** `P(G_s | π, F_s)` (§5.3).
-3. Read `r` in `s` picks one allele `a ∈ G_s` uniformly (1/ploidy); the repeat
-   region is generated from `a` by **stutter** `S_θ` (true → observed length) then
-   **sequencing error** (the Stage-1 `Qᵣ(L)`).
+3. **Read `r` in `s` is born in three steps.** *(a)* It comes off one physical
+   homolog, so it picks one allele `a ∈ G_s` uniformly — probability `1/ploidy`
+   (½ for diploid); this is what makes a heterozygote's reads a 50/50 mixture of
+   its two alleles. *(b)* **Stutter `S_θ`** then maps the true allele length `a` to
+   a **molecule length `L`** by adding/dropping whole repeat units (PCR slippage);
+   `L` is a *hidden intermediate*, never observed. *(c)* **Sequencing error** reads
+   that length-`L` molecule imperfectly — exactly the Stage-1 `Qᵣ(L)` (§4.2). The two
+   noise sources are ordered and kept apart on purpose: stutter (b) is a shared
+   chemistry property *learned in Stage 2*; sequencing error (c) is per-read and
+   was computed *stutter-free in Stage 1* (§4.2). Summing over the hidden `L` gives the
+   per-allele read likelihood below.
 
 `P(reads_s | G_s) = Πᵣ [ (1/ploidy)·Σ_{a∈G_s} P(read_r | a, θ) ]`, with
 `P(read_r | a, θ) = Σ_L Qᵣ(L)·S_θ(L | a)` — the convolution of the stutter-free
@@ -278,32 +400,82 @@ Stage-1 likelihood with the stutter kernel. **Stutter lives entirely in Stage 2.
 
 ### 5.2 Stutter model `S_θ`
 
-HipSTR's 3-parameter geometric form on whole-unit steps `δ` (`L = a + δ·period`):
+**What stutter is.** When a tandem repeat is replicated — by the polymerase in
+PCR, or in vivo — the nascent and template strands can transiently dissociate and
+**re-anneal out of register by one or more whole repeat units** (replication
+slippage). The result is a molecule whose repeat count differs from the true
+allele by an integer number of units, *before* a single base is sequenced. This
+is the dominant STR artifact: it manufactures a "ladder" of minor length variants
+flanking the true allele and is what turns a clean homozygote into something that
+*looks* heterozygous. `S_θ(L | a)` is the probability model for it — given the
+true allele length `a` (in units), the distribution over the **molecule length
+`L`** that actually enters sequencing.
+
+**The kernel, term by term.** Write the slippage as a whole-unit step
+`δ = (L − a)/period` (`δ = 0` no slip, `δ > 0` gain/expansion, `δ < 0`
+loss/contraction). HipSTR's 3-parameter geometric form:
 
 ```
-S_θ(δ) =  1 − u − d              δ = 0
+S_θ(δ) =  1 − u − d              δ = 0   (faithful copy — most reads)
           u · ρ · (1−ρ)^(δ−1)    δ > 0   (gain of δ units)
           d · ρ · (1−ρ)^(−δ−1)   δ < 0   (loss of |δ| units)
 ```
 
-Only **in-frame** (whole-unit) stutter; out-of-frame change is absorbed by the
-Stage-1 base-error term. `u` (gain) and `d` (loss) are separate (contraction
-bias). **`θ` is covariate-parameterised**, predicted per allele:
-`θ = θ(period, allele_length, motif, purity)`.
+- **`u`** = total probability the molecule gained units, **`d`** = total
+  probability it lost units (each summed over all step sizes); `1 − u − d` =
+  probability of a faithful copy. They are **separate** because slippage is
+  biased — STRs contract more often than they expand, so typically `d > u`
+  ("contraction bias").
+- **`ρ`** = the geometric decay: *given* a slip occurred, the chance it is exactly
+  one more unit before stopping. So a ±1-unit slip is the most likely, ±2 is
+  `(1−ρ)×` as likely, and so on — large jumps fall off geometrically (mean step
+  size `1/ρ`). Real STR stutter is overwhelmingly ±1 unit, which this captures.
+- The product `u·ρ(1−ρ)^(δ−1)` is just "a gain happened (`u`) **and** it was
+  exactly `δ` units (geometric)"; the `δ < 0` branch is the mirror image with `d`.
+  The three branches sum to 1 over all `δ` — it is a proper distribution.
 
-**Inference — joint mixture-deconvolution (D3).** Each (sample, locus)
-read-length distribution is a mixture of `ploidy` stutter kernels, one per latent
-allele: `O_{s,ℓ}(x) = (1/ploidy)·Σ_{a∈G_{s,ℓ}} K_{θ(cov)}(x − a)`. The kernel is
-the **shared** parameter (a chemistry+motif property, identical across samples of
-a library — so it auto-adapts to PCR vs PCR-free); allele positions are **per-unit
-latent**. Stutter is a **within-(sample,locus)** phenomenon — raw read lengths are
-**never** pooled across samples (that conflates stutter with population variation).
-Heterozygotes are *modelled* as ≥2-component mixtures, not excluded — so no
-homozygote classifier is needed.
+**Only in-frame.** The kernel moves probability *only* in whole-unit steps,
+because slippage re-registers on the repeat period. A length change that is **not**
+a multiple of the motif (e.g. a 1 bp indel inside a trinucleotide tract) is **not**
+stutter — it is a sequencing/replication base error, and was already accounted for
+by the Stage-1 `Qᵣ(L)` term (§4.2). Splitting them this way keeps each noise source
+in exactly one place.
 
-The covariate kernel is fit by **regression + hierarchical shrinkage**: data-rich
-motifs stand alone; rare ones shrink toward their **period-level** estimate.
-Reads pool across all (sample,locus) units of a covariate cell.
+**`θ` is covariate-parameterised**, predicted per allele:
+`θ = θ(period, allele_length, motif, purity)`. This is biology, not bookkeeping —
+stutter rate is not constant: it rises sharply with **allele length** (longer
+tracts slip more), is highest for **short periods** (mononucleotide runs are the
+worst, hexamers mild), varies by **motif** (`AT` vs `GC` content), and falls with
+**purity** (interruptions arrest slippage). So `(u, d, ρ)` are *functions* of these
+covariates rather than one global triple.
+
+**Inference — joint mixture-deconvolution (D3).** We never get to see `a`
+directly; we see a pile of read lengths per (sample, locus) that is a **blend of
+`ploidy` stutter ladders, one centred on each true allele**:
+`O_{s,ℓ}(x) = (1/ploidy)·Σ_{a∈G_{s,ℓ}} K_{θ(cov)}(x − a)`. Fitting means
+simultaneously (i) placing the allele centres `a` (the genotype) and (ii) learning
+the kernel shape `K_θ`. Two design choices make this identifiable:
+
+- **The kernel is shared, the alleles are local.** `K_θ` is a property of the
+  chemistry + motif, **identical across all samples of a library** — so pooling
+  reads across many (sample, locus) units of the same covariate cell pins it down,
+  and it **auto-adapts to PCR vs PCR-free** (PCR-free libraries simply fit a much
+  smaller `u`, `d`). The allele centres, by contrast, are **per-(sample,locus)
+  latent** — estimated locally.
+- **Stutter is strictly within-(sample,locus).** Raw read lengths are **never**
+  pooled across samples to estimate allele positions — doing so would confuse
+  one sample's stutter ladder with genuine **population** length variation (that
+  is `π`'s job, §5.1). Only the *kernel parameters* pool; the *allele calls* stay
+  local.
+- **Heterozygotes need no special-casing.** A het is just a ≥2-component mixture;
+  modelling the mixture directly means we never need a separate "is this sample
+  homozygous?" classifier — the data decide how many centres are supported.
+
+The covariate kernel is fit by **regression + hierarchical shrinkage**: covariate
+cells with abundant data (common motifs) get their own estimate; sparse cells
+**shrink toward the broader period-level estimate** rather than overfitting a
+handful of reads. Reads pool across all (sample, locus) units that fall in a
+covariate cell.
 
 ### 5.3 Genotype prior — inbreeding-adjusted (Wright / HWE-with-`F`)
 
@@ -336,10 +508,26 @@ heterozygotes — a *second* structural defence against stutter-driven false het
   heterozygote deficit only above an effective-sample threshold; else use the
   supplied default. Per-locus `F` is not estimated.
 
-**Structure:** a **confident-homozygote pre-pass** initialises the stutter kernel
-(deep + dominant single length); the joint deconvolution EM then refines using all
-loci including hets. **Convergence:** penalised-log-lik / parameter tolerance +
-max-iter; assert non-decreasing log-lik.
+**Structure — initialisation by a confident-homozygote pre-pass.** EM is
+non-convex and the stutter kernel and the genotypes are mutually dependent (learn
+the kernel ⇄ know which reads are stutter), so a good starting kernel matters. The
+pre-pass exploits the one case where the genotype is knowable *without* a stutter
+model: a **confident homozygote**, selected by two criteria — **deep** spanning
+coverage (the length histogram is well-resolved) **and** a **single dominant
+length** (one length holds the overwhelming majority of reads, the rest a small
+ladder around it). For such a (sample, locus) there is exactly one true allele
+`a` = the modal length, so **every non-modal read is, by construction, a stutter
+product of that single allele** — a labelled stutter observation with known step
+`δ = (L − a)/period`, no genotype inference required. Pooling these across many
+confident-homozygote loci within a covariate cell yields a clean initial
+`(u, d, ρ)` via the same estimators as the M-step (`u` = fraction longer,
+`d` = fraction shorter, `ρ` = geometric MLE of the ladder decay). The joint
+deconvolution EM then **refines** that seed using *all* loci, now including
+heterozygotes — where the two alleles' ladders overlap and the genotype is
+genuinely latent. This homozygote init is the spec's chosen defence against local
+optima (see Identifiability below); multi-restart is deferred.
+**Convergence:** penalised-log-lik / parameter tolerance + max-iter; assert
+non-decreasing log-lik.
 
 **Identifiability:** within one locus, adjacent-het vs hom+stutter is ambiguous;
 broken by (a) the **shared kernel** across many loci (it cannot be simultaneously
@@ -350,15 +538,52 @@ multi-restart deferred.
 
 ### 5.5 Allele-length prior (the Dirichlet base measure)
 
-**Not uniform.** Grounded in the stepwise mutation model (within-population
-microsatellite allele-size distributions are unimodal, peaked at a modal allele,
-decaying with offset in repeat units; Valdes, Slatkin & Freimer 1993). Base
-measure = **reference-centred, unimodal** over `Δ = (L − ref)/period`: v1
-**geometric** `∝ p^|Δ|`; principled upgrade = discretized Gaussian centred at
-`ref`, variance a hyperparameter (optionally per-locus `≈ θ/2`, the SMM link). It
-is only the **weak** base measure — the empirical `π` dominates at useful N; it
-matters at small N (its purpose). **This population spread is a separate parameter
-from the stutter decay** (population variation vs PCR measurement error).
+**What it is and where it plugs in.** The §5.4 M-step estimates allele
+frequencies `π` as **Dirichlet-smoothed** counts. A Dirichlet prior needs two
+things: a **strength** `α` (pseudocount) and a **base measure** `G₀` — a prior
+distribution over candidate lengths answering "before any data, where do we expect
+allele-frequency mass to sit?". The smoothed update is the blend
+
+```
+π_a  ←  ( α·G₀(a)  +  Σ_s Σ_G γ_s(G)·count_a(G) )  /  ( α + ploidy·N )
+```
+
+so `G₀` is the fallback `π` leans on when data are thin. This section specifies
+`G₀`.
+
+**Not uniform.** A uniform `G₀` would call every candidate length equally
+plausible a priori — contradicting microsatellite biology. Under the **stepwise
+mutation model (SMM)**, within-population allele-size distributions are
+**unimodal**: a modal length with frequency decaying as you move away in whole
+repeat units (Valdes, Slatkin & Freimer 1993). A length 8 units off the mode is a
+priori far less likely than ±1; a uniform prior would, at small N, let far-out or
+stutter-spawned lengths hold real frequency.
+
+**The shape — reference-centred, unimodal** in the signed offset
+`Δ = (L − ref)/period` (units from the reference allele):
+
+- **v1 — geometric**, `G₀ ∝ p^|Δ|` (`p < 1`): mass falls by a constant factor per
+  unit away from `ref`. One parameter, robust.
+- **upgrade — discretized Gaussian** centred at `ref`, variance a hyperparameter.
+  The variance may optionally be set **per-locus** from SMM theory: the
+  within-population variance of allele size ≈ `θ_pop / 2`, where
+  `θ_pop = 4·Nₑ·μ` is the **population mutation parameter** (the SMM equilibrium
+  link). ⚠ This `θ_pop` is **not** the stutter kernel `θ` of §5.2 — distinct
+  quantity, distinct symbol.
+
+**Deliberately weak — its job is small N.** `G₀` enters with weight `α` against
+`ploidy·N` observations, so at useful cohort sizes the **empirical data swamp it**
+and `π` ≈ the observed allele frequencies (as it should). Its whole purpose is the
+**small-N / single-sample** regime, where the data cannot pin `π` down: there `G₀`
+regularises `π` toward a biologically plausible unimodal shape around `ref` instead
+of something degenerate. A guardrail that fades as evidence accumulates.
+
+**Population spread ≠ stutter decay.** Both produce ladders of nearby lengths, but
+they differ in kind: population spread (`G₀`/`π`) is **real, heritable** allele
+variation (evolutionary, SMM); stutter (`S_θ`, §5.2) is a **non-heritable PCR /
+measurement artifact**. They are kept as **separate parameters** precisely so the
+model can attribute a minor length either to a true rare allele or to slippage —
+collapsing them would reintroduce the confusion §5.4 works to avoid.
 
 ### 5.6 Small-N / single-sample
 
@@ -387,6 +612,14 @@ species supply abundant homozygotes for the kernel init.
   HipSTR-derived defaults: posterior `Q ≥ MIN_POSTERIOR`, ≥ `MIN_SPANNING_READS`,
   ≤ `MAX_STUTTER_FRAC` stutter/flank-indel reads, ≥ `MIN_ALLELE_SUPPORT_FRAC`
   allele support; normalized-depth bounds; segdup/mappability exclusion.
+- **Stutter-artifact fraction is computed here, not in Stage 1.** Whether a read
+  is a stutter artifact is defined relative to the called allele and the fitted
+  kernel `S_θ` — both unknown until this stage. After EM, each read's
+  stutter-vs-true responsibility (the `S_θ(L | a)` mass in §5.1's convolution)
+  gives the per-call artifact fraction directly; the `MAX_STUTTER_FRAC` gate
+  applies to that. Stage 1 stays stutter-free and stores only the raw
+  `hist_lengths`/`hist_counts` this is derived from — it carries **no**
+  `n_stutter_artifact` column.
 
 ### 5.9 Output VCF — GangSTR-format-compatible
 
