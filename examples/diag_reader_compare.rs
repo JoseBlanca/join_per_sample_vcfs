@@ -20,7 +20,8 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use pop_var_caller::bam::alignment_input::{
-    AlignmentMergedReader, AlignmentMergedReaderConfig, MappedRead, load_pileup_inputs,
+    AlignmentMergedReader, AlignmentMergedReaderConfig, MappedRead, build_fasta_repository,
+    load_pileup_inputs,
 };
 
 #[derive(Parser, Debug)]
@@ -82,9 +83,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Indexed: query the target contig directly.
     let indexed: Vec<String> = {
+        let repository = build_fasta_repository(&cli.reference)?;
         let reader = AlignmentMergedReader::query(
             &files,
-            &cli.reference,
+            &repository,
             inputs.contigs.clone(),
             inputs.sample_name.clone(),
             &inputs.headers,

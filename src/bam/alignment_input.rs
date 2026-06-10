@@ -494,6 +494,42 @@ fn with_fai_extension(fasta_path: &Path) -> PathBuf {
     PathBuf::from(buf)
 }
 
+/// Build the noodles FASTA [`fasta::Repository`] used by the CRAM slice
+/// decoder and the reader's F1/F3 read-reference checks.
+///
+/// The `Repository` is a whole-contig cache keyed by name: the first
+/// fetch of any base on a contig loads (and caches) that contig's entire
+/// sequence. It is `Clone` (an `Arc` bump) and `clear()`-able, so the
+/// pileup region loop builds it **once** and shares it across every
+/// region, clearing the cache only on contig transition to keep one
+/// contig resident. Building it per region — as `query` used to —
+/// reloads the whole contig for every region on it, the
+/// `--regions` performance regression this centralisation fixes. See
+/// `doc/devel/implementation_plans/fasta_reference_reading_unification.md`.
+///
+/// # Errors
+///
+/// - [`AlignmentInputError::MissingFastaIndex`] if the sibling `.fai`
+///   does not exist.
+/// - [`AlignmentInputError::Io`] if the indexed FASTA reader cannot be
+///   built (unreadable FASTA / malformed `.fai`).
+pub fn build_fasta_repository(fasta: &Path) -> Result<fasta::Repository, AlignmentInputError> {
+    let fai_path = with_fai_extension(fasta);
+    if !fai_path.exists() {
+        return Err(AlignmentInputError::MissingFastaIndex {
+            fasta_path: fasta.to_path_buf(),
+        });
+    }
+    let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
+        .build_from_path(fasta)
+        .map_err(|source| AlignmentInputError::Io {
+            path: fasta.to_path_buf(),
+            source,
+        })?;
+    let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
+    Ok(fasta::Repository::new(adapter))
+}
+
 // ---------------------------------------------------------------------
 // AlignmentMergedReader
 // ---------------------------------------------------------------------
@@ -617,20 +653,7 @@ impl AlignmentMergedReader {
         }
 
         // FASTA repository — built once and shared across decoders.
-        let fai_path = with_fai_extension(fasta);
-        if !fai_path.exists() {
-            return Err(AlignmentInputError::MissingFastaIndex {
-                fasta_path: fasta.to_path_buf(),
-            });
-        }
-        let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
-            .build_from_path(fasta)
-            .map_err(|source| AlignmentInputError::Io {
-                path: fasta.to_path_buf(),
-                source,
-            })?;
-        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
-        let repository = fasta::Repository::new(adapter);
+        let repository = build_fasta_repository(fasta)?;
 
         // Reject mixed `.cram` + `.bam` inputs and unknown
         // extensions before touching the filesystem. The
@@ -820,14 +843,20 @@ impl AlignmentMergedReader {
     /// `sample_name` is propagated to the resulting reader's
     /// [`sample_name`](Self::sample_name) accessor.
     ///
+    /// `repository` is the shared FASTA [`fasta::Repository`] (CRAM
+    /// reference resolver + F1/F3 read-reference source). The caller
+    /// builds it once via [`build_fasta_repository`] and passes the
+    /// same instance to every region's `query`, clearing its cache on
+    /// contig transition; the clone taken here is an `Arc` bump.
+    ///
     /// **What this skips vs `new`.** Per-file header parsing
     /// (caller's `Arc<sam::Header>` is reused), FASTA contig
     /// agreement, sample-name reconciliation, and cross-file
-    /// contig-list cross-checks. Each per-worker call still opens
-    /// fresh `cram::io::Reader<File>` and `fasta::Repository`
-    /// instances because both are mutably held by the merge for the
-    /// reader's lifetime, but their construction cost is small next
-    /// to the per-contig seek + decode that follows.
+    /// contig-list cross-checks. Each per-worker call still opens a
+    /// fresh `cram::io::Reader<File>` (mutably held by the merge for
+    /// the reader's lifetime), but the FASTA repository is now shared,
+    /// not rebuilt, so the per-contig sequence is loaded once across
+    /// all of its regions.
     ///
     /// # Errors
     ///
@@ -835,8 +864,6 @@ impl AlignmentMergedReader {
     /// - [`AlignmentInputError::PerInputHandleCountMismatch`] —
     ///   `headers.len()` or `indexes.len()` disagree with
     ///   `crams.len()`.
-    /// - [`AlignmentInputError::MissingFastaIndex`] — `<fasta>.fai` is
-    ///   not present next to `fasta`.
     /// - [`AlignmentInputError::ContigNotInList`] — `contig_name` is
     ///   not present in `contigs`.
     /// - [`AlignmentInputError::OpenFailed`] / [`AlignmentInputError::Io`] —
@@ -844,7 +871,7 @@ impl AlignmentMergedReader {
     #[allow(clippy::too_many_arguments)]
     pub fn query(
         alignment_files: &[PathBuf],
-        fasta: &Path,
+        repository: &fasta::Repository,
         contigs: ContigList,
         sample_name: String,
         headers: &[Arc<sam::Header>],
@@ -881,23 +908,12 @@ impl AlignmentMergedReader {
         let region = region.filter(|iv| !(iv.start <= 1 && u64::from(iv.end) >= contig_length));
 
         // FASTA repository — needed by the slice decoder for the
-        // mismatch-fraction filter. Built per-worker because
-        // `fasta::Repository`'s internal adapter holds a file handle
-        // that is not shareable across threads.
-        let fai_path = with_fai_extension(fasta);
-        if !fai_path.exists() {
-            return Err(AlignmentInputError::MissingFastaIndex {
-                fasta_path: fasta.to_path_buf(),
-            });
-        }
-        let indexed_fasta_reader = noodles_fasta::io::indexed_reader::Builder::default()
-            .build_from_path(fasta)
-            .map_err(|source| AlignmentInputError::Io {
-                path: fasta.to_path_buf(),
-                source,
-            })?;
-        let adapter = fasta::repository::adapters::IndexedReader::new(indexed_fasta_reader);
-        let repository = fasta::Repository::new(adapter);
+        // mismatch-fraction filter. Injected by the caller (built once
+        // for the whole run and shared across regions, cleared on
+        // contig transition) rather than built here per region: building
+        // it per region reloaded the whole contig for every region on
+        // it, the `--regions` performance regression. See
+        // `build_fasta_repository`.
 
         // One indexed iterator per input. Format-specific decoders
         // live in the `cram_input` / `bam_input` sibling modules;
@@ -983,7 +999,7 @@ impl AlignmentMergedReader {
             contigs,
             sample_name,
             config,
-            Some(repository),
+            Some(repository.clone()),
         )
     }
 }
@@ -1926,6 +1942,38 @@ mod tests {
 
     fn default_seq(len: usize) -> Vec<u8> {
         b"A".repeat(len)
+    }
+
+    /// Test convenience wrapper around [`AlignmentMergedReader::query`].
+    /// Builds a fresh [`fasta::Repository`] for `fasta` and runs the
+    /// query with it, mirroring the pre-shared-repository signature so
+    /// per-call test sites stay terse. Production builds the repository
+    /// once (via [`build_fasta_repository`]) and shares it across every
+    /// region — see `run_pileup`.
+    #[allow(clippy::too_many_arguments)]
+    fn query_with_fasta(
+        alignment_files: &[PathBuf],
+        fasta: &Path,
+        contigs: ContigList,
+        sample_name: String,
+        headers: &[Arc<sam::Header>],
+        indexes: &[AlignmentIndex],
+        contig_name: &str,
+        region: Option<ContigInterval>,
+        config: AlignmentMergedReaderConfig,
+    ) -> Result<AlignmentMergedReader, AlignmentInputError> {
+        let repository = build_fasta_repository(fasta)?;
+        AlignmentMergedReader::query(
+            alignment_files,
+            &repository,
+            contigs,
+            sample_name,
+            headers,
+            indexes,
+            contig_name,
+            region,
+            config,
+        )
     }
 
     fn default_qual(len: usize) -> Vec<u8> {
@@ -3862,7 +3910,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&input_path);
-        let reader = AlignmentMergedReader::query(
+        let reader = query_with_fasta(
             std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -3899,7 +3947,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&input_path);
-        let reader = AlignmentMergedReader::query(
+        let reader = query_with_fasta(
             std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -3952,7 +4000,7 @@ mod tests {
         let headers = vec![header_a, header_b];
         let indexes = vec![index_a, index_b];
 
-        let query_positions: Vec<(Vec<u8>, u64)> = AlignmentMergedReader::query(
+        let query_positions: Vec<(Vec<u8>, u64)> = query_with_fasta(
             &[cram_a, cram_b],
             &fasta_path,
             contigs_for(&contigs),
@@ -3995,7 +4043,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&input_path);
-        let reader = AlignmentMergedReader::query(
+        let reader = query_with_fasta(
             std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -4022,7 +4070,7 @@ mod tests {
                 .expect("build_cram");
 
         let (header, index) = load_header_and_index(&input_path);
-        let err = AlignmentMergedReader::query(
+        let err = query_with_fasta(
             std::slice::from_ref(&input_path),
             &fasta_path,
             contigs_for(&contigs),
@@ -4052,7 +4100,7 @@ mod tests {
         let (header, index) = load_header_and_index(&input_path);
 
         // 2 crams, 1 header, 1 index → mismatch.
-        let err = AlignmentMergedReader::query(
+        let err = query_with_fasta(
             &[input_path.clone(), input_path.clone()],
             &fasta_path,
             contigs_for(&contigs),
@@ -4117,7 +4165,7 @@ mod tests {
         region: Option<ContigInterval>,
     ) -> Vec<u64> {
         let inputs = [input_path.to_path_buf()];
-        AlignmentMergedReader::query(
+        query_with_fasta(
             &inputs,
             fasta_path,
             contigs_for(&one_contig_chr1()),
@@ -4588,7 +4636,7 @@ mod tests {
         let empty_csi: noodles_csi::Index = Indexer::<BinnedIndex>::new(14, 6).build(contigs.len());
         let bad_index = AlignmentIndex::BamCsi(Arc::new(empty_csi));
 
-        let result = AlignmentMergedReader::query(
+        let result = query_with_fasta(
             std::slice::from_ref(&cram_path),
             &fasta_path,
             contigs_for(&contigs),
