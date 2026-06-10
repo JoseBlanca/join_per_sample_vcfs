@@ -833,6 +833,110 @@ adopt HipSTR's SNP-phasing** — SSRs are too sparse for reads to co-span an STR
 an informative SNP, and coupling to the SNP callset would break the
 two-independent-callers design (§6b).
 
+### D1 — Small-N / single-sample behaviour + the allele-length prior (2026-06-09)
+
+**Single-sample is a first-class use case.** The model is single-sample-capable
+*by construction* — no hard N=1 branch in genotyping:
+- **Stutter** stays estimable via the hierarchical motif-class prior (D3): even at
+  N=1 one sample has many loci → the genome-wide motif-class `θ` is well
+  determined; a thin per-locus `θ_ℓ` shrinks toward its class.
+- **Allele frequencies:** one mechanism self-interpolates — **Dirichlet-smoothed
+  per-locus `π_ℓ`** estimated from the samples with data at ℓ (pseudocount `α`).
+  Large N → empirical population AF; N→1 → the Dirichlet **base measure** (below)
+  dominates. **No threshold; no special-case** (PM); rare alleles never hard-zeroed.
+- **`F`:** supplied at low N (can't estimate from one sample); **default `F = 0`**
+  (outcrossing/HWE — matches the SNP caller's `DEFAULT_INBREEDING_COEFFICIENT`);
+  `f̂` estimated only above an effective-sample threshold (→ D4).
+
+**The Dirichlet base measure is NOT uniform** (PM). Grounded in the stepwise
+mutation model (SMM):
+- Within-population microsatellite allele-size distributions are **unimodal,
+  peaked at a modal allele, decaying with offset in repeat units** — Valdes,
+  Slatkin & Freimer 1993 (*Genetics*, PMC1205356): **simulation-characterized, no
+  clean closed form**; the analytic handle is that the **allele-size variance
+  estimates `Nu`/`θ`** (standard SMM result `E[(i−j)²] ≈ θ` between two random
+  alleles → within-population size variance ≈ `θ/2`). RepeatSeq (PMC3592458)
+  likewise uses a **reference-length-informed** prior, not uniform.
+- **Decision:** base measure = **reference-centred, unimodal** over the repeat-unit
+  offset `Δ = (L − ref)/period`. **v1 = geometric** decay `∝ p^|Δ|` (one knob,
+  FP-averse exponential tails). Principled upgrade = **discretized Gaussian**
+  centred at `ref`, variance a hyperparameter (optionally per-locus `≈ θ/2`, the
+  SMM link). It is only the **weak** base measure — empirical `π` dominates at
+  useful N, so the exact shape barely matters; it matters precisely at small N
+  (its purpose), so don't over-engineer it.
+- **Population decay ≠ stutter decay** (PM): this base-measure spread (θ-driven,
+  *population* length variation, can be wide) is a **separate parameter** from the
+  stutter `(u,d,ρ)` (PCR *measurement* error, typically narrower). Never shared.
+
+### D2 + D3 — EM structure, stutter inference, identifiability (2026-06-09)
+
+**Stutter is inferred by joint mixture-deconvolution** (the generative core of
+HipSTR/RepeatSeq), *not* by pre-classifying homozygotes.
+
+- **Unit of observation:** stutter is a **within-(sample, locus)** phenomenon —
+  the spread of one sample's reads around its own true allele(s). Raw read lengths
+  must **not** be pooled across samples (that conflates stutter with population
+  variation).
+- **Model:** each (sample, locus) read-length distribution is a **mixture of
+  `ploidy` stutter kernels**, one centred on each latent allele (1 component =
+  hom, `ploidy` = het/polyploid):
+  `O_{s,ℓ}(x) = (1/ploidy)·Σ_{a∈G_{s,ℓ}} K_{θ(cov)}(x − a)`. The **kernel `K_θ` is
+  the shared stutter parameter**; the allele positions `G_{s,ℓ}` are **per-unit
+  latent**. Sharing the kernel across units is *legitimate* (stutter = a
+  chemistry+motif property, identical across samples of a library), so we use
+  **all** samples without conflating: **kernel = chemistry (shared), alleles =
+  population (per-unit)**. **Heterozygotes are modelled (≥2 components), not
+  excluded** → resolves het-contamination and needs no homozygote classifier.
+- **Covariate-parameterised kernel `θ(cov)`** (D3 proper): `cov` = **period**
+  (dominant), **allele length** (per-allele — a 12/30 het gives the 30-allele a
+  higher stutter rate than the 12), **motif identity/composition**, **purity**;
+  `u` (gain) and `d` (loss) modelled **separately** (contraction bias). Fit by
+  **regression + hierarchical shrinkage**: data-rich motifs stand alone, rare ones
+  shrink toward their **period-level** estimate (we do *not* assume all
+  same-length motifs identical, but rare ones fall back gracefully). Pools reads
+  across all units of a covariate cell → ample data except the sparse tail.
+  **Auto-adapts to the library** (PCR vs PCR-free) by learning from the cohort's
+  own data.
+- **Fit = joint deconvolution EM:** E-step infers per-(sample,locus) genotype
+  under the current kernel; M-step updates the shared covariate-kernel from
+  responsibility-weighted residuals. **Initialised from confident homozygotes**
+  (deep + dominant single length) — the "pre-pass" (D2 Option A) is the
+  **initialiser**, not the training set; the joint fit then refines using **all**
+  loci including hets (D2 Option B as the estimator).
+- **Convergence:** penalised-log-lik / parameter tolerance + max-iter; assert
+  non-decreasing log-lik.
+- **Identifiability:** within one locus, adjacent-het vs hom+stutter is ambiguous;
+  broken by (a) the **shared kernel** across many loci (it cannot be both small —
+  reading loci as clean homs — and large — reading them as pure stutter), and (b)
+  **population recurrence** (a real allele recurs at stable frequency; a stutter
+  satellite's mass tracks its parent's read count). **No label-switching** (alleles
+  are ordered lengths). `π` kept positive by the Dirichlet pseudocount → stutter-
+  only candidates self-prune. Local optima → the confident-homozygote init;
+  multi-restart deferred to v2.
+- **Selfing bonus:** tomato's high homozygosity → abundant clean init/anchor
+  homozygotes — the same `F` that complicates the prior *helps* stutter fitting.
+
+### D4 — Ploidy & `F` input (2026-06-09)
+
+**Ploidy: a single, uniform `--ploidy` per run** (default 2). **No aneuploidy, no
+per-contig / per-locus copy number, no mixed ploidy** (PM — a major code
+simplification): a species whose chromosomes differ in ploidy (e.g. sex
+chromosomes) is run **separately per ploidy**. The genotype space is the **integer
+partitions of that one ploidy** over the candidate alleles (ConSTRain's
+enumeration trick; the karyotype/CNA-BED machinery is **dropped**). Depth still
+feeds the QC filter, **never** the genotype CN → no coupling to CNV calling
+(independence preserved). Polyploid is still supported (set `--ploidy 4`, etc.),
+just uniform.
+
+**`F` (fixation index):** reuse the SNP caller's design — **per-sample `F` =
+`fixation_index_default` (default `0`) + optional per-sample overrides**; supply
+it (e.g. `F ≈ s/(2−s)` from a known selfing rate) or **estimate a cohort /
+per-sample `f̂`** from the heterozygote deficit only above an effective-sample
+threshold, else use the default. **Per-locus `F` not pursued** (too noisy).
+Polyploid `F` (ploidy > 2) uses a **single-parameter polysomic** approximation
+(fully-IBD vs independent HWE draws; ignores double reduction) — a v-later
+refinement; most tomato work is diploid.
+
 **FP-aversion is baked in (precision ≫ recall):**
 - The **stutter model** is the first defence — it explains the ladder as noise
   instead of calling each rung an allele.
@@ -979,6 +1083,73 @@ geometric form with HipSTR's EM updates; Stage-1 `Q_r(L)` is the Dindel-emission
 ≤1-indel realignment; the polyploid genotype space uses integer-partition
 enumeration; and FP-aversion has ready-made thresholds. No change to the
 two-stage split or the inbreeding-adjusted prior.
+
+## 6g. Validation & testing strategy (final, C — 2026-06-09)
+
+QA splits into **two buckets** by purpose, truth source, and timing. **Only
+Bucket 1 is on the build critical path**; Bucket 2's data is acquired in parallel.
+
+### Bucket 1 — Synthetic data for code tests (the dev driver; built first)
+
+Purpose: **correctness of the machinery** — perfect known truth, deterministic,
+in-repo, **no external-data dependency** → unblocks development immediately and
+drives TDD per stage. A small STR-aware simulator emitting at **two levels**:
+- **Evidence level (first)** — synthetic per-sample Parquet evidence (`Qᵣ(L)`
+  histograms + ambiguous CSR profiles) **directly** → tests **Stage 2 statistics
+  in isolation** (EM recovers injected `π/θ/F`; calibrated posteriors;
+  FP-aversion) *before extraction exists*. The cheapest de-risk of the statistical
+  core.
+- **Read/BAM level** — inject genotype + stutter ladder + sequencing error →
+  synthetic BAM + truth genotype table → exercises the whole pipeline incl. the
+  pair-HMM extraction (B): catalog → extract → genotype.
+
+**Anti-tautology rule:** also generate data whose stutter/error **deviates** from
+the caller's `(u,d,ρ)` assumptions (perturbed params, empirical ladders, di-nuc
+edge cases), and keep the **simulator's model definition separate from the
+caller's code** — else a shared bug hides in both. Synthetic tests prove the
+inference is *correct + robust to model mismatch*; they **cannot** prove the model
+matches reality (that is Bucket 2).
+
+Test shapes: deterministic unit fixtures (a soft-clipped read; a known-genotype
+locus) + property/statistical tests (recovers injected `π/θ/F`; posterior
+calibration; no false hets from stutter on monomorphic loci; high `F` suppresses
+false hets; di-nuc / long-allele / low-coverage / polyploid stress).
+
+### Bucket 2 — Comparison vs reference tools (post-build benchmark; off the critical path)
+
+Purpose: **accuracy against reality + the field**, on real data, once the tool
+exists.
+- **Human (gold standard):** HG002 Illumina → our caller vs **GIAB-TR v1.0** truth,
+  compared with **Truvari `bench` + `refine`** (handles the STR allelic-
+  representation problem — the same normalization headache that bit our SNP
+  indels); **HipSTR + GangSTR** (already cloned) as comparators — reuse the SNP
+  cross-caller benchmark + comparison-dashboard methodology. *(Needs deeper HG002
+  WGS than the BED-restricted `human_genome_bottle` CRAM.)*
+- **Tomato (the real target), best-effort:** matched **CE + WGS** accessions if
+  findable (TGRC accessions are widely CE-genotyped at SSR panels and many are now
+  WGS'd — plausible overlap) → CE allele sizes as truth. Fallbacks if no matched
+  data: Mendelian concordance (pedigree/RIL set), replicate concordance, cross-tool
+  concordance, HWE/`F` sanity given the known selfing rate.
+- **Truth-free QC (always on, both species):** Mendelian-error rate (GIAB
+  Ashkenazi trio HG002/3/4), replicate concordance, HWE/population-spectrum
+  sanity, call-rate.
+
+**Acceptance targets (FP-averse *form*; numbers set once baselines exist):**
+genotype precision (exact allele-length-multiset match) **at a chosen posterior
+operating point, call-rate reported not maximized** (precision/call-rate sweep,
+reusing the SNP QUAL-sweep tooling); per-motif-length breakdown (di-nuc = the
+floor → lower bar); precision ≥ HipSTR/GangSTR at matched call-rate on GIAB-TR;
+low Mendelian error; high replicate concordance.
+
+**Deferred data/infra (Bucket 2 — acquire in parallel, NOT a build blocker):**
+clone **Truvari** (gitignored); download **GIAB-TR v1.0** + deeper HG002 Illumina;
+the **tomato matched-CE+WGS data hunt**; a `benchmarks/` STR harness (à la
+`human_genome_bottle`). Numeric targets deferred until HipSTR/GangSTR baselines
+are measured.
+
+**Sources:** GIAB-TR v1.0 — Nat Biotechnol 2024 (PMC11952744); FTP
+`…/AshkenazimTrio/HG002_NA24385_son/TandemRepeats_v1.0`. Truvari —
+`github.com/ACEnglish/truvari`.
 
 ## 7. Open questions / next steps
 
