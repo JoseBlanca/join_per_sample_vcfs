@@ -16,11 +16,11 @@ use thiserror::Error;
 
 use crate::bam::alignment_input::{
     AlignmentMergedReader, AlignmentMergedReaderConfig, ContigInterval, FilterCounts,
-    load_pileup_inputs,
+    build_fasta_repository, load_pileup_inputs,
 };
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
-use crate::fasta::ContigList;
+use crate::fasta::{ContigList, MultiChromStreamingRefFetcher};
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
 use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_region_into_writer};
 use crate::pileup::walker::{RunSummary, WalkerConfig};
@@ -304,18 +304,48 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     .map_err(PileupToPspError::from)?;
 
     // 7. Drive each region into the shared writer, totalling counters.
+    //
+    //    The FASTA repository (CRAM reference resolver + F1/F3
+    //    read-reference source) is built **once** here and shared across
+    //    every region, rather than rebuilt inside `query` per region.
+    //    The noodles repository is a whole-contig cache, so a per-region
+    //    rebuild reloaded the entire contig for every region on it — the
+    //    `--regions` perf/memory regression. `RegionSet` is sorted by
+    //    `(chrom_id, start)`, so regions arrive grouped by contig; we
+    //    `clear()` the cache on each contig transition to keep just one
+    //    contig's sequence resident (matching the whole-genome path's
+    //    memory profile). See
+    //    `doc/devel/implementation_plans/fasta_reference_reading_unification.md`.
+    let repository = build_fasta_repository(&args.reference)?;
+    let mut current_chrom_id: Option<u32> = None;
+
+    // The walker's reference fetcher is likewise built once and reused
+    // across regions (it streams, swapping its inner per-contig fetcher
+    // on chrom transition). Rebuilding it per region re-parsed the
+    // `.fai` and re-opened the FASTA every time.
+    let walker_fetcher =
+        MultiChromStreamingRefFetcher::new(args.reference.clone(), inputs.contigs.clone());
+
     let mut total_filter = FilterCounts::default();
     let mut total_walker = RunSummary::default();
     let mut total_baq_skip = (!stage1.no_baq).then(BaqSkipCounts::default);
     let mut stashed_upstream: Option<AlignmentInputError> = None;
 
     for region in region_set.iter() {
+        // Contig transition: drop the previous contig's cached sequence.
+        // Safe because the sorted RegionSet never revisits a contig, so
+        // a cleared contig is never fetched again.
+        if current_chrom_id != Some(region.chrom_id) {
+            repository.clear();
+            current_chrom_id = Some(region.chrom_id);
+        }
+
         let contig_name = inputs.contigs.entries[region.chrom_id as usize]
             .name
             .clone();
         let reader = AlignmentMergedReader::query(
             &args.alignment_files,
-            &args.reference,
+            &repository,
             inputs.contigs.clone(),
             inputs.sample_name.clone(),
             &inputs.headers,
@@ -331,6 +361,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         let outputs = super::stage1_pipeline::with_stage1_chain::<RunSummary, PileupCliError, _>(
             reader,
             &args.reference,
+            &walker_fetcher,
             baq_cfg,
             walker_cfg,
             stage1.baq_chunk_size,

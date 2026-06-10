@@ -282,6 +282,58 @@ fn regions_bed_spanning_two_contigs_restricts_each() {
     );
 }
 
+/// **Regression guard for the shared-FASTA-reader lifecycle.** Two
+/// regions on chr1 plus one on chr2 exercise the per-run FASTA
+/// reference readers (the noodles `Repository` and the walker's
+/// `MultiChromStreamingRefFetcher`), which are now built once and reused
+/// across regions rather than rebuilt per region:
+///
+/// - the two chr1 regions reuse the same resident chr1 reference (the
+///   repository cache is *not* cleared between them; the walker's
+///   streaming buffer advances forward across the region boundary);
+/// - the chr1→chr2 transition clears/swaps to chr2.
+///
+/// Each region is clamped to its own span. A bug in the
+/// shared-reader state (stale buffer across the boundary, premature
+/// clear) would corrupt or drop one of these spans.
+#[test]
+fn regions_bed_multiple_regions_per_contig_then_next_contig() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta_2contig(dir.path());
+    let records = vec![
+        read_record_on("r1", 0, 20, b"AAAAA"),
+        read_record_on("r2", 0, 150, b"AAAAA"),
+        read_record_on("r3", 1, 50, b"AAAAA"),
+    ];
+    let cram = build_bam_2contig(dir.path(), "NA12878", Some(fixture_md5()), &records);
+
+    // Two regions on chr1 (forcing repository + walker-fetcher reuse
+    // within the contig) and one on chr2 (forcing the transition).
+    let bed = dir.path().join("multi.bed");
+    std::fs::write(
+        &bed,
+        format!("{CONTIG_NAME}\t20\t23\n{CONTIG_NAME}\t150\t153\n{SECOND_CONTIG_NAME}\t50\t52\n"),
+    )
+    .expect("write bed");
+
+    let out = dir.path().join("multi_region.psp");
+    let mut args = default_args(fasta, out.clone(), vec![cram]);
+    args.regions = Some(bed);
+    run_pileup(&args).expect("run_pileup OK");
+
+    let recs = psp_records(&out);
+    assert_eq!(
+        positions_on(&recs, 0),
+        vec![21, 22, 23, 151, 152, 153],
+        "chr1's two regions each clamped, both emitted from one shared reader"
+    );
+    assert_eq!(
+        positions_on(&recs, 1),
+        vec![51, 52],
+        "chr2 clamped after the contig transition"
+    );
+}
+
 /// `--regions` restricts the emitted `.psp` to the BED's positions.
 /// The fixture's whole-genome run covers 1..=14; a BED selecting the
 /// 1-based span [5, 9] (0-based half-open `[4, 9)`) yields exactly

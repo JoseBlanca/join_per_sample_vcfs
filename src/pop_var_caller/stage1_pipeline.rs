@@ -84,13 +84,19 @@ pub struct Stage1Outputs<R> {
 /// `query()` reader per analysis region and calls this once per region,
 /// reusing the shared PSP writer inside `f`.
 ///
-/// `E: From<PileupCliError>` lets internal setup errors (fetcher init)
-/// lift into the closure's error type without changing the caller's
-/// surface; `run_pileup`'s closure picks `E = PileupCliError`.
+/// The `walker_fetcher` is built once by the caller and reused across
+/// regions (see `run_pileup`); `reference` is still needed here to build
+/// `BaqStream`'s per-worker fetchers on the BAQ-on path.
+///
+/// `E: From<PileupCliError>` lets an upstream read error stashed by the
+/// error-shedding adapter lift into the closure's error type without
+/// changing the caller's surface; `run_pileup`'s closure picks
+/// `E = PileupCliError`.
 #[allow(clippy::too_many_arguments)]
 pub fn with_stage1_chain<R, E, F>(
     mut reader: AlignmentMergedReader,
     reference: &Path,
+    walker_fetcher: &MultiChromStreamingRefFetcher,
     baq_cfg: BaqConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
@@ -109,20 +115,22 @@ where
 
     // 2. Reference fetcher for the walker — [`MultiChromStreamingRefFetcher`]
     //    wraps a `StreamingChromRefFetcher` and swaps it on chrom
-    //    transition. The walker is single-threaded so the adapter
-    //    can stay `!Sync` (RefCell-based interior mutability; no
-    //    Mutex overhead). BAQ builds its own per-rayon-worker
-    //    [`ManualEvictChromRefFetcher`] inside `BaqStream`, so there
-    //    is no shared fetcher between BAQ and the walker any more.
+    //    transition. It is now **injected** by the caller (built once
+    //    for the whole run, reused across every region) rather than
+    //    rebuilt here per region: building it per region re-parsed the
+    //    `.fai` and re-opened the FASTA for every region. The walker is
+    //    single-threaded so the adapter can stay `!Sync` internally.
+    //    Within a contig, regions arrive sorted and non-overlapping, so
+    //    the streamer's monotonic-forward `fetch` contract holds across
+    //    region boundaries; on a contig change the wrapper rebuilds its
+    //    inner fetcher.
     //
-    //    Step 2(c) of the `unified_chrom_ref_fetcher` plan walked
-    //    back: BAQ's parallel out-of-order access pattern is
-    //    genuinely random within a chunk, which doesn't fit the
-    //    walker's streaming-sliding-buffer abstraction. The new
-    //    manual-evict fetcher gives BAQ a per-worker buffer with
-    //    caller-managed eviction.
-    let walker_fetcher =
-        MultiChromStreamingRefFetcher::new(reference.to_path_buf(), contigs.clone());
+    //    BAQ builds its own per-rayon-worker
+    //    [`ManualEvictChromRefFetcher`] inside `BaqStream`, so there is
+    //    no shared fetcher between BAQ and the walker (Step 2(c) of the
+    //    `unified_chrom_ref_fetcher` plan walked back: BAQ's parallel
+    //    out-of-order access within a chunk doesn't fit the walker's
+    //    streaming-sliding-buffer abstraction).
 
     // 3. Build the boxed input iterator + handle for upstream errors,
     //    drive the closure, then snapshot every branch-local counter
@@ -152,7 +160,7 @@ where
         }));
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = walker::run(input, &walker_fetcher, &walker_cfg);
+        let walker = walker::run(input, walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,
@@ -176,7 +184,7 @@ where
         let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = walker::run(input, &walker_fetcher, &walker_cfg);
+        let walker = walker::run(input, walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
             sample_name: &sample_name,
