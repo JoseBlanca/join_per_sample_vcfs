@@ -111,6 +111,49 @@ def _(bench_selector, csv, mo, tsv_by_bench):
 
 
 @app.cell
+def _(mo):
+    # Precision / recall are meaningless at the gate=0 emission (every
+    # caller dumps a low-QUAL tail). Score them on the *confident* calls:
+    # drop everything below this QUAL. 1000 is a sensible common cutoff
+    # for all three SNP callers at this depth.
+    cutoff_sel = mo.ui.slider(
+        start=0, stop=15000, step=50, value=1000, show_value=True,
+        label="QUAL cutoff for precision / recall / F1",
+    )
+    cutoff_sel
+    return (cutoff_sel,)
+
+
+@app.cell
+def _(cutoff_sel, qual_rows, rows):
+    # Recompute the confusion counts at the QUAL cutoff: a call counts
+    # only if QUAL >= cutoff. Recall is anchored to the full truth set
+    # (TP+FN from the gate=0 table), so a TP dropped below the cutoff
+    # becomes an FN. Falls back to the gate=0 counts if no per-record
+    # qual_dist.tsv is present.
+    _t = cutoff_sel.value
+    if not qual_rows:
+        rows_cut = rows
+    else:
+        _truth = {(r["caller"], r["class"]): r["tp"] + r["fn"] for r in rows}
+        rows_cut = []
+        for _c, _cls in sorted({(r[0], r[1]) for r in qual_rows}):
+            _tp = sum(1 for r in qual_rows
+                      if r[0] == _c and r[1] == _cls and r[2] == "TP" and r[3] >= _t)
+            _fp = sum(1 for r in qual_rows
+                      if r[0] == _c and r[1] == _cls and r[2] == "FP" and r[3] >= _t)
+            _total = _truth.get((_c, _cls), _tp)
+            _fn = max(_total - _tp, 0)
+            _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 1.0
+            _rec = _tp / _total if _total > 0 else 0.0
+            _f1 = 2 * _prec * _rec / (_prec + _rec) if (_prec + _rec) > 0 else 0.0
+            rows_cut.append({"caller": _c, "class": _cls, "tp": _tp, "fp": _fp,
+                             "fn": _fn, "precision": _prec, "recall": _rec, "f1": _f1})
+    rows_cut
+    return (rows_cut,)
+
+
+@app.cell
 def _():
     import bisect
     import math
@@ -402,16 +445,23 @@ def _():
 
 
 @app.cell
-def _(callers, classes, mo, plot_metrics, rows):
-    mo.stop(not rows, mo.md(""))
-    plot_metrics(rows, callers, classes)
+def _(cutoff_sel, mo, rows_cut):
+    mo.stop(not rows_cut, mo.md(""))
+    mo.md(f"_Precision / recall / F1 on calls with **QUAL ≥ {cutoff_sel.value:g}**._")
     return
 
 
 @app.cell
-def _(classes, mo, plot_pr_scatter, rows):
-    mo.stop(not rows, mo.md(""))
-    plot_pr_scatter(rows, classes)
+def _(callers, classes, mo, plot_metrics, rows_cut):
+    mo.stop(not rows_cut, mo.md(""))
+    plot_metrics(rows_cut, callers, classes)
+    return
+
+
+@app.cell
+def _(classes, mo, plot_pr_scatter, rows_cut):
+    mo.stop(not rows_cut, mo.md(""))
+    plot_pr_scatter(rows_cut, classes)
     return
 
 
@@ -430,9 +480,9 @@ def _(mo):
 
 
 @app.cell
-def _(callers, classes, mo, plot_venn, rows):
-    mo.stop(not rows, mo.md(""))
-    plot_venn(rows, callers, classes)
+def _(callers, classes, mo, plot_venn, rows_cut):
+    mo.stop(not rows_cut, mo.md(""))
+    plot_venn(rows_cut, callers, classes)
     return
 
 
