@@ -69,7 +69,7 @@ subcommand — it is crate/test code, §2.1):
                                        ▼
   BAM/CRAM (sample 1) ─┐    ┌──────────────────────────────────────────────┐
   BAM/CRAM (sample 2) ─┼───►│  ssr-pileup    (Stage 1, per sample, ∥)       │──► evidence
-        ...            │    │  reads + reference + catalog → per-read Qᵣ(L)  │    sampleN.ssr.psp
+        ...            │    │  reads + catalog → per-read Qᵣ(L)              │    sampleN.ssr.psp
   BAM/CRAM (sample N) ─┘    └──────────────────────────────────────────────┘    (one per sample)
                                                                                     │
                                        ┌────────────────────────────────────────────┘
@@ -273,9 +273,13 @@ is the **first concrete extraction task** (§8 roadmap item 2).
 **Settled 2026-06-11.** Three subcommands, named to mirror the SNP caller's
 roles one-for-one (the simulator is not a subcommand, §2.1):
 
-- **`ssr-catalog`** — reference FASTA → catalog of loci (Stage 0).
-- **`ssr-pileup`** — BAM/CRAM + reference + catalog → per-sample evidence
-  `.ssr.psp` (Stage 1). The SSR analog of the SNP `pileup`.
+- **`ssr-catalog`** — reference FASTA → catalog of loci (Stage 0); embeds the
+  local reference into the catalog (`ref_seq`), so it is the only stage that
+  reads the FASTA for the SSR algorithm.
+- **`ssr-pileup`** — BAM/CRAM + catalog → per-sample evidence `.ssr.psp`
+  (Stage 1). The SSR analog of the SNP `pileup`. No reference for the SSR math
+  (it reads `ref_seq` from the catalog); a reference is needed only to *decode
+  CRAM* input, not BAM (spec §3.2 caveat).
 - **`ssr-call`** — N evidence files + catalog → cohort VCF (Stage 2). The SSR
   analog of the SNP `var-calling`.
 
@@ -308,7 +312,7 @@ src/
 ├── ssr/                     # NEW — the SSR caller, all stages
 │   ├── mod.rs
 │   ├── types.rs             #   ★ FOUNDATIONAL, built first — shared domain types (Locus,
-│   │                        #   Motif, the allele representation/key, candidate set). Own doc.
+│   │                        #   Motif, allele repr/key, candidate set). Doc: ssr_shared_types.md
 │   ├── catalog/             # Stage 0: TRF wrapper + post-process + catalog I/O
 │   │   ├── trf.rs           #   run/parse TRF — shell-out OR vendor/port, NO FFI (§6)
 │   │   ├── postprocess.rs   #   period≤6, purity/score filter, merge, split compounds, mappability
@@ -353,7 +357,7 @@ The reuse boundary is the plumbing layer (§2). Concretely:
 | **IBD-mixture genotype prior** | [posterior_engine.rs](../../src/var_calling/posterior_engine.rs) | spec §5.3: reuse the multiallelic `F`-adjusted prior **verbatim** — it already enumerates non-decreasing ploidy-tuples with the `F·π_i + (1−F)·π_i^ploidy` homozygous term. SSR feeds it a repeat-allele set instead of base alleles. Adapter only (`cohort/prior.rs`). |
 | **BAQ banded forward** | [probaln.rs](../../src/baq/probaln.rs), [scratch.rs](../../src/baq/scratch.rs) | spec §4.2: the slow-path pair-HMM **learns the banded-forward pattern** (and the scratch-buffer discipline) but does **not** couple to it — it's a *bespoke* 3-state forward. Pattern reuse, not code reuse; the scratch-buffer ethos transfers directly. |
 | **BAM/CRAM read I/O** | noodles via [`src/bam/`](../../src/bam/) | spec §4.1: pull reads overlapping a locus + flank. Shared low-level I/O — the sanctioned cross-caller reuse. |
-| **FASTA reference reader** | [`src/fasta/`](../../src/fasta/) | Stage 0 scans it (catalog); Stage 1 reads flanks/tract for the ladder. Same reader the pileup walker now shares (recent `3adb33a`/`ad83662`). |
+| **FASTA reference reader** | [`src/fasta/`](../../src/fasta/) | **Stage 0 only** for the SSR algorithm — scans the reference to build the catalog and embed `ref_seq` (§3.2). Stages 1–2 read reference bases from the catalog, not the FASTA (CRAM decoding aside). Same reader the pileup walker shares. |
 | **vendored sdust** | (vendored) | Stage 0 optional TRF prefilter (spec §3.1) — same masker the SNP DUST filter uses. |
 | **VCF writer** | [`src/vcf/`](../../src/vcf/) | Stage 2 output; SSR writes its own records/headers (GangSTR-compatible) but reuses the writer plumbing. |
 | **`--regions` / block index** | [regions.rs](../../src/regions.rs), [index.rs](../../src/psp/index.rs) | region-restricted `ssr-pileup`/`ssr-call`; the interval-keying change (§3.2) is the one delta. |
@@ -397,7 +401,8 @@ what it writes. The math is the spec's; this is the plumbing.
   detection) — not pre-decided here.
 
 ### Stage 1 — `ssr-pileup` (per sample, parallel processes)
-- **In:** one BAM/CRAM + reference + catalog.
+- **In:** one BAM/CRAM + catalog (the catalog's `ref_seq` supplies all
+  reference bases; a FASTA is needed only to decode CRAM, spec §3.2).
 - **Work, per locus:** `pileup/read_handling.rs` pulls + anchors reads and
   runs soft-clip recovery / the spanning test (spec §4.1);
   `pileup/fast_path.rs` counts the clean majority; `pileup/pair_hmm.rs`
@@ -495,10 +500,11 @@ order.** Each module is detailed in **its own document / implementation plan**
 immediately before it is built, *not* by growing this doc (see the header
 note). Each carries Bucket-1 synthetic tests on the critical path (spec §7/§11):
 
-0. **`types.rs` — shared domain model** *(first; foundational, its own doc).*
-   The allele representation (sequence-identity, on-/off-ladder hybrid,
-   normalized off-ladder key), `Locus`, `Motif`, the candidate-set type. The
-   spine every stage shares — settled before the stages that use it.
+0. **`types.rs` — shared domain model** *(first; foundational; drafted in
+   [ssr_shared_types.md](ssr_shared_types.md)).* The allele representation
+   (sequence-identity, on-/off-ladder hybrid, normalized off-ladder key),
+   `Locus`, `Motif`, the candidate-set type. The spine every stage shares —
+   settled before the stages that use it.
 1. **Stage 0 — `ssr-catalog`.** TRF integration strategy (shell-out vs
    vendor/port, **no FFI** — §6, decided at this pass's start from the vendored
    tools), the sdust-prefilter decision harness, the post-process filter

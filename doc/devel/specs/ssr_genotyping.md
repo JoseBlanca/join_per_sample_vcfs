@@ -56,7 +56,10 @@ Defined once here; used unqualified thereafter.
 - **FRR** — Fully Repetitive Read; a read lying entirely inside the repeat tract
   (no flank), used as a length lower bound for long alleles.
 - **purity** — fraction of the tract matching a perfect motif tiling; 1.0 =
-  perfect repeat, < 1.0 = imperfect / interrupted.
+  perfect repeat, < 1.0 = imperfect / interrupted. "purity" is the *concept*
+  used in prose; the concrete catalog column / `Locus` field is named
+  **`purity_fraction`** (the `_fraction` suffix marks it a degree in [0, 1], not
+  a boolean).
 - **allele (here)** — a repeat allele's *identity* is its actual tract
   **sequence**, not a bare number. Two molecules that differ by a
   non-motif-multiple amount (e.g. 12 clean repeats vs 12 repeats + 1 bp) are
@@ -65,14 +68,14 @@ Defined once here; used unqualified thereafter.
   on-ladder / off-ladder.
 - **on-ladder / off-ladder** — an allele is **on-ladder** if its length is a
   whole-motif multiple of the reference tiling — a clean rung `ref ± k` units; its
-  sequence is fully reconstructible from `(catalog scaffold, k)`, so it is the same
+  sequence is fully reconstructible from `(reference tract, k)`, so it is the same
   allele in every sample by construction. An allele is **off-ladder** if it differs
   from a clean tiling by a non-motif amount (a 1 bp indel, a partial unit, a
   *variable* interruption); its sequence is **not** reconstructible from a rung
   number, so it is carried explicitly. Stutter (§5.2) moves only between on-ladder
   rungs; an off-ladder allele is a genuine distinct allele, never a stutter
   product. (A *fixed* interruption shared by the whole population is not off-ladder
-  — it is pinned into the scaffold, §3.1.)
+  — it is pinned into the reference tract, §3.1.)
 
 **Tools / file formats**
 
@@ -152,9 +155,9 @@ allele's identity. The reason is cross-sample comparison: Stage 2 must decide wh
 two samples carry "the same" allele, and the integer count is not a faithful key
 (it collapses 12 and 12+1 bp onto the same number) — only the sequence is. Most
 alleles are **on-ladder** (clean rungs of the integer ladder) and are stored
-compactly as a rung number whose sequence is reconstructible from the catalog
-scaffold; the minority that are **off-ladder** carry their sequence explicitly
-(the *hybrid* representation, §4.2/§4.3). See the glossary entries for
+compactly as a rung number whose sequence is reconstructible from the catalog's
+reference tract; the minority that are **off-ladder** carry their sequence
+explicitly (the *hybrid* representation, §4.2/§4.3). See the glossary entries for
 *allele (here)* and *on-ladder / off-ladder*.
 
 ### 1.1 Two independent callers from one BAM (foundational)
@@ -283,30 +286,68 @@ for new species).
 ### 3.2 Catalog format
 
 One **self-describing bgzip+tabix BED-like TSV**: a VCF/GFF-style `##` metadata
-header (reference path + md5, TRF params, filters, tool/version, date), then a
-`#`-prefixed column header, then rows. Tabix skips comment lines. No sidecar.
+header (reference path + md5, TRF params, filters, **`flank_bp`** margin,
+tool/version, date), then a `#`-prefixed column header, then rows. Tabix skips
+comment lines. No sidecar.
 
-**Minimal schema (only non-derivable columns):**
+**Schema — non-derivable columns, plus the embedded local reference (§"Self-contained"):**
 
 ```
-chrom   start   end   motif   purity
+chrom   start   end   motif   purity_fraction   ref_seq_start   ref_seq
 ```
 
 - `start`/`end` are 0-based half-open; `end − start` is the reference tract length
   (the reference allele); `motif` gives the period.
+- `purity_fraction` is the fraction of the tract that is a clean motif tiling, in
+  [0, 1] — a *degree*, not a flag (1.0 = perfect, < 1.0 = interrupted). The
+  `_fraction` suffix is deliberate: the bare name reads like a boolean.
+- `ref_seq` is the **upper-cased reference bases of the tract plus a `flank_bp`
+  margin on each side** (clamped at contig ends); `ref_seq_start` is the 0-based
+  genomic coordinate of `ref_seq[0]`, so the tract is
+  `ref_seq[(start − ref_seq_start) .. (end − ref_seq_start)]` and the flanks are
+  what remain either side. (See §"Self-contained" for why this lives in the
+  catalog.)
 - Dropped as derivable: `period` = len(motif); `ref_copies` = (end−start)/period;
-  `class` (perfect/imperfect) = threshold(purity), perfect ⇔ purity = 1.0;
-  `locus_id` = f(chrom,start,motif). Cross-file linkage is **positional**; the VCF
-  `ID` is constructed at output.
-- **Reference allele identity is the reference tract sequence** (the bases of
-  `[start, end)`), not `ref_copies`. For an **imperfect** locus `(end − start)` is
-  generally *not* a multiple of `period`, so `ref_copies` is **fractional** — it is
-  a derived annotation only (rounded for the VCF integer field, §5.9), never the
-  reference allele's identity. The integer ladder Stage 1/2 work on is anchored on
-  this reference sequence as the scaffold; the fractional remainder is carried as
-  fixed scaffold context, not as a ladder rung (§4.2).
-- `purity` is retained only because Stage 2 may use it for confidence weighting;
-  it may be dropped if it ends up a build-time filter only.
+  `class` (perfect/imperfect) = threshold(purity_fraction), perfect ⇔
+  `purity_fraction` = 1.0; `locus_id` = f(chrom,start,motif). Cross-file linkage
+  is **positional**; the VCF `ID` is constructed at output.
+- **Reference allele identity is the reference tract sequence** (`ref_seq`'s tract
+  slice), not `ref_copies`. For an **imperfect** locus `(end − start)` is generally
+  *not* a multiple of `period`, so `ref_copies` is **fractional** — it is a derived
+  annotation only (rounded for the VCF integer field, §5.9), never the reference
+  allele's identity. The integer ladder Stage 1/2 work on is anchored on this
+  reference tract; the fractional remainder is carried as fixed reference-tract
+  context, not as a ladder rung (§4.2).
+- `purity_fraction` is retained only because Stage 2 may use it for confidence
+  weighting; it may be dropped if it ends up a build-time filter only.
+
+**Self-contained — the catalog embeds the local reference so the SSR *algorithm*
+in Stages 1–2 never reads the FASTA.** `ref_seq` is the *one deliberate
+exception* to "only non-derivable columns": the tract+flank bases **are**
+derivable from the reference, but storing them is the point. The reference FASTA
+is a fixed, multi-hundred-MB resident cost; embedding the few bytes each locus
+actually needs means the SSR math — candidate-ladder reconstruction (§4.2),
+off-ladder normalization, VCF REF/ALT (§5.9) — sources every reference base from
+the catalog. A direct expression of the project's memory-for-scaling thesis, and
+it makes the catalog a single self-contained input; the only thing that opens the
+reference *for the SSR algorithm* is this Stage-0 builder, which already has it
+for TRF.
+
+- ⚠ **CRAM caveat (I/O layer, not the algorithm).** CRAM stores reads as deltas
+  against the reference, so **decoding a CRAM** still needs the reference at the
+  noodles/htslib layer regardless of this embedding. So: **BAM input is fully
+  FASTA-free**; **CRAM input still requires the reference for decoding** (passed
+  to `ssr-pileup` for that purpose only — the SSR math never consults it). The
+  embedding removes the *algorithm's* reference dependency; it cannot remove
+  CRAM's *decoder* dependency.
+- **Costs.** The catalog grows by `ref_seq` (~tract + 2·`flank_bp` per locus,
+  ≈ tens of MB bgzip-compressed for a plant genome — small beside a genome), and
+  it is a **denormalization** of reference-derivable data, kept honest by the
+  header's `reference_md5` (any mismatch between `ref_seq` and the declared
+  reference is detectable).
+- `flank_bp` is sized to Stage 1's read-anchoring + pair-HMM band need (set when
+  building `ssr-pileup`); Stage 2 needs only the tract slice, so Stage 1 is the
+  binding constraint.
 
 ### 3.3 Decisions
 
@@ -377,11 +418,12 @@ forcing it onto the nearest rung.
 and applied in Stage 2). Candidates are *sequences*, in two families:
 
 - **on-ladder** — the integer ladder of clean tilings `H_L = outer_flank + (motif ×
-  L) + inner_context` for `L` near the observed count (flanks/motif from catalog +
-  reference). The ladder is catalog-defined, hence **identical across all samples**,
+  L) + inner_context` for `L` near the observed count (flanks/motif from the
+  catalog's embedded `ref_seq` + `motif`, §3.2 — no FASTA access). The ladder is
+  catalog-defined, hence **identical across all samples**,
   and is the spine every read is scored against. An on-ladder candidate is
   identified by its rung `L` alone (its sequence is reconstructible from the
-  scaffold).
+  reference tract).
 - **off-ladder** — an *actual* tract sequence a read supports that is **not** a
   clean rung. It is identified by its sequence, carried as a **normalized** delta
   from the reference tract (canonical left-aligned form, reusing the SNP caller's
@@ -514,11 +556,11 @@ decode).
 | `n_filtered` | int32 | low-mapq / dup / clipped |
 | `n_flank_indel` | int32 | |
 | `mapped_reads` | int32 | for normalized-depth QC |
-| `hist_lengths` | list&lt;int16&gt; | distinct observed **on-ladder** allele lengths (repeat units), ascending |
+| `hist_lengths` | list&lt;uint16&gt; | distinct observed **on-ladder** allele lengths (repeat units, non-negative), ascending |
 | `hist_counts` | list&lt;int32&gt; | confident-read count per on-ladder length (parallel) |
 | `hist_weight` | list&lt;float32&gt; | optional base-qual aggregate per on-ladder length |
 | `amb_read_offsets` | list&lt;int32&gt; | CSR prefix offsets for ambiguous reads (len = n_amb + 1) |
-| `amb_lengths` | list&lt;int16&gt; | flattened per-read candidate **on-ladder** lengths |
+| `amb_lengths` | list&lt;uint16&gt; | flattened per-read candidate **on-ladder** lengths (non-negative) |
 | `amb_logliks` | list&lt;float32&gt; | flattened **stutter-free** log-liks (parallel) |
 | `offl_seqs` | list&lt;string&gt; (dict) | distinct **off-ladder** allele sequences at this locus, as normalized deltas vs the ref tract, canonical order; empty when none |
 | `offl_counts` | list&lt;int32&gt; | confident off-ladder read count per sequence (parallel to `offl_seqs`) |
@@ -548,7 +590,8 @@ STUTTER_WINDOW_UNITS, AMB_LL_DROP}`, `tool_version`, and a contig name↔id tabl
 so it and the `.snp.psp` schema evolve without lockstep. Write knobs:
 `--block-window-bp` (the decode unit and the primary memory lever, as on the SNP
 path); per-column ZSTD. All stored likelihoods are **stutter-free**; on-ladder
-lengths are `int16` repeat units.
+lengths are `uint16` repeat units (non-negative; the only signed length
+quantity, the ref offset Δ, is derived, never stored — §5.5).
 
 ---
 
@@ -1155,9 +1198,12 @@ per-motif-length breakdown, precision ≥ HipSTR/GangSTR at matched call-rate.
 Three subcommands on the existing binary, named to mirror the SNP caller's
 `pileup → var-calling` roles one-for-one (architecture doc §2/§3.3):
 
-- `ssr-catalog` — reference FASTA → catalog (Stage 0).
-- `ssr-pileup` — BAM/CRAM + reference + catalog → per-sample evidence
-  `.ssr.psp` (Stage 1; the SSR analog of `pileup`).
+- `ssr-catalog` — reference FASTA → catalog (Stage 0). The only stage that reads
+  the FASTA; it embeds the local reference into the catalog (`ref_seq`, §3.2).
+- `ssr-pileup` — BAM/CRAM + catalog → per-sample evidence `.ssr.psp` (Stage 1;
+  the SSR analog of `pileup`). Takes **no reference for the SSR algorithm** (it
+  reads `ref_seq` from the catalog); a reference is needed **only to decode CRAM
+  input**, not for BAM (§3.2 CRAM caveat).
 - `ssr-call` — N evidence files + catalog → cohort VCF (Stage 2; the SSR
   analog of `var-calling`). Knobs include `--seed-dominance {fixed|auto}`
   (§5.4; `fixed` default until the cut-off detection is validated on real
