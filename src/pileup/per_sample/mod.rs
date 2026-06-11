@@ -20,6 +20,7 @@
 pub mod baq_engine;
 pub mod baq_stream;
 pub mod pileup_to_psp;
+pub mod read_processor;
 
 #[cfg(test)]
 mod baq_tests;

@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use noodles_fasta as fasta;
 use rayon::prelude::*;
 
 use crate::bam::alignment_input::MappedRead;
@@ -17,7 +18,10 @@ use crate::fasta::ContigList;
 use crate::fasta::ManualEvictChromRefFetcher;
 use crate::pileup::walker::PreparedRead;
 
-use super::baq_engine::{BaqEngine, BaqOutcome, BaqSkipReason};
+use super::baq_engine::{BaqEngine, BaqSkipReason};
+use super::read_processor::{
+    DropReason, RawContigRefCache, ReadOutcome, ReadProcessingConfig, process_read,
+};
 use crate::baq::BaqConfig;
 
 /// Default chunk size — reads per rayon batch. Picked at 1024 from the
@@ -106,9 +110,21 @@ impl BaqSkipCounts {
 pub struct BaqStream<R> {
     reads: R,
     cfg: BaqConfig,
+    /// F1 mismatch-fraction config, applied per read inside the worker.
+    proc_cfg: ReadProcessingConfig,
+    /// Whether to BAQ-cap each read. `false` is the `--no-baq` path:
+    /// G2/F3/F1 still run, but the surviving read is built by
+    /// `prepare_passthrough` (raw base qualities). When `false` no
+    /// per-worker BAQ engine or uppercased-window fetcher is built.
+    apply_baq: bool,
     /// Path to the reference FASTA. Each rayon worker opens its own
     /// `File` from this path on first use; cheap (one open per worker).
+    /// Drives the per-worker BAQ fetcher (uppercased windows).
     fasta_path: PathBuf,
+    /// Shared FASTA repository for the per-worker F3/F1 raw-byte cache
+    /// (case-preserving — see [`RawContigRefCache`]). `Arc`-backed, so
+    /// cloning one per worker is cheap and contig bytes stay shared.
+    repository: fasta::Repository,
     /// Contigs table for `chrom_id → name` resolution. Cloned cheaply
     /// into the rayon closure as a borrowed reference.
     contigs: ContigList,
@@ -122,7 +138,7 @@ pub struct BaqStream<R> {
     pending_next_read: Option<MappedRead>,
     /// Reusable parallel-output buffer; `collect_into_vec` clears and
     /// refills it in place.
-    outcomes_buf: Vec<BaqOutcome>,
+    outcomes_buf: Vec<ReadOutcome>,
     /// Surviving `PreparedRead`s for the current chunk, drained
     /// front-to-back via `pop_front`. Lives on the stream so the
     /// backing buffer survives across refills.
@@ -130,6 +146,13 @@ pub struct BaqStream<R> {
     pending_error: Option<AlignmentInputError>,
     upstream_done: bool,
     skip_counts: BaqSkipCounts,
+    /// G2 rejections (`cigar_is_bad`) tallied in the worker. Rolled
+    /// into `FilterCounts.bad_cigar` by the pipeline; counted here now
+    /// that G2 runs in the read-processing stage rather than the reader.
+    bad_cigar_count: u64,
+    /// F1 rejections (`read_exceeds_mismatch_fraction`) tallied in the
+    /// worker. Rolled into `FilterCounts.high_mismatch_fraction`.
+    high_mismatch_count: u64,
 }
 
 impl<R> BaqStream<R>
@@ -139,10 +162,14 @@ where
     /// Construct a `BaqStream`. Panics if `chunk_size == 0` — a
     /// programmer error in every call site (silently coercing to 1
     /// would mask a misconfigured CLI flag as a perf bug).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reads: R,
         cfg: BaqConfig,
+        proc_cfg: ReadProcessingConfig,
+        apply_baq: bool,
         fasta_path: PathBuf,
+        repository: fasta::Repository,
         contigs: ContigList,
         chunk_size: usize,
     ) -> Self {
@@ -150,7 +177,10 @@ where
         Self {
             reads,
             cfg,
+            proc_cfg,
+            apply_baq,
             fasta_path,
+            repository,
             contigs,
             chunk_size,
             chunk_buf: Vec::new(),
@@ -160,6 +190,8 @@ where
             pending_error: None,
             upstream_done: false,
             skip_counts: BaqSkipCounts::default(),
+            bad_cigar_count: 0,
+            high_mismatch_count: 0,
         }
     }
 
@@ -168,6 +200,20 @@ where
     /// reads `total` here.
     pub fn skip_counts(&self) -> &BaqSkipCounts {
         &self.skip_counts
+    }
+
+    /// G2 (`bad_cigar`) rejections tallied in the read-processing
+    /// stage so far. The pipeline rolls this into
+    /// `FilterCounts.bad_cigar`.
+    pub fn bad_cigar_count(&self) -> u64 {
+        self.bad_cigar_count
+    }
+
+    /// F1 (`high_mismatch_fraction`) rejections tallied in the
+    /// read-processing stage so far. The pipeline rolls this into
+    /// `FilterCounts.high_mismatch_fraction`.
+    pub fn high_mismatch_count(&self) -> u64 {
+        self.high_mismatch_count
     }
 
     fn refill_batch(&mut self) {
@@ -234,32 +280,46 @@ where
         let contig_name: &str = &contig_entry.name;
         let fasta_path: &std::path::Path = &self.fasta_path;
         let cfg = self.cfg;
+        let proc_cfg = &self.proc_cfg;
+        let apply_baq = self.apply_baq;
+        let repository = &self.repository;
+        let contigs = &self.contigs;
 
-        // par_drain consumes the chunk by-value (so `engine.process`
+        // par_drain consumes the chunk by-value (so the per-read fold
         // can move the read's cigar/seq/qname straight into the
         // resulting PreparedRead) while preserving both input order
         // and the chunk_buf's backing capacity. Each rayon worker
-        // builds its own `(BaqEngine, ManualEvictChromRefFetcher)`
-        // pair via `map_init` — no shared state, no Arc, no Mutex.
-        // After processing each read the worker calls
-        // `fetcher.evict_before(read.pos)` so the per-worker buffer
+        // builds its own per-worker scratch via `map_init` — no shared
+        // mutable state. `RawContigRefCache` serves F3/F1's
+        // case-preserving bytes (always); the `(BaqEngine,
+        // ManualEvictChromRefFetcher)` pair serves BAQ's uppercased
+        // windows and is built only when BAQ is enabled. After
+        // processing each read the worker calls
+        // `fetcher.evict_before(read.pos)` so the per-worker BAQ buffer
         // stays at "current-position window plus forward growth";
         // see ManualEvictChromRefFetcher's module-level comment.
         self.chunk_buf
             .par_drain(..)
             .map_init(
                 || {
-                    let fetcher = ManualEvictChromRefFetcher::for_contig(fasta_path, contig_name)
-                        .expect(
-                            "BAQ per-worker fetcher construction failed; \
-                             FASTA path + contig name were validated at BaqStream construction time",
-                        );
-                    (BaqEngine::new(cfg), fetcher)
+                    let baq = apply_baq.then(|| {
+                        let fetcher =
+                            ManualEvictChromRefFetcher::for_contig(fasta_path, contig_name).expect(
+                                "BAQ per-worker fetcher construction failed; FASTA path + \
+                                 contig name were validated at BaqStream construction time",
+                            );
+                        (BaqEngine::new(cfg), fetcher)
+                    });
+                    let raw_ref = RawContigRefCache::new(repository.clone(), contigs.clone());
+                    (baq, raw_ref)
                 },
-                |(engine, fetcher), read| {
+                |(baq, raw_ref), read| {
                     let pos = read.pos;
-                    let outcome = engine.process(read, fetcher);
-                    if let Ok(p) = u32::try_from(pos) {
+                    let baq_args = baq.as_mut().map(|(engine, fetcher)| (engine, fetcher));
+                    let outcome = process_read(read, baq_args, raw_ref, proc_cfg);
+                    if let Some((_, fetcher)) = baq.as_mut()
+                        && let Ok(p) = u32::try_from(pos)
+                    {
                         fetcher.evict_before(p);
                     }
                     outcome
@@ -270,8 +330,12 @@ where
         self.current_batch.clear();
         for outcome in self.outcomes_buf.drain(..) {
             match outcome {
-                BaqOutcome::Capped(p) => self.current_batch.push_back(p),
-                BaqOutcome::Skipped(reason) => self.skip_counts.bump(reason),
+                ReadOutcome::Prepared(p) => self.current_batch.push_back(p),
+                ReadOutcome::Dropped(DropReason::Baq(reason)) => self.skip_counts.bump(reason),
+                ReadOutcome::Dropped(DropReason::BadCigar) => self.bad_cigar_count += 1,
+                ReadOutcome::Dropped(DropReason::HighMismatchFraction) => {
+                    self.high_mismatch_count += 1
+                }
             }
         }
     }

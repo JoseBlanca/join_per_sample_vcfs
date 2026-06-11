@@ -23,6 +23,7 @@ use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
 use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_region_into_writer};
+use crate::pileup::per_sample::read_processor::ReadProcessingConfig;
 use crate::pileup::walker::{RunSummary, WalkerConfig};
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, basename, configure_rayon_pool, current_command_line,
@@ -234,6 +235,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     // 1. Translate CLI → module configs.
     let alignment_cfg = alignment_config_from_args(stage1);
     let baq_cfg = baq_config_from_args(stage1);
+    let proc_cfg = read_processing_config_from_args(stage1);
     let walker_cfg = walker_config_from_args(stage1);
 
     // 2. Size rayon's global pool when --threads is given (idempotent;
@@ -363,8 +365,10 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         let outputs = super::stage1_pipeline::with_stage1_chain::<RunSummary, PileupCliError, _>(
             reader,
             &args.reference,
+            &repository,
             &walker_fetcher,
             baq_cfg,
+            proc_cfg,
             walker_cfg,
             stage1.baq_chunk_size,
             stage1.no_baq,
@@ -433,6 +437,22 @@ pub(crate) fn alignment_config_from_args(
         },
         drop_qc_fail: !args.keep_qc_fail,
         drop_duplicate: !args.keep_duplicates,
+        max_read_mismatch_fraction: if args.max_read_mismatch_fraction == 0.0 {
+            None
+        } else {
+            Some(args.max_read_mismatch_fraction)
+        },
+        mismatch_bq_floor: args.mismatch_bq_floor,
+    }
+}
+
+/// F1 mismatch-fraction config for the parallel read-processing stage.
+/// Drawn from the same `Stage1Args` fields the reader config uses;
+/// these filters moved out of the reader into `read_processor`.
+pub(crate) fn read_processing_config_from_args(
+    args: &shared_args::Stage1Args,
+) -> ReadProcessingConfig {
+    ReadProcessingConfig {
         max_read_mismatch_fraction: if args.max_read_mismatch_fraction == 0.0 {
             None
         } else {

@@ -23,12 +23,13 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-use pop_var_caller::bam::alignment_input::MappedRead;
+use pop_var_caller::bam::alignment_input::{MappedRead, build_fasta_repository};
 use pop_var_caller::bam::errors::AlignmentInputError;
 use pop_var_caller::baq::BaqConfig;
 use pop_var_caller::fasta::{ContigEntry, ContigList, ManualEvictChromRefFetcher};
 use pop_var_caller::pileup::per_sample::baq_engine::{BaqEngine, BaqOutcome};
 use pop_var_caller::pileup::per_sample::baq_stream::{BaqStream, DEFAULT_BAQ_CHUNK_SIZE};
+use pop_var_caller::pileup::per_sample::read_processor::ReadProcessingConfig;
 use pop_var_caller::pileup::walker::CigarOp;
 
 /// Write a single-contig FASTA + `.fai` to `dir`. Contig is `length`
@@ -153,10 +154,19 @@ fn drain_stream(
     contigs: ContigList,
     chunk_size: usize,
 ) -> u64 {
+    // F1 disabled (match-only reads) so this still measures BAQ throughput.
+    let proc_cfg = ReadProcessingConfig {
+        max_read_mismatch_fraction: None,
+        mismatch_bq_floor: 0,
+    };
+    let repository = build_fasta_repository(&fasta_path).expect("repository");
     let stream = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        proc_cfg,
+        true,
         fasta_path,
+        repository,
         contigs,
         chunk_size,
     );

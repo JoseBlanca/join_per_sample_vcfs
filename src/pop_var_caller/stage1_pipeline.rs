@@ -17,12 +17,14 @@
 
 use std::path::Path;
 
+use noodles_fasta as fasta;
+
 use crate::bam::alignment_input::{AlignmentMergedReader, FilterCounts};
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
-use crate::pileup::per_sample::baq_engine::prepare_passthrough;
 use crate::pileup::per_sample::baq_stream::{BaqSkipCounts, BaqStream};
+use crate::pileup::per_sample::read_processor::ReadProcessingConfig;
 use crate::pileup::walker::{self, PileupWalker, PreparedRead, WalkerConfig};
 
 use super::cli::PileupCliError;
@@ -96,8 +98,10 @@ pub struct Stage1Outputs<R> {
 pub fn with_stage1_chain<R, E, F>(
     mut reader: AlignmentMergedReader,
     reference: &Path,
+    repository: &fasta::Repository,
     walker_fetcher: &RepositoryRefFetcher,
     baq_cfg: BaqConfig,
+    proc_cfg: ReadProcessingConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
     no_baq: bool,
@@ -116,89 +120,60 @@ where
     // 2. Reference fetcher for the walker — [`RepositoryRefFetcher`]
     //    reads the walker's reference windows from the same shared
     //    noodles `fasta::Repository` the reader already keeps resident
-    //    (for CRAM decode + the per-read F1/F3 fetch, on both CRAM and
-    //    BAM). It is **injected** by the caller (built once over the
-    //    shared repository) — the walker no longer opens a second,
-    //    independent streaming reader over the same FASTA. Random access
-    //    over a resident contig, so there is no monotonic-forward
-    //    contract to satisfy across region/contig boundaries.
+    //    (for CRAM decode, on both CRAM and BAM). It is **injected** by
+    //    the caller (built once over the shared repository) — the walker
+    //    no longer opens a second, independent streaming reader over the
+    //    same FASTA. Random access over a resident contig, so there is
+    //    no monotonic-forward contract to satisfy across region/contig
+    //    boundaries.
     //
-    //    BAQ builds its own per-rayon-worker
-    //    [`ManualEvictChromRefFetcher`] inside `BaqStream`, so there is
-    //    no shared fetcher between BAQ and the walker (Step 2(c) of the
-    //    `unified_chrom_ref_fetcher` plan walked back: BAQ's parallel
-    //    out-of-order access within a chunk doesn't fit a single shared
-    //    abstraction).
+    //    The read-processing stage (`BaqStream`) builds its own
+    //    per-worker reference access: an uppercased-window
+    //    `ManualEvictChromRefFetcher` for BAQ and a raw-byte
+    //    `RawContigRefCache` (over `repository`) for F3/F1.
 
-    // 3. Build the boxed input iterator + handle for upstream errors,
-    //    drive the closure, then snapshot every branch-local counter
-    //    into a single tuple. Both arms must produce the same tuple
-    //    shape, so a future per-branch counter cannot land in only
-    //    one arm — adding a field forces both arms to update.
-    //    Both branches also converge on `Box<dyn Iterator<Item =
-    //    PreparedRead>>` so the walker has the same concrete type
-    //    either way (see `Stage1Walker`).
-    let (result, baq_skip_counts, stashed_upstream_error): (
-        Result<R, E>,
-        Option<BaqSkipCounts>,
-        Option<AlignmentInputError>,
-    ) = if no_baq {
-        // No-BAQ: passthrough map directly off the reader.
-        let mut adapter = ErrorSheddingAdapter::new(reader.by_ref().map(|r| {
-            r.map(|read| {
-                // PANIC-FREE: `ref_id` is the CRAM-side contig id;
-                // `AlignmentMergedReader` only emits `PreparedRead`s with
-                // a non-negative `ref_id` (mapped reads pass the
-                // pre-walker filter, unmapped reads are dropped
-                // upstream). The cast to `u32` is therefore total
-                // for every value this iterator surfaces.
-                let chrom_id = u32::try_from(read.ref_id).expect("ref_id fits u32");
-                prepare_passthrough(read, chrom_id)
-            })
-        }));
-        let error_handle = adapter.error_handle();
-        let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = walker::run(input, walker_fetcher, &walker_cfg);
-        let ctx = Stage1PipelineContext {
-            walker,
-            sample_name: &sample_name,
-            contigs: &contigs,
-        };
-        let r = f(ctx);
-        // Closure dropped ctx (and walker inside it) — `&mut adapter`
-        // borrow released. Now drop adapter to release `&mut reader`.
-        drop(adapter);
-        let stash = error_handle.take();
-        (r, None, stash)
-    } else {
-        // BAQ-on: reader → BaqStream → adapter → walker.
-        let mut baq_stream = BaqStream::new(
-            reader.by_ref(),
-            baq_cfg,
-            reference.to_path_buf(),
-            contigs.clone(),
-            baq_chunk_size,
-        );
-        let mut adapter = ErrorSheddingAdapter::new(baq_stream.by_ref());
-        let error_handle = adapter.error_handle();
-        let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-        let walker = walker::run(input, walker_fetcher, &walker_cfg);
-        let ctx = Stage1PipelineContext {
-            walker,
-            sample_name: &sample_name,
-            contigs: &contigs,
-        };
-        let r = f(ctx);
-        // Closure dropped walker → `&mut adapter` released. Now drop
-        // adapter → `&mut baq_stream` released. Then snapshot.
-        drop(adapter);
-        let stash = error_handle.take();
-        let skip = Some(*baq_stream.skip_counts());
-        drop(baq_stream);
-        (r, skip, stash)
+    // 3. Build the read-processing stream → error-shedding adapter →
+    //    walker chain, drive the closure, then snapshot the counters.
+    //    One path covers both BAQ and `--no-baq`: the stream applies
+    //    BAQ only when `apply_baq` is set, but runs G2/F3/F1 either way
+    //    (F3 left-alignment is mandatory even under `--no-baq`).
+    let mut read_stream = BaqStream::new(
+        reader.by_ref(),
+        baq_cfg,
+        proc_cfg,
+        !no_baq,
+        reference.to_path_buf(),
+        repository.clone(),
+        contigs.clone(),
+        baq_chunk_size,
+    );
+    let mut adapter = ErrorSheddingAdapter::new(read_stream.by_ref());
+    let error_handle = adapter.error_handle();
+    let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
+    let walker = walker::run(input, walker_fetcher, &walker_cfg);
+    let ctx = Stage1PipelineContext {
+        walker,
+        sample_name: &sample_name,
+        contigs: &contigs,
     };
+    let result = f(ctx);
+    // Closure dropped walker → `&mut adapter` released. Now drop adapter
+    // → `&mut read_stream` released. Then snapshot.
+    drop(adapter);
+    let stashed_upstream_error = error_handle.take();
+    // BAQ skip counts only exist when BAQ ran; G2/F1 rejections are
+    // tallied in the stream in both modes and folded into FilterCounts.
+    let baq_skip_counts: Option<BaqSkipCounts> = (!no_baq).then(|| *read_stream.skip_counts());
+    let stage_bad_cigar = read_stream.bad_cigar_count();
+    let stage_high_mismatch = read_stream.high_mismatch_count();
+    drop(read_stream);
 
-    let filter_counts = *reader.filter_counts();
+    // The reader no longer counts G2/F1 (those filters moved to the
+    // read-processing stage); fold the stage's tallies back in so the
+    // run summary's totals match the old serial path exactly.
+    let mut filter_counts = *reader.filter_counts();
+    filter_counts.bad_cigar += stage_bad_cigar;
+    filter_counts.high_mismatch_fraction += stage_high_mismatch;
 
     // Surface order: if the closure errored AND the source stream had
     // already failed (the `ErrorSheddingAdapter` translated it to
