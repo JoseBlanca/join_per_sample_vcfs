@@ -24,8 +24,22 @@ use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
 use crate::pileup::per_sample::baq_stream::{BaqSkipCounts, BaqStream};
+use crate::pileup::per_sample::read_pipeline::{
+    RawPacket, ReorderReadIter, ResultPacket, StageCounts, produce_packets, run_worker,
+};
 use crate::pileup::per_sample::read_processor::ReadProcessingConfig;
 use crate::pileup::walker::{self, PileupWalker, PreparedRead, WalkerConfig};
+
+/// At or above this `--threads` count, Stage 1 runs the de-barriered
+/// source → workers → reorder → walker pipeline; below it, the inline
+/// bulk-synchronous `BaqStream` (whose coordination is cheaper when
+/// there are too few cores for the pipeline's three roles to overlap).
+const STAGED_MIN_THREADS: usize = 4;
+
+/// Bounded-channel depth per worker for the read pipeline — the same
+/// back-pressure knob the cohort producer uses. Peak in-flight packets
+/// ≈ `QUEUE_DEPTH_PER_WORKER × n_workers`.
+const QUEUE_DEPTH_PER_WORKER: usize = 2;
 
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;
@@ -104,6 +118,7 @@ pub fn with_stage1_chain<R, E, F>(
     proc_cfg: ReadProcessingConfig,
     walker_cfg: WalkerConfig,
     baq_chunk_size: usize,
+    n_threads: usize,
     no_baq: bool,
     f: F,
 ) -> Result<Stage1Outputs<R>, E>
@@ -117,63 +132,86 @@ where
     let sample_name = reader.sample_name().to_string();
     let contigs = reader.contigs().clone();
 
-    // 2. Reference fetcher for the walker — [`RepositoryRefFetcher`]
-    //    reads the walker's reference windows from the same shared
-    //    noodles `fasta::Repository` the reader already keeps resident
-    //    (for CRAM decode, on both CRAM and BAM). It is **injected** by
-    //    the caller (built once over the shared repository) — the walker
-    //    no longer opens a second, independent streaming reader over the
-    //    same FASTA. Random access over a resident contig, so there is
-    //    no monotonic-forward contract to satisfy across region/contig
-    //    boundaries.
-    //
-    //    The read-processing stage (`BaqStream`) builds its own
-    //    per-worker reference access: an uppercased-window
-    //    `ManualEvictChromRefFetcher` for BAQ and a raw-byte
-    //    `RawContigRefCache` (over `repository`) for F3/F1.
+    // Reference fetcher for the walker — [`RepositoryRefFetcher`] reads
+    // the walker's reference windows from the same shared noodles
+    // `fasta::Repository` the reader keeps resident (for CRAM decode).
+    // It is **injected** by the caller (built once over the shared
+    // repository). The read-processing stage builds its own per-worker
+    // reference access: an uppercased-window `ManualEvictChromRefFetcher`
+    // for BAQ and a raw-byte `RawContigRefCache` (over `repository`) for
+    // F3/F1.
 
-    // 3. Build the read-processing stream → error-shedding adapter →
-    //    walker chain, drive the closure, then snapshot the counters.
-    //    One path covers both BAQ and `--no-baq`: the stream applies
-    //    BAQ only when `apply_baq` is set, but runs G2/F3/F1 either way
-    //    (F3 left-alignment is mandatory even under `--no-baq`).
-    let mut read_stream = BaqStream::new(
-        reader.by_ref(),
-        baq_cfg,
-        proc_cfg,
-        !no_baq,
-        reference.to_path_buf(),
-        repository.clone(),
-        contigs.clone(),
-        baq_chunk_size,
-    );
-    let mut adapter = ErrorSheddingAdapter::new(read_stream.by_ref());
-    let error_handle = adapter.error_handle();
-    let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
-    let walker = walker::run(input, walker_fetcher, &walker_cfg);
-    let ctx = Stage1PipelineContext {
-        walker,
-        sample_name: &sample_name,
-        contigs: &contigs,
+    // Run the read-processing stage (G2/F3/F1 + BAQ; passthrough under
+    // `--no-baq`) feeding the serial walker, by one of two topologies
+    // chosen on the thread budget. Both produce the same `(closure
+    // result, stage counts, stashed upstream error, reader-level filter
+    // counts)`, so the snapshot tail below is shared and the choice
+    // cannot change results.
+    let apply_baq = !no_baq;
+    let (result, stage_counts, stashed_upstream_error, reader_filter_counts): (
+        Result<R, E>,
+        StageCounts,
+        Option<AlignmentInputError>,
+        FilterCounts,
+    ) = if n_threads >= STAGED_MIN_THREADS {
+        run_pipelined(
+            reader,
+            reference,
+            repository,
+            walker_fetcher,
+            baq_cfg,
+            proc_cfg,
+            &walker_cfg,
+            baq_chunk_size,
+            apply_baq,
+            n_threads,
+            &sample_name,
+            &contigs,
+            f,
+        )
+    } else {
+        // Inline bulk-synchronous path: reader → BaqStream → adapter →
+        // walker, all driven on this thread.
+        let mut read_stream = BaqStream::new(
+            reader.by_ref(),
+            baq_cfg,
+            proc_cfg,
+            apply_baq,
+            reference.to_path_buf(),
+            repository.clone(),
+            contigs.clone(),
+            baq_chunk_size,
+        );
+        let mut adapter = ErrorSheddingAdapter::new(read_stream.by_ref());
+        let error_handle = adapter.error_handle();
+        let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
+        let walker = walker::run(input, walker_fetcher, &walker_cfg);
+        let ctx = Stage1PipelineContext {
+            walker,
+            sample_name: &sample_name,
+            contigs: &contigs,
+        };
+        let result = f(ctx);
+        drop(adapter);
+        let stash = error_handle.take();
+        let stage_counts = StageCounts {
+            baq_skips: *read_stream.skip_counts(),
+            bad_cigar: read_stream.bad_cigar_count(),
+            high_mismatch: read_stream.high_mismatch_count(),
+        };
+        drop(read_stream);
+        let reader_filter_counts = *reader.filter_counts();
+        (result, stage_counts, stash, reader_filter_counts)
     };
-    let result = f(ctx);
-    // Closure dropped walker → `&mut adapter` released. Now drop adapter
-    // → `&mut read_stream` released. Then snapshot.
-    drop(adapter);
-    let stashed_upstream_error = error_handle.take();
-    // BAQ skip counts only exist when BAQ ran; G2/F1 rejections are
-    // tallied in the stream in both modes and folded into FilterCounts.
-    let baq_skip_counts: Option<BaqSkipCounts> = (!no_baq).then(|| *read_stream.skip_counts());
-    let stage_bad_cigar = read_stream.bad_cigar_count();
-    let stage_high_mismatch = read_stream.high_mismatch_count();
-    drop(read_stream);
 
     // The reader no longer counts G2/F1 (those filters moved to the
     // read-processing stage); fold the stage's tallies back in so the
-    // run summary's totals match the old serial path exactly.
-    let mut filter_counts = *reader.filter_counts();
-    filter_counts.bad_cigar += stage_bad_cigar;
-    filter_counts.high_mismatch_fraction += stage_high_mismatch;
+    // run summary's totals match the old serial path exactly. BAQ skip
+    // counts only exist when BAQ ran.
+    let mut filter_counts = reader_filter_counts;
+    filter_counts.bad_cigar += stage_counts.bad_cigar;
+    filter_counts.high_mismatch_fraction += stage_counts.high_mismatch;
+    let baq_skip_counts: Option<BaqSkipCounts> = apply_baq.then_some(stage_counts.baq_skips);
 
     // Surface order: if the closure errored AND the source stream had
     // already failed (the `ErrorSheddingAdapter` translated it to
@@ -195,6 +233,104 @@ where
         },
         stashed_upstream_error,
     })
+}
+
+/// De-barriered Stage 1 topology: a source thread (owns the reader,
+/// packetises coordinate-sorted reads), `n_threads` worker threads (the
+/// full per-read fold), and the walker on this thread fed by a
+/// sequence-ordered reorder buffer — all wired through bounded
+/// `crossbeam` channels so the stages overlap. Returns the closure
+/// result, the stage's filter tallies, any stashed upstream read error,
+/// and the reader-level filter counts (recovered from the producer
+/// thread). Byte-identical to the inline path: the reorder buffer
+/// restores global coordinate order before the (serial) walker.
+#[allow(clippy::too_many_arguments)]
+fn run_pipelined<R, E, F>(
+    mut reader: AlignmentMergedReader,
+    reference: &Path,
+    repository: &fasta::Repository,
+    walker_fetcher: &RepositoryRefFetcher,
+    baq_cfg: BaqConfig,
+    proc_cfg: ReadProcessingConfig,
+    walker_cfg: &WalkerConfig,
+    baq_chunk_size: usize,
+    apply_baq: bool,
+    n_threads: usize,
+    sample_name: &str,
+    contigs: &ContigList,
+    f: F,
+) -> (
+    Result<R, E>,
+    StageCounts,
+    Option<AlignmentInputError>,
+    FilterCounts,
+)
+where
+    F: FnOnce(Stage1PipelineContext<'_>) -> Result<R, E>,
+{
+    let err_cell = std::sync::Mutex::new(None);
+    let n_workers = n_threads.max(1);
+    let cap = (QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
+    let (pkt_tx, pkt_rx) = crossbeam_channel::bounded::<RawPacket>(cap);
+    let (res_tx, res_rx) = crossbeam_channel::bounded::<ResultPacket>(cap);
+
+    let err_ref = &err_cell;
+
+    let (result, stage_counts, reader_filter_counts) = std::thread::scope(|scope| {
+        // Source thread owns the reader; hands back its final filter
+        // counts (the reader is moved in, so the caller can't read them).
+        let producer = scope.spawn(move || {
+            produce_packets(&mut reader, pkt_tx, err_ref, baq_chunk_size);
+            *reader.filter_counts()
+        });
+
+        // Worker pool: each pulls packets and runs G2/F3/F1 + BAQ.
+        for _ in 0..n_workers {
+            let prx = pkt_rx.clone();
+            let rtx = res_tx.clone();
+            scope.spawn(move || {
+                run_worker(
+                    prx, rtx, baq_cfg, proc_cfg, apply_baq, repository, reference, contigs,
+                );
+            });
+        }
+        // Drop the originals so each channel disconnects once the
+        // producer / all workers finish.
+        drop(pkt_rx);
+        drop(res_tx);
+
+        // Consumer on this thread: reorder → walker → writer (via `f`).
+        let mut reorder = ReorderReadIter::new(res_rx);
+        let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(reorder.by_ref());
+        let walker = walker::run(input, walker_fetcher, walker_cfg);
+        let ctx = Stage1PipelineContext {
+            walker,
+            sample_name,
+            contigs,
+        };
+        let result = f(ctx);
+        // Walker dropped → `reorder` borrow released. Snapshot the
+        // counts, then drop `reorder` (releasing `res_rx`) *before*
+        // joining the producer: if `f` errored without draining, this
+        // disconnects the channels so the workers and producer unblock
+        // from full sends instead of deadlocking the join.
+        let stage_counts = reorder.counts();
+        drop(reorder);
+        let reader_filter_counts = producer
+            .join()
+            .expect("read-pipeline producer thread panicked");
+        (result, stage_counts, reader_filter_counts)
+    });
+
+    let stashed_upstream_error = err_cell
+        .into_inner()
+        .expect("read-pipeline err_cell poisoned");
+    (
+        result,
+        stage_counts,
+        stashed_upstream_error,
+        reader_filter_counts,
+    )
 }
 
 /// Surface-order rule used by [`with_stage1_chain`]: if both the

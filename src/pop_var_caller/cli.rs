@@ -241,6 +241,9 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     // 2. Size rayon's global pool when --threads is given (idempotent;
     //    first caller wins).
     configure_rayon_pool(args.threads).map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
+    // Worker count for the read-processing pipeline: the resolved thread
+    // budget (explicit `--threads`, else rayon's default = all cores).
+    let n_threads = rayon::current_num_threads();
 
     // 3. Load metadata + per-input handles. Index pre-flight runs here:
     //    a missing alignment index is built (with --build-map-file-index)
@@ -371,6 +374,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             proc_cfg,
             walker_cfg,
             stage1.baq_chunk_size,
+            n_threads,
             stage1.no_baq,
             |ctx| {
                 drive_region_into_writer(ctx.walker, &mut writer, region.start, region.end)
