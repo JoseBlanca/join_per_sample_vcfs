@@ -79,11 +79,14 @@ TSV_OUT="${TSV_OUT:-$OUT_ROOT/comparison/accuracy.tsv}"
 mkdir -p "$(dirname "$TSV_OUT")"
 printf 'caller\tclass\ttp\tfp\tfn\tprecision\trecall\tf1\n' > "$TSV_OUT"
 
-# Per-record QUAL of each caller's own calls, labelled TP/FP, for the
-# quality-distribution panels in the dashboard. One row per called
-# variant (so this file is large — thousands of rows).
+# Per-record QUAL (and locus depth DP) of each caller's own calls,
+# labelled TP/FP, for the quality-distribution panels in the dashboard.
+# One row per called variant (so this file is large — thousands of rows).
+# DP is INFO/DP = total read depth at the locus (all three callers emit
+# it); after `norm -m -any` it stays the locus total, which is what the
+# depth-stratified QUAL panels want. Missing DP is written as ".".
 QUAL_TSV="${QUAL_TSV:-$OUT_ROOT/comparison/qual_dist.tsv}"
-printf 'caller\tclass\tstatus\tqual\n' > "$QUAL_TSV"
+printf 'caller\tclass\tstatus\tqual\tdp\n' > "$QUAL_TSV"
 
 printf '%-26s %-7s %7s %7s %7s %9s %9s %7s\n' \
     caller class TP FP FN precision recall F1
@@ -108,11 +111,12 @@ for cls in $CLASSES; do
         local_fp=$(count_records "$isec_dir/0001.vcf")
         local_tp=$(count_records "$isec_dir/0002.vcf")
 
-        # Per-record QUAL, labelled by status, from the caller's own calls.
-        bcftools query -f '%QUAL\n' "$isec_dir/0003.vcf" 2>/dev/null \
-          | awk -v c="$name" -v cl="$cls" '$1!="."{print c"\t"cl"\tTP\t"$1}' >> "$QUAL_TSV"
-        bcftools query -f '%QUAL\n' "$isec_dir/0001.vcf" 2>/dev/null \
-          | awk -v c="$name" -v cl="$cls" '$1!="."{print c"\t"cl"\tFP\t"$1}' >> "$QUAL_TSV"
+        # Per-record QUAL + locus DP, labelled by status, from the
+        # caller's own calls. DP defaults to "." when the field is absent.
+        bcftools query -f '%QUAL\t%INFO/DP\n' "$isec_dir/0003.vcf" 2>/dev/null \
+          | awk -v c="$name" -v cl="$cls" '$1!="."{dp=($2==""?".":$2);print c"\t"cl"\tTP\t"$1"\t"dp}' >> "$QUAL_TSV"
+        bcftools query -f '%QUAL\t%INFO/DP\n' "$isec_dir/0001.vcf" 2>/dev/null \
+          | awk -v c="$name" -v cl="$cls" '$1!="."{dp=($2==""?".":$2);print c"\t"cl"\tFP\t"$1"\t"dp}' >> "$QUAL_TSV"
 
         read -r prec rec f1 < <(awk -v tp="$local_tp" -v fp="$local_fp" -v fn="$local_fn" 'BEGIN{
             p = (tp+fp>0) ? tp/(tp+fp) : 0;
