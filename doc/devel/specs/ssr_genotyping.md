@@ -34,6 +34,22 @@ Defined once here; used unqualified thereafter.
   (no flank), used as a length lower bound for long alleles.
 - **purity** — fraction of the tract matching a perfect motif tiling; 1.0 =
   perfect repeat, < 1.0 = imperfect / interrupted.
+- **allele (here)** — a repeat allele's *identity* is its actual tract
+  **sequence**, not a bare number. Two molecules that differ by a
+  non-motif-multiple amount (e.g. 12 clean repeats vs 12 repeats + 1 bp) are
+  **distinct alleles**. The integer **repeat count** is a *derived coordinate*
+  read off the sequence (used by stutter and the prior), never the identity. See
+  on-ladder / off-ladder.
+- **on-ladder / off-ladder** — an allele is **on-ladder** if its length is a
+  whole-motif multiple of the reference tiling — a clean rung `ref ± k` units; its
+  sequence is fully reconstructible from `(catalog scaffold, k)`, so it is the same
+  allele in every sample by construction. An allele is **off-ladder** if it differs
+  from a clean tiling by a non-motif amount (a 1 bp indel, a partial unit, a
+  *variable* interruption); its sequence is **not** reconstructible from a rung
+  number, so it is carried explicitly. Stutter (§5.2) moves only between on-ladder
+  rungs; an off-ladder allele is a genuine distinct allele, never a stutter
+  product. (A *fixed* interruption shared by the whole population is not off-ladder
+  — it is pinned into the scaffold, §3.1.)
 
 **Tools / file formats**
 
@@ -42,10 +58,20 @@ Defined once here; used unqualified thereafter.
 - **BAM / CRAM** — aligned-read containers (input).
 - **VCF** — Variant Call Format (output). **GFF / BED / TSV** — annotation/tabular
   formats used for the catalog.
-- **Parquet** — columnar storage format for the per-sample evidence table.
-- **psp** — the project's per-sample pileup/evidence artifact ("STR `.psp`"); here
-  the Stage-1 evidence file.
-- **md5** — checksum used to bind artifacts to their reference/catalog.
+- **Parquet** — a generic columnar storage format; considered for the per-sample
+  evidence but **rejected** in favour of the project's `.psp` columnar-block
+  container (§2 / §4.3), which gives positional cross-sample block alignment and
+  finer memory control.
+- **`.psp` / `.snp.psp` / `.ssr.psp`** — the project's bespoke columnar-block
+  evidence container. One shared format (genomic-window blocks, per-column zstd, CSR
+  ragged columns, tail block index, TOML header), two schemas: `.snp.psp` for the
+  SNP/indel caller, `.ssr.psp` for this one. The `kind` header field is the
+  authoritative schema tag; the extension is convenience.
+- **md5** — checksum binding artifacts to their reference/catalog. `reference_md5`
+  is the md5 of the reference's **concatenated, upper-cased sequence** (per-contig in
+  contig order — the same content convention as CRAM's per-contig `M5`), *not* the
+  file bytes, so it is invariant to FASTA line-wrapping and (de)compression.
+  `catalog_md5` is over the catalog's data rows (post-`#` header).
 
 **Methods / statistics**
 
@@ -90,8 +116,20 @@ from aligned short reads (BAM/CRAM)**, producing **per-individual repeat-allele
 lengths (copy numbers)** across a cohort, for **population genetics, diversity,
 GWAS and breeding**.
 
-It is a **length genotyper**: the genotype at a locus is a multiset of integer
-repeat counts, not a base substitution.
+It is a **length genotyper**: the genotype at a locus is a multiset of repeat
+**alleles**, not a base substitution. An allele's *identity* is its actual tract
+**sequence** — so two molecules differing by a non-motif-multiple amount (12 clean
+repeats vs 12 repeats + 1 bp) are distinct alleles, the way HipSTR represents them.
+Its integer **repeat count** is a *derived coordinate* read off that sequence,
+used by the stutter model (§5.2) and the population prior (§5.5) but never as the
+allele's identity. The reason is cross-sample comparison: Stage 2 must decide when
+two samples carry "the same" allele, and the integer count is not a faithful key
+(it collapses 12 and 12+1 bp onto the same number) — only the sequence is. Most
+alleles are **on-ladder** (clean rungs of the integer ladder) and are stored
+compactly as a rung number whose sequence is reconstructible from the catalog
+scaffold; the minority that are **off-ladder** carry their sequence explicitly
+(the *hybrid* representation, §4.2/§4.3). See the glossary entries for
+*allele (here)* and *on-ladder / off-ladder*.
 
 ### 1.1 Two independent callers from one BAM (foundational)
 
@@ -138,35 +176,55 @@ on both sides give exact lengths; this is the precise evidence and the
 precision-first choice. Alleles longer than the read are systematically missed
 (acceptable under a precision-first mandate; most plant SSR markers are short).
 A cheap in-paradigm extension — **merging overlapping read pairs** into longer
-fragments — is allowed to raise the spanning ceiling. The beyond-read-length read
-classes (flanking / in-repeat / insert-size, à la GangSTR) are **deferred**
-(§12).
+fragments — is allowed to raise the spanning ceiling, but it is **not free**: the
+overlap must be merged into a consistent base-quality model (combined quals where
+mates agree, conflict handling where they disagree), and a chimeric/mis-paired merge
+*inside the repeat* fabricates a false length — so merged fragments need the same
+slow-path scrutiny (§4.2) as soft-clipped reads, not a blind concatenation. The
+beyond-read-length read classes (flanking / in-repeat / insert-size, à la GangSTR)
+are **deferred** (§12).
 
 ---
 
 ## 2. Architecture
 
 Three pipeline stages plus a test simulator. Stages 1–2 reproduce the project's
-two-stage `pileup → .psp → var-calling` pattern: heavy per-sample work once,
+two-stage `pileup → .snp.psp → var-calling` pattern: heavy per-sample work once,
 summarised to a columnar artifact, then a light cohort math stage.
 
 ```
 reference FASTA ──► [Stage 0: catalog builder] ──► catalog (.ssr_catalog.bed.gz)
                                                         │
 BAM/CRAM (per sample) ─┐                                ▼
-                       └─► [Stage 1: per-sample extract] ──► evidence (.parquet, one per sample)
+                       └─► [Stage 1: per-sample extract] ──► evidence (.ssr.psp, one per sample)
                                                         │
                                                         ▼
                               [Stage 2: cohort genotyping] ──► VCF (allele lengths, GangSTR-compatible)
 ```
 
-**Self-describing artifacts (unifying rule):** every artifact carries its own
-metadata — the catalog in a `##` header, the evidence in the Parquet footer, the
-VCF in `##` headers. No sidecar files.
+**Reuse the `.psp` columnar-block container (not Parquet).** The per-sample evidence
+uses the **same bespoke columnar-block format the SNP/indel caller's `.psp` already
+uses**, abstracted into a shared container that both callers ride on. The SNP/indel
+schema becomes `.snp.psp`, the SSR schema `.ssr.psp` — same container, two column
+registries (the `kind` header field carries the authoritative schema identity; the
+extension is human/glob convenience). We chose this over Parquet deliberately: it
+gives **genomic-window-aligned blocks across samples** (Parquet's byte-sized row
+groups can't align positionally), full control of the decode unit and memory
+(`--block-window-bp`), and reuse of battle-tested read/write/index/compression code.
+The cost — no third-party-tool interop on an internal intermediate, and one extra
+column registry to maintain — is acceptable. (See §4.3; structural placement in §11.)
 
-**Locus identity** is positional: the catalog defines the row universe and order;
-each per-sample evidence file has exactly one row per catalog locus in catalog
-order, so the cohort stage is a synchronized N-file scan.
+**Self-describing artifacts (unifying rule):** every artifact carries its own
+metadata — the catalog in a `##` header, the evidence in the `.psp` TOML header,
+the VCF in `##` headers. No sidecar files.
+
+**Locus identity** is positional **by coordinate**, not by row index: the catalog
+defines the locus universe; each per-sample evidence file is **sparse**
+(no-coverage loci are simply absent) and is keyed by `(chrom, start)` through the
+`.psp` block index. The cohort stage is a synchronized scan that **merges by
+coordinate** across the N files — the genomic-window block grid makes every
+sample's blocks cover the same intervals, so the merge is block-aligned with no
+dense empty rows.
 
 ---
 
@@ -214,6 +272,13 @@ chrom   start   end   motif   purity
   `class` (perfect/imperfect) = threshold(purity), perfect ⇔ purity = 1.0;
   `locus_id` = f(chrom,start,motif). Cross-file linkage is **positional**; the VCF
   `ID` is constructed at output.
+- **Reference allele identity is the reference tract sequence** (the bases of
+  `[start, end)`), not `ref_copies`. For an **imperfect** locus `(end − start)` is
+  generally *not* a multiple of `period`, so `ref_copies` is **fractional** — it is
+  a derived annotation only (rounded for the VCF integer field, §5.9), never the
+  reference allele's identity. The integer ladder Stage 1/2 work on is anchored on
+  this reference sequence as the scaffold; the fractional remainder is carried as
+  fixed scaffold context, not as a ladder rung (§4.2).
 - `purity` is retained only because Stage 2 may use it for confidence weighting;
   it may be dropped if it ends up a build-time filter only.
 
@@ -239,20 +304,30 @@ Two distinct measurements:
 ## 4. Stage 1 — Per-sample evidence extraction
 
 For each catalog locus, read the BAM and emit a compact, **stutter-free**
-per-read length-likelihood summary — the "STR `.psp`".
+per-read length-likelihood summary — the per-sample `.ssr.psp` evidence file.
 
 ### 4.1 Read handling
 
 - Pull reads overlapping `[locus − flank, locus + flank]` (noodles).
-- **Use the full read sequence including soft-clipped bases.** The aligner
-  soft-clips exactly the bases carrying a non-reference allele length; naive CIGAR
-  parsing of the aligned span silently undercounts large alleles. Anchor on the
-  original alignment, then re-examine the whole read.
-- A read is **spanning** if it crosses the tract with ≥ `MIN_FLANK_BP` clean
-  matched bases on both sides; otherwise it is flanking / in-repeat and is counted
-  but (spanning-only scope) not used for the length likelihood in v1.
+- **Use the full read sequence including soft-clipped bases.** When a read carries
+  an allele longer than the *reference*, the aligner cannot place the extra repeat
+  units and often **soft-clips** them — pushing one flank *into the clip*, so naive
+  CIGAR parsing of the aligned span silently undercounts large alleles. Anchor on the
+  matched side, then **realign the clipped side** to recover where the tract ends and
+  the flank resumes. This recovery is a **slow-path** operation (§4.2), not a count
+  off the CIGAR — and it doubles as the test that the clip is a real long allele (it
+  realigns to extra units + a clean flank) rather than junk (adapter / low-quality
+  end, which yields no clean flank).
+- **Spanning is a property of the read's recovered *content*, not its CIGAR.** A read
+  is **spanning** if its sequence carries ≥ `MIN_FLANK_BP` clean flank on **both**
+  sides of the full tract — whether those flank bases were *aligned* or *recovered
+  from a soft-clip*. So a soft-clipped read whose clip yields a clean flank **is**
+  spanning and carries a real long allele; only when the clip yields **no** clean
+  flank does the allele run off the read end ("allele ≥ read length") and the read is
+  counted but not used for the length likelihood — the §1.4 scope boundary.
+  Otherwise-non-spanning reads are flanking / in-repeat: counted, not used in v1.
 
-### 4.2 Qᵣ(L) — the per-read length likelihood (two-tier)
+### 4.2 Qᵣ — the per-read allele likelihood (two-tier; on-ladder + off-ladder)
 
 **Reads fall into two natural classes, which is why the likelihood is computed
 two ways.** For many reads the repeat count is unambiguous: the read clearly
@@ -265,24 +340,55 @@ quality near a boundary makes the last unit uncertain, or the read only partiall
 covers the tract. For these, no single length is defensible — the honest answer
 is a *distribution* over plausible lengths. The fast path handles the first class
 by direct counting; the slow path handles the second by full probabilistic
-realignment.
+realignment. A subset of the ambiguous class is not fuzzy at all but cleanly
+**off-ladder** — the read supports a definite sequence that simply is not a clean
+rung (an in-frame count plus a 1 bp indel, a partial unit, a variable
+interruption); the slow path emits that sequence as its own allele rather than
+forcing it onto the nearest rung.
 
-`Qᵣ(L)` is the likelihood the read came from a molecule of repeat length `L`
-units, under **sequencing/alignment error only** — stutter is *not* applied here
-(it is learned and applied in Stage 2). Both tiers realign against candidate-length
-haplotypes `H_L = outer_flank + (motif × L) + inner_context` (flanks/motif from
-catalog + reference) to **escape reference bias**.
+`Qᵣ(·)` is the likelihood the read came from a given **candidate allele**, under
+**sequencing/alignment error only** — stutter is *not* applied here (it is learned
+and applied in Stage 2). Candidates are *sequences*, in two families:
 
-- **Fast path — flank-anchored exact motif count.** A read qualifies iff it spans
-  with ≥ `MIN_FLANK_BP` clean flanks on both sides, its tract is a pure integer
-  motif tiling with no interior sequencing indel, and boundary base-quality ≥
-  `MIN_BASE_QUAL`. → a confident length `L*` (+ weight). Handles the bulk in
-  O(read length).
-- **Slow path — banded pair-HMM forward.** For impure / ambiguous reads (anything
-  failing the fast-path test, bundled as `AMBIGUITY_THRESHOLD`), compute a forward
-  (sum-over-alignments) score against `H_L` for `L ∈ [count − W, count + W]`
-  (`W = STUTTER_WINDOW_UNITS`). → a real `Qᵣ(L)` distribution. **Forward, not
-  max** (true likelihood, honest ambiguity).
+- **on-ladder** — the integer ladder of clean tilings `H_L = outer_flank + (motif ×
+  L) + inner_context` for `L` near the observed count (flanks/motif from catalog +
+  reference). The ladder is catalog-defined, hence **identical across all samples**,
+  and is the spine every read is scored against. An on-ladder candidate is
+  identified by its rung `L` alone (its sequence is reconstructible from the
+  scaffold).
+- **off-ladder** — an *actual* tract sequence a read supports that is **not** a
+  clean rung. It is identified by its sequence, carried as a **normalized** delta
+  from the reference tract (canonical left-aligned form, reusing the SNP caller's
+  indel-normalization discipline so the *same* off-ladder allele in two samples
+  gets the *same* key — this is what makes the §5.1 cohort union work).
+
+Both families are realigned against to **escape reference bias**. We do **not**
+assemble haplotypes across reads (HipSTR does): an off-ladder allele is captured
+only when at least one read supports its sequence cleanly enough to emit it. An
+off-ladder allele present in the whole cohort *only* in error-buried form is
+missed — an accepted precision-first **sensitivity** limit, not an
+identity/comparison limit (every *emitted* off-ladder sequence is reconciled across
+samples in §5.1).
+
+- **Fast path — flank-anchored exact motif count.** A read qualifies iff both flanks
+  are **cleanly aligned** (matched, ≥ `MIN_FLANK_BP`, no soft-clip on either side),
+  its tract is a pure integer motif tiling with no interior sequencing indel, and
+  boundary base-quality ≥ `MIN_BASE_QUAL`. → a confident on-ladder length `L*`
+  (+ weight). A fast-path read is on-ladder by construction (a pure tiling is a clean
+  rung). Handles the bulk in O(read length). A **soft-clipped read never qualifies**
+  (a clipped flank is not matched), so it falls to the slow path — which is where its
+  length is recovered (§4.1).
+- **Slow path — banded pair-HMM forward.** For impure / ambiguous reads **and
+  soft-clip-recovered spanning reads** (anything failing the fast-path test, bundled
+  as `FAST_PATH_GATE`), compute a forward (sum-over-alignments) score against
+  `H_L` for `L ∈ [count − W, count + W]` (`W = STUTTER_WINDOW_UNITS`), where `count`
+  is the *recovered* repeat count — for a soft-clipped read, the realignment of the
+  clip establishes it, so the window centres on the true (possibly large) length, not
+  the reference. → a real `Qᵣ(L)` distribution. **Forward, not max** (true likelihood,
+  honest ambiguity); a cleanly-long soft-clipped read simply yields a sharply-peaked
+  `Qᵣ`. If the read's best alignment is **off-ladder** (its consensus tract is a
+  definite non-rung sequence), it *also* emits that normalized off-ladder sequence as
+  a candidate with its forward score, so Stage 2 treats it as a distinct allele.
   - **Base-error model:** Dindel/Albers — a 3-state pair-HMM (Match/Insertion/
     Deletion), per-base-quality emissions
     (`match = 1 − 10^(−Q/10)`, `mismatch = (10^(−Q/10))/3`), affine gaps for
@@ -311,9 +417,18 @@ sparse distribution, never a dense vector:
   and usually ≪ 2W + 1** (typically the 1–3 lengths with real mass). These are
   the only reads written individually, in the `amb_*` CSR columns
   (`amb_read_offsets` gives each read's variable-length slice).
+- **Off-ladder reads store a sequence — symmetrically to the on-ladder regimes.**
+  When a slow-path read supports an off-ladder allele, its normalized sequence
+  delta enters the locus-level off-ladder list (`offl_seqs`); confident off-ladder
+  reads collapse to an `(offl_seq → count)` tally (`offl_counts`, the off-ladder
+  analogue of the histogram), and a read genuinely ambiguous *between* an off-ladder
+  sequence and ladder rungs carries its off-ladder leg in the `offl_amb_*` CSR.
+  These columns are **empty at the vast majority of loci**, so the cost is paid only
+  where real off-ladder signal exists.
 
-So: one stored length for the confident majority (aggregated, not per-read), and
-a short sparse `(length, log-lik)` list for each genuinely ambiguous read.
+So: one stored length for the confident on-ladder majority (aggregated, not
+per-read), a short sparse `(length, log-lik)` list for each genuinely ambiguous
+read, and a normalized sequence for the rare off-ladder allele.
 
 > **Naming note:** `STUTTER_WINDOW_UNITS` sizes the candidate-`L` range even
 > though Stage 1 is stutter-free — the window must be wide enough to cover
@@ -321,25 +436,50 @@ a short sparse `(length, log-lik)` list for each genuinely ambiguous read.
 > stutter kernel against. The window bounds *which lengths get a likelihood*, not
 > a stutter computation here.
 
-Performance is negligible (sparse loci, most reads fast-path) next to the
-whole-genome alignment already paid for the BAM.
+**Cost — expected cheap, but to be measured, not asserted.** The relevant baseline
+is Stage 1's *own* wall time (and the per-sample SNP pileup it parallels) — **not**
+the whole-genome alignment, which was paid once upstream and never re-paid, so it is
+no yardstick. Cost = `BAM/CRAM decode over covered regions` + per-read work
+(`O(read length)` counting on the fast path; a banded pair-HMM forward over `2W+1`
+haplotypes × band × read length on the slow path). We *expect* it cheap — catalog
+loci are sparse (a small fraction of the genome, unlike the every-position pileup)
+and most reads fast-path — but the **slow-path fraction is the driver**, and it rises
+on repeat-rich / impure genomes (the very target of an STR caller) and with soft-clip
+recovery (every soft-clipped long-allele read is slow-path, §4.1). So Stage-1
+throughput is a claim to **benchmark on a repeat-rich genome** — reporting Stage-1
+wall, the fast/slow read split, and the slow-path share — not to assert.
 
-### 4.3 Evidence format (per-sample Parquet)
+### 4.3 Evidence format (per-sample `.ssr.psp`)
 
-**Parquet, one file per sample, a single table, exactly one row per catalog
-locus in catalog (genomic) order — including no-coverage loci as zero/empty
-rows** (they compress to ~nothing). Two invariants:
+**The shared `.psp` columnar-block container (§2), one file per sample, with the
+SSR column registry below.** One **record per covered locus** — the file is
+**sparse**: no-coverage loci are simply absent (no dense empty rows). Records are
+grouped into **blocks on the genomic-window grid** (`--block-window-bp`), blocks
+never cross a chromosome, and a tail-mounted **block index**
+`(chrom, first_start, last_end, n_records, offset)` makes the file seekable. Two
+invariants:
 
-- **Synchronized scan:** row `i` is the same locus in every sample → Stage 2 reads
-  row `i` across all files, no join/merge.
-- **Position query:** rows sorted by `(chrom, start)` → Parquet row-group min/max
-  + page index prune to row groups (no tabix). Optional `contig → row-group range`
-  footer map for O(1) seek.
+- **Coordinate-merge scan:** Stage 2 opens the N files and merges records by
+  `(chrom, start)`. Because every sample uses the same window grid, blocks cover the
+  same intervals, so the merge is **block-aligned** — the sparse analogue of a
+  synchronized scan, with no join index and no empty rows.
+- **Region query:** binary-search the block index for the first block overlapping
+  `[start, end)`, decode forward until past it (`ssr-genotype --regions`). The index
+  keys on **interval** extent — `last_end`, not `last_start` — so a locus that
+  starts before a query window but extends into it is not missed (the point-vs-
+  interval difference from the SNP `.psp`, whose records are points).
+
+The columns below are the SSR registry; they map onto the container's encodings —
+scalars as fixed/varint columns, the per-locus lists (`hist_*`, `amb_*`, `offl_*`)
+as the container's **CSR ragged columns**, and `chrom`/`offl_seqs` strings via its
+dictionary/bytes columns. Types shown are logical. Each column is independently
+zstd-framed, so a reader decodes only the columns a pass needs (column-selective
+decode).
 
 | column | type | notes |
 |---|---|---|
 | `chrom` | dict&lt;string&gt; | contig |
-| `start` | int32 | 0-based tract start; rows sorted by (chrom,start) |
+| `start` | int32 | 0-based tract start; records in `(chrom, start)` order (the block-grid key) |
 | `end` | int32 | tract end (exclusive) |
 | `depth` | int32 | total reads at locus |
 | `n_spanning` | int32 | usable spanning reads |
@@ -348,22 +488,41 @@ rows** (they compress to ~nothing). Two invariants:
 | `n_filtered` | int32 | low-mapq / dup / clipped |
 | `n_flank_indel` | int32 | |
 | `mapped_reads` | int32 | for normalized-depth QC |
-| `hist_lengths` | list&lt;int16&gt; | distinct observed allele lengths (repeat units), ascending |
-| `hist_counts` | list&lt;int32&gt; | confident-read count per length (parallel) |
-| `hist_weight` | list&lt;float32&gt; | optional base-qual aggregate per length |
+| `hist_lengths` | list&lt;int16&gt; | distinct observed **on-ladder** allele lengths (repeat units), ascending |
+| `hist_counts` | list&lt;int32&gt; | confident-read count per on-ladder length (parallel) |
+| `hist_weight` | list&lt;float32&gt; | optional base-qual aggregate per on-ladder length |
 | `amb_read_offsets` | list&lt;int32&gt; | CSR prefix offsets for ambiguous reads (len = n_amb + 1) |
-| `amb_lengths` | list&lt;int16&gt; | flattened per-read candidate lengths |
+| `amb_lengths` | list&lt;int16&gt; | flattened per-read candidate **on-ladder** lengths |
 | `amb_logliks` | list&lt;float32&gt; | flattened **stutter-free** log-liks (parallel) |
+| `offl_seqs` | list&lt;string&gt; (dict) | distinct **off-ladder** allele sequences at this locus, as normalized deltas vs the ref tract, canonical order; empty when none |
+| `offl_counts` | list&lt;int32&gt; | confident off-ladder read count per sequence (parallel to `offl_seqs`) |
+| `offl_weight` | list&lt;float32&gt; | optional base-qual aggregate per off-ladder sequence (parallel) |
+| `offl_amb_offsets` | list&lt;int32&gt; | CSR offsets for ambiguous reads carrying off-ladder mass (len = n_offl_amb + 1) |
+| `offl_amb_idx` | list&lt;int32&gt; | flattened index into `offl_seqs` per ambiguous-read off-ladder candidate |
+| `offl_amb_logliks` | list&lt;float32&gt; | flattened **stutter-free** log-liks (parallel) |
 
-Confident reads collapse to the `(length → count)` histogram; genuinely bimodal
-reads carry an explicit sparse `Qᵣ(L)` profile in the `amb_*` CSR columns (in
-v1, not deferred). Footer key-value metadata: `schema_version, sample_name,
-reference_md5, catalog_md5, n_loci, ploidy, extraction_params{MIN_FLANK_BP,
-MIN_BASE_QUAL, AMBIGUITY_THRESHOLD, STUTTER_WINDOW_UNITS, AMB_LL_DROP},
-tool_version` + a
-contig name↔id table. Write knobs: sort by `(chrom,start)`; row-group ≈ a few ×
-10⁴ loci; page index; ZSTD. All stored likelihoods are **stutter-free**; lengths
-are `int16` repeat units.
+The `offl_*` block mirrors the on-ladder block exactly — `offl_seqs`/`offl_counts`
+↔ `hist_lengths`/`hist_counts` (confident tally) and `offl_amb_*` ↔ `amb_*`
+(per-read sparse profile) — the only difference being that an off-ladder allele is
+keyed by a **normalized sequence** rather than an integer rung. The exact column
+split is an implementation detail; the invariant is that every read's likelihood is
+expressible over {its on-ladder window rungs} ∪ {the off-ladder sequences it
+supports}.
+
+Confident on-ladder reads collapse to the `(length → count)` histogram; genuinely
+bimodal reads carry an explicit sparse `Qᵣ(L)` profile in the `amb_*` CSR columns
+(in v1, not deferred); off-ladder alleles are stored symmetrically in the `offl_*`
+columns and are empty at the vast majority of loci. **TOML header** (human-readable;
+the container's, not a binary footer): `kind = "ssr"`, `container_version`,
+`schema_version`, `sample_name`, `reference_md5`, `catalog_md5`, `ploidy`,
+`extraction_params{MIN_FLANK_BP, MIN_BASE_QUAL, FAST_PATH_GATE,
+STUTTER_WINDOW_UNITS, AMB_LL_DROP}`, `tool_version`, and a contig name↔id table.
+`kind`/`schema_version` are authoritative (the filename is convenience);
+`container_version` versions the shared format **independently** of the SSR schema,
+so it and the `.snp.psp` schema evolve without lockstep. Write knobs:
+`--block-window-bp` (the decode unit and the primary memory lever, as on the SNP
+path); per-column ZSTD. All stored likelihoods are **stutter-free**; on-ladder
+lengths are `int16` repeat units.
 
 ---
 
@@ -374,12 +533,14 @@ posteriors, biased toward precision.
 
 ### 5.1 Generative model (per locus ℓ)
 
-1. **Population allele frequencies `π = (π_a)` over candidate allele lengths.** At
-   this locus an allele *is* a repeat length (10 units, 11, 12, …); the candidate
-   lengths are the plausible ones. `π_a` is the fraction of chromosomes in the
-   cohort carrying length `a`, so `π` is a probability distribution over those
-   lengths (`π_a ≥ 0`, `Σ_a π_a = 1`). It is one of the two unknowns Stage-2 EM
-   estimates (§5.4) and the root of the hierarchy: `π` → genotype (2) → reads (3).
+1. **Population allele frequencies `π = (π_a)` over the candidate allele set.** At
+   this locus an allele is a **sequence** — in practice a repeat length on the
+   integer ladder (10 units, 11, 12, …) for the on-ladder majority, plus any
+   **off-ladder** sequences the cohort emitted (§4.2). `π_a` is the fraction of
+   chromosomes in the cohort carrying allele `a`, so `π` is a probability
+   distribution over the candidate set (`π_a ≥ 0`, `Σ_a π_a = 1`). It is one of the
+   two unknowns Stage-2 EM estimates (§5.4) and the root of the hierarchy: `π` →
+   genotype (2) → reads (3). The candidate set is assembled before EM — see below.
 2. Sample `s` draws genotype `G_s` = multiset of `ploidy` alleles under the
    **inbreeding-adjusted prior** `P(G_s | π, F_s)` (§5.3).
 3. **Read `r` in `s` is born in three steps.** *(a)* It comes off one physical
@@ -397,6 +558,72 @@ posteriors, biased toward precision.
 `P(reads_s | G_s) = Πᵣ [ (1/ploidy)·Σ_{a∈G_s} P(read_r | a, θ) ]`, with
 `P(read_r | a, θ) = Σ_L Qᵣ(L)·S_θ(L | a)` — the convolution of the stutter-free
 Stage-1 likelihood with the stutter kernel. **Stutter lives entirely in Stage 2.**
+The sum runs over the molecule lengths `L` reachable from allele `a` by whole-unit
+slippage, *in `a`'s own frame*: if `a` is on-ladder, those `L` are on-ladder rungs
+(`amb_*`); if `a` is off-ladder, they are the off-ladder sequences sharing `a`'s
+remainder (`offl_*`). An off-ladder candidate a read has no support for contributes
+negligibly to that read's likelihood automatically — no special-casing.
+
+**Candidate allele set `A_ℓ` — the cohort union (assembled before EM).** The
+per-locus candidate set is built by the same synchronized N-file scan the cohort
+stage already does, from the **cohort-aggregate** on-ladder length profile (per-rung
+sum of all samples' `hist_*`/`amb_*` support) plus the off-ladder sequences:
+
+```
+A_ℓ  =  { on-ladder rungs that are a LOCAL MAXIMUM of the cohort-aggregate profile
+          (support ≥ both neighbours),  OR  adjacent (±1 unit) to such a maximum }
+     ∪  { supported off-ladder sequences,
+          unioned across samples by their normalized key (§4.2) }
+```
+
+Only evidenced rungs are eligible; a rung no read anywhere supports is never a
+candidate (there is no assembly — the precision-first sensitivity limit of §4.2).
+The off-ladder union by normalized key makes one biological off-ladder allele one
+candidate, not one-per-sample; off-ladder alleles are kept whenever supported (they
+cannot be in-frame stutter of an on-ladder allele, so they are their own peaks).
+This is the Stage-2 analogue of HipSTR's cross-sample candidate assembly, by
+sequence-key union rather than pooling raw reads — forbidden (§5.2) because it would
+confuse one sample's stutter ladder with population length variation. `π`, the
+genotype space (integer partitions of ploidy over `A_ℓ`), and the convolution above
+are all defined over this `A_ℓ`.
+
+**The peak + adjacent rule — pruning only the *unambiguous* stutter.** A length
+profile is peaks (true alleles) on decaying stutter shoulders. The rule keeps every
+peak and every rung within one unit of a peak, pruning the rest — *without ever
+having to tell a real allele from a stutter satellite*, which is impossible from the
+profile shape alone (a skewed adjacent het `a`/`a+1` puts a real allele at `a+1`
+that is **not** a local maximum — topologically identical to a +1 stutter satellite).
+The two clauses divide the labour:
+
+- **Local-maximum clause** keeps a real allele ≥2 rungs from a bigger one — it forms
+  its *own* peak (a real `a+2` is above `a+1` and `a+3`).
+- **±1-adjacent clause** keeps the one case the peak clause structurally cannot: a
+  real allele exactly one repeat from a bigger one. It is kept **unconditionally**,
+  and whether it is a rare real allele or a stutter satellite is left to the EM,
+  which *can* resolve it (shared kernel + population recurrence, §5.4) where the
+  profile shape cannot.
+- **Everything pruned** is then a non-peak rung ≥2 from every peak — an
+  *unambiguous* stutter tail or inter-peak valley, where a real allele could not live
+  without either peaking or being adjacent to a peak.
+
+Crucially, pruning a rung drops it as a genotype *candidate* but **not its reads**: a
+read at a pruned `a+2` rung still enters `P(read | a) = Σ_L Qᵣ(L)·S_θ(L | a)` as a +2
+slip of the kept peak, so the stutter kernel still sees the full ladder — only the
+disbelieved genotype hypothesis is removed. The single real-allele class this can
+lose is one that is *both* not a peak *and* ≥2 rungs from every peak anywhere in the
+cohort — permanently buried in a stutter tail at the sensitivity floor: a small,
+documented precision-first recall trade (an extension of the §4.2 no-assembly limit).
+Peak detection runs on the cohort-*aggregate* profile so **population recurrence**
+protects real alleles; an allele carried by very few samples is the sensitivity edge
+(admitting per-sample peaks is the escape hatch if data show it matters — deferred).
+
+**Bounding cost — hard cap, precision-first.** The genotype space is the integer
+partitions of ploidy over `|A_ℓ|` (§5.7), which blows up at a hypervariable locus ×
+high ploidy — and there the many candidates are genuine *peaks*, so the peak rule
+does not shrink them. The backstop is a hard cap `MAX_CANDIDATE_ALLELES`: if `|A_ℓ|`
+exceeds it, **no-call the locus and log it** (never a silent top-K truncation — a
+genotype over a clipped allele set is not trustworthy, and hypervariable loci are
+where genotyping is least reliable anyway).
 
 ### 5.2 Stutter model `S_θ`
 
@@ -434,12 +661,26 @@ S_θ(δ) =  1 − u − d              δ = 0   (faithful copy — most reads)
   exactly `δ` units (geometric)"; the `δ < 0` branch is the mirror image with `d`.
   The three branches sum to 1 over all `δ` — it is a proper distribution.
 
-**Only in-frame.** The kernel moves probability *only* in whole-unit steps,
-because slippage re-registers on the repeat period. A length change that is **not**
-a multiple of the motif (e.g. a 1 bp indel inside a trinucleotide tract) is **not**
-stutter — it is a sequencing/replication base error, and was already accounted for
-by the Stage-1 `Qᵣ(L)` term (§4.2). Splitting them this way keeps each noise source
-in exactly one place.
+**Only in-frame — and what a non-multiple change means.** The kernel moves
+probability *only* in whole-unit steps, because slippage re-registers on the repeat
+period (HipSTR additionally carries a small *out-of-frame*, bp-step term; we fold
+that into the cases below rather than model it as stutter — a deliberate
+simplification, see §12). A length change that is **not** a multiple of the motif —
+e.g. a 1 bp indel inside a trinucleotide tract — is **not** stutter, but it splits
+into two distinct things that must not be confused:
+
+- **A per-read, non-recurrent non-multiple change is a sequencing/replication base
+  error.** It is already accounted for by the Stage-1 `Qᵣ` term (§4.2) and never
+  becomes an allele.
+- **A recurrent non-multiple change is a real, heritable off-ladder allele.** It is
+  its own candidate in `A_ℓ` (§5.1), with its own in-frame stutter ladder in its own
+  frame. It is *not* a stutter satellite of the nearest on-ladder allele.
+
+The discriminator is **recurrence**: an error appears sporadically in single reads;
+an off-ladder allele recurs across reads and samples at a stable frequency (the same
+population-vs-stutter logic the identifiability argument uses, §5.4). Splitting them
+this way keeps each phenomenon in exactly one place: transient error in Stage-1 `Qᵣ`,
+in-frame slippage in `S_θ`, and heritable off-ladder variation in `π` over `A_ℓ`.
 
 **`θ` is covariate-parameterised**, predicted per allele:
 `θ = θ(period, allele_length, motif, purity)`. This is biology, not bookkeeping —
@@ -448,6 +689,21 @@ tracts slip more), is highest for **short periods** (mononucleotide runs are the
 worst, hexamers mild), varies by **motif** (`AT` vs `GC` content), and falls with
 **purity** (interruptions arrest slippage). So `(u, d, ρ)` are *functions* of these
 covariates rather than one global triple.
+
+**Pooling is a deliberate tradeoff, strongest for *pure* loci.** Three prior tools
+bracket the design space (verified against the vendored sources): **GangSTR** uses
+one fixed global triple (`0.05, 0.05, 0.9`) with an optional per-locus override
+table — robust but blind to real variation; **HipSTR** estimates a *separate* triple
+per locus by EM — captures everything locus-specific but is data-hungry and noisy at
+low depth; **popSTR2** (our approach) regresses the triple on covariates and pools
+across loci — borrows strength, robust at low depth, but **only as good as the
+covariates**. We bet the four covariates capture stutter well for **pure** loci
+(period + length + motif/GC essentially determine slippage there). The bet is
+weakest exactly where the covariate is weakest — **impure / interrupted loci**: a
+single scalar `purity` cannot encode *interruption structure* (one mid-tract
+interruption vs scattered mismatches vs a near-compound tract all read as the same
+`purity` yet arrest slippage differently). So impure loci are the regime to watch —
+hence the per-locus relief valve and the open data question below.
 
 **Inference — joint mixture-deconvolution (D3).** We never get to see `a`
 directly; we see a pile of read lengths per (sample, locus) that is a **blend of
@@ -471,11 +727,51 @@ the kernel shape `K_θ`. Two design choices make this identifiable:
   modelling the mixture directly means we never need a separate "is this sample
   homozygous?" classifier — the data decide how many centres are supported.
 
-The covariate kernel is fit by **regression + hierarchical shrinkage**: covariate
-cells with abundant data (common motifs) get their own estimate; sparse cells
-**shrink toward the broader period-level estimate** rather than overfitting a
-handful of reads. Reads pool across all (sample, locus) units that fall in a
-covariate cell.
+**Fitting the covariate kernel — proposed model (provisional; the exact form is the
+one genuinely open core of Stage 2, settled on real data — not pre-judged here).**
+
+*The invariant — valid-probability links.* However the covariate dependence is
+shaped, the three outcomes (no-slip / up / down) must always form a valid split and
+`ρ` must stay in `(0,1)`. So the parameters are modelled through link functions: a
+**multinomial-logit (softmax)** over `(1−u−d, u, d)` and a **logit** for `ρ`. Every
+prediction is then a proper distribution regardless of the covariates.
+
+*The structure — two options, choice deferred to data:*
+- **Option 1 (v1) — discretized cells + empirical-Bayes shrinkage.** Bin the
+  covariate space (period × `log(allele_length)` bin × motif-or-GC class × purity
+  class), estimate `(u,d,ρ)` per cell by the M-step estimators, and **shrink sparse
+  cells toward their period-level parent** (James–Stein / hierarchical) so a thin
+  cell inherits the period rate instead of overfitting. Simple, transparent,
+  trivially fits inside EM (responsibility-weighted counts per cell + shrinkage),
+  validates per-cell. Con: bin-edge artifacts, no smooth length extrapolation.
+- **Option 2 (upgrade) — continuous hierarchical GLM.** The softmax/logit above as
+  *smooth* functions of `log(allele_length)` (period, motif/GC as factors, purity
+  continuous), with **partial pooling** via a hierarchical prior on the
+  coefficients. Smooth, extrapolates, no arbitrary bins. Con: a constrained weighted
+  GLM re-fit each EM iteration — more machinery and robustness care.
+
+Recommendation: **Option 1 as v1** (it *is* the "cells shrink toward period-level"
+idea, and the cheapest honest thing that works), **Option 2 as the documented
+upgrade** if cell artifacts prove material — mirroring the v1/upgrade pattern of the
+base measure (§5.5). Reads pool across all (sample, locus) units in a cell; only the
+*kernel parameters* pool, never the allele calls (above).
+
+**Per-locus relief valve + impure-locus policy.** Pooling is the default, but a
+**high-depth locus that clearly disagrees with its covariate cell** may carry a
+per-locus deviation on top of the cell mean (partial pooling at the locus level —
+HipSTR-like where the data support it). This matters most for **impure loci**, where
+the policy is *per-locus when depth allows, else **no-call*** — we do not force an
+impure locus onto a covariate-cell rate we don't trust (precision-first). A cell or
+locus with neither enough data nor a trustworthy pooled rate falls back to the
+**fixed default kernel** at the bottom of the §5.4 seed hierarchy (GangSTR's
+`0.05/0.05/0.9`, ideally a per-period default table).
+
+⚠ **Open — settle on real data before committing.** How well covariate-pooling holds
+across **repeat size, GC content, and purity/impurity** is empirical and not
+pre-judged: measure per-cell stutter fit and residual locus-to-locus variation on
+real cohorts, then decide (a) Option 1 vs 2, (b) the impure-locus per-locus/no-call
+depth cutoff, and (c) whether a per-locus relief term is needed at all. This is the
+statistical core; §11 lists it as open, not settled.
 
 ### 5.3 Genotype prior — inbreeding-adjusted (Wright / HWE-with-`F`)
 
@@ -483,15 +779,28 @@ Plants are far from HWE (tomato is highly selfing), so the prior is **not** stri
 HWE. **Reuse the SNP caller's exact multiallelic IBD-mixture prior**
 ([`src/var_calling/posterior_engine.rs`](../../../src/var_calling/posterior_engine.rs))
 with a **per-sample fixation index `F ∈ [0,1]`** (`0` = outcrossing/HWE, `1` =
-full inbreeding):
+full inbreeding). With probability `F` the individual is **fully autozygous** (all
+`ploidy` copies IBD from one allele); else its `ploidy` copies are independent HWE
+draws from `π`. For a genotype `G` with allele counts `(k_a)`, `Σ_a k_a = ploidy`:
 
-- homozygote `i`: `P(ii | π, F) = F·π_i + (1 − F)·π_i²`
-- heterozygote `i ≠ j`: `P(ij | π, F) = (1 − F)·2·π_i·π_j`
+- **fully homozygous** (one allele `i`, `k_i = ploidy`):
+  `P(G | π, F) = F·π_i + (1 − F)·π_i^ploidy`
+- **≥2 distinct alleles** (incl. partial polyploid hets like `AABB`, `AAAB`):
+  `P(G | π, F) = (1 − F)·(ploidy! / Π_a k_a!)·Π_a π_a^{k_a}` — the multinomial HWE
+  term, with **no** `F` contribution (here `F` means *all* copies IBD, which forces
+  full homozygosity).
 
-(With prob `F` the two alleles are identical-by-descent; else two independent HWE
-draws.) STRs differ from SNPs only in that the allele set is repeat lengths and is
-highly multiallelic. High `F` in a selfing line a-priori down-weights
-heterozygotes — a *second* structural defence against stutter-driven false hets.
+Diploid is the familiar special case: `P(ii) = F·π_i + (1−F)·π_i²`,
+`P(ij) = (1−F)·2·π_i·π_j`. This is exactly what the SNP engine computes (verified: it
+enumerates all non-decreasing `ploidy`-tuples and uses the `π^ploidy` homozygous
+term), reused verbatim. It is the **single-parameter polysomic** approximation: `F`
+captures only full autozygosity, so **partial IBD** (e.g. 2 of 4 tetraploid copies
+IBD) and **double reduction** are ignored — the refinement deferred in §5.7/§12.
+
+STRs differ from SNPs only in that the allele set is repeat alleles (on-ladder
+lengths plus off-ladder sequences, §5.1) and is highly multiallelic. High `F` in a
+selfing line a-priori down-weights heterozygotes — a *second* structural defence
+against stutter-driven false hets.
 
 ### 5.4 Cohort EM (per locus; parameters `π`, `θ`; latent `G_s`)
 
@@ -499,33 +808,79 @@ heterozygotes — a *second* structural defence against stutter-driven false het
 - **M-step (allele freqs):** `π_a ← (1/(ploidy·N))·Σ_s Σ_G γ_s(G)·count_a(G)`
   (standard AF-EM → AC/AN/AF). **Dirichlet-smoothed** with pseudocount `α` and a
   **non-uniform base measure** (§5.5) so plausible rare alleles are never
-  hard-zeroed and stutter-only candidates self-prune.
+  hard-zeroed. This is also where the **kept-but-ambiguous candidates self-prune**:
+  a kept ±1 shoulder (§5.1) whose apparent reads are all assigned to its peak via
+  `S_θ` converges to `π_a → 0` and falls below `MIN_ALLELE_SUPPORT_FRAC` — the
+  *model* makes that call, not a pre-EM heuristic (§5.1 already excludes the
+  *unambiguous* stutter — non-peak rungs ≥2 from any peak; the ±1 shoulders it keeps
+  are the ambiguous ones the EM resolves here).
 - **M-step (stutter):** update the shared covariate kernel from
   responsibility-weighted observed-vs-assigned length residuals (the deconvolution
-  update); HipSTR's estimators (`u` = posterior-weighted fraction longer, `d` =
-  fraction shorter, `ρ` = geometric MLE).
+  update), following HipSTR's estimators — but note the normalisation: `u` and `d`
+  are each the posterior-weighted count of gain / loss events divided by **all**
+  events (no-slip included), not longer-vs-shorter among slips only; `ρ` is the
+  geometric MLE of the step-size decay. (`em_stutter_genotyper.cpp` normalises over
+  the full event total.)
 - **M-step (`F`, optional):** estimate a cohort/per-sample `f̂` from the
   heterozygote deficit only above an effective-sample threshold; else use the
   supplied default. Per-locus `F` is not estimated.
 
 **Structure — initialisation by a confident-homozygote pre-pass.** EM is
 non-convex and the stutter kernel and the genotypes are mutually dependent (learn
-the kernel ⇄ know which reads are stutter), so a good starting kernel matters. The
-pre-pass exploits the one case where the genotype is knowable *without* a stutter
-model: a **confident homozygote**, selected by two criteria — **deep** spanning
-coverage (the length histogram is well-resolved) **and** a **single dominant
-length** (one length holds the overwhelming majority of reads, the rest a small
-ladder around it). For such a (sample, locus) there is exactly one true allele
-`a` = the modal length, so **every non-modal read is, by construction, a stutter
-product of that single allele** — a labelled stutter observation with known step
-`δ = (L − a)/period`, no genotype inference required. Pooling these across many
-confident-homozygote loci within a covariate cell yields a clean initial
-`(u, d, ρ)` via the same estimators as the M-step (`u` = fraction longer,
-`d` = fraction shorter, `ρ` = geometric MLE of the ladder decay). The joint
-deconvolution EM then **refines** that seed using *all* loci, now including
-heterozygotes — where the two alleles' ladders overlap and the genotype is
-genuinely latent. This homozygote init is the spec's chosen defence against local
-optima (see Identifiability below); multi-restart is deferred.
+the kernel ⇄ know which reads are stutter), so a good *starting* kernel matters —
+but only as a start: the M-step re-estimates `(u,d,ρ)` from all loci every
+iteration, so the seed shifts **which basin EM starts in**, not where it converges.
+The pre-pass exploits the one case where the genotype is *nearly* knowable without a
+stutter model: a **confident homozygote**, selected by two named gates — spanning
+depth ≥ `SEED_MIN_DEPTH` (the length histogram is well-resolved) **and** a single
+dominant length holding fraction ≥ `SEED_MIN_DOMINANCE_FRAC` (~0.9) of spanning
+reads, the rest a small ladder around it. At such a (sample, locus) the modal
+length is taken as the single true allele `a`, so each non-modal read is treated as
+a stutter product with known step `δ = (L − a)/period` — a labelled stutter
+observation, no genotype inference. Pooling these across many confident-homozygote
+loci within a covariate cell yields an initial `(u, d, ρ)` via the M-step
+estimators.
+
+*This is a seed, not ground truth.* The selection is not perfectly clean: a
+**skewed adjacent-unit heterozygote** (true `a`/`a+1` with, say, 85/15 balance) can
+pass the dominance gate and masquerade as a homozygote, feeding its real minor
+allele into the stutter estimate. The resulting bias **inflates `u`/`d`** — it errs
+toward *more* stutter, which suppresses hets: a **precision-safe** direction,
+consistent with the mandate. `SEED_MIN_DOMINANCE_FRAC` is the primary control (at
+0.9 it excludes the 85/15 masquerader outright); stricter → cleaner seed but fewer
+seed loci, and genome-wide pooling supplies plenty, so lean strict. And because the
+seed only sets the starting basin (above), the residual contamination is
+low-stakes — its one real risk is starting EM in a bad basin, which the diagnostic
+below flags and the deferred multi-restart ultimately backstops.
+
+**Measured cut-off (per covariate cell).** Rather than fix the gate blindly, build a
+**per-cell** distribution over the seed-candidate loci and detect the het/stutter
+confusion directly (stutter rate varies by cell, so the cut-off must too). The
+discriminating statistic is **not** raw dominance — true homozygotes and skewed
+adjacent hets both sit at high dominance and overlap there — but the **one-sided
+adjacent-neighbour excess**: how much the ±1-unit mass exceeds, and is more
+lop-sided than, a plausible stutter ladder (a true homozygote's ladder is two-sided
+and decays per `u/d`; a masquerader's is a one-sided spike at the het partner).
+Bimodality in that statistic is the confusion signature: its valley **recommends**
+`SEED_MIN_DOMINANCE_FRAC` for the cell, and its strength is a **warning** flagging
+the regime where the otherwise-low-stakes seed could mislead the basin. Exposed as
+`--seed-dominance auto` (apply the per-cell valley) vs a fixed conservative default.
+⚠ **Open — to be validated on real data:** whether a clean per-cell cut-off can be
+*reliably* detected is an empirical question (the bimodality may be weak or smeared
+in practice). So `auto` ships **available but off by default**, and is promoted to
+the default **only if** that validation is convincing.
+
+**Seed fallback hierarchy** (so the kernel is always seedable, even where confident
+homozygotes are scarce — e.g. hypervariable cells in a diverse outcrosser): a cell
+with enough confident-homozygote observations uses its own seed; sparse cells
+**shrink toward the period-level pooled seed**; cells with neither fall back to a
+**fixed default kernel** (literature-derived per period). This removes any hard
+dependence on confident homozygotes existing in every cell.
+
+The joint deconvolution EM then **refines** the seed using *all* loci, now including
+heterozygotes — where the two alleles' ladders overlap and the genotype is genuinely
+latent. This homozygote init is the chosen defence against local optima (see
+Identifiability below); multi-restart is deferred.
 **Convergence:** penalised-log-lik / parameter tolerance + max-iter; assert
 non-decreasing log-lik.
 
@@ -571,6 +926,15 @@ stutter-spawned lengths hold real frequency.
   link). ⚠ This `θ_pop` is **not** the stutter kernel `θ` of §5.2 — distinct
   quantity, distinct symbol.
 
+**Off-ladder alleles.** `G₀` above lives on the integer `Δ` ladder. An off-ladder
+allele (§4.2) sits at a fractional offset, so it takes the `G₀` mass of its
+**nearest on-ladder rung** (its integer repeat count) scaled by a small constant
+`OFFLADDER_PRIOR_FACTOR` (< 1) — encoding that an off-ladder variant is a-priori
+rarer than the clean rung at the same length. This keeps off-ladder alleles
+representable in `π` without letting a thin off-ladder ladder masquerade as a major
+allele at small N; like the rest of `G₀`, it is swamped by data at useful cohort
+sizes.
+
 **Deliberately weak — its job is small N.** `G₀` enters with weight `α` against
 `ploidy·N` observations, so at useful cohort sizes the **empirical data swamp it**
 and `π` ≈ the observed allele frequencies (as it should). Its whole purpose is the
@@ -590,16 +954,26 @@ collapsing them would reintroduce the confusion §5.4 works to avoid.
 Single-sample is a **first-class use case, by construction, no N=1 special-case**:
 stutter stays estimable via the genome-wide motif-class kernel; the
 Dirichlet-smoothed `π` self-interpolates from the base measure (small N) to the
-empirical population AF (large N); `F` is supplied at low N (default 0). Selfing
-species supply abundant homozygotes for the kernel init.
+empirical population AF (large N); `F` is supplied at low N (default 0). The kernel
+seeds from a *single* sample **regardless of mating system**, because
+**homozygosity is per-locus**: even an outcrossing individual is homozygous at a
+large fraction of its loci, so its genome-wide confident-homozygote loci (§5.4)
+seed the kernel without needing other samples (selfing species simply supply more).
+Single-sample is, however, the **weakest identifiability regime**: with one sample
+there is no **population recurrence** (§5.4) to separate a real rare allele from a
+stutter satellite, so identifiability rests on the shared kernel + the base-measure
+prior alone — and the precision-first no-call (§5.8) is the safety valve when that
+is not enough.
 
 ### 5.7 Ploidy & `F` input
 
 - **Ploidy:** a single uniform `--ploidy` per run (default `2`); the genotype space
-  is the **integer partitions of that ploidy** over the candidate alleles (the
-  ConSTRain enumeration trick). No aneuploidy / per-locus CN / mixed ploidy.
-  Polyploid supported (uniform); polyploid `F` uses a single-parameter polysomic
-  approximation (ignores double reduction — a v-later refinement).
+  is the **integer partitions of that ploidy** over the candidate alleles `A_ℓ` (the
+  ConSTRain enumeration trick). Its size grows steeply with `|A_ℓ|` × ploidy, so
+  `MAX_CANDIDATE_ALLELES` (§5.1) is what bounds Stage-2 cost at hypervariable loci.
+  No aneuploidy / per-locus CN / mixed ploidy. Polyploid supported (uniform);
+  polyploid `F` uses a single-parameter polysomic approximation (ignores double
+  reduction — a v-later refinement).
 - **`F`:** per-sample `fixation_index_default` (default `0`) + optional per-sample
   overrides; optionally estimated (§5.4).
 
@@ -607,6 +981,15 @@ species supply abundant homozygotes for the kernel init.
 
 - The **stutter model** explains the ladder as noise (first defence); the
   **inbreeding prior** suppresses spurious hets (second defence).
+- **Known bias — heterozygosity runs low (document, don't hide).** Those two het
+  defences systematically under-call **adjacent-unit heterozygotes** (true
+  `a`/`a+1` → called `a`/`a`), so **observed heterozygosity Ho is biased downward** —
+  a real cost on a headline popgen statistic, not a free precision win. This is a
+  property of the **converged** kernel + these thresholds (distinct from, and not
+  caused by, the §5.4 *seed*). It is **worst at small N** and recovers as cohort
+  size grows, because **population recurrence** (§5.4) re-establishes a recurring
+  `a+1` as a genuine allele and lets its hets be called. Reported, swept alongside
+  the operating point, and checked in validation (§7).
 - **Posterior threshold + precision/call-rate sweep** (reuse the SNP QUAL-sweep
   tooling) sets the operating point; prefer no-call when posterior mass is diffuse.
   HipSTR-derived defaults: posterior `Q ≥ MIN_POSTERIOR`, ≥ `MIN_SPANNING_READS`,
@@ -627,20 +1010,51 @@ Maximally compatible with the **TRtools** ecosystem (dumpSTR/mergeSTR/statSTR/
 qcSTR/associaTR), verified against the vendored `TRTools/trtools/utils/
 tr_harmonizer.py`.
 
-- **REF/ALT = actual repeat-tract sequences** (not symbolic); per-allele copy
-  numbers in **`REPCN`**.
-- **Required:** INFO `END`, `RU` (motif), `PERIOD`, `REF` (reference copy number);
-  FORMAT `GT`, `DP`, `Q` (genotype posterior, 0–1 — TRtools' quality field),
-  `REPCN`.
+- **REF/ALT = actual repeat-tract sequences** (not symbolic) — the allele's
+  identity (§1); on- and off-ladder alleles round-trip losslessly (12 vs 12+1 bp
+  are distinct ALT strings). Copy number is a **derived** annotation, never the
+  identity: TRtools recomputes it as `len(allele)/len(motif)` and **tolerates
+  fractional values** (verified in `tr_harmonizer.py` — it does not even read our
+  `REPCN`), so an imperfect / off-ladder allele whose length is not a clean motif
+  multiple is represented honestly via its sequence rather than rounded into a
+  neighbour. We still emit per-allele **`REPCN`** (integer copies, rounded) for
+  consumers that expect it, plus a per-ALT **`BPDIFFS`** (bp difference from REF,
+  HipSTR-style) so exact bp-level detail survives.
+- **Fields, by who actually needs them** (verified against the gangstr harmonizer
+  path, not assumed):
+  - *Harmonizer-mandatory* (the path raises without them): INFO `RU` (motif);
+    FORMAT `GT`; and a `##FORMAT=<ID=Q,…>` header declaration for
+    `HasQualityScore`. Must **not** emit INFO `VID` (AdVNTR marker) or `VARID` (EH
+    marker) — the gangstr path raises on either.
+  - *GangSTR-conventional, emitted for fidelity / other consumers* (TRtools neither
+    reads nor requires them): INFO `END`, `PERIOD`, `REF` (reference copy number);
+    FORMAT `DP`, `REPCN`. `Q` (genotype posterior, 0–1) is TRtools' quality field —
+    read when its header is declared and the record is not Beagle-imputed.
 - **Our model → GangSTR fields:** stutter `(u,d,ρ)` → INFO
   `STUTTERUP`/`STUTTERDOWN`/`STUTTERP`.
 - **Our extras (TRtools ignores; carry our full posterior + Beagle compat):**
   FORMAT `GP`, `GL`/`PL`, `GQ`; INFO `AF`/`AC`/`AN`, `NS`, `F`. FILTER `PASS` +
   `lowGQ`/`lowDepth`/`segdup`/`lowSupport`. *(TRtools reads only the scalar `Q`, so
   `Q` must carry the called genotype's posterior.)*
-- **Detection:** the harmonizer types GangSTR on the `gangstr` header substring —
-  triggered honestly via a `##source` line stating "GangSTR-compatible" (or
-  `--vcftype gangstr`). No TRtools change needed.
+- **Detection (honest, collision-free).** TRtools infers `gangstr` when the
+  lowercased raw header contains **both** the substrings `command=` **and**
+  `gangstr` — two tokens, anywhere, possibly on different lines
+  (`tr_harmonizer.py:210`). We satisfy both truthfully: a real
+  `##command=ssr-genotype …` line (our actual invocation supplies `command=`) plus a
+  `##source=ssr-genotype <ver> (GangSTR-compatible output)` line (truthfully supplies
+  `gangstr`). **No spoofed GangSTR command** — we never claim GangSTR ran. To stay a
+  *unique* match (TRtools hard-errors on multi-match) we avoid the other detectors'
+  triggers: no `hipstr`/`longtr` tokens anywhere, no `source=advntr`/`source=popstr`,
+  no symbolic `##ALT=<ID=STR\d+>` (we emit real sequence ALTs regardless).
+  - ⚠ `--vcftype gangstr` is **not** a bypass: inference still runs and the flag
+    only succeeds if the header is *already* gangstr-detectable
+    (`tr_harmonizer.py:237`). So the two header tokens are required either way — the
+    flag only disambiguates, it cannot rescue a non-detectable header. No TRtools
+    change needed.
+- **Verified by a live test, not by assertion.** A test asserts
+  `TRRecordHarmonizer(our.vcf)` infers `gangstr` *uniquely* and round-trips a record
+  (REF/ALT-derived copy numbers, `Q`, `GT`) — guarding both our header construction
+  and against TRtools changing its detection rules.
 - **Ploidy caveat:** diploid is fully harmonizable; polyploid VCFs are valid but
   TRtools is diploid-centric.
 
@@ -654,12 +1068,18 @@ Defaults are starting points; the precision-critical ones are swept (§7).
 |---|---|---|
 | `MIN_FLANK_BP` | clean flank bases for a spanning read | ~10 bp (HipSTR) |
 | `MIN_BASE_QUAL` | boundary base-quality for the fast path | ~Q20 |
-| `AMBIGUITY_THRESHOLD` | bundles fast-path gate (flanks, 0 interior indels, base-qual) | — |
+| `FAST_PATH_GATE` | fast-path qualification **predicate** (cleanly-aligned flanks, 0 interior indels, base-qual) — a gate, not a tunable scalar | n/a (predicate) |
 | `STUTTER_WINDOW_UNITS` (`W`) | Qᵣ(L) candidate window ±units | 3 |
 | `ploidy` | uniform genotype size | 2 |
 | `fixation_index_default` (`F`) | inbreeding prior | 0.0 (SNP caller) |
+| `SEED_MIN_DEPTH` | min spanning depth for a kernel-seed homozygote (§5.4) | — |
+| `SEED_MIN_DOMINANCE_FRAC` | min modal-length fraction for a seed homozygote; per-cell `auto` or fixed (§5.4) | ~0.9 |
 | `alpha` (`α`) | Dirichlet pseudocount on `π` | — |
 | base-measure decay `p` | reference-centred allele-length prior | — (SMM) |
+| `OFFLADDER_PRIOR_FACTOR` | base-measure down-weight for off-ladder vs nearest rung | — (< 1) |
+| `MAX_CANDIDATE_ALLELES` | cap on `|A_ℓ|`; exceed → no-call + log the locus (§5.1) | — |
+| `DEFAULT_STUTTER_(U,D,RHO)` | fixed fallback kernel when a cell/locus lacks data (§5.2/§5.4) | 0.05 / 0.05 / 0.9 (GangSTR) |
+| `MIN_PERLOCUS_STUTTER_DEPTH` | depth to trust a per-locus kernel over the cell (impure loci; §5.2) | — |
 | `MIN_POSTERIOR` (`Q`) | call-quality gate | 0.9 (HipSTR) |
 | `MIN_SPANNING_READS` | depth gate | ~10 (HipSTR) |
 | `MAX_STUTTER_FRAC` | artifact-read gate | 0.10 (HipSTR) |
@@ -670,15 +1090,27 @@ Defaults are starting points; the precision-critical ones are swept (§7).
 ## 7. Validation & testing (two buckets)
 
 **Bucket 1 — synthetic data for code tests (build critical path).** A bespoke
-STR-aware simulator emitting at two levels: **evidence-level** (synthetic Parquet
-`Qᵣ(L)` → tests Stage 2 statistics in isolation, before extraction exists) and
+STR-aware simulator emitting at two levels: **evidence-level** (synthetic
+`.ssr.psp` `Qᵣ(L)` → tests Stage 2 statistics in isolation, before extraction
+exists) and
 **read/BAM-level** (synthetic BAM + truth genotype table → tests the whole
 pipeline incl. the pair-HMM). **Anti-tautology rule:** generate data whose
 stutter/error *deviates* from the caller's `(u,d,ρ)` assumptions, and keep the
 simulator's model definition separate from the caller's code. Tests: deterministic
 unit fixtures + property/statistical tests (recovers injected `π/θ/F`; calibrated
 posteriors; no false hets on monomorphic loci; di-nuc / long-allele / low-coverage
-/ polyploid stress).
+/ polyploid / **off-ladder-allele** (e.g. a 12 vs 12+1 bp cohort: must call two
+distinct alleles, not collapse them, and reconcile the off-ladder allele across
+samples) / **imperfect-locus** stress). Plus an **Ho/He-vs-cohort-size**
+calibration: quantify the adjacent-unit-het under-call (§5.8) and confirm it shrinks
+with N as population recurrence kicks in; and a **seed-cut-off detection** check —
+on data with injected adjacent-het contamination, does the per-cell bimodality
+diagnostic (§5.4) recover a clean cut-off? (gates whether `--seed-dominance auto`
+can become the default). And a **covariate-kernel-fit** study (the §5.2 open core):
+on real cohorts, measure per-cell stutter fit and residual locus-to-locus variation
+across repeat size / GC / purity — does covariate-pooling hold for pure loci, and
+how badly does it fail on impure ones? — to settle Option 1 vs 2 and the
+impure-locus per-locus/no-call cutoff.
 
 **Bucket 2 — comparison vs reference tools (post-build benchmark; data off the
 critical path).** Human gold standard: HG002 → GIAB-TR v1.0 truth, compared with
@@ -697,8 +1129,10 @@ per-motif-length breakdown, precision ≥ HipSTR/GangSTR at matched call-rate.
 Mirrors `pileup → var-calling`:
 
 - `ssr-catalog` — reference FASTA → catalog.
-- `ssr-extract` — BAM/CRAM + reference + catalog → per-sample evidence Parquet.
-- `ssr-genotype` — N evidence files + catalog → cohort VCF.
+- `ssr-extract` — BAM/CRAM + reference + catalog → per-sample evidence `.ssr.psp`.
+- `ssr-genotype` — N evidence files + catalog → cohort VCF. Knobs include
+  `--seed-dominance {fixed|auto}` (§5.4; `fixed` default until the cut-off detection
+  is validated on real data).
 - `ssr-simulate` — test/dev: inject genotypes+stutter → synthetic BAM and/or
   evidence + truth table.
 
@@ -730,10 +1164,26 @@ ConSTRain (PMC12504596); RepeatSeq (PMC3592458); Valdes/Slatkin/Freimer SMM
 
 ## 11. Open structural decision (E)
 
-Repo/crate placement and final CLI naming. Everything else in this spec is
-settled; once E is decided, each stage (0, 1, 2) and the simulator can be turned
-into its own implementation plan, in data-flow order, with Bucket-1 synthetic
-tests on the critical path.
+Repo/crate placement, final CLI naming, **and where the shared `.psp`
+columnar-block container lives** — i.e. abstracting the existing SNP `.psp`
+read/write/index/compression code into a container crate/module that both
+`.snp.psp` and `.ssr.psp` ride on (§2/§4.3). The abstraction should be extracted
+*from the two concrete consumers* as SSR is built, not designed up front (share the
+byte-level plumbing; keep each caller's record semantics and math native). Once E is
+decided, each stage (0, 1, 2) and the simulator can be turned into its own
+implementation plan, in data-flow order, with Bucket-1 synthetic tests on the
+critical path.
+
+**Two genuinely-open *modelling* cores** (distinct from E, which is structural) —
+both to be settled on real data during the Stage-2 plan, not pre-judged here:
+- **The covariate stutter-kernel form (§5.2):** Option 1 (cells + shrinkage) vs
+  Option 2 (continuous GLM); the impure-locus per-locus/no-call policy; whether a
+  per-locus relief term is needed. This is the statistical core of the caller.
+- **`--seed-dominance auto` (§5.4):** whether the per-cell cut-off can be reliably
+  detected.
+
+"Settled" elsewhere means the architecture and the generative model; several model
+defaults remain to be swept — see the §6 parameter table and §7.
 
 ---
 
@@ -744,5 +1194,10 @@ tests on the critical path.
 - Polyploid `F` with partial IBD / double reduction.
 - Multi-restart for hard-locus local optima; a second stutter-refinement round
   (full joint hierarchical EM) if measurements demand it.
+- **Out-of-frame stutter** as its own model term. We currently fold non-unit-multiple
+  slippage into sequencing error (Stage-1 `Qᵣ`) or a heritable off-ladder allele
+  (§5.2) — a deliberate simplification. HipSTR carries a separate bp-step out-of-frame
+  term; add one here if validation shows genuine out-of-frame slippage being
+  misattributed.
 - Discretized-Gaussian (θ-linked) allele-length base measure if geometric proves
   insufficient.
