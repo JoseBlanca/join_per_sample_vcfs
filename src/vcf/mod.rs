@@ -35,6 +35,7 @@ use std::path::PathBuf;
 
 mod errors;
 mod header;
+mod qual_refine;
 mod record_encode;
 mod sink;
 mod writable;

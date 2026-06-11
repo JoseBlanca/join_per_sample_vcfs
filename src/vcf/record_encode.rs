@@ -97,7 +97,10 @@ pub(super) fn encode<R: VcfWritable>(
         .collect::<Result<_, _>>()?;
     let alternate_bases = AlternateBases::from(alt_strings);
 
-    let qual = clamp_qual(record.qual_phred());
+    // Refine QUAL: deflate it at sites whose alt-allele support looks
+    // like a systematic artifact (allele-balance + strand/position bias).
+    // Affects the QUAL column only; genotypes/GQ/AF are unchanged.
+    let qual = clamp_qual(super::qual_refine::refine_qual(record, table, record.qual_phred()));
 
     // FILTER policy:
     //   * `PASS`     — EM converged within `max_iterations`.
