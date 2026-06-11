@@ -20,10 +20,33 @@ Defined once here; used unqualified thereafter.
 **Domain / biology**
 
 - **SSR** — Simple Sequence Repeat (microsatellite); a tandem repeat with a short
-  motif. Used interchangeably with **STR**.
-- **STR** — Short Tandem Repeat. Synonym of SSR in this document.
+  motif (period ≤ 6). Used interchangeably with **STR**. **We say SSR, not the
+  broader "TR", deliberately** — see the *SSR vs STR vs TR* note below.
+- **STR** — Short Tandem Repeat. Synonym of SSR in this document. The
+  human-genetics/forensics name for the same short-motif class.
+- **TR** — Tandem Repeat; the *umbrella* term (any period, homopolymer →
+  satellite) used by the modern long-read ecosystem (GIAB-TR, TRtools, TRGT).
+  **Broader than our scope** — we appropriate it only at the interop seam (§5.9
+  VCF, GIAB-TR benchmark), never as our own feature word.
 - **VNTR** — Variable Number Tandem Repeat; the broader family (minisatellites and
   up), explicitly out of scope here (period ≤ 6 only).
+
+  > **SSR vs STR vs TR — a deliberate naming choice, not an oversight.** The
+  > short-motif tandem repeat has several names that differ by field and by
+  > scope. *SSR / microsatellite* (period ~1–6 bp) is the dominant term in
+  > plant, agricultural, ecological and population genetics — our domain and
+  > audience. *STR* is the same class under its human-genetics/forensics name
+  > (CODIS markers are STRs); we treat it as a synonym. *TR (tandem repeat)* is
+  > the **superset** covering every period from homopolymers through
+  > kilobase VNTRs and pathogenic expansions. Modern sequencing tools
+  > (GIAB-TR, TRtools, TRGT, LongTR) standardised on "TR" for *principled*
+  > reasons — long reads dissolved the assay-defined size boundaries, the old
+  > motif-length cutoffs were always arbitrary, and expansion disorders broke
+  > the "short" in STR — but those reasons are driven by a scope that spans the
+  > whole continuum. **Ours does not:** period ≤ 6, spanning short reads,
+  > pop-gen markers; VNTRs and expansions are explicit non-goals (§1.3–§1.4).
+  > For *that* scope, SSR is the more precise term and the one our readers use,
+  > so we keep it. (And note: **TRF ≠ TR** — TRF is a *tool*, see below.)
 - **period** — length of the repeat unit (motif) in bp; period 1 = mono-, …, 6 =
   hexanucleotide.
 - **motif / RU** — the repeat unit itself (e.g. `CAG`). RU = Repeat Unit (the VCF
@@ -53,7 +76,10 @@ Defined once here; used unqualified thereafter.
 
 **Tools / file formats**
 
-- **TRF** — Tandem Repeats Finder; the catalog detector (Stage 0).
+- **TRF** — Tandem Repeats Finder (Benson 1999); the catalog **detector tool**
+  run in Stage 0. A *tool name*, never a name for the feature itself — a locus
+  is an SSR, not "a TRF". Do not confuse with **TR** (the feature umbrella,
+  above).
 - **DUST / sdust** — low-complexity sequence masker; optional TRF prefilter.
 - **BAM / CRAM** — aligned-read containers (input).
 - **VCF** — Variant Call Format (output). **GFF / BED / TSV** — annotation/tabular
@@ -464,7 +490,7 @@ invariants:
   same intervals, so the merge is **block-aligned** — the sparse analogue of a
   synchronized scan, with no join index and no empty rows.
 - **Region query:** binary-search the block index for the first block overlapping
-  `[start, end)`, decode forward until past it (`ssr-genotype --regions`). The index
+  `[start, end)`, decode forward until past it (`ssr-call --regions`). The index
   keys on **interval** extent — `last_end`, not `last_start` — so a locus that
   starts before a query window but extends into it is not missed (the point-vs-
   interval difference from the SNP `.psp`, whose records are points).
@@ -1040,8 +1066,8 @@ tr_harmonizer.py`.
   lowercased raw header contains **both** the substrings `command=` **and**
   `gangstr` — two tokens, anywhere, possibly on different lines
   (`tr_harmonizer.py:210`). We satisfy both truthfully: a real
-  `##command=ssr-genotype …` line (our actual invocation supplies `command=`) plus a
-  `##source=ssr-genotype <ver> (GangSTR-compatible output)` line (truthfully supplies
+  `##command=ssr-call …` line (our actual invocation supplies `command=`) plus a
+  `##source=ssr-call <ver> (GangSTR-compatible output)` line (truthfully supplies
   `gangstr`). **No spoofed GangSTR command** — we never claim GangSTR ran. To stay a
   *unique* match (TRtools hard-errors on multi-match) we avoid the other detectors'
   triggers: no `hipstr`/`longtr` tokens anywhere, no `source=advntr`/`source=popstr`,
@@ -1124,20 +1150,28 @@ per-motif-length breakdown, precision ≥ HipSTR/GangSTR at matched call-rate.
 
 ---
 
-## 8. CLI surface (provisional — see §11/E)
+## 8. CLI surface
 
-Mirrors `pileup → var-calling`:
+Three subcommands on the existing binary, named to mirror the SNP caller's
+`pileup → var-calling` roles one-for-one (architecture doc §2/§3.3):
 
-- `ssr-catalog` — reference FASTA → catalog.
-- `ssr-extract` — BAM/CRAM + reference + catalog → per-sample evidence `.ssr.psp`.
-- `ssr-genotype` — N evidence files + catalog → cohort VCF. Knobs include
-  `--seed-dominance {fixed|auto}` (§5.4; `fixed` default until the cut-off detection
-  is validated on real data).
-- `ssr-simulate` — test/dev: inject genotypes+stutter → synthetic BAM and/or
-  evidence + truth table.
+- `ssr-catalog` — reference FASTA → catalog (Stage 0).
+- `ssr-pileup` — BAM/CRAM + reference + catalog → per-sample evidence
+  `.ssr.psp` (Stage 1; the SSR analog of `pileup`).
+- `ssr-call` — N evidence files + catalog → cohort VCF (Stage 2; the SSR
+  analog of `var-calling`). Knobs include `--seed-dominance {fixed|auto}`
+  (§5.4; `fixed` default until the cut-off detection is validated on real
+  data).
 
-Repo/crate placement (same-repo separate binary vs new repo) is the open
-structural decision (E), to be settled before the implementation plan.
+**The simulator is not a subcommand.** Injecting genotypes+stutter →
+synthetic BAM and/or evidence + truth table is **test/dev scaffolding**, so it
+lives as a **crate module the test suite calls directly** (`src/ssr/simulate/`),
+not on the production CLI (architecture doc §2.1).
+
+Decision E (repo/crate placement, the shared `.psp` container split, CLI
+names) is **settled** in the architecture doc: same crate / new `src/ssr/`
+module tree; a generic schema-agnostic `psp` core + `snp`/`ssr` schemas (flat
+in `src/psp/`, submodules deferred); the three subcommand names above.
 
 ---
 
@@ -1162,15 +1196,29 @@ ConSTRain (PMC12504596); RepeatSeq (PMC3592458); Valdes/Slatkin/Freimer SMM
 
 ---
 
-## 11. Open structural decision (E)
+## 11. Structural decision (E) — SETTLED
 
-Repo/crate placement, final CLI naming, **and where the shared `.psp`
-columnar-block container lives** — i.e. abstracting the existing SNP `.psp`
-read/write/index/compression code into a container crate/module that both
-`.snp.psp` and `.ssr.psp` ride on (§2/§4.3). The abstraction should be extracted
-*from the two concrete consumers* as SSR is built, not designed up front (share the
-byte-level plumbing; keep each caller's record semantics and math native). Once E is
-decided, each stage (0, 1, 2) and the simulator can be turned into its own
+Repo/crate placement, CLI naming, **and where the shared `.psp`
+columnar-block container lives** are settled in the architecture doc
+([`../architecture/ssr_genotyping_architecture.md`](../architecture/ssr_genotyping_architecture.md),
+§2–§5, 2026-06-11):
+
+- **Placement:** same crate, new `src/ssr/` module tree, `ssr-*` subcommands on
+  the existing binary (not a new repo, not a workspace split).
+- **CLI:** three subcommands — `ssr-catalog`, `ssr-pileup`, `ssr-call` — named
+  to mirror the SNP `pileup`/`var-calling` roles. The simulator is **not** a
+  subcommand; it is a crate/test module (§8).
+- **Container:** a generic schema-agnostic core plus two thin schemas (`snp`,
+  `ssr`) in `src/psp/` — both `.snp.psp` and `.ssr.psp` ride the same core. The
+  three-layer split is **conceptual, enforced by file naming**; the directory
+  **stays flat** (~13–14 files) and grows `core/`/`snp/`/`ssr/` submodules only
+  on a crowding trigger (architecture doc §3.2). Extracted *from the two
+  concrete consumers* as SSR is built, not designed up front; **pre-alpha, so no
+  backwards-compat** — free to rev the format and restructure the SNP schema,
+  the regression gate being the SNP caller's end-to-end tests, not byte-identity
+  to the old format.
+
+With E settled, each stage (0, 1, 2) and the simulator becomes its own
 implementation plan, in data-flow order, with Bucket-1 synthetic tests on the
 critical path.
 
