@@ -19,7 +19,16 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-08):** **Code review of `src/var_calling/`**
+> - **Last completed task (2026-06-12):** **SSR caller — Phase 0 + code review.**
+>   First SSR code: the shared domain types `Motif`/`Locus`
+>   ([src/ssr/types.rs](src/ssr/types.rs), commit `74b5a2d`), then a code review
+>   (rust-code-review skill, 8 categories) →
+>   [ssr_types_2026-06-12.md](doc/devel/reports/reviews/ssr_types_2026-06-12.md):
+>   **Request-changes** (1 Blocker = broken `cargo doc` gate; 1 Major = `Locus`
+>   invariant unenforced → release-mode panic; 5 Minor + missing tests). Tracked
+>   under the new *SSR/STR caller* section below. Next: apply B1/M1, then build
+>   Stage 0 (`ssr-catalog`).
+> - **Prior task (2026-06-08):** **Code review of `src/var_calling/`**
 >   (orchestrator skill, 10 categories; `main` @ `35a6b67`; the re-architected
 >   record-streaming pipeline, excluding the PM-deferred `posterior_engine`
 >   module) —
@@ -869,6 +878,38 @@ EM over merged records → final multi-sample VCF.
 - **Open:** evaluation methodology pinned in the plan; needs the
   exact-math engine bench numbers before deciding which candidates
   to land.
+
+---
+
+## SSR/STR caller (independent pipeline)
+
+A second, independent caller — microsatellite/STR **length** genotyping from
+aligned reads — sharing only low-level alignment I/O and a few numerical kernels
+with the SNP caller above, never its records or math. Mirrors the SNP shape:
+`ssr-catalog → catalog → ssr-pileup → .ssr.psp → ssr-call → VCF`. Design:
+[ssr_genotyping.md](doc/devel/specs/ssr_genotyping.md) (model + why) and the
+architecture docs ([overall](doc/devel/architecture/ssr_genotyping_architecture.md),
+[shared types](doc/devel/architecture/ssr_shared_types.md),
+[Stage 0 catalog](doc/devel/architecture/ssr_catalog.md)). Decision E and the
+type model are settled; built in data-flow order (types → Stage 0 → Stage 1/2).
+
+### Stage 0 — `ssr-catalog` (reference → catalog)
+
+#### Shared domain types (`src/ssr/types.rs`)
+- **Status:** reviewed
+- **Design:** [ssr_shared_types.md](doc/devel/architecture/ssr_shared_types.md)
+- **Code:** [src/ssr/types.rs](src/ssr/types.rs), [src/ssr/mod.rs](src/ssr/mod.rs) (commit `74b5a2d`; no separate impl report — commit message carries context)
+- **Tests:** 6 unit tests in the module
+- **Latest review:** [ssr_types_2026-06-12.md](doc/devel/reports/reviews/ssr_types_2026-06-12.md) — Request-changes (1 Blocker, 1 Major, 5 Minor + missing tests)
+- **Open:**
+  - **B1** — broken `cargo doc` gate: intra-doc-link brackets on file paths in `src/ssr/mod.rs`.
+  - **M1** — `Locus` documented invariants unenforced (all-`pub` fields, no constructor) → release-mode panic/underflow; add a validated constructor + private fields + purity-range check.
+  - **Mi1–Mi5** + missing boundary/error tests — see the review §6/§8.
+
+#### Catalog builder (`src/ssr/catalog/`) — *planned*
+- **Status:** planned
+- **Plan:** [ssr_catalog.md](doc/devel/implementation_plans/ssr_catalog.md) (implementation sketch: files, structs, fn signatures)
+- **Notes:** detector = lh3/TRF-mod (shell-out via temp files, no FFI), genome-wide; post-process drops compound/bundled loci (GangSTR-style, no split); worker-per-contig with an ordered collector; `--num-chroms-in-parallel` is a speed⇄RAM knob.
 
 ---
 
