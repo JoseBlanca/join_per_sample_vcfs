@@ -19,15 +19,28 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-12):** **SSR caller — Phase 0 + code review.**
+> - **Last completed task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
+>   Applied the `ssr_types` code review
+>   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
+>   all 9 findings resolved — **B1** (drop intra-doc-link brackets → `cargo doc`
+>   gate restored); **M1** (private `Locus` fields + validated `Locus::new` /
+>   typed `LocusError` checking coord ordering, ref-bytes bounds, and finite
+>   purity ∈ [0,1]) + 10 new boundary/error tests; Minors **Mi1** (`MotifError`
+>   `#[non_exhaustive]` + named field), **Mi2** (Eq/Hash zeroed-tail guard +
+>   hashing test), **Mi3** (`tract_range` dedup), **Mi4** (`MAX_MOTIF_LEN`
+>   source doc), **Mi5** (`pub(crate)` surface, with a temporary module
+>   `#![allow(dead_code)]` until Stage 0 consumers exist); Nits accounted for.
+>   `cargo doc`/ssr clippy/fmt clean; 1039 lib tests pass (the 2 pre-existing
+>   heavy `vcf::record_encode` i32-overflow tests are out-of-scope/slow and were
+>   skipped). Next: build Stage 0 (`ssr-catalog`).
+> - **Prior task (2026-06-12):** **SSR caller — Phase 0 + code review.**
 >   First SSR code: the shared domain types `Motif`/`Locus`
 >   ([src/ssr/types.rs](src/ssr/types.rs), commit `74b5a2d`), then a code review
 >   (rust-code-review skill, 8 categories) →
 >   [ssr_types_2026-06-12.md](doc/devel/reports/reviews/ssr_types_2026-06-12.md):
 >   **Request-changes** (1 Blocker = broken `cargo doc` gate; 1 Major = `Locus`
 >   invariant unenforced → release-mode panic; 5 Minor + missing tests). Tracked
->   under the new *SSR/STR caller* section below. Next: apply B1/M1, then build
->   Stage 0 (`ssr-catalog`).
+>   under the *SSR/STR caller* section below.
 > - **Prior task (2026-06-08):** **Code review of `src/var_calling/`**
 >   (orchestrator skill, 10 categories; `main` @ `35a6b67`; the re-architected
 >   record-streaming pipeline, excluding the PM-deferred `posterior_engine`
@@ -896,15 +909,14 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 0 — `ssr-catalog` (reference → catalog)
 
 #### Shared domain types (`src/ssr/types.rs`)
-- **Status:** reviewed
+- **Status:** fixes-applied
 - **Design:** [ssr_shared_types.md](doc/devel/architecture/ssr_shared_types.md)
 - **Code:** [src/ssr/types.rs](src/ssr/types.rs), [src/ssr/mod.rs](src/ssr/mod.rs) (commit `74b5a2d`; no separate impl report — commit message carries context)
-- **Tests:** 6 unit tests in the module
+- **Tests:** 16 unit tests in the module (6 original + 10 boundary/error tests from the fix run)
 - **Latest review:** [ssr_types_2026-06-12.md](doc/devel/reports/reviews/ssr_types_2026-06-12.md) — Request-changes (1 Blocker, 1 Major, 5 Minor + missing tests)
+- **Latest fixes-applied:** [fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md) — **Completed**: all 9 findings resolved (B1 + M1 + Mi1–Mi5 Applied; Nit1 kept; Nit2 already consistent). M1 → private `Locus` fields + validated `Locus::new`/`LocusError`; Mi5 → `pub(crate)` surface (with a temporary module `#![allow(dead_code)]` until Stage 0 consumers land). `cargo doc`/ssr clippy/fmt clean; 1039 lib tests pass.
 - **Open:**
-  - **B1** — broken `cargo doc` gate: intra-doc-link brackets on file paths in `src/ssr/mod.rs`.
-  - **M1** — `Locus` documented invariants unenforced (all-`pub` fields, no constructor) → release-mode panic/underflow; add a validated constructor + private fields + purity-range check.
-  - **Mi1–Mi5** + missing boundary/error tests — see the review §6/§8.
+  - Remove the temporary `#![allow(dead_code)]` in `src/ssr/mod.rs` once `ssr-catalog` (Stage 0) wires these types up (tracked as Mi5 follow-up in the fix report).
 
 #### Catalog builder (`src/ssr/catalog/`) — *planned*
 - **Status:** planned

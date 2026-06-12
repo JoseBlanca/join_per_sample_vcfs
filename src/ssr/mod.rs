@@ -10,11 +10,17 @@
 //! reference ─► ssr-catalog ─► catalog ─► ssr-pileup ─► .ssr.psp ─► ssr-call ─► VCF
 //! ```
 //!
-//! Design docs: [`doc/devel/specs/ssr_genotyping.md`] (the model + why) and
-//! [`doc/devel/architecture/`] (`ssr_genotyping_architecture.md`,
+//! Design docs: `doc/devel/specs/ssr_genotyping.md` (the model + why) and
+//! `doc/devel/architecture/` (`ssr_genotyping_architecture.md`,
 //! `ssr_shared_types.md`, `ssr_catalog.md`).
 //!
 //! **Build status.** Only the shared types (`types`) are present so far; the
 //! stage modules are added in data-flow order as they are built.
+
+// The shared types land before their consumers: the catalog/pileup/call stages
+// that read them are built in later phases. Until then the `pub(crate)` surface
+// has no in-crate caller, so suppress `dead_code` here rather than scatter
+// per-item `#[allow]`s. Remove once `ssr-catalog` (Stage 0) wires these up.
+#![allow(dead_code)]
 
 pub mod types;
