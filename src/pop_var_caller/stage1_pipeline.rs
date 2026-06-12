@@ -34,7 +34,12 @@ use crate::pileup::walker::{self, PileupWalker, PreparedRead, WalkerConfig};
 /// source → workers → reorder → walker pipeline; below it, the inline
 /// bulk-synchronous `BaqStream` (whose coordination is cheaper when
 /// there are too few cores for the pipeline's three roles to overlap).
-const STAGED_MIN_THREADS: usize = 4;
+///
+/// `run_pileup` also reads this to decide whether to size the global
+/// rayon pool: only the inline path uses rayon, so sizing it for the
+/// pipeline path would spawn `n` idle rayon threads on top of the
+/// pipeline's own `n` workers.
+pub(crate) const STAGED_MIN_THREADS: usize = 4;
 
 /// Bounded-channel depth per worker for the read pipeline — the same
 /// back-pressure knob the cohort producer uses. Peak in-flight packets

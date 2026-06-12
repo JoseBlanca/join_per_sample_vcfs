@@ -240,10 +240,23 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
 
     // 2. Size rayon's global pool when --threads is given (idempotent;
     //    first caller wins).
-    configure_rayon_pool(args.threads).map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
-    // Worker count for the read-processing pipeline: the resolved thread
-    // budget (explicit `--threads`, else rayon's default = all cores).
-    let n_threads = rayon::current_num_threads();
+    // Resolve the thread budget directly from the flag (default: all
+    // logical cores). Taken from the flag rather than
+    // `rayon::current_num_threads()` so we don't lazily spin up a rayon
+    // pool we may not use.
+    let n_threads = args
+        .threads
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    // Only the inline read-processing path uses rayon (`BaqStream`'s
+    // `par_drain`); the staged pipeline uses dedicated threads. Sizing
+    // the global rayon pool for the pipeline path would leave `n` idle
+    // rayon threads alongside the pipeline's own `n` workers (~2n threads
+    // for an n-thread request), so size it only when the inline path runs.
+    if n_threads < super::stage1_pipeline::STAGED_MIN_THREADS {
+        configure_rayon_pool(Some(n_threads))
+            .map_err(|_| PileupCliError::RayonAlreadyConfigured)?;
+    }
 
     // 3. Load metadata + per-input handles. Index pre-flight runs here:
     //    a missing alignment index is built (with --build-map-file-index)
@@ -266,6 +279,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         args.block_target_bytes,
         args.block_window_bp,
         args.regions.as_deref(),
+        n_threads,
     )?;
 
     // 5. Region set: the BED, or one full-length span per contig. The
@@ -522,6 +536,7 @@ fn build_writer_header(
     block_target_bytes: usize,
     block_window_bp: u32,
     regions_bed: Option<&Path>,
+    n_threads: usize,
 ) -> Result<WriterHeader, PileupCliError> {
     let mut chromosomes = Vec::with_capacity(contigs.entries.len());
     for entry in &contigs.entries {
@@ -549,7 +564,7 @@ fn build_writer_header(
 
     let input_crams: Vec<String> = cram_paths.iter().map(|p| basename(p)).collect();
     let input_fasta = basename(fasta_path);
-    let mut parameters = effective_parameters(args, block_target_bytes, block_window_bp);
+    let mut parameters = effective_parameters(args, block_target_bytes, block_window_bp, n_threads);
     // Record the analysis-regions BED basename when one was supplied, so
     // the `.psp` self-describes that it covers only those regions (the
     // full path is also in `command_line`). `regions_count` is added by
@@ -586,6 +601,7 @@ fn effective_parameters(
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
     block_window_bp: u32,
+    n_threads: usize,
 ) -> BTreeMap<String, ParameterValue> {
     let mut p = BTreeMap::new();
     // CRAM input filters
@@ -652,9 +668,10 @@ fn effective_parameters(
         "max_active_reads".into(),
         ParameterValue::Integer(args.max_active_reads as i64),
     );
-    // Threads (effective count after rayon was sized).
-    let threads = rayon::current_num_threads();
-    p.insert("threads".into(), ParameterValue::Integer(threads as i64));
+    // Threads — the resolved budget (explicit `--threads`, else all
+    // logical cores). Read from the flag, not `rayon`, since the staged
+    // pipeline doesn't size a rayon pool.
+    p.insert("threads".into(), ParameterValue::Integer(n_threads as i64));
     // PSP writer.
     p.insert(
         "block_target_bytes".into(),
@@ -791,7 +808,12 @@ mod tests {
     #[test]
     fn effective_parameters_records_every_knob() {
         let args = default_args(PathBuf::from("r.fa"), PathBuf::from("o.psp"), vec![]);
-        let p = effective_parameters(&args.stage1, args.block_target_bytes, args.block_window_bp);
+        let p = effective_parameters(
+            &args.stage1,
+            args.block_target_bytes,
+            args.block_window_bp,
+            4,
+        );
         // Sanity: every knob shows up.
         for key in &[
             "min_mapq",
@@ -851,6 +873,7 @@ mod tests {
             args.block_target_bytes,
             args.block_window_bp,
             None,
+            4,
         )
         .expect_err("must error");
         assert!(matches!(err, PileupCliError::MissingMd5 { ref contig } if contig == "chr1"));
@@ -885,6 +908,7 @@ mod tests {
             args.block_target_bytes,
             args.block_window_bp,
             None,
+            4,
         )
         .expect("build_writer_header");
         assert_eq!(header.writer.input_fasta, "grch38.fa");
