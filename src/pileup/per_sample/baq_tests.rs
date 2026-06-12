@@ -19,6 +19,7 @@ use noodles_sam::{
     },
 };
 
+use crate::bam::alignment_input::build_fasta_repository;
 use crate::baq::{BaqConfig, ProbalnScratch, probaln_glocal};
 use crate::pileup::walker::CigarOp;
 
@@ -26,6 +27,18 @@ use super::baq_engine::{
     apply_baq_cap_into, compute_alignment_end, encode_base, extend_ref_window,
     locate_alignment_span,
 };
+use super::read_processor::ReadProcessingConfig;
+
+/// F1-disabled read-processing config for the `BaqStream` tests, which
+/// exercise BAQ (and order/skip plumbing) — not the mismatch filter.
+/// Their reads are all match-only or soft-clip, so G2 passes and F3 is
+/// a no-op; with F1 off the stream's output is pure BAQ.
+fn baq_only_proc_cfg() -> ReadProcessingConfig {
+    ReadProcessingConfig {
+        max_read_mismatch_fraction: None,
+        mismatch_bq_floor: 0,
+    }
+}
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -258,6 +271,7 @@ fn stream_components_from_chrom_bytes(
 ) -> (
     tempfile::TempDir,
     std::path::PathBuf,
+    fasta::Repository,
     crate::fasta::ContigList,
 ) {
     use crate::fasta::{ContigEntry, ContigList};
@@ -284,6 +298,10 @@ fn stream_components_from_chrom_bytes(
         )
         .expect("fai");
     }
+    // Repository for the F3/F1 raw-byte cache. F3 no-ops on these
+    // match-only reads and F1 is disabled in `baq_only_proc_cfg`, so it
+    // never changes output — it just satisfies the stream's signature.
+    let repository = build_fasta_repository(&fasta_path).expect("repository");
     let contigs = ContigList {
         entries: vec![ContigEntry {
             name: "chr0".into(),
@@ -291,7 +309,7 @@ fn stream_components_from_chrom_bytes(
             md5: None,
         }],
     };
-    (dir, fasta_path, contigs)
+    (dir, fasta_path, repository, contigs)
 }
 
 fn synthetic_read(
@@ -717,7 +735,8 @@ use super::baq_stream::BaqStream;
 
 #[test]
 fn stream_yields_prepared_reads_in_order_within_chunk() {
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = (1..=4)
         .map(|pos| {
             Ok(synthetic_read(
@@ -733,7 +752,10 @@ fn stream_yields_prepared_reads_in_order_within_chunk() {
     let stream = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
         fasta_path.clone(),
+        repository.clone(),
         contigs.clone(),
         16,
     );
@@ -750,7 +772,8 @@ fn stream_yields_prepared_reads_in_order_within_chunk() {
 fn stream_preserves_order_across_chunks() {
     // Chunk size 2 with 5 inputs → three batches. Output order must
     // still match input order.
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = (1..=5)
         .map(|pos| {
             Ok(synthetic_read(
@@ -766,7 +789,10 @@ fn stream_preserves_order_across_chunks() {
     let stream = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
         fasta_path.clone(),
+        repository.clone(),
         contigs.clone(),
         2,
     );
@@ -781,7 +807,7 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
     // the default rayon pool happens to do on a small CI runner.
     // Chrom needs to cover the extended ref window for the last read
     // (pos=64, 5M, ~p+7 extension); use a generous 128-byte chrom.
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT");
+    let (_dir, fasta_path, repository, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = (1..=64)
         .map(|pos| {
             Ok(synthetic_read(
@@ -802,7 +828,10 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
         let stream = BaqStream::new(
             inputs.into_iter(),
             BaqConfig::default(),
+            baq_only_proc_cfg(),
+            true,
             fasta_path.clone(),
+            repository.clone(),
             contigs.clone(),
             16,
         );
@@ -815,7 +844,8 @@ fn stream_preserves_order_with_explicit_multi_threaded_pool() {
 
 #[test]
 fn stream_increments_skip_counts_per_reason() {
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![
         // Capped — happy path.
         Ok(synthetic_read(
@@ -857,7 +887,10 @@ fn stream_increments_skip_counts_per_reason() {
     let mut stream = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
         fasta_path.clone(),
+        repository.clone(),
         contigs.clone(),
         16,
     );
@@ -871,7 +904,7 @@ fn stream_increments_skip_counts_per_reason() {
 
 #[test]
 fn stream_propagates_upstream_error_after_batched_reads() {
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
+    let (_dir, fasta_path, repository, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![
         Ok(synthetic_read(
             0,
@@ -886,7 +919,10 @@ fn stream_propagates_upstream_error_after_batched_reads() {
     let outputs: Vec<_> = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
         fasta_path.clone(),
+        repository.clone(),
         contigs.clone(),
         16,
     )
@@ -902,7 +938,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
     // force three chunks where the first two yield only skips. next()
     // must not return None prematurely — it must loop through the
     // refills until it finds the surviving read.
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
+    let (_dir, fasta_path, repository, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![
         Ok(synthetic_read(
             FLAG_UNMAPPED,
@@ -932,7 +968,10 @@ fn stream_returns_success_after_all_skipped_chunks() {
     let mut stream = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
         fasta_path.clone(),
+        repository.clone(),
         contigs.clone(),
         1,
     );
@@ -944,7 +983,7 @@ fn stream_returns_success_after_all_skipped_chunks() {
 
 #[test]
 fn stream_is_fused_after_exhaustion() {
-    let (_dir, fasta_path, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
+    let (_dir, fasta_path, repository, contigs) = stream_components_from_chrom_bytes(b"ACGTACGT");
     let inputs: Vec<Result<MappedRead, AlignmentInputError>> = vec![Ok(synthetic_read(
         0,
         1,
@@ -956,7 +995,10 @@ fn stream_is_fused_after_exhaustion() {
     let mut stream = BaqStream::new(
         inputs.into_iter(),
         BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
         fasta_path.clone(),
+        repository.clone(),
         contigs.clone(),
         16,
     );
@@ -970,15 +1012,177 @@ fn stream_is_fused_after_exhaustion() {
 #[should_panic(expected = "BaqStream chunk_size must be > 0")]
 fn stream_rejects_zero_chunk_size() {
     // M13: zero chunk_size is a programmer error, not a value to be
-    // silently coerced.
-    use crate::fasta::ContigList;
+    // silently coerced. The assert fires before any input is touched, so
+    // the components are throwaway.
+    let (_dir, fasta_path, repository, contigs) = stream_components_from_chrom_bytes(b"ACGT");
     let _ = BaqStream::new(
         std::iter::empty::<Result<MappedRead, AlignmentInputError>>(),
         BaqConfig::default(),
-        std::path::PathBuf::from("/dev/null"),
-        ContigList { entries: vec![] },
+        baq_only_proc_cfg(),
+        true,
+        fasta_path,
+        repository,
+        contigs,
         0,
     );
+}
+
+// --- relocated read-filter coverage --------------------------------
+// G2 (bad-CIGAR) and F1 (mismatch-fraction) reject + count moved from
+// the reader into this read-processing stage. These pin that the stage
+// drops the offending reads and tallies the right counters — the
+// behavior the former `bam::alignment_input` reader tests used to pin.
+
+#[test]
+fn read_proc_stage_drops_bad_cigar_consecutive_id() {
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    // M4 I2 D1 M4: adjacent I/D pair → G2 rejects. G2 runs before any
+    // reference fetch, so the read is dropped regardless of the ref.
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![
+            CigarOp::Match(4),
+            CigarOp::Insertion(2),
+            CigarOp::Deletion(1),
+            CigarOp::Match(4),
+        ],
+        b"ACGTACGTAC".to_vec(),
+        vec![40; 10],
+    );
+    let mut stream = BaqStream::new(
+        vec![Ok(read)].into_iter(),
+        BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
+        fasta_path,
+        repository,
+        contigs,
+        16,
+    );
+    let out: Vec<_> = (&mut stream).collect();
+    assert!(out.iter().all(|r| r.is_ok()), "drop must not be an error");
+    assert_eq!(out.len(), 0, "G2 must drop the consecutive-I/D read");
+    assert_eq!(stream.bad_cigar_count(), 1);
+}
+
+#[test]
+fn read_proc_stage_drops_bad_cigar_boundary_deletion() {
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    // SoftClip(3) D2 M5: post-clip first op is a deletion → G2 rejects.
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![
+            CigarOp::SoftClip(3),
+            CigarOp::Deletion(2),
+            CigarOp::Match(5),
+        ],
+        b"ACGTACGT".to_vec(),
+        vec![40; 8],
+    );
+    let mut stream = BaqStream::new(
+        vec![Ok(read)].into_iter(),
+        BaqConfig::default(),
+        baq_only_proc_cfg(),
+        true,
+        fasta_path,
+        repository,
+        contigs,
+        16,
+    );
+    let out: Vec<_> = (&mut stream).collect();
+    assert_eq!(out.len(), 0, "G2 must drop the boundary-deletion read");
+    assert_eq!(stream.bad_cigar_count(), 1);
+}
+
+#[test]
+fn read_proc_stage_drops_high_mismatch_read() {
+    // F1 enabled: an all-mismatch read (fraction 1.0 > 0.10) is dropped
+    // and tallied. Ref is all 'A', read all 'T' over a Match(8).
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"AAAAAAAAAAAAAAAA");
+    let proc_cfg = ReadProcessingConfig {
+        max_read_mismatch_fraction: Some(0.10),
+        mismatch_bq_floor: 0,
+    };
+    let read = synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::Match(8)],
+        b"TTTTTTTT".to_vec(),
+        vec![40; 8],
+    );
+    let mut stream = BaqStream::new(
+        vec![Ok(read)].into_iter(),
+        BaqConfig::default(),
+        proc_cfg,
+        true,
+        fasta_path,
+        repository,
+        contigs,
+        16,
+    );
+    let out: Vec<_> = (&mut stream).collect();
+    assert_eq!(out.len(), 0, "F1 must drop the all-mismatch read");
+    assert_eq!(stream.high_mismatch_count(), 1);
+}
+
+#[test]
+fn read_proc_stage_no_baq_runs_g2_and_passes_through_raw_qual() {
+    // --no-baq path (apply_baq = false): G2 still runs (the bad-CIGAR
+    // read is dropped), and the surviving read is built by passthrough,
+    // so its bq_baq equals the raw input qualities (no BAQ capping).
+    let (_dir, fasta_path, repository, contigs) =
+        stream_components_from_chrom_bytes(b"ACGTACGTACGTACGT");
+    let good = synthetic_read(
+        0,
+        1,
+        60,
+        vec![CigarOp::Match(5)],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    );
+    let bad = synthetic_read(
+        0,
+        2,
+        60,
+        vec![
+            CigarOp::Match(2),
+            CigarOp::Insertion(1),
+            CigarOp::Deletion(1),
+            CigarOp::Match(2),
+        ],
+        b"ACGTA".to_vec(),
+        vec![40; 5],
+    );
+    let mut stream = BaqStream::new(
+        vec![Ok(good), Ok(bad)].into_iter(),
+        BaqConfig::default(),
+        baq_only_proc_cfg(),
+        false, // --no-baq
+        fasta_path,
+        repository,
+        contigs,
+        16,
+    );
+    let out: Vec<_> = (&mut stream).map(|r| r.unwrap()).collect();
+    assert_eq!(
+        out.len(),
+        1,
+        "good read passes, bad-CIGAR read dropped by G2"
+    );
+    assert_eq!(
+        out[0].bq_baq,
+        vec![40; 5],
+        "passthrough keeps raw base qualities under --no-baq"
+    );
+    assert_eq!(stream.bad_cigar_count(), 1);
 }
 
 #[test]

@@ -25,7 +25,6 @@ use crate::bam::index_preflight::{
 use crate::fasta::{ContigEntry, ContigList};
 use crate::iter_ext::BufferedPeekable;
 use crate::pileup::walker::CigarOp;
-use crate::pileup::walker::indel_norm::left_align_indels;
 
 // ---------------------------------------------------------------------
 // Defaults
@@ -603,18 +602,6 @@ pub struct AlignmentMergedReader {
     contigs: ContigList,
     sample_name: String,
     config: AlignmentMergedReaderConfig,
-    /// FASTA repository for the F1 mismatch-fraction filter. `None`
-    /// disables that filter regardless of `config.max_read_mismatch_fraction`
-    /// — only relevant for in-memory test fixtures that do not have a
-    /// reference. The production `new()` always passes `Some`.
-    repository: Option<fasta::Repository>,
-    /// Cache of the most-recently-fetched contig sequence, indexed by
-    /// `ref_id`. Avoids one `Repository::get` (and its `RwLock`
-    /// acquisition) per accepted read on the steady-state path of a
-    /// chromosome. Cleared and refilled when the read's `ref_id`
-    /// changes. Held as `Arc<fasta::record::Sequence>` because that's
-    /// what `Repository::get` returns and cloning the `Arc` is free.
-    cached_contig: Option<(usize, std::sync::Arc<fasta::record::Sequence>)>,
     /// Previous `Locus` accepted from each input, parallel to
     /// `record_streams` and `paths`. `None` until the first record
     /// from that input is accepted. Used to detect within-file
@@ -801,14 +788,19 @@ impl AlignmentMergedReader {
                 PER_PEEKER_BUFFER_SIZE,
             ));
         }
+        // The F1/F3 reference filters moved to the parallel
+        // read-processing stage (`read_processor`), which builds its own
+        // per-worker reference cache from the repository the CLI passes
+        // to `BaqStream`. The reader no longer fetches reference bytes,
+        // so this `repository` argument is vestigial — retained only to
+        // keep the many call sites stable; slated for removal.
+        let _ = repository;
         Ok(Self {
             record_streams,
             paths,
             contigs,
             sample_name,
             config,
-            repository,
-            cached_contig: None,
             per_file_prev_locus: vec![None; n],
             current_locus_read_fingerprints: Vec::new(),
             current_locus: None,
@@ -1247,7 +1239,21 @@ impl Iterator for AlignmentMergedReader {
             }
 
             // Convert RecordBuf -> MappedRead.
-            let mut mapped = match record_buf_to_mapped_read(&record, chosen_idx) {
+            //
+            // G2 (bad-CIGAR), F3 (indel left-alignment), and F1
+            // (mismatch-fraction) used to run here, serially. They now
+            // run in the parallel read-processing stage
+            // (`read_processor::process_read`) so the whole per-read
+            // cost parallelises; see that module. The reader's job ends
+            // at the coordinate merge + dedup: it emits every converted,
+            // length-passing read and lets the downstream fold reject
+            // G2/F1 reads and left-align the rest. Survivors and filter
+            // totals are unchanged (verified by the byte-identity gate);
+            // the only shift is that a read later dropped by G2/F1 now
+            // appears in the at-locus dedup buffer, which is harmless
+            // because cross-file duplicates are content-identical and so
+            // share the same G2/F1 verdict.
+            let mapped = match record_buf_to_mapped_read(&record, chosen_idx) {
                 Ok(m) => m,
                 Err(e) => {
                     return self.fail(AlignmentInputError::MalformedRecord {
@@ -1257,71 +1263,6 @@ impl Iterator for AlignmentMergedReader {
                     });
                 }
             };
-
-            // G2 — `GoodCigar`-style read rejection. Drops reads
-            // whose CIGAR contains an adjacent `I`/`D` pair (no
-            // biological event produces this) or whose first/last
-            // op (after stripping clips) is a deletion (no flanking
-            // evidence on the missing side). Default-on, no opt-out.
-            //
-            // Runs **before** F3 because F3 can deliberately shift
-            // an interior indel to a boundary as part of normal
-            // canonicalisation; checking after F3 would punish that.
-            // Pre-F3 boundary deletions are the case where the
-            // aligner itself produced the suspect alignment.
-            if cigar_is_bad(&mapped.cigar) {
-                self.filter_counts.bad_cigar += 1;
-                continue;
-            }
-
-            // F3 + F1 both need the read's reference slice. Fetch
-            // once and share. Repository is cheap to clone — its
-            // internal state is `Arc<RwLock<...>>` — and cloning
-            // releases the immutable borrow on `self.repository`
-            // before `fetch_ref_for_read` takes `&mut self` for its
-            // cache update.
-            let ref_seq_opt = self
-                .repository
-                .clone()
-                .and_then(|repo| self.fetch_ref_for_read(&repo, &mapped));
-
-            // F3 — left-align indels in the CIGAR to their leftmost
-            // (canonical) position, so reads carrying the same biological
-            // indel converge on one `(anchor, REF, ALT)` and consolidate
-            // downstream. Always on, no opt-out. Mutates `mapped.cigar` in
-            // place; read seq and qual bytes are unchanged (only their
-            // alignment annotation moves). Skipped when no `Repository` is
-            // plumbed (test fixtures). Backed by the GATK `leftAlignIndels`
-            // port in `pileup::walker::indel_norm` (architecture spec
-            // §"Indel normalization (left-alignment)"); see that module for
-            // the algorithm.
-            if let Some(ref_seq) = ref_seq_opt.as_ref() {
-                left_align_indels(&mut mapped.cigar, &mapped.seq, ref_seq);
-            }
-
-            // F1 — per-read mismatch-fraction filter. Drops reads
-            // whose `M`-op mismatch fraction exceeds the configured
-            // threshold; defends against contamination, adapter
-            // readthrough, and chimeric tails that pass MAPQ but
-            // wouldn't survive base-by-base scrutiny against the
-            // reference. Runs *after* F3 so the mismatch fraction
-            // is computed against the canonicalised CIGAR. Skipped
-            // when the threshold is `None` or when no `Repository`
-            // is plumbed.
-            if let Some(threshold) = self.config.max_read_mismatch_fraction
-                && let Some(ref_seq) = ref_seq_opt.as_ref()
-                && read_exceeds_mismatch_fraction(
-                    &mapped.cigar,
-                    &mapped.seq,
-                    &mapped.qual,
-                    ref_seq,
-                    self.config.mismatch_bq_floor,
-                    threshold,
-                )
-            {
-                self.filter_counts.high_mismatch_fraction += 1;
-                continue;
-            }
 
             // Accept: record the fingerprint and bump the per-file
             // previous-locus tracker.
@@ -1342,55 +1283,6 @@ impl AlignmentMergedReader {
     fn fail(&mut self, e: AlignmentInputError) -> Option<<Self as Iterator>::Item> {
         self.fused = true;
         Some(Err(e))
-    }
-
-    /// Fetch the reference slice covering `[mapped.pos, mapped.pos +
-    /// cigar_ref_span)` for the F1 mismatch-fraction filter. Returns
-    /// `None` if the reference is unavailable or the slice would
-    /// extend past the end of the contig — both treated as "no
-    /// signal", which causes the F1 caller to skip the read instead
-    /// of dropping it.
-    ///
-    /// Caches one chromosome's `Arc<Sequence>` between calls so
-    /// reads contiguous on the same chromosome avoid the
-    /// `Repository::get` `RwLock` acquisition per read. The
-    /// underlying `noodles_fasta::Repository` already caches whole
-    /// contigs unboundedly, so this on-top cache is only an
-    /// optimisation against the per-call dispatch cost.
-    fn fetch_ref_for_read(
-        &mut self,
-        repository: &fasta::Repository,
-        mapped: &MappedRead,
-    ) -> Option<Vec<u8>> {
-        let ref_span = cigar_ref_span(&mapped.cigar);
-        if ref_span == 0 {
-            return None;
-        }
-        let contig = self.contigs.entries.get(mapped.ref_id)?;
-
-        // Refresh the cache on chrom change.
-        let needs_refresh = match &self.cached_contig {
-            Some((id, _)) => *id != mapped.ref_id,
-            None => true,
-        };
-        if needs_refresh {
-            let seq = repository.get(contig.name.as_bytes())?.ok()?;
-            self.cached_contig = Some((mapped.ref_id, seq));
-        }
-        let seq = &self.cached_contig.as_ref().expect("just set").1;
-
-        // `pos` is 1-based in our `MappedRead`; we want the byte
-        // slice covering reference positions `[pos, pos+ref_span)`.
-        // `Sequence` implements `AsRef<[u8]>` so we slice the raw
-        // byte buffer directly — sidesteps `Position` construction
-        // on the hot path.
-        let raw: &[u8] = AsRef::<[u8]>::as_ref(seq.as_ref());
-        let start = (mapped.pos as usize).checked_sub(1)?;
-        let end = start.checked_add(ref_span as usize)?;
-        if end > raw.len() {
-            return None;
-        }
-        Some(raw[start..end].to_vec())
     }
 
     fn advance_current_locus_if_needed(&mut self, ref_id: usize, pos: u64) {
@@ -1747,7 +1639,7 @@ pub(crate) fn compute_adaptor_boundary(
 /// — i.e. the count of reference positions the read covers. Helper
 /// for the F1 mismatch-fraction filter, which needs the slice
 /// `[pos, pos + ref_span)` of the reference to compare against.
-fn cigar_ref_span(cigar: &[CigarOp]) -> u32 {
+pub(crate) fn cigar_ref_span(cigar: &[CigarOp]) -> u32 {
     cigar
         .iter()
         .map(|op| match *op {
@@ -1790,7 +1682,7 @@ fn cigar_ref_span(cigar: &[CigarOp]) -> u32 {
 /// `D`/`I` pair, which is a legitimate (parsimonious) representation,
 /// not the aligner artefact this rule rejects. Running rule 1 first
 /// checks only what the aligner produced.
-fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
+pub(crate) fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
     // Rule 1 — adjacent I/D in either order.
     for window in cigar.windows(2) {
         let (a, b) = (window[0], window[1]);
@@ -1852,7 +1744,7 @@ fn cigar_is_bad(cigar: &[CigarOp]) -> bool {
 /// these slices uses the standard CIGAR semantics — see
 /// [`crate::pileup::walker::decompose`] for the
 /// reference walk pattern this function mirrors.
-fn read_exceeds_mismatch_fraction(
+pub(crate) fn read_exceeds_mismatch_fraction(
     cigar: &[CigarOp],
     seq: &[u8],
     qual: &[u8],
@@ -2708,76 +2600,18 @@ mod tests {
         assert!(reader.next().is_none());
     }
 
-    #[test]
-    fn g2_consecutive_id_record_is_dropped_with_counter() {
-        // Build a record whose CIGAR has an adjacent I/D pair. The
-        // record is otherwise pristine (passes MAPQ, length, flag
-        // checks) so the only filter that can fire is G2.
-        let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
-        let mut spec = pass_record("R", 0, 100);
-        // Adjust seq/qual length to match the new CIGAR's read-consuming ops.
-        // M(20) + I(2) + D(1) + M(rest) → read consumes 20 + 2 + (len - 20) = len + 2.
-        let m_tail = (len - 20) as u32;
-        spec.cigar_ops = vec![
-            CigarOp::Match(20),
-            CigarOp::Insertion(2),
-            CigarOp::Deletion(1),
-            CigarOp::Match(m_tail),
-        ];
-        spec.seq = default_seq(len + 2);
-        spec.qual = default_qual(len + 2);
-        let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = AlignmentMergedReader::from_open_alignment_files(
-            vec![cram],
-            default_contigs(),
-            "sample".into(),
-            AlignmentMergedReaderConfig::default(),
-            None,
-        )
-        .expect("reader");
-        let (out, counts, err) = run_to_completion(reader);
-        assert!(err.is_none(), "G2 drop should not surface an error");
-        assert!(out.is_empty(), "G2 must drop the consecutive-I/D record");
-        assert_eq!(counts.bad_cigar, 1);
-    }
+    // G2 (`cigar_is_bad`) reject + count moved out of the reader into
+    // the parallel read-processing stage; its drop/count behavior is now
+    // pinned in `baq_tests` (`read_proc_stage_drops_bad_cigar_*`). The
+    // pure `cigar_is_bad` logic stays covered by the direct unit tests
+    // below. The reader now passes bad-CIGAR records straight through, so
+    // the former reader-level G2 drop tests no longer apply.
 
     #[test]
-    fn g2_first_op_deletion_record_is_dropped_with_counter() {
-        // Boundary deletion: D as the first non-clip op. We add a
-        // leading soft-clip to verify the clip-stripping rule fires
-        // on the *post-clip* first op.
-        let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
-        let mut spec = pass_record("R", 0, 100);
-        let m_tail = (len - 5) as u32;
-        spec.cigar_ops = vec![
-            CigarOp::SoftClip(3),
-            CigarOp::Deletion(2),
-            CigarOp::Match(m_tail),
-        ];
-        // Read consumes 3 (SoftClip) + (len - 5) (Match) = len - 2.
-        spec.seq = default_seq(len - 2);
-        spec.qual = default_qual(len - 2);
-        let cram = open_cram_from_records("a.cram", vec![record_spec(spec)]);
-        let reader = AlignmentMergedReader::from_open_alignment_files(
-            vec![cram],
-            default_contigs(),
-            "sample".into(),
-            AlignmentMergedReaderConfig::default(),
-            None,
-        )
-        .expect("reader");
-        let (out, counts, err) = run_to_completion(reader);
-        assert!(err.is_none());
-        assert!(out.is_empty());
-        assert_eq!(counts.bad_cigar, 1);
-    }
-
-    #[test]
-    fn g2_well_formed_record_passes_through() {
-        // Negative control: a clean CIGAR (single interior insertion)
-        // must NOT be filtered by G2. Also pins that we are not
-        // accidentally rejecting non-G2 patterns when wiring the
-        // cascade.
+    fn well_formed_record_passes_through_reader() {
+        // A clean CIGAR (single interior insertion) passes the reader's
+        // remaining filters and is emitted with no `bad_cigar` tally
+        // (the reader no longer runs G2).
         let len = (DEFAULT_MIN_READ_LENGTH as usize) + 20;
         let mut spec = pass_record("R", 0, 100);
         let m_tail = (len - 20) as u32;
