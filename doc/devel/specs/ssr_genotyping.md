@@ -298,6 +298,12 @@ chrom   start   end   motif   purity_fraction   ref_seq_start   ref_seq
 
 - `start`/`end` are 0-based half-open; `end − start` is the reference tract length
   (the reference allele); `motif` gives the period.
+- `motif` is the **verbatim** repeat unit — reference-strand, phase-faithful (TRF's
+  consensus unit as it tiles the tract), *not* canonicalized: rotating it would
+  break tiling, and reconstruction reads phase-correct bytes from `ref_seq` anyway.
+  Its canonical *class* (lexicographically-min rotation over the motif + its
+  reverse complement) is **derived** as the §5.2 stutter "motif-or-GC class"
+  pooling key, never stored.
 - `purity_fraction` is the fraction of the tract that is a clean motif tiling, in
   [0, 1] — a *degree*, not a flag (1.0 = perfect, < 1.0 = interrupted). The
   `_fraction` suffix is deliberate: the bare name reads like a boolean.

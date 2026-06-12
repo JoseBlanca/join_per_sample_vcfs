@@ -210,25 +210,51 @@ Why the sequence, not a compact `(offset, ref, alt)` delta:
 byte-equality key for marginal memory we don't need, since the off-ladder set is
 sparse and dict-compressed anyway.)
 
-**Canonicalization — the contract behind the key.** The spec mandates
-"**canonical left-aligned form, reusing the SNP caller's indel-normalization
-discipline**" (§4.2). Reusable machinery exists —
-[indel_norm.rs](../../src/pileup/walker/indel_norm.rs) (`left_align_indels`,
-`left_align_cigar`, `normalize_alleles`) — **but it is CIGAR-oriented and
-`pub(crate)`**: it left-aligns an alignment, whereas our off-ladder allele is a
-tract-relative edit. So this is most likely **discipline reuse** (the same
-left-alignment rule, re-applied to our representation), like the BAQ pattern
-reuse — not a direct API call. The exact normalize routine is settled when
-building `pileup` (it is `pileup`'s job to *produce* canonical keys);
-`types.rs` only owns the **invariant** that `NormalizedSeq` bytes are already
-canonical, so `Eq`/`Hash`/serialization can treat them as opaque.
+**Canonicalization — share the SNP normalizer, do not re-implement it
+(DECIDED).** The spec mandates "**canonical left-aligned form, reusing the SNP
+caller's indel-normalization discipline**" (§4.2), and the right reading of
+"reuse" is *the actual code*, not a parallel copy of the rule — a hand-rolled
+SSR normalizer is a divergence-bug farm (a fix in one place that never reaches
+the other), and the cross-sample-equality invariant (§4) is exactly where that
+bites. Grounding (from a read of
+[indel_norm.rs](../../src/pileup/walker/indel_norm.rs)):
+
+- The left-alignment **core is already a representation-neutral kernel** —
+  `normalize_alleles(seqs: &[&[u8]], bounds, max_shift, trim)` — operating on
+  byte sequences, *not* CIGARs (the CIGAR functions are a wrapper on top). So
+  the primitive the off-ladder path needs already exists; it is just private.
+- It is a **port of GATK `leftAlignIndels` + `normalizeAlleles`, cross-checked
+  against freebayes** — the `bcftools norm` / `vt normalize` canonical form GIAB
+  truth uses. Reference-validated, subtle code: precisely what must not be
+  re-derived.
+- It solves the **identical problem**: the module's own doc comment describes
+  one biological indel landing at different offsets and "fragmenting support"
+  across the cohort merge — swap "reads" → "samples" and that is §4's off-ladder
+  union. One canonicalizer ⇒ SNP and SSR keys are produced by identical logic,
+  and fixes propagate to both.
+
+**Build-time shape** (settled when building `pileup`): lift `normalize_alleles`
+(+ its `Range`/helpers) into a **shared, public, representation-neutral module**,
+relocated out of `pileup/walker/` now that there are **two real users**; the SNP
+CIGAR path keeps its wrapper and calls the kernel (regression gate: SNP e2e
+tests), and the SSR off-ladder path is a **thin adapter** that builds
+`(seqs, bounds)` from `(off-ladder candidate, ref tract)` and calls the same
+kernel — not a CIGAR-faking shim, not a copy. `types.rs` only owns the
+**invariant** that `NormalizedSeq` bytes are already canonical, so
+`Eq`/`Hash`/serialization treat them as opaque.
 
 ---
 
 ## 5. Supporting types
 
 ```rust
-/// A repeat unit, ≤ 6 bp (SSR scope). `period = bytes.len()`.
+/// A repeat unit, ≤ 6 bp (SSR scope). `period = bytes.len()`. Stored
+/// **verbatim** — the reference-strand, phase-faithful unit as it appears at the
+/// locus, *not* canonicalized: canonicalizing (rotating) would break tiling, and
+/// reconstruction reads phase-correct bytes from `Locus::ref_bytes` anyway. The
+/// canonical *class* (lexicographically-min rotation over the motif and its
+/// reverse complement) is **derived on demand** as the stutter-model pooling key
+/// (spec §5.2 "motif-or-GC class"), never stored.
 struct Motif { bytes: ArrayVec<u8, 6> }   // or SmallVec; period ≤ 6 is the cap
 
 /// One catalog locus — and it carries its own reference bases, so reconstruction
@@ -322,18 +348,26 @@ the same split the SNP posterior engine uses over its allele set.
 
 ---
 
-## 8. Open questions
+## 8. Decisions (all settled)
 
-*Settled so far: the `Allele` enum (§2), its locus-relative scoping (§3),
-`NormalizedSeq` = canonical normalized sequence (§4), `units` = `u16` end-to-end
-(§2), and **reconstruction** — `Locus` carries its own reference bytes, so
-`to_sequence`/`repeat_count` are pure `Locus` methods, no `Scaffold` type, no
-FASTA past Stage 0 (§5). Still open:*
+The type model is closed. Settled:
 
-1. **Indel-norm reuse** — discipline-only (re-apply the left-align rule to our
-   off-ladder allele) vs lifting
-   [indel_norm.rs](../../src/pileup/walker/indel_norm.rs) to a shared,
-   tract-relative API. Confirm when building `pileup`; §4.
-2. **Where `Motif` canonicalization lives** — do we store the catalog motif
-   verbatim, or canonicalize (rotation/strand)? Likely verbatim (the catalog is
-   authoritative); flag if cross-locus motif comparison ever matters.
+- **`Allele` enum** — `OnLadder { units }` | `OffLadder(NormalizedSeq)`, two
+  encodings of one sequence; the enum's `==` *is* sequence-identity (§2).
+- **Locus-relative scoping** — `Allele` doesn't carry its locus; the candidate
+  set is ambient context (§3).
+- **`NormalizedSeq`** = the canonical normalized off-ladder sequence (§4).
+- **`units` = `u16`** end-to-end (`.ssr.psp` columns are `uint16`; §2).
+- **Reconstruction** — `Locus` carries its own reference bytes, so
+  `to_sequence`/`repeat_count` are pure `Locus` methods; no `Scaffold` type, no
+  FASTA past Stage 0 (§5).
+- **Indel-norm** — share the SNP `normalize_alleles` kernel (lift it to a
+  neutral module; SSR off-ladder is a thin adapter), do not re-implement (§4).
+- **Motif** — stored **verbatim** (reference-strand, phase-faithful); the
+  canonical class is **derived on demand** as the stutter pooling key, never
+  stored (§5).
+
+The two items that remain are not type questions but build-time mechanics,
+already pointed where they belong: the exact `normalize_alleles` extraction (the
+container/`pileup` refactor, §4) and `flank_bp` sizing (the catalog/`pileup`
+build, spec §3.2).
