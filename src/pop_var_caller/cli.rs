@@ -103,8 +103,11 @@ pub struct PileupArgs {
     #[arg(long)]
     pub build_map_file_index: bool,
 
-    /// Worker threads for the BAQ stage and any other rayon work.
-    /// If omitted, rayon's default (all logical cores) is used.
+    /// Worker thread count for the read-processing pipeline. If omitted,
+    /// defaults to 4 — a good balance for typical hardware. The
+    /// pipeline's scaling flattens by ~4 workers, so raising this past
+    /// your machine's performance-core count tends not to help (and can
+    /// hurt on hybrid performance/efficiency CPUs).
     #[arg(long)]
     pub threads: Option<usize>,
 
@@ -229,6 +232,12 @@ pub enum PileupCliError {
 /// Records are written to `<output>.tmp` and atomically renamed to
 /// `<output>` on success. Stderr receives a one-shot run-summary block
 /// totalling every region's counters.
+/// Default Stage 1 worker-thread count when `--threads` is omitted. A
+/// deliberately modest, hardware-agnostic value: the pipeline's wall
+/// time flattens by ~4 workers, and defaulting to all logical cores
+/// oversubscribes (badly on hybrid performance/efficiency CPUs).
+const DEFAULT_PILEUP_THREADS: usize = 4;
+
 pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let stage1 = &args.stage1;
 
@@ -238,16 +247,17 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let proc_cfg = read_processing_config_from_args(stage1);
     let walker_cfg = walker_config_from_args(stage1);
 
-    // 2. Size rayon's global pool when --threads is given (idempotent;
-    //    first caller wins).
-    // Resolve the thread budget directly from the flag (default: all
-    // logical cores). Taken from the flag rather than
-    // `rayon::current_num_threads()` so we don't lazily spin up a rayon
-    // pool we may not use.
+    // 2. Resolve the thread budget. Taken from the flag directly (not
+    //    `rayon::current_num_threads()`, which would lazily spin up a
+    //    rayon pool we may not use). When omitted we default to
+    //    `DEFAULT_PILEUP_THREADS` rather than all logical cores: the
+    //    pipeline's scaling flattens by ~4 workers, and grabbing every
+    //    core oversubscribes — worse on hybrid (performance + efficiency)
+    //    CPUs, where the extra workers land on the slow cores.
     let n_threads = args
         .threads
         .filter(|&t| t > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        .unwrap_or(DEFAULT_PILEUP_THREADS);
     // Only the inline read-processing path uses rayon (`BaqStream`'s
     // `par_drain`); the staged pipeline uses dedicated threads. Sizing
     // the global rayon pool for the pipeline path would leave `n` idle
