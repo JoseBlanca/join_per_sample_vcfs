@@ -83,7 +83,8 @@ Defined once here; used unqualified thereafter.
   run in Stage 0. A *tool name*, never a name for the feature itself — a locus
   is an SSR, not "a TRF". Do not confuse with **TR** (the feature umbrella,
   above).
-- **DUST / sdust** — low-complexity sequence masker; optional TRF prefilter.
+- **DUST / sdust** — low-complexity sequence masker. Used by the SNP path; the
+  SSR caller does **not** use it (the catalog sdust prefilter was dropped, §3.1).
 - **BAM / CRAM** — aligned-read containers (input).
 - **VCF** — Variant Call Format (output). **GFF / BED / TSV** — annotation/tabular
   formats used for the catalog.
@@ -170,7 +171,8 @@ per-locus repeat-length + stutter — and keeping the call sets independent lets
 population hypotheses be analysed independently on each marker type. Concretely:
 
 - A **standalone pipeline** (own binary/crate, own VCF); it shares only low-level
-  BAM/CRAM I/O (noodles) and the vendored `sdust`.
+  BAM/CRAM I/O (noodles). (It does *not* use the vendored `sdust` — the catalog's
+  sdust prefilter was dropped, §3.1.)
 - It does **not** read the SNP call set, and is **not** a tweak to the
   per-position `.psp` path — the SSR data model is locus/window-oriented.
 - **No SNP-phasing.** HipSTR gains accuracy by physically phasing an STR against
@@ -268,18 +270,38 @@ for new species).
   degenerate repeats (the real biology) and is the validated source of every
   established STR catalog. (Fast exact scanners like MISA/PERF are rejected as
   primary because perfect-only recall silently drops interrupted loci.)
-- **Optional DUST/sdust pre-search** to accelerate: run sdust genome-wide and
-  restrict TRF to masked windows + a margin. Kept **only if** shown near-lossless
-  *and* genome-wide TRF is too slow on the target genome (sdust is not
-  motif-aware and can miss/mis-bound loci). Must be measured (§3.4).
-- **Post-process** TRF output: keep **period ≤ 6** (SSR scope), filter by
-  purity/score, **merge overlapping/redundant** calls, drop loci without **unique
-  flanks** (mappability). These filters are accuracy knobs (§3.4).
+- **No sdust pre-search.** An earlier design kept an optional sdust prefilter
+  (mask the genome, restrict TRF to masked windows) as a speed lever; **dropped**.
+  It is speed-only and *lossy* (sdust isn't motif-aware → can miss/mis-bound
+  loci), non-standard (TRF genome-wide is the validated path), and premature (the
+  build is once-per-genome, parallelized by contig). If build speed ever matters,
+  the lossless lever is intra-contig chunking, not a lossy prefilter. **TRF runs
+  genome-wide.** (SSR therefore uses sdust nowhere — see §1.1.)
+- **Post-process** TRF output, in order: keep **period ≤ 6** (SSR scope) →
+  **split compounds** → **recompute purity, then filter** on it. These are
+  accuracy knobs (§3.4). Two specifics:
+  - **Merge is delegated to TRF**, not redone here — TRF-mod eliminates redundant
+    calls (period-multiples + same-period duplicates) by default.
+  - **`purity_fraction` is recomputed** from the (sub-)tract *after* split (using
+    the §3.2 definition — fraction matching a perfect motif tiling), because a
+    compound's combined purity is misleadingly low and TRF's per-call `fracMatch`
+    no longer fits a split sub-locus's boundaries. So the purity filter runs
+    last, on the recomputed value.
+  - **No mappability/unique-flank filter.** Mappability is delegated entirely to
+    **per-read MAPQ** in Stage 1 — MAPQ is paralog-aware by construction (a
+    near-identical copy elsewhere gives a competing alignment and lowers MAPQ) and
+    paired-end-aware (mate/insert-size rescue), which a static single-end
+    reference map is not. Unmappable/paralogous loci self-suppress downstream
+    (low-MAPQ reads → low depth → no-call); the catalog keeps *all* detected SSRs.
+    (Revisit §5.8's "segdup/mappability exclusion" consistently in the Stage-2
+    work.)
 - **Imperfect single-motif loci are kept and genotyped.** **Compound loci are
   split** into their component single-motif sub-loci (each a normal
   perfect/imperfect locus).
   - **Inner-flank consequence (carries into Stage 1):** a split sub-locus's
-    *inner* flank is the adjacent motif's repeat — *not* unique sequence. Stage 1
+    *inner* flank is the adjacent motif's repeat — *not* unique sequence. **Split
+    records the overlapping sequence** (the shared inner region between adjacent
+    sub-loci) so this structure is explicit. Stage 1
     must anchor on the **outer** flank and treat the inner boundary as
     catalog-known repeat structure, not a random unique flank.
 
@@ -357,20 +379,16 @@ for TRF.
 
 ### 3.3 Decisions
 
-- TRF primary; DUST prefilter conditional and measured.
+- TRF only, genome-wide (no sdust prefilter — §3.1).
 - Compounds split; imperfect kept.
 - No redundant columns; QA at the test level.
 
 ### 3.4 Accuracy harness (catalog)
 
-Two distinct measurements:
-1. **Catalog accuracy** — randomized-sequence FP rate (any "SSR" in shuffled
-   sequence is a false positive → calibrates thresholds); simulation recall by
-   motif × copy × purity; boundary accuracy; and **recovery of tomato published
-   capillary SSR markers** (known motif + sizes) as the species anchor.
-2. **DUST-prefilter recall** (if used) — TRF genome-wide vs TRF-within-sdust-
-   windows: fraction of true loci dropped, by motif/purity, vs wall-time saved.
-   Adopt the prefilter only if the recall loss is negligible.
+**Catalog accuracy** — randomized-sequence FP rate (any "SSR" in shuffled
+sequence is a false positive → calibrates thresholds); simulation recall by
+motif × copy × purity; boundary accuracy; and **recovery of tomato published
+capillary SSR markers** (known motif + sizes) as the species anchor.
 
 ---
 

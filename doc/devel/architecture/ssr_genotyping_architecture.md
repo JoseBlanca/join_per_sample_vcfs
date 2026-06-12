@@ -92,8 +92,9 @@ two-callers parallel is legible at the command line.
 Two framings from the spec drive every structural choice below:
 
 - **Two independent callers, one BAM** (spec §1.1). The SSR pipeline shares
-  only *low-level alignment I/O and the vendored sdust* with the SNP caller —
-  not its records, not its math, not its VCF. Architecturally this means the
+  only *low-level alignment I/O and shared numerical kernels* (`.psp` container,
+  the IBD prior, the indel-norm kernel) with the SNP caller — not its records,
+  not its math, not its VCF. Architecturally this means the
   reuse boundary is drawn at the **plumbing layer** (I/O, container,
   numerical kernels), never at the **caller layer** (records, mergers,
   variant semantics). Keeping that line clean is the single most important
@@ -152,14 +153,15 @@ to a later split if compile times or independent release ever demand it.
 
 | option | what it means | cost |
 |---|---|---|
-| **A. New repo** | SSR caller is its own project | re-vendoring or cross-repo-crate-splitting noodles, sdust, the `.psp` plumbing, posterior engine; two CI/release tracks; the "shared only raw alignments" boundary becomes a published API |
+| **A. New repo** | SSR caller is its own project | re-vendoring or cross-repo-crate-splitting noodles, the `.psp` plumbing, the posterior engine, the indel-norm kernel; two CI/release tracks; the "shared only raw alignments" boundary becomes a published API |
 | **B. New crate(s), same workspace** | split this single crate into a workspace; SSR is a sibling crate | introduces a workspace (currently one crate); forces the shared plumbing into its own crate *now*, up front |
 | **C. Same crate, new module tree + subcommands** (recommended) | `ssr-*` subcommands on the existing binary, code under a new top-level `src/ssr/` tree | none structural; reuse is direct `use` of existing modules; shared plumbing extracted *in place* as it's needed |
 
 **Recommendation: C.** The reuse surface (§5) is broad and lives *inside*
 this crate — the `.psp` container, the posterior engine's IBD prior, the BAQ
-banded-forward kernel, the FASTA/BAM readers, sdust. A new repo (A) or even a
-workspace split (B) turns every one of those into a cross-crate API that must
+banded-forward kernel, the indel-norm kernel, the FASTA/BAM readers. A new repo
+(A) or even a workspace split (B) turns every one of those into a cross-crate API
+that must
 be designed and stabilised before the SSR caller can compile a line. Option C
 lets the SSR caller `use crate::psp::…` today and lets the shared/private line
 be drawn *empirically*, by extraction from two live consumers (§3.2) — which
@@ -359,7 +361,6 @@ The reuse boundary is the plumbing layer (§2). Concretely:
 | **Indel left-align kernel** | [indel_norm.rs](../../src/pileup/walker/indel_norm.rs) (`normalize_alleles`) | spec §4.2: off-ladder canonicalization (§4 of the types doc) **reuses the actual GATK-ported kernel**, not a re-implementation — it's already a representation-neutral `(seqs, bounds)` primitive. Lift it to a neutral shared module (two real users now); SNP wrapper + SSR adapter both call it. **Code reuse**, unlike BAQ. |
 | **BAM/CRAM read I/O** | noodles via [`src/bam/`](../../src/bam/) | spec §4.1: pull reads overlapping a locus + flank. Shared low-level I/O — the sanctioned cross-caller reuse. |
 | **FASTA reference reader** | [`src/fasta/`](../../src/fasta/) | **Stage 0 only** for the SSR algorithm — scans the reference to build the catalog and embed `ref_seq` (§3.2). Stages 1–2 read reference bases from the catalog, not the FASTA (CRAM decoding aside). Same reader the pileup walker shares. |
-| **vendored sdust** | (vendored) | Stage 0 optional TRF prefilter (spec §3.1) — same masker the SNP DUST filter uses. |
 | **VCF writer** | [`src/vcf/`](../../src/vcf/) | Stage 2 output; SSR writes its own records/headers (GangSTR-compatible) but reuses the writer plumbing. |
 | **`--regions` / block index** | [regions.rs](../../src/regions.rs), [index.rs](../../src/psp/index.rs) | region-restricted `ssr-pileup`/`ssr-call`; the interval-keying change (§3.2) is the one delta. |
 | **CLI shared args** | [shared_args.rs](../../src/pop_var_caller/cli/shared_args.rs) | `--reference`, `--threads`, `--block-window-bp`, `--regions`. |
@@ -386,20 +387,19 @@ likelihood (spec §1.1).
 Each stage as a wiring diagram: what it reads, the module that does the work,
 what it writes. The math is the spec's; this is the plumbing.
 
-### Stage 0 — `ssr-catalog`
-- **In:** reference FASTA (+ optional sdust mask).
-- **Work:** `catalog/trf.rs` runs/parses TRF over the genome (or sdust
-  windows); `catalog/postprocess.rs` applies period≤6, purity/score filters,
-  overlap merge, compound split, mappability drop.
+### Stage 0 — `ssr-catalog` *(detailed in [ssr_catalog.md](ssr_catalog.md))*
+- **In:** reference FASTA.
+- **Work:** per-contig workers run **lh3/TRF-mod** (genome-wide, no sdust
+  prefilter; the binary is auto-located/launched — no FFI) and parse its BED-like
+  stdout; `catalog/postprocess.rs` applies period≤6, purity/score, overlap merge,
+  compound split (**no mappability** — MAPQ owns it); each worker embeds `ref_seq`
+  from the reference it holds.
 - **Out:** one self-describing bgzip+tabix BED-like TSV (`catalog/format.rs`),
-  `##`-header carrying reference md5 + TRF params (spec §3.2).
-- **Shape:** batch, single process, embarrassingly parallel by contig.
-- **TRF integration — no FFI.** TRF is an external C tool, not a crate. **FFI is
-  ruled out.** The choice is **shell-out to a `trf` binary** (parse its output;
-  a runtime/container dependency) **vs. vendor-and-port** the detection into
-  Rust. Settled at the **top of the Stage 0 pass**, *informed by reading the
-  vendored TRF / HipSTR / GangSTR sources* (how they invoke or reimplement
-  detection) — not pre-decided here.
+  columns `chrom start end motif purity_fraction ref_seq_start ref_seq`,
+  `##`-header carrying reference md5 + TRF-mod version/params + `flank_bp`.
+- **Shape:** fan-out worker-per-contig → ordered collector (contig order,
+  bgzip-sortable); `--num-chroms-in-parallel` caps process-level parallelism
+  (also a RAM knob); output deterministic across that knob.
 
 ### Stage 1 — `ssr-pileup` (per sample, parallel processes)
 - **In:** one BAM/CRAM + catalog (the catalog's `ref_seq` supplies all
@@ -506,10 +506,10 @@ note). Each carries Bucket-1 synthetic tests on the critical path (spec §7/§11
    (sequence-identity, on-/off-ladder hybrid, normalized off-ladder key),
    `Locus`, `Motif`, the candidate-set type. The spine every stage shares —
    settled before the stages that use it.
-1. **Stage 0 — `ssr-catalog`.** TRF integration strategy (shell-out vs
-   vendor/port, **no FFI** — §6, decided at this pass's start from the vendored
-   tools), the sdust-prefilter decision harness, the post-process filter
-   pipeline, catalog I/O types.
+1. **Stage 0 — `ssr-catalog`** *(drafted in [ssr_catalog.md](ssr_catalog.md);
+   detector = lh3/TRF-mod shell-out, worker-per-contig, `ref_seq` embed, no
+   mappability/no sdust).* Remaining: TRF-mod BED column order, post-process
+   order, `flank_bp` default.
 2. **Stage 1 — `ssr-pileup`.** The banded pair-HMM type design (bands, scratch,
    emission model), the fast/slow dispatch, the ladder/normalization types, the
    locus record → `ssr` columns mapping; **the stage's parallelism** (§7).
