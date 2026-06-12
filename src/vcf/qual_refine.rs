@@ -190,25 +190,27 @@ fn ln_binom_pmf(k: f64, n: f64, p: f64) -> f64 {
     ln_coeff + k * p.ln() + (n - k) * (1.0 - p).ln()
 }
 
-/// Above this `n`, [`binom_two_sided_p`] switches from the exact
-/// O(n) discrete sum to the O(1) normal approximation. Chosen so every
-/// calibrated and realistic single-sample depth stays on the exact
-/// path (the QUAL depth-sweep calibration ran at ≤301x; the cap leaves
-/// wide margin) — preserving byte-identical QUAL there — while bounding
-/// the per-record cost for large cohorts (where `n` is the cohort-wide
-/// depth) and for adversarial / overflow inputs. The normal
-/// approximation is most accurate precisely in the large-`n` regime
-/// where it is used.
+/// Above this `n`, [`binom_two_sided_p`] switches from the exact discrete sum
+/// to the closed-form incomplete-beta tail ([`binom_two_sided_p_beta`]). The
+/// beta method is itself exact at every `n` and `p`, so this is a
+/// *byte-identity* boundary, not an accuracy one: the discrete sum is kept
+/// below it only to preserve bit-for-bit-identical QUAL at every
+/// calibrated/realistic single-sample depth (the QUAL depth sweep ran at ≤301x;
+/// the cap leaves wide margin). Above it the per-record cost is bounded to
+/// O(log n) — for large cohorts (where `n` is the cohort-wide depth) and for
+/// adversarial / overflow inputs alike.
 const EXACT_TAIL_MAX_N: u64 = 2_000;
 
-/// Two-sided binomial-tail p-value for `k ~ Binom(n, p)`: total
-/// probability of outcomes no more likely than the observed `k`.
+/// Two-sided binomial-tail p-value for `k ~ Binom(n, p)`: total probability of
+/// outcomes no more likely than the observed `k` (the Sterne two-sided test).
 ///
-/// Exact (discrete sum over all `n+1` outcomes) for `n ≤
-/// EXACT_TAIL_MAX_N`; a continuity-corrected normal approximation above
-/// that, so the cost is bounded for large cohorts and cannot blow up on
-/// pathological depths (e.g. a corrupt `.psp` with `num_obs` near
-/// `u32::MAX`, which would otherwise loop billions of times).
+/// Exact discrete sum over all `n + 1` outcomes for `n ≤ EXACT_TAIL_MAX_N`; the
+/// exact incomplete-beta tail above that. Both are exact (the beta method
+/// reproduces the discrete sum to floating point); the split exists only to
+/// keep QUAL byte-identical at validated depths while bounding the cost to
+/// O(log n) on large cohorts and pathological inputs (e.g. a corrupt `.psp`
+/// with `num_obs` near `u32::MAX`, which the old `0..=n` sum looped billions of
+/// times over).
 fn binom_two_sided_p(k: f64, n: f64, p: f64) -> f64 {
     if n < 1.0 {
         return 1.0;
@@ -216,7 +218,7 @@ fn binom_two_sided_p(k: f64, n: f64, p: f64) -> f64 {
     let n_i = n.round() as u64;
     let k = k.round();
     if n_i > EXACT_TAIL_MAX_N {
-        return binom_two_sided_p_normal(k, n, p);
+        return binom_two_sided_p_beta(k, n, p);
     }
     let obs = ln_binom_pmf(k, n, p);
     let tol = 1e-7;
@@ -230,46 +232,158 @@ fn binom_two_sided_p(k: f64, n: f64, p: f64) -> f64 {
     acc.clamp(1e-300, 1.0)
 }
 
-/// Continuity-corrected normal approximation to [`binom_two_sided_p`],
-/// used when `n` exceeds [`EXACT_TAIL_MAX_N`]. By the CLT, `Binom(n, p)
-/// ≈ Normal(np, np(1-p))`; "outcomes no more likely than the observed
-/// `k`" become the two tails at least as far from the mean as `k`, so
-/// the two-sided tail mass is `2·Φ(−z) = erfc(z/√2)` with `z` the
-/// continuity-corrected standardized deviation.
-fn binom_two_sided_p_normal(k: f64, n: f64, p: f64) -> f64 {
-    let mean = n * p;
-    let var = n * p * (1.0 - p);
-    if var <= 0.0 {
-        // p∈{0,1}: the distribution is degenerate at np. (Callers
-        // clamp p away from the bounds, so this is only a guard.)
-        return if (k - mean).abs() < 0.5 { 1.0 } else { 1e-300 };
+/// Lentz continued fraction for the incomplete beta (Numerical Recipes
+/// `betacf`). Converges to ~1e-15 in a few dozen iterations regardless of the
+/// magnitude of `a`/`b`, which is what makes the tail O(1) in read depth.
+fn betacf(a: f64, b: f64, x: f64) -> f64 {
+    const MAXIT: usize = 300;
+    const EPS: f64 = 1e-15;
+    const FPMIN: f64 = 1e-300;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < FPMIN {
+        d = FPMIN;
     }
-    let sigma = var.sqrt();
-    // Half-count continuity correction; never let the deviation go
-    // negative (k at the mean → z = 0 → p = 1).
-    let dev = ((k - mean).abs() - 0.5).max(0.0);
-    let z = dev / sigma;
-    erfc(z / std::f64::consts::SQRT_2).clamp(1e-300, 1.0)
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=MAXIT {
+        let m_f = m as f64;
+        let m2 = 2.0 * m_f;
+        // Even step.
+        let aa = m_f * (b - m_f) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        // Odd step.
+        let aa = -(a + m_f) * (qab + m_f) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h
 }
 
-/// Complementary error function, Numerical Recipes `erfcc` rational
-/// approximation — fractional error < 1.2e-7 over the whole real line,
-/// far tighter than QUAL's ~0.01-phred resolution needs.
-fn erfc(x: f64) -> f64 {
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.5 * z);
-    let ans = t
-        * (-z * z - 1.265_512_23
-            + t * (1.000_023_68
-                + t * (0.374_091_96
-                    + t * (0.096_784_18
-                        + t * (-0.186_288_06
-                            + t * (0.278_868_07
-                                + t * (-1.135_203_98
-                                    + t * (1.488_515_87
-                                        + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
-            .exp();
-    if x >= 0.0 { ans } else { 2.0 - ans }
+/// Regularized incomplete beta `I_x(a, b)` (Numerical Recipes `betai`),
+/// self-contained via [`ln_gamma`] + [`betacf`]. Good to ~1e-12 relative —
+/// ample for a QUAL tail. This is the exact binomial CDF in closed form.
+fn reg_incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ln_front = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    let front = ln_front.exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * betacf(a, b, x) / a
+    } else {
+        1.0 - front * betacf(b, a, 1.0 - x) / b
+    }
+}
+
+/// `P(X <= k)` for `X ~ Binom(n, p)`, exact via the incomplete beta:
+/// `P(X <= k) = I_{1-p}(n - k, k + 1)`.
+fn binom_cdf_le(k: u64, n: u64, p: f64) -> f64 {
+    if k >= n {
+        return 1.0;
+    }
+    reg_incomplete_beta((n - k) as f64, (k + 1) as f64, 1.0 - p)
+}
+
+/// `P(X >= k)` for `X ~ Binom(n, p)`.
+fn binom_sf_ge(k: u64, n: u64, p: f64) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    1.0 - binom_cdf_le(k - 1, n, p)
+}
+
+/// Exact two-sided Sterne tail via the incomplete-beta CDF/SF plus a binary
+/// search for the opposite-flank cutoff, used when `n` exceeds
+/// [`EXACT_TAIL_MAX_N`]. The binomial is unimodal, so the "no more likely than
+/// `k`" set is the near tail through `k` plus a far tail beyond the
+/// opposite-side outcome of equal pmf; each flank is monotone, so the far-tail
+/// cutoff is one binary search over `ln_binom_pmf`. Cost: O(log n) pmf
+/// evaluations + two beta evaluations — independent of read depth.
+fn binom_two_sided_p_beta(k: f64, n: f64, p: f64) -> f64 {
+    if n < 1.0 {
+        return 1.0;
+    }
+    let n_u = n.round() as u64;
+    let k_u = k.round().clamp(0.0, n_u as f64) as u64;
+    let n_f = n_u as f64;
+    let lpk = ln_binom_pmf(k_u as f64, n_f, p);
+    let tol = 1e-7;
+    // `floor((n+1)p)` is always an argmax, so `pmf(mode)` is the maximum.
+    let mode = (((n_f + 1.0) * p).floor()).clamp(0.0, n_f) as u64;
+
+    // Observed at the peak: every outcome is "no more likely", so p = 1.0.
+    if k_u == mode {
+        return 1.0;
+    }
+
+    let two_sided = if k_u < mode {
+        let near = binom_cdf_le(k_u, n_u, p); // {i <= k}
+        // Far tail {i >= j}: smallest j on the right flank `[mode, n]` whose pmf
+        // is no greater than pmf(k). Empty if even pmf(n) exceeds pmf(k).
+        let far = if ln_binom_pmf(n_f, n_f, p) > lpk + tol {
+            0.0
+        } else {
+            let (mut lo, mut hi) = (mode, n_u);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if ln_binom_pmf(mid as f64, n_f, p) <= lpk + tol {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            binom_sf_ge(lo, n_u, p)
+        };
+        near + far
+    } else {
+        let near = binom_sf_ge(k_u, n_u, p); // {i >= k}
+        // Far tail {i <= j}: largest j on the left flank `[0, mode]` whose pmf
+        // is no greater than pmf(k).
+        let far = if ln_binom_pmf(0.0, n_f, p) > lpk + tol {
+            0.0
+        } else {
+            let (mut lo, mut hi) = (0u64, mode);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if ln_binom_pmf(mid as f64, n_f, p) <= lpk + tol {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            binom_cdf_le(lo, n_u, p)
+        };
+        near + far
+    };
+    two_sided.clamp(1e-300, 1.0)
 }
 
 /// Phred of a two-sided binomial tail — the balance / bias penalty.
@@ -280,6 +394,7 @@ fn tail_phred(k: f64, n: f64, p: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn ln_gamma_matches_factorial() {
@@ -303,70 +418,219 @@ mod tests {
         assert!(tail_phred(50.0, 100.0, 0.5) < 1.0);
     }
 
-    #[test]
-    fn erfc_matches_known_values() {
-        assert!((erfc(0.0) - 1.0).abs() < 1e-6);
-        // erfc(1) ≈ 0.157299, erfc(2) ≈ 0.004678 (tables).
-        assert!((erfc(1.0) - 0.157_299).abs() < 1e-5);
-        assert!((erfc(2.0) - 0.004_678).abs() < 1e-5);
-        // Symmetry: erfc(-x) = 2 - erfc(x).
-        assert!((erfc(-1.0) - (2.0 - erfc(1.0))).abs() < 1e-12);
-    }
+    // ----- verification of the incomplete-beta tail (above the cap) -----
+    //
+    // The exact discrete sum is the reference: it was validated against
+    // scipy.stats.binomtest to 0.0000 phred (tmp/qual_binom_calib.py), so the
+    // incomplete-beta method is correct iff it reproduces the sum wherever the
+    // result can change QUAL.
 
-    /// Exact two-sided tail via the discrete sum — the reference the
-    /// approximation is graded against (independent of the `n` cap).
-    fn exact_two_sided(k: f64, n: f64, p: f64) -> f64 {
+    /// Exact two-sided Sterne tail by discrete enumeration — the reference.
+    fn enumerated_two_sided_p(k: f64, n: f64, p: f64) -> f64 {
+        if n < 1.0 {
+            return 1.0;
+        }
+        let n_i = n.round() as u64;
+        let k = k.round();
         let obs = ln_binom_pmf(k, n, p);
+        let tol = 1e-7;
         let mut acc = 0.0_f64;
-        for i in 0..=(n as u64) {
+        for i in 0..=n_i {
             let lp = ln_binom_pmf(i as f64, n, p);
-            if lp <= obs + 1e-7 {
+            if lp <= obs + tol {
                 acc += lp.exp();
             }
         }
         acc.clamp(1e-300, 1.0)
     }
 
+    fn phred_of(p: f64) -> f64 {
+        (PHRED * p.log10()).max(0.0)
+    }
+
+    /// Core gate: the incomplete-beta tail must reproduce the enumeration across
+    /// the whole operating grid — every `p` incl. the clamp extremes, depths up
+    /// to where enumeration is affordable, `k` swept across both tails. Within
+    /// the decision band (penalty ≤ 100 phred, where QUAL can change) the two
+    /// must be numerically equal; deeper in the tail both saturate, so we only
+    /// require both to stay past the band.
     #[test]
-    fn normal_approx_agrees_with_exact_in_meaningful_range() {
-        // Where the penalty can actually move a QUAL (moderate
-        // deviations, z ≲ 3 → phred ~10–25), the approximation must
-        // track the exact discrete sum to within ~2 phred so the
-        // switchover at the n cap is seamless. The deep tail (z ≫ 6),
-        // where the normal approx diverges from the binomial, is checked
-        // separately — there both saturate QUAL to 0, so the gap is moot.
-        let n = EXACT_TAIL_MAX_N as f64;
-        for &(k, p) in &[(950.0, 0.5), (935.0, 0.5), (560.0, 0.3), (550.0, 0.3)] {
-            let exact_phred = -10.0 * exact_two_sided(k, n, p).log10();
-            let approx_phred = -10.0 * binom_two_sided_p_normal(k, n, p).log10();
-            let d = (exact_phred - approx_phred).abs();
-            assert!(
-                d < 2.0,
-                "phred mismatch at k={k}, p={p}: exact={exact_phred} approx={approx_phred} (Δ={d})"
+    fn beta_tail_matches_enumeration_across_grid() {
+        let ps = [1e-6, 0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.99, 0.999];
+        let ns = [1u64, 2, 5, 20, 50, 200, 1000, 2001, 4000];
+        let mut worst_band = 0.0_f64;
+        for &n in &ns {
+            for &p in &ps {
+                let nf = n as f64;
+                let mode = (((nf + 1.0) * p).floor()).clamp(0.0, nf);
+                let sd = (nf * p * (1.0 - p)).sqrt().max(1.0);
+                let mut ks: Vec<u64> = vec![0, n, mode as u64];
+                let mut z = -8.0;
+                while z <= 8.0 {
+                    let k = (mode + z * sd).round();
+                    if (0.0..=nf).contains(&k) {
+                        ks.push(k as u64);
+                    }
+                    z += 0.25;
+                }
+                ks.sort_unstable();
+                ks.dedup();
+                for &k in &ks {
+                    let kf = k as f64;
+                    let got = phred_of(binom_two_sided_p_beta(kf, nf, p));
+                    let want = phred_of(enumerated_two_sided_p(kf, nf, p));
+                    if want <= 100.0 {
+                        let d = (got - want).abs();
+                        worst_band = worst_band.max(d);
+                        assert!(
+                            d < 0.1,
+                            "decision-band mismatch at n={n} p={p} k={k}: \
+                             beta={got:.4} enum={want:.4} (Δ={d:.4})"
+                        );
+                    } else {
+                        assert!(
+                            got > 100.0,
+                            "deep-tail disagreement at n={n} p={p} k={k}: \
+                             beta={got:.4} enum={want:.4}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            worst_band < 1e-3,
+            "band agreement weaker than expected: {worst_band}"
+        );
+    }
+
+    /// Dispatch + byte-identity: the production entry point uses the exact
+    /// discrete sum at/below the cap (bit-for-bit) and the beta method above it.
+    #[test]
+    fn production_dispatch_matches_path_by_cap() {
+        let cases = [(20.0, 0.3), (50.0, 0.5), (180.0, 0.1), (995.0, 0.5)];
+        for &n in &[100.0, 1000.0, EXACT_TAIL_MAX_N as f64] {
+            for &(k, p) in &cases {
+                if k <= n {
+                    assert_eq!(
+                        binom_two_sided_p(k, n, p),
+                        enumerated_two_sided_p(k, n, p),
+                        "≤cap path must be the exact sum at n={n} k={k} p={p}"
+                    );
+                }
+            }
+        }
+        let n = (EXACT_TAIL_MAX_N + 1) as f64;
+        for &(k, p) in &[(900.0, 0.5), (300.0, 0.3), (2001.0, 0.9)] {
+            assert_eq!(
+                binom_two_sided_p(k, n, p),
+                binom_two_sided_p_beta(k.round(), n, p),
+                ">cap path must be the beta method at n={n} k={k} p={p}"
             );
         }
     }
 
     #[test]
-    fn normal_approx_saturates_in_the_deep_tail() {
-        // A gross deficit (k far below np) is "definitely an artifact"
-        // under both methods: each yields a penalty larger than any
-        // baseline QUAL, so QUAL clamps to 0 regardless of the exact
-        // value. We only require both to be very large, not equal.
-        let n = EXACT_TAIL_MAX_N as f64;
-        let exact_phred = -10.0 * exact_two_sided(300.0, n, 0.3).log10();
-        let approx_phred = -10.0 * binom_two_sided_p_normal(300.0, n, 0.3).log10();
-        assert!(exact_phred > 100.0 && approx_phred > 100.0);
+    fn reg_incomplete_beta_boundaries_and_symmetry() {
+        assert_eq!(reg_incomplete_beta(2.0, 3.0, 0.0), 0.0);
+        assert_eq!(reg_incomplete_beta(2.0, 3.0, 1.0), 1.0);
+        // I_x(a,b) = 1 - I_{1-x}(b,a).
+        for (a, b, x) in [(2.0, 3.0, 0.4), (7.5, 2.0, 0.6), (50.0, 20.0, 0.7)] {
+            let lhs = reg_incomplete_beta(a, b, x);
+            let rhs = 1.0 - reg_incomplete_beta(b, a, 1.0 - x);
+            assert!((lhs - rhs).abs() < 1e-12, "symmetry broke at ({a},{b},{x})");
+        }
+    }
+
+    #[test]
+    fn reg_incomplete_beta_matches_scipy_golden() {
+        // Pinned from scipy.special.betainc.
+        let cases = [
+            (2.0, 3.0, 0.4, 0.524_800_000_000_000),
+            (5.0, 5.0, 0.5, 0.500_000_000_000_000),
+            (10.0, 1.0, 0.9, 0.348_678_440_100_000),
+            (0.5, 0.5, 0.3, 0.369_010_119_565_545),
+            (50.0, 20.0, 0.7, 0.382_509_248_381_233),
+            (3.0, 7.0, 0.2, 0.261_802_496_000_000),
+        ];
+        for (a, b, x, want) in cases {
+            let got = reg_incomplete_beta(a, b, x);
+            assert!(
+                (got - want).abs() < 1e-10,
+                "I_{x}({a},{b})={got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn binom_cdf_matches_direct_summation() {
+        for (n, p) in [(10u64, 0.3), (25, 0.5), (40, 0.85)] {
+            for k in 0..=n {
+                let direct: f64 = (0..=k)
+                    .map(|i| ln_binom_pmf(i as f64, n as f64, p).exp())
+                    .sum();
+                let beta = binom_cdf_le(k, n, p);
+                assert!(
+                    (direct - beta).abs() < 1e-9,
+                    "CDF mismatch n={n} p={p} k={k}: direct={direct} beta={beta}"
+                );
+            }
+        }
+    }
+
+    /// At depths the enumeration can't reach (millions), the beta path must
+    /// still obey the structural invariants of a two-sided tail.
+    #[test]
+    fn beta_invariants_at_huge_depth() {
+        for &p in &[1e-6, 0.01, 0.5, 0.99, 0.999] {
+            let n = 2_000_000.0_f64;
+            let mode = ((n + 1.0) * p).floor();
+            assert!(
+                binom_two_sided_p_beta(mode, n, p) > 0.999_999,
+                "p at mode should be ~1 (p={p})"
+            );
+            let mut prev = binom_two_sided_p_beta(mode, n, p);
+            let sd = (n * p * (1.0 - p)).sqrt().max(1.0);
+            for step in 1..=8 {
+                let k = (mode + step as f64 * sd).min(n);
+                let cur = binom_two_sided_p_beta(k, n, p);
+                assert!(cur.is_finite() && (0.0..=1.0).contains(&cur));
+                assert!(cur <= prev + 1e-12, "not monotone right of mode (p={p})");
+                prev = cur;
+            }
+        }
     }
 
     #[test]
     fn large_n_is_bounded_and_sane() {
         // The whole point of the fix: a pathological depth returns a
-        // finite p-value in O(1) instead of looping billions of times.
+        // finite p-value in O(log n) instead of looping billions of times.
         let p = binom_two_sided_p(u32::MAX as f64 / 5.0, u32::MAX as f64, 0.5);
         assert!((1e-300..=1.0).contains(&p), "p out of range: {p}");
         // A 20% VAF against an expected 0.5 at enormous depth is
         // astronomically improbable → p pinned at the clamp floor.
         assert_eq!(p, 1e-300);
+    }
+
+    proptest! {
+        /// Fuzz the grid gaps: a random (n, p, k) where enumeration is still
+        /// affordable must match the beta method in the decision band.
+        #[test]
+        fn proptest_beta_matches_enumeration(
+            n in 1u64..3000,
+            p in 1e-6_f64..0.999_999,
+            frac in 0.0_f64..1.0,
+        ) {
+            let k = (frac * n as f64).round();
+            let got = phred_of(binom_two_sided_p_beta(k, n as f64, p));
+            let want = phred_of(enumerated_two_sided_p(k, n as f64, p));
+            if want <= 100.0 {
+                prop_assert!(
+                    (got - want).abs() < 0.1,
+                    "n={n} p={p} k={k}: beta={got} enum={want}"
+                );
+            } else {
+                prop_assert!(got > 100.0, "n={n} p={p} k={k}: beta={got} enum={want}");
+            }
+        }
     }
 }
