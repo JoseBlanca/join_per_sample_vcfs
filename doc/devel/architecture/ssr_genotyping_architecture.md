@@ -315,10 +315,10 @@ src/
 │   ├── mod.rs
 │   ├── types.rs             #   ★ FOUNDATIONAL, built first — shared domain types (Locus,
 │   │                        #   Motif, allele repr/key, candidate set). Doc: ssr_shared_types.md
-│   ├── catalog/             # Stage 0: TRF wrapper + post-process + catalog I/O
-│   │   ├── trf.rs           #   run/parse TRF — shell-out OR vendor/port, NO FFI (§6)
-│   │   ├── postprocess.rs   #   period≤6, purity/score filter, merge, split compounds, mappability
-│   │   └── format.rs        #   self-describing bgzip+tabix BED-like read/write
+│   ├── catalog/             # Stage 0: TRF-mod wrapper + post-process + catalog I/O
+│   │   ├── trf.rs           #   locate + run trf-mod (temp files, no FFI) + parse BED
+│   │   ├── postprocess.rs   #   period≤6, drop compound/bundle, trim, recompute purity (no split/mappability)
+│   │   └── io.rs            #   self-describing bgzip+tabix BED-like read/write
 │   ├── pileup/              # Stage 1 (ssr-pileup): per-sample reads → .ssr.psp
 │   │   ├── read_handling.rs #   pull/anchor reads, soft-clip recovery, spanning test (spec §4.1)
 │   │   ├── fast_path.rs     #   flank-anchored exact motif count (spec §4.2 fast)
@@ -390,11 +390,11 @@ what it writes. The math is the spec's; this is the plumbing.
 ### Stage 0 — `ssr-catalog` *(detailed in [ssr_catalog.md](ssr_catalog.md))*
 - **In:** reference FASTA.
 - **Work:** per-contig workers run **lh3/TRF-mod** (genome-wide, no sdust
-  prefilter; the binary is auto-located/launched — no FFI) and parse its BED-like
-  stdout; `catalog/postprocess.rs` applies period≤6, purity/score, overlap merge,
-  compound split (**no mappability** — MAPQ owns it); each worker embeds `ref_seq`
-  from the reference it holds.
-- **Out:** one self-describing bgzip+tabix BED-like TSV (`catalog/format.rs`),
+  prefilter; binary auto-located, run via temp files — no FFI) and parse its BED;
+  `catalog/postprocess.rs` applies period≤6, **drops** compound/bundled loci
+  (GangSTR-style — no split), end-trims, recomputes purity (**no mappability** —
+  MAPQ owns it); each worker embeds `ref_seq` from the reference it holds.
+- **Out:** one self-describing bgzip+tabix BED-like TSV (`catalog/io.rs`),
   columns `chrom start end motif purity_fraction ref_seq_start ref_seq`,
   `##`-header carrying reference md5 + TRF-mod version/params + `flank_bp`.
 - **Shape:** fan-out worker-per-contig → ordered collector (contig order,

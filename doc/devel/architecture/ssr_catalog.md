@@ -19,9 +19,9 @@ per reference**, offline, and its output is a self-contained, self-describing
 artifact.
 
 ```
-reference FASTA ──► [ detect ] ──► [ post-process ] ──► [ embed ref_seq ] ──► catalog.ssr_catalog.bed.gz (+ .tbi)
-                     TRF-mod          period≤6, purity,      tract + flank          self-describing TSV
-                   genome-wide        merge, split           per locus              (## header, bgzip+tabix)
+reference FASTA ──► [ detect ] ──► [ post-process ] ──────► [ embed ref_seq ] ──► catalog.ssr_catalog.bed.gz (+ .tbi)
+                     TRF-mod          period≤6, drop compound/    tract + flank      self-describing TSV
+                   genome-wide        bundle, trim, purity         per locus         (## header, bgzip+tabix)
 ```
 
 It owns one responsibility the spec recently added: **embedding the local
@@ -164,39 +164,41 @@ stdout into typed records for the post-processor.
 
 ## 4. Post-processing (`catalog/postprocess.rs`)
 
-In Rust, over the parsed TRF-mod records, per contig. **Order (decided):**
+In Rust, over the parsed TRF-mod records, per contig. **We drop compounds and
+bundles — we do not split** (decided; the GangSTR reference pipeline does exactly
+this, [GangSTR/scripts/create_ref_panel/](../../GangSTR/scripts/create_ref_panel/)).
+**Order:**
 
 1. **Period ≤ 6** — drop TRF calls outside SSR scope (cheap volume cut; acts on
    TRF's per-call period).
-2. **Split compound loci** — separate overlapping *different-motif* calls into
-   single-motif sub-loci (TRF does **not** do this — its redundancy elimination
-   is period/score-based, §3). The **inner-flank consequence** (spec §3.1): a
-   sub-locus's inner flank is the neighbour's repeat, not unique sequence.
-   **Split records the overlapping sequence** (the shared inner region between
-   adjacent sub-loci) so that structure is captured for Stage 1 (which then
-   anchors on the *outer* flank). *(That overlap also lands inside each
-   sub-locus's embedded `ref_seq` flank, §5 — the recording makes it explicit.)*
-3. **Recompute purity, then filter.** **`purity_fraction` is recomputed here from
-   the (sub-)tract bytes** — *not* taken from TRF. After split, TRF's `fracMatch`
-   was computed on the original call and no longer describes a sub-locus's
-   boundaries; and recomputing lets us use the spec's **exact** definition
-   (fraction of the tract matching a perfect motif tiling, §3.2) rather than
-   TRF's alignment-based `%match`. Recompute is **uniform** (split *and* unsplit)
-   for one consistent definition; TRF's `fracMatch` is demoted to a sanity-check.
-   The worker holds the contig resident, so the bytes are at hand. Then drop loci
-   below the purity floor (an accuracy knob, §3.4). **Imperfect single-motif loci
-   are kept** — the filter is a degeneracy floor, not perfect-only.
+2. **Drop compound-motif loci** — a locus whose motif is internally periodic
+   (`ATAT` = (AT)² — a non-fundamental period; the fundamental survives via TRF's
+   redundancy elimination). GangSTR's `minimal_trim.py::is_compound`.
+3. **Drop bundles** — any locus within `bundle_threshold` bp of another detected
+   repeat → discard the whole cluster (GangSTR's `remove_bundles.py`). This
+   sidesteps the motif-boundary change-point problem, and with
+   **`bundle_threshold ≥ flank_bp`** it *guarantees every surviving locus has
+   clean unique flanks* — so there is **no inner-flank case** anywhere downstream
+   (the `SubLocus`/overlap-recording machinery is gone).
+4. **End-trim** partial motifs at the tract ends so boundaries are clean
+   whole-motif (GangSTR's `minimal_trim`); apply per-period **copy-number floors**
+   (`{1:10, 2:5, 3:4, 4:3, 5:3, 6:3}`).
+5. **Recompute purity, then filter.** **`purity_fraction` is recomputed** from the
+   final (end-trimmed) tract bytes — *not* TRF's `fracMatch` — using the spec's
+   exact definition (fraction matching a perfect motif tiling, §3.2; end-trimming
+   moved the boundaries, so a recompute is needed anyway). The worker holds the
+   contig resident, so the bytes are at hand. Then drop loci below the purity
+   floor. **Imperfect single-motif loci are kept** — the floor is a degeneracy
+   cutoff, not perfect-only (our one divergence from GangSTR's perfect-only
+   `remove_messy`).
 
 **No own merge — trust TRF (decided).** TRF-mod eliminates redundancy by default
-(`IsRedundant`: period-multiples + same-period duplicates, §3); we **do not** add
-our own merge. (A light same-motif boundary cleanup is added later *only if*
-measurement shows a gap.)
+(`IsRedundant`: period-multiples + same-period duplicates, §3); we add none.
 
-**Why this order:** purity **after** split (a compound's combined purity is
-misleadingly low → filtering first would wrongly drop real loci); period ≤ 6
-first (cheap); merge delegated to TRF. *(A TRF-intrinsic `score` floor, if
-wanted, fits as an early accept-gate on raw TRF calls; the recomputed `purity`
-is the late, locus-level filter.)*
+**Why this order:** scope/cheap drops first; bundle-drop before trim/purity
+(purity is wasted on loci we'll discard); purity **last**, on the final trimmed
+boundaries. *(A TRF-intrinsic `score` floor, if wanted, fits as an early
+accept-gate on raw TRF calls.)*
 
 > **No mappability filter (decided).** An earlier draft had a
 > mappability/unique-flank filter; it's **dropped**. **MAPQ already handles
@@ -257,7 +259,7 @@ surface.
 
 ---
 
-## 7. Catalog format & writer (`catalog/format.rs`)
+## 7. Catalog format & writer (`catalog/io.rs`)
 
 Mostly settled in spec §3.2; the builder's job is to write it:
 
@@ -296,8 +298,8 @@ reference  ──►  │ read contig seq → spawn trf-mod → parse BED → po
 ```
 src/ssr/catalog/
 ├── trf.rs          # spawn `trf-mod` per contig + parse BED-like stdout → typed records
-├── postprocess.rs  # period≤6, purity, merge, split compounds (no mappability — MAPQ owns it)
-└── format.rs       # self-describing bgzip+tabix TSV read + write (the collector + writer)
+├── postprocess.rs  # period≤6, drop compound/bundle, trim, recompute purity (no split, no mappability)
+└── io.rs       # self-describing bgzip+tabix TSV read + write (the collector + writer)
 ```
 (plus a small `ssr-catalog` subcommand under `pop_var_caller/cli/`.)
 

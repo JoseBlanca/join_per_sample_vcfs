@@ -278,32 +278,37 @@ for new species).
   the lossless lever is intra-contig chunking, not a lossy prefilter. **TRF runs
   genome-wide.** (SSR therefore uses sdust nowhere — see §1.1.)
 - **Post-process** TRF output, in order: keep **period ≤ 6** (SSR scope) →
-  **split compounds** → **recompute purity, then filter** on it. These are
-  accuracy knobs (§3.4). Two specifics:
-  - **Merge is delegated to TRF**, not redone here — TRF-mod eliminates redundant
-    calls (period-multiples + same-period duplicates) by default.
-  - **`purity_fraction` is recomputed** from the (sub-)tract *after* split (using
-    the §3.2 definition — fraction matching a perfect motif tiling), because a
-    compound's combined purity is misleadingly low and TRF's per-call `fracMatch`
-    no longer fits a split sub-locus's boundaries. So the purity filter runs
-    last, on the recomputed value.
+  **drop compound + bundled loci** → **end-trim** partial motifs → **recompute
+  purity, then filter** (with per-period copy-number floors). These are accuracy
+  knobs (§3.4). Specifics:
+  - **Drop, don't split, compounds (decided).** Following GangSTR's validated
+    reference-panel pipeline (`GangSTR/scripts/create_ref_panel/`), we **discard**
+    rather than split: (a) loci whose **motif is internally periodic** (`ATAT` =
+    (AT)² — a non-fundamental period; the fundamental survives via TRF's
+    redundancy elimination), and (b) **bundles** — any locus within
+    `bundle_threshold` bp of another detected repeat (the whole cluster is
+    dropped, GangSTR's `remove_bundles`). This sidesteps the motif-boundary
+    change-point problem entirely; and with **`bundle_threshold ≥ flank_bp`**
+    every surviving locus has **clean unique flanks** by construction — so there
+    is **no inner-flank special case** anywhere downstream.
+  - **We keep imperfect single-motif loci** — the one deliberate divergence from
+    GangSTR (whose `remove_messy` keeps only perfect tilings). Stage 1's
+    realignment genotypes imperfect loci, so the purity filter is a degeneracy
+    **floor**, not perfect-only.
+  - **Merge is delegated to TRF** — period-multiples + same-period duplicates,
+    eliminated by default.
+  - **`purity_fraction` is recomputed** from the final (end-trimmed) tract using
+    the §3.2 definition (fraction matching a perfect motif tiling) — more faithful
+    than TRF's alignment-based `fracMatch`, and required because end-trimming
+    changes the boundaries. The purity filter runs last, on the recomputed value.
   - **No mappability/unique-flank filter.** Mappability is delegated entirely to
     **per-read MAPQ** in Stage 1 — MAPQ is paralog-aware by construction (a
     near-identical copy elsewhere gives a competing alignment and lowers MAPQ) and
     paired-end-aware (mate/insert-size rescue), which a static single-end
     reference map is not. Unmappable/paralogous loci self-suppress downstream
-    (low-MAPQ reads → low depth → no-call); the catalog keeps *all* detected SSRs.
-    (Revisit §5.8's "segdup/mappability exclusion" consistently in the Stage-2
-    work.)
-- **Imperfect single-motif loci are kept and genotyped.** **Compound loci are
-  split** into their component single-motif sub-loci (each a normal
-  perfect/imperfect locus).
-  - **Inner-flank consequence (carries into Stage 1):** a split sub-locus's
-    *inner* flank is the adjacent motif's repeat — *not* unique sequence. **Split
-    records the overlapping sequence** (the shared inner region between adjacent
-    sub-loci) so this structure is explicit. Stage 1
-    must anchor on the **outer** flank and treat the inner boundary as
-    catalog-known repeat structure, not a random unique flank.
+    (low-MAPQ reads → low depth → no-call); the catalog keeps all *surviving*
+    SSRs. (Revisit §5.8's "segdup/mappability exclusion" consistently in the
+    Stage-2 work.)
 
 ### 3.2 Catalog format
 
@@ -380,7 +385,7 @@ for TRF.
 ### 3.3 Decisions
 
 - TRF only, genome-wide (no sdust prefilter — §3.1).
-- Compounds split; imperfect kept.
+- Compounds **and bundles dropped** (not split — GangSTR-style); imperfect kept.
 - No redundant columns; QA at the test level.
 
 ### 3.4 Accuracy harness (catalog)
@@ -487,10 +492,10 @@ samples in §5.1).
     *sequencing* indels (distinct from stutter). Implemented as a **bespoke banded
     pair-HMM in Rust** (no `rust-bio` dependency), learning the banded-forward
     pattern from `baq_engine` but not coupling to it.
-  - **Compound inner-flank:** anchor on the outer unique flank; build the inner
-    context of `H_L` from the catalog neighbour (`motif × ref_copies`) via
-    coordinate adjacency. A sub-locus sandwiched between two repeats → flag
-    low-confidence.
+  - **Flanks are clean by construction** — Stage 0 drops bundled/compound loci
+    (§3.1), so every catalog locus is isolated (no detected repeat within
+    `flank_bp`). The realigner anchors on the embedded flanks with no inner-flank
+    or compound special case.
 
 **How `Qᵣ(L)` is stored — the two tiers map onto two storage regimes (§4.3),
 not a uniform per-read profile.** A read produces *either* a single length or a
