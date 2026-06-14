@@ -110,10 +110,15 @@ against `H_L` for a range of `L` yields `Qᵣ(L)`: a point mass when the read pi
 one length confidently, a spread when several lengths are plausible.
 
 **The plausible `L` are not a fixed global ladder — they are a per-read window
-around the read's own observed length.** Each read first yields a *single*
-observed count: the direct motif tally for a clean read, or the
-**soft-clip-recovered** count for a clipped one (§3.2 — the realignment of the
-clip establishes the true, possibly large, count). A *confident* read stops there
+around the read's own observed length.** Triage computes a *single* **observed
+count** for every usable read, by one of three estimators picked by where the
+read's flanks sit (§3.2/§3.3): the **direct motif tally** for a clean fast-path
+read (the aligned span *is* an integer tiling, §4); the **aligned tract span**
+(period-adjusted for interior indels) for a slow-path read still anchored on both
+flanks — interior indel / impurity / low-Q; or the **content pre-probe**
+(`find_longest_stretch`, §3.2) for a soft-clipped read, whose aligned span is
+untrustworthy and whose true (possibly large) count lives partly in the clip. A
+*confident* read stops there
 — its `Qᵣ` is a point mass at that count, stored as a single length (§11), no
 window. An *ambiguous* read instead has its forward evaluated over the window
 `L ∈ [count − W, count + W]` (`W = STUTTER_WINDOW_UNITS`, §5), because under
@@ -174,12 +179,15 @@ from the clip (§3).
 
 ## 3. Read triage (`pileup/triage.rs`)
 
-Given the reads already near a locus, **triage** them: anchor each to the flanks,
-recover soft-clipped tract ends, and sort each into spanning / allele-too-long /
-flanking / FRR / filtered. The subtle stage — everything downstream trusts this
-sorting. (Note this is a *different* decision from the fast/slow gate of §2: that
-gate decides *how to compute* a usable read's likelihood; triage decides *which
-reads are usable evidence* at all.)
+Given the reads already near a locus — already past the fetcher's cheap admission
+gate (§3.1: MAPQ/flag/length filtering reused from the SNP reader, + the
+coordinate-reach test) — **triage** them: anchor each to the flanks, recover
+soft-clipped tract ends, and sort each into spanning / allele-too-long / flanking /
+FRR. The subtle stage — everything downstream trusts this sorting. (Two distinct
+decisions sit nearby and should not be conflated: the *admission gate* (§3.1)
+cheaply drops non-evidence before the depth cap; *triage* here classifies what's
+left; and the fast/slow gate of §2 decides *how to compute* a usable read's
+likelihood. Gate → triage → fast/slow.)
 
 **3.1 Where the reads come from (not this module's job).** Reads overlapping
 `[start − flank_bp, end + flank_bp]` arrive in a bundle from the **fetcher** (§8),
@@ -187,9 +195,39 @@ not from `triage.rs`. The existing
 [`AlignmentMergedReader::query`](../../src/bam/alignment_input.rs) already yields
 every read whose footprint overlaps a region, sharing one FASTA `Repository` for
 CRAM decode — the sanctioned cross-caller I/O reuse
-([reuse map](ssr_genotyping_architecture.md), §5). The fetcher also applies the
-per-locus depth cap (§8.3) before handing the bundle off, so `triage.rs` just
-takes "the (capped) reads near this locus" and classifies them.
+([reuse map](ssr_genotyping_architecture.md), §5).
+
+**Read admission is split into a cheap gate (fetcher) and the full classification
+(this module) — and the gate's first half is *already the SNP reader's*.** The
+reason is the depth cap (§8.3): it must run in the fetcher's single streaming pass,
+so the reads it admits should already be plausible evidence — otherwise the cap
+budget `K` is spent on junk triage will discard, and a high-depth-but-messy locus
+loses its real spanning reads to eviction. The gate therefore has two cheap layers,
+neither doing sequence work:
+
+- **The shared read-admission filters, reused verbatim from the SNP pileup.**
+  `AlignmentMergedReader` (and its `query`) already drops, before it ever yields a
+  record, the same classes the SNP `pileup` drops — MAPQ `< --min-mapq` (default
+  `20`), duplicate, secondary, supplementary, unmapped, QC-fail, and reads shorter
+  than `--min-read-length` (`classify_pre_decode`,
+  [alignment_input.rs](../../src/bam/alignment_input.rs)). Stage 1 inherits these by
+  *using the same reader* — same flags, same `--min-mapq` (this is where "MAPQ owns
+  mappability", §3.3, physically happens), no reimplementation. So the reservoir
+  only ever sees flag/MAPQ/length-passing reads.
+- **One cheap SSR-specific coordinate-reach test, in the fetcher.** Of the reads the
+  reader yields, the fetcher additionally skips reservoir-admission for the ones
+  whose *aligned footprint* clearly cannot span — overlaps only one flank and is
+  **not** soft-clipped on the missing side (a coordinate + CIGAR-end test, no
+  sequence scan). Soft-clipped reads are **always admitted** (the clip may carry the
+  far flank — only the content scan in §3.2 can tell), so the gate stays
+  conservative: it never evicts a possible long allele.
+
+The **full content classification** — soft-clip recovery, spanning confirmation,
+pure-tiling, off-ladder (§3.2/§3.3) — stays in the worker, unchanged. So
+`triage.rs` takes "the (gated, capped) reads near this locus" and does the
+expensive part. The QC scalar counts (`depth`, `n_filtered`, `n_flanking`, …) are
+tallied across the fetcher's full streaming pass — over *all* reads, gated or not —
+so they report true totals even though only `K` admitted reads are kept (§8.3).
 
 **3.2 Anchor & soft-clip recovery — the hard part.** When a read carries an
 allele **longer than the reference**, the aligner often cannot place the extra
@@ -205,22 +243,42 @@ scan of the read's own repeat content *first* to estimate the length and bound t
 work, then realign only over that bounded set. **Neither tool blindly wide-band-
 aligns**, so neither do we.
 
-- **Pre-probe = count the motif in the read, GangSTR-style.** Scan the read
-  (clip included) for the longest contiguous motif run + total motif copies —
-  GangSTR's `find_longest_stretch`
+- **Pre-probe = count the motif in the read, GangSTR-style (the *clipped*-read
+  estimator).** Scan the read (clip included) for the longest contiguous motif run
+  + total motif copies — GangSTR's `find_longest_stretch`
   ([realignment.cpp:28-64](../../GangSTR/src/realignment.cpp)), an `O(read len)`
   pass that bounds its realignment range and filters junk. This is cheaper and
   more robust than aligning the clip to the flank (it needs no flank match to
-  estimate the count). It gives the `count` that centres the pair-HMM window
-  (`count ± W`, §5).
+  estimate the count). The **longest contiguous run** is the count that centres the
+  pair-HMM window (`count ± W`, §5); **total copies** is only a junk-bound / trigger
+  (`MIN_MOTIF_RUN_BY_PERIOD`, §10). The distinction matters at short periods — for a
+  period-2 motif incidental copies in the flanks inflate the *total* but not the
+  longest *contiguous* run, so centring on the contiguous run is the robust choice.
+  This estimator is used **only when a flank is in the clip** — precisely the case
+  where the CIGAR can't be trusted.
+- **The anchored slow-path read takes its count from the aligned span instead.** A
+  read that fell to the slow path for an *interior* reason (indel / impurity / low
+  boundary Q) but still has **both flanks aligned** doesn't need the content scan:
+  its anchors are placed, so triage reads `count` straight off the **aligned tract
+  span** (period-adjusted for any interior indel) — cheaper, and reliable exactly
+  because the flanks are aligned. (This is GangSTR's own two-mode behaviour: a fast
+  CIGAR-based estimate normally, content realignment only when the CIGAR indels
+  aren't a clean motif multiple.) Both estimators feed the same `count ± W` window;
+  the off-ladder candidate (§5.8) then captures whatever interior detail the integer
+  `count` glossed over.
 - **Plus a clean-flank check** against the catalog's embedded flank
   (`Locus::left_flank` / `right_flank`) — this is the **junk test and the
   spanning test** (§3.3): a real long allele shows *extra clean motif units + a
   clean flank surviving in the clip*; an adapter / low-quality end shows *no clean
   flank* and is rejected (and is the "allele ≥ read length" case if the tract runs
-  off the end). HipSTR likewise requires a soft-clip to carry the flank before it
-  trusts a clip-spanning read
-  ([bam_processor.cpp:172-186](../../HipSTR/src/bam_processor.cpp)).
+  off the end). **This is a deliberate divergence from HipSTR, which is *more
+  lenient* here:** its `spans_a_region` counts a soft-clipped read as spanning
+  whenever the clip *overlaps* the region — "the clipped sequence frequently extends
+  past the region"
+  ([bam_processor.cpp:172-186](../../HipSTR/src/bam_processor.cpp)) — without
+  requiring a clean flank to survive in the clip. We require the clean flank because
+  our two-tier design trusts the clip-recovered length directly (no full
+  re-alignment to sanity-check it later), so the flank match is our junk guard.
 - **Then the pair-HMM (§5)** runs over the narrow `count ± W` window — the
   pre-probe is what lets the band stay narrow (`W`-sized), the whole point of
   banding. Recovery is a **slow-path** operation, not a CIGAR count.
@@ -252,10 +310,21 @@ The counts feed the QC scalar columns (`depth`, `n_spanning`, `n_flanking`,
 `n_frr`, `n_filtered`, `n_flank_indel`, `mapped_reads`); only the **spanning**
 class flows into the likelihood.
 
-> **MAPQ owns mappability (catalog §4 decision).** Low-MAPQ reads are filtered
-> here (→ `n_filtered`); unmappable/paralogous loci self-suppress (low depth →
-> Stage-2 no-call). No reference-side mappability track. The MAPQ threshold is a
-> Stage-1 parameter (§10).
+> **Every QC count is *per-locus*, tallied in the fetcher's indexed pass — none is
+> a genome-wide total.** The fetcher reaches each locus through the index (§8.1:
+> seek to the first overlapping read, read until past the window), so the only reads
+> it ever sees are the ones over that locus. `mapped_reads` is therefore the count
+> of **mapped reads overlapping this locus's window** (the denominator for a
+> normalized per-locus depth), *not* the BAM's total mapped-read count — there is no
+> whole-file scan to produce such a total, by design. `depth` then counts reads
+> considered at the locus and `n_filtered` those the admission gate (§3.1) dropped
+> there; all are locus-scoped.
+
+> **MAPQ owns mappability (catalog §4 decision).** Low-MAPQ reads are filtered by
+> the shared reader's admission gate (§3.1, the SNP pileup's `--min-mapq`), not by a
+> separate `triage.rs` step, and counted into `n_filtered`; unmappable/paralogous
+> loci self-suppress (low depth → Stage-2 no-call). No reference-side mappability
+> track. The MAPQ threshold is the shared `MIN_MAPQ` Stage-1 parameter (§10).
 
 ---
 
@@ -272,6 +341,18 @@ histogram (`hist_lengths` / `hist_counts` / `hist_weight`), per-read identity
 discarded. This is the storage win: ~majority of reads cost one histogram bump,
 not a stored profile.
 
+> **"~majority" is an assumption pending measurement, not an established fact.** The
+> gate requires a **pure integer tiling**, so the fast-path fraction depends on how
+> *pure* real loci are — and interrupted/impure tracts are common in the
+> repeat-dense plant genomes this caller targets, where an intrinsically impure
+> locus sends *every* read to the slow path. The whole cost story (this section's
+> "cheap bulk", §2's split, §11's storage win) rests on this fraction, so it is a
+> **load-bearing measurement** (§14 residual validation), not a const to tune. The
+> risk is bounded — the design stays correct if the fast path is small (everything
+> just routes slow, at HipSTR-like cost minus the stutter marginalization) — but the
+> *speed claim* is not proven until the `SlowReason` split (§2) is measured on real
+> target data.
+
 > **Recommendation:** keep `fast_path.rs` allocation-free per read — it runs on
 > the hot majority. The tract walk is a strided motif compare; the only output is
 > `(units: u16, weight: f32)` pushed to a per-locus `HashMap<u16, (count,
@@ -286,17 +367,19 @@ not a stored profile.
 For every read failing the fast gate, compute a **forward (sum-over-alignments)**
 score against each candidate haplotype
 `H_L = left_flank + (motif × L) + right_flank` for `L ∈ [count − W, count + W]`
-(`W = STUTTER_WINDOW_UNITS`), where `count` is the **recovered** repeat count
-(§3.2) — so the window centres on the true length even for a soft-clipped long
-allele, not on the reference.
+(`W = STUTTER_WINDOW_UNITS`), where `count` is the read's **observed count** —
+aligned-span for an anchored read, clip-recovered via the pre-probe for a
+soft-clipped one (§3.2/§3.3) — so the window centres on the true length even for a
+soft-clipped long allele, not on the reference.
 
 The design below is **grounded in the two vendored STR callers** (read directly):
 **HipSTR** does exactly this — a forward, base-quality-aware pair-HMM realigning
 reads to STR haplotypes ([HipSTR/src/SeqAlignment/](../../HipSTR/src/SeqAlignment/),
 `HapAligner`, `AlignmentModel`), itself a port of **Dindel** (Albers et al. 2011);
 **GangSTR** takes the simpler route ([realignment.cpp](../../GangSTR/src/realignment.cpp))
-— Smith-Waterman *Viterbi*, base-quality ignored, one realign per copy number.
-Spec §4.2 chose forward + base-quality, so **HipSTR is our model**. The headline
+— a Smith-Waterman *Viterbi* (best single alignment, not a sum over alignments),
+one realign per copy number. Spec §4.2 chose a **forward** (sum-over-alignments) so
+that ambiguity is reported honestly, so **HipSTR is our model**. The headline
 finding: **our HMM is HipSTR's minus its hardest part** (next).
 
 **5.1 What we keep from HipSTR, and the big thing we drop.** HipSTR's aligner is
@@ -424,13 +507,48 @@ need only the final forward sum `Qᵣ(L)`, never an alignment**, so we keep just
 grow-and-keep (BAQ's [scratch.rs](../../src/baq/scratch.rs) pattern), **zero
 per-read allocation** on the hot path.
 
-**5.8 Off-ladder emission (§4.2).** If a read's best alignment is a definite
-*non-rung* sequence (an in-frame count + a 1 bp indel, a partial unit, a variable
-interruption), the forward *also* emits that **normalized** sequence as its own
-candidate with its forward score — so Stage 2 treats it as a distinct allele.
-Normalization is the shared indel-norm kernel (§7), not a re-implementation. The
-off-ladder leg is the §3.2-of-the-types-doc canonical key that makes the
-cross-sample union work.
+> **The forward is a pure scorer (`read × haplotype → Qᵣ`); it never reconstructs
+> a sequence.** This is what lets us drop traceback — and it is also why off-ladder
+> candidates (§5.8) are *generated* by candidate construction (§6), not "emitted"
+> by the DP: a forward over fixed haplotypes can only score a haplotype it is
+> handed, it cannot synthesize one. On- and off-ladder candidates therefore go
+> through the *same* scalar forward, and no traceback is needed for either.
+
+**5.8 Off-ladder candidates — generated from read content, then scored like any
+rung (§4.2).** A read whose tract is a definite *non-rung* sequence (an in-frame
+count + a 1 bp indel, a partial unit, a variable interruption) needs to vote for
+that exact spelling, not just the nearest rungs. Because the forward cannot *emit*
+a sequence (§5.7), the off-ladder candidate is **built from the read's own
+content** during candidate construction (§6), then handed to the same forward as
+the rungs:
+
+```
+on-ladder rung    =  left_flank + (motif × L)        + right_flank   ( count ± W of them )
+off-ladder cand.  =  left_flank + normalize(tract)   + right_flank   ( 0 or 1 per read )
+```
+
+where `tract` is the read's observed tract bases (between the anchored flanks, or
+the pre-probe-recovered tract for a soft-clip, §3.2) and `normalize` is the shared
+indel-norm kernel (§7), giving the canonical key that makes the cross-sample union
+work ([types doc](ssr_shared_types.md) §3.2). Three rules keep it bounded and
+honest:
+
+- **Generation is gated on the slow-path reason.** Only a read whose gate
+  `SlowReason` is *impure tiling / interior non-motif-multiple indel* (§2) gets an
+  off-ladder candidate; soft-clip-but-pure and low-Q reads stay purely on-ladder
+  (ambiguous, but still rungs). So the per-read candidate set is the `2W+1` rungs
+  **plus at most one** off-ladder spelling.
+- **The base-quality emission model (§5.3) does the arbitration.** Scoring the read
+  against a haplotype built from its own bases is not tautological: the off-ladder
+  spelling only out-scores the neighbouring rung `H_L` when the differing bases
+  carry high `Q`. A low-`Q` difference lets the rung explain the read as *clean
+  tract + sequencing error* and win. The on-/off-ladder comparison is thus the same
+  `Qᵣ` distribution Stage 2 needs, and routes to `offl_*` / `offl_amb_*` (§11)
+  exactly as on-ladder candidates route to `hist_*` / `amb_*`.
+- **Two degenerate cases.** If `normalize(tract)` is itself a pure tiling it *is* a
+  rung — drop the off-ladder candidate. Two reads producing the same oddball dedup
+  automatically: the per-locus off-ladder set is the union of canonical keys (§6
+  Job 2).
 
 **5.9 Flanks are clean by construction (§4.2).** Stage 0 dropped bundled/compound
 loci, so every catalog locus is isolated (no detected repeat within `flank_bp`).
@@ -457,7 +575,12 @@ explained in full here so this section stands alone):
   stray base, a partial unit, an internal interruption). It has no rung number, so
   we must carry its literal sequence.
 
-The module has two jobs, one per kind.
+**Candidate *generation* lives here; candidate *scoring* lives in the pair-HMM
+(§5).** This is the split that keeps the forward a pure scalar scorer (§5.7):
+`ladder.rs` produces the full candidate haplotype set for a read — the `count ± W`
+rungs **and**, when the read is off-ladder, one read-derived off-ladder haplotype —
+and `pair_hmm.rs` only hands each one to the forward and reads back its `Qᵣ`. The
+DP never constructs a sequence. The module has two jobs, one per allele kind.
 
 **Job 1 — build the candidate rungs as sequences (what the pair-HMM aligns
 against).** The repeat ladder is just the set of plausible lengths — rung 10, rung
@@ -476,6 +599,13 @@ downstream: because every rung is built from the **catalog** — one shared
 reference for the whole cohort — **rung 12 is the byte-identical sequence in every
 sample.** That is exactly what lets Stage 2 recognise "the 12-unit allele" as the
 same allele across all samples by its number alone.
+
+The same job also builds the **read-derived off-ladder candidate** when a read
+earns one (gated on its gate `SlowReason`, §5.8): `left_flank +
+normalize(observed_tract) + right_flank`, structurally identical to a rung but with
+the read's own (canonicalized) tract in the middle instead of a clean tiling. It
+goes into the same candidate set and is scored by the same forward — the only
+difference from a rung is where the middle bases come from.
 
 **Job 2 — give every off-ladder oddball one canonical spelling.** An off-ladder
 allele is carried as its literal sequence, and that creates a subtle trap: the
@@ -515,8 +645,12 @@ kernel**, not a copy (types doc §4, decided). The mechanics land here:
 
 - Lift `normalize_alleles` (+ its `Range`/helpers) out of
   [pileup/walker/indel_norm.rs](../../src/pileup/walker/indel_norm.rs) into a
-  **shared, public, representation-neutral module** — it is already a
-  CIGAR-agnostic `(seqs, bounds)` primitive with two real users now.
+  **shared, public, representation-neutral module**. It is *today* a **private** fn
+  whose only caller is the SNP CIGAR path (`left_align_cigar`), but its body already
+  operates on an abstract `(seqs, bounds)` pair — so the lift is making an existing
+  CIGAR-agnostic kernel public and giving it its **second** user (this stage), not
+  generalising CIGAR-coupled code. A real refactor with a regression gate (next),
+  not a free rename.
 - The SNP CIGAR path keeps its wrapper and calls the kernel; **regression gate =
   SNP end-to-end tests pass** (it is reference-validated, GATK/freebayes
   cross-checked — must not diverge).
@@ -555,8 +689,17 @@ read-fetching strategy without a benchmark:
   between loci. (A full scan would only win for a pathologically *dense* catalog,
   which ours is not.)
 
-So: **indexed access, driven off the sorted catalog.** The one cost to manage is
+So: **indexed access, driven off the sorted catalog.** The mechanism is the plain
+indexed-query loop — for each locus, the index seeks to the **first read overlapping
+`[start − flank_bp, end + flank_bp]`** and the fetcher reads forward until the first
+read past the window, then moves to the next locus. The one cost to manage is
 seeking — addressed next by centralizing it.
+
+> **Input must be indexed (a hard requirement).** This whole strategy is the index;
+> there is no whole-file-scan fallback. `ssr-pileup` therefore **requires a `.bai` /
+> `.csi` / `.crai`** alongside each input and errors out cleanly if one is missing
+> (same expectation as any region-query tool). It also implies the QC depth columns
+> are **per-locus, not genome-wide** — see §3.3.
 
 ### 8.2 The pipeline — one fetcher, a bounded queue, a worker pool, an ordered collector
 
@@ -602,7 +745,12 @@ seeking — addressed next by centralizing it.
 - **One free fetch optimization:** where several loci sit close together, the
   fetcher can cover them with **one query over the cluster's span** rather than one
   query per locus (fewer seeks, sequential decode). Where loci are far apart — the
-  common case — a cluster is one locus and this changes nothing.
+  common case — a cluster is one locus and this changes nothing. Note the
+  bookkeeping cost: during a cluster query the fetcher runs **one reservoir per
+  locus concurrently** over the shared read stream, so its working set is
+  `O(K · loci-in-cluster)`, not `O(K)` — bounded because a cluster is small (loci
+  within `flank_bp` of each other), but it is why the cluster span, not just the
+  per-locus window, must stay tight.
 
 **Scope: one invocation = one sample (not the cohort).** `ssr-pileup` processes a
 **single sample** and writes that sample's one `.ssr.psp`. It accepts **one or
@@ -634,32 +782,65 @@ task fat). Cap each locus at `MAX_READS_PER_LOCUS`, mirroring the SNP path's
 depth cap — but do it **in the fetcher's single pass**, since the total depth is
 not known until the locus is fully read.
 
-**Reservoir sampling (Algorithm R)** does exactly this. Keep the first `K =
-MAX_READS_PER_LOCUS` reads; for the `i`-th read with `i > K`, keep it with
-probability `K / i`, and if kept, drop one of the `K` currently held uniformly at
-random. At the end every read that covered the locus has the **same** probability
-`K / n` of being in the bundle (`n` = total depth) — an unbiased uniform sample,
-computed in one streaming pass with **`O(K)` memory and no second read of the
-BAM**, exactly as you'd want for the fetcher.
+**The cap is on *admitted* reads, not raw depth.** The reservoir samples only the
+reads that pass the §3.1 admission gate (the shared reader filters + the cheap
+coordinate-reach test) — so `K` budgets *plausible evidence*, never the low-MAPQ /
+duplicate / flanking-only junk that triage would discard anyway. This is what makes
+the cap-in-the-fetcher safe: capping *raw* reads pre-triage would let a junky
+high-depth locus evict its real spanning reads, but the gate has already removed the
+junk before the reservoir sees it. The one residual is conservative-by-design: a
+soft-clipped read is always admitted (only the §3.2 content scan can tell if its
+clip carries a clean flank), so a clip that later proves to be FRR/junk does consume
+a little budget and is dropped in the worker — a small, bounded leak that is
+irreducible without doing sequence work on the I/O thread.
 
-> **Determinism caveat (it interacts with §8.4).** Random subsampling must **not**
-> make the output depend on timing. Seed the per-locus reservoir RNG
-> **deterministically from the locus** (e.g. from `(chrom, start)`), not from
-> wall-clock or thread id, so the *same* reads survive the cap on every run and at
-> every `--threads`. With a per-locus seed the cap stays byte-identical. (The cap
-> threshold and the seed scheme go in the `.ssr.psp` header's `extraction_params`,
-> §10, so the subsample is reproducible and self-describing.)
+**Reservoir sampling (Algorithm R)** does exactly this. Keep the first `K =
+MAX_READS_PER_LOCUS` *admitted* reads; for the `i`-th admitted read with `i > K`,
+keep it with probability `K / i`, and if kept, drop one of the `K` currently held
+uniformly at random. At the end every *admitted* read has the **same** probability
+`K / n_adm` of being in the bundle (`n_adm` = admitted depth) — an unbiased uniform
+sample, computed in one streaming pass with **`O(K)` memory and no second read of
+the BAM**, exactly as you'd want for the fetcher. (The true `depth` / `n_filtered` /
+`n_flanking` totals are tallied over the *whole* pass, §3.1, so the QC columns are
+unaffected by the cap.)
+
+> **Determinism caveat (it interacts with §8.4) — a seed is necessary but not
+> sufficient.** Random subsampling must **not** make the output depend on timing.
+> Two preconditions, both required:
+>
+> 1. **A deterministic per-locus seed.** Seed the reservoir RNG **from the locus**
+>    (e.g. from `(chrom, start)`), not from wall-clock or thread id.
+> 2. **A total, deterministic read order.** Algorithm R's outcome depends on the
+>    *order* reads are presented — the "`i`-th read" — not just the seed. So the
+>    fetcher must present each locus's reads in a **fixed total order**, with a
+>    defined tiebreak for reads sharing a coordinate (the k-way merge of multiple
+>    inputs makes equal-coordinate collisions routine). This precondition is
+>    **already met**: [`AlignmentMergedReader`](../../src/bam/alignment_input.rs)
+>    yields a total order — `(ref_id, pos)`, then **source-file index** (ties keep
+>    the lower-indexed file), then **within-file record order** — and the single
+>    fetcher consumes that stream untouched, so every per-locus reservoir sees its
+>    reads in the same sub-order on every run and at every `--threads`. Stage 1 must
+>    **not** reorder, parallelise, or hash-shuffle reads ahead of the reservoir, or
+>    this guarantee breaks.
+>
+> With both, the cap stays byte-identical. (The cap threshold and the seed scheme go
+> in the `.ssr.psp` header's `extraction_params`, §10, so the subsample is
+> reproducible and self-describing.)
 
 ### 8.4 Determinism (invariant)
 
 Stage 1 is stutter-free with no cohort context, so it holds the **byte-identical
 output regardless of `--threads`** bar — the same standard as the catalog
-([ssr_catalog.md](ssr_catalog.md) §8.4) and the SNP pileup. Three things give it:
-the **fetcher** reads loci in a fixed coordinate order; the **collector** emits in
-`(chrom, start)` order regardless of which worker finished first; the **pair-HMM**
-is deterministic (fixed iteration order, no parallel float reduction within a
-read). The one subtlety is the depth cap — handled by the per-locus deterministic
-seed (§8.3). A regression gate.
+([ssr_catalog.md](ssr_catalog.md) §8.4) and the SNP pileup. Four things give it:
+the **fetcher** reads loci in a fixed coordinate order; it presents each locus's
+reads in a **total deterministic order** (`(ref_id, pos)` → source-file index →
+within-file record order, from `AlignmentMergedReader`; §8.3) so the reservoir's
+`i`-th read is well-defined; the **collector** emits in `(chrom, start)` order
+regardless of which worker finished first; and the **pair-HMM** is deterministic
+(fixed iteration order, no parallel float reduction within a read). The one subtlety
+is the depth cap — handled by the per-locus deterministic seed **plus** that total
+read order (§8.3); a seed alone is not enough. A regression gate, and the read-order
+invariant is part of it.
 
 ---
 
@@ -676,7 +857,11 @@ Two different "flank" sizes, easy to conflate:
 
 `FLANK_BP` must be the larger: `FLANK_BP ≥ MIN_FLANK_BP + (pair-HMM band, §5)`, so
 the realigner has reference context to anchor the flank against and the band can't
-run off `ref_bytes`.
+run off `ref_bytes`. (A read may carry *more* flank than `FLANK_BP`; the pair-HMM
+simply scores the read's flank against the embedded `FLANK_BP` window and ignores
+any excess — `FLANK_BP` is an anchor budget, not a claim about read flank length.
+Anchoring needs only enough clean flank to pin the tract boundary, which
+`MIN_FLANK_BP` already guarantees.)
 
 **Values — decided, converging on the two reference tools.** Both vendored callers
 independently land on the same anchor and a ~30 bp embedded flank:
@@ -730,9 +915,9 @@ and Stage 2 can verify the cohort was extracted consistently:
 | `STUTTER_WINDOW_UNITS` (`W`) | half-width of the candidate-`L` window | §5 |
 | `AMB_LL_DROP` | sparse-profile cutoff (drop candidates > this below per-read max, then renormalize) | §11 |
 | `FLANK_BP` | embedded-reference margin (≥ `MIN_FLANK_BP` + band; = `bundle_threshold`) | §9 |
-| `MIN_MAPQ` | read mappability filter | §3.3 |
+| `MIN_MAPQ` | read mappability filter — the **shared SNP `--min-mapq`** (default 20), applied by `AlignmentMergedReader`, not a separate SSR step | §3.1/§3.3 |
 | `MIN_MOTIF_RUN_BY_PERIOD[]` | pre-probe trigger: min motif-run in the read to attempt slow-path recovery (period-indexed, GangSTR-style: ~5/4/3 for period 2/3/≥4) | §3.2 |
-| `MAX_READS_PER_LOCUS` (`K`) | per-locus depth cap; excess reservoir-sampled (+ the per-locus seed scheme) | §8.3 |
+| `MAX_READS_PER_LOCUS` (`K`) | per-locus cap on **admitted** (gate-passing) reads — not raw depth; excess reservoir-sampled (+ the per-locus seed scheme) | §8.3 |
 | `PAIR_HMM_BAND_BP` | banded-forward half-width (sequencing-indel slack, ~7) | §5.5 |
 | `DINDEL_GAP_OPEN[]` / `GAP_EXTEND_PROB` | Dindel homopolymer-indexed gap-open table + fixed extend (`e^−1`), adopted verbatim | §5.4 |
 
@@ -768,6 +953,14 @@ All stored log-liks are **stutter-free** (the invariant). `units` lengths are
 `uint16` (non-negative; the only signed length quantity, the ref-offset Δ, is
 derived in Stage 2, never stored — types doc §2).
 
+> **What the confident-read `*_weight` columns mean for Stage 2.** A fast-path /
+> confident read has `Qᵣ` a point mass at `L*` — Stage 2 reads it as exactly that, a
+> count-1 vote with `Qᵣ(L*) = 1`. The parallel `hist_weight` / `offl_weight` is the
+> aggregated base-quality of those confident reads (a soft-count / confidence
+> aggregate), *not* a second likelihood: it lets Stage 2 down-weight a length whose
+> confident support is all low-quality, without re-storing per-read profiles for the
+> bulk. (Exact use is the spec §4.3 column contract; Stage 1 only fills it.)
+
 ---
 
 ## 12. Testing (spec §7/§11 — Bucket-1 on the critical path)
@@ -787,6 +980,14 @@ Two levels, both via the crate-internal simulator
 - **Determinism gate (§8.4):** byte-identical `.ssr.psp` across `--threads`,
   *including* the depth-cap subsample (the per-locus seed, §8.3).
 
+> **Deferred: external truth-set accuracy / cross-tool concordance.** The tests
+> above are simulator- and unit-based — they prove the stage recovers what it was
+> *given*, not that it is accurate on real data. A named external benchmark (a
+> GIAB-style STR truth set, and/or concordance against HipSTR/GangSTR on a shared
+> sample, mirroring the SNP side's GATK/freebayes cross-checks) is **deferred** —
+> not designed here, to be pinned before any precision claim is published. Tracked
+> as a known gap, not a blocker for building the stage.
+
 > The **evidence-level** simulator (synthetic `.ssr.psp` directly, no reads) is a
 > *Stage-2* tool — it lets `ssr-call` be tested before `ssr-pileup` exists
 > (architecture's critical-path order). Stage 1's tests are the *read*-level ones,
@@ -802,8 +1003,8 @@ src/ssr/pileup/
 ├── fetch.rs            # single I/O thread: forward-only index walk, depth-cap reservoir, build bundles (§8.2/§8.3)
 ├── triage.rs           # anchor reads, soft-clip recovery, spanning classification (§3)
 ├── fast_path.rs        # flank-anchored exact motif count (§4)
-├── pair_hmm.rs         # NEW bespoke banded 3-state forward + PairHmmScratch (§5)
-├── ladder.rs           # on-/off-ladder candidate construction + normalization (§6)
+├── pair_hmm.rs         # NEW bespoke banded 3-state forward + PairHmmScratch; pure scorer (read × hap → Qᵣ), no traceback (§5)
+├── ladder.rs           # candidate *generation*: rungs + read-derived off-ladder hap, + off-ladder normalization (§6)
 └── locus_record.rs     # per-locus aggregation → SsrLocusRecord → registry_ssr (§8.2/§11)
 ```
 (plus the `ssr-pileup` subcommand under
@@ -837,15 +1038,35 @@ owns mappability (§3.3); share the SNP indel-norm kernel (§7).
   (forward-only, no seek-thrash) → bounded queue → per-locus worker pool → ordered
   collector; per-locus depth cap by reservoir sampling with a deterministic
   per-locus seed (§8.3).
+- **Read admission & the depth cap (§3.1/§8.3)** — admission is a cheap two-layer
+  gate in the fetcher (the SNP reader's existing MAPQ/flag/length filters, reused
+  verbatim via `AlignmentMergedReader`, + one SSR-specific coordinate-reach test),
+  and the reservoir caps **admitted** reads, not raw depth. Cap-after-cheap-gate, not
+  cap-after-full-triage: the latter is correct but needs unbounded in-flight memory
+  at a junky locus, breaking the §8.2 memory bound. Soft-clips are always admitted
+  (conservative); full content classification stays in the worker; QC totals are
+  tallied over the whole pass.
 - **Pair-HMM (§5)** — HipSTR's flank model minus its stutter marginalization: a
   3-state forward in log-space; emission = the Dindel/BAQ per-Q model we already
   have; transitions = Dindel's homopolymer-indexed affine gaps (verbatim); layout =
   independent narrow-band forwards first, shared-flank lattice as a measured
   optimization; scratch = a rolling two-row buffer (no traceback ⇒ `O(band)`).
+- **Candidate generation vs. scoring (§5.7/§5.8/§6)** — the forward is a pure
+  scalar scorer (`read × hap → Qᵣ`, no traceback); candidate haplotypes are
+  *generated* by `ladder.rs` (the `count ± W` rungs + at most one read-derived
+  off-ladder haplotype, gated on the gate's `SlowReason`), never emitted by the DP.
+  Off-ladder candidates are the read's own normalized tract scored as one more
+  haplotype; base quality (§5.3) arbitrates off-ladder vs. nearest rung.
 - **Soft-clip / long-allele recovery (§3.2)** — cheap content pre-probe (motif
   count in the read, GangSTR `find_longest_stretch`) + clean-flank check, then the
   targeted pair-HMM. We don't re-align every read (HipSTR's choice); the fast path
   trusts the alignment for the clean majority.
+- **Observed-count estimator (§2/§3.2)** — every usable read gets one integer
+  `count` to centre the `count ± W` window, by an estimator chosen on flank
+  placement: exact motif tally (clean fast-path), aligned tract span (slow but both
+  flanks anchored — interior indel / impurity / low-Q), or the content pre-probe
+  (a flank in the clip). Aligned-span over content-probe for the anchored case —
+  cheaper and reliable because the anchors are placed (GangSTR's two-mode shape).
 - **Flank sizes (§9)** — `MIN_FLANK_BP = 5` (HipSTR `MIN_FLANK` / GangSTR
   `min_match`) and `FLANK_BP = 30 = bundle_threshold` (HipSTR's embedded-flank
   size).
@@ -862,6 +1083,10 @@ owns mappability (§3.3); share the SNP indel-norm kernel (§7).
   later extension, not a v1 entanglement.
 - **Stage-2 segdup/mappability revisit (spec §5.8)** — a Stage-2 concern, flagged
   there, not here.
+- **External truth-set accuracy / cross-tool concordance benchmark (§12)** — the
+  v1 tests are simulator- + unit-based; a named real-data benchmark (GIAB-style STR
+  truth set, HipSTR/GangSTR concordance) is deferred, to be pinned before any
+  precision claim — a known gap, not a build blocker.
 
 **Residual validation — calibration, not design (owned by §12 / Stage-0 harness).**
 These do not block building; they tune named `const`s already in place:
@@ -869,6 +1094,21 @@ These do not block building; they tune named `const`s already in place:
 - the pair-HMM constants on simulated + real repeat-rich data — the homopolymer
   extrapolation past length 10, any STR-period adjustment to the `e^−1` gap-extend,
   the band-width value (§5);
+- **the fast-path fraction on real target genomes — the one load-bearing
+  *assumption*, not just a tuned `const`.** The cost model (§2/§4) and the
+  histogram-vs-CSR storage split (§11) assume the fast path is the bulk; but the
+  fast gate demands a **pure integer tiling**, and interrupted/impure tracts are
+  common in the repeat-dense plant genomes this caller targets — at an intrinsically
+  impure locus *every* read falls to the slow path and the cost model inverts there.
+  The diagnostic already exists (the `SlowReason` breakdown, §2, is a headline
+  benchmark number): measure the per-locus and genome-wide fast/slow split on real
+  data, broken out by locus purity and period, **before** trusting the efficiency
+  story. The risk is **bounded, not existential** — if the fast path turns out small,
+  the design is still *correct* (everything routes slow), just closer to HipSTR's
+  cost; the slow path stays cheaper than HipSTR's per-locus work because it drops the
+  stutter marginalization (§5.1), and the shared-flank lattice (§5.5) is the lever to
+  pull if the slow path binds. What changes is the *headline speed claim*, so it must
+  be measured, not asserted;
 - whether the single fetcher ever becomes the throughput floor (escape hatch:
   shard by contig, §8.2);
 - the `FLANK_BP` locus-survival curve (completeness cost) and the read anchor
