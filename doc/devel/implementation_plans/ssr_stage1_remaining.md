@@ -67,12 +67,24 @@ synthetic tests.
      against `trf_print_bed`). 4 tests incl. a live integration run of trf-mod
      on a synthetic CAG repeat. Report:
      [ssr_catalog_trf_2026-06-15.md](../reports/implementations/ssr_catalog_trf_2026-06-15.md).
-   - **`run()` orchestrator + `ssr-catalog` CLI — NEXT (last Stage-0 piece)**:
-     per-contig fan-out/collect (rayon, order-preserving) reading the reference
-     (noodles-fasta) → `run_on_contig` → `build_loci` → `CatalogWriter`; compute
-     `reference_md5`, build the `CatalogHeader`, write the CSI index; wire the
-     `ssr-catalog` subcommand. Open: `min_score`/`flank_bp`/`bundle_threshold`
-     defaults (pin here).
+   - **`run()` orchestrator — DONE, sequential (2026-06-15)**: streams the
+     reference (noodles-fasta) → `run_on_contig` → `build_loci` →
+     `CatalogWriter`; whole-reference upper-cased md5; unified `CatalogParams`
+     (defaults pinned: `min_purity 0.8`, `min_score 0`, `flank_bp 50`,
+     `bundle_threshold 50`); end-to-end test drives the real trf-mod. Report:
+     [ssr_catalog_orchestrator_2026-06-15.md](../reports/implementations/ssr_catalog_orchestrator_2026-06-15.md).
+     **⚠ OPEN DESIGN QUESTION (arch §4): homopolymer bundling.** Keeping period-1
+     (per arch §4) makes long poly-A/T runs enter `drop_bundles` and drop
+     adjacent real SSRs (GangSTR drops period-1 *before* bundling to avoid this).
+     Decide: (a) drop period-1 pre-bundle (match GangSTR), (b) keep period-1 but
+     exclude it from forming bundles, or (c) accept it.
+   - **Per-contig rayon fan-out — NEXT**: bounded pool sized by
+     `--num-chroms-in-parallel`, ordered collector (contig order = sorted). The
+     single-threaded path works; parallelism is the §8 optimization.
+   - **`ssr-catalog` clap subcommand — NEXT**: `SsrCatalogArgs` + `run_ssr_catalog`
+     into `PopVarCallerCommand` (cli.rs) + `main.rs` dispatch + a CLI error type;
+     maps args → `CatalogConfig`, stamps `date`.
+   - `write_index` (CSI) for the `--regions` query path — after the writer.
 
 2. **`fetch_reads` I/O driver** *(the last missing primitive).* Add to
    [`fetch_reads.rs`](../../../src/ssr/pileup/fetch_reads.rs) (reservoir already

@@ -24,27 +24,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 use noodles_bgzf as bgzf;
 
-use super::CatalogError;
+use super::{CatalogError, CatalogParams};
 use crate::ssr::types::{Locus, Motif};
 
 /// The column-header line (without its trailing newline). Written verbatim and
 /// validated on read, so an upstream column reshuffle fails loudly.
 const COLUMN_HEADER: &str = "#chrom\tstart\tend\tmotif\tpurity_fraction\tref_seq_start\tref_seq";
-
-/// The post-process / build parameters recorded in the catalog header, so a
-/// reader can see exactly how the catalog was constructed (and Stage 1 can read
-/// back `flank_bp`, which sizes its read-anchoring band).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CatalogParams {
-    /// Flank margin (bp) embedded each side of the tract in `ref_seq`.
-    pub flank_bp: u32,
-    /// Purity floor applied after recomputation (a degeneracy cutoff).
-    pub min_purity: f32,
-    /// Early TRF-score accept-gate.
-    pub min_score: i32,
-    /// Bundle-drop radius (bp). `>= flank_bp` guarantees clean flanks.
-    pub bundle_threshold: u32,
-}
 
 /// The catalog's `##` metadata block.
 #[derive(Debug, Clone, PartialEq)]

@@ -25,23 +25,9 @@
 //! types §5) — which, after `minimal_trim` aligns the tract to a motif boundary,
 //! is exactly `trimmed_tract[0..period]`.
 
+use super::CatalogParams;
 use super::trf::TrfRecord;
 use crate::ssr::types::{Locus, Motif};
-
-/// Build/accept parameters for [`build_loci`]. The per-period copy-number
-/// floors are fixed constants ([`copy_number_floor`]), not a knob.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PostProcessParams {
-    /// Purity floor applied after recomputation (a degeneracy cutoff in
-    /// `[0, 1]`); imperfect-but-above-floor loci are kept.
-    pub min_purity: f32,
-    /// Early accept-gate on TRF's `score`; records below are dropped.
-    pub min_score: i32,
-    /// Flank margin (bp) embedded each side of the tract in `ref_seq`.
-    pub flank_bp: u32,
-    /// Bundle-drop radius (bp). `>= flank_bp` guarantees clean survivor flanks.
-    pub bundle_threshold: u32,
-}
 
 /// Per-period minimum copy number a tract must reach to survive (GangSTR
 /// `minimal_trim.py` `thresholds = {1:10, 2:5, 3:4, 4:3, 5:3, 6:3}`; default 3
@@ -68,7 +54,7 @@ pub(crate) fn build_loci(
     recs: Vec<TrfRecord>,
     chrom: &str,
     contig_seq: &[u8],
-    p: &PostProcessParams,
+    p: &CatalogParams,
 ) -> Vec<Locus> {
     // 1. scope + score gate, then 2. compound-motif drop. Both need the tract,
     //    so we slice the (upper-cased) prefix motif here and filter on it.
@@ -110,12 +96,7 @@ pub(crate) fn build_loci(
 
 /// Steps 4-5 for one record: end-trim, copy-number floor, motif, purity floor,
 /// `ref_seq` embed. `None` if the record fails any gate.
-fn finish_locus(
-    r: &TrfRecord,
-    chrom: &str,
-    contig_seq: &[u8],
-    p: &PostProcessParams,
-) -> Option<Locus> {
+fn finish_locus(r: &TrfRecord, chrom: &str, contig_seq: &[u8], p: &CatalogParams) -> Option<Locus> {
     let period = r.period as usize;
     let raw_tract = upper(&contig_seq[r.start as usize..r.end as usize]);
     let motif_bytes = raw_tract.get(..period)?.to_vec();
@@ -296,8 +277,8 @@ fn drop_bundles(recs: Vec<TrfRecord>, thresh: u32) -> Vec<TrfRecord> {
 mod tests {
     use super::*;
 
-    fn params() -> PostProcessParams {
-        PostProcessParams {
+    fn params() -> CatalogParams {
+        CatalogParams {
             min_purity: 0.8,
             min_score: 0,
             flank_bp: 5,

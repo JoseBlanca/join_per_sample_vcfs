@@ -146,9 +146,15 @@ Skills and agents are instructed to leave it untouched.
 >   `trf_print_bed`); 4 tests incl. a live trf-mod integration run; 1163 lib
 >   tests, gates green. Report
 >   [ssr_catalog_trf_2026-06-15.md](ia/reports/implementations/ssr_catalog_trf_2026-06-15.md).
->   **Stage 0 now has all three building blocks** (io + postprocess + trf);
->   last piece = the `run()` orchestrator (per-contig fan-out/collect + header +
->   CSI index) + the `ssr-catalog` CLI subcommand.
+>   **Then: `run()` orchestrator — sequential (2026-06-15)** — streams the
+>   reference (noodles-fasta) → trf → `build_loci` → `CatalogWriter`;
+>   whole-reference md5; unified `CatalogParams` (defaults pinned); end-to-end
+>   test drives real trf-mod; 1164 lib tests, gates green. Report
+>   [ssr_catalog_orchestrator_2026-06-15.md](ia/reports/implementations/ssr_catalog_orchestrator_2026-06-15.md).
+>   **⚠ Open arch-§4 design question surfaced: homopolymer bundling** — keeping
+>   period-1 (per arch §4) lets poly-A/T runs bundle-drop adjacent SSRs (GangSTR
+>   drops period-1 pre-bundle); needs a PM decision. Stage-0 remaining: per-contig
+>   rayon fan-out, the `ssr-catalog` clap subcommand, the CSI index.
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

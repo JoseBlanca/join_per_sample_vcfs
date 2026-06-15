@@ -31,6 +31,37 @@ pub mod io;
 pub mod postprocess;
 pub mod trf;
 
+/// Build/accept parameters — the post-process knobs that both drive
+/// [`postprocess::build_loci`] and are recorded in the catalog header
+/// ([`io::CatalogHeader`]) so a reader sees exactly how it was built. The
+/// per-period copy-number floors are fixed constants, not a knob.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CatalogParams {
+    /// Purity floor applied after recomputation (a degeneracy cutoff in
+    /// `[0, 1]`); imperfect-but-above-floor loci are kept.
+    pub min_purity: f32,
+    /// Early accept-gate on TRF's `score`; records below are dropped.
+    pub min_score: i32,
+    /// Flank margin (bp) embedded each side of the tract in `ref_seq`.
+    pub flank_bp: u32,
+    /// Bundle-drop radius (bp). `>= flank_bp` guarantees clean survivor flanks.
+    pub bundle_threshold: u32,
+}
+
+impl Default for CatalogParams {
+    /// Pinned Stage-0 defaults. `min_score = 0` leaves filtering to trf-mod's
+    /// own `-s 30`; `bundle_threshold == flank_bp` satisfies the
+    /// `bundle_threshold >= flank_bp` clean-flank invariant.
+    fn default() -> Self {
+        Self {
+            min_purity: 0.8,
+            min_score: 0,
+            flank_bp: 50,
+            bundle_threshold: 50,
+        }
+    }
+}
+
 /// Errors building or reading an SSR catalog (Stage 0).
 ///
 /// `#[non_exhaustive]`: the detection / post-processing front-end will add
@@ -99,4 +130,186 @@ pub(crate) enum CatalogError {
     /// failed to parse, or the contig-name column disagreed.
     #[error("malformed trf-mod BED at line {line}: {reason}")]
     TrfParse { line: usize, reason: String },
+
+    /// Reading the reference FASTA failed (open or record decode).
+    #[error("reading the reference FASTA failed ({context})")]
+    Fasta {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+// ---------------------------------------------------------------------
+// Orchestrator
+// ---------------------------------------------------------------------
+
+use std::path::PathBuf;
+
+use io::{CatalogHeader, CatalogWriter};
+
+/// Inputs for one catalog build. Plain config (the `ssr-catalog` CLI maps its
+/// clap args onto this); `date` is caller-supplied so this module reads no clock.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogConfig {
+    /// Reference FASTA to scan.
+    pub reference: PathBuf,
+    /// Output catalog path (a bgzip TSV).
+    pub output: PathBuf,
+    /// Optional explicit `trf-mod` path (else discovered, §2.4).
+    pub trf_mod_path: Option<PathBuf>,
+    /// Disk-backed root for per-contig trf-mod temp files (NOT tmpfs).
+    pub temp_dir: PathBuf,
+    /// Build/accept parameters.
+    pub params: CatalogParams,
+    /// Building tool version, recorded in the header.
+    pub tool_version: String,
+    /// Build date (`YYYY-MM-DD`), recorded in the header.
+    pub date: String,
+}
+
+/// Build a catalog: detect repeats per contig with `trf-mod`, post-process to
+/// loci, and write the bgzip TSV. **Single-threaded** for now — the per-contig
+/// rayon fan-out (architecture §8) is a follow-up; the contig order is the
+/// reference's, so output is already coordinate-sorted.
+pub(crate) fn run(cfg: &CatalogConfig) -> Result<(), CatalogError> {
+    use md5::{Digest, Md5};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let bin = trf::locate_trf_mod(cfg.trf_mod_path.as_deref())?;
+    let trf_version = trf::version(&bin)?;
+    std::fs::create_dir_all(&cfg.temp_dir).map_err(|source| CatalogError::Io {
+        context: "create catalog temp dir",
+        source,
+    })?;
+
+    // Stream the reference: per contig, detect + post-process into loci, and
+    // fold the upper-cased bases into the whole-reference md5 (the spec's
+    // upper-cased-content convention — recomputable by Stages 1-2 for an
+    // integrity check).
+    let file = File::open(&cfg.reference).map_err(|source| CatalogError::Fasta {
+        context: "open reference",
+        source,
+    })?;
+    let mut reader = noodles_fasta::io::Reader::new(BufReader::new(file));
+    let mut md5 = Md5::new();
+    let mut loci = Vec::new();
+    for result in reader.records() {
+        let rec = result.map_err(|source| CatalogError::Fasta {
+            context: "decode reference record",
+            source,
+        })?;
+        let name = String::from_utf8_lossy(rec.name()).into_owned();
+        let seq = rec.sequence().as_ref();
+        for &b in seq {
+            md5.update([b.to_ascii_uppercase()]);
+        }
+        let recs = trf::run_on_contig(&bin, &name, seq, &cfg.temp_dir)?;
+        loci.extend(postprocess::build_loci(recs, &name, seq, &cfg.params));
+    }
+    let reference_md5 = crate::pop_var_caller::common::format_md5_hex(md5.finalize().into());
+
+    let header = CatalogHeader {
+        tool_version: cfg.tool_version.clone(),
+        reference: cfg.reference.display().to_string(),
+        reference_md5,
+        trf_mod_version: trf_version,
+        params: cfg.params.clone(),
+        date: cfg.date.clone(),
+    };
+    let sink = File::create(&cfg.output).map_err(|source| CatalogError::Io {
+        context: "create catalog output",
+        source,
+    })?;
+    let mut writer = CatalogWriter::new(sink, &header)?;
+    for locus in &loci {
+        writer.write_locus(locus)?;
+    }
+    let file = writer.finish()?;
+    file.sync_all().map_err(|source| CatalogError::Io {
+        context: "sync catalog output",
+        source,
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssr::catalog::io::CatalogReader;
+    use std::io::Write;
+
+    /// End-to-end: write a tiny reference with one clean (CAG)*40 tract, run the
+    /// orchestrator (driving the installed trf-mod), and read the catalog back.
+    /// Skips (does not fail) if trf-mod is unavailable — exercised in the dev
+    /// container.
+    #[test]
+    fn run_builds_a_catalog_for_a_synthetic_reference() {
+        if trf::locate_trf_mod(None).is_err() {
+            eprintln!("skipping run() test: trf-mod not found on this host");
+            return;
+        }
+        std::fs::create_dir_all("tmp").unwrap();
+        let dir = tempfile::tempdir_in("tmp").unwrap();
+        let ref_path = dir.path().join("ref.fa");
+        let out_path = dir.path().join("catalog.bed.gz");
+
+        // (CAG)*40 (120 bp) bounded by NON-repetitive flanks — a homopolymer
+        // flank would be detected as a period-1 repeat and bundle-drop the CAG
+        // tract (see the design note in the report). trf-mod reports only the
+        // CAG record for this reference.
+        let flank = b"GTCAACTGGATCGTAACCGTTAGCATCGGATCAACGTTGACTGCAATGCATGCAGTTCGAT";
+        let mut seq = flank.to_vec();
+        for _ in 0..40 {
+            seq.extend_from_slice(b"CAG");
+        }
+        seq.extend_from_slice(flank);
+        {
+            let mut f = std::fs::File::create(&ref_path).unwrap();
+            writeln!(f, ">ctg1").unwrap();
+            f.write_all(&seq).unwrap();
+            writeln!(f).unwrap();
+        }
+
+        let cfg = CatalogConfig {
+            reference: ref_path,
+            output: out_path.clone(),
+            trf_mod_path: None,
+            temp_dir: PathBuf::from("tmp"),
+            params: CatalogParams::default(),
+            tool_version: "0.0.0-test".to_string(),
+            date: "2026-06-15".to_string(),
+        };
+        run(&cfg).expect("catalog build");
+
+        let mut reader = CatalogReader::new(std::fs::File::open(&out_path).unwrap()).unwrap();
+        assert_eq!(reader.header().reference_md5.len(), 32);
+        assert!(reader.header().trf_mod_version.contains("Version"));
+        let loci = reader.read_all().unwrap();
+        // One period-3, perfect CAG-family tract (phase-robust assertions).
+        let cag = loci
+            .iter()
+            .find(|l| l.period() == 3 && l.purity_fraction() == 1.0)
+            .expect("a perfect period-3 locus is in the catalog");
+        assert_eq!(cag.chrom(), "ctg1");
+        let motif = cag.motif();
+        let motif = motif.as_bytes();
+        assert!(
+            matches!(motif, b"CAG" | b"AGC" | b"GCA"),
+            "motif is a CAG rotation, got {motif:?}"
+        );
+        let span = cag.end() - cag.start();
+        assert!(
+            span >= 114 && span % 3 == 0,
+            "≈40 CAG copies, got {span} bp"
+        );
+        assert!(
+            cag.ref_tract()
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == motif[i % 3]),
+            "ref tract is a perfect motif tiling"
+        );
+    }
 }
