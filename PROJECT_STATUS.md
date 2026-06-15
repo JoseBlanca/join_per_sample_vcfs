@@ -134,8 +134,15 @@ Skills and agents are instructed to leave it untouched.
 >   wire format (`CatalogHeader`/`CatalogWriter`/`CatalogReader`, bgzip TSV,
 >   `Locus`⇄row, 6 round-trip tests; 1148 lib tests, gates green). Report
 >   [ssr_catalog_io_2026-06-15.md](ia/reports/implementations/ssr_catalog_io_2026-06-15.md).
->   Next Stage-0 increments: `postprocess.rs` (GangSTR port, buildable now) then
->   `trf.rs` (**blocked — `trf-mod` binary not in the container**) + `run()`/CLI.
+>   **Then: `postprocess.rs` + `trf::TrfRecord` (2026-06-15)** — the per-contig
+>   pipeline (period≤6 → drop-compound → drop-bundle → end-trim → purity →
+>   embed-`ref_seq`; faithful GangSTR `minimal_trim`/`remove_bundles` port; 11
+>   tests; 1159 lib tests, gates green). Report
+>   [ssr_catalog_postprocess_2026-06-15.md](ia/reports/implementations/ssr_catalog_postprocess_2026-06-15.md).
+>   **trf-mod now installed in the dev container** (`build(container)` commit;
+>   `/usr/local/bin/trf-mod`, lh3 @ `3e891db`), so the `trf.rs` spawn/parse
+>   increment is unblocked. Next: `trf.rs` locate/spawn/`parse_bed_line` →
+>   `run()` orchestrator + `ssr-catalog` CLI.
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

@@ -55,15 +55,18 @@ synthetic tests.
      (`CatalogHeader`/`CatalogWriter`/`CatalogReader` + `Locus`⇄row, bgzip TSV,
      6 round-trip tests). Report:
      [ssr_catalog_io_2026-06-15.md](../reports/implementations/ssr_catalog_io_2026-06-15.md).
-   - **`catalog/postprocess.rs` — NEXT** (pure GangSTR port, no external dep;
-     buildable now): period≤6 → drop-compound → drop-bundle → end-trim →
-     recompute-purity → embed-`ref_seq`. Consumes a `TrfRecord`, emits `Locus`.
-   - **`catalog/trf.rs` — BLOCKED on tooling**: locate/spawn `trf-mod` + BED
-     parse. The `trf-mod` **binary is not installed** in the dev container (only
-     the `TRF-mod/` source is vendored) — build it into the container image
-     before this increment. Open: BED column order (confirm against trf-mod),
-     `min_score`/`flank_bp` defaults.
-   - **`run()` orchestrator + `ssr-catalog` CLI** — after trf + postprocess.
+   - **`catalog/postprocess.rs` — DONE (2026-06-15)**: `build_loci` — the
+     period≤6 → drop-compound → drop-bundle → end-trim → recompute-purity →
+     embed-`ref_seq` pipeline (faithful GangSTR `minimal_trim`/`remove_bundles`
+     port; consumes `TrfRecord`, emits `Locus`; 11 unit tests). Also `trf.rs`
+     `TrfRecord` (the type postprocess consumes). Report:
+     [ssr_catalog_postprocess_2026-06-15.md](../reports/implementations/ssr_catalog_postprocess_2026-06-15.md).
+   - **`catalog/trf.rs` spawn/parse — NEXT** (UNBLOCKED — `trf-mod` is now in
+     the dev container at `/usr/local/bin/trf-mod`, commit `3e891db`):
+     `locate_trf_mod`, `version`, `run_on_contig` (temp-file spawn, no pipes),
+     `parse_bed_line` (10-col BED) + a golden test from real trf-mod output.
+   - **`run()` orchestrator + `ssr-catalog` CLI** — after trf spawn/parse.
+     Open: `min_score`/`flank_bp`/`bundle_threshold` defaults (pin here).
    - `write_index` (CSI) for the `--regions` query path — after the writer.
 
 2. **`fetch_reads` I/O driver** *(the last missing primitive).* Add to

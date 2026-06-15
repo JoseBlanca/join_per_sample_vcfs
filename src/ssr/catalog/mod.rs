@@ -18,13 +18,17 @@
 //!
 //! - [`io`] — **built**: [`io::CatalogHeader`], [`io::CatalogWriter`],
 //!   [`io::CatalogReader`], and the `Locus` ⇄ row serialisation + round-trip.
-//! - `trf` — *pending*: locate + spawn `trf-mod` per contig, parse its BED.
-//!   (Blocked on a `trf-mod` binary being available in the dev container.)
-//! - `postprocess` — *pending*: the period≤6 → drop-compound → drop-bundle →
-//!   end-trim → recompute-purity → embed-`ref_seq` pipeline (GangSTR port).
+//! - [`postprocess`] — **built**: [`postprocess::build_loci`] — the period≤6 →
+//!   drop-compound → drop-bundle → end-trim → recompute-purity → embed-`ref_seq`
+//!   pipeline (faithful GangSTR `minimal_trim`/`remove_bundles` port).
+//! - [`trf`] — **partial**: the parsed [`trf::TrfRecord`] type (what
+//!   `postprocess` consumes). The locate / spawn / BED-parse functions are the
+//!   next increment (the `trf-mod` binary is now in the dev container).
 //! - `run()` orchestrator + the `ssr-catalog` CLI subcommand — *pending*.
 
 pub mod io;
+pub mod postprocess;
+pub mod trf;
 
 /// Errors building or reading an SSR catalog (Stage 0).
 ///
