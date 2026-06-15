@@ -47,8 +47,10 @@ Skills and agents are instructed to leave it untouched.
 >   now wired end-to-end (`analyze_read`: triage → rungs → score → Qᵣ), and
 >   `locus_record` aggregates per-read outcomes into the locus evidence record
 >   (storage revised to **all-CSR** — no histogram/weight; renormalized profiles).
->   Next: `fetch_reads` (the I/O fetcher) and the driver, then the container
->   writer. Off-ladder wiring + the measured fast path deferred.
+>   `fetch_reads` started with the net-new per-locus reservoir (Algorithm R +
+>   deterministic per-locus seed). Next: the `fetch_reads` I/O driver
+>   (catalog-walk + `query`) + the driver + the container writer — the remaining
+>   pieces all converge on the container. Off-ladder + measured fast path deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
@@ -975,7 +977,8 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - `triage` complete (realign-everything) — `find_longest_stretch` pre-probe + `read_footprint`/`brackets`/`extract_region`/`triage_read` in [src/ssr/pileup/triage.rs](src/ssr/pileup/triage.rs): coverage classification (footprint position + clips, no flank-byte match) → region extract → window centre. Read seam = `MappedRead`. Recovers soft-clipped long alleles via the clip-included pre-probe (test: mapper's 3 units → true 6). 22 tests. [ssr_pileup_triage_2026-06-15.md](ia/reports/implementations/ssr_pileup_triage_2026-06-15.md)
   - Per-read analysis wired — `analyze_read` + `ReadOutcome` in [src/ssr/pileup/read_analysis.rs](src/ssr/pileup/read_analysis.rs): composes `triage_read` → `build_rungs` → `score_candidates` → dense `Qᵣ` (Spanning) / Flanking / InRepeat. Reuses scratch buffers. Integration-tested incl. the realign-everything win (soft-clipped 6-unit allele the mapper called as 3 → ranks rung 6). 4 tests. Off-ladder candidate generation deferred (needs anchored observed-tract isolation; rare). Context in commit.
   - `locus_record` aggregation — `aggregate` + `SsrLocusRecord` + `QcCounts` in [src/ssr/pileup/locus_record.rs](src/ssr/pileup/locus_record.rs). **Storage model revised → all-CSR** (no histogram, no weight): every spanning read stored as one pruned + renormalized `Qᵣ` profile; `AMB_LL_DROP` pruning; renormalize provably lossless (`Z_r` cancels); derive `n_spanning`/`n_flanking`/`n_frr`, take `depth`/`n_filtered`/`mapped_reads`; drop vestigial `n_flank_indel`. In-memory (CSR flattening = deferred container's job). Diverges from spec §4.3 (amend). 6 tests. [ssr_pileup_locus_record_2026-06-15.md](ia/reports/implementations/ssr_pileup_locus_record_2026-06-15.md)
-  - Stage modules still to build: `fetch_reads` (I/O fetcher: index walk + reservoir + bundles + `QcCounts`); the driver; the container schema/writer (deferred refactor — flattens `SsrLocusRecord` profiles → CSR columns). Deferred: off-ladder candidate wiring; the measured `count_repeats` fast-path shortcut.
+  - `fetch_reads` started — the per-locus depth cap: `Reservoir<T>` (Algorithm R) + deterministic `locus_seed(chrom, start)` (FNV-1a) + inline `SplitMix64` PRNG, in [src/ssr/pileup/fetch_reads.rs](src/ssr/pileup/fetch_reads.rs). Net-new (SNP has only a column cap); byte-identity-critical (deterministic seed + caller's fixed read order, §8.3/§8.4). `MAX_READS_PER_LOCUS=1000` placeholder. 6 tests. Context in commit.
+  - Stage modules still to build (need the container writer / real I/O): the `fetch_reads` catalog-walk + `query` driver (mirror SNP `run_pileup`: load handles once, share repo, clear per contig) + admission gate (reuse triage footprint) + bundles; the driver (`mod.rs run()`); the container schema/writer (deferred refactor — flattens `SsrLocusRecord` profiles → CSR). Single-threaded semantics first, then the fetcher-thread/pool (determinism-gated). Deferred: off-ladder wiring; the measured `count_repeats` fast-path shortcut.
   - `pair_hmm` follow-ups: homopolymer-indexed gap-open + banding (calibration/optimization, arch §14).
 
 ---

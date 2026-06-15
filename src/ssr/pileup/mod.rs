@@ -15,6 +15,7 @@
 
 pub mod candidate_generation;
 pub mod count_repeats;
+pub mod fetch_reads;
 pub mod locus_record;
 pub mod pair_hmm;
 pub mod read_analysis;
