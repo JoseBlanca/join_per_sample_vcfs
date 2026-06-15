@@ -6,9 +6,9 @@
 //! the otherwise schema-agnostic machinery needs (architecture §10.2):
 //! its **column table**, a **record type**, the **per-block
 //! accumulator** that buffers records into column buffers, and the
-//! **record → column-bytes** encode. The *decode* half (columns →
-//! record) is added in step 1b alongside the reader's typed path; this
-//! module is the writer-side surface only.
+//! **record → column-bytes** encode — plus the read-side mirror, the
+//! per-block [`BlockDecoder`] (columns → record), which is `pub(crate)`
+//! because it names internal wire types.
 //!
 //! The generic [`PspWriter`](super::writer::PspWriter) is parameterised
 //! on a [`PspKind`]; [`SnpKind`](super::writer::SnpKind) is the only
@@ -22,6 +22,53 @@ use std::io::Read;
 use super::ColumnDef;
 use super::block::BlockHeader;
 use super::errors::{PspReadError, PspWriteError};
+
+/// Declare a per-schema column-dispatch key enum with a compile-time
+/// single source of truth for the `key ↔ tag` pairing (M5).
+///
+/// Both directions — `tag(self) -> u16` and `from_tag(u16) ->
+/// Option<Self>` — are generated from one `Variant = tag` list as
+/// exhaustive `match`es, so a new variant *must* appear in the list to
+/// compile (it can't be silently omitted from a hand-written lookup
+/// array, which is the hole that a separate `from_tag` reintroduced).
+/// Tags must be integer literals so they double as `match` patterns.
+/// The enum is deliberately **not** `#[non_exhaustive]` — exhaustive
+/// dispatch at every call site is the point.
+macro_rules! column_key {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$var_meta:meta])* $variant:ident = $tag:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        $vis enum $name {
+            $( $(#[$var_meta])* $variant ),+
+        }
+
+        impl $name {
+            /// The column tag for this key. Exhaustive `match Self`, so
+            /// a new variant forces an arm here.
+            pub const fn tag(self) -> u16 {
+                match self { $( Self::$variant => $tag ),+ }
+            }
+
+            /// Map a column tag to its dispatch key, or `None` for a
+            /// tag this schema does not define. Generated from the same
+            /// variant↔tag list as [`Self::tag`], so the pairing is a
+            /// compile-time bijection — a forgotten variant cannot
+            /// compile.
+            pub fn from_tag(tag: u16) -> Option<Self> {
+                match tag {
+                    $( $tag => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+pub(crate) use column_key;
 
 /// One `.psp` kind (`snp` | `ssr`): the schema the generic container
 /// core needs beyond its block / index / header machinery.
@@ -160,4 +207,14 @@ pub(crate) trait BlockDecoder {
     /// cursor. `None` once the block is exhausted (or before any block
     /// is loaded). Mirrors the writer's `append` in reverse.
     fn next_record(&mut self) -> Option<Result<Self::Record, PspReadError>>;
+
+    /// Release the decoded block's per-block column buffers once it is
+    /// exhausted, before the generic reader advances to the next block.
+    /// Cross-block *reuse* buffers (e.g. the SNP CSR slabs) may be kept
+    /// — they are overwritten on the next `decode_block` — but the
+    /// large per-block columns should be freed so a held-but-idle
+    /// iterator does not pin the last block's memory (the project's
+    /// RAM-for-scaling thesis). After `unload`, `next_record` must
+    /// return `None` until the next `decode_block`.
+    fn unload(&mut self);
 }

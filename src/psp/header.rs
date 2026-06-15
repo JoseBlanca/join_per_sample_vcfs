@@ -247,9 +247,11 @@ struct WireHeader {
     format_version: String,
     /// Schema-family discriminator (architecture §10.3): `"snp"` |
     /// `"ssr"`. Selects the column registry the `[[column]]` array is
-    /// cross-checked against. `#[serde(default)]` so `.psp` files
-    /// written before the tag existed parse as the SNP default.
-    #[serde(default = "default_kind")]
+    /// cross-checked against. **Mandatory** (Mi3): the project carries
+    /// no on-disk back-compat requirement, so a missing `kind` is a
+    /// hard parse error rather than a silent inference — the silent
+    /// "default to snp" would re-open the very misdecode hole the
+    /// `UnknownKind` refusal exists to close.
     kind: String,
     sample: String,
     reference: String,
@@ -264,12 +266,6 @@ struct WireHeader {
     /// skipped" rule without losing them silently.
     #[serde(flatten)]
     extras: BTreeMap<String, toml::Value>,
-}
-
-/// Serde default for [`WireHeader::kind`] — pre-tag `.psp` files have
-/// no `kind`, and the only schema that existed then was SNP.
-fn default_kind() -> String {
-    registry::SNP_KIND.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1244,21 +1240,27 @@ mod tests {
         );
     }
 
-    /// Back-compat: a `.psp` written before the `kind` tag existed has
-    /// no `kind` key; it must parse as the SNP default, not error.
+    /// (Mi3.) The `kind` tag is mandatory — the project has no on-disk
+    /// back-compat requirement, so a header with no `kind` key is a
+    /// hard parse error, not a silent default to snp (which would
+    /// re-open the misdecode hole `UnknownKind` closes).
     #[test]
-    fn missing_kind_defaults_to_snp() {
+    fn missing_kind_is_rejected() {
         let body = String::from_utf8(build_header_toml(&minimal_writer_header()).unwrap()).unwrap();
-        // Drop the whole `kind = "snp"\n` line to simulate a pre-tag file.
-        let pre_tag: String = body
+        // Drop the whole `kind = "snp"\n` line to simulate a header
+        // that omits the (now-mandatory) tag.
+        let no_kind: String = body
             .lines()
             .filter(|l| !l.trim_start().starts_with("kind ="))
             .map(|l| format!("{l}\n"))
             .collect();
-        assert!(!pre_tag.contains("kind ="), "kind line should be removed");
-        let parsed = parse_header_toml(pre_tag.as_bytes())
-            .expect("pre-tag header should parse as the snp default");
-        assert_eq!(parsed.kind, "snp");
+        assert!(!no_kind.contains("kind ="), "kind line should be removed");
+        let err = parse_header_toml(no_kind.as_bytes())
+            .expect_err("a header missing the mandatory kind must fail");
+        assert!(
+            matches!(err, PspReadError::HeaderToml { .. }),
+            "expected a TOML deserialize error for the missing field, got {err:?}"
+        );
     }
 
     /// (M3.) Pin the literal kebab-case TOML wire keys produced by

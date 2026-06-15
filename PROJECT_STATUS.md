@@ -101,11 +101,34 @@ Skills and agents are instructed to leave it untouched.
 >   Round-trip test writes a multi-block `.ssr.psp` and reads it back equal.
 >   1138 lib tests + e2e green; report
 >   [4+5](ia/reports/implementations/psp_container_generalization_step4_2026-06-15.md).
->   Container done; remaining SSR Stage-1 work tracked in
+>   Container done; **§10 code review complete (2026-06-15)** —
+>   [psp_container_generalization_2026-06-15.md](doc/devel/reports/reviews/psp_container_generalization_2026-06-15.md):
+>   **Approve-with-changes** (0 Blockers, 5 Major, 11 Minor + Nits; gates all
+>   green — fmt/clippy `-D warnings`/doc clean, 1138 lib tests). SNP path
+>   verified sound (all 5 byte-identity/behaviour claims confirmed by
+>   refactor_safety); every Major is in the unshipped SSR schema and must be
+>   fixed before the Stage-1 driver lands — **M1** SSR write-then-can't-read
+>   round-trip break (exclusive `last_pos` vs reader's `last_pos <= chrom.length`
+>   on an end-of-contig locus), **M2** missing `sum(n_spanning) == n_total_alleles`
+>   check (silent profile loss on corrupt input), **M3** SSR structural errors
+>   mislabeled as `Io` (6-category convergent), **M4** `records_of::<S>` lacks an
+>   `S::KIND == header.kind` guard (silent cross-schema misdecode), **M5**
+>   `from_tag` array weakens the M4 compile-time exhaustiveness the docs claim.
+>   **§10 review fixes applied (2026-06-15)** —
+>   [fixes_applied_2026-06-15.md](doc/devel/reports/reviews/fixes_applied_2026-06-15.md):
+>   all 5 Majors + 9 Minors **Applied** (M1 inclusive `last_pos`; M2/M3 typed
+>   `BlockStructureInvalid`/`SsrProfileCountMismatch`; M4 poison-on-`KindMismatch`
+>   [user]; M5 `column_key!` macro [user]; Mi3 mandatory `kind` [user]; Mi2/Mi5–Mi11).
+>   **Deferred:** Mi1 (broad `n_total_alleles`→`n_entries` rename), Mi4
+>   (kind-taxonomy module move), 4 readability Nits, and the M2/M3/Mi9
+>   malformed-block rejection tests (need a raw-block fixture the writer can't
+>   emit). Gates green: fmt/clippy `-D warnings`/doc clean, 1142 lib tests
+>   (+4 new); `cargo audit` unavailable in-container; perf check skipped
+>   (no pre-fix baseline). Remaining SSR Stage-1 work tracked in
 >   [ssr_stage1_remaining.md](doc/devel/implementation_plans/ssr_stage1_remaining.md)
->   (running checklist: pending §10 **code review** first — fresh conversation;
->   then Stage 0 catalog check → `fetch_reads` I/O driver → Stage-1 driver +
->   name→chrom_id adapter + header build → `ssr-pileup` CLI → parallelism).
+>   (running checklist: Stage 0 catalog check →
+>   `fetch_reads` I/O driver → Stage-1 driver + name→chrom_id adapter + header
+>   build → `ssr-pileup` CLI → parallelism).
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

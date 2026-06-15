@@ -352,9 +352,13 @@ impl<R: Read + Seek> PspReader<R> {
 
     /// Sequential iterator typed to a given schema `S` (architecture
     /// §10). [`records`](Self::records) is the `S = SnpKind` case; SSR
-    /// callers (and tests) use `records_of::<SsrKind>()`. The caller is
-    /// responsible for matching `S` to the file's `kind` — read it from
-    /// [`header().kind`](ParsedHeader::kind) if unsure.
+    /// callers (and tests) use `records_of::<SsrKind>()`.
+    ///
+    /// If `S::KIND` disagrees with the file's header `kind` (e.g.
+    /// `records_of::<SnpKind>()` on an `.ssr.psp` file), the iterator
+    /// yields a single [`PspReadError::KindMismatch`] on its first
+    /// `next()` and then ends — it does not decode columns under the
+    /// wrong schema (M4).
     #[allow(private_bounds)]
     pub fn records_of<S: PspKind>(&mut self) -> RecordsIter<'_, R, S>
     where
@@ -562,6 +566,12 @@ pub struct RecordsIter<'r, R: Read + Seek, S: PspKind = SnpKind> {
     /// calls return `None`. Required for `Iterator` correctness
     /// when the source state after an error is unknown.
     poisoned: bool,
+    /// M4: an error to surface on the first `next()` before any block
+    /// is touched, then poison. Set when the iterator's schema `S`
+    /// disagrees with the file's header `kind` (decoding columns under
+    /// the wrong schema would yield garbage), so a kind/decoder
+    /// mismatch fails loudly instead of silently misdecoding.
+    pending_error: Option<PspReadError>,
     /// L1: persistent zstd decompressor reused across every column
     /// of every block. The DCtx workspace is allocated once
     /// (~hundreds of KiB at level 9) instead of per-column. Mirror
@@ -604,6 +614,17 @@ where
         // `Result<RecordsIter, _>`).
         let decompressor = new_column_decompressor()
             .expect("zstd::bulk::Decompressor::new is infallible on supported platforms");
+        // M4: refuse a schema/kind mismatch. The header `kind` was
+        // validated against a known registry at parse time; if the
+        // caller-chosen `S` names a *different* known kind, decoding
+        // would read the wrong columns. Surface it as the iterator's
+        // first item rather than yielding garbage records. (`records()`
+        // / `region_records()` default `S = SnpKind`, so an snp file is
+        // never flagged; an snp decoder over an ssr file now is.)
+        let pending_error = (S::KIND != reader.header().kind).then(|| PspReadError::KindMismatch {
+            expected: S::KIND,
+            found: reader.header().kind.clone(),
+        });
         Self {
             reader,
             cur_block_idx: 0,
@@ -611,6 +632,7 @@ where
             decoder: S::Decoder::new_decoder(),
             clamp,
             poisoned: false,
+            pending_error,
             decompressor,
             compressed_scratch: Vec::new(),
             decompressed_scratch: Vec::new(),
@@ -745,6 +767,15 @@ impl BlockDecoder for SnpDecoder {
             _ => None,
         }
     }
+
+    fn unload(&mut self) {
+        // Mi2: free the exhausted block's per-record / per-allele
+        // fixed-width columns (read by index, not `mem::take`, so they
+        // stay resident otherwise). The H1 CSR reuse slabs
+        // (`allele_seq_*` / `allele_chain_ids_*`) are kept — the next
+        // `decode_block` overwrites them.
+        self.cur_block = None;
+    }
 }
 
 impl SnpDecoder {
@@ -752,12 +783,14 @@ impl SnpDecoder {
     /// block. Caller must ensure a block is loaded and has records
     /// left (enforced by [`Self::next_record`]).
     ///
-    /// M13: ownership of every per-record / per-allele inner `Vec`
-    /// is moved out of the block via `mem::take`. The block is
-    /// consumed strictly forwards (the iterator never revisits a
-    /// `(block, i, j)` triple) and is dropped wholesale once
-    /// exhausted, so the columns are dead the moment the record
-    /// is emitted.
+    /// The block is consumed strictly forwards (the iterator never
+    /// revisits a `(block, i, j)` triple). The per-record / per-allele
+    /// fixed-width columns are read by index/copy (the H1 perf rework
+    /// replaced the original M13 `mem::take` shape — the allele bytes /
+    /// chain-ids now slice from the iter-owned CSR slabs). The block's
+    /// buffers are freed when it is exhausted, via
+    /// [`BlockDecoder::unload`](super::kind::BlockDecoder::unload),
+    /// which the generic reader calls before advancing (Mi2).
     fn materialise_next_record(&mut self) -> Result<PileupRecord, PspReadError> {
         // M1: lift the option-unwrap out of the function body —
         // the caller (`<Self as Iterator>::next`) gates this call
@@ -872,6 +905,11 @@ where
         if self.poisoned {
             return None;
         }
+        // M4: a schema/kind mismatch surfaces once, then poisons.
+        if let Some(err) = self.pending_error.take() {
+            self.poisoned = true;
+            return Some(Err(err));
+        }
         // State machine, per iteration:
         //   1. If the current block has records left, yield one
         //      (with region clamp).
@@ -901,8 +939,10 @@ where
                     }
                     return Some(Ok(record));
                 }
-                // Current block exhausted. Advance and load the next.
+                // Current block exhausted. Free its buffers (Mi2),
+                // advance, and load the next.
                 self.cur_block_loaded = false;
+                self.decoder.unload();
                 self.cur_block_idx += 1;
             }
             // For region iteration, peek at the next block's
@@ -1589,8 +1629,9 @@ fn decode_one_column<R: Read>(
     }
 
     // `ColumnDef` is schema-agnostic (no `key`); recover the SNP
-    // dispatch key from the tag. Always `Some` — `def` came from
-    // `lookup_by_tag` over `V1_0_COLUMNS`.
+    // dispatch key from the tag.
+    // UNREACHABLE: `def` came from `lookup_by_tag` over `V1_0_COLUMNS`,
+    // so its tag is always a `ColumnKey`.
     let key =
         ColumnKey::from_tag(def.tag).expect("decode_one_column resolved a non-SNP column tag");
 

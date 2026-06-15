@@ -594,10 +594,11 @@ impl<W: Write> PspWriter<W, SsrKind> {
             });
         }
         if record.end <= record.start || record.end > chrom.length + 1 {
-            return Err(PspWriteError::PosOutOfRange {
+            return Err(PspWriteError::LocusEndOutOfRange {
                 record_index,
                 chrom_id: record.chrom_id,
-                pos: record.end,
+                start: record.start,
+                end: record.end,
                 chrom_length: chrom.length,
             });
         }
@@ -612,6 +613,20 @@ impl<W: Write> PspWriter<W, SsrKind> {
                     prev_pos: prev_start,
                     this_chrom: record.chrom_id,
                     this_pos: record.start,
+                });
+            }
+        }
+
+        // Mi8: reject a NaN log-probability. `-inf` is legitimate
+        // (`log(0)` profile weight) and permitted; NaN never is, and
+        // since the SSR decode path runs no finite sweep
+        // (`amb-logliks` is `finite_constraint: false`) a NaN would
+        // round-trip silently into the downstream EM.
+        for (profile_index, profile) in record.spanning.iter().enumerate() {
+            if profile.iter().any(|&(_, loglik)| loglik.is_nan()) {
+                return Err(PspWriteError::NonFiniteLoglik {
+                    record_index,
+                    profile_index,
                 });
             }
         }
@@ -1075,8 +1090,10 @@ fn encode_snp_column_into(
     out: &mut Vec<u8>,
 ) -> Result<(), PspWriteError> {
     // `ColumnDef` is schema-agnostic (no `key`); recover the SNP
-    // dispatch key from the tag. Always `Some` here — `def` comes from
-    // `V1_0_COLUMNS`. The `match` stays exhaustive over `ColumnKey`.
+    // dispatch key from the tag. The `match` stays exhaustive over
+    // `ColumnKey`.
+    // UNREACHABLE: `def` is a `V1_0_COLUMNS` row (the only caller walks
+    // that table), so its tag is always a `ColumnKey`.
     let key = ColumnKey::from_tag(def.tag)
         .expect("encode_snp_column_into called with a non-SNP column tag");
     match key {

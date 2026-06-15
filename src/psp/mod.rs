@@ -1,9 +1,11 @@
-//! `.psp` per-sample pileup byte format — writer and reader.
+//! `.psp` generic columnar container — writer and reader.
 //!
-//! Stage 1 of the pipeline emits per-sample pileup records (one per
-//! covered reference position); this module is the bridge between
-//! those in-memory records and the on-disk artefact downstream stages
-//! consume. The byte layout is specified in
+//! Originally the SNP per-sample pileup byte format, this module is now
+//! a generic columnar container (architecture §10) hosting two schemas
+//! — `snp` (the Stage-1 per-sample pileup, one record per covered
+//! reference position) and `ssr` (per-locus microsatellite evidence).
+//! It is the bridge between those in-memory records and the on-disk
+//! artefact downstream stages consume. The byte layout is specified in
 //! `ia/specs/per_sample_pileup_format.md`; this module is its
 //! authoritative implementation.
 //!
@@ -11,8 +13,12 @@
 //! through the [`writer::PspWriter`] / [`reader::PspReader`] entry
 //! points and the public [`header`] type surface):
 //!
-//! - `registry`: the v1.0 column-tag registry — the single source
-//!   of truth shared by writer, reader, and `psp_spec_dump`.
+//! - [`kind`]: the cross-schema [`kind::PspKind`] / `BlockAccumulator`
+//!   / `BlockDecoder` trait surface a schema implements.
+//! - `registry`: the v1.0 **SNP** column-tag registry, and the
+//!   kind→registry dispatch (`columns_for_kind`); `registry_ssr` is the
+//!   SSR counterpart. Each is the single source of truth for its
+//!   schema's columns, shared by writer, reader, and `psp_spec_dump`.
 //! - `varint`: LEB128 / zig-zag-LEB128 codecs.
 //! - `errors`: typed error enums (re-exported below).
 //! - [`header`], `block`, `index`, `trailer`: per-section wire codecs.
@@ -32,7 +38,7 @@ pub(crate) mod index;
 pub mod kind;
 pub mod reader;
 pub(crate) mod registry;
-pub mod registry_ssr;
+pub(crate) mod registry_ssr;
 pub(crate) mod trailer;
 pub(crate) mod varint;
 pub mod writer;
