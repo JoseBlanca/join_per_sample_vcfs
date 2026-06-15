@@ -16,4 +16,5 @@
 pub mod candidate_generation;
 pub mod count_repeats;
 pub mod pair_hmm;
+pub mod read_analysis;
 pub mod triage;
