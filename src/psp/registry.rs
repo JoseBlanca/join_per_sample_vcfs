@@ -481,6 +481,25 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
 ];
 
+/// The SNP schema-family `kind` tag (header §10.3). Single source of
+/// truth for both `SnpKind::KIND` (write) and the reader's
+/// registry-by-kind selection (read).
+pub const SNP_KIND: &str = "snp";
+
+/// Comma-separated list of every `kind` this reader recognises — for
+/// the `UnknownKind` diagnostic. Grows as schemas land (`"snp, ssr"`).
+pub const KNOWN_KINDS: &str = "snp";
+
+/// Select the column registry for a header `kind` tag (architecture
+/// §10.3). `None` for an unrecognised kind — the reader then refuses
+/// with [`PspReadError::UnknownKind`](super::errors::PspReadError::UnknownKind).
+pub fn columns_for_kind(kind: &str) -> Option<&'static [ColumnDef]> {
+    match kind {
+        SNP_KIND => Some(V1_0_COLUMNS),
+        _ => None,
+    }
+}
+
 /// Linear-scan lookup by tag. Twelve entries — no hash table needed.
 pub fn lookup_by_tag(tag: u16) -> Option<&'static ColumnDef> {
     V1_0_COLUMNS.iter().find(|c| c.tag == tag)

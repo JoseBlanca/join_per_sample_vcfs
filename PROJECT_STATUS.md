@@ -70,7 +70,17 @@ Skills and agents are instructed to leave it untouched.
 >   tests + SNP e2e green. Reports:
 >   [1a](ia/reports/implementations/psp_container_generalization_step1a_2026-06-15.md),
 >   [1b](ia/reports/implementations/psp_container_generalization_step1b_2026-06-15.md).
->   Next: step 2 (`kind` tag → registry-by-kind), then 3 interval index → 4
+>   **Step 2 landed (`kind` header tag, §10.3):** writer emits `kind = "snp"`
+>   (`SnpKind::KIND` = `registry::SNP_KIND`); reader selects the column registry
+>   via `registry::columns_for_kind(kind)` (new `PspReadError::UnknownKind`) and
+>   `cross_check_against_registry` validates against the kind-selected registry
+>   (no longer hardcoded `V1_0_COLUMNS`). Header build parameterized on
+>   `(kind, columns)` with SNP-default wrappers; pre-tag `.psp` files default to
+>   `"snp"` (back-compat). **This step intentionally changes the produced `.psp`
+>   (adds the `kind` line) — gate is round-trip + e2e + back-compat, not
+>   byte-identity.** 1136 lib tests (+3 kind tests) + e2e green; report
+>   [2](ia/reports/implementations/psp_container_generalization_step2_2026-06-15.md).
+>   Next: step 3 (interval-overlap block index), then 4
 >   `registry_ssr`+`SsrLocusRecord` → 5 round-trip test.
 >   Off-ladder + measured fast path deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**

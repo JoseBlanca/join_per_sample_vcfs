@@ -150,6 +150,9 @@ pub enum ParameterValue {
 #[derive(Debug, Clone)]
 pub struct ParsedHeader {
     pub format_version: (u16, u16),
+    /// Schema-family tag (architecture §10.3): `"snp"` | `"ssr"`.
+    /// Defaults to `"snp"` for `.psp` files written before the tag.
+    pub kind: String,
     pub sample: String,
     pub reference: String,
     pub created: Datetime,
@@ -242,6 +245,12 @@ impl ParsedColumnPayload {
 struct WireHeader {
     #[serde(rename = "format-version")]
     format_version: String,
+    /// Schema-family discriminator (architecture §10.3): `"snp"` |
+    /// `"ssr"`. Selects the column registry the `[[column]]` array is
+    /// cross-checked against. `#[serde(default)]` so `.psp` files
+    /// written before the tag existed parse as the SNP default.
+    #[serde(default = "default_kind")]
+    kind: String,
     sample: String,
     reference: String,
     created: Datetime,
@@ -255,6 +264,12 @@ struct WireHeader {
     /// skipped" rule without losing them silently.
     #[serde(flatten)]
     extras: BTreeMap<String, toml::Value>,
+}
+
+/// Serde default for [`WireHeader::kind`] — pre-tag `.psp` files have
+/// no `kind`, and the only schema that existed then was SNP.
+fn default_kind() -> String {
+    registry::SNP_KIND.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,8 +324,20 @@ struct WireColumn {
 /// [`build_header_bytes`]; this lower-level form exists so the
 /// writer slice can frame the body without rebuilding it.
 pub fn build_header_toml(header: &WriterHeader) -> Result<Vec<u8>, PspWriteError> {
+    build_header_toml_for(header, registry::SNP_KIND, V1_0_COLUMNS)
+}
+
+/// Schema-aware [`build_header_toml`]: emits the given `kind` tag and
+/// `columns` registry into the TOML body. The writer passes its
+/// schema's `S::KIND` / `S::columns()`; the no-arg [`build_header_toml`]
+/// defaults to the SNP schema.
+pub fn build_header_toml_for(
+    header: &WriterHeader,
+    kind: &str,
+    columns: &[ColumnDef],
+) -> Result<Vec<u8>, PspWriteError> {
     validate_writer_header(header)?;
-    let wire = wire_from_writer_header(header);
+    let wire = wire_from_writer_header(header, kind, columns);
     let s = toml::to_string(&wire).map_err(|e| PspWriteError::HeaderToml {
         source: TomlSerError::new(e),
     })?;
@@ -319,9 +346,20 @@ pub fn build_header_toml(header: &WriterHeader) -> Result<Vec<u8>, PspWriteError
 
 /// Serialise a [`WriterHeader`] into the full, framed header
 /// (magic + length prefix + TOML body + sentinel). The first byte
-/// of the returned `Vec` is the file's first byte.
+/// of the returned `Vec` is the file's first byte. Defaults to the SNP
+/// schema; see [`build_header_bytes_for`] for the schema-aware form.
 pub fn build_header_bytes(header: &WriterHeader) -> Result<Vec<u8>, PspWriteError> {
-    let body = build_header_toml(header)?;
+    build_header_bytes_for(header, registry::SNP_KIND, V1_0_COLUMNS)
+}
+
+/// Schema-aware [`build_header_bytes`]: frames a header carrying the
+/// given `kind` tag and `columns` registry.
+pub fn build_header_bytes_for(
+    header: &WriterHeader,
+    kind: &str,
+    columns: &[ColumnDef],
+) -> Result<Vec<u8>, PspWriteError> {
+    let body = build_header_toml_for(header, kind, columns)?;
     let body_len = u64::try_from(body.len()).expect("header body fits in u64");
     if !(MIN_HEADER_BODY_BYTES..=MAX_HEADER_BODY_BYTES).contains(&body_len) {
         return Err(PspWriteError::HeaderBodyTooLarge {
@@ -338,7 +376,7 @@ pub fn build_header_bytes(header: &WriterHeader) -> Result<Vec<u8>, PspWriteErro
     Ok(out)
 }
 
-fn wire_from_writer_header(header: &WriterHeader) -> WireHeader {
+fn wire_from_writer_header(header: &WriterHeader, kind: &str, columns: &[ColumnDef]) -> WireHeader {
     let format_version = format!("{}.{}", header.format_version.0, header.format_version.1);
     let chromosomes = header
         .chromosomes
@@ -358,9 +396,10 @@ fn wire_from_writer_header(header: &WriterHeader) -> WireHeader {
         command_line: header.writer.command_line.clone(),
         parameters: header.writer.parameters.clone(),
     };
-    let columns = V1_0_COLUMNS.iter().map(wire_column_from_def).collect();
+    let columns = columns.iter().map(wire_column_from_def).collect();
     WireHeader {
         format_version,
+        kind: kind.to_string(),
         sample: header.sample.clone(),
         reference: header.reference.clone(),
         created: header.created,
@@ -490,8 +529,19 @@ fn parsed_from_wire(wire: WireHeader) -> Result<ParsedHeader, PspReadError> {
     // checks fire, so the error message names the lowest-level rule
     // that failed.
     let format_version = parse_format_version(&wire.format_version)?;
+    validate_printable_ascii("kind", &wire.kind)?;
     validate_printable_ascii("sample", &wire.sample)?;
     validate_printable_ascii("reference", &wire.reference)?;
+
+    // The `kind` tag selects the column registry the `[[column]]` array
+    // is cross-checked against (architecture §10.3). An unrecognised
+    // kind is a hard refusal — the file was written by a foreign/newer
+    // producer this reader can't decode.
+    let registry =
+        registry::columns_for_kind(&wire.kind).ok_or_else(|| PspReadError::UnknownKind {
+            kind: wire.kind.clone(),
+            known: registry::KNOWN_KINDS,
+        })?;
 
     // M6: reject any file whose major version exceeds the reader's.
     // Higher-major files may rest on layout assumptions a v1.x
@@ -539,11 +589,13 @@ fn parsed_from_wire(wire: WireHeader) -> Result<ParsedHeader, PspReadError> {
         }
     }
 
-    // Schema-vs-registry cross-check + required-column coverage.
-    cross_check_against_registry(&columns)?;
+    // Schema-vs-registry cross-check + required-column coverage,
+    // against the registry the `kind` selected.
+    cross_check_against_registry(&columns, registry)?;
 
     Ok(ParsedHeader {
         format_version,
+        kind: wire.kind,
         sample: wire.sample,
         reference: wire.reference,
         created: wire.created,
@@ -688,9 +740,12 @@ fn cross_check_shape_consistency(
 /// the registry on cardinality / shape / element-type / length-column
 /// / required; required columns in the registry must appear in the
 /// file; required columns the reader does not recognise abort.
-fn cross_check_against_registry(columns: &[ParsedColumn]) -> Result<(), PspReadError> {
+fn cross_check_against_registry(
+    columns: &[ParsedColumn],
+    registry: &[ColumnDef],
+) -> Result<(), PspReadError> {
     for c in columns {
-        if let Some(def) = registry::lookup_by_name(&c.name) {
+        if let Some(def) = registry.iter().find(|d| d.name == c.name) {
             check_match(c, def)?;
         } else if c.required {
             return Err(PspReadError::UnknownRequiredColumn {
@@ -705,7 +760,7 @@ fn cross_check_against_registry(columns: &[ParsedColumn]) -> Result<(), PspReadE
 
     // Every required column in the registry must be present in the
     // file.
-    for def in V1_0_COLUMNS {
+    for def in registry {
         if !def.required {
             continue;
         }
@@ -1160,6 +1215,52 @@ mod tests {
         assert_eq!(parsed.columns.last().unwrap().name, "allele-chain-ids");
     }
 
+    /// §10.3: a written SNP header carries `kind = "snp"` and the tag
+    /// round-trips into `ParsedHeader::kind`.
+    #[test]
+    fn header_carries_kind_snp_and_round_trips() {
+        let header = minimal_writer_header();
+        let body = String::from_utf8(build_header_toml(&header).unwrap()).unwrap();
+        assert!(
+            body.contains("kind = \"snp\""),
+            "TOML body should declare the snp kind tag, got:\n{body}"
+        );
+        let bytes = build_header_bytes(&header).unwrap();
+        let (parsed, _) = parse_header_bytes(&bytes).unwrap();
+        assert_eq!(parsed.kind, "snp");
+    }
+
+    /// §10.3: an unrecognised `kind` is a hard refusal (the reader
+    /// can't know which registry to validate the columns against).
+    #[test]
+    fn unknown_kind_is_rejected() {
+        let body = String::from_utf8(build_header_toml(&minimal_writer_header()).unwrap()).unwrap();
+        let mutated = body.replace("kind = \"snp\"", "kind = \"totally-unknown\"");
+        assert_ne!(mutated, body, "fixture must contain the kind line");
+        let err = parse_header_toml(mutated.as_bytes()).expect_err("unknown kind must fail");
+        assert!(
+            matches!(err, PspReadError::UnknownKind { ref kind, .. } if kind == "totally-unknown"),
+            "expected UnknownKind, got {err:?}"
+        );
+    }
+
+    /// Back-compat: a `.psp` written before the `kind` tag existed has
+    /// no `kind` key; it must parse as the SNP default, not error.
+    #[test]
+    fn missing_kind_defaults_to_snp() {
+        let body = String::from_utf8(build_header_toml(&minimal_writer_header()).unwrap()).unwrap();
+        // Drop the whole `kind = "snp"\n` line to simulate a pre-tag file.
+        let pre_tag: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("kind ="))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!pre_tag.contains("kind ="), "kind line should be removed");
+        let parsed = parse_header_toml(pre_tag.as_bytes())
+            .expect("pre-tag header should parse as the snp default");
+        assert_eq!(parsed.kind, "snp");
+    }
+
     /// (M3.) Pin the literal kebab-case TOML wire keys produced by
     /// the serde renames on `WireHeader`, `WireWriter`, `WireColumn`.
     /// Dropping a `#[serde(rename = ...)]` annotation would cause
@@ -1268,6 +1369,7 @@ mod tests {
     fn valid_wire() -> WireHeader {
         WireHeader {
             format_version: "1.0".to_string(),
+            kind: "snp".to_string(),
             sample: "NA12878".to_string(),
             reference: "GRCh38.fa".to_string(),
             created: "2026-05-13T10:00:00Z".parse().unwrap(),

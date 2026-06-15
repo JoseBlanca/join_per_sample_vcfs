@@ -291,6 +291,14 @@ pub enum PspReadError {
     )]
     SentinelMismatch { offset: u64 },
 
+    /// The header's `kind` schema-family tag (architecture §10.3) is
+    /// not one this reader knows. The `kind` selects which column
+    /// registry the `[[column]]` array is cross-checked against
+    /// (`"snp"` today; `"ssr"` later); an unknown value means the file
+    /// was written by a newer/foreign producer and cannot be decoded.
+    #[error("unknown .psp kind {kind:?} (this reader knows: {known})")]
+    UnknownKind { kind: String, known: &'static str },
+
     /// A column declared in the file's `[[column]]` array has
     /// `required = true` but the reader's column-tag registry does
     /// not recognise its `name` (or `tag`). The file's contract is

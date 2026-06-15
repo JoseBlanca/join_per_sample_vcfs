@@ -29,7 +29,7 @@ use super::block::{
     zstd_compress_into,
 };
 use super::errors::{InvalidRecordKind, PspWriteError};
-use super::header::{WriterHeader, build_header_bytes};
+use super::header::{WriterHeader, build_header_bytes_for};
 use super::index::{BlockIndexEntry, checksum_index, encode_index};
 use super::kind::{BlockAccumulator, PspKind};
 use super::registry::{
@@ -344,7 +344,7 @@ impl<W: Write> PspWriter<W, SnpKind> {
         target_block_bytes: usize,
         block_window_bp: u32,
     ) -> Result<Self, PspWriteError> {
-        let header_bytes = build_header_bytes(&header)?;
+        let header_bytes = build_header_bytes_for(&header, SnpKind::KIND, SnpKind::columns())?;
         sink.write_all(&header_bytes)
             .map_err(|e| PspWriteError::Io {
                 context: "file header",
@@ -761,7 +761,7 @@ impl PspKind for SnpKind {
     type Record = PileupRecord;
     type Block = SnpBlock;
     type Decoder = super::reader::SnpDecoder;
-    const KIND: &'static str = "snp";
+    const KIND: &'static str = super::registry::SNP_KIND;
 
     fn columns() -> &'static [ColumnDef] {
         V1_0_COLUMNS
