@@ -9,9 +9,11 @@
 //! **Build status.** Built bottom-up — the leaf scorers/counters first, the I/O
 //! fetcher and driver last — so each layer is testable before it has a consumer.
 //! Present so far: [`count_repeats`] (the fast-path motif counter),
-//! [`pair_hmm`] (the slow-path forward scorer), and [`candidate_generation`]
-//! (the on-ladder rung builder; off-ladder normalization deferred).
+//! [`pair_hmm`] (the slow-path forward scorer + per-read candidate scoring),
+//! [`candidate_generation`] (on-ladder rungs + off-ladder candidates), and
+//! [`triage`] (the content pre-probe so far; read classification next).
 
 pub mod candidate_generation;
 pub mod count_repeats;
 pub mod pair_hmm;
+pub mod triage;
