@@ -26,6 +26,9 @@
 
 use std::sync::LazyLock;
 
+use crate::ssr::pileup::candidate_generation::CandidateAllele;
+use crate::ssr::types::Allele;
+
 /// DP-cell state indices into a `[f64; 3]` cell: Match / Insertion / Deletion.
 const M: usize = 0;
 const I: usize = 1;
@@ -231,6 +234,31 @@ pub(crate) fn forward(
     ln_sum_exp3(last[M], last[I], last[D])
 }
 
+/// Score a read against a pre-built candidate set, returning the **dense** `Qᵣ`:
+/// one `(allele, forward log-likelihood)` per candidate, in candidate order.
+///
+/// This is the per-read join of candidate generation (arch §6) and the forward
+/// (arch §5): each candidate's full sequence is handed to [`forward`] and its raw
+/// log-likelihood read back, reusing the one `scratch` across the set. Pruning to
+/// a sparse profile (`AMB_LL_DROP`) and renormalization are the **aggregator's**
+/// job (`locus_record`, arch §11), so this returns the raw scores untouched — the
+/// dense distribution over the window the aggregator then sparsifies.
+pub(crate) fn score_candidates(
+    read: &[u8],
+    quals: &[u8],
+    candidates: &[CandidateAllele],
+    scratch: &mut PairHmmScratch,
+    model: &HmmModel,
+) -> Vec<(Allele, f64)> {
+    candidates
+        .iter()
+        .map(|c| {
+            let loglik = forward(read, quals, &c.candidate_seq, scratch, model);
+            (c.allele.clone(), loglik)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +359,51 @@ mod tests {
         let eps = 10f64.powf(-4.0);
         let want = (1.0 - eps).ln() + (1.0 - 2.0 * GAP_OPEN_PROB).ln();
         assert_close(short, want);
+    }
+
+    /// A perfect (CA) locus: GGG | CACACA | TTT, tract at [13, 19).
+    fn ca_locus() -> crate::ssr::types::Locus {
+        use crate::ssr::types::{Locus, Motif};
+        Locus::new(
+            "chr1".into(),
+            13,
+            19,
+            Motif::new(b"CA").unwrap(),
+            1.0,
+            (*b"GGGCACACATTT").into(),
+            10,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn score_candidates_returns_one_dense_score_per_candidate_in_order() {
+        use crate::ssr::pileup::candidate_generation::build_rungs;
+        let locus = ca_locus();
+        let mut cands = Vec::new();
+        build_rungs(&locus, 3, 2, &mut cands); // L ∈ 1..=5 → 5 candidates
+        let (model, mut s) = setup();
+        // Any read; we only check the shape + ordering here.
+        let scored = score_candidates(b"GGGCACACATTT", &[40; 12], &cands, &mut s, &model);
+        assert_eq!(scored.len(), cands.len());
+        let alleles: Vec<&Allele> = scored.iter().map(|(a, _)| a).collect();
+        let want: Vec<&Allele> = cands.iter().map(|c| &c.allele).collect();
+        assert_eq!(alleles, want, "dense scores follow candidate order");
+    }
+
+    #[test]
+    fn score_candidates_ranks_the_matching_rung_highest() {
+        use crate::ssr::pileup::candidate_generation::build_rungs;
+        let locus = ca_locus();
+        let mut cands = Vec::new();
+        build_rungs(&locus, 3, 2, &mut cands); // L ∈ 1..=5
+        let (model, mut s) = setup();
+        // A high-quality read equal to the L=3 rung (== ref_bytes): it must win.
+        let scored = score_candidates(b"GGGCACACATTT", &[40; 12], &cands, &mut s, &model);
+        let best = scored
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        assert_eq!(best.0, Allele::OnLadder { units: 3 });
     }
 }
