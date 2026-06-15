@@ -29,6 +29,7 @@ pub(crate) mod block;
 pub(crate) mod errors;
 pub mod header;
 pub(crate) mod index;
+pub mod kind;
 pub mod reader;
 pub(crate) mod registry;
 pub(crate) mod trailer;
@@ -48,3 +49,8 @@ pub use errors::{
 };
 pub use index::BlockIndexEntry;
 pub use reader::{BlockColumnReader, BlockColumns, PspReader, RecordsIter};
+// The container-schema abstraction (architecture §10) puts `ColumnDef`
+// in the `pub` [`kind::PspKind`] signatures, so it must be reachable at
+// at least that visibility. Re-exported here from the (otherwise
+// `pub(crate)`) registry rather than widening the whole registry.
+pub use registry::ColumnDef;

@@ -50,11 +50,19 @@ Skills and agents are instructed to leave it untouched.
 >   `fetch_reads` started with the net-new per-locus reservoir (Algorithm R +
 >   deterministic per-locus seed). Next: the `fetch_reads` I/O driver
 >   (catalog-walk + `query`) + the driver + the container writer — the remaining
->   pieces all converge on the container. **Now tackling the container refactor**
->   (§10): implementation sketch written
->   ([psp_container_generalization.md](doc/devel/implementation_plans/psp_container_generalization.md));
->   next is step 1 (parameterize the `.psp` writer on a schema, SNP-only,
->   behaviour-preserving). Off-ladder + measured fast path deferred.
+>   pieces all converge on the container. **Container refactor (§10) — step 1a
+>   landed:** the `.psp` **writer** is now parameterized on a `PspKind` trait
+>   (new [src/psp/kind.rs](src/psp/kind.rs): `PspKind` + `BlockAccumulator`),
+>   with `SnpKind`/`SnpBlock` as the only impl and `PspWriter<W, S = SnpKind>`
+>   keeping all call sites unchanged. The flush/encode machinery is generic
+>   over `S` (iterates `S::columns()`/`S::encode_column`); record ingest +
+>   validation stays SNP-concrete (fork §10.7-Q1 resolved = trait + shared
+>   generic functions). Behaviour-preserving — 1133 lib tests + SNP e2e green;
+>   report
+>   ([psp_container_generalization_step1a_2026-06-15.md](ia/reports/implementations/psp_container_generalization_step1a_2026-06-15.md)).
+>   Next: step 1b (reader's typed path on the schema), then steps 2–5 (`kind`
+>   tag → interval index → `registry_ssr`+`SsrLocusRecord` → round-trip test).
+>   Off-ladder + measured fast path deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
