@@ -101,10 +101,12 @@ Skills and agents are instructed to leave it untouched.
 >   Round-trip test writes a multi-block `.ssr.psp` and reads it back equal.
 >   1138 lib tests + e2e green; report
 >   [4+5](ia/reports/implementations/psp_container_generalization_step4_2026-06-15.md).
->   Container done; remaining SSR Stage-1 work (fetch_reads I/O driver, the
->   driver that emits `SsrLocusRecord`s + adapts to the container's chrom_id
->   form, the `ssr-pileup` CLI) is separate. Off-ladder + measured fast path
->   deferred.
+>   Container done; remaining SSR Stage-1 work tracked in
+>   [ssr_stage1_remaining.md](doc/devel/implementation_plans/ssr_stage1_remaining.md)
+>   (running checklist: pending §10 **code review** first — fresh conversation;
+>   then Stage 0 catalog check → `fetch_reads` I/O driver → Stage-1 driver +
+>   name→chrom_id adapter + header build → `ssr-pileup` CLI → parallelism).
+>   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
