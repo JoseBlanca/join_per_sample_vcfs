@@ -21,10 +21,11 @@
 //! - [`postprocess`] — **built**: [`postprocess::build_loci`] — the period≤6 →
 //!   drop-compound → drop-bundle → end-trim → recompute-purity → embed-`ref_seq`
 //!   pipeline (faithful GangSTR `minimal_trim`/`remove_bundles` port).
-//! - [`trf`] — **partial**: the parsed [`trf::TrfRecord`] type (what
-//!   `postprocess` consumes). The locate / spawn / BED-parse functions are the
-//!   next increment (the `trf-mod` binary is now in the dev container).
-//! - `run()` orchestrator + the `ssr-catalog` CLI subcommand — *pending*.
+//! - [`trf`] — **built**: [`trf::locate_trf_mod`], [`trf::version`],
+//!   [`trf::run_on_contig`] (temp-file spawn, no pipes), and
+//!   [`trf::parse_bed_line`] (the 10-column BED) → [`trf::TrfRecord`].
+//! - `run()` orchestrator + the `ssr-catalog` CLI subcommand — *pending* (the
+//!   last Stage-0 piece: per-contig fan-out/collect + header build + CSI index).
 
 pub mod io;
 pub mod postprocess;
@@ -72,4 +73,30 @@ pub(crate) enum CatalogError {
         #[source]
         source: crate::ssr::types::LocusError,
     },
+
+    /// `trf-mod` could not be located: no usable override, not found beside our
+    /// own executable, and not on `PATH` (architecture §2.4 layered discovery).
+    #[error("trf-mod binary not found (checked: override, exe-sibling, PATH)")]
+    TrfModNotFound,
+
+    /// Spawning or waiting on `trf-mod` failed at the OS level.
+    #[error("failed to run trf-mod ({context})")]
+    TrfSpawn {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `trf-mod` exited unsuccessfully while processing a contig.
+    #[error("trf-mod failed on contig {contig:?} ({status})")]
+    TrfRun { contig: String, status: String },
+
+    /// `trf-mod -v` produced no recognisable version line.
+    #[error("could not parse a version from `trf-mod -v`")]
+    TrfVersion,
+
+    /// A `trf-mod` BED line did not match the expected 10-column layout, a field
+    /// failed to parse, or the contig-name column disagreed.
+    #[error("malformed trf-mod BED at line {line}: {reason}")]
+    TrfParse { line: usize, reason: String },
 }

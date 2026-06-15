@@ -140,9 +140,15 @@ Skills and agents are instructed to leave it untouched.
 >   tests; 1159 lib tests, gates green). Report
 >   [ssr_catalog_postprocess_2026-06-15.md](ia/reports/implementations/ssr_catalog_postprocess_2026-06-15.md).
 >   **trf-mod now installed in the dev container** (`build(container)` commit;
->   `/usr/local/bin/trf-mod`, lh3 @ `3e891db`), so the `trf.rs` spawn/parse
->   increment is unblocked. Next: `trf.rs` locate/spawn/`parse_bed_line` →
->   `run()` orchestrator + `ssr-catalog` CLI.
+>   `/usr/local/bin/trf-mod`, lh3 @ `3e891db`). **Then: `trf.rs` spawn/parse
+>   (2026-06-15)** — `locate_trf_mod`/`version`/`run_on_contig` (temp-file
+>   spawn, no pipes)/`parse_bed_line` (10-col BED pinned against
+>   `trf_print_bed`); 4 tests incl. a live trf-mod integration run; 1163 lib
+>   tests, gates green. Report
+>   [ssr_catalog_trf_2026-06-15.md](ia/reports/implementations/ssr_catalog_trf_2026-06-15.md).
+>   **Stage 0 now has all three building blocks** (io + postprocess + trf);
+>   last piece = the `run()` orchestrator (per-contig fan-out/collect + header +
+>   CSI index) + the `ssr-catalog` CLI subcommand.
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
