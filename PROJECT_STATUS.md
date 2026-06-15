@@ -129,6 +129,13 @@ Skills and agents are instructed to leave it untouched.
 >   (running checklist: Stage 0 catalog check →
 >   `fetch_reads` I/O driver → Stage-1 driver + name→chrom_id adapter + header
 >   build → `ssr-pileup` CLI → parallelism).
+>   **Then: Stage 0 `ssr-catalog` started — format I/O layer (2026-06-15)**:
+>   new [src/ssr/catalog/](src/ssr/catalog/) (`io.rs` + `mod.rs`) — the catalog
+>   wire format (`CatalogHeader`/`CatalogWriter`/`CatalogReader`, bgzip TSV,
+>   `Locus`⇄row, 6 round-trip tests; 1148 lib tests, gates green). Report
+>   [ssr_catalog_io_2026-06-15.md](ia/reports/implementations/ssr_catalog_io_2026-06-15.md).
+>   Next Stage-0 increments: `postprocess.rs` (GangSTR port, buildable now) then
+>   `trf.rs` (**blocked — `trf-mod` binary not in the container**) + `run()`/CLI.
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

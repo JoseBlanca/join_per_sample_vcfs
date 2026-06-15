@@ -11,29 +11,21 @@ the per-step reports under [`ia/reports/implementations/`](../../../ia/reports/i
 
 ---
 
-## 0. Pending: code review of the §10 container work — **do first, fresh conversation**
+## 0. DONE: code review of the §10 container work + fixes (2026-06-15)
 
-The container generalization landed as 5 commits (`1eae1e9..f0dfffc`). Review it
-with the code-review skill in a **new conversation** (large diff, own context)
-before Stage-1 builds on top. Judgment calls to scrutinise:
-
-- **Two `SsrLocusRecord` types** — Stage-1 chrom-**name**-keyed
-  ([`src/ssr/pileup/locus_record.rs`](../../../src/ssr/pileup/locus_record.rs))
-  vs container chrom_**id**-keyed
-  ([`src/psp/registry_ssr.rs`](../../../src/psp/registry_ssr.rs)). The most
-  consequential call — it defines the §2 driver's adapter. Confirm or unify.
-- **`ColumnDef.key` removed** → schema-agnostic `ColumnDef`; each schema
-  dispatches via its own `from_tag` (`ColumnKey` / `SsrColumnKey`). Check the
-  `tag()`-exhaustive vs `from_tag`-array duplication and the M4 guarantee.
-- **Block-header invariant relaxed** (`n_total_alleles >= n_records` dropped;
-  `AllelesLessThanRecords` retained but never raised). Confirm SNP integrity is
-  still fully covered by write-side + read-side checks.
-- **`#[allow(private_bounds)]`** on the `RecordsIter` impls (encapsulating the
-  `pub(crate) BlockDecoder` bound vs widening the public API).
-- **SSR column schema** — `span` vs storing `end`; `n-spanning` doubling as the
-  per-record grouping count; no separate `profile-len` column (CSR offsets
-  carry it); `finite_constraint: false` on `amb-logliks` (no NaN/inf sweep on
-  the SSR decode path).
+Reviewed (rust-code-review skill, 10 categories) →
+[psp_container_generalization_2026-06-15.md](../reports/reviews/psp_container_generalization_2026-06-15.md):
+**Approve-with-changes** (0 Blockers, 5 Major, 11 Minor). SNP path verified
+sound; every Major was in the unshipped SSR schema. Fixes applied →
+[fixes_applied_2026-06-15.md](../reports/reviews/fixes_applied_2026-06-15.md):
+all 5 Majors + 9 Minors Applied (M1 inclusive `last_pos`; M2/M3 typed
+structural errors + `sum(n_spanning)` check; M4 poison-on-`KindMismatch`;
+M5 `column_key!` macro; Mi3 mandatory `kind`; Mi2/Mi5–Mi11). Deferred: Mi1
+(`n_total_alleles`→`n_entries` rename), Mi4 (kind-taxonomy module move), and the
+M2/M3/Mi9 malformed-block rejection tests (need a raw-block fixture). Gates
+green; 1142 lib tests. The judgment calls are settled there — including the two
+`SsrLocusRecord` types (kept as a deliberate name vs container mirror; the §2
+driver adapts between them).
 
 ---
 
@@ -58,11 +50,21 @@ Each lands with its own implementation plan + report; each carries Bucket-1
 synthetic tests.
 
 1. **Stage 0 — `ssr-catalog`** *(prerequisite: the fetcher needs a locus
-   source).* Plan drafted ([ssr_catalog.md](ssr_catalog.md)) but **verify
-   whether it is built**; the work pivoted to the Stage-1 compute path, so the
-   catalog may not exist yet. If not, building it (or pinning the locus-input
-   format the fetcher consumes) is the first gate. Open: TRF-mod BED column
-   order, post-process order, `flank_bp` default.
+   source).* Plan: [ssr_catalog.md](ssr_catalog.md). Building incrementally:
+   - **`catalog/io.rs` — DONE (2026-06-15)**: the format contract
+     (`CatalogHeader`/`CatalogWriter`/`CatalogReader` + `Locus`⇄row, bgzip TSV,
+     6 round-trip tests). Report:
+     [ssr_catalog_io_2026-06-15.md](../reports/implementations/ssr_catalog_io_2026-06-15.md).
+   - **`catalog/postprocess.rs` — NEXT** (pure GangSTR port, no external dep;
+     buildable now): period≤6 → drop-compound → drop-bundle → end-trim →
+     recompute-purity → embed-`ref_seq`. Consumes a `TrfRecord`, emits `Locus`.
+   - **`catalog/trf.rs` — BLOCKED on tooling**: locate/spawn `trf-mod` + BED
+     parse. The `trf-mod` **binary is not installed** in the dev container (only
+     the `TRF-mod/` source is vendored) — build it into the container image
+     before this increment. Open: BED column order (confirm against trf-mod),
+     `min_score`/`flank_bp` defaults.
+   - **`run()` orchestrator + `ssr-catalog` CLI** — after trf + postprocess.
+   - `write_index` (CSI) for the `--regions` query path — after the writer.
 
 2. **`fetch_reads` I/O driver** *(the last missing primitive).* Add to
    [`fetch_reads.rs`](../../../src/ssr/pileup/fetch_reads.rs) (reservoir already

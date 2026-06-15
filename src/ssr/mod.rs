@@ -23,5 +23,6 @@
 // per-item `#[allow]`s. Remove once `ssr-catalog` (Stage 0) wires these up.
 #![allow(dead_code)]
 
+pub mod catalog;
 pub mod pileup;
 pub mod types;
