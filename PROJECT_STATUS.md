@@ -34,9 +34,11 @@ Skills and agents are instructed to leave it untouched.
 >   [task 2](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md),
 >   [count_repeats](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md),
 >   [pair_hmm](ia/reports/implementations/ssr_pileup_pair_hmm_2026-06-15.md),
->   [candidate_generation Job 1](ia/reports/implementations/ssr_pileup_candidate_generation_2026-06-15.md)).
->   Next: `score_candidates` (joins rungs + forward), or the off-ladder
->   normalization contract decision, or the container refactor.
+>   [candidate_generation Job 1](ia/reports/implementations/ssr_pileup_candidate_generation_2026-06-15.md)
+>   + [score_candidates / Job 2](ia/reports/implementations/ssr_pileup_candidate_generation_job2_2026-06-15.md)).
+>   `candidate_generation` is now complete (off-ladder key = verbatim full tract;
+>   `norm_seqs` proved unnecessary for that representation). Next: the read-input
+>   seam (`triage`/`fetch_reads`), the container refactor, or pause.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
@@ -955,10 +957,10 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - Slow-path forward — `forward` + `HmmModel` + `PairHmmScratch` in [src/ssr/pileup/pair_hmm.rs](src/ssr/pileup/pair_hmm.rs); 3-state log-space pair-HMM, Dindel emission. Constant gap-open (homopolymer-indexed table deferred) + unbanded (banding deferred), both calibration per arch §14. [ssr_pileup_pair_hmm_2026-06-15.md](ia/reports/implementations/ssr_pileup_pair_hmm_2026-06-15.md)
   - Candidate generation Job 1 — `CandidateAllele` + `build_rungs` (on-ladder rungs `left_flank + motif×L + right_flank`) in [src/ssr/pileup/candidate_generation.rs](src/ssr/pileup/candidate_generation.rs); composes `Allele::to_sequence`. Job 2 (off-ladder normalization) deferred pending a contract decision. [ssr_pileup_candidate_generation_2026-06-15.md](ia/reports/implementations/ssr_pileup_candidate_generation_2026-06-15.md)
   - `score_candidates` in [src/ssr/pileup/pair_hmm.rs](src/ssr/pileup/pair_hmm.rs) — joins `build_rungs` + `forward` into the dense per-read `Qᵣ` (one `(allele, log-lik)` per candidate, raw scores; pruning/renorm is the aggregator's job). Small addition, context in commit; 2 added tests.
+  - Candidate generation Job 2 — `build_offladder` + `normalize_offladder` (off-ladder candidates) in [src/ssr/pileup/candidate_generation.rs](src/ssr/pileup/candidate_generation.rs); contract A + B1, canonical form is the **verbatim full tract** (left-alignment is provably a no-op on a full-tract key; clean flanks). **`norm_seqs` not needed for B1** — task-2's second consumer doesn't materialize. `candidate_generation` now complete. [ssr_pileup_candidate_generation_job2_2026-06-15.md](ia/reports/implementations/ssr_pileup_candidate_generation_job2_2026-06-15.md)
 - **Open:**
   - **Task 3 (container generalization, arch §10) deferred by choice** — a large multi-step refactor of the production `.psp` writer (58KB) + reader (136KB); gates the `.ssr.psp` writer/round-trip but not the stage's compute modules. Trait-vs-builders fork (§10.7 Q1) still to be decided at its step 1.
   - `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs`. The SSR off-ladder adapter onto `norm_seqs` lands with `candidate_generation` (first consumer beyond the SNP path).
-  - **Off-ladder normalization (candidate_generation Job 2) needs a contract decision** before building: what triage hands in as the observed tract (raw bytes vs. alignment with indel position) and what `NormalizedSeq` canonicalizes to (full tract vs. minimal trimmed variant). First real SSR consumer of `norm_seqs`.
   - Stage modules still to build: `triage` (+ `count_fast` wrapper, needs read-input types), `fetch_reads`, `locus_record` (needs container schema), the driver.
   - `pair_hmm` follow-ups: homopolymer-indexed gap-open + banding (calibration/optimization, arch §14).
 

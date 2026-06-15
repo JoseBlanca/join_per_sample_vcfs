@@ -11,16 +11,21 @@
 //! sample — which is what lets Stage 2 recognise "the L-unit allele" as the same
 //! allele across the cohort by its count alone (arch §6 Job 1).
 //!
-//! **Built so far: Job 1 (the on-ladder rungs).** Job 2 — the read-derived
-//! off-ladder candidate and its canonical normalization (`normalize_offladder`,
-//! the adapter onto [`crate::norm_seqs`]) — is deferred until its input contract
-//! is pinned: what the triage stage hands in as the observed tract (raw bytes
-//! vs. an alignment carrying the indel position) and what `NormalizedSeq`
-//! canonicalizes to operationally. Driving the indel-norm kernel needs the
-//! variant *bounds*, which raw tract bytes alone do not give; guessing risks the
-//! cross-sample-identity invariant the normalization exists to protect.
+//! **The off-ladder canonical form (Job 2) is the full tract, stored verbatim
+//! (contract A + B1).** Triage hands in the raw observed-tract bytes; the stored
+//! [`NormalizedSeq`] is the whole tract sequence (so [`Allele::to_sequence`]
+//! means the same thing — the tract — for both allele kinds). No left-alignment
+//! is applied, and that is **correct, not a shortcut**: a literal alt *sequence*
+//! is invariant under left-alignment (left-alignment canonicalizes an indel's
+//! *position in a `(ref, alt)` description*, never the alt bytes), and Stage 0
+//! guarantees clean flanks (arch §5.9) so the tract is deterministically
+//! delimited — hence two reads of the same molecule yield the same tract bytes,
+//! already canonical. The shared [`crate::norm_seqs`] kernel would only be needed
+//! for a *trimmed-variant* representation (the rejected delta form, shared-types
+//! §4); revisit if we ever adopt that or relax the clean-flank guarantee.
 
-use crate::ssr::types::{Allele, Locus};
+use crate::ssr::pileup::count_repeats::pure_tiling_units;
+use crate::ssr::types::{Allele, Locus, NormalizedSeq};
 
 /// One candidate allele the read is scored against: its full local DNA sequence
 /// (what the forward aligns the read to) + which [`Allele`] that sequence
@@ -75,6 +80,47 @@ pub(crate) fn build_rungs(
             allele,
         });
     }
+}
+
+/// Canonicalize an observed off-ladder tract into its [`NormalizedSeq`] key
+/// (Job 2). The canonical form **is** the tract bytes verbatim — see the module
+/// doc: with the full-tract representation (B1) and Stage-0 clean flanks, the
+/// sequence is already left-alignment-invariant, so there is nothing to shift.
+/// Kept as a named function so the canonicalization contract lives at one place
+/// (and is the single change point if a trimmed-variant form is ever adopted).
+pub(crate) fn normalize_offladder(observed_tract: &[u8]) -> NormalizedSeq {
+    NormalizedSeq::new(observed_tract.to_vec())
+}
+
+/// Build the single read-derived off-ladder candidate for an observed tract, or
+/// `None` if the tract is a clean tiling (then it is an on-ladder rung, not
+/// off-ladder — the degenerate case, arch §5.8). The candidate is `left_flank +
+/// tract + right_flank` with the [`Allele::OffLadder`] key carrying the
+/// canonical tract.
+///
+/// Whether a read *earns* an off-ladder candidate at all is gated upstream on
+/// its slow-path reason (only impure / interior-indel reads, arch §5.8); this
+/// builds the candidate once that gate has fired, so it takes just the locus and
+/// the observed tract.
+pub(crate) fn build_offladder(locus: &Locus, observed_tract: &[u8]) -> Option<CandidateAllele> {
+    // Degenerate case: a pure tiling is a rung, already covered by `build_rungs`.
+    if pure_tiling_units(observed_tract, &locus.motif()).is_some() {
+        return None;
+    }
+
+    let normalized = normalize_offladder(observed_tract);
+    let left = locus.left_flank();
+    let right = locus.right_flank();
+    let mut candidate_seq =
+        Vec::with_capacity(left.len() + normalized.as_bytes().len() + right.len());
+    candidate_seq.extend_from_slice(left);
+    candidate_seq.extend_from_slice(normalized.as_bytes());
+    candidate_seq.extend_from_slice(right);
+
+    Some(CandidateAllele {
+        candidate_seq,
+        allele: Allele::OffLadder(normalized),
+    })
 }
 
 #[cfg(test)]
@@ -166,5 +212,56 @@ mod tests {
         build_rungs(&locus, 2, 0, &mut out);
         build_rungs(&locus, 5, 0, &mut out);
         assert_eq!(out.len(), 2); // reused buffer accumulates
+    }
+
+    // --- Job 2: off-ladder candidates ----------------------------------------
+
+    #[test]
+    fn normalize_offladder_is_verbatim() {
+        // B1: the canonical form is the tract bytes themselves.
+        let seq = normalize_offladder(b"CACAACA");
+        assert_eq!(seq.as_bytes(), b"CACAACA");
+    }
+
+    #[test]
+    fn build_offladder_wraps_an_impure_tract_with_the_flanks() {
+        let locus = sample_locus(); // motif CA, flanks GGG / TTT
+        // "CACAACA" is not a clean (CA) tiling (the AA breaks it) → off-ladder.
+        let cand = build_offladder(&locus, b"CACAACA").unwrap();
+        assert_eq!(cand.candidate_seq, b"GGGCACAACATTT");
+        assert_eq!(
+            cand.allele,
+            Allele::OffLadder(NormalizedSeq::new(b"CACAACA".to_vec()))
+        );
+    }
+
+    #[test]
+    fn build_offladder_rejects_a_pure_tiling_as_a_rung() {
+        // A clean (CA) tiling is an on-ladder rung, not off-ladder (§5.8).
+        let locus = sample_locus();
+        assert!(build_offladder(&locus, b"CACACA").is_none());
+        assert!(build_offladder(&locus, b"CACACACA").is_none());
+        // The empty tract is the zero-unit rung, also a tiling.
+        assert!(build_offladder(&locus, b"").is_none());
+    }
+
+    #[test]
+    fn off_ladder_candidate_round_trips_through_to_sequence() {
+        // The OffLadder allele's to_sequence is the canonical tract — the same
+        // bytes build_offladder put between the flanks.
+        let locus = sample_locus();
+        let cand = build_offladder(&locus, b"CACAACA").unwrap();
+        assert_eq!(cand.allele.to_sequence(&locus), b"CACAACA");
+    }
+
+    #[test]
+    fn same_tract_two_reads_gives_an_identical_key() {
+        // Cross-sample identity: the verbatim full-tract key is byte-equal for
+        // two reads of the same molecule (there is only one spelling of a
+        // literal sequence — the property that makes left-alignment unnecessary).
+        let locus = sample_locus();
+        let a = build_offladder(&locus, b"CACAACA").unwrap();
+        let b = build_offladder(&locus, b"CACAACA").unwrap();
+        assert_eq!(a.allele, b.allele);
     }
 }

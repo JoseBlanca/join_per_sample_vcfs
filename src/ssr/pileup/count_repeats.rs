@@ -34,24 +34,13 @@ fn phred_correct(q: u8) -> f32 {
     PHRED_CORRECT[q as usize]
 }
 
-/// Count the repeat units in `tract` when it is a pure integer tiling of
-/// `motif`, returning `(units, weight)`; `None` when the tract is not a clean
-/// whole-number tiling — a partial trailing unit or any interior base that
-/// breaks the tiling (interrupted/impure). Such a read is not fast-path
-/// material and must take the slow path (arch §2/§4).
-///
-/// `tract` is the read's tract bases and `quals` their matching Phred scores,
-/// in read order, so `tract.len() == quals.len()` (a length mismatch is treated
-/// as malformed input and returns `None`). The returned `units` is the repeat
-/// count `L*`; `weight` is the **mean per-base probability the tract was read
-/// correctly** (`1 − 10^(−Q/10)` averaged over the tract), a confidence
-/// aggregate Stage 2 uses to down-weight a length whose confident support is all
-/// low-quality (spec §4.3) — it is *not* a likelihood. An empty tract is a
-/// vacuous clean tiling: `(0, 1.0)`.
-pub(crate) fn count_pure_tiling(tract: &[u8], quals: &[u8], motif: &Motif) -> Option<(u16, f32)> {
-    if tract.len() != quals.len() {
-        return None;
-    }
+/// The repeat-unit count if `tract` is a pure integer tiling of `motif`, else
+/// `None` — a partial trailing unit or any interior base that breaks the tiling
+/// (interrupted/impure). The tiling test alone, without the base-quality weight:
+/// shared by the fast-path counter ([`count_pure_tiling`]) and the off-ladder
+/// degenerate-case check (a tract that *is* a pure tiling is an on-ladder rung,
+/// not off-ladder — arch §5.8).
+pub(crate) fn pure_tiling_units(tract: &[u8], motif: &Motif) -> Option<u16> {
     let period = motif.period();
     // `Motif::new` guarantees `period >= 1`; the `period == 0` guard (which
     // short-circuits before `is_multiple_of`) keeps a future zero-period path a
@@ -76,6 +65,26 @@ pub(crate) fn count_pure_tiling(tract: &[u8], quals: &[u8], motif: &Motif) -> Op
     {
         return None;
     }
+    Some(units as u16)
+}
+
+/// Count the repeat units in `tract` when it is a pure integer tiling of
+/// `motif`, returning `(units, weight)`; `None` when the tract is not a clean
+/// whole-number tiling (the read then takes the slow path, arch §2/§4).
+///
+/// `tract` is the read's tract bases and `quals` their matching Phred scores,
+/// in read order, so `tract.len() == quals.len()` (a length mismatch is treated
+/// as malformed input and returns `None`). The returned `units` is the repeat
+/// count `L*`; `weight` is the **mean per-base probability the tract was read
+/// correctly** (`1 − 10^(−Q/10)` averaged over the tract), a confidence
+/// aggregate Stage 2 uses to down-weight a length whose confident support is all
+/// low-quality (spec §4.3) — it is *not* a likelihood. An empty tract is a
+/// vacuous clean tiling: `(0, 1.0)`.
+pub(crate) fn count_pure_tiling(tract: &[u8], quals: &[u8], motif: &Motif) -> Option<(u16, f32)> {
+    if tract.len() != quals.len() {
+        return None;
+    }
+    let units = pure_tiling_units(tract, motif)?;
 
     let weight = if tract.is_empty() {
         1.0
@@ -83,7 +92,7 @@ pub(crate) fn count_pure_tiling(tract: &[u8], quals: &[u8], motif: &Motif) -> Op
         let sum: f32 = quals.iter().map(|&q| phred_correct(q)).sum();
         sum / tract.len() as f32
     };
-    Some((units as u16, weight))
+    Some((units, weight))
 }
 
 #[cfg(test)]
