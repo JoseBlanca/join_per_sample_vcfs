@@ -26,11 +26,14 @@ Skills and agents are instructed to leave it untouched.
 >   shift core (`normalize_alleles` + `IndexRange`) into the shared, representation-
 >   neutral [src/norm_seqs.rs](src/norm_seqs.rs); the SNP CIGAR path now wraps it
 >   (behaviour-preserving — full lib suite 1065 green; 3 new kernel tests).
->   Build order: types → norm_seqs → container schema → stage modules. See the plan
+>   Then the fast-path motif counter (`count_pure_tiling` core) was built ahead of
+>   the heavy container refactor, needing only `types`. Build order: types →
+>   norm_seqs → [container schema, deferred] → stage modules. See the plan
 >   ([ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md)) and reports
 >   ([task 1](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md),
->   [task 2](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)).
->   Next: task 3 — the container SSR schema (`registry_ssr` + `SsrLocusRecord`).
+>   [task 2](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md),
+>   [count_repeats](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md)).
+>   Next: `pair_hmm` (slow-path forward) or returning to the container refactor.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
@@ -945,8 +948,11 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Impl reports:**
   - Task 1 — allele representation (`Allele`/`NormalizedSeq` + `to_sequence`/`repeat_count`) in [src/ssr/types.rs](src/ssr/types.rs): [ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)
   - Task 2 — lift `normalize_alleles` (+ `IndexRange`) to the shared [src/norm_seqs.rs](src/norm_seqs.rs); SNP CIGAR path ([src/pileup/walker/indel_norm.rs](src/pileup/walker/indel_norm.rs)) now wraps the kernel. Behaviour-preserving; full lib suite green: [ssr_pileup_task2_norm_seqs_lift_2026-06-15.md](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)
+  - Fast-path counter (reordered ahead of task 3) — `count_pure_tiling` core in [src/ssr/pileup/count_repeats.rs](src/ssr/pileup/count_repeats.rs); needs only `types`. Triage-typed wrapper deferred. [ssr_pileup_count_repeats_2026-06-15.md](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md)
 - **Open:**
-  - Tasks 3–4 not started. `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs` (task 4). The SSR off-ladder adapter onto `norm_seqs` also lands in task 4 (first consumer beyond the SNP path).
+  - **Task 3 (container generalization, arch §10) deferred by choice** — a large multi-step refactor of the production `.psp` writer (58KB) + reader (136KB); gates the `.ssr.psp` writer/round-trip but not the stage's compute modules. Trait-vs-builders fork (§10.7 Q1) still to be decided at its step 1.
+  - `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs`. The SSR off-ladder adapter onto `norm_seqs` lands with `candidate_generation` (first consumer beyond the SNP path).
+  - Stage modules still to build: `pair_hmm` (slow-path forward — next candidate, dependency-free), `candidate_generation`, `triage` (+ the `count_fast` wrapper), `fetch_reads`, `locus_record`, the driver.
 
 ---
 
