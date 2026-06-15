@@ -19,7 +19,16 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
+> - **Last completed task (2026-06-15):** **SSR Stage 1 (`ssr-pileup`) — task 1: allele representation.**
+>   Built the designed-but-unbuilt allele model in
+>   [src/ssr/types.rs](src/ssr/types.rs) — `NormalizedSeq` + `Allele`
+>   (`OnLadder`/`OffLadder`) with pure `to_sequence`/`repeat_count` methods (8 new
+>   tests; fmt/clippy clean; 24 `ssr::types` tests pass). First prerequisite of the
+>   Stage-1 build order; see the implementation plan
+>   ([ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md)) and report
+>   ([ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)).
+>   Next: task 2 — lift `normalize_alleles` to `src/norm_seqs/`.
+> - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
 >   all 9 findings resolved — **B1** (drop intra-doc-link brackets → `cargo doc`
@@ -922,6 +931,18 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Status:** planned
 - **Plan:** [ssr_catalog.md](doc/devel/implementation_plans/ssr_catalog.md) (implementation sketch: files, structs, fn signatures)
 - **Notes:** detector = lh3/TRF-mod (shell-out via temp files, no FFI), genome-wide; post-process drops compound/bundled loci (GangSTR-style, no split); worker-per-contig with an ordered collector; `--num-chroms-in-parallel` is a speed⇄RAM knob.
+
+### Stage 1 — `ssr-pileup` (per-sample evidence extraction)
+
+#### `ssr-pileup` stage
+- **Status:** in-flight
+- **Architecture:** [ssr_pileup.md](doc/devel/architecture/ssr_pileup.md) (every structural question decided)
+- **Plan:** [ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md) (implementation sketch: build order, modules, structs, fn signatures)
+- **Build order:** (1) allele types in `types.rs` → (2) lift `normalize_alleles` to `src/norm_seqs/` → (3) container SSR schema → (4) stage modules (`count_repeats` → `pair_hmm` → `candidate_generation` → `triage` → `fetch_reads` → `mod`).
+- **Impl reports:**
+  - Task 1 — allele representation (`Allele`/`NormalizedSeq` + `to_sequence`/`repeat_count`) in [src/ssr/types.rs](src/ssr/types.rs): [ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)
+- **Open:**
+  - Tasks 2–4 not started. `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs` (task 4).
 
 ---
 
