@@ -8,6 +8,8 @@
 //!
 //! **Build status.** Built bottom-up — the leaf scorers/counters first, the I/O
 //! fetcher and driver last — so each layer is testable before it has a consumer.
-//! Present so far: [`count_repeats`] (the fast-path motif counter).
+//! Present so far: [`count_repeats`] (the fast-path motif counter) and
+//! [`pair_hmm`] (the slow-path forward scorer).
 
 pub mod count_repeats;
+pub mod pair_hmm;

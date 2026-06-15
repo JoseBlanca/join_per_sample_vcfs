@@ -32,8 +32,9 @@ Skills and agents are instructed to leave it untouched.
 >   ([ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md)) and reports
 >   ([task 1](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md),
 >   [task 2](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md),
->   [count_repeats](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md)).
->   Next: `pair_hmm` (slow-path forward) or returning to the container refactor.
+>   [count_repeats](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md),
+>   [pair_hmm](ia/reports/implementations/ssr_pileup_pair_hmm_2026-06-15.md)).
+>   Next: `candidate_generation` (composes types + norm_seqs) or the container refactor.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
@@ -949,10 +950,12 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - Task 1 — allele representation (`Allele`/`NormalizedSeq` + `to_sequence`/`repeat_count`) in [src/ssr/types.rs](src/ssr/types.rs): [ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)
   - Task 2 — lift `normalize_alleles` (+ `IndexRange`) to the shared [src/norm_seqs.rs](src/norm_seqs.rs); SNP CIGAR path ([src/pileup/walker/indel_norm.rs](src/pileup/walker/indel_norm.rs)) now wraps the kernel. Behaviour-preserving; full lib suite green: [ssr_pileup_task2_norm_seqs_lift_2026-06-15.md](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)
   - Fast-path counter (reordered ahead of task 3) — `count_pure_tiling` core in [src/ssr/pileup/count_repeats.rs](src/ssr/pileup/count_repeats.rs); needs only `types`. Triage-typed wrapper deferred. [ssr_pileup_count_repeats_2026-06-15.md](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md)
+  - Slow-path forward — `forward` + `HmmModel` + `PairHmmScratch` in [src/ssr/pileup/pair_hmm.rs](src/ssr/pileup/pair_hmm.rs); 3-state log-space pair-HMM, Dindel emission. Constant gap-open (homopolymer-indexed table deferred) + unbanded (banding deferred), both calibration per arch §14. [ssr_pileup_pair_hmm_2026-06-15.md](ia/reports/implementations/ssr_pileup_pair_hmm_2026-06-15.md)
 - **Open:**
   - **Task 3 (container generalization, arch §10) deferred by choice** — a large multi-step refactor of the production `.psp` writer (58KB) + reader (136KB); gates the `.ssr.psp` writer/round-trip but not the stage's compute modules. Trait-vs-builders fork (§10.7 Q1) still to be decided at its step 1.
   - `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs`. The SSR off-ladder adapter onto `norm_seqs` lands with `candidate_generation` (first consumer beyond the SNP path).
-  - Stage modules still to build: `pair_hmm` (slow-path forward — next candidate, dependency-free), `candidate_generation`, `triage` (+ the `count_fast` wrapper), `fetch_reads`, `locus_record`, the driver.
+  - Stage modules still to build: `candidate_generation` (rungs + off-ladder norm adapter onto `norm_seqs`; next candidate), `triage` (+ the `count_fast` wrapper + `score_candidates` over `pair_hmm`), `fetch_reads`, `locus_record`, the driver.
+  - `pair_hmm` follow-ups: homopolymer-indexed gap-open + banding (calibration/optimization, arch §14); `score_candidates` wrapper (needs `CandidateAllele`).
 
 ---
 
