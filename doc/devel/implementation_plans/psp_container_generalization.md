@@ -5,7 +5,7 @@
 §10 is the architecture — written in-arch because it refactors existing shared
 code). Goal: make [`src/psp/`](../../src/psp/) host **two schemas** (`snp`, `ssr`)
 over one generic core, so Stage-1 `ssr-pileup` can write `.ssr.psp`. Files +
-the `PspSchema` shape + the incremental step order — not full pseudocode.
+the `PspKind` shape + the incremental step order — not full pseudocode.
 
 **Regression gate, every step:** the SNP caller's end-to-end tests pass. *Not*
 byte-identity to the old `.psp` (pre-alpha, no on-disk back-compat — arch §3.2).
@@ -35,12 +35,13 @@ Grounding (confirmed by reading the module, 2026-06-15):
 
 A schema supplies the four things the generic core can't know (arch §10.2):
 the **registry table**, a **record type**, **record→columns** (encode), and
-**columns→record** (decode). Sketch as a `PspSchema` trait:
+**columns→record** (decode). Sketch as a `PspKind` trait:
 
 ```rust
-/// A `.psp` schema family (snp | ssr): what the generic container core needs
-/// beyond the schema-agnostic block / index / header machinery.
-pub(crate) trait PspSchema {
+/// One `.psp` kind (snp | ssr): what the generic container core needs beyond
+/// the schema-agnostic block / index / header machinery. Each kind supplies its
+/// column schema, record type, and the record↔columns codec.
+pub(crate) trait PspKind {
     type Record;
     type Block: BlockAccumulator<Record = Self::Record>;
 
@@ -72,31 +73,31 @@ trait BlockAccumulator {
 }
 ```
 
-`PspWriter<W, S: PspSchema>` and the reader's typed iterator become generic over
-`S`, with `SnpSchema` as the **only** impl in steps 1–3.
+`PspWriter<W, S: PspKind>` and the reader's typed iterator become generic over
+`S`, with `SnpKind` as the **only** impl in steps 1–3.
 
 > **The fork to resolve in code (§10.7 Q1):** if the generics stay clean, keep
-> the `PspSchema` trait. If they get unwieldy — `'static`-bound creep (house-style
+> the `PspKind` trait. If they get unwieldy — `'static`-bound creep (house-style
 > smell), or the decode side fighting the borrow of `BlockColumns` — fall back to
 > **two concrete builders** (`SnpPspWriter` / `SsrPspWriter`) sharing the generic
 > mechanics as **free functions** (flush, manifest, zstd, header). Decide from the
 > *real* step-1 ergonomics, not up front.
 
-**Keeping call sites stable:** give `S` a default (`PspWriter<W, S = SnpSchema>`)
+**Keeping call sites stable:** give `S` a default (`PspWriter<W, S = SnpKind>`)
 and keep the public constructors (`new` / `new_with_block_target` /
-`new_with_block_layout`) on the `S = SnpSchema` impl, so the ~19 existing
+`new_with_block_layout`) on the `S = SnpKind` impl, so the ~19 existing
 `PspWriter::new(...)` call sites + tests are untouched; `write_record(&S::Record)`
 is `&PileupRecord` for them. (If the default-param inference fights us, a
-`type SnpPspWriter<W> = PspWriter<W, SnpSchema>` alias is the fallback.)
+`type SnpPspWriter<W> = PspWriter<W, SnpKind>` alias is the fallback.)
 
 ---
 
 ## 2. Build sequence (arch §10.6 — each step green before the next)
 
 1. **Parameterize the writer on a schema, behaviour-preserving (SNP-only).**
-   Introduce `PspSchema` + `BlockAccumulator`; move the SNP `BlockAccumulator` /
-   `append_record` / `encode_column_into` / `V1_0_COLUMNS` behind a `SnpSchema`
-   impl; make `PspWriter<W, S>` generic with `S = SnpSchema` default + constructors
+   Introduce `PspKind` + `BlockAccumulator`; move the SNP `BlockAccumulator` /
+   `append_record` / `encode_column_into` / `V1_0_COLUMNS` behind a `SnpKind`
+   impl; make `PspWriter<W, S>` generic with `S = SnpKind` default + constructors
    pinned to SNP. **This is where the trait-vs-builders fork resolves.** SNP e2e
    green. *(Split: writer first (1a), then the reader's typed path (1b) — the two
    biggest files, each landed green.)*
@@ -152,7 +153,7 @@ to a shared peer if the back-reference rule demands it).
 | `block.rs`, `varint.rs`, `trailer.rs` | none |
 | `index.rs` | `last_pos` = max-`end`; interval overlap (point = degenerate) |
 | `header.rs` | add `kind`; cross-check against the `kind`-selected registry |
-| `writer.rs`, `reader.rs` | parameterize on `S: PspSchema`; SNP becomes one impl |
+| `writer.rs`, `reader.rs` | parameterize on `S: PspKind`; SNP becomes one impl |
 | `registry.rs` → `registry_snp.rs` | `git mv`; `V1_0_COLUMNS` + SNP `ColumnKey` |
 | `registry_ssr.rs` (new) | SSR `ColumnDef` table + `SsrLocusRecord` mapping |
 
