@@ -41,8 +41,10 @@ Skills and agents are instructed to leave it untouched.
 >   the `find_longest_stretch` content pre-probe (read seam = `MappedRead`).
 >   **Architecture revised → realign-everything** (drop the CIGAR-trusting
 >   two-tier; `count_repeats` parked as a measured fast-path optimization the user
->   requires be tried). Container refactor deferred to last. Next: the simplified
->   `triage` (coverage classification + region extract + window centre).
+>   requires be tried). Container refactor deferred to last. `triage` is complete
+>   (coverage classification + region extract + window centre; recovers
+>   soft-clipped long alleles via the clip-included pre-probe). Next: the per-read
+>   worker wiring (triage → candidate_generation → score_candidates → ReadOutcome).
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
@@ -965,9 +967,9 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Open:**
   - **Task 3 (container generalization, arch §10) deferred by choice** — a large multi-step refactor of the production `.psp` writer (58KB) + reader (136KB); gates the `.ssr.psp` writer/round-trip but not the stage's compute modules. Trait-vs-builders fork (§10.7 Q1) still to be decided at its step 1.
   - `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs`. The SSR off-ladder adapter onto `norm_seqs` lands with `candidate_generation` (first consumer beyond the SNP path).
-  - `triage` started — content pre-probe `find_longest_stretch` + `ProbeHit` in [src/ssr/pileup/triage.rs](src/ssr/pileup/triage.rs); dependency-free, 8 tests. Read seam = `MappedRead` ([src/bam/alignment_input.rs](src/bam/alignment_input.rs): `pos`/`cigar`/`seq`/`qual`). Context in commit.
-  - **Architecture revised (2026-06-15): realign-everything** — v1 realigns every spanning read (pair-HMM), dropping the CIGAR-trusting two-tier fast/slow gate; the direct-count fast path (`count_repeats`, built + parked) becomes a **measured optimization the user requires be tried**. Docs amended: arch `ssr_pileup.md` §2/§14, plan §4. Triage collapses to coverage classification + region extract + window centre.
-  - Stage modules still to build: `triage` coverage classification + extract + centre (over `MappedRead`); `fetch_reads`; `locus_record` (needs container schema); the driver. Deferred + measured: the `count_repeats` fast-path shortcut.
+  - **Architecture revised (2026-06-15): realign-everything** — v1 realigns every spanning read (pair-HMM), dropping the CIGAR-trusting two-tier fast/slow gate; the direct-count fast path (`count_repeats`, built + parked) becomes a **measured optimization the user requires be tried**. Docs amended: arch `ssr_pileup.md` §2/§14, plan §4.
+  - `triage` complete (realign-everything) — `find_longest_stretch` pre-probe + `read_footprint`/`brackets`/`extract_region`/`triage_read` in [src/ssr/pileup/triage.rs](src/ssr/pileup/triage.rs): coverage classification (footprint position + clips, no flank-byte match) → region extract → window centre. Read seam = `MappedRead`. Recovers soft-clipped long alleles via the clip-included pre-probe (test: mapper's 3 units → true 6). 22 tests. [ssr_pileup_triage_2026-06-15.md](ia/reports/implementations/ssr_pileup_triage_2026-06-15.md)
+  - Stage modules still to build: worker wiring (`triage_read` → `build_rungs`/`build_offladder` → `score_candidates` → `ReadOutcome`); `locus_record` (needs container schema); `fetch_reads`; the driver. Deferred + measured: the `count_repeats` fast-path shortcut.
   - `pair_hmm` follow-ups: homopolymer-indexed gap-open + banding (calibration/optimization, arch §14).
 
 ---
