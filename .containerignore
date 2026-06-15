@@ -7,3 +7,14 @@ python_draft/
 __pycache__/
 *.pyc
 .claude/
+# Large data + vendored reference codebases — none are COPYd by the
+# Containerfile (it only copies Cargo.toml/Cargo.lock + the entrypoint), so
+# shipping them as build context is pure dead weight (benchmarks/ alone is
+# ~26 GB) that slows every image build.
+benchmarks/
+bcftools/
+htslib/
+samtools/
+sdust/
+TRF-mod/
+tmp/
