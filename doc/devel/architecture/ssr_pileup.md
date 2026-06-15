@@ -59,6 +59,32 @@ Three framings from the spec drive every choice below:
 
 ## 2. The two-tier likelihood — the core algorithm
 
+> **Design revision (2026-06-15) — realign-everything is the v1 compute path; the
+> fast direct-count path below is a *measured optimization to add back*, not
+> load-bearing.** Reconsidered because mappers align SSR reads poorly *exactly*
+> where it matters, and the fast-path fraction §14 flags as unvalidated is
+> expected to be small on the repeat-dense target genomes. So v1 **realigns every
+> spanning read** with the pair-HMM (§5) over `count ± W` candidates centred by
+> the content pre-probe (§3.2), never trusting the mapper's indel placement (only
+> its mapping *position* + clip lengths, for locus membership and coverage). This
+> collapses read triage to **coverage classification → region extract → centre**:
+> no CIGAR fast/slow gate, no aligned-span estimator, and **soft-clip recovery
+> stops being a special case** (every read is content-probed + realigned). The
+> arch already anticipated this — §14: the design "stays correct if the fast path
+> is small — everything just routes slow, at HipSTR-like cost minus stutter
+> marginalization."
+>
+> The **fast direct-count path described in the rest of this section is retained
+> as the first optimization to add back *and measure*** (a hard requirement, not a
+> someday): a confident shortcut that skips the pair-HMM when a read is a verified
+> pure tiling of a rung at high boundary-Q, gated on *measuring* the fast-path
+> fraction (§14's load-bearing measurement). So read the fast/slow material below
+> as **(a)** still the definition of the **storage tiers** — confident point-mass
+> → histogram, ambiguous → CSR (§11) — now keyed off `Qᵣ` *peakedness* (an output
+> property), not a compute branch; and **(b)** the design of that deferred,
+> measured shortcut. The `count_repeats` module (the fast counter) is already
+> built and parked for exactly this.
+
 > **The capillary-trace intuition (read this first if the math below is opaque).**
 > Genotyping a microsatellite on a capillary, you never see one clean peak — you
 > see a **main peak at the true allele** plus smaller **stutter peaks** a repeat
@@ -1023,6 +1049,18 @@ Net-new and shared-lift dependencies this stage pulls in, in build order:
 ---
 
 ## 14. Decisions & residual validation
+
+> **Revision (2026-06-15): realign-everything default, fast path = measured
+> optimization.** The biggest revision since this doc settled — see the §2 banner.
+> v1 realigns every spanning read (pair-HMM over `count ± W`, centred by the
+> content pre-probe); the CIGAR-trusting fast direct-count path is recast as a
+> confident shortcut to add back **and measure** (gated on the fast-path-fraction
+> measurement this section already demanded). Triage collapses to coverage
+> classification + extract + centre; soft-clip recovery is no longer a special
+> case. Correctness rests on the pair-HMM alone. Rationale: mappers mis-align SSR
+> reads precisely where it matters, so the fast path's value (never its
+> correctness) was resting on an unvalidated assumption better measured than
+> assumed.
 
 Every design question this pass raised is now **decided**; nothing structural is
 left open. Recap, with the deferred items and the data-validation that remains.

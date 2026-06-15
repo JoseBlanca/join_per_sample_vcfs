@@ -39,7 +39,8 @@ Grounding facts already checked in the tree:
 1. types.rs    : Allele / NormalizedSeq + to_sequence / repeat_count   (§1 below)
 2. shared lift : normalize_alleles → shared module, SNP tests green     (§2 below)
 3. container   : registry_ssr + SsrLocusRecord schema (if not landed)   (§8 below)
-4. stage       : candidate_generation → count_repeats → pair_hmm → triage → fetch_reads → mod  (§3–§9)
+4. stage       : candidate_generation → pair_hmm → triage(coverage+centre) → fetch_reads → mod  (§3–§9)
+                 (count_repeats parked as the deferred, measured fast-path shortcut — §2/§4)
 ```
 Each is landed and green before the next. The stage modules themselves go
 **bottom-up** (pure scorers + candidate builders first, the I/O fetcher and the
@@ -110,8 +111,8 @@ module path is new. Contract: "one kernel, two users".)*
 src/ssr/pileup/
 ├── mod.rs           # SsrPileupArgs, run(): wire fetcher→queue→pool→collector→writer (§9)
 ├── fetch_reads.rs   # single I/O thread: forward index walk, depth-cap reservoir, bundles (§7)
-├── triage.rs        # anchor, soft-clip recovery, spanning classification, Algorithm gate (§4)
-├── count_repeats.rs # flank-anchored exact motif count → confident L* (§4.3)
+├── triage.rs        # coverage classification + region extract + window centre (pre-probe) (§4)
+├── count_repeats.rs # parked: confident pure-tiling count — the deferred fast-path shortcut (§4)
 ├── pair_hmm.rs      # NEW banded 3-state log-space forward + PairHmmScratch (pure scorer) (§6)
 ├── candidate_generation.rs  # candidate gen: rungs + read-derived off-ladder + normalize (§5)
 └── locus_record.rs  # per-locus aggregation → SsrLocusRecord (hist_*/amb_*/offl_*) (§8)
@@ -123,71 +124,63 @@ Subcommand: an `SsrPileupArgs` (clap) dispatched from the existing router beside
 
 ---
 
-## 4. `triage.rs` — read classification & the fast/slow gate (arch §2/§3)
+## 4. `triage.rs` — coverage classification, then extract + centre (arch §2/§3)
 
-Takes the (gated, capped) reads of one bundle and decides, per read: spanning?
-how to count it? fast or slow? The subtle stage — everything downstream trusts it.
+> **Revised (2026-06-15, realign-everything — §2 banner).** Triage no longer runs
+> a fast/slow gate or trusts the CIGAR's indel placement. It classifies *coverage*
+> (CIGAR-lite: mapping position + ref-consumed length + clip lengths) and, for a
+> spanning read, extracts the locus-region bases and centres the pair-HMM window;
+> **every spanning read is then realigned** (§5/§6). The `Algorithm` /
+> `SlowReason` / `FastHit` gate types are the **deferred, measured optimization**,
+> not v1.
+
+Takes the (gated, capped) reads of one bundle and decides, per read: does its
+footprint span the locus, and if so what bases to score + where to centre the
+window? The subtle stage — everything downstream trusts the coverage call.
 
 ```rust
-/// Outcome of triaging one read against one locus (arch §3.3) — names the read's
-/// position vs the tract (how many of its two ends carry clean flank: 2/1/0).
-/// Only `Spanning` feeds the likelihood; the other two are tallied for QC, dropped.
+/// Outcome of triaging one read against one locus (arch §3.3) — how many of the
+/// tract's two ends the read's footprint brackets (2/1/0). Only `Spanning` feeds
+/// the likelihood; the other two are tallied for QC, then dropped.
 enum TriageResult {
-    Spanning(SpanningRead),     // clean flank BOTH ends (≥ MIN_FLANK_BP) → brackets the tract (§4.3/§6)
-    Flanking,                   // clean flank ONE end only → counted n_flanking, not used (v1)
-    InRepeat,                   // NEITHER end: read buried in the tract, allele ≥ read len → n_frr, not used
+    Spanning(SpanningRead),  // footprint brackets the tract + MIN_FLANK_BP, both ends
+    Flanking,                // brackets one end only → n_flanking, not used (v1)
+    InRepeat,                // brackets neither → n_frr, not used (v1)
 }
 
-/// A usable spanning read + everything the fast/slow split needs.
+/// A spanning read ready for the pair-HMM: the read-coord span covering the
+/// locus region (flanks + tract, soft-clips included) and the observed repeat
+/// count that centres the `count ± W` window. No fast/slow field — v1 realigns
+/// every spanning read (§2 revision); the direct-count shortcut adds one back later.
 struct SpanningRead {
-    algorithm: Algorithm,       // which method computes this read's Qᵣ (and, if slow, why)
-    observed_count: u16,        // the read's observed repeat length → centres the count±W window
-    tract_in_read: Range<usize>,// the tract's span in READ coords (aligned or clip-recovered)
-    // base-quality slice handle for the boundary / emission model
+    region: Range<usize>,    // read-coord span covering [locus ± FLANK_BP], clips included
+    observed_count: u16,     // pre-probe longest-run → window centre
+    // base-quality slice handle for the emission model
 }
 
-/// Which algorithm computes this read's length likelihood — the §2 gate decision
-/// (NEVER a bool: the split is a headline benchmark number, and Realign carries why).
-enum Algorithm {
-    DirectCount(FastHit),       // fast path: both flanks clean, pure tiling, no interior indel, boundary Q ok
-    Realign(SlowReason),        // slow path: the banded pair-HMM
-}
-enum SlowReason { SoftClip, InteriorIndel, Impure, LowBoundaryQ }
-
-/// Classify one read. The `observed_count` estimator is chosen by flank placement (arch §2/§3.2):
-///   - exact motif tally        (clean fast-path read; the aligned span IS a tiling)
-///   - aligned tract span       (slow but both flanks anchored: interior indel/impure/low-Q)
-///   - content pre-probe        (a flank lives in the clip: find_longest_stretch)
-fn triage_read(read: &MergedRecord, locus: &Locus, p: &SsrParams) -> TriageResult;
-
-/// GangSTR-style O(read len) content scan — longest contiguous motif run (centres
-/// the window) + total copies (junk bound). Used ONLY when a flank is in the clip.
-/// (port of GangSTR realignment.cpp find_longest_stretch, arch §3.2)
-fn find_longest_stretch(read: &[u8], motif: &Motif) -> ProbeHit;
-
-/// Clean-flank check against Locus::left_flank/right_flank — the junk + spanning
-/// test (our deliberate divergence from HipSTR: we REQUIRE a clean flank in the
-/// clip because the two-tier design trusts the recovered length directly, arch §3.2).
-fn clip_carries_clean_flank(clip: &[u8], flank: &[u8], p: &SsrParams) -> bool;
+/// Classify by footprint coverage; for a spanning read, extract the region and
+/// centre via the content pre-probe. Uses the CIGAR only for the footprint
+/// (start + ref-consumed length + clip lengths), never its indel placement.
+fn triage_read(read: &MappedRead, locus: &Locus, p: &SsrParams) -> TriageResult;
 ```
 
-The fast/slow predicate is the bundled `FAST_PATH_GATE` (arch §2): both flanks
-cleanly aligned ∧ pure tiling ∧ no interior sequencing indel ∧ boundary
-`Q ≥ MIN_BASE_QUAL`. Any clause failing → `Realign(reason)`; a soft-clipped read
-**never** qualifies. Per-locus QC scalar counts (`depth`, `n_spanning`,
-`n_flanking`, `n_frr`, `n_filtered`, `n_flank_indel`, `mapped_reads`) are tallied
-in the fetcher's full pass (§7); triage only classifies the admitted reads.
+`find_longest_stretch` (the content pre-probe) is built in this module — longest
+contiguous motif run (window centre) + total copies. The coverage test: the
+read's footprint (aligned ref-span plus any soft-clip on the missing side)
+reaches ≥ `MIN_FLANK_BP` past the tract on a side; both → `Spanning`, one →
+`Flanking`, neither → `InRepeat`. **No flank-byte match at triage** — the
+pair-HMM's flank emission (§5.3) judges flank quality and scores adapter/junk
+clips poorly on its own (triage dumb, HMM smart). Per-locus QC counts (`depth`,
+`n_spanning`, `n_flanking`, `n_frr`, `n_filtered`, `mapped_reads`) are tallied in
+the fetcher's full pass (§7).
 
-### `count_repeats.rs` — the fast path, the cheap bulk (arch §4)
+### `count_repeats.rs` — the deferred fast-path shortcut (arch §4, §2 revision)
 
-```rust
-/// Walk the tract between the two clean anchors, confirm a pure integer tiling of
-/// the motif, return one on-ladder length + a base-quality weight. O(read len),
-/// no DP, allocation-free (runs on the hot majority). On-ladder by construction.
-fn count_fast(read: &MergedRecord, hit: &FastHit, locus: &Locus) -> (u16, f32);
-```
-Fast-path reads are **not stored individually** — they tally into the locus
-histogram (§8). That is the storage win.
+Built and parked. `count_pure_tiling(tract, quals, motif) -> Option<(u16, f32)>`
+returns a confident `(units, weight)` when a read's tract is a clean tiling — the
+**measured optimization** to skip the pair-HMM for the easy majority, added back
+once the fast-path fraction is measured (arch §14). Its `pure_tiling_units` is
+already in use by the off-ladder degenerate check (§5).
 
 ---
 
@@ -355,9 +348,12 @@ pub fn run(args: SsrPileupArgs) -> Result<(), SsrPileupError>;
    reject inputs whose read groups disagree on sample; require the index.
 2. open CatalogReader (or .query() when --regions); read SsrParams + header.
 3. spawn 1 fetcher thread (fetch_reads.rs) → bounded queue.
-4. worker pool (threads): per LocusBundle, no BAM access —
-      triage → count_repeats | (candidate_generation → pair_hmm) → ReadOutcome[] → aggregate → SsrLocusRecord
-   each worker owns a PairHmmScratch + ladder scratch buffers (reused per read).
+4. worker pool (threads): per LocusBundle, no BAM access — for each spanning read:
+      triage(coverage+centre) → candidate_generation(rungs+offladder) → score_candidates
+      → ReadOutcome[] → aggregate → SsrLocusRecord
+   (v1 realigns every spanning read; the count_repeats shortcut, when measured-in,
+    would handle confident reads before candidate_generation.)
+   each worker owns a PairHmmScratch + candidate scratch buffers (reused per read).
 5. ordered collector: reorder finished records to (chrom, start) before the
       registry_ssr writer (determinism + the block grid).
 6. write header (extraction_params: all named consts + seed scheme) + finalize.
