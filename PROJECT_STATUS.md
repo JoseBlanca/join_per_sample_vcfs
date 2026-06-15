@@ -19,15 +19,18 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-15):** **SSR Stage 1 (`ssr-pileup`) — task 1: allele representation.**
->   Built the designed-but-unbuilt allele model in
->   [src/ssr/types.rs](src/ssr/types.rs) — `NormalizedSeq` + `Allele`
->   (`OnLadder`/`OffLadder`) with pure `to_sequence`/`repeat_count` methods (8 new
->   tests; fmt/clippy clean; 24 `ssr::types` tests pass). First prerequisite of the
->   Stage-1 build order; see the implementation plan
->   ([ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md)) and report
->   ([ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)).
->   Next: task 2 — lift `normalize_alleles` to `src/norm_seqs/`.
+> - **Last completed task (2026-06-15):** **SSR Stage 1 (`ssr-pileup`) — tasks 1–2.**
+>   **Task 1:** built the allele model in [src/ssr/types.rs](src/ssr/types.rs) —
+>   `NormalizedSeq` + `Allele` (`OnLadder`/`OffLadder`) with pure
+>   `to_sequence`/`repeat_count` (8 tests). **Task 2:** lifted the SNP indel-norm
+>   shift core (`normalize_alleles` + `IndexRange`) into the shared, representation-
+>   neutral [src/norm_seqs.rs](src/norm_seqs.rs); the SNP CIGAR path now wraps it
+>   (behaviour-preserving — full lib suite 1065 green; 3 new kernel tests).
+>   Build order: types → norm_seqs → container schema → stage modules. See the plan
+>   ([ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md)) and reports
+>   ([task 1](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md),
+>   [task 2](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)).
+>   Next: task 3 — the container SSR schema (`registry_ssr` + `SsrLocusRecord`).
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
@@ -941,8 +944,9 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Build order:** (1) allele types in `types.rs` → (2) lift `normalize_alleles` to `src/norm_seqs/` → (3) container SSR schema → (4) stage modules (`count_repeats` → `pair_hmm` → `candidate_generation` → `triage` → `fetch_reads` → `mod`).
 - **Impl reports:**
   - Task 1 — allele representation (`Allele`/`NormalizedSeq` + `to_sequence`/`repeat_count`) in [src/ssr/types.rs](src/ssr/types.rs): [ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)
+  - Task 2 — lift `normalize_alleles` (+ `IndexRange`) to the shared [src/norm_seqs.rs](src/norm_seqs.rs); SNP CIGAR path ([src/pileup/walker/indel_norm.rs](src/pileup/walker/indel_norm.rs)) now wraps the kernel. Behaviour-preserving; full lib suite green: [ssr_pileup_task2_norm_seqs_lift_2026-06-15.md](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)
 - **Open:**
-  - Tasks 2–4 not started. `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs` (task 4).
+  - Tasks 3–4 not started. `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs` (task 4). The SSR off-ladder adapter onto `norm_seqs` also lands in task 4 (first consumer beyond the SNP path).
 
 ---
 

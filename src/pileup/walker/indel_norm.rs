@@ -10,18 +10,23 @@
 //! `bcftools norm` / `vt normalize` / GATK form GIAB truth uses) so
 //! identical indels consolidate onto one allele.
 //!
-//! This is a port of GATK `AlignmentUtils.leftAlignIndels` +
-//! `normalizeAlleles` (`gatk/.../utils/read/AlignmentUtils.java`),
-//! cross-checked against freebayes `LeftAlign.cpp`. Both reference
-//! callers left-align by rewriting the read's whole CIGAR — traversing
-//! right-to-left, trimming for parsimony, then shifting each indel left
-//! across the preceding alignment block as long as the moved bases match
-//! **both the reference and the read**, bounded so one indel cannot
-//! cross the previous (a collision merges them). See
+//! This is a port of GATK `AlignmentUtils.leftAlignIndels`
+//! (`gatk/.../utils/read/AlignmentUtils.java`), cross-checked against
+//! freebayes `LeftAlign.cpp`. Both reference callers left-align by rewriting
+//! the read's whole CIGAR — traversing right-to-left, trimming for parsimony,
+//! then shifting each indel left across the preceding alignment block as long
+//! as the moved bases match **both the reference and the read**, bounded so
+//! one indel cannot cross the previous (a collision merges them).
+//!
+//! The shift core itself (`normalizeAlleles`, operating on byte sequences and
+//! index ranges) is **not** here — it lives in the representation-neutral
+//! [`crate::norm_seqs`] module, shared with the SSR caller's off-ladder path.
+//! This module is the CIGAR-walk wrapper that drives it. See
 //! `doc/devel/implementation_plans/indel_normalization.md` and the
 //! architecture spec §"Indel normalization (left-alignment)".
 
 use super::CigarOp;
+use crate::norm_seqs::{IndexRange, normalize_alleles};
 
 /// Result of left-aligning a read's CIGAR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,129 +128,6 @@ fn length_on_read(op: CigarOp) -> usize {
     } else {
         0
     }
-}
-
-// --- Index range (half-open [start, end)) -------------------------------
-//
-// Mirrors GATK's `IndexRange`. Signed fields so the trim/shift bookkeeping
-// can momentarily express the right-shift trimming case (start_shift < 0)
-// without underflow; indices are always in-bounds when used to read bases.
-
-#[derive(Debug, Clone, Copy)]
-struct Range {
-    start: i64,
-    end: i64,
-}
-
-impl Range {
-    #[inline]
-    fn size(self) -> usize {
-        // The range is always well-formed (`start <= end`) when `size` is
-        // read for op-length emission; the assert catches a future edit
-        // that inverts it rather than letting `as usize` wrap to ~2^64.
-        debug_assert!(self.end >= self.start, "inverted Range: {self:?}");
-        (self.end - self.start) as usize
-    }
-    #[inline]
-    fn shift(&mut self, n: i64) {
-        self.start += n;
-        self.end += n;
-    }
-    #[inline]
-    fn shift_left(&mut self, n: i64) {
-        self.shift(-n);
-    }
-    #[inline]
-    fn shift_start(&mut self, n: i64) {
-        self.start += n;
-    }
-    #[inline]
-    fn shift_start_left(&mut self, n: i64) {
-        self.start -= n;
-    }
-    #[inline]
-    fn shift_end_left(&mut self, n: i64) {
-        self.end -= n;
-    }
-}
-
-// --- Allele normalization (the shift core) ------------------------------
-
-#[inline]
-fn last_base_on_right_is_same(seqs: &[&[u8]], bounds: &[Range]) -> bool {
-    let first = seqs[0][(bounds[0].end - 1) as usize];
-    seqs.iter()
-        .zip(bounds)
-        .all(|(s, b)| s[(b.end - 1) as usize] == first)
-}
-
-#[inline]
-fn first_base_on_left_is_same(seqs: &[&[u8]], bounds: &[Range]) -> bool {
-    let first = seqs[0][bounds[0].start as usize];
-    seqs.iter()
-        .zip(bounds)
-        .all(|(s, b)| s[b.start as usize] == first)
-}
-
-#[inline]
-fn next_base_on_left_is_same(seqs: &[&[u8]], bounds: &[Range]) -> bool {
-    let first = seqs[0][(bounds[0].start - 1) as usize];
-    seqs.iter()
-        .zip(bounds)
-        .all(|(s, b)| s[(b.start - 1) as usize] == first)
-}
-
-/// Trim shared flanking bases (parsimony), then shift the alleles left as
-/// far as the moved bases stay equal across **all** `seqs`, bounded by
-/// `max_shift`. Mutates `bounds` in place and returns
-/// `(start_shift, end_shift)` — the number of bases the allele start and
-/// end moved left (start may be negative when trimming forced a right
-/// shift). Port of GATK `normalizeAlleles`.
-fn normalize_alleles(
-    seqs: &[&[u8]],
-    bounds: &mut [Range],
-    max_shift: i64,
-    trim: bool,
-) -> (i64, i64) {
-    let mut start_shift: i64 = 0;
-    let mut end_shift: i64 = 0;
-
-    let mut min_size = bounds.iter().map(|b| b.size()).min().unwrap_or(0);
-
-    // Consume redundant shared bases at the end of the alleles.
-    while trim && min_size > 0 && last_base_on_right_is_same(seqs, bounds) {
-        for b in bounds.iter_mut() {
-            b.shift_end_left(1);
-        }
-        min_size -= 1;
-        end_shift += 1;
-    }
-
-    // Consume redundant shared bases at the start of the alleles.
-    while trim && min_size > 0 && first_base_on_left_is_same(seqs, bounds) {
-        for b in bounds.iter_mut() {
-            b.shift_start(1);
-        }
-        min_size -= 1;
-        start_shift -= 1;
-    }
-
-    // Shift left while the next base on the left is equal across all
-    // sequences and the last base on the right is equal. For an empty
-    // range (e.g. the reference relative to an insertion) the last base
-    // on the right is the next base on the left.
-    while start_shift < max_shift
-        && next_base_on_left_is_same(seqs, bounds)
-        && last_base_on_right_is_same(seqs, bounds)
-    {
-        for b in bounds.iter_mut() {
-            b.shift_left(1);
-        }
-        start_shift += 1;
-        end_shift += 1;
-    }
-
-    (start_shift, end_shift)
 }
 
 // --- CIGAR builder ------------------------------------------------------
@@ -416,11 +298,11 @@ pub(crate) fn left_align_cigar(
     let mut result_right_to_left: Vec<CigarOp> = Vec::with_capacity(cigar.len() + 4);
     let ref_end = (read_start + ref_length) as i64;
     let read_end = read_seq.len() as i64;
-    let mut ref_indel_range = Range {
+    let mut ref_indel_range = IndexRange {
         start: ref_end,
         end: ref_end,
     };
-    let mut read_indel_range = Range {
+    let mut read_indel_range = IndexRange {
         start: read_end,
         end: read_end,
     };

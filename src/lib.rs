@@ -19,6 +19,7 @@ pub mod bam;
 pub mod baq;
 pub mod fasta;
 pub mod iter_ext;
+pub(crate) mod norm_seqs;
 pub mod pileup;
 pub mod pileup_record;
 pub mod pop_var_caller;
