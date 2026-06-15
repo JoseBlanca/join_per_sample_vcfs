@@ -80,8 +80,16 @@ Skills and agents are instructed to leave it untouched.
 >   (adds the `kind` line) — gate is round-trip + e2e + back-compat, not
 >   byte-identity.** 1136 lib tests (+3 kind tests) + e2e green; report
 >   [2](ia/reports/implementations/psp_container_generalization_step2_2026-06-15.md).
->   Next: step 3 (interval-overlap block index), then 4
->   `registry_ssr`+`SsrLocusRecord` → 5 round-trip test.
+>   **Step 3 landed (interval region query, §10.5):** the per-record region
+>   clamp is now interval-based — `PspKind::record_coord` → `record_interval`
+>   (`chrom, start, end`); SNP = degenerate point `(chrom, pos, pos+1)`, so
+>   behaviour is identical. The block-index overlap + `last_pos` fill were
+>   already interval-shaped (no writer/index change), so the produced `.psp` is
+>   **byte-identical to step 2**. 1136 lib tests + region-clamp e2e green; report
+>   [3](ia/reports/implementations/psp_container_generalization_step3_2026-06-15.md).
+>   Next: step 4 `registry_ssr`+`SsrLocusRecord` (+`SsrBlock`/`SsrDecoder`/
+>   `SsrKind`; where `record_interval` returns a real locus interval and
+>   `last_pos` becomes `max(record.end)`) → 5 round-trip test.
 >   Off-ladder + measured fast path deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

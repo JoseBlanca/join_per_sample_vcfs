@@ -67,11 +67,13 @@ pub trait PspKind {
         out: &mut Vec<u8>,
     ) -> Result<(), PspWriteError>;
 
-    /// The `(chrom_id, position)` of a record, used by the reader to
-    /// apply a region-query window. SNP returns the record's point
-    /// position; the interval generalisation (architecture §10.5, a
-    /// later step) widens the right edge to `record.end`.
-    fn record_coord(record: &Self::Record) -> (u32, u32);
+    /// The `(chrom_id, start, end)` interval a record occupies, used by
+    /// the reader to apply a region-query window (architecture §10.5).
+    /// `end` is **exclusive**. SNP is a degenerate point: `(chrom_id,
+    /// pos, pos + 1)`. SSR returns the locus interval. A query `[q_start,
+    /// q_end]` (inclusive) keeps a record iff `start <= q_end` and `end >
+    /// q_start`.
+    fn record_interval(record: &Self::Record) -> (u32, u32, u32);
 }
 
 /// The per-block accumulator a [`PspKind`] fills as records arrive: its

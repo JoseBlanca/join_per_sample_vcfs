@@ -486,24 +486,28 @@ enum RangeClamp {
 }
 
 impl RangeClamp {
-    /// Mi17: `true` iff `(chrom_id, pos)` lies past the window's right
-    /// edge (or on a different chromosome). In `Window` mode the
-    /// iterator terminates as soon as this fires. Coordinate-based (not
-    /// `PileupRecord`-typed) so the generic reader can clamp any kind's
-    /// records via [`PspKind::record_coord`].
-    fn coord_past_window(self, chrom_id: u32, pos: u32) -> bool {
+    /// Mi17: `true` iff a record interval `[rec_start, ..)` lies past
+    /// the window's right edge (or on a different chromosome). In
+    /// `Window` mode the iterator terminates as soon as this fires.
+    /// Interval-based (architecture §10.5) so the generic reader can
+    /// clamp any kind via [`PspKind::record_interval`]. The query `end`
+    /// is inclusive, so the record is past once `rec_start > end`.
+    fn interval_past_window(self, chrom_id: u32, rec_start: u32) -> bool {
         match self {
             Self::None => false,
             Self::Window {
                 chrom_id: c, end, ..
-            } => chrom_id != c || pos > end,
+            } => chrom_id != c || rec_start > end,
         }
     }
 
-    /// Mi17: `true` iff `pos < start` in `Window` mode — the iterator
-    /// skips the record and asks for the next one.
-    fn coord_before_window(self, pos: u32) -> bool {
-        matches!(self, Self::Window { start, .. } if pos < start)
+    /// Mi17: `true` iff a record interval `[.., rec_end)` ends at or
+    /// before the window's (inclusive) left edge — `rec_end <= start` —
+    /// in `Window` mode; the iterator skips it and asks for the next.
+    /// `rec_end` is exclusive, so a SNP point at `pos` (`rec_end = pos +
+    /// 1`) is skipped exactly when `pos < start`, as before.
+    fn interval_before_window(self, rec_end: u32) -> bool {
+        matches!(self, Self::Window { start, .. } if rec_end <= start)
     }
 
     /// Mi17: `true` iff `entry`'s range cannot intersect this
@@ -874,12 +878,12 @@ where
                         }
                     };
                     // Mi17: region clamp via RangeClamp methods, on the
-                    // schema-provided coordinate.
-                    let (chrom_id, pos) = S::record_coord(&record);
-                    if self.clamp.coord_past_window(chrom_id, pos) {
+                    // schema-provided interval (architecture §10.5).
+                    let (chrom_id, rec_start, rec_end) = S::record_interval(&record);
+                    if self.clamp.interval_past_window(chrom_id, rec_start) {
                         return None;
                     }
-                    if self.clamp.coord_before_window(pos) {
+                    if self.clamp.interval_before_window(rec_end) {
                         continue; // pre-window record, drop and ask for the next
                     }
                     return Some(Ok(record));

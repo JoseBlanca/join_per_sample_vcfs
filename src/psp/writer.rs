@@ -775,8 +775,12 @@ impl PspKind for SnpKind {
         encode_snp_column_into(def, block, out)
     }
 
-    fn record_coord(record: &PileupRecord) -> (u32, u32) {
-        (record.chrom_id, record.pos)
+    fn record_interval(record: &PileupRecord) -> (u32, u32, u32) {
+        // SNP is a degenerate point: the record covers exactly `pos`,
+        // so the half-open interval is `[pos, pos + 1)`. `pos` is
+        // bounded by the SAM `@SQ LN` max (`2^31 - 1`), so `+ 1` cannot
+        // overflow `u32`; `saturating_add` is belt-and-braces.
+        (record.chrom_id, record.pos, record.pos.saturating_add(1))
     }
 }
 
