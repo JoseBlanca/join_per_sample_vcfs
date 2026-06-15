@@ -57,11 +57,21 @@ Skills and agents are instructed to leave it untouched.
 >   keeping all call sites unchanged. The flush/encode machinery is generic
 >   over `S` (iterates `S::columns()`/`S::encode_column`); record ingest +
 >   validation stays SNP-concrete (fork §10.7-Q1 resolved = trait + shared
->   generic functions). Behaviour-preserving — 1133 lib tests + SNP e2e green;
->   report
->   ([psp_container_generalization_step1a_2026-06-15.md](ia/reports/implementations/psp_container_generalization_step1a_2026-06-15.md)).
->   Next: step 1b (reader's typed path on the schema), then steps 2–5 (`kind`
->   tag → interval index → `registry_ssr`+`SsrLocusRecord` → round-trip test).
+>   generic functions).
+>   **Step 1b landed (reader's typed path, symmetric with the writer):** new
+>   `BlockDecoder` trait (mirror of `BlockAccumulator`) + `PspKind::Decoder` +
+>   `record_coord`; `RecordsIter<'r, R, S = SnpKind>` now drives block framing +
+>   shared decompression and delegates the column→record decode to
+>   `SnpDecoder` (which wraps the **unchanged** `decode_block_payload` + the
+>   cross-block CSR scratch). The cohort columnar path
+>   (`BlockColumnReader`/`BlockColumns`/two-phase) is untouched. Verified
+>   **byte-identical** produced `.psp` vs pre-refactor baseline `aa6a105` (writer
+>   unchanged) + record-level round-trip through the generalized reader; 1133 lib
+>   tests + SNP e2e green. Reports:
+>   [1a](ia/reports/implementations/psp_container_generalization_step1a_2026-06-15.md),
+>   [1b](ia/reports/implementations/psp_container_generalization_step1b_2026-06-15.md).
+>   Next: step 2 (`kind` tag → registry-by-kind), then 3 interval index → 4
+>   `registry_ssr`+`SsrLocusRecord` → 5 round-trip test.
 >   Off-ladder + measured fast path deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

@@ -39,8 +39,10 @@ use super::header::{
     ParsedHeader, parse_header_bytes,
 };
 use super::index::{BlockIndexEntry, checksum_index, decode_index};
+use super::kind::{BlockDecoder, PspKind};
 use super::registry::{ColumnKey, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS, lookup_by_tag};
 use super::trailer::{TRAILER_BYTES, Trailer, decode_trailer};
+use super::writer::SnpKind;
 use crate::pileup_record::{AlleleObservation, AlleleSupportStats, ChainId, PileupRecord};
 
 /// Cap on how many bytes the reader will pull off the source in
@@ -484,20 +486,24 @@ enum RangeClamp {
 }
 
 impl RangeClamp {
-    /// Mi17: `true` iff `record` lies past the window's right
+    /// Mi17: `true` iff `(chrom_id, pos)` lies past the window's right
     /// edge (or on a different chromosome). In `Window` mode the
-    /// iterator terminates as soon as this fires.
-    fn record_past_window(self, record: &PileupRecord) -> bool {
+    /// iterator terminates as soon as this fires. Coordinate-based (not
+    /// `PileupRecord`-typed) so the generic reader can clamp any kind's
+    /// records via [`PspKind::record_coord`].
+    fn coord_past_window(self, chrom_id: u32, pos: u32) -> bool {
         match self {
             Self::None => false,
-            Self::Window { chrom_id, end, .. } => record.chrom_id != chrom_id || record.pos > end,
+            Self::Window {
+                chrom_id: c, end, ..
+            } => chrom_id != c || pos > end,
         }
     }
 
-    /// Mi17: `true` iff `record.pos < start` in `Window` mode —
-    /// the iterator skips the record and asks for the next one.
-    fn record_before_window(self, record: &PileupRecord) -> bool {
-        matches!(self, Self::Window { start, .. } if record.pos < start)
+    /// Mi17: `true` iff `pos < start` in `Window` mode — the iterator
+    /// skips the record and asks for the next one.
+    fn coord_before_window(self, pos: u32) -> bool {
+        matches!(self, Self::Window { start, .. } if pos < start)
     }
 
     /// Mi17: `true` iff `entry`'s range cannot intersect this
@@ -518,32 +524,23 @@ impl RangeClamp {
 /// `PspReader`. **Not `Send`** by design — see
 /// `ia/feature_implementation_plans/psp_reader.md` §"Tradeoffs"
 /// for the rationale.
-pub struct RecordsIter<'r, R: Read + Seek> {
+pub struct RecordsIter<'r, R: Read + Seek, S: PspKind = SnpKind> {
     reader: &'r mut PspReader<R>,
     /// Index of the next block to load. Equals
     /// `reader.index.len()` once iteration is exhausted.
     cur_block_idx: usize,
-    /// Decoded payload of the current block. `None` before the
-    /// first block has been pulled from disk; dropped when the
-    /// block is exhausted to free its column buffers.
-    cur_block: Option<DecodedBlock>,
-    /// Index of the next record (within the current block) to
-    /// materialise. Resets to 0 on each new block.
-    next_record_in_block: u32,
-    /// Cumulative allele offset into the per-allele columns,
-    /// scoped to the current block. Resets to 0 on each new
-    /// block.
-    next_allele_in_block: u32,
-    /// Running 1-based reference position of the last-materialised
-    /// record. Reset to `cur_block.first_pos` on the first record
-    /// of every block.
-    last_pos: u32,
+    /// Whether a block is currently decoded into `decoder`. `false`
+    /// before the first block is pulled and after the current block is
+    /// drained; gates whether `next()` materialises or loads.
+    cur_block_loaded: bool,
+    /// The schema's per-block decoder (architecture §10.2): owns the
+    /// decoded columns, any cross-block reuse buffers (e.g. the SNP CSR
+    /// slabs), and the per-block record cursor. Mirror of the writer's
+    /// `S::Block`.
+    decoder: S::Decoder,
     /// `RangeClamp::None` for sequential iteration; `Window` for
     /// region iteration.
     clamp: RangeClamp,
-    /// File-global running record count, incremented after each
-    /// successful `materialise_next_record`.
-    record_index: u64,
     /// Sticky: once `next()` has yielded `Some(Err(_))`, future
     /// calls return `None`. Required for `Iterator` correctness
     /// when the source state after an error is unknown.
@@ -551,7 +548,8 @@ pub struct RecordsIter<'r, R: Read + Seek> {
     /// L1: persistent zstd decompressor reused across every column
     /// of every block. The DCtx workspace is allocated once
     /// (~hundreds of KiB at level 9) instead of per-column. Mirror
-    /// of writer-side H3 (commit 969de6c).
+    /// of writer-side H3 (commit 969de6c). Shared decompression
+    /// machinery — handed to `decoder.decode_block`.
     decompressor: zstd::bulk::Decompressor<'static>,
     /// L2: per-iter scratch for the compressed column bytes. Cleared
     /// then resized to `entry.compressed_len` per column; capacity
@@ -567,27 +565,18 @@ pub struct RecordsIter<'r, R: Read + Seek> {
     /// loop. One Vec per `RecordsIter` instead of one per
     /// `read_block_header` call.
     block_header_buf: Vec<u8>,
-    /// H1: CSR data slab for the `allele-seq` bytes column. Used to
-    /// be `DecodedBlock.allele_seqs: Vec<Vec<u8>>` (one inner Vec per
-    /// allele, allocated per block). Now: one `Vec<u8>` reused
-    /// across blocks via `extend_from_slice` of the whole column
-    /// payload at decode time. Capacity converges to the largest
-    /// allele-seq column the iterator has seen.
-    allele_seq_data: Vec<u8>,
-    /// H1: CSR row offsets for `allele-seq`. `allele_seq_offsets[j]`
-    /// is the start of allele `j`'s bytes in `allele_seq_data`;
-    /// `allele_seq_offsets[j+1]` is its end (exclusive).
-    /// `offsets.len() == n_total_alleles_in_block + 1`.
-    allele_seq_offsets: Vec<u32>,
-    /// H1: CSR data slab for the `allele-chain-ids` list column.
-    /// Mirror of [`Self::allele_seq_data`] for the ChainId payload.
-    allele_chain_ids_data: Vec<ChainId>,
-    /// H1: CSR row offsets for `allele-chain-ids`. Same shape as
-    /// [`Self::allele_seq_offsets`].
-    allele_chain_ids_offsets: Vec<u32>,
 }
 
-impl<'r, R: Read + Seek> RecordsIter<'r, R> {
+// `BlockDecoder` is deliberately `pub(crate)` (it names internal wire
+// types — see its doc) and the bound is an implementation detail callers
+// can't observe (the public surface is just `Iterator<Item =
+// Result<Record>>`). Allowing keeps those wire types encapsulated rather
+// than leaking them through a `pub` re-export just to satisfy the lint.
+#[allow(private_bounds)]
+impl<'r, R: Read + Seek, S: PspKind> RecordsIter<'r, R, S>
+where
+    S::Decoder: BlockDecoder<Record = S::Record>,
+{
     fn new(reader: &'r mut PspReader<R>, clamp: RangeClamp) -> Self {
         // L1: persistent decompressor. `Decompressor::new()` only
         // fails in OOM scenarios and at that point we have bigger
@@ -601,27 +590,21 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
         Self {
             reader,
             cur_block_idx: 0,
-            cur_block: None,
-            next_record_in_block: 0,
-            next_allele_in_block: 0,
-            last_pos: 0,
+            cur_block_loaded: false,
+            decoder: S::Decoder::new_decoder(),
             clamp,
-            record_index: 0,
             poisoned: false,
             decompressor,
             compressed_scratch: Vec::new(),
             decompressed_scratch: Vec::new(),
             block_header_buf: Vec::with_capacity(BLOCK_HEADER_INITIAL_CHUNK),
-            allele_seq_data: Vec::new(),
-            allele_seq_offsets: Vec::new(),
-            allele_chain_ids_data: Vec::new(),
-            allele_chain_ids_offsets: Vec::new(),
         }
     }
 
-    /// Seek to the next un-decoded block and decode it into
-    /// `self.cur_block`. Returns `Ok(false)` when no more blocks
-    /// remain.
+    /// Seek to the next un-decoded block and decode it into the
+    /// schema decoder. Returns `Ok(false)` when no more blocks remain.
+    /// The block framing + shared decompression scratch are owned here;
+    /// the per-schema column decode is delegated to the decoder.
     ///
     /// With unique-per-file chain ids the block header no longer
     /// carries an active-slot snapshot, so there is no
@@ -639,14 +622,88 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
         )?;
         let (block_header, _consumed) =
             read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
+        let budget =
+            block_byte_budget(&self.reader.index, &self.reader.trailer, self.cur_block_idx);
 
-        let decoded = decode_block_payload(
+        self.decoder.decode_block(
             &mut self.reader.source,
             &block_header,
-            block_byte_budget(&self.reader.index, &self.reader.trailer, self.cur_block_idx),
+            budget,
             &mut self.decompressor,
             &mut self.compressed_scratch,
             &mut self.decompressed_scratch,
+        )?;
+        self.cur_block_loaded = true;
+        Ok(true)
+    }
+}
+
+/// The SNP per-block decoder — [`SnpKind`]'s [`BlockDecoder`]. Owns the
+/// decoded SNP block, the two CSR slabs reused across blocks (the H1
+/// allocation collapse), and the per-block record cursor. The mirror of
+/// the writer's [`SnpBlock`](super::writer::SnpBlock).
+pub struct SnpDecoder {
+    /// Decoded payload of the current block. `None` before the first
+    /// block is decoded.
+    cur_block: Option<DecodedBlock>,
+    /// Index of the next record (within the current block) to
+    /// materialise. Resets to 0 on each new block.
+    next_record_in_block: u32,
+    /// Cumulative allele offset into the per-allele columns, scoped to
+    /// the current block. Resets to 0 on each new block.
+    next_allele_in_block: u32,
+    /// Running 1-based reference position of the last-materialised
+    /// record. Reset to the block's `first_pos` on each new block.
+    last_pos: u32,
+    /// File-global running record count, incremented after each
+    /// materialised record.
+    record_index: u64,
+    /// H1: CSR data slab for the `allele-seq` bytes column, reused
+    /// across blocks via `extend_from_slice` of the whole column
+    /// payload at decode time.
+    allele_seq_data: Vec<u8>,
+    /// H1: CSR row offsets for `allele-seq`; `offsets.len() ==
+    /// n_total_alleles_in_block + 1`.
+    allele_seq_offsets: Vec<u32>,
+    /// H1: CSR data slab for the `allele-chain-ids` list column.
+    allele_chain_ids_data: Vec<ChainId>,
+    /// H1: CSR row offsets for `allele-chain-ids`.
+    allele_chain_ids_offsets: Vec<u32>,
+}
+
+impl BlockDecoder for SnpDecoder {
+    type Record = PileupRecord;
+
+    fn new_decoder() -> Self {
+        Self {
+            cur_block: None,
+            next_record_in_block: 0,
+            next_allele_in_block: 0,
+            last_pos: 0,
+            record_index: 0,
+            allele_seq_data: Vec::new(),
+            allele_seq_offsets: Vec::new(),
+            allele_chain_ids_data: Vec::new(),
+            allele_chain_ids_offsets: Vec::new(),
+        }
+    }
+
+    fn decode_block<R: Read>(
+        &mut self,
+        source: &mut R,
+        header: &BlockHeader,
+        budget: u64,
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed_scratch: &mut Vec<u8>,
+        decompressed_scratch: &mut Vec<u8>,
+    ) -> Result<(), PspReadError> {
+        let decoded = decode_block_payload(
+            source,
+            header,
+            budget,
+            decompressor,
+            compressed_scratch,
+            decompressed_scratch,
             &mut self.allele_seq_data,
             &mut self.allele_seq_offsets,
             &mut self.allele_chain_ids_data,
@@ -659,13 +716,24 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
         // record's `pos = first_pos + delta_pos[0] = first_pos`.
         // Initialise `last_pos` to make that fall out of the same
         // addition path used for the rest of the block.
-        self.last_pos = block_header.first_pos;
-        Ok(true)
+        self.last_pos = header.first_pos;
+        Ok(())
     }
 
+    fn next_record(&mut self) -> Option<Result<PileupRecord, PspReadError>> {
+        match &self.cur_block {
+            Some(block) if self.next_record_in_block < block.n_records => {
+                Some(self.materialise_next_record())
+            }
+            _ => None,
+        }
+    }
+}
+
+impl SnpDecoder {
     /// Construct the next `PileupRecord` from the currently-loaded
     /// block. Caller must ensure a block is loaded and has records
-    /// left.
+    /// left (enforced by [`Self::next_record`]).
     ///
     /// M13: ownership of every per-record / per-allele inner `Vec`
     /// is moved out of the block via `mem::take`. The block is
@@ -775,8 +843,13 @@ impl<'r, R: Read + Seek> RecordsIter<'r, R> {
     }
 }
 
-impl<R: Read + Seek> Iterator for RecordsIter<'_, R> {
-    type Item = Result<PileupRecord, PspReadError>;
+// See the `#[allow]` rationale on the inherent impl above.
+#[allow(private_bounds)]
+impl<R: Read + Seek, S: PspKind> Iterator for RecordsIter<'_, R, S>
+where
+    S::Decoder: BlockDecoder<Record = S::Record>,
+{
+    type Item = Result<S::Record, PspReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.poisoned {
@@ -791,29 +864,28 @@ impl<R: Read + Seek> Iterator for RecordsIter<'_, R> {
         //      early if it's past the window.
         //   4. Decode the next block; loop back to step 1.
         loop {
-            if let Some(block) = &self.cur_block
-                && self.next_record_in_block < block.n_records
-            {
-                let record = match self.materialise_next_record() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.poisoned = true;
-                        return Some(Err(e));
+            if self.cur_block_loaded {
+                if let Some(res) = self.decoder.next_record() {
+                    let record = match res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.poisoned = true;
+                            return Some(Err(e));
+                        }
+                    };
+                    // Mi17: region clamp via RangeClamp methods, on the
+                    // schema-provided coordinate.
+                    let (chrom_id, pos) = S::record_coord(&record);
+                    if self.clamp.coord_past_window(chrom_id, pos) {
+                        return None;
                     }
-                };
-                // Mi17: region clamp via RangeClamp methods.
-                if self.clamp.record_past_window(&record) {
-                    return None;
+                    if self.clamp.coord_before_window(pos) {
+                        continue; // pre-window record, drop and ask for the next
+                    }
+                    return Some(Ok(record));
                 }
-                if self.clamp.record_before_window(&record) {
-                    continue; // pre-window record, drop and ask for the next
-                }
-                return Some(Ok(record));
-            }
-            // Current block exhausted (or never loaded). Drop its
-            // buffers, advance, and load the next.
-            if self.cur_block.is_some() {
-                self.cur_block = None;
+                // Current block exhausted. Advance and load the next.
+                self.cur_block_loaded = false;
                 self.cur_block_idx += 1;
             }
             // For region iteration, peek at the next block's

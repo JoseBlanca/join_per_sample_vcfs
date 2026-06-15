@@ -760,6 +760,7 @@ pub struct SnpKind;
 impl PspKind for SnpKind {
     type Record = PileupRecord;
     type Block = SnpBlock;
+    type Decoder = super::reader::SnpDecoder;
     const KIND: &'static str = "snp";
 
     fn columns() -> &'static [ColumnDef] {
@@ -772,6 +773,10 @@ impl PspKind for SnpKind {
         out: &mut Vec<u8>,
     ) -> Result<(), PspWriteError> {
         encode_snp_column_into(def, block, out)
+    }
+
+    fn record_coord(record: &PileupRecord) -> (u32, u32) {
+        (record.chrom_id, record.pos)
     }
 }
 

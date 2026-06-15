@@ -17,8 +17,11 @@
 //! closing over the hardcoded `V1_0_COLUMNS` + `PileupRecord`, so a
 //! second kind is "a table + a record mapping" (§10.4), not a rewrite.
 
+use std::io::Read;
+
 use super::ColumnDef;
-use super::errors::PspWriteError;
+use super::block::BlockHeader;
+use super::errors::{PspReadError, PspWriteError};
 
 /// One `.psp` kind (`snp` | `ssr`): the schema the generic container
 /// core needs beyond its block / index / header machinery.
@@ -29,13 +32,21 @@ use super::errors::PspWriteError;
 /// is already schema-agnostic), so the typed decode can stay thin and
 /// per-kind.
 pub trait PspKind {
-    /// The in-memory record this kind writes (`PileupRecord` for SNP;
-    /// the future `SsrLocusRecord` for SSR).
+    /// The in-memory record this kind writes and reads (`PileupRecord`
+    /// for SNP; the future `SsrLocusRecord` for SSR).
     type Record;
 
     /// The per-block accumulator that buffers this kind's records into
-    /// its column buffers.
+    /// its column buffers (the **write** side).
     type Block: BlockAccumulator<Record = Self::Record>;
+
+    /// The per-block decoder that turns decompressed columns back into
+    /// records (the **read** side — mirror of [`Self::Block`]). Left
+    /// **unbounded here** so the `pub` trait surface does not leak the
+    /// `pub(crate)` [`BlockDecoder`] (or the wire types in its
+    /// signatures); the bound is applied where the decoder is driven
+    /// (the reader's `RecordsIter`).
+    type Decoder;
 
     /// Header schema-family tag (architecture §10.3). Written into the
     /// TOML header and used to select the registry on read.
@@ -55,6 +66,12 @@ pub trait PspKind {
         block: &Self::Block,
         out: &mut Vec<u8>,
     ) -> Result<(), PspWriteError>;
+
+    /// The `(chrom_id, position)` of a record, used by the reader to
+    /// apply a region-query window. SNP returns the record's point
+    /// position; the interval generalisation (architecture §10.5, a
+    /// later step) widens the right edge to `record.end`.
+    fn record_coord(record: &Self::Record) -> (u32, u32);
 }
 
 /// The per-block accumulator a [`PspKind`] fills as records arrive: its
@@ -100,4 +117,45 @@ pub trait BlockAccumulator {
     /// Rough projection of the uncompressed byte total, for the
     /// size-driven auto-flush safety cap.
     fn projected_bytes(&self) -> usize;
+}
+
+/// The per-block **decoder** a kind drives on the read path — the
+/// mirror of [`BlockAccumulator`] (architecture §10.2). The generic
+/// reader (`RecordsIter`) owns the block framing and the shared
+/// decompression scratch; the decoder owns the schema-specific decode
+/// state (its decoded columns + any cross-block reuse buffers) and the
+/// per-block record cursor.
+///
+/// `pub(crate)` on purpose: it names internal wire types
+/// ([`BlockHeader`]) and the zstd context in its signatures, so it must
+/// not become part of the public API. [`PspKind::Decoder`] is therefore
+/// left unbounded in the `pub` trait, and the `Decoder: BlockDecoder`
+/// bound is applied only where the reader instantiates it.
+pub(crate) trait BlockDecoder {
+    /// The record this decoder materialises (matches
+    /// [`PspKind::Record`]).
+    type Record;
+
+    /// A fresh decoder with empty reuse buffers and no block loaded.
+    fn new_decoder() -> Self;
+
+    /// Decode one block's columns into the decoder, replacing any
+    /// previously-loaded block and resetting the record cursor. The
+    /// generic caller has already positioned `source` at the block
+    /// payload (just past its header) and supplies the shared
+    /// decompression scratch; `budget` bounds the decompressed size.
+    fn decode_block<R: Read>(
+        &mut self,
+        source: &mut R,
+        header: &BlockHeader,
+        budget: u64,
+        decompressor: &mut zstd::bulk::Decompressor<'static>,
+        compressed_scratch: &mut Vec<u8>,
+        decompressed_scratch: &mut Vec<u8>,
+    ) -> Result<(), PspReadError>;
+
+    /// Materialise the next record of the loaded block, advancing the
+    /// cursor. `None` once the block is exhausted (or before any block
+    /// is loaded). Mirrors the writer's `append` in reverse.
+    fn next_record(&mut self) -> Option<Result<Self::Record, PspReadError>>;
 }
