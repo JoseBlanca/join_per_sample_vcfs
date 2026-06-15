@@ -32,6 +32,7 @@ pub(crate) mod index;
 pub mod kind;
 pub mod reader;
 pub(crate) mod registry;
+pub mod registry_ssr;
 pub(crate) mod trailer;
 pub(crate) mod varint;
 pub mod writer;

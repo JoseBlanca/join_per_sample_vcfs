@@ -171,12 +171,18 @@ impl ElementType {
 /// single-source-of-truth cap is enforced symmetrically.
 pub const MAX_ALLELE_SEQ_LEN: u64 = 10_000;
 
-/// Exhaustive enumeration of every v1.0 column the registry knows
-/// about, by static identity. Used by the writer to dispatch
-/// per-column encoders without the compile-time hole a `match` on
-/// `u16` tag literals leaves (M4). Adding a v1.x column means
-/// adding a variant here, which forces every dispatch match to be
-/// updated as a compile error.
+/// Exhaustive enumeration of every v1.0 **SNP** column by static
+/// identity. The SNP writer/reader dispatch per-column codecs by
+/// matching on this (via [`ColumnKey::from_tag`]) without the
+/// compile-time hole a `match` on `u16` tag literals leaves (M4) —
+/// every dispatch `match Self` is exhaustive, so adding a variant
+/// forces an arm at each site.
+///
+/// This is **SNP-schema-private**: it lives here, not on the
+/// schema-agnostic [`ColumnDef`] (which carries only wire metadata, so
+/// it can host any kind's columns). The SSR schema has its own key enum
+/// (`registry_ssr::SsrColumnKey`); the container generic core never
+/// dispatches on either.
 ///
 /// **Not `#[non_exhaustive]` by design** — see the comment on
 /// [`Cardinality`].
@@ -194,6 +200,50 @@ pub enum ColumnKey {
     AlleleMapqSum,
     AlleleMapqSumSq,
     AlleleChainIds,
+}
+
+impl ColumnKey {
+    /// The v1.0 tag for this key. Exhaustive `match Self`, so adding a
+    /// variant forces an arm here — the single source of the key↔tag
+    /// pairing now that `ColumnDef` no longer carries the key.
+    pub const fn tag(self) -> u16 {
+        match self {
+            Self::DeltaPos => 0x01,
+            Self::NAlleles => 0x02,
+            Self::AlleleSeqLen => 0x03,
+            Self::AlleleSeq => 0x04,
+            Self::AlleleObsCount => 0x10,
+            Self::AlleleQSumLog => 0x11,
+            Self::AlleleFwdCount => 0x12,
+            Self::AllelePlacedLeftCount => 0x13,
+            Self::AllelePlacedStartCount => 0x14,
+            Self::AlleleMapqSum => 0x15,
+            Self::AlleleMapqSumSq => 0x16,
+            Self::AlleleChainIds => 0x22,
+        }
+    }
+
+    /// Map a column tag to its SNP dispatch key. `None` for a tag the
+    /// SNP schema does not define. Used by the writer/reader to recover
+    /// the dispatch key from a [`ColumnDef`] / manifest entry.
+    pub fn from_tag(tag: u16) -> Option<Self> {
+        [
+            Self::DeltaPos,
+            Self::NAlleles,
+            Self::AlleleSeqLen,
+            Self::AlleleSeq,
+            Self::AlleleObsCount,
+            Self::AlleleQSumLog,
+            Self::AlleleFwdCount,
+            Self::AllelePlacedLeftCount,
+            Self::AllelePlacedStartCount,
+            Self::AlleleMapqSum,
+            Self::AlleleMapqSumSq,
+            Self::AlleleChainIds,
+        ]
+        .into_iter()
+        .find(|k| k.tag() == tag)
+    }
 }
 
 /// Per-payload-shape data, pinning the valid combinations of
@@ -252,12 +302,6 @@ pub struct ColumnDef {
     /// same integer.
     pub tag: u16,
 
-    /// Static identity used for compile-time-exhaustive dispatch
-    /// (writer encoders, decoders) without going through the numeric
-    /// `tag`. Adding a registry entry forces every dispatch match to
-    /// be updated.
-    pub key: ColumnKey,
-
     /// Lowercase kebab-case identifier, e.g. `"allele-q-sum-log"`.
     /// Stable across versions.
     pub name: &'static str,
@@ -311,7 +355,6 @@ impl ColumnDef {
 pub const V1_0_COLUMNS: &[ColumnDef] = &[
     ColumnDef {
         tag: 0x01,
-        key: ColumnKey::DeltaPos,
         name: "delta-pos",
         cardinality: Cardinality::PerRecord,
         payload: ColumnPayload::Scalar {
@@ -325,7 +368,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x02,
-        key: ColumnKey::NAlleles,
         name: "n-alleles",
         cardinality: Cardinality::PerRecord,
         payload: ColumnPayload::Scalar {
@@ -338,7 +380,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x03,
-        key: ColumnKey::AlleleSeqLen,
         name: "allele-seq-len",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -351,7 +392,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x04,
-        key: ColumnKey::AlleleSeq,
         name: "allele-seq",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Bytes {
@@ -364,7 +404,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x10,
-        key: ColumnKey::AlleleObsCount,
         name: "allele-obs-count",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -376,7 +415,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x11,
-        key: ColumnKey::AlleleQSumLog,
         name: "allele-q-sum-log",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -390,7 +428,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x12,
-        key: ColumnKey::AlleleFwdCount,
         name: "allele-fwd-count",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -403,7 +440,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x13,
-        key: ColumnKey::AllelePlacedLeftCount,
         name: "allele-placed-left-count",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -416,7 +452,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x14,
-        key: ColumnKey::AllelePlacedStartCount,
         name: "allele-placed-start-count",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -429,7 +464,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x15,
-        key: ColumnKey::AlleleMapqSum,
         name: "allele-mapq-sum",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -444,7 +478,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x16,
-        key: ColumnKey::AlleleMapqSumSq,
         name: "allele-mapq-sum-sq",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::Scalar {
@@ -459,7 +492,6 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
     },
     ColumnDef {
         tag: 0x22,
-        key: ColumnKey::AlleleChainIds,
         name: "allele-chain-ids",
         cardinality: Cardinality::PerAllele,
         payload: ColumnPayload::List {
@@ -487,16 +519,19 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
 pub const SNP_KIND: &str = "snp";
 
 /// Comma-separated list of every `kind` this reader recognises — for
-/// the `UnknownKind` diagnostic. Grows as schemas land (`"snp, ssr"`).
-pub const KNOWN_KINDS: &str = "snp";
+/// the `UnknownKind` diagnostic.
+pub const KNOWN_KINDS: &str = "snp, ssr";
 
 /// Select the column registry for a header `kind` tag (architecture
 /// §10.3). `None` for an unrecognised kind — the reader then refuses
 /// with [`PspReadError::UnknownKind`](super::errors::PspReadError::UnknownKind).
 pub fn columns_for_kind(kind: &str) -> Option<&'static [ColumnDef]> {
-    match kind {
-        SNP_KIND => Some(V1_0_COLUMNS),
-        _ => None,
+    if kind == SNP_KIND {
+        Some(V1_0_COLUMNS)
+    } else if kind == super::registry_ssr::SSR_KIND {
+        Some(super::registry_ssr::SSR_COLUMNS)
+    } else {
+        None
     }
 }
 
@@ -679,18 +714,21 @@ mod tests {
         assert_eq!(seq.length_column(), Some("allele-seq-len"));
     }
 
-    /// (M4.) `ColumnKey` is exhaustive over every registry entry.
-    /// Adding a `ColumnDef` row without giving it a `key` is a
-    /// compile error; reusing an existing key for a new row would
-    /// fail this uniqueness test.
+    /// (M4.) Every `V1_0_COLUMNS` tag maps to a distinct `ColumnKey`
+    /// via [`ColumnKey::from_tag`], and the key→tag pairing round-trips.
+    /// `ColumnKey::tag` is an exhaustive `match Self`, so a new variant
+    /// forces a pairing; this test fails if `from_tag`'s variant list or
+    /// `V1_0_COLUMNS` drifts out of sync with it.
     #[test]
     fn column_keys_are_unique_and_cover_v1_0() {
         let mut seen = std::collections::HashSet::new();
         for c in V1_0_COLUMNS {
+            let key = ColumnKey::from_tag(c.tag)
+                .unwrap_or_else(|| panic!("V1_0 column {} (tag {:#x}) has no key", c.name, c.tag));
+            assert_eq!(key.tag(), c.tag, "{}: from_tag/tag round-trip", c.name);
             assert!(
-                seen.insert(c.key),
-                "duplicate ColumnKey {:?} in V1_0_COLUMNS",
-                c.key
+                seen.insert(key),
+                "duplicate ColumnKey {key:?} in V1_0_COLUMNS"
             );
         }
         assert_eq!(seen.len(), V1_0_COLUMNS.len());

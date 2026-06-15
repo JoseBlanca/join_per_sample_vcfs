@@ -87,10 +87,24 @@ Skills and agents are instructed to leave it untouched.
 >   already interval-shaped (no writer/index change), so the produced `.psp` is
 >   **byte-identical to step 2**. 1136 lib tests + region-clamp e2e green; report
 >   [3](ia/reports/implementations/psp_container_generalization_step3_2026-06-15.md).
->   Next: step 4 `registry_ssr`+`SsrLocusRecord` (+`SsrBlock`/`SsrDecoder`/
->   `SsrKind`; where `record_interval` returns a real locus interval and
->   `last_pos` becomes `max(record.end)`) → 5 round-trip test.
->   Off-ladder + measured fast path deferred.
+>   **Steps 4+5 landed — the §10 container refactor is COMPLETE.** New
+>   [src/psp/registry_ssr.rs](src/psp/registry_ssr.rs): the second `PspKind`
+>   (`ssr`) — `SSR_COLUMNS` + `SsrColumnKey` + chrom_id-keyed `SsrLocusRecord` +
+>   `SsrKind`/`SsrBlock`/`SsrDecoder`. The all-CSR profiles map onto the SNP
+>   2-level shape (locus=record, spanning-profile=entry, `n-spanning` groups;
+>   `amb-lengths` u16 + `amb-logliks` f32 parallel per-profile CSR). Two SNP
+>   leaks fixed to host a 2nd schema, both verified **SNP-byte-identical**:
+>   `ColumnDef.key` removed (schema-agnostic; each schema dispatches via its own
+>   `from_tag`), and the `n_total_alleles >= n_records` block-header invariant
+>   relaxed (SSR loci can have 0 spanning profiles). Writer gained a generic
+>   `open` + `new_ssr*` + `write_locus`; reader gained `records_of::<S>()`.
+>   Round-trip test writes a multi-block `.ssr.psp` and reads it back equal.
+>   1138 lib tests + e2e green; report
+>   [4+5](ia/reports/implementations/psp_container_generalization_step4_2026-06-15.md).
+>   Container done; remaining SSR Stage-1 work (fetch_reads I/O driver, the
+>   driver that emits `SsrLocusRecord`s + adapts to the container's chrom_id
+>   form, the `ssr-pileup` CLI) is separate. Off-ladder + measured fast path
+>   deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review
 >   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):

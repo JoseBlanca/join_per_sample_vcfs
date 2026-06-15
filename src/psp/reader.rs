@@ -350,6 +350,19 @@ impl<R: Read + Seek> PspReader<R> {
         RecordsIter::new(self, RangeClamp::None)
     }
 
+    /// Sequential iterator typed to a given schema `S` (architecture
+    /// §10). [`records`](Self::records) is the `S = SnpKind` case; SSR
+    /// callers (and tests) use `records_of::<SsrKind>()`. The caller is
+    /// responsible for matching `S` to the file's `kind` — read it from
+    /// [`header().kind`](ParsedHeader::kind) if unsure.
+    #[allow(private_bounds)]
+    pub fn records_of<S: PspKind>(&mut self) -> RecordsIter<'_, R, S>
+    where
+        S::Decoder: BlockDecoder<Record = S::Record>,
+    {
+        RecordsIter::new(self, RangeClamp::None)
+    }
+
     /// Iterator over records inside `[start, end]` (inclusive
     /// both ends) on `chrom_id`.
     ///
@@ -1537,7 +1550,7 @@ fn decode_one_column<R: Read>(
 
     // Spec check #7 case 2 for `allele-seq`: predict against the
     // sum of `allele-seq-len` already decoded in this block.
-    if def.key == ColumnKey::AlleleSeq
+    if ColumnKey::from_tag(def.tag) == Some(ColumnKey::AlleleSeq)
         && let Some(lens) = allele_seq_len
     {
         let expected: u64 = lens.iter().sum();
@@ -1575,9 +1588,15 @@ fn decode_one_column<R: Read>(
         });
     }
 
+    // `ColumnDef` is schema-agnostic (no `key`); recover the SNP
+    // dispatch key from the tag. Always `Some` — `def` came from
+    // `lookup_by_tag` over `V1_0_COLUMNS`.
+    let key =
+        ColumnKey::from_tag(def.tag).expect("decode_one_column resolved a non-SNP column tag");
+
     // Per-column decode, exhaustive on `ColumnKey` so a registry
     // addition forces a new arm here as a compile error.
-    let decoded = match def.key {
+    let decoded = match key {
         ColumnKey::DeltaPos => {
             DecodedColumn::DeltaPos(decode_varint_column(bytes, n_records, column_name)?)
         }
@@ -1676,7 +1695,55 @@ fn decode_one_column<R: Read>(
 /// `source` at the column payload (manifest order).
 // Wired into the two-phase block decode in the next step; exercised now by
 // `two_phase_inflate_matches_eager_decode`.
-fn read_compressed_blob<R: Read>(
+/// Shared low-level read + inflate for one column: budget-check the
+/// compressed length, read it into `compressed_scratch`, and zstd-inflate
+/// into `decompressed_scratch` (whose contents are the column's
+/// uncompressed bytes on return). Used by per-schema block decoders
+/// (`SnpDecoder` decodes inline; `SsrDecoder` calls this) so the
+/// decompression machinery is shared while the per-column decode stays
+/// per-schema (architecture §10.2). `column_name` is for error context.
+pub(crate) fn read_and_inflate_column<R: Read>(
+    source: &mut R,
+    entry: &ColumnManifestEntry,
+    remaining_budget: u64,
+    column_name: &str,
+    decompressor: &mut zstd::bulk::Decompressor<'static>,
+    compressed_scratch: &mut Vec<u8>,
+    decompressed_scratch: &mut Vec<u8>,
+) -> Result<(), PspReadError> {
+    if entry.compressed_len as u64 > remaining_budget {
+        return Err(PspReadError::ColumnTruncated {
+            column: column_name.to_string(),
+            decoded: 0,
+            expected: entry.compressed_len as usize,
+        });
+    }
+    compressed_scratch.clear();
+    compressed_scratch.resize(entry.compressed_len as usize, 0);
+    source
+        .read_exact(compressed_scratch.as_mut_slice())
+        .map_err(io_err("block column payload"))?;
+    zstd_decompress_into(
+        decompressor,
+        compressed_scratch,
+        entry.uncompressed_len as usize,
+        decompressed_scratch,
+    )
+    .map_err(|source| PspReadError::Zstd {
+        context: format!("column {column_name:?}"),
+        source,
+    })?;
+    if decompressed_scratch.len() as u64 != entry.uncompressed_len as u64 {
+        return Err(PspReadError::UncompressedLenMismatch {
+            column: column_name.to_string(),
+            got: decompressed_scratch.len() as u64,
+            expected: entry.uncompressed_len as u64,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn read_compressed_blob<R: Read>(
     source: &mut R,
     entry: &ColumnManifestEntry,
     remaining_budget: u64,

@@ -35,6 +35,7 @@ use super::kind::{BlockAccumulator, PspKind};
 use super::registry::{
     ColumnDef, ColumnKey, ColumnPayload, ElementType, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS,
 };
+use super::registry_ssr::{SsrBlock, SsrKind, SsrLocusRecord};
 use super::trailer::{Trailer, encode_trailer};
 use crate::pileup_record::{ChainId, PileupRecord};
 
@@ -339,32 +340,12 @@ impl<W: Write> PspWriter<W, SnpKind> {
     /// is clamped to 1 (every record its own window — degenerate, but
     /// never panics).
     pub fn new_with_block_layout(
-        mut sink: W,
+        sink: W,
         header: WriterHeader,
         target_block_bytes: usize,
         block_window_bp: u32,
     ) -> Result<Self, PspWriteError> {
-        let header_bytes = build_header_bytes_for(&header, SnpKind::KIND, SnpKind::columns())?;
-        sink.write_all(&header_bytes)
-            .map_err(|e| PspWriteError::Io {
-                context: "file header",
-                block_index: None,
-                column_tag: None,
-                source: e,
-            })?;
-        let sink_offset = header_bytes.len() as u64;
-        let scratch = WriterScratch::new(SnpKind::columns().len())?;
-        Ok(Self {
-            sink,
-            header,
-            sink_offset,
-            index_entries: Vec::new(),
-            block: None,
-            ingest: IngestState::new(),
-            scratch,
-            target_block_bytes,
-            block_window_bp: block_window_bp.max(1),
-        })
+        Self::open(sink, header, target_block_bytes, block_window_bp)
     }
 
     /// Append one record. Returns the number of bytes pushed to the
@@ -532,7 +513,147 @@ impl<W: Write> PspWriter<W, SnpKind> {
     }
 }
 
+impl<W: Write> PspWriter<W, SsrKind> {
+    /// Open an `.ssr.psp` writer with the default block layout. Mirror
+    /// of [`PspWriter::<W, SnpKind>::new`].
+    pub fn new_ssr(sink: W, header: WriterHeader) -> Result<Self, PspWriteError> {
+        Self::open(sink, header, TARGET_BLOCK_BYTES, DEFAULT_BLOCK_WINDOW_BP)
+    }
+
+    /// Open an `.ssr.psp` writer with explicit block layout (window grid
+    /// + safety-cap bytes). Mirror of the SNP `new_with_block_layout`.
+    pub fn new_ssr_with_block_layout(
+        sink: W,
+        header: WriterHeader,
+        target_block_bytes: usize,
+        block_window_bp: u32,
+    ) -> Result<Self, PspWriteError> {
+        Self::open(sink, header, target_block_bytes, block_window_bp)
+    }
+
+    /// Append one locus record. Blocks are cut on the same genomic-window
+    /// grid as the SNP path, keyed on the locus `start`; the block index
+    /// `last_pos` tracks the block's max `end` (interval semantics,
+    /// §10.5). Returns bytes pushed by any auto-flush this call triggered.
+    pub fn write_locus(&mut self, record: &SsrLocusRecord) -> Result<u64, PspWriteError> {
+        let record_index = self.ingest.records_seen;
+        self.ingest.records_seen += 1;
+        self.validate_locus(record_index, record)?;
+
+        let pre_flush_bytes = self.sink_offset;
+        let w = self.block_window_bp;
+        let should_flush = match &self.block {
+            None => false,
+            Some(b) => {
+                b.chrom_id() != record.chrom_id
+                    || (record.start / w) != (b.first_pos() / w)
+                    || b.projected_bytes() >= self.target_block_bytes
+            }
+        };
+        if should_flush {
+            self.flush_block()?;
+        }
+        let flushed_bytes = self.sink_offset - pre_flush_bytes;
+
+        if self.block.is_none() {
+            self.block = Some(SsrBlock::new_block(record.chrom_id, record.start));
+        }
+        self.block
+            .as_mut()
+            .expect("block open by construction")
+            .append(record);
+        self.ingest.last_locus = Some((record.chrom_id, record.start));
+        Ok(flushed_bytes)
+    }
+
+    fn validate_locus(
+        &self,
+        record_index: u64,
+        record: &SsrLocusRecord,
+    ) -> Result<(), PspWriteError> {
+        let n_chroms = self.header.chromosomes.len();
+        if record.chrom_id as usize >= n_chroms {
+            return Err(PspWriteError::UnknownChromId {
+                record_index,
+                chrom_id: record.chrom_id,
+                n_chroms: n_chroms as u32,
+            });
+        }
+        let chrom = &self.header.chromosomes[record.chrom_id as usize];
+
+        // start in [1, length]; end in (start, length + 1] (the interval
+        // [start, end) is half-open, so `end` may sit one past the last
+        // 1-based position). `end <= start` would also underflow the
+        // `span = end - start` encode, so it must be rejected here.
+        if record.start == 0 || record.start > chrom.length {
+            return Err(PspWriteError::PosOutOfRange {
+                record_index,
+                chrom_id: record.chrom_id,
+                pos: record.start,
+                chrom_length: chrom.length,
+            });
+        }
+        if record.end <= record.start || record.end > chrom.length + 1 {
+            return Err(PspWriteError::PosOutOfRange {
+                record_index,
+                chrom_id: record.chrom_id,
+                pos: record.end,
+                chrom_length: chrom.length,
+            });
+        }
+
+        if let Some((prev_chrom, prev_start)) = self.ingest.last_locus {
+            let regression = record.chrom_id < prev_chrom
+                || (record.chrom_id == prev_chrom && record.start <= prev_start);
+            if regression {
+                return Err(PspWriteError::OutOfOrderRecord {
+                    record_index,
+                    prev_chrom,
+                    prev_pos: prev_start,
+                    this_chrom: record.chrom_id,
+                    this_pos: record.start,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<W: Write, S: PspKind> PspWriter<W, S> {
+    /// Schema-generic construction: frame the `S`-kind header (its
+    /// `kind` tag + column table), write it, and prepare empty state.
+    /// The per-kind public constructors (SNP `new`/`new_with_block_*`,
+    /// SSR `new_ssr*`) delegate here so the header/scratch wiring lives
+    /// in one place. `block_window_bp` of 0 is clamped to 1.
+    fn open(
+        mut sink: W,
+        header: WriterHeader,
+        target_block_bytes: usize,
+        block_window_bp: u32,
+    ) -> Result<Self, PspWriteError> {
+        let header_bytes = build_header_bytes_for(&header, S::KIND, S::columns())?;
+        sink.write_all(&header_bytes)
+            .map_err(|e| PspWriteError::Io {
+                context: "file header",
+                block_index: None,
+                column_tag: None,
+                source: e,
+            })?;
+        let sink_offset = header_bytes.len() as u64;
+        let scratch = WriterScratch::new(S::columns().len())?;
+        Ok(Self {
+            sink,
+            header,
+            sink_offset,
+            index_entries: Vec::new(),
+            block: None,
+            ingest: IngestState::new(),
+            scratch,
+            target_block_bytes,
+            block_window_bp: block_window_bp.max(1),
+        })
+    }
+
     /// Flush any open block, write the block index, and write the
     /// trailer. Consumes the writer; the returned sink is positioned
     /// at the end of a complete `.psp` file.
@@ -953,7 +1074,12 @@ fn encode_snp_column_into(
     block: &SnpBlock,
     out: &mut Vec<u8>,
 ) -> Result<(), PspWriteError> {
-    match def.key {
+    // `ColumnDef` is schema-agnostic (no `key`); recover the SNP
+    // dispatch key from the tag. Always `Some` here — `def` comes from
+    // `V1_0_COLUMNS`. The `match` stays exhaustive over `ColumnKey`.
+    let key = ColumnKey::from_tag(def.tag)
+        .expect("encode_snp_column_into called with a non-SNP column tag");
+    match key {
         ColumnKey::DeltaPos => encode_varint_column(&block.delta_pos, out),
         ColumnKey::NAlleles => encode_varint_column(&block.n_alleles, out),
         ColumnKey::AlleleSeqLen => encode_varint_column(&block.allele_seq_len, out),
