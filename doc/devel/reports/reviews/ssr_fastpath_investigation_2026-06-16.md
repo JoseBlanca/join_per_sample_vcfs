@@ -84,17 +84,34 @@ window=4  (9 rungs):   86.0 s   output 1,569,503 B   (−12% wall, output −0.0
    reads over-weights empty-locus fetch, but it directly corroborates the review's
    open **L5/L7** findings: the fetch path is where the end-to-end time goes.)
 
+## Window concordance — measured, and the default lowered 10 → 6 (APPLIED)
+
+Record-level diff of the `.ssr.psp` at each window vs window=10 (10425 loci,
+1243 spanning reads; `ssr_psp_concordance` ignored test):
+
+```
+window  loci w/ any read diff   reads: profile differs   ARGMAX (called length) differs
+  8      4 (0.04%)               10 (0.80%)               3 (0.24%)
+  6      6 (0.06%)               16 (1.29%)               6 (0.48%)
+  4      12 (0.12%)              55 (4.42%)               33 (2.66%)   <- elbow: don't go here
+```
+
+Realignment-only cost scales ~linearly in rung count even post-P1
+(`ssr_realign/window`: 7 rungs 38 ms, 21 rungs 125 ms, 31 rungs 207 ms), so
+`window=6` (13 rungs) is **~40% cheaper realignment** than `window=10` (21 rungs).
+The elbow is below 6 (4→2.66% argmax change); 6 keeps 99.5% of read calls and
+99.94% of loci identical, and ±6 brackets far more stutter than the ±1–2 units
+real STRs show.
+
+**Applied:** `DEFAULT_WINDOW` 10 → 6 ([driver.rs](../../../../src/ssr/pileup/driver.rs)).
+
 ## Recommendation
 
-- **Don't wire a standalone fast path.** Safe ⇒ low recall + byte-identity break
-  for a small post-P1 gain; high-recall ⇒ reintroduces the ~11% mis-count
-  realign-everything prevents.
-- **Do consider tightening the default window** (10 → ~6) as a calibration
-  change: validate the 1.3% large-correction tail against genotype concordance on
-  this fixture, then lower it. Mechanism-preserving, near output-identical here.
+- **Don't wire a standalone fast path** (above).
+- **Default window lowered 10 → 6** — done, validated on real data.
 - **Prioritize the fetch path (L7) for end-to-end wins** — on real data it, not
-  the realignment, is the wall. The realignment wins (H1/H2/P1) pay most on
-  high-coverage data where every locus has reads.
+  the realignment, is the wall. The realignment wins (H1/H2/P1 + the window
+  tightening) pay most on high-coverage data where every locus has reads.
 
 ## Reproducing the fixture
 

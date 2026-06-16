@@ -54,10 +54,19 @@ const LOCUS_BATCH: usize = 8192;
 
 /// Default `analyze_read` candidate half-width (rungs): the pair-HMM scores
 /// `observed_count ± DEFAULT_WINDOW` on-ladder lengths per spanning read. A
-/// **calibration** placeholder (arch §14), like `MAX_READS_PER_LOCUS` /
+/// **calibration** parameter (arch §14), like `MAX_READS_PER_LOCUS` /
 /// `MIN_FLANK_BP` — wide enough to bracket genuine stutter/length variation
 /// around the content pre-probe's estimate without inflating per-read work.
-pub(crate) const DEFAULT_WINDOW: u16 = 10;
+///
+/// Lowered 10 → 6 after measuring on a real tomato catalog + CRAM
+/// (`ssr_fastpath_investigation_2026-06-16.md`): at the old width of 10, 98.7%
+/// of real spanning reads kept every surviving length within ±6 of the
+/// pre-probe estimate, so the extra rungs scored only pruned-away tails. The
+/// 10→6 diff changes the called length on 0.48% of reads (0.06% of loci) — the
+/// large-correction tail — while cutting the per-read rung count 21→13
+/// (~40% of the realignment DP). ±6 still brackets far more stutter than the
+/// ±1–2 units real STRs show.
+pub(crate) const DEFAULT_WINDOW: u16 = 6;
 
 /// Errors from the Stage-1 driver.
 #[derive(Debug, thiserror::Error)]
@@ -765,6 +774,65 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .unwrap();
         assert_eq!(best.0, 3);
+    }
+
+    /// Manual concordance diff between two `.ssr.psp` files (e.g. window=10 vs
+    /// window=6), for the fast-path / window investigation. Paths come from
+    /// `PVC_PSP_A` / `PVC_PSP_B`. Run:
+    /// `PVC_PSP_A=a.ssr.psp PVC_PSP_B=b.ssr.psp cargo test --release \
+    ///   ssr_psp_concordance -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: diffs two real .ssr.psp files named by env vars"]
+    fn ssr_psp_concordance() {
+        let pa = std::env::var("PVC_PSP_A").expect("PVC_PSP_A");
+        let pb = std::env::var("PVC_PSP_B").expect("PVC_PSP_B");
+        let a = read_records(std::path::Path::new(&pa));
+        let b = read_records(std::path::Path::new(&pb));
+        assert_eq!(a.len(), b.len(), "locus count differs");
+
+        let argmax = |p: &[(u16, f32)]| -> Option<u16> {
+            p.iter()
+                .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap())
+                .map(|(u, _)| *u)
+        };
+
+        let (mut loci_diff, mut reads, mut reads_profile_diff, mut reads_argmax_diff) =
+            (0u64, 0u64, 0u64, 0u64);
+        for (ra, rb) in a.iter().zip(&b) {
+            assert_eq!((ra.chrom_id, ra.start), (rb.chrom_id, rb.start));
+            assert_eq!(ra.spanning.len(), rb.spanning.len(), "read count differs");
+            let mut this_locus_diff = false;
+            for (pa, pb) in ra.spanning.iter().zip(&rb.spanning) {
+                reads += 1;
+                if pa != pb {
+                    reads_profile_diff += 1;
+                    this_locus_diff = true;
+                }
+                if argmax(pa) != argmax(pb) {
+                    reads_argmax_diff += 1;
+                }
+            }
+            if this_locus_diff {
+                loci_diff += 1;
+            }
+        }
+        let pct = |n: u64, d: u64| 100.0 * n as f64 / d.max(1) as f64;
+        eprintln!("== .ssr.psp concordance ({pa} vs {pb}) ==");
+        eprintln!(
+            "loci: {} | loci with any read diff: {} ({:.2}%)",
+            a.len(),
+            loci_diff,
+            pct(loci_diff, a.len() as u64)
+        );
+        eprintln!("spanning reads: {reads}");
+        eprintln!(
+            "  profile differs: {reads_profile_diff} ({:.2}%)",
+            pct(reads_profile_diff, reads)
+        );
+        eprintln!(
+            "  ARGMAX (called length) differs: {reads_argmax_diff} ({:.3}%)",
+            pct(reads_argmax_diff, reads)
+        );
     }
 
     #[test]
