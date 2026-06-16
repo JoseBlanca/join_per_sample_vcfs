@@ -29,11 +29,13 @@ use super::block::{
     zstd_compress_into,
 };
 use super::errors::{InvalidRecordKind, PspWriteError};
-use super::header::{WriterHeader, build_header_bytes};
+use super::header::{WriterHeader, build_header_bytes_for};
 use super::index::{BlockIndexEntry, checksum_index, encode_index};
+use super::kind::{BlockAccumulator, PspKind};
 use super::registry::{
     ColumnDef, ColumnKey, ColumnPayload, ElementType, MAX_ALLELE_SEQ_LEN, V1_0_COLUMNS,
 };
+use super::registry_ssr::{SsrBlock, SsrKind, SsrLocusRecord};
 use super::trailer::{Trailer, encode_trailer};
 use crate::pileup_record::{ChainId, PileupRecord};
 
@@ -228,18 +230,21 @@ struct WriterScratch {
     compressor: zstd::bulk::Compressor<'static>,
     /// Reused per-column uncompressed-payload scratch.
     uncompressed: Vec<u8>,
-    /// Reused per-column compressed-frame buffers, indexed by
-    /// `V1_0_COLUMNS` position. Each flush `clear()`s the inner
+    /// Reused per-column compressed-frame buffers, indexed by the
+    /// schema's column-table position. Each flush `clear()`s the inner
     /// Vecs (preserving their capacity) before refilling.
     compressed: Vec<Vec<u8>>,
-    /// Reused per-flush manifest buffer (12 entries).
+    /// Reused per-flush manifest buffer (one entry per column).
     manifest: Vec<ColumnManifestEntry>,
     /// Reused block-header serialisation buffer.
     header_bytes: Vec<u8>,
 }
 
 impl WriterScratch {
-    fn new() -> Result<Self, PspWriteError> {
+    /// `n_columns` sizes the per-column compressed-frame buffers and
+    /// the manifest scratch to the schema's column count
+    /// (`S::columns().len()`).
+    fn new(n_columns: usize) -> Result<Self, PspWriteError> {
         let compressor = new_column_compressor().map_err(|e| PspWriteError::Io {
             context: "zstd compressor init",
             block_index: None,
@@ -249,17 +254,25 @@ impl WriterScratch {
         Ok(Self {
             compressor,
             uncompressed: Vec::new(),
-            compressed: (0..V1_0_COLUMNS.len()).map(|_| Vec::new()).collect(),
-            manifest: Vec::with_capacity(V1_0_COLUMNS.len()),
+            compressed: (0..n_columns).map(|_| Vec::new()).collect(),
+            manifest: Vec::with_capacity(n_columns),
             header_bytes: Vec::new(),
         })
     }
 }
 
-/// Streaming `.psp` writer over any `Write` sink. M15: down from
-/// 14 fields to 7 by extracting [`IngestState`] and
+/// Streaming `.psp` writer over any `Write` sink, generic over the
+/// container schema `S` (architecture §10). `S` defaults to
+/// [`SnpKind`], so the existing `PspWriter<W>` call sites and their
+/// `PspWriter::new(...)` constructors are unchanged. The schema supplies
+/// the column table ([`PspKind::columns`]), the per-block accumulator
+/// ([`PspKind::Block`]), and the record→column encode
+/// ([`PspKind::encode_column`]); the flush/index/header machinery here
+/// is schema-agnostic.
+///
+/// M15: down from 14 fields to 7 by extracting [`IngestState`] and
 /// [`WriterScratch`].
-pub struct PspWriter<W: Write> {
+pub struct PspWriter<W: Write, S: PspKind = SnpKind> {
     sink: W,
     header: WriterHeader,
     /// Bytes written to `sink` so far. Updated after every flush so
@@ -269,7 +282,7 @@ pub struct PspWriter<W: Write> {
     index_entries: Vec<BlockIndexEntry>,
     /// Open block — `None` when the writer is between blocks (just
     /// after `new` or just after a flush).
-    block: Option<BlockAccumulator>,
+    block: Option<S::Block>,
     /// Running per-record ingest state.
     ingest: IngestState,
     /// Reused per-flush scratch buffers + zstd compressor.
@@ -288,7 +301,7 @@ pub struct PspWriter<W: Write> {
     block_window_bp: u32,
 }
 
-impl<W: Write> PspWriter<W> {
+impl<W: Write> PspWriter<W, SnpKind> {
     /// Validate the header, frame it (magic + length prefix + TOML +
     /// sentinel), and write it to `sink`. After this returns, the
     /// writer is ready to accept records.
@@ -327,32 +340,12 @@ impl<W: Write> PspWriter<W> {
     /// is clamped to 1 (every record its own window — degenerate, but
     /// never panics).
     pub fn new_with_block_layout(
-        mut sink: W,
+        sink: W,
         header: WriterHeader,
         target_block_bytes: usize,
         block_window_bp: u32,
     ) -> Result<Self, PspWriteError> {
-        let header_bytes = build_header_bytes(&header)?;
-        sink.write_all(&header_bytes)
-            .map_err(|e| PspWriteError::Io {
-                context: "file header",
-                block_index: None,
-                column_tag: None,
-                source: e,
-            })?;
-        let sink_offset = header_bytes.len() as u64;
-        let scratch = WriterScratch::new()?;
-        Ok(Self {
-            sink,
-            header,
-            sink_offset,
-            index_entries: Vec::new(),
-            block: None,
-            ingest: IngestState::new(),
-            scratch,
-            target_block_bytes,
-            block_window_bp: block_window_bp.max(1),
-        })
+        Self::open(sink, header, target_block_bytes, block_window_bp)
     }
 
     /// Append one record. Returns the number of bytes pushed to the
@@ -392,83 +385,13 @@ impl<W: Write> PspWriter<W> {
         // block header only carries structural metadata
         // (chrom_id, first_pos, n_records, n_total_alleles, manifest).
         if self.block.is_none() {
-            self.block = Some(BlockAccumulator::new(record.chrom_id, record.pos));
+            self.block = Some(SnpBlock::new_block(record.chrom_id, record.pos));
         }
 
         self.apply_record_to_block(record_index, record)?;
         self.ingest.last_locus = Some((record.chrom_id, record.pos));
 
         Ok(flushed_bytes)
-    }
-
-    /// Flush any open block, write the block index, and write the
-    /// trailer. Consumes the writer; the returned sink is positioned
-    /// at the end of a complete `.psp` file.
-    ///
-    /// **End-of-stage discipline for `BufWriter`-wrapped file sinks.**
-    /// `BufWriter::drop` may swallow flush errors, which for a
-    /// billions-of-records file can silently truncate the trailer.
-    /// The production caller should do, in order:
-    /// ```ignore
-    /// let buf = writer.finish()?;       // PSP-level flush
-    /// let file = buf.into_inner()?;     // surface BufWriter errors
-    /// file.sync_all()?;                 // durability for downstream stages
-    /// ```
-    /// `sync_all` is end-of-stage only — never per-block.
-    pub fn finish(mut self) -> Result<W, PspWriteError> {
-        if self.block.is_some() {
-            self.flush_block()?;
-        }
-        let index_offset = self.sink_offset;
-        let index_bytes = encode_index(&self.index_entries);
-        let index_byte_length = index_bytes.len() as u64;
-        let index_checksum = checksum_index(&index_bytes);
-        self.sink
-            .write_all(&index_bytes)
-            .map_err(|e| PspWriteError::Io {
-                context: "block index",
-                block_index: None,
-                column_tag: None,
-                source: e,
-            })?;
-        self.sink_offset += index_byte_length;
-
-        let trailer = Trailer {
-            index_offset,
-            index_byte_length,
-            n_blocks: self.index_entries.len() as u64,
-            index_checksum,
-        };
-        let trailer_bytes = encode_trailer(&trailer);
-        self.sink
-            .write_all(&trailer_bytes)
-            .map_err(|e| PspWriteError::Io {
-                context: "file trailer",
-                block_index: None,
-                column_tag: None,
-                source: e,
-            })?;
-        self.sink_offset += trailer_bytes.len() as u64;
-        self.sink.flush().map_err(|e| PspWriteError::Io {
-            context: "final flush",
-            block_index: None,
-            column_tag: None,
-            source: e,
-        })?;
-        Ok(self.sink)
-    }
-
-    /// Projected uncompressed bytes the currently-open block has
-    /// accumulated. `None` when no block is open (just after `new` or
-    /// just after a flush).
-    ///
-    /// Hidden from rustdoc — this peek into writer state exists only
-    /// to let benches align iteration boundaries with the writer's
-    /// auto-flush boundary (see L10 in
-    /// `ia/reviews/perf_psp_writer_2026-05-13.md`).
-    #[doc(hidden)]
-    pub fn current_block_projected_bytes(&self) -> Option<usize> {
-        self.block.as_ref().map(|b| b.projected_bytes)
     }
 
     fn validate_record(
@@ -584,9 +507,236 @@ impl<W: Write> PspWriter<W> {
         // condition here.
         let _ = record_index;
         let block = self.block.as_mut().expect("block open by construction");
-        block.append_record(record);
+        block.append(record);
 
         Ok(())
+    }
+}
+
+impl<W: Write> PspWriter<W, SsrKind> {
+    /// Open an `.ssr.psp` writer with the default block layout. Mirror
+    /// of [`PspWriter::<W, SnpKind>::new`].
+    pub fn new_ssr(sink: W, header: WriterHeader) -> Result<Self, PspWriteError> {
+        Self::open(sink, header, TARGET_BLOCK_BYTES, DEFAULT_BLOCK_WINDOW_BP)
+    }
+
+    /// Open an `.ssr.psp` writer with explicit block layout (window grid
+    /// + safety-cap bytes). Mirror of the SNP `new_with_block_layout`.
+    pub fn new_ssr_with_block_layout(
+        sink: W,
+        header: WriterHeader,
+        target_block_bytes: usize,
+        block_window_bp: u32,
+    ) -> Result<Self, PspWriteError> {
+        Self::open(sink, header, target_block_bytes, block_window_bp)
+    }
+
+    /// Append one locus record. Blocks are cut on the same genomic-window
+    /// grid as the SNP path, keyed on the locus `start`; the block index
+    /// `last_pos` tracks the block's max `end` (interval semantics,
+    /// §10.5). Returns bytes pushed by any auto-flush this call triggered.
+    pub fn write_locus(&mut self, record: &SsrLocusRecord) -> Result<u64, PspWriteError> {
+        let record_index = self.ingest.records_seen;
+        self.ingest.records_seen += 1;
+        self.validate_locus(record_index, record)?;
+
+        let pre_flush_bytes = self.sink_offset;
+        let w = self.block_window_bp;
+        let should_flush = match &self.block {
+            None => false,
+            Some(b) => {
+                b.chrom_id() != record.chrom_id
+                    || (record.start / w) != (b.first_pos() / w)
+                    || b.projected_bytes() >= self.target_block_bytes
+            }
+        };
+        if should_flush {
+            self.flush_block()?;
+        }
+        let flushed_bytes = self.sink_offset - pre_flush_bytes;
+
+        if self.block.is_none() {
+            self.block = Some(SsrBlock::new_block(record.chrom_id, record.start));
+        }
+        self.block
+            .as_mut()
+            .expect("block open by construction")
+            .append(record);
+        self.ingest.last_locus = Some((record.chrom_id, record.start));
+        Ok(flushed_bytes)
+    }
+
+    fn validate_locus(
+        &self,
+        record_index: u64,
+        record: &SsrLocusRecord,
+    ) -> Result<(), PspWriteError> {
+        let n_chroms = self.header.chromosomes.len();
+        if record.chrom_id as usize >= n_chroms {
+            return Err(PspWriteError::UnknownChromId {
+                record_index,
+                chrom_id: record.chrom_id,
+                n_chroms: n_chroms as u32,
+            });
+        }
+        let chrom = &self.header.chromosomes[record.chrom_id as usize];
+
+        // start in [1, length]; end in (start, length + 1] (the interval
+        // [start, end) is half-open, so `end` may sit one past the last
+        // 1-based position). `end <= start` would also underflow the
+        // `span = end - start` encode, so it must be rejected here.
+        if record.start == 0 || record.start > chrom.length {
+            return Err(PspWriteError::PosOutOfRange {
+                record_index,
+                chrom_id: record.chrom_id,
+                pos: record.start,
+                chrom_length: chrom.length,
+            });
+        }
+        if record.end <= record.start || record.end > chrom.length + 1 {
+            return Err(PspWriteError::LocusEndOutOfRange {
+                record_index,
+                chrom_id: record.chrom_id,
+                start: record.start,
+                end: record.end,
+                chrom_length: chrom.length,
+            });
+        }
+
+        if let Some((prev_chrom, prev_start)) = self.ingest.last_locus {
+            let regression = record.chrom_id < prev_chrom
+                || (record.chrom_id == prev_chrom && record.start <= prev_start);
+            if regression {
+                return Err(PspWriteError::OutOfOrderRecord {
+                    record_index,
+                    prev_chrom,
+                    prev_pos: prev_start,
+                    this_chrom: record.chrom_id,
+                    this_pos: record.start,
+                });
+            }
+        }
+
+        // Mi8: reject a NaN log-probability. `-inf` is legitimate
+        // (`log(0)` profile weight) and permitted; NaN never is, and
+        // since the SSR decode path runs no finite sweep
+        // (`amb-logliks` is `finite_constraint: false`) a NaN would
+        // round-trip silently into the downstream EM.
+        for (profile_index, profile) in record.spanning.iter().enumerate() {
+            if profile.iter().any(|&(_, loglik)| loglik.is_nan()) {
+                return Err(PspWriteError::NonFiniteLoglik {
+                    record_index,
+                    profile_index,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write, S: PspKind> PspWriter<W, S> {
+    /// Schema-generic construction: frame the `S`-kind header (its
+    /// `kind` tag + column table), write it, and prepare empty state.
+    /// The per-kind public constructors (SNP `new`/`new_with_block_*`,
+    /// SSR `new_ssr*`) delegate here so the header/scratch wiring lives
+    /// in one place. `block_window_bp` of 0 is clamped to 1.
+    fn open(
+        mut sink: W,
+        header: WriterHeader,
+        target_block_bytes: usize,
+        block_window_bp: u32,
+    ) -> Result<Self, PspWriteError> {
+        let header_bytes = build_header_bytes_for(&header, S::KIND, S::columns())?;
+        sink.write_all(&header_bytes)
+            .map_err(|e| PspWriteError::Io {
+                context: "file header",
+                block_index: None,
+                column_tag: None,
+                source: e,
+            })?;
+        let sink_offset = header_bytes.len() as u64;
+        let scratch = WriterScratch::new(S::columns().len())?;
+        Ok(Self {
+            sink,
+            header,
+            sink_offset,
+            index_entries: Vec::new(),
+            block: None,
+            ingest: IngestState::new(),
+            scratch,
+            target_block_bytes,
+            block_window_bp: block_window_bp.max(1),
+        })
+    }
+
+    /// Flush any open block, write the block index, and write the
+    /// trailer. Consumes the writer; the returned sink is positioned
+    /// at the end of a complete `.psp` file.
+    ///
+    /// **End-of-stage discipline for `BufWriter`-wrapped file sinks.**
+    /// `BufWriter::drop` may swallow flush errors, which for a
+    /// billions-of-records file can silently truncate the trailer.
+    /// The production caller should do, in order:
+    /// ```ignore
+    /// let buf = writer.finish()?;       // PSP-level flush
+    /// let file = buf.into_inner()?;     // surface BufWriter errors
+    /// file.sync_all()?;                 // durability for downstream stages
+    /// ```
+    /// `sync_all` is end-of-stage only — never per-block.
+    pub fn finish(mut self) -> Result<W, PspWriteError> {
+        if self.block.is_some() {
+            self.flush_block()?;
+        }
+        let index_offset = self.sink_offset;
+        let index_bytes = encode_index(&self.index_entries);
+        let index_byte_length = index_bytes.len() as u64;
+        let index_checksum = checksum_index(&index_bytes);
+        self.sink
+            .write_all(&index_bytes)
+            .map_err(|e| PspWriteError::Io {
+                context: "block index",
+                block_index: None,
+                column_tag: None,
+                source: e,
+            })?;
+        self.sink_offset += index_byte_length;
+
+        let trailer = Trailer {
+            index_offset,
+            index_byte_length,
+            n_blocks: self.index_entries.len() as u64,
+            index_checksum,
+        };
+        let trailer_bytes = encode_trailer(&trailer);
+        self.sink
+            .write_all(&trailer_bytes)
+            .map_err(|e| PspWriteError::Io {
+                context: "file trailer",
+                block_index: None,
+                column_tag: None,
+                source: e,
+            })?;
+        self.sink_offset += trailer_bytes.len() as u64;
+        self.sink.flush().map_err(|e| PspWriteError::Io {
+            context: "final flush",
+            block_index: None,
+            column_tag: None,
+            source: e,
+        })?;
+        Ok(self.sink)
+    }
+
+    /// Projected uncompressed bytes the currently-open block has
+    /// accumulated. `None` when no block is open (just after `new` or
+    /// just after a flush).
+    ///
+    /// Hidden from rustdoc — this peek into writer state exists only
+    /// to let benches align iteration boundaries with the writer's
+    /// auto-flush boundary (see L10 in
+    /// `ia/reviews/perf_psp_writer_2026-05-13.md`).
+    #[doc(hidden)]
+    pub fn current_block_projected_bytes(&self) -> Option<usize> {
+        self.block.as_ref().map(|b| b.projected_bytes())
     }
 
     /// Encode the current block to wire bytes, compress its columns,
@@ -609,29 +759,29 @@ impl<W: Write> PspWriter<W> {
             .take()
             .expect("flush_block called with no open block");
         let block_offset = self.sink_offset;
-        let n_records = block.delta_pos.len() as u32;
-        let n_total_alleles = block.allele_seq_len.len() as u32;
+        let n_records = block.n_records();
+        let n_total_alleles = block.n_entries();
         let block_index = self.index_entries.len() as u64;
 
         // Mi30: split flush into three phases. Each is a free
         // function taking `&mut WriterScratch` (and, where needed,
         // the open block, the sink, and `block_index` for error
-        // context).
-        encode_and_compress_columns(&block, &mut self.scratch, block_index)?;
-        assemble_block_header(
+        // context). Each is generic over the schema `S`.
+        encode_and_compress_columns::<S>(&block, &mut self.scratch, block_index)?;
+        assemble_block_header::<S>(
             &block,
             &mut self.scratch,
             block_index,
             n_records,
             n_total_alleles,
         )?;
-        let written = emit_block_to_sink(&mut self.sink, &self.scratch, block_index)?;
+        let written = emit_block_to_sink::<W, S>(&mut self.sink, &self.scratch, block_index)?;
         self.sink_offset += written;
 
         self.index_entries.push(BlockIndexEntry {
-            chrom_id: block.chrom_id,
-            first_pos: block.first_pos,
-            last_pos: block.last_pos,
+            chrom_id: block.chrom_id(),
+            first_pos: block.first_pos(),
+            last_pos: block.last_pos(),
             n_records,
             block_offset,
         });
@@ -643,19 +793,19 @@ impl<W: Write> PspWriter<W> {
 // Flush phases (Mi30)
 // ---------------------------------------------------------------------
 
-/// Phase 1: walk the column registry, encoding each column's
+/// Phase 1: walk the schema's column table, encoding each column's
 /// uncompressed bytes, compressing them into `scratch.compressed[i]`,
 /// and recording a manifest entry. `block_index` is used only for
 /// error context.
-fn encode_and_compress_columns(
-    block: &BlockAccumulator,
+fn encode_and_compress_columns<S: PspKind>(
+    block: &S::Block,
     scratch: &mut WriterScratch,
     block_index: u64,
 ) -> Result<(), PspWriteError> {
     scratch.manifest.clear();
-    for (i, column_def) in V1_0_COLUMNS.iter().enumerate() {
+    for (i, column_def) in S::columns().iter().enumerate() {
         scratch.uncompressed.clear();
-        encode_column_into(column_def, block, &mut scratch.uncompressed)?;
+        S::encode_column(column_def, block, &mut scratch.uncompressed)?;
         let uncompressed_len = scratch.uncompressed.len() as u32;
         zstd_compress_into(
             &mut scratch.compressor,
@@ -681,16 +831,16 @@ fn encode_and_compress_columns(
 /// scratch into it) and serialise it into `scratch.header_bytes`.
 /// The manifest scratch is restored at the end so capacity carries
 /// over to the next flush.
-fn assemble_block_header(
-    block: &BlockAccumulator,
+fn assemble_block_header<S: PspKind>(
+    block: &S::Block,
     scratch: &mut WriterScratch,
     block_index: u64,
     n_records: u32,
     n_total_alleles: u32,
 ) -> Result<(), PspWriteError> {
     let header = BlockHeader {
-        chrom_id: block.chrom_id,
-        first_pos: block.first_pos,
+        chrom_id: block.chrom_id(),
+        first_pos: block.first_pos(),
         n_records,
         n_total_alleles,
         manifest: std::mem::take(&mut scratch.manifest),
@@ -707,7 +857,7 @@ fn assemble_block_header(
 /// Phase 3: write the encoded block header followed by every
 /// compressed column payload to the sink. Returns the total number
 /// of bytes written so the caller can update `sink_offset`.
-fn emit_block_to_sink<W: Write>(
+fn emit_block_to_sink<W: Write, S: PspKind>(
     sink: &mut W,
     scratch: &WriterScratch,
     block_index: u64,
@@ -720,11 +870,12 @@ fn emit_block_to_sink<W: Write>(
             source: e,
         })?;
     let mut written = scratch.header_bytes.len() as u64;
+    let columns = S::columns();
     for (i, compressed) in scratch.compressed.iter().enumerate() {
         sink.write_all(compressed).map_err(|e| PspWriteError::Io {
             context: "block column payload",
             block_index: Some(block_index),
-            column_tag: Some(V1_0_COLUMNS[i].tag),
+            column_tag: Some(columns[i].tag),
             source: e,
         })?;
         written += compressed.len() as u64;
@@ -733,8 +884,41 @@ fn emit_block_to_sink<W: Write>(
 }
 
 // ---------------------------------------------------------------------
-// BlockAccumulator
+// SnpKind — the SNP `.psp` schema (the only [`PspKind`] in steps 1–3)
 // ---------------------------------------------------------------------
+
+/// The SNP `.psp` schema. Supplies the v1.0 column table
+/// ([`V1_0_COLUMNS`]), the [`SnpBlock`] accumulator, and the
+/// `PileupRecord` → column-bytes encode. The generic
+/// [`PspWriter`]'s default schema parameter.
+pub struct SnpKind;
+
+impl PspKind for SnpKind {
+    type Record = PileupRecord;
+    type Block = SnpBlock;
+    type Decoder = super::reader::SnpDecoder;
+    const KIND: &'static str = super::registry::SNP_KIND;
+
+    fn columns() -> &'static [ColumnDef] {
+        V1_0_COLUMNS
+    }
+
+    fn encode_column(
+        def: &ColumnDef,
+        block: &SnpBlock,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PspWriteError> {
+        encode_snp_column_into(def, block, out)
+    }
+
+    fn record_interval(record: &PileupRecord) -> (u32, u32, u32) {
+        // SNP is a degenerate point: the record covers exactly `pos`,
+        // so the half-open interval is `[pos, pos + 1)`. `pos` is
+        // bounded by the SAM `@SQ LN` max (`2^31 - 1`), so `+ 1` cannot
+        // overflow `u32`; `saturating_add` is belt-and-braces.
+        (record.chrom_id, record.pos, record.pos.saturating_add(1))
+    }
+}
 
 /// Flat CSR storage for a per-record or per-allele list column.
 /// `offsets[i]..offsets[i+1]` is row `i`'s slice into `data`;
@@ -761,7 +945,10 @@ impl ListColumn {
     }
 }
 
-struct BlockAccumulator {
+/// The SNP per-block accumulator: the v1.0 column buffers plus the
+/// structural metadata the flush + block index read back. Implements
+/// [`BlockAccumulator`] for [`SnpKind`].
+pub struct SnpBlock {
     chrom_id: u32,
     first_pos: u32,
     last_pos: u32,
@@ -784,8 +971,10 @@ struct BlockAccumulator {
     projected_bytes: usize,
 }
 
-impl BlockAccumulator {
-    fn new(chrom_id: u32, first_pos: u32) -> Self {
+impl BlockAccumulator for SnpBlock {
+    type Record = PileupRecord;
+
+    fn new_block(chrom_id: u32, first_pos: u32) -> Self {
         Self {
             chrom_id,
             first_pos,
@@ -809,7 +998,7 @@ impl BlockAccumulator {
         }
     }
 
-    fn append_record(&mut self, record: &PileupRecord) {
+    fn append(&mut self, record: &PileupRecord) {
         let is_first = self.delta_pos.is_empty();
         let delta = if is_first {
             0u64
@@ -855,25 +1044,59 @@ impl BlockAccumulator {
             .sum();
         self.projected_bytes += per_record + per_allele;
     }
+
+    fn chrom_id(&self) -> u32 {
+        self.chrom_id
+    }
+
+    fn first_pos(&self) -> u32 {
+        self.first_pos
+    }
+
+    fn last_pos(&self) -> u32 {
+        self.last_pos
+    }
+
+    fn n_records(&self) -> u32 {
+        self.delta_pos.len() as u32
+    }
+
+    fn n_entries(&self) -> u32 {
+        self.allele_seq_len.len() as u32
+    }
+
+    fn projected_bytes(&self) -> usize {
+        self.projected_bytes
+    }
 }
 
 // ---------------------------------------------------------------------
 // Column encoders — exhaustive dispatch on `ColumnKey` (M4)
 // ---------------------------------------------------------------------
 
-/// Encode one column from the block accumulator into its
+/// Encode one SNP column from the block accumulator into its
 /// uncompressed wire form, appending into the caller-provided `out`
 /// buffer. Dispatches exhaustively on `def.key`, so adding a
 /// `ColumnKey` variant forces an arm here as a compile error — no
 /// runtime fall-through. The caller is responsible for `clear()`-ing
 /// `out` before calling so the buffer can be reused across columns
 /// without reallocation (L1).
-fn encode_column_into(
+///
+/// Backs [`SnpKind::encode_column`]; folds in the writer-side
+/// column-size self-check (M5).
+fn encode_snp_column_into(
     def: &ColumnDef,
-    block: &BlockAccumulator,
+    block: &SnpBlock,
     out: &mut Vec<u8>,
 ) -> Result<(), PspWriteError> {
-    match def.key {
+    // `ColumnDef` is schema-agnostic (no `key`); recover the SNP
+    // dispatch key from the tag. The `match` stays exhaustive over
+    // `ColumnKey`.
+    // UNREACHABLE: `def` is a `V1_0_COLUMNS` row (the only caller walks
+    // that table), so its tag is always a `ColumnKey`.
+    let key = ColumnKey::from_tag(def.tag)
+        .expect("encode_snp_column_into called with a non-SNP column tag");
+    match key {
         ColumnKey::DeltaPos => encode_varint_column(&block.delta_pos, out),
         ColumnKey::NAlleles => encode_varint_column(&block.n_alleles, out),
         ColumnKey::AlleleSeqLen => encode_varint_column(&block.allele_seq_len, out),
@@ -935,7 +1158,7 @@ fn encode_column_into(
 /// update when a new variant lands — replacing the prior
 /// `_ => true` catch-all that silently approved any future
 /// combination.
-fn predict_uncompressed_len(def: &ColumnDef, block: &BlockAccumulator) -> Option<usize> {
+fn predict_uncompressed_len(def: &ColumnDef, block: &SnpBlock) -> Option<usize> {
     use super::registry::Cardinality;
     let n_records = block.delta_pos.len();
     let n_total_alleles = block.allele_seq_len.len();

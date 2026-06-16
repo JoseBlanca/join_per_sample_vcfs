@@ -20,10 +20,33 @@ Defined once here; used unqualified thereafter.
 **Domain / biology**
 
 - **SSR** — Simple Sequence Repeat (microsatellite); a tandem repeat with a short
-  motif. Used interchangeably with **STR**.
-- **STR** — Short Tandem Repeat. Synonym of SSR in this document.
+  motif (period ≤ 6). Used interchangeably with **STR**. **We say SSR, not the
+  broader "TR", deliberately** — see the *SSR vs STR vs TR* note below.
+- **STR** — Short Tandem Repeat. Synonym of SSR in this document. The
+  human-genetics/forensics name for the same short-motif class.
+- **TR** — Tandem Repeat; the *umbrella* term (any period, homopolymer →
+  satellite) used by the modern long-read ecosystem (GIAB-TR, TRtools, TRGT).
+  **Broader than our scope** — we appropriate it only at the interop seam (§5.9
+  VCF, GIAB-TR benchmark), never as our own feature word.
 - **VNTR** — Variable Number Tandem Repeat; the broader family (minisatellites and
   up), explicitly out of scope here (period ≤ 6 only).
+
+  > **SSR vs STR vs TR — a deliberate naming choice, not an oversight.** The
+  > short-motif tandem repeat has several names that differ by field and by
+  > scope. *SSR / microsatellite* (period ~1–6 bp) is the dominant term in
+  > plant, agricultural, ecological and population genetics — our domain and
+  > audience. *STR* is the same class under its human-genetics/forensics name
+  > (CODIS markers are STRs); we treat it as a synonym. *TR (tandem repeat)* is
+  > the **superset** covering every period from homopolymers through
+  > kilobase VNTRs and pathogenic expansions. Modern sequencing tools
+  > (GIAB-TR, TRtools, TRGT, LongTR) standardised on "TR" for *principled*
+  > reasons — long reads dissolved the assay-defined size boundaries, the old
+  > motif-length cutoffs were always arbitrary, and expansion disorders broke
+  > the "short" in STR — but those reasons are driven by a scope that spans the
+  > whole continuum. **Ours does not:** period ≤ 6, spanning short reads,
+  > pop-gen markers; VNTRs and expansions are explicit non-goals (§1.3–§1.4).
+  > For *that* scope, SSR is the more precise term and the one our readers use,
+  > so we keep it. (And note: **TRF ≠ TR** — TRF is a *tool*, see below.)
 - **period** — length of the repeat unit (motif) in bp; period 1 = mono-, …, 6 =
   hexanucleotide.
 - **motif / RU** — the repeat unit itself (e.g. `CAG`). RU = Repeat Unit (the VCF
@@ -33,7 +56,10 @@ Defined once here; used unqualified thereafter.
 - **FRR** — Fully Repetitive Read; a read lying entirely inside the repeat tract
   (no flank), used as a length lower bound for long alleles.
 - **purity** — fraction of the tract matching a perfect motif tiling; 1.0 =
-  perfect repeat, < 1.0 = imperfect / interrupted.
+  perfect repeat, < 1.0 = imperfect / interrupted. "purity" is the *concept*
+  used in prose; the concrete catalog column / `Locus` field is named
+  **`purity_fraction`** (the `_fraction` suffix marks it a degree in [0, 1], not
+  a boolean).
 - **allele (here)** — a repeat allele's *identity* is its actual tract
   **sequence**, not a bare number. Two molecules that differ by a
   non-motif-multiple amount (e.g. 12 clean repeats vs 12 repeats + 1 bp) are
@@ -42,19 +68,23 @@ Defined once here; used unqualified thereafter.
   on-ladder / off-ladder.
 - **on-ladder / off-ladder** — an allele is **on-ladder** if its length is a
   whole-motif multiple of the reference tiling — a clean rung `ref ± k` units; its
-  sequence is fully reconstructible from `(catalog scaffold, k)`, so it is the same
+  sequence is fully reconstructible from `(reference tract, k)`, so it is the same
   allele in every sample by construction. An allele is **off-ladder** if it differs
   from a clean tiling by a non-motif amount (a 1 bp indel, a partial unit, a
   *variable* interruption); its sequence is **not** reconstructible from a rung
   number, so it is carried explicitly. Stutter (§5.2) moves only between on-ladder
   rungs; an off-ladder allele is a genuine distinct allele, never a stutter
   product. (A *fixed* interruption shared by the whole population is not off-ladder
-  — it is pinned into the scaffold, §3.1.)
+  — it is pinned into the reference tract, §3.1.)
 
 **Tools / file formats**
 
-- **TRF** — Tandem Repeats Finder; the catalog detector (Stage 0).
-- **DUST / sdust** — low-complexity sequence masker; optional TRF prefilter.
+- **TRF** — Tandem Repeats Finder (Benson 1999); the catalog **detector tool**
+  run in Stage 0. A *tool name*, never a name for the feature itself — a locus
+  is an SSR, not "a TRF". Do not confuse with **TR** (the feature umbrella,
+  above).
+- **DUST / sdust** — low-complexity sequence masker. Used by the SNP path; the
+  SSR caller does **not** use it (the catalog sdust prefilter was dropped, §3.1).
 - **BAM / CRAM** — aligned-read containers (input).
 - **VCF** — Variant Call Format (output). **GFF / BED / TSV** — annotation/tabular
   formats used for the catalog.
@@ -126,9 +156,9 @@ allele's identity. The reason is cross-sample comparison: Stage 2 must decide wh
 two samples carry "the same" allele, and the integer count is not a faithful key
 (it collapses 12 and 12+1 bp onto the same number) — only the sequence is. Most
 alleles are **on-ladder** (clean rungs of the integer ladder) and are stored
-compactly as a rung number whose sequence is reconstructible from the catalog
-scaffold; the minority that are **off-ladder** carry their sequence explicitly
-(the *hybrid* representation, §4.2/§4.3). See the glossary entries for
+compactly as a rung number whose sequence is reconstructible from the catalog's
+reference tract; the minority that are **off-ladder** carry their sequence
+explicitly (the *hybrid* representation, §4.2/§4.3). See the glossary entries for
 *allele (here)* and *on-ladder / off-ladder*.
 
 ### 1.1 Two independent callers from one BAM (foundational)
@@ -141,7 +171,8 @@ per-locus repeat-length + stutter — and keeping the call sets independent lets
 population hypotheses be analysed independently on each marker type. Concretely:
 
 - A **standalone pipeline** (own binary/crate, own VCF); it shares only low-level
-  BAM/CRAM I/O (noodles) and the vendored `sdust`.
+  BAM/CRAM I/O (noodles). (It does *not* use the vendored `sdust` — the catalog's
+  sdust prefilter was dropped, §3.1.)
 - It does **not** read the SNP call set, and is **not** a tweak to the
   per-position `.psp` path — the SSR data model is locus/window-oriented.
 - **No SNP-phasing.** HipSTR gains accuracy by physically phasing an STR against
@@ -239,65 +270,130 @@ for new species).
   degenerate repeats (the real biology) and is the validated source of every
   established STR catalog. (Fast exact scanners like MISA/PERF are rejected as
   primary because perfect-only recall silently drops interrupted loci.)
-- **Optional DUST/sdust pre-search** to accelerate: run sdust genome-wide and
-  restrict TRF to masked windows + a margin. Kept **only if** shown near-lossless
-  *and* genome-wide TRF is too slow on the target genome (sdust is not
-  motif-aware and can miss/mis-bound loci). Must be measured (§3.4).
-- **Post-process** TRF output: keep **period ≤ 6** (SSR scope), filter by
-  purity/score, **merge overlapping/redundant** calls, drop loci without **unique
-  flanks** (mappability). These filters are accuracy knobs (§3.4).
-- **Imperfect single-motif loci are kept and genotyped.** **Compound loci are
-  split** into their component single-motif sub-loci (each a normal
-  perfect/imperfect locus).
-  - **Inner-flank consequence (carries into Stage 1):** a split sub-locus's
-    *inner* flank is the adjacent motif's repeat — *not* unique sequence. Stage 1
-    must anchor on the **outer** flank and treat the inner boundary as
-    catalog-known repeat structure, not a random unique flank.
+- **No sdust pre-search.** An earlier design kept an optional sdust prefilter
+  (mask the genome, restrict TRF to masked windows) as a speed lever; **dropped**.
+  It is speed-only and *lossy* (sdust isn't motif-aware → can miss/mis-bound
+  loci), non-standard (TRF genome-wide is the validated path), and premature (the
+  build is once-per-genome, parallelized by contig). If build speed ever matters,
+  the lossless lever is intra-contig chunking, not a lossy prefilter. **TRF runs
+  genome-wide.** (SSR therefore uses sdust nowhere — see §1.1.)
+- **Post-process** TRF output, in order: keep **period ≤ 6** (SSR scope) →
+  **drop compound + bundled loci** → **end-trim** partial motifs → **recompute
+  purity, then filter** (with per-period copy-number floors). These are accuracy
+  knobs (§3.4). Specifics:
+  - **Drop, don't split, compounds (decided).** Following GangSTR's validated
+    reference-panel pipeline (`GangSTR/scripts/create_ref_panel/`), we **discard**
+    rather than split: (a) loci whose **motif is internally periodic** (`ATAT` =
+    (AT)² — a non-fundamental period; the fundamental survives via TRF's
+    redundancy elimination), and (b) **bundles** — any locus within
+    `bundle_threshold` bp of another detected repeat (the whole cluster is
+    dropped, GangSTR's `remove_bundles`). This sidesteps the motif-boundary
+    change-point problem entirely; and with **`bundle_threshold ≥ flank_bp`**
+    every surviving locus has **clean unique flanks** by construction — so there
+    is **no inner-flank special case** anywhere downstream.
+  - **We keep imperfect single-motif loci** — the one deliberate divergence from
+    GangSTR (whose `remove_messy` keeps only perfect tilings). Stage 1's
+    realignment genotypes imperfect loci, so the purity filter is a degeneracy
+    **floor**, not perfect-only.
+  - **Merge is delegated to TRF** — period-multiples + same-period duplicates,
+    eliminated by default.
+  - **`purity_fraction` is recomputed** from the final (end-trimmed) tract using
+    the §3.2 definition (fraction matching a perfect motif tiling) — more faithful
+    than TRF's alignment-based `fracMatch`, and required because end-trimming
+    changes the boundaries. The purity filter runs last, on the recomputed value.
+  - **No mappability/unique-flank filter.** Mappability is delegated entirely to
+    **per-read MAPQ** in Stage 1 — MAPQ is paralog-aware by construction (a
+    near-identical copy elsewhere gives a competing alignment and lowers MAPQ) and
+    paired-end-aware (mate/insert-size rescue), which a static single-end
+    reference map is not. Unmappable/paralogous loci self-suppress downstream
+    (low-MAPQ reads → low depth → no-call); the catalog keeps all *surviving*
+    SSRs. (Revisit §5.8's "segdup/mappability exclusion" consistently in the
+    Stage-2 work.)
 
 ### 3.2 Catalog format
 
 One **self-describing bgzip+tabix BED-like TSV**: a VCF/GFF-style `##` metadata
-header (reference path + md5, TRF params, filters, tool/version, date), then a
-`#`-prefixed column header, then rows. Tabix skips comment lines. No sidecar.
+header (reference path + md5, TRF params, filters, **`flank_bp`** margin,
+tool/version, date), then a `#`-prefixed column header, then rows. Tabix skips
+comment lines. No sidecar.
 
-**Minimal schema (only non-derivable columns):**
+**Schema — non-derivable columns, plus the embedded local reference (§"Self-contained"):**
 
 ```
-chrom   start   end   motif   purity
+chrom   start   end   motif   purity_fraction   ref_seq_start   ref_seq
 ```
 
 - `start`/`end` are 0-based half-open; `end − start` is the reference tract length
   (the reference allele); `motif` gives the period.
+- `motif` is the **verbatim** repeat unit — reference-strand, phase-faithful (TRF's
+  consensus unit as it tiles the tract), *not* canonicalized: rotating it would
+  break tiling, and reconstruction reads phase-correct bytes from `ref_seq` anyway.
+  Its canonical *class* (lexicographically-min rotation over the motif + its
+  reverse complement) is **derived** as the §5.2 stutter "motif-or-GC class"
+  pooling key, never stored.
+- `purity_fraction` is the fraction of the tract that is a clean motif tiling, in
+  [0, 1] — a *degree*, not a flag (1.0 = perfect, < 1.0 = interrupted). The
+  `_fraction` suffix is deliberate: the bare name reads like a boolean.
+- `ref_seq` is the **upper-cased reference bases of the tract plus a `flank_bp`
+  margin on each side** (clamped at contig ends); `ref_seq_start` is the 0-based
+  genomic coordinate of `ref_seq[0]`, so the tract is
+  `ref_seq[(start − ref_seq_start) .. (end − ref_seq_start)]` and the flanks are
+  what remain either side. (See §"Self-contained" for why this lives in the
+  catalog.)
 - Dropped as derivable: `period` = len(motif); `ref_copies` = (end−start)/period;
-  `class` (perfect/imperfect) = threshold(purity), perfect ⇔ purity = 1.0;
-  `locus_id` = f(chrom,start,motif). Cross-file linkage is **positional**; the VCF
-  `ID` is constructed at output.
-- **Reference allele identity is the reference tract sequence** (the bases of
-  `[start, end)`), not `ref_copies`. For an **imperfect** locus `(end − start)` is
-  generally *not* a multiple of `period`, so `ref_copies` is **fractional** — it is
-  a derived annotation only (rounded for the VCF integer field, §5.9), never the
-  reference allele's identity. The integer ladder Stage 1/2 work on is anchored on
-  this reference sequence as the scaffold; the fractional remainder is carried as
-  fixed scaffold context, not as a ladder rung (§4.2).
-- `purity` is retained only because Stage 2 may use it for confidence weighting;
-  it may be dropped if it ends up a build-time filter only.
+  `class` (perfect/imperfect) = threshold(purity_fraction), perfect ⇔
+  `purity_fraction` = 1.0; `locus_id` = f(chrom,start,motif). Cross-file linkage
+  is **positional**; the VCF `ID` is constructed at output.
+- **Reference allele identity is the reference tract sequence** (`ref_seq`'s tract
+  slice), not `ref_copies`. For an **imperfect** locus `(end − start)` is generally
+  *not* a multiple of `period`, so `ref_copies` is **fractional** — it is a derived
+  annotation only (rounded for the VCF integer field, §5.9), never the reference
+  allele's identity. The integer ladder Stage 1/2 work on is anchored on this
+  reference tract; the fractional remainder is carried as fixed reference-tract
+  context, not as a ladder rung (§4.2).
+- `purity_fraction` is retained only because Stage 2 may use it for confidence
+  weighting; it may be dropped if it ends up a build-time filter only.
+
+**Self-contained — the catalog embeds the local reference so the SSR *algorithm*
+in Stages 1–2 never reads the FASTA.** `ref_seq` is the *one deliberate
+exception* to "only non-derivable columns": the tract+flank bases **are**
+derivable from the reference, but storing them is the point. The reference FASTA
+is a fixed, multi-hundred-MB resident cost; embedding the few bytes each locus
+actually needs means the SSR math — candidate-ladder reconstruction (§4.2),
+off-ladder normalization, VCF REF/ALT (§5.9) — sources every reference base from
+the catalog. A direct expression of the project's memory-for-scaling thesis, and
+it makes the catalog a single self-contained input; the only thing that opens the
+reference *for the SSR algorithm* is this Stage-0 builder, which already has it
+for TRF.
+
+- ⚠ **CRAM caveat (I/O layer, not the algorithm).** CRAM stores reads as deltas
+  against the reference, so **decoding a CRAM** still needs the reference at the
+  noodles/htslib layer regardless of this embedding. So: **BAM input is fully
+  FASTA-free**; **CRAM input still requires the reference for decoding** (passed
+  to `ssr-pileup` for that purpose only — the SSR math never consults it). The
+  embedding removes the *algorithm's* reference dependency; it cannot remove
+  CRAM's *decoder* dependency.
+- **Costs.** The catalog grows by `ref_seq` (~tract + 2·`flank_bp` per locus,
+  ≈ tens of MB bgzip-compressed for a plant genome — small beside a genome), and
+  it is a **denormalization** of reference-derivable data, kept honest by the
+  header's `reference_md5` (any mismatch between `ref_seq` and the declared
+  reference is detectable).
+- `flank_bp` is sized to Stage 1's read-anchoring + pair-HMM band need (set when
+  building `ssr-pileup`); Stage 2 needs only the tract slice, so Stage 1 is the
+  binding constraint.
 
 ### 3.3 Decisions
 
-- TRF primary; DUST prefilter conditional and measured.
-- Compounds split; imperfect kept.
+- TRF only, genome-wide (no sdust prefilter — §3.1).
+- Compounds **and bundles dropped** (not split — GangSTR-style); imperfect kept.
 - No redundant columns; QA at the test level.
 
 ### 3.4 Accuracy harness (catalog)
 
-Two distinct measurements:
-1. **Catalog accuracy** — randomized-sequence FP rate (any "SSR" in shuffled
-   sequence is a false positive → calibrates thresholds); simulation recall by
-   motif × copy × purity; boundary accuracy; and **recovery of tomato published
-   capillary SSR markers** (known motif + sizes) as the species anchor.
-2. **DUST-prefilter recall** (if used) — TRF genome-wide vs TRF-within-sdust-
-   windows: fraction of true loci dropped, by motif/purity, vs wall-time saved.
-   Adopt the prefilter only if the recall loss is negligible.
+**Catalog accuracy** — randomized-sequence FP rate (any "SSR" in shuffled
+sequence is a false positive → calibrates thresholds); simulation recall by
+motif × copy × purity; boundary accuracy; and **recovery of tomato published
+capillary SSR markers** (known motif + sizes) as the species anchor.
 
 ---
 
@@ -351,11 +447,12 @@ forcing it onto the nearest rung.
 and applied in Stage 2). Candidates are *sequences*, in two families:
 
 - **on-ladder** — the integer ladder of clean tilings `H_L = outer_flank + (motif ×
-  L) + inner_context` for `L` near the observed count (flanks/motif from catalog +
-  reference). The ladder is catalog-defined, hence **identical across all samples**,
+  L) + inner_context` for `L` near the observed count (flanks/motif from the
+  catalog's embedded `ref_seq` + `motif`, §3.2 — no FASTA access). The ladder is
+  catalog-defined, hence **identical across all samples**,
   and is the spine every read is scored against. An on-ladder candidate is
   identified by its rung `L` alone (its sequence is reconstructible from the
-  scaffold).
+  reference tract).
 - **off-ladder** — an *actual* tract sequence a read supports that is **not** a
   clean rung. It is identified by its sequence, carried as a **normalized** delta
   from the reference tract (canonical left-aligned form, reusing the SNP caller's
@@ -395,10 +492,10 @@ samples in §5.1).
     *sequencing* indels (distinct from stutter). Implemented as a **bespoke banded
     pair-HMM in Rust** (no `rust-bio` dependency), learning the banded-forward
     pattern from `baq_engine` but not coupling to it.
-  - **Compound inner-flank:** anchor on the outer unique flank; build the inner
-    context of `H_L` from the catalog neighbour (`motif × ref_copies`) via
-    coordinate adjacency. A sub-locus sandwiched between two repeats → flag
-    low-confidence.
+  - **Flanks are clean by construction** — Stage 0 drops bundled/compound loci
+    (§3.1), so every catalog locus is isolated (no detected repeat within
+    `flank_bp`). The realigner anchors on the embedded flanks with no inner-flank
+    or compound special case.
 
 **How `Qᵣ(L)` is stored — the two tiers map onto two storage regimes (§4.3),
 not a uniform per-read profile.** A read produces *either* a single length or a
@@ -464,7 +561,7 @@ invariants:
   same intervals, so the merge is **block-aligned** — the sparse analogue of a
   synchronized scan, with no join index and no empty rows.
 - **Region query:** binary-search the block index for the first block overlapping
-  `[start, end)`, decode forward until past it (`ssr-genotype --regions`). The index
+  `[start, end)`, decode forward until past it (`ssr-call --regions`). The index
   keys on **interval** extent — `last_end`, not `last_start` — so a locus that
   starts before a query window but extends into it is not missed (the point-vs-
   interval difference from the SNP `.psp`, whose records are points).
@@ -488,11 +585,11 @@ decode).
 | `n_filtered` | int32 | low-mapq / dup / clipped |
 | `n_flank_indel` | int32 | |
 | `mapped_reads` | int32 | for normalized-depth QC |
-| `hist_lengths` | list&lt;int16&gt; | distinct observed **on-ladder** allele lengths (repeat units), ascending |
+| `hist_lengths` | list&lt;uint16&gt; | distinct observed **on-ladder** allele lengths (repeat units, non-negative), ascending |
 | `hist_counts` | list&lt;int32&gt; | confident-read count per on-ladder length (parallel) |
 | `hist_weight` | list&lt;float32&gt; | optional base-qual aggregate per on-ladder length |
 | `amb_read_offsets` | list&lt;int32&gt; | CSR prefix offsets for ambiguous reads (len = n_amb + 1) |
-| `amb_lengths` | list&lt;int16&gt; | flattened per-read candidate **on-ladder** lengths |
+| `amb_lengths` | list&lt;uint16&gt; | flattened per-read candidate **on-ladder** lengths (non-negative) |
 | `amb_logliks` | list&lt;float32&gt; | flattened **stutter-free** log-liks (parallel) |
 | `offl_seqs` | list&lt;string&gt; (dict) | distinct **off-ladder** allele sequences at this locus, as normalized deltas vs the ref tract, canonical order; empty when none |
 | `offl_counts` | list&lt;int32&gt; | confident off-ladder read count per sequence (parallel to `offl_seqs`) |
@@ -522,7 +619,8 @@ STUTTER_WINDOW_UNITS, AMB_LL_DROP}`, `tool_version`, and a contig name↔id tabl
 so it and the `.snp.psp` schema evolve without lockstep. Write knobs:
 `--block-window-bp` (the decode unit and the primary memory lever, as on the SNP
 path); per-column ZSTD. All stored likelihoods are **stutter-free**; on-ladder
-lengths are `int16` repeat units.
+lengths are `uint16` repeat units (non-negative; the only signed length
+quantity, the ref offset Δ, is derived, never stored — §5.5).
 
 ---
 
@@ -1040,8 +1138,8 @@ tr_harmonizer.py`.
   lowercased raw header contains **both** the substrings `command=` **and**
   `gangstr` — two tokens, anywhere, possibly on different lines
   (`tr_harmonizer.py:210`). We satisfy both truthfully: a real
-  `##command=ssr-genotype …` line (our actual invocation supplies `command=`) plus a
-  `##source=ssr-genotype <ver> (GangSTR-compatible output)` line (truthfully supplies
+  `##command=ssr-call …` line (our actual invocation supplies `command=`) plus a
+  `##source=ssr-call <ver> (GangSTR-compatible output)` line (truthfully supplies
   `gangstr`). **No spoofed GangSTR command** — we never claim GangSTR ran. To stay a
   *unique* match (TRtools hard-errors on multi-match) we avoid the other detectors'
   triggers: no `hipstr`/`longtr` tokens anywhere, no `source=advntr`/`source=popstr`,
@@ -1124,20 +1222,31 @@ per-motif-length breakdown, precision ≥ HipSTR/GangSTR at matched call-rate.
 
 ---
 
-## 8. CLI surface (provisional — see §11/E)
+## 8. CLI surface
 
-Mirrors `pileup → var-calling`:
+Three subcommands on the existing binary, named to mirror the SNP caller's
+`pileup → var-calling` roles one-for-one (architecture doc §2/§3.3):
 
-- `ssr-catalog` — reference FASTA → catalog.
-- `ssr-extract` — BAM/CRAM + reference + catalog → per-sample evidence `.ssr.psp`.
-- `ssr-genotype` — N evidence files + catalog → cohort VCF. Knobs include
-  `--seed-dominance {fixed|auto}` (§5.4; `fixed` default until the cut-off detection
-  is validated on real data).
-- `ssr-simulate` — test/dev: inject genotypes+stutter → synthetic BAM and/or
-  evidence + truth table.
+- `ssr-catalog` — reference FASTA → catalog (Stage 0). The only stage that reads
+  the FASTA; it embeds the local reference into the catalog (`ref_seq`, §3.2).
+- `ssr-pileup` — BAM/CRAM + catalog → per-sample evidence `.ssr.psp` (Stage 1;
+  the SSR analog of `pileup`). Takes **no reference for the SSR algorithm** (it
+  reads `ref_seq` from the catalog); a reference is needed **only to decode CRAM
+  input**, not for BAM (§3.2 CRAM caveat).
+- `ssr-call` — N evidence files + catalog → cohort VCF (Stage 2; the SSR
+  analog of `var-calling`). Knobs include `--seed-dominance {fixed|auto}`
+  (§5.4; `fixed` default until the cut-off detection is validated on real
+  data).
 
-Repo/crate placement (same-repo separate binary vs new repo) is the open
-structural decision (E), to be settled before the implementation plan.
+**The simulator is not a subcommand.** Injecting genotypes+stutter →
+synthetic BAM and/or evidence + truth table is **test/dev scaffolding**, so it
+lives as a **crate module the test suite calls directly** (`src/ssr/simulate/`),
+not on the production CLI (architecture doc §2.1).
+
+Decision E (repo/crate placement, the shared `.psp` container split, CLI
+names) is **settled** in the architecture doc: same crate / new `src/ssr/`
+module tree; a generic schema-agnostic `psp` core + `snp`/`ssr` schemas (flat
+in `src/psp/`, submodules deferred); the three subcommand names above.
 
 ---
 
@@ -1162,15 +1271,29 @@ ConSTRain (PMC12504596); RepeatSeq (PMC3592458); Valdes/Slatkin/Freimer SMM
 
 ---
 
-## 11. Open structural decision (E)
+## 11. Structural decision (E) — SETTLED
 
-Repo/crate placement, final CLI naming, **and where the shared `.psp`
-columnar-block container lives** — i.e. abstracting the existing SNP `.psp`
-read/write/index/compression code into a container crate/module that both
-`.snp.psp` and `.ssr.psp` ride on (§2/§4.3). The abstraction should be extracted
-*from the two concrete consumers* as SSR is built, not designed up front (share the
-byte-level plumbing; keep each caller's record semantics and math native). Once E is
-decided, each stage (0, 1, 2) and the simulator can be turned into its own
+Repo/crate placement, CLI naming, **and where the shared `.psp`
+columnar-block container lives** are settled in the architecture doc
+([`../architecture/ssr_genotyping_architecture.md`](../architecture/ssr_genotyping_architecture.md),
+§2–§5, 2026-06-11):
+
+- **Placement:** same crate, new `src/ssr/` module tree, `ssr-*` subcommands on
+  the existing binary (not a new repo, not a workspace split).
+- **CLI:** three subcommands — `ssr-catalog`, `ssr-pileup`, `ssr-call` — named
+  to mirror the SNP `pileup`/`var-calling` roles. The simulator is **not** a
+  subcommand; it is a crate/test module (§8).
+- **Container:** a generic schema-agnostic core plus two thin schemas (`snp`,
+  `ssr`) in `src/psp/` — both `.snp.psp` and `.ssr.psp` ride the same core. The
+  three-layer split is **conceptual, enforced by file naming**; the directory
+  **stays flat** (~13–14 files) and grows `core/`/`snp/`/`ssr/` submodules only
+  on a crowding trigger (architecture doc §3.2). Extracted *from the two
+  concrete consumers* as SSR is built, not designed up front; **pre-alpha, so no
+  backwards-compat** — free to rev the format and restructure the SNP schema,
+  the regression gate being the SNP caller's end-to-end tests, not byte-identity
+  to the old format.
+
+With E settled, each stage (0, 1, 2) and the simulator becomes its own
 implementation plan, in data-flow order, with Bucket-1 synthetic tests on the
 critical path.
 

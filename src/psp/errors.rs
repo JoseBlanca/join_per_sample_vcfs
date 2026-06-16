@@ -85,6 +85,18 @@ pub enum BlockHeaderInvariantKind {
     #[error("n_records must be >= 1 (empty blocks are forbidden)")]
     EmptyBlock,
 
+    /// Retained for wire/format compatibility but **no longer raised**
+    /// by the generic block-header validator (architecture §10):
+    /// `n_total_alleles >= n_records` is a SNP semantic, not a
+    /// container one — the SSR schema legitimately stores loci with
+    /// zero per-record entries. SNP integrity is now enforced where it
+    /// belongs: the writer rejects zero-allele records
+    /// (`validate_record`) and the reader cross-checks the per-allele
+    /// column counts against `n_total_alleles` (see
+    /// `block::validate_block_header_invariants`). This variant is kept
+    /// (not deleted) because `BlockHeaderInvariantKind` is part of the
+    /// stable error surface; do not re-wire it into the generic
+    /// validator without re-introducing the SNP-only coupling.
     #[error(
         "n_total_alleles {n_total_alleles} < n_records {n_records} \
          (every record has at least one allele)"
@@ -290,6 +302,49 @@ pub enum PspReadError {
         "header sentinel mismatch at byte offset {offset}: length prefix and sentinel disagree"
     )]
     SentinelMismatch { offset: u64 },
+
+    /// The header's `kind` schema-family tag (architecture §10.3) is
+    /// not one this reader knows. The `kind` selects which column
+    /// registry the `[[column]]` array is cross-checked against
+    /// (`"snp"` today; `"ssr"` later); an unknown value means the file
+    /// was written by a newer/foreign producer and cannot be decoded.
+    #[error("unknown .psp kind {kind:?} (this reader knows: {known})")]
+    UnknownKind { kind: String, known: &'static str },
+
+    /// The typed reader was instantiated for a schema (`expected`) that
+    /// does not match the file's header `kind` (`found`) — e.g.
+    /// `records_of::<SnpKind>()` on an `.ssr.psp` file. Decoding columns
+    /// under the wrong schema would yield garbage records, so the
+    /// iterator refuses (architecture §10.3). Distinct from
+    /// [`Self::UnknownKind`], which is raised at header parse when the
+    /// `kind` itself is unrecognised; this is raised on the typed read
+    /// path when the caller-chosen schema disagrees with a *known* kind.
+    #[error("requested schema {expected:?} does not match the file's kind {found:?}")]
+    KindMismatch {
+        expected: &'static str,
+        found: String,
+    },
+
+    /// A per-block structural invariant specific to a schema's columnar
+    /// layout was violated on decode — a corrupt or foreign block, not
+    /// an I/O fault. `context` names the violated invariant (e.g. the
+    /// SSR parallel-CSR columns disagree on row boundaries, or the
+    /// per-record grouping count over-runs the decoded entry total).
+    /// Kept separate from [`Self::Io`] so callers can distinguish a
+    /// torn read (retryable) from deterministic corruption (fatal).
+    #[error("block structural invariant violated: {context}")]
+    BlockStructureInvalid { context: &'static str },
+
+    /// The SSR per-record grouping column (`n-spanning`) sums to a
+    /// different total than the decoded per-profile entry count
+    /// (`n_total_alleles`). `got < expected` would silently drop
+    /// trailing profiles; `got > expected` would over-run the CSR
+    /// offsets. Either way the block is malformed/foreign.
+    #[error(
+        "ssr profile count mismatch: n-spanning sums to {got} but the block declares {expected} \
+         per-profile entries"
+    )]
+    SsrProfileCountMismatch { expected: u32, got: u64 },
 
     /// A column declared in the file's `[[column]]` array has
     /// `required = true` but the reader's column-tag registry does
@@ -581,6 +636,40 @@ pub enum PspWriteError {
         chrom_id: u32,
         pos: u32,
         chrom_length: u32,
+    },
+
+    /// An interval record's `end` is out of range. The locus interval
+    /// is half-open `[start, end)`, so `end` is legal in
+    /// `(start, chrom_length + 1]` — it may sit one past the last
+    /// 1-based position. This variant carries both bounds so the
+    /// message states the true accepted range (unlike
+    /// [`Self::PosOutOfRange`], whose `[1, length]` text is wrong for
+    /// an exclusive `end`), and distinguishes the `end <= start`
+    /// (empty/negative span) failure from `end` past the contig.
+    #[error(
+        "record at index {record_index}: locus end {end} out of ({start}, {chrom_length}+1] \
+         for chrom_id {chrom_id}"
+    )]
+    LocusEndOutOfRange {
+        record_index: u64,
+        chrom_id: u32,
+        start: u32,
+        end: u32,
+        chrom_length: u32,
+    },
+
+    /// An SSR spanning-read profile carries a `NaN` log-probability.
+    /// `-inf` is permitted (a legitimate `log(0)` profile weight), but
+    /// `NaN` is never a valid probability and would poison the
+    /// downstream EM sum if it round-tripped silently (the SSR decode
+    /// path runs no finite sweep — `amb-logliks` is
+    /// `finite_constraint: false` because `-inf` is legal).
+    #[error(
+        "record at index {record_index}: profile {profile_index} carries a NaN log-probability"
+    )]
+    NonFiniteLoglik {
+        record_index: u64,
+        profile_index: usize,
     },
 
     /// Two consecutive records on the same chromosome have

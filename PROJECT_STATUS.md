@@ -19,18 +19,184 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-16):** **Segment read fetcher — review
->   fixes applied** (`src/bam/segment_reader.rs`). All 6 Majors from the
->   same-day review Applied (Mutex-poison recovery, explicit format/index
->   mismatch arms, shared BAM/CRAM filter chokepoint, CRAM container
->   early-stop, narrow `SegmentReadFilter`, report-location convention) plus
->   2 Minors; 1059 lib + integration tests pass. Fix report:
+> - **Last completed task (2026-06-15):** **SSR Stage 1 (`ssr-pileup`) — tasks 1–2.**
+>   **Task 1:** built the allele model in [src/ssr/types.rs](src/ssr/types.rs) —
+>   `NormalizedSeq` + `Allele` (`OnLadder`/`OffLadder`) with pure
+>   `to_sequence`/`repeat_count` (8 tests). **Task 2:** lifted the SNP indel-norm
+>   shift core (`normalize_alleles` + `IndexRange`) into the shared, representation-
+>   neutral [src/norm_seqs.rs](src/norm_seqs.rs); the SNP CIGAR path now wraps it
+>   (behaviour-preserving — full lib suite 1065 green; 3 new kernel tests).
+>   Then the fast-path motif counter (`count_pure_tiling` core) was built ahead of
+>   the heavy container refactor, needing only `types`. Build order: types →
+>   norm_seqs → [container schema, deferred] → stage modules. See the plan
+>   ([ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md)) and reports
+>   ([task 1](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md),
+>   [task 2](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md),
+>   [count_repeats](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md),
+>   [pair_hmm](ia/reports/implementations/ssr_pileup_pair_hmm_2026-06-15.md),
+>   [candidate_generation Job 1](ia/reports/implementations/ssr_pileup_candidate_generation_2026-06-15.md)
+>   + [score_candidates / Job 2](ia/reports/implementations/ssr_pileup_candidate_generation_job2_2026-06-15.md)).
+>   `candidate_generation` is now complete (off-ladder key = verbatim full tract;
+>   `norm_seqs` proved unnecessary for that representation). `triage` started with
+>   the `find_longest_stretch` content pre-probe (read seam = `MappedRead`).
+>   **Architecture revised → realign-everything** (drop the CIGAR-trusting
+>   two-tier; `count_repeats` parked as a measured fast-path optimization the user
+>   requires be tried). Container refactor deferred to last. `triage` is complete
+>   (coverage classification + region extract + window centre; recovers
+>   soft-clipped long alleles via the clip-included pre-probe). The per-read path is
+>   now wired end-to-end (`analyze_read`: triage → rungs → score → Qᵣ), and
+>   `locus_record` aggregates per-read outcomes into the locus evidence record
+>   (storage revised to **all-CSR** — no histogram/weight; renormalized profiles).
+>   `fetch_reads` started with the net-new per-locus reservoir (Algorithm R +
+>   deterministic per-locus seed). Next: the `fetch_reads` I/O driver
+>   (catalog-walk + `query`) + the driver + the container writer — the remaining
+>   pieces all converge on the container. **Container refactor (§10) — step 1a
+>   landed:** the `.psp` **writer** is now parameterized on a `PspKind` trait
+>   (new [src/psp/kind.rs](src/psp/kind.rs): `PspKind` + `BlockAccumulator`),
+>   with `SnpKind`/`SnpBlock` as the only impl and `PspWriter<W, S = SnpKind>`
+>   keeping all call sites unchanged. The flush/encode machinery is generic
+>   over `S` (iterates `S::columns()`/`S::encode_column`); record ingest +
+>   validation stays SNP-concrete (fork §10.7-Q1 resolved = trait + shared
+>   generic functions).
+>   **Step 1b landed (reader's typed path, symmetric with the writer):** new
+>   `BlockDecoder` trait (mirror of `BlockAccumulator`) + `PspKind::Decoder` +
+>   `record_coord`; `RecordsIter<'r, R, S = SnpKind>` now drives block framing +
+>   shared decompression and delegates the column→record decode to
+>   `SnpDecoder` (which wraps the **unchanged** `decode_block_payload` + the
+>   cross-block CSR scratch). The cohort columnar path
+>   (`BlockColumnReader`/`BlockColumns`/two-phase) is untouched. Verified
+>   **byte-identical** produced `.psp` vs pre-refactor baseline `aa6a105` (writer
+>   unchanged) + record-level round-trip through the generalized reader; 1133 lib
+>   tests + SNP e2e green. Reports:
+>   [1a](ia/reports/implementations/psp_container_generalization_step1a_2026-06-15.md),
+>   [1b](ia/reports/implementations/psp_container_generalization_step1b_2026-06-15.md).
+>   **Step 2 landed (`kind` header tag, §10.3):** writer emits `kind = "snp"`
+>   (`SnpKind::KIND` = `registry::SNP_KIND`); reader selects the column registry
+>   via `registry::columns_for_kind(kind)` (new `PspReadError::UnknownKind`) and
+>   `cross_check_against_registry` validates against the kind-selected registry
+>   (no longer hardcoded `V1_0_COLUMNS`). Header build parameterized on
+>   `(kind, columns)` with SNP-default wrappers; pre-tag `.psp` files default to
+>   `"snp"` (back-compat). **This step intentionally changes the produced `.psp`
+>   (adds the `kind` line) — gate is round-trip + e2e + back-compat, not
+>   byte-identity.** 1136 lib tests (+3 kind tests) + e2e green; report
+>   [2](ia/reports/implementations/psp_container_generalization_step2_2026-06-15.md).
+>   **Step 3 landed (interval region query, §10.5):** the per-record region
+>   clamp is now interval-based — `PspKind::record_coord` → `record_interval`
+>   (`chrom, start, end`); SNP = degenerate point `(chrom, pos, pos+1)`, so
+>   behaviour is identical. The block-index overlap + `last_pos` fill were
+>   already interval-shaped (no writer/index change), so the produced `.psp` is
+>   **byte-identical to step 2**. 1136 lib tests + region-clamp e2e green; report
+>   [3](ia/reports/implementations/psp_container_generalization_step3_2026-06-15.md).
+>   **Steps 4+5 landed — the §10 container refactor is COMPLETE.** New
+>   [src/psp/registry_ssr.rs](src/psp/registry_ssr.rs): the second `PspKind`
+>   (`ssr`) — `SSR_COLUMNS` + `SsrColumnKey` + chrom_id-keyed `SsrLocusRecord` +
+>   `SsrKind`/`SsrBlock`/`SsrDecoder`. The all-CSR profiles map onto the SNP
+>   2-level shape (locus=record, spanning-profile=entry, `n-spanning` groups;
+>   `amb-lengths` u16 + `amb-logliks` f32 parallel per-profile CSR). Two SNP
+>   leaks fixed to host a 2nd schema, both verified **SNP-byte-identical**:
+>   `ColumnDef.key` removed (schema-agnostic; each schema dispatches via its own
+>   `from_tag`), and the `n_total_alleles >= n_records` block-header invariant
+>   relaxed (SSR loci can have 0 spanning profiles). Writer gained a generic
+>   `open` + `new_ssr*` + `write_locus`; reader gained `records_of::<S>()`.
+>   Round-trip test writes a multi-block `.ssr.psp` and reads it back equal.
+>   1138 lib tests + e2e green; report
+>   [4+5](ia/reports/implementations/psp_container_generalization_step4_2026-06-15.md).
+>   Container done; **§10 code review complete (2026-06-15)** —
+>   [psp_container_generalization_2026-06-15.md](doc/devel/reports/reviews/psp_container_generalization_2026-06-15.md):
+>   **Approve-with-changes** (0 Blockers, 5 Major, 11 Minor + Nits; gates all
+>   green — fmt/clippy `-D warnings`/doc clean, 1138 lib tests). SNP path
+>   verified sound (all 5 byte-identity/behaviour claims confirmed by
+>   refactor_safety); every Major is in the unshipped SSR schema and must be
+>   fixed before the Stage-1 driver lands — **M1** SSR write-then-can't-read
+>   round-trip break (exclusive `last_pos` vs reader's `last_pos <= chrom.length`
+>   on an end-of-contig locus), **M2** missing `sum(n_spanning) == n_total_alleles`
+>   check (silent profile loss on corrupt input), **M3** SSR structural errors
+>   mislabeled as `Io` (6-category convergent), **M4** `records_of::<S>` lacks an
+>   `S::KIND == header.kind` guard (silent cross-schema misdecode), **M5**
+>   `from_tag` array weakens the M4 compile-time exhaustiveness the docs claim.
+>   **§10 review fixes applied (2026-06-15)** —
+>   [fixes_applied_2026-06-15.md](doc/devel/reports/reviews/fixes_applied_2026-06-15.md):
+>   all 5 Majors + 9 Minors **Applied** (M1 inclusive `last_pos`; M2/M3 typed
+>   `BlockStructureInvalid`/`SsrProfileCountMismatch`; M4 poison-on-`KindMismatch`
+>   [user]; M5 `column_key!` macro [user]; Mi3 mandatory `kind` [user]; Mi2/Mi5–Mi11).
+>   **Deferred:** Mi1 (broad `n_total_alleles`→`n_entries` rename), Mi4
+>   (kind-taxonomy module move), 4 readability Nits, and the M2/M3/Mi9
+>   malformed-block rejection tests (need a raw-block fixture the writer can't
+>   emit). Gates green: fmt/clippy `-D warnings`/doc clean, 1142 lib tests
+>   (+4 new); `cargo audit` unavailable in-container; perf check skipped
+>   (no pre-fix baseline). Remaining SSR Stage-1 work tracked in
+>   [ssr_stage1_remaining.md](doc/devel/implementation_plans/ssr_stage1_remaining.md)
+>   (running checklist: Stage 0 catalog check →
+>   `fetch_reads` I/O driver → Stage-1 driver + name→chrom_id adapter + header
+>   build → `ssr-pileup` CLI → parallelism).
+>   **Then: Stage 0 `ssr-catalog` started — format I/O layer (2026-06-15)**:
+>   new [src/ssr/catalog/](src/ssr/catalog/) (`io.rs` + `mod.rs`) — the catalog
+>   wire format (`CatalogHeader`/`CatalogWriter`/`CatalogReader`, bgzip TSV,
+>   `Locus`⇄row, 6 round-trip tests; 1148 lib tests, gates green). Report
+>   [ssr_catalog_io_2026-06-15.md](ia/reports/implementations/ssr_catalog_io_2026-06-15.md).
+>   **Then: `postprocess.rs` + `trf::TrfRecord` (2026-06-15)** — the per-contig
+>   pipeline (period≤6 → drop-compound → drop-bundle → end-trim → purity →
+>   embed-`ref_seq`; faithful GangSTR `minimal_trim`/`remove_bundles` port; 11
+>   tests; 1159 lib tests, gates green). Report
+>   [ssr_catalog_postprocess_2026-06-15.md](ia/reports/implementations/ssr_catalog_postprocess_2026-06-15.md).
+>   **trf-mod now installed in the dev container** (`build(container)` commit;
+>   `/usr/local/bin/trf-mod`, lh3 @ `3e891db`). **Then: `trf.rs` spawn/parse
+>   (2026-06-15)** — `locate_trf_mod`/`version`/`run_on_contig` (temp-file
+>   spawn, no pipes)/`parse_bed_line` (10-col BED pinned against
+>   `trf_print_bed`); 4 tests incl. a live trf-mod integration run; 1163 lib
+>   tests, gates green. Report
+>   [ssr_catalog_trf_2026-06-15.md](ia/reports/implementations/ssr_catalog_trf_2026-06-15.md).
+>   **Then: `run()` orchestrator — sequential (2026-06-15)** — streams the
+>   reference (noodles-fasta) → trf → `build_loci` → `CatalogWriter`;
+>   whole-reference md5; unified `CatalogParams` (defaults pinned); end-to-end
+>   test drives real trf-mod; 1164 lib tests, gates green. Report
+>   [ssr_catalog_orchestrator_2026-06-15.md](ia/reports/implementations/ssr_catalog_orchestrator_2026-06-15.md).
+>   **Homopolymer-bundling decision RESOLVED (2026-06-16, PM): drop period-1**
+>   (GangSTR/HipSTR; target = di/tri/tetra microsatellites) — applied
+>   (`MIN_PERIOD = 2`); catalog is now period 2..=6 (an arch-§4 doc amendment is
+>   owed). **Then: `ssr-catalog` CLI subcommand (2026-06-16)** — `SsrCatalogArgs`
+>   + `run_ssr_catalog` into `PopVarCallerCommand` + `main.rs`; **Stage 0 usable
+>   end-to-end** (verified: `--help` + a synthetic-reference build → correct
+>   catalog, no period-1 survivors); 1167 lib tests, gates green. Report
+>   [ssr_catalog_cli_2026-06-16.md](ia/reports/implementations/ssr_catalog_cli_2026-06-16.md).
+>   Stage-0 follow-ups (non-blocking optimizations): per-contig rayon fan-out,
+>   the CSI index.
+>   Off-ladder + measured fast path + spec §4.3 amendment deferred.
+> - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
+>   Applied the `ssr_types` code review
+>   ([fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md)):
+>   all 9 findings resolved — **B1** (drop intra-doc-link brackets → `cargo doc`
+>   gate restored); **M1** (private `Locus` fields + validated `Locus::new` /
+>   typed `LocusError` checking coord ordering, ref-bytes bounds, and finite
+>   purity ∈ [0,1]) + 10 new boundary/error tests; Minors **Mi1** (`MotifError`
+>   `#[non_exhaustive]` + named field), **Mi2** (Eq/Hash zeroed-tail guard +
+>   hashing test), **Mi3** (`tract_range` dedup), **Mi4** (`MAX_MOTIF_LEN`
+>   source doc), **Mi5** (`pub(crate)` surface, with a temporary module
+>   `#![allow(dead_code)]` until Stage 0 consumers exist); Nits accounted for.
+>   `cargo doc`/ssr clippy/fmt clean; 1039 lib tests pass (the 2 pre-existing
+>   heavy `vcf::record_encode` i32-overflow tests are out-of-scope/slow and were
+>   skipped). Next: build Stage 0 (`ssr-catalog`).
+> - **Prior task (2026-06-12):** **SSR caller — Phase 0 + code review.**
+>   First SSR code: the shared domain types `Motif`/`Locus`
+>   ([src/ssr/types.rs](src/ssr/types.rs), commit `74b5a2d`), then a code review
+>   (rust-code-review skill, 8 categories) →
+>   [ssr_types_2026-06-12.md](doc/devel/reports/reviews/ssr_types_2026-06-12.md):
+>   **Request-changes** (1 Blocker = broken `cargo doc` gate; 1 Major = `Locus`
+>   invariant unenforced → release-mode panic; 5 Minor + missing tests). Tracked
+>   under the *SSR/STR caller* section below.
+> - **Merged from `main` (2026-06-16):** **Segment read fetcher — review
+>   fixes applied** (`src/bam/segment_reader.rs`). The shared pool-backed
+>   indexed-segment read source the SSR Stage-1 fetcher builds on. All 6
+>   Majors from the same-day review Applied (Mutex-poison recovery, explicit
+>   format/index mismatch arms, shared BAM/CRAM filter chokepoint, CRAM
+>   container early-stop, narrow `SegmentReadFilter`, report-location
+>   convention) plus 2 Minors; 1059 lib + integration tests pass. Fix report:
 >   [fixes_applied_2026-06-16.md](doc/devel/reports/reviews/fixes_applied_2026-06-16.md);
 >   review: [segment_reader_2026-06-16.md](doc/devel/reports/reviews/segment_reader_2026-06-16.md);
 >   impl: [segment_read_fetcher_2026-06-16.md](doc/devel/reports/implementations/segment_read_fetcher_2026-06-16.md).
 >   Also fixed the report-path convention across the four report-writing
 >   skills on `main` (`8c32b00`).
-> - **Previously (2026-06-08):** **Code review of `src/var_calling/`**
+> - **Prior task (2026-06-08):** **Code review of `src/var_calling/`**
 >   (orchestrator skill, 10 categories; `main` @ `35a6b67`; the re-architected
 >   record-streaming pipeline, excluding the PM-deferred `posterior_engine`
 >   module) —
@@ -894,6 +1060,64 @@ EM over merged records → final multi-sample VCF.
 - **Open:** evaluation methodology pinned in the plan; needs the
   exact-math engine bench numbers before deciding which candidates
   to land.
+
+---
+
+## SSR/STR caller (independent pipeline)
+
+A second, independent caller — microsatellite/STR **length** genotyping from
+aligned reads — sharing only low-level alignment I/O and a few numerical kernels
+with the SNP caller above, never its records or math. Mirrors the SNP shape:
+`ssr-catalog → catalog → ssr-pileup → .ssr.psp → ssr-call → VCF`. Design:
+[ssr_genotyping.md](doc/devel/specs/ssr_genotyping.md) (model + why) and the
+architecture docs ([overall](doc/devel/architecture/ssr_genotyping_architecture.md),
+[shared types](doc/devel/architecture/ssr_shared_types.md),
+[Stage 0 catalog](doc/devel/architecture/ssr_catalog.md)). Decision E and the
+type model are settled; built in data-flow order (types → Stage 0 → Stage 1/2).
+
+### Stage 0 — `ssr-catalog` (reference → catalog)
+
+#### Shared domain types (`src/ssr/types.rs`)
+- **Status:** fixes-applied
+- **Design:** [ssr_shared_types.md](doc/devel/architecture/ssr_shared_types.md)
+- **Code:** [src/ssr/types.rs](src/ssr/types.rs), [src/ssr/mod.rs](src/ssr/mod.rs) (commit `74b5a2d`; no separate impl report — commit message carries context)
+- **Tests:** 16 unit tests in the module (6 original + 10 boundary/error tests from the fix run)
+- **Latest review:** [ssr_types_2026-06-12.md](doc/devel/reports/reviews/ssr_types_2026-06-12.md) — Request-changes (1 Blocker, 1 Major, 5 Minor + missing tests)
+- **Latest fixes-applied:** [fixes_applied_2026-06-12.md](doc/devel/reports/reviews/fixes_applied_2026-06-12.md) — **Completed**: all 9 findings resolved (B1 + M1 + Mi1–Mi5 Applied; Nit1 kept; Nit2 already consistent). M1 → private `Locus` fields + validated `Locus::new`/`LocusError`; Mi5 → `pub(crate)` surface (with a temporary module `#![allow(dead_code)]` until Stage 0 consumers land). `cargo doc`/ssr clippy/fmt clean; 1039 lib tests pass.
+- **Open:**
+  - Remove the temporary `#![allow(dead_code)]` in `src/ssr/mod.rs` once `ssr-catalog` (Stage 0) wires these types up (tracked as Mi5 follow-up in the fix report).
+
+#### Catalog builder (`src/ssr/catalog/`) — *planned*
+- **Status:** planned
+- **Plan:** [ssr_catalog.md](doc/devel/implementation_plans/ssr_catalog.md) (implementation sketch: files, structs, fn signatures)
+- **Notes:** detector = lh3/TRF-mod (shell-out via temp files, no FFI), genome-wide; post-process drops compound/bundled loci (GangSTR-style, no split); worker-per-contig with an ordered collector; `--num-chroms-in-parallel` is a speed⇄RAM knob.
+
+### Stage 1 — `ssr-pileup` (per-sample evidence extraction)
+
+#### `ssr-pileup` stage
+- **Status:** in-flight
+- **Architecture:** [ssr_pileup.md](doc/devel/architecture/ssr_pileup.md) (every structural question decided)
+- **Plan:** [ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md) (implementation sketch: build order, modules, structs, fn signatures)
+- **Build order:** (1) allele types in `types.rs` → (2) lift `normalize_alleles` to `src/norm_seqs/` → (3) container SSR schema → (4) stage modules (`count_repeats` → `pair_hmm` → `candidate_generation` → `triage` → `fetch_reads` → `mod`).
+- **Impl reports:**
+  - Task 1 — allele representation (`Allele`/`NormalizedSeq` + `to_sequence`/`repeat_count`) in [src/ssr/types.rs](src/ssr/types.rs): [ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)
+  - Task 2 — lift `normalize_alleles` (+ `IndexRange`) to the shared [src/norm_seqs.rs](src/norm_seqs.rs); SNP CIGAR path ([src/pileup/walker/indel_norm.rs](src/pileup/walker/indel_norm.rs)) now wraps the kernel. Behaviour-preserving; full lib suite green: [ssr_pileup_task2_norm_seqs_lift_2026-06-15.md](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)
+  - Fast-path counter (reordered ahead of task 3) — `count_pure_tiling` core in [src/ssr/pileup/count_repeats.rs](src/ssr/pileup/count_repeats.rs); needs only `types`. Triage-typed wrapper deferred. [ssr_pileup_count_repeats_2026-06-15.md](ia/reports/implementations/ssr_pileup_count_repeats_2026-06-15.md)
+  - Slow-path forward — `forward` + `HmmModel` + `PairHmmScratch` in [src/ssr/pileup/pair_hmm.rs](src/ssr/pileup/pair_hmm.rs); 3-state log-space pair-HMM, Dindel emission. Constant gap-open (homopolymer-indexed table deferred) + unbanded (banding deferred), both calibration per arch §14. [ssr_pileup_pair_hmm_2026-06-15.md](ia/reports/implementations/ssr_pileup_pair_hmm_2026-06-15.md)
+  - Candidate generation Job 1 — `CandidateAllele` + `build_rungs` (on-ladder rungs `left_flank + motif×L + right_flank`) in [src/ssr/pileup/candidate_generation.rs](src/ssr/pileup/candidate_generation.rs); composes `Allele::to_sequence`. Job 2 (off-ladder normalization) deferred pending a contract decision. [ssr_pileup_candidate_generation_2026-06-15.md](ia/reports/implementations/ssr_pileup_candidate_generation_2026-06-15.md)
+  - `score_candidates` in [src/ssr/pileup/pair_hmm.rs](src/ssr/pileup/pair_hmm.rs) — joins `build_rungs` + `forward` into the dense per-read `Qᵣ` (one `(allele, log-lik)` per candidate, raw scores; pruning/renorm is the aggregator's job). Small addition, context in commit; 2 added tests.
+  - Candidate generation Job 2 — `build_offladder` + `normalize_offladder` (off-ladder candidates) in [src/ssr/pileup/candidate_generation.rs](src/ssr/pileup/candidate_generation.rs); contract A + B1, canonical form is the **verbatim full tract** (left-alignment is provably a no-op on a full-tract key; clean flanks). **`norm_seqs` not needed for B1** — task-2's second consumer doesn't materialize. `candidate_generation` now complete. [ssr_pileup_candidate_generation_job2_2026-06-15.md](ia/reports/implementations/ssr_pileup_candidate_generation_job2_2026-06-15.md)
+- **Open:**
+  - **Task 3 (container generalization, arch §10) deferred by choice** — a large multi-step refactor of the production `.psp` writer (58KB) + reader (136KB); gates the `.ssr.psp` writer/round-trip but not the stage's compute modules. Trait-vs-builders fork (§10.7 Q1) still to be decided at its step 1.
+  - `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs`. The SSR off-ladder adapter onto `norm_seqs` lands with `candidate_generation` (first consumer beyond the SNP path).
+  - **Architecture revised (2026-06-15): realign-everything** — v1 realigns every spanning read (pair-HMM), dropping the CIGAR-trusting two-tier fast/slow gate; the direct-count fast path (`count_repeats`, built + parked) becomes a **measured optimization the user requires be tried**. Docs amended: arch `ssr_pileup.md` §2/§14, plan §4.
+  - `triage` complete (realign-everything) — `find_longest_stretch` pre-probe + `read_footprint`/`brackets`/`extract_region`/`triage_read` in [src/ssr/pileup/triage.rs](src/ssr/pileup/triage.rs): coverage classification (footprint position + clips, no flank-byte match) → region extract → window centre. Read seam = `MappedRead`. Recovers soft-clipped long alleles via the clip-included pre-probe (test: mapper's 3 units → true 6). 22 tests. [ssr_pileup_triage_2026-06-15.md](ia/reports/implementations/ssr_pileup_triage_2026-06-15.md)
+  - Per-read analysis wired — `analyze_read` + `ReadOutcome` in [src/ssr/pileup/read_analysis.rs](src/ssr/pileup/read_analysis.rs): composes `triage_read` → `build_rungs` → `score_candidates` → dense `Qᵣ` (Spanning) / Flanking / InRepeat. Reuses scratch buffers. Integration-tested incl. the realign-everything win (soft-clipped 6-unit allele the mapper called as 3 → ranks rung 6). 4 tests. Off-ladder candidate generation deferred (needs anchored observed-tract isolation; rare). Context in commit.
+  - `locus_record` aggregation — `aggregate` + `SsrLocusRecord` + `QcCounts` in [src/ssr/pileup/locus_record.rs](src/ssr/pileup/locus_record.rs). **Storage model revised → all-CSR** (no histogram, no weight): every spanning read stored as one pruned + renormalized `Qᵣ` profile; `AMB_LL_DROP` pruning; renormalize provably lossless (`Z_r` cancels); derive `n_spanning`/`n_flanking`/`n_frr`, take `depth`/`n_filtered`/`mapped_reads`; drop vestigial `n_flank_indel`. In-memory (CSR flattening = deferred container's job). Diverges from spec §4.3 (amend). 6 tests. [ssr_pileup_locus_record_2026-06-15.md](ia/reports/implementations/ssr_pileup_locus_record_2026-06-15.md)
+  - `fetch_reads` started — the per-locus depth cap: `Reservoir<T>` (Algorithm R) + deterministic `locus_seed(chrom, start)` (FNV-1a) + inline `SplitMix64` PRNG, in [src/ssr/pileup/fetch_reads.rs](src/ssr/pileup/fetch_reads.rs). Net-new (SNP has only a column cap); byte-identity-critical (deterministic seed + caller's fixed read order, §8.3/§8.4). `MAX_READS_PER_LOCUS=1000` placeholder. 6 tests. Context in commit.
+  - **Container generalization** (the deferred §10 refactor — gates Stage-1 output): implementation sketch written, [psp_container_generalization.md](doc/devel/implementation_plans/psp_container_generalization.md) — `PspSchema` trait (or two-builders, decide at step 1), 5-step sequence (parameterize → `kind` tag → interval index → `registry_ssr`+`SsrLocusRecord` → round-trip), SNP e2e as the gate each step. Reconciles with all-CSR (SSR table = `amb_*` CSR + QC scalars, no `hist_*`). Next: step 1 (writer parameterization, SNP-only).
+  - Stage modules still to build (need the container writer / real I/O): the `fetch_reads` catalog-walk + `query` driver (mirror SNP `run_pileup`: load handles once, share repo, clear per contig) + admission gate (reuse triage footprint) + bundles; the driver (`mod.rs run()`); the container schema/writer (deferred refactor — flattens `SsrLocusRecord` profiles → CSR). Single-threaded semantics first, then the fetcher-thread/pool (determinism-gated). Deferred: off-ladder wiring; the measured `count_repeats` fast-path shortcut.
+  - `pair_hmm` follow-ups: homopolymer-indexed gap-open + banding (calibration/optimization, arch §14).
 
 ---
 

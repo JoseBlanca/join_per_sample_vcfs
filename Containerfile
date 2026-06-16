@@ -98,6 +98,21 @@ RUN apt-get update \
     && ldconfig \
     && rm -rf /tmp/coz /var/lib/apt/lists/*
 
+# TRF-mod (lh3): Tandem Repeats Finder with a BED-like output format — the
+# SSR caller's Stage 0 (`ssr-catalog`) detection engine, shelled out per
+# contig (see doc/devel/architecture/ssr_catalog.md §2). Single-file C build
+# (`make -f compile.mak`, only build-essential needed), pinned to the commit
+# the project vendors under TRF-mod/ so the catalog header's recorded
+# `trf_mod_version` is reproducible. Installs to /usr/local/bin/trf-mod (on
+# PATH for the catalog's layered binary discovery). Own layer so it does not
+# invalidate the slow cargo-install / GATK layers above.
+ARG TRF_MOD_COMMIT=3e891db310124f7e5f7a630a1c006650be9d1f3a
+RUN git clone https://github.com/lh3/TRF-mod /tmp/trf-mod \
+    && git -C /tmp/trf-mod checkout "${TRF_MOD_COMMIT}" \
+    && make -C /tmp/trf-mod -f compile.mak \
+    && install -m 0755 /tmp/trf-mod/trf-mod /usr/local/bin/trf-mod \
+    && rm -rf /tmp/trf-mod
+
 # Claude Code CLI, used when the container hosts an agent session.
 RUN npm install -g @anthropic-ai/claude-code
 

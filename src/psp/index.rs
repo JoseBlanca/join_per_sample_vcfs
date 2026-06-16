@@ -22,6 +22,15 @@ use super::varint::{decode_u64_leb128, encode_u64_leb128};
 
 /// One block's coordinate-keyed index entry.
 ///
+/// `first_pos` is record 0's position; `last_pos` is the block's
+/// **maximum (inclusive) end coordinate** — the largest reference
+/// position any record in the block touches. For the SNP schema records
+/// are points, so `last_pos` is the last record's start; for an
+/// interval schema (SSR) it is `max(record.end)` over the block
+/// (architecture §10.5). A region query `[start, end]` overlaps the
+/// block iff `first_pos <= end && last_pos >= start`
+/// (see `find_first_overlapping_block`).
+///
 /// Field widths match the on-disk schema: `chrom_id`, `first_pos`,
 /// `last_pos`, `n_records` are written as varints (so they may grow
 /// in future format versions) but are bounded to fit in `u32` at

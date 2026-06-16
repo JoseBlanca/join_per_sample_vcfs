@@ -927,12 +927,16 @@ fn validate_block_header_invariants(header: &BlockHeader) -> Result<(), BlockHea
     if header.n_records == 0 {
         return Err(BlockHeaderInvariantKind::EmptyBlock);
     }
-    if header.n_total_alleles < header.n_records {
-        return Err(BlockHeaderInvariantKind::AllelesLessThanRecords {
-            n_records: header.n_records,
-            n_total_alleles: header.n_total_alleles,
-        });
-    }
+    // NOTE: `n_total_alleles >= n_records` is **not** a universal
+    // container invariant — it is a SNP semantic (every record carries
+    // ≥1 allele). The SSR schema legitimately stores loci with zero
+    // spanning-read profiles, so `n_total_alleles < n_records` is valid
+    // there. SNP integrity is enforced where it belongs: the writer
+    // rejects zero-allele records (`validate_record`) and the reader
+    // cross-checks per-allele column counts against `n_total_alleles`.
+    // The `AllelesLessThanRecords` variant is retained for compatibility
+    // but no longer raised by the generic header validator.
+    //
     // Manifest tags strictly ascending, no duplicates.
     for w in header.manifest.windows(2) {
         if w[0].tag >= w[1].tag {
@@ -1456,20 +1460,20 @@ mod tests {
         assert!(matches!(err, BlockHeaderInvariantKind::EmptyBlock));
     }
 
+    /// `n_total_alleles < n_records` is **allowed** by the generic
+    /// header validator — it is a SNP semantic, not a container one, and
+    /// the SSR schema stores loci with zero per-record entries (no
+    /// spanning profiles). The header must encode/decode round-trip.
     #[test]
-    fn block_header_rejects_n_total_alleles_less_than_n_records() {
+    fn block_header_allows_fewer_entries_than_records() {
         let mut header = sample_block_header();
         header.n_records = 100;
         header.n_total_alleles = 99;
         let mut buf = Vec::new();
-        let err = encode_block_header(&header, &mut buf).unwrap_err();
-        assert!(matches!(
-            err,
-            BlockHeaderInvariantKind::AllelesLessThanRecords {
-                n_records: 100,
-                n_total_alleles: 99,
-            }
-        ));
+        encode_block_header(&header, &mut buf).expect("fewer entries than records is valid");
+        let (decoded, _) = decode_block_header(&buf).expect("decodes");
+        assert_eq!(decoded.n_records, 100);
+        assert_eq!(decoded.n_total_alleles, 99);
     }
 
     #[test]
