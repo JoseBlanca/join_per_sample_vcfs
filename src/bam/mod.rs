@@ -44,3 +44,8 @@ pub mod index_preflight;
 // scanners' decode helpers; adds reader ownership + a pool. Consumed
 // by the SSR Stage-1 fetcher (and, later, the SNP `--regions` path).
 pub(crate) mod segment_reader;
+// The multi-file coordinate merge over `segment_reader` — one sample's
+// per-file segment streams k-way-merged into the coordinate-sorted stream
+// the pileup walker consumes. Increment #5 (SNP `--regions` retrofit); no
+// production consumer until `run_pileup` is flipped onto it.
+pub(crate) mod segment_merge;
