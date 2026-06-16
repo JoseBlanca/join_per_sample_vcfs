@@ -40,8 +40,14 @@ use super::locus_record::{QcCounts, SsrLocusRecord, aggregate};
 use super::pair_hmm::{HmmModel, PairHmmScratch};
 use super::read_analysis::analyze_read;
 
-/// Errors from the Stage-1 driver. More variants (catalog read, container
-/// write, header build) land with the `run()` loop in the next increment.
+/// Default `analyze_read` candidate half-width (rungs): the pair-HMM scores
+/// `observed_count ± DEFAULT_WINDOW` on-ladder lengths per spanning read. A
+/// **calibration** placeholder (arch §14), like `MAX_READS_PER_LOCUS` /
+/// `MIN_FLANK_BP` — wide enough to bracket genuine stutter/length variation
+/// around the content pre-probe's estimate without inflating per-read work.
+pub(crate) const DEFAULT_WINDOW: u16 = 10;
+
+/// Errors from the Stage-1 driver.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum SsrPileupError {
