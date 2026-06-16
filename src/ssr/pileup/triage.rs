@@ -245,6 +245,35 @@ pub(crate) fn triage_read(read: &MappedRead, locus: &Locus) -> TriageResult {
     }
 }
 
+/// The fetcher's cheap coordinate-reach admission gate (arch §3.1): could this
+/// read plausibly *span* the locus, decided from the footprint alone — no
+/// sequence scan? The depth cap (arch §8.3) runs in the fetcher's single pass,
+/// so the reads it admits should already be plausible spanning evidence;
+/// otherwise the cap budget is spent on reads the worker will discard and a
+/// messy high-depth locus loses its real spanning reads to eviction.
+///
+/// - A **soft-clipped** read is **always** admitted — the clip may carry a long
+///   allele's far flank that the aligned span does not reach, and only the
+///   content scan ([`find_longest_stretch`], in the worker) can tell. Staying
+///   conservative here means the cap never evicts a possible long allele.
+/// - Otherwise, admit only a read whose aligned footprint brackets **both**
+///   tract ends (`MIN_FLANK_BP` each side) — it could be spanning. A non-clipped
+///   read reaching one flank only (flanking) or neither (buried) clearly cannot
+///   span and would just burn a reservoir slot.
+///
+/// This is *not* the full classification — spanning confirmation, soft-clip
+/// recovery, and the flanking / in-repeat split stay in [`triage_read`] in the
+/// worker. Nor is it a QC filter: QC counts are tallied over *all* reads
+/// regardless of this gate (arch §3.3).
+pub(crate) fn reaches_locus(read: &MappedRead, locus: &Locus) -> bool {
+    let fp = read_footprint(&read.cigar, read.pos);
+    if fp.leading_clip > 0 || fp.trailing_clip > 0 {
+        return true;
+    }
+    let (left, right) = brackets(fp, locus);
+    left && right
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +567,39 @@ mod tests {
         // Reaches the left flank, runs off the right without bracketing it.
         let read = mapped_read(6, vec![CigarOp::Match(12)], b"GGGGGCACACAC");
         assert_eq!(triage_read(&read, &locus6()), TriageResult::Flanking);
+    }
+
+    #[test]
+    fn reach_gate_admits_a_spanning_read() {
+        let read = mapped_read(11, vec![CigarOp::Match(18)], b"GGGGGGCACACATTTTTT");
+        assert!(reaches_locus(&read, &locus6()));
+    }
+
+    #[test]
+    fn reach_gate_skips_a_one_end_unclipped_read() {
+        // Brackets the left flank only (Flanking), no clip on the missing
+        // right side → clearly cannot span → skipped.
+        let read = mapped_read(6, vec![CigarOp::Match(12)], b"GGGGGCACACAC");
+        assert!(!reaches_locus(&read, &locus6()));
+    }
+
+    #[test]
+    fn reach_gate_skips_a_buried_unclipped_read() {
+        // Buried mid-tract (ref [17,21)), brackets neither end, no clips → skip.
+        let read = mapped_read(18, vec![CigarOp::Match(4)], b"CACA");
+        assert!(!reaches_locus(&read, &locus6()));
+    }
+
+    #[test]
+    fn reach_gate_always_admits_a_soft_clipped_read() {
+        // Same buried aligned span as above, but a soft-clip the gate must not
+        // second-guess (the clip may carry a long allele) → admitted.
+        let read = mapped_read(
+            18,
+            vec![CigarOp::SoftClip(3), CigarOp::Match(4)],
+            b"NNNCACA",
+        );
+        assert!(reaches_locus(&read, &locus6()));
     }
 
     #[test]
