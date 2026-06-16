@@ -389,7 +389,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             alignment_cfg,
         )?;
 
-        let outputs = super::stage1_pipeline::with_stage1_chain::<RunSummary, PileupCliError, _>(
+        let outputs = super::stage1_pipeline::with_stage1_chain::<_, RunSummary, PileupCliError, _>(
             reader,
             &args.reference,
             &repository,
@@ -400,6 +400,8 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             stage1.baq_chunk_size,
             n_threads,
             stage1.no_baq,
+            &inputs.sample_name,
+            &inputs.contigs,
             |ctx| {
                 drive_region_into_writer(ctx.walker, &mut writer, region.start, region.end)
                     .map_err(PileupCliError::from)
