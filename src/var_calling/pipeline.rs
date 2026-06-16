@@ -639,6 +639,9 @@ fn ref_fetch(
 
 /// Compute the interval's DUST mask (empty when complexity filtering is off),
 /// reusing a per-contig [`ManualEvictChromRefFetcher`].
+// Threads the per-contig fetcher cache + reference + chrom name/length tables
+// + the three complexity knobs; these are distinct concerns, not a cohesive
+// struct, and the fn has two call sites that pass different cache slots (Mi6).
 #[allow(clippy::too_many_arguments)]
 fn dust_mask_for(
     cache: &mut Option<(u32, ManualEvictChromRefFetcher)>,
@@ -794,5 +797,25 @@ mod tests {
         // Two disjoint regions inside one covered interval, each clipped.
         let got = restrict_intervals_to_regions(&[10..50], &[region(12, 15), region(30, 40)]);
         assert_eq!(got, vec![12..16, 30..41]);
+    }
+
+    #[test]
+    fn restrict_intervals_advances_covered_on_end_equals_region_end_excl() {
+        // Mi2: when a covered interval ends exactly at `region_end_excl`,
+        // the `c.end <= region_end_excl` branch must advance the *covered*
+        // pointer (not the region pointer): region [10,20] → end_excl 21,
+        // covered [5,21) overlaps as [10,21); the following covered
+        // interval [21,30) is past the region and yields nothing.
+        let got = restrict_intervals_to_regions(&[5..21, 21..30], &[region(10, 20)]);
+        assert_eq!(got, vec![10..21]);
+    }
+
+    #[test]
+    fn restrict_intervals_one_region_spanning_three_covered_intervals() {
+        // Mi2: a single region wide enough to cover three disjoint covered
+        // intervals clips to all three (the covered pointer advances three
+        // times against one region).
+        let got = restrict_intervals_to_regions(&[10..20, 30..40, 50..60], &[region(5, 100)]);
+        assert_eq!(got, vec![10..20, 30..40, 50..60]);
     }
 }

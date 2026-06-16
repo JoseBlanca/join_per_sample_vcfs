@@ -12,7 +12,9 @@ pub mod estimate_contamination;
 pub mod psp_to_pileup;
 pub mod ssr_catalog;
 pub mod ssr_pileup;
-pub mod stage1_pipeline;
+// Stage-1 pipeline seam — consumed only by `cli::run_pileup` (same crate),
+// so its surface is crate-internal (review Mi10).
+pub(crate) mod stage1_pipeline;
 pub mod var_calling;
 
 pub use batch_assignment::{BatchAssignment, BatchAssignmentError, DEFAULT_BATCH_ID};

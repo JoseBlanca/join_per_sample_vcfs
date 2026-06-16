@@ -306,7 +306,8 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
 
     // 5. Region set: the BED, or one full-length span per contig. The
     //    contig slice index is the `chrom_id` used by the writer and the
-    //    `query` reader, so this preserves the reference's contig order.
+    //    `SegmentMergedReads` reader, so this preserves the reference's
+    //    contig order.
     let region_set = {
         let contig_bounds: Vec<ContigBounds> = header
             .chromosomes
@@ -331,6 +332,17 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             ParameterValue::Integer(region_set.len() as i64),
         );
     }
+    // Announce the resolved analysis mode on stderr so a run is
+    // self-describing without inspecting the .psp header (review Mi4): a
+    // BED restricts to N spans; its absence means the whole genome.
+    match &args.regions {
+        Some(bed_path) => eprintln!(
+            "regions   : {} spans from {}",
+            region_set.len(),
+            bed_path.display()
+        ),
+        None => eprintln!("regions   : whole genome (no --regions BED)"),
+    }
 
     // 6. Open the shared writer on the .tmp path.
     let tmp_path = tmp_path_for(&args.output);
@@ -348,7 +360,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     //
     //    The FASTA repository (CRAM reference resolver + F1/F3
     //    read-reference source) is built **once** here and shared across
-    //    every region, rather than rebuilt inside `query` per region.
+    //    every region, rather than rebuilt per region.
     //    The noodles repository is a whole-contig cache, so a per-region
     //    rebuild reloaded the entire contig for every region on it — the
     //    `--regions` perf/memory regression. `RegionSet` is sorted by
@@ -424,7 +436,6 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             stage1.baq_chunk_size,
             n_threads,
             stage1.no_baq,
-            &inputs.sample_name,
             &inputs.contigs,
             |ctx| {
                 drive_region_into_writer(ctx.walker, &mut writer, region.start, region.end)
@@ -567,7 +578,7 @@ fn build_writer_header(
     sample: &str,
     fasta_path: &Path,
     contigs: &ContigList,
-    cram_paths: &[PathBuf],
+    alignment_paths: &[PathBuf],
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
     block_window_bp: u32,
@@ -598,7 +609,7 @@ fn build_writer_header(
         .parse()
         .map_err(|_| PileupCliError::TimestampFormat)?;
 
-    let input_crams: Vec<String> = cram_paths.iter().map(|p| basename(p)).collect();
+    let input_crams: Vec<String> = alignment_paths.iter().map(|p| basename(p)).collect();
     let input_fasta = basename(fasta_path);
     let mut parameters = effective_parameters(args, block_target_bytes, block_window_bp, n_threads);
     // Record the analysis-regions BED basename when one was supplied, so
@@ -704,9 +715,11 @@ fn effective_parameters(
         "max_active_reads".into(),
         ParameterValue::Integer(args.max_active_reads as i64),
     );
-    // Threads — the resolved budget (explicit `--threads`, else all
-    // logical cores). Read from the flag, not `rayon`, since the staged
-    // pipeline doesn't size a rayon pool.
+    // Threads — the resolved budget passed in by the caller (explicit
+    // `--threads`, else the stage's default; pileup's is
+    // `DEFAULT_PILEUP_THREADS`, not all logical cores). Read from the
+    // flag, not `rayon`, since the staged pipeline doesn't size a rayon
+    // pool.
     p.insert("threads".into(), ParameterValue::Integer(n_threads as i64));
     // PSP writer.
     p.insert(

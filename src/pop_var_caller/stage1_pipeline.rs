@@ -49,20 +49,25 @@ const QUEUE_DEPTH_PER_WORKER: usize = 2;
 use super::cli::PileupCliError;
 use super::cli::error_bridge::ErrorSheddingAdapter;
 
-/// Boxed walker type — uniform across the no-BAQ and BAQ-on branches.
-///
-/// The walker's input iterator is type-erased to a `Box<dyn ...>` so a
 /// A source of `MappedRead`s for the Stage-1 pipeline: a coordinate-sorted
 /// iterator plus the cheap-filter drop tally it accumulated. Implemented by
 /// the pooled
 /// [`SegmentMergedReads`](crate::bam::segment_merge::SegmentMergedReads),
-/// so the pipeline is agnostic to which reader feeds it — the
-/// SNP `--regions` retrofit swaps the reader without touching the BAQ /
-/// walker plumbing.
+/// so the pipeline is agnostic to which reader feeds it — the SNP
+/// `--regions` retrofit swaps the reader without touching the BAQ / walker
+/// plumbing.
+///
+/// This trait is deliberately defined *here*, in the consuming stage, not
+/// beside its sole implementor in `src/bam/`: it is a dependency-inversion
+/// seam — the stage declares the input contract it needs, and a reader
+/// satisfies it. That direction is what lets a test feed synthetic
+/// `MappedRead`s into the BAQ → walker chain without a real BAM/CRAM, and
+/// what would let a second reader plug in (review Mi11: kept as a seam, not
+/// moved).
 ///
 /// `Send` is required because the staged topology moves the source into a
 /// scoped producer thread.
-pub trait MappedReadSource:
+pub(crate) trait MappedReadSource:
     Iterator<Item = Result<MappedRead, AlignmentInputError>> + Send
 {
     /// The reads dropped by the cheap pre-decode filter so far (read after
@@ -78,20 +83,23 @@ impl MappedReadSource for crate::bam::segment_merge::SegmentMergedReads<'_> {
     }
 }
 
-/// single closure type signature covers both branches. The boxing
-/// costs one indirection per `PreparedRead` — invisible against the
-/// HMM / walker bookkeeping the per-record budget already pays.
-pub type Stage1Walker<'a> =
+/// Boxed walker type — uniform across the no-BAQ and BAQ-on branches.
+///
+/// The walker's input iterator is type-erased to a `Box<dyn ...>` so a
+/// single closure type signature covers both branches. The boxing costs
+/// one indirection per `PreparedRead` — invisible against the HMM / walker
+/// bookkeeping the per-record budget already pays.
+pub(crate) type Stage1Walker<'a> =
     PileupWalker<Box<dyn Iterator<Item = PreparedRead> + 'a>, &'a RepositoryRefFetcher>;
 
-/// Context handed to the [`with_stage1_chain`] callback. Contains
-/// the walker (by value — the closure may consume or drive it via
-/// `by_ref`) plus borrowed metadata the caller typically needs for
-/// header building.
+/// Context handed to the [`with_stage1_chain`] callback: the walker
+/// (by value — the closure may consume it or drive it via `by_ref`).
+///
+/// (Sample name / contigs were dropped 2026-06-16: the sole closure
+/// reads only the walker, and the caller already owns that metadata on
+/// its `PileupInputs`; threading it through here was dead weight.)
 pub struct Stage1PipelineContext<'a> {
     pub walker: Stage1Walker<'a>,
-    pub sample_name: &'a str,
-    pub contigs: &'a ContigList,
 }
 
 /// Counter snapshots collected after the closure returns. The fields
@@ -104,9 +112,12 @@ pub struct Stage1RunSummary {
 }
 
 /// Bundle returned by [`with_stage1_chain`]. Carries the closure's
-/// result `R`, the metadata the caller needs (sample name, contigs),
-/// the counter snapshot, and any upstream error stashed by the
-/// error-shedding adapter while the walker was running.
+/// result `R`, the counter snapshot, and any upstream error stashed by
+/// the error-shedding adapter while the walker was running.
+///
+/// (Sample name and contigs are *not* returned: the caller already owns
+/// them on its `PileupInputs` and never read them back off this bundle,
+/// so cloning them per region was dead weight — dropped 2026-06-16.)
 ///
 /// A `stashed_upstream_error` of `Some(_)` paired with `result =
 /// Ok(_)` is the standard "walker exhausted cleanly but the source
@@ -115,21 +126,18 @@ pub struct Stage1RunSummary {
 /// (e.g. delete a half-written output file).
 pub struct Stage1Outputs<R> {
     pub result: R,
-    pub sample_name: String,
-    pub contigs: ContigList,
     pub run_summary: Stage1RunSummary,
     pub stashed_upstream_error: Option<AlignmentInputError>,
 }
 
 /// Build the Stage 1 BAQ → walker chain over an already-opened
 /// `reader` on this function's stack and hand the walker to `f`. After
-/// `f` returns, snapshots `FilterCounts`, `BaqSkipCounts`, sample name
-/// and contigs, plus any stashed upstream error, and returns them
-/// bundled with `f`'s result.
+/// `f` returns, snapshots `FilterCounts`, `BaqSkipCounts`, plus any
+/// stashed upstream error, and returns them bundled with `f`'s result.
 ///
 /// The caller owns reader construction: `run_pileup` opens one
-/// `query()` reader per analysis region and calls this once per region,
-/// reusing the shared PSP writer inside `f`.
+/// `SegmentMergedReads` reader per analysis region and calls this once
+/// per region, reusing the shared PSP writer inside `f`.
 ///
 /// The `walker_fetcher` is built once by the caller and reused across
 /// regions (see `run_pileup`); `reference` is still needed here to build
@@ -139,6 +147,9 @@ pub struct Stage1Outputs<R> {
 /// error-shedding adapter lift into the closure's error type without
 /// changing the caller's surface; `run_pileup`'s closure picks
 /// `E = PileupCliError`.
+// Threads the full read→BAQ→walker configuration plus the caller-injected
+// fetchers; a config-bundle struct would only move the arity to the struct
+// literal at the single call site (review Mi6).
 #[allow(clippy::too_many_arguments)]
 pub fn with_stage1_chain<Rd, R, E, F>(
     mut reader: Rd,
@@ -151,7 +162,6 @@ pub fn with_stage1_chain<Rd, R, E, F>(
     baq_chunk_size: usize,
     n_threads: usize,
     no_baq: bool,
-    sample_name: &str,
     contigs: &ContigList,
     f: F,
 ) -> Result<Stage1Outputs<R>, E>
@@ -198,7 +208,6 @@ where
             baq_chunk_size,
             apply_baq,
             n_threads,
-            sample_name,
             contigs,
             f,
         )
@@ -219,11 +228,7 @@ where
         let error_handle = adapter.error_handle();
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(adapter.by_ref());
         let walker = walker::run(input, walker_fetcher, &walker_cfg);
-        let ctx = Stage1PipelineContext {
-            walker,
-            sample_name,
-            contigs,
-        };
+        let ctx = Stage1PipelineContext { walker };
         let result = f(ctx);
         drop(adapter);
         let stash = error_handle.take();
@@ -241,10 +246,17 @@ where
     // read-processing stage); fold the stage's tallies back in so the
     // run summary's totals match the old serial path exactly. BAQ skip
     // counts only exist when BAQ ran.
+    // Exhaustive destructure of StageCounts (no `..`) so a new field is a
+    // compile error until it is explicitly folded in (review M3, Minor).
+    let StageCounts {
+        baq_skips,
+        bad_cigar,
+        high_mismatch,
+    } = stage_counts;
     let mut filter_counts = reader_filter_counts;
-    filter_counts.bad_cigar += stage_counts.bad_cigar;
-    filter_counts.high_mismatch_fraction += stage_counts.high_mismatch;
-    let baq_skip_counts: Option<BaqSkipCounts> = apply_baq.then_some(stage_counts.baq_skips);
+    filter_counts.bad_cigar += bad_cigar;
+    filter_counts.high_mismatch_fraction += high_mismatch;
+    let baq_skip_counts: Option<BaqSkipCounts> = apply_baq.then_some(baq_skips);
 
     // Surface order: if the closure errored AND the source stream had
     // already failed (the `ErrorSheddingAdapter` translated it to
@@ -258,8 +270,6 @@ where
 
     Ok(Stage1Outputs {
         result: r,
-        sample_name: sample_name.to_string(),
-        contigs: contigs.clone(),
         run_summary: Stage1RunSummary {
             filter_counts,
             baq_skip_counts,
@@ -277,6 +287,8 @@ where
 /// and the reader-level filter counts (recovered from the producer
 /// thread). Byte-identical to the inline path: the reorder buffer
 /// restores global coordinate order before the (serial) walker.
+// Same config-threading rationale as `with_stage1_chain` — one internal
+// call site; a bundle struct would not reduce the real arity (review Mi6).
 #[allow(clippy::too_many_arguments)]
 fn run_pipelined<Rd, R, E, F>(
     mut reader: Rd,
@@ -289,7 +301,6 @@ fn run_pipelined<Rd, R, E, F>(
     baq_chunk_size: usize,
     apply_baq: bool,
     n_threads: usize,
-    sample_name: &str,
     contigs: &ContigList,
     f: F,
 ) -> (
@@ -318,16 +329,20 @@ where
             reader.filter_drop_counts()
         });
 
-        // Worker pool: each pulls packets and runs G2/F3/F1 + BAQ.
-        for _ in 0..n_workers {
-            let prx = pkt_rx.clone();
-            let rtx = res_tx.clone();
-            scope.spawn(move || {
-                run_worker(
-                    prx, rtx, baq_cfg, proc_cfg, apply_baq, repository, reference, contigs,
-                );
-            });
-        }
+        // Worker pool: each pulls packets and runs G2/F3/F1 + BAQ. The
+        // handles are kept (not discarded) so they can be joined
+        // explicitly below — see the join rationale.
+        let workers: Vec<_> = (0..n_workers)
+            .map(|_| {
+                let prx = pkt_rx.clone();
+                let rtx = res_tx.clone();
+                scope.spawn(move || {
+                    run_worker(
+                        prx, rtx, baq_cfg, proc_cfg, apply_baq, repository, reference, contigs,
+                    );
+                })
+            })
+            .collect();
         // Drop the originals so each channel disconnects once the
         // producer / all workers finish.
         drop(pkt_rx);
@@ -337,11 +352,7 @@ where
         let mut reorder = ReorderReadIter::new(res_rx);
         let input: Box<dyn Iterator<Item = PreparedRead> + '_> = Box::new(reorder.by_ref());
         let walker = walker::run(input, walker_fetcher, walker_cfg);
-        let ctx = Stage1PipelineContext {
-            walker,
-            sample_name,
-            contigs,
-        };
+        let ctx = Stage1PipelineContext { walker };
         let result = f(ctx);
         // Walker dropped → `reorder` borrow released. Snapshot the
         // counts, then drop `reorder` (releasing `res_rx`) *before*
@@ -353,6 +364,19 @@ where
         let reader_filter_counts = producer
             .join()
             .expect("read-pipeline producer thread panicked");
+        // Join the workers explicitly, surfacing a worker panic HERE —
+        // before the caller acts on `result` or finalises the output —
+        // rather than relying on `thread::scope` to re-raise it at block
+        // end. A worker that panicked mid-fold drops a sequence number;
+        // `ReorderReadIter` then yields end-of-stream with a GAP once all
+        // senders drop, so the walker closure can return `Ok` over a
+        // *truncated* read stream. The scope's implicit re-raise does
+        // abort before the caller's atomic rename, but that margin is
+        // implicit; joining here makes the panic propagation explicit and
+        // matches the producer / cohort-driver pattern (review M4).
+        for worker in workers {
+            worker.join().expect("read-pipeline worker thread panicked");
+        }
         (result, stage_counts, reader_filter_counts)
     });
 

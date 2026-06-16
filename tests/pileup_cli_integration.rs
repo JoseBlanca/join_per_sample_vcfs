@@ -399,6 +399,46 @@ fn regions_bed_restricts_pileup_to_listed_positions() {
     );
 }
 
+/// M6: the project's determinism gate for the `--regions` path — the
+/// per-region pileup must emit the same records regardless of `--threads`
+/// (the inline path at `< STAGED_MIN_THREADS` vs the staged pipeline at
+/// `>=`). The `.psp` header encodes the resolved thread count, so this
+/// compares the record stream rather than raw file bytes.
+#[test]
+fn regions_pileup_records_are_thread_count_invariant() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+    let records = vec![
+        read_record("r1", 1, b"AAAAA"),
+        read_record("r2", 5, b"AAAAA"),
+        read_record("r3", 10, b"AAAAA"),
+    ];
+    let cram = build_cram(dir.path(), &fasta, "NA12878", Some(fixture_md5()), &records);
+
+    let bed = dir.path().join("regions.bed");
+    std::fs::write(&bed, format!("{CONTIG_NAME}\t4\t9\n")).expect("write bed");
+
+    let run_at = |threads: usize, name: &str| -> Vec<(u32, u32)> {
+        let out = dir.path().join(name);
+        let mut args = default_args(fasta.clone(), out.clone(), vec![cram.clone()]);
+        args.regions = Some(bed.clone());
+        args.threads = Some(threads);
+        run_pileup(&args).expect("region run");
+        psp_records(&out)
+    };
+
+    let inline = run_at(1, "t1.psp"); // inline bulk-synchronous path
+    let staged = run_at(4, "t4.psp"); // staged producer/worker pipeline
+    assert!(
+        !inline.is_empty(),
+        "fixture should emit records inside the region"
+    );
+    assert_eq!(
+        inline, staged,
+        "--regions records must not depend on --threads (determinism gate)"
+    );
+}
+
 /// `--no-baq` path: the pipeline runs with BAQ bypassed. We verify
 /// `WriterProvenance.parameters["baq_enabled"] == Boolean(false)`
 /// and that the .psp still round-trips.

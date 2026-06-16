@@ -255,9 +255,13 @@ impl Iterator for SegmentMergedReads<'_> {
             // 5. Advance the locus, clearing the dedup buffer on a move.
             self.advance_current_locus_if_needed(ref_id, pos);
 
-            // 6. Cross-file duplicate check at the current locus.
+            // 6. Cross-file duplicate check at the current locus. `qname`
+            //    (cloned once at step 3 to release the peek borrow) is only
+            //    borrowed by the step-4 order check above, which has already
+            //    returned on its error path — so it can be *moved* into the
+            //    fingerprint here rather than cloned a second time.
             let new_key = ReadFingerprint {
-                qname: qname.clone(),
+                qname,
                 flag,
                 ref_id,
                 pos,
