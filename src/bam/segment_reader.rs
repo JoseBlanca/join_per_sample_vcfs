@@ -335,6 +335,15 @@ impl AlignmentFile {
             )),
         }
     }
+
+    /// The input file's path — used by the multi-file merge for error
+    /// messages (which file an out-of-order or duplicate read came from).
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Bam(file) => &file.path,
+            Self::Cram(file) => &file.path,
+        }
+    }
 }
 
 /// Validate a caller's `(chrom, start, end)` into a [`ContigInterval`]
