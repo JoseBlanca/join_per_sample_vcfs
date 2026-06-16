@@ -78,13 +78,16 @@ synthetic tests.
      Applied — `MIN_PERIOD = 2`, so period-1 never reaches bundling. *(Arch §4
      keeps "period ≤ 6"; the as-built catalog is period 2..=6 — a §4 doc
      amendment is owed alongside the deferred spec §4.3 amendment.)*
-   - **Per-contig rayon fan-out — NEXT**: bounded pool sized by
-     `--num-chroms-in-parallel`, ordered collector (contig order = sorted). The
-     single-threaded path works; parallelism is the §8 optimization.
-   - **`ssr-catalog` clap subcommand — NEXT**: `SsrCatalogArgs` + `run_ssr_catalog`
-     into `PopVarCallerCommand` (cli.rs) + `main.rs` dispatch + a CLI error type;
-     maps args → `CatalogConfig`, stamps `date`.
-   - `write_index` (CSI) for the `--regions` query path — after the writer.
+   - **`ssr-catalog` clap subcommand — DONE (2026-06-16)**: `SsrCatalogArgs` +
+     `run_ssr_catalog` wired into `PopVarCallerCommand` + `main.rs`; verified
+     end-to-end (`ssr-catalog --help` + a synthetic-reference build → correct
+     catalog, no period-1 survivors). **Stage 0 is usable end-to-end.** Report:
+     [ssr_catalog_cli_2026-06-16.md](../reports/implementations/ssr_catalog_cli_2026-06-16.md).
+   - **Per-contig rayon fan-out — follow-up (optimization)**: bounded pool sized
+     by `--num-chroms-in-parallel`, ordered collector (contig order = sorted).
+     The single-threaded path works; this is the §8 perf lever.
+   - `write_index` (CSI) for the `--regions` query path — after the writer
+     (consumed later by Stage 1's `fetch_reads`).
 
 2. **`fetch_reads` I/O driver** *(the last missing primitive).* Add to
    [`fetch_reads.rs`](../../../src/ssr/pileup/fetch_reads.rs) (reservoir already

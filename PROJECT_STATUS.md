@@ -154,8 +154,13 @@ Skills and agents are instructed to leave it untouched.
 >   **Homopolymer-bundling decision RESOLVED (2026-06-16, PM): drop period-1**
 >   (GangSTR/HipSTR; target = di/tri/tetra microsatellites) — applied
 >   (`MIN_PERIOD = 2`); catalog is now period 2..=6 (an arch-§4 doc amendment is
->   owed). Stage-0 remaining: per-contig rayon fan-out, the `ssr-catalog` clap
->   subcommand, the CSI index.
+>   owed). **Then: `ssr-catalog` CLI subcommand (2026-06-16)** — `SsrCatalogArgs`
+>   + `run_ssr_catalog` into `PopVarCallerCommand` + `main.rs`; **Stage 0 usable
+>   end-to-end** (verified: `--help` + a synthetic-reference build → correct
+>   catalog, no period-1 survivors); 1167 lib tests, gates green. Report
+>   [ssr_catalog_cli_2026-06-16.md](ia/reports/implementations/ssr_catalog_cli_2026-06-16.md).
+>   Stage-0 follow-ups (non-blocking optimizations): per-contig rayon fan-out,
+>   the CSI index.
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

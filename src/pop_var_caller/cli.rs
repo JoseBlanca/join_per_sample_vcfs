@@ -64,6 +64,10 @@ pub enum PopVarCallerCommand {
 
     /// Call SNPs across a cohort: `.psp` files → multi-sample VCF.
     VarCalling(super::var_calling::VarCallingArgs),
+
+    /// SSR Stage 0: detect tandem repeats in a reference and write the
+    /// per-genome SSR locus catalog (a bgzip TSV).
+    SsrCatalog(super::ssr_catalog::SsrCatalogArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the
