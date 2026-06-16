@@ -156,6 +156,23 @@ impl FilterCounts {
         self.bad_cigar += other.bad_cigar;
         self.baq_rejected += other.baq_rejected;
     }
+
+    /// Increment the field a [`classify_pre_decode`] drop falls into.
+    /// The single home for the `FilterBucket` → counter mapping, shared
+    /// by every reader that applies the pre-decode flag/MAPQ filter (the
+    /// merged reader's owned scanners and the segment reader), so the two
+    /// stay in lock-step.
+    pub(super) fn record_drop(&mut self, bucket: FilterBucket) {
+        match bucket {
+            FilterBucket::Unmapped => self.unmapped += 1,
+            FilterBucket::Secondary => self.secondary += 1,
+            FilterBucket::Supplementary => self.supplementary += 1,
+            FilterBucket::QcFail => self.qc_fail += 1,
+            FilterBucket::Duplicate => self.duplicate += 1,
+            FilterBucket::LowMapq => self.low_mapq += 1,
+            FilterBucket::BaqRejected => self.baq_rejected += 1,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
