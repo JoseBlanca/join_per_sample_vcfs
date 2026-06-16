@@ -3,17 +3,19 @@
 //!
 //! The work for **one** locus is a single self-contained unit, [`process_locus`]
 //! — fetch the locus's reads, analyze each, fold them into the locus record. It
-//! is pure over its shared `&` inputs (and [`AlignmentFile`] is `Sync`), so the
-//! eventual parallel step is just `for` → `par_iter().map_init(…)`: each worker
-//! reuses its own [`LocusScratch`], nothing inside the unit changes (arch §8.4).
+//! is pure over its shared `&` inputs (and [`AlignmentFile`] is `Sync`), so
+//! [`run`] processes the catalog in parallel batches: read a batch of loci,
+//! `par_iter().map_init(…)` them across the pool (each worker reuses its own
+//! [`LocusScratch`]), and write the batch in catalog order. Output is
+//! **byte-identical for any thread count** — each locus's reservoir is seeded by
+//! `(chrom, start)` and scored atomically on one thread, and writes stay in
+//! catalog order (arch §8.4).
 //!
-//! **Build status:** Stage 1 is runnable end to end — the per-locus unit
-//! ([`process_locus`], [`LocusScratch`], [`qc_counts`]), the name→chrom_id
+//! **Build status:** Stage 1 is runnable end to end and parallel — the per-locus
+//! unit ([`process_locus`], [`LocusScratch`], [`qc_counts`]), the name→chrom_id
 //! container adapter ([`to_container_record`]), the writer-header build, and the
-//! single-threaded [`run`] loop, wired to the `ssr-pileup` CLI subcommand and
-//! covered by a catalog→reference→BAM→`.ssr.psp` round-trip test. The
-//! worker-pool parallelization (turn the `run` loop's `for` into a
-//! `par_iter().map_init`) is the deferred §8.4 step.
+//! batched-parallel [`run`] loop, wired to the `ssr-pileup` CLI and covered by a
+//! catalog→reference→BAM→`.ssr.psp` round-trip + a thread-count determinism test.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -35,11 +37,20 @@ use crate::ssr::catalog::CatalogError;
 use crate::ssr::catalog::io::{CatalogHeader, CatalogReader};
 use crate::ssr::types::Locus;
 
+use rayon::prelude::*;
+
 use super::candidate_generation::CandidateAllele;
 use super::fetch_reads::{LocusReads, fetch_locus_reads};
 use super::locus_record::{QcCounts, SsrLocusRecord, aggregate};
 use super::pair_hmm::{HmmModel, PairHmmScratch};
 use super::read_analysis::analyze_read;
+
+/// Loci processed per parallel batch. Each batch is read sequentially from the
+/// catalog, processed across the worker pool, and written in catalog order.
+/// Batching bounds in-flight memory (loci + their records) instead of
+/// materializing the whole genome's worth at once, while staying large enough
+/// to amortize scheduling.
+const LOCUS_BATCH: usize = 8192;
 
 /// Default `analyze_read` candidate half-width (rungs): the pair-HMM scores
 /// `observed_count ± DEFAULT_WINDOW` on-ladder lengths per spanning read. A
@@ -68,6 +79,8 @@ pub(crate) enum SsrPileupError {
     ContigLengthOverflow { name: String, length: u64 },
     #[error("could not format the run timestamp")]
     TimestampFormat,
+    #[error("failed to build the worker thread pool")]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
 }
 
 /// Per-locus scratch reused across loci to avoid allocation churn — the
@@ -198,6 +211,9 @@ pub(crate) struct SsrPileupConfig {
     pub build_index_if_missing: bool,
     /// Sample name override; defaults to the one the inputs cross-validate.
     pub sample: Option<String>,
+    /// Worker threads for the per-locus pool. Output is identical for any value
+    /// (per-locus reservoir seeds + catalog-ordered writes).
+    pub threads: usize,
 }
 
 /// Build the `.ssr.psp` writer header — one [`ChromosomeEntry`] per reference
@@ -352,12 +368,39 @@ pub(crate) fn run(cfg: &SsrPileupConfig) -> Result<(), SsrPileupError> {
     let mut writer = PspWriter::<_, SsrKind>::new_ssr(writer_sink, header)?;
 
     let model = HmmModel::default();
-    let mut scratch = LocusScratch::new();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cfg.threads)
+        .build()?;
 
-    while let Some(locus) = catalog.read_locus() {
-        let locus = locus?;
-        let record = process_locus(&files, &locus, cfg.window, cfg.cap, &model, &mut scratch)?;
-        writer.write_locus(&to_container_record(record, &name_to_id)?)?;
+    // Read the sorted catalog in batches; process each batch across the pool
+    // and write it in catalog order. Per-locus reservoir seeds (and the fact
+    // that each locus is scored atomically on one thread) make the output
+    // byte-identical for any thread count; batching bounds in-flight memory.
+    let mut batch: Vec<Locus> = Vec::with_capacity(LOCUS_BATCH);
+    loop {
+        batch.clear();
+        while batch.len() < LOCUS_BATCH {
+            match catalog.read_locus() {
+                Some(locus) => batch.push(locus?),
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        let records: Vec<ContainerRecord> = pool.install(|| {
+            batch
+                .par_iter()
+                .map_init(LocusScratch::new, |scratch, locus| {
+                    let record =
+                        process_locus(&files, locus, cfg.window, cfg.cap, &model, scratch)?;
+                    to_container_record(record, &name_to_id)
+                })
+                .collect::<Result<Vec<_>, SsrPileupError>>()
+        })?;
+        for record in &records {
+            writer.write_locus(record)?;
+        }
     }
 
     // Atomic finish: flush + fsync the temp file, then rename into place.
@@ -494,6 +537,7 @@ mod tests {
             cap: 1000,
             build_index_if_missing: false,
             sample: None,
+            threads: 1,
         }
     }
 
@@ -561,10 +605,12 @@ mod tests {
 
     // --- end-to-end: catalog + reference + BAM -> .ssr.psp ------------
 
-    /// A coordinate-sorted BAM (one contig, `@RG SM`, a trusted `@SQ M5`) with a
-    /// single clean spanning read for a CA(3) locus. `run()` builds the index
-    /// (`build_index_if_missing`), so no `.csi` is written here.
-    fn write_spanning_bam(path: &std::path::Path) {
+    use tempfile::TempDir;
+
+    /// A coordinate-sorted BAM (one contig, `@RG SM`, a trusted `@SQ M5`) with one
+    /// clean spanning read per CA(3) locus at the given ascending tract starts.
+    /// `run()` builds the index (`build_index_if_missing`), so no `.csi` here.
+    fn write_bam_for_loci(path: &std::path::Path, tract_starts: &[u32]) {
         use bstr::BString;
         use noodles_bam as bam;
         use noodles_sam as sam;
@@ -585,104 +631,118 @@ mod tests {
         let mut hd = Map::<HeaderMap>::new(Version::new(1, 6));
         hd.other_fields_mut()
             .insert(SORT_ORDER, BString::from("coordinate"));
-
         let mut sq = Map::<ReferenceSequence>::new(NonZero::new(200usize).unwrap());
         sq.other_fields_mut()
             .insert(MD5_CHECKSUM, BString::from("0".repeat(32)));
-
         let mut rg = Map::<ReadGroup>::default();
         rg.other_fields_mut()
             .insert(SAMPLE, BString::from("sample0"));
-
         let header = sam::Header::builder()
             .set_header(hd)
             .add_reference_sequence(b"chr1".to_vec(), sq)
             .add_read_group(b"rg0".to_vec(), rg)
             .build();
 
-        // Aligned ref [5,35) (pos 6, M30). The locus window is ref [10,28),
-        // which maps to read[5..23] — laid out as the locus's embedded ref:
-        // 6 bp G-flank + CACACA + 6 bp T-flank, padded to 30 bp.
-        let mut seq = Vec::new();
-        seq.extend_from_slice(b"AAAAA");
-        seq.extend_from_slice(b"GGGGGGCACACATTTTTT");
-        seq.extend_from_slice(b"AAAAAAA");
-        assert_eq!(seq.len(), 30);
-        let read = RecordBuf::builder()
-            .set_name(b"r1")
-            .set_reference_sequence_id(0)
-            .set_flags(Flags::default())
-            .set_mapping_quality(MappingQuality::new(60).unwrap())
-            .set_alignment_start(noodles_core::Position::try_from(6).unwrap())
-            .set_cigar([Op::new(Kind::Match, 30)].into_iter().collect())
-            .set_sequence(Sequence::from(seq))
-            .set_quality_scores(QualityScores::from(vec![40u8; 30]))
-            .build();
-
         let mut writer = bam::io::Writer::new(File::create(path).unwrap());
         writer.write_header(&header).unwrap();
-        writer.write_alignment_record(&header, &read).unwrap();
+        for &start in tract_starts {
+            // Tract [start, start+6); window ref [start-6, start+12). The read is
+            // aligned at ref [start-11, start+19) (pos = start-10, M30) so the
+            // window maps to read[5..23] = 6 bp G-flank + CACACA + 6 bp T-flank.
+            let mut seq = Vec::new();
+            seq.extend_from_slice(b"AAAAA");
+            seq.extend_from_slice(b"GGGGGGCACACATTTTTT");
+            seq.extend_from_slice(b"AAAAAAA");
+            let read = RecordBuf::builder()
+                .set_name(format!("r{start}").as_bytes())
+                .set_reference_sequence_id(0)
+                .set_flags(Flags::default())
+                .set_mapping_quality(MappingQuality::new(60).unwrap())
+                .set_alignment_start(
+                    noodles_core::Position::try_from((start - 10) as usize).unwrap(),
+                )
+                .set_cigar([Op::new(Kind::Match, 30)].into_iter().collect())
+                .set_sequence(Sequence::from(seq))
+                .set_quality_scores(QualityScores::from(vec![40u8; 30]))
+                .build();
+            writer.write_alignment_record(&header, &read).unwrap();
+        }
         writer.try_finish().unwrap();
     }
 
-    #[test]
-    fn run_genotypes_one_locus_end_to_end() {
+    /// Reference (fa+fai), a BAM with one spanning read per locus, and a catalog
+    /// with a CA(3) locus per (ascending) tract start. Returns the temp dirs
+    /// (keep alive) + the bam / fasta / catalog paths.
+    fn stage1_fixture(tract_starts: &[u32]) -> (TempDir, TempDir, PathBuf, PathBuf, PathBuf) {
         use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
-        use crate::psp::PspReader;
-        use crate::psp::registry_ssr::SsrKind;
         use crate::ssr::catalog::io::CatalogWriter;
-        use crate::ssr::pileup::fetch_reads::MAX_READS_PER_LOCUS;
         use crate::ssr::types::{Locus, Motif};
-        use tempfile::TempDir;
 
-        let dir = TempDir::new().unwrap();
-        let (_fa_dir, fasta) = build_fasta(&[ContigSpec {
+        let (fa_dir, fasta) = build_fasta(&[ContigSpec {
             name: "chr1".into(),
             length: 200,
         }])
         .unwrap();
-
-        // BAM with one spanning read.
+        let dir = TempDir::new().unwrap();
         let bam = dir.path().join("s.bam");
-        write_spanning_bam(&bam);
+        write_bam_for_loci(&bam, tract_starts);
 
-        // One-locus catalog: CA tract ref [16,22), 6 bp flanks embedded.
-        let locus = Locus::new(
-            "chr1".into(),
-            16,
-            22,
-            Motif::new(b"CA").unwrap(),
-            1.0,
-            (*b"GGGGGGCACACATTTTTT").into(),
-            10,
-        )
-        .unwrap();
         let catalog = dir.path().join("c.ssr.catalog");
-        {
-            let mut w =
-                CatalogWriter::new(File::create(&catalog).unwrap(), &catalog_header()).unwrap();
+        let mut w = CatalogWriter::new(File::create(&catalog).unwrap(), &catalog_header()).unwrap();
+        for &start in tract_starts {
+            let locus = Locus::new(
+                "chr1".into(),
+                start,
+                start + 6,
+                Motif::new(b"CA").unwrap(),
+                1.0,
+                (*b"GGGGGGCACACATTTTTT").into(),
+                start - 6,
+            )
+            .unwrap();
             w.write_locus(&locus).unwrap();
-            w.finish().unwrap();
         }
+        w.finish().unwrap();
+        (fa_dir, dir, bam, fasta, catalog)
+    }
 
-        let output = dir.path().join("out.ssr.psp");
-        let cfg = SsrPileupConfig {
-            alignment_files: vec![bam],
-            reference: fasta,
-            catalog,
-            output: output.clone(),
+    fn read_records(path: &std::path::Path) -> Vec<ContainerRecord> {
+        use crate::psp::PspReader;
+        use crate::psp::registry_ssr::SsrKind;
+        let mut reader = PspReader::new(File::open(path).unwrap()).unwrap();
+        assert_eq!(reader.header().kind, "ssr");
+        reader.records_of::<SsrKind>().map(|r| r.unwrap()).collect()
+    }
+
+    fn run_config(
+        bam: &std::path::Path,
+        fasta: &std::path::Path,
+        catalog: &std::path::Path,
+        output: &std::path::Path,
+        threads: usize,
+    ) -> SsrPileupConfig {
+        use crate::ssr::pileup::fetch_reads::MAX_READS_PER_LOCUS;
+        SsrPileupConfig {
+            alignment_files: vec![bam.to_path_buf()],
+            reference: fasta.to_path_buf(),
+            catalog: catalog.to_path_buf(),
+            output: output.to_path_buf(),
             filter: SegmentReadFilter::default(),
             window: DEFAULT_WINDOW,
             cap: MAX_READS_PER_LOCUS,
             build_index_if_missing: true,
             sample: Some("S1".into()),
-        };
-        run(&cfg).expect("run");
+            threads,
+        }
+    }
 
-        let mut reader = PspReader::new(File::open(&output).unwrap()).unwrap();
-        assert_eq!(reader.header().kind, "ssr");
-        let records: Vec<_> = reader.records_of::<SsrKind>().map(|r| r.unwrap()).collect();
+    #[test]
+    fn run_genotypes_one_locus_end_to_end() {
+        let (_fa, dir, bam, fasta, catalog) = stage1_fixture(&[16]);
+        let output = dir.path().join("out.ssr.psp");
+        run(&run_config(&bam, &fasta, &catalog, &output, 1)).expect("run");
 
+        let records = read_records(&output);
         assert_eq!(records.len(), 1);
         let rec = &records[0];
         assert_eq!(rec.chrom_id, 0);
@@ -698,5 +758,23 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .unwrap();
         assert_eq!(best.0, 3);
+    }
+
+    #[test]
+    fn run_output_is_thread_count_invariant() {
+        // Three loci so batch processing + parallel scheduling actually engage.
+        let (_fa, dir, bam, fasta, catalog) = stage1_fixture(&[16, 66, 116]);
+        let out1 = dir.path().join("t1.ssr.psp");
+        let out3 = dir.path().join("t3.ssr.psp");
+        run(&run_config(&bam, &fasta, &catalog, &out1, 1)).expect("run @ 1 thread");
+        run(&run_config(&bam, &fasta, &catalog, &out3, 3)).expect("run @ 3 threads");
+
+        let r1 = read_records(&out1);
+        let r3 = read_records(&out3);
+        assert_eq!(r1.len(), 3);
+        // Identical records, identical order, regardless of thread count. (Raw
+        // file bytes differ only by the header's `created` timestamp between the
+        // two runs, so we compare the decoded records.)
+        assert_eq!(r1, r3);
     }
 }

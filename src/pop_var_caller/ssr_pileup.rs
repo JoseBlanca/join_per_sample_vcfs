@@ -66,6 +66,11 @@ pub struct SsrPileupArgs {
     /// Per-locus read depth cap (reservoir sampling).
     #[arg(long, default_value_t = MAX_READS_PER_LOCUS, help_heading = "Advanced")]
     pub max_reads_per_locus: usize,
+
+    /// Worker threads for the per-locus pool. The output `.ssr.psp` is identical
+    /// for any value (per-locus reservoir seeds + catalog-ordered writes).
+    #[arg(long, default_value_t = 4, help_heading = "Advanced")]
+    pub threads: usize,
 }
 
 /// Errors from the `ssr-pileup` subcommand.
@@ -100,6 +105,7 @@ fn to_config(args: &SsrPileupArgs) -> SsrPileupConfig {
         cap: args.max_reads_per_locus,
         build_index_if_missing: args.build_index_if_missing,
         sample: args.sample.clone(),
+        threads: args.threads,
     }
 }
 
@@ -138,6 +144,7 @@ mod tests {
                 assert_eq!(a.min_read_length, DEFAULT_MIN_READ_LENGTH);
                 assert_eq!(a.window, DEFAULT_WINDOW);
                 assert_eq!(a.max_reads_per_locus, MAX_READS_PER_LOCUS);
+                assert_eq!(a.threads, 4);
                 assert!(!a.keep_duplicates && !a.keep_qc_fail);
             }
             other => panic!("expected SsrPileup, got {other:?}"),
