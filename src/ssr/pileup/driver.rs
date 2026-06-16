@@ -7,12 +7,13 @@
 //! eventual parallel step is just `for` → `par_iter().map_init(…)`: each worker
 //! reuses its own [`LocusScratch`], nothing inside the unit changes (arch §8.4).
 //!
-//! **Build status:** the per-locus unit ([`process_locus`], [`LocusScratch`],
-//! [`qc_counts`]), the name→chrom_id container adapter ([`to_container_record`]),
-//! the writer-header build, and the single-threaded [`run`] loop are in place.
-//! The thin `ssr-pileup` CLI subcommand (and the end-to-end test that drives
-//! `run` through the binary) land next; the worker-pool parallelization is the
-//! deferred §8.4 step.
+//! **Build status:** Stage 1 is runnable end to end — the per-locus unit
+//! ([`process_locus`], [`LocusScratch`], [`qc_counts`]), the name→chrom_id
+//! container adapter ([`to_container_record`]), the writer-header build, and the
+//! single-threaded [`run`] loop, wired to the `ssr-pileup` CLI subcommand and
+//! covered by a catalog→reference→BAM→`.ssr.psp` round-trip test. The
+//! worker-pool parallelization (turn the `run` loop's `for` into a
+//! `par_iter().map_init`) is the deferred §8.4 step.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -556,5 +557,146 @@ mod tests {
         let cfg = config_for(vec![PathBuf::from("/data/s1.bam")]);
         let err = build_ssr_writer_header("S", &cfg, &contigs, &catalog_header()).unwrap_err();
         assert!(matches!(err, SsrPileupError::MissingMd5 { name } if name == "chr1"));
+    }
+
+    // --- end-to-end: catalog + reference + BAM -> .ssr.psp ------------
+
+    /// A coordinate-sorted BAM (one contig, `@RG SM`, a trusted `@SQ M5`) with a
+    /// single clean spanning read for a CA(3) locus. `run()` builds the index
+    /// (`build_index_if_missing`), so no `.csi` is written here.
+    fn write_spanning_bam(path: &std::path::Path) {
+        use bstr::BString;
+        use noodles_bam as bam;
+        use noodles_sam as sam;
+        use sam::alignment::RecordBuf;
+        use sam::alignment::io::Write as _;
+        use sam::alignment::record::cigar::Op;
+        use sam::alignment::record::cigar::op::Kind;
+        use sam::alignment::record::{Flags, MappingQuality};
+        use sam::alignment::record_buf::{QualityScores, Sequence};
+        use sam::header::record::value::Map;
+        use sam::header::record::value::map::header::Version;
+        use sam::header::record::value::map::header::tag::SORT_ORDER;
+        use sam::header::record::value::map::read_group::tag::SAMPLE;
+        use sam::header::record::value::map::reference_sequence::tag::MD5_CHECKSUM;
+        use sam::header::record::value::map::{Header as HeaderMap, ReadGroup, ReferenceSequence};
+        use std::num::NonZero;
+
+        let mut hd = Map::<HeaderMap>::new(Version::new(1, 6));
+        hd.other_fields_mut()
+            .insert(SORT_ORDER, BString::from("coordinate"));
+
+        let mut sq = Map::<ReferenceSequence>::new(NonZero::new(200usize).unwrap());
+        sq.other_fields_mut()
+            .insert(MD5_CHECKSUM, BString::from("0".repeat(32)));
+
+        let mut rg = Map::<ReadGroup>::default();
+        rg.other_fields_mut()
+            .insert(SAMPLE, BString::from("sample0"));
+
+        let header = sam::Header::builder()
+            .set_header(hd)
+            .add_reference_sequence(b"chr1".to_vec(), sq)
+            .add_read_group(b"rg0".to_vec(), rg)
+            .build();
+
+        // Aligned ref [5,35) (pos 6, M30). The locus window is ref [10,28),
+        // which maps to read[5..23] — laid out as the locus's embedded ref:
+        // 6 bp G-flank + CACACA + 6 bp T-flank, padded to 30 bp.
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"AAAAA");
+        seq.extend_from_slice(b"GGGGGGCACACATTTTTT");
+        seq.extend_from_slice(b"AAAAAAA");
+        assert_eq!(seq.len(), 30);
+        let read = RecordBuf::builder()
+            .set_name(b"r1")
+            .set_reference_sequence_id(0)
+            .set_flags(Flags::default())
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_alignment_start(noodles_core::Position::try_from(6).unwrap())
+            .set_cigar([Op::new(Kind::Match, 30)].into_iter().collect())
+            .set_sequence(Sequence::from(seq))
+            .set_quality_scores(QualityScores::from(vec![40u8; 30]))
+            .build();
+
+        let mut writer = bam::io::Writer::new(File::create(path).unwrap());
+        writer.write_header(&header).unwrap();
+        writer.write_alignment_record(&header, &read).unwrap();
+        writer.try_finish().unwrap();
+    }
+
+    #[test]
+    fn run_genotypes_one_locus_end_to_end() {
+        use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
+        use crate::psp::PspReader;
+        use crate::psp::registry_ssr::SsrKind;
+        use crate::ssr::catalog::io::CatalogWriter;
+        use crate::ssr::pileup::fetch_reads::MAX_READS_PER_LOCUS;
+        use crate::ssr::types::{Locus, Motif};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let (_fa_dir, fasta) = build_fasta(&[ContigSpec {
+            name: "chr1".into(),
+            length: 200,
+        }])
+        .unwrap();
+
+        // BAM with one spanning read.
+        let bam = dir.path().join("s.bam");
+        write_spanning_bam(&bam);
+
+        // One-locus catalog: CA tract ref [16,22), 6 bp flanks embedded.
+        let locus = Locus::new(
+            "chr1".into(),
+            16,
+            22,
+            Motif::new(b"CA").unwrap(),
+            1.0,
+            (*b"GGGGGGCACACATTTTTT").into(),
+            10,
+        )
+        .unwrap();
+        let catalog = dir.path().join("c.ssr.catalog");
+        {
+            let mut w =
+                CatalogWriter::new(File::create(&catalog).unwrap(), &catalog_header()).unwrap();
+            w.write_locus(&locus).unwrap();
+            w.finish().unwrap();
+        }
+
+        let output = dir.path().join("out.ssr.psp");
+        let cfg = SsrPileupConfig {
+            alignment_files: vec![bam],
+            reference: fasta,
+            catalog,
+            output: output.clone(),
+            filter: SegmentReadFilter::default(),
+            window: DEFAULT_WINDOW,
+            cap: MAX_READS_PER_LOCUS,
+            build_index_if_missing: true,
+            sample: Some("S1".into()),
+        };
+        run(&cfg).expect("run");
+
+        let mut reader = PspReader::new(File::open(&output).unwrap()).unwrap();
+        assert_eq!(reader.header().kind, "ssr");
+        let records: Vec<_> = reader.records_of::<SsrKind>().map(|r| r.unwrap()).collect();
+
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.chrom_id, 0);
+        assert_eq!((rec.start, rec.end), (17, 23)); // 0-based [16,22) -> 1-based [17,23)
+        assert_eq!(rec.depth, 1);
+        assert_eq!(rec.mapped_reads, 1);
+        assert_eq!(rec.n_filtered, 0);
+        assert_eq!(rec.spanning.len(), 1); // one spanning read -> one Qᵣ profile
+        // The profile's most-likely length is the true allele: 3 CA copies.
+        let best = rec.spanning[0]
+            .iter()
+            .copied()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        assert_eq!(best.0, 3);
     }
 }
