@@ -94,7 +94,8 @@ where
 {
     for item in walker.by_ref() {
         let record = item?;
-        if record.pos >= start && record.pos <= end {
+        // `start`/`end` are the region's 1-based inclusive bounds.
+        if (start..=end).contains(&record.pos) {
             writer.write_record(&record)?;
         }
     }

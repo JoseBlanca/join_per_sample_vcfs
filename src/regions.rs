@@ -126,13 +126,21 @@ impl RegionSet {
         let mut regions: Vec<Region> = Vec::new();
         for (line_idx, line) in reader.lines().enumerate() {
             let line_number = line_idx + 1;
-            let line = line.map_err(BedError::Io)?;
+            let line = line.map_err(|source| BedError::ReadLine {
+                line_number,
+                source,
+            })?;
             if let Some(region) = parse_bed_line(&line, line_number, &by_name)? {
                 regions.push(region);
             }
         }
 
-        sort_and_merge(&mut regions);
+        let regions = sort_and_merge(regions);
+        // An explicitly-supplied --regions BED that selects nothing is a
+        // configuration error, not a silent empty run (review M1).
+        if regions.is_empty() {
+            return Err(BedError::NoRegions);
+        }
         Ok(RegionSet { regions })
     }
 
@@ -177,6 +185,17 @@ impl RegionSet {
     }
 }
 
+impl<'a> IntoIterator for &'a RegionSet {
+    type Item = &'a Region;
+    type IntoIter = std::slice::Iter<'a, Region>;
+
+    /// Borrow-iterate the spans in genomic order, so callers can write
+    /// `for region in &region_set` (review Mi7).
+    fn into_iter(self) -> Self::IntoIter {
+        self.regions.iter()
+    }
+}
+
 /// Parse one BED line into a [`Region`], or `None` for lines that
 /// carry no span (blank, comment, or UCSC header). `by_name` resolves
 /// the `chrom` column to its `(chrom_id, length)`.
@@ -186,15 +205,18 @@ fn parse_bed_line(
     by_name: &HashMap<&str, (u32, u32)>,
 ) -> Result<Option<Region>, BedError> {
     let trimmed = line.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with('#')
-        || trimmed.starts_with("track")
-        || trimmed.starts_with("browser")
-    {
+    if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(None);
     }
 
     let mut fields = trimmed.split_whitespace();
+    // UCSC `track` / `browser` header lines begin with that keyword as a
+    // whole first token; a contig literally named e.g. `trackpos` must
+    // not be mistaken for a header (review Nit-track). Peeking the first
+    // token here also serves as the `chrom` column below.
+    if matches!(fields.clone().next(), Some("track") | Some("browser")) {
+        return Ok(None);
+    }
     let chrom = fields.next().ok_or_else(|| BedError::Parse {
         line_number,
         reason: "empty line after trimming".to_string(),
@@ -238,7 +260,12 @@ fn parse_bed_line(
             })?;
 
     // Convert to 1-based inclusive: [b_start, b_end) → [b_start+1, b_end].
-    let start_1based = bed_start + 1;
+    // `saturating_add` is overflow-safe on the untrusted parsed coordinate
+    // (the `bed_end <= bed_start` reject above already bounds a reachable
+    // `bed_start` below `u64::MAX`, but the saturation makes that explicit
+    // and panic-free regardless; a saturated value trips the
+    // `> length` reject below) (review Mi1).
+    let start_1based = bed_start.saturating_add(1);
     if start_1based > length as u64 {
         return Err(BedError::IntervalBeyondContig {
             line_number,
@@ -259,12 +286,12 @@ fn parse_bed_line(
 }
 
 /// Sort `regions` by `(chrom_id, start)` and merge spans that overlap
-/// or directly abut. In-place; leaves a sorted, non-overlapping list.
-fn sort_and_merge(regions: &mut Vec<Region>) {
+/// or directly abut, returning the sorted, non-overlapping list.
+fn sort_and_merge(mut regions: Vec<Region>) -> Vec<Region> {
     regions.sort_unstable_by_key(|r| (r.chrom_id, r.start, r.end));
 
     let mut merged: Vec<Region> = Vec::with_capacity(regions.len());
-    for region in regions.drain(..) {
+    for region in regions {
         match merged.last_mut() {
             // Same contig and the next span starts no later than one
             // base past the current end → they describe a contiguous
@@ -279,7 +306,7 @@ fn sort_and_merge(regions: &mut Vec<Region>) {
             _ => merged.push(region),
         }
     }
-    *regions = merged;
+    merged
 }
 
 /// Failure modes of BED parsing and resolution. Every variant that
@@ -289,12 +316,31 @@ fn sort_and_merge(regions: &mut Vec<Region>) {
 #[non_exhaustive]
 pub enum BedError {
     /// The BED file could not be opened.
-    #[error("could not open BED file {path}: {source}")]
-    Open { path: PathBuf, source: io::Error },
+    #[error("could not open BED file {path}")]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
-    /// An I/O error occurred while reading a line.
-    #[error("reading BED file: {0}")]
-    Io(io::Error),
+    /// An I/O error occurred while reading a specific line. The
+    /// `line_number` (in scope at the read site) is captured for a
+    /// pointable message, and the underlying `io::Error` is preserved as
+    /// the error *source* rather than flattened into the `Display`.
+    #[error("reading BED file at line {line_number}")]
+    ReadLine {
+        line_number: usize,
+        #[source]
+        source: io::Error,
+    },
+
+    /// The BED parsed successfully but selects no intervals at all
+    /// (empty file, only comments / `track` / `browser` headers, or
+    /// every line filtered). An explicitly-supplied `--regions` BED that
+    /// selects nothing is treated as a configuration error rather than a
+    /// silent empty run (review M1).
+    #[error("the --regions BED contains no usable intervals (it is empty after parsing)")]
+    NoRegions,
 
     /// A data line was structurally malformed: fewer than three
     /// columns, or non-numeric coordinates.
@@ -339,6 +385,7 @@ pub enum BedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn contigs() -> Vec<ContigBounds<'static>> {
         vec![
@@ -658,9 +705,87 @@ mod tests {
     }
 
     #[test]
-    fn empty_bed_yields_empty_region_set() {
-        let set = parse("# only a comment\n").unwrap();
-        assert!(set.is_empty());
-        assert_eq!(set.len(), 0);
+    fn empty_or_comment_only_bed_is_a_hard_error() {
+        // M1: an explicitly-supplied --regions BED that selects nothing
+        // (empty, comment-only, or header-only) is a configuration error,
+        // not a silent empty run.
+        assert!(matches!(parse(""), Err(BedError::NoRegions)));
+        assert!(matches!(
+            parse("# only a comment\n"),
+            Err(BedError::NoRegions)
+        ));
+        assert!(matches!(
+            parse("browser position chr1\ntrack name=foo\n"),
+            Err(BedError::NoRegions)
+        ));
+    }
+
+    #[test]
+    fn parse_bed_line_rejects_oversized_u64_start_coordinate() {
+        // Mi1: the `bed_start + 1` 1-based conversion must not overflow on
+        // an attacker-/typo-supplied coordinate. `u64::MAX` as the start
+        // is rejected (here as InvalidInterval, since end <= start trips
+        // first) rather than panicking.
+        let bed = format!("chr1\t{}\t{}\n", u64::MAX, u64::MAX);
+        assert!(matches!(parse(&bed), Err(BedError::InvalidInterval { .. })));
+        // A start past the contig with a valid (larger) end is rejected as
+        // beyond-contig, again without overflow on the +1.
+        let bed = format!("chr1\t{}\t{}\n", u64::MAX - 1, u64::MAX);
+        assert!(matches!(
+            parse(&bed),
+            Err(BedError::IntervalBeyondContig { .. })
+        ));
+    }
+
+    #[test]
+    fn contig_named_like_a_header_keyword_is_not_skipped() {
+        // Nit-track: `track`/`browser` are headers only as a whole first
+        // token; a contig literally named `trackpos` is data.
+        let cs = vec![ContigBounds {
+            name: "trackpos",
+            length: 100,
+        }];
+        let set = RegionSet::from_bed_reader("trackpos\t0\t10\n".as_bytes(), &cs).unwrap();
+        assert_eq!(set.len(), 1);
+    }
+
+    proptest::proptest! {
+        /// Mi3: whatever (in-bounds) spans go in, a successfully-parsed
+        /// `RegionSet` is always sorted by `(chrom_id, start)`, has no
+        /// overlapping or abutting spans on the same contig, and stays
+        /// within `[1, length]` — the invariants the rest of the pipeline
+        /// relies on. (An empty input is the only non-error "nothing"
+        /// case, and it is rejected as `NoRegions`.)
+        #[test]
+        fn region_set_invariants_hold_on_random_spans(
+            spans in proptest::collection::vec((0usize..3, 0u32..200, 1u32..50), 0..40)
+        ) {
+            let cs = vec![
+                ContigBounds { name: "c0", length: 300 },
+                ContigBounds { name: "c1", length: 300 },
+                ContigBounds { name: "c2", length: 300 },
+            ];
+            let mut bed = String::new();
+            for (idx, start, len) in &spans {
+                bed.push_str(&format!("c{}\t{}\t{}\n", idx, start, start + len));
+            }
+            match RegionSet::from_bed_reader(bed.as_bytes(), &cs) {
+                Ok(set) => {
+                    let rs = set.regions();
+                    for w in rs.windows(2) {
+                        prop_assert!((w[0].chrom_id, w[0].start) <= (w[1].chrom_id, w[1].start));
+                        if w[0].chrom_id == w[1].chrom_id {
+                            // strictly past end+1 ⇒ neither overlapping nor abutting
+                            prop_assert!(w[1].start as u64 > w[0].end as u64 + 1);
+                        }
+                    }
+                    for r in rs {
+                        prop_assert!(r.start >= 1 && r.end <= 300 && r.start <= r.end);
+                    }
+                }
+                Err(BedError::NoRegions) => prop_assert!(spans.is_empty()),
+                Err(e) => prop_assert!(false, "unexpected error: {e}"),
+            }
+        }
     }
 }

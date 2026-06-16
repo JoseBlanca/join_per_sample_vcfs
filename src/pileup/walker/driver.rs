@@ -258,16 +258,29 @@ impl RunSummary {
     /// one at a time, so the peak concurrent active-read count for the
     /// whole run is the largest single region's peak, not the sum.
     pub fn merge(&mut self, other: &RunSummary) {
-        self.reads_admitted += other.reads_admitted;
-        self.records_emitted += other.records_emitted;
-        self.record_widen_events += other.record_widen_events;
-        self.mate_overlap_positions += other.mate_overlap_positions;
-        self.chain_allocations += other.chain_allocations;
-        self.active_reads_high_water = self
-            .active_reads_high_water
-            .max(other.active_reads_high_water);
-        self.mate_lookup_evictions += other.mate_lookup_evictions;
-        self.column_depth_truncations += other.column_depth_truncations;
+        // Exhaustive destructure (no `..`): a new RunSummary field is a
+        // compile error here until it is explicitly folded in — important
+        // because the fold is not uniform (`active_reads_high_water` takes
+        // the max, the rest add), so a copy-paste `+=` on a new field
+        // would be silently wrong (review M3).
+        let RunSummary {
+            reads_admitted,
+            records_emitted,
+            record_widen_events,
+            mate_overlap_positions,
+            chain_allocations,
+            active_reads_high_water,
+            mate_lookup_evictions,
+            column_depth_truncations,
+        } = *other;
+        self.reads_admitted += reads_admitted;
+        self.records_emitted += records_emitted;
+        self.record_widen_events += record_widen_events;
+        self.mate_overlap_positions += mate_overlap_positions;
+        self.chain_allocations += chain_allocations;
+        self.active_reads_high_water = self.active_reads_high_water.max(active_reads_high_water);
+        self.mate_lookup_evictions += mate_lookup_evictions;
+        self.column_depth_truncations += column_depth_truncations;
     }
 }
 

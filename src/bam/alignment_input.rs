@@ -139,16 +139,30 @@ impl FilterCounts {
     /// the per-region readers' filter counts into one run summary when
     /// the pileup is driven region by region.
     pub fn merge(&mut self, other: &FilterCounts) {
-        self.unmapped += other.unmapped;
-        self.secondary += other.secondary;
-        self.supplementary += other.supplementary;
-        self.qc_fail += other.qc_fail;
-        self.duplicate += other.duplicate;
-        self.low_mapq += other.low_mapq;
-        self.too_short += other.too_short;
-        self.high_mismatch_fraction += other.high_mismatch_fraction;
-        self.bad_cigar += other.bad_cigar;
-        self.baq_rejected += other.baq_rejected;
+        // Exhaustive destructure (no `..`): a new FilterCounts field is a
+        // compile error here until it is explicitly folded in (review M3).
+        let FilterCounts {
+            unmapped,
+            secondary,
+            supplementary,
+            qc_fail,
+            duplicate,
+            low_mapq,
+            too_short,
+            high_mismatch_fraction,
+            bad_cigar,
+            baq_rejected,
+        } = *other;
+        self.unmapped += unmapped;
+        self.secondary += secondary;
+        self.supplementary += supplementary;
+        self.qc_fail += qc_fail;
+        self.duplicate += duplicate;
+        self.low_mapq += low_mapq;
+        self.too_short += too_short;
+        self.high_mismatch_fraction += high_mismatch_fraction;
+        self.bad_cigar += bad_cigar;
+        self.baq_rejected += baq_rejected;
     }
 
     /// Increment the field a [`classify_pre_decode`] drop falls into.
