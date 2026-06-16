@@ -149,3 +149,7 @@ harness = false
 name = "cohort_var_calling_perf"
 harness = false
 
+[[bench]]
+name = "ssr_pileup_perf"
+harness = false
+

@@ -100,6 +100,13 @@ impl LocusScratch {
             hmm: PairHmmScratch::new(),
         }
     }
+
+    /// Disjoint mutable access to both scratch buffers in one borrow
+    /// (perf-harness seam — `process_locus` reaches the fields directly).
+    #[doc(hidden)]
+    pub(crate) fn parts_mut(&mut self) -> (&mut Vec<CandidateAllele>, &mut PairHmmScratch) {
+        (&mut self.cands, &mut self.hmm)
+    }
 }
 
 /// Assemble the locus's QC scalars from the fetch pass. All three describe

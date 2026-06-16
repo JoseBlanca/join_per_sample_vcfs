@@ -13,6 +13,7 @@
 //! [`candidate_generation`] (on-ladder rungs + off-ladder candidates), and
 //! [`triage`] (the content pre-probe so far; read classification next).
 
+pub mod bench_harness;
 pub mod candidate_generation;
 pub mod count_repeats;
 pub mod driver;
