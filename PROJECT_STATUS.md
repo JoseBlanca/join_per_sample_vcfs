@@ -19,15 +19,14 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-16):** **bed-regions `--regions` performance review**
->   (branch `bed-regions-review`). Verdict **Profile first** — the segment-read-fetcher
->   retrofit is confirmed wired into `--regions` (the #5 "retrofit" item is stale), but no
->   benchmark or sampling profile of the current `SegmentMergedReads` path exists, so the
->   first deliverable is `benches/regions_pileup_perf.rs` + a profile, not code edits. 6-category
->   orchestrated review → 7 Likely findings (capped, no profile), top = qname double-clone in the
->   merge inner loop. Report:
->   [perf_bed-regions_2026-06-16.md](doc/devel/reports/reviews/perf_bed-regions_2026-06-16.md).
->   **(suggested follow-up: the code/correctness review of the same `--regions` files, still pending.)**
+> - **Last completed task (2026-06-16):** **bed-regions `--regions` performance + code review**
+>   (branch `bed-regions-review`). **Perf** ([perf_bed-regions_2026-06-16.md](doc/devel/reports/reviews/perf_bed-regions_2026-06-16.md)):
+>   measured on tomato1 — per-region overhead negligible (80→8000 regions = +1.9% wall), BAQ
+>   (`probaln_glocal`) dominates ~70%; the `--regions` findings are not a perf lever. L1+L3 applied
+>   as perf-neutral cleanups (committed). **Code review** ([regions_2026-06-16.md](doc/devel/reports/reviews/regions_2026-06-16.md),
+>   10 categories): Approve-with-changes, 0 Blockers / 6 Major / 12 Minor; top = M4 dropped worker
+>   `JoinHandle`s (silent-truncation margin), M1 silent empty output, M3/M2 = prior Majors still
+>   unfixed. **(suggested follow-up: apply the code-review fixes — M4/M1/M3 first.)**
 > - **Last completed task (2026-06-15):** **SSR Stage 1 (`ssr-pileup`) — tasks 1–2.**
 >   **Task 1:** built the allele model in [src/ssr/types.rs](src/ssr/types.rs) —
 >   `NormalizedSeq` + `Allele` (`OnLadder`/`OffLadder`) with pure
@@ -264,13 +263,14 @@ Stage descriptions are one-line reminders; the spec is authoritative.
 Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 
 #### Analysis regions from a BED file (`--regions`)
-- **Status:** reviewed (2026-06-03); merged to `main` (`6ecd22c`)
+- **Status:** reviewed (2026-06-16, re-review after the segment-reader retrofit); merged to `main` (`6ecd22c`)
 - **Plan:** [bed_regions.md](doc/devel/implementation_plans/bed_regions.md)
 - **Impl report:** [bed_regions_2026-06-03.md](doc/devel/reports/implementations/bed_regions_2026-06-03.md)
 - **Perf + byte-identity investigation:** [bed_regions_perf_and_byte_identity_2026-06-03.md](doc/devel/reports/bed_regions_perf_and_byte_identity_2026-06-03.md)
 - **Cross-cutting:** Stage 1 (pileup) + var-calling. The pipeline always operates on a `RegionSet` — the `--regions` BED, or one full-length span per contig (whole genome). The whole-file pileup streaming path is retired; pileup now always seeks via the index.
 - **Code:** [src/regions.rs](src/regions.rs) (`RegionSet` + BED parser); region-driven `run_pileup` ([src/pop_var_caller/cli.rs](src/pop_var_caller/cli.rs)) now opens pooled per-file readers once and k-way-merges per region via `SegmentMergedReads` ([src/bam/segment_merge.rs](src/bam/segment_merge.rs) + [src/bam/segment_reader.rs](src/bam/segment_reader.rs)) — the old per-region `AlignmentMergedReader::query` is **gone** (the segment-read-fetcher retrofit landed; cf. cli.rs:374-375); var-calling restriction in [src/var_calling/pipeline.rs](src/var_calling/pipeline.rs) (`restrict_intervals_to_regions`); command-line + regions provenance in [src/psp/header.rs](src/psp/header.rs).
-- **Latest review:** [bed_regions_2026-06-03.md](doc/devel/reports/reviews/bed_regions_2026-06-03.md) — **Approve-with-changes**: 0 Blockers, 6 Major, 9 Minor + Nits. Module structure / concurrency lockstep / idiomatic all clean; `restrict_intervals_to_regions` verified correct. HG002-bottle accuracy identical to `main` (SNP F1 0.9037), pileup time unchanged, peak RSS −71%.
+- **Latest code review:** [regions_2026-06-16.md](doc/devel/reports/reviews/regions_2026-06-16.md) — **Approve-with-changes** (re-review of the current segment-reader path; 10 categories): 0 Blockers, 6 Major, 12 Minor + Nits. Top: M4 worker `JoinHandle`s dropped (a worker panic could silently truncate the read stream — only `thread::scope`'s re-raise saves it); M1 silent empty output on a non-selecting BED; M3 + M2 = prior M1/M3 still unfixed. Both this branch's cleanup commits verified behavior-identical. Audit trail `tmp/review_2026-06-16_regions/`.
+- **Prior review:** [bed_regions_2026-06-03.md](doc/devel/reports/reviews/bed_regions_2026-06-03.md) — Approve-with-changes on the now-superseded `query` impl; 0 Blockers, 6 Major, 9 Minor. HG002-bottle accuracy identical to `main` (SNP F1 0.9037), peak RSS −71%.
 - **Latest perf review:** [perf_bed-regions_2026-06-16.md](doc/devel/reports/reviews/perf_bed-regions_2026-06-16.md) — Profile-first → **measured** on tomato1 (§8): a fragmentation sweep (80→8000 regions over identical 8 Mb = **+1.9% wall**) + a sampling profile (`probaln_glocal` ~70%; whole `--regions` read/merge path ~1–2%) **refute the per-region/read-path findings as a perf lever.** L1 (qname double-clone) + L3 (dead `Stage1Outputs` clones) applied as **perf-neutral cleanups**; rest closed/deferred. Real lever is BAQ (out of scope). Audit trail `tmp/perf_review_2026-06-16_bed-regions/`.
 - **Open (from the 2026-06-03 review):**
   - **M1** — the three `merge()` counter-folds (`RunSummary`/`FilterCounts`/`BaqSkipCounts`) aren't field-addition-safe (exhaustive-destructure + 3 tests).
@@ -281,6 +281,13 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - **M6** — whole-contig range collapse applied silently with no runtime trace.
   - **Minors:** per-region repeated work (FASTA repo rebuild + clones, undercuts "sparse BED is cheap"); pileup-vs-var-calling provenance asymmetry; empty-BED → silent empty output; `build_map_file_index` third-name / `stashed_upstream` noun; `#[from] AlignmentIndexError` collapses two origins; `#[allow(too_many_arguments)]` without justification. Plus the §8 missing tests (merge folds, `command-line` serde-default round-trip, adversarial BED coordinates, empty-BED pin).
   - **Efficiency follow-up:** indexed `.fai`-seek fetcher to replace the per-region streaming `MultiChromStreamingRefFetcher` rebuild (many sub-contig regions on a large contig).
+- **Open (from the 2026-06-16 code review — see [regions_2026-06-16.md](doc/devel/reports/reviews/regions_2026-06-16.md) for fixes):**
+  - **M4** (top) — `run_pipelined` drops the per-region worker `JoinHandle`s instead of joining; a worker panic mid-fold can drop a sequence number → `ReorderReadIter` yields a gap → walker finishes over a truncated stream. Only `thread::scope`'s panic re-raise (before the atomic rename) prevents wrong output — implicit, undocumented. Join the workers (or document the invariant).
+  - **M1** — a `--regions` BED that selects nothing → silent valid-but-empty `.psp`/VCF, exit 0 (both pileup + cohort). **Open question first:** error vs warn vs document.
+  - **M5** — staged/inline producer branches duplicate a ~25-line interval-walk (`pipeline.rs:431-595`) — the shape of the prior staged multi-interval regression; extract a shared `drive_schedule` helper.
+  - **M6** — no test pins `--regions` `.psp` byte-identity across `--threads` (inline path `<4` never exercised under `--regions`); the determinism gate is unverified for this feature.
+  - **Recurrences (still unfixed from 2026-06-03):** M3↑ = the counter-fold field-addition-safety (now confirmed across `FilterCounts`/`BaqSkipCounts`/`RunSummary`, the last with a `max`-semantic foot-gun); M2↑ = `BedError::Io` path/line/`#[source]` loss.
+  - **Minors:** restrict-intervals tie/multi-interval tests; BED parser proptest; whole-genome/clamp runtime observability; `cram_paths`→`alignment_paths` rename; bare `#[allow(too_many_arguments)]` ×3; `RegionSet` `IntoIterator`; `sort_and_merge` consuming form; Stage-1 `pub`→`pub(crate)`; `MappedReadSource` placement; `cargo audit` not wired. Plus the §8 missing tests.
 - **Resolved by the 2026-06-16 perf review (measured — see report §8):**
   - **Applied (perf-neutral cleanups, gates green):** L1 qname double-clone → move ([segment_merge.rs](src/bam/segment_merge.rs)); L3 dropped the unread `Stage1Outputs` `sample_name`/`contigs` fields ([stage1_pipeline.rs](src/pop_var_caller/stage1_pipeline.rs)). Neither moves wall (~1% paths) — kept as cleanups, not speedups.
   - **Closed — no gain:** L5/L6 (merge path ~1–2% of runtime); L7 region-parallelism (serial loop ~2% even at 8000 regions; cores already saturated).
