@@ -4,7 +4,9 @@
 //! We **drop** compounds and bundles — we do not split (the GangSTR reference
 //! pipeline does exactly this). Order (§4):
 //!
-//! 1. **Period ≤ 6** (+ an early TRF `score` floor) — cheap scope/volume cut.
+//! 1. **Period 2..=6** (+ an early TRF `score` floor) — cheap scope/volume cut.
+//!    Period-1 homopolymers are dropped (GangSTR/HipSTR convention; also stops
+//!    poly-A/T runs from bundle-dropping adjacent SSRs in step 3).
 //! 2. **Drop compound-motif loci** — a motif that is itself internally periodic
 //!    (`ATAT` = `(AT)²`). Port of GangSTR `minimal_trim.py::is_compound`.
 //! 3. **Drop bundles** — any locus within `bundle_threshold` bp of another is
@@ -31,7 +33,8 @@ use crate::ssr::types::{Locus, Motif};
 
 /// Per-period minimum copy number a tract must reach to survive (GangSTR
 /// `minimal_trim.py` `thresholds = {1:10, 2:5, 3:4, 4:3, 5:3, 6:3}`; default 3
-/// for any other period, though period is filtered to `1..=6` upstream).
+/// for any other period). Period 1 is filtered out upstream ([`MIN_PERIOD`]),
+/// so its floor is retained only for parity with the source table.
 const fn copy_number_floor(period: usize) -> u32 {
     match period {
         1 => 10,
@@ -43,6 +46,13 @@ const fn copy_number_floor(period: usize) -> u32 {
         _ => 3,
     }
 }
+
+/// The narrowest SSR period the catalog keeps. Period-1 **homopolymers are
+/// excluded** (architecture §4): the standard GangSTR/HipSTR drop — error-prone
+/// for STR genotyping and not the di/tri/tetra-nucleotide target — and dropping
+/// them *before* bundling stops a long poly-A/T run from bundle-dropping an
+/// adjacent real SSR.
+const MIN_PERIOD: u16 = 2;
 
 /// The widest SSR period the catalog keeps (architecture §4 step 1).
 const MAX_PERIOD: u16 = 6;
@@ -61,7 +71,7 @@ pub(crate) fn build_loci(
     let mut kept: Vec<TrfRecord> = recs
         .into_iter()
         .filter(|r| {
-            r.period >= 1
+            r.period >= MIN_PERIOD
                 && r.period <= MAX_PERIOD
                 && r.score >= p.min_score
                 && r.end > r.start
@@ -414,5 +424,23 @@ mod tests {
         let l = &loci[0];
         assert_eq!(l.ref_bytes_start(), 0, "left flank clamped to contig start");
         assert_eq!(l.left_flank(), b"G", "only 1 bp of left flank available");
+    }
+
+    /// Period-1 homopolymers are dropped (MIN_PERIOD = 2), and — because the
+    /// drop happens before bundling — a poly-A run adjacent to a real SSR no
+    /// longer bundle-drops it.
+    #[test]
+    fn build_loci_drops_period_one_homopolymer_and_spares_the_neighbour_ssr() {
+        // 20 bp poly-A, then (CAG)*10 immediately after. trf-style records.
+        let mut contig = vec![b'A'; 20];
+        for _ in 0..10 {
+            contig.extend_from_slice(b"CAG");
+        }
+        let homopolymer = TrfRecord::for_test(0, 20, 1, 100, b"A");
+        let cag = TrfRecord::for_test(20, 50, 3, 100, b"CAG");
+        let loci = build_loci(vec![homopolymer, cag], "chr1", &contig, &params());
+        assert_eq!(loci.len(), 1, "the homopolymer is gone, the CAG survives");
+        assert_eq!(loci[0].motif().as_bytes(), b"CAG");
+        assert_eq!(loci[0].period(), 3);
     }
 }

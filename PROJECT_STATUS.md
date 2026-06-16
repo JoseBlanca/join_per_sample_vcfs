@@ -151,10 +151,11 @@ Skills and agents are instructed to leave it untouched.
 >   whole-reference md5; unified `CatalogParams` (defaults pinned); end-to-end
 >   test drives real trf-mod; 1164 lib tests, gates green. Report
 >   [ssr_catalog_orchestrator_2026-06-15.md](ia/reports/implementations/ssr_catalog_orchestrator_2026-06-15.md).
->   **⚠ Open arch-§4 design question surfaced: homopolymer bundling** — keeping
->   period-1 (per arch §4) lets poly-A/T runs bundle-drop adjacent SSRs (GangSTR
->   drops period-1 pre-bundle); needs a PM decision. Stage-0 remaining: per-contig
->   rayon fan-out, the `ssr-catalog` clap subcommand, the CSI index.
+>   **Homopolymer-bundling decision RESOLVED (2026-06-16, PM): drop period-1**
+>   (GangSTR/HipSTR; target = di/tri/tetra microsatellites) — applied
+>   (`MIN_PERIOD = 2`); catalog is now period 2..=6 (an arch-§4 doc amendment is
+>   owed). Stage-0 remaining: per-contig rayon fan-out, the `ssr-catalog` clap
+>   subcommand, the CSI index.
 >   Off-ladder + measured fast path + spec §4.3 amendment deferred.
 > - **Prior task (2026-06-12):** **SSR caller — Phase 0 review fixes.**
 >   Applied the `ssr_types` code review

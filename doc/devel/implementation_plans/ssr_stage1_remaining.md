@@ -73,11 +73,11 @@ synthetic tests.
      (defaults pinned: `min_purity 0.8`, `min_score 0`, `flank_bp 50`,
      `bundle_threshold 50`); end-to-end test drives the real trf-mod. Report:
      [ssr_catalog_orchestrator_2026-06-15.md](../reports/implementations/ssr_catalog_orchestrator_2026-06-15.md).
-     **⚠ OPEN DESIGN QUESTION (arch §4): homopolymer bundling.** Keeping period-1
-     (per arch §4) makes long poly-A/T runs enter `drop_bundles` and drop
-     adjacent real SSRs (GangSTR drops period-1 *before* bundling to avoid this).
-     Decide: (a) drop period-1 pre-bundle (match GangSTR), (b) keep period-1 but
-     exclude it from forming bundles, or (c) accept it.
+     **Homopolymer-bundling question RESOLVED (2026-06-16):** drop period-1
+     homopolymers (GangSTR/HipSTR; target = di/tri/tetra microsatellites).
+     Applied — `MIN_PERIOD = 2`, so period-1 never reaches bundling. *(Arch §4
+     keeps "period ≤ 6"; the as-built catalog is period 2..=6 — a §4 doc
+     amendment is owed alongside the deferred spec §4.3 amendment.)*
    - **Per-contig rayon fan-out — NEXT**: bounded pool sized by
      `--num-chroms-in-parallel`, ordered collector (contig order = sorted). The
      single-threaded path works; parallelism is the §8 optimization.

@@ -255,16 +255,15 @@ mod tests {
         let ref_path = dir.path().join("ref.fa");
         let out_path = dir.path().join("catalog.bed.gz");
 
-        // (CAG)*40 (120 bp) bounded by NON-repetitive flanks — a homopolymer
-        // flank would be detected as a period-1 repeat and bundle-drop the CAG
-        // tract (see the design note in the report). trf-mod reports only the
-        // CAG record for this reference.
-        let flank = b"GTCAACTGGATCGTAACCGTTAGCATCGGATCAACGTTGACTGCAATGCATGCAGTTCGAT";
-        let mut seq = flank.to_vec();
+        // (CAG)*40 (120 bp) bounded by 100 bp poly-T flanks. trf-mod reports the
+        // flanks as period-1 homopolymers, but they are dropped (MIN_PERIOD = 2)
+        // before bundling, so the CAG tract survives cleanly at [100, 220) — this
+        // exercises the homopolymer-drop decision end-to-end.
+        let mut seq = vec![b'T'; 100];
         for _ in 0..40 {
             seq.extend_from_slice(b"CAG");
         }
-        seq.extend_from_slice(flank);
+        seq.extend(std::iter::repeat_n(b'T', 100));
         {
             let mut f = std::fs::File::create(&ref_path).unwrap();
             writeln!(f, ">ctg1").unwrap();
@@ -279,7 +278,7 @@ mod tests {
             temp_dir: PathBuf::from("tmp"),
             params: CatalogParams::default(),
             tool_version: "0.0.0-test".to_string(),
-            date: "2026-06-15".to_string(),
+            date: "2026-06-16".to_string(),
         };
         run(&cfg).expect("catalog build");
 
@@ -287,29 +286,18 @@ mod tests {
         assert_eq!(reader.header().reference_md5.len(), 32);
         assert!(reader.header().trf_mod_version.contains("Version"));
         let loci = reader.read_all().unwrap();
-        // One period-3, perfect CAG-family tract (phase-robust assertions).
+        // No period-1 homopolymer survived; the CAG tract did, at exact coords.
+        assert!(
+            loci.iter().all(|l| l.period() >= 2),
+            "period-1 homopolymers are excluded"
+        );
         let cag = loci
             .iter()
-            .find(|l| l.period() == 3 && l.purity_fraction() == 1.0)
-            .expect("a perfect period-3 locus is in the catalog");
+            .find(|l| l.motif().as_bytes() == b"CAG")
+            .expect("the CAG locus is in the catalog");
         assert_eq!(cag.chrom(), "ctg1");
-        let motif = cag.motif();
-        let motif = motif.as_bytes();
-        assert!(
-            matches!(motif, b"CAG" | b"AGC" | b"GCA"),
-            "motif is a CAG rotation, got {motif:?}"
-        );
-        let span = cag.end() - cag.start();
-        assert!(
-            span >= 114 && span % 3 == 0,
-            "≈40 CAG copies, got {span} bp"
-        );
-        assert!(
-            cag.ref_tract()
-                .iter()
-                .enumerate()
-                .all(|(i, &b)| b == motif[i % 3]),
-            "ref tract is a perfect motif tiling"
-        );
+        assert_eq!(cag.start(), 100);
+        assert_eq!(cag.end(), 220);
+        assert_eq!(cag.purity_fraction(), 1.0);
     }
 }

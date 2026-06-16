@@ -41,7 +41,20 @@ locus (phase-robust: motif ∈ {CAG,AGC,GCA}, ~120 bp, pure tiling) plus a
 32-hex `reference_md5` and a `Version`-bearing `trf_mod_version`. Skips
 gracefully if trf-mod is absent. 22 catalog tests total, all green.
 
-## DESIGN FINDING — homopolymers bundle-drop adjacent SSRs (needs a decision)
+## DESIGN FINDING — homopolymers bundle-drop adjacent SSRs — RESOLVED 2026-06-16
+
+**Resolution (PM):** drop period-1 homopolymers, matching GangSTR/HipSTR — the
+target is di/tri/tetra-nucleotide microsatellites, and homopolymers are
+error-prone for STR genotyping. Applied in `postprocess.rs`: `MIN_PERIOD = 2`,
+so the scope filter (step 1) keeps period `2..=6` and period-1 records never
+reach `drop_bundles`, sparing homopolymer-adjacent SSRs. The e2e test now uses
+poly-T flanks and asserts the CAG tract survives at `[100,220)` with no period-1
+survivor; a `postprocess` unit test pins the same. The original analysis below
+is retained for context.
+
+---
+
+
 
 The first version of the e2e test used `T*100` flanks; the build dropped the CAG
 locus. **Root cause is real, not a test bug:** trf-mod reports a long
