@@ -19,7 +19,7 @@ use std::path::Path;
 
 use noodles_fasta as fasta;
 
-use crate::bam::alignment_input::{AlignmentMergedReader, FilterCounts};
+use crate::bam::alignment_input::{AlignmentMergedReader, FilterCounts, MappedRead};
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
@@ -52,6 +52,38 @@ use super::cli::error_bridge::ErrorSheddingAdapter;
 /// Boxed walker type — uniform across the no-BAQ and BAQ-on branches.
 ///
 /// The walker's input iterator is type-erased to a `Box<dyn ...>` so a
+/// A source of `MappedRead`s for the Stage-1 pipeline: a coordinate-sorted
+/// iterator plus the cheap-filter drop tally it accumulated. Implemented by
+/// both the legacy [`AlignmentMergedReader`] (whole-file / `query`) and the
+/// pooled [`SegmentMergedReads`](crate::bam::segment_merge::SegmentMergedReads),
+/// so the pipeline is agnostic to which reader feeds it — the
+/// SNP `--regions` retrofit swaps the reader without touching the BAQ /
+/// walker plumbing.
+///
+/// `Send` is required because the staged topology moves the source into a
+/// scoped producer thread.
+pub trait MappedReadSource:
+    Iterator<Item = Result<MappedRead, AlignmentInputError>> + Send
+{
+    /// The reads dropped by the cheap pre-decode filter so far (read after
+    /// the source is drained). Named distinctly from any inherent
+    /// `filter_counts` accessor so an inherent method returning
+    /// `&FilterCounts` does not shadow this by-value trait method.
+    fn filter_drop_counts(&self) -> FilterCounts;
+}
+
+impl MappedReadSource for AlignmentMergedReader {
+    fn filter_drop_counts(&self) -> FilterCounts {
+        *self.filter_counts()
+    }
+}
+
+impl MappedReadSource for crate::bam::segment_merge::SegmentMergedReads<'_> {
+    fn filter_drop_counts(&self) -> FilterCounts {
+        self.filter_counts()
+    }
+}
+
 /// single closure type signature covers both branches. The boxing
 /// costs one indirection per `PreparedRead` — invisible against the
 /// HMM / walker bookkeeping the per-record budget already pays.
@@ -114,8 +146,8 @@ pub struct Stage1Outputs<R> {
 /// changing the caller's surface; `run_pileup`'s closure picks
 /// `E = PileupCliError`.
 #[allow(clippy::too_many_arguments)]
-pub fn with_stage1_chain<R, E, F>(
-    mut reader: AlignmentMergedReader,
+pub fn with_stage1_chain<Rd, R, E, F>(
+    mut reader: Rd,
     reference: &Path,
     repository: &fasta::Repository,
     walker_fetcher: &RepositoryRefFetcher,
@@ -125,17 +157,19 @@ pub fn with_stage1_chain<R, E, F>(
     baq_chunk_size: usize,
     n_threads: usize,
     no_baq: bool,
+    sample_name: &str,
+    contigs: &ContigList,
     f: F,
 ) -> Result<Stage1Outputs<R>, E>
 where
+    Rd: MappedReadSource,
     F: FnOnce(Stage1PipelineContext<'_>) -> Result<R, E>,
     E: From<PileupCliError>,
 {
-    // The reader is already opened and validated (via `new()` for a
-    // whole-file stream, or `query()` for one region). Capture the
-    // identification metadata it carries.
-    let sample_name = reader.sample_name().to_string();
-    let contigs = reader.contigs().clone();
+    // The reader is already opened and validated; its sample name and
+    // contig list are passed in by the caller (they are the same
+    // cross-validated metadata the reader was built from), so the
+    // pipeline does not depend on the reader carrying accessors for them.
 
     // Reference fetcher for the walker — [`RepositoryRefFetcher`] reads
     // the walker's reference windows from the same shared noodles
@@ -170,8 +204,8 @@ where
             baq_chunk_size,
             apply_baq,
             n_threads,
-            &sample_name,
-            &contigs,
+            sample_name,
+            contigs,
             f,
         )
     } else {
@@ -193,8 +227,8 @@ where
         let walker = walker::run(input, walker_fetcher, &walker_cfg);
         let ctx = Stage1PipelineContext {
             walker,
-            sample_name: &sample_name,
-            contigs: &contigs,
+            sample_name,
+            contigs,
         };
         let result = f(ctx);
         drop(adapter);
@@ -205,7 +239,7 @@ where
             high_mismatch: read_stream.high_mismatch_count(),
         };
         drop(read_stream);
-        let reader_filter_counts = *reader.filter_counts();
+        let reader_filter_counts = reader.filter_drop_counts();
         (result, stage_counts, stash, reader_filter_counts)
     };
 
@@ -230,8 +264,8 @@ where
 
     Ok(Stage1Outputs {
         result: r,
-        sample_name,
-        contigs,
+        sample_name: sample_name.to_string(),
+        contigs: contigs.clone(),
         run_summary: Stage1RunSummary {
             filter_counts,
             baq_skip_counts,
@@ -250,8 +284,8 @@ where
 /// thread). Byte-identical to the inline path: the reorder buffer
 /// restores global coordinate order before the (serial) walker.
 #[allow(clippy::too_many_arguments)]
-fn run_pipelined<R, E, F>(
-    mut reader: AlignmentMergedReader,
+fn run_pipelined<Rd, R, E, F>(
+    mut reader: Rd,
     reference: &Path,
     repository: &fasta::Repository,
     walker_fetcher: &RepositoryRefFetcher,
@@ -271,6 +305,7 @@ fn run_pipelined<R, E, F>(
     FilterCounts,
 )
 where
+    Rd: MappedReadSource,
     F: FnOnce(Stage1PipelineContext<'_>) -> Result<R, E>,
 {
     let err_cell = std::sync::Mutex::new(None);
@@ -286,7 +321,7 @@ where
         // counts (the reader is moved in, so the caller can't read them).
         let producer = scope.spawn(move || {
             produce_packets(&mut reader, pkt_tx, err_ref, baq_chunk_size);
-            *reader.filter_counts()
+            reader.filter_drop_counts()
         });
 
         // Worker pool: each pulls packets and runs G2/F3/F1 + BAQ.

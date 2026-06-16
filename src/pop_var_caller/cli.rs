@@ -1,6 +1,7 @@
 //! `pop_var_caller pileup` — the Stage 1 CLI orchestrator.
 //!
-//! Glues `AlignmentMergedReader` → `BaqStream` (or BAQ-bypass passthrough)
+//! Glues the per-region read source (`SegmentMergedReads` over pooled,
+//! re-seekable `AlignmentFile`s) → `BaqStream` (or BAQ-bypass passthrough)
 //! → pileup walker → `.psp` writer. Argument parsing is delegated to
 //! clap; everything else is in [`run_pileup`].
 //!
@@ -15,10 +16,11 @@ use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
 
 use crate::bam::alignment_input::{
-    AlignmentMergedReader, AlignmentMergedReaderConfig, ContigInterval, FilterCounts,
-    build_fasta_repository, load_pileup_inputs,
+    AlignmentMergedReaderConfig, FilterCounts, build_fasta_repository, load_pileup_inputs,
 };
 use crate::bam::errors::AlignmentInputError;
+use crate::bam::segment_merge::SegmentMergedReads;
+use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter};
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
@@ -228,11 +230,13 @@ pub enum PileupCliError {
 ///
 /// There is a single code path: the pileup always operates on a
 /// [`RegionSet`] — the `--regions` BED, or (without it) one full-length
-/// span per contig. For each region the alignment index is used to
-/// *seek* to the reads overlapping it
-/// ([`AlignmentMergedReader::query`]); the BAQ → walker chain
-/// ([`with_stage1_chain`](super::stage1_pipeline::with_stage1_chain))
-/// runs over those reads, and only the columns inside the region are
+/// span per contig. One pooled, re-seekable reader per input file is
+/// opened once for the whole run; for each region the per-file index is
+/// used to *seek* to the reads overlapping it, and those per-file streams
+/// are k-way-merged ([`SegmentMergedReads`](crate::bam::segment_merge::SegmentMergedReads)).
+/// The BAQ → walker chain
+/// ([`with_stage1_chain`](super::stage1_pipeline::with_stage1_chain)) runs
+/// over the merged reads, and only the columns inside the region are
 /// written to one shared [`PspWriter`]. "Whole genome" is not a special
 /// case — it is the region set whose every span covers an entire
 /// contig.
@@ -365,6 +369,30 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     // through the shared `Arc`.
     let walker_fetcher = RepositoryRefFetcher::new(repository.clone(), inputs.contigs.clone());
 
+    // Open one pooled, re-seekable reader per input file, once for the
+    // whole run. Per region we borrow a segment iterator from each and
+    // k-way-merge them (`SegmentMergedReads`) — replacing the old
+    // per-region `AlignmentMergedReader::query`, which re-opened every
+    // input and re-walked its index on each region (the `--regions` tax).
+    // The shared `repository` (cleared per contig transition below) is
+    // handed to every file; BAM ignores it, CRAM decodes against it.
+    let segment_filter = SegmentReadFilter::from(&alignment_cfg);
+    let segment_files: Vec<AlignmentFile> = args
+        .alignment_files
+        .iter()
+        .enumerate()
+        .map(|(input_index, path)| {
+            AlignmentFile::from_input(
+                path.clone(),
+                inputs.headers[input_index].clone(),
+                inputs.indexes[input_index].clone(),
+                Some(repository.clone()),
+                segment_filter,
+                input_index,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+
     let mut total_filter = FilterCounts::default();
     let mut total_walker = RunSummary::default();
     let mut total_baq_skip = (!stage1.no_baq).then(BaqSkipCounts::default);
@@ -382,22 +410,10 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         let contig_name = inputs.contigs.entries[region.chrom_id as usize]
             .name
             .clone();
-        let reader = AlignmentMergedReader::query(
-            &args.alignment_files,
-            &repository,
-            inputs.contigs.clone(),
-            inputs.sample_name.clone(),
-            &inputs.headers,
-            &inputs.indexes,
-            &contig_name,
-            Some(ContigInterval {
-                start: region.start,
-                end: region.end,
-            }),
-            alignment_cfg,
-        )?;
+        let reader =
+            SegmentMergedReads::new(&segment_files, &contig_name, region.start, region.end)?;
 
-        let outputs = super::stage1_pipeline::with_stage1_chain::<RunSummary, PileupCliError, _>(
+        let outputs = super::stage1_pipeline::with_stage1_chain::<_, RunSummary, PileupCliError, _>(
             reader,
             &args.reference,
             &repository,
@@ -408,6 +424,8 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             stage1.baq_chunk_size,
             n_threads,
             stage1.no_baq,
+            &inputs.sample_name,
+            &inputs.contigs,
             |ctx| {
                 drive_region_into_writer(ctx.walker, &mut writer, region.start, region.end)
                     .map_err(PileupCliError::from)
