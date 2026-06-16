@@ -12,8 +12,11 @@
 //! walk / `run()` loop, the name→chrom_id container adapter, the writer-header
 //! build, and the CLI land in the following increments.
 
+use std::collections::HashMap;
+
 use crate::bam::errors::AlignmentInputError;
 use crate::bam::segment_reader::AlignmentFile;
+use crate::psp::registry_ssr::SsrLocusRecord as ContainerRecord;
 use crate::ssr::types::Locus;
 
 use super::candidate_generation::CandidateAllele;
@@ -29,6 +32,8 @@ use super::read_analysis::analyze_read;
 pub(crate) enum SsrPileupError {
     #[error(transparent)]
     Read(#[from] AlignmentInputError),
+    #[error("locus contig {name:?} is not in the reference / alignment header")]
+    ContigNotInReference { name: String },
 }
 
 /// Per-locus scratch reused across loci to avoid allocation churn — the
@@ -108,6 +113,37 @@ pub(crate) fn process_locus(
     Ok(aggregate(locus, &outcomes, qc_counts(&fetched)))
 }
 
+/// Adapt the in-memory (chrom-**name**-keyed, 0-based) [`SsrLocusRecord`] to the
+/// container's (chrom-**id**-keyed, 1-based) record — the SNP-symmetric name→id
+/// boundary that keeps the two `SsrLocusRecord` types distinct by design.
+///
+/// **Coordinate shift:** the in-memory record carries the catalog locus's
+/// 0-based half-open `[start, end)`; the container is 1-based half-open (its
+/// `start` is "1-based", and an end-of-contig locus stores `end == length + 1`),
+/// so both bounds shift by `+1`. The container derives `n_spanning` from
+/// `spanning.len()`, so that field is dropped here.
+pub(crate) fn to_container_record(
+    record: SsrLocusRecord,
+    name_to_id: &HashMap<&str, u32>,
+) -> Result<ContainerRecord, SsrPileupError> {
+    let chrom_id = *name_to_id.get(record.chrom.as_ref()).ok_or_else(|| {
+        SsrPileupError::ContigNotInReference {
+            name: record.chrom.to_string(),
+        }
+    })?;
+    Ok(ContainerRecord {
+        chrom_id,
+        start: record.start + 1, // 0-based inclusive -> 1-based inclusive
+        end: record.end + 1,     // 0-based exclusive -> 1-based exclusive
+        depth: record.depth,
+        n_flanking: record.n_flanking,
+        n_frr: record.n_frr,
+        n_filtered: record.n_filtered,
+        mapped_reads: record.mapped_reads,
+        spanning: record.spanning,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +198,46 @@ mod tests {
     fn qc_counts_all_zero_for_an_empty_locus() {
         let qc = qc_counts(&locus_reads(0, FilterCounts::default()));
         assert_eq!((qc.depth, qc.n_filtered, qc.mapped_reads), (0, 0, 0));
+    }
+
+    fn in_memory_record(chrom: &str, start: u32, end: u32) -> SsrLocusRecord {
+        SsrLocusRecord {
+            chrom: chrom.into(),
+            start,
+            end,
+            depth: 5,
+            n_spanning: 2,
+            n_flanking: 1,
+            n_frr: 0,
+            n_filtered: 3,
+            mapped_reads: 8,
+            spanning: vec![vec![(10u16, -0.5f32)]],
+        }
+    }
+
+    #[test]
+    fn adapter_maps_name_to_id_and_shifts_coords_to_1_based() {
+        let name_to_id = HashMap::from([("chr1", 0u32), ("chr2", 1)]);
+        let c = to_container_record(in_memory_record("chr2", 16, 22), &name_to_id).unwrap();
+
+        assert_eq!(c.chrom_id, 1);
+        assert_eq!((c.start, c.end), (17, 23)); // 0-based [16,22) -> 1-based [17,23)
+        // Other QC/profile fields pass through; n_spanning is derived from
+        // spanning.len() by the container, so it is not carried here.
+        assert_eq!(
+            (c.depth, c.n_flanking, c.n_frr, c.n_filtered, c.mapped_reads),
+            (5, 1, 0, 3, 8)
+        );
+        assert_eq!(c.spanning, vec![vec![(10u16, -0.5f32)]]);
+    }
+
+    #[test]
+    fn adapter_errors_on_a_contig_absent_from_the_reference() {
+        let name_to_id = HashMap::from([("chr1", 0u32)]);
+        let err = to_container_record(in_memory_record("chrX", 1, 5), &name_to_id).unwrap_err();
+        assert!(matches!(
+            err,
+            SsrPileupError::ContigNotInReference { name } if name == "chrX"
+        ));
     }
 }
