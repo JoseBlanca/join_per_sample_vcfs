@@ -11,7 +11,7 @@
 //! snapshots counters after the closure returns and the borrow chain
 //! unwinds.
 //!
-//! `run_pileup` opens one `AlignmentMergedReader::query` reader per
+//! `run_pileup` opens one pooled `SegmentMergedReads` reader per
 //! region and calls [`with_stage1_chain`] once per region, writing the
 //! in-region columns to one shared PSP writer inside the closure.
 
@@ -19,7 +19,7 @@ use std::path::Path;
 
 use noodles_fasta as fasta;
 
-use crate::bam::alignment_input::{AlignmentMergedReader, FilterCounts, MappedRead};
+use crate::bam::alignment_input::{FilterCounts, MappedRead};
 use crate::bam::errors::AlignmentInputError;
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
@@ -54,8 +54,8 @@ use super::cli::error_bridge::ErrorSheddingAdapter;
 /// The walker's input iterator is type-erased to a `Box<dyn ...>` so a
 /// A source of `MappedRead`s for the Stage-1 pipeline: a coordinate-sorted
 /// iterator plus the cheap-filter drop tally it accumulated. Implemented by
-/// both the legacy [`AlignmentMergedReader`] (whole-file / `query`) and the
-/// pooled [`SegmentMergedReads`](crate::bam::segment_merge::SegmentMergedReads),
+/// the pooled
+/// [`SegmentMergedReads`](crate::bam::segment_merge::SegmentMergedReads),
 /// so the pipeline is agnostic to which reader feeds it — the
 /// SNP `--regions` retrofit swaps the reader without touching the BAQ /
 /// walker plumbing.
@@ -70,12 +70,6 @@ pub trait MappedReadSource:
     /// `filter_counts` accessor so an inherent method returning
     /// `&FilterCounts` does not shadow this by-value trait method.
     fn filter_drop_counts(&self) -> FilterCounts;
-}
-
-impl MappedReadSource for AlignmentMergedReader {
-    fn filter_drop_counts(&self) -> FilterCounts {
-        *self.filter_counts()
-    }
 }
 
 impl MappedReadSource for crate::bam::segment_merge::SegmentMergedReads<'_> {

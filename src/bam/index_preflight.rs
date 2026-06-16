@@ -268,11 +268,10 @@ pub fn preflight_alignment_indexes(
 /// extension only. We do not sniff the file's magic bytes — an
 /// explicit extension is required.
 ///
-/// `pub(crate)` so the
-/// [`crate::bam::alignment_input::AlignmentMergedReader::new`]
-/// dispatch can use the same classifier when opening the per-input
-/// record streams (avoids two different "which format is this
-/// path" rules drifting apart).
+/// `pub(crate)` so
+/// [`crate::bam::alignment_input::load_pileup_inputs`] can use the same
+/// classifier when dispatching per-input header reads (avoids two
+/// different "which format is this path" rules drifting apart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlignmentFileKind {
     Cram,

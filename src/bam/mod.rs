@@ -1,21 +1,20 @@
 //! Mapped-read file input — BAM and CRAM.
 //!
 //! Named `bam/` (not `cram/`) because BAM is the more common name for
-//! mapped-read files. The module hosts the format-agnostic merge /
-//! filter / header-validation surface (in [`alignment_input`]) plus
-//! two per-format record-stream decoders ([`cram_input`] and
-//! [`bam_input`]), both producing the same `OpenAlignmentFile`
-//! shape the merge consumes.
+//! mapped-read files. The module hosts the format-agnostic header-
+//! validation + per-read filter surface (in [`alignment_input`]) plus
+//! two per-format open helpers ([`cram_input`] and [`bam_input`]); the
+//! actual per-segment read fetch lives in [`segment_reader`] /
+//! [`segment_merge`].
 //!
-//! - [`alignment_input`] — `AlignmentMergedReader` opens a list of
-//!   coordinate-sorted alignment files for one sample, validates
-//!   their `@SQ` headers against each other and the reference
-//!   FASTA, and produces a single coordinate-sorted
-//!   [`alignment_input::MappedRead`] stream filtered through
-//!   [`alignment_input::AlignmentMergedReaderConfig`]. The merge
-//!   loop and filter cascade are format-agnostic; per-input
-//!   record-stream construction dispatches on file extension
-//!   into the format-specific sibling modules.
+//! - [`alignment_input`] — validates a list of coordinate-sorted
+//!   alignment files for one sample (their `@SQ` headers against each
+//!   other, a single sample name, coordinate sort order) via
+//!   [`alignment_input::load_pileup_inputs`], and owns the
+//!   format-agnostic per-read filter cascade
+//!   ([`alignment_input::AlignmentMergedReaderConfig`]) plus the shared
+//!   `RecordBuf` → [`alignment_input::MappedRead`] conversion the
+//!   segment readers feed through.
 //! - [`errors`] — typed I/O errors raised by the alignment-file
 //!   readers. Reused downstream by the BAQ stream and the cohort
 //!   CLI's error bridge, which is why they live here at the

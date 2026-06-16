@@ -1,13 +1,9 @@
-//! Test fixtures for Group A tests of `alignment_input` — synthetic
-//! `RecordBuf`s assembled from minimal field specs, plus an
-//! `OpenAlignmentFile` factory that wraps a `Vec` in the boxed iterator shape
-//! the merge expects. No filesystem, no FASTA, no noodles writer.
+//! Test fixtures for `alignment_input` — synthetic `RecordBuf`s
+//! assembled from minimal field specs. No filesystem, no FASTA, no
+//! noodles writer.
 //!
 //! See `ia/feature_implementation_plans/per_sample_caller_cram_input.md`
 //! §"Test-fixture helpers".
-
-use std::io;
-use std::path::PathBuf;
 
 use bstr::BString;
 use noodles_sam::alignment::record::Flags;
@@ -19,8 +15,6 @@ use noodles_sam::alignment::record_buf::QualityScores;
 use noodles_sam::alignment::record_buf::RecordBuf;
 use noodles_sam::alignment::record_buf::Sequence;
 
-use crate::bam::alignment_input::OpenAlignmentFile;
-use crate::fasta::{ContigEntry, ContigList};
 use crate::pileup::walker::CigarOp;
 
 /// Spec for a synthetic record built by `record_spec`. Every test
@@ -77,22 +71,4 @@ pub(crate) fn record_spec(spec: RecordSpec) -> RecordBuf {
         .and_then(|p| usize::try_from(p).ok())
         .and_then(noodles_core::Position::new);
     rb
-}
-
-pub(crate) fn open_cram_from_records(path: &str, records: Vec<RecordBuf>) -> OpenAlignmentFile {
-    let iter = records.into_iter().map(Ok::<_, io::Error>);
-    OpenAlignmentFile {
-        path: PathBuf::from(path),
-        records: Box::new(iter),
-    }
-}
-
-pub(crate) fn default_contigs() -> ContigList {
-    ContigList {
-        entries: vec![ContigEntry {
-            name: "chr1".into(),
-            length: 100_000,
-            md5: None,
-        }],
-    }
 }
