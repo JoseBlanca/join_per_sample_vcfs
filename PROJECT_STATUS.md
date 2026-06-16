@@ -19,6 +19,15 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-06-16):** **bed-regions `--regions` performance review**
+>   (branch `bed-regions-review`). Verdict **Profile first** — the segment-read-fetcher
+>   retrofit is confirmed wired into `--regions` (the #5 "retrofit" item is stale), but no
+>   benchmark or sampling profile of the current `SegmentMergedReads` path exists, so the
+>   first deliverable is `benches/regions_pileup_perf.rs` + a profile, not code edits. 6-category
+>   orchestrated review → 7 Likely findings (capped, no profile), top = qname double-clone in the
+>   merge inner loop. Report:
+>   [perf_bed-regions_2026-06-16.md](doc/devel/reports/reviews/perf_bed-regions_2026-06-16.md).
+>   **(suggested follow-up: the code/correctness review of the same `--regions` files, still pending.)**
 > - **Last completed task (2026-06-15):** **SSR Stage 1 (`ssr-pileup`) — tasks 1–2.**
 >   **Task 1:** built the allele model in [src/ssr/types.rs](src/ssr/types.rs) —
 >   `NormalizedSeq` + `Allele` (`OnLadder`/`OffLadder`) with pure
@@ -260,8 +269,9 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
 - **Impl report:** [bed_regions_2026-06-03.md](doc/devel/reports/implementations/bed_regions_2026-06-03.md)
 - **Perf + byte-identity investigation:** [bed_regions_perf_and_byte_identity_2026-06-03.md](doc/devel/reports/bed_regions_perf_and_byte_identity_2026-06-03.md)
 - **Cross-cutting:** Stage 1 (pileup) + var-calling. The pipeline always operates on a `RegionSet` — the `--regions` BED, or one full-length span per contig (whole genome). The whole-file pileup streaming path is retired; pileup now always seeks via the index.
-- **Code:** [src/regions.rs](src/regions.rs) (`RegionSet` + BED parser); region-driven `run_pileup` ([src/pop_var_caller/cli.rs](src/pop_var_caller/cli.rs)) over `AlignmentMergedReader::query` sub-contig ranges + `load_pileup_inputs` ([src/bam/alignment_input.rs](src/bam/alignment_input.rs)); var-calling restriction in [src/var_calling/driver.rs](src/var_calling/driver.rs) (`build_dust_plans` ∩ region set); command-line + regions provenance in [src/psp/header.rs](src/psp/header.rs).
+- **Code:** [src/regions.rs](src/regions.rs) (`RegionSet` + BED parser); region-driven `run_pileup` ([src/pop_var_caller/cli.rs](src/pop_var_caller/cli.rs)) now opens pooled per-file readers once and k-way-merges per region via `SegmentMergedReads` ([src/bam/segment_merge.rs](src/bam/segment_merge.rs) + [src/bam/segment_reader.rs](src/bam/segment_reader.rs)) — the old per-region `AlignmentMergedReader::query` is **gone** (the segment-read-fetcher retrofit landed; cf. cli.rs:374-375); var-calling restriction in [src/var_calling/pipeline.rs](src/var_calling/pipeline.rs) (`restrict_intervals_to_regions`); command-line + regions provenance in [src/psp/header.rs](src/psp/header.rs).
 - **Latest review:** [bed_regions_2026-06-03.md](doc/devel/reports/reviews/bed_regions_2026-06-03.md) — **Approve-with-changes**: 0 Blockers, 6 Major, 9 Minor + Nits. Module structure / concurrency lockstep / idiomatic all clean; `restrict_intervals_to_regions` verified correct. HG002-bottle accuracy identical to `main` (SNP F1 0.9037), pileup time unchanged, peak RSS −71%.
+- **Latest perf review:** [perf_bed-regions_2026-06-16.md](doc/devel/reports/reviews/perf_bed-regions_2026-06-16.md) — Profile-first → **measured** on tomato1 (§8): a fragmentation sweep (80→8000 regions over identical 8 Mb = **+1.9% wall**) + a sampling profile (`probaln_glocal` ~70%; whole `--regions` read/merge path ~1–2%) **refute the per-region/read-path findings as a perf lever.** L1 (qname double-clone) + L3 (dead `Stage1Outputs` clones) applied as **perf-neutral cleanups**; rest closed/deferred. Real lever is BAQ (out of scope). Audit trail `tmp/perf_review_2026-06-16_bed-regions/`.
 - **Open (from the 2026-06-03 review):**
   - **M1** — the three `merge()` counter-folds (`RunSummary`/`FilterCounts`/`BaqSkipCounts`) aren't field-addition-safe (exhaustive-destructure + 3 tests).
   - **M2** — `ContigInterval { start: 0, .. }` is constructible and aborts `query_interval`'s `Position::new(..).expect()` (checked constructor / drop `pub` fields).
@@ -271,6 +281,11 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - **M6** — whole-contig range collapse applied silently with no runtime trace.
   - **Minors:** per-region repeated work (FASTA repo rebuild + clones, undercuts "sparse BED is cheap"); pileup-vs-var-calling provenance asymmetry; empty-BED → silent empty output; `build_map_file_index` third-name / `stashed_upstream` noun; `#[from] AlignmentIndexError` collapses two origins; `#[allow(too_many_arguments)]` without justification. Plus the §8 missing tests (merge folds, `command-line` serde-default round-trip, adversarial BED coordinates, empty-BED pin).
   - **Efficiency follow-up:** indexed `.fai`-seek fetcher to replace the per-region streaming `MultiChromStreamingRefFetcher` rebuild (many sub-contig regions on a large contig).
+- **Resolved by the 2026-06-16 perf review (measured — see report §8):**
+  - **Applied (perf-neutral cleanups, gates green):** L1 qname double-clone → move ([segment_merge.rs](src/bam/segment_merge.rs)); L3 dropped the unread `Stage1Outputs` `sample_name`/`contigs` fields ([stage1_pipeline.rs](src/pop_var_caller/stage1_pipeline.rs)). Neither moves wall (~1% paths) — kept as cleanups, not speedups.
+  - **Closed — no gain:** L5/L6 (merge path ~1–2% of runtime); L7 region-parallelism (serial loop ~2% even at 8000 regions; cores already saturated).
+  - **Deferred — untestable on pre-sliced CRAMs:** L2 `.crai` head binary-search, L4 container cache — need a full un-sliced CRAM + fragmented-BED workload (tomato1 CRAMs are pre-sliced; tiny `.crai`). Still mirrored by the segment-read-fetcher block's deferred items.
+  - **Real lever (out of this feature's scope):** BAQ (`probaln_glocal` ~70% of pileup self-time) — see [perf_baq_2026-05-12.md](ia/reviews/perf_baq_2026-05-12.md).
 
 #### Alignment-file input (CRAM + BAM)
 - **Status:** fixes-applied (BAM slice); shipped (CRAM)
