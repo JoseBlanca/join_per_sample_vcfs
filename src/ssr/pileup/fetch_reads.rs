@@ -6,7 +6,7 @@
 //! - [`Reservoir`] — the read-level depth cap (§8.3), the net-new piece: the SNP
 //!   side has only a *column* cap (`MPLP_MAX_DEPTH`), not a read-level reservoir.
 //! - [`fetch_locus_reads`] — one locus's reads from a sample's
-//!   [`AlignmentFile`](crate::bam::segment_reader::AlignmentFile)s (the pooled
+//!   [`AlignmentFile`]s (the pooled
 //!   indexed-segment reader): segment-query the embedded window, apply the cheap
 //!   coordinate-reach admission gate ([`reaches_locus`]), reservoir-cap the
 //!   survivors, and surface the readers' filter drops for the `n_filtered` QC

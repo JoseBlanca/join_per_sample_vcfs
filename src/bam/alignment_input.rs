@@ -406,12 +406,9 @@ fn extract_single_sample_name(
 /// (name + length, in the same order). The alignment file's
 /// `@SQ M5` is trusted; we do not recompute it from the FASTA.
 ///
-/// Currently uncalled: the only former caller was the deleted whole-file
-/// `AlignmentMergedReader::new`. Retained — and `#[allow(dead_code)]`'d
-/// rather than deleted — because it is the canonical FASTA/`@SQ`
-/// agreement check the indexed `load_pileup_inputs` path is expected to
-/// adopt (it presently only checks that the `.fai` exists).
-#[allow(dead_code)]
+/// Called by [`load_pileup_inputs`] once the canonical `@SQ` list is
+/// known, so a reference whose contigs disagree with the inputs is
+/// rejected before any reads are pulled.
 fn validate_fasta_agreement(
     fasta_path: &Path,
     canonical_contigs: &ContigList,
@@ -692,9 +689,24 @@ pub fn load_pileup_inputs(
         indexes.push(load_alignment_index(path)?);
     }
 
+    let canonical_contigs = canonical_contigs.expect("at least one input validated above");
+    let canonical_sample = canonical_sample.expect("at least one input validated above");
+
+    // FASTA agreement — the reference `.fai` contigs must match the
+    // inputs' canonical `@SQ` list (name + length, in the same order).
+    // The `.fai`-exists check above is not enough: a reference whose
+    // contigs disagree with the alignment files' headers would mis-fetch
+    // reference windows and silently corrupt the pileup. Catch it here,
+    // before any reads are pulled.
+    validate_fasta_agreement(
+        fasta,
+        &canonical_contigs,
+        reference_input_path.as_deref().unwrap_or(fasta),
+    )?;
+
     Ok(PileupInputs {
-        sample_name: canonical_sample.expect("at least one input validated above"),
-        contigs: canonical_contigs.expect("at least one input validated above"),
+        sample_name: canonical_sample,
+        contigs: canonical_contigs,
         headers,
         indexes,
     })
@@ -1723,6 +1735,35 @@ mod tests {
         assert!(
             crai.exists(),
             "build_if_missing should have written the .crai"
+        );
+    }
+
+    #[test]
+    fn load_pileup_inputs_rejects_fasta_contig_mismatch() {
+        // The FASTA `.fai` says chr1 = 200 bp; the CRAM `@SQ` overrides the
+        // length, so the reference disagrees with the input's header.
+        // `load_pileup_inputs` must reject it (the `.fai`-exists check is
+        // not enough) before any reads are pulled.
+        let contigs = one_contig_chr1();
+        let (_fasta_dir, fasta_path) = build_fasta(&contigs).expect("fasta");
+        let overrides = HeaderOverrides {
+            read_groups: vec![("rg0".into(), Some("s1".into()))],
+            length_overrides: vec![("chr1".into(), 999)],
+            ..Default::default()
+        };
+        let records = vec![pass_record_for_b("R1", 0, 100)];
+        let (_cram_dir, input_path) =
+            build_cram(&fasta_path, &contigs, &overrides, &records).expect("build_cram");
+
+        let err = load_pileup_inputs(
+            std::slice::from_ref(&input_path),
+            &fasta_path,
+            /* build = */ true,
+        )
+        .expect_err("FASTA/@SQ length mismatch must be rejected");
+        assert!(
+            matches!(err, AlignmentInputError::FastaContigMismatch { .. }),
+            "expected FastaContigMismatch, got {err:?}"
         );
     }
 

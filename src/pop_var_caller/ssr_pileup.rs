@@ -2,7 +2,7 @@
 //! BAM/CRAM against an SSR catalog ([`crate::ssr::catalog`]) and writes a
 //! per-locus `.ssr.psp` evidence file. The struct below is the authoritative
 //! knob list; [`run_ssr_pileup`] translates it into an
-//! [`SsrPileupConfig`](crate::ssr::pileup::driver::SsrPileupConfig) and drives
+//! [`SsrPileupConfig`] and drives
 //! [`crate::ssr::pileup::driver::run`].
 
 use std::path::PathBuf;
