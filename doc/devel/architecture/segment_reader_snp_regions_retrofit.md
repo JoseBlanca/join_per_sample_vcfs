@@ -200,8 +200,13 @@ the coordinate sort and does not).
    Edge-only (normal data unaffected); narrow to exactly the *too-short* case —
    `classify_pre_decode` drops never reached the old order check either (the
    old `refill_heads` drops them before argmin), so those already agree.
-   Decide: (a) accept the divergence, or (b) have the fetcher surface
-   out-of-order even for filtered reads. Open question.
+   **Decision (2026-06-16): accept the divergence.** A read that is *both*
+   too-short *and* a coordinate regression is dropped (and counted as
+   `too_short`) rather than erroring — a corrupt-input edge case with no effect
+   on well-formed sorted data, and not worth complicating the fetcher to
+   reproduce the old error. The within-file order check stays (it still catches
+   a regression among *kept* reads). Noted at the order-check call site in
+   `segment_merge`.
 
 3. **Dedup buffer membership.** Too-short reads never entered the old dedup
    buffer (dropped before the fingerprint push); they don't reach the new

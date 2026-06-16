@@ -234,6 +234,11 @@ impl Iterator for SegmentMergedReads<'_> {
             };
 
             // 4. Within-file order check against this file's previous accept.
+            //    Accepted divergence from the old reader: a read that is both
+            //    too-short and a coordinate regression was dropped (and
+            //    counted) by the fetcher before reaching here, so it no longer
+            //    triggers this error. Corrupt-input edge only; well-formed
+            //    sorted data is unaffected (see the #5 architecture doc §2).
             if let Some((prev_ref, prev_pos)) = self.per_file_prev_locus[chosen]
                 && (ref_id, pos) < (prev_ref, prev_pos)
             {
@@ -538,5 +543,133 @@ mod tests {
         let files = [file_a, file_b];
         let merged = SegmentMergedReads::new(&files, "chr1", 100, 150).expect("merge");
         assert!(drain(merged).is_empty());
+    }
+
+    /// The gate for the #5 driver flip: the new merge must produce the
+    /// **same** surviving reads (same order) and the **same** `FilterCounts`
+    /// as the old `AlignmentMergedReader::query` over the same multi-file,
+    /// sub-region input. (The accepted divergence — a read that is both
+    /// too-short and out-of-order — is a corrupt-input edge not present in
+    /// well-formed sorted fixtures, so it does not surface here.)
+    #[test]
+    fn byte_identical_to_alignment_merged_reader_query() {
+        use std::path::PathBuf;
+
+        use crate::bam::alignment_input::{
+            AlignmentMergedReader, AlignmentMergedReaderConfig, ContigInterval,
+            build_fasta_repository,
+        };
+        use crate::fasta::{ContigEntry, ContigList};
+        use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
+
+        // Shared FASTA (chr1, 200) for the repository the old query requires
+        // (BAM decode never consults it, but the arg is mandatory).
+        let (_fa_dir, fasta_path) = build_fasta(&[ContigSpec {
+            name: "chr1".into(),
+            length: CONTIG_LEN as u64,
+        }])
+        .expect("fasta");
+        let repository = build_fasta_repository(&fasta_path).expect("repo");
+
+        // Two inputs for one sample: interleaved keepers plus a low-MAPQ drop
+        // in A and a too-short drop in B, so counts parity is exercised too.
+        let good = 34usize; // > DEFAULT_MIN_READ_LENGTH (30)
+        let hdr = Arc::new(header());
+        let dir = TempDir::new().expect("dir");
+        let write = |name: &str, recs: &[RecordBuf]| -> PathBuf {
+            let p = dir.path().join(name);
+            let mut w = bam::io::Writer::new(File::create(&p).expect("create"));
+            w.write_header(&hdr).expect("hdr");
+            for r in recs {
+                w.write_alignment_record(&hdr, r).expect("rec");
+            }
+            w.try_finish().expect("finish");
+            p
+        };
+        let path_a = write(
+            "a.bam",
+            &[
+                record("a_keep1", 5, good, 60),
+                record("a_lowmq", 8, good, 5), // dropped: MAPQ 5 < 20
+                record("a_keep2", 30, good, 60),
+            ],
+        );
+        let path_b = write(
+            "b.bam",
+            &[
+                record("b_keep1", 12, good, 60),
+                record("b_short", 15, 10, 60), // dropped: SEQ 10 < 30
+                record("b_keep2", 40, good, 60),
+            ],
+        );
+
+        let idx_a = AlignmentIndex::BamCsi(Arc::new(build_csi(&path_a)));
+        let idx_b = AlignmentIndex::BamCsi(Arc::new(build_csi(&path_b)));
+        let region = ContigInterval { start: 1, end: 50 };
+
+        // --- old path: AlignmentMergedReader::query ---
+        let old_cfg = AlignmentMergedReaderConfig {
+            min_mapq: Some(20),
+            min_read_length: Some(30),
+            drop_qc_fail: true,
+            drop_duplicate: true,
+            max_read_mismatch_fraction: None, // the merged reader never applies F1 itself
+            mismatch_bq_floor: 0,
+        };
+        let mut old = AlignmentMergedReader::query(
+            &[path_a.clone(), path_b.clone()],
+            &repository,
+            ContigList {
+                entries: vec![ContigEntry {
+                    name: "chr1".into(),
+                    length: CONTIG_LEN as u64,
+                    md5: None,
+                }],
+            },
+            "sample0".into(),
+            &[hdr.clone(), hdr.clone()],
+            &[idx_a.clone(), idx_b.clone()],
+            "chr1",
+            Some(region),
+            old_cfg,
+        )
+        .expect("query");
+        let old_reads: Vec<MappedRead> = old.by_ref().map(|r| r.expect("old ok")).collect();
+        let old_counts = *old.filter_counts();
+
+        // --- new path: SegmentMergedReads over pooled AlignmentFiles ---
+        let filter = SegmentReadFilter {
+            min_mapq: Some(20),
+            min_read_length: Some(30),
+            drop_qc_fail: true,
+            drop_duplicate: true,
+        };
+        let files = [
+            AlignmentFile::from_input(path_a, hdr.clone(), idx_a, None, filter, 0).expect("file a"),
+            AlignmentFile::from_input(path_b, hdr.clone(), idx_b, None, filter, 1).expect("file b"),
+        ];
+        let mut new =
+            SegmentMergedReads::new(&files, "chr1", region.start, region.end).expect("merge");
+        let new_reads: Vec<MappedRead> = new.by_ref().map(|r| r.expect("new ok")).collect();
+        let new_counts = new.filter_counts();
+
+        // The gate: byte-identical reads (incl. source_file_index) + counts.
+        assert_eq!(
+            new_reads, old_reads,
+            "merged reads must match the old query"
+        );
+        assert_eq!(
+            new_counts, old_counts,
+            "filter counts must match the old query"
+        );
+
+        // Sanity on the expected content.
+        let names: Vec<String> = new_reads
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.qname).into_owned())
+            .collect();
+        assert_eq!(names, vec!["a_keep1", "b_keep1", "a_keep2", "b_keep2"]);
+        assert_eq!(new_counts.low_mapq, 1);
+        assert_eq!(new_counts.too_short, 1);
     }
 }
