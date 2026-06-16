@@ -75,7 +75,7 @@ use noodles_sam as sam;
 
 use super::alignment_input::{
     AlignmentMergedReaderConfig, ContigInterval, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
-    MappedRead, PreDecodeOutcome, classify_pre_decode, record_buf_to_mapped_read,
+    FilterCounts, MappedRead, PreDecodeOutcome, classify_pre_decode, record_buf_to_mapped_read,
 };
 use super::bam_input::{BamIndex, open_bam_reader_with_header, query_interval};
 use super::cram_input::open_cram_reader_with_header;
@@ -372,30 +372,42 @@ fn resolve_segment(
 /// both. The BAM-only sorted early-stop (`alignment_start > segment.end`)
 /// stays in the BAM loop — it ends the scan rather than dropping one
 /// record, and the CRAM path has no per-record sort guarantee to exploit.
+///
+/// `counts` accumulates the **filter** drops (flags / MAPQ / length) so a
+/// consumer can report them (the SSR fetcher's `n_filtered` QC column).
+/// Out-of-segment drops — wrong contig, or a footprint the bin-granular
+/// index over-returns at the edges — are *not* counted: they are not reads
+/// "at the locus", just chunk slop.
 fn classify_segment_record(
     record: &sam::alignment::RecordBuf,
     target_reference_sequence_id: usize,
     segment: &ContigInterval,
     filter: &SegmentReadFilter,
+    counts: &mut FilterCounts,
     source_file_index: usize,
     path: &Path,
 ) -> Result<Option<MappedRead>, AlignmentInputError> {
-    // Different contig (a chunk/container straddling contigs) — drop.
+    // Different contig (a chunk/container straddling contigs) — drop,
+    // uncounted (not a read at this segment).
     if record.reference_sequence_id() != Some(target_reference_sequence_id) {
         return Ok(None);
     }
-    // Footprint does not overlap the segment — drop.
+    // Footprint does not overlap the segment — drop, uncounted (index
+    // over-return at the chunk edges).
     if !segment.overlaps_record(record) {
         return Ok(None);
     }
-    // Cheap pre-decode flag/MAPQ filter.
-    if let PreDecodeOutcome::Drop(_) = classify_pre_decode(&filter.pre_decode_config(), record) {
+    // Cheap pre-decode flag/MAPQ filter — a counted filter drop.
+    if let PreDecodeOutcome::Drop(bucket) = classify_pre_decode(&filter.pre_decode_config(), record)
+    {
+        counts.record_drop(bucket);
         return Ok(None);
     }
-    // Min read length.
+    // Min read length — a counted filter drop.
     if let Some(min) = filter.min_read_length
         && (record.sequence().as_ref().len() as u32) < min
     {
+        counts.too_short += 1;
         return Ok(None);
     }
     let mapped = record_buf_to_mapped_read(record, source_file_index).map_err(|source| {
@@ -462,6 +474,7 @@ impl BamFile {
             target_reference_sequence_id: target,
             segment,
             done: false,
+            filter_counts: FilterCounts::default(),
         })
     }
 
@@ -517,6 +530,9 @@ pub(crate) struct BamSegmentReads<'a> {
     /// Latched once we pass the segment end (sort order guarantees
     /// nothing later overlaps) or exhaust the chunks.
     done: bool,
+    /// Running tally of reads dropped by the cheap filter (flags / MAPQ /
+    /// length). Read via [`Self::filter_counts`] after draining.
+    filter_counts: FilterCounts,
 }
 
 impl BamSegmentReads<'_> {
@@ -525,6 +541,12 @@ impl BamSegmentReads<'_> {
             path: self.file.path.clone(),
             source,
         }
+    }
+
+    /// The filter-drop tally accumulated so far. See
+    /// [`MappedReadsInSegment::filter_counts`].
+    fn filter_counts(&self) -> &FilterCounts {
+        &self.filter_counts
     }
 }
 
@@ -593,6 +615,7 @@ impl Iterator for BamSegmentReads<'_> {
                         self.target_reference_sequence_id,
                         &self.segment,
                         &self.file.filter,
+                        &mut self.filter_counts,
                         self.file.source_file_index,
                         &self.file.path,
                     ) {
@@ -660,6 +683,7 @@ impl CramFile {
             target_reference_sequence_id: target,
             segment,
             done: false,
+            filter_counts: FilterCounts::default(),
         })
     }
 
@@ -711,6 +735,9 @@ pub(crate) struct CramSegmentReads<'a> {
     target_reference_sequence_id: usize,
     segment: ContigInterval,
     done: bool,
+    /// Running tally of reads dropped by the cheap filter (flags / MAPQ /
+    /// length). Read via [`Self::filter_counts`] after draining.
+    filter_counts: FilterCounts,
 }
 
 impl CramSegmentReads<'_> {
@@ -719,6 +746,12 @@ impl CramSegmentReads<'_> {
             path: self.file.path.clone(),
             source,
         }
+    }
+
+    /// The filter-drop tally accumulated so far. See
+    /// [`MappedReadsInSegment::filter_counts`].
+    fn filter_counts(&self) -> &FilterCounts {
+        &self.filter_counts
     }
 
     /// Decode the next target-contig container into `pending`. Returns
@@ -809,6 +842,7 @@ impl CramSegmentReads<'_> {
                         self.target_reference_sequence_id,
                         &self.segment,
                         &self.file.filter,
+                        &mut self.filter_counts,
                         self.file.source_file_index,
                         &self.file.path,
                     )? {
@@ -868,6 +902,24 @@ impl Drop for CramSegmentReads<'_> {
 pub(crate) enum MappedReadsInSegment<'a> {
     Bam(BamSegmentReads<'a>),
     Cram(CramSegmentReads<'a>),
+}
+
+impl MappedReadsInSegment<'_> {
+    /// The reads dropped by the cheap [`SegmentReadFilter`] (flags / MAPQ
+    /// / length) during the scan so far, bucketed by reason. Reads dropped
+    /// as out-of-segment (wrong contig, or index over-return at the chunk
+    /// edges) are **not** counted — only genuine filter rejections are.
+    ///
+    /// The tally grows as the iterator is polled, so read it **after
+    /// draining** for the final per-segment totals. The SSR fetcher uses
+    /// it for the `n_filtered` QC column (the reader owns the filter, so it
+    /// owns the count).
+    pub(crate) fn filter_counts(&self) -> &FilterCounts {
+        match self {
+            Self::Bam(reads) => reads.filter_counts(),
+            Self::Cram(reads) => reads.filter_counts(),
+        }
+    }
 }
 
 impl Iterator for MappedReadsInSegment<'_> {
@@ -1095,6 +1147,56 @@ mod tests {
         assert!(drain(&file, "chr1", 5, 5).is_empty());
         // Start exactly on the read's first base → included.
         assert_eq!(drain(&file, "chr1", 1, 1), vec![(1, "a".into())]);
+    }
+
+    #[test]
+    fn bam_filter_drops_are_counted_by_bucket_and_out_of_segment_reads_are_not() {
+        use noodles_sam::alignment::record::Flags;
+        let good_len = (DEFAULT_MIN_READ_LENGTH as usize) + 4; // 34, above the floor
+
+        // A duplicate-flagged read (otherwise admissible) — drops as
+        // `duplicate` under the default filter.
+        let dup = RecordBuf::builder()
+            .set_name(b"dup")
+            .set_reference_sequence_id(0)
+            .set_flags(Flags::DUPLICATE)
+            .set_mapping_quality(MappingQuality::new(60).expect("mapq"))
+            .set_alignment_start(Position::try_from(10).unwrap())
+            .set_cigar([Op::new(Kind::Match, good_len)].into_iter().collect())
+            .set_sequence(Sequence::from(vec![b'A'; good_len]))
+            .set_quality_scores(QualityScores::from(vec![30u8; good_len]))
+            .build();
+
+        // All footprints start at 10 (overlap the [1,50] query) except
+        // `faraway`, which sits past the segment end so the sorted
+        // early-stop should drop it *before* the filter ever sees it.
+        let records = [
+            aln_record("good", 0, 10, good_len, 60),    // kept
+            aln_record("lowmq", 0, 10, good_len, 5),    // low MAPQ (5 < 20)
+            aln_record("short", 0, 10, 10, 60),         // SEQ len 10 < 30
+            dup,                                        // duplicate flag
+            aln_record("faraway", 0, 150, good_len, 5), // low MAPQ but out of segment
+        ];
+        // Default filter (not the permissive one) so the cascade bites.
+        let (_dir, file) = bam_alignment_file(&records, SegmentReadFilter::default());
+
+        let mut reads = file.get_reads_from_segment("chr1", 1, 50).expect("segment");
+        let kept: Vec<String> = reads
+            .by_ref()
+            .map(|r| String::from_utf8_lossy(&r.expect("decode").qname).into_owned())
+            .collect();
+        let counts = reads.filter_counts();
+
+        assert_eq!(kept, vec!["good".to_string()]);
+        assert_eq!(counts.low_mapq, 1);
+        assert_eq!(counts.too_short, 1);
+        assert_eq!(counts.duplicate, 1);
+        // `faraway` is out of segment (sorted early-stop) → never counted,
+        // even though it would have failed the MAPQ filter.
+        assert_eq!(counts.qc_fail, 0);
+        assert_eq!(counts.secondary, 0);
+        assert_eq!(counts.supplementary, 0);
+        assert_eq!(counts.unmapped, 0);
     }
 
     #[test]

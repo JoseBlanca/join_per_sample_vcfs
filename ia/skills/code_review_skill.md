@@ -124,7 +124,7 @@ Compose the report using the *Output format* below. Verdict, top 3, and "What's 
 
 Each finding is filed once. Issues that were merged in step 7 (raised by multiple categories) carry a `**Categories:** <a>, <b>` line citing every sub-agent that surfaced them — this is convergent evidence and should be visible to the author, not hidden behind deduplication.
 
-Save to `reviews/<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
+Save to `doc/devel/reports/reviews/<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
 
 ### 10. Update `PROJECT_STATUS.md`
 
@@ -182,21 +182,21 @@ Be direct. If something is wrong, say so plainly and show the fix. Vague praise 
 
 ### Directory and filename
 
-Save to the project's `reviews/` directory at the crate root:
+Save to the project's `doc/devel/reports/reviews/` directory:
 
 ```
-reviews/<module-slug>_<YYYY-MM-DD>.md
+doc/devel/reports/reviews/<module-slug>_<YYYY-MM-DD>.md
 ```
 
 Examples:
 
-- `reviews/gvcf_parser_2026-04-13.md`
-- `reviews/genotype_merging_2026-04-13.md`
-- `reviews/pr-142_2026-04-13.md`
+- `doc/devel/reports/reviews/gvcf_parser_2026-04-13.md`
+- `doc/devel/reports/reviews/genotype_merging_2026-04-13.md`
+- `doc/devel/reports/reviews/pr-142_2026-04-13.md`
 
 If a review for the same scope and date already exists, append `_v<N>`:
 
-- `reviews/gvcf_parser_2026-04-13_v2.md`
+- `doc/devel/reports/reviews/gvcf_parser_2026-04-13_v2.md`
 
 ### Document header
 
@@ -214,10 +214,10 @@ The body is sections 1–10 of *Output format* above, in order, with verbatim he
 
 ### File links inside findings
 
-References to source files use relative Markdown links from the `reviews/` directory:
+References to source files use relative Markdown links from the `doc/devel/reports/reviews/` directory:
 
-- Single line: `[file.rs](../path/file.rs#L123)`
-- Range: `[file.rs](../path/file.rs#L123-L456)`
+- Single line: `[file.rs](../../../../path/file.rs#L123)`
+- Range: `[file.rs](../../../../path/file.rs#L123-L456)`
 
 Display text is the path (no backticks).
 
@@ -242,7 +242,7 @@ The project tracks the lifecycle of every feature in `PROJECT_STATUS.md` at the 
 
 **At task end** (after the review report has been saved): update only the in-scope feature's block in `PROJECT_STATUS.md`.
 
-- Append a link to the new review under `Latest review:` (or `Latest reviews:` if multiple). Prefer to replace the previous link rather than accumulate a long list — `git log` and `ls reviews/` carry chronology.
+- Append a link to the new review under `Latest review:` (or `Latest reviews:` if multiple). Prefer to replace the previous link rather than accumulate a long list — `git log` and `ls doc/devel/reports/reviews/` carry chronology.
 - Update `Status:` to `reviewed` (or keep `fixes-applied` / `shipped` if the review found nothing material; explain in one trailing word: `shipped (re-reviewed 2026-MM-DD)`).
 - Add any new `Open:` items the review surfaced; do not close existing ones (a review surfaces, it does not resolve — that is the apply-fixes skill's job).
 - Refresh **Current focus** — rewrite `Last completed task` to name this review and link the report. Touch `Next task` only if the human PM has not already set one; otherwise leave it alone, optionally appending `(suggested follow-up: apply fixes)`.
