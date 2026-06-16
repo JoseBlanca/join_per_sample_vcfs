@@ -1,12 +1,12 @@
 # Segment read fetcher — implementation report (2026-06-16)
 
-Plan: [segment_read_fetcher.md](../../../doc/devel/implementation_plans/segment_read_fetcher.md).
+Plan: [segment_read_fetcher.md](../../../../doc/devel/implementation_plans/segment_read_fetcher.md).
 Branch/worktree: `segment-read-fetcher`.
 
 ## 1. Plan
 
 Built the standalone, thread-safe indexed-segment read source in
-[segment_reader.rs](../../../src/bam/segment_reader.rs) (plan increments #1–#3):
+[segment_reader.rs](../../../../src/bam/segment_reader.rs) (plan increments #1–#3):
 `AlignmentFile` enum (`BamFile` / `CramFile`) with a pooled-reader design,
 `get_reads_from_segment`, and `from_input`. Reuses the existing per-format
 decode helpers; adds only reader ownership + pooling. The existing
@@ -40,7 +40,7 @@ decode helpers; adds only reader ownership + pooling. The existing
 
 ## 3. Changes made
 
-- **New** [src/bam/segment_reader.rs](../../../src/bam/segment_reader.rs):
+- **New** [src/bam/segment_reader.rs](../../../../src/bam/segment_reader.rs):
   - `AlignmentFile { Bam(BamFile), Cram(CramFile) }` — `Sync`, shared by `&`.
   - `BamFile` / `CramFile` — `path`, `Arc`-shared index, `Arc<HeaderRefMap>`
     (bundles the `Arc<sam::Header>` the decoder needs with a `name → ref_id`
@@ -54,15 +54,15 @@ decode helpers; adds only reader ownership + pooling. The existing
   - `BamSegmentReads` / `CramSegmentReads` — the per-call streaming iterators
     (chunk-walk / `.crai` container-walk) with the per-record pipeline above.
 - **Visibility lifts** so the primitive reuses existing logic (no fork):
-  - [alignment_input.rs](../../../src/bam/alignment_input.rs): `classify_pre_decode`,
+  - [alignment_input.rs](../../../../src/bam/alignment_input.rs): `classify_pre_decode`,
     `PreDecodeOutcome`, `record_buf_to_mapped_read` → `pub(super)`.
-  - [bam_input.rs](../../../src/bam/bam_input.rs): `query_interval`,
+  - [bam_input.rs](../../../../src/bam/bam_input.rs): `query_interval`,
     `open_bam_reader_with_header` → `pub(super)`.
-  - [cram_input.rs](../../../src/bam/cram_input.rs): `open_cram_reader_with_header`
+  - [cram_input.rs](../../../../src/bam/cram_input.rs): `open_cram_reader_with_header`
     → `pub(super)`.
-- **New errors** in [errors.rs](../../../src/bam/errors.rs): `MissingCramReference`,
+- **New errors** in [errors.rs](../../../../src/bam/errors.rs): `MissingCramReference`,
   `InvalidSegment`.
-- **Module registration** in [mod.rs](../../../src/bam/mod.rs).
+- **Module registration** in [mod.rs](../../../../src/bam/mod.rs).
 
 ## 4. Tests added (18, all in the module)
 

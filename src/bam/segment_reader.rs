@@ -51,16 +51,17 @@
 // Stage-1 fetcher (increment #4) and the SNP `--regions` retrofit
 // (increment #5) are wired onto it — both deferred to their own
 // measured changes per the implementation plan. Without that wiring the
-// public surface (`get_reads_from_segment`, the CRAM path, the
-// dispatch enum) is reachable only from `#[cfg(test)]`, which reads as
-// dead code to the non-test lib build. Allow it module-wide rather than
-// scatter per-item attributes; remove when the consumer lands.
-#![allow(dead_code)]
+// public surface (`get_reads_from_segment`, the CRAM path, the dispatch
+// enum) is reachable only from `#[cfg(test)]`, which reads as dead code
+// to the non-test lib build. Suppress that — but only in the non-test
+// build, so the test build still flags any genuinely-dead helper added
+// later. Remove the attribute entirely when the consumer lands.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::vec;
 
@@ -73,13 +74,81 @@ use noodles_fasta as fasta;
 use noodles_sam as sam;
 
 use super::alignment_input::{
-    AlignmentMergedReaderConfig, ContigInterval, MappedRead, PreDecodeOutcome, classify_pre_decode,
-    record_buf_to_mapped_read,
+    AlignmentMergedReaderConfig, ContigInterval, DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH,
+    MappedRead, PreDecodeOutcome, classify_pre_decode, record_buf_to_mapped_read,
 };
 use super::bam_input::{BamIndex, open_bam_reader_with_header, query_interval};
 use super::cram_input::open_cram_reader_with_header;
 use super::errors::AlignmentInputError;
 use super::index_preflight::{AlignmentFileKind, AlignmentIndex};
+
+// ---------------------------------------------------------------------
+// Read filter (the cheap, pre-decode subset)
+// ---------------------------------------------------------------------
+
+/// The read filters the segment reader applies — deliberately only the
+/// ones that are **cheap to evaluate before fully using a record**: SAM
+/// flags (duplicate / QC-fail / secondary / supplementary / unmapped),
+/// MAPQ, and decoded read length.
+///
+/// This is narrower than [`AlignmentMergedReaderConfig`] on purpose. The
+/// expensive, reference-dependent filters that type also carries —
+/// mismatch fraction (`max_read_mismatch_fraction` / `mismatch_bq_floor`),
+/// bad-CIGAR, indel left-alignment — are intentionally **not**
+/// representable here. A segment read is yielded whole and the consumer
+/// applies those itself: the SSR fetcher realigns every spanning read
+/// (so it distrusts the mapper's CIGAR that those filters lean on), and
+/// the SNP `--regions` path already applies them in its parallel
+/// read-processing stage. Making the reference-dependent fields
+/// unrepresentable means a caller cannot set one and have it silently
+/// ignored.
+///
+/// `min_mapq` / `min_read_length` are `Option`s: `None` is the explicit
+/// "no minimum" state, distinct from any specific threshold.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SegmentReadFilter {
+    /// `None` = no minimum; `Some(n)` = drop reads with MAPQ < n.
+    pub min_mapq: Option<u8>,
+    /// `None` = no minimum; `Some(n)` = drop reads with decoded SEQ
+    /// length < n.
+    pub min_read_length: Option<u32>,
+    /// Drop reads with the QC-fail flag (`0x200`) set.
+    pub drop_qc_fail: bool,
+    /// Drop reads with the duplicate flag (`0x400`) set.
+    pub drop_duplicate: bool,
+}
+
+impl Default for SegmentReadFilter {
+    fn default() -> Self {
+        Self {
+            min_mapq: Some(DEFAULT_MIN_MAPQ),
+            min_read_length: Some(DEFAULT_MIN_READ_LENGTH),
+            drop_qc_fail: true,
+            drop_duplicate: true,
+        }
+    }
+}
+
+impl SegmentReadFilter {
+    /// The flag/MAPQ view consumed by
+    /// [`classify_pre_decode`](super::alignment_input::classify_pre_decode),
+    /// reusing the merged reader's single source of truth for the
+    /// flag-drop policy. The reference-dependent fields are forced
+    /// inert — the segment reader never applies them (see the type
+    /// docs). A new field on [`AlignmentMergedReaderConfig`] breaks this
+    /// literal, forcing a deliberate decision about whether it belongs
+    /// in the cheap-filter set.
+    fn pre_decode_config(&self) -> AlignmentMergedReaderConfig {
+        AlignmentMergedReaderConfig {
+            min_mapq: self.min_mapq,
+            min_read_length: self.min_read_length,
+            drop_qc_fail: self.drop_qc_fail,
+            drop_duplicate: self.drop_duplicate,
+            max_read_mismatch_fraction: None,
+            mismatch_bq_floor: 0,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // Header ref map
@@ -139,15 +208,23 @@ pub(crate) enum AlignmentFile {
 impl AlignmentFile {
     /// Build an [`AlignmentFile`] from one input's already-validated
     /// handles: its `path`, the shared parsed `header`, the loaded
-    /// `index`, the per-read filter `cfg`, and the
-    /// `source_file_index` stamped into every [`MappedRead`] this file
-    /// yields (the caller's position for this file in its input list).
+    /// `index`, the cheap-read `filter`, and the `source_file_index`
+    /// stamped into every [`MappedRead`] this file yields (the caller's
+    /// position for this file in its input list).
     ///
     /// `repository` is the FASTA reference; **required for CRAM**
     /// (slice decoding consults it) and ignored for BAM. The caller
     /// builds it once via
     /// [`crate::bam::alignment_input::build_fasta_repository`] and
     /// shares the clone (an `Arc` bump).
+    ///
+    /// # Filtering
+    ///
+    /// Only the cheap, pre-decode filters in [`SegmentReadFilter`] are
+    /// applied (flags, MAPQ, read length). Reads are otherwise yielded
+    /// whole; the reference-dependent filters (mismatch fraction,
+    /// bad-CIGAR, indel left-alignment) are the consumer's job — see the
+    /// [`SegmentReadFilter`] docs for why.
     ///
     /// # Errors
     ///
@@ -162,7 +239,7 @@ impl AlignmentFile {
         header: Arc<sam::Header>,
         index: AlignmentIndex,
         repository: Option<fasta::Repository>,
-        cfg: AlignmentMergedReaderConfig,
+        filter: SegmentReadFilter,
         source_file_index: usize,
     ) -> Result<Self, AlignmentInputError> {
         let kind = AlignmentFileKind::from_path(&path)
@@ -174,7 +251,7 @@ impl AlignmentFile {
                 path,
                 index: BamIndex::Csi(idx),
                 ref_map,
-                cfg,
+                filter,
                 source_file_index,
                 readers_pool: Mutex::new(Vec::new()),
             })),
@@ -182,7 +259,7 @@ impl AlignmentFile {
                 path,
                 index: BamIndex::Bai(idx),
                 ref_map,
-                cfg,
+                filter,
                 source_file_index,
                 readers_pool: Mutex::new(Vec::new()),
             })),
@@ -195,18 +272,29 @@ impl AlignmentFile {
                     index: idx,
                     repository,
                     ref_map,
-                    cfg,
+                    filter,
                     source_file_index,
                     readers_pool: Mutex::new(Vec::new()),
                 }))
             }
-            // Format / index disagreement — the driver's index loader
-            // and the file extension say different things.
-            (kind, index) => Err(AlignmentInputError::AlignmentIndexFormatMismatch {
-                path,
-                file_format: kind.display_name(),
-                index_format: index.display_name(),
-            }),
+            // Genuine format / index disagreements — the driver's index
+            // loader and the file extension say different things. These
+            // are enumerated explicitly (rather than caught by a `_`
+            // wildcard) so that adding a new `AlignmentIndex` variant —
+            // the enum is `#[non_exhaustive]` — forces a new arm here
+            // instead of being silently absorbed as a "format mismatch".
+            // Mirrors `AlignmentMergedReader::query`'s convention.
+            (
+                AlignmentFileKind::Cram,
+                index @ (AlignmentIndex::BamCsi(_) | AlignmentIndex::BamBai(_)),
+            )
+            | (AlignmentFileKind::Bam, index @ AlignmentIndex::Crai(_)) => {
+                Err(AlignmentInputError::AlignmentIndexFormatMismatch {
+                    path,
+                    file_format: kind.display_name(),
+                    index_format: index.display_name(),
+                })
+            }
         }
     }
 
@@ -218,6 +306,10 @@ impl AlignmentFile {
     ///
     /// Callable concurrently from many threads for different segments
     /// through a shared `&AlignmentFile`.
+    ///
+    /// Reads failing the cheap [`SegmentReadFilter`] (flags / MAPQ /
+    /// length) are dropped; everything else is yielded whole, with the
+    /// reference-dependent filters left to the consumer.
     ///
     /// # Errors
     ///
@@ -269,6 +361,55 @@ fn resolve_segment(
     Ok((target, ContigInterval { start, end }))
 }
 
+/// Apply the per-record cascade shared by both formats once a record has
+/// been decoded: target-contig check, segment overlap, the cheap
+/// pre-decode flag/MAPQ filter, and the min-read-length filter — then
+/// convert to [`MappedRead`]. Returns `Ok(Some(read))` to keep,
+/// `Ok(None)` to drop, and `Err` for a malformed record.
+///
+/// This is the single source of truth for filter membership and ordering
+/// across the BAM and CRAM iterators, so a change to either applies to
+/// both. The BAM-only sorted early-stop (`alignment_start > segment.end`)
+/// stays in the BAM loop — it ends the scan rather than dropping one
+/// record, and the CRAM path has no per-record sort guarantee to exploit.
+fn classify_segment_record(
+    record: &sam::alignment::RecordBuf,
+    target_reference_sequence_id: usize,
+    segment: &ContigInterval,
+    filter: &SegmentReadFilter,
+    source_file_index: usize,
+    path: &Path,
+) -> Result<Option<MappedRead>, AlignmentInputError> {
+    // Different contig (a chunk/container straddling contigs) — drop.
+    if record.reference_sequence_id() != Some(target_reference_sequence_id) {
+        return Ok(None);
+    }
+    // Footprint does not overlap the segment — drop.
+    if !segment.overlaps_record(record) {
+        return Ok(None);
+    }
+    // Cheap pre-decode flag/MAPQ filter.
+    if let PreDecodeOutcome::Drop(_) = classify_pre_decode(&filter.pre_decode_config(), record) {
+        return Ok(None);
+    }
+    // Min read length.
+    if let Some(min) = filter.min_read_length
+        && (record.sequence().as_ref().len() as u32) < min
+    {
+        return Ok(None);
+    }
+    let mapped = record_buf_to_mapped_read(record, source_file_index).map_err(|source| {
+        AlignmentInputError::MalformedRecord {
+            path: path.to_path_buf(),
+            qname: record
+                .name()
+                .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned()),
+            source,
+        }
+    })?;
+    Ok(Some(mapped))
+}
+
 // ---------------------------------------------------------------------
 // BAM
 // ---------------------------------------------------------------------
@@ -279,7 +420,7 @@ pub(crate) struct BamFile {
     path: PathBuf,
     index: BamIndex,
     ref_map: Arc<HeaderRefMap>,
-    cfg: AlignmentMergedReaderConfig,
+    filter: SegmentReadFilter,
     source_file_index: usize,
     readers_pool: Mutex<Vec<BamReaderHandle>>,
 }
@@ -328,12 +469,7 @@ impl BamFile {
     /// pool is empty (the only file-open; happens ~once per concurrent
     /// caller).
     fn borrow_handle(&self) -> Result<BamReaderHandle, AlignmentInputError> {
-        if let Some(handle) = self
-            .readers_pool
-            .lock()
-            .expect("reader pool not poisoned")
-            .pop()
-        {
+        if let Some(handle) = self.lock_pool().pop() {
             return Ok(handle);
         }
         let (reader, _header) = open_bam_reader_with_header(&self.path)?;
@@ -341,17 +477,24 @@ impl BamFile {
     }
 
     fn return_handle(&self, handle: BamReaderHandle) {
-        if let Ok(mut pool) = self.readers_pool.lock() {
-            pool.push(handle);
-        }
+        self.lock_pool().push(handle);
+    }
+
+    /// Lock the pool, recovering the guard if a previous panic poisoned
+    /// the mutex. The lock only ever guards `Vec` pop/push/len — none of
+    /// which can unwind — so poisoning cannot happen through this type's
+    /// own code; recovering (rather than `expect`-panicking on borrow and
+    /// silently dropping the reader on return) keeps a poison introduced
+    /// elsewhere from cascading across every later query.
+    fn lock_pool(&self) -> std::sync::MutexGuard<'_, Vec<BamReaderHandle>> {
+        self.readers_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(test)]
     fn pool_len(&self) -> usize {
-        self.readers_pool
-            .lock()
-            .expect("reader pool not poisoned")
-            .len()
+        self.lock_pool().len()
     }
 }
 
@@ -360,7 +503,10 @@ impl BamFile {
 /// On drop it returns the borrowed reader to its [`BamFile`]'s pool.
 pub(crate) struct BamSegmentReads<'a> {
     file: &'a BamFile,
-    /// `Some` while borrowed; taken in `Drop` to return to the pool.
+    /// The borrowed reader. `Some` for the whole iterator lifetime;
+    /// taken only in `Drop` to return it to the pool. `next` therefore
+    /// always finds it present — the `.expect("handle held")` accesses
+    /// below cannot fire, because `next` never runs during `Drop`.
     handle: Option<BamReaderHandle>,
     chunks: vec::IntoIter<Chunk>,
     /// Virtual position where the current chunk ends, or `None` to
@@ -430,44 +576,31 @@ impl Iterator for BamSegmentReads<'_> {
                     continue;
                 }
                 Ok(_) => {
-                    // Different contig (a chunk straddling contigs) — skip.
-                    if record.reference_sequence_id() != Some(self.target_reference_sequence_id) {
-                        continue;
-                    }
-                    // Past the segment end → nothing later overlaps.
-                    if let Some(astart) = record.alignment_start()
+                    // BAM-only sorted early-stop: once a target-contig
+                    // read starts past the segment end, nothing later in
+                    // this linear scan can overlap, so end the iterator.
+                    if record.reference_sequence_id() == Some(self.target_reference_sequence_id)
+                        && let Some(astart) = record.alignment_start()
                         && usize::from(astart) as u64 > u64::from(self.segment.end)
                     {
                         self.done = true;
                         return None;
                     }
-                    // Footprint does not overlap (ends before start, or
-                    // the chunk over-returned) — skip.
-                    if !self.segment.overlaps_record(&record) {
-                        continue;
-                    }
-                    // Pre-decode flag/mapq filter.
-                    if let PreDecodeOutcome::Drop(_) = classify_pre_decode(&self.file.cfg, &record)
-                    {
-                        continue;
-                    }
-                    // Min read length (cheap, pre-conversion).
-                    if let Some(min) = self.file.cfg.min_read_length
-                        && (record.sequence().as_ref().len() as u32) < min
-                    {
-                        continue;
-                    }
-                    match record_buf_to_mapped_read(&record, self.file.source_file_index) {
-                        Ok(mapped) => return Some(Ok(mapped)),
-                        Err(source) => {
+                    // Shared per-record cascade (contig / overlap / filter
+                    // / convert).
+                    match classify_segment_record(
+                        &record,
+                        self.target_reference_sequence_id,
+                        &self.segment,
+                        &self.file.filter,
+                        self.file.source_file_index,
+                        &self.file.path,
+                    ) {
+                        Ok(Some(mapped)) => return Some(Ok(mapped)),
+                        Ok(None) => continue,
+                        Err(e) => {
                             self.done = true;
-                            return Some(Err(AlignmentInputError::MalformedRecord {
-                                path: self.file.path.clone(),
-                                qname: record
-                                    .name()
-                                    .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned()),
-                                source,
-                            }));
+                            return Some(Err(e));
                         }
                     }
                 }
@@ -499,7 +632,7 @@ pub(crate) struct CramFile {
     index: Arc<cram::crai::Index>,
     repository: fasta::Repository,
     ref_map: Arc<HeaderRefMap>,
-    cfg: AlignmentMergedReaderConfig,
+    filter: SegmentReadFilter,
     source_file_index: usize,
     readers_pool: Mutex<Vec<CramReaderHandle>>,
 }
@@ -531,12 +664,7 @@ impl CramFile {
     }
 
     fn borrow_handle(&self) -> Result<CramReaderHandle, AlignmentInputError> {
-        if let Some(handle) = self
-            .readers_pool
-            .lock()
-            .expect("reader pool not poisoned")
-            .pop()
-        {
+        if let Some(handle) = self.lock_pool().pop() {
             return Ok(handle);
         }
         let (reader, _header) = open_cram_reader_with_header(&self.path, Some(&self.repository))?;
@@ -544,17 +672,22 @@ impl CramFile {
     }
 
     fn return_handle(&self, handle: CramReaderHandle) {
-        if let Ok(mut pool) = self.readers_pool.lock() {
-            pool.push(handle);
-        }
+        self.lock_pool().push(handle);
+    }
+
+    /// Lock the pool, recovering the guard on poison. See
+    /// [`BamFile::lock_pool`] for the rationale (the lock guards only
+    /// `Vec` operations, so a poison can only originate elsewhere, and
+    /// recovering keeps it from cascading across later queries).
+    fn lock_pool(&self) -> std::sync::MutexGuard<'_, Vec<CramReaderHandle>> {
+        self.readers_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(test)]
     fn pool_len(&self) -> usize {
-        self.readers_pool
-            .lock()
-            .expect("reader pool not poisoned")
-            .len()
+        self.lock_pool().len()
     }
 }
 
@@ -564,6 +697,10 @@ impl CramFile {
 /// borrowed reader to its [`CramFile`]'s pool.
 pub(crate) struct CramSegmentReads<'a> {
     file: &'a CramFile,
+    /// The borrowed reader. `Some` for the whole iterator lifetime;
+    /// taken only in `Drop`. `refill` always finds it present — the
+    /// `.expect("handle held")` access cannot fire, because `refill`
+    /// never runs during `Drop`.
     handle: Option<CramReaderHandle>,
     /// Cursor into the `.crai` (held by `Arc` on the file, walked by
     /// integer to keep the struct free of self-referential borrows).
@@ -600,17 +737,22 @@ impl CramSegmentReads<'_> {
                 continue;
             }
 
-            // Container-level skip: a container whose footprint is
-            // disjoint from the segment holds nothing we want, so we
-            // can avoid the seek + decode entirely.
+            // Container-level narrowing using the coordinate-ordered
+            // `.crai`: skip a container entirely before the segment, and
+            // — crucially — *stop the whole walk* once a container starts
+            // past the segment end, since every later container on this
+            // contig starts no earlier and so cannot overlap. Without the
+            // stop, a tiny locus near the start of a large contig would
+            // scan that contig's entire index tail on every call.
             if let Some(container_start) = record.alignment_start() {
                 let container_start = usize::from(container_start) as u64;
+                if container_start > u64::from(self.segment.end) {
+                    return Ok(true);
+                }
                 let span = record.alignment_span() as u64;
                 if span > 0 {
                     let container_end = container_start + span - 1;
-                    if container_end < u64::from(self.segment.start)
-                        || container_start > u64::from(self.segment.end)
-                    {
+                    if container_end < u64::from(self.segment.start) {
                         continue;
                     }
                 }
@@ -660,30 +802,18 @@ impl CramSegmentReads<'_> {
                     let record =
                         sam::alignment::RecordBuf::try_from_alignment_record(header, cram_record)
                             .map_err(|e| self.io_error(e))?;
-                    if record.reference_sequence_id() != Some(self.target_reference_sequence_id) {
-                        continue;
+                    // Shared per-record cascade (contig / overlap / filter
+                    // / convert) — identical to the BAM path.
+                    if let Some(mapped) = classify_segment_record(
+                        &record,
+                        self.target_reference_sequence_id,
+                        &self.segment,
+                        &self.file.filter,
+                        self.file.source_file_index,
+                        &self.file.path,
+                    )? {
+                        converted.push(mapped);
                     }
-                    if !self.segment.overlaps_record(&record) {
-                        continue;
-                    }
-                    if let PreDecodeOutcome::Drop(_) = classify_pre_decode(&self.file.cfg, &record)
-                    {
-                        continue;
-                    }
-                    if let Some(min) = self.file.cfg.min_read_length
-                        && (record.sequence().as_ref().len() as u32) < min
-                    {
-                        continue;
-                    }
-                    let mapped = record_buf_to_mapped_read(&record, self.file.source_file_index)
-                        .map_err(|source| AlignmentInputError::MalformedRecord {
-                            path: self.file.path.clone(),
-                            qname: record
-                                .name()
-                                .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned()),
-                            source,
-                        })?;
-                    converted.push(mapped);
                 }
             }
             self.pending = converted.into_iter();
@@ -786,14 +916,12 @@ mod tests {
 
     /// Filters off — these overlap tests probe the seek + overlap
     /// logic, not the flag/mapq cascade (which has its own test).
-    fn permissive_config() -> AlignmentMergedReaderConfig {
-        AlignmentMergedReaderConfig {
+    fn permissive_config() -> SegmentReadFilter {
+        SegmentReadFilter {
             min_mapq: None,
             min_read_length: None,
             drop_qc_fail: false,
             drop_duplicate: false,
-            max_read_mismatch_fraction: None,
-            mismatch_bq_floor: 0,
         }
     }
 
@@ -886,7 +1014,7 @@ mod tests {
     /// `TempDir` alive via the returned handle.
     fn bam_alignment_file(
         records: &[RecordBuf],
-        cfg: AlignmentMergedReaderConfig,
+        filter: SegmentReadFilter,
     ) -> (TempDir, AlignmentFile) {
         let header = header_two_contigs();
         let (dir, bam_path) = write_bam(records, &header);
@@ -896,7 +1024,7 @@ mod tests {
             Arc::new(header),
             AlignmentIndex::BamCsi(Arc::new(csi)),
             None,
-            cfg,
+            filter,
             /* source_file_index = */ 7,
         )
         .expect("build alignment file");
@@ -1014,6 +1142,28 @@ mod tests {
     }
 
     #[test]
+    fn bam_pool_survives_a_poisoned_lock() {
+        let records = [aln_record("a", 0, 10, 4, 60), aln_record("b", 0, 20, 4, 60)];
+        let (_dir, file) = bam_alignment_file(&records, permissive_config());
+
+        // Poison the pool mutex by panicking while holding its guard.
+        let AlignmentFile::Bam(bam) = &file else {
+            unreachable!("built a BAM file");
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = bam.readers_pool.lock().unwrap();
+            panic!("poison the pool");
+        }));
+        assert!(bam.readers_pool.is_poisoned(), "pool should be poisoned");
+
+        // A poisoned pool must not take down queries: borrow + return
+        // recover the guard rather than panicking (the old `expect`) or
+        // silently dropping the reader (the old `if let Ok`).
+        assert_eq!(drain(&file, "chr1", 1, 200).len(), 2);
+        assert_eq!(pool_len(&file), 1);
+    }
+
+    #[test]
     fn bam_parallel_segments_match_sequential() {
         // Reads every 5 bp across chr1; query overlapping windows.
         let records: Vec<RecordBuf> = (0..30)
@@ -1057,11 +1207,11 @@ mod tests {
             aln_record("high", 0, 12, 4, 60),
         ];
         // Isolate the MAPQ gate (min_mapq = 20) from the other filters.
-        let cfg = AlignmentMergedReaderConfig {
+        let filter = SegmentReadFilter {
             min_mapq: Some(20),
             ..permissive_config()
         };
-        let (_dir, file) = bam_alignment_file(&records, cfg);
+        let (_dir, file) = bam_alignment_file(&records, filter);
 
         assert_eq!(drain(&file, "chr1", 1, 200), vec![(12, "high".into())]);
     }
@@ -1100,7 +1250,7 @@ mod tests {
     /// contig `chr1`. Keeps both tempdirs (FASTA + CRAM) alive.
     fn cram_alignment_file(
         records: &[RecordBuf],
-        cfg: AlignmentMergedReaderConfig,
+        filter: SegmentReadFilter,
     ) -> (TempDir, TempDir, AlignmentFile) {
         let contigs = [ContigSpec {
             name: "chr1".into(),
@@ -1121,7 +1271,7 @@ mod tests {
             Arc::new(header),
             AlignmentIndex::Crai(Arc::new(index)),
             Some(repository),
-            cfg,
+            filter,
             /* source_file_index = */ 3,
         )
         .expect("build alignment file");
@@ -1153,6 +1303,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.source_file_index, 3);
+    }
+
+    /// Exercises the container-level early-stop: when the container the
+    /// `.crai` points at starts past the segment end, the walk stops and
+    /// yields nothing — without dropping a container that *does* overlap.
+    /// (The fixture writer packs these few reads into one container, so
+    /// this checks the stop fires correctly on the observable single-
+    /// container case; the multi-container stop is the same predicate.)
+    #[test]
+    fn cram_early_stops_when_container_starts_past_segment() {
+        // All reads start at 100+ → the only container starts at 100.
+        let records = [
+            aln_record("a", 0, 100, 4, 60),
+            aln_record("b", 0, 110, 4, 60),
+        ];
+        let (_fa, _cram, file) = cram_alignment_file(&records, permissive_config());
+
+        // Segment entirely before the container start → early-stop, empty.
+        assert!(drain(&file, "chr1", 1, 50).is_empty());
+        assert_eq!(pool_len(&file), 1);
+
+        // Segment reaching the container is still served (stop not too eager).
+        assert_eq!(
+            drain(&file, "chr1", 100, 130),
+            vec![(100, "a".into()), (110, "b".into())]
+        );
     }
 
     #[test]
@@ -1257,6 +1433,38 @@ mod tests {
                 Arc::new(header),
                 AlignmentIndex::Crai(Arc::new(empty_crai)),
                 None,
+                permissive_config(),
+                0,
+            ),
+            Err(AlignmentInputError::AlignmentIndexFormatMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn from_input_rejects_cram_with_bam_index() {
+        // The other mismatch arm: a CRAM file paired with a BAM CSI index.
+        let contigs = [ContigSpec {
+            name: "chr1".into(),
+            length: CONTIG_LEN as u64,
+        }];
+        let (_fa, fasta_path) = build_fasta(&contigs).expect("build fasta");
+        let (_cram, cram_path) = build_cram(
+            &fasta_path,
+            &contigs,
+            &HeaderOverrides::default(),
+            &[aln_record("a", 0, 1, 4, 60)],
+        )
+        .expect("build cram");
+        let repository = build_fasta_repository(&fasta_path).expect("repository");
+        let (_reader, header) =
+            open_cram_reader_with_header(&cram_path, Some(&repository)).expect("read header");
+
+        assert!(matches!(
+            AlignmentFile::from_input(
+                cram_path,
+                Arc::new(header),
+                AlignmentIndex::BamCsi(Arc::new(noodles_csi::Index::default())),
+                Some(repository),
                 permissive_config(),
                 0,
             ),

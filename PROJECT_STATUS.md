@@ -19,14 +19,17 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-16):** **Segment read fetcher** —
->   the standalone, thread-safe indexed-segment read source in
->   [src/bam/segment_reader.rs](src/bam/segment_reader.rs) (plan increments
->   #1–#3: `AlignmentFile` + pooled re-seekable BAM/CRAM readers +
->   `get_reads_from_segment`), built ahead of its SSR/SNP consumers
->   (#4/#5 deferred). Report:
->   [segment_read_fetcher_2026-06-16.md](doc/devel/reports/implementations/segment_read_fetcher_2026-06-16.md);
->   18 in-module tests, all gates green.
+> - **Last completed task (2026-06-16):** **Segment read fetcher — review
+>   fixes applied** (`src/bam/segment_reader.rs`). All 6 Majors from the
+>   same-day review Applied (Mutex-poison recovery, explicit format/index
+>   mismatch arms, shared BAM/CRAM filter chokepoint, CRAM container
+>   early-stop, narrow `SegmentReadFilter`, report-location convention) plus
+>   2 Minors; 1059 lib + integration tests pass. Fix report:
+>   [fixes_applied_2026-06-16.md](doc/devel/reports/reviews/fixes_applied_2026-06-16.md);
+>   review: [segment_reader_2026-06-16.md](doc/devel/reports/reviews/segment_reader_2026-06-16.md);
+>   impl: [segment_read_fetcher_2026-06-16.md](doc/devel/reports/implementations/segment_read_fetcher_2026-06-16.md).
+>   Also fixed the report-path convention across the four report-writing
+>   skills on `main` (`8c32b00`).
 > - **Previously (2026-06-08):** **Code review of `src/var_calling/`**
 >   (orchestrator skill, 10 categories; `main` @ `35a6b67`; the re-architected
 >   record-streaming pipeline, excluding the PM-deferred `posterior_engine`
@@ -122,16 +125,18 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - Lift the no-mixing restriction (CRAM + BAM in one invocation) if a real workload appears. Pre-flight gate is the only place the restriction lives; merge core is already format-agnostic.
 
 #### Segment read fetcher (shared indexed-segment read source)
-- **Status:** implemented (increments #1–#3; standalone primitive, no consumer wired yet)
+- **Status:** fixes-applied (2026-06-16; increments #1–#3; standalone primitive, no consumer wired yet)
 - **Plan:** [segment_read_fetcher.md](doc/devel/implementation_plans/segment_read_fetcher.md)
 - **Impl report:** [segment_read_fetcher_2026-06-16.md](doc/devel/reports/implementations/segment_read_fetcher_2026-06-16.md)
-- **Code:** [src/bam/segment_reader.rs](src/bam/segment_reader.rs) — `AlignmentFile` (`BamFile`/`CramFile`), `from_input`, `get_reads_from_segment`, pooled re-seekable readers (`Mutex<Vec<Handle>>`), `MappedReadsInSegment` per-call iterators. Reuses `classify_pre_decode` / `record_buf_to_mapped_read` / `query_interval` / `ContigInterval::overlaps_record` (visibility lifted to `pub(super)`); two new typed errors (`MissingCramReference`, `InvalidSegment`).
-- **Tests:** 18 in-module (overlap + 1-based-inclusive edges, read spanning two segments yielded by both, pool open-once / resting size, `par_iter` determinism on a shared `&AlignmentFile`, empty segment, target-contig + MAPQ filters, error paths; BAM + CRAM, `.crai` via `cram::fs::index`). All gates green (fmt / clippy `-D warnings` / doc; 1056 lib + integration tests).
-- **Open:**
+- **Code:** [src/bam/segment_reader.rs](src/bam/segment_reader.rs) — `AlignmentFile` (`BamFile`/`CramFile`), `from_input`, `get_reads_from_segment`, pooled re-seekable readers (`Mutex<Vec<Handle>>`), `MappedReadsInSegment` per-call iterators, narrow `SegmentReadFilter` config, shared `classify_segment_record` per-record cascade. Reuses `classify_pre_decode` / `record_buf_to_mapped_read` / `query_interval` / `ContigInterval::overlaps_record` (visibility lifted to `pub(super)`); two new typed errors (`MissingCramReference`, `InvalidSegment`).
+- **Tests:** 21 in-module (overlap + 1-based-inclusive edges, read spanning two segments yielded by both, pool open-once / resting size, poisoned-pool recovery, `par_iter` determinism on a shared `&AlignmentFile`, empty segment, CRAM container early-stop, target-contig + MAPQ filters, both format/index mismatch arms, error paths; BAM + CRAM, `.crai` via `cram::fs::index`). All gates green (fmt / clippy `-D warnings` / doc; 1059 lib + integration tests).
+- **Latest review:** [segment_reader_2026-06-16.md](doc/devel/reports/reviews/segment_reader_2026-06-16.md) — **Approve-with-changes**: 0 Blockers, 6 Major, 9 Minor + Nits. Concurrency design verified sound; happy path well tested both formats. Audit trail: `tmp/review_2026-06-16_segment-reader/`.
+- **Latest fixes-applied:** [fixes_applied_2026-06-16.md](doc/devel/reports/reviews/fixes_applied_2026-06-16.md) — all 6 Majors **Applied** (M1 Mutex-poison recovery + test; M2 explicit format/index mismatch arms + test; M3 shared `classify_segment_record` chokepoint; M4 CRAM container early-stop + test; M5 narrow `SegmentReadFilter`; M6 report-location convention fixed in the skills on `main` `8c32b00` + report moved) plus Mi1 (handle-invariant docs) and Mi2 (`#[cfg_attr(not(test), allow(dead_code))]`). 1059 lib + integration tests pass; the only `--all-targets` failure is the pre-existing `psp_writer_perf` bench panic.
+- **Open (deferred from the 2026-06-16 fix run):**
+  - **Minors:** `get_reads_from_segment` `get_`-prefix / diverges from `query` (Mi3, naming — decide at #5); pool-never-shrinks doc note (Mi4); residual inline `Io` sites (Mi5, reader-scoped borrow constraint); cast-spelling + boundary test (Mi6); CRAM container-skip `span==0` test (Mi7, blocked on a multi-container fixture knob); `from_input` path↔header validation (Mi8, when #4 lands); test-only back-ref into `pileup::per_sample::cram_files` (Mi9). Plus the §8 missing tests not yet added (handle-leak-on-index-error, BAM error-fuse, min-length-filters-everything ×2, CRAM error paths, downstream-container completeness, `resolve_segment` boundary) — several blocked on the multi-container fixture limitation. Nits grouped for a cosmetic pass.
   - **#4** — wire the SSR Stage-1 `fetch_locus_reads` onto it (deferred: SSR module not on this branch).
-  - **#5** — retrofit the SNP `--regions` path (replace per-BED-interval re-`query`), measuring the `--regions` tax improvement.
-  - **#5 prereq** — converge the duplicated chunk/container-walk with `OwnedIndexed{Bam,Cram}Records` once `query` migrates onto this primitive.
-  - Deferred (plan §8): CRAM container cache; CRAM per-record early-stop. Remove the module-level `#![allow(dead_code)]` when a consumer lands.
+  - **#5** — retrofit the SNP `--regions` path (replace per-BED-interval re-`query`), measuring the `--regions` tax improvement; converge the duplicated chunk/container-walk with `OwnedIndexed{Bam,Cram}Records` then. Remove the module-level dead-code allow when a consumer lands.
+  - Deferred (plan §8): CRAM container cache; binary-search the crai head (measure-first, when #4 provides a real workload).
 
 #### Pileup walker
 - **Status:** shipped
