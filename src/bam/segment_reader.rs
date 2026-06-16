@@ -129,6 +129,22 @@ impl Default for SegmentReadFilter {
     }
 }
 
+impl From<&AlignmentMergedReaderConfig> for SegmentReadFilter {
+    /// Project the merged reader's full config onto the cheap subset the
+    /// segment reader applies. The reference-dependent fields
+    /// (`max_read_mismatch_fraction` / `mismatch_bq_floor`) are dropped —
+    /// the segment reader never applies them; the SNP `--regions` path's
+    /// downstream read-processing stage does (and the SSR fetcher realigns).
+    fn from(config: &AlignmentMergedReaderConfig) -> Self {
+        Self {
+            min_mapq: config.min_mapq,
+            min_read_length: config.min_read_length,
+            drop_qc_fail: config.drop_qc_fail,
+            drop_duplicate: config.drop_duplicate,
+        }
+    }
+}
+
 impl SegmentReadFilter {
     /// The flag/MAPQ view consumed by
     /// [`classify_pre_decode`](super::alignment_input::classify_pre_decode),

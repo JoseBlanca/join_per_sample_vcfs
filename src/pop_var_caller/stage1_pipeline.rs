@@ -78,6 +78,12 @@ impl MappedReadSource for AlignmentMergedReader {
     }
 }
 
+impl MappedReadSource for crate::bam::segment_merge::SegmentMergedReads<'_> {
+    fn filter_drop_counts(&self) -> FilterCounts {
+        self.filter_counts()
+    }
+}
+
 /// single closure type signature covers both branches. The boxing
 /// costs one indirection per `PreparedRead` — invisible against the
 /// HMM / walker bookkeeping the per-record budget already pays.
