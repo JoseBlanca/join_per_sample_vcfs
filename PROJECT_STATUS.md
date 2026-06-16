@@ -19,7 +19,15 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-08):** **Code review of `src/var_calling/`**
+> - **Last completed task (2026-06-16):** **Segment read fetcher** —
+>   the standalone, thread-safe indexed-segment read source in
+>   [src/bam/segment_reader.rs](src/bam/segment_reader.rs) (plan increments
+>   #1–#3: `AlignmentFile` + pooled re-seekable BAM/CRAM readers +
+>   `get_reads_from_segment`), built ahead of its SSR/SNP consumers
+>   (#4/#5 deferred). Report:
+>   [segment_read_fetcher_2026-06-16.md](doc/devel/reports/implementations/segment_read_fetcher_2026-06-16.md);
+>   18 in-module tests, all gates green.
+> - **Previously (2026-06-08):** **Code review of `src/var_calling/`**
 >   (orchestrator skill, 10 categories; `main` @ `35a6b67`; the re-architected
 >   record-streaming pipeline, excluding the PM-deferred `posterior_engine`
 >   module) —
@@ -112,6 +120,18 @@ Stage 1 reads each BAM/CRAM once per sample and writes one `.psp` artefact.
   - Wall-time validation on real multi-chrom BAMs (analogue of cohort H1's 3.85× at T=13 on tomato CRAMs). Picked up alongside the `examples/profile_from_bam_e2e.rs` + `benches/from_bam_e2e_perf.rs` infrastructure already deferred from the prior task.
   - **Deferred Minors** (from the fix run): **Mi5** (`process_one_chromosome_from_bam` rename — subcommand-name coupling), **Mi7** (`input_crams` PSP field rename — reach beyond `src/bam/`), **Mi12 + M17 redesign half** (lift `MixedAlignmentFileFormats` into a shared sub-enum), **Mi13** (`From<AlignmentIndexError>` 4-arm passthrough — design call), **Mi15** (`crate::bam` → `crate::alignment` module rename), **Mi20** (`OwnedIndexedBamRecords::next` phase extraction — cosmetic), **Mi21** (per-record `RecordBuf::default()` allocation — folds into parallelisation-tuning workstream), **Mi9 partial** (`tests/common::build_csi` copy stays until a test-support feature flag is introduced).
   - Lift the no-mixing restriction (CRAM + BAM in one invocation) if a real workload appears. Pre-flight gate is the only place the restriction lives; merge core is already format-agnostic.
+
+#### Segment read fetcher (shared indexed-segment read source)
+- **Status:** implemented (increments #1–#3; standalone primitive, no consumer wired yet)
+- **Plan:** [segment_read_fetcher.md](doc/devel/implementation_plans/segment_read_fetcher.md)
+- **Impl report:** [segment_read_fetcher_2026-06-16.md](doc/devel/reports/implementations/segment_read_fetcher_2026-06-16.md)
+- **Code:** [src/bam/segment_reader.rs](src/bam/segment_reader.rs) — `AlignmentFile` (`BamFile`/`CramFile`), `from_input`, `get_reads_from_segment`, pooled re-seekable readers (`Mutex<Vec<Handle>>`), `MappedReadsInSegment` per-call iterators. Reuses `classify_pre_decode` / `record_buf_to_mapped_read` / `query_interval` / `ContigInterval::overlaps_record` (visibility lifted to `pub(super)`); two new typed errors (`MissingCramReference`, `InvalidSegment`).
+- **Tests:** 18 in-module (overlap + 1-based-inclusive edges, read spanning two segments yielded by both, pool open-once / resting size, `par_iter` determinism on a shared `&AlignmentFile`, empty segment, target-contig + MAPQ filters, error paths; BAM + CRAM, `.crai` via `cram::fs::index`). All gates green (fmt / clippy `-D warnings` / doc; 1056 lib + integration tests).
+- **Open:**
+  - **#4** — wire the SSR Stage-1 `fetch_locus_reads` onto it (deferred: SSR module not on this branch).
+  - **#5** — retrofit the SNP `--regions` path (replace per-BED-interval re-`query`), measuring the `--regions` tax improvement.
+  - **#5 prereq** — converge the duplicated chunk/container-walk with `OwnedIndexed{Bam,Cram}Records` once `query` migrates onto this primitive.
+  - Deferred (plan §8): CRAM container cache; CRAM per-record early-stop. Remove the module-level `#![allow(dead_code)]` when a consumer lands.
 
 #### Pileup walker
 - **Status:** shipped

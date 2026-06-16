@@ -1400,7 +1400,7 @@ impl AlignmentMergedReader {
     }
 }
 
-fn classify_pre_decode(
+pub(super) fn classify_pre_decode(
     config: &AlignmentMergedReaderConfig,
     rb: &sam::alignment::RecordBuf,
 ) -> PreDecodeOutcome {
@@ -1471,7 +1471,7 @@ fn head_key(rb: &sam::alignment::RecordBuf) -> Option<HeadKey> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PreDecodeOutcome {
+pub(super) enum PreDecodeOutcome {
     Keep,
     Drop(FilterBucket),
 }
@@ -1495,7 +1495,7 @@ pub(super) enum FilterBucket {
 // Per-record conversion
 // ---------------------------------------------------------------------
 
-fn record_buf_to_mapped_read(
+pub(super) fn record_buf_to_mapped_read(
     rb: &sam::alignment::RecordBuf,
     source_file_index: usize,
 ) -> io::Result<MappedRead> {
