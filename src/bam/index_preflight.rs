@@ -75,13 +75,13 @@ pub const CSI_DEPTH: u8 = 6;
 /// Pre-loaded alignment index for a single input file, shareable
 /// across rayon workers via the `Arc` payload.
 ///
-/// Drivers that need per-chromosome random access call
+/// Drivers that need per-region random access call
 /// [`load_alignment_index`] once per input at startup, wrap the
-/// result in this enum, and pass a `&[AlignmentIndex]` (or
-/// `Vec<AlignmentIndex>`) into
-/// [`crate::bam::alignment_input::AlignmentMergedReader::query`]. Each rayon
-/// worker pays one `Arc::clone` to get its own handle on the
-/// already-parsed index; no per-worker disk reads or re-parsing.
+/// result in this enum, and build one pooled
+/// [`AlignmentFile`](crate::bam::segment_reader::AlignmentFile) per input
+/// from it (`run_pileup`). Each worker pays one `Arc::clone` to get its
+/// own handle on the already-parsed index; no per-worker disk reads or
+/// re-parsing.
 ///
 /// For BAM inputs we keep the on-disk format we loaded — either
 /// `.csi` or `.bai` — because the cohort driver wraps the payload
