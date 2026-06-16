@@ -113,6 +113,51 @@ real STRs show.
   the realignment, is the wall. The realignment wins (H1/H2/P1 + the window
   tightening) pay most on high-coverage data where every locus has reads.
 
+## Fetch path — profiled (the real end-to-end lever)
+
+Single-threaded `sample` profile of the pileup over the real fixture
+(`tmp/ssr_fix/fetch_sample.txt`). Excluding the rayon/idle scaffolding, the work
+self-time is **per-locus-query CRAM decoding**, all under `CramSegmentReads::next`:
+
+```
+noodles_cram Slice::decode_blocks + Block::decode + Slice::records   ~18k samples  (CRAM slice decode)
+md5::compress::compress                                               7478 samples  (~29%) reference-MD5 validation
+alloc/realloc/free                                                    ~5k samples
+```
+
+The MD5 is noodles validating each slice's reference subsequence against the
+slice-header `M5` — **per slice decode, hardcoded, no disable flag** (verified in
+noodles-cram 0.93 `container/slice.rs:359`; the fasta `Repository` caches the
+*sequence* but not the MD5). So the MD5 cannot be skipped; it can only be paid
+fewer times by **decoding each slice fewer times**.
+
+**Root cause = redundant decode.** One indexed query per locus; adjacent catalog
+loci fall in the same CRAM slice and re-decode (and re-MD5) it. Coalescing a run
+of adjacent loci into one query — decode the slice once, demux reads to each
+locus — removes the redundancy (review finding **L7**), cutting *both* the decode
+and the MD5.
+
+**The catch (byte-identity):** the per-locus QC scalars `n_filtered` /
+`mapped_reads` are the reader's filter-drop tallies *for that locus's window*
+([fetch_reads.rs](../../../../src/ssr/pileup/fetch_reads.rs#L179-L190)). A single
+union query returns one aggregate drop count for the whole group — the drops
+can't be split back per locus. So byte-identical coalescing requires **moving the
+read filter out of the reader and into the SSR fetch layer**: query the union
+span *unfiltered* (primary reads only), then per locus apply window-overlap +
+the MAPQ/dup/qc/length filter + reach-gate + reservoir. `yielded`/reservoir are
+trivially recomputable; the filter relocation is the real work and must
+byte-match the reader's `classify_segment_record` quality/dup logic. (Decode
+caching in the shared pooled reader is the alternative, but it's cross-cutting
+with the SNP path and has the same per-window-attribution issue.)
+
+**Status:** profiled and designed; not yet implemented. It is a contained-but-
+non-trivial change (new union-fetch + SSR-side filter, restructure the driver's
+par_iter unit from locus → locus-group, byte-identity gate vs the per-locus path).
+Recommended as the next focused step. On this sparse fixture most loci are empty
+(catalog spans 90 Mb, reads only in ~900 kb of bench regions), which over-weights
+empty-locus queries; the win is largest on dense whole-genome runs where every
+locus decodes.
+
 ## Reproducing the fixture
 
 `tmp/` is gitignored, so the fixture is local-only. To rebuild:
