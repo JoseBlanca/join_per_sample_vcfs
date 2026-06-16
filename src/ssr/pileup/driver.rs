@@ -7,16 +7,31 @@
 //! eventual parallel step is just `for` → `par_iter().map_init(…)`: each worker
 //! reuses its own [`LocusScratch`], nothing inside the unit changes (arch §8.4).
 //!
-//! **Build status (increment 2a):** the per-locus unit — [`process_locus`],
-//! [`LocusScratch`], and the [`QcCounts`] assembly ([`qc_counts`]). The catalog
-//! walk / `run()` loop, the name→chrom_id container adapter, the writer-header
-//! build, and the CLI land in the following increments.
+//! **Build status:** the per-locus unit ([`process_locus`], [`LocusScratch`],
+//! [`qc_counts`]), the name→chrom_id container adapter ([`to_container_record`]),
+//! the writer-header build, and the single-threaded [`run`] loop are in place.
+//! The thin `ssr-pileup` CLI subcommand (and the end-to-end test that drives
+//! `run` through the binary) land next; the worker-pool parallelization is the
+//! deferred §8.4 step.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 
+use crate::bam::alignment_input::{PileupInputs, build_fasta_repository, load_pileup_inputs};
 use crate::bam::errors::AlignmentInputError;
-use crate::bam::segment_reader::AlignmentFile;
-use crate::psp::registry_ssr::SsrLocusRecord as ContainerRecord;
+use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter};
+use crate::fasta::ContigList;
+use crate::pop_var_caller::common::{
+    DEFAULT_BUFFERED_IO_CAPACITY, basename, current_command_line, format_md5_hex, rfc3339_now,
+};
+use crate::psp::errors::PspWriteError;
+use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
+use crate::psp::registry_ssr::{SsrKind, SsrLocusRecord as ContainerRecord};
+use crate::psp::writer::PspWriter;
+use crate::ssr::catalog::CatalogError;
+use crate::ssr::catalog::io::{CatalogHeader, CatalogReader};
 use crate::ssr::types::Locus;
 
 use super::candidate_generation::CandidateAllele;
@@ -30,10 +45,22 @@ use super::read_analysis::analyze_read;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum SsrPileupError {
-    #[error(transparent)]
+    #[error("reading alignment input failed")]
     Read(#[from] AlignmentInputError),
+    #[error("reading the catalog failed")]
+    Catalog(#[from] CatalogError),
+    #[error("writing the .ssr.psp failed")]
+    Write(#[from] PspWriteError),
+    #[error("I/O error")]
+    Io(#[from] std::io::Error),
     #[error("locus contig {name:?} is not in the reference / alignment header")]
     ContigNotInReference { name: String },
+    #[error("contig {name:?} has no md5 in the reference (required for the .psp header)")]
+    MissingMd5 { name: String },
+    #[error("contig {name:?} length {length} exceeds the .psp u32 limit")]
+    ContigLengthOverflow { name: String, length: u64 },
+    #[error("could not format the run timestamp")]
+    TimestampFormat,
 }
 
 /// Per-locus scratch reused across loci to avoid allocation churn — the
@@ -144,6 +171,198 @@ pub(crate) fn to_container_record(
     })
 }
 
+/// Inputs for one `ssr-pileup` run.
+pub(crate) struct SsrPileupConfig {
+    /// One or more coordinate-sorted, indexed BAM/CRAM files for a single sample.
+    pub alignment_files: Vec<PathBuf>,
+    /// Reference FASTA (with sibling `.fai`).
+    pub reference: PathBuf,
+    /// The sorted `.ssr.catalog` to genotype against.
+    pub catalog: PathBuf,
+    /// Destination `.ssr.psp`.
+    pub output: PathBuf,
+    /// The cheap read filter (MAPQ / dup / qc-fail / length).
+    pub filter: SegmentReadFilter,
+    /// `analyze_read` candidate half-width (rungs).
+    pub window: u16,
+    /// Per-locus reservoir depth cap.
+    pub cap: usize,
+    /// Build a missing alignment index in place rather than erroring.
+    pub build_index_if_missing: bool,
+    /// Sample name override; defaults to the one the inputs cross-validate.
+    pub sample: Option<String>,
+}
+
+/// Build the `.ssr.psp` writer header — one [`ChromosomeEntry`] per reference
+/// contig (mirrors the SNP `build_writer_header`), `subcommand = "ssr-pileup"`,
+/// and the run parameters (including the catalog binding: its `reference_md5`
+/// and `flank_bp`).
+fn build_ssr_writer_header(
+    sample: &str,
+    cfg: &SsrPileupConfig,
+    contigs: &ContigList,
+    catalog: &CatalogHeader,
+) -> Result<WriterHeader, SsrPileupError> {
+    let mut chromosomes = Vec::with_capacity(contigs.entries.len());
+    for entry in &contigs.entries {
+        let length =
+            u32::try_from(entry.length).map_err(|_| SsrPileupError::ContigLengthOverflow {
+                name: entry.name.clone(),
+                length: entry.length,
+            })?;
+        let md5 = entry
+            .md5
+            .map(format_md5_hex)
+            .ok_or_else(|| SsrPileupError::MissingMd5 {
+                name: entry.name.clone(),
+            })?;
+        chromosomes.push(ChromosomeEntry {
+            name: entry.name.clone(),
+            length,
+            md5,
+        });
+    }
+
+    let created: toml::value::Datetime = rfc3339_now()
+        .parse()
+        .map_err(|_| SsrPileupError::TimestampFormat)?;
+
+    let input_crams: Vec<String> = cfg.alignment_files.iter().map(|p| basename(p)).collect();
+    let input_fasta = basename(&cfg.reference);
+
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        "window".to_string(),
+        ParameterValue::Integer(i64::from(cfg.window)),
+    );
+    parameters.insert(
+        "reservoir_cap".to_string(),
+        ParameterValue::Integer(cfg.cap as i64),
+    );
+    parameters.insert(
+        "flank_bp".to_string(),
+        ParameterValue::Integer(i64::from(catalog.params.flank_bp)),
+    );
+    parameters.insert(
+        "catalog_reference_md5".to_string(),
+        ParameterValue::String(catalog.reference_md5.clone()),
+    );
+    if let Some(mapq) = cfg.filter.min_mapq {
+        parameters.insert(
+            "min_mapq".to_string(),
+            ParameterValue::Integer(i64::from(mapq)),
+        );
+    }
+    if let Some(len) = cfg.filter.min_read_length {
+        parameters.insert(
+            "min_read_length".to_string(),
+            ParameterValue::Integer(i64::from(len)),
+        );
+    }
+    parameters.insert(
+        "drop_duplicate".to_string(),
+        ParameterValue::Boolean(cfg.filter.drop_duplicate),
+    );
+    parameters.insert(
+        "drop_qc_fail".to_string(),
+        ParameterValue::Boolean(cfg.filter.drop_qc_fail),
+    );
+
+    Ok(WriterHeader {
+        format_version: (1, 0),
+        sample: sample.to_string(),
+        reference: input_fasta.clone(),
+        created,
+        chromosomes,
+        writer: WriterProvenance {
+            tool: "pop_var_caller".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            subcommand: "ssr-pileup".to_string(),
+            input_crams,
+            input_fasta,
+            command_line: current_command_line(),
+            parameters,
+        },
+    })
+}
+
+/// `.tmp` sibling of `output`, written then atomically renamed into place.
+fn tmp_path(output: &Path) -> PathBuf {
+    let mut s = output.to_path_buf().into_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// Run Stage 1: walk the sorted catalog, genotype each locus from the sample's
+/// alignment files, and write the per-locus evidence to a `.ssr.psp`.
+///
+/// Single-threaded: the per-locus body is [`process_locus`] (the parallelization
+/// seam — see the module docs). Output is written to a temp file and atomically
+/// renamed, mirroring the SNP `pileup` path.
+pub(crate) fn run(cfg: &SsrPileupConfig) -> Result<(), SsrPileupError> {
+    let PileupInputs {
+        sample_name,
+        contigs,
+        headers,
+        indexes,
+    } = load_pileup_inputs(
+        &cfg.alignment_files,
+        &cfg.reference,
+        cfg.build_index_if_missing,
+    )?;
+    let repo = build_fasta_repository(&cfg.reference)?;
+
+    // One pooled reader per input file (built once; shared across all loci).
+    let files: Vec<AlignmentFile> = headers
+        .into_iter()
+        .zip(indexes)
+        .enumerate()
+        .map(|(i, (header, index))| {
+            AlignmentFile::from_input(
+                cfg.alignment_files[i].clone(),
+                header,
+                index,
+                Some(repo.clone()),
+                cfg.filter,
+                i,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+
+    let sample = cfg.sample.clone().unwrap_or(sample_name);
+    let mut catalog = CatalogReader::new(File::open(&cfg.catalog)?)?;
+    let header = build_ssr_writer_header(&sample, cfg, &contigs, catalog.header())?;
+
+    let name_to_id: HashMap<&str, u32> = contigs
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name.as_str(), i as u32))
+        .collect();
+
+    let tmp = tmp_path(&cfg.output);
+    let writer_sink = BufWriter::with_capacity(DEFAULT_BUFFERED_IO_CAPACITY, File::create(&tmp)?);
+    let mut writer = PspWriter::<_, SsrKind>::new_ssr(writer_sink, header)?;
+
+    let model = HmmModel::default();
+    let mut scratch = LocusScratch::new();
+
+    while let Some(locus) = catalog.read_locus() {
+        let locus = locus?;
+        let record = process_locus(&files, &locus, cfg.window, cfg.cap, &model, &mut scratch)?;
+        writer.write_locus(&to_container_record(record, &name_to_id)?)?;
+    }
+
+    // Atomic finish: flush + fsync the temp file, then rename into place.
+    let file = writer
+        .finish()?
+        .into_inner()
+        .map_err(|e| SsrPileupError::Io(e.into_error()))?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &cfg.output)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +458,97 @@ mod tests {
             err,
             SsrPileupError::ContigNotInReference { name } if name == "chrX"
         ));
+    }
+
+    // --- header build -------------------------------------------------
+
+    use crate::fasta::ContigEntry;
+    use crate::ssr::catalog::CatalogParams;
+
+    fn catalog_header() -> CatalogHeader {
+        CatalogHeader {
+            tool_version: "0.1.0".into(),
+            reference: "ref.fa".into(),
+            reference_md5: "a".repeat(32),
+            trf_mod_version: "1.0".into(),
+            params: CatalogParams::default(),
+            date: "2026-06-16".into(),
+        }
+    }
+
+    fn config_for(files: Vec<PathBuf>) -> SsrPileupConfig {
+        SsrPileupConfig {
+            alignment_files: files,
+            reference: PathBuf::from("/data/ref.fa"),
+            catalog: PathBuf::from("/data/cat.ssr.catalog"),
+            output: PathBuf::from("/data/out.ssr.psp"),
+            filter: SegmentReadFilter::default(),
+            window: 8,
+            cap: 1000,
+            build_index_if_missing: false,
+            sample: None,
+        }
+    }
+
+    #[test]
+    fn header_build_maps_contigs_records_params_and_subcommand() {
+        let contigs = ContigList {
+            entries: vec![
+                ContigEntry {
+                    name: "chr1".into(),
+                    length: 1000,
+                    md5: Some([1u8; 16]),
+                },
+                ContigEntry {
+                    name: "chr2".into(),
+                    length: 2000,
+                    md5: Some([2u8; 16]),
+                },
+            ],
+        };
+        let cfg = config_for(vec![
+            PathBuf::from("/data/s1.bam"),
+            PathBuf::from("/data/s2.cram"),
+        ]);
+        let h = build_ssr_writer_header("SAMPLE", &cfg, &contigs, &catalog_header()).unwrap();
+
+        assert_eq!(h.sample, "SAMPLE");
+        assert_eq!(h.writer.subcommand, "ssr-pileup");
+        assert_eq!(
+            h.writer.input_crams,
+            vec!["s1.bam".to_string(), "s2.cram".to_string()]
+        );
+        assert_eq!(h.writer.input_fasta, "ref.fa");
+        assert_eq!(h.chromosomes.len(), 2);
+        assert_eq!(h.chromosomes[1].name, "chr2");
+        assert_eq!(h.chromosomes[1].length, 2000);
+        assert_eq!(h.chromosomes[0].md5, format_md5_hex([1u8; 16]));
+        // Params, incl. the catalog binding (flank_bp + reference_md5).
+        assert!(matches!(
+            h.writer.parameters.get("window"),
+            Some(ParameterValue::Integer(8))
+        ));
+        assert!(matches!(
+            h.writer.parameters.get("flank_bp"),
+            Some(ParameterValue::Integer(50))
+        ));
+        assert!(matches!(
+            h.writer.parameters.get("catalog_reference_md5"),
+            Some(ParameterValue::String(s)) if *s == "a".repeat(32)
+        ));
+    }
+
+    #[test]
+    fn header_build_errors_when_a_contig_lacks_md5() {
+        let contigs = ContigList {
+            entries: vec![ContigEntry {
+                name: "chr1".into(),
+                length: 1000,
+                md5: None,
+            }],
+        };
+        let cfg = config_for(vec![PathBuf::from("/data/s1.bam")]);
+        let err = build_ssr_writer_header("S", &cfg, &contigs, &catalog_header()).unwrap_err();
+        assert!(matches!(err, SsrPileupError::MissingMd5 { name } if name == "chr1"));
     }
 }
