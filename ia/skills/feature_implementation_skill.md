@@ -181,10 +181,10 @@ When using this skill, structure the response in this order:
 For non-trivial features, save a report mirroring the *Response format* sections to:
 
 ```
-ia/reports/implementations/<feature-slug>_<YYYY-MM-DD>.md
+doc/devel/reports/implementations/<feature-slug>_<YYYY-MM-DD>.md
 ```
 
-Append `_v<N>` if a report for the same slug and date already exists. File references inside the report use relative Markdown links from the report's directory (e.g. `[file.rs](../../../src/file.rs#L42)`). Skip the saved report only for changes small enough that the commit message carries the full context.
+Append `_v<N>` if a report for the same slug and date already exists. File references inside the report use relative Markdown links from the report's directory (e.g. `[file.rs](../../../../src/file.rs#L42)`). Skip the saved report only for changes small enough that the commit message carries the full context.
 
 ## Project status protocol
 
@@ -217,7 +217,7 @@ After a feature_implementation run, the typical new status is `implemented` (no 
 - Do not edit the **About this project** paragraph or anything between the `ABOUT-PARAGRAPH-START` / `ABOUT-PARAGRAPH-END` comments.
 - Do not modify another feature's block.
 - Do not summarize report content inside the block — the block is a list of pointers.
-- Prefer in-place updates of an existing bullet over accumulating a long history (`git log` and `ls reviews/` carry chronology).
+- Prefer in-place updates of an existing bullet over accumulating a long history (`git log` and `ls doc/devel/reports/implementations/` carry chronology).
 - If `PROJECT_STATUS.md` and the current code disagree, trust the code; the status file is stale and should be updated, not relied on.
 
 ## Reusable prompt template

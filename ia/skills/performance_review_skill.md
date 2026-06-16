@@ -174,7 +174,7 @@ Promote findings whose measurement plans converge (multiple categories agree the
 
 ### 7. Synthesize the unified report
 
-Compose the report using the *Output format* below. Verdict, measurement plan, and "What's already good" need the full picture and are produced by you. Assign severity codes during synthesis: `H1, H2, …` for Hot-path; `L1, L2, …` for Likely; `S1, S2, …` for Speculative; Notes stay grouped without numbering. Save to `reviews/perf_<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
+Compose the report using the *Output format* below. Verdict, measurement plan, and "What's already good" need the full picture and are produced by you. Assign severity codes during synthesis: `H1, H2, …` for Hot-path; `L1, L2, …` for Likely; `S1, S2, …` for Speculative; Notes stay grouped without numbering. Save to `doc/devel/reports/reviews/perf_<module-slug>_<YYYY-MM-DD>.md` per the saving conventions below. Leave the per-category files in `tmp/` as an audit trail.
 
 ### 8. Update `PROJECT_STATUS.md`
 
@@ -225,21 +225,21 @@ Be direct. If something is plausibly hot, say so plainly and propose the experim
 
 ### Directory and filename
 
-Save to the project's `reviews/` directory at the crate root:
+Save to the project's `doc/devel/reports/reviews/` directory:
 
 ```
-reviews/perf_<module-slug>_<YYYY-MM-DD>.md
+doc/devel/reports/reviews/perf_<module-slug>_<YYYY-MM-DD>.md
 ```
 
 Examples:
 
-- `reviews/perf_gvcf_parser_2026-05-10.md`
-- `reviews/perf_pipeline_2026-05-10.md`
-- `reviews/perf_pr-142_2026-05-10.md`
+- `doc/devel/reports/reviews/perf_gvcf_parser_2026-05-10.md`
+- `doc/devel/reports/reviews/perf_pipeline_2026-05-10.md`
+- `doc/devel/reports/reviews/perf_pr-142_2026-05-10.md`
 
 If a review for the same scope and date already exists, append `_v<N>`:
 
-- `reviews/perf_gvcf_parser_2026-05-10_v2.md`
+- `doc/devel/reports/reviews/perf_gvcf_parser_2026-05-10_v2.md`
 
 ### Document header
 
@@ -258,10 +258,10 @@ The body is sections 1–7 of *Output format* above, in order, with verbatim hea
 
 ### File links inside findings
 
-References to source files use relative Markdown links from the `reviews/` directory:
+References to source files use relative Markdown links from the `doc/devel/reports/reviews/` directory:
 
-- Single line: `[file.rs](../path/file.rs#L123)`
-- Range: `[file.rs](../path/file.rs#L123-L456)`
+- Single line: `[file.rs](../../../../path/file.rs#L123)`
+- Range: `[file.rs](../../../../path/file.rs#L123-L456)`
 
 Display text is the path (no backticks).
 

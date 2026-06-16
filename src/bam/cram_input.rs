@@ -311,7 +311,12 @@ pub(super) fn open_cram_record_stream(
 /// `repository = None` reads the header without the reference
 /// (header reading does not consult it); slice decoding does, so
 /// `open_cram_record_stream` always passes `Some`.
-fn open_cram_reader_with_header(
+///
+/// Also used by the pooled [`crate::bam::segment_reader`] to open a
+/// fresh seekable reader positioned past the file definition + header
+/// (the returned header is discarded — the caller already holds the
+/// validated one); the version gate still runs on every open.
+pub(super) fn open_cram_reader_with_header(
     path: &Path,
     repository: Option<&fasta::Repository>,
 ) -> Result<(cram::io::Reader<File>, sam::Header), AlignmentInputError> {
