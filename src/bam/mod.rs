@@ -39,3 +39,8 @@ pub(crate) mod bam_input;
 pub(crate) mod cram_input;
 pub mod errors;
 pub mod index_preflight;
+// The shared indexed-segment read source: pooled, thread-safe
+// per-segment read queries over one BAM/CRAM. Reuses the per-format
+// scanners' decode helpers; adds reader ownership + a pool. Consumed
+// by the SSR Stage-1 fetcher (and, later, the SNP `--regions` path).
+pub(crate) mod segment_reader;

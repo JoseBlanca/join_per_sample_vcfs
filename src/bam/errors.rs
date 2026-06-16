@@ -199,6 +199,20 @@ pub enum AlignmentInputError {
     /// responsible flag.
     #[error("alignment index: {0}")]
     AlignmentIndex(#[from] AlignmentIndexError),
+
+    /// [`crate::bam::segment_reader::AlignmentFile::from_input`] was
+    /// asked to build a CRAM segment reader without a FASTA reference
+    /// repository. CRAM slice decoding needs the reference; the caller
+    /// must pass one. Programmer error at the call site, surfaced as a
+    /// typed error rather than a panic.
+    #[error("CRAM input '{path}' requires a FASTA reference repository but none was provided")]
+    MissingCramReference { path: PathBuf },
+
+    /// [`crate::bam::segment_reader::AlignmentFile::get_reads_from_segment`]
+    /// was given a segment that is not a valid 1-based inclusive range
+    /// (`start == 0`, or `start > end`).
+    #[error("invalid segment on '{chrom}': start={start}, end={end} (require 1 <= start <= end)")]
+    InvalidSegment { chrom: String, start: u32, end: u32 },
 }
 
 /// Errors raised by [`crate::bam::index_preflight::preflight_alignment_indexes`].

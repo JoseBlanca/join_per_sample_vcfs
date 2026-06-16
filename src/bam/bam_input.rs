@@ -204,8 +204,12 @@ pub(super) fn open_bam_record_stream(
 
 /// Shared BAM open + header-read sequence used by
 /// `open_bam_record_stream` so the magic-byte check and the error
-/// wrapping stay in one place.
-fn open_bam_reader_with_header(
+/// wrapping stay in one place. Also used by the pooled
+/// [`crate::bam::segment_reader`] to open a fresh seekable reader
+/// (discarding the re-parsed header — the caller already holds the
+/// validated one), so the reader is positioned past the header and
+/// any chunk seek lands at a record boundary.
+pub(super) fn open_bam_reader_with_header(
     path: &Path,
 ) -> Result<(bam::io::Reader<bgzf::io::Reader<File>>, sam::Header), AlignmentInputError> {
     let mut reader = bam::io::reader::Builder
@@ -282,7 +286,7 @@ pub(super) fn open_indexed_bam_record_stream(
 
 /// The `noodles` query interval for a `region`: the 1-based inclusive
 /// range when `Some`, or the whole contig (unbounded) when `None`.
-fn query_interval(region: Option<ContigInterval>) -> Interval {
+pub(super) fn query_interval(region: Option<ContigInterval>) -> Interval {
     match region {
         Some(iv) => {
             // `iv.start`/`iv.end` are >= 1 by construction, so the
