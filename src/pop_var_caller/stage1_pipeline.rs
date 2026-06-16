@@ -104,9 +104,12 @@ pub struct Stage1RunSummary {
 }
 
 /// Bundle returned by [`with_stage1_chain`]. Carries the closure's
-/// result `R`, the metadata the caller needs (sample name, contigs),
-/// the counter snapshot, and any upstream error stashed by the
-/// error-shedding adapter while the walker was running.
+/// result `R`, the counter snapshot, and any upstream error stashed by
+/// the error-shedding adapter while the walker was running.
+///
+/// (Sample name and contigs are *not* returned: the caller already owns
+/// them on its `PileupInputs` and never read them back off this bundle,
+/// so cloning them per region was dead weight — dropped 2026-06-16.)
 ///
 /// A `stashed_upstream_error` of `Some(_)` paired with `result =
 /// Ok(_)` is the standard "walker exhausted cleanly but the source
@@ -115,17 +118,14 @@ pub struct Stage1RunSummary {
 /// (e.g. delete a half-written output file).
 pub struct Stage1Outputs<R> {
     pub result: R,
-    pub sample_name: String,
-    pub contigs: ContigList,
     pub run_summary: Stage1RunSummary,
     pub stashed_upstream_error: Option<AlignmentInputError>,
 }
 
 /// Build the Stage 1 BAQ → walker chain over an already-opened
 /// `reader` on this function's stack and hand the walker to `f`. After
-/// `f` returns, snapshots `FilterCounts`, `BaqSkipCounts`, sample name
-/// and contigs, plus any stashed upstream error, and returns them
-/// bundled with `f`'s result.
+/// `f` returns, snapshots `FilterCounts`, `BaqSkipCounts`, plus any
+/// stashed upstream error, and returns them bundled with `f`'s result.
 ///
 /// The caller owns reader construction: `run_pileup` opens one
 /// `query()` reader per analysis region and calls this once per region,
@@ -258,8 +258,6 @@ where
 
     Ok(Stage1Outputs {
         result: r,
-        sample_name: sample_name.to_string(),
-        contigs: contigs.clone(),
         run_summary: Stage1RunSummary {
             filter_counts,
             baq_skip_counts,
