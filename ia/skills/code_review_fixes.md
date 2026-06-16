@@ -183,9 +183,9 @@ If criterion reports `no change` or `improved` on every group, a one-line note i
 
 ## Fix-application report
 
-**Every run must produce a report** in `reviews/`, even if no code changed, all findings were deferred, or the run was blocked. A run without a report is incomplete.
+**Every run must produce a report** in `doc/devel/reports/reviews/`, even if no code changed, all findings were deferred, or the run was blocked. A run without a report is incomplete.
 
-**File naming:** `reviews/fixes_applied_<YYYY-MM-DD>.md`, with `_v1`, `_v2` suffixes for multiple runs on the same date.
+**File naming:** `doc/devel/reports/reviews/fixes_applied_<YYYY-MM-DD>.md`, with `_v1`, `_v2` suffixes for multiple runs on the same date.
 
 **Accounting rule:** every finding from the source review must appear exactly once in the findings table with a terminal status or an active `Ask` state. No finding may disappear.
 
@@ -199,7 +199,7 @@ At the end of the run, tell the user where the report was written and list any u
 # Fix Application Report: <original-review-report.md>
 
 **Date:** YYYY-MM-DD
-**Source review:** `reviews/<review-file>.md`
+**Source review:** `doc/devel/reports/reviews/<review-file>.md`
 **Source state reviewed against:** <commit / branch / as-provided>
 **Execution mode:** <interactive / non-interactive>
 **Overall status:** <Completed / Partial / Blocked>
@@ -331,7 +331,7 @@ The project tracks the lifecycle of every feature in `PROJECT_STATUS.md` at the 
 
 **At task end** (after the fix-application report has been saved): update only the in-scope feature's block in `PROJECT_STATUS.md`.
 
-- Append a link to the new fix-application report under `Latest fixes-applied:`. Prefer to replace the previous link rather than accumulate a long list — `git log` and `ls reviews/` carry chronology.
+- Append a link to the new fix-application report under `Latest fixes-applied:`. Prefer to replace the previous link rather than accumulate a long list — `git log` and `ls doc/devel/reports/reviews/` carry chronology.
 - Update `Status:` to `fixes-applied` if any non-trivial findings remain open, or to `shipped` if every Blocker and Major was either `Applied` / `Already fixed` / `Disputed` with no open follow-ups.
 - Close `Open:` items the run resolved (`Applied` and `Already fixed`). Add new `Open:` items for `Deferred`, `Failed validation`, `Blocked by context mismatch`, or unresolved `Ask` findings — each linked to the relevant finding ID in the saved report.
 - Refresh **Current focus** — rewrite `Last completed task` to name this fix run and link the report. Touch `Next task` only if the human PM has not already set one; otherwise leave it alone.
