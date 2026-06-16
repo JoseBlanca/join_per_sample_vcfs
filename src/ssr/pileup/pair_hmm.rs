@@ -113,6 +113,11 @@ impl HmmModel {
 pub(crate) struct PairHmmScratch {
     prev: Vec<[f64; 3]>,
     cur: Vec<[f64; 3]>,
+    /// Saved DP column at the shared-prefix seam — one cell per read row.
+    /// [`score_candidates`] computes the forward over the candidates' longest
+    /// common prefix once, stores that column's cells here, and restarts each
+    /// candidate's tail from it (the prefix DP is rung-independent).
+    seam: Vec<[f64; 3]>,
 }
 
 impl PairHmmScratch {
@@ -129,6 +134,14 @@ impl PairHmmScratch {
             self.cur.resize(needed, [f64::NEG_INFINITY; 3]);
         }
     }
+
+    /// Ensure the seam column holds at least `read_len + 1` cells.
+    fn resize_seam(&mut self, read_len: usize) {
+        let needed = read_len + 1;
+        if self.seam.len() < needed {
+            self.seam.resize(needed, [f64::NEG_INFINITY; 3]);
+        }
+    }
 }
 
 /// `ln(e^a + e^b)`, numerically stable, treating `-∞` as a true zero
@@ -142,13 +155,35 @@ fn ln_sum_exp2(a: f64, b: f64) -> f64 {
         return a;
     }
     let m = a.max(b);
-    m + ((a - m).exp() + (b - m).exp()).ln()
+    let other = a.min(b);
+    // The max term contributes exp(m - m) == 1, so it never needs an `exp`;
+    // `ln_1p` evaluates ln(1 + x) directly (and accurately near zero).
+    m + (other - m).exp().ln_1p()
 }
 
-/// `ln(e^a + e^b + e^c)`.
+/// `ln(e^a + e^b + e^c)`, numerically stable, in a single pass over the three
+/// terms (one `ln_1p`, at most two `exp`) — the nested `ln_sum_exp2` form costs
+/// a second `ln`. The max term contributes `exp(0) == 1`, folded into `ln_1p`;
+/// `exp(-∞ − m) == 0` lets a `-∞` operand drop out without special-casing.
 #[inline]
 fn ln_sum_exp3(a: f64, b: f64, c: f64) -> f64 {
-    ln_sum_exp2(ln_sum_exp2(a, b), c)
+    let m = a.max(b).max(c);
+    if m == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY; // all three are true zeros
+    }
+    // Sum the exps of the two non-maximal terms; the maximal one is the `1` in
+    // `ln_1p`. Skip exactly one term equal to `m` (ties stay correct: the second
+    // tied term is exp'd back to 1.0).
+    let mut rest = 0.0f64;
+    let mut max_skipped = false;
+    for x in [a, b, c] {
+        if !max_skipped && x == m {
+            max_skipped = true;
+        } else {
+            rest += (x - m).exp();
+        }
+    }
+    m + rest.ln_1p()
 }
 
 /// Forward log-likelihood `ln P(read | candidate_seq)` summed over all
@@ -234,15 +269,79 @@ pub(crate) fn forward(
     ln_sum_exp3(last[M], last[I], last[D])
 }
 
+/// Length of the longest common prefix shared by every candidate haplotype.
+/// On-ladder rungs are `left_flank + motif×L + right_flank`, so they share the
+/// left flank and the shorter rungs' tract — typically more than half the
+/// haplotype. The forward DP over a prefix is independent of the bytes that
+/// follow (the recurrence only reads cells up/left), so this prefix can be scored
+/// once and reused across the whole window.
+fn longest_common_prefix_len(candidates: &[CandidateAllele]) -> usize {
+    let first = &candidates[0].candidate_seq;
+    let mut lcp = first.len();
+    for c in &candidates[1..] {
+        let common = first
+            .iter()
+            .zip(&c.candidate_seq)
+            .take_while(|(a, b)| a == b)
+            .count();
+        lcp = lcp.min(common);
+    }
+    lcp
+}
+
+/// Fill `cur[start..=end]` with one read row's M/I/D recurrence against `hap`,
+/// reading the previous row `prev` and the just-written `cur[j-1]`. `start ≥ 1`
+/// (column 0 is the insertion-only boundary, handled by the caller).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn fill_row(
+    prev: &[[f64; 3]],
+    cur: &mut [[f64; 3]],
+    hap: &[u8],
+    read_base: u8,
+    match_ln: f64,
+    mismatch_ln: f64,
+    ins_emit: f64,
+    model: &HmmModel,
+    start: usize,
+    end: usize,
+) {
+    for j in start..=end {
+        let emit = if read_base == hap[j - 1] {
+            match_ln
+        } else {
+            mismatch_ln
+        };
+        let m_cell = emit
+            + ln_sum_exp3(
+                model.ln_mm + prev[j - 1][M],
+                model.ln_gap_close + prev[j - 1][I],
+                model.ln_gap_close + prev[j - 1][D],
+            );
+        let i_cell = ins_emit
+            + ln_sum_exp2(
+                model.ln_gap_open + prev[j][M],
+                model.ln_gap_extend + prev[j][I],
+            );
+        let d_cell = ln_sum_exp2(
+            model.ln_gap_open + cur[j - 1][M],
+            model.ln_gap_extend + cur[j - 1][D],
+        );
+        cur[j] = [m_cell, i_cell, d_cell];
+    }
+}
+
 /// Score a read against a pre-built candidate set, returning the **dense** `Qᵣ`:
 /// one `(allele, forward log-likelihood)` per candidate, in candidate order.
 ///
 /// This is the per-read join of candidate generation (arch §6) and the forward
-/// (arch §5): each candidate's full sequence is handed to [`forward`] and its raw
-/// log-likelihood read back, reusing the one `scratch` across the set. Pruning to
-/// a sparse profile (`AMB_LL_DROP`) and renormalization are the **aggregator's**
-/// job (`locus_record`, arch §11), so this returns the raw scores untouched — the
-/// dense distribution over the window the aggregator then sparsifies.
+/// (arch §5). The result is identical to calling [`forward`] on each candidate,
+/// but the forward DP over the candidates' longest common prefix
+/// ([`longest_common_prefix_len`]) — the left flank plus the shorter rungs'
+/// tract — is computed **once** and its seam column reused for every candidate's
+/// tail, instead of recomputing the whole matrix per rung. Pruning to a sparse
+/// profile (`AMB_LL_DROP`) and renormalization are the **aggregator's** job
+/// (`locus_record`, arch §11), so this returns the raw scores untouched.
 pub(crate) fn score_candidates(
     read: &[u8],
     quals: &[u8],
@@ -250,10 +349,109 @@ pub(crate) fn score_candidates(
     scratch: &mut PairHmmScratch,
     model: &HmmModel,
 ) -> Vec<(Allele, f64)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    debug_assert_eq!(read.len(), quals.len(), "read and quals length mismatch");
+    let m = read.len();
+    let lcp = longest_common_prefix_len(candidates);
+    let max_n = candidates
+        .iter()
+        .map(|c| c.candidate_seq.len())
+        .max()
+        .unwrap_or(0);
+    scratch.resize_for(max_n);
+    scratch.resize_seam(m);
+
+    let ins_emit = *INS_EMIT_LN;
+    let emission = &*EMISSION_LN;
+    let prefix = &candidates[0].candidate_seq; // shared on [0, lcp)
+
+    // --- Pass 1: forward over the shared prefix [0..=lcp], saving column `lcp`
+    //     of every read row into `seam` (rung-independent). ------------------
+    {
+        let PairHmmScratch { prev, cur, seam } = scratch;
+
+        prev[0] = [0.0, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for j in 1..=lcp {
+            let d = ln_sum_exp2(
+                model.ln_gap_open + prev[j - 1][M],
+                model.ln_gap_extend + prev[j - 1][D],
+            );
+            prev[j] = [f64::NEG_INFINITY, f64::NEG_INFINITY, d];
+        }
+        seam[0] = prev[lcp];
+
+        for i in 1..=m {
+            let read_base = read[i - 1];
+            let (match_ln, mismatch_ln) = emission[quals[i - 1] as usize];
+            cur[0] = [
+                f64::NEG_INFINITY,
+                ins_emit
+                    + ln_sum_exp2(
+                        model.ln_gap_open + prev[0][M],
+                        model.ln_gap_extend + prev[0][I],
+                    ),
+                f64::NEG_INFINITY,
+            ];
+            fill_row(
+                prev,
+                cur,
+                prefix,
+                read_base,
+                match_ln,
+                mismatch_ln,
+                ins_emit,
+                model,
+                1,
+                lcp,
+            );
+            seam[i] = cur[lcp];
+            std::mem::swap(prev, cur);
+        }
+    }
+
+    // --- Pass 2: per candidate, continue the DP from the seam over its tail
+    //     [lcp+1..=n], then read back the final-cell log-likelihood. ----------
     candidates
         .iter()
         .map(|c| {
-            let loglik = forward(read, quals, &c.candidate_seq, scratch, model);
+            let hap = &c.candidate_seq;
+            let n = hap.len();
+            let PairHmmScratch { prev, cur, seam } = &mut *scratch;
+
+            // Row 0 over the tail is the byte-independent all-deletion chain,
+            // seeded by the shared seam at column `lcp`.
+            prev[lcp] = seam[0];
+            for j in (lcp + 1)..=n {
+                let d = ln_sum_exp2(
+                    model.ln_gap_open + prev[j - 1][M],
+                    model.ln_gap_extend + prev[j - 1][D],
+                );
+                prev[j] = [f64::NEG_INFINITY, f64::NEG_INFINITY, d];
+            }
+
+            for i in 1..=m {
+                let read_base = read[i - 1];
+                let (match_ln, mismatch_ln) = emission[quals[i - 1] as usize];
+                cur[lcp] = seam[i]; // shared boundary cell for this row
+                fill_row(
+                    prev,
+                    cur,
+                    hap,
+                    read_base,
+                    match_ln,
+                    mismatch_ln,
+                    ins_emit,
+                    model,
+                    lcp + 1,
+                    n,
+                );
+                std::mem::swap(prev, cur);
+            }
+
+            let last = &prev[n];
+            let loglik = ln_sum_exp3(last[M], last[I], last[D]);
             (c.allele.clone(), loglik)
         })
         .collect()
@@ -389,6 +587,76 @@ mod tests {
         let alleles: Vec<&Allele> = scored.iter().map(|(a, _)| a).collect();
         let want: Vec<&Allele> = cands.iter().map(|c| &c.allele).collect();
         assert_eq!(alleles, want, "dense scores follow candidate order");
+    }
+
+    /// The shared-prefix `score_candidates` must be **bit-identical** to scoring
+    /// every candidate independently with `forward` (it is a memoization of the
+    /// common-prefix DP, not an approximation). Cover varied windows, read
+    /// lengths, mismatches, and a no-common-prefix candidate set.
+    #[test]
+    fn score_candidates_is_bit_identical_to_per_candidate_forward() {
+        use crate::ssr::pileup::candidate_generation::{CandidateAllele, build_rungs};
+        use crate::ssr::types::Allele;
+
+        let locus = ca_locus();
+        let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"GGGCACACATTT".to_vec(), vec![40; 12]), // clean, == ref rung
+            (b"GGGCACACACATTT".to_vec(), vec![30; 14]), // one extra unit
+            (b"GGGCAGACATTT".to_vec(), vec![35; 12]), // an interior mismatch
+            (b"GGGCATTT".to_vec(), vec![20; 8]),      // short (zero-unit-ish)
+            (b"".to_vec(), vec![]),                   // empty read
+        ];
+
+        let mut oracle = PairHmmScratch::new();
+        let mut shared = PairHmmScratch::new();
+        let model = HmmModel::new();
+
+        // A spread of windows so the longest-common-prefix length varies.
+        for &(obs, w) in &[(3u16, 0u16), (3, 2), (5, 3), (1, 4)] {
+            let mut cands = Vec::new();
+            build_rungs(&locus, obs, w, &mut cands);
+            for (read, quals) in &cases {
+                let got = score_candidates(read, quals, &cands, &mut shared, &model);
+                let want: Vec<(Allele, f64)> = cands
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.allele.clone(),
+                            forward(read, quals, &c.candidate_seq, &mut oracle, &model),
+                        )
+                    })
+                    .collect();
+                assert_eq!(got.len(), want.len());
+                for (g, e) in got.iter().zip(&want) {
+                    assert_eq!(g.0, e.0, "allele mismatch");
+                    assert_eq!(
+                        g.1.to_bits(),
+                        e.1.to_bits(),
+                        "score for {:?}: shared {} vs oracle {} (obs={obs}, w={w})",
+                        g.0,
+                        g.1,
+                        e.1
+                    );
+                }
+            }
+        }
+
+        // A candidate set with NO common prefix (lcp == 0) must also match.
+        let no_prefix = vec![
+            CandidateAllele {
+                candidate_seq: b"ACGTACGT".to_vec(),
+                allele: Allele::OnLadder { units: 2 },
+            },
+            CandidateAllele {
+                candidate_seq: b"TGCATGCA".to_vec(),
+                allele: Allele::OnLadder { units: 3 },
+            },
+        ];
+        let got = score_candidates(b"ACGTACGT", &[40; 8], &no_prefix, &mut shared, &model);
+        for (c, g) in no_prefix.iter().zip(&got) {
+            let want = forward(b"ACGTACGT", &[40; 8], &c.candidate_seq, &mut oracle, &model);
+            assert_eq!(g.1.to_bits(), want.to_bits());
+        }
     }
 
     #[test]

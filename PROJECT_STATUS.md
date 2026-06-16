@@ -19,7 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-16):** **bed-regions `--regions` performance + code review**
+> - **Last completed task (2026-06-16):** **ssr-pileup performance review**
+>   (branch `ssr-pileup-review`, [perf_ssr_pileup_2026-06-16.md](doc/devel/reports/reviews/perf_ssr_pileup_2026-06-16.md)).
+>   First measurement of the SSR Stage-1 realignment hot path — new criterion bench
+>   ([benches/ssr_pileup_perf.rs](benches/ssr_pileup_perf.rs)) + profiling driver + a `#[doc(hidden)]`
+>   `bench_harness` seam. **Verdict: Apply the listed wins.** `sample` profile = **~74.6% of self-time in
+>   `exp`+`log`** (pair-HMM `ln_sum_exp2/3`); cost **perfectly linear in `2·window+1` rungs**; allocation cold.
+>   **Wins then applied (all byte-identical, test-gated): H1 (fold redundant `exp(0)`), H2 (single-pass
+>   `ln_sum_exp3`), and P1 (shared-prefix DP — score the rungs' common prefix once, continue each tail from
+>   the saved seam). Combined ≈−54% on the realignment core** (window/10 276.9→125.9 ms; tetra 430→200 ms),
+>   gated by a new bit-identity test vs per-candidate `forward`. L2 + an `−∞`-skip tried and reverted (no
+>   gain). Banding (L1) / approx-math (S1) / SIMD floor (B1) / end-to-end bench (L9) left as experiments.
+>   Audit trail `tmp/perf_review_2026-06-16_ssr-pileup/`.
+> - **Prior task (2026-06-16):** **bed-regions `--regions` performance + code review**
 >   (branch `bed-regions-review`). **Perf** ([perf_bed-regions_2026-06-16.md](doc/devel/reports/reviews/perf_bed-regions_2026-06-16.md)):
 >   measured on tomato1 — per-region overhead negligible (80→8000 regions = +1.9% wall), BAQ
 >   (`probaln_glocal`) dominates ~70%; the `--regions` findings are not a perf lever. L1+L3 applied
@@ -1122,6 +1134,7 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Architecture:** [ssr_pileup.md](doc/devel/architecture/ssr_pileup.md) (every structural question decided)
 - **Plan:** [ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md) (implementation sketch: build order, modules, structs, fn signatures)
 - **Build order:** (1) allele types in `types.rs` → (2) lift `normalize_alleles` to `src/norm_seqs/` → (3) container SSR schema → (4) stage modules (`count_repeats` → `pair_hmm` → `candidate_generation` → `triage` → `fetch_reads` → `mod`).
+- **Latest perf review:** [perf_ssr_pileup_2026-06-16.md](doc/devel/reports/reviews/perf_ssr_pileup_2026-06-16.md) (branch `ssr-pileup-review`) — **Apply the listed wins.** First measurement of the realignment hot path: new criterion bench [benches/ssr_pileup_perf.rs](benches/ssr_pileup_perf.rs) + profiling driver [examples/profile_ssr_pileup.rs](examples/profile_ssr_pileup.rs), both driving a new `#[doc(hidden)]` [bench_harness](src/ssr/pileup/bench_harness.rs) seam. The `sample` profile pins **~74.6% of self-time on `exp`+`log`** in the pair-HMM `ln_sum_exp2/3`; cost is **perfectly linear in the `2·window+1` rung count** (13.3 ms/rung). Allocation is cold (~0.02%). Audit trail `tmp/perf_review_2026-06-16_ssr-pileup/`.
 - **Impl reports:**
   - Task 1 — allele representation (`Allele`/`NormalizedSeq` + `to_sequence`/`repeat_count`) in [src/ssr/types.rs](src/ssr/types.rs): [ssr_pileup_task1_allele_types_2026-06-15.md](ia/reports/implementations/ssr_pileup_task1_allele_types_2026-06-15.md)
   - Task 2 — lift `normalize_alleles` (+ `IndexRange`) to the shared [src/norm_seqs.rs](src/norm_seqs.rs); SNP CIGAR path ([src/pileup/walker/indel_norm.rs](src/pileup/walker/indel_norm.rs)) now wraps the kernel. Behaviour-preserving; full lib suite green: [ssr_pileup_task2_norm_seqs_lift_2026-06-15.md](ia/reports/implementations/ssr_pileup_task2_norm_seqs_lift_2026-06-15.md)
@@ -1130,6 +1143,13 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - Candidate generation Job 1 — `CandidateAllele` + `build_rungs` (on-ladder rungs `left_flank + motif×L + right_flank`) in [src/ssr/pileup/candidate_generation.rs](src/ssr/pileup/candidate_generation.rs); composes `Allele::to_sequence`. Job 2 (off-ladder normalization) deferred pending a contract decision. [ssr_pileup_candidate_generation_2026-06-15.md](ia/reports/implementations/ssr_pileup_candidate_generation_2026-06-15.md)
   - `score_candidates` in [src/ssr/pileup/pair_hmm.rs](src/ssr/pileup/pair_hmm.rs) — joins `build_rungs` + `forward` into the dense per-read `Qᵣ` (one `(allele, log-lik)` per candidate, raw scores; pruning/renorm is the aggregator's job). Small addition, context in commit; 2 added tests.
   - Candidate generation Job 2 — `build_offladder` + `normalize_offladder` (off-ladder candidates) in [src/ssr/pileup/candidate_generation.rs](src/ssr/pileup/candidate_generation.rs); contract A + B1, canonical form is the **verbatim full tract** (left-alignment is provably a no-op on a full-tract key; clean flanks). **`norm_seqs` not needed for B1** — task-2's second consumer doesn't materialize. `candidate_generation` now complete. [ssr_pileup_candidate_generation_job2_2026-06-15.md](ia/reports/implementations/ssr_pileup_candidate_generation_job2_2026-06-15.md)
+- **Perf (review + applied wins, 2026-06-16):**
+  - **Applied (byte-identical, ≈−54% on realignment):** H1 fold `exp(0)` in `ln_sum_exp2`; H2 single-pass `ln_sum_exp3`; **P1 shared-prefix DP** in `score_candidates` (score the rungs' longest common prefix once, continue each tail from the saved seam). All gated by `score_candidates_is_bit_identical_to_per_candidate_forward`.
+  - **Open — P1 follow-up:** incremental motif-by-motif seam advance would also share the per-rung tract tail (a further ~20%), more complex; deferred.
+  - **Open — L1 (experiment):** band the DP (arch §5.5 `PAIR_HMM_BAND_BP`); approximation, gate on genotype concordance. With P1 landed, the remaining `exp` (~48% self-time) is the natural target for L1 / approx-math (S1).
+  - **Open — B1 (build):** add an `(aarch64, linux)` `target-cpu` floor to `.cargo/config.toml` (prod misses Neoverse SIMD; macOS bench flatters prod).
+  - **Open — L9 (measurement gap):** no end-to-end bench — fetch path + driver batch loop unmeasured; build one from the in-process `stage1_fixture` (no `trf-mod`).
+  - Design lever (route to SSR owners, not perf): the `window` candidate multiplier touches the realign-everything contract + Stage 2 support points.
 - **Open:**
   - **Task 3 (container generalization, arch §10) deferred by choice** — a large multi-step refactor of the production `.psp` writer (58KB) + reader (136KB); gates the `.ssr.psp` writer/round-trip but not the stage's compute modules. Trait-vs-builders fork (§10.7 Q1) still to be decided at its step 1.
   - `OnLadder::to_sequence` is a clean tiling; imperfect-locus interruptions deferred to `candidate_generation.rs`. The SSR off-ladder adapter onto `norm_seqs` lands with `candidate_generation` (first consumer beyond the SNP path).
