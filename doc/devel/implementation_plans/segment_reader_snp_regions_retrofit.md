@@ -73,8 +73,10 @@ assembly, and the pileup depends on every part. A replacement must preserve:
    `mate_ref_id`). **Load-bearing.**
 
 The segment reader already satisfies 1 (within one file/region), 5 (same
-`classify_pre_decode` + `min_read_length` via `SegmentReadFilter`), and 7.
-It does **not** provide 2, 3, 4, or 6 — those live in the merge layer.
+`classify_pre_decode` + `min_read_length` via `SegmentReadFilter`), 6 (the
+per-segment `FilterCounts` via `MappedReadsInSegment::filter_counts()`, added
+on `main` @ `3e5237e` — the merge just sums them across inputs), and 7.
+It does **not** provide 2, 3, or 4 — those live in the merge layer.
 
 ## 3. Target architecture (the merge moves to the `MappedRead` level)
 
@@ -95,7 +97,7 @@ per region (serial loop, unchanged):
      · argmin by (ref_id, pos)        (coordinate order)
      · cross-file dedup on (qname, flag, ref_id, pos)   → DuplicateReadAcrossFiles
      · within-file out-of-order check → OutOfOrderRead; fuse on first error
-     · accumulate FilterCounts
+     · sum per-stream FilterCounts  (each fetcher already tallies its own)
   → the existing BAQ/walker chain (unchanged)
 ```
 
@@ -113,18 +115,24 @@ reproduced exactly (see §5).
 
 ## 4. Increment sequence (each its own commit + tests)
 
-1. **`FilterCounts` in the fetcher.** Teach `AlignmentFile` /
-   `MappedReadsInSegment` to tally the cheap-filter drops it currently
-   discards (per `FilterBucket`: duplicate / low-mapq / supplementary /
-   secondary / unmapped / qc-fail / too-short), exposed via an accessor.
-   Smallest, lowest-risk, independently testable step; closes the one
-   functional gap (contract item 6). No consumer change yet.
+1. **`FilterCounts` in the fetcher — DONE** (`main` @ `3e5237e`,
+   "feat(bam): expose segment_reader filter-drop counts"). `MappedReadsInSegment`
+   accumulates cheap-filter drops (flags / MAPQ / length), readable via
+   `filter_counts() -> &FilterCounts` after draining; out-of-segment drops
+   (wrong contig, index over-return) are deliberately uncounted — which
+   matches the old reader (it pre-filters ref_id+overlap before counting), so
+   count parity holds by construction. The `FilterBucket → counter` mapping is
+   centralized in `FilterCounts::record_drop`, shared with the merged reader's
+   scanners. Closes contract item 6. **Not yet on the `segment-read-fetcher`
+   branch** (it's on `main`) — merge `main` in before step 2 so the branch
+   has it (and the `8c32b00` skill fix).
 2. **`MappedRead` k-way merge over `AlignmentFile`.** Build the merge layer
-   (argmin order + cross-file dedup + within-file out-of-order + fuse + count
-   reconciliation), consuming one pooled `AlignmentFile` per input. Land it
-   behind the existing `AlignmentMergedReader::query` *call signature* (or a
-   sibling the driver can switch to) so the swap in step 3 is a one-line
-   change. Gate on a **byte-identity test** (§5).
+   (argmin order + cross-file dedup + within-file out-of-order + fuse), one
+   pooled `AlignmentFile` per input; its `counts()` simply **sums** the
+   per-stream `filter_counts()` (step 1 already tallies them). Land it behind
+   a `PileupInputs::query_region(...)` method (or the existing
+   `AlignmentMergedReader::query` signature) so the swap in step 3 is a
+   one-line change. Gate on a **byte-identity test** (§5).
 3. **Flip `run_pileup` + retire the old path.** Hold pooled `AlignmentFile`s
    in `PileupInputs`; per region, drive the new merge. Then delete
    `OwnedIndexed{Bam,Cram}Records` and the now-dead `query` internals.
