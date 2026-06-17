@@ -6,5 +6,6 @@
 //! to land: `alignment` (the delimiter + quality gate), `locus_tally`, and the
 //! driver.
 
+pub mod alignment;
 pub mod fetch_reads;
 pub mod footprint;
