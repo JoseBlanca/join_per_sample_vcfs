@@ -46,6 +46,25 @@ fn end_soft_clip(op: &CigarOp) -> Option<u32> {
     }
 }
 
+/// The read length the CIGAR implies — the sum of its read-consuming op lengths
+/// (M / I / S / `=` / X). A well-formed record has `cigar_read_len(cigar) ==
+/// seq.len()`; [`fetch_locus_reads`](super::fetch_reads::fetch_locus_reads)
+/// drops reads where the two disagree (a truncated/malformed record), because
+/// the delimiter slices `seq` / `qual` by ranges derived from `seq.len()`.
+pub(crate) fn cigar_read_len(cigar: &[CigarOp]) -> usize {
+    cigar
+        .iter()
+        .map(|op| match op {
+            CigarOp::Match(n)
+            | CigarOp::Insertion(n)
+            | CigarOp::SoftClip(n)
+            | CigarOp::SeqMatch(n)
+            | CigarOp::SeqMismatch(n) => *n as usize,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// The read's reference footprint from its CIGAR + mapping position.
 pub(crate) fn read_footprint(cigar: &[CigarOp], pos: u64) -> Footprint {
     let ref_start = pos.saturating_sub(1) as u32;
@@ -132,6 +151,12 @@ pub(crate) fn extract_region(
     } else {
         ref_to_read(cigar, fp.ref_start, fp.leading_clip, w_end)
     };
+    // Clamp both ends into `[0, read_len]`: `ref_to_read` is bounded by the
+    // CIGAR's read-consumption, so a CIGAR consistent with `seq.len()` keeps
+    // `r_start <= read_len`. The clamp is defense-in-depth — the fetcher already
+    // drops length-inconsistent records — so an out-of-range index can never
+    // reach the `seq`/`qual` slice in `process_locus`.
+    let r_start = r_start.min(read_len);
     r_start..r_end.min(read_len).max(r_start)
 }
 
@@ -192,6 +217,30 @@ mod tests {
             adaptor_boundary: None,
             source_file_index: 0,
         }
+    }
+
+    #[test]
+    fn cigar_read_len_sums_read_consuming_ops() {
+        // M / I / S / = / X consume read bases; D / N / H / P do not.
+        assert_eq!(cigar_read_len(&[CigarOp::Match(30)]), 30);
+        assert_eq!(
+            cigar_read_len(&[
+                CigarOp::SoftClip(3),
+                CigarOp::Match(10),
+                CigarOp::Insertion(2),
+            ]),
+            15
+        );
+        // A deletion extends the reference span but consumes no read base.
+        assert_eq!(
+            cigar_read_len(&[CigarOp::Match(5), CigarOp::Deletion(4), CigarOp::Match(5)]),
+            10
+        );
+        // A hard clip is not present in the read sequence.
+        assert_eq!(
+            cigar_read_len(&[CigarOp::HardClip(4), CigarOp::Match(8)]),
+            8
+        );
     }
 
     #[test]
@@ -311,6 +360,25 @@ mod tests {
         let cigar = vec![CigarOp::SoftClip(6), CigarOp::Match(12)];
         let fp = read_footprint(&cigar, 17);
         assert_eq!(extract_region(&cigar, fp, 18, &locus6()), 0..18);
+    }
+
+    #[test]
+    fn extract_region_maps_window_across_an_internal_deletion() {
+        // M8 D2 M10 from pos 11: aligned ref [10,30) brackets the window [10,28);
+        // the 2 bp deletion means the read covers those 18 ref bases in 16 read
+        // bases, so the window maps to read[0..16].
+        let cigar = vec![CigarOp::Match(8), CigarOp::Deletion(2), CigarOp::Match(10)];
+        let fp = read_footprint(&cigar, 11);
+        assert_eq!(extract_region(&cigar, fp, 18, &locus6()), 0..16);
+    }
+
+    #[test]
+    fn extract_region_maps_window_across_an_internal_insertion() {
+        // M8 I2 M10 from pos 11: aligned ref [10,28) == the window; the 2 inserted
+        // read bases fall inside it, so the window maps to the whole read[0..20].
+        let cigar = vec![CigarOp::Match(8), CigarOp::Insertion(2), CigarOp::Match(10)];
+        let fp = read_footprint(&cigar, 11);
+        assert_eq!(extract_region(&cigar, fp, 20, &locus6()), 0..20);
     }
 
     #[test]

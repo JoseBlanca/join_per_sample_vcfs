@@ -129,8 +129,13 @@ pub(crate) enum Delimited {
 
 /// Max of the candidates, keeping the **first on ties** — so the caller encodes
 /// the tie-break by passing candidates in priority order.
+///
+/// # Panics
+/// Panics if `cands` is empty. Every call site passes a fixed non-empty array
+/// literal of transition candidates, so this cannot fire today.
 #[inline]
 fn pick(cands: &[(f64, u8)]) -> (f64, u8) {
+    debug_assert!(!cands.is_empty(), "pick requires at least one candidate");
     let mut best = cands[0];
     for &c in &cands[1..] {
         if c.0 > best.0 {
@@ -302,6 +307,8 @@ pub(crate) fn passes_quality_gate(
     let buf = &mut scratch.qual_buf;
     buf.clear();
     buf.extend_from_slice(quals);
+    // Nearest-rank lower quartile: the element at sorted index ⌊(n-1)/4⌋ (so a
+    // 4-base region keys on its lowest base, an 8-base region on its 2nd-lowest).
     let k = (buf.len() - 1) / 4;
     let (_, q1, _) = buf.select_nth_unstable(k);
     *q1 >= threshold
@@ -412,6 +419,26 @@ mod tests {
         ));
         // Empty region passes vacuously.
         assert!(passes_quality_gate(&[], MIN_REGION_Q1, &mut s));
+    }
+
+    #[test]
+    fn quality_gate_is_inclusive_at_the_threshold_and_handles_singletons() {
+        let mut s = ViterbiScratch::new();
+        // Boundary: a quartile base *equal* to the threshold passes (>=, not >).
+        assert!(passes_quality_gate(&[15], MIN_REGION_Q1, &mut s)); // single element, k = 0
+        assert!(!passes_quality_gate(&[14], MIN_REGION_Q1, &mut s));
+        assert!(passes_quality_gate(&[15, 15], MIN_REGION_Q1, &mut s)); // len 2, k = 0
+        // A region whose lower-quartile element (k = ⌊(4-1)/4⌋ = 0) is exactly 15.
+        assert!(passes_quality_gate(
+            &[15, 40, 40, 40],
+            MIN_REGION_Q1,
+            &mut s
+        ));
+        assert!(!passes_quality_gate(
+            &[14, 40, 40, 40],
+            MIN_REGION_Q1,
+            &mut s
+        ));
     }
 
     #[test]

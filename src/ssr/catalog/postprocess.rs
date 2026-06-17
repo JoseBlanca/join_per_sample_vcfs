@@ -19,6 +19,12 @@
 //!    (spec §3.2 — *not* TRF's `fracMatch`), then drop below the floor.
 //!    **Imperfect single-motif loci are kept** (our one divergence from
 //!    GangSTR's perfect-only `remove_messy`).
+//! 6. **Embed `ref_seq`** (trimmed tract + `flank_bp` each side, clamped at the
+//!    contig ends), and **drop any locus whose flank clamped to zero** on either
+//!    side — a tract abutting position 0 of the contig, or ending on its last
+//!    base. The Stage-1 delimiter anchors on both flank junctions, so a survivor
+//!    is guaranteed a non-empty flank each side (contig-boundary microsatellites
+//!    are not genotypeable and are dropped here, not crashed downstream).
 //!
 //! Two adaptations from the GangSTR scripts: (a) GangSTR reads the repeat
 //! sequence from a TRF column; we slice it from the resident contig
@@ -137,6 +143,17 @@ fn finish_locus(r: &TrfRecord, chrom: &str, contig_seq: &[u8], p: &CatalogParams
     // Embed ref_seq: trimmed tract + flank each side, clamped at contig ends.
     let ref_start = new_start.saturating_sub(p.flank_bp);
     let ref_end = (new_end + p.flank_bp).min(contig_seq.len() as u32);
+
+    // Drop a locus whose flank clamped to nothing on either side — a tract
+    // abutting position 0 of the contig (empty left flank) or ending on the
+    // contig's last base (empty right flank). The empirical-candidate delimiter
+    // (`ssr::pileup::alignment`) anchors the repeat region on *both* flank
+    // junctions; a zero-length flank leaves nothing to anchor against, so the
+    // tract is not genotypeable and must not reach Stage 1.
+    if ref_start == new_start || ref_end == new_end {
+        return None;
+    }
+
     let ref_bytes = upper(&contig_seq[ref_start as usize..ref_end as usize]);
 
     Locus::new(
@@ -417,6 +434,7 @@ mod tests {
     #[test]
     fn build_loci_clamps_flanks_at_contig_ends() {
         // Tract (AT)*8 starts at position 1; left flank (5 bp) is clamped to 1.
+        // A 1 bp flank is still a (weak) anchor, so the locus is kept.
         let contig = b"GATATATATATATATATCGCGCGCGCG";
         let recs = vec![TrfRecord::for_test(1, 17, 2, 100, b"AT")];
         let loci = build_loci(recs, "chr1", contig, &params());
@@ -426,16 +444,42 @@ mod tests {
         assert_eq!(l.left_flank(), b"G", "only 1 bp of left flank available");
     }
 
+    #[test]
+    fn build_loci_drops_locus_with_empty_left_flank() {
+        // Tract (AT)*8 abuts position 0 — the left flank clamps to nothing, so
+        // the delimiter would have no left junction to anchor: dropped.
+        let contig = b"ATATATATATATATATCGCGC";
+        let recs = vec![TrfRecord::for_test(0, 16, 2, 100, b"AT")];
+        assert!(
+            build_loci(recs, "chr1", contig, &params()).is_empty(),
+            "a tract at contig position 0 has no left flank and is not genotypeable"
+        );
+    }
+
+    #[test]
+    fn build_loci_drops_locus_with_empty_right_flank() {
+        // Tract (AT)*8 ends on the contig's last base — the right flank clamps
+        // to nothing: dropped for the same reason as the empty-left case.
+        let contig = b"CGCGCATATATATATATATAT";
+        let recs = vec![TrfRecord::for_test(5, 21, 2, 100, b"AT")];
+        assert!(
+            build_loci(recs, "chr1", contig, &params()).is_empty(),
+            "a tract ending on the contig's last base has no right flank"
+        );
+    }
+
     /// Period-1 homopolymers are dropped (MIN_PERIOD = 2), and — because the
     /// drop happens before bundling — a poly-A run adjacent to a real SSR no
     /// longer bundle-drops it.
     #[test]
     fn build_loci_drops_period_one_homopolymer_and_spares_the_neighbour_ssr() {
-        // 20 bp poly-A, then (CAG)*10 immediately after. trf-style records.
+        // 20 bp poly-A, then (CAG)*10, then a right flank so the CAG locus is
+        // not dropped for abutting the contig end (orthogonal to this test).
         let mut contig = vec![b'A'; 20];
         for _ in 0..10 {
             contig.extend_from_slice(b"CAG");
         }
+        contig.extend_from_slice(b"TTTTT");
         let homopolymer = TrfRecord::for_test(0, 20, 1, 100, b"A");
         let cag = TrfRecord::for_test(20, 50, 3, 100, b"CAG");
         let loci = build_loci(vec![homopolymer, cag], "chr1", &contig, &params());
