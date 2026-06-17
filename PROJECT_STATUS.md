@@ -19,7 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-17):** **ssr-pileup code-review fixes applied**
+> - **Last completed task (2026-06-17):** **SSR Stage 1 (`ssr-pileup`) rebuilt as Mark-2**
+>   (branch `ssr-pileup-mark2`, [ssr_pileup_mark2_2026-06-17.md](ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md)).
+>   Replaced the Mark-1 reference-anchored **rung** model with the **empirical-candidate** model: candidate
+>   alleles are observed sequences, the reference is only a coordinate frame, no on/off-ladder, no Stage-1
+>   likelihood. Per read: a per-Q Viterbi+traceback **delimits** the repeat region → first-quartile **quality
+>   gate** (Phred 15) → tally **observed sequence → count** per locus. New `registry_ssr` schema
+>   (per-observation `obs-count`/`obs-seq-len`/`obs-seq` Bytes; no version bump, pre-alpha). Built in 7 steps;
+>   the old `src/ssr_mark1/` tree + its bench/example were deleted at the cutover. fmt/clippy `-D warnings`
+>   clean; **1116 lib + integration + doctests, 0 failed**, incl. end-to-end catalog→BAM→`.ssr.psp` +
+>   thread-count determinism. Design: [ssr_ladder_model.md](doc/devel/architecture/ssr_ladder_model.md),
+>   [ssr_pileup_mark2.md](doc/devel/architecture/ssr_pileup_mark2.md). Open: calibrate Q1/cap on real data,
+>   a Mark-2 bench, spec §4 amendment, then Stage 2 (`ssr-call`).
+> - **Prior task (2026-06-17):** **ssr-pileup code-review fixes applied**
 >   (branch `ssr-pileup-review`, [fixes_applied_2026-06-17.md](doc/devel/reports/reviews/fixes_applied_2026-06-17.md)).
 >   Applied the same-day code review: **B1** doc gate restored; **M5** extracted a shared `decode_cram_container`
 >   used by both the per-call `refill` and the decode-once `CachingCramReader` (folds in **M2** EOF-stop alignment +
@@ -1151,7 +1163,8 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 1 — `ssr-pileup` (per-sample evidence extraction)
 
 #### `ssr-pileup` stage
-- **Status:** fixes-applied (perf branch `ssr-pileup-review`; code review 2026-06-17 → fixes applied same day)
+- **Status:** **implemented — rebuilt as Mark-2** (2026-06-17, branch `ssr-pileup-mark2`). The Mark-1 detail below (the reference-anchored rung model + its perf/review history) is **superseded**, kept for chronology.
+- **Mark-2 rebuild (current):** [ssr_pileup_mark2_2026-06-17.md](ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md). Empirical-candidate model — observed sequences, the reference is only a coordinate frame, no on/off-ladder, no Stage-1 likelihood. Design: [ssr_ladder_model.md](doc/devel/architecture/ssr_ladder_model.md) + [ssr_pileup_mark2.md](doc/devel/architecture/ssr_pileup_mark2.md); plan [ssr_pileup_mark2.md](doc/devel/implementation_plans/ssr_pileup_mark2.md). New `src/ssr/` (`types`/`catalog`/`pileup::{footprint,fetch_reads,alignment,locus_tally,driver}`) + rewritten `psp/registry_ssr.rs`; old `src/ssr_mark1/` + its bench/example deleted. fmt/clippy `-D warnings` clean; 1116 lib + integration + doctests green (end-to-end + thread-determinism). **Open:** calibrate `MIN_REGION_Q1` (15) / `MAX_READS_PER_LOCUS` on real data; a Mark-2 bench (the Mark-1 one was deleted); spec §4.2/§4.3/§5.1 amendment; then Stage 2 (`ssr-call`).
 - **Latest fixes-applied:** [fixes_applied_2026-06-17.md](doc/devel/reports/reviews/fixes_applied_2026-06-17.md) — B1 (doc gate restored), M5 (shared `decode_cram_container` for refill + caching path; folds in M2 EOF-stop + Mi3/Mi6), M3 (ContainerCache eviction/dedup unit tests), Mi1/Mi4/Mi5/Mi7/Mi8/Mi9/Mi10 + doc nits. M1/M4 reworded-as-doc per the review discussion (no `.ssr.psp` baseline → H1/H2 ULP-difference is inert; cache cap is non-output-affecting). All gates green: fmt/clippy `-D warnings`/doc clean, 1171 lib (+4) + 45 integration tests. **Open:** M3 multi-container *fetch* test (needs a multi-container CRAM fixture), Mi2 (cfg-gate bench seam), Mi11 (bench baseline guard), Mi12 (driver error context — re-assess vs `par_chunks`).
 - **Architecture:** [ssr_pileup.md](doc/devel/architecture/ssr_pileup.md) (every structural question decided)
 - **Plan:** [ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md) (implementation sketch: build order, modules, structs, fn signatures)

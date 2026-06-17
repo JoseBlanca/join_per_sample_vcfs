@@ -1,5 +1,15 @@
 # SSR Stage-1 — remaining work (reference checklist)
 
+> **SUPERSEDED (2026-06-17).** SSR Stage 1 was **rebuilt as Mark-2**
+> (empirical-candidate model) — the Mark-1 rung pipeline this checklist tracked is
+> gone (`src/ssr_mark1/` deleted). See
+> [ssr_pileup_mark2.md](ssr_pileup_mark2.md) (Mark-2 plan),
+> [../architecture/ssr_ladder_model.md](../architecture/ssr_ladder_model.md),
+> [../architecture/ssr_pileup_mark2.md](../architecture/ssr_pileup_mark2.md), and
+> the report
+> [../../../ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md](../../../ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md).
+> Kept below for historical reference only.
+
 **As of:** 2026-06-15, branch `ssr-architecture`.
 **Purpose:** the running to-do for SSR Stage 1 now that the `.psp` **container
 generalization (architecture §10) is complete**. A reference to follow, not a
