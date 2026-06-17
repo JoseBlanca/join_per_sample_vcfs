@@ -26,8 +26,8 @@
 
 use std::sync::LazyLock;
 
-use crate::ssr::pileup::candidate_generation::CandidateAllele;
-use crate::ssr::types::Allele;
+use crate::ssr_mark1::pileup::candidate_generation::CandidateAllele;
+use crate::ssr_mark1::types::Allele;
 
 /// DP-cell state indices into a `[f64; 3]` cell: Match / Insertion / Deletion.
 const M: usize = 0;
@@ -564,8 +564,8 @@ mod tests {
     }
 
     /// A perfect (CA) locus: GGG | CACACA | TTT, tract at [13, 19).
-    fn ca_locus() -> crate::ssr::types::Locus {
-        use crate::ssr::types::{Locus, Motif};
+    fn ca_locus() -> crate::ssr_mark1::types::Locus {
+        use crate::ssr_mark1::types::{Locus, Motif};
         Locus::new(
             "chr1".into(),
             13,
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn score_candidates_returns_one_dense_score_per_candidate_in_order() {
-        use crate::ssr::pileup::candidate_generation::build_rungs;
+        use crate::ssr_mark1::pileup::candidate_generation::build_rungs;
         let locus = ca_locus();
         let mut cands = Vec::new();
         build_rungs(&locus, 3, 2, &mut cands); // L ∈ 1..=5 → 5 candidates
@@ -599,8 +599,8 @@ mod tests {
     /// lengths, mismatches, and a no-common-prefix candidate set.
     #[test]
     fn score_candidates_is_bit_identical_to_per_candidate_forward() {
-        use crate::ssr::pileup::candidate_generation::{CandidateAllele, build_rungs};
-        use crate::ssr::types::Allele;
+        use crate::ssr_mark1::pileup::candidate_generation::{CandidateAllele, build_rungs};
+        use crate::ssr_mark1::types::Allele;
 
         let locus = ca_locus();
         let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn score_candidates_ranks_the_matching_rung_highest() {
-        use crate::ssr::pileup::candidate_generation::build_rungs;
+        use crate::ssr_mark1::pileup::candidate_generation::build_rungs;
         let locus = ca_locus();
         let mut cands = Vec::new();
         build_rungs(&locus, 3, 2, &mut cands); // L ∈ 1..=5
@@ -684,7 +684,7 @@ mod tests {
     /// comes straight from the seam. Must still be bit-identical to `forward`.
     #[test]
     fn score_candidates_single_candidate_matches_forward_bit_for_bit() {
-        use crate::ssr::pileup::candidate_generation::build_rungs;
+        use crate::ssr_mark1::pileup::candidate_generation::build_rungs;
         let locus = ca_locus();
         let mut cands = Vec::new();
         build_rungs(&locus, 3, 0, &mut cands); // window 0 → exactly one rung (L=3)

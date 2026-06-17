@@ -13,7 +13,7 @@
 //! Off-ladder evidence is deferred (empty) until off-ladder candidate generation
 //! lands ([`super::candidate_generation`]).
 
-use crate::ssr::types::{Allele, Locus};
+use crate::ssr_mark1::types::{Allele, Locus};
 
 use super::read_analysis::ReadOutcome;
 
@@ -136,7 +136,7 @@ fn prune_and_renormalize(scores: &[(Allele, f64)]) -> Vec<(u16, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssr::types::Motif;
+    use crate::ssr_mark1::types::Motif;
 
     fn locus() -> Locus {
         Locus::new(

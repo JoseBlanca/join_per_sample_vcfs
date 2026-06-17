@@ -93,16 +93,16 @@ pub(crate) enum CatalogError {
     InvalidMotif {
         line: usize,
         #[source]
-        source: crate::ssr::types::MotifError,
+        source: crate::ssr_mark1::types::MotifError,
     },
 
-    /// A row's coordinates / purity violate the [`Locus`](crate::ssr::types::Locus)
+    /// A row's coordinates / purity violate the [`Locus`](crate::ssr_mark1::types::Locus)
     /// invariants.
     #[error("invalid locus at line {line}")]
     InvalidLocus {
         line: usize,
         #[source]
-        source: crate::ssr::types::LocusError,
+        source: crate::ssr_mark1::types::LocusError,
     },
 
     /// `trf-mod` could not be located: no usable override, not found beside our
@@ -237,7 +237,7 @@ pub(crate) fn run(cfg: &CatalogConfig) -> Result<(), CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssr::catalog::io::CatalogReader;
+    use crate::ssr_mark1::catalog::io::CatalogReader;
     use std::io::Write;
 
     /// End-to-end: write a tiny reference with one clean (CAG)*40 tract, run the

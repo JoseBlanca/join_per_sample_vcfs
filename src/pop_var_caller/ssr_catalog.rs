@@ -1,14 +1,14 @@
 //! `ssr-catalog` subcommand — build the per-genome SSR locus catalog (Stage 0
 //! of the SSR caller). Detects tandem repeats in a reference with `trf-mod`,
 //! post-processes them to di/tri/tetra+ microsatellite loci, and writes a
-//! self-describing bgzip TSV catalog. See [`crate::ssr::catalog`].
+//! self-describing bgzip TSV catalog. See [`crate::ssr_mark1::catalog`].
 
 use std::path::PathBuf;
 
 use clap::Args;
 use thiserror::Error;
 
-use crate::ssr::catalog::{self, CatalogConfig, CatalogParams};
+use crate::ssr_mark1::catalog::{self, CatalogConfig, CatalogParams};
 
 /// Arguments for the `ssr-catalog` subcommand. The struct is the authoritative
 /// knob list; [`run_ssr_catalog`] translates it into a [`CatalogConfig`].

@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use noodles_bgzf as bgzf;
 
 use super::{CatalogError, CatalogParams};
-use crate::ssr::types::{Locus, Motif};
+use crate::ssr_mark1::types::{Locus, Motif};
 
 /// The column-header line (without its trailing newline). Written verbatim and
 /// validated on read, so an upstream column reshuffle fails loudly.

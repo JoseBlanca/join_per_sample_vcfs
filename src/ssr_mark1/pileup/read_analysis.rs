@@ -14,7 +14,7 @@
 //! — well-defined only for both-flanks-aligned reads (§5.8) — a focused follow-up.
 
 use crate::bam::alignment_input::MappedRead;
-use crate::ssr::types::{Allele, Locus};
+use crate::ssr_mark1::types::{Allele, Locus};
 
 use super::candidate_generation::{CandidateAllele, build_rungs};
 use super::pair_hmm::{HmmModel, PairHmmScratch, score_candidates};
@@ -62,8 +62,8 @@ pub(crate) fn analyze_read(
 mod tests {
     use super::*;
     use crate::pileup::walker::CigarOp;
-    use crate::ssr::pileup::candidate_generation::STUTTER_WINDOW_UNITS;
-    use crate::ssr::types::Motif;
+    use crate::ssr_mark1::pileup::candidate_generation::STUTTER_WINDOW_UNITS;
+    use crate::ssr_mark1::types::Motif;
 
     /// CA locus with 6 bp flanks: GGGGGG | CACACA | TTTTTT, tract ref [16,22).
     fn locus6() -> Locus {

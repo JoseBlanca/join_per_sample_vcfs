@@ -24,8 +24,8 @@
 //! for a *trimmed-variant* representation (the rejected delta form, shared-types
 //! §4); revisit if we ever adopt that or relax the clean-flank guarantee.
 
-use crate::ssr::pileup::count_repeats::pure_tiling_units;
-use crate::ssr::types::{Allele, Locus, NormalizedSeq};
+use crate::ssr_mark1::pileup::count_repeats::pure_tiling_units;
+use crate::ssr_mark1::types::{Allele, Locus, NormalizedSeq};
 
 /// One candidate allele the read is scored against: its full local DNA sequence
 /// (what the forward aligns the read to) + which [`Allele`] that sequence
@@ -126,7 +126,7 @@ pub(crate) fn build_offladder(locus: &Locus, observed_tract: &[u8]) -> Option<Ca
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssr::types::Motif;
+    use crate::ssr_mark1::types::Motif;
 
     /// A perfect dinucleotide locus: 3bp left flank + (CA)×3 tract + 3bp right
     /// flank, tract at genomic [13, 19); `ref_bytes` = `GGGCACACATTT`.

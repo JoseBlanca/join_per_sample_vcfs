@@ -33,9 +33,9 @@ use crate::psp::errors::PspWriteError;
 use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
 use crate::psp::registry_ssr::{SsrKind, SsrLocusRecord as ContainerRecord};
 use crate::psp::writer::PspWriter;
-use crate::ssr::catalog::CatalogError;
-use crate::ssr::catalog::io::{CatalogHeader, CatalogReader};
-use crate::ssr::types::Locus;
+use crate::ssr_mark1::catalog::CatalogError;
+use crate::ssr_mark1::catalog::io::{CatalogHeader, CatalogReader};
+use crate::ssr_mark1::types::Locus;
 
 use rayon::prelude::*;
 
@@ -571,7 +571,7 @@ mod tests {
     // --- header build -------------------------------------------------
 
     use crate::fasta::ContigEntry;
-    use crate::ssr::catalog::CatalogParams;
+    use crate::ssr_mark1::catalog::CatalogParams;
 
     fn catalog_header() -> CatalogHeader {
         CatalogHeader {
@@ -733,8 +733,8 @@ mod tests {
     /// (keep alive) + the bam / fasta / catalog paths.
     fn stage1_fixture(tract_starts: &[u32]) -> (TempDir, TempDir, PathBuf, PathBuf, PathBuf) {
         use crate::pileup::per_sample::cram_files::{ContigSpec, build_fasta};
-        use crate::ssr::catalog::io::CatalogWriter;
-        use crate::ssr::types::{Locus, Motif};
+        use crate::ssr_mark1::catalog::io::CatalogWriter;
+        use crate::ssr_mark1::types::{Locus, Motif};
 
         let (fa_dir, fasta) = build_fasta(&[ContigSpec {
             name: "chr1".into(),
@@ -779,7 +779,7 @@ mod tests {
         output: &std::path::Path,
         threads: usize,
     ) -> SsrPileupConfig {
-        use crate::ssr::pileup::fetch_reads::MAX_READS_PER_LOCUS;
+        use crate::ssr_mark1::pileup::fetch_reads::MAX_READS_PER_LOCUS;
         SsrPileupConfig {
             alignment_files: vec![bam.to_path_buf()],
             reference: fasta.to_path_buf(),

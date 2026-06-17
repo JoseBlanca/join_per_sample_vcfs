@@ -14,7 +14,7 @@
 
 use std::sync::LazyLock;
 
-use crate::ssr::types::Motif;
+use crate::ssr_mark1::types::Motif;
 
 /// Phred quality → probability the base is **correct**, `1 − 10^(−Q/10)`, as a
 /// 256-entry lookup. Process-wide and built once (the per-Q math is identical

@@ -20,7 +20,7 @@ use std::ops::Range;
 
 use crate::bam::alignment_input::MappedRead;
 use crate::pileup::walker::CigarOp;
-use crate::ssr::types::{Locus, Motif};
+use crate::ssr_mark1::types::{Locus, Motif};
 
 /// Minimum flank each side (in reference bases) a read's footprint must bracket
 /// for the read to count as spanning the tract (arch §9). A **calibration**

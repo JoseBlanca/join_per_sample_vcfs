@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 //! The `ssr` `.psp` schema — the second [`PspKind`] (after `snp`).
 //!
-//! Maps Stage-1's per-locus evidence ([`crate::ssr::pileup`]'s all-CSR
+//! Maps Stage-1's per-locus evidence ([`crate::ssr_mark1::pileup`]'s all-CSR
 //! `SsrLocusRecord`) onto the generic container. The fit is the SNP
 //! 2-level shape (architecture §10.2): a **locus is a record**, a
 //! **spanning-read profile is an entry** (`n-spanning` is the per-record
@@ -201,7 +201,7 @@ pub const SSR_COLUMNS: &[ColumnDef] = &[
 
 /// One sample's evidence at one locus, **container form** — the
 /// chrom_id-keyed mirror of the chrom-name-keyed in-memory
-/// [`crate::ssr::pileup`] record (the Stage-1 driver adapts between
+/// [`crate::ssr_mark1::pileup`] record (the Stage-1 driver adapts between
 /// them, resolving the chromosome name against the header table, exactly
 /// as Stage-1 SNP records become `chrom_id`-keyed `PileupRecord`s). The
 /// per-spanning-read profiles are the all-CSR storage; `n_spanning` is

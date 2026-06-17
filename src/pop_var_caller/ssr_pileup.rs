@@ -1,9 +1,9 @@
 //! `ssr-pileup` subcommand — Stage 1 of the SSR caller. Genotypes one sample's
-//! BAM/CRAM against an SSR catalog ([`crate::ssr::catalog`]) and writes a
+//! BAM/CRAM against an SSR catalog ([`crate::ssr_mark1::catalog`]) and writes a
 //! per-locus `.ssr.psp` evidence file. The struct below is the authoritative
 //! knob list; [`run_ssr_pileup`] translates it into an
 //! [`SsrPileupConfig`] and drives
-//! [`crate::ssr::pileup::driver::run`].
+//! [`crate::ssr_mark1::pileup::driver::run`].
 
 use std::path::PathBuf;
 
@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::bam::alignment_input::{DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH};
 use crate::bam::segment_reader::SegmentReadFilter;
-use crate::ssr::pileup::driver::{self, DEFAULT_WINDOW, SsrPileupConfig};
-use crate::ssr::pileup::fetch_reads::MAX_READS_PER_LOCUS;
+use crate::ssr_mark1::pileup::driver::{self, DEFAULT_WINDOW, SsrPileupConfig};
+use crate::ssr_mark1::pileup::fetch_reads::MAX_READS_PER_LOCUS;
 
 /// Arguments for the `ssr-pileup` subcommand.
 #[derive(Debug, Args, Clone)]

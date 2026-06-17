@@ -22,7 +22,7 @@
 use crate::bam::alignment_input::{FilterCounts, MappedRead};
 use crate::bam::errors::AlignmentInputError;
 use crate::bam::segment_reader::WorkerReader;
-use crate::ssr::types::Locus;
+use crate::ssr_mark1::types::Locus;
 
 use super::triage::reaches_locus;
 
@@ -221,7 +221,7 @@ mod tests {
 
     use crate::bam::index_preflight::AlignmentIndex;
     use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter};
-    use crate::ssr::types::Motif;
+    use crate::ssr_mark1::types::Motif;
 
     #[test]
     fn keeps_everything_when_offered_at_most_capacity() {

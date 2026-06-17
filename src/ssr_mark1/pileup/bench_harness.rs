@@ -17,7 +17,7 @@
 
 use crate::bam::alignment_input::MappedRead;
 use crate::pileup::walker::CigarOp;
-use crate::ssr::types::{Locus, Motif};
+use crate::ssr_mark1::types::{Locus, Motif};
 
 use super::driver::LocusScratch;
 use super::pair_hmm::HmmModel;

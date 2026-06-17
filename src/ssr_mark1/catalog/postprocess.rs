@@ -29,7 +29,7 @@
 
 use super::CatalogParams;
 use super::trf::TrfRecord;
-use crate::ssr::types::{Locus, Motif};
+use crate::ssr_mark1::types::{Locus, Motif};
 
 /// Per-period minimum copy number a tract must reach to survive (GangSTR
 /// `minimal_trim.py` `thresholds = {1:10, 2:5, 3:4, 4:3, 5:3, 6:3}`; default 3
