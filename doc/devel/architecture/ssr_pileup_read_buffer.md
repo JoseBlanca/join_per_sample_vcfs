@@ -23,20 +23,26 @@ exposed a **thread-scaling redundancy** (the cache was rebuilt per rayon job by
 re-decodes):
 
 ```
-                threads:   1     6     16     32
-map_init  decodes:        19    424   2202   5462   ← grows with threads (toward no-cache 8931)
-par_chunks decodes:      155    155    155    155   ← FIX: flat, thread-independent
+                  threads:   1     6     16     32
+map_init   decodes:         19    424   2202   5462   ← grows with threads (toward no-cache 8931)
+par_chunks decodes:         22     53     96    155   ← FIX: bounded, ~optimal at 1 thread
 ```
 
-**The fix (implemented):** process each batch with `par_chunks(FETCH_CHUNK)`
-instead of `par_iter().map_init`, so the decode cache lives for a whole
-**contiguous chunk** of sorted loci, not a rayon job. The decode count becomes
-flat in thread count — at the production 32 threads, **155 vs 5462 (~35× fewer
-decodes)** — byte-identical. The residual (155 vs the single-thread minimum 19)
-is the fixed per-chunk-boundary cost; the **slice-grouping of §5 would drive it
-toward the minimum** by aligning chunk boundaries to container boundaries, and is
-now a worthwhile (no-longer-dropped) follow-up. The end-to-end wall win is
-largest where decode dominates; a high-coverage run spends more in the
+**The fix (implemented):** process each batch with `par_chunks` instead of
+`par_iter().map_init`, so the decode cache lives for a whole **contiguous chunk**
+of sorted loci, not a rayon job. The chunk **count scales with the worker count**
+(`threads × CHUNKS_PER_THREAD`, with a `MIN_FETCH_CHUNK` floor so a small final
+batch isn't over-split): 1 thread → ~1 warm chunk (≈ the minimum-decode old
+behavior, **22 ≈ 19**), many threads → many chunks (parallelism). So the decode
+count grows only **mildly and boundedly** with threads instead of blowing up — at
+the production 32 threads, **155 vs 5462 (~35× fewer decodes)** — and low-thread
+runs are no longer penalized (an earlier fixed-chunk-count version regressed
+1 thread to 155; scaling the count with threads fixed it). Byte-identical. The
+residual (155 vs the single-thread minimum 19 at 32 threads) is the per-chunk-
+boundary cost; the **slice-grouping of §5 would drive it toward the minimum** by
+aligning chunk boundaries to container boundaries, and is a worthwhile follow-up.
+The end-to-end wall win is largest where decode dominates; a high-coverage run
+spends more in the
 (unchanged) realignment, but the decode redundancy — and its thread-scaling — is
 eliminated regardless.
 
@@ -203,9 +209,9 @@ iterator's internals.)*
 
 **Status: reopened.** An earlier 6-thread measurement made this look unnecessary;
 the thread-scaling measurement (top of doc) corrected that. The `par_chunks` fix
-already removes the *thread-scaling* redundancy (decode count flat at 155), but
-leaves a fixed per-chunk-boundary residual (155 vs the single-thread minimum 19)
-because chunk boundaries fall mid-container. Slice-grouping eliminates that
+already removes the *thread-scaling* blow-up (decodes bounded, ~155 at 32
+threads), but leaves a per-chunk-boundary residual (155 vs the single-thread
+minimum 19) because chunk boundaries fall mid-container. Slice-grouping eliminates that
 residual by making the chunk boundaries **align with container boundaries** (from
 the `.crai` slice spans), so each container is decoded exactly once. It composes
 with `par_chunks` — it just chooses smarter chunk boundaries. Worth building if
@@ -309,8 +315,9 @@ grouping becomes a pure placement optimization on top.
    cap A/B alone (6 threads) looked optimal, but the thread sweep exposed the
    `map_init`-per-job cache reset scaling decodes 19→5462 over 1→32 threads.
 3. **Cache-lifetime fix — `par_chunks`** (done, 2026-06-17): process each batch in
-   contiguous `FETCH_CHUNK`-sized chunks, one warm cache per chunk → decode count
-   flat (155) across threads, ~35× fewer decodes at 32 threads, byte-identical.
+   contiguous chunks (count = `threads × CHUNKS_PER_THREAD`, floored), one warm
+   cache per chunk → decodes bounded (22→155 over 1→32 threads vs map_init's
+   19→5462), ~35× fewer at 32 threads, ~optimal at 1 thread, byte-identical.
 4. **`covered_regions()` + slice-grouping** (§5): **reopened** (no longer dropped)
    — aligns chunk boundaries to container boundaries to drive the residual (155)
    toward the minimum (19). Worthwhile if the residual matters at scale.

@@ -5,7 +5,7 @@
 //! — fetch the locus's reads, analyze each, fold them into the locus record. It
 //! is pure over its shared `&` inputs (and [`AlignmentFile`] is `Sync`), so
 //! [`run`] processes the catalog in parallel batches: read a batch of loci,
-//! `par_chunks(FETCH_CHUNK)` them across the pool (each contiguous chunk owns one
+//! split each into contiguous `par_chunks` across the pool (each chunk owns one
 //! warm decode cache + [`LocusScratch`]), and write the batch in catalog order.
 //! Output is **byte-identical for any thread count** — each locus's reservoir is
 //! seeded by `(chrom, start)` and scored atomically on one thread, and writes
@@ -52,16 +52,22 @@ use super::read_analysis::analyze_read;
 /// to amortize scheduling.
 const LOCUS_BATCH: usize = 8192;
 
-/// Loci per cache-warm processing chunk within a batch. The batch is split into
-/// **contiguous** chunks and parallelized over those (`par_chunks`), each chunk
-/// owning one decode cache that stays warm across its whole sorted run — so a
-/// CRAM container is decoded ~once per chunk that spans it, **independent of
-/// `--threads`** (the cache lifetime is the chunk, not the per-rayon-job
-/// `map_init` it replaced, which re-decoded on every split and so grew the
-/// decode count with thread count). Fixed and small enough to give the pool many
-/// units to load-balance (≥ a few × the worker count at the production thread
-/// count), large enough that decode amortizes across the chunk.
-const FETCH_CHUNK: usize = 64;
+/// Parallel-chunk granularity. Each batch is split into **contiguous** chunks
+/// processed in parallel (`par_chunks`); each chunk owns one decode cache that
+/// stays warm across its whole sorted run, so a CRAM container is decoded ~once
+/// per chunk that spans it — *not* per rayon job, which is what the replaced
+/// `par_iter().map_init` did (it re-built the cache on every split, so finer
+/// splitting at higher thread counts grew the decode count without bound).
+///
+/// The chunk **count** scales with the worker count (`threads × CHUNKS_PER_THREAD`):
+/// 1 thread → ~1 chunk (one warm pass over the batch, near the minimum decode
+/// count), many threads → many chunks (parallel units + load-balance slack). So
+/// the decode count grows only mildly and *boundedly* with `--threads` instead of
+/// blowing up — while low-thread runs are not penalized by over-chunking.
+const CHUNKS_PER_THREAD: usize = 4;
+/// Floor on chunk size — never split a (small, e.g. final) batch into chunks
+/// below this, which would only add cold-cache boundaries for no parallelism gain.
+const MIN_FETCH_CHUNK: usize = 64;
 
 /// Default `analyze_read` candidate half-width (rungs): the pair-HMM scores
 /// `observed_count ± DEFAULT_WINDOW` on-ladder lengths per spanning read. A
@@ -415,9 +421,15 @@ pub(crate) fn run(cfg: &SsrPileupConfig) -> Result<(), SsrPileupError> {
         if batch.is_empty() {
             break;
         }
+        // Chunk count scales with the worker count: 1 thread → ~1 chunk
+        // (one warm cache over the whole batch, near-minimum decodes), many
+        // threads → many chunks (parallel units + load-balance slack). Keeps the
+        // decode count bounded as threads grow, without regressing low-thread runs.
+        let n_chunks = (cfg.threads.max(1) * CHUNKS_PER_THREAD).max(1);
+        let chunk_size = batch.len().div_ceil(n_chunks).max(MIN_FETCH_CHUNK);
         let chunks: Vec<Vec<ContainerRecord>> = pool.install(|| {
             batch
-                .par_chunks(FETCH_CHUNK)
+                .par_chunks(chunk_size)
                 .map(|chunk| -> Result<Vec<ContainerRecord>, SsrPileupError> {
                     // One decode-caching reader per input file + the pair-HMM
                     // scratch, owned by (and warm for) this contiguous chunk.
