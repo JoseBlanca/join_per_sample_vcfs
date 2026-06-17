@@ -1,30 +1,26 @@
-//! The single-threaded read fetcher (arch §8) — walks the sorted catalog,
-//! index-queries each locus's reads, depth-caps them, and (eventually) hands
-//! per-locus bundles to the worker pool.
+//! The per-locus read fetcher (arch §8) — index-queries one locus's reads,
+//! reach-gates them, drops length-inconsistent records, and reservoir
+//! depth-caps the survivors.
 //!
-//! **Built so far: the per-locus fetch + depth cap.**
 //! - [`Reservoir`] — the read-level depth cap (§8.3), the net-new piece: the SNP
 //!   side has only a *column* cap (`MPLP_MAX_DEPTH`), not a read-level reservoir.
 //! - [`fetch_locus_reads`] — one locus's reads from a sample's per-worker
 //!   [`WorkerReader`]s (the decode-caching CRAM / pooled BAM read source):
 //!   segment-query the embedded window, apply the cheap coordinate-reach
-//!   admission gate ([`reaches_locus`]), reservoir-cap the survivors, and
-//!   surface the readers' filter drops for the `n_filtered` QC scalar.
+//!   admission gate ([`reaches_locus`]), drop reads whose seq/qual/CIGAR lengths
+//!   disagree, reservoir-cap the survivors, and surface the readers' filter
+//!   drops for the `n_filtered` QC scalar.
 //!
-//! Still to land: the **catalog-walk driver loop** (open the per-sample
-//! `AlignmentFile`s once, walk the sorted `.ssr.catalog`, call
-//! [`fetch_locus_reads`] per locus, hand bundles to the worker), the
-//! `analyze_read` → [`super::locus_record::aggregate`] worker stage, the
-//! `.ssr.psp` container writer for output, and the fetcher-thread /
-//! bounded-queue / worker-pool / ordered-collector topology — the pool is a
-//! later, determinism-gated step (§8.4).
+//! The catalog-walk loop that calls this per locus, and the worker stage that
+//! delimits ([`super::alignment`]) + tallies ([`super::locus_tally::tally`]),
+//! live in [`super::driver`].
 
 use crate::bam::alignment_input::{FilterCounts, MappedRead};
 use crate::bam::errors::AlignmentInputError;
 use crate::bam::segment_reader::WorkerReader;
 use crate::ssr::types::Locus;
 
-use super::triage::reaches_locus;
+use super::footprint::{cigar_read_len, reaches_locus};
 
 /// Per-locus cap on **admitted** reads (arch §8.3/§10). A hypervariable,
 /// high-depth locus is reservoir-sampled down to this many reads so one locus
@@ -70,13 +66,17 @@ pub(crate) fn locus_seed(chrom: &str, start: u32) -> u64 {
     h.wrapping_mul(FNV_PRIME)
 }
 
-/// Reservoir sampler (Algorithm R) — an unbiased uniform sample of up to
+/// Reservoir sampler (Algorithm R) — an effectively-uniform sample of up to
 /// `capacity` items from a stream of unknown length, in one pass with `O(capacity)`
-/// memory (arch §8.3). The caller `offer`s each **admitted** read in a fixed
-/// total order (`AlignmentMergedReader`'s `(ref_id, pos)` → source-file → record
-/// order); with the deterministic per-locus seed, the kept set is identical on
-/// every run and at every `--threads`. The caller must not reorder the stream
-/// (§8.4).
+/// memory (arch §8.3). The eviction index is drawn as `next_u64() % seen`, so the
+/// sample carries a modulo bias bounded by `seen / 2^64` (negligible at any real
+/// depth); the bias is accepted deliberately because the draw is **deterministic
+/// and `--threads`-invariant**, which is the property the design needs (an
+/// unbiased Lemire reduction would change the kept set and break that). The caller
+/// `offer`s each **admitted** read in a fixed total order (`AlignmentMergedReader`'s
+/// `(ref_id, pos)` → source-file → record order); with the deterministic per-locus
+/// seed, the kept set is identical on every run and at every `--threads`. The
+/// caller must not reorder the stream (§8.4).
 pub(crate) struct Reservoir<T> {
     capacity: usize,
     held: Vec<T>,
@@ -135,6 +135,11 @@ pub(crate) struct LocusReads {
     /// past the flag/MAPQ/length filter — i.e. the pool the reach gate drew
     /// from (admitted + reach-discarded). Summed across files.
     pub(crate) yielded: u64,
+    /// Reads dropped before reservoir admission because their seq/qual/CIGAR
+    /// lengths disagree (empty/short `QUAL`, or a CIGAR whose read-consumption
+    /// differs from `seq.len()`) — a truncated/malformed record the delimiter
+    /// cannot slice safely. Folded into the `n_filtered` QC scalar.
+    pub(crate) malformed: u64,
     /// The readers' flag/MAPQ/length drops at this locus, summed across files —
     /// the raw material for the `n_filtered` QC scalar (arch §3.1/§3.3). The
     /// reader owns the filter, so it owns the count
@@ -173,12 +178,22 @@ pub(crate) fn fetch_locus_reads(
 
     let mut reservoir = Reservoir::new(cap, locus_seed(locus.chrom(), locus.start()));
     let mut yielded = 0u64;
+    let mut malformed = 0u64;
     let mut filtered = FilterCounts::default();
 
     for reader in readers.iter_mut() {
         let (reads, counts) = reader.fetch_mapped_reads(locus.chrom(), seg_start, seg_end)?;
         for read in reads {
             yielded += 1;
+            // Drop length-inconsistent records (empty/short `QUAL`, or a CIGAR
+            // whose read-consumption ≠ `seq.len()`). The delimiter slices `seq`
+            // and `qual` by ranges derived from `seq.len()`, so such a record
+            // cannot be analyzed without corrupting the slice (arch §8.1; the
+            // SNP path guards the same in `baq_engine`). Counted, not analyzed.
+            if read.qual.len() != read.seq.len() || cigar_read_len(&read.cigar) != read.seq.len() {
+                malformed += 1;
+                continue;
+            }
             if reaches_locus(&read, locus) {
                 reservoir.offer(read);
             }
@@ -189,6 +204,7 @@ pub(crate) fn fetch_locus_reads(
     Ok(LocusReads {
         reads: reservoir.into_held(),
         yielded,
+        malformed,
         filtered,
     })
 }
@@ -253,6 +269,28 @@ mod tests {
             r.into_held()
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn reservoir_keeps_a_deterministic_subset_when_offered_far_past_capacity() {
+        // Eviction branch taken ~10k times: the kept set is a subset of the
+        // stream, sized at the cap, and identical across runs (it depends only on
+        // seed + offer order — the basis of the cross-thread byte-identity claim).
+        let run = || {
+            let mut r = Reservoir::new(8, locus_seed("chrX", 7));
+            for x in 1..=10_000u32 {
+                r.offer(x);
+            }
+            (r.seen(), r.into_held())
+        };
+        let (seen, held) = run();
+        assert_eq!(seen, 10_000);
+        assert_eq!(held.len(), 8);
+        assert!(
+            held.iter().all(|x| (1..=10_000).contains(x)),
+            "kept set is a subset of the stream"
+        );
+        assert_eq!(run().1, held, "kept set is identical across runs");
     }
 
     #[test]
@@ -321,6 +359,20 @@ mod tests {
             .set_cigar([Op::new(Kind::Match, len)].into_iter().collect())
             .set_sequence(Sequence::from(vec![b'A'; len]))
             .set_quality_scores(QualityScores::from(vec![30u8; len]))
+            .build()
+    }
+
+    /// As [`aln_record`] but with no quality scores (`QUAL = *`) — `qual` decodes
+    /// to an empty buffer while `seq` is `len` long, so `qual.len() != seq.len()`.
+    fn aln_record_no_qual(qname: &str, start: usize, len: usize, mapq: u8) -> RecordBuf {
+        RecordBuf::builder()
+            .set_name(qname.as_bytes())
+            .set_reference_sequence_id(0)
+            .set_flags(Flags::default())
+            .set_mapping_quality(MappingQuality::new(mapq).expect("mapq"))
+            .set_alignment_start(Position::try_from(start).unwrap())
+            .set_cigar([Op::new(Kind::Match, len)].into_iter().collect())
+            .set_sequence(Sequence::from(vec![b'A'; len]))
             .build()
     }
 
@@ -415,6 +467,30 @@ mod tests {
         // `lowmq` did not (filtered out before it could be yielded).
         assert_eq!(got.yielded, 2);
         assert_eq!(got.filtered.low_mapq, 1);
+    }
+
+    #[test]
+    fn fetch_drops_length_inconsistent_reads_and_counts_them() {
+        // A spanning read with no quality scores (`qual.len() != seq.len()`) is
+        // dropped before reservoir admission and tallied in `malformed`, so the
+        // delimiter never slices it (B2). The clean read is still admitted.
+        let records = [
+            aln_record("good", 6, 30, 60),
+            aln_record_no_qual("noqual", 6, 30, 60),
+        ];
+        let (_dir, file) = bam_file(&records);
+
+        let mut readers = vec![file.worker_reader()];
+        let got = fetch_locus_reads(&mut readers, &locus6(), MAX_READS_PER_LOCUS).expect("fetch");
+
+        let admitted: Vec<String> = got
+            .reads
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.qname).into_owned())
+            .collect();
+        assert_eq!(admitted, vec!["good".to_string()]);
+        assert_eq!(got.yielded, 2);
+        assert_eq!(got.malformed, 1);
     }
 
     #[test]

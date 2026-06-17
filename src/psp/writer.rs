@@ -617,19 +617,10 @@ impl<W: Write> PspWriter<W, SsrKind> {
             }
         }
 
-        // Mi8: reject a NaN log-probability. `-inf` is legitimate
-        // (`log(0)` profile weight) and permitted; NaN never is, and
-        // since the SSR decode path runs no finite sweep
-        // (`amb-logliks` is `finite_constraint: false`) a NaN would
-        // round-trip silently into the downstream EM.
-        for (profile_index, profile) in record.spanning.iter().enumerate() {
-            if profile.iter().any(|&(_, loglik)| loglik.is_nan()) {
-                return Err(PspWriteError::NonFiniteLoglik {
-                    record_index,
-                    profile_index,
-                });
-            }
-        }
+        // Mark-2 records carry no log-probabilities (just observed sequences +
+        // counts), so there is no finite sweep to run here. Observed-sequence
+        // byte lengths are bounded by the read length (≪ MAX_ALLELE_SEQ_LEN), and
+        // the decoder caps them defensively for foreign files.
         Ok(())
     }
 }

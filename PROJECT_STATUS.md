@@ -19,7 +19,52 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-17):** **ssr-pileup code-review fixes applied**
+> - **Last completed task (2026-06-17):** **ssr-pileup Mark-2 review fixes applied**
+>   (branch `ssr-pileup-mark2`, [fixes_applied_2026-06-17_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-17_v2.md)).
+>   Applied the Mark-2 code review: **all 3 Blockers** + **9 of 12 Majors** + 9 Minors. **B1** doc gate restored
+>   (`cargo doc` green); **B2** length-inconsistent reads (empty-`QUAL`/over-consuming CIGAR) dropped+counted at
+>   the fetch boundary (`LocusReads.malformed`→`n_filtered`) + `extract_region` `r_start` clamp — a test confirmed
+>   noodles decodes `*` QUAL to an empty buffer, the exact pre-fix panic; **B3** added the missing byte-identity
+>   tests (multi-chunk e2e + cap-bites e2e + reservoir-subset); **M2** the Stage-0 empty-flank gate (`finish_locus`);
+>   **M1** split the catch-all `Io` into 5 operation-named variants; **M3** `reach_min_flank_bp` recorded in the
+>   `.ssr.psp` header; **M5** byte-identity scoped to one target/toolchain; **M6/M7/M8/M9/M10/M11** + Mi1/Mi3/Mi4/Mi5/
+>   Mi6/Mi7(local)/Mi-docs. **Deferred:** **M4** (HMM-model provenance — schema call), **M12** (`DpState` enum
+>   refactor — now guarded by the B3 tests), Mi2/Mi8/Mi9/Mi10/Mi11/Mi12 + Nits. Gates: fmt/clippy `-D warnings`/doc
+>   clean, **1129 lib + integration pass** (the only `--all-targets` failure is the pre-existing `psp_writer_perf`
+>   bench panic). Audit trail `tmp/review_2026-06-17_ssr-pileup-mark2/`.
+> - **Prior task (2026-06-17):** **ssr-pileup Mark-2 code review**
+>   (branch `ssr-pileup-mark2`, [ssr_pileup_mark2_2026-06-17.md](doc/devel/reports/reviews/ssr_pileup_mark2_2026-06-17.md),
+>   11 categories). First *correctness* review of the Mark-2 rebuild (`src/ssr/pileup/`). **Verdict:
+>   Request-changes** — 3 Blockers, 12 Major, 14 Minor + Nits. Gates: fmt/clippy `-D warnings` clean,
+>   40 ssr::pileup lib tests pass — but **`cargo doc` FAILS** (**B1**: fetch_reads.rs:17 links the deleted
+>   `super::locus_record::aggregate`; `locus_record`→`locus_tally`, `aggregate`→`tally`). **B2**: `process_locus`
+>   slices `read.qual` by a `seq.len()`-derived range with no length-consistency guard → an empty-`QUAL` record
+>   (legal SAM; the SNP BAQ engine guards it at baq_engine.rs:117, the SSR path doesn't) panics the whole run;
+>   an over-consuming CIGAR also panics via the unclamped `r_start`. **B3**: the byte-identity-for-any-thread-count
+>   contract is untested on the only paths that can break it (reservoir eviction never bites — 1 read/locus,
+>   cap 1000; `par_chunks` never splits — 3 loci < MIN_FETCH_CHUNK 64). Determinism *mechanism* verified sound
+>   by inspection; diff matches the stated empirical-candidate intent. Majors: M1 `Io(#[from])` collapses 5 I/O
+>   sites; M3/M4 MIN_FLANK_BP + HMM model constants shape output but aren't in the `.ssr.psp` header; M6
+>   `..FilterCounts::default()` test masks new buckets; M8 `ref_to_read` indel branches untested. Audit trail
+>   `tmp/review_2026-06-17_ssr-pileup-mark2/`. **(suggested follow-up: apply fixes — B1 first, then B2/B3;
+>   answer Q1 [does Stage-0 emit empty-flank loci → M2 severity] and Q4 [drop vs error for malformed records].)**
+> - **Prior task (2026-06-17):** **SSR Stage 1 (`ssr-pileup`) rebuilt as Mark-2**
+>   (branch `ssr-pileup-mark2`, [ssr_pileup_mark2_2026-06-17.md](ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md)).
+>   Replaced the Mark-1 reference-anchored **rung** model with the **empirical-candidate** model: candidate
+>   alleles are observed sequences, the reference is only a coordinate frame, no on/off-ladder, no Stage-1
+>   likelihood. Per read: a per-Q Viterbi+traceback **delimits** the repeat region → first-quartile **quality
+>   gate** (Phred 15) → tally **observed sequence → count** per locus. New `registry_ssr` schema
+>   (per-observation `obs-count`/`obs-seq-len`/`obs-seq` Bytes; no version bump, pre-alpha). Built in 7 steps;
+>   the old `src/ssr_mark1/` tree + its bench/example were deleted at the cutover. fmt/clippy `-D warnings`
+>   clean; **1116 lib + integration + doctests, 0 failed**, incl. end-to-end catalog→BAM→`.ssr.psp` +
+>   thread-count determinism. Design: [ssr_ladder_model.md](doc/devel/architecture/ssr_ladder_model.md),
+>   [ssr_pileup_mark2.md](doc/devel/architecture/ssr_pileup_mark2.md). **Latest review:**
+>   [ssr_pileup_mark2_2026-06-17.md](doc/devel/reports/reviews/ssr_pileup_mark2_2026-06-17.md) (Request-changes);
+>   fixes [fixes_applied_2026-06-17_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-17_v2.md) (3 Blockers + 9 Majors applied).
+>   Open (deferred from the fix run): **M4** HMM-model provenance tag; **M12** `DpState` enum refactor; Mi2/Mi8/Mi9/Mi10/Mi11/Mi12;
+>   `WriterProvenance.input_crams` crate-wide rename; allele-diverse cap-bites + `BorderOffEnd` e2e tests.
+>   Then: calibrate Q1/cap on real data; a Mark-2 bench; spec §4 amendment; Stage 2 (`ssr-call`).
+> - **Prior task (2026-06-17):** **ssr-pileup code-review fixes applied**
 >   (branch `ssr-pileup-review`, [fixes_applied_2026-06-17.md](doc/devel/reports/reviews/fixes_applied_2026-06-17.md)).
 >   Applied the same-day code review: **B1** doc gate restored; **M5** extracted a shared `decode_cram_container`
 >   used by both the per-call `refill` and the decode-once `CachingCramReader` (folds in **M2** EOF-stop alignment +
@@ -1151,7 +1196,8 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 1 — `ssr-pileup` (per-sample evidence extraction)
 
 #### `ssr-pileup` stage
-- **Status:** fixes-applied (perf branch `ssr-pileup-review`; code review 2026-06-17 → fixes applied same day)
+- **Status:** **implemented — rebuilt as Mark-2** (2026-06-17, branch `ssr-pileup-mark2`). The Mark-1 detail below (the reference-anchored rung model + its perf/review history) is **superseded**, kept for chronology.
+- **Mark-2 rebuild (current):** [ssr_pileup_mark2_2026-06-17.md](ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md). Empirical-candidate model — observed sequences, the reference is only a coordinate frame, no on/off-ladder, no Stage-1 likelihood. Design: [ssr_ladder_model.md](doc/devel/architecture/ssr_ladder_model.md) + [ssr_pileup_mark2.md](doc/devel/architecture/ssr_pileup_mark2.md); plan [ssr_pileup_mark2.md](doc/devel/implementation_plans/ssr_pileup_mark2.md). New `src/ssr/` (`types`/`catalog`/`pileup::{footprint,fetch_reads,alignment,locus_tally,driver}`) + rewritten `psp/registry_ssr.rs`; old `src/ssr_mark1/` + its bench/example deleted. fmt/clippy `-D warnings` clean; 1116 lib + integration + doctests green (end-to-end + thread-determinism). **Open:** calibrate `MIN_REGION_Q1` (15) / `MAX_READS_PER_LOCUS` on real data; a Mark-2 bench (the Mark-1 one was deleted); spec §4.2/§4.3/§5.1 amendment; then Stage 2 (`ssr-call`).
 - **Latest fixes-applied:** [fixes_applied_2026-06-17.md](doc/devel/reports/reviews/fixes_applied_2026-06-17.md) — B1 (doc gate restored), M5 (shared `decode_cram_container` for refill + caching path; folds in M2 EOF-stop + Mi3/Mi6), M3 (ContainerCache eviction/dedup unit tests), Mi1/Mi4/Mi5/Mi7/Mi8/Mi9/Mi10 + doc nits. M1/M4 reworded-as-doc per the review discussion (no `.ssr.psp` baseline → H1/H2 ULP-difference is inert; cache cap is non-output-affecting). All gates green: fmt/clippy `-D warnings`/doc clean, 1171 lib (+4) + 45 integration tests. **Open:** M3 multi-container *fetch* test (needs a multi-container CRAM fixture), Mi2 (cfg-gate bench seam), Mi11 (bench baseline guard), Mi12 (driver error context — re-assess vs `par_chunks`).
 - **Architecture:** [ssr_pileup.md](doc/devel/architecture/ssr_pileup.md) (every structural question decided)
 - **Plan:** [ssr_pileup.md](doc/devel/implementation_plans/ssr_pileup.md) (implementation sketch: build order, modules, structs, fn signatures)

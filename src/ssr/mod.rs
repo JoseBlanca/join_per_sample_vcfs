@@ -1,27 +1,26 @@
-//! SSR/STR genotyping — the project's second, independent variant caller.
+// Mark-2 SSR module. The CLI now drives Stage 0 (`ssr-catalog`) and Stage 1
+// (`ssr-pileup`) here; Stage 2 (`ssr-call`) is not built yet, so some surface is
+// still unused — allow dead code while the tree fills in.
+#![allow(dead_code)]
+//! SSR/STR genotyping — Mark 2 (the empirical-candidate model).
 //!
 //! Genotypes short tandem repeats (microsatellites, period ≤ 6) from aligned
-//! reads, producing per-individual repeat-allele lengths across a cohort. It is
-//! a *standalone* pipeline that shares only low-level alignment I/O and a few
-//! numerical kernels with the SNP caller — never its records or its math. The
-//! three stages mirror the SNP path's `pileup → .psp → var-calling` shape:
+//! reads. Candidate alleles are **observed sequences** assembled from the reads,
+//! not rungs generated off the reference (the Mark-1 model); the reference is only
+//! a coordinate frame. The three stages mirror the SNP path's
+//! `pileup → .psp → var-calling`:
 //!
 //! ```text
 //! reference ─► ssr-catalog ─► catalog ─► ssr-pileup ─► .ssr.psp ─► ssr-call ─► VCF
 //! ```
 //!
-//! Design docs: `doc/devel/specs/ssr_genotyping.md` (the model + why) and
-//! `doc/devel/architecture/` (`ssr_genotyping_architecture.md`,
-//! `ssr_shared_types.md`, `ssr_catalog.md`).
+//! Design docs: `doc/devel/architecture/ssr_ladder_model.md` (the Mark-2 model),
+//! `doc/devel/architecture/ssr_pileup_mark2.md` (Stage 1), and the build plan
+//! `doc/devel/implementation_plans/ssr_pileup_mark2.md`.
 //!
-//! **Build status.** Only the shared types (`types`) are present so far; the
-//! stage modules are added in data-flow order as they are built.
-
-// The shared types land before their consumers: the catalog/pileup/call stages
-// that read them are built in later phases. Until then the `pub(crate)` surface
-// has no in-crate caller, so suppress `dead_code` here rather than scatter
-// per-item `#[allow]`s. Remove once `ssr-catalog` (Stage 0) wires these up.
-#![allow(dead_code)]
+//! Built so far: [`types`] (`Locus`, `Motif`), [`catalog`] (Stage 0, copied
+//! verbatim from the Mark-1 tree — Stage 0 is model-agnostic), and the Stage-1
+//! read path in [`pileup`] (footprint geometry + reservoir fetch).
 
 pub mod catalog;
 pub mod pileup;
