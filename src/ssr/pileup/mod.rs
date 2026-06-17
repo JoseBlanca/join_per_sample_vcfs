@@ -9,3 +9,4 @@
 pub mod alignment;
 pub mod fetch_reads;
 pub mod footprint;
+pub mod locus_tally;
