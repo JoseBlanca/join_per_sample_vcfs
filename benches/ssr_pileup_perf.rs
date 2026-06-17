@@ -31,7 +31,9 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use pop_var_caller::ssr_mark1::pileup::bench_harness::{analyze_workload, build_synthetic_workload};
+use pop_var_caller::ssr_mark1::pileup::bench_harness::{
+    analyze_workload, build_synthetic_workload,
+};
 
 const DEPTH: usize = 30;
 const FLANK_BP: usize = 50;

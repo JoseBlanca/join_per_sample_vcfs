@@ -1296,9 +1296,7 @@ mod tests {
     fn container_cache_evicts_oldest_over_capacity() {
         let mut cache = ContainerCache::new(3);
         // Entry for offset N holds N records, so length identifies the entry.
-        let entry = |n: u64| -> Arc<[RecordBuf]> {
-            (0..n).map(|_| RecordBuf::default()).collect()
-        };
+        let entry = |n: u64| -> Arc<[RecordBuf]> { (0..n).map(|_| RecordBuf::default()).collect() };
         for off in 1..=4u64 {
             cache.insert(off, entry(off));
         }

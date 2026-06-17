@@ -17,7 +17,9 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use pop_var_caller::ssr_mark1::pileup::bench_harness::{analyze_workload, build_synthetic_workload};
+use pop_var_caller::ssr_mark1::pileup::bench_harness::{
+    analyze_workload, build_synthetic_workload,
+};
 
 fn arg<T: std::str::FromStr>(args: &[String], i: usize, default: T) -> T {
     args.get(i).and_then(|s| s.parse().ok()).unwrap_or(default)
