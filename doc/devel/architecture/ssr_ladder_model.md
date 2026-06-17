@@ -164,9 +164,9 @@ sequences is §7-S2.)
 
 Quality / Stage 1:
 - **Q1 — the region quality gate.** Method **decided (2026-06-17): the first
-  quartile of the repeat-region base qualities, dropped below a threshold.** Open:
-  the threshold value (repurpose `MIN_BASE_QUAL`?) and the long-allele-dropout
-  measurement.
+  quartile of the repeat-region base qualities, dropped below a threshold; first
+  value Phred 15.** Open: calibrating that threshold on real data and the
+  long-allele-dropout measurement.
 - **Q2 — border-alignment method + determinism. DECIDED (2026-06-17): Option A.**
   One unbanded global pair-HMM (Viterbi + traceback) of the whole read against the
   single reference frame `left_flank + ref_tract + right_flank`, delimit-only (no
