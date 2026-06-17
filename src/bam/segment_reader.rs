@@ -59,6 +59,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -916,6 +917,289 @@ impl Drop for CramSegmentReads<'_> {
 }
 
 // ---------------------------------------------------------------------
+// CRAM — per-thread caching reader (decode-once)
+// ---------------------------------------------------------------------
+
+/// Default number of decoded CRAM containers a [`CachingCramReader`] keeps.
+/// A locus window overlaps ≤ 2 containers (1 normally, 2 at a boundary); a
+/// third covers forward jitter. See `doc/devel/architecture/ssr_pileup_read_buffer.md`.
+pub(crate) const DEFAULT_MAX_CACHED_CONTAINERS: usize = 3;
+
+/// A tiny FIFO cache of decoded CRAM containers, keyed by container file
+/// offset. Each entry is the container's **unfiltered** decoded records (all
+/// of them — filtering happens per window in [`CachingCramReader`]), shared by
+/// `Arc` so a served window can outlive an eviction.
+struct ContainerCache {
+    cap: usize,
+    entries: VecDeque<(u64, Arc<Vec<sam::alignment::RecordBuf>>)>,
+}
+
+impl ContainerCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, offset: u64) -> Option<Arc<Vec<sam::alignment::RecordBuf>>> {
+        self.entries
+            .iter()
+            .find(|(o, _)| *o == offset)
+            .map(|(_, v)| Arc::clone(v))
+    }
+
+    fn insert(&mut self, offset: u64, value: Arc<Vec<sam::alignment::RecordBuf>>) {
+        if self.entries.iter().any(|(o, _)| *o == offset) {
+            return;
+        }
+        if self.entries.len() >= self.cap {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((offset, value));
+    }
+}
+
+/// A per-thread CRAM reader that decodes each container **once** and serves
+/// many nearby locus windows from a small FIFO cache. A drop-in for repeated
+/// [`CramFile::get_reads_from_segment`] over nearby windows (the SSR Stage-1
+/// fetch pattern): it returns the same `(reads, FilterCounts)` a per-call query
+/// would, reusing [`classify_segment_record`] so categorization is identical.
+///
+/// **Not shared between threads** — it owns its file handle and cache, so it
+/// needs no locking. Construct one per worker (see
+/// [`CramFile::caching_reader`]); it shares the index / header / repository /
+/// filter with the originating [`CramFile`] via `Arc`. Design + rationale:
+/// `doc/devel/architecture/ssr_pileup_read_buffer.md`.
+pub(crate) struct CachingCramReader {
+    /// Opened lazily on the first decode so construction is infallible (the
+    /// driver builds one per worker without I/O). `None` until first use.
+    reader: Option<cram::io::Reader<File>>,
+    path: PathBuf,
+    index: Arc<cram::crai::Index>,
+    repository: fasta::Repository,
+    ref_map: Arc<HeaderRefMap>,
+    filter: SegmentReadFilter,
+    source_file_index: usize,
+    cache: ContainerCache,
+}
+
+impl CachingCramReader {
+    fn io_error(&self, source: io::Error) -> AlignmentInputError {
+        AlignmentInputError::Io {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    /// Reads overlapping `[start, end]` on `chrom`, plus the **complete** filter
+    /// tally over that window — byte-identical to
+    /// [`CramFile::get_reads_from_segment`] drained to exhaustion. Decodes each
+    /// overlapping container once (cache miss) or reuses it (cache hit).
+    pub(crate) fn fetch_mapped_reads(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<(Vec<MappedRead>, FilterCounts), AlignmentInputError> {
+        let (target, segment) = resolve_segment(&self.ref_map, chrom, start, end)?;
+        let mut reads = Vec::new();
+        let mut counts = FilterCounts::default();
+
+        // Walk the `.crai` exactly as `CramSegmentReads::refill` does: skip
+        // off-contig / before-segment containers, and stop the whole walk once a
+        // container starts past the segment end (coordinate-ordered `.crai`).
+        for idx in 0..self.index.as_slice().len() {
+            let record = self.index.as_slice()[idx].clone();
+            if record.reference_sequence_id() != Some(target) {
+                continue;
+            }
+            if let Some(container_start) = record.alignment_start() {
+                let container_start = usize::from(container_start) as u64;
+                if container_start > u64::from(segment.end) {
+                    break;
+                }
+                let span = record.alignment_span() as u64;
+                if span > 0 {
+                    let container_end = container_start + span - 1;
+                    if container_end < u64::from(segment.start) {
+                        continue;
+                    }
+                }
+            }
+
+            let decoded = self.get_or_decode(record.offset())?;
+            for record_buf in decoded.iter() {
+                if let Some(mapped) = classify_segment_record(
+                    record_buf,
+                    target,
+                    &segment,
+                    &self.filter,
+                    &mut counts,
+                    self.source_file_index,
+                    &self.path,
+                )? {
+                    reads.push(mapped);
+                }
+            }
+        }
+
+        Ok((reads, counts))
+    }
+
+    /// The decoded records of the container at `offset`, from cache or by
+    /// decoding (and caching) it.
+    fn get_or_decode(
+        &mut self,
+        offset: u64,
+    ) -> Result<Arc<Vec<sam::alignment::RecordBuf>>, AlignmentInputError> {
+        if let Some(hit) = self.cache.get(offset) {
+            return Ok(hit);
+        }
+        let decoded = Arc::new(self.decode_container(offset)?);
+        self.cache.insert(offset, Arc::clone(&decoded));
+        Ok(decoded)
+    }
+
+    /// Decode one container (all its slices) at `offset` into owned `RecordBuf`s
+    /// — unfiltered; the same decode path `CramSegmentReads::refill` runs, minus
+    /// the per-record classify (which the caller applies per window).
+    /// Open the underlying reader if not yet open (lazy first-use).
+    fn ensure_open(&mut self) -> Result<(), AlignmentInputError> {
+        if self.reader.is_none() {
+            let (reader, _header) =
+                open_cram_reader_with_header(&self.path, Some(&self.repository))?;
+            self.reader = Some(reader);
+        }
+        Ok(())
+    }
+
+    fn decode_container(
+        &mut self,
+        offset: u64,
+    ) -> Result<Vec<sam::alignment::RecordBuf>, AlignmentInputError> {
+        self.ensure_open()?;
+        let mut container = cram::io::reader::Container::default();
+        {
+            // Borrow only `self.reader` (mut) and `self.path` (shared) — disjoint
+            // fields, so the inline error construction is allowed alongside.
+            let reader = self.reader.as_mut().expect("opened by ensure_open");
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| AlignmentInputError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                })?;
+            let decoded =
+                reader
+                    .read_container(&mut container)
+                    .map_err(|e| AlignmentInputError::Io {
+                        path: self.path.clone(),
+                        source: e,
+                    })?;
+            if decoded == 0 {
+                return Ok(Vec::new());
+            }
+        }
+
+        let header = self.ref_map.header();
+        let compression_header = container
+            .compression_header()
+            .map_err(|e| self.io_error(e))?;
+        let mut out = Vec::new();
+        for slice_result in container.slices() {
+            let slice = slice_result.map_err(|e| self.io_error(e))?;
+            let (core_data_src, external_data_srcs) =
+                slice.decode_blocks().map_err(|e| self.io_error(e))?;
+            let cram_records = slice
+                .records(
+                    self.repository.clone(),
+                    header,
+                    &compression_header,
+                    &core_data_src,
+                    &external_data_srcs,
+                )
+                .map_err(|e| self.io_error(e))?;
+            for cram_record in &cram_records {
+                out.push(
+                    sam::alignment::RecordBuf::try_from_alignment_record(header, cram_record)
+                        .map_err(|e| self.io_error(e))?,
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl CramFile {
+    /// Build a per-thread [`CachingCramReader`] over this file: its own open
+    /// handle + a FIFO container cache, sharing the index / header / repository
+    /// / filter via `Arc`. One per worker (not pooled).
+    pub(crate) fn caching_reader(&self, max_cached_containers: usize) -> CachingCramReader {
+        CachingCramReader {
+            reader: None,
+            path: self.path.clone(),
+            index: Arc::clone(&self.index),
+            repository: self.repository.clone(),
+            ref_map: Arc::clone(&self.ref_map),
+            filter: self.filter,
+            source_file_index: self.source_file_index,
+            cache: ContainerCache::new(max_cached_containers),
+        }
+    }
+}
+
+/// A per-worker read source: a caching CRAM reader (decode-once), or the shared
+/// pooled path for BAM (lighter decode, no slice concept). Built by
+/// [`AlignmentFile::worker_reader`] — one per worker via the driver's
+/// `map_init` — and unifies fetching into `(reads, FilterCounts)`.
+pub(crate) enum WorkerReader<'a> {
+    Cram(CachingCramReader),
+    /// BAM keeps the existing pooled per-call path; the borrow ties the reader
+    /// to the shared [`AlignmentFile`] (which outlives the worker pool).
+    Bam(&'a AlignmentFile),
+}
+
+impl WorkerReader<'_> {
+    /// Reads overlapping `[start, end]` on `chrom` + the complete filter tally —
+    /// the same `(reads, FilterCounts)` for both formats. For CRAM this hits the
+    /// per-worker container cache; for BAM it drains the pooled iterator.
+    pub(crate) fn fetch_mapped_reads(
+        &mut self,
+        chrom: &str,
+        start: u32,
+        end: u32,
+    ) -> Result<(Vec<MappedRead>, FilterCounts), AlignmentInputError> {
+        match self {
+            Self::Cram(reader) => reader.fetch_mapped_reads(chrom, start, end),
+            Self::Bam(file) => {
+                let mut iter = file.get_reads_from_segment(chrom, start, end)?;
+                let mut reads = Vec::new();
+                for read in iter.by_ref() {
+                    reads.push(read?);
+                }
+                let counts = *iter.filter_counts();
+                Ok((reads, counts))
+            }
+        }
+    }
+}
+
+impl AlignmentFile {
+    /// Build a per-worker [`WorkerReader`]: a caching CRAM reader (own handle +
+    /// cache) for CRAM, or a borrow of `self` for BAM. Infallible (CRAM opens
+    /// lazily on first decode). One per worker, via the driver's `map_init`.
+    pub(crate) fn worker_reader(&self) -> WorkerReader<'_> {
+        match self {
+            Self::Cram(file) => {
+                WorkerReader::Cram(file.caching_reader(DEFAULT_MAX_CACHED_CONTAINERS))
+            }
+            Self::Bam(_) => WorkerReader::Bam(self),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // The per-call iterator (format-dispatching wrapper)
 // ---------------------------------------------------------------------
 
@@ -1430,6 +1714,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.source_file_index, 3);
+    }
+
+    /// The byte-identity gate for [`CachingCramReader`]: for a spread of
+    /// repeated and overlapping windows, the caching reader must return exactly
+    /// the same `(reads, FilterCounts)` as draining the per-call
+    /// `get_reads_from_segment` path. Includes a low-MAPQ read so the filter
+    /// tally is non-trivial, and repeats `8..25` so a cache hit is exercised.
+    #[test]
+    fn caching_cram_reader_matches_per_call_path() {
+        let records = [
+            aln_record("a", 0, 1, 4, 60),
+            aln_record("b", 0, 6, 4, 60),
+            aln_record("lowmq", 0, 8, 4, 5),
+            aln_record("c", 0, 8, 4, 60),
+            aln_record("d", 0, 20, 4, 60),
+            aln_record("e", 0, 40, 4, 60),
+        ];
+        let filter = SegmentReadFilter {
+            min_mapq: Some(20),
+            min_read_length: None,
+            drop_qc_fail: true,
+            drop_duplicate: true,
+        };
+        let (_fa, _cram, file) = cram_alignment_file(&records, filter);
+        let cram = match &file {
+            AlignmentFile::Cram(c) => c,
+            _ => unreachable!("cram_alignment_file builds a CRAM file"),
+        };
+        let mut caching = cram.caching_reader(DEFAULT_MAX_CACHED_CONTAINERS);
+
+        for (s, e) in [
+            (1u32, 50),
+            (8, 25),
+            (6, 9),
+            (8, 11),
+            (20, 23),
+            (100, 110),
+            (40, 43),
+            (8, 25),
+        ] {
+            let mut iter = file.get_reads_from_segment("chr1", s, e).unwrap();
+            let mut want_reads = Vec::new();
+            for r in iter.by_ref() {
+                want_reads.push(r.unwrap());
+            }
+            let want_counts = *iter.filter_counts();
+            drop(iter);
+
+            let (got_reads, got_counts) = caching.fetch_mapped_reads("chr1", s, e).unwrap();
+            assert_eq!(got_reads, want_reads, "reads differ for window {s}..{e}");
+            assert_eq!(got_counts, want_counts, "counts differ for window {s}..{e}");
+        }
     }
 
     /// Exercises the container-level early-stop: when the container the

@@ -22,7 +22,7 @@
 
 use crate::bam::alignment_input::{FilterCounts, MappedRead};
 use crate::bam::errors::AlignmentInputError;
-use crate::bam::segment_reader::AlignmentFile;
+use crate::bam::segment_reader::WorkerReader;
 use crate::ssr::types::Locus;
 
 use super::triage::reaches_locus;
@@ -162,7 +162,7 @@ pub(crate) struct LocusReads {
 /// Propagates the first [`AlignmentInputError`] from opening/seeking a segment
 /// or decoding a record (an unknown contig, a bad segment, or I/O).
 pub(crate) fn fetch_locus_reads(
-    files: &[AlignmentFile],
+    readers: &mut [WorkerReader<'_>],
     locus: &Locus,
     cap: usize,
 ) -> Result<LocusReads, AlignmentInputError> {
@@ -176,17 +176,15 @@ pub(crate) fn fetch_locus_reads(
     let mut yielded = 0u64;
     let mut filtered = FilterCounts::default();
 
-    for file in files {
-        let mut reads = file.get_reads_from_segment(locus.chrom(), seg_start, seg_end)?;
-        for read in reads.by_ref() {
-            let read = read?;
+    for reader in readers.iter_mut() {
+        let (reads, counts) = reader.fetch_mapped_reads(locus.chrom(), seg_start, seg_end)?;
+        for read in reads {
             yielded += 1;
             if reaches_locus(&read, locus) {
                 reservoir.offer(read);
             }
         }
-        // Read the filter tally after draining, before the iterator drops.
-        filtered.merge(reads.filter_counts());
+        filtered.merge(&counts);
     }
 
     Ok(LocusReads {
@@ -223,7 +221,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::bam::index_preflight::AlignmentIndex;
-    use crate::bam::segment_reader::SegmentReadFilter;
+    use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter};
     use crate::ssr::types::Motif;
 
     #[test]
@@ -405,8 +403,8 @@ mod tests {
         ];
         let (_dir, file) = bam_file(&records);
 
-        let got = fetch_locus_reads(std::slice::from_ref(&file), &locus6(), MAX_READS_PER_LOCUS)
-            .expect("fetch");
+        let mut readers = vec![file.worker_reader()];
+        let got = fetch_locus_reads(&mut readers, &locus6(), MAX_READS_PER_LOCUS).expect("fetch");
 
         let admitted: Vec<String> = got
             .reads
@@ -426,7 +424,8 @@ mod tests {
         let (_d1, f1) = bam_file(&[aln_record("a", 6, 30, 60)]);
         let (_d2, f2) = bam_file(&[aln_record("b", 6, 30, 60)]);
 
-        let got = fetch_locus_reads(&[f1, f2], &locus6(), MAX_READS_PER_LOCUS).expect("fetch");
+        let mut readers = vec![f1.worker_reader(), f2.worker_reader()];
+        let got = fetch_locus_reads(&mut readers, &locus6(), MAX_READS_PER_LOCUS).expect("fetch");
 
         let mut admitted: Vec<String> = got
             .reads

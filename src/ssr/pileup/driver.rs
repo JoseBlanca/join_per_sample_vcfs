@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bam::alignment_input::{PileupInputs, build_fasta_repository, load_pileup_inputs};
 use crate::bam::errors::AlignmentInputError;
-use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter};
+use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter, WorkerReader};
 use crate::fasta::ContigList;
 use crate::pop_var_caller::common::{
     DEFAULT_BUFFERED_IO_CAPACITY, basename, current_command_line, format_md5_hex, rfc3339_now,
@@ -151,14 +151,14 @@ pub(crate) fn qc_counts(fetched: &LocusReads) -> QcCounts {
 /// reservoir depth cap. Concurrency-safe for different loci: the only `&mut` is
 /// the caller-owned `scratch`.
 pub(crate) fn process_locus(
-    files: &[AlignmentFile],
+    readers: &mut [WorkerReader<'_>],
     locus: &Locus,
     window: u16,
     cap: usize,
     model: &HmmModel,
     scratch: &mut LocusScratch,
 ) -> Result<SsrLocusRecord, SsrPileupError> {
-    let fetched = fetch_locus_reads(files, locus, cap)?;
+    let fetched = fetch_locus_reads(readers, locus, cap)?;
     let outcomes: Vec<_> = fetched
         .reads
         .iter()
@@ -407,11 +407,21 @@ pub(crate) fn run(cfg: &SsrPileupConfig) -> Result<(), SsrPileupError> {
         let records: Vec<ContainerRecord> = pool.install(|| {
             batch
                 .par_iter()
-                .map_init(LocusScratch::new, |scratch, locus| {
-                    let record =
-                        process_locus(&files, locus, cfg.window, cfg.cap, &model, scratch)?;
-                    to_container_record(record, &name_to_id)
-                })
+                .map_init(
+                    // Per-worker state: one decode-caching reader per input file
+                    // (CRAM) + the pair-HMM scratch. `map_init` rebuilds this per
+                    // rayon job, so each contiguous locus run gets a warm cache.
+                    || {
+                        let readers: Vec<WorkerReader> =
+                            files.iter().map(|f| f.worker_reader()).collect();
+                        (readers, LocusScratch::new())
+                    },
+                    |(readers, scratch), locus| {
+                        let record =
+                            process_locus(readers, locus, cfg.window, cfg.cap, &model, scratch)?;
+                        to_container_record(record, &name_to_id)
+                    },
+                )
                 .collect::<Result<Vec<_>, SsrPileupError>>()
         })?;
         for record in &records {
