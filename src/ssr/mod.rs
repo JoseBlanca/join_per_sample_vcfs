@@ -18,8 +18,10 @@
 //! `doc/devel/architecture/ssr_pileup_mark2.md` (Stage 1), and the build plan
 //! `doc/devel/implementation_plans/ssr_pileup_mark2.md`.
 //!
-//! Built so far: [`types`] (`Locus`, `Motif`) and [`catalog`] (Stage 0, copied
-//! verbatim from the Mark-1 tree — Stage 0 is model-agnostic).
+//! Built so far: [`types`] (`Locus`, `Motif`), [`catalog`] (Stage 0, copied
+//! verbatim from the Mark-1 tree — Stage 0 is model-agnostic), and the Stage-1
+//! read path in [`pileup`] (footprint geometry + reservoir fetch).
 
 pub mod catalog;
+pub mod pileup;
 pub mod types;

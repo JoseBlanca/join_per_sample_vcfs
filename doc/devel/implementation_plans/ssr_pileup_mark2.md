@@ -21,7 +21,7 @@ These move from `src/ssr_mark1/` → `src/ssr/` with only `crate::ssr_mark1` →
 | `types.rs` (`Locus`, `Motif`) | `ssr/types.rs` | **drop** `Allele`, `NormalizedSeq` (no on/off-ladder); keep `Locus`/`Motif` + tests verbatim |
 | `catalog/**` (Stage 0: TRF spawn/parse, postprocess, io, run) | `ssr/catalog/**` | **verbatim** (Stage 0 is model-agnostic, P5) |
 | `pileup/fetch_reads.rs` (`Reservoir`, `SplitMix64`, `locus_seed`, `LocusReads`, `fetch_locus_reads`, `MAX_READS_PER_LOCUS`) | `ssr/pileup/fetch_reads.rs` | **verbatim** + fold in the footprint geometry (next row) |
-| `pileup/triage.rs` → only `reaches_locus`, `read_footprint`, `brackets`, `ref_to_read`, `extract_region` (+ their tests) | **into** `ssr/pileup/fetch_reads.rs` | keep the **footprint geometry + admission gate**; **drop** `triage_read`, `SpanningRead`, `TriageResult`, `find_longest_stretch`, `ProbeHit` (Mark-1 rung-window machinery) |
+| `pileup/triage.rs` → only `reaches_locus`, `read_footprint`, `brackets`, `ref_to_read`, `extract_region` (+ their tests) | **into a new `ssr/pileup/footprint.rs`** (kept separate from `fetch_reads.rs` to avoid colliding test helpers) | keep the **footprint geometry + admission gate**; **drop** `triage_read`, `SpanningRead`, `TriageResult`, `find_longest_stretch`, `ProbeHit` (Mark-1 rung-window machinery) |
 | `pileup/driver.rs` skeleton (input loading, `AlignmentFile`/`WorkerReader`, batched `par_chunks`, `build_ssr_writer_header`, atomic temp+rename, `SsrPileupConfig`, `SsrPileupError`) | `ssr/pileup/driver.rs` | skeleton kept; **swap** `process_locus` body, the record type, `to_container_record`, `LocusScratch`, header params (§3) |
 | the **shared** `src/bam/**` readers (`load_pileup_inputs`, `AlignmentFile`, `WorkerReader`, `FilterCounts`, `SegmentReadFilter`) | — | used directly, **not** copied (already shared) |
 | `pileup/pair_hmm.rs` → only `HmmModel`, `EMISSION_LN`, `INS_EMIT_LN`, transition constants, `ln_*` helpers, the grow-and-keep scratch idea | **into** `ssr/pileup/alignment.rs` | reuse the **emission/transition model**; the forward (`forward`, `score_candidates`, prefix-seam) is **dropped** — replaced by Viterbi+traceback (§2) |
@@ -205,9 +205,10 @@ drop `n_obs` — derived); `build_ssr_writer_header` params drop `window`, add
 0. **Scaffold** `src/ssr/` + `pub mod ssr;` in `lib.rs` (empty `mod.rs`). green.
 1. **types + Stage 0**: copy `types.rs` (drop `Allele`/`NormalizedSeq`) + `catalog/`
    verbatim. Tests: the copied catalog/types tests pass under `crate::ssr`. green.
-2. **fetch_reads**: copy `fetch_reads.rs` + fold in the footprint geometry +
-   `reaches_locus`/`extract_region`. Tests: reservoir determinism, `fetch_locus_reads`
-   BAM fixture, `extract_region` (incl. clip-extended). green.
+2. **fetch_reads + footprint**: copy `fetch_reads.rs`; lift the footprint geometry
+   + `reaches_locus`/`extract_region` into a new `footprint.rs` (rung machinery
+   dropped). Tests: reservoir determinism, `fetch_locus_reads` BAM fixture,
+   footprint/brackets/region/reach-gate. green.
 3. **alignment**: `alignment.rs` — Viterbi+traceback delimiter + quality gate.
    Tests (anti-tautology): clean read → repeat region = the tract; interior-indel
    read → indel-bearing region extracted; a read with a flank off the end →

@@ -56,7 +56,7 @@ verbatim:
 |---|---|
 | `fetch_reads.rs`: `Reservoir<T>` (Algorithm R + SplitMix64), `locus_seed` (FNV-1a), `MAX_READS_PER_LOCUS` | **verbatim** — the deterministic per-locus depth cap |
 | `fetch_reads.rs`: `fetch_locus_reads` + `LocusReads { reads, yielded, filtered }` | **verbatim** — segment-query the embedded window, admission-gate, reservoir-cap |
-| `triage.rs`: `reaches_locus` (the cheap "could this read span the locus?" admission gate — a footprint/clip test, no alignment) + the footprint helpers it needs | **fold into `fetch_reads.rs`** — it *is* the reservoir admission gate, so it lives with fetching, not in a separate module. The footprint geometry is shared with the delimiter (§3). The rest of `triage.rs` (`triage_read`, `SpanningRead`, the rung window centre, `find_longest_stretch`) is Mark-1-specific and **dropped** — Mark-2 delimits by alignment (§3); `find_longest_stretch` may return later only as the P6 DP-bounding optimisation. |
+| `triage.rs`: `reaches_locus` (the cheap "could this read span the locus?" admission gate — a footprint/clip test, no alignment) + the footprint helpers it needs | **lift into a clearly-named `footprint.rs`** (read-vs-locus geometry + the admission gate). *(Originally folded into `fetch_reads.rs`; kept separate because both files carry their own test helpers — `locus6`/etc. — which would collide. The new name addresses the original objection to the opaque `reach.rs`.)* The footprint geometry is shared with the delimiter (§3). The rest of `triage.rs` (`triage_read`, `SpanningRead`, the rung window centre, `find_longest_stretch`) is Mark-1-specific and **dropped** — Mark-2 delimits by alignment (§3); `find_longest_stretch` may return later only as the P6 DP-bounding optimisation. |
 | `driver.rs`: input loading, per-file `AlignmentFile`, the **batched `par_chunks`** loop (warm decode cache per chunk, `LOCUS_BATCH`/`CHUNKS_PER_THREAD`/`MIN_FETCH_CHUNK`), `build_ssr_writer_header`, atomic temp-write+rename, the name→chrom_id adapter *shape*, `SsrPileupConfig` | **skeleton verbatim**; the per-locus body (`process_locus`) and the record type change (§3–§5), and the header params change (drop `window`; add the quality threshold) |
 | `driver.rs`: determinism approach (per-locus reservoir seed + atomic per-locus scoring + catalog-order writes) | **verbatim** — the §7 invariant |
 
@@ -185,12 +185,12 @@ order-sensitivity caveat (offer reads in a fixed total order) carries over uncha
 src/ssr/
   types.rs          # Locus, Motif  (reuse from ssr_mark1; DROP Allele/NormalizedSeq)
   pileup/
-    fetch_reads.rs  # COPY: Reservoir, locus_seed, fetch_locus_reads + the
-                    #       reaches_locus admission gate & footprint helpers
-                    #       (folded in from ssr_mark1 triage)
+    fetch_reads.rs  # COPY: Reservoir, locus_seed, fetch_locus_reads
+    footprint.rs    # read-vs-locus geometry + the reaches_locus admission gate
+                    #   (lifted from ssr_mark1 triage; rung machinery dropped)
     alignment.rs    # NEW: viterbi_align + traceback + boundary read-off (§3) +
-                    #      the first-quartile quality gate (§4); reuses the
-                    #      footprint geometry from fetch_reads for region extraction
+                    #      the first-quartile quality gate (§4); reuses
+                    #      footprint::extract_region for region extraction
     locus_tally.rs  # NEW: sequence tally -> SsrLocusObs (§5)
     driver.rs       # COPY skeleton; swap process_locus body + record type
   catalog/          # COPY verbatim from ssr_mark1 (Stage 0 is model-agnostic, P5)
