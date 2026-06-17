@@ -1,9 +1,9 @@
 //! `ssr-pileup` subcommand — Stage 1 of the SSR caller. Genotypes one sample's
-//! BAM/CRAM against an SSR catalog ([`crate::ssr_mark1::catalog`]) and writes a
+//! BAM/CRAM against an SSR catalog ([`crate::ssr::catalog`]) and writes a
 //! per-locus `.ssr.psp` evidence file. The struct below is the authoritative
 //! knob list; [`run_ssr_pileup`] translates it into an
 //! [`SsrPileupConfig`] and drives
-//! [`crate::ssr_mark1::pileup::driver::run`].
+//! [`crate::ssr::pileup::driver::run`].
 
 use std::path::PathBuf;
 
@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::bam::alignment_input::{DEFAULT_MIN_MAPQ, DEFAULT_MIN_READ_LENGTH};
 use crate::bam::segment_reader::SegmentReadFilter;
-use crate::ssr_mark1::pileup::driver::{self, DEFAULT_WINDOW, SsrPileupConfig};
-use crate::ssr_mark1::pileup::fetch_reads::MAX_READS_PER_LOCUS;
+use crate::ssr::pileup::driver::{self, SsrPileupConfig};
+use crate::ssr::pileup::fetch_reads::MAX_READS_PER_LOCUS;
 
 /// Arguments for the `ssr-pileup` subcommand.
 #[derive(Debug, Args, Clone)]
@@ -59,10 +59,6 @@ pub struct SsrPileupArgs {
     #[arg(long, help_heading = "Read filter")]
     pub keep_qc_fail: bool,
 
-    /// Pair-HMM candidate half-width (rungs) centred on the observed count.
-    #[arg(long, default_value_t = DEFAULT_WINDOW, help_heading = "Advanced")]
-    pub window: u16,
-
     /// Per-locus read depth cap (reservoir sampling).
     #[arg(long, default_value_t = MAX_READS_PER_LOCUS, help_heading = "Advanced")]
     pub max_reads_per_locus: usize,
@@ -101,7 +97,6 @@ fn to_config(args: &SsrPileupArgs) -> SsrPileupConfig {
             drop_duplicate: !args.keep_duplicates,
             drop_qc_fail: !args.keep_qc_fail,
         },
-        window: args.window,
         cap: args.max_reads_per_locus,
         build_index_if_missing: args.build_index_if_missing,
         sample: args.sample.clone(),
@@ -142,7 +137,6 @@ mod tests {
                 assert_eq!(a.alignment_files, vec![PathBuf::from("sample.bam")]);
                 assert_eq!(a.min_mapq, DEFAULT_MIN_MAPQ);
                 assert_eq!(a.min_read_length, DEFAULT_MIN_READ_LENGTH);
-                assert_eq!(a.window, DEFAULT_WINDOW);
                 assert_eq!(a.max_reads_per_locus, MAX_READS_PER_LOCUS);
                 assert_eq!(a.threads, 4);
                 assert!(!a.keep_duplicates && !a.keep_qc_fail);

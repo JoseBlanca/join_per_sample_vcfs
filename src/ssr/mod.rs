@@ -1,6 +1,6 @@
-// Net-new Mark-2 SSR module, built incrementally; no production consumers wire
-// into it yet (the CLI still drives `ssr_mark1` until the Stage-1 cutover), so
-// allow dead code while the tree fills in.
+// Mark-2 SSR module. The CLI now drives Stage 0 (`ssr-catalog`) and Stage 1
+// (`ssr-pileup`) here; Stage 2 (`ssr-call`) is not built yet, so some surface is
+// still unused — allow dead code while the tree fills in.
 #![allow(dead_code)]
 //! SSR/STR genotyping — Mark 2 (the empirical-candidate model).
 //!

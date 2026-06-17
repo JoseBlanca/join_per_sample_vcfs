@@ -7,6 +7,7 @@
 //! driver.
 
 pub mod alignment;
+pub mod driver;
 pub mod fetch_reads;
 pub mod footprint;
 pub mod locus_tally;
