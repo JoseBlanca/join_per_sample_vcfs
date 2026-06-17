@@ -337,6 +337,53 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Manual fixture builder for the fetch-path perf measurement: filter a
+    /// catalog to a BED's regions so every surviving locus has read coverage
+    /// (a "dense" catalog). Paths via env. Run:
+    /// `PVC_CATALOG_IN=a.ssr.catalog PVC_REGIONS=r.bed PVC_CATALOG_OUT=b.ssr.catalog \
+    ///   cargo test --release filter_catalog_to_regions -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: filter a catalog to BED regions (dense perf fixture)"]
+    fn filter_catalog_to_regions() {
+        use std::fs::File;
+        use std::io::BufRead;
+
+        let cat_in = std::env::var("PVC_CATALOG_IN").expect("PVC_CATALOG_IN");
+        let bed = std::env::var("PVC_REGIONS").expect("PVC_REGIONS");
+        let cat_out = std::env::var("PVC_CATALOG_OUT").expect("PVC_CATALOG_OUT");
+
+        let regions: Vec<(String, u32, u32)> = std::io::BufReader::new(File::open(&bed).unwrap())
+            .lines()
+            .filter_map(|line| {
+                let line = line.unwrap();
+                let mut f = line.split('\t');
+                let c = f.next()?.to_string();
+                let s: u32 = f.next()?.parse().ok()?;
+                let e: u32 = f.next()?.parse().ok()?;
+                Some((c, s, e))
+            })
+            .collect();
+
+        let mut reader = CatalogReader::new(File::open(&cat_in).unwrap()).unwrap();
+        let header = reader.header().clone();
+        let mut writer = CatalogWriter::new(File::create(&cat_out).unwrap(), &header).unwrap();
+        let (mut kept, mut total) = (0u64, 0u64);
+        while let Some(locus) = reader.read_locus() {
+            let locus = locus.unwrap();
+            total += 1;
+            // BED is 0-based half-open; Locus coords are 0-based.
+            let overlaps = regions
+                .iter()
+                .any(|(c, s, e)| locus.chrom() == c && locus.start() < *e && locus.end() > *s);
+            if overlaps {
+                writer.write_locus(&locus).unwrap();
+                kept += 1;
+            }
+        }
+        writer.finish().unwrap();
+        eprintln!("filtered catalog: {kept}/{total} loci kept");
+    }
+
     fn sample_header() -> CatalogHeader {
         CatalogHeader {
             tool_version: "0.1.0".to_string(),

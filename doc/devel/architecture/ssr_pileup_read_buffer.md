@@ -1,11 +1,29 @@
 # SSR Stage-1 fetch — per-thread `CramReader` with a slice cache (decode-once)
 
-**Status:** settled design, 2026-06-17 (worked through in discussion). A focused
-optimization of the [`ssr-pileup`](ssr_pileup.md) Stage-1 fetch path (the §8 read
-pipeline). It does **not** change the evidence model, the catalog, the
-`.ssr.psp` format, or the realignment — only *how reads are pulled from the
-CRAM/BAM for each locus*. Goal: remove the dominant end-to-end cost (redundant
-CRAM slice decoding) while keeping the per-locus output **byte-identical**.
+**Status:** step 1 implemented + measured (2026-06-17); **step 2 measured
+unnecessary** (see §5). A focused optimization of the [`ssr-pileup`](ssr_pileup.md)
+Stage-1 fetch path (the §8 read pipeline). It does **not** change the evidence
+model, the catalog, the `.ssr.psp` format, or the realignment — only *how reads
+are pulled from the CRAM/BAM for each locus*. Goal: remove the dominant
+end-to-end cost (redundant CRAM slice decoding) while keeping the per-locus
+output **byte-identical**.
+
+**Measured (real ch01 catalog + tomato CRAM, 6 threads), cache cap A/B:**
+
+```
+cap   CRAM decodes   wall     output
+ 0    8931           85.3 s   (no cache = old per-locus re-decode)
+ 3    341            4.23 s   (default)        ← ~26× fewer decodes, ~20× wall
+ 64   420            4.52 s   (≈ unbounded)
+```
+
+All three are byte-identical (0 record diffs across 10 425 loci). **cap=3 is
+already at the decode floor** — cap=64 does not reduce decodes (341 vs 420 is
+thread-scheduling noise), so a bigger cache, and the slice-grouping of §5, have
+no headroom. The end-to-end win is largest where decode dominates (this fixture
+has little realignment); a high-coverage run spends more in the (unchanged)
+realignment, so its end-to-end factor is smaller, but decode redundancy is
+eliminated regardless.
 
 Grounded in measurement: the fetch path was profiled on a real tomato catalog +
 CRAM in
@@ -166,7 +184,15 @@ slice/container by offset — the building blocks for interposing the cache. If 
 clean seam isn't public, drive the container reader directly per the Query
 iterator's internals.)*
 
-## 5. `covered_regions()` + orchestrator slice-grouping (step 2, optional)
+## 5. `covered_regions()` + orchestrator slice-grouping (step 2 — MEASURED UNNECESSARY)
+
+**Verdict: not worth building.** The cap A/B (top of doc) shows the per-thread
+cap=3 cache already decodes each container ~once — increasing the cache to 64 did
+not reduce the decode count. Slice-grouping targets the cross-thread boundary
+re-decodes, which this measurement bounds at *noise level* (a few % of decodes,
+and an even smaller % of wall once decode is no longer the bottleneck). The
+sketch below is retained for the record; the prediction "the boundary re-decodes
+may be negligible" held.
 
 The `.crai` index is a flat list of slice entries carrying
 `(reference_sequence_id, alignment_start, alignment_span, …)` — i.e. every
@@ -262,11 +288,11 @@ grouping becomes a pure placement optimization on top.
    byte-identity oracle. **Gate test** (§3). This alone kills the within-thread
    redundancy — the bulk of the win — with no change to the driver's parallel
    structure.
-2. **`covered_regions()` + slice-grouping** (§5): the orchestrator groups loci by
-   home slice and `par_iter`s over groups. A/B vs step 1.
-3. **Measure:** slice-decode count vs loci-with-reads (redundancy removed),
-   re-profile (CRAM-decode + MD5 self-time drop), end-to-end wall on the fixture
-   and a denser run.
+2. **Measure** (done, 2026-06-17): cap A/B with a decode counter — confirmed
+   ~26× fewer decodes, ~20× wall, byte-identical, and **cap=3 already at the
+   decode floor**.
+3. **`covered_regions()` + slice-grouping** (§5): **dropped** — step-2 measured
+   unnecessary (no decode headroom above cap=3).
 
 ## 9. Open questions
 
