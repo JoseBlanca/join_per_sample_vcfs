@@ -1,28 +1,43 @@
 # SSR Stage-1 fetch — per-thread `CramReader` with a slice cache (decode-once)
 
-**Status:** step 1 implemented + measured (2026-06-17); **step 2 measured
-unnecessary** (see §5). A focused optimization of the [`ssr-pileup`](ssr_pileup.md)
-Stage-1 fetch path (the §8 read pipeline). It does **not** change the evidence
-model, the catalog, the `.ssr.psp` format, or the realignment — only *how reads
-are pulled from the CRAM/BAM for each locus*. Goal: remove the dominant
-end-to-end cost (redundant CRAM slice decoding) while keeping the per-locus
-output **byte-identical**.
+**Status:** step 1 (cache) + the cache-lifetime fix implemented + measured
+(2026-06-17). A focused optimization of the [`ssr-pileup`](ssr_pileup.md) Stage-1
+fetch path (the §8 read pipeline). It does **not** change the evidence model, the
+catalog, the `.ssr.psp` format, or the realignment — only *how reads are pulled
+from the CRAM/BAM for each locus*. Goal: remove the dominant end-to-end cost
+(redundant CRAM slice decoding) while keeping the per-locus output
+**byte-identical**.
 
-**Measured (real ch01 catalog + tomato CRAM, 6 threads), cache cap A/B:**
+**Measured (real ch01 catalog + tomato CRAM), cache cap A/B at 6 threads:**
 
 ```
 cap   CRAM decodes   wall     output
  0    8931           85.3 s   (no cache = old per-locus re-decode)
  3    341            4.23 s   (default)        ← ~26× fewer decodes, ~20× wall
- 64   420            4.52 s   (≈ unbounded)
 ```
 
-All three are byte-identical (0 record diffs across 10 425 loci). **cap=3 is
-already at the decode floor** — cap=64 does not reduce decodes (341 vs 420 is
-thread-scheduling noise), so a bigger cache, and the slice-grouping of §5, have
-no headroom. The end-to-end win is largest where decode dominates (this fixture
-has little realignment); a high-coverage run spends more in the (unchanged)
-realignment, so its end-to-end factor is smaller, but decode redundancy is
+All byte-identical (0 record diffs across 10 425 loci). At 6 threads the cache
+looks near-optimal — **but that was a trap.** Decode count vs `--threads`
+exposed a **thread-scaling redundancy** (the cache was rebuilt per rayon job by
+`map_init`, so finer splitting at higher thread counts → more cold-cache
+re-decodes):
+
+```
+                threads:   1     6     16     32
+map_init  decodes:        19    424   2202   5462   ← grows with threads (toward no-cache 8931)
+par_chunks decodes:      155    155    155    155   ← FIX: flat, thread-independent
+```
+
+**The fix (implemented):** process each batch with `par_chunks(FETCH_CHUNK)`
+instead of `par_iter().map_init`, so the decode cache lives for a whole
+**contiguous chunk** of sorted loci, not a rayon job. The decode count becomes
+flat in thread count — at the production 32 threads, **155 vs 5462 (~35× fewer
+decodes)** — byte-identical. The residual (155 vs the single-thread minimum 19)
+is the fixed per-chunk-boundary cost; the **slice-grouping of §5 would drive it
+toward the minimum** by aligning chunk boundaries to container boundaries, and is
+now a worthwhile (no-longer-dropped) follow-up. The end-to-end wall win is
+largest where decode dominates; a high-coverage run spends more in the
+(unchanged) realignment, but the decode redundancy — and its thread-scaling — is
 eliminated regardless.
 
 Grounded in measurement: the fetch path was profiled on a real tomato catalog +
@@ -184,15 +199,17 @@ slice/container by offset — the building blocks for interposing the cache. If 
 clean seam isn't public, drive the container reader directly per the Query
 iterator's internals.)*
 
-## 5. `covered_regions()` + orchestrator slice-grouping (step 2 — MEASURED UNNECESSARY)
+## 5. `covered_regions()` + orchestrator slice-grouping (step 2 — worthwhile follow-up)
 
-**Verdict: not worth building.** The cap A/B (top of doc) shows the per-thread
-cap=3 cache already decodes each container ~once — increasing the cache to 64 did
-not reduce the decode count. Slice-grouping targets the cross-thread boundary
-re-decodes, which this measurement bounds at *noise level* (a few % of decodes,
-and an even smaller % of wall once decode is no longer the bottleneck). The
-sketch below is retained for the record; the prediction "the boundary re-decodes
-may be negligible" held.
+**Status: reopened.** An earlier 6-thread measurement made this look unnecessary;
+the thread-scaling measurement (top of doc) corrected that. The `par_chunks` fix
+already removes the *thread-scaling* redundancy (decode count flat at 155), but
+leaves a fixed per-chunk-boundary residual (155 vs the single-thread minimum 19)
+because chunk boundaries fall mid-container. Slice-grouping eliminates that
+residual by making the chunk boundaries **align with container boundaries** (from
+the `.crai` slice spans), so each container is decoded exactly once. It composes
+with `par_chunks` — it just chooses smarter chunk boundaries. Worth building if
+the ~8×-over-minimum residual proves to matter at scale; sketch below.
 
 The `.crai` index is a flat list of slice entries carrying
 `(reference_sequence_id, alignment_start, alignment_span, …)` — i.e. every
@@ -288,11 +305,15 @@ grouping becomes a pure placement optimization on top.
    byte-identity oracle. **Gate test** (§3). This alone kills the within-thread
    redundancy — the bulk of the win — with no change to the driver's parallel
    structure.
-2. **Measure** (done, 2026-06-17): cap A/B with a decode counter — confirmed
-   ~26× fewer decodes, ~20× wall, byte-identical, and **cap=3 already at the
-   decode floor**.
-3. **`covered_regions()` + slice-grouping** (§5): **dropped** — step-2 measured
-   unnecessary (no decode headroom above cap=3).
+2. **Measure** (done, 2026-06-17): cap A/B + **decode-count vs `--threads`**. The
+   cap A/B alone (6 threads) looked optimal, but the thread sweep exposed the
+   `map_init`-per-job cache reset scaling decodes 19→5462 over 1→32 threads.
+3. **Cache-lifetime fix — `par_chunks`** (done, 2026-06-17): process each batch in
+   contiguous `FETCH_CHUNK`-sized chunks, one warm cache per chunk → decode count
+   flat (155) across threads, ~35× fewer decodes at 32 threads, byte-identical.
+4. **`covered_regions()` + slice-grouping** (§5): **reopened** (no longer dropped)
+   — aligns chunk boundaries to container boundaries to drive the residual (155)
+   toward the minimum (19). Worthwhile if the residual matters at scale.
 
 ## 9. Open questions
 

@@ -5,11 +5,11 @@
 //! — fetch the locus's reads, analyze each, fold them into the locus record. It
 //! is pure over its shared `&` inputs (and [`AlignmentFile`] is `Sync`), so
 //! [`run`] processes the catalog in parallel batches: read a batch of loci,
-//! `par_iter().map_init(…)` them across the pool (each worker reuses its own
-//! [`LocusScratch`]), and write the batch in catalog order. Output is
-//! **byte-identical for any thread count** — each locus's reservoir is seeded by
-//! `(chrom, start)` and scored atomically on one thread, and writes stay in
-//! catalog order (arch §8.4).
+//! `par_chunks(FETCH_CHUNK)` them across the pool (each contiguous chunk owns one
+//! warm decode cache + [`LocusScratch`]), and write the batch in catalog order.
+//! Output is **byte-identical for any thread count** — each locus's reservoir is
+//! seeded by `(chrom, start)` and scored atomically on one thread, and writes
+//! stay in catalog order (arch §8.4).
 //!
 //! **Build status:** Stage 1 is runnable end to end and parallel — the per-locus
 //! unit ([`process_locus`], [`LocusScratch`], [`qc_counts`]), the name→chrom_id
@@ -51,6 +51,17 @@ use super::read_analysis::analyze_read;
 /// materializing the whole genome's worth at once, while staying large enough
 /// to amortize scheduling.
 const LOCUS_BATCH: usize = 8192;
+
+/// Loci per cache-warm processing chunk within a batch. The batch is split into
+/// **contiguous** chunks and parallelized over those (`par_chunks`), each chunk
+/// owning one decode cache that stays warm across its whole sorted run — so a
+/// CRAM container is decoded ~once per chunk that spans it, **independent of
+/// `--threads`** (the cache lifetime is the chunk, not the per-rayon-job
+/// `map_init` it replaced, which re-decoded on every split and so grew the
+/// decode count with thread count). Fixed and small enough to give the pool many
+/// units to load-balance (≥ a few × the worker count at the production thread
+/// count), large enough that decode amortizes across the chunk.
+const FETCH_CHUNK: usize = 64;
 
 /// Default `analyze_read` candidate half-width (rungs): the pair-HMM scores
 /// `observed_count ± DEFAULT_WINDOW` on-ladder lengths per spanning read. A
@@ -404,28 +415,37 @@ pub(crate) fn run(cfg: &SsrPileupConfig) -> Result<(), SsrPileupError> {
         if batch.is_empty() {
             break;
         }
-        let records: Vec<ContainerRecord> = pool.install(|| {
+        let chunks: Vec<Vec<ContainerRecord>> = pool.install(|| {
             batch
-                .par_iter()
-                .map_init(
-                    // Per-worker state: one decode-caching reader per input file
-                    // (CRAM) + the pair-HMM scratch. `map_init` rebuilds this per
-                    // rayon job, so each contiguous locus run gets a warm cache.
-                    || {
-                        let readers: Vec<WorkerReader> =
-                            files.iter().map(|f| f.worker_reader()).collect();
-                        (readers, LocusScratch::new())
-                    },
-                    |(readers, scratch), locus| {
-                        let record =
-                            process_locus(readers, locus, cfg.window, cfg.cap, &model, scratch)?;
-                        to_container_record(record, &name_to_id)
-                    },
-                )
+                .par_chunks(FETCH_CHUNK)
+                .map(|chunk| -> Result<Vec<ContainerRecord>, SsrPileupError> {
+                    // One decode-caching reader per input file + the pair-HMM
+                    // scratch, owned by (and warm for) this contiguous chunk.
+                    let mut readers: Vec<WorkerReader> =
+                        files.iter().map(|f| f.worker_reader()).collect();
+                    let mut scratch = LocusScratch::new();
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for locus in chunk {
+                        let record = process_locus(
+                            &mut readers,
+                            locus,
+                            cfg.window,
+                            cfg.cap,
+                            &model,
+                            &mut scratch,
+                        )?;
+                        out.push(to_container_record(record, &name_to_id)?);
+                    }
+                    Ok(out)
+                })
                 .collect::<Result<Vec<_>, SsrPileupError>>()
         })?;
-        for record in &records {
-            writer.write_locus(record)?;
+        // Chunks are in catalog order (`par_chunks` is indexed); within a chunk
+        // records are sequential — so this writes in catalog order.
+        for chunk_records in &chunks {
+            for record in chunk_records {
+                writer.write_locus(record)?;
+            }
         }
     }
 
