@@ -12,8 +12,9 @@
 //! Workloads:
 //!
 //! - `ssr_realign/period` — homopolymer / di / tri / tetra motif, fixed
-//!   units=15, flank=50, depth=30, window=10. Dinucleotide is the common case.
-//! - `ssr_realign/window` — window 3 vs 10 vs 15 at the dinucleotide default;
+//!   units=15, flank=50, depth=30, window=6 (the shipped default). Dinucleotide
+//!   is the common case.
+//! - `ssr_realign/window` — window 3 vs 6 vs 15 at the dinucleotide default;
 //!   isolates the per-read candidate count (`2·window + 1` forward passes).
 //! - `ssr_realign/units` — short (8) vs long (30) tract; isolates the per-rung
 //!   haplotype length (the DP's inner dimension).
@@ -39,7 +40,7 @@ fn bench_period(c: &mut Criterion) {
     let mut g = c.benchmark_group("ssr_realign/period");
     g.throughput(Throughput::Elements(DEPTH as u64));
     for (label, period) in [("homopolymer", 1), ("di", 2), ("tri", 3), ("tetra", 4)] {
-        let w = build_synthetic_workload(period, 15, FLANK_BP, DEPTH, 10, 0);
+        let w = build_synthetic_workload(period, 15, FLANK_BP, DEPTH, 6, 0);
         g.bench_with_input(BenchmarkId::from_parameter(label), &w, |b, w| {
             b.iter(|| black_box(analyze_workload(black_box(w))));
         });
@@ -50,7 +51,7 @@ fn bench_period(c: &mut Criterion) {
 fn bench_window(c: &mut Criterion) {
     let mut g = c.benchmark_group("ssr_realign/window");
     g.throughput(Throughput::Elements(DEPTH as u64));
-    for window in [3u16, 10, 15] {
+    for window in [3u16, 6, 15] {
         let w = build_synthetic_workload(2, 15, FLANK_BP, DEPTH, window, 0);
         g.bench_with_input(BenchmarkId::from_parameter(window), &w, |b, w| {
             b.iter(|| black_box(analyze_workload(black_box(w))));
@@ -63,7 +64,7 @@ fn bench_units(c: &mut Criterion) {
     let mut g = c.benchmark_group("ssr_realign/units");
     g.throughput(Throughput::Elements(DEPTH as u64));
     for units in [8u16, 30] {
-        let w = build_synthetic_workload(2, units, FLANK_BP, DEPTH, 10, 0);
+        let w = build_synthetic_workload(2, units, FLANK_BP, DEPTH, 6, 0);
         g.bench_with_input(BenchmarkId::from_parameter(units), &w, |b, w| {
             b.iter(|| black_box(analyze_workload(black_box(w))));
         });
@@ -75,7 +76,7 @@ fn bench_softclip(c: &mut Criterion) {
     let mut g = c.benchmark_group("ssr_realign/softclip");
     g.throughput(Throughput::Elements(DEPTH as u64));
     for (label, clip_units) in [("clean", 0u16), ("clip10", 10)] {
-        let w = build_synthetic_workload(2, 15, FLANK_BP, DEPTH, 10, clip_units);
+        let w = build_synthetic_workload(2, 15, FLANK_BP, DEPTH, 6, clip_units);
         g.bench_with_input(BenchmarkId::from_parameter(label), &w, |b, w| {
             b.iter(|| black_box(analyze_workload(black_box(w))));
         });

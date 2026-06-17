@@ -818,7 +818,8 @@ mod tests {
         assert_eq!(best.0, 3);
     }
 
-    /// Manual concordance diff between two `.ssr.psp` files (e.g. window=10 vs
+    /// Manual diagnostic — **not a CI regression test** (env-gated, prints a
+    /// report). Concordance diff between two `.ssr.psp` files (e.g. window=10 vs
     /// window=6), for the fast-path / window investigation. Paths come from
     /// `PVC_PSP_A` / `PVC_PSP_B`. Run:
     /// `PVC_PSP_A=a.ssr.psp PVC_PSP_B=b.ssr.psp cargo test --release \

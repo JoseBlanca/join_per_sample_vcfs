@@ -293,6 +293,10 @@ fn longest_common_prefix_len(candidates: &[CandidateAllele]) -> usize {
 /// reading the previous row `prev` and the just-written `cur[j-1]`. `start ≥ 1`
 /// (column 0 is the insertion-only boundary, handled by the caller).
 #[inline]
+// Hot-path row kernel: the emission scalars (`read_base`, `match_ln`,
+// `mismatch_ln`, `ins_emit`) plus the row bounds are passed flat so the
+// optimizer keeps them in registers; bundling them in a struct adds an
+// indirection per cell on the inner DP loop.
 #[allow(clippy::too_many_arguments)]
 fn fill_row(
     prev: &[[f64; 3]],
@@ -673,5 +677,30 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .unwrap();
         assert_eq!(best.0, Allele::OnLadder { units: 3 });
+    }
+
+    /// Single-candidate / `n == lcp` corner: `longest_common_prefix_len` returns
+    /// the whole candidate, so Pass 2's tail loop is empty and the final score
+    /// comes straight from the seam. Must still be bit-identical to `forward`.
+    #[test]
+    fn score_candidates_single_candidate_matches_forward_bit_for_bit() {
+        use crate::ssr::pileup::candidate_generation::build_rungs;
+        let locus = ca_locus();
+        let mut cands = Vec::new();
+        build_rungs(&locus, 3, 0, &mut cands); // window 0 → exactly one rung (L=3)
+        assert_eq!(cands.len(), 1, "window 0 yields a single candidate");
+
+        let (model, mut shared) = setup();
+        let mut oracle = PairHmmScratch::new();
+        let read = b"GGGCACACATTT";
+        let quals = [40u8; 12];
+        let got = score_candidates(read, &quals, &cands, &mut shared, &model);
+        let want = forward(read, &quals, &cands[0].candidate_seq, &mut oracle, &model);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].1.to_bits(),
+            want.to_bits(),
+            "single-candidate score must match forward bit-for-bit"
+        );
     }
 }

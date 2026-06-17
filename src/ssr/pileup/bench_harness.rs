@@ -41,7 +41,7 @@ pub struct SyntheticLocusWorkload {
 /// - `flank_bp` — clean flank each side of the tract (the catalog default is 50).
 /// - `depth` — number of spanning reads built (the per-locus realignment count).
 /// - `window` — pair-HMM candidate half-width; each read scores `2·window + 1`
-///   rungs (the `ssr-pileup` default is 10).
+///   rungs (the `ssr-pileup` default is `DEFAULT_WINDOW` = 6).
 /// - `clip_units` — if non-zero, every read is given a longer true allele
 ///   (`units + clip_units` copies) whose extra tract + far flank sit in a
 ///   trailing soft-clip, exercising the soft-clip recovery + longer-haplotype DP.

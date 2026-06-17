@@ -766,14 +766,53 @@ pub(crate) struct CramSegmentReads<'a> {
     filter_counts: FilterCounts,
 }
 
-impl CramSegmentReads<'_> {
-    fn io_error(&self, source: io::Error) -> AlignmentInputError {
-        AlignmentInputError::Io {
-            path: self.file.path.clone(),
-            source,
+/// Seek to `offset`, read one CRAM container, and decode all of its slices into
+/// owned records. Returns `Ok(None)` at end-of-stream (`read_container` reads 0
+/// — the EOF marker) and `Ok(Some(records))` for a decoded container (`records`
+/// may be empty). Shared by the per-call [`CramSegmentReads::refill`] and the
+/// decode-once [`CachingCramReader`] so the seek/decode path — and its EOF stop
+/// semantics — cannot drift between the two readers.
+fn decode_cram_container(
+    reader: &mut cram::io::Reader<File>,
+    repository: &fasta::Repository,
+    header: &sam::Header,
+    path: &Path,
+    offset: u64,
+) -> Result<Option<Vec<sam::alignment::RecordBuf>>, AlignmentInputError> {
+    let to_io = |source| AlignmentInputError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    reader.seek(SeekFrom::Start(offset)).map_err(&to_io)?;
+    let mut container = cram::io::reader::Container::default();
+    if reader.read_container(&mut container).map_err(&to_io)? == 0 {
+        return Ok(None); // EOF — the index walk is exhausted.
+    }
+    let compression_header = container.compression_header().map_err(&to_io)?;
+    let mut out = Vec::new();
+    for slice_result in container.slices() {
+        let slice = slice_result.map_err(&to_io)?;
+        let (core_data_src, external_data_srcs) = slice.decode_blocks().map_err(&to_io)?;
+        let cram_records = slice
+            .records(
+                repository.clone(),
+                header,
+                &compression_header,
+                &core_data_src,
+                &external_data_srcs,
+            )
+            .map_err(&to_io)?;
+        for cram_record in &cram_records {
+            out.push(
+                sam::alignment::RecordBuf::try_from_alignment_record(header, cram_record)
+                    .map_err(&to_io)?,
+            );
         }
     }
+    Ok(Some(out))
+}
 
+impl CramSegmentReads<'_> {
     /// The filter-drop tally accumulated so far. See
     /// [`MappedReadsInSegment::filter_counts`].
     fn filter_counts(&self) -> &FilterCounts {
@@ -817,63 +856,38 @@ impl CramSegmentReads<'_> {
                 }
             }
 
-            // Seek + decode. The reader borrow is confined to this
-            // block; container ownership outlives it.
-            let mut container = cram::io::reader::Container::default();
-            let decoded = {
+            // Seek + decode this container via the shared helper, so the decode
+            // path and its EOF stop semantics stay identical to the decode-once
+            // `CachingCramReader`. The reader borrow is confined to this block.
+            let records = {
                 let reader = &mut self.handle.as_mut().expect("handle held").reader;
-                reader.seek(SeekFrom::Start(record.offset())).map_err(|e| {
-                    AlignmentInputError::Io {
-                        path: self.file.path.clone(),
-                        source: e,
-                    }
-                })?;
-                reader
-                    .read_container(&mut container)
-                    .map_err(|e| AlignmentInputError::Io {
-                        path: self.file.path.clone(),
-                        source: e,
-                    })?
+                decode_cram_container(
+                    reader,
+                    &self.file.repository,
+                    self.file.ref_map.header(),
+                    &self.file.path,
+                    record.offset(),
+                )?
             };
-            if decoded == 0 {
-                return Ok(true);
-            }
+            let records = match records {
+                None => return Ok(true), // EOF — index exhausted.
+                Some(records) => records,
+            };
 
-            let header = self.file.ref_map.header();
-            let compression_header = container
-                .compression_header()
-                .map_err(|e| self.io_error(e))?;
             let mut converted: Vec<MappedRead> = Vec::new();
-            for slice_result in container.slices() {
-                let slice = slice_result.map_err(|e| self.io_error(e))?;
-                let (core_data_src, external_data_srcs) =
-                    slice.decode_blocks().map_err(|e| self.io_error(e))?;
-                let cram_records = slice
-                    .records(
-                        self.file.repository.clone(),
-                        header,
-                        &compression_header,
-                        &core_data_src,
-                        &external_data_srcs,
-                    )
-                    .map_err(|e| self.io_error(e))?;
-                for cram_record in &cram_records {
-                    let record =
-                        sam::alignment::RecordBuf::try_from_alignment_record(header, cram_record)
-                            .map_err(|e| self.io_error(e))?;
-                    // Shared per-record cascade (contig / overlap / filter
-                    // / convert) — identical to the BAM path.
-                    if let Some(mapped) = classify_segment_record(
-                        &record,
-                        self.target_reference_sequence_id,
-                        &self.segment,
-                        &self.file.filter,
-                        &mut self.filter_counts,
-                        self.file.source_file_index,
-                        &self.file.path,
-                    )? {
-                        converted.push(mapped);
-                    }
+            for record_buf in &records {
+                // Shared per-record cascade (contig / overlap / filter
+                // / convert) — identical to the BAM path.
+                if let Some(mapped) = classify_segment_record(
+                    record_buf,
+                    self.target_reference_sequence_id,
+                    &self.segment,
+                    &self.file.filter,
+                    &mut self.filter_counts,
+                    self.file.source_file_index,
+                    &self.file.path,
+                )? {
+                    converted.push(mapped);
                 }
             }
             self.pending = converted.into_iter();
@@ -923,37 +937,44 @@ impl Drop for CramSegmentReads<'_> {
 /// Default number of decoded CRAM containers a [`CachingCramReader`] keeps.
 /// A locus window overlaps ≤ 2 containers (1 normally, 2 at a boundary); a
 /// third covers forward jitter. See `doc/devel/architecture/ssr_pileup_read_buffer.md`.
+///
+/// Intentionally a fixed constant, not a CLI/runtime knob: it is a pure
+/// speed/memory tradeoff and **does not affect the `.ssr.psp` output** (decode
+/// count varies with the cap, decoded records do not), so it is neither exposed
+/// nor recorded in the artefact header.
 pub(crate) const DEFAULT_MAX_CACHED_CONTAINERS: usize = 3;
 
 /// A tiny FIFO cache of decoded CRAM containers, keyed by container file
 /// offset. Each entry is the container's **unfiltered** decoded records (all
 /// of them — filtering happens per window in [`CachingCramReader`]), shared by
-/// `Arc` so a served window can outlive an eviction.
+/// `Arc<[_]>` so a served window can outlive an eviction. `get`/`insert` scan
+/// linearly: intentional at this `capacity` (a handful of entries), where a
+/// linear scan over a `VecDeque` beats a map's hashing + indirection.
 struct ContainerCache {
-    cap: usize,
-    entries: VecDeque<(u64, Arc<Vec<sam::alignment::RecordBuf>>)>,
+    capacity: usize,
+    entries: VecDeque<(u64, Arc<[sam::alignment::RecordBuf]>)>,
 }
 
 impl ContainerCache {
-    fn new(cap: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            cap: cap.max(1),
+            capacity: capacity.max(1),
             entries: VecDeque::new(),
         }
     }
 
-    fn get(&self, offset: u64) -> Option<Arc<Vec<sam::alignment::RecordBuf>>> {
+    fn get(&self, offset: u64) -> Option<Arc<[sam::alignment::RecordBuf]>> {
         self.entries
             .iter()
             .find(|(o, _)| *o == offset)
             .map(|(_, v)| Arc::clone(v))
     }
 
-    fn insert(&mut self, offset: u64, value: Arc<Vec<sam::alignment::RecordBuf>>) {
+    fn insert(&mut self, offset: u64, value: Arc<[sam::alignment::RecordBuf]>) {
         if self.entries.iter().any(|(o, _)| *o == offset) {
             return;
         }
-        if self.entries.len() >= self.cap {
+        if self.entries.len() >= self.capacity {
             self.entries.pop_front();
         }
         self.entries.push_back((offset, value));
@@ -968,8 +989,9 @@ impl ContainerCache {
 ///
 /// **Not shared between threads** — it owns its file handle and cache, so it
 /// needs no locking. Construct one per worker (see
-/// [`CramFile::caching_reader`]); it shares the index / header / repository /
-/// filter with the originating [`CramFile`] via `Arc`. Design + rationale:
+/// [`CramFile::caching_reader`]); it shares the index / header via `Arc`, plus a
+/// clone-shared `repository` and the `Copy` `filter`, with the originating
+/// [`CramFile`]. Design + rationale:
 /// `doc/devel/architecture/ssr_pileup_read_buffer.md`.
 pub(crate) struct CachingCramReader {
     /// Opened lazily on the first decode so construction is infallible (the
@@ -985,13 +1007,6 @@ pub(crate) struct CachingCramReader {
 }
 
 impl CachingCramReader {
-    fn io_error(&self, source: io::Error) -> AlignmentInputError {
-        AlignmentInputError::Io {
-            path: self.path.clone(),
-            source,
-        }
-    }
-
     /// Reads overlapping `[start, end]` on `chrom`, plus the **complete** filter
     /// tally over that window — byte-identical to
     /// [`CramFile::get_reads_from_segment`] drained to exhaustion. Decodes each
@@ -1029,6 +1044,13 @@ impl CachingCramReader {
             }
 
             let decoded = self.get_or_decode(record.offset())?;
+            if decoded.is_empty() {
+                // Empty decode == end-of-stream (`read_container` read 0) — stop
+                // the walk, matching `CramSegmentReads::refill`'s `Ok(true)`. (A
+                // decoded-but-record-less container is not a real CRAM shape, so
+                // this never short-stops a live container.)
+                break;
+            }
             for record_buf in decoded.iter() {
                 if let Some(mapped) = classify_segment_record(
                     record_buf,
@@ -1048,23 +1070,23 @@ impl CachingCramReader {
     }
 
     /// The decoded records of the container at `offset`, from cache or by
-    /// decoding (and caching) it.
+    /// decoding (and caching) it. An empty slice means end-of-stream (the shared
+    /// helper read 0 — see [`decode_cram_container`]).
     fn get_or_decode(
         &mut self,
         offset: u64,
-    ) -> Result<Arc<Vec<sam::alignment::RecordBuf>>, AlignmentInputError> {
+    ) -> Result<Arc<[sam::alignment::RecordBuf]>, AlignmentInputError> {
         if let Some(hit) = self.cache.get(offset) {
             return Ok(hit);
         }
-        let decoded = Arc::new(self.decode_container(offset)?);
+        let decoded: Arc<[sam::alignment::RecordBuf]> =
+            self.decode_container(offset)?.unwrap_or_default().into();
         self.cache.insert(offset, Arc::clone(&decoded));
         Ok(decoded)
     }
 
-    /// Decode one container (all its slices) at `offset` into owned `RecordBuf`s
-    /// — unfiltered; the same decode path `CramSegmentReads::refill` runs, minus
-    /// the per-record classify (which the caller applies per window).
-    /// Open the underlying reader if not yet open (lazy first-use).
+    /// Open the underlying reader if not yet open (lazy first-use), so
+    /// construction stays infallible and I/O-free.
     fn ensure_open(&mut self) -> Result<(), AlignmentInputError> {
         if self.reader.is_none() {
             let (reader, _header) =
@@ -1074,60 +1096,24 @@ impl CachingCramReader {
         Ok(())
     }
 
+    /// Decode the container at `offset` into owned `RecordBuf`s — unfiltered (the
+    /// caller classifies per window). `Ok(None)` at end-of-stream. Delegates to
+    /// the shared [`decode_cram_container`] so the per-call and decode-once paths
+    /// cannot drift.
     fn decode_container(
         &mut self,
         offset: u64,
-    ) -> Result<Vec<sam::alignment::RecordBuf>, AlignmentInputError> {
+    ) -> Result<Option<Vec<sam::alignment::RecordBuf>>, AlignmentInputError> {
         self.ensure_open()?;
-        let mut container = cram::io::reader::Container::default();
-        {
-            // Borrow only `self.reader` (mut) and `self.path` (shared) — disjoint
-            // fields, so the inline error construction is allowed alongside.
-            let reader = self.reader.as_mut().expect("opened by ensure_open");
-            reader
-                .seek(SeekFrom::Start(offset))
-                .map_err(|e| AlignmentInputError::Io {
-                    path: self.path.clone(),
-                    source: e,
-                })?;
-            let decoded =
-                reader
-                    .read_container(&mut container)
-                    .map_err(|e| AlignmentInputError::Io {
-                        path: self.path.clone(),
-                        source: e,
-                    })?;
-            if decoded == 0 {
-                return Ok(Vec::new());
-            }
-        }
-
-        let header = self.ref_map.header();
-        let compression_header = container
-            .compression_header()
-            .map_err(|e| self.io_error(e))?;
-        let mut out = Vec::new();
-        for slice_result in container.slices() {
-            let slice = slice_result.map_err(|e| self.io_error(e))?;
-            let (core_data_src, external_data_srcs) =
-                slice.decode_blocks().map_err(|e| self.io_error(e))?;
-            let cram_records = slice
-                .records(
-                    self.repository.clone(),
-                    header,
-                    &compression_header,
-                    &core_data_src,
-                    &external_data_srcs,
-                )
-                .map_err(|e| self.io_error(e))?;
-            for cram_record in &cram_records {
-                out.push(
-                    sam::alignment::RecordBuf::try_from_alignment_record(header, cram_record)
-                        .map_err(|e| self.io_error(e))?,
-                );
-            }
-        }
-        Ok(out)
+        // PANIC-FREE: `ensure_open` populated `self.reader` immediately above.
+        let reader = self.reader.as_mut().expect("opened by ensure_open");
+        decode_cram_container(
+            reader,
+            &self.repository,
+            self.ref_map.header(),
+            &self.path,
+            offset,
+        )
     }
 }
 
@@ -1294,6 +1280,43 @@ mod tests {
         // threads. A regression that made a field non-`Sync` (e.g. a
         // `RefCell` in the pool) would fail to compile here.
         assert_sync::<AlignmentFile>();
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn worker_reader_is_send() {
+        // `map_init` hands each `WorkerReader` to a rayon worker, so it must be
+        // `Send`. A future non-`Send` field would otherwise surface as a deep
+        // generic error at the driver call site; pin it to this named test.
+        assert_send::<WorkerReader<'static>>();
+    }
+
+    #[test]
+    fn container_cache_evicts_oldest_over_capacity() {
+        let mut cache = ContainerCache::new(3);
+        // Entry for offset N holds N records, so length identifies the entry.
+        let entry = |n: u64| -> Arc<[RecordBuf]> {
+            (0..n).map(|_| RecordBuf::default()).collect()
+        };
+        for off in 1..=4u64 {
+            cache.insert(off, entry(off));
+        }
+        assert!(cache.get(1).is_none(), "oldest (offset 1) must be evicted");
+        assert_eq!(cache.get(2).map(|v| v.len()), Some(2));
+        assert_eq!(cache.get(3).map(|v| v.len()), Some(3));
+        assert_eq!(cache.get(4).map(|v| v.len()), Some(4));
+    }
+
+    #[test]
+    fn container_cache_insert_is_idempotent_on_repeat_offset() {
+        let mut cache = ContainerCache::new(3);
+        let first: Arc<[RecordBuf]> = Vec::new().into(); // 0 records
+        let second: Arc<[RecordBuf]> = vec![RecordBuf::default()].into(); // 1 record
+        cache.insert(7, Arc::clone(&first));
+        cache.insert(7, Arc::clone(&second)); // ignored — offset already cached
+        let got = cache.get(7).expect("offset 7 present");
+        assert_eq!(got.len(), 0, "the first insert wins; the repeat is dropped");
     }
 
     // --- BAM fixtures -------------------------------------------------

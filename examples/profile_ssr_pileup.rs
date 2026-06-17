@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Args: `[seconds] [period] [units] [depth] [window] [clip_units]`
-//! (defaults: 30s, dinucleotide, units=15, depth=30, window=10, clip=0).
+//! (defaults: 30s, dinucleotide, units=15, depth=30, window=6, clip=0).
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ fn main() {
     let period: usize = arg(&args, 2, 2);
     let units: u16 = arg(&args, 3, 15);
     let depth: usize = arg(&args, 4, 30);
-    let window: u16 = arg(&args, 5, 10);
+    let window: u16 = arg(&args, 5, 6);
     let clip: u16 = arg(&args, 6, 0);
 
     let workload = build_synthetic_workload(period, units, 50, depth, window, clip);

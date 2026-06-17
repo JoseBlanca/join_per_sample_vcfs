@@ -337,9 +337,9 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Manual fixture builder for the fetch-path perf measurement: filter a
-    /// catalog to a BED's regions so every surviving locus has read coverage
-    /// (a "dense" catalog). Paths via env. Run:
+    /// Manual fixture builder — **not a CI regression test** (env-gated). Filters
+    /// a catalog to a BED's regions so every surviving locus has read coverage
+    /// (a "dense" catalog), for the fetch-path perf measurement. Paths via env. Run:
     /// `PVC_CATALOG_IN=a.ssr.catalog PVC_REGIONS=r.bed PVC_CATALOG_OUT=b.ssr.catalog \
     ///   cargo test --release filter_catalog_to_regions -- --ignored --nocapture`
     #[test]
