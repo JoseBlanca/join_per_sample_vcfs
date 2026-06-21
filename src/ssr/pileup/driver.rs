@@ -299,7 +299,7 @@ fn build_ssr_writer_header(
         ParameterValue::Integer(i64::from(catalog.params.flank_bp)),
     );
     parameters.insert(
-        "catalog_reference_md5".to_string(),
+        crate::psp::registry_ssr::CATALOG_REFERENCE_MD5_PARAM.to_string(),
         ParameterValue::String(catalog.reference_md5.clone()),
     );
     if let Some(mapq) = cfg.filter.min_mapq {

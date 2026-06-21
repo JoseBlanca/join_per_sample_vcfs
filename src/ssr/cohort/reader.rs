@@ -33,6 +33,14 @@ pub(crate) enum SsrCohortReadError {
     /// remap — the file and the catalog/cohort disagree on the chromosome table.
     #[error("record chromosome id {per_file_id} is outside the chromosome remap (len {remap_len})")]
     ChromIdOutOfRange { per_file_id: u32, remap_len: usize },
+    /// The merger (walking the sorted catalog) asked for a locus *past* one this
+    /// sample still holds — so the sample contains a locus the catalog does not
+    /// list, i.e. it was genotyped against a different catalog.
+    #[error(
+        "sample contains locus {held:?} not present in the catalog \
+         (asked for {asked:?}; built against a different catalog?)"
+    )]
+    LocusNotInCatalog { held: LocusId, asked: LocusId },
 }
 
 /// A per-sample coordinate cursor over one `.ssr.psp`: ask it for a locus (in
@@ -82,10 +90,12 @@ impl<R: Read + Seek> SampleEvidenceCursor<R> {
     /// block refill, so it is wrapped in a `Result` here.)
     ///
     /// Comparing `q` to the held front gives three outcomes: `q == held` → return it
-    /// and advance; `q < held` → Absent (the sample lacks `q`); `q > held` → the merger
-    /// walked past a locus this sample *has* (out-of-order, or catalog/sample drift) →
-    /// panic. A rewind (`q <= last_query`) is caught by the guard *before* the match,
-    /// so the `q < held` arm can only mean a forward Absent — never a backwards step.
+    /// and advance; `q < held` → Absent (the sample lacks `q`); `q > held` → the sample
+    /// holds a locus the (sorted) catalog walked past, i.e. it was built against a
+    /// different catalog → a hard [`SsrCohortReadError::LocusNotInCatalog`]. A rewind
+    /// (`q <= last_query`) is caught by the `debug_assert` before the match — the merger
+    /// validates catalog monotonicity, so a rewind cannot occur from on-disk data and
+    /// this guard is belt-and-suspenders only.
     pub(crate) fn evidence_at(
         &mut self,
         q: LocusId,
@@ -98,18 +108,22 @@ impl<R: Read + Seek> SampleEvidenceCursor<R> {
         );
         self.last_query = Some(q);
 
-        match self.held.as_ref().map(|(front, _)| q.cmp(front)) {
+        let front = self.held.as_ref().map(|(locus, _)| *locus);
+        match front.map(|f| q.cmp(&f)) {
             None => Ok(None),                 // exhausted → Absent forever after
             Some(Ordering::Less) => Ok(None), // forward, sample lacks q → Absent
             Some(Ordering::Equal) => {
+                // PANIC-FREE: `Equal` is only produced when `front` (a clone of
+                // `self.held`) is `Some`, so `held` is `Some` here.
                 let (_, evidence) = self.held.take().expect("held is Some on Equal");
                 self.advance()?; // preload the next stored locus
                 Ok(Some(evidence))
             }
-            Some(Ordering::Greater) => panic!(
-                "merger skipped a stored locus this sample has: asked {q:?}, holding {:?}",
-                self.held.as_ref().map(|(front, _)| front)
-            ),
+            Some(Ordering::Greater) => Err(SsrCohortReadError::LocusNotInCatalog {
+                // PANIC-FREE: any `Some(Ordering::_)` means `front` was `Some`.
+                held: front.expect("front is Some on Greater"),
+                asked: q,
+            }),
         }
     }
 
@@ -137,11 +151,17 @@ impl<R: Read + Seek> SampleEvidenceCursor<R> {
                 remap_len: self.chrom_remap.len(),
             },
         )?;
-        debug_assert!(record.start >= 1, "container coordinates are 1-based");
+        // The SSR decoder rejects `start == 0` / `span == 0` on read
+        // (`registry_ssr` coordinate guards), so `start >= 1` and `end > start`
+        // hold here and neither subtraction can underflow.
+        debug_assert!(
+            record.start >= 1 && record.end > record.start,
+            "decoder guarantees well-formed 1-based coordinates"
+        );
         let locus = LocusId {
             chrom_id,
-            start: record.start - 1, // 1-based inclusive → 0-based inclusive
-            end: record.end - 1,     // 1-based exclusive → 0-based exclusive
+            start: record.start - 1, // 1-based start → 0-based start
+            end: record.end - 1,     // 1-based exclusive end → 0-based exclusive end
         };
         let evidence = SampleEvidence {
             seq_counts: record.observed,
@@ -292,6 +312,41 @@ mod tests {
         assert_eq!(e.qc.depth, 30);
     }
 
+    /// Pins the Stage-1 writer's `+1` coordinate shift against the cursor's `-1`:
+    /// a 0-based tally written through the *real* `to_container_record` and read back
+    /// through the cursor must recover its original 0-based coordinates. Catches a
+    /// drift on either side that the hand-written fixtures cannot.
+    #[test]
+    fn stage1_to_cohort_coordinate_round_trip() {
+        use crate::ssr::pileup::driver::to_container_record;
+        use crate::ssr::pileup::locus_tally::SsrLocusObs;
+        use std::collections::HashMap;
+
+        let tally = SsrLocusObs {
+            chrom: "chr1".into(),
+            start: 16, // 0-based half-open [16, 22)
+            end: 22,
+            depth: 9,
+            n_filtered: 1,
+            mapped_reads: 10,
+            n_low_quality: 0,
+            n_border_off_end: 0,
+            observed: obs(&[(b"CACACA", 9)]),
+        };
+        let name_to_id = HashMap::from([("chr1", 0u32)]);
+        let container = to_container_record(tally, &name_to_id).unwrap();
+
+        let reader = PspReader::new(Cursor::new(ssr_psp(&[container], 64))).unwrap();
+        let mut c = SampleEvidenceCursor::new(reader, vec![0, 1].into()).unwrap();
+
+        let ev = c
+            .evidence_at(locus(0, 16, 22)) // original 0-based coordinates
+            .unwrap()
+            .expect("the round-tripped locus is present at its original coordinates");
+        assert_eq!(ev.seq_counts, obs(&[(b"CACACA", 9)]));
+        assert_eq!(ev.qc.depth, 9);
+    }
+
     #[test]
     fn crosses_block_boundaries() {
         // Spaced-out starts + small window grid → distinct blocks.
@@ -339,12 +394,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "skipped a stored locus")]
-    fn skipping_a_held_locus_panics() {
+    fn skipping_a_held_locus_is_a_hard_error() {
         let mut c = cursor(&[rec(0, 51, 57, obs(&[(b"CA", 1)]))], 64, &[0, 1]);
-        // held = 0-based [50,56]; asking ahead of it (q > held) means the merger never
-        // asked for a locus this sample has.
-        let _ = c.evidence_at(locus(0, 60, 66));
+        // held = 0-based [50,56]; asking ahead (q > held) means the sample holds a
+        // locus the catalog lacks → typed hard error, not a panic.
+        let err = c.evidence_at(locus(0, 60, 66)).unwrap_err();
+        assert!(matches!(err, SsrCohortReadError::LocusNotInCatalog { .. }));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::io::Cursor;
 
 use crate::psp::PspReader;
 use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader};
-use crate::psp::registry_ssr::{SsrKind, SsrLocusRecord};
+use crate::psp::registry_ssr::{CATALOG_REFERENCE_MD5_PARAM, SsrKind, SsrLocusRecord};
 use crate::psp::test_fixtures::writer_header;
 use crate::psp::writer::PspWriter;
 use crate::ssr::catalog::CatalogParams;
@@ -14,9 +14,6 @@ use crate::ssr::types::{Locus, Motif};
 
 /// The reference md5 the fixtures bind catalog ↔ `.ssr.psp` on.
 pub(crate) const REF_MD5: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-/// The catalog-binding header parameter (mirrors Stage-1's writer).
-pub(crate) const CATALOG_MD5_PARAM: &str = "catalog_reference_md5";
 
 pub(crate) fn obs(pairs: &[(&[u8], u32)]) -> Vec<(Box<[u8]>, u32)> {
     pairs
@@ -72,7 +69,7 @@ pub(crate) fn ssr_header(chroms: &[&str], cat_md5: &str) -> WriterHeader {
         })
         .collect();
     header.writer.parameters.insert(
-        CATALOG_MD5_PARAM.to_string(),
+        CATALOG_REFERENCE_MD5_PARAM.to_string(),
         ParameterValue::String(cat_md5.to_string()),
     );
     header
@@ -82,7 +79,7 @@ pub(crate) fn ssr_header(chroms: &[&str], cat_md5: &str) -> WriterHeader {
 /// missing-md5 rejection test.
 pub(crate) fn ssr_header_without_md5(chroms: &[&str]) -> WriterHeader {
     let mut header = ssr_header(chroms, REF_MD5);
-    header.writer.parameters.remove(CATALOG_MD5_PARAM);
+    header.writer.parameters.remove(CATALOG_REFERENCE_MD5_PARAM);
     header
 }
 

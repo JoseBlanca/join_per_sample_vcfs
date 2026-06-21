@@ -20,15 +20,12 @@ use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::psp::header::ParameterValue;
+use crate::psp::registry_ssr::CATALOG_REFERENCE_MD5_PARAM;
 use crate::psp::{PspReadError, PspReader};
 use crate::ssr::catalog::CatalogError;
 use crate::ssr::catalog::io::CatalogReader;
 use crate::ssr::cohort::reader::{SampleEvidenceCursor, SsrCohortReadError};
 use crate::ssr::cohort::types::{CohortLocus, LocusId};
-
-/// The header parameter every `.ssr.psp` records naming the catalog it was built
-/// against (Stage-1 writes the catalog's `reference_md5` here).
-const CATALOG_MD5_PARAM: &str = "catalog_reference_md5";
 
 /// Errors from assembling or running the cohort merge.
 #[derive(Debug, thiserror::Error)]
@@ -43,7 +40,7 @@ pub(crate) enum SsrMergeError {
     #[error("input {path:?} is not an SSR .psp (kind = {kind:?})")]
     NotSsr { path: String, kind: String },
     /// An input is missing the catalog-binding header parameter.
-    #[error("input {path:?} is missing the {CATALOG_MD5_PARAM:?} header parameter")]
+    #[error("input {path:?} is missing the {CATALOG_REFERENCE_MD5_PARAM:?} header parameter")]
     MissingCatalogMd5 { path: String },
     /// An input was built against a different catalog.
     #[error(
@@ -63,6 +60,10 @@ pub(crate) enum SsrMergeError {
     /// A catalog locus sits on a chromosome no input declares.
     #[error("catalog locus on chromosome {chrom:?}, which no input declares")]
     UnknownCatalogChrom { chrom: String },
+    /// The catalog is not strictly coordinate-sorted in the cohort-global chromosome
+    /// order — the merge (and every cursor's monotonic contract) requires it.
+    #[error("catalog is not coordinate-sorted: locus {at:?} does not follow {prev:?}")]
+    UnsortedCatalog { prev: LocusId, at: LocusId },
     /// Opening an input file failed.
     #[error("opening {path:?}")]
     Open {
@@ -77,9 +78,14 @@ pub(crate) enum SsrMergeError {
         #[source]
         source: PspReadError,
     },
-    /// Streaming a sample's evidence failed.
-    #[error("streaming sample evidence")]
-    Read(#[from] SsrCohortReadError),
+    /// Reading a sample's evidence failed — at open or while streaming. Names the
+    /// offending input so a cohort of many files points at the right one.
+    #[error("reading sample {sample:?}")]
+    Read {
+        sample: String,
+        #[source]
+        source: SsrCohortReadError,
+    },
 }
 
 /// The cohort producer: a catalog-driven k-way merge over N per-sample cursors,
@@ -89,9 +95,14 @@ pub(crate) struct CohortMerger<R: Read + Seek, C: Read> {
     catalog: CatalogReader<C>,
     /// One cursor per input sample, indexed by cohort sample index.
     cursors: Vec<SampleEvidenceCursor<R>>,
+    /// Per-sample labels (paths/names), parallel to `cursors` — for error messages.
+    labels: Vec<String>,
     /// Chromosome name → cohort-global id (the canonical order, taken from the shared
     /// chromosome table). Maps catalog loci into the `LocusId` frame.
     name_to_global: HashMap<String, u32>,
+    /// The previous catalog locus visited — to enforce that the catalog is strictly
+    /// coordinate-sorted (the cursor's monotonic precondition).
+    prev_locus: Option<LocusId>,
     /// Next emitted-locus sequence number (monotonic over *emitted* loci).
     next_seq: u64,
 }
@@ -127,6 +138,7 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
             .collect();
 
         let mut cursors = Vec::with_capacity(inputs.len());
+        let mut labels = Vec::with_capacity(inputs.len());
         for (path, reader) in inputs {
             let header = reader.header();
             if header.kind != "ssr" {
@@ -135,7 +147,7 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
                     kind: header.kind.clone(),
                 });
             }
-            match header.writer.parameters.get(CATALOG_MD5_PARAM) {
+            match header.writer.parameters.get(CATALOG_REFERENCE_MD5_PARAM) {
                 Some(ParameterValue::String(found)) if *found == expected_md5 => {}
                 Some(ParameterValue::String(found)) => {
                     return Err(SsrMergeError::CatalogMismatch {
@@ -144,6 +156,8 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
                         found: found.clone(),
                     });
                 }
+                // REVIEW ON UPGRADE: absent, or present-but-not-a-String (a future
+                // `ParameterValue` variant), is treated as "missing the binding".
                 _ => return Err(SsrMergeError::MissingCatalogMd5 { path }),
             }
 
@@ -160,13 +174,23 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
                 }
             }
 
-            cursors.push(SampleEvidenceCursor::new(reader, remap.into_boxed_slice())?);
+            let cursor =
+                SampleEvidenceCursor::new(reader, remap.into_boxed_slice()).map_err(|source| {
+                    SsrMergeError::Read {
+                        sample: path.clone(),
+                        source,
+                    }
+                })?;
+            cursors.push(cursor);
+            labels.push(path);
         }
 
         Ok(Self {
             catalog,
             cursors,
+            labels,
             name_to_global,
+            prev_locus: None,
             next_seq: 0,
         })
     }
@@ -193,10 +217,27 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
                 end: locus.end(),
             };
 
+            // Enforce the strictly-ascending catalog contract before asking any cursor
+            // (an out-of-order query would otherwise trip the cursor's monotonic guard).
+            if let Some(prev) = self.prev_locus
+                && locus_id <= prev
+            {
+                return Err(SsrMergeError::UnsortedCatalog { prev, at: locus_id });
+            }
+            self.prev_locus = Some(locus_id);
+
             let mut cohort =
                 CohortLocus::new(locus_id, locus.motif(), Box::from(locus.ref_bytes()));
+            let labels = &self.labels;
             for (sample_idx, cursor) in self.cursors.iter_mut().enumerate() {
-                if let Some(evidence) = cursor.evidence_at(locus_id)? {
+                let evidence =
+                    cursor
+                        .evidence_at(locus_id)
+                        .map_err(|source| SsrMergeError::Read {
+                            sample: labels[sample_idx].clone(),
+                            source,
+                        })?;
+                if let Some(evidence) = evidence {
                     cohort.push(sample_idx as u32, evidence);
                 }
             }
@@ -212,6 +253,10 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
 
     /// Cohort-global chromosome names, indexed by global id (the inverse of
     /// `name_to_global`) — for labelling output.
+    ///
+    /// Relies on `name_to_global`'s values being a dense `0..len` permutation, which
+    /// holds because `from_parts` assigns them via `enumerate()` over the chromosome
+    /// table; a different id assignment would leave gaps (empty names) here.
     pub(crate) fn chrom_names(&self) -> Vec<String> {
         let mut names = vec![String::new(); self.name_to_global.len()];
         for (name, &id) in &self.name_to_global {
@@ -356,7 +401,7 @@ mod tests {
         let (seq, cl) = merger.next().unwrap().unwrap();
         assert_eq!(seq, 0);
         assert_eq!(cl.motif.as_bytes(), b"CA");
-        assert_eq!(cl.ref_tract.as_ref(), b"GGGGGGCACACATTTTTT");
+        assert_eq!(cl.ref_frame.as_ref(), b"GGGGGGCACACATTTTTT");
         assert_eq!(cl.present, vec![0]);
         assert_eq!(
             cl.samples[0].seq_counts,
@@ -448,6 +493,21 @@ mod tests {
         let err = merger.next().unwrap().unwrap_err();
         assert!(
             matches!(err, SsrMergeError::UnknownCatalogChrom { ref chrom } if chrom == "chr2"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn errors_on_an_unsorted_catalog() {
+        // Loci written out of coordinate order (the catalog writer does not sort).
+        let loci = [loc("chr1", 60), loc("chr1", 16)];
+        let catalog = catalog_reader(REF_MD5, &loci);
+        let a = reader(ssr_psp(ssr_header(&["chr1"], REF_MD5), &[]));
+        let mut merger = CohortMerger::from_parts(catalog, vec![("A".into(), a)]).unwrap();
+        // The second locus regresses → hard error (before any cursor is asked).
+        let err = merger.next().unwrap().unwrap_err();
+        assert!(
+            matches!(err, SsrMergeError::UnsortedCatalog { .. }),
             "got {err:?}"
         );
     }

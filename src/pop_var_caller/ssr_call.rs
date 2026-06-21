@@ -1,11 +1,13 @@
 //! `ssr-call` subcommand — Stage 2 of the SSR caller. Reads the per-sample
 //! `.ssr.psp` evidence files produced by `ssr-pileup`, merges them by catalog locus
-//! across the cohort, and (Phases 2–3) genotypes each locus into a multi-sample VCF.
+//! across the cohort, and writes the result.
 //!
-//! The struct below is the authoritative knob list; [`run_ssr_call`] will translate
-//! it into the cohort driver config. **Phase 1 of the build is scaffolding only** —
-//! [`run_ssr_call`] is a stub until the reader/merger lands (build plan
-//! `doc/devel/implementation_plans/ssr_call_reading.md`).
+//! The struct below is the authoritative knob list; [`run_ssr_call`] translates it
+//! into the cohort driver config. **The genotyping EM + VCF are not built yet** — the
+//! driver currently writes a catalog-ordered **TSV dump** of the merged evidence
+//! (a reading-layer inspection tool + VCF placeholder), and `--threads` /
+//! `--queue-depth` are reserved (the run is single-threaded). Build plan:
+//! `doc/devel/implementation_plans/ssr_call_reading.md`.
 
 use std::path::PathBuf;
 
@@ -27,20 +29,24 @@ pub struct SsrCallArgs {
     #[arg(long)]
     pub catalog: PathBuf,
 
-    /// Output multi-sample VCF path.
+    /// Output path. Currently a catalog-ordered TSV dump of the merged evidence;
+    /// the multi-sample VCF lands with the genotyping EM.
     #[arg(long)]
     pub output: PathBuf,
 
-    /// Worker threads for the EM pool. The output is identical for any value
-    /// (catalog-ordered, frozen-parameter genotyping).
-    #[arg(long, default_value_t = 4, help_heading = "Advanced")]
+    /// RESERVED — EM worker threads. The genotyping EM is not built yet, so the run is
+    /// single-threaded and this value currently has no effect.
+    #[arg(long, default_value_t = DEFAULT_THREADS, help_heading = "Advanced")]
     pub threads: usize,
 
-    /// Bounded-queue depth between the merge producer and the EM workers — the peak
-    /// resident-loci knob (trades throughput for RSS).
+    /// RESERVED — bounded producer→worker queue depth. Not yet wired (single-threaded);
+    /// currently has no effect.
     #[arg(long, default_value_t = DEFAULT_QUEUE_DEPTH, help_heading = "Advanced")]
     pub queue_depth: usize,
 }
+
+/// Default EM worker thread count (reserved until the EM lands).
+pub const DEFAULT_THREADS: usize = 4;
 
 /// Default bounded-queue depth (Q-R3; a starting point to be measured against a real
 /// run, arch `ssr_call_reading.md` §5).
@@ -66,6 +72,23 @@ pub enum SsrCallCliError {
 /// a catalog-ordered TSV dump of the reading layer to `--output`. The genotyping EM +
 /// VCF land in a later phase; `--threads` / `--queue-depth` are reserved.
 pub fn run_ssr_call(args: &SsrCallArgs) -> Result<(), SsrCallCliError> {
+    // The reserved flags currently have no effect; say so loudly rather than letting a
+    // user believe `--threads 32` did something.
+    if args.threads != DEFAULT_THREADS {
+        eprintln!(
+            "warning: --threads {} has no effect yet (ssr-call is single-threaded \
+             until the genotyping EM lands)",
+            args.threads
+        );
+    }
+    if args.queue_depth != DEFAULT_QUEUE_DEPTH {
+        eprintln!(
+            "warning: --queue-depth {} has no effect yet (the producer→worker queue \
+             is not wired until the genotyping EM lands)",
+            args.queue_depth
+        );
+    }
+
     let config = SsrCallConfig {
         catalog: args.catalog.clone(),
         psp_files: args.psp_files.clone(),

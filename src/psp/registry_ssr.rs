@@ -34,6 +34,12 @@ use super::registry::{Cardinality, ColumnDef, ColumnPayload, ElementType, MAX_AL
 /// The SSR schema-family `kind` tag (header §10.3).
 pub const SSR_KIND: &str = "ssr";
 
+/// The `.ssr.psp` header parameter binding a file to its catalog: Stage-1
+/// (`ssr-pileup`) writes the catalog's `reference_md5` here, and Stage-2 (`ssr-call`)
+/// checks every input's value matches the catalog it was given (the same-catalog
+/// precondition). Single source of truth for both stages.
+pub const CATALOG_REFERENCE_MD5_PARAM: &str = "catalog_reference_md5";
+
 /// Capacity hints for the per-locus / per-observation / byte buffers. SSR blocks
 /// hold far fewer records than SNP (loci are sparse); modest fixed hints suffice.
 const INITIAL_LOCI_HINT: usize = 256;
@@ -570,6 +576,23 @@ impl BlockDecoder for SsrDecoder {
         };
         let end = start.saturating_add(span);
 
+        // Defensive (read side): the writer already rejects these
+        // (`PosOutOfRange` / `LocusEndOutOfRange`), but a `.ssr.psp` from another
+        // tool or a corrupted one could still carry them — and downstream readers
+        // (the cohort `ssr-call` reader's 1-based→0-based shift) underflow on
+        // `start == 0`. Reject here so every reader sees only well-formed,
+        // non-empty 1-based intervals.
+        if start == 0 {
+            return Some(Err(PspReadError::BlockStructureInvalid {
+                context: "ssr record start is 0 (coordinates are 1-based)",
+            }));
+        }
+        if span == 0 {
+            return Some(Err(PspReadError::BlockStructureInvalid {
+                context: "ssr record span is 0 (empty interval; end must exceed start)",
+            }));
+        }
+
         let n_here = self.n_obs[i] as usize;
         let obs_start = self.next_obs as usize;
         let obs_end = obs_start + n_here;
@@ -657,6 +680,47 @@ mod tests {
             n_border_off_end: 3,
             observed,
         }
+    }
+
+    /// A loaded single-record decoder with the given `first_pos` and `span`, no
+    /// observations — for exercising the read-side coordinate guards directly
+    /// (the writer refuses to *write* these, so they can't be produced via a
+    /// round-trip).
+    fn one_record_decoder(first_pos: u32, span: u64) -> SsrDecoder {
+        let mut d = SsrDecoder::new_decoder();
+        d.loaded = true;
+        d.n_records = 1;
+        d.first_pos = first_pos;
+        d.delta_start = vec![0];
+        d.span = vec![span];
+        d.n_obs = vec![0];
+        d.depth = vec![0];
+        d.n_filtered = vec![0];
+        d.mapped_reads = vec![0];
+        d.n_low_quality = vec![0];
+        d.n_border_off_end = vec![0];
+        d
+    }
+
+    #[test]
+    fn next_record_rejects_zero_start() {
+        // start == 0 is invalid (coordinates are 1-based) and would underflow the
+        // cohort reader's 1-based->0-based shift.
+        let mut d = one_record_decoder(0, 6);
+        assert!(matches!(
+            d.next_record(),
+            Some(Err(PspReadError::BlockStructureInvalid { .. }))
+        ));
+    }
+
+    #[test]
+    fn next_record_rejects_zero_span() {
+        // span == 0 means end == start (empty interval) — rejected on read.
+        let mut d = one_record_decoder(10, 0);
+        assert!(matches!(
+            d.next_record(),
+            Some(Err(PspReadError::BlockStructureInvalid { .. }))
+        ));
     }
 
     /// SSR columns are well-formed: unique ascending tags, total key coverage.

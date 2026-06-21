@@ -3028,6 +3028,69 @@ mod tests {
         assert!(it.next().is_none(), "poisoned after the mismatch");
     }
 
+    /// The cohort reader drives the owning iterator with `SsrKind`, not `SnpKind` —
+    /// so equivalence with the borrowing iterator must hold on that decoder too,
+    /// across a multi-block file (the SNP-only test above is not enough).
+    #[test]
+    fn owned_records_iter_matches_borrowing_for_ssr_kind() {
+        use crate::psp::registry_ssr::{SsrKind, SsrLocusRecord};
+
+        fn ssr_rec(start: u32) -> SsrLocusRecord {
+            SsrLocusRecord {
+                chrom_id: 0,
+                start,
+                end: start + 6,
+                depth: 1,
+                n_filtered: 0,
+                mapped_reads: 1,
+                n_low_quality: 0,
+                n_border_off_end: 0,
+                observed: vec![(b"CACACA".to_vec().into_boxed_slice(), 1)],
+            }
+        }
+
+        // Spaced-out starts + a small genomic window grid → multiple blocks.
+        let mut w = PspWriter::<_, SsrKind>::new_ssr_with_block_layout(
+            Cursor::new(Vec::new()),
+            writer_header(1),
+            16 * 1024 * 1024,
+            16,
+        )
+        .unwrap();
+        for s in [11u32, 51, 101] {
+            w.write_locus(&ssr_rec(s)).unwrap();
+        }
+        let bytes = w.finish().unwrap().into_inner();
+
+        let mut borrow_reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
+        assert!(
+            borrow_reader.block_index().len() >= 2,
+            "fixture must be multi-block"
+        );
+        let borrowed: Vec<SsrLocusRecord> = borrow_reader
+            .records_of::<SsrKind>()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let owned: Vec<SsrLocusRecord> = PspReader::new(Cursor::new(bytes))
+            .unwrap()
+            .into_records_of::<SsrKind>()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned.len(), 3);
+    }
+
+    #[test]
+    fn owned_records_iter_on_empty_file_yields_none() {
+        let bytes = finish_empty_writer(writer_header(1));
+        let mut it = PspReader::new(Cursor::new(bytes))
+            .unwrap()
+            .into_records_of::<SnpKind>();
+        assert!(it.next().is_none());
+    }
+
     /// (B7) Random-access region query across multiple blocks.
     /// 1000 records on two chromosomes; `region_records(0,
     /// 50_000, 60_000)` (out-of-range on a fixture whose max pos

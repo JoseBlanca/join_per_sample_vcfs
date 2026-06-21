@@ -69,7 +69,7 @@ pub(crate) struct SampleEvidence {
 /// that covered it.
 ///
 /// The catalog supplies the **frame** ([`Self::locus`], [`Self::motif`],
-/// [`Self::ref_tract`]) — a coordinate/alignment frame, **not** an allele claim. The
+/// [`Self::ref_frame`]) — a coordinate/alignment frame, **not** an allele claim. The
 /// cohort evidence is stored **sparse, struct-of-arrays**: [`Self::samples`] holds
 /// only the present samples, and [`Self::present`] is the parallel vector of their
 /// cohort sample indices (`samples[k]` belongs to sample `present[k]`). Absent
@@ -81,8 +81,9 @@ pub(crate) struct CohortLocus {
     pub(crate) locus: LocusId,
     /// The repeat unit (the stutter unit the genotyper's stutter kernel uses).
     pub(crate) motif: Motif,
-    /// Reference tract + flanks: the Δ frame and the alignment frame.
-    pub(crate) ref_tract: Box<[u8]>,
+    /// Reference **tract + flanks** (not just the tract): the Δ frame and the
+    /// alignment frame the genotyper aligns reads against.
+    pub(crate) ref_frame: Box<[u8]>,
     /// Cohort sample indices of the present samples, ascending; parallel to
     /// [`Self::samples`].
     pub(crate) present: Vec<u32>,
@@ -94,11 +95,11 @@ impl CohortLocus {
     /// Start an empty work-item for `locus` with its catalog frame; the merger then
     /// [`push`](Self::push)es each present sample's evidence in ascending sample-index
     /// order.
-    pub(crate) fn new(locus: LocusId, motif: Motif, ref_tract: Box<[u8]>) -> Self {
+    pub(crate) fn new(locus: LocusId, motif: Motif, ref_frame: Box<[u8]>) -> Self {
         Self {
             locus,
             motif,
-            ref_tract,
+            ref_frame,
             present: Vec::new(),
             samples: Vec::new(),
         }

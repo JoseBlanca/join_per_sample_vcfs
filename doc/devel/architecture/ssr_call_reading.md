@@ -8,7 +8,8 @@ work-item, and feed it through the producer→queue→worker→writer topology.*
 two companions:
 
 - [ssr_call_parameters.md](ssr_call_parameters.md) — Phase 2: the pre-pass that
-  freezes `ε` and builds the `θ`/`G₀` priors (the "fixed parameters + priors").
+  freezes `ε` (per sample group) and builds the stutter-shape / stutter-level / `G₀`
+  priors (the "fixed parameters + priors").
 - [ssr_call_genotyping.md](ssr_call_genotyping.md) — Phase 3: candidate assembly,
   the HipSTR likelihood, the per-locus EM, the `F` loop, and the VCF.
 
@@ -106,17 +107,22 @@ product is one sample's `SampleEvidence`, never the locus-wide `CohortLocus`.
 ascending catalog order**. `held` is preloaded in `new` and re-filled after every hit
 (via `advance()`), so the cursor always has its next stored locus ready — or `None`:
 
+Decode can fail lazily on a block refill, so the real return is
+`Result<Option<SampleEvidence>, _>` (the `Option` is Present/Absent; the `Result` is a
+decode/contract error):
+
 ```rust
-fn evidence_at(&mut self, q: LocusId) -> Option<SampleEvidence> {
-    // monotonic guard — q must strictly ascend; catches ANY rewind (sparse or dense)
+fn evidence_at(&mut self, q: LocusId) -> Result<Option<SampleEvidence>, SsrCohortReadError> {
+    // monotonic guard — q must strictly ascend. The merger validates catalog sortedness,
+    // so a rewind can't come from on-disk data; this is belt-and-suspenders (debug only).
     debug_assert!(self.last_query.map_or(true, |p| q > p), "out-of-order / rewind");
     self.last_query = Some(q);
 
     match self.held {                  // held = next stored locus; None once exhausted
-        None               => None,                        // exhausted → Absent forever after
-        Some(f) if q == f  => { let e = self.take_held(); self.advance(); Some(e) }
-        Some(f) if q  < f  => None,                         // forward, sample lacks q → Absent
-        Some(_) /* q > f */ => panic!("merger skipped a stored locus"), // never asked for `held`
+        None               => Ok(None),                       // exhausted → Absent forever after
+        Some(f) if q == f  => { let e = self.take_held(); self.advance()?; Ok(Some(e)) }
+        Some(f) if q  < f  => Ok(None),                        // forward, sample lacks q → Absent
+        Some(_) /* q > f */ => Err(LocusNotInCatalog { .. }),  // sample has a locus the catalog lacks
     }
 }
 ```
@@ -125,9 +131,11 @@ The three outcomes:
 
 1. **`q == held`** → `Some(evidence)`, then `advance()` to preload the next stored
    locus.
-2. **`q > held`** (asked *past* our front) → **error**: the merger walked past a
-   locus *this sample has* without asking for it (out-of-order, or catalog/sample
-   drift). A `panic`/`debug_assert`, never silent — "we should not skip loci."
+2. **`q > held`** (asked *past* our front) → **hard error** (`LocusNotInCatalog`): given
+   the merger walks a *sorted* catalog (it validates this — §4), the only way it asks
+   past a locus this sample holds is that the sample contains a locus the catalog does
+   not — i.e. it was genotyped against a **different catalog**. A typed error, never a
+   panic, never silent — the "same catalog for all samples" violation is a hard error.
 3. **`q < held`** (asked for something *before* our front) → **`None` (Absent)**:
    this sample simply has no record at `q`.
 
@@ -318,15 +326,16 @@ analogs — and why the sketch is short.
   pure transform and the merger consumes blocks strictly in catalog order, so *when* a
   block decodes (and on which thread) affects only timing, never content. (The producer
   is single-threaded by design; the workers' determinism is Phases 2–3's concern,
-  carried by frozen `ε` + per-locus `θ`.)
+  carried by per-sample-group-frozen `ε` + per-locus stutter shape `θ_locus`.)
 
 ---
 
 ## 8. The two-pass question (the one real cross-phase wrinkle)
 
-Phase 2 (the pre-pass) needs to stream loci to estimate `ε` / the `θ_cell` priors
-*before* Phase 3 can genotype any locus. So the merge stream (§4) is consumed
-**twice**: once for the pre-pass, once for genotyping.
+Phase 2 (the pre-pass) needs to stream loci to estimate `ε` (per sample group) / the
+stutter-shape (cohort, per period) + stutter-level (per sample group) priors *before*
+Phase 3 can genotype any locus. So the merge stream (§4) is consumed **twice**: once
+for the pre-pass, once for genotyping.
 
 **RESOLVED: re-read** — reset all cursors and run the merge again for Phase 3. The
 rejected alternative was to **cache** the `CohortLocus` stream in memory between

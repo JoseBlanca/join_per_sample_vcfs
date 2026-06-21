@@ -68,7 +68,7 @@ fn write_dump<R: Read + Seek, C: Read, W: Write>(
 }
 
 /// One TSV row for a locus: coordinates + motif + the present samples, each as
-/// `idx:depth=…,alleles=…`. Pure, so the formatting is unit-testable on its own.
+/// `idx:depth=…,distinct=…`. Pure, so the formatting is unit-testable on its own.
 fn format_locus(cohort: &CohortLocus, chrom_names: &[String]) -> String {
     let chrom = chrom_names
         .get(cohort.locus.chrom_id as usize)
@@ -81,7 +81,7 @@ fn format_locus(cohort: &CohortLocus, chrom_names: &[String]) -> String {
         .zip(&cohort.samples)
         .map(|(idx, evidence)| {
             format!(
-                "{idx}:depth={},alleles={}",
+                "{idx}:depth={},distinct={}",
                 evidence.qc.depth,
                 evidence.seq_counts.len()
             )
@@ -125,7 +125,10 @@ mod tests {
                         .collect(),
                     qc: SsrQc {
                         depth,
-                        ..SsrQc::default()
+                        n_filtered: 0,
+                        mapped_reads: 0,
+                        n_low_quality: 0,
+                        n_border_off_end: 0,
                     },
                 },
             );
@@ -139,7 +142,7 @@ mod tests {
         let cl = cohort_locus(0, 16, &[(0, 30, 1), (2, 12, 3)]);
         assert_eq!(
             format_locus(&cl, &names),
-            "chr1\t16\t22\tCA\t2\t0:depth=30,alleles=1;2:depth=12,alleles=3"
+            "chr1\t16\t22\tCA\t2\t0:depth=30,distinct=1;2:depth=12,distinct=3"
         );
     }
 
@@ -181,9 +184,9 @@ mod tests {
         assert_eq!(
             text,
             "#chrom\tstart\tend\tmotif\tn_present\tsamples\n\
-             chr1\t16\t22\tCA\t1\t0:depth=30,alleles=1\n\
-             chr1\t60\t66\tCA\t1\t1:depth=30,alleles=1\n\
-             chr1\t100\t106\tCA\t2\t0:depth=30,alleles=1;1:depth=30,alleles=1\n"
+             chr1\t16\t22\tCA\t1\t0:depth=30,distinct=1\n\
+             chr1\t60\t66\tCA\t1\t1:depth=30,distinct=1\n\
+             chr1\t100\t106\tCA\t2\t0:depth=30,distinct=1;1:depth=30,distinct=1\n"
         );
     }
 
@@ -217,7 +220,7 @@ mod tests {
         assert_eq!(
             text,
             "#chrom\tstart\tend\tmotif\tn_present\tsamples\n\
-             chr1\t16\t22\tCA\t1\t0:depth=30,alleles=1\n"
+             chr1\t16\t22\tCA\t1\t0:depth=30,distinct=1\n"
         );
     }
 
