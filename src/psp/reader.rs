@@ -367,6 +367,23 @@ impl<R: Read + Seek> PspReader<R> {
         RecordsIter::new(self, RangeClamp::None)
     }
 
+    /// Consume the reader into an **owning**, schema-typed sequential iterator.
+    ///
+    /// [`records_of`](Self::records_of) borrows the reader for the iterator's
+    /// lifetime, so a caller cannot store the reader *and* a live iterator over it
+    /// (that would be self-referential). This variant moves the reader *into* the
+    /// iterator, letting a long-lived consumer (the SSR cohort cursor) hold the reader
+    /// and pull records across many calls. Like `records_of`, it decodes one block at
+    /// a time — never the whole file — and a schema/`kind` mismatch surfaces once on
+    /// the first `next()` then ends.
+    #[allow(private_bounds)]
+    pub fn into_records_of<S: PspKind>(self) -> OwnedRecordsIter<R, S>
+    where
+        S::Decoder: BlockDecoder<Record = S::Record>,
+    {
+        OwnedRecordsIter::new(self)
+    }
+
     /// Iterator over records inside `[start, end]` (inclusive
     /// both ends) on `chrom_id`.
     ///
@@ -953,6 +970,149 @@ where
                 if self.clamp.block_past_window(entry) {
                     return None;
                 }
+            }
+            match self.load_next_block() {
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+/// Owning, schema-typed **sequential** record iterator — [`RecordsIter`]'s state
+/// machine, but owning its [`PspReader`] instead of borrowing it.
+///
+/// The borrowing `RecordsIter` cannot be stored alongside the reader it reads (that
+/// is self-referential), which is exactly what a long-lived per-sample cursor needs.
+/// This type owns the reader, so the cursor can hold it and pull records across many
+/// `next()` calls. It decodes **one block at a time** (the persistent decompressor +
+/// scratch are reused across blocks), so the resident set is one decoded block, not
+/// the whole file. Sequential only — there is no region clamp; callers that want a
+/// window pre-position via the block index themselves.
+///
+/// The block-stepping mirrors `RecordsIter` deliberately, kept as a separate type so
+/// the production SNP `RecordsIter` path is left untouched.
+pub struct OwnedRecordsIter<R: Read + Seek, S: PspKind = SnpKind> {
+    reader: PspReader<R>,
+    /// Index of the next block to load; equals `reader.index.len()` once exhausted.
+    cur_block_idx: usize,
+    /// Whether a block is currently decoded into `decoder`.
+    cur_block_loaded: bool,
+    /// The schema's per-block decoder (owns the decoded block + the per-block cursor).
+    decoder: S::Decoder,
+    /// Sticky: once an error has been yielded, future calls return `None`.
+    poisoned: bool,
+    /// Surfaced once on the first `next()` then poisons — set when `S` disagrees with
+    /// the file's header `kind` (decoding under the wrong schema would be garbage).
+    pending_error: Option<PspReadError>,
+    /// Persistent zstd decompressor reused across every column of every block.
+    decompressor: zstd::bulk::Decompressor<'static>,
+    /// Reusable scratch for compressed / decompressed column bytes and the block
+    /// header grow loop (converge to the largest seen).
+    compressed_scratch: Vec<u8>,
+    decompressed_scratch: Vec<u8>,
+    block_header_buf: Vec<u8>,
+}
+
+#[allow(private_bounds)]
+impl<R: Read + Seek, S: PspKind> OwnedRecordsIter<R, S>
+where
+    S::Decoder: BlockDecoder<Record = S::Record>,
+{
+    fn new(reader: PspReader<R>) -> Self {
+        // Mirrors `RecordsIter::new`: the decompressor allocation is small and only
+        // fails under OOM; the kind/schema check is surfaced as the first item.
+        let decompressor = new_column_decompressor()
+            .expect("zstd::bulk::Decompressor::new is infallible on supported platforms");
+        let pending_error = (S::KIND != reader.header().kind).then(|| PspReadError::KindMismatch {
+            expected: S::KIND,
+            found: reader.header().kind.clone(),
+        });
+        Self {
+            reader,
+            cur_block_idx: 0,
+            cur_block_loaded: false,
+            decoder: S::Decoder::new_decoder(),
+            poisoned: false,
+            pending_error,
+            decompressor,
+            compressed_scratch: Vec::new(),
+            decompressed_scratch: Vec::new(),
+            block_header_buf: Vec::with_capacity(BLOCK_HEADER_INITIAL_CHUNK),
+        }
+    }
+
+    /// Recover the owned reader (e.g. to re-seek for a second pass). Drops the
+    /// current decode state.
+    pub fn into_reader(self) -> PspReader<R> {
+        self.reader
+    }
+
+    /// Seek to the next un-decoded block and decode it into the schema decoder.
+    /// Returns `Ok(false)` when no more blocks remain. Identical framing to
+    /// `RecordsIter::load_next_block`, with the reader owned rather than borrowed.
+    fn load_next_block(&mut self) -> Result<bool, PspReadError> {
+        if self.cur_block_idx >= self.reader.index.len() {
+            return Ok(false);
+        }
+        let entry = self.reader.index[self.cur_block_idx];
+        seek_to_offset(
+            &mut self.reader.source,
+            entry.block_offset,
+            "block start seek",
+        )?;
+        let (block_header, _consumed) =
+            read_block_header(&mut self.reader.source, &mut self.block_header_buf)?;
+        let budget =
+            block_byte_budget(&self.reader.index, &self.reader.trailer, self.cur_block_idx);
+        self.decoder.decode_block(
+            &mut self.reader.source,
+            &block_header,
+            budget,
+            &mut self.decompressor,
+            &mut self.compressed_scratch,
+            &mut self.decompressed_scratch,
+        )?;
+        self.cur_block_loaded = true;
+        Ok(true)
+    }
+}
+
+#[allow(private_bounds)]
+impl<R: Read + Seek, S: PspKind> Iterator for OwnedRecordsIter<R, S>
+where
+    S::Decoder: BlockDecoder<Record = S::Record>,
+{
+    type Item = Result<S::Record, PspReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+        if let Some(err) = self.pending_error.take() {
+            self.poisoned = true;
+            return Some(Err(err));
+        }
+        // Sequential variant of `RecordsIter`'s state machine (no region clamp):
+        // yield from the loaded block, else drop it, advance, decode the next.
+        loop {
+            if self.cur_block_loaded {
+                if let Some(res) = self.decoder.next_record() {
+                    return match res {
+                        Ok(r) => Some(Ok(r)),
+                        Err(e) => {
+                            self.poisoned = true;
+                            Some(Err(e))
+                        }
+                    };
+                }
+                self.cur_block_loaded = false;
+                self.decoder.unload();
+                self.cur_block_idx += 1;
             }
             match self.load_next_block() {
                 Ok(true) => continue,
@@ -2824,6 +2984,48 @@ mod tests {
             writer.write_record(&one_allele_record(0, i, b"A")).unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    /// The owning `into_records_of` yields the same record stream as the borrowing
+    /// `records_of` across a multi-block file — the cohort cursor's foundation must
+    /// not diverge from the production reader.
+    #[test]
+    fn owned_records_iter_matches_borrowing_across_blocks() {
+        let bytes = three_block_chrom0_fixture(4 * 1024);
+
+        let mut borrow_reader = PspReader::new(Cursor::new(bytes.clone())).unwrap();
+        assert!(
+            borrow_reader.block_index().len() >= 2,
+            "fixture must be multi-block"
+        );
+        let borrowed: Vec<PileupRecord> = borrow_reader
+            .records_of::<SnpKind>()
+            .collect::<Result<_, _>>()
+            .expect("borrowing iterator is clean");
+
+        let owning_reader = PspReader::new(Cursor::new(bytes)).unwrap();
+        let owned: Vec<PileupRecord> = owning_reader
+            .into_records_of::<SnpKind>()
+            .collect::<Result<_, _>>()
+            .expect("owning iterator is clean");
+
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned.len(), 300);
+    }
+
+    /// A schema/kind mismatch surfaces once then ends — the owning iterator mirrors
+    /// `records_of`'s poisoning (decoding an SNP file under the SSR schema is refused,
+    /// not silently misdecoded).
+    #[test]
+    fn owned_records_iter_kind_mismatch_yields_one_error_then_none() {
+        let bytes = three_block_chrom0_fixture(4 * 1024); // an SNP (.psp) file
+        let reader = PspReader::new(Cursor::new(bytes)).unwrap();
+        let mut it = reader.into_records_of::<crate::psp::registry_ssr::SsrKind>();
+        assert!(matches!(
+            it.next(),
+            Some(Err(PspReadError::KindMismatch { .. }))
+        ));
+        assert!(it.next().is_none(), "poisoned after the mismatch");
     }
 
     /// (B7) Random-access region query across multiple blocks.

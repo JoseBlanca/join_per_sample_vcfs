@@ -55,7 +55,7 @@ pub use errors::{
     TomlSerError, VarintError,
 };
 pub use index::BlockIndexEntry;
-pub use reader::{BlockColumnReader, BlockColumns, PspReader, RecordsIter};
+pub use reader::{BlockColumnReader, BlockColumns, OwnedRecordsIter, PspReader, RecordsIter};
 // The container-schema abstraction (architecture §10) puts `ColumnDef`
 // in the `pub` [`kind::PspKind`] signatures, so it must be reachable at
 // at least that visibility. Re-exported here from the (otherwise
