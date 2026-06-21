@@ -29,6 +29,12 @@ Skills and agents are instructed to leave it untouched.
 >   single-threaded `driver` (open+merge+write → catalog-ordered TSV dump; topology +
 >   EM/VCF deferred). fmt/clippy `-D warnings` clean; 1159 lib tests (+30). See the SSR
 >   **Stage 2** block below. **Next:** Phase 4 (two-pass re-read), then the genotyping EM/VCF.
+> - **Prior task (2026-06-21):** **Code review of the `ssr-call` reading layer (Phases 0–3)**
+>   (branch `ssr-cohort`, [ssr_call_reading_2026-06-21.md](doc/devel/reports/reviews/ssr_call_reading_2026-06-21.md)).
+>   rust-code-review skill (9 categories). **Request-changes** — 1 Blocker, 5 Major, 8 Minor + Nits;
+>   gates green (fmt/clippy `-D warnings`/doc clean, 1159 lib tests). Cluster: the cursor turns data
+>   conditions into a `panic!`/release-silent-wrong-result and decodes coordinates without overflow
+>   guards. (suggested follow-up: apply fixes — answer the two open questions first.)
 > - **Prior task (2026-06-17):** **ssr-pileup Mark-2 review fixes applied**
 >   (branch `ssr-pileup-mark2`, [fixes_applied_2026-06-17_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-17_v2.md)).
 >   Applied the Mark-2 code review: **all 3 Blockers** + **9 of 12 Majors** + 9 Minors. **B1** doc gate restored
@@ -979,13 +985,15 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
 
 #### Reading & merge layer (Phases 0–3 done; `ssr-call` runnable)
-- **Status:** in-flight (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (cursor) + 2 (merger) + 3 (driver — single-threaded, `ssr-call` runs end-to-end → catalog-ordered TSV dump). Two-pass / prefetch-pool + the genotyping EM/VCF to follow.
+- **Status:** reviewed (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (cursor) + 2 (merger) + 3 (driver — single-threaded, `ssr-call` runs end-to-end → catalog-ordered TSV dump). Two-pass / prefetch-pool + the genotyping EM/VCF to follow.
+- **Latest review:** [ssr_call_reading_2026-06-21.md](doc/devel/reports/reviews/ssr_call_reading_2026-06-21.md) — **Request-changes**: 1 Blocker, 5 Major, 8 Minor + Nits (audit trail `tmp/review_2026-06-21_ssr-call-reading/`). **B1** `evidence_at` panics on a data-reachable sample/catalog locus divergence (should be a typed error); **M1** rewind guard is `debug_assert`-only → silent wrong result in release on an unsorted catalog; **M2** `record.start/end - 1` underflows in release on malformed coords; **M3** the `+1`/`-1` coordinate coupling with the Stage-1 writer is prose-only (no round-trip test); **M4** the duplicated `OwnedRecordsIter` is equivalence-tested on `SnpKind`/happy-path only, not the `SsrKind`/error path it runs on; **M5** `--threads`/`--queue-depth` are silent no-ops with EM-pool help text. Two open questions gate B1/M1/M2 severity (is sample-loci-⊆-catalog + sorted-catalog a caller guarantee; are `.ssr.psp` inputs trusted).
 - **Spec:** [ssr_cohort_mark2.md §4.1](doc/devel/specs/ssr_cohort_mark2.md) (reading & orchestration intent, settled 2026-06-19).
 - **Architecture (settled):** [ssr_call_reading.md](doc/devel/architecture/ssr_call_reading.md) — `SampleEvidenceCursor` (`held` + `last_query` monotonic guard, `evidence_at`), catalog-driven k-way merge → one `CohortLocus` at a time, shared decode-priority pool + prefetched futures (profiling-gated), two-pass re-read. Companions (drafts): [parameters](doc/devel/architecture/ssr_call_parameters.md), [genotyping](doc/devel/architecture/ssr_call_genotyping.md).
 - **Plan:** [ssr_call_reading.md](doc/devel/implementation_plans/ssr_call_reading.md) — 6 incremental phases (0 scaffolding → 1 cursor → 2 merger → 3 driver/stub → 4 two-pass re-read → 5 prefetch pool).
 - **Impl report (Phases 0–1):** [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md).
 - **Code:** [src/ssr/cohort/](src/ssr/cohort/) — `types.rs` (`LocusId`/`SsrQc`/`SampleEvidence`/sparse-SoA `CohortLocus`), `reader.rs` (`SampleEvidenceCursor`: `held`+`last_query` contract, coordinate inversion, `observed→seq_counts`), `merge.rs` (`CohortMerger`: catalog-driven merge → `(seq, CohortLocus)`, `open`/`from_parts` validation: same-catalog md5 + chrom-id reconciliation), `driver.rs` (`run`/`write_dump`/`format_locus` — single-threaded, catalog-ordered TSV dump), `test_support.rs` (shared fixtures). Enabler: [src/psp/reader.rs](src/psp/reader.rs) `OwnedRecordsIter` + `PspReader::into_records_of` (SNP path untouched). `run_ssr_call` wired [src/pop_var_caller/ssr_call.rs](src/pop_var_caller/ssr_call.rs). 35 tests; 1159 lib pass.
 - **Open:**
+  - **Review fixes (2026-06-21)** — apply B1–M5 + Minors from the review above (cursor data-reachable panic→typed error; release-surviving order guards; checked coordinate subtraction; coordinate round-trip test; `OwnedRecordsIter` `SsrKind`/error-path equivalence test; reserved-flag warning + help). Answer the two open questions first.
   - **Phase 4** — two-pass re-read (the parameter pre-pass consumes the merge stream, then genotyping re-reads it; merge must be cheap to restart).
   - **Phase 5** — profiling-gated prefetch pool (Q-R4↔Q-R6).
   - **Genotyping EM + VCF** — the real worker + output (separate plan: arch [parameters](doc/devel/architecture/ssr_call_parameters.md) / [genotyping](doc/devel/architecture/ssr_call_genotyping.md)); the driver's TSV dump is a placeholder until then.
