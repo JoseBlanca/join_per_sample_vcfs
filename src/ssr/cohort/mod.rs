@@ -8,4 +8,5 @@
 //! `ssr_call_parameters.md`, `ssr_call_genotyping.md`; build plan
 //! `doc/devel/implementation_plans/ssr_call_reading.md`.
 
+pub mod reader;
 pub mod types;
