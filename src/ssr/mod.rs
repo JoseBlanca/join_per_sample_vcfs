@@ -23,5 +23,6 @@
 //! read path in [`pileup`] (footprint geometry + reservoir fetch).
 
 pub mod catalog;
+pub mod cohort;
 pub mod pileup;
 pub mod types;

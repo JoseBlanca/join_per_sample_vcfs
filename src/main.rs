@@ -17,7 +17,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use pop_var_caller::pop_var_caller::{
     Cli, PopVarCallerCommand, run_estimate_contamination, run_pileup, run_psp_to_pileup,
-    run_ssr_catalog, run_ssr_pileup, run_var_calling,
+    run_ssr_call, run_ssr_catalog, run_ssr_pileup, run_var_calling,
 };
 
 // Walk the `std::error::Error::source()` chain joining messages with
@@ -61,6 +61,9 @@ fn main() {
         }
         PopVarCallerCommand::SsrPileup(args) => {
             run_ssr_pileup(&args).map_err(|e| format_error_chain(&e))
+        }
+        PopVarCallerCommand::SsrCall(args) => {
+            run_ssr_call(&args).map_err(|e| format_error_chain(&e))
         }
     };
     if let Err(msg) = result {

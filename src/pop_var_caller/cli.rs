@@ -74,6 +74,10 @@ pub enum PopVarCallerCommand {
     /// SSR Stage 1: genotype one sample's BAM/CRAM against an SSR catalog,
     /// emitting a per-locus `.ssr.psp` evidence file.
     SsrPileup(super::ssr_pileup::SsrPileupArgs),
+
+    /// SSR Stage 2: merge per-sample `.ssr.psp` evidence across a cohort and
+    /// genotype each catalog locus into a multi-sample VCF.
+    SsrCall(super::ssr_call::SsrCallArgs),
 }
 
 /// Arguments accepted by the `pileup` subcommand. The struct is the
