@@ -1,4 +1,4 @@
-# SSR `ssr-call` reading layer — Phase 0 + Phase 1 (per-sample cursor)
+# SSR `ssr-call` reading layer — Phases 0–3 (scaffolding → cursor → merger → driver)
 
 **Date:** 2026-06-21 · **Branch:** `ssr-cohort` · **Skill:** rust-feature-implementation
 
@@ -53,6 +53,21 @@ are still open.
   `SampleEvidenceCursor<R>` (`held` + `last_query` guard; `evidence_at`; `advance`;
   `adapt`) + `SsrCohortReadError`.
 
+**Phase 2 — the merger** (commit `412536d`):
+- [src/ssr/cohort/merge.rs](../../../src/ssr/cohort/merge.rs) — `CohortMerger<R, C>`,
+  a catalog-driven k-way merge as `Iterator<Item = Result<(u64, CohortLocus)>>`
+  (sparse-omit, monotonic seq). `from_parts` owns the same-catalog md5 check + the
+  chromosome-id reconciliation (cohort-global ids from the shared table; per-file
+  remaps by name). `SsrMergeError`.
+
+**Phase 3 — the driver** (commit `8915e5e`):
+- [src/ssr/cohort/driver.rs](../../../src/ssr/cohort/driver.rs) — `run` (open +
+  merge + write), `write_dump` (generic, in-memory-testable), `format_locus` (pure);
+  `SsrCallConfig`, `SsrCallError`. `CohortMerger::open` (file-backed) + `chrom_names`.
+  `run_ssr_call` now drives the cohort. **Single-threaded by design** (see Tradeoffs).
+  Shared test fixtures lifted to
+  [src/ssr/cohort/test_support.rs](../../../src/ssr/cohort/test_support.rs).
+
 ## Tests added
 
 - **types (4):** `LocusId` ordering precedence; `CohortLocus` empty/build/parallel
@@ -63,20 +78,32 @@ are still open.
 - **cursor (9):** coordinate conversion + QC carry-through; Absent before / between /
   after stored loci; exhaustion → permanent `None`; empty-observed locus present;
   multi-block crossing; chrom remap; skip panic; rewind panic.
+- **merger (7):** present-sample gather + catalog-order + sparse-omit + dense seqs;
+  catalog-frame + evidence carry-through; cross-chromosome ordering; no-inputs; md5
+  mismatch; missing md5 param; unknown catalog chrom.
+- **driver (5):** `format_locus` render + unknown-chrom fallback; `write_dump` header +
+  one row/locus in catalog order; `run` over real temp files; `run` errors on missing
+  inputs.
 
 ## Validation
 
 - `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings`
   clean.
-- `cargo test --lib` → **1147 passed, 0 failed, 2 ignored** (+18 over the pre-Phase-0
+- `cargo test --lib` → **1159 passed, 0 failed, 2 ignored** (+30 over the pre-Phase-0
   baseline of 1129).
-- `ssr-call --help` renders.
+- `ssr-call --help` renders; `ssr-call` runs end-to-end (temp-file test + binary smoke).
 
 ## Tradeoffs / follow-ups
 
-- **Phase 1 cursor is synchronous inline decode** (no pool); the shared decode-priority
-  pool + prefetched futures are Phase 5, profiling-gated (Q-R4↔Q-R6).
-- **Next — Phase 2:** the catalog-driven k-way merger (builds the per-file→global chrom
-  map, the same-catalog md5 check, and emits one `CohortLocus` at a time).
-- Then Phase 3 (driver + worker stub + seq writer), Phase 4 (two-pass re-read), Phase 5
-  (prefetch pool).
+- **Phase 3 driver is single-threaded** — the producer/queue/worker-pool/writer topology
+  is deliberately *not* built. It exists to overlap expensive EM work with decode; there
+  is no EM yet (genotyping doc), and decode parallelism is the separate Phase-5 prefetch
+  pool, so a thread pool around a formatting stub would be unverifiable complexity.
+  `--threads` / `--queue-depth` are accepted but reserved.
+- **Output is a TSV dump**, not a VCF — a placeholder + reading-layer inspection tool
+  until the EM + VCF land (the genotyping doc).
+- **Cursor decode is synchronous inline** (no pool); the shared decode-priority pool +
+  prefetched futures are Phase 5, profiling-gated (Q-R4↔Q-R6).
+- **Remaining:** Phase 4 (two-pass re-read — the pre-pass consumes the merge stream,
+  then genotyping re-reads it), Phase 5 (prefetch pool), and the genotyping EM + VCF
+  (separate plan).
