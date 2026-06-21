@@ -15,10 +15,12 @@
 //! chromosome table).
 
 use std::collections::HashMap;
-use std::io::{Read, Seek};
+use std::fs::File;
+use std::io::{BufReader, Read, Seek};
+use std::path::{Path, PathBuf};
 
-use crate::psp::PspReader;
 use crate::psp::header::ParameterValue;
+use crate::psp::{PspReadError, PspReader};
 use crate::ssr::catalog::CatalogError;
 use crate::ssr::catalog::io::CatalogReader;
 use crate::ssr::cohort::reader::{SampleEvidenceCursor, SsrCohortReadError};
@@ -61,6 +63,20 @@ pub(crate) enum SsrMergeError {
     /// A catalog locus sits on a chromosome no input declares.
     #[error("catalog locus on chromosome {chrom:?}, which no input declares")]
     UnknownCatalogChrom { chrom: String },
+    /// Opening an input file failed.
+    #[error("opening {path:?}")]
+    Open {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Parsing a `.ssr.psp` header failed.
+    #[error("opening .ssr.psp {path:?}")]
+    OpenPsp {
+        path: String,
+        #[source]
+        source: PspReadError,
+    },
     /// Streaming a sample's evidence failed.
     #[error("streaming sample evidence")]
     Read(#[from] SsrCohortReadError),
@@ -193,6 +209,44 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
             return Ok(Some((seq, cohort)));
         }
     }
+
+    /// Cohort-global chromosome names, indexed by global id (the inverse of
+    /// `name_to_global`) — for labelling output.
+    pub(crate) fn chrom_names(&self) -> Vec<String> {
+        let mut names = vec![String::new(); self.name_to_global.len()];
+        for (name, &id) in &self.name_to_global {
+            names[id as usize] = name.clone();
+        }
+        names
+    }
+}
+
+impl CohortMerger<BufReader<File>, BufReader<File>> {
+    /// Open the catalog and the per-sample `.ssr.psp` files from disk and build the
+    /// validated merger ([`from_parts`](Self::from_parts)).
+    pub(crate) fn open(catalog: &Path, psp_files: &[PathBuf]) -> Result<Self, SsrMergeError> {
+        let catalog_file = File::open(catalog).map_err(|source| SsrMergeError::Open {
+            path: catalog.display().to_string(),
+            source,
+        })?;
+        let catalog_reader = CatalogReader::new(BufReader::new(catalog_file))?;
+
+        let mut inputs = Vec::with_capacity(psp_files.len());
+        for path in psp_files {
+            let file = File::open(path).map_err(|source| SsrMergeError::Open {
+                path: path.display().to_string(),
+                source,
+            })?;
+            let reader =
+                PspReader::new(BufReader::new(file)).map_err(|source| SsrMergeError::OpenPsp {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+            inputs.push((path.display().to_string(), reader));
+        }
+
+        Self::from_parts(catalog_reader, inputs)
+    }
 }
 
 impl<R: Read + Seek, C: Read> Iterator for CohortMerger<R, C> {
@@ -206,105 +260,10 @@ impl<R: Read + Seek, C: Read> Iterator for CohortMerger<R, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader};
-    use crate::psp::registry_ssr::{SsrKind, SsrLocusRecord};
-    use crate::psp::test_fixtures::writer_header;
-    use crate::psp::writer::PspWriter;
-    use crate::ssr::catalog::CatalogParams;
-    use crate::ssr::catalog::io::{CatalogHeader, CatalogReader, CatalogWriter};
-    use crate::ssr::types::{Locus, Motif};
+    use crate::ssr::cohort::test_support::{
+        REF_MD5, catalog_reader, loc, obs, reader, rec, ssr_header, ssr_header_without_md5, ssr_psp,
+    };
     use std::io::Cursor;
-
-    const REF_MD5: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    fn obs(pairs: &[(&[u8], u32)]) -> Vec<(Box<[u8]>, u32)> {
-        pairs
-            .iter()
-            .map(|(s, c)| (s.to_vec().into_boxed_slice(), *c))
-            .collect()
-    }
-
-    /// A catalog locus: CA(3) tract at 0-based `[start, start+6)`, 18-byte ref frame
-    /// (6 G + CACACA + 6 T) anchored at `start - 6`.
-    fn loc(chrom: &str, start: u32) -> Locus {
-        Locus::new(
-            chrom.into(),
-            start,
-            start + 6,
-            Motif::new(b"CA").unwrap(),
-            1.0,
-            (*b"GGGGGGCACACATTTTTT").into(),
-            start - 6,
-        )
-        .unwrap()
-    }
-
-    fn catalog_bytes(ref_md5: &str, loci: &[Locus]) -> Vec<u8> {
-        let header = CatalogHeader {
-            tool_version: "0".into(),
-            reference: "ref.fa".into(),
-            reference_md5: ref_md5.into(),
-            trf_mod_version: "1".into(),
-            params: CatalogParams::default(),
-            date: "2026-06-21".into(),
-        };
-        let mut w = CatalogWriter::new(Cursor::new(Vec::<u8>::new()), &header).unwrap();
-        for l in loci {
-            w.write_locus(l).unwrap();
-        }
-        w.finish().unwrap().into_inner()
-    }
-
-    fn catalog_reader(ref_md5: &str, loci: &[Locus]) -> CatalogReader<Cursor<Vec<u8>>> {
-        CatalogReader::new(Cursor::new(catalog_bytes(ref_md5, loci))).unwrap()
-    }
-
-    /// SSR `.psp` header naming `chroms` and binding `cat_md5`.
-    fn ssr_header(chroms: &[&str], cat_md5: &str) -> WriterHeader {
-        let mut header = writer_header(chroms.len());
-        header.chromosomes = chroms
-            .iter()
-            .map(|name| ChromosomeEntry {
-                name: (*name).to_string(),
-                length: 100_000,
-                md5: "0".repeat(32),
-            })
-            .collect();
-        header.writer.parameters.insert(
-            CATALOG_MD5_PARAM.to_string(),
-            ParameterValue::String(cat_md5.to_string()),
-        );
-        header
-    }
-
-    /// One container record (1-based coords) — a sample's evidence at 0-based
-    /// `[start, start+6)` becomes container `[start+1, start+7)`.
-    fn rec(chrom_id: u32, start_0based: u32, observed: Vec<(Box<[u8]>, u32)>) -> SsrLocusRecord {
-        SsrLocusRecord {
-            chrom_id,
-            start: start_0based + 1,
-            end: start_0based + 7,
-            depth: 30,
-            n_filtered: 0,
-            mapped_reads: 30,
-            n_low_quality: 0,
-            n_border_off_end: 0,
-            observed,
-        }
-    }
-
-    fn ssr_psp(header: WriterHeader, records: &[SsrLocusRecord]) -> Vec<u8> {
-        let mut w =
-            PspWriter::<_, SsrKind>::new_ssr(Cursor::new(Vec::<u8>::new()), header).unwrap();
-        for r in records {
-            w.write_locus(r).unwrap();
-        }
-        w.finish().unwrap().into_inner()
-    }
-
-    fn reader(bytes: Vec<u8>) -> PspReader<Cursor<Vec<u8>>> {
-        PspReader::new(Cursor::new(bytes)).unwrap()
-    }
 
     /// Collect a merge to `(seq, LocusId, present indices, per-sample first-seq bytes)`.
     fn run(
@@ -468,14 +427,10 @@ mod tests {
     #[test]
     fn rejects_a_missing_catalog_md5_param() {
         let catalog = catalog_reader(REF_MD5, &[loc("chr1", 16)]);
-        // Header without the binding parameter.
-        let mut header = writer_header(1);
-        header.chromosomes = vec![ChromosomeEntry {
-            name: "chr1".into(),
-            length: 100_000,
-            md5: "0".repeat(32),
-        }];
-        let no_param = reader(ssr_psp(header, &[rec(0, 16, obs(&[(b"CACACA", 5)]))]));
+        let no_param = reader(ssr_psp(
+            ssr_header_without_md5(&["chr1"]),
+            &[rec(0, 16, obs(&[(b"CACACA", 5)]))],
+        ));
         let result = CohortMerger::from_parts(catalog, vec![("p".into(), no_param)]);
         assert!(matches!(
             result,

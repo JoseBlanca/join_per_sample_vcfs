@@ -8,6 +8,10 @@
 //! `ssr_call_parameters.md`, `ssr_call_genotyping.md`; build plan
 //! `doc/devel/implementation_plans/ssr_call_reading.md`.
 
+pub mod driver;
 pub mod merge;
 pub mod reader;
 pub mod types;
+
+#[cfg(test)]
+pub(crate) mod test_support;

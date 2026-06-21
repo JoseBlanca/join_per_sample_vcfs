@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use clap::Args;
 use thiserror::Error;
 
+use crate::ssr::cohort::driver::SsrCallConfig;
+
 /// Arguments for the `ssr-call` subcommand.
 #[derive(Debug, Args, Clone)]
 pub struct SsrCallArgs {
@@ -60,11 +62,20 @@ pub enum SsrCallCliError {
 
 /// Run the `ssr-call` subcommand.
 ///
-/// **Phase 1 stub:** the reader/merger and EM are not built yet, so this currently
-/// only validates that the CLI is wired and returns. The cohort driver replaces this
-/// body in later phases.
-pub fn run_ssr_call(_args: &SsrCallArgs) -> Result<(), SsrCallCliError> {
-    Ok(())
+/// Phase 3: opens the cohort, merges per-sample evidence by catalog locus, and writes
+/// a catalog-ordered TSV dump of the reading layer to `--output`. The genotyping EM +
+/// VCF land in a later phase; `--threads` / `--queue-depth` are reserved.
+pub fn run_ssr_call(args: &SsrCallArgs) -> Result<(), SsrCallCliError> {
+    let config = SsrCallConfig {
+        catalog: args.catalog.clone(),
+        psp_files: args.psp_files.clone(),
+        output: args.output.clone(),
+        threads: args.threads,
+        queue_depth: args.queue_depth,
+    };
+    crate::ssr::cohort::driver::run(&config).map_err(|source| SsrCallCliError::Run {
+        source: Box::new(source),
+    })
 }
 
 #[cfg(test)]
@@ -113,14 +124,17 @@ mod tests {
     }
 
     #[test]
-    fn stub_run_is_ok() {
+    fn run_errors_on_missing_inputs() {
         let args = SsrCallArgs {
-            psp_files: vec![PathBuf::from("a.ssr.psp")],
-            catalog: PathBuf::from("x.ssr.catalog"),
-            output: PathBuf::from("out.vcf"),
+            psp_files: vec![PathBuf::from("/no/such/a.ssr.psp")],
+            catalog: PathBuf::from("/no/such/x.ssr.catalog"),
+            output: PathBuf::from("/tmp/unused.tsv"),
             threads: 4,
             queue_depth: DEFAULT_QUEUE_DEPTH,
         };
-        assert!(run_ssr_call(&args).is_ok());
+        assert!(matches!(
+            run_ssr_call(&args),
+            Err(SsrCallCliError::Run { .. })
+        ));
     }
 }
