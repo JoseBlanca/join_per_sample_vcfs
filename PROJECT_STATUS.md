@@ -19,13 +19,14 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phase 0 scaffolding**
->   (branch `ssr-cohort`). Settled the reading & merge architecture
->   ([ssr_call_reading.md](doc/devel/architecture/ssr_call_reading.md)) + wrote its phased
->   [implementation plan](doc/devel/implementation_plans/ssr_call_reading.md); landed Phase 0:
->   new `src/ssr/cohort/types.rs` (`LocusId`/`SsrQc`/`SampleEvidence`/sparse-SoA `CohortLocus`) +
->   `ssr-call` CLI slot (stub). fmt/clippy `-D warnings` clean; 1136 lib tests (+7). See the new SSR
->   **Stage 2** block below. **Next:** Phase 1 — `SampleEvidenceCursor`.
+> - **Last completed task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–1**
+>   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
+>   Settled the reading & merge architecture + phased plan, then built: Phase 0 scaffolding
+>   (`src/ssr/cohort/types.rs`, `ssr-call` CLI stub); a psp enabler (`OwnedRecordsIter` +
+>   `PspReader::into_records_of`, SNP path untouched); Phase 1 the per-sample
+>   `SampleEvidenceCursor` (`held`+`last_query` monotonic contract, container→catalog
+>   coordinate inversion, `observed→seq_counts`). fmt/clippy `-D warnings` clean; 1147 lib
+>   tests (+18). See the SSR **Stage 2** block below. **Next:** Phase 2 — catalog-driven merger.
 > - **Prior task (2026-06-17):** **ssr-pileup Mark-2 review fixes applied**
 >   (branch `ssr-pileup-mark2`, [fixes_applied_2026-06-17_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-17_v2.md)).
 >   Applied the Mark-2 code review: **all 3 Blockers** + **9 of 12 Majors** + 9 Minors. **B1** doc gate restored
@@ -975,15 +976,16 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
 
-#### Reading & merge layer (Phase 1)
-- **Status:** in-flight (2026-06-21, branch `ssr-cohort`). Phase 0 (scaffolding) done; reader/merger/driver to follow.
+#### Reading & merge layer (Phases 0–1 done)
+- **Status:** in-flight (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (per-sample cursor) done; merger/driver/two-pass/pool to follow.
 - **Spec:** [ssr_cohort_mark2.md §4.1](doc/devel/specs/ssr_cohort_mark2.md) (reading & orchestration intent, settled 2026-06-19).
-- **Architecture (settled):** [ssr_call_reading.md](doc/devel/architecture/ssr_call_reading.md) — `SampleEvidenceCursor` (`held` + `last_query` monotonic guard, `evidence_at(q) -> Option<SampleEvidence>`), catalog-driven k-way merge → one `CohortLocus` at a time, shared decode-priority pool + prefetched futures (profiling-gated), two-pass re-read. Companions (drafts): [parameters](doc/devel/architecture/ssr_call_parameters.md), [genotyping](doc/devel/architecture/ssr_call_genotyping.md).
+- **Architecture (settled):** [ssr_call_reading.md](doc/devel/architecture/ssr_call_reading.md) — `SampleEvidenceCursor` (`held` + `last_query` monotonic guard, `evidence_at`), catalog-driven k-way merge → one `CohortLocus` at a time, shared decode-priority pool + prefetched futures (profiling-gated), two-pass re-read. Companions (drafts): [parameters](doc/devel/architecture/ssr_call_parameters.md), [genotyping](doc/devel/architecture/ssr_call_genotyping.md).
 - **Plan:** [ssr_call_reading.md](doc/devel/implementation_plans/ssr_call_reading.md) — 6 incremental phases (0 scaffolding → 1 cursor → 2 merger → 3 driver/stub → 4 two-pass re-read → 5 prefetch pool).
-- **Code (Phase 0):** [src/ssr/cohort/](src/ssr/cohort/) (`types.rs`: `LocusId`, `SsrQc`, `SampleEvidence`, sparse-SoA `CohortLocus`), `ssr-call` CLI slot [src/pop_var_caller/ssr_call.rs](src/pop_var_caller/ssr_call.rs) (stub `run_ssr_call`) wired into [cli.rs](src/pop_var_caller/cli.rs) + [main.rs](src/main.rs). 7 tests; impl report deferred to Phase 1 (commit carries Phase 0).
+- **Impl report (Phases 0–1):** [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md).
+- **Code:** [src/ssr/cohort/](src/ssr/cohort/) — `types.rs` (`LocusId`/`SsrQc`/`SampleEvidence`/sparse-SoA `CohortLocus`), `reader.rs` (`SampleEvidenceCursor`: `held`+`last_query` contract, coordinate-frame inversion, `observed→seq_counts` adapter). Enabler: [src/psp/reader.rs](src/psp/reader.rs) `OwnedRecordsIter` + `PspReader::into_records_of` (owning typed iterator; SNP path untouched). `ssr-call` CLI stub [src/pop_var_caller/ssr_call.rs](src/pop_var_caller/ssr_call.rs). 18 tests; 1147 lib pass.
 - **Open:**
-  - **Phase 1** — `SampleEvidenceCursor` (synchronous inline decode) on `PspReader`/`BlockColumnReader`/`SsrDecoder`; the two code-level reconciliations (catalog 0-based/by-name ↔ container 1-based/by-id coordinate frame; `observed → seq_counts` adapter).
-  - **Phases 2–5** — catalog-driven merger; driver (producer + bounded queue + worker stub + seq writer); two-pass re-read; profiling-gated prefetch pool (Q-R4↔Q-R6).
+  - **Phase 2 (next)** — catalog-driven k-way merger: builds the per-file→cohort-global chrom map, the same-catalog md5 check, emits one `CohortLocus` at a time.
+  - **Phases 3–5** — driver (producer + bounded queue + worker stub + seq writer); two-pass re-read; profiling-gated prefetch pool (Q-R4↔Q-R6).
   - Q-R3 (queue depth default, measured), Q-R6 (genomically-aligned Stage-1 blocks — Stage-1-writer follow-up).
 
 ---
