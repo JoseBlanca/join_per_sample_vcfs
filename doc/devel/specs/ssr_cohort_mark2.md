@@ -324,7 +324,7 @@ shapes**:
 Cross-sample **contamination** (the heavier dedicated mechanism) is deferred (reuse
 the existing `estimate-contamination` machinery later).
 
-### 4.3 Seeding the EM — π⁰, θ⁰, and the prior on π  *(settled 2026-06-19; `G₀` shape open — §9)*
+### 4.3 Seeding the EM — π⁰, θ⁰, and the prior on π  *(settled 2026-06-19; `G₀` shape = geometric for v1, Gaussian upgrade open — §9)*
 
 EM lands in whatever basin its seed points at, and this is a deconvolution (allele
 vs stutter), so the seed matters. Two things are seeded — the starting frequencies
@@ -464,9 +464,9 @@ a hard clamp (airtight), this gives `G₀` the matching hard floor.
 the **prior alone** — π⁰ is the normalized `G₀` pseudocounts (centred on the modal
 candidate, which with no data *is* the seeded reference allele) — which is also the
 correct conservative behaviour at small N (§5.6). **`F⁰`** is a separate seed (a supplied / global default that is also
-the burn-in start of the §4.4 prior-side `F` loop that estimates `F`). *(Open — §9:
-the `G₀` **shape** — how fast the pseudo-mass decays from the reference, geometric (v1)
-vs Gaussian, §5.5.)*
+the burn-in start of the §4.4 prior-side `F` loop that estimates `F`). *(v1 shape =
+**geometric**, settled (heavier tail keeps real large jumps callable); **open — §9:** whether a
+**Gaussian** form is ever worth it — a documented upgrade, not a v1 gap, `ssr_genotyping.md` §5.5.)*
 
 ### 4.4 Estimating the shared parameters — pre-pass (freeze `ε`, prior for `θ`) + a prior-side `F` loop  *(settled 2026-06-19)*
 
@@ -648,7 +648,7 @@ role** — the `align` cache is **deferred**, §6 / genotyping Q-G3, so there ar
   partial-pooling **shrinks it toward its nearest neighbour / the cohort**, so it is never
   left estimating from nothing. The BIC test won't *carve out* a singleton regime unless the
   data support it, so an accidental singleton folds back in — no special-casing needed.
-- **Coverage is an *uncertainty*, not a coordinate.** Effective depth correlates with the
+- **Coverage is an *uncertainty*, not a coordinate.** Depth (duplicate-free upstream, verify-fix #5) correlates with the
   chemistry parameters two ways: as **estimation variance** (∝ 1/depth, *unbiased*) and as
   a **confound through preservation** (low-input degraded DNA is *simultaneously*
   high-stutter, high-`ε`, and low-coverage). The second is **real protocol signal we must
@@ -1363,10 +1363,11 @@ re-weight), `align(obs | cand⊕Δ)` is a **pure, iteration-invariant function**
 calls are **deterministic across and within thread counts** *whether `align` is recomputed
 or cached* — the Stage-1 byte-identity invariant carries into Stage 2 (no per-thread state,
 no `δ`-gated rebuild; the genotyping pass copies the frozen `ε` into each worker, and
-`θ_locus` is a deterministic per-locus quantity). `ε` is a single global scalar with
-**no shrinkage target**: a wide per-locus spread in the pre-pass is not something
-shrinkage can fix — it signals that the flat-`ε` assumption is strained (the cue to give
-`ε` a covariate, deferred). *(This supersedes the earlier per-thread-`ε` + `δ`-rebuild
+`θ_locus` is a deterministic per-locus quantity). `ε` is a **per-sample-group** value (one
+per chemistry cluster, §4.4 amend. — *not* one cohort-global scalar) with **no per-locus
+shrinkage target**: a wide *within-group* per-locus spread is not something shrinkage can
+fix — it signals that the flat-`ε` assumption is strained (the cue to give `ε` a covariate,
+deferred). *(This supersedes the earlier per-thread-`ε` + `δ`-rebuild
 design, which traded determinism for a synchronization the pre-pass makes unnecessary;
 `θ`, by contrast, is **not** frozen — it refines per locus, §4.4.)*
 
@@ -1468,7 +1469,7 @@ bolt-on key.
 HipSTR likelihood shape** (§5–§7: three-level pool → rungs → candidates, the
 adjacent-rung-difference locus-admission filter, per-allele stutter reachability, and
 the sum-over-slips likelihood), and the **EM seed + π prior** (§4.3: every-sample
-putative genotype → π⁰ tally, θ⁰ from confident homozygotes, `G₀` pseudocount floor),
+putative genotype → π⁰ tally, θ⁰ from confident **genotypes** (homs ∪ separated hets — CG-seed), `G₀` pseudocount floor),
 and the **shared-parameter estimation architecture** (§4.4: a three-part pre-pass
 freezes `ε` and seeds a per-loci-group `θ` prior refined per locus; `F` is a prior-side outer
 loop; the whole pass is deterministic), and the **output** (§4.5: emit variable loci,
@@ -1517,7 +1518,7 @@ The items below are the **details those settled shapes leave to flesh out.**
 - *Resolved:* `align(·)` = **flat-emission banded pair-HMM forward** (reusing the
   Stage-1 SSR pair-HMM), with an exact-match fast path; affine-gap rejected.
 - *Resolved:* `ε` is **estimated once and frozen** by the §4.4 pre-pass
-  (confident-homozygote phase + sensitivity gate), held constant through genotyping — so
+  (confident-**genotype** phase — homs ∪ separated hets, CG-seed — + sensitivity gate), held constant through genotyping — so
   `align` is a **pure, iteration-invariant function** and the calls are **deterministic
   across and within thread counts** *whether recomputed or cached* (the cache is **deferred**
   — §6). `θ` is **not** frozen: the pre-pass gives a per-loci-group
@@ -1567,7 +1568,7 @@ The items below are the **details those settled shapes leave to flesh out.**
 - **Stutter shape covariate** (§4.2 / §4.4): *Resolved, amended 2026-06-22 (M3)* — the
   stutter **shape** is **per `(group, period)`, shrunk toward a cohort-per-period parent
   `θ_period`** (length is *not* a shape covariate — it drives the level), built by the §4.4
-  pre-pass (confident-homozygote skirts accumulate per `(group, period)` via a deterministic
+  pre-pass (confident-**genotype** skirts — homs ∪ separated-het outer skirts, CG-seed — accumulate per `(group, period)` via a deterministic
   commutative reduce, *after* clustering fixes the groups), then **each locus refines a
   `θ_locus` shrunk toward the sample's group-period shape** in the per-locus EM (depth-driven
   partial pooling — Mark-1's relief valve). `θ` enters `align` only via `S_θ(Δ)`, so the
@@ -1621,7 +1622,7 @@ The items below are the **details those settled shapes leave to flesh out.**
   **Depth enters only as measurement precision** (distance scaling), never a
   feature/regressor; it is **duplicate-free by construction** — duplicates are marked
   upstream (post-mapping markdup) and **Stage 1 skips flag-`0x400` reads**, so `ssr-call` does
-  no dedup and assumes none (verify-fix #5, §4.4); the confident-homozygote selection **co-evolves
+  no dedup and assumes none (verify-fix #5, §4.4); the confident-**genotype** selection **co-evolves
   with the params in the burn-in loop**; all per-sample/per-group values are **reported**
   for audit. *Remaining (the correctness gates, M4):* the **discrete-vs-continuum experiment**
   (plot the real (`ε`, level) cloud — clusters or gradient?) + a known-protocol **positive

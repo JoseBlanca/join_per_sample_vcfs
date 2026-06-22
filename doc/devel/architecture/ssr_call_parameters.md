@@ -40,7 +40,7 @@ the rest of the doc against this table.
 | **repeat unit** | one copy of the locus's motif (`period` bp). Allele lengths, slips, and offsets are counted in **repeat units**, not in bp. |
 | **unit offset** (`Δ`) | a signed count of **repeat units** between two allele lengths (`+` = longer, `−` = shorter). Used in two places: a candidate's `Δ` from the per-locus **modal allele** (the frame for `G₀`, below), and a read's slip `Δ` from a candidate allele (the frame for the stutter kernel `S_θ(Δ)`). E.g. a candidate two repeats longer than the mode has `Δ = +2`. |
 | **loci group** | a set of loci grouped by shared behaviour (their repeat **covariates**), over which a *pooled* parameter is estimated — the loci-side analogue of a **sample group**. **In v1 the only grouping covariate is `period`, so a loci group = a period.** Repeat **length** is *not* a grouping axis — it enters as a continuous *level* covariate (`level_slope`), never as a bin; **motif** & **purity** are deferred covariates. The **`G₀`** decay is fit per loci group; the **stutter shape** is fit per **`(sample group, period)`** (shrunk to a cohort-per-period parent — M3), i.e. it crosses a loci group (period) with a sample group. |
-| **geometric pseudocounts** (`G₀`) | the prior on candidate allele frequencies `π` (§5): a small prior "count" of mass placed on **every** candidate allele, **decaying geometrically** with the candidate's **unit offset** `Δ` (repeat units from the per-locus modal allele — see above). A *pseudocount* is prior count added to the observed counts (Dirichlet smoothing) so no candidate gets `π = 0`; *geometric* names the decay shape. It keeps every `π_i > 0` (no `π = 0` absorbing trap), so a candidate the seed missed (e.g. a masked het) stays recoverable, and re-enters **every** EM M-step as a small-N regularizer + false-positive control. Decay parameter fit **per loci group**. (= the spec §5.5 Dirichlet base measure.) |
+| **geometric pseudocounts** (`G₀`) | the prior on candidate allele frequencies `π` (§5): a small prior "count" of mass placed on **every** candidate allele, **decaying geometrically** with the candidate's **unit offset** `Δ` (repeat units from the per-locus modal allele — see above). A *pseudocount* is prior count added to the observed counts (Dirichlet smoothing) so no candidate gets `π = 0`; *geometric* names the decay shape. It keeps every `π_i > 0` (no `π = 0` absorbing trap — **floored at a tiny `> 0`** so `p^|Δ|` can't underflow to exactly 0, verify-fix #4 / §5), so a candidate the seed missed (e.g. a masked het) stays recoverable, and re-enters **every** EM M-step as a small-N regularizer + false-positive control. Decay parameter fit **per loci group**. (= the spec §5.5 Dirichlet base measure.) |
 | **confident genotype** (CG-seed, §2) | a (sample, locus) whose read-length distribution **resolves into clear, well-separated peaks** at full confidence — **one** peak (homozygote) or up to **ploidy** peaks (heterozygote), each peak's allele **cohort-recurrent**, peaks **≥ 2 repeat units apart** with dosage-consistent heights. These are the pre-pass's *labelled* observations: each read's slip attributes to a known parent allele, so the skirt is stutter and the within-tract mismatches are `ε`. **Replaces "confident homozygote"** as the chemistry seed (a homozygote is the 1-peak special case); a well-separated het contributes its two outer skirts as hard labels (inner valley → soft EM). A merged (1-apart) het is **not** a confident genotype (stutter and allele confounded). |
 
 The kernel the likelihood uses is `S_θ(Δ) = level × shape(Δ)`: the **shape** says
@@ -196,7 +196,8 @@ at each locus, find the **clear local maxima** over the rungs and resolve the ge
    *independent* allele. This is the strongest guard against the hom-plus-stutter masquerade,
    and it is **strongest precisely in the het-heavy cohort** this serves (many samples to
    corroborate against);
-4. **depth** — a minimum effective depth to resolve the peaks at all.
+4. **depth** — a minimum depth to resolve the peaks at all (depth is duplicate-free upstream,
+   verify-fix #5).
 
 A genotype that fails resolution (peaks `< 2` apart, dosage-inconsistent, non-recurrent, or
 too thin) is **not a seed** — it is left to the soft EM, never *forced* into a label. (This
@@ -249,6 +250,10 @@ loop. (This replaces the earlier "iterate ×~2" framing — the loop runs to its
 > sample/locus** — it **leans on the app's coded priors** (literature stutter/`ε` defaults) plus
 > the soft EM + cohort recurrence. Polyploid seed resolution is a **documented approximation**,
 > the first place to look if a polyploid cohort's chemistry estimates are poor.
+> **Owner:** the coded literature `ε`/stutter defaults are the **same dev-computed defaults the
+> burn-in already starts from** (§2/§4); `rungs.rs` returns "unresolved" for the sample/locus
+> and `prepass.rs` simply emits **no labelled skirt** for it (the soft EM + recurrence carry it),
+> so no new storage is introduced — the defaults already live as the burn-in seed.
 
 > **m2(a) — now a far narrower corner (CG-seed).** The cohort-wide "no confident *homozygote*
 > anywhere" case (a hyper-het outbred cohort) is **largely closed** — those cohorts are rich in
@@ -259,7 +264,11 @@ loop. (This replaces the earlier "iterate ×~2" framing — the loop runs to its
 > estimated from data — running on literature defaults" warning** (an output obligation, like
 > the apparent-`F_IS` warning), with the confident-genotype count surfaced as a diagnostic. This
 > is the only path on which the "estimate from data" thesis falls back to constants, and it is
-> now **announced, not silent**.
+> now **announced, not silent**. **Owner:** `prepass.rs` detects the cohort-wide-zero
+> confident-genotype condition (the count it already tracks per §3) and raises a flag on the
+> Phase-2 output; the **driver / `vcf_out.rs`** emits the warning into the **VCF header + stderr**
+> (mirroring where the apparent-`F_IS` label is emitted, genotyping §6), and the per-sample
+> confident-genotype count rides the §4.4 reporting block.
 
 > **The shared-primitive boundary (Q-P1, resolved).** "Build rungs from the pooled cohort
 > distribution" and "find clear local maxima" are needed **both here** (confident-genotype
@@ -486,7 +495,8 @@ the **masked het**). The fix is **pseudocounts**: every candidate starts non-zer
 the EM grows it if the data warrant, the pseudocount vanishes under real evidence.
 This is what makes the seed's deliberate merged-het mislabelling **recoverable**.
 
-Shape (spec §4.3, settled; the *decay parameter* is fit here, the *shape* open §9):
+Shape (spec §4.3, settled; the *decay parameter* is fit here; the *functional form* is
+**geometric for v1** (settled), with a **Gaussian form** the open §9 upgrade):
 
 - **geometric decay** in the unit offset `Δ` (heavier-than-Gaussian tail keeps real
   large-step alleles callable),
@@ -595,14 +605,19 @@ to be optimistic precisely because the prior keeps the alleles it skips alive.
 ```
 src/ssr/cohort/
   rungs.rs        # SHARED with Phase 3 (Q-P1): pool -> rungs -> clear-maxima; confident-GENOTYPE
-                  #   resolution (hom ∪ separated het, 1..ploidy peaks — CG-seed §2)
-  prepass.rs      # the iterated estimation: skirt/ε accumulation (cohort shape + per-sample level/ε),
-                  #   burn-in settle + stratified measure + re-select loop, commutative reduce  (§2-4)
+                  #   resolution (hom ∪ separated het, 1..ploidy peaks — CG-seed §2); returns the
+                  #   resolved peak set + per-peak allele, or "unresolved" (merged/dosage/recurrence/thin)
+  prepass.rs      # the iterated estimation: from each resolved genotype, LABEL the skirts —
+                  #   hom: one skirt; separated het: TWO outer skirts (per allele) hard-labelled,
+                  #   inner valley -> soft-EM responsibilities (CG-seed §2/§3); skirt/ε accumulation
+                  #   (cohort shape + per-sample level/ε), burn-in settle + stratified measure +
+                  #   re-select loop, commutative reduce; coded-default fallback + m2(a) zero-flag  (§2-4)
   sample_groups.rs # cluster per-sample (ε, level) -> soft sample groups (K≤~8-10 selected;
                   #   precision = 1/√(depth), dup-free upstream); per-sample shrink to group; reporting  (§4)
   stutter.rs      # S_θ(Δ) kernel = (group,period)-shape × per-group level(length); shape fit +
-                  #   (group,period)->period->global shrinkage (M3); per-group level-slope fit
-                  #   (shared w/ Phase 3 re-weight)
+                  #   (group,period)->period->global shrinkage (M3); per-group level-slope fit;
+                  #   reachability ⊕ + placement-variant SET enumeration for impure A⊕Δ (verify-fix #3)
+                  #   (shared w/ Phase 3: re-weight + likelihood.rs sums the Σ_v)
   base_measure.rs # G₀ geometric pseudocounts: per-loci-group decay fit + per-candidate vector  (§5)
   seed.rs         # π⁰ tally (putative genotypes + G₀), θ⁰, F⁰  (§6; may fold into Phase 3 — Q-P3)
 ```

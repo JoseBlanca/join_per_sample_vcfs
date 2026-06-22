@@ -264,7 +264,7 @@ lets the whole cohort overrule a biased pre-pass level:
 ```
  F_i⁰ = supplied/default;  level_g⁰ = pre-pass seed (per group)
  repeat {
-   per-locus EM over all loci (current F_i, current level_g)   # refine π AND θ_locus; align cached
+   per-locus EM over all loci (current F_i, current level_g)   # refine π AND θ_locus; align recomputed (cache deferred, §4)
    F_i  reduce over VARIABLE loci (≥2 alleles):                # mean autozygous-branch responsibility
      raw F_i  →  shrink to cohort mean  →  clamp ≤ user cap  →  clamp ≤ F_CEILING=0.99
    level_g reduce per SAMPLE GROUP (soft per-allele resp.):    # re-fit level_baseline+level_slope·length

@@ -333,7 +333,7 @@ analogs — and why the sketch is short.
 ## 8. The two-pass question (the one real cross-phase wrinkle)
 
 Phase 2 (the pre-pass) needs to stream loci to estimate `ε` (per sample group) / the
-stutter-shape (cohort, per period) + stutter-level (per sample group) priors *before*
+stutter-shape (per `(group, period)`, shrunk to a cohort-per-period parent — M3) + stutter-level (per sample group) priors *before*
 Phase 3 can genotype any locus. So the merge stream (§4) is consumed **twice**: once
 for the pre-pass, once for genotyping.
 

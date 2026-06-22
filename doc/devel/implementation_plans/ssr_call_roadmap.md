@@ -19,7 +19,7 @@ resolved 2026-06-21 (parameters §9). This roadmap turns that design into build 
 - **Genotyping consumes parameters as an interface; the pre-pass *depends on* the
   genotyping likelihood/EM.** The dependency runs **one way**: genotyping takes the frozen
   parameters (ε, stutter shape, level, `G₀`) as *input*, but the pre-pass is **built on the
-  genotyping machinery** — the confident-homozygote seed gate reuses the EM scoring (D1 →
+  genotyping machinery** — the confident-genotype seed gate (CG-seed) reuses the EM scoring (D1 →
   C2), the soft-EM estimator and the `ε`-freeze check run the genotyper itself (D2/D3 → C2/C4),
   all via the shared primitives (Q-P1). So this is **not** a clean two-way decoupling — the
   pre-pass is downstream of genotyping. That is exactly why we **build supplied-parameter
@@ -107,20 +107,25 @@ with *supplied* parameters.** *Depends:* C2, C3. *Source:* spec §5.4/§4.2; gen
 
 ### Milestone D — Parameter pre-pass (estimate the parameters)
 
-**D1. Confident-homozygote test (one-vs-two) + per-locus fitting.**  ☐ arch ☐ plan
-The one-allele-vs-two-allele likelihood test (Q-P7) that gates which loci feed estimation;
-the per-locus parameter fit off confident homozygotes. *Depends:* B1, B3, C2. *Source:*
-parameters §2; spec §4.3.
+**D1. Confident-genotype resolution test (1..ploidy-peak) + per-locus fitting.**  ☐ arch ☐ plan
+The peak-count resolution test (Q-P7, generalized by CG-seed) that gates which (sample, locus)
+feed estimation — admitting **confident homozygotes ∪ well-separated hets** (peaks ≥ 2 units
+apart, dosage-consistent, each allele cohort-recurrent; the diploid core is the one-vs-two-allele
+test, extended to *p* peaks); the per-locus parameter fit off those confident genotypes (a het
+contributes two labelled outer skirts; polyploids that won't resolve lean on coded priors).
+*Depends:* B1, B3, C2. *Source:* parameters §2; spec §4.3/§4.4 (CG-seed).
 
 **D2. Burn-in loop + measure → freeze parameters.**  ☐ arch ☐ plan
 The adaptive burn-in (seeded batches, frozen-params map, barrier reduce, update — batch 32
 fixed) + measure (per-locus distributions → averages + shape diagnostics). The estimator is
-the **soft full-cohort EM responsibility reduce**, with the confident-homozygote gate as a
-**seed** (C2). **Stop on the penalized marginal log-likelihood plateau** (`Δℓ_pen/|ℓ_pen| <
-tol`; `ℓ_pen` = the E-step normalizer, ~free), **not** "calls/params don't move" (M4); with
+the **soft full-cohort EM responsibility reduce**, with the confident-**genotype** gate
+(homs ∪ separated hets — CG-seed) as a **seed** (C2). **Stop on the penalized marginal
+log-likelihood plateau** (`Δℓ_pen/|ℓ_pen| < tol`; `ℓ_pen` = the E-step normalizer, ~free,
+summed by fixed-point integer accum — verify-fix #1), **not** "calls/params don't move" (M4); with
 **multi-start** (best `ℓ_pen`, divergent basins flagged). Produces **frozen ε**, the **cohort-per-period shape
-parent** `θ_period`, and per-sample shape/level estimates, plus a **per-sample level seed**
-(`level⁰`; the per-group level is refined later in E1, not frozen — C2). (The
+parent** `θ_period`, and **per-sample** shape/level estimates (the clustering input). The
+outer-loop level seed `level⁰` is **per group** and is fit in D3 *after* clustering fixes the
+groups (D2's per-sample lines feed that clustering); it is then refined in E1, not frozen (C2). (The
 per-`(group,period)` shape is fit in D3, once clustering fixes the groups — M3.) Seeded
 subset via reservoir sampling over the reader's stream. **Milestone: recover known
 parameters on simulated data.** *Depends:* D1. *Source:* parameters §3/§4 (Q-P4/Q-P5).
