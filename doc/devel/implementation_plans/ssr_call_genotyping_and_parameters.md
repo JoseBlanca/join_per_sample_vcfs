@@ -330,6 +330,21 @@ mononucleotide/C1 case and well-separated-het cohorts (CG-seed). *Depends:* A1, 
 
 ### Milestone B — Shared locus primitives
 
+> **⚠ Match the simulator's forward model (B2 + B3).** The A2 simulator
+> ([src/ssr/cohort/sim.rs](../../../src/ssr/cohort/sim.rs), module header) and the B2/B3
+> kernel are **two encodings of the same generative model** — the simulator *draws* slips +
+> substitutions, the kernel *scores* their probability. They must agree, or the D-milestone
+> "recover what we put in" tests fail in a way that looks like an estimator bug but is really
+> a model mismatch. Concretely: B2's slip model (`S_θ(Δ) = level(length)·shape(Δ)`, geometric
+> magnitude, up/down split) must be the scoring counterpart of `sim.rs`'s
+> `slip_length` (`level = baseline + slope·units`; sign `up/(up+down)`; magnitude geometric in
+> `decay`, capped at `MAX_SLIP`), and B3's emission (`align_subst`, flat-`ε` within-tract
+> substitutions only) the counterpart of `sim.rs`'s `apply_substitutions`. **Write B2/B3
+> against the `sim.rs` header, and if the score/draw parameterizations must differ, document
+> the exact correspondence** (the simulator is the spec for the forward model; the kernel is
+> the spec for module shape — plan §0). Whichever side changes during F2 calibration, change
+> both together.
+
 **B1. `rung_ladder.rs`** — `build_rungs` + `resolve_confident_genotype` (1..ploidy peaks;
 separation ≥2 units, dosage-consistent heights, cohort recurrence ≥ *k*, depth floor).
 Pure, threshold-parameterized. *Depends:* A1. *Tests:* homozygote → 1 peak; separated het
