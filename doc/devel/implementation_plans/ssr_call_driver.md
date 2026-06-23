@@ -165,6 +165,13 @@ yet (that is Milestone I).
 - **Threads:** map `config.threads` to the rayon pool (the pre-pass is already parallel;
   the sweep stays **single-threaded** in Step 1 — parallelism is Milestone J).
   `config.queue_depth` documented as the future sweep knob.
+- **Carry-over from the H1 review (Mi1):** `build_param_set` backfills `G₀` over the
+  periods the pre-pass *characterized* (`shape_by_period`), not the genotyped loci's
+  periods, so a period with confident genotypes but zero recorded slips falls to the EM's
+  matching `0.5`. Decide here: accept the documented boundary (benign — the EM default
+  equals `G0FitCfg.fallback_p`), or pass the loci-derived period set into
+  `build_param_set` and backfill over that. See
+  [review](../reports/reviews/ssr_call_build_param_set_2026-06-23.md) Mi1.
 - **Integration test (DoD):** the **real** `run()` over a simulated-cohort `.ssr.psp`
   set produces a valid VCF — header + records, genotypes correct at high depth,
   a PASS variant with an ALT, a filtered record kept with its reason, a monomorphic

@@ -379,6 +379,10 @@ mod tests {
         );
         assert_eq!(params.error_per_sample_group, vec![PerBaseError(0.004); 2]);
         assert_eq!(params.stutter_shape_parent[&2], shape());
+        assert_eq!(
+            params.stutter_shape_by_cell[&(SampleGroupId(0), 2)],
+            shape()
+        );
         assert_eq!(params.level_seed.len(), 2);
         assert_eq!(params.pseudocount_decay_per_loci_group[&2].p, 0.3); // fitted, not fallback
         assert_eq!(params.f0_seed, 0.0); // F is frozen by the burn-in, not here
@@ -393,6 +397,26 @@ mod tests {
             Err(SsrCallError::UnresolvedSamples { samples }) => assert_eq!(samples, vec![1]),
             other => panic!("expected UnresolvedSamples, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_param_set_carries_a_g0_only_period() {
+        // Period 4 is fitted in g0_by_period but absent from shape_by_period; the
+        // clone-first base of the backfill must still carry its fitted value.
+        let est = est_for(&[2], &[2, 4]);
+        let grouped = grouped_for(&[(0, 0), (1, 0)], 1);
+        let params = build_param_set(&est, &grouped, 2, &G0FitCfg::dev_default()).unwrap();
+        assert_eq!(params.pseudocount_decay_per_loci_group[&4].p, 0.3);
+    }
+
+    #[test]
+    fn build_param_set_on_an_empty_cohort_is_ok_and_empty() {
+        // Degenerate (the merger rejects an empty cohort upstream): no samples → no
+        // unresolved samples → an empty, valid ParamSet.
+        let est = est_for(&[2], &[2]);
+        let grouped = grouped_for(&[], 0);
+        let params = build_param_set(&est, &grouped, 0, &G0FitCfg::dev_default()).unwrap();
+        assert!(params.group_of_sample.is_empty());
     }
 
     #[test]
