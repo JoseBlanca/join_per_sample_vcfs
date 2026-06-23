@@ -13,6 +13,7 @@ pub mod candidate_set;
 pub mod driver;
 pub mod em;
 pub mod em_init;
+pub mod inbreeding;
 pub mod likelihood;
 pub mod merge;
 pub mod pair_hmm;

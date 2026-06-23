@@ -78,6 +78,9 @@ pub(crate) struct LocusCall {
     pub(crate) calls: Vec<SampleCall>,
     /// The converged candidate allele frequencies.
     pub(crate) pi: Vec<f64>,
+    /// Per present sample: the posterior probability the sample is homozygous (the
+    /// E1 `F` reduce reads this against the HWE expectation `Σ π_i²`).
+    pub(crate) posterior_hom: Vec<f64>,
     /// The site admission verdict (drives the VCF FILTER).
     pub(crate) admit: Admission,
 }
@@ -119,10 +122,13 @@ fn period_decay(params: &ParamSet, period: usize) -> G0PseudocountDecay {
 }
 
 /// `ε` and the per-length stutter level for a present sample (by its sample group).
+/// `level_per_group` is supplied separately so the E1 outer loop can refit it without
+/// rebuilding the params.
 fn sample_chemistry(
     locus: &CohortLocus,
     present_k: usize,
     params: &ParamSet,
+    level_per_group: &[StutterLevel],
 ) -> (f64, StutterLevel) {
     let global = locus.present[present_k] as usize;
     let group = params
@@ -135,8 +141,7 @@ fn sample_chemistry(
         .get(group.0 as usize)
         .map(|e| e.0)
         .unwrap_or(0.01);
-    let level = params
-        .level_seed
+    let level = level_per_group
         .get(group.0 as usize)
         .copied()
         .unwrap_or(StutterLevel {
@@ -184,6 +189,34 @@ pub(crate) fn run_locus_em(
     ploidy: u8,
     cfg: &EmCfg,
 ) -> LocusCall {
+    let f_per_present = vec![cfg.inbreeding_f; locus.samples.len()];
+    run_locus_em_with(
+        locus,
+        rungs,
+        candidates,
+        params,
+        seed,
+        ploidy,
+        cfg,
+        &f_per_present,
+        &params.level_seed,
+    )
+}
+
+/// Genotype one locus with an explicit per-sample inbreeding `F` and per-group level
+/// (the E1 outer loop drives these); also emits each sample's posterior homozygosity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_locus_em_with(
+    locus: &CohortLocus,
+    rungs: &Rungs,
+    candidates: &CandidateSet,
+    params: &ParamSet,
+    seed: &LocusSeed,
+    ploidy: u8,
+    cfg: &EmCfg,
+    f_per_present: &[f64],
+    level_per_group: &[StutterLevel],
+) -> LocusCall {
     assert_eq!(ploidy, 2, "C4 EM is diploid-only (v1)");
     let n_present = locus.samples.len();
 
@@ -192,6 +225,7 @@ pub(crate) fn run_locus_em(
         return LocusCall {
             calls: vec![SampleCall::no_call(); n_present],
             pi: seed.pi0.clone(),
+            posterior_hom: vec![0.0; n_present],
             admit: candidates.admit,
         };
     }
@@ -214,7 +248,7 @@ pub(crate) fn run_locus_em(
     let mut scratch = LikelihoodScratch::new();
     let mut data_ll: Vec<Vec<f64>> = Vec::with_capacity(n_present);
     for (k_present, evidence) in locus.samples.iter().enumerate() {
-        let (eps, level) = sample_chemistry(locus, k_present, params);
+        let (eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
         // Per (distinct obs, candidate) Qᵣ — the read likelihood matrix.
         let obs_qr: Vec<(u32, Vec<f64>)> = evidence
             .seq_counts
@@ -258,11 +292,12 @@ pub(crate) fn run_locus_em(
     let mut pi = seed.pi0.clone();
     for _ in 0..cfg.max_iters {
         let mut expected = g0.clone();
-        for sample_ll in &data_ll {
+        for (k_present, sample_ll) in data_ll.iter().enumerate() {
+            let f = f_per_present[k_present];
             let log_joint: Vec<f64> = genotypes
                 .iter()
                 .zip(sample_ll)
-                .map(|(g, ll)| genotype_prior(*g, &pi, cfg.inbreeding_f).ln() + ll)
+                .map(|(g, ll)| genotype_prior(*g, &pi, f).ln() + ll)
                 .collect();
             let norm = log_sum_exp(&log_joint);
             for (g, lj) in genotypes.iter().zip(&log_joint) {
@@ -284,35 +319,43 @@ pub(crate) fn run_locus_em(
         }
     }
 
-    // Final E-step → MAP genotype + GQ per sample.
-    let calls = data_ll
-        .iter()
-        .map(|sample_ll| {
-            let log_joint: Vec<f64> = genotypes
-                .iter()
-                .zip(sample_ll)
-                .map(|(g, ll)| genotype_prior(*g, &pi, cfg.inbreeding_f).ln() + ll)
-                .collect();
-            let norm = log_sum_exp(&log_joint);
-            let (best, best_lj) = log_joint
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap();
-            let posterior = (best_lj - norm).exp();
-            let g = genotypes[best];
-            SampleCall {
-                allele_indices: vec![g.i, g.j],
-                genotype_units: vec![cand_units[g.i], cand_units[g.j]],
-                posterior,
-                gq: phred_gq(posterior),
-            }
-        })
-        .collect();
+    // Final E-step → MAP genotype + GQ + posterior homozygosity per sample.
+    let mut calls = Vec::with_capacity(n_present);
+    let mut posterior_hom = Vec::with_capacity(n_present);
+    for (k_present, sample_ll) in data_ll.iter().enumerate() {
+        let f = f_per_present[k_present];
+        let log_joint: Vec<f64> = genotypes
+            .iter()
+            .zip(sample_ll)
+            .map(|(g, ll)| genotype_prior(*g, &pi, f).ln() + ll)
+            .collect();
+        let norm = log_sum_exp(&log_joint);
+        let (best, best_lj) = log_joint
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+        let posterior = (best_lj - norm).exp();
+        let p_hom: f64 = genotypes
+            .iter()
+            .zip(&log_joint)
+            .filter(|(g, _)| g.i == g.j)
+            .map(|(_, lj)| (lj - norm).exp())
+            .sum();
+        let g = genotypes[best];
+        calls.push(SampleCall {
+            allele_indices: vec![g.i, g.j],
+            genotype_units: vec![cand_units[g.i], cand_units[g.j]],
+            posterior,
+            gq: phred_gq(posterior),
+        });
+        posterior_hom.push(p_hom);
+    }
 
     LocusCall {
         calls,
         pi,
+        posterior_hom,
         admit: candidates.admit,
     }
 }

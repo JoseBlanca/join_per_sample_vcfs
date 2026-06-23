@@ -160,6 +160,7 @@ mod tests {
                 },
             ],
             pi: vec![0.5, 0.25, 0.25],
+            posterior_hom: vec![0.99, 0.05],
             admit: Admission::Pass,
         };
         let line = format_vcf_record("chr1", &locus(), &candidates(), &call);
@@ -185,6 +186,7 @@ mod tests {
                 gq: 0,
             }],
             pi: vec![1.0],
+            posterior_hom: vec![0.0],
             admit: Admission::LowDepth,
         };
         let cands = CandidateSet {
