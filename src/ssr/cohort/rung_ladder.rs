@@ -179,7 +179,10 @@ fn is_clear_peak(histogram: &BTreeMap<u16, u32>, length: u16, prominence: u32) -
         .checked_sub(1)
         .and_then(|l| histogram.get(&l).copied())
         .unwrap_or(0);
-    let upper = histogram.get(&(length + 1)).copied().unwrap_or(0);
+    let upper = length
+        .checked_add(1)
+        .and_then(|l| histogram.get(&l).copied())
+        .unwrap_or(0);
     support > lower + prominence && support > upper + prominence
 }
 
@@ -230,6 +233,8 @@ fn representative_sequence(evidence: &SampleEvidence, length: u16, period: usize
         .seq_counts
         .iter()
         .filter(|(seq, _)| (seq.len() / period) as u16 == length)
+        // Pick the most-supported sequence; break count ties on the lexicographically
+        // smallest sequence (so `max_by` returns it, the tie-break order is reversed).
         .max_by(|(a_seq, a_c), (b_seq, b_c)| a_c.cmp(b_c).then_with(|| b_seq.cmp(a_seq)))
         .map(|(seq, _)| seq.clone())
         .expect("a resolved peak length is occupied by the sample")
@@ -262,7 +267,10 @@ pub(crate) fn resolve_confident_genotype(
         .collect();
 
     // No clear maximum despite adequate depth: two adjacent alleles cancel each
-    // other's prominence (the 1-apart merged het), or the locus has no structure.
+    // other's prominence (the 1-apart merged het). NOTE: a structureless / pure-noise
+    // locus also lands here — both correctly mean "not a seed", so they share the
+    // `Merged` reason in v1; split out a `NoStructure` reason only if D1's diagnostics
+    // need to tell them apart.
     if peaks.is_empty() {
         return Resolution::Unresolved(UnresolvedReason::Merged);
     }

@@ -19,18 +19,18 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) genotyping+pre-pass — Milestone A (Foundations)**
->   (branch `ssr-cohort`, [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_a_2026-06-23.md)).
->   First milestone of the fused Phase-2/3 plan: A1 core types & data model
->   (`ParamSet` interface, chemistry types, `SlipProfile`/`SampleStutterStats`
->   accumulators, `FixedPointAccum` determinism reduce, candidate/confident-genotype/
->   placement shapes) + A2 the cohort simulator (`sim.rs`: known genotypes × stutter
->   × `ε` × sample groups → `.ssr.psp` the reader consumes, with a queryable
->   `TruthTable`; dependency-free SplitMix64). Reviewed (Approve-with-changes; 0
->   Blocker/Major) and **fixes applied → Milestone A shipped** ([review](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23.md)). fmt/clippy
->   `-D warnings` clean; 1184 lib tests (+19). See the SSR **Stage 2** block below.
->   **Next (loop):** Milestone B (shared locus primitives — `rung_ladder`, `stutter`, `pair_hmm`).
+> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) genotyping+pre-pass — Milestone B (shared locus primitives)**
+>   (branch `ssr-cohort`, [impl](doc/devel/reports/implementations/ssr_call_genotyping_milestone_b_2026-06-23.md)).
+>   Full loop on the three real algorithms both halves call: B1 `rung_ladder`
+>   (`build_rungs` + heuristic `resolve_confident_genotype`), B2 `stutter`
+>   (`s_theta`/`reach_variants`/`refine_theta_locus` — the scoring counterpart of the
+>   A2 simulator's forward model, kernel sums to 1), B3 `pair_hmm` (`align_subst`
+>   banded forward, substitutions-in-tract / gaps-in-flank). Reviewed
+>   (Approve-with-changes; 0 Blocker/Major) and **fixes applied → Milestones A+B shipped**
+>   ([review](doc/devel/reports/reviews/ssr_call_genotyping_milestone_b_2026-06-23.md),
+>   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_v2.md)). fmt/clippy
+>   `-D warnings` clean; 1207 lib tests. See the SSR **Stage 2** block below.
+>   **Next (loop):** Milestone C (genotyping walking skeleton on supplied params → checkpoint 1: first VCF).
 > - **Prior task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
 >   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
 >   Built the reading & merge spine through a runnable `ssr-call`: Phase 0 scaffolding;
@@ -995,8 +995,9 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
 
 #### Genotyping + parameter pre-pass (Phases 2/3 — fused plan; Milestone A done)
-- **Status:** Milestone B **reviewed** (2026-06-23, branch `ssr-cohort`); fixes (loop step 5) next, then Milestone C (genotyping walking skeleton → checkpoint 1). Milestone A shipped.
-- **Milestone B review:** [ssr_call_genotyping_milestone_b_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_b_2026-06-23.md) — **Approve-with-changes**: 0 Blocker, 0 Major, 3 Minor + Nits + 1 missing test (Mi1 `is_clear_peak` overflow guard; Mi2 `align_subst` normalization doc; Mi3 `Merged` conflation doc).
+- **Status:** Milestones A + B **shipped** (2026-06-23, branch `ssr-cohort`); **Milestone C (genotyping walking skeleton → checkpoint 1) next** in the loop. B implemented, reviewed, fixes applied.
+- **Milestone B review:** [ssr_call_genotyping_milestone_b_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_b_2026-06-23.md) — Approve-with-changes: 0 Blocker, 0 Major, 3 Minor + Nits + 1 missing test.
+- **Milestone B fixes-applied:** [fixes_applied_2026-06-23_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-23_v2.md) — all 6 Applied (Mi1 overflow guard; Mi2/Mi3/nits doc; pure-contraction test). 1207 lib tests.
 - **Milestone B impl report:** [ssr_call_genotyping_milestone_b_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_b_2026-06-23.md) — B1 `rung_ladder` (`build_rungs` + heuristic `resolve_confident_genotype`), B2 `stutter` (`s_theta`/`reach_variants`/`refine_theta_locus`, the scoring counterpart of the sim forward model), B3 `pair_hmm` (`align_subst` banded forward, substitutions-in-tract/gaps-in-flank). 1206 lib tests (+22).
 - **Latest review:** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md) — **Approve-with-changes**: 0 Blocker, 0 Major, 2 Minor + Nits.
 - **Latest fixes-applied:** [fixes_applied_2026-06-23.md](doc/devel/reports/reviews/fixes_applied_2026-06-23.md) — all 4 findings Applied (Mi1 `FixedPointAccum` non-finite debug-assert + magnitude doc + guard test; Mi2 separated-het + per-group-shape sim tests; `below`→`index_below`; drop alloc-for-length). 1184 lib tests.

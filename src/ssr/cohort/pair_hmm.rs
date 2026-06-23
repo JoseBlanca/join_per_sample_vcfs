@@ -41,6 +41,14 @@ impl HmmScratch {
 
 /// `P(obs | variant)` under a flat per-base error `ε`: substitutions in the tract,
 /// gaps only in the flanks.
+///
+/// NORMALIZATION: the equal-length path is an exact distribution over `obs`
+/// (`Σ_obs (1−ε)^match·(ε/3)^mismatch = 1`). The unequal-length `banded_forward`
+/// adds flank-gap paths on top, so summed over differing-length `obs` the total mass
+/// slightly exceeds 1 — a boundary-slop correction, not a proper normalized
+/// transition. Harmless in `Qᵣ` (the EM normalizes responsibilities per read), and
+/// the equal-length core is the overwhelming majority; proper transition
+/// normalization is an F2 refinement.
 pub(crate) fn align_subst(obs: &[u8], variant: &[u8], eps: f64, scratch: &mut HmmScratch) -> f64 {
     if obs == variant {
         return (1.0 - eps).powi(obs.len() as i32);
@@ -68,6 +76,10 @@ fn in_flank(pos: usize, len: usize) -> bool {
 /// Banded forward sum for unequal-length sequences, with gaps confined to the
 /// flanks. `obs` has length `m`, `variant` length `n`; cells outside the band
 /// `|i − j| ≤ |m − n| + FLANK_SLOP` stay zero.
+///
+/// Compute is band-limited; the scratch buffer is still the full `(m+1)·(n+1)`
+/// matrix (memory is not banded). Fine at tract sizes; true memory-banding is an
+/// F1 perf concern, not correctness.
 fn banded_forward(obs: &[u8], variant: &[u8], eps: f64, scratch: &mut HmmScratch) -> f64 {
     let m = obs.len();
     let n = variant.len();

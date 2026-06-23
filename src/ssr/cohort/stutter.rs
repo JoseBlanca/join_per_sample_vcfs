@@ -300,6 +300,15 @@ mod tests {
     }
 
     #[test]
+    fn reach_variants_pure_contraction_shortens_the_tiling() {
+        // (CA)x5 contracted by −2 → (CA)x3, one variant.
+        let mut out = Vec::new();
+        reach_variants(b"CACACACACA", &motif(b"CA"), -2, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(&*out[0].seq, b"CACACA"); // CA x 3
+    }
+
+    #[test]
     fn reach_variants_skips_runs_that_cannot_contract() {
         // A 2-unit run cannot lose 3 units; with a single run that means no variant.
         let mut out = Vec::new();
