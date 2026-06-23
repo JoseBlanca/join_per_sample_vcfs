@@ -29,7 +29,7 @@ use crate::ssr::cohort::param_estimation::{
     MAX_SLIP, SampleStutterStats, SlipProfile, StutterLevel, StutterShape,
 };
 use crate::ssr::cohort::rung_ladder::{
-    Resolution, ResolvedGenotype, RungCfg, build_rungs, resolve_confident_genotype,
+    Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs, resolve_confident_genotype,
 };
 use crate::ssr::cohort::types::CohortLocus;
 
@@ -81,10 +81,17 @@ fn merge_sample_stats(dst: &mut SampleStutterStats, src: &SampleStutterStats) {
 }
 
 /// D1 — accumulate one locus's confident-genotype statistics into `stats`.
+///
+/// BIAS NOTE: `ε` is taken off a peak's *faithful* reads by comparing each to the
+/// peak's representative allele. For a het this is mildly biased high — the other
+/// allele's rare same-length (`≥2`-step) stutter and any impure same-length variant
+/// both count as base mismatch. Negligible on homozygote-dominated cohorts; the
+/// deferred soft full-cohort EM reduce removes it by fractional attribution. Slips
+/// with `|Δ| > MAX_SLIP` are dropped (the spec cap; rare in practice).
 pub(crate) fn accumulate_locus(
     stats: &mut PrepassStats,
     locus: &CohortLocus,
-    rungs: &crate::ssr::cohort::rung_ladder::Rungs,
+    rungs: &Rungs,
     ploidy: u8,
     cfg: &RungCfg,
 ) {
@@ -167,6 +174,11 @@ fn estimate_shape(profile: &SlipProfile) -> StutterShape {
 /// Fit a sample's stutter level line `baseline + slope·length` from its
 /// faithful/slipped counts by length (weighted least squares; constant fit when a
 /// single length is observed).
+///
+/// The returned line is a **seed** and is NOT clamped here: a weighted-LS fit can
+/// extrapolate to a negative or `>1` rate at lengths outside the observed range.
+/// Every consumer clamps `level` into `[0,1]` at evaluation (`em.rs`, `sim.rs`), so
+/// the raw line is intentionally preserved for the outer-loop refit (E1).
 fn fit_level(stats: &SampleStutterStats) -> StutterLevel {
     let points: Vec<(f64, f64, f64)> = stats
         .by_length
@@ -307,14 +319,87 @@ mod tests {
         }
     }
 
-    fn run(spec: &SimCohortSpec) -> EstimatedParams {
-        let cohort = simulate(spec);
-        let loci: Vec<CohortLocus> = cohort
+    fn collect_loci(spec: &SimCohortSpec) -> Vec<CohortLocus> {
+        simulate(spec)
             .merger()
             .map(|item| item.expect("locus"))
             .map(|(_, locus)| locus)
+            .collect()
+    }
+
+    fn run(spec: &SimCohortSpec) -> EstimatedParams {
+        run_prepass(collect_loci(spec), 2, &RungCfg::dev_default())
+    }
+
+    /// A cohort of cohort-recurrent separated hets (6/10), under a known chemistry.
+    fn het_spec() -> SimCohortSpec {
+        let chem = SimChemistry {
+            error: PerBaseError(0.004),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.10,
+                slope: 0.0,
+            },
+        };
+        let samples = (0..8)
+            .map(|i| SimSample {
+                name: format!("H{i}"),
+                group: SampleGroupId(0),
+                genotypes: vec![Some(SimGenotype::diploid(6, 10))],
+            })
             .collect();
-        run_prepass(loci, 2, &RungCfg::dev_default())
+        SimCohortSpec {
+            seed: 99,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 60,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 10,
+            }],
+            groups: vec![chem],
+            samples,
+            depth: 200,
+        }
+    }
+
+    #[test]
+    fn separated_hets_contribute_two_length_bins() {
+        // A 6/10 het must deposit faithful/slipped stats at BOTH allele lengths.
+        let loci = collect_loci(&het_spec());
+        let mut stats = PrepassStats::default();
+        for locus in &loci {
+            let rungs = build_rungs(locus, &RungCfg::dev_default());
+            accumulate_locus(&mut stats, locus, &rungs, 2, &RungCfg::dev_default());
+        }
+        // Every resolved het sample carries bins at lengths 6 and 10.
+        assert!(!stats.per_sample.is_empty(), "hets should resolve");
+        for sample in stats.per_sample.values() {
+            let mut lengths: Vec<u16> = sample.by_length.iter().map(|(l, _, _)| *l).collect();
+            lengths.sort_unstable();
+            assert_eq!(
+                lengths,
+                vec![6, 10],
+                "a 6/10 het should bin at both alleles"
+            );
+        }
+        // ε is still recovered off the (cleaner outer) het skirts.
+        let est = estimate(&stats);
+        assert!((est.eps - 0.004).abs() < 0.003, "ε recovered {}", est.eps);
+    }
+
+    #[test]
+    fn run_prepass_is_deterministic() {
+        let loci = collect_loci(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10));
+        let a = run_prepass(loci.clone(), 2, &RungCfg::dev_default());
+        let b = run_prepass(loci, 2, &RungCfg::dev_default());
+        assert_eq!(
+            a, b,
+            "the pre-pass must be order-independent / reproducible"
+        );
     }
 
     #[test]
