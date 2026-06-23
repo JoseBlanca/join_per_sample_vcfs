@@ -61,7 +61,7 @@ pub(crate) struct SampleCall {
 }
 
 impl SampleCall {
-    fn no_call() -> Self {
+    pub(crate) fn no_call() -> Self {
         Self {
             allele_indices: Vec::new(),
             genotype_units: Vec::new(),
