@@ -1,25 +1,35 @@
-//! The `ssr-call` driver — open the cohort, run the merge, write the output (arch
-//! `doc/devel/architecture/ssr_call_reading.md` §5).
+//! The `ssr-call` driver — the two-pass streaming pipeline that turns a cohort of
+//! `.ssr.psp` files into a VCF (arch `doc/devel/architecture/ssr_call_driver.md`).
 //!
-//! **Phase 3: single-threaded.** The producer→queue→worker-pool→writer topology and
-//! the genotyping EM are not built here. The worker would exist to overlap *expensive
-//! EM work* with decode; with no EM yet (the genotyping doc owns it) and decode
-//! parallelism being the separate Phase-5 prefetch pool, a thread pool around a
-//! formatting stub would be unverifiable complexity. So the driver streams the merged
-//! `CohortLocus`es straight to a **catalog-ordered TSV dump** of the reading layer — a
-//! placeholder until the EM + VCF land, and a useful way to inspect a cohort's merged
-//! evidence. `--threads` / `--queue-depth` are accepted but reserved.
+//! **Pass 1 (burn-in):** open the cohort, collect a bounded subset of loci, and freeze
+//! the cross-locus-pooled parameters — chemistry (ε, stutter shape/level, `G₀`) plus the
+//! per-individual inbreeding `F` (arch §4). **Pass 2 (genotyping sweep):** re-open and
+//! stream every locus, genotyping each independently on the frozen parameters and
+//! emitting a VCF record (emit-iff-variable for PASS, filtered loci kept with their
+//! reason — arch §6). The sweep is single-threaded for now; the bounded-queue worker
+//! pool is Milestone J. `config.threads` drives the (parallel, byte-identical) burn-in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 
+use crate::ssr::cohort::candidate_set::{Admission, CandidateCfg, assemble_candidates};
+use crate::ssr::cohort::em::{EmCfg, run_locus_em_with};
+use crate::ssr::cohort::em_init::seed_locus;
+use crate::ssr::cohort::inbreeding::{OuterCfg, run_cohort_em};
 use crate::ssr::cohort::merge::{CohortMerger, SsrMergeError};
-use crate::ssr::cohort::param_estimation::{G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError};
-use crate::ssr::cohort::prepass::EstimatedParams;
-use crate::ssr::cohort::sample_groups::GroupedParams;
+use crate::ssr::cohort::param_estimation::{
+    G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError, StutterLevel,
+};
+use crate::ssr::cohort::prepass::{EstimatedParams, estimate, run_prepass_stats};
+use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
+use crate::ssr::cohort::sample_groups::{ClusterCfg, GroupedParams, group_samples};
 use crate::ssr::cohort::types::CohortLocus;
+use crate::ssr::cohort::vcf_out::{
+    FpControlCfg, apply_fp_control, f_is_warning, format_vcf_record, is_variable, site_qual,
+    write_vcf_header,
+};
 
 /// Inputs for an `ssr-call` run.
 pub(crate) struct SsrCallConfig {
@@ -27,11 +37,13 @@ pub(crate) struct SsrCallConfig {
     pub(crate) catalog: PathBuf,
     /// The per-sample `.ssr.psp` evidence files.
     pub(crate) psp_files: Vec<PathBuf>,
-    /// Output path (currently the TSV dump; the VCF lands with the EM).
+    /// Where the cohort VCF is written.
     pub(crate) output: PathBuf,
-    /// Reserved — the EM worker pool is not built yet (Phase 3 is single-threaded).
+    /// Thread count for the parallel, byte-identical burn-in (the genotyping sweep is
+    /// single-threaded until Milestone J).
     pub(crate) threads: usize,
-    /// Reserved — the bounded producer→worker queue is not built yet.
+    /// Reserved — the bounded-queue depth of the streaming genotyping sweep (Milestone
+    /// J); the current single-threaded sweep does not use it.
     pub(crate) queue_depth: usize,
 }
 
@@ -56,6 +68,14 @@ pub(crate) enum SsrCallError {
         samples.len()
     )]
     UnresolvedSamples { samples: Vec<u32> },
+    /// Two cohort samples reduce to the same VCF sample name — duplicate `#CHROM`
+    /// columns would be an invalid VCF. Sample names are the input path basenames
+    /// (decision C-1), so two inputs with the same file name collide (H2 review Mi1).
+    #[error("duplicate sample name {name:?} — cohort inputs must have distinct file names")]
+    DuplicateSampleName { name: String },
+    /// Building the burn-in thread pool failed.
+    #[error("building the ssr-call thread pool")]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
 }
 
 /// Assemble the frozen [`ParamSet`] the genotyping EM consumes from the pre-pass
@@ -122,187 +142,350 @@ pub(crate) fn build_param_set(
     })
 }
 
-/// Open the cohort, merge, and write the catalog-ordered dump to `config.output`.
+/// Diploid is the only supported ploidy (decision D); `run_locus_em` asserts it.
+const PLOIDY: u8 = 2;
+
+/// Cap on the number of loci the burn-in holds in RAM to estimate and freeze the
+/// cross-locus-pooled parameters (arch §4). The genotyping sweep streams *all* loci
+/// regardless; only the burn-in is bounded. Loci are taken in catalog-stream order until
+/// the cap — a positionally-biased first-`cap` subset; a stratified / reservoir selection
+/// is a calibration follow-up (reading Q-R5), not needed for correctness.
+const BURN_IN_MAX_LOCI: usize = 20_000;
+
+/// The cross-locus-pooled parameters the burn-in freezes for the genotyping sweep.
+struct FrozenParams {
+    /// Frozen chemistry (ε, stutter shape parent, per-group level seed, `G₀`, groups).
+    params: ParamSet,
+    /// Frozen per-(global)-sample inbreeding `F`.
+    f_per_sample: Vec<f64>,
+    /// Frozen per-group stutter level.
+    level_per_group: Vec<StutterLevel>,
+}
+
+/// Run `ssr-call`: burn-in over a bounded subset to freeze the pooled parameters, then a
+/// streaming genotyping sweep over every locus → VCF at `config.output` (arch §2/§4/§6).
 pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
+    let rung_cfg = RungCfg::dev_default();
+    let cand_cfg = CandidateCfg::dev_default();
+    let em_cfg = EmCfg::dev_default();
+    let outer_cfg = OuterCfg::dev_default();
+    let cluster_cfg = ClusterCfg::dev_default();
+    let g0_cfg = G0FitCfg::dev_default();
+    let fp_cfg = FpControlCfg::dev_default();
+
+    // ── Pass 1: header table + bounded burn-in subset ──
     let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
+    let chromosomes = merger.chromosomes();
     let chrom_names = merger.chrom_names();
+    let sample_names = merger.sample_names();
+    let n_samples = sample_names.len();
+    check_unique_sample_names(&sample_names)?;
+    let subset = collect_burn_in_subset(merger)?;
+
+    // Estimate chemistry and freeze `F` + the per-group level on the requested thread
+    // pool. The reduces are integer / fixed-point, so the result is byte-identical
+    // regardless of thread count (arch §4).
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.threads.max(1))
+        .build()?;
+    let frozen = pool.install(|| -> Result<FrozenParams, SsrCallError> {
+        let stats = run_prepass_stats(&subset, PLOIDY, &rung_cfg);
+        let est = estimate(&stats, &g0_cfg);
+        let grouped = group_samples(&stats, &est, &cluster_cfg);
+        let params = build_param_set(&est, &grouped, n_samples, &g0_cfg)?;
+        let calls = run_cohort_em(
+            &subset,
+            &params,
+            grouped.level_per_group.clone(),
+            PLOIDY,
+            &em_cfg,
+            &rung_cfg,
+            &cand_cfg,
+            &outer_cfg,
+        );
+        Ok(FrozenParams {
+            params,
+            f_per_sample: calls.f_per_sample,
+            level_per_group: calls.level_per_group,
+        })
+    })?;
+    drop(subset);
+
+    // Cohort warnings (header + stderr): the apparent-`F_IS` notice (arch §7).
+    let mut warnings = Vec::new();
+    if let Some(warning) = f_is_warning(&frozen.f_per_sample, &fp_cfg) {
+        eprintln!("ssr-call warning: {warning}");
+        warnings.push(warning);
+    }
+
+    // ── Pass 2: re-open and stream every locus → VCF ──
+    let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
     let mut out = BufWriter::new(File::create(&config.output)?);
-    write_dump(merger, &chrom_names, &mut out)?;
+    write_vcf_header(&mut out, &chromosomes, &sample_names, &warnings)?;
+    for item in merger {
+        let (_seq, locus) = item?;
+        if let Some(line) = genotype_locus(
+            &locus,
+            &chrom_names,
+            &frozen,
+            &rung_cfg,
+            &cand_cfg,
+            &em_cfg,
+            &fp_cfg,
+        ) {
+            writeln!(out, "{line}")?;
+        }
+    }
     out.flush()?;
     Ok(())
 }
 
-/// Stream every emitted `CohortLocus` to `out` as one TSV row, in catalog order.
-/// Generic over the merge sources so it is testable in memory.
-fn write_dump<R: Read + Seek, C: Read, W: Write>(
-    merger: CohortMerger<R, C>,
-    chrom_names: &[String],
-    out: &mut W,
-) -> Result<(), SsrCallError> {
-    writeln!(out, "#chrom\tstart\tend\tmotif\tn_present\tsamples")?;
-    for item in merger {
-        let (_seq, cohort) = item?;
-        writeln!(out, "{}", format_locus(&cohort, chrom_names))?;
+/// Reject a cohort whose sample names are not all distinct (H2 review Mi1): duplicate
+/// `#CHROM` columns would be an invalid VCF.
+fn check_unique_sample_names(names: &[String]) -> Result<(), SsrCallError> {
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            return Err(SsrCallError::DuplicateSampleName { name: name.clone() });
+        }
     }
     Ok(())
 }
 
-/// One TSV row for a locus: coordinates + motif + the present samples, each as
-/// `idx:depth=…,distinct=…`. Pure, so the formatting is unit-testable on its own.
-fn format_locus(cohort: &CohortLocus, chrom_names: &[String]) -> String {
-    let chrom = chrom_names
-        .get(cohort.locus.chrom_id as usize)
-        .map(String::as_str)
-        .unwrap_or("?");
-    let motif = String::from_utf8_lossy(cohort.motif.as_bytes());
-    let samples = cohort
+/// Stream the merger and collect up to [`BURN_IN_MAX_LOCI`] loci for the burn-in
+/// (bounded memory; the genotyping pass re-reads all loci).
+fn collect_burn_in_subset<R: Read + Seek, C: Read>(
+    merger: CohortMerger<R, C>,
+) -> Result<Vec<CohortLocus>, SsrCallError> {
+    let mut subset = Vec::new();
+    for item in merger {
+        let (_seq, locus) = item?;
+        subset.push(locus);
+        if subset.len() >= BURN_IN_MAX_LOCI {
+            break;
+        }
+    }
+    Ok(subset)
+}
+
+/// Genotype one streamed locus on the frozen parameters and format its VCF line, applying
+/// the emit policy (arch §6): a filtered locus is emitted with its reason; a PASS locus is
+/// emitted iff it is variable; a monomorphic PASS locus is dropped (`None`).
+fn genotype_locus(
+    locus: &CohortLocus,
+    chrom_names: &[String],
+    frozen: &FrozenParams,
+    rung_cfg: &RungCfg,
+    cand_cfg: &CandidateCfg,
+    em_cfg: &EmCfg,
+    fp_cfg: &FpControlCfg,
+) -> Option<String> {
+    let rungs = build_rungs(locus, rung_cfg);
+    let candidates = assemble_candidates(locus, &rungs, PLOIDY, cand_cfg);
+    let seed = seed_locus(
+        locus,
+        &rungs,
+        &candidates,
+        &frozen.params,
+        PLOIDY,
+        rung_cfg.prominence,
+    );
+    let f_present: Vec<f64> = locus
         .present
         .iter()
-        .zip(&cohort.samples)
-        .map(|(idx, evidence)| {
-            format!(
-                "{idx}:depth={},distinct={}",
-                evidence.qc.depth,
-                evidence.seq_counts.len()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";");
-    format!(
-        "{chrom}\t{}\t{}\t{motif}\t{}\t{samples}",
-        cohort.locus.start,
-        cohort.locus.end,
-        cohort.present_count(),
-    )
+        .map(|&g| frozen.f_per_sample[g as usize])
+        .collect();
+    let mut call = run_locus_em_with(
+        locus,
+        &rungs,
+        &candidates,
+        &frozen.params,
+        &seed,
+        PLOIDY,
+        em_cfg,
+        &f_present,
+        &frozen.level_per_group,
+    );
+    apply_fp_control(locus, &mut call, fp_cfg);
+
+    // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
+    if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
+        return None;
+    }
+    let qual = site_qual(&call, &candidates, fp_cfg);
+    let chrom = chrom_names
+        .get(locus.locus.chrom_id as usize)
+        .map(String::as_str)
+        .unwrap_or("?");
+    Some(format_vcf_record(chrom, locus, &candidates, &call, qual))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssr::cohort::test_support::{
-        REF_MD5, catalog_bytes, loc, obs, reader, rec, ssr_header, ssr_psp,
-    };
-    use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
-    use crate::ssr::types::Motif;
-    use std::io::Cursor;
+    use crate::psp::registry_ssr::SsrLocusRecord;
+    use crate::ssr::cohort::test_support::{REF_MD5, catalog_bytes, ssr_header, ssr_psp};
+    use crate::ssr::types::{Locus, Motif};
 
-    fn cohort_locus(chrom_id: u32, start: u32, present: &[(u32, u32, usize)]) -> CohortLocus {
-        let mut cl = CohortLocus::new(
-            LocusId {
-                chrom_id,
-                start,
-                end: start + 6,
-            },
+    /// `CA` repeated `units` times — one allele's tract sequence.
+    fn ca(units: u16) -> Box<[u8]> {
+        "CA".repeat(units as usize).into_bytes().into_boxed_slice()
+    }
+
+    /// A catalog locus on `chrom` at 0-based `start` with a `units`-unit `CA` reference
+    /// tract (`GGGGGG` + `CA`×units + `TTTTTT`, anchored 6 bp upstream).
+    fn loc_units(chrom: &str, start: u32, units: u32) -> Locus {
+        let mut ref_seq = b"GGGGGG".to_vec();
+        ref_seq.extend_from_slice(&"CA".repeat(units as usize).into_bytes());
+        ref_seq.extend_from_slice(b"TTTTTT");
+        Locus::new(
+            chrom.into(),
+            start,
+            start + 2 * units,
             Motif::new(b"CA").unwrap(),
-            Box::from(b"GGGGGGCACACATTTTTT".as_slice()),
-            Box::from(b"CACACA".as_slice()),
-        );
-        for &(idx, depth, n_alleles) in present {
-            cl.push(
-                idx,
-                SampleEvidence {
-                    seq_counts: (0..n_alleles)
-                        .map(|i| (vec![b'C', b'A', i as u8].into_boxed_slice(), 1))
-                        .collect(),
-                    qc: SsrQc {
-                        depth,
-                        n_filtered: 0,
-                        mapped_reads: 0,
-                        n_low_quality: 0,
-                        n_border_off_end: 0,
-                    },
-                },
-            );
-        }
-        cl
-    }
-
-    #[test]
-    fn format_locus_renders_chrom_motif_and_samples() {
-        let names = vec!["chr1".to_string()];
-        let cl = cohort_locus(0, 16, &[(0, 30, 1), (2, 12, 3)]);
-        assert_eq!(
-            format_locus(&cl, &names),
-            "chr1\t16\t22\tCA\t2\t0:depth=30,distinct=1;2:depth=12,distinct=3"
-        );
-    }
-
-    #[test]
-    fn format_locus_falls_back_when_chrom_id_unknown() {
-        let cl = cohort_locus(7, 16, &[(0, 30, 1)]);
-        assert!(format_locus(&cl, &[]).starts_with("?\t16\t22\tCA\t1\t"));
-    }
-
-    #[test]
-    fn write_dump_emits_header_and_one_row_per_locus_in_order() {
-        let loci = [loc("chr1", 16), loc("chr1", 60), loc("chr1", 100)];
-        let catalog =
-            crate::ssr::catalog::io::CatalogReader::new(Cursor::new(catalog_bytes(REF_MD5, &loci)))
-                .unwrap();
-        // Sample 0 covers 16 + 100; sample 1 covers 60 + 100.
-        let a = reader(ssr_psp(
-            ssr_header(&["chr1"], REF_MD5),
-            &[
-                rec(0, 16, obs(&[(b"CACACA", 4)])),
-                rec(0, 100, obs(&[(b"CA", 2)])),
-            ],
-        ));
-        let b = reader(ssr_psp(
-            ssr_header(&["chr1"], REF_MD5),
-            &[
-                rec(0, 60, obs(&[(b"CACACACA", 5)])),
-                rec(0, 100, obs(&[(b"CA", 3)])),
-            ],
-        ));
-        let merger =
-            CohortMerger::from_parts(catalog, vec![("A".into(), a), ("B".into(), b)]).unwrap();
-        let names = merger.chrom_names();
-
-        let mut out = Vec::new();
-        write_dump(merger, &names, &mut out).unwrap();
-        let text = String::from_utf8(out).unwrap();
-
-        assert_eq!(
-            text,
-            "#chrom\tstart\tend\tmotif\tn_present\tsamples\n\
-             chr1\t16\t22\tCA\t1\t0:depth=30,distinct=1\n\
-             chr1\t60\t66\tCA\t1\t1:depth=30,distinct=1\n\
-             chr1\t100\t106\tCA\t2\t0:depth=30,distinct=1;1:depth=30,distinct=1\n"
-        );
-    }
-
-    #[test]
-    fn run_reads_files_and_writes_the_dump() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let catalog_path = dir.path().join("c.ssr.catalog");
-        let a_path = dir.path().join("a.ssr.psp");
-        let out_path = dir.path().join("out.tsv");
-
-        std::fs::write(&catalog_path, catalog_bytes(REF_MD5, &[loc("chr1", 16)])).unwrap();
-        std::fs::write(
-            &a_path,
-            ssr_psp(
-                ssr_header(&["chr1"], REF_MD5),
-                &[rec(0, 16, obs(&[(b"CACACA", 4)]))],
-            ),
+            1.0,
+            ref_seq.into_boxed_slice(),
+            start - 6,
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let config = SsrCallConfig {
-            catalog: catalog_path,
-            psp_files: vec![a_path],
-            output: out_path.clone(),
-            threads: 4,
+    /// Per-read evidence for a genotype: a clean peak at each allele length plus light
+    /// ±1 stutter (a homozygote gets full depth; a het splits it). An empty allele list
+    /// yields a thin record that never resolves confidently.
+    fn reads_for(alleles: &[u16]) -> Vec<(Box<[u8]>, u32)> {
+        if alleles.is_empty() {
+            return vec![(ca(8), 3)]; // below the resolution depth floor
+        }
+        let peak = if alleles.len() == 1 { 150 } else { 75 };
+        let mut counts: Vec<(Box<[u8]>, u32)> = Vec::new();
+        for &a in alleles {
+            counts.push((ca(a), peak));
+            counts.push((ca(a - 1), 4));
+            counts.push((ca(a + 1), 4));
+        }
+        counts.sort_by(|x, y| x.0.cmp(&y.0));
+        counts
+    }
+
+    /// One `.ssr.psp` record at the `units`-unit locus frame starting at 0-based `start`
+    /// (1-based half-open container coords; `end` matches the catalog frame, *not* the
+    /// observed allele lengths — the cursor derives the `LocusId` from these). Depth is
+    /// the observed read total.
+    fn ssr_record(start: u32, units: u32, observed: Vec<(Box<[u8]>, u32)>) -> SsrLocusRecord {
+        let depth = observed.iter().map(|(_, c)| *c).sum();
+        SsrLocusRecord {
+            chrom_id: 0,
+            start: start + 1,
+            end: start + 2 * units + 1,
+            depth,
+            n_filtered: 0,
+            mapped_reads: depth,
+            n_low_quality: 0,
+            n_border_off_end: 0,
+            observed,
+        }
+    }
+
+    /// Write a cohort to `dir`: a catalog over `loci` (`(start, ref_units)`) plus one
+    /// `.ssr.psp` per sample (`(name, per-locus allele genotype)`), and return the config.
+    fn write_cohort(
+        dir: &std::path::Path,
+        loci: &[(u32, u32)],
+        samples: &[(&str, Vec<Vec<u16>>)],
+    ) -> SsrCallConfig {
+        let catalog_loci: Vec<Locus> = loci.iter().map(|&(s, u)| loc_units("chr1", s, u)).collect();
+        let catalog = dir.join("c.ssr.catalog");
+        std::fs::write(&catalog, catalog_bytes(REF_MD5, &catalog_loci)).unwrap();
+        let mut psp_files = Vec::new();
+        for (name, genotypes) in samples {
+            let records: Vec<SsrLocusRecord> = loci
+                .iter()
+                .zip(genotypes)
+                .map(|(&(s, u), alleles)| ssr_record(s, u, reads_for(alleles)))
+                .collect();
+            let path = dir.join(format!("{name}.ssr.psp"));
+            std::fs::write(&path, ssr_psp(ssr_header(&["chr1"], REF_MD5), &records)).unwrap();
+            psp_files.push(path);
+        }
+        SsrCallConfig {
+            catalog,
+            psp_files,
+            output: dir.join("out.vcf"),
+            threads: 2,
             queue_depth: 4,
-        };
-        run(&config).unwrap();
+        }
+    }
 
-        let text = std::fs::read_to_string(&out_path).unwrap();
+    #[test]
+    fn run_emits_a_vcf_with_a_pass_variant_and_drops_a_monomorphic_locus() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Locus A (start 40): 6 homozygous-ref (8/8) + 6 separated hets (6/10) → variable.
+        // Locus B (start 100): every sample 8/8 (= reference) → monomorphic, dropped.
+        let mut owned: Vec<(String, Vec<Vec<u16>>)> = Vec::new();
+        for i in 0..6 {
+            owned.push((format!("hom{i}"), vec![vec![8], vec![8]]));
+        }
+        for i in 0..6 {
+            owned.push((format!("het{i}"), vec![vec![6, 10], vec![8]]));
+        }
+        let samples: Vec<(&str, Vec<Vec<u16>>)> =
+            owned.iter().map(|(n, g)| (n.as_str(), g.clone())).collect();
+        let config = write_cohort(dir.path(), &[(40, 8), (100, 8)], &samples);
+
+        run(&config).unwrap();
+        let vcf = std::fs::read_to_string(&config.output).unwrap();
+
+        assert!(vcf.starts_with("##fileformat=VCFv4.4"), "{vcf}");
+        let chrom_line = vcf.lines().find(|l| l.starts_with("#CHROM")).unwrap();
+        assert_eq!(chrom_line.split('\t').count(), 9 + 12, "12 sample columns");
+
+        // Exactly one data record (locus A); the monomorphic locus B is dropped.
+        let records: Vec<&str> = vcf.lines().filter(|l| !l.starts_with('#')).collect();
         assert_eq!(
-            text,
-            "#chrom\tstart\tend\tmotif\tn_present\tsamples\n\
-             chr1\t16\t22\tCA\t1\t0:depth=30,distinct=1\n"
+            records.len(),
+            1,
+            "monomorphic locus B must be dropped\n{vcf}"
         );
+        let cols: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!(cols[0], "chr1");
+        assert_eq!(cols[6], "PASS", "variant locus should PASS: {}", records[0]);
+        assert_ne!(cols[4], ".", "should carry an ALT allele");
+        // Sample columns are homs (9..15) then hets (15..21); each het calls REPCN 6/10.
+        for col in &cols[15..21] {
+            let repcn = col.split(':').nth(2).unwrap();
+            let mut units: Vec<u16> = repcn.split(',').map(|s| s.parse().unwrap()).collect();
+            units.sort_unstable();
+            assert_eq!(units, vec![6, 10], "het miscalled: {col}");
+        }
+    }
+
+    #[test]
+    fn run_hard_errors_when_a_sample_never_resolves() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Four resolvable homozygotes + one thin sample (index 4) that never resolves.
+        let mut owned: Vec<(String, Vec<Vec<u16>>)> = (0..4)
+            .map(|i| (format!("ok{i}"), vec![vec![8u16]]))
+            .collect();
+        owned.push(("thin".to_string(), vec![vec![]]));
+        let samples: Vec<(&str, Vec<Vec<u16>>)> =
+            owned.iter().map(|(n, g)| (n.as_str(), g.clone())).collect();
+        let config = write_cohort(dir.path(), &[(40, 8)], &samples);
+
+        match run(&config) {
+            Err(SsrCallError::UnresolvedSamples { samples }) => assert_eq!(samples, vec![4]),
+            other => panic!("expected UnresolvedSamples, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_unique_sample_names_rejects_a_collision() {
+        let names = vec!["s".to_string(), "t".to_string(), "s".to_string()];
+        match check_unique_sample_names(&names) {
+            Err(SsrCallError::DuplicateSampleName { name }) => assert_eq!(name, "s"),
+            other => panic!("expected DuplicateSampleName, got {other:?}"),
+        }
+        assert!(check_unique_sample_names(&["a".to_string(), "b".to_string()]).is_ok());
     }
 
     #[test]
@@ -319,7 +502,7 @@ mod tests {
 
     // ── H1: build_param_set ──
 
-    use crate::ssr::cohort::param_estimation::{SampleGroupId, StutterLevel, StutterShape};
+    use crate::ssr::cohort::param_estimation::{SampleGroupId, StutterShape};
 
     fn shape() -> StutterShape {
         StutterShape {
