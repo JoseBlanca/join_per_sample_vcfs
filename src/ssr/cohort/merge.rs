@@ -567,6 +567,7 @@ mod tests {
         assert_eq!(chroms.len(), 2);
         assert_eq!(chroms[0].name, "chr1");
         assert_eq!(chroms[0].length, 100_000);
+        assert_eq!(chroms[0].md5, "0".repeat(32));
         assert_eq!(chroms[1].name, "chr2");
         // The sample column name is the path basename without `.ssr.psp`.
         assert_eq!(merger.sample_names(), vec!["sampleA".to_string()]);

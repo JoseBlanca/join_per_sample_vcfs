@@ -145,6 +145,11 @@ yet (that is Milestone I).
   `#CHROM … FORMAT <sample_1…N>` line in merger order.
 - Dedicated SSR writer — **not** the SNP `src/vcf/writer.rs` (settled; the two diverge,
   and `format_vcf_record` already emits text data lines).
+- **Carry-over from the H2 review (Mi1):** `merger.sample_names()` derives basenames, which
+  can collide (same file name in different directories) → duplicate `#CHROM` columns =
+  invalid VCF. Validate uniqueness here (or in H4 before writing) and return a typed error
+  (e.g. `SsrCallError::DuplicateSampleName { name }`) rather than emitting a malformed VCF.
+  See [review](../reports/reviews/ssr_call_merger_accessors_2026-06-23.md) Mi1.
 - **Tests:** header lines present & correct; contig lengths; sample columns in order;
   warning line appears iff supplied; output parses as a VCF header.
 
