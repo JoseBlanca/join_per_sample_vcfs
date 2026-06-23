@@ -317,7 +317,7 @@ mod tests {
             .map(|item| item.expect("locus"))
             .map(|(_, locus)| locus)
             .collect();
-        let stats = run_prepass_stats(loci, 2, &RungCfg::dev_default());
+        let stats = run_prepass_stats(&loci, 2, &RungCfg::dev_default());
         let est = estimate(&stats);
         (stats, est)
     }

@@ -25,6 +25,8 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use crate::ssr::cohort::param_estimation::{
     MAX_SLIP, SampleStutterStats, SlipProfile, StutterLevel, StutterShape,
 };
@@ -44,6 +46,31 @@ pub(crate) struct PrepassStats {
     pub(crate) slip_by_sample_period: HashMap<(u32, u8), SlipProfile>,
     /// Global sample index → its stutter stats (level line + `ε` + depth).
     pub(crate) per_sample: HashMap<u32, SampleStutterStats>,
+}
+
+impl PrepassStats {
+    /// Fold another partial in. All fields are integer counts, so this is
+    /// commutative + associative — the merge order does not change the totals (the
+    /// determinism the parallel reduce relies on).
+    pub(crate) fn merge(&mut self, other: &PrepassStats) {
+        for (&period, profile) in &other.slip_by_period {
+            merge_slip_profile(self.slip_by_period.entry(period).or_default(), profile);
+        }
+        for (&key, profile) in &other.slip_by_sample_period {
+            merge_slip_profile(self.slip_by_sample_period.entry(key).or_default(), profile);
+        }
+        for (&sample, stats) in &other.per_sample {
+            merge_sample_stats(self.per_sample.entry(sample).or_default(), stats);
+        }
+    }
+}
+
+/// Add `src`'s slip counts into `dst` (integer, order-independent).
+fn merge_slip_profile(dst: &mut SlipProfile, src: &SlipProfile) {
+    for k in 0..MAX_SLIP {
+        dst.up[k] += src.up[k];
+        dst.down[k] += src.down[k];
+    }
 }
 
 /// The measured global parameters (pre-grouping; D3 splits these per sample group).
@@ -292,26 +319,28 @@ pub(crate) fn estimate(stats: &PrepassStats) -> EstimatedParams {
     }
 }
 
-/// Accumulate the pre-pass sufficient statistics over a cohort-locus stream.
-pub(crate) fn run_prepass_stats(
-    loci: impl IntoIterator<Item = CohortLocus>,
-    ploidy: u8,
-    cfg: &RungCfg,
-) -> PrepassStats {
-    let mut stats = PrepassStats::default();
-    for locus in loci {
-        let rungs = build_rungs(&locus, cfg);
-        accumulate_locus(&mut stats, &locus, &rungs, ploidy, cfg);
-    }
-    stats
+/// Accumulate the pre-pass sufficient statistics over the cohort loci (parallel).
+///
+/// Each thread accumulates a per-thread [`PrepassStats`] partial; the partials are
+/// reduced with [`PrepassStats::merge`]. The statistics are integer counts, so the
+/// reduce is order-independent — the result is byte-identical across thread counts
+/// (F1), and `estimate` reads off it deterministically regardless of any internal
+/// `Vec`/`HashMap` ordering.
+pub(crate) fn run_prepass_stats(loci: &[CohortLocus], ploidy: u8, cfg: &RungCfg) -> PrepassStats {
+    loci.par_iter()
+        .fold(PrepassStats::default, |mut acc, locus| {
+            let rungs = build_rungs(locus, cfg);
+            accumulate_locus(&mut acc, locus, &rungs, ploidy, cfg);
+            acc
+        })
+        .reduce(PrepassStats::default, |mut a, b| {
+            a.merge(&b);
+            a
+        })
 }
 
-/// Run the pre-pass over a cohort-locus stream and return the measured parameters.
-pub(crate) fn run_prepass(
-    loci: impl IntoIterator<Item = CohortLocus>,
-    ploidy: u8,
-    cfg: &RungCfg,
-) -> EstimatedParams {
+/// Run the pre-pass over the cohort loci and return the measured parameters.
+pub(crate) fn run_prepass(loci: &[CohortLocus], ploidy: u8, cfg: &RungCfg) -> EstimatedParams {
     estimate(&run_prepass_stats(loci, ploidy, cfg))
 }
 
@@ -373,7 +402,7 @@ mod tests {
     }
 
     fn run(spec: &SimCohortSpec) -> EstimatedParams {
-        run_prepass(collect_loci(spec), 2, &RungCfg::dev_default())
+        run_prepass(&collect_loci(spec), 2, &RungCfg::dev_default())
     }
 
     /// A cohort of cohort-recurrent separated hets (6/10), under a known chemistry.
@@ -436,11 +465,30 @@ mod tests {
         assert!((est.eps - 0.004).abs() < 0.003, "ε recovered {}", est.eps);
     }
 
+    fn with_threads<T: Send>(n: usize, f: impl FnOnce() -> T + Send) -> T {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .unwrap()
+            .install(f)
+    }
+
+    #[test]
+    fn prepass_is_byte_identical_across_thread_counts() {
+        let loci = collect_loci(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10));
+        let single = with_threads(1, || run_prepass(&loci, 2, &RungCfg::dev_default()));
+        let multi = with_threads(4, || run_prepass(&loci, 2, &RungCfg::dev_default()));
+        assert_eq!(
+            single, multi,
+            "the pre-pass must be byte-identical across thread counts (F1)"
+        );
+    }
+
     #[test]
     fn run_prepass_is_deterministic() {
         let loci = collect_loci(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10));
-        let a = run_prepass(loci.clone(), 2, &RungCfg::dev_default());
-        let b = run_prepass(loci, 2, &RungCfg::dev_default());
+        let a = run_prepass(&loci, 2, &RungCfg::dev_default());
+        let b = run_prepass(&loci, 2, &RungCfg::dev_default());
         assert_eq!(
             a, b,
             "the pre-pass must be order-independent / reproducible"

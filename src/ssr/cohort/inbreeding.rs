@@ -15,6 +15,8 @@
 //! parallel F1 step proves). The level refit here is the hard-label form; the soft
 //! per-allele responsibility reduce is the deferred refinement.
 
+use rayon::prelude::*;
+
 use crate::ssr::cohort::candidate_set::{CandidateCfg, CandidateSet, assemble_candidates};
 use crate::ssr::cohort::em::{EmCfg, LocusCall, run_locus_em_with};
 use crate::ssr::cohort::em_init::{LocusSeed, seed_locus};
@@ -221,9 +223,11 @@ pub(crate) fn run_cohort_em(
     let mut per_locus: Vec<LocusCall> = Vec::new();
 
     for _ in 0..outer_cfg.max_rounds {
+        // Per-locus EM is independent and pure; rayon's indexed `collect` preserves
+        // locus order, so the result is byte-identical across thread counts (F1).
         per_locus = loci
-            .iter()
-            .zip(&prepared)
+            .par_iter()
+            .zip(prepared.par_iter())
             .map(|(locus, prep)| {
                 let f_present: Vec<f64> = locus
                     .present
@@ -464,7 +468,7 @@ mod tests {
         let loci = collect_loci(&spec);
 
         // Pre-pass → estimate → cluster.
-        let stats = run_prepass_stats(loci.iter().cloned(), 2, &RungCfg::dev_default());
+        let stats = run_prepass_stats(&loci, 2, &RungCfg::dev_default());
         let est = estimate(&stats);
         let grouped = group_samples(&stats, &est, &ClusterCfg::dev_default());
 
@@ -550,6 +554,37 @@ mod tests {
             )
         };
         assert_eq!(run().f_per_sample, run().f_per_sample);
+    }
+
+    #[test]
+    fn cohort_em_is_byte_identical_across_thread_counts() {
+        let (spec, _) = inbreeding_spec();
+        let loci = collect_loci(&spec);
+        let params = clean_params(spec.samples.len());
+        let run = || {
+            run_cohort_em(
+                &loci,
+                &params,
+                params.level_seed.clone(),
+                2,
+                &EmCfg::dev_default(),
+                &RungCfg::dev_default(),
+                &CandidateCfg::dev_default(),
+                &OuterCfg::dev_default(),
+            )
+        };
+        let pool = |n: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+        };
+        let single = pool(1).install(run);
+        let multi = pool(4).install(run);
+        assert_eq!(
+            single, multi,
+            "the genotyping outer loop must be byte-identical across thread counts (F1)"
+        );
     }
 
     #[test]
