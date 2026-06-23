@@ -155,6 +155,16 @@ impl Rungs {
     pub(crate) fn period(&self) -> usize {
         self.period
     }
+
+    /// The cohort modal allele length (the most-supported rung; ties → the shorter
+    /// length). `None` only for an empty locus. This is the centre of the `G₀` prior
+    /// (spec §5.5 — the mode, *not* the reference).
+    pub(crate) fn modal_length(&self) -> Option<u16> {
+        self.cohort_support
+            .iter()
+            .max_by(|(la, sa), (lb, sb)| sa.cmp(sb).then_with(|| lb.cmp(la)))
+            .map(|(length, _)| *length)
+    }
 }
 
 /// One sample's length histogram (repeat units → total supporting reads).

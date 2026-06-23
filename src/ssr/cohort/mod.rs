@@ -8,8 +8,12 @@
 //! `ssr_call_parameters.md`, `ssr_call_genotyping.md`; build plan
 //! `doc/devel/implementation_plans/ssr_call_reading.md`.
 
+pub mod allele_freq_prior;
 pub mod candidate_set;
 pub mod driver;
+pub mod em;
+pub mod em_init;
+pub mod likelihood;
 pub mod merge;
 pub mod pair_hmm;
 pub mod param_estimation;
@@ -17,6 +21,7 @@ pub mod reader;
 pub mod rung_ladder;
 pub mod stutter;
 pub mod types;
+pub mod vcf_out;
 
 #[cfg(test)]
 pub(crate) mod sim;
