@@ -115,6 +115,7 @@ mod tests {
             },
             Motif::new(b"CA").unwrap(),
             Box::from(b"GGGGGGCACACATTTTTT".as_slice()),
+            Box::from(b"CACACA".as_slice()),
         );
         for &(idx, depth, n_alleles) in present {
             cl.push(

@@ -226,8 +226,12 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
             }
             self.prev_locus = Some(locus_id);
 
-            let mut cohort =
-                CohortLocus::new(locus_id, locus.motif(), Box::from(locus.ref_bytes()));
+            let mut cohort = CohortLocus::new(
+                locus_id,
+                locus.motif(),
+                Box::from(locus.ref_bytes()),
+                Box::from(locus.ref_tract()),
+            );
             let labels = &self.labels;
             for (sample_idx, cursor) in self.cursors.iter_mut().enumerate() {
                 let evidence =

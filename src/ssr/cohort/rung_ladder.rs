@@ -226,6 +226,26 @@ pub(crate) fn build_rungs(locus: &CohortLocus, cfg: &RungCfg) -> Rungs {
     }
 }
 
+/// One sample's clear local maxima as labelled peaks (shared by the confident-
+/// genotype gate and candidate assembly, C1). Ascending by length.
+pub(crate) fn sample_clear_peaks(
+    evidence: &SampleEvidence,
+    period: usize,
+    prominence: u32,
+) -> Vec<PeakAllele> {
+    let histogram = sample_histogram(evidence, period);
+    histogram
+        .keys()
+        .copied()
+        .filter(|&length| is_clear_peak(&histogram, length, prominence))
+        .map(|length| PeakAllele {
+            allele: representative_sequence(evidence, length, period),
+            repeat_len: length,
+            support: histogram[&length],
+        })
+        .collect()
+}
+
 /// The sample's most-supported sequence at `length` units (its representative
 /// parent allele for a resolved peak). `length` is known to be occupied.
 fn representative_sequence(evidence: &SampleEvidence, length: u16, period: usize) -> Box<[u8]> {
@@ -253,18 +273,7 @@ pub(crate) fn resolve_confident_genotype(
         return Resolution::Unresolved(UnresolvedReason::Thin);
     }
 
-    let period = rungs.period;
-    let histogram = sample_histogram(sample, period);
-    let mut peaks: Vec<PeakAllele> = histogram
-        .keys()
-        .copied()
-        .filter(|&length| is_clear_peak(&histogram, length, cfg.prominence))
-        .map(|length| PeakAllele {
-            allele: representative_sequence(sample, length, period),
-            repeat_len: length,
-            support: histogram[&length],
-        })
-        .collect();
+    let mut peaks = sample_clear_peaks(sample, rungs.period, cfg.prominence);
 
     // No clear maximum despite adequate depth: two adjacent alleles cancel each
     // other's prominence (the 1-apart merged het). NOTE: a structureless / pure-noise
@@ -396,6 +405,7 @@ mod tests {
             },
             Motif::new(b"CA").unwrap(),
             Box::from(b"GGGGGGCACACATTTTTT".as_slice()),
+            Box::from(b"CACACA".as_slice()),
         );
         for (idx, evidence) in samples.into_iter().enumerate() {
             locus.push(idx as u32, evidence);

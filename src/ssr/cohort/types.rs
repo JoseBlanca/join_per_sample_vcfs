@@ -84,6 +84,11 @@ pub(crate) struct CohortLocus {
     /// Reference **tract + flanks** (not just the tract): the Δ frame and the
     /// alignment frame the genotyper aligns reads against.
     pub(crate) ref_frame: Box<[u8]>,
+    /// The reference **tract** alone (the REF allele) — the bytes between the
+    /// flanks. Carried explicitly because `ref_frame` does not record where the
+    /// flanks end, and the genotyper needs the REF allele for candidate seeding and
+    /// the VCF REF column.
+    pub(crate) ref_tract: Box<[u8]>,
     /// Cohort sample indices of the present samples, ascending; parallel to
     /// [`Self::samples`].
     pub(crate) present: Vec<u32>,
@@ -95,11 +100,17 @@ impl CohortLocus {
     /// Start an empty work-item for `locus` with its catalog frame; the merger then
     /// [`push`](Self::push)es each present sample's evidence in ascending sample-index
     /// order.
-    pub(crate) fn new(locus: LocusId, motif: Motif, ref_frame: Box<[u8]>) -> Self {
+    pub(crate) fn new(
+        locus: LocusId,
+        motif: Motif,
+        ref_frame: Box<[u8]>,
+        ref_tract: Box<[u8]>,
+    ) -> Self {
         Self {
             locus,
             motif,
             ref_frame,
+            ref_tract,
             present: Vec::new(),
             samples: Vec::new(),
         }
@@ -182,6 +193,7 @@ mod tests {
             },
             motif(b"AT"),
             Box::from(b"ATATAT".as_slice()),
+            Box::from(b"ATATAT".as_slice()),
         );
         assert!(cl.is_empty());
         assert_eq!(cl.present_count(), 0);
@@ -196,6 +208,7 @@ mod tests {
                 end: 58,
             },
             motif(b"AT"),
+            Box::from(b"ATATATAT".as_slice()),
             Box::from(b"ATATATAT".as_slice()),
         );
         cl.push(0, evidence(&[(b"ATATAT", 7)]));
@@ -220,6 +233,7 @@ mod tests {
                 end: 4,
             },
             motif(b"AT"),
+            Box::from(b"ATAT".as_slice()),
             Box::from(b"ATAT".as_slice()),
         );
         cl.push(5, evidence(&[(b"AT", 1)]));
