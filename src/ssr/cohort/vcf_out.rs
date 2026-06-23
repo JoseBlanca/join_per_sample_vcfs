@@ -78,6 +78,13 @@ const FILTER_DESCRIPTIONS: &[(Admission, &str)] = &[
 /// differs and the data lines are the plain text [`format_vcf_record`] emits, so the
 /// whole SSR VCF stays in one serialization style. `warnings` are emitted as
 /// `##ssrCallWarning=…` meta lines (e.g. the apparent-`F_IS` notice, [`f_is_warning`]).
+///
+/// **Input contract:** each `warning` must be a single line (a newline would split it
+/// into a bogus meta line — `f_is_warning` honours this); the caller is responsible for
+/// VCF-clean sample/contig names (no tabs), and for **sample-name uniqueness** — the
+/// driver validates that before calling here, since duplicate `#CHROM` columns are an
+/// invalid VCF. `##contig` deliberately carries `ID` + `length` only; the `md5` on
+/// `ParsedChromosome` is available but omitted (arch §5).
 pub(crate) fn write_vcf_header<W: Write>(
     out: &mut W,
     chromosomes: &[ParsedChromosome],

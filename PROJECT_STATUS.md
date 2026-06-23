@@ -19,20 +19,20 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) driver wiring — Step H2 (merger header accessors)**
->   (branch `ssr-cohort`, impl `f01c14e`). Exposes the cohort header table for the VCF
->   writer (settled arch [ssr_call_driver.md](doc/devel/architecture/ssr_call_driver.md),
->   plan [ssr_call_driver.md](doc/devel/implementation_plans/ssr_call_driver.md)).
->   `CohortMerger::chromosomes()` returns name+length+md5 in global-id order — the lengths
->   come from the `.ssr.psp` headers, **not** the lengthless catalog (the correction to the
->   brief); `sample_names()` derives each `#CHROM` column as the input path basename without
->   `.ssr.psp` (decision C-1); the two-pass re-open (`open` twice → identical stream) is
->   proven. Reviewed (Approve-with-changes; 0 Blocker/Major, 1 Minor) and **fixes applied**
->   ([review](doc/devel/reports/reviews/ssr_call_merger_accessors_2026-06-23.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_merger_accessors.md); Mi1
->   sample-name uniqueness → H3/H4). fmt/clippy `-D warnings` clean; 1268 lib tests.
->   See the SSR Stage 2 **Driver wiring** block below.
->   **Next (loop):** Step H3 (dedicated SSR VCF header writer), then H4 (streaming driver → VCF = task DoD).
+> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) driver wiring — Step H3 (SSR VCF header writer)**
+>   (branch `ssr-cohort`, impl `2ff5b1b`). `vcf_out::write_vcf_header` — a dedicated
+>   plain-text SSR header (settled arch [ssr_call_driver.md](doc/devel/architecture/ssr_call_driver.md),
+>   plan [ssr_call_driver.md](doc/devel/implementation_plans/ssr_call_driver.md)), **not**
+>   the SNP `src/vcf/writer.rs`, so the whole SSR VCF stays in one serialization style with
+>   `format_vcf_record`'s data lines. Emits `##fileformat`, `##ssrCallWarning=` lines (e.g.
+>   apparent-`F_IS`), `##contig` with lengths (from the `.ssr.psp` headers), `PERIOD` INFO,
+>   `GT`/`GQ`/`REPCN` FORMAT, the SSR FILTER vocabulary (IDs from `filter_text`, one source
+>   of truth), and the `#CHROM … <samples>` column line. Reviewed (Approve-with-changes;
+>   0 Blocker/Major/Minor, Nits) and **fixes applied**
+>   ([review](doc/devel/reports/reviews/ssr_call_vcf_header_2026-06-23.md),
+>   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_vcf_header.md)).
+>   fmt/clippy `-D warnings` clean; 1271 lib tests. See the SSR Stage 2 **Driver wiring** block below.
+>   **Next (loop):** Step H4 — the streaming driver (burn-in → freeze → sweep → VCF), the task definition of done.
 > - **Prior task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
 >   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
 >   Built the reading & merge spine through a runnable `ssr-call`: Phase 0 scaffolding;
@@ -1031,8 +1031,9 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Plan:** [ssr_call_driver.md](doc/devel/implementation_plans/ssr_call_driver.md) — milestones G (G₀ fit) → H (Step 1 streaming driver + VCF = task DoD) → I (Step 2 per-locus stutter adaptation) → J (parallelism), each through the implement → review → fix loop.
 - **Step G1 (G₀ decay fit):** implemented `640a1e6`, [review](doc/devel/reports/reviews/ssr_call_g0_fit_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major, 3 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_g0_fit.md) (Mi2/Mi3 + 2 Nits Applied; Mi1 → H1). Per-period `G₀` `p` fit from the confident germline allele spread over variable loci (closed-form geometric MLE, thin-period fallback, over-tightening clamp).
 - **Step H1 (`build_param_set`):** implemented `4168331`, [review](doc/devel/reports/reviews/ssr_call_build_param_set_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major, 2 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_build_param_set.md) (Mi2 + 2 Nits Applied; Mi1 → H4). Pre-pass → frozen `ParamSet`; decision-E hard error (`SsrCallError::UnresolvedSamples`); resolves G1-Mi1 (backfills `G0FitCfg.fallback_p` for characterized periods without a fit).
-- **Step H2 (merger accessors):** implemented `f01c14e`, [review](doc/devel/reports/reviews/ssr_call_merger_accessors_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major, 1 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_merger_accessors.md) (md5-assert Nit Applied; Mi1 → H3/H4). `CohortMerger::chromosomes()` (name+length+md5 from the `.ssr.psp` headers, not the catalog) + `sample_names()` (basename); two-pass re-open proven. 1268 lib tests; fmt/clippy clean.
-- **Open:** H1-Mi1 (→ H4: backfill `G₀` over the genotyped-loci period set vs `shape_by_period`); H2-Mi1 (→ H3/H4: enforce sample-name uniqueness before emitting the VCF); Steps H3–J1 unstarted.
+- **Step H2 (merger accessors):** implemented `f01c14e`, [review](doc/devel/reports/reviews/ssr_call_merger_accessors_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major, 1 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_merger_accessors.md) (md5-assert Nit Applied; Mi1 → H3/H4). `CohortMerger::chromosomes()` (name+length+md5 from the `.ssr.psp` headers, not the catalog) + `sample_names()` (basename); two-pass re-open proven.
+- **Step H3 (VCF header writer):** implemented `2ff5b1b`, [review](doc/devel/reports/reviews/ssr_call_vcf_header_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major/Minor, Nits) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_vcf_header.md) (input-contract + md5-omission doc notes Applied). `vcf_out::write_vcf_header` — dedicated plain-text SSR header (fileformat, ##contig w/ lengths, PERIOD INFO, GT/GQ/REPCN FORMAT, SSR FILTER from `filter_text`, `#CHROM … <samples>`); warnings as `##ssrCallWarning=`. 1271 lib tests; fmt/clippy clean.
+- **Open:** H1-Mi1 (→ H4: backfill `G₀` over the genotyped-loci period set vs `shape_by_period`); H2-Mi1 (→ H4: enforce sample-name uniqueness before emitting the VCF); Steps H4–J1 unstarted.
 
 #### Reading & merge layer (Phases 0–3 done; `ssr-call` runnable; review applied)
 - **Status:** fixes-applied (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (cursor) + 2 (merger) + 3 (driver — single-threaded, `ssr-call` runs end-to-end → catalog-ordered TSV dump). Two-pass / prefetch-pool + the genotyping EM/VCF to follow.
