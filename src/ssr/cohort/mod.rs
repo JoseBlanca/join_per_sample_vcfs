@@ -11,6 +11,7 @@
 pub mod candidate_set;
 pub mod driver;
 pub mod merge;
+pub mod pair_hmm;
 pub mod param_estimation;
 pub mod reader;
 pub mod rung_ladder;

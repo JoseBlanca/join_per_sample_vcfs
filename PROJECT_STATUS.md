@@ -995,7 +995,8 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
 
 #### Genotyping + parameter pre-pass (Phases 2/3 — fused plan; Milestone A done)
-- **Status:** Milestone A **shipped** (2026-06-23, branch `ssr-cohort`); **Milestone B (shared locus primitives) next** in the loop. A1 core types + A2 simulator implemented, reviewed, fixes applied.
+- **Status:** Milestone B **implemented** (2026-06-23, branch `ssr-cohort`); review (loop step 3) next, then Milestone C (genotyping walking skeleton → checkpoint 1). Milestone A shipped.
+- **Milestone B impl report:** [ssr_call_genotyping_milestone_b_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_b_2026-06-23.md) — B1 `rung_ladder` (`build_rungs` + heuristic `resolve_confident_genotype`), B2 `stutter` (`s_theta`/`reach_variants`/`refine_theta_locus`, the scoring counterpart of the sim forward model), B3 `pair_hmm` (`align_subst` banded forward, substitutions-in-tract/gaps-in-flank). 1206 lib tests (+22).
 - **Latest review:** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md) — **Approve-with-changes**: 0 Blocker, 0 Major, 2 Minor + Nits.
 - **Latest fixes-applied:** [fixes_applied_2026-06-23.md](doc/devel/reports/reviews/fixes_applied_2026-06-23.md) — all 4 findings Applied (Mi1 `FixedPointAccum` non-finite debug-assert + magnitude doc + guard test; Mi2 separated-het + per-group-shape sim tests; `below`→`index_below`; drop alloc-for-length). 1184 lib tests.
 - **Plan:** [ssr_call_genotyping_and_parameters.md](doc/devel/implementation_plans/ssr_call_genotyping_and_parameters.md) — the fused Phase-2/3 plan (A1→F2), with the per-milestone execution loop (implement → commit → review → commit → fix → commit) and the two human checkpoints (after C4, after D2).
