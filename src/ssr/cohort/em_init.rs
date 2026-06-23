@@ -36,6 +36,12 @@ const FALLBACK_SHAPE: StutterShape = StutterShape {
 };
 
 /// The first candidate index whose allele has `length` repeat units, if any.
+///
+/// SIMPLIFICATION: a rung can legitimately hold several same-length sequences
+/// (substitution / interruption variants, first-class per spec §5/§7); this maps a
+/// nominated length to the *first* such candidate. Exact for the pure tracts that
+/// dominate; multi-variant-per-length attribution is a follow-up tied to S2 impure
+/// alleles.
 fn candidate_of_length(candidates: &CandidateSet, period: usize, length: u16) -> Option<usize> {
     candidates
         .alleles

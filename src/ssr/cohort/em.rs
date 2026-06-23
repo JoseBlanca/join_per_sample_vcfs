@@ -169,6 +169,12 @@ fn log_sum_exp(xs: &[f64]) -> f64 {
 }
 
 /// Genotype one locus on the supplied parameters.
+///
+/// PLOIDY CONTRACT: v1 is diploid-only and **panics** on `ploidy != 2`. This is a
+/// deliberate loud failure (the no-silent-fallback invariant, plan §5) — a
+/// non-diploid call in a diploid build is a programming error, not something to
+/// quietly no-call. Ploidy generalization (genotype enumeration + dosage priors) is
+/// a documented follow-up.
 pub(crate) fn run_locus_em(
     locus: &CohortLocus,
     rungs: &Rungs,
@@ -438,6 +444,77 @@ mod tests {
                 "sample {k}: called {:?} but truth is {:?} (GQ {})",
                 call.calls[k].genotype_units, expected, call.calls[k].gq
             );
+        }
+    }
+
+    #[test]
+    fn em_calls_correct_genotypes_under_moderate_stutter() {
+        // The same genotypes as checkpoint 1, but a markedly higher stutter level —
+        // an EM that only works at near-zero stutter would fail here.
+        let baseline = 0.15;
+        let chem = SimChemistry {
+            error: PerBaseError(0.001),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline,
+                slope: 0.0,
+            },
+        };
+        let genos = [
+            SimGenotype::homozygous(8, 2),
+            SimGenotype::homozygous(8, 2),
+            SimGenotype::diploid(6, 10),
+            SimGenotype::homozygous(10, 2),
+            SimGenotype::diploid(6, 10),
+        ];
+        let spec = SimCohortSpec {
+            seed: 77,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 40,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 8,
+            }],
+            groups: vec![chem],
+            samples: genos
+                .iter()
+                .enumerate()
+                .map(|(i, g)| SimSample {
+                    name: format!("S{i}"),
+                    group: SampleGroupId(0),
+                    genotypes: vec![Some(g.clone())],
+                })
+                .collect(),
+            depth: 200,
+        };
+        let cohort = crate::ssr::cohort::sim::simulate(&spec);
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        let mut params = clean_params(locus.present.len());
+        params.level_seed[0].baseline = baseline;
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        let truth = [[8, 8], [8, 8], [6, 10], [10, 10], [6, 10]];
+        for (k, expected) in truth.iter().enumerate() {
+            let mut got = call.calls[k].genotype_units.clone();
+            got.sort_unstable();
+            let mut want = expected.to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "sample {k} under moderate stutter");
         }
     }
 

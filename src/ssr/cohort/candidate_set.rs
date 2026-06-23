@@ -107,6 +107,10 @@ fn is_periodic(locus: &CohortLocus, cfg: &CandidateCfg) -> bool {
 }
 
 /// The cohort's most-supported sequence at rung `length`, if that rung is occupied.
+///
+/// SIMPLIFICATION: a rung may hold several same-length sequences (impure variants —
+/// first-class per spec §5/§7); v1 nominates only the most-supported one per length.
+/// Exact for the pure-tract common case; multi-variant nomination is a follow-up.
 fn cohort_representative(rungs: &Rungs, length: u16) -> Option<Box<[u8]>> {
     rungs
         .seqs_at(length)?
