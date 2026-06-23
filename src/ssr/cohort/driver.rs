@@ -61,7 +61,8 @@ pub(crate) enum SsrCallError {
     /// A sample that never resolves anywhere is a degenerate input (a blank/near-empty
     /// sample, a mis-supplied file, or a catalog/chemistry mismatch) — fail loud rather
     /// than silently assign it cohort-default chemistry. The driver maps the indices to
-    /// sample names for the user-facing message.
+    /// sample names for the user-facing message. (A cohort where no sample covers any
+    /// locus also surfaces here — every sample is unresolved.)
     #[error(
         "{} cohort sample(s) produced no confident genotype in the pre-pass \
          (sample indices {samples:?}); cannot estimate their chemistry — check the inputs",
@@ -150,6 +151,12 @@ const PLOIDY: u8 = 2;
 /// regardless; only the burn-in is bounded. Loci are taken in catalog-stream order until
 /// the cap — a positionally-biased first-`cap` subset; a stratified / reservoir selection
 /// is a calibration follow-up (reading Q-R5), not needed for correctness.
+///
+/// **Caveat (review Mi1):** the decision-E resolution check ([`build_param_set`]) runs on
+/// this subset, so positional selection could in principle reject a sample whose confident
+/// loci all fall past the cap. At this cap, over a real genome, every sample resolves
+/// within the first `cap` loci; representative selection (the calibration fix) removes the
+/// edge entirely.
 const BURN_IN_MAX_LOCI: usize = 20_000;
 
 /// The cross-locus-pooled parameters the burn-in freezes for the genotyping sweep.
@@ -222,6 +229,8 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
     let mut out = BufWriter::new(File::create(&config.output)?);
     write_vcf_header(&mut out, &chromosomes, &sample_names, &warnings)?;
+    // The serial sweep consumes the merger in catalog order, so records are already
+    // ordered and the sequence number needs no reorder (that is Milestone J's concern).
     for item in merger {
         let (_seq, locus) = item?;
         if let Some(line) = genotype_locus(
@@ -458,6 +467,28 @@ mod tests {
             units.sort_unstable();
             assert_eq!(units, vec![6, 10], "het miscalled: {col}");
         }
+    }
+
+    #[test]
+    fn run_is_byte_identical_across_thread_counts() {
+        // The burn-in is byte-identical across threads and the sweep is serial, so the
+        // whole VCF must be identical at any thread count (the headline property, e2e).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut owned: Vec<(String, Vec<Vec<u16>>)> = (0..6)
+            .map(|i| (format!("hom{i}"), vec![vec![8u16]]))
+            .collect();
+        owned.extend((0..6).map(|i| (format!("het{i}"), vec![vec![6u16, 10]])));
+        let samples: Vec<(&str, Vec<Vec<u16>>)> =
+            owned.iter().map(|(n, g)| (n.as_str(), g.clone())).collect();
+
+        let run_with = |threads: usize, out_name: &str| {
+            let mut config = write_cohort(dir.path(), &[(40, 8)], &samples);
+            config.threads = threads;
+            config.output = dir.path().join(out_name);
+            run(&config).unwrap();
+            std::fs::read_to_string(&config.output).unwrap()
+        };
+        assert_eq!(run_with(1, "t1.vcf"), run_with(4, "t4.vcf"));
     }
 
     #[test]
