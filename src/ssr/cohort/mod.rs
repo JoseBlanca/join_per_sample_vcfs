@@ -8,9 +8,13 @@
 //! `ssr_call_parameters.md`, `ssr_call_genotyping.md`; build plan
 //! `doc/devel/implementation_plans/ssr_call_reading.md`.
 
+pub mod candidate_set;
 pub mod driver;
 pub mod merge;
+pub mod param_estimation;
 pub mod reader;
+pub mod rung_ladder;
+pub mod stutter;
 pub mod types;
 
 #[cfg(test)]
