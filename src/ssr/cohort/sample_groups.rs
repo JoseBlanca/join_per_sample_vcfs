@@ -40,6 +40,9 @@ pub(crate) struct ClusterCfg {
     pub(crate) level_scale: f64,
     /// Two samples merge when their scaled distance is below this.
     pub(crate) distance_threshold: f64,
+    /// Reference depth at which the precision weighting saturates (above it, full
+    /// distance is used; below it, distances deflate so a thin sample merges readily).
+    pub(crate) precision_reference_depth: f64,
     /// Shrinkage strength of the per-`(group, period)` shape toward `θ_period`.
     pub(crate) shape_shrink_strength: f64,
 }
@@ -50,6 +53,7 @@ impl ClusterCfg {
             eps_scale: 0.005,
             level_scale: 0.05,
             distance_threshold: 1.5,
+            precision_reference_depth: 100.0,
             shape_shrink_strength: 50.0,
         }
     }
@@ -80,8 +84,10 @@ fn scaled_distance(a: (f64, f64, u64), b: (f64, f64, u64), cfg: &ClusterCfg) -> 
     let de = (eps_a - eps_b) / cfg.eps_scale;
     let dl = (level_a - level_b) / cfg.level_scale;
     let raw = (de * de + dl * dl).sqrt();
-    // Precision ∝ √depth; the less-certain sample's precision deflates the distance.
-    let precision = (depth_a.min(depth_b) as f64).sqrt() / 100.0_f64.sqrt();
+    // Precision ∝ √depth, normalized to the reference depth. The less-certain (thinner)
+    // sample's precision deflates the distance, so a wobbly thin sample is "close to
+    // many things" and merges readily; above the reference depth it saturates at 1.0.
+    let precision = (depth_a.min(depth_b) as f64).sqrt() / cfg.precision_reference_depth.sqrt();
     raw * precision.min(1.0)
 }
 
@@ -96,6 +102,12 @@ fn find(parent: &mut [usize], mut x: usize) -> usize {
 
 /// Cluster the per-sample features into groups (deterministic union-find over
 /// sorted sample indices). Returns `(group_of_sample, n_groups)`.
+///
+/// LIMITATION: this is single-linkage — a smooth `(ε, level)` continuum whose
+/// neighbours are each within the threshold chains into one group even when the
+/// extremes are far apart. The penalized-likelihood split test that breaks an
+/// over-merged group (spec §4.4) is deferred (F); for well-separated protocols (the
+/// common case) single-linkage is correct and cheap.
 fn cluster(
     features: &[(u32, f64, f64, u64)],
     cfg: &ClusterCfg,
@@ -349,6 +361,18 @@ mod tests {
             decays[0] < 0.2 && decays[1] > 0.3,
             "per-group decays should stay divergent: {decays:?}"
         );
+    }
+
+    #[test]
+    fn group_samples_is_deterministic() {
+        let spec = grouped_spec(
+            vec![chem(0.002, 0.06, 0.05), chem(0.012, 0.22, 0.45)],
+            &[0, 1],
+        );
+        let (stats, est) = prepare(&spec);
+        let a = group_samples(&stats, &est, &ClusterCfg::dev_default());
+        let b = group_samples(&stats, &est, &ClusterCfg::dev_default());
+        assert_eq!(a, b, "clustering + per-group fit must be reproducible");
     }
 
     #[test]
