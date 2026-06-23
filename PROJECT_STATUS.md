@@ -993,7 +993,8 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
 
 #### Genotyping + parameter pre-pass (Phases 2/3 — fused plan; Milestone A done)
-- **Status:** in-flight (2026-06-23, branch `ssr-cohort`). **Milestone A (Foundations)** implemented: A1 core types + A2 simulator. Review (loop step 3) next, then Milestone B.
+- **Status:** reviewed (2026-06-23, branch `ssr-cohort`). **Milestone A (Foundations)** implemented (A1 core types + A2 simulator) and reviewed; fixes (loop step 5) next, then Milestone B.
+- **Latest review:** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md) — **Approve-with-changes**: 0 Blocker, 0 Major, 2 Minor + Nits (Mi1 `FixedPointAccum` non-finite guard; Mi2 missing sim tests; naming/alloc nits).
 - **Plan:** [ssr_call_genotyping_and_parameters.md](doc/devel/implementation_plans/ssr_call_genotyping_and_parameters.md) — the fused Phase-2/3 plan (A1→F2), with the per-milestone execution loop (implement → commit → review → commit → fix → commit) and the two human checkpoints (after C4, after D2).
 - **Architecture:** [parameters](doc/devel/architecture/ssr_call_parameters.md) (pre-pass) + [genotyping](doc/devel/architecture/ssr_call_genotyping.md) (EM/VCF); spec [ssr_cohort_mark2.md](doc/devel/specs/ssr_cohort_mark2.md) §4.2–§4.5.
 - **Impl report (Milestone A):** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_a_2026-06-23.md).
