@@ -142,6 +142,12 @@ const SCALE: f64 = (1u64 << 40) as f64;
 /// the `F` / level responsibility reduces. Integer addition is associative and
 /// commutative, so partials reduced in any order, or merged in any grouping, yield
 /// the identical bit pattern from [`value`](Self::value).
+///
+/// Inputs to [`add`](Self::add) are expected **finite and bounded** well within
+/// `i128::MAX / 2⁴⁰ ≈ 1.5e26` (per-locus log-normalizers are `reads × O(few
+/// nats)`). A non-finite or out-of-range input would otherwise be absorbed
+/// silently (`NaN → 0`, overflow → saturation) and defeat the whole point — that a
+/// non-monotone `ℓ_pen` is a *sharp* diagnostic — so `add` debug-asserts finiteness.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FixedPointAccum {
     acc: i128,
@@ -154,7 +160,15 @@ impl FixedPointAccum {
     }
 
     /// Add one float contribution (scaled and rounded to the fixed-point grid).
+    ///
+    /// Inputs must be finite (see the type's magnitude contract); a non-finite
+    /// value is a caller bug and is caught in debug builds rather than silently
+    /// absorbed as `0`.
     pub(crate) fn add(&mut self, x: f64) {
+        debug_assert!(
+            x.is_finite(),
+            "FixedPointAccum::add got a non-finite value: {x}"
+        );
         self.acc += (x * SCALE).round() as i128;
     }
 
@@ -243,6 +257,14 @@ mod tests {
         // Bit-identical, not merely approximately equal — this is the determinism
         // guarantee the whole stage relies on.
         assert_eq!(forward.value().to_bits(), backward.value().to_bits());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn fixed_point_accum_rejects_non_finite_in_debug() {
+        // A NaN would otherwise be absorbed as 0 and hide a broken upstream reduce.
+        let mut acc = FixedPointAccum::new();
+        acc.add(f64::NAN);
     }
 
     #[test]

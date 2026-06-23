@@ -69,7 +69,7 @@ impl SplitMix64 {
     }
 
     /// A uniform index in `0..n` (`n > 0`).
-    fn below(&mut self, n: usize) -> usize {
+    fn index_below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
 }
@@ -266,9 +266,9 @@ fn apply_substitutions(rng: &mut SplitMix64, tract: &mut [u8], eps: f64) {
     }
     for base in tract.iter_mut() {
         if rng.chance(eps) {
-            let mut replacement = BASES[rng.below(BASES.len())];
+            let mut replacement = BASES[rng.index_below(BASES.len())];
             while replacement == *base {
-                replacement = BASES[rng.below(BASES.len())];
+                replacement = BASES[rng.index_below(BASES.len())];
             }
             *base = replacement;
         }
@@ -289,7 +289,7 @@ fn simulate_cell(
     let ploidy = genotype.allele_units.len();
     let mut counts: BTreeMap<Box<[u8]>, u32> = BTreeMap::new();
     for _ in 0..depth {
-        let parent = genotype.allele_units[rng.below(ploidy)];
+        let parent = genotype.allele_units[rng.index_below(ploidy)];
         let len = slip_length(&mut rng, chem, parent);
         let mut tract = build_tract(motif, len);
         apply_substitutions(&mut rng, &mut tract, chem.error.0);
@@ -337,7 +337,7 @@ pub(crate) fn simulate(spec: &SimCohortSpec) -> SimCohort {
                         spec.depth,
                     );
                     let depth: u32 = observed.iter().map(|(_, c)| c).sum();
-                    let tract_units_len = build_tract(&locus.motif, locus.ref_units).len() as u32;
+                    let tract_units_len = (locus.motif.period() * locus.ref_units as usize) as u32;
                     Some(SsrLocusRecord {
                         chrom_id: chrom_id(&locus.chrom),
                         start: locus.start + 1, // container coords are 1-based
@@ -593,6 +593,88 @@ mod tests {
         assert!(
             faithful_fraction(0.05) > faithful_fraction(0.40),
             "a higher stutter level must lower the faithful fraction"
+        );
+    }
+
+    #[test]
+    fn separated_het_deposits_support_at_both_allele_lengths() {
+        // A well-separated het (4 vs 9 units, CG-seed): both allele tracts must
+        // appear as supported observations — a generator that drew from one copy,
+        // or mis-tiled, would show a single mode.
+        let chem = SimChemistry {
+            error: PerBaseError(0.0),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.05,
+                slope: 0.0,
+            },
+        };
+        let motif = motif(b"CA");
+        let counts = simulate_cell(2024, &chem, &SimGenotype::diploid(4, 9), &motif, 400);
+
+        let support = |units: u16| {
+            let tract = build_tract(&motif, units).into_boxed_slice();
+            counts
+                .iter()
+                .find(|(s, _)| *s == tract)
+                .map(|(_, c)| *c)
+                .unwrap_or(0)
+        };
+        assert!(
+            support(4) > 50,
+            "low allele under-supported: {}",
+            support(4)
+        );
+        assert!(
+            support(9) > 50,
+            "high allele under-supported: {}",
+            support(9)
+        );
+    }
+
+    #[test]
+    fn differing_group_shape_changes_the_slip_magnitude_distribution() {
+        // Two chemistries identical except `shape.decay` (per-group SHAPE — the M3
+        // axis): the steeper-tailed shape must produce larger average slip
+        // magnitudes. Guards that the forward model actually reads `decay`.
+        let allele = SimGenotype::homozygous(12, 2);
+        let motif = motif(b"CA");
+        let faithful = build_tract(&motif, 12).into_boxed_slice();
+
+        let mean_abs_slip = |decay: f64| {
+            let chem = SimChemistry {
+                error: PerBaseError(0.0),
+                shape: StutterShape {
+                    up_rate: 1.0,
+                    down_rate: 1.0,
+                    decay,
+                },
+                level: StutterLevel {
+                    baseline: 1.0, // every read slips, isolating the magnitude
+                    slope: 0.0,
+                },
+            };
+            let counts = simulate_cell(31, &chem, &allele, &motif, 6000);
+            let mut slipped_reads = 0u64;
+            let mut total_abs_units = 0i64;
+            for (seq, count) in &counts {
+                if *seq == faithful {
+                    continue; // Δ = 0 contributes nothing to mean magnitude
+                }
+                let units = (seq.len() / motif.period()) as i64;
+                total_abs_units += (units - 12).abs() * i64::from(*count);
+                slipped_reads += u64::from(*count);
+            }
+            total_abs_units as f64 / slipped_reads as f64
+        };
+
+        assert!(
+            mean_abs_slip(0.5) > mean_abs_slip(0.05),
+            "a heavier-tailed shape (larger decay) must slip by larger magnitudes"
         );
     }
 }

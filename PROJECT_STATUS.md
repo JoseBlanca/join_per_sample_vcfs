@@ -26,9 +26,11 @@ Skills and agents are instructed to leave it untouched.
 >   accumulators, `FixedPointAccum` determinism reduce, candidate/confident-genotype/
 >   placement shapes) + A2 the cohort simulator (`sim.rs`: known genotypes × stutter
 >   × `ε` × sample groups → `.ssr.psp` the reader consumes, with a queryable
->   `TruthTable`; dependency-free SplitMix64). fmt/clippy `-D warnings` clean; 1181
->   lib tests (+16). See the SSR **Stage 2** block below. **Next (loop):** code review
->   of Milestone A, then Milestone B (shared locus primitives).
+>   `TruthTable`; dependency-free SplitMix64). Reviewed (Approve-with-changes; 0
+>   Blocker/Major) and **fixes applied → Milestone A shipped** ([review](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md),
+>   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23.md)). fmt/clippy
+>   `-D warnings` clean; 1184 lib tests (+19). See the SSR **Stage 2** block below.
+>   **Next (loop):** Milestone B (shared locus primitives — `rung_ladder`, `stutter`, `pair_hmm`).
 > - **Prior task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
 >   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
 >   Built the reading & merge spine through a runnable `ssr-call`: Phase 0 scaffolding;
@@ -993,8 +995,9 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
 
 #### Genotyping + parameter pre-pass (Phases 2/3 — fused plan; Milestone A done)
-- **Status:** reviewed (2026-06-23, branch `ssr-cohort`). **Milestone A (Foundations)** implemented (A1 core types + A2 simulator) and reviewed; fixes (loop step 5) next, then Milestone B.
-- **Latest review:** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md) — **Approve-with-changes**: 0 Blocker, 0 Major, 2 Minor + Nits (Mi1 `FixedPointAccum` non-finite guard; Mi2 missing sim tests; naming/alloc nits).
+- **Status:** Milestone A **shipped** (2026-06-23, branch `ssr-cohort`); **Milestone B (shared locus primitives) next** in the loop. A1 core types + A2 simulator implemented, reviewed, fixes applied.
+- **Latest review:** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/reviews/ssr_call_genotyping_milestone_a_2026-06-23.md) — **Approve-with-changes**: 0 Blocker, 0 Major, 2 Minor + Nits.
+- **Latest fixes-applied:** [fixes_applied_2026-06-23.md](doc/devel/reports/reviews/fixes_applied_2026-06-23.md) — all 4 findings Applied (Mi1 `FixedPointAccum` non-finite debug-assert + magnitude doc + guard test; Mi2 separated-het + per-group-shape sim tests; `below`→`index_below`; drop alloc-for-length). 1184 lib tests.
 - **Plan:** [ssr_call_genotyping_and_parameters.md](doc/devel/implementation_plans/ssr_call_genotyping_and_parameters.md) — the fused Phase-2/3 plan (A1→F2), with the per-milestone execution loop (implement → commit → review → commit → fix → commit) and the two human checkpoints (after C4, after D2).
 - **Architecture:** [parameters](doc/devel/architecture/ssr_call_parameters.md) (pre-pass) + [genotyping](doc/devel/architecture/ssr_call_genotyping.md) (EM/VCF); spec [ssr_cohort_mark2.md](doc/devel/specs/ssr_cohort_mark2.md) §4.2–§4.5.
 - **Impl report (Milestone A):** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_a_2026-06-23.md).
