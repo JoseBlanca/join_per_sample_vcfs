@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
-use crate::psp::header::ParameterValue;
+use crate::psp::header::{ParameterValue, ParsedChromosome};
 use crate::psp::registry_ssr::CATALOG_REFERENCE_MD5_PARAM;
 use crate::psp::{PspReadError, PspReader};
 use crate::ssr::catalog::CatalogError;
@@ -100,6 +100,11 @@ pub(crate) struct CohortMerger<R: Read + Seek, C: Read> {
     /// Chromosome name → cohort-global id (the canonical order, taken from the shared
     /// chromosome table). Maps catalog loci into the `LocusId` frame.
     name_to_global: HashMap<String, u32>,
+    /// The cohort-global chromosome table (name + length + md5), in global-id order —
+    /// taken from the first input's `.ssr.psp` header (the same-catalog precondition
+    /// makes every input's table identical). The `length`/`md5` the catalog lacks live
+    /// here; the VCF `##contig` lines come from this (arch `ssr_call_driver.md` §5).
+    chromosomes: Vec<ParsedChromosome>,
     /// The previous catalog locus visited — to enforce that the catalog is strictly
     /// coordinate-sorted (the cursor's monotonic precondition).
     prev_locus: Option<LocusId>,
@@ -128,10 +133,8 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
         let expected_md5 = catalog.header().reference_md5.clone();
 
         // Canonical chromosome order — global id = index in the first input's table.
-        let name_to_global: HashMap<String, u32> = first
-            .1
-            .header()
-            .chromosomes
+        let chromosomes = first.1.header().chromosomes.clone();
+        let name_to_global: HashMap<String, u32> = chromosomes
             .iter()
             .enumerate()
             .map(|(idx, chrom)| (chrom.name.clone(), idx as u32))
@@ -190,6 +193,7 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
             cursors,
             labels,
             name_to_global,
+            chromosomes,
             prev_locus: None,
             next_seq: 0,
         })
@@ -268,6 +272,35 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
         }
         names
     }
+
+    /// The cohort-global chromosome table (name + length + md5), in global-id order —
+    /// the source of the VCF `##contig` lines (arch `ssr_call_driver.md` §5). Unlike
+    /// [`chrom_names`](Self::chrom_names) it carries the lengths, which the catalog (a
+    /// lengthless TSV) does not have but the `.ssr.psp` headers do.
+    pub(crate) fn chromosomes(&self) -> Vec<ParsedChromosome> {
+        self.chromosomes.clone()
+    }
+
+    /// Sample names in cohort (merger / catalog) order — the `#CHROM … <samples>` VCF
+    /// columns. Derived from each input's path: the file name with any `.ssr.psp`
+    /// extension stripped (arch `ssr_call_driver.md` §5, decision C-1).
+    pub(crate) fn sample_names(&self) -> Vec<String> {
+        self.labels
+            .iter()
+            .map(|l| sample_name_from_label(l))
+            .collect()
+    }
+}
+
+/// Derive a sample name from an input label: drop the directory and the `.ssr.psp`
+/// extension. A label that is already a bare name (the in-memory test fixtures) or has
+/// no such extension is returned unchanged.
+fn sample_name_from_label(label: &str) -> String {
+    let base = Path::new(label)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(label);
+    base.strip_suffix(".ssr.psp").unwrap_or(base).to_string()
 }
 
 impl CohortMerger<BufReader<File>, BufReader<File>> {
@@ -310,7 +343,8 @@ impl<R: Read + Seek, C: Read> Iterator for CohortMerger<R, C> {
 mod tests {
     use super::*;
     use crate::ssr::cohort::test_support::{
-        REF_MD5, catalog_reader, loc, obs, reader, rec, ssr_header, ssr_header_without_md5, ssr_psp,
+        REF_MD5, catalog_bytes, catalog_reader, loc, obs, reader, rec, ssr_header,
+        ssr_header_without_md5, ssr_psp,
     };
     use std::io::Cursor;
 
@@ -513,6 +547,74 @@ mod tests {
         assert!(
             matches!(err, SsrMergeError::UnsortedCatalog { .. }),
             "got {err:?}"
+        );
+    }
+
+    // ── H2: header accessors + second-pass re-open ──
+
+    #[test]
+    fn chromosomes_and_sample_names_expose_the_header_table() {
+        let catalog = catalog_reader(REF_MD5, &[loc("chr1", 16)]);
+        let a = reader(ssr_psp(
+            ssr_header(&["chr1", "chr2"], REF_MD5),
+            &[rec(0, 16, obs(&[(b"CACACA", 5)]))],
+        ));
+        let merger =
+            CohortMerger::from_parts(catalog, vec![("path/to/sampleA.ssr.psp".into(), a)]).unwrap();
+
+        // The contig table carries lengths (from the .ssr.psp header) in global-id order.
+        let chroms = merger.chromosomes();
+        assert_eq!(chroms.len(), 2);
+        assert_eq!(chroms[0].name, "chr1");
+        assert_eq!(chroms[0].length, 100_000);
+        assert_eq!(chroms[1].name, "chr2");
+        // The sample column name is the path basename without `.ssr.psp`.
+        assert_eq!(merger.sample_names(), vec!["sampleA".to_string()]);
+    }
+
+    #[test]
+    fn sample_name_strips_path_and_ssr_psp_suffix() {
+        assert_eq!(sample_name_from_label("/x/y/foo.ssr.psp"), "foo");
+        assert_eq!(sample_name_from_label("bar.ssr.psp"), "bar");
+        assert_eq!(sample_name_from_label("plainlabel"), "plainlabel");
+    }
+
+    #[test]
+    fn open_can_be_called_twice_for_a_two_pass_run() {
+        // The driver re-opens the merger for the genotyping pass (pre-pass is pass 1);
+        // re-opening from disk must yield the identical locus stream.
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_path = dir.path().join("c.ssr.catalog");
+        let a_path = dir.path().join("a.ssr.psp");
+        std::fs::write(
+            &catalog_path,
+            catalog_bytes(REF_MD5, &[loc("chr1", 16), loc("chr1", 60)]),
+        )
+        .unwrap();
+        std::fs::write(
+            &a_path,
+            ssr_psp(
+                ssr_header(&["chr1"], REF_MD5),
+                &[
+                    rec(0, 16, obs(&[(b"CACACA", 5)])),
+                    rec(0, 60, obs(&[(b"CACACACA", 4)])),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let collect = || {
+            CohortMerger::open(&catalog_path, std::slice::from_ref(&a_path))
+                .unwrap()
+                .map(|r| r.unwrap().1.locus)
+                .collect::<Vec<_>>()
+        };
+        let first_pass = collect();
+        assert_eq!(first_pass.len(), 2);
+        assert_eq!(
+            first_pass,
+            collect(),
+            "re-open yields the same locus stream"
         );
     }
 }
