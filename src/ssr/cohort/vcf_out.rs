@@ -10,6 +10,9 @@
 //! blind spot) down to a low GQ / no-call. The site QUAL here is a posterior-based
 //! proxy; the exact-AF convolution kernel (verify-fix #7b) is an F2 refinement.
 
+use std::io::{self, Write};
+
+use crate::psp::header::ParsedChromosome;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em::{LocusCall, SampleCall};
 use crate::ssr::cohort::types::{CohortLocus, SampleEvidence};
@@ -47,6 +50,76 @@ fn filter_text(admit: Admission) -> &'static str {
         Admission::TooManyAlleles => "tooManyAlleles",
         Admission::LowDepth => "lowDepth",
     }
+}
+
+/// The non-PASS admission verdicts declared in the header, with their descriptions, in
+/// declaration order. The IDs are taken from [`filter_text`] so the header declarations
+/// and the per-record FILTER values stay one source of truth (PASS is implicit and not
+/// declared, per VCF convention).
+const FILTER_DESCRIPTIONS: &[(Admission, &str)] = &[
+    (
+        Admission::NotPeriodic,
+        "locus allele-length distribution is inconsistent with the motif period",
+    ),
+    (
+        Admission::TooManyAlleles,
+        "more candidate alleles segregate than the caller admits",
+    ),
+    (Admission::LowDepth, "insufficient depth to call the locus"),
+];
+
+/// Write the SSR VCF header (arch `ssr_call_driver.md` §5): `##fileformat`, any cohort
+/// warnings, one `##contig` per chromosome (the lengths come from the `.ssr.psp`
+/// headers via [`CohortMerger::chromosomes`](crate::ssr::cohort::merge::CohortMerger::chromosomes)),
+/// the `PERIOD` INFO, the `GT`/`GQ`/`REPCN` FORMATs, the SSR FILTER vocabulary, then the
+/// `#CHROM … <samples>` column line in cohort order.
+///
+/// A dedicated SSR writer rather than the SNP `src/vcf/writer.rs`: the field vocabulary
+/// differs and the data lines are the plain text [`format_vcf_record`] emits, so the
+/// whole SSR VCF stays in one serialization style. `warnings` are emitted as
+/// `##ssrCallWarning=…` meta lines (e.g. the apparent-`F_IS` notice, [`f_is_warning`]).
+pub(crate) fn write_vcf_header<W: Write>(
+    out: &mut W,
+    chromosomes: &[ParsedChromosome],
+    sample_names: &[String],
+    warnings: &[String],
+) -> io::Result<()> {
+    writeln!(out, "##fileformat=VCFv4.4")?;
+    for warning in warnings {
+        writeln!(out, "##ssrCallWarning={warning}")?;
+    }
+    for chrom in chromosomes {
+        writeln!(out, "##contig=<ID={},length={}>", chrom.name, chrom.length)?;
+    }
+    writeln!(
+        out,
+        "##INFO=<ID=PERIOD,Number=1,Type=Integer,Description=\"Repeat unit length in bases\">"
+    )?;
+    writeln!(
+        out,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+    )?;
+    writeln!(
+        out,
+        "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Phred-scaled genotype quality\">"
+    )?;
+    writeln!(
+        out,
+        "##FORMAT=<ID=REPCN,Number=.,Type=Integer,Description=\"Repeat copy number of each called allele\">"
+    )?;
+    for (admit, description) in FILTER_DESCRIPTIONS {
+        writeln!(
+            out,
+            "##FILTER=<ID={},Description=\"{description}\">",
+            filter_text(*admit)
+        )?;
+    }
+    write!(out, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+    for name in sample_names {
+        write!(out, "\t{name}")?;
+    }
+    writeln!(out)?;
+    Ok(())
 }
 
 /// The minor-allele read fraction of a het call (`0` … `0.5`), by hard-attributing
@@ -463,5 +536,73 @@ mod tests {
         let cfg = FpControlCfg::dev_default();
         assert!(f_is_warning(&[0.05, 0.0, 0.1], &cfg).is_none());
         assert!(f_is_warning(&[0.8, 0.9, 0.7], &cfg).is_some());
+    }
+
+    // ── H3: the VCF header writer ──
+
+    fn contig(name: &str, length: u32) -> ParsedChromosome {
+        ParsedChromosome {
+            name: name.to_string(),
+            length,
+            md5: "0".repeat(32),
+        }
+    }
+
+    fn header_to_string(
+        chroms: &[ParsedChromosome],
+        samples: &[String],
+        warnings: &[String],
+    ) -> String {
+        let mut out = Vec::new();
+        write_vcf_header(&mut out, chroms, samples, warnings).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn write_vcf_header_emits_all_sections() {
+        let text = header_to_string(
+            &[contig("chr1", 248_956_422), contig("chr2", 242_193_529)],
+            &["sampleA".to_string(), "sampleB".to_string()],
+            &["apparent F_IS unusually high".to_string()],
+        );
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert_eq!(lines[0], "##fileformat=VCFv4.4");
+        assert!(text.contains("##ssrCallWarning=apparent F_IS unusually high"));
+        assert!(text.contains("##contig=<ID=chr1,length=248956422>"));
+        assert!(text.contains("##contig=<ID=chr2,length=242193529>"));
+        assert!(text.contains("##INFO=<ID=PERIOD,"));
+        assert!(text.contains("##FORMAT=<ID=GT,"));
+        assert!(text.contains("##FORMAT=<ID=GQ,"));
+        assert!(text.contains("##FORMAT=<ID=REPCN,"));
+        // The column line is last, tab-separated, with the samples in order.
+        assert_eq!(
+            lines.last().unwrap(),
+            &"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsampleA\tsampleB"
+        );
+    }
+
+    #[test]
+    fn write_vcf_header_filter_ids_match_filter_text_and_omit_pass() {
+        let text = header_to_string(&[contig("chr1", 1000)], &["s".to_string()], &[]);
+        // Every non-PASS admission verdict is declared, with the same ID filter_text emits.
+        for admit in [
+            Admission::NotPeriodic,
+            Admission::TooManyAlleles,
+            Admission::LowDepth,
+        ] {
+            assert!(
+                text.contains(&format!("##FILTER=<ID={},", filter_text(admit))),
+                "missing FILTER for {admit:?}"
+            );
+        }
+        // PASS is implicit, never declared.
+        assert!(!text.contains("##FILTER=<ID=PASS"));
+    }
+
+    #[test]
+    fn write_vcf_header_without_warnings_emits_no_warning_line() {
+        let text = header_to_string(&[contig("chr1", 1000)], &["s".to_string()], &[]);
+        assert!(!text.contains("##ssrCallWarning="));
     }
 }
