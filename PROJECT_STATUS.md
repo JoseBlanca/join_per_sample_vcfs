@@ -19,16 +19,22 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
+> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) genotyping+pre-pass — Milestone A (Foundations)**
+>   (branch `ssr-cohort`, [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_a_2026-06-23.md)).
+>   First milestone of the fused Phase-2/3 plan: A1 core types & data model
+>   (`ParamSet` interface, chemistry types, `SlipProfile`/`SampleStutterStats`
+>   accumulators, `FixedPointAccum` determinism reduce, candidate/confident-genotype/
+>   placement shapes) + A2 the cohort simulator (`sim.rs`: known genotypes × stutter
+>   × `ε` × sample groups → `.ssr.psp` the reader consumes, with a queryable
+>   `TruthTable`; dependency-free SplitMix64). fmt/clippy `-D warnings` clean; 1181
+>   lib tests (+16). See the SSR **Stage 2** block below. **Next (loop):** code review
+>   of Milestone A, then Milestone B (shared locus primitives).
+> - **Prior task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
 >   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
->   Settled the reading & merge architecture + phased plan, then built it through a
->   runnable `ssr-call`: Phase 0 scaffolding; a psp enabler (`OwnedRecordsIter` +
->   `PspReader::into_records_of`, SNP path untouched); Phase 1 `SampleEvidenceCursor`
->   (`held`+`last_query` contract, coordinate inversion); Phase 2 catalog-driven
->   `CohortMerger` (same-catalog md5 + chrom-id reconciliation, sparse-omit); Phase 3
->   single-threaded `driver` (open+merge+write → catalog-ordered TSV dump; topology +
->   EM/VCF deferred). fmt/clippy `-D warnings` clean; 1159 lib tests (+30). See the SSR
->   **Stage 2** block below. **Next:** Phase 4 (two-pass re-read), then the genotyping EM/VCF.
+>   Built the reading & merge spine through a runnable `ssr-call`: Phase 0 scaffolding;
+>   a psp enabler (`OwnedRecordsIter` + `PspReader::into_records_of`); Phase 1
+>   `SampleEvidenceCursor`; Phase 2 catalog-driven `CohortMerger`; Phase 3
+>   single-threaded `driver` (catalog-ordered TSV dump). fmt/clippy clean; 1159 lib tests.
 > - **Prior task (2026-06-21):** **Code review of the `ssr-call` reading layer + fixes applied**
 >   (branch `ssr-cohort`, [review](doc/devel/reports/reviews/ssr_call_reading_2026-06-21.md) +
 >   [fixes_applied](doc/devel/reports/reviews/fixes_applied_2026-06-21.md)).
@@ -985,6 +991,18 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - `pair_hmm` follow-ups: homopolymer-indexed gap-open + banding (calibration/optimization, arch §14).
 
 ### Stage 2 — `ssr-call` (cohort caller: `.ssr.psp` × N → VCF)
+
+#### Genotyping + parameter pre-pass (Phases 2/3 — fused plan; Milestone A done)
+- **Status:** in-flight (2026-06-23, branch `ssr-cohort`). **Milestone A (Foundations)** implemented: A1 core types + A2 simulator. Review (loop step 3) next, then Milestone B.
+- **Plan:** [ssr_call_genotyping_and_parameters.md](doc/devel/implementation_plans/ssr_call_genotyping_and_parameters.md) — the fused Phase-2/3 plan (A1→F2), with the per-milestone execution loop (implement → commit → review → commit → fix → commit) and the two human checkpoints (after C4, after D2).
+- **Architecture:** [parameters](doc/devel/architecture/ssr_call_parameters.md) (pre-pass) + [genotyping](doc/devel/architecture/ssr_call_genotyping.md) (EM/VCF); spec [ssr_cohort_mark2.md](doc/devel/specs/ssr_cohort_mark2.md) §4.2–§4.5.
+- **Impl report (Milestone A):** [ssr_call_genotyping_milestone_a_2026-06-23.md](doc/devel/reports/implementations/ssr_call_genotyping_milestone_a_2026-06-23.md).
+- **Code:** [src/ssr/cohort/](src/ssr/cohort/) — `param_estimation.rs` (`ParamSet`/chemistry types/`SlipProfile`/`SampleStutterStats`/`FixedPointAccum`/`MAX_SLIP`), `candidate_set.rs` (`CandidateSet`/`Admission`), `rung_ladder.rs` (`Resolution`/`ResolvedGenotype`/`PeakAllele`/`UnresolvedReason`), `stutter.rs` (`PlacementVariant`), `sim.rs` (`#[cfg(test)]` simulator + `TruthTable`, SplitMix64). 1181 lib tests (+16).
+- **Open:**
+  - **Milestone A review** (loop step 3) — pending.
+  - Provisional calibration constants to pin in F2: `MAX_SLIP=10`, the simulator's geometric forward-model parameterization, the substitution model.
+  - B2's `align`/kernel must be written to **match `sim.rs`'s documented forward model** (else D-milestone recovery tests catch the divergence).
+- **Pre-existing unrelated bug surfaced:** `cargo test --all-targets` trips `benches/psp_writer_perf.rs:386` (index OOB in the bench harness) — separate fix.
 
 #### Reading & merge layer (Phases 0–3 done; `ssr-call` runnable; review applied)
 - **Status:** fixes-applied (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (cursor) + 2 (merger) + 3 (driver — single-threaded, `ssr-call` runs end-to-end → catalog-ordered TSV dump). Two-pass / prefetch-pool + the genotyping EM/VCF to follow.

@@ -18,4 +18,6 @@ pub mod stutter;
 pub mod types;
 
 #[cfg(test)]
+pub(crate) mod sim;
+#[cfg(test)]
 pub(crate) mod test_support;
