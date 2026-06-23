@@ -52,6 +52,14 @@ impl PrepassStats {
     /// Fold another partial in. All fields are integer counts, so this is
     /// commutative + associative — the merge order does not change the totals (the
     /// determinism the parallel reduce relies on).
+    ///
+    /// DETERMINISM LAYER: the *values* (and everything `estimate` derives from them —
+    /// `ε`, the per-period shape, the per-sample level) are merge-order-independent and
+    /// byte-identical across thread counts. The *struct itself* is **not** a canonical
+    /// form: `SampleStutterStats.by_length` is a `Vec` whose order follows insertion /
+    /// merge order, so two `PrepassStats` reduced at different thread counts can differ
+    /// under derived `PartialEq`. Determinism tests must compare `EstimatedParams` /
+    /// `CohortCalls`, not the raw stats.
     pub(crate) fn merge(&mut self, other: &PrepassStats) {
         for (&period, profile) in &other.slip_by_period {
             merge_slip_profile(self.slip_by_period.entry(period).or_default(), profile);
