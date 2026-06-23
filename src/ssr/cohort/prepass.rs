@@ -58,7 +58,12 @@ pub(crate) struct EstimatedParams {
 }
 
 /// Add `(faithful, slipped)` to the bin for `length`, creating it if new.
-fn add_bin(by_length: &mut Vec<(u16, u64, u64)>, length: u16, faithful: u64, slipped: u64) {
+pub(crate) fn add_bin(
+    by_length: &mut Vec<(u16, u64, u64)>,
+    length: u16,
+    faithful: u64,
+    slipped: u64,
+) {
     match by_length.iter_mut().find(|(l, _, _)| *l == length) {
         Some(bin) => {
             bin.1 += faithful;

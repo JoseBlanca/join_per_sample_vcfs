@@ -20,7 +20,7 @@ use crate::ssr::cohort::em::{EmCfg, LocusCall, run_locus_em_with};
 use crate::ssr::cohort::em_init::{LocusSeed, seed_locus};
 use crate::ssr::cohort::param_estimation::SampleStutterStats;
 use crate::ssr::cohort::param_estimation::{FixedPointAccum, ParamSet, StutterLevel};
-use crate::ssr::cohort::prepass::fit_level;
+use crate::ssr::cohort::prepass::{add_bin, fit_level};
 use crate::ssr::cohort::rung_ladder::{RungCfg, Rungs, build_rungs};
 use crate::ssr::cohort::types::CohortLocus;
 
@@ -35,6 +35,8 @@ pub(crate) struct OuterCfg {
     pub(crate) max_rounds: usize,
     /// Convergence tolerance on the largest `F_i` change between rounds.
     pub(crate) f_tol: f64,
+    /// Convergence tolerance on the largest level coefficient change between rounds.
+    pub(crate) level_tol: f64,
     /// Pseudo-count weight shrinking each `F_i` toward the cohort mean.
     pub(crate) f_shrink: f64,
     /// User cap on `F` (≤ [`F_CEILING`]).
@@ -46,6 +48,7 @@ impl OuterCfg {
         Self {
             max_rounds: 8,
             f_tol: 1e-3,
+            level_tol: 1e-3,
             f_shrink: 5.0,
             f_cap: F_CEILING,
         }
@@ -130,17 +133,6 @@ fn reduce_f(
         .collect()
 }
 
-/// Add `(faithful, slipped)` to the length bin (local copy of the prepass helper).
-fn add_bin(by_length: &mut Vec<(u16, u64, u64)>, length: u16, faithful: u64, slipped: u64) {
-    match by_length.iter_mut().find(|(l, _, _)| *l == length) {
-        Some(bin) => {
-            bin.1 += faithful;
-            bin.2 += slipped;
-        }
-        None => by_length.push((length, faithful, slipped)),
-    }
-}
-
 /// Reduce the per-group level by hard-attributing each read to its called allele and
 /// refitting the level line per group.
 fn reduce_level(
@@ -158,12 +150,17 @@ fn reduce_level(
             if sample_call.genotype_units.is_empty() {
                 continue; // no-call
             }
-            let group = params
+            let raw_group = params
                 .group_of_sample
                 .get(global as usize)
                 .map(|g| g.0 as usize)
-                .unwrap_or(0)
-                .min(n_groups - 1);
+                .unwrap_or(0);
+            debug_assert!(
+                raw_group < n_groups,
+                "sample group {raw_group} out of range for {n_groups} level groups \
+                 (group_of_sample / level_seed size mismatch)"
+            );
+            let group = raw_group.min(n_groups - 1);
             for (obs, count) in &locus.samples[k].seq_counts {
                 let read_units = (obs.len() / period) as u16;
                 // Attribute to the nearest called allele length.
@@ -248,15 +245,25 @@ pub(crate) fn run_cohort_em(
             .collect();
 
         let new_f = reduce_f(loci, &per_locus, n_global, outer_cfg, params.f0_seed);
-        level_per_group = reduce_level(loci, &prepared, &per_locus, params, n_groups);
+        let new_level = reduce_level(loci, &prepared, &per_locus, params, n_groups);
 
-        let delta = new_f
+        let f_delta = new_f
             .iter()
             .zip(&f_per_sample)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
+        let level_delta = new_level
+            .iter()
+            .zip(&level_per_group)
+            .map(|(a, b)| {
+                (a.baseline - b.baseline)
+                    .abs()
+                    .max((a.slope - b.slope).abs())
+            })
+            .fold(0.0, f64::max);
         f_per_sample = new_f;
-        if delta < outer_cfg.f_tol {
+        level_per_group = new_level;
+        if f_delta < outer_cfg.f_tol && level_delta < outer_cfg.level_tol {
             break;
         }
     }
@@ -403,6 +410,126 @@ mod tests {
                 .iter()
                 .all(|&f| (0.0..=F_CEILING).contains(&f))
         );
+    }
+
+    #[test]
+    fn full_pipeline_calls_and_emits_a_variant_vcf_line() {
+        use crate::ssr::cohort::candidate_set::assemble_candidates;
+        use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, PerBaseError};
+        use crate::ssr::cohort::prepass::{estimate, run_prepass_stats};
+        use crate::ssr::cohort::rung_ladder::build_rungs;
+        use crate::ssr::cohort::sample_groups::{ClusterCfg, group_samples};
+        use crate::ssr::cohort::vcf_out::{
+            FpControlCfg, apply_fp_control, format_vcf_record, is_variable, site_qual,
+        };
+        use std::collections::HashMap;
+
+        // A clean variant cohort at one locus: 6 homozygotes (8) + 6 separated hets (6/10).
+        let chem = SimChemistry {
+            error: PerBaseError(0.002),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.06,
+                slope: 0.0,
+            },
+        };
+        let mut samples: Vec<SimSample> = (0..6)
+            .map(|i| SimSample {
+                name: format!("hom{i}"),
+                group: SampleGroupId(0),
+                genotypes: vec![Some(SimGenotype::homozygous(8, 2))],
+            })
+            .collect();
+        samples.extend((0..6).map(|i| SimSample {
+            name: format!("het{i}"),
+            group: SampleGroupId(0),
+            genotypes: vec![Some(SimGenotype::diploid(6, 10))],
+        }));
+        let spec = SimCohortSpec {
+            seed: 555,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 40,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 8,
+            }],
+            groups: vec![chem],
+            samples,
+            depth: 150,
+        };
+        let loci = collect_loci(&spec);
+
+        // Pre-pass → estimate → cluster.
+        let stats = run_prepass_stats(loci.iter().cloned(), 2, &RungCfg::dev_default());
+        let est = estimate(&stats);
+        let grouped = group_samples(&stats, &est, &ClusterCfg::dev_default());
+
+        // Assemble a ParamSet from the pre-pass output (the real interface).
+        let n = spec.samples.len();
+        let mut decay = HashMap::new();
+        decay.insert(2u8, G0PseudocountDecay { p: 0.5 });
+        let group_of_sample = (0..n as u32)
+            .map(|s| {
+                grouped
+                    .group_of_sample
+                    .get(&s)
+                    .copied()
+                    .unwrap_or(SampleGroupId(0))
+            })
+            .collect();
+        let params = ParamSet {
+            error_per_sample_group: grouped
+                .eps_per_group
+                .iter()
+                .map(|&e| PerBaseError(e))
+                .collect(),
+            stutter_shape_parent: est.shape_by_period.clone(),
+            stutter_shape_by_cell: grouped.shape_by_group_period.clone(),
+            level_seed: grouped.level_per_group.clone(),
+            pseudocount_decay_per_loci_group: decay,
+            group_of_sample,
+            f0_seed: 0.0,
+        };
+
+        // Genotype with the outer loop, then FP-control + emit.
+        let result = run_cohort_em(
+            &loci,
+            &params,
+            grouped.level_per_group.clone(),
+            2,
+            &EmCfg::dev_default(),
+            &RungCfg::dev_default(),
+            &CandidateCfg::dev_default(),
+            &OuterCfg::dev_default(),
+        );
+
+        let locus = &loci[0];
+        let rungs = build_rungs(locus, &RungCfg::dev_default());
+        let cands = assemble_candidates(locus, &rungs, 2, &CandidateCfg::dev_default());
+        let fp = FpControlCfg::dev_default();
+        let mut call = result.per_locus[0].clone();
+        apply_fp_control(locus, &mut call, &fp);
+
+        assert!(is_variable(&call, &cands), "the site is polymorphic");
+        let qual = site_qual(&call, &cands, &fp);
+        let line = format_vcf_record("chr1", locus, &cands, &call, qual);
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols[6], "PASS", "line: {line}");
+        assert_ne!(cols[4], ".", "should carry an ALT allele");
+
+        // The het samples (indices 6..12) call genotype 6/10.
+        for k in 0..call.calls.len() {
+            let global = locus.present[k] as usize;
+            if global >= 6 {
+                let mut units = call.calls[k].genotype_units.clone();
+                units.sort_unstable();
+                assert_eq!(units, vec![6, 10], "het sample {global} miscalled");
+            }
+        }
     }
 
     #[test]
