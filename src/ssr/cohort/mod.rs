@@ -17,6 +17,7 @@ pub mod likelihood;
 pub mod merge;
 pub mod pair_hmm;
 pub mod param_estimation;
+pub mod prepass;
 pub mod reader;
 pub mod rung_ladder;
 pub mod stutter;
