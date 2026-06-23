@@ -110,6 +110,13 @@ yet (that is Milestone I).
 - **Decision E:** a cohort sample absent from `grouped.group_of_sample` (no confident
   genotype anywhere) is a **hard error** naming the offending sample(s) — new
   `SsrCallError::UnresolvedSamples` variant. No group-0 default; no m2(a) fallback.
+- **Carry-over from the G1 review (Mi1):** `est.g0_by_period` only carries periods with
+  ≥1 *variable* locus; a period whose loci are all monomorphic is absent (the EM then
+  uses its own hardcoded `p=0.5` — two unsynchronised fallbacks). In `build_param_set`,
+  fill `pseudocount_decay_per_loci_group` with `G0FitCfg.fallback_p` for **every period
+  present** in the genotyped loci, so the configured fallback is the single source of
+  truth (arch §9 "a `p` for every period present"). See
+  [review](../reports/reviews/ssr_call_g0_fit_2026-06-23.md) Mi1.
 - **Tests:** happy path (round-trips every field, dense `group_of_sample`); the
   unresolved-sample hard error; `G₀` carried through for every period present.
 - *Depends:* G1.

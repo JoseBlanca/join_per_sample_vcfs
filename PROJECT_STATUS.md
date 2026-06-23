@@ -19,18 +19,18 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) genotyping+pre-pass — Milestone B (shared locus primitives)**
->   (branch `ssr-cohort`, [impl](doc/devel/reports/implementations/ssr_call_genotyping_milestone_b_2026-06-23.md)).
->   Full loop on the three real algorithms both halves call: B1 `rung_ladder`
->   (`build_rungs` + heuristic `resolve_confident_genotype`), B2 `stutter`
->   (`s_theta`/`reach_variants`/`refine_theta_locus` — the scoring counterpart of the
->   A2 simulator's forward model, kernel sums to 1), B3 `pair_hmm` (`align_subst`
->   banded forward, substitutions-in-tract / gaps-in-flank). Reviewed
->   (Approve-with-changes; 0 Blocker/Major) and **fixes applied → Milestones A+B shipped**
->   ([review](doc/devel/reports/reviews/ssr_call_genotyping_milestone_b_2026-06-23.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_v2.md)). fmt/clippy
->   `-D warnings` clean; 1207 lib tests. See the SSR **Stage 2** block below.
->   **Next (loop):** Milestone C (genotyping walking skeleton on supplied params → checkpoint 1: first VCF).
+> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) driver wiring — Step G1 (fit `G₀` in the pre-pass)**
+>   (branch `ssr-cohort`, impl `640a1e6`). First step of wiring the genotyper into the
+>   `ssr-call` driver toward a real VCF (settled arch [ssr_call_driver.md](doc/devel/architecture/ssr_call_driver.md),
+>   plan [ssr_call_driver.md](doc/devel/implementation_plans/ssr_call_driver.md)). Replaces
+>   the coded `G₀` `p=0.5` with a per-period fit from the cohort's confident germline allele
+>   spread over **variable loci only** — closed-form geometric MLE `p=(√(1+K̄²)−1)/K̄`, thin-
+>   period fallback, over-tightening clamp; integer accumulators keep it byte-identical.
+>   Reviewed (Approve-with-changes; 0 Blocker/Major, 3 Minor) and **fixes applied**
+>   ([review](doc/devel/reports/reviews/ssr_call_g0_fit_2026-06-23.md),
+>   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_g0_fit.md); Mi1 deferred to H1).
+>   fmt/clippy `-D warnings` clean; 1260 lib tests. See the SSR Stage 2 **Driver wiring** block below.
+>   **Next (loop):** Step H1 (`build_param_set` + decision-E hard error), then H2–H4 → the streaming VCF (task DoD).
 > - **Prior task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
 >   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
 >   Built the reading & merge spine through a runnable `ssr-call`: Phase 0 scaffolding;
@@ -1022,6 +1022,13 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
   - Provisional calibration constants to pin in F2: `MAX_SLIP=10`, the simulator's geometric forward-model parameterization, the substitution model.
   - B2's `align`/kernel must be written to **match `sim.rs`'s documented forward model** (else D-milestone recovery tests catch the divergence).
 - **Pre-existing unrelated bug surfaced:** `cargo test --all-targets` trips `benches/psp_writer_perf.rs:386` (index OOB in the bench harness) — separate fix.
+
+#### Driver wiring (genotyper → VCF; two-pass streaming)
+- **Status:** in-flight (2026-06-23, branch `ssr-cohort`) — wiring the implemented genotyper into the `ssr-call` driver so it emits a real VCF instead of the Phase-1 TSV dump. Step **G1 shipped** (G₀ fit); H–J pending.
+- **Architecture:** [ssr_call_driver.md](doc/devel/architecture/ssr_call_driver.md) — settled (decisions A–E): **two-pass streaming** (materialization rejected) — bounded pre-pass/burn-in freezes the cross-locus-pooled params (`F`, group level line, `θ_period`, ε, `G₀`), then a single streaming sweep of independent per-locus EMs; per-locus stutter refined locally with shrinkage. Fit `G₀` in the pre-pass; dedicated SSR VCF header (contigs from `.ssr.psp` headers, not the catalog); hard error on samples with no confident genotype; ploidy 2.
+- **Plan:** [ssr_call_driver.md](doc/devel/implementation_plans/ssr_call_driver.md) — milestones G (G₀ fit) → H (Step 1 streaming driver + VCF = task DoD) → I (Step 2 per-locus stutter adaptation) → J (parallelism), each through the implement → review → fix loop.
+- **Step G1 (G₀ decay fit):** implemented `640a1e6`, [review](doc/devel/reports/reviews/ssr_call_g0_fit_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major, 3 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_g0_fit.md) (Mi2/Mi3 + 2 Nits Applied; Mi1 deferred to H1). Per-period `G₀` `p` fit from the confident germline allele spread over variable loci (closed-form geometric MLE, thin-period fallback, over-tightening clamp). 1260 lib tests; fmt/clippy clean.
+- **Open:** Mi1 (carry to H1 — `build_param_set` fills every present period's decay from `G0FitCfg.fallback_p`); Steps H1–J1 unstarted.
 
 #### Reading & merge layer (Phases 0–3 done; `ssr-call` runnable; review applied)
 - **Status:** fixes-applied (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (cursor) + 2 (merger) + 3 (driver — single-threaded, `ssr-call` runs end-to-end → catalog-ordered TSV dump). Two-pass / prefetch-pool + the genotyping EM/VCF to follow.

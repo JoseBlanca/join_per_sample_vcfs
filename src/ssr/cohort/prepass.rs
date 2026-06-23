@@ -176,8 +176,16 @@ pub(crate) fn accumulate_locus(
         };
 
         // Each peak is one distinct called allele; a 1-peak (homozygous) call carries
-        // `ploidy` chromosome copies, a `ploidy`-peak call one copy each.
-        let copies_per_allele = ploidy as u64 / peaks.len().max(1) as u64;
+        // `ploidy` chromosome copies, a `ploidy`-peak call one copy each. This integer
+        // split is exact only when the peak count divides the ploidy — true for the
+        // diploid contract (1 or 2 peaks); a future polyploid with a non-dividing peak
+        // count would need fractional/dosage attribution, so guard it here.
+        debug_assert!(
+            (ploidy as usize).is_multiple_of(peaks.len()),
+            "peak count {} does not divide ploidy {ploidy} (diploid-only contract)",
+            peaks.len()
+        );
+        let copies_per_allele = ploidy as u64 / peaks.len() as u64;
         for peak in &peaks {
             add_allele_copies(&mut locus_alleles, peak.repeat_len, copies_per_allele);
         }
@@ -354,7 +362,9 @@ pub(crate) fn fit_level(stats: &SampleStutterStats) -> StutterLevel {
 /// `min_p`. With `K̄ = 0` (every allele on the mode) the formula's limit is `0`, so it
 /// clamps straight to `min_p`.
 fn fit_g0_decay(accum: &AlleleSpreadAccum, cfg: &G0FitCfg) -> G0PseudocountDecay {
-    if accum.total_copies < cfg.min_copies {
+    // `.max(1)` keeps the divisor positive below even if a caller sets `min_copies = 0`
+    // — `total_copies` is then guaranteed ≥ 1, so `K̄` can never be a `0/0` NaN.
+    if accum.total_copies < cfg.min_copies.max(1) {
         return G0PseudocountDecay { p: cfg.fallback_p };
     }
     let k_bar = accum.distance_weighted as f64 / accum.total_copies as f64;
@@ -802,5 +812,67 @@ mod tests {
             (0.0..=1.0).contains(&p) && p >= G0FitCfg::dev_default().min_p,
             "fitted G₀ p = {p} should be a clamped decay in (0,1]"
         );
+    }
+
+    #[test]
+    fn g0_spread_counts_het_alleles_as_one_copy_each() {
+        // 8 separated 6/10 hets → alleles 6 and 10, ONE chromosome copy each per sample
+        // (the 2-peak multiplicity branch): 8 × (1 + 1) = 16 copies. The two alleles sit
+        // 0 and 4 units from the read modal length (which is one of 6 / 10), so the
+        // distance-weighted sum is 8·0 + 8·4 = 32 either way.
+        let stats = run_prepass_stats(&collect_loci(&het_spec()), 2, &RungCfg::dev_default());
+        let spread = stats.allele_spread_by_period[&2];
+        assert_eq!(
+            spread.total_copies, 16,
+            "het = one copy per allele per sample"
+        );
+        assert_eq!(spread.distance_weighted, 32);
+    }
+
+    #[test]
+    fn g0_spread_measures_distance_from_an_asymmetric_mode() {
+        // A skewed cohort: 6 homozygotes at the modal length 10, 3 at 13 (both ≥
+        // recurrence_k). The mode is 10 (more reads), so the minority allele lands at
+        // distance 3: copies = 6·2 + 3·2 = 18; weighted = 12·0 + 6·3 = 18 ⇒ K̄ = 1.0.
+        let chem = SimChemistry {
+            error: PerBaseError(0.004),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.06,
+                slope: 0.0,
+            },
+        };
+        let mut samples: Vec<SimSample> = (0..6)
+            .map(|i| SimSample {
+                name: format!("modal{i}"),
+                group: SampleGroupId(0),
+                genotypes: vec![Some(SimGenotype::homozygous(10, 2))],
+            })
+            .collect();
+        samples.extend((0..3).map(|i| SimSample {
+            name: format!("minor{i}"),
+            group: SampleGroupId(0),
+            genotypes: vec![Some(SimGenotype::homozygous(13, 2))],
+        }));
+        let spec = SimCohortSpec {
+            seed: 31,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 60,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 10,
+            }],
+            groups: vec![chem],
+            samples,
+            depth: 200,
+        };
+        let stats = run_prepass_stats(&collect_loci(&spec), 2, &RungCfg::dev_default());
+        let spread = stats.allele_spread_by_period[&2];
+        assert_eq!(spread.total_copies, 18);
+        assert_eq!(spread.distance_weighted, 18);
     }
 }
