@@ -76,6 +76,34 @@ pub(crate) struct G0PseudocountDecay {
     pub(crate) p: f64,
 }
 
+/// Controls for fitting the per-period `G₀` decay `p` from the cohort's confident
+/// germline allele spread (arch `ssr_call_driver.md` §9). Pinned in F2.
+///
+/// The fit reflects "*given* a locus varies, how spread are its alleles," so it runs on
+/// variable loci only; thin periods fall back to [`fallback_p`](Self::fallback_p), and
+/// the fit is clamped no steeper than [`min_p`](Self::min_p) so a relatedness- or
+/// structure-compressed cohort cannot over-tighten the prior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct G0FitCfg {
+    /// Minimum allele-copies for a period before the data-driven fit is trusted; below
+    /// it the period takes the coded [`fallback_p`](Self::fallback_p).
+    pub(crate) min_copies: u64,
+    /// The coded fallback decay used for a thin period.
+    pub(crate) fallback_p: f64,
+    /// The steepest (smallest) `p` the fit may return — the over-tightening guard.
+    pub(crate) min_p: f64,
+}
+
+impl G0FitCfg {
+    pub(crate) fn dev_default() -> Self {
+        Self {
+            min_copies: 30,
+            fallback_p: 0.5,
+            min_p: 0.1,
+        }
+    }
+}
+
 /// The **frozen** output of the pre-pass that the genotyping EM consumes (the
 /// plan §1 interface).
 ///
@@ -127,6 +155,23 @@ pub(crate) struct SampleStutterStats {
     /// Dup-free primary depth — a clustering **precision** weight (`1/√depth`)
     /// only, never a feature (arch §4; dup-free by construction).
     pub(crate) read_depth: u64,
+}
+
+/// Per loci group (= period) — the count-weighted spread of confident **germline**
+/// alleles around the per-locus modal allele, over **variable loci only**, used to fit
+/// the `G₀` decay `p` (arch `ssr_call_driver.md` §9).
+///
+/// Two integer running sums, not a histogram: they are the exact sufficient statistic
+/// for the closed-form mean distance `K̄ = distance_weighted / total_copies`, and being
+/// integer the reduce is commutative + associative (byte-identical across threads).
+/// Storing sums rather than a binned histogram also sidesteps any fixed distance bound
+/// (a long tract can put an allele far from the mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AlleleSpreadAccum {
+    /// `Σ C[k]` — total allele-copies counted across the period's variable loci.
+    pub(crate) total_copies: u64,
+    /// `Σ k·C[k]` — distance-weighted copies, `k = |length − mode|` in repeat units.
+    pub(crate) distance_weighted: u64,
 }
 
 /// Fixed-point scale: floats are rounded to multiples of `2⁻⁴⁰` before summing, so

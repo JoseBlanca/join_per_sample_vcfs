@@ -283,7 +283,7 @@ pub(crate) fn run_cohort_em(
 mod tests {
     use super::*;
     use crate::ssr::cohort::param_estimation::{
-        G0PseudocountDecay, PerBaseError, SampleGroupId, StutterShape,
+        G0FitCfg, G0PseudocountDecay, PerBaseError, SampleGroupId, StutterShape,
     };
     use crate::ssr::cohort::sim::{
         SimChemistry, SimCohortSpec, SimGenotype, SimLocus, SimSample, simulate,
@@ -469,7 +469,7 @@ mod tests {
 
         // Pre-pass → estimate → cluster.
         let stats = run_prepass_stats(&loci, 2, &RungCfg::dev_default());
-        let est = estimate(&stats);
+        let est = estimate(&stats, &G0FitCfg::dev_default());
         let grouped = group_samples(&stats, &est, &ClusterCfg::dev_default());
 
         // Assemble a ParamSet from the pre-pass output (the real interface).

@@ -28,7 +28,8 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::ssr::cohort::param_estimation::{
-    MAX_SLIP, SampleStutterStats, SlipProfile, StutterLevel, StutterShape,
+    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, MAX_SLIP, SampleStutterStats, SlipProfile,
+    StutterLevel, StutterShape,
 };
 use crate::ssr::cohort::rung_ladder::{
     Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs, resolve_confident_genotype,
@@ -46,6 +47,10 @@ pub(crate) struct PrepassStats {
     pub(crate) slip_by_sample_period: HashMap<(u32, u8), SlipProfile>,
     /// Global sample index → its stutter stats (level line + `ε` + depth).
     pub(crate) per_sample: HashMap<u32, SampleStutterStats>,
+    /// Period → the count-weighted spread of confident alleles around the per-locus
+    /// mode, over **variable loci only** — the sufficient statistic for the `G₀`
+    /// decay fit (arch `ssr_call_driver.md` §9).
+    pub(crate) allele_spread_by_period: HashMap<u8, AlleleSpreadAccum>,
 }
 
 impl PrepassStats {
@@ -70,6 +75,11 @@ impl PrepassStats {
         for (&sample, stats) in &other.per_sample {
             merge_sample_stats(self.per_sample.entry(sample).or_default(), stats);
         }
+        for (&period, accum) in &other.allele_spread_by_period {
+            let dst = self.allele_spread_by_period.entry(period).or_default();
+            dst.total_copies += accum.total_copies;
+            dst.distance_weighted += accum.distance_weighted;
+        }
     }
 }
 
@@ -90,6 +100,10 @@ pub(crate) struct EstimatedParams {
     pub(crate) shape_by_period: HashMap<u8, StutterShape>,
     /// Per-sample stutter level line.
     pub(crate) level_by_sample: HashMap<u32, StutterLevel>,
+    /// Per loci group (= period) `G₀` decay `p`, fit from the confident-allele spread
+    /// (arch `ssr_call_driver.md` §9). One entry per period observed among the
+    /// variable loci; thin periods carry the coded fallback.
+    pub(crate) g0_by_period: HashMap<u8, G0PseudocountDecay>,
 }
 
 /// Add `(faithful, slipped)` to the bin for `length`, creating it if new.
@@ -150,6 +164,9 @@ pub(crate) fn accumulate_locus(
     cfg: &RungCfg,
 ) {
     let period = rungs.period();
+    // Cohort-wide confident-allele tally for this locus (length in repeat units →
+    // chromosome copies), used for the G₀ allele-spread fit below.
+    let mut locus_alleles: Vec<(u16, u64)> = Vec::new();
     for (k, evidence) in locus.samples.iter().enumerate() {
         let global = locus.present[k];
         let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
@@ -157,6 +174,13 @@ pub(crate) fn accumulate_locus(
         else {
             continue;
         };
+
+        // Each peak is one distinct called allele; a 1-peak (homozygous) call carries
+        // `ploidy` chromosome copies, a `ploidy`-peak call one copy each.
+        let copies_per_allele = ploidy as u64 / peaks.len().max(1) as u64;
+        for peak in &peaks {
+            add_allele_copies(&mut locus_alleles, peak.repeat_len, copies_per_allele);
+        }
 
         // Accumulate locally first (avoids holding two &mut into `stats` at once).
         let mut local = SampleStutterStats::default();
@@ -196,6 +220,33 @@ pub(crate) fn accumulate_locus(
                 *count,
             );
         }
+    }
+
+    // G₀ spread: only loci that VARY (≥2 distinct confident alleles cohort-wide)
+    // inform the prior — "given a locus varies, how spread are its alleles." Distance
+    // is measured from the per-locus modal length, the same reference `g0_pseudocounts`
+    // uses at call time.
+    if locus_alleles.len() >= 2
+        && let Some(mode) = rungs.modal_length()
+    {
+        let accum = stats
+            .allele_spread_by_period
+            .entry(period as u8)
+            .or_default();
+        for &(length, copies) in &locus_alleles {
+            let distance = (length as i32 - mode as i32).unsigned_abs() as u64;
+            accum.total_copies += copies;
+            accum.distance_weighted += copies * distance;
+        }
+    }
+}
+
+/// Add `copies` chromosome copies of repeat length `length` to a per-locus allele
+/// tally, creating the entry if new.
+fn add_allele_copies(tally: &mut Vec<(u16, u64)>, length: u16, copies: u64) {
+    match tally.iter_mut().find(|(l, _)| *l == length) {
+        Some(entry) => entry.1 += copies,
+        None => tally.push((length, copies)),
     }
 }
 
@@ -296,8 +347,29 @@ pub(crate) fn fit_level(stats: &SampleStutterStats) -> StutterLevel {
     StutterLevel { baseline, slope }
 }
 
+/// Fit one period's `G₀` decay `p` from its confident-allele spread (arch
+/// `ssr_call_driver.md` §9): the closed-form MLE of the symmetric geometric `p^|Δ|`,
+/// `p = (√(1 + K̄²) − 1) / K̄` with `K̄` the mean distance-from-mode. A thin period
+/// (too few copies) takes the coded fallback; the fit is clamped no steeper than
+/// `min_p`. With `K̄ = 0` (every allele on the mode) the formula's limit is `0`, so it
+/// clamps straight to `min_p`.
+fn fit_g0_decay(accum: &AlleleSpreadAccum, cfg: &G0FitCfg) -> G0PseudocountDecay {
+    if accum.total_copies < cfg.min_copies {
+        return G0PseudocountDecay { p: cfg.fallback_p };
+    }
+    let k_bar = accum.distance_weighted as f64 / accum.total_copies as f64;
+    let p = if k_bar > 0.0 {
+        ((1.0 + k_bar * k_bar).sqrt() - 1.0) / k_bar
+    } else {
+        0.0
+    };
+    G0PseudocountDecay {
+        p: p.clamp(cfg.min_p, 1.0),
+    }
+}
+
 /// D2 — measure the parameters from the accumulated statistics.
-pub(crate) fn estimate(stats: &PrepassStats) -> EstimatedParams {
+pub(crate) fn estimate(stats: &PrepassStats, g0_cfg: &G0FitCfg) -> EstimatedParams {
     let (mut matches, mut mismatches) = (0u64, 0u64);
     for sample in stats.per_sample.values() {
         matches += sample.base_match;
@@ -319,11 +391,17 @@ pub(crate) fn estimate(stats: &PrepassStats) -> EstimatedParams {
         .iter()
         .map(|(sample, st)| (*sample, fit_level(st)))
         .collect();
+    let g0_by_period = stats
+        .allele_spread_by_period
+        .iter()
+        .map(|(period, accum)| (*period, fit_g0_decay(accum, g0_cfg)))
+        .collect();
 
     EstimatedParams {
         eps,
         shape_by_period,
         level_by_sample,
+        g0_by_period,
     }
 }
 
@@ -348,8 +426,13 @@ pub(crate) fn run_prepass_stats(loci: &[CohortLocus], ploidy: u8, cfg: &RungCfg)
 }
 
 /// Run the pre-pass over the cohort loci and return the measured parameters.
-pub(crate) fn run_prepass(loci: &[CohortLocus], ploidy: u8, cfg: &RungCfg) -> EstimatedParams {
-    estimate(&run_prepass_stats(loci, ploidy, cfg))
+pub(crate) fn run_prepass(
+    loci: &[CohortLocus],
+    ploidy: u8,
+    cfg: &RungCfg,
+    g0_cfg: &G0FitCfg,
+) -> EstimatedParams {
+    estimate(&run_prepass_stats(loci, ploidy, cfg), g0_cfg)
 }
 
 #[cfg(test)]
@@ -410,7 +493,12 @@ mod tests {
     }
 
     fn run(spec: &SimCohortSpec) -> EstimatedParams {
-        run_prepass(&collect_loci(spec), 2, &RungCfg::dev_default())
+        run_prepass(
+            &collect_loci(spec),
+            2,
+            &RungCfg::dev_default(),
+            &G0FitCfg::dev_default(),
+        )
     }
 
     /// A cohort of cohort-recurrent separated hets (6/10), under a known chemistry.
@@ -469,7 +557,7 @@ mod tests {
             );
         }
         // ε is still recovered off the (cleaner outer) het skirts.
-        let est = estimate(&stats);
+        let est = estimate(&stats, &G0FitCfg::dev_default());
         assert!((est.eps - 0.004).abs() < 0.003, "ε recovered {}", est.eps);
     }
 
@@ -484,8 +572,12 @@ mod tests {
     #[test]
     fn prepass_is_byte_identical_across_thread_counts() {
         let loci = collect_loci(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10));
-        let single = with_threads(1, || run_prepass(&loci, 2, &RungCfg::dev_default()));
-        let multi = with_threads(4, || run_prepass(&loci, 2, &RungCfg::dev_default()));
+        let single = with_threads(1, || {
+            run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default())
+        });
+        let multi = with_threads(4, || {
+            run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default())
+        });
         assert_eq!(
             single, multi,
             "the pre-pass must be byte-identical across thread counts (F1)"
@@ -495,8 +587,8 @@ mod tests {
     #[test]
     fn run_prepass_is_deterministic() {
         let loci = collect_loci(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10));
-        let a = run_prepass(&loci, 2, &RungCfg::dev_default());
-        let b = run_prepass(&loci, 2, &RungCfg::dev_default());
+        let a = run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default());
+        let b = run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default());
         assert_eq!(
             a, b,
             "the pre-pass must be order-independent / reproducible"
@@ -598,5 +690,117 @@ mod tests {
         let est = run(&spec);
         assert_eq!(est.eps, 0.0);
         assert!(est.level_by_sample.is_empty());
+    }
+
+    // ── G1: the G₀ decay fit ──
+
+    #[test]
+    fn g0_fit_recovers_the_closed_form_from_mean_distance() {
+        // K̄ = 16/32 = 0.5 → p = (√(1+K̄²) − 1)/K̄. min_p = 0 so the clamp can't mask it.
+        let cfg = G0FitCfg {
+            min_copies: 1,
+            fallback_p: 0.5,
+            min_p: 0.0,
+        };
+        let accum = AlleleSpreadAccum {
+            total_copies: 32,
+            distance_weighted: 16,
+        };
+        let k = 0.5_f64;
+        let expected = ((1.0 + k * k).sqrt() - 1.0) / k;
+        assert!((fit_g0_decay(&accum, &cfg).p - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn g0_fit_falls_back_for_a_thin_period() {
+        let cfg = G0FitCfg::dev_default(); // min_copies = 30
+        let accum = AlleleSpreadAccum {
+            total_copies: 10,
+            distance_weighted: 30,
+        };
+        assert_eq!(fit_g0_decay(&accum, &cfg).p, cfg.fallback_p);
+    }
+
+    #[test]
+    fn g0_fit_clamps_against_over_tightening() {
+        let cfg = G0FitCfg {
+            min_copies: 1,
+            fallback_p: 0.5,
+            min_p: 0.1,
+        };
+        // A very tight spread (K̄ ≈ 0.01) would fit p ≈ 0.005; clamped up to min_p.
+        let tight = AlleleSpreadAccum {
+            total_copies: 100,
+            distance_weighted: 1,
+        };
+        assert_eq!(fit_g0_decay(&tight, &cfg).p, 0.1);
+        // Every allele on the mode (K̄ = 0) also clamps rather than collapsing to 0.
+        let on_mode = AlleleSpreadAccum {
+            total_copies: 100,
+            distance_weighted: 0,
+        };
+        assert_eq!(fit_g0_decay(&on_mode, &cfg).p, 0.1);
+    }
+
+    #[test]
+    fn g0_spread_counts_only_variable_loci() {
+        // A variable cohort (homozygotes spread over 7..=12) populates the spread; a
+        // monomorphic cohort (all the same length) contributes nothing.
+        let variable = run_prepass_stats(
+            &collect_loci(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10)),
+            2,
+            &RungCfg::dev_default(),
+        );
+        let spread = variable.allele_spread_by_period[&2];
+        assert!(
+            spread.total_copies > 0,
+            "variable loci should populate spread"
+        );
+
+        let mono = SimCohortSpec {
+            seed: 7,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 60,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 10,
+            }],
+            groups: vec![SimChemistry {
+                error: PerBaseError(0.004),
+                shape: StutterShape {
+                    up_rate: 1.0,
+                    down_rate: 2.0,
+                    decay: 0.1,
+                },
+                level: StutterLevel {
+                    baseline: 0.06,
+                    slope: 0.0,
+                },
+            }],
+            // All eight samples homozygous for the SAME length → one distinct allele.
+            samples: (0..8)
+                .map(|i| SimSample {
+                    name: format!("S{i}"),
+                    group: SampleGroupId(0),
+                    genotypes: vec![Some(SimGenotype::homozygous(10, 2))],
+                })
+                .collect(),
+            depth: 200,
+        };
+        let mono_stats = run_prepass_stats(&collect_loci(&mono), 2, &RungCfg::dev_default());
+        assert!(
+            !mono_stats.allele_spread_by_period.contains_key(&2),
+            "a monomorphic locus must not feed the G₀ spread"
+        );
+    }
+
+    #[test]
+    fn g0_by_period_is_fit_for_a_variable_cohort() {
+        let est = run(&recovery_spec(0.004, 1.0, 2.0, 0.1, 0.10));
+        let p = est.g0_by_period[&2].p;
+        assert!(
+            (0.0..=1.0).contains(&p) && p >= G0FitCfg::dev_default().min_p,
+            "fitted G₀ p = {p} should be a clamped decay in (0,1]"
+        );
     }
 }

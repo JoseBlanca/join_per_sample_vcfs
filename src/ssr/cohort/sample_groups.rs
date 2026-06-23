@@ -256,7 +256,7 @@ fn eps_freeze_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssr::cohort::param_estimation::PerBaseError;
+    use crate::ssr::cohort::param_estimation::{G0FitCfg, PerBaseError};
     use crate::ssr::cohort::prepass::{estimate, run_prepass_stats};
     use crate::ssr::cohort::rung_ladder::RungCfg;
     use crate::ssr::cohort::sim::{
@@ -318,7 +318,7 @@ mod tests {
             .map(|(_, locus)| locus)
             .collect();
         let stats = run_prepass_stats(&loci, 2, &RungCfg::dev_default());
-        let est = estimate(&stats);
+        let est = estimate(&stats, &G0FitCfg::dev_default());
         (stats, est)
     }
 
