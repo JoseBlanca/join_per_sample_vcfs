@@ -38,6 +38,10 @@ use crate::ssr::cohort::types::CohortLocus;
 pub(crate) struct PrepassStats {
     /// Period → the cohort slip profile (the `θ_period` parent).
     pub(crate) slip_by_period: HashMap<u8, SlipProfile>,
+    /// `(global sample, period)` → that sample's slip profile, so D3 can
+    /// re-aggregate the slip profile **per sample group** once clustering fixes the
+    /// groups (the per-`(group, period)` shape).
+    pub(crate) slip_by_sample_period: HashMap<(u32, u8), SlipProfile>,
     /// Global sample index → its stutter stats (level line + `ε` + depth).
     pub(crate) per_sample: HashMap<u32, SampleStutterStats>,
 }
@@ -70,8 +74,18 @@ fn compare_bases(obs: &[u8], allele: &[u8]) -> (u64, u64) {
     (matches, obs.len() as u64 - matches)
 }
 
+/// A sample's per-base substitution rate `ε` from its faithful-peak base counts.
+pub(crate) fn sample_eps(stats: &SampleStutterStats) -> f64 {
+    let total = stats.base_match + stats.base_mismatch;
+    if total > 0 {
+        stats.base_mismatch as f64 / total as f64
+    } else {
+        0.0
+    }
+}
+
 /// Fold a sample's per-locus stats into its running accumulator.
-fn merge_sample_stats(dst: &mut SampleStutterStats, src: &SampleStutterStats) {
+pub(crate) fn merge_sample_stats(dst: &mut SampleStutterStats, src: &SampleStutterStats) {
     dst.base_match += src.base_match;
     dst.base_mismatch += src.base_mismatch;
     dst.read_depth += src.read_depth;
@@ -127,16 +141,33 @@ pub(crate) fn accumulate_locus(
         }
 
         merge_sample_stats(stats.per_sample.entry(global).or_default(), &local);
-        let profile = stats.slip_by_period.entry(period as u8).or_default();
-        for (delta, count) in slips {
-            let magnitude = delta.unsigned_abs() as usize;
-            if (1..=MAX_SLIP).contains(&magnitude) {
-                if delta > 0 {
-                    profile.up[magnitude - 1] += count as u64;
-                } else {
-                    profile.down[magnitude - 1] += count as u64;
-                }
-            }
+        for (delta, count) in &slips {
+            add_slip(
+                stats.slip_by_period.entry(period as u8).or_default(),
+                *delta,
+                *count,
+            );
+            add_slip(
+                stats
+                    .slip_by_sample_period
+                    .entry((global, period as u8))
+                    .or_default(),
+                *delta,
+                *count,
+            );
+        }
+    }
+}
+
+/// Add a slip of signed size `delta` (count `count`) to a profile, respecting the
+/// `MAX_SLIP` cap.
+fn add_slip(profile: &mut SlipProfile, delta: i32, count: u32) {
+    let magnitude = delta.unsigned_abs() as usize;
+    if (1..=MAX_SLIP).contains(&magnitude) {
+        if delta > 0 {
+            profile.up[magnitude - 1] += count as u64;
+        } else {
+            profile.down[magnitude - 1] += count as u64;
         }
     }
 }
@@ -179,7 +210,7 @@ fn estimate_shape(profile: &SlipProfile) -> StutterShape {
 /// extrapolate to a negative or `>1` rate at lengths outside the observed range.
 /// Every consumer clamps `level` into `[0,1]` at evaluation (`em.rs`, `sim.rs`), so
 /// the raw line is intentionally preserved for the outer-loop refit (E1).
-fn fit_level(stats: &SampleStutterStats) -> StutterLevel {
+pub(crate) fn fit_level(stats: &SampleStutterStats) -> StutterLevel {
     let points: Vec<(f64, f64, f64)> = stats
         .by_length
         .iter()
@@ -256,18 +287,27 @@ pub(crate) fn estimate(stats: &PrepassStats) -> EstimatedParams {
     }
 }
 
+/// Accumulate the pre-pass sufficient statistics over a cohort-locus stream.
+pub(crate) fn run_prepass_stats(
+    loci: impl IntoIterator<Item = CohortLocus>,
+    ploidy: u8,
+    cfg: &RungCfg,
+) -> PrepassStats {
+    let mut stats = PrepassStats::default();
+    for locus in loci {
+        let rungs = build_rungs(&locus, cfg);
+        accumulate_locus(&mut stats, &locus, &rungs, ploidy, cfg);
+    }
+    stats
+}
+
 /// Run the pre-pass over a cohort-locus stream and return the measured parameters.
 pub(crate) fn run_prepass(
     loci: impl IntoIterator<Item = CohortLocus>,
     ploidy: u8,
     cfg: &RungCfg,
 ) -> EstimatedParams {
-    let mut stats = PrepassStats::default();
-    for locus in loci {
-        let rungs = build_rungs(&locus, cfg);
-        accumulate_locus(&mut stats, &locus, &rungs, ploidy, cfg);
-    }
-    estimate(&stats)
+    estimate(&run_prepass_stats(loci, ploidy, cfg))
 }
 
 #[cfg(test)]

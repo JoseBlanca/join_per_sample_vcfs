@@ -20,6 +20,7 @@ pub mod param_estimation;
 pub mod prepass;
 pub mod reader;
 pub mod rung_ladder;
+pub mod sample_groups;
 pub mod stutter;
 pub mod types;
 pub mod vcf_out;
