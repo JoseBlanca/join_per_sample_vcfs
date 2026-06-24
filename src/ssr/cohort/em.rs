@@ -40,7 +40,11 @@ pub(crate) struct EmCfg {
     pub(crate) tol: f64,
     /// Outlier mixing weight `λ` (uniform junk term).
     pub(crate) lambda: f64,
-    /// Inbreeding coefficient `F` (the autozygous-branch weight); refined in E1.
+    /// Seed inbreeding coefficient `F` (the autozygous-branch weight) used **only** by the
+    /// [`run_locus_em`] convenience wrapper (tests / standalone). The production path
+    /// (`driver::genotype_locus` → [`run_locus_em_with`]) supplies an explicit per-sample
+    /// `F` frozen by the burn-in and never reads this field — so setting it and calling
+    /// `run_locus_em_with` directly has no effect (review Mi11).
     pub(crate) inbreeding_f: f64,
     /// Maximum per-locus refinement rounds (I1 shape + I2 level). `0` keeps the frozen
     /// `θ_period` seed shape and group level (no per-locus adaptation).
@@ -904,9 +908,9 @@ mod tests {
     fn refit_level_multiplier_collapses_to_one_without_excess_slips() {
         // Observed slips equal the group-expected slips ⇒ multiplier 1 (the group rate).
         let matched = LocusSlipFit {
+            profile: SlipProfile::default(),
             slipped: 10,
             expected_slipped: 10.0,
-            ..Default::default()
         };
         assert!((refit_level_multiplier(&matched, 20.0) - 1.0).abs() < 1e-9);
         // No data ⇒ also 1 (collapses to the group rate, no oscillation).
@@ -914,9 +918,9 @@ mod tests {
         // A genuinely stuttery locus (more observed than expected) pushes the rate up,
         // but shrinkage keeps a thin signal modest.
         let stuttery = LocusSlipFit {
+            profile: SlipProfile::default(),
             slipped: 60,
             expected_slipped: 20.0,
-            ..Default::default()
         };
         let m = refit_level_multiplier(&stuttery, 20.0);
         assert!(m > 1.0 && m < 3.0, "shrunk multiplier {m}");
@@ -1028,6 +1032,46 @@ mod tests {
             let mut want = expected.to_vec();
             want.sort_unstable();
             assert_eq!(got, want, "sample {k} with θ refit disabled");
+        }
+    }
+
+    #[test]
+    fn capped_refit_returns_calls_consistent_with_the_final_round() {
+        // A capped refit (refit_max_rounds: 1) that may not fully converge must still
+        // return the calls recomputed at the end of its last round — never stale pre-loop
+        // calls. At high depth one round already recovers the truth and agrees with the
+        // converged (refit_max_rounds: 3) genotypes (review Mi15).
+        let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let capped = EmCfg {
+            refit_max_rounds: 1,
+            ..EmCfg::dev_default()
+        };
+        let one = run_locus_em(&locus, &rungs, &candidates, &params, &seed, 2, &capped);
+        let three = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        let truth = [[8, 8], [8, 8], [6, 10], [10, 10], [6, 10]];
+        for (k, expected) in truth.iter().enumerate() {
+            let mut got = one.calls[k].genotype_units.clone();
+            got.sort_unstable();
+            let mut want = expected.to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "capped refit sample {k} should still call truth");
+            let mut got3 = three.calls[k].genotype_units.clone();
+            got3.sort_unstable();
+            assert_eq!(got, got3, "capped vs converged disagree at sample {k}");
         }
     }
 
