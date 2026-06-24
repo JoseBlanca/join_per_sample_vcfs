@@ -4,7 +4,7 @@
 **Source review:** `doc/devel/reports/reviews/ssr_call_driver_2026-06-24.md`
 **Source state reviewed against:** branch `ssr-cohort`, HEAD `ce91077` (post ia→ai/doc move)
 **Execution mode:** interactive
-**Overall status:** In progress
+**Overall status:** Completed (Blocker + all Majors Applied; 8 Minors Deferred as follow-ups)
 
 ---
 
@@ -16,18 +16,28 @@
 - Minors: 16 (Mi1–Mi16)
 - Nits: grouped
 
-### Outcome totals (running)
-- Applied: 0
-- Deferred: 0
-- (updated incrementally below)
+### Outcome totals
+- Applied: 15 (B1; M1–M6; Mi6, Mi7, Mi8, Mi9, Mi10, Mi11, Mi12, Mi15)
+- Applied with adaptation: 0 (B1/M2/M5/M6 adapted the review's *suggestion detail* but met intent — noted per finding)
+- Already fixed: 0
+- Deferred: 8 (Mi1, Mi2, Mi3, Mi4, Mi5, Mi13, Mi14, Mi16)
+- Disputed: 0
+- Failed validation: 0
+- Blocked by context mismatch: 0
+- Superseded: 0
+- Awaiting user answer: 0
 
-### Validation summary
-- Per-finding: `cargo test --lib --all-features ssr::cohort` + `cargo fmt --check` + `cargo clippy --lib`.
-- Final full gate: `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, `cargo doc --no-deps` (recorded at end).
-- Perf check: **skipped** — no bench under `benches/` references `ssr`/`cohort::` (confirmed `grep -rl "ssr\|cohort::" benches/` empty), so no Apply touches a bench-covered hot path.
+### Validation summary (final full gate)
+- `cargo fmt --check` → 0
+- `cargo clippy --all-targets --all-features -- -D warnings` → 0
+- `cargo test --lib --all-features` → 0, `1287 passed; 0 failed; 2 ignored` (+7 vs the 1280 baseline)
+- `cargo test --all-targets --all-features` → 101 — the **only** failure is the pre-existing `benches/psp_writer_perf.rs:386` panic (baseline; not this work). All lib + integration tests pass.
+- `cargo doc --no-deps` → 0
+- `cargo audit` → not run (cargo-audit not installed; diff adds no dependencies).
+- Performance check: **skipped** — no bench under `benches/` references `ssr`/`cohort::`, so no Apply touches a bench-covered hot path.
 
 ### Unresolved high-priority findings
-- (tracked at end)
+- None. Every Blocker and Major is Applied. The 8 Deferred are all Minors (refactors / bench-gated allocation levers / policy choices) — see §5.
 
 ## 2. Findings table
 
@@ -56,6 +66,10 @@
 | Mi14 | Minor | `QUAL=.` for variable-but-zero locus | Defer | — | — | — |
 | Mi15 | Minor | refit non-convergence untested | Apply (test-only) | Applied | em.rs (test) | Pass |
 | Mi16 | Minor | once-per-run `level_per_group.clone()` | Defer | — | — | — |
+
+## 3. Questions asked and answers
+
+None — every Applied finding had one clearly-correct implementation path; the Deferred set is held for design/policy decisions (Mi13/Mi14) or a missing SSR bench (Mi3/Mi4), not blocked on a question.
 
 ## 4. Per-finding log
 
@@ -253,6 +267,55 @@
 
 *Commit grouping note:* Mi7/Mi11/Mi15 all live in `em.rs` and Mi10/Mi12 in `driver.rs`; since interactive `git add -p` is unavailable to split a single file across commits, the `em.rs` trivials share one commit and the `driver.rs` trivials another. Each finding is logged separately above.
 
+## 5. Deferred findings to carry forward
+
+- **Mi1** — extract the shared read-to-nearest-allele attribution helper (3–4 call sites across `em.rs`/`prepass.rs`/`vcf_out.rs`). Cross-file refactor; tie-breaks agree today, so it is a maintainability/drift cost, not a bug. Best done alongside the planned soft-split change.
+- **Mi2** — bundle `compute_data_ll`'s 11-arg signature into a `LocusModel`. Signature refactor; the justification comments (Mi6) cover the lint in the interim.
+- **Mi3** — hoist `compute_data_ll`'s per-round `Vec<Vec<f64>>`/`obs_qr` allocations into reused scratch. Allocation lever the review says to bench-gate; **no SSR bench exists**, so deferred until one does (and the wall cost is measured).
+- **Mi4** — per-locus `f_present` allocation in the parallel sweep → `map_init` scratch. Same bench-gated rationale as Mi3; small (× locus count).
+- **Mi5** — replace the `(u16,u64,u64)`/`(u16,u64)` tuple bins with named structs. Multi-site refactor (`add_bin`/`merge_sample_stats`/`fit_level`/`add_allele_copies`); cosmetic, low value relative to churn.
+- **Mi13** — validate allele bytes are ACGTN/ASCII (vs `from_utf8_lossy`). A different untrusted-boundary than M5 (allele tracts, not names); needs a design choice on where to validate. Low real-world likelihood.
+- **Mi14** — `QUAL=.` vs `0.0` for a variable-but-zero-confidence emitted locus. The review flags this as an "either/or" **policy choice** (`.` is valid VCF per spec §4.5); deferred for a product decision rather than guessed.
+- **Mi16** — restructure the once-per-run `grouped.level_per_group.clone()` to a move. One-time burn-in cost; negligible, restructure not worth the churn now.
+
+## 6. Disputed findings to return to reviewer
+
+None.
+
+## 7. Failed-validation findings
+
+None.
+
+## 8. Blocked-by-context-mismatch findings
+
+None.
+
+## 9. Performance check
+
+- **Triggered:** No — no bench under `benches/` references `ssr`/`cohort::` (`grep -rl "ssr\|cohort::" benches/` empty), so no Apply changed a bench-covered hot path.
+- **Baseline saved:** N/A.
+- **Outcome:** Skipped — no Apply touched perf-sensitive code.
+
+## 10. Commands run
+
+- `cargo test --lib --all-features ssr::cohort` (per finding)
+- `cargo fmt --check` / `cargo fmt`
+- `cargo clippy --lib --all-features -- -D warnings` (per finding)
+- `cargo clippy --all-targets --all-features -- -D warnings` (final)
+- `cargo test --lib --all-features` (final)
+- `cargo test --all-targets --all-features` (final)
+- `cargo doc --no-deps` (final)
+
+## 11. Command results
+
+- `cargo fmt --check` → 0
+- `cargo clippy --all-targets --all-features -- -D warnings` → 0
+- `cargo test --lib --all-features` → 0, `1287 passed; 0 failed; 2 ignored`
+- `cargo test --all-targets --all-features` → 101 (pre-existing `psp_writer_perf` bench panic only)
+- `cargo doc --no-deps` → 0
+
 ## 12. Notes
 
-- Initial deferrals: Mi1/Mi2 (cross-file / signature refactors needing a design choice), Mi3/Mi4/Mi16 (allocation levers the review itself says to bench-gate, and no SSR bench exists yet), Mi5 (multi-site tuple→struct refactor), Mi13 (allele-byte validation boundary — design choice), Mi14 (QUAL `.`-vs-`0.0` is a policy choice the review flags as "either/or"). These remain open follow-ups.
+- All Applied fixes are behaviour-preserving on the supported path except the intended ones: B1 changes the data-row width (the bug fix); M1/M2 convert silent fallbacks to loud panics (broken-invariant paths only); M5 adds a new typed error for malformed names; M4 swaps `partial_cmp`→`total_cmp` (identical argmax for finite inputs).
+- Two commits group same-file trivials (`em.rs`: Mi7/Mi11/Mi15; `driver.rs`: Mi10/Mi12) because interactive `git add -p` is unavailable to split one file across commits; each finding is logged individually above.
+- The deferred Minors are recorded as `Open:` items in `PROJECT_STATUS.md`'s Driver-wiring block.
