@@ -185,7 +185,7 @@ const BURN_IN_MAX_LOCI: usize = 20_000;
 /// The cross-locus-pooled parameters the burn-in freezes for the genotyping sweep.
 struct FrozenParams {
     /// Frozen chemistry (ε, stutter shape parent, per-group level seed, `G₀`, groups).
-    params: ParamSet,
+    chemistry: ParamSet,
     /// Frozen per-(global)-sample inbreeding `F`.
     f_per_sample: Vec<f64>,
     /// Frozen per-group stutter level.
@@ -235,7 +235,7 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
             &outer_cfg,
         );
         Ok(FrozenParams {
-            params,
+            chemistry: params,
             f_per_sample: calls.f_per_sample,
             level_per_group: calls.level_per_group,
         })
@@ -398,7 +398,7 @@ fn genotype_locus(
         locus,
         &rungs,
         &candidates,
-        &frozen.params,
+        &frozen.chemistry,
         PLOIDY,
         rung_cfg.prominence,
     );
@@ -411,7 +411,7 @@ fn genotype_locus(
         locus,
         &rungs,
         &candidates,
-        &frozen.params,
+        &frozen.chemistry,
         &seed,
         PLOIDY,
         em_cfg,

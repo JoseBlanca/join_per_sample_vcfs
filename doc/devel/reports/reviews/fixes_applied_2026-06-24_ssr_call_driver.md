@@ -48,7 +48,7 @@
 | Mi6 | Minor | bare `#[allow(too_many_arguments)]` | Apply | Applied | driver.rs, em.rs | Pass |
 | Mi7 | Minor | `..Default::default()` in test literals | Apply | — | — | — |
 | Mi8 | Minor | `level_mult`→`level_multiplier` | Apply | Applied | em.rs | Pass |
-| Mi9 | Minor | `FrozenParams.params`→`chemistry` | Apply | — | — | — |
+| Mi9 | Minor | `FrozenParams.params`→`chemistry` | Apply | Applied | driver.rs | Pass |
 | Mi10 | Minor | stale "sweep is serial" comment | Apply | — | — | — |
 | Mi11 | Minor | `EmCfg.inbreeding_f` test-only | Apply | — | — | — |
 | Mi12 | Minor | unsurfaced threads/queue_depth coercion | Apply | — | — | — |
@@ -195,6 +195,24 @@
 - **Adaptation:** None.
 - **Verification performed:** rename is symbol-local (compiler-checked); `ssr::cohort` suite + clippy green.
 - **Files changed:** `src/ssr/cohort/em.rs`, `src/ssr/cohort/driver.rs`
+- **Tests added or modified:** None.
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `148 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None.
+
+### Mi9 — `FrozenParams.params` → `chemistry`
+- **Severity:** Minor
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** `frozen.params` (a bare generic noun beside the descriptive `f_per_sample`/`level_per_group`) read as a tautology; the field's doc already calls it "Frozen chemistry."
+- **Implementation summary:** renamed the `FrozenParams.params` field to `chemistry`; updated the constructor in `run` and the two `&frozen.params` reads in `genotype_locus`.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** symbol-local rename (compiler-checked); suite + clippy green.
+- **Files changed:** `src/ssr/cohort/driver.rs`
 - **Tests added or modified:** None.
 - **Validation:**
   - `cargo test --lib --all-features ssr::cohort` → 0, `148 passed`
