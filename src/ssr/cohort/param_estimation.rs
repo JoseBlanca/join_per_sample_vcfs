@@ -162,14 +162,26 @@ impl SlipProfile {
     }
 }
 
+/// One repeat-length bin of a sample's stutter tally: at `length` repeat units, how many
+/// reads sat faithfully on the peak vs slipped off it. The level line
+/// `baseline + slope·length` is fit from these. A named struct so `bin.faithful += …`
+/// reads itself rather than `bin.1 += …` (review Mi5); the `Vec` + linear scan is kept
+/// deliberately — the distinct-length cardinality per sample is tiny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct LengthBin {
+    pub(crate) length: u16,
+    pub(crate) faithful: u64,
+    pub(crate) slipped: u64,
+}
+
 /// Per sample — feeds (a) the per-group level line, (b) the clustering, and
 /// (c) — once groups are fixed — the per-`(group, period)` shape key (arch §3).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SampleStutterStats {
-    /// `(repeat length, faithful count, slipped count)` bins → the level line
+    /// Per-repeat-length faithful/slipped bins → the level line
     /// `baseline + slope · length`. A separated het adds a bin at each allele
     /// length.
-    pub(crate) by_length: Vec<(u16, u64, u64)>,
+    pub(crate) by_length: Vec<LengthBin>,
     /// Within-tract base matches off the faithful peaks → `ε`.
     pub(crate) base_match: u64,
     /// Within-tract base mismatches off the faithful peaks → `ε` (substitutions).

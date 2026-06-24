@@ -27,9 +27,10 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+use crate::ssr::cohort::attribution::nearest_parent;
 use crate::ssr::cohort::param_estimation::{
-    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, MAX_SLIP, SampleStutterStats, SlipProfile,
-    StutterLevel, StutterShape,
+    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, SampleStutterStats,
+    SlipProfile, StutterLevel, StutterShape,
 };
 use crate::ssr::cohort::rung_ladder::{
     Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs, resolve_confident_genotype,
@@ -107,18 +108,17 @@ pub(crate) struct EstimatedParams {
 }
 
 /// Add `(faithful, slipped)` to the bin for `length`, creating it if new.
-pub(crate) fn add_bin(
-    by_length: &mut Vec<(u16, u64, u64)>,
-    length: u16,
-    faithful: u64,
-    slipped: u64,
-) {
-    match by_length.iter_mut().find(|(l, _, _)| *l == length) {
+pub(crate) fn add_bin(by_length: &mut Vec<LengthBin>, length: u16, faithful: u64, slipped: u64) {
+    match by_length.iter_mut().find(|bin| bin.length == length) {
         Some(bin) => {
-            bin.1 += faithful;
-            bin.2 += slipped;
+            bin.faithful += faithful;
+            bin.slipped += slipped;
         }
-        None => by_length.push((length, faithful, slipped)),
+        None => by_length.push(LengthBin {
+            length,
+            faithful,
+            slipped,
+        }),
     }
 }
 
@@ -143,8 +143,8 @@ pub(crate) fn merge_sample_stats(dst: &mut SampleStutterStats, src: &SampleStutt
     dst.base_match += src.base_match;
     dst.base_mismatch += src.base_mismatch;
     dst.read_depth += src.read_depth;
-    for &(length, faithful, slipped) in &src.by_length {
-        add_bin(&mut dst.by_length, length, faithful, slipped);
+    for bin in &src.by_length {
+        add_bin(&mut dst.by_length, bin.length, bin.faithful, bin.slipped);
     }
 }
 
@@ -166,7 +166,7 @@ pub(crate) fn accumulate_locus(
     let period = rungs.period();
     // Cohort-wide confident-allele tally for this locus (length in repeat units →
     // chromosome copies), used for the G₀ allele-spread fit below.
-    let mut locus_alleles: Vec<(u16, u64)> = Vec::new();
+    let mut locus_alleles: Vec<AlleleCopies> = Vec::new();
     for (k, evidence) in locus.samples.iter().enumerate() {
         let global = locus.present[k];
         let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
@@ -193,13 +193,12 @@ pub(crate) fn accumulate_locus(
         // Accumulate locally first (avoids holding two &mut into `stats` at once).
         let mut local = SampleStutterStats::default();
         let mut slips: Vec<(i32, u32)> = Vec::new();
+        let peak_units: Vec<u16> = peaks.iter().map(|p| p.repeat_len).collect();
         for (obs, count) in &evidence.seq_counts {
-            let read_units = (obs.len() / period) as u16;
-            let peak = peaks
-                .iter()
-                .min_by_key(|p| (p.repeat_len as i32 - read_units as i32).abs())
-                .expect("a confident genotype has ≥1 peak");
-            let delta = read_units as i32 - peak.repeat_len as i32;
+            let read_units = (obs.len() / period) as i32;
+            let (peak_idx, delta) =
+                nearest_parent(read_units, &peak_units).expect("a confident genotype has ≥1 peak");
+            let peak = &peaks[peak_idx];
             if delta == 0 {
                 let (m, mm) = compare_bases(obs, &peak.allele);
                 local.base_match += m * *count as u64;
@@ -238,20 +237,29 @@ pub(crate) fn accumulate_locus(
             .allele_spread_by_period
             .entry(period as u8)
             .or_default();
-        for &(length, copies) in &locus_alleles {
-            let distance = (length as i32 - mode as i32).unsigned_abs() as u64;
-            accum.total_copies += copies;
-            accum.distance_weighted += copies * distance;
+        for entry in &locus_alleles {
+            let distance = (entry.length as i32 - mode as i32).unsigned_abs() as u64;
+            accum.total_copies += entry.copies;
+            accum.distance_weighted += entry.copies * distance;
         }
     }
 }
 
+/// One repeat-length entry of a locus's cohort-wide confident-allele tally: how many
+/// chromosome copies carry `length` repeat units. Feeds the `G₀` allele-spread fit; a
+/// named struct over a `(u16, u64)` tuple for the same reason as [`LengthBin`] (Mi5).
+#[derive(Debug, Clone, Copy)]
+struct AlleleCopies {
+    length: u16,
+    copies: u64,
+}
+
 /// Add `copies` chromosome copies of repeat length `length` to a per-locus allele
 /// tally, creating the entry if new.
-fn add_allele_copies(tally: &mut Vec<(u16, u64)>, length: u16, copies: u64) {
-    match tally.iter_mut().find(|(l, _)| *l == length) {
-        Some(entry) => entry.1 += copies,
-        None => tally.push((length, copies)),
+fn add_allele_copies(tally: &mut Vec<AlleleCopies>, length: u16, copies: u64) {
+    match tally.iter_mut().find(|entry| entry.length == length) {
+        Some(entry) => entry.copies += copies,
+        None => tally.push(AlleleCopies { length, copies }),
     }
 }
 
@@ -297,16 +305,20 @@ pub(crate) fn fit_level(stats: &SampleStutterStats) -> StutterLevel {
     let points: Vec<(f64, f64, f64)> = stats
         .by_length
         .iter()
-        .filter(|(_, faithful, slipped)| faithful + slipped > 0)
-        .map(|(length, faithful, slipped)| {
-            let total = (faithful + slipped) as f64;
-            (*length as f64, *slipped as f64 / total, total)
+        .filter(|bin| bin.faithful + bin.slipped > 0)
+        .map(|bin| {
+            let total = (bin.faithful + bin.slipped) as f64;
+            (bin.length as f64, bin.slipped as f64 / total, total)
         })
         .collect();
 
     if points.len() < 2 {
-        let total: u64 = stats.by_length.iter().map(|(_, f, s)| f + s).sum();
-        let slipped: u64 = stats.by_length.iter().map(|(_, _, s)| *s).sum();
+        let total: u64 = stats
+            .by_length
+            .iter()
+            .map(|bin| bin.faithful + bin.slipped)
+            .sum();
+        let slipped: u64 = stats.by_length.iter().map(|bin| bin.slipped).sum();
         let baseline = if total > 0 {
             slipped as f64 / total as f64
         } else {
@@ -542,7 +554,7 @@ mod tests {
         // Every resolved het sample carries bins at lengths 6 and 10.
         assert!(!stats.per_sample.is_empty(), "hets should resolve");
         for sample in stats.per_sample.values() {
-            let mut lengths: Vec<u16> = sample.by_length.iter().map(|(l, _, _)| *l).collect();
+            let mut lengths: Vec<u16> = sample.by_length.iter().map(|bin| bin.length).collect();
             lengths.sort_unstable();
             assert_eq!(
                 lengths,

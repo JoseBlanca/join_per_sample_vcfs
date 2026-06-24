@@ -86,6 +86,29 @@ pub(crate) enum SsrMergeError {
         #[source]
         source: SsrCohortReadError,
     },
+    /// An allele sequence — the catalog reference tract or a `.ssr.psp` observed sequence —
+    /// carries a byte that is not an A/C/G/T/N nucleotide. Such a byte would be silently
+    /// rewritten to U+FFFD in the VCF REF/ALT. The merge boundary is the chokepoint for
+    /// this untrusted input, so it fails loud rather than emitting a corrupt allele
+    /// (review Mi13).
+    #[error(
+        "invalid allele byte {byte:#04x} at locus {chrom}:{start} — allele sequences must \
+         be A/C/G/T/N nucleotides"
+    )]
+    InvalidAlleleByte { chrom: String, start: u32, byte: u8 },
+}
+
+/// The first byte of `seq` that is not an A/C/G/T/N nucleotide, if any. SSR loci sit in
+/// repetitive regions that may be soft-masked (lowercase), so case is accepted; anything
+/// else (control characters, non-UTF8 bytes, IUPAC ambiguity codes) is rejected so it can
+/// never reach the VCF REF/ALT as a `from_utf8_lossy` replacement char (review Mi13).
+fn first_non_acgtn(seq: &[u8]) -> Option<u8> {
+    seq.iter().copied().find(|b| {
+        !matches!(
+            b,
+            b'A' | b'C' | b'G' | b'T' | b'N' | b'a' | b'c' | b'g' | b't' | b'n'
+        )
+    })
 }
 
 /// The cohort producer: a catalog-driven k-way merge over N per-sample cursors,
@@ -230,6 +253,17 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
             }
             self.prev_locus = Some(locus_id);
 
+            // Reject non-nucleotide allele bytes from this untrusted input before they can
+            // reach the VCF REF/ALT (review Mi13): the catalog reference tract first, then
+            // each present sample's observed sequences.
+            if let Some(byte) = first_non_acgtn(locus.ref_tract()) {
+                return Err(SsrMergeError::InvalidAlleleByte {
+                    chrom: locus.chrom().to_string(),
+                    start: locus.start(),
+                    byte,
+                });
+            }
+
             let mut cohort = CohortLocus::new(
                 locus_id,
                 locus.motif(),
@@ -246,6 +280,15 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
                             source,
                         })?;
                 if let Some(evidence) = evidence {
+                    for (seq, _count) in &evidence.seq_counts {
+                        if let Some(byte) = first_non_acgtn(seq) {
+                            return Err(SsrMergeError::InvalidAlleleByte {
+                                chrom: locus.chrom().to_string(),
+                                start: locus.start(),
+                                byte,
+                            });
+                        }
+                    }
                     cohort.push(sample_idx as u32, evidence);
                 }
             }
@@ -548,6 +591,37 @@ mod tests {
             matches!(err, SsrMergeError::UnsortedCatalog { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn first_non_acgtn_accepts_nucleotides_and_flags_others() {
+        // Upper- and lower-case A/C/G/T/N (soft-masking) are accepted.
+        assert_eq!(first_non_acgtn(b"ACGTNacgtn"), None);
+        // A tab, a control char, and an IUPAC ambiguity code are each rejected.
+        assert_eq!(first_non_acgtn(b"CA\tCA"), Some(b'\t'));
+        assert_eq!(first_non_acgtn(b"CARCA"), Some(b'R'));
+        assert_eq!(first_non_acgtn(&[b'C', 0xFF, b'A']), Some(0xFF));
+    }
+
+    #[test]
+    fn merge_rejects_a_non_nucleotide_observed_sequence() {
+        // An untrusted `.ssr.psp` observed sequence carrying a non-nucleotide byte must
+        // fail loud at the merge boundary, not reach the VCF as a U+FFFD REF/ALT (Mi13).
+        let catalog = catalog_reader(REF_MD5, &[loc("chr1", 16)]);
+        let a = reader(ssr_psp(
+            ssr_header(&["chr1"], REF_MD5),
+            &[rec(0, 16, obs(&[(b"CAXACA", 5)]))],
+        ));
+        let mut merger = CohortMerger::from_parts(catalog, vec![("A".into(), a)]).unwrap();
+        let err = merger.next().unwrap().unwrap_err();
+        match err {
+            SsrMergeError::InvalidAlleleByte { chrom, start, byte } => {
+                assert_eq!(chrom, "chr1");
+                assert_eq!(start, 16);
+                assert_eq!(byte, b'X');
+            }
+            other => panic!("expected InvalidAlleleByte, got {other:?}"),
+        }
     }
 
     // ── H2: header accessors + second-pass re-open ──

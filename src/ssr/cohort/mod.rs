@@ -9,6 +9,7 @@
 //! `doc/devel/implementation_plans/ssr_call_reading.md`.
 
 pub mod allele_freq_prior;
+pub mod attribution;
 pub mod candidate_set;
 pub mod driver;
 pub mod em;

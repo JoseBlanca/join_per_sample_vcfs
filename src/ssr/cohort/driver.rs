@@ -228,10 +228,12 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
         let est = estimate(&stats, &g0_cfg);
         let grouped = group_samples(&stats, &est, &cluster_cfg);
         let params = build_param_set(&est, &grouped, n_samples, &g0_cfg)?;
+        // `build_param_set`'s borrow of `grouped` has ended and `grouped` is unused after
+        // this call, so move its level vector in rather than clone (review Mi16).
         let calls = run_cohort_em(
             &subset,
             &params,
-            grouped.level_per_group.clone(),
+            grouped.level_per_group,
             PLOIDY,
             &em_cfg,
             &rung_cfg,

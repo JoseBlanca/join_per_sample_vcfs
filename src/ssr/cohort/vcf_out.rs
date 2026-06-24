@@ -13,6 +13,7 @@
 use std::io::{self, Write};
 
 use crate::psp::header::ParsedChromosome;
+use crate::ssr::cohort::attribution::nearest_parent;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em::{LocusCall, SampleCall};
 use crate::ssr::cohort::types::{CohortLocus, SampleEvidence};
@@ -135,11 +136,15 @@ fn allele_balance(evidence: &SampleEvidence, call: &SampleCall, period: usize) -
     if call.genotype_units.len() < 2 || call.genotype_units[0] == call.genotype_units[1] {
         return 1.0;
     }
-    let (a, b) = (call.genotype_units[0], call.genotype_units[1]);
+    let parents = [call.genotype_units[0], call.genotype_units[1]];
     let (mut sa, mut sb) = (0u64, 0u64);
     for (obs, count) in &evidence.seq_counts {
         let units = (obs.len() / period) as i32;
-        if (units - a as i32).abs() <= (units - b as i32).abs() {
+        // The shared nearest-parent rule breaks an equidistant tie toward the first allele,
+        // matching the previous `<=` (review Mi1).
+        let (parent_idx, _delta) =
+            nearest_parent(units, &parents).expect("a het has two parent alleles");
+        if parent_idx == 0 {
             sa += *count as u64;
         } else {
             sb += *count as u64;
@@ -265,10 +270,15 @@ pub(crate) fn format_vcf_record(
         }
     }
 
-    let ref_allele = String::from_utf8_lossy(&candidates.alleles[candidates.ref_idx]);
-    let alt: Vec<String> = (0..k)
+    // PANIC-FREE: allele bytes are A/C/G/T/N-validated at the merge boundary (review Mi13),
+    // so they are always valid ASCII/UTF-8 — `from_utf8` cannot error here, and a broken
+    // upstream guarantee surfaces loudly rather than as a silent U+FFFD in REF/ALT.
+    const ACGTN_GUARANTEE: &str = "alleles are A/C/G/T/N-validated at the merge boundary";
+    let ref_allele =
+        std::str::from_utf8(&candidates.alleles[candidates.ref_idx]).expect(ACGTN_GUARANTEE);
+    let alt: Vec<&str> = (0..k)
         .filter(|&idx| idx != candidates.ref_idx)
-        .map(|idx| String::from_utf8_lossy(&candidates.alleles[idx]).into_owned())
+        .map(|idx| std::str::from_utf8(&candidates.alleles[idx]).expect(ACGTN_GUARANTEE))
         .collect();
     let alt_field = if alt.is_empty() {
         ".".to_string()
@@ -306,15 +316,14 @@ pub(crate) fn format_vcf_record(
         sample_fields[locus.present[k] as usize] = format!("{gt}:{}:{repcn}", sample.gq);
     }
 
+    // Every emitted record carries a numeric QUAL — `site_qual` always returns a finite
+    // value in `[0, qual_cap]`, so a clamped-to-zero variable locus prints `0.0`, not `.`
+    // (downstream QUAL filters then read "lowest", not "missing"; review Mi14). `.` is
+    // reserved for a genuinely unscored site, which this path never produces.
     format!(
-        "{chrom}\t{pos}\t.\t{ref_allele}\t{alt_field}\t{qual_field}\t{}\tPERIOD={period}\tGT:GQ:REPCN\t{}",
+        "{chrom}\t{pos}\t.\t{ref_allele}\t{alt_field}\t{qual:.1}\t{}\tPERIOD={period}\tGT:GQ:REPCN\t{}",
         filter_text(call.admit),
         sample_fields.join("\t"),
-        qual_field = if qual > 0.0 {
-            format!("{qual:.1}")
-        } else {
-            ".".to_string()
-        },
     )
 }
 
@@ -423,7 +432,7 @@ mod tests {
         };
         let line = format_vcf_record("chr1", &locus(), &cands, &call, 0.0, 1);
         let cols: Vec<&str> = line.split('\t').collect();
-        assert_eq!(cols[5], "."); // QUAL absent
+        assert_eq!(cols[5], "0.0"); // QUAL clamped to zero is printed numerically (Mi14)
         assert_eq!(cols[4], "."); // no ALT
         assert_eq!(cols[6], "lowDepth");
         assert_eq!(cols[9], "./.:.:.");

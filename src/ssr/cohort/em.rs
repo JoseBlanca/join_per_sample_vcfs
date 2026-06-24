@@ -21,6 +21,7 @@
 //! follow-up (the genotype enumeration generalizes, the dosage priors need care).
 
 use crate::ssr::cohort::allele_freq_prior::g0_pseudocounts;
+use crate::ssr::cohort::attribution::nearest_parent;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em_init::LocusSeed;
 use crate::ssr::cohort::likelihood::{LikelihoodScratch, read_given_genotype, read_likelihood};
@@ -280,6 +281,16 @@ pub(crate) fn run_locus_em_with(
         .map(|a| (a.len() / period) as u16)
         .collect();
 
+    // The iteration-invariant locus shaping, built once and reused across the refit rounds
+    // (review Mi2).
+    let model = LocusModel {
+        locus,
+        candidates,
+        cand_units: &cand_units,
+        genotypes: &genotypes,
+        distinct,
+    };
+
     let mut scratch = LikelihoodScratch::new();
 
     // Per-locus refinement (I1 shape + I2 level): genotype under the frozen `θ_period`
@@ -291,16 +302,12 @@ pub(crate) fn run_locus_em_with(
     let mut theta = seed.theta0;
     let mut level_multiplier = 1.0;
     let mut data_ll = compute_data_ll(
-        locus,
-        candidates,
+        &model,
         params,
         level_per_group,
         &theta,
         level_multiplier,
-        &cand_units,
-        &genotypes,
         cfg.lambda,
-        distinct,
         &mut scratch,
     );
     let mut pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
@@ -319,16 +326,12 @@ pub(crate) fn run_locus_em_with(
         theta = new_theta;
         level_multiplier = new_level_multiplier;
         data_ll = compute_data_ll(
-            locus,
-            candidates,
+            &model,
             params,
             level_per_group,
             &theta,
             level_multiplier,
-            &cand_units,
-            &genotypes,
             cfg.lambda,
-            distinct,
             &mut scratch,
         );
         pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
@@ -345,26 +348,39 @@ pub(crate) fn run_locus_em_with(
     }
 }
 
+/// The iteration-invariant per-locus shaping `compute_data_ll` reads: the locus and its
+/// candidate set, the candidate lengths in repeat units, the enumerated genotypes, and the
+/// distinct-observation count. Built once in [`run_locus_em_with`] and reused across every
+/// `θ_locus` / level-multiplier refit round, so the precompute call stays a pure function
+/// of `(model, chemistry, shape, rate)` (the byte-identity contract) instead of an 11-arg
+/// positional list (review Mi2).
+struct LocusModel<'a> {
+    locus: &'a CohortLocus,
+    candidates: &'a CandidateSet,
+    cand_units: &'a [u16],
+    genotypes: &'a [Genotype],
+    distinct: usize,
+}
+
 /// Each sample's per-genotype **data** log-likelihood `data_ll[s][g]` under stutter
 /// shape `theta` and per-locus rate multiplier `level_multiplier` on the group level (both
 /// constant across the π iterations; recomputed when `θ_locus` / the multiplier change).
-// The frozen params + the iterating (theta, level_multiplier) are threaded explicitly so
-// the precompute stays a pure function of its inputs (the byte-identity contract). Arg
-// count is intentional.
-#[allow(clippy::too_many_arguments)]
 fn compute_data_ll(
-    locus: &CohortLocus,
-    candidates: &CandidateSet,
+    model: &LocusModel,
     params: &ParamSet,
     level_per_group: &[StutterLevel],
     theta: &StutterShape,
     level_multiplier: f64,
-    cand_units: &[u16],
-    genotypes: &[Genotype],
     lambda: f64,
-    distinct: usize,
     scratch: &mut LikelihoodScratch,
 ) -> Vec<Vec<f64>> {
+    let LocusModel {
+        locus,
+        candidates,
+        cand_units,
+        genotypes,
+        distinct,
+    } = *model;
     let k = candidates.alleles.len();
     let mut data_ll: Vec<Vec<f64>> = Vec::with_capacity(locus.samples.len());
     for (k_present, evidence) in locus.samples.iter().enumerate() {
@@ -537,14 +553,12 @@ fn attribute_locus(
         let (_eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
         for (obs, count) in &locus.samples[k_present].seq_counts {
             let read_units = (obs.len() / period) as i32;
-            let parent = *call
-                .genotype_units
-                .iter()
-                .min_by_key(|&&u| (u as i32 - read_units).abs())
+            let (parent_idx, delta) = nearest_parent(read_units, &call.genotype_units)
                 .expect("a non-empty call has ≥1 allele");
+            let parent = call.genotype_units[parent_idx];
             let c = *count as u64;
-            if read_units != parent as i32 {
-                fit.profile.add_slip(read_units - parent as i32, c);
+            if delta != 0 {
+                fit.profile.add_slip(delta, c);
                 fit.slipped += c;
             }
             // The group's predicted slip probability at the parent length, for the rate
