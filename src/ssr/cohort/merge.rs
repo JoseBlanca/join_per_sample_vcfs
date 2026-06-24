@@ -270,6 +270,15 @@ impl<R: Read + Seek, C: Read> CohortMerger<R, C> {
                 Box::from(locus.ref_bytes()),
                 Box::from(locus.ref_tract()),
             );
+            // The VCF left-anchor base for length-zero alleles: the reference base just
+            // before the tract. `ref_bytes` spans `[ref_bytes_start, …)`, the tract starts
+            // at genome `start`, so the tract sits at offset `start − ref_bytes_start`
+            // within the frame and the anchor is the byte before it (absent only when the
+            // tract abuts the frame start, i.e. no left flank).
+            let tract_offset = (locus.start() - locus.ref_bytes_start()) as usize;
+            cohort.left_anchor = tract_offset
+                .checked_sub(1)
+                .and_then(|i| locus.ref_bytes().get(i).copied());
             let labels = &self.labels;
             for (sample_idx, cursor) in self.cursors.iter_mut().enumerate() {
                 let evidence =

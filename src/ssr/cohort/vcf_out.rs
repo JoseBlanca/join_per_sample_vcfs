@@ -215,7 +215,10 @@ pub(crate) fn site_qual(call: &LocusCall, candidates: &CandidateSet, cfg: &FpCon
         };
         log_p_mono += p_mono_s.log10();
     }
-    (-10.0 * log_p_mono).clamp(0.0, cfg.qual_cap)
+    // `-10·log₁₀ P(mono)` is `-0.0` when `log_p_mono` is exactly 0 (a fully monomorphic
+    // or all-no-call site); the trailing `+ 0.0` normalizes that negative zero so QUAL
+    // prints `0.0`, never `-0.0` (which some VCF consumers reject).
+    (-10.0 * log_p_mono).clamp(0.0, cfg.qual_cap) + 0.0
 }
 
 /// An apparent-`F_IS` warning when the cohort mean `F` is implausibly high (almost
@@ -274,19 +277,50 @@ pub(crate) fn format_vcf_record(
     // so they are always valid ASCII/UTF-8 — `from_utf8` cannot error here, and a broken
     // upstream guarantee surfaces loudly rather than as a silent U+FFFD in REF/ALT.
     const ACGTN_GUARANTEE: &str = "alleles are A/C/G/T/N-validated at the merge boundary";
-    let ref_allele =
-        std::str::from_utf8(&candidates.alleles[candidates.ref_idx]).expect(ACGTN_GUARANTEE);
-    let alt: Vec<&str> = (0..k)
+    let ref_bytes = candidates.alleles[candidates.ref_idx].as_ref();
+    let alt_bytes: Vec<&[u8]> = (0..k)
         .filter(|&idx| idx != candidates.ref_idx)
-        .map(|idx| std::str::from_utf8(&candidates.alleles[idx]).expect(ACGTN_GUARANTEE))
+        .map(|idx| candidates.alleles[idx].as_ref())
         .collect();
+
+    // A length-zero allele (a complete tract deletion) cannot be written as an empty
+    // REF/ALT field. When one is present, anchor the whole record on the reference base
+    // just left of the tract (the VCF indel convention) so no field is ever empty; the
+    // common case (no empty allele) still prints the tract sequences directly.
+    let needs_anchor = ref_bytes.is_empty() || alt_bytes.iter().any(|a| a.is_empty());
+    let mut pos = locus.locus.start + 1; // VCF is 1-based (tract start)
+    let plain = |b: &[u8]| std::str::from_utf8(b).expect(ACGTN_GUARANTEE).to_string();
+    let (ref_allele, alt): (String, Vec<String>) = if needs_anchor {
+        // PANIC-FREE: the merger sets `left_anchor` for every real locus; it is `None`
+        // only at a flankless contig-start locus, where a length-zero spanning-read
+        // allele cannot arise. Fall back to `N` (a valid base) rather than emit an
+        // invalid empty field, and only shift POS when a real left base was consumed.
+        let anchor = locus.left_anchor.unwrap_or(b'N');
+        if locus.left_anchor.is_some() {
+            pos -= 1; // the record now starts at the anchor base
+        }
+        let anchored = |b: &[u8]| {
+            let mut s = String::with_capacity(b.len() + 1);
+            s.push(anchor as char);
+            s.push_str(std::str::from_utf8(b).expect(ACGTN_GUARANTEE));
+            s
+        };
+        (
+            anchored(ref_bytes),
+            alt_bytes.iter().map(|a| anchored(a)).collect(),
+        )
+    } else {
+        (
+            plain(ref_bytes),
+            alt_bytes.iter().map(|a| plain(a)).collect(),
+        )
+    };
     let alt_field = if alt.is_empty() {
         ".".to_string()
     } else {
         alt.join(",")
     };
 
-    let pos = locus.locus.start + 1; // VCF is 1-based
     let period = locus.motif.period();
 
     // Dense over the cohort: every absent sample stays a `./.:.:.` no-call; each present
@@ -410,6 +444,82 @@ mod tests {
         assert_eq!(cols[8], "GT:GQ:REPCN");
         assert_eq!(cols[9], "0/0:40:8,8");
         assert_eq!(cols[10], "1/2:30:6,10");
+    }
+
+    #[test]
+    fn zero_unit_allele_is_anchored_so_no_field_is_empty() {
+        // A complete tract deletion (a 0-unit allele) would otherwise emit an empty ALT —
+        // an invalid VCF line. With the merger's left-anchor base set, the record anchors
+        // on the reference base just left of the tract: REF and ALT both carry it and POS
+        // shifts left by one. (Real-data regression: SL4.0ch01:32961838.)
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 40,
+                end: 56,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGGGG".as_slice()),
+            ca_seq(8),
+        );
+        locus.left_anchor = Some(b'G'); // the merger sets this from the catalog frame
+        locus.push(
+            0,
+            SampleEvidence {
+                seq_counts: vec![(ca_seq(8), 50), (Box::from(&b""[..]), 50)],
+                qc: SsrQc::default(),
+            },
+        );
+        let candidates = CandidateSet {
+            alleles: vec![ca_seq(8), Box::from(&b""[..])], // ref (8 units) + a 0-unit deletion
+            ref_idx: 0,
+            admit: Admission::Pass,
+        };
+        let call = LocusCall {
+            calls: vec![SampleCall {
+                allele_indices: vec![0, 1], // het: reference vs full deletion
+                genotype_units: vec![8, 0],
+                posterior: 0.9,
+                gq: 30,
+            }],
+            pi: vec![0.5, 0.5],
+            posterior_hom: vec![0.1],
+            admit: Admission::Pass,
+        };
+        let line = format_vcf_record("chr1", &locus, &candidates, &call, 42.0, 1);
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols[1], "40"); // POS shifted left to the anchor (41 - 1)
+        assert_eq!(cols[3], "GCACACACACACACACA"); // REF = anchor + (CA)x8
+        assert_eq!(cols[4], "G"); // ALT = anchor only (the deletion) — NOT empty
+        assert!(!cols[4].is_empty(), "ALT must never be an empty field");
+        assert_eq!(cols[9], "0/1:30:8,0");
+    }
+
+    #[test]
+    fn site_qual_normalizes_negative_zero() {
+        // An all-no-call (or fully monomorphic) site gives log_p_mono == 0, so
+        // -10*log_p_mono is -0.0; QUAL must print 0.0, never -0.0 (real-data regression:
+        // every lowDepth filtered locus hit this).
+        let cands = CandidateSet {
+            alleles: vec![ca_seq(8)],
+            ref_idx: 0,
+            admit: Admission::LowDepth,
+        };
+        let call = LocusCall {
+            calls: vec![SampleCall {
+                allele_indices: vec![],
+                genotype_units: vec![],
+                posterior: 0.0,
+                gq: 0,
+            }],
+            pi: vec![1.0],
+            posterior_hom: vec![0.0],
+            admit: Admission::LowDepth,
+        };
+        let q = site_qual(&call, &cands, &FpControlCfg::dev_default());
+        assert_eq!(q, 0.0);
+        assert!(q.is_sign_positive(), "QUAL must be +0.0, not -0.0");
+        assert_eq!(format!("{q:.1}"), "0.0");
     }
 
     #[test]

@@ -94,6 +94,13 @@ pub(crate) struct CohortLocus {
     pub(crate) present: Vec<u32>,
     /// Evidence for each present sample; `samples[k]` belongs to sample `present[k]`.
     pub(crate) samples: Vec<SampleEvidence>,
+    /// The reference base immediately to the **left** of the tract (the last left-flank
+    /// base), if one exists — the VCF left-anchor for length-zero alleles (a complete
+    /// tract deletion would otherwise emit an empty REF/ALT field). `None` only at a
+    /// contig-start locus with no left flank, or in unit tests that bypass the merger.
+    /// Set by [`CohortMerger`](super::merge::CohortMerger) from the catalog frame; the
+    /// genotyper does not read it.
+    pub(crate) left_anchor: Option<u8>,
 }
 
 impl CohortLocus {
@@ -113,6 +120,7 @@ impl CohortLocus {
             ref_tract,
             present: Vec::new(),
             samples: Vec::new(),
+            left_anchor: None,
         }
     }
 
