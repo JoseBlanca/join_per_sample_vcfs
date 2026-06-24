@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
+use crate::psp::header::ParsedChromosome;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateCfg, assemble_candidates};
 use crate::ssr::cohort::em::{EmCfg, run_locus_em_with};
 use crate::ssr::cohort::em_init::seed_locus;
@@ -80,6 +81,17 @@ pub(crate) enum SsrCallError {
     /// (decision C-1), so two inputs with the same file name collide (H2 review Mi1).
     #[error("duplicate sample name {name:?} — cohort inputs must have distinct file names")]
     DuplicateSampleName { name: String },
+    /// A contig or sample name carries a character that would corrupt the VCF — a tab
+    /// shifts every later column, a newline splits the line, and `,`/`<`/`>` break the
+    /// structured `##contig` field. Contig names come from the (untrusted) `.ssr.psp`
+    /// headers and sample names from input path basenames, so they are validated before
+    /// any output is written (review M5).
+    #[error("invalid {kind} name {name:?} for VCF output: contains {reason}")]
+    InvalidVcfName {
+        kind: &'static str,
+        name: String,
+        reason: &'static str,
+    },
     /// Building the burn-in thread pool failed.
     #[error("building the ssr-call thread pool")]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
@@ -198,6 +210,7 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     let sample_names = merger.sample_names();
     let n_samples = sample_names.len();
     check_unique_sample_names(&sample_names)?;
+    check_vcf_safe_names(&chromosomes, &sample_names)?;
     let subset = collect_burn_in_subset(merger)?;
 
     // Estimate chemistry and freeze `F` + the per-group level on the requested thread
@@ -296,6 +309,54 @@ fn check_unique_sample_names(names: &[String]) -> Result<(), SsrCallError> {
         }
     }
     Ok(())
+}
+
+/// Reject contig/sample names that would corrupt the VCF *before* any output is written
+/// (review M5). Names are untrusted — contig names come from the `.ssr.psp` headers and
+/// sample names from input path basenames — so a tab (column shift), newline (line split),
+/// or, for a contig, a `,`/`<`/`>` (structured-`##contig`-field breaker) must fail loud
+/// rather than silently emit a malformed VCF. `write_vcf_header`'s input contract states
+/// the caller validates this; this is that validation.
+fn check_vcf_safe_names(
+    chromosomes: &[ParsedChromosome],
+    sample_names: &[String],
+) -> Result<(), SsrCallError> {
+    for chrom in chromosomes {
+        if let Some(reason) = vcf_name_violation(&chrom.name, true) {
+            return Err(SsrCallError::InvalidVcfName {
+                kind: "contig",
+                name: chrom.name.clone(),
+                reason,
+            });
+        }
+    }
+    for name in sample_names {
+        if let Some(reason) = vcf_name_violation(name, false) {
+            return Err(SsrCallError::InvalidVcfName {
+                kind: "sample",
+                name: name.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The first VCF-corrupting character class in `name`, if any. Tabs/newlines/carriage
+/// returns are rejected for every name (they break the tab-separated columns / line
+/// structure); `,`/`<`/`>` are additionally rejected for a contig (they break the
+/// structured `##contig=<ID=…>` field).
+fn vcf_name_violation(name: &str, is_contig: bool) -> Option<&'static str> {
+    if name.contains('\t') {
+        return Some("a tab");
+    }
+    if name.contains('\n') || name.contains('\r') {
+        return Some("a newline");
+    }
+    if is_contig && name.contains([',', '<', '>']) {
+        return Some("a ',', '<', or '>' structured-field character");
+    }
+    None
 }
 
 /// Stream the merger and collect up to [`BURN_IN_MAX_LOCI`] loci for the burn-in
@@ -740,6 +801,51 @@ mod tests {
             other => panic!("expected DuplicateSampleName, got {other:?}"),
         }
         assert!(check_unique_sample_names(&["a".to_string(), "b".to_string()]).is_ok());
+    }
+
+    fn parsed_chrom(name: &str) -> ParsedChromosome {
+        ParsedChromosome {
+            name: name.to_string(),
+            length: 1000,
+            md5: "0".repeat(32),
+        }
+    }
+
+    #[test]
+    fn check_vcf_safe_names_rejects_a_tab_in_a_sample_name() {
+        // A tab in a sample column would shift every later column (review M5).
+        let chroms = [parsed_chrom("chr1")];
+        let samples = vec!["good".to_string(), "ba\td".to_string()];
+        match check_vcf_safe_names(&chroms, &samples) {
+            Err(SsrCallError::InvalidVcfName { kind, name, .. }) => {
+                assert_eq!(kind, "sample");
+                assert_eq!(name, "ba\td");
+            }
+            other => panic!("expected InvalidVcfName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_vcf_safe_names_rejects_structured_chars_and_newlines_in_a_contig() {
+        // A newline splits the meta line; a ',' / '<' / '>' breaks the ##contig field.
+        let samples = ["s".to_string()];
+        for bad in ["chr\n1", "chr,1", "ch<r>1"] {
+            let chroms = [parsed_chrom(bad)];
+            match check_vcf_safe_names(&chroms, &samples) {
+                Err(SsrCallError::InvalidVcfName { kind, name, .. }) => {
+                    assert_eq!(kind, "contig");
+                    assert_eq!(name, bad);
+                }
+                other => panic!("expected InvalidVcfName for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn check_vcf_safe_names_accepts_clean_names() {
+        let chroms = [parsed_chrom("chr1"), parsed_chrom("scaffold_12.1")];
+        let samples = ["sampleA".to_string(), "sample-B_2".to_string()];
+        assert!(check_vcf_safe_names(&chroms, &samples).is_ok());
     }
 
     #[test]

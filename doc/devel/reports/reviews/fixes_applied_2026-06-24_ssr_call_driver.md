@@ -38,7 +38,7 @@
 | M2 | Major | `sample_chemistry` silent defaults | Apply | Applied | em.rs | Pass |
 | M3 | Major | duplicate `G₀` fallback const | Apply | Applied | param_estimation.rs, em.rs | Pass |
 | M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | Applied | em.rs, vcf_out.rs | Pass |
-| M5 | Major | unguarded contig/sample names | Apply (test-first) | — | — | — |
+| M5 | Major | unguarded contig/sample names | Apply (test-first) | Applied | driver.rs | Pass |
 | M6 | Major | untested filtered-locus emit | Apply (test-only) | — | — | — |
 | Mi1 | Minor | duplicated attribution helper | Defer | — | — | — |
 | Mi2 | Minor | `LocusModel` bundle (11-arg) | Defer | — | — | — |
@@ -148,6 +148,24 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** None.
 - **Residual risk:** None — `total_cmp`/`partial_cmp` agree for finite/−∞ inputs; ties keep the first element under `max_by` in both.
+
+### M5 — unguarded contig/sample names
+- **Severity:** Major
+- **Initial decision:** Apply (test-first)
+- **Final status:** Applied
+- **Reasoning:** Contig names (untrusted `.ssr.psp` headers) and sample names (input basenames) were written verbatim into the header; the writer doc claims the caller validates VCF-cleanliness but only uniqueness was checked. A tab/newline/structured char would silently corrupt the VCF. Added a typed-error validation pass before the burn-in (fails fast, before any output).
+- **Implementation summary:** new `SsrCallError::InvalidVcfName { kind, name, reason }`; `check_vcf_safe_names` (called in `run` right after `check_unique_sample_names`) + `vcf_name_violation` helper rejecting `\t`/`\n`/`\r` in any name and `,`/`<`/`>` additionally in contig names; added the `ParsedChromosome` import.
+- **Review suggestion used verbatim?:** No (review suggested validate-or-escape; implemented reject-with-typed-error, the loud-failure style the crate prefers).
+- **Adaptation:** typed error rather than escaping; validation lives in `run` (the writer doc already delegates this to the caller).
+- **Verification performed:** test-first via direct unit tests on `check_vcf_safe_names` (a run()-level test is entangled with catalog/contig-name reconciliation, so the function is tested directly per the review's "assert the specific error variant").
+- **Files changed:** `src/ssr/cohort/driver.rs`
+- **Tests added or modified:** `check_vcf_safe_names_rejects_a_tab_in_a_sample_name`, `check_vcf_safe_names_rejects_structured_chars_and_newlines_in_a_contig`, `check_vcf_safe_names_accepts_clean_names` (all new).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `147 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** Mi13 (allele-byte UTF-8 validation) is the remaining untrusted-output gap, deferred.
+- **Residual risk:** Low — the char set rejected is the VCF-structural minimum; a stricter VCF 4.4 contig-ID grammar could be layered later if needed.
 
 ## 12. Notes
 
