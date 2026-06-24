@@ -150,6 +150,13 @@ fn period_decay(params: &ParamSet, period: usize) -> G0PseudocountDecay {
 /// `ε` and the per-length stutter level for a present sample (by its sample group).
 /// `level_per_group` is supplied separately so the E1 outer loop can refit it without
 /// rebuilding the params.
+///
+/// PANIC-FREE: decision E guarantees every present sample resolves to a frozen sample
+/// group (`build_param_set` hard-errors `UnresolvedSamples` otherwise), and the per-group
+/// vectors are sized per group — so all three lookups are in range. We index loudly rather
+/// than fabricate group-0 / default-ε / default-level chemistry, which would silently
+/// genotype a sample on wrong parameters under a broken invariant — exactly the
+/// no-silent-default failure `UnresolvedSamples` exists to prevent (review M2).
 fn sample_chemistry(
     locus: &CohortLocus,
     present_k: usize,
@@ -157,23 +164,18 @@ fn sample_chemistry(
     level_per_group: &[StutterLevel],
 ) -> (f64, StutterLevel) {
     let global = locus.present[present_k] as usize;
-    let group = params
+    let group = *params
         .group_of_sample
         .get(global)
-        .copied()
-        .unwrap_or(crate::ssr::cohort::param_estimation::SampleGroupId(0));
+        .expect("decision E: every present sample has a frozen sample group");
     let eps = params
         .error_per_sample_group
         .get(group.0 as usize)
-        .map(|e| e.0)
-        .unwrap_or(0.01);
-    let level = level_per_group
+        .expect("every sample group has a frozen ε")
+        .0;
+    let level = *level_per_group
         .get(group.0 as usize)
-        .copied()
-        .unwrap_or(StutterLevel {
-            baseline: 0.05,
-            slope: 0.0,
-        });
+        .expect("every sample group has a frozen stutter level");
     (eps, level)
 }
 
@@ -856,6 +858,34 @@ mod tests {
         assert_eq!(fit.profile.up.iter().sum::<u64>(), 0);
         assert_eq!(fit.slipped, 0);
         assert_eq!(fit.expected_slipped, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "frozen sample group")]
+    fn sample_chemistry_panics_on_a_sample_missing_its_group() {
+        // A ParamSet whose group_of_sample is shorter than the present samples violates
+        // decision E; sample_chemistry must fail loud, not fabricate group-0 chemistry (M2).
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 0,
+                end: 16,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGG".as_slice()),
+            ca(8),
+        );
+        locus.push(
+            0,
+            SampleEvidence {
+                seq_counts: vec![(ca(8), 10)],
+                qc: SsrQc::default(),
+            },
+        );
+        let mut params = clean_params(1);
+        params.group_of_sample.clear(); // break the decision-E density invariant
+        let _ = sample_chemistry(&locus, 0, &params, &params.level_seed);
     }
 
     #[test]

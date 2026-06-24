@@ -35,7 +35,7 @@
 |---|---|---|---|---|---|---|
 | B1 | Blocker | present-order VCF columns | Apply (test-first) | Applied | driver.rs, vcf_out.rs, inbreeding.rs | Pass |
 | M1 | Major | `"?"` contig fallback | Apply | Applied | driver.rs | Pass |
-| M2 | Major | `sample_chemistry` silent defaults | Apply | — | — | — |
+| M2 | Major | `sample_chemistry` silent defaults | Apply | Applied | em.rs | Pass |
 | M3 | Major | duplicate `G₀` fallback const | Apply | — | — | — |
 | M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | — | — | — |
 | M5 | Major | unguarded contig/sample names | Apply (test-first) | — | — | — |
@@ -94,6 +94,24 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** None.
 - **Residual risk:** None.
+
+### M2 — `sample_chemistry` silent defaults
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The three `unwrap_or` fallbacks (group-0 / ε=0.01 / level baseline 0.05) silently genotype a sample on fabricated chemistry if the frozen-`ParamSet` density invariant breaks — the exact silent-cohort-default that decision E + `UnresolvedSamples` exist to prevent. Made the lookups total so a broken invariant fails loud, matching the crate's no-silent-default style. Verified all current callers pass dense vectors (`clean_params`/`build_param_set`), so the change is behaviour-preserving on the supported path.
+- **Implementation summary:** replaced the three `.get(...).unwrap_or(...)` with `.get(...).expect(...)` carrying decision-E messages; added a `// PANIC-FREE:` doc paragraph. Removed the now-unused inline `SampleGroupId(0)` fallback path.
+- **Review suggestion used verbatim?:** No (review offered direct `[]` indexing or `.expect`; chose `.expect` for clearer diagnostics).
+- **Adaptation:** `.expect` with domain messages rather than bare `[]` index.
+- **Verification performed:** added `should_panic` test pinning the loud-failure; full `ssr::cohort` suite green.
+- **Files changed:** `src/ssr/cohort/em.rs`
+- **Tests added or modified:** `sample_chemistry_panics_on_a_sample_missing_its_group` (new, `#[should_panic(expected = "frozen sample group")]`).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort::em` → 0, `17 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None — the panic fires only on a broken decision-E invariant, which `build_param_set` rejects upstream.
 
 ## 12. Notes
 
