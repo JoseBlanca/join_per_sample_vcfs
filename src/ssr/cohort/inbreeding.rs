@@ -520,7 +520,7 @@ mod tests {
 
         assert!(is_variable(&call, &cands), "the site is polymorphic");
         let qual = site_qual(&call, &cands, &fp);
-        let line = format_vcf_record("chr1", locus, &cands, &call, qual);
+        let line = format_vcf_record("chr1", locus, &cands, &call, qual, locus.present.len());
         let cols: Vec<&str> = line.split('\t').collect();
         assert_eq!(cols[6], "PASS", "line: {line}");
         assert_ne!(cols[4], ".", "should carry an ALT allele");

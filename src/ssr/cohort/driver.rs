@@ -262,6 +262,7 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
                     &cand_cfg,
                     &em_cfg,
                     &fp_cfg,
+                    n_samples,
                     &mut out,
                 )?;
                 chunk.clear();
@@ -276,6 +277,7 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
                 &cand_cfg,
                 &em_cfg,
                 &fp_cfg,
+                n_samples,
                 &mut out,
             )?;
         }
@@ -315,6 +317,10 @@ fn collect_burn_in_subset<R: Read + Seek, C: Read>(
 /// Genotype one streamed locus on the frozen parameters and format its VCF line, applying
 /// the emit policy (arch §6): a filtered locus is emitted with its reason; a PASS locus is
 /// emitted iff it is variable; a monomorphic PASS locus is dropped (`None`).
+// The frozen params + the four dev-config structs are threaded explicitly (not bundled) so
+// the per-locus call stays a pure function of its inputs — the byte-identity contract. Arg
+// count is intentional.
+#[allow(clippy::too_many_arguments)]
 fn genotype_locus(
     locus: &CohortLocus,
     chrom_names: &[String],
@@ -323,6 +329,7 @@ fn genotype_locus(
     cand_cfg: &CandidateCfg,
     em_cfg: &EmCfg,
     fp_cfg: &FpControlCfg,
+    n_samples: usize,
 ) -> Option<String> {
     let rungs = build_rungs(locus, rung_cfg);
     let candidates = assemble_candidates(locus, &rungs, PLOIDY, cand_cfg);
@@ -361,7 +368,14 @@ fn genotype_locus(
         .get(locus.locus.chrom_id as usize)
         .map(String::as_str)
         .unwrap_or("?");
-    Some(format_vcf_record(chrom, locus, &candidates, &call, qual))
+    Some(format_vcf_record(
+        chrom,
+        locus,
+        &candidates,
+        &call,
+        qual,
+        n_samples,
+    ))
 }
 
 /// Genotype a chunk of loci in parallel, then write the emitted records in catalog order
@@ -378,6 +392,7 @@ fn write_genotyped_chunk<W: Write>(
     cand_cfg: &CandidateCfg,
     em_cfg: &EmCfg,
     fp_cfg: &FpControlCfg,
+    n_samples: usize,
     out: &mut W,
 ) -> Result<(), SsrCallError> {
     let lines: Vec<Option<String>> = chunk
@@ -391,6 +406,7 @@ fn write_genotyped_chunk<W: Write>(
                 cand_cfg,
                 em_cfg,
                 fp_cfg,
+                n_samples,
             )
         })
         .collect();
@@ -537,6 +553,69 @@ mod tests {
             let mut units: Vec<u16> = repcn.split(',').map(|s| s.parse().unwrap()).collect();
             units.sort_unstable();
             assert_eq!(units, vec![6, 10], "het miscalled: {col}");
+        }
+    }
+
+    #[test]
+    fn run_emits_dense_sample_columns_for_a_partial_coverage_locus() {
+        // Locus A (start 40) is covered only by samples 0..6 (separated 6/10 hets →
+        // variable); samples 6..12 have NO record there (the cursor reports them Absent).
+        // Locus B (start 100) is covered by all 12 (hom-ref → resolves them for decision-E,
+        // and is monomorphic → dropped). The emitted locus-A row must be DENSE over the
+        // whole cohort: 12 sample columns, with the absent samples 6..12 as `./.:.:.` in
+        // their own positions (regression test for B1 — present-order columns).
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_loci = vec![loc_units("chr1", 40, 8), loc_units("chr1", 100, 8)];
+        let catalog = dir.path().join("c.ssr.catalog");
+        std::fs::write(&catalog, catalog_bytes(REF_MD5, &catalog_loci)).unwrap();
+
+        let mut psp_files = Vec::new();
+        for i in 0..12 {
+            let mut records = Vec::new();
+            if i < 6 {
+                records.push(ssr_record(40, 8, reads_for(&[6, 10]))); // het at A
+            }
+            records.push(ssr_record(100, 8, reads_for(&[8]))); // hom-ref at B (every sample)
+            let path = dir.path().join(format!("s{i}.ssr.psp"));
+            std::fs::write(&path, ssr_psp(ssr_header(&["chr1"], REF_MD5), &records)).unwrap();
+            psp_files.push(path);
+        }
+        let config = SsrCallConfig {
+            catalog,
+            psp_files,
+            output: dir.path().join("out.vcf"),
+            threads: 2,
+            queue_depth: 4,
+        };
+
+        run(&config).unwrap();
+        let vcf = std::fs::read_to_string(&config.output).unwrap();
+        let records: Vec<&str> = vcf.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "only locus A emits (B is monomorphic)\n{vcf}"
+        );
+        let cols: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!(
+            cols.len(),
+            9 + 12,
+            "data row must be dense over the cohort\n{}",
+            records[0]
+        );
+        // Samples 0..6 (cols 9..15) carry the het; absent samples 6..12 (cols 15..21)
+        // are `./.:.:.` placeholders in their own cohort positions.
+        for col in &cols[9..15] {
+            assert_ne!(
+                *col, "./.:.:.",
+                "present het sample should carry a call: {col}"
+            );
+        }
+        for col in &cols[15..21] {
+            assert_eq!(
+                *col, "./.:.:.",
+                "absent sample must be a no-call placeholder"
+            );
         }
     }
 

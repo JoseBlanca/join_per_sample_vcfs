@@ -233,12 +233,20 @@ pub(crate) fn f_is_warning(f_per_sample: &[f64], cfg: &FpControlCfg) -> Option<S
 /// caller supplies the name). Allele numbering is VCF-standard: the reference
 /// candidate is `0`, the remaining candidates become `ALT` alleles `1..` in
 /// candidate order.
+///
+/// **Dense over the cohort (B1):** `call.calls` covers only the *present* samples
+/// (`call.calls[k]` belongs to cohort sample `locus.present[k]`), but a VCF data line
+/// must carry one column per cohort sample in cohort order. The row is built at width
+/// `n_samples` (= the `#CHROM` column count), each present call placed at its
+/// `locus.present[k]` position and every absent sample left as the `./.:.:.` no-call
+/// placeholder.
 pub(crate) fn format_vcf_record(
     chrom: &str,
     locus: &CohortLocus,
     candidates: &CandidateSet,
     call: &LocusCall,
     qual: f64,
+    n_samples: usize,
 ) -> String {
     let k = candidates.alleles.len();
 
@@ -268,11 +276,12 @@ pub(crate) fn format_vcf_record(
     let pos = locus.locus.start + 1; // VCF is 1-based
     let period = locus.motif.period();
 
-    let mut sample_fields = Vec::with_capacity(call.calls.len());
-    for sample in &call.calls {
+    // Dense over the cohort: every absent sample stays a `./.:.:.` no-call; each present
+    // call lands in its own cohort column via `locus.present` (B1).
+    let mut sample_fields = vec!["./.:.:.".to_string(); n_samples];
+    for (k, sample) in call.calls.iter().enumerate() {
         if sample.allele_indices.is_empty() {
-            sample_fields.push("./.:.:.".to_string());
-            continue;
+            continue; // a present-but-no-call sample keeps the placeholder
         }
         let mut numbers: Vec<usize> = sample
             .allele_indices
@@ -291,7 +300,7 @@ pub(crate) fn format_vcf_record(
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        sample_fields.push(format!("{gt}:{}:{repcn}", sample.gq));
+        sample_fields[locus.present[k] as usize] = format!("{gt}:{}:{repcn}", sample.gq);
     }
 
     format!(
@@ -377,7 +386,7 @@ mod tests {
             posterior_hom: vec![0.99, 0.05],
             admit: Admission::Pass,
         };
-        let line = format_vcf_record("chr1", &locus(), &candidates(), &call, 50.0);
+        let line = format_vcf_record("chr1", &locus(), &candidates(), &call, 50.0, 2);
         let cols: Vec<&str> = line.split('\t').collect();
         assert_eq!(cols[0], "chr1");
         assert_eq!(cols[5], "50.0"); // QUAL
@@ -409,7 +418,7 @@ mod tests {
             ref_idx: 0,
             admit: Admission::LowDepth,
         };
-        let line = format_vcf_record("chr1", &locus(), &cands, &call, 0.0);
+        let line = format_vcf_record("chr1", &locus(), &cands, &call, 0.0, 1);
         let cols: Vec<&str> = line.split('\t').collect();
         assert_eq!(cols[5], "."); // QUAL absent
         assert_eq!(cols[4], "."); // no ALT
