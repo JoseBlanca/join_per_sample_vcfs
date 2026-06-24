@@ -19,6 +19,25 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — stutter / read-likelihood model bake-off → productionized Model A (HipSTR)**
+>   (branch `ssr-cohort`, [ssr_stutter_scoring_model_bakeoff_2026-06-24.md](doc/devel/reports/implementations/ssr_stutter_scoring_model_bakeoff_2026-06-24.md)).
+>   Implemented all three `Qᵣ(obs|cand)` models behind one swappable `ReadLikelihoodModel`
+>   trait (new `src/ssr/cohort/read_model/`) and **baked them off on synthetic data with
+>   known truth** across a 3×3 scoring×generative matrix (G1 clean / G2 out-of-frame / G3
+>   messy) on concordance + allele-error + **calibration (ECE)** + runtime, via a committed
+>   `#[cfg(test)]` harness (`bakeoff.rs`) + the generative axis in `sim.rs` (`GenerativeNoise`).
+>   **Result:** **C (the user's two-penalty pair-HMM) eliminated** — even self-affinity-
+>   normalized it collapsed on out-of-frame reads (G3 concordance 0.04). **A (HipSTR) and B
+>   (fix-current) tied at perfect concordance** across G1/G2/G3, but A is far better
+>   calibrated (G3 ECE 0.0001 vs 0.017) and **~100× cheaper per `Qᵣ`** (one `bp_diff` term +
+>   closed-form substitution vs B's 21-way Δ-sum-with-DP). **Productionized A** (driver /
+>   inbreeding / EM wrapper now use `HipstrModel`), **removed C**, **kept B** test-only as the
+>   bake-off reference — the swap needed **zero test re-baselining** (A and B agree on every
+>   existing cohort/VCF test). fmt/clippy `-D warnings` clean; **1325 lib tests**. **Open
+>   follow-ups:** replace A's fixed `OUT_FRAME_REL` with a real per-period out-of-frame
+>   estimator from the pre-pass; fix the presence-based locus-admission periodicity gate
+>   (`is_periodic` trips `NotPeriodic` on a few out-of-frame reads — separate Stage-1.5
+>   finding); a release-build SSR `Qᵣ` bench; real-data calibration.
 > - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) driver wiring — Step H4 (streaming driver → VCF) — the task's definition of done**
 >   (branch `ssr-cohort`, impl `d17f524`). `ssr-call` now produces a real **VCF**: the
 >   driver is the two-pass streaming pipeline (settled arch
@@ -58,7 +77,12 @@ Skills and agents are instructed to leave it untouched.
 >   (branch `ssr-cohort`, [fixes_applied_2026-06-24_ssr_call_driver_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-24_ssr_call_driver_v2.md)). Picked up the 8 Minors the v1 run deferred. **6 Applied:** **Mi1** new `attribution::nearest_parent` primitive shared by `attribute_locus`/`accumulate_locus`/`allele_balance` (one tie-break; byte-identity preserved); **Mi2** `LocusModel` bundle drops `compute_data_ll` to 7 args (its `#[allow]` removed); **Mi5** `LengthBin`/`AlleleCopies` structs replace the tuple bins; **Mi13** new `SsrMergeError::InvalidAlleleByte` rejects non-ACGTN allele bytes at the merge boundary (+ loud `from_utf8().expect()` in `format_vcf_record`); **Mi14** emitted records always print numeric QUAL (`0.0`, not `.`); **Mi16** move-not-clone `level_per_group`. **2 Deferred:** Mi3/Mi4 (per-round/per-locus allocation levers — bench-gated, no SSR bench exists yet; user decision). The three user decisions (Mi14 numeric, Mi13 reject, Mi3/Mi4 defer) were settled before editing. Gates green: fmt/clippy `-D warnings`/doc clean, **1292 lib tests** (+5; only `--all-targets` failure is the pre-existing `psp_writer_perf` bench panic). See the **Driver wiring** block.
 > - **Last completed task (2026-06-24):** **SSR Stage 1 (`ssr-pileup`) — long-allele delimitation fix (tract-aware gap) + the first end-to-end BAM→VCF test**
 >   (branch `ssr-cohort`). Building the committed end-to-end test ([src/ssr/end_to_end_tests.rs](src/ssr/end_to_end_tests.rs), `107be5f`) surfaced that the delimiter collapsed any allele ≥ ref+2 units to the reference. Investigation ([ssr_delimiter_gap_penalty_2026-06-24.md](doc/devel/reports/research/ssr_delimiter_gap_penalty_2026-06-24.md)) traced it to a **uniform affine gap** (`GAP_OPEN_PROB = 2.9e-5`, HipSTR's *flank* value) applied across the whole alignment. Fix ([ssr_delimiter_tract_aware_gap_2026-06-24.md](doc/devel/reports/implementations/ssr_delimiter_tract_aware_gap_2026-06-24.md)): a **tract-aware gap** (cheap `GAP_OPEN_PROB_TRACT = 1e-2` in repeat-tract columns, stiff Dindel in flanks), matching HipSTR's flank/tract split. Long alleles now extract verbatim and recover end-to-end (`CA×10` BAM→VCF). Companion **long-allele window-recovery infra** (`feaa9ef`: `flank_truncated`/`widen_region`, `WidenedSequence`/`WindowTruncated`, `.ssr.psp` `n-widened`/`n-window-truncated` columns). Determinism preserved; fmt/clippy `-D warnings` clean; **1305 lib tests**. See the **`ssr-pileup` stage** block.
->   **Next (planned — fresh conversation):** **Stage-2 stutter / read-likelihood model bake-off** — plan written [ssr_stutter_scoring_model_bakeoff.md](doc/devel/implementation_plans/ssr_stutter_scoring_model_bakeoff.md). Investigation found Stage-2 already distinguishes in-frame (unit) stutter (`s_theta`) from out-of-frame (handled approximately via `align_subst` flank-slop); rather than pick blind, implement **three candidate `Qᵣ` models behind one trait** — (A) HipSTR explicit in-frame+out-of-frame geometric, (B) fix-our-current-code (pre-pass out-of-frame estimation leak), (C) the user's **two-penalty unified pair-HMM** (whole-unit gap vs single-base gap, applied uniformly) — and **bake them off on synthetic data with known truth** (cross-generative G1/G2/G3 fairness matrix; concordance / allele-error / calibration / robustness / runtime), then productionize the winner. Then: answer review Q1 (is Stage-1 `.ssr.psp` output sparse?); real-data calibration; first real cohort SSR call.
+>   **Next (planned):** the bake-off **is done** (Model A productionized — see the top bullet).
+>   Remaining Stage-2 follow-ups: (1) replace A's fixed `OUT_FRAME_REL` with a real
+>   per-period out-of-frame estimator from the pre-pass; (2) fix the presence-based
+>   locus-admission periodicity gate (`is_periodic` over-filters on a few out-of-frame
+>   reads); (3) answer review Q1 (is Stage-1 `.ssr.psp` output sparse?); (4) real-data
+>   calibration; first real cohort SSR call.
 > - **Prior task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step I1 (per-locus `θ_locus` shape refit)**
 >   (branch `ssr-cohort`, impl `46df902`). The genotype EM adapts the stutter **shape** per
 >   locus: genotype under the frozen `θ_period` seed → attribute reads → `refine_theta_locus`
