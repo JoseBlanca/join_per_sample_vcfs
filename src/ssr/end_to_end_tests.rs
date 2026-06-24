@@ -299,3 +299,68 @@ fn bam_to_vcf_emits_a_pass_variant_and_drops_a_monomorphic_locus() {
         "expected two each of hom-alt (6,6), het (6,8), hom-ref (8,8)\n{vcf}"
     );
 }
+
+/// The original collapse symptom, end to end: a **longer-than-reference** allele (`CA×10`
+/// vs a `CA×8` reference) whose reads are all-Match. Before the tract-aware delimiter gap,
+/// Stage 1 collapsed `CA×10 → CA×8` and the variant vanished; now the long allele survives
+/// extraction and reaches the VCF. Guards the gap-penalty fix through the whole chain.
+#[test]
+fn bam_to_vcf_recovers_a_long_allele_the_uniform_gap_collapsed() {
+    let (_fa_dir, fasta) = build_fasta(&[ContigSpec {
+        name: CONTIG.into(),
+        length: CONTIG_LEN as u64,
+    }])
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let catalog = dir.path().join("cohort.ssr.catalog");
+    let locus = 40u32;
+    write_catalog(&catalog, &[locus]);
+
+    // 3 homozygous-reference (CA×8) + 3 homozygous-long (CA×10) samples.
+    let groups: [(&str, &[u32]); 2] = [("ref", &[8]), ("long", &[10])];
+    let mut psp_files = Vec::new();
+    for (label, alleles) in groups {
+        for i in 0..3 {
+            let mut reads = Vec::new();
+            genotype_reads(locus, alleles, &format!("{label}{i}"), &mut reads);
+            psp_files.push(pileup_sample(
+                dir.path(),
+                &fasta,
+                &catalog,
+                &format!("{label}{i}"),
+                &reads,
+            ));
+        }
+    }
+
+    let output = dir.path().join("cohort.vcf");
+    call_driver::run(&SsrCallConfig {
+        catalog: catalog.clone(),
+        psp_files,
+        output: output.clone(),
+        threads: 2,
+        queue_depth: 0,
+    })
+    .expect("ssr-call run");
+
+    let vcf = std::fs::read_to_string(&output).unwrap();
+    let record = vcf
+        .lines()
+        .find(|l| !l.starts_with('#'))
+        .unwrap_or_else(|| panic!("expected a variant record (the CA×10 allele)\n{vcf}"));
+    let cols: Vec<&str> = record.split('\t').collect();
+    assert_eq!(
+        cols[6], "PASS",
+        "the long-allele locus should PASS: {record}"
+    );
+    assert!(
+        cols[4].split(',').any(|alt| alt == "CACACACACACACACACACA"),
+        "ALT should carry the recovered CA×10 allele: {record}"
+    );
+    // The three long samples call REPCN 10/10 — the allele the old gap collapsed to 8.
+    let long_count = cols[9..]
+        .iter()
+        .filter(|c| c.split(':').nth(2) == Some("10,10"))
+        .count();
+    assert_eq!(long_count, 3, "three samples are homozygous CA×10\n{vcf}");
+}

@@ -32,9 +32,22 @@ const NEG: f64 = f64::NEG_INFINITY;
 /// 15) — calibrate on real data.
 pub(crate) const MIN_REGION_Q1: u8 = 15;
 
-/// Gap-open probability (Match → Insertion or → Deletion). Dindel's base value
-/// for short homopolymer runs (Mark-1 pair-HMM, arch §5.4).
+/// Gap-open probability (Match → Insertion or → Deletion) in the **flanks**. Dindel's
+/// base value for short homopolymer runs (Mark-1 pair-HMM, arch §5.4). The flanks are
+/// clean unique sequence, so a stiff gap keeps them anchoring the tract junctions.
 const GAP_OPEN_PROB: f64 = 2.9e-5;
+
+/// Gap-open probability **inside the repeat tract** — far softer than the flank value
+/// because STR length variation *is* multi-unit tract indels, and the flank-grade Dindel
+/// gap collapses any allele more than ~1 unit longer than the reference (investigation
+/// `doc/devel/reports/research/ssr_delimiter_gap_penalty_2026-06-24.md`). HipSTR makes the
+/// same flank/tract split: it uses the Dindel gap for flanks and a separate stutter model
+/// inside the tract. Here the delimiter only *extracts* the observed tract (the
+/// empirical-candidate contract), so this is a flat per-base tract gap — content-agnostic,
+/// so impure / out-of-frame reads are still read out verbatim; the in-frame-vs-out-of-frame
+/// distinction is a Stage-2 *scoring* concern. **Provisional calibration constant** (like
+/// the other dev defaults) — to be reconciled with the Stage-2 stutter slippage rate.
+const GAP_OPEN_PROB_TRACT: f64 = 1e-2;
 
 /// Gap-extension probability: Dindel's fixed `e^-1 ≈ 0.368`.
 static GAP_EXTEND_PROB: LazyLock<f64> = LazyLock::new(|| (-1.0f64).exp());
@@ -58,11 +71,16 @@ static EMISSION_LN: LazyLock<[(f64, f64); 256]> = LazyLock::new(|| {
 /// distribution, `ln(1/4)`.
 static INS_EMIT_LN: LazyLock<f64> = LazyLock::new(|| 0.25f64.ln());
 
-/// The pair-HMM's log-space transition probabilities (Mark-1's, constant gap-open).
+/// The pair-HMM's log-space transition probabilities. Gap-open is **tract-aware**: a
+/// stiff value in the flanks ([`GAP_OPEN_PROB`]), a soft value inside the repeat tract
+/// ([`GAP_OPEN_PROB_TRACT`]) so a read's length difference is absorbed there rather than
+/// collapsing the tract. Gap-extend / -close are shared (the open is the dominant fixed
+/// cost; the extend is a tuning knob left uniform for now).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HmmModel {
     ln_mm: f64,
     ln_gap_open: f64,
+    ln_gap_open_tract: f64,
     ln_gap_close: f64,
     ln_gap_extend: f64,
 }
@@ -73,6 +91,7 @@ impl Default for HmmModel {
         Self {
             ln_mm: (1.0 - 2.0 * GAP_OPEN_PROB).ln(),
             ln_gap_open: GAP_OPEN_PROB.ln(),
+            ln_gap_open_tract: GAP_OPEN_PROB_TRACT.ln(),
             ln_gap_close: (1.0 - extend).ln(),
             ln_gap_extend: extend.ln(),
         }
@@ -176,6 +195,19 @@ pub(crate) fn delimit_read(
     let emission = &*EMISSION_LN;
     let ins_emit = *INS_EMIT_LN;
 
+    // Tract-aware gap-open: a gap that touches reference column `j` is **inside the repeat
+    // tract** (the soft gap) when `left_len < j <= n - right_len` — i.e. it inserts beside,
+    // or deletes, a tract base. Flank columns keep the stiff gap so the junctions still
+    // anchor. `j` ranges over `1..=n`.
+    let tract_hi = n - right_len;
+    let gap_open = |j: usize| {
+        if left_len < j && j <= tract_hi {
+            model.ln_gap_open_tract
+        } else {
+            model.ln_gap_open
+        }
+    };
+
     let ViterbiScratch {
         prev, cur, back, ..
     } = scratch;
@@ -186,7 +218,7 @@ pub(crate) fn delimit_read(
     back[0] = [M as u8, M as u8, M as u8];
     for j in 1..=n {
         let (d, dp) = pick(&[
-            (model.ln_gap_open + prev[j - 1][M], M as u8),
+            (gap_open(j) + prev[j - 1][M], M as u8),
             (model.ln_gap_extend + prev[j - 1][D], D as u8),
         ]);
         prev[j] = [NEG, NEG, d];
@@ -220,13 +252,14 @@ pub(crate) fn delimit_read(
                 (model.ln_gap_close + prev[j - 1][I], I as u8),
             ]);
             // Insertion: from the cell above (read consumed, hap not).
+            let go = gap_open(j);
             let (ii, ipp) = pick(&[
-                (model.ln_gap_open + prev[j][M], M as u8),
+                (go + prev[j][M], M as u8),
                 (model.ln_gap_extend + prev[j][I], I as u8),
             ]);
             // Deletion: from the cell left (hap consumed, read not).
             let (dd, dpp) = pick(&[
-                (model.ln_gap_open + cur[j - 1][M], M as u8),
+                (go + cur[j - 1][M], M as u8),
                 (model.ln_gap_extend + cur[j - 1][D], D as u8),
             ]);
             cur[j] = [emit + mm, ins_emit + ii, dd];
@@ -450,5 +483,81 @@ mod tests {
         // A quarter low: first quartile drops below the threshold → fail.
         let quarter_low = [5u8, 5, 40, 40, 40, 40, 40, 40];
         assert!(!passes_quality_gate(&quarter_low, MIN_REGION_Q1, &mut s));
+    }
+
+    // ── tract-aware gap penalty (long-allele recovery) ──
+
+    /// A `CA(8)` reference locus with 6 bp flanks: GGGGGG | (CA)x8 | TTTTTT, tract ref
+    /// [40, 56). Mirrors the real catalog geometry the e2e test uses.
+    fn ca8_locus() -> Locus {
+        let mut rb = Vec::new();
+        rb.extend_from_slice(b"GGGGGG");
+        for _ in 0..8 {
+            rb.extend_from_slice(b"CA");
+        }
+        rb.extend_from_slice(b"TTTTTT");
+        Locus::new(
+            "chr1".into(),
+            40,
+            56,
+            Motif::new(b"CA").unwrap(),
+            1.0,
+            rb.into_boxed_slice(),
+            34,
+        )
+        .unwrap()
+    }
+
+    /// Delimit a full-flank `CA(units)` region against `ca8_locus`, returning the extracted
+    /// repeat-unit count (or `None` on `BorderOffEnd`).
+    fn delimit_ca8_units(units: usize) -> Option<usize> {
+        let mut region = Vec::new();
+        region.extend_from_slice(b"GGGGGG");
+        for _ in 0..units {
+            region.extend_from_slice(b"CA");
+        }
+        region.extend_from_slice(b"TTTTTT");
+        let quals = vec![40u8; region.len()];
+        let mut s = ViterbiScratch::new();
+        match delimit_read(&region, &quals, &ca8_locus(), &HmmModel::new(), &mut s) {
+            Delimited::Region(r) => Some((r.end - r.start) / 2),
+            Delimited::BorderOffEnd => None,
+        }
+    }
+
+    #[test]
+    fn tract_aware_gap_recovers_long_alleles_without_collapse() {
+        // The regression for the gap-penalty investigation: with the uniform stiff gap, any
+        // allele >= ref+2 units collapsed to the reference (CA*8). The tract-aware soft gap
+        // extracts every length across a wide range, both shorter and (the bug) longer.
+        for units in 4..=20 {
+            assert_eq!(
+                delimit_ca8_units(units),
+                Some(units),
+                "CA*{units} should extract verbatim, not collapse"
+            );
+        }
+    }
+
+    #[test]
+    fn tract_aware_gap_keeps_the_flanks_anchored() {
+        // A substitution in the right flank (TTTTTT -> TTTATT) must not let the soft tract
+        // gap leak outward: the tract is still delimited as the clean CA*9 between the flanks.
+        let mut region = Vec::new();
+        region.extend_from_slice(b"GGGGGG");
+        for _ in 0..9 {
+            region.extend_from_slice(b"CA");
+        }
+        region.extend_from_slice(b"TTTATT"); // right flank with one substitution
+        let quals = vec![40u8; region.len()];
+        let mut s = ViterbiScratch::new();
+        match delimit_read(&region, &quals, &ca8_locus(), &HmmModel::new(), &mut s) {
+            Delimited::Region(span) => {
+                // The flank substitution is tolerated (base mismatch under the stiff flank
+                // gap) and the tract still reads out as the full CA*9 between the flanks.
+                assert_eq!(&region[span], b"CACACACACACACACACA");
+            }
+            other => panic!("expected Region, got {other:?}"),
+        }
     }
 }

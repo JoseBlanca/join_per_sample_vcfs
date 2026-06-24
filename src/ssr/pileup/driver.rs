@@ -1087,9 +1087,27 @@ mod tests {
         }
     }
 
-    // NOTE: the long-allele *recovery* and *drop* behavioural tests are intentionally not
-    // here yet — investigation (see the plan's gap-open note) showed the dominant collapse
-    // is the delimiter's `GAP_OPEN_PROB`, which collapses any allele ≥ ref+2 units even with
-    // a full-flank window, and confounds the flank-completeness detection. Those tests are
-    // meaningful only once the delimiter gap penalty is calibrated; deferred to that effort.
+    #[test]
+    fn classify_read_recovers_a_window_truncated_long_allele() {
+        // CA(10) as all-Match: the ref-sized window truncates the far flank on the first
+        // pass; the widened re-delimit restores the full flank and — now that the delimiter
+        // gap is tract-aware — recovers the full CA*10 tract.
+        match classify(&all_match_read(10, 5)) {
+            ReadObs::WidenedSequence(seq) => assert_eq!(&*seq, b"CACACACACACACACACACA"),
+            other => panic!("expected WidenedSequence(CA*10), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_read_drops_an_allele_too_long_to_span_the_window() {
+        // CA(20) all-Match: the tract fills the reference-sized window with no flank left, so
+        // the read cannot be delimited — it is dropped (BorderOffEnd, or WindowTruncated in
+        // the narrow case where widening still can't reach a flank), both of which are kept
+        // out of `observed`. The point is it is never silently collapsed to a short tract.
+        let outcome = classify(&all_match_read(20, 20));
+        assert!(
+            matches!(outcome, ReadObs::BorderOffEnd | ReadObs::WindowTruncated),
+            "a too-long allele must be dropped, not collapsed; got {outcome:?}"
+        );
+    }
 }
