@@ -9,8 +9,12 @@
 //! for this milestone (supplied params), each genotype's **data** log-likelihood is
 //! a one-time precompute and only `π` iterates — so the EM is a few cheap passes.
 //! Bending the SNP engine (chain anchors, class pseudocounts, contamination) would
-//! cost more than it saves. The `θ_locus` M-step (which needs slip attribution) is
-//! deferred until D wires the slip accumulators; here `θ = θ⁰`.
+//! cost more than it saves. `ε` and the per-group stutter level are frozen by the
+//! burn-in; the **stutter shape adapts per locus** (I1): an inner `θ_locus` M-step
+//! attributes the locus's reads to their called alleles, refits the shape, and shrinks
+//! it toward the frozen `θ_period` seed (so a thin locus stays at the seed — no
+//! oscillation), re-genotyping until `θ_locus` settles. The per-locus stutter *level*
+//! refit is the I2 follow-up.
 //!
 //! v1 is **diploid** (the simulator's ploidy); higher ploidy is a documented
 //! follow-up (the genotype enumeration generalizes, the dosage priors need care).
@@ -19,8 +23,11 @@ use crate::ssr::cohort::allele_freq_prior::g0_pseudocounts;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em_init::LocusSeed;
 use crate::ssr::cohort::likelihood::{LikelihoodScratch, read_given_genotype, read_likelihood};
-use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, ParamSet, StutterLevel};
+use crate::ssr::cohort::param_estimation::{
+    G0PseudocountDecay, MAX_SLIP, ParamSet, SlipProfile, StutterLevel, StutterShape,
+};
 use crate::ssr::cohort::rung_ladder::Rungs;
+use crate::ssr::cohort::stutter::refine_theta_locus;
 use crate::ssr::cohort::types::CohortLocus;
 
 /// EM controls (pinned in F2).
@@ -34,6 +41,14 @@ pub(crate) struct EmCfg {
     pub(crate) lambda: f64,
     /// Inbreeding coefficient `F` (the autozygous-branch weight); refined in E1.
     pub(crate) inbreeding_f: f64,
+    /// Maximum per-locus `θ_locus` shape-refinement rounds (I1). `0` keeps the frozen
+    /// `θ_period` seed (no per-locus adaptation).
+    pub(crate) theta_max_rounds: usize,
+    /// Pseudo-count weight shrinking `θ_locus` toward the frozen `θ_period` seed — the
+    /// anti-oscillation knob: a thin locus cannot overcome it and stays at the seed.
+    pub(crate) theta_shrink: f64,
+    /// Convergence tolerance on the largest `θ_locus` coefficient change between rounds.
+    pub(crate) theta_tol: f64,
 }
 
 impl EmCfg {
@@ -43,6 +58,9 @@ impl EmCfg {
             tol: 1e-6,
             lambda: 0.01,
             inbreeding_f: 0.0,
+            theta_max_rounds: 3,
+            theta_shrink: 50.0,
+            theta_tol: 1e-3,
         }
     }
 }
@@ -243,10 +261,79 @@ pub(crate) fn run_locus_em_with(
         .map(|a| (a.len() / period) as u16)
         .collect();
 
-    // Precompute each sample's per-genotype DATA log-likelihood (constant across the
-    // π iterations, since ε/θ/level are fixed for this milestone). `data_ll[s][g]`.
     let mut scratch = LikelihoodScratch::new();
-    let mut data_ll: Vec<Vec<f64>> = Vec::with_capacity(n_present);
+
+    // θ_locus refinement (I1): genotype under the frozen `θ_period` seed, then refit a
+    // per-locus shape from the called alleles' slips, shrunk toward that seed, and
+    // re-genotype until `θ_locus` settles. With few/no slips it collapses to the seed
+    // (no oscillation); each round's data log-likelihood is recomputed for the new shape.
+    let mut theta = seed.theta0;
+    let mut data_ll = compute_data_ll(
+        locus,
+        candidates,
+        params,
+        level_per_group,
+        &theta,
+        &cand_units,
+        &genotypes,
+        cfg.lambda,
+        distinct,
+        &mut scratch,
+    );
+    let mut pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
+    let (mut calls, mut posterior_hom) =
+        final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
+
+    for _ in 0..cfg.theta_max_rounds {
+        let profile = attribute_locus_slips(locus, &calls, period);
+        let new_theta = refine_theta_locus(&profile, &seed.theta0, cfg.theta_shrink);
+        if shapes_close(&new_theta, &theta, cfg.theta_tol) {
+            break;
+        }
+        theta = new_theta;
+        data_ll = compute_data_ll(
+            locus,
+            candidates,
+            params,
+            level_per_group,
+            &theta,
+            &cand_units,
+            &genotypes,
+            cfg.lambda,
+            distinct,
+            &mut scratch,
+        );
+        pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
+        let (c, ph) = final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
+        calls = c;
+        posterior_hom = ph;
+    }
+
+    LocusCall {
+        calls,
+        pi,
+        posterior_hom,
+        admit: candidates.admit,
+    }
+}
+
+/// Each sample's per-genotype **data** log-likelihood `data_ll[s][g]` under stutter
+/// shape `theta` (constant across the π iterations; recomputed when `θ_locus` changes).
+#[allow(clippy::too_many_arguments)]
+fn compute_data_ll(
+    locus: &CohortLocus,
+    candidates: &CandidateSet,
+    params: &ParamSet,
+    level_per_group: &[StutterLevel],
+    theta: &StutterShape,
+    cand_units: &[u16],
+    genotypes: &[Genotype],
+    lambda: f64,
+    distinct: usize,
+    scratch: &mut LikelihoodScratch,
+) -> Vec<Vec<f64>> {
+    let k = candidates.alleles.len();
+    let mut data_ll: Vec<Vec<f64>> = Vec::with_capacity(locus.samples.len());
     for (k_present, evidence) in locus.samples.iter().enumerate() {
         let (eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
         // Per (distinct obs, candidate) Qᵣ — the read likelihood matrix.
@@ -262,10 +349,10 @@ pub(crate) fn run_locus_em_with(
                             obs,
                             &candidates.alleles[c],
                             &locus.motif,
-                            &seed.theta0,
+                            theta,
                             lvl,
                             eps,
-                            &mut scratch,
+                            scratch,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -279,7 +366,7 @@ pub(crate) fn run_locus_em_with(
                 obs_qr
                     .iter()
                     .map(|(count, row)| {
-                        let p = read_given_genotype(row, &[g.i, g.j], cfg.lambda, distinct);
+                        let p = read_given_genotype(row, &[g.i, g.j], lambda, distinct);
                         *count as f64 * p.ln()
                     })
                     .sum::<f64>()
@@ -287,11 +374,22 @@ pub(crate) fn run_locus_em_with(
             .collect::<Vec<_>>();
         data_ll.push(sample_ll);
     }
+    data_ll
+}
 
-    // EM on π (E-step posteriors over genotypes → M-step allele frequencies).
-    let mut pi = seed.pi0.clone();
+/// The π loop: E-step posteriors over genotypes → `G₀`-regularized M-step on the allele
+/// frequencies, to convergence (or `max_iters`).
+fn run_pi_em(
+    data_ll: &[Vec<f64>],
+    genotypes: &[Genotype],
+    g0: &[f64],
+    pi0: &[f64],
+    f_per_present: &[f64],
+    cfg: &EmCfg,
+) -> Vec<f64> {
+    let mut pi = pi0.to_vec();
     for _ in 0..cfg.max_iters {
-        let mut expected = g0.clone();
+        let mut expected = g0.to_vec();
         for (k_present, sample_ll) in data_ll.iter().enumerate() {
             let f = f_per_present[k_present];
             let log_joint: Vec<f64> = genotypes
@@ -318,16 +416,25 @@ pub(crate) fn run_locus_em_with(
             break;
         }
     }
+    pi
+}
 
-    // Final E-step → MAP genotype + GQ + posterior homozygosity per sample.
-    let mut calls = Vec::with_capacity(n_present);
-    let mut posterior_hom = Vec::with_capacity(n_present);
+/// Final E-step → per sample: the MAP genotype + GQ + posterior homozygosity.
+fn final_calls(
+    data_ll: &[Vec<f64>],
+    genotypes: &[Genotype],
+    pi: &[f64],
+    f_per_present: &[f64],
+    cand_units: &[u16],
+) -> (Vec<SampleCall>, Vec<f64>) {
+    let mut calls = Vec::with_capacity(data_ll.len());
+    let mut posterior_hom = Vec::with_capacity(data_ll.len());
     for (k_present, sample_ll) in data_ll.iter().enumerate() {
         let f = f_per_present[k_present];
         let log_joint: Vec<f64> = genotypes
             .iter()
             .zip(sample_ll)
-            .map(|(g, ll)| genotype_prior(*g, &pi, f).ln() + ll)
+            .map(|(g, ll)| genotype_prior(*g, pi, f).ln() + ll)
             .collect();
         let norm = log_sum_exp(&log_joint);
         let (best, best_lj) = log_joint
@@ -351,13 +458,48 @@ pub(crate) fn run_locus_em_with(
         });
         posterior_hom.push(p_hom);
     }
+    (calls, posterior_hom)
+}
 
-    LocusCall {
-        calls,
-        pi,
-        posterior_hom,
-        admit: candidates.admit,
+/// Build the locus's slip profile by hard-attributing each read to its nearest called
+/// allele (the `θ_locus` M-step's sufficient statistic). Integer counts ⇒ the refit is
+/// order-independent. The soft per-read responsibility split is a deferred refinement.
+fn attribute_locus_slips(locus: &CohortLocus, calls: &[SampleCall], period: usize) -> SlipProfile {
+    let mut profile = SlipProfile::default();
+    for (k_present, call) in calls.iter().enumerate() {
+        if call.genotype_units.is_empty() {
+            continue; // no-call contributes no slips
+        }
+        for (obs, count) in &locus.samples[k_present].seq_counts {
+            let read_units = (obs.len() / period) as i32;
+            let parent = *call
+                .genotype_units
+                .iter()
+                .min_by_key(|&&u| (u as i32 - read_units).abs())
+                .expect("a non-empty call has ≥1 allele");
+            add_slip(&mut profile, read_units - parent as i32, *count as u64);
+        }
     }
+    profile
+}
+
+/// Add a slip of signed size `delta` (count `count`) to a profile, respecting `MAX_SLIP`.
+fn add_slip(profile: &mut SlipProfile, delta: i32, count: u64) {
+    let magnitude = delta.unsigned_abs() as usize;
+    if (1..=MAX_SLIP).contains(&magnitude) {
+        if delta > 0 {
+            profile.up[magnitude - 1] += count;
+        } else {
+            profile.down[magnitude - 1] += count;
+        }
+    }
+}
+
+/// Whether two shapes agree within `tol` on every coefficient (the `θ_locus` stop).
+fn shapes_close(a: &StutterShape, b: &StutterShape, tol: f64) -> bool {
+    (a.up_rate - b.up_rate).abs() < tol
+        && (a.down_rate - b.down_rate).abs() < tol
+        && (a.decay - b.decay).abs() < tol
 }
 
 /// Phred-scaled genotype quality from the MAP posterior, capped at 99.
@@ -581,6 +723,158 @@ mod tests {
         assert!((total - 1.0).abs() < 1e-9);
         // The true alleles are 6, 8, 10 units; their combined π should dominate.
         assert!(call.pi.iter().all(|&p| p >= 0.0));
+    }
+
+    // ── I1: the per-locus θ_locus shape refit ──
+
+    fn ca(units: u16) -> Box<[u8]> {
+        "CA".repeat(units as usize).into_bytes().into_boxed_slice()
+    }
+
+    #[test]
+    fn attribute_locus_slips_bins_reads_by_signed_distance() {
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 0,
+                end: 16,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGG".as_slice()),
+            ca(8),
+        );
+        locus.push(
+            0,
+            SampleEvidence {
+                seq_counts: vec![(ca(6), 3), (ca(7), 5), (ca(8), 100), (ca(9), 4)],
+                qc: SsrQc::default(),
+            },
+        );
+        // A homozygous-8 call: 8 is faithful (no slip), 7 is Δ=−1, 9 is Δ=+1, 6 is Δ=−2.
+        let calls = vec![SampleCall {
+            allele_indices: vec![0, 0],
+            genotype_units: vec![8, 8],
+            posterior: 0.99,
+            gq: 40,
+        }];
+        let profile = attribute_locus_slips(&locus, &calls, 2);
+        assert_eq!(profile.down[0], 5, "Δ=−1 count");
+        assert_eq!(profile.up[0], 4, "Δ=+1 count");
+        assert_eq!(profile.down[1], 3, "Δ=−2 count");
+        assert_eq!(profile.up[1], 0);
+    }
+
+    #[test]
+    fn attribute_locus_slips_skips_no_calls() {
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 0,
+                end: 16,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGG".as_slice()),
+            ca(8),
+        );
+        locus.push(
+            0,
+            SampleEvidence {
+                seq_counts: vec![(ca(7), 5)],
+                qc: SsrQc::default(),
+            },
+        );
+        let profile = attribute_locus_slips(&locus, &[SampleCall::no_call()], 2);
+        assert_eq!(profile.down.iter().sum::<u64>(), 0);
+        assert_eq!(profile.up.iter().sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn shapes_close_compares_every_coefficient() {
+        let a = StutterShape {
+            up_rate: 0.3,
+            down_rate: 0.7,
+            decay: 0.2,
+        };
+        assert!(shapes_close(&a, &a, 1e-9));
+        let mut b = a;
+        b.decay = 0.25; // a 0.05 change exceeds the tolerance
+        assert!(!shapes_close(&a, &b, 1e-3));
+    }
+
+    #[test]
+    fn theta_locus_refit_recovers_calls_under_a_shape_mismatched_seed() {
+        // Heavy-tailed stutter (decay 0.5) but a seed shape claiming low decay (0.1):
+        // the per-locus θ refit must adapt and still call the truth.
+        let chem = SimChemistry {
+            error: PerBaseError(0.001),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.5,
+            },
+            level: StutterLevel {
+                baseline: 0.15,
+                slope: 0.0,
+            },
+        };
+        let genos = [
+            SimGenotype::homozygous(8, 2),
+            SimGenotype::homozygous(8, 2),
+            SimGenotype::diploid(6, 10),
+            SimGenotype::homozygous(10, 2),
+            SimGenotype::diploid(6, 10),
+        ];
+        let spec = SimCohortSpec {
+            seed: 909,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 40,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 8,
+            }],
+            groups: vec![chem],
+            samples: genos
+                .iter()
+                .enumerate()
+                .map(|(i, g)| SimSample {
+                    name: format!("S{i}"),
+                    group: SampleGroupId(0),
+                    genotypes: vec![Some(g.clone())],
+                })
+                .collect(),
+            depth: 200,
+        };
+        let cohort = crate::ssr::cohort::sim::simulate(&spec);
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        // clean_params carries the (wrong-for-this-locus) low-decay 0.1 seed shape.
+        let mut params = clean_params(locus.present.len());
+        params.level_seed[0].baseline = 0.15;
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        let truth = [[8, 8], [8, 8], [6, 10], [10, 10], [6, 10]];
+        for (k, expected) in truth.iter().enumerate() {
+            let mut got = call.calls[k].genotype_units.clone();
+            got.sort_unstable();
+            let mut want = expected.to_vec();
+            want.sort_unstable();
+            assert_eq!(
+                got, want,
+                "sample {k} under shape-mismatched seed + θ refit"
+            );
+        }
     }
 
     #[test]
