@@ -39,7 +39,7 @@
 | M3 | Major | duplicate `G₀` fallback const | Apply | Applied | param_estimation.rs, em.rs | Pass |
 | M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | Applied | em.rs, vcf_out.rs | Pass |
 | M5 | Major | unguarded contig/sample names | Apply (test-first) | Applied | driver.rs | Pass |
-| M6 | Major | untested filtered-locus emit | Apply (test-only) | — | — | — |
+| M6 | Major | untested filtered-locus emit | Apply (test-only) | Applied | driver.rs (test) | Pass |
 | Mi1 | Minor | duplicated attribution helper | Defer | — | — | — |
 | Mi2 | Minor | `LocusModel` bundle (11-arg) | Defer | — | — | — |
 | Mi3 | Minor | per-round alloc churn | Defer | — | — | — |
@@ -166,6 +166,24 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** Mi13 (allele-byte UTF-8 validation) is the remaining untrusted-output gap, deferred.
 - **Residual risk:** Low — the char set rejected is the VCF-structural minimum; a stricter VCF 4.4 contig-ID grammar could be layered later if needed.
+
+### M6 — untested filtered-locus emit branch
+- **Severity:** Major
+- **Initial decision:** Apply (test-only)
+- **Final status:** Applied
+- **Reasoning:** The `candidates.admit != Pass` emit branch (filtered locus kept with its reason) was uncovered end-to-end; a widened/inverted drop guard would silently truncate the VCF with no failing test. Added a `run`-level regression test.
+- **Implementation summary:** new test driving a cohort whose locus B is covered only by sample 0 at cohort depth 3 (< the `min_cohort_depth = 10` floor) → `Admission::LowDepth`, asserting it is emitted with `FILTER == lowDepth`, dense `9 + 12` columns all `./.:.:.`, alongside the PASS variant at locus A. Production code unchanged — the branch was already correct; this closes the coverage gap (and incidentally pins B1's dense-row fix for filtered loci).
+- **Review suggestion used verbatim?:** No (adapted — used a single-sample partial-coverage locus B to hit the `LowDepth` floor reliably given `reads_for(&[])` depth 3 × the 10-floor).
+- **Adaptation:** single-coverage `LowDepth` fixture rather than an all-thin locus (which would exceed the cohort-depth floor).
+- **Verification performed:** new test passes; full `ssr::cohort` suite green.
+- **Files changed:** `src/ssr/cohort/driver.rs` (test only).
+- **Tests added or modified:** `run_emits_a_filtered_locus_with_its_reason` (new).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `148 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None.
 
 ## 12. Notes
 

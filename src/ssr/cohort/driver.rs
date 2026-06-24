@@ -693,6 +693,65 @@ mod tests {
     }
 
     #[test]
+    fn run_emits_a_filtered_locus_with_its_reason() {
+        // Locus A (40): 6 hom-ref + 6 separated hets → variable PASS (and resolves every
+        // sample for decision-E). Locus B (100): covered only by sample 0 at cohort depth
+        // 3 < the depth floor → Admission::LowDepth → emitted with its FILTER reason and
+        // all-no-call columns (regression for the filtered-locus *emit* branch, review M6).
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_loci = vec![loc_units("chr1", 40, 8), loc_units("chr1", 100, 8)];
+        let catalog = dir.path().join("c.ssr.catalog");
+        std::fs::write(&catalog, catalog_bytes(REF_MD5, &catalog_loci)).unwrap();
+
+        let mut psp_files = Vec::new();
+        for i in 0..12 {
+            let a_alleles: &[u16] = if i < 6 { &[8] } else { &[6, 10] };
+            let mut records = vec![ssr_record(40, 8, reads_for(a_alleles))]; // A
+            if i == 0 {
+                records.push(ssr_record(100, 8, reads_for(&[]))); // B: thin → LowDepth
+            }
+            let path = dir.path().join(format!("s{i}.ssr.psp"));
+            std::fs::write(&path, ssr_psp(ssr_header(&["chr1"], REF_MD5), &records)).unwrap();
+            psp_files.push(path);
+        }
+        let config = SsrCallConfig {
+            catalog,
+            psp_files,
+            output: dir.path().join("out.vcf"),
+            threads: 2,
+            queue_depth: 4,
+        };
+
+        run(&config).unwrap();
+        let vcf = std::fs::read_to_string(&config.output).unwrap();
+        let records: Vec<&str> = vcf.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            records.len(),
+            2,
+            "PASS variant (A) + filtered LowDepth (B)\n{vcf}"
+        );
+        let filtered = records
+            .iter()
+            .find(|r| r.contains("lowDepth"))
+            .expect("a lowDepth record");
+        let fcols: Vec<&str> = filtered.split('\t').collect();
+        assert_eq!(fcols[1], "101", "the filtered locus is B at POS 101");
+        assert_eq!(fcols[6], "lowDepth");
+        assert_eq!(
+            fcols.len(),
+            9 + 12,
+            "filtered locus is still dense over the cohort"
+        );
+        for col in &fcols[9..] {
+            assert_eq!(*col, "./.:.:.", "a filtered locus has all-no-call samples");
+        }
+        assert!(
+            records.iter().any(|r| r.contains("\tPASS\t")),
+            "the PASS variant still emits"
+        );
+    }
+
+    #[test]
     fn run_is_byte_identical_across_thread_counts() {
         // The burn-in is byte-identical across threads and the sweep is serial, so the
         // whole VCF must be identical at any thread count (the headline property, e2e).
