@@ -37,7 +37,7 @@
 | M1 | Major | `"?"` contig fallback | Apply | Applied | driver.rs | Pass |
 | M2 | Major | `sample_chemistry` silent defaults | Apply | Applied | em.rs | Pass |
 | M3 | Major | duplicate `G₀` fallback const | Apply | Applied | param_estimation.rs, em.rs | Pass |
-| M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | — | — | — |
+| M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | Applied | em.rs, vcf_out.rs | Pass |
 | M5 | Major | unguarded contig/sample names | Apply (test-first) | — | — | — |
 | M6 | Major | untested filtered-locus emit | Apply (test-only) | — | — | — |
 | Mi1 | Minor | duplicated attribution helper | Defer | — | — | — |
@@ -130,6 +130,24 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** None.
 - **Residual risk:** None.
+
+### M4 — `partial_cmp().unwrap()` NaN-argmax on the parallel emit path
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** Both `final_calls` (em.rs) and `site_qual` (vcf_out.rs) selected an argmax via `partial_cmp(...).unwrap()`, which panics a rayon worker on a NaN with no context. `total_cmp` is a total order (NaN-safe) and removes the `unwrap`; for the established finite invariants it gives the identical argmax, so behaviour is preserved (the genotype/QUAL-asserting tests still pass).
+- **Implementation summary:** `final_calls`: `partial_cmp(...).unwrap()` → `total_cmp(...)` and the trailing `.unwrap()` → `.expect("a PASS locus enumerates ≥1 genotype")`, with a `// PANIC-FREE:` comment. `site_qual`: `partial_cmp(...).unwrap()` → `total_cmp(...)` (empty handled by `.unwrap_or(ref_idx)`), with a comment.
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** all genotype/QUAL-asserting `ssr::cohort` tests pass unchanged; grep confirmed these were the only two `partial_cmp().unwrap()` sites in scope.
+- **Files changed:** `src/ssr/cohort/em.rs`, `src/ssr/cohort/vcf_out.rs`
+- **Tests added or modified:** None (existing tests pin the argmax; the change removes a panic on an unreachable NaN).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `144 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None — `total_cmp`/`partial_cmp` agree for finite/−∞ inputs; ties keep the first element under `max_by` in both.
 
 ## 12. Notes
 

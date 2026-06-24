@@ -461,11 +461,15 @@ fn final_calls(
             .map(|(g, ll)| genotype_prior(*g, pi, f).ln() + ll)
             .collect();
         let norm = log_sum_exp(&log_joint);
+        // PANIC-FREE: a PASS locus enumerates ≥1 genotype (`log_joint` non-empty), and every
+        // entry is finite-or-−∞ — `genotype_prior(...).ln()` is finite-or-−∞ and `ll` is a
+        // sum of `count·ln(p)` with `p ≥ lambda/D > 0`, so no entry is NaN. `total_cmp` is a
+        // total order over f64 (NaN-safe), so the argmax cannot panic (review M4).
         let (best, best_lj) = log_joint
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .unwrap();
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .expect("a PASS locus enumerates ≥1 genotype");
         let posterior = (best_lj - norm).exp();
         let p_hom: f64 = genotypes
             .iter()

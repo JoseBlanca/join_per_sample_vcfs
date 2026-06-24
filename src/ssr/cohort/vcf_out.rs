@@ -186,11 +186,14 @@ pub(crate) fn is_variable(call: &LocusCall, candidates: &CandidateSet) -> bool {
 /// the cohort modal allele; a confident non-modal sample drives it toward 0 (high
 /// QUAL).
 pub(crate) fn site_qual(call: &LocusCall, candidates: &CandidateSet, cfg: &FpControlCfg) -> f64 {
+    // `total_cmp` is a total order over f64 (NaN-safe): `pi` is a normalized, finite
+    // frequency vector from `run_pi_em`, so this is also panic-free, but `total_cmp` removes
+    // the `partial_cmp().unwrap()` outright (review M4). Empty `pi` → the ref candidate.
     let modal = call
         .pi
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i)
         .unwrap_or(candidates.ref_idx);
 
