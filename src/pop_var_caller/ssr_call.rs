@@ -1,13 +1,14 @@
 //! `ssr-call` subcommand — Stage 2 of the SSR caller. Reads the per-sample
 //! `.ssr.psp` evidence files produced by `ssr-pileup`, merges them by catalog locus
-//! across the cohort, and writes the result.
+//! across the cohort, genotypes each locus with the cohort EM, and writes a
+//! multi-sample **VCF**.
 //!
 //! The struct below is the authoritative knob list; [`run_ssr_call`] translates it
-//! into the cohort driver config. **The genotyping EM + VCF are not built yet** — the
-//! driver currently writes a catalog-ordered **TSV dump** of the merged evidence
-//! (a reading-layer inspection tool + VCF placeholder), and `--threads` /
-//! `--queue-depth` are reserved (the run is single-threaded). Build plan:
-//! `doc/devel/implementation_plans/ssr_call_reading.md`.
+//! into the cohort driver config. The driver is the two-pass streaming pipeline (arch
+//! `doc/devel/architecture/ssr_call_driver.md`): a bounded burn-in freezes the
+//! cross-locus-pooled parameters, then a chunk-parallel sweep genotypes every locus on
+//! `--threads` workers and emits the VCF. The VCF is byte-identical for any `--threads`
+//! / `--queue-depth` (each locus is a pure function of its reads + the frozen params).
 
 use std::path::PathBuf;
 
@@ -29,28 +30,28 @@ pub struct SsrCallArgs {
     #[arg(long)]
     pub catalog: PathBuf,
 
-    /// Output path. Currently a catalog-ordered TSV dump of the merged evidence;
-    /// the multi-sample VCF lands with the genotyping EM.
+    /// Output multi-sample VCF path (one record per emitted SSR locus, `GT:GQ:REPCN`).
     #[arg(long)]
     pub output: PathBuf,
 
-    /// RESERVED — EM worker threads. The genotyping EM is not built yet, so the run is
-    /// single-threaded and this value currently has no effect.
+    /// Worker threads for the burn-in pool and the chunk-parallel genotyping sweep. The
+    /// output VCF is byte-identical for any value; `0` is treated as single-threaded.
     #[arg(long, default_value_t = DEFAULT_THREADS, help_heading = "Advanced")]
     pub threads: usize,
 
-    /// RESERVED — bounded producer→worker queue depth. Not yet wired (single-threaded);
-    /// currently has no effect.
+    /// Loci per genotyping-sweep chunk (the resident-loci + parallelism knob). `0` (the
+    /// default) lets the driver pick a chunk size; the VCF is identical for any value.
     #[arg(long, default_value_t = DEFAULT_QUEUE_DEPTH, help_heading = "Advanced")]
     pub queue_depth: usize,
 }
 
-/// Default EM worker thread count (reserved until the EM lands).
+/// Default genotyping-sweep worker thread count.
 pub const DEFAULT_THREADS: usize = 4;
 
-/// Default bounded-queue depth (Q-R3; a starting point to be measured against a real
-/// run, arch `ssr_call_reading.md` §5).
-pub const DEFAULT_QUEUE_DEPTH: usize = 4;
+/// Default chunk size: `0` is the "unset" sentinel — the driver substitutes its own
+/// `DEFAULT_SWEEP_CHUNK`. (A nonzero CLI default would force tiny chunks and serialize
+/// the sweep.)
+pub const DEFAULT_QUEUE_DEPTH: usize = 0;
 
 /// Errors from the `ssr-call` subcommand.
 #[derive(Debug, Error)]
@@ -66,29 +67,10 @@ pub enum SsrCallCliError {
     },
 }
 
-/// Run the `ssr-call` subcommand.
-///
-/// Phase 3: opens the cohort, merges per-sample evidence by catalog locus, and writes
-/// a catalog-ordered TSV dump of the reading layer to `--output`. The genotyping EM +
-/// VCF land in a later phase; `--threads` / `--queue-depth` are reserved.
+/// Run the `ssr-call` subcommand: open the cohort, merge per-sample evidence by catalog
+/// locus, freeze the pooled parameters in a bounded burn-in, then stream-genotype every
+/// locus on `--threads` workers and write the multi-sample VCF to `--output`.
 pub fn run_ssr_call(args: &SsrCallArgs) -> Result<(), SsrCallCliError> {
-    // The reserved flags currently have no effect; say so loudly rather than letting a
-    // user believe `--threads 32` did something.
-    if args.threads != DEFAULT_THREADS {
-        eprintln!(
-            "warning: --threads {} has no effect yet (ssr-call is single-threaded \
-             until the genotyping EM lands)",
-            args.threads
-        );
-    }
-    if args.queue_depth != DEFAULT_QUEUE_DEPTH {
-        eprintln!(
-            "warning: --queue-depth {} has no effect yet (the producer→worker queue \
-             is not wired until the genotyping EM lands)",
-            args.queue_depth
-        );
-    }
-
     let config = SsrCallConfig {
         catalog: args.catalog.clone(),
         psp_files: args.psp_files.clone(),
@@ -151,7 +133,7 @@ mod tests {
         let args = SsrCallArgs {
             psp_files: vec![PathBuf::from("/no/such/a.ssr.psp")],
             catalog: PathBuf::from("/no/such/x.ssr.catalog"),
-            output: PathBuf::from("/tmp/unused.tsv"),
+            output: PathBuf::from("/tmp/unused.vcf"),
             threads: 4,
             queue_depth: DEFAULT_QUEUE_DEPTH,
         };
