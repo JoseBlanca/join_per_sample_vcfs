@@ -300,6 +300,186 @@ be planned with conventional timelines in mind.
 
 ---
 
+# Update — current state (2026-06-24)
+
+*Everything above is preserved as the original "first working version"
+accounting (state as of ~2026-05-19). This section re-runs the same
+analysis against the project as it stands one month later. The
+methodology, COCOMO coefficients, and dollar rates are identical — only
+the inputs (scope, LOC, elapsed time) have changed.*
+
+In the month since the first-version snapshot the project did **two**
+things at once:
+
+1. **Hardened and re-architected the SNP/indel cohort caller** — a
+   record-streaming pipeline that trades RAM for sample-count scaling
+   (swapped into production behind a byte-identity oracle), a
+   chunk-parallel within-chromosome driver, indel left-alignment, QUAL
+   calibration against depth-inflated false positives, BED `--regions`
+   support, and a long sequence of measured perf/memory levers. The
+   caller is now exercised against **real tomato cohort data and the
+   human HG002 "bottle" set, compared head-to-head with GATK,
+   freebayes, and samtools** — the real-data validation that was the
+   open item in the first-version report has substantially begun
+   (F1-vs-GATK tuning, QUAL-vs-depth calibration), though it is still
+   tuning rather than a published/production bar.
+2. **Opened a second caller from scratch — an SSR/STR (microsatellite)
+   genotyper.** This is a new locus-oriented module
+   (`ssr-catalog` / `ssr-pileup` / `ssr-call`, ~10.4 K code lines)
+   sharing the `.psp` container and the cohort statistics machinery but
+   with its own pair-HMM realignment core, empirical-candidate allele
+   model, and a per-locus EM with a parameter pre-pass. It runs
+   end-to-end on synthetic + simulator data; real-data validation is
+   the open item for it, exactly as Stages 3–6 were for the SNP caller
+   a month ago.
+
+## Timeline — additions since the first version
+
+| Date | Milestone | Elapsed from pivot (2026-04-17) |
+|---|---|---|
+| **2026-05-19** | **First working version — six-stage SNP caller, cohort CLI** (original report's endpoint) | +32 days |
+| 2026-05-28→31 | Chunk-parallel within-chromosome rewrite (column-native unification + EM, per-chunk DUST) | +41–44 days |
+| 2026-06-04 | `re-architect` record-streaming pipeline reaches byte-identity and is swapped into production | +48 days |
+| 2026-06-07→09 | Perf/memory levers; thread-budget single-pool; first SSR research docs | +51–53 days |
+| 2026-06-11 | QUAL calibration vs depth-inflated false positives (real-data work) | +55 days |
+| 2026-06-15→16 | SSR Stage 0 (`ssr-catalog`) + Stage 1 (`ssr-pileup`) runnable end-to-end | +59–60 days |
+| 2026-06-17 | SSR Stage 1 Mark-2 rebuild (empirical candidates, Viterbi delimiter) | +61 days |
+| 2026-06-23 | SSR Stage 2 (`ssr-call`) genotyping + parameter pre-pass — end-to-end SSR VCF | +67 days |
+| **2026-06-24** | **Current state** — two callers; SNP caller in real-data tuning, SSR caller synthetic-validated | **+68 days** |
+
+**State at 2026-06-24:** the SNP caller is re-architected, perf/memory
+tuned, and being validated against GATK/freebayes/samtools on real
+data; a second (SSR) caller is implemented end-to-end and
+synthetic/simulator-validated. Team unchanged: **one developer + Claude**
+(the assistant model itself moved Opus 4.6 → 4.7 → 4.8 over the
+project, mostly the 1M-context variant; the collaboration cadence
+tightened into a fixed `feat → review → fix` loop with adversarial spec
+review — see `project_history.md`).
+
+## Codebase growth
+
+| Basis | First version (~2026-05-19) | Current (2026-06-24) | Growth |
+|---|---|---|---|
+| `src/` files | 67 | 129 | 1.9× |
+| `src/` raw lines | ~45.5 K | ~80.2 K | 1.8× |
+| Whole-repo `.rs` code lines (blanks/comments excluded, recomputed consistently) | ~36.9 K | ~60.2 K | 1.63× |
+| **Tokei-basis code lines** (the original report's measure) | **41,826** | **~68,000** | **1.63×** |
+| of which: SSR module (`src/ssr/`) | 0 | ~10.4 K code lines | new |
+
+*The original report's 41,826 figure is a `tokei` count; an
+independent re-count (blank and comment-only lines excluded) puts the
+same first-version tree at ~36.9 K — i.e. `tokei` runs ~13% higher than
+this counter. To keep the new estimate on the original report's basis,
+the current size is the measured whole-repo growth factor (1.63×)
+applied to 41,826 → **~68,000 tokei-basis LOC**, used as the COCOMO
+input below.*
+
+## Cost estimate — what ~68,000 LOC of Rust would conventionally cost
+
+Same **COCOMO Basic** model and coefficients as the first-version
+section (which they reproduce exactly):
+
+| Mode | Effort (person-months) | COCOMO calendar time |
+|---|---|---|
+| Organic | ~202 | ~19 months |
+| **Semi-detached** | **~339** | **~19 months** |
+| Embedded | ~569 | ~19 months |
+
+A two-caller genomics toolkit — numerical correctness, performance-
+critical, two distinct realignment/statistics cores — still sits
+between semi-detached and embedded. Anchor on **~340 person-months**,
+with ~570 as the upper bound. (The first version anchored at ~200 pm;
+the scope grew ~1.7×.)
+
+**Cross-check against LOC/dev-month** (math-heavy Rust, lower end of the
+200–400 range):
+
+- At 200 LOC/dev-month: 68,000 / 200 = **340 person-months**
+- At 300 LOC/dev-month: 68,000 / 300 = **227 person-months**
+
+These again bracket COCOMO semi-detached.
+
+### Cost in dollars and euros
+
+Same loaded monthly rates as the first-version table:
+
+| Region / role | Loaded €/$ per month | At 340 pm (semi-detached) | At 570 pm (embedded) |
+|---|---|---|---|
+| US senior software engineer | $20,000 | **$6.8 M** | $11.4 M |
+| US specialist (genomics + Rust) | $25,000 | $8.5 M | $14.3 M |
+| EU senior software engineer | €10,000 | **€3.4 M** | €5.7 M |
+| EU PhD-level scientific developer | €8,000 | €2.7 M | €4.6 M |
+| Spain academic (CSIC / UPV staff scientist) | €5,000 | €1.7 M | €2.9 M |
+
+### Adjustments that pull the estimate down
+
+The same adjustments apply as in the first-version report — Rust is
+denser than COCOMO's calibration languages; test code is included in
+the count; the Bayesian/HMM algorithms are adapted from published work
+(HipSTR/GangSTR/ConSTRain for the SSR core, GATK/freebayes/samtools for
+the SNP core) and BAM/CRAM I/O is delegated to `noodles`. Two
+state-specific notes:
+
+- **The SNP caller's validation has advanced**, which *raises* the
+  realised quality bar relative to the first version (real-data
+  comparison vs three reference callers, not just synthetic fixtures) —
+  this is genuine value a conventional estimate would price in.
+- **The SSR caller is still synthetic/simulator-validated only**, so it
+  sits where the SNP caller sat a month ago — implemented and reviewed,
+  real-data validation ahead.
+
+After the same downward adjustments, a realistic conventional cost for
+the current state is roughly:
+
+- **US:** $3.5 M – $7 M
+- **EU:** €1.75 M – €3.5 M
+- **Spain academic rate:** €0.9 M – €1.8 M
+
+## Actual cost — current state
+
+| Line item | Estimate |
+|---|---|
+| Developer time (one developer, ~68 days from pivot ≈ ~2–2.5 months effective) | ~2 months of salary |
+| Claude usage (heavier now: Opus 4.8 1M-context, many review/verification passes over 2 months) | ~$500 – $3,000 |
+| **Total approximate cost so far** | **~€11,000 – €14,000** (at Spain academic rate) |
+
+Compared against the conventional estimate of **€0.9 M – €1.8 M**
+(Spain academic) up to **€1.75 M – €3.5 M** (EU senior), the cost
+compression is in the range of **~75× – 300×**. The multiplier is a
+touch lower than the first version's 100×–400× — unsurprising, because
+developer time roughly doubled while scope grew ~1.7×, so the per-hour
+leverage is similar but the denominator (actual cost) grew faster than
+in the first sprint. The order-of-magnitude conclusion is unchanged.
+
+### Caveats — unchanged and reinforced
+
+All four honest caveats from the first-version section still apply
+(invisible prior domain knowledge; real remaining validation work;
+review-depth/team-coverage variance; unstable LLM productivity across
+task types). The month since the first version actually **illustrates**
+the last two:
+
+- The perf/memory re-architecture and the SSR statistics were exactly
+  the kind of work where LLM assistance compounds (lots of structured
+  implementation, mechanical review loops, plan/spec documents) — and
+  the throughput shows it (456 commits, ~23 K net new code lines in a
+  month).
+- The real-data validation of the SNP caller is the part that did
+  **not** accelerate the same way: the slow step is running callers on
+  real cohorts, comparing against ground truth, and reasoning about why
+  the numbers diverge — work gated by empirical results, not by typing
+  speed. This is consistent with the first-version report's prediction.
+
+The defensible conclusion, updated: **what has been built in ~68 days
+corresponds to a conventional ~2–3 person-year project costing
+€0.9 M – €3.5 M.** A second from-scratch caller and a production
+re-architecture were added on top of the first version for roughly the
+same monthly cost — but the real-data validation arc for both callers
+remains the part that will be paced by experiments, not by the
+assistant.
+
+---
+
 ## Sources
 
 - Project git log (`git log` on this repo).
@@ -317,3 +497,8 @@ be planned with conventional timelines in mind.
 - Boehm 1981, *Software Engineering Economics* (COCOMO).
 - Industry productivity figures: Stack Overflow Developer Survey
   series; published Rust adoption case studies.
+- `doc/reports/project_history.md` — the detailed per-phase narrative
+  and per-day activity record this cost report is anchored to.
+- SSR/STR reference algorithms digested for the second caller:
+  HipSTR (Willems et al. 2017), GangSTR (Mousavi et al. 2019),
+  ConSTRain — see `doc/devel/reports/research/`.

@@ -1,16 +1,32 @@
 # Project history — `join_per_sample_vcfs` → `pop_var_caller`
 
-**Span:** 2025-12-04 → 2026-05-24 (~5.5 months, 550 commits)
-**Source growth:** 10 → 96 Rust files in `src/`, ~1.7 k → ~59.8 k LOC.
+**Span:** 2025-12-04 → 2026-06-24 (~6.5 months, ~1040 commits)
+**Source growth:** 10 → 129 Rust files in `src/`, ~1.7 k → ~80.1 k LOC.
 **Authoring model:** single primary author working with a Claude Code
 assistant; commit messages and per-stage `doc/devel/reports/` and
-`doc/devel/specs/` artefacts reflect that workflow.
+`doc/devel/specs/` artefacts reflect that workflow. The assistant model
+itself moved across the project (Claude Opus 4.6 → 4.7 → 4.8, mostly
+in the 1M-context variant) and the collaboration tooling matured — see
+[AI tooling evolution](#ai-tooling-evolution).
 
-The history breaks cleanly into **four phases**. The pivot at the
-boundary of Phase 2 and Phase 3 is the key inflection point: the
-project's original goal (joining per-sample gVCFs) was achieved and
-then deliberately discarded in favour of a much larger goal (a
-complete cohort variant caller from BAM).
+The history breaks into **six phases** across two arcs. The first arc
+(Phases 1–4) is the SNP/indel cohort caller; the second (Phases 5–6)
+hardens it and then pivots a second time into microsatellite (SSR/STR)
+genotyping. Two inflection points stand out:
+
+1. **End of Phase 2 → Phase 3** — the project's original goal (joining
+   per-sample gVCFs) was achieved and then deliberately discarded in
+   favour of a much larger goal: a complete cohort variant caller from
+   BAM.
+2. **Within Phase 6** — with the SNP caller working end-to-end on real
+   data, the author opens an entirely new front: a locus-oriented
+   microsatellite genotyper (`ssr-catalog` / `ssr-pileup` / `ssr-call`)
+   sharing the `.psp` container and cohort statistics but with its own
+   realignment core.
+
+*Phases 1–4 are summarised below; the detailed per-day record for them
+lives in the [feature timeline](#feature-timeline--what-landed-and-when).
+This revision (2026-06-24) extends the document through Phases 5–6.*
 
 ## Phase 1 — gVCF parsing foundation (2025-12 → late Feb 2026)
 
@@ -82,6 +98,89 @@ the MAPQ filter), per-chromosome parallelism, and a final restructure
 that promotes `bam/`, `baq/`, `fasta/`, `psp/`, `pileup/`, `vcf/`,
 `pileup_record`, and `iter_ext` to top-level `src/` modules.
 
+## Phase 5 — Re-architecture, perf, and memory (late May → mid June 2026)
+
+**Objective:** the caller works, but on real cohorts it is too slow
+and too memory-hungry. This month is spent making it *competitive* —
+chunk-parallel within a chromosome, a record-streaming pipeline that
+trades RAM for sample-count scaling, and a long sequence of measured
+perf/memory levers — while hardening correctness against GATK and
+freebayes on real tomato and human data.
+
+The defining move is the **chunk-parallel rewrite** and then the
+**`re-architect` record-streaming pipeline.** Rather than adapt the
+old streaming iterators, the author treats them as a spec and builds a
+new worker natively over columnar `.psp` data: column-native allele
+unification and a column-native EM, per-chunk DUST masking (replacing
+a serial whole-chromosome pre-pass), and a clean split between
+*building* the data partitions and *running* the math on them. The
+`re-architect` branch (Phase 0 → Phase 7) reaches a **byte-identity
+milestone** against `main`, gets a crossbeam producer→caller→writer
+topology with parallel per-sample decode, and is then swapped into
+production (2026-06-04). The direct `var-calling-from-bam` path is
+deleted — only `pileup → .psp → var-calling` remains.
+
+Memory and throughput are then driven down through a documented series
+of levers, most of them landing byte-identical: two-phase
+column-selective decode, dropping REF-allele chain-ids, a `--low-memory`
+two-pass producer, lowering the default block window 20 kb → 5 kb (the
+single biggest RSS knob), and a single-pool thread budget that honours
+`--threads N` with a producer/caller split. Correctness work in
+parallel: indel left-alignment (a GATK-port normaliser made
+mandatory), QUAL calibration that deflates scores at
+systematic-artifact sites (the depth-inflation false-positive
+problem), per-allele MAPQ filtering, and a BED `--regions` mode.
+
+This phase is also where the **per-step review loop becomes
+mechanical** — the giant `cohort_block` review (5 Blockers, 32 Major,
+26 Minor) and its ~40 fix commits in a single day, then conventional
+`feat → review → fix` triplets thereafter.
+
+## Phase 6 — Second pivot: SSR/STR genotyping (June 2026)
+
+**Objective:** build a microsatellite (short-tandem-repeat) genotyper
+as a new, locus-oriented module — reusing the `.psp` container and the
+cohort statistics machinery, but with its own realignment core,
+because read mappers handle repeats badly.
+
+The pivot is spec-first again, and heavily research-driven: a research
+report digests HipSTR / GangSTR / ConSTRain, an architecture doc
+settles placement (same crate, `src/ssr/`, CLI mirroring the SNP
+`pileup`/`var-calling` split), and the `.psp` format is generalised
+into a generic core with SNP and SSR specialisations (SNP output stays
+byte-identical). The implementation then walks three stages:
+
+- **Stage 0 — `ssr-catalog`:** build the locus catalog from a
+  `trf-mod` tandem-repeat scan, dropping period-1 homopolymers and
+  compound loci (HipSTR/GangSTR-style).
+- **Stage 1 — `ssr-pileup`:** per-locus read genotyping. The decision
+  is "realign everything" — every spanning read goes through a
+  pair-HMM rather than trusting the mapper's CIGAR — with
+  `count_repeats` kept only as a *measured* fast-path candidate (built,
+  measured, verdict "don't build it"). A **Mark-2 rebuild** then
+  replaces the first cut with an empirical-candidate allele model and a
+  Viterbi delimiter, and the realignment is tuned ~54 % faster
+  byte-identically.
+- **Stage 2 — `ssr-call`:** the cohort statistics layer. A Mark-2 spec
+  is settled end-to-end and then **hardened against a 13-finding
+  adversarial review.** The reading/merge layer lands first (typed
+  per-sample readers + a catalog-driven k-way merger), then the
+  genotyping + parameter pre-pass: a cohort simulator, shared locus
+  primitives (stutter model, alignment), a sum-over-slips likelihood,
+  per-locus EM, sample-group clustering, a frozen-parameter pre-pass
+  (ε, stutter shape θ per period refined per-locus, per-group stutter
+  level, per-individual F, G₀ decay), and finally a chunk-parallel
+  genotyping sweep with byte-identity across threads.
+
+Shared infrastructure also advanced underneath both modules: a
+`segment_reader` indexed read source replaced the old per-file query
+path, and the FASTA reference reading was unified onto the pileup path.
+
+As of 2026-06-24 the SSR genotyper runs end-to-end (`ssr-catalog` →
+`ssr-pileup` → `ssr-call` → VCF) with the parameter pre-pass and
+per-locus refits in place; the SNP caller continues to be tuned in
+parallel.
+
 ## Milestone summary
 
 | Date       | Objective at the time                              | Status                                                | LOC (rs) | files |
@@ -90,6 +189,9 @@ that promotes `bam/`, `baq/`, `fasta/`, `psp/`, `pileup/`, `vcf/`,
 | 2026-03-31 | Cross-sample gVCF merger w/ EM posteriors          | done; review hardening underway                       | ~6.2 k   | 18    |
 | 2026-04-30 | Pivot: spec a full cohort caller from BAM          | design frozen; CRAM input slice landed                | ~9.4 k   | 24    |
 | 2026-05-24 | Implement six-stage cohort caller, run on real BAM | end-to-end working; tuning F1 vs GATK                 | ~59.8 k  | 96    |
+| 2026-06-07 | Re-architect for scale (record-streaming, chunk-parallel) | byte-identical swap into production; perf/memory levers landing | ~70 k    | ~110  |
+| 2026-06-17 | SSR Stage 0+1 (`ssr-catalog`, `ssr-pileup`) on real data | Mark-2 rebuild done; per-locus reads genotyped       | ~75 k    | ~120  |
+| 2026-06-24 | SSR Stage 2 (`ssr-call`) cohort statistics + pre-pass | end-to-end SSR VCF; per-locus param refits in EM     | ~80.1 k  | 129   |
 
 ## Commits by category
 
@@ -159,6 +261,52 @@ What the table shows:
   as review since every commit in that day was a category fix from
   the same review.
 
+### Second period (2026-05-25 → 2026-06-24)
+
+The classification above was a snapshot at the document's creation
+(2026-05-24). The following month added **456 commits**, re-classified
+with the same intent-based method (the move to conventional-commit
+prefixes mid-period actually makes this *easier* — `feat`/`fix`/`perf`
+scopes map almost directly):
+
+| Category                            | Commits | Share |
+| ----------------------------------- | ------- | ----- |
+| **Implementation (new features)**   | **135** | **29.6%** |
+| **Code review (correctness fixes)** | **91**  | **20.0%** |
+| Docs / specs / plans / reports      | 81      | 17.8% |
+| Tooling / bench / container         | 38      | 8.3%  |
+| **Performance**                     | **36**  | **7.9%** |
+| Refactor / rename / cleanup         | 33      | 7.2%  |
+| Merge / revert / other              | 28      | 6.1%  |
+| Tests                               | 9       | 2.0%  |
+
+The proportions are remarkably stable versus the first period —
+implementation ~30 %, review ~20 % — but **docs nearly doubles its
+share** (8 % → 18 %). That is the spec-first, per-step methodology
+compounding: every SSR stage gets an architecture sketch, an
+implementation plan, and a per-step review report before and around
+the code. Review and docs together (~38 %) now *exceed* raw
+implementation.
+
+The monthly mix for the window:
+
+| Month        | impl | review | perf | refactor | docs | tooling | test | merge | total |
+| ------------ | ---: | -----: | ---: | -------: | ---: | ------: | ---: | ----: | ----: |
+| 2026-05 (25–31) |   50 |     33 |    3 |       10 |   12 |      17 |    3 |     2 |   134 |
+| 2026-06         |   85 |     58 |   33 |       23 |   69 |      21 |    6 |    26 |   322 |
+
+- **Late May** is the chunk-parallel rewrite and the `cohort_block`
+  review — note the 50 impl / 33 review split inside one week, plus a
+  heavy tooling column (the benchmark dashboards and dev-container
+  caller comparisons).
+- **June** is structurally a two-front month: the re-architecture and
+  perf levers (33 perf commits — the highest of any month) on the SNP
+  side, and the SSR pivot driving the 69 docs commits (research,
+  architecture, specs, per-step reports) and the 26 merges (the many
+  short-lived feature branches: `re-architect`, `low-memory-mode`,
+  `bed-regions`, `qual-analysis`, `segment-read-fetcher`,
+  `ssr-architecture`, `ssr-pileup-mark2`, `ssr-cohort`).
+
 ## Activity chart — commits and lines of code per active day
 
 Each row is one active day (days with no commits are omitted).
@@ -222,6 +370,34 @@ DATE         COMMITS  ADDED  REMOVED  ADDED ━━━━━━━━━━━━
 2026-05-22         6    2771      270  █████
 2026-05-23        32    9109     3103  ███████████████                           █████
 2026-05-24        30    7878     2461  █████████████                             ████
+2026-05-25         2     389       36  █
+2026-05-26         5    2532        6  ████
+2026-05-27         2     822       93  █
+2026-05-28        19   11053      426  ██████████████████                        █
+2026-05-29        80   14026     4043  ███████████████████████                   ███████
+2026-05-30        10    1328     1395  ██                                        ██
+2026-05-31        16    4344     1261  ███████                                   ██
+2026-06-01        32    3380     6238  ██████                                    ██████████
+2026-06-02         4     928      230  ██
+2026-06-03        22    4035      239  ███████
+2026-06-04        16   21735    31091  ████████████████████████████████████      ████████████████████
+2026-06-05         4     593      297  █
+2026-06-06         5    1752      162  ███
+2026-06-07        12    1303      122  ██
+2026-06-08        20    2296     1128  ████                                      ██
+2026-06-09        17    1957      181  ███
+2026-06-10         7    1822     1105  ███                                       ██
+2026-06-11        10    5002      604  ████████                                  █
+2026-06-12        12    2802      303  █████                                     █
+2026-06-14         2    1184       67  ██
+2026-06-15        28    9508      950  ████████████████                          ██
+2026-06-16        42    8396     4721  ██████████████                            ████████
+2026-06-17        20    7959     6550  █████████████                             ███████████
+2026-06-19         3    1592      418  ███                                       █
+2026-06-21        13    3246      250  █████
+2026-06-22         2    3465      256  ██████
+2026-06-23        42   11332      459  ███████████████████                       █
+2026-06-24         9    1245      149  ██
 ```
 
 Reading the chart: nothing of substance happens before 2026-02-12;
@@ -230,6 +406,17 @@ the gVCF-merger work in March is steady but small (≤ 14 commits/day,
 3000-line days (specs + CRAM input); May is structurally different
 — eight days exceed 5 k LOC added, and the single biggest day
 (2026-05-13, the `.psp` format) lands 42 commits and 21 k LOC.
+
+The Phase 5–6 tail (from 2026-05-25) reads differently: the spikes are
+no longer pure growth. **2026-06-04** is the largest single day of the
+whole project by *churn* (+21.7 k / −31.1 k) but barely grows the tree
+— it is the `re-architect` swap, where a whole new pipeline replaces
+the old one in place. **2026-05-29** (80 commits) is the `cohort_block`
+review-and-fix avalanche, and **2026-06-23** (42 commits, +11 k) is the
+SSR `ssr-call` genotyping milestones A–J landing in one sitting. The
+high-deletion days (06-01, 06-04, 06-17) mark deliberate removals — the
+direct BAM path, the old pipeline, the Mark-1 SSR module — rather than
+churn from indecision.
 
 ## Feature timeline — what landed and when
 
@@ -350,37 +537,165 @@ between feature bursts are summarised in italics.
 | 2026-05-23 | **`StreamingChromRefFetcher`** (1 MB sliding buffer); unused `SingleChromRefFetcher` deleted; **`ChromRefFetcher` trait + impl**; `cohort_driver` routed through new fetcher; Stage 1 pipeline routed via `WalkerLegacyAdapter`; BAQ + walker share one adapter; `var_calling_from_bam` swaps `SyncRefFetcher` → `WalkerLegacyAdapter`; legacy `SyncRefFetcher` + `ChromBoundaryRefFetcher` deleted; **`ManualEvictChromRefFetcher`** for BAQ workers; `PerChromRecordsIter` helper; DustFilter + PerGroupMerger + `drive_cohort_pipeline` migrated; **ref_fetcher perf review** (drop `Sync`, `Mutex` → `RefCell`, `fetch_into` trait method); **PSP reader perf review** (BufReader-buffer preservation across block seeks, CSR collapse, per-allele bounds-check hoist); fix-application wave (malformed `.fai` rejection, non-ACGT-byte folding to N, trait sealing, `iter_bases` borrow scope, doc `# Errors`, missing-test fixes); **legacy `RefSeqFetcher` retired** in favour of typed-error multi-chrom fetcher; `open_contig` helper; `chrom_name`/`chrom_length` unification |
 | 2026-05-24 | reports moved to canonical dir; **`scripts/precommit-check.sh`**; Rust 1.95 clippy fixes; broken benches/examples ported off retired trait; **module restructure**: `BufferedPeekable` → top-level `iter_ext`; `baq/` promoted to top-level (algorithm core + pileup glue flattened); `pileup_record` promoted to top-level; `psp/` promoted to top-level; `fasta/` (ref_fetcher + `ContigList` + `MultiChromRefFetcher` trait) promoted to top-level; **`pileup/` bundled as `walker/` + `per_sample/` submodules**; `pileup_record` flattened to single file; **`vcf/` promoted; `vcf_writer` decoupled from `PosteriorRecord` via a `VcfWritable` trait**; **`bam/` (CRAM input slice) promoted to top-level**; module-structure refactoring lessons captured in skills |
 
-## Open work as of 2026-05-24
+### Phase 5 — Re-architecture, perf, and memory
 
-From the current branch state (uncommitted changes plus the most
-recent commits), the active work is:
+**Chunk-parallel within-chromosome rewrite + `cohort_block` review** (2026-05-25 → 31)
 
-- **Per-chromosome var-calling from BAM** — the new
-  `doc/devel/implementation_plans/var_calling_from_bam_per_chromosome.md`
-  and uncommitted edits to `src/pop_var_caller/var_calling_from_bam.rs`
-  suggest the per-chromosome parallel mode (already live for the
-  `.psp`-input path) is being extended to the BAM-input subcommand.
-- **BAM index preflight** — new untracked file
-  `src/bam/index_preflight.rs`.
-- **F1 vs GATK tuning** — currently at 0.317 on a synthetic cohort
-  after the MAPQ filter; the DUST filter is kept on as a policy
-  choice even though `--no-complexity-filter` scored a touch better,
-  on the grounds that GATK has no DUST so agreement in low-complexity
-  regions isn't truth.
+| Date       | Feature                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| 2026-05-25 | deps update (`wide` 0.7→1.4, `lru` 0.16→0.18, drop `flate2`); `--max-alleles-lh-calc` fixes a release-build OOB on >64 alleles |
+| 2026-05-26 | **dev container gains samtools + freebayes + GATK** for caller comparison; Apple `container` as podman fallback; tomato caller-comparison benchmarks promoted from `tmp/` |
+| 2026-05-27 | `.psp` block target exposed on the pileup CLI; default 16 MiB → 512 KiB → 1 MiB |
+| 2026-05-28 | **within-chrom chunk-parallel rewrite begins**: `drive_cohort_chunked` driver; chunk loader + pre-pass + variant-group partitioner; worker adapter reusing `per_group_merger`/`posterior_engine`; **Phase A.1 column-native allele unification** (per-position projection, compound detection, max-alleles cap, column-native log-likelihoods) |
+| 2026-05-29 | **80-commit day**: Phase A.2 column-native EM (split EM along row/columnar boundary); **`cohort_block` code review (5 Blockers, 32 Major, 26 Minor)** + ~40 fix commits across Waves 1–7; **indel normalization** — pure left-alignment CIGAR rewrite (GATK-port F3 replacement), wired into the BAQ read-prep stage, made mandatory; ALT-allele pruning ported from main; accuracy/QUAL-sweep dashboards |
+| 2026-05-30 | per-chunk DUST mask (replaces whole-chromosome pre-pass); **`BlockIterator` extracted — decouple block production from math**; chunk produce (data-shaping) split from consume (math); parallelize loader fold + per-sample chunk loading; drop sub-chunk windows |
+| 2026-05-31 | span-addressable columnar PSP reader; streaming block loader (memory fix); DUST-ahead queue off the critical path; parallel ordered block consumption; `cohort_block` → `from_psp`, direct path → `from_bam/` renames |
+
+**Direct-path removal, `re-architect` record-streaming pipeline, perf/memory levers** (2026-06-01 → 09)
+
+| Date       | Feature                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| 2026-06-01 | **direct `var-calling-from-bam` path deleted** (only `pileup → .psp → var-calling` remains); `var_calling/` review + perf review (H1 single `log_sum_exp_slice` in QUAL convolution, H2 compound-detection churn, H3 inline SmallVec keys); `from_psp/` merged into parent module; chunk hot-path benches |
+| 2026-06-02 | **`.psp` blocks cut on a fixed genomic grid** for cross-sample alignment; `run_ours` benches go through `pileup → psp → var-calling` |
+| 2026-06-03 | **BED `--regions` feature** (RegionSet + parser, sub-contig query, region-driven pileup, command line + regions recorded in `.psp` header); **`--low-memory` two-pass producer** + load-time min-alt-obs filter pushdown; **linear-domain QUAL allele-count convolution** |
+| 2026-06-04 | **`re-architect` record-streaming pipeline** (16-commit day, +21.7 k/−31.1 k): Phase 0 scaffold + byte-identity oracle → per-sample segment reader → cohort keep/cut math over light columns → streaming cohort producer → record-based `VariantCaller` → **BYTE-IDENTITY MILESTONE** → crossbeam producer→caller→writer topology → parallel per-sample `.psp` decode → `--regions` support → **Phase 7 swap into production**; contamination ported to the record-based merger |
+| 2026-06-05 | re-architecture code review + fix waves (M1–M8, Mi2/Mi8) |
+| 2026-06-06 | **two-phase column-selective decode** wired into the cohort producer (−40 % live heap); cohort perf review; thread-oversubscription diagnostic playbook |
+| 2026-06-07 | **`re-architect` → `main` merge**; column-selective decode foundation; **drop REF-allele chain-ids end-to-end (H2)**; parallelize the producer fold; inline `ln_factorial` fast path (H3); independent producer rayon pool size (H1); coz causal profiler added to the container; threads × samples memory-scaling dashboard panels |
+| 2026-06-08 | **default block window 20 kb → 5 kb** (the single biggest RSS knob, −58 % at N=50); `var_calling` code review + fixes (typed `PipelineError`, `pub(crate)` demotion, dead-code cleanup); split producer into fold/plan + compact + read stages; `[profile.profiling]` for symbolised dhat/perf stacks; default target-variants-per-chunk 256 → 128 |
+| 2026-06-09 | **thread-budget single-pool**: honour `--threads N` with a producer/caller split (3N+c → N+c); thread-budget integration guard; first SSR research/design docs land (Stage-1 two-tier pair-HMM, file-format interfaces) |
+
+**QUAL calibration, FASTA unification, pileup de-barrier** (2026-06-10 → 12)
+
+| Date       | Feature                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| 2026-06-10 | **SSR/STR genotyping specification** + validation/Stage-2 detail; **FASTA reference readers built once per run** (fix `--regions` perf regression); walker reads reference from the shared `Repository` |
+| 2026-06-11 | **QUAL deflation at systematic-artifact sites** (depth-inflation FP fix) + depth-sweep / QUAL-vs-depth dashboards (`qual-analysis` merge); QUAL-cutoff precision/recall control; bound the QUAL-refine binomial tail to avoid an O(depth) hang |
+| 2026-06-12 | **SSR shared types** (`Motif`, `Locus`) + review; **Stage-1 pileup de-barriered** into a source/worker/reorder pipeline; pileup `--threads` default → 4; exact incomplete-beta QUAL tail above the n cap |
+
+### Phase 6 — SSR/STR genotyping
+
+**Stage 0 catalog + `.psp` container generalization** (2026-06-14 → 16)
+
+| Date       | Feature                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| 2026-06-14 | Stage-1 `ssr-pileup` architecture settled + adversarial review |
+| 2026-06-15 | **`.psp` container generalized** to a generic core + SNP/SSR specialisations via a `PspKind` trait (steps 1a→5, SNP byte-identical, SSR round-trips); **Stage 0 `ssr-catalog`** (format I/O, `trf-mod` spawn + BED parse, post-processing); **Stage-1 `ssr-pileup` core**: realign-everything triage, `count_repeats` fast-path (measured), pair-HMM forward scorer, on-ladder + off-ladder candidate generation, dense per-read scoring, all-CSR locus storage; `trf-mod` installed in the container |
+| 2026-06-16 | **`ssr-catalog` + `ssr-pileup` CLI subcommands runnable end-to-end**; drop period-1 homopolymers; **`segment_reader` shared indexed read source** + `SegmentMergedReads` multi-file coordinate merge (replaces the old indexed-query path); per-locus read fetcher (reach gate + reservoir); Stage-1 driver parallelized (batched rayon); SNP `--regions` retrofit onto the pooled reader; bed-regions `--regions` perf + review |
+
+**Stage 1 Mark-2 rebuild** (2026-06-16 → 17)
+
+| Date       | Feature                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| 2026-06-16 | `ssr-pileup` perf: per-worker `CachingCramReader` (decode each container once), `par_chunks` warm-cache scaling, **~54 % faster pair-HMM** (byte-identical), default pair-HMM window 10 → 6; fast-path investigation verdict "don't build it" |
+| 2026-06-17 | **Mark-2 rebuild**: rename `ssr/` → `ssr_mark1/`, scaffold Mark-2 (types + Stage 0 catalog), read path (`fetch_reads` + footprint), Viterbi+traceback delimiter, per-locus tally (observed sequences + counts), storage + driver + cutover (delete Mark-1); **empirical-candidate allele model**; Mark-2 code review (3 Blockers + 9 Majors) + fixes |
+
+**Stage 2 `ssr-call` — cohort statistics** (2026-06-19 → 24)
+
+| Date       | Feature                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| 2026-06-19 | **Mark-2 cohort spec settled end-to-end** + **hardened against a 13-finding adversarial review** (empirical candidates, locus-admission motif filter, HipSTR-informed sum-over-slips likelihood, per-locus EM) |
+| 2026-06-21 | **`ssr-call` reading layer** (Phases 0–3): owning typed record iterator (`PspReader::into_records_of`), `SampleEvidenceCursor` per-sample reader, catalog-driven k-way merger, single-threaded end-to-end driver; reading-layer code review + fixes |
+| 2026-06-22 | `ssr-call` adversarial re-verification + fixes + confident-genotype seed; global consistency pass |
+| 2026-06-23 | **`ssr-call` genotyping + parameter pre-pass** (42-commit day, Milestones A–J): A1 core types + A2 cohort simulator → B shared locus primitives (rungs, stutter, align) → C1–C4 candidate assembly + likelihood + prior/seeds + EM (**checkpoint 1**) → D1–D3 parameter pre-pass + sample-group clustering (**checkpoint 2**) → E prior-side F + stutter-level outer loop + FP control + VCF output → **F parallelism + byte-identity across threads** → G1 fit G₀ decay → H `build_param_set` (pre-pass → frozen `ParamSet`) + merger accessors + VCF header writer + two-pass streaming driver → VCF |
+| 2026-06-24 | **per-locus EM refits**: I1 θ_locus shape refit, I2 per-locus stutter-rate refit; **J chunk-parallel genotyping sweep** (each with its own per-step review + fix) |
+
+## Open work as of 2026-06-24
+
+From the most recent commits and branch state (`ssr-cohort`), the
+active work is:
+
+- **SSR `ssr-call` genotyping** — the Stage-2 cohort caller is the
+  live front: the EM now refits θ_locus shape and per-locus stutter
+  rate (Steps I1/I2), and the genotyping sweep was just made
+  chunk-parallel (Step J). The roadmap (`doc/devel/implementation_plans/ssr_call_roadmap.md`,
+  16 steps A1→F2) still has milestones beyond J pending; the next
+  checkpoints are the param-recovery and first-real-VCF gates.
+- **SNP caller tuning continues in parallel** — QUAL calibration
+  against the depth-inflation false-positive problem, and the
+  memory-for-scaling thesis (peak-RSS levers) remain open lines on the
+  `main` side.
+- **Pending review debt** — the `.psp` §10 container generalization
+  was flagged for a fresh-conversation code review; several
+  reading-layer and spec docs are owed (reading-layer module doc,
+  Mark-1 amendments, extend-vs-fork engine decision).
+
+## AI tooling evolution
+
+The user explicitly tracks how the *collaboration* changed alongside
+the code. Three shifts are visible in the log:
+
+**1. The assistant model moved up twice.** The `Co-Authored-By`
+trailers record the model in use: **Claude Opus 4.6** (first seen
+2026-04-14) → **Opus 4.7** (2026-04-21 → 2026-05-29) → **Opus 4.8**
+(from 2026-05-29 onward), predominantly in the **1M-context** variant.
+The model upgrades line up with the project's most ambitious bursts —
+4.7 carried the six-stage build, and 4.8 carried the re-architecture
+and the entire SSR module.
+
+**2. Commit conventions tightened.** Phases 1–4 used freeform,
+module-prefixed subjects (`cohort_block: …`, `psp::reader: …`,
+`review fixes [M5]`). From early June the project adopts
+**conventional-commit prefixes with scopes** — `feat(ssr):`,
+`perf(var_calling):`, `docs(review):`, `fix(ssr): apply … review` —
+which makes the *intent* of each commit machine-readable (and made the
+category re-classification above almost mechanical).
+
+**3. The review loop became a fixed, visible cadence.** Where Phase 2
+introduced the `code-review` / `code-review-fixes` skills as ad-hoc
+tools, by Phase 6 every increment is a rigid triplet in the log:
+`feat(ssr): <step>` → `docs(ssr): code review of <step>` →
+`fix(ssr): apply <step> review`. More than twenty such triplets appear
+in June alone. Two heavier-weight practices also matured:
+
+- **Adversarial spec review.** Major specs are now stress-tested
+  before implementation — the Mark-2 cohort spec was hardened against
+  a **13-finding adversarial review**, and the `ssr-call` design got a
+  second adversarial *re-verification* pass. This is spec-first
+  (Phase 3's lesson) plus an explicit attempt to break the design.
+- **Research-driven design.** The SSR pivot opened with literature
+  research reports (HipSTR / GangSTR / ConSTRain digested into
+  `doc/devel/reports/research/`) feeding the architecture — a heavier
+  research front than anything in the SNP arc.
+
+Supporting tooling also grew: a profiling stack (coz causal profiler
+in the dev container, a `[profile.profiling]` for symbolised
+dhat/perf stacks), `scripts/precommit-check.sh`, the dev container
+gaining samtools/freebayes/GATK/`trf-mod` for caller comparison, and a
+persistent project-knowledge memory index that carries decisions
+across conversations.
 
 ## Process observations
 
-Two things are unusual and visible in the log:
+Several patterns are unusual and visible across the whole log:
 
 1. **Skill-driven workflow.** Reviews aren't ad-hoc — the author wrote
    reusable `code-review`, `code-review-fixes`,
    `rust-performance-review`, and `feature-implementation` skills
    early and uses them mechanically on every new module. Roughly **a
    third of all commits in May are review or fix-application
-   commits**, not feature code.
-2. **Spec-first for the pivot.** The transition from gVCF merger to
+   commits**, not feature code; in June the review + docs share
+   actually *exceeds* implementation.
+2. **Spec-first for every pivot.** The transition from gVCF merger to
    cohort caller was preceded by ~10 days of spec writing with no
    implementation. That spec
    (`doc/devel/specs/calling_pipeline_architecture.md`) is referenced
    by name in commit messages months later — it's the project's
-   actual source of truth, not the code.
+   actual source of truth, not the code. The SSR pivot repeats the
+   pattern at higher intensity: research report → architecture doc →
+   per-stage spec → adversarial review, *then* code.
+3. **Rewrites are byte-identity-gated, not faith-based.** The two
+   biggest restructurings — the chunk-parallel rewrite and the
+   `re-architect` record-streaming pipeline — were both built behind a
+   byte-identity oracle that proves the new path produces the *exact*
+   same VCF as the old one before it is allowed to replace it. Perf
+   and memory levers are then landed one at a time, each labelled
+   byte-identical (or explicitly flagged when it changes output, e.g.
+   QUAL). Measurement precedes the optimisation and the verdict is
+   recorded even when it is "don't build it."
+4. **The project is willing to throw work away.** It has pivoted away
+   from its own name twice (gVCF merger → cohort caller; then a second
+   front into SSR), deleted the direct BAM path, the old pipeline, and
+   the entire Mark-1 SSR module once better designs existed. The
+   high-deletion days on the activity chart are deliberate, not
+   thrash.
