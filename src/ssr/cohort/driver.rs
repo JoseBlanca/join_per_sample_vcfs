@@ -6,13 +6,18 @@
 //! per-individual inbreeding `F` (arch §4). **Pass 2 (genotyping sweep):** re-open and
 //! stream every locus, genotyping each independently on the frozen parameters and
 //! emitting a VCF record (emit-iff-variable for PASS, filtered loci kept with their
-//! reason — arch §6). The sweep is single-threaded for now; the bounded-queue worker
-//! pool is Milestone J. `config.threads` drives the (parallel, byte-identical) burn-in.
+//! reason — arch §6). The sweep is **chunk-parallel** (Milestone J): bounded chunks of
+//! loci are genotyped on the `config.threads` pool with an order-preserving `par_iter`
+//! and written in catalog order. Each locus is a pure function of its reads + the frozen
+//! params, so the whole VCF is byte-identical across thread counts; `config.queue_depth`
+//! is the chunk size (the resident-loci + parallelism-granularity knob).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
+
+use rayon::prelude::*;
 
 use crate::ssr::cohort::candidate_set::{Admission, CandidateCfg, assemble_candidates};
 use crate::ssr::cohort::em::{EmCfg, run_locus_em_with};
@@ -42,8 +47,9 @@ pub(crate) struct SsrCallConfig {
     /// Thread count for the parallel, byte-identical burn-in (the genotyping sweep is
     /// single-threaded until Milestone J).
     pub(crate) threads: usize,
-    /// Reserved — the bounded-queue depth of the streaming genotyping sweep (Milestone
-    /// J); the current single-threaded sweep does not use it.
+    /// Loci per parallel sweep chunk — the bounded-resident-loci knob *and* the
+    /// genotyping parallelism granularity (Milestone J). Larger = more memory + better
+    /// parallelism; the CLI should default it generously (e.g. ~1024).
     pub(crate) queue_depth: usize,
 }
 
@@ -225,28 +231,48 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
         warnings.push(warning);
     }
 
-    // ── Pass 2: re-open and stream every locus → VCF ──
+    // ── Pass 2: re-open and stream every locus → VCF (chunk-parallel sweep, Milestone J) ──
+    // Accumulate a bounded chunk of loci, genotype the chunk in parallel on the pool, and
+    // write the results in catalog order. `par_iter`'s indexed `collect` preserves order
+    // and each locus is a pure function of its reads + the frozen params, so the VCF is
+    // byte-identical across thread counts; chunking keeps peak memory bounded.
     let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
     let mut out = BufWriter::new(File::create(&config.output)?);
-    write_vcf_header(&mut out, &chromosomes, &sample_names, &warnings)?;
-    // The serial sweep consumes the merger in catalog order, so records are already
-    // ordered and the sequence number needs no reorder (that is Milestone J's concern).
-    for item in merger {
-        let (_seq, locus) = item?;
-        if let Some(line) = genotype_locus(
-            &locus,
-            &chrom_names,
-            &frozen,
-            &rung_cfg,
-            &cand_cfg,
-            &em_cfg,
-            &fp_cfg,
-        ) {
-            writeln!(out, "{line}")?;
+    let chunk_size = config.queue_depth.max(1);
+    pool.install(|| -> Result<(), SsrCallError> {
+        write_vcf_header(&mut out, &chromosomes, &sample_names, &warnings)?;
+        let mut chunk: Vec<CohortLocus> = Vec::with_capacity(chunk_size);
+        for item in merger {
+            chunk.push(item?.1);
+            if chunk.len() >= chunk_size {
+                write_genotyped_chunk(
+                    &chunk,
+                    &chrom_names,
+                    &frozen,
+                    &rung_cfg,
+                    &cand_cfg,
+                    &em_cfg,
+                    &fp_cfg,
+                    &mut out,
+                )?;
+                chunk.clear();
+            }
         }
-    }
-    out.flush()?;
-    Ok(())
+        if !chunk.is_empty() {
+            write_genotyped_chunk(
+                &chunk,
+                &chrom_names,
+                &frozen,
+                &rung_cfg,
+                &cand_cfg,
+                &em_cfg,
+                &fp_cfg,
+                &mut out,
+            )?;
+        }
+        out.flush()?;
+        Ok(())
+    })
 }
 
 /// Reject a cohort whose sample names are not all distinct (H2 review Mi1): duplicate
@@ -327,6 +353,42 @@ fn genotype_locus(
         .map(String::as_str)
         .unwrap_or("?");
     Some(format_vcf_record(chrom, locus, &candidates, &call, qual))
+}
+
+/// Genotype a chunk of loci in parallel, then write the emitted records in catalog order
+/// (Milestone J). `par_iter`'s indexed `collect` keeps `lines[i]` aligned to `chunk[i]`,
+/// and `genotype_locus` is a pure function of its locus + the frozen params, so the
+/// output — and thus the whole VCF — is identical at any thread count. A dropped
+/// (monomorphic PASS) locus is `None` and skipped.
+#[allow(clippy::too_many_arguments)]
+fn write_genotyped_chunk<W: Write>(
+    chunk: &[CohortLocus],
+    chrom_names: &[String],
+    frozen: &FrozenParams,
+    rung_cfg: &RungCfg,
+    cand_cfg: &CandidateCfg,
+    em_cfg: &EmCfg,
+    fp_cfg: &FpControlCfg,
+    out: &mut W,
+) -> Result<(), SsrCallError> {
+    let lines: Vec<Option<String>> = chunk
+        .par_iter()
+        .map(|locus| {
+            genotype_locus(
+                locus,
+                chrom_names,
+                frozen,
+                rung_cfg,
+                cand_cfg,
+                em_cfg,
+                fp_cfg,
+            )
+        })
+        .collect();
+    for line in lines.into_iter().flatten() {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -489,6 +551,44 @@ mod tests {
             std::fs::read_to_string(&config.output).unwrap()
         };
         assert_eq!(run_with(1, "t1.vcf"), run_with(4, "t4.vcf"));
+    }
+
+    #[test]
+    fn chunk_parallel_sweep_orders_records_and_is_deterministic() {
+        // Four variant loci with a small queue_depth → multiple sweep chunks: the records
+        // must stay in catalog (ascending POS) order and the VCF must be byte-identical
+        // across thread counts.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut owned: Vec<(String, Vec<Vec<u16>>)> = (0..6)
+            .map(|i| (format!("hom{i}"), vec![vec![8u16]; 4]))
+            .collect();
+        owned.extend((0..6).map(|i| (format!("het{i}"), vec![vec![6u16, 10]; 4])));
+        let samples: Vec<(&str, Vec<Vec<u16>>)> =
+            owned.iter().map(|(n, g)| (n.as_str(), g.clone())).collect();
+        let loci = [(40, 8), (100, 8), (160, 8), (220, 8)];
+
+        let run_with = |threads: usize, out_name: &str| {
+            let mut config = write_cohort(dir.path(), &loci, &samples);
+            config.threads = threads;
+            config.queue_depth = 2; // < 4 loci ⇒ multiple chunks
+            config.output = dir.path().join(out_name);
+            run(&config).unwrap();
+            std::fs::read_to_string(&config.output).unwrap()
+        };
+        let parallel = run_with(4, "par.vcf");
+        let serial = run_with(1, "ser.vcf");
+        assert_eq!(
+            parallel, serial,
+            "chunk-parallel sweep must be byte-identical\n{parallel}"
+        );
+
+        // All four loci are variant and emitted in ascending POS order (41, 101, 161, 221).
+        let positions: Vec<u32> = parallel
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.split('\t').nth(1).unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(positions, vec![41, 101, 161, 221]);
     }
 
     #[test]
