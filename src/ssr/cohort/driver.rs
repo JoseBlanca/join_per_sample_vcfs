@@ -29,6 +29,7 @@ use crate::ssr::cohort::param_estimation::{
     G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError, StutterLevel,
 };
 use crate::ssr::cohort::prepass::{EstimatedParams, estimate, run_prepass_stats};
+use crate::ssr::cohort::read_model::HipstrModel;
 use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
 use crate::ssr::cohort::sample_groups::{ClusterCfg, GroupedParams, group_samples};
 use crate::ssr::cohort::types::CohortLocus;
@@ -423,6 +424,7 @@ fn genotype_locus(
         em_cfg,
         &f_present,
         &frozen.level_per_group,
+        &HipstrModel,
     );
     apply_fp_control(locus, &mut call, fp_cfg);
 

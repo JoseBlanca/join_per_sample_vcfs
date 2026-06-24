@@ -23,6 +23,7 @@ use crate::ssr::cohort::em_init::{LocusSeed, seed_locus};
 use crate::ssr::cohort::param_estimation::SampleStutterStats;
 use crate::ssr::cohort::param_estimation::{FixedPointAccum, ParamSet, StutterLevel};
 use crate::ssr::cohort::prepass::{add_bin, fit_level};
+use crate::ssr::cohort::read_model::HipstrModel;
 use crate::ssr::cohort::rung_ladder::{RungCfg, Rungs, build_rungs};
 use crate::ssr::cohort::types::CohortLocus;
 
@@ -244,6 +245,7 @@ pub(crate) fn run_cohort_em(
                     em_cfg,
                     &f_present,
                     &level_per_group,
+                    &HipstrModel,
                 )
             })
             .collect();

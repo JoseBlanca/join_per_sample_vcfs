@@ -24,10 +24,11 @@ use crate::ssr::cohort::allele_freq_prior::g0_pseudocounts;
 use crate::ssr::cohort::attribution::nearest_parent;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em_init::LocusSeed;
-use crate::ssr::cohort::likelihood::{LikelihoodScratch, read_given_genotype, read_likelihood};
+use crate::ssr::cohort::likelihood::read_given_genotype;
 use crate::ssr::cohort::param_estimation::{
     DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, SlipProfile, StutterLevel, StutterShape,
 };
+use crate::ssr::cohort::read_model::{HipstrModel, ReadLikelihoodModel, ReadScoringContext};
 use crate::ssr::cohort::rung_ladder::Rungs;
 use crate::ssr::cohort::stutter::refine_theta_locus;
 use crate::ssr::cohort::types::CohortLocus;
@@ -235,6 +236,7 @@ pub(crate) fn run_locus_em(
         cfg,
         &f_per_present,
         &params.level_seed,
+        &HipstrModel,
     )
 }
 
@@ -244,7 +246,7 @@ pub(crate) fn run_locus_em(
 // explicitly (not bundled) so the per-locus call stays a pure function of its inputs — the
 // byte-identity contract. Arg count is intentional.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_locus_em_with(
+pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
     locus: &CohortLocus,
     rungs: &Rungs,
     candidates: &CandidateSet,
@@ -254,6 +256,7 @@ pub(crate) fn run_locus_em_with(
     cfg: &EmCfg,
     f_per_present: &[f64],
     level_per_group: &[StutterLevel],
+    model: &M,
 ) -> LocusCall {
     assert_eq!(ploidy, 2, "C4 EM is diploid-only (v1)");
     let n_present = locus.samples.len();
@@ -283,7 +286,7 @@ pub(crate) fn run_locus_em_with(
 
     // The iteration-invariant locus shaping, built once and reused across the refit rounds
     // (review Mi2).
-    let model = LocusModel {
+    let locus_model = LocusModel {
         locus,
         candidates,
         cand_units: &cand_units,
@@ -291,7 +294,7 @@ pub(crate) fn run_locus_em_with(
         distinct,
     };
 
-    let mut scratch = LikelihoodScratch::new();
+    let mut scratch = M::Scratch::default();
 
     // Per-locus refinement (I1 shape + I2 level): genotype under the frozen `θ_period`
     // seed and group level, then refit a per-locus shape `θ_locus` (shrunk toward the
@@ -302,12 +305,13 @@ pub(crate) fn run_locus_em_with(
     let mut theta = seed.theta0;
     let mut level_multiplier = 1.0;
     let mut data_ll = compute_data_ll(
-        &model,
+        &locus_model,
         params,
         level_per_group,
         &theta,
         level_multiplier,
         cfg.lambda,
+        model,
         &mut scratch,
     );
     let mut pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
@@ -326,12 +330,13 @@ pub(crate) fn run_locus_em_with(
         theta = new_theta;
         level_multiplier = new_level_multiplier;
         data_ll = compute_data_ll(
-            &model,
+            &locus_model,
             params,
             level_per_group,
             &theta,
             level_multiplier,
             cfg.lambda,
+            model,
             &mut scratch,
         );
         pi = run_pi_em(&data_ll, &genotypes, &g0, &seed.pi0, f_per_present, cfg);
@@ -365,14 +370,19 @@ struct LocusModel<'a> {
 /// Each sample's per-genotype **data** log-likelihood `data_ll[s][g]` under stutter
 /// shape `theta` and per-locus rate multiplier `level_multiplier` on the group level (both
 /// constant across the π iterations; recomputed when `θ_locus` / the multiplier change).
-fn compute_data_ll(
-    model: &LocusModel,
+// The model + its scratch join the (already-bundled) locus shaping, chemistry, and
+// per-round shape/level — all distinct inputs threaded explicitly so the precompute
+// stays a pure function (the byte-identity contract). One over the lint's bound.
+#[allow(clippy::too_many_arguments)]
+fn compute_data_ll<M: ReadLikelihoodModel>(
+    locus_model: &LocusModel,
     params: &ParamSet,
     level_per_group: &[StutterLevel],
     theta: &StutterShape,
     level_multiplier: f64,
     lambda: f64,
-    scratch: &mut LikelihoodScratch,
+    model: &M,
+    scratch: &mut M::Scratch,
 ) -> Vec<Vec<f64>> {
     let LocusModel {
         locus,
@@ -380,7 +390,7 @@ fn compute_data_ll(
         cand_units,
         genotypes,
         distinct,
-    } = *model;
+    } = *locus_model;
     let k = candidates.alleles.len();
     let mut data_ll: Vec<Vec<f64>> = Vec::with_capacity(locus.samples.len());
     for (k_present, evidence) in locus.samples.iter().enumerate() {
@@ -395,15 +405,13 @@ fn compute_data_ll(
                         let lvl = ((level.baseline + level.slope * cand_units[c] as f64)
                             * level_multiplier)
                             .clamp(0.0, 1.0);
-                        read_likelihood(
-                            obs,
-                            &candidates.alleles[c],
-                            &locus.motif,
-                            theta,
-                            lvl,
+                        let ctx = ReadScoringContext {
+                            motif: &locus.motif,
+                            shape: theta,
+                            level: lvl,
                             eps,
-                            scratch,
-                        )
+                        };
+                        model.q_r(obs, &candidates.alleles[c], &ctx, scratch)
                     })
                     .collect::<Vec<_>>();
                 (*count, row)

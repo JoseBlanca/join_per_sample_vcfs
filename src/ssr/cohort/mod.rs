@@ -20,6 +20,7 @@ pub mod merge;
 pub mod pair_hmm;
 pub mod param_estimation;
 pub mod prepass;
+pub mod read_model;
 pub mod reader;
 pub mod rung_ladder;
 pub mod sample_groups;
@@ -27,6 +28,8 @@ pub mod stutter;
 pub mod types;
 pub mod vcf_out;
 
+#[cfg(test)]
+pub(crate) mod bakeoff;
 #[cfg(test)]
 pub(crate) mod sim;
 #[cfg(test)]

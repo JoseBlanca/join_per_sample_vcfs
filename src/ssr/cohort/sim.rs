@@ -151,6 +151,53 @@ pub(crate) struct SimCohortSpec {
     pub(crate) depth: u32,
 }
 
+/// Read-level generative noise *on top of* the whole-unit stutter + ε forward model —
+/// the knobs that turn the clean in-frame generator (G1) into the bake-off's harder
+/// generative cases (plan §5). Each is independent and length-/composition-only, so the
+/// **truth genotype (allele lengths in units) is unchanged** — these stress the read
+/// likelihood's robustness, not the labels it is scored against.
+///
+/// - **G1** = [`none`](Self::none) (whole-unit slips only — the original model).
+/// - **G2** = [`hipstr_like`](Self::hipstr_like) (adds out-of-frame draws).
+/// - **G3** = [`messy`](Self::messy) (out-of-frame + interruptions + a heavier ε tail).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GenerativeNoise {
+    /// Probability a read's tract length is knocked **off the unit grid** by ±1 bp (an
+    /// out-of-frame event), independent of the whole-unit slip.
+    pub(crate) out_of_frame_rate: f64,
+    /// Probability a read's tract carries one motif-breaking substitution (a sequence
+    /// interruption), length-preserving.
+    pub(crate) impurity_rate: f64,
+    /// Extra per-base substitution added on top of the chemistry's ε (the heavier tail).
+    pub(crate) extra_substitution: f64,
+}
+
+impl GenerativeNoise {
+    /// G1 — the clean whole-unit generator (no extra noise).
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    /// G2 — HipSTR-style: whole-unit slips plus a moderate out-of-frame fraction.
+    pub(crate) fn hipstr_like() -> Self {
+        Self {
+            out_of_frame_rate: 0.10,
+            impurity_rate: 0.0,
+            extra_substitution: 0.0,
+        }
+    }
+
+    /// G3 — messy realistic: out-of-frame draws, interruptions, and a heavier ε tail.
+    /// The case production robustness is weighed on (plan §5/§7).
+    pub(crate) fn messy() -> Self {
+        Self {
+            out_of_frame_rate: 0.12,
+            impurity_rate: 0.12,
+            extra_substitution: 0.015,
+        }
+    }
+}
+
 /// What was put in — queried by the recovery asserts of later milestones.
 #[derive(Debug, Clone)]
 pub(crate) struct TruthTable {
@@ -259,6 +306,58 @@ fn slip_length(rng: &mut SplitMix64, chem: &SimChemistry, units: u16) -> u16 {
     slipped.clamp(1, u16::MAX as i32) as u16
 }
 
+/// Tile `motif` to exactly `len_bp` bases (the final unit may be partial — an
+/// out-of-frame length). Equals [`build_tract`] when `len_bp` is a unit multiple.
+fn build_tract_bp(motif: &Motif, len_bp: usize) -> Vec<u8> {
+    let m = motif.as_bytes();
+    (0..len_bp).map(|i| m[i % m.len()]).collect()
+}
+
+/// Force one motif-breaking substitution at a random tract position (a sequence
+/// interruption); length-preserving, so the allele's unit length is unchanged.
+fn force_interruption(rng: &mut SplitMix64, tract: &mut [u8]) {
+    if tract.is_empty() {
+        return;
+    }
+    let pos = rng.index_below(tract.len());
+    let mut replacement = BASES[rng.index_below(BASES.len())];
+    while replacement == tract[pos] {
+        replacement = BASES[rng.index_below(BASES.len())];
+    }
+    tract[pos] = replacement;
+}
+
+/// Draw one read's realized tract from a parent allele of `parent_units`: a whole-unit
+/// slip ([`slip_length`]), then the optional out-of-frame / interruption / heavier-ε
+/// noise of `GenerativeNoise`. With [`GenerativeNoise::none`] this is exactly the G1
+/// forward model (whole-unit slip + ε substitutions).
+fn draw_read(
+    rng: &mut SplitMix64,
+    chem: &SimChemistry,
+    parent_units: u16,
+    motif: &Motif,
+    noise: &GenerativeNoise,
+) -> Box<[u8]> {
+    let units = slip_length(rng, chem, parent_units);
+    let period = motif.period() as i32;
+    let mut len_bp = units as i32 * period;
+    if noise.out_of_frame_rate > 0.0 && rng.chance(noise.out_of_frame_rate) {
+        len_bp += if rng.chance(0.5) { 1 } else { -1 };
+    }
+    let len_bp = len_bp.max(1) as usize;
+
+    let mut tract = build_tract_bp(motif, len_bp);
+    if noise.impurity_rate > 0.0 && rng.chance(noise.impurity_rate) {
+        force_interruption(rng, &mut tract);
+    }
+    apply_substitutions(
+        rng,
+        &mut tract,
+        (chem.error.0 + noise.extra_substitution).min(1.0),
+    );
+    tract.into_boxed_slice()
+}
+
 /// Apply within-tract substitutions at rate `ε`.
 fn apply_substitutions(rng: &mut SplitMix64, tract: &mut [u8], eps: f64) {
     if eps <= 0.0 {
@@ -275,9 +374,8 @@ fn apply_substitutions(rng: &mut SplitMix64, tract: &mut [u8], eps: f64) {
     }
 }
 
-/// Generate one (sample, locus) cell's distinct observed sequences, ascending by
-/// bytes (the Stage-1 writer's contract). A `BTreeMap` keyed by the sequence keeps
-/// that order for free.
+/// Generate one (sample, locus) cell's distinct observed sequences under the clean G1
+/// forward model (whole-unit slip + ε). Thin wrapper over [`simulate_cell_with`].
 fn simulate_cell(
     seed: u64,
     chem: &SimChemistry,
@@ -285,21 +383,41 @@ fn simulate_cell(
     motif: &Motif,
     depth: u32,
 ) -> Vec<(Box<[u8]>, u32)> {
+    simulate_cell_with(seed, chem, genotype, motif, depth, &GenerativeNoise::none())
+}
+
+/// Generate one (sample, locus) cell's distinct observed sequences, ascending by bytes
+/// (the Stage-1 writer's contract — a `BTreeMap` keyed by the sequence keeps that order
+/// for free), under the supplied [`GenerativeNoise`].
+fn simulate_cell_with(
+    seed: u64,
+    chem: &SimChemistry,
+    genotype: &SimGenotype,
+    motif: &Motif,
+    depth: u32,
+    noise: &GenerativeNoise,
+) -> Vec<(Box<[u8]>, u32)> {
     let mut rng = SplitMix64::new(seed);
     let ploidy = genotype.allele_units.len();
     let mut counts: BTreeMap<Box<[u8]>, u32> = BTreeMap::new();
     for _ in 0..depth {
         let parent = genotype.allele_units[rng.index_below(ploidy)];
-        let len = slip_length(&mut rng, chem, parent);
-        let mut tract = build_tract(motif, len);
-        apply_substitutions(&mut rng, &mut tract, chem.error.0);
-        *counts.entry(tract.into_boxed_slice()).or_insert(0) += 1;
+        let tract = draw_read(&mut rng, chem, parent, motif, noise);
+        *counts.entry(tract).or_insert(0) += 1;
     }
     counts.into_iter().collect()
 }
 
-/// Generate a cohort from its spec.
+/// Generate a cohort from its spec under the clean G1 forward model. Thin wrapper over
+/// [`simulate_with`].
 pub(crate) fn simulate(spec: &SimCohortSpec) -> SimCohort {
+    simulate_with(spec, &GenerativeNoise::none())
+}
+
+/// Generate a cohort from its spec under the supplied [`GenerativeNoise`] (the bake-off
+/// generative axis G1/G2/G3). The truth table is the same regardless of noise — the
+/// noise perturbs reads, not the genotypes they are scored against.
+pub(crate) fn simulate_with(spec: &SimCohortSpec, noise: &GenerativeNoise) -> SimCohort {
     // The per-file chromosome frame: distinct catalog chromosome names, sorted.
     let mut chroms: Vec<String> = spec.loci.iter().map(|l| l.chrom.clone()).collect();
     chroms.sort();
@@ -329,12 +447,13 @@ pub(crate) fn simulate(spec: &SimCohortSpec) -> SimCohort {
                 .enumerate()
                 .filter_map(|(l_idx, locus)| {
                     let genotype = sample.genotypes[l_idx].as_ref()?;
-                    let observed = simulate_cell(
+                    let observed = simulate_cell_with(
                         cell_seed(spec.seed, s_idx, l_idx),
                         chem,
                         genotype,
                         &locus.motif,
                         spec.depth,
+                        noise,
                     );
                     let depth: u32 = observed.iter().map(|(_, c)| c).sum();
                     let tract_units_len = (locus.motif.period() * locus.ref_units as usize) as u32;
@@ -635,6 +754,83 @@ mod tests {
             support(9) > 50,
             "high allele under-supported: {}",
             support(9)
+        );
+    }
+
+    #[test]
+    fn g2_out_of_frame_noise_produces_non_unit_lengths() {
+        // G1 produces only unit-multiple tract lengths; G2 (out-of-frame) must produce
+        // some reads whose length is off the period grid — the in/out-of-frame axis.
+        let chem = SimChemistry {
+            error: PerBaseError(0.0),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 1.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.05,
+                slope: 0.0,
+            },
+        };
+        let motif = motif(b"CA");
+        let allele = SimGenotype::homozygous(10, 2);
+        let period = motif.period();
+
+        let g1 = simulate_cell_with(7, &chem, &allele, &motif, 500, &GenerativeNoise::none());
+        assert!(
+            g1.iter().all(|(s, _)| s.len() % period == 0),
+            "G1 must stay on the unit grid"
+        );
+
+        let g2 = simulate_cell_with(
+            7,
+            &chem,
+            &allele,
+            &motif,
+            500,
+            &GenerativeNoise::hipstr_like(),
+        );
+        assert!(
+            g2.iter().any(|(s, _)| s.len() % period != 0),
+            "G2 must produce some out-of-frame (non-unit-length) reads"
+        );
+    }
+
+    #[test]
+    fn g3_impurity_breaks_the_motif_tiling() {
+        // G3 interruptions must yield reads that are NOT a clean motif tiling even at an
+        // in-frame length (a motif-breaking substitution), with ε = 0 so only the
+        // interruption knob can cause it.
+        let chem = SimChemistry {
+            error: PerBaseError(0.0),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 1.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.0, // no slips: isolate the interruption knob
+                slope: 0.0,
+            },
+        };
+        let motif = motif(b"CA");
+        let allele = SimGenotype::homozygous(8, 2);
+        let noise = GenerativeNoise {
+            out_of_frame_rate: 0.0,
+            impurity_rate: 0.5,
+            extra_substitution: 0.0,
+        };
+        let counts = simulate_cell_with(3, &chem, &allele, &motif, 400, &noise);
+        let clean = build_tract(&motif, 8).into_boxed_slice();
+        let impure_reads: u32 = counts
+            .iter()
+            .filter(|(s, _)| **s != *clean && s.len() == clean.len())
+            .map(|(_, c)| *c)
+            .sum();
+        assert!(
+            impure_reads > 0,
+            "G3 impurity must produce interrupted same-length reads"
         );
     }
 
