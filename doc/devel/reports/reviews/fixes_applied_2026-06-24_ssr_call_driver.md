@@ -45,9 +45,9 @@
 | Mi3 | Minor | per-round alloc churn | Defer | — | — | — |
 | Mi4 | Minor | per-locus `f_present` alloc | Defer | — | — | — |
 | Mi5 | Minor | tuple bins primitive obsession | Defer | — | — | — |
-| Mi6 | Minor | bare `#[allow(too_many_arguments)]` | Apply | — | — | — |
+| Mi6 | Minor | bare `#[allow(too_many_arguments)]` | Apply | Applied | driver.rs, em.rs | Pass |
 | Mi7 | Minor | `..Default::default()` in test literals | Apply | — | — | — |
-| Mi8 | Minor | `level_mult`→`level_multiplier` | Apply | — | — | — |
+| Mi8 | Minor | `level_mult`→`level_multiplier` | Apply | Applied | em.rs | Pass |
 | Mi9 | Minor | `FrozenParams.params`→`chemistry` | Apply | — | — | — |
 | Mi10 | Minor | stale "sweep is serial" comment | Apply | — | — | — |
 | Mi11 | Minor | `EmCfg.inbreeding_f` test-only | Apply | — | — | — |
@@ -178,6 +178,24 @@
 - **Verification performed:** new test passes; full `ssr::cohort` suite green.
 - **Files changed:** `src/ssr/cohort/driver.rs` (test only).
 - **Tests added or modified:** `run_emits_a_filtered_locus_with_its_reason` (new).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `148 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None.
+
+### Mi8 — `level_mult` → `level_multiplier` & Mi6 — bare `#[allow(too_many_arguments)]`
+- **Severity:** Minor (both)
+- **Initial decision:** Apply (both)
+- **Final status:** Applied (both)
+- **Reasoning:** Bundled — both are small mechanical em.rs/driver.rs cleanups touching the same `compute_data_ll`/`run_locus_em_with` region (`mult` is a non-standard abbreviation while the spelled form is used everywhere else; the three remaining bare `#[allow]` lacked the project-mandated justification comment — `genotype_locus`'s allow already got one in B1).
+- **Implementation summary:** Mi8 — renamed the `level_mult` local/param/`new_level_mult` to `level_multiplier`/`new_level_multiplier` across `run_locus_em_with`, `compute_data_ll`, and the doc comments (left `refit_level_multiplier`/`level_multiplier_recovers…` untouched). Mi6 — added a one-line justification comment above the `#[allow(clippy::too_many_arguments)]` on `compute_data_ll`, `run_locus_em_with` (em.rs) and `write_genotyped_chunk` (driver.rs).
+- **Review suggestion used verbatim?:** Yes.
+- **Adaptation:** None.
+- **Verification performed:** rename is symbol-local (compiler-checked); `ssr::cohort` suite + clippy green.
+- **Files changed:** `src/ssr/cohort/em.rs`, `src/ssr/cohort/driver.rs`
+- **Tests added or modified:** None.
 - **Validation:**
   - `cargo test --lib --all-features ssr::cohort` → 0, `148 passed`
   - `cargo fmt --check` → 0

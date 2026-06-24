@@ -456,6 +456,9 @@ fn genotype_locus(
 /// and `genotype_locus` is a pure function of its locus + the frozen params, so the
 /// output — and thus the whole VCF — is identical at any thread count. A dropped
 /// (monomorphic PASS) locus is `None` and skipped.
+// The frozen params + the four dev-config structs are threaded explicitly (not bundled) so
+// each per-locus genotyping call stays a pure function of its inputs — the byte-identity
+// contract. Arg count is intentional.
 #[allow(clippy::too_many_arguments)]
 fn write_genotyped_chunk<W: Write>(
     chunk: &[CohortLocus],

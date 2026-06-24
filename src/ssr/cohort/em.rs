@@ -235,6 +235,9 @@ pub(crate) fn run_locus_em(
 
 /// Genotype one locus with an explicit per-sample inbreeding `F` and per-group level
 /// (the E1 outer loop drives these); also emits each sample's posterior homozygosity.
+// The frozen params + dev-config + the per-sample F / per-group level are threaded
+// explicitly (not bundled) so the per-locus call stays a pure function of its inputs — the
+// byte-identity contract. Arg count is intentional.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_locus_em_with(
     locus: &CohortLocus,
@@ -282,14 +285,14 @@ pub(crate) fn run_locus_em_with(
     // both collapse to the frozen priors (no oscillation); each round recomputes the data
     // log-likelihood for the new shape + rate.
     let mut theta = seed.theta0;
-    let mut level_mult = 1.0;
+    let mut level_multiplier = 1.0;
     let mut data_ll = compute_data_ll(
         locus,
         candidates,
         params,
         level_per_group,
         &theta,
-        level_mult,
+        level_multiplier,
         &cand_units,
         &genotypes,
         cfg.lambda,
@@ -303,21 +306,21 @@ pub(crate) fn run_locus_em_with(
     for _ in 0..cfg.refit_max_rounds {
         let fit = attribute_locus(locus, &calls, period, params, level_per_group);
         let new_theta = refine_theta_locus(&fit.profile, &seed.theta0, cfg.theta_shrink);
-        let new_level_mult = refit_level_multiplier(&fit, cfg.level_shrink);
+        let new_level_multiplier = refit_level_multiplier(&fit, cfg.level_shrink);
         if shapes_close(&new_theta, &theta, cfg.theta_tol)
-            && (new_level_mult - level_mult).abs() < cfg.level_tol
+            && (new_level_multiplier - level_multiplier).abs() < cfg.level_tol
         {
             break;
         }
         theta = new_theta;
-        level_mult = new_level_mult;
+        level_multiplier = new_level_multiplier;
         data_ll = compute_data_ll(
             locus,
             candidates,
             params,
             level_per_group,
             &theta,
-            level_mult,
+            level_multiplier,
             &cand_units,
             &genotypes,
             cfg.lambda,
@@ -339,8 +342,11 @@ pub(crate) fn run_locus_em_with(
 }
 
 /// Each sample's per-genotype **data** log-likelihood `data_ll[s][g]` under stutter
-/// shape `theta` and per-locus rate multiplier `level_mult` on the group level (both
+/// shape `theta` and per-locus rate multiplier `level_multiplier` on the group level (both
 /// constant across the π iterations; recomputed when `θ_locus` / the multiplier change).
+// The frozen params + the iterating (theta, level_multiplier) are threaded explicitly so
+// the precompute stays a pure function of its inputs (the byte-identity contract). Arg
+// count is intentional.
 #[allow(clippy::too_many_arguments)]
 fn compute_data_ll(
     locus: &CohortLocus,
@@ -348,7 +354,7 @@ fn compute_data_ll(
     params: &ParamSet,
     level_per_group: &[StutterLevel],
     theta: &StutterShape,
-    level_mult: f64,
+    level_multiplier: f64,
     cand_units: &[u16],
     genotypes: &[Genotype],
     lambda: f64,
@@ -367,7 +373,7 @@ fn compute_data_ll(
                 let row = (0..k)
                     .map(|c| {
                         let lvl = ((level.baseline + level.slope * cand_units[c] as f64)
-                            * level_mult)
+                            * level_multiplier)
                             .clamp(0.0, 1.0);
                         read_likelihood(
                             obs,
@@ -489,9 +495,9 @@ fn final_calls(
     (calls, posterior_hom)
 }
 
-/// The largest per-locus stutter-rate multiplier the refit may return (the `level_mult`
-/// clamp; the resulting per-read level is `[0,1]`-clamped anyway, but this bounds the
-/// multiplier itself against a degenerate `expected ≈ 0` denominator).
+/// The largest per-locus stutter-rate multiplier the refit may return (the
+/// `level_multiplier` clamp; the resulting per-read level is `[0,1]`-clamped anyway, but
+/// this bounds the multiplier itself against a degenerate `expected ≈ 0` denominator).
 const LEVEL_MULT_MAX: f64 = 10.0;
 
 /// The per-locus slip attribution: the sufficient statistics for both per-locus refits
