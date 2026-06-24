@@ -25,7 +25,7 @@ use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em_init::LocusSeed;
 use crate::ssr::cohort::likelihood::{LikelihoodScratch, read_given_genotype, read_likelihood};
 use crate::ssr::cohort::param_estimation::{
-    G0PseudocountDecay, ParamSet, SlipProfile, StutterLevel, StutterShape,
+    DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, SlipProfile, StutterLevel, StutterShape,
 };
 use crate::ssr::cohort::rung_ladder::Rungs;
 use crate::ssr::cohort::stutter::refine_theta_locus;
@@ -137,9 +137,11 @@ fn genotype_prior(g: Genotype, pi: &[f64], f: f64) -> f64 {
     }
 }
 
-/// The `G₀` decay for the locus period (mild default if absent).
+/// The `G₀` decay for the locus period (the shared coded fallback if absent — review M3).
 fn period_decay(params: &ParamSet, period: usize) -> G0PseudocountDecay {
-    const FALLBACK: G0PseudocountDecay = G0PseudocountDecay { p: 0.5 };
+    const FALLBACK: G0PseudocountDecay = G0PseudocountDecay {
+        p: DEFAULT_G0_FALLBACK_P,
+    };
     params
         .pseudocount_decay_per_loci_group
         .get(&(period as u8))

@@ -36,7 +36,7 @@
 | B1 | Blocker | present-order VCF columns | Apply (test-first) | Applied | driver.rs, vcf_out.rs, inbreeding.rs | Pass |
 | M1 | Major | `"?"` contig fallback | Apply | Applied | driver.rs | Pass |
 | M2 | Major | `sample_chemistry` silent defaults | Apply | Applied | em.rs | Pass |
-| M3 | Major | duplicate `G₀` fallback const | Apply | — | — | — |
+| M3 | Major | duplicate `G₀` fallback const | Apply | Applied | param_estimation.rs, em.rs | Pass |
 | M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | — | — | — |
 | M5 | Major | unguarded contig/sample names | Apply (test-first) | — | — | — |
 | M6 | Major | untested filtered-locus emit | Apply (test-only) | — | — | — |
@@ -112,6 +112,24 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** None.
 - **Residual risk:** None — the panic fires only on a broken decision-E invariant, which `build_param_set` rejects upstream.
+
+### M3 — duplicate `G₀` fallback const
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** `em::period_decay`'s `FALLBACK { p: 0.5 }` was an independent copy of `G0FitCfg::fallback_p`'s `0.5`; the driver's backfill doc claims `fallback_p` is "the single fallback source of truth," which the EM literal silently contradicts for any unobserved period. Promoted to one named const.
+- **Implementation summary:** added `pub(crate) const DEFAULT_G0_FALLBACK_P: f64 = 0.5` in `param_estimation.rs`; `G0FitCfg::dev_default` and `em::period_decay`'s `FALLBACK` both reference it. Imported the const in `em.rs`.
+- **Review suggestion used verbatim?:** Yes (the review's named-const form).
+- **Adaptation:** None.
+- **Verification performed:** value unchanged (still `0.5`), so behaviour-identical; `ssr::cohort` suite green.
+- **Files changed:** `src/ssr/cohort/param_estimation.rs`, `src/ssr/cohort/em.rs`
+- **Tests added or modified:** None (pure single-source-of-truth refactor; existing `period_decay`/`G0FitCfg` tests cover the value).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `144 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None.
 
 ## 12. Notes
 

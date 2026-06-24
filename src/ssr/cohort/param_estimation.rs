@@ -94,11 +94,17 @@ pub(crate) struct G0FitCfg {
     pub(crate) min_p: f64,
 }
 
+/// Coded `G₀` decay `p` for a period with no data-driven fit — the single source of truth
+/// for the fallback, shared by [`G0FitCfg::dev_default`]'s `fallback_p` and the genotyping
+/// EM's own last-resort fallback (`em::period_decay`) so recalibrating one moves both
+/// (review M3).
+pub(crate) const DEFAULT_G0_FALLBACK_P: f64 = 0.5;
+
 impl G0FitCfg {
     pub(crate) fn dev_default() -> Self {
         Self {
             min_copies: 30,
-            fallback_p: 0.5,
+            fallback_p: DEFAULT_G0_FALLBACK_P,
             min_p: 0.1,
         }
     }
