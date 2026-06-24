@@ -9,12 +9,13 @@
 //! for this milestone (supplied params), each genotype's **data** log-likelihood is
 //! a one-time precompute and only `π` iterates — so the EM is a few cheap passes.
 //! Bending the SNP engine (chain anchors, class pseudocounts, contamination) would
-//! cost more than it saves. `ε` and the per-group stutter level are frozen by the
-//! burn-in; the **stutter shape adapts per locus** (I1): an inner `θ_locus` M-step
-//! attributes the locus's reads to their called alleles, refits the shape, and shrinks
-//! it toward the frozen `θ_period` seed (so a thin locus stays at the seed — no
-//! oscillation), re-genotyping until `θ_locus` settles. The per-locus stutter *level*
-//! refit is the I2 follow-up.
+//! cost more than it saves. `ε` is frozen by the burn-in; the **stutter shape and rate
+//! adapt per locus** (I1 + I2): an inner M-step attributes the locus's reads to their
+//! called alleles and refits both the shape `θ_locus` (shrunk toward the frozen
+//! `θ_period` seed) and a per-locus rate multiplier on the frozen group level (shrunk
+//! toward 1) — so a thin locus stays at the frozen priors (no oscillation) — re-genotyping
+//! until both settle. The group level keeps the length-dependence; the locus nudges the
+//! overall rate. The soft per-read responsibility split is the deferred refinement.
 //!
 //! v1 is **diploid** (the simulator's ploidy); higher ploidy is a documented
 //! follow-up (the genotype enumeration generalizes, the dosage priors need care).
@@ -49,6 +50,11 @@ pub(crate) struct EmCfg {
     pub(crate) theta_shrink: f64,
     /// Convergence tolerance on the largest `θ_locus` coefficient change between rounds.
     pub(crate) theta_tol: f64,
+    /// Pseudo-count weight (in slipped-read units) shrinking the per-locus stutter-rate
+    /// multiplier toward the group level — the level analogue of `theta_shrink` (I2).
+    pub(crate) level_shrink: f64,
+    /// Convergence tolerance on the per-locus level multiplier between rounds.
+    pub(crate) level_tol: f64,
 }
 
 impl EmCfg {
@@ -61,6 +67,8 @@ impl EmCfg {
             theta_max_rounds: 3,
             theta_shrink: 50.0,
             theta_tol: 1e-3,
+            level_shrink: 20.0,
+            level_tol: 1e-3,
         }
     }
 }
@@ -263,17 +271,21 @@ pub(crate) fn run_locus_em_with(
 
     let mut scratch = LikelihoodScratch::new();
 
-    // θ_locus refinement (I1): genotype under the frozen `θ_period` seed, then refit a
-    // per-locus shape from the called alleles' slips, shrunk toward that seed, and
-    // re-genotype until `θ_locus` settles. With few/no slips it collapses to the seed
-    // (no oscillation); each round's data log-likelihood is recomputed for the new shape.
+    // Per-locus refinement (I1 shape + I2 level): genotype under the frozen `θ_period`
+    // seed and group level, then refit a per-locus shape `θ_locus` (shrunk toward the
+    // seed) and a per-locus stutter-rate multiplier on the group level (shrunk toward 1)
+    // from the called alleles' slips, re-genotyping until both settle. With few / no slips
+    // both collapse to the frozen priors (no oscillation); each round recomputes the data
+    // log-likelihood for the new shape + rate.
     let mut theta = seed.theta0;
+    let mut level_mult = 1.0;
     let mut data_ll = compute_data_ll(
         locus,
         candidates,
         params,
         level_per_group,
         &theta,
+        level_mult,
         &cand_units,
         &genotypes,
         cfg.lambda,
@@ -285,18 +297,23 @@ pub(crate) fn run_locus_em_with(
         final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
 
     for _ in 0..cfg.theta_max_rounds {
-        let profile = attribute_locus_slips(locus, &calls, period);
-        let new_theta = refine_theta_locus(&profile, &seed.theta0, cfg.theta_shrink);
-        if shapes_close(&new_theta, &theta, cfg.theta_tol) {
+        let fit = attribute_locus(locus, &calls, period, params, level_per_group);
+        let new_theta = refine_theta_locus(&fit.profile, &seed.theta0, cfg.theta_shrink);
+        let new_level_mult = refit_level_multiplier(&fit, cfg.level_shrink);
+        if shapes_close(&new_theta, &theta, cfg.theta_tol)
+            && (new_level_mult - level_mult).abs() < cfg.level_tol
+        {
             break;
         }
         theta = new_theta;
+        level_mult = new_level_mult;
         data_ll = compute_data_ll(
             locus,
             candidates,
             params,
             level_per_group,
             &theta,
+            level_mult,
             &cand_units,
             &genotypes,
             cfg.lambda,
@@ -318,7 +335,8 @@ pub(crate) fn run_locus_em_with(
 }
 
 /// Each sample's per-genotype **data** log-likelihood `data_ll[s][g]` under stutter
-/// shape `theta` (constant across the π iterations; recomputed when `θ_locus` changes).
+/// shape `theta` and per-locus rate multiplier `level_mult` on the group level (both
+/// constant across the π iterations; recomputed when `θ_locus` / the multiplier change).
 #[allow(clippy::too_many_arguments)]
 fn compute_data_ll(
     locus: &CohortLocus,
@@ -326,6 +344,7 @@ fn compute_data_ll(
     params: &ParamSet,
     level_per_group: &[StutterLevel],
     theta: &StutterShape,
+    level_mult: f64,
     cand_units: &[u16],
     genotypes: &[Genotype],
     lambda: f64,
@@ -343,8 +362,9 @@ fn compute_data_ll(
             .map(|(obs, count)| {
                 let row = (0..k)
                     .map(|c| {
-                        let lvl =
-                            (level.baseline + level.slope * cand_units[c] as f64).clamp(0.0, 1.0);
+                        let lvl = ((level.baseline + level.slope * cand_units[c] as f64)
+                            * level_mult)
+                            .clamp(0.0, 1.0);
                         read_likelihood(
                             obs,
                             &candidates.alleles[c],
@@ -461,15 +481,42 @@ fn final_calls(
     (calls, posterior_hom)
 }
 
-/// Build the locus's slip profile by hard-attributing each read to its nearest called
-/// allele (the `θ_locus` M-step's sufficient statistic). Integer counts ⇒ the refit is
-/// order-independent. The soft per-read responsibility split is a deferred refinement.
-fn attribute_locus_slips(locus: &CohortLocus, calls: &[SampleCall], period: usize) -> SlipProfile {
-    let mut profile = SlipProfile::default();
+/// The largest per-locus stutter-rate multiplier the refit may return (the `level_mult`
+/// clamp; the resulting per-read level is `[0,1]`-clamped anyway, but this bounds the
+/// multiplier itself against a degenerate `expected ≈ 0` denominator).
+const LEVEL_MULT_MAX: f64 = 10.0;
+
+/// The per-locus slip attribution: the sufficient statistics for both per-locus refits
+/// (I1 shape, I2 level), built by hard-attributing each read to its nearest called allele.
+#[derive(Debug, Default)]
+struct LocusSlipFit {
+    /// Signed slip-magnitude counts → the `θ_locus` shape M-step (I1).
+    profile: SlipProfile,
+    /// Total slipped reads (`Δ ≠ 0`) → the level numerator (I2).
+    slipped: u64,
+    /// Reads expected to slip under the *group* level at their parent length → the level
+    /// denominator (I2): the multiplier is `observed / expected`.
+    expected_slipped: f64,
+}
+
+/// Attribute the locus's reads to their nearest called allele and accumulate the slip
+/// sufficient statistics. Integer slip counts ⇒ the shape refit is order-independent;
+/// the level's float `expected_slipped` is summed in fixed per-locus order, so the whole
+/// per-locus call stays identical on whichever thread runs it. The soft per-read
+/// responsibility split is a deferred refinement.
+fn attribute_locus(
+    locus: &CohortLocus,
+    calls: &[SampleCall],
+    period: usize,
+    params: &ParamSet,
+    level_per_group: &[StutterLevel],
+) -> LocusSlipFit {
+    let mut fit = LocusSlipFit::default();
     for (k_present, call) in calls.iter().enumerate() {
         if call.genotype_units.is_empty() {
             continue; // no-call contributes no slips
         }
+        let (_eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
         for (obs, count) in &locus.samples[k_present].seq_counts {
             let read_units = (obs.len() / period) as i32;
             let parent = *call
@@ -477,10 +524,25 @@ fn attribute_locus_slips(locus: &CohortLocus, calls: &[SampleCall], period: usiz
                 .iter()
                 .min_by_key(|&&u| (u as i32 - read_units).abs())
                 .expect("a non-empty call has ≥1 allele");
-            profile.add_slip(read_units - parent as i32, *count as u64);
+            let c = *count as u64;
+            if read_units != parent as i32 {
+                fit.profile.add_slip(read_units - parent as i32, c);
+                fit.slipped += c;
+            }
+            // The group's predicted slip probability at the parent length, for the rate
+            // multiplier's "expected slips" denominator.
+            let parent_level = (level.baseline + level.slope * parent as f64).clamp(0.0, 1.0);
+            fit.expected_slipped += parent_level * c as f64;
         }
     }
-    profile
+    fit
+}
+
+/// The per-locus stutter-rate multiplier on the group level (I2): `observed / expected`
+/// slips, shrunk toward `1` with pseudo-count `strength`. With few slips (or a thin
+/// locus) it collapses to `1` (the group rate); a genuinely stuttery locus pushes it up.
+fn refit_level_multiplier(fit: &LocusSlipFit, strength: f64) -> f64 {
+    ((fit.slipped as f64 + strength) / (fit.expected_slipped + strength)).clamp(0.0, LEVEL_MULT_MAX)
 }
 
 /// Whether two shapes agree within `tol` on every coefficient (the `θ_locus` stop).
@@ -746,15 +808,18 @@ mod tests {
             posterior: 0.99,
             gq: 40,
         }];
-        let profile = attribute_locus_slips(&locus, &calls, 2);
-        assert_eq!(profile.down[0], 5, "Δ=−1 count");
-        assert_eq!(profile.up[0], 4, "Δ=+1 count");
-        assert_eq!(profile.down[1], 3, "Δ=−2 count");
-        assert_eq!(profile.up[1], 0);
+        let params = clean_params(1);
+        let fit = attribute_locus(&locus, &calls, 2, &params, &params.level_seed);
+        assert_eq!(fit.profile.down[0], 5, "Δ=−1 count");
+        assert_eq!(fit.profile.up[0], 4, "Δ=+1 count");
+        assert_eq!(fit.profile.down[1], 3, "Δ=−2 count");
+        assert_eq!(fit.profile.up[1], 0);
+        // 5 + 4 + 3 = 12 slipped reads; the faithful 8s are not slips.
+        assert_eq!(fit.slipped, 12);
     }
 
     #[test]
-    fn attribute_locus_slips_skips_no_calls() {
+    fn attribute_locus_skips_no_calls() {
         use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
         let mut locus = CohortLocus::new(
             LocusId {
@@ -773,9 +838,40 @@ mod tests {
                 qc: SsrQc::default(),
             },
         );
-        let profile = attribute_locus_slips(&locus, &[SampleCall::no_call()], 2);
-        assert_eq!(profile.down.iter().sum::<u64>(), 0);
-        assert_eq!(profile.up.iter().sum::<u64>(), 0);
+        let params = clean_params(1);
+        let fit = attribute_locus(
+            &locus,
+            &[SampleCall::no_call()],
+            2,
+            &params,
+            &params.level_seed,
+        );
+        assert_eq!(fit.profile.down.iter().sum::<u64>(), 0);
+        assert_eq!(fit.profile.up.iter().sum::<u64>(), 0);
+        assert_eq!(fit.slipped, 0);
+        assert_eq!(fit.expected_slipped, 0.0);
+    }
+
+    #[test]
+    fn refit_level_multiplier_collapses_to_one_without_excess_slips() {
+        // Observed slips equal the group-expected slips ⇒ multiplier 1 (the group rate).
+        let matched = LocusSlipFit {
+            slipped: 10,
+            expected_slipped: 10.0,
+            ..Default::default()
+        };
+        assert!((refit_level_multiplier(&matched, 20.0) - 1.0).abs() < 1e-9);
+        // No data ⇒ also 1 (collapses to the group rate, no oscillation).
+        assert!((refit_level_multiplier(&LocusSlipFit::default(), 20.0) - 1.0).abs() < 1e-9);
+        // A genuinely stuttery locus (more observed than expected) pushes the rate up,
+        // but shrinkage keeps a thin signal modest.
+        let stuttery = LocusSlipFit {
+            slipped: 60,
+            expected_slipped: 20.0,
+            ..Default::default()
+        };
+        let m = refit_level_multiplier(&stuttery, 20.0);
+        assert!(m > 1.0 && m < 3.0, "shrunk multiplier {m}");
     }
 
     #[test]
@@ -789,6 +885,76 @@ mod tests {
         let mut b = a;
         b.decay = 0.25; // a 0.05 change exceeds the tolerance
         assert!(!shapes_close(&a, &b, 1e-3));
+    }
+
+    #[test]
+    fn level_multiplier_recovers_calls_under_an_underestimated_group_level() {
+        // True stutter level 0.22 but the group seed claims a much lower 0.05: the
+        // per-locus rate multiplier must scale the level up and still call the truth.
+        let chem = SimChemistry {
+            error: PerBaseError(0.001),
+            shape: StutterShape {
+                up_rate: 1.0,
+                down_rate: 2.0,
+                decay: 0.1,
+            },
+            level: StutterLevel {
+                baseline: 0.22,
+                slope: 0.0,
+            },
+        };
+        let genos = [
+            SimGenotype::homozygous(8, 2),
+            SimGenotype::homozygous(8, 2),
+            SimGenotype::diploid(6, 10),
+            SimGenotype::homozygous(10, 2),
+            SimGenotype::diploid(6, 10),
+        ];
+        let spec = SimCohortSpec {
+            seed: 4040,
+            loci: vec![SimLocus {
+                chrom: "chr1".into(),
+                start: 40,
+                motif: Motif::new(b"CA").unwrap(),
+                ref_units: 8,
+            }],
+            groups: vec![chem],
+            samples: genos
+                .iter()
+                .enumerate()
+                .map(|(i, g)| SimSample {
+                    name: format!("S{i}"),
+                    group: SampleGroupId(0),
+                    genotypes: vec![Some(g.clone())],
+                })
+                .collect(),
+            depth: 200,
+        };
+        let cohort = crate::ssr::cohort::sim::simulate(&spec);
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        // clean_params keeps the (wrong-for-this-locus) low group level 0.05.
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        let truth = [[8, 8], [8, 8], [6, 10], [10, 10], [6, 10]];
+        for (k, expected) in truth.iter().enumerate() {
+            let mut got = call.calls[k].genotype_units.clone();
+            got.sort_unstable();
+            let mut want = expected.to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "sample {k} under an underestimated group level");
+        }
     }
 
     #[test]
