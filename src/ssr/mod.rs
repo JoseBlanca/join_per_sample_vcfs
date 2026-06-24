@@ -26,3 +26,6 @@ pub mod catalog;
 pub mod cohort;
 pub mod pileup;
 pub mod types;
+
+#[cfg(test)]
+mod end_to_end_tests;
