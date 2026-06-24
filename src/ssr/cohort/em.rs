@@ -42,9 +42,9 @@ pub(crate) struct EmCfg {
     pub(crate) lambda: f64,
     /// Inbreeding coefficient `F` (the autozygous-branch weight); refined in E1.
     pub(crate) inbreeding_f: f64,
-    /// Maximum per-locus `θ_locus` shape-refinement rounds (I1). `0` keeps the frozen
-    /// `θ_period` seed (no per-locus adaptation).
-    pub(crate) theta_max_rounds: usize,
+    /// Maximum per-locus refinement rounds (I1 shape + I2 level). `0` keeps the frozen
+    /// `θ_period` seed shape and group level (no per-locus adaptation).
+    pub(crate) refit_max_rounds: usize,
     /// Pseudo-count weight shrinking `θ_locus` toward the frozen `θ_period` seed — the
     /// anti-oscillation knob: a thin locus cannot overcome it and stays at the seed.
     pub(crate) theta_shrink: f64,
@@ -64,7 +64,7 @@ impl EmCfg {
             tol: 1e-6,
             lambda: 0.01,
             inbreeding_f: 0.0,
-            theta_max_rounds: 3,
+            refit_max_rounds: 3,
             theta_shrink: 50.0,
             theta_tol: 1e-3,
             level_shrink: 20.0,
@@ -296,7 +296,7 @@ pub(crate) fn run_locus_em_with(
     let (mut calls, mut posterior_hom) =
         final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
 
-    for _ in 0..cfg.theta_max_rounds {
+    for _ in 0..cfg.refit_max_rounds {
         let fit = attribute_locus(locus, &calls, period, params, level_per_group);
         let new_theta = refine_theta_locus(&fit.profile, &seed.theta0, cfg.theta_shrink);
         let new_level_mult = refit_level_multiplier(&fit, cfg.level_shrink);
@@ -541,6 +541,12 @@ fn attribute_locus(
 /// The per-locus stutter-rate multiplier on the group level (I2): `observed / expected`
 /// slips, shrunk toward `1` with pseudo-count `strength`. With few slips (or a thin
 /// locus) it collapses to `1` (the group rate); a genuinely stuttery locus pushes it up.
+///
+/// HIERARCHY (no double-count): the per-group stutter level is the prior *mean*,
+/// estimated upstream by the burn-in's `reduce_level` from the called genotypes (not
+/// from this multiplier); `m` is the per-locus *deviation* around it, applied only at
+/// genotyping time. At burn-in convergence loci that match the group have `m ≈ 1`, so
+/// the group level and `m` model the rate once, hierarchically — not twice.
 fn refit_level_multiplier(fit: &LocusSlipFit, strength: f64) -> f64 {
     ((fit.slipped as f64 + strength) / (fit.expected_slipped + strength)).clamp(0.0, LEVEL_MULT_MAX)
 }
@@ -958,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn theta_max_rounds_zero_reproduces_the_seed_shape_result() {
+    fn refit_max_rounds_zero_reproduces_the_seed_shape_result() {
         // With the θ refit disabled the EM is the pre-I1 (frozen-seed-shape) genotyper;
         // it must still call the clean truth — pinning that the refit is purely additive.
         let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
@@ -968,7 +974,7 @@ mod tests {
         let params = clean_params(locus.present.len());
         let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
         let no_refit = EmCfg {
-            theta_max_rounds: 0,
+            refit_max_rounds: 0,
             ..EmCfg::dev_default()
         };
         let call = run_locus_em(&locus, &rungs, &candidates, &params, &seed, 2, &no_refit);
