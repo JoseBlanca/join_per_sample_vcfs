@@ -34,7 +34,7 @@
 | ID | Severity | Title | Initial decision | Final status | Files changed | Validation |
 |---|---|---|---|---|---|---|
 | B1 | Blocker | present-order VCF columns | Apply (test-first) | Applied | driver.rs, vcf_out.rs, inbreeding.rs | Pass |
-| M1 | Major | `"?"` contig fallback | Apply | — | — | — |
+| M1 | Major | `"?"` contig fallback | Apply | Applied | driver.rs | Pass |
 | M2 | Major | `sample_chemistry` silent defaults | Apply | — | — | — |
 | M3 | Major | duplicate `G₀` fallback const | Apply | — | — | — |
 | M4 | Major | `partial_cmp().unwrap()` NaN-argmax | Apply | — | — | — |
@@ -76,6 +76,24 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** None.
 - **Residual risk:** None — `present[k] < n_samples` holds by construction (present indices are cohort sample ids `< n_samples`).
+
+### M1 — `"?"` contig fallback
+- **Severity:** Major
+- **Initial decision:** Apply
+- **Final status:** Applied
+- **Reasoning:** The silent `"?"` fallback masked a merger-invariant break with a structurally-valid-but-wrong VCF row. The merger hard-errors `UnknownCatalogChrom` upstream so the id is always in range — making this a "cannot happen" path; the crate convention for broken internal invariants is a loud panic (cf. the ploidy `assert_eq!`). Chose panic over threading a `Result` to keep the change minimal and `genotype_locus`'s `Option` shape (the emit/drop signal) intact.
+- **Implementation summary:** replaced `.unwrap_or("?")` with `.unwrap_or_else(|| panic!(...))` naming the bad `chrom_id` and the table size, with a `// PANIC-FREE:` comment citing the merger guarantee.
+- **Review suggestion used verbatim?:** Yes (the review's minimal panic form).
+- **Adaptation:** None.
+- **Verification performed:** `ssr::cohort` suite green; no test constructs an out-of-range `chrom_id`, so the panic path is not exercised (it is provably unreachable given the merger contract).
+- **Files changed:** `src/ssr/cohort/driver.rs`
+- **Tests added or modified:** None (unreachable-by-contract path; a test would need a deliberately corrupt `CohortLocus` the merger cannot produce).
+- **Validation:**
+  - `cargo test --lib --all-features ssr::cohort` → 0, `143 passed`
+  - `cargo fmt --check` → 0
+  - `cargo clippy --lib --all-features -- -D warnings` → 0
+- **Follow-up:** None.
+- **Residual risk:** None.
 
 ## 12. Notes
 

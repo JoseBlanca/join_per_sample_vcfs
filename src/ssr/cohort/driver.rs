@@ -364,10 +364,22 @@ fn genotype_locus(
         return None;
     }
     let qual = site_qual(&call, &candidates, fp_cfg);
+    // PANIC-FREE: every emitted locus carries a chrom_id the merger resolved from the
+    // cohort chromosome table (merge.rs hard-errors `UnknownCatalogChrom` otherwise), so
+    // this indexes in range. Fail loud rather than emit a placeholder `"?"` contig — an
+    // out-of-range id is a merger-invariant break, and a `"?"` CHROM is a silently corrupt
+    // VCF (no `##contig`) that downstream tooling would accept (review M1).
     let chrom = chrom_names
         .get(locus.locus.chrom_id as usize)
         .map(String::as_str)
-        .unwrap_or("?");
+        .unwrap_or_else(|| {
+            panic!(
+                "locus chrom_id {} is out of range of the {}-chromosome cohort table \
+                 (merger invariant broken)",
+                locus.locus.chrom_id,
+                chrom_names.len(),
+            )
+        });
     Some(format_vcf_record(
         chrom,
         locus,
