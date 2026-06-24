@@ -9,7 +9,7 @@ You are scanning Rust code for performance-improvement candidates. You are **not
 
 This work has a hostile prior: most "obvious" optimizations either do not matter (cold code), do not help (the compiler already handles it), or trade real complexity for an imagined win. Be skeptical. Each candidate must answer: where on the call graph does this run? what would we measure? how much complexity does the fix add?
 
-The review is split across focused per-category checklists in `ia/skills/performance_review/`. **You are the orchestrator**: you triage which categories apply to the scope, dispatch one sub-agent per category in parallel, then synthesize their findings into a single report. Per-category rules are not duplicated in this file — read each category file when dispatching the corresponding sub-agent.
+The review is split across focused per-category checklists in `ai/skills/rust-performance-review/performance_review/`. **You are the orchestrator**: you triage which categories apply to the scope, dispatch one sub-agent per category in parallel, then synthesize their findings into a single report. Per-category rules are not duplicated in this file — read each category file when dispatching the corresponding sub-agent.
 
 ## Review principles (must always hold)
 
@@ -20,7 +20,7 @@ The review is split across focused per-category checklists in `ia/skills/perform
 - **Correctness first.** Never recommend an optimization that weakens invariants, introduces `unsafe`, or relaxes atomic ordering without a separate, justified safety review. Performance findings that touch correctness boundaries are flagged as such and held to the evidence bar of a correctness review.
 - **One change per measurement.** Bundling allocator switch + LTO + a code refactor in the same PR produces an unreadable result. Each PR names the single hypothesis being tested.
 
-The severity rubric and per-finding format are defined in `ia/skills/performance_review/_finding_format.md`. Read it once at the start of every review — both you (for synthesis) and every sub-agent you dispatch will follow it.
+The severity rubric and per-finding format are defined in `ai/skills/rust-performance-review/performance_review/_finding_format.md`. Read it once at the start of every review — both you (for synthesis) and every sub-agent you dispatch will follow it.
 
 ## Review procedure
 
@@ -126,7 +126,7 @@ Write a one-paragraph "performance intent" summary; it is passed into each sub-a
 
 ### 4. Triage categories
 
-Decide which per-category checklists apply. Each lives at `ia/skills/performance_review/<category>.md`.
+Decide which per-category checklists apply. Each lives at `ai/skills/rust-performance-review/performance_review/<category>.md`.
 
 | Category | Apply when |
 |---|---|
@@ -156,8 +156,8 @@ For each selected category, dispatch a `general-purpose` sub-agent **in parallel
 > **Out of scope:** <list, with reasons>
 >
 > **Instructions:**
-> 1. Read `ia/skills/performance_review/<category>.md` for the rules to apply.
-> 2. Read `ia/skills/performance_review/_finding_format.md` for the severity rubric and finding format.
+> 1. Read `ai/skills/rust-performance-review/performance_review/<category>.md` for the rules to apply.
+> 2. Read `ai/skills/rust-performance-review/performance_review/_finding_format.md` for the severity rubric and finding format.
 > 3. Read each in-scope file.
 > 4. Apply each rule and produce findings in the specified format. For every candidate, propose the **measurement plan** (benchmark or profile that confirms the gain) and the **complexity cost** of the fix. Findings without a measurement plan are downgraded.
 > 5. Write findings to `tmp/perf_review_<date>_<slug>/<category>.md`. If no findings apply, write only the line `No findings.`
@@ -206,7 +206,7 @@ The benchmarks and profiles to add or run, in the order they unblock other findi
 LTO, codegen-units, panic, opt-level, debug, allocator, target-cpu — anything in `Cargo.toml` or `.cargo/config.toml` that should change before code-level work. Driven by the `methodology` sub-agent's findings.
 
 ### 5. Code-level findings
-Grouped by severity (**Hot-path** → **Likely** → **Speculative** → **Note**). Within each severity, ordered by confidence (High → Low), then by file. Each finding follows the format defined in `ia/skills/performance_review/_finding_format.md`, with the severity code (H1, L1, …) prepended to the title — e.g. `H1: src/parser.rs:42 — Title`.
+Grouped by severity (**Hot-path** → **Likely** → **Speculative** → **Note**). Within each severity, ordered by confidence (High → Low), then by file. Each finding follows the format defined in `ai/skills/rust-performance-review/performance_review/_finding_format.md`, with the severity code (H1, L1, …) prepended to the title — e.g. `H1: src/parser.rs:42 — Title`.
 
 ### 6. Out-of-scope observations
 Performance smells in untouched code, surfaced but not blocking. Each: file, brief description, suggested follow-up (separate PR or issue).

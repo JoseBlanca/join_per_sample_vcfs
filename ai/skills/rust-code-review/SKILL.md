@@ -7,7 +7,7 @@ description: Use this skill whenever the user asks for a code review, audit, cri
 
 You are performing a professional, uncompromising code review of Rust code. Quality is the highest priority — be precise, specific, and direct. Vague praise is forbidden; every comment must point to a concrete location and propose a concrete change.
 
-The review is split across focused per-category checklists in `ia/skills/code_review/`. **You are the orchestrator**: you triage which categories apply to the scope, dispatch one sub-agent per category in parallel, then synthesize their findings into a single report. Per-category rules are not duplicated in this file — read each category file when dispatching the corresponding sub-agent.
+The review is split across focused per-category checklists in `ai/skills/rust-code-review/code_review/`. **You are the orchestrator**: you triage which categories apply to the scope, dispatch one sub-agent per category in parallel, then synthesize their findings into a single report. Per-category rules are not duplicated in this file — read each category file when dispatching the corresponding sub-agent.
 
 ## Review principles (must always hold)
 
@@ -17,7 +17,7 @@ The review is split across focused per-category checklists in `ia/skills/code_re
 - **Actionability.** Every non-trivial finding must include a concrete fix (diff/snippet, test, or refactor step), or — if the right fix depends on intent the reviewer cannot infer — a specific question whose answer would determine the fix.
 - **Scope discipline.** Review what was asked. For a diff or PR, focus on changed lines and their direct callers/callees; flag pre-existing issues in untouched code separately under "Out of scope observations". Exception: pre-existing Blocker-severity issues (security, data loss, undefined behavior) are raised under Findings regardless of scope.
 
-The severity rubric and per-finding format are defined in `ia/skills/code_review/_finding_format.md`. Read it once at the start of every review — both you (for synthesis) and every sub-agent you dispatch will follow it.
+The severity rubric and per-finding format are defined in `ai/skills/rust-code-review/code_review/_finding_format.md`. Read it once at the start of every review — both you (for synthesis) and every sub-agent you dispatch will follow it.
 
 ## Review procedure
 
@@ -55,7 +55,7 @@ Write a one-paragraph "domain intent" summary; it is passed into each sub-agent'
 
 ### 5. Triage categories
 
-Decide which per-category checklists apply. Each lives at `ia/skills/code_review/<category>.md`.
+Decide which per-category checklists apply. Each lives at `ai/skills/rust-code-review/code_review/<category>.md`.
 
 | Category | Apply when |
 |---|---|
@@ -90,8 +90,8 @@ For each selected category, dispatch a `general-purpose` sub-agent **in parallel
 > **Verification command output:** <verbatim quotes from step 3, or "not run, because …">
 >
 > **Instructions:**
-> 1. Read `ia/skills/code_review/<category>.md` for the rules to apply.
-> 2. Read `ia/skills/code_review/_finding_format.md` for the severity rubric and finding format.
+> 1. Read `ai/skills/rust-code-review/code_review/<category>.md` for the rules to apply.
+> 2. Read `ai/skills/rust-code-review/code_review/_finding_format.md` for the severity rubric and finding format.
 > 3. Read each in-scope file.
 > 4. Apply each rule and produce findings in the specified format.
 > 5. Write findings to `tmp/review_<date>_<slug>/<category>.md`. If no findings apply, write only the line `No findings.`
@@ -156,7 +156,7 @@ Numbered. Each entry references the findings it affects. The author resolves the
 The highest-impact fixes, with one-line rationale and pointer to the full finding.
 
 ### 6. Findings
-Grouped by severity (**Blocker** → **Major** → **Minor** → **Nits**). Within each severity, ordered by confidence (High → Low), then by file. Nits collected into a single sub-section, not enumerated. Each finding follows the format defined in `ia/skills/code_review/_finding_format.md`, with the severity code (B1, M1, …) prepended to the title — e.g. `B1: src/parser.rs:42 — Title`.
+Grouped by severity (**Blocker** → **Major** → **Minor** → **Nits**). Within each severity, ordered by confidence (High → Low), then by file. Nits collected into a single sub-section, not enumerated. Each finding follows the format defined in `ai/skills/rust-code-review/code_review/_finding_format.md`, with the severity code (B1, M1, …) prepended to the title — e.g. `B1: src/parser.rs:42 — Title`.
 
 ### 7. Out of scope observations
 Pre-existing issues in untouched code, surfaced but not blocking. Each: file, brief description, suggested follow-up (separate PR or issue). Pre-existing Blocker-severity issues (security, data loss, UB) appear under Findings instead, marked "pre-existing".
