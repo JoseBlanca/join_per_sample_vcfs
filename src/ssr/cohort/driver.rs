@@ -46,11 +46,15 @@ pub(crate) struct SsrCallConfig {
     /// Where the cohort VCF is written.
     pub(crate) output: PathBuf,
     /// Thread count for the rayon pool the burn-in and the chunk-parallel genotyping
-    /// sweep run on. Output is byte-identical regardless of the count.
+    /// sweep run on. Output is byte-identical regardless of the count. `0` is coerced to a
+    /// single-threaded pool (`threads.max(1)`), so a zero from a CLI default runs serially
+    /// rather than erroring (review Mi12).
     pub(crate) threads: usize,
     /// Loci per parallel sweep chunk — the bounded-resident-loci knob *and* the
     /// genotyping parallelism granularity (Milestone J). Larger = more memory + better
-    /// parallelism; the CLI should default it generously (e.g. ~1024).
+    /// parallelism; the CLI should default it generously (e.g. ~1024). `0` is the
+    /// "unset" sentinel and is replaced by [`DEFAULT_SWEEP_CHUNK`]; output is
+    /// chunk-size-invariant either way (review Mi12).
     pub(crate) queue_depth: usize,
 }
 
@@ -756,7 +760,8 @@ mod tests {
 
     #[test]
     fn run_is_byte_identical_across_thread_counts() {
-        // The burn-in is byte-identical across threads and the sweep is serial, so the
+        // The burn-in reduces and the chunk-parallel sweep's order-preserving `par_iter`
+        // collect (over a pure per-locus map) are both byte-identical across threads, so the
         // whole VCF must be identical at any thread count (the headline property, e2e).
         let dir = tempfile::TempDir::new().unwrap();
         let mut owned: Vec<(String, Vec<Vec<u16>>)> = (0..6)

@@ -46,15 +46,15 @@
 | Mi4 | Minor | per-locus `f_present` alloc | Defer | — | — | — |
 | Mi5 | Minor | tuple bins primitive obsession | Defer | — | — | — |
 | Mi6 | Minor | bare `#[allow(too_many_arguments)]` | Apply | Applied | driver.rs, em.rs | Pass |
-| Mi7 | Minor | `..Default::default()` in test literals | Apply | — | — | — |
+| Mi7 | Minor | `..Default::default()` in test literals | Apply | Applied | em.rs (test) | Pass |
 | Mi8 | Minor | `level_mult`→`level_multiplier` | Apply | Applied | em.rs | Pass |
 | Mi9 | Minor | `FrozenParams.params`→`chemistry` | Apply | Applied | driver.rs | Pass |
-| Mi10 | Minor | stale "sweep is serial" comment | Apply | — | — | — |
-| Mi11 | Minor | `EmCfg.inbreeding_f` test-only | Apply | — | — | — |
-| Mi12 | Minor | unsurfaced threads/queue_depth coercion | Apply | — | — | — |
+| Mi10 | Minor | stale "sweep is serial" comment | Apply | Applied | driver.rs (test comment) | Pass |
+| Mi11 | Minor | `EmCfg.inbreeding_f` test-only | Apply | Applied | em.rs (doc) | Pass |
+| Mi12 | Minor | unsurfaced threads/queue_depth coercion | Apply | Applied | driver.rs (doc) | Pass |
 | Mi13 | Minor | `from_utf8_lossy` alleles | Defer | — | — | — |
 | Mi14 | Minor | `QUAL=.` for variable-but-zero locus | Defer | — | — | — |
-| Mi15 | Minor | refit non-convergence untested | Apply (test-only) | — | — | — |
+| Mi15 | Minor | refit non-convergence untested | Apply (test-only) | Applied | em.rs (test) | Pass |
 | Mi16 | Minor | once-per-run `level_per_group.clone()` | Defer | — | — | — |
 
 ## 4. Per-finding log
@@ -220,6 +220,38 @@
   - `cargo clippy --lib --all-features -- -D warnings` → 0
 - **Follow-up:** None.
 - **Residual risk:** None.
+
+### Mi7 — `..Default::default()` in `LocusSlipFit` test literals
+- **Severity:** Minor — **Final status:** Applied
+- **Reasoning/implementation:** the two `refit_level_multiplier_collapses_to_one…` literals used `..Default::default()`, which would silently test a future `LocusSlipFit` field at its default; spelled `profile: SlipProfile::default()` explicitly (zero behaviour change, makes a future field a compile error).
+- **Files changed:** `src/ssr/cohort/em.rs` (test). **Tests:** existing test edited.
+- **Validation:** `cargo test --lib ssr::cohort` → `149 passed`; fmt/clippy 0.
+
+### Mi10 — stale "sweep is serial" comment
+- **Severity:** Minor — **Final status:** Applied
+- **Reasoning/implementation:** the `run_is_byte_identical_across_thread_counts` comment said "the sweep is serial"; post-J it is chunk-parallel. Reworded to describe the order-preserving `par_iter` collect over a pure per-locus map.
+- **Files changed:** `src/ssr/cohort/driver.rs` (test comment). **Tests:** none.
+- **Validation:** as above.
+
+### Mi11 — `EmCfg.inbreeding_f` is test-wrapper-only
+- **Severity:** Minor — **Final status:** Applied
+- **Reasoning/implementation:** documented on the field that it seeds only the `run_locus_em` convenience wrapper; the production `run_locus_em_with` path takes explicit per-sample `F` and never reads it (a latent misuse trap, now flagged in the doc).
+- **Files changed:** `src/ssr/cohort/em.rs` (doc). **Tests:** none.
+- **Validation:** as above.
+
+### Mi12 — unsurfaced `threads`/`queue_depth` coercions
+- **Severity:** Minor — **Final status:** Applied
+- **Reasoning/implementation:** documented on the `SsrCallConfig` fields that `threads == 0` is coerced to a single-threaded pool and `queue_depth == 0` is the unset sentinel replaced by `DEFAULT_SWEEP_CHUNK` (output is chunk-size-invariant). Doc-only; no runtime logging added (kept minimal — the values are visible at the call site and in the docs).
+- **Files changed:** `src/ssr/cohort/driver.rs` (doc). **Tests:** none.
+- **Validation:** as above.
+
+### Mi15 — refit non-convergence untested
+- **Severity:** Minor — **Final status:** Applied
+- **Reasoning/implementation:** added `capped_refit_returns_calls_consistent_with_the_final_round` — `refit_max_rounds: 1` recovers the truth at high depth and agrees with the converged (`refit_max_rounds: 3`) genotypes, pinning that a capped/non-converged run returns the last-round-recomputed calls, never stale pre-loop calls.
+- **Files changed:** `src/ssr/cohort/em.rs` (test). **Tests:** `capped_refit_returns_calls_consistent_with_the_final_round` (new).
+- **Validation:** `cargo test --lib ssr::cohort` → `149 passed`; fmt/clippy/doc 0.
+
+*Commit grouping note:* Mi7/Mi11/Mi15 all live in `em.rs` and Mi10/Mi12 in `driver.rs`; since interactive `git add -p` is unavailable to split a single file across commits, the `em.rs` trivials share one commit and the `driver.rs` trivials another. Each finding is logged separately above.
 
 ## 12. Notes
 
