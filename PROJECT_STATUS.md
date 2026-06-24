@@ -36,18 +36,20 @@ Skills and agents are instructed to leave it untouched.
 >   ([review](doc/devel/reports/reviews/ssr_call_streaming_driver_2026-06-23.md),
 >   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_streaming_driver.md)).
 >   fmt/clippy `-D warnings` clean; 1271 lib tests. See the SSR Stage 2 **Driver wiring** block below.
-> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step I2 (per-locus stutter-rate refit) — Milestone I complete**
->   (branch `ssr-cohort`, impl `fd53330`). The per-locus refit loop now adapts the stutter
->   **rate** as well as the shape (I1): from the same slip attribution it fits a per-locus
->   rate multiplier on the frozen group level (`observed/expected` slips, shrunk toward 1),
->   so the group line keeps the length-dependence and the locus nudges the overall rate —
->   the HipSTR-style adaptation with a cohort-pooled anchor. Local per locus ⇒ the sweep
->   stays single-pass + byte-identical; the cohort `reduce_level` is unaffected (hierarchy,
->   no double-count). Reviewed (Approve-with-changes; 0 Blocker/Major, 2 Minor) + fixes applied
->   ([review](doc/devel/reports/reviews/ssr_call_level_refit_2026-06-24.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_level_refit.md); `refit_max_rounds`
->   rename + hierarchy doc). 1278 lib tests; fmt/clippy clean.
->   **Next (loop):** Step J (parallel genotyping sweep + byte-identity — the bounded-queue worker pool; the last milestone). Real-data calibration is the separate downstream effort.
+> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step J (chunk-parallel sweep) — the `ssr-call` plan (G→H→I→J) is COMPLETE**
+>   (branch `ssr-cohort`, impl `8d7e4d2`). The Pass-2 genotyping sweep is now chunk-parallel:
+>   bounded chunks of loci are genotyped on the `--threads` pool via an order-preserving
+>   `par_iter` and written in catalog order — **byte-identical across thread counts** (each
+>   locus is a pure function of its reads + the frozen params; no `seq`-reorder needed).
+>   `config.queue_depth` is the chunk size (resident-loci + parallelism knob). Chosen as a
+>   simpler realization of the reading-layer producer/worker/writer topology (arch §4
+>   J-realization note; the full overlapping channel pipeline is a measure-first follow-up).
+>   Reviewed (Approve-with-changes; 0 Blocker/Major, 2 Minor) + fixes applied
+>   ([review](doc/devel/reports/reviews/ssr_call_parallel_sweep_2026-06-24.md),
+>   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_parallel_sweep.md);
+>   `queue_depth=0` default + arch note). 1280 lib tests; fmt/clippy clean. `ssr-call` now
+>   produces a real VCF and scales with `--threads`. See the SSR Stage 2 **Driver wiring** block.
+>   **Next:** real-data calibration of the provisional `dev_default` constants (the separate downstream effort), plus the recorded measure-first follow-ups.
 > - **Prior task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step I1 (per-locus `θ_locus` shape refit)**
 >   (branch `ssr-cohort`, impl `46df902`). The genotype EM adapts the stutter **shape** per
 >   locus: genotype under the frozen `θ_period` seed → attribute reads → `refine_theta_locus`
@@ -1057,7 +1059,8 @@ type model are settled; built in data-flow order (types → Stage 0 → Stage 1/
 - **Step H4 (streaming driver → VCF) — TASK DoD MET:** implemented `d17f524`, [review](doc/devel/reports/reviews/ssr_call_streaming_driver_2026-06-23.md) (Approve-with-changes: 0 Blocker/Major, 3 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_streaming_driver.md) (Mi2 cross-thread-determinism test + Mi1/Mi3 doc notes Applied; filtered-record e2e + representative subset deferred to calibration). `driver::run` is now the two-pass streaming pipeline: burn-in (bounded subset → freeze chemistry+`F`+level on a `config.threads` pool) → genotyping sweep (re-open, stream, `run_locus_em_with(frozen)`, emit policy) → VCF. Sample-name uniqueness (H2-Mi1) enforced; H1-Mi1 boundary accepted; ploidy 2 (D). Integration test drives real `run()` over an on-disk cohort → PASS variant + monomorphic drop + decision-E hard error; VCF byte-identical across thread counts. TSV `write_dump` path removed. 1271 lib tests; fmt/clippy clean.
 - **Step I1 (per-locus `θ_locus` shape refit):** implemented `46df902`, [review](doc/devel/reports/reviews/ssr_call_theta_locus_2026-06-24.md) (Approve-with-changes: 0 Blocker/Major, 2 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_theta_locus.md) (Mi1 shared `add_slip` + pin test Applied; Mi2 π warm-start deferred). The genotype EM now adapts the stutter **shape** per locus: `run_locus_em_with` wraps the π-EM in a `θ_locus` loop (genotype under the frozen `θ_period` seed → attribute reads to called alleles → `refine_theta_locus` shrunk toward the seed → re-genotype until settled), local so the sweep stays single-pass + byte-identical. `EmCfg` gains `theta_max_rounds`/`theta_shrink`/`theta_tol`. 1276 lib tests; fmt/clippy clean.
 - **Step I2 (per-locus stutter-rate refit):** implemented `fd53330`, [review](doc/devel/reports/reviews/ssr_call_level_refit_2026-06-24.md) (Approve-with-changes: 0 Blocker/Major, 2 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_level_refit.md) (Mi1 rename `refit_max_rounds` + Mi2 hierarchy doc Applied). The per-locus refit loop now adapts the stutter **rate** too: `attribute_locus` → `LocusSlipFit` (slip profile + observed/expected slips); `refit_level_multiplier` = `(slipped+strength)/(expected+strength)` shrunk toward 1, applied as a multiplier on the frozen group level (group keeps the length-dependence, locus nudges the rate). `EmCfg` gains `level_shrink`/`level_tol`; `theta_max_rounds`→`refit_max_rounds`. 1278 lib tests; fmt/clippy clean. **Milestone I (Step 2 per-locus stutter adaptation) complete.**
-- **Open:** Step **J** (parallel sweep + byte-identity) unstarted. Calibration carry-overs: H4-Mi1 representative burn-in subset selection (positional first-cap biases chemistry **and** couples to the decision-E check); H1-Mi1 `G₀` backfill universe; filtered-record e2e test; I1-Mi2 π warm-start across refit rounds (→ J throughput); the soft per-read responsibility split (I1/I2 use hard-label attribution); all `dev_default` constants incl. `BURN_IN_MAX_LOCI` + the `theta_*`/`level_*`.
+- **Step J (chunk-parallel sweep):** implemented `8d7e4d2`, [review](doc/devel/reports/reviews/ssr_call_parallel_sweep_2026-06-24.md) (Approve-with-changes: 0 Blocker/Major, 2 Minor) + [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_parallel_sweep.md) (Mi1 `DEFAULT_SWEEP_CHUNK` when `queue_depth=0` + test; Mi2 arch-doc realization note Applied). The Pass-2 genotyping sweep is now chunk-parallel: bounded chunks genotyped on the `--threads` pool via order-preserving `par_iter`, written in catalog order — byte-identical across thread counts (multi-chunk + 1-locus determinism tests), no `seq`-reorder needed (chosen realization over the full channel pipeline; arch §4 J-realization note). `config.queue_depth` = chunk size. 1280 lib tests; fmt/clippy clean. **Milestone J complete → the `ssr-call` plan (G→H→I→J) is DONE.**
+- **Open:** none in the plan. Real-data calibration is the separate downstream effort. Calibration / measure-first carry-overs: H4-Mi1 representative burn-in subset selection (positional first-cap biases chemistry **and** couples to decision-E); H1-Mi1 `G₀` backfill universe; filtered-record e2e test; I1-Mi2 π warm-start across refit rounds; the soft per-read responsibility split (I1/I2 use hard-label attribution); the fully-overlapping channel pipeline (vs chunking); all `dev_default` constants (`BURN_IN_MAX_LOCI`, `DEFAULT_SWEEP_CHUNK`, `theta_*`, `level_*`).
 
 #### Reading & merge layer (Phases 0–3 done; `ssr-call` runnable; review applied)
 - **Status:** fixes-applied (2026-06-21, branch `ssr-cohort`). Phases 0 (scaffolding) + 1 (cursor) + 2 (merger) + 3 (driver — single-threaded, `ssr-call` runs end-to-end → catalog-ordered TSV dump). Two-pass / prefetch-pool + the genotyping EM/VCF to follow.

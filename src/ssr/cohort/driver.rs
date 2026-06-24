@@ -44,8 +44,8 @@ pub(crate) struct SsrCallConfig {
     pub(crate) psp_files: Vec<PathBuf>,
     /// Where the cohort VCF is written.
     pub(crate) output: PathBuf,
-    /// Thread count for the parallel, byte-identical burn-in (the genotyping sweep is
-    /// single-threaded until Milestone J).
+    /// Thread count for the rayon pool the burn-in and the chunk-parallel genotyping
+    /// sweep run on. Output is byte-identical regardless of the count.
     pub(crate) threads: usize,
     /// Loci per parallel sweep chunk — the bounded-resident-loci knob *and* the
     /// genotyping parallelism granularity (Milestone J). Larger = more memory + better
@@ -152,6 +152,11 @@ pub(crate) fn build_param_set(
 /// Diploid is the only supported ploidy (decision D); `run_locus_em` asserts it.
 const PLOIDY: u8 = 2;
 
+/// Loci per genotyping-sweep chunk when `config.queue_depth` is unset (`0`). A generous
+/// default keeps the parallel sweep from collapsing to one-locus (≈ serial) chunks; an
+/// explicit `queue_depth` is honoured as-is (review Mi1).
+const DEFAULT_SWEEP_CHUNK: usize = 1024;
+
 /// Cap on the number of loci the burn-in holds in RAM to estimate and freeze the
 /// cross-locus-pooled parameters (arch §4). The genotyping sweep streams *all* loci
 /// regardless; only the burn-in is bounded. Loci are taken in catalog-stream order until
@@ -238,7 +243,11 @@ pub(crate) fn run(config: &SsrCallConfig) -> Result<(), SsrCallError> {
     // byte-identical across thread counts; chunking keeps peak memory bounded.
     let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
     let mut out = BufWriter::new(File::create(&config.output)?);
-    let chunk_size = config.queue_depth.max(1);
+    let chunk_size = if config.queue_depth == 0 {
+        DEFAULT_SWEEP_CHUNK
+    } else {
+        config.queue_depth
+    };
     pool.install(|| -> Result<(), SsrCallError> {
         write_vcf_header(&mut out, &chromosomes, &sample_names, &warnings)?;
         let mut chunk: Vec<CohortLocus> = Vec::with_capacity(chunk_size);
@@ -589,6 +598,29 @@ mod tests {
             .map(|l| l.split('\t').nth(1).unwrap().parse().unwrap())
             .collect();
         assert_eq!(positions, vec![41, 101, 161, 221]);
+    }
+
+    #[test]
+    fn sweep_output_is_independent_of_chunk_size() {
+        // queue_depth 0 (→ the default chunk) and 1 (one locus per chunk) must give the
+        // same VCF — the chunking only affects parallelism/memory, never the output.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut owned: Vec<(String, Vec<Vec<u16>>)> = (0..6)
+            .map(|i| (format!("hom{i}"), vec![vec![8u16]; 3]))
+            .collect();
+        owned.extend((0..6).map(|i| (format!("het{i}"), vec![vec![6u16, 10]; 3])));
+        let samples: Vec<(&str, Vec<Vec<u16>>)> =
+            owned.iter().map(|(n, g)| (n.as_str(), g.clone())).collect();
+        let loci = [(40, 8), (100, 8), (160, 8)];
+
+        let run_with = |queue_depth: usize, out_name: &str| {
+            let mut config = write_cohort(dir.path(), &loci, &samples);
+            config.queue_depth = queue_depth;
+            config.output = dir.path().join(out_name);
+            run(&config).unwrap();
+            std::fs::read_to_string(&config.output).unwrap()
+        };
+        assert_eq!(run_with(0, "default.vcf"), run_with(1, "one.vcf"));
     }
 
     #[test]

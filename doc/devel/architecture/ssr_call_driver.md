@@ -200,6 +200,19 @@ writer topology; the pre-pass is a separate, earlier consumer of the same merger
 reads a **bounded subset**; genotyping streams all loci at ≈ N × lockstep blocks
 resident (`--block-window-bp` + queue depth are the RSS knobs).
 
+> **J realization (settled 2026-06-24): chunk-parallel `par_iter`, not the channel
+> pipeline.** Milestone J achieves the topology's guarantees — parallel, bounded,
+> ordered, byte-identical — with far less machinery: the sweep accumulates a bounded
+> chunk of loci, genotypes it on the `--threads` pool with an **order-preserving
+> `par_iter`** (so `lines[i]` stays aligned to `chunk[i]`), and writes the chunk in
+> catalog order; `config.queue_depth` is the chunk size. Because the chunk is index-
+> ordered there is **no `seq`-reorder** to do (the reorder-by-seq writer is only needed
+> when workers finish out of order, which they can't here). Trade-off vs the full
+> producer/worker/writer channel pipeline: chunking reads a chunk *then* processes it, so
+> it does not overlap the merger read with genotyping — a small serialization, dwarfed by
+> the per-locus EM at any reasonable chunk size. The fully-overlapping channel pipeline
+> is a **measure-first** follow-up, not built.
+
 ---
 
 ## 5. The VCF header + writer (decision C)
