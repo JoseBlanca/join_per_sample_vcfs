@@ -59,6 +59,8 @@ super::kind::column_key! {
         MappedReads = 0x06,
         NLowQuality = 0x07,
         NBorderOffEnd = 0x08,
+        NWidened = 0x09,
+        NWindowTruncated = 0x0A,
         ObsCount = 0x10,
         ObsSeqLen = 0x11,
         ObsSeq = 0x12,
@@ -163,6 +165,30 @@ pub const SSR_COLUMNS: &[ColumnDef] = &[
             >= read length).",
     },
     ColumnDef {
+        tag: 0x09,
+        name: "n-widened",
+        cardinality: Cardinality::PerRecord,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
+        required: true,
+        finite_constraint: false,
+        description: "Reads whose long allele was recovered by re-delimiting in a \
+            flank-widened window (a mapper-misalignment QC signal; kept in observed).",
+    },
+    ColumnDef {
+        tag: 0x0A,
+        name: "n-window-truncated",
+        cardinality: Cardinality::PerRecord,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::U32,
+        },
+        required: true,
+        finite_constraint: false,
+        description: "Reads dropped because the allele stayed flank-truncated even \
+            after widening (allele longer than the read / safe margin; not in observed).",
+    },
+    ColumnDef {
         tag: 0x10,
         name: "obs-count",
         cardinality: Cardinality::PerAllele,
@@ -215,6 +241,12 @@ pub struct SsrLocusRecord {
     pub mapped_reads: u32,
     pub n_low_quality: u32,
     pub n_border_off_end: u32,
+    /// Reads whose long allele was recovered by widening the realignment window
+    /// (kept in `observed`).
+    pub n_widened: u32,
+    /// Reads dropped because the allele stayed flank-truncated even after widening
+    /// (kept out of `observed`).
+    pub n_window_truncated: u32,
     /// Distinct observed repeat-region sequences → observation count, ascending
     /// by bytes.
     pub observed: Vec<(Box<[u8]>, u32)>,
@@ -254,6 +286,8 @@ impl PspKind for SsrKind {
             SsrColumnKey::MappedReads => encode_scalar_column(&block.mapped_reads, out),
             SsrColumnKey::NLowQuality => encode_scalar_column(&block.n_low_quality, out),
             SsrColumnKey::NBorderOffEnd => encode_scalar_column(&block.n_border_off_end, out),
+            SsrColumnKey::NWidened => encode_scalar_column(&block.n_widened, out),
+            SsrColumnKey::NWindowTruncated => encode_scalar_column(&block.n_window_truncated, out),
             SsrColumnKey::ObsCount => encode_varint_column(&block.obs_count, out),
             SsrColumnKey::ObsSeqLen => encode_varint_column(&block.obs_seq_len, out),
             // The per-entry chunking lives in obs-seq-len; the payload is the
@@ -289,6 +323,8 @@ pub struct SsrBlock {
     mapped_reads: Vec<u32>,
     n_low_quality: Vec<u32>,
     n_border_off_end: Vec<u32>,
+    n_widened: Vec<u32>,
+    n_window_truncated: Vec<u32>,
     // Per-observation columns.
     obs_count: Vec<u64>,
     obs_seq_len: Vec<u64>,
@@ -313,6 +349,8 @@ impl BlockAccumulator for SsrBlock {
             mapped_reads: Vec::with_capacity(INITIAL_LOCI_HINT),
             n_low_quality: Vec::with_capacity(INITIAL_LOCI_HINT),
             n_border_off_end: Vec::with_capacity(INITIAL_LOCI_HINT),
+            n_widened: Vec::with_capacity(INITIAL_LOCI_HINT),
+            n_window_truncated: Vec::with_capacity(INITIAL_LOCI_HINT),
             obs_count: Vec::with_capacity(INITIAL_OBS_HINT),
             obs_seq_len: Vec::with_capacity(INITIAL_OBS_HINT),
             obs_seq_bytes: Vec::with_capacity(INITIAL_OBS_BYTES_HINT),
@@ -335,6 +373,8 @@ impl BlockAccumulator for SsrBlock {
         self.mapped_reads.push(record.mapped_reads);
         self.n_low_quality.push(record.n_low_quality);
         self.n_border_off_end.push(record.n_border_off_end);
+        self.n_widened.push(record.n_widened);
+        self.n_window_truncated.push(record.n_window_truncated);
 
         for (seq, count) in &record.observed {
             self.obs_count.push(*count as u64);
@@ -349,7 +389,7 @@ impl BlockAccumulator for SsrBlock {
         self.last_pos = self.last_pos.max(record.end - 1);
 
         let total_seq_bytes: usize = record.observed.iter().map(|(s, _)| s.len()).sum();
-        self.projected_bytes += 2 + 1 + 4 * 5 // deltas/span/n-obs varints + five u32s
+        self.projected_bytes += 2 + 1 + 4 * 7 // deltas/span/n-obs varints + seven u32s
             + record.observed.len() * (1 + 1) // per-obs count + seq-len varints
             + total_seq_bytes; // per-obs sequence bytes
     }
@@ -393,6 +433,8 @@ pub struct SsrDecoder {
     mapped_reads: Vec<u32>,
     n_low_quality: Vec<u32>,
     n_border_off_end: Vec<u32>,
+    n_widened: Vec<u32>,
+    n_window_truncated: Vec<u32>,
     // Per-observation columns.
     obs_count: Vec<u64>,
     obs_seq_len: Vec<u64>,
@@ -420,6 +462,8 @@ impl BlockDecoder for SsrDecoder {
             mapped_reads: Vec::new(),
             n_low_quality: Vec::new(),
             n_border_off_end: Vec::new(),
+            n_widened: Vec::new(),
+            n_window_truncated: Vec::new(),
             obs_count: Vec::new(),
             obs_seq_len: Vec::new(),
             obs_seq: Vec::new(),
@@ -502,6 +546,13 @@ impl BlockDecoder for SsrDecoder {
                 }
                 SsrColumnKey::NBorderOffEnd => {
                     self.n_border_off_end =
+                        decode_scalar_column_pod::<u32>(bytes, n_records, def.name)?;
+                }
+                SsrColumnKey::NWidened => {
+                    self.n_widened = decode_scalar_column_pod::<u32>(bytes, n_records, def.name)?;
+                }
+                SsrColumnKey::NWindowTruncated => {
+                    self.n_window_truncated =
                         decode_scalar_column_pod::<u32>(bytes, n_records, def.name)?;
                 }
                 SsrColumnKey::ObsCount => {
@@ -632,6 +683,8 @@ impl BlockDecoder for SsrDecoder {
             mapped_reads: self.mapped_reads[i],
             n_low_quality: self.n_low_quality[i],
             n_border_off_end: self.n_border_off_end[i],
+            n_widened: self.n_widened[i],
+            n_window_truncated: self.n_window_truncated[i],
             observed,
         }))
     }
@@ -647,6 +700,8 @@ impl BlockDecoder for SsrDecoder {
         self.mapped_reads = Vec::new();
         self.n_low_quality = Vec::new();
         self.n_border_off_end = Vec::new();
+        self.n_widened = Vec::new();
+        self.n_window_truncated = Vec::new();
         self.obs_count = Vec::new();
         self.obs_seq_len = Vec::new();
         self.obs_seq = Vec::new();
@@ -678,6 +733,8 @@ mod tests {
             mapped_reads: 33,
             n_low_quality: 1,
             n_border_off_end: 3,
+            n_widened: 0,
+            n_window_truncated: 0,
             observed,
         }
     }
@@ -699,6 +756,8 @@ mod tests {
         d.mapped_reads = vec![0];
         d.n_low_quality = vec![0];
         d.n_border_off_end = vec![0];
+        d.n_widened = vec![0];
+        d.n_window_truncated = vec![0];
         d
     }
 
@@ -788,6 +847,39 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(read_back, records);
+    }
+
+    /// The long-allele-recovery QC scalars (`n-widened` / `n-window-truncated`) survive a
+    /// full write/read round-trip with non-zero values.
+    #[test]
+    fn ssr_window_recovery_counts_round_trip() {
+        let records = vec![SsrLocusRecord {
+            chrom_id: 0,
+            start: 50,
+            end: 56,
+            depth: 40,
+            n_filtered: 1,
+            mapped_reads: 41,
+            n_low_quality: 2,
+            n_border_off_end: 3,
+            n_widened: 7,
+            n_window_truncated: 4,
+            observed: obs(&[(b"CACACA", 30)]),
+        }];
+        let sink = Cursor::new(Vec::<u8>::new());
+        let mut writer = PspWriter::<_, SsrKind>::new_ssr(sink, writer_header(1)).unwrap();
+        for r in &records {
+            writer.write_locus(r).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
+        let read_back: Vec<SsrLocusRecord> = reader
+            .records_of::<SsrKind>()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(read_back, records);
+        assert_eq!(read_back[0].n_widened, 7);
+        assert_eq!(read_back[0].n_window_truncated, 4);
     }
 
     /// M1: a locus whose half-open interval ends one past the contig's last base

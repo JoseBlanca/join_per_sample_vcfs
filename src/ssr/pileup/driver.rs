@@ -44,8 +44,11 @@ use super::alignment::{
     Delimited, HmmModel, MIN_REGION_Q1, ViterbiScratch, delimit_read, passes_quality_gate,
 };
 use super::fetch_reads::{LocusReads, fetch_locus_reads};
-use super::footprint::{MIN_FLANK_BP, extract_region, read_footprint};
+use super::footprint::{
+    MIN_FLANK_BP, extract_region, flank_truncated, read_footprint, widen_region,
+};
 use super::locus_tally::{QcCounts, ReadObs, SsrLocusObs, tally};
+use crate::bam::alignment_input::MappedRead;
 
 /// Loci processed per parallel batch — bounds in-flight memory while staying large
 /// enough to amortize scheduling.
@@ -166,30 +169,106 @@ pub(crate) fn process_locus(
     scratch: &mut LocusScratch,
 ) -> Result<SsrLocusObs, SsrPileupError> {
     let fetched = fetch_locus_reads(readers, locus, cap)?;
-    let mut outcomes = Vec::with_capacity(fetched.reads.len());
-    for read in &fetched.reads {
-        let fp = read_footprint(&read.cigar, read.pos);
-        let region = extract_region(&read.cigar, fp, read.seq.len(), locus);
-        let region_seq = &read.seq[region.clone()];
-        let region_qual = &read.qual[region];
-        let outcome =
-            match delimit_read(region_seq, region_qual, locus, model, &mut scratch.viterbi) {
-                Delimited::Region(r) => {
-                    if passes_quality_gate(
-                        &region_qual[r.clone()],
-                        MIN_REGION_Q1,
-                        &mut scratch.viterbi,
-                    ) {
-                        ReadObs::Sequence(region_seq[r].to_vec().into_boxed_slice())
-                    } else {
-                        ReadObs::LowQuality
-                    }
-                }
-                Delimited::BorderOffEnd => ReadObs::BorderOffEnd,
-            };
-        outcomes.push(outcome);
-    }
+    let outcomes: Vec<ReadObs> = fetched
+        .reads
+        .iter()
+        .map(|read| classify_read(read, locus, model, &mut scratch.viterbi))
+        .collect();
     Ok(tally(locus, &outcomes, qc_counts(&fetched)))
+}
+
+/// Delimit one read against the locus and classify it into a [`ReadObs`].
+///
+/// Normal path: extract the reference-sized window, run the pair-HMM, quality-gate the
+/// tract. **Long-allele recovery** (plan `ssr_pileup_long_allele_window_recovery.md`): if
+/// the delimited tract looks truncated by the window — a far flank eaten by an allele the
+/// mapper mis-aligned as all-Match — re-delimit in a window widened by one flank each side.
+/// A recovered tract is a [`ReadObs::WidenedSequence`] (kept + counted); a tract still
+/// truncated after widening is a [`ReadObs::WindowTruncated`] (dropped + counted) so a
+/// collapsed allele can never reach the tally.
+///
+/// NOTE: the widening only restores the *flank*; whether the delimiter can then score a
+/// long allele is bounded by its gap penalty (`alignment::GAP_OPEN_PROB`), which currently
+/// collapses alleles more than ~1 unit longer than the reference even with a full-flank
+/// window. Calibrating that gap penalty is the dominant fix; this recovery is the
+/// complementary defence for the mapper-misaligned window-truncation case.
+fn classify_read(
+    read: &MappedRead,
+    locus: &Locus,
+    model: &HmmModel,
+    viterbi: &mut ViterbiScratch,
+) -> ReadObs {
+    let fp = read_footprint(&read.cigar, read.pos);
+    let read_len = read.seq.len();
+    let left_len = locus.left_flank().len();
+    let right_len = locus.right_flank().len();
+
+    let region = extract_region(&read.cigar, fp, read_len, locus);
+    match delimit_read(
+        &read.seq[region.clone()],
+        &read.qual[region.clone()],
+        locus,
+        model,
+        viterbi,
+    ) {
+        Delimited::Region(tract)
+            if flank_truncated(&region, &tract, read_len, left_len, right_len) =>
+        {
+            // Suspicious: the mapper likely collapsed a long allele. Re-delimit wider.
+            let wide = widen_region(region, read_len, left_len, right_len);
+            match delimit_read(
+                &read.seq[wide.clone()],
+                &read.qual[wide.clone()],
+                locus,
+                model,
+                viterbi,
+            ) {
+                Delimited::Region(wtract)
+                    if !flank_truncated(&wide, &wtract, read_len, left_len, right_len) =>
+                {
+                    sequence_or_low_quality(
+                        &read.seq[wide.clone()],
+                        &read.qual[wide],
+                        wtract,
+                        true,
+                        viterbi,
+                    )
+                }
+                // Still truncated, or a flank now off the (widened) read end — unrecoverable.
+                _ => ReadObs::WindowTruncated,
+            }
+        }
+        Delimited::Region(tract) => sequence_or_low_quality(
+            &read.seq[region.clone()],
+            &read.qual[region],
+            tract,
+            false,
+            viterbi,
+        ),
+        Delimited::BorderOffEnd => ReadObs::BorderOffEnd,
+    }
+}
+
+/// Quality-gate a delimited tract: a passing tract becomes an observed sequence (a
+/// [`ReadObs::WidenedSequence`] when `widened`, else [`ReadObs::Sequence`]); a failing one
+/// is [`ReadObs::LowQuality`]. `tract` indexes the region slices.
+fn sequence_or_low_quality(
+    region_seq: &[u8],
+    region_qual: &[u8],
+    tract: std::ops::Range<usize>,
+    widened: bool,
+    viterbi: &mut ViterbiScratch,
+) -> ReadObs {
+    if passes_quality_gate(&region_qual[tract.clone()], MIN_REGION_Q1, viterbi) {
+        let seq = region_seq[tract].to_vec().into_boxed_slice();
+        if widened {
+            ReadObs::WidenedSequence(seq)
+        } else {
+            ReadObs::Sequence(seq)
+        }
+    } else {
+        ReadObs::LowQuality
+    }
 }
 
 /// Adapt the in-memory (chrom-**name**-keyed, 0-based) [`SsrLocusObs`] to the
@@ -214,6 +293,8 @@ pub(crate) fn to_container_record(
         mapped_reads: record.mapped_reads,
         n_low_quality: record.n_low_quality,
         n_border_off_end: record.n_border_off_end,
+        n_widened: record.n_widened,
+        n_window_truncated: record.n_window_truncated,
         observed: record.observed,
     })
 }
@@ -524,6 +605,8 @@ mod tests {
             mapped_reads: 8,
             n_low_quality: 1,
             n_border_off_end: 2,
+            n_widened: 7,
+            n_window_truncated: 2,
             observed: vec![(b"CACACA".to_vec().into_boxed_slice(), 4)],
         }
     }
@@ -540,9 +623,11 @@ mod tests {
                 c.n_filtered,
                 c.mapped_reads,
                 c.n_low_quality,
-                c.n_border_off_end
+                c.n_border_off_end,
+                c.n_widened,
+                c.n_window_truncated,
             ),
-            (5, 3, 8, 1, 2)
+            (5, 3, 8, 1, 2, 7, 2)
         );
         assert_eq!(c.observed, vec![(b"CACACA".to_vec().into_boxed_slice(), 4)]);
     }
@@ -932,4 +1017,79 @@ mod tests {
             vec![(b"CACACA".to_vec().into_boxed_slice(), 1)]
         );
     }
+
+    // ── long-allele window recovery (classify_read) ──
+
+    use crate::pileup::walker::CigarOp;
+
+    /// A `CA(8)` reference locus with 6 bp flanks: GGGGGG | (CA)x8 | TTTTTT, tract ref
+    /// [40, 56), embedded window ref [34, 62).
+    fn ca8_locus() -> Locus {
+        use crate::ssr::types::Motif;
+        let mut ref_bytes = Vec::new();
+        ref_bytes.extend_from_slice(b"GGGGGG");
+        for _ in 0..8 {
+            ref_bytes.extend_from_slice(b"CA");
+        }
+        ref_bytes.extend_from_slice(b"TTTTTT");
+        Locus::new(
+            "chr1".into(),
+            40,
+            56,
+            Motif::new(b"CA").unwrap(),
+            1.0,
+            ref_bytes.into_boxed_slice(),
+            34,
+        )
+        .unwrap()
+    }
+
+    /// An all-Match read whose tract is `units` copies of `CA`, with `tail_pad` trailing
+    /// `A` bases. The CIGAR is a single Match over the whole read — the mapper-misaligns-a-
+    /// long-allele case the recovery exists for (no soft-clip, no insertion).
+    fn all_match_read(units: u32, tail_pad: usize) -> MappedRead {
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"AAAAA");
+        seq.extend_from_slice(b"GGGGGG");
+        for _ in 0..units {
+            seq.extend_from_slice(b"CA");
+        }
+        seq.extend_from_slice(b"TTTTTT");
+        seq.extend(std::iter::repeat_n(b'A', tail_pad));
+        let len = seq.len();
+        MappedRead {
+            qname: b"r".to_vec(),
+            flag: 0,
+            ref_id: 0,
+            pos: 30, // 1-based; aligns the GGGGGG flank to ref [34, 40)
+            mapq: 60,
+            cigar: vec![CigarOp::Match(len as u32)],
+            seq,
+            qual: vec![40; len],
+            mate_ref_id: None,
+            mate_pos: None,
+            adaptor_boundary: None,
+            source_file_index: 0,
+        }
+    }
+
+    fn classify(read: &MappedRead) -> ReadObs {
+        let mut viterbi = ViterbiScratch::new();
+        classify_read(read, &ca8_locus(), &HmmModel::new(), &mut viterbi)
+    }
+
+    #[test]
+    fn classify_read_leaves_a_faithful_reference_allele_unchanged() {
+        // CA(8) == the reference: full flanks both sides, no widening → plain Sequence.
+        match classify(&all_match_read(8, 5)) {
+            ReadObs::Sequence(seq) => assert_eq!(&*seq, b"CACACACACACACACA"),
+            other => panic!("expected Sequence(CA*8), got {other:?}"),
+        }
+    }
+
+    // NOTE: the long-allele *recovery* and *drop* behavioural tests are intentionally not
+    // here yet — investigation (see the plan's gap-open note) showed the dominant collapse
+    // is the delimiter's `GAP_OPEN_PROB`, which collapses any allele ≥ ref+2 units even with
+    // a full-flank window, and confounds the flank-completeness detection. Those tests are
+    // meaningful only once the delimiter gap penalty is calibrated; deferred to that effort.
 }

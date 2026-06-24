@@ -203,6 +203,8 @@ mod tests {
             mapped_reads: 33,
             n_low_quality: 1,
             n_border_off_end: 3,
+            n_widened: 0,
+            n_window_truncated: 0,
             observed,
         }
     }
@@ -331,6 +333,8 @@ mod tests {
             mapped_reads: 10,
             n_low_quality: 0,
             n_border_off_end: 0,
+            n_widened: 0,
+            n_window_truncated: 0,
             observed: obs(&[(b"CACACA", 9)]),
         };
         let name_to_id = HashMap::from([("chr1", 0u32)]);

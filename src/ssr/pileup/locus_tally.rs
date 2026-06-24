@@ -30,10 +30,19 @@ pub(crate) struct QcCounts {
 pub(crate) enum ReadObs {
     /// A usable, quality-passing repeat-region sequence.
     Sequence(Box<[u8]>),
+    /// A usable, quality-passing sequence that was only recovered by re-delimiting in a
+    /// flank-widened window — the mapper had likely mis-aligned a long allele as all-Match
+    /// (plan `ssr_pileup_long_allele_window_recovery.md`). Tallied as an observed sequence
+    /// **and** counted (`n_widened`) so the mapper trouble is visible in QC.
+    WidenedSequence(Box<[u8]>),
     /// Dropped by the first-quartile quality gate.
     LowQuality,
     /// A flank ran off the read end (allele ≥ read length).
     BorderOffEnd,
+    /// The tract was still flank-truncated after widening — the allele exceeds what the
+    /// read (or the safe `flank_bp` margin) can hold. Dropped from the tally so a collapsed
+    /// allele can never reach the VCF, and counted (`n_window_truncated`) for QC.
+    WindowTruncated,
 }
 
 /// One sample's observed evidence at one locus — in-memory form (chrom-**name**
@@ -50,6 +59,12 @@ pub(crate) struct SsrLocusObs {
     pub(crate) mapped_reads: u32,
     pub(crate) n_low_quality: u32,
     pub(crate) n_border_off_end: u32,
+    /// Reads whose long allele was recovered by widening the realignment window (kept in
+    /// `observed`; a mapper-misalignment QC signal).
+    pub(crate) n_widened: u32,
+    /// Reads dropped because the allele stayed flank-truncated even after widening (kept
+    /// out of `observed`; a stronger mapper-misalignment / too-long-allele QC signal).
+    pub(crate) n_window_truncated: u32,
     /// Distinct repeat-region sequences → observation count, **sorted by bytes**
     /// (deterministic storage order — the cross-thread byte-identity invariant).
     pub(crate) observed: Vec<(Box<[u8]>, u32)>,
@@ -63,11 +78,18 @@ pub(crate) fn tally(locus: &Locus, outcomes: &[ReadObs], qc: QcCounts) -> SsrLoc
     let mut counts: HashMap<Box<[u8]>, u32> = HashMap::new();
     let mut n_low_quality = 0u32;
     let mut n_border_off_end = 0u32;
+    let mut n_widened = 0u32;
+    let mut n_window_truncated = 0u32;
     for outcome in outcomes {
         match outcome {
             ReadObs::Sequence(seq) => *counts.entry(seq.clone()).or_insert(0) += 1,
+            ReadObs::WidenedSequence(seq) => {
+                *counts.entry(seq.clone()).or_insert(0) += 1;
+                n_widened += 1;
+            }
             ReadObs::LowQuality => n_low_quality += 1,
             ReadObs::BorderOffEnd => n_border_off_end += 1,
+            ReadObs::WindowTruncated => n_window_truncated += 1,
         }
     }
     let mut observed: Vec<(Box<[u8]>, u32)> = counts.into_iter().collect();
@@ -82,6 +104,8 @@ pub(crate) fn tally(locus: &Locus, outcomes: &[ReadObs], qc: QcCounts) -> SsrLoc
         mapped_reads: qc.mapped_reads,
         n_low_quality,
         n_border_off_end,
+        n_widened,
+        n_window_truncated,
         observed,
     }
 }
@@ -146,6 +170,29 @@ mod tests {
         assert_eq!((rec.depth, rec.n_filtered, rec.mapped_reads), (30, 4, 33));
         assert!(rec.observed.is_empty());
         assert_eq!((rec.n_low_quality, rec.n_border_off_end), (0, 0));
+        assert_eq!((rec.n_widened, rec.n_window_truncated), (0, 0));
+    }
+
+    #[test]
+    fn widened_sequences_are_observed_and_counted_truncated_are_dropped_and_counted() {
+        let outcomes = vec![
+            seq(b"CACACA"),
+            ReadObs::WidenedSequence(b"CACACACACACA".to_vec().into_boxed_slice()),
+            ReadObs::WidenedSequence(b"CACACACACACA".to_vec().into_boxed_slice()),
+            ReadObs::WindowTruncated,
+        ];
+        let rec = tally(&ca_locus(), &outcomes, qc());
+        // The widened tracts join `observed` (kept) and bump n_widened; the truncated read
+        // is absent from `observed` and only bumps n_window_truncated.
+        assert_eq!(rec.n_widened, 2);
+        assert_eq!(rec.n_window_truncated, 1);
+        assert_eq!(
+            rec.observed,
+            vec![
+                (b"CACACA".to_vec().into_boxed_slice(), 1),
+                (b"CACACACACACA".to_vec().into_boxed_slice(), 2),
+            ]
+        );
     }
 
     #[test]

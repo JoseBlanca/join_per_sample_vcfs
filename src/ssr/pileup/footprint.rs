@@ -160,6 +160,53 @@ pub(crate) fn extract_region(
     r_start..r_end.min(read_len).max(r_start)
 }
 
+/// Whether a delimited tract looks **truncated by the extraction window** rather than by
+/// the read genuinely ending — the long-allele recovery trigger (plan
+/// `ssr_pileup_long_allele_window_recovery.md`). A read carrying an allele longer than the
+/// reference, whose mapper represented it as all-Match (no soft-clip, no insertion), has
+/// its far flank pushed out of the ref-sized window; the pair-HMM then can't anchor that
+/// flank and collapses the allele toward the reference length.
+///
+/// A side is **window-bounded** (more read bases exist there, the window just stopped short)
+/// when [`extract_region`] did not reach the read edge on that side: `region.start > 0`
+/// (left) / `region.end < read_len` (right). The tract is suspicious when a window-bounded
+/// side carries fewer flank bytes than the locus declares — the displaced tract ate into the
+/// flank. `tract` is **region-relative** (the [`Delimited::Region`](super::alignment::Delimited)
+/// span). A side that reached the read edge is not flagged: there are no more read bases to
+/// recover, so it is the genuine "allele ≥ read length" case the delimiter already reports.
+pub(crate) fn flank_truncated(
+    region: &Range<usize>,
+    tract: &Range<usize>,
+    read_len: usize,
+    left_flank_len: usize,
+    right_flank_len: usize,
+) -> bool {
+    let region_len = region.end - region.start;
+    let left_flank_bytes = tract.start; // region-relative tract start = bytes before the tract
+    let right_flank_bytes = region_len - tract.end;
+    let left_window_bounded = region.start > 0;
+    let right_window_bounded = region.end < read_len;
+    (left_window_bounded && left_flank_bytes < left_flank_len)
+        || (right_window_bounded && right_flank_bytes < right_flank_len)
+}
+
+/// Widen a read-coordinate region by one full reference flank on each side, clamped to the
+/// read (plan `ssr_pileup_long_allele_window_recovery.md`). Extending in **read** rather
+/// than reference coordinates sidesteps the unreliable CIGAR of a mis-aligned long-allele
+/// read; the margin is the locus's own flank length, which the catalog's bundle guarantee
+/// (`bundle_threshold ≥ flank_bp` of clean sequence past each flank) makes safe — the wider
+/// window cannot reach a neighbouring tract.
+pub(crate) fn widen_region(
+    region: Range<usize>,
+    read_len: usize,
+    left_flank_len: usize,
+    right_flank_len: usize,
+) -> Range<usize> {
+    let start = region.start.saturating_sub(left_flank_len);
+    let end = (region.end + right_flank_len).min(read_len);
+    start..end
+}
+
 /// The fetcher's cheap coordinate-reach admission gate (arch §3.1): could this
 /// read plausibly *span* the locus, decided from the footprint alone — no
 /// sequence scan? The depth cap (arch §8.3) runs in the fetcher's single pass,
@@ -412,5 +459,38 @@ mod tests {
             b"NNNCACA",
         );
         assert!(reaches_locus(&read, &locus6()));
+    }
+
+    // ── long-allele window recovery: flank_truncated / widen_region ──
+
+    #[test]
+    fn flank_truncated_false_for_a_full_flanked_tract() {
+        // region = GGGGGG | CACACA | TTTTTT (6 bp flanks both sides), read continues
+        // past both ends → window-bounded but flanks complete → not suspicious.
+        assert!(!flank_truncated(&(5..33), &(6..12), 42, 6, 6));
+    }
+
+    #[test]
+    fn flank_truncated_true_when_the_far_flank_is_eaten_by_a_long_allele() {
+        // The collapse case: region 28 bp, tract delimited to [10,26) leaving only 2 bp of
+        // right flank (region_len - 26 = 2 < 6), and the right side is window-bounded
+        // (region.end 33 < read_len 42) → suspicious.
+        assert!(flank_truncated(&(5..33), &(10..26), 42, 6, 6));
+    }
+
+    #[test]
+    fn flank_truncated_false_when_the_short_side_reached_the_read_end() {
+        // Same short right flank, but the region ends at the read end (33 == read_len):
+        // no more read bases to recover → the genuine allele-≥-read-length case, not a
+        // window truncation → not flagged.
+        assert!(!flank_truncated(&(5..33), &(10..26), 33, 6, 6));
+    }
+
+    #[test]
+    fn widen_region_extends_one_flank_each_side_clamped_to_the_read() {
+        // Interior region widens by the full flank on both sides.
+        assert_eq!(widen_region(20..40, 100, 6, 6), 14..46);
+        // Clamps at the read bounds (start floors at 0, end caps at read_len).
+        assert_eq!(widen_region(3..38, 40, 6, 6), 0..40);
     }
 }

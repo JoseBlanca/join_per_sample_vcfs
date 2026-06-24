@@ -347,6 +347,8 @@ pub(crate) fn simulate(spec: &SimCohortSpec) -> SimCohort {
                         mapped_reads: depth,
                         n_low_quality: 0,
                         n_border_off_end: 0,
+                        n_widened: 0,
+                        n_window_truncated: 0,
                         observed,
                     })
                 })
