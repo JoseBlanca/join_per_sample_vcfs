@@ -2,8 +2,8 @@
 //! implementation plan §3.3, C1).
 //!
 //! [`assemble_candidates`] turns the cohort rung ladder into the per-locus
-//! [`CandidateSet`]: a **locus-admission** check (the adjacent observed-length
-//! spacing must be motif-dominated), per-sample **nomination** (top-ploidy clear
+//! [`CandidateSet`]: a **locus-admission** check (the fraction of out-of-frame reads
+//! must stay low — a clean periodic repeat), per-sample **nomination** (top-ploidy clear
 //! peaks, or a `±1` neighbour rescue when a sample under-resolves), the **union**
 //! across samples, the **reference allele seeded unconditionally**, and a cap on the
 //! allele count. Recall is the goal — a kept-but-spurious candidate is the EM's job
@@ -20,8 +20,8 @@ use crate::ssr::cohort::types::CohortLocus;
 pub(crate) enum Admission {
     /// The locus is admitted.
     Pass,
-    /// Adjacent-rung spacing did not match the motif length — not a periodic
-    /// ladder (`notPeriodic`).
+    /// Too large a fraction of reads were out-of-frame (off the modal unit grid) — the
+    /// locus does not look like a clean periodic repeat (`notPeriodic`).
     NotPeriodic,
     /// The candidate count exceeded the per-locus cap (`tooManyAlleles`).
     TooManyAlleles,
@@ -53,9 +53,14 @@ pub(crate) struct CandidateCfg {
     pub(crate) min_cohort_depth: u32,
     /// Maximum number of candidate alleles before the locus is `TooManyAlleles`.
     pub(crate) max_candidate_alleles: usize,
-    /// Minimum number of distinct observed lengths needed to *run* the periodicity
-    /// test; below this the locus is admitted by default (too little to judge).
-    pub(crate) min_lengths_for_admission: usize,
+    /// Maximum cohort-wide **fraction of out-of-frame reads** a locus may carry before
+    /// it is rejected as `NotPeriodic` — a read being out-of-frame when its tract length
+    /// is not a whole-motif-unit offset from the modal length. A few out-of-frame reads
+    /// are normal (sequencing/PCR artefacts the read likelihood already handles); only a
+    /// locus *dominated* by off-grid reads (a non-repeat region) is filtered. Mirrors
+    /// HipSTR's per-locus `--max-loc-flank-indel` fraction filter; generous by default,
+    /// pinned in F2.
+    pub(crate) max_out_of_frame_frac: f64,
 }
 
 impl CandidateCfg {
@@ -65,7 +70,7 @@ impl CandidateCfg {
             prominence: 3,
             min_cohort_depth: 10,
             max_candidate_alleles: 24,
-            min_lengths_for_admission: 3,
+            max_out_of_frame_frac: 0.10,
         }
     }
 }
@@ -79,31 +84,49 @@ fn cohort_depth(locus: &CohortLocus) -> u32 {
         .sum()
 }
 
-/// Whether the locus behaves like an SSR: the **mode** of the adjacent
-/// observed-length differences (in bytes) equals the motif period. Loci with too
-/// few distinct lengths to judge are admitted by default (spec §5 level 3).
+/// Whether the locus looks like a clean periodic repeat: the cohort-wide **fraction of
+/// out-of-frame reads** must not exceed [`max_out_of_frame_frac`](CandidateCfg::max_out_of_frame_frac).
+///
+/// A read is *out-of-frame* when its tract length differs from the **modal** tract length
+/// by something other than a whole number of motif units. This is a *fraction* test, not
+/// a *presence* test (mirroring HipSTR's per-locus `--max-loc-flank-indel` /
+/// `--max-loc-stutter` filters): the handful of out-of-frame reads always present in real
+/// data — and already handled by the read likelihood — must not condemn an otherwise-clean
+/// locus, while a genuine non-repeat region (where most reads land off the unit grid) still
+/// fails. The grid is anchored to the **modal length**, not to zero, so an interrupted
+/// repeat sitting at an odd reference length (e.g. alleles at 13/15/17 bp) stays periodic.
+/// Mononucleotide loci (period 1) can never be out-of-frame and always pass.
 fn is_periodic(locus: &CohortLocus, cfg: &CandidateCfg) -> bool {
     let period = locus.motif.period();
-    let mut lengths: Vec<usize> = locus
-        .samples
-        .iter()
-        .flat_map(|ev| ev.seq_counts.iter().map(|(seq, _)| seq.len()))
-        .collect();
-    lengths.sort_unstable();
-    lengths.dedup();
-    if lengths.len() < cfg.min_lengths_for_admission {
+    if period <= 1 {
         return true;
     }
-    let mut diff_counts: BTreeMap<usize, u32> = BTreeMap::new();
-    for window in lengths.windows(2) {
-        *diff_counts.entry(window[1] - window[0]).or_insert(0) += 1;
+    let mut support_by_length: BTreeMap<usize, u64> = BTreeMap::new();
+    for ev in &locus.samples {
+        for (seq, count) in &ev.seq_counts {
+            *support_by_length.entry(seq.len()).or_insert(0) += u64::from(*count);
+        }
     }
-    // The dominant adjacent spacing must be the motif period.
-    diff_counts
+    let total: u64 = support_by_length.values().sum();
+    if total == 0 {
+        return true; // no reads to judge (the depth gate already ran)
+    }
+    // The modal tract length anchors the in-frame grid's phase. Ascending iteration with
+    // a strict `>` keeps the shortest length among equal-support ties (deterministic).
+    let mut anchor = 0usize;
+    let mut best_support = 0u64;
+    for (&length, &support) in &support_by_length {
+        if support > best_support {
+            best_support = support;
+            anchor = length;
+        }
+    }
+    let off_frame: u64 = support_by_length
         .iter()
-        .max_by(|(da, ca), (db, cb)| ca.cmp(cb).then_with(|| db.cmp(da)))
-        .map(|(diff, _)| *diff == period)
-        .unwrap_or(true)
+        .filter(|&(&length, _)| length.abs_diff(anchor) % period != 0)
+        .map(|(_, &support)| support)
+        .sum();
+    off_frame as f64 <= cfg.max_out_of_frame_frac * total as f64
 }
 
 /// The cohort's most-supported sequence at rung `length`, if that rung is occupied.
@@ -304,7 +327,8 @@ mod tests {
 
     #[test]
     fn non_periodic_locus_is_not_admitted() {
-        // Observed byte lengths 10, 13, 17 → diffs 3, 4 (mode ≠ period 2).
+        // Observed byte lengths 10/13/17, equally supported: anchored on 10, both 13
+        // (Δ3) and 17 (Δ7) are off the 2 bp grid → 2/3 of reads out-of-frame ≫ 10%.
         let sample = SampleEvidence {
             seq_counts: vec![
                 (Box::from(&b"AAAAAAAAAA"[..]), 20),        // len 10
@@ -327,6 +351,40 @@ mod tests {
         locus.push(1, sample);
         let cs = assemble(&locus);
         assert_eq!(cs.admit, Admission::NotPeriodic);
+    }
+
+    #[test]
+    fn clean_locus_with_a_few_out_of_frame_reads_is_still_admitted() {
+        // The bug fix: a clean CA locus (alleles at 12 and 14 bp, strongly supported)
+        // plus a couple of stray out-of-frame reads (13 bp) must NOT be discarded — the
+        // old presence-based gate threw the whole locus away on the singleton's existence.
+        let sample = SampleEvidence {
+            seq_counts: vec![
+                (ca_seq(6), 50),                       // 12 bp, in frame
+                (Box::from(&b"CACACACACACAC"[..]), 2), // 13 bp, out of frame (rare)
+                (ca_seq(7), 48),                       // 14 bp, in frame
+            ],
+            qc: SsrQc::default(),
+        };
+        let locus = ca_cohort(6, vec![sample.clone(), sample]);
+        // 4 out-of-frame reads out of 200 = 2% ≤ 10% → admitted.
+        assert_eq!(assemble(&locus).admit, Admission::Pass);
+    }
+
+    #[test]
+    fn odd_reference_interrupted_repeat_is_admitted() {
+        // Modal-length anchoring: an interrupted repeat whose alleles sit at odd bp
+        // lengths (13 and 15) is perfectly periodic (2 bp apart) even though neither is
+        // divisible by the period. Anchored on the mode, nothing is out-of-frame.
+        let sample = SampleEvidence {
+            seq_counts: vec![
+                (Box::from(&b"CACACACACACAC"[..]), 50),   // 13 bp (modal)
+                (Box::from(&b"CACACACACACACAC"[..]), 45), // 15 bp
+            ],
+            qc: SsrQc::default(),
+        };
+        let locus = ca_cohort(6, vec![sample.clone(), sample]);
+        assert_eq!(assemble(&locus).admit, Admission::Pass);
     }
 
     #[test]

@@ -217,16 +217,14 @@ pub(crate) fn run_bakeoff_with<M: ReadLikelihoodModel>(
     );
 
     let rung_cfg = RungCfg::dev_default();
-    // Relax the locus-admission periodicity gate for the bake-off. That gate is
-    // PRESENCE-based (it counts distinct observed lengths with no support floor), so the
-    // singleton odd lengths the G2/G3 out-of-frame reads inject trip `NotPeriodic` and
-    // filter the locus to a no-call *before the read-likelihood model runs* — identically
-    // for every model, leaving nothing to compare. The bake-off isolates the Qᵣ model
-    // (downstream of admission), so we force admission through and let the model genotype
-    // the messy reads. (The gate's presence-based fragility is a separate Stage-1.5
-    // finding, noted in the report — not what this bake-off measures.)
+    // Force locus admission for the bake-off. The G2/G3 generative cases deliberately
+    // dial the out-of-frame fraction *above* the production admission threshold to stress
+    // the read-likelihood models, so the real gate would filter those loci to a no-call
+    // *before any model runs* — identically for every model, leaving nothing to compare.
+    // The bake-off isolates the Qᵣ model (downstream of admission), so it admits every
+    // locus (`max_out_of_frame_frac = 1.0`) and lets the model genotype the messy reads.
     let cand_cfg = CandidateCfg {
-        min_lengths_for_admission: usize::MAX,
+        max_out_of_frame_frac: 1.0,
         ..CandidateCfg::dev_default()
     };
     let em_cfg = EmCfg::dev_default();
@@ -577,6 +575,56 @@ mod tests {
                 m.concordance()
             );
         }
+    }
+
+    #[test]
+    fn production_admission_gate_admits_realistic_but_rejects_excessive_out_of_frame() {
+        use crate::ssr::cohort::candidate_set::{Admission, assemble_candidates};
+        use crate::ssr::cohort::rung_ladder::build_rungs;
+
+        // Confirm the support-aware periodicity gate on *real simulated* cohorts, through
+        // the production `dev_default` config (threshold 10% out-of-frame) — NOT the
+        // bake-off's admit-everything override.
+        let spec = sweep_spec(2026);
+        let rc = RungCfg::dev_default();
+        let cc = CandidateCfg::dev_default();
+        let admits = |noise: &GenerativeNoise| -> Vec<Admission> {
+            simulate_with(&spec, noise)
+                .merger()
+                .map(|item| {
+                    let (_, locus) = item.unwrap();
+                    let rungs = build_rungs(&locus, &rc);
+                    assemble_candidates(&locus, &rungs, PLOIDY, &cc).admit
+                })
+                .collect()
+        };
+
+        // Realistic 5% out-of-frame: every locus is still admitted (the bug fix — the old
+        // presence-based gate filtered these on the first stray read).
+        let realistic = GenerativeNoise {
+            out_of_frame_rate: 0.05,
+            impurity_rate: 0.0,
+            extra_substitution: 0.0,
+        };
+        assert!(
+            admits(&realistic).iter().all(|a| *a == Admission::Pass),
+            "5% out-of-frame loci must admit, got {:?}",
+            admits(&realistic)
+        );
+
+        // Excessive 30% out-of-frame: the gate still does its job and rejects them.
+        let excessive = GenerativeNoise {
+            out_of_frame_rate: 0.30,
+            impurity_rate: 0.0,
+            extra_substitution: 0.0,
+        };
+        assert!(
+            admits(&excessive)
+                .iter()
+                .all(|a| *a == Admission::NotPeriodic),
+            "30% out-of-frame loci must be rejected, got {:?}",
+            admits(&excessive)
+        );
     }
 
     #[test]

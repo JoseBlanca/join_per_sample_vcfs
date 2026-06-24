@@ -79,10 +79,12 @@ Skills and agents are instructed to leave it untouched.
 >   (branch `ssr-cohort`). Building the committed end-to-end test ([src/ssr/end_to_end_tests.rs](src/ssr/end_to_end_tests.rs), `107be5f`) surfaced that the delimiter collapsed any allele ≥ ref+2 units to the reference. Investigation ([ssr_delimiter_gap_penalty_2026-06-24.md](doc/devel/reports/research/ssr_delimiter_gap_penalty_2026-06-24.md)) traced it to a **uniform affine gap** (`GAP_OPEN_PROB = 2.9e-5`, HipSTR's *flank* value) applied across the whole alignment. Fix ([ssr_delimiter_tract_aware_gap_2026-06-24.md](doc/devel/reports/implementations/ssr_delimiter_tract_aware_gap_2026-06-24.md)): a **tract-aware gap** (cheap `GAP_OPEN_PROB_TRACT = 1e-2` in repeat-tract columns, stiff Dindel in flanks), matching HipSTR's flank/tract split. Long alleles now extract verbatim and recover end-to-end (`CA×10` BAM→VCF). Companion **long-allele window-recovery infra** (`feaa9ef`: `flank_truncated`/`widen_region`, `WidenedSequence`/`WindowTruncated`, `.ssr.psp` `n-widened`/`n-window-truncated` columns). Determinism preserved; fmt/clippy `-D warnings` clean; **1305 lib tests**. See the **`ssr-pileup` stage** block.
 >   **Next (planned):** the bake-off **is done** (Model A productionized — see the top bullet).
 >   Remaining Stage-2 follow-ups: (1) replace A's fixed `OUT_FRAME_REL` with a real
->   per-period out-of-frame estimator from the pre-pass; (2) fix the presence-based
->   locus-admission periodicity gate (`is_periodic` over-filters on a few out-of-frame
->   reads); (3) answer review Q1 (is Stage-1 `.ssr.psp` output sparse?); (4) real-data
->   calibration; first real cohort SSR call.
+>   per-period out-of-frame estimator from the pre-pass; (2) **DONE** — the locus-admission
+>   periodicity gate (`is_periodic`) is now **support-aware/fraction-based** (rejects only
+>   when the cohort out-of-frame fraction exceeds `max_out_of_frame_frac`, default 0.10,
+>   modal-anchored; mirrors HipSTR's `--max-loc-flank-indel`); the old presence-based test
+>   over-filtered on a few stray reads; (3) answer review Q1 (is Stage-1 `.ssr.psp` output
+>   sparse?); (4) real-data calibration; first real cohort SSR call.
 > - **Prior task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step I1 (per-locus `θ_locus` shape refit)**
 >   (branch `ssr-cohort`, impl `46df902`). The genotype EM adapts the stutter **shape** per
 >   locus: genotype under the frozen `θ_period` seed → attribute reads → `refine_theta_locus`
