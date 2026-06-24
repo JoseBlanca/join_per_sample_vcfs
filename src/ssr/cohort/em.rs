@@ -24,7 +24,7 @@ use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em_init::LocusSeed;
 use crate::ssr::cohort::likelihood::{LikelihoodScratch, read_given_genotype, read_likelihood};
 use crate::ssr::cohort::param_estimation::{
-    G0PseudocountDecay, MAX_SLIP, ParamSet, SlipProfile, StutterLevel, StutterShape,
+    G0PseudocountDecay, ParamSet, SlipProfile, StutterLevel, StutterShape,
 };
 use crate::ssr::cohort::rung_ladder::Rungs;
 use crate::ssr::cohort::stutter::refine_theta_locus;
@@ -477,22 +477,10 @@ fn attribute_locus_slips(locus: &CohortLocus, calls: &[SampleCall], period: usiz
                 .iter()
                 .min_by_key(|&&u| (u as i32 - read_units).abs())
                 .expect("a non-empty call has ≥1 allele");
-            add_slip(&mut profile, read_units - parent as i32, *count as u64);
+            profile.add_slip(read_units - parent as i32, *count as u64);
         }
     }
     profile
-}
-
-/// Add a slip of signed size `delta` (count `count`) to a profile, respecting `MAX_SLIP`.
-fn add_slip(profile: &mut SlipProfile, delta: i32, count: u64) {
-    let magnitude = delta.unsigned_abs() as usize;
-    if (1..=MAX_SLIP).contains(&magnitude) {
-        if delta > 0 {
-            profile.up[magnitude - 1] += count;
-        } else {
-            profile.down[magnitude - 1] += count;
-        }
-    }
 }
 
 /// Whether two shapes agree within `tol` on every coefficient (the `θ_locus` stop).
@@ -801,6 +789,32 @@ mod tests {
         let mut b = a;
         b.decay = 0.25; // a 0.05 change exceeds the tolerance
         assert!(!shapes_close(&a, &b, 1e-3));
+    }
+
+    #[test]
+    fn theta_max_rounds_zero_reproduces_the_seed_shape_result() {
+        // With the θ refit disabled the EM is the pre-I1 (frozen-seed-shape) genotyper;
+        // it must still call the clean truth — pinning that the refit is purely additive.
+        let cohort = crate::ssr::cohort::sim::simulate(&checkpoint_spec());
+        let (_, locus) = cohort.merger().next().unwrap().expect("one locus");
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let no_refit = EmCfg {
+            theta_max_rounds: 0,
+            ..EmCfg::dev_default()
+        };
+        let call = run_locus_em(&locus, &rungs, &candidates, &params, &seed, 2, &no_refit);
+
+        let truth = [[8, 8], [8, 8], [6, 10], [10, 10], [6, 10]];
+        for (k, expected) in truth.iter().enumerate() {
+            let mut got = call.calls[k].genotype_units.clone();
+            got.sort_unstable();
+            let mut want = expected.to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "sample {k} with θ refit disabled");
+        }
     }
 
     #[test]

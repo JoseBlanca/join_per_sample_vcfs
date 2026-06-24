@@ -214,19 +214,16 @@ pub(crate) fn accumulate_locus(
 
         merge_sample_stats(stats.per_sample.entry(global).or_default(), &local);
         for (delta, count) in &slips {
-            add_slip(
-                stats.slip_by_period.entry(period as u8).or_default(),
-                *delta,
-                *count,
-            );
-            add_slip(
-                stats
-                    .slip_by_sample_period
-                    .entry((global, period as u8))
-                    .or_default(),
-                *delta,
-                *count,
-            );
+            stats
+                .slip_by_period
+                .entry(period as u8)
+                .or_default()
+                .add_slip(*delta, *count as u64);
+            stats
+                .slip_by_sample_period
+                .entry((global, period as u8))
+                .or_default()
+                .add_slip(*delta, *count as u64);
         }
     }
 
@@ -255,19 +252,6 @@ fn add_allele_copies(tally: &mut Vec<(u16, u64)>, length: u16, copies: u64) {
     match tally.iter_mut().find(|(l, _)| *l == length) {
         Some(entry) => entry.1 += copies,
         None => tally.push((length, copies)),
-    }
-}
-
-/// Add a slip of signed size `delta` (count `count`) to a profile, respecting the
-/// `MAX_SLIP` cap.
-fn add_slip(profile: &mut SlipProfile, delta: i32, count: u32) {
-    let magnitude = delta.unsigned_abs() as usize;
-    if (1..=MAX_SLIP).contains(&magnitude) {
-        if delta > 0 {
-            profile.up[magnitude - 1] += count as u64;
-        } else {
-            profile.down[magnitude - 1] += count as u64;
-        }
     }
 }
 

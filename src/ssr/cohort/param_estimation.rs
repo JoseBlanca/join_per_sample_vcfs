@@ -140,6 +140,22 @@ pub(crate) struct SlipProfile {
     pub(crate) up: [u64; MAX_SLIP],
 }
 
+impl SlipProfile {
+    /// Add a slip of signed size `delta` (count `count`) to the profile, respecting the
+    /// `MAX_SLIP` cap (a `|Δ|` beyond the cap is dropped). Shared by the pre-pass `θ`
+    /// accumulators and the per-locus `θ_locus` M-step.
+    pub(crate) fn add_slip(&mut self, delta: i32, count: u64) {
+        let magnitude = delta.unsigned_abs() as usize;
+        if (1..=MAX_SLIP).contains(&magnitude) {
+            if delta > 0 {
+                self.up[magnitude - 1] += count;
+            } else {
+                self.down[magnitude - 1] += count;
+            }
+        }
+    }
+}
+
 /// Per sample — feeds (a) the per-group level line, (b) the clustering, and
 /// (c) — once groups are fixed — the per-`(group, period)` shape key (arch §3).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
