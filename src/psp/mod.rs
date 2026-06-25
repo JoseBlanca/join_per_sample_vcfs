@@ -61,3 +61,7 @@ pub use reader::{BlockColumnReader, BlockColumns, OwnedRecordsIter, PspReader, R
 // at least that visibility. Re-exported here from the (otherwise
 // `pub(crate)`) registry rather than widening the whole registry.
 pub use registry::ColumnDef;
+// Re-exported for external SSR tooling/diagnostics (e.g. the ssr_psp_dump
+// example): the SSR psp kind tag + its decoded per-locus record. The module
+// itself stays crate-private.
+pub use registry_ssr::{SsrKind, SsrLocusRecord};

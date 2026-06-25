@@ -6,9 +6,15 @@
 # Run it with benchmarks/lib/run_ours_ssr.sh. Every value is env-overridable.
 #
 # NOTE: the SSR caller has no region flag (like the SNP caller); the cohort
-# CRAMs are already pre-sliced to regions.bed (~2 Mb of SL4.0), so there is no
-# BED here. ssr-catalog scans the WHOLE reference, so most catalog loci sit
-# outside the sliced regions and simply no-call (LowDepth) — harmless.
+# CRAMs are pre-sliced to an SSR-targeted region set. ssr-catalog scans the
+# WHOLE reference, so catalog loci outside the slice simply no-call.
+#
+# BED here is NOT a caller flag — it is the slice the CRAMs were cut to
+# (ssr_regions.bed: ~15k catalog SSRs ±500 bp, ch00 excluded; built by
+# scripts/pick_ssr_regions.py, sliced on rick via lib/slice_crams_on_rick.sh).
+# run_hipstr.sh uses it to restrict HipSTR's loci to the covered set so both
+# callers genotype the same loci. Regenerate the crams if you change it.
+BED="${BED:-ssr_regions.bed}"
 
 BENCH_NAME="ssr_tomato1"
 
@@ -17,13 +23,15 @@ BENCH_NAME="ssr_tomato1"
 # the pileups must use this exact FASTA. A sibling .fai is required.
 REFERENCE="${REFERENCE:-$HOME/genomes/s_lycopersicum/4.00/S_lycopersicum_chromosomes.4.00.fa}"
 
-# Reuse the SNP tomato1 cohort CRAMs (gitignored local data). Defaults to the
-# sibling SNP bench's crams; override CRAM_DIR if they live elsewhere (e.g. in a
-# separate working tree).
-CRAM_DIR="${CRAM_DIR:-$BENCH_DIR/../tomato1/crams}"
+# SSR-targeted cohort CRAMs (gitignored local data), sliced on rick to
+# ssr_regions.bed and copied here. Self-contained — no longer borrows the SNP
+# bench's CRAMs (those covered only ~774 SSRs; this set covers ~15k).
+CRAM_DIR="${CRAM_DIR:-$BENCH_DIR/crams}"
 CRAM_GLOB="${CRAM_GLOB:-*.bench.cram}"
 CRAM_SUFFIX="${CRAM_SUFFIX:-.bench.cram}"
-SINGLE_CRAM="${SINGLE_CRAM:-SRR7279481.p1.bench.cram}"
+# First cohort CRAM by name; overridable. (single mode is unused for SSR — the
+# cohort pre-pass needs multiple samples — but bench_single_cram still expects it.)
+SINGLE_CRAM="${SINGLE_CRAM:-}"
 
 PLOIDY="${PLOIDY:-2}"
 THREADS="${THREADS:-4}"

@@ -29,10 +29,14 @@ benchmarks/tomato1/results/**
 benchmarks/human_genome_bottle/crams/
 benchmarks/human_genome_bottle/results/
 benchmarks/human_genome_bottle/results_nobaq/
-# SSR benchmark: reuses the tomato1 CRAMs; only its derived results are
-# local. Glob covers results/, results_smoke6/, results_cmp6/, and any
-# future results* dir (VCFs + .ssr.psp are large, never committed).
-benchmarks/ssr_tomato1/results*/
+# SSR benchmark: derived results are local. Glob covers results/,
+# results_smoke6/, results_cmp6/, results_full63/, and any future results*
+# dir (VCFs + .ssr.psp are large, never committed).
+benchmarks/ssr_tomato1/results*
+# SSR-targeted crams (sliced on rick from the whole-genome crams against
+# ssr_regions.bed). Large; never committed. The ssr_regions.bed that defines
+# them IS tracked (small, reproducible from the catalog + seed).
+benchmarks/ssr_tomato1/crams/
 # marimo per-notebook session cache (machine-specific, auto-generated)
 __marimo__/
 # macOS Finder metadata

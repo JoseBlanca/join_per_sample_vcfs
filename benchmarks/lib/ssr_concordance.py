@@ -3,20 +3,29 @@
 # ///
 """Ours-vs-HipSTR STR genotype concordance (no truth set).
 
-The two callers genotype the *same* locus set (HipSTR's --regions BED is
+Both callers genotype the *same* locus set (HipSTR's --regions BED is
 projected from our ssr-catalog). With no STR truth for tomato, this scores
-*agreement*, not accuracy: at loci/samples both call, do the genotypes match?
+*agreement*, not accuracy.
 
-Comparison unit: per-allele base-pair difference from REF (the locus's
-reference tract). This cancels any constant flank/representation offset
-between callers and is exactly what HipSTR's GB field encodes. A genotype
-is the sorted multiset of its alleles' (len(allele) - len(REF)) values; two
-calls are concordant iff those multisets are equal.
+The two tools define an STR allele differently, and the report makes that
+explicit instead of penalising it:
+  * ours   : repeat LENGTH / copy number (REPCN). Same-length sequences are
+             the same allele; length-monomorphic loci are not emitted.
+  * HipSTR : full sequence HAPLOTYPE. A SNP inside the repeat is a distinct
+             allele, so HipSTR emits "variants" that carry no length change.
 
-Loci are joined on (CHROM, POS). Both callers put POS at the 1-based repeat
-start (== catalog_start + 1), so they align exactly; unmatched loci are
-reported. Samples are joined by name (VCF column / @RG SM); if exactly one
-sample column exists on each side, they're paired regardless of name.
+So every HipSTR variable locus is classified by its ALT-vs-REF lengths
+(period from the INFO PERIOD field):
+  * length-poly : >=1 ALT whose length differs from REF by a whole motif
+                  unit  -> the COMPARABLE set; our caller should also call it.
+  * non-unit    : a length change that is not a whole motif unit (e.g. a 1bp
+                  indel in a 5bp repeat) -> our period model flags notPeriodic.
+  * seq-only    : every ALT is REF-length (a SNP in the repeat) -> outside
+                  our REPCN model; our caller is correctly silent (not a miss).
+
+Concordance unit: per-allele base-pair difference from REF, as a sorted
+multiset (== HipSTR's GB). SNP-only HipSTR genotypes collapse to (0,..),
+matching our length view. Loci join on (CHROM, POS); samples by name.
 
 Usage:
   ssr_concordance.py --ours ours.vcf[.gz] --hipstr hipstr.vcf.gz [--out report.txt]
@@ -25,7 +34,7 @@ Usage:
 import argparse
 import gzip
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 
 def opener(path):
@@ -33,7 +42,7 @@ def opener(path):
 
 
 def parse_vcf(path):
-    """-> (samples, {(chrom,pos): (ref, [alts], {sample: gt_indices|None})})."""
+    """-> (samples, {(chrom,pos): Locus})  with Locus = (ref, [alts], period, {sample: gt|None})."""
     samples = []
     loci = {}
     with opener(path) as fh:
@@ -44,20 +53,26 @@ def parse_vcf(path):
                 samples = line.rstrip("\n").split("\t")[9:]
                 continue
             f = line.rstrip("\n").split("\t")
-            chrom, pos, ref, alt, fmt = f[0], int(f[1]), f[3], f[4], f[8]
+            chrom, pos, ref, alt, info, fmt = f[0], int(f[1]), f[3], f[4], f[7], f[8]
             alts = [] if alt == "." else alt.split(",")
+            period = _info_int(info, "PERIOD")
             gt_i = fmt.split(":").index("GT")
-            calls = {}
-            for name, col in zip(samples, f[9:]):
-                gt = col.split(":")[gt_i]
-                idx = _gt_indices(gt)
-                calls[name] = idx
-            loci[(chrom, pos)] = (ref, alts, calls)
+            calls = {name: _gt_indices(col.split(":")[gt_i]) for name, col in zip(samples, f[9:])}
+            loci[(chrom, pos)] = (ref, alts, period, calls)
     return samples, loci
 
 
+def _info_int(info, key):
+    for kv in info.split(";"):
+        if kv.startswith(key + "="):
+            try:
+                return int(kv.split("=")[1])
+            except ValueError:
+                return None
+    return None
+
+
 def _gt_indices(gt):
-    """'1/2' or '0|1' -> [1,2]; missing ('.', './.') -> None."""
     parts = gt.replace("|", "/").split("/")
     if any(p in (".", "") for p in parts):
         return None
@@ -65,54 +80,62 @@ def _gt_indices(gt):
 
 
 def rel_genotype(ref, alts, idx):
-    """Sorted per-allele (len(allele) - len(ref)) for a GT index list."""
     alleles = [ref] + alts
     return tuple(sorted(len(alleles[i]) - len(ref) for i in idx))
+
+
+def classify_hipstr_locus(ref, alts, period):
+    """'mono' | 'length-poly' | 'non-unit' | 'seq-only' (period unknown -> 'unknown')."""
+    if not alts:
+        return "mono"
+    if not period:
+        return "unknown"
+    deltas = [len(a) - len(ref) for a in alts]
+    if any(d != 0 and d % period == 0 for d in deltas):
+        return "length-poly"
+    if any(d != 0 for d in deltas):  # length change, but not whole-unit
+        return "non-unit"
+    return "seq-only"  # all ALTs == REF length
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ours", required=True)
     ap.add_argument("--hipstr", required=True)
-    ap.add_argument("--out", help="write the report here too (default: stdout only)")
+    ap.add_argument("--out")
     args = ap.parse_args()
 
     o_samples, ours = parse_vcf(args.ours)
     h_samples, hip = parse_vcf(args.hipstr)
 
-    # Sample pairing: by name, else the lone column on each side.
     shared_samples = [s for s in o_samples if s in set(h_samples)]
     name_map = {s: s for s in shared_samples}
     if not shared_samples and len(o_samples) == 1 and len(h_samples) == 1:
         name_map = {o_samples[0]: h_samples[0]}
         shared_samples = [o_samples[0]]
 
-    shared_loci = sorted(set(ours) & set(hip))
-    only_ours = len(set(ours) - set(hip))
-    only_hip = len(set(hip) - set(ours))
+    # Classify every HipSTR locus.
+    hip_class = {key: classify_hipstr_locus(ref, alts, period) for key, (ref, alts, period, _) in hip.items()}
+    class_counts = Counter(hip_class.values())
 
-    # Per-sample-locus tallies over shared loci.
+    in_ours = set(ours)
+    # The comparable set: HipSTR loci with a whole-unit length polymorphism.
+    comparable = [k for k, c in hip_class.items() if c == "length-poly"]
+    comp_emitted = [k for k in comparable if k in in_ours]
+    comp_absent = [k for k in comparable if k not in in_ours]
+
+    # Concordance on the comparable set, per shared sample-cell called by both.
     both_called = concordant = 0
-    ours_called = hip_called = 0
-    sl_total = len(shared_loci) * len(shared_samples)
-    diff_hist = defaultdict(int)  # signed sum-of-allele-length-diff between callers
-
-    for key in shared_loci:
-        o_ref, o_alts, o_calls = ours[key]
-        h_ref, h_alts, h_calls = hip[key]
+    diff_hist = defaultdict(int)
+    for key in comp_emitted:
+        o_ref, o_alts, _, o_calls = ours[key]
+        h_ref, h_alts, _, h_calls = hip[key]
         for osamp in shared_samples:
-            hsamp = name_map[osamp]
-            oi = o_calls.get(osamp)
-            hi = h_calls.get(hsamp)
-            if oi is not None:
-                ours_called += 1
-            if hi is not None:
-                hip_called += 1
+            oi, hi = o_calls.get(osamp), h_calls.get(name_map[osamp])
             if oi is None or hi is None:
                 continue
             both_called += 1
-            og = rel_genotype(o_ref, o_alts, oi)
-            hg = rel_genotype(h_ref, h_alts, hi)
+            og, hg = rel_genotype(o_ref, o_alts, oi), rel_genotype(h_ref, h_alts, hi)
             if og == hg:
                 concordant += 1
             else:
@@ -121,31 +144,39 @@ def main():
     def pct(n, d):
         return f"{100 * n / d:.1f}%" if d else "n/a"
 
-    lines = []
-    lines.append("=== Ours vs HipSTR — STR genotype concordance (agreement, no truth) ===")
-    lines.append(f"ours VCF   : {args.ours}  ({len(o_samples)} samples, {len(ours)} loci)")
-    lines.append(f"hipstr VCF : {args.hipstr}  ({len(h_samples)} samples, {len(hip)} loci)")
-    lines.append("")
-    lines.append(f"shared loci (CHROM,POS join) : {len(shared_loci)}")
-    lines.append(f"  loci only in ours          : {only_ours}")
-    lines.append(f"  loci only in hipstr        : {only_hip}")
-    lines.append(f"paired samples               : {len(shared_samples)}  {shared_samples if len(shared_samples) <= 8 else ''}")
-    lines.append("")
-    lines.append(f"sample×locus cells (shared)  : {sl_total}")
-    lines.append(f"  called by ours             : {ours_called}  ({pct(ours_called, sl_total)})")
-    lines.append(f"  called by hipstr           : {hip_called}  ({pct(hip_called, sl_total)})")
-    lines.append(f"  called by BOTH             : {both_called}  ({pct(both_called, sl_total)})")
-    lines.append("")
-    lines.append(f"CONCORDANCE (both-called cells with matching allele-length genotype):")
-    lines.append(f"  concordant                 : {concordant} / {both_called}  ({pct(concordant, both_called)})")
-    lines.append(f"  discordant                 : {both_called - concordant}")
+    L = []
+    L.append("=== Ours vs HipSTR — STR concordance (agreement, no truth) ===")
+    L.append(f"ours VCF   : {args.ours}  ({len(o_samples)} samples, {len(ours)} loci emitted)")
+    L.append(f"hipstr VCF : {args.hipstr}  ({len(h_samples)} samples, {len(hip)} loci emitted)")
+    L.append(f"paired samples : {len(shared_samples)}")
+    L.append("")
+    L.append("HipSTR locus classes (by ALT-vs-REF length; the callers define alleles differently):")
+    L.append(f"  mono (ref-only)            : {class_counts.get('mono', 0)}")
+    L.append(f"  length-poly (whole-unit)   : {class_counts.get('length-poly', 0)}   <- COMPARABLE to our REPCN model")
+    L.append(f"  non-unit indel             : {class_counts.get('non-unit', 0)}   (our model flags notPeriodic)")
+    L.append(f"  seq-only (SNP in repeat)   : {class_counts.get('seq-only', 0)}   (outside our model; we are silent, not wrong)")
+    if class_counts.get("unknown"):
+        L.append(f"  unknown (no PERIOD)        : {class_counts['unknown']}")
+    L.append("")
+    L.append("COMPARABLE set — HipSTR whole-unit length-polymorphic loci:")
+    L.append(f"  total                      : {len(comparable)}")
+    L.append(f"  also emitted by ours       : {len(comp_emitted)}  ({pct(len(comp_emitted), len(comparable))})")
+    L.append(f"  absent from ours (we call length-mono / no-call / filtered) : {len(comp_absent)}")
+    L.append("")
+    L.append("CONCORDANCE on comparable loci (sample cells called by BOTH, allele-length genotype):")
+    L.append(f"  both-called cells          : {both_called}")
+    L.append(f"  concordant                 : {concordant} / {both_called}  ({pct(concordant, both_called)})")
     if diff_hist:
-        lines.append("")
-        lines.append("  discordant Σallele-bp-diff (ours − hipstr) histogram:")
+        L.append("  discordant Σallele-bp-diff (ours − hipstr):")
         for d in sorted(diff_hist):
-            lines.append(f"    {d:+d} bp : {diff_hist[d]}")
+            L.append(f"    {d:+d} bp : {diff_hist[d]}")
+    if comp_absent:
+        L.append("")
+        L.append("  comparable loci HipSTR called but ours did not emit (first 20):")
+        for k in comp_absent[:20]:
+            L.append(f"    {k[0]}:{k[1]}")
 
-    report = "\n".join(lines)
+    report = "\n".join(L)
     print(report)
     if args.out:
         with open(args.out, "w") as fh:
