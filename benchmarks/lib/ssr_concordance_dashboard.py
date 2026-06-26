@@ -3,6 +3,7 @@
 # dependencies = [
 #     "marimo",
 #     "matplotlib",
+#     "matplotlib-venn",
 # ]
 # ///
 
@@ -29,38 +30,35 @@
 
 import marimo
 
-__generated_with = "0.23.8"
+__generated_with = "0.23.10"
 app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
     import gzip
-    import math
     from collections import defaultdict
     from pathlib import Path
 
     import marimo as mo
 
-    return Path, defaultdict, gzip, math, mo
+    return Path, defaultdict, gzip, mo
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        # SSR genotyping concordance — ours vs HipSTR
+    mo.md("""
+    # SSR genotyping concordance — ours vs HipSTR
 
-        Agreement on a shared locus set (no truth set → agreement, not accuracy).
-        **Length-variable** = a locus where some sample carries an allele whose
-        length differs from the reference tract. This is the apples-to-apples
-        notion: HipSTR's in-repeat-SNP alleles are REF-length, so they collapse
-        out and only genuine repeat-length polymorphism is compared.
+    Agreement on a shared locus set (no truth set → agreement, not accuracy).
+    **Length-variable** = a locus where some sample carries an allele whose
+    length differs from the reference tract. This is the apples-to-apples
+    notion: HipSTR's in-repeat-SNP alleles are REF-length, so they collapse
+    out and only genuine repeat-length polymorphism is compared.
 
-        Genotype unit: the sorted per-allele bp-difference-from-REF (== HipSTR's
-        `GB`); two genotypes agree iff those multisets are equal.
-        """
-    )
+    Genotype unit: the sorted per-allele bp-difference-from-REF (== HipSTR's
+    `GB`); two genotypes agree iff those multisets are equal.
+    """)
     return
 
 
@@ -172,7 +170,7 @@ def _(gzip):
                 s.update(g)
         return s
 
-    return (locus_alleles, locus_is_length_variable, parse_vcf, period_label)
+    return locus_alleles, locus_is_length_variable, parse_vcf, period_label
 
 
 @app.cell
@@ -196,117 +194,129 @@ def _(hip_loci, locus_is_length_variable, mo, ours_loci, run_sel):
     mo.stop(run_sel is None, mo.md(""))
     ours_var = {k for k, r in ours_loci.items() if locus_is_length_variable(r)}
     hip_var = {k for k, r in hip_loci.items() if locus_is_length_variable(r)}
+    # HipSTR genotyped these but found no length variation (every sample at the
+    # reference length). Disjoint from hip_var; together they are everything
+    # HipSTR emitted. The split separates a real disagreement (ours variant,
+    # HipSTR monomorphic) from "HipSTR never genotyped the locus" (skipped).
+    hip_mono = set(hip_loci) - hip_var
     both_var = ours_var & hip_var
     ours_only = ours_var - hip_var
     hip_only = hip_var - ours_var
-    return both_var, hip_only, hip_var, ours_only, ours_var
+    return both_var, hip_mono, hip_only, hip_var, ours_only, ours_var
 
 
 @app.cell
 def _():
     import matplotlib.pyplot as plt
 
-    OURS_C, HIP_C, BOTH_C = "#1f77b4", "#d62728", "#6a3d9a"  # blue / red / purple
-    return BOTH_C, HIP_C, OURS_C, plt
+    # ours = blue, HipSTR-variable = red, HipSTR-monomorphic = grey.
+    OURS_C, HIP_C, MONO_C = "#1f77b4", "#d62728", "#999999"
+    return HIP_C, MONO_C, OURS_C, plt
 
 
 @app.cell
-def _(math, plt):
-    # --- a proportional 2-set Venn (hand-rolled; no matplotlib-venn dep) ---
-    def _lens_area(d, ra, rb):
-        if d >= ra + rb:
-            return 0.0
-        if d <= abs(ra - rb):
-            return math.pi * min(ra, rb) ** 2
-        a1 = ra * ra * math.acos((d * d + ra * ra - rb * rb) / (2 * d * ra))
-        a2 = rb * rb * math.acos((d * d + rb * rb - ra * ra) / (2 * d * rb))
-        a3 = 0.5 * math.sqrt(max(0.0,
-            (-d + ra + rb) * (d + ra - rb) * (d - ra + rb) * (d + ra + rb)))
-        return a1 + a2 - a3
+def _(plt):
+    from matplotlib_venn import venn3
 
-    def _solve_distance(ra, rb, target):
-        if ra <= 0 or rb <= 0:
-            return ra + rb
-        amax = math.pi * min(ra, rb) ** 2
-        if target >= amax:
-            return abs(ra - rb)
-        if target <= 0:
-            return ra + rb
-        lo, hi = abs(ra - rb), ra + rb
-        for _ in range(80):
-            mid = 0.5 * (lo + hi)
-            if _lens_area(mid, ra, rb) > target:
-                lo = mid
-            else:
-                hi = mid
-        return 0.5 * (lo + hi)
-
-    def venn2(a_only, b_only, both, label_a, label_b, col_a, col_b, title):
-        from matplotlib.patches import Circle
-        na, nb = a_only + both, b_only + both
-        total = max(na, nb, 1)
-        rmax = 1.0
-        k = math.pi * rmax * rmax / total
-        ra = rmax * math.sqrt(na / total) if na else 0.0
-        rb = rmax * math.sqrt(nb / total) if nb else 0.0
-        d = _solve_distance(ra, rb, both * k)
-        xa, xb = -d / 2, d / 2
-        half = (max(abs(xa) + ra, abs(xb) + rb) or 1.0) * 1.25
-        fig, ax = plt.subplots(figsize=(7, 4.6))
-        ax.add_patch(Circle((xa, 0), ra, color=col_a, alpha=0.45, lw=0))
-        ax.add_patch(Circle((xb, 0), rb, color=col_b, alpha=0.45, lw=0))
-        ax.text(xa, ra + 0.05 * half, label_a, ha="center", va="bottom",
-                fontsize=11, color=col_a, fontweight="bold")
-        ax.text(xb, rb + 0.05 * half, label_b, ha="center", va="bottom",
-                fontsize=11, color=col_b, fontweight="bold")
-        ax.text(xa - ra * 0.45, 0, f"{label_a} only\n{a_only:,}",
-                ha="center", va="center", fontsize=10)
-        ax.text((ra - rb) / 2 if d > 0 else 0, 0, f"both\n{both:,}",
-                ha="center", va="center", fontsize=10, fontweight="bold")
-        ax.text(xb + rb * 0.45, 0, f"{label_b} only\n{b_only:,}",
-                ha="center", va="center", fontsize=10)
-        ax.set_xlim(-half, half)
-        ax.set_ylim(-half, half)
-        ax.set_aspect("equal")
-        ax.axis("off")
+    def venn3_plot(sets, labels, colors, title):
+        """Area-weighted 3-set Venn; each region is labelled with its true
+        locus count. HipSTR-variable and HipSTR-monomorphic are disjoint, so
+        their overlap regions read 0 by construction."""
+        fig, ax = plt.subplots(figsize=(8.5, 6.4))
+        v = venn3(subsets=[set(s) for s in sets], set_labels=labels,
+                  set_colors=colors, alpha=0.5, ax=ax)
+        for lbl in v.set_labels or []:
+            if lbl:
+                lbl.set_fontsize(11)
+                lbl.set_fontweight("bold")
+        for lbl in v.subset_labels or []:
+            if lbl:
+                lbl.set_fontsize(11)
         ax.set_title(title, fontsize=12)
         fig.tight_layout()
         return fig
 
-    return (venn2,)
+    return (venn3_plot,)
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ---
-        ## 1. Length-variable loci — how many did each tool find?
-        Areas ∝ set size, overlap ∝ shared loci.
-        """
+    mo.md("""
+    ---
+    ## 1. Length-variable loci — ours vs HipSTR (HipSTR split variable / mono)
+
+    Three circles: **ours variable**, **HipSTR variable**, and **HipSTR
+    monomorphic** (loci HipSTR genotyped but found at the reference length in
+    every sample). HipSTR's two circles are mutually exclusive — a locus is one
+    or the other — so their overlap reads 0. The split tells apart *why* a locus
+    is ours-only:
+
+    - **ours ∩ HipSTR-variable** — both agree there is length variation.
+    - **ours ∩ HipSTR-monomorphic** — genuine disagreement: we call a variant,
+      HipSTR genotyped the same locus and saw none.
+    - **ours only** (outside both HipSTR circles) — HipSTR never genotyped the
+      locus (skipped: too few reads / tract too long).
+    """)
+    return
+
+
+@app.cell
+def _(HIP_C, MONO_C, OURS_C, hip_mono, hip_var, mo, ours_var, run_sel, venn3_plot):
+    mo.stop(run_sel is None, mo.md(""))
+    venn3_plot(
+        [ours_var, hip_var, hip_mono],
+        ("ours\nvariable", "HipSTR\nvariable", "HipSTR\nmonomorphic"),
+        (OURS_C, HIP_C, MONO_C),
+        "Length-variable SSR loci — ours vs HipSTR (split by HipSTR's call)",
     )
     return
 
 
 @app.cell
-def _(HIP_C, OURS_C, both_var, hip_only, mo, ours_only, run_sel, venn2):
+def _(hip_mono, hip_var, mo, ours_var, run_sel):
+    # Exact region counts — always legible even when the big monomorphic
+    # circle squashes the small overlaps in the Venn above.
     mo.stop(run_sel is None, mo.md(""))
-    venn2(len(ours_only), len(hip_only), len(both_var),
-          "ours", "HipSTR", OURS_C, HIP_C,
-          "Length-variable SSR loci (ours vs HipSTR)")
+    hip_emit = hip_var | hip_mono
+    agree = len(ours_var & hip_var)
+    disagree = len(ours_var & hip_mono)
+    ours_skipped = len(ours_var - hip_emit)
+    hipvar_only = len(hip_var - ours_var)
+    monoonly = len(hip_mono - ours_var)
+    _md = "### Venn regions\n\n| region | loci | meaning |\n|---|---:|---|\n"
+    _md += f"| ours ∩ HipSTR-variable | {agree:,} | both agree there's length variation |\n"
+    _md += (f"| ours ∩ HipSTR-monomorphic | {disagree:,} | **disagreement** — we call a "
+            f"variant, HipSTR genotyped it and saw none |\n")
+    _md += (f"| ours only (HipSTR absent) | {ours_skipped:,} | HipSTR never genotyped it "
+            f"(skipped: too few reads / tract too long) |\n")
+    _md += f"| HipSTR-variable only | {hipvar_only:,} | HipSTR variant, ours not length-variable |\n"
+    _md += f"| HipSTR-monomorphic only | {monoonly:,} | both agree monomorphic (the boring bulk) |\n"
+    mo.md(_md)
     return
 
 
 @app.cell
 def _(mo):
-    mo.md("## 2. Length-variable loci per motif length (mono / di / tri / …)")
+    mo.md("""
+    ## 2. Length-variable loci per motif length (mono / di / tri / …)
+    """)
     return
 
 
 @app.cell
 def _(
-    HIP_C, OURS_C, both_var, defaultdict, hip_loci, hip_only, mo,
-    ours_loci, ours_only, period_label, plt, run_sel,
+    HIP_C,
+    OURS_C,
+    both_var,
+    defaultdict,
+    hip_loci,
+    hip_only,
+    mo,
+    ours_loci,
+    ours_only,
+    period_label,
+    plt,
+    run_sel,
 ):
     mo.stop(run_sel is None, mo.md(""))
 
@@ -367,14 +377,12 @@ def _(by_p, mo, period_label, periods_sorted, run_sel):
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ---
-        ## 3. Genotype similarity on common loci
-        For loci both tools call length-variable, compare each sample's
-        length-genotype. A cell counts only when **both** tools call it.
-        """
-    )
+    mo.md("""
+    ---
+    ## 3. Genotype similarity on common loci
+    For loci both tools call length-variable, compare each sample's
+    length-genotype. A cell counts only when **both** tools call it.
+    """)
     return
 
 
@@ -410,7 +418,7 @@ def _(both_var, defaultdict, hip_loci, mo, ours_loci, run_sel, shared_samples):
         f"### Overall: **{cc_conc:,} / {cc_total:,} = {overall:.1%}** "
         f"concordant cells across {len(both_var):,} common length-variable loci"
     )
-    return cc_conc, cc_total, diff_hist, per_locus_conc, per_period_cc
+    return diff_hist, per_locus_conc, per_period_cc
 
 
 @app.cell
@@ -481,20 +489,25 @@ def _(mo, per_locus_conc, plt, run_sel):
 
 @app.cell
 def _(mo):
-    mo.md(
-        """
-        ---
-        ## 4. Other relevant stats
-        Call rate, heterozygosity (relevant to the high F_IS), and allelic
-        richness — computed on the common length-variable loci.
-        """
-    )
+    mo.md("""
+    ---
+    ## 4. Other relevant stats
+    Call rate, heterozygosity (relevant to the high F_IS), and allelic
+    richness — computed on the common length-variable loci.
+    """)
     return
 
 
 @app.cell
 def _(
-    HIP_C, OURS_C, both_var, hip_loci, mo, ours_loci, plt, run_sel,
+    HIP_C,
+    OURS_C,
+    both_var,
+    hip_loci,
+    mo,
+    ours_loci,
+    plt,
+    run_sel,
     shared_samples,
 ):
     mo.stop(run_sel is None, mo.md(""))
@@ -541,7 +554,14 @@ def _(
 
 @app.cell
 def _(
-    HIP_C, OURS_C, both_var, hip_loci, locus_alleles, mo, ours_loci, plt,
+    HIP_C,
+    OURS_C,
+    both_var,
+    hip_loci,
+    locus_alleles,
+    mo,
+    ours_loci,
+    plt,
     run_sel,
 ):
     mo.stop(run_sel is None, mo.md(""))
