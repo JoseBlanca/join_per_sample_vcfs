@@ -44,3 +44,10 @@ __marimo__/
 
 # Claude Code personal overrides (not for commit)
 .claude/settings.local.json
+
+# GIAB human benchmark: track the runner/analysis scripts and README, but keep
+# the heavy local data out of git (reference genome, BAM/CRAM, truth VCFs,
+# generated .psp/.vcf results — gigabytes, fetched/built locally).
+benchmarks/giab/*
+!benchmarks/giab/src/
+!benchmarks/giab/README.md

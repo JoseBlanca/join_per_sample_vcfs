@@ -191,6 +191,16 @@ impl VcfWriter {
 
 const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
 
+/// Debug switch for the MAPQ-diff filter. When `PVC_DEBUG_MAPQ_DIFF` is set
+/// (to any non-empty value), `record_fails_mapq_diff_t` emits one TSV line per
+/// (record, alt) to stderr with the pooled MAPQ moments and the Welch's t it
+/// computes, so a false-negative hunt can see exactly which true SNPs the
+/// filter rejects and how skewed their alt-read MAPQ actually is. Off by
+/// default; zero cost on the hot path beyond one cached env read.
+static DEBUG_MAPQ_DIFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var_os("PVC_DEBUG_MAPQ_DIFF").is_some_and(|v| !v.is_empty())
+});
+
 /// Test alias for the private MAPQ Welch's-t filter
 /// ([`record_fails_mapq_diff_t`]) so the integration suite can exercise the
 /// decision in isolation (was `driver::record_fails_mapq_diff_t_for_test`).
@@ -252,7 +262,25 @@ fn record_fails_mapq_diff_t(record: &Variant, threshold: f32) -> bool {
             continue;
         }
         let t = (mean_alt - mean_ref) / se2.sqrt();
-        if (t as f32) < threshold {
+        let fails = (t as f32) < threshold;
+        if *DEBUG_MAPQ_DIFF {
+            // TSV: tag chrom_id pos1 alt_idx n_ref mean_ref n_alt mean_alt t thr decision
+            // locus.start is already 1-based (see PosteriorRecord::pos_1based).
+            eprintln!(
+                "MAPQDIFF\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{:.2}\t{:.3}\t{}\t{}",
+                record.locus.chrom_id,
+                record.locus.start,
+                alt_idx,
+                ref_moments.n,
+                mean_ref,
+                alt_moments.n,
+                mean_alt,
+                t,
+                threshold,
+                if fails { "DROP" } else { "keep" },
+            );
+        }
+        if fails {
             return true;
         }
     }
