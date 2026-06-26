@@ -407,10 +407,11 @@ fn print_run_summary(
     } else {
         String::new()
     };
-    let dropped_low_mapq_diff_t_note = if stats.records_dropped_low_mapq_diff_t > 0 {
+    let dropped_allele_balance_note = if stats.records_dropped_allele_balance > 0 {
         format!(
-            " records_dropped_low_mapq_diff_t={} (any ALT Welch's t < --min-mapq-diff-t)",
-            stats.records_dropped_low_mapq_diff_t,
+            " records_dropped_allele_balance={} (het ALT fraction inconsistent with genotype; \
+             AB log-LR < --min-allele-balance-log-lr)",
+            stats.records_dropped_allele_balance,
         )
     } else {
         String::new()
@@ -433,7 +434,7 @@ fn print_run_summary(
         dropped_hom_ref_note,
         dropped_low_qual_note,
         dropped_low_alt_obs_note,
-        dropped_low_mapq_diff_t_note,
+        dropped_allele_balance_note,
         lh_cap_note,
     );
 }

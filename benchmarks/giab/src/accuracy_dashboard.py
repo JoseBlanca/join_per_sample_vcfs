@@ -123,10 +123,20 @@ def _(RESULTS_DIR, mo):
 @app.cell
 def _(RESULTS_DIR, cov_dd, mo):
     cov_path = RESULTS_DIR / cov_dd.value
-    variants = sorted(p.name for p in cov_path.iterdir() if p.is_dir() and p.name.startswith("ours"))
-    mo.stop(not variants, mo.md(f"No `ours*` variant dirs under `{cov_path}`."))
-    # Prefer the BAQ+DUST-off variant (the indel-inclusive config) by default.
-    default_variant = "ours_nobaq_nodust" if "ours_nobaq_nodust" in variants else variants[0]
+    # Any of our caller-output variant dirs: the `ours*` toggles plus the named
+    # presets (high-recall / high-confidence). A dir qualifies if it holds at
+    # least one per-sample VCF (excludes empty/aux dirs and other callers).
+    OTHER_CALLERS = {"gatk", "freebayes", "comparison"}
+    variants = sorted(
+        p.name
+        for p in cov_path.iterdir()
+        if p.is_dir()
+        and p.name not in OTHER_CALLERS
+        and any(p.glob("HG*.vcf"))
+    )
+    mo.stop(not variants, mo.md(f"No caller variant dirs with VCFs under `{cov_path}`."))
+    # Prefer the high-recall preset (BAQ/DUST off, allele-balance on) by default.
+    default_variant = "high-recall" if "high-recall" in variants else variants[0]
     var_dd = mo.ui.dropdown(options=variants, value=default_variant, label="Caller variant")
     return cov_path, var_dd, variants
 
@@ -278,6 +288,67 @@ def _(df, mo, pl, query_dir, var_dd, warn):
 
 
 @app.cell
+def _(BED_DIR, BED_OF, CLASSES, RESULTS_DIR, SAMPLES, TRUTH_DIR, TRUTH_OF,
+      counts_for, mo, pl, var_dd):
+    # TP/FP/FN per coverage for the selected variant (cohort totals across the
+    # three samples). Recomputed for every coverage dir that holds this variant,
+    # so it's heavier than the single-coverage panels above.
+    variant = var_dd.value
+
+    def _cov_x(name):
+        stem = name[:-1] if name.endswith("x") else name
+        return int(stem) if stem.isdigit() else None
+
+    def _build_rows():
+        # Wrapped in a function so the loop locals don't leak as marimo
+        # cell-level globals (which would collide with the per-coverage cell).
+        rows = []
+        for cov_dir in sorted(RESULTS_DIR.iterdir(), key=lambda p: _cov_x(p.name) or 0):
+            qdir = cov_dir / variant
+            if not qdir.is_dir():
+                continue
+            for cls in CLASSES:
+                tp = fp = fn = 0
+                present = False
+                for s in SAMPLES:
+                    q = qdir / f"{s}.vcf"
+                    if not q.exists():
+                        continue
+                    present = True
+                    t, f, n, _, _ = counts_for(
+                        TRUTH_DIR / TRUTH_OF[s], q, BED_DIR / BED_OF[s], cls
+                    )
+                    tp += t
+                    fp += f
+                    fn += n
+                if not present:
+                    continue
+                prec = tp / (tp + fp) if (tp + fp) else 0.0
+                rec = tp / (tp + fn) if (tp + fn) else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+                rows.append(dict(
+                    coverage=cov_dir.name, cov_x=_cov_x(cov_dir.name),
+                    **{"class": cls}, TP=tp, FP=fp, FN=fn,
+                    precision=round(prec, 4), recall=round(rec, 4), f1=round(f1, 4),
+                ))
+        return rows
+
+    cov_table = pl.DataFrame(_build_rows())
+    mo.stop(
+        cov_table.height == 0,
+        mo.md(f"### Accuracy across coverage — no other coverages found for `{variant}`."),
+    )
+    cov_table = cov_table.sort(["class", "cov_x"])
+    mo.vstack([
+        mo.md(f"### Accuracy across coverage — `{variant}` (cohort totals, per class)"),
+        mo.ui.table(cov_table, selection=None),
+        mo.md("_TP/FP/FN summed over HG002/3/4. The allele-balance filter is "
+              "depth-aware, so FP falls with coverage while FN stays low._"),
+    ])
+    return
+
+
+@app.cell
 def _(alt, df, mo, pl):
     # Long form for a grouped bar chart of TP/FP/FN.
     long = df.unpivot(
@@ -357,134 +428,6 @@ def _(alt, class_radio, clip_switch, mo, pl, qual_df):
             "red = false positives. A QUAL threshold that cleanly separates the "
             "two is the gateable-FP signal; FPs piled up at low QUAL can be "
             "filtered, FPs overlapping the TP mass cannot."
-        ),
-    ])
-    return
-
-
-@app.cell
-def _(mo, pl, query_dir):
-    # MAPQ-diff filter analysis — loaded from the TSVs produced by
-    # mapq_t_distribution.sh and mapq_diff_sweep.sh for the selected variant.
-    tdist_path = query_dir / "mapq_t_dist.tsv"
-    sweep_path = query_dir / "mapq_diff_sweep.tsv"
-    tdist_df = pl.read_csv(tdist_path, separator="\t") if tdist_path.exists() else None
-    sweep_df = pl.read_csv(sweep_path, separator="\t") if sweep_path.exists() else None
-    mapq_hdr = mo.md(
-        "## MAPQ-difference filter (`--min-mapq-diff-t`)\n\n"
-        "Welch's t-test comparing ALT-read MAPQ to REF-read MAPQ; a record is "
-        "dropped if any ALT's `t < threshold` (default **−3**). It only engages "
-        "where MAPQ *varies* (at unique sites every read is MAPQ 60 → t undefined "
-        "→ inert). Because `t ∝ √n`, at 300× even a benign MAPQ gap trips −3 — so "
-        "the filter drops real SNPs in paralogous/segmental-dup regions."
-        if tdist_df is not None else
-        f"## MAPQ-difference filter\n\n_No `mapq_t_dist.tsv` under `{query_dir}` — "
-        "run `benchmarks/giab/src/mapq_t_distribution.sh` and `mapq_diff_sweep.sh`._"
-    )
-    return mapq_hdr, sweep_df, tdist_df
-
-
-@app.cell
-def _(mapq_hdr, mo, tdist_df):
-    mo.stop(tdist_df is None, mapq_hdr)
-    # Interactive threshold for the t-distribution panel.
-    thr_slider = mo.ui.slider(
-        start=-20.0, stop=0.0, step=0.5, value=-3.0,
-        label="--min-mapq-diff-t", show_value=True,
-    )
-    return (thr_slider,)
-
-
-@app.cell
-def _(alt, mapq_hdr, mo, pl, tdist_df, thr_slider):
-    snp_t = tdist_df.filter((pl.col("class") == "snps") & (pl.col("status").is_in(["TP", "FP"])))
-    thr = thr_slider.value
-    tp_drop = snp_t.filter((pl.col("status") == "TP") & (pl.col("t") < thr)).height
-    fp_drop = snp_t.filter((pl.col("status") == "FP") & (pl.col("t") < thr)).height
-    tp_tot = snp_t.filter(pl.col("status") == "TP").height
-    fp_tot = snp_t.filter(pl.col("status") == "FP").height
-
-    t_hist = (
-        alt.Chart(snp_t)
-        .mark_bar(opacity=0.55)
-        .encode(
-            x=alt.X("t:Q", title="Welch's t (ALT vs REF MAPQ)", bin=alt.Bin(maxbins=50)),
-            y=alt.Y("count():Q", title="records (SNP, MAPQ-variable sites)", stack=None),
-            color=alt.Color("status:N", sort=["TP", "FP"],
-                            scale=alt.Scale(domain=["TP", "FP"], range=["#2ca02c", "#d62728"])),
-            tooltip=["status:N", alt.Tooltip("count():Q", title="records")],
-        )
-        .properties(width=620, height=320,
-                    title="MAPQ-diff t by call status — left of the line is DROPPED")
-    )
-    t_rule = alt.Chart(pl.DataFrame({"thr": [float(thr)]})).mark_rule(
-        color="black", strokeDash=[6, 4], size=2).encode(x="thr:Q")
-
-    mo.vstack([
-        mapq_hdr,
-        mo.md("### t-value distribution: true vs false positives"),
-        thr_slider,
-        mo.md(
-            f"At **t < {thr:+.1f}** the filter drops **{tp_drop}/{tp_tot} TP** "
-            f"and **{fp_drop}/{fp_tot} FP** SNPs. "
-            + ("⚠️ dropping more TP than FP — net harmful."
-               if tp_drop > fp_drop else
-               "✓ dropping more FP than TP.")
-        ),
-        mo.ui.altair_chart(t_hist + t_rule),
-    ])
-    return
-
-
-@app.cell
-def _(alt, mo, pl, sweep_df):
-    mo.stop(sweep_df is None, mo.md("_No `mapq_diff_sweep.tsv` for the sweep curves._"))
-    # Recall / FP vs threshold (SNPs), one line per sample. Map -inf -> a finite
-    # plotting x so the categorical order reads left(strict)->right(lax).
-    order = ["-3", "-5", "-10", "-20", "-inf"]
-    snp = sweep_df.filter(pl.col("class") == "snps").with_columns(
-        pl.col("threshold").cast(pl.Utf8)
-    )
-    recall_chart = (
-        alt.Chart(snp).mark_line(point=True).encode(
-            x=alt.X("threshold:N", sort=order, title="--min-mapq-diff-t"),
-            y=alt.Y("recall:Q", scale=alt.Scale(zero=False), title="SNP recall"),
-            color=alt.Color("sample:N"),
-            tooltip=["sample", "threshold", "recall", "fp", "fn"],
-        ).properties(width=300, height=260, title="SNP recall vs threshold")
-    )
-    fp_chart = (
-        alt.Chart(snp).mark_line(point=True).encode(
-            x=alt.X("threshold:N", sort=order, title="--min-mapq-diff-t"),
-            y=alt.Y("fp:Q", scale=alt.Scale(zero=False), title="SNP false positives"),
-            color=alt.Color("sample:N"),
-            tooltip=["sample", "threshold", "fp", "recall", "fn"],
-        ).properties(width=300, height=260, title="SNP false positives vs threshold")
-    )
-    fn_chart = (
-        alt.Chart(snp).mark_line(point=True).encode(
-            x=alt.X("threshold:N", sort=order, title="--min-mapq-diff-t"),
-            y=alt.Y("fn:Q", scale=alt.Scale(zero=False), title="SNP false negatives"),
-            color=alt.Color("sample:N"),
-            tooltip=["sample", "threshold", "fn", "recall", "fp"],
-        ).properties(width=300, height=260, title="SNP false negatives vs threshold")
-    )
-    # Render as SEPARATE chart embeds (not `recall_chart | fp_chart | fn_chart`):
-    # an hconcat puts every `sample` legend selection in one Vega spec, which
-    # collides ("Duplicate signal name: legend_selection_sample_tuple").
-    # Independent embeds each get their own signal scope.
-    mo.vstack([
-        mo.md("### Recall / FP / FN trade-off across thresholds (SNPs)"),
-        mo.hstack(
-            [mo.ui.altair_chart(recall_chart),
-             mo.ui.altair_chart(fp_chart),
-             mo.ui.altair_chart(fn_chart)],
-            justify="start", gap=1, wrap=True),
-        mo.md(
-            "Relaxing the threshold (left→right) trades precision for recall: "
-            "false negatives fall while false positives rise. The knee is around "
-            "**−10** — FN drops to near zero with little FP cost. Disabling entirely "
-            "(−inf) adds FP for no further FN reduction."
         ),
     ])
     return

@@ -41,17 +41,6 @@ use crate::pileup::walker::{
 };
 use crate::pop_var_caller::cli::parse_mismatch_fraction;
 use crate::pop_var_caller::cli::parsers;
-use crate::var_calling::{
-    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
-};
-
-/// Tiny shim so `clap`'s `default_value_t` (which needs a `Display`
-/// expression evaluated at attribute time) can read
-/// [`DEFAULT_MIN_MAPQ_DIFF_T`] without dragging the path through
-/// every CLI helper that reads this constant.
-const fn pop_var_caller_default_min_mapq_diff_t() -> f32 {
-    DEFAULT_MIN_MAPQ_DIFF_T
-}
 use crate::var_calling::dust_filter::{DEFAULT_DUST_THRESHOLD, DEFAULT_DUST_WINDOW};
 use crate::var_calling::per_group_merger::{
     DEFAULT_MAX_ALLELES_LH_CALC, DEFAULT_MAX_ALLELES_PER_RECORD, DEFAULT_PLOIDY,
@@ -62,6 +51,7 @@ use crate::var_calling::posterior_engine::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
 use crate::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
+use crate::var_calling::{DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_QUAL_PHRED};
 use crate::vcf::DEFAULT_EMIT_GP;
 
 /// Stage 1 knobs (CRAM-input filters, BAQ HMM, pileup walker).
@@ -387,37 +377,46 @@ pub struct CohortPipelineArgs {
     )]
     pub min_alt_obs_per_sample: u32,
 
-    /// Skip the Welch's-t MAPQ-difference drop entirely. The
-    /// `INFO/MQRef`, `MQAlt`, `MQDiff`, and `MQDiffT` annotations
-    /// still emit; setting this keeps records that would otherwise
-    /// be dropped for having alt-supporting reads at systematically
-    /// lower MAPQ than ref-supporting reads (the multi-mapper
-    /// fingerprint).
+    /// Skip the allele-balance drop entirely (max sensitivity). The
+    /// per-call allele balance is otherwise tested for biallelic het
+    /// calls: a site is dropped only when every variant-carrying
+    /// sample is a het whose observed ALT read fraction is
+    /// inconsistent with the expected ~0.5 (the persistent-low-VAF
+    /// artefact fingerprint). On by default.
     #[arg(
-        long = "no-mapq-diff-filter",
+        long = "no-allele-balance-filter",
         hide_short_help = true,
         default_value_t = false,
-        help_heading = "Advanced — MAPQ filter"
+        help_heading = "Advanced — Allele-balance filter"
     )]
-    pub no_mapq_diff_filter: bool,
+    pub no_allele_balance_filter: bool,
 
-    /// Threshold for the Welch's-t MAPQ-difference drop. Records
-    /// with at least one ALT whose cohort-pooled Welch's t (ALT vs
-    /// REF MAPQ) is below this value AND both sides have ≥ 3
-    /// supporting reads are dropped before reaching the writer.
-    /// Pass `-inf` to disable; pass `--no-mapq-diff-filter` for the
-    /// equivalent boolean. Default `-3.0` empirically catches 25 %
-    /// of GATK-extreme multi-mapper sites at a 2.0 % false-flag
-    /// rate on GATK-clean sites; see the per_allele_mapq_tracking
-    /// implementation plan for the cross-validation.
+    /// Drop threshold on the allele-balance log-likelihood ratio
+    /// (Beta-Binomial fit of the genotype's expected balance vs a
+    /// free fit). More negative = more inconsistent with a real
+    /// genotype. The score is depth-aware, so a single threshold is
+    /// self-silencing at low coverage. Default `-5.0` removes ~96 %
+    /// of false positives at 300× for ~0.8 % true-call loss on the
+    /// GIAB per_sample benchmark, and ~nothing below ~30×.
     #[arg(
-        long = "min-mapq-diff-t",
+        long = "min-allele-balance-log-lr",
         hide_short_help = true,
-        default_value_t = pop_var_caller_default_min_mapq_diff_t(),
-        value_parser = parsers::parse_min_mapq_diff_t,
-        help_heading = "Advanced — MAPQ filter",
+        default_value_t = crate::var_calling::allele_balance::DEFAULT_AB_MIN_LOG_LR,
+        help_heading = "Advanced — Allele-balance filter",
     )]
-    pub min_mapq_diff_t: f32,
+    pub min_allele_balance_log_lr: f64,
+
+    /// Beta-Binomial concentration (overdispersion) for the
+    /// allele-balance test. Larger = tighter around the expected
+    /// balance. This is the depth-honesty knob; the default was fit
+    /// by MLE on high-coverage true hets.
+    #[arg(
+        long = "allele-balance-concentration",
+        hide_short_help = true,
+        default_value_t = crate::var_calling::allele_balance::DEFAULT_AB_CONCENTRATION,
+        help_heading = "Advanced — Allele-balance filter",
+    )]
+    pub allele_balance_concentration: f64,
 
     /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
     /// default — `GP` is `Number=G`, so the per-sample cell grows as

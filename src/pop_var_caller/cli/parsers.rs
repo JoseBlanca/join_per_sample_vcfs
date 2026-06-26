@@ -212,25 +212,6 @@ pub fn parse_min_alt_obs_per_sample(s: &str) -> Result<u32, String> {
     parse_u32_in(s, "min-alt-obs-per-sample", 0, 100)
 }
 
-/// `--min-mapq-diff-t`: any finite or `-inf` float; finite values
-/// must lie in `[-50.0, 50.0]` to catch obvious unit confusion (the
-/// effective range under any realistic MAPQ profile is `[-20, 20]`).
-/// `-inf` disables the filter without needing `--no-mapq-diff-filter`.
-pub fn parse_min_mapq_diff_t(s: &str) -> Result<f32, String> {
-    let value: f32 = s
-        .parse()
-        .map_err(|_| format!("--min-mapq-diff-t: not a valid float: {s:?}"))?;
-    if value.is_nan() {
-        return Err("--min-mapq-diff-t: NaN is not a valid threshold".into());
-    }
-    if value.is_finite() && !(-50.0..=50.0).contains(&value) {
-        return Err(format!(
-            "--min-mapq-diff-t: {value} is outside [-50.0, 50.0] (use -inf to disable)"
-        ));
-    }
-    Ok(value)
-}
-
 /// Shared body for every Dirichlet-pseudocount parser. Range is the
 /// same across the posterior engine and the contamination side-pass
 /// (`PSEUDOCOUNT_RANGE_MAX = 1000.0` in both modules); the only thing

@@ -57,7 +57,7 @@ use crate::var_calling::types::{CalledChunk, RawCohortChunk};
 use crate::var_calling::variant_caller::{CallerError, VariantCaller};
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError};
 use crate::var_calling::vcf_writer::{
-    DownstreamFilters, MapqDiffFilter, VcfWriter, WriterError, WriterStats,
+    AlleleBalanceFilter, DownstreamFilters, VcfWriter, WriterError, WriterStats,
 };
 use crate::vcf::{CohortMetadata, WriterConfig};
 
@@ -332,11 +332,12 @@ pub fn run_var_calling(
     let writer_config = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
     let filters = DownstreamFilters {
         min_qual_phred: cohort.min_qual_phred,
-        mapq_diff: if cohort.no_mapq_diff_filter {
-            MapqDiffFilter::Off
+        allele_balance: if cohort.no_allele_balance_filter {
+            AlleleBalanceFilter::Off
         } else {
-            MapqDiffFilter::On {
-                min_t: cohort.min_mapq_diff_t,
+            AlleleBalanceFilter::On {
+                min_log_lr: cohort.min_allele_balance_log_lr,
+                concentration: cohort.allele_balance_concentration,
             }
         },
     };

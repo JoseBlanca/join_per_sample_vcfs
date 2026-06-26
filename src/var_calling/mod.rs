@@ -36,6 +36,7 @@
 //! columnar likelihood path is needed).
 
 // --- Numeric kernels (byte-identity-sensitive math) ---
+pub mod allele_balance;
 pub mod contamination_estimation;
 pub mod dust_filter;
 pub mod per_group_merger;
@@ -59,8 +60,6 @@ pub mod vcf_writer;
 pub const DEFAULT_MIN_QUAL_PHRED: f64 = 30.0;
 /// Default `--min-alt-obs-per-sample` (CLI default).
 pub const DEFAULT_MIN_ALT_OBS_PER_SAMPLE: u32 = 2;
-/// Default `--min-mapq-diff-t` Welch's-t threshold (CLI default).
-pub const DEFAULT_MIN_MAPQ_DIFF_T: f32 = -3.0;
 
 #[cfg(test)]
 mod test_helpers;

@@ -15,15 +15,17 @@ use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig};
 
 use crate::var_calling::types::{CallStats, CalledChunk, Variant};
 
-/// The MAPQ-difference Welch's-t filter setting: either off, or on with a
-/// threshold. A single value so the "off" state cannot carry a stale,
-/// silently-ignored threshold (the two old co-dependent fields collapse here).
+/// The allele-balance filter setting: either off, or on with a threshold and
+/// Beta-Binomial concentration. A single value so the "off" state cannot carry
+/// a stale, silently-ignored threshold.
 #[derive(Debug, Clone, Copy)]
-pub enum MapqDiffFilter {
-    /// `--no-mapq-diff-filter`: the test is never run.
+pub enum AlleleBalanceFilter {
+    /// `--no-allele-balance-filter`: the test is never run.
     Off,
-    /// Drop a record whose MAPQ-difference Welch's-t falls below `min_t`.
-    On { min_t: f32 },
+    /// Drop a biallelic het call whose allele-balance log-LR falls below
+    /// `min_log_lr`, evaluated against a Beta-Binomial of the given
+    /// `concentration` (see [`crate::var_calling::allele_balance`]).
+    On { min_log_lr: f64, concentration: f64 },
 }
 
 /// Post-EM downstream filters applied per record at write time (the
@@ -32,7 +34,7 @@ pub enum MapqDiffFilter {
 #[derive(Debug, Clone, Copy)]
 pub struct DownstreamFilters {
     pub min_qual_phred: f64,
-    pub mapq_diff: MapqDiffFilter,
+    pub allele_balance: AlleleBalanceFilter,
 }
 
 /// Run-level counters for the run summary (≈ the old `ChunkDriverStats`). The
@@ -45,7 +47,7 @@ pub struct WriterStats {
     pub records_written: u64,
     pub records_dropped_hom_ref: u64,
     pub records_dropped_low_qual: u64,
-    pub records_dropped_low_mapq_diff_t: u64,
+    pub records_dropped_allele_balance: u64,
     pub records_unconverged: u64,
     // Rolled from the callers' per-chunk CallStats.
     pub records_dropped_low_alt_obs: u64,
@@ -159,8 +161,7 @@ impl VcfWriter {
 
     /// Per-record filter + write (the `min_alt_obs_per_sample` filter is
     /// upstream, in the caller). Order is load-bearing: hom-ref, then QUAL, then
-    /// the MAPQ-diff t-test — byte-identical to the pre-rewrite emit gate
-    /// (verified out-of-tree).
+    /// the allele-balance test.
     fn emit_or_drop(&mut self, record: Variant) -> Result<(), WriterError> {
         if !record.is_variant_call() {
             self.stats.records_dropped_hom_ref += 1;
@@ -170,10 +171,13 @@ impl VcfWriter {
             self.stats.records_dropped_low_qual += 1;
             return Ok(());
         }
-        if let MapqDiffFilter::On { min_t } = self.filters.mapq_diff
-            && record_fails_mapq_diff_t(&record, min_t)
+        if let AlleleBalanceFilter::On {
+            min_log_lr,
+            concentration,
+        } = self.filters.allele_balance
+            && record_fails_allele_balance(&record, min_log_lr, concentration)
         {
-            self.stats.records_dropped_low_mapq_diff_t += 1;
+            self.stats.records_dropped_allele_balance += 1;
             return Ok(());
         }
         if !record.diagnostics.converged {
@@ -186,105 +190,73 @@ impl VcfWriter {
 }
 
 // ---------------------------------------------------------------------------
-// MAPQ-difference Welch's-t filter (byte-identical to the pre-rewrite filter).
+// Allele-balance filter (post-EM, in `emit_or_drop`).
 // ---------------------------------------------------------------------------
 
-const MAPQ_FILTER_MIN_READS_PER_SIDE: u64 = 3;
-
-/// Debug switch for the MAPQ-diff filter. When `PVC_DEBUG_MAPQ_DIFF` is set
-/// (to any non-empty value), `record_fails_mapq_diff_t` emits one TSV line per
-/// (record, alt) to stderr with the pooled MAPQ moments and the Welch's t it
-/// computes, so a false-negative hunt can see exactly which true SNPs the
-/// filter rejects and how skewed their alt-read MAPQ actually is. Off by
-/// default; zero cost on the hot path beyond one cached env read.
-static DEBUG_MAPQ_DIFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var_os("PVC_DEBUG_MAPQ_DIFF").is_some_and(|v| !v.is_empty())
-});
-
-/// Test alias for the private MAPQ Welch's-t filter
-/// ([`record_fails_mapq_diff_t`]) so the integration suite can exercise the
-/// decision in isolation (was `driver::record_fails_mapq_diff_t_for_test`).
+/// Test alias for the private allele-balance filter
+/// ([`record_fails_allele_balance`]) so the integration suite can exercise the
+/// decision in isolation.
 #[doc(hidden)]
-pub fn record_fails_mapq_diff_t_for_test(record: &Variant, threshold: f32) -> bool {
-    record_fails_mapq_diff_t(record, threshold)
+pub fn record_fails_allele_balance_for_test(
+    record: &Variant,
+    min_log_lr: f64,
+    concentration: f64,
+) -> bool {
+    record_fails_allele_balance(record, min_log_lr, concentration)
 }
 
-/// Per-allele MAPQ moments pooled across the cohort.
-struct PooledMapqMoments {
-    n: u64,
-    sum: u64,
-    sum_of_squares: u128,
-}
+/// Allele-balance drop test. Restricted to **biallelic** records (the SNP
+/// artefact class). For each variant-carrying sample:
+///
+/// - a hom-alt carrier (or any non-het variant genotype) is *untested support*
+///   — allele balance can't see hom-alt artefacts — and keeps the site;
+/// - a het carrier whose observed (ref, alt) read split fits its expected
+///   balance (allele-balance log-LR `≥ min_log_lr`) keeps the site;
+/// - only if there is at least one het carrier and **every** variant carrier is
+///   a het that fails the test is the record dropped.
+///
+/// So a clean carrier anywhere rescues the site; the gate fires exactly when
+/// all the variant evidence is allele-balance-failing hets.
+fn record_fails_allele_balance(record: &Variant, min_log_lr: f64, concentration: f64) -> bool {
+    use crate::var_calling::allele_balance::{allele_balance_log_lr, expected_vaf};
 
-fn pool_allele_mapq(record: &Variant, allele_idx: usize) -> PooledMapqMoments {
-    let mut moments = PooledMapqMoments {
-        n: 0,
-        sum: 0,
-        sum_of_squares: 0,
-    };
+    // Biallelic only: REF + one ALT. For this shape `best_genotype[s]` is the
+    // sample's alt-copy count (the genotype enumeration orders biallelic
+    // genotypes by ascending alt count), so 0 = hom-ref, `ploidy` = hom-alt,
+    // anything between = het.
+    if record.alleles.len() != 2 {
+        return false;
+    }
+    // SNP only (v1). Indel allele balance from the AD counts is unreliable —
+    // reads spanning an indel are assigned ambiguously, so real indel hets show
+    // skewed fractions and would be wrongly dropped (measured ~29% indel-recall
+    // loss at 300×). A SNP has a single-base REF and ALT over the group span.
+    if record.alleles[0].seq.len() != 1 || record.alleles[1].seq.len() != 1 {
+        return false;
+    }
+    let ploidy = record.ploidy;
+    let mut saw_failing_het = false;
     for sample_idx in 0..record.n_samples {
-        let stats = &record.scalars_row(sample_idx)[allele_idx];
-        moments.n += u64::from(stats.num_obs);
-        moments.sum += u64::from(stats.mapq_sum);
-        moments.sum_of_squares += stats.mapq_sum_sq as u128;
-    }
-    moments
-}
-
-/// Welch's-t MAPQ-difference filter applied post-EM in `emit_or_drop`.
-fn record_fails_mapq_diff_t(record: &Variant, threshold: f32) -> bool {
-    if !threshold.is_finite() {
-        return false;
-    }
-    let n_alleles = record.alleles.len();
-    if n_alleles < 2 {
-        return false;
-    }
-    let ref_moments = pool_allele_mapq(record, 0);
-    if ref_moments.n < MAPQ_FILTER_MIN_READS_PER_SIDE {
-        return false;
-    }
-    let mean_ref = ref_moments.sum as f64 / ref_moments.n as f64;
-    let var_ref = ((ref_moments.sum_of_squares as f64 - (ref_moments.sum as f64) * mean_ref)
-        .max(0.0))
-        / ((ref_moments.n - 1) as f64);
-    for alt_idx in 1..n_alleles {
-        let alt_moments = pool_allele_mapq(record, alt_idx);
-        if alt_moments.n < MAPQ_FILTER_MIN_READS_PER_SIDE {
-            continue;
+        let alt_copies = record.best_genotype[sample_idx];
+        if alt_copies == 0 {
+            continue; // hom-ref: not a carrier
         }
-        let mean_alt = alt_moments.sum as f64 / alt_moments.n as f64;
-        let var_alt = ((alt_moments.sum_of_squares as f64 - (alt_moments.sum as f64) * mean_alt)
-            .max(0.0))
-            / ((alt_moments.n - 1) as f64);
-        let se2 = var_alt / (alt_moments.n as f64) + var_ref / (ref_moments.n as f64);
-        if se2 <= 0.0 {
-            continue;
+        if alt_copies as u32 >= u32::from(ploidy) {
+            return false; // hom-alt support — allele balance can't challenge it
         }
-        let t = (mean_alt - mean_ref) / se2.sqrt();
-        let fails = (t as f32) < threshold;
-        if *DEBUG_MAPQ_DIFF {
-            // TSV: tag chrom_id pos1 alt_idx n_ref mean_ref n_alt mean_alt t thr decision
-            // locus.start is already 1-based (see PosteriorRecord::pos_1based).
-            eprintln!(
-                "MAPQDIFF\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{:.2}\t{:.3}\t{}\t{}",
-                record.locus.chrom_id,
-                record.locus.start,
-                alt_idx,
-                ref_moments.n,
-                mean_ref,
-                alt_moments.n,
-                mean_alt,
-                t,
-                threshold,
-                if fails { "DROP" } else { "keep" },
-            );
+        let row = record.scalars_row(sample_idx);
+        let lr = allele_balance_log_lr(
+            row[0].num_obs,
+            row[1].num_obs,
+            expected_vaf(alt_copies as u8, ploidy),
+            concentration,
+        );
+        if lr >= min_log_lr {
+            return false; // a clean het — the variant is real
         }
-        if fails {
-            return true;
-        }
+        saw_failing_het = true;
     }
-    false
+    saw_failing_het
 }
 
 #[cfg(test)]
@@ -361,10 +333,10 @@ mod tests {
         }
     }
 
-    fn filters_no_mapq() -> DownstreamFilters {
+    fn filters_no_ab() -> DownstreamFilters {
         DownstreamFilters {
             min_qual_phred: 30.0,
-            mapq_diff: MapqDiffFilter::Off,
+            allele_balance: AlleleBalanceFilter::Off,
         }
     }
 
@@ -378,7 +350,7 @@ mod tests {
         let mut writer = VcfWriter::new(
             metadata_two_samples(),
             WriterConfig::new(out.clone()),
-            filters_no_mapq(),
+            filters_no_ab(),
         )
         .unwrap();
         writer
@@ -413,7 +385,7 @@ mod tests {
         let mut writer = VcfWriter::new(
             metadata_two_samples(),
             WriterConfig::new(out),
-            filters_no_mapq(),
+            filters_no_ab(),
         )
         .unwrap();
         writer
@@ -432,13 +404,13 @@ mod tests {
     #[test]
     fn emit_or_drop_counts_each_bucket() {
         // One chunk carrying one record per outcome (the MAPQ-diff gate is
-        // covered in isolation by `record_fails_mapq_diff_t_for_test`):
+        // covered in isolation by `record_fails_allele_balance_for_test`):
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
         let mut writer = VcfWriter::new(
             metadata_two_samples(),
             WriterConfig::new(out),
-            filters_no_mapq(),
+            filters_no_ab(),
         )
         .unwrap();
         let records = vec![

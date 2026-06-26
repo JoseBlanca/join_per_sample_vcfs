@@ -33,6 +33,9 @@ use pop_var_caller::pop_var_caller::var_calling::{
     VarCallingArgs, VarCallingCliError, run_var_calling,
 };
 use pop_var_caller::pop_var_caller::{PileupArgs, run_pileup};
+use pop_var_caller::var_calling::allele_balance::{
+    DEFAULT_AB_CONCENTRATION, DEFAULT_AB_MIN_LOG_LR,
+};
 use pop_var_caller::var_calling::contamination_estimation::{
     DEFAULT_C_S_INIT, DEFAULT_Q_B_INIT_PER_CLASS,
 };
@@ -46,9 +49,7 @@ use pop_var_caller::var_calling::posterior_engine::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
 use pop_var_caller::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
-use pop_var_caller::var_calling::{
-    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
-};
+use pop_var_caller::var_calling::{DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_QUAL_PHRED};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------
@@ -124,8 +125,9 @@ fn var_calling_args(
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
-            no_mapq_diff_filter: false,
-            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
+            no_allele_balance_filter: false,
+            min_allele_balance_log_lr: DEFAULT_AB_MIN_LOG_LR,
+            allele_balance_concentration: DEFAULT_AB_CONCENTRATION,
             emit_gp: false,
         },
     }
@@ -295,7 +297,7 @@ fn var_calling_regions_bed_restricts_emitted_positions() {
         let mut args = var_calling_args(fasta, out, psps, None);
         args.cohort.min_alt_obs_per_sample = 1;
         args.cohort.min_qual_phred = 0.0;
-        args.cohort.no_mapq_diff_filter = true;
+        args.cohort.no_allele_balance_filter = true;
         args
     };
 
