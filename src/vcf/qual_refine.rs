@@ -141,9 +141,76 @@ pub(super) fn refine_qual<R: VcfWritable>(
     } else {
         0.5
     };
-    let bias = tail_phred(fwd_alt, n_alt, ref_fwd).max(tail_phred(pl_alt, n_alt, ref_pl));
+    // Raw strand/position bias penalty.
+    let bias_raw = tail_phred(fwd_alt, n_alt, ref_fwd).max(tail_phred(pl_alt, n_alt, ref_pl));
+    // Power-aware down-weight: the bias test has no statistical power with only
+    // a handful of alt reads (2-3 reads pile on one strand/position by chance),
+    // so the raw penalty spuriously sinks genuine low-coverage hets. Ramp it
+    // from 0 (<= lo alt reads) to full (>= hi alt reads).
+    let bias = bias_raw * bias_power_factor(n_alt);
+
+    // Step-2 instrumentation: dump the per-record QUAL decomposition (baseline
+    // vs the two penalties) so the depth behaviour can be analysed. Env-gated
+    // (read once); mirrors the project's PVC_DEBUG_MAPQ_DIFF pattern.
+    if debug_qual_enabled() {
+        eprintln!(
+            "QUALDBG\t{}\t{}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+            record.chrom_id(),
+            record.pos_1based(),
+            n_ref,
+            n_alt,
+            n_total,
+            p_exp,
+            baseline_qual,
+            balance,
+            bias,
+        );
+    }
 
     (baseline_qual - balance - bias).max(0.0)
+}
+
+/// Power-aware scaling factor for the strand/position bias penalty: 0 at
+/// `<= lo` alt reads, ramping linearly to 1 at `>= hi`. With too few alt reads
+/// the bias test can't distinguish a real het's chance strand/position pile-up
+/// from an artifact, so its penalty is suppressed there. The ramp endpoints
+/// are tunable via `PVC_BIAS_RAMP="lo,hi"` for sweeps (default `3,7`, chosen
+/// from the GIAB alt-read distributions: bias-killed low-coverage hets carry
+/// 2-3 alt reads, medium-depth artifacts 5+).
+fn bias_power_factor(n_alt: f64) -> f64 {
+    let (lo, hi) = bias_ramp();
+    if n_alt <= lo {
+        0.0
+    } else if n_alt >= hi {
+        1.0
+    } else {
+        (n_alt - lo) / (hi - lo)
+    }
+}
+
+fn bias_ramp() -> (f64, f64) {
+    use std::sync::OnceLock;
+    static RAMP: OnceLock<(f64, f64)> = OnceLock::new();
+    *RAMP.get_or_init(|| {
+        std::env::var("PVC_BIAS_RAMP")
+            .ok()
+            .and_then(|s| parse_bias_ramp(&s))
+            .unwrap_or((3.0, 7.0))
+    })
+}
+
+/// Parse a `"lo,hi"` ramp spec; `None` if malformed or `hi <= lo`.
+fn parse_bias_ramp(s: &str) -> Option<(f64, f64)> {
+    let mut it = s.split(',');
+    let lo: f64 = it.next()?.trim().parse().ok()?;
+    let hi: f64 = it.next()?.trim().parse().ok()?;
+    (hi > lo).then_some((lo, hi))
+}
+
+fn debug_qual_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PVC_DEBUG_QUAL").is_some())
 }
 
 // ---- self-contained math (no external deps) ----------------------------
@@ -416,6 +483,29 @@ mod tests {
         // 50/100 alt against an expected 0.5 is the modal outcome → tail
         // ~1 → ~0 penalty.
         assert!(tail_phred(50.0, 100.0, 0.5) < 1.0);
+    }
+
+    #[test]
+    fn bias_power_factor_suppresses_low_alt_count() {
+        // The strand/position bias test has no power with a few alt reads, so
+        // the factor must be 0 there (a genuine low-coverage het keeps its
+        // QUAL) and ramp to full once there are enough alt reads to mean
+        // something (the medium-depth artifacts).
+        assert_eq!(bias_power_factor(2.0), 0.0); // 2 alt reads: no penalty
+        assert_eq!(bias_power_factor(3.0), 0.0); // at lo: still none
+        assert_eq!(bias_power_factor(7.0), 1.0); // at hi: full
+        assert_eq!(bias_power_factor(50.0), 1.0); // deep: full
+        let mid = bias_power_factor(5.0); // halfway up the (3,7) ramp
+        assert!((mid - 0.5).abs() < 1e-9, "mid factor = {mid}");
+    }
+
+    #[test]
+    fn bias_ramp_spec_parsing() {
+        assert_eq!(parse_bias_ramp("4,10"), Some((4.0, 10.0)));
+        assert_eq!(parse_bias_ramp(" 2 , 8 "), Some((2.0, 8.0)));
+        assert_eq!(parse_bias_ramp("7,3"), None); // hi <= lo rejected
+        assert_eq!(parse_bias_ramp("garbage"), None);
+        assert_eq!(parse_bias_ramp("5"), None); // missing hi
     }
 
     // ----- verification of the incomplete-beta tail (above the cap) -----

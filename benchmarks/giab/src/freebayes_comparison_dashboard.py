@@ -74,9 +74,14 @@ def _():
     SAMPLES = ["HG002", "HG003", "HG004"]
     CLASSES = ["snps", "indels"]
 
-    # caller label -> result subdir name under results/per_sample/<cov>/
+    # caller label -> result subdir name under results/per_sample/<cov>/.
+    # `ours-power-aware` is the high-recall preset with the step-2 QUAL fix
+    # (filter on the refined QUAL + power-aware bias penalty); `ours-baseline`
+    # is the pre-fix output (gate on the un-refined baseline QUAL) kept for
+    # before/after contrast. A subdir is skipped if it holds no per-sample VCFs.
     CALLERS = {
-        "ours-high-recall": "high-recall",
+        "ours-power-aware": "high-recall-paware",
+        "ours-baseline": "high-recall",
         "freebayes": "freebayes",
     }
 
@@ -253,13 +258,16 @@ def _(RESULTS_DIR, cmp_df, mo):
 @app.cell
 def _(cmp_df, mo):
     mo.vstack([
-        mo.md("# freebayes vs ours-high-recall — GIAB per_sample"),
+        mo.md("# freebayes vs ours (high-recall) — GIAB per_sample"),
         mo.md(
             "Cohort totals (HG002+HG003+HG004 summed), per coverage tier, "
             "split by variant class. precision = TP/(TP+FP), recall = "
             "TP/(TP+FN), F1 = harmonic mean. freebayes is QUAL ≥ 30 gated; "
-            "ours is the high-recall preset (BAQ off, DUST off, "
-            "allele-balance filter on)."
+            "ours is the high-recall preset (BAQ off, DUST off, allele-balance "
+            "filter on). **ours-power-aware** = with the step-2 QUAL fix (gate "
+            "on the refined QUAL + alt-count-ramped bias penalty); "
+            "**ours-baseline** = pre-fix (gate on the un-refined baseline QUAL) "
+            "— note its SNP-FP spike at 30x/50x that the fix removes."
         ),
         mo.md("## SNPs"),
         mo.ui.table(cmp_df.filter(cmp_df["class"] == "snps"), selection=None),
@@ -274,7 +282,11 @@ def _(alt, cmp_df, mo):
     # Side-by-side precision/recall/FP vs coverage, faceted by class, colored by
     # caller. Rendered as SEPARATE altair_chart embeds (one per metric) so Vega
     # doesn't hit "Duplicate signal name" when concatenating shared-scale charts.
-    COLORS = {"ours-high-recall": "#1f77b4", "freebayes": "#ff7f0e"}
+    COLORS = {
+        "ours-power-aware": "#1f77b4",
+        "ours-baseline": "#9ecae1",
+        "freebayes": "#ff7f0e",
+    }
 
     def _line(metric: str, title: str, y_title: str, zero_to_one: bool):
         y = alt.Y(f"{metric}:Q", title=y_title)
@@ -325,14 +337,14 @@ def _(cmp_df, mo, pl):
         .sort(["class", "cov_x"])
     )
     cols = wide.columns
-    if "ours-high-recall" in cols and "freebayes" in cols:
+    if "ours-power-aware" in cols and "freebayes" in cols:
         wide = wide.with_columns(
-            (pl.col("ours-high-recall") - pl.col("freebayes")).round(4).alias("F1_delta(ours-fb)")
+            (pl.col("ours-power-aware") - pl.col("freebayes")).round(4).alias("F1_delta(ours-fb)")
         )
     mo.vstack([
-        mo.md("## F1 head-to-head (ours − freebayes)"),
+        mo.md("## F1 head-to-head (ours-power-aware − freebayes)"),
         mo.ui.table(wide, selection=None),
-        mo.md("_Positive `F1_delta` = ours wins at that coverage/class._"),
+        mo.md("_Positive `F1_delta` = ours (power-aware QUAL) wins at that coverage/class._"),
     ])
     return
 
