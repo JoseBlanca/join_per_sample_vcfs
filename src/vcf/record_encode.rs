@@ -100,11 +100,7 @@ pub(super) fn encode<R: VcfWritable>(
     // Refine QUAL: deflate it at sites whose alt-allele support looks
     // like a systematic artifact (allele-balance + strand/position bias).
     // Affects the QUAL column only; genotypes/GQ/AF are unchanged.
-    let qual = clamp_qual(super::qual_refine::refine_qual(
-        record,
-        table,
-        record.qual_phred(),
-    ));
+    let qual = final_qual(record, table);
 
     // FILTER policy:
     //   * `PASS`     — EM converged within `max_iterations`.
@@ -249,6 +245,24 @@ fn allele_to_string(seq: &[u8], _chrom_id: u32, _pos: u32) -> Result<String, Vcf
             operation: "allele bytes UTF-8",
             source: Box::new(e),
         })
+}
+
+/// The final QUAL emitted for `record`: the engine baseline refined for
+/// artifact shape ([`refine_qual`](super::qual_refine::refine_qual)) then
+/// clamped to the VCF `f32` range.
+///
+/// This is the single source of truth for two things that must stay in
+/// lock-step: the value written to the QUAL column (here, via [`encode`])
+/// and the value the filtering layer gates `--min-qual` on (via
+/// [`CohortVcfWriter::final_qual`](super::writer::CohortVcfWriter::final_qual)).
+/// Routing both through one function makes it impossible to write a record
+/// with a QUAL below the emission threshold.
+pub(super) fn final_qual<R: VcfWritable>(record: &R, table: &[Vec<u8>]) -> f32 {
+    clamp_qual(super::qual_refine::refine_qual(
+        record,
+        table,
+        record.qual_phred(),
+    ))
 }
 
 /// Clamp QUAL to `[0, QUAL_MAX]`. `INFINITY` maps to `QUAL_MAX` (every

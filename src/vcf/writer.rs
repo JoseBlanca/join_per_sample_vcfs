@@ -196,6 +196,21 @@ impl CohortVcfWriter {
     ///   (non-UTF-8 allele bytes, invalid `Position`, …).
     /// * [`VcfWriteError::WriteRecord`] — the sink rejected the
     ///   serialised bytes.
+    /// The final (refined + clamped) QUAL this writer would emit for
+    /// `record`, computed via the same path as [`write_record`] and reusing
+    /// the cached genotype table. The filtering layer calls this so it gates
+    /// `--min-qual` on the exact value that lands in the QUAL column, rather
+    /// than the engine's pre-refinement baseline.
+    ///
+    /// [`write_record`]: Self::write_record
+    pub fn final_qual<R: VcfWritable>(&mut self, record: &R) -> f32 {
+        let table = self
+            .genotype_tables
+            .entry((record.ploidy(), record.n_alleles()))
+            .or_insert_with(|| genotype_order(record.ploidy(), record.n_alleles()));
+        super::record_encode::final_qual(record, table)
+    }
+
     pub fn write_record<R: VcfWritable>(&mut self, record: &R) -> Result<(), VcfWriteError> {
         let locus = (record.chrom_id(), record.pos_1based());
         if let Some(prev) = self.last_locus

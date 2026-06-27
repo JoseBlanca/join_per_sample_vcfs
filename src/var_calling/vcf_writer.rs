@@ -167,7 +167,14 @@ impl VcfWriter {
             self.stats.records_dropped_hom_ref += 1;
             return Ok(());
         }
-        if record.qual_phred < self.filters.min_qual_phred {
+        // Gate on the FINAL QUAL we are about to write (engine baseline
+        // refined for artifact shape, then clamped) — NOT the pre-refinement
+        // baseline. The refinement deflates depth-inflation artifacts (steady
+        // low-VAF alt support) to ~0; gating on the baseline let those through
+        // as PASS records with a written QUAL of 0. Computing it here, via the
+        // same path the writer uses, keeps the filter and the QUAL column in
+        // lock-step.
+        if f64::from(self.inner.final_qual(&record)) < self.filters.min_qual_phred {
             self.stats.records_dropped_low_qual += 1;
             return Ok(());
         }
