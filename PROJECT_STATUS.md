@@ -553,14 +553,15 @@ gitignored).
     [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs).
 
 #### Hidden-paralog per-sample summaries (`.psp` metadata section)
-- **Status:** in-flight (branch `tomato2-paralog-filter`; A1 reviewed + fixes-applied, step B1 next)
+- **Status:** in-flight (branch `tomato2-paralog-filter`; A1 + B1 reviewed + fixes-applied, step B2 next)
 - **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md)
 - **Architecture:** [hidden_paralog_psp_integration.md](doc/devel/architecture/hidden_paralog_psp_integration.md)
 - **Plan:** [paralog_psp_summaries.md](doc/devel/implementation_plans/paralog_psp_summaries.md)
 - **A1 (`.psp` metadata-section container):** done — optional zstd-framed metadata section between the block index and the trailer (trailer byte-identical; located by arithmetic; zip-bomb + trailing-byte guards). Code: [src/psp/metadata.rs](src/psp/metadata.rs), `PspWriter::attach_metadata` / `PspReader::metadata`.
-- **Latest review:** [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
-- **Latest fixes-applied:** [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
-- **Open:** Mi5 (cap not inspectable at call site — deferred, cold path); out-of-scope crate-wide `write_io_err` helper follow-up.
+- **B1 (SNP summary payload + TOML serde):** done — `SampleSummary { coverage_by_gc, heterozygosity }` data model serialised as the section's TOML document, with `validate()` invariants + version policy. Code: [src/sample_summary/mod.rs](src/sample_summary/mod.rs).
+- **Latest reviews:** [sample_summary_2026-06-29.md](doc/devel/reports/reviews/sample_summary_2026-06-29.md), [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
+- **Latest fixes-applied:** [fixes_applied_2026-06-29_sample_summary.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_sample_summary.md), [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
+- **Open:** A1-Mi5 (cap not inspectable — deferred); B1-Mi4 (`bad` closure extract once B2/B3 add a 3rd use); out-of-scope crate-wide `write_io_err` helper follow-up.
 
 ---
 

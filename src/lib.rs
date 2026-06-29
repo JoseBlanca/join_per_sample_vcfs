@@ -25,6 +25,7 @@ pub mod pileup_record;
 pub mod pop_var_caller;
 pub mod psp;
 pub mod regions;
+pub mod sample_summary;
 pub mod ssr;
 pub mod var_calling;
 pub mod vcf;
