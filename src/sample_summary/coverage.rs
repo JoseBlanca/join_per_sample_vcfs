@@ -340,7 +340,7 @@ mod tests {
                 n_variant_sites: 0,
                 min_depth: 1,
                 error_rate: 0.02,
-                lr_margin: 2.302_585,
+                lr_margin: std::f64::consts::LN_10,
             },
         };
         summary

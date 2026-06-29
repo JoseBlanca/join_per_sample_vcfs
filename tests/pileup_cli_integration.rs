@@ -55,6 +55,7 @@ fn default_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBu
         alignment_files,
         block_target_bytes: TARGET_BLOCK_BYTES,
         block_window_bp: DEFAULT_BLOCK_WINDOW_BP,
+        gc_window_bp: pop_var_caller::sample_summary::DEFAULT_GC_WINDOW_BP,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: false,
@@ -119,6 +120,23 @@ fn happy_path_default_config() {
     assert_eq!(header.chromosomes.len(), 1);
     assert_eq!(header.chromosomes[0].name, CONTIG_NAME);
     assert_eq!(header.chromosomes[0].md5, fixture_md5());
+
+    // The `.psp` carries a valid per-sample summary metadata section
+    // (hidden-paralog filter input). It parses, validates, and reflects
+    // the CLI window + recorded defaults; the covered positions produced
+    // at least one coverage tile.
+    let summary = pop_var_caller::sample_summary::SampleSummary::from_toml_bytes(
+        reader.metadata().expect("metadata section present"),
+    )
+    .expect("summary parses + validates");
+    assert_eq!(
+        summary.coverage_by_gc.window_bp,
+        pop_var_caller::sample_summary::DEFAULT_GC_WINDOW_BP
+    );
+    assert!(
+        summary.coverage_by_gc.n_tiles >= 1,
+        "covered positions should yield at least one coverage tile"
+    );
 
     // Every CLI knob got recorded.
     let params: &BTreeMap<String, ParameterValue> = &header.writer.parameters;

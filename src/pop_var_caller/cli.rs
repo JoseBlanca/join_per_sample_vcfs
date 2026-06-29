@@ -24,7 +24,9 @@ use crate::bam::segment_reader::{AlignmentFile, SegmentReadFilter};
 use crate::baq::BaqConfig;
 use crate::fasta::{ContigList, RepositoryRefFetcher};
 use crate::pileup::per_sample::baq_stream::BaqSkipCounts;
-use crate::pileup::per_sample::pileup_to_psp::{PileupToPspError, drive_region_into_writer};
+use crate::pileup::per_sample::pileup_to_psp::{
+    PileupToPspError, SampleSummaryAccumulators, drive_region_into_writer,
+};
 use crate::pileup::per_sample::read_processor::ReadProcessingConfig;
 use crate::pileup::walker::{RunSummary, WalkerConfig};
 use crate::pop_var_caller::common::{
@@ -34,6 +36,12 @@ use crate::pop_var_caller::common::{
 use crate::psp::header::{ChromosomeEntry, ParameterValue, WriterHeader, WriterProvenance};
 use crate::psp::writer::{DEFAULT_BLOCK_WINDOW_BP, MAX_BLOCK_TARGET_BYTES, PspWriter};
 use crate::regions::{ContigBounds, RegionSet};
+use crate::sample_summary::coverage::CoverageBinScheme;
+use crate::sample_summary::het::HetClassifyParams;
+use crate::sample_summary::{
+    DEFAULT_DEPTH_BIN_WIDTH, DEFAULT_DEPTH_BINS, DEFAULT_GC_BINS, DEFAULT_GC_WINDOW_BP,
+    DEFAULT_HET_ERROR_RATE, DEFAULT_HET_LR_MARGIN, DEFAULT_HET_MIN_DEPTH,
+};
 
 pub mod error_bridge;
 pub mod parsers;
@@ -182,6 +190,21 @@ pub struct PileupArgs {
     )]
     pub block_window_bp: u32,
 
+    /// Tile / GC covariate window (bases) for the per-sample coverage-by-GC
+    /// summary stored in the `.psp` metadata section (hidden-paralog filter
+    /// input). Coverage is tiled into non-overlapping windows of this width,
+    /// each contributing one (GC fraction, mean depth) sample; it is also
+    /// the analysis window the downstream filter GC-corrects at. Default
+    /// 500 bp. The remaining summary parameters (bin resolution, het error
+    /// rate / margin) use built-in defaults recorded in the `.psp`.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_GC_WINDOW_BP,
+        value_parser = clap::value_parser!(u32).range(1..),
+        help_heading = "Advanced — sample summary",
+    )]
+    pub gc_window_bp: u32,
+
     // ===== Stage 1 (shared with var-calling-from-bam) =========
     #[command(flatten)]
     pub stage1: shared_args::Stage1Args,
@@ -224,6 +247,8 @@ pub enum PileupCliError {
     ContigLengthOverflow { name: String, length: u64 },
     #[error("internal: failed to format current timestamp as RFC3339")]
     TimestampFormat,
+    #[error("sample summary: {0}")]
+    SampleSummary(#[from] crate::sample_summary::SampleSummaryError),
 }
 
 // ---------------------------------------------------------------------
@@ -304,6 +329,7 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         stage1,
         args.block_target_bytes,
         args.block_window_bp,
+        args.gc_window_bp,
         args.regions.as_deref(),
         n_threads,
     )?;
@@ -414,6 +440,24 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     let mut total_baq_skip = (!stage1.no_baq).then(BaqSkipCounts::default);
     let mut stashed_upstream: Option<AlignmentInputError> = None;
 
+    // Per-sample summary accumulators (coverage-by-GC + observed het) for
+    // the `.psp` metadata section. One bundle for the whole run, fed the
+    // written records of every region, reduced + attached before finish.
+    // The GC window is the CLI knob; the rest use recorded defaults.
+    let mut summary_acc = SampleSummaryAccumulators::new(
+        CoverageBinScheme {
+            window_bp: args.gc_window_bp,
+            gc_bins: DEFAULT_GC_BINS,
+            depth_bin_width: DEFAULT_DEPTH_BIN_WIDTH,
+            depth_bins: DEFAULT_DEPTH_BINS,
+        },
+        HetClassifyParams {
+            min_depth: DEFAULT_HET_MIN_DEPTH,
+            error_rate: DEFAULT_HET_ERROR_RATE,
+            lr_margin: DEFAULT_HET_LR_MARGIN,
+        },
+    );
+
     for region in region_set.iter() {
         // Contig transition: drop the previous contig's cached sequence.
         // Safe because the sorted RegionSet never revisits a contig, so
@@ -442,8 +486,14 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
             stage1.no_baq,
             &inputs.contigs,
             |ctx| {
-                drive_region_into_writer(ctx.walker, &mut writer, region.start, region.end)
-                    .map_err(PileupCliError::from)
+                drive_region_into_writer(
+                    ctx.walker,
+                    &mut writer,
+                    region.start,
+                    region.end,
+                    &mut summary_acc,
+                )
+                .map_err(PileupCliError::from)
             },
         )?;
 
@@ -464,16 +514,27 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
         }
     }
 
-    // 8. Finalise: fsync + atomically rename the .tmp into place.
-    let buf_sink = writer.finish().map_err(PileupToPspError::from)?;
-    finalise_output(buf_sink, &tmp_path, &args.output)?;
-
-    // 9. Surface a stashed upstream read error (the walker exited cleanly
-    //    from its own perspective, so this is the only report site).
+    // 8. An upstream read error halts the run: surface it **before** any
+    //    summary/finalise work, so a secondary serialise/finish failure on a
+    //    `.psp` we are about to discard cannot mask the real cause. The
+    //    writer's `.tmp` (header + partial blocks, never finished) is closed
+    //    and removed best-effort.
     if let Some(e) = stashed_upstream {
-        let _ = fs::remove_file(&args.output); // best-effort cleanup
+        drop(writer);
+        let _ = fs::remove_file(&tmp_path);
         return Err(PileupCliError::AlignmentInput(e));
     }
+
+    // 9. Reduce the per-sample summaries and attach them as the `.psp`
+    //    metadata section, then finalise: fsync + atomically rename the
+    //    .tmp into place. (Attach before `finish` — the section is written
+    //    between the block index and the trailer.)
+    let summary_doc = summary_acc.finish();
+    writer
+        .attach_metadata(summary_doc.to_toml_bytes()?)
+        .map_err(PileupToPspError::from)?;
+    let buf_sink = writer.finish().map_err(PileupToPspError::from)?;
+    finalise_output(buf_sink, &tmp_path, &args.output)?;
 
     // 10. Stderr run-summary block, totalled across regions.
     print_run_summary(
@@ -586,6 +647,7 @@ fn build_writer_header(
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
     block_window_bp: u32,
+    gc_window_bp: u32,
     regions_bed: Option<&Path>,
     n_threads: usize,
 ) -> Result<WriterHeader, PileupCliError> {
@@ -615,7 +677,13 @@ fn build_writer_header(
 
     let input_crams: Vec<String> = alignment_paths.iter().map(|p| basename(p)).collect();
     let input_fasta = basename(fasta_path);
-    let mut parameters = effective_parameters(args, block_target_bytes, block_window_bp, n_threads);
+    let mut parameters = effective_parameters(
+        args,
+        block_target_bytes,
+        block_window_bp,
+        gc_window_bp,
+        n_threads,
+    );
     // Record the analysis-regions BED basename when one was supplied, so
     // the `.psp` self-describes that it covers only those regions (the
     // full path is also in `command_line`). `regions_count` is added by
@@ -652,6 +720,7 @@ fn effective_parameters(
     args: &shared_args::Stage1Args,
     block_target_bytes: usize,
     block_window_bp: u32,
+    gc_window_bp: u32,
     n_threads: usize,
 ) -> BTreeMap<String, ParameterValue> {
     let mut p = BTreeMap::new();
@@ -734,6 +803,13 @@ fn effective_parameters(
         "block_window_bp".into(),
         ParameterValue::Integer(block_window_bp as i64),
     );
+    // Sample-summary (hidden-paralog filter) GC window. The remaining
+    // summary parameters (bin resolution, het ε / margin / min-depth) are
+    // recorded directly in the metadata-section document rather than here.
+    p.insert(
+        "gc_window_bp".into(),
+        ParameterValue::Integer(gc_window_bp as i64),
+    );
     p
 }
 
@@ -812,6 +888,7 @@ mod tests {
             alignment_files,
             block_target_bytes: TARGET_BLOCK_BYTES,
             block_window_bp: DEFAULT_BLOCK_WINDOW_BP,
+            gc_window_bp: DEFAULT_GC_WINDOW_BP,
             stage1: shared_args::Stage1Args {
                 min_mapq: DEFAULT_MIN_MAPQ,
                 no_baq: false,
@@ -865,6 +942,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            args.gc_window_bp,
             4,
         );
         // Sanity: every knob shows up.
@@ -888,6 +966,7 @@ mod tests {
             "threads",
             "block_target_bytes",
             "block_window_bp",
+            "gc_window_bp",
         ] {
             assert!(p.contains_key(*key), "missing parameter: {key}");
         }
@@ -925,6 +1004,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            args.gc_window_bp,
             None,
             4,
         )
@@ -960,6 +1040,7 @@ mod tests {
             &args.stage1,
             args.block_target_bytes,
             args.block_window_bp,
+            args.gc_window_bp,
             None,
             4,
         )

@@ -71,6 +71,7 @@ fn pileup_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBuf
         alignment_files,
         block_target_bytes: pop_var_caller::psp::writer::TARGET_BLOCK_BYTES,
         block_window_bp: pop_var_caller::psp::writer::DEFAULT_BLOCK_WINDOW_BP,
+        gc_window_bp: pop_var_caller::sample_summary::DEFAULT_GC_WINDOW_BP,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: true, // skip BAQ — tiny synthetic reads don't need it

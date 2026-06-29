@@ -27,6 +27,32 @@ use thiserror::Error;
 /// only `1..=SAMPLE_SUMMARY_VERSION`.
 pub const SAMPLE_SUMMARY_VERSION: u16 = 1;
 
+/// Default tile / GC covariate window in bp (architecture Premise 3). The
+/// `pileup --gc-window-bp` flag overrides it.
+pub const DEFAULT_GC_WINDOW_BP: u32 = 500;
+
+/// Default number of GC bins (≈ 2 % GC resolution). Tuning, not
+/// architecture (Premise 2) — recorded in the `.psp` so it can change
+/// without breaking readers.
+pub const DEFAULT_GC_BINS: u32 = 50;
+
+/// Default depth-bin width in covered-bases-mean-depth units.
+pub const DEFAULT_DEPTH_BIN_WIDTH: f64 = 0.5;
+
+/// Default number of regular depth bins (so the regular range is
+/// `0..DEFAULT_DEPTH_BINS * DEFAULT_DEPTH_BIN_WIDTH` = `0..100×`, with an
+/// overflow bin above — generous for high-copy paralogs at typical depth).
+pub const DEFAULT_DEPTH_BINS: u32 = 200;
+
+/// Default minimum total fragment depth for a site to enter the het call.
+pub const DEFAULT_HET_MIN_DEPTH: u32 = 4;
+
+/// Default per-read error rate `ε` for the het hom-model.
+pub const DEFAULT_HET_ERROR_RATE: f64 = 0.02;
+
+/// Default het confidence margin `M` (nats) = `ln 10`, i.e. 10:1 odds.
+pub const DEFAULT_HET_LR_MARGIN: f64 = std::f64::consts::LN_10;
+
 /// The per-sample summary document stored (TOML, then zstd-framed) in the
 /// `.psp` metadata section. Serialises with kebab-case keys; `version`
 /// precedes the two tables so the TOML is well-formed (top-level scalars
@@ -304,7 +330,7 @@ mod tests {
                 n_variant_sites: 250,
                 min_depth: 4,
                 error_rate: 0.02,
-                lr_margin: 2.302_585, // ln(10)
+                lr_margin: std::f64::consts::LN_10,
             },
         }
     }
