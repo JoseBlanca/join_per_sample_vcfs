@@ -88,9 +88,17 @@ that routed het through a Stage-2 cohort pre-pass was over-engineered.
 Hobs is used as a **prior** that places a sample on the selfer↔outbred
 axis (tomato2 F ranged 0.00–0.97, §7). Separating F≈0 from F≈0.9 is
 coarse, so a rough estimate suffices. In the same walk we call a rough
-per-site genotype from the allele fractions (hom-ref / het / hom-alt by
-VAF, with min depth + a real minor allele) and accumulate the het
-fraction → **one scalar per sample**.
+per-site genotype for each variant site from its `(k_alt, n_total)`
+fragment counts — **not** a depth-blind VAF threshold but a **binomial
+het-vs-hom likelihood ratio** (`logLR = n·ln½ − k·ln(1−ε) − (n−k)·ln ε`;
+the binomial coefficient cancels, so it is a couple of multiplies). A
+confidence margin `M` splits variant sites three ways: **confident het**
+(`logLR > +M`), **confident hom-alt** (`logLR < −M`), and **ambiguous**
+(`|logLR| ≤ M`). This is depth-aware by construction — at high depth the
+LR is sharp and almost nothing is ambiguous; at ~6× many sites land in
+ambiguous, exactly as they should. `Hobs = n_het / (n_het + n_hom_alt)`
+(the confident ratio); `n_ambiguous` is kept as the **uncertainty
+signal** (large in low-coverage samples → trust their Hobs less).
 
 **Residual bias, bounded:** collapsed paralogs inflate the het count
 (their capped-below-1 VAF often reads ~0.5), biasing Hobs up / F down.
@@ -136,13 +144,13 @@ gate only if the bias shows up.
 - **At finish:** the raw histogram is serialized into the metadata
   section (Premise 2 stores it raw; the curve / single-copy-scale fit is
   downstream, in var-calling).
-- **Het rides the same walk** (Premise 1b): a running
-  `(n_het_sites, n_variant_sites)` tally from the rough per-site
-  genotype calls, also persisted across regions and finalized once.
-  It reduces to **one scalar** (`Hobs = n_het / n_variant`) — no
-  histogram (see Premise 2's coverage-vs-het asymmetry).
-- **Cost:** a few-KB array + two counters, O(1) per record, on a thread
-  that is already the serial bottleneck's *consumer*, not the
+- **Het rides the same walk** (Premise 1b): a running tally of
+  `(n_het, n_hom_alt, n_ambiguous)` over variant sites from the per-site
+  binomial-LR genotype calls, also persisted across regions and finalized
+  once. It reduces to **four counts** (the three + `n_variant` = their
+  sum), not a histogram (see Premise 2's coverage-vs-het asymmetry).
+- **Cost:** a few-KB array + a handful of counters, O(1) per record, on a
+  thread that is already the serial bottleneck's *consumer*, not the
   bottleneck. Expected to be in the noise; to be measured, not assumed.
 
 Open sub-questions deferred: depth-axis bounding for the histogram; the
@@ -160,14 +168,18 @@ The two summaries store at **different fidelities, on purpose**:
   maybe quantiles), so keeping raw sufficient statistics lets var-calling
   re-fit without re-running the pileup. Mirrors the `.psp` carrying
   `mapq-sum` / `mapq-sum-sq` raw and computing Welch's-t downstream.
-- **Observed het → one scalar** (`Hobs`), stored as the two counts
-  `(n_het_sites, n_variant_sites)` so the rate *and its support* survive
-  (a sample backed by 50 variant sites is not trusted like one backed by
-  50 000; downstream may shrink low-support estimates). There is **no
-  downstream fit** to preserve raw stats for — rough genotype → het
-  fraction is a settled computation — so a histogram would buy nothing.
-  This is the asymmetry: raw stats are worth it only when a calibrating
-  model consumes them.
+- **Observed het → four counts** over variant sites: `n_het_sites`,
+  `n_hom_alt_sites`, `n_ambiguous_sites` (and `n_variant_sites` = their
+  sum). `Hobs = n_het / (n_het + n_hom_alt)` and its support (and the
+  ambiguous fraction = low-coverage uncertainty) are all recoverable.
+  There is **no downstream fit** to preserve raw stats for — the
+  binomial-LR three-way classification at a *fixed* margin `M` is a
+  settled computation — so a logLR histogram would buy nothing the four
+  counts don't. This is the asymmetry: raw distributions are worth it only
+  when a calibrating model consumes them (coverage), not when the
+  statistic is settled (het). The price of counts-not-histogram: `M` is
+  frozen at pileup time (recorded), so retuning the het/hom boundary means
+  re-running the pileup — acceptable for a settled threshold.
 
 ### Coverage histogram details
 
@@ -194,11 +206,13 @@ Bin-resolution defaults are tuning, not architecture — they are
 recorded in the section so they can change without breaking readers.
 The curve and single-copy scale are **derived downstream**, not stored.
 
-### Het scalar
+### Het counts
 
-`n_het_sites` and `n_variant_sites` (two integers) + the rough-genotype
-thresholds used (min depth, minor-allele VAF band) recorded for
-reproducibility. `Hobs = n_het / n_variant` is formed downstream.
+`n_het_sites`, `n_hom_alt_sites`, `n_ambiguous_sites`, `n_variant_sites`
+(four integers, the last = sum of the first three) + the rough-genotype
+parameters recorded for reproducibility: `min_depth`, the error rate `ε`,
+and the confidence margin `M`. `Hobs = n_het / (n_het + n_hom_alt)` is
+formed downstream; `n_ambiguous` is the per-sample uncertainty weight.
 
 ## Premise 3 — the GC window scale *(SETTLED)*
 
@@ -264,7 +278,8 @@ metadata section is:
   ([`contamination_artefact.rs`](../../../src/pop_var_caller/contamination_artefact.rs#L184)),
   one serialization stack. The coverage histogram (Premise 2) is a flat
   row-major integer array + the bin-scheme / window scalars; the het
-  summary is the two counts + recorded thresholds — both plain TOML.
+  summary is the four counts + recorded parameters (`min_depth`, `ε`,
+  `M`) — both plain TOML.
 
 **Why not header-reserve-and-patch** (considered): the size *is* fixed
 by config so reservation is feasible, but it forces `W: Write + Seek` +

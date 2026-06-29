@@ -335,10 +335,12 @@ mod tests {
             coverage_by_gc: h,
             heterozygosity: super::super::HetCounts {
                 n_het_sites: 0,
+                n_hom_alt_sites: 0,
+                n_ambiguous_sites: 0,
                 n_variant_sites: 0,
                 min_depth: 1,
-                het_vaf_lo: 0.3,
-                het_vaf_hi: 0.7,
+                error_rate: 0.02,
+                lr_margin: 2.302_585,
             },
         };
         summary

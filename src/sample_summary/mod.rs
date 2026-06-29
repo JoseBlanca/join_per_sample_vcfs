@@ -7,15 +7,17 @@
 //! - a **coverage-by-GC histogram** — a raw 2-D count matrix of tiled
 //!   windows keyed by `(GC fraction, covered-bases mean depth)`, from
 //!   which var-calling fits the depth∼GC curve and single-copy scale;
-//! - **observed heterozygosity** — two counts (`n_het_sites`,
-//!   `n_variant_sites`) from a rough per-site genotype call.
+//! - **observed heterozygosity** — four counts (confident het / hom-alt /
+//!   ambiguous / total variant sites) from a rough per-site binomial-LR
+//!   genotype call.
 //!
 //! The TOML document model + serialisation lives here; the accumulators
 //! that *produce* the summaries from the Stage-1 stream live in submodules
-//! ([`coverage`]; het in a later step). The model fit that *consumes* the
-//! histogram lives downstream in var-calling.
+//! ([`coverage`], [`het`]). The model fit that *consumes* the histogram
+//! lives downstream in var-calling.
 
 pub mod coverage;
+pub mod het;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -70,26 +72,39 @@ pub struct CoverageByGcHistogram {
     pub counts: Vec<u32>,
 }
 
-/// Observed-heterozygosity counts: among sites where the sample carries a
-/// real minor allele (`n_variant_sites`), how many were called
-/// heterozygous (`n_het_sites`). `Hobs = n_het_sites / n_variant_sites`
-/// is formed downstream; storing the counts preserves the support so a
-/// low-evidence estimate can be down-weighted.
+/// Observed-heterozygosity counts over variant sites, from the rough
+/// per-site **binomial het-vs-hom likelihood-ratio** genotype call
+/// (architecture Premise 1b): each variant site is confident-het
+/// (`logLR > +margin`), confident-hom-alt (`logLR < −margin`), or
+/// ambiguous (`|logLR| ≤ margin`). `Hobs = n_het / (n_het + n_hom_alt)`
+/// is formed downstream; `n_ambiguous_sites` is the per-sample
+/// uncertainty weight (large at low coverage). Counts, not a logLR
+/// histogram, because the classification margin is a *settled* threshold
+/// (contrast the still-calibrating coverage curve — Premise 2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct HetCounts {
-    /// Sites called heterozygous (minor-allele VAF in the het band).
+    /// Variant sites called confident heterozygous (`logLR > +margin`).
     pub n_het_sites: u64,
-    /// Sites with a real minor allele (the denominator of `Hobs`).
+    /// Variant sites called confident homozygous-alt (`logLR < −margin`).
+    pub n_hom_alt_sites: u64,
+    /// Variant sites where het vs hom-alt is unresolved
+    /// (`|logLR| ≤ margin`) — the uncertainty signal.
+    pub n_ambiguous_sites: u64,
+    /// Total variant sites; must equal
+    /// `n_het_sites + n_hom_alt_sites + n_ambiguous_sites`.
     pub n_variant_sites: u64,
-    /// Minimum total depth for a site to be considered (recorded for
-    /// reproducibility of the rough genotype call).
+    /// Minimum total depth for a site to be considered a candidate
+    /// (recorded for reproducibility of the rough genotype call).
     pub min_depth: u32,
-    /// Lower edge of the het VAF band (inclusive).
-    pub het_vaf_lo: f64,
-    /// Upper edge of the het VAF band (inclusive).
-    pub het_vaf_hi: f64,
+    /// Per-read error rate `ε` in the hom-alt model `Binomial(n, 1 − ε)`.
+    /// In the open interval `(0, 1)` (the LR's `ln ε` / `ln(1 − ε)` are
+    /// `−∞` at the endpoints).
+    pub error_rate: f64,
+    /// Confidence margin `M` (nats) splitting het / hom-alt / ambiguous.
+    /// `>= 0`.
+    pub lr_margin: f64,
 }
 
 /// Failure modes for building / parsing a [`SampleSummary`].
@@ -141,8 +156,8 @@ pub enum SampleSummaryError {
         expected: usize,
     },
     /// A field violated a value invariant (zero where positive required,
-    /// non-finite float, out-of-order VAF band, het exceeding variant
-    /// sites).
+    /// non-finite float, error rate outside `(0, 1)`, negative margin, or
+    /// the het class counts not summing to `n_variant_sites`).
     #[error("invalid sample-summary field {field}: {reason}")]
     InvalidField { field: &'static str, reason: String },
 }
@@ -230,27 +245,35 @@ impl CoverageByGcHistogram {
 impl HetCounts {
     fn validate(&self) -> Result<(), SampleSummaryError> {
         let bad = |field, reason: String| SampleSummaryError::InvalidField { field, reason };
-        if self.n_het_sites > self.n_variant_sites {
+        // The three class counts must sum to the recorded total. Checked
+        // with `checked_add` so a hostile/corrupt overflowing triple is
+        // caught rather than wrapping to a value that happens to match.
+        let sum = self
+            .n_het_sites
+            .checked_add(self.n_hom_alt_sites)
+            .and_then(|s| s.checked_add(self.n_ambiguous_sites));
+        if sum != Some(self.n_variant_sites) {
             return Err(bad(
-                "heterozygosity.n-het-sites",
+                "heterozygosity.n-variant-sites",
                 format!(
-                    "{} exceeds n-variant-sites {}",
-                    self.n_het_sites, self.n_variant_sites
+                    "{} != n-het-sites {} + n-hom-alt-sites {} + n-ambiguous-sites {}",
+                    self.n_variant_sites,
+                    self.n_het_sites,
+                    self.n_hom_alt_sites,
+                    self.n_ambiguous_sites,
                 ),
             ));
         }
-        for (field, v) in [
-            ("heterozygosity.het-vaf-lo", self.het_vaf_lo),
-            ("heterozygosity.het-vaf-hi", self.het_vaf_hi),
-        ] {
-            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
-                return Err(bad(field, format!("must be finite in [0, 1], got {v}")));
-            }
-        }
-        if self.het_vaf_lo > self.het_vaf_hi {
+        if !(self.error_rate.is_finite() && self.error_rate > 0.0 && self.error_rate < 1.0) {
             return Err(bad(
-                "heterozygosity.het-vaf-lo",
-                format!("{} exceeds het-vaf-hi {}", self.het_vaf_lo, self.het_vaf_hi),
+                "heterozygosity.error-rate",
+                format!("must be finite in (0, 1), got {}", self.error_rate),
+            ));
+        }
+        if !(self.lr_margin.is_finite() && self.lr_margin >= 0.0) {
+            return Err(bad(
+                "heterozygosity.lr-margin",
+                format!("must be finite and >= 0, got {}", self.lr_margin),
             ));
         }
         Ok(())
@@ -276,10 +299,12 @@ mod tests {
             },
             heterozygosity: HetCounts {
                 n_het_sites: 100,
+                n_hom_alt_sites: 120,
+                n_ambiguous_sites: 30,
                 n_variant_sites: 250,
                 min_depth: 4,
-                het_vaf_lo: 0.3,
-                het_vaf_hi: 0.7,
+                error_rate: 0.02,
+                lr_margin: 2.302_585, // ln(10)
             },
         }
     }
@@ -303,13 +328,22 @@ mod tests {
             "n-skipped-tiles",
             "[heterozygosity]",
             "n-het-sites",
+            "n-hom-alt-sites",
+            "n-ambiguous-sites",
             "n-variant-sites",
-            "het-vaf-lo",
+            "error-rate",
+            "lr-margin",
         ] {
             assert!(body.contains(key), "wire key {key:?} absent from:\n{body}");
         }
         // snake_case must not leak.
-        for forbidden in ["window_bp", "gc_bins", "n_het_sites"] {
+        for forbidden in [
+            "window_bp",
+            "gc_bins",
+            "n_het_sites",
+            "n_hom_alt_sites",
+            "lr_margin",
+        ] {
             assert!(!body.contains(forbidden), "snake_case {forbidden:?} leaked");
         }
     }
@@ -333,24 +367,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inverted_vaf_band() {
-        let mut s = sample();
-        s.heterozygosity.het_vaf_lo = 0.8;
-        s.heterozygosity.het_vaf_hi = 0.6;
-        let err = s.to_toml_bytes().expect_err("inverted band must fail");
-        assert!(
-            matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.het-vaf-lo"),
-            "got {err:?}"
-        );
+    fn rejects_error_rate_out_of_range() {
+        for bad_eps in [0.0, 1.0, -0.1, f64::NAN] {
+            let mut s = sample();
+            s.heterozygosity.error_rate = bad_eps;
+            let err = s.to_toml_bytes().expect_err("bad error-rate must fail");
+            assert!(
+                matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.error-rate"),
+                "error_rate {bad_eps} -> {err:?}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_het_exceeding_variant_sites() {
+    fn rejects_count_sum_mismatch() {
         let mut s = sample();
-        s.heterozygosity.n_het_sites = s.heterozygosity.n_variant_sites + 1;
-        let err = s.to_toml_bytes().expect_err("het > variant must fail");
+        // n_variant no longer equals het + hom_alt + ambiguous.
+        s.heterozygosity.n_variant_sites += 1;
+        let err = s.to_toml_bytes().expect_err("sum mismatch must fail");
         assert!(
-            matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.n-het-sites"),
+            matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.n-variant-sites"),
             "got {err:?}"
         );
     }
@@ -458,34 +494,34 @@ mod tests {
     fn from_toml_bytes_rejects_value_invariant_violation() {
         let body = String::from_utf8(sample().to_toml_bytes().unwrap())
             .unwrap()
-            // Make n-het-sites (100) exceed n-variant-sites (250 -> 50).
-            .replace("n-variant-sites = 250", "n-variant-sites = 50");
+            // Break the count identity (250 = 100 + 120 + 30 -> 999).
+            .replace("n-variant-sites = 250", "n-variant-sites = 999");
         let err = SampleSummary::from_toml_bytes(body.as_bytes())
             .expect_err("value invariant must be enforced on parse");
         assert!(
-            matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.n-het-sites"),
+            matches!(err, SampleSummaryError::InvalidField { field, .. } if field == "heterozygosity.n-variant-sites"),
             "got {err:?}"
         );
     }
 
     proptest::proptest! {
         /// Round-trip over random valid documents, including boundary values
-        /// (`gc_bins`/`depth_bins` at 1, `u32::MAX` counts, `lo == hi`,
-        /// `min_depth = 0`). Catches float-format / large-integer drift and
-        /// kebab-case key collisions a single hand-built example misses.
+        /// (`gc_bins`/`depth_bins` at 1, `u32::MAX` counts, the count
+        /// identity, error-rate near the open-interval edges, `min_depth =
+        /// 0`). Catches float-format / large-integer drift and kebab-case
+        /// key collisions a single hand-built example misses.
         #[test]
         fn round_trips_arbitrary_valid_summary(
             gc_bins in 1u32..6,
             depth_bins in 1u32..6,
             depth_bin_width in 0.001f64..1e6,
-            lo in 0.0f64..=1.0,
-            band in 0.0f64..=1.0,
+            error_rate in 0.000_1f64..0.999_9,
+            lr_margin in 0.0f64..50.0,
             n_het in 0u64..1000,
-            extra in 0u64..1000,
+            n_hom in 0u64..1000,
+            n_amb in 0u64..1000,
             window_bp in 1u32..100_000,
         ) {
-            let het_vaf_lo = lo;
-            let het_vaf_hi = (lo + band).min(1.0);
             let cells = (gc_bins as usize) * (depth_bins as usize + 1);
             let s = SampleSummary {
                 version: SAMPLE_SUMMARY_VERSION,
@@ -494,16 +530,18 @@ mod tests {
                     gc_bins,
                     depth_bin_width,
                     depth_bins,
-                    n_tiles: u64::from(n_het) + 7,
+                    n_tiles: n_het + 7,
                     n_skipped_tiles: 3,
                     counts: vec![u32::MAX; cells],
                 },
                 heterozygosity: HetCounts {
                     n_het_sites: n_het,
-                    n_variant_sites: n_het + extra,
+                    n_hom_alt_sites: n_hom,
+                    n_ambiguous_sites: n_amb,
+                    n_variant_sites: n_het + n_hom + n_amb,
                     min_depth: 0,
-                    het_vaf_lo,
-                    het_vaf_hi,
+                    error_rate,
+                    lr_margin,
                 },
             };
             let bytes = s.to_toml_bytes().expect("serialise");

@@ -553,16 +553,17 @@ gitignored).
     [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs).
 
 #### Hidden-paralog per-sample summaries (`.psp` metadata section)
-- **Status:** in-flight (branch `tomato2-paralog-filter`; A1 + B1 + B2 reviewed + fixes-applied; B3 (het accumulator) pending a spec/arch amendment — three-way het/hom/ambiguous classification via a binomial LR, under discussion)
+- **Status:** in-flight (branch `tomato2-paralog-filter`; A1 + B1 + B2 + B3 reviewed + fixes-applied; C1 (CLI flag) next)
 - **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md)
 - **Architecture:** [hidden_paralog_psp_integration.md](doc/devel/architecture/hidden_paralog_psp_integration.md)
 - **Plan:** [paralog_psp_summaries.md](doc/devel/implementation_plans/paralog_psp_summaries.md)
 - **A1 (`.psp` metadata-section container):** done — optional zstd-framed metadata section between the block index and the trailer (trailer byte-identical; located by arithmetic; zip-bomb + trailing-byte guards). Code: [src/psp/metadata.rs](src/psp/metadata.rs), `PspWriter::attach_metadata` / `PspReader::metadata`.
 - **B1 (SNP summary payload + TOML serde):** done — `SampleSummary { coverage_by_gc, heterozygosity }` data model serialised as the section's TOML document, with `validate()` invariants + version policy. Code: [src/sample_summary/mod.rs](src/sample_summary/mod.rs).
 - **B2 (coverage-by-GC accumulator):** done — single-pass tiled fold producing the histogram. Code: [src/sample_summary/coverage.rs](src/sample_summary/coverage.rs).
-- **Latest reviews:** [coverage_accumulator_2026-06-29.md](doc/devel/reports/reviews/coverage_accumulator_2026-06-29.md), [sample_summary_2026-06-29.md](doc/devel/reports/reviews/sample_summary_2026-06-29.md), [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
-- **Latest fixes-applied:** [fixes_applied_2026-06-29_coverage_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_coverage_accumulator.md), [fixes_applied_2026-06-29_sample_summary.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_sample_summary.md), [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
-- **Open:** B3 het-accumulator design amendment (three-way het/hom/ambiguous via binomial LR) under discussion; A1-Mi5 (cap not inspectable — deferred); B1-Mi4 (`bad` closure extract once a 3rd use appears); B2-Mi3 (scheme/histogram field dup — deferred); out-of-scope crate-wide `write_io_err` helper follow-up.
+- **B3 (het accumulator):** done — binomial het-vs-hom LR three-way classification (confident het / hom-alt / ambiguous) over `SiteCounts`; amended spec §3 + arch Premise 1b/2 + B1 `HetCounts` (two→four counts). Code: [src/sample_summary/het.rs](src/sample_summary/het.rs).
+- **Latest reviews:** [het_accumulator_2026-06-29.md](doc/devel/reports/reviews/het_accumulator_2026-06-29.md), [coverage_accumulator_2026-06-29.md](doc/devel/reports/reviews/coverage_accumulator_2026-06-29.md), [sample_summary_2026-06-29.md](doc/devel/reports/reviews/sample_summary_2026-06-29.md), [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
+- **Latest fixes-applied:** [fixes_applied_2026-06-29_het_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_het_accumulator.md), [fixes_applied_2026-06-29_coverage_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_coverage_accumulator.md), [fixes_applied_2026-06-29_sample_summary.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_sample_summary.md), [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
+- **Open:** A1-Mi5 (cap not inspectable — deferred); B1-Mi4 (`bad` closure extract once a 3rd use appears); B2-Mi3 (scheme/histogram field dup — deferred); out-of-scope crate-wide `write_io_err` helper follow-up.
 
 ---
 

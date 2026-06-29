@@ -66,6 +66,22 @@ Two corollaries that shaped everything below:
   (not the derived inbreeding coefficient F = 1 − Hobs/Hexp, though they are
   equivalent); it must be **per sample** because a panel mixes near-homozygous
   inbreds with more-heterozygous wild relatives.
+
+  Hobs is a single-sample observable, estimated in the Stage-1 pileup from a
+  **rough per-site genotype** — no cohort needed. The rough call is **not** a
+  VAF threshold (depth-blind: at ~6× a true het reads VAF ≈ 1/6…5/6 from
+  sampling alone). It is a **depth-aware binomial likelihood ratio** between the
+  het model (alt ~ Binomial(n, ½)) and the hom-alt model (alt ~ Binomial(n,
+  1−ε)) for a variant site's `(k_alt, n_total)` fragment counts; the binomial
+  coefficient cancels, so `logLR = n·ln½ − k·ln(1−ε) − (n−k)·ln ε` is a couple
+  of multiplies. A confidence margin `M` splits variant sites three ways —
+  **confident het** (`logLR > +M`), **confident hom-alt** (`logLR < −M`), and
+  **ambiguous** (`|logLR| ≤ M`). `Hobs = n_het / (n_het + n_hom_alt)` is the
+  confident-only ratio; `n_ambiguous` is retained as the **uncertainty signal**
+  (it grows at low coverage, telling the model to trust a sample's Hobs less).
+  The three counts (+ `n_variant`, `ε`, `M`) are stored; `M` is a settled
+  threshold frozen at pileup time (contrast the coverage histogram, whose model
+  is still being calibrated — §6/§9).
 - **Divergence (MQDiff / MQDiffT)** — ALT-vs-REF mean mapping quality. Negative ⇒
   ALT reads map worse ⇒ divergent. Shared with introgression, so **only usable
   coverage-gated** (§5.4). **SNP-only**: indel-carrying reads get low MAPQ from the
