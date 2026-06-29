@@ -69,6 +69,11 @@ pub struct PspReader<R: Read + Seek> {
     trailer: Trailer,
     /// Decoded block index. Empty for a zero-block file.
     index: Vec<BlockIndexEntry>,
+    /// Decompressed payload of the optional metadata section (the gap
+    /// between the block index and the trailer), or `None` when the
+    /// file carries no section. Opaque to the container core; a
+    /// kind-specific parser interprets the bytes.
+    metadata: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> std::fmt::Debug for PspReader<R> {
@@ -93,8 +98,10 @@ impl<R: Read + Seek> PspReader<R> {
     /// # Errors
     ///
     /// `Err(PspReadError::Io { .. })` on I/O failure;
-    /// `BadTrailerMagic` / `IndexChecksum` / `IndexTrailingBytes` on
-    /// trailer or index corruption; `BadHeadMagic` /
+    /// `BadTrailerMagic` / `IndexChecksum` / `IndexTrailingBytes` /
+    /// `IndexOverrunsTrailer` on trailer or index corruption;
+    /// `Zstd` / `MetadataSectionTooLarge` on a corrupt or oversized
+    /// metadata section; `BadHeadMagic` /
     /// `BadHeaderLength` / `HeaderToml` / `InvalidHeaderField` /
     /// `SentinelMismatch` / `UnsupportedFormatVersion` /
     /// `UnknownRequiredColumn` / `MissingRequiredColumn` /
@@ -167,14 +174,22 @@ impl<R: Read + Seek> PspReader<R> {
         // `unwrap_or(u64::MAX)` so the path stays panic-free in
         // debug and emits a clamped (but never wrapping) count in
         // release.
+        // The block index ends at `index_offset + index_byte_length`.
+        // The bytes from there to the trailer start are the optional
+        // metadata section (architecture
+        // `doc/devel/architecture/hidden_paralog_psp_integration.md`); a
+        // zero-length gap means no section. Only an index that runs
+        // *past* the trailer start (or overflows `u64`) is corruption.
         let trailer_start = file_len - TRAILER_BYTES as u64;
-        let computed_end = trailer.index_offset.checked_add(trailer.index_byte_length);
-        if computed_end != Some(trailer_start) {
-            let trailing_bytes = computed_end
-                .and_then(|end| trailer_start.checked_sub(end))
-                .unwrap_or(0) as usize;
-            return Err(PspReadError::IndexTrailingBytes { trailing_bytes });
-        }
+        let index_end = trailer
+            .index_offset
+            .checked_add(trailer.index_byte_length)
+            .filter(|&end| end <= trailer_start)
+            .ok_or(PspReadError::IndexOverrunsTrailer {
+                index_offset: trailer.index_offset,
+                index_byte_length: trailer.index_byte_length,
+                trailer_start,
+            })?;
 
         // 3. Read + decode the block index, then verify the XXH3-64
         //    checksum the trailer stamped over it.
@@ -193,6 +208,21 @@ impl<R: Read + Seek> PspReader<R> {
             });
         }
         let index = decode_index(&index_bytes, trailer.n_blocks)?;
+
+        // 3b. Read the optional metadata section — the bytes between the
+        //     index end and the trailer start. The cursor is already at
+        //     `index_end` after the index `read_exact`, so no seek is
+        //     needed. An empty gap means no section.
+        let metadata_len = (trailer_start - index_end) as usize;
+        let metadata = if metadata_len == 0 {
+            None
+        } else {
+            let mut frame = vec![0u8; metadata_len];
+            source
+                .read_exact(&mut frame)
+                .map_err(io_err("metadata section"))?;
+            Some(super::metadata::decompress_metadata(&frame)?)
+        };
 
         // 4. Read + parse the framed header. Body length is
         //    range-checked before allocating so a tampered length
@@ -297,6 +327,7 @@ impl<R: Read + Seek> PspReader<R> {
             header,
             trailer,
             index,
+            metadata,
         })
     }
 
@@ -304,6 +335,14 @@ impl<R: Read + Seek> PspReader<R> {
     /// returns — does not require any block reads.
     pub fn header(&self) -> &ParsedHeader {
         &self.header
+    }
+
+    /// Decompressed bytes of the optional metadata section, or `None`
+    /// when the file carries none. The payload is opaque here — a
+    /// kind-specific parser (e.g. the SNP per-sample summary) interprets
+    /// it. Available immediately after [`Self::new`]; no block reads.
+    pub fn metadata(&self) -> Option<&[u8]> {
+        self.metadata.as_deref()
     }
 
     /// Decoded block index, in genomic order. Empty for a

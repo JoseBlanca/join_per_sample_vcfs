@@ -36,6 +36,7 @@ pub(crate) mod errors;
 pub mod header;
 pub(crate) mod index;
 pub mod kind;
+pub(crate) mod metadata;
 pub mod reader;
 pub(crate) mod registry;
 pub(crate) mod registry_ssr;

@@ -552,6 +552,16 @@ gitignored).
     end-to-end integration test exists in
     [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs).
 
+#### Hidden-paralog per-sample summaries (`.psp` metadata section)
+- **Status:** in-flight (branch `tomato2-paralog-filter`; A1 reviewed + fixes-applied, step B1 next)
+- **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md)
+- **Architecture:** [hidden_paralog_psp_integration.md](doc/devel/architecture/hidden_paralog_psp_integration.md)
+- **Plan:** [paralog_psp_summaries.md](doc/devel/implementation_plans/paralog_psp_summaries.md)
+- **A1 (`.psp` metadata-section container):** done — optional zstd-framed metadata section between the block index and the trailer (trailer byte-identical; located by arithmetic; zip-bomb + trailing-byte guards). Code: [src/psp/metadata.rs](src/psp/metadata.rs), `PspWriter::attach_metadata` / `PspReader::metadata`.
+- **Latest review:** [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
+- **Latest fixes-applied:** [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
+- **Open:** Mi5 (cap not inspectable at call site — deferred, cold path); out-of-scope crate-wide `write_io_err` helper follow-up.
+
 ---
 
 ### Stage 4 — grouping
