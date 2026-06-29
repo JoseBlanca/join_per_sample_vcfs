@@ -10,11 +10,12 @@
 //! - **observed heterozygosity** — two counts (`n_het_sites`,
 //!   `n_variant_sites`) from a rough per-site genotype call.
 //!
-//! This module is the **data model + serialisation** only: the TOML
-//! document that fills the `.psp` metadata section ([`crate::psp`]). The
-//! accumulators that *produce* the summaries (coverage, het) arrive as
-//! submodules in later steps; the model fit that *consumes* the histogram
-//! lives downstream in var-calling.
+//! The TOML document model + serialisation lives here; the accumulators
+//! that *produce* the summaries from the Stage-1 stream live in submodules
+//! ([`coverage`]; het in a later step). The model fit that *consumes* the
+//! histogram lives downstream in var-calling.
+
+pub mod coverage;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
