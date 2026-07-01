@@ -31,6 +31,8 @@
 // wires them into `run_var_calling`; until that consumer lands, their public
 // surface is dead to the non-test crate. The allow is removed at S6.
 #[allow(dead_code)]
+pub(crate) mod calibrate;
+#[allow(dead_code)]
 pub(crate) mod prepass;
 #[allow(dead_code)]
 pub(crate) mod spill;

@@ -149,7 +149,7 @@ pub(crate) struct ParalogSpillWriter<W: Write> {
 }
 
 impl<W: Write> ParalogSpillWriter<W> {
-    fn new(sink: W) -> Self {
+    pub(crate) fn new(sink: W) -> Self {
         Self {
             sink,
             scratch: Vec::new(),
@@ -192,7 +192,7 @@ pub(crate) struct ParalogSpillReader<R: Read> {
 }
 
 impl<R: Read> ParalogSpillReader<R> {
-    fn new(source: R) -> Self {
+    pub(crate) fn new(source: R) -> Self {
         Self {
             source,
             buf: Vec::new(),
