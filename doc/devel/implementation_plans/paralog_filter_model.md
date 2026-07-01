@@ -183,11 +183,17 @@ data-first checks:
 Wire into `var_calling::pipeline::run_var_calling`. The data-flow architecture
 is settled in
 [hidden_paralog_varcalling_wiring.md](../architecture/hidden_paralog_varcalling_wiring.md)
-(supersedes the Premise 6 sketch): the pass structure + `Hexp` timing, the
-per-window coverage source (a per-sample body pass), the ephemeral spill format
-(reuse the `.psp` block-writer), and the owner-settled decisions — **hard
-removal** of flagged loci and **filter on by default** (`--paralog-fdr ≈ 0.01`,
-`--no-paralog-filter` to disable).
+(supersedes the Premise 6 sketch): the pass structure + `Hexp` timing, per-window
+coverage aggregated **inline in the fold** (depth is free in phase-1 light
+columns — no second body pass, no schema change), the ephemeral spill (reuse the
+`.psp` block-writer), EM-on-the-histogram with a fixed-prior fallback, and the
+owner-settled decisions — **hard removal** of flagged loci and **filter on by
+default** (`--paralog-fdr ≈ 0.01`, `--no-paralog-filter` to disable).
+
+**The detailed build order lives in
+[paralog_varcalling_wiring.md](paralog_varcalling_wiring.md)** (S1–S6 + T1–T2,
+each types-first with fixtures + tests). The step sketch below is superseded by
+that plan.
 
 **S1. Pre-pass: per-sample models + cohort `Hexp`.** ☐
 Where the `PspReader`s are open: read each sample's summary → fit
