@@ -418,6 +418,34 @@ pub struct CohortPipelineArgs {
     )]
     pub allele_balance_concentration: f64,
 
+    /// Target false-discovery rate for the hidden-paralog filter, which
+    /// drops candidate SNPs that a coverage + allele-balance model
+    /// explains better as a reference-collapsed hidden paralog than as a
+    /// real single-copy variant. On by default at a low (introgression-
+    /// safe) rate: a real introgressed variant has normal coverage, so it
+    /// never approaches the cut. `0.0` disables the filter (equivalent to
+    /// `--no-paralog-filter`). See also `--no-paralog-filter`.
+    #[arg(
+        long = "paralog-fdr",
+        hide_short_help = true,
+        default_value_t = crate::var_calling::paralog_filter::DEFAULT_PARALOG_FDR,
+        value_parser = parsers::parse_paralog_fdr,
+        help_heading = "Advanced — Hidden-paralog filter",
+    )]
+    pub paralog_fdr: f64,
+
+    /// Skip the hidden-paralog filter entirely, restoring the single-pass,
+    /// direct-to-VCF behaviour (no spill, no coverage calibration). On by
+    /// default the filter runs; use this (or `--paralog-fdr 0`) to turn it
+    /// off.
+    #[arg(
+        long = "no-paralog-filter",
+        hide_short_help = true,
+        default_value_t = false,
+        help_heading = "Advanced — Hidden-paralog filter"
+    )]
+    pub no_paralog_filter: bool,
+
     /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
     /// default — `GP` is `Number=G`, so the per-sample cell grows as
     /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at

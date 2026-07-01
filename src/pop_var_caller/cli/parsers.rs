@@ -212,6 +212,12 @@ pub fn parse_min_alt_obs_per_sample(s: &str) -> Result<u32, String> {
     parse_u32_in(s, "min-alt-obs-per-sample", 0, 100)
 }
 
+/// `--paralog-fdr`: target false-discovery rate in `[0.0, 1.0]`. `0.0`
+/// disables the hidden-paralog filter (nothing is flagged).
+pub fn parse_paralog_fdr(s: &str) -> Result<f64, String> {
+    parse_f64_with(s, "paralog-fdr", |v| (0.0..=1.0).contains(&v), "[0.0, 1.0]")
+}
+
 /// Shared body for every Dirichlet-pseudocount parser. Range is the
 /// same across the posterior engine and the contamination side-pass
 /// (`PSEUDOCOUNT_RANGE_MAX = 1000.0` in both modules); the only thing
@@ -410,6 +416,17 @@ mod tests {
         assert!(parse_min_qual_phred("1000.001").is_err());
         assert!(parse_min_qual_phred("nan").is_err());
         assert!(parse_min_qual_phred("inf").is_err());
+    }
+
+    #[test]
+    fn paralog_fdr_boundaries() {
+        parse_paralog_fdr("0").unwrap(); // disables the filter
+        parse_paralog_fdr("0.01").unwrap();
+        parse_paralog_fdr("1").unwrap();
+        assert!(parse_paralog_fdr("-0.001").is_err());
+        assert!(parse_paralog_fdr("1.001").is_err());
+        assert!(parse_paralog_fdr("nan").is_err());
+        assert!(parse_paralog_fdr("inf").is_err());
     }
 
     #[test]
