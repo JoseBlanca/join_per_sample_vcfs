@@ -32,3 +32,5 @@
 // surface is dead to the non-test crate. The allow is removed at S6.
 #[allow(dead_code)]
 pub(crate) mod prepass;
+#[allow(dead_code)]
+pub(crate) mod spill;
