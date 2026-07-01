@@ -180,7 +180,14 @@ data-first checks:
 
 ## Milestone S — var-calling wiring (bounded-RAM, spill-to-disk)
 
-Wire into `var_calling::pipeline::run_var_calling` (arch Premise 6).
+Wire into `var_calling::pipeline::run_var_calling`. The data-flow architecture
+is settled in
+[hidden_paralog_varcalling_wiring.md](../architecture/hidden_paralog_varcalling_wiring.md)
+(supersedes the Premise 6 sketch): the pass structure + `Hexp` timing, the
+per-window coverage source (a per-sample body pass), the ephemeral spill format
+(reuse the `.psp` block-writer), and the owner-settled decisions — **hard
+removal** of flagged loci and **filter on by default** (`--paralog-fdr ≈ 0.01`,
+`--no-paralog-filter` to disable).
 
 **S1. Pre-pass: per-sample models + cohort `Hexp`.** ☐
 Where the `PspReader`s are open: read each sample's summary → fit

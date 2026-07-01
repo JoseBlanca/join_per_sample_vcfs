@@ -483,7 +483,7 @@ empirical-Bayes prior + FDR) and the var-calling wiring that scores every locus 
 emits a `FILTER`/INFO verdict.
 - **Status:** in progress on branch `tomato2-paralog-filter`. Plan step **P1 done**.
 - **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md) (§4–§7)
-- **Architecture:** [hidden_paralog_locus_statistic.md](doc/devel/architecture/hidden_paralog_locus_statistic.md) (Premises 0–6)
+- **Architecture:** [hidden_paralog_locus_statistic.md](doc/devel/architecture/hidden_paralog_locus_statistic.md) (Premises 0–6, statistics core) + [hidden_paralog_varcalling_wiring.md](doc/devel/architecture/hidden_paralog_varcalling_wiring.md) (Milestone S data flow — settled: hard removal, on-by-default, per-sample coverage pass, `.psp` block-writer spill)
 - **Plan:** [paralog_filter_model.md](doc/devel/implementation_plans/paralog_filter_model.md) (P1; Q1–Q5; R1; S1–S5; T1–T2)
 - **P1 (callable-position total):** done — `CoverageByGcHistogram.callable_positions` (het-rate denominator) accumulated in Stage-1, round-trips through the `.psp`, `SAMPLE_SUMMARY_VERSION` 1→2. Code: [src/sample_summary/coverage.rs](src/sample_summary/coverage.rs), [src/sample_summary/mod.rs](src/sample_summary/mod.rs). Review: [paralog_p1_callable_positions_2026-07-01.md](doc/devel/reports/reviews/paralog_p1_callable_positions_2026-07-01.md).
 - **Q1 (module skeleton + `ParalogModelParams`):** done — `src/paralog/` peer module; fixed model constants/grids (ε, carrier copy numbers, folded-SFS + carrier-freq grids, hom-alt veto) with prototype-faithful defaults. Code: [src/paralog/mod.rs](src/paralog/mod.rs).
