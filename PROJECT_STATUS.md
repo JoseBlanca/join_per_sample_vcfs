@@ -19,6 +19,17 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — R1 data-first validation on tomato2 (checkpoint) → the pure maths is trustworthy on real data**
+>   (branch `tomato2-paralog-filter`). New `examples/paralog_score_parity.rs` (Rust harness: reads
+>   59 `.psp` + cohort VCF, runs Q2–Q5 end-to-end, dumps per-locus LR/post/qval + per-sample σ₀/F)
+>   + `benchmarks/tomato2/src/paralog_score_parity.py` (uv companion: the checks Rust can't — LR
+>   correlation vs the prototype parquet, F Spearman, flagged-set profile). **All data-first checks
+>   met:** σ₀ 0.282 (≈0.28); mode/median guard passes 58/59 real samples; **LR Pearson 0.9931** vs
+>   the prototype (≥0.98 target) on 268 537 shared loci; **π 8.88 %** (≈9 %); **F Spearman 0.851**
+>   (≈0.86); flagged set = paralog profile (obs_het 0.115 + 1.31× coverage vs kept 0.043 + 1.04×).
+>   The data caught one real bug (the `Hexp` per-position scale — must be Σ2pq/callable not
+>   mean-2pq-over-variant-sites; the S1 wiring must match). Report:
+>   [paralog_r1_data_validation_2026-07-01.md](doc/devel/reports/implementations/paralog_r1_data_validation_2026-07-01.md).
 > - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q COMPLETE (Q4 inbreeding + Q5 empirical-Bayes prior/FDR) → the pure statistics core is done (checkpoint)**
 >   (branch `tomato2-paralog-filter`). Q4: `obs_het` (het rate) + `inbreeding_coefficient`. Q5:
 >   bounded-RAM `ParalogLrHistogram` + `ParalogPrior::estimate` (EM for π over histogram bins) +
@@ -480,7 +491,8 @@ emits a `FILTER`/INFO verdict.
 - **Q3 (`score_locus_for_paralogy`):** done — pure H1-vs-H2 marginal LR (folded-SFS `p` marginal + Wright HWE for H1; carrier config × freq marginal for H2; hom-alt veto falls out). Numerically verified faithful to the prototype. Code: [src/paralog/locus_score.rs](src/paralog/locus_score.rs). Review: [paralog_q3_locus_score_2026-07-01.md](doc/devel/reports/reviews/paralog_q3_locus_score_2026-07-01.md).
 - **Q4 (inbreeding scalar `F`):** done — pure `obs_het = n_het/callable` (het *rate*, not the inverting variant-site ratio) + `inbreeding_coefficient = clip(1 − obs_het/hexp, 0, 0.99)`; `Hexp` accumulated by the wiring (S1). Zero-callable → `F` inert (no per-locus data). Code: [src/paralog/inbreeding.rs](src/paralog/inbreeding.rs).
 - **Q5 (empirical-Bayes prior + FDR):** done — bounded-RAM `ParalogLrHistogram` + `ParalogPrior::estimate` (EM for π over bins, `converged` flag) + `ParalogFdrCurve` (`q_of_lr` tail FDR + `lr_threshold_for_fdr`). Numerically verified faithful to the prototype. Code: [src/paralog/prior.rs](src/paralog/prior.rs). Review: [paralog_q5_prior_2026-07-01.md](doc/devel/reports/reviews/paralog_q5_prior_2026-07-01.md).
-- **Milestone Q complete** — the three pure statistics pieces (coverage model, scorer, prior/FDR) built + unit-tested in isolation. Checkpoint reached; next is R1 (data-first validation).
+- **Milestone Q complete** — the three pure statistics pieces (coverage model, scorer, prior/FDR) built + unit-tested in isolation.
+- **R1 (data-first validation):** done — `examples/paralog_score_parity.rs` + `benchmarks/tomato2/src/paralog_score_parity.py` validate Q2–Q5 on real tomato2: σ₀ 0.282, LR Pearson 0.9931 vs prototype, π 8.88 %, F Spearman 0.851, flagged=paralog profile. Caught + fixed the `Hexp` per-position scale bug (Σ2pq/callable). Report: [paralog_r1_data_validation_2026-07-01.md](doc/devel/reports/implementations/paralog_r1_data_validation_2026-07-01.md). **The maths is trustworthy before wiring (Milestone S).**
 - **Carried forward:** downstream `Hobs` consumers (S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample); Q4 handles it (zero rate → inert `F`).
 
 ---
