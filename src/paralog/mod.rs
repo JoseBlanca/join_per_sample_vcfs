@@ -30,6 +30,12 @@
 //! `build_paralog_eb.py`, `build_gc_normalization.py`) — a *reference
 //! draft*, not a bit-exact oracle.
 
+pub mod coverage_model;
+
+pub use coverage_model::{
+    CoverageFitConfig, CoverageModelError, ModeMedianRatioBounds, SingleCopyCoverageModel,
+};
+
 /// A per-read allele error floor (`ε`): the VAF assigned to a genotype's
 /// "should be absent" allele (hom-ref / non-carrier), and, as `1 − ε`, the
 /// VAF of a "should be fully present" allele (hom-alt). It keeps the

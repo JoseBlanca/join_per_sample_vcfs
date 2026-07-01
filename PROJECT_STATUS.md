@@ -19,6 +19,16 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q, steps Q1–Q2 (pure statistics module: `ParalogModelParams` + `SingleCopyCoverageModel::fit`)**
+>   (branch `tomato2-paralog-filter`). New `src/paralog/` peer module (arch Premise 0). **Q1:**
+>   `ParalogModelParams` + `SfsPriorSpec`/`GridSpec` with prototype-faithful defaults. **Q2:**
+>   `SingleCopyCoverageModel::fit` from the binned coverage-by-GC histogram — mode-anchored
+>   `single_copy_scale` (parabolic sub-bin refine + mode/median sanity guard), per-GC weighted-median
+>   `gc_bias_curve` (gap-filled + smoothed), σ₀ = 1.4826·MAD floored at histogram resolution;
+>   `relative_copy_number(gc,depth)`. Two parallel review sub-agents caught + fixed a σ₀
+>   band-collapse over-confidence bug, a dead error variant (→ reachable `DepthModeAtBottomBin`),
+>   and a tuple→`ModeMedianRatioBounds` newtype; **24 paralog tests**, 1422 lib tests, fmt/clippy
+>   clean. Reports: [paralog_q2_coverage_model_2026-07-01.md](doc/devel/reports/reviews/paralog_q2_coverage_model_2026-07-01.md).
 > - **Last completed task (2026-07-01):** **Hidden-paralog filter — plan step P1 (store the per-sample callable-position total)**
 >   (branch `tomato2-paralog-filter`). `CoverageByGcAccumulator` now keeps a running grand
 >   total of GC-defined (non-`N`) covered positions and threads it through `finish()` into a
@@ -589,6 +599,8 @@ emits a `FILTER`/INFO verdict.
 - **Architecture:** [hidden_paralog_locus_statistic.md](doc/devel/architecture/hidden_paralog_locus_statistic.md) (Premises 0–6)
 - **Plan:** [paralog_filter_model.md](doc/devel/implementation_plans/paralog_filter_model.md) (P1; Q1–Q5; R1; S1–S5; T1–T2)
 - **P1 (callable-position total):** done — `CoverageByGcHistogram.callable_positions` (het-rate denominator) accumulated in Stage-1, round-trips through the `.psp`, `SAMPLE_SUMMARY_VERSION` 1→2. Code: [src/sample_summary/coverage.rs](src/sample_summary/coverage.rs), [src/sample_summary/mod.rs](src/sample_summary/mod.rs). Review: [paralog_p1_callable_positions_2026-07-01.md](doc/devel/reports/reviews/paralog_p1_callable_positions_2026-07-01.md).
+- **Q1 (module skeleton + `ParalogModelParams`):** done — `src/paralog/` peer module; fixed model constants/grids (ε, carrier copy numbers, folded-SFS + carrier-freq grids, hom-alt veto) with prototype-faithful defaults. Code: [src/paralog/mod.rs](src/paralog/mod.rs).
+- **Q2 (`SingleCopyCoverageModel::fit`):** done — mode-anchored single-copy scale (parabolic refine + mode/median guard), per-GC weighted-median bias curve, σ₀ = 1.4826·MAD floored at histogram resolution; `relative_copy_number`. Code: [src/paralog/coverage_model.rs](src/paralog/coverage_model.rs). Review: [paralog_q2_coverage_model_2026-07-01.md](doc/devel/reports/reviews/paralog_q2_coverage_model_2026-07-01.md).
 - **Carried forward:** downstream `Hobs` consumers (Q4/S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample).
 
 ---
