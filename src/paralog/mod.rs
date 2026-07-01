@@ -31,9 +31,13 @@
 //! draft*, not a bit-exact oracle.
 
 pub mod coverage_model;
+pub mod locus_score;
 
 pub use coverage_model::{
     CoverageFitConfig, CoverageModelError, ModeMedianRatioBounds, SingleCopyCoverageModel,
+};
+pub use locus_score::{
+    LocusObservations, ParalogScore, SampleObservation, score_locus_for_paralogy,
 };
 
 /// A per-read allele error floor (`ε`): the VAF assigned to a genotype's
