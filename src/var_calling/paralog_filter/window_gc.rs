@@ -40,6 +40,12 @@ impl ReferenceWindowGc {
         self.gc.get(tile).copied().flatten()
     }
 
+    /// The GC fraction of window `tile` directly (the builder keys by tile).
+    /// `None` if the tile is past the contig or was all-`N`.
+    pub(crate) fn gc_at_tile(&self, tile: u32) -> Option<f32> {
+        self.gc.get(tile as usize).copied().flatten()
+    }
+
     /// Number of window tiles covered.
     pub(crate) fn n_windows(&self) -> usize {
         self.gc.len()

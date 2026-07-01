@@ -36,11 +36,14 @@ pub(crate) mod spill;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod write_pass;
-// S6c consumers (producer window wiring) not landed yet.
-#[allow(dead_code)]
+// S6c: window_coverage feeds window_producer (the window-spill builder).
+// window_gc + window_producer's remaining surface (and the window-spill reader
+// side) are consumed by the pipeline join in the next S6c step.
 pub(crate) mod window_coverage;
 #[allow(dead_code)]
 pub(crate) mod window_gc;
+#[allow(dead_code)]
+pub(crate) mod window_producer;
 
 /// Default `--paralog-fdr`: the target false-discovery rate for the
 /// hidden-paralog filter. ≈ 1 % (introgression-safe), so the filter is **on by
