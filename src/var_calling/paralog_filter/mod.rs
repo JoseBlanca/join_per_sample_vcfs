@@ -27,26 +27,23 @@
 //! - S5 — the write pass (spill → recompute LR → apply cut → VCF).
 //! - S6 — orchestration + CLI.
 
-// S1–S5 build standalone pieces (each unit-tested against fixtures) before S6
-// wires them into `run_var_calling`; until that consumer lands, their public
-// surface is dead to the non-test crate. The allow is removed at S6.
-#[allow(dead_code)]
+// S6b wires the pre-pass, spill, calibrate, and write pass into
+// `run_var_calling`. The window modules (S3) are consumed by S6c — until then
+// they carry a `dead_code` allow.
 pub(crate) mod calibrate;
-#[allow(dead_code)]
 pub(crate) mod prepass;
-
-/// Default `--paralog-fdr`: the target false-discovery rate for the
-/// hidden-paralog filter. ≈ 1 % (introgression-safe), so the filter is **on by
-/// default**. `0.0` disables it (nothing is flagged). Pinned here pending the
-/// T1 flagged-set profile on tomato2.
-pub(crate) const DEFAULT_PARALOG_FDR: f64 = 0.01;
-#[allow(dead_code)]
 pub(crate) mod spill;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
+pub(crate) mod write_pass;
+// S6c consumers (producer window wiring) not landed yet.
 #[allow(dead_code)]
 pub(crate) mod window_coverage;
 #[allow(dead_code)]
 pub(crate) mod window_gc;
-#[allow(dead_code)]
-pub(crate) mod write_pass;
+
+/// Default `--paralog-fdr`: the target false-discovery rate for the
+/// hidden-paralog filter. ≈ 1 % (introgression-safe), so the filter is **on by
+/// default** (once S6c wires the producer windows; held off until then). `0.0`
+/// disables it. Pinned here pending the T1 flagged-set profile on tomato2.
+pub(crate) const DEFAULT_PARALOG_FDR: f64 = 0.01;

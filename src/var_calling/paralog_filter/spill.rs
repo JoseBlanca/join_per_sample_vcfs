@@ -65,7 +65,7 @@ pub(crate) struct ParalogSpillRecord {
 
 /// Failure modes of the spill read/write path.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SpillError {
+pub enum SpillError {
     /// Underlying file / stream I/O failed.
     #[error("spill I/O error")]
     Io(#[from] io::Error),
@@ -171,7 +171,10 @@ impl<W: Write> ParalogSpillWriter<W> {
         Ok(())
     }
 
-    /// Records appended so far.
+    /// Records appended so far. (Exercised by the round-trip tests and a
+    /// diagnostic accessor for callers; allowed so the non-test lib build
+    /// doesn't flag it before a production caller reads it.)
+    #[allow(dead_code)]
     pub(crate) fn records_written(&self) -> u64 {
         self.records_written
     }

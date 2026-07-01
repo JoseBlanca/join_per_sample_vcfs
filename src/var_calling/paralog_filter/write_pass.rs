@@ -29,7 +29,7 @@ use super::spill::{ParalogSpillReader, SpillError};
 
 /// Failure modes of the write pass.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WritePassError {
+pub enum WritePassError {
     /// Reading the spill back failed.
     #[error("spill read failed")]
     Spill(#[from] SpillError),

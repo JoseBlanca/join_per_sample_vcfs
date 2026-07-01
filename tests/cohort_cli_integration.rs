@@ -130,6 +130,8 @@ fn var_calling_args(
             min_allele_balance_log_lr: DEFAULT_AB_MIN_LOG_LR,
             allele_balance_concentration: DEFAULT_AB_CONCENTRATION,
             emit_gp: false,
+            paralog_fdr: 0.0,
+            no_paralog_filter: true,
         },
     }
 }

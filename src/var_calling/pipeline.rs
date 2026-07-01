@@ -30,7 +30,7 @@
 //! output is byte-identical for any worker count and any stage timing.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
 use std::ops::Range;
 
 use thiserror::Error;
@@ -60,6 +60,19 @@ use crate::var_calling::vcf_writer::{
     AlleleBalanceFilter, DownstreamFilters, VcfWriter, WriterError, WriterStats,
 };
 use crate::vcf::{CohortMetadata, WriterConfig};
+
+use std::collections::BTreeMap;
+
+use crate::paralog::ParalogModelParams;
+use crate::sample_summary::SampleSummary;
+use crate::var_calling::paralog_filter::calibrate::{CalibrationConfig, calibrate};
+use crate::var_calling::paralog_filter::prepass::{HexpAccumulator, ParalogPrePass};
+use crate::var_calling::paralog_filter::spill::{
+    ParalogSpill, ParalogSpillRecord, ParalogSpillWriter, SpillError,
+};
+use crate::var_calling::paralog_filter::write_pass::{
+    WritePassError, paralog_provenance, run_write_pass,
+};
 
 /// Open-file buffer size — the shared default, referenced directly so it can't
 /// drift from the canonical value.
@@ -204,6 +217,17 @@ pub enum PipelineError {
     Caller(#[from] CallerError),
     #[error(transparent)]
     Writer(#[from] WriterError),
+    /// Paralog-filter spill I/O (write or read-back).
+    #[error(transparent)]
+    ParalogSpill(#[from] SpillError),
+    /// The spill sink finished with chunks still buffered — a gap in
+    /// `chunk_order` stalled the reorder drain (would silently truncate the
+    /// spill). Mirrors [`WriterError::MissingChunks`].
+    #[error("{count} chunk(s) never spilled — a gap in chunk_order stalled the paralog spill sink")]
+    ParalogSpillGap { count: usize },
+    /// The paralog write pass (spill → surviving VCF) failed.
+    #[error(transparent)]
+    ParalogWrite(#[from] WritePassError),
 }
 
 /// Cohort `.psp` → VCF entry point — the production pipeline the CLI's
@@ -293,6 +317,30 @@ pub fn run_var_calling(
         None => None,
     };
 
+    // --- Hidden-paralog filter set-up (S1), while the `PspReader`s are still
+    //     open: fit each sample's coverage model + obs_het from its `.psp`
+    //     metadata section (the `SampleSummary`). Only when the filter is on —
+    //     `paralog_requested` gates every filter cost so the off path is
+    //     untouched. A sample whose `.psp` carries no summary (or fails to
+    //     parse) is carried absent (S1), not fatal. ---
+    let paralog_requested =
+        PARALOG_WINDOWS_WIRED && !cohort.no_paralog_filter && cohort.paralog_fdr > 0.0;
+    let paralog_prepass = if paralog_requested {
+        let summaries: Vec<Option<SampleSummary>> = psp_readers
+            .iter()
+            .map(|r| {
+                r.metadata()
+                    .and_then(|bytes| SampleSummary::from_toml_bytes(bytes).ok())
+            })
+            .collect();
+        Some(ParalogPrePass::fit(
+            &summaries,
+            &crate::paralog::CoverageFitConfig::default(),
+        ))
+    } else {
+        None
+    };
+
     // --- Per-sample segment readers. The (chrom_id, region_start, region_end)
     //     = (0, 1, 1) triple is an inert placeholder: the read stage calls
     //     `reset()` on every reader at the first interval before the first
@@ -344,7 +392,30 @@ pub fn run_var_calling(
             }
         },
     };
-    let mut writer = VcfWriter::new(metadata, writer_config, filters)?;
+    // The main-pass sink: the direct VCF writer (single-pass) or the paralog
+    // spill sink (two-pass). Only the sink differs — the producer→callers
+    // topology below is shared. For two-pass, `metadata` / `writer_config` are
+    // kept (not moved) to build the final writer *after* calibration, when they
+    // carry the paralog provenance; the single-pass branch clones them so they
+    // survive for the borrow checker either way.
+    let paralog_spill = if paralog_requested {
+        let scratch_dir = args
+            .output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Some(ParalogSpill::create_in(scratch_dir)?)
+    } else {
+        None
+    };
+    let sink: Box<dyn ChunkSink> = match &paralog_spill {
+        Some(spill) => Box::new(SpillSink::new(spill.writer()?)),
+        None => Box::new(VcfWriterSink(VcfWriter::new(
+            metadata.clone(),
+            writer_config.clone(),
+            filters,
+        )?)),
+    };
     let caller = VariantCaller::new(
         grouper_cfg,
         merger_cfg,
@@ -397,17 +468,19 @@ pub fn run_var_calling(
     let producer_pool = pool;
     let schedule = &schedule;
 
-    std::thread::scope(|scope| -> Result<WriterStats, PipelineError> {
-        // Writer thread: drain CalledChunks (reorder + filter + write); returns
-        // the run-level stats for the summary. The callers share `&caller` (it
-        // is `Sync` — stateless `call_chunk`); the writer reorders out-of-order
-        // `CalledChunk`s by `chunk_order`, so the VCF is byte-identical
-        // regardless of worker count or producer topology.
-        let writer_handle = scope.spawn(move || -> Result<WriterStats, PipelineError> {
+    let sink_output = std::thread::scope(|scope| -> Result<SinkOutput, PipelineError> {
+        // Sink thread: drain CalledChunks and hand them to the sink (single-pass
+        // = reorder + filter + write VCF; two-pass = reorder + accumulate Hexp +
+        // spill). The callers share `&caller` (it is `Sync` — stateless
+        // `call_chunk`); the sink reorders out-of-order `CalledChunk`s by
+        // `chunk_order`, so the output is byte-identical regardless of worker
+        // count or producer topology.
+        let writer_handle = scope.spawn(move || -> Result<SinkOutput, PipelineError> {
+            let mut sink = sink;
             for called in called_rx {
-                writer.handle(called)?;
+                sink.accept(called)?;
             }
-            Ok(writer.finish()?)
+            sink.close()
         });
 
         // Caller threads: pop chunks, call, push results.
@@ -611,9 +684,177 @@ pub fn run_var_calling(
         let writer_result = writer_handle.join().expect("writer thread panicked");
         match (first_err, writer_result) {
             (Some(e), _) | (None, Err(e)) => Err(e),
-            (None, Ok(stats)) => Ok(stats),
+            (None, Ok(output)) => Ok(output),
         }
-    })
+    })?;
+
+    // Single-pass produced the VCF directly; two-pass now calibrates from the
+    // spill and writes the surviving calls (S4 + S5). The spill is read twice
+    // (calibrate, then write) and deleted when `paralog_spill` drops at the end
+    // of this function — on success and on any `?` error alike.
+    match sink_output {
+        SinkOutput::Vcf(stats) => Ok(stats),
+        SinkOutput::Spill(hexp) => {
+            let spill = paralog_spill.expect("a spill sink implies a spill file");
+            let prepass = paralog_prepass.expect("a spill sink implies a pre-pass");
+            eprintln!(
+                "var-calling: paralog filter — {} samples fit; Hexp Σ2pq {:.1} over {} variant \
+                 loci; spill at {}",
+                prepass.fit_count(),
+                hexp.expected_het_sum(),
+                hexp.loci(),
+                spill.path().display(),
+            );
+            // Hexp on the per-callable-position scale (R1 correction): the
+            // representative callable is the cohort median; `.max(1)` guards a
+            // degenerate zero (→ Hexp 0 → F 0, treat every sample as outbred).
+            let callable_ref = prepass.callable_reference().unwrap_or(1).max(1);
+            let hexp = hexp.finish(callable_ref);
+            let params = ParalogModelParams::default();
+            let cfg = CalibrationConfig::default();
+
+            let calibration = {
+                let mut reader = spill.reader()?;
+                calibrate(
+                    &prepass,
+                    hexp,
+                    &mut reader,
+                    &params,
+                    cohort.paralog_fdr,
+                    &cfg,
+                )?
+            };
+            if !calibration.prior.converged {
+                eprintln!(
+                    "var-calling: paralog filter — the prior did not converge (or no scorable \
+                     loci); using fallback π = {:.4}",
+                    calibration.prior.prior_probability,
+                );
+            }
+
+            let mut md = metadata;
+            md.paralog_provenance = paralog_provenance(&calibration);
+            let writer = VcfWriter::new(md, writer_config, filters)?;
+            let mut reader = spill.reader()?;
+            let stats = run_write_pass(
+                &mut reader,
+                &prepass,
+                hexp,
+                &calibration,
+                &params,
+                cfg.min_samples,
+                writer,
+            )?;
+            Ok(stats)
+        }
+    }
+}
+
+/// Whether the producer computes per-window depth yet (S6c). Until it does, the
+/// two-pass paralog path would spill records with no coverage signal and score
+/// nothing — so the filter is held **off** regardless of `--paralog-fdr`. S6c
+/// flips this to `true` (and this const is removed) once the windows are wired.
+const PARALOG_WINDOWS_WIRED: bool = false;
+
+/// A consumer of the caller→writer [`CalledChunk`] stream. Lets the main pass
+/// drive either the direct VCF writer (single-pass) or the paralog spill sink
+/// (two-pass) through the same producer→callers→sink topology; only the sink
+/// differs. `Send` because it is moved into the sink thread.
+trait ChunkSink: Send {
+    /// Accept one chunk (reordering by `chunk_order` internally, as the writer
+    /// does), so the sink sees records in genomic order.
+    fn accept(&mut self, chunk: CalledChunk) -> Result<(), PipelineError>;
+    /// Finish the sink, yielding its output. Takes `Box<Self>` so it can be
+    /// called on the boxed trait object the sink thread owns.
+    fn close(self: Box<Self>) -> Result<SinkOutput, PipelineError>;
+}
+
+/// What a [`ChunkSink`] produced: either the finished VCF stats (single-pass) or
+/// the finished `Hexp` accumulator (two-pass; the spill is on disk).
+#[derive(Debug)]
+enum SinkOutput {
+    /// Single-pass: the writer already produced the final VCF.
+    Vcf(WriterStats),
+    /// Two-pass: the spill is written; carries the finished `Hexp` accumulator
+    /// (its `Σ2pq`), which the caller divides by the callable reference.
+    Spill(HexpAccumulator),
+}
+
+/// Single-pass sink: the existing [`VcfWriter`], unchanged. `accept`/`close`
+/// monomorphise to the same `handle`/`finish` the direct path always ran, so the
+/// emitted VCF is byte-identical to the pre-filter pipeline.
+struct VcfWriterSink(VcfWriter);
+
+impl ChunkSink for VcfWriterSink {
+    fn accept(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
+        self.0.handle(chunk)?;
+        Ok(())
+    }
+    fn close(self: Box<Self>) -> Result<SinkOutput, PipelineError> {
+        Ok(SinkOutput::Vcf(self.0.finish()?))
+    }
+}
+
+/// Two-pass sink: reorder the chunks (as the writer does), accumulate `Hexp`
+/// from each record's cohort allele frequencies, and spill each record. Window
+/// coverage is left empty here (`window_gc = 0`, all-`None` depths); S6c fills it
+/// from the producer.
+struct SpillSink {
+    writer: ParalogSpillWriter<BufWriter<File>>,
+    hexp: HexpAccumulator,
+    /// Reorder buffer: chunks that arrived before their turn (mirrors
+    /// [`VcfWriter`]'s reorder so the spill is in genomic order).
+    reorder: BTreeMap<u64, CalledChunk>,
+    /// The next `chunk_order` to spill (the gapless cursor).
+    next_expected: u64,
+}
+
+impl SpillSink {
+    fn new(writer: ParalogSpillWriter<BufWriter<File>>) -> Self {
+        Self {
+            writer,
+            hexp: HexpAccumulator::new(),
+            reorder: BTreeMap::new(),
+            next_expected: 0,
+        }
+    }
+
+    /// Accumulate `Hexp` and spill every record of one (in-order) chunk.
+    fn spill_chunk(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
+        for record in chunk.records {
+            self.hexp.observe(&record.allele_frequencies);
+            // S6c fills the window coverage; empty here (no coverage signal, so
+            // the filter is inert until the producer wiring lands).
+            let window_mean_depth = vec![None; record.n_samples];
+            self.writer.append(&ParalogSpillRecord {
+                record,
+                window_gc: 0.0,
+                window_mean_depth,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ChunkSink for SpillSink {
+    fn accept(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
+        self.reorder.insert(chunk.chunk_order, chunk);
+        while let Some(ready) = self.reorder.remove(&self.next_expected) {
+            self.spill_chunk(ready)?;
+            self.next_expected += 1;
+        }
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> Result<SinkOutput, PipelineError> {
+        if !self.reorder.is_empty() {
+            return Err(PipelineError::ParalogSpillGap {
+                count: self.reorder.len(),
+            });
+        }
+        self.writer.finish()?;
+        Ok(SinkOutput::Spill(self.hexp))
+    }
 }
 
 /// Fetch REF bytes for `chrom_id`, building a fresh per-contig
@@ -758,6 +999,75 @@ mod tests {
             chrom_id: 0,
             start,
             end,
+        }
+    }
+
+    /// The spill sink reorders out-of-order chunks by `chunk_order`, spills the
+    /// records in genomic order, accumulates `Hexp` from each record's cohort
+    /// allele frequencies, and yields the finished accumulator — the two-pass
+    /// main-pass sink's contract.
+    #[test]
+    fn spill_sink_reorders_accumulates_hexp_and_spills() {
+        use crate::var_calling::paralog_filter::spill::ParalogSpill;
+        use crate::var_calling::paralog_filter::test_support::normal_locus;
+        use crate::var_calling::types::CallStats;
+
+        let n = 4;
+        // Three biallelic-SNP records (allele_frequencies [0.5, 0.5] → 2pq 0.5).
+        let rec = |pos: u32| normal_locus(pos, n).record;
+        let chunk = |order: u64, pos: u32| CalledChunk {
+            chunk_order: order,
+            records: vec![rec(pos)],
+            stats: CallStats::default(),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let spill = ParalogSpill::create_in(dir.path()).unwrap();
+        let mut sink: Box<dyn ChunkSink> = Box::new(SpillSink::new(spill.writer().unwrap()));
+
+        // Deliver out of order: 2, 0, 1 (genomic order is 100, 200, 300).
+        sink.accept(chunk(2, 300)).unwrap();
+        sink.accept(chunk(0, 100)).unwrap();
+        sink.accept(chunk(1, 200)).unwrap();
+        let out = sink.close().unwrap();
+        let SinkOutput::Spill(hexp) = out else {
+            panic!("spill sink must yield SinkOutput::Spill");
+        };
+
+        // Hexp accumulator saw all three records' 2pq (0.5 each).
+        assert_eq!(hexp.loci(), 3);
+        assert!((hexp.expected_het_sum() - 1.5).abs() < 1e-9);
+
+        // The spill holds the records in genomic order (reorder worked).
+        let mut reader = spill.reader().unwrap();
+        let positions: Vec<u32> = std::iter::from_fn(|| reader.next_record())
+            .map(|r| r.unwrap().record.locus.start)
+            .collect();
+        assert_eq!(positions, vec![100, 200, 300]);
+    }
+
+    /// A spill sink closed with a gap in `chunk_order` (a chunk never arrived)
+    /// errors rather than silently truncating the spill — mirrors the writer's
+    /// gapless invariant.
+    #[test]
+    fn spill_sink_close_errors_on_gap() {
+        use crate::var_calling::paralog_filter::spill::ParalogSpill;
+        use crate::var_calling::paralog_filter::test_support::normal_locus;
+        use crate::var_calling::types::CallStats;
+
+        let dir = tempfile::tempdir().unwrap();
+        let spill = ParalogSpill::create_in(dir.path()).unwrap();
+        let mut sink: Box<dyn ChunkSink> = Box::new(SpillSink::new(spill.writer().unwrap()));
+        // chunk_order 0 never delivered; 1 stays buffered behind the gap.
+        sink.accept(CalledChunk {
+            chunk_order: 1,
+            records: vec![normal_locus(100, 4).record],
+            stats: CallStats::default(),
+        })
+        .unwrap();
+        match sink.close() {
+            Err(PipelineError::ParalogSpillGap { count }) => assert_eq!(count, 1),
+            other => panic!("expected ParalogSpillGap, got {other:?}"),
         }
     }
 

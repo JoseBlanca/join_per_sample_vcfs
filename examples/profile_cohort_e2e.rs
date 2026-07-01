@@ -189,6 +189,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             allele_balance_concentration:
                 pop_var_caller::var_calling::allele_balance::DEFAULT_AB_CONCENTRATION,
             emit_gp: false,
+            paralog_fdr: 0.0,
+            no_paralog_filter: true,
         },
     };
 
