@@ -732,8 +732,12 @@ pub fn run_var_calling(
                 );
             }
 
-            let mut md = metadata;
-            md.paralog_provenance = paralog_provenance(&calibration);
+            // Struct-update spread so a new `CohortMetadata` field is a compile
+            // error here rather than silently defaulting.
+            let md = CohortMetadata {
+                paralog_provenance: paralog_provenance(&calibration),
+                ..metadata
+            };
             let writer = VcfWriter::new(md, writer_config, filters)?;
             let mut reader = spill.reader()?;
             let stats = run_write_pass(
@@ -838,6 +842,15 @@ impl SpillSink {
 
 impl ChunkSink for SpillSink {
     fn accept(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
+        // Mirror the writer's reorder invariant: a chunk for an already-drained
+        // slot would be silently buffered and never emitted (surfacing only as a
+        // spurious gap at close). The producer is monotone, so this cannot fire.
+        debug_assert!(
+            chunk.chunk_order >= self.next_expected,
+            "chunk_order {} already spilled (next_expected {})",
+            chunk.chunk_order,
+            self.next_expected,
+        );
         self.reorder.insert(chunk.chunk_order, chunk);
         while let Some(ready) = self.reorder.remove(&self.next_expected) {
             self.spill_chunk(ready)?;
