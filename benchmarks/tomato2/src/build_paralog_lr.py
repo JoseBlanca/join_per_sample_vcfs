@@ -8,17 +8,22 @@
 Per sample s we use coverage c_s (500bp per-sample GC-corrected gc_rel) and the
 SNP allele reads (k_s alt, n_s total = AD).
 
-H1  real variant, single copy (param: allele freq p)
-    genotype G ~ HWE(p);  coverage ~ Normal(1, σ0)  INDEPENDENT of G
-    k_s ~ Binom(n_s, vaf), vaf = ε / 0.5 / 1-ε for homref/het/homalt
-H2  hidden paralog, dup dosage (param: dup freq q)
-    dosage d ∈ {0,1,2} ~ HWE(q);  coverage ~ Normal(1 + d/2, σ_d)
-    k_s ~ Binom(n_s, vaf2), vaf2 = ε / 1/3 / 1/2   (tied to the SAME d)
-    -> coverage AND allele balance both rise with d, in a fixed ratio.
-    -> VAF capped at 0.5: a confident hom-alt sample is ~impossible under H2.
+H1  real variant, single copy (latent: allele freq p)
+    genotype G ~ inbreeding-adjusted HWE(p, F_s);  coverage ~ Normal(1, σ0)
+    INDEPENDENT of G;  k_s ~ Binom(n_s, vaf), vaf = ε / 0.5 / 1-ε for
+    homref/het/homalt.  p is MARGINALISED under the folded site-frequency-
+    spectrum prior 1/(p(1-p)) on [1/2N, 1-1/2N] (most real variants are rare).
+H2  hidden paralog (latent: config (T,m) and carrier freq q)
+    a carrier has T total copies, m mutant -> coverage ~ Normal(T/2, σ0·√(T/2)),
+    VAF = m/T;  a non-carrier is single-copy REF (coverage ~Normal(1,σ0), VAF ε).
+    carrier vs non-carrier ~ inbreeding-adjusted HWE(q, F_s).  Configs kept:
+    single-PSV (m=1) and balanced (m≈T/2) for T in {3,4,6,8}.
+    -> VAF < 1 always: a confident hom-alt sample is ~impossible under H2.
 
-LR = max_q logL_H2 - max_p logL_H1.   LR>0 => paralog, LR<0 => real variant.
-Binomial C(n,k) cancels in the ratio (dropped). Params maximized on a grid.
+LR = logL_H2 - logL_H1, both MARGINAL (log-sum-exp over the grid, /grid size --
+NOT maximised: averaging charges each hypothesis for its flexibility). LR>0 =>
+paralog. Binomial C(n,k) cancels in the ratio (dropped). MQDiff is NOT in the
+score (shared with introgression) -- it stays a VCF INFO field.
 Output: results/paralog_lr.parquet  (+ distribution / spot-check figure)
 """
 import numpy as np
@@ -28,23 +33,15 @@ from cyvcf2 import VCF
 W = 500
 EPS = 0.01
 SIGMA0 = 0.26          # single-copy gc_rel spread at 500bp (measured)
-MQ_W = 0.25            # mqdiff term: +MQ_W*(-mqdiff) for divergent ALT reads.
-                       # coverage-gated by construction (no excess => H2 stays penalised),
-                       # so it lifts diverging paralogs (esp. single-carrier) without
-                       # flagging introgressions — validated in paralog_simulation.py
 CMAX = 4.0             # winsorise coverage for the Normal tail
 HOM_REF, HET, UNKNOWN, HOM_ALT = 0, 1, 2, 3
 VCF_PATH = "benchmarks/tomato2/results/cohort.vcf.gz"
 
-# H1 genotype VAFs; H2 dosage VAFs + coverage means/sigmas
-VAF_H1 = np.array([EPS, 0.5, 1 - EPS])              # homref, het, homalt
-VAF_H2 = np.array([EPS, 1 / 3, 0.5])               # d = 0, 1, 2
-MU_H2 = np.array([1.0, 1.5, 2.0])
-SIG_H2 = SIGMA0 * np.sqrt(MU_H2)                    # Poisson-ish: SD grows with mean
+# H1 genotype VAFs (homref, het, homalt)
+VAF_H1 = np.array([EPS, 0.5, 1 - EPS])
 LOGVAF_H1, LOG1M_H1 = np.log(VAF_H1), np.log(1 - VAF_H1)
-LOGVAF_H2, LOG1M_H2 = np.log(VAF_H2), np.log(1 - VAF_H2)
 
-# extended H2: a carrier has total copies T and m mutant copies -> coverage T/2,
+# H2: a carrier has total copies T and m mutant copies -> coverage T/2,
 # VAF = m/T (high copy => low VAF; m in 1..T-2 so the 2 orthologous copies stay REF)
 T_CARRIER = np.array([3, 4, 6, 8])      # coverage 1.5,2,3,4× (cap 4×)
 T_MEAN = T_CARRIER / 2.0
@@ -58,9 +55,14 @@ TM_VC = np.array([m / T_CARRIER[ti] for ti, m in _TM])
 LOG_VC, LOG1M_VC = np.log(TM_VC), np.log(1 - TM_VC)
 QEXT = np.linspace(0.004, 0.6, 40)
 
-NGRID = 80
-PGRID = np.linspace(0.005, 0.995, NGRID)
-QGRID = np.linspace(0.005, 0.995, NGRID)
+NGRID = 200            # p grid points (dense: the SFS prior concentrates weight at low p)
+# H1's allele-frequency prior is the folded neutral site-frequency spectrum
+# 1/(p(1-p)) on p in [1/2N, 1-1/2N] (N = samples), NOT a flat grid: real variants
+# are mostly rare, so weighting p by the SFS gives H1 proper credit for the
+# rare-variant explanation. The floor 1/2N (a singleton — the finest frequency the
+# panel can resolve) replaces the arbitrary flat-grid cutoff and makes the paralog
+# rate robust to it (measured). "Folded" because ALT is reference-relative, not
+# polarised to ancestral. PGRID + LOGW_P are built in main() once n_samp is known.
 
 
 def inbreeding_logprior(freq, Fs):
@@ -125,6 +127,10 @@ def main():
     Fs = np.clip(1 - obs / np.maximum(exp, 1e-9), 0.0, 0.99)
     print(f"per-sample inbreeding F_s: median={np.median(Fs):.2f} "
           f"range=[{Fs.min():.2f},{Fs.max():.2f}]  (per-sample het rate, not cohort-wide)")
+    inv2n = 1.0 / (2 * n_samp)
+    PGRID = np.linspace(inv2n, 1 - inv2n, NGRID)          # p in [1/2N, 1-1/2N]
+    _wp = 1.0 / (PGRID * (1 - PGRID))                      # folded SFS weight 1/(p(1-p))
+    LOGW_P = np.log(_wp) - lse(np.log(_wp), axis=0)        # normalised log prior (sums to 1)
     LOGPG_full = inbreeding_logprior(PGRID, Fs)        # (NGRID, n_samp, 3)
     # extended-H2 carrier prior P(non-carrier) per (sample, q): inbreeding HWE
     _q = QEXT[None, :]
@@ -158,7 +164,7 @@ def main():
         lc1 = float(np.sum(normlog(c, 1.0, SIGMA0)))
         h1 = LOGPG_full[:, idx, :] + lrg[None, :, :]       # (NGRID,m,3)
         summed1 = np.sum(lse(h1, axis=2), axis=1)          # (NGRID,) per p
-        logL1 = lse(summed1, axis=0) - np.log(NGRID) + lc1  # MARGINAL over p (flat prior)
+        logL1 = lse(summed1 + LOGW_P, axis=0) + lc1  # MARGINAL over p (folded-SFS prior)
 
         # --- extended H2: non-carrier (cov 1, hom-ref) vs carrier (copies T,
         #     mutant m -> cov T/2, VAF m/T). max over q (carrier freq) x (T,m) ---
@@ -175,9 +181,10 @@ def main():
 
         af = k / nn
         n_homalt_conf = int(np.sum((af > 0.9) & (nn >= 5)))
-        mqd = first(v.INFO.get("MQDiff"))                  # per-locus ALT-vs-REF MAPQ diff
-        mqd = mqd if np.isfinite(mqd) else 0.0
-        lr_val = float(logL2 - logL1) + MQ_W * (-min(mqd, 0.0))
+        # Pure likelihood ratio. MQDiff is shared with introgression, so it is
+        # NOT folded into the score (it stays a VCF INFO field); this keeps the
+        # LR a clean Bayes factor for the empirical-Bayes posterior/FDR step.
+        lr_val = float(logL2 - logL1)
         rows.append((v.CHROM, int(v.POS), lr_val, m,
                      n_homalt_conf, float(np.mean(c)), float(np.mean(af))))
     vcf.close()

@@ -96,9 +96,14 @@ confidence margin `M` splits variant sites three ways: **confident het**
 (`logLR > +M`), **confident hom-alt** (`logLR < −M`), and **ambiguous**
 (`|logLR| ≤ M`). This is depth-aware by construction — at high depth the
 LR is sharp and almost nothing is ambiguous; at ~6× many sites land in
-ambiguous, exactly as they should. `Hobs = n_het / (n_het + n_hom_alt)`
-(the confident ratio); `n_ambiguous` is kept as the **uncertainty
-signal** (large in low-coverage samples → trust their Hobs less).
+ambiguous, exactly as they should. Observed heterozygosity is then the het
+**rate**, `Hobs = n_het / callable_positions` — het count over *all*
+callable positions (the covered-position total the coverage accumulator in
+the same walk already holds), **not** over variant sites. (Dividing by
+variant sites, `n_het/(n_het+n_hom_alt)`, tracks reference divergence and
+inverts on divergent samples — measured; see the consumer doc's Premise 3.)
+`n_ambiguous` is kept as the **uncertainty signal** (large in low-coverage
+samples → trust their Hobs less).
 
 **Residual bias, bounded:** collapsed paralogs inflate the het count
 (their capped-below-1 VAF often reads ~0.5), biasing Hobs up / F down.
@@ -168,10 +173,14 @@ The two summaries store at **different fidelities, on purpose**:
   maybe quantiles), so keeping raw sufficient statistics lets var-calling
   re-fit without re-running the pileup. Mirrors the `.psp` carrying
   `mapq-sum` / `mapq-sum-sq` raw and computing Welch's-t downstream.
-- **Observed het → four counts** over variant sites: `n_het_sites`,
-  `n_hom_alt_sites`, `n_ambiguous_sites` (and `n_variant_sites` = their
-  sum). `Hobs = n_het / (n_het + n_hom_alt)` and its support (and the
-  ambiguous fraction = low-coverage uncertainty) are all recoverable.
+- **Observed het → four counts + the callable-position total.** The counts
+  `n_het_sites`, `n_hom_alt_sites`, `n_ambiguous_sites` (and
+  `n_variant_sites` = their sum), plus the **callable-position total** (the
+  covered-position count from the coverage side of the same walk). Obs het is
+  the het *rate* `Hobs = n_het / callable_positions` (**not**
+  `n_het/(n_het+n_hom_alt)`, which inverts on reference-divergent samples —
+  consumer doc Premise 3); `n_hom_alt`/`n_ambiguous` remain as the hom-alt
+  and low-coverage-uncertainty signals.
   There is **no downstream fit** to preserve raw stats for — the
   binomial-LR three-way classification at a *fixed* margin `M` is a
   settled computation — so a logLR histogram would buy nothing the four
@@ -209,10 +218,12 @@ The curve and single-copy scale are **derived downstream**, not stored.
 ### Het counts
 
 `n_het_sites`, `n_hom_alt_sites`, `n_ambiguous_sites`, `n_variant_sites`
-(four integers, the last = sum of the first three) + the rough-genotype
-parameters recorded for reproducibility: `min_depth`, the error rate `ε`,
-and the confidence margin `M`. `Hobs = n_het / (n_het + n_hom_alt)` is
-formed downstream; `n_ambiguous` is the per-sample uncertainty weight.
+(four integers, the last = sum of the first three) + the
+**callable-position total** + the rough-genotype parameters recorded for
+reproducibility: `min_depth`, the error rate `ε`, and the confidence margin
+`M`. Obs het is formed downstream as the het rate
+`Hobs = n_het / callable_positions` (not `n_het/(n_het+n_hom_alt)`);
+`n_ambiguous` is the per-sample uncertainty weight.
 
 ## Premise 3 — the GC window scale *(SETTLED)*
 

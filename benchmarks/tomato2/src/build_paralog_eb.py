@@ -5,10 +5,15 @@
 # ///
 """Empirical-Bayes calibration of the paralog likelihood ratio.
 
-The LR comes from an explicit two-hypothesis generative model, so (treating
-exp(LR) as the Bayes factor — the Occam terms ~cancel: H1 and H2 have the same
-parameter count and latent structure) the per-locus posterior is a logistic of
-the LR shifted by the prior odds:
+The LR is the ratio of two MARGINAL likelihoods — H1 and H2 each averaged over
+their own unknowns (allele freq p for H1; copy-number config and carrier freq q
+for H2) under flat priors. That ratio IS the Bayes factor by definition: the
+Occam charge for H2's extra flexibility is already baked into the averaging, so
+the two hypotheses do NOT need equal parameter counts for exp(LR) to be a valid
+Bayes factor (an earlier note here wrongly claimed they did). The comparison's
+fairness instead rests on the chosen parameter RANGES — the p/q grids and the
+config set — which are examined separately. Given the Bayes factor, the
+per-locus posterior is a logistic of the LR shifted by the prior odds:
 
     P(paralog | data) = σ( LR + log(π/(1-π)) )
 
