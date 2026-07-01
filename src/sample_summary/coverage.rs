@@ -87,6 +87,11 @@ pub struct CoverageByGcAccumulator {
     last_observed: Option<(u32, u32)>,
     n_tiles: u64,
     n_skipped_tiles: u64,
+    /// Running grand total of GC-defined (non-`N`) covered positions across
+    /// every folded tile — the sample's callable-position count, kept here
+    /// because the histogram cells lose each tile's covered count once the
+    /// tile collapses to one `(GC, mean depth)` sample.
+    callable_positions: u64,
 }
 
 impl CoverageByGcAccumulator {
@@ -115,6 +120,7 @@ impl CoverageByGcAccumulator {
             last_observed: None,
             n_tiles: 0,
             n_skipped_tiles: 0,
+            callable_positions: 0,
         }
     }
 
@@ -193,6 +199,7 @@ impl CoverageByGcAccumulator {
             depth_bins: self.scheme.depth_bins,
             n_tiles: self.n_tiles,
             n_skipped_tiles: self.n_skipped_tiles,
+            callable_positions: self.callable_positions,
             counts: self.counts,
         }
     }
@@ -204,6 +211,10 @@ impl CoverageByGcAccumulator {
             self.n_skipped_tiles += 1;
             return;
         }
+        // Sum the tile's covered positions into the callable grand total
+        // before it collapses to a single histogram cell. Skipped tiles
+        // (handled above) contribute nothing.
+        self.callable_positions = self.callable_positions.saturating_add(tile.covered);
         let gc_frac = tile.gc as f64 / tile.covered as f64;
         let mean_depth = tile.depth_sum as f64 / tile.covered as f64;
         let cell = self.cell_index(gc_frac, mean_depth);
@@ -258,6 +269,59 @@ mod tests {
         let total: u32 = h.counts.iter().sum();
         assert_eq!(total, 1);
         assert_eq!(h.counts[7], 1);
+    }
+
+    /// `callable_positions` is the grand total of GC-defined (non-`N`)
+    /// covered positions across every folded tile — independent of how the
+    /// tiles bin into the histogram. Here: two tiles, 3 non-`N` + 2 non-`N`
+    /// covered positions (the interleaved `N`s do not count), so the total
+    /// is 5.
+    #[test]
+    fn callable_positions_sum_covered_non_n() {
+        let mut acc = CoverageByGcAccumulator::new(scheme());
+        // Tile (0,0): positions 1..=10. 3 non-N (A, C, G) + 1 N.
+        acc.observe(0, 1, b'A', 1);
+        acc.observe(0, 2, b'N', 9);
+        acc.observe(0, 3, b'C', 1);
+        acc.observe(0, 4, b'G', 1);
+        // Tile (0,1): positions 11..=20. 2 non-N (T, a) + 1 lowercase n.
+        acc.observe(0, 11, b'T', 1);
+        acc.observe(0, 12, b'n', 9);
+        acc.observe(0, 13, b'a', 1);
+        let h = acc.finish();
+        assert_eq!(h.callable_positions, 5);
+        assert_eq!(h.n_tiles, 2);
+    }
+
+    /// The callable total sums covered positions across *every* tile,
+    /// including the final still-open tile drained by [`finish`]. Three tiles
+    /// with distinct counts (2 + 3 + 1) separate "sum all tiles" from
+    /// "sum last tile only" or "drop the final open tile" — a bug in any of
+    /// those would miscount here.
+    #[test]
+    fn callable_positions_counts_every_covered_position_across_many_tiles() {
+        let mut acc = CoverageByGcAccumulator::new(scheme()); // window_bp 10
+        // tile 0: 2 covered (pos 1,2); tile 1: 3 covered (11,12,13);
+        // tile 2: 1 covered (21) — left OPEN, drained by finish().
+        for (c, p) in [(0u32, 1u32), (0, 2), (0, 11), (0, 12), (0, 13), (0, 21)] {
+            acc.observe(c, p, b'A', 1);
+        }
+        let h = acc.finish();
+        assert_eq!(h.callable_positions, 6);
+        assert_eq!(h.n_tiles, 3);
+    }
+
+    /// A tile with only `N` covered positions contributes nothing to the
+    /// callable total (and is counted as skipped), so an all-`N` sample has
+    /// `callable_positions == 0`.
+    #[test]
+    fn all_n_tile_adds_zero_callable() {
+        let mut acc = CoverageByGcAccumulator::new(scheme());
+        acc.observe(0, 1, b'N', 10);
+        acc.observe(0, 2, b'N', 10);
+        let h = acc.finish();
+        assert_eq!(h.callable_positions, 0);
+        assert_eq!(h.n_skipped_tiles, 1);
     }
 
     /// `N` positions are excluded from covered/gc/depth, shifting the GC

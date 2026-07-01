@@ -25,7 +25,17 @@ use thiserror::Error;
 /// Schema version of the sample-summary TOML document. A flat counter
 /// (no major/minor split): every bump is breaking, and a reader accepts
 /// only `1..=SAMPLE_SUMMARY_VERSION`.
-pub const SAMPLE_SUMMARY_VERSION: u16 = 1;
+///
+/// - v1: `coverage_by_gc` + `heterozygosity`.
+/// - v2: adds `coverage_by_gc.callable_positions` (the het-rate denominator,
+///   P1 of the hidden-paralog filter). A required field (no
+///   `#[serde(default)]`), so a stale on-disk v1 document is rejected at the
+///   TOML layer as a missing-field [`SampleSummaryError::ParseToml`] *before*
+///   the version guard in [`SampleSummary::validate`] runs — the guard
+///   catches only future/zeroed versions, not v1 on disk. Pre-alpha, no
+///   backwards-compatibility promise: regenerate old summary sections by
+///   re-running `pileup`.
+pub const SAMPLE_SUMMARY_VERSION: u16 = 2;
 
 /// Default tile / GC covariate window in bp (architecture Premise 3). The
 /// `pileup --gc-window-bp` flag overrides it.
@@ -93,6 +103,17 @@ pub struct CoverageByGcHistogram {
     /// Tiles skipped because they had no GC-defined (non-`N`) covered
     /// positions, so no `(GC, depth)` sample could be formed.
     pub n_skipped_tiles: u64,
+    /// Grand total of GC-defined (non-`N`) covered positions summed across
+    /// every folded tile — the sample's callable-position count. It is the
+    /// denominator of the observed-heterozygosity **rate**
+    /// `Hobs = n_het_sites / callable_positions` the hidden-paralog filter
+    /// consumes (spec §3; *not* `n_het/(n_het+n_hom_alt)`, which tracks
+    /// reference divergence and inverts). The binned `counts` matrix cannot
+    /// recover it — a tile's per-position covered count is lost when the
+    /// tile collapses to one `(GC, mean depth)` cell — so it is kept as its
+    /// own running total. Every folded tile contributes at least one covered
+    /// position, so `callable_positions >= n_tiles`.
+    pub callable_positions: u64,
     /// Row-major `[gc_bin][depth_bin]` counts. Length is exactly
     /// `gc_bins * (depth_bins + 1)`.
     pub counts: Vec<u32>,
@@ -102,11 +123,15 @@ pub struct CoverageByGcHistogram {
 /// per-site **binomial het-vs-hom likelihood-ratio** genotype call
 /// (architecture Premise 1b): each variant site is confident-het
 /// (`logLR > +margin`), confident-hom-alt (`logLR < −margin`), or
-/// ambiguous (`|logLR| ≤ margin`). `Hobs = n_het / (n_het + n_hom_alt)`
-/// is formed downstream; `n_ambiguous_sites` is the per-sample
-/// uncertainty weight (large at low coverage). Counts, not a logLR
-/// histogram, because the classification margin is a *settled* threshold
-/// (contrast the still-calibrating coverage curve — Premise 2).
+/// ambiguous (`|logLR| ≤ margin`). The observed-het **rate** the paralog
+/// filter consumes is `Hobs = n_het_sites / callable_positions` (the
+/// denominator lives on [`CoverageByGcHistogram::callable_positions`]); the
+/// confident ratio `n_het / (n_het + n_hom_alt)` is a *reference-divergence*
+/// proxy, **not** `Hobs` — it is dominated by the hom-alt count and inverts
+/// (spec §3). `n_ambiguous_sites` is the per-sample uncertainty weight
+/// (large at low coverage). Counts, not a logLR histogram, because the
+/// classification margin is a *settled* threshold (contrast the
+/// still-calibrating coverage curve — Premise 2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -264,6 +289,20 @@ impl CoverageByGcHistogram {
                 expected,
             });
         }
+        // Every folded (non-skipped) tile carries at least one GC-defined
+        // covered position, and `callable_positions` sums exactly those
+        // positions, so it can never be smaller than the folded-tile count.
+        // A document violating this is corrupt (or was built by a producer
+        // that miscounts) and would yield a nonsensical het rate.
+        if self.callable_positions < self.n_tiles {
+            return Err(bad(
+                "coverage-by-gc.callable-positions",
+                format!(
+                    "{} < n-tiles {} (each folded tile has >= 1 covered position)",
+                    self.callable_positions, self.n_tiles,
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -320,6 +359,7 @@ mod tests {
                 depth_bins: 3,
                 n_tiles: 42,
                 n_skipped_tiles: 1,
+                callable_positions: 4200,
                 // gc_bins (2) * (depth_bins + 1 = 4) = 8 cells.
                 counts: vec![0, 1, 2, 3, 4, 5, 6, 7],
             },
@@ -352,6 +392,7 @@ mod tests {
             "gc-bins",
             "depth-bin-width",
             "n-skipped-tiles",
+            "callable-positions",
             "[heterozygosity]",
             "n-het-sites",
             "n-hom-alt-sites",
@@ -366,6 +407,7 @@ mod tests {
         for forbidden in [
             "window_bp",
             "gc_bins",
+            "callable_positions",
             "n_het_sites",
             "n_hom_alt_sites",
             "lr_margin",
@@ -491,6 +533,34 @@ mod tests {
         }
     }
 
+    /// The `callable_positions >= n_tiles` invariant is enforced: a document
+    /// claiming fewer callable positions than folded tiles (impossible — each
+    /// folded tile carries >= 1 covered position) is rejected. Without this
+    /// test a future refactor that drops or inverts the check would pass CI.
+    #[test]
+    fn validate_rejects_callable_positions_below_n_tiles() {
+        let mut s = sample(); // n_tiles: 42, callable_positions: 4200
+        s.coverage_by_gc.callable_positions = 41; // < n_tiles 42
+        let err = s.validate().expect_err("callable < n_tiles must fail");
+        assert!(
+            matches!(err, SampleSummaryError::InvalidField { field, .. }
+                     if field == "coverage-by-gc.callable-positions"),
+            "got {err:?}"
+        );
+    }
+
+    /// The accept side of the boundary: `callable_positions == n_tiles` (one
+    /// covered position per tile) is the tight legitimate edge and must pass.
+    /// Pins the `>=` against an off-by-one flip to `>`.
+    #[test]
+    fn validate_accepts_callable_positions_equal_to_n_tiles() {
+        let mut s = sample();
+        s.coverage_by_gc.n_tiles = 8;
+        s.coverage_by_gc.callable_positions = 8; // exactly one covered pos/tile
+        s.validate()
+            .expect("callable == n_tiles is the valid boundary");
+    }
+
     /// Non-UTF-8 metadata bytes surface as `NotUtf8` (carrying the cause),
     /// not a panic or a mislabelled field error.
     #[test]
@@ -558,6 +628,7 @@ mod tests {
                     depth_bins,
                     n_tiles: n_het + 7,
                     n_skipped_tiles: 3,
+                    callable_positions: n_het + 7,
                     counts: vec![u32::MAX; cells],
                 },
                 heterozygosity: HetCounts {

@@ -19,6 +19,18 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — plan step P1 (store the per-sample callable-position total)**
+>   (branch `tomato2-paralog-filter`). `CoverageByGcAccumulator` now keeps a running grand
+>   total of GC-defined (non-`N`) covered positions and threads it through `finish()` into a
+>   new `CoverageByGcHistogram.callable_positions` field — the denominator of the observed-het
+>   **rate** `Hobs = n_het_sites / callable_positions` the filter consumes (the older
+>   `n_het/(n_het+n_hom_alt)` ratio inverts). Kebab wire key `callable-positions`, round-tripped
+>   through the `.psp` TOML; `validate()` enforces `callable_positions >= n_tiles`;
+>   `SAMPLE_SUMMARY_VERSION` bumped 1→2 (required field, pre-alpha no-compat). `dump_sample_summary`
+>   prints it + the correct het rate. Review (2 parallel sub-agents) clean — no Blocker/Major;
+>   Minor doc-consistency + 3 missing invariant/boundary tests fixed. **42 sample_summary tests**
+>   (+3), 1395 lib tests, fmt/clippy clean on the touched surface. Report:
+>   [paralog_p1_callable_positions_2026-07-01.md](doc/devel/reports/reviews/paralog_p1_callable_positions_2026-07-01.md).
 > - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — stutter / read-likelihood model bake-off → productionized Model A (HipSTR)**
 >   (branch `ssr-cohort`, [ssr_stutter_scoring_model_bakeoff_2026-06-24.md](doc/devel/reports/implementations/ssr_stutter_scoring_model_bakeoff_2026-06-24.md)).
 >   Implemented all three `Qᵣ(obs|cand)` models behind one swappable `ReadLikelihoodModel`
@@ -566,6 +578,18 @@ gitignored).
 - **Latest reviews:** [stage1_summary_wiring_2026-06-29.md](doc/devel/reports/reviews/stage1_summary_wiring_2026-06-29.md), [het_accumulator_2026-06-29.md](doc/devel/reports/reviews/het_accumulator_2026-06-29.md), [coverage_accumulator_2026-06-29.md](doc/devel/reports/reviews/coverage_accumulator_2026-06-29.md), [sample_summary_2026-06-29.md](doc/devel/reports/reviews/sample_summary_2026-06-29.md), [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
 - **Latest fixes-applied:** [fixes_applied_2026-06-29_stage1_summary_wiring.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_stage1_summary_wiring.md), [fixes_applied_2026-06-29_het_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_het_accumulator.md), [fixes_applied_2026-06-29_coverage_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_coverage_accumulator.md), [fixes_applied_2026-06-29_sample_summary.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_sample_summary.md), [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
 - **Open:** D2 empirical parity vs the tomato2 Python prototype + D3 cost check (both need real tomato2 CRAM/`.psp` data); A1-Mi5 (cap not inspectable — deferred); B1-Mi4 (`bad` closure extract once a 3rd use appears); B2-Mi3 (scheme/histogram field dup — deferred); het/bin params hardcoded (promote to CLI flags when calibration needs it); out-of-scope crate-wide `write_io_err` helper follow-up.
+
+#### Hidden-paralog filter — consumer model + var-calling wiring
+The follow-on that *consumes* the per-sample summaries above: the pure statistics
+module `src/paralog/` (coverage-model fit, H1-vs-H2 LR, inbreeding scalar,
+empirical-Bayes prior + FDR) and the var-calling wiring that scores every locus and
+emits a `FILTER`/INFO verdict.
+- **Status:** in progress on branch `tomato2-paralog-filter`. Plan step **P1 done**.
+- **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md) (§4–§7)
+- **Architecture:** [hidden_paralog_locus_statistic.md](doc/devel/architecture/hidden_paralog_locus_statistic.md) (Premises 0–6)
+- **Plan:** [paralog_filter_model.md](doc/devel/implementation_plans/paralog_filter_model.md) (P1; Q1–Q5; R1; S1–S5; T1–T2)
+- **P1 (callable-position total):** done — `CoverageByGcHistogram.callable_positions` (het-rate denominator) accumulated in Stage-1, round-trips through the `.psp`, `SAMPLE_SUMMARY_VERSION` 1→2. Code: [src/sample_summary/coverage.rs](src/sample_summary/coverage.rs), [src/sample_summary/mod.rs](src/sample_summary/mod.rs). Review: [paralog_p1_callable_positions_2026-07-01.md](doc/devel/reports/reviews/paralog_p1_callable_positions_2026-07-01.md).
+- **Carried forward:** downstream `Hobs` consumers (Q4/S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample).
 
 ---
 

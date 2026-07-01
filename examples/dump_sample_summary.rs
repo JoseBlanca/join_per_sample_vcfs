@@ -112,6 +112,7 @@ fn main() {
     );
     println!("  n_tiles        : {}", cov.n_tiles);
     println!("  n_skipped_tiles: {}", cov.n_skipped_tiles);
+    println!("  callable_pos   : {}", cov.callable_positions);
     println!("  est mean depth : {mean_depth:.3}  (histogram-weighted)");
 
     println!("heterozygosity:");
@@ -119,10 +120,20 @@ fn main() {
     println!("  n_het_sites     : {}", het.n_het_sites);
     println!("  n_hom_alt_sites : {}", het.n_hom_alt_sites);
     println!("  n_ambiguous     : {}", het.n_ambiguous_sites);
+    // The het *rate* over callable positions — the quantity the paralog
+    // filter consumes (spec §3). The `n_het/(n_het+n_hom_alt)` ratio below
+    // is the *wrong* one (it tracks reference divergence and inverts); it is
+    // printed only for contrast with the older prototype output.
+    if cov.callable_positions > 0 {
+        println!(
+            "  Hobs (het/Mb)   : {:.2}  (n_het_sites per Mb callable)",
+            het.n_het_sites as f64 / cov.callable_positions as f64 * 1e6
+        );
+    }
     let confident = het.n_het_sites + het.n_hom_alt_sites;
     if confident > 0 {
         println!(
-            "  Hobs (confident): {:.4}",
+            "  het/(het+homalt): {:.4}  (NOT Hobs — divergence proxy, inverts)",
             het.n_het_sites as f64 / confident as f64
         );
     }

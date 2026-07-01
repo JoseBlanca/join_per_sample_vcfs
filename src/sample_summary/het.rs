@@ -345,6 +345,7 @@ mod tests {
                 depth_bins: 1,
                 n_tiles: 0,
                 n_skipped_tiles: 0,
+                callable_positions: 0,
                 counts: vec![0, 0],
             },
             heterozygosity: het,
