@@ -19,6 +19,16 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q COMPLETE (Q4 inbreeding + Q5 empirical-Bayes prior/FDR) → the pure statistics core is done (checkpoint)**
+>   (branch `tomato2-paralog-filter`). Q4: `obs_het` (het rate) + `inbreeding_coefficient`. Q5:
+>   bounded-RAM `ParalogLrHistogram` + `ParalogPrior::estimate` (EM for π over histogram bins) +
+>   `ParalogFdrCurve` (tail-FDR `q_of_lr` + `lr_threshold_for_fdr`). Numerically verified faithful
+>   to `build_paralog_eb.py` (histogram EM ≡ full-vector mean; tail-FDR-from-top ≡ rank-by-posterior
+>   running mean). Fixed constructor-contract inconsistency (→ `Option`), silent EM non-convergence
+>   (→ `converged` flag), duplicated binning (→ shared `UniformBinning`). **65 paralog tests**, 1463
+>   lib tests, fmt/clippy clean. **Checkpoint reached: the three statistics pieces (coverage model,
+>   scorer, prior/FDR) are built and unit-tested in isolation.** Next: R1 (data-first validation on
+>   tomato2), then Milestone S (var-calling wiring). Report: [paralog_q5_prior_2026-07-01.md](doc/devel/reports/reviews/paralog_q5_prior_2026-07-01.md).
 > - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q, step Q3 (`score_locus_for_paralogy` — the H1-vs-H2 marginal likelihood ratio)**
 >   (branch `tomato2-paralog-filter`). Pure per-locus scorer: H1 (real variant) marginalises allele
 >   freq under the folded-SFS prior with Wright HWE genotype priors + genotype-independent Normal
@@ -469,6 +479,8 @@ emits a `FILTER`/INFO verdict.
 - **Q2 (`SingleCopyCoverageModel::fit`):** done — mode-anchored single-copy scale (parabolic refine + mode/median guard), per-GC weighted-median bias curve, σ₀ = 1.4826·MAD floored at histogram resolution; `relative_copy_number`. Code: [src/paralog/coverage_model.rs](src/paralog/coverage_model.rs). Review: [paralog_q2_coverage_model_2026-07-01.md](doc/devel/reports/reviews/paralog_q2_coverage_model_2026-07-01.md).
 - **Q3 (`score_locus_for_paralogy`):** done — pure H1-vs-H2 marginal LR (folded-SFS `p` marginal + Wright HWE for H1; carrier config × freq marginal for H2; hom-alt veto falls out). Numerically verified faithful to the prototype. Code: [src/paralog/locus_score.rs](src/paralog/locus_score.rs). Review: [paralog_q3_locus_score_2026-07-01.md](doc/devel/reports/reviews/paralog_q3_locus_score_2026-07-01.md).
 - **Q4 (inbreeding scalar `F`):** done — pure `obs_het = n_het/callable` (het *rate*, not the inverting variant-site ratio) + `inbreeding_coefficient = clip(1 − obs_het/hexp, 0, 0.99)`; `Hexp` accumulated by the wiring (S1). Zero-callable → `F` inert (no per-locus data). Code: [src/paralog/inbreeding.rs](src/paralog/inbreeding.rs).
+- **Q5 (empirical-Bayes prior + FDR):** done — bounded-RAM `ParalogLrHistogram` + `ParalogPrior::estimate` (EM for π over bins, `converged` flag) + `ParalogFdrCurve` (`q_of_lr` tail FDR + `lr_threshold_for_fdr`). Numerically verified faithful to the prototype. Code: [src/paralog/prior.rs](src/paralog/prior.rs). Review: [paralog_q5_prior_2026-07-01.md](doc/devel/reports/reviews/paralog_q5_prior_2026-07-01.md).
+- **Milestone Q complete** — the three pure statistics pieces (coverage model, scorer, prior/FDR) built + unit-tested in isolation. Checkpoint reached; next is R1 (data-first validation).
 - **Carried forward:** downstream `Hobs` consumers (S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample); Q4 handles it (zero rate → inert `F`).
 
 ---

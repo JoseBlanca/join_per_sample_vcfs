@@ -33,6 +33,7 @@
 pub mod coverage_model;
 pub mod inbreeding;
 pub mod locus_score;
+pub mod prior;
 
 pub use coverage_model::{
     CoverageFitConfig, CoverageModelError, ModeMedianRatioBounds, SingleCopyCoverageModel,
@@ -41,6 +42,7 @@ pub use inbreeding::{inbreeding_coefficient, obs_het};
 pub use locus_score::{
     LocusObservations, ParalogScore, SampleObservation, score_locus_for_paralogy,
 };
+pub use prior::{EmConfig, ParalogFdrCurve, ParalogLrHistogram, ParalogPrior};
 
 /// A per-read allele error floor (`ε`): the VAF assigned to a genotype's
 /// "should be absent" allele (hom-ref / non-carrier), and, as `1 − ε`, the
