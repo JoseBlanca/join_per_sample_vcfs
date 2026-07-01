@@ -48,6 +48,10 @@ pub struct WriterStats {
     pub records_dropped_hom_ref: u64,
     pub records_dropped_low_qual: u64,
     pub records_dropped_allele_balance: u64,
+    /// Records dropped by the hidden-paralog filter (its keep/drop verdict is
+    /// decided in the paralog write pass, which then routes survivors through
+    /// this writer; this counter is set there, not in `emit_or_drop`).
+    pub records_dropped_paralog: u64,
     pub records_unconverged: u64,
     // Rolled from the callers' per-chunk CallStats.
     pub records_dropped_low_alt_obs: u64,
@@ -297,6 +301,7 @@ mod tests {
             }],
             tool_string: "pop_var_caller vcf-writer-test".into(),
             command_line: "pop_var_caller cohort --output out.vcf".into(),
+            paralog_provenance: String::new(),
         }
     }
 

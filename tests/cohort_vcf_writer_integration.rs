@@ -49,6 +49,7 @@ fn metadata_two_samples() -> CohortMetadata {
         }],
         tool_string: "pop_var_caller integration-test".into(),
         command_line: "pop_var_caller cohort --output out.vcf".into(),
+        paralog_provenance: String::new(),
     }
 }
 

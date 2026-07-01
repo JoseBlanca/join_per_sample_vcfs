@@ -341,6 +341,7 @@ mod tests {
             }],
             tool_string: "pop_var_caller test".into(),
             command_line: String::new(),
+            paralog_provenance: String::new(),
         }
     }
     fn mk_record(start: u32) -> PosteriorRecord {

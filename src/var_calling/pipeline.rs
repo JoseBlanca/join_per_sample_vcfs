@@ -328,6 +328,9 @@ pub fn run_var_calling(
         contigs: chromosomes.clone(),
         tool_string: format!("pop_var_caller {}", env!("CARGO_PKG_VERSION")),
         command_line: crate::pop_var_caller::common::current_command_line(),
+        // Filled by the paralog write pass (S6) when the filter runs; empty
+        // here keeps the single-pass header byte-identical.
+        paralog_provenance: String::new(),
     };
     let writer_config = WriterConfig::new(args.output.clone()).with_emit_gp(cohort.emit_gp);
     let filters = DownstreamFilters {
