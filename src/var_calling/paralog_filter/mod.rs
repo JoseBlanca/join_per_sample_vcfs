@@ -34,3 +34,7 @@
 pub(crate) mod prepass;
 #[allow(dead_code)]
 pub(crate) mod spill;
+#[allow(dead_code)]
+pub(crate) mod window_coverage;
+#[allow(dead_code)]
+pub(crate) mod window_gc;

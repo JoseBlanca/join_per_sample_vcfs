@@ -33,22 +33,34 @@ use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::per_group_merger::{CompoundConstituent, MergedAllele};
 use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 
-/// One locus on the spill: the full caller output plus the per-sample analysis
-/// window used to score it.
+/// One locus on the spill: the full caller output plus the analysis-window
+/// coverage used to score it.
 ///
 /// The [`PosteriorRecord`] is stored verbatim so the write pass (S5) can
-/// reconstruct it exactly and emit byte-identical VCF; `window_depth` is the
-/// one extra ingredient the paralog score needs beyond the record (each
-/// sample's window relative copy number is derived from it against that
-/// sample's fitted coverage model in the pre-pass).
+/// reconstruct it exactly and emit byte-identical VCF. The window coverage is
+/// the extra ingredient the paralog score needs beyond the record, split into
+/// its two natural halves (settled 2026-07-01):
+///
+/// - `window_gc` — the analysis window's **GC fraction**, a property of the
+///   *reference* over the window and therefore **shared by all samples** at
+///   this locus (computed once from the reference, not per sample).
+/// - `window_mean_depth` — the **per-sample** mean read depth over the window,
+///   which is what actually carries the collapsed-paralog coverage signal.
+///
+/// The scorer forms each sample's relative copy number as
+/// `window_mean_depth[s] / expected_single_copy_depth(window_gc)` against that
+/// sample's fitted coverage model.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParalogSpillRecord {
     /// The caller's emitted record for this locus, carried in full.
     pub record: PosteriorRecord,
+    /// The analysis window's GC fraction at this locus — one shared value (a
+    /// reference property; see the type doc).
+    pub window_gc: f32,
     /// Per cohort sample (length `record.n_samples`): the sample's
-    /// analysis-window `(gc_fraction, mean depth)`, or `None` if the sample had
-    /// no covered window spanning this locus.
-    pub window_depth: Vec<Option<(f32, f32)>>,
+    /// analysis-window mean depth, or `None` if the sample had no covered
+    /// window spanning this locus.
+    pub window_mean_depth: Vec<Option<f32>>,
 }
 
 /// Failure modes of the spill read/write path.
@@ -380,13 +392,13 @@ fn encode_record(spill: &ParalogSpillRecord, out: &mut Vec<u8>) {
     put_u32(out, r.diagnostics.iterations);
     put_f64(out, r.diagnostics.final_max_delta_p);
     put_bool(out, r.diagnostics.converged);
-    // window_depth (Option<(f32, f32)>)
-    put_len(out, spill.window_depth.len());
-    for w in &spill.window_depth {
+    // window_gc (shared) + window_mean_depth (per-sample Option<f32>)
+    put_f32(out, spill.window_gc);
+    put_len(out, spill.window_mean_depth.len());
+    for w in &spill.window_mean_depth {
         match w {
-            Some((gc, depth)) => {
+            Some(depth) => {
                 put_bool(out, true);
-                put_f32(out, *gc);
                 put_f32(out, *depth);
             }
             None => put_bool(out, false),
@@ -545,13 +557,12 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
         converged: d.bool("diagnostics.converged")?,
     };
 
-    let n_win = d.len("window_depth.len")?;
-    let mut window_depth = Vec::with_capacity(n_win);
+    let window_gc = d.f32("window_gc")?;
+    let n_win = d.len("window_mean_depth.len")?;
+    let mut window_mean_depth = Vec::with_capacity(n_win);
     for _ in 0..n_win {
-        window_depth.push(if d.bool("window_depth.tag")? {
-            let gc = d.f32("window_depth.gc")?;
-            let depth = d.f32("window_depth.depth")?;
-            Some((gc, depth))
+        window_mean_depth.push(if d.bool("window_mean_depth.tag")? {
+            Some(d.f32("window_mean_depth.depth")?)
         } else {
             None
         });
@@ -575,7 +586,8 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
             chain_anchor_flags,
             diagnostics,
         },
-        window_depth,
+        window_gc,
+        window_mean_depth,
     })
 }
 
@@ -666,7 +678,8 @@ mod tests {
                     converged: true,
                 },
             },
-            window_depth: vec![Some((0.41, 18.3)), None],
+            window_gc: 0.41,
+            window_mean_depth: vec![Some(18.3), None],
         }
     }
 
@@ -854,8 +867,15 @@ mod tests {
                         converged: seed % 2 == 0,
                     },
                 },
-                window_depth: (0..n_samples)
-                    .map(|s| if s % 2 == 0 { Some((f(s as u64 + 700) as f32, (f(s as u64 + 800) * 50.0) as f32)) } else { None })
+                window_gc: f(700) as f32,
+                window_mean_depth: (0..n_samples)
+                    .map(|s| {
+                        if s % 2 == 0 {
+                            Some((f(s as u64 + 800) * 50.0) as f32)
+                        } else {
+                            None
+                        }
+                    })
                     .collect(),
             };
             let mut buf = Vec::new();
