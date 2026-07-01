@@ -49,6 +49,10 @@ pub mod variant_grouping;
 // `WriterStats` (a CLI struct field) + a test-only filter helper. The rest is
 // crate-internal plumbing with no consumer outside this subtree.
 pub(crate) mod cohort_integration;
+// The hidden-paralog filter's var-calling wiring (Milestone S): the two-pass
+// spill-and-calibrate flow that turns the pure `crate::paralog` statistics into
+// a VCF filter. Depends inward on `crate::paralog` (arch Premise 0).
+pub(crate) mod paralog_filter;
 pub(crate) mod pileup_overlaps;
 pub mod pipeline;
 pub(crate) mod sample_reader;
