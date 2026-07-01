@@ -468,7 +468,8 @@ emits a `FILTER`/INFO verdict.
 - **Q1 (module skeleton + `ParalogModelParams`):** done — `src/paralog/` peer module; fixed model constants/grids (ε, carrier copy numbers, folded-SFS + carrier-freq grids, hom-alt veto) with prototype-faithful defaults. Code: [src/paralog/mod.rs](src/paralog/mod.rs).
 - **Q2 (`SingleCopyCoverageModel::fit`):** done — mode-anchored single-copy scale (parabolic refine + mode/median guard), per-GC weighted-median bias curve, σ₀ = 1.4826·MAD floored at histogram resolution; `relative_copy_number`. Code: [src/paralog/coverage_model.rs](src/paralog/coverage_model.rs). Review: [paralog_q2_coverage_model_2026-07-01.md](doc/devel/reports/reviews/paralog_q2_coverage_model_2026-07-01.md).
 - **Q3 (`score_locus_for_paralogy`):** done — pure H1-vs-H2 marginal LR (folded-SFS `p` marginal + Wright HWE for H1; carrier config × freq marginal for H2; hom-alt veto falls out). Numerically verified faithful to the prototype. Code: [src/paralog/locus_score.rs](src/paralog/locus_score.rs). Review: [paralog_q3_locus_score_2026-07-01.md](doc/devel/reports/reviews/paralog_q3_locus_score_2026-07-01.md).
-- **Carried forward:** downstream `Hobs` consumers (Q4/S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample).
+- **Q4 (inbreeding scalar `F`):** done — pure `obs_het = n_het/callable` (het *rate*, not the inverting variant-site ratio) + `inbreeding_coefficient = clip(1 − obs_het/hexp, 0, 0.99)`; `Hexp` accumulated by the wiring (S1). Zero-callable → `F` inert (no per-locus data). Code: [src/paralog/inbreeding.rs](src/paralog/inbreeding.rs).
+- **Carried forward:** downstream `Hobs` consumers (S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample); Q4 handles it (zero rate → inert `F`).
 
 ---
 

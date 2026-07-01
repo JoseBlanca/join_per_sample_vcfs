@@ -31,11 +31,13 @@
 //! draft*, not a bit-exact oracle.
 
 pub mod coverage_model;
+pub mod inbreeding;
 pub mod locus_score;
 
 pub use coverage_model::{
     CoverageFitConfig, CoverageModelError, ModeMedianRatioBounds, SingleCopyCoverageModel,
 };
+pub use inbreeding::{inbreeding_coefficient, obs_het};
 pub use locus_score::{
     LocusObservations, ParalogScore, SampleObservation, score_locus_for_paralogy,
 };
