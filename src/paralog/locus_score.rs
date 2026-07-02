@@ -266,7 +266,11 @@ pub fn score_locus_for_paralogy(
     // dropping samples whose σ₀ is degenerate (an unfit coverage model → `≤ 0` or
     // non-finite would make the Normal term `NaN`).
     let cmax = precompute.max_relative_copy_number;
-    let mut usable: Vec<UsableSample> = Vec::new();
+    // Presized to the cohort (the max possible usable count) so the push loop
+    // below never reallocates — DHAT showed the un-presized `Vec::new()` grew
+    // through ~5 reallocations per locus, the bulk of the scorer's per-locus
+    // allocation count (wall-negligible, but free to remove).
+    let mut usable: Vec<UsableSample> = Vec::with_capacity(cohort_size);
     let mut confident_homalt_carriers = 0usize;
     for (cohort_index, (obs, &sigma0)) in observations
         .samples
