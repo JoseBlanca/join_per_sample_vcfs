@@ -19,6 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — single-individual reformulation IMPLEMENTED + validated (Steps A/B/C)**
+>   (branch `tomato2-paralog-filter`). Built the reformulation: **Step A** dropped `min_samples` (the
+>   LR self-gates — under-powered → LR≈0 → kept); **Step B** made `F` the caller's single cohort
+>   `--inbreeding-coefficient` and **deleted `Hexp` + the main-pass accumulator + `obs_het` +
+>   callable-reference** (a correct per-individual `F` isn't AF-free-identifiable, and the per-variant
+>   proxy is divergence-contaminated per Premise 3; `F` is a weak knob). Only global quantity left = π
+>   (over loci). **Step C re-validation on tomato2 (no truth → profile coherence):** π = 0.092 (R1
+>   ≈0.09, converged), **6.64 % dropped**, drop profile **preserved** (coverage 1.29× + het-excess
+>   0.116 vs 0.046), **Jaccard 0.87** vs the old drop set, filter-off byte-identical. **n=1 works:**
+>   one tomato sample drops 531 loci (7.1 %) that are het at **2.3× coverage** — graceful degradation
+>   confirmed, coverage carries it. `F=0` default (outbred) still works because coverage is
+>   load-bearing; selfing cohorts can raise `--inbreeding-coefficient`. Full suite green, clippy clean.
+>   Report: [paralog_single_sample_validation_2026-07-02.md](doc/devel/reports/implementations/paralog_single_sample_validation_2026-07-02.md).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — single-individual reformulation DESIGNED (spec + plan; supersedes Premise 3)**
 >   (branch `tomato2-paralog-filter`). Settled with the owner across a long design thread: make the
 >   score degrade gracefully from **one individual** up, with no cohort-wide allele-frequency
