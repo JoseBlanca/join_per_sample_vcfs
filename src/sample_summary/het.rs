@@ -343,7 +343,7 @@ mod tests {
                 gc_bins: 1,
                 depth_bin_width: 1.0,
                 depth_bins: 1,
-                n_tiles: 0,
+                n_positions: 0,
                 n_skipped_tiles: 0,
                 callable_positions: 0,
                 counts: vec![0, 0],

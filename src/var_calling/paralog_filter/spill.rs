@@ -21,8 +21,8 @@
 //! The paralog score's coverage input (per-sample centred-window GC + mean
 //! coverage) rides **on** each record spill entry ([`ParalogSpillRecord::window_coverage`]),
 //! gathered by the caller from the psp windowed columns. The sibling window-spill
-//! stream (Approach A, S6c) that once carried it, joined by tile key, is being
-//! retired (its read side is gone; the write side follows in M6).
+//! stream (Approach A, S6c) that once carried it, joined by tile key, has been
+//! retired (both sides removed in M6).
 //!
 //! This deliberately re-adds a second per-sample vector to each record frame —
 //! the very cost the sibling window spill was introduced (S6c) to keep *out* of
@@ -75,27 +75,6 @@ pub(crate) struct ParalogSpillRecord {
     /// locus whose chunk carried no window coverage (e.g. the write pass's
     /// re-emitted survivors, which never re-score).
     pub window_coverage: LocusWindowCoverage,
-}
-
-/// One analysis window on the **window spill** (Approach A, S6c): the window's
-/// tile key, its shared reference GC, and each sample's mean depth over the
-/// window. The calibrate / write passes join this to each locus record by tile
-/// key, so the paralog score's coverage inputs are supplied without carrying
-/// per-sample window data in the (per-locus, all-samples) record spill.
-///
-/// Written in coordinate (tile) order by the producer's window builder; read
-/// back in lockstep with the record spill (both coordinate-ordered).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct WindowSpillRecord {
-    /// Chromosome id (matches the record spill's `locus.chrom_id`).
-    pub chrom_id: u32,
-    /// Window tile index, `(pos − 1) / window_bp`.
-    pub tile: u32,
-    /// The window's shared reference GC fraction.
-    pub gc: f32,
-    /// Per cohort sample: mean depth over the window, or `None` if the sample
-    /// had no covered position in it.
-    pub depths: Vec<Option<f32>>,
 }
 
 /// Failure modes of the spill read/write path.
@@ -166,19 +145,6 @@ impl ParalogSpill {
     pub(crate) fn reader(&self) -> Result<ParalogSpillReader<BufReader<File>>, SpillError> {
         let file = File::open(&self.temp_path)?;
         Ok(ParalogSpillReader::new(BufReader::with_capacity(
-            64 * 1024,
-            file,
-        )))
-    }
-
-    /// Open a buffered [`WindowSpillWriter`] over this file (truncating). Used
-    /// when the spill holds [`WindowSpillRecord`]s (the window spill).
-    pub(crate) fn window_writer(&self) -> Result<WindowSpillWriter<BufWriter<File>>, SpillError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.temp_path)?;
-        Ok(WindowSpillWriter::new(BufWriter::with_capacity(
             64 * 1024,
             file,
         )))
@@ -266,107 +232,6 @@ impl<R: Read> Iterator for ParalogSpillReader<R> {
     }
 }
 
-/// Streaming append-only writer for the window spill (same length-framing as the
-/// record spill, one [`WindowSpillRecord`] per frame).
-pub(crate) struct WindowSpillWriter<W: Write> {
-    sink: W,
-    scratch: Vec<u8>,
-}
-
-impl<W: Write> WindowSpillWriter<W> {
-    pub(crate) fn new(sink: W) -> Self {
-        Self {
-            sink,
-            scratch: Vec::new(),
-        }
-    }
-
-    /// Append one window record (tile-ordered by the caller).
-    pub(crate) fn append(&mut self, record: &WindowSpillRecord) -> Result<(), SpillError> {
-        self.scratch.clear();
-        encode_window(record, &mut self.scratch);
-        write_frame(&mut self.sink, &self.scratch)
-    }
-
-    /// Flush and return the sink.
-    pub(crate) fn finish(mut self) -> Result<W, SpillError> {
-        self.sink.flush()?;
-        Ok(self.sink)
-    }
-}
-
-/// Encode a window record: `chrom_id`, `tile`, `gc`, then the per-sample
-/// `Option<f32>` depth vector (tag byte + `f32`).
-fn encode_window(record: &WindowSpillRecord, out: &mut Vec<u8>) {
-    put_u32(out, record.chrom_id);
-    put_u32(out, record.tile);
-    put_f32(out, record.gc);
-    put_len(out, record.depths.len());
-    for d in &record.depths {
-        match d {
-            Some(depth) => {
-                put_bool(out, true);
-                put_f32(out, *depth);
-            }
-            None => put_bool(out, false),
-        }
-    }
-}
-
-/// One-pass reader for the window spill, one record at a time. **Test-only**: the
-/// production score reads its coverage from the record spill now, so nothing
-/// reads the window spill at runtime — this reader survives only to round-trip
-/// the still-live writer in its unit tests, until M6 retires the window spill.
-#[cfg(test)]
-pub(crate) struct WindowSpillReader<R: Read> {
-    source: R,
-    buf: Vec<u8>,
-}
-
-#[cfg(test)]
-impl<R: Read> WindowSpillReader<R> {
-    pub(crate) fn new(source: R) -> Self {
-        Self {
-            source,
-            buf: Vec::new(),
-        }
-    }
-
-    /// The next window record, or `None` at a clean end of stream.
-    pub(crate) fn next_record(&mut self) -> Option<Result<WindowSpillRecord, SpillError>> {
-        match read_frame(&mut self.source, &mut self.buf) {
-            Ok(false) => None,
-            Ok(true) => Some(decode_window(&self.buf)),
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
-
-/// Decode a window record (mirror of [`encode_window`]). Test-only alongside
-/// [`WindowSpillReader`].
-#[cfg(test)]
-fn decode_window(buf: &[u8]) -> Result<WindowSpillRecord, SpillError> {
-    let mut d = Decoder::new(buf);
-    let chrom_id = d.u32("window.chrom_id")?;
-    let tile = d.u32("window.tile")?;
-    let gc = d.f32("window.gc")?;
-    let n = d.len("window.depths.len")?;
-    let mut depths = Vec::with_capacity(n);
-    for _ in 0..n {
-        depths.push(if d.bool("window.depths.tag")? {
-            Some(d.f32("window.depths.value")?)
-        } else {
-            None
-        });
-    }
-    Ok(WindowSpillRecord {
-        chrom_id,
-        tile,
-        gc,
-        depths,
-    })
-}
-
 /// Read a 4-byte length frame. `Ok(false)` if the stream is cleanly at EOF
 /// before any byte of the frame; `Ok(true)` if the frame was filled;
 /// [`SpillError::Truncated`] if EOF arrived mid-frame.
@@ -391,8 +256,7 @@ fn read_frame_len<R: Read>(source: &mut R, out: &mut [u8; 4]) -> Result<bool, Sp
     Ok(true)
 }
 
-/// Write one length-framed payload: a `u32` LE length prefix + the bytes. Shared
-/// by the record spill and the window spill.
+/// Write one length-framed payload: a `u32` LE length prefix + the bytes.
 fn write_frame<W: Write>(sink: &mut W, payload: &[u8]) -> Result<(), SpillError> {
     let len = u32::try_from(payload.len())
         .map_err(|_| SpillError::RecordTooLarge { len: payload.len() })?;
@@ -949,36 +813,6 @@ mod tests {
         );
         // The reused decode buffer holds exactly one record's payload.
         assert!(reader.buf.len() < one_record_len + 4);
-    }
-
-    /// Window-spill records round-trip through a stream (including a `None`
-    /// per-sample depth and a `NaN`-free GC).
-    #[test]
-    fn window_records_round_trip() {
-        let records = vec![
-            WindowSpillRecord {
-                chrom_id: 0,
-                tile: 2,
-                gc: 0.41,
-                depths: vec![Some(18.3), None, Some(0.0)],
-            },
-            WindowSpillRecord {
-                chrom_id: 1,
-                tile: 0,
-                gc: 1.0,
-                depths: vec![None, None],
-            },
-        ];
-        let mut writer = WindowSpillWriter::new(Cursor::new(Vec::new()));
-        for r in &records {
-            writer.append(r).unwrap();
-        }
-        let bytes = writer.finish().unwrap().into_inner();
-        let mut reader = WindowSpillReader::new(Cursor::new(bytes));
-        let back: Vec<WindowSpillRecord> = std::iter::from_fn(|| reader.next_record())
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(back, records);
     }
 
     /// A stream truncated inside a record's payload surfaces as an error, not a

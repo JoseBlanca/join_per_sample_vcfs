@@ -394,7 +394,10 @@ mod tests {
         let h = acc.finish(&mut writer).unwrap().coverage_by_gc;
         // Two covered positions (2 and 3), each finalised into one window
         // sample — no double-count of the wide record's interior.
-        assert_eq!(h.n_tiles, 2, "two covered positions → two window samples");
+        assert_eq!(
+            h.n_positions, 2,
+            "two covered positions → two window samples"
+        );
         assert_eq!(h.callable_positions, 2);
     }
 
@@ -462,7 +465,7 @@ mod tests {
             .expect("finish flushes + reduces");
         // Four covered positions (2,3,4,5), each one window sample; no ALT
         // alleles -> no variant sites.
-        assert_eq!(summary_doc.coverage_by_gc.n_tiles, 4);
+        assert_eq!(summary_doc.coverage_by_gc.n_positions, 4);
         assert_eq!(summary_doc.coverage_by_gc.callable_positions, 4);
         assert_eq!(summary_doc.heterozygosity.n_variant_sites, 0);
         writer

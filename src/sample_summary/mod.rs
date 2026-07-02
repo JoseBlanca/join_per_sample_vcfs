@@ -35,7 +35,13 @@ use thiserror::Error;
 ///   catches only future/zeroed versions, not v1 on disk. Pre-alpha, no
 ///   backwards-compatibility promise: regenerate old summary sections by
 ///   re-running `pileup`.
-pub const SAMPLE_SUMMARY_VERSION: u16 = 2;
+/// - v3: renames `coverage_by_gc.n-tiles` → `coverage_by_gc.n-positions`
+///   (the sliding-window model emits one window sample per covered position,
+///   so the field counts positions, not fixed tiles). A breaking wire-key
+///   change: like the v1→v2 case above, a stale v2 document is rejected at the
+///   TOML layer (missing required `n-positions`) rather than by the version
+///   guard. Same pre-alpha regenerate-by-re-running-`pileup` policy.
+pub const SAMPLE_SUMMARY_VERSION: u16 = 3;
 
 /// Default tile / GC covariate window in bp (architecture Premise 3). The
 /// `pileup --gc-window-bp` flag overrides it.
@@ -98,8 +104,10 @@ pub struct CoverageByGcHistogram {
     /// above `depth_bins * depth_bin_width`) follows them, so each GC row
     /// holds `depth_bins + 1` cells.
     pub depth_bins: u32,
-    /// Tiles folded into the histogram (its support).
-    pub n_tiles: u64,
+    /// Covered positions folded into the histogram (its support). In the
+    /// sliding-window model each covered position contributes one window sample,
+    /// so this counts positions, not fixed tiles — hence the name.
+    pub n_positions: u64,
     /// Tiles skipped because they had no GC-defined (non-`N`) covered
     /// positions, so no `(GC, depth)` sample could be formed.
     pub n_skipped_tiles: u64,
@@ -112,7 +120,7 @@ pub struct CoverageByGcHistogram {
     /// recover it — a tile's per-position covered count is lost when the
     /// tile collapses to one `(GC, mean depth)` cell — so it is kept as its
     /// own running total. Every folded tile contributes at least one covered
-    /// position, so `callable_positions >= n_tiles`.
+    /// position, so `callable_positions >= n_positions`.
     pub callable_positions: u64,
     /// Row-major `[gc_bin][depth_bin]` counts. Length is exactly
     /// `gc_bins * (depth_bins + 1)`.
@@ -289,17 +297,17 @@ impl CoverageByGcHistogram {
                 expected,
             });
         }
-        // Every folded (non-skipped) tile carries at least one GC-defined
-        // covered position, and `callable_positions` sums exactly those
-        // positions, so it can never be smaller than the folded-tile count.
-        // A document violating this is corrupt (or was built by a producer
-        // that miscounts) and would yield a nonsensical het rate.
-        if self.callable_positions < self.n_tiles {
+        // Every folded (non-skipped) window sample carries at least one
+        // GC-defined covered position, and `callable_positions` sums exactly
+        // those positions, so it can never be smaller than `n_positions`. A
+        // document violating this is corrupt (or was built by a producer that
+        // miscounts) and would yield a nonsensical het rate.
+        if self.callable_positions < self.n_positions {
             return Err(bad(
                 "coverage-by-gc.callable-positions",
                 format!(
-                    "{} < n-tiles {} (each folded tile has >= 1 covered position)",
-                    self.callable_positions, self.n_tiles,
+                    "{} < n-positions {} (each folded sample has >= 1 covered position)",
+                    self.callable_positions, self.n_positions,
                 ),
             ));
         }
@@ -357,7 +365,7 @@ mod tests {
                 gc_bins: 2,
                 depth_bin_width: 0.5,
                 depth_bins: 3,
-                n_tiles: 42,
+                n_positions: 42,
                 n_skipped_tiles: 1,
                 callable_positions: 4200,
                 // gc_bins (2) * (depth_bins + 1 = 4) = 8 cells.
@@ -533,15 +541,15 @@ mod tests {
         }
     }
 
-    /// The `callable_positions >= n_tiles` invariant is enforced: a document
-    /// claiming fewer callable positions than folded tiles (impossible — each
-    /// folded tile carries >= 1 covered position) is rejected. Without this
-    /// test a future refactor that drops or inverts the check would pass CI.
+    /// The `callable_positions >= n_positions` invariant is enforced: a document
+    /// claiming fewer callable positions than folded window samples (impossible
+    /// — each folded sample carries >= 1 covered position) is rejected. Without
+    /// this test a future refactor that drops or inverts the check would pass CI.
     #[test]
-    fn validate_rejects_callable_positions_below_n_tiles() {
-        let mut s = sample(); // n_tiles: 42, callable_positions: 4200
-        s.coverage_by_gc.callable_positions = 41; // < n_tiles 42
-        let err = s.validate().expect_err("callable < n_tiles must fail");
+    fn validate_rejects_callable_positions_below_n_positions() {
+        let mut s = sample(); // n_positions: 42, callable_positions: 4200
+        s.coverage_by_gc.callable_positions = 41; // < n_positions 42
+        let err = s.validate().expect_err("callable < n_positions must fail");
         assert!(
             matches!(err, SampleSummaryError::InvalidField { field, .. }
                      if field == "coverage-by-gc.callable-positions"),
@@ -549,16 +557,34 @@ mod tests {
         );
     }
 
-    /// The accept side of the boundary: `callable_positions == n_tiles` (one
-    /// covered position per tile) is the tight legitimate edge and must pass.
-    /// Pins the `>=` against an off-by-one flip to `>`.
+    /// The rejection diagnostic names the current field (`n-positions`), not the
+    /// retired `n-tiles` — pins the error text against re-drift after the rename
+    /// (the invariant test above only checks the `field` tag, not the message).
     #[test]
-    fn validate_accepts_callable_positions_equal_to_n_tiles() {
+    fn validate_below_n_positions_message_uses_current_field_name() {
         let mut s = sample();
-        s.coverage_by_gc.n_tiles = 8;
-        s.coverage_by_gc.callable_positions = 8; // exactly one covered pos/tile
+        s.coverage_by_gc.callable_positions = 41; // < n_positions 42
+        let msg = s.validate().expect_err("must fail").to_string();
+        assert!(
+            !msg.contains("n-tiles"),
+            "diagnostic must not use the retired 'n-tiles' wording: {msg}"
+        );
+        assert!(
+            msg.contains("n-positions"),
+            "diagnostic should name the current field 'n-positions': {msg}"
+        );
+    }
+
+    /// The accept side of the boundary: `callable_positions == n_positions` (one
+    /// covered position per window sample) is the tight legitimate edge and must
+    /// pass. Pins the `>=` against an off-by-one flip to `>`.
+    #[test]
+    fn validate_accepts_callable_positions_equal_to_n_positions() {
+        let mut s = sample();
+        s.coverage_by_gc.n_positions = 8;
+        s.coverage_by_gc.callable_positions = 8; // exactly one covered pos/sample
         s.validate()
-            .expect("callable == n_tiles is the valid boundary");
+            .expect("callable == n_positions is the valid boundary");
     }
 
     /// Non-UTF-8 metadata bytes surface as `NotUtf8` (carrying the cause),
@@ -626,7 +652,7 @@ mod tests {
                     gc_bins,
                     depth_bin_width,
                     depth_bins,
-                    n_tiles: n_het + 7,
+                    n_positions: n_het + 7,
                     n_skipped_tiles: 3,
                     callable_positions: n_het + 7,
                     counts: vec![u32::MAX; cells],

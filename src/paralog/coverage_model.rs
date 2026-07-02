@@ -607,7 +607,7 @@ mod tests {
 
     /// Build a histogram by binning `(gc_fraction, depth, count)` tiles with
     /// the same cell arithmetic the accumulator uses. `callable_positions`
-    /// is set to the tile total (`>= n_tiles`, satisfying the invariant).
+    /// is set to the tile total (`>= n_positions`, satisfying the invariant).
     fn hist(
         gc_bins: u32,
         depth_bins: u32,
@@ -629,7 +629,7 @@ mod tests {
             gc_bins,
             depth_bin_width: width,
             depth_bins,
-            n_tiles: n,
+            n_positions: n,
             n_skipped_tiles: 0,
             callable_positions: n,
             counts,

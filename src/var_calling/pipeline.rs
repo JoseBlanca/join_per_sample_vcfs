@@ -70,8 +70,6 @@ use crate::var_calling::paralog_filter::prepass::ParalogPrePass;
 use crate::var_calling::paralog_filter::spill::{
     ParalogSpill, ParalogSpillRecord, ParalogSpillWriter, SpillError,
 };
-use crate::var_calling::paralog_filter::window_gc::ReferenceWindowGc;
-use crate::var_calling::paralog_filter::window_producer::WindowSpillBuilder;
 use crate::var_calling::paralog_filter::write_pass::{
     WritePassError, paralog_provenance, run_write_pass,
 };
@@ -415,42 +413,24 @@ pub fn run_var_calling(
     // kept (not moved) to build the final writer *after* calibration, when they
     // carry the paralog provenance; the single-pass branch clones them so they
     // survive for the borrow checker either way.
-    // Two ephemeral spills when the filter is on (arch §5, Approach A): the
-    // **record spill** (per-locus caller output, written by the sink thread) and
-    // the **window spill** (per variant-window coverage, written inline in the
-    // fold loop by `window_builder`). Both live in the output's scratch directory
-    // and are deleted when these values drop, on success and on any `?` alike.
-    let (paralog_spill, paralog_window_spill) = if paralog_requested {
+    // One ephemeral spill when the filter is on (arch §5): the **record spill**
+    // (per-locus caller output, written by the sink thread), carrying each
+    // record's per-sample centred-window coverage inline. It lives in the
+    // output's scratch directory and is deleted when the value drops, on success
+    // and on any `?` alike. (The sibling window spill — Approach A, S6c — that
+    // once joined coverage by tile key has been retired: the coverage now flows
+    // as .psp columns → the caller's `CalledChunk::window_coverage` → the record
+    // spill.)
+    let paralog_spill = if paralog_requested {
         let scratch_dir = args
             .output
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
-        (
-            Some(ParalogSpill::create_in(scratch_dir)?),
-            Some(ParalogSpill::create_in(scratch_dir)?),
-        )
+        Some(ParalogSpill::create_in(scratch_dir)?)
     } else {
-        (None, None)
+        None
     };
-    // The window-depth accumulator's tile width must match the coverage
-    // histogram's (arch §4); the pre-pass carries it. Only meaningful when the
-    // filter is on (a pre-pass exists).
-    let paralog_window_bp = paralog_prepass
-        .as_ref()
-        .map(|p| p.window_bp())
-        .unwrap_or(crate::sample_summary::DEFAULT_GC_WINDOW_BP);
-    // The window-spill builder, fed inline in the fold loop (§4). `None` off the
-    // filter path. Owns a writer handle to the window spill file.
-    let mut window_builder: Option<WindowSpillBuilder<BufWriter<File>>> =
-        match &paralog_window_spill {
-            Some(ws) => Some(WindowSpillBuilder::new(
-                n_samples,
-                paralog_window_bp,
-                ws.window_writer()?,
-            )),
-            None => None,
-        };
     let sink: Box<dyn ChunkSink> = match &paralog_spill {
         Some(spill) => Box::new(SpillSink::new(spill.writer()?)),
         None => Box::new(VcfWriterSink(VcfWriter::new(
@@ -603,11 +583,6 @@ pub fn run_var_calling(
             // `producer_pool` because the whole loop is inside `install`).
             let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
             let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
-            // Paralog window-spill state (S6c): the builder is fed inline from
-            // each plan; `window_gc_chrom` tracks the contig its GC is built for,
-            // `variant_scratch` is the reused variant-position buffer.
-            let mut window_gc_chrom: Option<u32> = None;
-            let mut variant_scratch: Vec<u32> = Vec::new();
             let produce = producer_pool.install(|| -> Result<(), PipelineError> {
                 // Full topology (main + pool + callers + writer [+ coordinators])
                 // is live by here — log the OS thread count for the §6 budget
@@ -626,14 +601,6 @@ pub fn run_var_calling(
                         cohort.complexity_window,
                         cohort.complexity_threshold,
                     )?;
-                    begin_window_interval(
-                        &mut window_builder,
-                        &mut window_gc_chrom,
-                        chrom_id,
-                        &args.reference,
-                        &chrom_names,
-                        paralog_window_bp,
-                    )?;
                     producer.begin_interval(chrom_id, interval.clone(), mask);
                     loop {
                         let plan = {
@@ -651,9 +618,6 @@ pub fn run_var_calling(
                             producer.plan_chunk(&mut fetch)?
                         };
                         let Some(plan) = plan else { break };
-                        if let Some(builder) = window_builder.as_mut() {
-                            feed_window_builder(builder, &plan, &mut variant_scratch)?;
-                        }
                         if plan_tx.send(plan).is_err() {
                             return Ok(()); // compact stage gone; error on join
                         }
@@ -683,9 +647,6 @@ pub fn run_var_calling(
             let mut producer = CohortChunkIntegrator::new(readers, min_alt_obs, target_variants);
             let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
             let mut dust_fetcher: Option<(u32, ManualEvictChromRefFetcher)> = None;
-            // Paralog window-spill state (S6c), as in the staged branch.
-            let mut window_gc_chrom: Option<u32> = None;
-            let mut variant_scratch: Vec<u32> = Vec::new();
             let produce = producer_pool.install(|| -> Result<(), PipelineError> {
                 // Full topology (main + pool + callers + writer [+ coordinators])
                 // is live by here — log the OS thread count for the §6 budget
@@ -704,14 +665,6 @@ pub fn run_var_calling(
                         cohort.complexity_window,
                         cohort.complexity_threshold,
                     )?;
-                    begin_window_interval(
-                        &mut window_builder,
-                        &mut window_gc_chrom,
-                        chrom_id,
-                        &args.reference,
-                        &chrom_names,
-                        paralog_window_bp,
-                    )?;
                     producer.begin_interval(chrom_id, interval.clone(), mask);
                     loop {
                         let plan = {
@@ -729,9 +682,6 @@ pub fn run_var_calling(
                             producer.plan_chunk(&mut fetch)?
                         };
                         let Some(plan) = plan else { break };
-                        if let Some(builder) = window_builder.as_mut() {
-                            feed_window_builder(builder, &plan, &mut variant_scratch)?;
-                        }
                         let chunk = compact_plan(plan, cache_straddlers)?;
                         if chunk_tx.send(chunk).is_err() {
                             return Ok(()); // callers gone; error on join
@@ -761,23 +711,14 @@ pub fn run_var_calling(
         }
     })?;
 
-    // Flush + close the window-spill builder now the fold has finished (drains
-    // each contig's last windows). Done before the read passes so both spills
-    // are complete on disk. `None` off the filter path.
-    if let Some(builder) = window_builder.take() {
-        builder.finish()?;
-    }
-
     // Single-pass produced the VCF directly; two-pass now calibrates from the
-    // spill and writes the surviving calls (S4 + S5). Each spill is read twice
+    // spill and writes the surviving calls (S4 + S5). The spill is read twice
     // (calibrate, then write) and deleted when its `ParalogSpill` drops at the
     // end of this function — on success and on any `?` error alike.
     match sink_output {
         SinkOutput::Vcf(stats) => Ok(stats),
         SinkOutput::Spill => {
             let spill = paralog_spill.expect("a spill sink implies a record spill file");
-            let window_spill =
-                paralog_window_spill.expect("a spill sink implies a window spill file");
             let prepass = paralog_prepass.expect("a spill sink implies a pre-pass");
             // The inbreeding coefficient `F` is one cohort constant — the caller's
             // `--inbreeding-coefficient`, the same value its genotype prior uses —
@@ -785,12 +726,10 @@ pub fn run_var_calling(
             // reformulation).
             let inbreeding = cohort.inbreeding_coefficient;
             eprintln!(
-                "var-calling: paralog filter — {} samples fit; F = {:.4}; record spill at {}, \
-                 window spill at {}",
+                "var-calling: paralog filter — {} samples fit; F = {:.4}; record spill at {}",
                 prepass.fit_count(),
                 inbreeding,
                 spill.path().display(),
-                window_spill.path().display(),
             );
             let params = ParalogModelParams::default();
             let cfg = CalibrationConfig::default();
@@ -999,81 +938,6 @@ fn require_paralog_summaries(
         });
     }
     Ok(())
-}
-
-/// Build one contig's per-window reference GC for the paralog window join (S6c),
-/// by streaming its FASTA bases through a fresh [`StreamingChromRefFetcher`] —
-/// the same memory-flat serial walk the DUST mask uses (a ~1 MB sliding buffer,
-/// never the whole contig). A separate fetcher from the fold's ref-span one,
-/// because `iter_bases` resets the sliding buffer (the fetchers must not share).
-fn build_window_gc(
-    fasta: &std::path::Path,
-    chrom_name: &str,
-    window_bp: u32,
-) -> Result<ReferenceWindowGc, PipelineError> {
-    let fetcher = StreamingChromRefFetcher::for_contig(fasta, chrom_name)?;
-    // `iter_bases` yields `Result<u8, _>`; capture the first fetch error and
-    // stop the walk (map_while) rather than folding a bogus base into the GC.
-    let mut fetch_err: Option<ChromRefFetchError> = None;
-    let gc = ReferenceWindowGc::from_base_iter(
-        fetcher.iter_bases()?.map_while(|b| match b {
-            Ok(base) => Some(base),
-            Err(e) => {
-                fetch_err = Some(e);
-                None
-            }
-        }),
-        window_bp,
-    );
-    match fetch_err {
-        Some(e) => Err(e.into()),
-        None => Ok(gc),
-    }
-}
-
-/// On a contig change, build the new contig's reference GC and open the window
-/// builder's interval for it (draining the previous contig's windows). A no-op
-/// off the filter path (`builder` is `None`) or within a contig. `gc_chrom`
-/// tracks the contig the builder's GC is currently built for.
-fn begin_window_interval<W: std::io::Write>(
-    builder: &mut Option<WindowSpillBuilder<W>>,
-    gc_chrom: &mut Option<u32>,
-    chrom_id: u32,
-    fasta: &std::path::Path,
-    chrom_names: &[String],
-    window_bp: u32,
-) -> Result<(), PipelineError> {
-    let Some(builder) = builder.as_mut() else {
-        return Ok(());
-    };
-    if *gc_chrom != Some(chrom_id) {
-        let gc = build_window_gc(fasta, &chrom_names[chrom_id as usize], window_bp)?;
-        builder.begin_interval(chrom_id, gc)?;
-        *gc_chrom = Some(chrom_id);
-    }
-    Ok(())
-}
-
-/// Feed one planned chunk's per-sample covered positions + variant positions
-/// into the window-spill builder, then flush the windows now closed for the
-/// whole cohort. Runs in the fold loop *before* the plan is compacted/sent, so it
-/// reads the plan's light data without touching the caller path (byte-identity of
-/// the caller output holds). `variant_scratch` is a reused buffer.
-fn feed_window_builder<W: std::io::Write>(
-    builder: &mut WindowSpillBuilder<W>,
-    plan: &ChunkPlan,
-    variant_scratch: &mut Vec<u32>,
-) -> Result<(), SpillError> {
-    plan.for_each_window_observation(|sample_idx, pos, depth| {
-        builder.observe(sample_idx, pos, depth);
-    });
-    variant_scratch.clear();
-    variant_scratch.extend(plan.chunk_variant_positions());
-    builder.mark_variant_positions(variant_scratch);
-    // Flush up to the cohort-fed frontier (this chunk's exclusive `cut`), not
-    // each sample's last-covered tile — keeps `pending` bounded when a sample
-    // has a coverage gap (S6c review).
-    builder.flush_ready(plan.cut())
 }
 
 /// Fetch REF bytes for `chrom_id`, building a fresh per-contig

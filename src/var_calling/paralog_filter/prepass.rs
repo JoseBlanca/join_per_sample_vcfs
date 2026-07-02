@@ -45,12 +45,6 @@ pub(crate) struct ParalogSampleModel {
 pub(crate) struct ParalogPrePass {
     /// Per cohort sample, in column order; `None` = absent / rejected.
     samples: Vec<Option<ParalogSampleModel>>,
-    /// The analysis/GC window width the coverage histograms were tiled at (the
-    /// `pileup --gc-window-bp`, `500` by default). The window-depth accumulator
-    /// (S6c) must tile at the **same** width so a locus's window mean depth is
-    /// on the scale the coverage model was fit on. Taken from the first present
-    /// summary (all cohort samples share one pileup window).
-    window_bp: u32,
 }
 
 impl ParalogPrePass {
@@ -72,23 +66,7 @@ impl ParalogPrePass {
                 })
             })
             .collect();
-        // The window is a pileup property shared by the cohort, so read it from
-        // the first present summary (even a fit-rejected one carries it);
-        // default to the pileup default if no summary is present at all.
-        let window_bp = summaries
-            .iter()
-            .flatten()
-            .map(|s| s.coverage_by_gc.window_bp)
-            .next()
-            .unwrap_or(crate::sample_summary::DEFAULT_GC_WINDOW_BP)
-            .max(1);
-        Self { samples, window_bp }
-    }
-
-    /// The analysis/GC window width (bp) the coverage histograms were tiled at
-    /// — the width the window-depth accumulator (S6c) must reuse.
-    pub(crate) fn window_bp(&self) -> u32 {
-        self.window_bp
+        Self { samples }
     }
 
     /// The per-sample fitted state, in cohort column order (`None` = absent).
@@ -132,7 +110,7 @@ mod tests {
         let width = 1.0f64;
         let row_stride = depth_bins as usize + 1;
         let mut counts = vec![0u32; gc_bins as usize * row_stride];
-        let mut n_tiles = 0u64;
+        let mut n_positions = 0u64;
         // (gc_fraction, depth, count) tiles: peak at depth-bin 10 in both GC bins.
         for &(gc, depth, count) in &[
             (0.25, 9.5, 100u32),
@@ -145,14 +123,14 @@ mod tests {
             let gb = ((gc * gc_bins as f64) as usize).min(gc_bins as usize - 1);
             let db = ((depth / width) as usize).min(depth_bins as usize);
             counts[gb * row_stride + db] += count;
-            n_tiles += u64::from(count);
+            n_positions += u64::from(count);
         }
         CoverageByGcHistogram {
             window_bp: 500,
             gc_bins,
             depth_bin_width: width,
             depth_bins,
-            n_tiles,
+            n_positions,
             n_skipped_tiles: 0,
             callable_positions,
             counts,
@@ -190,7 +168,7 @@ mod tests {
         s.coverage_by_gc.counts = vec![0u32; s.coverage_by_gc.gc_bins as usize * row_stride];
         s.coverage_by_gc.counts[0] = 500;
         s.coverage_by_gc.counts[row_stride] = 500;
-        s.coverage_by_gc.n_tiles = 1000;
+        s.coverage_by_gc.n_positions = 1000;
         s.coverage_by_gc.callable_positions = 1000;
         s
     }
@@ -223,18 +201,5 @@ mod tests {
         assert!(sigma[0] > 0.0);
         assert_eq!(sigma[1], 1.0, "absent sample → inert σ₀ placeholder");
         assert_eq!(sigma[2], 1.0);
-    }
-
-    /// The window width is read from the first present summary (all cohort
-    /// samples share one pileup window), defaulting when none is present.
-    #[test]
-    fn window_bp_from_first_present_summary() {
-        let with = ParalogPrePass::fit(&[None, Some(summary(1000))], &CoverageFitConfig::default());
-        assert_eq!(with.window_bp(), 500);
-        let without = ParalogPrePass::fit(&[None], &CoverageFitConfig::default());
-        assert_eq!(
-            without.window_bp(),
-            crate::sample_summary::DEFAULT_GC_WINDOW_BP
-        );
     }
 }

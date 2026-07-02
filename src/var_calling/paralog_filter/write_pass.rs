@@ -29,7 +29,6 @@ use crate::var_calling::vcf_writer::{VcfWriter, WriterError, WriterStats};
 use super::calibrate::{ParalogCalibration, cohort_inbreeding, score_spill_record};
 use super::prepass::ParalogPrePass;
 use super::spill::{ParalogSpillReader, SpillError};
-use super::window_gc::reference_base_matches;
 
 /// Failure modes of the write pass.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +101,21 @@ fn check_reference_consistency(
         });
     }
     Ok(())
+}
+
+/// Whether the reference base the FASTA walk reports at a locus matches the
+/// REF allele the caller decoded there — the coordinate-consistency guard used
+/// by [`check_reference_consistency`].
+///
+/// The `.psp` REF allele's first base *is* the reference base at that position,
+/// so a mismatch means the coordinate arithmetic has drifted (e.g. an off-by-one
+/// against the FASTA). Compared case-insensitively; an `N` on either side is
+/// treated as a match (soft-masked / ambiguous reference is not a coordinate
+/// error).
+fn reference_base_matches(fasta_base: u8, decoded_ref_base: u8) -> bool {
+    fasta_base.eq_ignore_ascii_case(&b'N')
+        || decoded_ref_base.eq_ignore_ascii_case(&b'N')
+        || fasta_base.eq_ignore_ascii_case(&decoded_ref_base)
 }
 
 /// The `##paralogFilter=...` header provenance for a calibration: the target
@@ -483,5 +497,16 @@ mod tests {
             std::fs::read_to_string(&out).unwrap()
         };
         assert_eq!(run(), run(), "same inputs → identical VCF");
+    }
+
+    /// The coordinate-consistency guard matches on equal bases (any case) and on
+    /// an `N` either side, and rejects a genuine mismatch.
+    #[test]
+    fn reference_base_consistency_guard() {
+        assert!(reference_base_matches(b'A', b'A'));
+        assert!(reference_base_matches(b'a', b'A')); // case-insensitive
+        assert!(reference_base_matches(b'N', b'A')); // N reference is a match
+        assert!(reference_base_matches(b'G', b'n')); // N allele is a match
+        assert!(!reference_base_matches(b'A', b'C')); // genuine mismatch
     }
 }

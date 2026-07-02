@@ -21,23 +21,24 @@
 //! - **S1 (this file's [`prepass`]):** the up-front per-sample state
 //!   ([`ParalogPrePass`]) plus the running [`HexpAccumulator`] for the one
 //!   global quantity that comes from the caller pass.
-//! - S2 `spill` — the ephemeral per-locus store (written once, read twice).
-//! - S3 — inline per-window coverage folded into the existing caller pass.
+//! - S2 `spill` — the ephemeral per-locus store (written once, read twice),
+//!   carrying each record's per-sample centred-window coverage inline.
 //! - S4 `calibrate` — spill → LR → histogram → `π` + FDR cut.
 //! - S5 — the write pass (spill → recompute LR → apply cut → VCF).
 //! - S6 — orchestration + CLI.
+//!
+//! The per-sample centred-window coverage the score consumes is computed in the
+//! pileup phase and carried as `.psp` columns; the caller reads it into each
+//! record's spill entry. The sibling window-spill stream (Approach A, S6c) that
+//! once joined coverage by tile key has been fully retired (M5/M6).
 
 // The two-pass flow is fully wired into `run_var_calling` (S6): the pre-pass,
-// the record + window spills, the calibrate pass, and the write pass. The window
-// modules (S3/S6c) feed the window spill that the read passes join by tile key.
+// the record spill, the calibrate pass, and the write pass.
 pub(crate) mod calibrate;
 pub(crate) mod prepass;
 pub(crate) mod spill;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod window_coverage;
-pub(crate) mod window_gc;
-pub(crate) mod window_producer;
 pub(crate) mod write_pass;
 
 /// Default `--paralog-fdr`: the target false-discovery rate for the

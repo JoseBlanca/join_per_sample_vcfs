@@ -120,6 +120,10 @@ pub struct CoverageByGcAccumulator {
     /// `(chrom_id, pos)` of the previous [`observe`](Self::observe) call,
     /// used to debug-assert the walker's coordinate-order invariant.
     last_observed: Option<(u32, u32)>,
+    /// Non-skipped tiles folded so far. In this (legacy, tiled) accumulator a
+    /// tile spans many positions, so this is a tile count — it feeds the
+    /// histogram's position-named `n_positions` field, which in the live
+    /// sliding-window model is genuinely one-per-position.
     n_tiles: u64,
     n_skipped_tiles: u64,
     /// Running grand total of GC-defined (non-`N`) covered positions across
@@ -225,7 +229,7 @@ impl CoverageByGcAccumulator {
             gc_bins: self.scheme.gc_bins,
             depth_bin_width: self.scheme.depth_bin_width,
             depth_bins: self.scheme.depth_bins,
-            n_tiles: self.n_tiles,
+            n_positions: self.n_tiles,
             n_skipped_tiles: self.n_skipped_tiles,
             callable_positions: self.callable_positions,
             counts: self.counts,
@@ -332,7 +336,7 @@ pub struct SlidingWindowCoverageAccumulator {
     /// Row-major `[gc_bin][depth_bin]` counts, length `scheme.n_cells()`.
     counts: Vec<u32>,
     /// GC-defined covered positions finalised so far (one per emitted window).
-    /// In the sliding model this is *both* the histogram's `n_tiles` and its
+    /// In the sliding model this is *both* the histogram's `n_positions` and its
     /// `callable_positions` — every finalised centre is exactly one covered
     /// position — so a single counter feeds both.
     n_covered_positions: u64,
@@ -447,9 +451,9 @@ impl SlidingWindowCoverageAccumulator {
             depth_bin_width: self.scheme.depth_bin_width,
             depth_bins: self.scheme.depth_bins,
             // Every finalised centre is one covered position — there are no
-            // "skipped tiles" in the sliding model, so `n_tiles == callable ==
+            // "skipped tiles" in the sliding model, so `n_positions == callable ==
             // n_covered_positions` and `n_skipped_tiles == 0`.
-            n_tiles: self.n_covered_positions,
+            n_positions: self.n_covered_positions,
             n_skipped_tiles: 0,
             callable_positions: self.n_covered_positions,
             counts: self.counts,
@@ -559,7 +563,7 @@ mod tests {
             acc.observe(0, p, b, 2);
         }
         let h = acc.finish();
-        assert_eq!(h.n_tiles, 1);
+        assert_eq!(h.n_positions, 1);
         assert_eq!(h.n_skipped_tiles, 0);
         // GC = 0.5 -> gc_bin = floor(0.5 * 2) = 1. depth = 2.0, width 1 ->
         // depth_bin = 2. cell = 1 * (4 + 1) + 2 = 7.
@@ -587,7 +591,7 @@ mod tests {
         acc.observe(0, 13, b'a', 1);
         let h = acc.finish();
         assert_eq!(h.callable_positions, 5);
-        assert_eq!(h.n_tiles, 2);
+        assert_eq!(h.n_positions, 2);
     }
 
     /// The callable total sums covered positions across *every* tile,
@@ -605,7 +609,7 @@ mod tests {
         }
         let h = acc.finish();
         assert_eq!(h.callable_positions, 6);
-        assert_eq!(h.n_tiles, 3);
+        assert_eq!(h.n_positions, 3);
     }
 
     /// A tile with only `N` covered positions contributes nothing to the
@@ -632,7 +636,7 @@ mod tests {
         acc.observe(0, 2, b'N', 100);
         acc.observe(0, 3, b'n', 100); // lowercase N too
         let h = acc.finish();
-        assert_eq!(h.n_tiles, 1);
+        assert_eq!(h.n_positions, 1);
         // GC = 1.0 -> gc_bin clamps to 1. depth 4.0 -> depth_bin 4 (overflow).
         // cell = 1 * 5 + 4 = 9.
         assert_eq!(h.counts[9], 1);
@@ -647,7 +651,7 @@ mod tests {
         acc.observe(0, 1, b'N', 10);
         acc.observe(0, 2, b'N', 10);
         let h = acc.finish();
-        assert_eq!(h.n_tiles, 0);
+        assert_eq!(h.n_positions, 0);
         assert_eq!(h.n_skipped_tiles, 1);
         assert_eq!(h.counts.iter().sum::<u32>(), 0);
     }
@@ -661,7 +665,7 @@ mod tests {
         acc.observe(0, 11, b'A', 1); // tile (0,1) -> finalises (0,0)
         acc.observe(1, 1, b'A', 1); // chrom 1 tile (1,0) -> finalises (0,1)
         let h = acc.finish(); // finalises (1,0)
-        assert_eq!(h.n_tiles, 3);
+        assert_eq!(h.n_positions, 3);
     }
 
     /// Depth at or above `depth_bins * depth_bin_width` lands in the
@@ -714,7 +718,7 @@ mod tests {
     #[test]
     fn empty_accumulator_finishes_clean() {
         let h = CoverageByGcAccumulator::new(scheme()).finish();
-        assert_eq!(h.n_tiles, 0);
+        assert_eq!(h.n_positions, 0);
         assert_eq!(h.n_skipped_tiles, 0);
         assert_eq!(h.counts.iter().sum::<u32>(), 0);
         assert_eq!(h.counts.len(), 2 * 5);
@@ -741,7 +745,7 @@ mod tests {
         let mut acc = CoverageByGcAccumulator::new(scheme());
         acc.observe(0, 0, b'A', 1);
         let h = acc.finish();
-        assert_eq!(h.n_tiles, 1);
+        assert_eq!(h.n_positions, 1);
         assert_eq!(h.counts.iter().sum::<u32>(), 1);
     }
 
@@ -826,7 +830,7 @@ mod tests {
             assert!((w.gc_fraction - 1.0).abs() < 1e-6, "all-G → gc 1.0");
         }
         // Every finalised centre is one covered position; no skipped tiles.
-        assert_eq!(hist.n_tiles, 10);
+        assert_eq!(hist.n_positions, 10);
         assert_eq!(hist.callable_positions, 10);
         assert_eq!(hist.n_skipped_tiles, 0);
     }
@@ -946,7 +950,7 @@ mod tests {
         let (windows, hist) = run_sliding(sliding_scheme(), 0, &[]);
         assert!(windows.is_empty());
         assert_eq!(hist.callable_positions, 0);
-        assert_eq!(hist.n_tiles, 0);
+        assert_eq!(hist.n_positions, 0);
     }
 
     /// `window_bp = 1` → `half = 0`: the window is `[p, p]` (the centre alone),
@@ -1015,6 +1019,6 @@ mod tests {
         let (windows, hist) = acc.finish();
         assert_eq!(windows.len(), 5, "every window returned, none dropped");
         assert_eq!(hist.callable_positions, 5);
-        assert_eq!(hist.n_tiles, 5);
+        assert_eq!(hist.n_positions, 5);
     }
 }

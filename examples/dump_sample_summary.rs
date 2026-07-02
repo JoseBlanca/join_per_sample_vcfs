@@ -110,7 +110,7 @@ fn main() {
         "  depth bins     : {} regular (width {}) + 1 overflow",
         cov.depth_bins, cov.depth_bin_width
     );
-    println!("  n_tiles        : {}", cov.n_tiles);
+    println!("  n_positions        : {}", cov.n_positions);
     println!("  n_skipped_tiles: {}", cov.n_skipped_tiles);
     println!("  callable_pos   : {}", cov.callable_positions);
     println!("  est mean depth : {mean_depth:.3}  (histogram-weighted)");

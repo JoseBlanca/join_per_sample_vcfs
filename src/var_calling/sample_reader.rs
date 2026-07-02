@@ -772,19 +772,6 @@ impl TwoPhaseSegment {
         &self.nonref_obs
     }
 
-    /// Per-record total observed depth = REF-allele obs (allele 0) + Σ non-REF
-    /// obs — both **light** columns (`allele_obs_count` and the folded
-    /// `nonref_obs`), so this is a couple of additions off already-decoded data,
-    /// no heavy-column inflate. Feeds the paralog window-depth accumulator (S6c);
-    /// read-only, it touches no fold state. Parallel to [`positions`](Self::positions).
-    pub fn depth_at(&self, record_idx: usize) -> u32 {
-        let ref_obs = self
-            .allele_obs_count
-            .get(self.allele_offsets[record_idx] as usize)
-            .copied()
-            .unwrap_or(0);
-        ref_obs.saturating_add(self.nonref_obs[record_idx])
-    }
     /// The segment's last 1-based position (its true extent — for the cohort
     /// watermark / finalisation check), or `None` when empty.
     pub fn last_pos(&self) -> Option<u32> {

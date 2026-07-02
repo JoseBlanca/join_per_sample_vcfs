@@ -19,6 +19,18 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M6: retire the window-spill write side + `n_tiles`→`n_positions` rename**
+>   (branch `tomato2-paralog-filter`). Per-sample centred-window coverage now flows `.psp` columns → `CalledChunk::window_coverage` →
+>   the record spill (landed M5), so the old sibling "window spill" (Approach A / S6c: a tile-keyed coverage file joined per locus) is
+>   fully dead. M6 deleted its whole write side — `WindowSpillBuilder`/`WindowSpillWriter`/`WindowSpillRecord`/`encode_window`,
+>   `WindowMeanDepthAccumulator`, `ReferenceWindowGc`, the fold-loop wiring in `pipeline.rs`, the now-dead `ChunkPlan` accessors,
+>   `TwoPhaseSegment::depth_at`, `ParalogPrePass::window_bp()` (3 modules removed, +105/−1302). `reference_base_matches` (the write-pass
+>   coordinate guard) relocated into `write_pass.rs`. Renamed the coverage-by-GC histogram field `n_tiles`→`n_positions` (sliding-window
+>   model = one sample per covered position) and **bumped `SAMPLE_SUMMARY_VERSION` 2→3** (review finding — the on-disk `.psp` key changed).
+>   1517 lib tests + paralog integration green, clippy/fmt clean, VCF byte-identity preserved (record-spill codec + calibrate/write passes
+>   untouched). 7-category parallel review: 1 Major + 1 Minor + 1 missing test, all applied.
+>   Review: [paralog_m6_2026-07-02.md](doc/devel/reports/reviews/paralog_m6_2026-07-02.md).
+>   Next in plan: M7 (score the paralog LR once in the caller worker → single write pass) then M8 (tomato2 validation + report).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — single-individual reformulation IMPLEMENTED + validated (Steps A/B/C)**
 >   (branch `tomato2-paralog-filter`). Built the reformulation: **Step A** dropped `min_samples` (the
 >   LR self-gates — under-powered → LR≈0 → kept); **Step B** made `F` the caller's single cohort

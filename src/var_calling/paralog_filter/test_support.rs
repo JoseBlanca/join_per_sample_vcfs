@@ -28,12 +28,12 @@ pub(crate) fn single_copy_summary() -> SampleSummary {
     let width = 0.5f64;
     let row_stride = depth_bins as usize + 1;
     let mut counts = vec![0u32; gc_bins as usize * row_stride];
-    let mut n_tiles = 0u64;
+    let mut n_positions = 0u64;
     for gc_bin in 0..gc_bins as usize {
         for (depth, count) in [(19.0, 100u32), (20.0, 300), (21.0, 100)] {
             let db = ((depth / width) as usize).min(depth_bins as usize);
             counts[gc_bin * row_stride + db] += count;
-            n_tiles += u64::from(count);
+            n_positions += u64::from(count);
         }
     }
     SampleSummary {
@@ -43,7 +43,7 @@ pub(crate) fn single_copy_summary() -> SampleSummary {
             gc_bins,
             depth_bin_width: width,
             depth_bins,
-            n_tiles,
+            n_positions,
             n_skipped_tiles: 0,
             callable_positions: 1_000_000,
             counts,

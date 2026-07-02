@@ -134,7 +134,7 @@ fn happy_path_default_config() {
         pop_var_caller::sample_summary::DEFAULT_GC_WINDOW_BP
     );
     assert!(
-        summary.coverage_by_gc.n_tiles >= 1,
+        summary.coverage_by_gc.n_positions >= 1,
         "covered positions should yield at least one coverage tile"
     );
 
