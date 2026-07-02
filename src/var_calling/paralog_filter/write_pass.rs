@@ -26,9 +26,9 @@ use crate::var_calling::posterior_engine::PosteriorRecord;
 use crate::var_calling::types::{CallStats, CalledChunk};
 use crate::var_calling::vcf_writer::{VcfWriter, WriterError, WriterStats};
 
-use super::calibrate::{ParalogCalibration, cohort_inbreeding, score_joined_locus};
+use super::calibrate::{ParalogCalibration, cohort_inbreeding, score_spill_record};
 use super::prepass::ParalogPrePass;
-use super::spill::{ParalogSpillReader, SpillError, WindowJoin};
+use super::spill::{ParalogSpillReader, SpillError};
 use super::window_gc::reference_base_matches;
 
 /// Failure modes of the write pass.
@@ -119,19 +119,17 @@ pub(crate) fn paralog_provenance(calibration: &ParalogCalibration) -> String {
 /// through `writer`. Returns the writer's stats with
 /// [`WriterStats::records_dropped_paralog`] set.
 ///
-/// `prepass`, `inbreeding_coefficient`, `window_bp`, and `params` must be the
-/// **same** as the calibrate pass used (both `inbreeding` and
-/// `single_copy_depth_sd` are derived from `prepass`), and `windows` must be a
-/// fresh joiner over the **same** window spill, so the recomputed LRs match the
-/// histogram the cut came from. Survivors are fed to the writer in spill order
+/// `prepass`, `inbreeding_coefficient`, and `params` must be the **same** as the
+/// calibrate pass used (both `inbreeding` and `single_copy_depth_sd` are derived
+/// from `prepass`), and each locus carries its own window coverage on the record
+/// spill, so the recomputed LRs match the histogram the cut came from. Survivors
+/// are fed to the writer in spill order
 /// (which is genomic order — the main pass spills post-reorder), one record per
 /// `CalledChunk` with a gapless `chunk_order`; the writer's reorder passes them
 /// straight through.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_write_pass<R: Read, WR: Read>(
+pub(crate) fn run_write_pass<R: Read>(
     spill: &mut ParalogSpillReader<R>,
-    windows: &mut WindowJoin<WR>,
-    window_bp: u32,
     prepass: &ParalogPrePass,
     inbreeding_coefficient: f64,
     calibration: &ParalogCalibration,
@@ -154,20 +152,18 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
 
     while let Some(record) = spill.next_record() {
         let record = record?;
-        // Recompute the LR from the same joined inputs (bit-identical to
-        // calibrate) and drop the locus if the calibration flags it. An unscored
-        // locus (not a biallelic SNP, no usable samples, or no joined window) is
-        // never flagged → kept.
-        let flagged = score_joined_locus(
-            &record.record,
-            windows,
-            window_bp,
+        // Recompute the LR from the record's own carried window coverage
+        // (bit-identical to calibrate — same spilled inputs, same pure scorer)
+        // and drop the locus if the calibration flags it. An unscored locus (not
+        // a biallelic SNP, or no usable samples) is never flagged → kept.
+        let flagged = score_spill_record(
+            &record,
             prepass,
             &inbreeding,
             &single_copy_depth_sd,
             &precompute,
             &mut obs_buf,
-        )?
+        )
         .is_some_and(|lr| calibration.flags(lr));
 
         if flagged {
@@ -203,12 +199,9 @@ mod tests {
     use super::*;
     use crate::psp::header::ParsedChromosome;
     use crate::var_calling::paralog_filter::calibrate::{CalibrationConfig, calibrate};
-    use crate::var_calling::paralog_filter::spill::{
-        ParalogSpillReader, ParalogSpillRecord, WindowSpillReader, WindowSpillRecord,
-    };
+    use crate::var_calling::paralog_filter::spill::{ParalogSpillReader, ParalogSpillRecord};
     use crate::var_calling::paralog_filter::test_support::{
-        TEST_WINDOW_BP, normal_locus, normal_window, paralog_locus, paralog_window, prepass,
-        write_spill, write_window_spill,
+        normal_locus, paralog_locus, prepass, write_spill,
     };
     use crate::var_calling::vcf_writer::{AlleleBalanceFilter, DownstreamFilters};
     use crate::vcf::{CohortMetadata, WriterConfig};
@@ -216,11 +209,6 @@ mod tests {
     use tempfile::tempdir;
 
     const COHORT_F: f64 = 0.02;
-
-    /// A fresh [`WindowJoin`] over the given window fixtures.
-    fn join(windows: &[WindowSpillRecord]) -> WindowJoin<Cursor<Vec<u8>>> {
-        WindowJoin::new(WindowSpillReader::new(Cursor::new(write_window_spill(windows)))).unwrap()
-    }
 
     /// The single contig name the fixtures live on (matches [`metadata`]).
     fn chrom_names() -> Vec<String> {
@@ -270,18 +258,11 @@ mod tests {
         }
     }
 
-    fn calibration_for(
-        records: &[ParalogSpillRecord],
-        windows: &[WindowSpillRecord],
-        n: usize,
-        fdr: f64,
-    ) -> ParalogCalibration {
+    fn calibration_for(records: &[ParalogSpillRecord], n: usize, fdr: f64) -> ParalogCalibration {
         calibrate(
             &prepass(n),
             COHORT_F,
             &mut ParalogSpillReader::new(Cursor::new(write_spill(records))),
-            &mut join(windows),
-            TEST_WINDOW_BP,
             &ParalogModelParams::default(),
             fdr,
             &CalibrationConfig::default(),
@@ -296,16 +277,13 @@ mod tests {
     fn drops_flagged_writes_survivors_and_records_provenance() {
         let n = 20;
         let mut records = Vec::new();
-        let mut windows = Vec::new();
         for i in 0..80u32 {
             records.push(normal_locus(1000 + i, n));
-            windows.push(normal_window(1000 + i, n));
         }
         for i in 0..20u32 {
             records.push(paralog_locus(5000 + i, n));
-            windows.push(paralog_window(5000 + i, n));
         }
-        let cal = calibration_for(&records, &windows, n, 0.05);
+        let cal = calibration_for(&records, n, 0.05);
         let provenance = paralog_provenance(&cal);
         assert!(provenance.contains("target_fdr=0.05"));
 
@@ -321,8 +299,6 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(6000, b'A');
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-            &mut join(&windows),
-            TEST_WINDOW_BP,
             &prepass(n),
             COHORT_F,
             &cal,
@@ -362,9 +338,7 @@ mod tests {
         let n = 10;
         let records: Vec<ParalogSpillRecord> =
             (0..5u32).map(|i| normal_locus(1000 + i, n)).collect();
-        let windows: Vec<WindowSpillRecord> =
-            (0..5u32).map(|i| normal_window(1000 + i, n)).collect();
-        let cal = calibration_for(&records, &windows, n, -1.0); // flags nothing → all survive
+        let cal = calibration_for(&records, n, -1.0); // flags nothing → all survive
 
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
@@ -377,8 +351,6 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(2000, b'C'); // REF is A → mismatch
         let err = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-            &mut join(&windows),
-            TEST_WINDOW_BP,
             &prepass(n),
             COHORT_F,
             &cal,
@@ -406,10 +378,8 @@ mod tests {
         let n = 10;
         let records: Vec<ParalogSpillRecord> =
             (0..30u32).map(|i| normal_locus(1000 + i, n)).collect();
-        let windows: Vec<WindowSpillRecord> =
-            (0..30u32).map(|i| normal_window(1000 + i, n)).collect();
         // A negative FDR target is unachievable → flags nothing.
-        let cal = calibration_for(&records, &windows, n, -1.0);
+        let cal = calibration_for(&records, n, -1.0);
 
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
@@ -423,8 +393,6 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(2000, b'A');
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-            &mut join(&windows),
-            TEST_WINDOW_BP,
             &prepass(n),
             COHORT_F,
             &cal,
@@ -443,7 +411,7 @@ mod tests {
     #[test]
     fn writes_nothing_on_empty_spill() {
         let n = 4;
-        let cal = calibration_for(&[normal_locus(1, n)], &[normal_window(1, n)], n, 0.05);
+        let cal = calibration_for(&[normal_locus(1, n)], n, 0.05);
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
         let writer = VcfWriter::new(
@@ -455,8 +423,6 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(100, b'A');
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(Vec::<u8>::new())),
-            &mut join(&[]),
-            TEST_WINDOW_BP,
             &prepass(n),
             COHORT_F,
             &cal,
@@ -476,16 +442,13 @@ mod tests {
     fn write_pass_is_deterministic() {
         let n = 15;
         let mut records = Vec::new();
-        let mut windows = Vec::new();
         for i in 0..40u32 {
             records.push(normal_locus(1000 + i, n));
-            windows.push(normal_window(1000 + i, n));
         }
         for i in 0..10u32 {
             records.push(paralog_locus(5000 + i, n));
-            windows.push(paralog_window(5000 + i, n));
         }
-        let cal = calibration_for(&records, &windows, n, 0.1);
+        let cal = calibration_for(&records, n, 0.1);
 
         let (_ref_dir, reference) = reference_fasta(6000, b'A');
         let run = || {
@@ -499,8 +462,6 @@ mod tests {
             .unwrap();
             run_write_pass(
                 &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-                &mut join(&windows),
-                TEST_WINDOW_BP,
                 &prepass(n),
                 COHORT_F,
                 &cal,

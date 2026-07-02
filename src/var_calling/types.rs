@@ -170,7 +170,7 @@ pub struct CalledChunk {
 /// matching the retired window join's `None`. Per-sample GC (not a single
 /// shared reference GC) because each sample's window spans **its** covered
 /// positions; storing it per sample is what lets var-calling stay window-free.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LocusWindowCoverage {
     /// Per-sample centred-window GC fraction; `NaN` = sample absent at locus.
     pub gc: Vec<f32>,

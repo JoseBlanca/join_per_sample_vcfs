@@ -22,9 +22,10 @@ use crate::paralog::{
 };
 
 use crate::var_calling::posterior_engine::PosteriorRecord;
+use crate::var_calling::types::LocusWindowCoverage;
 
 use super::prepass::ParalogPrePass;
-use super::spill::{ParalogSpillReader, SpillError, WindowJoin};
+use super::spill::{ParalogSpillReader, ParalogSpillRecord, SpillError};
 
 /// Default fallback `π` used when the EM does not converge — a rare-paralog
 /// prior deliberately low so a pathological dataset yields a conservative
@@ -117,20 +118,26 @@ fn is_biallelic_snp(record: &PosteriorRecord) -> bool {
 /// One sample's paralog observation at a locus, or `None` if the sample is
 /// unusable here (absent from the pre-pass, no covered window, or no reads).
 ///
-/// `window_gc` and `window_depths` are the locus's joined window coverage (from
-/// the sibling window spill): the shared reference GC and each sample's window
-/// mean depth. Together with the record's per-sample AD they form the score's
-/// per-sample observation.
+/// `window` is the locus's per-sample centred-window coverage, read straight
+/// from the record spill ([`ParalogSpillRecord::window_coverage`], gathered by
+/// the caller from the psp windowed columns). Each sample carries its own GC +
+/// mean coverage; a `NaN` in either means the sample had no covered record at
+/// the locus and is skipped. Together with the record's per-sample AD they form
+/// the score's per-sample observation.
 fn build_observation(
     record: &PosteriorRecord,
-    window_gc: f32,
-    window_depths: &[Option<f32>],
+    window: &LocusWindowCoverage,
     sample_idx: usize,
     prepass: &ParalogPrePass,
     inbreeding: &[f64],
 ) -> Option<SampleObservation> {
     let model = prepass.samples().get(sample_idx)?.as_ref()?;
-    let mean_depth = (*window_depths.get(sample_idx)?)?;
+    let window_gc = *window.gc.get(sample_idx)?;
+    let mean_depth = *window.coverage.get(sample_idx)?;
+    // A NaN sentinel (sample absent at the locus) is not a usable observation.
+    if !window_gc.is_finite() || !mean_depth.is_finite() {
+        return None;
+    }
     let rel = model
         .coverage_model
         .relative_copy_number(f64::from(window_gc), f64::from(mean_depth));
@@ -162,20 +169,19 @@ fn build_observation(
 /// self-gates in the LR (LR≈0 → kept). Only a locus with zero usable samples is
 /// left unscored — there is nothing to fold into the histogram.
 ///
-/// `window_gc` + `window_depths` are the locus's window coverage joined from the
-/// window spill by tile key: the window's shared reference GC and each sample's
-/// window mean depth (`None` where a sample had no covered window there).
+/// `window` is the locus's per-sample centred-window coverage, read straight
+/// from the record spill — each sample's own GC + mean coverage (`NaN` where a
+/// sample had no covered record there).
 ///
 /// **Pure and deterministic**, so the calibrate pass (S4) and the write pass
-/// (S5) get bit-identical LRs from the same joined inputs — the invariant that
+/// (S5) get bit-identical LRs from the same spilled inputs — the invariant that
 /// lets the cut apply to the histogram it was built from. `obs_buf` is a caller
 /// scratch buffer (reused across loci to keep the per-locus cost allocation-free
 /// and memory `O(samples)`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score_spilled_locus(
     record: &PosteriorRecord,
-    window_gc: f32,
-    window_depths: &[Option<f32>],
+    window: &LocusWindowCoverage,
     prepass: &ParalogPrePass,
     inbreeding: &[f64],
     single_copy_depth_sd: &[f64],
@@ -195,7 +201,7 @@ pub(crate) fn score_spilled_locus(
     obs_buf.clear();
     obs_buf.resize(n, None);
     for (sample_idx, slot) in obs_buf.iter_mut().enumerate() {
-        *slot = build_observation(record, window_gc, window_depths, sample_idx, prepass, inbreeding);
+        *slot = build_observation(record, window, sample_idx, prepass, inbreeding);
     }
     // No usable sample → nothing to score (a locus with all-`None` observations
     // would fold a meaningless LR≈0 into the histogram); one or more → scored,
@@ -212,39 +218,29 @@ pub(crate) fn score_spilled_locus(
     Some(score.paralog_log_likelihood_ratio)
 }
 
-/// Score one record-spill record by joining its window from `windows` (by tile
-/// key `(chrom_id, (pos−1)/window_bp)`) and running the pure scorer. Shared by
-/// the calibrate pass (S4) and the write pass (S5) so their LRs are
-/// bit-identical. `Ok(None)` — unscored, so **kept** — when the window spill
-/// holds no window for the locus's tile (the producer never marked it variant)
-/// or the scorer declines (not a SNP, no usable samples). Advances `windows` past
-/// any window sorting before the locus; the locus stream must be monotone in
-/// `(chrom_id, tile)` (it is — the record spill is genomic-ordered).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn score_joined_locus<WR: Read>(
-    record: &PosteriorRecord,
-    windows: &mut WindowJoin<WR>,
-    window_bp: u32,
+/// Score one record-spill record from its own carried window coverage (gathered
+/// by the caller from the psp windowed columns — no window join). Shared by the
+/// calibrate pass (S4) and the write pass (S5) so their LRs are bit-identical.
+/// `None` — unscored, so **kept** — when the scorer declines (not a SNP, no
+/// usable samples). The window coverage is per-locus and self-contained, so
+/// unlike the retired tile join this needs no ordering side-channel.
+pub(crate) fn score_spill_record(
+    spill: &ParalogSpillRecord,
     prepass: &ParalogPrePass,
     inbreeding: &[f64],
     single_copy_depth_sd: &[f64],
     precompute: &ParalogScorePrecompute,
     obs_buf: &mut Vec<Option<SampleObservation>>,
-) -> Result<Option<f64>, SpillError> {
-    let tile = record.locus.start.saturating_sub(1) / window_bp.max(1);
-    let Some(window) = windows.window_for(record.locus.chrom_id, tile)? else {
-        return Ok(None);
-    };
-    Ok(score_spilled_locus(
-        record,
-        window.gc,
-        &window.depths,
+) -> Option<f64> {
+    score_spilled_locus(
+        &spill.record,
+        &spill.window_coverage,
         prepass,
         inbreeding,
         single_copy_depth_sd,
         precompute,
         obs_buf,
-    ))
+    )
 }
 
 /// Stream the spill once, scoring every locus and folding its LR into a
@@ -256,12 +252,10 @@ pub(crate) fn score_joined_locus<WR: Read>(
 /// operator's FDR. On EM non-convergence the prior falls back to
 /// `cfg.fallback_prior` (the caller inspects `prior.converged` to warn).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn calibrate<R: Read, WR: Read>(
+pub(crate) fn calibrate<R: Read>(
     prepass: &ParalogPrePass,
     inbreeding_coefficient: f64,
     records: &mut ParalogSpillReader<R>,
-    windows: &mut WindowJoin<WR>,
-    window_bp: u32,
     params: &ParalogModelParams,
     fdr_target: f64,
     cfg: &CalibrationConfig,
@@ -278,16 +272,14 @@ pub(crate) fn calibrate<R: Read, WR: Read>(
     let mut obs_buf: Vec<Option<SampleObservation>> = Vec::new();
     while let Some(record) = records.next_record() {
         let record = record?;
-        if let Some(lr) = score_joined_locus(
-            &record.record,
-            windows,
-            window_bp,
+        if let Some(lr) = score_spill_record(
+            &record,
             prepass,
             &inbreeding,
             &single_copy_depth_sd,
             &precompute,
             &mut obs_buf,
-        )? {
+        ) {
             histogram.push(lr);
         }
         // `record` is dropped here — nothing per-locus is retained.
@@ -319,35 +311,26 @@ pub(crate) fn calibrate<R: Read, WR: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::var_calling::paralog_filter::spill::{
-        ParalogSpillRecord, WindowJoin, WindowSpillReader, WindowSpillRecord,
-    };
+    use crate::var_calling::paralog_filter::spill::ParalogSpillRecord;
     use crate::var_calling::paralog_filter::test_support::{
-        TEST_WINDOW_BP, allele, normal_locus, normal_window, paralog_locus, paralog_window, prepass,
-        snp_window, write_spill, write_window_spill,
+        allele, normal_locus, paralog_locus, prepass, window_coverage, write_spill,
     };
     use std::io::Cursor;
 
-    /// Run [`calibrate`] over parallel record / window fixtures (the record spill
-    /// and its sibling window spill, joined by tile key).
+    /// Run [`calibrate`] over the record fixtures (each carries its own window
+    /// coverage — no sibling window spill).
     fn run_calibrate(
         prepass: &ParalogPrePass,
         f: f64,
         records: &[ParalogSpillRecord],
-        windows: &[WindowSpillRecord],
         fdr: f64,
         cfg: &CalibrationConfig,
     ) -> ParalogCalibration {
         let mut reader = ParalogSpillReader::new(Cursor::new(write_spill(records)));
-        let mut join =
-            WindowJoin::new(WindowSpillReader::new(Cursor::new(write_window_spill(windows))))
-                .unwrap();
         calibrate(
             prepass,
             f,
             &mut reader,
-            &mut join,
-            TEST_WINDOW_BP,
             &ParalogModelParams::default(),
             fdr,
             cfg,
@@ -355,10 +338,9 @@ mod tests {
         .expect("calibrate")
     }
 
-    /// Score one fixture locus directly (its record + its window).
+    /// Score one fixture locus directly from its record-carried window coverage.
     fn score_fixture(
         record: &ParalogSpillRecord,
-        window: &WindowSpillRecord,
         prepass: &ParalogPrePass,
         inbreeding: &[f64],
         sigma0: &[f64],
@@ -367,8 +349,7 @@ mod tests {
         let precompute = ParalogScorePrecompute::new(&ParalogModelParams::default(), inbreeding);
         score_spilled_locus(
             &record.record,
-            window.gc,
-            &window.depths,
+            &record.window_coverage,
             prepass,
             inbreeding,
             sigma0,
@@ -385,19 +366,16 @@ mod tests {
         let n = 30;
         let prepass = prepass(n);
         let mut records = Vec::new();
-        let mut windows = Vec::new();
         for i in 0..90u32 {
             records.push(normal_locus(1000 + i, n));
-            windows.push(normal_window(1000 + i, n));
         }
         for i in 0..10u32 {
             records.push(paralog_locus(5000 + i, n));
-            windows.push(paralog_window(5000 + i, n));
         }
 
         let cfg = CalibrationConfig::default();
         // Hexp → F ≈ 0 (obs_het 0.005, so F ≈ 0.75; still outbred-ish).
-        let cal = run_calibrate(&prepass, 0.02, &records, &windows, 0.05, &cfg);
+        let cal = run_calibrate(&prepass, 0.02, &records, 0.05, &cfg);
 
         assert!(
             cal.prior.prior_probability > 0.0 && cal.prior.prior_probability < 1.0,
@@ -410,7 +388,6 @@ mod tests {
         let mut buf = Vec::new();
         let lr_paralog = score_fixture(
             &paralog_locus(5000, n),
-            &paralog_window(5000, n),
             &prepass,
             &inbreeding,
             &sigma0,
@@ -419,7 +396,6 @@ mod tests {
         .expect("paralog scored");
         let lr_normal = score_fixture(
             &normal_locus(1000, n),
-            &normal_window(1000, n),
             &prepass,
             &inbreeding,
             &sigma0,
@@ -443,14 +419,7 @@ mod tests {
         // An indel record (REF "AT") — not a biallelic SNP, never scored.
         let mut indel = normal_locus(100, n);
         indel.record.alleles = vec![allele(b"AT"), allele(b"A")];
-        let cal = run_calibrate(
-            &prepass,
-            0.02,
-            &[indel],
-            &[normal_window(100, n)],
-            0.01,
-            &CalibrationConfig::default(),
-        );
+        let cal = run_calibrate(&prepass, 0.02, &[indel], 0.01, &CalibrationConfig::default());
         assert!(!cal.prior.converged, "empty histogram → non-converged");
         assert_eq!(cal.prior.prior_probability, DEFAULT_FALLBACK_PARALOG_PRIOR);
     }
@@ -467,77 +436,39 @@ mod tests {
         let sigma0 = prepass.single_copy_depth_sd();
         let mut buf = Vec::new();
 
-        // No usable sample (every window depth is `None`) → nothing to fold.
-        let no_depth = snp_window(1, n, 0.5, &|_| None);
+        // No usable sample (every sample's window coverage is `NaN`) → nothing
+        // to fold.
+        let mut no_depth = normal_locus(1, n);
+        no_depth.window_coverage = window_coverage(n, 0.5, &|_| None);
         assert!(
-            score_fixture(
-                &normal_locus(1, n),
-                &no_depth,
-                &prepass,
-                &inbreeding,
-                &sigma0,
-                &mut buf
-            )
-            .is_none()
+            score_fixture(&no_depth, &prepass, &inbreeding, &sigma0, &mut buf).is_none()
         );
         // Not a biallelic SNP.
         let mut indel = normal_locus(1, n);
         indel.record.alleles = vec![allele(b"AT"), allele(b"A")];
-        assert!(
-            score_fixture(
-                &indel,
-                &normal_window(1, n),
-                &prepass,
-                &inbreeding,
-                &sigma0,
-                &mut buf
-            )
-            .is_none()
-        );
+        assert!(score_fixture(&indel, &prepass, &inbreeding, &sigma0, &mut buf).is_none());
         // A tiny cohort (n=4) is still scored — no count gate.
         assert!(
-            score_fixture(
-                &normal_locus(1, n),
-                &normal_window(1, n),
-                &prepass,
-                &inbreeding,
-                &sigma0,
-                &mut buf
-            )
-            .is_some(),
+            score_fixture(&normal_locus(1, n), &prepass, &inbreeding, &sigma0, &mut buf).is_some(),
             "a low-n locus is scored; the LR self-gates instead of a count gate"
         );
     }
 
-    /// A record whose tile has no window in the window spill is left unscored
-    /// (kept), not scored on stale coverage — the join returns `None`.
+    /// A record carrying no usable window coverage (every sample `NaN`) is left
+    /// unscored (kept) via [`score_spill_record`] — the record-spill analogue of
+    /// the retired "no window for the tile" join miss.
     #[test]
-    fn locus_without_a_window_is_unscored() {
+    fn locus_without_window_coverage_is_unscored() {
         let n = 10;
         let prepass = prepass(n);
         let inbreeding = cohort_inbreeding(prepass.samples().len(), 0.02);
         let sigma0 = prepass.single_copy_depth_sd();
         let precompute = ParalogScorePrecompute::new(&ParalogModelParams::default(), &inbreeding);
         let mut buf = Vec::new();
-        // Window spill holds only tile for pos 100; the record at pos 5000 has no
-        // window → the join yields None → unscored.
-        let mut join = WindowJoin::new(WindowSpillReader::new(Cursor::new(write_window_spill(&[
-            paralog_window(100, n),
-        ]))))
-        .unwrap();
-        let rec = paralog_locus(5000, n);
-        let scored = score_joined_locus(
-            &rec.record,
-            &mut join,
-            TEST_WINDOW_BP,
-            &prepass,
-            &inbreeding,
-            &sigma0,
-            &precompute,
-            &mut buf,
-        )
-        .unwrap();
-        assert!(scored.is_none(), "no window for the tile → unscored");
+        let mut rec = paralog_locus(5000, n);
+        rec.window_coverage = window_coverage(n, 0.5, &|_| None);
+        let scored = score_spill_record(&rec, &prepass, &inbreeding, &sigma0, &precompute, &mut buf);
+        assert!(scored.is_none(), "no usable window coverage → unscored");
     }
 
     /// A non-finite LR is never flagged — it is screened before the curve
@@ -549,15 +480,7 @@ mod tests {
         let prepass = prepass(n);
         // A calibration with a low target so finite high-LR loci would flag.
         let records: Vec<ParalogSpillRecord> = (0..20).map(|i| paralog_locus(i + 1, n)).collect();
-        let windows: Vec<WindowSpillRecord> = (0..20).map(|i| paralog_window(i + 1, n)).collect();
-        let cal = run_calibrate(
-            &prepass,
-            0.02,
-            &records,
-            &windows,
-            0.5,
-            &CalibrationConfig::default(),
-        );
+        let cal = run_calibrate(&prepass, 0.02, &records, 0.5, &CalibrationConfig::default());
         assert!(!cal.flags(f64::NAN));
         assert!(!cal.flags(f64::INFINITY));
         assert!(!cal.flags(f64::NEG_INFINITY));
@@ -570,19 +493,16 @@ mod tests {
         let n = 20;
         let prepass = prepass(n);
         let mut records = Vec::new();
-        let mut windows = Vec::new();
         for i in 0..80u32 {
             records.push(normal_locus(1000 + i, n));
-            windows.push(normal_window(1000 + i, n));
         }
         for i in 0..20u32 {
             records.push(paralog_locus(5000 + i, n));
-            windows.push(paralog_window(5000 + i, n));
         }
         let cfg = CalibrationConfig::default();
 
-        let cal_strict = run_calibrate(&prepass, 0.02, &records, &windows, 0.01, &cfg);
-        let cal_loose = run_calibrate(&prepass, 0.02, &records, &windows, 0.5, &cfg);
+        let cal_strict = run_calibrate(&prepass, 0.02, &records, 0.01, &cfg);
+        let cal_loose = run_calibrate(&prepass, 0.02, &records, 0.5, &cfg);
 
         // The loose threshold is at or below the strict one (less stringent).
         match (cal_strict.lr_threshold, cal_loose.lr_threshold) {

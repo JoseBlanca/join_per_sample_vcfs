@@ -18,12 +18,11 @@
 //! byte-identity safety net holds by construction, with no dependence on which
 //! record fields the writer happens to read.
 //!
-//! The paralog score's coverage input (analysis-window GC + per-sample mean
-//! depth) is **not** in this record spill — it lives in the sibling
-//! [`WindowSpillRecord`] stream (Approach A, S6c), one record per variant window
-//! in coordinate order, joined to each locus by tile key via [`WindowJoin`]. That
-//! keeps the record spill's per-locus payload from carrying a second per-sample
-//! vector.
+//! The paralog score's coverage input (per-sample centred-window GC + mean
+//! coverage) rides **on** each record spill entry ([`ParalogSpillRecord::window_coverage`]),
+//! gathered by the caller from the psp windowed columns. The sibling window-spill
+//! stream (Approach A, S6c) that once carried it, joined by tile key, is being
+//! retired (its read side is gone; the write side follows in M6).
 //!
 //! Memory-flat by construction: the writer encodes into one reused scratch
 //! buffer and the reader decodes one record at a time into a reused byte buffer
@@ -38,6 +37,7 @@ use tempfile::{NamedTempFile, TempPath};
 use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::per_group_merger::{CompoundConstituent, MergedAllele};
 use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
+use crate::var_calling::types::LocusWindowCoverage;
 
 /// One locus on the **record spill**: the full caller output, carried verbatim,
 /// plus the locus's stored paralog likelihood ratio.
@@ -59,6 +59,13 @@ pub(crate) struct ParalogSpillRecord {
     pub record: PosteriorRecord,
     /// The stored paralog likelihood ratio (`f64::NAN` = unscored → kept).
     pub paralog_lr: f64,
+    /// Per-sample centred-window GC + coverage at this locus, gathered from the
+    /// psp windowed columns by the caller ([`CalledChunk::window_coverage`]).
+    /// The score reads it directly — no window join. `NaN` per sample = no
+    /// covered record there (that sample is skipped). Empty (both vectors) for a
+    /// locus whose chunk carried no window coverage (e.g. the write pass's
+    /// re-emitted survivors, which never re-score).
+    pub window_coverage: LocusWindowCoverage,
 }
 
 /// One analysis window on the **window spill** (Approach A, S6c): the window's
@@ -168,14 +175,6 @@ impl ParalogSpill {
         )))
     }
 
-    /// Open a buffered [`WindowSpillReader`] over this file from the start.
-    pub(crate) fn window_reader(&self) -> Result<WindowSpillReader<BufReader<File>>, SpillError> {
-        let file = File::open(&self.temp_path)?;
-        Ok(WindowSpillReader::new(BufReader::with_capacity(
-            64 * 1024,
-            file,
-        )))
-    }
 }
 
 /// Streaming append-only writer over any sink. Encodes each record into one
@@ -288,96 +287,6 @@ impl<W: Write> WindowSpillWriter<W> {
     }
 }
 
-/// One-pass reader for the window spill, one record at a time.
-pub(crate) struct WindowSpillReader<R: Read> {
-    source: R,
-    buf: Vec<u8>,
-}
-
-impl<R: Read> WindowSpillReader<R> {
-    pub(crate) fn new(source: R) -> Self {
-        Self {
-            source,
-            buf: Vec::new(),
-        }
-    }
-
-    /// The next window record, or `None` at a clean end of stream.
-    pub(crate) fn next_record(&mut self) -> Option<Result<WindowSpillRecord, SpillError>> {
-        match read_frame(&mut self.source, &mut self.buf) {
-            Ok(false) => None,
-            Ok(true) => Some(decode_window(&self.buf)),
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
-
-/// Streams the window spill in lockstep with a coordinate-ordered locus stream,
-/// yielding each locus its window by tile key (the S6c join).
-///
-/// Both spills ascend by `(chrom_id, tile)`: the record spill is genomic-ordered
-/// (many loci may share one window) and the window spill is one record per
-/// variant window in tile order. So the join is a forward merge — hold the
-/// current window, advance past any window that sorts before the locus, and
-/// hand the same window to every locus that lands in it. A locus whose tile has
-/// no window record (e.g. a coordinate the producer never marked variant) gets
-/// `None` — the scorer then leaves it unscored (kept), never flagged.
-pub(crate) struct WindowJoin<R: Read> {
-    reader: WindowSpillReader<R>,
-    /// The window at or ahead of the last requested key; `None` past end.
-    current: Option<WindowSpillRecord>,
-    /// The last key requested, to debug-assert the monotone-input invariant the
-    /// forward-only advance relies on.
-    last_key: Option<(u32, u32)>,
-}
-
-impl<R: Read> WindowJoin<R> {
-    /// Wrap a window-spill reader, priming the first window.
-    pub(crate) fn new(mut reader: WindowSpillReader<R>) -> Result<Self, SpillError> {
-        let current = reader.next_record().transpose()?;
-        Ok(Self {
-            reader,
-            current,
-            last_key: None,
-        })
-    }
-
-    /// The window matching `(chrom_id, tile)`, or `None` if the spill holds none
-    /// for it. Advances past windows sorting strictly before the key; never
-    /// rewinds (the locus stream is monotone non-decreasing in the key), so a
-    /// matched window can be returned to several loci in the same tile before the
-    /// stream moves on.
-    ///
-    /// The monotone-input invariant is **load-bearing**: a key behind `current`
-    /// would silently return `None` (leaving a real paralog unscored/kept), so
-    /// it is debug-asserted, matching the sibling invariants on the record-spill
-    /// order (`SpillSink::accept`) and the accumulator's `observe`.
-    pub(crate) fn window_for(
-        &mut self,
-        chrom_id: u32,
-        tile: u32,
-    ) -> Result<Option<&WindowSpillRecord>, SpillError> {
-        let key = (chrom_id, tile);
-        debug_assert!(
-            self.last_key.is_none_or(|prev| key >= prev),
-            "WindowJoin key out of order: {key:?} after {:?}",
-            self.last_key,
-        );
-        self.last_key = Some(key);
-        while self
-            .current
-            .as_ref()
-            .is_some_and(|w| (w.chrom_id, w.tile) < key)
-        {
-            self.current = self.reader.next_record().transpose()?;
-        }
-        Ok(self
-            .current
-            .as_ref()
-            .filter(|w| (w.chrom_id, w.tile) == key))
-    }
-}
-
 /// Encode a window record: `chrom_id`, `tile`, `gc`, then the per-sample
 /// `Option<f32>` depth vector (tag byte + `f32`).
 fn encode_window(record: &WindowSpillRecord, out: &mut Vec<u8>) {
@@ -396,6 +305,38 @@ fn encode_window(record: &WindowSpillRecord, out: &mut Vec<u8>) {
     }
 }
 
+/// One-pass reader for the window spill, one record at a time. **Test-only**: the
+/// production score reads its coverage from the record spill now, so nothing
+/// reads the window spill at runtime — this reader survives only to round-trip
+/// the still-live writer in its unit tests, until M6 retires the window spill.
+#[cfg(test)]
+pub(crate) struct WindowSpillReader<R: Read> {
+    source: R,
+    buf: Vec<u8>,
+}
+
+#[cfg(test)]
+impl<R: Read> WindowSpillReader<R> {
+    pub(crate) fn new(source: R) -> Self {
+        Self {
+            source,
+            buf: Vec::new(),
+        }
+    }
+
+    /// The next window record, or `None` at a clean end of stream.
+    pub(crate) fn next_record(&mut self) -> Option<Result<WindowSpillRecord, SpillError>> {
+        match read_frame(&mut self.source, &mut self.buf) {
+            Ok(false) => None,
+            Ok(true) => Some(decode_window(&self.buf)),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// Decode a window record (mirror of [`encode_window`]). Test-only alongside
+/// [`WindowSpillReader`].
+#[cfg(test)]
 fn decode_window(buf: &[u8]) -> Result<WindowSpillRecord, SpillError> {
     let mut d = Decoder::new(buf);
     let chrom_id = d.u32("window.chrom_id")?;
@@ -604,6 +545,15 @@ fn encode_record(spill: &ParalogSpillRecord, out: &mut Vec<u8>) {
     put_bool(out, r.diagnostics.converged);
     // the stored paralog LR (NaN = unscored)
     put_f64(out, spill.paralog_lr);
+    // per-sample window coverage (gc then coverage; NaN = sample absent)
+    put_len(out, spill.window_coverage.gc.len());
+    for &g in &spill.window_coverage.gc {
+        put_f32(out, g);
+    }
+    put_len(out, spill.window_coverage.coverage.len());
+    for &c in &spill.window_coverage.coverage {
+        put_f32(out, c);
+    }
 }
 
 /// A forward cursor over a record's bytes with range-checked reads.
@@ -757,9 +707,14 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
         converged: d.bool("diagnostics.converged")?,
     };
     let paralog_lr = d.f64("paralog_lr")?;
+    let window_coverage = LocusWindowCoverage {
+        gc: decode_f32_vec(&mut d, "window_coverage.gc")?,
+        coverage: decode_f32_vec(&mut d, "window_coverage.coverage")?,
+    };
 
     Ok(ParalogSpillRecord {
         paralog_lr,
+        window_coverage,
         record: PosteriorRecord {
             locus,
             alleles,
@@ -785,6 +740,15 @@ fn decode_f64_vec(d: &mut Decoder, field: &'static str) -> Result<Vec<f64>, Spil
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(d.f64(field)?);
+    }
+    Ok(v)
+}
+
+fn decode_f32_vec(d: &mut Decoder, field: &'static str) -> Result<Vec<f32>, SpillError> {
+    let n = d.len(field)?;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(d.f32(field)?);
     }
     Ok(v)
 }
@@ -841,6 +805,12 @@ mod tests {
             // the field (NaN would break equality — that path is covered by the
             // dedicated nan_lr round-trip test below).
             paralog_lr: (pos as f64) * 0.25 - 5.0,
+            // Distinct finite per-sample window coverage so the round-trip's
+            // `assert_eq` exercises the field (NaN handling covered separately).
+            window_coverage: LocusWindowCoverage {
+                gc: vec![0.31 + pos as f32 * 0.001, 0.44],
+                coverage: vec![100.0 + pos as f32, 205.5],
+            },
             record: PosteriorRecord {
                 locus: RecordLocus {
                     chrom_id: 2,
@@ -1078,6 +1048,10 @@ mod tests {
                 .collect();
             let rec = ParalogSpillRecord {
                 paralog_lr: f(700) * 20.0 - 10.0,
+                window_coverage: LocusWindowCoverage {
+                    gc: (0..n_samples).map(|s| f(s as u64 + 800) as f32).collect(),
+                    coverage: (0..n_samples).map(|s| f(s as u64 + 900) as f32 * 300.0).collect(),
+                },
                 record: PosteriorRecord {
                     locus: RecordLocus { chrom_id, start, end: start },
                     alleles,

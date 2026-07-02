@@ -53,7 +53,7 @@ use crate::var_calling::per_group_merger::{
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
 use crate::var_calling::posterior_engine::{PosteriorEngineConfig, PosteriorEngineConfigError};
 use crate::var_calling::sample_reader::SamplePspReader;
-use crate::var_calling::types::{CalledChunk, RawCohortChunk};
+use crate::var_calling::types::{CalledChunk, LocusWindowCoverage, RawCohortChunk};
 use crate::var_calling::variant_caller::{CallerError, VariantCaller};
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperConfigError};
 use crate::var_calling::vcf_writer::{
@@ -68,7 +68,7 @@ use crate::sample_summary::SampleSummary;
 use crate::var_calling::paralog_filter::calibrate::{CalibrationConfig, calibrate};
 use crate::var_calling::paralog_filter::prepass::ParalogPrePass;
 use crate::var_calling::paralog_filter::spill::{
-    ParalogSpill, ParalogSpillRecord, ParalogSpillWriter, SpillError, WindowJoin,
+    ParalogSpill, ParalogSpillRecord, ParalogSpillWriter, SpillError,
 };
 use crate::var_calling::paralog_filter::window_gc::ReferenceWindowGc;
 use crate::var_calling::paralog_filter::window_producer::WindowSpillBuilder;
@@ -779,7 +779,6 @@ pub fn run_var_calling(
             let window_spill =
                 paralog_window_spill.expect("a spill sink implies a window spill file");
             let prepass = paralog_prepass.expect("a spill sink implies a pre-pass");
-            let window_bp = prepass.window_bp();
             // The inbreeding coefficient `F` is one cohort constant — the caller's
             // `--inbreeding-coefficient`, the same value its genotype prior uses —
             // not a per-individual `Hexp`-derived quantity (arch: single-sample
@@ -798,13 +797,10 @@ pub fn run_var_calling(
 
             let calibration = {
                 let mut reader = spill.reader()?;
-                let mut windows = WindowJoin::new(window_spill.window_reader()?)?;
                 calibrate(
                     &prepass,
                     inbreeding,
                     &mut reader,
-                    &mut windows,
-                    window_bp,
                     &params,
                     cohort.paralog_fdr,
                     &cfg,
@@ -826,11 +822,8 @@ pub fn run_var_calling(
             };
             let writer = VcfWriter::new(md, writer_config, filters)?;
             let mut reader = spill.reader()?;
-            let mut windows = WindowJoin::new(window_spill.window_reader()?)?;
             let stats = run_write_pass(
                 &mut reader,
-                &mut windows,
-                window_bp,
                 &prepass,
                 inbreeding,
                 &calibration,
@@ -912,7 +905,16 @@ impl SpillSink {
     /// record's window coverage is supplied separately by the window spill
     /// (joined by tile key in the read passes).
     fn spill_chunk(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
-        for record in chunk.records {
+        let CalledChunk {
+            records,
+            mut window_coverage,
+            ..
+        } = chunk;
+        // `call_chunk` fills one window-coverage entry per record; be defensive
+        // if it is empty (a chunk built off the direct path) by padding with an
+        // empty coverage (all samples absent → the locus scores unflagged).
+        window_coverage.resize_with(records.len(), LocusWindowCoverage::default);
+        for (record, window_coverage) in records.into_iter().zip(window_coverage) {
             // Transitional: the LR is still recomputed in the calibrate/write
             // passes, so store `NaN` (unscored) here for now. Inline scoring
             // (arch: hidden_paralog_inline_scoring.md) will compute + store the
@@ -920,6 +922,7 @@ impl SpillSink {
             self.writer.append(&ParalogSpillRecord {
                 record,
                 paralog_lr: f64::NAN,
+                window_coverage,
             })?;
         }
         Ok(())
