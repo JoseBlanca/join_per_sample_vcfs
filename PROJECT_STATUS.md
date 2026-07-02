@@ -19,6 +19,15 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M8: tomato2 validation of M7 (byte-identical, 3.97× faster)**
+>   (branch `tomato2-paralog-filter`). Regenerated all 59 tomato2 `.psp` with the current binary (the on-disk ones predated M5/M6 —
+>   no windowed columns, v2 summary) and ran the M7 vs M6 comparison in the container (8 cpu / 16 GB, ref bind-mounted). **Byte-identity
+>   PASS:** M7-filter-on ≡ M6-filter-on except the `##commandline` binary-path line — all 262,539 records identical, provenance identical
+>   (π=0.100521, lr_cut=3.8500, converged). **Drop-profile unchanged:** 20,809 dropped = 7.34 %. **Wall: 3.97× end-to-end** (M6 178.4 s →
+>   M7 44.9 s; filter marginal cost +150.3 s → +16.8 s, ~8.9×; baseline caller 28.1 s). **RSS flat** (M7 350 MB vs M6 399 MB). **σ₀
+>   recorded** (owed from M4): 59/59 fit, median 0.270 (0.208–0.329) via new `examples/tomato2_sigma0.rs`. Container-capped — prod 32-core
+>   re-measure belongs on the Linux dev box, but the M6:M7 ratio is the trustworthy figure. The pileup-window-coverage arch (M1–M8) is
+>   complete. Report: [paralog_m7_tomato2_validation_2026-07-02.md](doc/devel/reports/implementations/paralog_m7_tomato2_validation_2026-07-02.md).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M7: score the LR once in the caller worker (single write pass)**
 >   (branch `tomato2-paralog-filter`). The main perf payoff for the +11.6× two-pass regression. Placement A (the arch doc's later
 >   refinement, now trivial because M5 made the worker gather window coverage): a cohort-constant `ParalogScoringContext` (pre-pass
