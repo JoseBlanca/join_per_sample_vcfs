@@ -822,6 +822,8 @@ pub fn run_var_calling(
                 &calibration,
                 &params,
                 cfg.min_samples,
+                &args.reference,
+                &chrom_names,
                 writer,
             )?;
             Ok(stats)
