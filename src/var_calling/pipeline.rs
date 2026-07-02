@@ -1219,6 +1219,7 @@ mod tests {
         let chunk = |order: u64, pos: u32| CalledChunk {
             chunk_order: order,
             records: vec![rec(pos)],
+            window_coverage: Vec::new(),
             stats: CallStats::default(),
         };
 
@@ -1260,6 +1261,7 @@ mod tests {
         sink.accept(CalledChunk {
             chunk_order: 1,
             records: vec![normal_locus(100, 4).record],
+            window_coverage: Vec::new(),
             stats: CallStats::default(),
         })
         .unwrap();

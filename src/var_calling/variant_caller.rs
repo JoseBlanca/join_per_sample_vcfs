@@ -31,7 +31,8 @@ use crate::var_calling::posterior_engine::{
 };
 use crate::var_calling::sample_reader::SamplePspChunk;
 use crate::var_calling::types::{
-    CallStats, CalledChunk, CohortPileupRecord, RawCohortChunk, RefSpan, Variant,
+    CallStats, CalledChunk, CohortPileupRecord, LocusWindowCoverage, RawCohortChunk, RefSpan,
+    Variant,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperError};
 
@@ -158,7 +159,11 @@ impl VariantCaller {
         // Columns → records + per-position merge — the record-building work
         // moved off the single producer thread onto this parallel caller.
         let records = merge_compacted_samples(&per_sample, &self.sample_names)?;
-        self.call_records(chunk_order, records, ref_span)
+        let mut called = self.call_records(chunk_order, records, ref_span)?;
+        // Gather each called locus's per-sample window coverage from the
+        // (still-owned) per-sample chunks, for the hidden-paralog score.
+        called.window_coverage = gather_window_coverage(&per_sample, &called.records);
+        Ok(called)
     }
 
     /// Group + per-group merge + EM over already-merged cohort `records`. Split
@@ -220,9 +225,48 @@ impl VariantCaller {
         Ok(CalledChunk {
             chunk_order,
             records: called,
+            // Filled by `call_chunk` (which has the per-sample chunks to gather
+            // from); left empty on this direct path — see the field doc.
+            window_coverage: Vec::new(),
             stats,
         })
     }
+}
+
+/// Gather each called locus's per-sample centred-window coverage from the
+/// source chunk's per-sample windowed columns, one [`LocusWindowCoverage`] per
+/// record in `records` order.
+///
+/// For each record, binary-search every sample's compacted positions for the
+/// locus anchor `record.locus.pos`; a hit copies that sample's windowed GC +
+/// coverage, a miss leaves `NaN` (the sample has no covered record there, so the
+/// score skips it — the same "keep, don't flag" behaviour the retired window
+/// join gave via `None`). Per-position by construction: the value is the window
+/// centred on this exact locus, not a 500 bp tile mean.
+fn gather_window_coverage(
+    per_sample: &[SamplePspChunk],
+    records: &[Variant],
+) -> Vec<LocusWindowCoverage> {
+    records
+        .iter()
+        .map(|record| window_coverage_at(per_sample, record.locus.start))
+        .collect()
+}
+
+/// One locus's per-sample window coverage at 1-based `pos`: for each sample,
+/// binary-search its compacted positions for `pos`; a hit copies that sample's
+/// windowed GC + coverage, a miss leaves `NaN` (sample not covered here).
+fn window_coverage_at(per_sample: &[SamplePspChunk], pos: u32) -> LocusWindowCoverage {
+    let n_samples = per_sample.len();
+    let mut gc = vec![f32::NAN; n_samples];
+    let mut coverage = vec![f32::NAN; n_samples];
+    for (s, chunk) in per_sample.iter().enumerate() {
+        if let Ok(idx) = chunk.positions_all().binary_search(&pos) {
+            gc[s] = chunk.windowed_gc()[idx];
+            coverage[s] = chunk.windowed_coverage()[idx];
+        }
+    }
+    LocusWindowCoverage { gc, coverage }
 }
 
 /// Pre-EM `min_alt_obs_per_sample` predicate over the projected per-allele
@@ -342,6 +386,46 @@ mod tests {
         let merger = PerGroupMerger::with_config(groups, fetcher, PerGroupMergerConfig::default());
         let engine = PosteriorEngine::with_config(merger, PosteriorEngineConfig::default());
         engine.map(|r| r.expect("row pipeline")).collect()
+    }
+
+    /// The window-coverage gather aligns each sample's windowed values to a
+    /// locus by exact position, leaves `NaN` where a sample has no record
+    /// there, and indexes by cohort sample order.
+    #[test]
+    fn window_coverage_gather_aligns_by_position() {
+        // Sample 0 covers 10, 25, 40; sample 1 covers 10, 40 (no record at 25).
+        let per_sample = vec![
+            SamplePspChunk::from_windowed_for_test(
+                0,
+                vec![10, 25, 40],
+                vec![0.30, 0.31, 0.32],
+                vec![100.0, 101.0, 102.0],
+            ),
+            SamplePspChunk::from_windowed_for_test(
+                0,
+                vec![10, 40],
+                vec![0.40, 0.42],
+                vec![200.0, 202.0],
+            ),
+        ];
+
+        // Locus at 25: sample 0 present, sample 1 absent (NaN).
+        let at25 = window_coverage_at(&per_sample, 25);
+        assert_eq!(at25.gc[0].to_bits(), 0.31f32.to_bits());
+        assert_eq!(at25.coverage[0].to_bits(), 101.0f32.to_bits());
+        assert!(at25.gc[1].is_nan(), "sample 1 has no record at 25");
+        assert!(at25.coverage[1].is_nan());
+
+        // Locus at 40: both present.
+        let at40 = window_coverage_at(&per_sample, 40);
+        assert_eq!(at40.gc[1].to_bits(), 0.42f32.to_bits());
+        assert_eq!(at40.coverage[1].to_bits(), 202.0f32.to_bits());
+        assert_eq!(at40.coverage[0].to_bits(), 102.0f32.to_bits());
+
+        // A locus no sample covers → all NaN.
+        let at99 = window_coverage_at(&per_sample, 99);
+        assert!(at99.gc.iter().all(|v| v.is_nan()));
+        assert!(at99.coverage.iter().all(|v| v.is_nan()));
     }
 
     #[test]

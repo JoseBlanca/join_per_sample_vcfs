@@ -150,7 +150,51 @@ pub struct CalledChunk {
     /// Carried through untouched from the source [`RawCohortChunk`].
     pub chunk_order: u64,
     pub records: Vec<Variant>,
+    /// Per-record centred-window coverage for the hidden-paralog score, in the
+    /// **same order** as `records` (so `window_coverage[i]` describes
+    /// `records[i]`). Gathered by [`VariantCaller::call_chunk`] from the source
+    /// chunk's per-sample windowed columns; **empty** for a `CalledChunk`
+    /// produced by [`VariantCaller::call_records`] directly (the test path,
+    /// which has no per-sample chunks to gather from). The spill sink reads it
+    /// alongside each record.
+    pub window_coverage: Vec<LocusWindowCoverage>,
     pub stats: CallStats,
+}
+
+/// Per-sample centred-window coverage for one called locus, gathered from the
+/// psp `windowed_gc`/`windowed_coverage` columns by matching each sample's
+/// compacted-chunk row at the locus position.
+///
+/// Both vectors are indexed by cohort sample order and hold `NaN` where the
+/// sample has no covered record at the locus — the score skips those samples,
+/// matching the retired window join's `None`. Per-sample GC (not a single
+/// shared reference GC) because each sample's window spans **its** covered
+/// positions; storing it per sample is what lets var-calling stay window-free.
+#[derive(Debug, Clone)]
+pub struct LocusWindowCoverage {
+    /// Per-sample centred-window GC fraction; `NaN` = sample absent at locus.
+    pub gc: Vec<f32>,
+    /// Per-sample centred-window mean coverage; `NaN` = sample absent at locus.
+    pub coverage: Vec<f32>,
+}
+
+/// Byte-identity equality: the windowed values carry `NaN` sentinels, so they
+/// are compared on their bit pattern (a derived `PartialEq` would make
+/// `NaN != NaN` and break `CalledChunk` equality in tests). No `Eq`/`Hash`.
+impl PartialEq for LocusWindowCoverage {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { gc, coverage } = self;
+        gc.len() == other.gc.len()
+            && gc
+                .iter()
+                .zip(&other.gc)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && coverage.len() == other.coverage.len()
+            && coverage
+                .iter()
+                .zip(&other.coverage)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
 }
 
 #[cfg(test)]

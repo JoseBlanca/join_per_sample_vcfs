@@ -461,6 +461,32 @@ impl SamplePspChunk {
         hi - lo
     }
 
+    /// Minimal chunk carrying only positions + the windowed columns — the
+    /// window-coverage gather reads nothing else. For testing that gather.
+    #[cfg(test)]
+    pub(crate) fn from_windowed_for_test(
+        chrom_id: u32,
+        positions: Vec<u32>,
+        windowed_gc: Vec<f32>,
+        windowed_coverage: Vec<f32>,
+    ) -> Self {
+        let n = positions.len();
+        assert_eq!(positions.len(), windowed_gc.len());
+        assert_eq!(positions.len(), windowed_coverage.len());
+        Self {
+            chrom_id,
+            positions,
+            nonref_obs: Vec::new(),
+            ref_spans: Vec::new(),
+            allele_offsets: vec![0; n + 1],
+            windowed_gc,
+            windowed_coverage,
+            scalar: AlleleScalarColumns::default(),
+            seq: AlleleSeqColumns::empty(),
+            chain_ids: AlleleChainIdColumns::empty(),
+        }
+    }
+
     /// An empty chunk for `chrom_id`, ready to accumulate compacted records
     /// via [`append_range`](Self::append_range).
     ///

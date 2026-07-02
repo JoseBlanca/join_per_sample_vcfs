@@ -184,6 +184,9 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
         // reorder cursor gapless from 0.
         writer.handle(CalledChunk {
             chunk_order,
+            // The VCF writer ignores window coverage (it rode the spill only for
+            // the score, already applied above); an empty vec suffices here.
+            window_coverage: Vec::new(),
             records: vec![record.record],
             stats: CallStats::default(),
         })?;
