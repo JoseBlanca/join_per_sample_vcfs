@@ -18,8 +18,7 @@ use std::io::Read;
 
 use crate::paralog::{
     EmConfig, LocusObservations, ParalogFdrCurve, ParalogLrHistogram, ParalogModelParams,
-    ParalogPrior, ParalogScorePrecompute, SampleObservation, inbreeding_coefficient,
-    score_locus_for_paralogy,
+    ParalogPrior, ParalogScorePrecompute, SampleObservation, score_locus_for_paralogy,
 };
 
 use crate::var_calling::posterior_engine::PosteriorRecord;
@@ -93,20 +92,17 @@ impl ParalogCalibration {
     }
 }
 
-/// Per-sample inbreeding coefficient `F = 1 − obs_het/Hexp`, indexed parallel to
-/// the cohort columns; `0.0` (outbred, inert) for an absent sample.
+/// The cohort inbreeding coefficient `F`, one value for every sample.
 ///
-/// The write pass (S5) recomputes this the same way so its `score_spilled_locus`
-/// inputs are bit-identical to the calibrate pass's.
-pub(crate) fn inbreeding_by_sample(prepass: &ParalogPrePass, hexp: f64) -> Vec<f64> {
-    prepass
-        .samples()
-        .iter()
-        .map(|s| match s {
-            Some(model) => inbreeding_coefficient(model.obs_het, hexp),
-            None => 0.0,
-        })
-        .collect()
+/// `F` is *not* per-individual (it isn't identifiable from one sample, and the
+/// per-individual het-rate proxy is divergence-contaminated — see
+/// `doc/devel/architecture/hidden_paralog_single_sample_scoring.md`): it is the
+/// caller's single cohort `--inbreeding-coefficient`, the same one the SNP
+/// caller uses in its genotype prior. The write pass (S5) rebuilds this slice
+/// identically so its `score_spilled_locus` inputs are bit-identical to the
+/// calibrate pass's.
+pub(crate) fn cohort_inbreeding(n_samples: usize, f: f64) -> Vec<f64> {
+    vec![f; n_samples]
 }
 
 /// Whether the record is a biallelic SNP — the class the paralog score is
@@ -255,14 +251,14 @@ pub(crate) fn score_joined_locus<WR: Read>(
 /// fixed-size histogram, then estimate `π` and the FDR cut — all RAM-flat (the
 /// histogram is a few KB; no per-locus vector).
 ///
-/// `hexp` is the finished cohort expected heterozygosity (from the main pass's
-/// [`super::prepass::HexpAccumulator`]); `fdr_target` is the operator's FDR. On
-/// EM non-convergence the prior falls back to `cfg.fallback_prior` (the caller
-/// inspects `prior.converged` to warn).
+/// `inbreeding` is the cohort inbreeding coefficient `F` (the caller's
+/// `--inbreeding-coefficient`), applied to every sample; `fdr_target` is the
+/// operator's FDR. On EM non-convergence the prior falls back to
+/// `cfg.fallback_prior` (the caller inspects `prior.converged` to warn).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn calibrate<R: Read, WR: Read>(
     prepass: &ParalogPrePass,
-    hexp: f64,
+    inbreeding_coefficient: f64,
     records: &mut ParalogSpillReader<R>,
     windows: &mut WindowJoin<WR>,
     window_bp: u32,
@@ -270,8 +266,8 @@ pub(crate) fn calibrate<R: Read, WR: Read>(
     fdr_target: f64,
     cfg: &CalibrationConfig,
 ) -> Result<ParalogCalibration, SpillError> {
-    let inbreeding = inbreeding_by_sample(prepass, hexp);
     let single_copy_depth_sd = prepass.single_copy_depth_sd();
+    let inbreeding = cohort_inbreeding(single_copy_depth_sd.len(), inbreeding_coefficient);
     // The per-pass locus-invariant scoring tables (Wright genotype priors +
     // carrier-frequency probs + configs), built once from the params + cohort
     // inbreeding and reused for every locus. The write pass builds an identical
@@ -336,7 +332,7 @@ mod tests {
     /// and its sibling window spill, joined by tile key).
     fn run_calibrate(
         prepass: &ParalogPrePass,
-        hexp: f64,
+        f: f64,
         records: &[ParalogSpillRecord],
         windows: &[WindowSpillRecord],
         fdr: f64,
@@ -348,7 +344,7 @@ mod tests {
                 .unwrap();
         calibrate(
             prepass,
-            hexp,
+            f,
             &mut reader,
             &mut join,
             TEST_WINDOW_BP,
@@ -409,7 +405,7 @@ mod tests {
             cal.prior.prior_probability
         );
         // The paralog-like locus is flagged; the normal locus is not.
-        let inbreeding = inbreeding_by_sample(&prepass, 0.02);
+        let inbreeding = cohort_inbreeding(prepass.samples().len(), 0.02);
         let sigma0 = prepass.single_copy_depth_sd();
         let mut buf = Vec::new();
         let lr_paralog = score_fixture(
@@ -467,7 +463,7 @@ mod tests {
     fn unscored_loci_are_none() {
         let n = 4;
         let prepass = prepass(n);
-        let inbreeding = inbreeding_by_sample(&prepass, 0.02);
+        let inbreeding = cohort_inbreeding(prepass.samples().len(), 0.02);
         let sigma0 = prepass.single_copy_depth_sd();
         let mut buf = Vec::new();
 
@@ -519,7 +515,7 @@ mod tests {
     fn locus_without_a_window_is_unscored() {
         let n = 10;
         let prepass = prepass(n);
-        let inbreeding = inbreeding_by_sample(&prepass, 0.02);
+        let inbreeding = cohort_inbreeding(prepass.samples().len(), 0.02);
         let sigma0 = prepass.single_copy_depth_sd();
         let precompute = ParalogScorePrecompute::new(&ParalogModelParams::default(), &inbreeding);
         let mut buf = Vec::new();

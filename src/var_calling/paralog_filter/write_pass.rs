@@ -26,7 +26,7 @@ use crate::var_calling::posterior_engine::PosteriorRecord;
 use crate::var_calling::types::{CallStats, CalledChunk};
 use crate::var_calling::vcf_writer::{VcfWriter, WriterError, WriterStats};
 
-use super::calibrate::{ParalogCalibration, inbreeding_by_sample, score_joined_locus};
+use super::calibrate::{ParalogCalibration, cohort_inbreeding, score_joined_locus};
 use super::prepass::ParalogPrePass;
 use super::spill::{ParalogSpillReader, SpillError, WindowJoin};
 use super::window_gc::reference_base_matches;
@@ -119,28 +119,29 @@ pub(crate) fn paralog_provenance(calibration: &ParalogCalibration) -> String {
 /// through `writer`. Returns the writer's stats with
 /// [`WriterStats::records_dropped_paralog`] set.
 ///
-/// `prepass`, `hexp`, `window_bp`, and `params` must be the **same** as the
-/// calibrate pass used (both `inbreeding` and `single_copy_depth_sd` are derived
-/// from `prepass`), and `windows` must be a fresh joiner over the **same** window
-/// spill, so the recomputed LRs match the histogram the cut came from. Survivors
-/// are fed to the writer in spill order (which is genomic order — the main pass
-/// spills post-reorder), one record per `CalledChunk` with a gapless
-/// `chunk_order`; the writer's reorder passes them straight through.
+/// `prepass`, `inbreeding_coefficient`, `window_bp`, and `params` must be the
+/// **same** as the calibrate pass used (both `inbreeding` and
+/// `single_copy_depth_sd` are derived from `prepass`), and `windows` must be a
+/// fresh joiner over the **same** window spill, so the recomputed LRs match the
+/// histogram the cut came from. Survivors are fed to the writer in spill order
+/// (which is genomic order — the main pass spills post-reorder), one record per
+/// `CalledChunk` with a gapless `chunk_order`; the writer's reorder passes them
+/// straight through.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_write_pass<R: Read, WR: Read>(
     spill: &mut ParalogSpillReader<R>,
     windows: &mut WindowJoin<WR>,
     window_bp: u32,
     prepass: &ParalogPrePass,
-    hexp: f64,
+    inbreeding_coefficient: f64,
     calibration: &ParalogCalibration,
     params: &ParalogModelParams,
     reference: &Path,
     chrom_names: &[String],
     mut writer: VcfWriter,
 ) -> Result<WriterStats, WritePassError> {
-    let inbreeding = inbreeding_by_sample(prepass, hexp);
     let single_copy_depth_sd = prepass.single_copy_depth_sd();
+    let inbreeding = cohort_inbreeding(single_copy_depth_sd.len(), inbreeding_coefficient);
     // Built once from the same params + cohort inbreeding the calibrate pass
     // used, so the recomputed LRs are bit-identical to the histogram's.
     let precompute = ParalogScorePrecompute::new(params, &inbreeding);
@@ -211,7 +212,7 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
 
-    const HEXP: f64 = 0.02;
+    const COHORT_F: f64 = 0.02;
 
     /// A fresh [`WindowJoin`] over the given window fixtures.
     fn join(windows: &[WindowSpillRecord]) -> WindowJoin<Cursor<Vec<u8>>> {
@@ -274,7 +275,7 @@ mod tests {
     ) -> ParalogCalibration {
         calibrate(
             &prepass(n),
-            HEXP,
+            COHORT_F,
             &mut ParalogSpillReader::new(Cursor::new(write_spill(records))),
             &mut join(windows),
             TEST_WINDOW_BP,
@@ -320,7 +321,7 @@ mod tests {
             &mut join(&windows),
             TEST_WINDOW_BP,
             &prepass(n),
-            HEXP,
+            COHORT_F,
             &cal,
             &ParalogModelParams::default(),
             &reference,
@@ -376,7 +377,7 @@ mod tests {
             &mut join(&windows),
             TEST_WINDOW_BP,
             &prepass(n),
-            HEXP,
+            COHORT_F,
             &cal,
             &ParalogModelParams::default(),
             &reference,
@@ -422,7 +423,7 @@ mod tests {
             &mut join(&windows),
             TEST_WINDOW_BP,
             &prepass(n),
-            HEXP,
+            COHORT_F,
             &cal,
             &ParalogModelParams::default(),
             &reference,
@@ -454,7 +455,7 @@ mod tests {
             &mut join(&[]),
             TEST_WINDOW_BP,
             &prepass(n),
-            HEXP,
+            COHORT_F,
             &cal,
             &ParalogModelParams::default(),
             &reference,
@@ -498,7 +499,7 @@ mod tests {
                 &mut join(&windows),
                 TEST_WINDOW_BP,
                 &prepass(n),
-                HEXP,
+                COHORT_F,
                 &cal,
                 &ParalogModelParams::default(),
                 &reference,

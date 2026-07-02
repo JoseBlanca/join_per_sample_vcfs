@@ -53,8 +53,6 @@ use pop_var_caller::sample_summary::{
 /// The GC / analysis window (matches the prototype `W = 500` and the
 /// per-sample summary default).
 const WINDOW_BP: u32 = DEFAULT_GC_WINDOW_BP;
-/// Minimum usable samples for a locus to be scored (prototype `m < 20` skip).
-const MIN_SAMPLES: usize = 20;
 /// FDR level for the flagged-set profile report.
 const REPORT_FDR: f64 = 0.05;
 
@@ -222,13 +220,13 @@ fn main() {
                 .unwrap_or(1.0)
         })
         .collect();
-    // Per-sample F, parallel to the cohort columns (0.0 for an absent sample —
-    // inert, since an absent sample contributes no observation). The scorer's
+    // `F` is one cohort constant now (the caller's `--inbreeding-coefficient`),
+    // not a per-individual `Hexp`-derived value — see the single-sample
+    // reformulation. The per-sample `state.inbreeding`/`obs_het` above are kept
+    // only as diagnostics in the output table, not fed to the score. The scorer's
     // log-prior tables are memoised once from (params, F) via the precompute.
-    let inbreeding_by_sample: Vec<f64> = states
-        .iter()
-        .map(|s| s.as_ref().map(|s| s.inbreeding).unwrap_or(0.0))
-        .collect();
+    let cohort_f = pop_var_caller::var_calling::posterior_engine::DEFAULT_INBREEDING_COEFFICIENT;
+    let inbreeding_by_sample: Vec<f64> = vec![cohort_f; sample_names.len()];
     let precompute = ParalogScorePrecompute::new(&params, &inbreeding_by_sample);
 
     let mut histogram = ParalogLrHistogram::with_defaults();
@@ -254,8 +252,9 @@ fn main() {
             for (col, slot) in obs_buf.iter_mut().enumerate() {
                 *slot = build_observation(&record, col, &states, win);
             }
-            let usable = obs_buf.iter().filter(|o| o.is_some()).count();
-            if usable < MIN_SAMPLES {
+            // No minimum-sample gate — the LR self-gates (under-powered → LR≈0).
+            // Only skip a locus with nothing to score (no usable sample).
+            if obs_buf.iter().all(|o| o.is_none()) {
                 continue;
             }
             let score = score_locus_for_paralogy(

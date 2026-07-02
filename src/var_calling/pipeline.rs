@@ -66,7 +66,7 @@ use std::collections::BTreeMap;
 use crate::paralog::ParalogModelParams;
 use crate::sample_summary::SampleSummary;
 use crate::var_calling::paralog_filter::calibrate::{CalibrationConfig, calibrate};
-use crate::var_calling::paralog_filter::prepass::{HexpAccumulator, ParalogPrePass};
+use crate::var_calling::paralog_filter::prepass::ParalogPrePass;
 use crate::var_calling::paralog_filter::spill::{
     ParalogSpill, ParalogSpillRecord, ParalogSpillWriter, SpillError, WindowJoin,
 };
@@ -774,26 +774,25 @@ pub fn run_var_calling(
     // end of this function — on success and on any `?` error alike.
     match sink_output {
         SinkOutput::Vcf(stats) => Ok(stats),
-        SinkOutput::Spill(hexp) => {
+        SinkOutput::Spill => {
             let spill = paralog_spill.expect("a spill sink implies a record spill file");
             let window_spill =
                 paralog_window_spill.expect("a spill sink implies a window spill file");
             let prepass = paralog_prepass.expect("a spill sink implies a pre-pass");
             let window_bp = prepass.window_bp();
+            // The inbreeding coefficient `F` is one cohort constant — the caller's
+            // `--inbreeding-coefficient`, the same value its genotype prior uses —
+            // not a per-individual `Hexp`-derived quantity (arch: single-sample
+            // reformulation).
+            let inbreeding = cohort.inbreeding_coefficient;
             eprintln!(
-                "var-calling: paralog filter — {} samples fit; Hexp Σ2pq {:.1} over {} variant \
-                 loci; record spill at {}, window spill at {}",
+                "var-calling: paralog filter — {} samples fit; F = {:.4}; record spill at {}, \
+                 window spill at {}",
                 prepass.fit_count(),
-                hexp.expected_het_sum(),
-                hexp.loci(),
+                inbreeding,
                 spill.path().display(),
                 window_spill.path().display(),
             );
-            // Hexp on the per-callable-position scale (R1 correction): the
-            // representative callable is the cohort median; `.max(1)` guards a
-            // degenerate zero (→ Hexp 0 → F 0, treat every sample as outbred).
-            let callable_ref = prepass.callable_reference().unwrap_or(1).max(1);
-            let hexp = hexp.finish(callable_ref);
             let params = ParalogModelParams::default();
             let cfg = CalibrationConfig::default();
 
@@ -802,7 +801,7 @@ pub fn run_var_calling(
                 let mut windows = WindowJoin::new(window_spill.window_reader()?)?;
                 calibrate(
                     &prepass,
-                    hexp,
+                    inbreeding,
                     &mut reader,
                     &mut windows,
                     window_bp,
@@ -833,7 +832,7 @@ pub fn run_var_calling(
                 &mut windows,
                 window_bp,
                 &prepass,
-                hexp,
+                inbreeding,
                 &calibration,
                 &params,
                 &args.reference,
@@ -858,15 +857,16 @@ trait ChunkSink: Send {
     fn close(self: Box<Self>) -> Result<SinkOutput, PipelineError>;
 }
 
-/// What a [`ChunkSink`] produced: either the finished VCF stats (single-pass) or
-/// the finished `Hexp` accumulator (two-pass; the spill is on disk).
+/// What a [`ChunkSink`] produced: the finished VCF stats (single-pass) or a
+/// signal that the record spill is written (two-pass; the spill is on disk and
+/// carries no in-memory payload — the score reads it back in the calibrate/write
+/// passes).
 #[derive(Debug)]
 enum SinkOutput {
     /// Single-pass: the writer already produced the final VCF.
     Vcf(WriterStats),
-    /// Two-pass: the spill is written; carries the finished `Hexp` accumulator
-    /// (its `Σ2pq`), which the caller divides by the callable reference.
-    Spill(HexpAccumulator),
+    /// Two-pass: the record spill is written and on disk.
+    Spill,
 }
 
 /// Single-pass sink: the existing [`VcfWriter`], unchanged. `accept`/`close`
@@ -884,14 +884,14 @@ impl ChunkSink for VcfWriterSink {
     }
 }
 
-/// Two-pass sink: reorder the chunks (as the writer does), accumulate `Hexp`
-/// from each record's cohort allele frequencies, and spill each record to the
-/// **record spill**. The per-sample window coverage lives in the sibling window
-/// spill (built inline in the fold loop by `window_builder`), joined to each
-/// record by tile key in the read passes (Approach A, S6c).
+/// Two-pass sink: reorder the chunks (as the writer does) and spill each record
+/// to the **record spill** in genomic order. Nothing global is accumulated — the
+/// score's only global quantity (π) is estimated later over the spilled loci, and
+/// `F` is a cohort constant known up front. The per-sample window coverage lives
+/// in the sibling window spill (built inline in the fold loop by
+/// `window_builder`), joined to each record by tile key in the read passes.
 struct SpillSink {
     writer: ParalogSpillWriter<BufWriter<File>>,
-    hexp: HexpAccumulator,
     /// Reorder buffer: chunks that arrived before their turn (mirrors
     /// [`VcfWriter`]'s reorder so the spill is in genomic order).
     reorder: BTreeMap<u64, CalledChunk>,
@@ -903,18 +903,16 @@ impl SpillSink {
     fn new(writer: ParalogSpillWriter<BufWriter<File>>) -> Self {
         Self {
             writer,
-            hexp: HexpAccumulator::new(),
             reorder: BTreeMap::new(),
             next_expected: 0,
         }
     }
 
-    /// Accumulate `Hexp` and spill every record of one (in-order) chunk to the
-    /// record spill. The record's window coverage is supplied separately by the
-    /// window spill (joined by tile key in the read passes).
+    /// Spill every record of one (in-order) chunk to the record spill. The
+    /// record's window coverage is supplied separately by the window spill
+    /// (joined by tile key in the read passes).
     fn spill_chunk(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
         for record in chunk.records {
-            self.hexp.observe(&record.allele_frequencies);
             self.writer.append(&ParalogSpillRecord { record })?;
         }
         Ok(())
@@ -947,7 +945,7 @@ impl ChunkSink for SpillSink {
             });
         }
         self.writer.finish()?;
-        Ok(SinkOutput::Spill(self.hexp))
+        Ok(SinkOutput::Spill)
     }
 }
 
@@ -1200,18 +1198,16 @@ mod tests {
         }
     }
 
-    /// The spill sink reorders out-of-order chunks by `chunk_order`, spills the
-    /// records in genomic order, accumulates `Hexp` from each record's cohort
-    /// allele frequencies, and yields the finished accumulator — the two-pass
-    /// main-pass sink's contract.
+    /// The spill sink reorders out-of-order chunks by `chunk_order` and spills the
+    /// records in genomic order — the two-pass main-pass sink's contract (it
+    /// accumulates nothing global; `F` is a cohort constant and π is over loci).
     #[test]
-    fn spill_sink_reorders_accumulates_hexp_and_spills() {
+    fn spill_sink_reorders_and_spills_in_genomic_order() {
         use crate::var_calling::paralog_filter::spill::ParalogSpill;
         use crate::var_calling::paralog_filter::test_support::normal_locus;
         use crate::var_calling::types::CallStats;
 
         let n = 4;
-        // Three biallelic-SNP records (allele_frequencies [0.5, 0.5] → 2pq 0.5).
         let rec = |pos: u32| normal_locus(pos, n).record;
         let chunk = |order: u64, pos: u32| CalledChunk {
             chunk_order: order,
@@ -1228,13 +1224,10 @@ mod tests {
         sink.accept(chunk(0, 100)).unwrap();
         sink.accept(chunk(1, 200)).unwrap();
         let out = sink.close().unwrap();
-        let SinkOutput::Spill(hexp) = out else {
-            panic!("spill sink must yield SinkOutput::Spill");
-        };
-
-        // Hexp accumulator saw all three records' 2pq (0.5 each).
-        assert_eq!(hexp.loci(), 3);
-        assert!((hexp.expected_het_sum() - 1.5).abs() < 1e-9);
+        assert!(
+            matches!(out, SinkOutput::Spill),
+            "spill sink must yield SinkOutput::Spill"
+        );
 
         // The spill holds the records in genomic order (reorder worked).
         let mut reader = spill.reader().unwrap();
