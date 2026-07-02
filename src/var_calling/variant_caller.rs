@@ -238,7 +238,7 @@ impl VariantCaller {
 /// record in `records` order.
 ///
 /// For each record, binary-search every sample's compacted positions for the
-/// locus anchor `record.locus.pos`; a hit copies that sample's windowed GC +
+/// locus anchor `record.locus.start`; a hit copies that sample's windowed GC +
 /// coverage, a miss leaves `NaN` (the sample has no covered record there, so the
 /// score skips it — the same "keep, don't flag" behaviour the retired window
 /// join gave via `None`). Per-position by construction: the value is the window
@@ -256,14 +256,23 @@ fn gather_window_coverage(
 /// One locus's per-sample window coverage at 1-based `pos`: for each sample,
 /// binary-search its compacted positions for `pos`; a hit copies that sample's
 /// windowed GC + coverage, a miss leaves `NaN` (sample not covered here).
+///
+/// The windowed vectors are aligned 1:1 with `positions` by every chunk
+/// constructor, so a hit's `idx` is in bounds — but the reads go through `.get()`
+/// so a hypothetical length skew degrades to `NaN` (sample absent → skipped),
+/// never an out-of-bounds panic.
 fn window_coverage_at(per_sample: &[SamplePspChunk], pos: u32) -> LocusWindowCoverage {
     let n_samples = per_sample.len();
     let mut gc = vec![f32::NAN; n_samples];
     let mut coverage = vec![f32::NAN; n_samples];
     for (s, chunk) in per_sample.iter().enumerate() {
-        if let Ok(idx) = chunk.positions_all().binary_search(&pos) {
-            gc[s] = chunk.windowed_gc()[idx];
-            coverage[s] = chunk.windowed_coverage()[idx];
+        if let Ok(idx) = chunk.positions().binary_search(&pos) {
+            gc[s] = chunk.windowed_gc().get(idx).copied().unwrap_or(f32::NAN);
+            coverage[s] = chunk
+                .windowed_coverage()
+                .get(idx)
+                .copied()
+                .unwrap_or(f32::NAN);
         }
     }
     LocusWindowCoverage { gc, coverage }
@@ -426,6 +435,44 @@ mod tests {
         let at99 = window_coverage_at(&per_sample, 99);
         assert!(at99.gc.iter().all(|v| v.is_nan()));
         assert!(at99.coverage.iter().all(|v| v.is_nan()));
+    }
+
+    /// The gather keys on the locus **anchor** (`record.locus.start`), not the
+    /// group span: a sample covered only at a grouped variant's interior — with
+    /// no record at the anchor — is left `NaN` (absent → skipped, the safe
+    /// keep-don't-flag direction). Pins the per-position anchor semantics so a
+    /// future change to span-matching is a deliberate, test-visible choice.
+    #[test]
+    fn window_coverage_gather_keys_on_anchor_not_group_span() {
+        // Sample 0 covers 10 and 11; sample 1 covers only 11 (no row at 10).
+        let per_sample = vec![
+            SamplePspChunk::from_windowed_for_test(
+                0,
+                vec![10, 11],
+                vec![0.30, 0.31],
+                vec![100.0, 101.0],
+            ),
+            SamplePspChunk::from_windowed_for_test(0, vec![11], vec![0.40], vec![200.0]),
+        ];
+        // A variant anchored at 10 (a group's leftmost position): sample 1 has no
+        // covered record there, so it is absent even though it is covered at 11.
+        let at10 = window_coverage_at(&per_sample, 10);
+        assert_eq!(at10.gc[0].to_bits(), 0.30f32.to_bits());
+        assert!(
+            at10.gc[1].is_nan() && at10.coverage[1].is_nan(),
+            "sample 1 is not covered at the anchor 10, so it is absent"
+        );
+    }
+
+    /// A chunk from a legacy `.psp` without the windowed columns carries NaN-
+    /// filled windowed vectors (still aligned 1:1 with positions). A hit yields a
+    /// `NaN` value (sample skipped), never a panic or a search miss.
+    #[test]
+    fn window_coverage_gather_nan_for_legacy_windowless_chunk() {
+        let chunk =
+            SamplePspChunk::from_windowed_for_test(0, vec![10], vec![f32::NAN], vec![f32::NAN]);
+        let at10 = window_coverage_at(&[chunk], 10);
+        assert!(at10.gc[0].is_nan() && at10.coverage[0].is_nan());
     }
 
     #[test]

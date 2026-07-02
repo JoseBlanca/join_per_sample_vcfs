@@ -880,9 +880,10 @@ impl ChunkSink for VcfWriterSink {
 /// Two-pass sink: reorder the chunks (as the writer does) and spill each record
 /// to the **record spill** in genomic order. Nothing global is accumulated — the
 /// score's only global quantity (π) is estimated later over the spilled loci, and
-/// `F` is a cohort constant known up front. The per-sample window coverage lives
-/// in the sibling window spill (built inline in the fold loop by
-/// `window_builder`), joined to each record by tile key in the read passes.
+/// `F` is a cohort constant known up front. Each record's per-sample centred-
+/// window coverage rides on the record itself ([`CalledChunk::window_coverage`],
+/// gathered by the caller from the psp windowed columns); the read passes score
+/// straight off it — no window-spill join.
 struct SpillSink {
     writer: ParalogSpillWriter<BufWriter<File>>,
     /// Reorder buffer: chunks that arrived before their turn (mirrors
@@ -901,19 +902,31 @@ impl SpillSink {
         }
     }
 
-    /// Spill every record of one (in-order) chunk to the record spill. The
-    /// record's window coverage is supplied separately by the window spill
-    /// (joined by tile key in the read passes).
+    /// Spill every record of one (in-order) chunk to the record spill, carrying
+    /// each record's per-sample window coverage (gathered by `call_chunk` from
+    /// the psp windowed columns) alongside it — the read passes score from it
+    /// directly, with no window-spill join.
     fn spill_chunk(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
         let CalledChunk {
+            chunk_order: _,
             records,
             mut window_coverage,
-            ..
+            stats: _,
         } = chunk;
-        // `call_chunk` fills one window-coverage entry per record; be defensive
-        // if it is empty (a chunk built off the direct path) by padding with an
-        // empty coverage (all samples absent → the locus scores unflagged).
-        window_coverage.resize_with(records.len(), LocusWindowCoverage::default);
+        // `call_chunk` fills exactly one window-coverage entry per record; the
+        // direct `call_records` path (tests) ships an empty vec. Any other length
+        // is a caller bug — assert it rather than let `resize_with` silently
+        // truncate/misalign the per-record coverage against the records. Pad only
+        // the empty (direct-path) case, to all-absent coverage (locus unscored).
+        debug_assert!(
+            window_coverage.is_empty() || window_coverage.len() == records.len(),
+            "window_coverage len {} must be 0 (direct path) or == records len {}",
+            window_coverage.len(),
+            records.len(),
+        );
+        if window_coverage.is_empty() {
+            window_coverage.resize_with(records.len(), LocusWindowCoverage::default);
+        }
         for (record, window_coverage) in records.into_iter().zip(window_coverage) {
             // Transitional: the LR is still recomputed in the calibrate/write
             // passes, so store `NaN` (unscored) here for now. Inline scoring

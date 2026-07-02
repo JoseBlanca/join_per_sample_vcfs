@@ -33,6 +33,7 @@ use crate::psp::BlockColumns;
 use crate::psp::ScalarDecodeError;
 use crate::psp::reader::{DecodedColumn, RetainedColumn, TwoPhaseBlock, inflate_retained_column};
 use crate::psp::{BlockColumnReader, BlockIndexEntry, PspReadError, PspReader};
+use crate::var_calling::types::f32_slices_bit_eq;
 
 // ---------------------------------------------------------------------------
 // Heavy per-allele column carriers.
@@ -271,16 +272,8 @@ impl PartialEq for SamplePspChunk {
             && *nonref_obs == other.nonref_obs
             && *ref_spans == other.ref_spans
             && *allele_offsets == other.allele_offsets
-            && windowed_gc.len() == other.windowed_gc.len()
-            && windowed_gc
-                .iter()
-                .zip(&other.windowed_gc)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-            && windowed_coverage.len() == other.windowed_coverage.len()
-            && windowed_coverage
-                .iter()
-                .zip(&other.windowed_coverage)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && f32_slices_bit_eq(windowed_gc, &other.windowed_gc)
+            && f32_slices_bit_eq(windowed_coverage, &other.windowed_coverage)
             && *scalar == other.scalar
             && *seq == other.seq
             && *chain_ids == other.chain_ids
@@ -433,9 +426,9 @@ impl SamplePspChunk {
         self.positions.len()
     }
 
-    /// 1-based positions, one per record (light, cached). Test-only accessor
-    /// (the eager-decode oracle); production reads the field directly.
-    #[cfg(test)]
+    /// 1-based positions, one per record (light, cached) — the key the window
+    /// gather binary-searches to align a called locus to this sample's rows, and
+    /// the eager-decode test oracle's accessor.
     pub fn positions(&self) -> &[u32] {
         &self.positions
     }
@@ -522,12 +515,6 @@ impl SamplePspChunk {
     /// [`windowed_gc`](Self::windowed_gc).
     pub fn windowed_coverage(&self) -> &[f32] {
         &self.windowed_coverage
-    }
-
-    /// 1-based positions, one per record — the key the window gather binary-
-    /// searches to align a called locus to this sample's windowed values.
-    pub fn positions_all(&self) -> &[u32] {
-        &self.positions
     }
 
     /// Append `src`'s records whose position is in `[lo, hi)` onto `self` — the

@@ -161,6 +161,15 @@ pub struct CalledChunk {
     pub stats: CallStats,
 }
 
+/// Bit-exact equality of two `f32` slices, so a `NaN` sentinel compares equal to
+/// itself (plain `==` makes `NaN != NaN`). The windowed columns carry `NaN` for
+/// "sample absent", so their byte-identity `PartialEq` impls compare on the bit
+/// pattern via this helper — keeping the "NaN must compare bit-equal" rule in one
+/// place instead of hand-rolled at each field.
+pub(crate) fn f32_slices_bit_eq(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
 /// Per-sample centred-window coverage for one called locus, gathered from the
 /// psp `windowed_gc`/`windowed_coverage` columns by matching each sample's
 /// compacted-chunk row at the locus position.
@@ -170,6 +179,8 @@ pub struct CalledChunk {
 /// matching the retired window join's `None`. Per-sample GC (not a single
 /// shared reference GC) because each sample's window spans **its** covered
 /// positions; storing it per sample is what lets var-calling stay window-free.
+/// The fields are the same quantities as the psp `windowed_gc`/`windowed_coverage`
+/// columns (kept short here since the type name already says "window").
 #[derive(Debug, Clone, Default)]
 pub struct LocusWindowCoverage {
     /// Per-sample centred-window GC fraction; `NaN` = sample absent at locus.
@@ -184,16 +195,7 @@ pub struct LocusWindowCoverage {
 impl PartialEq for LocusWindowCoverage {
     fn eq(&self, other: &Self) -> bool {
         let Self { gc, coverage } = self;
-        gc.len() == other.gc.len()
-            && gc
-                .iter()
-                .zip(&other.gc)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-            && coverage.len() == other.coverage.len()
-            && coverage
-                .iter()
-                .zip(&other.coverage)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
+        f32_slices_bit_eq(gc, &other.gc) && f32_slices_bit_eq(coverage, &other.coverage)
     }
 }
 

@@ -486,6 +486,48 @@ mod tests {
         assert!(scored.is_none(), "no usable window coverage → unscored");
     }
 
+    /// `build_observation` skips a sample whose window GC is `NaN` even when its
+    /// coverage is finite (and vice-versa). The `window_coverage` fixtures only
+    /// NaN the coverage (GC stays 0.5), so this pins the `gc.is_finite()` half of
+    /// the guard, which no other test exercises.
+    #[test]
+    fn build_observation_skips_on_half_nan_window() {
+        let n = 1;
+        let prepass = prepass(n);
+        let inbreeding = cohort_inbreeding(1, 0.02);
+        let rec = normal_locus(1, n);
+
+        // NaN GC, finite coverage → skipped.
+        let nan_gc = LocusWindowCoverage {
+            gc: vec![f32::NAN],
+            coverage: vec![20.0],
+        };
+        assert!(
+            build_observation(&rec.record, &nan_gc, 0, &prepass, &inbreeding).is_none(),
+            "a NaN window GC must skip the sample"
+        );
+
+        // Finite GC, NaN coverage → skipped.
+        let nan_cov = LocusWindowCoverage {
+            gc: vec![0.5],
+            coverage: vec![f32::NAN],
+        };
+        assert!(
+            build_observation(&rec.record, &nan_cov, 0, &prepass, &inbreeding).is_none(),
+            "a NaN window coverage must skip the sample"
+        );
+
+        // Both finite → a usable observation.
+        let finite = LocusWindowCoverage {
+            gc: vec![0.5],
+            coverage: vec![20.0],
+        };
+        assert!(
+            build_observation(&rec.record, &finite, 0, &prepass, &inbreeding).is_some(),
+            "a fully finite window is a usable observation"
+        );
+    }
+
     /// A non-finite LR is never flagged — it is screened before the curve
     /// lookup, matching the histogram's refusal to fold a non-finite LR (so the
     /// two passes treat garbage identically: excluded, kept).

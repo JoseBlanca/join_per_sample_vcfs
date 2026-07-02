@@ -24,6 +24,15 @@
 //! stream (Approach A, S6c) that once carried it, joined by tile key, is being
 //! retired (its read side is gone; the write side follows in M6).
 //!
+//! This deliberately re-adds a second per-sample vector to each record frame —
+//! the very cost the sibling window spill was introduced (S6c) to keep *out* of
+//! the record spill. It is accepted now because the psp windowed columns give a
+//! true per-locus centred window at gather time (the tile-keyed window spill
+//! could only approximate it), and the record spill is an ephemeral temp file:
+//! `8·n_samples` extra bytes per locus alongside the existing per-sample
+//! `scalars`/`posteriors`/`gq_phred` vectors is a worthwhile trade for dropping
+//! the whole sibling-spill join.
+//!
 //! Memory-flat by construction: the writer encodes into one reused scratch
 //! buffer and the reader decodes one record at a time into a reused byte buffer
 //! — neither retains a genome-wide structure (arch §9).
@@ -983,6 +992,26 @@ mod tests {
         let mut reader = ParalogSpillReader::new(Cursor::new(bytes));
         let result = reader.next_record().expect("frame present");
         assert!(result.is_err(), "truncated payload must error");
+    }
+
+    /// A record payload cut inside the trailing `window_coverage` f32 vectors
+    /// surfaces as a typed `Truncated` error on that field — pinning the new
+    /// `decode_f32_vec` under-read path (the window coverage is the last-encoded
+    /// field, so a short tail lands in it).
+    #[test]
+    fn truncated_window_coverage_is_a_typed_error() {
+        let mut buf = Vec::new();
+        encode_record(&spill_record(7), &mut buf);
+        buf.truncate(buf.len() - 4); // drop the last coverage f32
+        match decode_record(&buf) {
+            Err(SpillError::Truncated { field, .. }) => {
+                assert!(
+                    field.starts_with("window_coverage"),
+                    "expected a window_coverage truncation, got field {field}"
+                );
+            }
+            other => panic!("expected Truncated on window_coverage, got {other:?}"),
+        }
     }
 
     /// A stream that ends inside the 4-byte length prefix is a `Truncated`
