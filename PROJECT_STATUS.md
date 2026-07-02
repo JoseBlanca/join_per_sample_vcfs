@@ -19,6 +19,24 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — Milestone S COMPLETE: var-calling wiring (S6c part 2) → the two-pass filter runs end-to-end and is ON by default (S6 checkpoint)**
+>   (branch `tomato2-paralog-filter`). Approach A landed: the producer writes a second ephemeral
+>   **window spill** ((chrom_id, tile, gc, [per-sample depths]) per variant window) alongside the
+>   record spill; the calibrate + write passes join the two by tile key in coordinate lockstep
+>   (`WindowJoin`), so the byte-identity-critical caller/chunk types stay untouched. Steps: ChunkPlan
+>   + `TwoPhaseSegment::depth_at` accessors; `WindowSpillBuilder` fed inline in both fold loops with
+>   a per-contig `ReferenceWindowGc` (separate streaming fetcher); `score_spilled_locus` takes the
+>   joined (gc, depths); write-pass reference-base consistency guard (fail loud on coordinate drift);
+>   `PARALOG_WINDOWS_WIRED` deleted → filter **on by default** at `--paralog-fdr 0.01`
+>   (`--no-paralog-filter` restores the single-pass path). Adversarial review fix: `flush_ready`
+>   flushes by the cohort-fed frontier (force-closing lagging samples' open windows) so `pending`
+>   stays bounded near the frontier, not O(contig tiles × samples). New end-to-end two-pass
+>   integration test (provenance header + spill cleanup). **1512 lib + all integration tests green,
+>   clippy clean, byte-identity preserved (existing var-calling tests pass `--no-paralog-filter`).**
+>   Owed: **T1** (real tomato2 drop-profile vs R1) + **T2** (cost/RSS gate — the on-by-default cost);
+>   the E2E test asserts orchestration/cleanup but defers the *synthetic drop* assertion to T1
+>   (`min_samples`=20 + coverage-fit make a deterministic synthetic drop brittle; drop mechanics are
+>   unit-tested in `write_pass`). Plan: [paralog_varcalling_wiring.md](doc/devel/implementation_plans/paralog_varcalling_wiring.md).
 > - **Last completed task (2026-07-01):** **Hidden-paralog filter — R1 data-first validation on tomato2 (checkpoint) → the pure maths is trustworthy on real data**
 >   (branch `tomato2-paralog-filter`). New `examples/paralog_score_parity.rs` (Rust harness: reads
 >   59 `.psp` + cohort VCF, runs Q2–Q5 end-to-end, dumps per-locus LR/post/qval + per-sample σ₀/F)
