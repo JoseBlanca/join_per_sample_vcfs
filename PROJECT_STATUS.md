@@ -19,6 +19,26 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — freebayes comparison (GIAB safety + tomato2 FP-class)**
+>   (branch `tomato2-paralog-filter`). **GIAB:** the cohort filter is a structural no-op on the
+>   single-sample GIAB benchmark (0 loci scored → 0 dropped; on==off byte-identical across HG002/3/4
+>   @50×) — no harm to the clean human callset; GIAB also excludes seg-dups so the paralog class is
+>   absent by construction. **tomato2 vs freebayes (v1.3.10, same 59 samples / 160×200 kb): freebayes
+>   emits 79 % of the loci our filter drops** (99 % ALT match; **55 % of all our drops pass freebayes'
+>   default QUAL≥30**; fb QUAL mean 750 vs 585 kept — the depth-inflated confidently-wrong signature)
+>   → the filter removes an FP class a standard caller leaves in. Figure
+>   `benchmarks/tomato2/results/paralog_vs_freebayes.png` (local/regenerable). Report:
+>   [paralog_vs_freebayes_2026-07-02.md](doc/devel/reports/implementations/paralog_vs_freebayes_2026-07-02.md).
+>   (Aside: pre-existing single-pass stack overflow on HG003 @default stack — untouched code, needs `RUST_MIN_STACK`.)
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — performance review of the T2 wall regression (+11.6×) → root-caused + solutions ranked**
+>   (branch `tomato2-paralog-filter`). Ran the `rust-performance-review` skill (5 categories in parallel) over the two
+>   scoring passes + the pure kernel. Root cause: the entire +249 s is `score_locus_for_paralogy` run
+>   **single-threaded, twice** (calibrate + write) after the 16-way main pass finished — RSS flat, I/O only ~15 s.
+>   Verdict *Apply the listed wins*: **H1** parallelise both passes (pure scorer, order-independent histogram fold,
+>   write-pass re-serialise-before-emit → byte-identity holds); **L1** memoise the two locus-invariant log-prior
+>   tables (H1 Wright 200×58 = ~26 B redundant `ln`/run, H2 carrier 40×58) as a bit-identical hoist; **L2**/**L3**
+>   config + scratch hoists; **S1** score-once-spill-the-LR (owner sign-off). Gate: add a paralog criterion bench +
+>   one flamegraph. Build profile already optimal. Report: [perf_paralog-filter_2026-07-02.md](doc/devel/reports/reviews/perf_paralog-filter_2026-07-02.md).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — Milestone T (T1 behaviour + T2 cost gate) on tomato2 → T1 PASS, T2 memory-flat but wall +11.6× (owner decision pending)**
 >   (branch `tomato2-paralog-filter`). Ran the production two-pass filter on the 59-sample tomato2
 >   cohort (regenerated `.psp` with the stored summary section — the committed fixtures predate it,
@@ -529,6 +549,8 @@ emits a `FILTER`/INFO verdict.
 - **S3 (per-window coverage pieces):** done — `ReferenceWindowGc` (shared per-window GC from the reference, streamed via the existing memory-flat `StreamingChromRefFetcher`; N-excluded) + `WindowMeanDepthAccumulator` (per-sample window mean depth, free from the `.psp` light columns; tiling byte-identical to `CoverageByGcAccumulator`) + `reference_base_matches` (coordinate-consistency guard). **Design revised with the owner:** GC is a shared *reference* property (not per-sample; FASTA not a per-position sync but a standalone window walk), depth is per-sample; per-sample depth deliberately does *not* N-exclude (documented approximation, T1-validated). Spill record reshaped to `window_gc: f32` + `window_mean_depth: Vec<Option<f32>>`. Code: [src/var_calling/paralog_filter/window_gc.rs](src/var_calling/paralog_filter/window_gc.rs), [window_coverage.rs](src/var_calling/paralog_filter/window_coverage.rs). Reviewed (approve). The producer *wiring* of these moves to S6 (the fold re-folds + is parallel, so a standalone "run unused in the fold" milestone isn't meaningful).
 - **S4 (calibrate pass):** done — `score_spilled_locus` (shared, pure, deterministic per-locus scorer reused by S5 for bit-identical recompute) + `calibrate` (streams the spill → `ParalogLrHistogram` → `ParalogPrior::estimate` EM with fixed-prior fallback → `ParalogFdrCurve` + `lr_threshold`). RAM-flat (histogram + one record + O(samples) scratch). `ParalogCalibration::flags` = the FDR drop decision. Code: [src/var_calling/paralog_filter/calibrate.rs](src/var_calling/paralog_filter/calibrate.rs). Reviewed (approve-with-changes; non-finite-LR screen + fallible access applied). **S4 checkpoint: given a spill, π + FDR cut produced RAM-flat.**
 - **Carried forward:** downstream `Hobs` consumers (S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample); Q4 handles it (zero rate → inert `F`). Next: **S5** (write pass — spill → recompute LR → apply cut → VCF + header provenance + `records_dropped_paralog`), then **S6** (orchestration: main-pass spilling, producer window wiring, CLI `--paralog-fdr` / `--no-paralog-filter`, byte-identity-off). S6 also owns: the fallback-warning granularity (empty-histogram vs EM-max-iter), and the operator warning on non-convergence.
+- **Latest perf review:** [perf_paralog-filter_2026-07-02.md](doc/devel/reports/reviews/perf_paralog-filter_2026-07-02.md) — the T2 wall follow-up (filter on = +11.6× wall, RSS flat). Verdict *Apply the listed wins*; 5 categories dispatched. The whole +249 s is the pure per-locus scorer run **single-threaded, twice** (calibrate + write) after the 16-way main pass finished — I/O is only ~15 s. Levers, ranked: **H1** parallelise both passes (serial read+join → rayon score-batch → serial fold/emit; histogram fold is order-independent, write pass re-serialises before the writer — byte-identity holds); **L1** memoise the two locus-invariant log-prior tables (H1 Wright 200×58 rebuilt every locus = ~26 B redundant `ln`; H2 carrier 40×58) — pure bit-identical hoist; **L2** hoist `enumerate_carrier_configs` out of the per-locus call; **L3** reuse the six per-locus scratch `Vec`s (per-worker after H1). **S1** score-once + spill the LR to disk (halves work, complements H1, needs owner sign-off — overturns recompute-not-cache). Gating deliverable: add `benches/paralog_scoring_perf.rs` (kernel + streaming) + one `cpu-clock` flamegraph to order the kernel micro-opts. Build profile already optimal (no change). Audit trail `tmp/perf_review_2026-07-02_paralog-filter/`.
+- **Open (perf, from the 2026-07-02 review):** **H1** parallelise the calibrate + write passes (the +11.6× fix; RSS-vs-batch-size sweep is the gate — the batch of N owned records is a new RAM cost vs the RAM-flat one-record-at-a-time design). **L1** memoise the Wright/carrier log-prior tables (exact-float-equality gate). **L2** hoist `enumerate_carrier_configs`. **L3** `ScorerScratch` per-worker. **Bench gap:** no criterion bench or sampling profile for the paralog path yet — add both before landing the kernel micro-opts (one hypothesis per measurement).
 
 ---
 
