@@ -836,7 +836,6 @@ pub fn run_var_calling(
                 hexp,
                 &calibration,
                 &params,
-                cfg.min_samples,
                 &args.reference,
                 &chrom_names,
                 writer,

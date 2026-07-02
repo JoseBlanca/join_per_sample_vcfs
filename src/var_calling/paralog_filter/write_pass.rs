@@ -119,14 +119,13 @@ pub(crate) fn paralog_provenance(calibration: &ParalogCalibration) -> String {
 /// through `writer`. Returns the writer's stats with
 /// [`WriterStats::records_dropped_paralog`] set.
 ///
-/// `prepass`, `hexp`, `window_bp`, `params`, and `min_samples` must be the
-/// **same** as the calibrate pass used (both `inbreeding` and
-/// `single_copy_depth_sd` are derived from `prepass`), and `windows` must be a
-/// fresh joiner over the **same** window spill, so the recomputed LRs match the
-/// histogram the cut came from. Survivors are fed to the writer in spill order
-/// (which is genomic order — the main pass spills post-reorder), one record per
-/// `CalledChunk` with a gapless `chunk_order`; the writer's reorder passes them
-/// straight through.
+/// `prepass`, `hexp`, `window_bp`, and `params` must be the **same** as the
+/// calibrate pass used (both `inbreeding` and `single_copy_depth_sd` are derived
+/// from `prepass`), and `windows` must be a fresh joiner over the **same** window
+/// spill, so the recomputed LRs match the histogram the cut came from. Survivors
+/// are fed to the writer in spill order (which is genomic order — the main pass
+/// spills post-reorder), one record per `CalledChunk` with a gapless
+/// `chunk_order`; the writer's reorder passes them straight through.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_write_pass<R: Read, WR: Read>(
     spill: &mut ParalogSpillReader<R>,
@@ -136,7 +135,6 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
     hexp: f64,
     calibration: &ParalogCalibration,
     params: &ParalogModelParams,
-    min_samples: usize,
     reference: &Path,
     chrom_names: &[String],
     mut writer: VcfWriter,
@@ -157,7 +155,7 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
         let record = record?;
         // Recompute the LR from the same joined inputs (bit-identical to
         // calibrate) and drop the locus if the calibration flags it. An unscored
-        // locus (not a biallelic SNP, too few samples, or no joined window) is
+        // locus (not a biallelic SNP, no usable samples, or no joined window) is
         // never flagged → kept.
         let flagged = score_joined_locus(
             &record.record,
@@ -167,7 +165,6 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
             &inbreeding,
             &single_copy_depth_sd,
             &precompute,
-            min_samples,
             &mut obs_buf,
         )?
         .is_some_and(|lr| calibration.flags(lr));
@@ -215,7 +212,6 @@ mod tests {
     use tempfile::tempdir;
 
     const HEXP: f64 = 0.02;
-    const MIN_SAMPLES: usize = 5;
 
     /// A fresh [`WindowJoin`] over the given window fixtures.
     fn join(windows: &[WindowSpillRecord]) -> WindowJoin<Cursor<Vec<u8>>> {
@@ -284,10 +280,7 @@ mod tests {
             TEST_WINDOW_BP,
             &ParalogModelParams::default(),
             fdr,
-            &CalibrationConfig {
-                min_samples: MIN_SAMPLES,
-                ..Default::default()
-            },
+            &CalibrationConfig::default(),
         )
         .expect("calibrate")
     }
@@ -330,7 +323,6 @@ mod tests {
             HEXP,
             &cal,
             &ParalogModelParams::default(),
-            MIN_SAMPLES,
             &reference,
             &chrom_names(),
             writer,
@@ -387,7 +379,6 @@ mod tests {
             HEXP,
             &cal,
             &ParalogModelParams::default(),
-            MIN_SAMPLES,
             &reference,
             &chrom_names(),
             writer,
@@ -434,7 +425,6 @@ mod tests {
             HEXP,
             &cal,
             &ParalogModelParams::default(),
-            MIN_SAMPLES,
             &reference,
             &chrom_names(),
             writer,
@@ -467,7 +457,6 @@ mod tests {
             HEXP,
             &cal,
             &ParalogModelParams::default(),
-            MIN_SAMPLES,
             &reference,
             &chrom_names(),
             writer,
@@ -512,7 +501,6 @@ mod tests {
                 HEXP,
                 &cal,
                 &ParalogModelParams::default(),
-                MIN_SAMPLES,
                 &reference,
                 &chrom_names(),
                 writer,

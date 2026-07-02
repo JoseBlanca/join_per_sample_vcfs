@@ -27,12 +27,6 @@ use crate::var_calling::posterior_engine::PosteriorRecord;
 use super::prepass::ParalogPrePass;
 use super::spill::{ParalogSpillReader, SpillError, WindowJoin};
 
-/// Default minimum usable samples for a locus to be scored. A locus with fewer
-/// usable samples has too little evidence for a trustworthy paralog verdict, so
-/// it is left unscored (never flagged). Matches the R1 prototype's `m < 20`
-/// skip.
-pub(crate) const DEFAULT_MIN_SAMPLES_FOR_SCORE: usize = 20;
-
 /// Default fallback `π` used when the EM does not converge — a rare-paralog
 /// prior deliberately low so a pathological dataset yields a conservative
 /// (few-drops) calibration rather than trusting a junk estimate. Chosen to
@@ -42,10 +36,13 @@ pub(crate) const DEFAULT_MIN_SAMPLES_FOR_SCORE: usize = 20;
 pub(crate) const DEFAULT_FALLBACK_PARALOG_PRIOR: f64 = 0.03;
 
 /// Tuning knobs for [`calibrate`]. [`Default`] is the production configuration.
+///
+/// There is deliberately **no minimum-sample gate**: an under-powered locus
+/// self-gates in the likelihood ratio (when the coverage can't tell 1× from 2×,
+/// H1 and H2 fit the data equally → LR≈0 → kept), so a count threshold would be
+/// redundant. See `doc/devel/architecture/hidden_paralog_single_sample_scoring.md`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CalibrationConfig {
-    /// Minimum usable samples for a locus to be scored (else left unscored).
-    pub min_samples: usize,
     /// EM configuration for the prior estimate.
     pub em: EmConfig,
     /// Fallback `π` when the EM does not converge.
@@ -55,7 +52,6 @@ pub(crate) struct CalibrationConfig {
 impl Default for CalibrationConfig {
     fn default() -> Self {
         Self {
-            min_samples: DEFAULT_MIN_SAMPLES_FOR_SCORE,
             em: EmConfig::default(),
             fallback_prior: DEFAULT_FALLBACK_PARALOG_PRIOR,
         }
@@ -162,9 +158,13 @@ fn build_observation(
 }
 
 /// Score one locus for paralogy from its caller record and joined window
-/// coverage, returning its likelihood ratio, or `None` if the locus is not
-/// scored (not a biallelic SNP, a cohort-size mismatch, or fewer than
-/// `min_samples` usable samples — all "keep, never flag" cases).
+/// coverage, returning its likelihood ratio, or `None` if the locus cannot be
+/// scored at all (not a biallelic SNP, a cohort-size mismatch, or *no* usable
+/// samples — all "keep, never flag" cases).
+///
+/// There is **no minimum-sample count**: an under-powered locus is scored and
+/// self-gates in the LR (LR≈0 → kept). Only a locus with zero usable samples is
+/// left unscored — there is nothing to fold into the histogram.
 ///
 /// `window_gc` + `window_depths` are the locus's window coverage joined from the
 /// window spill by tile key: the window's shared reference GC and each sample's
@@ -184,7 +184,6 @@ pub(crate) fn score_spilled_locus(
     inbreeding: &[f64],
     single_copy_depth_sd: &[f64],
     precompute: &ParalogScorePrecompute,
-    min_samples: usize,
     obs_buf: &mut Vec<Option<SampleObservation>>,
 ) -> Option<f64> {
     if !is_biallelic_snp(record) {
@@ -202,8 +201,10 @@ pub(crate) fn score_spilled_locus(
     for (sample_idx, slot) in obs_buf.iter_mut().enumerate() {
         *slot = build_observation(record, window_gc, window_depths, sample_idx, prepass, inbreeding);
     }
-    let usable = obs_buf.iter().filter(|o| o.is_some()).count();
-    if usable < min_samples {
+    // No usable sample → nothing to score (a locus with all-`None` observations
+    // would fold a meaningless LR≈0 into the histogram); one or more → scored,
+    // and the LR self-gates if the coverage can't discriminate.
+    if obs_buf.iter().all(|o| o.is_none()) {
         return None;
     }
 
@@ -220,7 +221,7 @@ pub(crate) fn score_spilled_locus(
 /// the calibrate pass (S4) and the write pass (S5) so their LRs are
 /// bit-identical. `Ok(None)` — unscored, so **kept** — when the window spill
 /// holds no window for the locus's tile (the producer never marked it variant)
-/// or the scorer declines (not a SNP, too few samples). Advances `windows` past
+/// or the scorer declines (not a SNP, no usable samples). Advances `windows` past
 /// any window sorting before the locus; the locus stream must be monotone in
 /// `(chrom_id, tile)` (it is — the record spill is genomic-ordered).
 #[allow(clippy::too_many_arguments)]
@@ -232,7 +233,6 @@ pub(crate) fn score_joined_locus<WR: Read>(
     inbreeding: &[f64],
     single_copy_depth_sd: &[f64],
     precompute: &ParalogScorePrecompute,
-    min_samples: usize,
     obs_buf: &mut Vec<Option<SampleObservation>>,
 ) -> Result<Option<f64>, SpillError> {
     let tile = record.locus.start.saturating_sub(1) / window_bp.max(1);
@@ -247,7 +247,6 @@ pub(crate) fn score_joined_locus<WR: Read>(
         inbreeding,
         single_copy_depth_sd,
         precompute,
-        min_samples,
         obs_buf,
     ))
 }
@@ -291,7 +290,6 @@ pub(crate) fn calibrate<R: Read, WR: Read>(
             &inbreeding,
             &single_copy_depth_sd,
             &precompute,
-            cfg.min_samples,
             &mut obs_buf,
         )? {
             histogram.push(lr);
@@ -330,7 +328,7 @@ mod tests {
     };
     use crate::var_calling::paralog_filter::test_support::{
         TEST_WINDOW_BP, allele, normal_locus, normal_window, paralog_locus, paralog_window, prepass,
-        write_spill, write_window_spill,
+        snp_window, write_spill, write_window_spill,
     };
     use std::io::Cursor;
 
@@ -368,7 +366,6 @@ mod tests {
         prepass: &ParalogPrePass,
         inbreeding: &[f64],
         sigma0: &[f64],
-        min_samples: usize,
         buf: &mut Vec<Option<SampleObservation>>,
     ) -> Option<f64> {
         let precompute = ParalogScorePrecompute::new(&ParalogModelParams::default(), inbreeding);
@@ -380,7 +377,6 @@ mod tests {
             inbreeding,
             sigma0,
             &precompute,
-            min_samples,
             buf,
         )
     }
@@ -403,10 +399,7 @@ mod tests {
             windows.push(paralog_window(5000 + i, n));
         }
 
-        let cfg = CalibrationConfig {
-            min_samples: 5,
-            ..Default::default()
-        };
+        let cfg = CalibrationConfig::default();
         // Hexp → F ≈ 0 (obs_het 0.005, so F ≈ 0.75; still outbred-ish).
         let cal = run_calibrate(&prepass, 0.02, &records, &windows, 0.05, &cfg);
 
@@ -425,7 +418,6 @@ mod tests {
             &prepass,
             &inbreeding,
             &sigma0,
-            5,
             &mut buf,
         )
         .expect("paralog scored");
@@ -435,7 +427,6 @@ mod tests {
             &prepass,
             &inbreeding,
             &sigma0,
-            5,
             &mut buf,
         )
         .expect("normal scored");
@@ -462,17 +453,16 @@ mod tests {
             &[indel],
             &[normal_window(100, n)],
             0.01,
-            &CalibrationConfig {
-                min_samples: 5,
-                ..Default::default()
-            },
+            &CalibrationConfig::default(),
         );
         assert!(!cal.prior.converged, "empty histogram → non-converged");
         assert_eq!(cal.prior.prior_probability, DEFAULT_FALLBACK_PARALOG_PRIOR);
     }
 
-    /// `score_spilled_locus` returns `None` for a locus below `min_samples`
-    /// (kept, never flagged) and for a non-SNP locus.
+    /// `score_spilled_locus` returns `None` only when there is nothing to score —
+    /// a non-SNP locus or a locus with no usable samples — never on a
+    /// sample-count threshold. A low-n locus with real coverage is still scored
+    /// (the LR self-gates in place of the old `min_samples` gate).
     #[test]
     fn unscored_loci_are_none() {
         let n = 4;
@@ -481,15 +471,15 @@ mod tests {
         let sigma0 = prepass.single_copy_depth_sd();
         let mut buf = Vec::new();
 
-        // Too few usable samples (require 100, only 4 exist).
+        // No usable sample (every window depth is `None`) → nothing to fold.
+        let no_depth = snp_window(1, n, 0.5, &|_| None);
         assert!(
             score_fixture(
                 &normal_locus(1, n),
-                &normal_window(1, n),
+                &no_depth,
                 &prepass,
                 &inbreeding,
                 &sigma0,
-                100,
                 &mut buf
             )
             .is_none()
@@ -504,10 +494,22 @@ mod tests {
                 &prepass,
                 &inbreeding,
                 &sigma0,
-                1,
                 &mut buf
             )
             .is_none()
+        );
+        // A tiny cohort (n=4) is still scored — no count gate.
+        assert!(
+            score_fixture(
+                &normal_locus(1, n),
+                &normal_window(1, n),
+                &prepass,
+                &inbreeding,
+                &sigma0,
+                &mut buf
+            )
+            .is_some(),
+            "a low-n locus is scored; the LR self-gates instead of a count gate"
         );
     }
 
@@ -536,7 +538,6 @@ mod tests {
             &inbreeding,
             &sigma0,
             &precompute,
-            5,
             &mut buf,
         )
         .unwrap();
@@ -559,10 +560,7 @@ mod tests {
             &records,
             &windows,
             0.5,
-            &CalibrationConfig {
-                min_samples: 5,
-                ..Default::default()
-            },
+            &CalibrationConfig::default(),
         );
         assert!(!cal.flags(f64::NAN));
         assert!(!cal.flags(f64::INFINITY));
@@ -585,10 +583,7 @@ mod tests {
             records.push(paralog_locus(5000 + i, n));
             windows.push(paralog_window(5000 + i, n));
         }
-        let cfg = CalibrationConfig {
-            min_samples: 5,
-            ..Default::default()
-        };
+        let cfg = CalibrationConfig::default();
 
         let cal_strict = run_calibrate(&prepass, 0.02, &records, &windows, 0.01, &cfg);
         let cal_loose = run_calibrate(&prepass, 0.02, &records, &windows, 0.5, &cfg);
