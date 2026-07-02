@@ -109,19 +109,39 @@ impl<W: Write> WindowSpillBuilder<W> {
         }
     }
 
-    /// Flush every window that is now closed for the whole cohort — tile
-    /// `< min(open tile across samples)`. Call after each chunk's positions are
-    /// fed.
-    pub(crate) fn flush_ready(&mut self) -> Result<(), SpillError> {
-        let min_open_tile = self
-            .accumulators
-            .iter()
-            .filter_map(|a| a.current_key().map(|k| k.1))
-            .min();
-        if let Some(limit) = min_open_tile {
-            self.flush_below(limit)?;
+    /// Flush every window now closed for the whole cohort — those with tile
+    /// strictly below the tile of `fed_up_to`, the **exclusive** upper bound of
+    /// the positions fed so far (the chunk's `cut`). Every sample was fed the
+    /// same `[chunk_start, cut)` span and every later chunk feeds positions
+    /// `>= cut`, so no future position can land in a tile below
+    /// `tile_of(fed_up_to)` — those windows are final regardless of whether a
+    /// given (lagging or gapped) sample happened to cover them.
+    ///
+    /// Using the **cohort-fed frontier** (not each sample's last-observed open
+    /// tile) is what keeps `pending` bounded near the frontier: a sample with a
+    /// long coverage gap would otherwise pin the flush point at its stale open
+    /// tile and let `pending` grow to `O(contig tiles × samples)` (S6c review).
+    /// Call after each chunk's positions are fed.
+    ///
+    /// A sample whose open window lies **below** the frontier is final (it will
+    /// get no more positions there), but its mean is still sitting in the
+    /// accumulator, not in `pending`. Force-close those first, else flushing the
+    /// window would drop that sample's depth (write `None` for a sample that did
+    /// cover the tile).
+    pub(crate) fn flush_ready(&mut self, fed_up_to: u32) -> Result<(), SpillError> {
+        let frontier_tile = fed_up_to.saturating_sub(1) / self.window_bp;
+        let n_samples = self.n_samples;
+        for (sample_idx, acc) in self.accumulators.iter_mut().enumerate() {
+            if acc.current_key().is_some_and(|(_, tile)| tile < frontier_tile)
+                && let Some(window) = acc.finish()
+            {
+                self.pending
+                    .entry(window.key.1)
+                    .or_insert_with(|| vec![None; n_samples])[sample_idx] =
+                    Some(window.mean_depth);
+            }
         }
-        Ok(())
+        self.flush_below(frontier_tile)
     }
 
     /// Write + evict every pending variant window with tile `< limit`
@@ -224,7 +244,9 @@ mod tests {
         }
         // Variants in windows 0 and 2 only (tiles 0 and 2).
         b.mark_variant_positions(&[3, 22]);
-        b.flush_ready().unwrap();
+        // Fed up to pos 22 (chunk cut 23 → frontier tile 2): windows 0 and 1
+        // are below the frontier and flush; window 2 stays open until finish.
+        b.flush_ready(23).unwrap();
         let bytes = b.finish().unwrap().into_inner();
 
         let mut reader = WindowSpillReader::new(Cursor::new(bytes));
@@ -259,13 +281,19 @@ mod tests {
         b.observe(0, 2, 15);
         b.observe(1, 11, 30);
         b.mark_variant_positions(&[1]); // variant in window 0
-        b.flush_ready().unwrap();
+        // Fed up to pos 11 (cut 12 → frontier tile 1): sample 0's window-0 stays
+        // open (it never crossed a boundary) but is below the frontier, so it is
+        // force-closed and its depth captured — the S6c-review regression: a
+        // lagging sample's contribution must not be lost when the cohort
+        // frontier advances past its open window.
+        b.flush_ready(12).unwrap();
         let bytes = b.finish().unwrap().into_inner();
         let mut reader = WindowSpillReader::new(Cursor::new(bytes));
         let recs: Vec<WindowSpillRecord> = std::iter::from_fn(|| reader.next_record())
             .map(|r| r.unwrap())
             .collect();
-        // Window 0: sample 0 present (15), sample 1 absent (None).
+        // Window 0: sample 0 present (15), sample 1 absent (None) — written by
+        // flush_ready (not finish), proving the force-close captured sample 0.
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].tile, 0);
         assert_eq!(recs[0].depths, vec![Some(15.0), None]);
@@ -288,11 +316,11 @@ mod tests {
         b.observe(0, 1, 10);
         b.observe(0, 2, 20);
         b.mark_variant_positions(&[1]);
-        b.flush_ready().unwrap(); // window 0 still open (no pos past it yet)
+        b.flush_ready(3).unwrap(); // cut 3 → frontier tile 0: window 0 still open
         // Interval 2 of chrom 0 (a second begin_interval, SAME chrom → no reset):
         b.begin_interval(0, gc_all(window_bp, 2, 1.0)).unwrap();
         b.observe(0, 50, 30); // still window 0
-        b.flush_ready().unwrap();
+        b.flush_ready(51).unwrap(); // cut 51 → frontier tile 0: still open
         let bytes = b.finish().unwrap().into_inner();
         let mut reader = WindowSpillReader::new(Cursor::new(bytes));
         let recs: Vec<WindowSpillRecord> = std::iter::from_fn(|| reader.next_record())

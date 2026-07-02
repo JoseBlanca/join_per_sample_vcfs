@@ -33,34 +33,20 @@ use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::per_group_merger::{CompoundConstituent, MergedAllele};
 use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 
-/// One locus on the spill: the full caller output plus the analysis-window
-/// coverage used to score it.
+/// One locus on the **record spill**: the full caller output, carried verbatim.
 ///
-/// The [`PosteriorRecord`] is stored verbatim so the write pass (S5) can
-/// reconstruct it exactly and emit byte-identical VCF. The window coverage is
-/// the extra ingredient the paralog score needs beyond the record, split into
-/// its two natural halves (settled 2026-07-01):
-///
-/// - `window_gc` — the analysis window's **GC fraction**, a property of the
-///   *reference* over the window and therefore **shared by all samples** at
-///   this locus (computed once from the reference, not per sample).
-/// - `window_mean_depth` — the **per-sample** mean read depth over the window,
-///   which is what actually carries the collapsed-paralog coverage signal.
-///
-/// The scorer forms each sample's relative copy number as
-/// `window_mean_depth[s] / expected_single_copy_depth(window_gc)` against that
-/// sample's fitted coverage model.
+/// The [`PosteriorRecord`] is stored in full so the write pass (S5) can
+/// reconstruct it exactly and emit byte-identical VCF. The paralog score's
+/// extra ingredient — the analysis window's GC + each sample's window mean depth
+/// — is **not** here: it lives in the sibling [`WindowSpillRecord`] (Approach A,
+/// S6c), written in coordinate order by the producer and joined to each locus by
+/// tile key. Keeping the per-sample window vectors out of the (per-locus,
+/// all-samples) record spill is what keeps the record spill's per-locus payload
+/// from carrying a second per-sample vector.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParalogSpillRecord {
     /// The caller's emitted record for this locus, carried in full.
     pub record: PosteriorRecord,
-    /// The analysis window's GC fraction at this locus — one shared value (a
-    /// reference property; see the type doc).
-    pub window_gc: f32,
-    /// Per cohort sample (length `record.n_samples`): the sample's
-    /// analysis-window mean depth, or `None` if the sample had no covered
-    /// window spanning this locus.
-    pub window_mean_depth: Vec<Option<f32>>,
 }
 
 /// One analysis window on the **window spill** (Approach A, S6c): the window's
@@ -318,6 +304,74 @@ impl<R: Read> WindowSpillReader<R> {
     }
 }
 
+/// Streams the window spill in lockstep with a coordinate-ordered locus stream,
+/// yielding each locus its window by tile key (the S6c join).
+///
+/// Both spills ascend by `(chrom_id, tile)`: the record spill is genomic-ordered
+/// (many loci may share one window) and the window spill is one record per
+/// variant window in tile order. So the join is a forward merge — hold the
+/// current window, advance past any window that sorts before the locus, and
+/// hand the same window to every locus that lands in it. A locus whose tile has
+/// no window record (e.g. a coordinate the producer never marked variant) gets
+/// `None` — the scorer then leaves it unscored (kept), never flagged.
+#[allow(dead_code)] // consumed by the S6c pipeline join
+pub(crate) struct WindowJoin<R: Read> {
+    reader: WindowSpillReader<R>,
+    /// The window at or ahead of the last requested key; `None` past end.
+    current: Option<WindowSpillRecord>,
+    /// The last key requested, to debug-assert the monotone-input invariant the
+    /// forward-only advance relies on.
+    last_key: Option<(u32, u32)>,
+}
+
+#[allow(dead_code)] // consumed by the S6c pipeline join
+impl<R: Read> WindowJoin<R> {
+    /// Wrap a window-spill reader, priming the first window.
+    pub(crate) fn new(mut reader: WindowSpillReader<R>) -> Result<Self, SpillError> {
+        let current = reader.next_record().transpose()?;
+        Ok(Self {
+            reader,
+            current,
+            last_key: None,
+        })
+    }
+
+    /// The window matching `(chrom_id, tile)`, or `None` if the spill holds none
+    /// for it. Advances past windows sorting strictly before the key; never
+    /// rewinds (the locus stream is monotone non-decreasing in the key), so a
+    /// matched window can be returned to several loci in the same tile before the
+    /// stream moves on.
+    ///
+    /// The monotone-input invariant is **load-bearing**: a key behind `current`
+    /// would silently return `None` (leaving a real paralog unscored/kept), so
+    /// it is debug-asserted, matching the sibling invariants on the record-spill
+    /// order (`SpillSink::accept`) and the accumulator's `observe`.
+    pub(crate) fn window_for(
+        &mut self,
+        chrom_id: u32,
+        tile: u32,
+    ) -> Result<Option<&WindowSpillRecord>, SpillError> {
+        let key = (chrom_id, tile);
+        debug_assert!(
+            self.last_key.is_none_or(|prev| key >= prev),
+            "WindowJoin key out of order: {key:?} after {:?}",
+            self.last_key,
+        );
+        self.last_key = Some(key);
+        while self
+            .current
+            .as_ref()
+            .is_some_and(|w| (w.chrom_id, w.tile) < key)
+        {
+            self.current = self.reader.next_record().transpose()?;
+        }
+        Ok(self
+            .current
+            .as_ref()
+            .filter(|w| (w.chrom_id, w.tile) == key))
+    }
+}
+
 /// Encode a window record: `chrom_id`, `tile`, `gc`, then the per-sample
 /// `Option<f32>` depth vector (tag byte + `f32`).
 fn encode_window(record: &WindowSpillRecord, out: &mut Vec<u8>) {
@@ -543,18 +597,6 @@ fn encode_record(spill: &ParalogSpillRecord, out: &mut Vec<u8>) {
     put_u32(out, r.diagnostics.iterations);
     put_f64(out, r.diagnostics.final_max_delta_p);
     put_bool(out, r.diagnostics.converged);
-    // window_gc (shared) + window_mean_depth (per-sample Option<f32>)
-    put_f32(out, spill.window_gc);
-    put_len(out, spill.window_mean_depth.len());
-    for w in &spill.window_mean_depth {
-        match w {
-            Some(depth) => {
-                put_bool(out, true);
-                put_f32(out, *depth);
-            }
-            None => put_bool(out, false),
-        }
-    }
 }
 
 /// A forward cursor over a record's bytes with range-checked reads.
@@ -708,17 +750,6 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
         converged: d.bool("diagnostics.converged")?,
     };
 
-    let window_gc = d.f32("window_gc")?;
-    let n_win = d.len("window_mean_depth.len")?;
-    let mut window_mean_depth = Vec::with_capacity(n_win);
-    for _ in 0..n_win {
-        window_mean_depth.push(if d.bool("window_mean_depth.tag")? {
-            Some(d.f32("window_mean_depth.depth")?)
-        } else {
-            None
-        });
-    }
-
     Ok(ParalogSpillRecord {
         record: PosteriorRecord {
             locus,
@@ -737,8 +768,6 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
             chain_anchor_flags,
             diagnostics,
         },
-        window_gc,
-        window_mean_depth,
     })
 }
 
@@ -795,8 +824,8 @@ mod tests {
     }
 
     /// A representative biallelic-SNP spill record for a 2-sample cohort, with
-    /// non-trivial values in every field (incl. `qual_phred = +inf`, a `None`
-    /// window, a compound allele) so the round-trip exercises all branches.
+    /// non-trivial values in every field (incl. `qual_phred = +inf`, a compound
+    /// allele) so the round-trip exercises all branches.
     fn spill_record(pos: u32) -> ParalogSpillRecord {
         ParalogSpillRecord {
             record: PosteriorRecord {
@@ -829,8 +858,6 @@ mod tests {
                     converged: true,
                 },
             },
-            window_gc: 0.41,
-            window_mean_depth: vec![Some(18.3), None],
         }
     }
 
@@ -1048,16 +1075,6 @@ mod tests {
                         converged: seed % 2 == 0,
                     },
                 },
-                window_gc: f(700) as f32,
-                window_mean_depth: (0..n_samples)
-                    .map(|s| {
-                        if s % 2 == 0 {
-                            Some((f(s as u64 + 800) * 50.0) as f32)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
             };
             let mut buf = Vec::new();
             encode_record(&rec, &mut buf);

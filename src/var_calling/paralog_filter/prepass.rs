@@ -54,6 +54,12 @@ pub(crate) struct ParalogSampleModel {
 pub(crate) struct ParalogPrePass {
     /// Per cohort sample, in column order; `None` = absent / rejected.
     samples: Vec<Option<ParalogSampleModel>>,
+    /// The analysis/GC window width the coverage histograms were tiled at (the
+    /// `pileup --gc-window-bp`, `500` by default). The window-depth accumulator
+    /// (S6c) must tile at the **same** width so a locus's window mean depth is
+    /// on the scale the coverage model was fit on. Taken from the first present
+    /// summary (all cohort samples share one pileup window).
+    window_bp: u32,
 }
 
 impl ParalogPrePass {
@@ -78,7 +84,23 @@ impl ParalogPrePass {
                 })
             })
             .collect();
-        Self { samples }
+        // The window is a pileup property shared by the cohort, so read it from
+        // the first present summary (even a fit-rejected one carries it);
+        // default to the pileup default if no summary is present at all.
+        let window_bp = summaries
+            .iter()
+            .flatten()
+            .map(|s| s.coverage_by_gc.window_bp)
+            .next()
+            .unwrap_or(crate::sample_summary::DEFAULT_GC_WINDOW_BP)
+            .max(1);
+        Self { samples, window_bp }
+    }
+
+    /// The analysis/GC window width (bp) the coverage histograms were tiled at
+    /// — the width the window-depth accumulator (S6c) must reuse.
+    pub(crate) fn window_bp(&self) -> u32 {
+        self.window_bp
     }
 
     /// The per-sample fitted state, in cohort column order (`None` = absent).

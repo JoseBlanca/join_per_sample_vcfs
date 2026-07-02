@@ -17,7 +17,14 @@ use crate::var_calling::per_group_merger::MergedAllele;
 use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 
 use super::prepass::ParalogPrePass;
-use super::spill::{ParalogSpillRecord, ParalogSpillWriter};
+use super::spill::{
+    ParalogSpillRecord, ParalogSpillWriter, WindowSpillRecord, WindowSpillWriter,
+};
+
+/// Window bp the wiring tests join on. `1` makes every locus its own window tile
+/// (`tile = pos − 1`), so the record-spill ↔ window-spill join is 1:1 and a
+/// fixture need not share one window's depth across several loci.
+pub(crate) const TEST_WINDOW_BP: u32 = 1;
 
 /// A single-copy coverage histogram (scale ≈ 20) every synthetic sample shares,
 /// so `relative_copy_number(gc, depth) ≈ depth / 20`.
@@ -80,21 +87,20 @@ pub(crate) fn allele(seq: &[u8]) -> MergedAllele {
     }
 }
 
-/// A biallelic-SNP spill record for `n_samples`, each sample given a window mean
-/// depth and an `(ref_obs, alt_obs)` AD by the `per_sample` closure.
-pub(crate) fn snp_spill(
+/// A biallelic-SNP **record-spill** record for `n_samples`, each sample given an
+/// `(ref_obs, alt_obs)` AD by `per_sample`. The paralog score's coverage input
+/// (window GC + per-sample depth) lives in the sibling [`WindowSpillRecord`]
+/// built by [`snp_window`], joined by tile key.
+pub(crate) fn snp_record(
     pos: u32,
     n_samples: usize,
-    gc: f32,
-    per_sample: &dyn Fn(usize) -> (f32, u32, u32),
+    per_sample: &dyn Fn(usize) -> (u32, u32),
 ) -> ParalogSpillRecord {
     let mut scalars = Vec::with_capacity(n_samples * 2);
-    let mut window_mean_depth = Vec::with_capacity(n_samples);
     for s in 0..n_samples {
-        let (depth, ref_obs, alt_obs) = per_sample(s);
+        let (ref_obs, alt_obs) = per_sample(s);
         scalars.push(support(ref_obs));
         scalars.push(support(alt_obs));
-        window_mean_depth.push(Some(depth));
     }
     ParalogSpillRecord {
         record: PosteriorRecord {
@@ -122,27 +128,65 @@ pub(crate) fn snp_spill(
                 converged: true,
             },
         },
-        window_gc: gc,
-        window_mean_depth,
     }
 }
 
-/// A "normal" locus: every sample at ~1× coverage with a clean het — a real
-/// single-copy variant, LR should be `< 0`.
+/// The **window-spill** record for a locus at `pos` (chrom 0): tile `pos − 1`
+/// (`TEST_WINDOW_BP = 1`), shared GC `gc`, and each sample's window mean depth
+/// from `depth`.
+pub(crate) fn snp_window(
+    pos: u32,
+    n_samples: usize,
+    gc: f32,
+    depth: &dyn Fn(usize) -> Option<f32>,
+) -> WindowSpillRecord {
+    WindowSpillRecord {
+        chrom_id: 0,
+        tile: pos.saturating_sub(1) / TEST_WINDOW_BP,
+        gc,
+        depths: (0..n_samples).map(depth).collect(),
+    }
+}
+
+/// A "normal" locus record: every sample a clean het (AD 10/10) — a real
+/// single-copy variant. Paired with [`normal_window`] (1× coverage), its LR is
+/// `< 0`.
 pub(crate) fn normal_locus(pos: u32, n: usize) -> ParalogSpillRecord {
-    snp_spill(pos, n, 0.5, &|_| (20.0, 10, 10))
+    snp_record(pos, n, &|_| (10, 10))
 }
 
-/// A "paralog-like" locus: every sample at ~2× coverage with a skewed VAF (~1/3,
-/// a collapsed-paralog PSV), LR should be `> 0`.
+/// The window for a [`normal_locus`]: every sample at ~1× coverage (depth 20 vs
+/// the single-copy scale ≈ 20), GC 0.5.
+pub(crate) fn normal_window(pos: u32, n: usize) -> WindowSpillRecord {
+    snp_window(pos, n, 0.5, &|_| Some(20.0))
+}
+
+/// A "paralog-like" locus record: every sample a skewed VAF (~1/3, a
+/// collapsed-paralog PSV; AD 20/10). Paired with [`paralog_window`] (2×
+/// coverage), its LR is `> 0`.
 pub(crate) fn paralog_locus(pos: u32, n: usize) -> ParalogSpillRecord {
-    snp_spill(pos, n, 0.5, &|_| (40.0, 20, 10))
+    snp_record(pos, n, &|_| (20, 10))
 }
 
-/// Serialise records to spill bytes.
+/// The window for a [`paralog_locus`]: every sample at ~2× coverage (depth 40),
+/// GC 0.5.
+pub(crate) fn paralog_window(pos: u32, n: usize) -> WindowSpillRecord {
+    snp_window(pos, n, 0.5, &|_| Some(40.0))
+}
+
+/// Serialise record-spill records to bytes.
 pub(crate) fn write_spill(records: &[ParalogSpillRecord]) -> Vec<u8> {
     let mut w = ParalogSpillWriter::new(std::io::Cursor::new(Vec::new()));
     for r in records {
+        w.append(r).unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+/// Serialise window-spill records to bytes (tile-ordered by the caller).
+pub(crate) fn write_window_spill(windows: &[WindowSpillRecord]) -> Vec<u8> {
+    let mut w = WindowSpillWriter::new(std::io::Cursor::new(Vec::new()));
+    for r in windows {
         w.append(r).unwrap();
     }
     w.finish().unwrap().into_inner()
