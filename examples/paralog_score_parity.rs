@@ -38,7 +38,8 @@ use noodles_vcf::variant::record_buf::samples::sample::value::Array;
 use pop_var_caller::paralog::coverage_model::CoverageFitConfig;
 use pop_var_caller::paralog::{
     EmConfig, LocusObservations, ParalogFdrCurve, ParalogLrHistogram, ParalogModelParams,
-    ParalogPrior, SampleObservation, SingleCopyCoverageModel, inbreeding_coefficient, obs_het,
+    ParalogPrior, ParalogScorePrecompute, SampleObservation, SingleCopyCoverageModel,
+    inbreeding_coefficient, obs_het,
     score_locus_for_paralogy,
 };
 use pop_var_caller::psp::PspReader;
@@ -221,6 +222,14 @@ fn main() {
                 .unwrap_or(1.0)
         })
         .collect();
+    // Per-sample F, parallel to the cohort columns (0.0 for an absent sample —
+    // inert, since an absent sample contributes no observation). The scorer's
+    // log-prior tables are memoised once from (params, F) via the precompute.
+    let inbreeding_by_sample: Vec<f64> = states
+        .iter()
+        .map(|s| s.as_ref().map(|s| s.inbreeding).unwrap_or(0.0))
+        .collect();
+    let precompute = ParalogScorePrecompute::new(&params, &inbreeding_by_sample);
 
     let mut histogram = ParalogLrHistogram::with_defaults();
     let mut per_locus: Vec<(String, u32, f64)> = Vec::new();
@@ -252,7 +261,7 @@ fn main() {
             let score = score_locus_for_paralogy(
                 &LocusObservations { samples: &obs_buf },
                 &sigma0_by_sample,
-                &params,
+                &precompute,
             );
             let lr = score.paralog_log_likelihood_ratio;
             histogram.push(lr);
