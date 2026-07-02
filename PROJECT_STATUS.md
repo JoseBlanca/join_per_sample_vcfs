@@ -19,6 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — Milestone T (T1 behaviour + T2 cost gate) on tomato2 → T1 PASS, T2 memory-flat but wall +11.6× (owner decision pending)**
+>   (branch `tomato2-paralog-filter`). Ran the production two-pass filter on the 59-sample tomato2
+>   cohort (regenerated `.psp` with the stored summary section — the committed fixtures predate it,
+>   which silently no-op'd the filter: **footgun** — recommend a loud warn/error when few samples
+>   fit). **T1 PASS:** 58/59 fit, **π = 0.099** (R1 ≈0.09, EM converged), 6.98 % dropped; dropped set =
+>   **coverage excess (1.27×) + het excess (0.124 vs 0.045)** = the R1 paralog signature; AF is not the
+>   discriminator; introgression-like (normal-coverage) loci survive. **T2:** peak RSS **flat**
+>   (336→363 MB, +8 %, independent of 376 k loci — the memory obligation holds) but **wall +11.6×**
+>   (23→272 s) from the per-locus H1/H2 scorer running over 376 k loci × 58 samples **twice**,
+>   **single-threaded** (calibrate + write passes); spill 3.5 GB on disk (record spill, verbatim
+>   `PosteriorRecord`). **Owner decision (T2 gate):** parallelise the two scoring passes / spill the
+>   LR once / or ship off-by-default — memory is fine, cost is an optimisation problem not a design
+>   flaw. Report: [paralog_t1_t2_2026-07-02.md](doc/devel/reports/implementations/paralog_t1_t2_2026-07-02.md).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — Milestone S COMPLETE: var-calling wiring (S6c part 2) → the two-pass filter runs end-to-end and is ON by default (S6 checkpoint)**
 >   (branch `tomato2-paralog-filter`). Approach A landed: the producer writes a second ephemeral
 >   **window spill** ((chrom_id, tile, gc, [per-sample depths]) per variant window) alongside the
