@@ -683,6 +683,63 @@ mod tests {
         assert_eq!(model.window_bp(), 500);
     }
 
+    /// The fit is invariant to the histogram's **count scale**. The sliding
+    /// window (M3) folds one sample per *covered position* rather than per
+    /// *tile* — ~`window_bp`× more counts of the same shape (and correlated
+    /// between neighbours). Because the fit reads only the density (the
+    /// arg-max depth mode and the weighted-MAD σ₀), a `W`×-denser histogram of
+    /// the same shape produces the identical `single_copy_scale` and σ₀. This
+    /// is why the sliding-window switch needs no fit-code change: the absolute
+    /// σ₀ shrinks only because the *distribution* is smoother, not because the
+    /// denser counts bias the estimator.
+    #[test]
+    fn fit_is_invariant_to_count_scale() {
+        // A single-copy peak at depth-bin 10 with a symmetric spread, in two GC
+        // bins so the GC curve has anchors.
+        // Counts high enough per GC bin (sum 100 > min_bin_count) that even the
+        // "tile scale" is a valid fit; the shape is what matters.
+        let shape = [
+            (0.25, 8.5, 10u32),
+            (0.25, 9.5, 20),
+            (0.25, 10.5, 40),
+            (0.25, 11.5, 20),
+            (0.25, 12.5, 10),
+            (0.75, 8.5, 10),
+            (0.75, 9.5, 20),
+            (0.75, 10.5, 40),
+            (0.75, 11.5, 20),
+            (0.75, 12.5, 10),
+        ];
+        // "Tile scale" vs "position scale": the same shape, 500× more counts.
+        let dense: Vec<(f64, f64, u32)> =
+            shape.iter().map(|&(gc, d, c)| (gc, d, c * 500)).collect();
+        let cfg = CoverageFitConfig::default(); // MAD fit, no σ₀ override.
+
+        let sparse =
+            SingleCopyCoverageModel::fit(&hist(2, 40, 1.0, 500, &shape), &cfg).expect("sparse fit");
+        let denser =
+            SingleCopyCoverageModel::fit(&hist(2, 40, 1.0, 500, &dense), &cfg).expect("dense fit");
+
+        assert!(
+            approx(sparse.single_copy_scale(), denser.single_copy_scale(), 1e-9),
+            "mode invariant to count scale: {} vs {}",
+            sparse.single_copy_scale(),
+            denser.single_copy_scale(),
+        );
+        assert!(
+            approx(
+                sparse.single_copy_depth_sd(),
+                denser.single_copy_depth_sd(),
+                1e-9
+            ),
+            "σ₀ invariant to count scale: {} vs {}",
+            sparse.single_copy_depth_sd(),
+            denser.single_copy_depth_sd(),
+        );
+        // The MAD fit produced a real, positive σ₀ (not the override path).
+        assert!(sparse.single_copy_depth_sd() > 0.0);
+    }
+
     /// A GC-dependent single-copy shift (low-GC windows read low, high-GC
     /// high) is absorbed by `gc_bias_curve`: both extremes normalise to one
     /// copy, and the expected single-copy depth rises with GC.
