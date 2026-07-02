@@ -19,6 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — hard-error on missing `.psp` summary + fix perf-work example breakage**
+>   (branch `tomato2-paralog-filter`). Closed the on-by-default footgun: `require_paralog_summaries`
+>   now **fails loud** (`PipelineError::ParalogSummaryMissing`, names the first sample, points at
+>   `--no-paralog-filter`) when the filter is on but a `.psp` carries no parseable coverage summary —
+>   no more silent unfiltered callset on pre-summary `.psp`. A summary that parses but fails the
+>   coverage fit (degenerate sample) is still carried absent, not fatal. Unit tests for the guard;
+>   `thread_budget_integration` now passes `--no-paralog-filter` (synthetic summary-less `.psp`). Also
+>   fixed the L1-memoization commit's missed propagation to `examples/paralog_score_parity.rs`
+>   (`score_locus_for_paralogy` now takes `&ParalogScorePrecompute`) so `--all-targets` builds. Full
+>   suite green, clippy clean. **Open (owner):** the T2 wall cost (perf review ranked H1 parallelise
+>   /L1 done/S1 spill-LR) and the **single-individual graceful-degradation reformulation** (drop
+>   `min_samples` + the pop-gen `Hexp`/`F` term → per-individual obs-het excess coupled to coverage;
+>   π stays as the only global, across-loci quantity).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — freebayes comparison (GIAB safety + tomato2 FP-class)**
 >   (branch `tomato2-paralog-filter`). **GIAB:** the cohort filter is a structural no-op on the
 >   single-sample GIAB benchmark (0 loci scored → 0 dropped; on==off byte-identical across HG002/3/4
