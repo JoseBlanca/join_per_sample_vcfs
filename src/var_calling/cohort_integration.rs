@@ -442,6 +442,61 @@ pub(crate) struct ChunkPlan {
     per_sample_segments: Vec<Vec<Arc<TwoPhaseSegment>>>,
 }
 
+/// Read-only accessors for the paralog window-spill builder (S6c). The builder
+/// runs in the fold/plan stage, after `plan_chunk` returns a plan and *before*
+/// it is sent to compaction, so it reads the plan's light data without touching
+/// the fold or the compaction path (byte-identity of the caller output holds).
+impl ChunkPlan {
+    /// The chromosome this chunk is on.
+    #[allow(dead_code)] // consumed by the S6c pipeline join
+    pub(crate) fn chrom_id(&self) -> u32 {
+        self.chrom_id
+    }
+
+    /// The chunk's half-open span lower bound (its first spanned position).
+    #[allow(dead_code)] // consumed by the S6c pipeline join
+    pub(crate) fn chunk_start(&self) -> u32 {
+        self.chunk_start
+    }
+
+    /// The chunk's half-open span upper bound (the safe-gap cut, exclusive).
+    #[allow(dead_code)] // consumed by the S6c pipeline join
+    pub(crate) fn cut(&self) -> u32 {
+        self.cut
+    }
+
+    /// This chunk's variant positions — `kept_all ∩ [chunk_start, cut)`, in
+    /// ascending order. Clamped to the chunk span so a straddling fold's future
+    /// positions (also in `kept_all`) are not double-counted across consecutive
+    /// plans; each variant position is visited by exactly one plan.
+    #[allow(dead_code)] // consumed by the S6c pipeline join
+    pub(crate) fn chunk_variant_positions(&self) -> impl Iterator<Item = u32> + '_ {
+        let (start, cut) = (self.chunk_start, self.cut);
+        self.kept_all
+            .iter()
+            .copied()
+            .filter(move |&p| p >= start && p < cut)
+    }
+
+    /// Visit every covered position in `[chunk_start, cut)` for each sample, in
+    /// ascending `(sample, position)` order, with its total depth (`ref_obs + Σ
+    /// non-REF obs`, [`TwoPhaseSegment::depth_at`]). This is the window
+    /// accumulator's per-position feed: the clamp matches `compact_plan`'s row
+    /// filter, so a straddling segment's positions belong to exactly one chunk.
+    #[allow(dead_code)] // consumed by the S6c pipeline join
+    pub(crate) fn for_each_window_observation(&self, mut f: impl FnMut(usize, u32, u32)) {
+        for (sample_idx, segs) in self.per_sample_segments.iter().enumerate() {
+            for seg in segs {
+                for (i, &pos) in seg.positions().iter().enumerate() {
+                    if pos >= self.chunk_start && pos < self.cut {
+                        f(sample_idx, pos, seg.depth_at(i));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Compact stage: inflate each plan'd segment's heavy columns for its variable
 /// rows in `[chunk_start, cut)` and assemble the cohort chunk. Stateless and
 /// `self`-free, so it runs on a separate stage thread (still fanning out across
