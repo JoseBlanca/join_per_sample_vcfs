@@ -229,12 +229,12 @@ mod tests {
     /// samples share one pileup window), defaulting when none is present.
     #[test]
     fn window_bp_from_first_present_summary() {
-        let with = ParalogPrePass::fit(
-            &[None, Some(summary(1000))],
-            &CoverageFitConfig::default(),
-        );
+        let with = ParalogPrePass::fit(&[None, Some(summary(1000))], &CoverageFitConfig::default());
         assert_eq!(with.window_bp(), 500);
         let without = ParalogPrePass::fit(&[None], &CoverageFitConfig::default());
-        assert_eq!(without.window_bp(), crate::sample_summary::DEFAULT_GC_WINDOW_BP);
+        assert_eq!(
+            without.window_bp(),
+            crate::sample_summary::DEFAULT_GC_WINDOW_BP
+        );
     }
 }

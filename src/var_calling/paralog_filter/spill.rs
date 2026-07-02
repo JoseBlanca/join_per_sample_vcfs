@@ -174,7 +174,6 @@ impl ParalogSpill {
             file,
         )))
     }
-
 }
 
 /// Streaming append-only writer over any sink. Encodes each record into one

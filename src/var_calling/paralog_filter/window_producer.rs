@@ -132,13 +132,14 @@ impl<W: Write> WindowSpillBuilder<W> {
         let frontier_tile = fed_up_to.saturating_sub(1) / self.window_bp;
         let n_samples = self.n_samples;
         for (sample_idx, acc) in self.accumulators.iter_mut().enumerate() {
-            if acc.current_key().is_some_and(|(_, tile)| tile < frontier_tile)
+            if acc
+                .current_key()
+                .is_some_and(|(_, tile)| tile < frontier_tile)
                 && let Some(window) = acc.finish()
             {
                 self.pending
                     .entry(window.key.1)
-                    .or_insert_with(|| vec![None; n_samples])[sample_idx] =
-                    Some(window.mean_depth);
+                    .or_insert_with(|| vec![None; n_samples])[sample_idx] = Some(window.mean_depth);
             }
         }
         self.flush_below(frontier_tile)

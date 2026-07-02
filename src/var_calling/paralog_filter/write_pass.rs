@@ -81,11 +81,18 @@ fn check_reference_consistency(
     let chrom_id = record.locus.chrom_id;
     if fetcher.as_ref().map(|(c, _)| *c) != Some(chrom_id) {
         let name = &chrom_names[chrom_id as usize];
-        *fetcher = Some((chrom_id, StreamingChromRefFetcher::for_contig(reference, name)?));
+        *fetcher = Some((
+            chrom_id,
+            StreamingChromRefFetcher::for_contig(reference, name)?,
+        ));
     }
     // UNREACHABLE: `fetcher` is `Some` on both branches above.
     let (_, f) = fetcher.as_ref().expect("fetcher just set for this contig");
-    let fasta_base = f.fetch(record.locus.start, 1)?.first().copied().unwrap_or(b'N');
+    let fasta_base = f
+        .fetch(record.locus.start, 1)?
+        .first()
+        .copied()
+        .unwrap_or(b'N');
     if !reference_base_matches(fasta_base, decoded) {
         return Err(WritePassError::ReferenceMismatch {
             chrom_id,
@@ -231,7 +238,11 @@ mod tests {
         // name\tlength\toffset\tline_bases\tline_width
         std::fs::write(
             &fai,
-            format!("chr1\t{len}\t{off}\t{len}\t{width}\n", off = header.len(), width = len + 1),
+            format!(
+                "chr1\t{len}\t{off}\t{len}\t{width}\n",
+                off = header.len(),
+                width = len + 1
+            ),
         )
         .unwrap();
         (dir, fasta)
@@ -361,9 +372,7 @@ mod tests {
         )
         .expect_err("mismatch must fail loud");
         match err {
-            WritePassError::ReferenceMismatch {
-                fasta, decoded, ..
-            } => {
+            WritePassError::ReferenceMismatch { fasta, decoded, .. } => {
                 assert_eq!(fasta, 'C');
                 assert_eq!(decoded, 'A');
             }

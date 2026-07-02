@@ -39,8 +39,7 @@ use pop_var_caller::paralog::coverage_model::CoverageFitConfig;
 use pop_var_caller::paralog::{
     EmConfig, LocusObservations, ParalogFdrCurve, ParalogLrHistogram, ParalogModelParams,
     ParalogPrior, ParalogScorePrecompute, SampleObservation, SingleCopyCoverageModel,
-    inbreeding_coefficient, obs_het,
-    score_locus_for_paralogy,
+    inbreeding_coefficient, obs_het, score_locus_for_paralogy,
 };
 use pop_var_caller::psp::PspReader;
 use pop_var_caller::sample_summary::coverage::{CoverageBinScheme, CoverageByGcAccumulator};

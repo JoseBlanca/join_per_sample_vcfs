@@ -91,7 +91,9 @@ pub(crate) fn window_coverage(
 ) -> LocusWindowCoverage {
     LocusWindowCoverage {
         gc: vec![gc; n_samples],
-        coverage: (0..n_samples).map(|s| depth(s).unwrap_or(f32::NAN)).collect(),
+        coverage: (0..n_samples)
+            .map(|s| depth(s).unwrap_or(f32::NAN))
+            .collect(),
     }
 }
 
@@ -145,14 +147,24 @@ pub(crate) fn snp_record(
 /// single-copy variant — carrying ~1× coverage (depth 20 vs the single-copy
 /// scale ≈ 20), GC 0.5. Its LR is `< 0`.
 pub(crate) fn normal_locus(pos: u32, n: usize) -> ParalogSpillRecord {
-    snp_record(pos, n, &|_| (10, 10), window_coverage(n, 0.5, &|_| Some(20.0)))
+    snp_record(
+        pos,
+        n,
+        &|_| (10, 10),
+        window_coverage(n, 0.5, &|_| Some(20.0)),
+    )
 }
 
 /// A "paralog-like" locus record: every sample a skewed VAF (~1/3, a
 /// collapsed-paralog PSV; AD 20/10) carrying ~2× coverage (depth 40), GC 0.5.
 /// Its LR is `> 0`.
 pub(crate) fn paralog_locus(pos: u32, n: usize) -> ParalogSpillRecord {
-    snp_record(pos, n, &|_| (20, 10), window_coverage(n, 0.5, &|_| Some(40.0)))
+    snp_record(
+        pos,
+        n,
+        &|_| (20, 10),
+        window_coverage(n, 0.5, &|_| Some(40.0)),
+    )
 }
 
 /// Serialise record-spill records to bytes.

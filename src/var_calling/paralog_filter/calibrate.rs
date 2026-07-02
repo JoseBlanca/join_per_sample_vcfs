@@ -406,7 +406,10 @@ mod tests {
             lr_paralog > lr_normal,
             "paralog LR {lr_paralog} > normal LR {lr_normal}"
         );
-        assert!(cal.flags(lr_paralog), "paralog-like locus should be flagged");
+        assert!(
+            cal.flags(lr_paralog),
+            "paralog-like locus should be flagged"
+        );
         assert!(!cal.flags(lr_normal), "normal locus should be kept");
     }
 
@@ -419,7 +422,13 @@ mod tests {
         // An indel record (REF "AT") — not a biallelic SNP, never scored.
         let mut indel = normal_locus(100, n);
         indel.record.alleles = vec![allele(b"AT"), allele(b"A")];
-        let cal = run_calibrate(&prepass, 0.02, &[indel], 0.01, &CalibrationConfig::default());
+        let cal = run_calibrate(
+            &prepass,
+            0.02,
+            &[indel],
+            0.01,
+            &CalibrationConfig::default(),
+        );
         assert!(!cal.prior.converged, "empty histogram → non-converged");
         assert_eq!(cal.prior.prior_probability, DEFAULT_FALLBACK_PARALOG_PRIOR);
     }
@@ -440,16 +449,21 @@ mod tests {
         // to fold.
         let mut no_depth = normal_locus(1, n);
         no_depth.window_coverage = window_coverage(n, 0.5, &|_| None);
-        assert!(
-            score_fixture(&no_depth, &prepass, &inbreeding, &sigma0, &mut buf).is_none()
-        );
+        assert!(score_fixture(&no_depth, &prepass, &inbreeding, &sigma0, &mut buf).is_none());
         // Not a biallelic SNP.
         let mut indel = normal_locus(1, n);
         indel.record.alleles = vec![allele(b"AT"), allele(b"A")];
         assert!(score_fixture(&indel, &prepass, &inbreeding, &sigma0, &mut buf).is_none());
         // A tiny cohort (n=4) is still scored — no count gate.
         assert!(
-            score_fixture(&normal_locus(1, n), &prepass, &inbreeding, &sigma0, &mut buf).is_some(),
+            score_fixture(
+                &normal_locus(1, n),
+                &prepass,
+                &inbreeding,
+                &sigma0,
+                &mut buf
+            )
+            .is_some(),
             "a low-n locus is scored; the LR self-gates instead of a count gate"
         );
     }
@@ -467,7 +481,8 @@ mod tests {
         let mut buf = Vec::new();
         let mut rec = paralog_locus(5000, n);
         rec.window_coverage = window_coverage(n, 0.5, &|_| None);
-        let scored = score_spill_record(&rec, &prepass, &inbreeding, &sigma0, &precompute, &mut buf);
+        let scored =
+            score_spill_record(&rec, &prepass, &inbreeding, &sigma0, &precompute, &mut buf);
         assert!(scored.is_none(), "no usable window coverage → unscored");
     }
 

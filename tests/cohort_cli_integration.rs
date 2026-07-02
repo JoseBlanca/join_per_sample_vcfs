@@ -259,8 +259,14 @@ fn var_calling_paralog_filter_two_pass_runs_and_cleans_up() {
 
     // Three samples; one carries a SNP at pos 11 so the write pass emits (and
     // reference-consistency-checks) at least one survivor.
-    let plain = vec![read_record("r1", 10, b"AAAAA"), read_record("r2", 15, b"AAAAA")];
-    let snp = vec![read_record("r1", 10, b"ACAAA"), read_record("r2", 15, b"AAAAA")];
+    let plain = vec![
+        read_record("r1", 10, b"AAAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let snp = vec![
+        read_record("r1", 10, b"ACAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
     let psp_a = make_psp_for_sample(dir.path(), &fasta, "NA00001", &plain);
     let psp_b = make_psp_keep_snps(dir.path(), &fasta, "NA00002", &snp);
     let psp_c = make_psp_for_sample(dir.path(), &fasta, "NA00003", &plain);
@@ -289,7 +295,10 @@ fn var_calling_paralog_filter_two_pass_runs_and_cleans_up() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with(".tmp"))
         .collect();
-    assert!(stray.is_empty(), "spill temp files not cleaned up: {stray:?}");
+    assert!(
+        stray.is_empty(),
+        "spill temp files not cleaned up: {stray:?}"
+    );
 }
 
 /// Variant POS values (column 2) of every non-header VCF record.
