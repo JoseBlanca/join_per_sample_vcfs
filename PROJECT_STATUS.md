@@ -19,6 +19,22 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — single-individual reformulation DESIGNED (spec + plan; supersedes Premise 3)**
+>   (branch `tomato2-paralog-filter`). Settled with the owner across a long design thread: make the
+>   score degrade gracefully from **one individual** up, with no cohort-wide allele-frequency
+>   quantity and no `min_samples` gate. Key resolution — the evidence separates by what it needs:
+>   **per-individual** coverage model (load-bearing, n=1-safe); **per-locus het expectation inferred**
+>   by H1's SFS-prior marginalisation (immune to the paralog self-masking because H1's coverage term
+>   is `Normal(1)` regardless of frequency, so a 2× locus is unexplainable — the coverage is the
+>   discriminator); **cohort-level, weak** `F` = the caller's single `--inbreeding-coefficient` (NOT a
+>   per-individual `Hexp`-derived value — that reduces to the divergence-contaminated `n_het/n_variant`
+>   ratio Premise 3 already measured as inverted); **across-loci** π unchanged. Three code changes
+>   (drop `min_samples` → LR self-gates; `F` = cohort coeff; **remove `Hexp` + accumulator + obs_het**
+>   → two-pass flow simplifies) + profile-based T1 re-validation (no truth set). Optional SFS-prior
+>   calibration + low-n soft-flag deferred. Docs:
+>   [hidden_paralog_single_sample_scoring.md](doc/devel/architecture/hidden_paralog_single_sample_scoring.md)
+>   + [paralog_single_sample_scoring.md](doc/devel/implementation_plans/paralog_single_sample_scoring.md).
+>   **Next:** implement Step A (drop gate) → Step B (F/Hexp) → Step C (re-validate).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — hard-error on missing `.psp` summary + fix perf-work example breakage**
 >   (branch `tomato2-paralog-filter`). Closed the on-by-default footgun: `require_paralog_summaries`
 >   now **fails loud** (`PipelineError::ParalogSummaryMissing`, names the first sample, points at
