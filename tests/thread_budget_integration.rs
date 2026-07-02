@@ -118,6 +118,9 @@ fn var_calling_thread_count_within_budget() {
         .arg("--threads")
         .arg(threads.to_string())
         .arg("--no-complexity-filter") // all-`A` ref would otherwise DUST-mask out
+        // Synthetic .psp carry no coverage summary and this test isn't about the
+        // paralog filter (just thread budget) — keep the single-pass path.
+        .arg("--no-paralog-filter")
         .args(&psp)
         .output()
         .expect("spawn var-calling binary");

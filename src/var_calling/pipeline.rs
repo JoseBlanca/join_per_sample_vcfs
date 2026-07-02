@@ -230,6 +230,20 @@ pub enum PipelineError {
     /// The paralog write pass (spill → surviving VCF) failed.
     #[error(transparent)]
     ParalogWrite(#[from] WritePassError),
+    /// The hidden-paralog filter was requested, but one or more `.psp` carry no
+    /// usable per-sample coverage summary in their metadata section — the filter
+    /// cannot score without it, so refuse rather than silently emit an
+    /// unfiltered callset (a summary-less `.psp` predates the summary feature).
+    #[error(
+        "the hidden-paralog filter needs the per-sample coverage summary in each .psp's metadata \
+         section, but {missing} of {total} .psp lack a usable one (first: {example}). Rebuild those \
+         .psp with a current `pileup` (which writes the summary), or pass --no-paralog-filter."
+    )]
+    ParalogSummaryMissing {
+        missing: usize,
+        total: usize,
+        example: String,
+    },
 }
 
 /// Cohort `.psp` → VCF entry point — the production pipeline the CLI's
@@ -334,6 +348,8 @@ pub fn run_var_calling(
                     .and_then(|bytes| SampleSummary::from_toml_bytes(bytes).ok())
             })
             .collect();
+        // Hard-fail if the required info is absent (see `require_paralog_summaries`).
+        require_paralog_summaries(&summaries, &sample_names)?;
         Some(ParalogPrePass::fit(
             &summaries,
             &crate::paralog::CoverageFitConfig::default(),
@@ -936,6 +952,35 @@ impl ChunkSink for SpillSink {
     }
 }
 
+/// Guard for the hidden-paralog filter: every `.psp` must carry a parseable
+/// per-sample coverage summary in its metadata section, or the filter can't score
+/// (a summary-less `.psp` predates the summary feature). Rather than silently
+/// emit an unfiltered callset, refuse — naming the first offending sample.
+///
+/// A summary that *parses* but whose coverage fit is later rejected (a
+/// degenerate/too-shallow sample) is a data-quality case, not missing info:
+/// [`ParalogPrePass::fit`] carries it absent, not fatal — so this guard only
+/// fires on `None` (metadata absent or unparseable), never on a fit rejection.
+fn require_paralog_summaries(
+    summaries: &[Option<SampleSummary>],
+    sample_names: &[String],
+) -> Result<(), PipelineError> {
+    let missing: Vec<usize> = summaries
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(&first) = missing.first() {
+        return Err(PipelineError::ParalogSummaryMissing {
+            missing: missing.len(),
+            total: summaries.len(),
+            example: sample_names.get(first).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(())
+}
+
 /// Build one contig's per-window reference GC for the paralog window join (S6c),
 /// by streaming its FASTA bases through a fresh [`StreamingChromRefFetcher`] —
 /// the same memory-flat serial walk the DUST mask uses (a ~1 MB sliding buffer,
@@ -1223,6 +1268,38 @@ mod tests {
             Err(PipelineError::ParalogSpillGap { count }) => assert_eq!(count, 1),
             other => panic!("expected ParalogSpillGap, got {other:?}"),
         }
+    }
+
+    /// The paralog filter refuses (hard error) when any `.psp` lacks a usable
+    /// coverage summary — silently emitting an unfiltered callset is worse.
+    #[test]
+    fn paralog_summary_guard_errors_on_missing() {
+        use crate::var_calling::paralog_filter::test_support::single_copy_summary;
+        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        // Sample B has a summary; A and C do not (metadata absent / unparseable).
+        let summaries = vec![None, Some(single_copy_summary()), None];
+        match require_paralog_summaries(&summaries, &names) {
+            Err(PipelineError::ParalogSummaryMissing {
+                missing,
+                total,
+                example,
+            }) => {
+                assert_eq!(missing, 2);
+                assert_eq!(total, 3);
+                assert_eq!(example, "A", "names the first offending sample");
+            }
+            other => panic!("expected ParalogSummaryMissing, got {other:?}"),
+        }
+    }
+
+    /// The guard passes when every sample carries a summary (a fit-rejected
+    /// sample is still `Some` here — the fit rejection is not this guard's job).
+    #[test]
+    fn paralog_summary_guard_passes_when_all_present() {
+        use crate::var_calling::paralog_filter::test_support::single_copy_summary;
+        let names = vec!["A".to_string(), "B".to_string()];
+        let summaries = vec![Some(single_copy_summary()), Some(single_copy_summary())];
+        assert!(require_paralog_summaries(&summaries, &names).is_ok());
     }
 
     #[test]
