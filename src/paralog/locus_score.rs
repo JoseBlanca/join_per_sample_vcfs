@@ -109,6 +109,10 @@ const PROB_FLOOR: f64 = 1e-300;
 struct UsableSample {
     observation: SampleObservation,
     single_copy_depth_sd: f64,
+    /// The sample's original index in the cohort-length `observations.samples`
+    /// slice — used to index the precomputed per-sample log-prior tables, which
+    /// are keyed by cohort position (not by the compacted `usable` position).
+    cohort_index: usize,
 }
 
 /// One H2 carrier configuration `(T, m)`: the coverage mean `T/2`, its σ
@@ -121,31 +125,155 @@ struct CarrierConfig {
     log1m_vaf: f64,
 }
 
+/// Per-pass, locus-**invariant** scoring inputs, built once and reused for every
+/// locus in a calibrate / write pass.
+///
+/// Everything here is a pure function of the model params and the cohort's
+/// per-sample inbreeding coefficients `F` — both fixed across all loci in a
+/// pass — so recomputing it per locus (as the scorer used to) is wasted work.
+/// The two dominant terms are the genotype/carrier log-prior **tables**, indexed
+/// by `[grid_point][cohort_sample]`: `wright` (H1's Wright HWE genotype
+/// log-priors at each SFS grid point) and `carrier_probs` (H2's carrier /
+/// non-carrier log-probabilities at each carrier-frequency grid point). Both are
+/// keyed by the sample's **original cohort index**, because a locus's usable
+/// samples are a variable-length subset (some drop out per locus).
+///
+/// Build it once with [`ParalogScorePrecompute::new`] from the same
+/// `ParalogModelParams` and cohort-length inbreeding slice the pass uses, then
+/// pass `&self` to [`score_locus_for_paralogy`]. Because the values stored are
+/// the exact `.ln()` results the old inline code produced (same grids, same `F`,
+/// same helper functions), the per-locus likelihood ratio is **bit-identical**
+/// to recomputing them.
+#[derive(Debug, Clone)]
+pub struct ParalogScorePrecompute {
+    /// Cohort size `N` the tables were built for (the SFS floor `1/2N` and the
+    /// table strides depend on it); a locus whose cohort size differs is a
+    /// precondition failure (neutral score), never a silently-truncated table.
+    cohort_size: usize,
+    // --- scalar params the per-locus winsor / hom-alt veto still needs ---
+    max_relative_copy_number: f64,
+    homalt_vaf_threshold: f64,
+    homalt_min_depth: u32,
+    // --- H1 (real single-copy variant) ---
+    /// Number of SFS grid points (`params.allele_freq_prior.n_points`).
+    sfs_points: usize,
+    /// Per SFS grid point: the (un-normalised) folded-SFS log-weight
+    /// `-(ln p + ln(1−p))`. Length `sfs_points`.
+    sfs_log_weight: Vec<f64>,
+    /// Wright genotype log-priors `(hom-ref, het, hom-alt)`, row-major
+    /// `[sfs_point * cohort_size + cohort_sample]`.
+    wright: Vec<[f64; 3]>,
+    /// H1 genotype VAF log-factors `[hom-ref ε, het ½, hom-alt 1−ε]` and their
+    /// complements — depend only on `ε`.
+    log_vaf_h1: [f64; 3],
+    log1m_vaf_h1: [f64; 3],
+    // --- H2 (hidden paralog) ---
+    /// The kept carrier configurations `(T, m)`.
+    configs: Vec<CarrierConfig>,
+    /// Number of carrier-frequency grid points (`params.carrier_freq_grid.n_points`).
+    carrier_freq_points: usize,
+    /// Carrier / non-carrier log-probabilities `(log P(non-carrier), log
+    /// P(carrier))`, row-major `[carrier_freq_point * cohort_size +
+    /// cohort_sample]`.
+    carrier_probs: Vec<(f64, f64)>,
+    /// H2 non-carrier VAF log-factors (`ε`, `1−ε`).
+    log_eps: f64,
+    log1m_eps: f64,
+}
+
+impl ParalogScorePrecompute {
+    /// Build the per-pass tables from the model params and the cohort's
+    /// per-sample inbreeding coefficients (`inbreeding[i]` is sample `i`'s `F`,
+    /// `0.0` for an absent/outbred sample). `inbreeding.len()` is the cohort size
+    /// `N` — every locus scored with this precompute must have the same cohort
+    /// size (its `observations.samples.len()`).
+    pub fn new(params: &ParalogModelParams, inbreeding: &[f64]) -> Self {
+        let cohort_size = inbreeding.len();
+        let eps = params.pseudocount_vaf;
+
+        // H1 SFS grid + Wright table.
+        let sfs_points = params.allele_freq_prior.n_points;
+        let inv2n = 1.0 / (2.0 * cohort_size as f64);
+        let mut sfs_log_weight = Vec::with_capacity(sfs_points);
+        let mut wright = Vec::with_capacity(sfs_points * cohort_size);
+        for i in 0..sfs_points {
+            let p = sfs_grid_point(i, sfs_points, inv2n);
+            sfs_log_weight.push(-(p * (1.0 - p)).ln());
+            for &f in inbreeding {
+                let (log_homref, log_het, log_homalt) = wright_genotype_log_priors(p, f);
+                wright.push([log_homref, log_het, log_homalt]);
+            }
+        }
+
+        // H2 carrier configs + carrier-frequency table.
+        let configs = enumerate_carrier_configs(params);
+        let grid = params.carrier_freq_grid;
+        let carrier_freq_points = grid.n_points;
+        let mut carrier_probs = Vec::with_capacity(carrier_freq_points * cohort_size);
+        for iq in 0..carrier_freq_points {
+            let q = linspace_point(iq, carrier_freq_points, grid.lo, grid.hi);
+            for &f in inbreeding {
+                // Wright dosage HWE: P(non-carrier) = (1−q)² + F·q(1−q), floored
+                // exactly as the old inline code did so the `.ln()` is identical.
+                let p_noncarrier = ((1.0 - q) * (1.0 - q) + f * q * (1.0 - q)).max(PROB_FLOOR);
+                carrier_probs.push((p_noncarrier.ln(), (1.0 - p_noncarrier).max(PROB_FLOOR).ln()));
+            }
+        }
+
+        Self {
+            cohort_size,
+            max_relative_copy_number: params.max_relative_copy_number,
+            homalt_vaf_threshold: params.homalt_vaf_threshold,
+            homalt_min_depth: params.homalt_min_depth,
+            sfs_points,
+            sfs_log_weight,
+            wright,
+            log_vaf_h1: [eps.ln(), 0.5f64.ln(), (1.0 - eps).ln()],
+            log1m_vaf_h1: [(1.0 - eps).ln(), 0.5f64.ln(), eps.ln()],
+            configs,
+            carrier_freq_points,
+            carrier_probs,
+            log_eps: eps.ln(),
+            log1m_eps: (1.0 - eps).ln(),
+        }
+    }
+}
+
 /// Score one locus for paralogy. `single_copy_depth_sd` holds each sample's
 /// σ₀ (one-copy relative-depth SD), indexed parallel to
-/// `observations.samples`. Pure: same inputs → same output, no state.
+/// `observations.samples`; `precompute` holds the per-pass locus-invariant
+/// tables built once via [`ParalogScorePrecompute::new`] (for the same model
+/// params + cohort inbreeding). Pure: same inputs → same output, no state.
 pub fn score_locus_for_paralogy(
     observations: &LocusObservations,
     single_copy_depth_sd: &[f64],
-    params: &ParalogModelParams,
+    precompute: &ParalogScorePrecompute,
 ) -> ParalogScore {
     let cohort_size = observations.samples.len();
-    let configs = enumerate_carrier_configs(params);
-    // A σ₀ slice out of step with the observations would silently truncate the
-    // cohort via the `zip` below (the SFS floor `1/2N` still counts the dropped
-    // sample), so a mismatch is a hard precondition failure → neutral, not a
-    // plausible-but-wrong score.
-    if cohort_size == 0 || configs.is_empty() || single_copy_depth_sd.len() != cohort_size {
+    // A σ₀ slice or precompute table out of step with the observations would
+    // silently truncate the cohort via the `zip` / table indexing below (the SFS
+    // floor `1/2N` still counts the dropped sample), so a mismatch is a hard
+    // precondition failure → neutral, not a plausible-but-wrong score.
+    if cohort_size == 0
+        || precompute.configs.is_empty()
+        || single_copy_depth_sd.len() != cohort_size
+        || precompute.cohort_size != cohort_size
+    {
         return ParalogScore::neutral();
     }
 
-    // Winsorise coverage and pair each usable sample with its σ₀, dropping
-    // samples whose σ₀ is degenerate (an unfit coverage model → `≤ 0` or
+    // Winsorise coverage and pair each usable sample with its σ₀ + cohort index,
+    // dropping samples whose σ₀ is degenerate (an unfit coverage model → `≤ 0` or
     // non-finite would make the Normal term `NaN`).
-    let cmax = params.max_relative_copy_number;
+    let cmax = precompute.max_relative_copy_number;
     let mut usable: Vec<UsableSample> = Vec::new();
     let mut confident_homalt_carriers = 0usize;
-    for (obs, &sigma0) in observations.samples.iter().zip(single_copy_depth_sd.iter()) {
+    for (cohort_index, (obs, &sigma0)) in observations
+        .samples
+        .iter()
+        .zip(single_copy_depth_sd.iter())
+        .enumerate()
+    {
         let Some(mut sample) = *obs else { continue };
         if !(sigma0.is_finite() && sigma0 > 0.0) {
             continue;
@@ -157,24 +285,25 @@ pub fn score_locus_for_paralogy(
         sample.relative_copy_number = sample.relative_copy_number.clamp(0.0, cmax);
         // `total_reads > 0` guards the `homalt_min_depth == 0` config (with the
         // default `5` it is already implied).
-        if sample.total_reads >= params.homalt_min_depth
+        if sample.total_reads >= precompute.homalt_min_depth
             && sample.total_reads > 0
             && f64::from(sample.alt_reads) / f64::from(sample.total_reads)
-                > params.homalt_vaf_threshold
+                > precompute.homalt_vaf_threshold
         {
             confident_homalt_carriers += 1;
         }
         usable.push(UsableSample {
             observation: sample,
             single_copy_depth_sd: sigma0,
+            cohort_index,
         });
     }
     if usable.is_empty() {
         return ParalogScore::neutral();
     }
 
-    let log_likelihood_real_variant = h1_log_likelihood(&usable, cohort_size, params);
-    let log_likelihood_hidden_paralog = h2_log_likelihood(&usable, &configs, params);
+    let log_likelihood_real_variant = h1_log_likelihood(&usable, precompute);
+    let log_likelihood_hidden_paralog = h2_log_likelihood(&usable, precompute);
 
     ParalogScore {
         paralog_log_likelihood_ratio: log_likelihood_hidden_paralog - log_likelihood_real_variant,
@@ -187,16 +316,11 @@ pub fn score_locus_for_paralogy(
 
 /// H1 — real, single-copy variant. Coverage is `Normal(1, σ₀)` independent of
 /// genotype (a constant added once); the allele/genotype term is marginalised
-/// over `p` under the folded-SFS prior.
-fn h1_log_likelihood(
-    usable: &[UsableSample],
-    cohort_size: usize,
-    params: &ParalogModelParams,
-) -> f64 {
-    let eps = params.pseudocount_vaf;
-    // H1 genotype VAFs: hom-ref ε, het ½, hom-alt 1−ε.
-    let log_vaf = [eps.ln(), 0.5f64.ln(), (1.0 - eps).ln()];
-    let log1m_vaf = [(1.0 - eps).ln(), 0.5f64.ln(), eps.ln()];
+/// over `p` under the folded-SFS prior. The Wright genotype log-priors and the
+/// SFS log-weights are read from `precompute` (locus-invariant), not recomputed.
+fn h1_log_likelihood(usable: &[UsableSample], precompute: &ParalogScorePrecompute) -> f64 {
+    let log_vaf = precompute.log_vaf_h1;
+    let log1m_vaf = precompute.log1m_vaf_h1;
 
     // Per-sample allele factor per genotype, and the genotype-independent
     // coverage term summed once.
@@ -221,22 +345,16 @@ fn h1_log_likelihood(
     // with `logw_p` the normalised prior. We accumulate the numerator LSE
     // (`summed1[p] + raw_logw_p`) and the normaliser LSE (`raw_logw_p`)
     // online, so `LSE_num − LSE_norm` is the p-marginal without a p vector.
-    let n_points = params.allele_freq_prior.n_points;
-    let inv2n = 1.0 / (2.0 * cohort_size as f64);
+    let cohort_size = precompute.cohort_size;
     let mut lse_num = LogSumExp::new();
     let mut lse_norm = LogSumExp::new();
-    for i in 0..n_points {
-        let p = sfs_grid_point(i, n_points, inv2n);
-        let raw_logw = -(p * (1.0 - p)).ln();
+    for i in 0..precompute.sfs_points {
+        let raw_logw = precompute.sfs_log_weight[i];
+        let base = i * cohort_size;
         let mut summed = 0.0;
         for (sample, allele) in usable.iter().zip(allele_by_genotype.iter()) {
-            let (log_homref, log_het, log_homalt) =
-                wright_genotype_log_priors(p, sample.observation.inbreeding_coefficient);
-            summed += log_sum_exp3(
-                log_homref + allele[0],
-                log_het + allele[1],
-                log_homalt + allele[2],
-            );
+            let w = precompute.wright[base + sample.cohort_index];
+            summed += log_sum_exp3(w[0] + allele[0], w[1] + allele[1], w[2] + allele[2]);
         }
         lse_num.push(summed + raw_logw);
         lse_norm.push(raw_logw);
@@ -247,14 +365,11 @@ fn h1_log_likelihood(
 
 /// H2 — hidden paralog. Per `(configuration, q)`, each sample is a mixture of
 /// non-carrier (single-copy REF) and carrier `(T, m)`; marginalised flat over
-/// `configuration × q`.
-fn h2_log_likelihood(
-    usable: &[UsableSample],
-    configs: &[CarrierConfig],
-    params: &ParalogModelParams,
-) -> f64 {
-    let eps = params.pseudocount_vaf;
-    let (log_eps, log1m_eps) = (eps.ln(), (1.0 - eps).ln());
+/// `configuration × q`. The carrier / non-carrier log-probabilities (per `q`,
+/// per sample) are read from `precompute` (locus-invariant), not recomputed.
+fn h2_log_likelihood(usable: &[UsableSample], precompute: &ParalogScorePrecompute) -> f64 {
+    let configs = &precompute.configs;
+    let (log_eps, log1m_eps) = (precompute.log_eps, precompute.log1m_eps);
     let n_configs = configs.len();
 
     // Per-sample non-carrier base term (coverage 1, VAF ε) and the carrier
@@ -282,28 +397,20 @@ fn h2_log_likelihood(
 
     // Marginalise over configuration × q (flat prior): logL2 = LSE(g) − ln|g|,
     // g[config,q] = Σ_s logaddexp(P(noncarrier|q)+base, P(carrier|q)+carrier).
-    let grid = params.carrier_freq_grid;
-    let mut log_noncarrier = vec![0.0f64; usable.len()];
-    let mut log_carrier = vec![0.0f64; usable.len()];
+    // The (q, sample) carrier / non-carrier log-probabilities are precomputed
+    // (Wright dosage HWE, floored) and read from `precompute.carrier_probs`.
+    let cohort_size = precompute.cohort_size;
     let mut lse = LogSumExp::new();
     let mut cells = 0usize;
-    for iq in 0..grid.n_points {
-        let q = linspace_point(iq, grid.n_points, grid.lo, grid.hi);
-        // Wright dosage HWE: P(non-carrier) = (1−q)² + F·q(1−q). The floor
-        // guards a non-default grid reaching `q → 1` (where P0 → 0); it is
-        // inert on the default grid where `min P0 = 0.16` (prototype floors
-        // only the carrier branch, but this is harmless there).
-        for (s, sample) in usable.iter().enumerate() {
-            let f = sample.observation.inbreeding_coefficient;
-            let p_noncarrier = ((1.0 - q) * (1.0 - q) + f * q * (1.0 - q)).max(PROB_FLOOR);
-            log_noncarrier[s] = p_noncarrier.ln();
-            log_carrier[s] = (1.0 - p_noncarrier).max(PROB_FLOOR).ln();
-        }
+    for iq in 0..precompute.carrier_freq_points {
+        let qbase = iq * cohort_size;
         for j in 0..n_configs {
             let mut acc = 0.0;
-            for s in 0..usable.len() {
-                let a = log_noncarrier[s] + noncarrier_base[s];
-                let b = log_carrier[s] + carrier_branch[s * n_configs + j];
+            for (s, sample) in usable.iter().enumerate() {
+                let (log_noncarrier, log_carrier) =
+                    precompute.carrier_probs[qbase + sample.cohort_index];
+                let a = log_noncarrier + noncarrier_base[s];
+                let b = log_carrier + carrier_branch[s * n_configs + j];
                 acc += log_add_exp(a, b);
             }
             lse.push(acc);
@@ -449,12 +556,23 @@ mod tests {
         })
     }
 
+    /// Build a default-params precompute from the samples' per-sample `F`
+    /// (absent sample → outbred `0.0`) — the same cohort inbreeding the
+    /// production driver feeds [`ParalogScorePrecompute::new`].
+    fn precompute_from(samples: &[Option<SampleObservation>]) -> ParalogScorePrecompute {
+        let inbreeding: Vec<f64> = samples
+            .iter()
+            .map(|o| o.map_or(0.0, |s| s.inbreeding_coefficient))
+            .collect();
+        ParalogScorePrecompute::new(&ParalogModelParams::default(), &inbreeding)
+    }
+
     fn score(samples: &[Option<SampleObservation>]) -> ParalogScore {
         let sds = vec![SIGMA0; samples.len()];
         score_locus_for_paralogy(
             &LocusObservations { samples },
             &sds,
-            &ParalogModelParams::default(),
+            &precompute_from(samples),
         )
     }
 
@@ -653,7 +771,7 @@ mod tests {
         let s = score_locus_for_paralogy(
             &LocusObservations { samples: &samples },
             &sds,
-            &ParalogModelParams::default(),
+            &precompute_from(&samples),
         );
         assert!(s.paralog_log_likelihood_ratio.is_finite());
         assert_eq!(s.samples_used, 23); // two degenerate σ₀ samples dropped
@@ -668,7 +786,7 @@ mod tests {
         let s = score_locus_for_paralogy(
             &LocusObservations { samples: &samples },
             &sds,
-            &ParalogModelParams::default(),
+            &precompute_from(&samples),
         );
         assert_eq!(s.paralog_log_likelihood_ratio, 0.0);
         assert_eq!(s.samples_used, 0);
@@ -693,8 +811,12 @@ mod tests {
         };
         // One sample: rel 1.0, 5 alt of 10, F = 0, σ₀ = 0.26.
         let samples = [obs(1.0, 5, 10, 0.0)];
-        let s =
-            score_locus_for_paralogy(&LocusObservations { samples: &samples }, &[SIGMA0], &params);
+        let precompute = ParalogScorePrecompute::new(&params, &[0.0]);
+        let s = score_locus_for_paralogy(
+            &LocusObservations { samples: &samples },
+            &[SIGMA0],
+            &precompute,
+        );
         // Hand-derived from ln N + binomial-allele + Wright priors (see the
         // module's H1/H2 formulas): logL1 ≈ −7.1965, logL2 ≈ −11.3157.
         assert!(

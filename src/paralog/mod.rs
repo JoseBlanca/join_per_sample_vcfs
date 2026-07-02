@@ -40,7 +40,8 @@ pub use coverage_model::{
 };
 pub use inbreeding::{inbreeding_coefficient, obs_het};
 pub use locus_score::{
-    LocusObservations, ParalogScore, SampleObservation, score_locus_for_paralogy,
+    LocusObservations, ParalogScore, ParalogScorePrecompute, SampleObservation,
+    score_locus_for_paralogy,
 };
 pub use prior::{EmConfig, ParalogFdrCurve, ParalogLrHistogram, ParalogPrior};
 

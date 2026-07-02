@@ -18,7 +18,8 @@ use std::io::Read;
 
 use crate::paralog::{
     EmConfig, LocusObservations, ParalogFdrCurve, ParalogLrHistogram, ParalogModelParams,
-    ParalogPrior, SampleObservation, inbreeding_coefficient, score_locus_for_paralogy,
+    ParalogPrior, ParalogScorePrecompute, SampleObservation, inbreeding_coefficient,
+    score_locus_for_paralogy,
 };
 
 use crate::var_calling::posterior_engine::PosteriorRecord;
@@ -182,7 +183,7 @@ pub(crate) fn score_spilled_locus(
     prepass: &ParalogPrePass,
     inbreeding: &[f64],
     single_copy_depth_sd: &[f64],
-    params: &ParalogModelParams,
+    precompute: &ParalogScorePrecompute,
     min_samples: usize,
     obs_buf: &mut Vec<Option<SampleObservation>>,
 ) -> Option<f64> {
@@ -209,7 +210,7 @@ pub(crate) fn score_spilled_locus(
     let score = score_locus_for_paralogy(
         &LocusObservations { samples: obs_buf },
         single_copy_depth_sd,
-        params,
+        precompute,
     );
     Some(score.paralog_log_likelihood_ratio)
 }
@@ -230,7 +231,7 @@ pub(crate) fn score_joined_locus<WR: Read>(
     prepass: &ParalogPrePass,
     inbreeding: &[f64],
     single_copy_depth_sd: &[f64],
-    params: &ParalogModelParams,
+    precompute: &ParalogScorePrecompute,
     min_samples: usize,
     obs_buf: &mut Vec<Option<SampleObservation>>,
 ) -> Result<Option<f64>, SpillError> {
@@ -245,7 +246,7 @@ pub(crate) fn score_joined_locus<WR: Read>(
         prepass,
         inbreeding,
         single_copy_depth_sd,
-        params,
+        precompute,
         min_samples,
         obs_buf,
     ))
@@ -272,6 +273,11 @@ pub(crate) fn calibrate<R: Read, WR: Read>(
 ) -> Result<ParalogCalibration, SpillError> {
     let inbreeding = inbreeding_by_sample(prepass, hexp);
     let single_copy_depth_sd = prepass.single_copy_depth_sd();
+    // The per-pass locus-invariant scoring tables (Wright genotype priors +
+    // carrier-frequency probs + configs), built once from the params + cohort
+    // inbreeding and reused for every locus. The write pass builds an identical
+    // one, so the recomputed LRs stay bit-identical.
+    let precompute = ParalogScorePrecompute::new(params, &inbreeding);
 
     let mut histogram = ParalogLrHistogram::with_defaults();
     let mut obs_buf: Vec<Option<SampleObservation>> = Vec::new();
@@ -284,7 +290,7 @@ pub(crate) fn calibrate<R: Read, WR: Read>(
             prepass,
             &inbreeding,
             &single_copy_depth_sd,
-            params,
+            &precompute,
             cfg.min_samples,
             &mut obs_buf,
         )? {
@@ -365,6 +371,7 @@ mod tests {
         min_samples: usize,
         buf: &mut Vec<Option<SampleObservation>>,
     ) -> Option<f64> {
+        let precompute = ParalogScorePrecompute::new(&ParalogModelParams::default(), inbreeding);
         score_spilled_locus(
             &record.record,
             window.gc,
@@ -372,7 +379,7 @@ mod tests {
             prepass,
             inbreeding,
             sigma0,
-            &ParalogModelParams::default(),
+            &precompute,
             min_samples,
             buf,
         )
@@ -512,7 +519,7 @@ mod tests {
         let prepass = prepass(n);
         let inbreeding = inbreeding_by_sample(&prepass, 0.02);
         let sigma0 = prepass.single_copy_depth_sd();
-        let params = ParalogModelParams::default();
+        let precompute = ParalogScorePrecompute::new(&ParalogModelParams::default(), &inbreeding);
         let mut buf = Vec::new();
         // Window spill holds only tile for pos 100; the record at pos 5000 has no
         // window → the join yields None → unscored.
@@ -528,7 +535,7 @@ mod tests {
             &prepass,
             &inbreeding,
             &sigma0,
-            &params,
+            &precompute,
             5,
             &mut buf,
         )

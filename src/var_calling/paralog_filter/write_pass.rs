@@ -21,7 +21,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::fasta::{ChromRefFetchError, ChromRefFetcher, StreamingChromRefFetcher};
-use crate::paralog::ParalogModelParams;
+use crate::paralog::{ParalogModelParams, ParalogScorePrecompute};
 use crate::var_calling::posterior_engine::PosteriorRecord;
 use crate::var_calling::types::{CallStats, CalledChunk};
 use crate::var_calling::vcf_writer::{VcfWriter, WriterError, WriterStats};
@@ -143,6 +143,9 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
 ) -> Result<WriterStats, WritePassError> {
     let inbreeding = inbreeding_by_sample(prepass, hexp);
     let single_copy_depth_sd = prepass.single_copy_depth_sd();
+    // Built once from the same params + cohort inbreeding the calibrate pass
+    // used, so the recomputed LRs are bit-identical to the histogram's.
+    let precompute = ParalogScorePrecompute::new(params, &inbreeding);
     let mut obs_buf = Vec::new();
     let mut records_dropped_paralog = 0u64;
     let mut chunk_order = 0u64;
@@ -163,7 +166,7 @@ pub(crate) fn run_write_pass<R: Read, WR: Read>(
             prepass,
             &inbreeding,
             &single_copy_depth_sd,
-            params,
+            &precompute,
             min_samples,
             &mut obs_buf,
         )?
