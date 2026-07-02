@@ -178,6 +178,11 @@ impl OpenPileupRecord {
             chrom_id: self.chrom_id,
             pos: self.pos,
             alleles,
+            // The walker cannot compute the centred window (it needs
+            // look-ahead); the pileup→psp seam fills these from the
+            // sliding-window accumulator before writing.
+            windowed_gc: f32::NAN,
+            windowed_coverage: f32::NAN,
         }
     }
 }

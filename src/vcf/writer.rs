@@ -196,6 +196,7 @@ impl CohortVcfWriter {
     ///   (non-UTF-8 allele bytes, invalid `Position`, …).
     /// * [`VcfWriteError::WriteRecord`] — the sink rejected the
     ///   serialised bytes.
+    ///
     /// The final (refined + clamped) QUAL this writer would emit for
     /// `record`, computed via the same path as [`write_record`] and reusing
     /// the cached genotype table. The filtering layer calls this so it gates
@@ -340,6 +341,7 @@ mod tests {
             }],
             tool_string: "pop_var_caller test".into(),
             command_line: String::new(),
+            paralog_provenance: String::new(),
         }
     }
     fn mk_record(start: u32) -> PosteriorRecord {

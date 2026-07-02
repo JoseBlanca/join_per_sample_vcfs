@@ -71,6 +71,7 @@ fn pileup_args(reference: PathBuf, output: PathBuf, alignment_files: Vec<PathBuf
         alignment_files,
         block_target_bytes: pop_var_caller::psp::writer::TARGET_BLOCK_BYTES,
         block_window_bp: pop_var_caller::psp::writer::DEFAULT_BLOCK_WINDOW_BP,
+        gc_window_bp: pop_var_caller::sample_summary::DEFAULT_GC_WINDOW_BP,
         stage1: Stage1Args {
             min_mapq: DEFAULT_MIN_MAPQ,
             no_baq: true, // skip BAQ — tiny synthetic reads don't need it
@@ -129,6 +130,8 @@ fn var_calling_args(
             min_allele_balance_log_lr: DEFAULT_AB_MIN_LOG_LR,
             allele_balance_concentration: DEFAULT_AB_CONCENTRATION,
             emit_gp: false,
+            paralog_fdr: 0.0,
+            no_paralog_filter: true,
         },
     }
 }
@@ -232,6 +235,69 @@ fn var_calling_happy_path_three_samples() {
     assert!(
         body.contains("\tNA00001\tNA00002\tNA00003"),
         "sample columns missing"
+    );
+}
+
+/// **End-to-end two-pass paralog path.** With the hidden-paralog filter ON
+/// (the default), `run_var_calling` takes the spill → calibrate → write flow:
+/// the main pass spills each locus to the record spill while the fold builds the
+/// window spill, then the calibrate + write passes join them by tile key and
+/// emit the survivors. This test drives that whole path on real `.psp` fixtures
+/// (with the coverage/het `SampleSummary` the pileup writes) and asserts the
+/// orchestration invariants: the run succeeds, the VCF carries the
+/// `##paralogFilter=` provenance the write pass stamps, and **both** ephemeral
+/// spill files are gone afterwards (RAII cleanup on the tempdir).
+///
+/// It does **not** assert a specific drop: the score's `min_samples` gate (20)
+/// and the coverage-model fit make a deterministic synthetic drop brittle. The
+/// drop mechanics are unit-tested (`write_pass::drops_flagged_...`) and the
+/// behavioural drop profile is validated on real tomato2 data in T1.
+#[test]
+fn var_calling_paralog_filter_two_pass_runs_and_cleans_up() {
+    let dir = TempDir::new().expect("tempdir");
+    let fasta = build_fasta(dir.path());
+
+    // Three samples; one carries a SNP at pos 11 so the write pass emits (and
+    // reference-consistency-checks) at least one survivor.
+    let plain = vec![
+        read_record("r1", 10, b"AAAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let snp = vec![
+        read_record("r1", 10, b"ACAAA"),
+        read_record("r2", 15, b"AAAAA"),
+    ];
+    let psp_a = make_psp_for_sample(dir.path(), &fasta, "NA00001", &plain);
+    let psp_b = make_psp_keep_snps(dir.path(), &fasta, "NA00002", &snp);
+    let psp_c = make_psp_for_sample(dir.path(), &fasta, "NA00003", &plain);
+
+    let vcf_out = dir.path().join("cohort.vcf");
+    let mut args = var_calling_args(fasta, vcf_out.clone(), vec![psp_a, psp_b, psp_c], None);
+    // Turn the filter ON (the helper defaults it off for the byte-identity tests).
+    args.cohort.no_paralog_filter = false;
+    args.cohort.paralog_fdr = 0.01;
+    run_var_calling(&args).expect("two-pass paralog run OK");
+
+    assert!(vcf_out.exists(), "VCF must exist at the final path");
+    let body = fs::read_to_string(&vcf_out).expect("read VCF");
+    assert!(body.contains("##fileformat=VCFv4"), "VCF header missing");
+    assert!(
+        body.contains("##paralogFilter="),
+        "two-pass path must stamp the paralog-filter provenance header, got:\n{body}"
+    );
+
+    // Both ephemeral spills (record + window) are created via NamedTempFile in
+    // the output's directory and must be unlinked when the run ends — no stray
+    // `.tmp*` file survives beside the VCF.
+    let stray: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".tmp"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "spill temp files not cleaned up: {stray:?}"
     );
 }
 

@@ -61,6 +61,13 @@ pub struct CohortMetadata {
     /// `std::env::args()`; library users may pass an empty string to
     /// skip the field.
     pub command_line: String,
+    /// Goes into `##paralogFilter=...` — the hidden-paralog filter's run
+    /// provenance (target FDR, estimated `π`, resolved LR cut), recorded so a
+    /// reader knows the filter ran and with what settings (the filter drops
+    /// flagged records with no per-record trace, so the header is the only
+    /// place this lives). An **empty string skips the line**, so a run with the
+    /// filter off is byte-identical to one produced before this field existed.
+    pub paralog_provenance: String,
 }
 
 pub(super) fn build_vcf_header(
@@ -73,6 +80,8 @@ pub(super) fn build_vcf_header(
 
     builder = insert_unstructured(builder, "source", &metadata.tool_string)?;
     builder = insert_unstructured(builder, "commandline", &metadata.command_line)?;
+    // Empty when the paralog filter is off → no line → byte-identical header.
+    builder = insert_unstructured(builder, "paralogFilter", &metadata.paralog_provenance)?;
 
     for entry in &metadata.contigs {
         // Mi4: `usize::try_from(u32)` is infallible on 32-bit and
@@ -336,6 +345,7 @@ mod tests {
             ],
             tool_string: "pop_var_caller 0.1.0".into(),
             command_line: "pop_var_caller cohort --output out.vcf".into(),
+            paralog_provenance: String::new(),
         }
     }
 

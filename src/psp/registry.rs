@@ -193,6 +193,8 @@ super::kind::column_key! {
         NAlleles = 0x02,
         AlleleSeqLen = 0x03,
         AlleleSeq = 0x04,
+        WindowedGc = 0x05,
+        WindowedCoverage = 0x06,
         AlleleObsCount = 0x10,
         AlleleQSumLog = 0x11,
         AlleleFwdCount = 0x12,
@@ -359,6 +361,35 @@ pub const V1_0_COLUMNS: &[ColumnDef] = &[
         finite_constraint: false,
         description: "Allele sequence bytes (uppercase ASCII over \
             {A,C,G,T,N}). REF is the first allele in each record.",
+    },
+    ColumnDef {
+        tag: 0x05,
+        name: "windowed-gc",
+        cardinality: Cardinality::PerRecord,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::F32,
+        },
+        required: true,
+        // NaN is a legitimate value here ("no window at this position", e.g. an
+        // N reference base), and the seam writes NaN transitionally before the
+        // sliding-window accumulator is wired — so finite is NOT required.
+        finite_constraint: false,
+        description: "GC fraction of the centred window around this position \
+            (0.0-1.0), the hidden-paralog score's per-position coverage input; \
+            NaN = no window here.",
+    },
+    ColumnDef {
+        tag: 0x06,
+        name: "windowed-coverage",
+        cardinality: Cardinality::PerRecord,
+        payload: ColumnPayload::Scalar {
+            element_type: ElementType::F32,
+        },
+        required: true,
+        finite_constraint: false,
+        description: "Mean read coverage of the centred window around this \
+            position, the hidden-paralog score's per-position coverage input; \
+            NaN = no window here.",
     },
     ColumnDef {
         tag: 0x10,

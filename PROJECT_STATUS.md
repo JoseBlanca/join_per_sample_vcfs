@@ -19,137 +19,173 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
-> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — stutter / read-likelihood model bake-off → productionized Model A (HipSTR)**
->   (branch `ssr-cohort`, [ssr_stutter_scoring_model_bakeoff_2026-06-24.md](doc/devel/reports/implementations/ssr_stutter_scoring_model_bakeoff_2026-06-24.md)).
->   Implemented all three `Qᵣ(obs|cand)` models behind one swappable `ReadLikelihoodModel`
->   trait (new `src/ssr/cohort/read_model/`) and **baked them off on synthetic data with
->   known truth** across a 3×3 scoring×generative matrix (G1 clean / G2 out-of-frame / G3
->   messy) on concordance + allele-error + **calibration (ECE)** + runtime, via a committed
->   `#[cfg(test)]` harness (`bakeoff.rs`) + the generative axis in `sim.rs` (`GenerativeNoise`).
->   **Result:** **C (the user's two-penalty pair-HMM) eliminated** — even self-affinity-
->   normalized it collapsed on out-of-frame reads (G3 concordance 0.04). **A (HipSTR) and B
->   (fix-current) tied at perfect concordance** across G1/G2/G3, but A is far better
->   calibrated (G3 ECE 0.0001 vs 0.017) and **~100× cheaper per `Qᵣ`** (one `bp_diff` term +
->   closed-form substitution vs B's 21-way Δ-sum-with-DP). **Productionized A** (driver /
->   inbreeding / EM wrapper now use `HipstrModel`), **removed C**, **kept B** test-only as the
->   bake-off reference — the swap needed **zero test re-baselining** (A and B agree on every
->   existing cohort/VCF test). fmt/clippy `-D warnings` clean; **1325 lib tests**. **Open
->   follow-ups:** replace A's fixed `OUT_FRAME_REL` with a real per-period out-of-frame
->   estimator from the pre-pass; fix the presence-based locus-admission periodicity gate
->   (`is_periodic` trips `NotPeriodic` on a few out-of-frame reads — separate Stage-1.5
->   finding); a release-build SSR `Qᵣ` bench; real-data calibration.
-> - **Last completed task (2026-06-23):** **SSR Stage 2 (`ssr-call`) driver wiring — Step H4 (streaming driver → VCF) — the task's definition of done**
->   (branch `ssr-cohort`, impl `d17f524`). `ssr-call` now produces a real **VCF**: the
->   driver is the two-pass streaming pipeline (settled arch
->   [ssr_call_driver.md](doc/devel/architecture/ssr_call_driver.md), plan
->   [ssr_call_driver.md](doc/devel/implementation_plans/ssr_call_driver.md)) — Pass 1
->   burn-in over a bounded subset freezes chemistry + `F` + per-group level on a
->   `config.threads` pool; Pass 2 re-opens and streams every locus, genotyping each on the
->   frozen params and applying the emit policy (filtered kept with reason, PASS emitted iff
->   variable, monomorphic dropped). Sample-name uniqueness enforced (H2-Mi1); decision-E
->   hard error on unresolved samples; ploidy 2. The integration test drives the real
->   `run()` over an on-disk simulated cohort → a PASS variant (correct het 6/10 calls) +
->   monomorphic-locus drop + decision-E error, and the VCF is byte-identical across thread
->   counts. The TSV-dump placeholder is gone. Reviewed (Approve-with-changes; 0
->   Blocker/Major, 3 Minor) and **fixes applied**
->   ([review](doc/devel/reports/reviews/ssr_call_streaming_driver_2026-06-23.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-23_streaming_driver.md)).
->   fmt/clippy `-D warnings` clean; 1271 lib tests. See the SSR Stage 2 **Driver wiring** block below.
-> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step J (chunk-parallel sweep) — the `ssr-call` plan (G→H→I→J) is COMPLETE**
->   (branch `ssr-cohort`, impl `8d7e4d2`). The Pass-2 genotyping sweep is now chunk-parallel:
->   bounded chunks of loci are genotyped on the `--threads` pool via an order-preserving
->   `par_iter` and written in catalog order — **byte-identical across thread counts** (each
->   locus is a pure function of its reads + the frozen params; no `seq`-reorder needed).
->   `config.queue_depth` is the chunk size (resident-loci + parallelism knob). Chosen as a
->   simpler realization of the reading-layer producer/worker/writer topology (arch §4
->   J-realization note; the full overlapping channel pipeline is a measure-first follow-up).
->   Reviewed (Approve-with-changes; 0 Blocker/Major, 2 Minor) + fixes applied
->   ([review](doc/devel/reports/reviews/ssr_call_parallel_sweep_2026-06-24.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_parallel_sweep.md);
->   `queue_depth=0` default + arch note). 1280 lib tests; fmt/clippy clean. `ssr-call` now
->   produces a real VCF and scales with `--threads`. See the SSR Stage 2 **Driver wiring** block.
-> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) driver wiring — fresh-eyes multi-agent code review (G→J, the re-review the inline per-step reviews never got)**
->   (branch `ssr-cohort`, [ssr_call_driver_2026-06-24.md](doc/devel/reports/reviews/ssr_call_driver_2026-06-24.md)). rust-code-review skill, 11 categories dispatched in parallel → **Request-changes**: 1 Blocker, 6 Major, 16 Minor + Nits. Headline **B1**: `format_vcf_record` emits per-sample VCF columns in **present-order, not cohort-order**, so any partial-coverage locus produces a short, mis-aligned row (wrong genotypes + invalid VCF) — masked by the integration tests' full-coverage fixtures. Determinism/byte-identity, decision-E, ploidy panic, emit/drop policy verified sound; gates green (1280 lib tests). Audit trail `tmp/review_2026-06-24_ssr-call-driver/`. See the **Driver wiring** block for the full Open list.
->   Audit trail `tmp/review_2026-06-24_ssr-call-driver/`.
-> - **Prior task (2026-06-24):** **SSR Stage 2 (`ssr-call`) driver wiring — re-review fixes applied (B1 + all 6 Majors + 9 Minors)**
->   (branch `ssr-cohort`, [fixes_applied_2026-06-24_ssr_call_driver.md](doc/devel/reports/reviews/fixes_applied_2026-06-24_ssr_call_driver.md), commits `1999d82`→`f3f8d04`). Applied the fresh-eyes re-review: **B1** VCF rows are now dense over the cohort (`format_vcf_record(n_samples)`, present calls placed by `locus.present`, `./.:.:.` for absent) + a partial-coverage regression test; **M1/M2** silent `"?"` contig + `sample_chemistry` defaults → loud panics; **M3** shared `DEFAULT_G0_FALLBACK_P`; **M4** `total_cmp` NaN-safe argmax; **M5** `InvalidVcfName` rejects tab/newline/`,<>` in untrusted names; **M6** filtered-locus emit test; + 9 Minor cleanups. Each fix its own commit. 8 Minors deferred (refactors / bench-gated allocation / policy). Gates green: fmt/clippy `-D warnings`/doc clean, **1287 lib tests** (the only `--all-targets` failure is the pre-existing `psp_writer_perf` bench panic). See the **Driver wiring** block.
-> - **Last completed task (2026-06-24):** **SSR Stage 2 (`ssr-call`) driver wiring — re-review deferred-Minor follow-up (6 Applied, 2 Deferred)**
->   (branch `ssr-cohort`, [fixes_applied_2026-06-24_ssr_call_driver_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-24_ssr_call_driver_v2.md)). Picked up the 8 Minors the v1 run deferred. **6 Applied:** **Mi1** new `attribution::nearest_parent` primitive shared by `attribute_locus`/`accumulate_locus`/`allele_balance` (one tie-break; byte-identity preserved); **Mi2** `LocusModel` bundle drops `compute_data_ll` to 7 args (its `#[allow]` removed); **Mi5** `LengthBin`/`AlleleCopies` structs replace the tuple bins; **Mi13** new `SsrMergeError::InvalidAlleleByte` rejects non-ACGTN allele bytes at the merge boundary (+ loud `from_utf8().expect()` in `format_vcf_record`); **Mi14** emitted records always print numeric QUAL (`0.0`, not `.`); **Mi16** move-not-clone `level_per_group`. **2 Deferred:** Mi3/Mi4 (per-round/per-locus allocation levers — bench-gated, no SSR bench exists yet; user decision). The three user decisions (Mi14 numeric, Mi13 reject, Mi3/Mi4 defer) were settled before editing. Gates green: fmt/clippy `-D warnings`/doc clean, **1292 lib tests** (+5; only `--all-targets` failure is the pre-existing `psp_writer_perf` bench panic). See the **Driver wiring** block.
-> - **Last completed task (2026-06-24):** **SSR Stage 1 (`ssr-pileup`) — long-allele delimitation fix (tract-aware gap) + the first end-to-end BAM→VCF test**
->   (branch `ssr-cohort`). Building the committed end-to-end test ([src/ssr/end_to_end_tests.rs](src/ssr/end_to_end_tests.rs), `107be5f`) surfaced that the delimiter collapsed any allele ≥ ref+2 units to the reference. Investigation ([ssr_delimiter_gap_penalty_2026-06-24.md](doc/devel/reports/research/ssr_delimiter_gap_penalty_2026-06-24.md)) traced it to a **uniform affine gap** (`GAP_OPEN_PROB = 2.9e-5`, HipSTR's *flank* value) applied across the whole alignment. Fix ([ssr_delimiter_tract_aware_gap_2026-06-24.md](doc/devel/reports/implementations/ssr_delimiter_tract_aware_gap_2026-06-24.md)): a **tract-aware gap** (cheap `GAP_OPEN_PROB_TRACT = 1e-2` in repeat-tract columns, stiff Dindel in flanks), matching HipSTR's flank/tract split. Long alleles now extract verbatim and recover end-to-end (`CA×10` BAM→VCF). Companion **long-allele window-recovery infra** (`feaa9ef`: `flank_truncated`/`widen_region`, `WidenedSequence`/`WindowTruncated`, `.ssr.psp` `n-widened`/`n-window-truncated` columns). Determinism preserved; fmt/clippy `-D warnings` clean; **1305 lib tests**. See the **`ssr-pileup` stage** block.
->   **Next (planned):** the bake-off **is done** (Model A productionized — see the top bullet).
->   Remaining Stage-2 follow-ups: (1) replace A's fixed `OUT_FRAME_REL` with a real
->   per-period out-of-frame estimator from the pre-pass; (2) **DONE** — the locus-admission
->   periodicity gate (`is_periodic`) is now **support-aware/fraction-based** (rejects only
->   when the cohort out-of-frame fraction exceeds `max_out_of_frame_frac`, default 0.10,
->   modal-anchored; mirrors HipSTR's `--max-loc-flank-indel`); the old presence-based test
->   over-filtered on a few stray reads; (3) answer review Q1 (is Stage-1 `.ssr.psp` output
->   sparse?); (4) real-data calibration; first real cohort SSR call.
-> - **Prior task (2026-06-24):** **SSR Stage 2 (`ssr-call`) — Step I1 (per-locus `θ_locus` shape refit)**
->   (branch `ssr-cohort`, impl `46df902`). The genotype EM adapts the stutter **shape** per
->   locus: genotype under the frozen `θ_period` seed → attribute reads → `refine_theta_locus`
->   shrunk toward the seed → re-genotype until settled. Reviewed + fixes applied
->   ([review](doc/devel/reports/reviews/ssr_call_theta_locus_2026-06-24.md),
->   [fixes](doc/devel/reports/reviews/fixes_applied_2026-06-24_theta_locus.md); shared `add_slip`). 1276 lib tests.
-> - **Prior task (2026-06-21):** **SSR Stage 2 (`ssr-call`) reading layer — Phases 0–3 (`ssr-call` runnable)**
->   (branch `ssr-cohort`, [ssr_call_reading_phase1_2026-06-21.md](doc/devel/reports/implementations/ssr_call_reading_phase1_2026-06-21.md)).
->   Built the reading & merge spine through a runnable `ssr-call`: Phase 0 scaffolding;
->   a psp enabler (`OwnedRecordsIter` + `PspReader::into_records_of`); Phase 1
->   `SampleEvidenceCursor`; Phase 2 catalog-driven `CohortMerger`; Phase 3
->   single-threaded `driver` (catalog-ordered TSV dump). fmt/clippy clean; 1159 lib tests.
-> - **Prior task (2026-06-21):** **Code review of the `ssr-call` reading layer + fixes applied**
->   (branch `ssr-cohort`, [review](doc/devel/reports/reviews/ssr_call_reading_2026-06-21.md) +
->   [fixes_applied](doc/devel/reports/reviews/fixes_applied_2026-06-21.md)).
->   rust-code-review skill (9 categories) → Request-changes (1 Blocker, 5 Major, 8 Minor). Applied
->   B1 + all 5 Majors + 7/8 Minors (commit `c15280c`): the cursor's data-reachable panic → typed
->   `LocusNotInCatalog`; merger validates catalog sort order → `UnsortedCatalog`; coordinate guards
->   moved to the SSR decode boundary; coordinate round-trip + `SsrKind` owning-iter tests; reserved
->   flags warn + honest help. Gates green; 1165 lib tests (+6). Mi4 (tree-wide allow) deferred.
-> - **Prior task (2026-06-17):** **ssr-pileup Mark-2 review fixes applied**
->   (branch `ssr-pileup-mark2`, [fixes_applied_2026-06-17_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-17_v2.md)).
->   Applied the Mark-2 code review: **all 3 Blockers** + **9 of 12 Majors** + 9 Minors. **B1** doc gate restored
->   (`cargo doc` green); **B2** length-inconsistent reads (empty-`QUAL`/over-consuming CIGAR) dropped+counted at
->   the fetch boundary (`LocusReads.malformed`→`n_filtered`) + `extract_region` `r_start` clamp — a test confirmed
->   noodles decodes `*` QUAL to an empty buffer, the exact pre-fix panic; **B3** added the missing byte-identity
->   tests (multi-chunk e2e + cap-bites e2e + reservoir-subset); **M2** the Stage-0 empty-flank gate (`finish_locus`);
->   **M1** split the catch-all `Io` into 5 operation-named variants; **M3** `reach_min_flank_bp` recorded in the
->   `.ssr.psp` header; **M5** byte-identity scoped to one target/toolchain; **M6/M7/M8/M9/M10/M11** + Mi1/Mi3/Mi4/Mi5/
->   Mi6/Mi7(local)/Mi-docs. **Deferred:** **M4** (HMM-model provenance — schema call), **M12** (`DpState` enum
->   refactor — now guarded by the B3 tests), Mi2/Mi8/Mi9/Mi10/Mi11/Mi12 + Nits. Gates: fmt/clippy `-D warnings`/doc
->   clean, **1129 lib + integration pass** (the only `--all-targets` failure is the pre-existing `psp_writer_perf`
->   bench panic). Audit trail `tmp/review_2026-06-17_ssr-pileup-mark2/`.
-> - **Prior task (2026-06-17):** **ssr-pileup Mark-2 code review**
->   (branch `ssr-pileup-mark2`, [ssr_pileup_mark2_2026-06-17.md](doc/devel/reports/reviews/ssr_pileup_mark2_2026-06-17.md),
->   11 categories). First *correctness* review of the Mark-2 rebuild (`src/ssr/pileup/`). **Verdict:
->   Request-changes** — 3 Blockers, 12 Major, 14 Minor + Nits. Gates: fmt/clippy `-D warnings` clean,
->   40 ssr::pileup lib tests pass — but **`cargo doc` FAILS** (**B1**: fetch_reads.rs:17 links the deleted
->   `super::locus_record::aggregate`; `locus_record`→`locus_tally`, `aggregate`→`tally`). **B2**: `process_locus`
->   slices `read.qual` by a `seq.len()`-derived range with no length-consistency guard → an empty-`QUAL` record
->   (legal SAM; the SNP BAQ engine guards it at baq_engine.rs:117, the SSR path doesn't) panics the whole run;
->   an over-consuming CIGAR also panics via the unclamped `r_start`. **B3**: the byte-identity-for-any-thread-count
->   contract is untested on the only paths that can break it (reservoir eviction never bites — 1 read/locus,
->   cap 1000; `par_chunks` never splits — 3 loci < MIN_FETCH_CHUNK 64). Determinism *mechanism* verified sound
->   by inspection; diff matches the stated empirical-candidate intent. Majors: M1 `Io(#[from])` collapses 5 I/O
->   sites; M3/M4 MIN_FLANK_BP + HMM model constants shape output but aren't in the `.ssr.psp` header; M6
->   `..FilterCounts::default()` test masks new buckets; M8 `ref_to_read` indel branches untested. Audit trail
->   `tmp/review_2026-06-17_ssr-pileup-mark2/`. **(suggested follow-up: apply fixes — B1 first, then B2/B3;
->   answer Q1 [does Stage-0 emit empty-flank loci → M2 severity] and Q4 [drop vs error for malformed records].)**
-> - **Prior task (2026-06-17):** **SSR Stage 1 (`ssr-pileup`) rebuilt as Mark-2**
->   (branch `ssr-pileup-mark2`, [ssr_pileup_mark2_2026-06-17.md](ia/reports/implementations/ssr_pileup_mark2_2026-06-17.md)).
->   Replaced the Mark-1 reference-anchored **rung** model with the **empirical-candidate** model: candidate
->   alleles are observed sequences, the reference is only a coordinate frame, no on/off-ladder, no Stage-1
->   likelihood. Per read: a per-Q Viterbi+traceback **delimits** the repeat region → first-quartile **quality
->   gate** (Phred 15) → tally **observed sequence → count** per locus. New `registry_ssr` schema
->   (per-observation `obs-count`/`obs-seq-len`/`obs-seq` Bytes; no version bump, pre-alpha). Built in 7 steps;
->   the old `src/ssr_mark1/` tree + its bench/example were deleted at the cutover. fmt/clippy `-D warnings`
->   clean; **1116 lib + integration + doctests, 0 failed**, incl. end-to-end catalog→BAM→`.ssr.psp` +
->   thread-count determinism. Design: [ssr_ladder_model.md](doc/devel/architecture/ssr_ladder_model.md),
->   [ssr_pileup_mark2.md](doc/devel/architecture/ssr_pileup_mark2.md). **Latest review:**
->   [ssr_pileup_mark2_2026-06-17.md](doc/devel/reports/reviews/ssr_pileup_mark2_2026-06-17.md) (Request-changes);
->   fixes [fixes_applied_2026-06-17_v2.md](doc/devel/reports/reviews/fixes_applied_2026-06-17_v2.md) (3 Blockers + 9 Majors applied).
->   Open (deferred from the fix run): **M4** HMM-model provenance tag; **M12** `DpState` enum refactor; Mi2/Mi8/Mi9/Mi10/Mi11/Mi12;
->   `WriterProvenance.input_crams` crate-wide rename; allele-diverse cap-bites + `BorderOffEnd` e2e tests.
->   Then: calibrate Q1/cap on real data; a Mark-2 bench; spec §4 amendment; Stage 2 (`ssr-call`).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M8: tomato2 validation of M7 (byte-identical, 3.97× faster)**
+>   (branch `tomato2-paralog-filter`). Regenerated all 59 tomato2 `.psp` with the current binary (the on-disk ones predated M5/M6 —
+>   no windowed columns, v2 summary) and ran the M7 vs M6 comparison in the container (8 cpu / 16 GB, ref bind-mounted). **Byte-identity
+>   PASS:** M7-filter-on ≡ M6-filter-on except the `##commandline` binary-path line — all 262,539 records identical, provenance identical
+>   (π=0.100521, lr_cut=3.8500, converged). **Drop-profile unchanged:** 20,809 dropped = 7.34 %. **Wall: 3.97× end-to-end** (M6 178.4 s →
+>   M7 44.9 s; filter marginal cost +150.3 s → +16.8 s, ~8.9×; baseline caller 28.1 s). **RSS flat** (M7 350 MB vs M6 399 MB). **σ₀
+>   recorded** (owed from M4): 59/59 fit, median 0.270 (0.208–0.329) via new `examples/tomato2_sigma0.rs`. Container-capped — prod 32-core
+>   re-measure belongs on the Linux dev box, but the M6:M7 ratio is the trustworthy figure. The pileup-window-coverage arch (M1–M8) is
+>   complete. Report: [paralog_m7_tomato2_validation_2026-07-02.md](doc/devel/reports/implementations/paralog_m7_tomato2_validation_2026-07-02.md).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M7: score the LR once in the caller worker (single write pass)**
+>   (branch `tomato2-paralog-filter`). The main perf payoff for the +11.6× two-pass regression. Placement A (the arch doc's later
+>   refinement, now trivial because M5 made the worker gather window coverage): a cohort-constant `ParalogScoringContext` (pre-pass
+>   coverage models + cohort `F` slice + σ₀ + precompute) is built once and held read-only by `VariantCaller`; `call_chunk` scores each
+>   locus's LR inline (from the window coverage it gathers + the record's AD) onto `CalledChunk.paralog_lr` (NaN=unscored→kept). The sink
+>   folds each stored LR into the calibration histogram inline (`SinkOutput::Spill(histogram)`), so calibration is now pure
+>   (`calibrate_from_histogram`, no spill read) and the write pass reads the stored LR and applies the cut — **one spill read, one scoring,
+>   on the parallel workers**. The old spill-reading `calibrate`/`score_spill_record` became `#[cfg(test)]`. Also replaced the per-locus
+>   binary-search window gather with a per-sample forward merge-join (monotone cursor + debug_assert). VCF byte-identity holds by
+>   construction (same pure scorer, same inputs, bit-exact spill round-trip; order-independent integer-bin histogram) — verified by the
+>   review's reliability pass. 1519 lib + all integration + clippy/fmt green. 7-category parallel review: 2 Major (missing worker-scoring
+>   test + stale module docs) + 3 Minor, all applied. Review: [paralog_m7_2026-07-02.md](doc/devel/reports/reviews/paralog_m7_2026-07-02.md).
+>   Next in plan: M8 (validate on tomato2 — drop-profile/wall/RSS — + implementation report + real tomato2 σ₀).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M6: retire the window-spill write side + `n_tiles`→`n_positions` rename**
+>   (branch `tomato2-paralog-filter`). Per-sample centred-window coverage now flows `.psp` columns → `CalledChunk::window_coverage` →
+>   the record spill (landed M5), so the old sibling "window spill" (Approach A / S6c: a tile-keyed coverage file joined per locus) is
+>   fully dead. M6 deleted its whole write side — `WindowSpillBuilder`/`WindowSpillWriter`/`WindowSpillRecord`/`encode_window`,
+>   `WindowMeanDepthAccumulator`, `ReferenceWindowGc`, the fold-loop wiring in `pipeline.rs`, the now-dead `ChunkPlan` accessors,
+>   `TwoPhaseSegment::depth_at`, `ParalogPrePass::window_bp()` (3 modules removed, +105/−1302). `reference_base_matches` (the write-pass
+>   coordinate guard) relocated into `write_pass.rs`. Renamed the coverage-by-GC histogram field `n_tiles`→`n_positions` (sliding-window
+>   model = one sample per covered position) and **bumped `SAMPLE_SUMMARY_VERSION` 2→3** (review finding — the on-disk `.psp` key changed).
+>   1517 lib tests + paralog integration green, clippy/fmt clean, VCF byte-identity preserved (record-spill codec + calibrate/write passes
+>   untouched). 7-category parallel review: 1 Major + 1 Minor + 1 missing test, all applied.
+>   Review: [paralog_m6_2026-07-02.md](doc/devel/reports/reviews/paralog_m6_2026-07-02.md).
+>   Next in plan: M7 (score the paralog LR once in the caller worker → single write pass) then M8 (tomato2 validation + report).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — single-individual reformulation IMPLEMENTED + validated (Steps A/B/C)**
+>   (branch `tomato2-paralog-filter`). Built the reformulation: **Step A** dropped `min_samples` (the
+>   LR self-gates — under-powered → LR≈0 → kept); **Step B** made `F` the caller's single cohort
+>   `--inbreeding-coefficient` and **deleted `Hexp` + the main-pass accumulator + `obs_het` +
+>   callable-reference** (a correct per-individual `F` isn't AF-free-identifiable, and the per-variant
+>   proxy is divergence-contaminated per Premise 3; `F` is a weak knob). Only global quantity left = π
+>   (over loci). **Step C re-validation on tomato2 (no truth → profile coherence):** π = 0.092 (R1
+>   ≈0.09, converged), **6.64 % dropped**, drop profile **preserved** (coverage 1.29× + het-excess
+>   0.116 vs 0.046), **Jaccard 0.87** vs the old drop set, filter-off byte-identical. **n=1 works:**
+>   one tomato sample drops 531 loci (7.1 %) that are het at **2.3× coverage** — graceful degradation
+>   confirmed, coverage carries it. `F=0` default (outbred) still works because coverage is
+>   load-bearing; selfing cohorts can raise `--inbreeding-coefficient`. Full suite green, clippy clean.
+>   Report: [paralog_single_sample_validation_2026-07-02.md](doc/devel/reports/implementations/paralog_single_sample_validation_2026-07-02.md).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — single-individual reformulation DESIGNED (spec + plan; supersedes Premise 3)**
+>   (branch `tomato2-paralog-filter`). Settled with the owner across a long design thread: make the
+>   score degrade gracefully from **one individual** up, with no cohort-wide allele-frequency
+>   quantity and no `min_samples` gate. Key resolution — the evidence separates by what it needs:
+>   **per-individual** coverage model (load-bearing, n=1-safe); **per-locus het expectation inferred**
+>   by H1's SFS-prior marginalisation (immune to the paralog self-masking because H1's coverage term
+>   is `Normal(1)` regardless of frequency, so a 2× locus is unexplainable — the coverage is the
+>   discriminator); **cohort-level, weak** `F` = the caller's single `--inbreeding-coefficient` (NOT a
+>   per-individual `Hexp`-derived value — that reduces to the divergence-contaminated `n_het/n_variant`
+>   ratio Premise 3 already measured as inverted); **across-loci** π unchanged. Three code changes
+>   (drop `min_samples` → LR self-gates; `F` = cohort coeff; **remove `Hexp` + accumulator + obs_het**
+>   → two-pass flow simplifies) + profile-based T1 re-validation (no truth set). Optional SFS-prior
+>   calibration + low-n soft-flag deferred. Docs:
+>   [hidden_paralog_single_sample_scoring.md](doc/devel/architecture/hidden_paralog_single_sample_scoring.md)
+>   + [paralog_single_sample_scoring.md](doc/devel/implementation_plans/paralog_single_sample_scoring.md).
+>   **Next:** implement Step A (drop gate) → Step B (F/Hexp) → Step C (re-validate).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — hard-error on missing `.psp` summary + fix perf-work example breakage**
+>   (branch `tomato2-paralog-filter`). Closed the on-by-default footgun: `require_paralog_summaries`
+>   now **fails loud** (`PipelineError::ParalogSummaryMissing`, names the first sample, points at
+>   `--no-paralog-filter`) when the filter is on but a `.psp` carries no parseable coverage summary —
+>   no more silent unfiltered callset on pre-summary `.psp`. A summary that parses but fails the
+>   coverage fit (degenerate sample) is still carried absent, not fatal. Unit tests for the guard;
+>   `thread_budget_integration` now passes `--no-paralog-filter` (synthetic summary-less `.psp`). Also
+>   fixed the L1-memoization commit's missed propagation to `examples/paralog_score_parity.rs`
+>   (`score_locus_for_paralogy` now takes `&ParalogScorePrecompute`) so `--all-targets` builds. Full
+>   suite green, clippy clean. **Open (owner):** the T2 wall cost (perf review ranked H1 parallelise
+>   /L1 done/S1 spill-LR) and the **single-individual graceful-degradation reformulation** (drop
+>   `min_samples` + the pop-gen `Hexp`/`F` term → per-individual obs-het excess coupled to coverage;
+>   π stays as the only global, across-loci quantity).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — freebayes comparison (GIAB safety + tomato2 FP-class)**
+>   (branch `tomato2-paralog-filter`). **GIAB:** the cohort filter is a structural no-op on the
+>   single-sample GIAB benchmark (0 loci scored → 0 dropped; on==off byte-identical across HG002/3/4
+>   @50×) — no harm to the clean human callset; GIAB also excludes seg-dups so the paralog class is
+>   absent by construction. **tomato2 vs freebayes (v1.3.10, same 59 samples / 160×200 kb): freebayes
+>   emits 79 % of the loci our filter drops** (99 % ALT match; **55 % of all our drops pass freebayes'
+>   default QUAL≥30**; fb QUAL mean 750 vs 585 kept — the depth-inflated confidently-wrong signature)
+>   → the filter removes an FP class a standard caller leaves in. Figure
+>   `benchmarks/tomato2/results/paralog_vs_freebayes.png` (local/regenerable). Report:
+>   [paralog_vs_freebayes_2026-07-02.md](doc/devel/reports/implementations/paralog_vs_freebayes_2026-07-02.md).
+>   (Aside: pre-existing single-pass stack overflow on HG003 @default stack — untouched code, needs `RUST_MIN_STACK`.)
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — performance review of the T2 wall regression (+11.6×) → root-caused + solutions ranked**
+>   (branch `tomato2-paralog-filter`). Ran the `rust-performance-review` skill (5 categories in parallel) over the two
+>   scoring passes + the pure kernel. Root cause: the entire +249 s is `score_locus_for_paralogy` run
+>   **single-threaded, twice** (calibrate + write) after the 16-way main pass finished — RSS flat, I/O only ~15 s.
+>   Verdict *Apply the listed wins*: **H1** parallelise both passes (pure scorer, order-independent histogram fold,
+>   write-pass re-serialise-before-emit → byte-identity holds); **L1** memoise the two locus-invariant log-prior
+>   tables (H1 Wright 200×58 = ~26 B redundant `ln`/run, H2 carrier 40×58) as a bit-identical hoist; **L2**/**L3**
+>   config + scratch hoists; **S1** score-once-spill-the-LR (owner sign-off). Gate: add a paralog criterion bench +
+>   one flamegraph. Build profile already optimal. Report: [perf_paralog-filter_2026-07-02.md](doc/devel/reports/reviews/perf_paralog-filter_2026-07-02.md).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — Milestone T (T1 behaviour + T2 cost gate) on tomato2 → T1 PASS, T2 memory-flat but wall +11.6× (owner decision pending)**
+>   (branch `tomato2-paralog-filter`). Ran the production two-pass filter on the 59-sample tomato2
+>   cohort (regenerated `.psp` with the stored summary section — the committed fixtures predate it,
+>   which silently no-op'd the filter: **footgun** — recommend a loud warn/error when few samples
+>   fit). **T1 PASS:** 58/59 fit, **π = 0.099** (R1 ≈0.09, EM converged), 6.98 % dropped; dropped set =
+>   **coverage excess (1.27×) + het excess (0.124 vs 0.045)** = the R1 paralog signature; AF is not the
+>   discriminator; introgression-like (normal-coverage) loci survive. **T2:** peak RSS **flat**
+>   (336→363 MB, +8 %, independent of 376 k loci — the memory obligation holds) but **wall +11.6×**
+>   (23→272 s) from the per-locus H1/H2 scorer running over 376 k loci × 58 samples **twice**,
+>   **single-threaded** (calibrate + write passes); spill 3.5 GB on disk (record spill, verbatim
+>   `PosteriorRecord`). **Owner decision (T2 gate):** parallelise the two scoring passes / spill the
+>   LR once / or ship off-by-default — memory is fine, cost is an optimisation problem not a design
+>   flaw. Report: [paralog_t1_t2_2026-07-02.md](doc/devel/reports/implementations/paralog_t1_t2_2026-07-02.md).
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — Milestone S COMPLETE: var-calling wiring (S6c part 2) → the two-pass filter runs end-to-end and is ON by default (S6 checkpoint)**
+>   (branch `tomato2-paralog-filter`). Approach A landed: the producer writes a second ephemeral
+>   **window spill** ((chrom_id, tile, gc, [per-sample depths]) per variant window) alongside the
+>   record spill; the calibrate + write passes join the two by tile key in coordinate lockstep
+>   (`WindowJoin`), so the byte-identity-critical caller/chunk types stay untouched. Steps: ChunkPlan
+>   + `TwoPhaseSegment::depth_at` accessors; `WindowSpillBuilder` fed inline in both fold loops with
+>   a per-contig `ReferenceWindowGc` (separate streaming fetcher); `score_spilled_locus` takes the
+>   joined (gc, depths); write-pass reference-base consistency guard (fail loud on coordinate drift);
+>   `PARALOG_WINDOWS_WIRED` deleted → filter **on by default** at `--paralog-fdr 0.01`
+>   (`--no-paralog-filter` restores the single-pass path). Adversarial review fix: `flush_ready`
+>   flushes by the cohort-fed frontier (force-closing lagging samples' open windows) so `pending`
+>   stays bounded near the frontier, not O(contig tiles × samples). New end-to-end two-pass
+>   integration test (provenance header + spill cleanup). **1512 lib + all integration tests green,
+>   clippy clean, byte-identity preserved (existing var-calling tests pass `--no-paralog-filter`).**
+>   Owed: **T1** (real tomato2 drop-profile vs R1) + **T2** (cost/RSS gate — the on-by-default cost);
+>   the E2E test asserts orchestration/cleanup but defers the *synthetic drop* assertion to T1
+>   (`min_samples`=20 + coverage-fit make a deterministic synthetic drop brittle; drop mechanics are
+>   unit-tested in `write_pass`). Plan: [paralog_varcalling_wiring.md](doc/devel/implementation_plans/paralog_varcalling_wiring.md).
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — R1 data-first validation on tomato2 (checkpoint) → the pure maths is trustworthy on real data**
+>   (branch `tomato2-paralog-filter`). New `examples/paralog_score_parity.rs` (Rust harness: reads
+>   59 `.psp` + cohort VCF, runs Q2–Q5 end-to-end, dumps per-locus LR/post/qval + per-sample σ₀/F)
+>   + `benchmarks/tomato2/src/paralog_score_parity.py` (uv companion: the checks Rust can't — LR
+>   correlation vs the prototype parquet, F Spearman, flagged-set profile). **All data-first checks
+>   met:** σ₀ 0.282 (≈0.28); mode/median guard passes 58/59 real samples; **LR Pearson 0.9931** vs
+>   the prototype (≥0.98 target) on 268 537 shared loci; **π 8.88 %** (≈9 %); **F Spearman 0.851**
+>   (≈0.86); flagged set = paralog profile (obs_het 0.115 + 1.31× coverage vs kept 0.043 + 1.04×).
+>   The data caught one real bug (the `Hexp` per-position scale — must be Σ2pq/callable not
+>   mean-2pq-over-variant-sites; the S1 wiring must match). Report:
+>   [paralog_r1_data_validation_2026-07-01.md](doc/devel/reports/implementations/paralog_r1_data_validation_2026-07-01.md).
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q COMPLETE (Q4 inbreeding + Q5 empirical-Bayes prior/FDR) → the pure statistics core is done (checkpoint)**
+>   (branch `tomato2-paralog-filter`). Q4: `obs_het` (het rate) + `inbreeding_coefficient`. Q5:
+>   bounded-RAM `ParalogLrHistogram` + `ParalogPrior::estimate` (EM for π over histogram bins) +
+>   `ParalogFdrCurve` (tail-FDR `q_of_lr` + `lr_threshold_for_fdr`). Numerically verified faithful
+>   to `build_paralog_eb.py` (histogram EM ≡ full-vector mean; tail-FDR-from-top ≡ rank-by-posterior
+>   running mean). Fixed constructor-contract inconsistency (→ `Option`), silent EM non-convergence
+>   (→ `converged` flag), duplicated binning (→ shared `UniformBinning`). **65 paralog tests**, 1463
+>   lib tests, fmt/clippy clean. **Checkpoint reached: the three statistics pieces (coverage model,
+>   scorer, prior/FDR) are built and unit-tested in isolation.** Next: R1 (data-first validation on
+>   tomato2), then Milestone S (var-calling wiring). Report: [paralog_q5_prior_2026-07-01.md](doc/devel/reports/reviews/paralog_q5_prior_2026-07-01.md).
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q, step Q3 (`score_locus_for_paralogy` — the H1-vs-H2 marginal likelihood ratio)**
+>   (branch `tomato2-paralog-filter`). Pure per-locus scorer: H1 (real variant) marginalises allele
+>   freq under the folded-SFS prior with Wright HWE genotype priors + genotype-independent Normal
+>   coverage; H2 (hidden paralog) marginalises carrier config × carrier-freq, coverage `Normal(T/2,
+>   σ₀√(T/2))`, `vaf=m/T<1` (hom-alt veto falls out). Result = `logL(H2)−logL(H1)`, a pure LR.
+>   Two parallel review sub-agents **verified numerical faithfulness** to `build_paralog_lr.py`
+>   line-by-line, then caught + fixed 3 release-mode safety holes (u32 underflow, zero-σ₀ NaN,
+>   length-mismatch truncation). **44 paralog tests** incl. an absolute-value hand-computed parity
+>   anchor; fmt/clippy clean. Report: [paralog_q3_locus_score_2026-07-01.md](doc/devel/reports/reviews/paralog_q3_locus_score_2026-07-01.md).
+> - **Last completed task (2026-07-01):** **Hidden-paralog filter — Milestone Q, steps Q1–Q2 (pure statistics module: `ParalogModelParams` + `SingleCopyCoverageModel::fit`)**
+>   (branch `tomato2-paralog-filter`). New `src/paralog/` peer module (arch Premise 0). **Q1:**
+>   `ParalogModelParams` + `SfsPriorSpec`/`GridSpec` with prototype-faithful defaults. **Q2:**
+>   `SingleCopyCoverageModel::fit` from the binned coverage-by-GC histogram — mode-anchored
+>   `single_copy_scale` (parabolic sub-bin refine + mode/median sanity guard), per-GC weighted-median
+>   `gc_bias_curve` (gap-filled + smoothed), σ₀ = 1.4826·MAD floored at histogram resolution;
+>   `relative_copy_number(gc,depth)`. Two parallel review sub-agents caught + fixed a σ₀
+>   band-collapse over-confidence bug, a dead error variant (→ reachable `DepthModeAtBottomBin`),
+>   and a tuple→`ModeMedianRatioBounds` newtype; **24 paralog tests**, 1422 lib tests, fmt/clippy
+>   clean. Reports: [paralog_q2_coverage_model_2026-07-01.md](doc/devel/reports/reviews/paralog_q2_coverage_model_2026-07-01.md).
 
 ---
 
@@ -551,6 +587,46 @@ gitignored).
     `--no-complexity-filter`) shipped with `var-calling`;
     end-to-end integration test exists in
     [tests/cohort_cli_integration.rs](tests/cohort_cli_integration.rs).
+
+#### Hidden-paralog per-sample summaries (`.psp` metadata section)
+- **Status:** shipped on branch `tomato2-paralog-filter` (A1–D3 done; the `pileup` CLI emits the per-sample summary section end-to-end; D2 coverage parity vs the tomato2 prototype confirmed — exact window counts, mean depth within histogram-bin resolution; D3 cost in the noise). Owed: an exact pileup wall/RSS before-after on host CRAM; the downstream filter model that *consumes* the summaries (curve/scale fit, H1/H2 LR, EB/FDR) is a separate follow-on plan.
+- **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md)
+- **Architecture:** [hidden_paralog_psp_integration.md](doc/devel/architecture/hidden_paralog_psp_integration.md)
+- **Plan:** [paralog_psp_summaries.md](doc/devel/implementation_plans/paralog_psp_summaries.md)
+- **A1 (`.psp` metadata-section container):** done — optional zstd-framed metadata section between the block index and the trailer (trailer byte-identical; located by arithmetic; zip-bomb + trailing-byte guards). Code: [src/psp/metadata.rs](src/psp/metadata.rs), `PspWriter::attach_metadata` / `PspReader::metadata`.
+- **B1 (SNP summary payload + TOML serde):** done — `SampleSummary { coverage_by_gc, heterozygosity }` data model serialised as the section's TOML document, with `validate()` invariants + version policy. Code: [src/sample_summary/mod.rs](src/sample_summary/mod.rs).
+- **B2 (coverage-by-GC accumulator):** done — single-pass tiled fold producing the histogram. Code: [src/sample_summary/coverage.rs](src/sample_summary/coverage.rs).
+- **B3 (het accumulator):** done — binomial het-vs-hom LR three-way classification (confident het / hom-alt / ambiguous) over `SiteCounts`; amended spec §3 + arch Premise 1b/2 + B1 `HetCounts` (two→four counts). Code: [src/sample_summary/het.rs](src/sample_summary/het.rs).
+- **C1+C2 (Stage-1 wiring):** done — `--gc-window-bp` flag + `SampleSummaryAccumulators` bundle wired into the [pileup_to_psp.rs](src/pileup/per_sample/pileup_to_psp.rs) seam (record→counts shaping); the `pileup` CLI emits the `.psp` summary section end-to-end (asserted in `pileup_cli_integration`). D1 reader-side accessor is satisfied by composition (`PspReader::metadata()` + `SampleSummary::from_toml_bytes`); no new code (keeps the container schema-agnostic).
+- **D2/D3 (parity + cost):** done — coverage histogram re-derived from existing tomato2 `.psp` bodies matches the prototype's `window_cov.w500` (exact window counts, mean depth within 0.07%); re-derive cost ~1.25 s/sample. Tool: [examples/dump_sample_summary.rs](examples/dump_sample_summary.rs). Report: [paralog_summary_parity_2026-06-29.md](doc/devel/reports/implementations/paralog_summary_parity_2026-06-29.md).
+- **Latest reviews:** [stage1_summary_wiring_2026-06-29.md](doc/devel/reports/reviews/stage1_summary_wiring_2026-06-29.md), [het_accumulator_2026-06-29.md](doc/devel/reports/reviews/het_accumulator_2026-06-29.md), [coverage_accumulator_2026-06-29.md](doc/devel/reports/reviews/coverage_accumulator_2026-06-29.md), [sample_summary_2026-06-29.md](doc/devel/reports/reviews/sample_summary_2026-06-29.md), [psp_metadata_section_2026-06-29.md](doc/devel/reports/reviews/psp_metadata_section_2026-06-29.md)
+- **Latest fixes-applied:** [fixes_applied_2026-06-29_stage1_summary_wiring.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_stage1_summary_wiring.md), [fixes_applied_2026-06-29_het_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_het_accumulator.md), [fixes_applied_2026-06-29_coverage_accumulator.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_coverage_accumulator.md), [fixes_applied_2026-06-29_sample_summary.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_sample_summary.md), [fixes_applied_2026-06-29_psp_metadata_section.md](doc/devel/reports/reviews/fixes_applied_2026-06-29_psp_metadata_section.md)
+- **Open:** D2 empirical parity vs the tomato2 Python prototype + D3 cost check (both need real tomato2 CRAM/`.psp` data); A1-Mi5 (cap not inspectable — deferred); B1-Mi4 (`bad` closure extract once a 3rd use appears); B2-Mi3 (scheme/histogram field dup — deferred); het/bin params hardcoded (promote to CLI flags when calibration needs it); out-of-scope crate-wide `write_io_err` helper follow-up.
+
+#### Hidden-paralog filter — consumer model + var-calling wiring
+The follow-on that *consumes* the per-sample summaries above: the pure statistics
+module `src/paralog/` (coverage-model fit, H1-vs-H2 LR, inbreeding scalar,
+empirical-Bayes prior + FDR) and the var-calling wiring that scores every locus and
+emits a `FILTER`/INFO verdict.
+- **Status:** in progress on branch `tomato2-paralog-filter`. **P1 + Q1–Q5 + R1 done; Milestone S wiring in flight (S1–S4 done, S4 checkpoint reached — given a spill, the full calibration is produced RAM-flat). Next: S5 write pass, S6 orchestration+CLI.**
+- **Spec:** [hidden_paralog_filter.md](doc/devel/specs/hidden_paralog_filter.md) (§4–§7)
+- **Architecture:** [hidden_paralog_locus_statistic.md](doc/devel/architecture/hidden_paralog_locus_statistic.md) (Premises 0–6, statistics core) + [hidden_paralog_varcalling_wiring.md](doc/devel/architecture/hidden_paralog_varcalling_wiring.md) (Milestone S data flow — settled: hard removal, on-by-default, inline per-window coverage fold, ephemeral length-framed-binary spill)
+- **Plan:** [paralog_filter_model.md](doc/devel/implementation_plans/paralog_filter_model.md) (P1; Q1–Q5; R1 — **done**) + the detailed wiring plan [paralog_varcalling_wiring.md](doc/devel/implementation_plans/paralog_varcalling_wiring.md) (S1–S6; T1–T2 — next)
+- **P1 (callable-position total):** done — `CoverageByGcHistogram.callable_positions` (het-rate denominator) accumulated in Stage-1, round-trips through the `.psp`, `SAMPLE_SUMMARY_VERSION` 1→2. Code: [src/sample_summary/coverage.rs](src/sample_summary/coverage.rs), [src/sample_summary/mod.rs](src/sample_summary/mod.rs). Review: [paralog_p1_callable_positions_2026-07-01.md](doc/devel/reports/reviews/paralog_p1_callable_positions_2026-07-01.md).
+- **Q1 (module skeleton + `ParalogModelParams`):** done — `src/paralog/` peer module; fixed model constants/grids (ε, carrier copy numbers, folded-SFS + carrier-freq grids, hom-alt veto) with prototype-faithful defaults. Code: [src/paralog/mod.rs](src/paralog/mod.rs).
+- **Q2 (`SingleCopyCoverageModel::fit`):** done — mode-anchored single-copy scale (parabolic refine + mode/median guard), per-GC weighted-median bias curve, σ₀ = 1.4826·MAD floored at histogram resolution; `relative_copy_number`. Code: [src/paralog/coverage_model.rs](src/paralog/coverage_model.rs). Review: [paralog_q2_coverage_model_2026-07-01.md](doc/devel/reports/reviews/paralog_q2_coverage_model_2026-07-01.md).
+- **Q3 (`score_locus_for_paralogy`):** done — pure H1-vs-H2 marginal LR (folded-SFS `p` marginal + Wright HWE for H1; carrier config × freq marginal for H2; hom-alt veto falls out). Numerically verified faithful to the prototype. Code: [src/paralog/locus_score.rs](src/paralog/locus_score.rs). Review: [paralog_q3_locus_score_2026-07-01.md](doc/devel/reports/reviews/paralog_q3_locus_score_2026-07-01.md).
+- **Q4 (inbreeding scalar `F`):** done — pure `obs_het = n_het/callable` (het *rate*, not the inverting variant-site ratio) + `inbreeding_coefficient = clip(1 − obs_het/hexp, 0, 0.99)`; `Hexp` accumulated by the wiring (S1). Zero-callable → `F` inert (no per-locus data). Code: [src/paralog/inbreeding.rs](src/paralog/inbreeding.rs).
+- **Q5 (empirical-Bayes prior + FDR):** done — bounded-RAM `ParalogLrHistogram` + `ParalogPrior::estimate` (EM for π over bins, `converged` flag) + `ParalogFdrCurve` (`q_of_lr` tail FDR + `lr_threshold_for_fdr`). Numerically verified faithful to the prototype. Code: [src/paralog/prior.rs](src/paralog/prior.rs). Review: [paralog_q5_prior_2026-07-01.md](doc/devel/reports/reviews/paralog_q5_prior_2026-07-01.md).
+- **Milestone Q complete** — the three pure statistics pieces (coverage model, scorer, prior/FDR) built + unit-tested in isolation.
+- **R1 (data-first validation):** done — `examples/paralog_score_parity.rs` + `benchmarks/tomato2/src/paralog_score_parity.py` validate Q2–Q5 on real tomato2: σ₀ 0.282, LR Pearson 0.9931 vs prototype, π 8.88 %, F Spearman 0.851, flagged=paralog profile. Caught + fixed the `Hexp` per-position scale bug (Σ2pq/callable). Report: [paralog_r1_data_validation_2026-07-01.md](doc/devel/reports/implementations/paralog_r1_data_validation_2026-07-01.md). **The maths is trustworthy before wiring (Milestone S).**
+- **S1 (`ParalogPrePass` + `HexpAccumulator`):** done — the up-front per-sample state (coverage model + `obs_het` + callable count fit from each `.psp` `SampleSummary`; a missing/rejected sample carried absent, never fatal; `callable_reference()` = cohort-median callable) and the running `Hexp` accumulator (`Σ(1−Σpᵢ²)`, `finish` divides by the callable reference — per-callable-position scale, the R1 correction). Memory-flat (accumulator = two scalars). Code: [src/var_calling/paralog_filter/prepass.rs](src/var_calling/paralog_filter/prepass.rs). Reviewed (approve, doc fixes applied).
+- **S2 (ephemeral spill):** done — `ParalogSpill`/`ParalogSpillWriter`/`ParalogSpillReader`: a self-contained length-framed binary store (chosen over the `.psp` container — the payload is per-sample-vector shaped), carrying the full `PosteriorRecord` verbatim + per-sample window so S5 reconstructs a bit-identical record and byte-identity holds by construction; RAII temp-file deleted on drop (success/error/panic); one record resident at a time. Code: [src/var_calling/paralog_filter/spill.rs](src/var_calling/paralog_filter/spill.rs). Reviewed (approve-with-changes; `put_support` exhaustive-destructure + bounded read applied).
+- **S3 (per-window coverage pieces):** done — `ReferenceWindowGc` (shared per-window GC from the reference, streamed via the existing memory-flat `StreamingChromRefFetcher`; N-excluded) + `WindowMeanDepthAccumulator` (per-sample window mean depth, free from the `.psp` light columns; tiling byte-identical to `CoverageByGcAccumulator`) + `reference_base_matches` (coordinate-consistency guard). **Design revised with the owner:** GC is a shared *reference* property (not per-sample; FASTA not a per-position sync but a standalone window walk), depth is per-sample; per-sample depth deliberately does *not* N-exclude (documented approximation, T1-validated). Spill record reshaped to `window_gc: f32` + `window_mean_depth: Vec<Option<f32>>`. Code: [src/var_calling/paralog_filter/window_gc.rs](src/var_calling/paralog_filter/window_gc.rs), [window_coverage.rs](src/var_calling/paralog_filter/window_coverage.rs). Reviewed (approve). The producer *wiring* of these moves to S6 (the fold re-folds + is parallel, so a standalone "run unused in the fold" milestone isn't meaningful).
+- **S4 (calibrate pass):** done — `score_spilled_locus` (shared, pure, deterministic per-locus scorer reused by S5 for bit-identical recompute) + `calibrate` (streams the spill → `ParalogLrHistogram` → `ParalogPrior::estimate` EM with fixed-prior fallback → `ParalogFdrCurve` + `lr_threshold`). RAM-flat (histogram + one record + O(samples) scratch). `ParalogCalibration::flags` = the FDR drop decision. Code: [src/var_calling/paralog_filter/calibrate.rs](src/var_calling/paralog_filter/calibrate.rs). Reviewed (approve-with-changes; non-finite-LR screen + fallible access applied). **S4 checkpoint: given a spill, π + FDR cut produced RAM-flat.**
+- **Carried forward:** downstream `Hobs` consumers (S1) must guard the zero-callable case (`validate()` admits `callable_positions == 0` for an all-`N` sample); Q4 handles it (zero rate → inert `F`). Next: **S5** (write pass — spill → recompute LR → apply cut → VCF + header provenance + `records_dropped_paralog`), then **S6** (orchestration: main-pass spilling, producer window wiring, CLI `--paralog-fdr` / `--no-paralog-filter`, byte-identity-off). S6 also owns: the fallback-warning granularity (empty-histogram vs EM-max-iter), and the operator warning on non-convergence.
+- **Latest perf review:** [perf_paralog-filter_2026-07-02.md](doc/devel/reports/reviews/perf_paralog-filter_2026-07-02.md) — the T2 wall follow-up (filter on = +11.6× wall, RSS flat). Verdict *Apply the listed wins*; 5 categories dispatched. The whole +249 s is the pure per-locus scorer run **single-threaded, twice** (calibrate + write) after the 16-way main pass finished — I/O is only ~15 s. Levers, ranked: **H1** parallelise both passes (serial read+join → rayon score-batch → serial fold/emit; histogram fold is order-independent, write pass re-serialises before the writer — byte-identity holds); **L1** memoise the two locus-invariant log-prior tables (H1 Wright 200×58 rebuilt every locus = ~26 B redundant `ln`; H2 carrier 40×58) — pure bit-identical hoist; **L2** hoist `enumerate_carrier_configs` out of the per-locus call; **L3** reuse the six per-locus scratch `Vec`s (per-worker after H1). **S1** score-once + spill the LR to disk (halves work, complements H1, needs owner sign-off — overturns recompute-not-cache). Gating deliverable: add `benches/paralog_scoring_perf.rs` (kernel + streaming) + one `cpu-clock` flamegraph to order the kernel micro-opts. Build profile already optimal (no change). Audit trail `tmp/perf_review_2026-07-02_paralog-filter/`.
+- **Open (perf, from the 2026-07-02 review):** **H1** parallelise the calibrate + write passes (the +11.6× fix; RSS-vs-batch-size sweep is the gate — the batch of N owned records is a new RAM cost vs the RAM-flat one-record-at-a-time design). **L1** memoise the Wright/carrier log-prior tables (exact-float-equality gate). **L2** hoist `enumerate_carrier_configs`. **L3** `ScorerScratch` per-worker. **Bench gap:** no criterion bench or sampling profile for the paralog path yet — add both before landing the kernel micro-opts (one hypothesis per measurement).
 
 ---
 

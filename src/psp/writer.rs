@@ -299,6 +299,13 @@ pub struct PspWriter<W: Write, S: PspKind = SnpKind> {
     /// a different window starts a new block. Identical across samples ⇒
     /// aligned block boundaries. See [`DEFAULT_BLOCK_WINDOW_BP`].
     block_window_bp: u32,
+    /// Opaque payload for the optional metadata section (architecture
+    /// `doc/devel/architecture/hidden_paralog_psp_integration.md`),
+    /// stamped by [`Self::attach_metadata`] and written at
+    /// [`Self::finish`] between the block index and the trailer. `None`
+    /// ⇒ no section is written and the file is byte-identical to one
+    /// produced before this field existed.
+    metadata: Option<Vec<u8>>,
 }
 
 impl<W: Write> PspWriter<W, SnpKind> {
@@ -657,7 +664,26 @@ impl<W: Write, S: PspKind> PspWriter<W, S> {
             scratch,
             target_block_bytes,
             block_window_bp: block_window_bp.max(1),
+            metadata: None,
         })
+    }
+
+    /// Attach an opaque payload to be written as the file's single
+    /// **metadata section** at [`Self::finish`] — a zstd frame placed
+    /// between the block index and the trailer, located on read as the
+    /// bytes between `index_offset + index_byte_length` and the trailer
+    /// start (the 32-byte trailer layout is unchanged). The payload is a
+    /// kind-defined document; the container core stores it verbatim.
+    ///
+    /// Call at most once before `finish`. A second call is a producer
+    /// bug (the first payload would be lost) and returns
+    /// [`PspWriteError::MetadataAlreadyAttached`].
+    pub fn attach_metadata(&mut self, payload: Vec<u8>) -> Result<(), PspWriteError> {
+        if self.metadata.is_some() {
+            return Err(PspWriteError::MetadataAlreadyAttached);
+        }
+        self.metadata = Some(payload);
+        Ok(())
     }
 
     /// Flush any open block, write the block index, and write the
@@ -691,6 +717,28 @@ impl<W: Write, S: PspKind> PspWriter<W, S> {
                 source: e,
             })?;
         self.sink_offset += index_byte_length;
+
+        // Optional metadata section: a zstd frame after the index and
+        // before the trailer. The trailer's pointer math is unchanged —
+        // the reader recovers the section as the gap between index-end
+        // and trailer-start, so writing nothing leaves a zero-length gap
+        // (no section) and a byte-identical file.
+        if let Some(payload) = self.metadata.take() {
+            let frame =
+                super::metadata::compress_metadata(&payload).map_err(|e| PspWriteError::Io {
+                    context: "metadata section",
+                    block_index: None,
+                    column_tag: None,
+                    source: e,
+                })?;
+            self.sink.write_all(&frame).map_err(|e| PspWriteError::Io {
+                context: "metadata section",
+                block_index: None,
+                column_tag: None,
+                source: e,
+            })?;
+            self.sink_offset += frame.len() as u64;
+        }
 
         let trailer = Trailer {
             index_offset,
@@ -946,6 +994,8 @@ pub struct SnpBlock {
     // Per-record columns.
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
+    windowed_gc: Vec<f32>,
+    windowed_coverage: Vec<f32>,
     // Per-allele columns.
     allele_seq_len: Vec<u64>,
     allele_seq_bytes: Vec<u8>,
@@ -972,6 +1022,8 @@ impl BlockAccumulator for SnpBlock {
             last_pos: first_pos,
             delta_pos: Vec::with_capacity(INITIAL_RECORDS_HINT),
             n_alleles: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            windowed_gc: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            windowed_coverage: Vec::with_capacity(INITIAL_RECORDS_HINT),
             allele_seq_len: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_seq_bytes: Vec::with_capacity(INITIAL_ALLELE_SEQ_BYTES_HINT),
             allele_obs_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
@@ -998,6 +1050,8 @@ impl BlockAccumulator for SnpBlock {
         };
         self.delta_pos.push(delta);
         self.n_alleles.push(record.alleles.len() as u64);
+        self.windowed_gc.push(record.windowed_gc);
+        self.windowed_coverage.push(record.windowed_coverage);
 
         for allele in &record.alleles {
             self.allele_seq_len.push(allele.seq.len() as u64);
@@ -1021,7 +1075,9 @@ impl BlockAccumulator for SnpBlock {
         // cap. Chain ids are u64 little-endian (8 bytes/id);
         // zstd compresses the high-order zero bytes effectively.
         let per_record = 1 // delta-pos varint typical
-            + 1; // n-alleles varint typical
+            + 1 // n-alleles varint typical
+            + 4 // windowed-gc f32
+            + 4; // windowed-coverage f32
         let per_allele: usize = record
             .alleles
             .iter()
@@ -1100,6 +1156,9 @@ fn encode_snp_column_into(
             &[&block.allele_seq_bytes[..]],
             out,
         ),
+        // Per-record windowed coverage (NaN permitted — no finite check).
+        ColumnKey::WindowedGc => encode_scalar_column(&block.windowed_gc, out),
+        ColumnKey::WindowedCoverage => encode_scalar_column(&block.windowed_coverage, out),
         ColumnKey::AlleleObsCount => encode_scalar_column(&block.allele_obs_count, out),
         ColumnKey::AlleleQSumLog => {
             // q_sum was finite-validated at write_record time.
@@ -1191,6 +1250,7 @@ fn predict_uncompressed_len(def: &ColumnDef, block: &SnpBlock) -> Option<usize> 
 mod tests {
     use super::*;
     use crate::pileup_record::{AlleleObservation, AlleleSupportStats};
+    use crate::psp::PspReadError;
     use crate::psp::header::{ParsedHeader, parse_header_bytes};
     use crate::psp::index::decode_index;
     use crate::psp::trailer::{TRAILER_BYTES, decode_trailer};
@@ -1225,11 +1285,7 @@ mod tests {
     }
 
     fn record(chrom_id: u32, pos: u32, alleles: Vec<AlleleObservation>) -> PileupRecord {
-        PileupRecord {
-            chrom_id,
-            pos,
-            alleles,
-        }
+        PileupRecord::new(chrom_id, pos, alleles)
     }
 
     // ---------- new() emits a valid framed header -----------------
@@ -1272,6 +1328,175 @@ mod tests {
 
         let index = decode_index(&[], trailer.n_blocks).unwrap();
         assert!(index.is_empty());
+    }
+
+    // ---------- metadata section (A1) -----------------------------
+
+    /// A payload attached via `attach_metadata` round-trips through the
+    /// reader, and the records are unaffected.
+    #[test]
+    fn attach_metadata_round_trips_through_reader() {
+        use crate::psp::PspReader;
+
+        let header = writer_header(1);
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), header).unwrap();
+        writer
+            .write_record(&record(0, 100, vec![allele(b"A", 9, -1.0, &[])]))
+            .unwrap();
+        writer
+            .write_record(&record(0, 200, vec![allele(b"C", 7, -1.0, &[])]))
+            .unwrap();
+        let payload = b"[coverage-gc]\nwindow-bp = 500\n".to_vec();
+        writer.attach_metadata(payload.clone()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut reader = PspReader::new(Cursor::new(bytes)).expect("reader open");
+        assert_eq!(reader.metadata(), Some(payload.as_slice()));
+        // Records still decode correctly alongside the section.
+        let positions: Vec<u32> = reader.records().map(|r| r.unwrap().pos).collect();
+        assert_eq!(positions, vec![100, 200]);
+    }
+
+    /// With no `attach_metadata`, the reader reports `None` and the
+    /// trailing region is empty — the index ends exactly at the trailer
+    /// start (additive-tail invariant: no section bytes are written).
+    #[test]
+    fn no_metadata_yields_none_and_no_trailing_gap() {
+        use crate::psp::PspReader;
+
+        let header = writer_header(1);
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), header).unwrap();
+        writer
+            .write_record(&record(0, 100, vec![allele(b"A", 9, -1.0, &[])]))
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        // index_offset + index_byte_length == trailer_start (no gap).
+        let trailer_bytes: &[u8; TRAILER_BYTES] =
+            bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
+        let trailer = decode_trailer(trailer_bytes).unwrap();
+        let trailer_start = (bytes.len() - TRAILER_BYTES) as u64;
+        assert_eq!(
+            trailer.index_offset + trailer.index_byte_length,
+            trailer_start
+        );
+
+        let reader = PspReader::new(Cursor::new(bytes)).expect("reader open");
+        assert_eq!(reader.metadata(), None);
+    }
+
+    /// `attach_metadata` is single-shot; a second call is rejected.
+    #[test]
+    fn double_attach_metadata_is_rejected() {
+        let header = writer_header(1);
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), header).unwrap();
+        writer.attach_metadata(b"first".to_vec()).unwrap();
+        let err = writer
+            .attach_metadata(b"second".to_vec())
+            .expect_err("second attach must fail");
+        assert!(matches!(err, PspWriteError::MetadataAlreadyAttached));
+    }
+
+    /// Attaching an *empty* payload writes a (tiny) section that reads
+    /// back as `Some(&[])` — distinct from never attaching, which reads
+    /// back as `None`. Pins the zero-vs-no-section semantics.
+    #[test]
+    fn attach_empty_metadata_is_some_empty_distinct_from_none() {
+        use crate::psp::PspReader;
+
+        let mut with = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+        with.attach_metadata(Vec::new()).unwrap();
+        let with_bytes = with.finish().unwrap().into_inner();
+        let with_reader = PspReader::new(Cursor::new(with_bytes)).expect("reader open");
+        assert_eq!(with_reader.metadata(), Some(&[][..]));
+
+        let without = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+        let without_bytes = without.finish().unwrap().into_inner();
+        let without_reader = PspReader::new(Cursor::new(without_bytes)).expect("reader open");
+        assert_eq!(without_reader.metadata(), None);
+    }
+
+    /// A trailer whose `index_byte_length` makes the index end past the
+    /// trailer start is rejected at open with `IndexOverrunsTrailer` —
+    /// both the "runs past trailer" arm and the `u64`-overflow arm.
+    #[test]
+    fn reader_rejects_index_overrunning_trailer() {
+        use crate::psp::PspReader;
+
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+        writer
+            .write_record(&record(0, 100, vec![allele(b"A", 9, -1.0, &[])]))
+            .unwrap();
+        let good = writer.finish().unwrap().into_inner();
+
+        // Rewrite the trailer in place with a corrupted index_byte_length.
+        let corrupt_with = |index_byte_length: u64| -> Vec<u8> {
+            let mut bytes = good.clone();
+            let tb: &[u8; TRAILER_BYTES] = bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
+            let mut trailer = decode_trailer(tb).unwrap();
+            trailer.index_byte_length = index_byte_length;
+            let encoded = encode_trailer(&trailer);
+            let start = bytes.len() - TRAILER_BYTES;
+            bytes[start..].copy_from_slice(&encoded);
+            bytes
+        };
+
+        // (a) index_end = index_offset + len lands past trailer_start.
+        let past = corrupt_with(1_000_000);
+        let err = PspReader::new(Cursor::new(past)).expect_err("overrun must fail");
+        assert!(
+            matches!(err, PspReadError::IndexOverrunsTrailer { .. }),
+            "expected IndexOverrunsTrailer (past), got {err:?}"
+        );
+
+        // (b) index_offset + len overflows u64.
+        let overflow = corrupt_with(u64::MAX);
+        let err = PspReader::new(Cursor::new(overflow)).expect_err("overflow must fail");
+        assert!(
+            matches!(err, PspReadError::IndexOverrunsTrailer { .. }),
+            "expected IndexOverrunsTrailer (overflow), got {err:?}"
+        );
+    }
+
+    /// A corrupt byte inside the metadata frame is caught at open
+    /// (`PspReader::new`) and surfaces as `Zstd`, not a panic or silent
+    /// accept.
+    #[test]
+    fn reader_rejects_corrupt_metadata_frame() {
+        use crate::psp::PspReader;
+
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+        writer
+            .write_record(&record(0, 100, vec![allele(b"A", 9, -1.0, &[])]))
+            .unwrap();
+        writer
+            .attach_metadata(b"[coverage-gc]\nwindow-bp = 500\n".to_vec())
+            .unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+
+        // The metadata frame sits between the index end and the trailer
+        // start. Decode the trailer to locate it, then flip a content
+        // byte in the middle of the frame so the frame length is
+        // unchanged but the content checksum fails.
+        let tb: &[u8; TRAILER_BYTES] = bytes[bytes.len() - TRAILER_BYTES..].try_into().unwrap();
+        let trailer = decode_trailer(tb).unwrap();
+        let index_end = (trailer.index_offset + trailer.index_byte_length) as usize;
+        let trailer_start = bytes.len() - TRAILER_BYTES;
+        assert!(
+            index_end < trailer_start,
+            "expected a non-empty metadata gap"
+        );
+        let target = index_end + (trailer_start - index_end) / 2;
+        bytes[target] ^= 0xFF;
+
+        let err = PspReader::new(Cursor::new(bytes)).expect_err("corrupt metadata must fail");
+        assert!(
+            matches!(
+                err,
+                PspReadError::Zstd { .. } | PspReadError::MetadataTrailingBytes { .. }
+            ),
+            "expected Zstd or MetadataTrailingBytes, got {err:?}"
+        );
     }
 
     // ---------- write_record validation ---------------------------

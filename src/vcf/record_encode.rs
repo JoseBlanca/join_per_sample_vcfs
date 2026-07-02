@@ -729,6 +729,7 @@ mod tests {
             contigs: fixture_contigs(),
             tool_string: "test 0".into(),
             command_line: String::new(),
+            paralog_provenance: String::new(),
         };
         build_vcf_header(&metadata, config).unwrap()
     }

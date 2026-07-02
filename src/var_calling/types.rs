@@ -145,12 +145,96 @@ pub struct CallStats {
 /// grouping/merge still ships exactly one `CalledChunk`, to keep
 /// `chunk_order` gapless for the writer's reorder (an empty `Vec` does not
 /// allocate, and the writer treats it uniformly).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct CalledChunk {
     /// Carried through untouched from the source [`RawCohortChunk`].
     pub chunk_order: u64,
     pub records: Vec<Variant>,
+    /// Per-record centred-window coverage for the hidden-paralog score, in the
+    /// **same order** as `records` (so `window_coverage[i]` describes
+    /// `records[i]`). Gathered by [`VariantCaller::call_chunk`] from the source
+    /// chunk's per-sample windowed columns; **empty** for a `CalledChunk`
+    /// produced by [`VariantCaller::call_records`] directly (the test path,
+    /// which has no per-sample chunks to gather from). The spill sink reads it
+    /// alongside each record.
+    pub window_coverage: Vec<LocusWindowCoverage>,
+    /// Per-record hidden-paralog likelihood ratio, in the **same order** as
+    /// `records`. Computed inline by [`VariantCaller::call_chunk`] when the
+    /// filter is on (from `window_coverage` + each record's AD via the cohort-
+    /// constant scoring context); `NaN` marks an unscored locus (not a biallelic
+    /// SNP, or no usable samples) — kept, matching the "non-finite LR is never
+    /// flagged" rule. **Empty** when the filter is off or on the direct
+    /// [`VariantCaller::call_records`] path (no scoring context). The spill sink
+    /// folds it into the calibration histogram and stores it per record so the
+    /// write pass never re-scores.
+    pub paralog_lr: Vec<f64>,
     pub stats: CallStats,
+}
+
+/// Byte-identity equality: `paralog_lr` carries `NaN` for unscored loci and
+/// `window_coverage` carries `NaN` for absent samples, so both are compared on
+/// their bit pattern (a derived `PartialEq` would make `NaN != NaN`). No
+/// `Eq`/`Hash`.
+impl PartialEq for CalledChunk {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            chunk_order,
+            records,
+            window_coverage,
+            paralog_lr,
+            stats,
+        } = self;
+        *chunk_order == other.chunk_order
+            && *records == other.records
+            && *window_coverage == other.window_coverage
+            && f64_slices_bit_eq(paralog_lr, &other.paralog_lr)
+            && *stats == other.stats
+    }
+}
+
+/// Bit-exact equality of two `f32` slices, so a `NaN` sentinel compares equal to
+/// itself (plain `==` makes `NaN != NaN`). The windowed columns carry `NaN` for
+/// "sample absent", so their byte-identity `PartialEq` impls compare on the bit
+/// pattern via this helper — keeping the "NaN must compare bit-equal" rule in one
+/// place instead of hand-rolled at each field.
+pub(crate) fn f32_slices_bit_eq(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Bit-exact equality of two `f64` slices, so a `NaN` (the unscored-locus
+/// sentinel on [`CalledChunk::paralog_lr`]) compares equal to itself. The `f64`
+/// analogue of [`f32_slices_bit_eq`].
+pub(crate) fn f64_slices_bit_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Per-sample centred-window coverage for one called locus, gathered from the
+/// psp `windowed_gc`/`windowed_coverage` columns by matching each sample's
+/// compacted-chunk row at the locus position.
+///
+/// Both vectors are indexed by cohort sample order and hold `NaN` where the
+/// sample has no covered record at the locus — the score skips those samples,
+/// matching the retired window join's `None`. Per-sample GC (not a single
+/// shared reference GC) because each sample's window spans **its** covered
+/// positions; storing it per sample is what lets var-calling stay window-free.
+/// The fields are the same quantities as the psp `windowed_gc`/`windowed_coverage`
+/// columns (kept short here since the type name already says "window").
+#[derive(Debug, Clone, Default)]
+pub struct LocusWindowCoverage {
+    /// Per-sample centred-window GC fraction; `NaN` = sample absent at locus.
+    pub gc: Vec<f32>,
+    /// Per-sample centred-window mean coverage; `NaN` = sample absent at locus.
+    pub coverage: Vec<f32>,
+}
+
+/// Byte-identity equality: the windowed values carry `NaN` sentinels, so they
+/// are compared on their bit pattern (a derived `PartialEq` would make
+/// `NaN != NaN` and break `CalledChunk` equality in tests). No `Eq`/`Hash`.
+impl PartialEq for LocusWindowCoverage {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { gc, coverage } = self;
+        f32_slices_bit_eq(gc, &other.gc) && f32_slices_bit_eq(coverage, &other.coverage)
+    }
 }
 
 #[cfg(test)]

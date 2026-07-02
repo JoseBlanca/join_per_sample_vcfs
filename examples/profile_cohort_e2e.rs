@@ -71,9 +71,7 @@ use pop_var_caller::var_calling::posterior_engine::{
     DEFAULT_MAX_ITERATIONS, DEFAULT_REF_PSEUDOCOUNT, DEFAULT_SNP_ALT_PSEUDOCOUNT,
 };
 use pop_var_caller::var_calling::variant_grouping::DEFAULT_MAX_VARIANT_GROUP_SPAN;
-use pop_var_caller::var_calling::{
-    DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_MAPQ_DIFF_T, DEFAULT_MIN_QUAL_PHRED,
-};
+use pop_var_caller::var_calling::{DEFAULT_MIN_ALT_OBS_PER_SAMPLE, DEFAULT_MIN_QUAL_PHRED};
 
 #[derive(Parser, Debug)]
 #[command(about = "End-to-end profiling driver for cohort var-calling")]
@@ -185,9 +183,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             min_qual_phred: DEFAULT_MIN_QUAL_PHRED,
             min_alt_obs_per_sample: DEFAULT_MIN_ALT_OBS_PER_SAMPLE,
-            no_mapq_diff_filter: false,
-            min_mapq_diff_t: DEFAULT_MIN_MAPQ_DIFF_T,
+            no_allele_balance_filter: false,
+            min_allele_balance_log_lr:
+                pop_var_caller::var_calling::allele_balance::DEFAULT_AB_MIN_LOG_LR,
+            allele_balance_concentration:
+                pop_var_caller::var_calling::allele_balance::DEFAULT_AB_CONCENTRATION,
             emit_gp: false,
+            paralog_fdr: 0.0,
+            no_paralog_filter: true,
         },
     };
 

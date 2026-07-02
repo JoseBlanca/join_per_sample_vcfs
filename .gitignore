@@ -51,3 +51,11 @@ __marimo__/
 benchmarks/giab/*
 !benchmarks/giab/src/
 !benchmarks/giab/README.md
+
+# tomato2 hidden-paralog-filter study: track the scripts + the region definition,
+# keep the heavy/derivable data out (CRAMs, .psp, windowed coverage, VCF/parquet
+# results — gigabytes, all built locally from the scripts).
+benchmarks/tomato2/*
+!benchmarks/tomato2/src/
+!benchmarks/tomato2/regions_n160_200kb.bed
+!benchmarks/tomato2/README.md

@@ -18,8 +18,10 @@
 //! > buffer the row merger produces. So the record-based path runs the SIMD EM
 //! > with no SIMD loss.
 
+use crate::paralog::SampleObservation;
 use crate::pileup_record::{AlleleSupportStats, PileupRecord};
 use crate::psp::PspReadError;
+use crate::var_calling::paralog_filter::calibrate::ParalogScoringContext;
 use crate::var_calling::per_group_merger::{
     MergeGroupOutcome, MergedRecord, PerGroupMergerConfig, PerGroupMergerError,
     build_genotype_tables, merge_group_with_ref,
@@ -31,7 +33,8 @@ use crate::var_calling::posterior_engine::{
 };
 use crate::var_calling::sample_reader::SamplePspChunk;
 use crate::var_calling::types::{
-    CallStats, CalledChunk, CohortPileupRecord, RawCohortChunk, RefSpan, Variant,
+    CallStats, CalledChunk, CohortPileupRecord, LocusWindowCoverage, RawCohortChunk, RefSpan,
+    Variant,
 };
 use crate::var_calling::variant_grouping::{GrouperConfig, GrouperError};
 
@@ -127,15 +130,22 @@ pub struct VariantCaller {
     /// Per-(ploidy, n_alleles) genotype enumeration cache, built once from
     /// `merger_cfg` (identical to what `PerGroupMerger` builds internally).
     genotype_tables: Vec<Vec<Vec<u8>>>,
+    /// The cohort-constant hidden-paralog scoring context when the filter is on;
+    /// `None` when it is off. Read-only (so `&VariantCaller` stays `Sync`), it
+    /// lets [`call_chunk`](Self::call_chunk) score each locus's LR inline —
+    /// scoring runs on the parallel workers instead of a serial calibrate/write
+    /// pass (arch `hidden_paralog_inline_scoring.md`).
+    paralog: Option<ParalogScoringContext>,
 }
 
 impl VariantCaller {
-    pub fn new(
+    pub(crate) fn new(
         grouper_cfg: GrouperConfig,
         merger_cfg: PerGroupMergerConfig,
         posterior_cfg: PosteriorEngineConfig,
         min_alt_obs: u32,
         sample_names: Vec<String>,
+        paralog: Option<ParalogScoringContext>,
     ) -> Self {
         let genotype_tables = build_genotype_tables(&merger_cfg);
         Self {
@@ -145,6 +155,7 @@ impl VariantCaller {
             min_alt_obs,
             sample_names,
             genotype_tables,
+            paralog,
         }
     }
 
@@ -158,7 +169,40 @@ impl VariantCaller {
         // Columns → records + per-position merge — the record-building work
         // moved off the single producer thread onto this parallel caller.
         let records = merge_compacted_samples(&per_sample, &self.sample_names)?;
-        self.call_records(chunk_order, records, ref_span)
+        let mut called = self.call_records(chunk_order, records, ref_span)?;
+        // Gather each called locus's per-sample window coverage from the
+        // (still-owned) per-sample chunks, then score its hidden-paralog LR
+        // inline — the worker already holds each locus's window coverage (just
+        // gathered) + its AD (the called record), and the score depends on
+        // nothing genome-wide, so this runs the expensive transcendental once, in
+        // parallel, instead of a serial calibrate + write recompute (arch: inline
+        // scoring). Both stay empty when the filter is off.
+        called.window_coverage = gather_window_coverage(&per_sample, &called.records);
+        called.paralog_lr = self.score_paralog_lrs(&called.records, &called.window_coverage);
+        Ok(called)
+    }
+
+    /// Score each called locus's hidden-paralog LR from its record + gathered
+    /// window coverage, one `f64` per record in `records` order (`f64::NAN` =
+    /// unscored → kept). Returns an **empty** vec when the filter is off
+    /// (`self.paralog` is `None`). Split from [`call_chunk`](Self::call_chunk) so
+    /// the worker-scoring path is unit-testable without materialising a full
+    /// [`RawCohortChunk`]; `obs_buf` is a scratch buffer reused across the chunk's
+    /// loci (allocation-free per locus, memory `O(samples)`).
+    fn score_paralog_lrs(
+        &self,
+        records: &[Variant],
+        window_coverage: &[LocusWindowCoverage],
+    ) -> Vec<f64> {
+        let Some(paralog) = &self.paralog else {
+            return Vec::new();
+        };
+        let mut obs_buf: Vec<Option<SampleObservation>> = Vec::new();
+        records
+            .iter()
+            .zip(window_coverage)
+            .map(|(record, window)| paralog.score(record, window, &mut obs_buf))
+            .collect()
     }
 
     /// Group + per-group merge + EM over already-merged cohort `records`. Split
@@ -220,9 +264,90 @@ impl VariantCaller {
         Ok(CalledChunk {
             chunk_order,
             records: called,
+            // Both filled by `call_chunk` (which has the per-sample chunks to
+            // gather from + the scoring context); left empty on this direct path
+            // — see the field docs.
+            window_coverage: Vec::new(),
+            paralog_lr: Vec::new(),
             stats,
         })
     }
+}
+
+/// Gather each called locus's per-sample centred-window coverage from the
+/// source chunk's per-sample windowed columns, one [`LocusWindowCoverage`] per
+/// record in `records` order.
+///
+/// Keys each locus on its anchor `record.locus.start`; the join itself is a
+/// per-sample forward merge (see [`gather_window_coverage_at_anchors`]).
+fn gather_window_coverage(
+    per_sample: &[SamplePspChunk],
+    records: &[Variant],
+) -> Vec<LocusWindowCoverage> {
+    let anchors: Vec<u32> = records.iter().map(|r| r.locus.start).collect();
+    gather_window_coverage_at_anchors(per_sample, &anchors)
+}
+
+/// Per-sample centred-window coverage for a list of locus `anchors`, in anchor
+/// order, via a **forward per-sample merge-join**.
+///
+/// Both `anchors` (called-record positions) and each sample's `positions()`
+/// (compacted rows) are coordinate-sorted ascending, so one monotone cursor per
+/// sample matches every anchor in a single linear sweep — `O(anchors + positions)`
+/// per sample, replacing the per-anchor `O(log positions)` binary search that
+/// re-probed each sample from scratch for every locus. A hit copies that sample's
+/// windowed GC + coverage; a miss leaves `NaN` (the sample has no covered record
+/// there, so the score skips it — the "keep, don't flag" behaviour the retired
+/// window join gave via `None`). Per-position by construction: the value is the
+/// window centred on this exact locus, not a 500 bp tile mean.
+///
+/// Bit-identical to the old per-anchor binary search: `positions` are unique and
+/// sorted, so the cursor lands on the same row index a binary search would find
+/// (and a miss yields `NaN` on both). The `debug_assert`s pin the ascending-input
+/// precondition the linear sweep relies on (both hold by construction — the
+/// producer emits rows in coordinate order and the caller emits loci in genomic
+/// order).
+///
+/// The windowed vectors are aligned 1:1 with `positions` by every chunk
+/// constructor, so a hit's index is in bounds — but the reads go through `.get()`
+/// so a hypothetical length skew degrades to `NaN` (sample absent → skipped),
+/// never an out-of-bounds panic.
+fn gather_window_coverage_at_anchors(
+    per_sample: &[SamplePspChunk],
+    anchors: &[u32],
+) -> Vec<LocusWindowCoverage> {
+    debug_assert!(
+        anchors.windows(2).all(|w| w[0] <= w[1]),
+        "anchors must be ascending for the forward merge-join"
+    );
+    let n_samples = per_sample.len();
+    let mut out: Vec<LocusWindowCoverage> = anchors
+        .iter()
+        .map(|_| LocusWindowCoverage {
+            gc: vec![f32::NAN; n_samples],
+            coverage: vec![f32::NAN; n_samples],
+        })
+        .collect();
+    for (s, chunk) in per_sample.iter().enumerate() {
+        let positions = chunk.positions();
+        debug_assert!(
+            positions.windows(2).all(|w| w[0] <= w[1]),
+            "sample positions must be ascending for the forward merge-join"
+        );
+        let gc = chunk.windowed_gc();
+        let coverage = chunk.windowed_coverage();
+        let mut cursor = 0usize;
+        for (a, &anchor) in anchors.iter().enumerate() {
+            while cursor < positions.len() && positions[cursor] < anchor {
+                cursor += 1;
+            }
+            if cursor < positions.len() && positions[cursor] == anchor {
+                out[a].gc[s] = gc.get(cursor).copied().unwrap_or(f32::NAN);
+                out[a].coverage[s] = coverage.get(cursor).copied().unwrap_or(f32::NAN);
+            }
+        }
+    }
+    out
 }
 
 /// Pre-EM `min_alt_obs_per_sample` predicate over the projected per-allele
@@ -329,6 +454,7 @@ mod tests {
             PosteriorEngineConfig::default(),
             min_alt_obs,
             vec!["S0".to_string(), "S1".to_string()],
+            None,
         )
     }
 
@@ -342,6 +468,113 @@ mod tests {
         let merger = PerGroupMerger::with_config(groups, fetcher, PerGroupMergerConfig::default());
         let engine = PosteriorEngine::with_config(merger, PosteriorEngineConfig::default());
         engine.map(|r| r.expect("row pipeline")).collect()
+    }
+
+    /// The window-coverage gather aligns each sample's windowed values to a
+    /// locus by exact position, leaves `NaN` where a sample has no record
+    /// there, and indexes by cohort sample order.
+    #[test]
+    fn window_coverage_gather_aligns_by_position() {
+        // Sample 0 covers 10, 25, 40; sample 1 covers 10, 40 (no record at 25).
+        let per_sample = vec![
+            SamplePspChunk::from_windowed_for_test(
+                0,
+                vec![10, 25, 40],
+                vec![0.30, 0.31, 0.32],
+                vec![100.0, 101.0, 102.0],
+            ),
+            SamplePspChunk::from_windowed_for_test(
+                0,
+                vec![10, 40],
+                vec![0.40, 0.42],
+                vec![200.0, 202.0],
+            ),
+        ];
+
+        // One merge-join sweep over three ascending anchors (25, 40, 99).
+        let got = gather_window_coverage_at_anchors(&per_sample, &[25, 40, 99]);
+
+        // Locus at 25: sample 0 present, sample 1 absent (NaN).
+        let at25 = &got[0];
+        assert_eq!(at25.gc[0].to_bits(), 0.31f32.to_bits());
+        assert_eq!(at25.coverage[0].to_bits(), 101.0f32.to_bits());
+        assert!(at25.gc[1].is_nan(), "sample 1 has no record at 25");
+        assert!(at25.coverage[1].is_nan());
+
+        // Locus at 40: both present (the cursor advanced past 25 for sample 0
+        // and past 10 for sample 1).
+        let at40 = &got[1];
+        assert_eq!(at40.gc[1].to_bits(), 0.42f32.to_bits());
+        assert_eq!(at40.coverage[1].to_bits(), 202.0f32.to_bits());
+        assert_eq!(at40.coverage[0].to_bits(), 102.0f32.to_bits());
+
+        // A locus no sample covers → all NaN.
+        let at99 = &got[2];
+        assert!(at99.gc.iter().all(|v| v.is_nan()));
+        assert!(at99.coverage.iter().all(|v| v.is_nan()));
+    }
+
+    /// The merge-join cursor handles an anchor that falls **before** a sample's
+    /// first covered position and **between** two covered positions (a gap),
+    /// leaving `NaN` at both without desyncing later matches — the cases a
+    /// per-anchor binary search got for free but the linear cursor must get right.
+    #[test]
+    fn window_coverage_gather_cursor_handles_gaps_and_leading_miss() {
+        // Sample 0 covers 20, 30, 40 (nothing at or before 10, a gap at 25).
+        let per_sample = vec![SamplePspChunk::from_windowed_for_test(
+            0,
+            vec![20, 30, 40],
+            vec![0.20, 0.30, 0.40],
+            vec![200.0, 300.0, 400.0],
+        )];
+        // Anchors: 10 (before first pos → miss), 25 (in the 20..30 gap → miss),
+        // 30 (hit), 40 (hit).
+        let got = gather_window_coverage_at_anchors(&per_sample, &[10, 25, 30, 40]);
+        assert!(
+            got[0].coverage[0].is_nan(),
+            "10 is before the first position"
+        );
+        assert!(got[1].coverage[0].is_nan(), "25 is in the 20..30 gap");
+        assert_eq!(got[2].coverage[0].to_bits(), 300.0f32.to_bits());
+        assert_eq!(got[3].coverage[0].to_bits(), 400.0f32.to_bits());
+    }
+
+    /// The gather keys on the locus **anchor** (`record.locus.start`), not the
+    /// group span: a sample covered only at a grouped variant's interior — with
+    /// no record at the anchor — is left `NaN` (absent → skipped, the safe
+    /// keep-don't-flag direction). Pins the per-position anchor semantics so a
+    /// future change to span-matching is a deliberate, test-visible choice.
+    #[test]
+    fn window_coverage_gather_keys_on_anchor_not_group_span() {
+        // Sample 0 covers 10 and 11; sample 1 covers only 11 (no row at 10).
+        let per_sample = vec![
+            SamplePspChunk::from_windowed_for_test(
+                0,
+                vec![10, 11],
+                vec![0.30, 0.31],
+                vec![100.0, 101.0],
+            ),
+            SamplePspChunk::from_windowed_for_test(0, vec![11], vec![0.40], vec![200.0]),
+        ];
+        // A variant anchored at 10 (a group's leftmost position): sample 1 has no
+        // covered record there, so it is absent even though it is covered at 11.
+        let at10 = &gather_window_coverage_at_anchors(&per_sample, &[10])[0];
+        assert_eq!(at10.gc[0].to_bits(), 0.30f32.to_bits());
+        assert!(
+            at10.gc[1].is_nan() && at10.coverage[1].is_nan(),
+            "sample 1 is not covered at the anchor 10, so it is absent"
+        );
+    }
+
+    /// A chunk from a legacy `.psp` without the windowed columns carries NaN-
+    /// filled windowed vectors (still aligned 1:1 with positions). A hit yields a
+    /// `NaN` value (sample skipped), never a panic or a search miss.
+    #[test]
+    fn window_coverage_gather_nan_for_legacy_windowless_chunk() {
+        let chunk =
+            SamplePspChunk::from_windowed_for_test(0, vec![10], vec![f32::NAN], vec![f32::NAN]);
+        let at10 = &gather_window_coverage_at_anchors(&[chunk], &[10])[0];
+        assert!(at10.gc[0].is_nan() && at10.coverage[0].is_nan());
     }
 
     #[test]
@@ -377,6 +610,82 @@ mod tests {
             .unwrap();
         assert_eq!(all.records.len(), 3);
         assert_eq!(all.stats.records_dropped_low_alt_obs, 0);
+    }
+
+    /// The worker-scoring path (`score_paralog_lrs`, the fill run by `call_chunk`)
+    /// produces one LR per record in record order, stores a finite LR for a
+    /// scorable biallelic-SNP locus and `NaN` for an unscored one (no usable
+    /// window), and each stored LR bit-equals a standalone
+    /// `ParalogScoringContext::score` — the load-bearing M7 mapping the
+    /// byte-identity guarantee rests on. `None`-context returns an empty vec.
+    #[test]
+    fn score_paralog_lrs_fills_one_lr_per_record() {
+        use crate::paralog::ParalogModelParams;
+        use crate::var_calling::paralog_filter::calibrate::ParalogScoringContext;
+        use crate::var_calling::paralog_filter::test_support::{
+            prepass, snp_record, window_coverage,
+        };
+
+        let n = 4;
+        let f = 0.02;
+        let ctx = || ParalogScoringContext::new(prepass(n), f, &ParalogModelParams::default());
+        let names: Vec<String> = (0..n).map(|s| format!("S{s}")).collect();
+        let with_ctx = VariantCaller::new(
+            GrouperConfig::default(),
+            PerGroupMergerConfig::default(),
+            PosteriorEngineConfig::default(),
+            0,
+            names.clone(),
+            Some(ctx()),
+        );
+
+        // A scorable ~2× paralog-like locus (finite LR) and an unscored locus
+        // (every sample's window coverage NaN → no usable observation).
+        let scorable = snp_record(
+            10,
+            n,
+            &|_| (20, 10),
+            window_coverage(n, 0.5, &|_| Some(40.0)),
+        );
+        let unscored = snp_record(20, n, &|_| (20, 10), window_coverage(n, 0.5, &|_| None));
+        let records = vec![scorable.record.clone(), unscored.record.clone()];
+        let windows = vec![
+            scorable.window_coverage.clone(),
+            unscored.window_coverage.clone(),
+        ];
+
+        let lrs = with_ctx.score_paralog_lrs(&records, &windows);
+        assert_eq!(lrs.len(), records.len(), "one LR per record");
+        assert!(
+            lrs[0].is_finite(),
+            "scorable locus → finite LR, got {}",
+            lrs[0]
+        );
+        assert!(lrs[1].is_nan(), "no usable window → unscored NaN");
+
+        // Each stored LR bit-equals a standalone score from an identically-built
+        // context (pins worker-score == the pure scorer, bit-for-bit).
+        let standalone = ctx();
+        let mut buf = Vec::new();
+        for (i, (record, window)) in records.iter().zip(&windows).enumerate() {
+            let want = standalone.score(record, window, &mut buf);
+            assert_eq!(
+                lrs[i].to_bits(),
+                want.to_bits(),
+                "record {i}: fill LR must bit-equal a standalone score",
+            );
+        }
+
+        // Filter off (`None` context) → empty, so the sink pads to NaN (kept).
+        let without = VariantCaller::new(
+            GrouperConfig::default(),
+            PerGroupMergerConfig::default(),
+            PosteriorEngineConfig::default(),
+            0,
+            names,
+            None,
+        );
+        assert!(without.score_paralog_lrs(&records, &windows).is_empty());
     }
 
     #[test]

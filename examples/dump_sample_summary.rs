@@ -1,0 +1,117 @@
+//! Print the per-sample summary (coverage-by-GC + observed het) stored in
+//! a `.psp` metadata section — the hidden-paralog filter input.
+//!
+//! This is the canonical **consumer** of the summary section: it opens the
+//! `.psp` with the schema-agnostic [`PspReader`], pulls the opaque metadata
+//! bytes ([`PspReader::metadata`]), and parses them with the SNP-kind
+//! [`SampleSummary::from_toml_bytes`]. No new reader API is needed — the
+//! container stays schema-agnostic and the kind interprets the bytes.
+//!
+//! Usage: `cargo run --release --example dump_sample_summary -- <file.psp>`
+
+use std::fs::File;
+use std::io::BufReader;
+
+use pop_var_caller::psp::PspReader;
+use pop_var_caller::sample_summary::SampleSummary;
+
+fn main() {
+    let path = match std::env::args().nth(1) {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: dump_sample_summary <file.psp>");
+            std::process::exit(2);
+        }
+    };
+
+    let file = File::open(&path).unwrap_or_else(|e| {
+        eprintln!("open {path}: {e}");
+        std::process::exit(1);
+    });
+    let reader = PspReader::new(BufReader::new(file)).unwrap_or_else(|e| {
+        eprintln!("open psp {path}: {e}");
+        std::process::exit(1);
+    });
+
+    println!("sample: {}", reader.header().sample);
+    // Read the stored summary section. It is a required part of the v1.0 `.psp`
+    // schema (the reader rejects a body without the windowed columns), so any
+    // loadable `.psp` carries it; a `None` here means an older, pre-schema file
+    // that should be regenerated with `pileup`.
+    let summary = match reader.metadata() {
+        Some(bytes) => SampleSummary::from_toml_bytes(bytes).unwrap_or_else(|e| {
+            eprintln!("parse summary: {e}");
+            std::process::exit(1);
+        }),
+        None => {
+            eprintln!(
+                "{path}: no stored sample-summary section — a pre-schema `.psp`; \
+                 regenerate it with `pileup`"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let cov = &summary.coverage_by_gc;
+    let het = &summary.heterozygosity;
+
+    // Coverage: derive the overall covered-bases mean depth from the
+    // histogram (Σ count·bin-midpoint ÷ Σ count) as a single-number sanity
+    // figure against the prototype's per-window depth table.
+    let depth_cols = cov.depth_bins as usize + 1;
+    let mut total = 0.0_f64;
+    let mut weighted = 0.0_f64;
+    for gc in 0..cov.gc_bins as usize {
+        for d in 0..depth_cols {
+            let c = cov.counts[gc * depth_cols + d] as f64;
+            // Bin midpoint; the overflow column uses its lower edge.
+            let mid = if d < cov.depth_bins as usize {
+                (d as f64 + 0.5) * cov.depth_bin_width
+            } else {
+                cov.depth_bins as f64 * cov.depth_bin_width
+            };
+            total += c;
+            weighted += c * mid;
+        }
+    }
+    let mean_depth = if total > 0.0 { weighted / total } else { 0.0 };
+
+    println!("coverage-by-gc:");
+    println!("  window_bp      : {}", cov.window_bp);
+    println!("  gc_bins        : {}", cov.gc_bins);
+    println!(
+        "  depth bins     : {} regular (width {}) + 1 overflow",
+        cov.depth_bins, cov.depth_bin_width
+    );
+    println!("  n_positions        : {}", cov.n_positions);
+    println!("  n_skipped_tiles: {}", cov.n_skipped_tiles);
+    println!("  callable_pos   : {}", cov.callable_positions);
+    println!("  est mean depth : {mean_depth:.3}  (histogram-weighted)");
+
+    println!("heterozygosity:");
+    println!("  n_variant_sites : {}", het.n_variant_sites);
+    println!("  n_het_sites     : {}", het.n_het_sites);
+    println!("  n_hom_alt_sites : {}", het.n_hom_alt_sites);
+    println!("  n_ambiguous     : {}", het.n_ambiguous_sites);
+    // The het *rate* over callable positions — the quantity the paralog
+    // filter consumes (spec §3). The `n_het/(n_het+n_hom_alt)` ratio below
+    // is the *wrong* one (it tracks reference divergence and inverts); it is
+    // printed only for contrast with the older prototype output.
+    if cov.callable_positions > 0 {
+        println!(
+            "  Hobs (het/Mb)   : {:.2}  (n_het_sites per Mb callable)",
+            het.n_het_sites as f64 / cov.callable_positions as f64 * 1e6
+        );
+    }
+    let confident = het.n_het_sites + het.n_hom_alt_sites;
+    if confident > 0 {
+        println!(
+            "  het/(het+homalt): {:.4}  (NOT Hobs — divergence proxy, inverts)",
+            het.n_het_sites as f64 / confident as f64
+        );
+    }
+    println!(
+        "  params          : min_depth {} eps {} margin {:.4}",
+        het.min_depth, het.error_rate, het.lr_margin
+    );
+}

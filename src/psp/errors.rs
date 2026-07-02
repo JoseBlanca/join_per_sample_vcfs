@@ -265,6 +265,37 @@ pub enum PspReadError {
     #[error("block index has {got} entries, trailer claims {expected}")]
     IndexEntryCountMismatch { got: usize, expected: u64 },
 
+    /// `index_offset + index_byte_length` exceeds the trailer's start
+    /// (or overflowed `u64`), so the block index would overrun the
+    /// region reserved for the optional metadata section and the
+    /// trailer. Corruption or a truncated/garbled trailer. The region
+    /// `[index_end, trailer_start)` is the legal metadata section; only
+    /// an index that runs *past* `trailer_start` is invalid.
+    #[error(
+        "block index ends at index_offset {index_offset} + index_byte_length {index_byte_length}, past the trailer start {trailer_start}"
+    )]
+    IndexOverrunsTrailer {
+        index_offset: u64,
+        index_byte_length: u64,
+        trailer_start: u64,
+    },
+
+    /// The metadata section's decompressed size exceeded the reader's
+    /// cap. A guard against a zip-bomb frame in a hostile or corrupt
+    /// file — the legitimate section (per-sample summary statistics) is
+    /// kilobytes, far below the cap `MAX_METADATA_DECOMPRESSED_BYTES`.
+    #[error("metadata section decompresses to more than the {cap}-byte cap")]
+    MetadataSectionTooLarge { cap: usize },
+
+    /// The metadata section region carried bytes past the end of its
+    /// single zstd frame. The writer emits exactly one frame that fills
+    /// the gap between the block index and the trailer, so trailing
+    /// bytes mean corruption, truncation, or tampering in a region the
+    /// frame checksum does not cover. Mirrors [`Self::IndexTrailingBytes`]
+    /// for the metadata gap.
+    #[error("metadata section has {trailing} trailing bytes after its zstd frame")]
+    MetadataTrailingBytes { trailing: usize },
+
     /// The first four bytes of the file are not `PSP\n` — either the
     /// file is not a `.psp` or the head magic is corrupt.
     #[error("file head magic mismatch: got {got:02x?}, expected {expected:02x?}")]
@@ -707,6 +738,13 @@ pub enum PspWriteError {
         got: usize,
         expected: usize,
     },
+
+    /// [`attach_metadata`](crate::psp::writer::PspWriter::attach_metadata)
+    /// was called more than once. The file carries at most one metadata
+    /// section; a second attach is a producer bug (the first payload
+    /// would be silently lost).
+    #[error("metadata section already attached; attach_metadata may be called at most once")]
+    MetadataAlreadyAttached,
 }
 
 /// Helper for [`PspWriteError::Io`]'s `Display`: renders the

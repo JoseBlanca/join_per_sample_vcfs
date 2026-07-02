@@ -33,6 +33,7 @@ use crate::psp::BlockColumns;
 use crate::psp::ScalarDecodeError;
 use crate::psp::reader::{DecodedColumn, RetainedColumn, TwoPhaseBlock, inflate_retained_column};
 use crate::psp::{BlockColumnReader, BlockIndexEntry, PspReadError, PspReader};
+use crate::var_calling::types::f32_slices_bit_eq;
 
 // ---------------------------------------------------------------------------
 // Heavy per-allele column carriers.
@@ -218,7 +219,7 @@ fn u32_from_usize(v: usize) -> u32 {
 /// per-allele columns are owned and handed out by the move-out take-getters
 /// for the `keep` rows. Record indices used by the getters and by `keep` are
 /// `0..len()` over this chunk's (region-clamped) records.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SamplePspChunk {
     chrom_id: u32,
     /// 1-based positions, one per record. Light, cached at `new`.
@@ -230,10 +231,53 @@ pub struct SamplePspChunk {
     /// CSR record→allele offsets (`len() == n_records + 1`); maps a record
     /// index to its allele range in the heavy columns.
     allele_offsets: Vec<u32>,
+    /// Per-record centred-window GC fraction (psp column `WindowedGc`), one
+    /// value per record, aligned with `positions`. `NaN` where the pileup had
+    /// no window centred here (e.g. an N reference base). Empty for a chunk
+    /// built from a legacy `.psp` that predates the windowed columns. Read by
+    /// the hidden-paralog score; carried through every per-record maintenance
+    /// site alongside `positions`.
+    windowed_gc: Vec<f32>,
+    /// Per-record centred-window mean coverage (psp column `WindowedCoverage`),
+    /// mirror of [`windowed_gc`](Self::windowed_gc).
+    windowed_coverage: Vec<f32>,
     /// Heavy columns, owned; moved out (and emptied) by the take-getters.
     scalar: AlleleScalarColumns,
     seq: AlleleSeqColumns,
     chain_ids: AlleleChainIdColumns,
+}
+
+/// Byte-identity equality (the `.psp` round-trip oracle compares chunks). The
+/// windowed columns hold `NaN` for un-windowed records, so they are compared on
+/// their bit pattern — a derived `PartialEq` would make `NaN != NaN` and break
+/// reflexivity. Must not derive `Eq`/`Hash` for the same reason (see
+/// `PileupRecord`). Exhaustive destructure so a new field cannot silently skip
+/// the comparison.
+impl PartialEq for SamplePspChunk {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            chrom_id,
+            positions,
+            nonref_obs,
+            ref_spans,
+            allele_offsets,
+            windowed_gc,
+            windowed_coverage,
+            scalar,
+            seq,
+            chain_ids,
+        } = self;
+        *chrom_id == other.chrom_id
+            && *positions == other.positions
+            && *nonref_obs == other.nonref_obs
+            && *ref_spans == other.ref_spans
+            && *allele_offsets == other.allele_offsets
+            && f32_slices_bit_eq(windowed_gc, &other.windowed_gc)
+            && f32_slices_bit_eq(windowed_coverage, &other.windowed_coverage)
+            && *scalar == other.scalar
+            && *seq == other.seq
+            && *chain_ids == other.chain_ids
+    }
 }
 
 /// Chain ids to attach to allele index `a` of a record whose allele range
@@ -343,6 +387,8 @@ impl SamplePspChunk {
 
         // Light per-record columns over the clamped range.
         let positions = abs[r_lo..r_hi].to_vec();
+        let windowed_gc = cols.windowed_gc[r_lo..r_hi].to_vec();
+        let windowed_coverage = cols.windowed_coverage[r_lo..r_hi].to_vec();
         let mut nonref_obs = Vec::with_capacity(r_hi - r_lo);
         let mut ref_spans = Vec::with_capacity(r_hi - r_lo);
         let mut base = a_lo;
@@ -366,6 +412,8 @@ impl SamplePspChunk {
             nonref_obs,
             ref_spans,
             allele_offsets,
+            windowed_gc,
+            windowed_coverage,
             scalar,
             seq,
             chain_ids,
@@ -378,9 +426,9 @@ impl SamplePspChunk {
         self.positions.len()
     }
 
-    /// 1-based positions, one per record (light, cached). Test-only accessor
-    /// (the eager-decode oracle); production reads the field directly.
-    #[cfg(test)]
+    /// 1-based positions, one per record (light, cached) — the key the window
+    /// gather binary-searches to align a called locus to this sample's rows, and
+    /// the eager-decode test oracle's accessor.
     pub fn positions(&self) -> &[u32] {
         &self.positions
     }
@@ -406,6 +454,32 @@ impl SamplePspChunk {
         hi - lo
     }
 
+    /// Minimal chunk carrying only positions + the windowed columns — the
+    /// window-coverage gather reads nothing else. For testing that gather.
+    #[cfg(test)]
+    pub(crate) fn from_windowed_for_test(
+        chrom_id: u32,
+        positions: Vec<u32>,
+        windowed_gc: Vec<f32>,
+        windowed_coverage: Vec<f32>,
+    ) -> Self {
+        let n = positions.len();
+        assert_eq!(positions.len(), windowed_gc.len());
+        assert_eq!(positions.len(), windowed_coverage.len());
+        Self {
+            chrom_id,
+            positions,
+            nonref_obs: Vec::new(),
+            ref_spans: Vec::new(),
+            allele_offsets: vec![0; n + 1],
+            windowed_gc,
+            windowed_coverage,
+            scalar: AlleleScalarColumns::default(),
+            seq: AlleleSeqColumns::empty(),
+            chain_ids: AlleleChainIdColumns::empty(),
+        }
+    }
+
     /// An empty chunk for `chrom_id`, ready to accumulate compacted records
     /// via [`append_range`](Self::append_range).
     ///
@@ -422,10 +496,25 @@ impl SamplePspChunk {
             nonref_obs: Vec::new(),
             ref_spans: Vec::new(),
             allele_offsets: vec![0],
+            windowed_gc: Vec::new(),
+            windowed_coverage: Vec::new(),
             scalar: AlleleScalarColumns::default(),
             seq: AlleleSeqColumns::empty(),
             chain_ids: AlleleChainIdColumns::empty(),
         }
+    }
+
+    /// Per-record centred-window GC, one value per record (aligned with
+    /// [`positions`](Self::positions)); empty for a legacy `.psp` without the
+    /// windowed columns. Read by the hidden-paralog score's window gather.
+    pub fn windowed_gc(&self) -> &[f32] {
+        &self.windowed_gc
+    }
+
+    /// Per-record centred-window mean coverage; mirror of
+    /// [`windowed_gc`](Self::windowed_gc).
+    pub fn windowed_coverage(&self) -> &[f32] {
+        &self.windowed_coverage
     }
 
     /// Append `src`'s records whose position is in `[lo, hi)` onto `self` — the
@@ -441,6 +530,12 @@ impl SamplePspChunk {
             let a_lo = src.allele_offsets[r] as usize;
             let a_hi = src.allele_offsets[r + 1] as usize;
             self.positions.push(src.positions[r]);
+            // Windowed columns stay aligned 1:1 with `positions`; NaN fills a
+            // source that predates them (keeps `len() == positions.len()`).
+            self.windowed_gc
+                .push(src.windowed_gc.get(r).copied().unwrap_or(f32::NAN));
+            self.windowed_coverage
+                .push(src.windowed_coverage.get(r).copied().unwrap_or(f32::NAN));
             self.scalar.extend_from_range(&src.scalar, a_lo..a_hi);
             self.seq.extend_from_range(&src.seq, a_lo..a_hi);
             self.chain_ids.extend_from_range(&src.chain_ids, a_lo..a_hi);
@@ -578,6 +673,11 @@ pub(crate) struct DecodedHeavy {
     scalar: AlleleScalarColumns,
     seq: AlleleSeqColumns,
     chain_ids: AlleleChainIdColumns,
+    /// Full-block per-record windowed columns (NaN where absent), sliced to the
+    /// kept rows by [`compact_rows`](TwoPhaseSegment::compact_rows). Pre-sized to
+    /// `n_records` NaN so a `.psp` without the columns still slices cleanly.
+    windowed_gc: Vec<f32>,
+    windowed_coverage: Vec<f32>,
 }
 
 /// A `.psp` segment decoded in two phases (the column-selective producer read):
@@ -671,6 +771,7 @@ impl TwoPhaseSegment {
     pub fn nonref_obs(&self) -> &[u32] {
         &self.nonref_obs
     }
+
     /// The segment's last 1-based position (its true extent — for the cohort
     /// watermark / finalisation check), or `None` when empty.
     pub fn last_pos(&self) -> Option<u32> {
@@ -700,9 +801,12 @@ impl TwoPhaseSegment {
         let n_records = self.positions.len();
 
         // Kept positions + re-based CSR + each kept row's full-block allele range.
+        // `kept_rows` records the full-block record index of each kept row, so
+        // the per-record windowed columns can be compacted the same way.
         let mut positions = Vec::new();
         let mut allele_offsets = vec![0u32];
         let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut kept_rows: Vec<usize> = Vec::new();
         let mut cum = 0u32;
         for (r, &k) in keep.iter().enumerate() {
             if k {
@@ -710,6 +814,7 @@ impl TwoPhaseSegment {
                 let hi = self.allele_offsets[r + 1] as usize;
                 positions.push(self.positions[r]);
                 ranges.push((lo, hi));
+                kept_rows.push(r);
                 cum += (hi - lo) as u32;
                 allele_offsets.push(cum);
             }
@@ -722,6 +827,11 @@ impl TwoPhaseSegment {
         // Inflate + compact each deferred column, freeing between (one resident).
         let mut seq = AlleleSeqColumns::empty();
         let mut chain_ids = AlleleChainIdColumns::empty();
+        // Per-record windowed columns, compacted to the kept rows. NaN-filled to
+        // `kept_rows.len()` up front so a `.psp` without these columns still
+        // yields the `len() == positions.len()` invariant the score relies on.
+        let mut windowed_gc = vec![f32::NAN; kept_rows.len()];
+        let mut windowed_coverage = vec![f32::NAN; kept_rows.len()];
         // Per-column inflate scratch: seq bytes/offsets, chain-id data/offsets.
         let (mut seq_bytes, mut seq_offsets, mut chain_data, mut chain_offsets) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -775,6 +885,18 @@ impl TwoPhaseSegment {
                         chain_ids.extend_from_range(&full, lo..hi);
                     }
                 }
+                // Per-record windowed columns: compact by kept record index
+                // (not allele range) into the pre-sized NaN buffers.
+                Some(DecodedColumn::WindowedGc(v)) => {
+                    for (slot, &r) in windowed_gc.iter_mut().zip(&kept_rows) {
+                        *slot = v[r];
+                    }
+                }
+                Some(DecodedColumn::WindowedCoverage(v)) => {
+                    for (slot, &r) in windowed_coverage.iter_mut().zip(&kept_rows) {
+                        *slot = v[r];
+                    }
+                }
                 // Light columns are never retained; an unknown optional → None.
                 _ => {}
             }
@@ -786,6 +908,8 @@ impl TwoPhaseSegment {
             nonref_obs: Vec::new(),
             ref_spans: Vec::new(),
             allele_offsets,
+            windowed_gc,
+            windowed_coverage,
             scalar,
             seq,
             chain_ids,
@@ -822,6 +946,8 @@ impl TwoPhaseSegment {
         };
         let mut seq = AlleleSeqColumns::empty();
         let mut chain_ids = AlleleChainIdColumns::empty();
+        let mut windowed_gc = vec![f32::NAN; n_records];
+        let mut windowed_coverage = vec![f32::NAN; n_records];
         let (mut seq_bytes, mut seq_offsets, mut chain_data, mut chain_offsets) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for rc in &self.retained {
@@ -858,6 +984,8 @@ impl TwoPhaseSegment {
                         ids: std::mem::take(&mut chain_data),
                     };
                 }
+                Some(DecodedColumn::WindowedGc(v)) => windowed_gc = v,
+                Some(DecodedColumn::WindowedCoverage(v)) => windowed_coverage = v,
                 // Light columns are never retained; an unknown optional → None.
                 _ => {}
             }
@@ -866,6 +994,8 @@ impl TwoPhaseSegment {
             scalar,
             seq,
             chain_ids,
+            windowed_gc,
+            windowed_coverage,
         })
     }
 
@@ -879,6 +1009,8 @@ impl TwoPhaseSegment {
         let mut positions = Vec::new();
         let mut allele_offsets = vec![0u32];
         let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut windowed_gc = Vec::new();
+        let mut windowed_coverage = Vec::new();
         let mut cum = 0u32;
         for (r, &k) in keep.iter().enumerate() {
             if k {
@@ -886,6 +1018,8 @@ impl TwoPhaseSegment {
                 let hi = self.allele_offsets[r + 1] as usize;
                 positions.push(self.positions[r]);
                 ranges.push((lo, hi));
+                windowed_gc.push(decoded.windowed_gc[r]);
+                windowed_coverage.push(decoded.windowed_coverage[r]);
                 cum += (hi - lo) as u32;
                 allele_offsets.push(cum);
             }
@@ -904,6 +1038,8 @@ impl TwoPhaseSegment {
             nonref_obs: Vec::new(),
             ref_spans: Vec::new(),
             allele_offsets,
+            windowed_gc,
+            windowed_coverage,
             scalar,
             seq,
             chain_ids,
@@ -1157,6 +1293,76 @@ mod tests {
         assert_eq!(seg.positions(), &[10, 25, 40, 55]);
         assert_eq!(seg.ref_spans(), &[1, 1, 1, 1]); // allele-0 lengths: A,T,G,C
         assert_eq!(seg.nonref_obs(), &[2, 1, 0, 2]); // Σ non-REF obs
+    }
+
+    /// The per-record windowed columns must survive the round-trip and compact
+    /// to the **kept** rows — in both compaction paths (`set_variable_rows` for a
+    /// fully-consumed segment, `inflate_all` + `compact_rows` for a straddler),
+    /// and byte-identically to the eager `from_block` oracle. Distinct finite
+    /// values per row (the shared fixture defaults them to NaN) so a mis-indexed
+    /// slice is caught.
+    #[test]
+    fn windowed_columns_compact_to_kept_rows() {
+        let mut records = vec![
+            record(10, vec![allele(b"A", 5, -1.0, &[])]),
+            record(25, vec![allele(b"T", 6, -1.0, &[3])]),
+            record(40, vec![allele(b"G", 4, -1.0, &[])]),
+            record(55, vec![allele(b"C", 3, -1.0, &[])]),
+        ];
+        // Distinct, finite windowed values keyed to the position.
+        for (i, r) in records.iter_mut().enumerate() {
+            r.windowed_gc = 0.10 + i as f32 * 0.05;
+            r.windowed_coverage = 100.0 + i as f32;
+        }
+        let bytes = psp_bytes(&records, 1024); // single block
+        let keep = vec![true, false, true, true]; // drop row 1 (pos 25)
+        let want_gc = [0.10f32, 0.20, 0.25]; // rows 0, 2, 3
+        let want_cov = [100.0f32, 102.0, 103.0];
+
+        let mut dz = crate::psp::block::new_column_decompressor().unwrap();
+        let (mut cs, mut ds) = (Vec::new(), Vec::new());
+
+        // Eager oracle: from_block keeps all rows; compare its whole-block
+        // windowed columns to the source (no compaction) as a decode check.
+        {
+            let mut br = PspReader::new(Cursor::new(bytes.clone()))
+                .unwrap()
+                .into_column_blocks();
+            assert!(br.load_current().unwrap());
+            let cols = br.columns().unwrap();
+            let chunk = SamplePspChunk::from_block(&cols, 0, 1, u32::MAX)
+                .unwrap()
+                .unwrap();
+            assert_eq!(chunk.windowed_gc(), &[0.10, 0.15, 0.20, 0.25]);
+            assert_eq!(chunk.windowed_coverage(), &[100.0, 101.0, 102.0, 103.0]);
+        }
+
+        // Path 1 — set_variable_rows (fully-consumed segment).
+        {
+            let mut br = PspReader::new(Cursor::new(bytes.clone()))
+                .unwrap()
+                .into_column_blocks();
+            let tp = br.decode_current_two_phase().unwrap().unwrap();
+            let seg = TwoPhaseSegment::from_two_phase_block(tp).unwrap();
+            let chunk = seg
+                .set_variable_rows(&keep, &mut dz, &mut cs, &mut ds)
+                .unwrap();
+            assert_eq!(chunk.windowed_gc(), &want_gc);
+            assert_eq!(chunk.windowed_coverage(), &want_cov);
+        }
+
+        // Path 2 — inflate_all + compact_rows (straddler decode-once).
+        {
+            let mut br = PspReader::new(Cursor::new(bytes))
+                .unwrap()
+                .into_column_blocks();
+            let tp = br.decode_current_two_phase().unwrap().unwrap();
+            let seg = TwoPhaseSegment::from_two_phase_block(tp).unwrap();
+            let decoded = seg.inflate_all(&mut dz, &mut cs, &mut ds).unwrap();
+            let chunk = seg.compact_rows(&decoded, &keep);
+            assert_eq!(chunk.windowed_gc(), &want_gc);
+            assert_eq!(chunk.windowed_coverage(), &want_cov);
+        }
     }
 
     /// Step 4 (reader side): draining `next_two_phase` (+ `set_variable_rows`

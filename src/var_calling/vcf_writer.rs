@@ -48,6 +48,10 @@ pub struct WriterStats {
     pub records_dropped_hom_ref: u64,
     pub records_dropped_low_qual: u64,
     pub records_dropped_allele_balance: u64,
+    /// Records dropped by the hidden-paralog filter (its keep/drop verdict is
+    /// decided in the paralog write pass, which then routes survivors through
+    /// this writer; this counter is set there, not in `emit_or_drop`).
+    pub records_dropped_paralog: u64,
     pub records_unconverged: u64,
     // Rolled from the callers' per-chunk CallStats.
     pub records_dropped_low_alt_obs: u64,
@@ -138,6 +142,11 @@ impl VcfWriter {
         let CalledChunk {
             chunk_order: _,
             records,
+            // The VCF writer uses neither the per-locus window coverage nor the
+            // paralog LR; they ride the record spill for the hidden-paralog score
+            // only (applied in the write pass before a survivor reaches here).
+            window_coverage: _,
+            paralog_lr: _,
             stats,
         } = chunk;
         // Roll the caller-side counters into the run summary. Destructured
@@ -297,6 +306,7 @@ mod tests {
             }],
             tool_string: "pop_var_caller vcf-writer-test".into(),
             command_line: "pop_var_caller cohort --output out.vcf".into(),
+            paralog_provenance: String::new(),
         }
     }
 
@@ -336,6 +346,8 @@ mod tests {
         CalledChunk {
             chunk_order,
             records,
+            window_coverage: Vec::new(),
+            paralog_lr: Vec::new(),
             stats: CallStats::default(),
         }
     }
