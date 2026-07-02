@@ -12,14 +12,8 @@
 use std::fs::File;
 use std::io::BufReader;
 
-use pop_var_caller::pileup::per_sample::pileup_to_psp::SampleSummaryAccumulators;
 use pop_var_caller::psp::PspReader;
-use pop_var_caller::sample_summary::coverage::CoverageBinScheme;
-use pop_var_caller::sample_summary::het::HetClassifyParams;
-use pop_var_caller::sample_summary::{
-    DEFAULT_DEPTH_BIN_WIDTH, DEFAULT_DEPTH_BINS, DEFAULT_GC_BINS, DEFAULT_GC_WINDOW_BP,
-    DEFAULT_HET_ERROR_RATE, DEFAULT_HET_LR_MARGIN, DEFAULT_HET_MIN_DEPTH, SampleSummary,
-};
+use pop_var_caller::sample_summary::SampleSummary;
 
 fn main() {
     let path = match std::env::args().nth(1) {
@@ -34,50 +28,29 @@ fn main() {
         eprintln!("open {path}: {e}");
         std::process::exit(1);
     });
-    let mut reader = PspReader::new(BufReader::new(file)).unwrap_or_else(|e| {
+    let reader = PspReader::new(BufReader::new(file)).unwrap_or_else(|e| {
         eprintln!("open psp {path}: {e}");
         std::process::exit(1);
     });
 
     println!("sample: {}", reader.header().sample);
-    // Prefer the stored summary section (new producer). For an older `.psp`
-    // without one, re-derive it from the body — the coverage histogram is a
-    // pure function of the per-position records (Premise 1), which is what
-    // makes the section a cache rather than new information. This re-derive
-    // path is also the empirical-parity (D2) tool.
-    let (summary, source) = match reader.metadata() {
-        Some(bytes) => {
-            let s = SampleSummary::from_toml_bytes(bytes).unwrap_or_else(|e| {
-                eprintln!("parse summary: {e}");
-                std::process::exit(1);
-            });
-            (s, "stored section")
-        }
+    // Read the stored summary section. It is a required part of the v1.0 `.psp`
+    // schema (the reader rejects a body without the windowed columns), so any
+    // loadable `.psp` carries it; a `None` here means an older, pre-schema file
+    // that should be regenerated with `pileup`.
+    let summary = match reader.metadata() {
+        Some(bytes) => SampleSummary::from_toml_bytes(bytes).unwrap_or_else(|e| {
+            eprintln!("parse summary: {e}");
+            std::process::exit(1);
+        }),
         None => {
-            let mut acc = SampleSummaryAccumulators::new(
-                CoverageBinScheme {
-                    window_bp: DEFAULT_GC_WINDOW_BP,
-                    gc_bins: DEFAULT_GC_BINS,
-                    depth_bin_width: DEFAULT_DEPTH_BIN_WIDTH,
-                    depth_bins: DEFAULT_DEPTH_BINS,
-                },
-                HetClassifyParams {
-                    min_depth: DEFAULT_HET_MIN_DEPTH,
-                    error_rate: DEFAULT_HET_ERROR_RATE,
-                    lr_margin: DEFAULT_HET_LR_MARGIN,
-                },
+            eprintln!(
+                "{path}: no stored sample-summary section — a pre-schema `.psp`; \
+                 regenerate it with `pileup`"
             );
-            for r in reader.records() {
-                let record = r.unwrap_or_else(|e| {
-                    eprintln!("decode record: {e}");
-                    std::process::exit(1);
-                });
-                acc.observe_record(&record);
-            }
-            (acc.finish(), "re-derived from body")
+            std::process::exit(1);
         }
     };
-    println!("summary source: {source}");
 
     let cov = &summary.coverage_by_gc;
     let het = &summary.heterozygosity;
