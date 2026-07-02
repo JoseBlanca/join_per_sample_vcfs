@@ -39,20 +39,26 @@ use crate::pileup_record::AlleleSupportStats;
 use crate::var_calling::per_group_merger::{CompoundConstituent, MergedAllele};
 use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 
-/// One locus on the **record spill**: the full caller output, carried verbatim.
+/// One locus on the **record spill**: the full caller output, carried verbatim,
+/// plus the locus's stored paralog likelihood ratio.
 ///
 /// The [`PosteriorRecord`] is stored in full so the write pass (S5) can
-/// reconstruct it exactly and emit byte-identical VCF. The paralog score's
-/// extra ingredient — the analysis window's GC + each sample's window mean depth
-/// — is **not** here: it lives in the sibling [`WindowSpillRecord`] (Approach A,
-/// S6c), written in coordinate order by the producer and joined to each locus by
-/// tile key. Keeping the per-sample window vectors out of the (per-locus,
-/// all-samples) record spill is what keeps the record spill's per-locus payload
-/// from carrying a second per-sample vector.
+/// reconstruct it exactly and emit byte-identical VCF.
+///
+/// `paralog_lr` is the locus's H1-vs-H2 likelihood ratio, computed **once** and
+/// stored here so the write pass reads it instead of re-scoring (the
+/// inline-scoring architecture,
+/// `doc/devel/architecture/hidden_paralog_inline_scoring.md`). `f64::NAN` marks a
+/// locus that was not scored (not a biallelic SNP, no usable samples, or no
+/// window) — which is *kept*, matching the existing "non-finite LR is never
+/// flagged" rule. (Transitional: until inline scoring lands, the sink writes
+/// `NAN` here and the calibrate/write passes still recompute the LR.)
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ParalogSpillRecord {
     /// The caller's emitted record for this locus, carried in full.
     pub record: PosteriorRecord,
+    /// The stored paralog likelihood ratio (`f64::NAN` = unscored → kept).
+    pub paralog_lr: f64,
 }
 
 /// One analysis window on the **window spill** (Approach A, S6c): the window's
@@ -596,6 +602,8 @@ fn encode_record(spill: &ParalogSpillRecord, out: &mut Vec<u8>) {
     put_u32(out, r.diagnostics.iterations);
     put_f64(out, r.diagnostics.final_max_delta_p);
     put_bool(out, r.diagnostics.converged);
+    // the stored paralog LR (NaN = unscored)
+    put_f64(out, spill.paralog_lr);
 }
 
 /// A forward cursor over a record's bytes with range-checked reads.
@@ -748,8 +756,10 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
         final_max_delta_p: d.f64("diagnostics.final_max_delta_p")?,
         converged: d.bool("diagnostics.converged")?,
     };
+    let paralog_lr = d.f64("paralog_lr")?;
 
     Ok(ParalogSpillRecord {
+        paralog_lr,
         record: PosteriorRecord {
             locus,
             alleles,
@@ -827,6 +837,10 @@ mod tests {
     /// allele) so the round-trip exercises all branches.
     fn spill_record(pos: u32) -> ParalogSpillRecord {
         ParalogSpillRecord {
+            // A finite, pos-varying LR so the round-trip's `assert_eq` exercises
+            // the field (NaN would break equality — that path is covered by the
+            // dedicated nan_lr round-trip test below).
+            paralog_lr: (pos as f64) * 0.25 - 5.0,
             record: PosteriorRecord {
                 locus: RecordLocus {
                     chrom_id: 2,
@@ -877,6 +891,20 @@ mod tests {
             .map(|r| r.expect("decode"))
             .collect();
         assert_eq!(read_back, records);
+    }
+
+    /// The `paralog_lr = NaN` unscored sentinel round-trips (an `assert_eq`
+    /// can't check it — `NaN != NaN` — so assert `is_nan()` explicitly). This is
+    /// the value the sink stores today for every locus.
+    #[test]
+    fn nan_lr_round_trips_as_unscored() {
+        let mut rec = spill_record(42);
+        rec.paralog_lr = f64::NAN;
+        let mut buf = Vec::new();
+        encode_record(&rec, &mut buf);
+        let back = decode_record(&buf).expect("decode");
+        assert!(back.paralog_lr.is_nan(), "NaN LR sentinel must survive");
+        assert_eq!(back.record, rec.record, "the record round-trips unchanged");
     }
 
     /// A `f64::INFINITY` QUAL survives the round-trip exactly (a Phred passed
@@ -1049,6 +1077,7 @@ mod tests {
                 .map(|a| allele(if a == 0 { b"A" } else { b"C" }, a % 2 == 1))
                 .collect();
             let rec = ParalogSpillRecord {
+                paralog_lr: f(700) * 20.0 - 10.0,
                 record: PosteriorRecord {
                     locus: RecordLocus { chrom_id, start, end: start },
                     alleles,

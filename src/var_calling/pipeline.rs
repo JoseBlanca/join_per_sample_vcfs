@@ -913,7 +913,14 @@ impl SpillSink {
     /// (joined by tile key in the read passes).
     fn spill_chunk(&mut self, chunk: CalledChunk) -> Result<(), PipelineError> {
         for record in chunk.records {
-            self.writer.append(&ParalogSpillRecord { record })?;
+            // Transitional: the LR is still recomputed in the calibrate/write
+            // passes, so store `NaN` (unscored) here for now. Inline scoring
+            // (arch: hidden_paralog_inline_scoring.md) will compute + store the
+            // real LR at this point and drop the recompute.
+            self.writer.append(&ParalogSpillRecord {
+                record,
+                paralog_lr: f64::NAN,
+            })?;
         }
         Ok(())
     }

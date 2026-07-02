@@ -17,9 +17,7 @@ use crate::var_calling::per_group_merger::MergedAllele;
 use crate::var_calling::posterior_engine::{EmDiagnostics, PosteriorRecord, RecordLocus};
 
 use super::prepass::ParalogPrePass;
-use super::spill::{
-    ParalogSpillRecord, ParalogSpillWriter, WindowSpillRecord, WindowSpillWriter,
-};
+use super::spill::{ParalogSpillRecord, ParalogSpillWriter, WindowSpillRecord, WindowSpillWriter};
 
 /// Window bp the wiring tests join on. `1` makes every locus its own window tile
 /// (`tile = pos − 1`), so the record-spill ↔ window-spill join is 1:1 and a
@@ -103,6 +101,7 @@ pub(crate) fn snp_record(
         scalars.push(support(alt_obs));
     }
     ParalogSpillRecord {
+        paralog_lr: f64::NAN,
         record: PosteriorRecord {
             locus: RecordLocus {
                 chrom_id: 0,
