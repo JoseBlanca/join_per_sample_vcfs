@@ -142,9 +142,11 @@ impl VcfWriter {
         let CalledChunk {
             chunk_order: _,
             records,
-            // The VCF writer does not use the per-locus window coverage; it
-            // rides the record spill for the hidden-paralog score only.
+            // The VCF writer uses neither the per-locus window coverage nor the
+            // paralog LR; they ride the record spill for the hidden-paralog score
+            // only (applied in the write pass before a survivor reaches here).
             window_coverage: _,
+            paralog_lr: _,
             stats,
         } = chunk;
         // Roll the caller-side counters into the run summary. Destructured
@@ -345,6 +347,7 @@ mod tests {
             chunk_order,
             records,
             window_coverage: Vec::new(),
+            paralog_lr: Vec::new(),
             stats: CallStats::default(),
         }
     }

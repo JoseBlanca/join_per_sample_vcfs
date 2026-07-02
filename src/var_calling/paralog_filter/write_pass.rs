@@ -1,10 +1,11 @@
-//! S5 — the write pass: spill → recompute LR → apply cut → VCF.
+//! S5 — the write pass: spill → read stored LR → apply cut → VCF.
 //!
-//! The second spill read. It streams the spill a second time, **recomputes**
-//! each locus's LR from the same spilled inputs via the shared
-//! [`score_spilled_locus`] (bit-identical to the calibrate pass, since the
-//! scorer is pure — arch §3), looks up its FDR q-value on the calibration, and
-//! either **drops** the locus (a paralog, counted in
+//! The **single** spill read. Each locus's LR was scored **once in the main
+//! pass** — in the caller worker (`ParalogScoringContext::score`), stored on its
+//! spill record (`ParalogSpillRecord::paralog_lr`) and folded into the histogram
+//! the calibration was derived from (arch: inline scoring).
+//! This pass streams the spill, looks up each **stored** LR's FDR q-value on the
+//! calibration, and either **drops** the locus (a paralog, counted in
 //! [`WriterStats::records_dropped_paralog`]) or routes the surviving record back
 //! through the unchanged [`VcfWriter`] — so the existing downstream filters
 //! (hom-ref / min-QUAL / allele-balance) and the byte-identity-critical VCF
@@ -12,22 +13,19 @@
 //! in the VCF header ([`paralog_provenance`]) since a dropped call leaves no
 //! per-record trace (arch §7).
 //!
-//! Recompute-not-cache is the non-negotiable invariant: holding the calibrate
-//! pass's LRs (or records) to skip this second read would make RAM grow with the
-//! variant count — the exact thing the spill exists to prevent. This pass holds
-//! one record + an `O(samples)` scratch buffer at a time.
+//! Applying the cut to the *stored* LR (rather than re-scoring) makes the cut
+//! match the histogram it came from **by construction**, and holds only one
+//! record at a time — RAM stays flat in the variant count.
 
 use std::io::Read;
 use std::path::Path;
 
 use crate::fasta::{ChromRefFetchError, ChromRefFetcher, StreamingChromRefFetcher};
-use crate::paralog::{ParalogModelParams, ParalogScorePrecompute};
 use crate::var_calling::posterior_engine::PosteriorRecord;
 use crate::var_calling::types::{CallStats, CalledChunk};
 use crate::var_calling::vcf_writer::{VcfWriter, WriterError, WriterStats};
 
-use super::calibrate::{ParalogCalibration, cohort_inbreeding, score_spill_record};
-use super::prepass::ParalogPrePass;
+use super::calibrate::ParalogCalibration;
 use super::spill::{ParalogSpillReader, SpillError};
 
 /// Failure modes of the write pass.
@@ -140,31 +138,20 @@ pub(crate) fn paralog_provenance(calibration: &ParalogCalibration) -> String {
 /// through `writer`. Returns the writer's stats with
 /// [`WriterStats::records_dropped_paralog`] set.
 ///
-/// `prepass`, `inbreeding_coefficient`, and `params` must be the **same** as the
-/// calibrate pass used (both `inbreeding` and `single_copy_depth_sd` are derived
-/// from `prepass`), and each locus carries its own window coverage on the record
-/// spill, so the recomputed LRs match the histogram the cut came from. Survivors
-/// are fed to the writer in spill order
-/// (which is genomic order — the main pass spills post-reorder), one record per
-/// `CalledChunk` with a gapless `chunk_order`; the writer's reorder passes them
-/// straight through.
-#[allow(clippy::too_many_arguments)]
+/// Each locus's LR was **scored once in the main pass** (the worker) and stored
+/// on the spill ([`ParalogSpillRecord::paralog_lr`]), and folded into the
+/// histogram `calibration` was derived from — so this pass just reads the stored
+/// LR and applies the cut, with no re-score (arch: inline scoring). Survivors are
+/// fed to the writer in spill order (which is genomic order — the main pass
+/// spills post-reorder), one record per `CalledChunk` with a gapless
+/// `chunk_order`; the writer's reorder passes them straight through.
 pub(crate) fn run_write_pass<R: Read>(
     spill: &mut ParalogSpillReader<R>,
-    prepass: &ParalogPrePass,
-    inbreeding_coefficient: f64,
     calibration: &ParalogCalibration,
-    params: &ParalogModelParams,
     reference: &Path,
     chrom_names: &[String],
     mut writer: VcfWriter,
 ) -> Result<WriterStats, WritePassError> {
-    let single_copy_depth_sd = prepass.single_copy_depth_sd();
-    let inbreeding = cohort_inbreeding(single_copy_depth_sd.len(), inbreeding_coefficient);
-    // Built once from the same params + cohort inbreeding the calibrate pass
-    // used, so the recomputed LRs are bit-identical to the histogram's.
-    let precompute = ParalogScorePrecompute::new(params, &inbreeding);
-    let mut obs_buf = Vec::new();
     let mut records_dropped_paralog = 0u64;
     let mut chunk_order = 0u64;
     // Per-contig reference fetcher for the coordinate-consistency guard, built
@@ -173,19 +160,11 @@ pub(crate) fn run_write_pass<R: Read>(
 
     while let Some(record) = spill.next_record() {
         let record = record?;
-        // Recompute the LR from the record's own carried window coverage
-        // (bit-identical to calibrate — same spilled inputs, same pure scorer)
-        // and drop the locus if the calibration flags it. An unscored locus (not
-        // a biallelic SNP, or no usable samples) is never flagged → kept.
-        let flagged = score_spill_record(
-            &record,
-            prepass,
-            &inbreeding,
-            &single_copy_depth_sd,
-            &precompute,
-            &mut obs_buf,
-        )
-        .is_some_and(|lr| calibration.flags(lr));
+        // Apply the cut to the locus's stored LR (scored once in the worker,
+        // folded into the histogram `calibration` came from — so the cut applies
+        // to the exact value the calibration was built from). An unscored locus
+        // carries `NaN` and is never flagged → kept.
+        let flagged = calibration.flags(record.paralog_lr);
 
         if flagged {
             records_dropped_paralog += 1;
@@ -201,9 +180,10 @@ pub(crate) fn run_write_pass<R: Read>(
         // reorder cursor gapless from 0.
         writer.handle(CalledChunk {
             chunk_order,
-            // The VCF writer ignores window coverage (it rode the spill only for
-            // the score, already applied above); an empty vec suffices here.
+            // The VCF writer ignores the window coverage + LR (they rode the spill
+            // only for the score, already applied above); empty vecs suffice here.
             window_coverage: Vec::new(),
+            paralog_lr: Vec::new(),
             records: vec![record.record],
             stats: CallStats::default(),
         })?;
@@ -218,8 +198,11 @@ pub(crate) fn run_write_pass<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paralog::{ParalogLrHistogram, ParalogModelParams};
     use crate::psp::header::ParsedChromosome;
-    use crate::var_calling::paralog_filter::calibrate::{CalibrationConfig, calibrate};
+    use crate::var_calling::paralog_filter::calibrate::{
+        CalibrationConfig, ParalogScoringContext, calibrate_from_histogram,
+    };
     use crate::var_calling::paralog_filter::spill::{ParalogSpillReader, ParalogSpillRecord};
     use crate::var_calling::paralog_filter::test_support::{
         normal_locus, paralog_locus, prepass, write_spill,
@@ -230,6 +213,27 @@ mod tests {
     use tempfile::tempdir;
 
     const COHORT_F: f64 = 0.02;
+
+    /// Fill each record's `paralog_lr` as the worker does — score it from its own
+    /// window coverage — and build the calibration from those LRs (the histogram
+    /// the sink folds inline), exactly the production path. Mutates `records` in
+    /// place so `write_spill(records)` then carries the stored LR the write pass
+    /// reads. Returns the calibration for the target `fdr`.
+    fn score_and_calibrate(
+        records: &mut [ParalogSpillRecord],
+        n: usize,
+        fdr: f64,
+    ) -> ParalogCalibration {
+        let ctx = ParalogScoringContext::new(prepass(n), COHORT_F, &ParalogModelParams::default());
+        let mut buf = Vec::new();
+        let mut histogram = ParalogLrHistogram::with_defaults();
+        for record in records.iter_mut() {
+            let lr = ctx.score(&record.record, &record.window_coverage, &mut buf);
+            record.paralog_lr = lr;
+            histogram.push(lr);
+        }
+        calibrate_from_histogram(&histogram, fdr, &CalibrationConfig::default())
+    }
 
     /// The single contig name the fixtures live on (matches [`metadata`]).
     fn chrom_names() -> Vec<String> {
@@ -283,18 +287,6 @@ mod tests {
         }
     }
 
-    fn calibration_for(records: &[ParalogSpillRecord], n: usize, fdr: f64) -> ParalogCalibration {
-        calibrate(
-            &prepass(n),
-            COHORT_F,
-            &mut ParalogSpillReader::new(Cursor::new(write_spill(records))),
-            &ParalogModelParams::default(),
-            fdr,
-            &CalibrationConfig::default(),
-        )
-        .expect("calibrate")
-    }
-
     /// The write pass drops exactly the paralog-flagged loci and writes the rest;
     /// the surviving VCF has the kept positions, and the header records the
     /// provenance.
@@ -308,7 +300,7 @@ mod tests {
         for i in 0..20u32 {
             records.push(paralog_locus(5000 + i, n));
         }
-        let cal = calibration_for(&records, n, 0.05);
+        let cal = score_and_calibrate(&mut records, n, 0.05);
         let provenance = paralog_provenance(&cal);
         assert!(provenance.contains("target_fdr=0.05"));
 
@@ -324,10 +316,7 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(6000, b'A');
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-            &prepass(n),
-            COHORT_F,
             &cal,
-            &ParalogModelParams::default(),
             &reference,
             &chrom_names(),
             writer,
@@ -361,9 +350,9 @@ mod tests {
     #[test]
     fn reference_mismatch_fails_loud() {
         let n = 10;
-        let records: Vec<ParalogSpillRecord> =
+        let mut records: Vec<ParalogSpillRecord> =
             (0..5u32).map(|i| normal_locus(1000 + i, n)).collect();
-        let cal = calibration_for(&records, n, -1.0); // flags nothing → all survive
+        let cal = score_and_calibrate(&mut records, n, -1.0); // flags nothing → all survive
 
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
@@ -376,10 +365,7 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(2000, b'C'); // REF is A → mismatch
         let err = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-            &prepass(n),
-            COHORT_F,
             &cal,
-            &ParalogModelParams::default(),
             &reference,
             &chrom_names(),
             writer,
@@ -399,10 +385,10 @@ mod tests {
     #[test]
     fn nothing_flagged_writes_everything() {
         let n = 10;
-        let records: Vec<ParalogSpillRecord> =
+        let mut records: Vec<ParalogSpillRecord> =
             (0..30u32).map(|i| normal_locus(1000 + i, n)).collect();
         // A negative FDR target is unachievable → flags nothing.
-        let cal = calibration_for(&records, n, -1.0);
+        let cal = score_and_calibrate(&mut records, n, -1.0);
 
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
@@ -416,10 +402,7 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(2000, b'A');
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-            &prepass(n),
-            COHORT_F,
             &cal,
-            &ParalogModelParams::default(),
             &reference,
             &chrom_names(),
             writer,
@@ -434,7 +417,7 @@ mod tests {
     #[test]
     fn writes_nothing_on_empty_spill() {
         let n = 4;
-        let cal = calibration_for(&[normal_locus(1, n)], n, 0.05);
+        let cal = score_and_calibrate(&mut [normal_locus(1, n)], n, 0.05);
         let dir = tempdir().unwrap();
         let out = dir.path().join("out.vcf");
         let writer = VcfWriter::new(
@@ -446,10 +429,7 @@ mod tests {
         let (_ref_dir, reference) = reference_fasta(100, b'A');
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(Vec::<u8>::new())),
-            &prepass(n),
-            COHORT_F,
             &cal,
-            &ParalogModelParams::default(),
             &reference,
             &chrom_names(),
             writer,
@@ -460,7 +440,7 @@ mod tests {
     }
 
     /// The write pass is deterministic: the same spill + calibration produce the
-    /// identical VCF (the LR recompute is pure).
+    /// identical VCF (the cut is a pure curve lookup on the stored LR).
     #[test]
     fn write_pass_is_deterministic() {
         let n = 15;
@@ -471,7 +451,7 @@ mod tests {
         for i in 0..10u32 {
             records.push(paralog_locus(5000 + i, n));
         }
-        let cal = calibration_for(&records, n, 0.1);
+        let cal = score_and_calibrate(&mut records, n, 0.1);
 
         let (_ref_dir, reference) = reference_fasta(6000, b'A');
         let run = || {
@@ -485,10 +465,7 @@ mod tests {
             .unwrap();
             run_write_pass(
                 &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
-                &prepass(n),
-                COHORT_F,
                 &cal,
-                &ParalogModelParams::default(),
                 &reference,
                 &chrom_names(),
                 writer,

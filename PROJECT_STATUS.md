@@ -19,6 +19,19 @@ Skills and agents are instructed to leave it untouched.
 > **Current focus.** _Maintained by skills (last-completed) and the human
 > project manager (next-task)._
 >
+> - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M7: score the LR once in the caller worker (single write pass)**
+>   (branch `tomato2-paralog-filter`). The main perf payoff for the +11.6× two-pass regression. Placement A (the arch doc's later
+>   refinement, now trivial because M5 made the worker gather window coverage): a cohort-constant `ParalogScoringContext` (pre-pass
+>   coverage models + cohort `F` slice + σ₀ + precompute) is built once and held read-only by `VariantCaller`; `call_chunk` scores each
+>   locus's LR inline (from the window coverage it gathers + the record's AD) onto `CalledChunk.paralog_lr` (NaN=unscored→kept). The sink
+>   folds each stored LR into the calibration histogram inline (`SinkOutput::Spill(histogram)`), so calibration is now pure
+>   (`calibrate_from_histogram`, no spill read) and the write pass reads the stored LR and applies the cut — **one spill read, one scoring,
+>   on the parallel workers**. The old spill-reading `calibrate`/`score_spill_record` became `#[cfg(test)]`. Also replaced the per-locus
+>   binary-search window gather with a per-sample forward merge-join (monotone cursor + debug_assert). VCF byte-identity holds by
+>   construction (same pure scorer, same inputs, bit-exact spill round-trip; order-independent integer-bin histogram) — verified by the
+>   review's reliability pass. 1519 lib + all integration + clippy/fmt green. 7-category parallel review: 2 Major (missing worker-scoring
+>   test + stale module docs) + 3 Minor, all applied. Review: [paralog_m7_2026-07-02.md](doc/devel/reports/reviews/paralog_m7_2026-07-02.md).
+>   Next in plan: M8 (validate on tomato2 — drop-profile/wall/RSS — + implementation report + real tomato2 σ₀).
 > - **Last completed task (2026-07-02):** **Hidden-paralog filter — pileup-window-coverage arch, Milestone M6: retire the window-spill write side + `n_tiles`→`n_positions` rename**
 >   (branch `tomato2-paralog-filter`). Per-sample centred-window coverage now flows `.psp` columns → `CalledChunk::window_coverage` →
 >   the record spill (landed M5), so the old sibling "window spill" (Approach A / S6c: a tile-keyed coverage file joined per locus) is

@@ -1,19 +1,24 @@
-//! S4 — the calibrate pass: spill → LR → histogram → π + FDR cut.
+//! S4 — the per-locus paralog scorer + calibration (LR histogram → π + FDR cut).
 //!
-//! The first of the two spill reads. It streams the spill locus by locus,
-//! scores each candidate variant for paralogy, folds the likelihood ratio into
-//! a **fixed-size histogram**, and discards the locus — nothing per-locus is
-//! retained, so RAM stays flat in variant count (arch §3 step 5, §6). From the
-//! finished histogram it estimates the empirical-Bayes prior `π` (Q5, with a
-//! fixed-prior fallback if the EM does not converge), builds the tail-FDR
-//! `q_of_lr` curve, and resolves the LR threshold for the operator's target
-//! FDR.
+//! Two responsibilities after the inline-scoring change (arch:
+//! `hidden_paralog_inline_scoring.md`):
 //!
-//! The per-locus scoring lives in [`score_spilled_locus`], a pure function of
-//! the spilled inputs and the pre-pass. The **write pass (S5) calls the exact
-//! same function** to recompute each LR, so the applied cut matches the
-//! histogram it came from bit-for-bit (the non-negotiable invariant in arch §3).
+//! 1. **The per-locus scorer** — [`score_spilled_locus`], a pure function of a
+//!    locus's record + window coverage + the pre-pass. In production the caller
+//!    **worker** runs it once per locus through [`ParalogScoringContext`] (built
+//!    once from the pre-pass + cohort `F` + params, shared read-only across
+//!    workers) and stores the LR on the spill; nothing re-scores downstream.
+//! 2. **The calibration** — [`calibrate_from_histogram`] estimates the
+//!    empirical-Bayes prior `π` (Q5, with a fixed-prior fallback if the EM does
+//!    not converge), builds the tail-FDR `q_of_lr` curve, and resolves the LR
+//!    threshold for the operator's target FDR. It runs on the histogram the sink
+//!    folds inline during the main pass — no spill read, no scoring.
+//!
+//! The spill-streaming [`calibrate`] (score every record into a histogram, then
+//! calibrate) and its [`score_spill_record`] wrapper survive only as `#[cfg(test)]`
+//! helpers that drive the scorer end-to-end from record fixtures.
 
+#[cfg(test)]
 use std::io::Read;
 
 use crate::paralog::{
@@ -25,6 +30,7 @@ use crate::var_calling::posterior_engine::PosteriorRecord;
 use crate::var_calling::types::LocusWindowCoverage;
 
 use super::prepass::ParalogPrePass;
+#[cfg(test)]
 use super::spill::{ParalogSpillReader, ParalogSpillRecord, SpillError};
 
 /// Default fallback `π` used when the EM does not converge — a rare-paralog
@@ -173,13 +179,16 @@ fn build_observation(
 /// from the record spill — each sample's own GC + mean coverage (`NaN` where a
 /// sample had no covered record there).
 ///
-/// **Pure and deterministic**, so the calibrate pass (S4) and the write pass
-/// (S5) get bit-identical LRs from the same spilled inputs — the invariant that
-/// lets the cut apply to the histogram it was built from. `obs_buf` is a caller
-/// scratch buffer (reused across loci to keep the per-locus cost allocation-free
-/// and memory `O(samples)`).
+/// **Pure and deterministic**, so every locus's LR is reproducible from its own
+/// inputs — the invariant that lets the sink fold, and the write pass apply, the
+/// exact same value. `obs_buf` is a caller scratch buffer (reused across loci to
+/// keep the per-locus cost allocation-free and memory `O(samples)`).
+///
+/// Private to this module: production reaches it only through
+/// [`ParalogScoringContext::score`]; the `#[cfg(test)]` [`calibrate`] /
+/// [`score_spill_record`] and the unit tests are its only other callers.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn score_spilled_locus(
+fn score_spilled_locus(
     record: &PosteriorRecord,
     window: &LocusWindowCoverage,
     prepass: &ParalogPrePass,
@@ -218,12 +227,14 @@ pub(crate) fn score_spilled_locus(
     Some(score.paralog_log_likelihood_ratio)
 }
 
-/// Score one record-spill record from its own carried window coverage (gathered
-/// by the caller from the psp windowed columns — no window join). Shared by the
-/// calibrate pass (S4) and the write pass (S5) so their LRs are bit-identical.
+/// Score one record-spill record from its own carried window coverage.
+///
+/// **Test-only after M7**: production scores each locus once in the worker
+/// ([`ParalogScoringContext::score`]) and stores the LR on the spill, so no read
+/// pass re-scores. Kept to drive the calibrate tests directly from spill records.
 /// `None` — unscored, so **kept** — when the scorer declines (not a SNP, no
-/// usable samples). The window coverage is per-locus and self-contained, so
-/// unlike the retired tile join this needs no ordering side-channel.
+/// usable samples).
+#[cfg(test)]
 pub(crate) fn score_spill_record(
     spill: &ParalogSpillRecord,
     prepass: &ParalogPrePass,
@@ -243,14 +254,119 @@ pub(crate) fn score_spill_record(
     )
 }
 
+/// The cohort-constant inputs the hidden-paralog score needs, built **once**
+/// when the filter is on and shared read-only across the caller workers.
+///
+/// After the single-individual reformulation the LR depends on nothing
+/// genome-wide (arch `hidden_paralog_inline_scoring.md`), so a worker can score
+/// a locus the moment its own data exists — it needs only this context (the
+/// pre-pass coverage models, the cohort `F` slice, the σ₀ slice, and the
+/// locus-invariant precompute) plus the locus's record + window coverage + a
+/// reusable scratch buffer. Owning these here lets [`score`](Self::score) be a
+/// method on shared `&self`, keeping [`crate::var_calling::VariantCaller`]
+/// `Sync`.
+pub(crate) struct ParalogScoringContext {
+    prepass: ParalogPrePass,
+    inbreeding: Vec<f64>,
+    single_copy_depth_sd: Vec<f64>,
+    precompute: ParalogScorePrecompute,
+}
+
+impl ParalogScoringContext {
+    /// Build the context from the fitted pre-pass, the cohort inbreeding
+    /// coefficient `F` (the caller's `--inbreeding-coefficient`, applied to every
+    /// sample), and the model params — the same quantities the retired
+    /// calibrate/write scoring built per pass, now built once up front.
+    pub(crate) fn new(
+        prepass: ParalogPrePass,
+        inbreeding_coefficient: f64,
+        params: &ParalogModelParams,
+    ) -> Self {
+        let single_copy_depth_sd = prepass.single_copy_depth_sd();
+        let inbreeding = cohort_inbreeding(single_copy_depth_sd.len(), inbreeding_coefficient);
+        let precompute = ParalogScorePrecompute::new(params, &inbreeding);
+        Self {
+            prepass,
+            inbreeding,
+            single_copy_depth_sd,
+            precompute,
+        }
+    }
+
+    /// The hidden-paralog LR for one called locus from its record + per-sample
+    /// window coverage, or `f64::NAN` when the locus is unscored (not a biallelic
+    /// SNP, or no usable samples) — the "keep, never flag" cases. `NaN` (rather
+    /// than `Option`) so the worker stores it straight into the per-record
+    /// `paralog_lr` vector and every downstream step treats non-finite as
+    /// "unscored → kept" uniformly (the histogram drops it, `flags` returns
+    /// `false`). `obs_buf` is a per-worker scratch buffer reused across the
+    /// chunk's records.
+    pub(crate) fn score(
+        &self,
+        record: &PosteriorRecord,
+        window: &LocusWindowCoverage,
+        obs_buf: &mut Vec<Option<SampleObservation>>,
+    ) -> f64 {
+        score_spilled_locus(
+            record,
+            window,
+            &self.prepass,
+            &self.inbreeding,
+            &self.single_copy_depth_sd,
+            &self.precompute,
+            obs_buf,
+        )
+        .unwrap_or(f64::NAN)
+    }
+}
+
+/// Estimate `π` and the FDR cut from an **already-folded** LR histogram — the
+/// histogram the sink builds inline during the main pass (arch
+/// `hidden_paralog_inline_scoring.md`), so calibration needs no spill read and
+/// no scoring. Pure: same histogram → same calibration.
+///
+/// On EM non-convergence the prior falls back to `cfg.fallback_prior` (the
+/// caller inspects `prior.converged` to warn).
+pub(crate) fn calibrate_from_histogram(
+    histogram: &ParalogLrHistogram,
+    fdr_target: f64,
+    cfg: &CalibrationConfig,
+) -> ParalogCalibration {
+    let estimated = ParalogPrior::estimate(histogram, &cfg.em);
+    let prior = if estimated.converged {
+        estimated
+    } else {
+        // Fallback: the EM did not converge (or the histogram was empty), so
+        // trust a documented default π over a junk estimate. `converged =
+        // false` signals the caller to warn.
+        ParalogPrior {
+            prior_probability: cfg.fallback_prior,
+            converged: false,
+        }
+    };
+    let curve = ParalogFdrCurve::from_histogram(histogram, &prior);
+    let lr_threshold = curve.lr_threshold_for_fdr(fdr_target);
+    ParalogCalibration {
+        prior,
+        curve,
+        lr_threshold,
+        target_fdr: fdr_target,
+    }
+}
+
 /// Stream the spill once, scoring every locus and folding its LR into a
 /// fixed-size histogram, then estimate `π` and the FDR cut — all RAM-flat (the
 /// histogram is a few KB; no per-locus vector).
 ///
+/// **Test-only after M7**: production folds the histogram inline in the main
+/// pass ([`ParalogScoringContext::score`] in the worker + the sink) and
+/// calibrates via [`calibrate_from_histogram`]. This spill-reading path is kept
+/// to exercise the record → LR → π/cut chain end-to-end from record fixtures.
+///
 /// `inbreeding` is the cohort inbreeding coefficient `F` (the caller's
 /// `--inbreeding-coefficient`), applied to every sample; `fdr_target` is the
-/// operator's FDR. On EM non-convergence the prior falls back to
-/// `cfg.fallback_prior` (the caller inspects `prior.converged` to warn).
+/// operator's FDR.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn calibrate<R: Read>(
     prepass: &ParalogPrePass,
@@ -262,10 +378,6 @@ pub(crate) fn calibrate<R: Read>(
 ) -> Result<ParalogCalibration, SpillError> {
     let single_copy_depth_sd = prepass.single_copy_depth_sd();
     let inbreeding = cohort_inbreeding(single_copy_depth_sd.len(), inbreeding_coefficient);
-    // The per-pass locus-invariant scoring tables (Wright genotype priors +
-    // carrier-frequency probs + configs), built once from the params + cohort
-    // inbreeding and reused for every locus. The write pass builds an identical
-    // one, so the recomputed LRs stay bit-identical.
     let precompute = ParalogScorePrecompute::new(params, &inbreeding);
 
     let mut histogram = ParalogLrHistogram::with_defaults();
@@ -285,27 +397,7 @@ pub(crate) fn calibrate<R: Read>(
         // `record` is dropped here — nothing per-locus is retained.
     }
 
-    let estimated = ParalogPrior::estimate(&histogram, &cfg.em);
-    let prior = if estimated.converged {
-        estimated
-    } else {
-        // Fallback: the EM did not converge (or the histogram was empty), so
-        // trust a documented default π over a junk estimate. `converged =
-        // false` signals the caller to warn.
-        ParalogPrior {
-            prior_probability: cfg.fallback_prior,
-            converged: false,
-        }
-    };
-    let curve = ParalogFdrCurve::from_histogram(&histogram, &prior);
-    let lr_threshold = curve.lr_threshold_for_fdr(fdr_target);
-
-    Ok(ParalogCalibration {
-        prior,
-        curve,
-        lr_threshold,
-        target_fdr: fdr_target,
-    })
+    Ok(calibrate_from_histogram(&histogram, fdr_target, cfg))
 }
 
 #[cfg(test)]
