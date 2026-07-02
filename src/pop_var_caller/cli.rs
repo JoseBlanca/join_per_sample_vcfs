@@ -529,7 +529,11 @@ pub fn run_pileup(args: &PileupArgs) -> Result<(), PileupCliError> {
     //    metadata section, then finalise: fsync + atomically rename the
     //    .tmp into place. (Attach before `finish` — the section is written
     //    between the block index and the trailer.)
-    let summary_doc = summary_acc.finish();
+    // `finish` also flushes the last staged records (their windows truncated at
+    // the stream end) into the writer before we attach the metadata section.
+    let summary_doc = summary_acc
+        .finish(&mut writer)
+        .map_err(PileupToPspError::from)?;
     writer
         .attach_metadata(summary_doc.to_toml_bytes()?)
         .map_err(PileupToPspError::from)?;
