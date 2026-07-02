@@ -27,26 +27,21 @@
 //! - S5 — the write pass (spill → recompute LR → apply cut → VCF).
 //! - S6 — orchestration + CLI.
 
-// S6b wires the pre-pass, spill, calibrate, and write pass into
-// `run_var_calling`. The window modules (S3) are consumed by S6c — until then
-// they carry a `dead_code` allow.
+// The two-pass flow is fully wired into `run_var_calling` (S6): the pre-pass,
+// the record + window spills, the calibrate pass, and the write pass. The window
+// modules (S3/S6c) feed the window spill that the read passes join by tile key.
 pub(crate) mod calibrate;
 pub(crate) mod prepass;
 pub(crate) mod spill;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod write_pass;
-// S6c: window_coverage feeds window_producer (the window-spill builder).
-// window_gc + window_producer's remaining surface (and the window-spill reader
-// side) are consumed by the pipeline join in the next S6c step.
 pub(crate) mod window_coverage;
-#[allow(dead_code)]
 pub(crate) mod window_gc;
-#[allow(dead_code)]
 pub(crate) mod window_producer;
+pub(crate) mod write_pass;
 
 /// Default `--paralog-fdr`: the target false-discovery rate for the
 /// hidden-paralog filter. ≈ 1 % (introgression-safe), so the filter is **on by
-/// default** (once S6c wires the producer windows; held off until then). `0.0`
-/// disables it. Pinned here pending the T1 flagged-set profile on tomato2.
+/// default**. `0.0` (or `--no-paralog-filter`) disables it. Pinned here pending
+/// the T1 flagged-set profile on tomato2.
 pub(crate) const DEFAULT_PARALOG_FDR: f64 = 0.01;

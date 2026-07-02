@@ -325,8 +325,7 @@ pub fn run_var_calling(
     //     `paralog_requested` gates every filter cost so the off path is
     //     untouched. A sample whose `.psp` carries no summary (or fails to
     //     parse) is carried absent (S1), not fatal. ---
-    let paralog_requested =
-        PARALOG_WINDOWS_WIRED && !cohort.no_paralog_filter && cohort.paralog_fdr > 0.0;
+    let paralog_requested = !cohort.no_paralog_filter && cohort.paralog_fdr > 0.0;
     let paralog_prepass = if paralog_requested {
         let summaries: Vec<Option<SampleSummary>> = psp_readers
             .iter()
@@ -830,12 +829,6 @@ pub fn run_var_calling(
         }
     }
 }
-
-/// Whether the producer computes per-window depth yet (S6c). Until it does, the
-/// two-pass paralog path would spill records with no coverage signal and score
-/// nothing — so the filter is held **off** regardless of `--paralog-fdr`. S6c
-/// flips this to `true` (and this const is removed) once the windows are wired.
-const PARALOG_WINDOWS_WIRED: bool = false;
 
 /// A consumer of the caller→writer [`CalledChunk`] stream. Lets the main pass
 /// drive either the direct VCF writer (single-pass) or the paralog spill sink

@@ -34,7 +34,10 @@ pub(crate) struct ReferenceWindowGc {
 
 impl ReferenceWindowGc {
     /// The GC fraction of the window containing 1-based `pos`, or `None` if that
-    /// window had no non-`N` reference base (or `pos` is past the contig).
+    /// window had no non-`N` reference base (or `pos` is past the contig). The
+    /// production join keys by tile directly ([`gc_at_tile`](Self::gc_at_tile));
+    /// this position-keyed convenience is exercised only by the unit tests.
+    #[cfg(test)]
     pub(crate) fn gc_at(&self, pos: u32) -> Option<f32> {
         let tile = (pos.saturating_sub(1) / self.window_bp) as usize;
         self.gc.get(tile).copied().flatten()
@@ -46,14 +49,18 @@ impl ReferenceWindowGc {
         self.gc.get(tile as usize).copied().flatten()
     }
 
-    /// Number of window tiles covered.
+    /// Number of window tiles covered. (Test-only; production reads GC by tile.)
+    #[cfg(test)]
     pub(crate) fn n_windows(&self) -> usize {
         self.gc.len()
     }
 
     /// Build from a contiguous slice of reference bases for the contig, where
-    /// `bases[i]` is the base at 1-based position `i + 1`. Any case; `N`
-    /// excluded from the GC denominator.
+    /// `bases[i]` is the base at 1-based position `i + 1`. Any case; `N` excluded
+    /// from the GC denominator. Production streams the contig via
+    /// [`from_base_iter`](Self::from_base_iter); this slice form is a test
+    /// convenience.
+    #[cfg(test)]
     pub(crate) fn from_bases(bases: &[u8], window_bp: u32) -> Self {
         Self::from_base_iter(bases.iter().copied(), window_bp)
     }

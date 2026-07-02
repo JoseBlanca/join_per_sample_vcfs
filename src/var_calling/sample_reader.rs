@@ -677,7 +677,6 @@ impl TwoPhaseSegment {
     /// `nonref_obs`), so this is a couple of additions off already-decoded data,
     /// no heavy-column inflate. Feeds the paralog window-depth accumulator (S6c);
     /// read-only, it touches no fold state. Parallel to [`positions`](Self::positions).
-    #[allow(dead_code)] // consumed by the S6c pipeline join
     pub fn depth_at(&self, record_idx: usize) -> u32 {
         let ref_obs = self
             .allele_obs_count

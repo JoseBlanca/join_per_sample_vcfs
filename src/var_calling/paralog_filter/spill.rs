@@ -9,15 +9,21 @@
 //! deleted when the run ends (success *or* failure).
 //!
 //! Framing (settled 2026-07-01 over the columnar `.psp` container): the spill's
-//! payload is dominated by **per-sample** vectors (GT/GQ/AD per sample, the
-//! analysis-window `(gc, mean depth)` per sample) which the `.psp` container's
-//! per-record / per-allele column model does not fit, so the spill is its own
-//! simple format — a `u32` little-endian length prefix followed by one record's
-//! bytes, `BufWriter`/`BufReader`-buffered. Each record carries the **whole**
-//! [`PosteriorRecord`] verbatim plus the per-sample window, so the write pass
-//! reconstructs a bit-identical record and feeds it back through the unchanged
-//! VCF writer — the byte-identity safety net holds by construction, with no
-//! dependence on which record fields the writer happens to read.
+//! payload is dominated by **per-sample** vectors (GT/GQ/AD per sample) which the
+//! `.psp` container's per-record / per-allele column model does not fit, so the
+//! spill is its own simple format — a `u32` little-endian length prefix followed
+//! by one record's bytes, `BufWriter`/`BufReader`-buffered. Each record carries
+//! the **whole** [`PosteriorRecord`] verbatim, so the write pass reconstructs a
+//! bit-identical record and feeds it back through the unchanged VCF writer — the
+//! byte-identity safety net holds by construction, with no dependence on which
+//! record fields the writer happens to read.
+//!
+//! The paralog score's coverage input (analysis-window GC + per-sample mean
+//! depth) is **not** in this record spill — it lives in the sibling
+//! [`WindowSpillRecord`] stream (Approach A, S6c), one record per variant window
+//! in coordinate order, joined to each locus by tile key via [`WindowJoin`]. That
+//! keeps the record spill's per-locus payload from carrying a second per-sample
+//! vector.
 //!
 //! Memory-flat by construction: the writer encodes into one reused scratch
 //! buffer and the reader decodes one record at a time into a reused byte buffer
@@ -143,7 +149,6 @@ impl ParalogSpill {
         )))
     }
 
-    #[allow(dead_code)] // consumed by the S6c pipeline join
     /// Open a buffered [`WindowSpillWriter`] over this file (truncating). Used
     /// when the spill holds [`WindowSpillRecord`]s (the window spill).
     pub(crate) fn window_writer(&self) -> Result<WindowSpillWriter<BufWriter<File>>, SpillError> {
@@ -158,7 +163,6 @@ impl ParalogSpill {
     }
 
     /// Open a buffered [`WindowSpillReader`] over this file from the start.
-    #[allow(dead_code)] // consumed by the S6c pipeline join
     pub(crate) fn window_reader(&self) -> Result<WindowSpillReader<BufReader<File>>, SpillError> {
         let file = File::open(&self.temp_path)?;
         Ok(WindowSpillReader::new(BufReader::with_capacity(
@@ -278,14 +282,12 @@ impl<W: Write> WindowSpillWriter<W> {
     }
 }
 
-#[allow(dead_code)] // consumed by the S6c pipeline join
 /// One-pass reader for the window spill, one record at a time.
 pub(crate) struct WindowSpillReader<R: Read> {
     source: R,
     buf: Vec<u8>,
 }
 
-#[allow(dead_code)] // consumed by the S6c pipeline join
 impl<R: Read> WindowSpillReader<R> {
     pub(crate) fn new(source: R) -> Self {
         Self {
@@ -314,7 +316,6 @@ impl<R: Read> WindowSpillReader<R> {
 /// hand the same window to every locus that lands in it. A locus whose tile has
 /// no window record (e.g. a coordinate the producer never marked variant) gets
 /// `None` — the scorer then leaves it unscored (kept), never flagged.
-#[allow(dead_code)] // consumed by the S6c pipeline join
 pub(crate) struct WindowJoin<R: Read> {
     reader: WindowSpillReader<R>,
     /// The window at or ahead of the last requested key; `None` past end.
@@ -324,7 +325,6 @@ pub(crate) struct WindowJoin<R: Read> {
     last_key: Option<(u32, u32)>,
 }
 
-#[allow(dead_code)] // consumed by the S6c pipeline join
 impl<R: Read> WindowJoin<R> {
     /// Wrap a window-spill reader, priming the first window.
     pub(crate) fn new(mut reader: WindowSpillReader<R>) -> Result<Self, SpillError> {
@@ -390,7 +390,6 @@ fn encode_window(record: &WindowSpillRecord, out: &mut Vec<u8>) {
     }
 }
 
-#[allow(dead_code)] // consumed by the S6c pipeline join
 fn decode_window(buf: &[u8]) -> Result<WindowSpillRecord, SpillError> {
     let mut d = Decoder::new(buf);
     let chrom_id = d.u32("window.chrom_id")?;
