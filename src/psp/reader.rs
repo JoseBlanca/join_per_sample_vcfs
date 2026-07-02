@@ -531,6 +531,8 @@ struct DecodedBlock {
     // Per-record columns
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
+    windowed_gc: Vec<f32>,
+    windowed_coverage: Vec<f32>,
     // Per-allele fixed-width columns
     allele_obs_count: Vec<u32>,
     allele_q_sum_log: Vec<f64>,
@@ -939,6 +941,10 @@ impl SnpDecoder {
             chrom_id: block.chrom_id,
             pos,
             alleles,
+            // Per-record columns, indexed like `delta_pos[i]` / `n_alleles[i]`
+            // above (the decode-side length check guarantees `len == n_records`).
+            windowed_gc: block.windowed_gc[i],
+            windowed_coverage: block.windowed_coverage[i],
         };
 
         self.last_pos = pos;
@@ -1555,6 +1561,8 @@ fn decode_block_payload<R: Read>(
     // Per-record slots.
     let mut delta_pos: Option<Vec<u64>> = None;
     let mut n_alleles: Option<Vec<u64>> = None;
+    let mut windowed_gc: Option<Vec<f32>> = None;
+    let mut windowed_coverage: Option<Vec<f32>> = None;
 
     // Per-allele slots.
     let mut allele_seq_len: Option<Vec<u64>> = None;
@@ -1622,6 +1630,8 @@ fn decode_block_payload<R: Read>(
         match column {
             DecodedColumn::DeltaPos(v) => delta_pos = Some(v),
             DecodedColumn::NAlleles(v) => n_alleles = Some(v),
+            DecodedColumn::WindowedGc(v) => windowed_gc = Some(v),
+            DecodedColumn::WindowedCoverage(v) => windowed_coverage = Some(v),
             DecodedColumn::AlleleSeqLen(v) => allele_seq_len = Some(v),
             // H1: unit variants — payload landed in the caller's
             // CSR scratches inside `decode_one_column`. Nothing to
@@ -1660,6 +1670,9 @@ fn decode_block_payload<R: Read>(
         n_records: header.n_records,
         delta_pos: delta_pos.expect("delta-pos column required by v1.0 schema"),
         n_alleles,
+        windowed_gc: windowed_gc.expect("windowed-gc column required by v1.0 schema"),
+        windowed_coverage: windowed_coverage
+            .expect("windowed-coverage column required by v1.0 schema"),
         allele_obs_count: allele_obs_count
             .expect("allele-obs-count column required by v1.0 schema"),
         allele_q_sum_log: allele_q_sum_log
@@ -1685,6 +1698,8 @@ fn decode_block_payload<R: Read>(
 pub(crate) enum DecodedColumn {
     DeltaPos(Vec<u64>),
     NAlleles(Vec<u64>),
+    WindowedGc(Vec<f32>),
+    WindowedCoverage(Vec<f32>),
     AlleleSeqLen(Vec<u64>),
     /// H1 (2026-05-23): unit variant — the CSR `data` + `offsets`
     /// were written through the caller's `allele_seq_*` `&mut Vec`
@@ -1842,6 +1857,18 @@ fn decode_one_column<R: Read>(
         }
         ColumnKey::NAlleles => {
             DecodedColumn::NAlleles(decode_varint_column(bytes, n_records, column_name)?)
+        }
+        ColumnKey::WindowedGc => DecodedColumn::WindowedGc(decode_scalar_column_pod::<f32>(
+            bytes,
+            n_records,
+            column_name,
+        )?),
+        ColumnKey::WindowedCoverage => {
+            DecodedColumn::WindowedCoverage(decode_scalar_column_pod::<f32>(
+                bytes,
+                n_records,
+                column_name,
+            )?)
         }
         ColumnKey::AlleleSeqLen => {
             let lens = decode_varint_column(bytes, n_total_alleles, column_name)?;
@@ -2264,6 +2291,8 @@ mod tests {
 
     fn one_allele_record(chrom_id: u32, pos: u32, seq: &[u8]) -> PileupRecord {
         PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id,
             pos,
             alleles: vec![AlleleObservation {
@@ -2287,6 +2316,8 @@ mod tests {
     /// and every per-allele scalar stat (distinct values per allele).
     fn multi_allele_record(pos: u32, alleles: &[(&[u8], &[ChainId])]) -> PileupRecord {
         PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id: 0,
             pos,
             alleles: alleles
@@ -2401,6 +2432,8 @@ mod tests {
                 Some(DecodedColumn::AlleleMapqSumSq(v)) => mss = Some(v),
                 Some(DecodedColumn::DeltaPos(_))
                 | Some(DecodedColumn::NAlleles(_))
+                | Some(DecodedColumn::WindowedGc(_))
+                | Some(DecodedColumn::WindowedCoverage(_))
                 | Some(DecodedColumn::AlleleSeq)
                 | Some(DecodedColumn::AlleleChainIds)
                 | None => {}
@@ -2484,8 +2517,9 @@ mod tests {
         assert_eq!(tp.n_alleles, eager.n_alleles);
         assert_eq!(tp.allele_obs_count, eager.allele_obs_count);
         assert_eq!(tp.n_total_alleles, header.n_total_alleles);
-        // The 8 deferred columns (seq, six stats, chain-ids) were retained.
-        assert_eq!(tp.retained.len(), 8);
+        // The 10 deferred columns (seq, six allele stats, chain-ids, and the
+        // two per-record windowed-coverage columns) were retained.
+        assert_eq!(tp.retained.len(), 10);
 
         // Each retained blob inflates to the eager heavy column.
         let (mut sd, mut so, mut cd, mut co) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -2516,6 +2550,8 @@ mod tests {
                 }
                 Some(DecodedColumn::AlleleMapqSum(v)) => assert_eq!(v, eager.allele_mapq_sum),
                 Some(DecodedColumn::AlleleMapqSumSq(v)) => assert_eq!(v, eager.allele_mapq_sum_sq),
+                Some(DecodedColumn::WindowedGc(v)) => assert_eq!(v, eager.windowed_gc),
+                Some(DecodedColumn::WindowedCoverage(v)) => assert_eq!(v, eager.windowed_coverage),
                 Some(DecodedColumn::AlleleSeq) | Some(DecodedColumn::AlleleChainIds) => {}
                 other => panic!("unexpected retained column {other:?}"),
             }
@@ -2570,7 +2606,7 @@ mod tests {
         let tp = br.decode_current_two_phase().unwrap().unwrap();
         assert_eq!(tp.delta_pos, e_delta);
         assert_eq!(tp.allele_obs_count, e_obs);
-        assert_eq!(tp.retained.len(), 8);
+        assert_eq!(tp.retained.len(), 10);
 
         let mut dz = new_column_decompressor().unwrap();
         let (mut cs, mut ds) = (Vec::new(), Vec::new());
@@ -2746,6 +2782,56 @@ mod tests {
         }
     }
 
+    /// The per-record windowed-coverage columns (M2) round-trip exactly,
+    /// including distinct per-record values (so a mis-indexing bug would show)
+    /// and the `NaN` "no window here" sentinel (which round-trips bit-for-bit,
+    /// verified on the raw bits since `NaN != NaN`).
+    #[test]
+    fn windowed_coverage_columns_round_trip() {
+        let mut records = Vec::new();
+        for (k, pos) in [10u32, 20, 30].into_iter().enumerate() {
+            let mut r = PileupRecord::new(0, pos, vec![allele(b"A", 5, -3.0, 3, 0, 5, &[])]);
+            // Distinct per-record values (a mis-index would show), with the NaN
+            // "no window" sentinel on a different record per field so both
+            // fields' NaN paths are exercised.
+            r.windowed_gc = if k == 2 {
+                f32::NAN
+            } else {
+                0.25 + 0.1 * k as f32
+            };
+            r.windowed_coverage = if k == 1 { f32::NAN } else { 12.0 + pos as f32 };
+            records.push(r);
+        }
+
+        let mut writer = PspWriter::new(Cursor::new(Vec::new()), writer_header(1)).unwrap();
+        for r in &records {
+            writer.write_record(r).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
+        let got: Vec<PileupRecord> = reader.records().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got.len(), 3);
+        for (g, w) in got.iter().zip(&records) {
+            assert_eq!(g.pos, w.pos);
+            // Bit comparison so the NaN records are checked on both fields.
+            assert_eq!(
+                g.windowed_gc.to_bits(),
+                w.windowed_gc.to_bits(),
+                "gc at pos {}",
+                w.pos,
+            );
+            assert_eq!(
+                g.windowed_coverage.to_bits(),
+                w.windowed_coverage.to_bits(),
+                "coverage at pos {}",
+                w.pos,
+            );
+        }
+        assert!(got[1].windowed_coverage.is_nan(), "coverage NaN survives");
+        assert!(got[2].windowed_gc.is_nan(), "gc NaN survives");
+    }
+
     /// Variant of `allele()` that also pins the new mapq_sum /
     /// mapq_sum_sq scalars. Used by the round-trip tests covering
     /// the per-allele MAPQ tracking added in 2026-05.
@@ -2781,6 +2867,8 @@ mod tests {
     #[test]
     fn single_record_single_allele_round_trip() {
         let want = PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id: 0,
             pos: 100,
             alleles: vec![allele(b"A", 17, -42.5, 9, 3, 7, &[])],
@@ -2821,6 +2909,8 @@ mod tests {
         //   REF n=7, mapq_sum=420, mapq_sum_sq=25200  (all MAPQ 60)
         //   ALT n=3, mapq_sum= 60, mapq_sum_sq= 3600  (one MAPQ 60, two MAPQ 0)
         let rec = PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id: 0,
             pos: 500,
             alleles: vec![
@@ -2854,6 +2944,8 @@ mod tests {
     #[test]
     fn multi_allele_round_trip() {
         let snp = PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id: 0,
             pos: 100,
             alleles: vec![
@@ -2862,6 +2954,8 @@ mod tests {
             ],
         };
         let multi = PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id: 0,
             pos: 200,
             alleles: vec![
@@ -2966,6 +3060,8 @@ mod tests {
     /// Record referencing chain id `chain_id` in its REF allele.
     fn record_with_chain_id(chrom_id: u32, pos: u32, chain_id: ChainId) -> PileupRecord {
         PileupRecord {
+            windowed_gc: 0.5,
+            windowed_coverage: 25.0,
             chrom_id,
             pos,
             alleles: vec![allele(b"A", 1, -1.0, 1, 0, 1, &[chain_id])],
@@ -3174,10 +3270,10 @@ mod tests {
     /// 50..=250 across 3 blocks each covering 100 positions.
     #[test]
     fn region_across_multiple_blocks() {
-        // Choose target so each block holds ~100 records.
-        // ~42 bytes per record (after adding mapq_sum + mapq_sum_sq),
-        // 100 records ≈ 4200 bytes.
-        let bytes = three_block_chrom0_fixture(4 * 1024);
+        // Choose target so each block holds ~100 records. ~50 bytes per record
+        // (after adding mapq_sum + mapq_sum_sq + the two windowed-coverage f32s),
+        // 100 records ≈ 5000 bytes.
+        let bytes = three_block_chrom0_fixture(5 * 1024);
         let mut reader = PspReader::new(Cursor::new(bytes)).unwrap();
         assert_eq!(
             reader.block_index().len(),

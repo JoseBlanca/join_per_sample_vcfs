@@ -169,7 +169,7 @@ impl AlleleObservation {
 /// active-set bookkeeping, and no per-record lifecycle markers.
 /// Two allele observations sharing a chain id came from the same
 /// read or read-pair in this sample.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PileupRecord {
     pub chrom_id: u32,
@@ -177,6 +177,53 @@ pub struct PileupRecord {
     pub pos: u32,
     /// At least one entry; `alleles[0]` is always REF.
     pub alleles: Vec<AlleleObservation>,
+    /// GC fraction of the centred window around this position (the paralog
+    /// score's per-position coverage input;
+    /// `doc/devel/architecture/hidden_paralog_pileup_window_coverage.md`).
+    /// The walker does **not** compute this — it needs look-ahead — so the
+    /// walker leaves it `f32::NAN` and the pileup→psp seam fills it from the
+    /// sliding-window accumulator before writing. `NaN` is the legitimate "no
+    /// window here" value (e.g. an `N` reference position) and round-trips
+    /// through the `.psp` as-is.
+    pub windowed_gc: f32,
+    /// Mean read coverage of the centred window around this position (see
+    /// [`windowed_gc`](Self::windowed_gc) for how it is populated and the `NaN`
+    /// convention).
+    pub windowed_coverage: f32,
+}
+
+/// Equality is **byte-identity** — the property the `.psp` round-trip and
+/// decode-path-equivalence tests actually check. The windowed-coverage floats
+/// are compared on their raw bits (`f32::to_bits`) rather than with IEEE `==`,
+/// so a `NaN` that round-tripped bit-for-bit compares equal to itself (IEEE `==`
+/// would report `NaN != NaN` and spuriously fail an otherwise-identical record).
+/// `NaN` is the walker's "window not computed / no window here" value, so
+/// records legitimately carry it. (These fields hold *means* and GC fractions,
+/// never a signed zero, so bit-equality and value-equality coincide for the
+/// finite case.)
+///
+/// **`PileupRecord` must not derive `Eq` or `Hash`:** this `PartialEq` reports
+/// `NaN == NaN`, which violates the reflexivity law `Eq` (and the `HashMap` /
+/// `HashSet` keys that need it) requires. It is `PartialEq`-only by design.
+impl PartialEq for PileupRecord {
+    fn eq(&self, other: &Self) -> bool {
+        // Exhaustive destructure: adding a field to `PileupRecord` fails to
+        // compile here until it is folded into the byte-identity comparison
+        // (`#[non_exhaustive]` only blocks *external* struct literals — it does
+        // not make this hand-written `eq` self-updating).
+        let Self {
+            chrom_id,
+            pos,
+            alleles,
+            windowed_gc,
+            windowed_coverage,
+        } = self;
+        *chrom_id == other.chrom_id
+            && *pos == other.pos
+            && *alleles == other.alleles
+            && windowed_gc.to_bits() == other.windowed_gc.to_bits()
+            && windowed_coverage.to_bits() == other.windowed_coverage.to_bits()
+    }
 }
 
 impl PileupRecord {
@@ -190,11 +237,50 @@ impl PileupRecord {
     /// The walker builds records via struct-update syntax internally
     /// because [`PileupRecord`] is `#[non_exhaustive]`; this `new` is
     /// the supported entry point from outside the crate.
+    ///
+    /// The windowed-coverage fields default to `f32::NAN` ("not computed");
+    /// set [`windowed_gc`](Self::windowed_gc) / [`windowed_coverage`](Self::windowed_coverage)
+    /// directly (both are `pub`) when a caller needs them populated.
     pub fn new(chrom_id: u32, pos: u32, alleles: Vec<AlleleObservation>) -> Self {
         Self {
             chrom_id,
             pos,
             alleles,
+            windowed_gc: f32::NAN,
+            windowed_coverage: f32::NAN,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-written `PartialEq` treats two byte-identical `NaN`-carrying
+    /// records as equal (IEEE `==` would report `NaN != NaN`). This is the whole
+    /// reason the derive was replaced; a revert to `#[derive(PartialEq)]` would
+    /// break every `.psp` round-trip / decode-equivalence assertion that relies
+    /// on record equality, and this test pins it directly.
+    #[test]
+    fn eq_treats_bitwise_identical_nan_as_equal() {
+        let mk = || PileupRecord::new(0, 42, Vec::new()); // both windowed fields = NaN
+        let a = mk();
+        let b = mk();
+        assert!(a.windowed_gc.is_nan() && a.windowed_coverage.is_nan());
+        assert_eq!(a, b, "byte-identical NaN records must compare equal");
+    }
+
+    /// Both windowed fields participate in equality — a copy-paste dropping one
+    /// would be invisible in the round-trip tests (which set both to the same
+    /// value), so pin it here.
+    #[test]
+    fn eq_distinguishes_each_windowed_field() {
+        let base = PileupRecord::new(0, 42, Vec::new()); // both NaN
+        let mut gc_diff = base.clone();
+        gc_diff.windowed_gc = 0.5;
+        assert_ne!(base, gc_diff, "windowed_gc must participate in eq");
+        let mut cov_diff = base.clone();
+        cov_diff.windowed_coverage = 0.5;
+        assert_ne!(base, cov_diff, "windowed_coverage must participate in eq");
     }
 }

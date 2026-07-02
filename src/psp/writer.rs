@@ -994,6 +994,8 @@ pub struct SnpBlock {
     // Per-record columns.
     delta_pos: Vec<u64>,
     n_alleles: Vec<u64>,
+    windowed_gc: Vec<f32>,
+    windowed_coverage: Vec<f32>,
     // Per-allele columns.
     allele_seq_len: Vec<u64>,
     allele_seq_bytes: Vec<u8>,
@@ -1020,6 +1022,8 @@ impl BlockAccumulator for SnpBlock {
             last_pos: first_pos,
             delta_pos: Vec::with_capacity(INITIAL_RECORDS_HINT),
             n_alleles: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            windowed_gc: Vec::with_capacity(INITIAL_RECORDS_HINT),
+            windowed_coverage: Vec::with_capacity(INITIAL_RECORDS_HINT),
             allele_seq_len: Vec::with_capacity(INITIAL_ALLELES_HINT),
             allele_seq_bytes: Vec::with_capacity(INITIAL_ALLELE_SEQ_BYTES_HINT),
             allele_obs_count: Vec::with_capacity(INITIAL_ALLELES_HINT),
@@ -1046,6 +1050,8 @@ impl BlockAccumulator for SnpBlock {
         };
         self.delta_pos.push(delta);
         self.n_alleles.push(record.alleles.len() as u64);
+        self.windowed_gc.push(record.windowed_gc);
+        self.windowed_coverage.push(record.windowed_coverage);
 
         for allele in &record.alleles {
             self.allele_seq_len.push(allele.seq.len() as u64);
@@ -1069,7 +1075,9 @@ impl BlockAccumulator for SnpBlock {
         // cap. Chain ids are u64 little-endian (8 bytes/id);
         // zstd compresses the high-order zero bytes effectively.
         let per_record = 1 // delta-pos varint typical
-            + 1; // n-alleles varint typical
+            + 1 // n-alleles varint typical
+            + 4 // windowed-gc f32
+            + 4; // windowed-coverage f32
         let per_allele: usize = record
             .alleles
             .iter()
@@ -1148,6 +1156,9 @@ fn encode_snp_column_into(
             &[&block.allele_seq_bytes[..]],
             out,
         ),
+        // Per-record windowed coverage (NaN permitted — no finite check).
+        ColumnKey::WindowedGc => encode_scalar_column(&block.windowed_gc, out),
+        ColumnKey::WindowedCoverage => encode_scalar_column(&block.windowed_coverage, out),
         ColumnKey::AlleleObsCount => encode_scalar_column(&block.allele_obs_count, out),
         ColumnKey::AlleleQSumLog => {
             // q_sum was finite-validated at write_record time.
@@ -1274,11 +1285,7 @@ mod tests {
     }
 
     fn record(chrom_id: u32, pos: u32, alleles: Vec<AlleleObservation>) -> PileupRecord {
-        PileupRecord {
-            chrom_id,
-            pos,
-            alleles,
-        }
+        PileupRecord::new(chrom_id, pos, alleles)
     }
 
     // ---------- new() emits a valid framed header -----------------

@@ -246,6 +246,9 @@ mod tests {
         .map(|r| r.expect("walker yielded error"))
         .collect();
 
+        // `PileupRecord`'s `PartialEq` is byte-identity (windowed floats compared
+        // on bits), so the walker's `NaN` windowed placeholders round-trip and
+        // compare equal.
         assert_eq!(
             read_back, expected,
             "records read back must equal records the walker emitted",
@@ -265,6 +268,8 @@ mod tests {
         let rec = |pos: u32, ref_seq: &[u8], obs: u32| PileupRecord {
             chrom_id: 0,
             pos,
+            windowed_gc: f32::NAN,
+            windowed_coverage: f32::NAN,
             alleles: vec![AlleleObservation {
                 seq: ref_seq.to_vec(),
                 support: AlleleSupportStats {
