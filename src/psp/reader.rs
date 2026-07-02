@@ -1204,6 +1204,10 @@ pub struct BlockColumns<'a> {
     pub allele_placed_start_count: &'a [u32],
     pub allele_mapq_sum: &'a [u32],
     pub allele_mapq_sum_sq: &'a [u64],
+    /// Per-record centred-window columns (aligned with the per-record
+    /// `delta_pos`/`n_alleles`, not the per-allele columns).
+    pub windowed_gc: &'a [f32],
+    pub windowed_coverage: &'a [f32],
     /// Ragged `allele-seq` CSR (`data` indexed by `offsets`).
     pub allele_seq_data: &'a [u8],
     pub allele_seq_offsets: &'a [u32],
@@ -1388,6 +1392,8 @@ impl<R: Read + Seek> BlockColumnReader<R> {
             allele_placed_start_count: &b.allele_placed_start_count,
             allele_mapq_sum: &b.allele_mapq_sum,
             allele_mapq_sum_sq: &b.allele_mapq_sum_sq,
+            windowed_gc: &b.windowed_gc,
+            windowed_coverage: &b.windowed_coverage,
             allele_seq_data: &self.allele_seq_data,
             allele_seq_offsets: &self.allele_seq_offsets,
             allele_chain_ids_data: &self.allele_chain_ids_data,
