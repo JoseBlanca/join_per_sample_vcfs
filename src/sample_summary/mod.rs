@@ -56,9 +56,20 @@ pub const DEFAULT_GC_BINS: u32 = 50;
 pub const DEFAULT_DEPTH_BIN_WIDTH: f64 = 0.5;
 
 /// Default number of regular depth bins (so the regular range is
-/// `0..DEFAULT_DEPTH_BINS * DEFAULT_DEPTH_BIN_WIDTH` = `0..100×`, with an
-/// overflow bin above — generous for high-copy paralogs at typical depth).
-pub const DEFAULT_DEPTH_BINS: u32 = 200;
+/// `0..DEFAULT_DEPTH_BINS * DEFAULT_DEPTH_BIN_WIDTH` = `0..1000×`, with an
+/// overflow bin above).
+///
+/// The range must comfortably clear the sample's own *single-copy* depth AND a
+/// collapsed paralog's 2× depth on top of it, or the single-copy peak overflows
+/// the histogram and the coverage fit anchors on noise (see the depth-range
+/// guard [`crate::paralog::CoverageModelError::DepthRangeExceeded`]). The old
+/// `0..100×` range was exceeded by ~100× human WGS: the ~100× single-copy peak
+/// piled into the overflow bin, so the fit read a spurious low mode and the
+/// paralog filter deleted ~85% of the callset. `0..1000×` (2000 × 0.5-wide
+/// bins ≈ 50k cells/sample, compressing to almost nothing on disk) clears both
+/// deep WGS and its paralogs; the guard remains the backstop for anything above
+/// it (ultra-deep amplicon/targeted data).
+pub const DEFAULT_DEPTH_BINS: u32 = 2000;
 
 /// Default minimum total fragment depth for a site to enter the het call.
 pub const DEFAULT_HET_MIN_DEPTH: u32 = 4;
