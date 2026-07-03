@@ -11,7 +11,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::vcf::{CohortMetadata, CohortVcfWriter, VcfWriteError, WriterConfig};
+use crate::vcf::{
+    CohortMetadata, CohortVcfWriter, DetachedFormatter, GenotypeTableCache, VcfWritable,
+    VcfWriteError, WriterConfig,
+};
 
 use crate::var_calling::types::{CallStats, CalledChunk, Variant};
 
@@ -35,6 +38,86 @@ pub enum AlleleBalanceFilter {
 pub struct DownstreamFilters {
     pub min_qual_phred: f64,
     pub allele_balance: AlleleBalanceFilter,
+}
+
+/// Which downstream filter dropped a record — reported by a
+/// [`ParallelRecordFormatter`] worker so the (single) writer thread can tally the
+/// matching [`WriterStats`] counter in order, keeping the run summary identical
+/// to the serial `emit_or_drop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropBucket {
+    HomRef,
+    LowQual,
+    AlleleBalance,
+}
+
+/// A worker's verdict for one paralog-surviving record: dropped by a downstream
+/// filter, or kept and already serialised to its VCF text line. The writer thread
+/// commits an `Emit` in genomic order via [`VcfWriter::write_preformatted_line`]
+/// (after the coordinate-consistency guard) and tallies a `Drop` via
+/// [`VcfWriter::tally_drop`].
+pub enum FormatOutcome {
+    Drop(DropBucket),
+    Emit {
+        /// The serialised VCF record line (byte-identical to the serial writer).
+        bytes: Vec<u8>,
+        /// `(chrom_id, pos_1based)` — the writer's non-decreasing order key.
+        chrom_id: u32,
+        pos_1based: u32,
+        /// `locus.start` (0-based) + the decoded REF first base, for the
+        /// coordinate-consistency guard (a `None` base skips the check).
+        locus_start: u32,
+        decoded_ref: Option<u8>,
+        /// The EM did not converge → `FILTER=EMNoConv` was written; the writer
+        /// tallies `records_unconverged`.
+        unconverged: bool,
+    },
+}
+
+/// A thread-local record formatter: applies the downstream filters and, for a
+/// survivor, serialises the record to its VCF text line — off the writer thread.
+/// Built per worker from [`VcfWriter::make_formatter`] (cheap-cloneable
+/// [`DetachedFormatter`] + the filter config + its own genotype-table cache).
+///
+/// The filter *order* — hom-ref, then min-QUAL, then allele-balance — is
+/// load-bearing: it matches the serial `emit_or_drop` so each record lands in the
+/// same drop bucket (or is emitted), keeping the callset and stats byte-identical.
+pub struct ParallelRecordFormatter {
+    formatter: DetachedFormatter,
+    filters: DownstreamFilters,
+    cache: GenotypeTableCache,
+}
+
+impl ParallelRecordFormatter {
+    /// Decide + (if kept) serialise one record. Pure w.r.t. shared state — the
+    /// only mutation is the worker-local genotype-table memo.
+    pub fn process(&mut self, record: &Variant) -> Result<FormatOutcome, VcfWriteError> {
+        // Order matches `emit_or_drop` exactly (first match wins).
+        if !record.is_variant_call() {
+            return Ok(FormatOutcome::Drop(DropBucket::HomRef));
+        }
+        if f64::from(self.formatter.final_qual(record, &mut self.cache)) < self.filters.min_qual_phred
+        {
+            return Ok(FormatOutcome::Drop(DropBucket::LowQual));
+        }
+        if let AlleleBalanceFilter::On {
+            min_log_lr,
+            concentration,
+        } = self.filters.allele_balance
+            && record_fails_allele_balance(record, min_log_lr, concentration)
+        {
+            return Ok(FormatOutcome::Drop(DropBucket::AlleleBalance));
+        }
+        let bytes = self.formatter.format(record, &mut self.cache)?;
+        Ok(FormatOutcome::Emit {
+            bytes,
+            chrom_id: record.chrom_id(),
+            pos_1based: record.pos_1based(),
+            locus_start: record.locus.start,
+            decoded_ref: record.alleles.first().and_then(|a| a.seq.first()).copied(),
+            unconverged: !record.diagnostics.converged,
+        })
+    }
 }
 
 /// Run-level counters for the run summary (≈ the old `ChunkDriverStats`). The
@@ -106,6 +189,47 @@ impl VcfWriter {
             reorder: BTreeMap::new(),
             next_expected: 0,
         })
+    }
+
+    /// A thread-local [`ParallelRecordFormatter`] for a format worker: the
+    /// detached encoding context + this writer's filter config + a fresh
+    /// genotype-table cache. Build one per worker; they never share mutable state.
+    pub fn make_formatter(&self) -> ParallelRecordFormatter {
+        ParallelRecordFormatter {
+            formatter: self.inner.detached_formatter(),
+            filters: self.filters,
+            cache: GenotypeTableCache::new(),
+        }
+    }
+
+    /// Commit one already-serialised survivor line (from
+    /// [`ParallelRecordFormatter::process`]) in genomic order, tallying
+    /// `records_written`. The `(chrom_id, pos_1based)` order key must be
+    /// non-decreasing (same invariant as the serial `write_record`).
+    pub fn write_preformatted_line(
+        &mut self,
+        bytes: &[u8],
+        chrom_id: u32,
+        pos_1based: u32,
+    ) -> Result<(), WriterError> {
+        self.inner.write_preformatted(bytes, chrom_id, pos_1based)?;
+        self.stats.records_written += 1;
+        Ok(())
+    }
+
+    /// Tally one downstream-filter drop (parallel-path analogue of the serial
+    /// `emit_or_drop` counters).
+    pub fn tally_drop(&mut self, bucket: DropBucket) {
+        match bucket {
+            DropBucket::HomRef => self.stats.records_dropped_hom_ref += 1,
+            DropBucket::LowQual => self.stats.records_dropped_low_qual += 1,
+            DropBucket::AlleleBalance => self.stats.records_dropped_allele_balance += 1,
+        }
+    }
+
+    /// Tally one emitted-but-unconverged record (`FILTER=EMNoConv`).
+    pub fn tally_unconverged(&mut self) {
+        self.stats.records_unconverged += 1;
     }
 
     /// Accept one [`CalledChunk`] (in any order) and emit every chunk that is

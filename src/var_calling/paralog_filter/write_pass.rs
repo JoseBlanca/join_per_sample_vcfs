@@ -17,13 +17,13 @@
 //! match the histogram it came from **by construction**, and holds only one
 //! record at a time — RAM stays flat in the variant count.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 
 use crate::fasta::{ChromRefFetchError, ChromRefFetcher, StreamingChromRefFetcher};
 use crate::var_calling::posterior_engine::PosteriorRecord;
-use crate::var_calling::types::{CallStats, CalledChunk};
-use crate::var_calling::vcf_writer::{VcfWriter, WriterError, WriterStats};
+use crate::var_calling::vcf_writer::{FormatOutcome, VcfWriter, WriterError, WriterStats};
 
 use super::calibrate::ParalogCalibration;
 use super::spill::{ParalogSpillReader, SpillError};
@@ -66,16 +66,17 @@ pub enum WritePassError {
 /// strictly-increasing `(chrom_id, pos)` order, satisfying the streaming
 /// fetcher's monotonic-forward contract.
 fn check_reference_consistency(
-    record: &PosteriorRecord,
+    chrom_id: u32,
+    locus_start: u32,
+    decoded: Option<u8>,
     fetcher: &mut Option<(u32, StreamingChromRefFetcher)>,
     reference: &Path,
     chrom_names: &[String],
 ) -> Result<(), WritePassError> {
     // An alleleless record never reaches the writer, but stay total.
-    let Some(&decoded) = record.alleles.first().and_then(|a| a.seq.first()) else {
+    let Some(decoded) = decoded else {
         return Ok(());
     };
-    let chrom_id = record.locus.chrom_id;
     if fetcher.as_ref().map(|(c, _)| *c) != Some(chrom_id) {
         let name = &chrom_names[chrom_id as usize];
         *fetcher = Some((
@@ -85,15 +86,11 @@ fn check_reference_consistency(
     }
     // UNREACHABLE: `fetcher` is `Some` on both branches above.
     let (_, f) = fetcher.as_ref().expect("fetcher just set for this contig");
-    let fasta_base = f
-        .fetch(record.locus.start, 1)?
-        .first()
-        .copied()
-        .unwrap_or(b'N');
+    let fasta_base = f.fetch(locus_start, 1)?.first().copied().unwrap_or(b'N');
     if !reference_base_matches(fasta_base, decoded) {
         return Err(WritePassError::ReferenceMismatch {
             chrom_id,
-            pos: record.locus.start,
+            pos: locus_start,
             fasta: fasta_base as char,
             decoded: decoded as char,
         });
@@ -134,75 +131,176 @@ pub(crate) fn paralog_provenance(calibration: &ParalogCalibration) -> String {
     )
 }
 
-/// Stream the spill, drop the paralog-flagged loci, and write the survivors
-/// through `writer`. Returns the writer's stats with
+/// Depth (per worker) of both write-pass hand-off queues. Bounds resident
+/// records to `O(workers)` so the spill's flat-RAM property survives; `2` keeps
+/// every worker fed across one hand-off.
+const WRITE_PASS_QUEUE_DEPTH_PER_WORKER: usize = 2;
+
+/// Stream the spill, drop the paralog-flagged loci, and write the survivors —
+/// **parallel-format pipeline**. Returns the writer's stats with
 /// [`WriterStats::records_dropped_paralog`] set.
 ///
-/// Each locus's LR was **scored once in the main pass** (the worker) and stored
-/// on the spill ([`ParalogSpillRecord::paralog_lr`]), and folded into the
-/// histogram `calibration` was derived from — so this pass just reads the stored
-/// LR and applies the cut, with no re-score (arch: inline scoring). Survivors are
-/// fed to the writer in spill order (which is genomic order — the main pass
-/// spills post-reorder), one record per `CalledChunk` with a gapless
-/// `chunk_order`; the writer's reorder passes them straight through.
-pub(crate) fn run_write_pass<R: Read>(
+/// The serial predecessor decoded, filtered, formatted, and bgzf-wrote each
+/// survivor on one thread; profiling put ~70% of that in the *VCF text format*
+/// (`encode` + noodles serialisation), which is pure per record. So this splits
+/// into three stages inside a [`std::thread::scope`], hand-offs bounded for
+/// back-pressure (RAM stays flat in the variant count):
+///
+/// 1. **reader** (one thread): decode each spill frame, stamp the paralog
+///    posterior, apply the stored-LR cut, and forward survivors — tagged with a
+///    contiguous `order` in spill (= genomic) order — to the workers;
+/// 2. **`W` format workers**: run the downstream filters (hom-ref → min-QUAL →
+///    allele-balance, order load-bearing) and serialise each survivor to its VCF
+///    line ([`ParallelRecordFormatter`](crate::var_calling::vcf_writer::ParallelRecordFormatter)),
+///    off the writer thread;
+/// 3. **sink** (this thread): reorder by `order`, run the coordinate-consistency
+///    guard, and commit the pre-formatted bytes to the bgzf sink in genomic order
+///    — byte-identical VCF (same `encode`, same header, same order) and identical
+///    run-summary counters to the serial path.
+///
+/// Each locus's LR was scored once in the main pass (arch: inline scoring); this
+/// pass only applies the stored cut, no re-score.
+pub(crate) fn run_write_pass<R: Read + Send>(
     spill: &mut ParalogSpillReader<R>,
     calibration: &ParalogCalibration,
     keep_dup_artifacts: bool,
     reference: &Path,
     chrom_names: &[String],
     mut writer: VcfWriter,
+    worker_count: usize,
 ) -> Result<WriterStats, WritePassError> {
-    let mut records_dropped_paralog = 0u64;
-    let mut chunk_order = 0u64;
-    // Per-contig reference fetcher for the coordinate-consistency guard, built
-    // lazily on the first written record of each contig.
-    let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
+    let n_workers = worker_count.max(1);
+    let cap = (WRITE_PASS_QUEUE_DEPTH_PER_WORKER * n_workers).max(1);
+    let (work_tx, work_rx) = crossbeam_channel::bounded::<(u64, PosteriorRecord)>(cap);
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<(u64, FormatOutcome)>(cap);
 
-    while let Some(record) = spill.next_record() {
-        let mut record = record?;
-        // Apply the cut to the locus's stored LR (scored once in the worker,
-        // folded into the histogram `calibration` came from — so the cut applies
-        // to the exact value the calibration was built from). An unscored locus
-        // carries `NaN` and is never flagged → kept.
-        let flagged = calibration.flags(record.paralog_lr);
+    let records_dropped_paralog = std::thread::scope(
+        |scope| -> Result<u64, WritePassError> {
+            // Reader: decode + paralog cut, contiguous `order` to survivors.
+            let reader = scope.spawn(move || -> Result<u64, WritePassError> {
+                let mut order = 0u64;
+                let mut dropped = 0u64;
+                while let Some(record) = spill.next_record() {
+                    let mut record = record?;
+                    // Apply the cut to the stored LR (folded into the histogram this
+                    // `calibration` came from — so the cut matches the value it was
+                    // built from). `NaN` = unscored → never flagged → kept.
+                    let flagged = calibration.flags(record.paralog_lr);
+                    // Stamp the paralog posterior on every scored locus (drop or
+                    // keep) so emitted records carry `PARALOG_POST`; `NaN` → `None`.
+                    record.record.paralog_posterior = calibration.posterior(record.paralog_lr);
+                    if flagged && !keep_dup_artifacts {
+                        dropped += 1;
+                        continue;
+                    }
+                    if work_tx.send((order, record.record)).is_err() {
+                        break; // workers gone
+                    }
+                    order += 1;
+                }
+                Ok(dropped)
+            });
 
-        // Stamp the paralog posterior on every scored locus — regardless of the
-        // drop decision — so emitted records carry `PARALOG_POST`. An unscored
-        // locus (NaN LR) yields `None` and the INFO field is omitted. In the
-        // default (drop) mode only survivors are emitted, so the posterior is
-        // present exactly on the loci that passed the threshold.
-        record.record.paralog_posterior = calibration.posterior(record.paralog_lr);
+            // Format workers: filter + serialise, off the writer thread.
+            let mut worker_handles = Vec::with_capacity(n_workers);
+            for _ in 0..n_workers {
+                let work_rx = work_rx.clone();
+                let done_tx = done_tx.clone();
+                let mut formatter = writer.make_formatter();
+                worker_handles.push(scope.spawn(move || -> Result<(), WritePassError> {
+                    for (order, record) in work_rx {
+                        let outcome = formatter.process(&record).map_err(WriterError::from)?;
+                        if done_tx.send((order, outcome)).is_err() {
+                            break; // sink gone
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            // Drop the main-thread channel handles so the channels disconnect once
+            // the reader / workers finish (else the sink loop never ends).
+            drop(work_rx);
+            drop(done_tx);
 
-        // Default: drop a flagged locus. With `--do-not-drop-dup-artifacts` the
-        // flagged locus is kept (still annotated) so it can be inspected.
-        if flagged && !keep_dup_artifacts {
-            records_dropped_paralog += 1;
-            continue;
-        }
+            // Sink (this thread): reorder by `order`, guard, commit in genomic order.
+            let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
+            let mut pending: BTreeMap<u64, FormatOutcome> = BTreeMap::new();
+            let mut next = 0u64;
+            let sink_result = (|| -> Result<(), WritePassError> {
+                for (order, outcome) in done_rx.iter() {
+                    pending.insert(order, outcome);
+                    while let Some(outcome) = pending.remove(&next) {
+                        emit_outcome(
+                            outcome,
+                            &mut writer,
+                            &mut ref_fetcher,
+                            reference,
+                            chrom_names,
+                        )?;
+                        next += 1;
+                    }
+                }
+                Ok(())
+            })();
 
-        // Emitted record: verify the coordinate is consistent with the reference
-        // before writing (fails loud on window/coordinate drift).
-        check_reference_consistency(&record.record, &mut ref_fetcher, reference, chrom_names)?;
-
-        // Route through the unchanged writer (existing filters + byte-identity-
-        // critical formatting). One record per chunk keeps the reorder cursor
-        // gapless from 0.
-        writer.handle(CalledChunk {
-            chunk_order,
-            // The VCF writer ignores the window coverage + LR (they rode the spill
-            // only for the score, already applied above); empty vecs suffice here.
-            window_coverage: Vec::new(),
-            paralog_lr: Vec::new(),
-            records: vec![record.record],
-            stats: CallStats::default(),
-        })?;
-        chunk_order += 1;
-    }
+            // Join everyone; first error wins (sink → reader → workers). The scope
+            // would auto-join, but we join explicitly to surface thread errors.
+            let reader_result = reader.join().expect("write-pass reader thread panicked");
+            let mut worker_err = None;
+            for h in worker_handles {
+                if let Err(e) = h.join().expect("write-pass format worker panicked") {
+                    worker_err.get_or_insert(e);
+                }
+            }
+            sink_result?;
+            let dropped = reader_result?;
+            if let Some(e) = worker_err {
+                return Err(e);
+            }
+            Ok(dropped)
+        },
+    )?;
 
     let mut stats = writer.finish()?;
     stats.records_dropped_paralog = records_dropped_paralog;
     Ok(stats)
+}
+
+/// Commit one worker verdict on the sink thread: tally a drop, or (for a
+/// survivor) run the coordinate-consistency guard and write the pre-formatted
+/// bytes to the sink in genomic order.
+fn emit_outcome(
+    outcome: FormatOutcome,
+    writer: &mut VcfWriter,
+    ref_fetcher: &mut Option<(u32, StreamingChromRefFetcher)>,
+    reference: &Path,
+    chrom_names: &[String],
+) -> Result<(), WritePassError> {
+    match outcome {
+        FormatOutcome::Drop(bucket) => writer.tally_drop(bucket),
+        FormatOutcome::Emit {
+            bytes,
+            chrom_id,
+            pos_1based,
+            locus_start,
+            decoded_ref,
+            unconverged,
+        } => {
+            check_reference_consistency(
+                chrom_id,
+                locus_start,
+                decoded_ref,
+                ref_fetcher,
+                reference,
+                chrom_names,
+            )?;
+            if unconverged {
+                writer.tally_unconverged();
+            }
+            writer.write_preformatted_line(&bytes, chrom_id, pos_1based)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -331,6 +429,7 @@ mod tests {
             &reference,
             &chrom_names(),
             writer,
+            2, // format workers (exercise the parallel path)
         )
         .expect("write pass");
 
@@ -395,6 +494,7 @@ mod tests {
             &reference,
             &chrom_names(),
             writer,
+            2, // format workers (exercise the parallel path)
         )
         .expect("write pass");
 
@@ -445,6 +545,7 @@ mod tests {
             &reference,
             &chrom_names(),
             writer,
+            2, // format workers (exercise the parallel path)
         )
         .expect_err("mismatch must fail loud");
         match err {
@@ -483,6 +584,7 @@ mod tests {
             &reference,
             &chrom_names(),
             writer,
+            2, // format workers (exercise the parallel path)
         )
         .unwrap();
         assert_eq!(stats.records_dropped_paralog, 0);
@@ -511,6 +613,7 @@ mod tests {
             &reference,
             &chrom_names(),
             writer,
+            2, // format workers (exercise the parallel path)
         )
         .unwrap();
         assert_eq!(stats.records_written, 0);
@@ -548,6 +651,7 @@ mod tests {
                 &reference,
                 &chrom_names(),
                 writer,
+                2, // format workers (exercise the parallel path)
             )
             .unwrap();
             std::fs::read_to_string(&out).unwrap()

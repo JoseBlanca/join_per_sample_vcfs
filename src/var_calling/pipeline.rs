@@ -768,6 +768,9 @@ pub fn run_var_calling(
             };
             let writer = VcfWriter::new(md, writer_config, filters)?;
             let mut reader = spill.reader()?;
+            // The write pass runs after the main pass finishes, so the whole
+            // thread budget (`P + C`) is free for its parallel format workers.
+            let write_pass_workers = pool.current_num_threads() + caller_threads;
             let stats = run_write_pass(
                 &mut reader,
                 &calibration,
@@ -775,6 +778,7 @@ pub fn run_var_calling(
                 &args.reference,
                 &chrom_names,
                 writer,
+                write_pass_workers,
             )?;
             Ok(stats)
         }

@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use noodles_vcf::Header as VcfHeader;
 use noodles_vcf::variant::io::Write as _;
@@ -249,6 +250,60 @@ impl CohortVcfWriter {
         Ok(())
     }
 
+    /// A read-only, thread-shareable snapshot of the per-record encoding context
+    /// (header, contigs, config, FORMAT keys, cohort size). Hand a clone to each
+    /// parallel format worker — cloning shares the header/contigs via `Arc`, so it
+    /// is cheap. A worker formats a record to bytes with [`DetachedFormatter::format`]
+    /// (byte-identical to [`write_record`](Self::write_record) — same `encode`,
+    /// same header, same noodles serialisation) and the owning writer then commits
+    /// those bytes in genomic order via [`write_preformatted`](Self::write_preformatted).
+    pub fn detached_formatter(&self) -> DetachedFormatter {
+        DetachedFormatter {
+            header: Arc::new(self.header.clone()),
+            contigs: Arc::new(self.contigs.clone()),
+            config: self.config.clone(),
+            format_keys: self.format_keys.clone(),
+            expected_samples: self.expected_samples,
+        }
+    }
+
+    /// Commit one already-serialised record line (produced by
+    /// [`DetachedFormatter::format`]) to the sink, in genomic order. Enforces the
+    /// same non-decreasing-`(chrom_id, pos)` invariant as
+    /// [`write_record`](Self::write_record) and writes the pre-formatted bytes
+    /// straight to the underlying sink, so the emitted byte stream — and thus the
+    /// bgzf output — is identical to the serial path. `pos` is 1-based (as
+    /// `pos_1based`).
+    pub fn write_preformatted(
+        &mut self,
+        bytes: &[u8],
+        chrom_id: u32,
+        pos: u32,
+    ) -> Result<(), VcfWriteError> {
+        use std::io::Write as _;
+        let locus = (chrom_id, pos);
+        if let Some(prev) = self.last_locus
+            && locus <= prev
+        {
+            return Err(VcfWriteError::RecordOutOfOrder {
+                chrom_id,
+                pos,
+                prev_chrom_id: prev.0,
+                prev_pos: prev.1,
+            });
+        }
+        self.inner
+            .get_mut()
+            .write_all(bytes)
+            .map_err(|source| VcfWriteError::WriteRecord {
+                chrom_id,
+                pos,
+                source,
+            })?;
+        self.last_locus = Some(locus);
+        Ok(())
+    }
+
     /// Flush, emit the bgzf EOF block when applicable, sync the file
     /// and parent directory, then atomic-rename `<output>.tmp` →
     /// `<output>`.
@@ -297,6 +352,76 @@ impl CohortVcfWriter {
         let tmp = tmp_path_for(&self.final_path);
         drop(self.inner); // close the file handle
         std::fs::remove_file(tmp)
+    }
+}
+
+/// Cache of `genotype_order(ploidy, n_alleles)` tables. One per format worker
+/// (never shared), so each thread memoises the small tables it needs without a
+/// lock — steady-state cohorts hit the cache after the first record.
+pub type GenotypeTableCache = HashMap<(u8, usize), Vec<Vec<u8>>>;
+
+/// A read-only, `Send + Sync`, cheaply-cloneable snapshot of the per-record VCF
+/// encoding context, detached from the owning [`CohortVcfWriter`] so parallel
+/// workers can format records into byte lines off the writer thread. Build one
+/// with [`CohortVcfWriter::detached_formatter`]; the owning writer commits the
+/// produced bytes in order via [`CohortVcfWriter::write_preformatted`].
+///
+/// The produced bytes are **identical** to [`CohortVcfWriter::write_record`]:
+/// same [`encode`] over the same context, serialised through the same noodles
+/// header — so routing a record through a worker + `write_preformatted` yields
+/// the exact byte stream the serial writer would.
+#[derive(Clone)]
+pub struct DetachedFormatter {
+    header: Arc<VcfHeader>,
+    contigs: Arc<Vec<ParsedChromosome>>,
+    config: WriterConfig,
+    format_keys: Keys,
+    expected_samples: usize,
+}
+
+impl DetachedFormatter {
+    /// The genotype-order table for `(ploidy, n_alleles)`, memoised in `cache`.
+    fn table<'a>(cache: &'a mut GenotypeTableCache, ploidy: u8, n_alleles: usize) -> &'a [Vec<u8>] {
+        cache
+            .entry((ploidy, n_alleles))
+            .or_insert_with(|| genotype_order(ploidy, n_alleles))
+    }
+
+    /// The final (artifact-refined, clamped) QUAL the record would carry —
+    /// identical to [`CohortVcfWriter::final_qual`], for the min-QUAL gate the
+    /// worker applies before formatting.
+    pub fn final_qual<R: VcfWritable>(&self, record: &R, cache: &mut GenotypeTableCache) -> f32 {
+        let table = Self::table(cache, record.ploidy(), record.n_alleles());
+        super::record_encode::final_qual(record, table)
+    }
+
+    /// Serialise one record to its VCF text line (bytes), byte-identical to what
+    /// [`CohortVcfWriter::write_record`] would emit for it. `cache` is the
+    /// worker's own genotype-table memo.
+    pub fn format<R: VcfWritable>(
+        &self,
+        record: &R,
+        cache: &mut GenotypeTableCache,
+    ) -> Result<Vec<u8>, VcfWriteError> {
+        let table = Self::table(cache, record.ploidy(), record.n_alleles());
+        let buf = encode(
+            record,
+            &self.contigs,
+            &self.config,
+            &self.format_keys,
+            self.expected_samples,
+            table,
+        )?;
+        // A throwaway noodles writer over a `Vec` gives exactly the bytes the
+        // shared writer would write for this record (same header, same buf).
+        let mut w = noodles_vcf::io::Writer::new(Vec::new());
+        w.write_variant_record(&self.header, &buf)
+            .map_err(|source| VcfWriteError::WriteRecord {
+                chrom_id: record.chrom_id(),
+                pos: record.pos_1based(),
+                source,
+            })?;
+        Ok(w.into_inner())
     }
 }
 
