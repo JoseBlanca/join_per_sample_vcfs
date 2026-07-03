@@ -170,15 +170,23 @@ impl VariantCaller {
         // moved off the single producer thread onto this parallel caller.
         let records = merge_compacted_samples(&per_sample, &self.sample_names)?;
         let mut called = self.call_records(chunk_order, records, ref_span)?;
-        // Gather each called locus's per-sample window coverage from the
-        // (still-owned) per-sample chunks, then score its hidden-paralog LR
-        // inline — the worker already holds each locus's window coverage (just
-        // gathered) + its AD (the called record), and the score depends on
-        // nothing genome-wide, so this runs the expensive transcendental once, in
-        // parallel, instead of a serial calibrate + write recompute (arch: inline
-        // scoring). Both stay empty when the filter is off.
-        called.window_coverage = gather_window_coverage(&per_sample, &called.records);
-        called.paralog_lr = self.score_paralog_lrs(&called.records, &called.window_coverage);
+        // Score each called locus's hidden-paralog LR inline, when the filter is
+        // on (arch: inline scoring) — the worker already holds each locus's window
+        // coverage (gathered here) + its AD (the called record), and the score
+        // depends on nothing genome-wide, so it runs the expensive transcendental
+        // once, in parallel, instead of a serial calibrate + write recompute.
+        //
+        // `window_coverage` is a *transient* scoring input: gathered here,
+        // consumed by the score, then dropped. It is deliberately NOT stored on
+        // the `CalledChunk` — the LR is already applied, so carrying the coverage
+        // onward would only spill dead weight the two-pass write pass never reads
+        // (it re-reads the spill just to apply the stored LR's cut). Skipping the
+        // gather+score entirely off the filter path leaves `paralog_lr` empty (the
+        // `call_records` default).
+        if self.paralog.is_some() {
+            let window_coverage = gather_window_coverage(&per_sample, &called.records);
+            called.paralog_lr = self.score_paralog_lrs(&called.records, &window_coverage);
+        }
         Ok(called)
     }
 
@@ -201,7 +209,22 @@ impl VariantCaller {
         records
             .iter()
             .zip(window_coverage)
-            .map(|(record, window)| paralog.score(record, window, &mut obs_buf))
+            .map(|(record, window)| {
+                // Only variable loci belong in the paralog machinery. A record
+                // where no sample carries an ALT (`!is_variant_call`) is dropped
+                // downstream as hom-ref regardless of its LR, and — being a
+                // non-variant — must not enter the FDR calibration histogram that
+                // sets the cut for the real candidates. Return the `NaN` unscored
+                // sentinel: the histogram fold drops it (calibration is built from
+                // variable loci only) and the write pass keeps it (then the VCF
+                // writer drops it as hom-ref). This also skips the expensive
+                // per-locus transcendental score for ~all-hom-ref positions.
+                if record.is_variant_call() {
+                    paralog.score(record, window, &mut obs_buf)
+                } else {
+                    f64::NAN
+                }
+            })
             .collect()
     }
 

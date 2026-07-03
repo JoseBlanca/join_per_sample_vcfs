@@ -45,7 +45,7 @@ pub use errors::VcfWriteError;
 pub use header::CohortMetadata;
 pub use sink::tmp_path_for;
 pub use writable::VcfWritable;
-pub use writer::CohortVcfWriter;
+pub use writer::{CohortVcfWriter, DetachedFormatter, GenotypeTableCache};
 
 /// Default for [`WriterConfig::emit_gp`]. Off — `GP` is `Number=G`
 /// and most consumers don't read it (size grows as

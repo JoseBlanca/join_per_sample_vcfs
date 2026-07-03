@@ -768,6 +768,9 @@ pub fn run_var_calling(
             };
             let writer = VcfWriter::new(md, writer_config, filters)?;
             let mut reader = spill.reader()?;
+            // The write pass runs after the main pass finishes, so the whole
+            // thread budget (`P + C`) is free for its parallel format workers.
+            let write_pass_workers = pool.current_num_threads() + caller_threads;
             let stats = run_write_pass(
                 &mut reader,
                 &calibration,
@@ -775,6 +778,7 @@ pub fn run_var_calling(
                 &args.reference,
                 &chrom_names,
                 writer,
+                write_pass_workers,
             )?;
             Ok(stats)
         }
@@ -868,11 +872,13 @@ impl SpillSink {
             mut paralog_lr,
             stats: _,
         } = chunk;
-        // `call_chunk` fills exactly one window-coverage + one LR entry per
-        // record; the direct `call_records` path (tests) ships empty vecs. Any
-        // other length is a caller bug — assert rather than let `resize_with`
-        // silently truncate/misalign against the records. Pad only the empty
-        // (direct-path) case: all-absent coverage + `NaN` LR (locus unscored).
+        // `call_chunk` fills exactly one LR entry per record; `window_coverage` is
+        // a transient scoring input the caller drops after scoring (it never rides
+        // the spill — the write pass only needs the stored LR), so it arrives empty
+        // here and is padded to all-absent below. A non-empty length that mismatches
+        // the record count is a caller bug — assert rather than let `resize_with`
+        // silently truncate/misalign. Pad the (normal) empty case: all-absent
+        // coverage + `NaN` LR for any locus the caller left unscored.
         debug_assert!(
             window_coverage.is_empty() || window_coverage.len() == records.len(),
             "window_coverage len {} must be 0 (direct path) or == records len {}",
