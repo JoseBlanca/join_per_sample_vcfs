@@ -229,6 +229,37 @@ impl CohortSpanFold {
         std::mem::swap(&mut self.max_nonref_obs, &mut self.tmp_max_nonref_obs);
     }
 
+    /// Empty the fold (positions + parallel arrays + scratch), reusing the
+    /// allocations. Used to reset the incremental fold at each chunk cut /
+    /// interval start (see [`CohortChunkIntegrator::reset_fold`]).
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.max_ref_span.clear();
+        self.max_nonref_obs.clear();
+        self.tmp_positions.clear();
+        self.tmp_max_ref_span.clear();
+        self.tmp_max_nonref_obs.clear();
+    }
+
+    /// Append `other`'s entries, which must all sort **strictly after** `self`'s
+    /// last position. That precondition makes the union a plain concatenation (no
+    /// interleave, no `max` collisions), so it is `O(other)` rather than the
+    /// `O(self + other)` merge — the incremental fold relies on it: each new
+    /// watermark window `(fold_upto, w]` holds only positions greater than
+    /// everything already folded, so its partial reduces onto the tail.
+    pub fn append_ascending(&mut self, other: &CohortSpanFold) {
+        debug_assert!(
+            match (self.positions.last(), other.positions.first()) {
+                (Some(&a), Some(&b)) => a < b,
+                _ => true,
+            },
+            "append_ascending requires other's positions to be strictly greater",
+        );
+        self.positions.extend_from_slice(&other.positions);
+        self.max_ref_span.extend_from_slice(&other.max_ref_span);
+        self.max_nonref_obs.extend_from_slice(&other.max_nonref_obs);
+    }
+
     /// The clean group boundary at or before `watermark`: the start of the
     /// still-open group, or `watermark + 1` if every group is closed.
     /// Byte-for-byte the pre-rewrite safe-gap cut (verified out-of-tree).
@@ -687,7 +718,15 @@ pub struct CohortChunkIntegrator<R: Read + Seek> {
     chunk_order: u64,
 
     // Reusable scratch.
+    /// The cohort fold over `[next_chunk_start, fold_upto]`, grown **incrementally**
+    /// as the watermark advances (see [`extend_fold`](Self::extend_fold)) rather
+    /// than rebuilt from scratch every read-ahead iteration, and reset at each cut
+    /// / interval start ([`reset_fold`](Self::reset_fold)).
     fold: CohortSpanFold,
+    /// The highest position already folded into `self.fold` (exclusive lower bound
+    /// of the next increment). `self.fold` covers every position in
+    /// `[next_chunk_start, fold_upto]`; `extend_fold(w)` folds only `(fold_upto, w]`.
+    fold_upto: u32,
     is_kept: Vec<bool>,
 }
 
@@ -749,6 +788,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             dust_mask: Vec::new(),
             chunk_order: 0,
             fold: CohortSpanFold::new(),
+            fold_upto: 0,
             is_kept: Vec::new(),
         }
     }
@@ -867,6 +907,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         self.chrom_id = chrom_id;
         self.interval_end = interval.end;
         self.next_chunk_start = interval.start;
+        self.reset_fold();
         for b in &mut self.buffers {
             b.clear();
         }
@@ -957,34 +998,50 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
         Ok(())
     }
 
-    /// Rebuild [`self.fold`] over the buffered light columns in
-    /// `[next_chunk_start, w]` (all samples' data is complete there).
+    /// Reset the incremental fold for a fresh window starting at
+    /// `next_chunk_start` (called at each cut and at interval start). Clears
+    /// `self.fold` and parks `fold_upto` just below `next_chunk_start`, so the
+    /// next [`extend_fold`](Self::extend_fold) folds `[next_chunk_start, w]`.
+    fn reset_fold(&mut self) {
+        self.fold.clear();
+        self.fold_upto = self.next_chunk_start.saturating_sub(1);
+    }
+
+    /// Grow [`self.fold`] to cover `[next_chunk_start, w]` by folding **only** the
+    /// new watermark window `(fold_upto, w]` and appending it — instead of
+    /// rebuilding the whole growing window every read-ahead iteration (the old
+    /// `rebuild_fold`, the producer's serial floor per the L1 perf review).
     ///
-    /// L1 (perf review): this fold is the producer's serial floor — profiling
-    /// pinned it as the dominant non-decode self-time, re-run every read-ahead
-    /// iteration over the growing window. The aggregation is per-position
-    /// **integer `max`** on ref-span / non-REF obs plus a position union — both
-    /// associative and commutative — so each sample folds independently and the
-    /// partials reduce via [`CohortSpanFold::merge`] in **any order** for a
-    /// **byte-identical** result. Run it across the producer pool (this method
-    /// executes inside `producer_pool.install(...)`).
-    fn rebuild_fold(&mut self, w: u32) {
+    /// Byte-identical to the rebuild: the aggregation is per-position integer
+    /// `max` on ref-span / non-REF obs plus a position union (associative +
+    /// commutative), so (a) each sample folds independently and the partials
+    /// reduce in **any order**, and (b) the increment's positions are all strictly
+    /// greater than everything already folded, so it *appends* (a subset of the
+    /// order-independent union) — the same final fold the rebuild produced, one
+    /// window slice at a time. Correctness rests on `w ≤ watermark`: every
+    /// sample's data in `(fold_upto, w]` is already buffered, so the increment is
+    /// complete and no later read can add a position `≤ fold_upto`. Runs on the
+    /// producer pool (this method executes inside `producer_pool.install(...)`).
+    fn extend_fold(&mut self, w: u32) {
         use rayon::prelude::*;
-        let lo_bound = self.next_chunk_start;
-        let fold = self
+        if w <= self.fold_upto {
+            return; // watermark has not advanced past the folded range
+        }
+        let lo = self.fold_upto; // exclusive lower bound of the new window
+        let increment = self
             .buffers
             .par_iter()
             .map(|buf| {
                 let mut f = CohortSpanFold::new();
                 for chunk in buf {
                     let pos = chunk.positions();
-                    let lo = pos.partition_point(|&p| p < lo_bound);
-                    let hi = pos.partition_point(|&p| p <= w);
-                    if lo < hi {
+                    let a = pos.partition_point(|&p| p <= lo);
+                    let b = pos.partition_point(|&p| p <= w);
+                    if a < b {
                         f.fold_sample_light(
-                            &pos[lo..hi],
-                            &chunk.ref_spans()[lo..hi],
-                            &chunk.nonref_obs()[lo..hi],
+                            &pos[a..b],
+                            &chunk.ref_spans()[a..b],
+                            &chunk.nonref_obs()[a..b],
                         );
                     }
                 }
@@ -994,7 +1051,8 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 a.merge(&b);
                 a
             });
-        self.fold = fold;
+        self.fold.append_ascending(&increment);
+        self.fold_upto = w;
     }
 
     /// Read-ahead: pull segments (advancing the laggard samples) until the
@@ -1011,7 +1069,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 self.read_samples(&seed)?;
             }
             let w = self.watermark();
-            self.rebuild_fold(w);
+            self.extend_fold(w);
             let kept = self
                 .fold
                 .count_kept_below(w.saturating_add(1), self.min_alt_obs);
@@ -1116,6 +1174,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
                 // Variant-free span — emit nothing, keep chunk_order gapless.
                 self.next_chunk_start = cut;
                 self.drop_buffers_below(cut);
+                self.reset_fold();
                 continue;
             }
 
@@ -1125,6 +1184,7 @@ impl<R: Read + Seek + Send> CohortChunkIntegrator<R> {
             let ref_span = self.fetch_ref_span(&variable, fetch_ref)?;
             self.next_chunk_start = cut;
             self.drop_buffers_below(cut);
+            self.reset_fold();
 
             let chunk_order = self.chunk_order;
             self.chunk_order += 1;
