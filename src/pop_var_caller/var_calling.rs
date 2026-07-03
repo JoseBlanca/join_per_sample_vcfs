@@ -233,8 +233,7 @@ pub enum VarCallingCliError {
 ///    [`CohortVcfWriter`](crate::vcf::CohortVcfWriter) in genomic order
 ///    — no per-chromosome fragments, no concat.
 /// 10. Print a one-shot stderr run-summary block (includes
-///     `effective_threads` + the `requested … capped by N chromosomes`
-///     parenthetical when the soft cap bit).
+///     `effective_threads`, the realised producer + caller concurrency).
 pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> {
     // 1. Split the thread budget `N` into a `P`-thread producer pool + `C`
     //    dedicated EM caller threads (`P + C = N`), then build the producer
@@ -323,8 +322,13 @@ pub fn run_var_calling(args: &VarCallingArgs) -> Result<(), VarCallingCliError> 
     let stats =
         crate::var_calling::pipeline::run_var_calling(args, contamination, &pool, caller_threads)?;
 
-    // 8. Stderr summary.
-    print_run_summary(&sample_names, stats, args.threads, chromosomes.len());
+    // 8. Stderr summary. The realised concurrency is the producer pool size
+    //    (`P`) plus the dedicated EM caller threads (`C`); `P + C` is the
+    //    thread budget the run actually used. It is NOT bounded by the
+    //    chromosome count — the pipeline distributes an interval `schedule`
+    //    across the caller pool, not one thread per chromosome.
+    let producer_threads = pool.current_num_threads();
+    print_run_summary(&sample_names, stats, producer_threads, caller_threads);
     Ok(())
 }
 
@@ -349,13 +353,14 @@ fn load_contamination(
 
 /// Print the one-shot stderr run summary.
 ///
-/// `effective_threads` is the per-chrom parallelism actually
-/// realised — `min(rayon_pool_size, n_chromosomes)`. The
-/// parenthetical `(requested R; capped by N chromosomes)` is
-/// appended only when the cap actually bit (i.e. the user passed
-/// `--threads R` with `R > n_chromosomes`). Matches the convention
-/// in samtools / bcftools where over-provisioning the thread pool
-/// is a warning-grade fact, not an error.
+/// `effective_threads` is the realised concurrency — the producer
+/// pool size `P` plus the dedicated EM caller threads `C` (`P + C`,
+/// the [`resolve_split`](crate::var_calling::pipeline::resolve_split)
+/// budget). It is NOT bounded by the chromosome count: the pipeline
+/// distributes an interval `schedule` across the caller pool, so
+/// requesting more threads than there are chromosomes still helps.
+/// (The old per-chromosome-parallel architecture capped here; that
+/// cap is gone.)
 ///
 /// `records_emnoconv` is a tally of records whose posterior EM hit
 /// the iteration cap and were emitted with `FILTER=EMNoConv`. Only
@@ -364,17 +369,10 @@ fn load_contamination(
 fn print_run_summary(
     sample_names: &[String],
     stats: crate::var_calling::vcf_writer::WriterStats,
-    requested_threads: Option<usize>,
-    n_chromosomes: usize,
+    producer_threads: usize,
+    caller_threads: usize,
 ) {
-    let pool_size = rayon::current_num_threads();
-    let effective_threads = pool_size.min(n_chromosomes.max(1));
-    let cap_note = match requested_threads {
-        Some(req) if req > n_chromosomes && n_chromosomes > 0 => {
-            format!(" (requested {req}; capped by {n_chromosomes} chromosomes)")
-        }
-        _ => String::new(),
-    };
+    let effective_threads = producer_threads + caller_threads;
     let emnoconv_note = if stats.records_unconverged > 0 {
         format!(
             " records_emnoconv={} (FILTER=EMNoConv; EM iteration cap)",
@@ -425,11 +423,10 @@ fn print_run_summary(
         String::new()
     };
     eprintln!(
-        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}{}",
+        "var-calling: n_samples={} records_emitted={} effective_threads={}{}{}{}{}{}{}",
         sample_names.len(),
         stats.records_written,
         effective_threads,
-        cap_note,
         emnoconv_note,
         dropped_hom_ref_note,
         dropped_low_qual_note,
