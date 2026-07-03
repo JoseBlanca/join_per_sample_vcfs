@@ -819,5 +819,86 @@ def _(np, op_w, opdata, pl, plt):
     return
 
 
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Het and coverage distributions by posterior band
+    Loci split into three posterior bands — **0.0–0.2** (confident non-paralog),
+    **0.2–0.8** (ambiguous), **0.8–1.0** (confident collapsed paralog). Each band's
+    distribution is drawn as a **density** (area = 1) on a **log y-axis**, so the
+    rare paralog band is directly comparable to the ~240k non-paralog majority that
+    otherwise swamps a raw scatter/hexbin.
+
+    **Top — `obs_het`:** the paralog signal is in the **high-het tail** (all three
+    bands share the low-het peak, but the paralog band's density sits well above the
+    non-paralog one for `obs_het ≳ 0.2` — ~15 % of the paralog band exceeds 0.15 vs
+    ~2 % of non-paralog).
+
+    **Bottom — `total_cov = Σ AD`:** the three bands nearly overlap. The per-sample
+    coverage excess of a collapsed paralog is **diluted in the cohort-summed absolute
+    read count** (only the carriers are over-covered). The sharp coverage signal is
+    the per-sample GC-normalized `mean_rel_cov` (band medians 1.055 / 1.142 / 1.108),
+    not `total_cov`.
+    """)
+    return
+
+
+@app.cell
+def _(df, np, pl, plt):
+    def _plot():
+        w = (
+            df.select(["post", "obs_het", "total_cov"])
+            .drop_nulls()
+            .filter(pl.col("post").is_finite() & pl.col("obs_het").is_finite())
+        )
+        # Half-open bands [lo, hi) partition the loci; the top band closes at 1.
+        bands = [
+            ("post 0.0–0.2  (non-paralog)", 0.0, 0.2, "#4c78a8"),
+            ("post 0.2–0.8  (ambiguous)", 0.2, 0.8, "#f58518"),
+            ("post 0.8–1.0  (paralog)", 0.8, 1.01, "#e45756"),
+        ]
+        subsets = [
+            (lbl, w.filter((pl.col("post") >= lo) & (pl.col("post") < hi)), col)
+            for (lbl, lo, hi, col) in bands
+        ]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7.5))
+
+        # Panel 1 — obs_het density per band.
+        het_hi = max(1e-6, float(np.percentile(w["obs_het"].to_numpy(), 99.9)))
+        het_bins = np.linspace(0.0, het_hi, 50)
+        for lbl, s, col in subsets:
+            ax1.hist(
+                s["obs_het"].to_numpy(), bins=het_bins, density=True,
+                histtype="step", lw=1.8, color=col,
+                label=f"{lbl}   (n={s.height:,})",
+            )
+        ax1.set_xlabel("obs_het")
+        ax1.set_ylabel("density (log)")
+        ax1.set_yscale("log")  # the paralog signal is in the high-het tail
+        ax1.set_title("observed heterozygosity by posterior band")
+        ax1.legend(fontsize=8)
+
+        # Panel 2 — total_cov (Σ allele reads) density per band.
+        cov_hi = max(1.0, float(np.percentile(w["total_cov"].to_numpy(), 99.0)))
+        cov_bins = np.linspace(0.0, cov_hi, 50)
+        for lbl, s, col in subsets:
+            ax2.hist(
+                s["total_cov"].to_numpy().astype(float), bins=cov_bins, density=True,
+                histtype="step", lw=1.8, color=col, label=lbl,
+            )
+        ax2.set_xlabel("Σ allele reads  (total_cov)")
+        ax2.set_ylabel("density (log)")
+        ax2.set_yscale("log")
+        ax2.set_title("total allele read count by posterior band")
+        ax2.legend(fontsize=8)
+
+        fig.tight_layout()
+        return fig
+
+    _plot()
+    return
+
+
 if __name__ == "__main__":
     app.run()

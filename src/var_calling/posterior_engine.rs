@@ -732,6 +732,12 @@ pub struct PosteriorRecord {
     pub chain_anchor_flags: Vec<bool>,
     /// EM bookkeeping — iteration count, final delta.
     pub diagnostics: EmDiagnostics,
+    /// Hidden-paralog posterior probability `P(paralog | data)`, stamped by the
+    /// paralog write pass when the locus was scored (biallelic SNP with a finite
+    /// LR). `None` for loci the paralog filter did not score (indels,
+    /// multiallelic, or the whole filter disabled) → the `PARALOG_POST` INFO
+    /// field is then omitted. Not part of the EM output; set downstream.
+    pub paralog_posterior: Option<f64>,
 }
 
 impl PosteriorRecord {
@@ -1000,6 +1006,9 @@ impl crate::vcf::VcfWritable for PosteriorRecord {
     }
     fn chain_anchor_flags_len(&self) -> usize {
         self.chain_anchor_flags.len()
+    }
+    fn paralog_posterior(&self) -> Option<f64> {
+        self.paralog_posterior
     }
 }
 
@@ -2086,6 +2095,8 @@ fn run_em_for_record<M: MathBackend>(
         other_scalars,
         chain_anchor_flags,
         diagnostics: em_outputs.diagnostics,
+        // Set later by the paralog write pass (if the filter runs and scores it).
+        paralog_posterior: None,
     };
     // Drop candidate ALT alleles no sample's argmax genotype uses, so
     // the VCF never carries AC=0 alleles (see the method docs). No-op
@@ -3494,6 +3505,7 @@ mod tests {
                 final_max_delta_p: 0.0,
                 converged: true,
             },
+            paralog_posterior: None,
         }
     }
 
@@ -3592,6 +3604,7 @@ mod tests {
                 final_max_delta_p: 0.0,
                 converged: true,
             },
+            paralog_posterior: None,
         };
         assert_eq!(rec.prune_unsupported_alleles(99.0), 0);
         assert_eq!(rec.alleles.len(), 2);

@@ -97,6 +97,24 @@ impl ParalogCalibration {
     pub(crate) fn flags(&self, lr: f64) -> bool {
         lr.is_finite() && self.curve.q_of_lr(lr) <= self.target_fdr
     }
+
+    /// The empirical-Bayes posterior `P(paralog | data) = σ(LR + logit π)` for a
+    /// locus's likelihood ratio, using the calibration's estimated prior `π`.
+    /// This is the same posterior the prototype reports; the caller emits it as
+    /// the `PARALOG_POST` INFO field.
+    ///
+    /// `None` for a non-finite `lr` (an unscored locus never entered the
+    /// calibration), or a degenerate prior (`π ∉ (0, 1)`) where the log-odds
+    /// offset is undefined — the field is then omitted rather than emitting a
+    /// saturated `0`/`1`.
+    pub(crate) fn posterior(&self, lr: f64) -> Option<f64> {
+        let pi = self.prior.prior_probability;
+        if !lr.is_finite() || pi <= 0.0 || pi >= 1.0 {
+            return None;
+        }
+        let log_odds = lr + (pi / (1.0 - pi)).ln(); // LR + logit(π)
+        Some(1.0 / (1.0 + (-log_odds).exp())) // σ(·)
+    }
 }
 
 /// The cohort inbreeding coefficient `F`, one value for every sample.
@@ -503,6 +521,49 @@ mod tests {
             "paralog-like locus should be flagged"
         );
         assert!(!cal.flags(lr_normal), "normal locus should be kept");
+    }
+
+    /// The paralog posterior is `σ(LR + logit π)`: it matches the closed form
+    /// using the calibration's own `π`, is bounded to `(0, 1)`, is monotone in
+    /// LR, and is `None` for a non-finite (unscored) LR.
+    #[test]
+    fn posterior_is_logistic_of_lr_shifted_by_prior_odds() {
+        let n = 30;
+        let prepass = prepass(n);
+        let mut records = Vec::new();
+        for i in 0..90u32 {
+            records.push(normal_locus(1000 + i, n));
+        }
+        for i in 0..10u32 {
+            records.push(paralog_locus(5000 + i, n));
+        }
+        let cal = run_calibrate(
+            &prepass,
+            0.02,
+            &records,
+            0.05,
+            &CalibrationConfig::default(),
+        );
+        let pi = cal.prior.prior_probability;
+        assert!(pi > 0.0 && pi < 1.0, "π = {pi}");
+        let logit_pi = (pi / (1.0 - pi)).ln();
+        let sigma = |x: f64| 1.0 / (1.0 + (-x).exp());
+        for &lr in &[-5.0, -1.0, 0.0, 1.0, 5.0] {
+            let p = cal.posterior(lr).expect("finite lr → Some");
+            assert!(
+                (p - sigma(lr + logit_pi)).abs() < 1e-12,
+                "lr={lr}: {p} vs {}",
+                sigma(lr + logit_pi)
+            );
+            assert!(p > 0.0 && p < 1.0, "posterior in (0,1): {p}");
+        }
+        assert!(
+            cal.posterior(2.0).unwrap() > cal.posterior(-2.0).unwrap(),
+            "monotone increasing in LR"
+        );
+        // An unscored locus carries a non-finite LR → no posterior (field omitted).
+        assert!(cal.posterior(f64::NAN).is_none());
+        assert!(cal.posterior(f64::INFINITY).is_none());
     }
 
     /// Calibrating a spill with no scorable loci (all indels) leaves the EM

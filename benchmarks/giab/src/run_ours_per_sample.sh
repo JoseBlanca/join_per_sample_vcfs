@@ -60,6 +60,12 @@ MIN_MAPQ="${MIN_MAPQ:-}"
 # depth-aware so inert below ~30x). AB_LR overrides the threshold (default -5).
 NO_AB="${NO_AB:-0}"
 AB_LR="${AB_LR:-}"
+# NO_PARALOG: set to 1 to disable the var-calling hidden-paralog filter
+# (--no-paralog-filter). The filter is ON by default; on the single-sample GIAB
+# data it is inert (no seg-dups, and high-depth samples are rejected as
+# out-of-range), so with vs without should match. Tags "_noparalog" into the
+# variant dir (or "-noparalog" onto a named preset).
+NO_PARALOG="${NO_PARALOG:-0}"
 
 # PRESET: named bundles that set the toggles above together (see GIAB README).
 # The allele-balance filter is ON in BOTH presets — it removes ~94% of
@@ -85,8 +91,11 @@ if [[ "$NO_DUST" == "1" ]]; then VARCALL_EXTRA+=(--no-complexity-filter); VARIAN
 if [[ -n "$MIN_MAPQ" ]]; then PILEUP_EXTRA+=(--min-mapq "$MIN_MAPQ"); VARIANT="${VARIANT}_mapq${MIN_MAPQ}"; fi
 if [[ "$NO_AB" == "1" ]]; then VARCALL_EXTRA+=(--no-allele-balance-filter); VARIANT="${VARIANT}_noab"; fi
 if [[ -n "$AB_LR" ]]; then VARCALL_EXTRA+=(--min-allele-balance-log-lr="$AB_LR"); VARIANT="${VARIANT}_ablr${AB_LR}"; fi
-# A named preset owns the output dir name outright.
+if [[ "$NO_PARALOG" == "1" ]]; then VARCALL_EXTRA+=(--no-paralog-filter); VARIANT="${VARIANT}_noparalog"; fi
+# A named preset owns the output dir name outright; the paralog toggle still
+# suffixes it so a preset's with/without-filter runs land in sibling dirs.
 [[ -n "$PRESET" ]] && VARIANT="$PRESET"
+[[ -n "$PRESET" && "$NO_PARALOG" == "1" ]] && VARIANT="${PRESET}-noparalog"
 OUT_DIR="$BENCH_DIR/results/per_sample/$COVERAGE/$VARIANT"
 
 # --- sample -> alignment filename / BED filename ---------------------------
@@ -177,7 +186,7 @@ echo "dataset   : per_sample / $COVERAGE"
 echo "reference : $REFERENCE"
 echo "threads   : $THREADS"
 echo "preset    : ${PRESET:-<none>}"
-echo "config    : BAQ=$([[ $NO_BAQ == 1 ]] && echo off || echo on) DUST=$([[ $NO_DUST == 1 ]] && echo off || echo on) allele-balance=$([[ $NO_AB == 1 ]] && echo off || echo "on(${AB_LR:--5})") (variant=$VARIANT)"
+echo "config    : BAQ=$([[ $NO_BAQ == 1 ]] && echo off || echo on) DUST=$([[ $NO_DUST == 1 ]] && echo off || echo on) allele-balance=$([[ $NO_AB == 1 ]] && echo off || echo "on(${AB_LR:--5})") paralog=$([[ $NO_PARALOG == 1 ]] && echo off || echo on) (variant=$VARIANT)"
 echo "samples   : ${SAMPLES[*]}"
 echo "out dir   : $OUT_DIR"
 echo

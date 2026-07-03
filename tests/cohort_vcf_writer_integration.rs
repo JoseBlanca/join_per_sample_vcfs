@@ -80,6 +80,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
             final_max_delta_p: 1e-6,
             converged: true,
         },
+        paralog_posterior: None,
     };
 
     // Triallelic SNP at chr1:500, A → T, A → C.
@@ -119,6 +120,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
             final_max_delta_p: 1e-6,
             converged: true,
         },
+        paralog_posterior: None,
     };
 
     // Insertion at chr1:900, REF=A, ALT=ATT (length-3 inserted bases
@@ -148,6 +150,7 @@ fn three_record_fixture() -> Vec<PosteriorRecord> {
             final_max_delta_p: 1e-6,
             converged: true,
         },
+        paralog_posterior: None,
     };
 
     vec![biallelic, triallelic, insertion]
@@ -344,6 +347,7 @@ fn mapq_info_fields_reflect_cohort_pooled_stats() {
             final_max_delta_p: 1e-6,
             converged: true,
         },
+        paralog_posterior: None,
     };
     writer.write_record(&record).unwrap();
     writer.finish().unwrap();
@@ -431,6 +435,7 @@ fn allele_balance_filter_decision_matches_contract() {
             final_max_delta_p: 1e-6,
             converged: true,
         },
+        paralog_posterior: None,
     };
     assert!(
         fails(&suspect, THR, S),

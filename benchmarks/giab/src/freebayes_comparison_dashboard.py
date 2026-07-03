@@ -75,13 +75,17 @@ def _():
     CLASSES = ["snps", "indels"]
 
     # caller label -> result subdir name under results/per_sample/<cov>/.
-    # `ours-power-aware` is the high-recall preset with the step-2 QUAL fix
-    # (filter on the refined QUAL + power-aware bias penalty); `ours-baseline`
-    # is the pre-fix output (gate on the un-refined baseline QUAL) kept for
-    # before/after contrast. A subdir is skipped if it holds no per-sample VCFs.
+    # Both "ours" rows are the high-recall config (BAQ off, DUST off,
+    # allele-balance on); they differ ONLY in the hidden-paralog filter, so the
+    # pair isolates that filter's effect. It is ON by default and expected to be
+    # inert on GIAB (single-sample, no seg-dups; high-depth samples rejected as
+    # out-of-range), so the two "ours" rows should coincide — the check that the
+    # filter does no harm on clean human data. Generate the OFF row with:
+    #   PRESET=high-recall NO_PARALOG=1 benchmarks/giab/src/run_ours_per_sample.sh <COV>
+    # A subdir is skipped if it holds no per-sample VCFs.
     CALLERS = {
-        "ours-power-aware": "high-recall-paware",
-        "ours-baseline": "high-recall",
+        "ours (paralog filter on)": "high-recall",
+        "ours (paralog filter off)": "high-recall-noparalog",
         "freebayes": "freebayes",
     }
 
@@ -263,11 +267,13 @@ def _(cmp_df, mo):
             "Cohort totals (HG002+HG003+HG004 summed), per coverage tier, "
             "split by variant class. precision = TP/(TP+FP), recall = "
             "TP/(TP+FN), F1 = harmonic mean. freebayes is QUAL ≥ 30 gated; "
-            "ours is the high-recall preset (BAQ off, DUST off, allele-balance "
-            "filter on). **ours-power-aware** = with the step-2 QUAL fix (gate "
-            "on the refined QUAL + alt-count-ramped bias penalty); "
-            "**ours-baseline** = pre-fix (gate on the un-refined baseline QUAL) "
-            "— note its SNP-FP spike at 30x/50x that the fix removes."
+            "both **ours** rows are the high-recall preset (BAQ off, DUST off, "
+            "allele-balance filter on) and differ ONLY in the hidden-paralog "
+            "filter — **paralog filter on** (default) vs **off** "
+            "(`--no-paralog-filter`). On GIAB the filter is expected to be inert "
+            "(single-sample, no seg-dups; high-depth samples rejected as "
+            "out-of-range), so the two ours rows should coincide — the check "
+            "that the filter does no harm on clean human data."
         ),
         mo.md("## SNPs"),
         mo.ui.table(cmp_df.filter(cmp_df["class"] == "snps"), selection=None),
@@ -282,10 +288,25 @@ def _(alt, cmp_df, mo):
     # Side-by-side precision/recall/FP vs coverage, faceted by class, colored by
     # caller. Rendered as SEPARATE altair_chart embeds (one per metric) so Vega
     # doesn't hit "Duplicate signal name" when concatenating shared-scale charts.
+    #
+    # The two "ours" rows are near-identical (the paralog filter is inert on
+    # GIAB), so paralog-OFF is a DASHED line drawn LAST (on top) — otherwise it
+    # sits exactly under the solid paralog-ON line and is invisible. Draw order
+    # follows the colour-scale domain, so ON is listed first and OFF last.
+    ORDER = [
+        "ours (paralog filter on)",
+        "freebayes",
+        "ours (paralog filter off)",
+    ]
     COLORS = {
-        "ours-power-aware": "#1f77b4",
-        "ours-baseline": "#9ecae1",
+        "ours (paralog filter on)": "#1f77b4",
         "freebayes": "#ff7f0e",
+        "ours (paralog filter off)": "#2ca02c",
+    }
+    DASHES = {
+        "ours (paralog filter on)": [1, 0],
+        "freebayes": [1, 0],
+        "ours (paralog filter off)": [6, 3],
     }
 
     def _line(metric: str, title: str, y_title: str, zero_to_one: bool):
@@ -294,13 +315,18 @@ def _(alt, cmp_df, mo):
             y = alt.Y(f"{metric}:Q", title=y_title, scale=alt.Scale(domain=[0.0, 1.0]))
         return (
             alt.Chart(cmp_df)
-            .mark_line(point=True)
+            .mark_line(point=True, opacity=0.9)
             .encode(
                 x=alt.X("cov_x:Q", title="coverage (x)",
                         scale=alt.Scale(type="log")),
                 y=y,
                 color=alt.Color("caller:N",
-                                scale=alt.Scale(domain=list(COLORS), range=list(COLORS.values()))),
+                                scale=alt.Scale(domain=ORDER, range=[COLORS[c] for c in ORDER])),
+                strokeDash=alt.StrokeDash(
+                    "caller:N",
+                    scale=alt.Scale(domain=ORDER, range=[DASHES[c] for c in ORDER]),
+                    legend=None,
+                ),
                 column=alt.Column("class:N", title=None),
                 tooltip=["coverage", "caller", "class", "TP", "FP", "FN",
                          "precision", "recall", "f1"],
@@ -337,14 +363,25 @@ def _(cmp_df, mo, pl):
         .sort(["class", "cov_x"])
     )
     cols = wide.columns
-    if "ours-power-aware" in cols and "freebayes" in cols:
+    ours_on = "ours (paralog filter on)"
+    if ours_on in cols and "freebayes" in cols:
         wide = wide.with_columns(
-            (pl.col("ours-power-aware") - pl.col("freebayes")).round(4).alias("F1_delta(ours-fb)")
+            (pl.col(ours_on) - pl.col("freebayes")).round(4).alias("F1_delta(ours-fb)")
+        )
+    if ours_on in cols and "ours (paralog filter off)" in cols:
+        wide = wide.with_columns(
+            (pl.col(ours_on) - pl.col("ours (paralog filter off)"))
+            .round(4)
+            .alias("F1_delta(on-off)")
         )
     mo.vstack([
-        mo.md("## F1 head-to-head (ours-power-aware − freebayes)"),
+        mo.md("## F1 head-to-head (ours − freebayes, and paralog on − off)"),
         mo.ui.table(wide, selection=None),
-        mo.md("_Positive `F1_delta` = ours (power-aware QUAL) wins at that coverage/class._"),
+        mo.md(
+            "_`F1_delta(ours-fb)` > 0 = ours (paralog on) beats freebayes. "
+            "`F1_delta(on-off)` should be ~0 everywhere — the paralog filter is "
+            "inert on GIAB._"
+        ),
     ])
     return
 

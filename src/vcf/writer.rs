@@ -369,6 +369,7 @@ mod tests {
                 final_max_delta_p: 1e-6,
                 converged: true,
             },
+            paralog_posterior: None,
         }
     }
 

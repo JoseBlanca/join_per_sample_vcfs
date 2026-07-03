@@ -148,6 +148,7 @@ pub(crate) fn paralog_provenance(calibration: &ParalogCalibration) -> String {
 pub(crate) fn run_write_pass<R: Read>(
     spill: &mut ParalogSpillReader<R>,
     calibration: &ParalogCalibration,
+    keep_dup_artifacts: bool,
     reference: &Path,
     chrom_names: &[String],
     mut writer: VcfWriter,
@@ -155,29 +156,38 @@ pub(crate) fn run_write_pass<R: Read>(
     let mut records_dropped_paralog = 0u64;
     let mut chunk_order = 0u64;
     // Per-contig reference fetcher for the coordinate-consistency guard, built
-    // lazily on the first survivor of each contig.
+    // lazily on the first written record of each contig.
     let mut ref_fetcher: Option<(u32, StreamingChromRefFetcher)> = None;
 
     while let Some(record) = spill.next_record() {
-        let record = record?;
+        let mut record = record?;
         // Apply the cut to the locus's stored LR (scored once in the worker,
         // folded into the histogram `calibration` came from — so the cut applies
         // to the exact value the calibration was built from). An unscored locus
         // carries `NaN` and is never flagged → kept.
         let flagged = calibration.flags(record.paralog_lr);
 
-        if flagged {
+        // Stamp the paralog posterior on every scored locus — regardless of the
+        // drop decision — so emitted records carry `PARALOG_POST`. An unscored
+        // locus (NaN LR) yields `None` and the INFO field is omitted. In the
+        // default (drop) mode only survivors are emitted, so the posterior is
+        // present exactly on the loci that passed the threshold.
+        record.record.paralog_posterior = calibration.posterior(record.paralog_lr);
+
+        // Default: drop a flagged locus. With `--do-not-drop-dup-artifacts` the
+        // flagged locus is kept (still annotated) so it can be inspected.
+        if flagged && !keep_dup_artifacts {
             records_dropped_paralog += 1;
             continue;
         }
 
-        // Survivor: verify the coordinate is consistent with the reference
-        // before emitting (fails loud on window/coordinate drift).
+        // Emitted record: verify the coordinate is consistent with the reference
+        // before writing (fails loud on window/coordinate drift).
         check_reference_consistency(&record.record, &mut ref_fetcher, reference, chrom_names)?;
 
-        // Survivor: route through the unchanged writer (existing filters +
-        // byte-identity-critical formatting). One record per chunk keeps the
-        // reorder cursor gapless from 0.
+        // Route through the unchanged writer (existing filters + byte-identity-
+        // critical formatting). One record per chunk keeps the reorder cursor
+        // gapless from 0.
         writer.handle(CalledChunk {
             chunk_order,
             // The VCF writer ignores the window coverage + LR (they rode the spill
@@ -317,6 +327,7 @@ mod tests {
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
             &cal,
+            false, // keep_dup_artifacts: default drop mode
             &reference,
             &chrom_names(),
             writer,
@@ -344,6 +355,70 @@ mod tests {
         assert!(!data_positions.iter().any(|p| p.starts_with("500")));
     }
 
+    /// `--do-not-drop-dup-artifacts` keeps every flagged locus (nothing dropped)
+    /// and stamps the `PARALOG_POST` posterior on the scored records, so the
+    /// artifact class is present and annotated instead of removed.
+    #[test]
+    fn keep_dup_artifacts_retains_flagged_and_annotates_posterior() {
+        let n = 20;
+        let mut records = Vec::new();
+        for i in 0..80u32 {
+            records.push(normal_locus(1000 + i, n));
+        }
+        for i in 0..20u32 {
+            records.push(paralog_locus(5000 + i, n));
+        }
+        let cal = score_and_calibrate(&mut records, n, 0.05);
+
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("out.vcf");
+        // Min-qual 0 so ONLY the paralog keep/drop decision governs — the
+        // skewed-AB paralog loci would otherwise trip the refined-QUAL min-qual
+        // filter downstream (the research callset pairs this flag with
+        // `--min-qual 0` for exactly that reason).
+        let filters = DownstreamFilters {
+            min_qual_phred: 0.0,
+            allele_balance: AlleleBalanceFilter::Off,
+        };
+        let writer = VcfWriter::new(
+            metadata(n, paralog_provenance(&cal)),
+            WriterConfig::new(out.clone()),
+            filters,
+        )
+        .unwrap();
+
+        let (_ref_dir, reference) = reference_fasta(6000, b'A');
+        let stats = run_write_pass(
+            &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
+            &cal,
+            true, // keep_dup_artifacts: annotate but do not drop
+            &reference,
+            &chrom_names(),
+            writer,
+        )
+        .expect("write pass");
+
+        // Nothing dropped; all 100 loci written (80 normal + 20 flagged kept).
+        assert_eq!(stats.records_dropped_paralog, 0);
+        assert_eq!(stats.records_written, 100);
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        // The PARALOG_POST INFO field is declared and emitted on scored loci.
+        assert!(
+            text.contains("##INFO=<ID=PARALOG_POST"),
+            "header must declare PARALOG_POST"
+        );
+        let data: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(data.len(), 100);
+        // The flagged paralog positions (5000..) are RETAINED here.
+        assert!(data.iter().any(|l| l.split('\t').nth(1) == Some("5000")));
+        // Every scored biallelic-SNP record carries the posterior.
+        assert!(
+            data.iter().all(|l| l.contains("PARALOG_POST=")),
+            "each scored locus must carry PARALOG_POST"
+        );
+    }
+
     /// A reference that disagrees with the decoded REF allele fails the write
     /// pass loud (coordinate/window drift), rather than emitting a mis-scored
     /// callset. Here every survivor's REF is `A` but the FASTA is all `C`.
@@ -366,6 +441,7 @@ mod tests {
         let err = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
             &cal,
+            false, // keep_dup_artifacts: default drop mode
             &reference,
             &chrom_names(),
             writer,
@@ -403,6 +479,7 @@ mod tests {
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
             &cal,
+            false, // keep_dup_artifacts: default drop mode
             &reference,
             &chrom_names(),
             writer,
@@ -430,6 +507,7 @@ mod tests {
         let stats = run_write_pass(
             &mut ParalogSpillReader::new(Cursor::new(Vec::<u8>::new())),
             &cal,
+            false, // keep_dup_artifacts: default drop mode
             &reference,
             &chrom_names(),
             writer,
@@ -466,6 +544,7 @@ mod tests {
             run_write_pass(
                 &mut ParalogSpillReader::new(Cursor::new(write_spill(&records))),
                 &cal,
+                false, // keep_dup_artifacts: default drop mode
                 &reference,
                 &chrom_names(),
                 writer,
