@@ -56,6 +56,27 @@ pub const DEFAULT_MODE_MEDIAN_RATIO_LO: f64 = 0.5;
 /// Upper `mode/median` acceptance bound. See [`DEFAULT_MODE_MEDIAN_RATIO_LO`].
 pub const DEFAULT_MODE_MEDIAN_RATIO_HI: f64 = 1.5;
 
+/// Default cap on the fraction of covered positions allowed in the depth
+/// histogram's **overflow** bin before the fit is rejected as out-of-range.
+///
+/// The regular depth bins span `0 .. depth_bins·depth_bin_width` (the default
+/// scheme = `0..100×`); everything above lands in a single overflow column.
+/// The overflow column legitimately holds a small tail — the high-copy
+/// (`≥ 2×`) duplication windows the filter is meant to catch — so a few
+/// percent is expected. When the fraction is large, the sample's own
+/// *single-copy* depth has reached the top of the range: the single-copy peak
+/// itself overflows, the regular bins hold only noise, and `mode_depth`
+/// anchors `single_copy_scale` on that noise (a single ~100× human sample fit
+/// its scale to a 145-position stray bin at 76× while 99.9% of positions
+/// overflowed — every ordinary variant then read as ~1.3 copies and was
+/// flagged as a hidden paralog). Past this point the coverage signal cannot
+/// separate single-copy from a collapsed paralog anyway — a 2× paralog and the
+/// single-copy peak both overflow — so rejecting the fit (→ the sample is
+/// carried absent, its coverage inert) is the honest outcome, not a
+/// workaround. `0.20` = reject once more than a fifth of covered positions
+/// exceed the histogram's depth range.
+pub const DEFAULT_MAX_OVERFLOW_FRACTION: f64 = 0.20;
+
 /// Acceptance bounds on the `mode/median` depth ratio: the fit is rejected
 /// unless `mode/median ∈ [lo, hi]`. A well-formed pair has `0 < lo <= hi`;
 /// [`new`] enforces that at the construction boundary, and [`DEFAULT`] is the
@@ -112,6 +133,10 @@ pub struct CoverageFitConfig {
     pub single_copy_depth_sd_override: Option<f64>,
     /// `mode/median` must fall within these bounds or the fit is rejected.
     pub mode_median_ratio_bounds: ModeMedianRatioBounds,
+    /// Reject the fit when more than this fraction of covered positions land in
+    /// the depth histogram's overflow bin (the sample's single-copy depth has
+    /// exceeded the histogram range). See [`DEFAULT_MAX_OVERFLOW_FRACTION`].
+    pub max_overflow_fraction: f64,
 }
 
 impl Default for CoverageFitConfig {
@@ -123,6 +148,7 @@ impl Default for CoverageFitConfig {
             smooth_window: DEFAULT_SMOOTH_WINDOW,
             single_copy_depth_sd_override: None,
             mode_median_ratio_bounds: ModeMedianRatioBounds::DEFAULT,
+            max_overflow_fraction: DEFAULT_MAX_OVERFLOW_FRACTION,
         }
     }
 }
@@ -152,6 +178,16 @@ pub enum CoverageModelError {
         "mode/median {ratio:.3} outside [{lo:.3}, {hi:.3}]: the depth mode landed on a wrong copy-number peak"
     )]
     ModeMedianRatioOutOfBounds { ratio: f64, lo: f64, hi: f64 },
+    /// Too large a fraction of covered positions landed in the depth
+    /// histogram's overflow bin: the sample's single-copy depth has reached
+    /// the top of the histogram range, so the single-copy peak is unresolvable
+    /// and the coverage signal can no longer separate single-copy from a
+    /// collapsed paralog. Rejected rather than anchoring the scale on the noise
+    /// left in the near-empty regular bins.
+    #[error(
+        "depth range exceeded: {overflow_fraction:.3} of covered positions are in the overflow bin (limit {limit:.3}) — single-copy depth is above the histogram range"
+    )]
+    DepthRangeExceeded { overflow_fraction: f64, limit: f64 },
     /// No GC bin had enough single-copy-band tiles to seed the GC curve, so
     /// it cannot be gap-filled from any anchor.
     #[error("no GC bin has enough single-copy tiles to fit the GC-bias curve")]
@@ -202,9 +238,25 @@ impl SingleCopyCoverageModel {
         validate_config(cfg)?;
         let layout = HistogramLayout::new(hist);
 
+        // 0. Depth-range guard: if the single-copy peak has overflowed the
+        //    histogram range, the regular bins hold only noise and the mode
+        //    anchor is meaningless. Reject before fitting anything.
+        let depth_marginal = layout.depth_marginal(hist);
+        let regular_total: u64 = depth_marginal.iter().sum();
+        let overflow_total = layout.overflow_total(hist);
+        let covered_total = regular_total + overflow_total;
+        if covered_total > 0 {
+            let overflow_fraction = overflow_total as f64 / covered_total as f64;
+            if overflow_fraction > cfg.max_overflow_fraction {
+                return Err(CoverageModelError::DepthRangeExceeded {
+                    overflow_fraction,
+                    limit: cfg.max_overflow_fraction,
+                });
+            }
+        }
+
         // 1. Single-copy scale = mode of the marginal depth distribution
         //    (sub-bin-refined), guarded against a wrong-peak landing.
-        let depth_marginal = layout.depth_marginal(hist);
         let single_copy_scale = mode_depth(&depth_marginal, hist.depth_bin_width)?;
         let median =
             median_depth(&layout, hist, &depth_marginal).ok_or(CoverageModelError::NoTiles)?;
@@ -311,6 +363,14 @@ impl HistogramLayout {
     /// overflow column.
     fn cell(&self, hist: &CoverageByGcHistogram, gc_bin: usize, depth_bin: usize) -> u64 {
         u64::from(hist.counts[gc_bin * self.row_stride + depth_bin])
+    }
+
+    /// Total count in the overflow column across all GC bins (positions whose
+    /// mean depth exceeded the histogram's regular range).
+    fn overflow_total(&self, hist: &CoverageByGcHistogram) -> u64 {
+        (0..self.gc_bins)
+            .map(|gc_bin| self.cell(hist, gc_bin, self.depth_bins))
+            .sum()
     }
 
     /// Marginal depth histogram over the **regular** bins (overflow
@@ -558,13 +618,25 @@ fn smooth_median(curve: &[f64], window: usize) -> Vec<f64> {
 /// prototype, which filters `rel` then measures spread on the corrected
 /// value), and the MAD is taken over the corrected `rcn = rel / mult`.
 ///
-/// The result is floored at the histogram's own resolution — half a depth
-/// bin expressed in relative-copy-number units, `0.5 · depth_bin_width /
-/// scale` — not an arbitrary constant. A band that collapses to one depth
-/// bin has MAD 0, and the true spread is then unknowable below one bin; the
-/// resolution floor is the honest, non-degenerate σ₀ (≈ 0.04 at production
-/// binning, vs a catastrophically overconfident hardcoded `1e-3`). It keeps
-/// σ₀ strictly positive so the Normal coverage term never spikes.
+/// The result is floored at the **sampling** spread — the relative SD a
+/// one-copy window's depth would have from read-sampling alone, `√scale /
+/// scale = 1/√scale` (a count with mean `scale` reads has Poisson SD
+/// `√scale`). A one-copy window cannot be *tighter* than this, so it is the
+/// honest lower bound when the band's MAD is uninformative: a band that
+/// collapses to a single dominant depth bin has weighted MAD 0, and the true
+/// spread is then unknowable from the histogram.
+///
+/// The earlier floor used the histogram's own *resolution* (`0.5 ·
+/// depth_bin_width / scale`) instead. That shrinks as `1/scale`, so at deep
+/// coverage — where the band MAD does collapse — it drove σ₀ to ~1e-3
+/// (≈ `0.25/100` at 100× with the 0.5-wide bins), some 30× under the true
+/// ~`1/√scale` ≈ 0.1 single-copy spread. The `Normal(1, σ₀)` coverage term
+/// then became absurdly overconfident: an ordinary variant window scored
+/// dozens of σ from single-copy and was flagged as a hidden paralog, so the
+/// filter deleted almost the whole callset of any single high-depth sample
+/// whose fit slipped past the mode/median guard (GIAB HG004 @≈100×: 725 → 106
+/// calls, recall 0.98 → 0.02). The sampling floor is depth-appropriate at every
+/// tier and keeps σ₀ strictly positive so the Normal coverage term never spikes.
 fn fit_sigma0(
     hist: &CoverageByGcHistogram,
     layout: &HistogramLayout,
@@ -573,7 +645,10 @@ fn fit_sigma0(
     cfg: &CoverageFitConfig,
 ) -> f64 {
     debug_assert_eq!(curve.len(), layout.gc_bins, "curve is fit per GC bin");
-    let resolution_floor = 0.5 * hist.depth_bin_width / scale;
+    // Read-sampling (Poisson) relative-depth SD: the tightest a one-copy
+    // window can plausibly be, hence the honest σ₀ floor. `scale > 0` is an
+    // invariant of the fit (mode-anchored, bottom-bin rejected).
+    let sampling_floor = 1.0 / scale.sqrt();
 
     // Collect (relative_copy_number, weight) over single-copy-band tiles.
     // `curve` is index-aligned with the GC bins (asserted above).
@@ -594,11 +669,11 @@ fn fit_sigma0(
         }
     }
     let Some(center) = weighted_median(&mut vals) else {
-        return resolution_floor;
+        return sampling_floor;
     };
     let mut devs: Vec<(f64, u64)> = vals.iter().map(|&(v, w)| ((v - center).abs(), w)).collect();
     let mad = weighted_median(&mut devs).unwrap_or(0.0);
-    (1.4826 * mad).max(resolution_floor)
+    (1.4826 * mad).max(sampling_floor)
 }
 
 #[cfg(test)]
@@ -767,9 +842,11 @@ mod tests {
         assert!(model.expected_single_copy_depth(0.125) < model.expected_single_copy_depth(0.875));
     }
 
-    /// σ₀ is the robust SD (`1.4826·MAD`) of the relative copy number over
-    /// single-copy tiles. A symmetric five-bin spread gives a MAD of exactly
-    /// one bin's worth of rel (0.095 here → σ₀ ≈ 0.1408).
+    /// σ₀ is `max(1.4826·MAD, 1/√scale)` — the robust MAD spread, floored at
+    /// the read-sampling (Poisson) relative SD. This shallow five-bin spread
+    /// (scale 10.5) has a MAD-based σ₀ of `1.4826·0.095 ≈ 0.141`, but a
+    /// one-copy window at depth 10.5 cannot be tighter than `1/√10.5 ≈ 0.309`,
+    /// so the sampling floor governs.
     #[test]
     fn sigma0_fit_from_spread() {
         let tiles = [
@@ -781,11 +858,46 @@ mod tests {
         ];
         let h = hist(1, 30, 1.0, 500, &tiles);
         let model = SingleCopyCoverageModel::fit(&h, &CoverageFitConfig::default()).expect("fit");
-        // MAD = 0.095 (one bin / scale 10.5); σ₀ = 1.4826 · 0.095.
+        let mad_based = 1.4826 * (1.0 / 10.5);
+        let sampling_floor = 1.0 / 10.5_f64.sqrt();
         assert!(
-            approx(model.single_copy_depth_sd(), 1.4826 * (1.0 / 10.5), 1e-6),
+            sampling_floor > mad_based,
+            "the floor governs at this depth"
+        );
+        assert!(
+            approx(model.single_copy_depth_sd(), sampling_floor, 1e-6),
             "sigma0 = {}",
             model.single_copy_depth_sd()
+        );
+    }
+
+    /// Regression for the high-depth σ₀ collapse: when the single-copy band
+    /// collapses to one depth bin the MAD is 0, and the honest σ₀ is the
+    /// sampling floor `1/√scale`, NOT the histogram-resolution floor
+    /// `0.5·depth_bin_width/scale` (which shrinks as `1/scale` and drove σ₀ to
+    /// ~1e-3 at deep coverage, making the H1 coverage term absurdly
+    /// overconfident).
+    #[test]
+    fn sigma0_floors_at_sampling_spread_when_band_collapses() {
+        // All mass in one depth bin at ~64× (mode == median, no overflow).
+        let h = hist(
+            2,
+            200,
+            0.5,
+            500,
+            &[(0.25, 64.25, 1000), (0.75, 64.25, 1000)],
+        );
+        let model = SingleCopyCoverageModel::fit(&h, &CoverageFitConfig::default()).expect("fit");
+        let sampling_floor = 1.0 / 64.25_f64.sqrt(); // ≈ 0.1247
+        let old_resolution_floor = 0.5 * 0.5 / 64.25; // ≈ 0.0039
+        assert!(
+            approx(model.single_copy_depth_sd(), sampling_floor, 1e-6),
+            "sigma0 = {} (want sampling floor {sampling_floor})",
+            model.single_copy_depth_sd()
+        );
+        assert!(
+            model.single_copy_depth_sd() > 10.0 * old_resolution_floor,
+            "sampling floor must dwarf the old resolution floor"
         );
     }
 
@@ -806,6 +918,58 @@ mod tests {
         assert!(
             matches!(err, CoverageModelError::ModeMedianRatioOutOfBounds { .. }),
             "got {err:?}"
+        );
+    }
+
+    /// The depth-range guard rejects a sample whose single-copy depth has
+    /// exceeded the histogram range: most covered positions pile into the
+    /// overflow bin, leaving only noise in the regular bins. (The ≈100× human
+    /// GIAB samples hit exactly this — 99.9% overflow of the 0..100× range.)
+    #[test]
+    fn rejects_when_depth_range_exceeded() {
+        // Range 0..10× (10 bins × 1.0). A little single-copy mass in-range,
+        // most positions at ~50× → the overflow bin (fraction 0.8 > 0.2).
+        let h = hist(2, 10, 1.0, 500, &[(0.5, 5.5, 100), (0.5, 50.0, 400)]);
+        let err = SingleCopyCoverageModel::fit(&h, &CoverageFitConfig::default())
+            .expect_err("out-of-range sample must be rejected");
+        match err {
+            CoverageModelError::DepthRangeExceeded {
+                overflow_fraction,
+                limit,
+            } => {
+                assert!(
+                    approx(overflow_fraction, 0.8, 1e-9),
+                    "got {overflow_fraction}"
+                );
+                assert!(approx(limit, DEFAULT_MAX_OVERFLOW_FRACTION, 1e-9));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A small overflow tail (the high-copy duplication windows the filter is
+    /// meant to catch) is under the limit and does NOT trip the range guard.
+    #[test]
+    fn small_overflow_tail_is_accepted() {
+        // ~9% overflow (10 of 110) around a single-copy peak at 5×.
+        let tiles = [
+            (0.25, 4.5, 200),
+            (0.25, 5.5, 300),
+            (0.25, 6.5, 200),
+            (0.75, 4.5, 200),
+            (0.75, 5.5, 300),
+            (0.75, 6.5, 200),
+            (0.25, 50.0, 70), // overflow
+            (0.75, 50.0, 70), // overflow
+        ];
+        let h = hist(2, 10, 1.0, 500, &tiles);
+        let err_is_range = matches!(
+            SingleCopyCoverageModel::fit(&h, &CoverageFitConfig::default()),
+            Err(CoverageModelError::DepthRangeExceeded { .. })
+        );
+        assert!(
+            !err_is_range,
+            "a small overflow tail must not trip the guard"
         );
     }
 
@@ -901,15 +1065,17 @@ mod tests {
     }
 
     /// When the single-copy band collapses to one depth bin the MAD is 0, so
-    /// σ₀ falls back to the histogram's resolution (`0.5·width/scale`) — a
-    /// small but non-degenerate SD, not a catastrophically tight `1e-3`.
+    /// σ₀ falls back to the read-sampling (Poisson) floor `1/√scale` — the
+    /// honest single-copy spread, not the depth-shrinking histogram resolution
+    /// (see [`sigma0_floors_at_sampling_spread_when_band_collapses`] for the
+    /// high-depth regime where the two diverge catastrophically).
     #[test]
-    fn sigma0_floors_at_resolution_when_band_collapses() {
+    fn sigma0_floors_at_sampling_spread_when_band_collapses_low_depth() {
         let h = hist(1, 30, 1.0, 500, &[(0.5, 10.5, 500)]);
         let model = SingleCopyCoverageModel::fit(&h, &CoverageFitConfig::default()).expect("fit");
-        // scale = 10.5, width = 1.0 → floor = 0.5 / 10.5.
+        // scale = 10.5 → sampling floor = 1/√10.5 ≈ 0.309.
         assert!(
-            approx(model.single_copy_depth_sd(), 0.5 / 10.5, 1e-12),
+            approx(model.single_copy_depth_sd(), 1.0 / 10.5_f64.sqrt(), 1e-12),
             "sigma0 = {}",
             model.single_copy_depth_sd()
         );
