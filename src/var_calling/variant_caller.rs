@@ -201,7 +201,22 @@ impl VariantCaller {
         records
             .iter()
             .zip(window_coverage)
-            .map(|(record, window)| paralog.score(record, window, &mut obs_buf))
+            .map(|(record, window)| {
+                // Only variable loci belong in the paralog machinery. A record
+                // where no sample carries an ALT (`!is_variant_call`) is dropped
+                // downstream as hom-ref regardless of its LR, and — being a
+                // non-variant — must not enter the FDR calibration histogram that
+                // sets the cut for the real candidates. Return the `NaN` unscored
+                // sentinel: the histogram fold drops it (calibration is built from
+                // variable loci only) and the write pass keeps it (then the VCF
+                // writer drops it as hom-ref). This also skips the expensive
+                // per-locus transcendental score for ~all-hom-ref positions.
+                if record.is_variant_call() {
+                    paralog.score(record, window, &mut obs_buf)
+                } else {
+                    f64::NAN
+                }
+            })
             .collect()
     }
 
