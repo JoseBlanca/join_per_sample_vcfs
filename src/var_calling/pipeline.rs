@@ -771,6 +771,7 @@ pub fn run_var_calling(
             let stats = run_write_pass(
                 &mut reader,
                 &calibration,
+                cohort.do_not_drop_dup_artifacts,
                 &args.reference,
                 &chrom_names,
                 writer,

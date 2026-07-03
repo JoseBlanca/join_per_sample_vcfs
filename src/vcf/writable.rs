@@ -98,4 +98,13 @@ pub trait VcfWritable {
     /// Total length of the row-major `chain_anchor_flags` table;
     /// `chain_anchor_flags_len() == n_samples * n_alleles`.
     fn chain_anchor_flags_len(&self) -> usize;
+
+    // ---- Optional annotations ------------------------------------------
+
+    /// Hidden-paralog posterior `P(paralog | data)`, set by the paralog write
+    /// pass when the locus was scored. `None` (the default) omits the
+    /// `PARALOG_POST` INFO field; records that carry the score override this.
+    fn paralog_posterior(&self) -> Option<f64> {
+        None
+    }
 }

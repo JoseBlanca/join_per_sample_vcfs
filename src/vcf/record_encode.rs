@@ -346,6 +346,14 @@ fn build_info<R: VcfWritable>(
     // no reads of the relevant class).
     emit_mapq_info(record, n_alleles, &mut info);
 
+    // PARALOG_POST — hidden-paralog posterior, present only when the paralog
+    // filter scored this locus (mirrors the CA present-on-some pattern).
+    // Inserted last so the existing INFO field order is unchanged.
+    if let Some(post) = record.paralog_posterior() {
+        info.as_mut()
+            .insert("PARALOG_POST".into(), Some(InfoValue::Float(post as f32)));
+    }
+
     Ok(info)
 }
 
@@ -690,6 +698,7 @@ mod tests {
                 final_max_delta_p: 1e-6,
                 converged: true,
             },
+            paralog_posterior: None,
         }
     }
 

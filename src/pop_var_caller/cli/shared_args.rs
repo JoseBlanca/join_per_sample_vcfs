@@ -446,6 +446,19 @@ pub struct CohortPipelineArgs {
     )]
     pub no_paralog_filter: bool,
 
+    /// Run the hidden-paralog filter but do NOT drop the flagged loci: keep
+    /// every scored locus and annotate it with the `PARALOG_POST` INFO field
+    /// (the collapsed-paralog posterior). Use this to inspect the artifact
+    /// class instead of removing it. No effect when the filter is off
+    /// (`--no-paralog-filter` / `--paralog-fdr 0`).
+    #[arg(
+        long = "do-not-drop-dup-artifacts",
+        hide_short_help = true,
+        default_value_t = false,
+        help_heading = "Advanced — Hidden-paralog filter"
+    )]
+    pub do_not_drop_dup_artifacts: bool,
+
     /// Emit `GP` (genotype posteriors) `FORMAT` per sample. Off by
     /// default — `GP` is `Number=G`, so the per-sample cell grows as
     /// `(ploidy + n_alleles − 1) choose ploidy` (21 floats at
