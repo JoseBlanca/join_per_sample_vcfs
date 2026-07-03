@@ -301,6 +301,7 @@ fn make_args(fx: &Fixture, threads: usize) -> VarCallingArgs {
             emit_gp: false,
             paralog_fdr: 0.0,
             no_paralog_filter: true,
+            do_not_drop_dup_artifacts: false,
         },
     }
 }

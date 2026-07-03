@@ -603,6 +603,9 @@ fn decode_record(buf: &[u8]) -> Result<ParalogSpillRecord, SpillError> {
             other_scalars,
             chain_anchor_flags,
             diagnostics,
+            // Not part of the spill wire format: the write pass stamps the
+            // posterior after reading the record back.
+            paralog_posterior: None,
         },
     })
 }
@@ -712,6 +715,7 @@ mod tests {
                     final_max_delta_p: 1e-7,
                     converged: true,
                 },
+                paralog_posterior: None,
             },
         }
     }
@@ -938,6 +942,7 @@ mod tests {
                         final_max_delta_p: f(600) * 1e-3,
                         converged: seed % 2 == 0,
                     },
+                    paralog_posterior: None,
                 },
             };
             let mut buf = Vec::new();

@@ -189,6 +189,14 @@ pub(super) fn build_vcf_header(
                 InfoType::Float,
                 "Welch's t-statistic comparing ALT vs REF MAPQ distributions across the cohort. Negative => alt reads cluster at lower MAPQ.",
             ),
+        )
+        .add_info(
+            "PARALOG_POST",
+            Map::<Info>::new(
+                InfoNumber::Count(1),
+                InfoType::Float,
+                "Hidden-paralog posterior P(collapsed paralog | data) from the coverage/het likelihood ratio; present only on loci the paralog filter scored (biallelic SNPs). Higher => more likely a reference-collapsed paralog artifact.",
+            ),
         );
 
     // FORMAT entries — always-on quartet, plus GP only when enabled.
