@@ -446,6 +446,26 @@ impl PosteriorEngineConfig {
         Ok(self)
     }
 
+    /// Validating setter for the per-sample `fixation_index_overrides`. Each
+    /// entry must be finite and in `[0.0, 1.0]`; `None` clears the overrides so
+    /// every sample falls back to `fixation_index_default`. The cohort-length
+    /// invariant (`len == n_samples`) is checked per record in the engine, where
+    /// the sample count is known.
+    pub fn with_fixation_index_overrides(
+        mut self,
+        fixation_index_overrides: Option<Vec<f64>>,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        if let Some(overrides) = &fixation_index_overrides {
+            for &f in overrides {
+                if !(f.is_finite() && (0.0..=1.0).contains(&f)) {
+                    return Err(PosteriorEngineConfigError::InvalidFixationIndex { got: f });
+                }
+            }
+        }
+        self.fixation_index_overrides = fixation_index_overrides;
+        Ok(self)
+    }
+
     /// Validating setter for `max_gq_phred` — finite, in
     /// `(GQ_PHRED_RANGE_MIN_EXCLUSIVE, GQ_PHRED_RANGE_MAX]`
     /// (i.e. `(10.0, 200.0]`).
