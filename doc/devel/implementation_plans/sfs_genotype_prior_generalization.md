@@ -48,13 +48,24 @@ between milestones.
 - **Deliverable:** the general random-mating prior, matching the biallelic result.
 
 ### Step G3 — `α` from θ
-- **Build:** `alpha_from_diversity(n_alleles, theta, ...) -> Vec<f64>` — `α_ref`
-  (reference weight) + `α_alt(a)` from θ (single ALT: `α_alt = f(θ)`; multiallelic:
-  split θ across ALTs). Calibrate `α_ref` / the θ scale so diploid-biallelic
-  matches the validated grid at the human default.
-- **Tests:** biallelic α reproduces the Step-B genotype prior within tolerance;
-  θ scales the variant mass; multiallelic split sums correctly.
-- **Deliverable:** the θ→α mapping; the biallelic prior reproduced from α.
+- **Decision (settled with owner 2026-07-04, "C + choice-2" thread — see arch
+  §9.2):** `α_ref = 1` (fixed; the value that makes the biallelic ratio → 2:1),
+  `α_alt(a) = θ̂ / (n_alleles − 1)` (measured diversity, split across ALTs). **No
+  calibration constant.** This is the clean population-genetics marginal
+  (`P(het)=θ`, `P(hom-alt)=θ/2`, monomorphic `1−3θ/2`); it deliberately does **not**
+  reproduce the old grid's inflated hom-ref weight (that 0.878 was an un-normalised
+  grid-sum artifact ~80× too high). The θ-independent 2:1 ratio holds at every
+  realistic diversity because `α_alt = θ̂` is always small.
+- **Build:** `alpha_from_diversity(n_alleles, theta) -> Vec<f64>` in `genetics.rs`,
+  returning `[1.0, θ/(k−1), …]`. The random-mating log-priors are then
+  `dirichlet_multinomial_log_priors(shape, alpha_from_diversity(…))` — reuses G2,
+  no separate invariant-mass machinery.
+- **Tests:** biallelic α gives the clean SFS marginals (het ≈ θ, hom-alt ≈ θ/2,
+  ratio → 2:1, θ-independent); the ratio stays ~2:1 even at diverse-organism θ;
+  multiallelic split sums to θ; θ scales the variant mass monotonically.
+- **Deliverable:** the θ→α mapping; the clean-marginal biallelic prior from α.
+- **Held in reserve (only if GIAB regresses):** an independent monomorphic-mass
+  term (the "C" separation) to lower the hom-ref weight without touching α_alt.
 
 **Checkpoint:** the general prior + α mapping exist and reproduce the biallelic
 win, no engine change yet. Pause for review.

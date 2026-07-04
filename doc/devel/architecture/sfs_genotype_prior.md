@@ -281,27 +281,57 @@ log P_random(g) = log_multinomial_coeff(g)
 ### 9.2 The SFS enters as the concentration `α`
 
 The site-frequency spectrum *is* a Dirichlet on allele frequency. The mapping,
-settled with the owner (tie `α_alt` to the estimated diversity):
+**settled with the owner 2026-07-04** (the "C + choice-2" thread), is deliberately
+simple:
 
-- **`α_alt(a) ∝ θ`** — the estimated cohort diversity ([`DiversityEstimate`],
-  already wired). A rare-alt SFS is a small `α_alt`; a diverse organism gets a
-  larger one, so the variant-vs-invariant balance is species-aware by
-  construction. For a multiallelic site split `θ` across the ALTs (e.g.
-  `α_alt(a) = θ / (n_alleles − 1)`) — a design detail to pin during
-  implementation.
-- **`α_ref ≈ 1`** — the reference weight (the invariant-site mass of §4b, in
-  Dirichlet form).
+- **`α_ref = 1`** — a fixed constant, not a calibration target. It is the value
+  that makes the biallelic het:hom-alt ratio `2·α_ref/(α_alt+1)` approach the
+  defensible **2:1** as `α_alt → 0`.
+- **`α_alt(a) = θ̂ / (n_alleles − 1)`** — the *measured* cohort diversity θ̂
+  ([`DiversityEstimate`]), split evenly across the ALT alleles (total alt
+  concentration = θ̂, independent of allele count). **No calibration constant.**
 
-This reproduces the biallelic win by construction: at diploid-biallelic the
-Dirichlet-multinomial het:hom-alt ratio is `2·α_ref / (α_alt + 1) ≈ 2:1` for
-`α_ref ≈ 1, α_alt → 0` — the same defensible 2:1, θ-independent in the ratio,
-θ-scaled in the variant mass. (The exact `α_ref` that best matches the validated
-grid's hom-ref weight is a calibration target for the GIAB re-run.)
+**Why this is exactly the clean population-genetics answer (choice 2).** Marginal­
+ising Hardy–Weinberg over the neutral SFS density `θ/x` gives the finite, exact
+per-individual marginals `P(het) = ∫2x(1−x)(θ/x)dx = θ`, `P(hom-alt) =
+∫x²(θ/x)dx = θ/2`, so the variant fraction is `3θ/2` and the monomorphic weight is
+`1 − 3θ/2` — spec §3's derivation, no grid, no cutoff. The Dirichlet-multinomial
+with `α_ref = 1, α_alt = θ̂` **reproduces these marginals to first order in θ**
+(at θ = 1e-3: hom-ref 0.99850, het 0.000998 ≈ θ, hom-alt 0.000500 ≈ θ/2). So the
+`α_ref = 1` reference weight *is* the monomorphic mass of §4b — but only because
+we adopt the correct variant fraction. No separate invariant-mass term is needed
+at the default.
+
+**The 2:1 ratio stays θ-independent at every realistic diversity**, because
+`α_alt = θ̂` is always small (even a very diverse organism at θ = 0.02 gives
+`α_alt = 0.02` → ratio 1.96 ≈ 2:1). This is what fixes the low-coverage het
+over-call regardless of species (spec §4a). The earlier worry that `α_alt ∝ θ`
+would drag the ratio anti-het only applied to a *large* proportionality constant
+(the discarded "match the grid's variant fraction" option); with the correct
+`α_alt = θ̂` it does not arise.
+
+**This intentionally does not reproduce the old grid's hom-ref weight (0.878).**
+That figure was an artifact — the grid summed `θ/x` over 200 points without the
+`1/200` spacing factor, inflating its variant fraction ~80× above the correct
+`3θ/2`. The grid still validated on GIAB because the genotype prior's variant
+fraction does not flow into QUAL/calling (that path uses the Beta pseudocounts,
+§5) and, at an already-called-variant site with reads, the 2:1 packaging is what
+decides the genotype. The new prior's stronger hom-ref weight (0.9985) is the
+genetically-correct genome-wide value; **GIAB is the gate** for whether it is too
+conservative at the very-low-coverage tail (a single alt read at a cohort-variant
+site).
+
+**Reserved knob (build only if GIAB regresses).** If the pure-marginal variant
+fraction proves too conservative at the low-coverage tail, the fix is the "C"
+separation held in reserve: an independent monomorphic-mass term on the
+all-reference genotype, sized from θ̂, so the hom-ref weight can be lowered
+*without* changing `α_alt` — keeping the 2:1 ratio intact. Not built at the
+default because `α_ref = 1` already supplies the correct monomorphic mass.
 
 **The Dirichlet pseudocounts become `α`.** `ref_pseudocount` / `snp_alt_pseudocount`
 are already a Dirichlet on allele frequency — today the engine plugs in their MAP
 estimate (the bug). The generalisation *marginalises* them, with `α_alt` sourced
-from θ rather than a fixed `0.01`.
+from the measured θ̂ rather than a fixed `0.01`.
 
 ### 9.3 Inbreeding `F` — reuse the Wright mixture already in the engine
 

@@ -168,6 +168,66 @@ pub fn dirichlet_multinomial_log_priors(
         .collect()
 }
 
+/// The reference-allele Dirichlet concentration `α_ref`. Fixed at `1`, the value
+/// that makes the biallelic-diploid het:hom-alt ratio `2·α_ref/(α_alt+1)`
+/// approach the defensible **2:1** as `α_alt → 0`. It doubles as the
+/// monomorphic-site weight (arch §9.2): with the small `α_alt = θ̂` from
+/// [`alpha_from_diversity`] the Dirichlet-multinomial's hom-ref probability comes
+/// out at the genetically-correct `1 − 3θ/2`, so no separate invariant mass is
+/// needed at the default.
+pub const ALPHA_REF: f64 = 1.0;
+
+/// A tiny positive floor for each ALT concentration, so the
+/// Dirichlet-multinomial's `lgamma(α_alt)` stays finite when the estimated
+/// diversity is exactly zero (a fully invariant cohort, or `--diversity 0`). It
+/// sits far below any real diversity (human `θ ≈ 1e-3`), so it never perturbs a
+/// genuine estimate; at `θ = 0` it yields an effectively-certain hom-ref prior,
+/// matching the biallelic grid path's `θ = 0` behaviour.
+pub const MIN_ALT_CONCENTRATION: f64 = 1e-12;
+
+/// The Dirichlet concentration `α = (α_ref, α_alt(1), …, α_alt(k−1))` for the SFS
+/// genotype prior at estimated diversity `theta` (`θ̂`).
+///
+/// - `α_ref = ALPHA_REF = 1`.
+/// - The total ALT concentration is `θ̂`, split evenly across the `n_alleles − 1`
+///   ALT alleles: `α_alt(a) = θ̂ / (n_alleles − 1)`, floored at
+///   [`MIN_ALT_CONCENTRATION`] so it stays strictly positive. Splitting keeps a
+///   site's total polymorphism `θ̂` independent of how many ALT alleles it
+///   carries.
+///
+/// Fed to [`dirichlet_multinomial_log_priors`], this yields the clean
+/// population-genetics marginals for a biallelic-diploid site (`F = 0`): `P(het)
+/// ≈ θ`, `P(hom-alt) ≈ θ/2`, monomorphic weight `≈ 1 − 3θ/2`, and a het:hom-alt
+/// ratio that stays `≈ 2:1` at every realistic diversity (because `θ̂` — hence
+/// `α_alt` — is always small). Per-sample inbreeding `F` is applied on top by the
+/// engine's Wright mixture, not here. See the SFS-prior architecture doc §9.2 for
+/// why this is the settled mapping (no calibration constant).
+///
+/// # Preconditions
+///
+/// `n_alleles >= 1` is a hard assertion (a zero-allele shape is impossible — every
+/// site has a reference allele — and would flow a wrong-length `α` into the
+/// Dirichlet-multinomial). A monomorphic shape (`n_alleles == 1`) has no ALT to
+/// carry diversity and returns `[ALPHA_REF]`. `theta` finite and `>= 0` is a
+/// `debug_assert` (a bad θ degrades the prior but cannot mis-shape `α`).
+pub fn alpha_from_diversity(n_alleles: usize, theta: f64) -> Vec<f64> {
+    assert!(n_alleles >= 1, "n_alleles must be >= 1");
+    debug_assert!(
+        theta.is_finite() && theta >= 0.0,
+        "theta must be finite and non-negative, got {theta}"
+    );
+
+    let n_alt = n_alleles - 1;
+    if n_alt == 0 {
+        return vec![ALPHA_REF];
+    }
+    let per_alt = (theta / n_alt as f64).max(MIN_ALT_CONCENTRATION);
+    let mut alpha = Vec::with_capacity(n_alleles);
+    alpha.push(ALPHA_REF);
+    alpha.resize(n_alleles, per_alt);
+    alpha
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +357,127 @@ mod tests {
             assert!((got[g] - want).abs() < 1e-12, "genotype {g}");
         }
         assert!((softmax(&got).iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    // ---- α from diversity θ (G3) ----
+
+    /// The biallelic-diploid genotype probabilities (F = 0) that
+    /// [`alpha_from_diversity`] + [`dirichlet_multinomial_log_priors`] produce at
+    /// diversity `theta`: `[P(hom-ref), P(het), P(hom-alt)]`.
+    fn biallelic_probs_from_theta(theta: f64) -> [f64; 3] {
+        let alpha = alpha_from_diversity(2, theta);
+        // AA, AB, BB with ln C(2;k) = 0, ln2, 0.
+        let counts = [2u32, 0, 1, 1, 0, 2];
+        let coeffs = [0.0, 2.0_f64.ln(), 0.0];
+        let logs = dirichlet_multinomial_log_priors(&counts, &coeffs, 2, &alpha);
+        let p = softmax(&logs);
+        [p[0], p[1], p[2]]
+    }
+
+    /// `alpha_from_diversity` sets `α_ref = 1` and splits `θ` across the ALTs:
+    /// biallelic → `[1, θ]`, triallelic → `[1, θ/2, θ/2]`.
+    #[test]
+    fn alpha_from_diversity_sets_ref_one_and_splits_theta() {
+        assert_eq!(alpha_from_diversity(2, 1e-3), vec![1.0, 1e-3]);
+        let tri = alpha_from_diversity(3, 2e-3);
+        assert_eq!(tri[0], 1.0);
+        assert!((tri[1] - 1e-3).abs() < 1e-18 && (tri[2] - 1e-3).abs() < 1e-18);
+        // Total ALT concentration is θ regardless of allele count.
+        assert!((tri[1] + tri[2] - 2e-3).abs() < 1e-15);
+    }
+
+    /// At the human default θ = 1e-3 the biallelic prior gives the clean SFS
+    /// marginals: het ≈ θ, hom-alt ≈ θ/2, monomorphic ≈ 1 − 3θ/2. This is the
+    /// settled "choice-2" behaviour — NOT the old grid's inflated hom-ref 0.878.
+    #[test]
+    fn alpha_from_diversity_reproduces_clean_sfs_marginals() {
+        let theta = 1e-3;
+        let [homref, het, homalt] = biallelic_probs_from_theta(theta);
+        assert!((het - theta).abs() < 5e-6, "het {het} vs θ {theta}");
+        assert!(
+            (homalt - theta / 2.0).abs() < 5e-6,
+            "homalt {homalt} vs θ/2"
+        );
+        assert!(
+            (homref - (1.0 - 1.5 * theta)).abs() < 5e-6,
+            "homref {homref} vs 1−3θ/2"
+        );
+    }
+
+    /// The het:hom-alt ratio stays ≈ 2:1 across the whole realistic diversity
+    /// range — the θ-independence spec §4a requires — because `α_alt = θ` is
+    /// always small (even a very diverse organism at θ = 0.02 stays near 2:1).
+    #[test]
+    fn alpha_from_diversity_ratio_is_two_to_one_across_theta() {
+        for &theta in &[1e-4, 1e-3, 2e-3, 1e-2, 2e-2] {
+            let [_, het, homalt] = biallelic_probs_from_theta(theta);
+            let ratio = het / homalt;
+            assert!(
+                (ratio - 2.0).abs() < 0.05,
+                "θ={theta}: ratio {ratio} not ≈ 2:1"
+            );
+        }
+    }
+
+    /// θ scales the variant mass monotonically: a more diverse cohort puts more
+    /// prior weight on carrying a variant (less on hom-ref).
+    #[test]
+    fn alpha_from_diversity_variant_mass_grows_with_theta() {
+        let variant = |theta: f64| {
+            let [_, het, homalt] = biallelic_probs_from_theta(theta);
+            het + homalt
+        };
+        assert!(variant(1e-4) < variant(1e-3));
+        assert!(variant(1e-3) < variant(1e-2));
+        // And tracks 3θ/2 at the human default.
+        assert!((variant(1e-3) - 1.5e-3).abs() < 1e-5);
+    }
+
+    /// Zero diversity floors `α_alt` at [`MIN_ALT_CONCENTRATION`] rather than
+    /// producing `α_alt = 0` (which would break the Dirichlet-multinomial's
+    /// `lgamma`), yielding an effectively-certain hom-ref prior.
+    #[test]
+    fn alpha_from_diversity_zero_theta_is_floored_and_homref() {
+        let alpha = alpha_from_diversity(2, 0.0);
+        assert_eq!(alpha[0], 1.0);
+        assert_eq!(alpha[1], MIN_ALT_CONCENTRATION);
+        let [homref, _, _] = biallelic_probs_from_theta(0.0);
+        assert!(homref > 0.999_999_999, "homref {homref} not ≈ 1");
+    }
+
+    /// A monomorphic shape (`n_alleles = 1`) has no ALT to carry diversity and
+    /// returns just `[α_ref]`.
+    #[test]
+    fn alpha_from_diversity_monomorphic_shape_is_ref_only() {
+        assert_eq!(alpha_from_diversity(1, 1e-3), vec![1.0]);
+    }
+
+    /// A legitimately tiny — but non-zero — diversity passes through unfloored:
+    /// `MIN_ALT_CONCENTRATION = 1e-12` sits far below any real cohort's θ, so a
+    /// low-diversity cohort at θ = 1e-8 keeps `α_alt = 1e-8`. Guards the doc
+    /// claim that the floor "never perturbs a genuine estimate".
+    #[test]
+    fn alpha_from_diversity_tiny_real_theta_is_not_floored() {
+        let alpha = alpha_from_diversity(2, 1e-8);
+        assert_eq!(alpha[1], 1e-8, "a real θ=1e-8 was clamped by the floor");
+        assert!(alpha[1] > MIN_ALT_CONCENTRATION);
+    }
+
+    /// A nonsensical θ > 1 (reachable via `--diversity`) is passed through as
+    /// `[1, θ]` rather than rejected — documents the map has no upper clamp (the
+    /// value precondition is only θ ≥ 0).
+    #[test]
+    fn alpha_from_diversity_theta_above_one_passes_through() {
+        assert_eq!(alpha_from_diversity(2, 3.0), vec![1.0, 3.0]);
+    }
+
+    /// A zero-allele shape is impossible and trips the hard assertion rather than
+    /// silently returning a wrong-length `α` (which would then mis-shape the
+    /// Dirichlet-multinomial).
+    #[test]
+    #[should_panic(expected = "n_alleles must be >= 1")]
+    fn alpha_from_diversity_panics_on_zero_alleles() {
+        alpha_from_diversity(0, 1e-3);
     }
 
     /// Haploid (`ploidy = 1`) is structurally distinct — each genotype carries a
