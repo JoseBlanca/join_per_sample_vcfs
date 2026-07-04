@@ -70,6 +70,13 @@ const CHROMOSOMES_PER_DIPLOID: u64 = 2;
 /// this is "copies per hom-alt genotype", that is "chromosomes per position".
 const ALT_COPIES_PER_HOM_ALT: u64 = 2;
 
+/// Default species-range fallback diversity `θ`, used when the cohort is too
+/// thin to estimate (see [`MIN_COPIES_FOR_ESTIMATE`]). A conservative,
+/// low-diversity value (~human nucleotide diversity); a user working with a more
+/// diverse organism should raise it. This is the weakly-informative prior the
+/// estimator falls back toward, not a hard default for the estimate itself.
+pub const DEFAULT_DIVERSITY_PRIOR: f64 = 1e-3;
+
 /// Minimum total confident alt-allele copies across the whole cohort for the
 /// diversity estimate to be trusted. Below this the sampling variance is too
 /// high — the relative standard error of a copy-count rate is roughly

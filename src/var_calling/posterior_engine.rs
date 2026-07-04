@@ -261,6 +261,20 @@ pub struct PosteriorEngineConfig {
     ///
     /// [`estimate_contamination`]: crate::var_calling::contamination_estimation::estimate_contamination
     contamination: Option<ContaminationEstimates>,
+
+    /// Precomputed per-sample biallelic-diploid genotype log-priors from the
+    /// SFS-marginalized prior (`[ln P(0/0), ln P(0/1), ln P(1/1)]` per sample,
+    /// cohort-length). `Some` → the engine uses this SFS-marginal prior in place
+    /// of the HWE(p̂) + Dirichlet genotype prior for **biallelic-diploid**
+    /// records (multiallelic / non-diploid records keep the HWE path — the SFS
+    /// prior's general-shape support is deferred). `None` → the HWE(p̂) prior for
+    /// every shape (the pre-SFS behaviour). Built once by the driver from the
+    /// cohort diversity θ and per-sample inbreeding F; see
+    /// [`crate::var_calling::sfs_prior`].
+    ///
+    /// **Private.** Set via
+    /// [`with_sfs_prior_tables`](Self::with_sfs_prior_tables).
+    sfs_prior_tables: Option<Vec<[f64; 3]>>,
 }
 
 impl Default for PosteriorEngineConfig {
@@ -300,6 +314,7 @@ impl PosteriorEngineConfig {
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             approximate_posterior_calculation: false,
             contamination: None,
+            sfs_prior_tables: None,
         }
     }
 
@@ -445,6 +460,29 @@ impl PosteriorEngineConfig {
         self.contamination = contamination;
         Ok(self)
     }
+
+    /// Validating setter for the private `sfs_prior_tables` field. Each entry
+    /// is one sample's biallelic-diploid genotype log-priors
+    /// `[ln P(0/0), ln P(0/1), ln P(1/1)]`; `−∞` is allowed (a floored genotype
+    /// at full inbreeding) but `NaN`/`+∞` are rejected as a wiring error. The
+    /// cohort-length invariant (`len == n_samples`) is checked per record in the
+    /// engine, where the sample count is known.
+    pub fn with_sfs_prior_tables(
+        mut self,
+        sfs_prior_tables: Option<Vec<[f64; 3]>>,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        if let Some(tables) = &sfs_prior_tables {
+            for row in tables {
+                for &v in row {
+                    if v.is_nan() || v == f64::INFINITY {
+                        return Err(PosteriorEngineConfigError::InvalidSfsPriorTable { got: v });
+                    }
+                }
+            }
+        }
+        self.sfs_prior_tables = sfs_prior_tables;
+        Ok(self)
+    }
 }
 
 /// Shared validator for the four `*_pseudocount` setters. Keeps the
@@ -494,6 +532,12 @@ pub enum PosteriorEngineConfigError {
         "max_gq_phred must be finite and in ({GQ_PHRED_RANGE_MIN_EXCLUSIVE}, {GQ_PHRED_RANGE_MAX}], got {got}"
     )]
     InvalidMaxGqPhred { got: f64 },
+
+    /// An `sfs_prior_tables` entry was `NaN` or `+∞`. The SFS genotype prior's
+    /// log-priors are finite or `−∞` (a floored genotype); `NaN`/`+∞` signal a
+    /// construction bug upstream.
+    #[error("sfs_prior_tables contained a non-finite log-prior (NaN or +inf), got {got}")]
+    InvalidSfsPriorTable { got: f64 },
 }
 
 /// Why a posterior calculation hit an unrecoverable value. Surfaced
@@ -671,6 +715,19 @@ pub enum PosteriorEngineError {
     ContaminationCohortSizeMismatch {
         locus: RecordLocus,
         estimates_n_samples: usize,
+        record_samples: usize,
+    },
+
+    /// `PosteriorEngineConfig::sfs_prior_tables` length did not match the
+    /// upstream record's `n_samples`. The precomputed per-sample genotype prior
+    /// tables were built for a different cohort than the one driving Stage 5.
+    #[error(
+        "sfs_prior_tables cohort size {table_samples} does not match \
+         record sample count {record_samples} at {locus}"
+    )]
+    SfsPriorTableCohortSizeMismatch {
+        locus: RecordLocus,
+        table_samples: usize,
         record_samples: usize,
     },
 }
@@ -1794,6 +1851,13 @@ struct EmContext<'a> {
     /// `doc/devel/reports/reviews/perf_posterior_engine_2026-05-18.md`.
     homogeneous_fixation: bool,
     compound_pseudocount: f64,
+    /// Per-sample biallelic-diploid genotype log-priors from the SFS-marginal
+    /// prior, borrowed from `config.sfs_prior_tables`. `Some` **only** when the
+    /// prior is configured *and* this record is biallelic-diploid
+    /// (`ploidy == 2, n_alleles == 2`); the E-step then reads the fixed
+    /// per-sample table instead of building the HWE(p̂) prior. `None` routes to
+    /// the HWE(p̂) path (multiallelic/non-diploid records, or the prior off).
+    sfs_prior_tables: Option<&'a [[f64; 3]]>,
 }
 
 /// Per-engine scratch buffers reused across every record.
@@ -2294,6 +2358,26 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
         log_likelihoods
     };
 
+    // SFS-marginal genotype prior: used only for biallelic-diploid records
+    // (`ploidy == 2, n_alleles == 2`). For those, the per-sample genotype prior
+    // is the fixed table `config.sfs_prior_tables[sample]`; the HWE(p̂) path is
+    // bypassed. Other shapes keep the HWE path even when the prior is
+    // configured. The cohort-length invariant is checked here where `n_samples`
+    // is known.
+    let sfs_prior_tables: Option<&[[f64; 3]]> = match config.sfs_prior_tables.as_deref() {
+        Some(tables) if ploidy == 2 && n_alleles == 2 => {
+            if tables.len() != n_samples {
+                return Err(PosteriorEngineError::SfsPriorTableCohortSizeMismatch {
+                    locus,
+                    table_samples: tables.len(),
+                    record_samples: n_samples,
+                });
+            }
+            Some(tables)
+        }
+        _ => None,
+    };
+
     let ctx = EmContext {
         locus,
         n_samples,
@@ -2303,6 +2387,7 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
         shape: &shape,
         homogeneous_fixation,
         compound_pseudocount: config.compound_alt_pseudocount,
+        sfs_prior_tables,
     };
 
     // EM initial point: uniform allele frequencies and uniform
@@ -2323,8 +2408,11 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
     // contents.
     //
     // `M::HAS_LANE_4` is a compile-time const so the unused branch is
-    // dead-code-eliminated after monomorphisation.
-    if M::HAS_LANE_4 {
+    // dead-code-eliminated after monomorphisation. The SFS-marginal prior takes
+    // its own biallelic-diploid E-step (fixed per-sample table, no p̂).
+    if ctx.sfs_prior_tables.is_some() {
+        e_step_sfs_biallelic(ctx, math, ll_for_em, scratch)?;
+    } else if M::HAS_LANE_4 {
         e_step_simd(ctx, math, ll_for_em, scratch)?;
     } else {
         e_step(ctx, math, ll_for_em, scratch)?;
@@ -2459,7 +2547,9 @@ fn run_em_loop<M: MathBackend>(
     while iterations < max_iterations {
         iterations += 1;
 
-        if M::HAS_LANE_4 {
+        if ctx.sfs_prior_tables.is_some() {
+            e_step_sfs_biallelic(ctx, math, log_likelihoods, scratch)?;
+        } else if M::HAS_LANE_4 {
             e_step_simd(ctx, math, log_likelihoods, scratch)?;
         } else {
             e_step(ctx, math, log_likelihoods, scratch)?;
@@ -2601,6 +2691,66 @@ fn e_step<M: MathBackend>(
         // and f̂_C strictly positive, so the only realistic trigger is
         // a likelihood matrix that is all `-∞` — itself a malformed
         // upstream record. Surface it loudly.
+        if !log_z.is_finite() {
+            return Err(PosteriorEngineError::NonFinitePosterior {
+                locus: ctx.locus,
+                sample_idx,
+                genotype_idx: None,
+                kind: classify_nonfinite(log_z),
+            });
+        }
+
+        let post_base = sample_idx * n_genotypes;
+        for g_idx in 0..n_genotypes {
+            let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
+            if !posterior.is_finite() {
+                return Err(PosteriorEngineError::NonFinitePosterior {
+                    locus: ctx.locus,
+                    sample_idx,
+                    genotype_idx: Some(g_idx),
+                    kind: classify_nonfinite(posterior),
+                });
+            }
+            scratch.posteriors[post_base + g_idx] = posterior;
+        }
+    }
+
+    Ok(())
+}
+
+/// E-step for the biallelic-diploid **SFS-marginal** genotype prior.
+///
+/// The per-sample genotype log-prior is a fixed table
+/// `[ln P(0/0), ln P(0/1), ln P(1/1)]` (from `ctx.sfs_prior_tables`) that does
+/// **not** depend on the EM's allele-frequency estimate `p̂` — so the posterior
+/// is just `likelihood × prior`, normalised, with no HWE(p̂) construction. Only
+/// reached when `ctx.sfs_prior_tables` is `Some`, which the caller sets only for
+/// `ploidy == 2, n_alleles == 2` (three genotypes in canonical order
+/// `0/0, 0/1, 1/1`, matching the table's index order).
+fn e_step_sfs_biallelic<M: MathBackend>(
+    ctx: EmContext<'_>,
+    math: &M,
+    log_likelihoods: &[f64],
+    scratch: &mut RecordScratch,
+) -> Result<(), PosteriorEngineError> {
+    let tables = ctx
+        .sfs_prior_tables
+        .expect("e_step_sfs_biallelic called without sfs_prior_tables");
+    let n_genotypes = ctx.n_genotypes;
+    debug_assert_eq!(
+        n_genotypes, 3,
+        "SFS-marginal E-step is biallelic-diploid only"
+    );
+    debug_assert_eq!(tables.len(), ctx.n_samples);
+
+    for sample_idx in 0..ctx.n_samples {
+        let ll_row = &log_likelihoods[sample_idx * n_genotypes..(sample_idx + 1) * n_genotypes];
+        let prior = &tables[sample_idx];
+        for g_idx in 0..n_genotypes {
+            scratch.log_post_unnorm[g_idx] = ll_row[g_idx] + prior[g_idx];
+        }
+
+        let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm[..n_genotypes]);
         if !log_z.is_finite() {
             return Err(PosteriorEngineError::NonFinitePosterior {
                 locus: ctx.locus,
@@ -3701,6 +3851,62 @@ mod tests {
         let mut out = engine_for(record);
         assert_eq!(out.len(), 1);
         out.remove(0).expect("posterior record")
+    }
+
+    /// End-to-end wiring check for the SFS-marginal genotype prior: a single
+    /// sample at a biallelic-diploid site whose likelihood favours hom-alt ~4:1
+    /// (the "0 ref, 2 alt reads" shape). With the default HWE(p̂) + Dirichlet
+    /// prior the n=1 reference pseudocount pulls the call to het (the bug); with
+    /// the SFS prior's 2:1 het:hom-alt table the reads win and it calls hom-alt.
+    #[test]
+    fn sfs_prior_flips_single_sample_low_coverage_homalt_call() {
+        use crate::var_calling::sfs_prior::{
+            DEFAULT_INVARIANT_SITE_MASS, DEFAULT_SFS_GRID_POINTS, SfsGenotypePrior,
+        };
+        let eps = 0.01_f64;
+        // genotype log-likelihoods [0/0, 0/1, 1/1] for "both reads alt".
+        let likelihoods = vec![vec![
+            (eps * eps).ln(),
+            0.25_f64.ln(),
+            ((1.0 - eps) * (1.0 - eps)).ln(),
+        ]];
+        let record = || merged_record_simple(1, 100, vec![b"A", b"G"], 2, likelihoods.clone());
+
+        // Default HWE(p̂)+Dirichlet prior → het (the low-coverage over-call).
+        assert_eq!(single_ok(record()).best_genotype, vec![1]);
+
+        // SFS-marginal prior (het:hom-alt 2:1 at F=0) → hom-alt (correct).
+        let table =
+            SfsGenotypePrior::new(1e-3, DEFAULT_INVARIANT_SITE_MASS, DEFAULT_SFS_GRID_POINTS)
+                .biallelic_diploid_log_priors(0.0);
+        let cfg = PosteriorEngineConfig::with_project_defaults()
+            .with_sfs_prior_tables(Some(vec![table]))
+            .unwrap();
+        let out = engine_for_with_config(record(), cfg);
+        assert_eq!(out[0].as_ref().unwrap().best_genotype, vec![2]);
+    }
+
+    /// The SFS prior is bypassed for non-biallelic-diploid records even when
+    /// configured: a triallelic record still genotypes via the HWE path (the
+    /// table only covers 3 genotypes, so a cohort-size/shape mismatch must not
+    /// occur — the engine routes multiallelic to HWE regardless).
+    #[test]
+    fn sfs_prior_ignored_for_multiallelic_record() {
+        use crate::var_calling::sfs_prior::{
+            DEFAULT_INVARIANT_SITE_MASS, DEFAULT_SFS_GRID_POINTS, SfsGenotypePrior,
+        };
+        // Triallelic diploid, one sample: 6 genotypes.
+        let likelihoods = vec![vec![-10.0, -1.0, -10.0, -10.0, -10.0, -10.0]];
+        let record = merged_record_simple(1, 100, vec![b"A", b"G", b"T"], 2, likelihoods);
+        let table =
+            SfsGenotypePrior::new(1e-3, DEFAULT_INVARIANT_SITE_MASS, DEFAULT_SFS_GRID_POINTS)
+                .biallelic_diploid_log_priors(0.0);
+        let cfg = PosteriorEngineConfig::with_project_defaults()
+            .with_sfs_prior_tables(Some(vec![table]))
+            .unwrap();
+        // Must not panic or error on the shape mismatch — routed to the HWE path.
+        let out = engine_for_with_config(record, cfg);
+        assert!(out[0].is_ok());
     }
 
     /// Proptest-friendly variant of [`single_ok`]: returns the engine's
