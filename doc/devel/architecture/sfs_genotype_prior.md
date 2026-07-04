@@ -246,6 +246,114 @@ All recorded in the VCF header for provenance.
 
 ---
 
+## 9. Generalizing to all genotype shapes — the Dirichlet-multinomial prior
+
+**Status:** design settled 2026-07-04 (resolves the §7.3 open item). Implemented
+biallelic-diploid first (`SfsGenotypePrior` grid + `e_step_sfs_biallelic`,
+GIAB-validated: 5× SNP concordance 83.6→94.6, zero precision/recall cost). This
+section is the **next phase** — generalize to arbitrary `(ploidy, n_alleles)` and
+**delete the HWE(p̂) + Dirichlet plug-in prior entirely**. Its own implementation
+plan: [../implementation_plans/sfs_genotype_prior_generalization.md](../implementation_plans/sfs_genotype_prior_generalization.md).
+
+### 9.1 Why a closed form, not a grid
+
+The biallelic grid (integrate the Wright genotype prior over a `θ/p` frequency
+grid) does not generalise: a multiallelic site's frequency is a point on the
+`(k−1)`-simplex, and a grid over a simplex explodes with the number of alleles;
+polyploidy needs the general Wright formula too. There is a closed form instead.
+
+**Marginalising the multinomial genotype prior over a Dirichlet frequency prior
+is the Dirichlet-multinomial.** For a genotype `g` with allele-count vector
+`k(g)` (how many of each allele, summing to the ploidy `m`) at concentration
+`α = (α_0, …, α_{k−1})` (`α_0` = REF):
+
+```text
+log P_random(g) = log_multinomial_coeff(g)
+                + Σ_a [ lgamma(α_a + k_a(g)) − lgamma(α_a) ]
+                − [ lgamma(Σα + m) − lgamma(Σα) ]      ← genotype-independent, cancels in normalisation
+```
+
+`log_multinomial_coeff(g)` and `k(g)` are exactly what the engine's
+[`GenotypeShape`] already precomputes (`log_multinomial_coeffs`,
+`genotype_allele_counts`) for every `(ploidy, n_alleles)`. So the general prior is
+`lgamma` over data the engine already has — fast, exact, any shape.
+
+### 9.2 The SFS enters as the concentration `α`
+
+The site-frequency spectrum *is* a Dirichlet on allele frequency. The mapping,
+settled with the owner (tie `α_alt` to the estimated diversity):
+
+- **`α_alt(a) ∝ θ`** — the estimated cohort diversity ([`DiversityEstimate`],
+  already wired). A rare-alt SFS is a small `α_alt`; a diverse organism gets a
+  larger one, so the variant-vs-invariant balance is species-aware by
+  construction. For a multiallelic site split `θ` across the ALTs (e.g.
+  `α_alt(a) = θ / (n_alleles − 1)`) — a design detail to pin during
+  implementation.
+- **`α_ref ≈ 1`** — the reference weight (the invariant-site mass of §4b, in
+  Dirichlet form).
+
+This reproduces the biallelic win by construction: at diploid-biallelic the
+Dirichlet-multinomial het:hom-alt ratio is `2·α_ref / (α_alt + 1) ≈ 2:1` for
+`α_ref ≈ 1, α_alt → 0` — the same defensible 2:1, θ-independent in the ratio,
+θ-scaled in the variant mass. (The exact `α_ref` that best matches the validated
+grid's hom-ref weight is a calibration target for the GIAB re-run.)
+
+**The Dirichlet pseudocounts become `α`.** `ref_pseudocount` / `snp_alt_pseudocount`
+are already a Dirichlet on allele frequency — today the engine plugs in their MAP
+estimate (the bug). The generalisation *marginalises* them, with `α_alt` sourced
+from θ rather than a fixed `0.01`.
+
+### 9.3 Inbreeding `F` — reuse the Wright mixture already in the engine
+
+Wright's model is `P(g) = (1−F)·P_random(g) + F·P_IBD(g)`, where a fully-IBD
+individual is homozygous for a single allele drawn at its marginal frequency.
+This is **exactly** the mixture `fill_log_prior_per_g_homogeneous` already
+computes (`log_sum_exp_2` of an independent term and an IBD homozygote term). The
+generalisation keeps that structure verbatim and only swaps the two inputs:
+
+- independent term: `log P_random(g)` (the Dirichlet-multinomial, §9.1) instead of
+  the plug-in `Σ_a k_a(g)·log p̂_a`;
+- IBD marginal frequency for allele `a`: `log(α_a / Σα)` instead of `log p̂_a`.
+
+So `F` works cleanly at any ploidy — load-bearing for the inbred plant-cohort
+target — with no new IBD machinery.
+
+### 9.4 Engine integration and what gets deleted
+
+- **`fill_log_indep_per_g`**: change the per-genotype independent term from
+  `Σ k_a·log_p_effective[a]` to the Dirichlet-multinomial `lgamma` form. The
+  Wright-`F` wrapper (`fill_log_prior_per_g_homogeneous` / the heterogeneous
+  branch) is unchanged except that `log_p_effective[a]` now holds `log(α_a/Σα)`.
+- **Applies to every shape** → the biallelic special case
+  (`e_step_sfs_biallelic`, `SfsGenotypePrior` grid, `config.sfs_prior_tables`, the
+  `EmContext`/routing added for it) is **removed**; the standard `e_step` /
+  `e_step_simd` now carry the SFS prior for all records.
+- **Delete the plug-in HWE genotype prior**: the genotype prior no longer reads
+  the EM `p̂`. Keep `m_step_p_hat` **only** if AF (`INFO/AF`) reporting still wants
+  the frequency estimate; otherwise drop it too. The `ref_pseudocount` /
+  `snp_alt_pseudocount` CLI knobs are replaced by the θ-derived `α` (retire or
+  repurpose them).
+- **Open details to settle in implementation:** (a) **compound alleles** — the
+  chain-linked `f̂_C` path substitutes a cohort frequency for `p̂[compound]`; give
+  compound alleles their own `α_compound` in the Dirichlet-multinomial (or keep
+  the `f̂_C` estimate feeding `α_compound`). (b) **`lgamma`** — Rust `std` has no
+  `lgamma`; the crate has `ln_factorial` (integer only). Non-integer `α` needs a
+  real `lgamma` (e.g. `libm`/`statrs`, or a vendored Lanczos approximation) — a
+  small dependency decision. (c) the exact `α_ref` and `θ→α_alt` scale (§9.2),
+  fixed by the GIAB re-validation.
+
+### 9.5 Validation
+
+The biallelic numbers shift slightly (the hom-ref weight is computed differently
+from the grid), so the GIAB per-sample panel (SNP GT concordance +
+precision/recall/FP) is re-run as the gate — the 2:1 ratio is preserved by
+construction, but the 94.6 % needs re-confirming. New synthetic tests cover the
+shapes GIAB does not exercise: **multiallelic diploid** and **polyploid**
+(biallelic + multiallelic), each checking the Dirichlet-multinomial against a
+hand-computed value and the `F`-mixture limit (`F=0` random, `F=1` homozygotes).
+
+---
+
 ## 8. What this does not touch
 
 - **Indels.** The indel genotype errors are upstream allele mis-assignment in
