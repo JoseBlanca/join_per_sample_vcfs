@@ -73,6 +73,11 @@ clap = { version = "4", features = ["derive"] }
 # producer→caller (1→W) hand-off (src/var_calling_new/pipeline.rs).
 crossbeam-channel = "0.5"
 dhat = { version = "0.3", optional = true }
+# libm: `lgamma` for the SFS genotype prior's Dirichlet-multinomial log-priors
+# (src/genetics.rs). Rust std has no log-gamma and the crate's `ln_factorial` is
+# integer-only; the prior's concentration `α` is non-integer. libm is the
+# rust-lang port of musl's libm — zero transitive deps, exact to f64 precision.
+libm = "0.2"
 md-5 = "0.11"
 mimalloc = { version = "0.1", default-features = false, optional = true }
 # noodles-bam and noodles-csi are promoted from transitive (via

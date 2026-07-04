@@ -16,6 +16,29 @@
 /// probability and never bites on the default grids.
 pub const PROBABILITY_FLOOR: f64 = 1e-300;
 
+/// Natural log of the gamma function, `ln Γ(x)`, for `x > 0`.
+///
+/// The Dirichlet-multinomial genotype prior needs `ln Γ` at **non-integer**
+/// arguments (the concentration `α` is derived from the continuous diversity
+/// `θ`), which the integer-only factorial helpers cannot supply. This is a thin
+/// wrapper over `libm::lgamma` (the rust-lang port of musl's libm), kept here so
+/// the rest of the caller depends on one project-owned name and the accuracy
+/// tests live beside it.
+///
+/// Only ever called with `x > 0` in this crate (Dirichlet concentrations and
+/// `α + k` are strictly positive). `libm::lgamma` is defined for other inputs,
+/// but this wrapper documents the contract the callers actually rely on.
+///
+/// The `x > 0` precondition is checked with a debug assertion (zero-cost in
+/// release): `libm::lgamma` does not panic on a non-positive argument, so a
+/// wiring regression that let `α` reach `0` or go negative would otherwise
+/// silently produce a corrupt log-prior. The bare `libm` call in release keeps
+/// the hot path allocation- and branch-free.
+pub fn lgamma(x: f64) -> f64 {
+    debug_assert!(x > 0.0, "lgamma requires x > 0, got {x}");
+    libm::lgamma(x)
+}
+
 /// The `i`-th of `n` points on the inclusive linear grid `[lo, hi]`. `n <= 1`
 /// yields the midpoint (a degenerate grid still returns a usable point).
 pub fn linear_grid_point(i: usize, n: usize, lo: f64, hi: f64) -> f64 {
@@ -62,6 +85,62 @@ mod tests {
         assert_eq!(linear_grid_point(0, 1, 0.2, 0.8), 0.5);
         assert_eq!(linear_grid_point(0, 0, 0.2, 0.8), 0.5);
         assert_eq!(sfs_grid_point(0, 1, 0.01), 0.5);
+    }
+
+    /// `lgamma` reproduces the log-factorial identity `ln Γ(n+1) = ln n!` at
+    /// integer arguments and the classic `ln Γ(1/2) = ln √π` at a non-integer
+    /// one — the case the integer factorial helpers cannot cover.
+    #[test]
+    fn lgamma_matches_known_values() {
+        // ln Γ(1) = ln 0! = 0, ln Γ(2) = ln 1! = 0.
+        assert!(lgamma(1.0).abs() < 1e-12);
+        assert!(lgamma(2.0).abs() < 1e-12);
+        // ln Γ(n+1) = ln n! for a few n.
+        for (n, fact) in [(3u32, 6.0), (5, 120.0), (6, 720.0)] {
+            let got = lgamma(n as f64 + 1.0);
+            assert!(
+                (got - (fact as f64).ln()).abs() < 1e-10,
+                "lgamma({}) = {got}, want ln {fact}",
+                n + 1
+            );
+        }
+        // Half-integer absolute anchors — closed forms with √π, so a shared
+        // systematic error (which the relative recurrence test cannot see)
+        // would show up here.
+        let half_ln_pi = std::f64::consts::PI.ln() / 2.0;
+        // ln Γ(1/2) = ln √π.
+        assert!((lgamma(0.5) - half_ln_pi).abs() < 1e-12, "Γ(1/2)");
+        // ln Γ(3/2) = ½ln π − ln 2.
+        assert!(
+            (lgamma(1.5) - (half_ln_pi - 2.0_f64.ln())).abs() < 1e-12,
+            "Γ(3/2) = {}",
+            lgamma(1.5)
+        );
+        // ln Γ(5/2) = ln(3/4) + ½ln π.
+        assert!(
+            (lgamma(2.5) - ((3.0_f64 / 4.0).ln() + half_ln_pi)).abs() < 1e-12,
+            "Γ(5/2) = {}",
+            lgamma(2.5)
+        );
+    }
+
+    /// The `x > 0` contract is enforced in debug builds: a non-positive argument
+    /// trips the debug assertion rather than silently returning a corrupt value.
+    #[test]
+    #[should_panic(expected = "lgamma requires x > 0")]
+    fn lgamma_panics_on_non_positive_in_debug() {
+        lgamma(0.0);
+    }
+
+    /// `lgamma` satisfies the recurrence `ln Γ(x+1) = ln x + ln Γ(x)` at the
+    /// small non-integer arguments the prior actually evaluates (`α ≈ θ`, small).
+    #[test]
+    fn lgamma_satisfies_recurrence_at_small_args() {
+        for &x in &[1e-3, 0.01, 0.3, 1.7] {
+            let lhs = lgamma(x + 1.0);
+            let rhs = x.ln() + lgamma(x);
+            assert!((lhs - rhs).abs() < 1e-10, "x={x}: {lhs} vs {rhs}");
+        }
     }
 
     /// The Wright genotype priors are a proper distribution: `hom-ref + het +
