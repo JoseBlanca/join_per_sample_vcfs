@@ -65,6 +65,9 @@ pub mod vcf_writer;
 // Reads the per-sample `.psp` summaries to estimate cohort diversity θ and
 // per-sample inbreeding F for the SFS genotype prior.
 pub mod diversity;
+// The SFS-marginalized Hardy–Weinberg genotype prior built from those
+// hyperparameters — the fix for the single-sample low-coverage het over-call.
+pub mod sfs_prior;
 
 /// Default `--min-qual` (phred) emission gate (CLI default).
 pub const DEFAULT_MIN_QUAL_PHRED: f64 = 30.0;
