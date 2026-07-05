@@ -1,11 +1,12 @@
 //! Shared population-genetics primitives.
 //!
 //! Small, pure building blocks used by more than one part of the caller: the
-//! **Wright inbreeding-adjusted Hardy–Weinberg genotype priors** and the
-//! **site-frequency-spectrum frequency grid** they are evaluated on. Both the
-//! hidden-paralog filter (`crate::paralog`) and the SFS genotype prior
-//! (`crate::var_calling::sfs_prior`) need the same maths — keeping one copy here
-//! means the two cannot drift.
+//! **Wright inbreeding-adjusted Hardy–Weinberg genotype priors**, the
+//! **site-frequency-spectrum frequency grid**, and the **Dirichlet-multinomial**
+//! genotype prior with its `α`-from-`θ` mapping. Both the hidden-paralog filter
+//! (`crate::paralog`) and the SFS genotype prior in the posterior engine
+//! (`crate::var_calling::posterior_engine`) build on these — keeping one copy
+//! here means they cannot drift.
 //!
 //! These functions moved out of `crate::paralog::locus_score` verbatim (same
 //! floating-point operations, same order, same constants) so the paralog

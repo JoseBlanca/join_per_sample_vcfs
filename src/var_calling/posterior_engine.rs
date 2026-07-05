@@ -139,12 +139,15 @@ pub const DEFAULT_COMPOUND_ALT_PSEUDOCOUNT: f64 = 0.001;
 pub const DEFAULT_INBREEDING_COEFFICIENT: f64 = 0.0;
 
 /// Default cohort nucleotide diversity `θ̂` for the Dirichlet-multinomial SFS
-/// genotype prior — a conservative human-scale value. Used by
-/// [`PosteriorEngineConfig::with_project_defaults`] for callers (and tests) that
-/// do not estimate `θ̂` from the data; the driver overrides it with the value
-/// from [`crate::var_calling::diversity::DiversityEstimate`] (or that module's
+/// genotype prior. Used by [`PosteriorEngineConfig::with_project_defaults`] for
+/// callers (and tests) that do not estimate `θ̂` from the data; the driver
+/// overrides it with the value from
+/// [`crate::var_calling::diversity::DiversityEstimate`] (or that module's
 /// `DEFAULT_DIVERSITY_PRIOR` fallback when the `.psp` summaries are absent).
-pub const DEFAULT_NUCLEOTIDE_DIVERSITY: f64 = 1e-3;
+/// Aliased to `DEFAULT_DIVERSITY_PRIOR` so the two species-range defaults stay a
+/// single source of truth.
+pub const DEFAULT_NUCLEOTIDE_DIVERSITY: f64 =
+    crate::var_calling::diversity::DEFAULT_DIVERSITY_PRIOR;
 
 /// Default Phred cap on per-sample GQ. Matches the GATK and bcftools
 /// convention (`GQ` capped at 99) so downstream tooling sees a
@@ -2283,12 +2286,13 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
 
     // SFS genotype prior (Dirichlet-multinomial): derive this record's
     // concentration α = [1, θ̂/(n_alleles−1), …] (the in-place equivalent of
-    // `crate::genetics::alpha_from_diversity`, avoiding a per-record alloc) plus
-    // the two record-static tables the E-step reads: `lgamma(α_a)` (the
-    // Dirichlet-multinomial independent-term baseline, in `lgamma_alpha`) and the
-    // IBD marginal allele log-frequency `log(α_a/Σα)` (kept in `log_p_effective`,
-    // which the Wright-`F` mixture consumes in place of `log p̂_a`). All three are
-    // p̂-independent, so they are filled once here rather than per EM iteration.
+    // `crate::genetics::alpha_from_diversity`, avoiding a per-record alloc) into
+    // `alpha`, plus the two derived record-static tables the E-step reads:
+    // `lgamma(α_a)` (the Dirichlet-multinomial independent-term baseline, in
+    // `lgamma_alpha`) and the IBD marginal allele log-frequency `log(α_a/Σα)`
+    // (kept in `log_p_effective`, which the Wright-`F` mixture consumes in place
+    // of `log p̂_a`). All three buffers are p̂-independent, so they are filled once
+    // here rather than per EM iteration.
     // Compound alleles are treated as ordinary rare ALTs — they take the same
     // θ̂/(n_alleles−1) share; only the likelihood (already baked upstream) and AF
     // reporting distinguish them.
@@ -3935,6 +3939,44 @@ mod tests {
             assert!(
                 (a - b).abs() < 1e-4,
                 "SIMD DM diverged from scalar: {a} vs {b}"
+            );
+        }
+        assert_eq!(scalar.best_genotype, simd.best_genotype);
+    }
+
+    /// Same SIMD-vs-scalar parity as above but under **heterogeneous** per-sample
+    /// inbreeding, so the SIMD batch loop takes its per-cell IBD branch — the one
+    /// that reads the now-record-static `log_p_effective` (the DM's `log(α_a/Σα)`)
+    /// via `log_sum_exp_2_x4`. The homogeneous case above short-circuits that term
+    /// (`F = 0 ⇒ log_f = −∞`), so this is what actually exercises the SIMD read of
+    /// the α-based frequency after the per-iteration fill loop was deleted.
+    #[test]
+    fn dirichlet_prior_simd_matches_scalar_under_heterogeneous_inbreeding() {
+        let flat = vec![vec![0.0_f64; 3]; 5]; // 5 samples → batch of 4 + 1 tail
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, flat);
+        let cfg = || {
+            let mut c = PosteriorEngineConfig::with_project_defaults()
+                .with_nucleotide_diversity(5e-3)
+                .unwrap();
+            // Distinct per-sample F → heterogeneous path, differing across the
+            // 4-lane batch and into the scalar tail.
+            c.fixation_index_overrides = Some(vec![0.0, 0.5, 0.9, 0.2, 0.7]);
+            c
+        };
+        let mut scalar = engine_for_with_config(record.clone(), cfg());
+        let scalar = scalar.remove(0).expect("scalar posterior");
+        let simd_upstream = std::iter::once(Ok::<_, PerGroupMergerError>(record));
+        let mut simd: Vec<_> = PosteriorEngine::with_math_backend(
+            simd_upstream,
+            cfg(),
+            super::backends::InterpUnivariateSimdMath,
+        )
+        .collect();
+        let simd = simd.remove(0).expect("simd posterior");
+        for (a, b) in scalar.posteriors.iter().zip(&simd.posteriors) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "SIMD DM (heterogeneous F) diverged from scalar: {a} vs {b}"
             );
         }
         assert_eq!(scalar.best_genotype, simd.best_genotype);
