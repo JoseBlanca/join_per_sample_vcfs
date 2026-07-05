@@ -118,6 +118,51 @@ win, no engine change yet. Pause for review.
 
 ---
 
+## Milestone 4 — empirical-Bayes large-cohort sharpening (deferred, owner-approved 2026-07-05)
+
+**Why.** The DM prior (G4/G5) is `p̂`-independent — `α` fixed from θ — so it is the
+*species-only* / small-cohort marginal. That fixes the single-sample low-coverage
+over-call (GIAB-validated) but drops the plug-in's **cohort strength-borrowing**:
+`N` samples with weak-but-consistent het evidence are each judged alone against the
+rare-allele prior → conservative hom-ref instead of het (site still emitted as a
+variant; only the low-depth per-sample genotype is conservative). This is spec §4a's
+large-cohort regime + §7.2's open item, surfaced by the ignored integration test
+`cohort_evidence_overcomes_rare_allele_prior_when_all_samples_agree`.
+
+**Approach (settled with the owner — the prior→posterior idea).** The SFS is a
+Dirichlet *prior* on the site's allele frequency; the cohort reads update it to a
+*posterior*; the per-sample genotype prior marginalises over that posterior.
+Because the Dirichlet is conjugate to the multinomial, the update is closed-form
+and reuses the existing DM primitive:
+
+```text
+species prior:  α_species = alpha_from_diversity(n_alleles, θ̂)     ([1, θ̂/(k−1), …])
+cohort update:  α' = α_species + E[cohort allele copies]           (the EM's expected_counts)
+genotype prior: dirichlet_multinomial_log_priors(shape, α')        (same G2 formula, α → α')
+```
+
+- Few samples → `E[counts]` small → `α' ≈ α_species` → single-sample fix intact.
+- Large cohort agreeing → `E[counts]` dominates → prior sharpens toward the cohort
+  frequency → strength-borrowing recovered. Interpolates automatically.
+
+**The real work (not the one-line α swap):**
+- The prior re-couples to the EM state (`α'` refreshes each iteration from
+  `expected_counts`) — undoes G4/G5's "constant prior" simplification, but with the
+  *real* cohort evidence, not the fabricated `α_ref=10` pseudocount.
+- **EM initialisation / fixed points:** seeding "everyone hom-ref" can trap a
+  cohort of weak hets at hom-ref (counts never grow → prior never sharpens); the
+  frequency estimate must start neutral and let the reads pull it. Get convergence
+  right for biallelic **and** multiallelic/polyploid.
+- Decide how `E[counts]` (currently the `m_step_p_hat` expected counts) feeds `α'`
+  and whether `m_step_p_hat` / the pseudocounts change.
+
+**Gate:** flip `#[ignore]` off the cohort test; **tomato cohort** (inbred, real
+multi-sample) as the accuracy gate; GIAB single-sample must not regress.
+
+**Deliverable:** its own design note + implementation report + validation.
+
+---
+
 ## Notes on ordering and risk
 
 - **Pure primitive before wiring** (M1 before M2): the Dirichlet-multinomial +

@@ -348,7 +348,12 @@ pub fn run_var_calling(
         )?
         .with_max_gq_phred(cohort.max_gq_phred)?
         .with_contamination(contamination)?
-        .with_nucleotide_diversity(diversity.as_ref().map(|d| d.nucleotide_diversity))?;
+        .with_nucleotide_diversity(
+            diversity
+                .as_ref()
+                .map(|d| d.nucleotide_diversity)
+                .unwrap_or(DEFAULT_DIVERSITY_PRIOR),
+        )?;
 
     let min_alt_obs = cohort.min_alt_obs_per_sample;
     let max_group_span = cohort.var_group_max_span;
