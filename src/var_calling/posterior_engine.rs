@@ -3830,12 +3830,10 @@ mod tests {
         );
         let expected = softmax_row(&dm);
         assert_eq!(rec.posteriors.len(), n_genotypes);
-        for g in 0..n_genotypes {
+        for (g, (&post, &exp)) in rec.posteriors.iter().zip(&expected).enumerate() {
             assert!(
-                (rec.posteriors[g] - expected[g]).abs() < 1e-12,
-                "genotype {g}: engine {} vs pure {}",
-                rec.posteriors[g],
-                expected[g]
+                (post - exp).abs() < 1e-12,
+                "genotype {g}: engine {post} vs pure {exp}"
             );
         }
     }

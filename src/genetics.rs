@@ -533,10 +533,10 @@ mod tests {
         assert!(lgamma(1.0).abs() < 1e-12);
         assert!(lgamma(2.0).abs() < 1e-12);
         // ln Γ(n+1) = ln n! for a few n.
-        for (n, fact) in [(3u32, 6.0), (5, 120.0), (6, 720.0)] {
+        for (n, fact) in [(3u32, 6.0_f64), (5, 120.0), (6, 720.0)] {
             let got = lgamma(n as f64 + 1.0);
             assert!(
-                (got - (fact as f64).ln()).abs() < 1e-10,
+                (got - fact.ln()).abs() < 1e-10,
                 "lgamma({}) = {got}, want ln {fact}",
                 n + 1
             );
