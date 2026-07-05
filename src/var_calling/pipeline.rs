@@ -46,11 +46,15 @@ use crate::var_calling::cohort_integration::{
     covered_intervals_for, drive_read_stage,
 };
 use crate::var_calling::contamination_estimation::ContaminationEstimates;
+use crate::var_calling::diversity::{DEFAULT_DIVERSITY_PRIOR, DiversityEstimate};
 use crate::var_calling::dust_filter::{MIN_DUST_HALO, sdust_mask_for_span};
 use crate::var_calling::per_group_merger::{
     DEFAULT_BATCH_SIZE, PerGroupMergerConfig, PerGroupMergerConfigError,
 };
 use crate::var_calling::per_position_merger::{PerPositionMergerError, check_chromosome_agreement};
+// The grid `SfsGenotypePrior` is retired in favour of the engine's general
+// Dirichlet-multinomial prior (fed via `with_nucleotide_diversity`); its module
+// is removed in Step G5.
 use crate::var_calling::posterior_engine::{PosteriorEngineConfig, PosteriorEngineConfigError};
 use crate::var_calling::sample_reader::SamplePspReader;
 use crate::var_calling::types::{CalledChunk, LocusWindowCoverage, RawCohortChunk};
@@ -287,6 +291,37 @@ pub fn run_var_calling(
     let chrom_lengths: Vec<u32> = chromosomes.iter().map(|c| c.length).collect();
     let n_chromosomes = chromosomes.len() as u32;
 
+    // --- Per-sample `.psp` summaries, read once here and shared by the SFS
+    //     genotype prior (below) and the hidden-paralog filter (further down).
+    //     A sample whose `.psp` predates the summary section (or fails to parse)
+    //     is `None`. ---
+    let summaries: Vec<Option<SampleSummary>> = psp_readers
+        .iter()
+        .map(|r| {
+            r.metadata()
+                .and_then(|bytes| SampleSummary::from_toml_bytes(bytes).ok())
+        })
+        .collect();
+
+    // --- SFS-marginalized genotype prior: estimate cohort diversity θ̂ and
+    //     per-sample inbreeding F from the summaries, then feed both to the
+    //     posterior engine. The general Dirichlet-multinomial genotype prior
+    //     (concentration α from θ̂) replaces the HWE(p̂) prior for **every** shape
+    //     — the low-coverage het over-call fix — with per-sample F applied via
+    //     the engine's Wright mixture (`fixation_index_overrides`). Requires
+    //     every sample to carry a summary; if any is missing (pre-summary
+    //     `.psp`), fall back to the HWE prior + the cohort
+    //     `--inbreeding-coefficient` (`None`).
+    //
+    //     When present, the data-estimated per-sample F takes precedence over the
+    //     cohort `--inbreeding-coefficient` for the SFS-prior path (matching the
+    //     prior grid behaviour, which likewise derived F from the summaries). ---
+    let diversity: Option<DiversityEstimate> = summaries
+        .iter()
+        .cloned()
+        .collect::<Option<Vec<SampleSummary>>>()
+        .map(|present| DiversityEstimate::from_summaries(&present, DEFAULT_DIVERSITY_PRIOR, None));
+
     // --- Build every per-stage config from the args. Each builder returns a
     //     typed config error, surfaced through its own `PipelineError` variant
     //     (via `?` / `#[from]`) so the cause is preserved in the `source()`
@@ -306,8 +341,19 @@ pub fn run_var_calling(
         .with_indel_alt_pseudocount(cohort.indel_alt_pseudocount)?
         .with_compound_alt_pseudocount(cohort.compound_alt_pseudocount)?
         .with_fixation_index_default(cohort.inbreeding_coefficient)?
+        .with_fixation_index_overrides(
+            diversity
+                .as_ref()
+                .map(|d| d.inbreeding_coefficients.clone()),
+        )?
         .with_max_gq_phred(cohort.max_gq_phred)?
-        .with_contamination(contamination)?;
+        .with_contamination(contamination)?
+        .with_nucleotide_diversity(
+            diversity
+                .as_ref()
+                .map(|d| d.nucleotide_diversity)
+                .unwrap_or(DEFAULT_DIVERSITY_PRIOR),
+        )?;
 
     let min_alt_obs = cohort.min_alt_obs_per_sample;
     let max_group_span = cohort.var_group_max_span;
@@ -341,13 +387,6 @@ pub fn run_var_calling(
     //     parse) is carried absent (S1), not fatal. ---
     let paralog_requested = !cohort.no_paralog_filter && cohort.paralog_fdr > 0.0;
     let paralog_prepass = if paralog_requested {
-        let summaries: Vec<Option<SampleSummary>> = psp_readers
-            .iter()
-            .map(|r| {
-                r.metadata()
-                    .and_then(|bytes| SampleSummary::from_toml_bytes(bytes).ok())
-            })
-            .collect();
         // Hard-fail if the required info is absent (see `require_paralog_summaries`).
         require_paralog_summaries(&summaries, &sample_names)?;
         Some(ParalogPrePass::fit(

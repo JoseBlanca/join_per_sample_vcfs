@@ -138,6 +138,17 @@ pub const DEFAULT_COMPOUND_ALT_PSEUDOCOUNT: f64 = 0.001;
 /// target tends to want a non-zero override per the spec.
 pub const DEFAULT_INBREEDING_COEFFICIENT: f64 = 0.0;
 
+/// Default cohort nucleotide diversity `θ̂` for the Dirichlet-multinomial SFS
+/// genotype prior. Used by [`PosteriorEngineConfig::with_project_defaults`] for
+/// callers (and tests) that do not estimate `θ̂` from the data; the driver
+/// overrides it with the value from
+/// [`crate::var_calling::diversity::DiversityEstimate`] (or that module's
+/// `DEFAULT_DIVERSITY_PRIOR` fallback when the `.psp` summaries are absent).
+/// Aliased to `DEFAULT_DIVERSITY_PRIOR` so the two species-range defaults stay a
+/// single source of truth.
+pub const DEFAULT_NUCLEOTIDE_DIVERSITY: f64 =
+    crate::var_calling::diversity::DEFAULT_DIVERSITY_PRIOR;
+
 /// Default Phred cap on per-sample GQ. Matches the GATK and bcftools
 /// convention (`GQ` capped at 99) so downstream tooling sees a
 /// familiar range; the cap also prevents `+∞` GQ when EM yields
@@ -261,6 +272,18 @@ pub struct PosteriorEngineConfig {
     ///
     /// [`estimate_contamination`]: crate::var_calling::contamination_estimation::estimate_contamination
     contamination: Option<ContaminationEstimates>,
+
+    /// Cohort nucleotide diversity `θ̂` for the genotype prior. Every record's
+    /// genotype prior is the **Dirichlet-multinomial** with concentration `α`
+    /// from θ̂ ([`crate::genetics::alpha_from_diversity`]), for **all**
+    /// `(ploidy, n_alleles)` shapes — this is the sole genotype prior (the HWE(p̂)
+    /// plug-in was removed in the SFS-prior generalization). Defaults to
+    /// [`DEFAULT_NUCLEOTIDE_DIVERSITY`]; the driver overrides it with the
+    /// data-estimated value.
+    ///
+    /// **Private.** Set via
+    /// [`with_nucleotide_diversity`](Self::with_nucleotide_diversity).
+    nucleotide_diversity: f64,
 }
 
 impl Default for PosteriorEngineConfig {
@@ -300,6 +323,7 @@ impl PosteriorEngineConfig {
             max_gq_phred: DEFAULT_MAX_GQ_PHRED,
             approximate_posterior_calculation: false,
             contamination: None,
+            nucleotide_diversity: DEFAULT_NUCLEOTIDE_DIVERSITY,
         }
     }
 
@@ -414,6 +438,26 @@ impl PosteriorEngineConfig {
         Ok(self)
     }
 
+    /// Validating setter for the per-sample `fixation_index_overrides`. Each
+    /// entry must be finite and in `[0.0, 1.0]`; `None` clears the overrides so
+    /// every sample falls back to `fixation_index_default`. The cohort-length
+    /// invariant (`len == n_samples`) is checked per record in the engine, where
+    /// the sample count is known.
+    pub fn with_fixation_index_overrides(
+        mut self,
+        fixation_index_overrides: Option<Vec<f64>>,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        if let Some(overrides) = &fixation_index_overrides {
+            for &f in overrides {
+                if !(f.is_finite() && (0.0..=1.0).contains(&f)) {
+                    return Err(PosteriorEngineConfigError::InvalidFixationIndex { got: f });
+                }
+            }
+        }
+        self.fixation_index_overrides = fixation_index_overrides;
+        Ok(self)
+    }
+
     /// Validating setter for `max_gq_phred` — finite, in
     /// `(GQ_PHRED_RANGE_MIN_EXCLUSIVE, GQ_PHRED_RANGE_MAX]`
     /// (i.e. `(10.0, 200.0]`).
@@ -443,6 +487,23 @@ impl PosteriorEngineConfig {
         contamination: Option<ContaminationEstimates>,
     ) -> Result<Self, PosteriorEngineConfigError> {
         self.contamination = contamination;
+        Ok(self)
+    }
+
+    /// Validating setter for the private `nucleotide_diversity` field (the SFS
+    /// genotype prior's `θ̂`). Must be finite and `>= 0` (it comes from
+    /// [`crate::var_calling::diversity::DiversityEstimate`], which guarantees
+    /// both).
+    pub fn with_nucleotide_diversity(
+        mut self,
+        nucleotide_diversity: f64,
+    ) -> Result<Self, PosteriorEngineConfigError> {
+        if !(nucleotide_diversity.is_finite() && nucleotide_diversity >= 0.0) {
+            return Err(PosteriorEngineConfigError::InvalidNucleotideDiversity {
+                got: nucleotide_diversity,
+            });
+        }
+        self.nucleotide_diversity = nucleotide_diversity;
         Ok(self)
     }
 }
@@ -494,6 +555,12 @@ pub enum PosteriorEngineConfigError {
         "max_gq_phred must be finite and in ({GQ_PHRED_RANGE_MIN_EXCLUSIVE}, {GQ_PHRED_RANGE_MAX}], got {got}"
     )]
     InvalidMaxGqPhred { got: f64 },
+
+    /// `nucleotide_diversity` (`θ̂`) was non-finite or negative. It comes from
+    /// [`crate::var_calling::diversity::DiversityEstimate`], which guarantees a
+    /// finite, non-negative value; a bad value signals a wiring error.
+    #[error("nucleotide_diversity must be finite and >= 0, got {got}")]
+    InvalidNucleotideDiversity { got: f64 },
 }
 
 /// Why a posterior calculation hit an unrecoverable value. Surfaced
@@ -1821,11 +1888,36 @@ struct EmContext<'a> {
 /// every EM iter).
 pub(crate) struct RecordScratch {
     // ===== EM working set (previously EmScratch). =====
-    /// Effective per-allele frequency seen by the prior (compounds
-    /// substituted with `f̂_C`). Length `n_alleles`.
-    p_effective: Vec<f64>,
-    /// Natural log of `p_effective`. Length `n_alleles`.
+    /// The IBD marginal allele log-frequency `log(α_a / Σα)` per allele — what the
+    /// Wright-`F` mixture's homozygote term consumes as the genotype prior's
+    /// frequency. Record-static (θ̂-derived, p̂-independent); filled once per
+    /// record. Length `n_alleles`.
     log_p_effective: Vec<f64>,
+    /// Dirichlet concentration `α` for the SFS prior (`α_ref = 1`,
+    /// `α_alt = θ̂/(n_alleles−1)`); filled once per record from
+    /// `config.nucleotide_diversity`. Length `n_alleles`.
+    alpha: Vec<f64>,
+    /// `lgamma(α_a)` per allele — the baseline the Dirichlet-multinomial
+    /// independent term subtracts. Length `n_alleles`. Filled beside `alpha`.
+    lgamma_alpha: Vec<f64>,
+    /// Milestone 4 (leave-one-out cohort prior): the per-sample posterior
+    /// concentration `α'_s = α_species + max(0, E[cohort counts] − E[own_s])`,
+    /// rebuilt for each sample inside [`e_step_cohort_loo`] and consumed by that
+    /// sample's Dirichlet-multinomial term. Working buffer, overwritten per
+    /// sample; only meaningful for `n_samples > 1`. Length `n_alleles`.
+    alpha_prime: Vec<f64>,
+    /// `lgamma(α'_s,a)` for the current sample's [`alpha_prime`]. Length
+    /// `n_alleles`.
+    lgamma_alpha_prime: Vec<f64>,
+    /// The IBD marginal allele log-frequency `log(α'_s,a / Σα'_s)` for the
+    /// current sample — the leave-one-out analogue of [`log_p_effective`] the
+    /// Wright-`F` mixture's homozygote term reads. Length `n_alleles`.
+    log_p_effective_prime: Vec<f64>,
+    /// The current sample's own posterior-weighted allele copies, subtracted
+    /// from the cohort total to form the leave-one-out counts. Working buffer,
+    /// cleared and refilled per sample in [`e_step_cohort_loo`]. Length
+    /// `n_alleles`.
+    own_counts: Vec<f64>,
     /// Per-genotype `log_indep` = `log_multinomial_coeffs[g] + Σ k *
     /// log_p_effective[a]` over non-zero pairs. Sample-invariant
     /// within one EM iteration; `e_step` / `e_step_simd` rebuild it
@@ -1939,8 +2031,13 @@ impl RecordScratch {
     /// All Vecs empty; capacity grows on first `resize_to` call.
     pub(crate) fn empty() -> Self {
         Self {
-            p_effective: Vec::new(),
             log_p_effective: Vec::new(),
+            alpha: Vec::new(),
+            lgamma_alpha: Vec::new(),
+            alpha_prime: Vec::new(),
+            lgamma_alpha_prime: Vec::new(),
+            log_p_effective_prime: Vec::new(),
+            own_counts: Vec::new(),
             log_indep_per_g: Vec::new(),
             log_prior_per_g: Vec::new(),
             log_post_unnorm: Vec::new(),
@@ -1985,8 +2082,13 @@ impl RecordScratch {
     /// preserves capacity above the high-water mark, so steady-state
     /// records of the same shape allocate nothing.
     fn resize_to(&mut self, n_samples: usize, n_alleles: usize, n_genotypes: usize, ploidy: u8) {
-        self.p_effective.resize(n_alleles, 0.0);
         self.log_p_effective.resize(n_alleles, 0.0);
+        self.alpha.resize(n_alleles, 0.0);
+        self.lgamma_alpha.resize(n_alleles, 0.0);
+        self.alpha_prime.resize(n_alleles, 0.0);
+        self.lgamma_alpha_prime.resize(n_alleles, 0.0);
+        self.log_p_effective_prime.resize(n_alleles, 0.0);
+        self.own_counts.resize(n_alleles, 0.0);
         self.log_indep_per_g.resize(n_genotypes, 0.0);
         self.log_prior_per_g.resize(n_genotypes, 0.0);
         self.log_post_unnorm.resize(n_genotypes, 0.0);
@@ -2208,6 +2310,34 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
         scratch.mixture_contam_class_per_allele[a] = map_to_contam_class(class);
     }
 
+    // SFS genotype prior (Dirichlet-multinomial): derive this record's
+    // concentration α = [1, θ̂/(n_alleles−1), …] (the in-place equivalent of
+    // `crate::genetics::alpha_from_diversity`, avoiding a per-record alloc) into
+    // `alpha`, plus the two derived record-static tables the E-step reads:
+    // `lgamma(α_a)` (the Dirichlet-multinomial independent-term baseline, in
+    // `lgamma_alpha`) and the IBD marginal allele log-frequency `log(α_a/Σα)`
+    // (kept in `log_p_effective`, which the Wright-`F` mixture consumes in place
+    // of `log p̂_a`). All three buffers are p̂-independent, so they are filled once
+    // here rather than per EM iteration.
+    // Compound alleles are treated as ordinary rare ALTs — they take the same
+    // θ̂/(n_alleles−1) share; only the likelihood (already baked upstream) and AF
+    // reporting distinguish them.
+    let theta = config.nucleotide_diversity;
+    scratch.alpha[0] = crate::genetics::ALPHA_REF;
+    let n_alt = n_alleles - 1;
+    if n_alt > 0 {
+        let per_alt = (theta / n_alt as f64).max(crate::genetics::MIN_ALT_CONCENTRATION);
+        for a in 1..n_alleles {
+            scratch.alpha[a] = per_alt;
+        }
+    }
+    let sum_alpha: f64 = scratch.alpha[..n_alleles].iter().sum();
+    let log_sum_alpha = math.ln(sum_alpha);
+    for a in 0..n_alleles {
+        scratch.lgamma_alpha[a] = crate::genetics::lgamma(scratch.alpha[a]);
+        scratch.log_p_effective[a] = math.ln(scratch.alpha[a]) - log_sum_alpha;
+    }
+
     // Genotype-shape artefacts (allele-count table, multinomial
     // coefficients, non-zero-pair and homozygous-allele lookups) come
     // from a thread-local `(ploidy, n_alleles)`-keyed cache. Repeated
@@ -2317,18 +2447,13 @@ pub(crate) fn run_em_columnar<M: MathBackend>(
 
     let diagnostics = run_em_loop(ctx, config, math, ll_for_em, scratch)?;
 
-    // Final E-step under the converged (p̂, f̂_C) so the emitted
-    // posteriors reflect the *post-final-M-step* parameters rather
-    // than the parameters that produced the last `posteriors` buffer
-    // contents.
-    //
-    // `M::HAS_LANE_4` is a compile-time const so the unused branch is
-    // dead-code-eliminated after monomorphisation.
-    if M::HAS_LANE_4 {
-        e_step_simd(ctx, math, ll_for_em, scratch)?;
-    } else {
-        e_step(ctx, math, ll_for_em, scratch)?;
-    }
+    // Final E-step under the converged parameters so the emitted
+    // posteriors reflect the *post-final-M-step* state rather than the
+    // parameters that produced the last `posteriors` buffer contents.
+    // Uses the steady-state prior variant (never the flat first-iteration
+    // one): for a single sample the §9 species path; for a cohort the
+    // leave-one-out prior read off the converged `expected_counts`.
+    dispatch_e_step(ctx, math, ll_for_em, scratch, EmStepPhase::SteadyState)?;
 
     summarise_posteriors(n_samples, n_genotypes, scratch, config.max_gq_phred);
     // Beta(α_alt, α_ref) prior shape for the AC marginalisation —
@@ -2445,6 +2570,49 @@ fn validate_record_shape(
     Ok(())
 }
 
+/// Which E-step variant to run — selected by [`dispatch_e_step`] from the
+/// iteration index. Only distinguishes the two multi-sample (cohort) variants;
+/// a single-sample record ignores it and always runs the §9 species path.
+#[derive(Clone, Copy)]
+enum EmStepPhase {
+    /// The first EM iteration of a multi-sample record: a flat genotype prior
+    /// (likelihood only) so the cohort's reads set an honest initial frequency
+    /// before the leave-one-out prior engages (arch §10.2b).
+    FirstIteration,
+    /// Every later iteration (and the post-loop final E-step): the
+    /// leave-one-out empirical-Bayes cohort prior (arch §10.1–10.2a).
+    SteadyState,
+}
+
+/// Run one E-step, choosing the genotype-prior variant by cohort size and EM
+/// phase (arch §10):
+///
+/// - **Single sample** (`n_samples == 1`): leave-one-out leaves the species
+///   prior and the flat first step is unnecessary (no cohort to un-trap), so the
+///   §9 record-static path runs verbatim — GIAB stays byte-identical.
+/// - **Cohort, first iteration**: [`e_step_flat`].
+/// - **Cohort, steady state**: [`e_step_cohort_loo`].
+fn dispatch_e_step<M: MathBackend>(
+    ctx: EmContext<'_>,
+    math: &M,
+    log_likelihoods: &[f64],
+    scratch: &mut RecordScratch,
+    phase: EmStepPhase,
+) -> Result<(), PosteriorEngineError> {
+    if ctx.n_samples == 1 {
+        if M::HAS_LANE_4 {
+            e_step_simd(ctx, math, log_likelihoods, scratch)
+        } else {
+            e_step(ctx, math, log_likelihoods, scratch)
+        }
+    } else {
+        match phase {
+            EmStepPhase::FirstIteration => e_step_flat(ctx, math, log_likelihoods, scratch),
+            EmStepPhase::SteadyState => e_step_cohort_loo(ctx, math, log_likelihoods, scratch),
+        }
+    }
+}
+
 fn run_em_loop<M: MathBackend>(
     ctx: EmContext<'_>,
     config: &PosteriorEngineConfig,
@@ -2459,11 +2627,12 @@ fn run_em_loop<M: MathBackend>(
     while iterations < max_iterations {
         iterations += 1;
 
-        if M::HAS_LANE_4 {
-            e_step_simd(ctx, math, log_likelihoods, scratch)?;
+        let phase = if iterations == 1 {
+            EmStepPhase::FirstIteration
         } else {
-            e_step(ctx, math, log_likelihoods, scratch)?;
-        }
+            EmStepPhase::SteadyState
+        };
+        dispatch_e_step(ctx, math, log_likelihoods, scratch, phase)?;
 
         // M-step writes `p_hat_next` and overwrites `f_hat_compound`
         // in place. `p_hat` is double-buffered against `p_hat_next`
@@ -2474,7 +2643,17 @@ fn run_em_loop<M: MathBackend>(
         last_delta = max_abs_diff(&scratch.p_hat, &scratch.p_hat_next);
         std::mem::swap(&mut scratch.p_hat, &mut scratch.p_hat_next);
 
-        if last_delta < config.convergence_threshold {
+        // For a cohort (`n_samples > 1`) iteration 1 runs the *flat* prior, so
+        // its `p̂` reflects the likelihood-only seed, not the leave-one-out
+        // prior that produces the emitted genotypes. Never converge on it:
+        // require at least one steady-state (LOO) iteration so `converged`
+        // means the LOO prior stabilised, and the post-loop final E-step is
+        // consistent with the last M-step's `expected_counts`. A single-sample
+        // record has no flat step and keeps its §9 convergence behaviour
+        // (byte-identical).
+        let converged_this_iteration =
+            last_delta < config.convergence_threshold && !(iterations == 1 && ctx.n_samples > 1);
+        if converged_this_iteration {
             return Ok(EmDiagnostics {
                 iterations,
                 final_max_delta_p: last_delta,
@@ -2528,31 +2707,60 @@ fn resolve_fixation_indices(
     Ok(())
 }
 
+/// Normalise one sample's unnormalised genotype log-posteriors `logits` into its
+/// posterior row: `out_row[g] = exp(logits[g] − logsumexp(logits))`. Surfaces
+/// [`PosteriorEngineError::NonFinitePosterior`] if the normaliser (`log_z`) or
+/// any posterior is non-finite.
+///
+/// `log_z` is `-∞` only when every logit is `-∞`, which needs the prior to zero
+/// out every genotype the likelihood permits; pseudocounts keep the prior
+/// strictly positive, so in practice this fires only on a malformed all-`-∞`
+/// likelihood row. `logits.len() == out_row.len() == n_genotypes`. Shared by all
+/// four E-step variants (`e_step`, the `e_step_simd` scalar tail, `e_step_flat`,
+/// `e_step_cohort_loo`) so the non-finite contract lives in one place.
+#[inline]
+fn normalise_logits_into_posteriors<M: MathBackend>(
+    math: &M,
+    locus: RecordLocus,
+    sample_idx: usize,
+    logits: &[f64],
+    out_row: &mut [f64],
+) -> Result<(), PosteriorEngineError> {
+    let log_z = log_sum_exp_slice(math, logits);
+    if !log_z.is_finite() {
+        return Err(PosteriorEngineError::NonFinitePosterior {
+            locus,
+            sample_idx,
+            genotype_idx: None,
+            kind: classify_nonfinite(log_z),
+        });
+    }
+    for (g_idx, (&logit, slot)) in logits.iter().zip(out_row.iter_mut()).enumerate() {
+        let posterior = math.exp(logit - log_z);
+        if !posterior.is_finite() {
+            return Err(PosteriorEngineError::NonFinitePosterior {
+                locus,
+                sample_idx,
+                genotype_idx: Some(g_idx),
+                kind: classify_nonfinite(posterior),
+            });
+        }
+        *slot = posterior;
+    }
+    Ok(())
+}
+
 fn e_step<M: MathBackend>(
     ctx: EmContext<'_>,
     math: &M,
     log_likelihoods: &[f64],
     scratch: &mut RecordScratch,
 ) -> Result<(), PosteriorEngineError> {
-    // Effective per-allele frequency seen by the prior: `f̂_C`
-    // substitutes for `p̂[compound]` in every compound slot, regardless
-    // of any per-sample chain-broken flag (the chain-broken flag only
-    // affects the likelihood, which Stage 5 has already baked into
-    // `log_likelihoods`).
-    for a in 0..ctx.n_alleles {
-        let p = if scratch.compound_mask[a] {
-            scratch.f_hat_compound[a]
-        } else {
-            scratch.p_hat[a]
-        };
-        scratch.p_effective[a] = p;
-        scratch.log_p_effective[a] = safe_ln(math, p);
-    }
-
-    // H2: `log_indep` depends only on `log_p_effective` and the
-    // genotype shape — sample-invariant within an EM iteration.
-    // Precompute once and read inside the sample loop instead of
-    // rebuilding per (sample, g_idx).
+    // The genotype prior is the Dirichlet-multinomial from the record-static
+    // concentration `α` (θ̂-derived): `log_p_effective` (the IBD marginal
+    // `log(α_a/Σα)`), `alpha`, and `lgamma_alpha` are all p̂-independent and were
+    // filled once per record, so the E-step reads them without a per-iteration
+    // rebuild. `fill_log_indep_per_g` computes the per-genotype independent term.
     fill_log_indep_per_g(ctx, scratch);
 
     // H4: when every sample shares the same `f_s`, the whole
@@ -2594,35 +2802,14 @@ fn e_step<M: MathBackend>(
             }
         }
 
-        let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
-        // log_z is `-∞` iff every entry of `log_post_unnorm` is `-∞`,
-        // which can only happen if the prior assigns zero mass to
-        // every genotype the likelihood permits. Pseudocounts keep p̂
-        // and f̂_C strictly positive, so the only realistic trigger is
-        // a likelihood matrix that is all `-∞` — itself a malformed
-        // upstream record. Surface it loudly.
-        if !log_z.is_finite() {
-            return Err(PosteriorEngineError::NonFinitePosterior {
-                locus: ctx.locus,
-                sample_idx,
-                genotype_idx: None,
-                kind: classify_nonfinite(log_z),
-            });
-        }
-
         let post_base = sample_idx * n_genotypes;
-        for g_idx in 0..n_genotypes {
-            let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
-            if !posterior.is_finite() {
-                return Err(PosteriorEngineError::NonFinitePosterior {
-                    locus: ctx.locus,
-                    sample_idx,
-                    genotype_idx: Some(g_idx),
-                    kind: classify_nonfinite(posterior),
-                });
-            }
-            scratch.posteriors[post_base + g_idx] = posterior;
-        }
+        normalise_logits_into_posteriors(
+            math,
+            ctx.locus,
+            sample_idx,
+            &scratch.log_post_unnorm,
+            &mut scratch.posteriors[post_base..post_base + n_genotypes],
+        )?;
     }
 
     Ok(())
@@ -2642,18 +2829,10 @@ fn e_step_simd<M: MathBackend>(
     log_likelihoods: &[f64],
     scratch: &mut RecordScratch,
 ) -> Result<(), PosteriorEngineError> {
-    // `log_p_effective` build is per-allele scalar work — identical
-    // to the scalar e_step.
-    for a in 0..ctx.n_alleles {
-        let p = if scratch.compound_mask[a] {
-            scratch.f_hat_compound[a]
-        } else {
-            scratch.p_hat[a]
-        };
-        scratch.p_effective[a] = p;
-        scratch.log_p_effective[a] = safe_ln(math, p);
-    }
-
+    // The genotype prior's `log_p_effective` (IBD marginal `log(α_a/Σα)`),
+    // `alpha`, and `lgamma_alpha` are record-static (θ̂-derived, p̂-independent) —
+    // filled once per record, read here without a rebuild. See `e_step`.
+    //
     // H2: cache `log_indep[g]` once per iteration; the batch loop
     // splats from it instead of recomputing per (batch, g_idx).
     fill_log_indep_per_g(ctx, scratch);
@@ -2794,30 +2973,153 @@ fn e_step_simd<M: MathBackend>(
             }
         }
 
-        let log_z = log_sum_exp_slice(math, &scratch.log_post_unnorm);
-        if !log_z.is_finite() {
-            return Err(PosteriorEngineError::NonFinitePosterior {
-                locus: ctx.locus,
-                sample_idx,
-                genotype_idx: None,
-                kind: classify_nonfinite(log_z),
-            });
-        }
         let post_base = sample_idx * n_genotypes;
-        for g_idx in 0..n_genotypes {
-            let posterior = math.exp(scratch.log_post_unnorm[g_idx] - log_z);
-            if !posterior.is_finite() {
-                return Err(PosteriorEngineError::NonFinitePosterior {
-                    locus: ctx.locus,
-                    sample_idx,
-                    genotype_idx: Some(g_idx),
-                    kind: classify_nonfinite(posterior),
-                });
-            }
-            scratch.posteriors[post_base + g_idx] = posterior;
-        }
+        normalise_logits_into_posteriors(
+            math,
+            ctx.locus,
+            sample_idx,
+            &scratch.log_post_unnorm,
+            &mut scratch.posteriors[post_base..post_base + n_genotypes],
+        )?;
     }
 
+    Ok(())
+}
+
+/// The flat-prior first E-step for a multi-sample record (arch §10.2b): no
+/// genotype prior at all, so each sample's posterior is just its normalised
+/// likelihood. This lets the cohort's reads place an honest initial frequency
+/// before the leave-one-out prior takes over on the next iteration — without it,
+/// starting from the species prior traps a weak-but-consistent cohort at
+/// hom-ref (the counts never grow, so the prior never sharpens).
+///
+/// Neutral, not pro-het: a genuinely monomorphic site has every sample's
+/// likelihood pinned at hom-ref, so the seeded `expected_counts` come out ≈
+/// hom-ref and the site stays put. Only used when `n_samples > 1`.
+fn e_step_flat<M: MathBackend>(
+    ctx: EmContext<'_>,
+    math: &M,
+    log_likelihoods: &[f64],
+    scratch: &mut RecordScratch,
+) -> Result<(), PosteriorEngineError> {
+    let n_genotypes = ctx.n_genotypes;
+    for sample_idx in 0..ctx.n_samples {
+        let post_base = sample_idx * n_genotypes;
+        // The flat prior contributes nothing, so the likelihood row *is* the
+        // unnormalised log-posterior — normalise it straight into the row.
+        let ll_row = &log_likelihoods[post_base..post_base + n_genotypes];
+        normalise_logits_into_posteriors(
+            math,
+            ctx.locus,
+            sample_idx,
+            ll_row,
+            &mut scratch.posteriors[post_base..post_base + n_genotypes],
+        )?;
+    }
+    Ok(())
+}
+
+/// The steady-state E-step for a multi-sample record: the leave-one-out
+/// empirical-Bayes cohort prior (arch §10.1–10.2a). Each sample `s` is judged
+/// against a per-sample Dirichlet-multinomial prior whose concentration is the
+/// species prior updated by the **other** samples' expected allele copies:
+///
+/// ```text
+/// α'_s = α_species + max(0, E[cohort counts] − E[own_s])
+/// ```
+///
+/// - `E[cohort counts]` is `scratch.expected_counts`, the cohort total from the
+///   previous M-step.
+/// - `E[own_s]` is recomputed here from sample `s`'s **previous** posterior row
+///   (read before this E-step overwrites it), so it is subtracted out — no
+///   sample votes for its own prior. With one sample the difference is zero and
+///   `α'_s = α_species`, which is why `dispatch_e_step` never routes a
+///   single-sample record here (the §9 path stays byte-identical).
+///
+/// The Wright-`F` mixture wrapping the Dirichlet-multinomial term is identical
+/// to [`e_step`]; it just reads the per-sample `α'_s` (via `alpha_prime`,
+/// `lgamma_alpha_prime`, `log_p_effective_prime`) instead of the record-static
+/// species concentration. Runs per sample (no SIMD/homogeneous-prior sharing —
+/// the prior is per-sample now); the large-cohort shared-prior shortcut is a
+/// deferred perf-review item (arch §10.2a).
+fn e_step_cohort_loo<M: MathBackend>(
+    ctx: EmContext<'_>,
+    math: &M,
+    log_likelihoods: &[f64],
+    scratch: &mut RecordScratch,
+) -> Result<(), PosteriorEngineError> {
+    let n_genotypes = ctx.n_genotypes;
+    let n_alleles = ctx.n_alleles;
+    for sample_idx in 0..ctx.n_samples {
+        let post_base = sample_idx * n_genotypes;
+
+        // E[own_s] from this sample's previous posterior row — captured
+        // before the write-back below clobbers it.
+        scratch.own_counts.fill(0.0);
+        let prev_row = &scratch.posteriors[post_base..post_base + n_genotypes];
+        accumulate_row_counts(ctx.shape, n_alleles, prev_row, &mut scratch.own_counts);
+
+        // α'_s = α_species + leave-one-out counts. `own` is one non-negative
+        // addend of the cohort `total`, so `total − own ≥ 0` exactly; only
+        // float noise can make it slightly negative, hence the `.max(0.0)`. A
+        // *materially* negative value signals a desync between the two count
+        // paths (the biallelic fast path in `accumulate_expected_counts` vs
+        // `accumulate_row_counts` here) and is caught in debug. α_species is
+        // strictly positive and the added counts are non-negative, so α'_s > 0
+        // and its `lgamma` stays finite.
+        for a in 0..n_alleles {
+            let raw_loo = scratch.expected_counts[a] - scratch.own_counts[a];
+            debug_assert!(
+                raw_loo > -1e-6,
+                "leave-one-out counts went materially negative at allele {a}: \
+                 total={} own={} diff={raw_loo}",
+                scratch.expected_counts[a],
+                scratch.own_counts[a],
+            );
+            scratch.alpha_prime[a] = scratch.alpha[a] + raw_loo.max(0.0);
+        }
+        let sum_alpha: f64 = scratch.alpha_prime.iter().sum();
+        let log_sum_alpha = math.ln(sum_alpha);
+        for a in 0..n_alleles {
+            scratch.lgamma_alpha_prime[a] = crate::genetics::lgamma(scratch.alpha_prime[a]);
+            scratch.log_p_effective_prime[a] = math.ln(scratch.alpha_prime[a]) - log_sum_alpha;
+        }
+
+        // Per-sample Dirichlet-multinomial independent term from α'_s.
+        fill_log_indep_per_g_from(
+            ctx.shape,
+            &scratch.alpha_prime,
+            &scratch.lgamma_alpha_prime,
+            &mut scratch.log_indep_per_g,
+        );
+
+        // Wright-`F` mixture (per-sample `f_s`) + likelihood → posterior.
+        // Same structure as `e_step`'s heterogeneous branch, reading the
+        // leave-one-out IBD marginal `log(α'_s,a / Σα'_s)`.
+        let log_f = scratch.log_f_per_sample[sample_idx];
+        let log_one_minus_f = scratch.log_one_minus_f_per_sample[sample_idx];
+        let ll_row = &log_likelihoods[post_base..post_base + n_genotypes];
+        for (g_idx, &ll) in ll_row.iter().enumerate() {
+            let log_indep = scratch.log_indep_per_g[g_idx];
+            let log_prior = match ctx.shape.homozygous_allele_for[g_idx] {
+                Some(homo_allele) => log_sum_exp_2(
+                    math,
+                    log_one_minus_f + log_indep,
+                    log_f + scratch.log_p_effective_prime[homo_allele as usize],
+                ),
+                None => log_one_minus_f + log_indep,
+            };
+            scratch.log_post_unnorm[g_idx] = ll + log_prior;
+        }
+
+        normalise_logits_into_posteriors(
+            math,
+            ctx.locus,
+            sample_idx,
+            &scratch.log_post_unnorm,
+            &mut scratch.posteriors[post_base..post_base + n_genotypes],
+        )?;
+    }
     Ok(())
 }
 
@@ -2878,17 +3180,34 @@ fn accumulate_expected_counts(ctx: EmContext<'_>, posteriors: &[f64], expected_c
         *slot = 0.0;
     }
     for post_row in posteriors.chunks_exact(ctx.n_genotypes) {
-        for (g_idx, gt_counts) in ctx
-            .shape
-            .genotype_allele_counts
-            .chunks_exact(ctx.n_alleles)
-            .enumerate()
-        {
-            let weight = post_row[g_idx];
-            for (a, &k) in gt_counts.iter().enumerate() {
-                if k != 0 {
-                    expected_counts[a] += weight * k as f64;
-                }
+        accumulate_row_counts(ctx.shape, ctx.n_alleles, post_row, expected_counts);
+    }
+}
+
+/// Add one sample's posterior-weighted allele copies to `out`:
+/// `out[a] += Σ_g post_row[g] · gt_counts[g, a]`. **Adds** into `out`
+/// (does not clear it), so [`accumulate_expected_counts`]'s cohort sum
+/// is just this called per sample, and the leave-one-out E-step can
+/// reuse it to recover a single sample's own expected counts.
+///
+/// `post_row.len() == n_genotypes` and
+/// `shape.genotype_allele_counts.len() == n_genotypes · n_alleles`.
+#[inline]
+fn accumulate_row_counts(
+    shape: &GenotypeShape,
+    n_alleles: usize,
+    post_row: &[f64],
+    out: &mut [f64],
+) {
+    for (g_idx, gt_counts) in shape
+        .genotype_allele_counts
+        .chunks_exact(n_alleles)
+        .enumerate()
+    {
+        let weight = post_row[g_idx];
+        for (a, &k) in gt_counts.iter().enumerate() {
+            if k != 0 {
+                out[a] += weight * k as f64;
             }
         }
     }
@@ -3283,25 +3602,64 @@ fn trivial_em_outputs(
 // E-step prelude helpers
 // ---------------------------------------------------------------------
 
-/// Fill `scratch.log_indep_per_g` from the current `log_p_effective`.
+/// Fill `scratch.log_indep_per_g` — the random-mating (no-inbreeding) genotype
+/// log-prior term that the Wright-`F` mixture then bends by each sample's `F`.
 ///
-/// `log_indep[g] = log_multinomial_coeffs[g] + Σ k · log_p_effective[a]`
-/// over the genotype's non-zero `(allele, count)` pairs (1 entry for
-/// homozygous, 2 for heterozygous in the diploid case). Sample-
-/// invariant within an EM iteration; both `e_step` and `e_step_simd`
-/// call this once per iteration so the sample / batch loop can read
-/// from the cache instead of rebuilding (H2 in
-/// `perf_posterior_engine_2026-05-18.md`).
+/// This is the **Dirichlet-multinomial** SFS prior:
+/// `log_multinomial_coeffs[g] + Σ_a [lgamma(α_a+k_a) − lgamma(α_a)]` over the
+/// genotype's non-zero `(allele, count)` pairs — the exact marginal of the
+/// multinomial genotype prior over the Dirichlet frequency prior with
+/// concentration `α` (`crate::genetics::dirichlet_multinomial_log_priors`,
+/// computed here in place from `scratch.alpha` / `scratch.lgamma_alpha` to avoid
+/// a per-record allocation).
+///
+/// p̂-independent and sample-invariant, so both `e_step` and `e_step_simd` call it
+/// once per iteration and the sample / batch loop reads from the cache instead of
+/// rebuilding (H2 in `perf_posterior_engine_2026-05-18.md`).
 #[inline]
 fn fill_log_indep_per_g(ctx: EmContext<'_>, scratch: &mut RecordScratch) {
-    for g_idx in 0..ctx.n_genotypes {
-        let (start, len) = ctx.shape.nonzero_pairs_offsets[g_idx];
-        let pairs = &ctx.shape.nonzero_pairs[start as usize..start as usize + len as usize];
-        scratch.log_indep_per_g[g_idx] = ctx.shape.log_multinomial_coeffs[g_idx]
-            + pairs
-                .iter()
-                .map(|&(a, k)| f64::from(k) * scratch.log_p_effective[a as usize])
-                .sum::<f64>();
+    fill_log_indep_per_g_from(
+        ctx.shape,
+        &scratch.alpha,
+        &scratch.lgamma_alpha,
+        &mut scratch.log_indep_per_g,
+    );
+}
+
+/// The Dirichlet-multinomial independent term of [`fill_log_indep_per_g`], but
+/// reading the concentration `alpha` / `lgamma(alpha)` from caller-supplied
+/// slices and writing into a caller-supplied `out`.
+///
+/// `alpha.len()` and `lgamma_alpha.len()` are the allele count; `out.len()` is
+/// the genotype count. Both callers write the shared `scratch.log_indep_per_g`:
+/// the species path ([`fill_log_indep_per_g`]) fills it once per record from the
+/// record-static `scratch.alpha`; the leave-one-out cohort path
+/// ([`e_step_cohort_loo`]) overwrites it once per sample from that sample's
+/// `α'_s` (`scratch.alpha_prime`).
+#[inline]
+fn fill_log_indep_per_g_from(
+    shape: &GenotypeShape,
+    alpha: &[f64],
+    lgamma_alpha: &[f64],
+    out: &mut [f64],
+) {
+    // The loop drives off `out` but indexes `shape` by the same `g_idx`, so a
+    // shorter `out` would silently under-fill and a longer one would panic on
+    // the shape index. Pin the three-slice contract in debug.
+    debug_assert_eq!(out.len(), shape.nonzero_pairs_offsets.len());
+    debug_assert_eq!(out.len(), shape.log_multinomial_coeffs.len());
+    for (g_idx, out_slot) in out.iter_mut().enumerate() {
+        let (start, len) = shape.nonzero_pairs_offsets[g_idx];
+        let pairs = &shape.nonzero_pairs[start as usize..start as usize + len as usize];
+        // Σ_a [lgamma(α_a + k_a) − lgamma(α_a)]; a zero count contributes 0
+        // (excluded from `nonzero_pairs`).
+        let sum: f64 = pairs
+            .iter()
+            .map(|&(a, k)| {
+                crate::genetics::lgamma(alpha[a as usize] + f64::from(k)) - lgamma_alpha[a as usize]
+            })
+            .sum();
+        *out_slot = shape.log_multinomial_coeffs[g_idx] + sum;
     }
 }
 
@@ -3701,6 +4059,337 @@ mod tests {
         let mut out = engine_for(record);
         assert_eq!(out.len(), 1);
         out.remove(0).expect("posterior record")
+    }
+
+    // ---- General Dirichlet-multinomial SFS prior (G4) ----
+
+    /// Softmax of a log-prior row (test helper).
+    fn softmax_row(logs: &[f64]) -> Vec<f64> {
+        let m = logs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = logs.iter().map(|&l| (l - m).exp()).collect();
+        let z: f64 = exps.iter().sum();
+        exps.iter().map(|&e| e / z).collect()
+    }
+
+    /// [`accumulate_row_counts`] sums one sample's posterior-weighted allele
+    /// copies and *adds* into `out` (does not clear) so the cohort E-step's
+    /// leave-one-out subtraction can rebuild a single sample's own counts.
+    #[test]
+    fn accumulate_row_counts_sums_posterior_weighted_allele_copies() {
+        // Triallelic diploid: genotype order AA, AC, CC, AG, CG, GG with
+        // allele-count rows [2,0,0], [1,1,0], [0,2,0], [1,0,1], [0,1,1], [0,0,2].
+        let shape = shape_for(2, 3);
+        let post_row = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0]; // half AA, half AC
+        let mut out = vec![0.0_f64; 3];
+        accumulate_row_counts(&shape, 3, &post_row, &mut out);
+        // ref = 2·0.5 + 1·0.5 = 1.5; alt1 = 1·0.5 = 0.5; alt2 = 0.
+        assert!((out[0] - 1.5).abs() < 1e-12, "ref {}", out[0]);
+        assert!((out[1] - 0.5).abs() < 1e-12, "alt1 {}", out[1]);
+        assert!((out[2] - 0.0).abs() < 1e-12, "alt2 {}", out[2]);
+        // Adds (does not clear): a second call doubles the running totals.
+        accumulate_row_counts(&shape, 3, &post_row, &mut out);
+        assert!((out[0] - 3.0).abs() < 1e-12, "ref after 2× {}", out[0]);
+        assert!((out[1] - 1.0).abs() < 1e-12, "alt1 after 2× {}", out[1]);
+
+        // Exercise a genotype touching allele index 2 (AG = index 3, row
+        // [1,0,1]) so the full `n_alleles == 3` inner loop is covered.
+        let mut out2 = vec![0.0_f64; 3];
+        let ag_row = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // all mass on AG
+        accumulate_row_counts(&shape, 3, &ag_row, &mut out2);
+        assert!((out2[0] - 1.0).abs() < 1e-12, "AG ref {}", out2[0]);
+        assert!((out2[1] - 0.0).abs() < 1e-12, "AG alt1 {}", out2[1]);
+        assert!((out2[2] - 1.0).abs() < 1e-12, "AG alt2 {}", out2[2]);
+    }
+
+    /// The cohort leave-one-out subtraction (`e_step_cohort_loo`) forms
+    /// `expected_counts − own_counts`, where `expected_counts` uses
+    /// [`accumulate_expected_counts`]'s hand-unrolled biallelic-diploid fast
+    /// path while `own_counts` uses the general [`accumulate_row_counts`]. The
+    /// LOO counts are only correct if the two agree per allele — pin it so a
+    /// future edit to either path fails loudly instead of silently miscalling
+    /// every biallelic cohort genotype.
+    #[test]
+    fn accumulate_expected_counts_fast_path_matches_general_path_for_biallelic_diploid() {
+        let shape = shape_for(2, 2); // genotype order RR, RA, AA
+        let ctx = EmContext {
+            locus: RecordLocus {
+                chrom_id: 1,
+                start: 1,
+                end: 1,
+            },
+            n_samples: 2,
+            n_genotypes: 3,
+            n_alleles: 2,
+            ploidy: 2,
+            shape: &shape,
+            homogeneous_fixation: true,
+            compound_pseudocount: 0.01,
+        };
+        // Two samples, arbitrary per-row posteriors (need not be normalised for
+        // the count arithmetic to line up).
+        let posteriors = [0.2_f64, 0.5, 0.3, 0.7, 0.1, 0.2];
+
+        // Fast path — the biallelic-diploid specialisation.
+        let mut fast = vec![0.0_f64; 2];
+        accumulate_expected_counts(ctx, &posteriors, &mut fast);
+
+        // General path — the same sum via `accumulate_row_counts` per row.
+        let mut general = vec![0.0_f64; 2];
+        for row in posteriors.chunks_exact(3) {
+            accumulate_row_counts(&shape, 2, row, &mut general);
+        }
+
+        assert!(
+            (fast[0] - general[0]).abs() < 1e-12,
+            "ref {} vs {}",
+            fast[0],
+            general[0]
+        );
+        assert!(
+            (fast[1] - general[1]).abs() < 1e-12,
+            "alt {} vs {}",
+            fast[1],
+            general[1]
+        );
+    }
+
+    /// With **flat** likelihoods the per-sample posterior IS the normalised
+    /// genotype prior, so at `F = 0` the engine's Dirichlet-multinomial path must
+    /// reproduce the pure `genetics::dirichlet_multinomial_log_priors` value for
+    /// the record's shape — the G4 "engine matches the pure primitive" check.
+    fn assert_dm_prior_matches_pure(ploidy: u8, alleles: Vec<&[u8]>, theta: f64) {
+        let n_alleles = alleles.len();
+        let n_genotypes = genotype_order(ploidy, n_alleles).len();
+        let flat = vec![vec![0.0_f64; n_genotypes]]; // one sample, flat likelihood
+        let record = merged_record_simple(1, 100, alleles, ploidy, flat);
+        let cfg = PosteriorEngineConfig::with_project_defaults()
+            .with_nucleotide_diversity(theta)
+            .unwrap();
+        let mut out = engine_for_with_config(record, cfg);
+        let rec = out.remove(0).expect("posterior record");
+
+        let alpha = crate::genetics::alpha_from_diversity(n_alleles, theta);
+        let shape = shape_for(ploidy, n_alleles);
+        let dm = crate::genetics::dirichlet_multinomial_log_priors(
+            &shape.genotype_allele_counts,
+            &shape.log_multinomial_coeffs,
+            n_alleles,
+            &alpha,
+        );
+        let expected = softmax_row(&dm);
+        assert_eq!(rec.posteriors.len(), n_genotypes);
+        for (g, (&post, &exp)) in rec.posteriors.iter().zip(&expected).enumerate() {
+            assert!(
+                (post - exp).abs() < 1e-12,
+                "genotype {g}: engine {post} vs pure {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn dirichlet_prior_matches_pure_value_biallelic_diploid() {
+        assert_dm_prior_matches_pure(2, vec![b"A", b"G"], 1e-3);
+    }
+
+    #[test]
+    fn dirichlet_prior_matches_pure_value_triallelic_diploid() {
+        assert_dm_prior_matches_pure(2, vec![b"A", b"G", b"C"], 5e-3);
+    }
+
+    #[test]
+    fn dirichlet_prior_matches_pure_value_tetraploid_biallelic() {
+        assert_dm_prior_matches_pure(4, vec![b"A", b"G"], 2e-2);
+    }
+
+    /// Full inbreeding (`F = 1`): the Wright mixture floors every heterozygote and
+    /// leaves the homozygotes carrying the IBD marginal `α_a/Σα`, so for a
+    /// biallelic site AA:BB = α_ref:α_alt = 1:θ. Confirms the DM prior threads
+    /// through the existing Wright-`F` mixture unchanged at the `F = 1` limit.
+    #[test]
+    fn dirichlet_prior_full_inbreeding_concentrates_on_homozygotes() {
+        let theta = 1e-3;
+        let flat = vec![vec![0.0_f64; 3]];
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, flat);
+        let cfg = PosteriorEngineConfig::with_project_defaults()
+            .with_nucleotide_diversity(theta)
+            .unwrap()
+            .with_fixation_index_default(1.0)
+            .unwrap();
+        let mut out = engine_for_with_config(record, cfg);
+        let rec = out.remove(0).expect("posterior record");
+        // Heterozygote floored.
+        assert!(
+            rec.posteriors[1] < 1e-9,
+            "het not floored: {}",
+            rec.posteriors[1]
+        );
+        // AA:BB = α_ref:α_alt = 1:θ.
+        let ratio = rec.posteriors[0] / rec.posteriors[2];
+        assert!(
+            (ratio / (1.0 / theta) - 1.0).abs() < 1e-6,
+            "AA:BB ratio {ratio} vs {}",
+            1.0 / theta
+        );
+    }
+
+    /// The Dirichlet-multinomial prior reproduces the biallelic low-coverage
+    /// fix end-to-end: the same "0 ref, 2 alt reads" record the grid prior flips
+    /// to hom-alt is also called hom-alt under the general θ-driven path (the DM
+    /// het:hom-alt ratio ≈ 2:1 overrides the weak likelihood).
+    #[test]
+    fn dirichlet_prior_flips_single_sample_low_coverage_homalt_call() {
+        let eps = 0.01_f64;
+        let likelihoods = vec![vec![
+            (eps * eps).ln(),
+            0.25_f64.ln(),
+            ((1.0 - eps) * (1.0 - eps)).ln(),
+        ]];
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, likelihoods);
+        // The DM SFS prior is now the sole (default) genotype prior: its
+        // het:hom-alt ratio ≈ 2:1 lets the reads win → hom-alt (correct), not the
+        // het the old n=1 reference-pseudocount plug-in over-called.
+        assert_eq!(single_ok(record).best_genotype, vec![2]);
+    }
+
+    /// The production **SIMD** backend (`InterpUnivariateSimdMath`, `HAS_LANE_4`)
+    /// runs its own DM fill loop and 4-lane batch consumption, distinct from the
+    /// scalar `e_step` the other DM tests exercise. With 5 samples the batch loop
+    /// (samples 0..4) AND the scalar tail (sample 4) both run; the SIMD posteriors
+    /// must match the exact scalar path (pinned to the pure DM value elsewhere)
+    /// within the interpolation tolerance. Guards a silent typo in the SIMD DM
+    /// branch — the path production actually takes.
+    #[test]
+    fn dirichlet_prior_simd_backend_matches_scalar_across_batch_and_tail() {
+        let theta = 5e-3;
+        let flat = vec![vec![0.0_f64; 3]; 5]; // 5 samples → batch of 4 + 1 tail
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, flat);
+        let cfg = || {
+            PosteriorEngineConfig::with_project_defaults()
+                .with_nucleotide_diversity(theta)
+                .unwrap()
+        };
+        // Exact scalar reference.
+        let mut scalar = engine_for_with_config(record.clone(), cfg());
+        let scalar = scalar.remove(0).expect("scalar posterior");
+        // Production SIMD backend.
+        let simd_upstream = std::iter::once(Ok::<_, PerGroupMergerError>(record));
+        let mut simd: Vec<_> = PosteriorEngine::with_math_backend(
+            simd_upstream,
+            cfg(),
+            super::backends::InterpUnivariateSimdMath,
+        )
+        .collect();
+        let simd = simd.remove(0).expect("simd posterior");
+        assert_eq!(scalar.posteriors.len(), simd.posteriors.len());
+        for (a, b) in scalar.posteriors.iter().zip(&simd.posteriors) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "SIMD DM diverged from scalar: {a} vs {b}"
+            );
+        }
+        assert_eq!(scalar.best_genotype, simd.best_genotype);
+    }
+
+    /// Same SIMD-vs-scalar parity as above but under **heterogeneous** per-sample
+    /// inbreeding, so the SIMD batch loop takes its per-cell IBD branch — the one
+    /// that reads the now-record-static `log_p_effective` (the DM's `log(α_a/Σα)`)
+    /// via `log_sum_exp_2_x4`. The homogeneous case above short-circuits that term
+    /// (`F = 0 ⇒ log_f = −∞`), so this is what actually exercises the SIMD read of
+    /// the α-based frequency after the per-iteration fill loop was deleted.
+    #[test]
+    fn dirichlet_prior_simd_matches_scalar_under_heterogeneous_inbreeding() {
+        let flat = vec![vec![0.0_f64; 3]; 5]; // 5 samples → batch of 4 + 1 tail
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, flat);
+        let cfg = || {
+            let mut c = PosteriorEngineConfig::with_project_defaults()
+                .with_nucleotide_diversity(5e-3)
+                .unwrap();
+            // Distinct per-sample F → heterogeneous path, differing across the
+            // 4-lane batch and into the scalar tail.
+            c.fixation_index_overrides = Some(vec![0.0, 0.5, 0.9, 0.2, 0.7]);
+            c
+        };
+        let mut scalar = engine_for_with_config(record.clone(), cfg());
+        let scalar = scalar.remove(0).expect("scalar posterior");
+        let simd_upstream = std::iter::once(Ok::<_, PerGroupMergerError>(record));
+        let mut simd: Vec<_> = PosteriorEngine::with_math_backend(
+            simd_upstream,
+            cfg(),
+            super::backends::InterpUnivariateSimdMath,
+        )
+        .collect();
+        let simd = simd.remove(0).expect("simd posterior");
+        for (a, b) in scalar.posteriors.iter().zip(&simd.posteriors) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "SIMD DM (heterogeneous F) diverged from scalar: {a} vs {b}"
+            );
+        }
+        assert_eq!(scalar.best_genotype, simd.best_genotype);
+    }
+
+    /// `with_nucleotide_diversity` accepts finite non-negative θ̂ (including 0)
+    /// and rejects NaN / +∞ / negative — the wiring-error guard.
+    #[test]
+    fn with_nucleotide_diversity_validates_theta() {
+        let base = PosteriorEngineConfig::with_project_defaults;
+        assert!(base().with_nucleotide_diversity(0.0).is_ok());
+        assert!(base().with_nucleotide_diversity(1e-3).is_ok());
+        assert_eq!(
+            base().with_nucleotide_diversity(-1e-3).unwrap_err(),
+            PosteriorEngineConfigError::InvalidNucleotideDiversity { got: -1e-3 }
+        );
+        assert!(matches!(
+            base().with_nucleotide_diversity(f64::NAN).unwrap_err(),
+            PosteriorEngineConfigError::InvalidNucleotideDiversity { .. }
+        ));
+        assert!(matches!(
+            base().with_nucleotide_diversity(f64::INFINITY).unwrap_err(),
+            PosteriorEngineConfigError::InvalidNucleotideDiversity { .. }
+        ));
+    }
+
+    /// Under the DM prior, per-sample inbreeding F still routes through the
+    /// heterogeneous Wright mixture: a selfing sample (F=0.9) carries a smaller
+    /// heterozygote prior than an outbred one (F=0) at the same site. Exercises
+    /// the per-sample (non-homogeneous) branch with the α-based IBD term.
+    #[test]
+    fn dirichlet_prior_heterogeneous_inbreeding_lowers_het_for_the_selfer() {
+        let flat = vec![vec![0.0_f64; 3], vec![0.0_f64; 3]]; // 2 samples
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, flat);
+        let mut cfg = PosteriorEngineConfig::with_project_defaults()
+            .with_nucleotide_diversity(1e-2)
+            .unwrap();
+        cfg.fixation_index_overrides = Some(vec![0.0, 0.9]);
+        let mut out = engine_for_with_config(record, cfg);
+        let rec = out.remove(0).expect("posterior record");
+        // posteriors are sample-major: [s0: 0/0,0/1,1/1 | s1: 0/0,0/1,1/1].
+        let het_outbred = rec.posteriors[1];
+        let het_selfer = rec.posteriors[3 + 1];
+        assert!(
+            het_selfer < het_outbred,
+            "selfer het {het_selfer} not < outbred het {het_outbred}"
+        );
+    }
+
+    /// θ̂ = 0 (a fully-invariant cohort, or `--diversity 0`): α_alt floors to
+    /// `MIN_ALT_CONCENTRATION` so the prior is effectively certain hom-ref rather
+    /// than `NaN` — graceful degradation matching the biallelic grid path.
+    #[test]
+    fn dirichlet_prior_zero_theta_is_certain_homref() {
+        let flat = vec![vec![0.0_f64; 3]];
+        let record = merged_record_simple(1, 100, vec![b"A", b"G"], 2, flat);
+        let cfg = PosteriorEngineConfig::with_project_defaults()
+            .with_nucleotide_diversity(0.0)
+            .unwrap();
+        let mut out = engine_for_with_config(record, cfg);
+        let rec = out.remove(0).expect("posterior record");
+        assert!(
+            rec.posteriors[0] > 0.999_999_999,
+            "homref {} not ~1",
+            rec.posteriors[0]
+        );
+        assert_eq!(rec.best_genotype, vec![0]);
     }
 
     /// Proptest-friendly variant of [`single_ok`]: returns the engine's
@@ -4582,6 +5271,32 @@ mod tests {
                 assert_eq!(*kind, NonFiniteKind::NegativeInfinity);
             }
             other => panic!("expected NonFinitePosterior, got {other:?}"),
+        }
+    }
+
+    /// The multi-sample non-finite guard: a cohort routes iteration 1 through
+    /// `e_step_flat`, so an all-`-∞` likelihood row on a *non-first* sample must
+    /// surface `NonFinitePosterior` tagged with that sample's index (the guard
+    /// in `e_step_flat`, distinct from the single-sample species-path guard
+    /// above).
+    #[test]
+    fn cohort_flat_step_surfaces_non_finite_posterior_for_bad_non_first_sample() {
+        let good = || vec![-2.0_f64, 0.0, -2.0];
+        let bad = || vec![f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let record = merged_record_simple(3, 55, vec![b"A", b"C"], 2, vec![good(), bad(), good()]);
+        let out = engine_for(record);
+        match &out[0] {
+            Err(PosteriorEngineError::NonFinitePosterior {
+                sample_idx,
+                genotype_idx,
+                kind,
+                ..
+            }) => {
+                assert_eq!(*sample_idx, 1, "expected the bad sample (index 1)");
+                assert!(genotype_idx.is_none());
+                assert_eq!(*kind, NonFiniteKind::NegativeInfinity);
+            }
+            other => panic!("expected NonFinitePosterior for sample 1, got {other:?}"),
         }
     }
 

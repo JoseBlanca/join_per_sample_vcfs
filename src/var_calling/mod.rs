@@ -60,6 +60,12 @@ pub(crate) mod types;
 pub(crate) mod variant_caller;
 pub mod vcf_writer;
 
+// --- Pre-calling cohort estimation (seeds prior hyperparameters) ---
+// Runs before the genotyping EM; not part of the byte-identity math contract.
+// Reads the per-sample `.psp` summaries to estimate cohort diversity θ and
+// per-sample inbreeding F for the SFS genotype prior.
+pub mod diversity;
+
 /// Default `--min-qual` (phred) emission gate (CLI default).
 pub const DEFAULT_MIN_QUAL_PHRED: f64 = 30.0;
 /// Default `--min-alt-obs-per-sample` (CLI default).

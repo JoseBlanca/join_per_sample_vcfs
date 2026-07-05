@@ -129,6 +129,16 @@ fn cohort_prior_pulls_lone_weak_alt_back_to_ref() {
     assert!(pr.allele_frequencies[1] < 0.1);
 }
 
+/// The **empirical-Bayes large-cohort regime** (arch §10, Milestone 4): five
+/// samples with weak-but-consistent het evidence let the cohort overrule the
+/// rare-allele species prior and call het.
+///
+/// This is the unit-level proof of cohort strength-borrowing. Each sample alone
+/// (the single-sample species prior) would call hom-ref against the rare-allele
+/// prior; pooled via the leave-one-out frequency-posterior update
+/// (`α'_s = α_species + expected cohort allele copies of the *other* samples`),
+/// the accumulated evidence sharpens each sample's prior toward het. Landed with
+/// the flat-first-step + leave-one-out EM (arch §10.2).
 #[test]
 fn cohort_evidence_overcomes_rare_allele_prior_when_all_samples_agree() {
     let likelihoods: Vec<Vec<f64>> = (0..5).map(|_| vec![-2.0, 0.0, -2.0]).collect();
@@ -137,15 +147,155 @@ fn cohort_evidence_overcomes_rare_allele_prior_when_all_samples_agree() {
     for &g in &pr.best_genotype {
         assert_eq!(g, 1, "best_genotype = {:?}", pr.best_genotype);
     }
-    // p̂[alt] should be appreciable. For 5 het samples (E[n_alt] ≈ 5
-    // out of 10 chromosomes) with α_ref = 10, α_alt = 0.01:
-    // p̂[alt] ≈ 5.01 / 20.01 ≈ 0.25 in the idealised case; the weak
-    // het likelihood smears it a bit lower.
     assert!(
         pr.allele_frequencies[1] > 0.15,
         "p̂[alt] = {}",
         pr.allele_frequencies[1]
     );
+}
+
+/// Cohort sharpening generalises past biallelic diploid: a **triallelic**
+/// diploid site where five samples all weakly favour the same REF/ALT1
+/// heterozygote is called het by the cohort, while the identical evidence from a
+/// lone sample stays hom-ref (the leave-one-out single-sample guarantee, arch
+/// §10.2a). Genotype order for 3 alleles is `AA, AC, CC, AG, CG, GG`, so the
+/// A/C het is index 1 and the all-ref hom is index 0.
+#[test]
+fn cohort_sharpens_a_multiallelic_het_a_lone_sample_leaves_hom_ref() {
+    // Weakly favour the A/C het (index 1) over everything else.
+    let weak_ac_het = || {
+        let mut ll = vec![-2.0_f64; 6];
+        ll[1] = 0.0;
+        ll
+    };
+
+    let cohort: Vec<Vec<f64>> = (0..5).map(|_| weak_ac_het()).collect();
+    let record = merged_record_simple(1, 100, vec![b"A", b"C", b"G"], 2, cohort);
+    let pr = collect_ok(vec![record]).into_iter().next().unwrap();
+    // ALT2 (G) is unused → pruned to the biallelic [A, C]; the A/C het remains
+    // index 1 in the pruned genotype order (AA, AC, CC).
+    for &g in &pr.best_genotype {
+        assert_eq!(g, 1, "cohort best_genotype = {:?}", pr.best_genotype);
+    }
+    assert!(
+        pr.allele_frequencies[1] > 0.15,
+        "p̂[C] = {}",
+        pr.allele_frequencies[1]
+    );
+
+    // The same weak evidence, alone, must not be talked into a het.
+    let lone = merged_record_simple(1, 100, vec![b"A", b"C", b"G"], 2, vec![weak_ac_het()]);
+    let pr_lone = collect_ok(vec![lone]).into_iter().next().unwrap();
+    assert_eq!(
+        pr_lone.best_genotype,
+        vec![0],
+        "lone best_genotype = {:?}",
+        pr_lone.best_genotype
+    );
+}
+
+/// Cohort sharpening at higher ploidy: a **tetraploid** biallelic site where
+/// five samples all weakly favour the balanced (2-ALT-copy) genotype is called
+/// heterozygous by the cohort, while a lone sample with the same evidence stays
+/// hom-ref. Genotype order for ploidy 4 / 2 alleles is by ALT-copy count
+/// `0,1,2,3,4`, so the 2-copy genotype is index 2 and the all-ref hom is 0.
+#[test]
+fn cohort_sharpens_a_polyploid_het_a_lone_sample_leaves_hom_ref() {
+    let weak_two_copy = || {
+        let mut ll = vec![-2.0_f64; 5];
+        ll[2] = 0.0;
+        ll
+    };
+
+    let cohort: Vec<Vec<f64>> = (0..5).map(|_| weak_two_copy()).collect();
+    let record = merged_record_simple(1, 100, vec![b"A", b"C"], 4, cohort);
+    let pr = collect_ok(vec![record]).into_iter().next().unwrap();
+    for &g in &pr.best_genotype {
+        assert_eq!(g, 2, "cohort best_genotype = {:?}", pr.best_genotype);
+    }
+    assert!(
+        pr.allele_frequencies[1] > 0.15,
+        "p̂[alt] = {}",
+        pr.allele_frequencies[1]
+    );
+
+    let lone = merged_record_simple(1, 100, vec![b"A", b"C"], 4, vec![weak_two_copy()]);
+    let pr_lone = collect_ok(vec![lone]).into_iter().next().unwrap();
+    assert_eq!(
+        pr_lone.best_genotype,
+        vec![0],
+        "lone best_genotype = {:?}",
+        pr_lone.best_genotype
+    );
+}
+
+/// The leave-one-out cohort prior couples samples through `expected_counts`, but
+/// with unambiguous per-sample evidence (no genotype-probability ties) the
+/// per-sample calls stay exactly equivariant under a sample-order permutation.
+/// (The order-dependent floating sum in `expected_counts` can only flip a call
+/// at an exact tie, which this fixture avoids.)
+#[test]
+fn cohort_loo_per_sample_calls_follow_sample_permutation() {
+    // Distinct, sharp evidence: hom-ref / het / hom-alt / hom-ref / het.
+    let rows: Vec<Vec<f64>> = vec![
+        vec![0.0, -30.0, -60.0],
+        vec![-30.0, 0.0, -30.0],
+        vec![-60.0, -30.0, 0.0],
+        vec![0.0, -30.0, -60.0],
+        vec![-30.0, 0.0, -30.0],
+    ];
+    let base = collect_ok(vec![merged_record_simple(
+        1,
+        100,
+        vec![b"A", b"C"],
+        2,
+        rows.clone(),
+    )])
+    .into_iter()
+    .next()
+    .unwrap();
+
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    let permuted = collect_ok(vec![merged_record_simple(
+        1,
+        100,
+        vec![b"A", b"C"],
+        2,
+        reversed,
+    )])
+    .into_iter()
+    .next()
+    .unwrap();
+
+    let n = base.best_genotype.len();
+    assert_eq!(n, permuted.best_genotype.len());
+    for i in 0..n {
+        assert_eq!(
+            base.best_genotype[i],
+            permuted.best_genotype[n - 1 - i],
+            "sample {i} call not equivariant under sample-order reversal: {:?} vs reversed {:?}",
+            base.best_genotype,
+            permuted.best_genotype
+        );
+    }
+}
+
+/// A cohort never converges on its flat first iteration: the emitted genotypes
+/// come from the leave-one-out prior, so the EM runs iteration 1 (flat) plus at
+/// least one steady-state (LOO) iteration, and `converged` reflects LOO
+/// stability rather than the likelihood-only seed (arch §10.2b).
+#[test]
+fn cohort_runs_at_least_one_leave_one_out_iteration_before_converging() {
+    let likelihoods: Vec<Vec<f64>> = (0..5).map(|_| vec![-2.0, 0.0, -2.0]).collect();
+    let record = merged_record_simple(1, 100, vec![b"A", b"C"], 2, likelihoods);
+    let pr = collect_ok(vec![record]).into_iter().next().unwrap();
+    assert!(
+        pr.diagnostics.iterations >= 2,
+        "cohort converged on the flat step alone: iterations = {}",
+        pr.diagnostics.iterations
+    );
+    assert!(pr.diagnostics.converged, "expected convergence");
 }
 
 #[test]

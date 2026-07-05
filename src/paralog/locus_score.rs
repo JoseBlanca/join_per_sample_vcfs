@@ -33,6 +33,9 @@
 //! [`SingleCopyCoverageModel`]: crate::paralog::SingleCopyCoverageModel
 
 use super::ParalogModelParams;
+use crate::genetics::{
+    PROBABILITY_FLOOR, linear_grid_point, sfs_grid_point, wright_genotype_log_priors,
+};
 
 /// One sample's evidence at a locus — built for *every* locus scored, not
 /// only known paralogs.
@@ -95,11 +98,6 @@ impl ParalogScore {
 /// `0.5·ln(2π)` — the constant term of a Normal log-density.
 const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
 
-/// A tiny floor clamping an analytically-positive probability away from
-/// `ln(0) = −∞`. The prototype instead *adds* `1e-300`; the clamp is
-/// equivalent to f64 precision for any realistic probability and likewise
-/// never bites on the default grids.
-const PROB_FLOOR: f64 = 1e-300;
 
 /// A usable sample paired with its one-copy relative-depth SD (σ₀). Formed
 /// once in [`score_locus_for_paralogy`] after validation (coverage
@@ -211,12 +209,15 @@ impl ParalogScorePrecompute {
         let carrier_freq_points = grid.n_points;
         let mut carrier_probs = Vec::with_capacity(carrier_freq_points * cohort_size);
         for iq in 0..carrier_freq_points {
-            let q = linspace_point(iq, carrier_freq_points, grid.lo, grid.hi);
+            let q = linear_grid_point(iq, carrier_freq_points, grid.lo, grid.hi);
             for &f in inbreeding {
                 // Wright dosage HWE: P(non-carrier) = (1−q)² + F·q(1−q), floored
                 // exactly as the old inline code did so the `.ln()` is identical.
-                let p_noncarrier = ((1.0 - q) * (1.0 - q) + f * q * (1.0 - q)).max(PROB_FLOOR);
-                carrier_probs.push((p_noncarrier.ln(), (1.0 - p_noncarrier).max(PROB_FLOOR).ln()));
+                let p_noncarrier = ((1.0 - q) * (1.0 - q) + f * q * (1.0 - q)).max(PROBABILITY_FLOOR);
+                carrier_probs.push((
+                    p_noncarrier.ln(),
+                    (1.0 - p_noncarrier).max(PROBABILITY_FLOOR).ln(),
+                ));
             }
         }
 
@@ -453,36 +454,6 @@ fn enumerate_carrier_configs(params: &ParalogModelParams) -> Vec<CarrierConfig> 
         }
     }
     out
-}
-
-/// The `i`-th of `n` folded-SFS grid points on `[inv2n, 1−inv2n]`, uniform in
-/// `p`. A single-point grid collapses to the midpoint `0.5`.
-fn sfs_grid_point(i: usize, n: usize, inv2n: f64) -> f64 {
-    linspace_point(i, n, inv2n, 1.0 - inv2n)
-}
-
-/// The `i`-th of `n` points on the inclusive linear grid `[lo, hi]`. `n <= 1`
-/// yields the midpoint (a degenerate grid still returns a usable point).
-fn linspace_point(i: usize, n: usize, lo: f64, hi: f64) -> f64 {
-    if n <= 1 {
-        return 0.5 * (lo + hi);
-    }
-    lo + (hi - lo) * (i as f64) / ((n - 1) as f64)
-}
-
-/// The Wright inbreeding-adjusted HWE genotype log-priors `(hom-ref, het,
-/// hom-alt)` at ALT frequency `p` and inbreeding `F`:
-/// `P(het) = 2pq(1−F)`, homozygotes `q²+Fpq` / `p²+Fpq` (`q = 1−p`).
-fn wright_genotype_log_priors(p: f64, f: f64) -> (f64, f64, f64) {
-    let q = 1.0 - p;
-    let het = 2.0 * p * q * (1.0 - f);
-    let hom_ref = q * q + f * p * q;
-    let hom_alt = p * p + f * p * q;
-    (
-        hom_ref.max(PROB_FLOOR).ln(),
-        het.max(PROB_FLOOR).ln(),
-        hom_alt.max(PROB_FLOOR).ln(),
-    )
 }
 
 /// A Normal log-density `ln N(x; μ, σ)`. `σ` must be `> 0`.
@@ -857,25 +828,4 @@ mod tests {
         assert!((vafs[3] - 3.0 / 7.0).abs() < 1e-12);
     }
 
-    /// A degenerate (`n <= 1`) grid returns the interval midpoint rather than
-    /// dividing by `n − 1 = 0`.
-    #[test]
-    fn linspace_point_degenerate_grid_returns_midpoint() {
-        assert_eq!(linspace_point(0, 1, 0.2, 0.8), 0.5);
-        assert_eq!(linspace_point(0, 0, 0.2, 0.8), 0.5);
-        assert_eq!(sfs_grid_point(0, 1, 0.01), 0.5);
-    }
-
-    /// The Wright genotype priors are a proper distribution: `hom-ref + het +
-    /// hom-alt = 1` for every `(p, F)` — a coefficient typo would break this.
-    #[test]
-    fn wright_genotype_priors_sum_to_one() {
-        for &p in &[0.01, 0.2, 0.5, 0.9] {
-            for &f in &[0.0, 0.3, 0.99] {
-                let (a, b, c) = wright_genotype_log_priors(p, f);
-                let sum = a.exp() + b.exp() + c.exp();
-                assert!((sum - 1.0).abs() < 1e-12, "p={p} F={f} sum={sum}");
-            }
-        }
-    }
 }
