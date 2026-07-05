@@ -392,3 +392,228 @@ hand-computed value and the `F`-mixture limit (`F=0` random, `F=1` homozygotes).
   unchanged. Only the genotype-prior *source* moves.
 - **The pileup phase** — no new statistics required for the first cut; it already
   writes the counts Component A needs.
+
+---
+
+## 10. Milestone 4 — empirical-Bayes large-cohort sharpening (design, 2026-07-05)
+
+**Status:** design **signed off by the owner 2026-07-05**; implementation in
+progress. Implements Milestone 4 of
+[../implementation_plans/sfs_genotype_prior_generalization.md](../implementation_plans/sfs_genotype_prior_generalization.md).
+This section settles the four decisions the plan flags: the `α'` update mechanics,
+the EM initialisation/convergence fix, the `m_step` interaction, and
+biallelic-vs-general behaviour. **Sign-off decisions:** leave-one-out is the
+mechanism (single-sample byte-identical to §9 by construction); the permissive
+flat-start is the first cut (tomato2 gates spurious het inflation); the large-N
+shared-prior compute shortcut is deferred to the perf review.
+
+### 10.0 The problem, in plain English
+
+The prior we ship today (§9) is *species-only*. It asks one question of every
+sample in isolation: "given that this species carries variants at rate θ, and I
+know nothing else about this site, what genotype do these reads imply?" For a
+single sample that is exactly right — it is what stopped the low-coverage
+het over-call. But it throws away a real source of evidence: **the other samples
+at the same site.**
+
+Picture five samples, each with shallow coverage — say two reads, one reference
+and one alternate. Alone, each one is ambiguous: one alt read is as easily a
+sequencing error as a true heterozygous site, and the species prior ("alt alleles
+are rare") tips each one to homozygous-reference. But all five showing the *same*
+alt allele is not a coincidence you expect from independent errors. Together they
+are good evidence that the site really is polymorphic, and each individual is
+probably a true heterozygote. The caller should let the cohort talk each sample
+out of the conservative call. That is **strength borrowing**, and the species-only
+prior cannot do it because it never looks at more than one sample at a time.
+
+The fix keeps the exact same machine (§9) and only changes *what frequency the
+prior is built from*: instead of the fixed species rate θ, use the frequency the
+**cohort's own reads** imply at this site.
+
+### 10.1 The model — a prior that the cohort updates
+
+The site-frequency spectrum is a Dirichlet *prior* on the site's allele
+frequency. The cohort's reads are data. Bayes' rule turns the prior into a
+**posterior** frequency, and because the Dirichlet is conjugate to the multinomial
+allele-count likelihood, that posterior is again a Dirichlet — with its
+concentration bumped by the observed allele copies:
+
+```text
+species prior      α_species = alpha_from_diversity(k, θ̂)        =  [1, θ̂/(k−1), …]
+cohort update      α'        = α_species + E[cohort allele copies]
+genotype prior     log P(g)  = dirichlet_multinomial_log_priors(shape, α')   ← §9.1, α → α'
+```
+
+`E[cohort allele copies]` is the posterior-weighted allele-count vector the EM
+already computes every iteration — `accumulate_expected_counts` inside
+`m_step_p_hat` (`scratch.expected_counts`). So the genotype prior is *the same
+Dirichlet-multinomial formula as §9*, evaluated at a concentration that has been
+nudged by the cohort. No new prior implementation, no grid.
+
+The interpolation is automatic and is the whole point:
+
+- **Few samples** → `E[counts]` is small → `α' ≈ α_species` → the single-sample
+  fix from §9 is untouched.
+- **Large cohort agreeing** → `E[counts]` dominates the small `α_species` → the
+  prior sharpens toward the cohort's actual frequency → strength borrowing.
+
+`F` (inbreeding) rides on top exactly as in §9.3 — the Wright mixture is
+unchanged; it now just reads its independent term and its IBD marginal
+`log(α'_a/Σα')` off the *updated* `α'` instead of the fixed one.
+
+### 10.2 Why the naive version fails, and the two things that fix it
+
+Coupling the prior back to `E[counts]` re-introduces two classic pitfalls. Both
+have clean, standard resolutions, and together they are the real content of this
+milestone.
+
+#### (a) A sample must not vote for its own prior — **leave-one-out**
+
+If sample *s*'s genotype prior is built from an `E[counts]` that *includes sample
+s's own reads*, the sample reinforces itself: one alt read raises `α'_alt`, the
+raised prior makes the alt read look more like a real het, which raises `α'_alt`
+further. A **single** low-coverage sample would talk *itself* into a
+heterozygote — precisely the over-call §9 was built to kill. That would regress
+GIAB, which is a non-negotiable.
+
+The standard fix is **leave-one-out** (LOO): the prior handed to sample *s*
+excludes *s*'s own expected counts.
+
+```text
+α'_s = α_species + ( E[total counts]  −  E[own counts of s] )
+```
+
+This is not a tuning knob; it is what makes the scheme correct, and it earns two
+guarantees for free:
+
+1. **Single-sample runs are byte-identical to §9.** With one sample,
+   `E[total] − E[own] = 0`, so `α'_s = α_species` on every iteration. The
+   genotype prior, the final posteriors, GQ, and the calls are exactly today's.
+   **GIAB — a per-sample benchmark — passes by construction, not by re-measuring.**
+   (The §9 parity tests, all single-sample, stay green for the same reason.)
+2. **No self-reinforcement at any cohort size.** Each sample is judged against
+   what the *rest* of the cohort says, never against an echo of itself.
+
+The cost: the genotype prior is now **per-sample** (each `α'_s` differs), so the
+homogeneous-fixation hoist that computes one shared prior row per iteration (H4 in
+the perf review) no longer applies for `n_samples > 1`. Each sample pays its own
+Dirichlet-multinomial `lgamma` evaluation per iteration. For `n_samples = 1` the
+prior collapses to `α_species` and today's fast path is preserved. This is
+expected per-iteration `lgamma` work; §10.5 flags it for the perf review.
+
+#### (b) Starting at "everyone hom-ref" traps the cohort — **neutral first step**
+
+The EM finds a *local* optimum. If it starts from the species prior (everyone
+looks hom-ref → `E[counts]_alt ≈ 0` → `α'_alt` stays tiny → the prior keeps
+everyone hom-ref), the cohort of weak hets is stuck at the wrong answer — the
+counts never grow, so the prior never sharpens. Walking through the iterations by
+hand confirms it: five samples at one-ref-one-alt started from `α_species` creep
+*back* toward hom-ref, never toward het. This is the trap the plan warns about.
+
+The escape is to let the **first** E-step run with a **flat genotype prior**
+(likelihood only — no species prior, no cohort prior). The reads, unopposed, place
+each sample at the genotype they actually favour; the resulting `E[counts]` is an
+honest, cohort-wide read on the frequency; and from iteration 2 onward the
+leave-one-out EB prior takes over. Concretely:
+
+```text
+iteration 1     genotype prior = flat            (posterior ∝ likelihood)
+iteration ≥ 2   genotype prior = LOO EB prior    α'_s = α_species + (E[total] − E[own_s])
+convergence     unchanged — still on p̂            (m_step / pseudocounts untouched)
+```
+
+The flat first step is neutral, not pro-het: a genuinely monomorphic site has
+every sample's likelihood pinned at hom-ref, so `E[counts]_alt` comes out ≈ 0 on
+iteration 1 and the site stays monomorphic. It only lets *ambiguous* sites float
+up to where the reads point before the prior weighs in.
+
+Crucially, **leave-one-out still protects a single sample even with the flat
+start.** Iteration 1 may float a lone weak sample toward het, but with one sample
+`E[total] − E[own] = 0`, so iteration 2 snaps it straight back to `α_species` →
+hom-ref. The flat start changes the *cohort* trajectory without loosening the
+single-sample guarantee.
+
+### 10.3 What this does to small cohorts — the one behaviour to watch
+
+The flat first step sets an implicit *threshold*: how many corroborating samples
+it takes to overturn the species prior and call het. Hand-tracing the two-read
+`(1 ref, 1 alt)` case: one sample → hom-ref (guaranteed), and a handful of
+agreeing samples is enough to reach het. A strict marginal-likelihood accounting
+(pay the SFS "variants are rare" penalty once, earn the per-sample likelihood gain
+N times) puts the crossover at a small N that grows as the per-sample evidence
+weakens. The flat-start + LOO scheme lands on the *permissive* side of that
+crossover — it will call het for small agreeing cohorts.
+
+This is a **model choice, not a bug**, and it is the one place the owner should
+weigh in:
+
+- **Permissive (this proposal).** Two-plus independent samples showing the same
+  allele is real corroboration; calling het is defensible and is exactly the
+  joint-calling benefit. Simplest; passes the cohort test; GIAB-safe by LOO.
+- **Stricter.** Raise the crossover by making the first step *warm* instead of
+  flat (a down-weighted species prior on iteration 1), or by a
+  multi-start + evidence-selection EM (run from both the hom-ref and the flat
+  seed, keep the higher cohort evidence). More faithful to the marginal-likelihood
+  optimum; more code and compute.
+
+**Recommendation:** ship the permissive flat-start + LOO scheme first. It is the
+minimal correct change, byte-identical on GIAB, and passes the cohort unit test.
+Use the **tomato cohort** (real, inbred, `F > 0`) as the accuracy gate: selfing
+already damps heterozygosity, and the callset-coherence analysis will show whether
+the small-cohort threshold produces *spurious het inflation*. If it does, escalate
+to the warm-start or multi-start variant — the machinery (α' update, LOO) is
+identical; only the iteration-1 seed changes.
+
+### 10.4 `m_step`, pseudocounts, and AF — unchanged
+
+`α'` is built from `α_species` (`= [1, θ̂/(k−1), …]`) **plus the EM's real
+expected counts** — *not* from the `ref = 10` / SNP / indel Dirichlet
+pseudocounts. Those pseudocounts keep their existing job on a separate axis:
+
+- `m_step_p_hat` still forms `p̂` with the pseudocounts → drives `INFO/AF`.
+- the `α_ref` / `α_alt` Beta pair still feeds the exact-AF QUAL marginalisation.
+
+Neither path reads the genotype prior, so neither changes. The genotype prior and
+the AF/QUAL estimate stay decoupled — the genotype prior marginalises the cohort
+frequency *posterior*; AF/QUAL keep their pseudocount-regularised point estimate.
+This preserves the §9 separation and means the QUAL/precision/recall profile
+GIAB validated is untouched at `n = 1`.
+
+### 10.5 Shapes, correctness, and the implementation surface
+
+- **Any `(ploidy, n_alleles)`.** `E[counts]`, `α_species`, and the DM primitive
+  are all defined per allele over the general genotype shape; the LOO subtraction
+  is per allele. Biallelic diploid is just the `k = 2`, `ploidy = 2` case. The new
+  synthetic multiallelic + polyploid end-to-end tests (plan G6) exercise the rest.
+- **Positivity.** `α'_a` is `α_species_a` (strictly positive — `α_ref = 1`,
+  `α_alt ≥ MIN_ALT_CONCENTRATION`) plus a non-negative LOO count, so it stays
+  `> 0`; `lgamma` is always finite. (Floating-point subtraction of the own-count
+  could dip a hair below the total; clamp `E[total] − E[own]` at 0 to be safe.)
+- **Data flow.** The LOO prior for sample *s* in iteration *t* needs (i) the
+  cohort total `E[counts]` from iteration *t−1* (already in
+  `scratch.expected_counts` after the `m_step`) and (ii) *s*'s own expected counts
+  from iteration *t−1*, recomputed on the fly from `scratch.posteriors[s]`
+  **before** the E-step overwrites that row. No new per-sample storage.
+- **Where the code changes.** `run_em_loop` gains an iteration counter feeding an
+  "iteration 1 = flat prior" branch; the per-sample E-step
+  (`fill_log_indep_per_g` + the Wright mixture) moves inside the sample loop for
+  `n > 1` to consume the per-sample `α'_s` (via `log_p_effective`,
+  `lgamma_alpha`, `alpha`, now refreshed per sample rather than once per record).
+  `m_step_p_hat` / `accumulate_expected_counts` / the QUAL path are untouched.
+- **Perf.** Per-sample, per-iteration `lgamma` for `n > 1`, replacing §9's
+  once-per-record fill. Flagged for the perf review; the biallelic-diploid case is
+  ~6 `lgamma` per sample per iteration. `n = 1` keeps the fast path.
+
+### 10.6 Validation plan (gate)
+
+1. Flip `#[ignore]` off
+   `cohort_evidence_overcomes_rare_allele_prior_when_all_samples_agree` — the
+   unit-level proof that five agreeing weak samples now call het (and AF > 0.15).
+2. **GIAB** (`run_ours_per_sample.sh`, 5/10/15/30×): byte-identical to §9 by the
+   LOO single-sample guarantee — re-run only to confirm the guarantee holds in
+   practice (concordance ≈ 94.9 %, no precision/recall/FP move).
+3. **tomato2** (59-sample real cohort, inbred): profile-coherence / callset-change
+   analysis — cohort evidence sharpens low-depth-consistent sites toward het where
+   warranted **without spurious het inflation**; π/profile stays coherent. Selfing
+   `F > 0` damps the effect — a sanity gate, not a concordance number.
+4. Add the synthetic multiallelic + polyploid end-to-end tests (plan G6).
