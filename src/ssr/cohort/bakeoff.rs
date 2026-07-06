@@ -23,7 +23,7 @@ use crate::ssr::cohort::candidate_set::{CandidateCfg, assemble_candidates};
 use crate::ssr::cohort::em::{EmCfg, run_locus_em_with};
 use crate::ssr::cohort::em_init::seed_locus;
 use crate::ssr::cohort::param_estimation::{
-    DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, StutterShape,
+    DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, PurityLevel, StutterShape,
 };
 use crate::ssr::cohort::read_model::ReadLikelihoodModel;
 use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
@@ -172,6 +172,7 @@ pub(crate) fn param_set_from_truth(spec: &SimCohortSpec, truth: &TruthTable) -> 
         pseudocount_decay_per_loci_group,
         group_of_sample: truth.group_of_sample.clone(),
         f0_seed: 0.0,
+        purity_level: PurityLevel::none(),
     }
 }
 

@@ -285,7 +285,7 @@ pub(crate) fn run_cohort_em(
 mod tests {
     use super::*;
     use crate::ssr::cohort::param_estimation::{
-        G0FitCfg, G0PseudocountDecay, PerBaseError, SampleGroupId, StutterShape,
+        G0FitCfg, G0PseudocountDecay, PerBaseError, PurityLevel, SampleGroupId, StutterShape,
     };
     use crate::ssr::cohort::sim::{
         SimChemistry, SimCohortSpec, SimGenotype, SimLocus, SimSample, simulate,
@@ -316,6 +316,7 @@ mod tests {
             pseudocount_decay_per_loci_group: decay,
             group_of_sample: vec![SampleGroupId(0); n_samples],
             f0_seed: 0.0,
+            purity_level: PurityLevel::none(),
         }
     }
 
@@ -421,7 +422,7 @@ mod tests {
     #[test]
     fn full_pipeline_calls_and_emits_a_variant_vcf_line() {
         use crate::ssr::cohort::candidate_set::assemble_candidates;
-        use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, PerBaseError};
+        use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, PerBaseError, PurityLevel};
         use crate::ssr::cohort::prepass::{estimate, run_prepass_stats};
         use crate::ssr::cohort::rung_ladder::build_rungs;
         use crate::ssr::cohort::sample_groups::{ClusterCfg, group_samples};
@@ -499,6 +500,7 @@ mod tests {
             pseudocount_decay_per_loci_group: decay,
             group_of_sample,
             f0_seed: 0.0,
+            purity_level: PurityLevel::none(),
         };
 
         // Genotype with the outer loop, then FP-control + emit.

@@ -186,7 +186,9 @@ fn period_decay(
 mod tests {
     use super::*;
     use crate::ssr::cohort::candidate_set::{Admission, CandidateCfg, assemble_candidates};
-    use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, PerBaseError, SampleGroupId};
+    use crate::ssr::cohort::param_estimation::{
+        G0PseudocountDecay, PerBaseError, PurityLevel, SampleGroupId,
+    };
     use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
     use crate::ssr::cohort::types::{CohortLocus, LocusId, SampleEvidence, SsrQc};
     use crate::ssr::types::Motif;
@@ -236,6 +238,7 @@ mod tests {
             pseudocount_decay_per_loci_group: decay,
             group_of_sample: vec![SampleGroupId(0)],
             f0_seed: 0.0,
+            purity_level: PurityLevel::none(),
         }
     }
 

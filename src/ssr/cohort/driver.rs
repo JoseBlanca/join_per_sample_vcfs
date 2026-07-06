@@ -26,7 +26,7 @@ use crate::ssr::cohort::em_init::seed_locus;
 use crate::ssr::cohort::inbreeding::{OuterCfg, run_cohort_em};
 use crate::ssr::cohort::merge::{CohortMerger, SsrMergeError};
 use crate::ssr::cohort::param_estimation::{
-    G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError, StutterLevel,
+    G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError, PurityLevel, StutterLevel,
 };
 use crate::ssr::cohort::prepass::{EstimatedParams, estimate, run_prepass_stats};
 use crate::ssr::cohort::read_model::HipstrModel;
@@ -159,6 +159,8 @@ pub(crate) fn build_param_set(
         stutter_shape_parent: est.shape_by_period.clone(),
         stutter_shape_by_cell: grouped.shape_by_group_period.clone(),
         level_seed: grouped.level_per_group.clone(),
+        // Phase-1-neutral until the P2.2 pre-pass fits the purity → level factor.
+        purity_level: PurityLevel::none(),
         pseudocount_decay_per_loci_group,
         group_of_sample,
         // `F` is estimated and frozen by the burn-in (arch §4), not here.
@@ -1143,8 +1145,9 @@ mod tests {
     struct AlleleSlip {
         period: usize,
         units: u16,
-        /// Interruptions at the **true** catalog period: positions `i ≥ period` with
-        /// `seq[i] != seq[i - period]`. `0` ⇒ a pure motif tiling.
+        /// Interruptions at the **true** catalog period (the canonical
+        /// [`interruption_count`](crate::ssr::cohort::param_estimation::interruption_count)).
+        /// `0` ⇒ a pure motif tiling.
         interruptions: u32,
         faithful: u64,
         slip_by_delta: std::collections::BTreeMap<i32, u64>,
@@ -1152,13 +1155,12 @@ mod tests {
 
     impl AlleleSlip {
         fn new(seq: &[u8], period: usize) -> Self {
-            let interruptions = (period..seq.len())
-                .filter(|&i| seq[i] != seq[i - period])
-                .count() as u32;
             AlleleSlip {
                 period,
                 units: (seq.len() / period.max(1)) as u16,
-                interruptions,
+                interruptions: crate::ssr::cohort::param_estimation::interruption_count(
+                    seq, period,
+                ),
                 faithful: 0,
                 slip_by_delta: std::collections::BTreeMap::new(),
             }
