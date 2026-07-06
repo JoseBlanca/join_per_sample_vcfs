@@ -29,6 +29,31 @@ paralog .psp coverage-by-GC evidence already produced in Stage 1. Until a guard
 exists, gate Phase 1 on a benchmark FP audit that specifically counts cohort-
 universal same-length hets as suspected paralog artifacts.
 
+SSR Phase-2 purity->level — fit from the broad caller genotypes, not the
+confident-genotype pre-pass. Phase 2 (per-allele purity->stutter-level, spec
+ssr_interrupted_repeat_recall.md 6) is built and correct: the pre-pass fits a
+cohort-global per_interruption_factor (prepass.rs fit_purity_level) and the read
+model applies it (em.rs candidate_level). It is guarded (fixed-length contrast,
+capped at 1, floored, none() when no clean contrast) and collapses to Phase 1.
+But on ssr_tomato1 it is INERT (factor 1.0): the pre-pass's data source -- the
+confident-genotype gate (resolve_confident_genotype) -- yields no robust
+fixed-length purity contrast, and at a relaxed read floor even a WRONG-SIGNED one
+(impure appears to slip MORE), so the fit correctly refuses it. This contradicts
+the P2.0 measurement (driver.rs measure_allele_slips, the ignored
+p20_dump_per_allele_slip_stats test), which -- over ALL called alleles with the
+caller's own sequence attribution -- found impure alleles slip ~0.35x at fixed
+length. So the effect is real in the broad population but not recoverable from the
+thinner, length-attributed confident-homozygote subset the spec 6.4 fit uses
+(possibly the confident population is genuinely different, or the broad-population
+signal is partly an attribution/het-contamination artifact -- unresolved). Owner
+decision 2026-07-06: ship Phase 2 guarded + inert; do NOT force a wrong-signed
+factor. Follow-up if impure-loci GQ calibration becomes a priority: refit the
+purity factor from the caller's own post-genotyping alleles (the P2.0 population)
+instead of the confident pre-pass, or reconcile the population discrepancy (add a
+units>=3 filter + sequence attribution to the pre-pass purity_slip accumulation).
+Report: doc/devel/reports/ssr_interrupted_repeat_p20_slip_measurement_2026-07-06.md
+and the P2.3 section of the validation report.
+
 SSR pre-pass D1 — model-based confident-genotype resolution test (replace the
 length heuristic). The pre-pass that estimates the frozen chemistry parameters
 (per-base error eps, stutter shape/level) picks its "confident genotypes" with a
