@@ -14,6 +14,7 @@
 
 use crate::ssr::cohort::allele_freq_prior::g0_pseudocounts;
 use crate::ssr::cohort::candidate_set::CandidateSet;
+use crate::ssr::cohort::pair_hmm::{HmmScratch, align_subst};
 use crate::ssr::cohort::param_estimation::{ParamSet, StutterShape};
 use crate::ssr::cohort::rung_ladder::{Rungs, sample_clear_peaks};
 use crate::ssr::cohort::types::CohortLocus;
@@ -35,18 +36,64 @@ const FALLBACK_SHAPE: StutterShape = StutterShape {
     decay: 0.1,
 };
 
-/// The first candidate index whose allele has `length` repeat units, if any.
+/// The candidate a sample's peak seeds its allele-copies onto: the candidate whose sequence
+/// **equals** the sample's representative `target` at `length` (so a same-length homozygote
+/// seeds *its own* composition, not just the first candidate at that length — the P1.3 fix),
+/// else — when that representative is not itself an admitted candidate — the closest
+/// same-length candidate by `align_subst` (the substitution metric the read likelihood uses,
+/// arch §2.4), ties broken on the lower candidate index. `None` iff no candidate sits at
+/// `length`.
 ///
-/// SIMPLIFICATION: a rung can legitimately hold several same-length sequences
-/// (substitution / interruption variants, first-class per spec §5/§7); this maps a
-/// nominated length to the *first* such candidate. Exact for the pure tracts that
-/// dominate; multi-variant-per-length attribution is a follow-up tied to S2 impure
-/// alleles.
-fn candidate_of_length(candidates: &CandidateSet, period: usize, length: u16) -> Option<usize> {
+/// `eps` is evaluated **lazily**, only on the fallback path (a sample whose plurality
+/// sequence is not an admitted candidate), so the common exact-match case pays nothing and
+/// never touches per-sample chemistry.
+///
+/// SAME-LENGTH HET LIMITATION (spec §5.3): a same-length het shows one length peak with one
+/// representative, so **both** allele copies seed the *majority* composition here (a hom
+/// seed); the minority same-length allele starts only at its `G₀` floor. Recovering the het
+/// is the EM's job (P1.4), not the seed's — documented, not fixed, in Phase 1.
+fn candidate_for_sequence(
+    candidates: &CandidateSet,
+    target: &[u8],
+    period: usize,
+    length: u16,
+    eps: impl FnOnce() -> f64,
+    scratch: &mut HmmScratch,
+) -> Option<usize> {
+    if let Some(idx) = candidates
+        .alleles
+        .iter()
+        .position(|seq| seq.as_ref() == target)
+    {
+        return Some(idx);
+    }
+    let eps = eps();
     candidates
         .alleles
         .iter()
-        .position(|seq| (seq.len() / period) as u16 == length)
+        .enumerate()
+        .filter(|(_, seq)| (seq.len() / period) as u16 == length)
+        .map(|(idx, seq)| (idx, align_subst(target, seq, eps, scratch)))
+        // Strict `>` keeps the first (lowest-index) maximum on a score tie (arch §2.4).
+        .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
+        .map(|(idx, _)| idx)
+}
+
+/// The frozen per-base error `ε` for present sample `k_present` (its sample group's value).
+/// Reached only on the seed's rare fallback path, so it indexes **loudly** — matching
+/// `em::sample_chemistry`'s decision-E contract — to surface a malformed `ParamSet` rather
+/// than fabricate default chemistry.
+fn sample_eps(locus: &CohortLocus, k_present: usize, params: &ParamSet) -> f64 {
+    let global = locus.present[k_present] as usize;
+    let group = *params
+        .group_of_sample
+        .get(global)
+        .expect("decision E: every present sample has a frozen sample group");
+    params
+        .error_per_sample_group
+        .get(group.0 as usize)
+        .expect("every sample group has a frozen ε")
+        .0
 }
 
 /// Build the per-locus EM seed.
@@ -63,7 +110,10 @@ pub(crate) fn seed_locus(
     // Start the tally from the G₀ pseudocounts (so every candidate stays > 0).
     let mut counts = g0_pseudocounts(candidates, rungs, period_decay(params, period));
 
-    for evidence in &locus.samples {
+    // Reused across samples for the (rare) composition fallback in `candidate_for_sequence`.
+    let mut scratch = HmmScratch::new();
+
+    for (k_present, evidence) in locus.samples.iter().enumerate() {
         let mut peaks = sample_clear_peaks(evidence, period, prominence);
         if peaks.is_empty() {
             continue; // no putative genotype for this sample → prior only
@@ -75,17 +125,33 @@ pub(crate) fn seed_locus(
         });
 
         // Exactly `ploidy` allele-copies: the top peaks get one each; any shortfall
-        // (an under-resolved / homozygous sample) is absorbed by the top peak.
+        // (an under-resolved / homozygous sample) is absorbed by the top peak. Each peak
+        // seeds the candidate matching its **representative sequence** (not just its length),
+        // so two same-length candidates are seeded by composition (spec §5.3).
         let resolved = peaks.len().min(ploidy as usize);
         let mut copies_left = ploidy as usize;
         for peak in &peaks[..resolved] {
-            if let Some(idx) = candidate_of_length(candidates, period, peak.repeat_len) {
+            if let Some(idx) = candidate_for_sequence(
+                candidates,
+                peak.allele.as_ref(),
+                period,
+                peak.repeat_len,
+                || sample_eps(locus, k_present, params),
+                &mut scratch,
+            ) {
                 counts[idx] += 1.0;
                 copies_left -= 1;
             }
         }
         if copies_left > 0
-            && let Some(idx) = candidate_of_length(candidates, period, peaks[0].repeat_len)
+            && let Some(idx) = candidate_for_sequence(
+                candidates,
+                peaks[0].allele.as_ref(),
+                period,
+                peaks[0].repeat_len,
+                || sample_eps(locus, k_present, params),
+                &mut scratch,
+            )
         {
             counts[idx] += copies_left as f64;
         }
@@ -120,7 +186,7 @@ fn period_decay(
 mod tests {
     use super::*;
     use crate::ssr::cohort::candidate_set::{Admission, CandidateCfg, assemble_candidates};
-    use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, SampleGroupId};
+    use crate::ssr::cohort::param_estimation::{G0PseudocountDecay, PerBaseError, SampleGroupId};
     use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
     use crate::ssr::cohort::types::{CohortLocus, LocusId, SampleEvidence, SsrQc};
     use crate::ssr::types::Motif;
@@ -198,7 +264,11 @@ mod tests {
         let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
         let s = seed_locus(&locus, &rungs, &candidates, &params_with_decay(0.5), 2, 3);
 
-        let six = candidate_of_length(&candidates, 2, 6).unwrap();
+        let six = candidates
+            .alleles
+            .iter()
+            .position(|seq| seq.len() / 2 == 6)
+            .unwrap();
         let top = (0..s.pi0.len())
             .max_by(|&a, &b| s.pi0[a].partial_cmp(&s.pi0[b]).unwrap())
             .unwrap();
@@ -240,5 +310,129 @@ mod tests {
         params.stutter_shape_parent.insert(2, parent);
         let s = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
         assert_eq!(s.theta0, parent);
+    }
+
+    // ── P1.3: sequence-aware seed (same-length composition) ──
+
+    /// `CA×6` (12 bp) — the pure same-length allele (candidate index 0 in these fixtures).
+    fn pure6() -> Box<[u8]> {
+        ca_seq(6)
+    }
+
+    /// A same-length (12 bp) interruption sibling of `pure6`: one interior base flipped.
+    fn interrupted6() -> Box<[u8]> {
+        let mut s = pure6().to_vec();
+        s[5] = b'T';
+        s.into_boxed_slice()
+    }
+
+    /// A sample observing the given `(sequence, count)` pairs (byte-sorted, zeros dropped).
+    fn seq_sample(entries: &[(Box<[u8]>, u32)]) -> SampleEvidence {
+        let mut seq_counts: Vec<(Box<[u8]>, u32)> =
+            entries.iter().filter(|(_, c)| *c > 0).cloned().collect();
+        seq_counts.sort_by(|(a, _), (b, _)| a.cmp(b));
+        SampleEvidence {
+            seq_counts,
+            qc: SsrQc::default(),
+        }
+    }
+
+    /// Params carrying a real per-base error (for the seed's composition fallback path).
+    fn params_with_eps(p_decay: f64, eps: f64) -> ParamSet {
+        let mut params = params_with_decay(p_decay);
+        params.error_per_sample_group = vec![PerBaseError(eps)];
+        params
+    }
+
+    /// The two same-length candidates `[pure6, interrupted6]` (ref = pure at index 0).
+    fn same_length_candidates() -> CandidateSet {
+        CandidateSet {
+            alleles: vec![pure6(), interrupted6()],
+            ref_idx: 0,
+            admit: Admission::Pass,
+        }
+    }
+
+    #[test]
+    fn same_length_homozygote_seeds_its_own_composition() {
+        // A sample homozygous for the *interrupted* allele must seed the interrupted candidate
+        // (index 1), not the first-at-length (pure, index 0) the old length-only seed loaded.
+        // G₀ starts both same-length candidates equal (both at the modal length), so any
+        // asymmetry in π⁰ comes purely from the composition-aware seed (spec §5.3).
+        let sample = seq_sample(&[(interrupted6(), 50)]);
+        let locus = locus_with(6, vec![sample]);
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let s = seed_locus(
+            &locus,
+            &rungs,
+            &same_length_candidates(),
+            &params_with_decay(0.5),
+            2,
+            3,
+        );
+        assert!(
+            s.pi0[1] > s.pi0[0],
+            "the interrupted allele's own composition must dominate the seed"
+        );
+        assert!(s.pi0[1] > 0.5, "both copies seed the interrupted candidate");
+    }
+
+    #[test]
+    fn same_length_het_seeds_a_hom_for_the_majority_documented_limitation() {
+        // A same-length het (majority interrupted, minority pure) shows ONE length peak with
+        // ONE representative, so the seed cannot express the het: both copies load the
+        // majority (interrupted), and the minority (pure) starts only at its G₀ floor. This
+        // is the documented Phase-1 limitation (spec §5.3) — a correct het seed would be
+        // ~0.5/0.5; recovering it is the EM's job (P1.4), asserted in P1.5.
+        let sample = seq_sample(&[(pure6(), 10), (interrupted6(), 40)]);
+        let locus = locus_with(6, vec![sample]);
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let s = seed_locus(
+            &locus,
+            &rungs,
+            &same_length_candidates(),
+            &params_with_decay(0.5),
+            2,
+            3,
+        );
+        // Both copies on the majority → π⁰ ≈ [0.25, 0.75], NOT the ~[0.5, 0.5] of a het seed.
+        assert!(
+            s.pi0[1] > 0.7,
+            "both allele copies seed the majority (a hom seed), not a het"
+        );
+        assert!(
+            s.pi0[0] < 0.3,
+            "the minority same-length allele gets only its G₀ floor"
+        );
+    }
+
+    #[test]
+    fn seed_falls_back_to_the_composition_closest_candidate() {
+        // A sample whose plurality sequence is a private double-substitution variant that is
+        // NOT an admitted candidate. The seed's exact match fails, so it falls back to the
+        // closest same-length candidate by `align_subst`: the variant differs from
+        // interrupted6 by one base and from pure6 by two, so the interrupted candidate (index
+        // 1) must win — exercising the fallback + `sample_eps` path.
+        let variant6: Box<[u8]> = {
+            let mut s = interrupted6().to_vec();
+            s[9] = b'G'; // a second substitution → 1 base from interrupted6, 2 from pure6
+            s.into_boxed_slice()
+        };
+        assert_eq!(variant6.len(), 12, "still a same-length (12 bp) variant");
+        let sample = seq_sample(&[(variant6, 50)]);
+        let locus = locus_with(6, vec![sample]);
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let s = seed_locus(
+            &locus,
+            &rungs,
+            &same_length_candidates(),
+            &params_with_eps(0.5, 0.01),
+            2,
+            3,
+        );
+        assert!(
+            s.pi0[1] > s.pi0[0],
+            "the composition-closest candidate (interrupted) must take the seed mass"
+        );
     }
 }
