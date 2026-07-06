@@ -19,8 +19,23 @@ use std::collections::BTreeMap;
 
 use crate::ssr::cohort::types::{CohortLocus, SampleEvidence};
 
-/// A distinct observed sequence and its read count — the element a rung holds.
-type SeqCount = (Box<[u8]>, u32);
+/// A distinct observed sequence at a rung with its cohort support — the element a rung
+/// holds.
+///
+/// `reads` is the total cohort read count; `samples` is the number of **distinct samples**
+/// that observed it. The sample count is the recurrence signal the same-length admission
+/// bar keys on (spec §5.2): a real interruption haplotype recurs across its carriers, a
+/// per-base substitution error is sporadic and lands at a different base each time. It is
+/// an integer count → order-free, so it does not disturb cross-thread determinism (arch §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RungSeq {
+    /// The distinct tract sequence.
+    pub(crate) seq: Box<[u8]>,
+    /// Total cohort reads supporting this sequence at its length.
+    pub(crate) reads: u32,
+    /// Number of distinct samples that observed this sequence (spec §5.2 recurrence).
+    pub(crate) samples: u32,
+}
 
 /// One resolved peak with its labelled parent allele.
 ///
@@ -125,9 +140,9 @@ pub(crate) struct Rungs {
     cohort_support: BTreeMap<u16, u32>,
     /// Per length: number of samples in which that length is a clear local maximum.
     peak_recurrence: BTreeMap<u16, u32>,
-    /// Per length: distinct sequences at that length and their cohort counts
+    /// Per length: distinct sequences at that length with their cohort support
     /// (a rung holds a *set* of sequences — substitution / interruption variants).
-    seqs_by_length: BTreeMap<u16, Vec<SeqCount>>,
+    seqs_by_length: BTreeMap<u16, Vec<RungSeq>>,
 }
 
 impl Rungs {
@@ -146,8 +161,8 @@ impl Rungs {
         self.peak_recurrence.get(&length).copied().unwrap_or(0)
     }
 
-    /// The distinct sequences (with cohort counts) at `length` units, if any.
-    pub(crate) fn seqs_at(&self, length: u16) -> Option<&[SeqCount]> {
+    /// The distinct sequences (with cohort support) at `length` units, byte-sorted, if any.
+    pub(crate) fn seqs_at(&self, length: u16) -> Option<&[RungSeq]> {
         self.seqs_by_length.get(&length).map(Vec::as_slice)
     }
 
@@ -201,16 +216,26 @@ pub(crate) fn build_rungs(locus: &CohortLocus, cfg: &RungCfg) -> Rungs {
     let period = locus.motif.period().max(1);
     let mut cohort_support: BTreeMap<u16, u32> = BTreeMap::new();
     let mut peak_recurrence: BTreeMap<u16, u32> = BTreeMap::new();
-    let mut seqs_by_length: BTreeMap<u16, Vec<SeqCount>> = BTreeMap::new();
+    let mut seqs_by_length: BTreeMap<u16, Vec<RungSeq>> = BTreeMap::new();
 
     for evidence in &locus.samples {
+        // Each `(seq, count)` in a sample's `seq_counts` is one distinct sample observing
+        // that sequence (the Stage-1 contract keys `seq_counts` on distinct sequences), so
+        // every match/insert here increments the per-sequence distinct-sample tally by one.
         for (seq, count) in &evidence.seq_counts {
             let units = (seq.len() / period) as u16;
             *cohort_support.entry(units).or_insert(0) += count;
             let bucket = seqs_by_length.entry(units).or_default();
-            match bucket.iter_mut().find(|(s, _)| s.as_ref() == seq.as_ref()) {
-                Some((_, c)) => *c += count,
-                None => bucket.push((seq.clone(), *count)),
+            match bucket.iter_mut().find(|rs| rs.seq.as_ref() == seq.as_ref()) {
+                Some(rs) => {
+                    rs.reads += count;
+                    rs.samples += 1;
+                }
+                None => bucket.push(RungSeq {
+                    seq: seq.clone(),
+                    reads: *count,
+                    samples: 1,
+                }),
             }
         }
         let histogram = sample_histogram(evidence, period);
@@ -223,7 +248,7 @@ pub(crate) fn build_rungs(locus: &CohortLocus, cfg: &RungCfg) -> Rungs {
 
     // Deterministic, distinct-sequence order within each rung (bytes ascending).
     for bucket in seqs_by_length.values_mut() {
-        bucket.sort_by(|(a, _), (b, _)| a.cmp(b));
+        bucket.sort_by(|a, b| a.seq.cmp(&b.seq));
     }
 
     let lengths = cohort_support.keys().copied().collect();
@@ -385,6 +410,13 @@ mod tests {
     use crate::ssr::cohort::types::{CohortLocus, LocusId, SampleEvidence, SsrQc};
     use crate::ssr::types::Motif;
 
+    /// A `CA`-tiled tract of `units` repeat units (12 bp for `units = 6`).
+    fn ca_seq(units: u16) -> Box<[u8]> {
+        std::iter::repeat_n(*b"CA", units as usize)
+            .flatten()
+            .collect()
+    }
+
     /// A `SampleEvidence` over a CA (period-2) motif from `(units, count)` bins —
     /// each bin becomes the tiled sequence `CA × units`. Sorted ascending by bytes
     /// (the Stage-1 contract).
@@ -439,7 +471,65 @@ mod tests {
         assert_eq!(rungs.cohort_support(6), 100); // 50 + 50
         assert_eq!(rungs.peak_recurrence(6), 2); // both samples peak at 6
         assert_eq!(rungs.peak_recurrence(5), 0); // stutter band, never a peak
-        assert_eq!(rungs.seqs_at(6).unwrap().len(), 1);
+        let modal = rungs.seqs_at(6).unwrap();
+        assert_eq!(modal.len(), 1);
+        assert_eq!(modal[0].reads, 100); // 50 + 50 cohort reads
+        assert_eq!(modal[0].samples, 2); // both samples observed the length-6 sequence
+    }
+
+    #[test]
+    fn build_rungs_tallies_distinct_samples_per_same_length_sequence() {
+        // Two same-length (6-unit / 12 bp) sequences: a pure `CA×6` and an interrupted
+        // variant of equal length. The pure allele recurs in 3 samples, the interrupted in
+        // 2, and a singleton substitution noise variant in 1 — the per-sequence sample
+        // tally must separate them (the §5.2 recurrence signal).
+        let pure = ca_seq(6); // CA×6, 12 bp
+        let interrupted: Box<[u8]> = {
+            let mut s = pure.to_vec();
+            s[5] = b'T'; // flip one interior base → same length, distinct sequence
+            s.into_boxed_slice()
+        };
+        let noise: Box<[u8]> = {
+            let mut s = pure.to_vec();
+            s[7] = b'G'; // a different sporadic substitution
+            s.into_boxed_slice()
+        };
+        let sample_of = |seqs: &[&Box<[u8]>]| {
+            let mut seq_counts: Vec<(Box<[u8]>, u32)> =
+                seqs.iter().map(|s| ((*s).clone(), 20)).collect();
+            seq_counts.sort_by(|(a, _), (b, _)| a.cmp(b));
+            SampleEvidence {
+                seq_counts,
+                qc: SsrQc::default(),
+            }
+        };
+        let samples = vec![
+            sample_of(&[&pure, &interrupted]),
+            sample_of(&[&pure, &interrupted]),
+            sample_of(&[&pure, &noise]),
+        ];
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 20,
+                end: 32,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGGGGCACACACACACATTTTTT".as_slice()),
+            pure.clone(),
+        );
+        for (idx, ev) in samples.into_iter().enumerate() {
+            locus.push(idx as u32, ev);
+        }
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+
+        let at6 = rungs.seqs_at(6).unwrap();
+        let tally = |seq: &[u8]| at6.iter().find(|rs| rs.seq.as_ref() == seq).unwrap();
+        assert_eq!(tally(&pure).samples, 3);
+        assert_eq!(tally(&interrupted).samples, 2);
+        assert_eq!(tally(&noise).samples, 1);
+        // Bytes-ascending order within the rung (determinism contract).
+        assert!(at6.windows(2).all(|w| w[0].seq <= w[1].seq));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::ssr::cohort::read_model::{HipstrModel, ReadLikelihoodModel, ReadScori
 use crate::ssr::cohort::rung_ladder::Rungs;
 use crate::ssr::cohort::stutter::refine_theta_locus;
 use crate::ssr::cohort::types::CohortLocus;
+use smallvec::SmallVec;
 
 /// EM controls (pinned in F2).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -90,6 +91,12 @@ pub(crate) struct SampleCall {
     pub(crate) posterior: f64,
     /// Phred genotype quality, capped at 99.
     pub(crate) gq: u8,
+    /// Deconvolved per-called-allele read responsibility, parallel to `allele_indices`:
+    /// `n_a = Σ_reads count · Qᵣ(obs | a) / Σ_{a'∈G} Qᵣ(obs | a')` for the called genotype
+    /// `G`. This is the sequence-aware input to the allele-balance FP term (arch §3), which
+    /// splits reads by *composition* (so a same-length het is deconvolved) rather than by
+    /// tract length. Empty on a no-call and until P1.4 fills it (Phase 1's issue-2 fix).
+    pub(crate) allele_support: SmallVec<[f64; 2]>,
 }
 
 impl SampleCall {
@@ -99,6 +106,7 @@ impl SampleCall {
             genotype_units: Vec::new(),
             posterior: 0.0,
             gq: 0,
+            allele_support: SmallVec::new(),
         }
     }
 }
@@ -517,6 +525,8 @@ fn final_calls(
             genotype_units: vec![cand_units[g.i], cand_units[g.j]],
             posterior,
             gq: phred_gq(posterior),
+            // Filled in P1.4 (sequence-aware allele balance); empty here in Phase-1 types.
+            allele_support: SmallVec::new(),
         });
         posterior_hom.push(p_hom);
     }
@@ -853,6 +863,7 @@ mod tests {
             genotype_units: vec![8, 8],
             posterior: 0.99,
             gq: 40,
+            allele_support: SmallVec::new(),
         }];
         let params = clean_params(1);
         let fit = attribute_locus(&locus, &calls, 2, &params, &params.level_seed);

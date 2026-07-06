@@ -61,6 +61,18 @@ pub(crate) struct CandidateCfg {
     /// HipSTR's per-locus `--max-loc-flank-indel` fraction filter; generous by default,
     /// pinned in F2.
     pub(crate) max_out_of_frame_frac: f64,
+    /// Minimum cohort read count a same-length sequence must carry to be promoted to its own
+    /// candidate — the first of the three joined §5.2 admission conditions (enough total
+    /// support to be more than noise). dev 8; swept against recovered-loci vs new FPs in P1.5.
+    pub(crate) min_same_length_reads: u32,
+    /// Minimum number of **distinct samples** that must observe a same-length sequence for
+    /// promotion — the §5.2 sporadic-vs-systematic recurrence test (a substitution error is
+    /// sporadic; a real interruption allele recurs across carriers). dev 3.
+    pub(crate) min_same_length_samples: u32,
+    /// Minimum share of the reads at a length a same-length sequence must carry for promotion
+    /// — the §5.2 within-length fraction, so a single deeply-sequenced sample cannot alone
+    /// manufacture an allele. dev 0.10.
+    pub(crate) min_same_length_fraction: f64,
 }
 
 impl CandidateCfg {
@@ -71,6 +83,9 @@ impl CandidateCfg {
             min_cohort_depth: 10,
             max_candidate_alleles: 24,
             max_out_of_frame_frac: 0.10,
+            min_same_length_reads: 8,
+            min_same_length_samples: 3,
+            min_same_length_fraction: 0.10,
         }
     }
 }
@@ -138,8 +153,8 @@ fn cohort_representative(rungs: &Rungs, length: u16) -> Option<Box<[u8]>> {
     rungs
         .seqs_at(length)?
         .iter()
-        .max_by(|(a_seq, a_c), (b_seq, b_c)| a_c.cmp(b_c).then_with(|| b_seq.cmp(a_seq)))
-        .map(|(seq, _)| seq.clone())
+        .max_by(|a, b| a.reads.cmp(&b.reads).then_with(|| b.seq.cmp(&a.seq)))
+        .map(|rs| rs.seq.clone())
 }
 
 /// Assemble the candidate set for one locus from its rung ladder (spec §5).
