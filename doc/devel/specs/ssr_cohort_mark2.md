@@ -305,6 +305,16 @@ informative SNP, and it would couple the two callers. We resolve the same merged
 het-vs-stutter ambiguity instead through **cohort recurrence + the per-locus `θ`** above —
 a population lever rather than a physical-phasing one.)*
 
+> **Open for reconsideration (2026-07-06).** The exclusion above rests on keeping
+> the SNP and SSR callers independent. That premise is under review — a **tighter
+> coupling between the two callers** is being evaluated. If they share machinery,
+> SNP-phasing an STR against nearby heterozygous SNPs (read-backed phasing, or
+> borrowing the SNP caller's phase blocks) becomes cheap enough to revisit as a
+> second het-resolution lever alongside cohort recurrence. Still gated by the
+> sparsity concern (reads rarely co-span an STR and an informative SNP), so it
+> would help long-read / dense-SNP regions most; kept as a documented future
+> option, not a commitment.
+
 **Three distinct noise sources — keep them separate.** (1) **stutter** —
 whole-repeat-unit length change (PCR, dominant, length-dependent); (2) **per-base
 error** — substitutions / small indels / flank misplacement (the flat `Qᵣ`); (3)
@@ -1322,6 +1332,37 @@ length-`a` pile inflated by `a+1`'s −1 stutter), so the balance test must run 
 **post-stutter per-read responsibilities** the E-step already produces (which allele
 each read is attributed to *after* `S_θ`), where a real het sits near 1/ploidy — not on
 the raw `(seq, count)` tally.
+
+> **Amendment (2026-07-06) — key the balance on allele *identity*, not tract length.**
+> The deconvolution above must be split by **candidate allele (its sequence)**, never by
+> repeat-unit length, because **two called alleles can share a length**: an interruption
+> polymorphism (`(TA)₃C(TA)₃` vs a pure `(TA)₇` of equal bp, the
+> [interrupted-repeat recall](ssr_interrupted_repeat_recall.md) case) is a genuine
+> heterozygote whose alleles differ only in composition. A length-keyed implementation
+> disables this whole defence for exactly that het, in two ways that must both be avoided:
+> - **The het-vs-hom trigger fires on distinct candidate indices, not distinct lengths.**
+>   Two same-length alleles are a het to be tested; treating "equal length" as "homozygote"
+>   skips the balance check and lets a same-length false het through unpenalised.
+> - **The per-read split attributes by composition, not nearest length.** Each read's
+>   share of allele `a` is the E-step's own `Qᵣ(obs | a)` normalized over the genotype's
+>   alleles — `Qᵣ(obs | A) / (Qᵣ(obs | A) + Qᵣ(obs | B))` for a het `(A,B)` — using the
+>   per-candidate, sequence-level `Qᵣ` the data likelihood already computes (it scores
+>   every observed sequence against every candidate *sequence*, §6). No new deconvolution
+>   is needed; the length-based read attribution is a redundant, worse re-derivation of
+>   what the EM already has, and for same-length alleles it collapses (both alleles are
+>   equidistant, so no split exists).
+>
+> This carries **extra** FP load here: for same-length alleles the `G₀` length prior gives
+> no separation (both sit at the modal length, §5.5) and cohort recurrence cannot tell a
+> real interruption allele from a *systematic* same-length artifact (a collapsed paralog,
+> a consistent mismap), so allele balance is one of the few remaining discriminators —
+> precisely where a length-keyed version silently switches off. The **same
+> identity-not-length rule applies to the per-locus stutter refit's read attribution**
+> (the `θ_locus` M-step, §4.4): it too must attribute reads to called alleles by sequence,
+> though for same-length alleles the slip statistics are length-identical so the refit is
+> effect-neutral and the balance term is the urgent one. (See the
+> [interrupted-repeat recall spec](ssr_interrupted_repeat_recall.md) §5.3 and its risk §10;
+> the paralog FP mode this leaves open is tracked in `doc/devel/TODO.txt`.)
 
 Together: `λ` absorbs **random** junk at the per-read level, the recurrence filter
 removes junk at the **cohort** level (§5), and the **allele-balance / overdispersion**
