@@ -438,4 +438,28 @@ mod tests {
             "the composition-closest candidate (interrupted) must take the seed mass"
         );
     }
+
+    #[test]
+    #[should_panic(expected = "frozen sample group")]
+    fn sample_eps_panics_on_a_sample_missing_its_group() {
+        // Decision-E loud-fail on the seed's composition-fallback path: a ParamSet whose
+        // `group_of_sample` is shorter than the present samples must panic, not fabricate
+        // default-ε chemistry — mirroring `em::sample_chemistry`'s regression test (review Mi5).
+        let sample = seq_sample(&[(interrupted6(), 50)]);
+        let locus = locus_with(6, vec![sample]);
+        let mut params = params_with_eps(0.5, 0.01);
+        params.group_of_sample.clear();
+        let _ = sample_eps(&locus, 0, &params);
+    }
+
+    #[test]
+    fn candidate_for_sequence_returns_none_when_no_candidate_sits_at_the_length() {
+        // No candidate at the target length → None (the fallback must not return a wrong-length
+        // candidate). review §8.
+        let candidates = same_length_candidates(); // both at length 6
+        let mut scratch = HmmScratch::new();
+        let idx =
+            candidate_for_sequence(&candidates, ca_seq(9).as_ref(), 2, 9, || 0.01, &mut scratch);
+        assert_eq!(idx, None);
+    }
 }

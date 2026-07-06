@@ -35,15 +35,18 @@ pub(crate) fn nearest_parent(read_units: i32, parent_units: &[u16]) -> Option<(u
 /// `(index into `called`, signed length slip Δ = read_units − called_units[index])`, or `None`
 /// iff `called` is empty.
 ///
-/// **Length distance first, composition only to break a tie.** A slip *is* a length change, so
-/// the parent is the length-nearest allele (and `align_subst` cannot even score a multi-unit
-/// slip — the gaps exceed its flank band). Composition decides only among the length-nearest,
-/// which is exactly the same-length case an interruption polymorphism creates: there the
-/// `align_subst` substitution score — the metric inside `Qᵣ`, so attribution and the
-/// likelihood agree (spec §5.3) — picks the composition-matching allele. The slip `Δ` is
-/// identical whichever same-length allele wins, so the `θ_locus` slip statistics are unchanged
-/// (effect-neutral), but the code is no longer length-keyed. A tie on `align_subst` → the
-/// lower index (the shared deterministic tie-break).
+/// **Length distance first; composition only to break a *same-length* tie.** A slip *is* a
+/// length change, so the parent is the length-nearest allele (and `align_subst` cannot even
+/// score a multi-unit slip — the gaps exceed its flank band). The composition tie-break is used
+/// **only among length-nearest alleles that share a length** — exactly the same-length case an
+/// interruption polymorphism creates, where the `align_subst` substitution score (the metric
+/// inside `Qᵣ`, so attribution and the likelihood agree, spec §5.3) picks the composition-
+/// matching allele; the slip `Δ` is then identical whichever same-length allele wins, so the
+/// `θ_locus` slip statistics are unchanged (effect-neutral). Two *different-length* alleles that
+/// are equidistant from the read carry no composition signal comparable across lengths, so they
+/// keep the deterministic **lowest-index** rule of [`nearest_parent`] (letting `align_subst`
+/// decide there could flip the slip sign). A single nearest allele is taken directly — no
+/// alignment is run, so a pure locus / length-separated het pays only integer comparisons.
 pub(crate) fn nearest_called_by_sequence(
     obs: &[u8],
     read_units: i32,
@@ -55,16 +58,27 @@ pub(crate) fn nearest_called_by_sequence(
         .iter()
         .map(|&(_, units)| (i32::from(units) - read_units).abs())
         .min()?;
-    // Among the length-nearest called alleles, the highest `align_subst`; strict `>` keeps the
-    // first (lowest-index) maximum on a tie. `align_subst` is only decisive when ≥ 2 alleles
-    // share the minimum distance (same-length or equidistant); with one nearest it is a
-    // single, ignored evaluation.
-    let (best_idx, _) = called
+    // Indices of the length-nearest alleles, lowest first.
+    let tied: SmallVec<[usize; 2]> = called
         .iter()
         .enumerate()
         .filter(|&(_, &(_, units))| (i32::from(units) - read_units).abs() == min_dist)
-        .map(|(idx, &(seq, _))| (idx, align_subst(obs, seq, eps, scratch)))
-        .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })?;
+        .map(|(idx, _)| idx)
+        .collect();
+    let all_same_length = tied.iter().all(|&idx| called[idx].1 == called[tied[0]].1);
+    let best_idx = if tied.len() == 1 || !all_same_length {
+        // A single nearest, or a *different-length* equidistant tie: take the lowest index —
+        // no `align_subst`. Matches `nearest_parent`.
+        tied[0]
+    } else {
+        // ≥ 2 alleles tie at the *same* length → break on composition (`align_subst`); strict
+        // `>` keeps the lowest-index maximum. Δ is identical across them, so this is
+        // effect-neutral for the slip stats.
+        tied.iter()
+            .map(|&idx| (idx, align_subst(obs, called[idx].0, eps, scratch)))
+            .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
+            .map_or(tied[0], |(idx, _)| idx)
+    };
     Some((best_idx, read_units - i32::from(called[best_idx].1)))
 }
 
@@ -191,6 +205,26 @@ mod tests {
             nearest_called_by_sequence(b"CACA", 2, &[], EPS, &mut scratch),
             None
         );
+    }
+
+    #[test]
+    fn equidistant_different_length_tie_falls_to_lower_index_not_composition() {
+        // A read equidistant (1 unit) from two DIFFERENT-length alleles whose compositions
+        // differ: the length-6 allele mismatches the read, the length-8 one matches it.
+        // Composition must NOT flip the attribution to the length-8 allele (that is only for
+        // SAME-length ties); the deterministic lowest-index rule of `nearest_parent` holds, so
+        // the slip Δ stays +1 (not −1). (Regression for the equidistant-slip-sign bug.)
+        let a6: Vec<u8> = "CG".repeat(6).into_bytes(); // 12 bytes — mismatches the read
+        let a8: Vec<u8> = "CA".repeat(8).into_bytes(); // 16 bytes — matches the read
+        let read7: Vec<u8> = "CA".repeat(7).into_bytes(); // 14 bytes, 7 units
+        let called: &[(&[u8], u16)] = &[(&a6, 6), (&a8, 8)];
+        let mut scratch = HmmScratch::new();
+        assert_eq!(
+            nearest_called_by_sequence(&read7, 7, called, EPS, &mut scratch),
+            Some((0, 1)),
+            "equidistant different-length tie must not be flipped by composition"
+        );
+        assert_eq!(nearest_parent(7, &[6, 8]), Some((0, 1)));
     }
 
     #[test]

@@ -120,10 +120,14 @@ pub(crate) struct EstimatedParams {
     pub(crate) purity_level: PurityLevel,
 }
 
-/// Minimum reads on **each** side of a fixed-length pure-vs-impure cell for it to inform the
-/// purity fit — thin cells are noise, and the P2.0 contrast was well-powered at ≥100/side.
+/// Minimum reads in a fixed-length pure-vs-impure **cell** (`faithful + slipped`) for it to
+/// inform the purity fit — thin cells are noise. Set to 50 (half the ≥100/side the P2.0 contrast
+/// carried) to admit moderately-covered cells while still excluding singletons; a provisional
+/// dev value, pinned against recovered-vs-spurious purity fits in F2.
 const MIN_PURITY_FIT_READS: u64 = 50;
-/// Floor on the fitted per-interruption factor: an impure allele slips less, never zero.
+/// Floor on the fitted per-interruption factor: an impure allele slips less, never zero. A
+/// conservative guard (not a measured value) so a thin/noisy contrast cannot collapse the factor
+/// to ~0 and silence all stutter on impure alleles; revisit against the purity fits in F2.
 const PURITY_FACTOR_FLOOR: f64 = 0.05;
 
 /// Fit the cohort-global purity → stutter-level factor from the confident-genotype slip
@@ -1008,5 +1012,33 @@ mod tests {
         slip.insert((6u16, 0u32), (40u64, 5u64)); // pure total 45 < 50
         slip.insert((6u16, 1u32), (950u64, 50u64));
         assert_eq!(fit_purity_level(&slip), PurityLevel::none());
+    }
+
+    #[test]
+    fn fit_purity_level_floors_an_extreme_contrast() {
+        // An extreme impure/pure ratio would drive the factor to ~0 (modelled zero stutter);
+        // the floor clamps it (review §8).
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (100u64, 900u64)); // pure rate 0.90
+        slip.insert((6u16, 1u32), (999u64, 1u64)); // impure rate ~0.001 → ratio ~0.001
+        assert_eq!(
+            fit_purity_level(&slip).per_interruption_factor,
+            PURITY_FACTOR_FLOOR
+        );
+    }
+
+    #[test]
+    fn fit_purity_level_fits_multiple_interruption_levels_through_origin() {
+        // Two interruption levels at one length: the through-origin WLS must compound the
+        // per-interruption factor (k=2 ≈ factor²), pinning the "once per interruption" semantics.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (800u64, 200u64)); // pure rate 0.20
+        slip.insert((6u16, 1u32), (900u64, 100u64)); // k=1 rate 0.10 → ratio 0.5
+        slip.insert((6u16, 2u32), (950u64, 50u64)); // k=2 rate 0.05 → ratio 0.25 ≈ 0.5²
+        let f = fit_purity_level(&slip).per_interruption_factor;
+        assert!(
+            (f - 0.5).abs() < 0.05,
+            "compounding per-interruption factor {f}"
+        );
     }
 }

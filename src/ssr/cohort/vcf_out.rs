@@ -162,6 +162,16 @@ pub(crate) fn apply_fp_control(call: &mut LocusCall, cfg: &FpControlCfg) {
         if sample_call.allele_indices.is_empty() {
             continue; // already a no-call
         }
+        // A called het must carry the deconvolved `allele_support` the balance term reads
+        // (`fill_allele_support` fills it in the EM's final E-step). A het that arrives without
+        // it would make `allele_balance` silently return 1.0 and drop the depth-inflated-false-
+        // het defence, so fail loud in debug/test builds rather than lose the filter (review Mi2).
+        debug_assert!(
+            sample_call.allele_indices.len() < 2
+                || sample_call.allele_indices[0] == sample_call.allele_indices[1]
+                || sample_call.allele_support.len() >= 2,
+            "het call reached apply_fp_control without allele_support — fill_allele_support skipped?"
+        );
         let balance = allele_balance(sample_call);
         if balance < cfg.min_allele_balance {
             // A depth-inflated false het: scale GQ by how far below the floor it is.
@@ -573,6 +583,16 @@ mod tests {
         let balanced = het_call(40, 0.99, smallvec![100.0, 100.0]);
         assert!(allele_balance(&imbalanced) < 0.1);
         assert!(allele_balance(&balanced) > 0.45);
+    }
+
+    #[test]
+    fn allele_balance_returns_one_when_support_absent() {
+        // The defensive branch (review Mi2): a het whose `allele_support` was never filled
+        // returns 1.0 (balance test skipped) rather than panicking or misreading. In the
+        // production path `fill_allele_support` always populates it; `apply_fp_control` carries a
+        // `debug_assert!` so a future path that forgets the fill fails loud in tests.
+        let het_no_support = het_call(40, 0.99, SmallVec::new());
+        assert_eq!(allele_balance(&het_no_support), 1.0);
     }
 
     #[test]

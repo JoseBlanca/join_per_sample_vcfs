@@ -447,6 +447,19 @@ fn compute_data_ll<M: ReadLikelihoodModel>(
     let mut data_ll: Vec<Vec<f64>> = Vec::with_capacity(locus.samples.len());
     for (k_present, evidence) in locus.samples.iter().enumerate() {
         let (eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
+        // Per-candidate level (group line × per-locus multiplier × purity) — independent of the
+        // read, so compute it once per sample rather than per (read × candidate).
+        let cand_levels: Vec<f64> = (0..k)
+            .map(|c| {
+                candidate_level(
+                    level,
+                    cand_units[c],
+                    level_multiplier,
+                    &params.purity_level,
+                    cand_interruptions[c],
+                )
+            })
+            .collect();
         // Per (distinct obs, candidate) Qᵣ — the read likelihood matrix.
         let obs_qr: Vec<(u32, Vec<f64>)> = evidence
             .seq_counts
@@ -454,17 +467,10 @@ fn compute_data_ll<M: ReadLikelihoodModel>(
             .map(|(obs, count)| {
                 let row = (0..k)
                     .map(|c| {
-                        let lvl = candidate_level(
-                            level,
-                            cand_units[c],
-                            level_multiplier,
-                            &params.purity_level,
-                            cand_interruptions[c],
-                        );
                         let ctx = ReadScoringContext {
                             motif: &locus.motif,
                             shape: theta,
-                            level: lvl,
+                            level: cand_levels[c],
                             eps,
                         };
                         model.q_r(obs, &candidates.alleles[c], &ctx, scratch)
@@ -630,6 +636,9 @@ fn attribute_locus(
             .collect();
         for (obs, count) in &locus.samples[k_present].seq_counts {
             let read_units = (obs.len() / period) as i32;
+            // PANIC-FREE: the loop above skips empty-`allele_indices` calls, and `called` is built
+            // parallel to `allele_indices`/`genotype_units`, so it is non-empty here;
+            // `nearest_called_by_sequence` returns `None` only for an empty `called` slice.
             let (parent_pos, delta) =
                 nearest_called_by_sequence(obs, read_units, &called, eps, &mut scratch)
                     .expect("a non-empty call has ≥1 allele");
@@ -684,22 +693,30 @@ fn fill_allele_support<M: ReadLikelihoodModel>(
             continue; // a no-call keeps its empty support
         }
         let (eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
+        // Per-called-allele level — same formula (purity included) as the data likelihood, so
+        // the two never disagree — computed once per sample, not per read.
+        let called_levels: SmallVec<[f64; 2]> = call
+            .allele_indices
+            .iter()
+            .map(|&c| {
+                candidate_level(
+                    level,
+                    cand_units[c],
+                    level_multiplier,
+                    &params.purity_level,
+                    cand_interruptions[c],
+                )
+            })
+            .collect();
         let mut support: SmallVec<[f64; 2]> = smallvec![0.0; call.allele_indices.len()];
         for (obs, count) in &locus.samples[k_present].seq_counts {
             // Qᵣ of this observed sequence against each called allele (a handful of distinct
-            // sequences × the ploidy called alleles — cheap; arch §3). Same per-candidate
-            // level (purity included) as the data likelihood, so the two never disagree.
+            // sequences × the ploidy called alleles — cheap; arch §3).
             let qrs: SmallVec<[f64; 2]> = call
                 .allele_indices
                 .iter()
-                .map(|&c| {
-                    let lvl = candidate_level(
-                        level,
-                        cand_units[c],
-                        level_multiplier,
-                        &params.purity_level,
-                        cand_interruptions[c],
-                    );
+                .zip(&called_levels)
+                .map(|(&c, &lvl)| {
                     let ctx = ReadScoringContext {
                         motif: &locus.motif,
                         shape: theta,
@@ -1476,6 +1493,85 @@ mod tests {
         assert!(
             any_call,
             "the cohort produced at least one non-no-call sample"
+        );
+    }
+
+    #[test]
+    fn fill_allele_support_skips_a_read_matching_no_called_allele() {
+        // A read wildly off both called alleles (Σ Qᵣ = 0 — junk the λ term owns) must
+        // contribute nothing to allele_support; the matching reads still apportion fully
+        // (review §8). The junk read is too sparse to be nominated as a candidate.
+        use crate::ssr::cohort::candidate_set::assemble_candidates;
+        use crate::ssr::cohort::em_init::seed_locus;
+        use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+
+        let pure = ca(6);
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[5] = b'T';
+            s.into_boxed_slice()
+        };
+        let junk = ca(30); // 60 bp — 24 units off the 6-unit alleles → Qᵣ underflows to 0
+        let sample = |obs: Vec<(Box<[u8]>, u32)>| {
+            let mut seq_counts = obs;
+            seq_counts.sort_by(|a, b| a.0.cmp(&b.0));
+            SampleEvidence {
+                seq_counts,
+                qc: SsrQc::default(),
+            }
+        };
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 40,
+                end: 52,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGGGG".as_slice()),
+            pure.clone(),
+        );
+        let mut evs = Vec::new();
+        for _ in 0..3 {
+            evs.push(sample(vec![(pure.clone(), 60)]));
+        }
+        for _ in 0..3 {
+            evs.push(sample(vec![(interrupted.clone(), 60)]));
+        }
+        // Carrier: hom-pure (60 reads) + 2 junk reads (too few to be a clear peak → not a
+        // candidate) at a wildly different length.
+        evs.push(sample(vec![(pure.clone(), 60), (junk.clone(), 2)]));
+        let carrier = evs.len() - 1;
+        for (i, ev) in evs.into_iter().enumerate() {
+            locus.push(i as u32, ev);
+        }
+
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        assert_eq!(
+            candidates.alleles.len(),
+            2,
+            "the junk read is not promoted to a candidate"
+        );
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        let c = &call.calls[carrier];
+        assert!(!c.allele_indices.is_empty(), "carrier is called");
+        let support_total: f64 = c.allele_support.iter().sum();
+        // The 2 junk reads must NOT be apportioned: support sums to the 60 matching reads only.
+        assert!(
+            (support_total - 60.0).abs() < 1e-6,
+            "junk read must be skipped (support {support_total}, expected 60)"
         );
     }
 

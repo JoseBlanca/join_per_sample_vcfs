@@ -98,22 +98,37 @@ impl PurityLevel {
 }
 
 /// The **purity measure** (Q-I2): the number of interruptions in a tract — bases that break its
-/// motif tiling. Each position from the second unit on is compared to the corresponding base of
-/// the **first unit** (`seq[i] != seq[i % period]`), so one interrupting base is counted **once**
-/// (unlike a self-periodicity `seq[i] vs seq[i-period]` scan, which flags it ≈ twice). `0` ⇒ a
-/// pure motif tiling — the same pure/impure split the P2.0 gate used. This assumes the first unit
-/// carries the motif phase, which holds for the extracted repeat tracts this scores.
+/// motif tiling. Each of the `period` phase positions (`i mod period`) is scored independently:
+/// its **majority base** across the tract is the motif base for that phase, and every position
+/// deviating from it is one interruption. So a single interrupting base is counted **once** —
+/// including one in the *first* unit (a first-unit-anchored `seq[i] != seq[i % period]` scan
+/// would miscount it ≈ `units−1` times, and a self-periodicity scan ≈ twice). `0` ⇒ a pure motif
+/// tiling — the same pure/impure split the P2.0 gate used, and it is **phase-robust** (it does
+/// not assume the first unit is a clean motif copy).
 ///
 /// Period-1 (mononucleotide) tracts are **not** scored — there every non-matching base is an
 /// "interruption" and stutter already subsumes single-base indels (spec §6), so purity is not
 /// separable; they return `0` (pure).
 pub(crate) fn interruption_count(seq: &[u8], period: usize) -> u32 {
-    if period < 2 {
+    if period < 2 || seq.len() < period {
         return 0;
     }
-    (period..seq.len())
-        .filter(|&i| seq[i] != seq[i % period])
-        .count() as u32
+    let mut interruptions = 0u32;
+    for phase in 0..period {
+        // Tally the bases at this phase (positions `phase, phase+period, …`); the majority is
+        // the phase's motif base, so the rest are interruptions. Integer counts → determinism.
+        let mut base_counts = [0u32; 256];
+        let mut total = 0u32;
+        let mut i = phase;
+        while i < seq.len() {
+            base_counts[seq[i] as usize] += 1;
+            total += 1;
+            i += period;
+        }
+        let majority = base_counts.iter().copied().max().unwrap_or(0);
+        interruptions += total - majority;
+    }
+    interruptions
 }
 
 /// `G₀` geometric pseudocount decay on the allele-frequency prior `π`, per loci
@@ -447,6 +462,21 @@ mod tests {
         assert_eq!(interruption_count(b"TTATTATTATTGTTATTA", 3), 1);
         // Period 1 (mononucleotide) is never scored — purity is not separable there.
         assert_eq!(interruption_count(b"AAAAGAAAA", 1), 0);
+    }
+
+    #[test]
+    fn interruption_count_scores_a_first_unit_interruption_once() {
+        // A CA tract whose FIRST unit carries the substitution (`TA` instead of `CA`). A
+        // first-unit-anchored scan would count every later `C` position as a mismatch
+        // (~units−1); the phase-majority measure counts the lone `T` once.
+        assert_eq!(interruption_count(b"TACACACACACA", 2), 1);
+    }
+
+    #[test]
+    fn interruption_count_is_zero_for_a_tract_shorter_than_one_period() {
+        assert_eq!(interruption_count(b"", 2), 0);
+        assert_eq!(interruption_count(b"C", 2), 0); // shorter than one period
+        assert_eq!(interruption_count(b"CA", 2), 0); // exactly one period, nothing to compare
     }
 
     #[test]
