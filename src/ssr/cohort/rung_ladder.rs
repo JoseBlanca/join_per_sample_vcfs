@@ -494,9 +494,9 @@ mod tests {
             s[7] = b'G'; // a different sporadic substitution
             s.into_boxed_slice()
         };
-        let sample_of = |seqs: &[&Box<[u8]>]| {
+        let sample_of = |seqs: &[&[u8]]| {
             let mut seq_counts: Vec<(Box<[u8]>, u32)> =
-                seqs.iter().map(|s| ((*s).clone(), 20)).collect();
+                seqs.iter().map(|s| (Box::<[u8]>::from(*s), 20)).collect();
             seq_counts.sort_by(|(a, _), (b, _)| a.cmp(b));
             SampleEvidence {
                 seq_counts,
@@ -504,9 +504,9 @@ mod tests {
             }
         };
         let samples = vec![
-            sample_of(&[&pure, &interrupted]),
-            sample_of(&[&pure, &interrupted]),
-            sample_of(&[&pure, &noise]),
+            sample_of(&[pure.as_ref(), interrupted.as_ref()]),
+            sample_of(&[pure.as_ref(), interrupted.as_ref()]),
+            sample_of(&[pure.as_ref(), noise.as_ref()]),
         ];
         let mut locus = CohortLocus::new(
             LocusId {

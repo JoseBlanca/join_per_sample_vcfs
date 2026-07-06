@@ -1130,4 +1130,225 @@ mod tests {
             cfg.fallback_p // backfilled
         );
     }
+
+    // ── P2.0 measurement gate (spec §6.5): per-allele slip stats from the real caller ──
+    //
+    // A precise, in-caller replacement for the reads-only proxy: the true catalog period
+    // (`locus.motif`) and the caller's own sequence-aware attribution
+    // (`nearest_called_by_sequence`), bucketed per called allele. Answers whether purity
+    // moves the stutter rate before any Phase-2 type is written. Reached only by the ignored
+    // `p20_dump_per_allele_slip_stats` test on the ssr_tomato1 psp.
+
+    /// Per called-allele slip statistics accumulated across the cohort.
+    struct AlleleSlip {
+        period: usize,
+        units: u16,
+        /// Interruptions at the **true** catalog period: positions `i ≥ period` with
+        /// `seq[i] != seq[i - period]`. `0` ⇒ a pure motif tiling.
+        interruptions: u32,
+        faithful: u64,
+        slip_by_delta: std::collections::BTreeMap<i32, u64>,
+    }
+
+    impl AlleleSlip {
+        fn new(seq: &[u8], period: usize) -> Self {
+            let interruptions = (period..seq.len())
+                .filter(|&i| seq[i] != seq[i - period])
+                .count() as u32;
+            AlleleSlip {
+                period,
+                units: (seq.len() / period.max(1)) as u16,
+                interruptions,
+                faithful: 0,
+                slip_by_delta: std::collections::BTreeMap::new(),
+            }
+        }
+        fn slipped(&self) -> u64 {
+            self.slip_by_delta.values().sum()
+        }
+    }
+
+    /// Attribute each carrier's reads to its called alleles (the caller's own
+    /// `nearest_called_by_sequence`) and bucket the length slips per called candidate.
+    fn accumulate_allele_slips(
+        locus: &CohortLocus,
+        candidates: &crate::ssr::cohort::candidate_set::CandidateSet,
+        call: &crate::ssr::cohort::em::LocusCall,
+        params: &ParamSet,
+        acc: &mut std::collections::BTreeMap<Box<[u8]>, AlleleSlip>,
+    ) {
+        use crate::ssr::cohort::attribution::nearest_called_by_sequence;
+        use crate::ssr::cohort::pair_hmm::HmmScratch;
+        use smallvec::SmallVec;
+
+        let period = locus.motif.period().max(1);
+        let mut scratch = HmmScratch::new();
+        for (k, sc) in call.calls.iter().enumerate() {
+            if sc.allele_indices.is_empty() {
+                continue;
+            }
+            let group = params.group_of_sample[locus.present[k] as usize];
+            let eps = params.error_per_sample_group[group.0 as usize].0;
+            let called: SmallVec<[(&[u8], u16); 2]> = sc
+                .allele_indices
+                .iter()
+                .zip(&sc.genotype_units)
+                .map(|(&idx, &u)| (candidates.alleles[idx].as_ref(), u))
+                .collect();
+            for (obs, count) in &locus.samples[k].seq_counts {
+                let read_units = (obs.len() / period) as i32;
+                let (pos, delta) =
+                    nearest_called_by_sequence(obs, read_units, &called, eps, &mut scratch)
+                        .expect("a non-empty call has >=1 allele");
+                let cand_idx = sc.allele_indices[pos];
+                let entry = acc
+                    .entry(candidates.alleles[cand_idx].clone())
+                    .or_insert_with(|| AlleleSlip::new(&candidates.alleles[cand_idx], period));
+                let c = u64::from(*count);
+                if delta == 0 {
+                    entry.faithful += c;
+                } else {
+                    *entry.slip_by_delta.entry(delta).or_insert(0) += c;
+                }
+            }
+        }
+    }
+
+    /// Genotype the whole cohort (real burn-in + per-locus EM) and accumulate per-allele slip
+    /// stats. Mirrors `run`'s two passes but collects slips instead of writing a VCF.
+    fn measure_allele_slips(config: &SsrCallConfig) -> Result<Vec<AlleleSlip>, SsrCallError> {
+        let rung_cfg = RungCfg::dev_default();
+        let cand_cfg = CandidateCfg::dev_default();
+        let em_cfg = EmCfg::dev_default();
+        let outer_cfg = OuterCfg::dev_default();
+        let cluster_cfg = ClusterCfg::dev_default();
+        let g0_cfg = G0FitCfg::dev_default();
+        let fp_cfg = FpControlCfg::dev_default();
+
+        let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
+        let n_samples = merger.sample_names().len();
+        let subset = collect_burn_in_subset(merger)?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.threads.max(1))
+            .build()?;
+        let frozen = pool.install(|| -> Result<FrozenParams, SsrCallError> {
+            let stats = run_prepass_stats(&subset, PLOIDY, &rung_cfg);
+            let est = estimate(&stats, &g0_cfg);
+            let grouped = group_samples(&stats, &est, &cluster_cfg);
+            let params = build_param_set(&est, &grouped, n_samples, &g0_cfg)?;
+            let calls = run_cohort_em(
+                &subset,
+                &params,
+                grouped.level_per_group,
+                PLOIDY,
+                &em_cfg,
+                &rung_cfg,
+                &cand_cfg,
+                &outer_cfg,
+            );
+            Ok(FrozenParams {
+                chemistry: params,
+                f_per_sample: calls.f_per_sample,
+                level_per_group: calls.level_per_group,
+            })
+        })?;
+        drop(subset);
+
+        let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
+        let mut acc: std::collections::BTreeMap<Box<[u8]>, AlleleSlip> =
+            std::collections::BTreeMap::new();
+        for item in merger {
+            let locus = item?.1;
+            let rungs = build_rungs(&locus, &rung_cfg);
+            let candidates = assemble_candidates(&locus, &rungs, PLOIDY, &cand_cfg);
+            if candidates.admit != Admission::Pass {
+                continue;
+            }
+            let seed = seed_locus(
+                &locus,
+                &rungs,
+                &candidates,
+                &frozen.chemistry,
+                PLOIDY,
+                rung_cfg.prominence,
+            );
+            let f_present: Vec<f64> = locus
+                .present
+                .iter()
+                .map(|&g| frozen.f_per_sample[g as usize])
+                .collect();
+            let mut call = run_locus_em_with(
+                &locus,
+                &rungs,
+                &candidates,
+                &frozen.chemistry,
+                &seed,
+                PLOIDY,
+                &em_cfg,
+                &f_present,
+                &frozen.level_per_group,
+                &HipstrModel,
+            );
+            apply_fp_control(&mut call, &fp_cfg);
+            accumulate_allele_slips(&locus, &candidates, &call, &frozen.chemistry, &mut acc);
+        }
+        Ok(acc.into_values().collect())
+    }
+
+    #[test]
+    #[ignore = "P2.0 measurement — needs ssr_tomato1 psp; set SSR_P20_{CATALOG,PSP_DIR,OUT}"]
+    fn p20_dump_per_allele_slip_stats() {
+        use std::io::Write;
+        let catalog = std::env::var("SSR_P20_CATALOG").expect("SSR_P20_CATALOG");
+        let psp_dir = std::env::var("SSR_P20_PSP_DIR").expect("SSR_P20_PSP_DIR");
+        let out = std::env::var("SSR_P20_OUT").expect("SSR_P20_OUT");
+        let mut psp_files: Vec<PathBuf> = std::fs::read_dir(&psp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".ssr.psp"))
+            .collect();
+        psp_files.sort();
+        assert!(!psp_files.is_empty(), "no .ssr.psp under {psp_dir}");
+        let config = SsrCallConfig {
+            catalog: catalog.into(),
+            psp_files,
+            output: PathBuf::from("/dev/null"),
+            threads: 4,
+            queue_depth: 1024,
+        };
+        let alleles = measure_allele_slips(&config).unwrap();
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
+        writeln!(
+            w,
+            "period\tunits\tinterruptions\tis_pure\tfaithful\tslipped\ttotal\tslip_rate\tslip_hist"
+        )
+        .unwrap();
+        for a in &alleles {
+            let slipped = a.slipped();
+            let total = a.faithful + slipped;
+            if total == 0 {
+                continue;
+            }
+            let hist: Vec<String> = a
+                .slip_by_delta
+                .iter()
+                .map(|(d, c)| format!("{d}:{c}"))
+                .collect();
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                a.period,
+                a.units,
+                a.interruptions,
+                a.interruptions == 0,
+                a.faithful,
+                slipped,
+                total,
+                slipped as f64 / total as f64,
+                hist.join(",")
+            )
+            .unwrap();
+        }
+        eprintln!("wrote {} alleles to {out}", alleles.len());
+    }
 }
