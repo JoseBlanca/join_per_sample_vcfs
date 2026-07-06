@@ -29,8 +29,8 @@ use rayon::prelude::*;
 
 use crate::ssr::cohort::attribution::nearest_parent;
 use crate::ssr::cohort::param_estimation::{
-    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, SampleStutterStats,
-    SlipProfile, StutterLevel, StutterShape,
+    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, PurityLevel,
+    SampleStutterStats, SlipProfile, StutterLevel, StutterShape, interruption_count,
 };
 use crate::ssr::cohort::rung_ladder::{
     Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs, resolve_confident_genotype,
@@ -52,6 +52,11 @@ pub(crate) struct PrepassStats {
     /// mode, over **variable loci only** — the sufficient statistic for the `G₀`
     /// decay fit (arch `ssr_call_driver.md` §9).
     pub(crate) allele_spread_by_period: HashMap<u8, AlleleSpreadAccum>,
+    /// `(length in units, interruption count)` → `(faithful, slipped)` reads over confident
+    /// alleles — the sufficient statistic for the Phase-2 purity→level fit
+    /// ([`fit_purity_level`]). The fixed-length pure-vs-impure contrast (§6.5a) lives in the
+    /// length key; integer counts, so it reduces order-independently like the rest.
+    pub(crate) purity_slip: HashMap<(u16, u32), (u64, u64)>,
 }
 
 impl PrepassStats {
@@ -81,6 +86,11 @@ impl PrepassStats {
             dst.total_copies += accum.total_copies;
             dst.distance_weighted += accum.distance_weighted;
         }
+        for (&key, &(faithful, slipped)) in &other.purity_slip {
+            let dst = self.purity_slip.entry(key).or_default();
+            dst.0 += faithful;
+            dst.1 += slipped;
+        }
     }
 }
 
@@ -105,6 +115,62 @@ pub(crate) struct EstimatedParams {
     /// (arch `ssr_call_driver.md` §9). One entry per period observed among the
     /// variable loci; thin periods carry the coded fallback.
     pub(crate) g0_by_period: HashMap<u8, G0PseudocountDecay>,
+    /// Phase-2 cohort-global purity→level factor (P2.2b). [`PurityLevel::none`] when the data
+    /// carries no fixed-length pure-vs-impure contrast (→ Phase 1).
+    pub(crate) purity_level: PurityLevel,
+}
+
+/// Minimum reads on **each** side of a fixed-length pure-vs-impure cell for it to inform the
+/// purity fit — thin cells are noise, and the P2.0 contrast was well-powered at ≥100/side.
+const MIN_PURITY_FIT_READS: u64 = 50;
+/// Floor on the fitted per-interruption factor: an impure allele slips less, never zero.
+const PURITY_FACTOR_FLOOR: f64 = 0.05;
+
+/// Fit the cohort-global purity → stutter-level factor from the confident-genotype slip
+/// contrast (P2.2b, spec §6.3). At each length, contrast every impure cell against the pure
+/// (0-interruption) cell of the **same length** — the identifying variation free of the length
+/// confound (§6.5a). Weighted least-squares of `ln(impure_rate / pure_rate)` on interruption
+/// count **through the origin** (a pure allele's ratio is 1 → `ln 0`): `slope = Σ w·k·y / Σ w·k²`,
+/// `factor = exp(slope)`. Read-weighted by cell depth. The factor is capped at `1` — an
+/// interruption stabilises the tract, so it never *amplifies* stutter — and floored so a thin
+/// noisy contrast cannot drive it to zero. No usable contrast → [`PurityLevel::none`] (Phase 1).
+pub(crate) fn fit_purity_level(purity_slip: &HashMap<(u16, u32), (u64, u64)>) -> PurityLevel {
+    // Sort the cells into a canonical `(length, k)` order first, so the float accumulation is a
+    // FIXED-ORDER reduce — byte-identical across thread counts (arch §4), not at the mercy of
+    // `HashMap` iteration order.
+    let mut cells: Vec<((u16, u32), (u64, u64))> =
+        purity_slip.iter().map(|(&k, &v)| (k, v)).collect();
+    cells.sort_unstable_by_key(|&(key, _)| key);
+    // Pure baseline (0 interruptions) per length, in the same sorted pass.
+    let mut pure_rate: HashMap<u16, f64> = HashMap::new();
+    for &((len, k), (f, s)) in &cells {
+        if k == 0 && f + s >= MIN_PURITY_FIT_READS && s > 0 {
+            pure_rate.insert(len, s as f64 / (f + s) as f64);
+        }
+    }
+
+    let (mut sxy, mut sxx) = (0.0_f64, 0.0_f64);
+    for &((len, k), (f, s)) in &cells {
+        if k == 0 || f + s < MIN_PURITY_FIT_READS || s == 0 {
+            continue;
+        }
+        let Some(&pr) = pure_rate.get(&len) else {
+            continue; // no pure baseline at this length → skip (avoids the length confound)
+        };
+        let rate = s as f64 / (f + s) as f64;
+        let y = (rate / pr).ln();
+        let w = (f + s) as f64;
+        let x = f64::from(k);
+        sxy += w * x * y;
+        sxx += w * x * x;
+    }
+    if sxx <= 0.0 {
+        return PurityLevel::none(); // no fixed-length contrast anywhere → Phase 1
+    }
+    let factor = (sxy / sxx).exp().clamp(PURITY_FACTOR_FLOOR, 1.0);
+    PurityLevel {
+        per_interruption_factor: factor,
+    }
 }
 
 /// Add `(faithful, slipped)` to the bin for `length`, creating it if new.
@@ -194,6 +260,14 @@ pub(crate) fn accumulate_locus(
         let mut local = SampleStutterStats::default();
         let mut slips: Vec<(i32, u32)> = Vec::new();
         let peak_units: Vec<u16> = peaks.iter().map(|p| p.repeat_len).collect();
+        // Per-peak faithful/slipped totals, keyed to each peak's purity, feed the Phase-2
+        // purity→level contrast (folded into `stats.purity_slip` after the read loop).
+        let peak_interruptions: Vec<u32> = peaks
+            .iter()
+            .map(|p| interruption_count(&p.allele, period))
+            .collect();
+        let mut peak_faithful = vec![0u64; peaks.len()];
+        let mut peak_slipped = vec![0u64; peaks.len()];
         for (obs, count) in &evidence.seq_counts {
             let read_units = (obs.len() / period) as i32;
             let (peak_idx, delta) =
@@ -204,14 +278,24 @@ pub(crate) fn accumulate_locus(
                 local.base_match += m * *count as u64;
                 local.base_mismatch += mm * *count as u64;
                 add_bin(&mut local.by_length, peak.repeat_len, *count as u64, 0);
+                peak_faithful[peak_idx] += *count as u64;
             } else {
                 add_bin(&mut local.by_length, peak.repeat_len, 0, *count as u64);
                 slips.push((delta, *count));
+                peak_slipped[peak_idx] += *count as u64;
             }
             local.read_depth += *count as u64;
         }
 
         merge_sample_stats(stats.per_sample.entry(global).or_default(), &local);
+        for (i, peak) in peaks.iter().enumerate() {
+            let cell = stats
+                .purity_slip
+                .entry((peak.repeat_len, peak_interruptions[i]))
+                .or_default();
+            cell.0 += peak_faithful[i];
+            cell.1 += peak_slipped[i];
+        }
         for (delta, count) in &slips {
             stats
                 .slip_by_period
@@ -408,6 +492,7 @@ pub(crate) fn estimate(stats: &PrepassStats, g0_cfg: &G0FitCfg) -> EstimatedPara
         shape_by_period,
         level_by_sample,
         g0_by_period,
+        purity_level: fit_purity_level(&stats.purity_slip),
     }
 }
 
@@ -870,5 +955,58 @@ mod tests {
         let spread = stats.allele_spread_by_period[&2];
         assert_eq!(spread.total_copies, 18);
         assert_eq!(spread.distance_weighted, 18);
+    }
+
+    // ── P2.2b: the purity → level fit ──
+
+    #[test]
+    fn fit_purity_level_recovers_a_lower_impure_slip_rate() {
+        // At length 6: pure (0 interruptions) slips 20 %, impure (1 interruption) slips 5 % →
+        // ratio 0.25 at k=1 → per-interruption factor ≈ 0.25.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (800u64, 200u64)); // pure: rate 0.20
+        slip.insert((6u16, 1u32), (950u64, 50u64)); // impure: rate 0.05
+        let p = fit_purity_level(&slip);
+        assert!(p.per_interruption_factor < 1.0);
+        assert!(
+            (p.per_interruption_factor - 0.25).abs() < 0.02,
+            "factor {}",
+            p.per_interruption_factor
+        );
+    }
+
+    #[test]
+    fn fit_purity_level_is_neutral_without_a_fixed_length_contrast() {
+        // Only pure alleles → nothing to contrast → Phase 1.
+        let mut pure_only = HashMap::new();
+        pure_only.insert((6u16, 0u32), (800u64, 200u64));
+        assert_eq!(fit_purity_level(&pure_only), PurityLevel::none());
+        // Impure at a length with no pure baseline → no fixed-length contrast → Phase 1
+        // (the length confound §6.5a is never crossed).
+        let mut no_pair = HashMap::new();
+        no_pair.insert((6u16, 0u32), (800u64, 200u64));
+        no_pair.insert((8u16, 1u32), (950u64, 50u64));
+        assert_eq!(fit_purity_level(&no_pair), PurityLevel::none());
+        // Empty.
+        assert_eq!(fit_purity_level(&HashMap::new()), PurityLevel::none());
+    }
+
+    #[test]
+    fn fit_purity_level_never_amplifies_stutter() {
+        // If impure slips MORE than pure (noise / confound), the factor is capped at 1 — an
+        // interruption never *increases* the modelled stutter.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (950u64, 50u64)); // pure rate 0.05
+        slip.insert((6u16, 1u32), (800u64, 200u64)); // impure rate 0.20 (higher)
+        assert_eq!(fit_purity_level(&slip).per_interruption_factor, 1.0);
+    }
+
+    #[test]
+    fn fit_purity_level_ignores_thin_cells() {
+        // Cells below the read floor on either side carry no signal → Phase 1.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (40u64, 5u64)); // pure total 45 < 50
+        slip.insert((6u16, 1u32), (950u64, 50u64));
+        assert_eq!(fit_purity_level(&slip), PurityLevel::none());
     }
 }

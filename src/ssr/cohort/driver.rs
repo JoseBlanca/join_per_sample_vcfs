@@ -26,7 +26,7 @@ use crate::ssr::cohort::em_init::seed_locus;
 use crate::ssr::cohort::inbreeding::{OuterCfg, run_cohort_em};
 use crate::ssr::cohort::merge::{CohortMerger, SsrMergeError};
 use crate::ssr::cohort::param_estimation::{
-    G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError, PurityLevel, StutterLevel,
+    G0FitCfg, G0PseudocountDecay, ParamSet, PerBaseError, StutterLevel,
 };
 use crate::ssr::cohort::prepass::{EstimatedParams, estimate, run_prepass_stats};
 use crate::ssr::cohort::read_model::HipstrModel;
@@ -159,8 +159,9 @@ pub(crate) fn build_param_set(
         stutter_shape_parent: est.shape_by_period.clone(),
         stutter_shape_by_cell: grouped.shape_by_group_period.clone(),
         level_seed: grouped.level_per_group.clone(),
-        // Phase-1-neutral until the P2.2 pre-pass fits the purity → level factor.
-        purity_level: PurityLevel::none(),
+        // The Phase-2 purity → level factor the pre-pass fit (P2.2b); `none()` (Phase 1) when
+        // the cohort carries no fixed-length pure-vs-impure contrast.
+        purity_level: est.purity_level,
         pseudocount_decay_per_loci_group,
         group_of_sample,
         // `F` is estimated and frozen by the burn-in (arch §4), not here.
@@ -1039,6 +1040,7 @@ mod tests {
                 .iter()
                 .map(|&p| (p, G0PseudocountDecay { p: 0.3 }))
                 .collect(),
+            purity_level: crate::ssr::cohort::param_estimation::PurityLevel::none(),
         }
     }
 
