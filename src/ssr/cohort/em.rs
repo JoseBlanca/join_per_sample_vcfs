@@ -1412,4 +1412,96 @@ mod tests {
             "the cohort produced at least one non-no-call sample"
         );
     }
+
+    #[test]
+    fn low_depth_same_length_het_carrier_is_recovered_by_the_em() {
+        // The P1.5 exit gate (spec §5.3/§9): the seed CANNOT express a same-length het (it sees
+        // one length peak with one representative → a hom seed), so a genuine same-length het
+        // carrier is recovered ONLY if the composition-aware E-step moves posterior weight onto
+        // the het. This fixture puts such a carrier at realistic LOW depth (2 pure + 2
+        // interrupted reads) alongside common hom carriers of both alleles, and asserts the
+        // carrier is called HET — the recovery the seed can't do. (F = 0 here; the low-depth /
+        // high-F_IS undercall tail is a measured benchmark concern, not this unit invariant.)
+        use crate::ssr::cohort::candidate_set::assemble_candidates;
+        use crate::ssr::cohort::em_init::seed_locus;
+        use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+
+        let pure = ca(6);
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[5] = b'T';
+            s.into_boxed_slice()
+        };
+        let sample = |obs: Vec<(Box<[u8]>, u32)>| {
+            let mut seq_counts = obs;
+            seq_counts.sort_by(|a, b| a.0.cmp(&b.0));
+            SampleEvidence {
+                seq_counts,
+                qc: SsrQc::default(),
+            }
+        };
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 40,
+                end: 52,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGGGG".as_slice()),
+            pure.clone(),
+        );
+        // 4 hom-pure + 4 hom-interrupted (both alleles common → admitted, π not tiny), then the
+        // low-depth same-length HET carrier as the last sample.
+        let mut evs = Vec::new();
+        for _ in 0..4 {
+            evs.push(sample(vec![(pure.clone(), 60)]));
+        }
+        for _ in 0..4 {
+            evs.push(sample(vec![(interrupted.clone(), 60)]));
+        }
+        evs.push(sample(vec![(pure.clone(), 2), (interrupted.clone(), 2)])); // 4 reads, het
+        let carrier = evs.len() - 1;
+        for (i, ev) in evs.into_iter().enumerate() {
+            locus.push(i as u32, ev);
+        }
+
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        assert_eq!(
+            candidates.alleles.len(),
+            2,
+            "two same-length candidates admitted"
+        );
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        // The locus is variable, and the low-depth carrier is called HET — two DISTINCT
+        // candidate indices, i.e. one pure and one interrupted allele.
+        let carrier_call = &call.calls[carrier];
+        assert_eq!(carrier_call.allele_indices.len(), 2, "carrier is called");
+        assert_ne!(
+            carrier_call.allele_indices[0], carrier_call.allele_indices[1],
+            "the low-depth same-length het is recovered as a het, not collapsed to a hom \
+             (indices {:?})",
+            carrier_call.allele_indices
+        );
+        // Its deconvolved support is balanced (the 2/2 split), so the allele-balance term does
+        // not wrongly penalise this genuine same-length het.
+        let support = &carrier_call.allele_support;
+        let total: f64 = support.iter().sum();
+        assert!(
+            support[0].min(support[1]) / total > 0.3,
+            "a balanced same-length het is not flagged imbalanced (support {support:?})"
+        );
+    }
 }
