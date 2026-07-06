@@ -27,7 +27,8 @@ use crate::ssr::cohort::em_init::LocusSeed;
 use crate::ssr::cohort::likelihood::read_given_genotype;
 use crate::ssr::cohort::pair_hmm::HmmScratch;
 use crate::ssr::cohort::param_estimation::{
-    DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, SlipProfile, StutterLevel, StutterShape,
+    DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, PurityLevel, SlipProfile, StutterLevel,
+    StutterShape, interruption_count,
 };
 use crate::ssr::cohort::read_model::{HipstrModel, ReadLikelihoodModel, ReadScoringContext};
 use crate::ssr::cohort::rung_ladder::Rungs;
@@ -196,6 +197,25 @@ fn sample_chemistry(
     (eps, level)
 }
 
+/// The per-read stutter **level** for one candidate: the group level line
+/// `baseline + slope·units`, scaled by the per-locus rate `multiplier` and — the Phase-2
+/// addition — the candidate's **purity** factor `purity.level_factor(interruptions)`, clamped
+/// to `[0, 1]`. A pure allele (0 interruptions) or a neutral `purity` (`per_interruption_factor
+/// = 1`) leaves the pre-Phase-2 arithmetic exactly. Shared by the data likelihood and the
+/// allele-balance deconvolution so both score on the identical level (arch §3).
+fn candidate_level(
+    level: StutterLevel,
+    units: u16,
+    multiplier: f64,
+    purity: &PurityLevel,
+    interruptions: u32,
+) -> f64 {
+    ((level.baseline + level.slope * f64::from(units))
+        * multiplier
+        * purity.level_factor(interruptions))
+    .clamp(0.0, 1.0)
+}
+
 /// Distinct observed sequences across the cohort at this locus (`D`, the outlier
 /// term's denominator).
 fn distinct_sequence_count(locus: &CohortLocus) -> usize {
@@ -292,6 +312,13 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         .iter()
         .map(|a| (a.len() / period) as u16)
         .collect();
+    // Per-candidate interruption count (Phase 2): the purity that scales its stutter level. A
+    // pure allele scores 0 → factor 1 → pre-Phase-2 arithmetic (spec §6.3).
+    let cand_interruptions: Vec<u32> = candidates
+        .alleles
+        .iter()
+        .map(|a| interruption_count(a, period))
+        .collect();
 
     // The iteration-invariant locus shaping, built once and reused across the refit rounds
     // (review Mi2).
@@ -299,6 +326,7 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         locus,
         candidates,
         cand_units: &cand_units,
+        cand_interruptions: &cand_interruptions,
         genotypes: &genotypes,
         distinct,
     };
@@ -385,6 +413,7 @@ struct LocusModel<'a> {
     locus: &'a CohortLocus,
     candidates: &'a CandidateSet,
     cand_units: &'a [u16],
+    cand_interruptions: &'a [u32],
     genotypes: &'a [Genotype],
     distinct: usize,
 }
@@ -410,6 +439,7 @@ fn compute_data_ll<M: ReadLikelihoodModel>(
         locus,
         candidates,
         cand_units,
+        cand_interruptions,
         genotypes,
         distinct,
     } = *locus_model;
@@ -424,9 +454,13 @@ fn compute_data_ll<M: ReadLikelihoodModel>(
             .map(|(obs, count)| {
                 let row = (0..k)
                     .map(|c| {
-                        let lvl = ((level.baseline + level.slope * cand_units[c] as f64)
-                            * level_multiplier)
-                            .clamp(0.0, 1.0);
+                        let lvl = candidate_level(
+                            level,
+                            cand_units[c],
+                            level_multiplier,
+                            &params.purity_level,
+                            cand_interruptions[c],
+                        );
                         let ctx = ReadScoringContext {
                             motif: &locus.motif,
                             shape: theta,
@@ -642,6 +676,7 @@ fn fill_allele_support<M: ReadLikelihoodModel>(
         locus,
         candidates,
         cand_units,
+        cand_interruptions,
         ..
     } = *locus_model;
     for (k_present, call) in calls.iter_mut().enumerate() {
@@ -652,14 +687,19 @@ fn fill_allele_support<M: ReadLikelihoodModel>(
         let mut support: SmallVec<[f64; 2]> = smallvec![0.0; call.allele_indices.len()];
         for (obs, count) in &locus.samples[k_present].seq_counts {
             // Qᵣ of this observed sequence against each called allele (a handful of distinct
-            // sequences × the ploidy called alleles — cheap; arch §3).
+            // sequences × the ploidy called alleles — cheap; arch §3). Same per-candidate
+            // level (purity included) as the data likelihood, so the two never disagree.
             let qrs: SmallVec<[f64; 2]> = call
                 .allele_indices
                 .iter()
                 .map(|&c| {
-                    let lvl = ((level.baseline + level.slope * cand_units[c] as f64)
-                        * level_multiplier)
-                        .clamp(0.0, 1.0);
+                    let lvl = candidate_level(
+                        level,
+                        cand_units[c],
+                        level_multiplier,
+                        &params.purity_level,
+                        cand_interruptions[c],
+                    );
                     let ctx = ReadScoringContext {
                         motif: &locus.motif,
                         shape: theta,
@@ -1075,6 +1115,31 @@ mod tests {
         let mut b = a;
         b.decay = 0.25; // a 0.05 change exceeds the tolerance
         assert!(!shapes_close(&a, &b, 1e-3));
+    }
+
+    #[test]
+    fn candidate_level_scales_by_purity_only_for_impure_alleles() {
+        let level = StutterLevel {
+            baseline: 0.1,
+            slope: 0.0,
+        };
+        let neutral = PurityLevel::none();
+        let halving = PurityLevel {
+            per_interruption_factor: 0.5,
+        };
+        // A pure allele (0 interruptions) is unchanged — even under a non-neutral factor —
+        // so Phase 2 collapses to Phase 1 wherever alleles are pure.
+        assert!((candidate_level(level, 6, 1.0, &neutral, 0) - 0.1).abs() < 1e-12);
+        assert!((candidate_level(level, 6, 1.0, &halving, 0) - 0.1).abs() < 1e-12);
+        // An impure allele's level is scaled once per interruption (compounding).
+        assert!((candidate_level(level, 6, 1.0, &halving, 1) - 0.05).abs() < 1e-12);
+        assert!((candidate_level(level, 6, 1.0, &halving, 2) - 0.025).abs() < 1e-12);
+        // The result stays clamped to [0, 1].
+        let high = StutterLevel {
+            baseline: 0.9,
+            slope: 0.1,
+        };
+        assert!(candidate_level(high, 20, 5.0, &neutral, 0) <= 1.0);
     }
 
     #[test]
