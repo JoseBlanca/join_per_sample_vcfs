@@ -518,7 +518,7 @@ mod tests {
         let cands = assemble_candidates(locus, &rungs, 2, &CandidateCfg::dev_default());
         let fp = FpControlCfg::dev_default();
         let mut call = result.per_locus[0].clone();
-        apply_fp_control(locus, &mut call, &fp);
+        apply_fp_control(&mut call, &fp);
 
         assert!(is_variable(&call, &cands), "the site is polymorphic");
         let qual = site_qual(&call, &cands, &fp);

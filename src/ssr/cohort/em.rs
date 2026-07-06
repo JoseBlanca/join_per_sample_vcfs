@@ -21,10 +21,11 @@
 //! follow-up (the genotype enumeration generalizes, the dosage priors need care).
 
 use crate::ssr::cohort::allele_freq_prior::g0_pseudocounts;
-use crate::ssr::cohort::attribution::nearest_parent;
+use crate::ssr::cohort::attribution::{allele_responsibilities, nearest_called_by_sequence};
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em_init::LocusSeed;
 use crate::ssr::cohort::likelihood::read_given_genotype;
+use crate::ssr::cohort::pair_hmm::HmmScratch;
 use crate::ssr::cohort::param_estimation::{
     DEFAULT_G0_FALLBACK_P, G0PseudocountDecay, ParamSet, SlipProfile, StutterLevel, StutterShape,
 };
@@ -32,7 +33,7 @@ use crate::ssr::cohort::read_model::{HipstrModel, ReadLikelihoodModel, ReadScori
 use crate::ssr::cohort::rung_ladder::Rungs;
 use crate::ssr::cohort::stutter::refine_theta_locus;
 use crate::ssr::cohort::types::CohortLocus;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 /// EM controls (pinned in F2).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -327,7 +328,7 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         final_calls(&data_ll, &genotypes, &pi, f_per_present, &cand_units);
 
     for _ in 0..cfg.refit_max_rounds {
-        let fit = attribute_locus(locus, &calls, period, params, level_per_group);
+        let fit = attribute_locus(locus, &calls, period, candidates, params, level_per_group);
         let new_theta = refine_theta_locus(&fit.profile, &seed.theta0, cfg.theta_shrink);
         let new_level_multiplier = refit_level_multiplier(&fit, cfg.level_shrink);
         if shapes_close(&new_theta, &theta, cfg.theta_tol)
@@ -352,6 +353,19 @@ pub(crate) fn run_locus_em_with<M: ReadLikelihoodModel>(
         calls = c;
         posterior_hom = ph;
     }
+
+    // Deconvolve each call's per-allele read support (sequence-aware allele balance, arch §3),
+    // using the same settled shape / level that produced these calls.
+    fill_allele_support(
+        &mut calls,
+        &locus_model,
+        params,
+        level_per_group,
+        &theta,
+        level_multiplier,
+        model,
+        &mut scratch,
+    );
 
     LocusCall {
         calls,
@@ -560,20 +574,32 @@ fn attribute_locus(
     locus: &CohortLocus,
     calls: &[SampleCall],
     period: usize,
+    candidates: &CandidateSet,
     params: &ParamSet,
     level_per_group: &[StutterLevel],
 ) -> LocusSlipFit {
     let mut fit = LocusSlipFit::default();
+    let mut scratch = HmmScratch::new();
     for (k_present, call) in calls.iter().enumerate() {
-        if call.genotype_units.is_empty() {
+        if call.allele_indices.is_empty() {
             continue; // no-call contributes no slips
         }
-        let (_eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
+        let (eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
+        // The called alleles as (sequence, length-in-units), parallel to the call — so a read
+        // is attributed to its parent allele **by sequence**, same-length ties broken by
+        // composition (spec §5.3). Slip counts stay integers → order-free reduce.
+        let called: SmallVec<[(&[u8], u16); 2]> = call
+            .allele_indices
+            .iter()
+            .zip(&call.genotype_units)
+            .map(|(&idx, &units)| (candidates.alleles[idx].as_ref(), units))
+            .collect();
         for (obs, count) in &locus.samples[k_present].seq_counts {
             let read_units = (obs.len() / period) as i32;
-            let (parent_idx, delta) = nearest_parent(read_units, &call.genotype_units)
-                .expect("a non-empty call has ≥1 allele");
-            let parent = call.genotype_units[parent_idx];
+            let (parent_pos, delta) =
+                nearest_called_by_sequence(obs, read_units, &called, eps, &mut scratch)
+                    .expect("a non-empty call has ≥1 allele");
+            let parent = called[parent_pos].1;
             let c = *count as u64;
             if delta != 0 {
                 fit.profile.add_slip(delta, c);
@@ -586,6 +612,73 @@ fn attribute_locus(
         }
     }
     fit
+}
+
+/// Fill each sample's [`SampleCall::allele_support`] — the deconvolved per-called-allele read
+/// responsibilities `n_a = Σ_reads count · Qᵣ(obs | a) / Σ_{a'∈G} Qᵣ(obs | a')` for the called
+/// genotype `G` (Q-I1 / arch §3, Mark-2 §6 amendment). Computed here, at the final E-step,
+/// because this is where the read model + candidates + the settled `θ_locus` / level live; the
+/// VCF stage then reads `allele_support` directly, with no read model and no length attribution.
+///
+/// Determinism: `Qᵣ` is a pure function of the frozen `ε` and the settled shape/level, and the
+/// responsibility sums run over `seq_counts` in its fixed byte-sorted order (the Stage-1
+/// contract), so `(n_A, n_B)` is byte-identical across threads (arch §4). A read that explains
+/// none of the called alleles (`Σ Qᵣ = 0` — random junk `λ` owns) contributes nothing.
+// The model + its scratch join the locus shaping, chemistry, and settled shape/level — all
+// distinct inputs threaded explicitly so this stays a pure function of them (the byte-identity
+// contract), like `compute_data_ll`. Two over the lint's bound.
+#[allow(clippy::too_many_arguments)]
+fn fill_allele_support<M: ReadLikelihoodModel>(
+    calls: &mut [SampleCall],
+    locus_model: &LocusModel,
+    params: &ParamSet,
+    level_per_group: &[StutterLevel],
+    theta: &StutterShape,
+    level_multiplier: f64,
+    model: &M,
+    scratch: &mut M::Scratch,
+) {
+    let LocusModel {
+        locus,
+        candidates,
+        cand_units,
+        ..
+    } = *locus_model;
+    for (k_present, call) in calls.iter_mut().enumerate() {
+        if call.allele_indices.is_empty() {
+            continue; // a no-call keeps its empty support
+        }
+        let (eps, level) = sample_chemistry(locus, k_present, params, level_per_group);
+        let mut support: SmallVec<[f64; 2]> = smallvec![0.0; call.allele_indices.len()];
+        for (obs, count) in &locus.samples[k_present].seq_counts {
+            // Qᵣ of this observed sequence against each called allele (a handful of distinct
+            // sequences × the ploidy called alleles — cheap; arch §3).
+            let qrs: SmallVec<[f64; 2]> = call
+                .allele_indices
+                .iter()
+                .map(|&c| {
+                    let lvl = ((level.baseline + level.slope * cand_units[c] as f64)
+                        * level_multiplier)
+                        .clamp(0.0, 1.0);
+                    let ctx = ReadScoringContext {
+                        motif: &locus.motif,
+                        shape: theta,
+                        level: lvl,
+                        eps,
+                    };
+                    model.q_r(obs, &candidates.alleles[c], &ctx, scratch)
+                })
+                .collect();
+            if qrs.iter().sum::<f64>() <= 0.0 {
+                continue; // the read explains none of the called alleles
+            }
+            let resp = allele_responsibilities(&qrs);
+            for (s, r) in support.iter_mut().zip(&resp) {
+                *s += *count as f64 * r;
+            }
+        }
+        call.allele_support = support;
+    }
 }
 
 /// The per-locus stutter-rate multiplier on the group level (I2): `observed / expected`
@@ -866,7 +959,12 @@ mod tests {
             allele_support: SmallVec::new(),
         }];
         let params = clean_params(1);
-        let fit = attribute_locus(&locus, &calls, 2, &params, &params.level_seed);
+        let candidates = CandidateSet {
+            alleles: vec![ca(8)],
+            ref_idx: 0,
+            admit: Admission::Pass,
+        };
+        let fit = attribute_locus(&locus, &calls, 2, &candidates, &params, &params.level_seed);
         assert_eq!(fit.profile.down[0], 5, "Δ=−1 count");
         assert_eq!(fit.profile.up[0], 4, "Δ=+1 count");
         assert_eq!(fit.profile.down[1], 3, "Δ=−2 count");
@@ -896,10 +994,16 @@ mod tests {
             },
         );
         let params = clean_params(1);
+        let candidates = CandidateSet {
+            alleles: vec![ca(8)],
+            ref_idx: 0,
+            admit: Admission::Pass,
+        };
         let fit = attribute_locus(
             &locus,
             &[SampleCall::no_call()],
             2,
+            &candidates,
             &params,
             &params.level_seed,
         );
@@ -1217,5 +1321,95 @@ mod tests {
         let call = call_locus(&cohort);
         assert_eq!(call.admit, Admission::LowDepth);
         assert!(call.calls.iter().all(|c| c.allele_indices.is_empty()));
+    }
+
+    #[test]
+    fn run_locus_em_fills_allele_support_from_the_final_e_step() {
+        // The Q-I1 data wire: after the EM, every called sample carries a populated
+        // `allele_support` (the deconvolved per-allele responsibilities the balance term reads,
+        // arch §3), parallel to its genotype and summing to the sample's read depth — the
+        // invariant that a genotype's reads are fully apportioned across its called alleles.
+        use crate::ssr::cohort::candidate_set::assemble_candidates;
+        use crate::ssr::cohort::em_init::seed_locus;
+        use crate::ssr::cohort::rung_ladder::{RungCfg, build_rungs};
+        use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+
+        let pure = ca(6); // CACACACACACA (12 bp)
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[5] = b'T';
+            s.into_boxed_slice()
+        };
+        let sample = |obs: Vec<(Box<[u8]>, u32)>| {
+            let mut seq_counts = obs;
+            seq_counts.sort_by(|a, b| a.0.cmp(&b.0));
+            SampleEvidence {
+                seq_counts,
+                qc: SsrQc::default(),
+            }
+        };
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 40,
+                end: 52,
+            },
+            Motif::new(b"CA").unwrap(),
+            Box::from(b"GGGGGG".as_slice()),
+            pure.clone(),
+        );
+        let mut evs = Vec::new();
+        for _ in 0..3 {
+            evs.push(sample(vec![(pure.clone(), 60)]));
+        }
+        for _ in 0..3 {
+            evs.push(sample(vec![(interrupted.clone(), 60)]));
+        }
+        evs.push(sample(vec![(pure.clone(), 30), (interrupted.clone(), 30)]));
+        for (i, ev) in evs.into_iter().enumerate() {
+            locus.push(i as u32, ev);
+        }
+
+        let rungs = build_rungs(&locus, &RungCfg::dev_default());
+        let candidates = assemble_candidates(&locus, &rungs, 2, &CandidateCfg::dev_default());
+        assert_eq!(candidates.alleles.len(), 2, "pure + interrupted candidates");
+        let params = clean_params(locus.present.len());
+        let seed = seed_locus(&locus, &rungs, &candidates, &params, 2, 3);
+        let call = run_locus_em(
+            &locus,
+            &rungs,
+            &candidates,
+            &params,
+            &seed,
+            2,
+            &EmCfg::dev_default(),
+        );
+
+        let mut any_call = false;
+        for (k, c) in call.calls.iter().enumerate() {
+            if c.allele_indices.is_empty() {
+                continue;
+            }
+            any_call = true;
+            assert_eq!(
+                c.allele_support.len(),
+                c.allele_indices.len(),
+                "allele_support is parallel to the called genotype (sample {k})"
+            );
+            let depth: f64 = locus.samples[k]
+                .seq_counts
+                .iter()
+                .map(|(_, n)| f64::from(*n))
+                .sum();
+            let support_total: f64 = c.allele_support.iter().sum();
+            assert!(
+                (support_total - depth).abs() < 1e-6,
+                "responsibilities apportion all {depth} reads (sample {k}, got {support_total})"
+            );
+        }
+        assert!(
+            any_call,
+            "the cohort produced at least one non-no-call sample"
+        );
     }
 }

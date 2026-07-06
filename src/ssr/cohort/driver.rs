@@ -426,7 +426,7 @@ fn genotype_locus(
         &frozen.level_per_group,
         &HipstrModel,
     );
-    apply_fp_control(locus, &mut call, fp_cfg);
+    apply_fp_control(&mut call, fp_cfg);
 
     // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
     if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
@@ -785,6 +785,87 @@ mod tests {
             std::fs::read_to_string(&config.output).unwrap()
         };
         assert_eq!(run_with(1, "t1.vcf"), run_with(4, "t4.vcf"));
+    }
+
+    #[test]
+    fn same_length_interruption_locus_emits_a_variable_row_identically_across_threads() {
+        // Checkpoint 1 (P1.4): an interruption polymorphism — two 12 bp alleles differing only
+        // in composition (pure CA×6 vs an interrupted sibling at the same length) — must
+        // (a) emit a variable PASS row carrying a SAME-LENGTH ALT (the drop the feature fixes),
+        // and (b) be byte-identical across thread counts (the SSR determinism contract, §4).
+        let pure = ca(6); // CACACACACACA (12 bp)
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[5] = b'T'; // one interior base → same length, distinct composition
+            s.into_boxed_slice()
+        };
+        let sorted = |mut v: Vec<(Box<[u8]>, u32)>| {
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_loci = vec![loc_units("chr1", 40, 6)]; // ref = pure CA×6
+        let catalog = dir.path().join("c.ssr.catalog");
+        std::fs::write(&catalog, catalog_bytes(REF_MD5, &catalog_loci)).unwrap();
+
+        // 4 hom-pure, 4 hom-interrupted, 2 balanced same-length hets — both alleles clear §5.2.
+        let mut sample_obs: Vec<Vec<(Box<[u8]>, u32)>> = Vec::new();
+        for _ in 0..4 {
+            sample_obs.push(vec![(pure.clone(), 100)]);
+        }
+        for _ in 0..4 {
+            sample_obs.push(vec![(interrupted.clone(), 100)]);
+        }
+        for _ in 0..2 {
+            sample_obs.push(sorted(vec![(pure.clone(), 50), (interrupted.clone(), 50)]));
+        }
+
+        let mut psp_files = Vec::new();
+        for (i, obs) in sample_obs.into_iter().enumerate() {
+            let record = ssr_record(40, 6, obs);
+            let path = dir.path().join(format!("s{i}.ssr.psp"));
+            std::fs::write(&path, ssr_psp(ssr_header(&["chr1"], REF_MD5), &[record])).unwrap();
+            psp_files.push(path);
+        }
+
+        let run_with = |threads: usize, out: &str| {
+            let config = SsrCallConfig {
+                catalog: catalog.clone(),
+                psp_files: psp_files.clone(),
+                output: dir.path().join(out),
+                threads,
+                queue_depth: 4,
+            };
+            run(&config).unwrap();
+            std::fs::read_to_string(&config.output).unwrap()
+        };
+        let t1 = run_with(1, "t1.vcf");
+        let t4 = run_with(4, "t4.vcf");
+        assert_eq!(
+            t1, t4,
+            "a same-length locus must be byte-identical across thread counts\n{t1}"
+        );
+
+        let records: Vec<&str> = t1.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "the interruption locus emits one variable row\n{t1}"
+        );
+        let cols: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!(cols[6], "PASS", "{}", records[0]);
+        let refa = cols[3];
+        assert_ne!(cols[4], ".", "must carry the interruption ALT");
+        // Every ALT is a SAME-LENGTH, distinct-composition allele — the recovery (§5.4).
+        for alt in cols[4].split(',') {
+            assert_eq!(
+                alt.len(),
+                refa.len(),
+                "an interruption ALT is the same length as REF: REF={refa} ALT={alt}"
+            );
+            assert_ne!(alt, refa, "the ALT differs from REF in composition");
+        }
     }
 
     #[test]
