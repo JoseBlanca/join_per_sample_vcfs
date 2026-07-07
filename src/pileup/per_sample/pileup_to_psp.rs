@@ -88,16 +88,9 @@ impl SampleSummaryAccumulators {
         writer: &mut PspWriter<W>,
     ) -> Result<(), PspWriteError> {
         // Het: one candidate site per record that carries a non-reference
-        // allele. Pure-REF columns (one allele) are skipped.
-        if let Some(ref_allele) = record.alleles.first()
-            && record.alleles.len() > 1
-        {
-            let ref_obs = u64::from(ref_allele.support.num_obs);
-            let alt_obs: u64 = record.alleles[1..]
-                .iter()
-                .map(|a| u64::from(a.support.num_obs))
-                .sum();
-            self.het.observe_site(SiteCounts { ref_obs, alt_obs });
+        // allele. Pure-REF columns (`from_record` returns `None`) are skipped.
+        if let Some(site) = SiteCounts::from_record(&record) {
+            self.het.observe_site(site);
         }
 
         // Coverage: ONE observation at the record's **anchor** position. The
@@ -406,7 +399,7 @@ mod tests {
     fn test_summary_accumulators() -> SampleSummaryAccumulators {
         use crate::sample_summary::{
             DEFAULT_DEPTH_BIN_WIDTH, DEFAULT_DEPTH_BINS, DEFAULT_GC_BINS, DEFAULT_HET_ERROR_RATE,
-            DEFAULT_HET_LR_MARGIN, DEFAULT_HET_MIN_DEPTH,
+            DEFAULT_HET_LR_MARGIN, DEFAULT_HET_MIN_DEPTH, DEFAULT_HET_STRAND_BIAS_Z,
         };
         SampleSummaryAccumulators::new(
             CoverageBinScheme {
@@ -419,6 +412,7 @@ mod tests {
                 min_depth: DEFAULT_HET_MIN_DEPTH,
                 error_rate: DEFAULT_HET_ERROR_RATE,
                 lr_margin: DEFAULT_HET_LR_MARGIN,
+                strand_bias_z: DEFAULT_HET_STRAND_BIAS_Z,
             },
         )
     }
