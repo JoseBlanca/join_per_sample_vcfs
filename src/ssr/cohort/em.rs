@@ -153,6 +153,107 @@ fn genotype_prior(g: Genotype, pi: &[f64], f: f64) -> f64 {
     }
 }
 
+// ------------------------------------------------------------------------
+// Marginalized Dirichlet-multinomial genotype prior (Phase 3.2).
+//
+// The improved SNP-path prior, ported to SSR: instead of plugging a point
+// frequency `π` into HWE ([`genotype_prior`]), average the genotype probability
+// over the frequency uncertainty using the Dirichlet-multinomial, seeded by the
+// **mode-centred `G₀`** concentration (§Q1 — SSR keeps its own hypervariable
+// seed, it does NOT inherit the SNP reference-is-common seed). Wright-`F` IBD is
+// mixed on top exactly as the SNP engine does. This is additive: the plug-in path
+// above is untouched, and the SNP engine is untouched (this mirrors its
+// `e_step_cohort_loo`, it does not extract from it — protecting the SNP SIMD
+// gains). Gated on behind an `EmCfg` toggle in a later step.
+// ------------------------------------------------------------------------
+
+/// The flat Dirichlet-multinomial inputs for a diploid candidate set of size `k`:
+/// `genotype_allele_counts` (row-major `n_genotypes × k`) and the per-genotype
+/// `log_multinomial_coeffs` (`ln 1 = 0` for a homozygote, `ln 2` for a het), in
+/// `genotypes` order. These are exactly what
+/// [`crate::genetics::dirichlet_multinomial_log_priors`] consumes.
+fn diploid_dm_inputs(genotypes: &[Genotype], k: usize) -> (Vec<u32>, Vec<f64>) {
+    let mut counts = vec![0u32; genotypes.len() * k];
+    let mut log_coeffs = vec![0.0_f64; genotypes.len()];
+    for (g_idx, g) in genotypes.iter().enumerate() {
+        // A candidate index `≥ k` would write into a later genotype's row and
+        // silently corrupt it (the flat buffer stays in-bounds), so guard loudly
+        // rather than let a shape bug escape as a wrong prior.
+        debug_assert!(
+            g.i < k && g.j < k,
+            "genotype ({}, {}) out of range k={k}",
+            g.i,
+            g.j
+        );
+        let base = g_idx * k;
+        if g.i == g.j {
+            counts[base + g.i] = 2;
+            // ln(2!/2!) = ln 1 = 0 (already).
+        } else {
+            counts[base + g.i] = 1;
+            counts[base + g.j] = 1;
+            log_coeffs[g_idx] = std::f64::consts::LN_2; // ln(2!/(1!1!)) = ln 2
+        }
+    }
+    (counts, log_coeffs)
+}
+
+/// Leave-one-out concentration `α'_s = G₀ + max(0, E[cohort copies] − E[own copies])`
+/// for one sample, mirroring the SNP engine's `e_step_cohort_loo`. `g0` is the
+/// mode-centred seed; `cohort_expected` / `own_expected` are posterior-weighted
+/// allele copies over the whole cohort and over this sample. The `max(0, …)`
+/// guards float noise on `cohort − own` (own is one non-negative addend of the
+/// total, so the true difference is `≥ 0`). All three slices are length `k`.
+fn leave_one_out_alpha(g0: &[f64], cohort_expected: &[f64], own_expected: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(g0.len(), cohort_expected.len());
+    debug_assert_eq!(g0.len(), own_expected.len());
+    g0.iter()
+        .zip(cohort_expected)
+        .zip(own_expected)
+        .map(|((&g0_a, &total_a), &own_a)| g0_a + (total_a - own_a).max(0.0))
+        .collect()
+}
+
+/// Per-genotype log-prior under the marginalized Dirichlet-multinomial with a
+/// Wright-`F` IBD branch, for a diploid locus of `k` candidates. `alpha` is the
+/// per-candidate concentration (the sample's `α'_s` from [`leave_one_out_alpha`]);
+/// `f` is the sample's inbreeding coefficient. Returns one value per genotype in
+/// `genotypes` order, log-priors up to a shared additive constant (softmax-ready)
+/// — matching the SNP engine's convention and [`dirichlet_multinomial_log_priors`].
+///
+/// The IBD mixture mirrors the SNP `e_step`: a homozygote `(i, i)` is
+/// `logsumexp((1−f)·DM,  f·(α_i/Σα))`; a heterozygote is `(1−f)·DM`.
+fn marginalized_genotype_log_priors(
+    genotypes: &[Genotype],
+    k: usize,
+    alpha: &[f64],
+    f: f64,
+) -> Vec<f64> {
+    debug_assert_eq!(alpha.len(), k);
+    let (counts, log_coeffs) = diploid_dm_inputs(genotypes, k);
+    let log_indep =
+        crate::genetics::dirichlet_multinomial_log_priors(&counts, &log_coeffs, k, alpha);
+
+    let sum_alpha: f64 = alpha.iter().sum();
+    let log_sum_alpha = sum_alpha.ln();
+    let log_one_minus_f = (1.0 - f).ln(); // -∞ at f = 1
+    let log_f = f.ln(); // -∞ at f = 0
+
+    genotypes
+        .iter()
+        .zip(&log_indep)
+        .map(|(g, &log_indep_g)| {
+            if g.i == g.j {
+                // IBD marginal allele log-frequency log(α_i / Σα).
+                let log_p_effective_i = alpha[g.i].ln() - log_sum_alpha;
+                log_sum_exp(&[log_one_minus_f + log_indep_g, log_f + log_p_effective_i])
+            } else {
+                log_one_minus_f + log_indep_g
+            }
+        })
+        .collect()
+}
+
 /// The `G₀` decay for the locus period (the shared coded fallback if absent — review M3).
 fn period_decay(params: &ParamSet, period: usize) -> G0PseudocountDecay {
     const FALLBACK: G0PseudocountDecay = G0PseudocountDecay {
@@ -779,6 +880,171 @@ mod tests {
     };
     use crate::ssr::types::Motif;
     use std::collections::HashMap;
+
+    /// softmax of a log-prior row, for the marginalized-prior tests.
+    fn softmax(logs: &[f64]) -> Vec<f64> {
+        let m = logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = logs.iter().map(|&l| (l - m).exp()).collect();
+        let z: f64 = exps.iter().sum();
+        exps.iter().map(|&e| e / z).collect()
+    }
+
+    #[test]
+    fn marginalized_prior_at_f_zero_is_the_bare_dm_prior() {
+        // With F = 0 the Wright mixture collapses: every genotype's log-prior is
+        // just its Dirichlet-multinomial term, so the wrapper must reproduce
+        // `dirichlet_multinomial_log_priors` exactly.
+        let genotypes = enumerate_diploid_genotypes(3);
+        let alpha = [0.6, 0.3, 0.1];
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 3);
+        let bare = crate::genetics::dirichlet_multinomial_log_priors(&counts, &coeffs, 3, &alpha);
+        let got = marginalized_genotype_log_priors(&genotypes, 3, &alpha, 0.0);
+        assert_eq!(got.len(), bare.len());
+        for (g, b) in got.iter().zip(&bare) {
+            assert!((g - b).abs() < 1e-12, "got {g}, bare {b}");
+        }
+    }
+
+    #[test]
+    fn marginalized_prior_reduces_to_plugin_hwe_at_high_concentration() {
+        // As Σα → ∞ with α ∝ π the Dirichlet-multinomial collapses to the
+        // multinomial, i.e. plug-in HWE(π). The softmaxed marginalized prior must
+        // approach HWE(π) = [p0², 2·p0·p1, p1²].
+        let genotypes = enumerate_diploid_genotypes(2);
+        let pi = [0.7_f64, 0.3];
+        let big = 1.0e6;
+        let alpha = [big * pi[0], big * pi[1]];
+        let probs = softmax(&marginalized_genotype_log_priors(
+            &genotypes, 2, &alpha, 0.0,
+        ));
+        // HWE reference at F = 0 via the plug-in prior (already normalised: the
+        // three genotype priors sum to 1 for a biallelic locus).
+        let hwe: Vec<f64> = genotypes
+            .iter()
+            .map(|&g| genotype_prior(g, &pi, 0.0))
+            .collect();
+        for (p, h) in probs.iter().zip(&hwe) {
+            assert!((p - h).abs() < 1e-4, "marginalized {p} vs HWE {h}");
+        }
+    }
+
+    #[test]
+    fn marginalized_prior_at_f_one_forbids_heterozygotes() {
+        // Full inbreeding: every heterozygote is impossible (log-prior −∞) and
+        // the homozygotes carry finite mass at the IBD marginal allele frequency.
+        let genotypes = enumerate_diploid_genotypes(2);
+        let alpha = [0.6, 0.4];
+        let logs = marginalized_genotype_log_priors(&genotypes, 2, &alpha, 1.0);
+        for (g, &lp) in genotypes.iter().zip(&logs) {
+            if g.i == g.j {
+                assert!(
+                    lp.is_finite(),
+                    "homozygote {g:?} should be finite, got {lp}"
+                );
+            } else {
+                assert!(
+                    lp == f64::NEG_INFINITY,
+                    "heterozygote {g:?} must be forbidden at F=1, got {lp}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leave_one_out_alpha_excludes_own_counts_and_floors_at_seed() {
+        let g0 = [1.0_f64, 0.5];
+        // α'_s = G₀ + (cohort − own); own is excluded.
+        let alpha = leave_one_out_alpha(&g0, &[3.0, 2.0], &[1.0, 1.0]);
+        assert!((alpha[0] - 3.0).abs() < 1e-12); // 1.0 + (3.0 − 1.0)
+        assert!((alpha[1] - 1.5).abs() < 1e-12); // 0.5 + (2.0 − 1.0)
+        // Float noise making (cohort − own) slightly negative floors at G₀, never
+        // below (keeps the concentration strictly positive).
+        let noisy = leave_one_out_alpha(&g0, &[1.0, 1.0], &[1.0 + 1e-15, 1.0 + 1e-15]);
+        assert!((noisy[0] - 1.0).abs() < 1e-12);
+        assert!((noisy[1] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn marginalized_prior_at_f_one_equals_ibd_marginal_log_frequency() {
+        // At F = 1 a homozygote collapses to the IBD term alone, so its value is
+        // the hand-computable marginal allele log-frequency ln(α_i / Σα). This
+        // pins the −log_sum_alpha normalization the boundary tests can't see (a
+        // shared constant washes out under softmax at F=1).
+        let genotypes = enumerate_diploid_genotypes(2);
+        let alpha = [0.6_f64, 0.4];
+        let sum: f64 = alpha.iter().sum();
+        let logs = marginalized_genotype_log_priors(&genotypes, 2, &alpha, 1.0);
+        for (g, &lp) in genotypes.iter().zip(&logs) {
+            if g.i == g.j {
+                let expected = (alpha[g.i] / sum).ln();
+                assert!(
+                    (lp - expected).abs() < 1e-12,
+                    "hom {g:?}: got {lp}, want {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marginalized_prior_mixes_dm_and_ibd_at_intermediate_f() {
+        // 0 < F < 1: reconstruct every genotype's log-prior from the documented
+        // formula, catching any error that vanishes at the F=0/F=1 boundaries
+        // (swapped log_f/log_one_minus_f, a shifted IBD term, or a het branch that
+        // wrongly picks up an IBD contribution).
+        let genotypes = enumerate_diploid_genotypes(3);
+        let alpha = [0.6_f64, 0.3, 0.1];
+        let f = 0.25_f64;
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 3);
+        let dm = crate::genetics::dirichlet_multinomial_log_priors(&counts, &coeffs, 3, &alpha);
+        let sum: f64 = alpha.iter().sum();
+        let got = marginalized_genotype_log_priors(&genotypes, 3, &alpha, f);
+        for ((g, &dm_g), &lp) in genotypes.iter().zip(&dm).zip(&got) {
+            let expected = if g.i == g.j {
+                log_sum_exp(&[(1.0 - f).ln() + dm_g, f.ln() + (alpha[g.i] / sum).ln()])
+            } else {
+                (1.0 - f).ln() + dm_g
+            };
+            assert!(
+                (lp - expected).abs() < 1e-12,
+                "{g:?}: got {lp}, want {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn diploid_dm_inputs_encodes_homozygote_as_double_count_and_het_as_two_singles() {
+        // k=2 genotypes: (0,0), (0,1), (1,1). Isolates the flat-input builder from
+        // the DM math + mixture so a shape bug localizes here, not downstream.
+        let genotypes = enumerate_diploid_genotypes(2);
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 2);
+        assert_eq!(counts, vec![2, 0, 1, 1, 0, 2]);
+        assert_eq!(coeffs, vec![0.0, std::f64::consts::LN_2, 0.0]);
+    }
+
+    #[test]
+    fn marginalized_prior_handles_single_candidate_locus() {
+        // k=1 boundary: one genotype (0,0); ln(α/α) = 0 so the homozygote's IBD
+        // term is 0 and the prior stays finite.
+        let genotypes = enumerate_diploid_genotypes(1);
+        let (counts, coeffs) = diploid_dm_inputs(&genotypes, 1);
+        assert_eq!(counts, vec![2]);
+        assert_eq!(coeffs, vec![0.0]);
+        let logs = marginalized_genotype_log_priors(&genotypes, 1, &[0.5], 0.3);
+        assert_eq!(logs.len(), 1);
+        assert!(
+            logs[0].is_finite(),
+            "single-candidate prior must be finite, got {}",
+            logs[0]
+        );
+    }
+
+    #[test]
+    fn marginalized_prior_returns_empty_on_empty_genotypes() {
+        // Degenerate empty candidate set: no genotypes in, no priors out (no
+        // index/unwrap on a first genotype, no empty-sum division).
+        let logs = marginalized_genotype_log_priors(&[], 2, &[0.6, 0.4], 0.5);
+        assert!(logs.is_empty());
+    }
 
     /// Params for a single low-stutter sample group matching the clean sim chemistry.
     fn clean_params(n_samples: usize) -> ParamSet {
