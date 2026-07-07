@@ -17,6 +17,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::ssr::cohort::likelihood::LikelihoodScratch;
+use crate::ssr::cohort::param_estimation::StutterShape;
 use crate::ssr::cohort::types::{CohortLocus, SampleEvidence};
 
 /// A distinct observed sequence at a rung with its cohort support — the element a rung
@@ -119,6 +121,62 @@ impl RungCfg {
             separation_min: 2,
             min_depth: 10,
             balance_ratio: 0.30,
+        }
+    }
+}
+
+/// The coded **seed** parameters the model-based confident-genotype gate (D1) scores
+/// the read likelihood `Qᵣ` with — the "burn-in start" of Mark-2 §4.3/§4.4
+/// (spec [`ssr_bic_confident_genotype.md`] §4).
+///
+/// The gate needs `ε`, a stutter shape, and a stutter level to score reads, but the
+/// pre-pass is what *measures* those — a bootstrap. D1 breaks it with these coded
+/// seeds; the gate is prior hygiene (the EM can overrule a biased prior), and the case
+/// it targets (the same-length het) is robust to a rough seed because its signal is
+/// composition, not length. The data-driven co-evolution that replaces this seed with
+/// the pre-pass's own fitted params — re-running the gate inside the burn-in loop — is
+/// roadmap D2, out of D1 scope. Every field is an exposed dev value (no hidden
+/// defaults); the numbers are pinned on the simulator in F2.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GateParams {
+    /// Seed per-base error `ε` for `Qᵣ`.
+    pub(crate) eps: f64,
+    /// Seed stutter shape (direction split + geometric decay of multi-unit slips).
+    pub(crate) shape: StutterShape,
+    /// Seed stutter level (≈ `P(Δ ≠ 0)`); constant in the seed (no length slope).
+    pub(crate) level: f64,
+    /// Seed uniform-outlier weight `λ` for the genotype-likelihood floor.
+    pub(crate) lambda: f64,
+    /// The purity-tuned BIC coefficient: admit the second allele (call a het) iff
+    /// `lnL̂₂ − lnL̂₁ > het_admission_cost · ln(n)` (`n` = reads scored). BIC-neutral
+    /// for one extra parameter is `½`; the seed runs it **well above** ½ so almost no
+    /// false het sneaks into the chemistry seed (a hidden het poisons `ε`/`θ`; a
+    /// discarded homozygote only costs a little data — spec §2.1). Pinned in F2.
+    pub(crate) het_admission_cost: f64,
+    /// Cap on how many of the sample's distinct observed sequences are searched as
+    /// candidate alleles (top-M by read support, then bytes) — bounds the pair search
+    /// and keeps scattered low-count error variants out of it (spec §2.4).
+    pub(crate) max_candidates: usize,
+}
+
+impl GateParams {
+    /// Working seed values (recalibrated in F2). The shape is symmetric with a mild
+    /// decay — a deliberately neutral seed. (Its literals coincide with the pre-pass's
+    /// `FALLBACK_SHAPE` today, but the two are *independent* seeds, each pinned
+    /// separately in F2, so they are not coupled and may diverge.) `het_admission_cost`
+    /// is deliberately conservative (§2.1).
+    pub(crate) fn dev_default() -> Self {
+        Self {
+            eps: 0.005,
+            shape: StutterShape {
+                up_rate: 0.5,
+                down_rate: 0.5,
+                decay: 0.1,
+            },
+            level: 0.05,
+            lambda: 0.01,
+            het_admission_cost: 3.0,
+            max_candidates: 6,
         }
     }
 }
@@ -295,14 +353,22 @@ fn representative_sequence(evidence: &SampleEvidence, length: u16, period: usize
         .expect("a resolved peak length is occupied by the sample")
 }
 
-/// Run the heuristic confident-genotype gate on one sample (spec §5 level 4 + the
-/// arch §2 guards). Returns the labelled peaks when confident, else the reason.
+/// Run the confident-genotype gate on one sample (spec §5 level 4 + the arch §2
+/// guards). Returns the labelled peaks when confident, else the reason.
+///
+/// `seed` + `scratch` are the model-based gate's inputs (the seed params it scores
+/// `Qᵣ` with, and a reusable per-locus likelihood buffer). D1a threads them through
+/// the interface; the model-based body that consumes them lands in D1b — the current
+/// body is still the length-histogram heuristic and ignores them.
 pub(crate) fn resolve_confident_genotype(
     sample: &SampleEvidence,
     rungs: &Rungs,
     ploidy: u8,
     cfg: &RungCfg,
+    seed: &GateParams,
+    scratch: &mut LikelihoodScratch,
 ) -> Resolution {
+    let _ = (seed, scratch); // consumed by the model-based body in D1b
     let depth: u32 = sample.seq_counts.iter().map(|(_, c)| c).sum();
     if depth < cfg.min_depth {
         return Resolution::Unresolved(UnresolvedReason::Thin);
@@ -457,7 +523,15 @@ mod tests {
 
     fn resolve_sample0(locus: &CohortLocus, cfg: &RungCfg) -> Resolution {
         let rungs = build_rungs(locus, cfg);
-        resolve_confident_genotype(&locus.samples[0], &rungs, 2, cfg)
+        let mut scratch = LikelihoodScratch::new();
+        resolve_confident_genotype(
+            &locus.samples[0],
+            &rungs,
+            2,
+            cfg,
+            &GateParams::dev_default(),
+            &mut scratch,
+        )
     }
 
     #[test]

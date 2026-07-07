@@ -28,12 +28,14 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 
 use crate::ssr::cohort::attribution::nearest_parent;
+use crate::ssr::cohort::likelihood::LikelihoodScratch;
 use crate::ssr::cohort::param_estimation::{
     AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, PurityLevel,
     SampleStutterStats, SlipProfile, StutterLevel, StutterShape, interruption_count,
 };
 use crate::ssr::cohort::rung_ladder::{
-    Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs, resolve_confident_genotype,
+    GateParams, Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs,
+    resolve_confident_genotype,
 };
 use crate::ssr::cohort::types::CohortLocus;
 
@@ -232,6 +234,8 @@ pub(crate) fn accumulate_locus(
     rungs: &Rungs,
     ploidy: u8,
     cfg: &RungCfg,
+    seed: &GateParams,
+    scratch: &mut LikelihoodScratch,
 ) {
     let period = rungs.period();
     // Cohort-wide confident-allele tally for this locus (length in repeat units →
@@ -240,7 +244,7 @@ pub(crate) fn accumulate_locus(
     for (k, evidence) in locus.samples.iter().enumerate() {
         let global = locus.present[k];
         let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
-            resolve_confident_genotype(evidence, rungs, ploidy, cfg)
+            resolve_confident_genotype(evidence, rungs, ploidy, cfg, seed, scratch)
         else {
             continue;
         };
@@ -508,12 +512,21 @@ pub(crate) fn estimate(stats: &PrepassStats, g0_cfg: &G0FitCfg) -> EstimatedPara
 /// (F1), and `estimate` reads off it deterministically regardless of any internal
 /// `Vec`/`HashMap` ordering.
 pub(crate) fn run_prepass_stats(loci: &[CohortLocus], ploidy: u8, cfg: &RungCfg) -> PrepassStats {
+    // The gate's seed params are cohort-constant (D1 scores with coded seeds; D2's
+    // burn-in will lift this to a threaded parameter — spec §4). The likelihood scratch
+    // is per-thread: allocate once per fold partition and reuse across that partition's
+    // loci (the scratch-buffer idiom), so no cross-thread state and no per-locus alloc.
+    let seed = GateParams::dev_default();
     loci.par_iter()
-        .fold(PrepassStats::default, |mut acc, locus| {
-            let rungs = build_rungs(locus, cfg);
-            accumulate_locus(&mut acc, locus, &rungs, ploidy, cfg);
-            acc
-        })
+        .fold(
+            || (PrepassStats::default(), LikelihoodScratch::new()),
+            |(mut acc, mut scratch), locus| {
+                let rungs = build_rungs(locus, cfg);
+                accumulate_locus(&mut acc, locus, &rungs, ploidy, cfg, &seed, &mut scratch);
+                (acc, scratch)
+            },
+        )
+        .map(|(acc, _scratch)| acc)
         .reduce(PrepassStats::default, |mut a, b| {
             a.merge(&b);
             a
@@ -636,9 +649,19 @@ mod tests {
         // A 6/10 het must deposit faithful/slipped stats at BOTH allele lengths.
         let loci = collect_loci(&het_spec());
         let mut stats = PrepassStats::default();
+        let seed = GateParams::dev_default();
+        let mut scratch = LikelihoodScratch::new();
         for locus in &loci {
             let rungs = build_rungs(locus, &RungCfg::dev_default());
-            accumulate_locus(&mut stats, locus, &rungs, 2, &RungCfg::dev_default());
+            accumulate_locus(
+                &mut stats,
+                locus,
+                &rungs,
+                2,
+                &RungCfg::dev_default(),
+                &seed,
+                &mut scratch,
+            );
         }
         // Every resolved het sample carries bins at lengths 6 and 10.
         assert!(!stats.per_sample.is_empty(), "hets should resolve");
