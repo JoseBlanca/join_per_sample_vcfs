@@ -159,6 +159,9 @@ pub(crate) fn build_param_set(
         stutter_shape_parent: est.shape_by_period.clone(),
         stutter_shape_by_cell: grouped.shape_by_group_period.clone(),
         level_seed: grouped.level_per_group.clone(),
+        // The Phase-2 purity → level factor the pre-pass fit (P2.2b); `none()` (Phase 1) when
+        // the cohort carries no fixed-length pure-vs-impure contrast.
+        purity_level: est.purity_level,
         pseudocount_decay_per_loci_group,
         group_of_sample,
         // `F` is estimated and frozen by the burn-in (arch §4), not here.
@@ -426,7 +429,7 @@ fn genotype_locus(
         &frozen.level_per_group,
         &HipstrModel,
     );
-    apply_fp_control(locus, &mut call, fp_cfg);
+    apply_fp_control(&mut call, fp_cfg);
 
     // PASS + monomorphic → drop; PASS + variable or any filtered verdict → emit.
     if candidates.admit == Admission::Pass && !is_variable(&call, &candidates) {
@@ -788,6 +791,87 @@ mod tests {
     }
 
     #[test]
+    fn same_length_interruption_locus_emits_a_variable_row_identically_across_threads() {
+        // Checkpoint 1 (P1.4): an interruption polymorphism — two 12 bp alleles differing only
+        // in composition (pure CA×6 vs an interrupted sibling at the same length) — must
+        // (a) emit a variable PASS row carrying a SAME-LENGTH ALT (the drop the feature fixes),
+        // and (b) be byte-identical across thread counts (the SSR determinism contract, §4).
+        let pure = ca(6); // CACACACACACA (12 bp)
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[5] = b'T'; // one interior base → same length, distinct composition
+            s.into_boxed_slice()
+        };
+        let sorted = |mut v: Vec<(Box<[u8]>, u32)>| {
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_loci = vec![loc_units("chr1", 40, 6)]; // ref = pure CA×6
+        let catalog = dir.path().join("c.ssr.catalog");
+        std::fs::write(&catalog, catalog_bytes(REF_MD5, &catalog_loci)).unwrap();
+
+        // 4 hom-pure, 4 hom-interrupted, 2 balanced same-length hets — both alleles clear §5.2.
+        let mut sample_obs: Vec<Vec<(Box<[u8]>, u32)>> = Vec::new();
+        for _ in 0..4 {
+            sample_obs.push(vec![(pure.clone(), 100)]);
+        }
+        for _ in 0..4 {
+            sample_obs.push(vec![(interrupted.clone(), 100)]);
+        }
+        for _ in 0..2 {
+            sample_obs.push(sorted(vec![(pure.clone(), 50), (interrupted.clone(), 50)]));
+        }
+
+        let mut psp_files = Vec::new();
+        for (i, obs) in sample_obs.into_iter().enumerate() {
+            let record = ssr_record(40, 6, obs);
+            let path = dir.path().join(format!("s{i}.ssr.psp"));
+            std::fs::write(&path, ssr_psp(ssr_header(&["chr1"], REF_MD5), &[record])).unwrap();
+            psp_files.push(path);
+        }
+
+        let run_with = |threads: usize, out: &str| {
+            let config = SsrCallConfig {
+                catalog: catalog.clone(),
+                psp_files: psp_files.clone(),
+                output: dir.path().join(out),
+                threads,
+                queue_depth: 4,
+            };
+            run(&config).unwrap();
+            std::fs::read_to_string(&config.output).unwrap()
+        };
+        let t1 = run_with(1, "t1.vcf");
+        let t4 = run_with(4, "t4.vcf");
+        assert_eq!(
+            t1, t4,
+            "a same-length locus must be byte-identical across thread counts\n{t1}"
+        );
+
+        let records: Vec<&str> = t1.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "the interruption locus emits one variable row\n{t1}"
+        );
+        let cols: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!(cols[6], "PASS", "{}", records[0]);
+        let refa = cols[3];
+        assert_ne!(cols[4], ".", "must carry the interruption ALT");
+        // Every ALT is a SAME-LENGTH, distinct-composition allele — the recovery (§5.4).
+        for alt in cols[4].split(',') {
+            assert_eq!(
+                alt.len(),
+                refa.len(),
+                "an interruption ALT is the same length as REF: REF={refa} ALT={alt}"
+            );
+            assert_ne!(alt, refa, "the ALT differs from REF in composition");
+        }
+    }
+
+    #[test]
     fn chunk_parallel_sweep_orders_records_and_is_deterministic() {
         // Four variant loci with a small queue_depth → multiple sweep chunks: the records
         // must stay in catalog (ascending POS) order and the VCF must be byte-identical
@@ -956,6 +1040,7 @@ mod tests {
                 .iter()
                 .map(|&p| (p, G0PseudocountDecay { p: 0.3 }))
                 .collect(),
+            purity_level: crate::ssr::cohort::param_estimation::PurityLevel::none(),
         }
     }
 
@@ -1048,5 +1133,319 @@ mod tests {
             params.pseudocount_decay_per_loci_group[&3].p,
             cfg.fallback_p // backfilled
         );
+    }
+
+    // ── P2.0 measurement gate (spec §6.5): per-allele slip stats from the real caller ──
+    //
+    // A precise, in-caller replacement for the reads-only proxy: the true catalog period
+    // (`locus.motif`) and the caller's own sequence-aware attribution
+    // (`nearest_called_by_sequence`), bucketed per called allele. Answers whether purity
+    // moves the stutter rate before any Phase-2 type is written. Reached only by the ignored
+    // `p20_dump_per_allele_slip_stats` test on the ssr_tomato1 psp.
+
+    /// Per called-allele slip statistics accumulated across the cohort.
+    struct AlleleSlip {
+        period: usize,
+        units: u16,
+        /// Interruptions at the **true** catalog period (the canonical
+        /// [`interruption_count`](crate::ssr::cohort::param_estimation::interruption_count)).
+        /// `0` ⇒ a pure motif tiling.
+        interruptions: u32,
+        faithful: u64,
+        slip_by_delta: std::collections::BTreeMap<i32, u64>,
+    }
+
+    impl AlleleSlip {
+        fn new(seq: &[u8], period: usize) -> Self {
+            AlleleSlip {
+                period,
+                units: (seq.len() / period.max(1)) as u16,
+                interruptions: crate::ssr::cohort::param_estimation::interruption_count(
+                    seq, period,
+                ),
+                faithful: 0,
+                slip_by_delta: std::collections::BTreeMap::new(),
+            }
+        }
+        fn slipped(&self) -> u64 {
+            self.slip_by_delta.values().sum()
+        }
+    }
+
+    /// Attribute each carrier's reads to its called alleles (the caller's own
+    /// `nearest_called_by_sequence`) and bucket the length slips per called candidate.
+    fn accumulate_allele_slips(
+        locus: &CohortLocus,
+        candidates: &crate::ssr::cohort::candidate_set::CandidateSet,
+        call: &crate::ssr::cohort::em::LocusCall,
+        params: &ParamSet,
+        acc: &mut std::collections::BTreeMap<Box<[u8]>, AlleleSlip>,
+    ) {
+        use crate::ssr::cohort::attribution::nearest_called_by_sequence;
+        use crate::ssr::cohort::pair_hmm::HmmScratch;
+        use smallvec::SmallVec;
+
+        let period = locus.motif.period().max(1);
+        let mut scratch = HmmScratch::new();
+        for (k, sc) in call.calls.iter().enumerate() {
+            if sc.allele_indices.is_empty() {
+                continue;
+            }
+            let group = params.group_of_sample[locus.present[k] as usize];
+            let eps = params.error_per_sample_group[group.0 as usize].0;
+            let called: SmallVec<[(&[u8], u16); 2]> = sc
+                .allele_indices
+                .iter()
+                .zip(&sc.genotype_units)
+                .map(|(&idx, &u)| (candidates.alleles[idx].as_ref(), u))
+                .collect();
+            for (obs, count) in &locus.samples[k].seq_counts {
+                let read_units = (obs.len() / period) as i32;
+                let (pos, delta) =
+                    nearest_called_by_sequence(obs, read_units, &called, eps, &mut scratch)
+                        .expect("a non-empty call has >=1 allele");
+                let cand_idx = sc.allele_indices[pos];
+                let entry = acc
+                    .entry(candidates.alleles[cand_idx].clone())
+                    .or_insert_with(|| AlleleSlip::new(&candidates.alleles[cand_idx], period));
+                let c = u64::from(*count);
+                if delta == 0 {
+                    entry.faithful += c;
+                } else {
+                    *entry.slip_by_delta.entry(delta).or_insert(0) += c;
+                }
+            }
+        }
+    }
+
+    /// Genotype the whole cohort (real burn-in + per-locus EM) and accumulate per-allele slip
+    /// stats. Mirrors `run`'s two passes but collects slips instead of writing a VCF.
+    fn measure_allele_slips(config: &SsrCallConfig) -> Result<Vec<AlleleSlip>, SsrCallError> {
+        let rung_cfg = RungCfg::dev_default();
+        let cand_cfg = CandidateCfg::dev_default();
+        let em_cfg = EmCfg::dev_default();
+        let outer_cfg = OuterCfg::dev_default();
+        let cluster_cfg = ClusterCfg::dev_default();
+        let g0_cfg = G0FitCfg::dev_default();
+        let fp_cfg = FpControlCfg::dev_default();
+
+        let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
+        let n_samples = merger.sample_names().len();
+        let subset = collect_burn_in_subset(merger)?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.threads.max(1))
+            .build()?;
+        let frozen = pool.install(|| -> Result<FrozenParams, SsrCallError> {
+            let stats = run_prepass_stats(&subset, PLOIDY, &rung_cfg);
+            let est = estimate(&stats, &g0_cfg);
+            let grouped = group_samples(&stats, &est, &cluster_cfg);
+            let params = build_param_set(&est, &grouped, n_samples, &g0_cfg)?;
+            let calls = run_cohort_em(
+                &subset,
+                &params,
+                grouped.level_per_group,
+                PLOIDY,
+                &em_cfg,
+                &rung_cfg,
+                &cand_cfg,
+                &outer_cfg,
+            );
+            Ok(FrozenParams {
+                chemistry: params,
+                f_per_sample: calls.f_per_sample,
+                level_per_group: calls.level_per_group,
+            })
+        })?;
+        drop(subset);
+
+        let merger = CohortMerger::open(&config.catalog, &config.psp_files)?;
+        let mut acc: std::collections::BTreeMap<Box<[u8]>, AlleleSlip> =
+            std::collections::BTreeMap::new();
+        for item in merger {
+            let locus = item?.1;
+            let rungs = build_rungs(&locus, &rung_cfg);
+            let candidates = assemble_candidates(&locus, &rungs, PLOIDY, &cand_cfg);
+            if candidates.admit != Admission::Pass {
+                continue;
+            }
+            let seed = seed_locus(
+                &locus,
+                &rungs,
+                &candidates,
+                &frozen.chemistry,
+                PLOIDY,
+                rung_cfg.prominence,
+            );
+            let f_present: Vec<f64> = locus
+                .present
+                .iter()
+                .map(|&g| frozen.f_per_sample[g as usize])
+                .collect();
+            let mut call = run_locus_em_with(
+                &locus,
+                &rungs,
+                &candidates,
+                &frozen.chemistry,
+                &seed,
+                PLOIDY,
+                &em_cfg,
+                &f_present,
+                &frozen.level_per_group,
+                &HipstrModel,
+            );
+            apply_fp_control(&mut call, &fp_cfg);
+            accumulate_allele_slips(&locus, &candidates, &call, &frozen.chemistry, &mut acc);
+        }
+        Ok(acc.into_values().collect())
+    }
+
+    #[test]
+    #[ignore = "P2.0 measurement — needs ssr_tomato1 psp; set SSR_P20_{CATALOG,PSP_DIR,OUT}"]
+    fn p20_dump_per_allele_slip_stats() {
+        use std::io::Write;
+        let catalog = std::env::var("SSR_P20_CATALOG").expect("SSR_P20_CATALOG");
+        let psp_dir = std::env::var("SSR_P20_PSP_DIR").expect("SSR_P20_PSP_DIR");
+        let out = std::env::var("SSR_P20_OUT").expect("SSR_P20_OUT");
+        let mut psp_files: Vec<PathBuf> = std::fs::read_dir(&psp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".ssr.psp"))
+            .collect();
+        psp_files.sort();
+        assert!(!psp_files.is_empty(), "no .ssr.psp under {psp_dir}");
+        let config = SsrCallConfig {
+            catalog: catalog.into(),
+            psp_files,
+            output: PathBuf::from("/dev/null"),
+            threads: 4,
+            queue_depth: 1024,
+        };
+        let alleles = measure_allele_slips(&config).unwrap();
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
+        writeln!(
+            w,
+            "period\tunits\tinterruptions\tis_pure\tfaithful\tslipped\ttotal\tslip_rate\tslip_hist"
+        )
+        .unwrap();
+        for a in &alleles {
+            let slipped = a.slipped();
+            let total = a.faithful + slipped;
+            if total == 0 {
+                continue;
+            }
+            let hist: Vec<String> = a
+                .slip_by_delta
+                .iter()
+                .map(|(d, c)| format!("{d}:{c}"))
+                .collect();
+            writeln!(
+                w,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                a.period,
+                a.units,
+                a.interruptions,
+                a.interruptions == 0,
+                a.faithful,
+                slipped,
+                total,
+                slipped as f64 / total as f64,
+                hist.join(",")
+            )
+            .unwrap();
+        }
+        eprintln!("wrote {} alleles to {out}", alleles.len());
+    }
+
+    /// D1d measurement: the frozen `ε` and the confident-genotype composition the pre-pass
+    /// seeds chemistry from, on the real ssr_tomato1 cohort. The direct D1 win is `ε`
+    /// de-inflation (fewer same-length-het reads mis-scored as substitutions) and the
+    /// appearance of **same-length hets** in the confident set (invisible to the old length
+    /// gate). Reuses the `SSR_P20_{CATALOG,PSP_DIR}` env vars.
+    ///
+    ///   SSR_P20_CATALOG=… SSR_P20_PSP_DIR=… \
+    ///     cargo test -p pop_var_caller --lib d1_dump_frozen_chemistry -- --ignored --nocapture
+    #[test]
+    #[ignore = "D1d measurement — needs ssr_tomato1 psp; set SSR_P20_{CATALOG,PSP_DIR}"]
+    fn d1_dump_frozen_chemistry() {
+        use crate::ssr::cohort::likelihood::LikelihoodScratch;
+        use crate::ssr::cohort::rung_ladder::{
+            GateParams, Resolution, ResolvedGenotype, build_rungs, resolve_confident_genotype,
+        };
+        let catalog = std::env::var("SSR_P20_CATALOG").expect("SSR_P20_CATALOG");
+        let psp_dir = std::env::var("SSR_P20_PSP_DIR").expect("SSR_P20_PSP_DIR");
+        let mut psp_files: Vec<PathBuf> = std::fs::read_dir(&psp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".ssr.psp"))
+            .collect();
+        psp_files.sort();
+        assert!(!psp_files.is_empty(), "no .ssr.psp under {psp_dir}");
+
+        let catalog_path = PathBuf::from(catalog);
+        let merger = CohortMerger::open(&catalog_path, &psp_files).unwrap();
+        let subset = collect_burn_in_subset(merger).unwrap();
+        let rung_cfg = RungCfg::dev_default();
+
+        // Confident-genotype composition (the gate's verdicts, scored with the same seed the
+        // pre-pass uses internally).
+        let seed = GateParams::dev_default();
+        let mut scratch = LikelihoodScratch::new();
+        let (mut hom, mut len_sep_het, mut same_len_het) = (0u64, 0u64, 0u64);
+        for locus in &subset {
+            let rungs = build_rungs(locus, &rung_cfg);
+            for ev in &locus.samples {
+                if let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
+                    resolve_confident_genotype(
+                        ev,
+                        &rungs,
+                        PLOIDY,
+                        &rung_cfg,
+                        &locus.motif,
+                        &seed,
+                        &mut scratch,
+                    )
+                {
+                    match peaks.as_slice() {
+                        [_] => hom += 1,
+                        [a, b] if a.repeat_len == b.repeat_len => same_len_het += 1,
+                        _ => len_sep_het += 1,
+                    }
+                }
+            }
+        }
+
+        // Frozen chemistry.
+        let stats = run_prepass_stats(&subset, PLOIDY, &rung_cfg);
+        let est = estimate(&stats, &G0FitCfg::dev_default());
+        let (mut base_match, mut base_mismatch) = (0u64, 0u64);
+        for st in stats.per_sample.values() {
+            base_match += st.base_match;
+            base_mismatch += st.base_mismatch;
+        }
+        let mean_level = est
+            .level_by_sample
+            .values()
+            .map(|l| l.baseline)
+            .sum::<f64>()
+            / est.level_by_sample.len().max(1) as f64;
+
+        eprintln!("D1d frozen chemistry — {} burn-in loci:", subset.len());
+        eprintln!("  eps                = {:.6}", est.eps);
+        eprintln!("  base_match         = {base_match}");
+        eprintln!("  base_mismatch      = {base_mismatch}");
+        eprintln!(
+            "  confident genotypes: hom={hom}  len_sep_het={len_sep_het}  same_length_het={same_len_het}"
+        );
+        eprintln!("  samples with stats = {}", stats.per_sample.len());
+        eprintln!("  mean per-sample level baseline = {mean_level:.4}");
+        let mut periods: Vec<_> = est.shape_by_period.keys().copied().collect();
+        periods.sort_unstable();
+        for p in periods {
+            let s = &est.shape_by_period[&p];
+            eprintln!(
+                "  shape[period={p}] up={:.3} down={:.3} decay={:.3}",
+                s.up_rate, s.down_rate, s.decay
+            );
+        }
     }
 }

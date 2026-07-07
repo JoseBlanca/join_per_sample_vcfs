@@ -65,6 +65,72 @@ pub(crate) struct StutterLevel {
     pub(crate) slope: f64,
 }
 
+/// Phase-2 purity → stutter-**level** covariate (spec §6.3), the one covariate the P2.0
+/// measurement earned: at fixed length an interrupted allele slips **less** than a pure one
+/// (P2.0 on `ssr_tomato1`: ~3× less), and the effect is on the *level*, not the decay, with no
+/// per-allele residual. So an allele's per-read stutter level is scaled by
+/// `per_interruption_factor` raised to its **interruption count** ([`interruption_count`]):
+/// a pure allele (0 interruptions) is unchanged (factor 1), so this collapses to Phase 1
+/// wherever no impure alleles exist. `per_interruption_factor == 1.0` disables the effect.
+///
+/// A single cohort-global factor in v1 (the P2.0 contrast was cohort-pooled); a per-period
+/// factor is the natural refinement if a period-specific fit is later warranted. Fit in the
+/// pre-pass (P2.2); this Phase-1-neutral default is [`PurityLevel::none`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PurityLevel {
+    /// Multiplicative per-read level factor applied once per interruption, in `(0, 1]`.
+    pub(crate) per_interruption_factor: f64,
+}
+
+impl PurityLevel {
+    /// No purity effect — the Phase-1-identical default the pre-pass fit (P2.2) replaces.
+    pub(crate) const fn none() -> Self {
+        Self {
+            per_interruption_factor: 1.0,
+        }
+    }
+
+    /// The multiplicative level factor for an allele with `interruptions` interruptions:
+    /// `per_interruption_factor^interruptions`. `1.0` for a pure allele (0 interruptions).
+    pub(crate) fn level_factor(&self, interruptions: u32) -> f64 {
+        self.per_interruption_factor.powi(interruptions as i32)
+    }
+}
+
+/// The **purity measure** (Q-I2): the number of interruptions in a tract — bases that break its
+/// motif tiling. Each of the `period` phase positions (`i mod period`) is scored independently:
+/// its **majority base** across the tract is the motif base for that phase, and every position
+/// deviating from it is one interruption. So a single interrupting base is counted **once** —
+/// including one in the *first* unit (a first-unit-anchored `seq[i] != seq[i % period]` scan
+/// would miscount it ≈ `units−1` times, and a self-periodicity scan ≈ twice). `0` ⇒ a pure motif
+/// tiling — the same pure/impure split the P2.0 gate used, and it is **phase-robust** (it does
+/// not assume the first unit is a clean motif copy).
+///
+/// Period-1 (mononucleotide) tracts are **not** scored — there every non-matching base is an
+/// "interruption" and stutter already subsumes single-base indels (spec §6), so purity is not
+/// separable; they return `0` (pure).
+pub(crate) fn interruption_count(seq: &[u8], period: usize) -> u32 {
+    if period < 2 || seq.len() < period {
+        return 0;
+    }
+    let mut interruptions = 0u32;
+    for phase in 0..period {
+        // Tally the bases at this phase (positions `phase, phase+period, …`); the majority is
+        // the phase's motif base, so the rest are interruptions. Integer counts → determinism.
+        let mut base_counts = [0u32; 256];
+        let mut total = 0u32;
+        let mut i = phase;
+        while i < seq.len() {
+            base_counts[seq[i] as usize] += 1;
+            total += 1;
+            i += period;
+        }
+        let majority = base_counts.iter().copied().max().unwrap_or(0);
+        interruptions += total - majority;
+    }
+    interruptions
+}
+
 /// `G₀` geometric pseudocount decay on the allele-frequency prior `π`, per loci
 /// group (= period in v1; arch §0/§5).
 ///
@@ -125,6 +191,9 @@ pub(crate) struct ParamSet {
     pub(crate) stutter_shape_by_cell: HashMap<(SampleGroupId, u8), StutterShape>,
     /// Per-sample-group stutter-level seed (refined in E1, not frozen).
     pub(crate) level_seed: Vec<StutterLevel>,
+    /// Phase-2 purity → level covariate (cohort-global; [`PurityLevel::none`] = Phase 1). Fit
+    /// in the pre-pass (P2.2), applied per-candidate at the read-model level site.
+    pub(crate) purity_level: PurityLevel,
     /// `G₀` decay, per loci group (= period in v1).
     pub(crate) pseudocount_decay_per_loci_group: HashMap<u8, G0PseudocountDecay>,
     /// Sample index → its sample group.
@@ -301,6 +370,7 @@ mod tests {
             pseudocount_decay_per_loci_group: g0,
             group_of_sample: vec![SampleGroupId(0), SampleGroupId(1), SampleGroupId(0)],
             f0_seed: 0.05,
+            purity_level: PurityLevel::none(),
         };
 
         assert_eq!(params.error_per_sample_group[1], PerBaseError(0.002));
@@ -378,5 +448,49 @@ mod tests {
         }
         b.merge(&a);
         assert_eq!(b.value().to_bits(), sequential.value().to_bits());
+    }
+
+    // ── P2.1: purity measure + purity → level factor ──
+
+    #[test]
+    fn interruption_count_counts_breaks_in_the_period_tiling() {
+        // Pure CA×6 (period 2): a perfect tiling → 0 interruptions.
+        assert_eq!(interruption_count(b"CACACACACACA", 2), 0);
+        // One interior base flipped → exactly one interruption at period 2.
+        assert_eq!(interruption_count(b"CACACTCACACA", 2), 1);
+        // TTA×6 with a TTG interruption (spec's 4279322 shape): one break at period 3.
+        assert_eq!(interruption_count(b"TTATTATTATTGTTATTA", 3), 1);
+        // Period 1 (mononucleotide) is never scored — purity is not separable there.
+        assert_eq!(interruption_count(b"AAAAGAAAA", 1), 0);
+    }
+
+    #[test]
+    fn interruption_count_scores_a_first_unit_interruption_once() {
+        // A CA tract whose FIRST unit carries the substitution (`TA` instead of `CA`). A
+        // first-unit-anchored scan would count every later `C` position as a mismatch
+        // (~units−1); the phase-majority measure counts the lone `T` once.
+        assert_eq!(interruption_count(b"TACACACACACA", 2), 1);
+    }
+
+    #[test]
+    fn interruption_count_is_zero_for_a_tract_shorter_than_one_period() {
+        assert_eq!(interruption_count(b"", 2), 0);
+        assert_eq!(interruption_count(b"C", 2), 0); // shorter than one period
+        assert_eq!(interruption_count(b"CA", 2), 0); // exactly one period, nothing to compare
+    }
+
+    #[test]
+    fn purity_level_factor_is_multiplicative_and_neutral_for_pure_alleles() {
+        // The neutral default leaves every allele's level unchanged (Phase 1).
+        let none = PurityLevel::none();
+        assert_eq!(none.level_factor(0), 1.0);
+        assert_eq!(none.level_factor(3), 1.0);
+        // A per-interruption factor compounds; a pure allele (0 interruptions) is unchanged.
+        let p = PurityLevel {
+            per_interruption_factor: 0.5,
+        };
+        assert_eq!(p.level_factor(0), 1.0);
+        assert_eq!(p.level_factor(1), 0.5);
+        assert!((p.level_factor(2) - 0.25).abs() < 1e-12);
     }
 }

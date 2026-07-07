@@ -1,3 +1,83 @@
 
 
 Add an issue, create integration tests that check that the phase chains are correctely considered in the likelihood calculation.
+
+SSR same-length paralog false-hets (sequence-keyed alleles). Once ssr-call
+makes alleles sequence-keyed (see doc/devel/specs/ssr_interrupted_repeat_recall.md
+Phase 1), two same-length-but-different-composition tracts become distinct
+candidate alleles. This recovers real interrupted-repeat polymorphisms, but it
+also exposes a new false-positive class the length-collapse used to hide: a
+collapsed paralog / CNV copy (or a consistent mismapping, or systematic damage)
+whose second copy carries a fixed substitution at the same tract length. That
+variant recurs at the same base, in many reads, across many samples, so the §5.2
+recurrence admission bar (>=reads, >=samples, >=fraction) does not reject it, and
+G0 cannot penalise it (both alleles sit at the modal length). The result is a
+false ALT called het in every carrier, at a stable ~50% balance, with high GQ.
+Note the allele-balance backstop is also blind to it: vcf_out.rs allele_balance()
+short-circuits to 1.0 when the two genotype_units are equal, so it treats a
+same-length het as a homozygote.
+
+Try to adapt the SNP-path paralog machinery (src/var_calling/paralog_filter/,
+the coverage / excess-heterozygosity signal) to the SSR cohort caller. This is
+expected to be hard: microsatellites are far more diverse than SNPs (multi-allelic,
+stutter skirts, per-locus length structure), so the coverage-excess and
+allele-balance signals the SNP filter keys on do not transfer cleanly. Candidate
+signals worth exploring: per-locus coverage excess vs the cohort typical, a locus
+where (almost) every sample is heterozygous for the same same-length allele pair
+(strongly negative F_IS / HWE departure at that locus), and reusing the hidden-
+paralog .psp coverage-by-GC evidence already produced in Stage 1. Until a guard
+exists, gate Phase 1 on a benchmark FP audit that specifically counts cohort-
+universal same-length hets as suspected paralog artifacts.
+
+SSR Phase-2 purity->level — fit from the broad caller genotypes, not the
+confident-genotype pre-pass. Phase 2 (per-allele purity->stutter-level, spec
+ssr_interrupted_repeat_recall.md 6) is built and correct: the pre-pass fits a
+cohort-global per_interruption_factor (prepass.rs fit_purity_level) and the read
+model applies it (em.rs candidate_level). It is guarded (fixed-length contrast,
+capped at 1, floored, none() when no clean contrast) and collapses to Phase 1.
+But on ssr_tomato1 it is INERT (factor 1.0): the pre-pass's data source -- the
+confident-genotype gate (resolve_confident_genotype) -- yields no robust
+fixed-length purity contrast, and at a relaxed read floor even a WRONG-SIGNED one
+(impure appears to slip MORE), so the fit correctly refuses it. This contradicts
+the P2.0 measurement (driver.rs measure_allele_slips, the ignored
+p20_dump_per_allele_slip_stats test), which -- over ALL called alleles with the
+caller's own sequence attribution -- found impure alleles slip ~0.35x at fixed
+length. So the effect is real in the broad population but not recoverable from the
+thinner, length-attributed confident-homozygote subset the spec 6.4 fit uses
+(possibly the confident population is genuinely different, or the broad-population
+signal is partly an attribution/het-contamination artifact -- unresolved). Owner
+decision 2026-07-06: ship Phase 2 guarded + inert; do NOT force a wrong-signed
+factor. Follow-up if impure-loci GQ calibration becomes a priority: refit the
+purity factor from the caller's own post-genotyping alleles (the P2.0 population)
+instead of the confident pre-pass, or reconcile the population discrepancy (add a
+units>=3 filter + sequence attribution to the pre-pass purity_slip accumulation).
+Report: doc/devel/reports/ssr_interrupted_repeat_p20_slip_measurement_2026-07-06.md
+and the P2.3 section of the validation report.
+
+SSR pre-pass D1 — model-based confident-genotype resolution test (replace the
+length heuristic). The pre-pass that estimates the frozen chemistry parameters
+(per-base error eps, stutter shape/level) picks its "confident genotypes" with a
+length-histogram heuristic (rung_ladder.rs resolve_confident_genotype: one clear
+length peak = homozygote). The roadmap D1 / decision Q-P7 specced a model-based
+1-vs-2(..ploidy)-peak BIC resolution test instead: score the reads under the best
+one-allele model vs the best two-allele model using the C2 read likelihood, and
+admit the extra allele only when it earns its BIC complexity penalty (tuned
+conservatively "for purity" — let almost no het sneak in, since a hidden het
+poisons the estimates while a discarded homozygote only costs a little data). That
+test shipped as a heuristic stand-in in Milestone D; the BIC form itself is not yet
+built (rung_ladder.rs:13 documents it as the intended layer). See
+doc/devel/implementation_plans/ssr_call_genotyping_and_parameters.md D1 (line ~397)
+and ssr_call_roadmap.md D1.
+
+Why it matters / dependency: the length heuristic always mislabels a same-length
+het (pure-18 / interrupted-18) as a homozygote, dumping the minority-composition
+reads into the error halo and inflating eps on interruption-rich cohorts (the
+prepass.rs BIAS NOTE already flags this; see ssr_interrupted_repeat_recall.md
+5.5). The BIC test decides hom-vs-het by likelihood over candidate SEQUENCES, so
+it can propose "two alleles at one length" and catch that het — but only once the
+candidate machinery nominates two same-length sequences, which is the interruption
+spec's Phase 1. So Phase 1 is a prerequisite; the BIC-form D1 is a separate
+follow-up that actually delivers the cleaner eps/theta (it is NOT a free payoff of
+Phase 1). Deterministic: the reads/peak sufficient stats already reduce in fixed
+per-locus order (BIC log-liks via FixedPointAccum), so the test stays byte-identical
+across threads.

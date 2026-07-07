@@ -13,10 +13,9 @@
 use std::io::{self, Write};
 
 use crate::psp::header::ParsedChromosome;
-use crate::ssr::cohort::attribution::nearest_parent;
 use crate::ssr::cohort::candidate_set::{Admission, CandidateSet};
 use crate::ssr::cohort::em::{LocusCall, SampleCall};
-use crate::ssr::cohort::types::{CohortLocus, SampleEvidence};
+use crate::ssr::cohort::types::CohortLocus;
 
 /// FP-control + output thresholds (pinned in F2).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,42 +129,50 @@ pub(crate) fn write_vcf_header<W: Write>(
     Ok(())
 }
 
-/// The minor-allele read fraction of a het call (`0` … `0.5`), by hard-attributing
-/// each read to the nearer called allele length. A homozygote returns `1.0`.
-fn allele_balance(evidence: &SampleEvidence, call: &SampleCall, period: usize) -> f64 {
-    if call.genotype_units.len() < 2 || call.genotype_units[0] == call.genotype_units[1] {
+/// The minor-allele read fraction of a het call (`0` … `0.5`) from the **deconvolved
+/// per-allele responsibilities** the EM's final E-step already computed
+/// ([`SampleCall::allele_support`], via the per-candidate `Qᵣ` — arch §3). No read model and
+/// no length attribution here: the VCF stage just reads the split off the call.
+///
+/// Triggers on allele **identity**, not length: `1.0` (skip the balance test) only when the
+/// two called allele *indices* are equal — a genuine homozygote — never when two *same-length*
+/// alleles are called, which is exactly the interruption het this defence must test (Mark-2 §6
+/// amendment; the old `genotype_units`-equal short-circuit silently disabled it there). Also
+/// `1.0` when support is absent (nothing to weigh).
+fn allele_balance(call: &SampleCall) -> f64 {
+    if call.allele_indices.len() < 2 || call.allele_indices[0] == call.allele_indices[1] {
+        return 1.0; // homozygote by identity → no balance test
+    }
+    let support = &call.allele_support;
+    if support.len() < 2 {
+        return 1.0; // no deconvolved evidence to weigh
+    }
+    let total = support[0] + support[1];
+    if total <= 0.0 {
         return 1.0;
     }
-    let parents = [call.genotype_units[0], call.genotype_units[1]];
-    let (mut sa, mut sb) = (0u64, 0u64);
-    for (obs, count) in &evidence.seq_counts {
-        let units = (obs.len() / period) as i32;
-        // The shared nearest-parent rule breaks an equidistant tie toward the first allele,
-        // matching the previous `<=` (review Mi1).
-        let (parent_idx, _delta) =
-            nearest_parent(units, &parents).expect("a het has two parent alleles");
-        if parent_idx == 0 {
-            sa += *count as u64;
-        } else {
-            sb += *count as u64;
-        }
-    }
-    let total = sa + sb;
-    if total == 0 {
-        return 1.0;
-    }
-    sa.min(sb) as f64 / total as f64
+    support[0].min(support[1]) / total
 }
 
 /// Apply the allele-balance FP defence in place: scale down an imbalanced het's GQ
-/// and convert sub-threshold calls to no-calls.
-pub(crate) fn apply_fp_control(locus: &CohortLocus, call: &mut LocusCall, cfg: &FpControlCfg) {
-    let period = locus.motif.period();
-    for (k, sample_call) in call.calls.iter_mut().enumerate() {
+/// and convert sub-threshold calls to no-calls. Reads only each call's own
+/// [`SampleCall::allele_support`], so it needs neither the locus reads nor the read model.
+pub(crate) fn apply_fp_control(call: &mut LocusCall, cfg: &FpControlCfg) {
+    for sample_call in call.calls.iter_mut() {
         if sample_call.allele_indices.is_empty() {
             continue; // already a no-call
         }
-        let balance = allele_balance(&locus.samples[k], sample_call, period);
+        // A called het must carry the deconvolved `allele_support` the balance term reads
+        // (`fill_allele_support` fills it in the EM's final E-step). A het that arrives without
+        // it would make `allele_balance` silently return 1.0 and drop the depth-inflated-false-
+        // het defence, so fail loud in debug/test builds rather than lose the filter (review Mi2).
+        debug_assert!(
+            sample_call.allele_indices.len() < 2
+                || sample_call.allele_indices[0] == sample_call.allele_indices[1]
+                || sample_call.allele_support.len() >= 2,
+            "het call reached apply_fp_control without allele_support — fill_allele_support skipped?"
+        );
+        let balance = allele_balance(sample_call);
         if balance < cfg.min_allele_balance {
             // A depth-inflated false het: scale GQ by how far below the floor it is.
             let scale = (balance / cfg.min_allele_balance).clamp(0.0, 1.0);
@@ -367,6 +374,7 @@ mod tests {
     use crate::ssr::cohort::em::SampleCall;
     use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
     use crate::ssr::types::Motif;
+    use smallvec::{SmallVec, smallvec};
 
     fn ca_seq(units: u16) -> Box<[u8]> {
         std::iter::repeat_n(*b"CA", units as usize)
@@ -420,12 +428,14 @@ mod tests {
                     genotype_units: vec![8, 8],
                     posterior: 0.99,
                     gq: 40,
+                    allele_support: Default::default(),
                 },
                 SampleCall {
                     allele_indices: vec![1, 2], // het 6/10
                     genotype_units: vec![6, 10],
                     posterior: 0.95,
                     gq: 30,
+                    allele_support: Default::default(),
                 },
             ],
             pi: vec![0.5, 0.25, 0.25],
@@ -481,6 +491,7 @@ mod tests {
                 genotype_units: vec![8, 0],
                 posterior: 0.9,
                 gq: 30,
+                allele_support: Default::default(),
             }],
             pi: vec![0.5, 0.5],
             posterior_hom: vec![0.1],
@@ -511,6 +522,7 @@ mod tests {
                 genotype_units: vec![],
                 posterior: 0.0,
                 gq: 0,
+                allele_support: Default::default(),
             }],
             pi: vec![1.0],
             posterior_hom: vec![0.0],
@@ -530,6 +542,7 @@ mod tests {
                 genotype_units: vec![],
                 posterior: 0.0,
                 gq: 0,
+                allele_support: Default::default(),
             }],
             pi: vec![1.0],
             posterior_hom: vec![0.0],
@@ -550,58 +563,78 @@ mod tests {
 
     // ── E2: FP control + output semantics ──
 
-    fn het_call(gq: u8, posterior: f64) -> SampleCall {
+    /// A 6/10 het call carrying the deconvolved per-allele support the balance term reads.
+    fn het_call(gq: u8, posterior: f64, support: SmallVec<[f64; 2]>) -> SampleCall {
         SampleCall {
             allele_indices: vec![1, 2], // 6/10 het
             genotype_units: vec![6, 10],
             posterior,
             gq,
+            allele_support: support,
         }
     }
 
-    /// A sample whose reads are 95% at length 6 (so the 6/10 "het" is a depth-
-    /// inflated false het) and a balanced 6/10 sample.
-    fn imbalance_locus() -> CohortLocus {
-        let mut l = locus(); // ref tract 8; samples replaced below
-        l.present.clear();
-        l.samples.clear();
-        // Sample 0: 190 reads at 6, 10 at 10 → balance ≈ 0.05.
-        l.push(
-            0,
-            SampleEvidence {
-                seq_counts: vec![(ca_seq(6), 190), (ca_seq(10), 10)],
-                qc: SsrQc::default(),
-            },
-        );
-        // Sample 1: balanced 100/100 → balance ≈ 0.5.
-        l.push(
-            1,
-            SampleEvidence {
-                seq_counts: vec![(ca_seq(6), 100), (ca_seq(10), 100)],
-                qc: SsrQc::default(),
-            },
-        );
-        l
+    #[test]
+    fn allele_balance_reads_the_deconvolved_support_and_flags_an_imbalanced_het() {
+        // Balance now comes from the call's own `allele_support` (the EM's deconvolution), not
+        // from re-attributing reads at the VCF stage. A 190/10 split is a suspect false het; a
+        // 100/100 split is a clean het.
+        let imbalanced = het_call(40, 0.99, smallvec![190.0, 10.0]);
+        let balanced = het_call(40, 0.99, smallvec![100.0, 100.0]);
+        assert!(allele_balance(&imbalanced) < 0.1);
+        assert!(allele_balance(&balanced) > 0.45);
     }
 
     #[test]
-    fn allele_balance_flags_an_imbalanced_het_and_keeps_a_balanced_one() {
-        let l = imbalance_locus();
-        let call = het_call(40, 0.99);
-        assert!(allele_balance(&l.samples[0], &call, 2) < 0.1);
-        assert!(allele_balance(&l.samples[1], &call, 2) > 0.45);
+    fn allele_balance_returns_one_when_support_absent() {
+        // The defensive branch (review Mi2): a het whose `allele_support` was never filled
+        // returns 1.0 (balance test skipped) rather than panicking or misreading. In the
+        // production path `fill_allele_support` always populates it; `apply_fp_control` carries a
+        // `debug_assert!` so a future path that forgets the fill fails loud in tests.
+        let het_no_support = het_call(40, 0.99, SmallVec::new());
+        assert_eq!(allele_balance(&het_no_support), 1.0);
+    }
+
+    #[test]
+    fn allele_balance_tests_a_same_length_het_instead_of_short_circuiting() {
+        // The issue-2 fix: two same-length alleles (equal `genotype_units`) but distinct
+        // candidate indices are a genuine het the balance MUST test — the old
+        // `genotype_units`-equal short-circuit returned 1.0 here, silently disabling the FP
+        // defence for exactly the interruption het Phase 1 adds (Mark-2 §6 amendment).
+        let same_length_imbalanced = SampleCall {
+            allele_indices: vec![1, 2], // distinct candidates …
+            genotype_units: vec![6, 6], // … at the SAME length
+            posterior: 0.99,
+            gq: 40,
+            allele_support: smallvec![180.0, 20.0],
+        };
+        assert!(
+            allele_balance(&same_length_imbalanced) < 0.15,
+            "a same-length het is tested, not skipped as a homozygote"
+        );
+        // A homozygote (equal indices) is still skipped.
+        let hom = SampleCall {
+            allele_indices: vec![1, 1],
+            genotype_units: vec![6, 6],
+            posterior: 0.99,
+            gq: 40,
+            allele_support: smallvec![100.0, 100.0],
+        };
+        assert_eq!(allele_balance(&hom), 1.0);
     }
 
     #[test]
     fn fp_control_no_calls_a_depth_inflated_false_het() {
-        let l = imbalance_locus();
         let mut call = LocusCall {
-            calls: vec![het_call(40, 0.99), het_call(40, 0.99)],
+            calls: vec![
+                het_call(40, 0.99, smallvec![190.0, 10.0]), // imbalanced → no-call
+                het_call(40, 0.99, smallvec![100.0, 100.0]), // balanced → kept
+            ],
             pi: vec![0.2, 0.4, 0.4],
             posterior_hom: vec![0.0, 0.0],
             admit: Admission::Pass,
         };
-        apply_fp_control(&l, &mut call, &FpControlCfg::dev_default());
+        apply_fp_control(&mut call, &FpControlCfg::dev_default());
         // The imbalanced het collapsed to a no-call; the balanced het survived.
         assert!(
             call.calls[0].allele_indices.is_empty(),
@@ -614,7 +647,7 @@ mod tests {
     fn is_variable_true_with_an_alt_call_false_when_all_ref() {
         let cands = candidates();
         let variant = LocusCall {
-            calls: vec![het_call(40, 0.9)],
+            calls: vec![het_call(40, 0.9, smallvec![50.0, 50.0])],
             pi: vec![0.5, 0.25, 0.25],
             posterior_hom: vec![0.1],
             admit: Admission::Pass,
@@ -627,6 +660,7 @@ mod tests {
                 genotype_units: vec![8, 8],
                 posterior: 0.99,
                 gq: 40,
+                allele_support: Default::default(),
             }],
             pi: vec![1.0, 0.0, 0.0],
             posterior_hom: vec![0.99],
@@ -641,7 +675,10 @@ mod tests {
         let cands = candidates();
 
         let variant = LocusCall {
-            calls: vec![het_call(40, 0.99), het_call(40, 0.99)],
+            calls: vec![
+                het_call(40, 0.99, smallvec![50.0, 50.0]),
+                het_call(40, 0.99, smallvec![50.0, 50.0]),
+            ],
             pi: vec![0.2, 0.4, 0.4],
             posterior_hom: vec![0.0, 0.0],
             admit: Admission::Pass,
@@ -653,12 +690,14 @@ mod tests {
                     genotype_units: vec![8, 8],
                     posterior: 0.99,
                     gq: 40,
+                    allele_support: Default::default(),
                 },
                 SampleCall {
                     allele_indices: vec![0, 0],
                     genotype_units: vec![8, 8],
                     posterior: 0.99,
                     gq: 40,
+                    allele_support: Default::default(),
                 },
             ],
             pi: vec![1.0, 0.0, 0.0],

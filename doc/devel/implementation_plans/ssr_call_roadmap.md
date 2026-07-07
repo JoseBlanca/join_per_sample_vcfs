@@ -114,6 +114,12 @@ apart, dosage-consistent, each allele cohort-recurrent; the diploid core is the 
 test, extended to *p* peaks); the per-locus parameter fit off those confident genotypes (a het
 contributes two labelled outer skirts; polyploids that won't resolve lean on coded priors).
 *Depends:* B1, B3, C2. *Source:* parameters §2; spec §4.3/§4.4 (CG-seed).
+The heuristic stand-in shipped in Milestone D; the **BIC form** (the model-based part that
+fixes the same-length-het ε contamination) is designed in its own trio — spec
+[ssr_bic_confident_genotype.md](../specs/ssr_bic_confident_genotype.md), arch
+[../architecture/ssr_bic_confident_genotype.md](../architecture/ssr_bic_confident_genotype.md),
+plan [ssr_bic_confident_genotype.md](ssr_bic_confident_genotype.md) — stacked on Phase-1
+(`ssr-interruptions`), pending sign-off.
 
 **D2. Burn-in loop + measure → freeze parameters.**  ☐ arch ☐ plan
 The adaptive burn-in (seeded batches, frozen-params map, barrier reduce, update — batch 32

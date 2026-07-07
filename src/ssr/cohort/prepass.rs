@@ -2,38 +2,44 @@
 //! from confident genotypes (arch `ssr_call_parameters.md` §2–§4, spec §4.4,
 //! implementation plan §4 D1/D2).
 //!
-//! D1 — from each **confident genotype** (the B1 heuristic gate: homozygotes ∪
-//! well-separated hets), label every read against its nearest parent allele and
-//! accumulate two order-independent integer accumulators: a per-period
-//! [`SlipProfile`] (the cohort `θ_period` parent) and a per-sample
-//! [`SampleStutterStats`] (the level line + `ε` + the clustering input).
+//! D1 — from each **confident genotype** (the model-based BIC gate
+//! [`resolve_confident_genotype`](super::rung_ladder): homozygotes ∪ resolved hets,
+//! including **same-length interruption hets**, scored with coded [`GateParams`] seeds),
+//! label every read against its nearest parent allele and accumulate two order-
+//! independent integer accumulators: a per-period [`SlipProfile`] (the cohort `θ_period`
+//! parent) and a per-sample [`SampleStutterStats`] (the level line + `ε` + the
+//! clustering input).
 //!
 //! D2 — **measure**: turn those sufficient statistics into estimates — `ε` from the
 //! within-tract base mismatch fraction, the per-period stutter **shape** from the
 //! slip profile (direction split + geometric-decay MLE), and the per-sample stutter
 //! **level** line from the faithful-vs-slipped counts by length.
 //!
-//! Scope notes (the refinements this milestone defers): the gate here is B1's
-//! **heuristic** resolution (param-free), so the estimator is a single pass — the
-//! model-based 1-vs-2-peak BIC gate, the soft full-cohort EM responsibility reduce,
-//! the `ℓ_pen`-plateau burn-in iteration with multi-start, and the
-//! `FixedPointAccum` float reduce all matter once the gate co-evolves with the
-//! params / data is messy, and arrive with the parallel machinery (F1). On clean
-//! data the hard-label single pass recovers the injected parameters (checkpoint 2).
-//! Het inner-valley reads are hard-assigned to the nearer allele here (a documented
-//! approximation; the soft split is the refinement).
+//! Scope notes (the refinements this milestone defers): the gate scores with **coded
+//! seed params** (`GateParams`), so the estimator is a single pass — the gate's data-
+//! driven co-evolution (the `ℓ_pen`-plateau burn-in re-running it with the pre-pass's
+//! own fitted params, multi-start) and the soft full-cohort EM responsibility reduce
+//! arrive with the parallel machinery (D2/F1). The gate's own BIC log-likelihoods are
+//! computed within one locus (never crossing a thread boundary), so they need no
+//! `FixedPointAccum`. On clean data the hard-label single pass recovers the injected
+//! parameters (checkpoint 2). Het inner-valley reads are hard-assigned to the nearer
+//! allele here (a documented approximation; the soft split is the refinement).
 
 use std::collections::HashMap;
 
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
-use crate::ssr::cohort::attribution::nearest_parent;
+use crate::ssr::cohort::attribution::nearest_called_by_sequence;
+use crate::ssr::cohort::likelihood::LikelihoodScratch;
+use crate::ssr::cohort::pair_hmm::HmmScratch;
 use crate::ssr::cohort::param_estimation::{
-    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, SampleStutterStats,
-    SlipProfile, StutterLevel, StutterShape,
+    AlleleSpreadAccum, G0FitCfg, G0PseudocountDecay, LengthBin, MAX_SLIP, PurityLevel,
+    SampleStutterStats, SlipProfile, StutterLevel, StutterShape, interruption_count,
 };
 use crate::ssr::cohort::rung_ladder::{
-    Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs, resolve_confident_genotype,
+    GateParams, Resolution, ResolvedGenotype, RungCfg, Rungs, build_rungs,
+    resolve_confident_genotype,
 };
 use crate::ssr::cohort::types::CohortLocus;
 
@@ -52,6 +58,11 @@ pub(crate) struct PrepassStats {
     /// mode, over **variable loci only** — the sufficient statistic for the `G₀`
     /// decay fit (arch `ssr_call_driver.md` §9).
     pub(crate) allele_spread_by_period: HashMap<u8, AlleleSpreadAccum>,
+    /// `(length in units, interruption count)` → `(faithful, slipped)` reads over confident
+    /// alleles — the sufficient statistic for the Phase-2 purity→level fit
+    /// ([`fit_purity_level`]). The fixed-length pure-vs-impure contrast (§6.5a) lives in the
+    /// length key; integer counts, so it reduces order-independently like the rest.
+    pub(crate) purity_slip: HashMap<(u16, u32), (u64, u64)>,
 }
 
 impl PrepassStats {
@@ -81,6 +92,11 @@ impl PrepassStats {
             dst.total_copies += accum.total_copies;
             dst.distance_weighted += accum.distance_weighted;
         }
+        for (&key, &(faithful, slipped)) in &other.purity_slip {
+            let dst = self.purity_slip.entry(key).or_default();
+            dst.0 += faithful;
+            dst.1 += slipped;
+        }
     }
 }
 
@@ -105,6 +121,66 @@ pub(crate) struct EstimatedParams {
     /// (arch `ssr_call_driver.md` §9). One entry per period observed among the
     /// variable loci; thin periods carry the coded fallback.
     pub(crate) g0_by_period: HashMap<u8, G0PseudocountDecay>,
+    /// Phase-2 cohort-global purity→level factor (P2.2b). [`PurityLevel::none`] when the data
+    /// carries no fixed-length pure-vs-impure contrast (→ Phase 1).
+    pub(crate) purity_level: PurityLevel,
+}
+
+/// Minimum reads in a fixed-length pure-vs-impure **cell** (`faithful + slipped`) for it to
+/// inform the purity fit — thin cells are noise. Set to 50 (half the ≥100/side the P2.0 contrast
+/// carried) to admit moderately-covered cells while still excluding singletons; a provisional
+/// dev value, pinned against recovered-vs-spurious purity fits in F2.
+const MIN_PURITY_FIT_READS: u64 = 50;
+/// Floor on the fitted per-interruption factor: an impure allele slips less, never zero. A
+/// conservative guard (not a measured value) so a thin/noisy contrast cannot collapse the factor
+/// to ~0 and silence all stutter on impure alleles; revisit against the purity fits in F2.
+const PURITY_FACTOR_FLOOR: f64 = 0.05;
+
+/// Fit the cohort-global purity → stutter-level factor from the confident-genotype slip
+/// contrast (P2.2b, spec §6.3). At each length, contrast every impure cell against the pure
+/// (0-interruption) cell of the **same length** — the identifying variation free of the length
+/// confound (§6.5a). Weighted least-squares of `ln(impure_rate / pure_rate)` on interruption
+/// count **through the origin** (a pure allele's ratio is 1 → `ln 0`): `slope = Σ w·k·y / Σ w·k²`,
+/// `factor = exp(slope)`. Read-weighted by cell depth. The factor is capped at `1` — an
+/// interruption stabilises the tract, so it never *amplifies* stutter — and floored so a thin
+/// noisy contrast cannot drive it to zero. No usable contrast → [`PurityLevel::none`] (Phase 1).
+pub(crate) fn fit_purity_level(purity_slip: &HashMap<(u16, u32), (u64, u64)>) -> PurityLevel {
+    // Sort the cells into a canonical `(length, k)` order first, so the float accumulation is a
+    // FIXED-ORDER reduce — byte-identical across thread counts (arch §4), not at the mercy of
+    // `HashMap` iteration order.
+    let mut cells: Vec<((u16, u32), (u64, u64))> =
+        purity_slip.iter().map(|(&k, &v)| (k, v)).collect();
+    cells.sort_unstable_by_key(|&(key, _)| key);
+    // Pure baseline (0 interruptions) per length, in the same sorted pass.
+    let mut pure_rate: HashMap<u16, f64> = HashMap::new();
+    for &((len, k), (f, s)) in &cells {
+        if k == 0 && f + s >= MIN_PURITY_FIT_READS && s > 0 {
+            pure_rate.insert(len, s as f64 / (f + s) as f64);
+        }
+    }
+
+    let (mut sxy, mut sxx) = (0.0_f64, 0.0_f64);
+    for &((len, k), (f, s)) in &cells {
+        if k == 0 || f + s < MIN_PURITY_FIT_READS || s == 0 {
+            continue;
+        }
+        let Some(&pr) = pure_rate.get(&len) else {
+            continue; // no pure baseline at this length → skip (avoids the length confound)
+        };
+        let rate = s as f64 / (f + s) as f64;
+        let y = (rate / pr).ln();
+        let w = (f + s) as f64;
+        let x = f64::from(k);
+        sxy += w * x * y;
+        sxx += w * x * x;
+    }
+    if sxx <= 0.0 {
+        return PurityLevel::none(); // no fixed-length contrast anywhere → Phase 1
+    }
+    let factor = (sxy / sxx).exp().clamp(PURITY_FACTOR_FLOOR, 1.0);
+    PurityLevel {
+        per_interruption_factor: factor,
+    }
 }
 
 /// Add `(faithful, slipped)` to the bin for `length`, creating it if new.
@@ -150,27 +226,36 @@ pub(crate) fn merge_sample_stats(dst: &mut SampleStutterStats, src: &SampleStutt
 
 /// D1 — accumulate one locus's confident-genotype statistics into `stats`.
 ///
-/// BIAS NOTE: `ε` is taken off a peak's *faithful* reads by comparing each to the
-/// peak's representative allele. For a het this is mildly biased high — the other
-/// allele's rare same-length (`≥2`-step) stutter and any impure same-length variant
-/// both count as base mismatch. Negligible on homozygote-dominated cohorts; the
-/// deferred soft full-cohort EM reduce removes it by fractional attribution. Slips
-/// with `|Δ| > MAX_SLIP` are dropped (the spec cap; rare in practice).
+/// Reads are attributed to their parent allele **by sequence**
+/// ([`nearest_called_by_sequence`], scored with the gate's seed `ε`), so a same-length
+/// interruption het splits its reads by composition: an interrupted-allele read matches
+/// its own peak (faithful, no mismatch) instead of counting every interruption base as a
+/// substitution against the pure allele. This is what de-contaminates `ε` on interruption-
+/// rich cohorts (spec §7). The residual `ε` bias is only the genuine inner-valley soft-
+/// split approximation (a het's own `≥2`-step stutter landing on the other allele's
+/// length), which the deferred soft full-cohort EM reduce removes by fractional
+/// attribution. Slips with `|Δ| > MAX_SLIP` are dropped (the spec cap; rare in practice).
 pub(crate) fn accumulate_locus(
     stats: &mut PrepassStats,
     locus: &CohortLocus,
     rungs: &Rungs,
     ploidy: u8,
     cfg: &RungCfg,
+    seed: &GateParams,
+    scratch: &mut LikelihoodScratch,
 ) {
     let period = rungs.period();
     // Cohort-wide confident-allele tally for this locus (length in repeat units →
     // chromosome copies), used for the G₀ allele-spread fit below.
     let mut locus_alleles: Vec<AlleleCopies> = Vec::new();
+    // Reused per-locus buffer for the sequence-aware attribution's same-length tie-break
+    // (`align_subst`), allocated once and reused across all this locus's reads — mirrors
+    // `em::attribute_locus`.
+    let mut hmm_scratch = HmmScratch::new();
     for (k, evidence) in locus.samples.iter().enumerate() {
         let global = locus.present[k];
         let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
-            resolve_confident_genotype(evidence, rungs, ploidy, cfg)
+            resolve_confident_genotype(evidence, rungs, ploidy, cfg, &locus.motif, seed, scratch)
         else {
             continue;
         };
@@ -193,25 +278,51 @@ pub(crate) fn accumulate_locus(
         // Accumulate locally first (avoids holding two &mut into `stats` at once).
         let mut local = SampleStutterStats::default();
         let mut slips: Vec<(i32, u32)> = Vec::new();
-        let peak_units: Vec<u16> = peaks.iter().map(|p| p.repeat_len).collect();
+        // The called alleles as (sequence, length-in-units), parallel to `peaks`, so a read
+        // is attributed to its parent **by sequence** — a same-length het's two peaks are
+        // told apart by composition, not collapsed by length (the D1c fix). Sized to the
+        // diploid ≤ 2 peaks on the stack, matching `em::attribute_locus`.
+        let called: SmallVec<[(&[u8], u16); 2]> = peaks
+            .iter()
+            .map(|p| (p.allele.as_ref(), p.repeat_len))
+            .collect();
+        // Per-peak faithful/slipped totals, keyed to each peak's purity, feed the Phase-2
+        // purity→level contrast (folded into `stats.purity_slip` after the read loop).
+        let peak_interruptions: Vec<u32> = peaks
+            .iter()
+            .map(|p| interruption_count(&p.allele, period))
+            .collect();
+        let mut peak_faithful = vec![0u64; peaks.len()];
+        let mut peak_slipped = vec![0u64; peaks.len()];
         for (obs, count) in &evidence.seq_counts {
             let read_units = (obs.len() / period) as i32;
             let (peak_idx, delta) =
-                nearest_parent(read_units, &peak_units).expect("a confident genotype has ≥1 peak");
+                nearest_called_by_sequence(obs, read_units, &called, seed.eps, &mut hmm_scratch)
+                    .expect("a confident genotype has ≥1 peak");
             let peak = &peaks[peak_idx];
             if delta == 0 {
                 let (m, mm) = compare_bases(obs, &peak.allele);
                 local.base_match += m * *count as u64;
                 local.base_mismatch += mm * *count as u64;
                 add_bin(&mut local.by_length, peak.repeat_len, *count as u64, 0);
+                peak_faithful[peak_idx] += *count as u64;
             } else {
                 add_bin(&mut local.by_length, peak.repeat_len, 0, *count as u64);
                 slips.push((delta, *count));
+                peak_slipped[peak_idx] += *count as u64;
             }
             local.read_depth += *count as u64;
         }
 
         merge_sample_stats(stats.per_sample.entry(global).or_default(), &local);
+        for (i, peak) in peaks.iter().enumerate() {
+            let cell = stats
+                .purity_slip
+                .entry((peak.repeat_len, peak_interruptions[i]))
+                .or_default();
+            cell.0 += peak_faithful[i];
+            cell.1 += peak_slipped[i];
+        }
         for (delta, count) in &slips {
             stats
                 .slip_by_period
@@ -408,6 +519,7 @@ pub(crate) fn estimate(stats: &PrepassStats, g0_cfg: &G0FitCfg) -> EstimatedPara
         shape_by_period,
         level_by_sample,
         g0_by_period,
+        purity_level: fit_purity_level(&stats.purity_slip),
     }
 }
 
@@ -419,12 +531,21 @@ pub(crate) fn estimate(stats: &PrepassStats, g0_cfg: &G0FitCfg) -> EstimatedPara
 /// (F1), and `estimate` reads off it deterministically regardless of any internal
 /// `Vec`/`HashMap` ordering.
 pub(crate) fn run_prepass_stats(loci: &[CohortLocus], ploidy: u8, cfg: &RungCfg) -> PrepassStats {
+    // The gate's seed params are cohort-constant (D1 scores with coded seeds; D2's
+    // burn-in will lift this to a threaded parameter — spec §4). The likelihood scratch
+    // is per-thread: allocate once per fold partition and reuse across that partition's
+    // loci (the scratch-buffer idiom), so no cross-thread state and no per-locus alloc.
+    let seed = GateParams::dev_default();
     loci.par_iter()
-        .fold(PrepassStats::default, |mut acc, locus| {
-            let rungs = build_rungs(locus, cfg);
-            accumulate_locus(&mut acc, locus, &rungs, ploidy, cfg);
-            acc
-        })
+        .fold(
+            || (PrepassStats::default(), LikelihoodScratch::new()),
+            |(mut acc, mut scratch), locus| {
+                let rungs = build_rungs(locus, cfg);
+                accumulate_locus(&mut acc, locus, &rungs, ploidy, cfg, &seed, &mut scratch);
+                (acc, scratch)
+            },
+        )
+        .map(|(acc, _scratch)| acc)
         .reduce(PrepassStats::default, |mut a, b| {
             a.merge(&b);
             a
@@ -547,9 +668,19 @@ mod tests {
         // A 6/10 het must deposit faithful/slipped stats at BOTH allele lengths.
         let loci = collect_loci(&het_spec());
         let mut stats = PrepassStats::default();
+        let seed = GateParams::dev_default();
+        let mut scratch = LikelihoodScratch::new();
         for locus in &loci {
             let rungs = build_rungs(locus, &RungCfg::dev_default());
-            accumulate_locus(&mut stats, locus, &rungs, 2, &RungCfg::dev_default());
+            accumulate_locus(
+                &mut stats,
+                locus,
+                &rungs,
+                2,
+                &RungCfg::dev_default(),
+                &seed,
+                &mut scratch,
+            );
         }
         // Every resolved het sample carries bins at lengths 6 and 10.
         assert!(!stats.per_sample.is_empty(), "hets should resolve");
@@ -870,5 +1001,272 @@ mod tests {
         let spread = stats.allele_spread_by_period[&2];
         assert_eq!(spread.total_copies, 18);
         assert_eq!(spread.distance_weighted, 18);
+    }
+
+    // ── P2.2b: the purity → level fit ──
+
+    #[test]
+    fn fit_purity_level_recovers_a_lower_impure_slip_rate() {
+        // At length 6: pure (0 interruptions) slips 20 %, impure (1 interruption) slips 5 % →
+        // ratio 0.25 at k=1 → per-interruption factor ≈ 0.25.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (800u64, 200u64)); // pure: rate 0.20
+        slip.insert((6u16, 1u32), (950u64, 50u64)); // impure: rate 0.05
+        let p = fit_purity_level(&slip);
+        assert!(p.per_interruption_factor < 1.0);
+        assert!(
+            (p.per_interruption_factor - 0.25).abs() < 0.02,
+            "factor {}",
+            p.per_interruption_factor
+        );
+    }
+
+    #[test]
+    fn fit_purity_level_is_neutral_without_a_fixed_length_contrast() {
+        // Only pure alleles → nothing to contrast → Phase 1.
+        let mut pure_only = HashMap::new();
+        pure_only.insert((6u16, 0u32), (800u64, 200u64));
+        assert_eq!(fit_purity_level(&pure_only), PurityLevel::none());
+        // Impure at a length with no pure baseline → no fixed-length contrast → Phase 1
+        // (the length confound §6.5a is never crossed).
+        let mut no_pair = HashMap::new();
+        no_pair.insert((6u16, 0u32), (800u64, 200u64));
+        no_pair.insert((8u16, 1u32), (950u64, 50u64));
+        assert_eq!(fit_purity_level(&no_pair), PurityLevel::none());
+        // Empty.
+        assert_eq!(fit_purity_level(&HashMap::new()), PurityLevel::none());
+    }
+
+    #[test]
+    fn fit_purity_level_never_amplifies_stutter() {
+        // If impure slips MORE than pure (noise / confound), the factor is capped at 1 — an
+        // interruption never *increases* the modelled stutter.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (950u64, 50u64)); // pure rate 0.05
+        slip.insert((6u16, 1u32), (800u64, 200u64)); // impure rate 0.20 (higher)
+        assert_eq!(fit_purity_level(&slip).per_interruption_factor, 1.0);
+    }
+
+    #[test]
+    fn fit_purity_level_ignores_thin_cells() {
+        // Cells below the read floor on either side carry no signal → Phase 1.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (40u64, 5u64)); // pure total 45 < 50
+        slip.insert((6u16, 1u32), (950u64, 50u64));
+        assert_eq!(fit_purity_level(&slip), PurityLevel::none());
+    }
+
+    #[test]
+    fn fit_purity_level_floors_an_extreme_contrast() {
+        // An extreme impure/pure ratio would drive the factor to ~0 (modelled zero stutter);
+        // the floor clamps it (review §8).
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (100u64, 900u64)); // pure rate 0.90
+        slip.insert((6u16, 1u32), (999u64, 1u64)); // impure rate ~0.001 → ratio ~0.001
+        assert_eq!(
+            fit_purity_level(&slip).per_interruption_factor,
+            PURITY_FACTOR_FLOOR
+        );
+    }
+
+    #[test]
+    fn fit_purity_level_fits_multiple_interruption_levels_through_origin() {
+        // Two interruption levels at one length: the through-origin WLS must compound the
+        // per-interruption factor (k=2 ≈ factor²), pinning the "once per interruption" semantics.
+        let mut slip = HashMap::new();
+        slip.insert((6u16, 0u32), (800u64, 200u64)); // pure rate 0.20
+        slip.insert((6u16, 1u32), (900u64, 100u64)); // k=1 rate 0.10 → ratio 0.5
+        slip.insert((6u16, 2u32), (950u64, 50u64)); // k=2 rate 0.05 → ratio 0.25 ≈ 0.5²
+        let f = fit_purity_level(&slip).per_interruption_factor;
+        assert!(
+            (f - 0.5).abs() < 0.05,
+            "compounding per-interruption factor {f}"
+        );
+    }
+
+    // ── D1c: sequence-aware attribution (same-length het ε de-contamination) ──
+
+    use crate::ssr::cohort::types::{LocusId, SampleEvidence, SsrQc};
+
+    /// A `CA × units` tract (2·units bp).
+    fn ca_tract(units: u16) -> Box<[u8]> {
+        "CA".repeat(units as usize).into_bytes().into_boxed_slice()
+    }
+
+    /// A `SampleEvidence` from `(sequence, count)` reads, byte-sorted (Stage-1 contract).
+    fn evidence_from(reads: &[(Box<[u8]>, u32)]) -> SampleEvidence {
+        let mut seq_counts = reads.to_vec();
+        seq_counts.sort_by(|(a, _), (b, _)| a.cmp(b));
+        SampleEvidence {
+            seq_counts,
+            qc: SsrQc::default(),
+        }
+    }
+
+    /// A locus of `n` identical pure-9 / interrupted-9 hets (both 18 bp; the interruption
+    /// sibling differs at 2 interior bases), reads faithful (no injected error).
+    fn same_length_het_locus(start: u32, n: u32) -> CohortLocus {
+        let pure = ca_tract(9);
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[6] = b'G';
+            s[7] = b'G';
+            s.into_boxed_slice()
+        };
+        let mut ref_frame = b"GGGGGG".to_vec();
+        ref_frame.extend_from_slice(&pure);
+        ref_frame.extend_from_slice(b"TTTTTT");
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start,
+                end: start + 18,
+            },
+            Motif::new(b"CA").unwrap(),
+            ref_frame.into_boxed_slice(),
+            pure.clone(),
+        );
+        for idx in 0..n {
+            locus.push(
+                idx,
+                evidence_from(&[(pure.clone(), 30), (interrupted.clone(), 30)]),
+            );
+        }
+        locus
+    }
+
+    /// A locus of `n` identical homozygotes at `units` with a ±1 stutter skirt.
+    fn pure_hom_locus(start: u32, units: u16, n: u32) -> CohortLocus {
+        let tract = ca_tract(units);
+        let mut ref_frame = b"GGGGGG".to_vec();
+        ref_frame.extend_from_slice(&tract);
+        ref_frame.extend_from_slice(b"TTTTTT");
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start,
+                end: start + 2 * units as u32,
+            },
+            Motif::new(b"CA").unwrap(),
+            ref_frame.into_boxed_slice(),
+            tract.clone(),
+        );
+        for idx in 0..n {
+            locus.push(
+                idx,
+                evidence_from(&[
+                    (ca_tract(units - 1), 5),
+                    (tract.clone(), 50),
+                    (ca_tract(units + 1), 5),
+                ]),
+            );
+        }
+        locus
+    }
+
+    #[test]
+    fn same_length_hets_do_not_inflate_epsilon() {
+        // Three pure-9 / interrupted-9 hets, reads faithful (no injected sequencing error),
+        // the two alleles differing at 2 of 18 bases. Sequence-aware attribution (D1c)
+        // matches each read to its OWN allele → zero base mismatch → ε ≈ 0. The old
+        // length-only attribution would have scored the interrupted reads against the pure
+        // allele, counting 2 substitutions each and inflating ε to ≈ (2/18)·½ ≈ 0.056.
+        let loci = vec![same_length_het_locus(100, 3)];
+        let stats = run_prepass_stats(&loci, 2, &RungCfg::dev_default());
+        // The het must actually resolve — else ε would be 0 for the wrong reason (no stats).
+        assert!(
+            !stats.per_sample.is_empty(),
+            "the same-length het must resolve"
+        );
+        for st in stats.per_sample.values() {
+            assert!(st.base_match > 0, "faithful reads are recorded");
+            assert_eq!(
+                st.base_mismatch, 0,
+                "no faithful read is scored as a substitution (ε not inflated)"
+            );
+        }
+        let est = estimate(&stats, &G0FitCfg::dev_default());
+        assert!(
+            est.eps < 1e-9,
+            "ε must not be inflated by same-length hets, got {}",
+            est.eps
+        );
+    }
+
+    #[test]
+    fn same_length_het_slip_read_is_attributed_length_first() {
+        // A same-length het (pure-9 / interrupted-9) with a +1 stutter-skirt read
+        // (length 10). Sequence attribution resolves the same-length tie by composition,
+        // but the slip Δ is length-based (identical whichever same-length allele wins), so
+        // the read is booked as a +1 slip and never as a base mismatch — the integration
+        // path the primitive test covers in isolation.
+        let pure = ca_tract(9);
+        let interrupted = {
+            let mut s = pure.to_vec();
+            s[6] = b'G';
+            s[7] = b'G';
+            s.into_boxed_slice()
+        };
+        let slip10 = ca_tract(10);
+        let mut ref_frame = b"GGGGGG".to_vec();
+        ref_frame.extend_from_slice(&pure);
+        ref_frame.extend_from_slice(b"TTTTTT");
+        let mut locus = CohortLocus::new(
+            LocusId {
+                chrom_id: 0,
+                start: 100,
+                end: 118,
+            },
+            Motif::new(b"CA").unwrap(),
+            ref_frame.into_boxed_slice(),
+            pure.clone(),
+        );
+        for idx in 0..3 {
+            locus.push(
+                idx,
+                evidence_from(&[
+                    (pure.clone(), 30),
+                    (interrupted.clone(), 30),
+                    (slip10.clone(), 6),
+                ]),
+            );
+        }
+        let stats = run_prepass_stats(&[locus], 2, &RungCfg::dev_default());
+        assert!(
+            !stats.per_sample.is_empty(),
+            "the same-length het must resolve"
+        );
+        // The +1 slip reads are booked as expansions, not base mismatches.
+        let up1: u64 = stats.slip_by_period[&2].up[0];
+        assert_eq!(up1, 3 * 6, "each sample's six +1 reads are +1 slips");
+        for st in stats.per_sample.values() {
+            assert_eq!(
+                st.base_mismatch, 0,
+                "a slip read is not scored as a substitution"
+            );
+        }
+    }
+
+    #[test]
+    fn prepass_is_byte_identical_on_a_multi_locus_cohort() {
+        // Several loci (pure-hom loci at different lengths + a same-length-het locus)
+        // genuinely partition across threads, so the 1-vs-4-thread comparison exercises the
+        // cross-locus reduce — unlike the single-locus `recovery_spec` test above.
+        let loci = vec![
+            pure_hom_locus(100, 8, 4),
+            pure_hom_locus(200, 10, 4),
+            pure_hom_locus(300, 12, 4),
+            same_length_het_locus(400, 3),
+        ];
+        let single = with_threads(1, || {
+            run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default())
+        });
+        let multi = with_threads(4, || {
+            run_prepass(&loci, 2, &RungCfg::dev_default(), &G0FitCfg::dev_default())
+        });
+        assert_eq!(
+            single, multi,
+            "the pre-pass must be byte-identical across thread counts on a multi-locus cohort"
+        );
     }
 }
