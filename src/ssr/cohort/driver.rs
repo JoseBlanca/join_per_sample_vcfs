@@ -1355,4 +1355,97 @@ mod tests {
         }
         eprintln!("wrote {} alleles to {out}", alleles.len());
     }
+
+    /// D1d measurement: the frozen `ε` and the confident-genotype composition the pre-pass
+    /// seeds chemistry from, on the real ssr_tomato1 cohort. The direct D1 win is `ε`
+    /// de-inflation (fewer same-length-het reads mis-scored as substitutions) and the
+    /// appearance of **same-length hets** in the confident set (invisible to the old length
+    /// gate). Reuses the `SSR_P20_{CATALOG,PSP_DIR}` env vars.
+    ///
+    ///   SSR_P20_CATALOG=… SSR_P20_PSP_DIR=… \
+    ///     cargo test -p pop_var_caller --lib d1_dump_frozen_chemistry -- --ignored --nocapture
+    #[test]
+    #[ignore = "D1d measurement — needs ssr_tomato1 psp; set SSR_P20_{CATALOG,PSP_DIR}"]
+    fn d1_dump_frozen_chemistry() {
+        use crate::ssr::cohort::likelihood::LikelihoodScratch;
+        use crate::ssr::cohort::rung_ladder::{
+            GateParams, Resolution, ResolvedGenotype, build_rungs, resolve_confident_genotype,
+        };
+        let catalog = std::env::var("SSR_P20_CATALOG").expect("SSR_P20_CATALOG");
+        let psp_dir = std::env::var("SSR_P20_PSP_DIR").expect("SSR_P20_PSP_DIR");
+        let mut psp_files: Vec<PathBuf> = std::fs::read_dir(&psp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".ssr.psp"))
+            .collect();
+        psp_files.sort();
+        assert!(!psp_files.is_empty(), "no .ssr.psp under {psp_dir}");
+
+        let catalog_path = PathBuf::from(catalog);
+        let merger = CohortMerger::open(&catalog_path, &psp_files).unwrap();
+        let subset = collect_burn_in_subset(merger).unwrap();
+        let rung_cfg = RungCfg::dev_default();
+
+        // Confident-genotype composition (the gate's verdicts, scored with the same seed the
+        // pre-pass uses internally).
+        let seed = GateParams::dev_default();
+        let mut scratch = LikelihoodScratch::new();
+        let (mut hom, mut len_sep_het, mut same_len_het) = (0u64, 0u64, 0u64);
+        for locus in &subset {
+            let rungs = build_rungs(locus, &rung_cfg);
+            for ev in &locus.samples {
+                if let Resolution::Confident(ResolvedGenotype::Peaks(peaks)) =
+                    resolve_confident_genotype(
+                        ev,
+                        &rungs,
+                        PLOIDY,
+                        &rung_cfg,
+                        &locus.motif,
+                        &seed,
+                        &mut scratch,
+                    )
+                {
+                    match peaks.as_slice() {
+                        [_] => hom += 1,
+                        [a, b] if a.repeat_len == b.repeat_len => same_len_het += 1,
+                        _ => len_sep_het += 1,
+                    }
+                }
+            }
+        }
+
+        // Frozen chemistry.
+        let stats = run_prepass_stats(&subset, PLOIDY, &rung_cfg);
+        let est = estimate(&stats, &G0FitCfg::dev_default());
+        let (mut base_match, mut base_mismatch) = (0u64, 0u64);
+        for st in stats.per_sample.values() {
+            base_match += st.base_match;
+            base_mismatch += st.base_mismatch;
+        }
+        let mean_level = est
+            .level_by_sample
+            .values()
+            .map(|l| l.baseline)
+            .sum::<f64>()
+            / est.level_by_sample.len().max(1) as f64;
+
+        eprintln!("D1d frozen chemistry — {} burn-in loci:", subset.len());
+        eprintln!("  eps                = {:.6}", est.eps);
+        eprintln!("  base_match         = {base_match}");
+        eprintln!("  base_mismatch      = {base_mismatch}");
+        eprintln!(
+            "  confident genotypes: hom={hom}  len_sep_het={len_sep_het}  same_length_het={same_len_het}"
+        );
+        eprintln!("  samples with stats = {}", stats.per_sample.len());
+        eprintln!("  mean per-sample level baseline = {mean_level:.4}");
+        let mut periods: Vec<_> = est.shape_by_period.keys().copied().collect();
+        periods.sort_unstable();
+        for p in periods {
+            let s = &est.shape_by_period[&p];
+            eprintln!(
+                "  shape[period={p}] up={:.3} down={:.3} decay={:.3}",
+                s.up_rate, s.down_rate, s.decay
+            );
+        }
+    }
 }
