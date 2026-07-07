@@ -80,6 +80,10 @@ pub const DEFAULT_HET_ERROR_RATE: f64 = 0.02;
 /// Default het confidence margin `M` (nats) = `ln 10`, i.e. 10:1 odds.
 pub const DEFAULT_HET_LR_MARGIN: f64 = std::f64::consts::LN_10;
 
+/// Default strand-bias veto threshold for the het call
+/// ([`het::DEFAULT_STRAND_BIAS_Z`]).
+pub const DEFAULT_HET_STRAND_BIAS_Z: f64 = het::DEFAULT_STRAND_BIAS_Z;
+
 /// The per-sample summary document stored (TOML, then zstd-framed) in the
 /// `.psp` metadata section. Serialises with kebab-case keys; `version`
 /// precedes the two tables so the TOML is well-formed (top-level scalars
