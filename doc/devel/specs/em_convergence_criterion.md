@@ -10,10 +10,10 @@ failure (`var_calling::posterior_engine::larger_ref_pseudocount_cannot_increase_
 turned up during the SSR work.
 
 This is **Phase 0 of a larger arc**: unifying the SNP and SSR EM machines onto
-one Dirichlet-multinomial core (design doc to follow). The fix here is
-self-contained and mergeable on its own, and it moves the SNP engine onto the
-same principle the unified core will use — "test the quantity the iteration
-actually drives."
+one Dirichlet-multinomial core ([unified_genotype_em.md](unified_genotype_em.md)).
+The fix here is self-contained and mergeable on its own, and it moves the SNP
+engine onto the same principle the unified core is built around — "test the
+quantity the iteration actually drives."
 
 **Scope.** This is about the **stopping rule** of the cohort EM in
 `src/var_calling/posterior_engine.rs` — the `while` loop in `run_em_loop`. It
